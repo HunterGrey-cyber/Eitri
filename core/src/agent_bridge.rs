@@ -618,8 +618,9 @@ pub fn serialize_enter_input_for_js() -> String {
 
 /// `{"kind":"arrive"}`: the keys moved into the panel by keyboard (spec §8, §10.1) -- replaces
 /// `enter_input` at the two arrival sites (Task 6). Unlike `enter_input`, arriving lands BROWSE
-/// rather than opening the composer straight into INPUT: which row and mode it lands on is a pure
-/// decision on the Rust side (Owner answers Q1), not something this envelope itself carries.
+/// rather than opening the composer straight into INPUT. Which row it lands on is the page's own
+/// decision, not something this envelope carries: a waiting card, else the last row for a reader
+/// who was following it, else the row and scroll they left (owner decision #22, 2026-09-29).
 pub fn serialize_arrive_for_js() -> String {
     json!({ "kind": "arrive" }).to_string()
 }

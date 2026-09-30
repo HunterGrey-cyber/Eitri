@@ -2,11 +2,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   clampStep,
+  clipBox,
   controlsOf,
   conversationRows,
   currentStop,
   firstShownLine,
   hintTargets,
+  hintVisible,
   linkOpensAtOnce,
   nextControl,
   nextStop,
@@ -15,6 +17,7 @@ import {
   rowOf,
   stopOf,
   stopsIn,
+  visibleBox,
   webLinks,
   webUrl,
 } from "./nav";
@@ -670,5 +673,50 @@ describe("hintTargets: web links (v1 picks, Task 8, R6)", () => {
     rect(byId("stray"), 150, 10);
     rect(byId("stop"), 160, 20);
     expect(hintTargets(byId("root")).map((t) => `${t.kind}:${t.el.id}`)).toEqual(["row:r0", "control:stop"]);
+  });
+});
+
+/* K07 (2026-09-29): what a HINT label is placed on -- the part of its target that shows. `clipBox` is
+   the intersection of the root and every clipping ancestor between them; `visibleBox` is the target's
+   own box inside it; `hintVisible` is exactly "`visibleBox` is not null", so what gets a label and
+   where it goes cannot disagree. */
+describe("clipBox and visibleBox", () => {
+  const edges = (b: { top: number; bottom: number; left: number; right: number } | null) =>
+    b === null ? null : { top: b.top, bottom: b.bottom, left: b.left, right: b.right };
+
+  it("a target fully inside the list: its own box, clipped by the list", () => {
+    const root = hintDoc();
+    expect(edges(clipBox(byId("code"), root))).toEqual({ top: 0, bottom: 100, left: 0, right: 100 });
+    expect(edges(visibleBox(byId("code"), root))).toEqual({ top: 25, bottom: 45, left: 0, right: 100 });
+    expect(hintVisible(byId("code"), root)).toBe(true);
+  });
+  it("a target whose top is scrolled out of the list: the part below the list's top", () => {
+    const root = hintDoc();
+    rect(byId("code"), -30, 50);
+    expect(edges(visibleBox(byId("code"), root))).toEqual({ top: 0, bottom: 20, left: 0, right: 100 });
+    expect(hintVisible(byId("code"), root)).toBe(true);
+  });
+  it("a nested scroller clips too: the clip box is the tool result's box, not the list", () => {
+    const root = hintDoc();
+    byId("r1").insertAdjacentHTML("beforeend", '<div id="box" style="overflow-y: auto"><pre id="inner">x</pre></div>');
+    rect(byId("box"), 50, 30);
+    rect(byId("inner"), 40, 100);
+    expect(edges(clipBox(byId("inner"), root))).toEqual({ top: 50, bottom: 80, left: 0, right: 100 });
+    expect(edges(visibleBox(byId("inner"), root))).toEqual({ top: 50, bottom: 80, left: 0, right: 100 });
+    expect(hintVisible(byId("inner"), root)).toBe(true);
+    rect(byId("inner"), 90, 5); // inside the list, outside its own scroller
+    expect(visibleBox(byId("inner"), root)).toBeNull();
+    expect(hintVisible(byId("inner"), root)).toBe(false);
+  });
+  it("a target entirely outside the list: no box, and not visible", () => {
+    const root = hintDoc();
+    expect(visibleBox(byId("r2"), root)).toBeNull();
+    expect(hintVisible(byId("r2"), root)).toBe(false);
+  });
+  it("a zero-sized target: no box, and not visible", () => {
+    const root = hintDoc();
+    rect(byId("stop"), 180, 0);
+    expect(visibleBox(byId("stop"), root)).toBeNull();
+    expect(hintVisible(byId("stop"), root)).toBe(false);
   });
 });

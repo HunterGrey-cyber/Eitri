@@ -35,6 +35,10 @@ type Props = {
    *  and hollow states in `index.css`; see the `.row-current .row-sign` rule there. Defaults to
    *  `true`, the state with no host to say otherwise; `App.tsx` always passes it explicitly. */
   focused?: boolean;
+  /** K07: a HINT landing on a code block is "the item" until the next key; drawn as the block's own
+   *  outline (`data-hint-landed`, set on the `pre` by `App.tsx`, since the block lives in markdown HTML)
+   *  and, through this, a hollow sign on the current row -- one solid mark at a time. */
+  codeLanded?: boolean;
   /** D7's third button: `permissionId -> "<words> *"`, exactly the rules Rust offered for the
    *  cards currently on screen (`rule_offers`). Absent/no entry means no rule -- the card never
    *  invents its own suggestion. */
@@ -187,6 +191,7 @@ export function MessageList({
   cursor,
   detailed = false,
   focused = true,
+  codeLanded = false,
   ruleOffers,
   yankedKey = null,
   onAnswerPermission,
@@ -747,6 +752,7 @@ export function MessageList({
       <div
         className="message-list"
         data-focused={String(focused)}
+        data-code-landed={codeLanded ? "" : undefined}
         data-visual={visual ?? undefined}
         ref={listRef}
         onScroll={onScroll}

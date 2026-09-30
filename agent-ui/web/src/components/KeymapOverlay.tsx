@@ -1,5 +1,5 @@
 import { forwardRef } from "react";
-import { BROWSE_KEYS, CARET_KEYS, INPUT_KEYS, VISUAL_KEYS } from "../keymap";
+import { browseKeys, CARET_KEYS, INPUT_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
@@ -238,7 +238,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           sees, so it is this group's `note` -- not a row of `BROWSE_KEYS` either. */}
       <Section
         title="This panel"
-        rows={[...BROWSE_KEYS, { keys: "Ctrl+j", what: "Type (the box below)" }]}
+        rows={[...browseKeys(prefixLabel), { keys: "Ctrl+j", what: "Type (the box below)" }]}
         note="Ctrl+[ is Esc everywhere in this panel."
       />
       <Selecting panel={panel} />

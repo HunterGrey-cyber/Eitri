@@ -294,3 +294,27 @@ describe("KeymapOverlay", () => {
     });
   });
 });
+
+/* The PageUp row said "(Ctrl+b is the prefix)" whatever the prefix was: under the owner's own Ctrl+a it
+   named the wrong key. It now follows the effective prefix (`prefixLabel`, the same source as the
+   "After <prefix>" heading): the parenthesis says why vim's Ctrl+b is not the way back a page only when
+   Ctrl+b IS the prefix. */
+describe("KeymapOverlay: the PageUp row follows the configured prefix", () => {
+  const pageUpRow = (container: HTMLElement) =>
+    Array.from(sectionTitled(container, "This panel").querySelectorAll("tr, li, div")).find(
+      (el) => el.children.length >= 2 && el.children[0].textContent === "PageUp",
+    )!;
+  it("under Ctrl+a, the row names no Ctrl+b", () => {
+    const { container } = render(
+      <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+a" panel={EMPTY_PANEL_TABLE} />,
+    );
+    const row = pageUpRow(container);
+    expect(row).toBeDefined();
+    expect(row.textContent).toContain("A view up");
+    expect(row.textContent).not.toContain("Ctrl+b");
+  });
+  it("under the stock Ctrl+b, the row says Ctrl+b is the prefix", () => {
+    const { container } = overlay();
+    expect(pageUpRow(container).textContent).toContain("A view up (Ctrl+b is the prefix)");
+  });
+});

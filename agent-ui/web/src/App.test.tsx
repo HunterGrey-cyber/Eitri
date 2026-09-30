@@ -263,17 +263,16 @@ describe("arrive (panel round 2, spec §8, decision 4)", () => {
     return container.querySelector<HTMLElement>("[data-testid=mode-block]")!;
   }
 
-  it("with no card: BROWSE on the last row, following resumed, no textarea focused", () => {
+  /* #22 (owner decision, 2026-09-29) reversed this describe's first test, which moved the cursor away
+     with `gg` and asserted the arrival landed on the last row anyway. Split: a reader on the last row
+     (following) still lands there, following resumed; one who put the cursor elsewhere keeps it. The
+     park-and-restore cases are the "#22: coming back restores where you were" describe below. */
+  it("with no card, from INPUT on the last row: BROWSE on the last row, following resumed, no textarea focused", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 2);
     dispatch({ kind: "pane_focus", focused: true });
-    const root = container.querySelector(".agent-ui-conversation")!;
-    // Away from the last row first, so landing there is a real move, not a no-op that would pass
-    // even if `arrive` touched nothing.
-    fireEvent.keyDown(root, { key: "g" });
-    fireEvent.keyDown(root, { key: "g" });
-    expect(container.querySelector(".row-current")!.textContent).toContain("first");
+    expect(container.querySelector(".row-current")!.textContent).toContain("second");
     enterInputMode(container);
     expect(modeBlock(container).dataset.mode).toBe("input");
     const seen: string[] = [];
@@ -287,6 +286,30 @@ describe("arrive (panel round 2, spec §8, decision 4)", () => {
     expect(modeBlock(container).dataset.mode).toBe("browse");
     expect(container.querySelector(".row-current")!.textContent).toContain("second");
     expect(seen).toEqual(["resume"]);
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("with no card, the cursor moved off the last row: BROWSE where it is, following not resumed (#22)", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 2);
+    dispatch({ kind: "pane_focus", focused: true });
+    const root = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "g" });
+    expect(container.querySelector(".row-current")!.textContent).toContain("first");
+    enterInputMode(container);
+    const seen: string[] = [];
+    const onResume = () => seen.push("resume");
+    document.addEventListener(RESUME_FOLLOW_EVENT, onResume, true);
+    try {
+      dispatch({ kind: "arrive" });
+    } finally {
+      document.removeEventListener(RESUME_FOLLOW_EVENT, onResume, true);
+    }
+    expect(modeBlock(container).dataset.mode).toBe("browse");
+    expect(container.querySelector(".row-current")!.textContent).toContain("first");
+    expect(seen).toEqual([]);
     expect(container.querySelector("textarea")).toBeNull();
   });
 
@@ -5335,8 +5358,10 @@ describe("App global HINT: the panel's half", () => {
       const origin = root(container).getBoundingClientRect();
       const label = labels(container)[at];
       expect(label.classList.contains("hint-link")).toBe(true);
-      expect(label.style.top).toBe(`${second.top - origin.top - 6}px`);
-      expect(label.style.left).toBe(`${second.left - origin.left - 6}px`);
+      // K07 and its fix round: the chosen line's label is clamped into the list (x 0, y 0 here), so it no
+      // longer hangs 6px outside it; the first line's would be at x 34.
+      expect(label.style.top).toBe(`${Math.max(second.top - 6, 0) - origin.top}px`);
+      expect(label.style.left).toBe(`${Math.max(second.left - 6, 0) - origin.left}px`);
     });
 
     it("falls back to the bounding box where the browser reports no line boxes", () => {
@@ -5346,7 +5371,8 @@ describe("App global HINT: the panel's half", () => {
       const r = anchor.getBoundingClientRect();
       expect(anchor.getClientRects()).toHaveLength(0); // jsdom measures none
       expect(labels(container)[at].style.top).toBe(`${r.top - origin.top - 6}px`);
-      expect(labels(container)[at].style.left).toBe(`${r.left - origin.left - 6}px`);
+      // K07 fix round: clamped into the link's clip box (the list, here at x 0), never left of it.
+      expect(labels(container)[at].style.left).toBe(`${Math.max(r.left - 6, 0) - origin.left}px`);
     });
   });
 
@@ -5468,6 +5494,177 @@ describe("App global HINT: the panel's half", () => {
     expect(count).toBe(0);
     show(1, count);
     expect(labels(container)).toHaveLength(0);
+  });
+
+  /* K07 (2026-09-29): (a) a label is placed on the VISIBLE part of its target, its top clamped into the
+     clipping box, so a code block whose top is scrolled out (or a sliver at either edge) keeps its label
+     on screen; (b) a landing on a code block is drawn -- the block outlined, the row's sign hollow --
+     until the next key, as the one-solid-mark rule draws a control inside the current row. The list
+     is 0..1000 here (`layOut`), the root too, so a label's `top` is also its y in the list. */
+  describe("K07: code block labels and landings", () => {
+    const codeLabel = (c: HTMLElement) => c.querySelector<HTMLElement>(".hint-label.hint-code")!;
+    const topOf = (el: HTMLElement) => parseFloat(el.style.top);
+    function labelled(setUp: (c: HTMLElement) => void, replyTail?: string) {
+      const rendered = conversation(replyTail);
+      setUp(rendered.container);
+      show(1, collect(1));
+      return rendered;
+    }
+
+    it("K07-1: a block whose top is scrolled out gets its label at the visible top, not above the list", () => {
+      const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, -62, 300));
+      expect(codeLabel(container).style.top).toBe("4px");
+    });
+    it("K07-2: a block scrolled 3724px out of its top (the P6 case) likewise", () => {
+      const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, -3724, 4000));
+      expect(codeLabel(container).style.top).toBe("4px");
+    });
+    it("K07-3: a block fully in view keeps the label where it always was", () => {
+      const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, 200, 50));
+      expect(codeLabel(container).style.top).toBe("204px");
+    });
+    it("K07-4a: a sliver at the top edge: the label is inside the list, never above it", () => {
+      const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, -290, 300));
+      expect(codeLabel(container).style.top).toBe("4px");
+    });
+    it("K07-4b: a sliver at the bottom edge: the label is inside the list, never past it", () => {
+      const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, 990, 300));
+      expect(codeLabel(container).style.top).toBe("984px");
+    });
+    it("K07-5: a tall row whose sign cell starts above the list gets its label inside the list", () => {
+      const { container } = labelled((c) => {
+        const reply = c.querySelector<HTMLElement>(".row-assistant")!;
+        box(reply, -500, 2000);
+        box(reply.querySelector(".row-sign")!, -500, 2000);
+      });
+      const rowLabels = Array.from(container.querySelectorAll<HTMLElement>(".hint-label.hint-row"));
+      expect(rowLabels.length).toBeGreaterThan(0);
+      for (const label of rowLabels) expect(topOf(label)).toBeGreaterThanOrEqual(0);
+    });
+    it("K07-9: a link partly scrolled out gets its label inside the list", () => {
+      const { container } = labelled(
+        (c) => box(c.querySelector('.row-assistant a[href^="https:"]')!, -5, 20),
+        "then see [the docs](https://example.com/docs).",
+      );
+      const link = container.querySelector<HTMLElement>(".hint-label.hint-link")!;
+      expect(link).not.toBeNull();
+      expect(topOf(link)).toBeGreaterThanOrEqual(0);
+    });
+
+    /** Lands HINT session `sessionId` on target `index`. */
+    function land(sessionId: number, index: number) {
+      show(sessionId, collect(sessionId));
+      dispatch({ kind: "hint_land", sessionId, index });
+    }
+    const marked = (c: HTMLElement) => Array.from(c.querySelectorAll("pre[data-hint-landed]"));
+    const listMarked = (c: HTMLElement) => c.querySelector(".message-list")!.hasAttribute("data-code-landed");
+
+    it("K07-6: a landing on a code block marks that block and the list, and nothing else", () => {
+      const { container } = conversation("then look.\n\n```\npwd\n```\n");
+      const [first, second] = Array.from(container.querySelectorAll("pre.code-block"));
+      expect(second).toBeDefined();
+      land(1, AT.code);
+      expect(marked(container)).toEqual([first]);
+      expect(listMarked(container)).toBe(true);
+    });
+    it.each([
+      ["j", (c: HTMLElement) => fireEvent.keyDown(root(c), { key: "j" })],
+      ["y, after copying the block", (c: HTMLElement) => {
+        const clipboard = stubClipboard();
+        fireEvent.keyDown(root(c), { key: "y" });
+        expect(clipboard.writeText).toHaveBeenCalledWith("ls -la");
+      }],
+      ["a new landing on a row", () => land(2, AT.prompt)],
+      ["a new landing on a control", () => land(2, AT.approve)],
+    ])("K07-7: the mark goes with the landing: %s", (_name, next) => {
+      const { container } = conversation();
+      land(1, AT.code);
+      expect(marked(container)).toHaveLength(1);
+      next(container);
+      expect(marked(container)).toEqual([]);
+      expect(listMarked(container)).toBe(false);
+    });
+    it("K07-10: a streamed delta that re-renders the landed block takes the hollow sign with it", () => {
+      const { container } = started();
+      events(
+        { type: "user_prompt_submitted", text: "list it" },
+        { type: "turn_started", turn_id: "t1" },
+        { type: "content_delta", turn_id: "t1", kind: "text", text: "Run this:\n\n```\nls -la\n```\n\n" },
+      );
+      layOut(container);
+      act(() => root(container).focus());
+      land(1, 2); // prompt 0, the reply 1, its code block 2
+      expect(listMarked(container)).toBe(true);
+      const block = container.querySelector("pre.code-block");
+      dispatch({
+        kind: "events", tab: 1, fromRevision: 3, throughRevision: 4,
+        events: [{ type: "content_delta", turn_id: "t1", kind: "text", text: "then look." }],
+      });
+      expect(block!.isConnected).toBe(false);
+      expect(marked(container)).toEqual([]);
+      expect(listMarked(container)).toBe(false);
+    });
+    it("K07 fix round, Codex 2: an arrival that lands on a card takes the block's mark with it", () => {
+      const { container } = conversation();
+      land(1, AT.code);
+      expect(listMarked(container)).toBe(true);
+      dispatch({ kind: "pane_focus", focused: false });
+      dispatch({ kind: "pane_focus", focused: true });
+      dispatch({ kind: "arrive" });
+      expect(container.querySelector(".row-current")).toBe(container.querySelector(".row-permission"));
+      expect(marked(container)).toEqual([]);
+      expect(listMarked(container)).toBe(false);
+    });
+    it("K07 fix round: an arrival that stays on the block's row keeps the mark (y still copies it)", () => {
+      const { container } = started();
+      events(
+        { type: "user_prompt_submitted", text: "list it" },
+        { type: "turn_started", turn_id: "t1" },
+        { type: "content_delta", turn_id: "t1", kind: "text", text: "Run this:\n\n```\nls -la\n```\n\n" },
+      );
+      layOut(container);
+      act(() => root(container).focus());
+      land(1, 2);
+      dispatch({ kind: "pane_focus", focused: false });
+      dispatch({ kind: "pane_focus", focused: true });
+      dispatch({ kind: "arrive" });
+      expect(marked(container)).toHaveLength(1);
+      expect(listMarked(container)).toBe(true);
+    });
+    it("K07 fix round, Codex 3: the clamp uses the label's real height (a large font)", () => {
+      const tall = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+        return this.classList.contains("hint-label") ? 31 : 0;
+      });
+      try {
+        const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, 990, 300));
+        expect(codeLabel(container).style.top).toBe("969px");
+      } finally {
+        tall.mockRestore();
+      }
+    });
+    it("K07 fix round, Codex 4: a link scrolled sideways out of its box keeps its label inside it", () => {
+      const { container } = labelled(
+        (c) => {
+          const a = c.querySelector<HTMLElement>('.row-assistant a[href^="https:"]')!;
+          a.getBoundingClientRect = () =>
+            ({ top: 100, bottom: 120, left: -50, right: 50, width: 100, height: 20, x: -50, y: 100 }) as DOMRect;
+        },
+        "then see [the docs](https://example.com/docs).",
+      );
+      const link = container.querySelector<HTMLElement>(".hint-label.hint-link")!;
+      expect(parseFloat(link.style.left)).toBeGreaterThanOrEqual(0);
+    });
+    it("K07-8: a landing on a block in another row reveals the block, not the row", () => {
+      const { container } = conversation();
+      expect(container.querySelector(".row-current .code-block")).toBeNull();
+      const reveal = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+      show(1, collect(1));
+      reveal.mockClear();
+      dispatch({ kind: "hint_land", sessionId: 1, index: AT.code });
+      const block = container.querySelector("pre.code-block")!;
+      expect(reveal.mock.contexts).toContain(block);
+      expect(reveal.mock.contexts).not.toContain(block.closest(".row"));
+    });
   });
 });
 
@@ -12510,5 +12707,671 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     fireEvent.keyDown(root, { key: "v" });
     fireEvent.keyDown(root, { key: "d" });
     expect(container.querySelector(".band-message")?.textContent).toBe("CARET ended: d is not a CARET key (v selects)");
+  });
+});
+
+/* K04 (2026-09-29, arrival #22/K04/K07): a failed-start tab's `r` was dead -- not on arrival (the kbux
+   S13 evidence: an `r` right after a `Ctrl+l` worked), but after the tab failed while its composer had
+   the keys. The textarea went disabled, WebKit's focus fix-up moved focus to <body>, and the document
+   replay re-dispatched the key on `.agent-ui-root`, the empty tab's PARENT, whose only handler is the
+   `?`/confirm capture; the replay also focused that root, so every later key was dead too. jsdom does
+   not apply WebKit's fix-up (a disabled focused textarea stays `activeElement`), so these tests blur
+   explicitly where WebKit would. */
+describe("K04: r on a failed empty tab", () => {
+  const FAILED = { ...LIVE_TAB, state: "failed", failure: "claude: not logged in -- run claude /login" } as const;
+
+  /** A starting tab whose composer holds the keys (C1: it is live while starting), then failing. */
+  function failWhileTyping() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+    // The panel holds the keys (the band names BROWSE/INPUT only then).
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "enter_input" });
+    const textarea = rendered.container.querySelector("textarea")!;
+    expect(document.activeElement).toBe(textarea);
+    dispatch({ kind: "tabs", active: 1, tabs: [FAILED] });
+    return rendered;
+  }
+
+  /** WebKit's focus fix-up, done by hand: a focused control that went disabled loses focus to <body>
+   *  and fires `blur` (jsdom's own `blur()` refuses a disabled element, so the event is fired and the
+   *  unmount that follows it moves jsdom's focus to <body>); anything else focused is blurred. */
+  function focusFixup() {
+    const el = document.activeElement as HTMLElement;
+    if (el instanceof HTMLTextAreaElement && el.disabled) fireEvent.blur(el);
+    else act(() => el.blur());
+  }
+
+  it("K04-a (control): after an arrival, r on the failed tab posts reset_tab", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [FAILED] });
+    dispatch({ kind: "arrive" });
+    const target = (document.activeElement ?? document.body) as HTMLElement;
+    expect(container.querySelector(".empty-tab")!.contains(target)).toBe(true);
+    fireEvent.keyDown(target, { key: "r" });
+    expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
+  });
+
+  it("K04-b: failing while the composer had the keys, r on <body> still resets the tab", () => {
+    failWhileTyping();
+    // WebKit's focus fix-up: the focused control went disabled (or, after the fix, the keys already
+    // moved to the empty tab's root); either way this is where a key lands in the reported trap.
+    focusFixup();
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.keyDown(document.body, { key: "r" });
+    expect(posted.filter((m) => m.type === "reset_tab")).toHaveLength(1);
+  });
+
+  it("K04-c: the keys are not stranded afterwards -- a second r still resets", () => {
+    failWhileTyping();
+    focusFixup();
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.keyDown(document.body, { key: "r" });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "r" });
+    expect(posted.filter((m) => m.type === "reset_tab")).toHaveLength(2);
+  });
+
+  it("K04-d: a failed tab with no conversation is the empty tab; a kept one is the conversation, and r on <body> resets it", () => {
+    const { container, unmount } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [FAILED] });
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
+    expect(container.querySelector(".agent-ui-conversation")).toBeNull();
+    unmount();
+    posted = [];
+    const kept = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "restored reply" }] }));
+    const message = "the connection to the provider ended before this session did (x)";
+    dispatch({ kind: "error", tab: 1, message });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: message }] });
+    expect(kept.container.querySelector(".agent-ui-conversation")).not.toBeNull();
+    act(() => (document.activeElement as HTMLElement | null)?.blur());
+    fireEvent.keyDown(document.body, { key: "r" });
+    expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
+  });
+
+  it("K04-e: the tab failing moves the keys from the dead composer to the empty tab's own root, in BROWSE", () => {
+    const { container } = failWhileTyping();
+    const emptyTab = container.querySelector(".empty-tab")!;
+    expect(document.activeElement).toBe(emptyTab);
+    expect(container.querySelector(".status-band")!.textContent).toContain("BROWSE");
+    expect(container.querySelector("textarea")).toBeNull();
+    fireEvent.keyDown(document.activeElement!, { key: "r" });
+    expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
+  });
+
+  it("K04-f: a key replayed off <body> on the empty layout reaches the empty tab (a Dismiss that removed its own banner)", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatch({ kind: "tabs", active: 1, tabs: [FAILED] });
+      dispatch({ kind: "command_result", requestId: "req-unknown", ok: false, error: "could not do that" });
+      const dismiss = buttonLabelled(container, "Dismiss")!;
+      act(() => dismiss.focus());
+      fireEvent.click(dismiss);
+      expect(container.querySelector(".command-notice")).toBeNull();
+      expect(document.activeElement).toBe(document.body);
+      fireEvent.keyDown(document.body, { key: "r" });
+      expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
+
+      // And on a not-started tab, the dashboard's own `w` (deferred by the typing guard).
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 2));
+      dispatch({ kind: "command_result", requestId: "req-unknown-2", ok: false, error: "again" });
+      const dismiss2 = buttonLabelled(container, "Dismiss")!;
+      act(() => dismiss2.focus());
+      fireEvent.click(dismiss2);
+      expect(document.activeElement).toBe(document.body);
+      fireEvent.keyDown(document.body, { key: "w" });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 2));
+      expect(lastOfType("tab_verb")).toMatchObject({ verb: "choose" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("K04-g: failing while the chooser is open over the empty tab leaves the keys with the chooser", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+    dispatch({ kind: "enter_input" });
+    dispatch({ kind: "chooser", open: [], records: [] });
+    const chooser = container.querySelector<HTMLElement>(".chooser")!;
+    expect(chooser.contains(document.activeElement)).toBe(true);
+    dispatch({ kind: "tabs", active: 1, tabs: [FAILED] });
+    expect(chooser.contains(document.activeElement)).toBe(true);
+  });
+
+  it("K04 fix round: a key replayed off <body> never reaches the empty tab while the chooser is open", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [FAILED] });
+    dispatch({ kind: "chooser", open: [], records: [] });
+    const chooser = container.querySelector<HTMLElement>(".chooser")!;
+    expect(chooser.contains(document.activeElement)).toBe(true);
+    act(() => (document.activeElement as HTMLElement).blur());
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.keyDown(document.body, { key: "r" });
+    expect(lastOfType("reset_tab")).toBeUndefined();
+    expect(container.querySelector(".chooser")).not.toBeNull();
+    expect(container.querySelector(".chooser")!.contains(document.activeElement)).toBe(true);
+  });
+
+  it("K04 edge: r twice on a failed tab resets once per press, and the reset dashboard's own r does not resume by accident", () => {
+    vi.useFakeTimers();
+    try {
+      const resumable: Hello = {
+        ...HELLO,
+        backend: "sidecar",
+        resumableSessions: [{ provider: "claude", providerSessionId: "newest", createdAt: "", updatedAt: "" }],
+      };
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...resumable });
+      dispatch({ kind: "tabs", active: 1, tabs: [FAILED] });
+      dispatch({ kind: "arrive" });
+      fireEvent.keyDown(document.activeElement!, { key: "r" });
+      // Rust answers the reset: the tab is not_started again, the dashboard is back.
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
+      expect(container.querySelector(".empty-tab")).not.toBeNull();
+      // The second, fast `r` lands on the dashboard, where `r` means "resume newest" -- deferred,
+      // and cancelled by nothing here, so it must be a deliberate lone key to act: a repeat never is.
+      fireEvent.keyDown(document.activeElement!, { key: "r", repeat: true });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 2));
+      expect(posted.filter((m) => m.type === "reset_tab")).toHaveLength(1);
+      expect(lastOfType("resume")).toBeUndefined();
+      // A fast second `r` that is NOT a repeat (review, fix round 1): typed within the guard's window
+      // after the first, it is refused (`TypingGuard.mayAnswerNow`), never a resume.
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      fireEvent.keyDown(document.activeElement!, { key: "x" });
+      act(() => vi.advanceTimersByTime(50));
+      fireEvent.keyDown(document.activeElement!, { key: "r" });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(lastOfType("resume")).toBeUndefined();
+      // The control: the same `r` standing alone does resume, so the refusal above is the guard's.
+      fireEvent.keyDown(document.activeElement!, { key: "r" });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(lastOfType("resume")).toMatchObject({ provider_session_id: "newest" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/* #22 (owner decision, 2026-09-29: "contrl h之后再contrl l，会自动跳到最底下，能不能类似记住光标位置"): coming back
+   to the panel (`Ctrl+h/l`, `prefix a`, a tray chip) restores a reader's cursor row and scroll unless they
+   were following the bottom, who land on the last row and keep following; a waiting card still wins (P1),
+   and a new tab still lands INPUT. The geometry below is a fake layout: rows stacked at given heights in a
+   list `viewport` px tall at y = 0, `scrollTop` clamped as a browser's is, every rect following it.
+   `scrollIntoView` is this file's mock, so a reveal of a row that fits moves nothing; the view is set by
+   writing `scrollTop`. None of this proves what a real WebKit draws. */
+describe("#22: coming back restores where you were", () => {
+  let revision = 0;
+  const row = (n: number) => ({ seq: n, text: `row ${n}` });
+  function started(n = 5, extra: Partial<AgentUiState> = {}) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    // Every `seq` in a snapshot is below its `throughRevision` (the reducer's next `seq`), so rows that
+    // stream in afterwards sort after these.
+    revision = 100;
+    dispatchLiveTab(
+      snapshotState({ activeTurnId: "t", transcript: Array.from({ length: n }, (_, i) => row(i + 1)), ...extra }),
+      revision,
+    );
+    dispatch({ kind: "pane_focus", focused: true });
+    return rendered;
+  }
+  function events(...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", tab: 1, fromRevision: revision, throughRevision: revision + list.length, events: list });
+    revision += list.length;
+  }
+  /** Replies streamed in: one new row per text. */
+  function stream(...texts: string[]) {
+    events(
+      ...texts.flatMap((text): AgentDomainEvent[] => [
+        { type: "assistant_message_boundary", turn_id: "t" },
+        { type: "content_delta", turn_id: "t", kind: "text", text },
+      ]),
+    );
+  }
+  const listOf = (c: HTMLElement) => c.querySelector<HTMLElement>(".message-list")!;
+  const rootOf = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const rowsOf = (c: HTMLElement) => Array.from(listOf(c).querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
+  const current = (c: HTMLElement) => (c.querySelector(".row-current .row-body")?.textContent ?? "").trim();
+  const modeOf = (c: HTMLElement) => c.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode;
+  const press = (key: string) => fireEvent.keyDown(document.activeElement ?? document.body, { key });
+
+  /** Lays the list out (again): `scrollTop` starts where given, so a re-layout after rows arrived keeps
+   *  the view where it was, as a browser's would. A row that arrives after this call counts 300px
+   *  towards `scrollHeight` at once (fix round): in a browser the list is taller by the time
+   *  `MessageList`'s layout effect reads it, and a stale height would read as "at the bottom". */
+  function layOut(c: HTMLElement, heights: number[], scrollTop = 0, viewport = 400) {
+    const list = listOf(c);
+    const rows = rowsOf(c);
+    expect(rows.length).toBe(heights.length);
+    const totalNow = () => rowsOf(c).reduce((sum, _r, i) => sum + (heights[i] ?? 300), 0);
+    const clamp = (v: number) => Math.max(0, Math.min(totalNow() - viewport, v));
+    let top = clamp(scrollTop);
+    Object.defineProperty(list, "clientHeight", { value: viewport, configurable: true });
+    Object.defineProperty(list, "scrollHeight", { get: totalNow, configurable: true });
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get: () => top,
+      set: (v: number) => {
+        top = clamp(v);
+      },
+    });
+    list.getBoundingClientRect = () => ({ top: 0, bottom: viewport }) as DOMRect;
+    let y = 0;
+    rows.forEach((r, i) => {
+      const at = y;
+      y += heights[i];
+      r.getBoundingClientRect = () => ({ top: at - top, bottom: at + heights[i] - top }) as DOMRect;
+      r.querySelector<HTMLElement>(".row-body")!.style.lineHeight = "20px";
+    });
+    return list;
+  }
+  const FIVE = [300, 300, 300, 300, 300];
+  const SEVEN = [300, 300, 300, 300, 300, 300, 300];
+
+  /** "Parked on row 3": at the bottom (R1 has the cursor on row 5), the reader scrolls up to 600 (R1's
+   *  clamp moves the cursor to row 4, the nearest visible), then `k` (row 3 fits and is on screen: the
+   *  mocked reveal moves nothing, and `k` stops following). */
+  function parkOnRow3(c: HTMLElement) {
+    const list = layOut(c, FIVE, 1100);
+    act(() => rootOf(c).focus());
+    expect(current(c)).toBe("row 5");
+    list.scrollTop = 600;
+    fireEvent.scroll(list);
+    expect(current(c)).toBe("row 4");
+    press("k");
+    expect(current(c)).toBe("row 3");
+    expect(list.scrollTop).toBe(600);
+    return list;
+  }
+  const leave = () => dispatch({ kind: "pane_focus", focused: false });
+  type Order = "focus-first" | "arrive-first";
+  function come(order: Order = "focus-first") {
+    if (order === "focus-first") {
+      dispatch({ kind: "pane_focus", focused: true });
+      dispatch({ kind: "arrive" });
+    } else {
+      dispatch({ kind: "arrive" });
+      dispatch({ kind: "pane_focus", focused: true });
+    }
+  }
+  /** What reached the list: `resume` (following re-armed) and `user <direction>` announcements. */
+  function recording<T>(run: () => T): { seen: string[]; result: T } {
+    const seen: string[] = [];
+    const onResume = () => seen.push("resume");
+    document.addEventListener(RESUME_FOLLOW_EVENT, onResume, true);
+    try {
+      return { seen, result: run() };
+    } finally {
+      document.removeEventListener(RESUME_FOLLOW_EVENT, onResume, true);
+    }
+  }
+
+  it("T1: a reader following the bottom lands on the last row and keeps following", () => {
+    const { container } = started();
+    layOut(container, FIVE, 1100);
+    expect(current(container)).toBe("row 5");
+    leave();
+    stream("row 6", "row 7");
+    layOut(container, SEVEN, 2100 - 400);
+    const { seen } = recording(() => come());
+    expect(current(container)).toBe("row 7");
+    expect(seen).toEqual(["resume"]);
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it.each<Order>(["focus-first", "arrive-first"])("T2: a reader who had scrolled up gets their row and scroll back (%s)", (order) => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    stream("row 6", "row 7");
+    // Hidden and shown again, WebKit may lay the list out from the top: no scroll event, no clamp.
+    const list = layOut(container, SEVEN, 0);
+    const { seen } = recording(() => come(order));
+    expect(current(container)).toBe("row 3");
+    expect(list.scrollTop).toBe(600);
+    expect(seen).toEqual([]);
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("T2b: at the bottom with the cursor above the last row is not following: row and view stay, streaming does not carry them", () => {
+    const { container } = started();
+    const first = layOut(container, FIVE, 1100);
+    act(() => rootOf(container).focus());
+    press("k");
+    expect(current(container)).toBe("row 4");
+    expect(first.scrollTop).toBe(1100);
+    leave();
+    stream("row 6", "row 7");
+    const list = layOut(container, SEVEN, 1100);
+    const { seen } = recording(() => {
+      come();
+      stream("row 8");
+      layOut(container, [...SEVEN, 300], 1100);
+    });
+    expect(current(container)).toBe("row 4");
+    expect(list.scrollTop).toBe(1100);
+    expect(seen).toEqual([]);
+  });
+
+  it("T3: a scroll the reader did not make while away (R1's clamp moved the cursor) is undone", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    stream("row 6", "row 7");
+    const list = layOut(container, SEVEN, 600);
+    list.scrollTop = 1500;
+    fireEvent.scroll(list);
+    expect(current(container)).toBe("row 6");
+    come();
+    expect(current(container)).toBe("row 3");
+    expect(list.scrollTop).toBe(600);
+  });
+
+  it("T4: a row removed above the cursor while away: the same row comes back, by key", () => {
+    const { container } = started(4, {
+      transcript: [row(1), row(2), row(4), row(5)],
+      pendingPermissions: [{ seq: 3, permissionId: "p3", toolUseId: null, toolName: "Write", input: { file_path: "a" } }],
+    });
+    layOut(container, FIVE, 1100);
+    act(() => rootOf(container).focus());
+    expect(current(container)).toBe("row 5");
+    press("k");
+    expect(current(container)).toBe("row 4");
+    leave();
+    events({ type: "permission_resolved", permission_id: "p3", outcome: "allowed" });
+    expect(container.querySelector(".row-permission")).toBeNull();
+    const list = layOut(container, [300, 300, 300, 300], 1100);
+    come();
+    expect(current(container)).toBe("row 4");
+    expect(list.scrollTop).toBe(800);
+  });
+
+  it("T5: a card that arrived while away wins, and the park is dropped with it", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    events({ type: "permission_requested", permission_id: "p9", tool_use_id: "toolu_9", tool_name: "Bash", input: {} });
+    layOut(container, [...FIVE, 300], 600);
+    come();
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+    expect(modeOf(container)).toBe("browse");
+    // The park is gone, not merely outranked by the card: with the card resolved, an arrive with no
+    // leave in between restores nothing.
+    events({ type: "permission_resolved", permission_id: "p9", outcome: "allowed" });
+    layOut(container, FIVE, 600);
+    const before = current(container);
+    expect(before).not.toBe("row 3");
+    dispatch({ kind: "arrive" });
+    expect(current(container)).toBe(before);
+  });
+
+  it("T6: a new tab still lands INPUT; the switch back is Task 9's restore, and an arrive right after moves nothing", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
+    act(() => {
+      window.__neovibeDispatch!(JSON.stringify({ kind: "tabs", active: 2, tabs: two }));
+      window.__neovibeDispatch!(JSON.stringify({ kind: "enter_input" }));
+    });
+    const box = container.querySelector("textarea");
+    expect(document.activeElement).toBe(box);
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({
+      kind: "snapshot", tab: 1, throughRevision: revision,
+      state: snapshotState({ activeTurnId: "t", transcript: [row(1), row(2), row(3), row(4), row(5)] }),
+    });
+    expect(current(container)).toBe("row 3");
+    dispatch({ kind: "arrive" });
+    expect(current(container)).toBe("row 3");
+  });
+
+  /* Every arrival route reduces to the same envelopes (read, not run): `Ctrl+h`/`Ctrl+l` (`move_focus`;
+     the agent host's capture controller hands them to GTK before the page sees a keydown) and `prefix a`
+     with the chat shown send `pane_focus` and `arrive`; `prefix a`/a tray chip with the chat hidden first
+     hid it with the keys in it, which reports the agent unfocused (`ModuleGrid::hide_module` moves the
+     keys first). GTK's focus notify and `arrive` are not ordered by contract, so both orders. */
+  it.each<[string, Order]>([
+    ["Ctrl+h then Ctrl+l", "focus-first"],
+    ["Ctrl+h then Ctrl+l", "arrive-first"],
+    ["prefix a, chat shown", "focus-first"],
+    ["prefix a, chat shown", "arrive-first"],
+    ["prefix a / tray chip, chat hidden", "focus-first"],
+    ["prefix a / tray chip, chat hidden", "arrive-first"],
+  ])("T7: %s (%s) restores the parked row and scroll", (_route, order) => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    stream("row 6", "row 7");
+    const list = layOut(container, SEVEN, 0);
+    come(order);
+    expect(current(container)).toBe("row 3");
+    expect(list.scrollTop).toBe(600);
+  });
+
+  it("T7b: the card route (a tray chip agent ⚑N, prefix a with a card) lands on the card, and the park is gone", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    events({ type: "permission_requested", permission_id: "p9", tool_use_id: "toolu_9", tool_name: "Bash", input: {} });
+    layOut(container, [...FIVE, 300], 600);
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "focus_permission", tab: 1 });
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+    events({ type: "permission_resolved", permission_id: "p9", outcome: "allowed" });
+    layOut(container, FIVE, 600);
+    const before = current(container);
+    expect(before).not.toBe("row 3");
+    dispatch({ kind: "arrive" });
+    expect(current(container)).toBe(before);
+  });
+
+  it("T8: the reader scrolled the list with the wheel while away: that is where they are", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    stream("row 6", "row 7");
+    const list = layOut(container, SEVEN, 600);
+    fireEvent.wheel(list, { deltaY: 300 });
+    list.scrollTop = 1200;
+    fireEvent.scroll(list);
+    expect(current(container)).toBe("row 5");
+    come();
+    expect(current(container)).toBe("row 5");
+    expect(list.scrollTop).toBe(1200);
+  });
+
+  it("T9: a panel key since the leave makes the park stale", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => rootOf(container).focus());
+    press("j");
+    expect(current(container)).toBe("row 4");
+    dispatch({ kind: "arrive" });
+    expect(current(container)).toBe("row 4");
+  });
+
+  it("T10: a tab switch while away drops the park: the other tab lands by the live rule", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ transcript: [row(1), row(2)] }) });
+    // The same list element now holds tab 2's two rows, followed to its end (it opened there).
+    layOut(container, [300, 300], 200);
+    const { seen } = recording(() => dispatch({ kind: "arrive" }));
+    expect(current(container)).toBe("row 2");
+    expect(seen).toEqual(["resume"]);
+  });
+
+  it("T11: a reader who left from INPUT comes back in BROWSE on their row, draft untouched", () => {
+    const { container } = started();
+    const list = parkOnRow3(container);
+    press("i");
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "half a thought" } });
+    leave();
+    layOut(container, FIVE, 0);
+    come();
+    expect(modeOf(container)).toBe("browse");
+    expect(current(container)).toBe("row 3");
+    expect(list.scrollTop).toBe(600);
+    act(() => rootOf(container).focus());
+    press("i");
+    expect(container.querySelector("textarea")!.value).toBe("half a thought");
+  });
+
+  it("T12: in a conversation that fits the view, a cursor on row 1 stays there, and streaming does not move it", () => {
+    const { container } = started(3);
+    layOut(container, [100, 100, 100]);
+    act(() => rootOf(container).focus());
+    press("g");
+    press("g");
+    expect(current(container)).toBe("row 1");
+    leave();
+    const { seen } = recording(() => come());
+    expect(current(container)).toBe("row 1");
+    expect(seen).toEqual([]);
+    stream("row 4");
+    layOut(container, [100, 100, 100, 100]);
+    expect(current(container)).toBe("row 1");
+  });
+
+  it("T13: the restored row is off screen after a reflow: it is revealed, and the cursor stays on it", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    stream("row 6", "row 7");
+    layOut(container, [700, 700, 300, 300, 300, 300, 300], 600);
+    const reveal = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    reveal.mockClear();
+    come();
+    expect(current(container)).toBe("row 3");
+    expect(reveal.mock.contexts).toContain(rowsOf(container)[2]);
+  });
+
+  it("fix round, Codex 1: a parked reader stays parked even if the list re-armed following while away", () => {
+    const { container } = started(4, {
+      transcript: [row(1), row(2), row(4), row(5)],
+      pendingPermissions: [{ seq: 3, permissionId: "p3", toolUseId: null, toolName: "Write", input: { file_path: "a" } }],
+    });
+    layOut(container, FIVE, 1100);
+    act(() => rootOf(container).focus());
+    press("k");
+    expect(current(container)).toBe("row 4");
+    leave();
+    // The card above resolves: the list shrinks, the browser clamps 1100 -> 800 and says so with a
+    // scroll event, which `MessageList` reads as "at the bottom": following again.
+    events({ type: "permission_resolved", permission_id: "p3", outcome: "allowed" });
+    const list = layOut(container, [300, 300, 300, 300], 1100);
+    fireEvent.scroll(list);
+    come();
+    expect(current(container)).toBe("row 4");
+    // The next streamed row must not carry the view (and, through R1's clamp, the cursor) away.
+    stream("row 6");
+    layOut(container, [300, 300, 300, 300, 300], list.scrollTop);
+    stream("row 7");
+    expect(list.scrollTop).toBe(800);
+    fireEvent.scroll(list);
+    expect(current(container)).toBe("row 4");
+  });
+
+  it("fix round: a park that was following lands last even when the view is not at the bottom on arrival", () => {
+    const { container } = started();
+    layOut(container, FIVE, 1100);
+    expect(current(container)).toBe("row 5");
+    leave();
+    stream("row 6");
+    layOut(container, [...FIVE, 300], 0); // shown again from the top: no scroll event
+    const { seen } = recording(() => come());
+    expect(current(container)).toBe("row 6");
+    expect(seen).toEqual(["resume"]);
+  });
+
+  /* Every way the park is dropped or consumed, each made observable the same way: after it, a scroll
+     the reader did not make moves the cursor (R1's clamp), and the arrival must leave it there rather
+     than restore row 3. */
+  function driftAway(c: HTMLElement): string {
+    const list = listOf(c);
+    list.scrollTop = 1100;
+    fireEvent.scroll(list);
+    const now = current(c);
+    expect(now).not.toBe("row 3");
+    return now;
+  }
+  it.each<[string, (c: HTMLElement) => void]>([
+    ["a touch drag on the list", (c) => fireEvent.touchMove(listOf(c))],
+    ["a pointer press in the panel", (c) => fireEvent.pointerDown(rootOf(c))],
+    ["enter_input", () => dispatch({ kind: "enter_input" })],
+    ["an arrival that consumed it", () => come()],
+    ["a tab switch and back", (c) => {
+      const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+      dispatch({ kind: "tabs", active: 2, tabs: two });
+      dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ transcript: [row(1)] }) });
+      dispatch({ kind: "tabs", active: 1, tabs: two });
+      dispatch({
+        kind: "snapshot", tab: 1, throughRevision: revision,
+        state: snapshotState({ activeTurnId: "t", transcript: [row(1), row(2), row(3), row(4), row(5)] }),
+      });
+      layOut(c, FIVE, 600); // the rows are new elements: lay them out again
+    }],
+  ])("fix round: %s drops the park", (_name, drop) => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    drop(container);
+    const before = driftAway(container);
+    dispatch({ kind: "arrive" });
+    expect(current(container)).toBe(before);
+  });
+  it("fix round: focus_permission drops the park (the card resolved before the next arrive)", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    events({ type: "permission_requested", permission_id: "p9", tool_use_id: "toolu_9", tool_name: "Bash", input: {} });
+    layOut(container, [...FIVE, 300], 600);
+    dispatch({ kind: "focus_permission", tab: 1 });
+    events({ type: "permission_resolved", permission_id: "p9", outcome: "allowed" });
+    layOut(container, FIVE, 600);
+    const before = driftAway(container);
+    dispatch({ kind: "arrive" });
+    expect(current(container)).toBe(before);
+  });
+  it("fix round: a leave from the empty layout clears an older park", () => {
+    const { container } = started();
+    parkOnRow3(container);
+    leave();
+    // The tab was reset while away and started again: same tab, no switch.
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
+    dispatch({ kind: "pane_focus", focused: true });
+    leave();
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({
+      kind: "snapshot", tab: 1, throughRevision: revision,
+      state: snapshotState({ activeTurnId: "t", transcript: [row(1), row(2), row(3), row(4), row(5)] }),
+    });
+    layOut(container, FIVE, 0);
+    const before = driftAway(container);
+    dispatch({ kind: "arrive" });
+    expect(current(container)).toBe(before);
+  });
+
+  it("T14: a launch arrival (nothing parked) lands on the last row, following", () => {
+    const { container } = started();
+    const { seen } = recording(() => dispatch({ kind: "arrive" }));
+    expect(current(container)).toBe("row 5");
+    expect(seen).toEqual(["resume"]);
   });
 });

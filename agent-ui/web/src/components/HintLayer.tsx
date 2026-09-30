@@ -16,9 +16,9 @@
  *  come here: it cancels the whole HINT (`shell/src/hint.rs`'s window-level scroll controller, spec
  *  §2.5). None of this has been seen on a screen. The colour pair is `hint-bg`/`hint-fg`, guarded
  *  against each other in Rust (`tokens.rs`). */
-import { useLayoutEffect, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { firstShownLine, hintVisible } from "../nav";
+import { clipBox, firstShownLine, visibleBox } from "../nav";
 import type { HintTarget } from "../nav";
 
 export type ShownHint = { target: HintTarget; label: string };
@@ -27,35 +27,71 @@ export type ShownHint = { target: HintTarget; label: string };
  *  longer in view. */
 type Placement = { top: number; left: number; width?: number; height?: number; shift?: boolean } | null;
 
-function place(root: HTMLElement, hints: ShownHint[]): Placement[] {
+/** K07: a label's size for the clamps below until one has been drawn to measure (`index.css`'s
+ *  `.hint-label`: one `--fs-xs` line plus 3px padding each side, at the default 14px font). Fix round:
+ *  only a fallback -- the drawn labels are measured (`labelSize`), since `agent.font_size` 32 or a
+ *  `Ctrl+=` zoom makes a label about twice this, and a clamp with 16 would let it overhang the clip box.
+ *  jsdom measures nothing, so the fallback is also what its tests see. */
+export const LABEL_PX = 16;
+
+/** The largest label drawn in `layer` (a two-letter label is wider than a one-letter one), rows' aside, or
+ *  `LABEL_PX` for a dimension nothing has been drawn to measure yet. The placement effect runs after
+ *  every commit, so the first pass uses the fallback and the next one the measured size. */
+function labelSize(layer: HTMLElement | null): { width: number; height: number } {
+  let width = 0;
+  let height = 0;
+  // A row's label is sized to its sign cell (`place`), so it says nothing about a label's own size.
+  for (const label of layer?.querySelectorAll<HTMLElement>(".hint-label:not(.hint-row)") ?? []) {
+    width = Math.max(width, label.offsetWidth);
+    height = Math.max(height, label.offsetHeight);
+  }
+  return { width: width > 0 ? width : LABEL_PX, height: height > 0 ? height : LABEL_PX };
+}
+
+function place(root: HTMLElement, hints: ShownHint[], label: { width: number; height: number }): Placement[] {
   const origin = root.getBoundingClientRect();
   return hints.map(({ target }) => {
-    if (!target.el.isConnected || !hintVisible(target.el, root)) return null;
-    const host = target.kind === "row" ? (target.el.querySelector<HTMLElement>(".row-sign") ?? target.el) : target.el;
-    const r = host.getBoundingClientRect();
-    if (target.kind === "code") return { top: r.top - origin.top + 4, left: r.right - origin.left - 4, shift: true };
-    if (target.kind === "row") return { top: r.top - origin.top, left: r.left - origin.left, width: r.width, height: r.height };
+    if (!target.el.isConnected) return null;
+    // K07: everything is placed on the part of the target that shows, and every label's top is clamped
+    // into the box that part shows in, so a target scrolled half out of the list -- or a sliver at
+    // either edge -- keeps its label on screen rather than over the band above the list or past its
+    // end. A label on screen matters more than one flush with its target (Vimium's rule: a hint on the
+    // visible part of its target).
+    const vis = visibleBox(target.el, root);
+    const clip = vis === null ? null : clipBox(target.el, root);
+    if (vis === null || clip === null) return null;
+    const clampTop = (want: number) => Math.max(clip.top, Math.min(want, clip.bottom - label.height)) - origin.top;
+    // Fix round: sideways too -- a link in a wide table scrolled sideways starts left of its box.
+    const clampLeft = (want: number) => Math.max(clip.left, Math.min(want, clip.right - label.width)) - origin.left;
+    if (target.kind === "code") return { top: clampTop(vis.top + 4), left: vis.right - origin.left - 4, shift: true };
+    if (target.kind === "row") {
+      const sign = target.el.querySelector<HTMLElement>(".row-sign");
+      const cell = (sign === null ? null : visibleBox(sign, root)) ?? vis;
+      return { top: clampTop(cell.top), left: cell.left - origin.left, width: cell.width, height: cell.height };
+    }
     // A link (v1 picks, Task 8, R6) that wraps onto a second line has a bounding box starting at the row's
     // left edge on its FIRST line, where its label would sit over unrelated text -- perhaps another link's.
     // The first line box that is on screen is where its label belongs (`firstShownLine`: not simply the first,
     // which may have scrolled out of the list while the link's last line is still in it). jsdom reports none,
-    // so the bounding box stays the fallback.
+    // so the bounding box stays the fallback. Either way the label is clamped into the clip box (K07).
+    const r = target.el.getBoundingClientRect();
     const at = target.kind === "link" ? firstShownLine(target.el, root) : r;
-    return { top: at.top - origin.top - 6, left: at.left - origin.left - 6 };
+    return { top: clampTop(at.top - 6), left: clampLeft(at.left - 6) };
   });
 }
 
 export function HintLayer({ root, hints, typed }: { root: HTMLElement | null; hints: ShownHint[]; typed: string }) {
   const [placements, setPlacements] = useState<Placement[]>([]);
+  const layerRef = useRef<HTMLDivElement>(null);
   // No dependency list on purpose: see the doc above. The equality check is what stops this effect
   // from re-rendering itself forever.
   useLayoutEffect(() => {
-    const next = root === null ? [] : place(root, hints);
+    const next = root === null ? [] : place(root, hints, labelSize(layerRef.current));
     if (JSON.stringify(next) !== JSON.stringify(placements)) setPlacements(next);
   });
   if (root === null || hints.length === 0) return null;
   return (
-    <div className="hint-layer" aria-hidden="true">
+    <div className="hint-layer" aria-hidden="true" ref={layerRef}>
       {hints.map(({ target, label }, i) => {
         const p = placements[i];
         // `undefined`: not measured yet (the first commit of a new list; the layout effect fills it

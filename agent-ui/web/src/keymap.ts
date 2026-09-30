@@ -833,6 +833,20 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
 /** One line of the `?` keymap: the key as a person types it, and what it does. */
 export type KeyHelp = { keys: string; what: string };
 
+/** The PageUp row's text under the effective prefix (`KeymapHelp.prefix`, as a person reads it). vim's way
+ *  back a page is `Ctrl+b`, which this panel never claims (`resolveKey`'s `Ctrl+f` note); the row says why
+ *  only when `Ctrl+b` really is the prefix -- under another one (the owner's `Ctrl+a`) naming `Ctrl+b` as
+ *  "the prefix" was simply wrong, and naming that other key would explain nothing about PageUp. */
+export function pageUpHelp(prefix: string): string {
+  return prefix === "Ctrl+b" ? "A view up (Ctrl+b is the prefix)" : "A view up";
+}
+
+/** `BROWSE_KEYS` as the `?` overlay shows them under the effective prefix (only the PageUp row depends
+ *  on it). */
+export function browseKeys(prefix: string): KeyHelp[] {
+  return BROWSE_KEYS.map((row) => (row.keys === "PageUp" ? { ...row, what: pageUpHelp(prefix) } : row));
+}
+
 /** BROWSE, i.e. everything `resolveKey` claims outside INPUT. Kept beside `resolveKey` and tied to
  *  it both ways by `keymap.test.ts`, so this list can neither promise a key that does nothing nor
  *  leave out one that does (spec §3.3). */
@@ -847,7 +861,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
   { keys: "Ctrl+e / Ctrl+y", what: "One line down / up (a count repeats it, e.g. 5 Ctrl+e)" },
   { keys: "Ctrl+f / PageDown", what: "A view down, keeping two lines (a count repeats it)" },
-  { keys: "PageUp", what: "A view up (Ctrl+b is the prefix)" },
+  { keys: "PageUp", what: pageUpHelp("Ctrl+b") },
   { keys: "Ctrl+c", what: "Interrupt the running turn (never closes anything)" },
   { keys: "a / d", what: "Allow / deny the card under the cursor or gating its tool call; only a lone key answers" },
   { keys: "Enter", what: "Show or hide a tool's result or a collapsed run" },

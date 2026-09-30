@@ -460,6 +460,31 @@ function oldestPendingTool(state: AgentUiState): string | null {
   return oldest?.toolName ?? null;
 }
 
+/** #22: where a reader was when the keys left the panel (`pane_focus` false), for the `arrive` that
+ *  brings them back. One slot beside `viewStore`, never in it: an arrival must neither consume nor
+ *  overwrite the view a tab switch saved, and a park dies with a switch (`tabs` arm). `following` is
+ *  "at the bottom AND on the last row" -- in a conversation that fits the view `atBottom` alone is
+ *  always true, and would send a reader who put the cursor on row 1 back to the last row. `atKey`:
+ *  `typingGuard.keyCount()` at the leave, so any panel key since then makes the park stale. */
+type ArrivalPark = { tab: TabId; view: TabViewState; cursorKey: string | null; following: boolean; atKey: number };
+
+/** The scroll half of putting a saved view back (Task 9's switch restore and #22's arrival): `follow`
+ *  re-arms following outright, as a send does; otherwise the write is announced as the user's, so
+ *  `MessageList` does not fight it, and the list goes back to where it was. */
+function applyViewScroll(list: HTMLElement, view: TabViewState, follow: boolean, stop = false) {
+  if (follow) {
+    resumeFollowing(list);
+    return;
+  }
+  // `stop` (#22, fix round): a view that was not following must come back not following, whatever the
+  // list decided while it was away -- a card resolved above the reader shrinks the list, the browser
+  // clamps `scrollTop` to the new end, and `MessageList` reads that scroll as "at the bottom" and
+  // re-arms following, so the next streamed row would snap the view (and, through R1's clamp, the
+  // cursor) away from the row just restored. "up" stops following outright, as `k`/`gg` do.
+  noteUserScroll(list, stop ? "up" : "unknown");
+  list.scrollTop = view.scrollTop;
+}
+
 export default function App() {
   const [state, setState] = useState(initialState());
   const [hello, setHello] = useState<Hello | null>(null);
@@ -478,6 +503,11 @@ export default function App() {
   /** The view to restore once the switch's `snapshot` (or, for a tab with none, the switch itself)
    *  is applied. Read and cleared by the `snapshot` arm's layout effect below. */
   const restoreRef = useRef<TabViewState | null>(null);
+  /** #22: see `ArrivalPark`. Taken by the `pane_focus` arm when the keys leave, used and cleared by the
+   *  next `arrive`, dropped by anything that means the reader chose a place themselves while away (a
+   *  wheel or touch on the list, a press in the panel) or by a route that lands elsewhere (a switch,
+   *  `enter_input`, `focus_permission`). */
+  const arrivalParkRef = useRef<ArrivalPark | null>(null);
   /** Set by the `tabs` arm whenever `payload.active` names a different tab than before (mount
    *  included, the same condition that arm's own per-tab reset already runs on), and
    *  read-and-cleared by the `snapshot` arm right after (P1, ruling 26): landing on a tab already
@@ -647,8 +677,9 @@ export default function App() {
    *  used to send `enter_input` (spec §8, decision 4): `Ctrl+h/j/k/l` into the chat, `prefix a`/a tray
    *  chip with no card, and a launch that starts with the keys already in the chat. A counter for the
    *  same reason `inputRequest` is one. The effect below decides, against the current render, whether
-   *  a card is waiting (P1, unchanged: lands there instead) or the panel lands BROWSE on the last row
-   *  with following resumed -- never the composer, which is the whole point of the reversal. */
+   *  a card is waiting (P1, unchanged: lands there instead) or the panel lands BROWSE -- on the last row
+   *  with following resumed for a reader who was following, else where they were (#22) -- never the
+   *  composer, which is the whole point of the reversal. */
   const [arriveRequest, setArriveRequest] = useState(0);
   /** V1 C1 (spec §3.5): bumped by each `nav_key` envelope, direction carried along -- the
    *  `arriveRequest` pattern (a counter, not a flag), so two arrivals in a row both act and the
@@ -697,6 +728,23 @@ export default function App() {
   expandedRef.current = expanded;
   const detailedRef = useRef(detailed);
   detailedRef.current = detailed;
+  /** What the reader has on screen now, from the live refs: what a tab switch parks (Task 9) and what
+   *  #22's leave parks, one capture for both. `atBottom` is Task 9's own formula. */
+  function captureView(list: HTMLElement | null): TabViewState {
+    const atBottom = list === null || list.scrollTop + list.clientHeight >= list.scrollHeight - 1;
+    return {
+      cursor: cursorRef.current,
+      mode: modeRef.current,
+      expanded: expandedRef.current,
+      scrollTop: list?.scrollTop ?? 0,
+      atBottom,
+      detailed: detailedRef.current,
+      // At the bottom, following is what a restore should resume (see the `snapshot` arm's restore
+      // block), so no threshold is worth remembering -- and `null` there matches `MessageList`'s own
+      // "while following" reset (wave 3, Task 3).
+      unseenAfterSeq: atBottom ? null : unseenAfterSeqRef.current,
+    };
+  }
   /** Visual-mode spec, D2-D5: the model VISUAL/V-LINE keep between keys (the two caret ends, the
    *  linewise flag, the goal column), and the native selection's own snapshot from the last
    *  rebuild (D8's own "still the one VISUAL built" check). `null` outside VISUAL/V-LINE -- `mode`
@@ -1214,6 +1262,9 @@ export default function App() {
     renaming !== null ||
     (search !== null && sessionStarted) ||
     (exLine !== null && sessionStarted);
+  /** For the document replay (installed once): see its K04 fix-round note. */
+  const overlayOpenRef = useRef(overlayOpen);
+  overlayOpenRef.current = overlayOpen;
   /** Counters `takeKeys` (below) bumps to ask a specific overlay/composer to re-focus itself,
    *  mirroring the existing `inputRequest`/`arriveRequest` convention: a plain number so a second
    *  request while the first is still pending is never silently coalesced away by React (an
@@ -1311,6 +1362,9 @@ export default function App() {
     () => buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
     [state, expanded, detailed],
   );
+  /** For the dispatch handler (installed once), as `cursorRef`: #22's park names the cursor's row by key. */
+  const timelineRef = useRef(timeline);
+  timelineRef.current = timeline;
   /** D11: the SAME pure computation as `timeline` above, over `frozenSnapshot` instead of the live
    *  render -- functionally identical to what `MessageList` recomputes internally once it is handed
    *  the frozen props, so a row found in the frozen DOM can be placed at this array's own index
@@ -1562,11 +1616,25 @@ export default function App() {
      reliably firing `blur` (a removed node fires nothing), and a disabled button receives no key
      events, so the next key would sail past `onKeyDown` and the panel would stop answering its own
      keys. The key is REPLAYED on the root rather than dropped, so the keystroke that noticed the
-     problem still does what it says. The replay targets the root, so it never re-enters here. */
+     problem still does what it says. The replay targets the root, so it never re-enters here.
+     K04 (2026-09-29): on the empty layout the root that handles keys is `.empty-tab`, not
+     `.agent-ui-root` -- its parent, whose only handler is the `?`/confirm capture, so a key replayed
+     there never reached `EmptyTab`'s own `onKeyDown` (a failed tab's `r` was dead), and focusing it
+     stranded every later key there too (`returnKeysToRoot`'s own trap, the same answer). */
   useEffect(() => {
     function onDocumentKeyDown(event: globalThis.KeyboardEvent) {
       if (event.target !== document.body && event.target !== document.documentElement) return;
-      const root = containerRef.current ?? startScreenRef.current;
+      const start = startScreenRef.current;
+      // K04 fix round: under an overlay (the `prefix w` chooser, a rename) the empty layout is modal, as
+      // the conversation's is -- the key is not replayed onto the empty tab behind it (a failed tab's
+      // `r` would reset it under the chooser); the keys go back to the overlay instead.
+      if (containerRef.current === null && overlayOpenRef.current) {
+        event.preventDefault();
+        setKeysRequest((n) => n + 1);
+        return;
+      }
+      const root =
+        containerRef.current ?? start?.querySelector<HTMLElement>(":scope > .empty-tab[tabindex]") ?? start;
       if (root === null) return;
       root.focus({ preventScroll: true });
       const replay = new globalThis.KeyboardEvent("keydown", {
@@ -1709,8 +1777,19 @@ export default function App() {
         setCursor(next);
       }
     };
+    // #22: a wheel or a touch drag on the list is the reader choosing a new place, keys or not; the
+    // next arrival must not undo it by restoring the parked one.
+    const dropPark = () => {
+      arrivalParkRef.current = null;
+    };
     list.addEventListener("scroll", onListScroll, { passive: true });
-    return () => list.removeEventListener("scroll", onListScroll);
+    list.addEventListener("wheel", dropPark, { passive: true });
+    list.addEventListener("touchmove", dropPark, { passive: true });
+    return () => {
+      list.removeEventListener("scroll", onListScroll);
+      list.removeEventListener("wheel", dropPark);
+      list.removeEventListener("touchmove", dropPark);
+    };
   }, [sessionStarted]);
   /** R1: at the bottom, the cursor rides the new last row as the conversation grows, and a sent
    *  prompt takes the cursor outright. Keyed on `timeline`, since a plain `state` change (a card
@@ -1783,12 +1862,7 @@ export default function App() {
     // said outright, as a send does, rather than as a scroll to the end the list reads a frame later
     // inside a steering window -- where any other movement above the end counted as the user
     // scrolling up. A tab left parked comes back exactly where it was.
-    if (view.atBottom) {
-      resumeFollowing(list);
-      return;
-    }
-    noteUserScroll(list, "unknown");
-    list.scrollTop = view.scrollTop;
+    applyViewScroll(list, view, view.atBottom);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [restoreTick]);
   /** The session is gone (lost or closed). Read before the start-screen branch below, because the
@@ -1857,12 +1931,19 @@ export default function App() {
   /* `arrive` (panel round 2, spec §8, decision 4): reverses the 2026-09-19 ruling "control l直接闪
      cursor" for every keyboard arrival except a brand-new tab's (`enter_input`, unchanged, above). A
      card waiting in this tab gets the same landing `focus_permission` gives -- BROWSE, on the oldest
-     one -- never a composer the user never asked to type into. Otherwise BROWSE on the last row, with
-     following resumed the same way a send does (`./follow.ts`): the point of the reversal is that a
-     stray keyboard arrival must never fall straight into a live turn's box. Keyed on the request
-     alone, like `inputRequest`. */
+     one -- never a composer the user never asked to type into. Keyed on the request alone, like
+     `inputRequest`.
+     #22 (owner decision, 2026-09-29: "contrl h之后再contrl l，会自动跳到最底下，能不能类似记住光标位置")
+     reverses the landing half for everything else: BROWSE, and the reader's own place. A reader who was
+     following the bottom lands on the last row and keeps following (the same way a send does,
+     `./follow.ts`); anyone else gets the row they left (by key, so a row removed above it while away
+     does not shift the landing) and the scroll they left, through the park the `pane_focus` arm took.
+     With no usable park (a launch arrival, a park for another tab, one a key or a hand on the list made
+     stale), the live view decides the same way: following lands last, anything else moves nothing. */
   useEffect(() => {
     if (arriveRequest === 0) return;
+    const park = arrivalParkRef.current;
+    arrivalParkRef.current = null;
     // Fix round 1 (reviewer finding, blocking, both review programs): an arrival (a tab switch,
     // `Ctrl+h`/`Ctrl+l`) used to write `mode`/`cursor` directly below without ever calling
     // `exitRegion`, so `frozenSnapshot` -- and the row VISUAL was looking at in the OLD tab -- stayed
@@ -1880,14 +1961,38 @@ export default function App() {
       setPermissionRequest((n) => n + 1);
       return;
     }
+    const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
     const last = Math.max(timeline.length - 1, 0);
-    // Only when the cursor really moves -- a `"keep"` set for a `setCursor` that changes nothing
-    // fires no `[cursor]` effect, so nothing consumes it, and it swallows the NEXT move's reveal
-    // (the same convention the switch restore below follows).
-    if (last !== cursorRef.current) landingRef.current = "keep";
+    const usable = park !== null && park.tab === activeTabRef.current && park.atKey === typingGuard.keyCount();
+    const following = usable
+      ? park.following
+      : (list === null || list.scrollTop + list.clientHeight >= list.scrollHeight - 1) && cursorRef.current === last;
     setMode("browse");
-    setCursor(last);
-    resumeFollowing(containerRef.current?.querySelector(".message-list"));
+    if (following) {
+      // Only when the cursor really moves -- a `"keep"` set for a `setCursor` that changes nothing
+      // fires no `[cursor]` effect, so nothing consumes it, and it swallows the NEXT move's reveal
+      // (the same convention the switch restore below follows).
+      if (last !== cursorRef.current) landingRef.current = "keep";
+      setCursor(last);
+      resumeFollowing(list);
+      return;
+    }
+    if (!usable || list === null) return;
+    const index =
+      (park.cursorKey === null ? null : indexOfKey(timeline, park.cursorKey)) ??
+      Math.min(Math.max(park.view.cursor, 0), last);
+    if (index !== cursorRef.current) landingRef.current = "keep";
+    setCursor(index);
+    // Never `park.view.atBottom` here: a park that is not following can still be at the bottom (`k`
+    // once from the last row, `gg` in a conversation that fits), and re-arming following would undo
+    // the stop that `k`/`gg` made on purpose. Written directly rather than through `restoreRef`, which
+    // waits for a switch's snapshot and must not be clobbered by an arrival.
+    applyViewScroll(list, park.view, false, true);
+    // The row is authoritative: if it is entirely off screen at that scroll (the width changed while
+    // the panel was hidden), bring it into view rather than leaving R1's clamp to move the cursor.
+    const rows = conversationRows(list);
+    const row = rows[index];
+    if (row !== undefined && clampCursorToView(list, rows, index) !== null) revealRow(list, row, 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [arriveRequest]);
   /* `focus_permission` (modules spec §3.3): BROWSE, with the cursor on the oldest pending card, so
@@ -2081,6 +2186,41 @@ export default function App() {
   /** A code block HINT landed on: the next `y` copies exactly that block's code rather than the
    *  whole message (spec §2.4). Cleared by that copy and by any other key the table resolves. */
   const copyCodeRef = useRef<HTMLElement | null>(null);
+  /** K07: whether `copyCodeRef` holds a block, for `MessageList`'s `data-code-landed` (the row's sign
+   *  goes hollow while the block is the item). */
+  const [codeLanded, setCodeLanded] = useState(false);
+  /** K07: the one way `copyCodeRef` is written. Keeps the ref (the dispatch handler and `enterRegion`
+   *  read it synchronously) and draws the landing: `data-hint-landed` on the block itself -- it lives in
+   *  markdown `innerHTML`, so React cannot render the attribute -- and `codeLanded` for the row. A block
+   *  re-rendered by a streamed delta is a new `pre`: the old one leaves with its attribute, and the ref
+   *  already lands nowhere useful then (`isConnected`), as before. */
+  function markLandedCode(el: HTMLElement | null) {
+    const previous = copyCodeRef.current;
+    if (previous === el) return;
+    previous?.removeAttribute("data-hint-landed");
+    copyCodeRef.current = el;
+    el?.setAttribute("data-hint-landed", "");
+    setCodeLanded(el !== null);
+  }
+  // K07: a streamed delta that re-rendered the landed block took its outline with it; the row's sign
+  // goes solid again rather than staying hollow for a mark nobody can see. The ref itself is left as it
+  // was (what `y` does with a detached block is unchanged). Fix round (review): and the landing ends
+  // whenever the cursor is moved off the block's row by anything but a key (which clears it itself) --
+  // an arrival landing on a waiting card, say -- or the block would keep its outline and the card its
+  // hollow sign. An arrival that stays on the row (a park restored, or following on the last row) keeps
+  // it, so `y` still copies the block after `Ctrl+h Ctrl+l`.
+  useEffect(() => {
+    const block = copyCodeRef.current;
+    if (block === null || frozenSnapshotRef.current !== null) return;
+    if (!block.isConnected) {
+      if (codeLanded) setCodeLanded(false);
+      return;
+    }
+    const root = containerRef.current;
+    if (root === null) return;
+    if (rowOf(root, block) !== (conversationRows(root)[cursor] ?? null)) markLandedCode(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeline, cursor]);
   /** A control HINT landed on, for the `mode` effect above to leave focused: landing from INPUT
    *  blurs the composer, which sets BROWSE, and that effect would otherwise take focus straight back
    *  to the root. Consumed or dropped on the very next commit (the effect just below). */
@@ -2185,6 +2325,24 @@ export default function App() {
         // Visual-mode spec D12: `pane_focus` false ends VISUAL -- this arm never otherwise sets
         // `mode`, so nothing else here would (spec §7, finding 4).
         if (!payload.focused) exitRegion();
+        // #22: the keys leave -- park where the reader is, after `exitRegion` (as the `tabs` arm's
+        // capture), so a VISUAL mode is never what is parked. Only over a conversation: the empty tab
+        // lands its own way (`EmptyTab`'s `arriveRequest` effect).
+        if (!payload.focused) {
+          const tab = activeTabRef.current;
+          const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+          if (tab !== null && list !== null) {
+            const view = captureView(list);
+            const items = timelineRef.current;
+            arrivalParkRef.current = {
+              tab,
+              view,
+              cursorKey: items[view.cursor]?.key ?? null,
+              following: view.atBottom && view.cursor === items.length - 1,
+              atKey: typingGuard.keyCount(),
+            };
+          } else arrivalParkRef.current = null;
+        }
         // Wave 3 Task 1: only REGAINING focus is a request for the keys back -- losing it is not a
         // request for anything, and WebKitGTK's DOM focus across the round trip is not guaranteed
         // to have survived (`takeKeys`'s own doc comment), so this is the one place that asks.
@@ -2198,6 +2356,7 @@ export default function App() {
         setDetail(null);
         setHandoffOpen(false);
         cancelBypassConfirm(); // v1, D11/spec §3.4's cancel list
+        arrivalParkRef.current = null; // #22: this lands INPUT, never on a parked row
         setEmptyLanding("input");
         setInputRequest((n) => n + 1);
       } else if (payload.kind === "arrive") {
@@ -2224,6 +2383,7 @@ export default function App() {
         setHandoffOpen(false);
         setChooser(null);
         cancelBypassConfirm(); // v1, D11/spec §3.4's cancel list
+        arrivalParkRef.current = null; // #22: a card landing wins over a parked row
         setPermissionRequest((n) => n + 1);
       } else if (payload.kind === "nav_key") {
         // A key, claimed by GTK before the WebView saw it, so it never reached `answerConfirm`: D1's
@@ -2366,21 +2526,14 @@ export default function App() {
           // The old tab's view is saved from the live refs -- BEFORE the resets below overwrite
           // the render state they mirror -- and only when there IS an old tab (not on mount).
           if (previous !== null) {
-            const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
-            const atBottom = list === null || list.scrollTop + list.clientHeight >= list.scrollHeight - 1;
-            saveView(viewStore.current, previous, {
-              cursor: cursorRef.current,
-              mode: modeRef.current,
-              expanded: expandedRef.current,
-              scrollTop: list?.scrollTop ?? 0,
-              atBottom,
-              detailed: detailedRef.current,
-              // At the bottom, following is what a restore should resume (see the `snapshot` arm's
-              // restore block below), so no threshold is worth remembering -- and `null` there matches
-              // `MessageList`'s own "while following" reset (wave 3, Task 3).
-              unseenAfterSeq: atBottom ? null : unseenAfterSeqRef.current,
-            });
+            saveView(
+              viewStore.current,
+              previous,
+              captureView(containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null),
+            );
           }
+          // #22: an arrival park names a row of the tab just left.
+          arrivalParkRef.current = null;
           restoreRef.current = takeView(viewStore.current, payload.active) ?? null;
           // The box goes empty on a switch, never the left tab's words: Rust's own `draft` envelope
           // for the new tab follows in the same batch (ruling 6), so this is never what the reader
@@ -2988,7 +3141,7 @@ export default function App() {
    *  a button is focused, never clicked, and `Enter` is what presses it afterwards. A target whose
    *  element has left the DOM since it was frozen lands nowhere rather than somewhere else. */
   function landOnHint(target: HintTarget | undefined) {
-    copyCodeRef.current = null;
+    markLandedCode(null);
     if (target === undefined || !target.el.isConnected) return;
     const root = containerRef.current;
     // Landing can scroll the conversation (a focused control, the cursor's row revealed), and that
@@ -3027,8 +3180,15 @@ export default function App() {
     const row = target.kind === "row" ? target.el : root === null ? null : rowOf(root, target.el);
     const rowIndex = root === null || row === null ? null : rowIndexOf(root, row);
     if (rowIndex === null) return;
-    if (target.kind === "code") copyCodeRef.current = target.el;
     setMode("browse");
+    if (target.kind === "code") {
+      markLandedCode(target.el);
+      // K07: reveal the BLOCK, not its row. `revealRow`'s `nearest` on a row taller than the view whose
+      // top is out and bottom in aligns the row's bottom with the list's (CSSOM View's "determine the
+      // scroll-into-view position"), which can carry the block just landed on off the top.
+      if (rowIndex !== cursorRef.current) landingRef.current = "keep";
+      target.el.scrollIntoView({ block: "nearest" });
+    }
     setCursor(rowIndex);
     root?.focus({ preventScroll: true });
   }
@@ -4602,7 +4762,7 @@ export default function App() {
     }
     // A code block HINT landed on is "the item" for exactly the next `y`; any other key moves on.
     const landedCode = copyCodeRef.current;
-    copyCodeRef.current = null;
+    markLandedCode(null);
     // The row the cursor is on, found by structure (`conversationRows`), never as the first
     // `.row-current` or the `cursor`-th `[data-nav-stop="row"]` in the subtree: a model reply's own
     // HTML can carry either (v1 hardening, ruling R2). Read only by the keys that need it.
@@ -5190,7 +5350,10 @@ export default function App() {
       // card's reason box shows BROWSE at once, and the Enter that follows it then denies as the box
       // says, spec §7 finding 1's own accepted reading). Capture phase, ahead of every descendant's
       // own `onClick`/`onMouseDown`.
-      onPointerDownCapture={() => exitRegion()}
+      onPointerDownCapture={() => {
+        exitRegion();
+        arrivalParkRef.current = null; // #22: a press in the panel is a place chosen by hand
+      }}
       onFocus={(event) => {
         // K02 (ruling R3): the focus move a plain Tab just made is a landing, at that Tab's count --
         // consumed by the first focus event after it, so a focus nothing typed (an effect, a later
@@ -5249,6 +5412,7 @@ export default function App() {
           cursor={frozenTimeline === null ? cursor : (indexOfKey(frozenTimeline, timeline[cursor]?.key ?? "") ?? -1)}
           detailed={frozenSnapshot?.detailed ?? detailed}
           focused={paneFocused && !edgeFocused}
+          codeLanded={codeLanded}
           ruleOffers={frozenSnapshot?.ruleOffers ?? ruleOffers}
           yankedKey={yanked?.key ?? null}
           onAnswerPermission={answerPermission}

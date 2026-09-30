@@ -986,9 +986,10 @@ fn build_ui(
     };
 
     // Where the keys land after a module key or a tray chip. Into the agent: on its oldest pending
-    // card if one waits (spec §3.3, `focus_oldest_card`), else BROWSE, on the last row (panel round
-    // 2 plan spec §8, decision 4: reverses 2026-09-19's "control l直接闪cursor"), as every keyboard
-    // arrival there does (`move_focus`).
+    // card if one waits (spec §3.3, `focus_oldest_card`), else BROWSE (panel round 2 plan spec §8,
+    // decision 4: reverses 2026-09-19's "control l直接闪cursor"), as every keyboard arrival there does
+    // (`move_focus`) -- on the last row if the reader was following it, else on the row and scroll
+    // they left (owner decision #22, 2026-09-29; the page decides, `App.tsx`'s `arrive` effect).
     let arrive: Rc<dyn Fn(&ModuleId)> = {
         let agent_panel_handle = agent_panel_handle.clone();
         Rc::new(move |id| {
@@ -1383,8 +1384,9 @@ fn build_ui(
 
     // --- A module takes the keys by keyboard: `Ctrl+h/j/k/l` (`move_focus`, below) and `prefix ;`/
     // `prefix o` (the prefix's `Action::SelectLast`/`SelectNext`) land the same way. A zoom ends
-    // first (spec §3.4), as tmux's `select-pane` does. Arriving in the agent lands in BROWSE, on the
-    // last row (panel round 2 plan spec §8, decision 4: reverses 2026-09-19's "control l直接闪cursor"),
+    // first (spec §3.4), as tmux's `select-pane` does. Arriving in the agent lands in BROWSE (panel
+    // round 2 plan spec §8, decision 4: reverses 2026-09-19's "control l直接闪cursor"), on the last
+    // row if the reader was following it, else where they left it (owner decision #22, 2026-09-29),
     // and `arrive` also drops a bypass prompt. A click on a row does not come through here and
     // still lands in BROWSE on that row. `false`: the module did not take the keys.
     let land_by_key: Rc<dyn Fn(&ModuleId) -> bool> = {

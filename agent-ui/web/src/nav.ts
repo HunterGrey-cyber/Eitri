@@ -389,25 +389,60 @@ function clips(el: HTMLElement): boolean {
   return [style.overflow, style.overflowX, style.overflowY].some((v) => v !== "" && v !== "visible");
 }
 
-function intersects(a: DOMRect, b: DOMRect): boolean {
-  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+/** An axis-aligned box in viewport pixels: what `getBoundingClientRect` gives, reduced to its edges. */
+export type Box = { top: number; bottom: number; left: number; right: number; width: number; height: number };
+
+/** The overlap of two boxes, or `null` when they share no area (touching edges share none). */
+function overlap(a: Box, b: DOMRect | Box): Box | null {
+  const top = Math.max(a.top, b.top);
+  const bottom = Math.min(a.bottom, b.bottom);
+  const left = Math.max(a.left, b.left);
+  const right = Math.min(a.right, b.right);
+  if (bottom <= top || right <= left) return null;
+  return { top, bottom, left, right, width: right - left, height: bottom - top };
 }
 
-/** Whether `el` shows on screen inside `root`: it has a non-zero box, and that box intersects the
- *  root and every ancestor between them that clips its overflow (spec §2.2, "visible inside its own
- *  scroll container"). Every ancestor, not only the nearest: a nested scroller's content is only on
- *  screen where each of them lets it through. */
+function boxOf(r: DOMRect): Box {
+  return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.right - r.left, height: r.bottom - r.top };
+}
+
+/** K07: where anything inside `root` can show, for `el`: the root's box, cut down by every ancestor of
+ *  `el` between them that clips its overflow (the list, or a tool result's own capped box inside it).
+ *  `null` when those leave nothing. */
+export function clipBox(el: HTMLElement, root: HTMLElement): Box | null {
+  let clip: Box | null = boxOf(root.getBoundingClientRect());
+  for (let a = el.parentElement; a !== null && a !== root && clip !== null; a = a.parentElement) {
+    if (clips(a)) clip = overlap(clip, a.getBoundingClientRect());
+  }
+  return clip;
+}
+
+/** K07: the part of `el` that shows inside `root` -- its own box inside `clipBox` -- or `null` when none
+ *  does (or it has no box at all, which is how a hidden element measures). A HINT label is placed on
+ *  this, never on the whole box: a code block whose top is scrolled out of the list has its full box's
+ *  top above the list, where a label drawn over the band above it could not be read. */
+export function visibleBox(el: HTMLElement, root: HTMLElement): Box | null {
+  const box = el.getBoundingClientRect();
+  if (box.width === 0 || box.height === 0) return null;
+  const clip = clipBox(el, root);
+  return clip === null ? null : overlap(clip, box);
+}
+
+/** Whether `el` shows on screen inside `root`: it has a non-zero box, and that box meets the root and
+ *  every ancestor between them that clips its overflow (spec §2.2, "visible inside its own scroll
+ *  container"). Every ancestor, not only the nearest: a nested scroller's content is only on screen
+ *  where each of them lets it through. Exactly "`visibleBox` is not `null`" (K07), so what gets a label
+ *  and where the label goes can never disagree. */
 export function hintVisible(el: HTMLElement, root: HTMLElement): boolean {
-  return boxShows(el.getBoundingClientRect(), el, root);
+  return visibleBox(el, root) !== null;
 }
 
-/** `hintVisible`'s test for one box of `el`'s: non-zero, and inside the root and every clipping ancestor. */
+/** `hintVisible`'s test for one box of `el`'s (one line box of a wrapped link, `firstShownLine`): non-zero,
+ *  and meeting the clip box `el` shows in. */
 function boxShows(box: DOMRect, el: HTMLElement, root: HTMLElement): boolean {
   if (box.width === 0 || box.height === 0) return false;
-  for (let a = el.parentElement; a !== null && a !== root; a = a.parentElement) {
-    if (clips(a) && !intersects(box, a.getBoundingClientRect())) return false;
-  }
-  return intersects(box, root.getBoundingClientRect());
+  const clip = clipBox(el, root);
+  return clip !== null && overlap(clip, box) !== null;
 }
 
 /** Where a HINT label for a link that WRAPS belongs (v1 picks, Task 8, fix round 1, Codex): the first of
@@ -415,8 +450,7 @@ function boxShows(box: DOMRect, el: HTMLElement, root: HTMLElement): boolean {
  *  A link is a target while any part of it shows, and one whose first line has scrolled above the list
  *  but whose last line has not would otherwise be labelled where nothing is drawn. With no line box on
  *  screen, or none reported (jsdom lays nothing out), the bounding box, as before. A first line that only
- *  PARTLY shows is still the first one on screen: its label may hang past the edge by its own height, as a
- *  control at the edge of the list already does. */
+ *  PARTLY shows is still the first one on screen; `HintLayer` clamps its label into the clip box (K07). */
 export function firstShownLine(el: HTMLElement, root: HTMLElement): DOMRect {
   for (const line of Array.from(el.getClientRects())) {
     if (boxShows(line, el, root)) return line;

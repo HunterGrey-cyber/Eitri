@@ -848,8 +848,9 @@ impl AgentPanelHandle {
         );
     }
 
-    /// Where every other keyboard arrival lands: BROWSE, on the last row, following resumed if it
-    /// was, or the view restored as it was left (spec §8, Owner answers Q1). Sent after `Ctrl+l`/a
+    /// Where every other keyboard arrival lands: BROWSE -- on the last row with following resumed if
+    /// the reader was following it, else on the row and scroll they left (owner decision #22,
+    /// 2026-09-29; the page decides, from what it parked when the keys left). Sent after `Ctrl+l`/a
     /// tray chip/`prefix a`'s miss have moved GTK focus into the panel (panel round 2 plan Task 6,
     /// decision 4: reverses 2026-09-19's "control l直接闪cursor"). Mirrors `enter_input` exactly
     /// except for the envelope it dispatches; safe before the page loads for the same reason.

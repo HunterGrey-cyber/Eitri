@@ -1231,3 +1231,30 @@ describe("EmptyTab: C1's navKeyRequest (v1 spec §3.1, §3.5)", () => {
     expect(onNavFallthrough).toHaveBeenCalledTimes(1);
   });
 });
+
+/* K04 (2026-09-29): a tab failing while its composer holds the keys hands them to this screen's own
+   root, in BROWSE, rather than leaving them in a disabled textarea for WebKit's focus fix-up to drop
+   on <body>. */
+describe("EmptyTab: K04, a failure while the composer has the keys", () => {
+  it("focuses the root and reports BROWSE when the tab turns failed", () => {
+    const onModeChange = vi.fn();
+    const rendered = renderEmpty({ tab: { ...TAB, state: "starting" }, onModeChange, focusRequest: 1 });
+    const textarea = rendered.container.querySelector("textarea")!;
+    act(() => textarea.focus());
+    expect(document.activeElement).toBe(textarea);
+    rendered.rerender(
+      <EmptyTab {...rendered.props} onModeChange={onModeChange} focusRequest={1} tab={{ ...TAB, state: "failed" }} failure="boom" />,
+    );
+    expect(document.activeElement).toBe(rendered.container.querySelector(".empty-tab"));
+    expect(onModeChange).toHaveBeenLastCalledWith("browse");
+    fireEvent.keyDown(document.activeElement!, { key: "r" });
+    expect(rendered.props.onReset).toHaveBeenCalledTimes(1);
+  });
+  it("leaves the keys alone under an overlay", () => {
+    const rendered = renderEmpty({ tab: { ...TAB, state: "starting" } });
+    const textarea = rendered.container.querySelector("textarea")!;
+    act(() => textarea.focus());
+    rendered.rerender(<EmptyTab {...rendered.props} overlayOpen={true} tab={{ ...TAB, state: "failed" }} failure="boom" />);
+    expect(document.activeElement).toBe(textarea);
+  });
+});

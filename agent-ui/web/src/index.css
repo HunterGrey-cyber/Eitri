@@ -2282,6 +2282,27 @@ textarea,
   color: var(--nv-fg);
   box-shadow: inset 0 0 0 1.5px var(--nv-fg);
 }
+/* K07: a code block the global f HINT landed on is "the item" until the next key (`y` copies it, `v`
+   starts inside it). It is drawn as the block's own outline in the body's ink, thinner while the panel
+   does not have the keys (the solid/hollow rule), and the current row's sign steps back to hollow
+   meanwhile, as for a control focused inside the row: one solid mark at a time, and the hollow one says
+   which row `j`/`k` continue from. An attribute each (`App.tsx`'s `markLandedCode`), not `:has()` and
+   not focus on the `pre`: a focused non-control would enter `./nav`'s "the selected control is the
+   focused one" logic. */
+.message-list pre.code-block[data-hint-landed] {
+  outline-style: solid;
+  outline-width: 2px;
+  outline-color: var(--nv-fg);
+  outline-offset: -2px;
+}
+.message-list[data-focused="false"] pre.code-block[data-hint-landed] {
+  outline-width: 1.5px;
+}
+.message-list[data-code-landed] .row-current .row-sign {
+  background: none;
+  color: var(--nv-fg);
+  box-shadow: inset 0 0 0 1.5px var(--nv-fg);
+}
 
 /* The global f HINT's labels (spec 2026-09-19-global-hint-design.md). The IncSearch pair, so a
    label reads as a transient jump target and never as the solid cursor. `hint-fg` is guarded for

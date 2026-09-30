@@ -370,6 +370,28 @@ export function EmptyTab(props: EmptyTabProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.arriveRequest]);
+  /* K04 (2026-09-29): a tab that fails while its composer has the keys disables the focused
+     textarea, and WebKit's focus fix-up drops the keys on <body> -- a failed tab's `r` then depended
+     on the document replay alone. The root takes the keys first, then BROWSE (defect 4's ordering, as
+     `Esc` and `arrive` above). Not a copy of the live layout's `[sessionEnded]` effect, which only ends
+     VISUAL and sets BROWSE and takes no focus: there the replay's target, the conversation's own root,
+     handles the keys itself, where this layout's replay needed K04's fix to find `.empty-tab`. Only when the keys
+     are in this screen's dead composer or nowhere in it (a failure while the panel does not have the
+     keys focuses DOM-wise only; the next `arrive` lands here anyway), and never under an overlay. */
+  const wasFailed = useRef(failed);
+  useEffect(() => {
+    const turnedFailed = failed && !wasFailed.current;
+    wasFailed.current = failed;
+    if (!turnedFailed || props.overlayOpen) return;
+    const root = rootRef.current;
+    if (root === null) return;
+    const active = document.activeElement;
+    const deadControl = active instanceof HTMLTextAreaElement && active.disabled;
+    if (root.contains(active) && !deadControl) return;
+    root.focus({ preventScroll: true });
+    setMode("browse");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [failed]);
   /** Wave 3 Task 1: `App`'s own `[keysRequest]` effect bumps this directly (there is no
    *  `containerRef` on this layout for it to check). A no-op when the root already contains the
    *  active element -- WebKitGTK's DOM focus across a GTK round trip may well have survived, and a
@@ -493,6 +515,9 @@ export function EmptyTab(props: EmptyTabProps) {
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (props.answerConfirm?.(event)) return;
+    // K04 fix round: an overlay drawn over this screen (the chooser, a rename) owns the keys; one that
+    // reaches this root anyway (replayed off <body>) must not act on the tab behind it.
+    if (props.overlayOpen) return;
     // Every other keydown is "a key" to the typing guard, first, as `App.tsx`'s own `onKeyDown` does
     // (v1 S1): the leader below asks it whether it stood alone.
     const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
