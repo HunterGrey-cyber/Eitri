@@ -19,6 +19,7 @@ mod module_grid;
 mod nvim_keys;
 mod pane_focus;
 mod pane_switch;
+mod panel_pacer;
 mod panel_super;
 mod prefix;
 mod prefix_strip;
@@ -352,6 +353,25 @@ fn build_ui(
             }
         },
     };
+
+    // How often the agent panel's stream reaches its page while the user types in the editor
+    // (owner decision #37: an even cadence, not a hold; `neovibe_core::panel_cadence`). Unset is
+    // `DEFAULT_CADENCE_HZ` (5) a second; `"off"` is today's full rate; anything else is a startup failure naming the key, like
+    // `agent.font_size` above.
+    let typing_cadence = match neovibe_core::panel_cadence::parse_config(
+        lua_engine.config.borrow().get(neovibe_core::panel_cadence::CADENCE_KEY),
+    ) {
+        Ok(cadence) => cadence,
+        Err(message) => {
+            eprintln!("neovibe: {message}");
+            std::process::exit(1);
+        }
+    };
+    match typing_cadence {
+        Some(hz) => eprintln!("[panel] stream cadence while typing in the editor: {hz}/s"),
+        None => eprintln!("[panel] stream cadence while typing in the editor: off (full rate)"),
+    }
+    agent_panel_handle.set_typing_cadence(typing_cadence);
 
     // What a card for a hidden chat does (modules P2, spec §3.3, decision b): the tray's chip and a
     // toast, or with `reveal` the chat itself. Anything but `badge`/`reveal` is a startup failure
@@ -781,6 +801,12 @@ fn build_ui(
             agent_panel_handle.set_editor_row_px(css_px);
         });
     }
+    // A key the user pressed in the editor reached nvim: the typing window that paces the agent
+    // panel's stream (`AgentPanelHandle::note_editor_key`). A notification only.
+    {
+        let agent_panel_handle = agent_panel_handle.clone();
+        pane.connect_key_activity(move || agent_panel_handle.note_editor_key());
+    }
     // ...and the moment WebKitGTK re-zooms the panel: it follows `notify::gtk-xft-dpi` live
     // (`webkit_zoom`'s module doc), so the same row is a different number of CSS px afterwards.
     // The live value, not the notified one: `xft_dpi`'s own handler may already have replaced it.
@@ -948,7 +974,11 @@ fn build_ui(
             move |id, has_keys| {
                 println!("[pane_focus] {id} has_keys={has_keys}");
                 match id.kind() {
-                    ModuleKind::Editor => editor.set_focused(has_keys),
+                    ModuleKind::Editor => {
+                        editor.set_focused(has_keys);
+                        // The typing window only counts while the editor holds the keys.
+                        agent_panel_handle.set_editor_has_keys(has_keys);
+                    }
                     ModuleKind::Agent => agent_panel_handle.set_pane_focused(has_keys),
                     ModuleKind::Terminal => terminal.set_focused(has_keys),
                     _ => {}

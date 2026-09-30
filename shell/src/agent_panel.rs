@@ -667,6 +667,9 @@ impl AgentPanelHandle {
         eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
         // The page that said `ready` is going; the tick holds its envelopes until the new one does.
         self.state.borrow_mut().document_ready = false;
+        // What the typing cadence still holds is in the projection, hence in the new page's snapshot.
+        let discarded = crate::panel_pacer::pacer_for(webview).borrow_mut().discard_pending();
+        trace_discarded_first_texts(&self.state, discarded);
         // And so is the mode it reported: until the new page's `ready`, nothing is BROWSE or INPUT.
         forget_the_pages_nav_mode(&self.state.borrow());
         let vars = self.state.borrow().theme.css_vars();
@@ -723,6 +726,8 @@ impl AgentPanelHandle {
                     "Reload it by hand with \u{21bb} in the top bar, or prefix r.",
                 );
                 if let Some(webview) = &self.webview {
+                    let discarded = crate::panel_pacer::pacer_for(webview).borrow_mut().discard_pending();
+                    trace_discarded_first_texts(&self.state, discarded);
                     webview.load_html(&html, Some(PANEL_BASE_URI));
                 }
             }
@@ -807,6 +812,8 @@ impl AgentPanelHandle {
     fn dispatch(&self, payload: String, what: &'static str) {
         // No page at all (`webview`'s own doc): nothing is listening, as before a page loads.
         let Some(webview) = &self.webview else { return };
+        // Behind whatever the typing cadence is holding, as `evaluate_js_dispatch` is.
+        crate::panel_pacer::flush(webview);
         let script = format!(
             "window.__neovibeDispatch && window.__neovibeDispatch({});",
             serde_json::to_string(&payload).unwrap_or_default()
@@ -816,6 +823,36 @@ impl AgentPanelHandle {
                 eprintln!("[agent_panel] {what} dispatch failed: {e}");
             }
         });
+    }
+
+    /// The user pressed a key in the editor and it reached nvim (`NeovideEditorPane::
+    /// connect_key_activity`). Starts, or extends, the typing window that paces the stream
+    /// (`crate::panel_pacer`). O(1): it runs in the press's path.
+    pub(crate) fn note_editor_key(&self) {
+        if let Some(webview) = &self.webview {
+            crate::panel_pacer::pacer_for(webview)
+                .borrow_mut()
+                .note_editor_key(std::time::Instant::now());
+        }
+    }
+
+    /// Whether the editor holds the window's keys (`pane_focus`). Losing them ends the typing window
+    /// at once: the next tick releases what is held.
+    pub(crate) fn set_editor_has_keys(&self, has_keys: bool) {
+        if let Some(webview) = &self.webview {
+            crate::panel_pacer::pacer_for(webview)
+                .borrow_mut()
+                .set_editor_has_keys(has_keys);
+        }
+    }
+
+    /// `agent.typing_cadence_hz` as `init.lua` left it (`None`: `"off"`), applied once after it ran.
+    pub(crate) fn set_typing_cadence(&self, cadence_hz: Option<u32>) {
+        if let Some(webview) = &self.webview {
+            crate::panel_pacer::pacer_for(webview)
+                .borrow_mut()
+                .set_cadence(cadence_hz);
+        }
     }
 
     /// Records whether this panel's pane has keyboard focus and tells the live document, which
@@ -1483,6 +1520,7 @@ fn panel_state(
 ///
 /// Then the `tabs` envelope and `hello` go out if what they describe changed.
 fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
+    let pacer = crate::panel_pacer::pacer_for(&webview);
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(PUMP_POLL_INTERVAL_MS), move || {
         // The window has been closed and its tabs taken; everything below would be a no-op
         // against a destroyed window for as long as the close watch holds the application. Stop
@@ -1503,7 +1541,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
         // message handler takes the same `RefCell`, and anything that let it run during the
         // dispatch would panic on an already-borrowed cell rather than fail gracefully.
-        let (payload, first_text, turn_ended, offers_changed, tripped) = {
+        let (payload, class, first_text, turn_ended, offers_changed, tripped) = {
             let mut state_ref = state.borrow_mut();
             let state_ref = &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
@@ -1542,9 +1580,26 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
             if let Some(supervisor) = state_ref.supervisor.as_mut() {
                 supervisor.send_status(status);
             }
+            // Whose first text the payload carries, kept with it: the cadence may release it after
+            // the active tab, or that tab's turn, has changed (`panel_pacer::FirstText`).
+            let first_text = if out.first_text {
+                let active = state_ref.tabs.active();
+                state_ref
+                    .tabs
+                    .active_tab()
+                    .turn_trace
+                    .as_ref()
+                    .map(|trace| crate::panel_pacer::FirstText {
+                        tab: active,
+                        turn: trace.submitted_at(),
+                    })
+            } else {
+                None
+            };
             (
                 out.active_payload,
-                out.first_text,
+                out.active_class,
+                first_text,
                 out.turn_ended,
                 out.offers_changed,
                 out.tripped,
@@ -1560,14 +1615,34 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 evaluate_js_dispatch(&webview, &serialize_error_for_js(tripped.tab, &tripped.reason));
             }
         }
-        if let Some(payload) = payload {
-            evaluate_js_dispatch(&webview, &payload);
-            // Stamped after the dispatch call, which is where the WebView's own clock starts.
+        // The stream goes through the typing cadence (`crate::panel_pacer`): held for the next
+        // slot while the user types in the editor, if it is plain streamed content; at once
+        // otherwise, and always at once into a page that has not said `ready` (its snapshot
+        // follows), as before. Whatever a slot or the end of the typing window releases goes out
+        // in this same tick.
+        let page_ready = state.borrow().document_ready;
+        {
+            let sink = crate::panel_pacer::WebViewSink(&webview);
+            let mut pacer = pacer.borrow_mut();
+            let now = std::time::Instant::now();
+            if let Some(payload) = payload {
+                let class = if page_ready {
+                    class
+                } else {
+                    neovibe_core::panel_cadence::EnvelopeClass::Immediate
+                };
+                pacer.send_stream(&sink, payload, first_text, class, now);
+            }
+            pacer.poll(&sink, now, page_ready);
+        }
+        let sent = pacer.borrow_mut().take_sent();
+        // Stamped at the dispatch call that really sent it -- where the WebView's own clock starts,
+        // which under the cadence may be a later tick or a flush between ticks -- for the tab and
+        // turn it was pumped for.
+        stamp_first_text_dispatches(&state, sent.first_text);
+        if sent.any {
             let mut state_ref = state.borrow_mut();
             if let Some(trace) = state_ref.tabs.active_tab_mut().turn_trace.as_mut() {
-                if first_text {
-                    trace.mark_first_text_dispatched();
-                }
                 if trace.is_complete() {
                     trace.emit();
                 }
@@ -2584,6 +2659,46 @@ fn apply_outcome(
     }
 }
 
+/// Applies the pacer's first-text stamps (`panel_pacer::Sent::first_text`): each to the tab and turn
+/// its envelope was pumped for, at the moment it was handed to the page -- never to whichever tab
+/// is active when this runs, and never to a later turn of the same tab
+/// (`TurnTrace::mark_first_text_dispatched_for`). Called by the pump tick and before a
+/// `turn_rendered` report is folded.
+fn stamp_first_text_dispatches(
+    state: &Rc<RefCell<AgentPanelState>>,
+    stamps: Vec<(crate::panel_pacer::FirstText, std::time::Instant)>,
+) {
+    if stamps.is_empty() {
+        return;
+    }
+    let mut state_ref = state.borrow_mut();
+    for (first, at) in stamps {
+        if let Some(trace) = state_ref.tabs.get_mut(first.tab).and_then(|t| t.turn_trace.as_mut()) {
+            if trace.mark_first_text_dispatched_for(first.turn, at) && trace.is_complete() {
+                trace.emit();
+            }
+        }
+    }
+}
+
+/// The first texts the pacer threw away (`Pacer::discard_pending`: a reload, a fresh `ready`, the
+/// give-up page) reach the panel inside a snapshot, which it reports no paint for: each turn's
+/// trace stops waiting for one, and prints now if that leaves nothing else to wait for -- no later
+/// dispatch of this turn is coming to print it if the turn has already ended.
+fn trace_discarded_first_texts(state: &Rc<RefCell<AgentPanelState>>, discarded: Vec<crate::panel_pacer::FirstText>) {
+    if discarded.is_empty() {
+        return;
+    }
+    let mut state_ref = state.borrow_mut();
+    for first in discarded {
+        if let Some(trace) = state_ref.tabs.get_mut(first.tab).and_then(|t| t.turn_trace.as_mut()) {
+            if trace.mark_first_text_in_snapshot_for(first.turn) && trace.is_complete() {
+                trace.emit();
+            }
+        }
+    }
+}
+
 fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     let Some(message) = parse_inbound_message(raw) else {
         // Already logged inside parse_inbound_message -- an unparseable/unrecognized message
@@ -2614,6 +2729,11 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
 
     match message {
         InboundMessage::Ready { .. } => {
+            // A stream envelope the typing cadence still holds is already in the snapshot below
+            // (it was drained from the queue and folded into the projection before it was held);
+            // sent after that snapshot it would draw the same text twice.
+            let discarded = crate::panel_pacer::pacer_for(webview).borrow_mut().discard_pending();
+            trace_discarded_first_texts(state, discarded);
             // Everything a fresh document is owed is decided by one pure function, so the reload
             // path is testable without a WebView -- see `ready_payloads`. Wave 4 R2 (owner: "默认
             // 界面是new session这个界面，不用默认弹到all session界面"): a `ready` never opens the
@@ -2840,6 +2960,14 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             // Purely a diagnostic: no command_result, and nothing downstream reads it. A WebView
             // that never sends one costs only a missing column in a trace line.
             let tab = tab_of(target);
+            // A flush between ticks (a focus change, a tab switch) may have released the first
+            // text after the last tick: its stamp is applied first, or this report -- which the
+            // page sends only once -- would find no dispatch to measure from and be dropped.
+            let stamps = crate::panel_pacer::pacer_for(webview)
+                .try_borrow_mut()
+                .map(|mut pacer| pacer.take_first_text())
+                .unwrap_or_default();
+            stamp_first_text_dispatches(state, stamps);
             let mut state_ref = state.borrow_mut();
             if let Some(trace) = state_ref.tabs.get_mut(tab).and_then(|t| t.turn_trace.as_mut()) {
                 trace.mark_painted(receive_to_frame_ms);
@@ -3628,16 +3756,11 @@ const PANEL_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'uns
 /// the CSP is.
 const PANEL_NETWORK_PROXY_URI: &str = "http://127.0.0.1:9";
 
+/// Sends one envelope to the page, never delayed -- and never ahead of a stream envelope the typing
+/// cadence is still holding (`crate::panel_pacer`): whatever waits goes first, so the page sees
+/// things in the order they happened. The only way this module puts an envelope in the page.
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
-    let script = format!(
-        "window.__neovibeDispatch({});",
-        serde_json::to_string(json_payload).unwrap_or_default()
-    );
-    webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
-        if let Err(e) = result {
-            eprintln!("[agent_panel] evaluate_javascript failed: {e}");
-        }
-    });
+    crate::panel_pacer::send_immediate(webview, json_payload);
 }
 
 /// Installs `app.reload-agent-panel`, which the top bar's `↻` and `prefix r` (keymap spec §2.1)

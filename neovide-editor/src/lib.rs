@@ -465,6 +465,8 @@ pub struct NeovideEditorPane {
     cell_size_callback: CellSizeCallbackSlot,
     /// See [`NeovideEditorPane::on_start_failed`].
     start_failed_callback: StartFailedCallbackSlot,
+    /// See [`NeovideEditorPane::connect_key_activity`].
+    key_activity: keyboard::KeyActivity,
     /// The tick callback's registration and the event-loop fd watch (`tick_driver`).
     tick_driver: Rc<TickDriver>,
 }
@@ -1141,7 +1143,8 @@ impl NeovideEditorPane {
         // what this wires onto `gl_area` (GtkIMMulticontext composition + GtkEventControllerKey
         // plain-text input). The constructed `IMMulticontext` is handed back so it can be stored
         // in `Self::im_context` below for `grab_focus()` to use later.
-        let im_context = keyboard::attach_keyboard_input(&gl_area, &live_state);
+        let key_activity = keyboard::KeyActivity::default();
+        let im_context = keyboard::attach_keyboard_input(&gl_area, &live_state, &key_activity);
 
         // --- mouse input: three GTK4 controllers on the GLArea for click/drag-selection/
         // scroll-wheel. All three share the exact content_region/grid-scale coordinate math
@@ -1890,6 +1893,7 @@ impl NeovideEditorPane {
             scale_watch,
             cell_size_callback,
             start_failed_callback,
+            key_activity,
             tick_driver,
         }
     }
@@ -2224,6 +2228,18 @@ impl NeovideEditorPane {
     /// Replaces any earlier callback.
     pub fn connect_cell_size_changed(&self, callback: impl Fn(f64, f64) + 'static) {
         *self.cell_size_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Registers `callback`, called each time a key the user pressed in this pane (or an input
+    /// method's commit) has been handed to nvim -- a notification and nothing else: what reaches
+    /// nvim is unchanged, and a key nvim could not take (not started, exited) is not reported. For
+    /// a host that wants to know the user is typing (`shell` quiets the agent panel's stream
+    /// while they do). Not called for [`send_keys`](Self::send_keys), a host handing a key on or
+    /// driving a scratch round trip, nor for the mouse. Called from the key handler with no borrow
+    /// of this pane held, so it may call back in; keep it short, it runs in the press's path.
+    /// Replaces any earlier callback.
+    pub fn connect_key_activity(&self, callback: impl Fn() + 'static) {
+        self.key_activity.set(callback);
     }
 
     /// Registers a callback fired (at most once) when the tick callback observes that nvim

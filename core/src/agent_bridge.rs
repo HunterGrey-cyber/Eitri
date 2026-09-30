@@ -606,6 +606,17 @@ pub fn serialize_pane_focus_for_js(focused: bool) -> String {
     json!({ "kind": "pane_focus", "focused": focused }).to_string()
 }
 
+/// `{"kind":"editor_typing","typing":bool,"periodMs":n}`: whether the user is typing in the editor
+/// (`panel_cadence`: the editor holds the keys and pressed one within the last 500 ms), and the
+/// gap between the panel's stream pushes while they do. The page slows its own self-driven motion
+/// (the turn meter) to no faster than one repaint per `periodMs` while `typing` is true, so it
+/// never causes more frame-clock cycles than the cadence does. Sent only when that changes
+/// something -- a cadence slower than the meter's own step (`panel_cadence::SELF_DRIVEN_STEP_MS`)
+/// -- and again after every document load while typing. Window-level: no tab.
+pub fn serialize_editor_typing_for_js(typing: bool, period_ms: u32) -> String {
+    json!({ "kind": "editor_typing", "typing": typing, "periodMs": period_ms }).to_string()
+}
+
 /// `{"kind":"enter_input"}`: the user moved INTO the panel with the keyboard (`Ctrl+l` from the
 /// editor), so the panel should open its composer with a blinking caret, the way it did before the
 /// three-mode rework made BROWSE the landing mode. The owner asked for exactly that (2026-09-19):
@@ -1599,6 +1610,20 @@ mod tests {
     // the same reason `serializes_focus_permission` and the `confirm_close_others` test above parse
     // rather than compare raw strings), so this checks the exact two wire spellings the Interfaces
     // block gives ("down"/"up") through a parsed `Value` rather than a literal byte string.
+    #[test]
+    fn serializes_editor_typing_with_its_period() {
+        let v: serde_json::Value = serde_json::from_str(&serialize_editor_typing_for_js(true, 500)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "kind": "editor_typing", "typing": true, "periodMs": 500 })
+        );
+        let v: serde_json::Value = serde_json::from_str(&serialize_editor_typing_for_js(false, 1000)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "kind": "editor_typing", "typing": false, "periodMs": 1000 })
+        );
+    }
+
     #[test]
     fn serializes_nav_key_for_both_directions() {
         let v: serde_json::Value = serde_json::from_str(&serialize_nav_key_for_js(NavKeyDirection::Down)).unwrap();

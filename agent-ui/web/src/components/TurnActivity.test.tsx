@@ -84,3 +84,38 @@ describe("TurnActivity", () => {
     expect(container.querySelector(".turn-elapsed")).toBeNull();
   });
 });
+
+// Owner decision #37 (revised 2026-09-29): while the user types in the editor the page slows the
+// meter to the panel's cadence, but it never pauses the motion the turn is showing, and the elapsed
+// clock (one repaint a second, never faster than the slowest cadence Rust accepts) is left alone.
+describe("TurnActivity while the user types in the editor", () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute("data-editor-typing");
+    document.documentElement.style.removeProperty("--meter-step");
+  });
+
+  it("keeps the meter mounted and the elapsed clock ticking once a second", async () => {
+    const { applyEditorTyping } = await import("../typingCadence");
+    vi.useFakeTimers();
+    try {
+      applyEditorTyping(document.documentElement, true, 1000);
+      const since = Date.now();
+      const { container } = render(<TurnActivity phase={{ kind: "replying" }} clock={{ turnId: "t1", since, exact: true }} />);
+      const meter = container.querySelector(".meter-fill");
+      expect(meter).not.toBeNull();
+      expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s");
+      for (let second = 1; second <= 3; second += 1) {
+        act(() => {
+          vi.advanceTimersByTime(1000);
+        });
+        expect(container.querySelector(".turn-elapsed")?.textContent).toBe(`${second}s`);
+      }
+      expect(container.querySelector(".meter-fill")).toBe(meter);
+      // Never paused: nothing inline stops the animation, and the typing state is only the variable.
+      expect((meter as HTMLElement).style.animationPlayState).toBe("");
+      expect(document.documentElement.style.getPropertyValue("--meter-step")).toBe("1000ms");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

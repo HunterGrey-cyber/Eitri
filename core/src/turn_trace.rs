@@ -182,6 +182,40 @@ impl TurnTrace {
         }
     }
 
+    /// When this turn was submitted: what identifies the turn to a caller that stamps it later
+    /// ([`mark_first_text_dispatched_for`](Self::mark_first_text_dispatched_for)).
+    pub fn submitted_at(&self) -> Instant {
+        self.submitted_at
+    }
+
+    /// [`mark_first_text_dispatched`](Self::mark_first_text_dispatched) for a payload that was
+    /// handed to the WebView at `at`, earlier than now, and that belongs to the turn submitted at
+    /// `turn`. The panel's typing cadence can hold the first text and release it from a flush
+    /// between pump ticks (a tab switch, a focus change); the stamp is applied afterwards, to the
+    /// tab it was held for, at the moment it really went. A stamp for another turn (the tab has
+    /// started a new one since) is ignored, as is a second one. Returns whether it was taken.
+    pub fn mark_first_text_dispatched_for(&mut self, turn: Instant, at: Instant) -> bool {
+        if turn != self.submitted_at || self.first_text_dispatched.is_some() {
+            return false;
+        }
+        self.first_text_dispatched = Some(at.saturating_duration_since(self.submitted_at));
+        true
+    }
+
+    /// The payload carrying the first text of the turn submitted at `turn` was thrown away
+    /// undelivered, because a snapshot the panel is about to get (a document reload's `ready`)
+    /// carries the text. The panel measures a paint only for text it received as events, so no
+    /// report is coming for this turn: the trace stops waiting for one (`in_snapshot`, printed as
+    /// `first_paint_frame=snapshot`). A mark for another turn, or for a text that did go out as an
+    /// envelope (a paint report may still come), is ignored. Returns whether it was taken.
+    pub fn mark_first_text_in_snapshot_for(&mut self, turn: Instant) -> bool {
+        if turn != self.submitted_at || self.first_text_dispatched.is_some() {
+            return false;
+        }
+        self.in_snapshot = true;
+        true
+    }
+
     /// The WebView's own receive-to-animation-frame span for that payload. Ignored if it arrives
     /// twice, or before the dispatch it refers to.
     pub fn mark_painted(&mut self, receive_to_frame_ms: f64) {
@@ -369,6 +403,45 @@ mod tests {
         assert!(trace.is_finished());
     }
 
+    /// A reload while the typing cadence holds the turn's first text: the envelope is thrown away
+    /// because the `ready` snapshot carries the text, so the page reports no paint for it and the
+    /// line must not wait for one (it used to never print).
+    #[test]
+    fn a_first_text_thrown_away_for_a_snapshot_finishes_the_trace_without_a_paint() {
+        let mut trace = trace();
+        trace.observe(&[AgentDomainEvent::TurnStarted { turn_id: "t1".into() }, text("hi")]);
+        trace.observe(&[AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        }]);
+        assert!(!trace.is_complete(), "waiting for a paint report");
+        let turn = trace.submitted_at();
+        assert!(
+            !trace.mark_first_text_in_snapshot_for(turn + Duration::from_millis(1)),
+            "another turn's first text is not this trace's"
+        );
+        assert!(!trace.is_complete());
+        assert!(trace.mark_first_text_in_snapshot_for(turn));
+        assert!(trace.is_complete(), "nothing is coming for text the snapshot carried");
+        assert!(trace.line().contains("first_paint_frame=snapshot"), "{}", trace.line());
+    }
+
+    #[test]
+    fn a_first_text_that_was_dispatched_is_not_marked_as_in_a_snapshot() {
+        let mut trace = trace();
+        trace.observe(&[text("hi")]);
+        trace.mark_first_text_dispatched();
+        assert!(
+            !trace.mark_first_text_in_snapshot_for(trace.submitted_at()),
+            "it went out as an envelope: a paint report may still come"
+        );
+        assert!(trace.first_text_dispatched.is_some());
+        assert!(!trace.in_snapshot);
+    }
+
     #[test]
     fn a_background_turn_is_complete_without_a_paint_and_says_so() {
         let mut trace = trace();
@@ -435,5 +508,27 @@ mod tests {
         trace.emit();
         assert!(trace.emitted);
         trace.emit(); // no panic, no second line
+    }
+
+    /// Fix round 1 (panel stream cadence): a first text the cadence released between ticks is
+    /// stamped at the moment it went, for the turn it was held for -- never for a later turn, and
+    /// a paint report that follows is measured from that moment.
+    #[test]
+    fn a_late_stamp_counts_from_when_the_text_went_and_only_for_its_own_turn() {
+        let mut trace = trace();
+        let turn = trace.submitted_at();
+        assert!(trace.observe(&[text("hi")]));
+        let went = turn + Duration::from_millis(40);
+        assert!(
+            !trace.mark_first_text_dispatched_for(turn + Duration::from_nanos(1), went),
+            "another turn's stamp"
+        );
+        assert!(trace.mark_first_text_dispatched_for(turn, went));
+        assert!(
+            !trace.mark_first_text_dispatched_for(turn, went + Duration::from_millis(5)),
+            "taken once"
+        );
+        trace.mark_painted(15.0);
+        assert_eq!(trace.first_paint_frame, Some(Duration::from_millis(55)));
     }
 }

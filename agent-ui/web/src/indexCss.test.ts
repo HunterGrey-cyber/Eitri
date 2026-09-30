@@ -6,6 +6,10 @@ import css from "./index.css?raw";
 // "every --nv-* this stylesheet reads is one Rust actually emits" at the bottom of this file for
 // why the allowed names are derived from this source rather than written down here.
 import tokensRs from "../../../core/src/theme/tokens.rs?raw";
+// The pacer's threshold for telling the page that the user is typing is the meter's own step; the
+// number lives in both languages, so this file holds them equal (see the typing-cadence test below).
+import panelCadenceRs from "../../../core/src/panel_cadence.rs?raw";
+import { NATURAL_METER_STEP_MS } from "./typingCadence";
 // The sideways guard below renders the panel's real `<pre>`s (the GUI pass, 2026-09-24).
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -1063,7 +1067,9 @@ describe("index.css", () => {
     // `jump-none` emits {0, 1/3, 2/3, 1}, so the scale is exactly {0.25, 0.5, 0.75, 1}.
     const fill = withoutComments.match(/\.turn-activity \.meter-fill \{[^}]*\}/);
     expect(fill).not.toBeNull();
-    expect(fill![0]).toMatch(/animation: turn-meter 1200ms steps\(4, jump-none\) infinite;/);
+    // The duration is four steps of `--meter-step` (300ms unless the typing cadence slows it; the
+    // test after this one holds that half), so the resting shorthand is the original 1200ms.
+    expect(fill![0]).toMatch(/animation: turn-meter calc\(var\(--meter-step, 300ms\) \* 4\) steps\(4, jump-none\) infinite;/);
 
     // (2) Reduced motion. `animation: none` alone left the computed transform at the initial
     // `none` -- the identity -- so `width: 100%` of the 4ch meter painted a FULL bar, which is the
@@ -1084,6 +1090,34 @@ describe("index.css", () => {
     // transform, so the same extraction finds nothing to rest at.
     const bare = "@media (prefers-reduced-motion: reduce) {\n  .turn-activity .meter-fill {\n    animation: none;\n  }\n}";
     expect(bare).not.toContain("transform:");
+  });
+
+  it("lets the typing cadence slow the meter through --meter-step, never pause it, and keeps Rust's threshold equal to the meter's step (decision #37)", () => {
+    const fill = withoutComments.match(/\.turn-activity \.meter-fill \{[^}]*\}/);
+    expect(fill).not.toBeNull();
+    const shorthand = fill![0].match(
+      /animation: turn-meter calc\(var\(--meter-step, (\d+)ms\) \* (\d+)\) steps\((\d+), jump-none\) infinite;/,
+    );
+    expect(shorthand).not.toBeNull();
+    const [, fallbackMs, factor, steps] = shorthand!;
+    // One visible state lasts `--meter-step`: the duration is that times the number of states, so a
+    // step of 500ms really is 500ms between repaints, not 125.
+    expect(Number(factor)).toBe(Number(steps));
+    // Nothing set, the meter costs one repaint per 300ms (1200ms over four states) -- design §3.
+    expect(Number(fallbackMs)).toBe(NATURAL_METER_STEP_MS);
+    expect(Number(fallbackMs) * Number(steps)).toBe(1200);
+    // The same number, in Rust, decides whether the page is told about typing at all
+    // (`panel_cadence::SELF_DRIVEN_STEP_MS`): a cadence at least that slow is the only one the meter
+    // could outpace. If the CSS step moves and this does not, the page is silently not told.
+    const rust = panelCadenceRs.match(/pub const SELF_DRIVEN_STEP_MS: u32 = (\d+);/);
+    expect(rust, "core/src/panel_cadence.rs names SELF_DRIVEN_STEP_MS").not.toBeNull();
+    expect(Number(rust![1])).toBe(NATURAL_METER_STEP_MS);
+    // "Slowed, never paused" (the owner: the stream must stay smooth, not stop): no rule anywhere in
+    // the sheet pauses an animation, and the typing attribute has no rule of its own that could.
+    expect(withoutComments).not.toMatch(/animation-play-state/i);
+    expect(withoutComments).not.toMatch(/data-editor-typing/);
+    // Negative control: a pause would be seen by the same check.
+    expect(".turn-activity .meter-fill { animation-play-state: paused; }").toMatch(/animation-play-state/i);
   });
 
   it("keeps the meter's keyframes to transform only -- geometry cannot break the contrast guarantee, colour and alpha can (design §7.1)", () => {

@@ -180,6 +180,10 @@ type InboundHandler = (
      *  `window` focus/blur: `shell` arbitrates Ctrl+h/Ctrl+l, and the same answer drives the
      *  status bar and the pane outline, so the three agree. */
     | { kind: "pane_focus"; focused: boolean }
+    /** Whether the user is typing in the editor, and the gap between the panel's stream pushes
+     *  while they do (`typingCadence.ts`; `serialize_editor_typing_for_js`, `core/src/agent_bridge.rs`).
+     *  Window-level, and Rust's word is the only one: nothing in the page clears it. */
+    | { kind: "editor_typing"; typing: boolean; periodMs: number }
     /** A brand-new tab's own arrival: open the composer with the caret in it. This is `enter_input`'s
      *  only sender now (panel round 2, spec §8, decision 4) -- every other keyboard arrival that used
      *  to send this now sends `arrive` instead. A click on a row still lands in BROWSE on that row.
@@ -291,6 +295,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "handoff" ||
         obj.kind === "theme" ||
         obj.kind === "pane_focus" ||
+        obj.kind === "editor_typing" ||
         obj.kind === "enter_input" ||
         obj.kind === "arrive" ||
         obj.kind === "keymap" ||

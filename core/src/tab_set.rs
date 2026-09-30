@@ -372,6 +372,11 @@ impl Tab {
 pub struct PumpOutput {
     /// The active tab's `events` or `snapshot` envelope, if it had any.
     pub active_payload: Option<String>,
+    /// How urgent `active_payload` is (`panel_cadence`): [`EnvelopeClass::Stream`] only for an
+    /// `events` envelope made entirely of streamed content with no call notes; a snapshot, a card,
+    /// a turn's start or end and everything else is [`EnvelopeClass::Immediate`]. Meaningless when
+    /// there is no payload.
+    pub active_class: crate::panel_cadence::EnvelopeClass,
     /// The active tab's turn trace saw its first text in this batch.
     pub first_text: bool,
     /// Tabs whose turn went from running to not running in this tick: the caller flushes their
@@ -1007,6 +1012,7 @@ impl TabSet {
         let active = self.active;
         let mut out = PumpOutput {
             active_payload: None,
+            active_class: crate::panel_cadence::EnvelopeClass::Immediate,
             first_text: false,
             turn_ended: Vec::new(),
             offers_changed: Vec::new(),
@@ -1237,6 +1243,7 @@ impl TabSet {
                         // folded these events) did not carry; the panel applies notes to what it
                         // already holds (`applyCallNotes`), so they go on their own.
                         if !fresh.is_empty() || !fresh_notes.is_empty() {
+                            out.active_class = crate::panel_cadence::classify_events(fresh, !fresh_notes.is_empty());
                             out.active_payload = Some(serialize_events_with_notes_for_js(
                                 tab.id,
                                 from_revision,
@@ -1431,6 +1438,8 @@ impl TabSet {
                         };
                         backend.note_ui_snapshot(revision);
                         out.active_payload = Some(payload);
+                        // A snapshot replaces the panel's state: never held behind a cadence slot.
+                        out.active_class = crate::panel_cadence::EnvelopeClass::Immediate;
                         dispatched = true;
                     } else {
                         tab.stale = true;
@@ -4248,6 +4257,81 @@ mod tests {
         let (ids, prompt) = set.close_others_plan().unwrap();
         assert_eq!(ids, vec![second, third]);
         assert_eq!(prompt, "close 2 other tabs? (y/n)");
+    }
+
+    /// Pumps until the active tab has a payload, returning it with its class.
+    fn pump_until_payload(set: &mut TabSet, dir: &Path) -> (String, crate::panel_cadence::EnvelopeClass) {
+        let mut got = None;
+        until("a payload for the active tab", || {
+            let out = set.pump(dir, true);
+            if let Some(payload) = out.active_payload {
+                got = Some((payload, out.active_class));
+            }
+            got.is_some()
+        });
+        got.unwrap()
+    }
+
+    #[test]
+    fn the_pump_says_which_payloads_may_wait_for_the_typing_cadence() {
+        use crate::panel_cadence::EnvelopeClass::{Immediate, Stream};
+        let dir = workspace("tabs-pump-class");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        // A turn starting is state the chrome hangs on.
+        provider.queue(started("t1"));
+        let (payload, class) = pump_until_payload(&mut set, &dir);
+        assert!(payload.contains("turn_started"), "{payload}");
+        assert_eq!(class, Immediate);
+
+        // Plain streamed text is what the cadence exists to pace.
+        provider.queue(text_delta("t1", "hello"));
+        let (payload, class) = pump_until_payload(&mut set, &dir);
+        assert_eq!(events_text(Some(&payload)), "hello");
+        assert_eq!(class, Stream);
+
+        // A card is never held behind a slot.
+        provider.queue(write("perm-1"));
+        let (payload, class) = pump_until_payload(&mut set, &dir);
+        assert!(payload.contains("permission_requested"), "{payload}");
+        assert_eq!(class, Immediate);
+
+        // Nor is the end of the turn.
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        let (payload, class) = pump_until_payload(&mut set, &dir);
+        assert!(payload.contains("turn_completed"), "{payload}");
+        assert_eq!(class, Immediate);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_resync_snapshot_is_never_paced() {
+        use crate::panel_cadence::EnvelopeClass::Immediate;
+        let dir = workspace("tabs-pump-class-resync");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        // Without pumping in between: enough to overflow the sidecar's own UI queue.
+        provider.queue(started("t1"));
+        for i in 0..300 {
+            provider.queue(text_delta("t1", &format!("chunk {i}")));
+        }
+        until("the whole stream folded", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            let projection = backend.projection();
+            projection.transcript.iter().any(|m| m.text.contains("chunk 299"))
+        });
+        let (payload, class) = pump_until_payload(&mut set, &dir);
+        assert!(
+            payload.contains("\"kind\":\"snapshot\""),
+            "an overflow resyncs: {payload:.120}"
+        );
+        assert_eq!(class, Immediate);
+        shut_down_all(&mut set);
     }
 
     fn interruptible_live(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {

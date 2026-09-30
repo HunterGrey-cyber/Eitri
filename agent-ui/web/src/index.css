@@ -1474,7 +1474,7 @@ textarea,
      purpose ("never empty, so it cannot read as a blink") unreachable. `jump-none` emits {0, 1/3,
      2/3, 1}, so the scale is exactly {0.25, 0.5, 0.75, 1}: one, two, three, four cells, starting
      on the `from` value, which is the behaviour design §4 describes and §6 relies on. */
-  animation: turn-meter 1200ms steps(4, jump-none) infinite;
+  animation: turn-meter calc(var(--meter-step, 300ms) * 4) steps(4, jump-none) infinite;
 }
 @keyframes turn-meter {
   from { transform: scaleX(0.25); }

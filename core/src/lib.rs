@@ -25,6 +25,7 @@ pub mod lua;
 pub mod nvim_bin;
 pub mod nvim_keys;
 pub mod pane_switch;
+pub mod panel_cadence;
 pub mod permission_store;
 pub mod project_root;
 pub mod prompt_history;

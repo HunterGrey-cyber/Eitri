@@ -33,6 +33,80 @@ use neovide::units::{GridScale, PixelPos};
 
 use crate::LiveState;
 
+/// Told each time a key the user pressed in this pane was sent to nvim (see
+/// [`NeovideEditorPane::connect_key_activity`](crate::NeovideEditorPane::connect_key_activity)).
+///
+/// A notification and nothing else: it never changes what reaches nvim, and it fires from the
+/// same place the text is sent (`send_text`), so the two cannot drift apart. Cheap to clone -- a
+/// shared slot -- so `attach_keyboard_input`'s closures and the pane hold the same one.
+#[derive(Clone, Default)]
+pub(crate) struct KeyActivity {
+    callback: Rc<RefCell<ActivityCallback>>,
+}
+
+/// Named for `clippy::type_complexity`. An `Rc` so `notify` can call it with the slot released.
+type ActivityCallback = Option<Rc<dyn Fn()>>;
+
+impl KeyActivity {
+    /// Replaces any earlier callback.
+    pub(crate) fn set(&self, callback: impl Fn() + 'static) {
+        *self.callback.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    /// Calls the callback, if any, with the slot's borrow released first: a host's handler is free
+    /// to call back into this pane (or replace itself through `set`).
+    pub(crate) fn notify(&self) {
+        let callback = self.callback.borrow().clone();
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+}
+
+/// Where keyboard text goes: the live nvim session, or a stand-in in a test.
+pub(crate) trait TextTarget {
+    /// Whether text sent now would reach a running nvim.
+    fn accepts_text(&self) -> bool;
+    fn send_text(&mut self, text: &str);
+}
+
+impl TextTarget for LiveState {
+    fn accepts_text(&self) -> bool {
+        matches!(self, LiveState::Ready(session) if !session.harness.has_neovim_exited())
+    }
+
+    fn send_text(&mut self, text: &str) {
+        if let LiveState::Ready(session) = self {
+            // nvim's reply requests the frame (event-driven redraw).
+            session.harness.send_text_input(text);
+        }
+    }
+}
+
+/// The one way keyboard text (a key event's Neovim notation, or an input method's commit) reaches
+/// nvim from this pane. Sends it when `target` can take it and only then tells `activity`, after
+/// the borrow of `target` is released. Returns whether it was sent.
+///
+/// **Every keyboard path goes through here** -- `keyboard_text_reaches_nvim_only_through_send_text`
+/// reads this file to hold that -- so "the user typed in the editor" is not a second opinion that
+/// could disagree with what nvim actually received. `NeovideEditorPane::send_keys` deliberately
+/// does not: it is a host handing a key on (`Ctrl+a Ctrl+a`) or driving a scratch round trip, not
+/// the user typing here.
+pub(crate) fn send_text<T: TextTarget>(target: &RefCell<T>, text: &str, activity: &KeyActivity) -> bool {
+    let sent = {
+        let mut target = target.borrow_mut();
+        let accepts = target.accepts_text();
+        if accepts {
+            target.send_text(text);
+        }
+        accepts
+    };
+    if sent {
+        activity.notify();
+    }
+    sent
+}
+
 /// Neovim's own name for a GDK key that is *never* sent as a bare character -- the GTK-keyed
 /// equivalent of the fork's `neovide::window::keyboard_manager::get_special_key`, which does the
 /// same job against winit's `NamedKey`. A name returned here is always bracketed
@@ -284,7 +358,11 @@ fn publish_cursor_location(im_context: &IMMulticontext, gl_area: &GLArea, live_s
 /// later call `im_context.focus_in()` from `grab_focus()` once the host's window is actually shown
 /// -- mirroring the reference's own `gl_area.grab_focus(); im_context.focus_in();` pairing, which
 /// only makes sense once the widget is realized, not at construction time.
-pub(crate) fn attach_keyboard_input(gl_area: &GLArea, live_state: &Rc<RefCell<LiveState>>) -> IMMulticontext {
+pub(crate) fn attach_keyboard_input(
+    gl_area: &GLArea,
+    live_state: &Rc<RefCell<LiveState>>,
+    activity: &KeyActivity,
+) -> IMMulticontext {
     // --- IME: a GtkIMMulticontext attached to the key controller via `set_im_context`, which
     // makes GTK itself run `gtk_im_context_filter_keypress` on every key event before ever
     // emitting ::key-pressed -- a key an input method consumes (composition in progress) never
@@ -305,18 +383,13 @@ pub(crate) fn attach_keyboard_input(gl_area: &GLArea, live_state: &Rc<RefCell<Li
     im_context.set_use_preedit(false);
     {
         let live_state = live_state.clone();
+        let activity = activity.clone();
         im_context.connect_commit(move |_ctx, text| {
             let text = escape_for_nvim_input(text);
             if std::env::var_os("NEOVIDE_EDITOR_LOG_KEYS").is_some() {
                 println!("[key] im-commit -> {text:?}");
             }
-            let mut live = live_state.borrow_mut();
-            if let LiveState::Ready(session) = &mut *live {
-                if !session.harness.has_neovim_exited() {
-                    // nvim's reply requests the frame (event-driven redraw).
-                    session.harness.send_text_input(&text);
-                }
-            }
+            send_text(&live_state, &text, &activity);
         });
     }
     // --- IME candidate-window placement (P4). Without these, `set_cursor_location` is never
@@ -397,6 +470,7 @@ pub(crate) fn attach_keyboard_input(gl_area: &GLArea, live_state: &Rc<RefCell<Li
     // closure at all -- see the `im_context` wiring just above.
     {
         let live_state = live_state.clone();
+        let activity = activity.clone();
         let key_controller = EventControllerKey::new();
         key_controller.set_im_context(Some(&im_context));
         key_controller.connect_key_pressed(move |_controller, key, _keycode, state| {
@@ -419,13 +493,7 @@ pub(crate) fn attach_keyboard_input(gl_area: &GLArea, live_state: &Rc<RefCell<Li
                 println!("[key] {:?} state={state:?} -> {text:?}", key.name());
             }
 
-            let mut live = live_state.borrow_mut();
-            if let LiveState::Ready(session) = &mut *live {
-                if !session.harness.has_neovim_exited() {
-                    session.harness.send_text_input(&text);
-                    // nvim's reply requests the frame (event-driven redraw).
-                }
-            }
+            send_text(&live_state, &text, &activity);
             // Handled either way (even pre-Ready/post-exit) -- there is nothing else on this
             // single-widget pane that should react to a keypress instead.
             glib::Propagation::Stop
@@ -575,6 +643,135 @@ mod tests {
         assert_eq!(escape_for_nvim_input("你好"), "你好");
         assert_eq!(escape_for_nvim_input("hello"), "hello");
         assert_eq!(escape_for_nvim_input(""), "");
+    }
+
+    /// A stand-in for the live session: records what reached "nvim" and in what order relative to
+    /// the activity callback, and can refuse text the way an exited nvim does.
+    struct FakeTarget {
+        accepts: bool,
+        sent: Vec<String>,
+        log: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl FakeTarget {
+        fn new(accepts: bool, log: &Rc<RefCell<Vec<String>>>) -> RefCell<Self> {
+            RefCell::new(Self {
+                accepts,
+                sent: Vec::new(),
+                log: log.clone(),
+            })
+        }
+    }
+
+    impl TextTarget for FakeTarget {
+        fn accepts_text(&self) -> bool {
+            self.accepts
+        }
+
+        fn send_text(&mut self, text: &str) {
+            self.sent.push(text.to_string());
+            self.log.borrow_mut().push(format!("sent {text}"));
+        }
+    }
+
+    fn activity_logging(log: &Rc<RefCell<Vec<String>>>) -> KeyActivity {
+        let activity = KeyActivity::default();
+        let log = log.clone();
+        activity.set(move || log.borrow_mut().push("activity".to_string()));
+        activity
+    }
+
+    #[test]
+    fn a_key_sent_to_nvim_reports_activity_after_the_text_went() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let target = FakeTarget::new(true, &log);
+        let activity = activity_logging(&log);
+        assert!(send_text(&target, "j", &activity));
+        assert!(send_text(&target, "<C-w>", &activity));
+        assert_eq!(target.borrow().sent, vec!["j", "<C-w>"]);
+        assert_eq!(
+            *log.borrow(),
+            vec!["sent j", "activity", "sent <C-w>", "activity"],
+            "one report per key, after its text was handed over"
+        );
+    }
+
+    #[test]
+    fn text_an_exited_or_missing_nvim_cannot_take_is_not_activity() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let target = FakeTarget::new(false, &log);
+        let activity = activity_logging(&log);
+        assert!(!send_text(&target, "j", &activity));
+        assert!(target.borrow().sent.is_empty());
+        assert!(log.borrow().is_empty(), "nothing was typed into a live editor");
+    }
+
+    #[test]
+    fn a_host_handler_can_call_back_into_the_target_and_replace_itself() {
+        // The handler runs with neither the target's borrow nor the callback slot's held.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let target = Rc::new(FakeTarget::new(true, &log));
+        let activity = KeyActivity::default();
+        {
+            let target = target.clone();
+            let again = activity.clone();
+            let log = log.clone();
+            activity.set(move || {
+                assert!(
+                    target.try_borrow_mut().is_ok(),
+                    "the target is free while the host is told"
+                );
+                log.borrow_mut().push("first".to_string());
+                let log = log.clone();
+                again.set(move || log.borrow_mut().push("second".to_string()));
+            });
+        }
+        send_text(&target, "a", &activity);
+        send_text(&target, "b", &activity);
+        assert_eq!(*log.borrow(), vec!["sent a", "first", "sent b", "second"]);
+    }
+
+    #[test]
+    fn with_no_callback_a_key_is_just_sent() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let target = FakeTarget::new(true, &log);
+        assert!(send_text(&target, "x", &KeyActivity::default()));
+        assert_eq!(target.borrow().sent, vec!["x"]);
+    }
+
+    #[test]
+    fn a_later_callback_replaces_an_earlier_one() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let activity = KeyActivity::default();
+        for name in ["one", "two"] {
+            let log = log.clone();
+            activity.set(move || log.borrow_mut().push(name.to_string()));
+        }
+        activity.notify();
+        assert_eq!(*log.borrow(), vec!["two"]);
+    }
+
+    #[test]
+    fn keyboard_text_reaches_nvim_only_through_send_text() {
+        // Both keyboard handlers (an input method's commit and a key press) call `send_text`; this
+        // file may name `.send_text_input(` in code exactly once, inside `TextTarget for LiveState`.
+        // A third site would type into the editor without telling the host, and the panel would
+        // go on streaming at full rate under the user's fingers.
+        let source = include_str!("keyboard.rs");
+        let code = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields one part");
+        let sites = code
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains(".send_text_input("))
+            .count();
+        assert_eq!(sites, 1, "keyboard.rs sends text to nvim outside `send_text`");
+        assert!(
+            code.matches("send_text(&live_state, &text, &activity)").count() == 2,
+            "the commit path and the key-press path both go through send_text"
+        );
     }
 
     #[test]

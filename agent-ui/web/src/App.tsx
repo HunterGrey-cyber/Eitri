@@ -85,6 +85,7 @@ import { shortModel, usageSegment } from "./band";
 import type { BandFacts } from "./band";
 import type { AgentUiState, HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope, ContextSummary, QueueItem, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
+import { applyEditorTyping } from "./typingCadence";
 
 /** The line `agent/src/providers/claude_sidecar/spawn.rs::describe_checkout` writes for version skew.
  *  Moved in from the deleted `statusRow.ts` (panel round 2 plan, Task 10): the band's `warn` fact
@@ -2294,6 +2295,11 @@ export default function App() {
       if (CANCELS_WAITING_ANSWER.has(payload.kind)) typingGuard.cancel();
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
+      } else if (payload.kind === "editor_typing") {
+        // Window-level and Rust's alone (a cadence slower than the meter's step): it slows the
+        // meter, never pauses it. Deliberately not among the envelopes that cancel a waiting answer
+        // or touch any other state -- it is not about the panel's own keys.
+        applyEditorTyping(document.documentElement, payload.typing, payload.periodMs);
       } else if (payload.kind === "pane_focus") {
         // A pending prefix is for the very next key; a pane switch in between (GTK takes `Ctrl+h`/
         // `Ctrl+k` before the WebView sees a keydown) must not leave it armed for a key pressed much
@@ -3037,6 +3043,9 @@ export default function App() {
       }
     });
     requestHello();
+    // A page mounted again in the same document (a dev reload) starts unslowed; a real reload is a
+    // new document, which has no attribute to begin with, and Rust tells it again on `ready`.
+    return () => applyEditorTyping(document.documentElement, false, 0);
   }, []);
 
   /** V1 C1 (spec §3.5): the composer mirror. `browse`/`input` mean a live BROWSE/INPUT (this tab's
