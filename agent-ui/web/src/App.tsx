@@ -3406,6 +3406,7 @@ export default function App() {
               projectDir={hello?.projectDir ?? ""}
               newTabChord={keymapHelp.newTabChord}
               focusRequest={chooserFocusRequest}
+              dropKeysRequest={emptyDropKeys}
               onSwitch={onChooserSwitch}
               onResume={onChooserResume}
               onNewSession={onChooserNewSession}
@@ -4979,6 +4980,7 @@ export default function App() {
               projectDir={hello?.projectDir ?? ""}
               newTabChord={keymapHelp.newTabChord}
               focusRequest={chooserFocusRequest}
+              dropKeysRequest={emptyDropKeys}
               onSwitch={onChooserSwitch}
               onResume={onChooserResume}
               onNewSession={onChooserNewSession}
@@ -5102,57 +5104,91 @@ export default function App() {
       />
       {/* `gf` with several paths and the open `/` prompt each own every key through
           `onKeyDown` branches that run before `resolveKey`. Their placement here does not change that. */}
-      {pathPick !== null && <PathPick paths={pathPick} />}
-      {linkPick !== null && <LinkPick urls={linkPick} />}
+      {/* Each overlay has its own `PanelErrorBoundary`, so a render failure closes that overlay and
+          flashes in the band without unmounting the panel. The pickers leave focus at the root, so
+          closing them is enough. The two input lines hold focus and must return it as their Escape
+          handlers do. */}
+      {pathPick !== null && (
+        <PanelErrorBoundary name="path picker" onError={() => overlayFailed("path picker", () => setPathPick(null))}>
+          <PathPick paths={pathPick} />
+        </PanelErrorBoundary>
+      )}
+      {linkPick !== null && (
+        <PanelErrorBoundary name="link picker" onError={() => overlayFailed("link picker", () => setLinkPick(null))}>
+          <LinkPick urls={linkPick} />
+        </PanelErrorBoundary>
+      )}
       {search !== null && (
-        <SearchBar
-          query={search.query}
-          focusRequest={lineFocusRequest}
-          onChange={(query) => {
-            setSearch({ query, origin: search.origin });
-            const found = findMatch(timeline, query, search.origin, 1, true);
-            setCursor(found ?? search.origin);
-          }}
-          onAccept={(event) => {
-            noteLineKey(event);
-            lastSearchRef.current = search.query;
-            if (search.query !== "" && findMatch(timeline, search.query, search.origin, 1, true) === null) {
-              showFlash(`pattern not found: ${search.query}`);
+        <PanelErrorBoundary
+          name="search line"
+          onError={() =>
+            overlayFailed("search line", () => {
+              // Esc's own effect: the cursor goes back to where the search started.
               setCursor(search.origin);
-            }
-            setSearch(null);
-            containerRef.current?.focus({ preventScroll: true });
-          }}
-          onCancel={(event) => {
-            noteLineKey(event);
-            setCursor(search.origin);
-            setSearch(null);
-            containerRef.current?.focus({ preventScroll: true });
-          }}
-        />
+              setSearch(null);
+              returnKeysToRoot();
+            })
+          }
+        >
+          <SearchBar
+            query={search.query}
+            focusRequest={lineFocusRequest}
+            onChange={(query) => {
+              setSearch({ query, origin: search.origin });
+              const found = findMatch(timeline, query, search.origin, 1, true);
+              setCursor(found ?? search.origin);
+            }}
+            onAccept={(event) => {
+              noteLineKey(event);
+              lastSearchRef.current = search.query;
+              if (search.query !== "" && findMatch(timeline, search.query, search.origin, 1, true) === null) {
+                showFlash(`pattern not found: ${search.query}`);
+                setCursor(search.origin);
+              }
+              setSearch(null);
+              containerRef.current?.focus({ preventScroll: true });
+            }}
+            onCancel={(event) => {
+              noteLineKey(event);
+              setCursor(search.origin);
+              setSearch(null);
+              containerRef.current?.focus({ preventScroll: true });
+            }}
+          />
+        </PanelErrorBoundary>
       )}
       {/* The `:` command line takes command text so `:ls`, `:l` or `:d` followed by Enter
           cannot activate a card. It runs nothing; Enter explains that, while Esc and `Ctrl+[`
           close it silently. */}
       {exLine !== null && (
-        <SearchBar
-          lead=":"
-          label="Command line"
-          query={exLine}
-          focusRequest={lineFocusRequest}
-          onChange={setExLine}
-          onAccept={(event) => {
-            noteLineKey(event);
-            showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
-            setExLine(null);
-            returnKeysToRoot();
-          }}
-          onCancel={(event) => {
-            noteLineKey(event);
-            setExLine(null);
-            returnKeysToRoot();
-          }}
-        />
+        <PanelErrorBoundary
+          name="command line"
+          onError={() =>
+            overlayFailed("command line", () => {
+              setExLine(null);
+              returnKeysToRoot();
+            })
+          }
+        >
+          <SearchBar
+            lead=":"
+            label="Command line"
+            query={exLine}
+            focusRequest={lineFocusRequest}
+            onChange={setExLine}
+            onAccept={(event) => {
+              noteLineKey(event);
+              showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
+              setExLine(null);
+              returnKeysToRoot();
+            }}
+            onCancel={(event) => {
+              noteLineKey(event);
+              setExLine(null);
+              returnKeysToRoot();
+            }}
+          />
+        </PanelErrorBoundary>
       )}
       {/* The bottom band combines status, unread counts and context in one status row.
           `showcmd` reads the same `box` as the which-key popup but appears immediately, without

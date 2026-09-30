@@ -195,7 +195,7 @@ describe("installDispatch", () => {
   it("demuxes a confirm_bypass envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    const envelope = { kind: "confirm_bypass", tab: 3, scope: "tab", nonce: 17, lines: ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"] };
+    const envelope = { kind: "confirm_bypass", tab: 3, scope: "tab", nonce: 17, lines: ["Switch to bypass and approve the 2 waiting cards? (y/n)"] };
     window.__neovibeDispatch!(JSON.stringify(envelope));
     expect(handler).toHaveBeenCalledWith(envelope);
   });
@@ -203,7 +203,7 @@ describe("installDispatch", () => {
   it("demuxes a confirm_bypass envelope with a null tab (window default scope)", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    const envelope = { kind: "confirm_bypass", tab: null, scope: "default", nonce: 18, lines: ["新会话默认用 bypass？(y/n)"] };
+    const envelope = { kind: "confirm_bypass", tab: null, scope: "default", nonce: 18, lines: ["Start new sessions in bypass? (y/n)"] };
     window.__neovibeDispatch!(JSON.stringify(envelope));
     expect(handler).toHaveBeenCalledWith(envelope);
   });

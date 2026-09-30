@@ -411,6 +411,23 @@ describe("Chooser", () => {
     expect(outer).not.toHaveBeenCalledWith(expect.objectContaining({ key: "g" }));
     expect(outer).not.toHaveBeenCalledWith(expect.objectContaining({ key: "G" }));
   });
+  /** rc.3 minors review: a `g` held with Ctrl, Alt or Meta is a chord meant for something else; it must
+   *  not arm the chooser's `gg` wait and so swallow the next plain key. */
+  it("a modified g does not arm gg, so the next j still moves", () => {
+    const { root } = renderChooser();
+    void root;
+    const current = () => document.querySelector(".chooser-row.current")!.textContent;
+    const el = () => document.querySelector<HTMLElement>(".chooser")!;
+    for (const mod of [{ altKey: true }, { metaKey: true }, { ctrlKey: true }]) {
+      fireEvent.keyDown(el(), { key: "G" });
+      fireEvent.keyDown(el(), { key: "g" });
+      fireEvent.keyDown(el(), { key: "g" });
+      expect(current()).toContain("New session");
+      fireEvent.keyDown(el(), { key: "g", ...mod });
+      fireEvent.keyDown(el(), { key: "j" });
+      expect(current()).toContain("1 fix-parser");
+    }
+  });
   /** The current row's sign cell draws a solid cursor holding `›`, alongside the row fill. */
   it("draws the current row's sign as › and no other row's", () => {
     const { root } = renderChooser();
@@ -640,6 +657,48 @@ describe("Chooser: the list keys", () => {
     fireEvent.keyDown(root, { key: "Shift" });
     fireEvent.keyDown(root, { key: "x" });
     expect(props.onCloseTab).not.toHaveBeenCalled();
+    expect(currentRow(container)).toContain("1 fix-parser");
+  });
+});
+
+/** A lone `g` waits without a timeout, so window cancellation must clear it too. Shift+Tab cancels
+ *  directly; focus changes, arrival, HINT, tab switches, and overlays cancel through
+ *  `dropKeysRequest`. Otherwise the next `j` would be swallowed by an obsolete wait. */
+describe("Chooser: a waiting g ends on the window's cancel routes (K01)", () => {
+  const currentRow = (c: HTMLElement) => c.querySelector(".chooser-row.current")?.textContent ?? null;
+
+  it("Shift+Tab ends it: g, Shift+Tab, then j moves the cursor", () => {
+    const { root, container } = renderChooser({ active: 1 });
+    expect(currentRow(container)).toContain("1 fix-parser");
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    fireEvent.keyDown(root, { key: "j" });
+    expect(currentRow(container)).toContain("2 legacy");
+  });
+
+  it("Shift+Tab ends it: g, Shift+Tab, g is a fresh wait, not the second half of gg", () => {
+    const { root, container } = renderChooser({ active: 2 });
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    fireEvent.keyDown(root, { key: "g" });
+    expect(currentRow(container), "no gg happened").toContain("2 legacy");
+    fireEvent.keyDown(root, { key: "g" });
+    expect(currentRow(container), "a real gg still does").toContain("New session");
+  });
+
+  it("a bump of dropKeysRequest ends it: g, a cancel route, then j moves the cursor", () => {
+    const { root, container, props, rerender } = renderChooser({ active: 1, dropKeysRequest: 0 });
+    fireEvent.keyDown(root, { key: "g" });
+    rerender(<Chooser {...props} dropKeysRequest={1} />);
+    fireEvent.keyDown(root, { key: "j" });
+    expect(currentRow(container)).toContain("2 legacy");
+  });
+
+  it("without a bump the wait stands: g, a re-render, then j is still the swallowed cancel key", () => {
+    const { root, container, props, rerender } = renderChooser({ active: 1, dropKeysRequest: 3 });
+    fireEvent.keyDown(root, { key: "g" });
+    rerender(<Chooser {...props} dropKeysRequest={3} />);
+    fireEvent.keyDown(root, { key: "j" });
     expect(currentRow(container)).toContain("1 fix-parser");
   });
 });

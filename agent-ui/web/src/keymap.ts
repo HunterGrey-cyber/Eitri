@@ -487,8 +487,9 @@ export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNulla
 
 /** Resolve the key after a pending prefix. Bare modifiers keep waiting; Ctrl+c interrupts
  *  a running turn and is otherwise unclaimed. gv is reserved, and []/][ do nothing.
- *  Fixed pairs reject Ctrl and Shift but ignore Alt and Meta, matching how g, z, [ and ] arm.
- *  This lets [[ and ]] work on layouts that type brackets with Option.
+ *  Fixed pairs reject Ctrl and Shift but ignore Alt and Meta. This lets [[ and ]] work on
+ *  layouts that type brackets with Option. Only brackets can arm with Alt or Meta held;
+ *  g/z must arm plainly, but their second key may carry either modifier.
  *  A key completing no pair cancels without running its bare-key action. */
 function resolvePendingSecond(prefix: PendingPrefix, event: KeyLike, ctx: KeyContext): PanelAction {
   if (isModifierKey(event.key)) return null;
@@ -664,8 +665,17 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   switch (event.key) {
     case "g":
     case "z":
+      // rc.3 minors 6: a chord meant for something else (Alt+g, Meta+z) must not arm a prefix that
+      // then swallows the next plain key. No layout types `g` or `z` with Alt or Meta held, unlike a
+      // bracket (next case), so a modified one is simply not this key -- the same test `v`, `D` and
+      // `a`/`d` apply. Unclaimed rather than cancelled: nothing is pending yet.
+      if (!isPlainAnswerKey(event)) return null;
+      return { kind: "pending", prefix: event.key };
     case "[":
     case "]":
+      // Armed with Alt or Meta held on purpose: `event.key` being a bracket while Option is down IS
+      // how a macOS German, French or Swiss layout types one, and `[[`/`]]` (completed by
+      // `resolvePendingSecond`, which reads Alt and Meta the same way) must keep jumping there.
       return { kind: "pending", prefix: event.key };
     case "i":
     case "o":

@@ -1328,6 +1328,18 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     expect(container.querySelector(".composer-browse-hint")).not.toBeNull();
   });
 
+  /** rc.3 minors 6: a chord (Alt+g, Meta+z) is not the `g`/`z` prefix, so it must not swallow the plain key
+   *  after it -- `i` here, which the armed prefix used to cancel. */
+  it.each([["g", { altKey: true }], ["g", { metaKey: true }], ["z", { altKey: true }], ["z", { metaKey: true }]])(
+    "enters INPUT on i right after %s with %j held: the chord armed no prefix",
+    (first, held) => {
+      const { container } = startedApp();
+      fireEvent.keyDown(conversationRoot(container), { key: first, ...held });
+      fireEvent.keyDown(conversationRoot(container), { key: "i" });
+      expect(container.querySelector("textarea")).not.toBeNull();
+    },
+  );
+
   it("gives a composing Escape back to the input method instead of leaving INPUT", () => {
     const { container } = startedApp();
     fireEvent.keyDown(conversationRoot(container), { key: "i" });
@@ -9063,6 +9075,66 @@ describe("takes the keys", () => {
     expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
   });
 
+  /** The chooser's lone `g` is a pending key. Losing and regaining focus cancels it through
+   *  `dropPendingKeys`, so the next `j` moves the cursor instead of cancelling an old prefix.
+   *  Shift+Tab cancels it too. */
+  it("a2. chooser open: a waiting g does not outlive a focus round trip, and j moves the cursor", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    dispatch({ kind: "pane_focus", focused: true });
+    openChooser();
+    fireEvent.keyDown(document.activeElement!, { key: "g" });
+    loseThenRegainFocus();
+    expect(container.querySelector(".chooser")!.contains(document.activeElement)).toBe(true);
+    const before = container.querySelector(".chooser-row.current")!.textContent;
+    fireEvent.keyDown(document.activeElement!, { key: "j" });
+    expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
+  });
+
+  it("a3. chooser open: a waiting g does not outlive Shift+Tab, and j moves the cursor", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    dispatch({ kind: "pane_focus", focused: true });
+    openChooser();
+    fireEvent.keyDown(document.activeElement!, { key: "g" });
+    fireEvent.keyDown(document.activeElement!, { key: "Tab", shiftKey: true });
+    const before = container.querySelector(".chooser-row.current")!.textContent;
+    fireEvent.keyDown(document.activeElement!, { key: "j" });
+    expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
+  });
+
+  /** App renders the chooser over both a live conversation and an empty tab.
+   *  Exercise both cancel routes on the empty layout too, so its `dropKeysRequest` is covered. */
+  it("a2e. chooser open over an empty tab: a waiting g does not outlive a focus round trip, and j moves the cursor", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ kind: "pane_focus", focused: true });
+    openChooser();
+    expect(container.querySelector(".agent-ui-conversation")).toBeNull();
+    fireEvent.keyDown(document.activeElement!, { key: "g" });
+    loseThenRegainFocus();
+    expect(container.querySelector(".chooser")!.contains(document.activeElement)).toBe(true);
+    const before = container.querySelector(".chooser-row.current")!.textContent;
+    fireEvent.keyDown(document.activeElement!, { key: "j" });
+    expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
+  });
+
+  it("a3e. chooser open over an empty tab: a waiting g does not outlive Shift+Tab, and j moves the cursor", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ kind: "pane_focus", focused: true });
+    openChooser();
+    fireEvent.keyDown(document.activeElement!, { key: "g" });
+    fireEvent.keyDown(document.activeElement!, { key: "Tab", shiftKey: true });
+    const before = container.querySelector(".chooser-row.current")!.textContent;
+    fireEvent.keyDown(document.activeElement!, { key: "j" });
+    expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
+  });
+
   it("b. chooser open with the filter open: pane_focus regaining focus re-focuses the filter input", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -9606,7 +9678,7 @@ describe("K01 on the empty tab: every cancel route drops its waiting prefix and 
     [
       "a bypass prompt, answered n",
       () => {
-        dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["bypass? (y/n)"] });
+        dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["Switch to bypass? (y/n)"] });
         press("n");
       },
     ],
@@ -9638,7 +9710,7 @@ describe("v1 mode: entering bypass asks first", () => {
       tab: over.tab === undefined ? 1 : over.tab,
       scope: over.scope ?? "tab",
       nonce: over.nonce ?? 7,
-      lines: over.lines ?? ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"],
+      lines: over.lines ?? ["Switch to bypass and approve the 2 waiting cards? (y/n)"],
     });
   }
   /** Mounts `App`, delivers `hello` and a live tab 1 (legacy backend, auto mode -- ordinary
@@ -9663,8 +9735,8 @@ describe("v1 mode: entering bypass asks first", () => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
-      dispatchBypassConfirm({ tab: 1, scope: "tab", nonce: 7, lines: ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"] });
-      expect(container.querySelector(".band-prompt")!.textContent).toBe("切到 bypass 并批准 2 张等待中的卡片？(y/n)");
+      dispatchBypassConfirm({ tab: 1, scope: "tab", nonce: 7, lines: ["Switch to bypass and approve the 2 waiting cards? (y/n)"] });
+      expect(container.querySelector(".band-prompt")!.textContent).toBe("Switch to bypass and approve the 2 waiting cards? (y/n)");
       act(() => vi.advanceTimersByTime(300));
       fireEvent.keyDown(root, { key: "y" });
       expect(lastOfType("confirm_bypass")).toMatchObject({ tab: 1, scope: "tab", nonce: 7 });
@@ -9724,7 +9796,7 @@ describe("v1 mode: entering bypass asks first", () => {
     fakeClock();
     try {
       const { root } = liveConversation();
-      dispatchBypassConfirm({ tab: null, scope: "default", nonce: 11, lines: ["新会话默认用 bypass？(y/n)"] });
+      dispatchBypassConfirm({ tab: null, scope: "default", nonce: 11, lines: ["Start new sessions in bypass? (y/n)"] });
       act(() => vi.advanceTimersByTime(300));
       fireEvent.keyDown(root, { key: "y" });
       expect(lastOfType("confirm_bypass")).toMatchObject({ tab: null, scope: "default", nonce: 11 });
@@ -9738,9 +9810,9 @@ describe("v1 mode: entering bypass asks first", () => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
-      dispatchBypassConfirm({ nonce: 1, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
-      dispatchBypassConfirm({ nonce: 2, lines: ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"] });
-      expect(container.querySelector(".band-prompt")!.textContent).toBe("切到 bypass 并批准 2 张等待中的卡片？(y/n)");
+      dispatchBypassConfirm({ nonce: 1, lines: ["Switch to bypass and approve the 1 waiting card? (y/n)"] });
+      dispatchBypassConfirm({ nonce: 2, lines: ["Switch to bypass and approve the 2 waiting cards? (y/n)"] });
+      expect(container.querySelector(".band-prompt")!.textContent).toBe("Switch to bypass and approve the 2 waiting cards? (y/n)");
       act(() => vi.advanceTimersByTime(300));
       fireEvent.keyDown(root, { key: "y" });
       expect(lastOfType("confirm_bypass")).toMatchObject({ nonce: 2 });
@@ -9817,7 +9889,7 @@ describe("v1 mode: entering bypass asks first", () => {
       fireEvent.keyDown(root, { key: " " });
       act(() => vi.advanceTimersByTime(100));
       fireEvent.keyDown(root, { key: "m" });
-      dispatchBypassConfirm({ lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+      dispatchBypassConfirm({ lines: ["Switch to bypass and approve the 1 waiting card? (y/n)"] });
       act(() => vi.advanceTimersByTime(100));
       fireEvent.keyDown(root, { key: "y" });
       expect(lastOfType("confirm_bypass")).toBeUndefined();
@@ -10146,7 +10218,7 @@ describe("the prompt and the chooser take the keys whole", () => {
   it("the key that cancels the prompt still counts for the typing guard: x then a 100 ms later answers nothing", () => {
     fakeClock();
     const { container } = arrivedOnACard();
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 3, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 3, lines: ["Switch to bypass and approve the 1 waiting card? (y/n)"] });
     wait(1000);
     press("x");
     expect(container.querySelector(".band-prompt")).toBeNull();
@@ -10160,13 +10232,13 @@ describe("the prompt and the chooser take the keys whole", () => {
   it("a held y's autorepeat never answers the reprompt that followed its first press", () => {
     fakeClock();
     const { container } = arrivedOnACard();
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["Switch to bypass and approve the 1 waiting card? (y/n)"] });
     wait(300);
     press("y");
     expect(confirms().map((m) => m.nonce)).toEqual([1]);
     wait(20);
     // A card arrived while the prompt was open, so Rust responds with a fresh prompt.
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 2, lines: ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 2, lines: ["Switch to bypass and approve the 2 waiting cards? (y/n)"] });
     wait(280);
     press("y", { repeat: true });
     expect(confirms().map((m) => m.nonce)).toEqual([1]);
@@ -10179,7 +10251,7 @@ describe("the prompt and the chooser take the keys whole", () => {
   it("defect 2: after a held y cancels the prompt, its autorepeats do not fall through as BROWSE's copy", () => {
     fakeClock();
     const { container } = arrivedOnACard();
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["Switch to bypass and approve the 1 waiting card? (y/n)"] });
     // Too soon after the prompt opened (needs >= 250ms): this first, non-repeat "y" cancels rather
     // than answers -- the physical first keydown of a held press is never itself a repeat.
     wait(100);
@@ -10201,13 +10273,13 @@ describe("the prompt and the chooser take the keys whole", () => {
   it("defect 2: once the held key is released, a fresh y answers the next prompt normally", () => {
     fakeClock();
     const { container } = arrivedOnACard();
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["Switch to bypass and approve the 1 waiting card? (y/n)"] });
     wait(100);
     press("y"); // cancels
     press("y", { repeat: true }); // swallowed
     fireEvent.keyUp(document.activeElement ?? document.body, { key: "y" });
     wait(500);
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 2, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 2, lines: ["Switch to bypass and approve the 1 waiting card? (y/n)"] });
     wait(300);
     press("y"); // a genuinely fresh, non-repeat press
     expect(confirms().map((m) => m.nonce)).toEqual([2]);
@@ -10218,7 +10290,7 @@ describe("the prompt and the chooser take the keys whole", () => {
     fakeClock();
     const { container } = arrivedOnACard();
     dispatch({ kind: "chooser", open: [], records: [] });
-    dispatch({ kind: "confirm_bypass", tab: null, scope: "default", nonce: 5, lines: ["新会话默认用 bypass？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: null, scope: "default", nonce: 5, lines: ["Start new sessions in bypass? (y/n)"] });
     wait(300);
     fireEvent.keyDown(container.querySelector(".chooser")!, { key: "y" });
     expect(confirms()).toEqual([expect.objectContaining({ scope: "default", nonce: 5 })]);
@@ -10235,7 +10307,7 @@ describe("the prompt and the chooser take the keys whole", () => {
     fireEvent.keyDown(container.querySelector(".chooser")!, { key: "/" });
     const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
     expect(document.activeElement).toBe(filter);
-    dispatch({ kind: "confirm_bypass", tab: null, scope: "default", nonce: 6, lines: ["新会话默认用 bypass？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: null, scope: "default", nonce: 6, lines: ["Start new sessions in bypass? (y/n)"] });
     wait(300);
     fireEvent.keyDown(filter, { key: "Enter" });
     expect(container.querySelector(".band-prompt")).toBeNull();
@@ -10257,7 +10329,7 @@ describe("the prompt and the chooser take the keys whole", () => {
     fireEvent.keyDown(container.querySelector(".chooser")!, { key: "r", ctrlKey: true });
     const rename = container.querySelector<HTMLInputElement>(".chooser-rename")!;
     expect(document.activeElement).toBe(rename);
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 7, lines: ["切到 bypass？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 7, lines: ["Switch to bypass? (y/n)"] });
     wait(300);
     fireEvent.keyDown(rename, { key: "Escape" });
     expect(container.querySelector(".band-prompt")).toBeNull();
@@ -10277,7 +10349,7 @@ describe("the prompt and the chooser take the keys whole", () => {
     dispatch({ kind: "begin_rename", tab: 1, current: null });
     const rename = container.querySelector<HTMLInputElement>(".tab-rename")!;
     expect(document.activeElement).toBe(rename);
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 9, lines: ["切到 bypass？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 9, lines: ["Switch to bypass? (y/n)"] });
     wait(300);
     fireEvent.keyDown(rename, { key: "Enter" });
     expect(container.querySelector(".band-prompt")).toBeNull();
@@ -10296,7 +10368,7 @@ describe("the prompt and the chooser take the keys whole", () => {
     enterInputMode(container);
     const box = container.querySelector<HTMLTextAreaElement>(".composer textarea")!;
     fireEvent.change(box, { target: { value: "hello" } });
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 10, lines: ["切到 bypass？(y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 10, lines: ["Switch to bypass? (y/n)"] });
     wait(300);
     fireEvent.keyDown(box, { key: "Enter" });
     expect(container.querySelector(".band-prompt")).toBeNull();
@@ -11259,7 +11331,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     const { container, root } = startedOnPromptRow();
     fireEvent.keyDown(root, { key: "v" });
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 7, lines: ["bypass? (y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 7, lines: ["Switch to bypass? (y/n)"] });
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
     // Close the still-open y/n prompt itself before re-entering: any key but a counted `y` cancels
     // it, and a `v` aimed at a live prompt must answer THAT, not start the region.
@@ -11267,7 +11339,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     fireEvent.keyDown(root, { key: "v" });
     fireEvent.keyDown(root, { key: "v" });
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
-    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 8, lines: ["bypass? (y/n)"] });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 8, lines: ["Switch to bypass? (y/n)"] });
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
   });
 

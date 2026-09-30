@@ -18,6 +18,11 @@ type Props = {
    *  Focus the rename input if open, else the filter input if open, else the root.
    *  Mount also focuses, regardless of the initial counter value. */
   focusRequest: number;
+  /** Bumped by `dropPendingKeys()` for cancellation routes this chooser never receives as keys:
+   *  focus changes, arrival, HINT, tab switches, and other overlays. Clears its lone-g wait along
+   *  with the panel's prefix, count, and leader sequence. Shift+Tab clears the wait in `onKeyDown`.
+   *  Optional for callers that need no external cancellation. */
+  dropKeysRequest?: number;
   onSwitch: (tab: TabId) => void;
   onResume: (providerSessionId: string) => void;
   onNewSession: () => void;
@@ -164,6 +169,7 @@ export function Chooser({
   projectDir,
   newTabChord,
   focusRequest,
+  dropKeysRequest,
   onSwitch,
   onResume,
   onNewSession,
@@ -258,6 +264,11 @@ export function Chooser({
   // wait, so `gx` cannot close a tab and `gEnter` cannot choose a row. Bare modifiers keep
   // waiting.
   const pendingG = useRef(false);
+  // Clear the pending `g` on the window's cancellation routes. This also runs on mount, when
+  // nothing is waiting.
+  useEffect(() => {
+    pendingG.current = false;
+  }, [dropKeysRequest]);
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (composing(event)) return;
     // A bypass or window-close confirmation takes every key before chooser navigation, filter or
@@ -270,6 +281,9 @@ export function Chooser({
     if (isShiftTab(event)) {
       event.preventDefault();
       event.stopPropagation();
+      // Shift+Tab performs an action here, so it ends a pending `g` wait. A bare modifier leaves
+      // the wait intact.
+      pendingG.current = false;
       cycleMode(current);
       return;
     }
@@ -286,6 +300,9 @@ export function Chooser({
       if (key === "g") setCursor(0);
       return;
     }
+    // A `g` held with Ctrl, Alt or Meta is a chord for something else: it arms no `gg` wait, which would
+    // swallow the next plain key (rc.3 minors review, the same rule as the panel's own g/z/[/]).
+    if (key === "g" && (event.ctrlKey || event.altKey || event.metaKey)) return;
     if (key === "g" || key === "G") {
       event.preventDefault();
       event.stopPropagation();

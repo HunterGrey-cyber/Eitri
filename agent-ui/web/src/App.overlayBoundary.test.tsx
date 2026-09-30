@@ -2,8 +2,8 @@
 /** A throw while an overlay rendered used to unmount the whole panel, leaving `#root` empty
  * and every key dead. Each overlay in `App.tsx` has its own `PanelErrorBoundary`, so a throw
  * closes only that overlay through its leave path, reports it in the band, and leaves the panel
- * drawn and the keys working. This covers the chooser, the `/model`/`/effort` picker, the `?`
- * overlay and session details.
+ * drawn and the keys working. This includes the chooser, the `/model`/`/effort` picker, the `?`
+ * overlay, session details, `gf`'s path picker, `gx`'s link picker, `/` search and `:` commands.
  * The wrappers let each overlay throw on demand (`broken`). Otherwise they render the real
  * component, so nothing else about `App` changes under test. */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,7 +14,16 @@ import { initialState } from "./reducer";
 import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 
 /** Which overlay's next render throws. Read at render time, so a test flips one on before it opens the overlay. */
-const broken = vi.hoisted(() => ({ chooser: false, picker: false, keymap: false, detail: false }));
+const broken = vi.hoisted(() => ({
+  chooser: false,
+  picker: false,
+  keymap: false,
+  detail: false,
+  pathPick: false,
+  linkPick: false,
+  search: false,
+  exLine: false,
+}));
 
 vi.mock("./components/Chooser", async (importOriginal) => {
   const real = await importOriginal<typeof import("./components/Chooser")>();
@@ -57,6 +66,41 @@ vi.mock("./components/DetailPopover", async (importOriginal) => {
   return { ...real, DetailPopover };
 });
 
+vi.mock("./components/PathPick", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./components/PathPick")>();
+  const { createElement } = await import("react");
+  return {
+    ...real,
+    PathPick: (props: ComponentProps<typeof real.PathPick>) => {
+      if (broken.pathPick) throw new Error("path pick exploded");
+      return createElement(real.PathPick, props);
+    },
+  };
+});
+vi.mock("./components/LinkPick", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./components/LinkPick")>();
+  const { createElement } = await import("react");
+  return {
+    ...real,
+    LinkPick: (props: ComponentProps<typeof real.LinkPick>) => {
+      if (broken.linkPick) throw new Error("link pick exploded");
+      return createElement(real.LinkPick, props);
+    },
+  };
+});
+// One component draws both the `/` search (lead "/") and the `:` command line (lead ":").
+vi.mock("./components/SearchBar", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./components/SearchBar")>();
+  const { createElement } = await import("react");
+  return {
+    ...real,
+    SearchBar: (props: ComponentProps<typeof real.SearchBar>) => {
+      if (props.lead === ":" ? broken.exLine : broken.search) throw new Error("search bar exploded");
+      return createElement(real.SearchBar, props);
+    },
+  };
+});
+
 /** React reports a caught render error on `console.error` and, through jsdom, as an uncaught error on
  *  `window`, which vitest would count as an unhandled error. Both are expected here. */
 const claimWindowError = (event: ErrorEvent) => event.preventDefault();
@@ -76,6 +120,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   cleanup();
   broken.chooser = broken.picker = broken.keymap = broken.detail = false;
+  broken.pathPick = broken.linkPick = broken.search = broken.exLine = false;
 });
 
 function dispatch(payload: unknown) {
@@ -179,6 +224,37 @@ function openModelPicker(container: HTMLElement, round = 1) {
   dispatch({ kind: "events", tab: 1, fromRevision: (round - 1) * 2, throughRevision: round * 2, events });
 }
 
+/** A conversation whose one reply names two paths and two links, so `gf` and `gx` each have to wait for a
+ *  letter (a pick) instead of acting at once. `round` numbers the snapshot's revision. */
+function withReply(round: number) {
+  dispatch({
+    kind: "snapshot",
+    tab: 1,
+    throughRevision: round,
+    state: snapshotState({
+      transcript: [{ seq: 1, text: "compare a.rs and b.rs, see https://example.com/a and [docs](https://EXAMPLE.com/b)" }],
+    }),
+  });
+}
+const rootOf = (container: HTMLElement) => container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+/** jsdom lays nothing out: give the list and each anchor a box, which is what `hintVisible` reads as "on screen". */
+function boxLinks(container: HTMLElement) {
+  const boxOf = (el: Element, top: number, height: number) => {
+    (el as HTMLElement).getBoundingClientRect = () =>
+      ({ top, bottom: top + height, left: 0, right: 100, width: 100, height, x: 0, y: top }) as DOMRect;
+  };
+  boxOf(rootOf(container), 0, 1000);
+  boxOf(container.querySelector(".message-list")!, 0, 1000);
+  let y = 0;
+  for (const a of container.querySelectorAll(".row a[href]:not([hidden])")) {
+    boxOf(a, y, 10);
+    y += 10;
+  }
+}
+function keys(container: HTMLElement, ...chars: string[]) {
+  for (const key of chars) fireEvent.keyDown(rootOf(container), { key });
+}
+
 type Site = {
   name: string;
   layout: Layout;
@@ -195,6 +271,11 @@ const SITES: Site[] = [
   { name: "the ? overlay over a conversation", layout: "conversation", flag: "keymap", overlay: ".keymap-overlay", flash: "the keys overlay failed and closed", open: () => dispatch({ kind: "open_keymap" }) },
   { name: "the ? overlay over an empty tab", layout: "empty", flag: "keymap", overlay: ".keymap-overlay", flash: "the keys overlay failed and closed", open: () => dispatch({ kind: "open_keymap" }) },
   { name: "the session details popover", layout: "conversation", flag: "detail", overlay: ".detail-popover", flash: "the session details failed and closed", open: () => dispatch(DETAIL) },
+  // The path picker, link picker, search line and command line each need their own error boundary.
+  { name: "gf's path picker", layout: "conversation", flag: "pathPick", overlay: ".path-pick", flash: "the path picker failed and closed", open: (c, round) => { withReply(round); keys(c, "g", "f"); } },
+  { name: "gx's link picker", layout: "conversation", flag: "linkPick", overlay: ".link-pick", flash: "the link picker failed and closed", open: (c, round) => { withReply(round); boxLinks(c); keys(c, "g", "x"); } },
+  { name: "the / search line", layout: "conversation", flag: "search", overlay: ".search-bar", flash: "the search line failed and closed", open: (c) => keys(c, "/") },
+  { name: "the : command line", layout: "conversation", flag: "exLine", overlay: ".search-bar", flash: "the command line failed and closed", open: (c) => keys(c, ":") },
 ];
 
 describe("an overlay that throws closes itself and leaves the panel drawn (K03)", () => {
@@ -259,6 +340,24 @@ describe("an overlay that throws closes itself and leaves the panel drawn (K03)"
       expect(container.querySelector(".empty-tab")).not.toBeNull();
       expect(container.contains(document.activeElement), "the keys are on the empty tab again").toBe(true);
       expect(document.activeElement).not.toBe(document.body);
+    });
+
+    it.each([
+      ["the / search line", "/", "search", "the search line failed and closed"],
+      ["the : command line", ":", "exLine", "the command line failed and closed"],
+    ] as const)("%s", (_name, key, flag, flash) => {
+      const { container } = start("conversation");
+      keys(container, key);
+      const bar = container.querySelector<HTMLElement>(".search-bar")!;
+      expect(bar.contains(document.activeElement), "the line holds the keys").toBe(true);
+      broken[flag] = true;
+      renderAgain();
+      expect(container.querySelector(".search-bar")).toBeNull();
+      expect(container.querySelector(".band-message")?.textContent).toBe(flash);
+      const root = rootOf(container);
+      expect(document.activeElement, "the keys are on the panel again").toBe(root);
+      fireEvent.keyDown(root, { key: "?", shiftKey: true });
+      expect(container.querySelector(".keymap-overlay"), "and a key does what it does there").not.toBeNull();
     });
 
     it("the /model picker", () => {
