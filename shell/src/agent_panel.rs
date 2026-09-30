@@ -53,7 +53,7 @@ const PUMP_POLL_INTERVAL_MS: u64 = 33;
 /// It is the legacy backend's real close time with room to spare (~0.8s of grace periods plus
 /// three thread joins) and is knowingly shorter than the sidecar path's documented worst case --
 /// this backstop's expiry only releases the application hold, it does not kill anything, so
-/// "knowingly short" here means eitri's own process may exit before a still-reaping sidecar
+/// "knowingly short" here means Eitri's own process may exit before a still-reaping sidecar
 /// finishes its cleanup, not that anything gets SIGKILLed early; `AgentPanelHandle::shutdown`'s
 /// handoff branch says what expiring costs.
 const HANDOFF_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);

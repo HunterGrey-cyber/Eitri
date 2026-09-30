@@ -1,6 +1,6 @@
 //! The shell's embedded Lua extension kernel -- a separate, independent runtime from Neovim's
 //! own internal Lua. Exposes exactly four v1
-//! extension points under a `eitri` global table: `panel.register`, `command.register`, `on`,
+//! extension points under an `eitri` global table: `panel.register`, `command.register`, `on`,
 //! `config.get`/`config.set`, plus `keymap.prefix`/`keymap.set`/`keymap.del`.
 
 mod panel;
@@ -150,7 +150,7 @@ impl LuaEngine {
     /// the agent are not registered here at all: every window has them).
     ///
     /// **One exception, a startup failure: a command id `eitri.command.register` refused**
-    /// (sw-lua-5, `CommandRegistry::refused`). It is a config value eitri validates, and like
+    /// (sw-lua-5, `CommandRegistry::refused`). It is a config value Eitri validates, and like
     /// `agent.font_size` or a keybinding collision (`main.rs`) it exits 1 naming itself -- rather
     /// than a window that silently lacks everything init.lua registered after it, the account pin
     /// among them. Checked after the file has run, so a `pcall` around the call changes nothing.

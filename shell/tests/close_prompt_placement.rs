@@ -72,7 +72,7 @@ fn prompt_box() -> Result<(f32, f32), String> {
 
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     bar.set_size_request(-1, BAR_HEIGHT);
-    let name = gtk4::Label::new(Some("eitri"));
+    let name = gtk4::Label::new(Some("Eitri"));
     let strip = gtk4::Label::new(Some("proj"));
     bar.append(&name);
     bar.append(&strip);

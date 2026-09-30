@@ -664,7 +664,7 @@ mod tests {
     }
 }
 
-// ---- eitri additions (2026-09-23): what the bottom terminal needs beyond the frozen module ----
+// ---- Eitri additions (2026-09-23): what the bottom terminal needs beyond the frozen module ----
 
 /// Which of foot's two clipboard chords a key is ([`clipboard_chord`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

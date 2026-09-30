@@ -711,7 +711,7 @@ fn build_ui(
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("eitri")
+        .title("Eitri")
         .default_width(1280)
         .default_height(760)
         // No HeaderBar: decorated(false) suppresses GTK's own CSD titlebar entirely -- the
@@ -1346,7 +1346,7 @@ fn build_ui(
             };
             match terminal::on_exit(scope) {
                 terminal::OnExit::CloseWindow => {
-                    println!("[terminal] the shell ended; the last module on screen closes eitri");
+                    println!("[terminal] the shell ended; the last module on screen closes Eitri");
                     window.close();
                     false
                 }
@@ -1872,7 +1872,7 @@ fn build_ui(
         }
     }
 
-    // --- Ctrl+h/j/k/l in the terminal: eitri's, always.
+    // --- Ctrl+h/j/k/l in the terminal: Eitri's, always.
     // Capture phase on its own widget, like the web modules' controllers above, so the chord is
     // claimed before the terminal's key controller hands it to the shell. Unlike theirs, all four
     // are swallowed even with no module that way, so what the shell receives never depends on the
@@ -2544,7 +2544,7 @@ mod tests {
 
     /// The overlay's "Anywhere in the window" rows come from `eitri_core::keymap::root`, and its
     /// `Ctrl+j` row exists only because of the terminal: every chord the terminal gives up to
-    /// eitri (`terminal::navigation`, asked about each letter) must be named there.
+    /// Eitri (`terminal::navigation`, asked about each letter) must be named there.
     #[test]
     fn every_chord_the_terminal_gives_up_is_in_the_root_help() {
         let documented: std::collections::HashSet<String> = eitri_core::keymap::root::help_rows()
@@ -2591,7 +2591,7 @@ mod tests {
         assert_eq!(
             gone_editor_toast_text(&LayoutError::Gone(ModuleId::editor())),
             Some(
-                "nvim exited and cannot restart in this window \u{2014} relaunch eitri to get the editor back"
+                "nvim exited and cannot restart in this window \u{2014} relaunch Eitri to get the editor back"
                     .to_string()
             )
         );

@@ -85,7 +85,7 @@ fn notice_for(
         return None;
     }
     Some(format!(
-        "eitri: this `tmux` is eitri's pane-switch shim (TMUX is set for nvim inside eitri).\n\
+        "eitri: this `tmux` is Eitri's pane-switch shim (TMUX is set for nvim inside Eitri).\n\
          Run the real tmux with:  env -u TMUX {}",
         real_tmux_after(path_var, own_dir, shim)
     ))
@@ -288,7 +288,7 @@ mod tests {
         let a = args(&["-S", "/s", "display-message", "-p", "x"]);
         let notice = notice_for(&a, true, Some(&path_var), &own_dir, None).expect("a notice on a real tty call");
         assert!(
-            notice.starts_with("eitri: this `tmux` is eitri's pane-switch shim (TMUX is set for nvim inside eitri)."),
+            notice.starts_with("eitri: this `tmux` is Eitri's pane-switch shim (TMUX is set for nvim inside Eitri)."),
             "got {notice:?}"
         );
         assert!(

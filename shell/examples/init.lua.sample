@@ -1,4 +1,4 @@
--- eitri example init.lua
+-- Eitri example init.lua
 --
 -- `shell` loads `<config dir>/init.lua` once at startup, after its two built-in panels
 -- (the editor on the left, the agent-panel placeholder on the right) are already registered

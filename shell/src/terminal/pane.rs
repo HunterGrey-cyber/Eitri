@@ -1321,7 +1321,7 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
     let keys = EventControllerKey::new();
     // GTK runs the input method on every key before `key-pressed`/`key-released` below, and a key it
     // consumes never reaches them (phase 2; the editor's own wiring, `neovide-editor/src/keyboard.rs`).
-    // eitri's own chords never get this far: they are taken in the capture phase.
+    // Eitri's own chords never get this far: they are taken in the capture phase.
     keys.set_im_context(Some(im));
     {
         let state = state.clone();
@@ -1371,7 +1371,7 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
             state.borrow_mut().delivered.mark(keyval);
             deliver(&state, raw_key(&area, keyval, keycode, modifier, true, repeat));
             // Claimed unconditionally: every key that reaches the terminal is the child's. The keys
-            // eitri keeps were taken before this controller ever saw them.
+            // Eitri keeps were taken before this controller ever saw them.
             glib::Propagation::Stop
         });
     }

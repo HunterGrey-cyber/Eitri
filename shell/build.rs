@@ -90,7 +90,7 @@ fn emit_build_info(workspace_root: &Path) {
 /// **The root of its own checkout, not merely inside one.** `git` climbs to the nearest enclosing
 /// repository, so without this check a tree with no `.git` of its own -- the source asset, unpacked
 /// anywhere, or its `neovide/` directory -- would report whatever repository happens to
-/// contain it as eitri's commit or the fork's rev. `--show-toplevel` must name `dir` itself.
+/// contain it as Eitri's commit or the fork's rev. `--show-toplevel` must name `dir` itself.
 ///
 /// Also registers `dir`'s HEAD with cargo ([`watch_git_head`]), so a development build reruns this
 /// script when HEAD moves and `--version` names the commit it was built from. Before that, the

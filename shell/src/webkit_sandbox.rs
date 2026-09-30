@@ -21,9 +21,10 @@
 //! commands for this install's layout, and the escape hatch. `main()` also prints it to stderr.
 //! This module does not set the escape hatch or disable the sandbox automatically.
 //!
-//! The packaged AppArmor profile is installed as configuration for the packaged executable.
-//! A restart or `apparmor_parser -r` loads it. For other installs, [`render_profile`] uses
-//! the resolved executable path and a profile name containing the user ID, so different
+//! `packaging/apparmor/eitri` is the one profile text. The `.deb` installs it as
+//! `/etc/apparmor.d/eitri` for `/usr/lib/eitri/shell`, as configuration with no maintainer
+//! script, so a restart or `apparmor_parser -r` loads it. For other installs, [`render_profile`]
+//! writes the same text with the resolved executable path and the profile name `eitri-user-<uid>`, so different
 //! users' installs do not replace each other's profiles. The literal path limits the grant
 //! to that install rather than using a home-directory glob.
 //! `packaging/install.sh` renders the same profile through `apparmor_render`;
@@ -64,7 +65,7 @@ const TEMPLATE_LOCAL: &str = "include if exists <local/eitri>";
 /// is killed (by the pid this process spawned) and the probe tells nothing.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// What eitri does about `WebView`s in this process.
+/// What Eitri does about `WebView`s in this process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decision {
     /// WebKit's sandbox can start here, or nothing here restricts it: `WebView`s are built as always.
@@ -340,18 +341,18 @@ pub(crate) fn plan_fix(exe: &Path, packaged_profile_exists: bool, data_home: Opt
 /// fix; the escape hatch. `write_error`: the rendered profile could not be written.
 pub(crate) fn notice(reason: &str, fix: Option<&Fix>, write_error: Option<&str>) -> String {
     let mut text = format!(
-        "eitri's agent panel is off: this system does not let WebKit start its sandbox (Ubuntu's AppArmor \
+        "Eitri's agent panel is off: this system does not let WebKit start its sandbox (Ubuntu's AppArmor \
          restriction on unprivileged user namespaces; bwrap said \"{reason}\"). The editor and the terminal work \
          as usual.\n\n"
     );
     match fix {
         Some(fix) if fix.write.is_none() => text.push_str(
-            "To fix it once, load the AppArmor profile the eitri package installed (or restart the computer), \
-             then reopen eitri:\n\n",
+            "To fix it once, load the AppArmor profile the Eitri package installed (or restart the computer), \
+             then reopen Eitri:\n\n",
         ),
-        Some(_) => text.push_str("To fix it once, install and load eitri's AppArmor profile, then reopen eitri:\n\n"),
+        Some(_) => text.push_str("To fix it once, install and load Eitri's AppArmor profile, then reopen Eitri:\n\n"),
         None => text.push_str(
-            "eitri cannot name an AppArmor profile for this install: one that grants `userns` to this program \
+            "Eitri cannot name an AppArmor profile for this install: one that grants `userns` to this program \
              fixes it.\n",
         ),
     }
@@ -363,11 +364,11 @@ pub(crate) fn notice(reason: &str, fix: Option<&Fix>, write_error: Option<&str>)
         }
         text.push_str(&format!("\nThe profile: {}\n", fix.profile.display()));
         if let Some(error) = write_error {
-            text.push_str(&format!("(eitri could not write it: {error})\n"));
+            text.push_str(&format!("(Eitri could not write it: {error})\n"));
         }
     }
     text.push_str(&format!(
-        "\nStarting eitri with {ESCAPE_HATCH}=1 also works, but it removes the operating system's sandbox from \
+        "\nStarting Eitri with {ESCAPE_HATCH}=1 also works, but it removes the operating system's sandbox from \
          the process that renders the model's output.\n"
     ));
     text
@@ -697,11 +698,11 @@ mod tests {
 
         let packaged = plan_fix(Path::new("/usr/lib/eitri/shell"), true, None, UID).unwrap();
         let text = notice("x", Some(&packaged), None);
-        assert!(text.contains("load the AppArmor profile the eitri package installed (or restart the computer)"));
+        assert!(text.contains("load the AppArmor profile the Eitri package installed (or restart the computer)"));
         assert!(text.contains("\n    sudo apparmor_parser -r /etc/apparmor.d/eitri\n"));
 
         let text = notice("x", Some(&fix), Some("disk full"));
-        assert!(text.contains("(eitri could not write it: disk full)"));
+        assert!(text.contains("(Eitri could not write it: disk full)"));
         let text = notice("x", None, None);
         assert!(text.contains("cannot name an AppArmor profile") && text.contains(ESCAPE_HATCH));
     }

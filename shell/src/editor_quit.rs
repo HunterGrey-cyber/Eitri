@@ -41,7 +41,7 @@ pub(crate) const UNREACHABLE_NVIM: &str = "nvim's launcher exited and nvim still
 /// A relaunch shows the editor again, so the message explains how to get it back
 /// without claiming to know why it exited.
 pub(crate) const RETIRED_EDITOR_TEXT: &str =
-    "nvim exited and cannot restart in this window \u{2014} relaunch eitri to get the editor back";
+    "nvim exited and cannot restart in this window \u{2014} relaunch Eitri to get the editor back";
 
 /// What nvim's quit-cancelled letter did ([`EditorQuitting::cancelled`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1031,7 +1031,7 @@ mod tests {
     fn the_retired_editors_text_claims_no_cause() {
         assert!(!RETIRED_EDITOR_TEXT.contains(":qa"));
         assert!(!RETIRED_EDITOR_TEXT.contains("prefix x"));
-        assert!(RETIRED_EDITOR_TEXT.contains("relaunch eitri"));
+        assert!(RETIRED_EDITOR_TEXT.contains("relaunch Eitri"));
     }
 
     /// A launcher that does not `exec` can exit while nvim is still handling a window close.

@@ -430,7 +430,7 @@ mod tests {
 
     /// A web module's `WebHost` exists only to hold its `WebView` at (0,0) (`web_host`'s module doc)
     /// and must add nothing around it: the host's rectangle is the module's and the `WebView`'s. No
-    /// rule here names the host's node, so eitri's own stylesheet gives it no padding, border or
+    /// rule here names the host's node, so Eitri's own stylesheet gives it no padding, border or
     /// background of its own.
     #[test]
     fn no_rule_names_the_web_host() {

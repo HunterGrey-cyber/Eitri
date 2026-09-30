@@ -40,12 +40,12 @@ use neovide_editor::CallWatch;
 /// `running`/`queued` are the agent's tabs with a turn or a connect in flight and its queued
 /// messages (the window-close prompt's two counts). For [`KillScope::Module`] they are the agent's
 /// own consequences, ignored for any other module; for [`KillScope::Window`] -- the last module on
-/// screen, whose kill closes eitri -- they are the window close's, for every module, so this one
+/// screen, whose kill closes Eitri -- they are the window close's, for every module, so this one
 /// question stands in for that one too.
 pub(crate) fn prompt(id: &ModuleId, title: &str, scope: KillScope, running: usize, queued: usize) -> String {
     let mut consequences = Vec::new();
     if scope == KillScope::Window {
-        consequences.push("closes eitri".to_string());
+        consequences.push("closes Eitri".to_string());
         if running > 0 {
             consequences.push(format!("{running} running"));
         }
@@ -592,25 +592,25 @@ mod tests {
         );
     }
 
-    /// The last module on screen: the kill closes eitri, and the one question also carries the
+    /// The last module on screen: the kill closes Eitri, and the one question also carries the
     /// window close's own `N running, M queued` (it is not asked a second time), for every module.
     #[test]
     fn the_last_modules_prompt_says_it_closes_eitri_and_what_is_running() {
         assert_eq!(
             prompt(&ModuleId::editor(), "editor", KillScope::Window, 0, 0),
-            "kill-pane editor? closes eitri (y/n)"
+            "kill-pane editor? closes Eitri (y/n)"
         );
         assert_eq!(
             prompt(&ModuleId::editor(), "editor", KillScope::Window, 2, 1),
-            "kill-pane editor? closes eitri, 2 running, 1 queued (y/n)"
+            "kill-pane editor? closes Eitri, 2 running, 1 queued (y/n)"
         );
         assert_eq!(
             prompt(&ModuleId::terminal(), "terminal", KillScope::Window, 1, 0),
-            "kill-pane terminal? closes eitri, 1 running (y/n)"
+            "kill-pane terminal? closes Eitri, 1 running (y/n)"
         );
         assert_eq!(
             prompt(&ModuleId::agent(), "agent", KillScope::Window, 0, 3),
-            "kill-pane agent? closes eitri, 3 queued (y/n)"
+            "kill-pane agent? closes Eitri, 3 queued (y/n)"
         );
     }
 
