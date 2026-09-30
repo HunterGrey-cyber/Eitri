@@ -970,9 +970,10 @@ fn build_ui(
         })
     };
 
-    // A module key or tray chip focuses the agent's oldest pending card if one waits
-    // (`focus_oldest_card`). Otherwise it enters BROWSE on the last row, like every
-    // other keyboard arrival through `move_focus`.
+    // A module key or tray chip focuses the oldest pending card in the chat if one
+    // waits (`focus_oldest_card`). Otherwise it enters BROWSE, like other keyboard
+    // arrivals. The page's `App.tsx` arrival effect selects the last row when the
+    // reader was following it, or restores the row and scroll position they left.
     let arrive: Rc<dyn Fn(&ModuleId)> = {
         let agent_panel_handle = agent_panel_handle.clone();
         Rc::new(move |id| {
@@ -1360,8 +1361,8 @@ fn build_ui(
 
     // --- A module takes the keys by keyboard: `Ctrl+h/j/k/l` (`move_focus`, below) and `prefix ;`/
     // `prefix o` (the prefix's `Action::SelectLast`/`SelectNext`) land the same way. A zoom ends
-    // first, as tmux's `select-pane` does. Arriving in the agent lands in BROWSE, on the
-    // last row,
+    // first, as tmux's `select-pane` does. Arriving in the agent lands in BROWSE rather than in
+    // the composer, on the last row if the reader was following it, else where they left it,
     // and `arrive` also drops a bypass prompt. A click on a row does not come through here and
     // still lands in BROWSE on that row. `false`: the module did not take the keys.
     let land_by_key: Rc<dyn Fn(&ModuleId) -> bool> = {

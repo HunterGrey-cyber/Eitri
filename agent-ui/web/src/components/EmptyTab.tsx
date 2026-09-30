@@ -337,6 +337,25 @@ export function EmptyTab(props: EmptyTabProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.arriveRequest]);
+  /* Failure disables the focused composer, which can move focus to <body> and leave retry
+     keys dependent on document replay. Focus the root before entering BROWSE so this screen
+     can handle them. The live layout only ends VISUAL and sets BROWSE because its conversation
+     root already handles replayed keys. Move focus only if it is in the disabled composer or
+     outside this screen, and never while an overlay is open. */
+  const wasFailed = useRef(failed);
+  useEffect(() => {
+    const turnedFailed = failed && !wasFailed.current;
+    wasFailed.current = failed;
+    if (!turnedFailed || props.overlayOpen) return;
+    const root = rootRef.current;
+    if (root === null) return;
+    const active = document.activeElement;
+    const deadControl = active instanceof HTMLTextAreaElement && active.disabled;
+    if (root.contains(active) && !deadControl) return;
+    root.focus({ preventScroll: true });
+    setMode("browse");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [failed]);
   /** `App`'s `[keysRequest]` effect bumps this directly because this layout has no
    *  `containerRef`. If the root already contains the active element, DOM focus survived the GTK
    *  focus transfer and needs no change, just as in the live conversation's `takeKeys` guard. */
@@ -451,6 +470,9 @@ export function EmptyTab(props: EmptyTabProps) {
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (props.answerConfirm?.(event)) return;
+    // An overlay such as a chooser or rename owns the keys. A key replayed from <body> that reaches
+    // this root must not act on the tab behind the overlay.
+    if (props.overlayOpen) return;
     // Pass every other keydown to the typing guard first, as `App.tsx` does.
     // The leader handler below asks the guard whether the key stood alone.
     const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();

@@ -2088,6 +2088,30 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(getComputedStyle(sign).boxShadow).toBe("inset 0 0 0 1.5px var(--nv-fg)");
   });
 
+  /* A HINT-landed code block is the current item until the next key: `y` copies it and `v`
+     starts inside it. Outline the block in the body's ink, thinner while the panel lacks the keys.
+     Hollow the row's sign meanwhile so only one solid mark is shown, as for a focused control. */
+  it("K07: outlines a HINT-landed code block, thinner without the keys, and hollows the row's sign", () => {
+    const landed = (focused: string) =>
+      `<div class="message-list" data-focused="${focused}" data-code-landed=""><div class="row row-assistant row-current">` +
+      `<span class="row-sign">●</span><div class="row-body"><pre class="code-block" data-hint-landed=""><code>x</code></pre></div></div></div>`;
+    const block = computed(landed("true"), "pre.code-block");
+    expect(block.outlineStyle).toBe("solid");
+    expect(block.outlineWidth).toBe("2px");
+    expect(block.outlineColor).toBe("var(--nv-fg)");
+    expect(computed(landed("false"), "pre.code-block").outlineWidth).toBe("1.5px");
+    const sign = computed(landed("true"), ".row-sign");
+    expect(sign.background).not.toBe("var(--nv-fg)");
+    expect(sign.color).toBe("var(--nv-fg)");
+    expect(sign.boxShadow).toBe("inset 0 0 0 1.5px var(--nv-fg)");
+    // Not landed: no outline, and the sign is the solid cursor.
+    const plain =
+      `<div class="message-list" data-focused="true"><div class="row row-assistant row-current">` +
+      `<span class="row-sign">●</span><div class="row-body"><pre class="code-block"><code>x</code></pre></div></div></div>`;
+    expect(computed(plain, "pre.code-block").outlineStyle).not.toBe("solid");
+    expect(computed(plain, ".row-sign").background).toBe("var(--nv-fg)");
+  });
+
   it("draws the panel's cursor solid with focus and hollow without", () => {
     const row = (focused: string) =>
       `<div class="message-list" data-focused="${focused}"><div class="row row-tool row-current"><span class="row-sign">⚙</span><div class="row-body">x</div></div></div>`;
