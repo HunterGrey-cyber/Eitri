@@ -1,11 +1,11 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=66f05a6769f94351f3f6550642af1b851575f1be72b768f6e26e933ceb5eeba3 -->
+<!-- translated-from: README.md sha256=4441ed568013cdae1f12c86fcef1eea7a2dea874e292da0da9fc56fa6d163b60 -->
 
 # Eitri
 
 **你的 Neovim，旁边是 Claude Code。**
 
-一个你愿意读下去的 Claude Code：渲染好的 markdown 和 diff、权限卡片，全程不用去碰鼠标。Eitri 是一个 Linux 桌面窗口（MIT 许可），包在你自己的 Neovim 配置和你已安装的 `claude` 外面。代码始终由你掌控：每一处改动都是一份要经你阅读的 diff；在 auto 模式下，除了项目内的编辑和安全的读取，其余操作都会等你回答。
+一个你愿意读下去的 Claude Code：渲染好的 markdown 和 diff、权限卡片，全程不用去碰鼠标。Eitri 是一个 Linux 桌面窗口（MIT 许可），包在你自己的 Neovim 配置和你已安装的 `claude` 外面。
 
 <!-- MEDIA: hero.png -- the whole window. Left: the editor on LazyVim, a file open, a Visual selection.
 Right: the panel mid-conversation: a markdown reply with a highlighted code block, a folded tool-call
@@ -14,8 +14,7 @@ edit outside the project or on a protected path such as `.git/`). Terminal hidde
 2, shown at width 900; the caption names the desktop, session type and distribution. -->
 
 - **你自己的 Neovim。** 一个真正的 `nvim --embed`，加载你的 `init.lua`、插件、LSP 和按键映射，由 Neovide GPU 渲染器的一个 fork 绘制；Eitri 只为自己保留少数几个按键。
-- **每处改动都摆在眼前。** agent 做的每一次编辑，在面板里都是单独的一行 diff，文件也会在你的 Neovim 里重新加载。卡片用一个按键回答：`a` 允许，`d` 拒绝。
-- **读得下去的回复。** markdown、按你配色方案的语法颜色高亮的代码，以及结果可以折叠的工具调用。当前文件的文件名，以及 Visual 选区（如果有的话），会随每条提示一起发送。
+- **读得下去的回复。** markdown、按你配色方案的语法颜色高亮的代码、结果可以折叠的工具调用，以及每一次编辑各占一行的 diff；编辑之后，你已打开且没改过的文件会在你的 Neovim 里重新加载。当前文件的文件名，以及 Visual 选区（如果有的话），会随每条提示一起发送。
 - **键盘优先。** 面板里用 vim 的按键，窗口用 tmux 的按键（前缀键 `Ctrl+b`），`Ctrl+h/j/k/l` 在各窗格之间移动。
 - **一个项目一个窗口**：多个 agent 会话放在标签页里，一个底部终端，以及按项目保存的布局。
 
@@ -59,7 +58,7 @@ its code block follow each switch. 1280x800, 6 seconds or less, under 3 MB. -->
 
 | | 编辑器 | agent | 你在哪里读 agent 的工作成果 |
 |---|---|---|---|
-| Eitri | Neovim（`nvim --embed`，你自己的配置） | Claude Code | 编辑器旁边一个渲染后的面板 |
+| Eitri | Neovim（`nvim --embed`，你自己的配置） | Claude Code | 编辑器旁边一个渲染后的面板。它目前是一个独立的窗口；从你终端里正在用的 Neovim 打开它、关掉后回到原处，在路线图上。 |
 | [avante.nvim](https://github.com/avante-corp/avante.nvim) | Neovim（插件） | 多家 LLM 提供商；ACP agent，其中包括 Claude Code | Neovim 窗口里的侧边栏聊天 |
 | [codecompanion.nvim](https://github.com/olimorris/codecompanion.nvim) | Neovim（插件） | LLM 适配器；ACP agent，其中包括 Claude Code | 一个聊天 buffer；较大的修改建议放在浮动窗口的 diff 里 |
 | [claude-code.nvim](https://github.com/greggh/claude-code.nvim) | Neovim（插件） | Claude Code | Neovim 窗口里的 Claude Code 终端界面 |
@@ -71,9 +70,9 @@ its code block follow each switch. 1280x800, 6 seconds or less, under 3 MB. -->
 
 ## 为什么不是插件
 
-如果你想留在终端里，就用上面的某个插件。它们保留了你的终端、你的 tmux 会话和 `ssh`；Eitri 这三样都放弃了。而且，如果单是 Neovide 本身还不足以让你离开终端，那么 Eitri 的编辑器这一半同样不构成理由：编辑器就是同一个 Neovim，以同样的方式绘制。
+我们自己也住在终端里，也不打算劝你搬走。Eitri 走出终端只为一件事：把回复排成文档来读，这是终端的字符格子画不出来的。上面那些 Neovim 插件，以及 tmux 窗格里跑的 `claude`，都让你留在终端、tmux 和 `ssh` 里；Eitri 多出来的是“读”。而且，如果单是 Neovide 本身还不足以让你离开终端，那么 Eitri 的编辑器这一半同样不构成理由：编辑器就是同一个 Neovim，以同样的方式绘制。
 
-理由在另一半：在你接受之前，读一读 agent 做了什么。在终端或 Neovim buffer 里，回复是画进一个单一字体的字符格子网格里的。Eitri 把它放进 WebView 里排版（正文、表格、代码块、diff），并让它周围的一切仍按 Vim 的方式运作：面板有模式、计数、`gg`/`G`、搜索和你的 leader 键；批准就是在卡片上按 `a`；整个窗口由 tmux 的按键驱动。Zed 和 Cursor 也会渲染 agent 的工作成果，只不过是围绕它们自己的编辑器。
+理由在另一半：读一读 agent 做了什么。在终端或 Neovim buffer 里，回复是画进一个单一字体的字符格子网格里的。Eitri 把它放进 WebView 里排版（正文、表格、代码块、diff），并让它周围的一切仍按 Vim 的方式运作：面板有模式、计数、`gg`/`G`、搜索和你的 leader 键；批准就是在卡片上按 `a`；整个窗口由 tmux 的按键驱动。Zed 和 Cursor 也会渲染 agent 的工作成果，只不过是围绕它们自己的编辑器。
 
 代价：一个 GUI 窗口（Linux、x86_64，在 Wayland 上测试过；不支持远程编辑）、Claude Code 是唯一的 agent，以及比原生 Neovide 更多的内存和 GPU 时间，因为面板是一个 WebView。测量环境为 headless sway（Intel Core Ultra 5 125H，Mesa 26.2.2，GTK 4.22.5，WebKitGTK 2.52.6，165 Hz 下 3072x1920，缩放 1.5），两个应用都用 `nvim --clean` 和全新的用户配置，原生 Neovide 由同一个 fork 构建，面板停在空标签页上、没有 agent 在运行；尚未在 GTK 4.14 或 Ubuntu 24.04 上测量：
 
@@ -101,6 +100,20 @@ used on, and what was exercised only in the project's headless GUI sandbox. -->
 - 已安装的 Claude Code ≥ 2.1.252 且 < 3.0。Eitri 不捆绑 Claude Code，它运行的是你自己装的那份。
 - 对于在安装时于你机器上构建的 agent sidecar：需要网络访问（安装脚本会获取 Verdandi 源码和它自己锁定版本的 Node.js；不使用系统的 Node 或 npm），以及约 600 MiB 的可用空间。
 
+## 路线图
+
+按这个顺序，不给日期。
+
+1. ACP 客户端：Claude Code 以外的 agent 也能进面板，先接 Codex。
+2. `@` 引用：从 Neovim 里挑文件、符号和诊断。
+3. 行内 diff：agent 的修改直接画在你的 Neovim buffer 里，逐块接受或丢弃。
+4. 一轮对话改过的文件一次看完，并能整轮回滚。
+5. 从终端出发：在你正在用的 Neovim 里敲 `:Eitri`，窗口接上同一个会话；关掉窗口，就回到终端里原来的位置。
+
+## 遥测
+
+Eitri 自己不增加任何遥测；Claude Code 自己的遥测按你的 Claude Code 设置来。
+
 ## 许可证
 
 MIT（[LICENSE](LICENSE)），`terminal-input/` 除外，它是 Apache-2.0（派生自 Alacritty；见它自己的 `NOTICE`）。编辑器窗格构建在 [Neovide](https://github.com/neovide/neovide)（MIT）的一个 fork 之上。
@@ -116,3 +129,5 @@ agent sidecar 打包了 Anthropic 的 Claude Agent SDK，它不是开源软件�
 - [CONTRIBUTING.md](CONTRIBUTING.md)（仅有英文版）：从源码构建和运行测试
 - [HunterGrey-cyber/neovide](https://github.com/HunterGrey-cyber/neovide)：Neovide 的 fork（`neovibe-integration` 分支）
 - [HunterGrey-cyber/verdandi](https://github.com/HunterGrey-cyber/verdandi)：agent sidecar
+
+Eitri 的开发有 Claude 协助。

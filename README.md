@@ -4,10 +4,9 @@ English | [简体中文](README.zh-CN.md)
 
 **Your Neovim, with Claude Code beside it.**
 
-A Claude Code you'd actually want to read: rendered markdown and diffs, permission cards — without
+A Claude Code you'd actually want to read: rendered markdown and diffs, permission cards, all without
 reaching for the mouse. Eitri is a Linux desktop window (MIT) around your own Neovim configuration and
-the `claude` you have installed. You keep control of the code: each change is a diff you read, and in
-auto mode anything beyond an in-project edit or a safe read waits for your answer.
+the `claude` you have installed.
 
 <!-- MEDIA: hero.png -- the whole window. Left: the editor on LazyVim, a file open, a Visual selection.
 Right: the panel mid-conversation: a markdown reply with a highlighted code block, a folded tool-call
@@ -17,10 +16,9 @@ edit outside the project or on a protected path such as `.git/`). Terminal hidde
 
 - **Your own Neovim.** A real `nvim --embed` with your `init.lua`, plugins, LSP and keymaps, drawn by a
   fork of Neovide's GPU renderer; Eitri keeps only a few keys for itself.
-- **Every change in front of you.** Each edit the agent makes is its own diff row in the panel, and the
-  file reloads in your Neovim. Cards are answered with a key: `a` allows, `d` denies.
-- **Replies you can read.** Markdown, code highlighted in your colorscheme's syntax colours, and tool
-  calls with foldable results. The current file's name and any Visual selection go with each prompt.
+- **Replies you can read.** Markdown, code highlighted in your colorscheme's syntax colours, tool calls
+  with foldable results, and each edit as its own diff row; after an edit, an open file you have not
+  modified reloads in your Neovim. The current file's name and any Visual selection go with each prompt.
 - **Keyboard first.** vim keys in the panel, tmux keys for the window (prefix `Ctrl+b`), and
   `Ctrl+h/j/k/l` across panes.
 - **One window per project**: several agent sessions in tabs, a bottom terminal, and a layout that
@@ -85,7 +83,7 @@ Other ways to run a coding agent next to Neovim, as each project describes itsel
 
 | | Editor | Agent | Where you read the agent's work |
 |---|---|---|---|
-| Eitri | Neovim (`nvim --embed`, your config) | Claude Code | A rendered panel beside the editor |
+| Eitri | Neovim (`nvim --embed`, your config) | Claude Code | A rendered panel beside the editor. For now it is a window of its own; opening it from the Neovim you already run in a terminal, and landing back there when you close it, is on the roadmap. |
 | [avante.nvim](https://github.com/avante-corp/avante.nvim) | Neovim (plugin) | Many LLM providers; ACP agents, Claude Code among them | A sidebar chat in Neovim windows |
 | [codecompanion.nvim](https://github.com/olimorris/codecompanion.nvim) | Neovim (plugin) | LLM adapters; ACP agents, Claude Code among them | A chat buffer; larger proposed edits in a floating diff |
 | [claude-code.nvim](https://github.com/greggh/claude-code.nvim) | Neovim (plugin) | Claude Code | Claude Code's terminal UI in a Neovim window |
@@ -97,12 +95,14 @@ Other ways to run a coding agent next to Neovim, as each project describes itsel
 
 ## Why not a plugin
 
-If you want to stay in the terminal, use one of the plugins above. They keep your terminal, your tmux
-session and `ssh`; Eitri gives all three up. And if Neovide on its own was not a reason to leave the
-terminal, Eitri's editor half is not one either: the editor is the same Neovim, drawn the same way.
+We live in the terminal too, and we are not asking you to move out. Eitri steps outside it for one
+thing terminal cells cannot draw: the reply laid out as a document. The Neovim plugins above and a tmux
+pane running `claude` keep you in the terminal, tmux and `ssh`; what Eitri adds is the reading. And if
+Neovide on its own was not a reason to leave the terminal, Eitri's editor half is not one either: the
+editor is the same Neovim, drawn the same way.
 
-The reason is the other half: reading what the agent did before you accept it. In a terminal or a
-Neovim buffer, a reply is drawn into a grid of cells in one font. Eitri lays it out in a web view
+The reason is the other half: reading what the agent did. In a terminal or a Neovim buffer, a reply is
+drawn into a grid of cells in one font. Eitri lays it out in a web view
 (prose, tables, code blocks, diffs) and keeps everything around it Vim-shaped: the panel has modes,
 counts, `gg`/`G`, search and your leader key; approving is `a` on a card; the window is driven by
 tmux's keys. Zed and Cursor also render the agent's work, but around their own editor.
@@ -150,6 +150,21 @@ used on, and what was exercised only in the project's headless GUI sandbox. -->
 - For the agent sidecar, built on your machine at install time: network access (the installer fetches
   the Verdandi source and its own pinned Node.js; no system Node or npm is used) and about 600 MiB free.
 
+## Roadmap
+
+In this order, no dates.
+
+1. An ACP client: agents other than Claude Code in the panel, Codex first.
+2. `@` references to files, symbols and diagnostics, picked from Neovim.
+3. Inline diffs: the agent's edit drawn in your Neovim buffer, taken or dropped hunk by hunk.
+4. Every file a turn changed in one view, and a way to roll the turn back.
+5. Start from your terminal: `:Eitri` in the Neovim you already run opens this window on the same
+   session, and closing the window puts you back in the terminal where you left off.
+
+## Telemetry
+
+Eitri adds no telemetry of its own; Claude Code's own follows your Claude Code settings.
+
 ## Licence
 
 MIT ([LICENSE](LICENSE)), except `terminal-input/`, which is Apache-2.0 (derived from Alacritty; see
@@ -171,3 +186,5 @@ Anthropic's own terms.
 - [CONTRIBUTING.md](CONTRIBUTING.md): building from source and running the tests
 - [HunterGrey-cyber/neovide](https://github.com/HunterGrey-cyber/neovide): the Neovide fork (`neovibe-integration`)
 - [HunterGrey-cyber/verdandi](https://github.com/HunterGrey-cyber/verdandi): the agent sidecar
+
+Eitri is developed with Claude's assistance.
