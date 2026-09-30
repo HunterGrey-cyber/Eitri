@@ -56,7 +56,7 @@ fn real_pretooluse_permission_allow_end_to_end() {
     // resolve every request by its own permissionId, assume no count, and assume nothing about
     // which tool the first one is for.
     //
-    // Neovibe's own product path was always right about this -- `AgentSessionProjection`'s
+    // Eitri's own product path was always right about this -- `AgentSessionProjection`'s
     // `pending_permissions` is a map and `agent-ui`'s is an array -- so what this fixes is the test,
     // not the client.
     let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();

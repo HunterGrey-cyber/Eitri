@@ -9,10 +9,10 @@ t_http_nonloopback_refused() {
 		# The logging curl stub is first on PATH: a refusal must come before any download.
 		inst --stubs "$S/stubs-net" -- --base-url "$u" --release-signers "$SIGNERS"
 		expect_fail "--base-url $u"
-		expect_out "neovibe: error: --base-url $u: "
+		expect_out "eitri: error: --base-url $u: "
 	done
 	if [ -s "$S/logs/curl.log" ]; then fail "a refused base URL was fetched: $(cat "$S/logs/curl.log")"; fi
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_absent "$TH/.local/lib/eitri"
 	expect_absent "$TH/.cache"
 }
 
@@ -24,12 +24,12 @@ t_http_tricky_hosts_refused() {
 		"http://localhost.$EVIL:8080/" "http://127.0.0.1:$PORT@$EVIL/" "http://x@127.0.0.1:$PORT/"; do
 		inst --stubs "$S/stubs-net" -- --base-url "$u" --release-signers "$SIGNERS"
 		expect_fail "--base-url $u"
-		expect_out "neovibe: error: --base-url $u: "
+		expect_out "eitri: error: --base-url $u: "
 		# Spec §6.2's own rule: no `@` anywhere in an http authority, checked before the host.
 		case $u in *@*) expect_out "may not carry a user part ('@')" ;; esac
 	done
 	if [ -s "$S/logs/curl.log" ]; then fail "a refused base URL was fetched: $(cat "$S/logs/curl.log")"; fi
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_absent "$TH/.local/lib/eitri"
 }
 
 TESTS="$TESTS t_http_loopback_accepted"
@@ -79,11 +79,11 @@ t_wget_never_used() {
 		expect_out 'Install curl (sudo apt install curl) and re-run'
 	done
 	if [ -s "$S/logs/wget.log" ]; then fail "wget was run: $(cat "$S/logs/wget.log")"; fi
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_absent "$TH/.local/lib/eitri"
 	expect_absent "$TH/.cache"
 	# An offline install downloads nothing, so it needs no curl.
 	d=$S/fix/v1.0.0
-	inst --stubs "$S/stubs-wget" --path-tail "$S/path-no-curl" -- --tarball "$d/neovibe-1.0.0-x86_64-linux.tar.gz" \
+	inst --stubs "$S/stubs-wget" --path-tail "$S/path-no-curl" -- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" \
 		--sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" --release-signers "$SIGNERS"
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.0.0 "installed from files with no curl"

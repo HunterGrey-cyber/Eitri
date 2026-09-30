@@ -57,7 +57,7 @@ describe("renderToolCall", () => {
     expect(ruled.container.textContent).not.toContain("allowed by auto");
   });
 
-  /** O3 review item 7: a call whose CLI prompt neovibe answered without a card says so, muted, the
+  /** O3 review item 7: a call whose CLI prompt Eitri answered without a card says so, muted, the
    *  way a call a saved rule answered does; a call without one says nothing of the kind. */
   it("says when the CLI's own prompt for a call was answered without a card", () => {
     const { container } = render(<>{renderToolCall(call({ name: "Write", promptNote: "Claude Code safety check — allowed in bypass" }))}</>);

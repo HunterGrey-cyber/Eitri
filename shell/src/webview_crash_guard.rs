@@ -121,7 +121,7 @@ pub(crate) fn crash_message_html(recovery: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0;padding:24px;\
 font-family:sans-serif;background:#1e1e1e;color:#d4d4d4;\"><p>This panel's web process kept crashing, \
-so neovibe stopped trying to reload it automatically.</p><p>{recovery}</p></body></html>"
+so Eitri stopped trying to reload it automatically.</p><p>{recovery}</p></body></html>"
     )
 }
 

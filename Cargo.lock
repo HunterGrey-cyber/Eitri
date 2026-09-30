@@ -946,6 +946,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
+name = "eitri-core"
+version = "0.2.0-rc.1"
+dependencies = [
+ "agent",
+ "libc",
+ "mlua",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "eitri-terminal"
+version = "0.2.0-rc.1"
+dependencies = [
+ "alacritty_terminal",
+ "libc",
+ "log",
+ "rustix 1.1.4",
+ "rustix-openpty",
+ "skia-safe",
+ "terminal-frame",
+ "terminal-input",
+ "terminal-render",
+ "terminal-sync",
+ "unicode-width",
+]
+
+[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2540,36 +2570,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "neovibe-core"
-version = "0.2.0-rc.1"
-dependencies = [
- "agent",
- "libc",
- "mlua",
- "rmpv",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "neovibe-terminal"
-version = "0.2.0-rc.1"
-dependencies = [
- "alacritty_terminal",
- "libc",
- "log",
- "rustix 1.1.4",
- "rustix-openpty",
- "skia-safe",
- "terminal-frame",
- "terminal-input",
- "terminal-render",
- "terminal-sync",
- "unicode-width",
-]
-
-[[package]]
 name = "neovide"
 version = "0.16.2"
 dependencies = [
@@ -4013,13 +4013,13 @@ version = "0.2.0-rc.1"
 dependencies = [
  "agent",
  "alacritty_terminal",
+ "eitri-core",
+ "eitri-terminal",
  "futures-channel",
  "gtk4",
  "libc",
  "libloading 0.9.0",
  "mlua",
- "neovibe-core",
- "neovibe-terminal",
  "neovide",
  "neovide-editor",
  "serde_json",

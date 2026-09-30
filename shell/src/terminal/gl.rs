@@ -1,5 +1,5 @@
 //! Moved from `terminal-pane/src/gl.rs` on `freeze/terminal-stack` @ `1e715ab` (2026-09-23),
-//! unchanged below this paragraph. It lives in `shell` rather than in `neovibe-terminal` because the
+//! unchanged below this paragraph. It lives in `shell` rather than in `eitri-terminal` because the
 //! libepoxy lookup it does is how a GtkGLArea's GL is reached, not how a terminal paints: a macOS
 //! host would bring its own.
 //!

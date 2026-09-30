@@ -4,7 +4,7 @@
 //! **Why a request and not keys.** `NeovideEditorPane::send_keys` goes through `nvim_input`, and
 //! typed keys are read as whatever nvim is waiting for: after `f`, inside `getchar()`, after an
 //! insert-mode `Ctrl-V`, the first key of a command becomes that one character and the rest runs as
-//! Normal-mode commands (`neovibe_core::layout::kill::editor_quit_lua`'s doc has the measurement). A
+//! Normal-mode commands (`eitri_core::layout::kill::editor_quit_lua`'s doc has the measurement). A
 //! request types nothing. It is what stock Neovide's own window close sends, too: `ParallelCommand::
 //! Quit` runs `exit_handler.lua` through `nvim_exec_lua`.
 //!

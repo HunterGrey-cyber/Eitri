@@ -136,14 +136,14 @@ export type ResumableSession = {
 };
 export type PermissionModeChoice = "auto" | "bypass";
 
-/** The command that continues a conversation Neovibe has just closed, in the user's own terminal.
+/** The command that continues a conversation Eitri has just closed, in the user's own terminal.
  *
  * Arrives once, in a `handoff` envelope, and only AFTER the real session shutdown has finished —
  * `agent_panel.rs`'s `collect_pending_handoff` dispatches it there and nowhere else, so nobody can
- * be looking at this line while Neovibe is still driving the session.
+ * be looking at this line while Eitri is still driving the session.
  *
  * `command` is a ready-to-paste POSIX-shell line (`cd <dir> && claude --resume <id>`), built by
- * Rust from the same argv the supported `neovibe-claude-handoff` wrapper would `exec`. `cwd` and
+ * Rust from the same argv the supported `eitri-claude-handoff` wrapper would `exec`. `cwd` and
  * `providerSessionId` are its own parts, sent so the panel can name them without re-parsing the
  * line it was given.
  *
@@ -186,8 +186,8 @@ export type ProviderInfo = {
 
 /** Which of the two records a restored history came from. The panel says which, because the two
  * can genuinely differ: Claude's own transcript is what `claude --resume` in a terminal would show,
- * while Neovibe's copy is this side's unilateral record of the same session. */
-export type HistorySource = "claude_transcript" | "neovibe_copy";
+ * while Eitri's copy is this side's unilateral record of the same session. */
+export type HistorySource = "claude_transcript" | "eitri_copy";
 
 /** One statement about the history a resumed session was seeded with (design §5.5).
  *
@@ -217,10 +217,10 @@ export type HistoryNotice = {
   /** The Claude transcript that was looked for and not used. `null` when `source` is
    * `claude_transcript`, and when no path could be built at all. */
   attemptedTranscriptPath: string | null;
-  /** Why Claude's own transcript was not used. Non-null exactly when `source` is `neovibe_copy`. */
+  /** Why Claude's own transcript was not used. Non-null exactly when `source` is `eitri_copy`. */
   fallbackReason: string | null;
   /** The CLI release that wrote the transcript. Never a schema version, and nothing branches on
-   * it. `null` on the `neovibe_copy` path, which has no such concept. */
+   * it. `null` on the `eitri_copy` path, which has no such concept. */
   writerVersion: string | null;
 };
 
@@ -235,7 +235,7 @@ export type ContextSummary = { file: string | null; lines: [number, number] | nu
 export type AgentUiState = {
   backend: BackendKind;
   /** Three identities, deliberately never collapsed into one field.
-   *  conversationId    -- Neovibe's own, stable for a workspace (null on the legacy backend)
+   *  conversationId    -- Eitri's own, stable for a workspace (null on the legacy backend)
    *  sessionId         -- Verdandi's, what every RPC is addressed with
    *  providerSessionId -- Claude's, what `claude --resume <id>` takes (null until the provider
    *                       reports it, which is why a session that never took a turn has none) */
@@ -422,7 +422,7 @@ export type AgentDomainEvent =
   | { type: "session_unavailable"; reason: string }
   | { type: "session_closed"; reason: string }
   /** Wave 5, Task 1/2: the sidecar's own acknowledgement of a `set_permission_mode` RPC (W1, a
-   *  synchronous unary call issued on the GTK thread, never optimistic). `mode` is neovibe's own
+   *  synchronous unary call issued on the GTK thread, never optimistic). `mode` is Eitri's own
    *  `PermissionModeChoice`; `provider_mode` is Verdandi's raw string (diagnostics only); `floor_applied`
    *  is `true` exactly when Verdandi's bypass floor (`usesDefaultBypassDeny`) still restricted
    *  the session (a deny list) despite `unrestricted: true` -- logged loudly, never silently. **The reducer ignores
@@ -430,11 +430,11 @@ export type AgentDomainEvent =
    *  on this per-session projection, so folding it here would just be a second, driftable copy. */
   | { type: "permission_mode_changed"; mode: PermissionModeChoice; provider_mode: string; floor_applied: boolean };
 
-/** A session tab's identity for its whole life, and the bridge's (`neovibe_core::tabs::TabId`). */
+/** A session tab's identity for its whole life, and the bridge's (`eitri_core::tabs::TabId`). */
 export type TabId = number;
-/** `neovibe_core::agent_bridge::TabStateWire`. */
+/** `eitri_core::agent_bridge::TabStateWire`. */
 export type TabState = "not_started" | "starting" | "live" | "ended" | "failed";
-/** `neovibe_core::tabs::Marker::wire()`. Precedence is Rust's: ⚑ > ✕ > working > •. */
+/** `eitri_core::tabs::Marker::wire()`. Precedence is Rust's: ⚑ > ✕ > working > •. */
 export type TabMarker = "needs_input" | "ended" | "working" | "unread";
 export type TabInfo = {
   id: TabId;

@@ -3,8 +3,8 @@
 //!
 //! **What this does NOT do, and why.** It starts nothing and it takes no lease. The supported,
 //! strongly-exclusive handoff the design doc describes (§8.3, and `agent::handoff::
-//! prepare_neovibe_to_cli_handoff` which implements it) works by spawning
-//! `neovibe-claude-handoff` as a direct child with the already-locked lease fd inherited and the
+//! prepare_eitri_to_cli_handoff` which implements it) works by spawning
+//! `eitri-claude-handoff` as a direct child with the already-locked lease fd inherited and the
 //! host's own stdio inherited -- it hands the CALLER's terminal to `claude`. `shell` is a GUI
 //! process and has no terminal to hand over: under a desktop launcher its stdio is not a terminal
 //! at all, and under `cargo run` it is a terminal `shell` is itself still writing `eprintln!`
@@ -18,7 +18,7 @@
 //! terminal emulator's interface promises to preserve a file descriptor it knows nothing about
 //! across the fork/exec that starts the command, and whether any of these does has NOT been
 //! tested here. The failure that matters is not "the lock was silently dropped" but "fd number N
-//! is open and refers to something else": `neovibe-claude-handoff`'s own sanity check is
+//! is open and refers to something else": `eitri-claude-handoff`'s own sanity check is
 //! `fcntl(fd, F_GETFD)`, which only asks whether the descriptor is open, so a reused number would
 //! pass it and `claude` would run believing it holds a lease it does not.
 //!
@@ -31,7 +31,7 @@
 //!
 //! What this module DOES enforce is the ordering §8.3 asks for, **steps 1-4 and only those**:
 //! `agent_panel` closes the session for real and waits for that close to finish before the command
-//! is ever shown. The user cannot be looking at the command while Neovibe is still driving the
+//! is ever shown. The user cannot be looking at the command while Eitri is still driving the
 //! session.
 //!
 //! Step 5 (保存 Neovibe projection 与 provider session ID) is NOT done here, and saying "steps 1-5"
@@ -43,7 +43,7 @@
 //! `ClaudeResumeCommand` in the Rust host, so a reloaded document is handed it again. That is the
 //! command, not the transcript -- the conversation itself is gone from this panel either way.
 //!
-//! `agent::handoff::prepare_neovibe_to_cli_handoff` is therefore still without a consumer. It is
+//! `agent::handoff::prepare_eitri_to_cli_handoff` is therefore still without a consumer. It is
 //! the right mechanism for a host that owns a terminal; `shell` is not one.
 
 use agent::handoff::{ClaudeResumeCommand, ResumeCommandError};

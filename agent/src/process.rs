@@ -150,12 +150,12 @@ pub const CONSERVATIVE_DISALLOWED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "N
 /// permission flag reliably blocks all tool use. It is the second line; the hook is the first.
 ///
 /// **Resolved by R07 (2026-09-27): the ruling's stated expiry is this design — the CLI never runs in
-/// `bypassPermissions`; bypass is neovibe answering every request `allow`, and still denies
+/// `bypassPermissions`; bypass is Eitri answering every request `allow`, and still denies
 /// nothing.**
 pub fn disallowed_tools() -> &'static [&'static str] {
     // Empty, not `CONSERVATIVE_DISALLOWED_TOOLS`. The hook gates every tool (matcher `*`), so an edit
     // or a shell command reaches the policy, and through it the user as a card when it needs one
-    // (owner's ruling, 2026-09-25) -- or, in bypass, neovibe's own `allow` (R07). On the sidecar path
+    // (owner's ruling, 2026-09-25) -- or, in bypass, Eitri's own `allow` (R07). On the sidecar path
     // an empty list is sent as `unrestricted` (see `providers::claude_sidecar::build_create_request`).
     // The constant itself is untouched: it is still the floor Verdandi injects for a caller that says
     // nothing, and it is still hand-copied there as `CONSERVATIVE_BYPASS_DENY`.
@@ -174,13 +174,13 @@ pub fn disallowed_tools() -> &'static [&'static str] {
 pub const SETTING_SOURCES_NOTE: &str =
     "project + local only (.claude/ and CLAUDE.md here); ~/.claude's settings, hooks, plugins and CLAUDE.md are not loaded";
 
-/// The host's answer mode — whether neovibe answers every permission request `allow` itself. Never
+/// The host's answer mode — whether Eitri answers every permission request `allow` itself. Never
 /// sent to the CLI (R07).
 ///
 /// It used to be the CLI's own posture: `Auto` spawned `--permission-mode auto` under the hook and
 /// `Bypass` spawned `bypassPermissions` with no hook at all. Since R07 (2026-09-27) every session on
 /// both backends runs gated -- `--permission-mode default` plus the `PreToolUse` hook on legacy,
-/// `INTERACTIVE` on the sidecar -- and this is only what `neovibe-core` passes to the one point that
+/// `INTERACTIVE` on the sidecar -- and this is only what `eitri-core` passes to the one point that
 /// answers requests. No session request carries it (spec §2.3): a parameter the wire ignored would
 /// break "a requested permission mode must never silently become a different one", and one the wire
 /// honoured would be a way back to `bypassPermissions`.
@@ -197,7 +197,7 @@ pub enum PermissionMode {
 
 /// What a permission mode the CLI reports about itself means for a gated session (spec §2.3, D12).
 ///
-/// Neovibe asks for `default` on both backends. A project's own `.claude/settings.json` can set
+/// Eitri asks for `default` on both backends. A project's own `.claude/settings.json` can set
 /// `permissions.defaultMode`, but an explicit `--permission-mode default` outranks it: measured on
 /// CLI 2.1.283 (2026-09-28), `acceptEdits` there reports `default` and a `Write` is denied, and
 /// `bypassPermissions` there is ignored even with no flag. Legacy passes the flag and the sidecar
@@ -211,7 +211,7 @@ pub enum PermissionMode {
 /// anything not known to be at least as strict as `default` stops the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliModeReport {
-    /// `default`: what neovibe asked for.
+    /// `default`: what Eitri asked for.
     Default,
     /// `plan` or `dontAsk`: stricter than `default` -- a non-answer still denies. Noted once, the
     /// session continues.
@@ -417,7 +417,7 @@ fn spawn_hook_listener(
                 write_fail_closed_deny(
                     &stream,
                     &format!(
-                        "the CLI reports permission mode '{reported}' -- neovibe runs only sessions \
+                        "the CLI reports permission mode '{reported}' -- Eitri runs only sessions \
                          it gates itself; this call is denied and the session is being closed"
                     ),
                 );
@@ -650,7 +650,7 @@ impl AgentProcess {
     /// it: the hook configuration goes in argv and the per-conversation socket in the temp dir.
     ///
     /// There is no mode parameter (R07): every conversation runs the CLI in `default` under the
-    /// `PreToolUse` gate, and whether neovibe answers `allow` on its own is decided above this
+    /// `PreToolUse` gate, and whether Eitri answers `allow` on its own is decided above this
     /// crate's session API, never by the CLI.
     pub fn spawn(project_dir: &Path, disallowed_tools: &[&str]) -> std::io::Result<Self> {
         Self::spawn_with_binary(project_dir, disallowed_tools, "claude")
@@ -751,7 +751,7 @@ impl AgentProcess {
             // the tree (`spawn_hook_listener`'s fail-closed paragraph calls that exactly the leak
             // this hook exists to close). It is also the sidecar's mode underneath, so one real-CLI
             // probe describes both backends (spec §2.3). And never the ungated mode (R07): bypass is
-            // neovibe answering `allow`, not a CLI flag.
+            // Eitri answering `allow`, not a CLI flag.
             .arg("--permission-mode")
             .arg("default")
             .stdin(Stdio::piped())
@@ -1143,7 +1143,7 @@ mod deny_list_tests {
     ///
     /// **Resolved by R07, 2026-09-27: one list for both, because there is one CLI mode.** Neither
     /// half of the history above is undone -- `Auto` still offers every tool under the gate, and
-    /// bypass still denies nothing -- but bypass is now neovibe answering `allow` under that same
+    /// bypass still denies nothing -- but bypass is now Eitri answering `allow` under that same
     /// gate rather than a CLI with none, so the question "do the two modes need different lists"
     /// no longer has two modes to ask it of. `disallowed_tools()` is that one list.
     #[test]
@@ -1153,7 +1153,7 @@ mod deny_list_tests {
             assert!(
                 !list.contains(&tool),
                 "{tool} must be offered: the PreToolUse hook gates every call (owner's ruling, 2026-09-25), \
-                 and bypass, neovibe's own allow, denies nothing (2026-09-20, R07)"
+                 and bypass, Eitri's own allow, denies nothing (2026-09-20, R07)"
             );
         }
         // Empty, and that is the whole list: an empty list is what makes the legacy spawn omit
@@ -1165,7 +1165,7 @@ mod deny_list_tests {
         );
     }
 
-    /// D12's classification, one row per value the spec names: `default` is what neovibe asks for,
+    /// D12's classification, one row per value the spec names: `default` is what Eitri asks for,
     /// `plan`/`dontAsk` still deny on a non-answer, empty is unreported, and everything else --
     /// including a value no build of this crate has seen -- stops the session.
     #[test]
@@ -1188,7 +1188,7 @@ mod deny_list_tests {
     /// statement: it owns no tool namespace, and a hardcoded list of real tool names on its side
     /// would rot. So it is named as a known hole in its own proto comment rather than fixed there.
     ///
-    /// This list is the statement neovibe sends. Lowercasing one entry here would disarm the floor
+    /// This list is the statement Eitri sends. Lowercasing one entry here would disarm the floor
     /// over there, install no hook, and emit no notice — nothing anywhere would say so. This repo
     /// owns this list, so this is the one place the hole can be closed: an edit has to be
     /// deliberate enough to update an assertion that spells the consequence out.
@@ -1871,7 +1871,7 @@ mod tests {
         }
     }
 
-    /// `default` is what neovibe asked for: an ordinary request, filed, and nothing noted.
+    /// `default` is what Eitri asked for: an ordinary request, filed, and nothing noted.
     #[test]
     fn a_hook_call_in_default_is_an_ordinary_request() {
         let socket_path = temp_socket_path();

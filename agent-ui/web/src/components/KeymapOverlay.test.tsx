@@ -56,7 +56,7 @@ describe("KeymapOverlay", () => {
       expect(text).toContain(row.what);
     }
     // Typing carries four rows of its own on top of INPUT_KEYS: the pane-switch chord and the
-    // prefix (C6), plus V1 C1's `Ctrl+k`/`Ctrl+j` -- all four of which neovibe (or Rust's mirror)
+    // prefix (C6), plus V1 C1's `Ctrl+k`/`Ctrl+j` -- all four of which Eitri (or Rust's mirror)
     // keeps for itself rather than handing to the composer. "This panel" carries one of its own on
     // top of BROWSE_KEYS (V1 C1): `Ctrl+j`, Rust's mirror claiming the chord ahead of `resolveKey`.
     // Neither GTK-decided pair can live in `BROWSE_KEYS`/`INPUT_KEYS` themselves -- both are tied to
@@ -69,7 +69,7 @@ describe("KeymapOverlay", () => {
     );
   });
 
-  it("names the chords neovibe keeps while typing (C6)", () => {
+  it("names the chords Eitri keeps while typing (C6)", () => {
     const { container } = render(
       <KeymapOverlay onClose={() => {}} windowKeys={[]} prefixKeys={[]} prefixLabel="Ctrl+b" panel={EMPTY_PANEL_TABLE} />,
     );
@@ -77,7 +77,7 @@ describe("KeymapOverlay", () => {
     // Fix round 1 (reviewer finding): narrowed to h/l -- j/k are claimed by the two rows below
     // instead, so the pane row no longer claims them too.
     expect(typing.textContent).toContain("Ctrl+h / l");
-    expect(typing.textContent).toContain("Move between panes (neovibe keeps these)");
+    expect(typing.textContent).toContain("Move between panes (Eitri keeps these)");
     expect(typing.textContent).toContain("Ctrl+b");
     // V1 C1 (spec §3.1, §3.5): the mirror's own Ctrl+k/Ctrl+j, spliced in the same way.
     expect(typing.textContent).toContain("Back to browsing (as Esc)");

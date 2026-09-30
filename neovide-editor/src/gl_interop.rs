@@ -342,7 +342,7 @@ pub(crate) fn current_content_region(fb: (i32, i32), grid_scale: GridScale) -> P
 /// Wave 4 (owner: "neovim最下面的空白应该填在上面"): the render callback, the resize handler, the
 /// tick's resync and hit testing each used to derive this themselves, some from GTK's reported
 /// framebuffer and some from `widget.width() * scale_factor()`; one function over one size means
-/// they cannot drift apart. neovibe-only.
+/// they cannot drift apart. eitri-only.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GridLayout {
     pub region: PixelRect<f32>,
@@ -371,7 +371,7 @@ pub(crate) fn grid_layout(
 /// Whether two grid scales are the same cell, compared by bits. `GridScale` has no `PartialEq`,
 /// and a plain f32 `!=` would call a NaN cell (before nvim reports a font) "changed" on every
 /// frame -- the render callback would then ask for another frame forever, the P11 idle-CPU
-/// regression. By bits, NaN equals itself. neovibe-only.
+/// regression. By bits, NaN equals itself. eitri-only.
 pub(crate) fn same_grid_scale(a: GridScale, b: GridScale) -> bool {
     (a.width().to_bits(), a.height().to_bits()) == (b.width().to_bits(), b.height().to_bits())
 }

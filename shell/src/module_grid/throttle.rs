@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use neovibe_core::layout::{ModuleId, Rect, Size};
+use eitri_core::layout::{ModuleId, Rect, Size};
 
 /// P7's debounce: a web host gets its real size this long after the last change.
 pub(crate) const QUIET: Duration = Duration::from_millis(70);

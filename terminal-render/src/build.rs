@@ -73,7 +73,7 @@ pub enum CursorColoring {
     /// stays visible whatever colours a program paints under the cursor. A fixed
     /// colour taken from a host's theme is invisible on a cell the program
     /// painted near it -- a dark theme's pale foreground on LazyVim's light
-    /// background, neovibe's GUI pass 2026-09-23, defect 3.
+    /// background, Eitri's GUI pass 2026-09-23, defect 3.
     CellInverse,
 }
 

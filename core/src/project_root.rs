@@ -31,7 +31,7 @@ use std::path::PathBuf;
 /// The environment variable consulted when no directory was given on the command line. Exists so a
 /// launcher (`.desktop` entry, sandbox harness) can point `shell` at a project without having to
 /// control its working directory.
-const PROJECT_DIR_ENV: &str = "NEOVIBE_PROJECT_DIR";
+const PROJECT_DIR_ENV: &str = "EITRI_PROJECT_DIR";
 
 /// Every option `main()` itself matches on, listed here because this function is the only place
 /// that can tell a flag from a path that happens to start with `-`.
@@ -90,7 +90,7 @@ pub fn flag_given<'a>(args: impl IntoIterator<Item = &'a OsStr>, flag: &str) -> 
 pub(crate) enum RootSource {
     /// The first positional (non-`-`-prefixed) command-line argument, or whatever followed `--`.
     Argument(OsString),
-    /// `NEOVIBE_PROJECT_DIR`.
+    /// `EITRI_PROJECT_DIR`.
     Env(OsString),
     /// Neither was given -- fall back to this process's own working directory.
     Cwd,
@@ -184,7 +184,7 @@ pub(crate) fn select_root_source<'a>(
         return Ok(RootSource::Argument(arg.to_os_string()));
     }
     Ok(match env {
-        // An empty value is treated as unset: `export NEOVIBE_PROJECT_DIR=` (or a launcher
+        // An empty value is treated as unset: `export EITRI_PROJECT_DIR=` (or a launcher
         // interpolating an unset variable) is a far likelier explanation than a request to open a
         // project whose path is the empty string.
         Some(value) if !value.is_empty() => RootSource::Env(value.to_os_string()),
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn an_empty_environment_value_counts_as_unset() {
-        // `export NEOVIBE_PROJECT_DIR=` is a common shell accident; canonicalizing "" fails with a
+        // `export EITRI_PROJECT_DIR=` is a common shell accident; canonicalizing "" fails with a
         // bare ENOENT that reads as a missing directory rather than as an unset variable.
         assert_eq!(select([], Some("")), Ok(RootSource::Cwd));
     }
@@ -396,11 +396,11 @@ mod tests {
     #[test]
     fn a_missing_directory_is_an_error_naming_both_the_path_and_where_it_came_from() {
         let err = canonicalize_source(
-            &RootSource::Env(OsString::from("/definitely/not/a/real/neovibe/project")),
+            &RootSource::Env(OsString::from("/definitely/not/a/real/eitri/project")),
             Ok(PathBuf::from("/tmp")),
         )
         .expect_err("a missing directory must not silently fall back to the cwd");
-        assert!(err.contains("/definitely/not/a/real/neovibe/project"), "got {err}");
+        assert!(err.contains("/definitely/not/a/real/eitri/project"), "got {err}");
         assert!(err.contains(PROJECT_DIR_ENV), "got {err}");
     }
 
@@ -409,7 +409,7 @@ mod tests {
         // `shell README.md` would otherwise hand a regular file to nvim's cwd and to the agent's
         // project_dir, each of which fails differently and later.
         let file = std::env::temp_dir().join(format!(
-            "neovibe-project-root-test-{}-{}",
+            "eitri-project-root-test-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn the_selected_source_is_the_one_that_gets_canonicalized() {
         let real = std::env::temp_dir().canonicalize().expect("temp_dir exists");
-        let missing = "/definitely/not/a/real/neovibe/project";
+        let missing = "/definitely/not/a/real/eitri/project";
 
         // Argument beats env, all the way through to the returned path.
         let args = [OsString::from(real.display().to_string())];

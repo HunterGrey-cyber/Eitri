@@ -6,12 +6,12 @@
 //! ```sh
 //! claude --version    # record the build
 //! XDG_STATE_HOME=/tmp/nv-friction-real-state \
-//!     cargo test -p neovibe-core --test panel_friction_real_cli -- --ignored --nocapture --test-threads=1
+//!     cargo test -p eitri-core --test panel_friction_real_cli -- --ignored --nocapture --test-threads=1
 //! ```
 
-use neovibe_core::agent_backend::{AgentBackend, BackendKind};
-use neovibe_core::agent_bridge::SessionModeChoice;
-use neovibe_core::tab_set::{SendNow, TabBackend, TabSet};
+use eitri_core::agent_backend::{AgentBackend, BackendKind};
+use eitri_core::agent_bridge::SessionModeChoice;
+use eitri_core::tab_set::{SendNow, TabBackend, TabSet};
 use std::time::{Duration, Instant};
 
 fn project(label: &str) -> std::path::PathBuf {
@@ -21,11 +21,11 @@ fn project(label: &str) -> std::path::PathBuf {
     dir.canonicalize().unwrap()
 }
 
-fn live_set(dir: &std::path::Path) -> (TabSet, neovibe_core::tabs::TabId) {
+fn live_set(dir: &std::path::Path) -> (TabSet, eitri_core::tabs::TabId) {
     live_set_on(BackendKind::Sidecar, dir)
 }
 
-fn live_set_on(kind: BackendKind, dir: &std::path::Path) -> (TabSet, neovibe_core::tabs::TabId) {
+fn live_set_on(kind: BackendKind, dir: &std::path::Path) -> (TabSet, eitri_core::tabs::TabId) {
     let mut set = TabSet::new(kind, SessionModeChoice::Auto);
     let tab = set.active();
     let backend = AgentBackend::start(kind, dir, None)
@@ -35,7 +35,7 @@ fn live_set_on(kind: BackendKind, dir: &std::path::Path) -> (TabSet, neovibe_cor
     (set, tab)
 }
 
-fn transcript(set: &TabSet, tab: neovibe_core::tabs::TabId) -> String {
+fn transcript(set: &TabSet, tab: eitri_core::tabs::TabId) -> String {
     let projection = set.get(tab).unwrap().live().unwrap().projection();
     projection
         .transcript
@@ -49,7 +49,7 @@ fn pump_until(
     set: &mut TabSet,
     dir: &std::path::Path,
     what: &str,
-    mut done: impl FnMut(&mut TabSet, Vec<neovibe_core::tabs::TabId>) -> bool,
+    mut done: impl FnMut(&mut TabSet, Vec<eitri_core::tabs::TabId>) -> bool,
 ) {
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
@@ -211,7 +211,7 @@ fn a_rule_answers_its_command_and_git_log_output_still_cards() {
 fn deny_the_next_card(
     set: &mut TabSet,
     dir: &std::path::Path,
-    tab: neovibe_core::tabs::TabId,
+    tab: eitri_core::tabs::TabId,
     prompt: &str,
     label: &str,
 ) -> agent::PermissionRequestRecord {

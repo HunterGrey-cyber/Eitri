@@ -409,7 +409,7 @@ describe("applyEvent", () => {
   it("a fresh session carries no history notice", () => {
     expect(initialState().history).toBeNull();
     // `r` on an ended session starts over, and starting over restores nothing.
-    expect(resetToStartScreen({ ...initialState(), history: { source: "neovibe_copy", restoredItems: 1, omittedItems: 0, uptoSeq: 1, sourcePath: "/x", attemptedTranscriptPath: null, fallbackReason: "transcript file not found", writerVersion: null } }).history).toBeNull();
+    expect(resetToStartScreen({ ...initialState(), history: { source: "eitri_copy", restoredItems: 1, omittedItems: 0, uptoSeq: 1, sourcePath: "/x", attemptedTranscriptPath: null, fallbackReason: "transcript file not found", writerVersion: null } }).history).toBeNull();
   });
 
   it("applySnapshot replaces the whole state wholesale", () => {
@@ -473,7 +473,7 @@ describe("partial assistant streaming", () => {
   it("accumulates a streamed reply into ONE transcript entry, not one per delta", () => {
     // The defect this pins: under partial streaming a 600-word reply arrives as 400+ deltas. One
     // transcript entry each renders 400 separate bubbles, every fragment markdown-parsed alone --
-    // so "`neovibe_" or "**bold" is not valid standalone markdown and the formatting breaks.
+    // so "`eitri_" or "**bold" is not valid standalone markdown and the formatting breaks.
     let state = applyEvent(initialState(), opened);
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     for (const chunk of ["The ", "quick ", "**brown** ", "fox"]) state = applyEvent(state, delta(chunk));

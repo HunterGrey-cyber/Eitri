@@ -29,7 +29,7 @@ runner; pytest itself must still be importable.)
 No container, no network: `VerifyRecipeRefusesTamperedInstallShTests` and `PublicTreeLayoutTests`
 build their fixtures under pytest's own `tmp_path` fixture (an autouse fixture, since they are
 `unittest.TestCase`s; pytest puts it under `$TMPDIR`, else `/tmp`, unless `--basetemp` is given), or,
-under plain unittest, in a fresh directory under `~/.cache/neovibe-public-docs-tests` removed after
+under plain unittest, in a fresh directory under `~/.cache/eitri-public-docs-tests` removed after
 each test -- never a bare `tempfile.mkdtemp()`. The required flags are parsed out of the real
 packaging/install.sh -- never hardcoded a second time here -- so a future change to fetch()'s own
 flags is what this test tracks, not a copy that could drift from it. The "catches a regression" tests
@@ -50,7 +50,7 @@ import unittest
 import pytest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SCRATCH_ROOT = os.path.expanduser("~/.cache/neovibe-public-docs-tests")
+_SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-public-docs-tests")
 _PACKAGING = os.path.dirname(_HERE)
 _REPO_ROOT = os.path.dirname(_PACKAGING)
 _INSTALL_SH = os.path.join(_PACKAGING, "install.sh")
@@ -81,7 +81,7 @@ _VERIFY_RECIPE_END = "<!-- verify-recipe:end -->"
 
 _README_ONE_LINER = (
     "curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL "
-    "https://github.com/HunterGrey-cyber/neovibe/releases/latest/download/install.sh | sh"
+    "https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh"
 )
 
 # A line documenting the installer, in a public doc: curl ... install.sh ... | sh [-s -- ...].
@@ -246,7 +246,7 @@ class FindCurlInstallLinesTests(unittest.TestCase):
     def test_finds_a_fenced_one_liner_and_ignores_unrelated_lines(self):
         doc = "\n".join(
             [
-                "# neovibe",
+                "# eitri",
                 "",
                 "Some prose about install.sh, not a command.",
                 "```sh",
@@ -342,8 +342,8 @@ class VerifyRecipeHashStepTests(unittest.TestCase):
 
     def test_the_recipe_also_verifies_the_signature(self):
         self.assertIn("ssh-keygen -Y verify", self.recipe)
-        self.assertIn("release@neovibe", self.recipe)
-        self.assertIn("neovibe-release", self.recipe)
+        self.assertIn("release@eitri", self.recipe)
+        self.assertIn("eitri-release", self.recipe)
 
 
 class VerifyRecipeRefusesTamperedInstallShTests(unittest.TestCase):
@@ -389,7 +389,7 @@ class VerifyRecipeRefusesTamperedInstallShTests(unittest.TestCase):
             key_type, key_data = f.read().split()[:2]
         signers_path = os.path.join(self.tmp, "release-signers")
         with open(signers_path, "w", encoding="utf-8") as f:
-            f.write(f'release@neovibe namespaces="neovibe-release" {key_type} {key_data}\n')
+            f.write(f'release@eitri namespaces="eitri-release" {key_type} {key_data}\n')
 
         install_sh = os.path.join(self.tmp, "install.sh")
         with open(install_sh, "w", encoding="utf-8") as f:
@@ -401,7 +401,7 @@ class VerifyRecipeRefusesTamperedInstallShTests(unittest.TestCase):
             f.write(f"{_sha256_file(install_sh)}  install.sh\n")
 
         subprocess.run(
-            ["ssh-keygen", "-Y", "sign", "-f", key_path, "-n", "neovibe-release", sums_path],
+            ["ssh-keygen", "-Y", "sign", "-f", key_path, "-n", "eitri-release", sums_path],
             check=True,
             capture_output=True,
         )

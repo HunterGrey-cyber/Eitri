@@ -1,13 +1,13 @@
 //! The inverse of wire 1's `compose_turn_text`: taking the editor-context block back off a prompt
 //! that was read from disk.
 //!
-//! **Why this is not in `neovibe_core::editor_context`, where the design asked for it.**
+//! **Why this is not in `eitri_core::editor_context`, where the design asked for it.**
 //! `docs/superpowers/specs/2026-09-20-resume-history-design.md` §3.1.2 specifies
-//! `neovibe_core::editor_context::strip_composed_block`, "written in the same module" as
-//! `compose_turn_text`. That is not buildable: `neovibe-core` depends on `agent` (`core/Cargo.toml`),
+//! `eitri_core::editor_context::strip_composed_block`, "written in the same module" as
+//! `compose_turn_text`. That is not buildable: `eitri-core` depends on `agent` (`core/Cargo.toml`),
 //! and the history reader that needs this function lives in `agent`, so putting the function in
-//! `core` would need `agent -> neovibe-core -> agent`. The function therefore lives here, and
-//! `neovibe_core::editor_context` re-exports it under exactly the path the design names, so a
+//! `core` would need `agent -> eitri-core -> agent`. The function therefore lives here, and
+//! `eitri_core::editor_context` re-exports it under exactly the path the design names, so a
 //! caller sees what §3.1.2 describes. The round-trip property test the design asks for
 //! (`strip(compose(t, ctx)) == t`) lives beside `compose_turn_text`'s own cases in
 //! `core/src/editor_context/compose.rs`, which is the half of §3.1.2 that matters: the two

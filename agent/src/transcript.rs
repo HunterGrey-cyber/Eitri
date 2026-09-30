@@ -11,9 +11,9 @@
 //! What is overturned is only its general form, "never, for any purpose".
 //!
 //! It is overturned because the panel is empty after a resume, and this file is the only place on
-//! disk that remembers the conversation. Neovibe's own copy (`$XDG_STATE_HOME/neovibe/history/`,
+//! disk that remembers the conversation. Eitri's own copy (`$XDG_STATE_HOME/eitri/history/`,
 //! [`crate::history::store`]) exists as a fallback, but it cannot be the primary source: it only
-//! covers sessions Neovibe itself drove, and only from the day it was added.
+//! covers sessions Eitri itself drove, and only from the day it was added.
 //!
 //! **What a real transcript looks like, measured 2026-09-20** over the 822 `.jsonl` files (570 MB,
 //! 117,826 lines) under this machine's own `$CLAUDE_CONFIG_DIR/projects` -- note
@@ -75,7 +75,7 @@ use std::time::Duration;
 ///
 /// **Correction (2026-09-21): this process's own `CLAUDE_CONFIG_DIR` is the *fallback*, not the
 /// answer.** When [`crate::account`] has been given an account -- `init.lua`'s
-/// `neovibe.config.set("agent.account", ...)` -- the directory comes from that account's own
+/// `eitri.config.set("agent.account", ...)` -- the directory comes from that account's own
 /// convention instead, because this process's variable says only which account launched the
 /// window, while the account says which one the CLI is spending. The two were different on the
 /// host this was found on (`.claude-personal` inherited, `.claude-work` written), which is why a
@@ -173,12 +173,12 @@ pub const AI_TITLE_TAIL_BYTES: u64 = 64 * 1024;
 /// this module's constraint 3.
 ///
 /// **Bounded and cheap, because its caller is the GTK main loop.**
-/// `BackendGreeting::for_kind` already reads Neovibe's own small records synchronously there, and
+/// `BackendGreeting::for_kind` already reads Eitri's own small records synchronously there, and
 /// `persistence`'s own retention cap already bounds how many rows a picker can have
 /// (`MAX_RECORDS_PER_CONVERSATION` + 1), so this adds one fixed-size read per row and nothing that
 /// grows -- measured at 1.74 ms hot and 5.92 ms cold over this machine's 16 largest sessions
 /// (116 MB in total). **Parsing the whole transcript here would not be acceptable at any speed**:
-/// it would trade a bounded read of Neovibe's own files for one that grows with a file this project
+/// it would trade a bounded read of Eitri's own files for one that grows with a file this project
 /// neither controls nor knows a bound for (the largest here is 47,254,948 bytes).
 ///
 /// **No stability probe.** [`is_transcript_stable`] sleeps, and a sleep on the GTK main loop is a

@@ -8,7 +8,7 @@
 #
 #   --sh           the shell every installer run uses (`bash`, or `/bin/sh` = dash in the image)
 #   --scratch      an empty or absent directory under ~/.cache (never /tmp); kept on failure
-#   --real-home    the real HOME, whose neovibe directories run-in-env.sh guards on every run
+#   --real-home    the real HOME, whose Eitri directories run-in-env.sh guards on every run
 #                  (on the host; the image cannot see it, and test_install.py guards around it)
 #   --server-port  a fixture server already serving <scratch>/srv on 127.0.0.1, for a hand run
 #                  against a server of your own. Without it (how test_install.py runs both halves:
@@ -61,7 +61,7 @@ SIDECAR_LINE='verdandi-claude-sidecar 0.1.0 (protocol 3, node v22.23.2, build 01
 
 setup_stubs() {
 	mkdir -p "$S/logs" "$S/stubs" "$S/stubs-root" "$S/stubs-tarfail" "$S/stubs-net" "$S/stubs-wget" \
-		"$S/stubs-mvlog" "$S/stubs-oldglibc" "$S/stubs-pathneovibe" "$S/stubs-mvfail" "$S/stubs-mvterm" \
+		"$S/stubs-mvlog" "$S/stubs-oldglibc" "$S/stubs-patheitri" "$S/stubs-mvfail" "$S/stubs-mvterm" \
 		"$S/stubs-probeuname" "$S/stubs-swapcat" "$S/stubs-swapsha" "$S/stubs-mvafterswap" \
 		"$S/stubs-cargo" "$S/stubs-cpswap" "$S/stubs-fakeowner" \
 		"$S/helpers"
@@ -75,7 +75,7 @@ setup_stubs() {
 	cp "$FIXTURES/mv-swap-fails" "$S/stubs-mvfail/mv"
 	cp "$FIXTURES/mv-swap-fails" "$S/stubs-mvterm/mv"
 	cp "$FIXTURES/getconf-old" "$S/stubs-oldglibc/getconf"
-	cp "$FIXTURES/neovibe-other" "$S/stubs-pathneovibe/neovibe"
+	cp "$FIXTURES/eitri-other" "$S/stubs-patheitri/eitri"
 	cp "$FIXTURES/uname-probe" "$S/stubs-probeuname/uname"
 	cp "$FIXTURES/cat-swap" "$S/stubs-swapcat/cat"
 	cp "$FIXTURES/sha256sum-swap" "$S/stubs-swapsha/sha256sum"
@@ -114,12 +114,12 @@ setup_keys() {
 	ssh-keygen -q -t ed25519 -N '' -C '' -f "$S/keys/other"
 	# allowed_signers lines with no comment field, as packaging/release-signers specifies.
 	for k in release other; do
-		awk '{ print "release@neovibe namespaces=\"neovibe-release\" " $1 " " $2 }' "$S/keys/$k.pub" >"$S/keys/signers-$k"
+		awk '{ print "release@eitri namespaces=\"eitri-release\" " $1 " " $2 }' "$S/keys/$k.pub" >"$S/keys/signers-$k"
 	done
 	SIGNERS=$S/keys/signers-release
 	# The installer with the test key embedded in its signers block, as every final release's
 	# installer carries one (spec §6.4, D13): the branch that runs with no --release-signers.
-	awk -v key="$(cat "$SIGNERS")" '/^NEOVIBE_RELEASE_SIGNERS$/ { print key } { print }' \
+	awk -v key="$(cat "$SIGNERS")" '/^EITRI_RELEASE_SIGNERS$/ { print key } { print }' \
 		"$INSTALLER" >"$S/install-keyed.sh"
 	KEYED_INSTALLER=$S/install-keyed.sh
 	if [ "$(diff "$INSTALLER" "$KEYED_INSTALLER" | grep -c '^[<>]')" != 1 ]; then
@@ -190,7 +190,7 @@ setup_sidecar_fixtures() {
 # skia-bindings' own unauthenticated one, so a test double only needs to be a real, checksummable
 # file; nothing here ever unpacks or links it. SKIA_FIXTURE_URL is a fixed, made-up upstream URL
 # (never actually fetched: fetch_skia_binaries only ever reads its basename in test mode and fetches
-# that basename from NEOVIBE_INSTALL_TEST_SKIA_BASE_URL instead) that fs_scaffold writes into every
+# that basename from EITRI_INSTALL_TEST_SKIA_BASE_URL instead) that fs_scaffold writes into every
 # from-source fixture's own pins.env as SKIA_BINARIES_URL_UPSTREAM.
 SKIA_FIXTURE_URL='https://example.invalid/skia-binaries-test.tar.gz'
 setup_skia_fixture() {
@@ -246,29 +246,29 @@ mk_verdandi_source() {
 }
 
 # mk_release VERSION REV: a release directory $S/fix/v$VERSION laid out as spec §4.3, from stub
-# binaries, the real launcher and desktop file, this installer as neovibe-setup, and a real (fake)
+# binaries, the real launcher and desktop file, this installer as eitri-setup, and a real (fake)
 # Verdandi source asset + the shared fake Node's pins, so every release's RELEASE is one a sidecar
 # build can actually be attempted against (plan Task 10).
 mk_release() {
 	v=$1
 	rev=$2
 	rev7=$(echo "$rev" | cut -c1-7)
-	top=neovibe-$v-x86_64-linux
+	top=eitri-$v-x86_64-linux
 	b=$S/fix/build-$v/$top
 	rm -rf "$S/fix/build-$v" "$S/fix/v$v"
-	mkdir -p "$b/bin" "$b/lib/neovibe" "$b/share/applications" "$b/share/licenses/neovibe" "$S/fix/v$v"
-	cp "$PKG/neovibe.launcher.sh" "$b/bin/neovibe"
-	chmod 0755 "$b/bin/neovibe"
-	for bin in shell neovibe-supervisor neovibe-tmux-shim neovibe-claude-handoff; do
-		printf '#!/bin/sh\necho "stub %s %s"\n' "$bin" "$v" >"$b/lib/neovibe/$bin"
-		chmod 0755 "$b/lib/neovibe/$bin"
+	mkdir -p "$b/bin" "$b/lib/eitri" "$b/share/applications" "$b/share/licenses/eitri" "$S/fix/v$v"
+	cp "$PKG/eitri.launcher.sh" "$b/bin/eitri"
+	chmod 0755 "$b/bin/eitri"
+	for bin in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff; do
+		printf '#!/bin/sh\necho "stub %s %s"\n' "$bin" "$v" >"$b/lib/eitri/$bin"
+		chmod 0755 "$b/lib/eitri/$bin"
 	done
-	cp "$INSTALLER" "$b/lib/neovibe/neovibe-setup"
-	chmod 0755 "$b/lib/neovibe/neovibe-setup"
+	cp "$INSTALLER" "$b/lib/eitri/eitri-setup"
+	chmod 0755 "$b/lib/eitri/eitri-setup"
 	mk_verdandi_source "$rev7" "$S/fix/v$v/verdandi-$rev7-source.tar.gz"
 	{
-		echo "NEOVIBE_VERSION=$v"
-		echo "NEOVIBE_COMMIT=1111111111111111111111111111111111111111"
+		echo "EITRI_VERSION=$v"
+		echo "EITRI_COMMIT=1111111111111111111111111111111111111111"
 		echo "NEOVIDE_FORK_COMMIT=2222222222222222222222222222222222222222"
 		echo "VERDANDI_REV=$rev"
 		echo "VERDANDI_SOURCE=verdandi-$rev7-source.tar.gz"
@@ -279,13 +279,13 @@ mk_release() {
 		echo "NVIM_VERSION=$NVIM_FIXTURE_VERSION"
 		echo "NVIM_SHA256_linux_x86_64=$NVIM_FIXTURE_SHA256"
 		echo "GTK_FLOOR=4.14"
-	} >"$b/lib/neovibe/RELEASE"
-	cp "$PKG/neovibe.desktop" "$b/share/applications/neovibe.desktop"
+	} >"$b/lib/eitri/RELEASE"
+	cp "$PKG/eitri.desktop" "$b/share/applications/eitri.desktop"
 	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do
-		echo "$f for $v" >"$b/share/licenses/neovibe/$f"
+		echo "$f for $v" >"$b/share/licenses/eitri/$f"
 	done
 	tar -C "$S/fix/build-$v" -czf "$S/fix/v$v/$top.tar.gz" "$top"
-	cp "$b/lib/neovibe/RELEASE" "$S/fix/v$v/RELEASE"
+	cp "$b/lib/eitri/RELEASE" "$S/fix/v$v/RELEASE"
 	cp "$INSTALLER" "$S/fix/v$v/install.sh"
 	resign "$S/fix/v$v"
 }
@@ -302,7 +302,7 @@ resign() {
 
 sign_sums() {
 	rm -f "$1/SHA256SUMS.sig"
-	ssh-keygen -q -Y sign -f "$S/keys/$2" -n neovibe-release "$1/SHA256SUMS" 2>/dev/null
+	ssh-keygen -q -Y sign -f "$S/keys/$2" -n eitri-release "$1/SHA256SUMS" 2>/dev/null
 }
 
 setup_releases() {
@@ -396,17 +396,17 @@ inst() {
 	# it). Unset for every caller that does not set it, so this is a no-op everywhere else.
 	if [ -n "${PRE_STUBS:-}" ]; then
 		"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$PRE_STUBS" --stubs "$S/stubs" \
-			--set NEOVIBE_INSTALL_TEST=1 \
-			--set "NEOVIBE_INSTALL_TEST_LIBDIRS=$S/libs/ok" \
-			--set "NEOVIBE_INSTALL_TEST_SYSTEM_RELEASE=$S/system/RELEASE" \
-			--set "NEOVIBE_INSTALL_TEST_OS_RELEASE=$S/osrel/ubuntu-24.04" \
+			--set EITRI_INSTALL_TEST=1 \
+			--set "EITRI_INSTALL_TEST_LIBDIRS=$S/libs/ok" \
+			--set "EITRI_INSTALL_TEST_SYSTEM_RELEASE=$S/system/RELEASE" \
+			--set "EITRI_INSTALL_TEST_OS_RELEASE=$S/osrel/ubuntu-24.04" \
 			"$@" </dev/null >"$OUT" 2>&1
 	else
 		"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$S/stubs" \
-			--set NEOVIBE_INSTALL_TEST=1 \
-			--set "NEOVIBE_INSTALL_TEST_LIBDIRS=$S/libs/ok" \
-			--set "NEOVIBE_INSTALL_TEST_SYSTEM_RELEASE=$S/system/RELEASE" \
-			--set "NEOVIBE_INSTALL_TEST_OS_RELEASE=$S/osrel/ubuntu-24.04" \
+			--set EITRI_INSTALL_TEST=1 \
+			--set "EITRI_INSTALL_TEST_LIBDIRS=$S/libs/ok" \
+			--set "EITRI_INSTALL_TEST_SYSTEM_RELEASE=$S/system/RELEASE" \
+			--set "EITRI_INSTALL_TEST_OS_RELEASE=$S/osrel/ubuntu-24.04" \
 			"$@" </dev/null >"$OUT" 2>&1
 	fi
 	RC=$?
@@ -469,19 +469,19 @@ snap() {
 }
 
 # snap_but_lock DIR: snap, except the mtimes of the directories a locked run creates its lock in
-# and removes it from again (<cache>, <cache>/neovibe) -- for a HOME whose cache already existed.
+# and removes it from again (<cache>, <cache>/eitri) -- for a HOME whose cache already existed.
 snap_but_lock() {
-	snap "$1" | sed -E 's#^(\./\.cache(/neovibe)? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
+	snap "$1" | sed -E 's#^(\./\.cache(/eitri)? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
 }
 
 # snap_but_staging DIR: snap, except the mtimes of the directories a fresh install or an upgrade
 # that fails creates and removes its own entries in, leaving every file as it was: .local/lib
-# (neovibe.new, a swap's renames), the three the launcher, desktop entry and licences are staged in
+# (eitri.new, a swap's renames), the three the launcher, desktop entry and licences are staged in
 # before the swap, and -- for a run against a HOME with no prior install at all -- .local itself,
 # whose own mtime changes the moment unpack_new's mkdir -p makes .local/lib the first time (plan
 # Task 10 review: reached once a fatal sidecar-build failure could die there too).
 snap_but_staging() {
-	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/neovibe))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
+	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/eitri))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
 }
 
 # tree DIR: names and types only, excluding the planted editors.
@@ -507,7 +507,7 @@ data_of() { printf '%s\n' "$TH/.local/share"; }
 
 # plant_sidecar REV7 [DATA]: a sidecar that is *present* (spec §5.3 step 6) for REV7.
 plant_sidecar() {
-	_ps_dir=${2:-$TH/.local/share}/neovibe/sidecar/$1
+	_ps_dir=${2:-$TH/.local/share}/eitri/sidecar/$1
 	mkdir -p "$_ps_dir"
 	printf '#!/bin/sh\nprintf "%%s\\n" "%s" "claude-agent-sdk 0.3.252 (bundled claude code 2.1.252)" "supported claude code CLI: >=2.1.252 <3.0.0" "executable sources served: host_cli"\n' \
 		"$SIDECAR_LINE" >"$_ps_dir/verdandi-claude-sidecar"
@@ -516,7 +516,7 @@ plant_sidecar() {
 }
 
 installed_version() {
-	sed -n 's/^NEOVIBE_VERSION=//p' "$TH/.local/lib/neovibe/RELEASE" 2>/dev/null
+	sed -n 's/^EITRI_VERSION=//p' "$TH/.local/lib/eitri/RELEASE" 2>/dev/null
 }
 
 # srv_mark / srv_paths: the request paths the fixture server logged since the mark.

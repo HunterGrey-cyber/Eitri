@@ -1,6 +1,6 @@
 /**
  * S1 (spec `docs/superpowers/specs/2026-09-27-v1-ui-design.md` §2.1): a permission card is answered
- * only by a key that stands alone. **neovibe's own rule** -- no tool this panel copies has an exact
+ * only by a key that stands alone. **Eitri's own rule** -- no tool this panel copies has an exact
  * precedent. Claude Code answers a prompt only by an explicit choice (Enter on the highlighted option,
  * or a digit); vim tells a sequence from a lone key by time (`:h 'timeoutlen'`). This keeps R04's
  * `a`/`d` and still makes "arrive, then type" harmless: arrivals land BROWSE (R02) with the cursor on

@@ -23,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Only the runtime libraries spec sec 6.3's debian/ubuntu hint row names, plus curl/xz-utils/
 # ca-certificates for the installer's own downloads and openssh-client for the signature (codex
 # verdict #5). apt's own package lists are kept (not `rm -rf /var/lib/apt/lists/*`): the pkg-flow
-# scenario (`apt install ./neovibe_*.deb` as root) runs later, inside the same image, and re-running
+# scenario (`apt install ./eitri_*.deb` as root) runs later, inside the same image, and re-running
 # `apt-get update` there is one more real network round trip this image already proves is needed.
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends \

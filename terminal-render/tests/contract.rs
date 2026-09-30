@@ -220,7 +220,7 @@ fn cursor_colors(list: &terminal_render::PaintList) -> (RgbColor, Option<RgbColo
 
 #[test]
 fn a_cell_inverse_cursor_takes_the_covered_cells_own_colours_swapped() {
-    // neovibe's GUI pass 2026-09-23, defect 3: a fixed cursor colour from the
+    // Eitri's GUI pass 2026-09-23, defect 3: a fixed cursor colour from the
     // host's theme (a dark theme's pale foreground) nearly vanished on a cell a
     // program had painted light -- nvim with a light colorscheme, inside. foot
     // draws the cell inverted. Black on white here, the case in miniature.

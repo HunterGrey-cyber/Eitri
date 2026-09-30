@@ -1,5 +1,5 @@
 //! Shared protocol types and small helpers for the cross-window agent-status dashboard
-//! (`neovibe-supervisor`, `src/bin/neovibe_supervisor.rs`) and `shell`'s own client of it
+//! (`eitri-supervisor`, `src/bin/eitri_supervisor.rs`) and `shell`'s own client of it
 //! (`shell/src/supervisor_client.rs`). See
 //! `docs/superpowers/specs/2026-09-08-supervisor-cross-window-agent-status-design.md`.
 
@@ -18,7 +18,7 @@ pub enum AgentStatus {
     Done,
 }
 
-/// A message `shell` sends to `neovibe-supervisor` over their shared connection (spec §3).
+/// A message `shell` sends to `eitri-supervisor` over their shared connection (spec §3).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ShellMessage {
@@ -34,19 +34,19 @@ pub enum ShellMessage {
     },
 }
 
-/// A message `neovibe-supervisor` sends back to `shell` over that same connection (spec §3).
+/// A message `eitri-supervisor` sends back to `shell` over that same connection (spec §3).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SupervisorMessage {
     Activate,
 }
 
-/// The one well-known socket every `shell` instance and `neovibe-supervisor` agree on (spec §3)
+/// The one well-known socket every `shell` instance and `eitri-supervisor` agree on (spec §3)
 /// -- unlike `agent-hook`'s per-conversation UUID sockets, there is exactly one of these on the
 /// whole machine at a time, since every `shell` window must find the *same* supervisor.
 pub fn socket_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("neovibe-supervisor.sock");
+        return PathBuf::from(runtime_dir).join("eitri-supervisor.sock");
     }
     // Fallback: `std::env::temp_dir()` is world-writable (unlike `$XDG_RUNTIME_DIR`'s 0700
     // permissions), so on a multi-user machine another local user could squat this path before
@@ -56,13 +56,13 @@ pub fn socket_path() -> PathBuf {
     // future reader doesn't assume the fallback carries the same isolation guarantee as the
     // primary path. **On macOS this is not the unreachable branch, it is the only one taken**:
     // `XDG_RUNTIME_DIR` is never set there (it is a systemd/Linux convention with no macOS
-    // equivalent), so `neovibe-supervisor` always resolves through here on the Mac -- worth
+    // equivalent), so `eitri-supervisor` always resolves through here on the Mac -- worth
     // knowing before assuming the lib's behaviour is Linux-tested and macOS-theoretical.
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    std::env::temp_dir().join(format!("neovibe-supervisor-{user}.sock"))
+    std::env::temp_dir().join(format!("eitri-supervisor-{user}.sock"))
 }
 
-/// Finds the `neovibe-supervisor` binary next to whichever binary is currently running (mirrors
+/// Finds the `eitri-supervisor` binary next to whichever binary is currently running (mirrors
 /// `agent::settings`'s own `locate_agent_hook_binary` exactly -- same "same cargo build, sibling
 /// binary" assumption, same `deps`/`examples`-directory-one-level-up fallback for `cargo test`/
 /// `cargo run --example` builds).
@@ -71,7 +71,7 @@ pub fn locate_supervisor_binary() -> std::io::Result<PathBuf> {
     let dir = current
         .parent()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "current_exe has no parent directory"))?;
-    let candidate = dir.join("neovibe-supervisor");
+    let candidate = dir.join("eitri-supervisor");
     if candidate.exists() {
         return Ok(candidate);
     }
@@ -81,7 +81,7 @@ pub fn locate_supervisor_binary() -> std::io::Result<PathBuf> {
     );
     if one_dir_deeper {
         if let Some(parent) = dir.parent() {
-            let fallback = parent.join("neovibe-supervisor");
+            let fallback = parent.join("eitri-supervisor");
             if fallback.exists() {
                 return Ok(fallback);
             }
@@ -89,7 +89,7 @@ pub fn locate_supervisor_binary() -> std::io::Result<PathBuf> {
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        format!("neovibe-supervisor binary not found at {candidate:?} -- was it built in the same cargo build?"),
+        format!("eitri-supervisor binary not found at {candidate:?} -- was it built in the same cargo build?"),
     ))
 }
 
@@ -103,14 +103,14 @@ mod tests {
     fn register_message_round_trips_through_json() {
         let msg = ShellMessage::Register {
             instance_id: "abc-123".into(),
-            project_name: "neovibe".into(),
-            project_dir: "/home/user/src/neovibe".into(),
+            project_name: "eitri".into(),
+            project_dir: "/home/user/src/eitri".into(),
             pid: 4242,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"register","instance_id":"abc-123","project_name":"neovibe","project_dir":"/home/user/src/neovibe","pid":4242}"#
+            r#"{"type":"register","instance_id":"abc-123","project_name":"eitri","project_dir":"/home/user/src/eitri","pid":4242}"#
         );
         let parsed: ShellMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, msg);
@@ -159,7 +159,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
         assert_eq!(
             socket_path(),
-            std::path::PathBuf::from("/run/user/1000/neovibe-supervisor.sock")
+            std::path::PathBuf::from("/run/user/1000/eitri-supervisor.sock")
         );
 
         unsafe {
@@ -167,7 +167,7 @@ mod tests {
             std::env::set_var("USER", "testuser");
         }
         let path = socket_path();
-        assert_eq!(path, std::env::temp_dir().join("neovibe-supervisor-testuser.sock"));
+        assert_eq!(path, std::env::temp_dir().join("eitri-supervisor-testuser.sock"));
 
         unsafe { std::env::remove_var("USER") };
     }

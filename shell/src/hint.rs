@@ -1,6 +1,6 @@
 //! The global `f` HINT's coordinator (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md).
 //! `shell` owns the session because only it sees GTK and the WebView at once. Pure logic lives in
-//! `neovibe_core::hint`; this file is GTK: collecting targets, drawing labels, capturing keys at the
+//! `eitri_core::hint`; this file is GTK: collecting targets, drawing labels, capturing keys at the
 //! window, landing, and cancelling. The two small decisions that need no display -- what a key
 //! means while HINT is up, and how a label is drawn for a typed prefix -- are split out as plain
 //! functions so they are unit-tested; everything else here is owed to a GUI pass
@@ -37,8 +37,8 @@ use gtk4::glib;
 use gtk4::graphene;
 use gtk4::prelude::*;
 
-use neovibe_core::hint::{order_targets, HintSession, HintStep, LabelPlan, Landing, Slot, TargetOrder, WindowLayout};
-use neovibe_core::layout::ModuleId;
+use eitri_core::hint::{order_targets, HintSession, HintStep, LabelPlan, Landing, Slot, TargetOrder, WindowLayout};
+use eitri_core::layout::ModuleId;
 use neovide_editor::NeovideEditorPane;
 
 use crate::agent_panel::{AgentPanelHandle, HintInbound};

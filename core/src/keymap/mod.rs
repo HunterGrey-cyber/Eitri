@@ -1,6 +1,6 @@
 //! The keymap (docs/superpowers/specs/2026-09-25-keymap-tabs-panel-design.md §2): tmux's key names,
 //! the closed set of actions a key can run, the default prefix table (stock tmux, prefix `C-b`), the
-//! root accelerators, and what `init.lua`'s `neovibe.keymap` calls turn it into. GTK-free: `shell`
+//! root accelerators, and what `init.lua`'s `eitri.keymap` calls turn it into. GTK-free: `shell`
 //! registers what this says and looks keys up in it; a macOS host would do the same.
 
 pub mod action;

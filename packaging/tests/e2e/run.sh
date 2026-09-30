@@ -12,21 +12,21 @@
 #     and this script greps for the non-degraded "signature on SHA256SUMS: good" line, so a future
 #     accidental removal of openssh-client fails loudly instead of silently degrading to
 #     checksum-only);
-#   - spec sec 6.5's install layout, `neovibe --version`, and the built sidecar's own `--version`
+#   - spec sec 6.5's install layout, `eitri --version`, and the built sidecar's own `--version`
 #     (host_cli, protocol 3, the pinned Node);
-#   - on Ubuntu's own 0.9.5-nvim variant: neovibe's private nvim is fetched and used, and the
+#   - on Ubuntu's own 0.9.5-nvim variant: Eitri's private nvim is fetched and used, and the
 #     distro's /usr/bin/nvim is byte-for-byte untouched;
-#   - a second run says "up to date"; `neovibe --legacy` / `NEOVIBE_AGENT_BACKEND=legacy neovibe`
+#   - a second run says "up to date"; `eitri --legacy` / `EITRI_AGENT_BACKEND=legacy eitri`
 #     both exit 1 naming the reason (plan Task 5); `--uninstall` leaves nothing outside
-#     ~/.config/neovibe and the state directory; there is no `sudo` in any image, so a maintainer
+#     ~/.config/eitri and the state directory; there is no `sudo` in any image, so a maintainer
 #     script that tried to use it would fail loudly, and there is no maintainer script at all (REL-2
 #     below);
-#   - REL-1: `apt install ./neovibe_*.deb` / `dnf install ./neovibe-*.rpm` as root, then
-#     `neovibe setup --yes` as the created non-root user, builds the sidecar reading only
-#     /usr/lib/neovibe/RELEASE -- proved behaviourally, not just read off the source: the mirror
-#     `neovibe setup` is pointed at carries no SHA256SUMS at all, so a fetch of it would 404 and the
+#   - REL-1: `apt install ./eitri_*.deb` / `dnf install ./eitri-*.rpm` as root, then
+#     `eitri setup --yes` as the created non-root user, builds the sidecar reading only
+#     /usr/lib/eitri/RELEASE -- proved behaviourally, not just read off the source: the mirror
+#     `eitri setup` is pointed at carries no SHA256SUMS at all, so a fetch of it would 404 and the
 #     run would fail;
-#   - REL-2: the installed package ran no maintainer script, and `neovibe setup` refuses as root.
+#   - REL-2: the installed package ran no maintainer script, and `eitri setup` refuses as root.
 #
 # Usage: packaging/tests/e2e/run.sh --release-dir DIR [--release-signers FILE]
 #                                   [--only NAME[,NAME...]] [--out DIR]
@@ -103,8 +103,8 @@ else
 		die "no $RELEASE_SIGNERS: release.sh writes no signers file into a release directory, so pass --release-signers FILE (the allowed_signers file of the key that signed SHA256SUMS)"
 fi
 RELEASE_SIGNERS="$(cd -- "$(dirname -- "$RELEASE_SIGNERS")" && pwd -P)/$(basename -- "$RELEASE_SIGNERS")"
-VERSION="$(sed -n 's/^NEOVIBE_VERSION=//p' "$RELEASE_DIR/RELEASE")"
-[ -n "$VERSION" ] || die "$RELEASE_DIR/RELEASE has no NEOVIBE_VERSION"
+VERSION="$(sed -n 's/^EITRI_VERSION=//p' "$RELEASE_DIR/RELEASE")"
+[ -n "$VERSION" ] || die "$RELEASE_DIR/RELEASE has no EITRI_VERSION"
 REV7="$(sed -n 's/^VERDANDI_REV=\(.......\).*/\1/p' "$RELEASE_DIR/RELEASE" | head -n1)"
 [ -n "$REV7" ] || die "$RELEASE_DIR/RELEASE has no VERDANDI_REV"
 
@@ -137,12 +137,12 @@ for f in "$RELEASE_DIR"/*; do
 	name="$(basename "$f")"
 	ln -s -- "$f" "$SCRATCH/serve/full/releases/download/v$VERSION/$name"
 done
-for f in RELEASE SHA256SUMS SHA256SUMS.sig "neovibe-$VERSION-x86_64-linux.tar.gz" install.sh; do
+for f in RELEASE SHA256SUMS SHA256SUMS.sig "eitri-$VERSION-x86_64-linux.tar.gz" install.sh; do
 	ln -s -- "$RELEASE_DIR/$f" "$SCRATCH/serve/full/releases/latest/download/$f"
 done
 ln -s -- "$RELEASE_DIR/install.sh" "$SCRATCH/serve/full/install.sh"
 # The REL-1 mirror: only the Verdandi source asset, deliberately no SHA256SUMS anywhere under it --
-# `neovibe setup` succeeding against this mirror is the behavioural proof that it never fetches one.
+# `eitri setup` succeeding against this mirror is the behavioural proof that it never fetches one.
 ln -s -- "$RELEASE_DIR/verdandi-$REV7-source.tar.gz" \
 	"$SCRATCH/serve/setuponly/releases/download/v$VERSION/verdandi-$REV7-source.tar.gz"
 
@@ -164,7 +164,7 @@ SETUP_BASE_URL="http://127.0.0.1:$PORT/setuponly"
 SIGNERS_HOST="$RELEASE_SIGNERS"
 log "release $RELEASE_DIR, signers $SIGNERS_HOST"
 
-EXPECT_VERSION_LINE="neovibe $VERSION (commit $(sed -n 's/^NEOVIBE_COMMIT=//p' "$RELEASE_DIR/RELEASE" | cut -c1-12), neovide fork $(sed -n 's/^NEOVIDE_FORK_COMMIT=//p' "$RELEASE_DIR/RELEASE" | cut -c1-7), verdandi $REV7)"
+EXPECT_VERSION_LINE="eitri $VERSION (commit $(sed -n 's/^EITRI_COMMIT=//p' "$RELEASE_DIR/RELEASE" | cut -c1-12), neovide fork $(sed -n 's/^NEOVIDE_FORK_COMMIT=//p' "$RELEASE_DIR/RELEASE" | cut -c1-7), verdandi $REV7)"
 
 PASS=0
 FAIL=0
@@ -219,8 +219,8 @@ say "id: $(id); uname: $(uname -srm)"
 if command -v sudo >/dev/null 2>&1; then fail "sudo is on PATH in this image; it must not be"; else say "sudo: absent (ok)"; fi
 
 XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
-SIDECAR_BIN="$XDG_DATA_HOME/neovibe/sidecar/$REV7/verdandi-claude-sidecar"
-LAUNCHER="$HOME/.local/bin/neovibe"
+SIDECAR_BIN="$XDG_DATA_HOME/eitri/sidecar/$REV7/verdandi-claude-sidecar"
+LAUNCHER="$HOME/.local/bin/eitri"
 
 if [ "$EXPECT_DISTRO_NVIM" = 1 ]; then
 	command -v nvim >/dev/null 2>&1 || fail "the 0.9.5 variant has no distro nvim on PATH at all"
@@ -246,7 +246,7 @@ else
 	fi
 fi
 cat first-install.log
-if ! grep -qF 'signature on SHA256SUMS: good (release@neovibe)' first-install.log; then
+if ! grep -qF 'signature on SHA256SUMS: good (release@eitri)' first-install.log; then
 	fail "no 'signature on SHA256SUMS: good' line: the real ssh-keygen -Y verify path did not run cleanly (codex verdict #5)"
 fi
 if grep -qi 'ssh-keygen was not found' first-install.log; then
@@ -256,22 +256,22 @@ fi
 say "disk usage after the first install (sidecar + nvim included, before --uninstall reclaims it): $(du -sh "$HOME" 2>/dev/null | awk '{print $1}')"
 
 say "=== spec sec 6.5 layout ==="
-for p in shell neovibe-supervisor neovibe-tmux-shim neovibe-claude-handoff neovibe-setup RELEASE; do
-	[ -f "$HOME/.local/lib/neovibe/$p" ] || fail "missing $HOME/.local/lib/neovibe/$p"
+for p in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-setup RELEASE; do
+	[ -f "$HOME/.local/lib/eitri/$p" ] || fail "missing $HOME/.local/lib/eitri/$p"
 done
 [ -f "$LAUNCHER" ] || fail "missing launcher $LAUNCHER"
-grep -qF '# neovibe-launcher v1' "$LAUNCHER" || fail "$LAUNCHER carries no marker line"
-[ -f "$HOME/.local/share/applications/neovibe.desktop" ] || fail "missing the desktop entry"
+grep -qF '# eitri-launcher v1' "$LAUNCHER" || fail "$LAUNCHER carries no marker line"
+[ -f "$HOME/.local/share/applications/eitri.desktop" ] || fail "missing the desktop entry"
 for p in LICENSE THIRD-PARTY-LICENSES SOURCE; do
-	[ -f "$HOME/.local/share/licenses/neovibe/$p" ] || fail "missing licences/$p"
+	[ -f "$HOME/.local/share/licenses/eitri/$p" ] || fail "missing licences/$p"
 done
 [ -x "$SIDECAR_BIN" ] || fail "missing sidecar binary $SIDECAR_BIN"
-[ -f "$XDG_DATA_HOME/neovibe/sidecar/$REV7/BUILD" ] || fail "missing sidecar BUILD file"
+[ -f "$XDG_DATA_HOME/eitri/sidecar/$REV7/BUILD" ] || fail "missing sidecar BUILD file"
 
-say "=== neovibe --version ==="
+say "=== eitri --version ==="
 GOT_VERSION=$("$LAUNCHER" --version)
 say "got: $GOT_VERSION"
-[ "$GOT_VERSION" = "$EXPECT_VERSION_LINE" ] || fail "neovibe --version = '$GOT_VERSION', expected '$EXPECT_VERSION_LINE'"
+[ "$GOT_VERSION" = "$EXPECT_VERSION_LINE" ] || fail "eitri --version = '$GOT_VERSION', expected '$EXPECT_VERSION_LINE'"
 
 say "=== sidecar --version ==="
 SC_VERSION=$("$SIDECAR_BIN" --version)
@@ -282,7 +282,7 @@ printf '%s\n' "$SC_VERSION" | sed -n 4p | grep -qFx 'executable sources served: 
 	fail "sidecar --version's 4th line is not 'executable sources served: host_cli'"
 
 say "=== nvim offer ==="
-NVIM_DIR="$XDG_DATA_HOME/neovibe/nvim/0.11.2"
+NVIM_DIR="$XDG_DATA_HOME/eitri/nvim/0.11.2"
 [ -x "$NVIM_DIR/bin/nvim" ] || fail "the pinned nvim 0.11.2 was not fetched into $NVIM_DIR"
 if [ -x "$NVIM_DIR/bin/nvim" ]; then
 	NVOUT=$("$NVIM_DIR/bin/nvim" --version 2>&1 | head -n1)
@@ -297,7 +297,7 @@ if [ -x "$NVIM_DIR/bin/nvim" ]; then
 fi
 if [ "$EXPECT_DISTRO_NVIM" = 1 ]; then
 	DISTRO_NVIM_SHA_AFTER=$(sha256sum "$DISTRO_NVIM" | awk '{print $1}')
-	[ "$DISTRO_NVIM_SHA_BEFORE" = "$DISTRO_NVIM_SHA_AFTER" ] || fail "$DISTRO_NVIM changed sha256 during install: neovibe touched the distro nvim"
+	[ "$DISTRO_NVIM_SHA_BEFORE" = "$DISTRO_NVIM_SHA_AFTER" ] || fail "$DISTRO_NVIM changed sha256 during install: Eitri touched the distro nvim"
 	command -v nvim >/dev/null 2>&1 && [ "$(command -v nvim)" = "$DISTRO_NVIM" ] || fail "nvim no longer resolves to the distro copy on PATH"
 fi
 
@@ -307,18 +307,18 @@ if ! sh install.sh --base-url "$BASE_URL" --release-signers "$SIGNERS" --yes --w
 	fail "the second install exited non-zero"
 fi
 cat second-install.log
-grep -qF "neovibe $VERSION is up to date" second-install.log || fail "the second run did not say 'up to date'"
+grep -qF "Eitri $VERSION is up to date" second-install.log || fail "the second run did not say 'up to date'"
 
-say "=== neovibe --legacy / NEOVIBE_AGENT_BACKEND=legacy (plan Task 5) ==="
+say "=== eitri --legacy / EITRI_AGENT_BACKEND=legacy (plan Task 5) ==="
 set +e
 "$LAUNCHER" --legacy --quiet "$HOME" >legacy-flag.log 2>&1
 rc1=$?
-NEOVIBE_AGENT_BACKEND=legacy "$LAUNCHER" --quiet "$HOME" >legacy-env.log 2>&1
+EITRI_AGENT_BACKEND=legacy "$LAUNCHER" --quiet "$HOME" >legacy-env.log 2>&1
 rc2=$?
 set -e
-[ "$rc1" = 1 ] || fail "neovibe --legacy exited $rc1, not 1"
+[ "$rc1" = 1 ] || fail "eitri --legacy exited $rc1, not 1"
 grep -qF 'the legacy backend is not in this build' legacy-flag.log || fail "--legacy's output does not name 'the legacy backend is not in this build'"
-[ "$rc2" = 1 ] || fail "NEOVIBE_AGENT_BACKEND=legacy exited $rc2, not 1"
+[ "$rc2" = 1 ] || fail "EITRI_AGENT_BACKEND=legacy exited $rc2, not 1"
 grep -qF 'the legacy backend is not in this build' legacy-env.log || fail "the env-var path's output does not name 'the legacy backend is not in this build'"
 
 say "=== uninstall ==="
@@ -328,8 +328,8 @@ fi
 cat uninstall.log
 # Spec sec 6.6's own removal list, checked by name (never claims uninstall also prunes a now-empty
 # parent such as ~/.local/bin or ~/.local/share/applications, which it is not asked to and does not).
-for p in .local/lib/neovibe .local/bin/neovibe .local/share/applications/neovibe.desktop \
-	.local/share/licenses/neovibe .local/share/neovibe; do
+for p in .local/lib/eitri .local/bin/eitri .local/share/applications/eitri.desktop \
+	.local/share/licenses/eitri .local/share/eitri; do
 	if [ -e "$HOME/$p" ] || [ -L "$HOME/$p" ]; then fail "uninstall left $HOME/$p behind"; fi
 done
 LEFT=$(find "$HOME" -mindepth 1 -type f \
@@ -393,8 +393,8 @@ run_curl_flow() {
 
 # ================================================================================================
 # The pkg-flow driver: `apt`/`dnf` install a local package as root, confirm no maintainer script ran
-# and that `neovibe setup` refuses as root, then drop to the created non-root user and run
-# `neovibe setup --yes` against the SHA256SUMS-less mirror (REL-1's behavioural proof).
+# and that `eitri setup` refuses as root, then drop to the created non-root user and run
+# `eitri setup --yes` against the SHA256SUMS-less mirror (REL-1's behavioural proof).
 cat >"$SCRATCH/scripts/pkg-flow.sh" <<'DRIVER'
 #!/bin/sh
 # Env in: PKG(deb|rpm) PKGFILE PKGNAME SETUP_BASE_URL REV7. Runs as root throughout; drops to the
@@ -430,23 +430,23 @@ else
 	if [ -n "$SC" ] && [ "$SC" != "(none)" ]; then fail "rpm -q --scripts reports a script: $SC"; fi
 fi
 
-say "=== neovibe setup as root refuses ==="
+say "=== eitri setup as root refuses ==="
 set +e
-neovibe setup --yes --base-url "$SETUP_BASE_URL" >root-setup.log 2>&1
+eitri setup --yes --base-url "$SETUP_BASE_URL" >root-setup.log 2>&1
 rc=$?
 set -e
 cat root-setup.log
-[ "$rc" != 0 ] || fail "neovibe setup as root did not refuse"
+[ "$rc" != 0 ] || fail "eitri setup as root did not refuse"
 grep -qiE 'root' root-setup.log || fail "the root refusal message does not mention root"
 
-say "=== neovibe setup --yes as the non-root user (REL-1) ==="
+say "=== eitri setup --yes as the non-root user (REL-1) ==="
 # The redirection is inside the -c string, so tester's own shell creates the log: redirected out
 # here, root's shell would create it first, leaving a root-owned file on the host's bind mount
 # (spec sec 2.4's hygiene).
-su - tester -c "neovibe setup --yes --base-url '$SETUP_BASE_URL' >/home/tester/user-setup.log 2>&1" ||
-	fail "neovibe setup --yes as tester failed"
+su - tester -c "eitri setup --yes --base-url '$SETUP_BASE_URL' >/home/tester/user-setup.log 2>&1" ||
+	fail "eitri setup --yes as tester failed"
 cat /home/tester/user-setup.log
-SIDECAR="/home/tester/.local/share/neovibe/sidecar/$REV7/verdandi-claude-sidecar"
+SIDECAR="/home/tester/.local/share/eitri/sidecar/$REV7/verdandi-claude-sidecar"
 [ -x "$SIDECAR" ] || fail "REL-1: the sidecar did not land at $SIDECAR"
 
 if [ "$ok" = 1 ]; then
@@ -486,22 +486,22 @@ run_pkg_flow() {
 
 log "building the e2e images (never --pull)"
 docker build -q --build-arg UID="$UID_H" --build-arg GID="$GID_H" --build-arg WITH_DISTRO_NVIM=0 \
-	-t neovibe-e2e-ubuntu-no-nvim -f "$HERE/ubuntu-24.04.Dockerfile" "$HERE" >/dev/null
+	-t eitri-e2e-ubuntu-no-nvim -f "$HERE/ubuntu-24.04.Dockerfile" "$HERE" >/dev/null
 docker build -q --build-arg UID="$UID_H" --build-arg GID="$GID_H" --build-arg WITH_DISTRO_NVIM=1 \
-	-t neovibe-e2e-ubuntu-0.9.5 -f "$HERE/ubuntu-24.04.Dockerfile" "$HERE" >/dev/null
+	-t eitri-e2e-ubuntu-0.9.5 -f "$HERE/ubuntu-24.04.Dockerfile" "$HERE" >/dev/null
 docker build -q --build-arg UID="$UID_H" --build-arg GID="$GID_H" \
-	-t neovibe-e2e-fedora -f "$HERE/fedora-44.Dockerfile" "$HERE" >/dev/null
+	-t eitri-e2e-fedora -f "$HERE/fedora-44.Dockerfile" "$HERE" >/dev/null
 docker build -q --build-arg UID="$UID_H" --build-arg GID="$GID_H" \
-	-t neovibe-e2e-arch -f "$HERE/arch.Dockerfile" "$HERE" >/dev/null
+	-t eitri-e2e-arch -f "$HERE/arch.Dockerfile" "$HERE" >/dev/null
 
-run_curl_flow ubuntu-no-nvim neovibe-e2e-ubuntu-no-nvim 0 0
-run_curl_flow ubuntu-0.9.5 neovibe-e2e-ubuntu-0.9.5 0 1
-run_curl_flow ubuntu-piped neovibe-e2e-ubuntu-no-nvim 1 0
-run_curl_flow fedora neovibe-e2e-fedora 0 0
-run_curl_flow arch neovibe-e2e-arch 0 0
+run_curl_flow ubuntu-no-nvim eitri-e2e-ubuntu-no-nvim 0 0
+run_curl_flow ubuntu-0.9.5 eitri-e2e-ubuntu-0.9.5 0 1
+run_curl_flow ubuntu-piped eitri-e2e-ubuntu-no-nvim 1 0
+run_curl_flow fedora eitri-e2e-fedora 0 0
+run_curl_flow arch eitri-e2e-arch 0 0
 
-run_pkg_flow ubuntu-pkg neovibe-e2e-ubuntu-no-nvim deb "$RELEASE_DIR/neovibe_${VERSION}_amd64.deb" neovibe
-run_pkg_flow fedora-pkg neovibe-e2e-fedora rpm "$RELEASE_DIR/neovibe-${VERSION}-1.x86_64.rpm" neovibe
+run_pkg_flow ubuntu-pkg eitri-e2e-ubuntu-no-nvim deb "$RELEASE_DIR/eitri_${VERSION}_amd64.deb" eitri
+run_pkg_flow fedora-pkg eitri-e2e-fedora rpm "$RELEASE_DIR/eitri-${VERSION}-1.x86_64.rpm" eitri
 
 log "=== summary: $PASS passed, $FAIL failed ==="
 cat "$RESULTS"

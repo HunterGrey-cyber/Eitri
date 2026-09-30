@@ -74,7 +74,7 @@ pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 /// - A command a plugin registers at run time through its hooks module (`$.command.register`, built
 ///   by `Jgn` as `type:"local"`, `supportsNonInteractive:!0`, `loadedFrom:"plugin"`): its
 ///   `command.run` hook receives `args` the same way, so `/choose-profile staging` with a file open
-///   reaches it as `staging` plus the block. Its name is whatever the plugin chose, and neovibe never
+///   reaches it as `staging` plus the block. Its name is whatever the plugin chose, and Eitri never
 ///   sees the CLI's command table: `system/init`'s `slash_commands` lists names with no type, and the
 ///   sidecar does not forward it. Hooks modules are early access in 2.1.283 -- off for installed
 ///   plugins unless `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is set or the `tengu_plugin_hooks_modules`
@@ -519,7 +519,7 @@ mod tests {
     /// typed, deliberately NOT the text that went on the wire" -- would show a file path and a
     /// selection nobody wrote.
     ///
-    /// `strip_composed_block` lives in `agent`, not in this file, because `neovibe-core` depends on
+    /// `strip_composed_block` lives in `agent`, not in this file, because `eitri-core` depends on
     /// `agent`; see this module's re-export for the full reason.
     #[test]
     fn stripping_the_composed_block_recovers_exactly_what_the_user_typed() {

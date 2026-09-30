@@ -3,9 +3,9 @@
 //!
 //! Split out of `persistence.rs` and `lease.rs` for a single reason: a test must be able to move
 //! them somewhere disposable. Without that, `cargo test -p agent` writes real conversation records
-//! into the developer's own `$XDG_STATE_HOME/neovibe/conversations/`, real stored histories into
-//! `$XDG_STATE_HOME/neovibe/history/`, and real lock files into their
-//! `$XDG_RUNTIME_DIR/neovibe/session-leases/`, and none of them is removed afterwards. That is not
+//! into the developer's own `$XDG_STATE_HOME/eitri/conversations/`, real stored histories into
+//! `$XDG_STATE_HOME/eitri/history/`, and real lock files into their
+//! `$XDG_RUNTIME_DIR/eitri/session-leases/`, and none of them is removed afterwards. That is not
 //! avoidable by "just not calling persistence" either: the record write and the session-lease
 //! acquire both happen on `AgentConversation`'s own ingestion thread when the provider's first
 //! `SessionOpened` is folded, so any test that drives a conversation past that event reaches them.
@@ -34,8 +34,8 @@ fn test_root() -> Option<&'static Path> {
     TEST_ROOT.get().map(PathBuf::as_path)
 }
 
-/// `$XDG_STATE_HOME/neovibe/conversations/`, falling back to
-/// `~/.local/state/neovibe/conversations/` per the XDG Base Directory spec's own stated default for
+/// `$XDG_STATE_HOME/eitri/conversations/`, falling back to
+/// `~/.local/state/eitri/conversations/` per the XDG Base Directory spec's own stated default for
 /// `XDG_STATE_HOME` when unset. Persistent on purpose: a conversation record has to survive a
 /// reboot, so `$XDG_RUNTIME_DIR` (tmpfs, cleared on logout) would be the wrong home for it.
 pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
@@ -43,14 +43,14 @@ pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
         return Ok(root.join("conversations"));
     }
     if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(state_home).join("neovibe/conversations"));
+        return Ok(PathBuf::from(state_home).join("eitri/conversations"));
     }
     let home = std::env::var("HOME")
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_STATE_HOME nor HOME is set"))?;
-    Ok(PathBuf::from(home).join(".local/state/neovibe/conversations"))
+    Ok(PathBuf::from(home).join(".local/state/eitri/conversations"))
 }
 
-/// `$XDG_STATE_HOME/neovibe/history/`, beside `conversations_dir()` and resolved the same way.
+/// `$XDG_STATE_HOME/eitri/history/`, beside `conversations_dir()` and resolved the same way.
 ///
 /// A directory of its own rather than a file inside `conversations/<conversation_id>/`, which is
 /// where the owner's own words would have put it. Two functions walk that directory treating every
@@ -64,22 +64,22 @@ pub(crate) fn history_dir() -> std::io::Result<PathBuf> {
         return Ok(root.join("history"));
     }
     if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(state_home).join("neovibe/history"));
+        return Ok(PathBuf::from(state_home).join("eitri/history"));
     }
     let home = std::env::var("HOME")
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_STATE_HOME nor HOME is set"))?;
-    Ok(PathBuf::from(home).join(".local/state/neovibe/history"))
+    Ok(PathBuf::from(home).join(".local/state/eitri/history"))
 }
 
 /// Where session-lease lock files live. Two platforms, two answers, and every process of one user
 /// on one machine must reach the SAME directory -- two processes that disagree each take "the"
 /// lock in their own directory, both succeed, and nothing reports it.
 ///
-/// - **Linux:** `$XDG_RUNTIME_DIR/neovibe/session-leases/`, matching this project's own established
+/// - **Linux:** `$XDG_RUNTIME_DIR/eitri/session-leases/`, matching this project's own established
 ///   pattern for ephemeral, per-session state (`supervisor::socket_path`, `agent::process`'s hook
 ///   sockets). A lease has no meaning across a reboot, so tmpfs is right here and wrong for the
 ///   records above. Unset is still an error, as before M1.
-/// - **macOS:** `<home>/Library/Application Support/neovibe/session-leases/`, where `<home>` is the
+/// - **macOS:** `<home>/Library/Application Support/eitri/session-leases/`, where `<home>` is the
 ///   account's home directory from the user database (`getpwuid_r`), not `$HOME`. macOS has no
 ///   `XDG_RUNTIME_DIR`, and it is deliberately NOT consulted even when someone sets it: a process
 ///   launched with it and one launched without would split the lock. Two other homes were
@@ -107,7 +107,7 @@ pub(crate) fn leases_dir() -> std::io::Result<PathBuf> {
 fn platform_leases_dir() -> std::io::Result<PathBuf> {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
-    Ok(PathBuf::from(runtime_dir).join("neovibe/session-leases"))
+    Ok(PathBuf::from(runtime_dir).join("eitri/session-leases"))
 }
 
 #[cfg(target_os = "macos")]
@@ -117,7 +117,7 @@ fn platform_leases_dir() -> std::io::Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn macos_leases_dir_under(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/neovibe/session-leases")
+    home.join("Library/Application Support/eitri/session-leases")
 }
 
 /// This process's real user's home directory, from the user database rather than `$HOME`.
@@ -165,7 +165,7 @@ fn account_home_dir() -> std::io::Result<PathBuf> {
 /// call wins and every later one returns the same root, so a test file can call it from each of its
 /// own helpers without coordinating.
 ///
-/// The root is `$TMPDIR/neovibe-agent-test-state/<pid>`. Keyed on the pid rather than a fresh uuid
+/// The root is `$TMPDIR/eitri-agent-test-state/<pid>`. Keyed on the pid rather than a fresh uuid
 /// deliberately: libtest has no after-all-tests hook, so nothing can delete the root when the run
 /// ends, and a uuid would leave one directory behind per `cargo test` invocation forever. A pid can
 /// instead be checked for liveness by the NEXT run, which is what `prune_dead_roots` does below --
@@ -176,7 +176,7 @@ fn account_home_dir() -> std::io::Result<PathBuf> {
 pub fn redirect_state_to_a_test_root() -> PathBuf {
     TEST_ROOT
         .get_or_init(|| {
-            let parent = std::env::temp_dir().join("neovibe-agent-test-state");
+            let parent = std::env::temp_dir().join("eitri-agent-test-state");
             prune_dead_roots(&parent);
             let root = parent.join(std::process::id().to_string());
             // A pid can be reused, so a leftover root from a dead process with this same pid may
@@ -256,7 +256,7 @@ mod tests {
         let dir = platform_leases_dir().unwrap();
         assert_eq!(dir, macos_leases_dir_under(&home));
         assert!(
-            dir.ends_with("Library/Application Support/neovibe/session-leases"),
+            dir.ends_with("Library/Application Support/eitri/session-leases"),
             "{dir:?}"
         );
         assert!(
@@ -325,7 +325,7 @@ mod tests {
     /// process group" -- so they are kept here as the regression cases for that.
     #[test]
     fn pruning_removes_dead_roots_and_leaves_live_ones() {
-        let parent = std::env::temp_dir().join(format!("neovibe-prune-test-{}", uuid::Uuid::new_v4()));
+        let parent = std::env::temp_dir().join(format!("eitri-prune-test-{}", uuid::Uuid::new_v4()));
         let dead = parent.join(u32::MAX.to_string());
         let pid_zero = parent.join("0");
         let live = parent.join("1");

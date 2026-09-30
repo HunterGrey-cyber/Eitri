@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# packaging/aur/test-in-container.sh -- builds, checks and installs both neovibe-bin and
-# neovibe-git in clean archlinux:latest containers (plan Task 14 brief's acceptance: "both
+# packaging/aur/test-in-container.sh -- builds, checks and installs both eitri-bin and
+# eitri-git in clean archlinux:latest containers (plan Task 14 brief's acceptance: "both
 # packages build, install and run --version in a clean Arch container").
 #
 # Every source= in both PKGBUILDs points at a real, not-yet-existing GitHub location (the AUR
@@ -8,13 +8,13 @@
 # test-only, local, never-committed location -- documented, not silent (spec sec 2.4's
 # "--network host only where a 127.0.0.1 server must be reached ... with that reason recorded"):
 #
-#   neovibe-bin   the two neovibe.git release assets (the tarball, the verdandi source archive) are
+#   eitri-bin   the two eitri.git release assets (the tarball, the verdandi source archive) are
 #                 served from --release-dir by a `python3 -m http.server` on 127.0.0.1, reached with
 #                 --network host. Node still comes from the real nodejs.org (a real, always-true
 #                 part of the recipe, not an artifact of this being a test).
-#   neovibe-git   all three git sources (neovibe, neovide, verdandi) come from local repositories,
+#   eitri-git   all three git sources (Eitri, neovide, verdandi) come from local repositories,
 #                 bind-mounted read-only into the container at /mirrors/ with source= rewritten to
-#                 git+file:///mirrors/...: --neovibe-checkout (tagged with --tag in a throwaway
+#                 git+file:///mirrors/...: --eitri-checkout (tagged with --tag in a throwaway
 #                 clone, since the public repo carries no tag yet during the rc window --
 #                 the private review notes #2's own follow-up ask),
 #                 --neovide-mirror (must carry neovibe-integration, with the checkout's submodule
@@ -24,12 +24,12 @@
 #                 fetches the pinned Verdandi crate from its real public URL.
 #
 # Usage:
-#   test-in-container.sh --release-dir DIR --neovibe-checkout DIR --neovide-mirror DIR \
+#   test-in-container.sh --release-dir DIR --eitri-checkout DIR --neovide-mirror DIR \
 #       --verdandi-mirror DIR [--tag TAG] [--work DIR] [--only bin|git] [--jobs N]
 #
 # --release-dir is the only thing that needs to change to re-run this against a later (real,
-# signed) release: `--release-dir ~/.cache/neovibe-release/v0.2.0/` (release.sh's default --out)
-# once it exists, keeping --neovibe-checkout/--neovide-mirror/--verdandi-mirror pointed at whatever
+# signed) release: `--release-dir ~/.cache/eitri-release/v0.2.0/` (release.sh's default --out)
+# once it exists, keeping --eitri-checkout/--neovide-mirror/--verdandi-mirror pointed at whatever
 # public clone/mirrors correspond to that release (a fresh public export for a real cut, or the
 # same ones here if the commits have not moved).
 set -euo pipefail
@@ -37,7 +37,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 RELEASE_DIR=""
-NEOVIBE_CHECKOUT=""
+EITRI_CHECKOUT=""
 NEOVIDE_MIRROR=""
 VERDANDI_MIRROR=""
 TAG=""
@@ -57,8 +57,8 @@ while [ $# -gt 0 ]; do
 		RELEASE_DIR=$2
 		shift 2
 		;;
-	--neovibe-checkout)
-		NEOVIBE_CHECKOUT=$2
+	--eitri-checkout)
+		EITRI_CHECKOUT=$2
 		shift 2
 		;;
 	--neovide-mirror)
@@ -99,8 +99,8 @@ case "$WORK" in
 /tmp | /tmp/*) die "--work must not be under /tmp (a small shared tmpfs)" ;;
 esac
 
-VERSION="$(sed -n 's/^NEOVIBE_VERSION=//p' "$RELEASE_DIR/RELEASE")"
-[ -n "$VERSION" ] || die "$RELEASE_DIR/RELEASE has no NEOVIBE_VERSION"
+VERSION="$(sed -n 's/^EITRI_VERSION=//p' "$RELEASE_DIR/RELEASE")"
+[ -n "$VERSION" ] || die "$RELEASE_DIR/RELEASE has no EITRI_VERSION"
 [ -n "$TAG" ] || TAG="v$VERSION"
 
 rm -rf -- "$WORK"
@@ -184,44 +184,44 @@ echo "--- namcap *.pkg.tar.zst ---"
 runuser -u builder -- bash -c "cd /build/PKGDIR && namcap ./*.pkg.tar.zst"
 echo "--- pacman -U ---"
 pacman -U --noconfirm /build/PKGDIR/*.pkg.tar.zst
-echo "--- neovibe --version ---"
-neovibe --version
+echo "--- eitri --version ---"
+eitri --version
 echo "--- verdandi-claude-sidecar --version ---"
-/usr/lib/neovibe/verdandi-claude-sidecar --version
+/usr/lib/eitri/verdandi-claude-sidecar --version
 echo "--- licence directory ---"
 ls -la /usr/share/licenses/PKGNAME/
 test -f /usr/share/licenses/PKGNAME/LICENSE.md
 '
 
 test_bin() {
-	echo "== neovibe-bin =="
-	mkdir -p -- "$WORK/build/neovibe-bin"
-	cp -- "$SCRIPT_DIR/neovibe-bin/PKGBUILD" "$WORK/build/neovibe-bin/PKGBUILD"
-	"$SCRIPT_DIR/bump-bin.sh" "$RELEASE_DIR" --allow-prerelease --pkgbuild-dir "$WORK/build/neovibe-bin"
+	echo "== eitri-bin =="
+	mkdir -p -- "$WORK/build/eitri-bin"
+	cp -- "$SCRIPT_DIR/eitri-bin/PKGBUILD" "$WORK/build/eitri-bin/PKGBUILD"
+	"$SCRIPT_DIR/bump-bin.sh" "$RELEASE_DIR" --allow-prerelease --pkgbuild-dir "$WORK/build/eitri-bin"
 
-	# Test-only source= override: the two neovibe.git assets come from a local HTTP server over
+	# Test-only source= override: the two eitri.git assets come from a local HTTP server over
 	# the release dir (read-only: never modifies --release-dir); Node is still the real nodejs.org.
 	local port=18080
-	sed -i -E "s#https://github.com/HunterGrey-cyber/neovibe/releases/download/v[^/]+/#http://127.0.0.1:$port/#g" \
-		"$WORK/build/neovibe-bin/PKGBUILD"
-	(cd "$WORK/build/neovibe-bin" && makepkg --printsrcinfo >.SRCINFO)
+	sed -i -E "s#https://github.com/HunterGrey-cyber/eitri/releases/download/v[^/]+/#http://127.0.0.1:$port/#g" \
+		"$WORK/build/eitri-bin/PKGBUILD"
+	(cd "$WORK/build/eitri-bin" && makepkg --printsrcinfo >.SRCINFO)
 
 	python3 -m http.server "$port" --bind 127.0.0.1 --directory "$RELEASE_DIR" >"$WORK/http-server-bin.log" 2>&1 &
 	# The global, not a local: see stop_http_server's comment -- the EXIT trap is what reaps this
 	# server when run_arch below fails.
 	HTTP_PID=$!
 
-	local script="$ARCH_SETUP"$'\n'"${BUILD_AND_CHECK//PKGDIR/neovibe-bin}"
-	script="${script//PKGNAME/neovibe-bin}"
+	local script="$ARCH_SETUP"$'\n'"${BUILD_AND_CHECK//PKGDIR/eitri-bin}"
+	script="${script//PKGNAME/eitri-bin}"
 	run_arch "nv-aur-bin-$$" "$WORK/log-bin.log" --network host -- "$script"
 
 	stop_http_server
-	echo "neovibe-bin: OK"
+	echo "eitri-bin: OK"
 }
 
 test_git() {
-	echo "== neovibe-git =="
-	[ -n "$NEOVIBE_CHECKOUT" ] || die "--neovibe-checkout is required for --only git (or the default, both)"
+	echo "== eitri-git =="
+	[ -n "$EITRI_CHECKOUT" ] || die "--eitri-checkout is required for --only git (or the default, both)"
 	[ -n "$NEOVIDE_MIRROR" ] || die "--neovide-mirror is required for --only git (or the default, both)"
 	[ -n "$VERDANDI_MIRROR" ] || die "--verdandi-mirror is required for --only git (or the default, both)"
 	NEOVIDE_MIRROR="$(realpath -- "$NEOVIDE_MIRROR")"
@@ -229,67 +229,67 @@ test_git() {
 
 	# A throwaway tagged clone: the public repo carries no v0.2.0-rc.1 tag yet (the rc window this
 	# is testing IS the scenario finding #2 asks to be exercised specifically), so pkgver()'s
-	# `git describe --long --tags` needs one to describe from. Never touches --neovibe-checkout
+	# `git describe --long --tags` needs one to describe from. Never touches --eitri-checkout
 	# itself. A checkout that already carries $TAG (tagged once the release is cut) keeps it, but
 	# only where it names the commit being built.
-	rm -rf -- "$WORK/neovibe-tagged.git"
-	git clone --quiet --bare "$NEOVIBE_CHECKOUT" "$WORK/neovibe-tagged.git"
+	rm -rf -- "$WORK/eitri-tagged.git"
+	git clone --quiet --bare "$EITRI_CHECKOUT" "$WORK/eitri-tagged.git"
 	local head tagged
-	head="$(git -C "$WORK/neovibe-tagged.git" rev-parse HEAD)"
-	if tagged="$(git -C "$WORK/neovibe-tagged.git" rev-parse -q --verify "refs/tags/$TAG^{commit}")"; then
-		[ "$tagged" = "$head" ] || die "--neovibe-checkout already has $TAG at $tagged, not at its HEAD $head"
+	head="$(git -C "$WORK/eitri-tagged.git" rev-parse HEAD)"
+	if tagged="$(git -C "$WORK/eitri-tagged.git" rev-parse -q --verify "refs/tags/$TAG^{commit}")"; then
+		[ "$tagged" = "$head" ] || die "--eitri-checkout already has $TAG at $tagged, not at its HEAD $head"
 	else
-		git -C "$WORK/neovibe-tagged.git" tag "$TAG" "$head"
+		git -C "$WORK/eitri-tagged.git" tag "$TAG" "$head"
 	fi
 
 	# Fail here, in seconds, rather than an hour into the container build: the two mirrors must
-	# hold what this neovibe commit pins (prepare() checks both out by commit, and makepkg checks
+	# hold what this Eitri commit pins (prepare() checks both out by commit, and makepkg checks
 	# the neovide mirror out by the PKGBUILD's #branch=neovibe-integration).
 	local fork_commit verdandi_rev
-	fork_commit="$(git -C "$WORK/neovibe-tagged.git" rev-parse "$head:neovide")"
-	verdandi_rev="$(git -C "$WORK/neovibe-tagged.git" show "$head:agent/Cargo.toml" |
+	fork_commit="$(git -C "$WORK/eitri-tagged.git" rev-parse "$head:neovide")"
+	verdandi_rev="$(git -C "$WORK/eitri-tagged.git" show "$head:agent/Cargo.toml" |
 		sed -n 's/^claude-runtime-protocol[[:space:]]*=.*rev[[:space:]]*=[[:space:]]*"\([0-9a-f]*\)".*/\1/p')"
-	[ -n "$verdandi_rev" ] || die "$NEOVIBE_CHECKOUT's agent/Cargo.toml pins no claude-runtime-protocol rev"
+	[ -n "$verdandi_rev" ] || die "$EITRI_CHECKOUT's agent/Cargo.toml pins no claude-runtime-protocol rev"
 	git -C "$NEOVIDE_MIRROR" rev-parse --verify --quiet refs/heads/neovibe-integration >/dev/null ||
 		die "--neovide-mirror $NEOVIDE_MIRROR has no neovibe-integration branch (the PKGBUILD's #branch=)"
 	git -C "$NEOVIDE_MIRROR" merge-base --is-ancestor "$fork_commit" refs/heads/neovibe-integration ||
 		die "--neovide-mirror $NEOVIDE_MIRROR: submodule commit $fork_commit is not on neovibe-integration"
 	git -C "$VERDANDI_MIRROR" cat-file -e "$verdandi_rev^{commit}" 2>/dev/null ||
 		die "--verdandi-mirror $VERDANDI_MIRROR does not have the pinned Verdandi $verdandi_rev"
-	if [ "$head" != "$(sed -n 's/^NEOVIBE_COMMIT=//p' "$RELEASE_DIR/RELEASE")" ]; then
-		echo "note: --neovibe-checkout HEAD $head is not $RELEASE_DIR's NEOVIBE_COMMIT" >&2
+	if [ "$head" != "$(sed -n 's/^EITRI_COMMIT=//p' "$RELEASE_DIR/RELEASE")" ]; then
+		echo "note: --eitri-checkout HEAD $head is not $RELEASE_DIR's EITRI_COMMIT" >&2
 	fi
 
 	# The three git sources are bind-mounted read-only into the container and source= is rewritten
 	# to those container paths: makepkg runs *inside* the container, where a host path such as
-	# $WORK/neovibe-tagged.git does not exist. (An earlier revision rewrote source= to the host
+	# $WORK/eitri-tagged.git does not exist. (An earlier revision rewrote source= to the host
 	# paths and mounted nothing but /build, so makepkg's first clone could never have succeeded --
 	# this half had not been run until Task 14's fix round 2.)
-	mkdir -p -- "$WORK/build/neovibe-git"
-	cp -- "$SCRIPT_DIR/neovibe-git/PKGBUILD" "$WORK/build/neovibe-git/PKGBUILD"
+	mkdir -p -- "$WORK/build/eitri-git"
+	cp -- "$SCRIPT_DIR/eitri-git/PKGBUILD" "$WORK/build/eitri-git/PKGBUILD"
 	sed -i \
-		-e "s#git+https://github.com/HunterGrey-cyber/neovibe.git#git+file:///mirrors/neovibe.git#" \
+		-e "s#git+https://github.com/HunterGrey-cyber/eitri.git#git+file:///mirrors/eitri.git#" \
 		-e "s#git+https://github.com/HunterGrey-cyber/neovide.git#git+file:///mirrors/neovide.git#" \
 		-e "s#git+https://github.com/HunterGrey-cyber/verdandi.git#git+file:///mirrors/verdandi.git#" \
-		"$WORK/build/neovibe-git/PKGBUILD"
-	if grep -n 'git+https://' "$WORK/build/neovibe-git/PKGBUILD"; then
+		"$WORK/build/eitri-git/PKGBUILD"
+	if grep -n 'git+https://' "$WORK/build/eitri-git/PKGBUILD"; then
 		die "a git source= was not rewritten to a local mirror (above)"
 	fi
-	(cd "$WORK/build/neovibe-git" && makepkg --printsrcinfo >.SRCINFO)
+	(cd "$WORK/build/eitri-git" && makepkg --printsrcinfo >.SRCINFO)
 
-	local script="$ARCH_SETUP"$'\n'"${BUILD_AND_CHECK//PKGDIR/neovibe-git}"
-	script="${script//PKGNAME/neovibe-git}"
+	local script="$ARCH_SETUP"$'\n'"${BUILD_AND_CHECK//PKGDIR/eitri-git}"
+	script="${script//PKGNAME/eitri-git}"
 	# Real network: cargo's registry and the pinned Verdandi git dependency, npm, the Skia archive
 	# (prepare()) and nodejs.org -- git+file:// sources need no network of their own, so this is
 	# the default bridge network, not the 127.0.0.1-only --network host exception spec sec 2.4
 	# names, just ordinary package-build network access (already an accepted AUR norm per spec
 	# sec 9's own "AUR norms this bends" note).
 	run_arch "nv-aur-git-$$" "$WORK/log-git.log" \
-		--mount "type=bind,src=$WORK/neovibe-tagged.git,dst=/mirrors/neovibe.git,readonly" \
+		--mount "type=bind,src=$WORK/eitri-tagged.git,dst=/mirrors/eitri.git,readonly" \
 		--mount "type=bind,src=$NEOVIDE_MIRROR,dst=/mirrors/neovide.git,readonly" \
 		--mount "type=bind,src=$VERDANDI_MIRROR,dst=/mirrors/verdandi.git,readonly" \
 		-- "$script"
-	echo "neovibe-git: OK"
+	echo "eitri-git: OK"
 }
 
 case "$ONLY" in

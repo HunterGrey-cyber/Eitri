@@ -6,14 +6,14 @@
 //! `cmd | neovide` opens `cmd`'s output) dups it, and `ui_attach` passes it as `stdin_fd`. nvim reads
 //! it as a buffer and, for a pipe or a socket whose writer stays open, blocks in `read()` until EOF.
 //! The editor stays blank (no theme, a default-size grid) and the window's close then times out
-//! waiting for nvim. neovibe has no "read stdin into the editor" feature; being started with a pipe
+//! waiting for nvim. Eitri has no "read stdin into the editor" feature; being started with a pipe
 //! on stdin -- by a launcher, a service, a test harness -- is ordinary. The GUI pass of 2026-09-23
 //! lost 18 launches to it on both builds before it was found (its defect 2).
 //!
 //! **What this does instead.** The fork is not changed: it reads fd 0 when the harness starts, so
 //! [`detach_stdin_from_nvim`] points fd 0 at `/dev/null` before that, and only when the fork would
 //! have forwarded it ([`forwarded_kind`] restates the fork's rule). A terminal and `/dev/null` are
-//! character devices and are left alone, so running neovibe from a shell changes nothing. A closed
+//! character devices and are left alone, so running Eitri from a shell changes nothing. A closed
 //! fd 0 cannot reach `main`: Rust's runtime opens `/dev/null` over a closed standard fd before
 //! `main` runs, and an fd `fstat` refuses is one the fork forwards nothing from either.
 

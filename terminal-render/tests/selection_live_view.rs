@@ -9,7 +9,7 @@
 //! `project_window` regardless of `ViewMode` (see its `paint_window`), so it never reproduces the
 //! live-view gap this test exists to catch. This drives a real `Term` through the real
 //! `vte::ansi::Processor` and reprojects it with `Projector::full`, exactly the frame shape
-//! `neovibe_terminal::screen::Screen::render` uses outside a synchronized update.
+//! `eitri_terminal::screen::Screen::render` uses outside a synchronized update.
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;

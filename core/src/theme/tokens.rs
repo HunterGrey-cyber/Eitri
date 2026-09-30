@@ -160,7 +160,7 @@ pub struct ThemeTokens {
     /// `guifont` height is the editor's size for a monospace face, and the panel is mostly
     /// proportional prose, so following it 1:1 would make the two panes disagree by however much
     /// the two faces disagree. This is a host setting -- `init.lua`'s
-    /// `neovibe.config.set("agent.font_size", ...)` -- that `shell` writes over the default after
+    /// `eitri.config.set("agent.font_size", ...)` -- that `shell` writes over the default after
     /// deriving the rest. [`DEFAULT_PANEL_FONT_SIZE_PX`] is what the panel shipped with, so an
     /// unset key changes nothing.
     pub font_size_px: f32,

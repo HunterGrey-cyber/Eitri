@@ -90,7 +90,7 @@ pub use wire::translate_line;
 pub const LEGACY_BACKEND_COMPILED: bool = cfg!(feature = "legacy-backend");
 
 /// What a build without the legacy backend says when legacy is asked for: `AgentSession::start`'s
-/// error, and the startup error for `--legacy`/`NEOVIBE_AGENT_BACKEND=legacy`. Names the flag that
+/// error, and the startup error for `--legacy`/`EITRI_AGENT_BACKEND=legacy`. Names the flag that
 /// brings it back, because the only reader who can act on this is a developer.
 pub const LEGACY_NOT_IN_BUILD: &str =
     "the legacy backend is not in this build (it is development-only: build with --features shell/legacy-backend)";

@@ -246,7 +246,7 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
 /// **NOT YET RUN (item 4A fix round 2, 2026-09-28): owed to the next the test-account wrapper pass.** A
 /// user's own `permissions.ask` rule for an edit must still stop a write the gate's hook allowed.
 ///
-/// Why it is load-bearing now: before item 4A every edit carded on neovibe's side, so a human
+/// Why it is load-bearing now: before item 4A every edit carded on Eitri's side, so a human
 /// answered it whatever the CLI would have done after. Since 4A an in-project `Write` gets the
 /// hook's `allow` with no card, and what stands between the user's `Edit(...)` ask rule and a silent
 /// write is the CLI's own re-check. Read from CLI 2.1.283's bundle, not yet observed: after a hook
@@ -255,7 +255,7 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
 /// and `DR` hands that ask back (`Pve`: a rule-forced ask); `EQn` then calls `canUseTool` instead of
 /// taking the hook's allow. Under `--print` with no permission prompt tool -- the legacy backend's
 /// shape, and this probe's -- that is a refusal; on the sidecar it is an O3 provider prompt carrying
-/// `matched_ask_rule`, which neovibe-core cards in every mode
+/// `matched_ask_rule`, which eitri-core cards in every mode
 /// (`agent_backend::tests::a_users_own_ask_rule_still_cards_an_edit_the_fast_path_allowed`). The O3
 /// record lists "a real permissions.ask rule surviving the gate's allow" as not yet verified on the
 /// real CLI; this is that check, for an edit.

@@ -4,7 +4,7 @@
 
 FS_GIT_ID="-c user.name=fromsource-test -c user.email=fromsource-test@example.invalid -c commit.gpgsign=false"
 
-# fs_scaffold DIR VERSION VERDANDI_URL VERDANDI_REV: a minimal but real neovibe-shaped checkout --
+# fs_scaffold DIR VERSION VERDANDI_URL VERDANDI_REV: a minimal but real eitri-shaped checkout --
 # just enough for checkout_version, lockfile_rev and agent_toml_verdandi to read something real, and
 # for from_source_stage to find real files at the paths it copies (the launcher, the desktop entry,
 # this installer itself, LICENSE). Not committed yet -- the caller commits and tags.
@@ -53,8 +53,8 @@ fs_scaffold() {
 		printf 'SKIA_BINARIES_URL_UPSTREAM=%s\n' "$SKIA_FIXTURE_URL"
 		printf 'SKIA_BINARIES_SHA256=%s\n' "$SKIA_FIXTURE_SHA256"
 	} >"$_fs_dir/packaging/pins.env"
-	cp "$PKG/neovibe.launcher.sh" "$_fs_dir/packaging/neovibe.launcher.sh"
-	cp "$PKG/neovibe.desktop" "$_fs_dir/packaging/neovibe.desktop"
+	cp "$PKG/eitri.launcher.sh" "$_fs_dir/packaging/eitri.launcher.sh"
+	cp "$PKG/eitri.desktop" "$_fs_dir/packaging/eitri.desktop"
 	cp "$INSTALLER" "$_fs_dir/packaging/install.sh"
 	printf 'test fixture LICENSE: MIT-shaped, not the real text.\n' >"$_fs_dir/LICENSE"
 }
@@ -98,12 +98,12 @@ fs_verdandi_checkout() {
 }
 
 # mk_from_source_release VERSION REV COMMIT: mk_release (the shared harness fixture builder), with
-# its own always-fake NEOVIBE_COMMIT replaced by COMMIT (a from-source fixture repo's real HEAD) and
+# its own always-fake EITRI_COMMIT replaced by COMMIT (a from-source fixture repo's real HEAD) and
 # re-signed. A fresh VERSION every caller uses (9.9.x), never one of setup_releases' own 1.x.y
 # versions: mutating those in place would corrupt every other test file's shared fixtures.
 mk_from_source_release() {
 	mk_release "$1" "$2"
-	sed -i "s/^NEOVIBE_COMMIT=.*/NEOVIBE_COMMIT=$3/" "$S/fix/v$1/RELEASE"
+	sed -i "s/^EITRI_COMMIT=.*/EITRI_COMMIT=$3/" "$S/fix/v$1/RELEASE"
 	resign "$S/fix/v$1"
 }
 
@@ -123,13 +123,13 @@ TESTS="$TESTS t_from_source_clone_head_mismatch_refuses"
 t_from_source_clone_head_mismatch_refuses() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
 	fs_repo 9.9.1 https://github.com/HunterGrey-cyber/verdandi.git ddddddd000000000000000000000000000000000
-	# setup_releases' own mk_release always writes NEOVIBE_COMMIT=1111...1, which is never a real
+	# setup_releases' own mk_release always writes EITRI_COMMIT=1111...1, which is never a real
 	# git repo's HEAD -- so the clone this checks against never matches.
 	mk_release 9.9.1 ddddddd000000000000000000000000000000000
 	serve 9.9.1
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_REPO_URL=$FS_DIR" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+	inst --set "EITRI_INSTALL_TEST_REPO_URL=$FS_DIR" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
 		-- --from-source --version 9.9.1 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 1
 	if ! grep -Fq "is at $FS_HEAD, not 1111111111111111111111111111111111111111" "$OUT"; then
@@ -145,32 +145,32 @@ t_from_source_clone_head_match_builds_and_installs() {
 	mk_from_source_release 9.9.2 ddddddd000000000000000000000000000000000 "$FS_HEAD"
 	serve 9.9.2
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_REPO_URL=$FS_DIR" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_REPO_URL=$FS_DIR" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --version 9.9.2 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 0
-	expect_out "building neovibe 9.9.2 from source"
+	expect_out "building Eitri 9.9.2 from source"
 	if [ "$(grep -c '^cargo build ' "$S/logs/cargo.log")" != 1 ]; then
 		fail "cargo build did not run exactly once: $(cat "$S/logs/cargo.log")"
 	fi
 	# F3 (v1-dist whole-branch review, 2026-09-28): --target-dir now pins staging's own
-	# <src>/target/release assumption -- $TH/.cache/neovibe/src is clone_public_neovibe's own
+	# <src>/target/release assumption -- $TH/.cache/eitri/src is clone_public_eitri's own
 	# NV_CACHE_NV/src, the from-source dir a network (non---checkout) build clones into.
-	if ! grep -Fqx "cargo build --release --locked --target-dir $TH/.cache/neovibe/src/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
+	if ! grep -Fqx "cargo build --release --locked --target-dir $TH/.cache/eitri/src/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
 		fail "the recorded build command is not exactly the spec's: $(cat "$S/logs/cargo.log")"
 	fi
 	# Installed exactly like the prebuilt path: the four binaries, the launcher, RELEASE, licences.
-	for b in shell neovibe-supervisor neovibe-tmux-shim neovibe-claude-handoff; do
-		expect_exec "$TH/.local/lib/neovibe/$b"
+	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff; do
+		expect_exec "$TH/.local/lib/eitri/$b"
 	done
-	expect_exec "$TH/.local/bin/neovibe"
-	expect_file "$TH/.local/lib/neovibe/RELEASE"
+	expect_exec "$TH/.local/bin/eitri"
+	expect_file "$TH/.local/lib/eitri/RELEASE"
 	expect_eq "$(installed_version)" 9.9.2 "the version installed from source"
 	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do
-		expect_file "$TH/.local/share/licenses/neovibe/$f"
+		expect_file "$TH/.local/share/licenses/eitri/$f"
 	done
-	if ! grep -q 'built directly from source' "$TH/.local/share/licenses/neovibe/THIRD-PARTY-LICENSES"; then
+	if ! grep -q 'built directly from source' "$TH/.local/share/licenses/eitri/THIRD-PARTY-LICENSES"; then
 		fail "THIRD-PARTY-LICENSES does not say it is a from-source placeholder"
 	fi
 }
@@ -186,8 +186,8 @@ t_from_source_node_checksum_verified_before_build() {
 	_bad=$S/srv/dist/$NODE_FIXTURE_VERSION/node-$NODE_FIXTURE_VERSION-linux-x64.tar.xz
 	cp "$_bad" "$T/good-node.tar.xz"
 	echo corrupt >"$_bad"
-	inst --set "NEOVIBE_INSTALL_TEST_REPO_URL=$FS_DIR" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+	inst --set "EITRI_INSTALL_TEST_REPO_URL=$FS_DIR" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
 		-- --from-source --version 9.9.3 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 1
 	expect_out "checksum mismatch for node-$NODE_FIXTURE_VERSION-linux-x64.tar.xz"
@@ -202,7 +202,7 @@ t_from_source_missing_build_tools_refuses() {
 	mk_from_source_release 9.9.4 ddddddd000000000000000000000000000000000 "$FS_HEAD"
 	serve 9.9.4
 	inst --path-tail "$S/path-no-cargo" \
-		--set "NEOVIBE_INSTALL_TEST_REPO_URL=$FS_DIR" \
+		--set "EITRI_INSTALL_TEST_REPO_URL=$FS_DIR" \
 		-- --from-source --version 9.9.4 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 1
 	expect_out "building from source needs cargo and rustc"
@@ -245,11 +245,11 @@ t_from_source_older_version_refused() {
 	serve 9.9.9 9.9.10
 	before=$(snap "$TH")
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_REPO_URL=$FS_DIR" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+	inst --set "EITRI_INSTALL_TEST_REPO_URL=$FS_DIR" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
 		-- --from-source --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_fail "a from-source downgrade without --version"
-	expect_out 'neovibe 9.9.10 is installed, and the release offered is older (9.9.9): refusing to downgrade silently'
+	expect_out 'Eitri 9.9.10 is installed, and the release offered is older (9.9.9): refusing to downgrade silently'
 	expect_out '--version 9.9.9'
 	expect_eq "$(snap "$TH")" "$before" "the home after a refused from-source downgrade"
 	if [ -f "$S/logs/cargo.log" ] && grep -q '^cargo build ' "$S/logs/cargo.log"; then
@@ -257,9 +257,9 @@ t_from_source_older_version_refused() {
 	fi
 
 	# With --version, the refusal does not apply: the run proceeds to a real clone-and-build.
-	inst --set "NEOVIBE_INSTALL_TEST_REPO_URL=$FS_DIR" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_REPO_URL=$FS_DIR" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --version 9.9.9 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 0
 	expect_eq "$(installed_version)" 9.9.9 "the explicit from-source downgrade"
@@ -272,14 +272,14 @@ TESTS="$TESTS t_from_source_checkout_public_rev_builds_and_installs"
 t_from_source_checkout_public_rev_builds_and_installs() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
 	# The pinned rev must be one resolve_verdandi_source's own public-clone branch can actually
-	# check out: a fresh clone of NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL (this fixture), not an
+	# check out: a fresh clone of EITRI_INSTALL_TEST_VERDANDI_REPO_URL (this fixture), not an
 	# arbitrary 40-hex string.
 	fs_verdandi_checkout "$T/verdandi-src"
 	fs_repo 1.0.0 https://github.com/HunterGrey-cyber/verdandi.git "$FS_VC_HEAD"
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --checkout "$FS_DIR"
 	expect_rc 0
 	# F3 (v1-dist whole-branch review, 2026-09-28): --target-dir now pins staging's own
@@ -287,17 +287,17 @@ t_from_source_checkout_public_rev_builds_and_installs() {
 	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
 		fail "the recorded build command is not exactly the spec's: $(cat "$S/logs/cargo.log")"
 	fi
-	if ! grep -Fqx "SKIA_BINARIES_URL=file://$T/home/.cache/neovibe/from-source-skia/skia-binaries-test.tar.gz" "$S/logs/cargo.log"; then
+	if ! grep -Fqx "SKIA_BINARIES_URL=file://$T/home/.cache/eitri/from-source-skia/skia-binaries-test.tar.gz" "$S/logs/cargo.log"; then
 		fail "the build did not see the pinned, checked local Skia archive: $(cat "$S/logs/cargo.log")"
 	fi
-	expect_exec "$TH/.local/lib/neovibe/shell"
+	expect_exec "$TH/.local/lib/eitri/shell"
 	expect_eq "$(installed_version)" 1.0.0 "the version installed from --checkout"
-	have_rev=$(sed -n 's/^VERDANDI_REV=//p' "$TH/.local/lib/neovibe/RELEASE")
+	have_rev=$(sed -n 's/^VERDANDI_REV=//p' "$TH/.local/lib/eitri/RELEASE")
 	expect_eq "$have_rev" "$FS_VC_HEAD" "the synthesized RELEASE's own VERDANDI_REV"
-	have_commit=$(sed -n 's/^NEOVIBE_COMMIT=//p' "$TH/.local/lib/neovibe/RELEASE")
-	expect_eq "$have_commit" "$FS_HEAD" "the synthesized RELEASE's own NEOVIBE_COMMIT"
-	if ! grep -Fqx 'NEOVIBE_BUILT_FROM_CHECKOUT=1' "$TH/.local/lib/neovibe/RELEASE"; then
-		fail "the installed RELEASE is not marked NEOVIBE_BUILT_FROM_CHECKOUT: $(cat "$TH/.local/lib/neovibe/RELEASE")"
+	have_commit=$(sed -n 's/^EITRI_COMMIT=//p' "$TH/.local/lib/eitri/RELEASE")
+	expect_eq "$have_commit" "$FS_HEAD" "the synthesized RELEASE's own EITRI_COMMIT"
+	if ! grep -Fqx 'EITRI_BUILT_FROM_CHECKOUT=1' "$TH/.local/lib/eitri/RELEASE"; then
+		fail "the installed RELEASE is not marked EITRI_BUILT_FROM_CHECKOUT: $(cat "$TH/.local/lib/eitri/RELEASE")"
 	fi
 }
 
@@ -317,9 +317,9 @@ t_from_source_checkout_target_dir_pinned_against_stale_binary() {
 	chmod 0755 "$FS_DIR/target/release/shell"
 	_elsewhere=$T/elsewhere-cargo-target
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		--set "CARGO_TARGET_DIR=$_elsewhere" \
 		-- --from-source --checkout "$FS_DIR"
 	expect_rc 0
@@ -328,11 +328,11 @@ t_from_source_checkout_target_dir_pinned_against_stale_binary() {
 	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
 		fail "--target-dir did not win over the caller's CARGO_TARGET_DIR: $(cat "$S/logs/cargo.log")"
 	fi
-	if grep -q 'STALE stub shell' "$TH/.local/lib/neovibe/shell"; then
+	if grep -q 'STALE stub shell' "$TH/.local/lib/eitri/shell"; then
 		fail "the stale planted binary was installed instead of a fresh build"
 	fi
-	if ! grep -q 'from-source test build' "$TH/.local/lib/neovibe/shell"; then
-		fail "the installed shell is not the fresh stub build: $(cat "$TH/.local/lib/neovibe/shell")"
+	if ! grep -q 'from-source test build' "$TH/.local/lib/eitri/shell"; then
+		fail "the installed shell is not the fresh stub build: $(cat "$TH/.local/lib/eitri/shell")"
 	fi
 	# --target-dir wins entirely (real cargo's own precedence): the caller's CARGO_TARGET_DIR is
 	# never touched at all.
@@ -357,9 +357,9 @@ t_from_source_checkout_relative_path_from_its_parent_directory() {
 	fs_verdandi_checkout "$T/verdandi-src"
 	fs_repo 1.0.0 https://github.com/HunterGrey-cyber/verdandi.git "$FS_VC_HEAD"
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --checkout ../fs-repo
 	expect_rc 0
 	# The absolutized checkout dir, not the literal relative argument: --target-dir must name the
@@ -367,7 +367,7 @@ t_from_source_checkout_relative_path_from_its_parent_directory() {
 	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
 		fail "a relative --checkout did not resolve --target-dir against the checkout itself: $(cat "$S/logs/cargo.log")"
 	fi
-	expect_exec "$TH/.local/lib/neovibe/shell"
+	expect_exec "$TH/.local/lib/eitri/shell"
 	expect_eq "$(installed_version)" 1.0.0 "the version installed from a relative --checkout"
 }
 
@@ -386,17 +386,17 @@ t_from_source_checkout_build_that_writes_nothing_refuses_stale_binary() {
 	printf '#!/bin/sh\necho "STALE stub shell: must never be installed"\n' >"$FS_DIR/target/release/shell"
 	chmod 0755 "$FS_DIR/target/release/shell"
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
-		--set "NEOVIBE_INSTALL_TEST_CARGO_MODE=skip" \
+	inst --set "EITRI_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+		--set "EITRI_INSTALL_TEST_CARGO_MODE=skip" \
 		-- --from-source --checkout "$FS_DIR"
 	expect_fail "a build that wrote nothing into target/release, with a stale binary already there"
 	expect_out "the build did not produce target/release/shell"
-	if [ -e "$TH/.local/lib/neovibe/shell" ]; then
+	if [ -e "$TH/.local/lib/eitri/shell" ]; then
 		fail "the stale planted binary was installed despite the build producing nothing"
 	fi
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_absent "$TH/.local/lib/eitri"
 	# The rm loop really did remove it (rather than the stub simply never having been asked to
 	# overwrite it): the stale file is gone from the source tree too.
 	expect_absent "$FS_DIR/target/release/shell"
@@ -406,7 +406,7 @@ TESTS="$TESTS t_from_source_checkout_setup_refuses_honestly_not_as_a_mismatch"
 t_from_source_checkout_setup_refuses_honestly_not_as_a_mismatch() {
 	# installer-claude-7: a --checkout install's own RELEASE names a VERDANDI_SOURCE_SHA256 that is
 	# a `git archive` hash of the checkout tree, never the real release asset's bytes. A later,
-	# separate `neovibe setup` run (this test's own second inst call, a fresh process with no
+	# separate `eitri setup` run (this test's own second inst call, a fresh process with no
 	# override tarball of its own) used to download the real asset from the release server and
 	# refuse it as a checksum mismatch -- reading as tampering, when the real reason is that this
 	# kind of RELEASE cannot be resolved that way at all.
@@ -414,23 +414,23 @@ t_from_source_checkout_setup_refuses_honestly_not_as_a_mismatch() {
 	fs_verdandi_checkout "$T/verdandi-src"
 	fs_repo 1.0.0 https://github.com/HunterGrey-cyber/verdandi.git "$FS_VC_HEAD"
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --checkout "$FS_DIR"
 	expect_rc 0
-	if ! grep -Fqx 'NEOVIBE_BUILT_FROM_CHECKOUT=1' "$TH/.local/lib/neovibe/RELEASE"; then
-		fail "the installed RELEASE is not marked NEOVIBE_BUILT_FROM_CHECKOUT: $(cat "$TH/.local/lib/neovibe/RELEASE")"
+	if ! grep -Fqx 'EITRI_BUILT_FROM_CHECKOUT=1' "$TH/.local/lib/eitri/RELEASE"; then
+		fail "the installed RELEASE is not marked EITRI_BUILT_FROM_CHECKOUT: $(cat "$TH/.local/lib/eitri/RELEASE")"
 	fi
 	# The --checkout install's own run already built (and left present) a sidecar for this rev, from
-	# its own override tarball: removed here so the "neovibe setup" run below has to actually try to
+	# its own override tarball: removed here so the "eitri setup" run below has to actually try to
 	# resolve the Verdandi source itself, instead of returning early on "sidecar ... present".
-	rm -rf -- "$(data_of)/neovibe/sidecar"
-	INSTALLER_UNDER_TEST=$TH/.local/lib/neovibe/neovibe-setup
+	rm -rf -- "$(data_of)/eitri/sidecar"
+	INSTALLER_UNDER_TEST=$TH/.local/lib/eitri/eitri-setup
 	sc_inst_setup -- --sidecar-only
-	expect_fail "a separate neovibe setup run against a checkout-built RELEASE"
+	expect_fail "a separate eitri setup run against a checkout-built RELEASE"
 	expect_out 'was built from a --checkout tree'
-	expect_out 'NEOVIBE_BUILT_FROM_CHECKOUT=1'
+	expect_out 'EITRI_BUILT_FROM_CHECKOUT=1'
 	expect_no_out 'checksum mismatch'
 	expect_no_out 'tampered'
 }
@@ -527,13 +527,13 @@ t_from_source_checkout_public_shape_builds_and_installs() {
 	fs_verdandi_checkout "$T/verdandi-src"
 	fs_repo_public 1.0.0 https://github.com/HunterGrey-cyber/verdandi.git "$FS_VC_HEAD"
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
-		--set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --checkout "$FS_DIR"
 	expect_rc 0
-	expect_exec "$TH/.local/lib/neovibe/shell"
-	have_fork=$(sed -n 's/^NEOVIDE_FORK_COMMIT=//p' "$TH/.local/lib/neovibe/RELEASE")
+	expect_exec "$TH/.local/lib/eitri/shell"
+	have_fork=$(sed -n 's/^NEOVIDE_FORK_COMMIT=//p' "$TH/.local/lib/eitri/RELEASE")
 	expect_eq "$have_fork" "$FS_NEOVIDE_HEAD" "the synthesized RELEASE's NEOVIDE_FORK_COMMIT (the submodule's gitlink)"
 }
 
@@ -583,7 +583,7 @@ t_from_source_checkout_private_verdandi_without_checkout_refuses() {
 	inst -- --from-source --checkout "$FS_DIR"
 	expect_rc 1
 	expect_out 'pins Verdandi from a private source'
-	expect_out 'NEOVIBE_VERDANDI_CHECKOUT'
+	expect_out 'EITRI_VERDANDI_CHECKOUT'
 	expect_out '--verdandi-checkout'
 	if grep -q '^cargo build ' "$S/logs/cargo.log"; then fail "cargo build ran despite the unreachable private source"; fi
 }
@@ -594,11 +594,11 @@ t_from_source_checkout_private_verdandi_with_checkout_succeeds() {
 	fs_verdandi_checkout "$T/verdandi-src"
 	fs_repo 1.0.0 ssh://git@example.invalid/grey/verdandi.git "$FS_VC_HEAD"
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --checkout "$FS_DIR" --verdandi-checkout "$T/verdandi-src"
 	expect_rc 0
-	expect_exec "$TH/.local/lib/neovibe/shell"
+	expect_exec "$TH/.local/lib/eitri/shell"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -608,7 +608,7 @@ TESTS="$TESTS t_verdandi_checkout_rev_mismatch_refuses"
 t_verdandi_checkout_rev_mismatch_refuses() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
 	fs_verdandi_checkout "$T/verdandi-src"
-	# The neovibe checkout pins a DIFFERENT rev than $T/verdandi-src is actually at.
+	# The Eitri checkout pins a DIFFERENT rev than $T/verdandi-src is actually at.
 	fs_repo 1.0.0 ssh://git@example.invalid/grey/verdandi.git ffffffff00000000000000000000000000000000
 	PRE_STUBS=$(fs_cargo_stubs)
 	inst -- --from-source --checkout "$FS_DIR" --verdandi-checkout "$T/verdandi-src"
@@ -638,18 +638,18 @@ t_verdandi_checkout_allow_mismatch_proceeds_and_records() {
 	fs_verdandi_checkout "$T/verdandi-src"
 	fs_repo 1.0.0 ssh://git@example.invalid/grey/verdandi.git ffffffff00000000000000000000000000000000
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --checkout "$FS_DIR" --verdandi-checkout "$T/verdandi-src" --allow-verdandi-rev-mismatch
 	expect_rc 0
 	expect_out 'building against it anyway'
-	expect_exec "$TH/.local/lib/neovibe/shell"
+	expect_exec "$TH/.local/lib/eitri/shell"
 }
 
 # snap_but_git_index DIR: snap, except .git/index's own mtime and .git's own directory mtime --
 # `git status`/`git rev-parse HEAD`/`git archive` legitimately refresh the index's stat cache (so
 # its mtime) and transiently create-and-remove a lock file directly under .git/ (so ITS mtime, the
-# same reason harness.sh's own snap_but_lock excludes ./.cache and ./.cache/neovibe), with no
+# same reason harness.sh's own snap_but_lock excludes ./.cache and ./.cache/eitri), with no
 # content change at all -- comparing either verbatim would fail on the harness's own read-only
 # probes, not on anything this installer did.
 snap_but_git_index() {
@@ -666,8 +666,8 @@ t_verdandi_checkout_archive_leaves_checkout_unchanged() {
 	before_status=$(git -C "$T/verdandi-src" status --porcelain)
 	before_snap=$(snap_but_git_index "$T/verdandi-src")
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		--set "NEOVIBE_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --checkout "$FS_DIR" --verdandi-checkout "$T/verdandi-src"
 	expect_rc 0
 	after_status=$(git -C "$T/verdandi-src" status --porcelain)

@@ -1,8 +1,8 @@
 //! Host-side orchestration for "continue in a real terminal" (design doc §8.3). The caller (a
 //! future `shell` UI action, not built in this phase) is responsible for its own "deny new
 //! turns, complete or interrupt any active turn, then close the session" sequence BEFORE calling
-//! `prepare_neovibe_to_cli_handoff` -- this function's only job is: acquire the lease, spawn
-//! `neovibe-claude-handoff` with that lease's fd inherited, and confirm the handoff genuinely
+//! `prepare_eitri_to_cli_handoff` -- this function's only job is: acquire the lease, spawn
+//! `eitri-claude-handoff` with that lease's fd inherited, and confirm the handoff genuinely
 //! started before returning. It does not itself touch any `AgentSession`/`ClaudeSidecarProvider`
 //! -- see this plan's "Explicitly out of scope" section for why no shared session-identity trait
 //! exists yet.
@@ -33,7 +33,7 @@ pub enum ResumeCommandError {
     /// becomes a flag.
     SessionIdLooksLikeAFlag,
     /// No working directory. A session's cwd is part of its identity throughout this design
-    /// (`prepare_neovibe_to_cli_handoff` runs the wrapper with `current_dir(canonical_cwd)`, the
+    /// (`prepare_eitri_to_cli_handoff` runs the wrapper with `current_dir(canonical_cwd)`, the
     /// lease key includes it, and design doc §8.4 has the provider validate it on an import), so a
     /// `--resume` with nowhere to run is not a weaker command -- it is a different one.
     MissingCwd,
@@ -63,7 +63,7 @@ impl std::error::Error for ResumeCommandError {}
 /// else.
 ///
 /// The one place this project decides what that invocation is. Both consumers call it -- the
-/// `neovibe-claude-handoff` wrapper, which `exec`s it while holding the lease fd, and
+/// `eitri-claude-handoff` wrapper, which `exec`s it while holding the lease fd, and
 /// `ClaudeResumeCommand`, which renders it for a human to run -- so the command a user is shown is
 /// by construction the command the supported handoff path would run.
 ///
@@ -76,8 +76,8 @@ impl std::error::Error for ResumeCommandError {}
 ///
 /// **Two of those omissions widen what the resumed session can do, and that is the substantive
 /// point, not a footnote.** `--settings` is where the `PreToolUse` gate lives, so the resumed
-/// session has no Neovibe permission gate at all and its tool calls raise no card anywhere.
-/// `--permission-mode` and `--disallowedTools` are simply absent, so a session that Neovibe ran in
+/// session has no Eitri permission gate at all and its tool calls raise no card anywhere.
+/// `--permission-mode` and `--disallowedTools` are simply absent, so a session that Eitri ran in
 /// `auto` with `Bash,Write,Edit,NotebookEdit` disallowed comes back as a plain `claude` at the
 /// user's own default mode with none of those refusals -- it can do MORE than the conversation it
 /// continues could. The user-facing card states the settings difference; this is the precise
@@ -183,8 +183,8 @@ impl std::fmt::Display for HandoffError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HandoffError::Lease(e) => write!(f, "handoff lease error: {e}"),
-            HandoffError::BinaryNotFound(e) => write!(f, "could not locate neovibe-claude-handoff binary: {e}"),
-            HandoffError::SpawnFailed(e) => write!(f, "failed to spawn neovibe-claude-handoff: {e}"),
+            HandoffError::BinaryNotFound(e) => write!(f, "could not locate eitri-claude-handoff binary: {e}"),
+            HandoffError::SpawnFailed(e) => write!(f, "failed to spawn eitri-claude-handoff: {e}"),
         }
     }
 }
@@ -196,7 +196,7 @@ pub struct HandoffOutcome {
     pub child_pid: u32,
 }
 
-/// Locates the `neovibe-claude-handoff` binary next to whichever binary is currently running --
+/// Locates the `eitri-claude-handoff` binary next to whichever binary is currently running --
 /// the same "same cargo build, sibling binary" convention as `supervisor::locate_supervisor_binary`
 /// and this crate's own `settings::locate_agent_hook_binary`, whose body this mirrors line for line
 /// with only the binary name changed. Keep all three in step: if the lookup rule needs to change,
@@ -206,7 +206,7 @@ fn locate_handoff_binary() -> std::io::Result<std::path::PathBuf> {
     let dir = current
         .parent()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "current_exe has no parent directory"))?;
-    let candidate = dir.join("neovibe-claude-handoff");
+    let candidate = dir.join("eitri-claude-handoff");
     if candidate.exists() {
         return Ok(candidate);
     }
@@ -216,7 +216,7 @@ fn locate_handoff_binary() -> std::io::Result<std::path::PathBuf> {
     );
     if one_dir_deeper {
         if let Some(parent) = dir.parent() {
-            let fallback = parent.join("neovibe-claude-handoff");
+            let fallback = parent.join("eitri-claude-handoff");
             if fallback.exists() {
                 return Ok(fallback);
             }
@@ -224,7 +224,7 @@ fn locate_handoff_binary() -> std::io::Result<std::path::PathBuf> {
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        format!("neovibe-claude-handoff binary not found at {candidate:?} -- was it built in the same cargo build?"),
+        format!("eitri-claude-handoff binary not found at {candidate:?} -- was it built in the same cargo build?"),
     ))
 }
 
@@ -249,7 +249,7 @@ fn locate_handoff_binary() -> std::io::Result<std::path::PathBuf> {
 /// Getting it wrong is not unsafe, just useless: the companion binary fail-closes on an empty id,
 /// and a `claude --resume` against a nonexistent one exits on its own, releasing the lease. But it
 /// wastes a real lease acquisition and a real process spawn to accomplish nothing.
-pub fn prepare_neovibe_to_cli_handoff(
+pub fn prepare_eitri_to_cli_handoff(
     provider: &str,
     canonical_cwd: &str,
     provider_session_id: &str,
@@ -261,8 +261,8 @@ pub fn prepare_neovibe_to_cli_handoff(
         .map_err(|e| HandoffError::Lease(LeaseError::Io(e)))?;
 
     let child = match Command::new(&binary)
-        .env("NEOVIBE_LEASE_FD", fd.to_string())
-        .env("NEOVIBE_RESUME_SESSION_ID", provider_session_id)
+        .env("EITRI_LEASE_FD", fd.to_string())
+        .env("EITRI_RESUME_SESSION_ID", provider_session_id)
         .current_dir(canonical_cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -291,7 +291,7 @@ pub fn prepare_neovibe_to_cli_handoff(
     // That matters because the alternative is a real bug, not a style preference. If this process
     // kept its reference, the lock would outlive the child and stay held for this process's entire
     // remaining lifetime -- so once the user finished in the terminal and quit the CLI, neither
-    // Neovibe nor anything else could ever re-acquire that session again, and the failure would
+    // Eitri nor anything else could ever re-acquire that session again, and the failure would
     // present as `AlreadyHeld` naming a holder that no longer exists.
     //
     // Verified for real, both directions, rather than reasoned from the flock(2) man page: with
@@ -368,7 +368,7 @@ mod tests {
     /// What this actually pins, stated exactly, because an earlier version of this doc claimed
     /// more than the body can deliver: the command a user is SHOWN is built from
     /// `claude_resume_argv` and renders as that literal line. It says nothing about the
-    /// `neovibe-claude-handoff` wrapper -- the first assert is `f(x) == f(x)` (`for_session` calls
+    /// `eitri-claude-handoff` wrapper -- the first assert is `f(x) == f(x)` (`for_session` calls
     /// `claude_resume_argv`), and the binary is not in scope of a unit test in this crate at all.
     ///
     /// The wrapper's own argv is guarded for real, by running the real binary, in

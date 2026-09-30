@@ -5,13 +5,13 @@
 
 TESTS="$TESTS t_recover_stale_new"
 t_recover_stale_new() {
-	mkdir -p "$TH/.local/lib/neovibe.new/leftover"
-	echo junk >"$TH/.local/lib/neovibe.new/leftover/file"
+	mkdir -p "$TH/.local/lib/eitri.new/leftover"
+	echo junk >"$TH/.local/lib/eitri.new/leftover/file"
 	serve 1.0.0
 	inst_net
 	expect_rc 0
-	expect_out "removing $TH/.local/lib/neovibe.new, left by an interrupted run"
-	expect_absent "$TH/.local/lib/neovibe.new"
+	expect_out "removing $TH/.local/lib/eitri.new, left by an interrupted run"
+	expect_absent "$TH/.local/lib/eitri.new"
 	expect_eq "$(installed_version)" 1.0.0 "the version installed after the recovery"
 }
 
@@ -21,16 +21,16 @@ t_recover_old_moved_back() {
 	inst_net
 	expect_rc 0
 	plant_sidecar aaaaaaa
-	# An upgrade interrupted between its two renames: neovibe missing, neovibe.old present.
-	mv "$TH/.local/lib/neovibe" "$TH/.local/lib/neovibe.old"
-	before=$(snap "$TH/.local/lib/neovibe.old")
+	# An upgrade interrupted between its two renames: eitri missing, eitri.old present.
+	mv "$TH/.local/lib/eitri" "$TH/.local/lib/eitri.old"
+	before=$(snap "$TH/.local/lib/eitri.old")
 	inst_net
 	expect_rc 0
-	expect_out "restoring $TH/.local/lib/neovibe from $TH/.local/lib/neovibe.old"
+	expect_out "restoring $TH/.local/lib/eitri from $TH/.local/lib/eitri.old"
 	# Moved back first, so the same version is then up to date and nothing else changes.
-	expect_out 'neovibe 1.0.0 is up to date'
-	expect_absent "$TH/.local/lib/neovibe.old"
-	expect_eq "$(snap "$TH/.local/lib/neovibe")" "$before" "the restored install"
+	expect_out 'Eitri 1.0.0 is up to date'
+	expect_absent "$TH/.local/lib/eitri.old"
+	expect_eq "$(snap "$TH/.local/lib/eitri")" "$before" "the restored install"
 }
 
 TESTS="$TESTS t_recover_both_old_removed_first"
@@ -38,21 +38,21 @@ t_recover_both_old_removed_first() {
 	serve 1.0.0
 	inst_net
 	expect_rc 0
-	mkdir -p "$TH/.local/lib/neovibe.old/stale"
-	echo stale >"$TH/.local/lib/neovibe.old/stale/file"
+	mkdir -p "$TH/.local/lib/eitri.old/stale"
+	echo stale >"$TH/.local/lib/eitri.old/stale/file"
 	serve 1.1.0 1.0.0
 	inst_net --stubs "$S/stubs-mvlog" --
 	expect_rc 0
-	expect_out "removing $TH/.local/lib/neovibe.old, left by an interrupted upgrade"
+	expect_out "removing $TH/.local/lib/eitri.old, left by an interrupted upgrade"
 	expect_eq "$(installed_version)" 1.1.0 "the version after the upgrade"
-	expect_absent "$TH/.local/lib/neovibe.old"
-	expect_absent "$TH/.local/lib/neovibe/neovibe"
-	# No mv ever targeted neovibe.old while it existed as a directory (which would move the tree
+	expect_absent "$TH/.local/lib/eitri.old"
+	expect_absent "$TH/.local/lib/eitri/eitri"
+	# No mv ever targeted eitri.old while it existed as a directory (which would move the tree
 	# inside it), and the swap did happen through mv.
-	if grep -F "$TH/.local/lib/neovibe.old INTO-EXISTING-DIR" "$S/logs/mv.log" >/dev/null; then
-		fail "a tree was moved inside neovibe.old: $(cat "$S/logs/mv.log")"
+	if grep -F "$TH/.local/lib/eitri.old INTO-EXISTING-DIR" "$S/logs/mv.log" >/dev/null; then
+		fail "a tree was moved inside eitri.old: $(cat "$S/logs/mv.log")"
 	fi
-	if ! grep -F -x "mv -- $TH/.local/lib/neovibe $TH/.local/lib/neovibe.old" "$S/logs/mv.log" >/dev/null; then
+	if ! grep -F -x "mv -- $TH/.local/lib/eitri $TH/.local/lib/eitri.old" "$S/logs/mv.log" >/dev/null; then
 		fail "the swap's first rename was not seen: $(cat "$S/logs/mv.log")"
 	fi
 }
@@ -60,18 +60,18 @@ t_recover_both_old_removed_first() {
 TESTS="$TESTS t_lock_live_refuses"
 t_lock_live_refuses() {
 	serve 1.0.0
-	mkdir -p "$TH/.cache/neovibe/lock"
+	mkdir -p "$TH/.cache/eitri/lock"
 	sleep 300 &
 	holder=$!
-	echo "$holder" >"$TH/.cache/neovibe/lock/pid"
+	echo "$holder" >"$TH/.cache/eitri/lock/pid"
 	inst_net
 	kill "$holder" 2>/dev/null
 	wait "$holder" 2>/dev/null
 	expect_fail "a lock held by a live pid"
-	expect_out "another neovibe installer (pid $holder) is running"
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_out "another Eitri installer (pid $holder) is running"
+	expect_absent "$TH/.local/lib/eitri"
 	# The lock belongs to the live holder: a refused run leaves it.
-	expect_file "$TH/.cache/neovibe/lock/pid"
+	expect_file "$TH/.cache/eitri/lock/pid"
 }
 
 TESTS="$TESTS t_lock_dead_taken_over"
@@ -80,13 +80,13 @@ t_lock_dead_taken_over() {
 	sh -c 'exit 0' &
 	dead=$!
 	wait "$dead"
-	mkdir -p "$TH/.cache/neovibe/lock"
-	echo "$dead" >"$TH/.cache/neovibe/lock/pid"
+	mkdir -p "$TH/.cache/eitri/lock"
+	echo "$dead" >"$TH/.cache/eitri/lock/pid"
 	inst_net
 	expect_rc 0
 	expect_out "taking over a lock left by an installer that is no longer running (pid $dead)"
 	expect_eq "$(installed_version)" 1.0.0 "the version installed after taking the lock over"
-	expect_absent "$TH/.cache/neovibe/lock"
+	expect_absent "$TH/.cache/eitri/lock"
 }
 
 TESTS="$TESTS t_lock_takeover_blocked_while_live"
@@ -101,12 +101,12 @@ t_lock_takeover_blocked_while_live() {
 	sh -c 'exit 0' &
 	dead=$!
 	wait "$dead"
-	mkdir -p "$TH/.cache/neovibe/lock"
-	echo "$dead" >"$TH/.cache/neovibe/lock/pid"
+	mkdir -p "$TH/.cache/eitri/lock"
+	echo "$dead" >"$TH/.cache/eitri/lock/pid"
 	sleep 300 &
 	holder=$!
-	mkdir -p "$TH/.cache/neovibe/lock.takeover"
-	echo "$holder" >"$TH/.cache/neovibe/lock.takeover/pid"
+	mkdir -p "$TH/.cache/eitri/lock.takeover"
+	echo "$holder" >"$TH/.cache/eitri/lock.takeover/pid"
 	inst_net
 	kill "$holder" 2>/dev/null
 	wait "$holder" 2>/dev/null
@@ -115,13 +115,13 @@ t_lock_takeover_blocked_while_live() {
 	# "already recovering the stale lock" -- this message fires on ordinary contention for
 	# lock.takeover too, whether or not the outer lock actually turns out to be stale, and used to
 	# claim staleness before this run had checked.
-	expect_out "another neovibe installer (pid $holder) is already checking the lock $TH/.cache/neovibe/lock"
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_out "another Eitri installer (pid $holder) is already checking the lock $TH/.cache/eitri/lock"
+	expect_absent "$TH/.local/lib/eitri"
 	# Neither lock was disturbed: the stale one still has its own original (dead) pid, and the
 	# takeover sub-lock still has the other run's (then-live) one -- nothing was renamed, restored
 	# or removed.
-	expect_eq "$(cat "$TH/.cache/neovibe/lock/pid" 2>/dev/null)" "$dead" "the stale lock itself, untouched"
-	expect_eq "$(cat "$TH/.cache/neovibe/lock.takeover/pid" 2>/dev/null)" "$holder" "the other run's takeover sub-lock, untouched"
+	expect_eq "$(cat "$TH/.cache/eitri/lock/pid" 2>/dev/null)" "$dead" "the stale lock itself, untouched"
+	expect_eq "$(cat "$TH/.cache/eitri/lock.takeover/pid" 2>/dev/null)" "$holder" "the other run's takeover sub-lock, untouched"
 }
 
 TESTS="$TESTS t_lock_takeover_self_heals_abandoned_sub_lock"
@@ -136,16 +136,16 @@ t_lock_takeover_self_heals_abandoned_sub_lock() {
 	sh -c 'exit 0' &
 	dead2=$!
 	wait "$dead2"
-	mkdir -p "$TH/.cache/neovibe/lock"
-	echo "$dead1" >"$TH/.cache/neovibe/lock/pid"
-	mkdir -p "$TH/.cache/neovibe/lock.takeover"
-	echo "$dead2" >"$TH/.cache/neovibe/lock.takeover/pid"
+	mkdir -p "$TH/.cache/eitri/lock"
+	echo "$dead1" >"$TH/.cache/eitri/lock/pid"
+	mkdir -p "$TH/.cache/eitri/lock.takeover"
+	echo "$dead2" >"$TH/.cache/eitri/lock.takeover/pid"
 	inst_net
 	expect_rc 0
 	expect_out "taking over a lock left by an installer that is no longer running (pid $dead1)"
 	expect_eq "$(installed_version)" 1.0.0 "the version installed after self-healing both locks"
-	expect_absent "$TH/.cache/neovibe/lock"
-	expect_absent "$TH/.cache/neovibe/lock.takeover"
+	expect_absent "$TH/.cache/eitri/lock"
+	expect_absent "$TH/.cache/eitri/lock.takeover"
 }
 
 TESTS="$TESTS t_lock_takeover_sub_lock_without_pid_refused"
@@ -156,22 +156,22 @@ t_lock_takeover_sub_lock_without_pid_refused() {
 	# generic "already recovering the stale lock" message ordinary live contention gets, never
 	# telling a human that lock.takeover itself, not lock, is what has to be removed by hand.
 	serve 1.0.0
-	mkdir -p "$TH/.cache/neovibe/lock"
+	mkdir -p "$TH/.cache/eitri/lock"
 	sh -c 'exit 0' &
 	dead=$!
 	wait "$dead"
-	echo "$dead" >"$TH/.cache/neovibe/lock/pid"
-	mkdir -p "$TH/.cache/neovibe/lock.takeover"
+	echo "$dead" >"$TH/.cache/eitri/lock/pid"
+	mkdir -p "$TH/.cache/eitri/lock.takeover"
 	inst_net
 	expect_fail "a takeover sub-lock that never got a pid"
-	expect_out "$TH/.cache/neovibe/lock.takeover holds no pid"
-	expect_out "remove $TH/.cache/neovibe/lock.takeover and re-run"
-	expect_dir "$TH/.cache/neovibe/lock.takeover"
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_out "$TH/.cache/eitri/lock.takeover holds no pid"
+	expect_out "remove $TH/.cache/eitri/lock.takeover and re-run"
+	expect_dir "$TH/.cache/eitri/lock.takeover"
+	expect_absent "$TH/.local/lib/eitri"
 	# Neither lock was disturbed: the stale main lock still names its own dead pid, and the pid-less
 	# sub-lock is exactly as it was left.
-	expect_eq "$(cat "$TH/.cache/neovibe/lock/pid" 2>/dev/null)" "$dead" "the stale lock itself, untouched"
-	expect_absent "$TH/.cache/neovibe/lock.takeover/pid"
+	expect_eq "$(cat "$TH/.cache/eitri/lock/pid" 2>/dev/null)" "$dead" "the stale lock itself, untouched"
+	expect_absent "$TH/.cache/eitri/lock.takeover/pid"
 }
 
 TESTS="$TESTS t_lock_without_pid_refused"
@@ -179,13 +179,13 @@ t_lock_without_pid_refused() {
 	# A lock with no pid, even after the second a holder gets to write one: whether its holder is
 	# alive cannot be told, so it is not taken over.
 	serve 1.0.0
-	mkdir -p "$TH/.cache/neovibe/lock"
+	mkdir -p "$TH/.cache/eitri/lock"
 	inst_net
 	expect_fail "a lock with no pid"
-	expect_out "$TH/.cache/neovibe/lock holds no pid"
-	expect_out "remove $TH/.cache/neovibe/lock and re-run"
-	expect_dir "$TH/.cache/neovibe/lock"
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_out "$TH/.cache/eitri/lock holds no pid"
+	expect_out "remove $TH/.cache/eitri/lock and re-run"
+	expect_dir "$TH/.cache/eitri/lock"
+	expect_absent "$TH/.local/lib/eitri"
 }
 
 TESTS="$TESTS t_lock_pid_write_failure_cleaned_up"
@@ -199,9 +199,9 @@ t_lock_pid_write_failure_cleaned_up() {
 	chmod 0755 "$T/stubs-lockpidfail/mkdir"
 	inst_net --stubs "$T/stubs-lockpidfail" --
 	expect_fail "the pid write fails"
-	expect_out "cannot write $TH/.cache/neovibe/lock/pid"
-	expect_absent "$TH/.cache/neovibe/lock"
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_out "cannot write $TH/.cache/eitri/lock/pid"
+	expect_absent "$TH/.cache/eitri/lock"
+	expect_absent "$TH/.local/lib/eitri"
 	# The lock is gone, so an ordinary re-run (the real mkdir, no stub) is not stuck behind
 	# "the lock holds no pid": it proceeds and installs normally.
 	inst_net
@@ -216,12 +216,12 @@ t_swap_fails_restores() {
 	expect_rc 0
 	serve 1.1.0 1.0.0
 	before=$(snap_but_staging "$TH")
-	# The swap's second rename (neovibe.new -> neovibe) fails after the first has moved the old
-	# install to neovibe.old: on_exit moves it back.
+	# The swap's second rename (eitri.new -> eitri) fails after the first has moved the old
+	# install to eitri.old: on_exit moves it back.
 	inst_net --stubs "$S/stubs-mvfail" --
 	expect_fail "a failed swap"
 	expect_out 'mv: simulated failure of the swap'
-	expect_no_out 'installed neovibe 1.1.0'
+	expect_no_out 'installed Eitri 1.1.0'
 	expect_eq "$(installed_version)" 1.0.0 "the version after a failed swap"
 	expect_eq "$(snap_but_staging "$TH")" "$before" "the home after a failed swap"
 }
@@ -253,7 +253,7 @@ t_set_e_tar_fails() {
 	expect_fail "tar failing inside a function"
 	expect_out 'tar: simulated failure'
 	expect_out 'could not unpack'
-	expect_no_out 'installed neovibe 1.1.0'
+	expect_no_out 'installed Eitri 1.1.0'
 	expect_eq "$(snap "$TH")" "$before" "the home after tar failed"
 }
 
@@ -264,13 +264,13 @@ t_truncated_script() {
 	lines=$(wc -l <"$INSTALLER")
 	head -n "$((lines - 1))" "$INSTALLER" >"$T/truncated.sh"
 	before=$(snap "$TH")
-	"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$S/stubs" --set NEOVIBE_INSTALL_TEST=1 \
+	"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$S/stubs" --set EITRI_INSTALL_TEST=1 \
 		-- "$NV_SH" -s -- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS" \
 		<"$T/truncated.sh" >"$OUT" 2>&1
 	RC=$?
 	expect_fail "a truncated script"
 	expect_eq "$(snap "$TH")" "$before" "the home after a truncated script ran"
-	expect_no_out 'neovibe:'
+	expect_no_out 'eitri:'
 	# And cut in the middle, too.
 	head -c "$(($(wc -c <"$INSTALLER") / 2))" "$INSTALLER" >"$T/half.sh"
 	"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$S/stubs" -- "$NV_SH" -s -- --uninstall <"$T/half.sh" >"$OUT" 2>&1
@@ -293,10 +293,10 @@ t_truncated_every_cut_point() {
 	while [ "$k" -le "$tail3" ]; do
 		n=$((size - tail3 + k))
 		head -c "$n" "$INSTALLER" >"$T/cut.sh"
-		"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$S/stubs" --stubs "$S/stubs-probeuname" --set NEOVIBE_INSTALL_TEST=1 \
+		"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$S/stubs" --stubs "$S/stubs-probeuname" --set EITRI_INSTALL_TEST=1 \
 			-- "$NV_SH" -s -- --help <"$T/cut.sh" >"$OUT" 2>&1
 		RC=$?
-		if grep -F -e PROBE-UNAME -e 'neovibe:' "$OUT" >/dev/null; then
+		if grep -F -e PROBE-UNAME -e 'eitri:' "$OUT" >/dev/null; then
 			fail "cut at byte $n of $size ran main without its arguments: $(cat "$OUT")"
 		fi
 		if [ "$n" -ge "$((size - 1))" ]; then
@@ -317,8 +317,8 @@ t_piped_stdin() {
 	serve 1.0.0
 	# cat install.sh | sh -s -- --yes ...: the script arrives on stdin, which it never reads.
 	cat "$INSTALLER" | "$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$S/stubs" \
-		--set NEOVIBE_INSTALL_TEST=1 --set "NEOVIBE_INSTALL_TEST_LIBDIRS=$S/libs/ok" \
-		--set "NEOVIBE_INSTALL_TEST_SYSTEM_RELEASE=$S/system/RELEASE" \
+		--set EITRI_INSTALL_TEST=1 --set "EITRI_INSTALL_TEST_LIBDIRS=$S/libs/ok" \
+		--set "EITRI_INSTALL_TEST_SYSTEM_RELEASE=$S/system/RELEASE" \
 		-- "$NV_SH" -s -- --yes --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS" >"$OUT" 2>&1
 	RC=$?
 	expect_rc 0
@@ -344,7 +344,7 @@ t_upgrade_unwritable_bindir() {
 	# The launcher, desktop entry and licences are written (to temporary names beside their
 	# destinations) before the swap, so an unwritable ~/.local/bin stops an upgrade while the old
 	# install is still in place, untouched -- not after the swap, leaving the new lib with the old
-	# launcher and licences and no neovibe.old to go back to.
+	# launcher and licences and no eitri.old to go back to.
 	serve 1.0.0
 	inst_net
 	expect_rc 0
@@ -359,22 +359,22 @@ t_upgrade_unwritable_bindir() {
 	inst_net
 	chmod 0755 "$TH/.local/bin"
 	expect_fail "an upgrade with an unwritable ~/.local/bin"
-	expect_out "cannot write $TH/.local/bin/.neovibe.tmp."
-	expect_no_out 'installed neovibe 1.1.0'
+	expect_out "cannot write $TH/.local/bin/.eitri.tmp."
+	expect_no_out 'installed Eitri 1.1.0'
 	expect_eq "$(installed_version)" 1.0.0 "the version after the refused upgrade"
 	expect_eq "$(snap_but_staging "$TH")" "$before" "the home after the refused upgrade"
 	# Once the directory is writable, the same run goes through.
 	inst_net
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.1.0 "the version after the re-run"
-	expect_eq "$(sed -n 's/^LICENSE for //p' "$TH/.local/share/licenses/neovibe/LICENSE")" 1.1.0 "the licences"
+	expect_eq "$(sed -n 's/^LICENSE for //p' "$TH/.local/share/licenses/eitri/LICENSE")" 1.1.0 "the licences"
 	expect_eq "$(tree "$TH")" "$EXPECTED_TREE" "the tree after the re-run"
 }
 
 TESTS="$TESTS t_interrupted_after_swap_rerun_finishes"
 t_interrupted_after_swap_rerun_finishes() {
 	# An interrupt right after the swap's second rename: the new lib is in place and nothing after it
-	# was done. A sidecar for its rev is already present (a .deb install's `neovibe setup` can have
+	# was done. A sidecar for its rev is already present (a .deb install's `eitri setup` can have
 	# built it, and plan Task 10 builds it before the swap), so the re-run once said "up to date"
 	# and left the install without a launcher, desktop entry or licences for good.
 	plant_sidecar aaaaaaa
@@ -382,18 +382,18 @@ t_interrupted_after_swap_rerun_finishes() {
 	inst_net --stubs "$S/stubs-mvafterswap" --
 	expect_rc 143 "an install interrupted right after its swap"
 	expect_eq "$(installed_version)" 1.0.0 "the lib in place after the interrupt"
-	expect_absent "$TH/.local/bin/neovibe"
+	expect_absent "$TH/.local/bin/eitri"
 	inst_net
 	expect_rc 0
 	expect_no_out 'is up to date'
-	expect_out 'installed neovibe 1.0.0'
-	expect_exec "$TH/.local/bin/neovibe"
-	expect_file "$(data_of)/applications/neovibe.desktop"
-	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do expect_file "$(data_of)/licenses/neovibe/$f"; done
+	expect_out 'installed Eitri 1.0.0'
+	expect_exec "$TH/.local/bin/eitri"
+	expect_file "$(data_of)/applications/eitri.desktop"
+	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do expect_file "$(data_of)/licenses/eitri/$f"; done
 	# And now it is finished, a re-run is up to date.
 	inst_net
 	expect_rc 0
-	expect_out 'neovibe 1.0.0 is up to date'
+	expect_out 'Eitri 1.0.0 is up to date'
 }
 
 TESTS="$TESTS t_interrupted_upgrade_stale_old_files_not_up_to_date"
@@ -408,19 +408,19 @@ t_interrupted_upgrade_stale_old_files_not_up_to_date() {
 	inst_net
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.0.0 "the first install"
-	before_source=$(cat "$(data_of)/licenses/neovibe/SOURCE")
+	before_source=$(cat "$(data_of)/licenses/eitri/SOURCE")
 	plant_sidecar bbbbbbb
 	inst_net --stubs "$S/stubs-mvafterswap" -- --version 1.1.0
 	expect_rc 143 "an upgrade interrupted right after its swap"
 	expect_eq "$(installed_version)" 1.1.0 "the lib in place after the interrupt"
-	expect_eq "$(cat "$(data_of)/licenses/neovibe/SOURCE")" "$before_source" "SOURCE is still 1.0.0's own, untouched by the interrupt"
+	expect_eq "$(cat "$(data_of)/licenses/eitri/SOURCE")" "$before_source" "SOURCE is still 1.0.0's own, untouched by the interrupt"
 	inst_net --version 1.1.0
 	expect_rc 0
 	expect_no_out 'is up to date'
-	expect_out 'installed neovibe 1.1.0'
-	expect_eq "$(sed -n 's/^SOURCE for //p' "$(data_of)/licenses/neovibe/SOURCE")" 1.1.0 "SOURCE, now the new release's own"
+	expect_out 'installed Eitri 1.1.0'
+	expect_eq "$(sed -n 's/^SOURCE for //p' "$(data_of)/licenses/eitri/SOURCE")" 1.1.0 "SOURCE, now the new release's own"
 	# And now it really is finished: a further re-run is up to date.
 	inst_net --version 1.1.0
 	expect_rc 0
-	expect_out 'neovibe 1.1.0 is up to date'
+	expect_out 'Eitri 1.1.0 is up to date'
 }

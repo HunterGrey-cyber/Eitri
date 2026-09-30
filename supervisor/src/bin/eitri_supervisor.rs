@@ -1,4 +1,4 @@
-//! `neovibe-supervisor`: a persistent, single-process GTK4 app showing live agent status
+//! `eitri-supervisor`: a persistent, single-process GTK4 app showing live agent status
 //! (blocked/working/done/idle/no_session) for every currently-running `shell` window on this
 //! machine. See docs/superpowers/specs/2026-09-08-supervisor-cross-window-agent-status-design.md.
 //!
@@ -21,7 +21,7 @@ use std::rc::Rc;
 use supervisor::registry::{Registry, Row};
 use supervisor::{AgentStatus, ShellMessage};
 
-const APP_ID: &str = "cn.huntergrey.neovibe.supervisor";
+const APP_ID: &str = "cn.huntergrey.eitri.supervisor";
 const POLL_INTERVAL_MS: u64 = 200;
 
 /// One accepted connection: its raw stream (kept for writing `Activate` back) and a buffered
@@ -53,7 +53,7 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &Application) {
-    // gio enforces single-instance-per-application_id: a second `neovibe-supervisor` process
+    // gio enforces single-instance-per-application_id: a second `eitri-supervisor` process
     // launched while one is already running does not run its own copy of this function --
     // instead gio relays a remote activation request back to THIS (the primary) process, which
     // fires `activate` again, running `build_ui` a second time in the same process. Without this
@@ -72,12 +72,12 @@ fn build_ui(app: &Application) {
     // bypassing gio's single-instance mechanism entirely) owns this path, and unlinking it out
     // from under that listener would orphan it. Exit cleanly rather than stealing the path.
     if UnixStream::connect(&socket_path).is_ok() {
-        eprintln!("neovibe-supervisor: another instance is already listening on {socket_path:?} -- exiting");
+        eprintln!("eitri-supervisor: another instance is already listening on {socket_path:?} -- exiting");
         std::process::exit(0);
     }
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap_or_else(|e| {
-        panic!("neovibe-supervisor: failed to bind {socket_path:?}: {e}");
+        panic!("eitri-supervisor: failed to bind {socket_path:?}: {e}");
     });
     // Both the listener AND every accepted stream must be non-blocking -- an accepted
     // `UnixStream` does NOT inherit its listener's non-blocking flag on Linux. This exact gap
@@ -94,7 +94,7 @@ fn build_ui(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("neovibe supervisor")
+        .title("Eitri supervisor")
         .default_width(320)
         .default_height(400)
         .build();
@@ -181,7 +181,7 @@ fn poll_once(listener: &UnixListener, state: &Rc<RefCell<AppState>>) {
                         }
                         Err(e) => {
                             eprintln!(
-                                "neovibe-supervisor: unparseable message on connection {id}: {e} -- raw: {trimmed}"
+                                "eitri-supervisor: unparseable message on connection {id}: {e} -- raw: {trimmed}"
                             );
                         }
                     }
@@ -252,7 +252,7 @@ fn activate_instance(state: &Rc<RefCell<AppState>>, instance_id: &str) {
     let payload = serde_json::to_string(&supervisor::SupervisorMessage::Activate).unwrap();
     if let Some(connection) = state_ref.connections.get_mut(&connection_id) {
         if let Err(e) = connection.stream.write_all(format!("{payload}\n").as_bytes()) {
-            eprintln!("neovibe-supervisor: failed to send activate to connection {connection_id}: {e}");
+            eprintln!("eitri-supervisor: failed to send activate to connection {connection_id}: {e}");
         }
     }
 }

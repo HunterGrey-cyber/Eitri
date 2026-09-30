@@ -1,16 +1,16 @@
 //! Directories and files only this user can read (v1 hardening Task 9, ruling R5).
 //!
-//! Everything neovibe keeps under `$XDG_STATE_HOME/neovibe/` -- conversation records, stored
+//! Everything Eitri keeps under `$XDG_STATE_HOME/eitri/` -- conversation records, stored
 //! histories, the prompt history, permission rules, layouts, the empty tab's mode -- used to be
 //! created with the process umask's defaults: `0755` directories and `0644` files under the usual
-//! umask 022. Where the path down to the state home is traversable by other accounts (neovibe is
+//! umask 022. Where the path down to the state home is traversable by other accounts (Eitri is
 //! the first to create `~/.local/state`, or `XDG_STATE_HOME` points somewhere shared), any local
 //! user could read every prompt the owner typed (the local-IPC review's finding 8). The rule now:
-//! directories 0700, files 0600, and a directory of neovibe's own that an older build left open is
-//! tightened when neovibe next writes into it -- `chmod`, never `chown`, and only on a real
+//! directories 0700, files 0600, and a directory of Eitri's own that an older build left open is
+//! tightened when Eitri next writes into it -- `chmod`, never `chown`, and only on a real
 //! directory owned by this user.
 //!
-//! Also the one place `neovibe-core` asks "is this ours?" ([`current_uid`]): its stale-instance
+//! Also the one place `eitri-core` asks "is this ours?" ([`current_uid`]): its stale-instance
 //! sweep must skip another user's entries in a shared `TMPDIR` before connecting to anything.
 //!
 //! Modes are changed with `fchmod` on a handle opened without following a symlink, never by path:
@@ -62,7 +62,7 @@ pub fn is_own_real_dir(path: &Path) -> bool {
 /// itself down to `dir`'s parent stops the walk there rather than being resolved through -- see
 /// the module doc's C3 section for why that matters and what a symlinked `root` means.
 ///
-/// `root` is the directory neovibe owns outright, `<state home>/neovibe` in production; nothing
+/// `root` is the directory Eitri owns outright, `<state home>/eitri` in production; nothing
 /// above it is ever changed, because the state home and the home directory above it are shared
 /// with every other program. `dir` must be `root` or inside it; otherwise only `dir` is tightened
 /// (by path, the same single-component-`O_NOFOLLOW` protection [`tighten_own_dir`] always gave).
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn new_directories_are_0700_and_files_0600_whatever_the_umask() {
         let base = scratch("umask");
-        let root = base.join("neovibe");
+        let root = base.join("eitri");
         let dir = root.join("conversations").join("abc");
         let file = dir.join("record.json");
         // SAFETY: `umask` has no preconditions; the old value is restored right after.
@@ -236,7 +236,7 @@ mod tests {
     fn an_older_builds_open_directories_are_tightened_from_the_root_down() {
         let base = scratch("tighten");
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let root = base.join("neovibe");
+        let root = base.join("eitri");
         let dir = root.join("history");
         std::fs::create_dir_all(&dir).unwrap();
         for d in [&root, &dir] {
@@ -262,7 +262,7 @@ mod tests {
         let target = base.join("elsewhere");
         std::fs::create_dir(&target).unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let link = base.join("neovibe");
+        let link = base.join("eitri");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         tighten_own_dir(&link);
         assert_eq!(mode(&target), 0o755);
@@ -272,7 +272,7 @@ mod tests {
     }
 
     /// C3: a symlinked `root` must skip tightening altogether, never walk through it by path.
-    /// `root` (`neovibe`) is a symlink to `target`; `target/sub` pre-exists at 0755.
+    /// `root` (`eitri`) is a symlink to `target`; `target/sub` pre-exists at 0755.
     /// `create_private_dir_all(root/sub/x, root)` must never touch `target/sub`'s mode -- before
     /// the fix, `tighten_own_dir(root)` itself failed closed (`ELOOP`) but the loop's next path,
     /// `root/sub`, resolved straight through the symlink and fchmodded `target/sub` to 0700.
@@ -284,7 +284,7 @@ mod tests {
         let sub = target.join("sub");
         std::fs::create_dir(&sub).unwrap();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let root = base.join("neovibe");
+        let root = base.join("eitri");
         std::os::unix::fs::symlink(&target, &root).unwrap();
 
         let dir = root.join("sub").join("x");
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn a_symlinked_middle_component_is_never_walked_through() {
         let base = scratch("symlinked-middle");
-        let root = base.join("neovibe");
+        let root = base.join("eitri");
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         let other = base.join("other");

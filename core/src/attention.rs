@@ -13,7 +13,7 @@
 //!
 //! **That gap is closed as of R07/S2 (2026-09-27, Task 2), not by counting less here.**
 //! [`AttentionTracker::resync`] still takes whatever set the caller hands it, but `TabSet::pump`
-//! now passes the projection's pending ids MINUS `Tab::host_answered` (D9) -- the ids neovibe
+//! now passes the projection's pending ids MINUS `Tab::host_answered` (D9) -- the ids Eitri
 //! itself already answered, in bypass or under the classifier -- so a request nobody needs to see
 //! a card for is never counted here either. The fix stays in the caller, not in `resync` itself:
 //! this tracker still counts exactly the set it is handed.
@@ -162,7 +162,7 @@ impl AttentionTracker {
     }
 }
 
-/// `init.lua`'s `neovibe.config.set("modules.chat.on_permission", ...)` (spec §3.3, decision b).
+/// `init.lua`'s `eitri.config.set("modules.chat.on_permission", ...)` (spec §3.3, decision b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatOnPermission {
     /// The default: the chip and a toast. Nothing reveals itself.
@@ -182,7 +182,7 @@ impl ChatOnPermission {
             None | Some("badge") => Ok(ChatOnPermission::Badge),
             Some("reveal") => Ok(ChatOnPermission::Reveal),
             Some(other) => Err(format!(
-                "neovibe.config.set(\"{}\", {other:?}): must be \"badge\" or \"reveal\"",
+                "eitri.config.set(\"{}\", {other:?}): must be \"badge\" or \"reveal\"",
                 Self::KEY
             )),
         }
@@ -359,7 +359,7 @@ mod tests {
         let err = ChatOnPermission::parse(Some("popup")).unwrap_err();
         assert_eq!(
             err,
-            "neovibe.config.set(\"modules.chat.on_permission\", \"popup\"): must be \"badge\" or \"reveal\""
+            "eitri.config.set(\"modules.chat.on_permission\", \"popup\"): must be \"badge\" or \"reveal\""
         );
     }
 

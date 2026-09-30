@@ -5,7 +5,7 @@
 //! This module is the GTK half: locating the shim binary, the `glib` timer that drains the socket,
 //! and the focus grabs `main.rs` wires to each direction. The protocol under it -- the private
 //! directory, the fake-`tmux` symlink, the socket, the parser, the cleanup -- is
-//! `neovibe_core::pane_switch`, moved there in L2 T5 (2026-09-17) so a second host can reuse it
+//! `eitri_core::pane_switch`, moved there in L2 T5 (2026-09-17) so a second host can reuse it
 //! with its own run-loop timer.
 //!
 //! # The mechanism, and why it is shaped this way
@@ -32,10 +32,10 @@
 //!   is deliberately not used: it mutates process-global state, would leak into the `claude`
 //!   subprocesses `agent` spawns, and races concurrent `getenv` in a multi-threaded GTK app.
 //! - `PATH` for that same child is prefixed with a private directory whose only entry is a
-//!   symlink named `tmux` pointing at this workspace's own `neovibe-tmux-shim` binary
-//!   (`shell/src/bin/neovibe-tmux-shim.rs`).
+//!   symlink named `tmux` pointing at this workspace's own `eitri-tmux-shim` binary
+//!   (`shell/src/bin/eitri-tmux-shim.rs`).
 //! - The shim writes one direction letter to the Unix socket named by
-//!   `NEOVIBE_PANE_SWITCH_SOCKET`; [`listen`] polls that socket from the GTK main loop and hands
+//!   `EITRI_PANE_SWITCH_SOCKET`; [`listen`] polls that socket from the GTK main loop and hands
 //!   the letter to the host's callback.
 //!
 //! Because all three are per-child environment variables, a real terminal + real tmux + real
@@ -47,7 +47,7 @@
 //! A message only ever arrives while the *editor* has focus (that is the only context in which
 //! the Neovim plugin's mappings are live) and Neovim has already hit its own boundary. Each letter
 //! is a [`Direction`] ([`letter_direction`]), and where it goes is geometry, not a table: the
-//! neighbouring module that way (`neovibe_core::layout::navigate`, modules design §6.2). For the
+//! neighbouring module that way (`eitri_core::layout::navigate`, modules design §6.2). For the
 //! default `[editor | agent]` that is exactly what the old four arms did -- `R` the agent (the
 //! load-bearing case), `U` the top bar, `L`/`D` tmux's no-op at the edge of its grid -- and
 //! `navigation_reproduces_todays_dispatch_on_the_default_tree` holds it there. **What changed:**
@@ -76,8 +76,8 @@ use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 
 use crate::layout::Direction;
-use neovibe_core::pane_switch::{sweep_stale_dirs, PaneSwitchReader, POLL_INTERVAL};
-pub(crate) use neovibe_core::pane_switch::{PaneMessage, PaneSwitchChannel};
+use eitri_core::pane_switch::{sweep_stale_dirs, PaneSwitchReader, POLL_INTERVAL};
+pub(crate) use eitri_core::pane_switch::{PaneMessage, PaneSwitchChannel};
 
 /// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
 /// else is not a direction (the shim only ever sends these four).
@@ -222,7 +222,7 @@ pub(crate) fn listen(channel: &mut PaneSwitchChannel, on_message: impl Fn(PaneMe
     });
 }
 
-/// Finds the `neovibe-tmux-shim` binary next to the currently-running executable. Both are
+/// Finds the `eitri-tmux-shim` binary next to the currently-running executable. Both are
 /// binaries of the same Cargo package, so they always land in the same directory -- `target/debug`
 /// during development, a single `bin/` directory for any real install.
 ///
@@ -236,7 +236,7 @@ fn locate_shim_binary() -> Option<PathBuf> {
             return None;
         }
     };
-    let candidate = exe.parent()?.join("neovibe-tmux-shim");
+    let candidate = exe.parent()?.join("eitri-tmux-shim");
     if !Path::new(&candidate).is_file() {
         eprintln!(
             "[pane_switch] {} not found -- Ctrl+h/j/k/l out of nvim disabled (build it with `cargo build -p shell`)",

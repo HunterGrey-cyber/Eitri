@@ -9,22 +9,22 @@
 //! either backend's first `SessionOpened` folds (`agent::ingestion::persist_record`,
 //! `agent::state_dirs::conversations_dir`), which this test drives twice, for real, on purpose --
 //! without `XDG_STATE_HOME` set, `conversations_dir()` falls back to the operator's own
-//! `$HOME/.local/state/neovibe/conversations/` and two real, never-cleaned-up records land there
+//! `$HOME/.local/state/eitri/conversations/` and two real, never-cleaned-up records land there
 //! (the test-account wrapper does not set or clear it either, so it is left exactly as the caller's shell
 //! has it):
 //!
 //! ```sh
 //! claude --version    # record the build; nothing prints it for you
 //! XDG_STATE_HOME=/tmp/nv-tabs-real-state \
-//!     cargo test -p neovibe-core --test session_tabs_real_cli -- --ignored --nocapture
+//!     cargo test -p eitri-core --test session_tabs_real_cli -- --ignored --nocapture
 //! ```
 //!
 //! The test-account wrapper sets `VERDANDI_CLAUDE_CLI_PATH` to the `claude-wrapper` launcher, which is what
 //! decides the sidecar's CLI (CLAUDE.md, the environment table); `PATH` alone does not.
 
-use neovibe_core::agent_backend::{AgentBackend, BackendKind};
-use neovibe_core::agent_bridge::SessionModeChoice;
-use neovibe_core::tab_set::{TabBackend, TabSet};
+use eitri_core::agent_backend::{AgentBackend, BackendKind};
+use eitri_core::agent_bridge::SessionModeChoice;
+use eitri_core::tab_set::{TabBackend, TabSet};
 use std::time::{Duration, Instant};
 
 fn project() -> std::path::PathBuf {
@@ -40,7 +40,7 @@ fn start(dir: &std::path::Path) -> AgentBackend {
         .expect("a sidecar session starts; is this running under a test-account wrapper?")
 }
 
-fn transcript(set: &TabSet, tab: neovibe_core::tabs::TabId) -> String {
+fn transcript(set: &TabSet, tab: eitri_core::tabs::TabId) -> String {
     let backend = set.get(tab).unwrap().live().unwrap();
     let projection = backend.projection();
     projection

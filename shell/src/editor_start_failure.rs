@@ -5,10 +5,10 @@
 //! after the pane already has a widget sitting in the module grid -- so the label has to already be
 //! in place, hidden, from the moment the editor module is added.
 
+use eitri_core::layout::{Direction, ModuleId};
 use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 use gtk4::prelude::*;
-use neovibe_core::layout::{Direction, ModuleId};
 
 /// Wraps `editor` (the editor pane's own `GtkGLArea`, [`neovide_editor::NeovideEditorPane::widget`])
 /// in an `Overlay` carrying a hidden `Label` for the failure message. Return the overlay to register
@@ -76,8 +76,8 @@ pub(crate) fn keys_after_failure(focused: Option<&ModuleId>) -> KeysAfterFailure
 
 /// `Ctrl+h/j/k/l` on the editor while no nvim runs in it -- it failed to start, it is still
 /// starting, or it exited -- move between modules at the shell's level, as they do from every other
-/// module (the Opus review's T7-1). Otherwise they belong to nvim, whose own navigator (or neovibe's
-/// fallback, `NEOVIBE_NAV_LUA`) resolves them and calls out to the shell only at a window edge; with
+/// module (the Opus review's T7-1). Otherwise they belong to nvim, whose own navigator (or Eitri's
+/// fallback, `EITRI_NAV_LUA`) resolves them and calls out to the shell only at a window edge; with
 /// no nvim there, the pane swallowed them and a failed editor, once reached again by `Ctrl+h`,
 /// `prefix e`, a HINT label or a click, kept the keys for good. The precedent is
 /// vim-tmux-navigator's own tmux half: `bind -n C-h if-shell "$is_vim" "send-keys C-h" "select-pane

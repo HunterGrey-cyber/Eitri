@@ -1,5 +1,5 @@
 //! The permission mode an empty session tab starts in, remembered per project (session tabs spec
-//! §3.6): `$XDG_STATE_HOME/neovibe/agent/<16 hex>.json`, named like the layout file
+//! §3.6): `$XDG_STATE_HOME/eitri/agent/<16 hex>.json`, named like the layout file
 //! (`layout::persist::file_name`) and written the same way -- a `.tmp` beside it, then renamed.
 //! Never inside the project. A file that cannot be used is set aside as `.json.unusable` and read as
 //! nothing, as the layout file is.
@@ -21,7 +21,7 @@ struct PrefsFile {
     permission_mode: SessionModeChoice,
 }
 
-/// `<state home>/neovibe/agent`.
+/// `<state home>/eitri/agent`.
 pub fn state_dir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     state_subdir(xdg_state_home, home, "agent")
 }
@@ -159,11 +159,11 @@ mod tests {
     fn it_lives_beside_the_layout_directory() {
         assert_eq!(
             state_dir(Some(OsStr::new("/s")), Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/s/neovibe/agent"))
+            Some(PathBuf::from("/s/eitri/agent"))
         );
         assert_eq!(
             state_dir(None, Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/h/.local/state/neovibe/agent"))
+            Some(PathBuf::from("/h/.local/state/eitri/agent"))
         );
         assert_eq!(state_dir(Some(OsStr::new("relative")), None), None);
     }

@@ -16,7 +16,7 @@
 #       --build-arg RUSTUP_INIT_VERSION=... --build-arg RUSTUP_INIT_SHA256_LINUX_X86_64=... \
 #       --build-arg NODE_VERSION=... --build-arg NODE_SHA256_LINUX_X64=... \
 #       --build-arg NFPM_VERSION=... --build-arg NFPM_SHA256_LINUX_X86_64=... \
-#       -t neovibe-release-build:<version> \
+#       -t eitri-release-build:<version> \
 #       -f packaging/container/build.Dockerfile packaging/container
 #
 # Never `docker build --pull`: the pinned digest below is the only base there is (Global

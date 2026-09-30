@@ -1,4 +1,4 @@
-//! The GTK-free half of `neovibe.panel.register({ id, title, position, content })`: parsing and
+//! The GTK-free half of `eitri.panel.register({ id, title, position, content })`: parsing and
 //! validating a plugin's registration table, and resolving its `content.url` to a real URL. No
 //! GTK/WebKit touched here, which is exactly why this (unlike the real widget construction) gets
 //! a direct `cargo test` -- see `shell::lua::panel` for the half that builds a real
@@ -53,12 +53,12 @@ pub struct ParsedPanelSpec {
     /// `layout::ModuleKeys::build` once every panel has registered, because a clash between two
     /// panels can only be seen then -- and a clash, or a string that is not one key, is a startup
     /// failure naming it. A `key` that is not a string at all (`key = true`) is caught earlier, by
-    /// mlua's conversion here: `neovibe.panel.register` itself fails, which, like every `init.lua`
+    /// mlua's conversion here: `eitri.panel.register` itself fails, which, like every `init.lua`
     /// error, is logged and leaves that panel out. A number is taken as its text (`key = 1` is `'1'`).
     pub key: Option<String>,
 }
 
-/// Pure validation of a `neovibe.panel.register` call's argument table -- no GTK/WebKit touched
+/// Pure validation of an `eitri.panel.register` call's argument table -- no GTK/WebKit touched
 /// here, which is exactly why this (unlike the real widget construction below) gets a direct
 /// `cargo test`.
 pub fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
@@ -68,7 +68,7 @@ pub fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
     // on every launch. Refused here, the same way an unknown `position` is.
     if id.is_empty() {
         return Err(mlua::Error::RuntimeError(
-            "neovibe.panel.register: id must not be empty".to_string(),
+            "eitri.panel.register: id must not be empty".to_string(),
         ));
     }
     let title: String = spec.get("title")?;
@@ -77,14 +77,14 @@ pub fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
     let content_type: String = content.get("type")?;
     if content_type != "webview" {
         return Err(mlua::Error::RuntimeError(format!(
-            "neovibe.panel.register: unsupported content.type '{content_type}' -- v1 only supports 'webview'"
+            "eitri.panel.register: unsupported content.type '{content_type}' -- v1 only supports 'webview'"
         )));
     }
     let url: String = content.get("url")?;
     let key: Option<String> = spec.get("key")?;
     let slot = PanelSlot::parse(&position).ok_or_else(|| {
         mlua::Error::RuntimeError(format!(
-            "neovibe.panel.register: unknown position '{position}' -- must be 'main', 'side' or 'bottom'"
+            "eitri.panel.register: unknown position '{position}' -- must be 'main', 'side' or 'bottom'"
         ))
     })?;
     Ok(ParsedPanelSpec {
@@ -102,7 +102,7 @@ pub fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
 /// (`file://`, `http://`): `data:` URIs have no authority at all (`data:text/html,<h1>...`),
 /// so a `raw.contains("://")` check alone misses them and wrongly treats them as a relative
 /// filename -- found via sandbox verification (a `data:text/html,...` panel URL from
-/// `neovibe.panel.register` resolved to a bogus `file://<config_dir>/panels/data:text/html,...`
+/// `eitri.panel.register` resolved to a bogus `file://<config_dir>/panels/data:text/html,...`
 /// path instead of being used as-is).
 fn has_uri_scheme(raw: &str) -> bool {
     match raw.find(':') {
@@ -114,7 +114,7 @@ fn has_uri_scheme(raw: &str) -> bool {
 }
 
 /// Resolves a Lua-registered webview panel's `url` field against `<config_dir>/panels/`, per
-/// the plugin-loading convention (`~/.config/neovibe/panels/*.html`). A bare relative filename
+/// the plugin-loading convention (`~/.config/eitri/panels/*.html`). A bare relative filename
 /// resolves there; anything already carrying a URI scheme (`data:`, `file://`, `http://`,
 /// `https://`, ...) or starting with `/` is used exactly as given.
 pub fn resolve_panel_url(config_dir: &std::path::Path, raw: &str) -> String {
@@ -214,7 +214,7 @@ mod tests {
     /// **Do not delete it as terminal-era leftover.** Without it, `PanelSlot::parse`'s `"bottom"`
     /// arm and `ParsedPanelSpec`'s slot handling have no coverage, and a later refactor could drop
     /// `Bottom` from the parser and ship a green build in which
-    /// `neovibe.panel.register{ position = "bottom" }` errors at runtime.
+    /// `eitri.panel.register{ position = "bottom" }` errors at runtime.
     #[test]
     fn accepts_the_bottom_position() {
         let lua = Lua::new();
@@ -279,16 +279,16 @@ mod tests {
 
     #[test]
     fn resolve_panel_url_joins_relative_paths_under_panels_dir() {
-        let dir = std::path::Path::new("/home/example/.config/neovibe");
+        let dir = std::path::Path::new("/home/example/.config/eitri");
         assert_eq!(
             resolve_panel_url(dir, "my-panel.html"),
-            "file:///home/example/.config/neovibe/panels/my-panel.html"
+            "file:///home/example/.config/eitri/panels/my-panel.html"
         );
     }
 
     #[test]
     fn resolve_panel_url_passes_through_absolute_and_scheme_urls() {
-        let dir = std::path::Path::new("/home/example/.config/neovibe");
+        let dir = std::path::Path::new("/home/example/.config/eitri");
         assert_eq!(resolve_panel_url(dir, "https://example.com"), "https://example.com");
         assert_eq!(resolve_panel_url(dir, "/tmp/x.html"), "/tmp/x.html");
     }
@@ -297,7 +297,7 @@ mod tests {
     fn resolve_panel_url_passes_through_data_uris() {
         // `data:` URIs have no `//` authority component (unlike `file://`/`http://`), so they
         // need their own scheme-aware check -- found broken via sandbox verification (task 8).
-        let dir = std::path::Path::new("/home/example/.config/neovibe");
+        let dir = std::path::Path::new("/home/example/.config/eitri");
         let raw = "data:text/html,<h1>plugin panel</h1>";
         assert_eq!(resolve_panel_url(dir, raw), raw);
     }

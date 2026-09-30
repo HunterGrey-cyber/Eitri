@@ -25,7 +25,7 @@
 //! `seeded_random_streams_survive_at_the_canonical_geometry`, `compensation_is_load_bearing`) cost
 //! about two minutes in a debug build between them and are `#[ignore]`d; run them with `--ignored`.
 //! The other three (the torture-corpus tests and the corpus-size guard) cost well under a second
-//! and run by default. `Screen` only ever calls `Projector::full`, so neovibe does not use the
+//! and run by default. `Screen` only ever calls `Projector::full`, so Eitri does not use the
 //! delta path at all -- these tests protect `terminal-frame`'s own contract, not anything on the
 //! product's critical path (engine review 2026-09-23, minor 4).
 

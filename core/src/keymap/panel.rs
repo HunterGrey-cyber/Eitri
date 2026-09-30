@@ -172,7 +172,7 @@ impl PanelSeq {
 
 /// Alone in BROWSE these already mean something (keymap.ts `resolveKey`, spec §2.3). `o` and `A`
 /// (C1a, v1 hardening codex-release-p1 #8 = R2-5) joined `i` the same day as its own two INPUT
-/// aliases but were never added here, so a `neovibe.keymap.set("panel", "o"/"A", ...)` -- or an
+/// aliases but were never added here, so an `eitri.keymap.set("panel", "o"/"A", ...)` -- or an
 /// nvim `mapleader`/mapping on either -- silently shadowed a frozen key instead of being refused.
 /// `:` (v1 picks, K02/ruling R4) opens the panel's own command line, so it is refused the same way.
 const FIXED: &str = "jkhladioAyYDfrnNG/?:0123456789";
@@ -214,7 +214,7 @@ pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f
 
 /// The 16 default rows (spec §2.2, plus `gt`/`gT` since v1 polish F16), in table order: direct
 /// tab-as-buffer keys first, then the `<leader>` rows. Every row's source is the
-/// LazyVim/nvim/which-key line it copies, or `neovibe-only` with why (spec, "Rule for every line").
+/// LazyVim/nvim/which-key line it copies, or `eitri-only` with why (spec, "Rule for every line").
 pub fn default_bindings() -> Vec<PanelBinding> {
     vec![
         // lazyvim: config/keymaps.lua:34-35 (<S-h>/<S-l> = bprevious/bnext, "Prev/Next Buffer")
@@ -292,20 +292,20 @@ pub fn default_bindings() -> Vec<PanelBinding> {
             action: PanelAction::Search,
             source: PanelSource::Default,
         },
-        // neovibe-only: LazyVim has no session-info key; `i` is `prefix i`'s letter
+        // eitri-only: LazyVim has no session-info key; `i` is `prefix i`'s letter
         PanelBinding {
             seq: parse_seq("<leader>i").unwrap(),
             action: PanelAction::Tab(TabAction::Info),
             source: PanelSource::Default,
         },
-        // neovibe-only: the handoff button leaves the bottom (spec §5.4); mock: bottom.html names
+        // eitri-only: the handoff button leaves the bottom (spec §5.4); mock: bottom.html names
         // `Space t`
         PanelBinding {
             seq: parse_seq("<leader>t").unwrap(),
             action: PanelAction::Handoff,
             source: PanelSource::Default,
         },
-        // neovibe-only, the same effect as Shift+Tab (Claude Code, docs: permission-modes.md);
+        // eitri-only, the same effect as Shift+Tab (Claude Code, docs: permission-modes.md);
         // mock: leader.html draws `m ➜ mode: auto, fixed`
         PanelBinding {
             seq: parse_seq("<leader>m").unwrap(),
@@ -321,7 +321,7 @@ pub fn default_bindings() -> Vec<PanelBinding> {
     ]
 }
 
-/// `init.lua`'s recorded `neovibe.keymap.set("panel", ...)`/`.del("panel", ...)` calls (spec §3.6,
+/// `init.lua`'s recorded `eitri.keymap.set("panel", ...)`/`.del("panel", ...)` calls (spec §3.6,
 /// Task 3): applied over the defaults and, before this, over nvim's own mappings in [`effective`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelUserTable {
@@ -330,7 +330,7 @@ pub struct PanelUserTable {
 }
 
 impl PanelUserTable {
-    /// `neovibe.keymap.set("panel", key, action)`: fails naming the call's own key/action text when
+    /// `eitri.keymap.set("panel", key, action)`: fails naming the call's own key/action text when
     /// the key does not parse, is one of §2.3's reserved BROWSE keys, the action name is unknown, or
     /// the sequence is already bound (by a default not yet `del`'d, or by an earlier `set`) --
     /// `table.rs` wraps the message as `KeymapError::Panel`.
@@ -346,13 +346,13 @@ impl PanelUserTable {
             .find(|b| b.seq == seq && !self.dels.contains(&b.seq))
         {
             return Err(format!(
-                "{human} is already bound to {} (default); neovibe.keymap.del(\"panel\", {key:?}) first",
+                "{human} is already bound to {} (default); eitri.keymap.del(\"panel\", {key:?}) first",
                 default.action.name()
             ));
         }
         if let Some(existing) = self.sets.iter().find(|b| b.seq == seq) {
             return Err(format!(
-                "{human} is already bound to {} (set earlier in init.lua); neovibe.keymap.del(\"panel\", {key:?}) first",
+                "{human} is already bound to {} (set earlier in init.lua); eitri.keymap.del(\"panel\", {key:?}) first",
                 existing.action.name()
             ));
         }
@@ -364,7 +364,7 @@ impl PanelUserTable {
         Ok(())
     }
 
-    /// `neovibe.keymap.del("panel", key)`: removes an earlier `set`, or records a deletion of a
+    /// `eitri.keymap.del("panel", key)`: removes an earlier `set`, or records a deletion of a
     /// default; `"nothing binds {key}"` when neither binds it.
     pub fn del(&mut self, key: &str) -> Result<(), String> {
         let seq = parse_seq(key)?;
@@ -528,7 +528,7 @@ mod tests {
     fn the_fixed_browse_keys_are_reserved() {
         // v1 hardening, codex-release-p1 #8 (= R2-5, v1-release-review.md): `o` and `A` became
         // fixed BROWSE keys the same day as `i` (C1a: `o` is `i`'s exact alias, `A` opens INPUT with
-        // the caret at the end) but FIXED was never updated, so `neovibe.keymap.set("panel", "o",
+        // the caret at the end) but FIXED was never updated, so `eitri.keymap.set("panel", "o",
         // ...)` -- or an nvim `mapleader`/mapping of `o`/`A` -- silently shadowed a frozen key.
         // K02 (v1 picks, ruling R4): `:` opens the panel's command line, so it is fixed too.
         for key in [
@@ -550,7 +550,7 @@ mod tests {
     }
 
     /// v1 hardening, codex-release-p1 #8 (= R2-5): the review's own reproduction, at the public API
-    /// surface a real `neovibe.keymap.set("panel", "o", ...)` reaches -- before the fix this
+    /// surface a real `eitri.keymap.set("panel", "o", ...)` reaches -- before the fix this
     /// silently succeeded for both `o` and `A`.
     #[test]
     fn o_and_a_are_refused_by_set_the_same_way_i_is() {

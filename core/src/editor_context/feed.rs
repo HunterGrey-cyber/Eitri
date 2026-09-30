@@ -42,7 +42,7 @@ pub(crate) const NVIM_EDITOR_CONTEXT_LUA: &str = include_str!("nvim_editor_conte
 /// under `--embed` is the RPC pipe -- and wraps the load in `pcall`, so a broken snippet costs the
 /// context, never the editor.
 pub(crate) const LOADER_CMD: &str =
-    "lua local p = vim.env.NEOVIBE_EDITOR_LUA; if p and p ~= '' then pcall(dofile, p) end";
+    "lua local p = vim.env.EITRI_EDITOR_LUA; if p and p ~= '' then pcall(dofile, p) end";
 
 pub struct EditorContextFeed {
     dir: PathBuf,
@@ -111,10 +111,10 @@ impl EditorContextFeed {
     pub fn child_env(&self) -> Vec<(String, String)> {
         vec![
             (
-                "NEOVIBE_EDITOR_SOCKET".to_string(),
+                "EITRI_EDITOR_SOCKET".to_string(),
                 self.socket_path.display().to_string(),
             ),
-            ("NEOVIBE_EDITOR_LUA".to_string(), self.lua_path.display().to_string()),
+            ("EITRI_EDITOR_LUA".to_string(), self.lua_path.display().to_string()),
         ]
     }
 
@@ -307,7 +307,7 @@ mod tests {
                 "the snippet no longer writes {needle:?}"
             );
         }
-        for needle in ["NEOVIBE_EDITOR_SOCKET", "getregion", "getpos"] {
+        for needle in ["EITRI_EDITOR_SOCKET", "getregion", "getpos"] {
             assert!(
                 NVIM_EDITOR_CONTEXT_LUA.contains(needle),
                 "the snippet no longer uses {needle:?}"

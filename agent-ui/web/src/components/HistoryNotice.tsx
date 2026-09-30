@@ -7,7 +7,7 @@ import { historyNoticeText } from "../history";
  *
  * **Drawn whenever history was restored, not only when it was truncated.** The question it answers
  * first is "is this what we said last time, or what we said just now?", and the second is "where
- * did it come from" -- which has consequences (§8: Claude's own transcript and Neovibe's copy of
+ * did it come from" -- which has consequences (§8: Claude's own transcript and Eitri's copy of
  * the same session can genuinely differ). Truncation is the third thing it can say, and since the
  * item cap became 400 it is the rare one: 8 of this machine's 44 real sessions.
  *

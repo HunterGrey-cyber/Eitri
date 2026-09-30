@@ -15,7 +15,7 @@ const NO_SOCKET: &str = "none";
 const LUA_NAME: &str = "nvim_scratch.lua";
 const NVIM_SCRATCH_LUA: &str = include_str!("nvim_scratch.lua");
 
-pub const LOADER_CMD: &str = "lua local p = vim.env.NEOVIBE_SCRATCH_LUA; if p and p ~= '' then pcall(dofile, p) end";
+pub const LOADER_CMD: &str = "lua local p = vim.env.EITRI_SCRATCH_LUA; if p and p ~= '' then pcall(dofile, p) end";
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -37,7 +37,7 @@ impl ScratchRequest {
     }
     /// What `NeovideEditorPane::send_keys` is given.
     pub fn input_keys(&self) -> String {
-        format!("<Cmd>lua NeovibeScratch.call('{}')<CR>", self.hex)
+        format!("<Cmd>lua EitriScratch.call('{}')<CR>", self.hex)
     }
 }
 
@@ -88,7 +88,7 @@ impl PendingEdit {
 }
 
 /// Whether nvim's buffer name `file` lies inside the scratch directory `dir`: a `Ctrl+g` draft or an
-/// `R3` view, neovibe's own buffer and never a file the user is working on. The editor-context feed
+/// `R3` view, Eitri's own buffer and never a file the user is working on. The editor-context feed
 /// drops such a report, so the V1 line and the next turn keep naming the file the user was in
 /// (the phase-3 GUI pass, 2026-09-25). Compared by path component, so `<dir>x/…` is not inside.
 pub fn holds(dir: &Path, file: &str) -> bool {
@@ -138,7 +138,7 @@ impl ScratchDir {
     }
 
     pub fn child_env(&self) -> Vec<(String, String)> {
-        vec![("NEOVIBE_SCRATCH_LUA".to_string(), self.lua_path.display().to_string())]
+        vec![("EITRI_SCRATCH_LUA".to_string(), self.lua_path.display().to_string())]
     }
 
     pub fn nvim_args(&self) -> Vec<String> {
@@ -221,7 +221,7 @@ mod tests {
         let request = open_request(hostile, Some(42));
         let keys = request.input_keys();
         assert!(
-            keys.starts_with("<Cmd>lua NeovibeScratch.call('") && keys.ends_with("')<CR>"),
+            keys.starts_with("<Cmd>lua EitriScratch.call('") && keys.ends_with("')<CR>"),
             "{keys}"
         );
         assert!(request
@@ -236,7 +236,7 @@ mod tests {
     }
 
     /// The phase-3 GUI pass (2026-09-25): with a `Ctrl+g` split focused, the V1 context line named
-    /// the draft's scratch file. A buffer in this directory is neovibe's own, never the user's file.
+    /// the draft's scratch file. A buffer in this directory is Eitri's own, never the user's file.
     #[test]
     fn only_files_inside_the_scratch_directory_are_scratch_buffers() {
         let mut dir = ScratchDir::in_dir(&tmp()).unwrap();
@@ -301,7 +301,7 @@ mod tests {
         let dir = ScratchDir::in_dir(&tmp()).unwrap();
         let env = dir.child_env();
         assert_eq!(env.len(), 1);
-        assert_eq!(env[0].0, "NEOVIBE_SCRATCH_LUA");
+        assert_eq!(env[0].0, "EITRI_SCRATCH_LUA");
         assert!(Path::new(&env[0].1).exists(), "the snippet is on disk");
         assert_eq!(dir.nvim_args(), vec!["--cmd".to_string(), LOADER_CMD.to_string()]);
         assert!(

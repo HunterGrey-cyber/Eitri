@@ -4,24 +4,24 @@
 
 EXPECTED_TREE='./.local d
 ./.local/bin d
-./.local/bin/neovibe f
+./.local/bin/eitri f
 ./.local/lib d
-./.local/lib/neovibe d
-./.local/lib/neovibe/RELEASE f
-./.local/lib/neovibe/neovibe-claude-handoff f
-./.local/lib/neovibe/neovibe-setup f
-./.local/lib/neovibe/neovibe-supervisor f
-./.local/lib/neovibe/neovibe-tmux-shim f
-./.local/lib/neovibe/shell f
+./.local/lib/eitri d
+./.local/lib/eitri/RELEASE f
+./.local/lib/eitri/eitri-claude-handoff f
+./.local/lib/eitri/eitri-setup f
+./.local/lib/eitri/eitri-supervisor f
+./.local/lib/eitri/eitri-tmux-shim f
+./.local/lib/eitri/shell f
 ./.local/share d
 ./.local/share/applications d
-./.local/share/applications/neovibe.desktop f
+./.local/share/applications/eitri.desktop f
 ./.local/share/licenses d
-./.local/share/licenses/neovibe d
-./.local/share/licenses/neovibe/.installed-version f
-./.local/share/licenses/neovibe/LICENSE f
-./.local/share/licenses/neovibe/SOURCE f
-./.local/share/licenses/neovibe/THIRD-PARTY-LICENSES f'
+./.local/share/licenses/eitri d
+./.local/share/licenses/eitri/.installed-version f
+./.local/share/licenses/eitri/LICENSE f
+./.local/share/licenses/eitri/SOURCE f
+./.local/share/licenses/eitri/THIRD-PARTY-LICENSES f'
 
 TESTS="$TESTS t_fresh_layout"
 t_fresh_layout() {
@@ -30,34 +30,34 @@ t_fresh_layout() {
 	expect_rc 0
 	expect_eq "$(tree "$TH")" "$EXPECTED_TREE" "the installed tree"
 	expect_eq "$(installed_version)" 1.0.0 "the installed version"
-	for b in shell neovibe-supervisor neovibe-tmux-shim neovibe-claude-handoff neovibe-setup; do
-		expect_exec "$TH/.local/lib/neovibe/$b"
+	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-setup; do
+		expect_exec "$TH/.local/lib/eitri/$b"
 	done
-	expect_exec "$TH/.local/bin/neovibe"
-	# The launcher carries the marker, and is otherwise the tarball's bin/neovibe.
-	if ! grep -Fqx '# neovibe-launcher v1' "$TH/.local/bin/neovibe"; then fail "the launcher has no marker line"; fi
-	if ! cmp -s "$PKG/neovibe.launcher.sh" "$TH/.local/bin/neovibe" &&
-		! head -c "$(wc -c <"$PKG/neovibe.launcher.sh")" "$TH/.local/bin/neovibe" | cmp -s - "$PKG/neovibe.launcher.sh"; then
-		fail "the launcher is not the tarball's bin/neovibe plus the marker"
+	expect_exec "$TH/.local/bin/eitri"
+	# The launcher carries the marker, and is otherwise the tarball's bin/eitri.
+	if ! grep -Fqx '# eitri-launcher v1' "$TH/.local/bin/eitri"; then fail "the launcher has no marker line"; fi
+	if ! cmp -s "$PKG/eitri.launcher.sh" "$TH/.local/bin/eitri" &&
+		! head -c "$(wc -c <"$PKG/eitri.launcher.sh")" "$TH/.local/bin/eitri" | cmp -s - "$PKG/eitri.launcher.sh"; then
+		fail "the launcher is not the tarball's bin/eitri plus the marker"
 	fi
-	# neovibe-setup is this installer, byte for byte (spec §4.3).
-	if ! cmp -s "$INSTALLER" "$TH/.local/lib/neovibe/neovibe-setup"; then fail "neovibe-setup differs from install.sh"; fi
-	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/neovibe.desktop")" \
-		"Exec=\"$TH/.local/bin/neovibe\" --quiet %f" "the desktop Exec line"
+	# eitri-setup is this installer, byte for byte (spec §4.3).
+	if ! cmp -s "$INSTALLER" "$TH/.local/lib/eitri/eitri-setup"; then fail "eitri-setup differs from install.sh"; fi
+	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/eitri.desktop")" \
+		"Exec=\"$TH/.local/bin/eitri\" --quiet %f" "the desktop Exec line"
 	expect_absent "$TH/.cache"
-	expect_out 'installed neovibe 1.0.0'
-	expect_no_out 'restart open neovibe windows'
+	expect_out 'installed Eitri 1.0.0'
+	expect_no_out 'restart open Eitri windows'
 }
 
 TESTS="$TESTS t_symlinked_bindir_launches"
 t_symlinked_bindir_launches() {
 	# F5 (whole-branch review): a symlinked ~/.local/bin -- e.g. GNU stow folding it into a
 	# dotfiles repo -- is a directory symlink, not a symlink on the launcher file itself. The
-	# install still lands a real ~/.local/lib/neovibe (untouched here), but the launcher's old
+	# install still lands a real ~/.local/lib/eitri (untouched here), but the launcher's old
 	# `readlink -f "$0"` canonicalized straight through the symlinked bindir, landing LIBDIR next
-	# to the symlink's TARGET directory instead of this install's own sibling lib/neovibe -- so
-	# install reported success and every launch, `neovibe setup` included, died `cd:
-	# .../lib/neovibe: No such file or directory`. Move the planted bindir (with its nvim/vim)
+	# to the symlink's TARGET directory instead of this install's own sibling lib/eitri -- so
+	# install reported success and every launch, `eitri setup` included, died `cd:
+	# .../lib/eitri: No such file or directory`. Move the planted bindir (with its nvim/vim)
 	# aside and replace it with a symlink before installing, so it stays reachable at the same
 	# path after_each's byte-for-byte planted check reads.
 	mv "$TH/.local/bin" "$T/realbin"
@@ -65,15 +65,15 @@ t_symlinked_bindir_launches() {
 	serve 1.0.0
 	inst_net
 	expect_rc 0
-	expect_out 'installed neovibe 1.0.0'
+	expect_out 'installed Eitri 1.0.0'
 	# The install must not have replaced the planted symlink with a real directory -- otherwise a
 	# later change to the installer could make this test stop exercising F5 at all without ever
 	# going red.
 	if [ ! -L "$TH/.local/bin" ]; then fail "the installer replaced the symlinked bindir with a real directory"; fi
-	launch_out=$(env -i HOME="$TH" PATH="$TH/.local/bin:/usr/bin:/bin" bash -c 'neovibe --version' 2>&1)
+	launch_out=$(env -i HOME="$TH" PATH="$TH/.local/bin:/usr/bin:/bin" bash -c 'eitri --version' 2>&1)
 	launch_rc=$?
 	if [ "$launch_rc" != 0 ]; then
-		fail "neovibe --version through the symlinked bindir exited $launch_rc: $launch_out"
+		fail "eitri --version through the symlinked bindir exited $launch_rc: $launch_out"
 	fi
 	case $launch_out in
 	*'No such file or directory'*) fail "LIBDIR resolution broke through the symlinked bindir: $launch_out" ;;
@@ -90,10 +90,10 @@ t_desktop_exec_space_percent() {
 	serve 1.0.0
 	inst_net
 	expect_rc 0
-	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/neovibe.desktop")" \
-		"Exec=\"$T/my home 100%%/.local/bin/neovibe\" --quiet %f" "the escaped Exec line"
+	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/eitri.desktop")" \
+		"Exec=\"$T/my home 100%%/.local/bin/eitri\" --quiet %f" "the escaped Exec line"
 	# Every other line is the tarball's desktop file's.
-	if [ "$(grep -v '^Exec=' "$TH/.local/share/applications/neovibe.desktop")" != "$(grep -v '^Exec=' "$PKG/neovibe.desktop")" ]; then
+	if [ "$(grep -v '^Exec=' "$TH/.local/share/applications/eitri.desktop")" != "$(grep -v '^Exec=' "$PKG/eitri.desktop")" ]; then
 		fail "the desktop file differs from the tarball's in more than Exec"
 	fi
 }
@@ -111,9 +111,9 @@ t_desktop_exec_all_specials() {
 	# Quoting rule first (a backslash before each), then the string-value rule doubles every
 	# backslash, then % becomes %%.
 	# shellcheck disable=SC2016 # literal characters, deliberately unexpanded
-	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/neovibe.desktop")" \
-		"Exec=\"$T/"'q\\"b\\`t\\$d\\\\s 5%%/.local/bin/neovibe" --quiet %f' "the escaped Exec line"
-	expect_exec "$TH/.local/bin/neovibe"
+	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/eitri.desktop")" \
+		"Exec=\"$T/"'q\\"b\\`t\\$d\\\\s 5%%/.local/bin/eitri" --quiet %f' "the escaped Exec line"
+	expect_exec "$TH/.local/bin/eitri"
 	expect_eq "$(installed_version)" 1.0.0 "installed into a HOME with every special character"
 }
 
@@ -127,7 +127,7 @@ t_rerun_up_to_date() {
 	sleep 1
 	inst_net
 	expect_rc 0
-	expect_out 'neovibe 1.0.0 is up to date'
+	expect_out 'Eitri 1.0.0 is up to date'
 	expect_eq "$(snap "$TH")" "$before" "the home after an up-to-date re-run (mtimes included)"
 }
 
@@ -140,25 +140,25 @@ t_rerun_finishes_incomplete_install() {
 	inst_net
 	expect_rc 0
 	plant_sidecar aaaaaaa
-	for f in "$TH/.local/bin/neovibe" "$(data_of)/applications/neovibe.desktop" \
-		"$(data_of)/licenses/neovibe/LICENSE" "$(data_of)/licenses/neovibe/THIRD-PARTY-LICENSES" \
-		"$(data_of)/licenses/neovibe/SOURCE"; do
+	for f in "$TH/.local/bin/eitri" "$(data_of)/applications/eitri.desktop" \
+		"$(data_of)/licenses/eitri/LICENSE" "$(data_of)/licenses/eitri/THIRD-PARTY-LICENSES" \
+		"$(data_of)/licenses/eitri/SOURCE"; do
 		rm "$f"
 		inst_net
 		expect_rc 0
 		expect_no_out 'is up to date'
-		expect_out 'installed neovibe 1.0.0'
+		expect_out 'installed Eitri 1.0.0'
 		expect_file "$f"
 	done
 	# A launcher without the marker is not this install's: not finished either.
-	printf '#!/bin/sh\necho mine\n' >"$TH/.local/bin/neovibe"
+	printf '#!/bin/sh\necho mine\n' >"$TH/.local/bin/eitri"
 	inst_net
 	expect_rc 0
 	expect_no_out 'is up to date'
-	if ! grep -Fqx '# neovibe-launcher v1' "$TH/.local/bin/neovibe"; then fail "the launcher was not reinstalled"; fi
+	if ! grep -Fqx '# eitri-launcher v1' "$TH/.local/bin/eitri"; then fail "the launcher was not reinstalled"; fi
 	inst_net
 	expect_rc 0
-	expect_out 'neovibe 1.0.0 is up to date'
+	expect_out 'Eitri 1.0.0 is up to date'
 }
 
 TESTS="$TESTS t_same_version_without_sidecar_reinstalls"
@@ -168,11 +168,11 @@ t_same_version_without_sidecar_reinstalls() {
 	expect_rc 0
 	# A sidecar whose BUILD does not match its binary is not *present* (spec §5.3 step 6).
 	plant_sidecar aaaaaaa
-	printf 'VERDANDI_REV=x\nSIDECAR_VERSION_LINE=something else\n' >"$(data_of)/neovibe/sidecar/aaaaaaa/BUILD"
+	printf 'VERDANDI_REV=x\nSIDECAR_VERSION_LINE=something else\n' >"$(data_of)/eitri/sidecar/aaaaaaa/BUILD"
 	inst_net
 	expect_rc 0
 	expect_no_out 'is up to date'
-	expect_out 'installed neovibe 1.0.0'
+	expect_out 'installed Eitri 1.0.0'
 }
 
 TESTS="$TESTS t_upgrade_swap"
@@ -184,13 +184,13 @@ t_upgrade_swap() {
 	inst_net
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.1.0 "the version after the upgrade"
-	expect_out 'installed neovibe 1.1.0'
-	expect_out 'restart open neovibe windows'
-	expect_absent "$TH/.local/lib/neovibe.old"
-	expect_absent "$TH/.local/lib/neovibe.new"
+	expect_out 'installed Eitri 1.1.0'
+	expect_out 'restart open Eitri windows'
+	expect_absent "$TH/.local/lib/eitri.old"
+	expect_absent "$TH/.local/lib/eitri.new"
 	expect_eq "$(tree "$TH")" "$EXPECTED_TREE" "the tree after an upgrade"
-	if ! grep -q 'stub shell 1.1.0' "$TH/.local/lib/neovibe/shell"; then fail "shell was not replaced"; fi
-	expect_eq "$(sed -n 's/^LICENSE for //p' "$TH/.local/share/licenses/neovibe/LICENSE")" 1.1.0 "the licences"
+	if ! grep -q 'stub shell 1.1.0' "$TH/.local/lib/eitri/shell"; then fail "shell was not replaced"; fi
+	expect_eq "$(sed -n 's/^LICENSE for //p' "$TH/.local/share/licenses/eitri/LICENSE")" 1.1.0 "the licences"
 }
 
 TESTS="$TESTS t_upgrade_corrupt_tarball"
@@ -202,13 +202,13 @@ t_upgrade_corrupt_tarball() {
 	# checksum passes and the unpack is what fails.
 	serve 1.1.0 1.0.0
 	d=$(served 1.1.0)
-	head -c 4096 /dev/urandom >"$d/neovibe-1.1.0-x86_64-linux.tar.gz"
+	head -c 4096 /dev/urandom >"$d/eitri-1.1.0-x86_64-linux.tar.gz"
 	resign "$d"
 	relatest 1.1.0
 	before=$(snap "$TH")
 	inst_net
 	expect_fail "a corrupt tarball"
-	expect_out 'could not unpack neovibe-1.1.0-x86_64-linux.tar.gz'
+	expect_out 'could not unpack eitri-1.1.0-x86_64-linux.tar.gz'
 	expect_eq "$(snap "$TH")" "$before" "the home after a failed upgrade"
 }
 
@@ -217,49 +217,49 @@ t_upgrade_bad_layout() {
 	serve 1.0.0
 	inst_net
 	expect_rc 0
-	# A valid tarball without lib/neovibe/shell: the unpack passes, the layout check refuses.
+	# A valid tarball without lib/eitri/shell: the unpack passes, the layout check refuses.
 	serve 1.1.0 1.0.0
 	d=$(served 1.1.0)
 	rm -rf "$T/bad"
 	mkdir -p "$T/bad"
-	tar -C "$T/bad" -xzf "$d/neovibe-1.1.0-x86_64-linux.tar.gz"
-	rm "$T/bad/neovibe-1.1.0-x86_64-linux/lib/neovibe/shell"
-	tar -C "$T/bad" -czf "$d/neovibe-1.1.0-x86_64-linux.tar.gz" neovibe-1.1.0-x86_64-linux
+	tar -C "$T/bad" -xzf "$d/eitri-1.1.0-x86_64-linux.tar.gz"
+	rm "$T/bad/eitri-1.1.0-x86_64-linux/lib/eitri/shell"
+	tar -C "$T/bad" -czf "$d/eitri-1.1.0-x86_64-linux.tar.gz" eitri-1.1.0-x86_64-linux
 	resign "$d"
 	relatest 1.1.0
 	before=$(snap "$TH")
 	inst_net
 	expect_fail "a tarball without shell"
-	expect_out 'has no executable lib/neovibe/shell'
+	expect_out 'has no executable lib/eitri/shell'
 	expect_eq "$(snap "$TH")" "$before" "the home after a refused upgrade"
 }
 
 TESTS="$TESTS t_release_malformed"
 t_release_malformed() {
 	# A RELEASE naming no valid VERDANDI_REV refuses, and the message names the file -- in a real
-	# run the unpacked lib/neovibe/RELEASE, in a dry run the release's RELEASE asset.
+	# run the unpacked lib/eitri/RELEASE, in a dry run the release's RELEASE asset.
 	serve 1.0.0
 	inst_net
 	expect_rc 0
 	serve 1.1.0 1.0.0
 	d=$(served 1.1.0)
-	top=neovibe-1.1.0-x86_64-linux
+	top=eitri-1.1.0-x86_64-linux
 	rm -rf "$T/bad"
 	mkdir -p "$T/bad"
 	tar -C "$T/bad" -xzf "$d/$top.tar.gz"
-	sed -i 's/^VERDANDI_REV=.*/VERDANDI_REV=not-a-rev/' "$T/bad/$top/lib/neovibe/RELEASE"
+	sed -i 's/^VERDANDI_REV=.*/VERDANDI_REV=not-a-rev/' "$T/bad/$top/lib/eitri/RELEASE"
 	tar -C "$T/bad" -czf "$d/$top.tar.gz" "$top"
-	cp "$T/bad/$top/lib/neovibe/RELEASE" "$d/RELEASE"
+	cp "$T/bad/$top/lib/eitri/RELEASE" "$d/RELEASE"
 	resign "$d"
 	relatest 1.1.0
 	before=$(snap "$TH")
 	inst_net --dry-run
 	expect_fail "a dry run with a malformed RELEASE"
-	expect_out 'neovibe: error: the RELEASE of 1.1.0 names no valid VERDANDI_REV (40 hex)'
-	expect_no_out 'NEOVIBE_VERSION=1.1.0 names'
+	expect_out 'eitri: error: the RELEASE of 1.1.0 names no valid VERDANDI_REV (40 hex)'
+	expect_no_out 'EITRI_VERSION=1.1.0 names'
 	inst_net
 	expect_fail "an upgrade with a malformed RELEASE"
-	expect_out "/$top/lib/neovibe/RELEASE names no valid VERDANDI_REV (40 hex)"
+	expect_out "/$top/lib/eitri/RELEASE names no valid VERDANDI_REV (40 hex)"
 	expect_eq "$(installed_version)" 1.0.0 "the version after a refused upgrade"
 	expect_eq "$(snap "$TH")" "$before" "the home after a refused upgrade"
 }
@@ -272,12 +272,12 @@ t_dry_run_fresh() {
 	expect_rc 0
 	expect_eq "$(snap "$TH")" "$before" "the home after a dry run"
 	expect_out 'would take the lock'
-	expect_out "would download http://127.0.0.1:$PORT/releases/download/v1.0.0/neovibe-1.0.0-x86_64-linux.tar.gz"
-	expect_out 'would unpack neovibe-1.0.0-x86_64-linux.tar.gz'
-	expect_out "would run: 'mv' '--' '$TH/.local/lib/neovibe.new' '$TH/.local/lib/neovibe'"
-	expect_out "would write the launcher $TH/.local/bin/neovibe"
-	expect_out "would write $TH/.local/share/applications/neovibe.desktop"
-	expect_out "would write $TH/.local/share/licenses/neovibe/LICENSE"
+	expect_out "would download http://127.0.0.1:$PORT/releases/download/v1.0.0/eitri-1.0.0-x86_64-linux.tar.gz"
+	expect_out 'would unpack eitri-1.0.0-x86_64-linux.tar.gz'
+	expect_out "would run: 'mv' '--' '$TH/.local/lib/eitri.new' '$TH/.local/lib/eitri'"
+	expect_out "would write the launcher $TH/.local/bin/eitri"
+	expect_out "would write $TH/.local/share/applications/eitri.desktop"
+	expect_out "would write $TH/.local/share/licenses/eitri/LICENSE"
 	expect_out 'would download http'
 	expect_out '/SHA256SUMS.sig and check it with ssh-keygen -Y verify'
 	expect_out 'dry run: nothing was changed'
@@ -298,28 +298,28 @@ t_dry_run_upgrade() {
 	# 1.1.0's own sidecar (bbbbbbb) is already there: a real upgrade keeps it and finds it present,
 	# so a dry run must report the same, never removing it.
 	plant_sidecar bbbbbbb
-	mkdir -p "$(data_of)/neovibe/sidecar/0123456"
+	mkdir -p "$(data_of)/eitri/sidecar/0123456"
 	serve 1.1.0 1.0.0
 	before=$(snap "$TH")
 	inst_net --dry-run
 	expect_rc 0
 	expect_eq "$(snap "$TH")" "$before" "the home after a dry-run upgrade"
-	expect_out "would run: 'mv' '--' '$TH/.local/lib/neovibe' '$TH/.local/lib/neovibe.old'"
+	expect_out "would run: 'mv' '--' '$TH/.local/lib/eitri' '$TH/.local/lib/eitri.old'"
 	expect_out "the new release's RELEASE (checked against SHA256SUMS) names verdandi bbbbbbb"
 	expect_out 'sidecar for verdandi bbbbbbb: present'
-	expect_out "would run: 'rm' '-rf' '--' '$(data_of)/neovibe/sidecar/0123456'"
+	expect_out "would run: 'rm' '-rf' '--' '$(data_of)/eitri/sidecar/0123456'"
 	expect_no_out "sidecar/aaaaaaa'"
 	expect_no_out "sidecar/bbbbbbb'"
 	# Offline, the RELEASE is read out of the --tarball itself.
 	d=$S/fix/v1.1.0
-	inst -- --tarball "$d/neovibe-1.1.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
+	inst -- --tarball "$d/eitri-1.1.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
 		--release-signers "$SIGNERS" --dry-run
 	expect_rc 0
 	expect_eq "$(snap "$TH")" "$before" "the home after an offline dry-run upgrade"
 	# With the key in a file already (--release-signers), the dry run checks the local .sig; only
 	# the embedded key, which a dry run never writes out, is left unchecked (t_embedded_key_dry_run).
-	expect_out 'signature on SHA256SUMS: good (release@neovibe)'
-	expect_out "the new release's RELEASE (read from neovibe-1.1.0-x86_64-linux.tar.gz) names verdandi bbbbbbb"
+	expect_out 'signature on SHA256SUMS: good (release@eitri)'
+	expect_out "the new release's RELEASE (read from eitri-1.1.0-x86_64-linux.tar.gz) names verdandi bbbbbbb"
 	expect_out 'sidecar for verdandi bbbbbbb: present'
 	expect_no_out "sidecar/bbbbbbb'"
 	# A release whose SHA256SUMS lists no RELEASE: the rev cannot be told, and the report says so.
@@ -331,7 +331,7 @@ t_dry_run_upgrade() {
 	expect_rc 0
 	expect_eq "$(snap "$TH")" "$before" "the home after a dry run that cannot read RELEASE"
 	expect_out 'this dry run could not obtain the new release'
-	expect_out "would run: 'rm' '-rf' '--' '$(data_of)/neovibe/sidecar/bbbbbbb'"
+	expect_out "would run: 'rm' '-rf' '--' '$(data_of)/eitri/sidecar/bbbbbbb'"
 	expect_out 'removing the sidecar for verdandi bbbbbbb, unless the new release uses it'
 	# A RELEASE asset that does not match SHA256SUMS refuses, as a download that does not would.
 	serve 1.1.0 1.0.0
@@ -349,10 +349,10 @@ t_prune_sidecars() {
 	serve 1.0.0
 	inst_net
 	expect_rc 0
-	sc=$(data_of)/neovibe/sidecar
+	sc=$(data_of)/eitri/sidecar
 	for r in aaaaaaa ddddddd eeeeeee; do plant_sidecar "$r"; done
 	mkdir -p "$sc/not-a-rev"
-	printf 'NEOVIBE_VERSION=0.9.0\nVERDANDI_REV=ddddddd000000000000000000000000000000000\n' >"$S/system/RELEASE"
+	printf 'EITRI_VERSION=0.9.0\nVERDANDI_REV=ddddddd000000000000000000000000000000000\n' >"$S/system/RELEASE"
 	serve 1.1.0 1.0.0
 	# F1 (v1-dist whole-branch review, 2026-09-28): plant_sidecar aaaaaaa above makes the
 	# now-installed rev's own sidecar genuinely "present" (sidecar_state matches its BUILD file), so
@@ -360,7 +360,7 @@ t_prune_sidecars() {
 	# being replaced. Node's own download is redirected (like sc_inst_net) so the upgrade's real
 	# sidecar build succeeds; this test's own subject (which OTHER rev directories prune keeps or
 	# drops) is unaffected either way.
-	inst --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
 		-- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	rm -f "$S/system/RELEASE"
 	expect_rc 0
@@ -370,7 +370,7 @@ t_prune_sidecars() {
 	expect_absent "$sc/eeeeeee"
 	# The next upgrade drops the rev of the install replaced one upgrade ago.
 	serve 1.2.0 1.1.0
-	inst --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
 		-- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 0
 	expect_absent "$sc/aaaaaaa"
@@ -386,18 +386,18 @@ t_malformed_own_release_stops() {
 	inst_net
 	expect_rc 0
 	plant_sidecar aaaaaaa
-	sed -i 's/^VERDANDI_REV=\(.*\)$/VERDANDI_REV="\1"/' "$TH/.local/lib/neovibe/RELEASE"
+	sed -i 's/^VERDANDI_REV=\(.*\)$/VERDANDI_REV="\1"/' "$TH/.local/lib/eitri/RELEASE"
 	serve 1.1.0 1.0.0
 	srv_mark
 	before=$(snap_but_lock "$TH")
 	inst_net
 	expect_fail "an upgrade over an install whose RELEASE names no valid rev"
-	expect_out "$TH/.local/lib/neovibe/RELEASE names no valid VERDANDI_REV"
-	expect_out "remove $TH/.local/lib/neovibe"
+	expect_out "$TH/.local/lib/eitri/RELEASE names no valid VERDANDI_REV"
+	expect_out "remove $TH/.local/lib/eitri"
 	expect_eq "$(snap_but_lock "$TH")" "$before" "the home after a refused upgrade"
 	if srv_paths | grep -F .tar.gz >/dev/null; then fail "a tarball was fetched: $(srv_paths)"; fi
 	# Once the damaged install is removed, as the message says, the upgrade proceeds.
-	rm -rf "$TH/.local/lib/neovibe"
+	rm -rf "$TH/.local/lib/eitri"
 	inst_net
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.1.0 "the version after removing the damaged install"
@@ -406,7 +406,7 @@ t_malformed_own_release_stops() {
 TESTS="$TESTS t_offline_install"
 t_offline_install() {
 	d=$S/fix/v1.0.0
-	inst -- --tarball "$d/neovibe-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
+	inst -- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
 		--release-signers "$SIGNERS"
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.0.0 "the version installed from files"
@@ -417,16 +417,16 @@ t_offline_install() {
 TESTS="$TESTS t_offline_sig_required"
 t_offline_sig_required() {
 	d=$S/fix/v1.0.0
-	inst -- --tarball "$d/neovibe-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --release-signers "$SIGNERS"
+	inst -- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --release-signers "$SIGNERS"
 	expect_fail "--tarball without --sig while a key is listed"
 	expect_out '--tarball needs --sig'
-	expect_absent "$TH/.local/lib/neovibe"
+	expect_absent "$TH/.local/lib/eitri"
 }
 
 TESTS="$TESTS t_path_warning"
 t_path_warning() {
 	serve 1.0.0
-	inst_net --stubs "$S/stubs-pathneovibe" --
+	inst_net --stubs "$S/stubs-patheitri" --
 	expect_rc 0
-	expect_out "\`neovibe\` on this PATH runs $S/stubs-pathneovibe/neovibe, not the one just installed"
+	expect_out "\`eitri\` on this PATH runs $S/stubs-patheitri/eitri, not the one just installed"
 }

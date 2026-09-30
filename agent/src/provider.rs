@@ -129,7 +129,7 @@ pub struct ProviderCapabilities {
     pub interrupt: bool,
     /// The provider advertises a BYPASS permission mode: tools run without asking.
     ///
-    /// A reported handshake fact only, never requested since R07: neovibe's bypass is its own
+    /// A reported handshake fact only, never requested since R07: Eitri's bypass is its own
     /// `allow` answer under the gate, which needs `interactive_permission_mode` and nothing else.
     pub bypass_permission_mode: bool,
     /// The provider advertises an INTERACTIVE permission mode: tool use raises a real

@@ -5,7 +5,7 @@
 //! thing: a directory holding a socket, unique per window, that a SIGKILL'd `shell` would otherwise
 //! leak. The reasoning below was learned in `pane_switch` and is kept with the code it justifies.
 //!
-//! The sweep's pid-liveness check was `/proc/<pid>` until this module moved into `neovibe-core`
+//! The sweep's pid-liveness check was `/proc/<pid>` until this module moved into `eitri-core`
 //! (L2 T3, 2026-09-17): that answers "not alive" unconditionally on macOS, which has no `/proc`, so
 //! every instance would have looked dead. It is now `agent::process_probe::pid_is_alive` -- see
 //! [`pid_is_running`]'s own doc for why that also answers Linux's own two hazards (an unprivileged
@@ -272,7 +272,7 @@ mod tests {
             Some(4321)
         );
         assert_eq!(stale_instance_dir_pid("neovibe-pane-switch-4321", PREFIX), Some(4321));
-        assert_eq!(stale_instance_dir_pid("neovibe-supervisor.sock", PREFIX), None);
+        assert_eq!(stale_instance_dir_pid("eitri-supervisor.sock", PREFIX), None);
         assert_eq!(stale_instance_dir_pid("systemd-private-abcdef", PREFIX), None);
         assert_eq!(stale_instance_dir_pid("", PREFIX), None);
         assert_eq!(stale_instance_dir_pid("neovibe-pane-switch-4321-scratch", PREFIX), None);

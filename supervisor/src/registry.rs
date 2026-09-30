@@ -1,4 +1,4 @@
-//! The pure, I/O-free bookkeeping half of `neovibe-supervisor`: which `shell` instances are
+//! The pure, I/O-free bookkeeping half of `eitri-supervisor`: which `shell` instances are
 //! currently connected, what their last-reported status is, and in what order to render them.
 //! `connection_id` is an opaque key the caller (Task 3's accept loop) assigns per accepted
 //! `UnixStream` -- this module never touches a socket itself, so it's fully unit-testable.
@@ -105,12 +105,12 @@ mod tests {
     #[test]
     fn a_freshly_registered_instance_starts_as_no_session() {
         let mut reg = Registry::new();
-        reg.handle_register(1, "abc".into(), "neovibe".into(), "/tmp/neovibe".into(), 100);
+        reg.handle_register(1, "abc".into(), "eitri".into(), "/tmp/eitri".into(), 100);
         assert_eq!(
             reg.rows(),
             vec![Row {
                 instance_id: "abc".into(),
-                project_name: "neovibe".into(),
+                project_name: "eitri".into(),
                 status: AgentStatus::NoSession
             }]
         );

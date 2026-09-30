@@ -24,14 +24,14 @@
 //! falls back to `GtkGLArea`'s own buffer for the rest of that GL context. A frame that fails
 //! mid-run (an allocation, an import, an incomplete framebuffer, a texture GTK refuses) is reported
 //! too, and the path is tried again at the next size change, a few times per GL context
-//! (`editor_area`). `NEOVIBE_EDITOR_DMABUF=0` takes the fallback on purpose, for a driver on which
+//! (`editor_area`). `EITRI_EDITOR_DMABUF=0` takes the fallback on purpose, for a driver on which
 //! this path draws wrongly without failing (and for the regression test that forces the fallback).
 //!
 //! **Only on GTK 4.16 and later by default** ([`decide`]). The cost above exists only where
 //! `GtkGLArea` exports a dmabuf per frame, which began in 4.16. GTK 4.14 (the v1 floor, Ubuntu
 //! 24.04) hands GSK a `GdkGLTexture` with a `GLsync` and exports nothing; there this path would
 //! trade the copy out of the intermediate for GSK's per-frame EGL import of a new
-//! `GdkDmabufTexture`, which was never measured. `NEOVIBE_EDITOR_DMABUF=1` forces the path there,
+//! `GdkDmabufTexture`, which was never measured. `EITRI_EDITOR_DMABUF=1` forces the path there,
 //! for measuring it.
 //!
 //! **What GTK's format list does not promise.** `gdk_display_get_dmabuf_formats` is the union of
@@ -42,7 +42,7 @@
 //! driver does, or `GSK_RENDERER=cairo`), GSK silently downloads the buffer through another
 //! importer every frame, a GPU->CPU->GPU round trip nothing on this side can see. The public API
 //! cannot tell which importer will take a texture. `GDK_DEBUG=dmabuf` shows it;
-//! `NEOVIBE_EDITOR_DMABUF=0` is the escape hatch. Only Intel (i915, one GPU) has run this path.
+//! `EITRI_EDITOR_DMABUF=0` is the escape hatch. Only Intel (i915, one GPU) has run this path.
 //!
 //! **The fallback itself can cost a download (2026-09-29).** On GTK 4.16+ with GSK's Vulkan
 //! renderer, a driver whose Vulkan cannot import `GtkGLArea`'s implicit-modifier export
@@ -134,13 +134,13 @@ struct DmaBufImportSyncFile {
 /// The environment variable that turns this path off (`0`, `off`, `false`, `no`) or forces it on
 /// below [`MEASURED_FROM_GTK`] (`1`, `on`, `true`, `yes`), any case. Unset, or anything else, is the
 /// default: on from GTK 4.16.
-pub(crate) const ENV: &str = "NEOVIBE_EDITOR_DMABUF";
+pub(crate) const ENV: &str = "EITRI_EDITOR_DMABUF";
 
 /// The first GTK whose `GtkGLArea` exports its texture as a dmabuf every frame: where the cost this
 /// path removes exists, and where it was measured (module doc).
 pub(crate) const MEASURED_FROM_GTK: (u32, u32) = (4, 16);
 
-/// What `NEOVIBE_EDITOR_DMABUF` asks for.
+/// What `EITRI_EDITOR_DMABUF` asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Setting {
     Off,
@@ -177,7 +177,7 @@ pub(crate) fn fallback_hint(gtk_minor: u32, fell_back: bool, renderer_type_name:
     )
 }
 
-/// Whether to try this path, from `NEOVIBE_EDITOR_DMABUF` and the **runtime** GTK version
+/// Whether to try this path, from `EITRI_EDITOR_DMABUF` and the **runtime** GTK version
 /// (`gtk_get_*_version`, not the version the crate was compiled against). `Ok(note)`: try, and
 /// print `note` if there is one; `Err(reason)`: fall back, and say why. Pure, so tested.
 pub(crate) fn decide(value: Option<&OsStr>, gtk: (u32, u32, u32)) -> Result<Option<String>, String> {
@@ -1004,7 +1004,7 @@ mod tests {
             let reason = decide(None, below).expect_err("off below 4.16 by default");
             let (major, minor, micro) = below;
             assert!(reason.contains(&format!("GTK {major}.{minor}.{micro}")), "{reason}");
-            assert!(reason.contains("NEOVIBE_EDITOR_DMABUF=1 forces it"), "{reason}");
+            assert!(reason.contains("EITRI_EDITOR_DMABUF=1 forces it"), "{reason}");
         }
     }
 
@@ -1013,10 +1013,7 @@ mod tests {
         let note = decide(Some(OsStr::new("1")), GTK_4_14)
             .expect("forced on")
             .expect("a forced run below 4.16 is noted");
-        assert!(
-            note.contains("forced by NEOVIBE_EDITOR_DMABUF=1 on GTK 4.14.5"),
-            "{note}"
-        );
+        assert!(note.contains("forced by EITRI_EDITOR_DMABUF=1 on GTK 4.14.5"), "{note}");
         assert_eq!(
             decide(Some(OsStr::new("on")), GTK_4_22),
             Ok(None),
@@ -1025,7 +1022,7 @@ mod tests {
         for gtk in [GTK_4_14, GTK_4_16, GTK_4_22] {
             assert_eq!(
                 decide(Some(OsStr::new("0")), gtk),
-                Err("disabled by NEOVIBE_EDITOR_DMABUF=0".to_string())
+                Err("disabled by EITRI_EDITOR_DMABUF=0".to_string())
             );
         }
     }

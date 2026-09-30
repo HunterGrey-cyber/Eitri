@@ -1,7 +1,7 @@
--- neovibe's scratch buffers (keymap/tabs spec §4.2, R3 and C5; phase 3 ruling 18). Loaded by one
--- `--cmd` like editor_context.lua. shell calls NeovibeScratch.call('<hex>') through nvim_input's
+-- Eitri's scratch buffers (keymap/tabs spec §4.2, R3 and C5; phase 3 ruling 18). Loaded by one
+-- `--cmd` like editor_context.lua. shell calls EitriScratch.call('<hex>') through nvim_input's
 -- <Cmd>; the hex is a JSON request, so nothing the request carries is ever read as keys.
-NeovibeScratch = {}
+EitriScratch = {}
 
 local function unhex(h)
   return (h:gsub('..', function(c) return string.char(tonumber(c, 16)) end))
@@ -30,7 +30,7 @@ local function split(path)
   return buf
 end
 
-function NeovibeScratch.call(hex)
+function EitriScratch.call(hex)
   local ok, req = pcall(vim.json.decode, unhex(hex))
   if not ok or type(req) ~= 'table' then return end
   local ran, err = pcall(function()

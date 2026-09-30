@@ -3,8 +3,8 @@
 //! `#[arg(long = "neovim-bin", env = "NEOVIM_BIN")]`, `cmd_line.rs:229` at the pinned rev `910053d`)
 //! picks it up and spawns exactly that binary -- never plain `nvim` -- which is the one thing
 //! `shell::main`'s own `unsafe { std::env::set_var(..) }` (documented at that call site,
-//! `neovibe_core::nvim_bin`'s module doc) depends on and nothing in this workspace's own tests
-//! otherwise exercises: `neovibe_core::nvim_bin`'s tests are pure, over an injected `version_of`,
+//! `eitri_core::nvim_bin`'s module doc) depends on and nothing in this workspace's own tests
+//! otherwise exercises: `eitri_core::nvim_bin`'s tests are pure, over an injected `version_of`,
 //! and never touch the fork at all.
 //!
 //! Proof, not inference: a wrapper script stands in for `nvim`, appends its own argv to a marker
@@ -59,7 +59,7 @@ fn main() {
     // `$TMPDIR` (`/tmp` when unset), like every other test in this workspace that needs a throwaway
     // directory -- this project's own dev-scratch convention (`~/.cache/nv-v1dist-*`) is for a human
     // running commands, not for a test's own temporary files, and nothing here is a build artifact.
-    let scratch = std::env::temp_dir().join(format!("neovibe-nvim-bin-override-test-{}", std::process::id()));
+    let scratch = std::env::temp_dir().join(format!("eitri-nvim-bin-override-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("creating the scratch dir must succeed");
     let marker = scratch.join("wrapper-argv.txt");

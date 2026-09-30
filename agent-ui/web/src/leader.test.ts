@@ -64,7 +64,7 @@ describe("the box after g / z / [ / ] / Ctrl+w (K01)", () => {
     ]);
   });
 
-  /* A table binding cannot start with `Ctrl+w` (`neovibe.keymap.set("panel", ...)` parses no `<C-w>`),
+  /* A table binding cannot start with `Ctrl+w` (`eitri.keymap.set("panel", ...)` parses no `<C-w>`),
      so the box after it is these four rows and nothing the table adds. */
   it("adds nothing from the panel table after Ctrl+w", () => {
     expect(boxEntries(TABLE, ["C-w"], false)).toEqual([]);

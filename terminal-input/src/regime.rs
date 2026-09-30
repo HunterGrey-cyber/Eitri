@@ -10,7 +10,7 @@
 //!   * `alacritty/src/event.rs`          lines 1369-1410 (`paste`)
 //! Licence: Apache-2.0, see LICENSE-APACHE and NOTICE at the crate root.
 //! MODIFIED (Apache-2.0 s.4(b)): rewritten, not copied. See NOTICE.
-//! Reformatted by rustfmt (max_width = 120) when moved into neovibe on 2026-09-23: whitespace only.
+//! Reformatted by rustfmt (max_width = 120) when moved into Eitri on 2026-09-23: whitespace only.
 //!
 //! WHY THIS LAYER EXISTS AT ALL
 //! ----------------------------

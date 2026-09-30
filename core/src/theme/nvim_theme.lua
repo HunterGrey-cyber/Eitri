@@ -1,10 +1,10 @@
--- neovibe theme feed. Loaded by `shell` with `--cmd`, before the user's own config, so it only
+-- Eitri theme feed. Loaded by `shell` with `--cmd`, before the user's own config, so it only
 -- installs autocommands; it changes no setting. It snapshots the highlight groups `shell` derives
--- its colours from and writes one JSON line to NEOVIBE_THEME_SOCKET.
+-- its colours from and writes one JSON line to EITRI_THEME_SOCKET.
 --
 -- The group list must cover `GROUPS_READ` in core/src/theme/tokens.rs; a Rust test checks it.
 
-local socket = vim.env.NEOVIBE_THEME_SOCKET
+local socket = vim.env.EITRI_THEME_SOCKET
 if not socket or socket == "" then
   return
 end
@@ -75,7 +75,7 @@ local function send_now()
   send(false)
 end
 
-local augroup = vim.api.nvim_create_augroup("NeovibeThemeFeed", { clear = true })
+local augroup = vim.api.nvim_create_augroup("EitriThemeFeed", { clear = true })
 vim.api.nvim_create_autocmd({ "VimEnter", "ColorScheme" }, { group = augroup, callback = send_now })
 vim.api.nvim_create_autocmd("OptionSet", { group = augroup, pattern = { "background", "guifont" }, callback = send_now })
 

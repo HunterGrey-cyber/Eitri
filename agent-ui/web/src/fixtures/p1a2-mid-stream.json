@@ -118,5 +118,5 @@
     "text": "P1-unique-text",
     "throughRevision": 2
   },
-  "writtenBy": "core/src/tab_set.rs, tests::with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both -- compared on every run; NEOVIBE_WRITE_FIXTURES=1 rewrites it"
+  "writtenBy": "core/src/tab_set.rs, tests::with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
 }

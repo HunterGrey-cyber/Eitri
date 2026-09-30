@@ -1,7 +1,7 @@
 //! Which local Claude account this process spends, as a configured value rather than an accident.
 //!
 //! **Why this exists, measured 2026-09-21.** A resumed session opened with an empty transcript.
-//! The record was real (`~/.local/state/neovibe/conversations/<id>/<session>.json`, with a project,
+//! The record was real (`~/.local/state/eitri/conversations/<id>/<session>.json`, with a project,
 //! a title and `updated_at` > `created_at`), and so was the transcript -- but the two were in
 //! different accounts. The `shell` process had `CLAUDE_CONFIG_DIR=$HOME/.claude-a` inherited from
 //! the terminal it was launched from, while the sidecar's `claude` had written the transcript into
@@ -18,10 +18,10 @@
 //! `ANTHROPIC_CONFIG_DIR` on every `claude` it spawns -- overriding whatever a caller inherited,
 //! silently (`agent/src/providers/claude_sidecar/runtime_policy_verification.rs` records the run
 //! that proved that override is real). **`account` is not on the proto**: it is a sidecar-process
-//! environment variable, and neovibe is what spawns the sidecar, so nothing in Verdandi had to
+//! environment variable, and Eitri is what spawns the sidecar, so nothing in Verdandi had to
 //! change for this.
 //!
-//! What this module is, therefore, is the *other* half: neovibe deriving the same directory by the
+//! What this module is, therefore, is the *other* half: Eitri deriving the same directory by the
 //! same convention, from the same name, so the place it reads and the place the CLI writes cannot
 //! disagree again. The derivation below mirrors `resolveAccountSpec` term for term, including the
 //! `VERDANDI_CLAUDE_CONFIG_DIR` override -- because the sidecar inherits this process's
@@ -190,8 +190,8 @@ impl ClaudeAccount {
 /// Which name this process should use: an inherited `VERDANDI_CLAUDE_ACCOUNT` first, and failing
 /// that `init.lua`'s `agent.account`.
 ///
-/// **That order is the launcher's, not a preference.** `packaging/neovibe.launcher.sh` has taken
-/// `neovibe --account <name>` since the package existed and exports exactly this variable; it also
+/// **That order is the launcher's, not a preference.** `packaging/eitri.launcher.sh` has taken
+/// `eitri --account <name>` since the package existed and exports exactly this variable; it also
 /// *prints* which account it chose and where from. A per-launch flag beating a per-machine config
 /// file is the ordinary expectation, and it is the only order under which that printed line stays
 /// true -- config-wins would have the launcher announce one account while the window used another,
@@ -366,7 +366,7 @@ mod tests {
     fn a_directory_that_is_not_there_is_named_not_shrugged_at() {
         let account = ClaudeAccount::resolve_from(
             "canry",
-            env_of(&[("VERDANDI_CLAUDE_CONFIG_DIR", "/nonexistent/neovibe-account-test")]),
+            env_of(&[("VERDANDI_CLAUDE_CONFIG_DIR", "/nonexistent/eitri-account-test")]),
         )
         .unwrap();
         let err = account.check_config_dir().unwrap_err();
@@ -374,18 +374,18 @@ mod tests {
             err,
             AccountError::MissingConfigDir {
                 name: "canry".to_string(),
-                path: PathBuf::from("/nonexistent/neovibe-account-test"),
+                path: PathBuf::from("/nonexistent/eitri-account-test"),
             }
         );
         // The message has to carry both, because the typo is only visible next to the path.
         let rendered = err.to_string();
         assert!(rendered.contains("canry"), "{rendered}");
-        assert!(rendered.contains("/nonexistent/neovibe-account-test"), "{rendered}");
+        assert!(rendered.contains("/nonexistent/eitri-account-test"), "{rendered}");
     }
 
     #[test]
     fn a_real_directory_passes_the_same_check() {
-        let dir = std::env::temp_dir().join(format!("neovibe-account-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("eitri-account-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let account = ClaudeAccount::resolve_from(
             "work",
@@ -402,7 +402,7 @@ mod tests {
         assert_eq!(resolve_for(None, None), Ok(None));
     }
 
-    /// `neovibe --account <name>` is a statement about one launch and the launcher prints it, so it
+    /// `eitri --account <name>` is a statement about one launch and the launcher prints it, so it
     /// outranks `init.lua`; `init.lua` outranks nothing at all. Either way ONE name decides both
     /// the sidecar child and where transcripts are read.
     #[test]

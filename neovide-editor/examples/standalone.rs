@@ -31,7 +31,7 @@ use gtk4::{Application, ApplicationWindow};
 
 use neovide_editor::NeovideEditorPane;
 
-const APP_ID: &str = "cn.huntergrey.neovibe.neovide_editor_standalone";
+const APP_ID: &str = "cn.huntergrey.eitri.neovide_editor_standalone";
 
 fn main() -> glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();

@@ -1,4 +1,4 @@
-"""Tests for packaging/aur/bump-bin.sh: what it writes into a copy of neovibe-bin's PKGBUILD from a
+"""Tests for packaging/aur/bump-bin.sh: what it writes into a copy of eitri-bin's PKGBUILD from a
 release directory's RELEASE and SHA256SUMS.
 
     python3 -m pytest packaging/tests/test_aur_bump_bin.py -q
@@ -18,8 +18,8 @@ import unittest
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _AUR = os.path.join(os.path.dirname(_HERE), "aur")
 _BUMP = os.path.join(_AUR, "bump-bin.sh")
-_PKGBUILD = os.path.join(_AUR, "neovibe-bin", "PKGBUILD")
-_SCRATCH_ROOT = os.path.expanduser("~/.cache/neovibe-bump-bin-tests")
+_PKGBUILD = os.path.join(_AUR, "eitri-bin", "PKGBUILD")
+_SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-bump-bin-tests")
 
 _TARBALL_SHA = "11" * 32
 _VERDANDI_SHA = "22" * 32
@@ -30,12 +30,12 @@ def _release(root, version="1.0.0", node_version="v24.1.0", node_sha=_NODE_SHA):
     rel = os.path.join(root, "release")
     os.makedirs(rel)
     with open(os.path.join(rel, "RELEASE"), "w", encoding="utf-8") as f:
-        f.write(f"NEOVIBE_VERSION={version}\n"
+        f.write(f"EITRI_VERSION={version}\n"
                 "VERDANDI_SOURCE=verdandi-abcdef0-source.tar.gz\n"
                 f"NODE_VERSION={node_version}\n"
                 f"NODE_SHA256_linux_x64={node_sha}\n")
     with open(os.path.join(rel, "SHA256SUMS"), "w", encoding="utf-8") as f:
-        f.write(f"{_TARBALL_SHA}  neovibe-{version}-x86_64-linux.tar.gz\n"
+        f.write(f"{_TARBALL_SHA}  eitri-{version}-x86_64-linux.tar.gz\n"
                 f"{_VERDANDI_SHA}  verdandi-abcdef0-source.tar.gz\n")
     return rel
 
@@ -45,7 +45,7 @@ class BumpBinTest(unittest.TestCase):
         os.makedirs(_SCRATCH_ROOT, exist_ok=True)
         self.root = tempfile.mkdtemp(dir=_SCRATCH_ROOT)
         self.addCleanup(shutil.rmtree, self.root, True)
-        self.pkgdir = os.path.join(self.root, "neovibe-bin")
+        self.pkgdir = os.path.join(self.root, "eitri-bin")
         os.makedirs(self.pkgdir)
         shutil.copy(_PKGBUILD, os.path.join(self.pkgdir, "PKGBUILD"))
         # A PATH without makepkg: bump-bin.sh then stops after writing the PKGBUILD, with a message.

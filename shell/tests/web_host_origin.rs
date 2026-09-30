@@ -84,7 +84,7 @@ fn stand_in() -> gtk4::DrawingArea {
 
 fn run() -> Result<Vec<String>, String> {
     let app = gtk4::Application::builder()
-        .application_id("cn.huntergrey.neovibe.test.webhostorigin")
+        .application_id("cn.huntergrey.eitri.test.webhostorigin")
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.register(None::<&gtk4::gio::Cancellable>)

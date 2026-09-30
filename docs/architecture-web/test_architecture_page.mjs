@@ -3,15 +3,15 @@ import { readFile } from "node:fs/promises";
 
 const page = await readFile(new URL("./index.html", import.meta.url), "utf8");
 
-assert.match(page, /<title>neovibe · architecture<\/title>/);
+assert.match(page, /<title>Eitri · architecture<\/title>/);
 assert.match(page, /id="theme-toggle"/);
-assert.match(page, /<svg[^>]*aria-label="neovibe runtime architecture"/);
+assert.match(page, /<svg[^>]*aria-label="Eitri runtime architecture"/);
 
 for (const label of [
   "GTK4 shell",
   "neovide-editor",
   "agent-ui/web",
-  "neovibe-core",
+  "eitri-core",
   "legacy",
   "sidecar",
   "terminal-pane",

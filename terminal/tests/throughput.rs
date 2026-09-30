@@ -3,7 +3,7 @@
 //!
 //! Release-only and `#[ignore]`d -- a debug build measures the debug build:
 //!
-//!     cargo test --release -p neovibe-terminal --test throughput -- --ignored --nocapture
+//!     cargo test --release -p eitri-terminal --test throughput -- --ignored --nocapture
 
 mod common;
 
@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use common::{size, spec, Harness};
-use neovibe_terminal::PtyChild;
+use eitri_terminal::PtyChild;
 
 const FLOOD: &str = "yes | head -n 5000000"; // 15 MB once the tty turns each \n into \r\n
 

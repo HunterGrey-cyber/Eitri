@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="description" content="neovibe 的运行时架构：嵌入式 Neovim、AI agent 与 Verdandi 面板。">
-  <title>neovibe · architecture</title>
+  <meta name="description" content="Eitri 的运行时架构：嵌入式 Neovim、AI agent 与 Verdandi 面板。">
+  <title>Eitri · architecture</title>
   <style>
     :root {
       color-scheme: dark;
@@ -138,7 +138,7 @@
   <main class="page">
     <header>
       <div>
-        <h1>neovibe 的运行时架构</h1>
+        <h1>Eitri 的运行时架构</h1>
         <p class="lede">一个以真实 Neovim 编辑体验为核心的 GTK4 开发环境：编辑、AI 与 Verdandi runtime 各自独立，随后在 shell 中汇合为同一扇窗口。</p>
         <p class="build-note">architecture overview · 2026-09-18</p>
       </div>
@@ -149,7 +149,7 @@
       <h2 id="map-title">一张运行时地图</h2>
       <p class="section-note">外壳负责组合而不吞没实现；颜色表示数据移动方向，而不是模块的重要程度。</p>
       <div class="diagram-frame">
-        <svg viewBox="0 0 1100 560" role="img" aria-label="neovibe runtime architecture">
+        <svg viewBox="0 0 1100 560" role="img" aria-label="Eitri runtime architecture">
           <defs>
             <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M 0 0 L 8 4.5 L 0 9 z" fill="context-stroke"/></marker>
           </defs>
@@ -170,7 +170,7 @@
           <rect class="zone" x="25" y="210" width="1050" height="145"/>
           <text class="zone-label" x="48" y="240">CORE + AGENT LAYER</text>
           <g class="node-group" tabindex="0">
-            <rect class="node" x="48" y="258" width="240" height="70"/><text class="node-title" x="66" y="286">neovibe-core</text><text class="node-copy" x="66" y="309">bridge · tokens · sockets · trace</text>
+            <rect class="node" x="48" y="258" width="240" height="70"/><text class="node-title" x="66" y="286">eitri-core</text><text class="node-copy" x="66" y="309">bridge · tokens · sockets · trace</text>
           </g>
           <g class="node-group" tabindex="0">
             <rect class="node" x="385" y="258" width="208" height="70"/><text class="node-title" x="403" y="286">agent · legacy</text><text class="node-copy" x="403" y="309">Claude CLI · stream-json</text>
@@ -211,7 +211,7 @@
     <section class="facts" aria-labelledby="boundaries-title">
       <div>
         <h2 id="boundaries-title">边界比集成更重要</h2>
-        <p>产品窗口只承担编排：GTK 依赖留在 shell 与面板 crate；可测试的协议、路径、主题 token 与 agent backend 边界沉在 <code>neovibe-core</code>。这使 Linux/macOS 的平台工作能从 UI 依赖中分离出来。</p>
+        <p>产品窗口只承担编排：GTK 依赖留在 shell 与面板 crate；可测试的协议、路径、主题 token 与 agent backend 边界沉在 <code>eitri-core</code>。这使 Linux/macOS 的平台工作能从 UI 依赖中分离出来。</p>
       </div>
       <ul class="fact-list">
         <li><b>默认 agent</b><span>legacy；环境变量可选择 sidecar。</span></li>

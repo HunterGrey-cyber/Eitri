@@ -11,9 +11,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use eitri_core::attention::Attention;
+use eitri_core::layout::{chip_label, tray, Layout, ModuleId, ModuleKind};
 use gtk4::prelude::*;
-use neovibe_core::attention::Attention;
-use neovibe_core::layout::{chip_label, tray, Layout, ModuleId, ModuleKind};
 
 /// A module's name on its chip and in the prefix strip: the built-ins by kind, a Lua panel by the
 /// `title` it registered with (its id if it is somehow not in `lua`).

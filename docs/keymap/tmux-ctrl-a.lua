@@ -1,5 +1,5 @@
--- Reproduces ~/.config/tmux/base.conf's bindings in neovibe. Paste into ~/.config/neovibe/init.lua.
-local k = neovibe.keymap
+-- Reproduces ~/.config/tmux/base.conf's bindings in Eitri. Paste into ~/.config/eitri/init.lua.
+local k = eitri.keymap
 k.prefix("C-a")                                             -- base.conf:11
 k.del("prefix", "C-b")                                      -- base.conf:12
 k.set("prefix", "C-a", "send-prefix")                       -- base.conf:14
@@ -17,5 +17,5 @@ k.set("prefix", "m", "zoom", { repeatable = true })         -- base.conf:61
 for key, dir in pairs({ H = "left", J = "down", K = "up", L = "right" }) do
   k.set("prefix", key, "swap." .. dir)                      -- base.conf:64-67
 end
-k.set("prefix", "q", "tab.close")                           -- base.conf:70 (neovibe always asks y/n)
--- base.conf:69 `x` and :73 `C-l` are neovibe's defaults already.
+k.set("prefix", "q", "tab.close")                           -- base.conf:70 (Eitri always asks y/n)
+-- base.conf:69 `x` and :73 `C-l` are Eitri's defaults already.

@@ -1,8 +1,8 @@
 //! Which `nvim` binary the (forked) Neovide runtime spawns (v1-dist plan Task 6, spec §7):
-//! `NEOVIBE_NVIM` above everything, then an inherited `NEOVIM_BIN` the fork already reads for
-//! itself, then the user's own `PATH` nvim whenever it is new enough, then the newest neovibe-
-//! private copy the installer (Task 11) or `neovibe setup` left under
-//! `$XDG_DATA_HOME/neovibe/nvim`, and only then plain `nvim` again -- letting the fork report its
+//! `EITRI_NVIM` above everything, then an inherited `NEOVIM_BIN` the fork already reads for
+//! itself, then the user's own `PATH` nvim whenever it is new enough, then the newest eitri-
+//! private copy the installer (Task 11) or `eitri setup` left under
+//! `$XDG_DATA_HOME/eitri/nvim`, and only then plain `nvim` again -- letting the fork report its
 //! own version error rather than this module guessing at one.
 //!
 //! [`resolve`] is the one impure caller `shell`'s `main()` needs; [`decide`] is the pure decision
@@ -26,7 +26,7 @@
 //! for never doing this), leaking `NEOVIM_BIN` into every other child of `shell` -- nvim's own
 //! `:terminal` jobs, the sidecar, `claude` and its Bash tool -- is harmless, because only Neovide
 //! ever reads it (spec §7). The one child that must never see it is the bottom terminal's shell,
-//! which removes it itself (`neovibe_terminal::pty::REMOVED_ENV`).
+//! which removes it itself (`eitri_terminal::pty::REMOVED_ENV`).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -34,11 +34,11 @@ use std::time::Duration;
 
 /// Above everything: an absolute path to the exact binary to run. A value that is not absolute, or
 /// not a file, is a hard startup failure naming this variable (spec §7 step 1).
-pub const NVIM_OVERRIDE_ENV: &str = "NEOVIBE_NVIM";
+pub const NVIM_OVERRIDE_ENV: &str = "EITRI_NVIM";
 
 /// The pinned fork's own setting (`CmdLineSettings`'s `#[arg(long = "neovim-bin", env =
 /// "NEOVIM_BIN")]`, `cmd_line.rs:229` at the pinned rev `910053d`) -- read here only so [`Choice`]
-/// can say what it will use; never neovibe's to set when it is already present (spec §7 step 2).
+/// can say what it will use; never Eitri's to set when it is already present (spec §7 step 2).
 /// `main()` writes this same variable on the two branches that need it -- see this module's own doc
 /// above for why that write cannot go through `child_env` instead.
 pub const NEOVIM_BIN_ENV: &str = "NEOVIM_BIN";
@@ -47,10 +47,10 @@ pub const NEOVIM_BIN_ENV: &str = "NEOVIM_BIN";
 /// more (0.11.2), but enforcing that is the fork's business, not this resolver's (spec §7).
 pub const MINIMUM_VERSION: (u64, u64, u64) = (0, 10, 0);
 
-/// `$XDG_DATA_HOME/neovibe/<this>`: where the installer's (Task 11) `tar --strip-components=1`
+/// `$XDG_DATA_HOME/eitri/<this>`: where the installer's (Task 11) `tar --strip-components=1`
 /// lands a version, and where [`resolve`] looks for one. The exact path a match is built from is
 /// `<root>/<X.Y.Z>/bin/nvim` -- the layout contract this module shares with that task.
-pub const PRIVATE_NVIM_SUBDIR: &str = "neovibe/nvim";
+pub const PRIVATE_NVIM_SUBDIR: &str = "eitri/nvim";
 
 /// How long [`resolve`]'s own `<path> --version` probe waits before giving up. A `PATH` `nvim` can
 /// be anything -- a wrapper script, a stuck mount -- and startup must never hang on it.
@@ -60,16 +60,16 @@ const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// not) and print the one line spec §7 asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
-    /// `NEOVIBE_NVIM` named this file explicitly.
+    /// `EITRI_NVIM` named this file explicitly.
     Explicit(PathBuf),
     /// `NEOVIM_BIN` was already set on this process before it decided anything -- the user's or a
-    /// launcher's own choice, never neovibe's to overwrite (spec §7 step 2).
+    /// launcher's own choice, never Eitri's to overwrite (spec §7 step 2).
     Inherited(PathBuf),
     /// The user's own `PATH` nvim is new enough, or nothing usable was found anywhere -- either way
     /// the fork's own default lookup for plain `"nvim"` is exactly right, and it reports its own
     /// version error when there is one to report.
     Path,
-    /// The newest neovibe-private copy: the `PATH` nvim was too old or absent, and at least one
+    /// The newest Eitri-private copy: the `PATH` nvim was too old or absent, and at least one
     /// private copy exists.
     Private {
         /// `<private root>/<X.Y.Z>/bin/nvim`.
@@ -115,7 +115,7 @@ impl Choice {
             Choice::Explicit(path) => format!("nvim: {} ({NVIM_OVERRIDE_ENV})", path.display()),
             Choice::Inherited(path) => {
                 format!(
-                    "nvim: {} ({NEOVIM_BIN_ENV}, inherited -- not neovibe's own choice)",
+                    "nvim: {} ({NEOVIM_BIN_ENV}, inherited -- not Eitri's own choice)",
                     path.display()
                 )
             }
@@ -126,7 +126,7 @@ impl Choice {
                     PathNvim::Unreadable => "an nvim that did not report its version".to_string(),
                     PathNvim::Version((a, b, c)) => format!("{a}.{b}.{c}"),
                 };
-                format!("nvim: {} (neovibe's own copy; your PATH has {on_path})", path.display())
+                format!("nvim: {} (Eitri's own copy; your PATH has {on_path})", path.display())
             }
         }
     }
@@ -144,7 +144,7 @@ impl Choice {
 /// - `path_nvim`: the result of a `PATH` walk for an executable literally named `nvim`, or `None`
 ///   when nothing on `PATH` matches.
 /// - `private_candidates`: every directory entry [`resolve`] found directly under
-///   `$XDG_DATA_HOME/neovibe/nvim`, each paired with the `bin/nvim` path inside it. **Unfiltered**
+///   `$XDG_DATA_HOME/eitri/nvim`, each paired with the `bin/nvim` path inside it. **Unfiltered**
 ///   -- this function applies the `^[0-9]+\.[0-9]+\.[0-9]+$` pattern and the version sort, so a
 ///   `nvim-linux-x86_64/`-named sibling (the official tarball's own top directory, never searched)
 ///   is excluded here rather than by a caller having to agree about which names count.
@@ -154,7 +154,7 @@ impl Choice {
 ///   way (spec: "The version probe ... runs only when a neovibe-private nvim exists").
 ///
 /// Returns `Err` only for steps 1 and 2's own validation failure, naming the variable: the value is
-/// not an absolute path, or not a file. **Absolute, for both.** Spec §7 says so of `NEOVIBE_NVIM`
+/// not an absolute path, or not a file. **Absolute, for both.** Spec §7 says so of `EITRI_NVIM`
 /// and asks `NEOVIM_BIN` to be "validated the same way"; the reason is the fork's spawn, which sets
 /// the child's working directory to the project, so a relative value would be checked here against
 /// `shell`'s own cwd and then run from a different directory -- two files, one name. (A bare command
@@ -260,7 +260,7 @@ pub fn parse_nvim_version_line(first_line: &str) -> Option<(u64, u64, u64)> {
     parse_version_dirname(core)
 }
 
-/// `$XDG_DATA_HOME/neovibe/nvim`, or `<home>/.local/share/neovibe/nvim` when `XDG_DATA_HOME` is
+/// `$XDG_DATA_HOME/eitri/nvim`, or `<home>/.local/share/eitri/nvim` when `XDG_DATA_HOME` is
 /// unset, empty or not absolute -- the same three-case rule `core::layout::persist::state_subdir`
 /// uses for `XDG_STATE_HOME`, and `agent::providers::claude_sidecar::user_sidecar_path` uses for its
 /// own directory under this same `XDG_DATA_HOME` (that function's own doc: `core` depends on
@@ -280,7 +280,7 @@ pub fn private_nvim_root(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) ->
 
 /// Every directory directly under `root`, paired with the `bin/nvim` path inside it -- [`decide`]
 /// applies the version filter and sort; this only lists, once, with no subprocess. A `root` that
-/// does not exist yet (`neovibe setup`/the installer never ran, the ordinary case) is silently
+/// does not exist yet (`eitri setup`/the installer never ran, the ordinary case) is silently
 /// empty, not an error -- absence is the normal state here, not a fault.
 fn list_private_candidates(root: &Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -423,21 +423,21 @@ mod tests {
     }
 
     #[test]
-    fn neovibe_nvim_wins_when_it_is_a_file() {
+    fn eitri_nvim_wins_when_it_is_a_file() {
         let chosen = decide(
             Some(OsStr::new("/opt/my-nvim")),
             None,
             always_is_file,
             None,
             &[],
-            |_| panic!("must not probe a version when NEOVIBE_NVIM already decided it"),
+            |_| panic!("must not probe a version when EITRI_NVIM already decided it"),
         )
         .unwrap();
         assert_eq!(chosen, Choice::Explicit(PathBuf::from("/opt/my-nvim")));
     }
 
     #[test]
-    fn neovibe_nvim_naming_a_non_file_is_an_error_naming_the_variable() {
+    fn eitri_nvim_naming_a_non_file_is_an_error_naming_the_variable() {
         let err = decide(
             Some(OsStr::new("/opt/does-not-exist")),
             None,
@@ -447,7 +447,7 @@ mod tests {
             |_| panic!("not reached"),
         )
         .unwrap_err();
-        assert!(err.contains("NEOVIBE_NVIM"), "{err}");
+        assert!(err.contains("EITRI_NVIM"), "{err}");
         assert!(err.contains("/opt/does-not-exist"), "{err}");
     }
 
@@ -629,13 +629,13 @@ mod tests {
     #[test]
     fn describe_matches_spec_7_wording_for_a_private_win() {
         let chosen = Choice::Private {
-            path: PathBuf::from("/home/x/.local/share/neovibe/nvim/0.11.4/bin/nvim"),
+            path: PathBuf::from("/home/x/.local/share/eitri/nvim/0.11.4/bin/nvim"),
             version: (0, 11, 4),
             on_path: PathNvim::Version((0, 9, 5)),
         };
         assert_eq!(
             chosen.describe(),
-            "nvim: /home/x/.local/share/neovibe/nvim/0.11.4/bin/nvim (neovibe's own copy; your PATH has 0.9.5)"
+            "nvim: /home/x/.local/share/eitri/nvim/0.11.4/bin/nvim (Eitri's own copy; your PATH has 0.9.5)"
         );
         let chosen_no_path = Choice::Private {
             path: PathBuf::from("/x/bin/nvim"),
@@ -681,18 +681,18 @@ mod tests {
         );
     }
 
-    /// Spec §7: `NEOVIBE_NVIM` is an absolute path, and an inherited `NEOVIM_BIN` is validated the
+    /// Spec §7: `EITRI_NVIM` is an absolute path, and an inherited `NEOVIM_BIN` is validated the
     /// same way. A relative value would be checked against `shell`'s cwd and then run by the fork
     /// from the project directory, so it is refused before `is_file` is even asked -- here with an
     /// `is_file` that says yes to everything, which is what a same-named file in `shell`'s cwd does.
     #[test]
-    fn a_relative_neovibe_nvim_or_neovim_bin_is_an_error_naming_the_variable() {
+    fn a_relative_eitri_nvim_or_neovim_bin_is_an_error_naming_the_variable() {
         for relative in ["bin/nvim", "./nvim", "nvim"] {
             let err = decide(Some(OsStr::new(relative)), None, always_is_file, None, &[], |_| {
                 panic!("not reached")
             })
             .unwrap_err();
-            assert!(err.contains("NEOVIBE_NVIM"), "{err}");
+            assert!(err.contains("EITRI_NVIM"), "{err}");
             assert!(err.contains("not an absolute path"), "{err}");
 
             let err = decide(None, Some(OsStr::new(relative)), always_is_file, None, &[], |_| {
@@ -708,17 +708,17 @@ mod tests {
     fn private_nvim_root_follows_the_same_three_case_rule_as_the_sidecar_directory() {
         assert_eq!(
             private_nvim_root(Some(OsStr::new("/data")), Some(OsStr::new("/home/x"))),
-            Some(PathBuf::from("/data/neovibe/nvim"))
+            Some(PathBuf::from("/data/eitri/nvim"))
         );
         assert_eq!(
             private_nvim_root(None, Some(OsStr::new("/home/x"))),
-            Some(PathBuf::from("/home/x/.local/share/neovibe/nvim"))
+            Some(PathBuf::from("/home/x/.local/share/eitri/nvim"))
         );
         assert_eq!(private_nvim_root(None, None), None);
         // A relative `XDG_DATA_HOME` is ignored, falling back to `$HOME` -- the XDG spec's own rule.
         assert_eq!(
             private_nvim_root(Some(OsStr::new("relative")), Some(OsStr::new("/home/x"))),
-            Some(PathBuf::from("/home/x/.local/share/neovibe/nvim"))
+            Some(PathBuf::from("/home/x/.local/share/eitri/nvim"))
         );
     }
 

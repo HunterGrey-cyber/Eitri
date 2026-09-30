@@ -3,7 +3,7 @@
 //!
 //! R07 made the CLI's permission mode a constant. Every session, on both backends, is gated --
 //! `--permission-mode default` plus the `PreToolUse` hook on legacy, `INTERACTIVE` with
-//! `permission_mode_switchable: false` on the sidecar -- and "bypass" is neovibe answering `allow`
+//! `permission_mode_switchable: false` on the sidecar -- and "bypass" is Eitri answering `allow`
 //! itself. The types carry half of that: no session request has a mode any more. This scan carries
 //! the half the compiler cannot see -- a string literal, a proto enum constructor, a setter, a
 //! pre-approval list -- any of which would put the CLI back in `bypassPermissions` without a single

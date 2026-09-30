@@ -1,7 +1,7 @@
-//! neovibe never has nvim force-quit (the round-4 ruling of the v1-hardening fix rounds, 2026-09-27).
+//! Eitri never has nvim force-quit (the round-4 ruling of the v1-hardening fix rounds, 2026-09-27).
 //! Ending an editor is only: nvim's own `:confirm qall` (it asks the user); closing its stdin and
 //! waiting (on EOF nvim exits keeping the swap files of modified buffers); SIGTERM, which nvim's
-//! own deadly-signal handler answers the same way; and SIGKILL by the pid neovibe holds, only when
+//! own deadly-signal handler answers the same way; and SIGKILL by the pid Eitri holds, only when
 //! those did not end it within the patience window (`neovide_editor`'s `nvim_child::end`).
 //!
 //! `:qa!` discards unsaved buffers AND deletes their swap files, and the pinned fork's own shutdown
@@ -437,7 +437,7 @@ fn the_matcher_sees_every_spelling_and_nothing_else() {
     assert!(force_quits("pcall(vim.cmd, 'confirm qall')").is_empty());
 }
 
-/// neovibe's own product code sends no force-quit to nvim.
+/// Eitri's own product code sends no force-quit to nvim.
 #[test]
 fn no_product_code_force_quits_nvim() {
     let root = workspace();
@@ -454,7 +454,7 @@ fn no_product_code_force_quits_nvim() {
     }
     assert!(paths.len() > 50, "only {} files -- the walk is broken", paths.len());
     let offences: Vec<String> = paths.iter().flat_map(|p| offences(p)).collect();
-    assert_eq!(offences, Vec::<String>::new(), "neovibe never force-quits nvim");
+    assert_eq!(offences, Vec::<String>::new(), "Eitri never force-quits nvim");
 }
 
 /// The pinned fork's root, as cargo resolved it for this workspace.
@@ -489,7 +489,7 @@ fn fork_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The fork's lifecycle code: the harness neovibe embeds never sends nvim the fork's quit, which is
+/// The fork's lifecycle code: the harness Eitri embeds never sends nvim the fork's quit, which is
 /// `:qa!` with `confirm_quit` off; the one quit nvim itself can still trigger there (`<D-q>`, from
 /// the fork's `lua/init.lua`) confirms; and the only `qa!` left in the fork's Lua is stock
 /// Neovide's, which an embedding never reaches.

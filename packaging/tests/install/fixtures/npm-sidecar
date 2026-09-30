@@ -6,16 +6,16 @@
 # invokes this by the absolute path inside the (real or fake) extracted Node tarball, never a bare
 # `npm` resolved off PATH -- this fixture never needs to shadow a real npm.
 #
-# NEOVIBE_INSTALL_TEST_NPM_MODE selects the behaviour (default "ok"):
+# EITRI_INSTALL_TEST_NPM_MODE selects the behaviour (default "ok"):
 #   ok            both steps succeed, producing a spec-shaped artifact
 #   fail-ci       `npm ci` exits 1
 #   fail-build    `npm run build:binary` exits 1
 #   bad-protocol  the built artifact reports the wrong protocol number
 #   bad-node      the built artifact reports the wrong node version
 #   sdk-bundled   the built artifact serves "host_cli, sdk_bundled" (never host_cli alone)
-mode=${NEOVIBE_INSTALL_TEST_NPM_MODE:-ok}
-sidecar_version=${NEOVIBE_INSTALL_TEST_SIDECAR_VERSION:-0.1.0}
-build_stamp=${NEOVIBE_INSTALL_TEST_BUILD_STAMP:-0123456789abcdef}
+mode=${EITRI_INSTALL_TEST_NPM_MODE:-ok}
+sidecar_version=${EITRI_INSTALL_TEST_SIDECAR_VERSION:-0.1.0}
+build_stamp=${EITRI_INSTALL_TEST_BUILD_STAMP:-0123456789abcdef}
 
 case $1 in
 ci)
@@ -44,7 +44,7 @@ run)
 		;;
 	esac
 	protocol=3
-	node_version=${NEOVIBE_INSTALL_TEST_NODE_VERSION:-v22.23.2}
+	node_version=${EITRI_INSTALL_TEST_NODE_VERSION:-v22.23.2}
 	served=host_cli
 	case $mode in
 	bad-protocol) protocol=99 ;;

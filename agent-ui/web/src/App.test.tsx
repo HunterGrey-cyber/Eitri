@@ -31,7 +31,7 @@ let posted: Array<Record<string, unknown>>;
 beforeEach(() => {
   posted = [];
   (window as unknown as { webkit: unknown }).webkit = {
-    messageHandlers: { neovibeAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } },
+    messageHandlers: { eitriAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } },
   };
 });
 
@@ -39,7 +39,7 @@ beforeEach(() => {
  *  the global the page installed on mount. */
 function dispatch(payload: unknown) {
   act(() => {
-    window.__neovibeDispatch!(JSON.stringify(payload));
+    window.__eitriDispatch!(JSON.stringify(payload));
   });
 }
 
@@ -347,8 +347,8 @@ describe("arrive (panel round 2, spec §8, decision 4)", () => {
     // One batch, as WebKitGTK delivered them in the pass: Rust's `new_tab()` and `enter_input()`
     // run back to back, and React committed both before the new `EmptyTab`'s mount effects ran.
     act(() => {
-      window.__neovibeDispatch!(JSON.stringify({ kind: "tabs", active: 2, tabs: two }));
-      window.__neovibeDispatch!(JSON.stringify({ kind: "enter_input" }));
+      window.__eitriDispatch!(JSON.stringify({ kind: "tabs", active: 2, tabs: two }));
+      window.__eitriDispatch!(JSON.stringify({ kind: "enter_input" }));
     });
     const box = container.querySelector("textarea");
     expect(box).not.toBeNull();
@@ -3783,10 +3783,10 @@ describe("v1: typing never answers a card", () => {
     ];
     const state = other.reduce(applyEvent, snapshotState({ capabilities: { ...initialState().capabilities, interrupt: true } }));
     act(() => {
-      window.__neovibeDispatch!(
+      window.__eitriDispatch!(
         JSON.stringify({ kind: "tabs", active: 2, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 live" }] }),
       );
-      window.__neovibeDispatch!(JSON.stringify({ kind: "snapshot", tab: 2, throughRevision: other.length, state }));
+      window.__eitriDispatch!(JSON.stringify({ kind: "snapshot", tab: 2, throughRevision: other.length, state }));
     });
     expect(approve.isConnected).toBe(true);
     expect(container.querySelector('.permission-card [data-nav-action="allow"]')).toBe(approve);
@@ -8176,7 +8176,7 @@ describe("a switch back to a tab whose reply streams (the small-defects GUI pass
     const root = container.querySelector(".agent-ui-conversation")!;
     act(() => {
       fireEvent.keyDown(root, { key: "k" });
-      window.__neovibeDispatch!(
+      window.__eitriDispatch!(
         JSON.stringify({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events: [
           { type: "content_delta", turn_id: "t", kind: "text", text: " more" },
         ] }),
@@ -8943,7 +8943,7 @@ describe("gx: web links on a row (v1 picks, Task 8, R6)", () => {
   it("says there is no web link on a row with only relative or non-web ones, and posts nothing", () => {
     const widen = stubBandWidth();
     try {
-      const { container } = withReply("see [docs](docs/a.md), [own](https://neovibe.invalid/x) and [mail](mailto:a@b)");
+      const { container } = withReply("see [docs](docs/a.md), [own](https://eitri.invalid/x) and [mail](mailto:a@b)");
       act(() => widen(container));
       boxLinks(container);
       gx(container);
@@ -13192,8 +13192,8 @@ describe("#22: coming back restores where you were", () => {
     parkOnRow3(container);
     const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
     act(() => {
-      window.__neovibeDispatch!(JSON.stringify({ kind: "tabs", active: 2, tabs: two }));
-      window.__neovibeDispatch!(JSON.stringify({ kind: "enter_input" }));
+      window.__eitriDispatch!(JSON.stringify({ kind: "tabs", active: 2, tabs: two }));
+      window.__eitriDispatch!(JSON.stringify({ kind: "enter_input" }));
     });
     const box = container.querySelector("textarea");
     expect(document.activeElement).toBe(box);

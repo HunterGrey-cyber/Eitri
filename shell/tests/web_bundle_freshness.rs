@@ -299,7 +299,7 @@ fn watch_paths_cover_every_top_level_input_and_the_src_directory_only() {
 /// implementations of the same algorithm, kept in step only by their doc comments and by whatever
 /// exercises each one -- nothing else compares them against each other directly, so a change to
 /// either one that silently drifted from the other would otherwise only surface as every real
-/// release's source asset failing `release_check.py`'s `check_neovibe_source_tree` (Task 12 fix
+/// release's source asset failing `release_check.py`'s `check_eitri_source_tree` (Task 12 fix
 /// round 1, finding #3).
 #[test]
 fn fingerprint_matches_the_pinned_value_the_python_side_also_asserts() {

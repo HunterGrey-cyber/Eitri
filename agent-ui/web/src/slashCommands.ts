@@ -114,10 +114,10 @@ export function barePickerCommand(text: string): "model" | "effort" | null {
   return parsed.name === "model" || parsed.name === "effort" ? parsed.name : null;
 }
 
-/** Spec §9.2's own wording, verbatim: "the band flashes `/<name> does not work in neovibe — ? lists
- *  the ones that do`". */
+/** Spec §9.2's own wording, with the product's name as it is now: "the band flashes `/<name> does not
+ *  work in Eitri — ? lists the ones that do`". */
 export function slashCommandFlashText(name: string): string {
-  return `/${name} does not work in neovibe — ? lists the ones that do`;
+  return `/${name} does not work in Eitri — ? lists the ones that do`;
 }
 
 /** Spec §9.2: "The `?` overlay gets a 'Slash commands' section listing the **works** row." --
@@ -129,9 +129,9 @@ export function worksSlashCommands(): string[] {
 }
 
 /** What the `?` overlay lists (the v1-ui GUI pass, 2026-09-27): the **works** rows that Enter would
- *  actually send. The pass saw `/config` refused with "does not work in neovibe — ? lists the ones that
- *  do" while `?` listed `/config`, so the two contradicted each other on one screen. A command held
- *  back unconditionally (`/config`, the only one left since owner trial item 2 removed `/model`'s own
+ *  actually send. The pass saw `/config` refused with that flash ("does not work in <the product> — ? lists
+ *  the ones that do") while `?` listed `/config`, so the two contradicted each other on one screen. A command
+ *  held back unconditionally (`/config`, the only one left since owner trial item 2 removed `/model`'s own
  *  holdback) is left out; `worksSlashCommands` above stays the table's own class, unchanged. */
 export function listedSlashCommands(): string[] {
   return worksSlashCommands().flatMap((name) => (heldBackSlashCommand(`/${name}`) === null ? [name] : []));

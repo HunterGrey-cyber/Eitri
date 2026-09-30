@@ -1,2 +1,2 @@
-claude-sidecar exited with exit status: 1 before binding "/scratch/v1ui-gui/tmp/neovibe-sc-3cb8d8725afe4260bf0e0fb1428c4086.sock"; its stderr said:
+claude-sidecar exited with exit status: 1 before binding "/scratch/v1ui-gui/tmp/eitri-sc-3cb8d8725afe4260bf0e0fb1428c4086.sock"; its stderr said:
 claude account configuration is unusable: claude account "scratch" is not logged in: /scratch/v1ui-gui/claude-scratch/.credentials.json is missing and ANTHROPIC_API_KEY is unset

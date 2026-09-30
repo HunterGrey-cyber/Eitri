@@ -19,8 +19,8 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
   return activeTab !== null && payload.tab === activeTab;
 }
 
-/** Claude Code's mode pill (docs, permission-modes.md), with neovibe's own word for the mode
- *  (`hello.permissionModes`): neovibe's `auto` is not the CLI's. `cycleOffered` used to name wave
+/** Claude Code's mode pill (docs, permission-modes.md), with Eitri's own word for the mode
+ *  (`hello.permissionModes`): Eitri's `auto` is not the CLI's. `cycleOffered` used to name wave
  *  5's own `SetPermissionMode` capability gate; v1 (spec `2026-09-27-v1-mode-design.md`) removes
  *  that capability entirely -- every tab can always attempt to cycle now (`modeKey.ts`'s
  *  `modeKeyRoute`) -- but the parameter stays for the long form's own shape, below.
@@ -33,7 +33,7 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
  *  future caller that wants the long form back does not have to relearn what it looked like.
  *
  *  D8: bypass's short pill spells out what it means (`⏵⏵ bypass permissions on`) rather than the
- *  bare mode word every other mode gets -- neovibe's own answer, spent on every waiting card, is not
+ *  bare mode word every other mode gets -- Eitri's own answer, spent on every waiting card, is not
  *  something a glance at "bypass" alone says. */
 export function modePill(mode: PermissionModeChoice, cycleOffered: boolean, short = false): string {
   if (short) return mode === "bypass" ? "⏵⏵ bypass permissions on" : `⏵⏵ ${mode}`;

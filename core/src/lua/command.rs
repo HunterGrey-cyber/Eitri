@@ -1,4 +1,4 @@
-//! `neovibe.command.register({ id, title, keybinding, action })`. `keybinding` is optional --
+//! `eitri.command.register({ id, title, keybinding, action })`. `keybinding` is optional --
 //! a command with none is still invocable (e.g. from a future command palette), just not bound
 //! to any accelerator. The actual GTK `gio::SimpleAction`/accelerator wiring lives in
 //! `main.rs` (Task 7), not here -- this module only owns the pure id/title/keybinding/callback
@@ -21,7 +21,7 @@ pub struct CommandEntry {
     // (verified against the installed mlua 0.12.1's `src/types/registry_key.rs`), and
     // `LuaEngine::invoke_command` needs to clone the handle *out* of a borrowed
     // `CommandRegistry` before dropping that borrow, to avoid a reentrant `BorrowMutError` if
-    // the action itself calls `neovibe.command.register(...)`.
+    // the action itself calls `eitri.command.register(...)`.
     pub action: Rc<RegistryKey>,
 }
 
@@ -80,7 +80,7 @@ fn is_valid_command_id(id: &str) -> bool {
 }
 
 /// `pub`: `LuaEngine::new` calls this.
-pub fn install(lua: &Lua, neovibe: &Table, registry: Rc<RefCell<CommandRegistry>>) -> mlua::Result<()> {
+pub fn install(lua: &Lua, eitri: &Table, registry: Rc<RefCell<CommandRegistry>>) -> mlua::Result<()> {
     let command_table = lua.create_table()?;
     let register_fn = lua.create_function(move |lua, spec: Table| {
         let id: String = spec.get("id")?;
@@ -102,7 +102,7 @@ pub fn install(lua: &Lua, neovibe: &Table, registry: Rc<RefCell<CommandRegistry>
             // (`CommandRegistry::refused`) whatever init.lua does with the error, and
             // `LuaEngine::load_init_file` exits naming it, as every other validated config value does.
             let message = format!(
-                "neovibe.command.register: invalid command id {id:?} -- only ASCII letters, digits, \
+                "eitri.command.register: invalid command id {id:?} -- only ASCII letters, digits, \
                  '-' and '.' are allowed (an invalid id crashes the whole process once bound to a keybinding)"
             );
             registry.borrow_mut().refused.get_or_insert_with(|| message.clone());
@@ -123,7 +123,7 @@ pub fn install(lua: &Lua, neovibe: &Table, registry: Rc<RefCell<CommandRegistry>
         Ok(())
     })?;
     command_table.set("register", register_fn)?;
-    neovibe.set("command", command_table)?;
+    eitri.set("command", command_table)?;
     Ok(())
 }
 
@@ -134,15 +134,15 @@ mod tests {
     #[test]
     fn registers_a_command_and_the_action_is_callable() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let registry = Rc::new(RefCell::new(CommandRegistry::default()));
-        install(&lua, &neovibe, registry.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         lua.load(
             r#"
             action_ran = false
-            neovibe.command.register({
+            eitri.command.register({
                 id = "test-command",
                 title = "Test Command",
                 keybinding = "<primary>t",
@@ -166,14 +166,14 @@ mod tests {
     #[test]
     fn keybinding_is_optional() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let registry = Rc::new(RefCell::new(CommandRegistry::default()));
-        install(&lua, &neovibe, registry.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         lua.load(
             r#"
-            neovibe.command.register({ id = "no-key", title = "No Key", action = function() end })
+            eitri.command.register({ id = "no-key", title = "No Key", action = function() end })
             "#,
         )
         .exec()
@@ -183,7 +183,7 @@ mod tests {
     }
 
     /// Regression test for the reentrancy panic the final review reproduced: a command action
-    /// that itself calls `neovibe.command.register(...)` -- registering another command from
+    /// that itself calls `eitri.command.register(...)` -- registering another command from
     /// inside a command's own action -- must not panic with `BorrowMutError`. This mirrors
     /// `LuaEngine::invoke_command`'s own borrow/call sequence rather than going through
     /// `LuaEngine` directly, since this module (unlike `LuaEngine`) needs no display and is
@@ -191,18 +191,18 @@ mod tests {
     #[test]
     fn action_that_registers_another_command_does_not_panic() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let registry = Rc::new(RefCell::new(CommandRegistry::default()));
-        install(&lua, &neovibe, registry.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         lua.load(
             r#"
-            neovibe.command.register({
+            eitri.command.register({
                 id = "first",
                 title = "First",
                 action = function()
-                    neovibe.command.register({
+                    eitri.command.register({
                         id = "second",
                         title = "Second",
                         action = function() end,
@@ -217,7 +217,7 @@ mod tests {
         // Mirror `LuaEngine::invoke_command`'s clone-out-then-call pattern: resolve the action
         // under a scoped borrow, drop the borrow, then call it. Before the fix (a bare
         // `RegistryKey` resolved and called while still holding `registry.borrow()`), the
-        // action's own `neovibe.command.register` call would panic with `BorrowMutError`.
+        // action's own `eitri.command.register` call would panic with `BorrowMutError`.
         let action = {
             let commands = registry.borrow();
             let entry = commands.get("first").expect("command should be registered");
@@ -239,13 +239,13 @@ mod tests {
     #[test]
     fn register_rejects_an_id_containing_a_space() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let registry = Rc::new(RefCell::new(CommandRegistry::default()));
-        install(&lua, &neovibe, registry.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         let err = lua
-            .load(r#"neovibe.command.register({ id = "my command", title = "x", action = function() end })"#)
+            .load(r#"eitri.command.register({ id = "my command", title = "x", action = function() end })"#)
             .exec()
             .expect_err("an id containing a space must be refused, not crash GTK once bound");
         assert!(
@@ -258,13 +258,13 @@ mod tests {
     #[test]
     fn register_rejects_an_id_containing_parentheses() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let registry = Rc::new(RefCell::new(CommandRegistry::default()));
-        install(&lua, &neovibe, registry.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         let err = lua
-            .load(r#"neovibe.command.register({ id = "foo(bar)", title = "x", action = function() end })"#)
+            .load(r#"eitri.command.register({ id = "foo(bar)", title = "x", action = function() end })"#)
             .exec()
             .expect_err("an id containing parentheses must be refused, not crash GTK once bound");
         assert!(
@@ -277,13 +277,13 @@ mod tests {
     #[test]
     fn register_rejects_an_id_containing_a_double_colon() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let registry = Rc::new(RefCell::new(CommandRegistry::default()));
-        install(&lua, &neovibe, registry.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         let err = lua
-            .load(r#"neovibe.command.register({ id = "x::y", title = "x", action = function() end })"#)
+            .load(r#"eitri.command.register({ id = "x::y", title = "x", action = function() end })"#)
             .exec()
             .expect_err(
                 "an id containing '::' must be refused -- it silently mis-binds the accel to a different action",
@@ -295,12 +295,12 @@ mod tests {
     #[test]
     fn register_accepts_alphanumerics_hyphen_and_dot() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let registry = Rc::new(RefCell::new(CommandRegistry::default()));
-        install(&lua, &neovibe, registry.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
-        lua.load(r#"neovibe.command.register({ id = "my-command.v2", title = "x", action = function() end })"#)
+        lua.load(r#"eitri.command.register({ id = "my-command.v2", title = "x", action = function() end })"#)
             .exec()
             .unwrap();
         assert!(registry.borrow().get("my-command.v2").is_some());
@@ -317,16 +317,16 @@ mod tests {
     #[test]
     fn an_invalid_id_stops_the_rest_of_the_chunk_not_just_that_call() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let registry = Rc::new(RefCell::new(CommandRegistry::default()));
-        install(&lua, &neovibe, registry.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         let result = lua
             .load(
                 r#"
                 before_the_bad_call = true
-                neovibe.command.register({ id = "bad id", title = "x", action = function() end })
+                eitri.command.register({ id = "bad id", title = "x", action = function() end })
                 after_the_bad_call = true
                 "#,
             )
@@ -347,21 +347,21 @@ mod tests {
     /// one stderr line an app-menu launch never shows -- and an init.lua that wrapped the call in
     /// `pcall` swallowed even that. A refused id is now remembered however the error is handled, so
     /// `LuaEngine::load_init_file` can make it a startup failure naming the id, as every other
-    /// config value neovibe validates is (`agent.font_size`, `agent.account`, a keybinding).
+    /// config value Eitri validates is (`agent.font_size`, `agent.account`, a keybinding).
     #[test]
     fn a_refused_id_is_remembered_even_when_init_lua_catches_the_error() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let registry = Rc::new(RefCell::new(CommandRegistry::default()));
-        install(&lua, &neovibe, registry.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         assert!(registry.borrow().refused().is_none());
         lua.load(
             r#"
-            local ok = pcall(neovibe.command.register, { id = "my command", title = "x", action = function() end })
+            local ok = pcall(eitri.command.register, { id = "my command", title = "x", action = function() end })
             assert(not ok)
-            neovibe.command.register({ id = "fine", title = "y", action = function() end })
+            eitri.command.register({ id = "fine", title = "y", action = function() end })
             "#,
         )
         .exec()

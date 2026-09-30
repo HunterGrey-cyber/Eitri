@@ -27,11 +27,11 @@ Deterministic by construction: every list is sorted, nothing reads the clock, an
 are printed once and referred to afterwards. Running it twice gives byte-identical output.
 
 Inputs it expects to exist (publish.sh / release.sh produce all of them before calling it):
-  <repo>/target/release/{shell,neovibe-supervisor,neovibe-tmux-shim,neovibe-claude-handoff}
+  <repo>/target/release/{shell,eitri-supervisor,eitri-tmux-shim,eitri-claude-handoff}
     (or --binaries-dir DIR; no agent-hook -- it is not in any release, spec sec 10, D16)
   dist/verdandi-claude-sidecar                    (sidecar profile only; not read with --no-sidecar)
   agent-ui/web/node_modules                       (shell/build.rs runs npm ci there)
-  $NEOVIBE_VERDANDI_CHECKOUT (default ~/src/verdandi), with node_modules installed and
+  $EITRI_VERDANDI_CHECKOUT (default ~/src/verdandi), with node_modules installed and
   apps/claude-sidecar/build/node-cache/ holding the Node the artifact was built from (sidecar profile
   only)
 
@@ -47,9 +47,9 @@ Two profiles (spec sec 11, sec 8):
       redistributes the WHOLE Skia prebuilt archive (spec D9), and every component it contains --
       not just what the shipped binaries end up linking -- needs a notice.
   --source-notice FILE --skia-archive NAME --skia-sha256 HEX --source-url URL
-      also write share/licenses/neovibe/SOURCE (spec sec 11.3) to FILE, in either profile. version
-      comes from cargo metadata's `shell` package; commit from $NEOVIBE_BUILD_COMMIT or
-      `git rev-parse HEAD` in --repo; the Neovide fork's commit from $NEOVIBE_BUILD_FORK_COMMIT or
+      also write share/licenses/eitri/SOURCE (spec sec 11.3) to FILE, in either profile. version
+      comes from cargo metadata's `shell` package; commit from $EITRI_BUILD_COMMIT or
+      `git rev-parse HEAD` in --repo; the Neovide fork's commit from $EITRI_BUILD_FORK_COMMIT or
       `git rev-parse HEAD` in --repo's own neovide/ checkout. --source-url is required here too,
       even under --sidecar (whose own default is the bare repo, which SOURCE must never name as the
       asset).
@@ -98,7 +98,7 @@ TARGET = "x86_64-unknown-linux-gnu"
 # `-p shell -p agent -p supervisor --bins`). No `agent-hook`: it is the legacy backend's permission
 # hook, and after Task 4 (D16) no release build compiles the legacy backend at all, in either
 # profile (spec sec 10).
-SHIPPED_BINARIES = ["shell", "neovibe-supervisor", "neovibe-tmux-shim", "neovibe-claude-handoff"]
+SHIPPED_BINARIES = ["shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff"]
 SHIPPED_CARGO_PACKAGES = ["shell", "agent", "supervisor"]
 
 # Small counts, spelled as words in prose (never digits) -- licences-claude-2: a note once read
@@ -114,7 +114,7 @@ def _count_word(n):
 # The URL used when neither profile names one explicitly (only the --sidecar/dev profile may omit
 # --source-url; --no-sidecar requires it). A dev run has no versioned release asset to point at, so
 # this is just the repository, which is at least still true.
-DEFAULT_SOURCE_URL = "https://github.com/HunterGrey-cyber/neovibe"
+DEFAULT_SOURCE_URL = "https://github.com/HunterGrey-cyber/eitri"
 
 # ---------------------------------------------------------------------------------------------
 # Classification
@@ -155,7 +155,7 @@ COPYLEFT_ACK = {
 # Exactly these. Anything else without a classifiable licence and a findable text fails.
 ALLOWLIST = {
     ("cargo", "claude-runtime-protocol"): (
-        "Verdandi's own generated gRPC types, same owner as neovibe. Its own Cargo.toml declares no "
+        "Verdandi's own generated gRPC types, same owner as Eitri. Its own Cargo.toml declares no "
         "`license` field. cargo_texts()'s git-checkout walk falls back to the checkout's own root "
         "LICENSE when the crate's own directory ships none -- which is present (MIT) on the public "
         "Verdandi mirror and absent on at least one private checkout, so whether a licence text is "
@@ -165,35 +165,35 @@ ALLOWLIST = {
         "allowlisted\" even where a root LICENSE happens to be found. Re-check only once "
         "claude-runtime-protocol's own Cargo.toml declares `license = \"MIT\"`."),
     ("npm", "@verdandi/claude-sidecar"): (
-        "Verdandi's own sidecar, same owner as neovibe; no licence stated yet (to be MIT)."),
+        "Verdandi's own sidecar, same owner as Eitri; no licence stated yet (to be MIT)."),
     ("npm", "@verdandi/claude-runtime"): (
-        "Verdandi's own runtime package, same owner as neovibe; no licence stated yet (to be MIT)."),
+        "Verdandi's own runtime package, same owner as Eitri; no licence stated yet (to be MIT)."),
     ("npm", "@anthropic-ai/claude-agent-sdk"): (
         "NOT open source. Bundled into the sidecar knowingly (the owner's decision B, 2026-09-19). "
-        "Its own LICENSE.md is reproduced verbatim; neovibe's MIT licence does not and cannot "
+        "Its own LICENSE.md is reproduced verbatim; Eitri's MIT licence does not and cannot "
         "cover it."),
 }
 
-# Workspace members that are NOT neovibe's own MIT code. Every other workspace member is covered by
+# Workspace members that are NOT Eitri's own MIT code. Every other workspace member is covered by
 # LICENSE and left out of this file; these were moved in with a licence of their own, which travels
 # with the binary exactly as a crates.io dependency's does (bottom-terminal spec, decision 4.1).
 WORKSPACE_THIRD_PARTY = {
     "terminal-input": (
         "derived from Alacritty (commit 94e7c8874e526b1e67b349d9ba30ddf81669119e) and Apache-2.0, "
-        "which cannot be relicensed. Moved into neovibe from Verdandi with its LICENSE-APACHE and its "
+        "which cannot be relicensed. Moved into Eitri from Verdandi with its LICENSE-APACHE and its "
         "NOTICE, both reproduced as Apache-2.0 section 4 requires."),
 }
 
 
 def own_code(name, license):
-    """Whether workspace member `name` is neovibe's own code, covered by LICENSE and not listed here.
+    """Whether workspace member `name` is Eitri's own code, covered by LICENSE and not listed here.
     A member declaring anything but MIT (or nothing) must be in WORKSPACE_THIRD_PARTY -- a moved-in
-    crate that kept its own licence must never be skipped as if it were neovibe's."""
+    crate that kept its own licence must never be skipped as if it were Eitri's."""
     if name in WORKSPACE_THIRD_PARTY:
         return False
     if license in (None, "MIT"):
         return True
-    raise Fail(f"workspace member {name} declares {license!r}: not neovibe's MIT, and not in "
+    raise Fail(f"workspace member {name} declares {license!r}: not Eitri's MIT, and not in "
                "WORKSPACE_THIRD_PARTY")
 
 
@@ -365,7 +365,7 @@ def cargo_packages(repo=REPO):
             raise Fail(f"cargo tree names {nv[0]} {nv[1]}, which matches {len(cands)} packages in cargo metadata")
         p = cands[0]
         if p["id"] in workspace and own_code(p["name"], p["license"]):
-            continue  # neovibe's own code: covered by LICENSE, not by this file
+            continue  # Eitri's own code: covered by LICENSE, not by this file
         out.append({
             "eco": "cargo", "name": p["name"], "version": p["version"], "license": p["license"],
             "dir": os.path.dirname(p["manifest_path"]), "source": p["source"] or "",
@@ -457,7 +457,7 @@ def resolve(pkg, by_nv, counts):
             raise Fail(f"an override names {n} {v} but the tree has {ver}; re-check the text and update it")
 
     if eco == "cargo" and name in WORKSPACE_THIRD_PARTY:
-        note = "in neovibe's own repository, under its own licence: " + WORKSPACE_THIRD_PARTY[name]
+        note = "in Eitri's own repository, under its own licence: " + WORKSPACE_THIRD_PARTY[name]
 
     lic = pkg["license"]
     if key in ALLOWLIST:
@@ -1278,17 +1278,17 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
     # LGPL-3.0 4(a): a "prominent notice ... that the Library is used" -- first, in BOTH profiles
     # (spec sec 11.3: "the same sentence is at the top of THIRD-PARTY-LICENSES"; the private/sidecar
     # profile ships the identical statically-linked `shell`, so 4(a) is owed there too).
-    L = [RULE, "neovibe -- third-party licences", RULE, "", nvim_rs_lgpl_notice(nvim_rs["version"]), ""]
+    L = [RULE, "Eitri -- third-party licences", RULE, "", nvim_rs_lgpl_notice(nvim_rs["version"]), ""]
     L += [
-        "neovibe's own code is MIT-licensed: see LICENSE, installed beside this file.",
+        "Eitri's own code is MIT-licensed: see LICENSE, installed beside this file.",
         "",
         "This package also contains other people's code, each part under its own licence,",
-        "reproduced below. MIT covers neovibe's code only; it does not relicense any of this.",
+        "reproduced below. MIT covers Eitri's code only; it does not relicense any of this.",
     ]
     if not no_sidecar:
         L += [
             "",
-            "ONE PART IS NOT OPEN SOURCE. /usr/lib/neovibe/verdandi-claude-sidecar bundles",
+            "ONE PART IS NOT OPEN SOURCE. /usr/lib/eitri/verdandi-claude-sidecar bundles",
             f"@anthropic-ai/claude-agent-sdk {sc['sdk']}, which is (c) Anthropic PBC, all rights",
             "reserved, and whose use is subject to Anthropic's legal agreements. Its licence file is",
             "reproduced verbatim in part 4. The Claude Code CLI itself is NOT included: the sidecar",
@@ -1302,7 +1302,7 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
     for e in copyleft:
         L.append(f"  {e['title']} [{e['license']}]  https://crates.io/crates/{e['name']}/{e['version']}")
     L += [
-        f"neovibe's own source is at {source_url}.",
+        f"Eitri's own source is at {source_url}.",
         "",
         "Libraries this package links dynamically from your system (GTK 4, WebKitGTK, GLib and",
         "their dependencies) are not redistributed here and are not listed.",
@@ -1399,7 +1399,7 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
     L += ["", RULE, "PART 3 -- the agent panel's web bundle (embedded in shell)", RULE, ""]
     render_entries(web, printed, L)
     if not no_sidecar:
-        L += ["", RULE, "PART 4 -- /usr/lib/neovibe/verdandi-claude-sidecar", RULE, ""]
+        L += ["", RULE, "PART 4 -- /usr/lib/eitri/verdandi-claude-sidecar", RULE, ""]
         L += [f"A Node.js single-executable application. Its own --version reports:", ""]
         L += ["  " + l for l in sc["version_text"].splitlines()]
         L += [""]
@@ -1440,19 +1440,19 @@ def neovide_checkout_head(repo):
                                   capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         pass
-    raise Fail("cannot tell the Neovide fork's commit for SOURCE: set NEOVIBE_BUILD_FORK_COMMIT, or run "
+    raise Fail("cannot tell the Neovide fork's commit for SOURCE: set EITRI_BUILD_FORK_COMMIT, or run "
                f"where {d} is its own git checkout")
 
 
 def write_source_notice(path, version, commit, url, skia_archive, skia_sha256, nvim_rs_version, fork_commit):
-    """Write share/licenses/neovibe/SOURCE (spec sec 11.3): the LGPL-3.0 section 4(d)(0) route, with
+    """Write share/licenses/eitri/SOURCE (spec sec 11.3): the LGPL-3.0 section 4(d)(0) route, with
     the modified-nvim-rs relink recipe release.sh proves offline (spec sec 4.2 step 8). `url` is
     printed exactly as given -- this function never derives or guesses a download URL; the caller
     (release.sh, via --source-url) is the one that knows the release's real asset link. `version` is
-    neovibe's own (the `shell` package's) version; `nvim_rs_version` is nvim-rs's, resolved from the
+    Eitri's own (the `shell` package's) version; `nvim_rs_version` is nvim-rs's, resolved from the
     same dependency tree collect() already read rather than assumed. `commit` and `fork_commit` are
     what the shipped `--version` names; a rebuild from the asset (no .git anywhere in it) gets them
-    back only through the two NEOVIBE_BUILD_* lines printed here, which release.sh's proof (a)
+    back only through the two EITRI_BUILD_* lines printed here, which release.sh's proof (a)
     reads out of this file and checks against the shipped binary."""
     lines = [
         nvim_rs_lgpl_notice(nvim_rs_version),
@@ -1477,7 +1477,7 @@ def write_source_notice(path, version, commit, url, skia_archive, skia_sha256, n
         "",
         f"    {url}",
         "",
-        f"for neovibe {version}, built from commit {commit}. That asset contains:",
+        f"for Eitri {version}, built from commit {commit}. That asset contains:",
         "  - this project's source tree at that commit (`git archive`);",
         f"  - the Neovide fork submodule, at its pinned commit {fork_commit};",
         "  - this project's Rust dependencies, vendored (`cargo vendor --locked`), nvim-rs's own",
@@ -1499,8 +1499,8 @@ def write_source_notice(path, version, commit, url, skia_archive, skia_sha256, n
         "from, in this project or in neovide/), set these before building, so `shell --version`",
         "names the same two commits the released binary does:",
         "",
-        f"    NEOVIBE_BUILD_COMMIT={commit}",
-        f"    NEOVIBE_BUILD_FORK_COMMIT={fork_commit}",
+        f"    EITRI_BUILD_COMMIT={commit}",
+        f"    EITRI_BUILD_FORK_COMMIT={fork_commit}",
         "",
         "Relinking against a MODIFIED nvim-rs",
         "-" * 78,
@@ -1605,7 +1605,7 @@ def main(argv):
     if artifact is None:
         artifact = os.path.join(REPO, "dist", "verdandi-claude-sidecar")
 
-    verdandi = os.environ.get("NEOVIBE_VERDANDI_CHECKOUT") or os.path.expanduser("~/src/verdandi")
+    verdandi = os.environ.get("EITRI_VERDANDI_CHECKOUT") or os.path.expanduser("~/src/verdandi")
     try:
         text, summary = collect(repo, binaries_dir, no_sidecar, source_url,
                                  sidecar_artifact=None if no_sidecar else artifact,
@@ -1617,8 +1617,8 @@ def main(argv):
         if source_notice:
             meta = load_metadata(repo)
             version = workspace_package_version(meta, "shell")
-            commit = os.environ.get("NEOVIBE_BUILD_COMMIT") or run(["git", "rev-parse", "HEAD"], repo).strip()
-            fork_commit = os.environ.get("NEOVIBE_BUILD_FORK_COMMIT") or neovide_checkout_head(repo)
+            commit = os.environ.get("EITRI_BUILD_COMMIT") or run(["git", "rev-parse", "HEAD"], repo).strip()
+            fork_commit = os.environ.get("EITRI_BUILD_FORK_COMMIT") or neovide_checkout_head(repo)
             write_source_notice(source_notice, version, commit, source_url, skia_archive, skia_sha256,
                                  summary["nvim_rs_version"], fork_commit)
     except (Fail, OSError, json.JSONDecodeError) as e:

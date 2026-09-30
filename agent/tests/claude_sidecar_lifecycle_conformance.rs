@@ -18,7 +18,7 @@
 //!
 //! **Since R07 (2026-09-27) every session here is gated** -- `INTERACTIVE`, the CLI in `default`,
 //! which is again the path that really runs: the client can no longer ask for anything else, and
-//! the product's bypass is neovibe answering `allow`. So a turn that uses a tool raises a
+//! the product's bypass is Eitri answering `allow`. So a turn that uses a tool raises a
 //! `PermissionRequested`, and `run_turn` answers each one `Allow`, standing in for that answer.
 
 use agent::{
@@ -170,7 +170,7 @@ fn run_turn(
     events
 }
 
-/// Answers every `PermissionRequested` in `events` with `Allow` -- what neovibe's bypass does since
+/// Answers every `PermissionRequested` in `events` with `Allow` -- what Eitri's bypass does since
 /// R07, done here at the provider level because these tests drive the provider directly.
 fn allow_every_request(provider: &ClaudeSidecarProvider, session_id: &str, events: &[AgentDomainEvent]) {
     for event in events {
@@ -407,7 +407,7 @@ fn real_gated_session_runs_a_tool_once_the_host_allows_it() {
     let events = run_turn(
         &provider,
         &session_id,
-        "Run the bash command `echo neovibe_bypass_marker_9f3a` and reply with its exact output.",
+        "Run the bash command `echo eitri_bypass_marker_9f3a` and reply with its exact output.",
         90,
     );
 
@@ -437,7 +437,7 @@ fn real_gated_session_runs_a_tool_once_the_host_allows_it() {
 
     let reply = text_of(&events);
     assert!(
-        reply.contains("neovibe_bypass_marker_9f3a"),
+        reply.contains("eitri_bypass_marker_9f3a"),
         "the model never reported the tool's real output, so the tool result did not reach it. got: {reply:?}"
     );
 

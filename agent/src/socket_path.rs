@@ -23,12 +23,12 @@
 //! clear error where they used to get std's.
 //!
 //! [`in_dir`] is not `#[doc(hidden)]` (removed 2026-09-17, L2 follow-up): it started out as test-
-//! only plumbing -- `agent/tests/` binds through it too -- but `neovibe-core`'s PRODUCT code
+//! only plumbing -- `agent/tests/` binds through it too -- but `eitri-core`'s PRODUCT code
 //! (`pane_switch`, `theme::feed`) now builds every socket path it has through this same function,
 //! so hiding it from the docs would hide the one thing every Mac-bound socket path in this
 //! workspace actually depends on. `tests::every_sock_path_in_this_crate_is_built_here` scans this
 //! crate's own sources so a new construction site here fails a test rather than a Mac;
-//! `neovibe-core/src/socket_path_guard.rs` is the reciprocal scanner, over that crate's own
+//! `eitri-core/src/socket_path_guard.rs` is the reciprocal scanner, over that crate's own
 //! sources, added when L2 T5 put two construction sites there. The two are independent scanners
 //! over two crates, not one shared mechanism -- keep them in step by hand.
 
@@ -54,8 +54,8 @@ pub fn in_dir(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// The legacy backend's per-conversation `PreToolUse` relay socket: `neovibe-hook-<32 hex>.sock`,
-/// 50 bytes of file name (99 under macOS's 49-byte `temp_dir()`). Only in a build with the legacy
+/// The legacy backend's per-conversation `PreToolUse` relay socket: `eitri-hook-<32 hex>.sock`,
+/// 48 bytes of file name (97 under macOS's 49-byte `temp_dir()`). Only in a build with the legacy
 /// backend (`legacy-backend`, spec 2026-09-27-v1-dist-design.md §10, D16), its one user.
 #[cfg(feature = "legacy-backend")]
 pub(crate) fn hook_socket(dir: &Path, conversation_id: uuid::Uuid) -> io::Result<PathBuf> {
@@ -64,17 +64,17 @@ pub(crate) fn hook_socket(dir: &Path, conversation_id: uuid::Uuid) -> io::Result
 
 /// The file-name prefix [`hook_socket`] uses, for code that lists leftover sockets.
 #[cfg(feature = "legacy-backend")]
-pub(crate) const HOOK_SOCKET_PREFIX: &str = "neovibe-hook-";
+pub(crate) const HOOK_SOCKET_PREFIX: &str = "eitri-hook-";
 
-/// One sidecar instance's gRPC socket: `neovibe-sc-<id>.sock`. A hyphenated UUID -- which is what
-/// every caller in this workspace passes -- is written in its 32-hex simple form, 48 bytes of file
-/// name (97 under macOS's `temp_dir()`); any other id is used verbatim and is subject to the check.
+/// One sidecar instance's gRPC socket: `eitri-sc-<id>.sock`. A hyphenated UUID -- which is what
+/// every caller in this workspace passes -- is written in its 32-hex simple form, 46 bytes of file
+/// name (95 under macOS's `temp_dir()`); any other id is used verbatim and is subject to the check.
 pub(crate) fn sidecar_socket(dir: &Path, instance_id: &str) -> io::Result<PathBuf> {
     let id = match uuid::Uuid::parse_str(instance_id) {
         Ok(uuid) => uuid.simple().to_string(),
         Err(_) => instance_id.to_owned(),
     };
-    in_dir(dir, &format!("neovibe-sc-{id}.sock"))
+    in_dir(dir, &format!("eitri-sc-{id}.sock"))
 }
 
 #[cfg(test)]
@@ -153,10 +153,10 @@ mod tests {
     fn a_hyphenated_uuid_instance_id_is_written_in_its_simple_form() {
         let id = uuid::Uuid::new_v4();
         let path = sidecar_socket(Path::new("/t"), &id.to_string()).unwrap();
-        assert_eq!(path, Path::new(&format!("/t/neovibe-sc-{}.sock", id.simple())));
+        assert_eq!(path, Path::new(&format!("/t/eitri-sc-{}.sock", id.simple())));
         assert_eq!(
             sidecar_socket(Path::new("/t"), "abc").unwrap(),
-            Path::new("/t/neovibe-sc-abc.sock")
+            Path::new("/t/eitri-sc-abc.sock")
         );
     }
 
@@ -166,7 +166,7 @@ mod tests {
     /// every entry on the list says why that path is never bound. A new socket path built anywhere
     /// else fails here, on Linux, before it fails `bind` on a Mac.
     ///
-    /// Scoped to this crate only. `neovibe-core/src/socket_path_guard.rs` is the same scan over
+    /// Scoped to this crate only. `eitri-core/src/socket_path_guard.rs` is the same scan over
     /// that crate's sources instead -- a separate scanner, not a shared one, so keep both in step
     /// by hand when either crate's set of socket-building files changes.
     #[test]
@@ -174,7 +174,7 @@ mod tests {
         // (file, a substring of the line) -- each one a path that is never passed to bind/connect.
         const NEVER_BOUND: &[(&str, &str)] = &[
             // Only formats the hook's argv JSON; asserts on the string.
-            ("src/settings.rs", "\"/tmp/neovibe-agent-hook-abc123.sock\""),
+            ("src/settings.rs", "\"/tmp/eitri-agent-hook-abc123.sock\""),
             ("src/settings.rs", "dir.join(\"s.sock\")"),
             ("src/settings.rs", "\"/tmp/a.sock\""),
             ("src/settings.rs", "\"/tmp/b.sock\""),

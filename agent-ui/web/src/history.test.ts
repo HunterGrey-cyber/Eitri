@@ -40,15 +40,15 @@ describe("historyNoticeText", () => {
     expect(
       historyNoticeText(
         notice({
-          source: "neovibe_copy",
+          source: "eitri_copy",
           fallbackReason: "transcript file not found",
           attemptedTranscriptPath: "/home/user/.claude/projects/-home-user-p/7432932d.jsonl",
           writerVersion: null,
-          sourcePath: "/home/user/.local/state/neovibe/history/conv/sess.json",
+          sourcePath: "/home/user/.local/state/eitri/history/conv/sess.json",
         }),
       ),
     ).toBe(
-      "Claude's own transcript was not used (transcript file not found). Showing Neovibe's own copy instead — the two can differ.",
+      "Claude's own transcript was not used (transcript file not found). Showing Eitri's own copy instead — the two can differ.",
     );
   });
 
@@ -58,9 +58,9 @@ describe("historyNoticeText", () => {
      honest answer is both, in that order. Choosing one would break the other invariant silently. */
   it("says both when the fallback copy was also truncated", () => {
     const text = historyNoticeText(
-      notice({ source: "neovibe_copy", fallbackReason: "unknown history format version 2", omittedItems: 7 }),
+      notice({ source: "eitri_copy", fallbackReason: "unknown history format version 2", omittedItems: 7 }),
     );
-    expect(text).toContain("Showing Neovibe's own copy instead");
+    expect(text).toContain("Showing Eitri's own copy instead");
     expect(text).toContain("7 earlier records were not loaded");
   });
 

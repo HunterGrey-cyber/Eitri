@@ -59,7 +59,7 @@ pub enum KeyError {
         action: String,
         source: Source,
     },
-    /// Not bound by neovibe, but stock tmux binds it after its prefix: kept free.
+    /// Not bound by Eitri, but stock tmux binds it after its prefix: kept free.
     StockTmux {
         panel: String,
         key: char,
@@ -78,7 +78,7 @@ impl fmt::Display for KeyError {
         match self {
             KeyError::Malformed { panel, key } => write!(
                 f,
-                "neovibe.panel.register{{ id = {panel:?}, key = {key:?} }}: a key is one character, not a space"
+                "eitri.panel.register{{ id = {panel:?}, key = {key:?} }}: a key is one character, not a space"
             ),
             KeyError::Bound {
                 panel,
@@ -88,17 +88,17 @@ impl fmt::Display for KeyError {
                 source,
             } => write!(
                 f,
-                "neovibe.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is bound after {prefix} to \
+                "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is bound after {prefix} to \
                  {action} ({source})"
             ),
             KeyError::StockTmux { panel, key, command } => write!(
                 f,
-                "neovibe.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is stock tmux's {command} \
-                 after its prefix, kept free for neovibe"
+                "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is stock tmux's {command} \
+                 after its prefix, kept free for Eitri"
             ),
             KeyError::Taken { panel, key, by } => write!(
                 f,
-                "neovibe.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is already {by:?}'s key"
+                "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is already {by:?}'s key"
             ),
             KeyError::ShiftOfBuiltIn { panel, key } => {
                 let lower = key.to_ascii_lowercase();
@@ -110,13 +110,13 @@ impl fmt::Display for KeyError {
                 };
                 write!(
                     f,
-                    "neovibe.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is Shift+'{lower}', and \
-                     after a split key neovibe reads it as '{lower}', {whose} key"
+                    "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is Shift+'{lower}', and \
+                     after a split key Eitri reads it as '{lower}', {whose} key"
                 )
             }
             KeyError::Reserved { panel, key } => write!(
                 f,
-                "neovibe.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is reserved for the canvas"
+                "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is reserved for the canvas"
             ),
         }
     }
@@ -334,7 +334,7 @@ mod tests {
     }
 
     /// Every character the default table binds refuses a Lua panel, so a panel's key can never
-    /// shadow one of neovibe's own (this replaces `shell`'s `every_bound_key_is_reserved_against_lua_panels`).
+    /// shadow one of Eitri's own (this replaces `shell`'s `every_bound_key_is_reserved_against_lua_panels`).
     #[test]
     fn every_character_the_effective_table_binds_refuses_a_lua_panel() {
         let keymap = Keymap::defaults();
@@ -365,8 +365,8 @@ mod tests {
     }
 
     #[test]
-    fn a_stock_tmux_key_neovibe_does_not_bind_stays_reserved() {
-        // `[` and `PPage` are stock tmux's `copy-mode`/`copy-mode -u`, and neovibe now binds both
+    fn a_stock_tmux_key_eitri_does_not_bind_stays_reserved() {
+        // `[` and `PPage` are stock tmux's `copy-mode`/`copy-mode -u`, and Eitri now binds both
         // itself (P5) -- so a Lua panel taking either fails `Bound`, not `StockTmux`; see
         // `every_character_the_effective_table_binds_refuses_a_lua_panel`. `;` and `o`
         // (`last-pane`, `select-pane -t :.+`) went the same way in v1 picks (2026-09-29); `q`
@@ -390,7 +390,7 @@ mod tests {
         }
     }
 
-    /// A key the user freed from neovibe's table is still stock tmux's (`f`), or a module key (`e`).
+    /// A key the user freed from Eitri's table is still stock tmux's (`f`), or a module key (`e`).
     #[test]
     fn a_key_deleted_from_the_table_is_still_refused_for_the_other_reasons() {
         let del = |k: &str| KeymapOp::Del {

@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=neovibe
+Name=Eitri
 Comment=Neovim, embedded, with a Claude agent panel
-Exec=/usr/bin/neovibe --quiet %f
+Exec=/usr/bin/eitri --quiet %f
 Terminal=false
 Categories=Development;TextEditor;
 MimeType=inode/directory;

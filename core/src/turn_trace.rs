@@ -1,6 +1,6 @@
 //! Where a turn's latency actually goes, from the click to the pixels.
 //!
-//! Off unless `NEOVIBE_AGENT_TRACE=1`. One line per turn, to stderr.
+//! Off unless `EITRI_AGENT_TRACE=1`. One line per turn, to stderr.
 //!
 //! The point is to tell "the model is slow" apart from "our pipeline is slow", which the numbers in
 //! `agent/tests/claude_sidecar_partial_streaming.rs` cannot do: those are measured at the provider
@@ -42,11 +42,11 @@
 use agent::{AgentDomainEvent, ContentKind};
 use std::time::{Duration, Instant};
 
-/// True when `NEOVIBE_AGENT_TRACE=1`. Read once per turn rather than cached in a `static`, so it can
+/// True when `EITRI_AGENT_TRACE=1`. Read once per turn rather than cached in a `static`, so it can
 /// be flipped between runs of a long-lived process without a restart; a turn is far too coarse for
 /// one `std::env::var` to matter.
 fn enabled() -> bool {
-    matches!(std::env::var("NEOVIBE_AGENT_TRACE").as_deref(), Ok("1"))
+    matches!(std::env::var("EITRI_AGENT_TRACE").as_deref(), Ok("1"))
 }
 
 fn ms(duration: Duration) -> f64 {
@@ -89,7 +89,7 @@ impl TurnTrace {
         enabled().then(Self::started_now)
     }
 
-    /// A trace regardless of `NEOVIBE_AGENT_TRACE`, for this crate's tests.
+    /// A trace regardless of `EITRI_AGENT_TRACE`, for this crate's tests.
     pub(crate) fn started_now() -> Self {
         Self {
             submitted_at: Instant::now(),

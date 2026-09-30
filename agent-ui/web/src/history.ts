@@ -64,10 +64,10 @@ export function historyNoticeText(notice: HistoryNotice): string {
   // to read whole), so it is truncation just as much as a positive count is.
   const truncated = notice.omittedItems === null || notice.omittedItems > 0;
   const sentences: string[] = [];
-  if (notice.source === "neovibe_copy") {
+  if (notice.source === "eitri_copy") {
     sentences.push(
       `Claude's own transcript was not used (${notice.fallbackReason ?? "reason unknown"}).` +
-        " Showing Neovibe's own copy instead — the two can differ.",
+        " Showing Eitri's own copy instead — the two can differ.",
     );
   } else if (!truncated) {
     sentences.push("Earlier messages in this session, read from Claude's own transcript.");

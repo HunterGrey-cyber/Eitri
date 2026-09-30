@@ -1,6 +1,6 @@
 //! The prefix (keymap spec, docs/superpowers/specs/2026-09-25-keymap-tabs-panel-design.md §2): stock
-//! tmux's `Ctrl+b` by default, or whatever `init.lua`'s `neovibe.keymap.prefix` set, then one key
-//! looked up in the effective prefix table (`neovibe_core::keymap::Keymap`). The table is data; this
+//! tmux's `Ctrl+b` by default, or whatever `init.lua`'s `eitri.keymap.prefix` set, then one key
+//! looked up in the effective prefix table (`eitri_core::keymap::Keymap`). The table is data; this
 //! file is the state machine tmux runs over it: arm on the prefix, run the key's action, stay in a
 //! 500ms repeat window after a `-r` binding, swallow an unbound key and end the wait, `Esc` cancels.
 //!
@@ -22,8 +22,8 @@ use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 use gtk4::prelude::*;
 
-use neovibe_core::keymap::{Action, KeyName, KeySpec, Keymap};
-use neovibe_core::layout::{Axis, ModuleId, ModuleKeys, ModuleKind};
+use eitri_core::keymap::{Action, KeyName, KeySpec, Keymap};
+use eitri_core::layout::{Axis, ModuleId, ModuleKeys, ModuleKind};
 
 /// tmux's default `repeat-time`.
 pub(crate) const REPEAT_TIME: Duration = Duration::from_millis(500);
@@ -412,8 +412,8 @@ pub(crate) fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neovibe_core::keymap::{KeymapOp, SwapTarget, TextChange};
-    use neovibe_core::layout::Direction;
+    use eitri_core::keymap::{KeymapOp, SwapTarget, TextChange};
+    use eitri_core::layout::Direction;
 
     // Arbitrary, distinct hardware keycodes: a real keyboard never reuses one for two keys.
     const PREFIX: u32 = 56;
@@ -493,7 +493,7 @@ mod tests {
             (
                 Key::_1,
                 ModifierType::ALT_MASK,
-                Action::Even(neovibe_core::layout::Axis::Row),
+                Action::Even(eitri_core::layout::Axis::Row),
             ),
             (Key::F11, ModifierType::empty(), Action::WindowImmersive),
         ] {
@@ -833,8 +833,8 @@ mod tests {
                 key: "l".into(),
                 action: "resize.right".into(),
                 opts: vec![
-                    ("cells".into(), neovibe_core::keymap::OptValue::Int(5)),
-                    ("repeatable".into(), neovibe_core::keymap::OptValue::Bool(true)),
+                    ("cells".into(), eitri_core::keymap::OptValue::Int(5)),
+                    ("repeatable".into(), eitri_core::keymap::OptValue::Bool(true)),
                 ],
             },
             KeymapOp::Set {

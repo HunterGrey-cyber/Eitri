@@ -4,7 +4,7 @@
 //! **Why.** GDK's frame clock is one clock for the whole toplevel: a WebKit frame the panel causes
 //! delays the editor's next frame by up to one refresh, so a key pressed within ~8 ms of a panel
 //! frame lands two refreshes late (`the private review notes`).
-//! neovibe has no API to start a cycle early; the lever is to cause fewer, better-spaced panel
+//! Eitri has no API to start a cycle early; the lever is to cause fewer, better-spaced panel
 //! cycles while the user types.
 //!
 //! **What.** While the editor holds the keys AND a key was pressed in it within [`TYPING_WINDOW`],
@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use agent::AgentDomainEvent;
 
-/// The config key (`init.lua`: `neovibe.config.set("agent.typing_cadence_hz", "5")`).
+/// The config key (`init.lua`: `eitri.config.set("agent.typing_cadence_hz", "5")`).
 pub const CADENCE_KEY: &str = "agent.typing_cadence_hz";
 
 /// Pushes per second while typing when `init.lua` says nothing. 5 by the owner's selection rule
@@ -69,7 +69,7 @@ pub fn parse_config(value: Option<&str>) -> Result<Option<u32>, String> {
     match text.parse::<u32>() {
         Ok(hz) if CADENCE_HZ_RANGE.contains(&hz) => Ok(Some(hz)),
         _ => Err(format!(
-            "neovibe.config.set(\"{CADENCE_KEY}\", {raw:?}): must be a whole number from {} to {} \
+            "eitri.config.set(\"{CADENCE_KEY}\", {raw:?}): must be a whole number from {} to {} \
              (panel updates per second while typing in the editor) or \"off\"",
             CADENCE_HZ_RANGE.start(),
             CADENCE_HZ_RANGE.end(),
@@ -326,20 +326,20 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
         let lua = mlua::Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let store = Rc::new(RefCell::new(ConfigStore::default()));
-        install(&lua, &neovibe, store.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
         for (script, expected) in [
-            (r#"neovibe.config.set("agent.typing_cadence_hz", "5")"#, Ok(Some(5))),
+            (r#"eitri.config.set("agent.typing_cadence_hz", "5")"#, Ok(Some(5))),
             // A Lua number is stored as its text.
-            (r#"neovibe.config.set("agent.typing_cadence_hz", 12)"#, Ok(Some(12))),
-            (r#"neovibe.config.set("agent.typing_cadence_hz", "off")"#, Ok(None)),
+            (r#"eitri.config.set("agent.typing_cadence_hz", 12)"#, Ok(Some(12))),
+            (r#"eitri.config.set("agent.typing_cadence_hz", "off")"#, Ok(None)),
         ] {
             lua.load(script).exec().unwrap();
             assert_eq!(parse_config(store.borrow().get(CADENCE_KEY)), expected, "{script}");
         }
-        lua.load(r#"neovibe.config.set("agent.typing_cadence_hz", 0)"#)
+        lua.load(r#"eitri.config.set("agent.typing_cadence_hz", 0)"#)
             .exec()
             .unwrap();
         assert!(parse_config(store.borrow().get(CADENCE_KEY)).is_err());

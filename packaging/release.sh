@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# packaging/release.sh -- build one neovibe release inside the pinned build container.
+# packaging/release.sh -- build one Eitri release inside the pinned build container.
 #
 #   packaging/release.sh <version> --source <public clone> (--sign KEY | --unsigned)
 #                        [--release-signers FILE] [--out DIR] [--rehearsal] [--verdandi-mirror DIR]
@@ -21,7 +21,7 @@
 #                          clone's packaging/release-signers, with a warning. Once that file holds a
 #                          key, --sign's key must be listed there too, and SHA256SUMS.sig must
 #                          verify against both files
-#   --out DIR              the release root (default ~/.cache/neovibe-release). The assets land in
+#   --out DIR              the release root (default ~/.cache/eitri-release). The assets land in
 #                          DIR/v<version>/; logs in DIR/logs/, the build tree in DIR/work/ (kept),
 #                          caches in DIR/{cargo,target,npm,skia,verdandi.git}
 #   --rehearsal            a trial run (release candidates, --unsigned only): writes DIR/v<version>-
@@ -52,11 +52,11 @@ set -euo pipefail
 
 RS_GTK_FLOOR=4.14
 RS_GLIBC_FLOOR=2.39
-RS_SIGN_NAMESPACE=neovibe-release
-RS_SIGN_IDENTITY=release@neovibe
-RS_PUBLIC_REPO=https://github.com/HunterGrey-cyber/neovibe
-RS_IMAGE_REPO=neovibe-release-build
-RS_BINARIES=(shell neovibe-supervisor neovibe-tmux-shim neovibe-claude-handoff)
+RS_SIGN_NAMESPACE=eitri-release
+RS_SIGN_IDENTITY=release@eitri
+RS_PUBLIC_REPO=https://github.com/HunterGrey-cyber/eitri
+RS_IMAGE_REPO=eitri-release-build
+RS_BINARIES=(shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff)
 RS_VERSION_ERE='^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
 RS_LEGACY_MESSAGE='the legacy backend is not in this build'
 # The public identity every public commit carries (publish/commit.sh commits as it, publish/tag.sh
@@ -176,8 +176,8 @@ write_sums() {
 # when known; a rehearsal carries REHEARSAL=1.
 write_release() {
 	{
-		echo "NEOVIBE_VERSION=$RS_VERSION"
-		echo "NEOVIBE_COMMIT=$RS_COMMIT"
+		echo "EITRI_VERSION=$RS_VERSION"
+		echo "EITRI_COMMIT=$RS_COMMIT"
 		echo "NEOVIDE_FORK_COMMIT=$RS_FORK_COMMIT"
 		echo "VERDANDI_REV=$RS_VERDANDI_REV"
 		echo "VERDANDI_SOURCE=verdandi-${RS_VERDANDI_REV:0:7}-source.tar.gz"
@@ -227,7 +227,7 @@ verdandi_fetch_public() {
 }
 
 source_asset_url() {
-	printf '%s\n' "$RS_PUBLIC_REPO/releases/download/v$1/neovibe-$1-source.tar.gz"
+	printf '%s\n' "$RS_PUBLIC_REPO/releases/download/v$1/eitri-$1-source.tar.gz"
 }
 
 # public_commits_check CLONE: F7 (whole-branch review). CLONE's HEAD is the commit this run releases,
@@ -239,7 +239,7 @@ source_asset_url() {
 # publish/tag.sh makes before it tags. The public repo's branches are read from it (git ls-remote
 # RS_PUBLIC_REPO.git), never from CLONE's own refs/remotes/origin/*: in a clone of a local clone those
 # already hold the commits the public repo lacks, and the scan then read nothing (fix round 1). A
-# public tip CLONE lacks excludes nothing, so the scan reads more, never less. NEOVIBE_PUBLIC_REPO_URL
+# public tip CLONE lacks excludes nothing, so the scan reads more, never less. EITRI_PUBLIC_REPO_URL
 # reads the branches from another URL instead, for tests, with a warning.
 #
 # A replacement object (git replace, under refs/replace/ or wherever GIT_REPLACE_REF_BASE points)
@@ -256,8 +256,8 @@ public_commits_check() {
 	ident="$(git -C "$1" log -1 --format='%an <%ae>|%cn <%ce>' HEAD)" || die "cannot read $1's HEAD commit"
 	[ "$ident" = "$RS_PUBLIC_NAME <$RS_PUBLIC_EMAIL>|$RS_PUBLIC_NAME <$RS_PUBLIC_EMAIL>" ] \
 		|| die "$1's HEAD is authored|committed as '$ident', not the public identity $RS_PUBLIC_NAME <$RS_PUBLIC_EMAIL> publish/commit.sh commits with: a release publishes that commit as it is"
-	url="${NEOVIBE_PUBLIC_REPO_URL:-$RS_PUBLIC_REPO.git}"
-	[ "$url" = "$RS_PUBLIC_REPO.git" ] || warn "reading the public repo's branches from $url (NEOVIBE_PUBLIC_REPO_URL, for tests), not $RS_PUBLIC_REPO.git"
+	url="${EITRI_PUBLIC_REPO_URL:-$RS_PUBLIC_REPO.git}"
+	[ "$url" = "$RS_PUBLIC_REPO.git" ] || warn "reading the public repo's branches from $url (EITRI_PUBLIC_REPO_URL, for tests), not $RS_PUBLIC_REPO.git"
 	refs="$(GIT_TERMINAL_PROMPT=0 git -C "$1" ls-remote "$url")" \
 		|| die "cannot read the branches of $url: the commits new to the public repo, which are the ones scanned, are read from it, never from $1's own refs/remotes/origin/*"
 	while IFS=$'\t' read -r sha ref; do
@@ -277,7 +277,7 @@ public_commits_check() {
 	[ -z "$new" ] || count="$(printf '%s\n' "$new" | wc -l)"
 	say "$url has${tips:- no branches}; $count commit(s) reachable from HEAD or main are new to it -- scanning those and HEAD"
 	mkdir -p -- "${XDG_CACHE_HOME:-$HOME/.cache}"
-	dump="$(mktemp "${XDG_CACHE_HOME:-$HOME/.cache}/neovibe-release-commits.XXXXXX")"
+	dump="$(mktemp "${XDG_CACHE_HOME:-$HOME/.cache}/eitri-release-commits.XXXXXX")"
 	if ! { printf '%s\n' "$head"; [ -z "$new" ] || printf '%s\n' "$new"; } | awk '!seen[$0]++' \
 		| git -C "$1" cat-file --batch > "$dump"; then
 		rm -f -- "$dump"
@@ -516,7 +516,7 @@ preflight() {
 # prepare_dirs: the release root and everything under it (M11). A finished release is never
 # overwritten; a partial one (no SHA256SUMS) is cleared and rebuilt.
 prepare_dirs() {
-	local root="${RS_OUT:-$HOME/.cache/neovibe-release}"
+	local root="${RS_OUT:-$HOME/.cache/eitri-release}"
 	mkdir -p -- "$root"
 	RS_ROOT="$(realpath "$root")"
 	case "$RS_ROOT" in /tmp|/tmp/*) die "--out must not be under /tmp (a small shared tmpfs)" ;; esac
@@ -581,7 +581,7 @@ phase_f() {
 		warn "rehearsal: the public Verdandi revision comes from $RS_VERDANDI_MIRROR, not $RS_VERDANDI_URL"
 	fi
 	step "phase F (network on): copy, cargo fetch, npm ci, the Skia and nvim downloads, the public Verdandi"
-	ctr_run "neovibe-release-f-$$" "$RS_LOGS/phase-f.log" \
+	ctr_run "eitri-release-f-$$" "$RS_LOGS/phase-f.log" \
 		--mount "type=bind,src=$RS_SOURCE,dst=/src,readonly" \
 		--mount "type=bind,src=$RS_WORK/src,dst=/build/src" \
 		--mount "type=bind,src=$RS_WORK/check,dst=/build/check" \
@@ -596,7 +596,7 @@ phase_f() {
 
 phase_b() {
 	step "phase B (--network none): build, check, package, assemble, check the extracted assets"
-	ctr_run "neovibe-release-b-$$" "$RS_LOGS/phase-b.log" --network none \
+	ctr_run "eitri-release-b-$$" "$RS_LOGS/phase-b.log" --network none \
 		--mount "type=bind,src=$RS_WORK/src,dst=/build/src" \
 		--mount "type=bind,src=$RS_WORK/stage,dst=/build/stage" \
 		--mount "type=bind,src=$RS_WORK/check,dst=/build/check" \
@@ -612,9 +612,9 @@ phase_b() {
 }
 
 proof() {
-	local asset="neovibe-$RS_VERSION-source.tar.gz"
+	local asset="eitri-$RS_VERSION-source.tar.gz"
 	step "the proof (--network none, empty CARGO_HOME, fresh target, npm stubbed to fail): offline rebuild, then SOURCE's relink recipe"
-	ctr_run "neovibe-release-p-$$" "$RS_LOGS/proof.log" --network none \
+	ctr_run "eitri-release-p-$$" "$RS_LOGS/proof.log" --network none \
 		--mount "type=bind,src=$RS_REL/$asset,dst=/asset/$asset,readonly" \
 		--mount "type=bind,src=$RS_PROOF,dst=/proof" \
 		--mount "type=bind,src=$RS_LOGS,dst=/build/logs" \
@@ -638,7 +638,7 @@ host_scans() {
 		python3 "$RS_SOURCE/packaging/release_check.py" make-scan-view "$RS_WORK/check/x/$name" "$RS_WORK/scan/$name"
 	done
 	python3 "$RS_SOURCE/packaging/release_check.py" make-scan-view \
-		"$RS_WORK/check/x/source/neovibe-$RS_VERSION-source" "$RS_WORK/scan/source"
+		"$RS_WORK/check/x/source/eitri-$RS_VERSION-source" "$RS_WORK/scan/source"
 	mkdir -p -- "$RS_WORK/scan/assets"
 	cp -- "$RS_REL/install.sh" "$RS_REL/RELEASE" "$RS_WORK/scan/assets/"
 	for view in "$RS_WORK/scan"/*; do
@@ -674,7 +674,7 @@ fill_notes() {
 built into it. To check it by hand, against the key in the repository's
 `packaging/release-signers`:
 
-    ssh-keygen -Y verify -f release-signers -I release@neovibe -n neovibe-release -s SHA256SUMS.sig < SHA256SUMS
+    ssh-keygen -Y verify -f release-signers -I release@eitri -n eitri-release -s SHA256SUMS.sig < SHA256SUMS
 NV_VERIFY
 )"
 		verify_section_zh="$(cat <<'NV_VERIFY_ZH'
@@ -682,7 +682,7 @@ NV_VERIFY
 
 `SHA256SUMS` 已签名（`SHA256SUMS.sig`）：`install.sh` 会自行验证签名，使用内置的发布密钥。如果想手动核对，可对照仓库中的 `packaging/release-signers`：
 
-    ssh-keygen -Y verify -f release-signers -I release@neovibe -n neovibe-release -s SHA256SUMS.sig < SHA256SUMS
+    ssh-keygen -Y verify -f release-signers -I release@eitri -n eitri-release -s SHA256SUMS.sig < SHA256SUMS
 NV_VERIFY_ZH
 )"
 	elif signers_has_key "$RS_SOURCE/packaging/release-signers"; then
@@ -719,7 +719,7 @@ NV_VERIFY_ZH
 )"
 	fi
 	sed -e "s|@VERSION@|$RS_VERSION|g" -e "s|@COMMIT@|$RS_COMMIT|g" -e "s|@NVIM_RS_VERSION@|$nvim_rs|g" \
-		-e "s|@SOURCE_ASSET@|neovibe-$RS_VERSION-source.tar.gz|g" \
+		-e "s|@SOURCE_ASSET@|eitri-$RS_VERSION-source.tar.gz|g" \
 		-e "s|@VERDANDI_ASSET@|verdandi-${RS_VERDANDI_REV:0:7}-source.tar.gz|g" \
 		-e "s|@VERDANDI_REV@|$RS_VERDANDI_REV|g" \
 		"$RS_SOURCE/packaging/release-notes.md.in" > "$notes.tmp"
@@ -739,7 +739,7 @@ host_main() {
 	trap cleanup_containers EXIT
 	trap 'cleanup_containers; exit 130' INT TERM
 	local started=$SECONDS names=() name
-	say "releasing neovibe $RS_VERSION from $RS_SOURCE at $RS_COMMIT (neovide $RS_FORK_COMMIT, Verdandi $RS_VERDANDI_REV) into $RS_REL"
+	say "releasing Eitri $RS_VERSION from $RS_SOURCE at $RS_COMMIT (neovide $RS_FORK_COMMIT, Verdandi $RS_VERDANDI_REV) into $RS_REL"
 	build_image
 	phase_f
 	phase_b
@@ -765,7 +765,7 @@ host_main() {
 	local gh_line paths=()
 	for name in "${names[@]}"; do paths+=("$RS_REL/$name"); done
 	gh_line="$(python3 "$RS_SOURCE/packaging/release_check.py" gh-release-command "$RS_VERSION" \
-		--repo "${RS_PUBLIC_REPO#https://github.com/}" --title "neovibe $RS_VERSION" --notes-file "$RS_NOTES" \
+		--repo "${RS_PUBLIC_REPO#https://github.com/}" --title "Eitri $RS_VERSION" --notes-file "$RS_NOTES" \
 		"${paths[@]}")"
 	echo
 	if [ "$RS_NO_LEAK_SCAN" = 1 ]; then
@@ -776,7 +776,7 @@ host_main() {
 		[ -n "$RS_NVIM_VERSION" ] || echo "REHEARSAL -- RELEASE has no NVIM_VERSION/NVIM_SHA256_linux_x86_64: pins.env has no nvim pin yet."
 		[ -z "$RS_VERDANDI_MIRROR" ] || echo "REHEARSAL -- Verdandi $RS_VERDANDI_REV was read from $RS_VERDANDI_MIRROR, not its public URL."
 	fi
-	echo "neovibe $RS_VERSION is in $RS_REL ($(( (SECONDS - started) / 60 )) min); logs in $RS_LOGS."
+	echo "Eitri $RS_VERSION is in $RS_REL ($(( (SECONDS - started) / 60 )) min); logs in $RS_LOGS."
 	echo "The rest is by hand (spec sec 4.4), in this order -- this script runs none of it:"
 	echo "  publish/tag.sh $RS_SOURCE $RS_REL"
 	echo "  git -C $RS_SOURCE push origin HEAD:main"
@@ -795,13 +795,13 @@ ctr_env() {
 	export CARGO_NET_GIT_FETCH_WITH_CLI=true
 	export npm_config_cache=/build/npm
 	export npm_config_update_notifier=false
-	export NEOVIBE_BUILD_COMMIT="$RS_COMMIT"
+	export EITRI_BUILD_COMMIT="$RS_COMMIT"
 	# "A release always rebuilds clean" (v1-dist plan Task 6, P4-A1): shell/build.rs's own npm ci +
 	# npm run build run unconditionally, never trusting a fingerprint (or a node_modules/) left over
 	# from an earlier, unrelated build in this tree. Shared by phase F and phase B via this function;
 	# ctr_proof deliberately does not call ctr_env and so never sets this -- its whole point is
 	# proving the source asset's offline rebuild reaches no npm at all.
-	export NEOVIBE_WEB_CLEAN_BUILD=1
+	export EITRI_WEB_CLEAN_BUILD=1
 	umask 022
 }
 
@@ -819,7 +819,7 @@ ctr_fetch_pinned() {
 # $RS_ROOT/target is kept across runs, and cargo takes a path crate as fresh when none of its sources
 # is newer than its last build there: a tree checked out before some later build in the same --out
 # root would ship that build's code under this commit's RELEASE, and proof (a) could not tell, since
-# --version comes from NEOVIBE_BUILD_COMMIT. Touched, every path crate rebuilds; registry and git
+# --version comes from EITRI_BUILD_COMMIT. Touched, every path crate rebuilds; registry and git
 # crates are keyed by version and stay cached.
 ctr_copy_source() {
 	cp -a "$1/." "$2/"
@@ -886,7 +886,7 @@ ctr_phase_b() {
 	[ "$RS_FORK_COMMIT" = "$(git ls-tree HEAD neovide | awk '{ print $3 }')" ] || ctr_die "neovide is not at its recorded commit"
 	# The same value shell/build.rs would read from neovide/'s own checkout here, set explicitly so
 	# collect-licenses.py prints it in SOURCE for a rebuild from the asset, which has no .git.
-	export NEOVIBE_BUILD_FORK_COMMIT="$RS_FORK_COMMIT"
+	export EITRI_BUILD_FORK_COMMIT="$RS_FORK_COMMIT"
 	local sde skia_url out=/build/out logs=/build/logs b rc7="${RS_VERDANDI_REV:0:7}"
 	sde="$(git log -1 --format=%ct HEAD)"
 	skia_url="file:///build/skia/$RS_SKIA_ARCHIVE"
@@ -947,31 +947,31 @@ ctr_phase_b() {
 	for b in "${RS_BINARIES[@]}"; do install -m 0755 "$CARGO_TARGET_DIR/release/$b" "$st/target/release/$b"; done
 	chmod 0644 "$st/dist/RELEASE" "$st/dist/THIRD-PARTY-LICENSES" "$st/dist/SOURCE"
 	install -m 0755 packaging/install.sh "$st/packaging/install.sh"
-	install -m 0755 packaging/neovibe.launcher.sh "$st/packaging/neovibe.launcher.sh"
-	install -m 0644 packaging/neovibe.desktop "$st/packaging/neovibe.desktop"
+	install -m 0755 packaging/eitri.launcher.sh "$st/packaging/eitri.launcher.sh"
+	install -m 0644 packaging/eitri.desktop "$st/packaging/eitri.desktop"
 	# The .deb's AppArmor profile (nfpm-public.yaml's `packager: deb` entry).
-	install -D -m 0644 packaging/apparmor/neovibe "$st/packaging/apparmor/neovibe"
+	install -D -m 0644 packaging/apparmor/eitri "$st/packaging/apparmor/eitri"
 	install -m 0644 LICENSE "$st/LICENSE"
 	install -m 0644 packaging/nfpm-public.yaml "$st/nfpm-public.yaml"
-	(cd "$st" && VERSION="$RS_VERSION" NEOVIBE_SOURCE_URL="$(source_asset_url "$RS_VERSION")" \
-		nfpm pkg --config nfpm-public.yaml --packager deb --target "$out/neovibe_${RS_VERSION}_amd64.deb")
-	(cd "$st" && VERSION="$RS_VERSION" NEOVIBE_SOURCE_URL="$(source_asset_url "$RS_VERSION")" \
-		nfpm pkg --config nfpm-public.yaml --packager rpm --target "$out/neovibe-${RS_VERSION}-1.x86_64.rpm")
-	local tt="neovibe-$RS_VERSION-x86_64-linux" tb=/build/check/tarball-tree
+	(cd "$st" && VERSION="$RS_VERSION" EITRI_SOURCE_URL="$(source_asset_url "$RS_VERSION")" \
+		nfpm pkg --config nfpm-public.yaml --packager deb --target "$out/eitri_${RS_VERSION}_amd64.deb")
+	(cd "$st" && VERSION="$RS_VERSION" EITRI_SOURCE_URL="$(source_asset_url "$RS_VERSION")" \
+		nfpm pkg --config nfpm-public.yaml --packager rpm --target "$out/eitri-${RS_VERSION}-1.x86_64.rpm")
+	local tt="eitri-$RS_VERSION-x86_64-linux" tb=/build/check/tarball-tree
 	rm -rf "$tb"; mkdir -p "$tb/$tt"
-	install -D -m 0755 "$st/packaging/neovibe.launcher.sh" "$tb/$tt/bin/neovibe"
-	for b in "${RS_BINARIES[@]}"; do install -D -m 0755 "$st/target/release/$b" "$tb/$tt/lib/neovibe/$b"; done
-	install -D -m 0755 "$st/packaging/install.sh" "$tb/$tt/lib/neovibe/neovibe-setup"
-	install -D -m 0644 "$st/dist/RELEASE" "$tb/$tt/lib/neovibe/RELEASE"
-	install -D -m 0644 "$st/packaging/neovibe.desktop" "$tb/$tt/share/applications/neovibe.desktop"
-	install -D -m 0644 "$st/LICENSE" "$tb/$tt/share/licenses/neovibe/LICENSE"
-	install -D -m 0644 "$st/dist/THIRD-PARTY-LICENSES" "$tb/$tt/share/licenses/neovibe/THIRD-PARTY-LICENSES"
-	install -D -m 0644 "$st/dist/SOURCE" "$tb/$tt/share/licenses/neovibe/SOURCE"
+	install -D -m 0755 "$st/packaging/eitri.launcher.sh" "$tb/$tt/bin/eitri"
+	for b in "${RS_BINARIES[@]}"; do install -D -m 0755 "$st/target/release/$b" "$tb/$tt/lib/eitri/$b"; done
+	install -D -m 0755 "$st/packaging/install.sh" "$tb/$tt/lib/eitri/eitri-setup"
+	install -D -m 0644 "$st/dist/RELEASE" "$tb/$tt/lib/eitri/RELEASE"
+	install -D -m 0644 "$st/packaging/eitri.desktop" "$tb/$tt/share/applications/eitri.desktop"
+	install -D -m 0644 "$st/LICENSE" "$tb/$tt/share/licenses/eitri/LICENSE"
+	install -D -m 0644 "$st/dist/THIRD-PARTY-LICENSES" "$tb/$tt/share/licenses/eitri/THIRD-PARTY-LICENSES"
+	install -D -m 0644 "$st/dist/SOURCE" "$tb/$tt/share/licenses/eitri/SOURCE"
 	find "$tb/$tt" -exec touch -h -d "@$sde" {} +
 	ctr_tar "$tt" "$tb" "$out/$tt.tar.gz"
 
-	step "the neovibe source asset (spec sec 11.3): git archive, neovide, vendor/, proto/, the web bundle, Skia"
-	local sa="neovibe-$RS_VERSION-source" sd=/build/check/source-tree
+	step "the Eitri source asset (spec sec 11.3): git archive, neovide, vendor/, proto/, the web bundle, Skia"
+	local sa="eitri-$RS_VERSION-source" sd=/build/check/source-tree
 	rm -rf "$sd"; mkdir -p "$sd/$sa/neovide"
 	git archive --format=tar HEAD | tar -x -C "$sd/$sa"
 	git -C neovide archive --format=tar HEAD | tar -x -C "$sd/$sa/neovide"
@@ -997,10 +997,10 @@ ctr_phase_b() {
 	rm -rf /build/check/x
 	python3 packaging/release_check.py check-assets "$out" /build/check/x "$RS_VERSION" "$RS_VERDANDI_REV" \
 		/build/src /build/verdandi "$RS_SKIA_ARCHIVE" "$RS_SKIA_SHA256"
-	local shell_bin="/build/check/x/tarball/$tt/lib/neovibe/shell" want got rc
+	local shell_bin="/build/check/x/tarball/$tt/lib/eitri/shell" want got rc
 	nm -C "$shell_bin" > "$logs/extracted-shell.nm"
 	python3 packaging/release_check.py check-legacy-symbols "$logs/extracted-shell.nm"
-	want="neovibe $RS_VERSION (commit ${RS_COMMIT:0:12}, neovide fork ${RS_FORK_COMMIT:0:7}, verdandi $rc7)"
+	want="eitri $RS_VERSION (commit ${RS_COMMIT:0:12}, neovide fork ${RS_FORK_COMMIT:0:7}, verdandi $rc7)"
 	got="$(env -i PATH=/usr/bin:/bin HOME=/home/builder "$shell_bin" --version)"
 	[ "$got" = "$want" ] || ctr_die "shell --version prints '$got', expected '$want'"
 	echo "$got" > "$logs/version.txt"
@@ -1009,19 +1009,19 @@ ctr_phase_b() {
 		if [ "$how" = flag ]; then
 			got="$(env -i PATH=/usr/bin:/bin HOME=/home/builder "$shell_bin" --legacy 2>&1)" || rc=$?
 		else
-			got="$(env -i PATH=/usr/bin:/bin HOME=/home/builder NEOVIBE_AGENT_BACKEND=legacy "$shell_bin" 2>&1)" || rc=$?
+			got="$(env -i PATH=/usr/bin:/bin HOME=/home/builder EITRI_AGENT_BACKEND=legacy "$shell_bin" 2>&1)" || rc=$?
 		fi
 		[ "$rc" = 1 ] && [[ "$got" == *"$RS_LEGACY_MESSAGE"* ]] \
 			|| ctr_die "the extracted shell with legacy asked for by $how exited $rc without saying '$RS_LEGACY_MESSAGE': $got"
 	done
-	echo "legacy proof: 4 executables built; nm finds no legacy symbol and the sidecar backend; --legacy and NEOVIBE_AGENT_BACKEND=legacy exit 1 with '$RS_LEGACY_MESSAGE'; no agent-hook in any asset" \
+	echo "legacy proof: 4 executables built; nm finds no legacy symbol and the sidecar backend; --legacy and EITRI_AGENT_BACKEND=legacy exit 1 with '$RS_LEGACY_MESSAGE'; no agent-hook in any asset" \
 		> "$logs/legacy-proof.txt"
 	{ rustc -vV; dpkg-query -W; } > "$logs/toolchain.txt"
 	step "phase B done"
 }
 
 ctr_proof() {
-	local asset="neovibe-$RS_VERSION-source" logs=/build/logs marker=/proof/npm-was-called
+	local asset="eitri-$RS_VERSION-source" logs=/build/logs marker=/proof/npm-was-called
 	mkdir -p /proof/stub /proof/cargo-home /proof/target /proof/work
 	[ -z "$(ls -A /proof/cargo-home)" ] || ctr_die "/proof/cargo-home is not empty"
 	[ -z "$(ls -A /proof/target)" ] || ctr_die "/proof/target is not empty"
@@ -1035,13 +1035,13 @@ ctr_proof() {
 	# The build identity comes from SOURCE's own rebuild lines, as it would for anyone rebuilding
 	# the asset (no .git in it, nor in neovide/): the rebuilt --version must then equal the shipped
 	# one phase B checked and wrote to version.txt (whole-branch review, lane D).
-	unset NEOVIBE_BUILD_COMMIT NEOVIBE_BUILD_FORK_COMMIT
+	unset EITRI_BUILD_COMMIT EITRI_BUILD_FORK_COMMIT
 	while IFS='=' read -r name value; do
 		export "$name=$value"
 	done < <(python3 packaging/release_check.py rebuild-env SOURCE)
-	[ "${NEOVIBE_BUILD_COMMIT:-}" = "$RS_COMMIT" ] \
-		|| ctr_die "SOURCE's NEOVIBE_BUILD_COMMIT is '${NEOVIBE_BUILD_COMMIT:-}', not $RS_COMMIT"
-	[ -n "${NEOVIBE_BUILD_FORK_COMMIT:-}" ] || ctr_die "SOURCE gives no NEOVIBE_BUILD_FORK_COMMIT"
+	[ "${EITRI_BUILD_COMMIT:-}" = "$RS_COMMIT" ] \
+		|| ctr_die "SOURCE's EITRI_BUILD_COMMIT is '${EITRI_BUILD_COMMIT:-}', not $RS_COMMIT"
+	[ -n "${EITRI_BUILD_FORK_COMMIT:-}" ] || ctr_die "SOURCE gives no EITRI_BUILD_FORK_COMMIT"
 
 	step "proof (a): the full release command, offline and --locked, from the source asset"
 	SKIA_BINARIES_URL="file://$PWD/skia/$archive" \
@@ -1067,7 +1067,7 @@ ctr_proof() {
 	[ -n "$copy" ] && [ -n "$unlock" ] && [ -n "$build" ] && [ "${#patch[@]}" = 2 ] || ctr_die "cannot read SOURCE's relink recipe"
 	bash -c "$copy"
 	bash -c "$unlock"
-	printf '\n// neovibe release proof: a trivial change (LGPL-3.0 sec 4(d)(0) relink recipe)\npub const NEOVIBE_RELINK_PROOF: u32 = 1;\n' \
+	printf '\n// Eitri release proof: a trivial change (LGPL-3.0 sec 4(d)(0) relink recipe)\npub const EITRI_RELINK_PROOF: u32 = 1;\n' \
 		>> "$modified/src/lib.rs"
 	printf '\n%s\n' "${patch[@]}" >> Cargo.toml
 	bash -c "$build" 2>&1 | tee "$logs/proof-b-build.log"

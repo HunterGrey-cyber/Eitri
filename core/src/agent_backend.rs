@@ -14,7 +14,7 @@
 //! path's state is authoritative because it comes from the server. This enum keeps both callable
 //! from one place without pretending they are the same thing.
 //!
-//! Selected by `NEOVIBE_AGENT_BACKEND=legacy|sidecar`, defaulting to `legacy` until the sidecar
+//! Selected by `EITRI_AGENT_BACKEND=legacy|sidecar`, defaulting to `legacy` until the sidecar
 //! path clears its acceptance criteria.
 
 use agent::{
@@ -36,7 +36,7 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     fork: false,
     interrupt: true,
     // False since R07 (2026-09-27): this backend never starts the CLI in `bypassPermissions` any
-    // more -- it always passes `--permission-mode default` and the hook. Neovibe's bypass is its own
+    // more -- it always passes `--permission-mode default` and the hook. Eitri's bypass is its own
     // `allow` under that gate, which needs only the capability below.
     bypass_permission_mode: false,
     // Its interactive gate is the `PreToolUse` hook relay, which is this backend's primary,
@@ -58,7 +58,7 @@ const _: () = {
         !LEGACY_CAPABILITIES.fork,
         "fork must not be advertised before it works end to end"
     );
-    // R07: every offered mode is honoured through the interactive gate (bypass is neovibe answering
+    // R07: every offered mode is honoured through the interactive gate (bypass is Eitri answering
     // `allow` under it), and this backend never starts the CLI ungated.
     assert!(
         LEGACY_CAPABILITIES.interactive_permission_mode,
@@ -103,7 +103,7 @@ impl BackendKind {
         }
     }
 
-    /// Reads `NEOVIBE_AGENT_BACKEND` and `agent::LEGACY_BACKEND_COMPILED`.
+    /// Reads `EITRI_AGENT_BACKEND` and `agent::LEGACY_BACKEND_COMPILED`.
     ///
     /// `legacy_flag` is `main()`'s own `--legacy`, read the same way it reads `--clean` -- passed
     /// in rather than read here for the same testability reason `explicit` is (see [`choose`]).
@@ -113,13 +113,13 @@ impl BackendKind {
     /// below until this correction. Legacy is now the gated backend (`agent::LEGACY_BACKEND_COMPILED`,
     /// off in every release), so a typo or a missing artifact can no longer land there: both now
     /// select the sidecar, with a warning for the typo (D10). Only an explicit `--legacy` or
-    /// `NEOVIBE_AGENT_BACKEND=legacy` can still select legacy, and only in a build that compiled it
+    /// `EITRI_AGENT_BACKEND=legacy` can still select legacy, and only in a build that compiled it
     /// in -- otherwise `Err` names why. See [`choose`]'s own doc for the resulting matrix.
     ///
     /// [`choose`]: Self::choose
     pub fn from_env(legacy_flag: bool) -> Result<Self, BackendChoiceError> {
         Self::choose(
-            std::env::var("NEOVIBE_AGENT_BACKEND").ok().as_deref().map(str::trim),
+            std::env::var("EITRI_AGENT_BACKEND").ok().as_deref().map(str::trim),
             legacy_flag,
             agent::sidecar_availability(),
             agent::LEGACY_BACKEND_COMPILED,
@@ -137,7 +137,7 @@ impl BackendKind {
     /// (`legacy_compiled = true`) without a `cfg`-gated test module.
     ///
     /// **The matrix (spec §10):**
-    /// - `--legacy` (`legacy_flag`) or `NEOVIBE_AGENT_BACKEND=legacy` (`explicit`) asks for legacy.
+    /// - `--legacy` (`legacy_flag`) or `EITRI_AGENT_BACKEND=legacy` (`explicit`) asks for legacy.
     ///   When `legacy_compiled`, that ask is granted. When it is not (every release build), it is
     ///   `Err` naming [`agent::LEGACY_NOT_IN_BUILD`] and which of the two asked -- the flag wins the
     ///   naming when both are given, because it is a decision made on *this* invocation's command
@@ -151,7 +151,7 @@ impl BackendKind {
     ///   hint when it actually tries to spawn one). `sidecar` ([`agent::SidecarAvailability`]) only
     ///   shapes which sentence this prints -- it is not part of the choice between backends. It was
     ///   a `bool` (`packaged_sidecar_available`) until lane A's whole-branch review, which made the
-    ///   "not installed" sentence appear above a named `NEOVIBE_VERDANDI_CHECKOUT` the spawn was
+    ///   "not installed" sentence appear above a named `EITRI_VERDANDI_CHECKOUT` the spawn was
     ///   about to build; the third value names that case.
     pub fn choose(
         explicit: Option<&str>,
@@ -165,11 +165,11 @@ impl BackendKind {
             }
             // The flag is the more explicit act -- a decision made on this command line -- so it
             // wins the naming when both are somehow given at once (e.g. a launcher's leftover
-            // `NEOVIBE_AGENT_BACKEND=legacy` plus a freshly typed `--legacy`).
+            // `EITRI_AGENT_BACKEND=legacy` plus a freshly typed `--legacy`).
             let asked_via = if legacy_flag {
                 "--legacy"
             } else {
-                "NEOVIBE_AGENT_BACKEND=legacy"
+                "EITRI_AGENT_BACKEND=legacy"
             };
             return Err(BackendChoiceError {
                 message: format!("{asked_via}: {}", agent::LEGACY_NOT_IN_BUILD),
@@ -183,7 +183,7 @@ impl BackendKind {
         if let Some(other) = explicit {
             if other != "sidecar" && !other.is_empty() {
                 eprintln!(
-                    "[agent_backend] NEOVIBE_AGENT_BACKEND={other:?} is not recognized \
+                    "[agent_backend] EITRI_AGENT_BACKEND={other:?} is not recognized \
                      (expected \"legacy\" or \"sidecar\"); using sidecar"
                 );
             }
@@ -195,13 +195,13 @@ impl BackendKind {
             ),
             // Development only: naming a checkout is what authorizes the build (spawn step 2).
             agent::SidecarAvailability::BuildsNamedCheckout => eprintln!(
-                "[agent_backend] using the sidecar backend: NEOVIBE_VERDANDI_CHECKOUT names a \
+                "[agent_backend] using the sidecar backend: EITRI_VERDANDI_CHECKOUT names a \
                  checkout with no sidecar built for this machine, so the first session start \
                  builds it there (npm)"
             ),
             // Said every time, not once: this is the line that explains why the panel's greeting
             // names no session, and a reader who does not see it will look for the reason in the
-            // code. `NO_SIDECAR_HINT` names the way out (`neovibe setup`) because starting the
+            // code. `NO_SIDECAR_HINT` names the way out (`eitri setup`) because starting the
             // sidecar path anyway is about to fail with that identical sentence.
             agent::SidecarAvailability::Missing => {
                 eprintln!("[agent_backend] using the sidecar backend: {}", agent::NO_SIDECAR_HINT)
@@ -211,9 +211,9 @@ impl BackendKind {
     }
 }
 
-/// What [`BackendKind::choose`] returns when `--legacy`/`NEOVIBE_AGENT_BACKEND=legacy` asked for a
+/// What [`BackendKind::choose`] returns when `--legacy`/`EITRI_AGENT_BACKEND=legacy` asked for a
 /// backend this build did not compile in. `message` is a finished, human-readable sentence for
-/// `main()` to print before exiting -- the same contract `neovibe_core::project_root::resolve`'s
+/// `main()` to print before exiting -- the same contract `eitri_core::project_root::resolve`'s
 /// `Result<_, String>` keeps, as a dedicated type here only so the error case cannot be confused
 /// with a real `BackendKind` at the call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,7 +403,7 @@ impl AgentBackend {
         }
     }
 
-    /// Neovibe's own conversation identity. `None` for the legacy backend, which has no concept of
+    /// Eitri's own conversation identity. `None` for the legacy backend, which has no concept of
     /// one -- it never distinguished its three identities in the first place.
     pub fn conversation_id(&self) -> Option<&str> {
         match self {
@@ -725,10 +725,10 @@ impl AgentBackend {
     /// failure than an extra click.
     ///
     /// **In `Bypass` (R07/S2, 2026-09-27), every `PermissionRequested` is answered `Allow` here,
-    /// unconditionally, before the classifier ever runs.** This is neovibe's own definition of
+    /// unconditionally, before the classifier ever runs.** This is Eitri's own definition of
     /// bypass since R07: the CLI itself is never told to skip permissions (it always runs gated,
     /// `--permission-mode default` plus the hook, or the sidecar's INTERACTIVE mode); "bypass" means
-    /// neovibe answers every request `allow` under that gate instead of showing a card. `mode` comes
+    /// Eitri answers every request `allow` under that gate instead of showing a card. `mode` comes
     /// from the caller's `Tab::mode` on every pump -- this function holds no mode of its own, so
     /// nothing here can drift from what the tab set thinks the tab is in. An id already in
     /// `host_answered` (a duplicate delivery of a request already allowed, e.g. after a resync) is
@@ -1284,7 +1284,7 @@ fn client_implements_resume(kind: BackendKind) -> bool {
     }
 }
 
-/// One picker row's title: the CLI's own, then Neovibe's own, then none (design §3.1.3's
+/// One picker row's title: the CLI's own, then Eitri's own, then none (design §3.1.3's
 /// Amendment ②, the owner's ruling of 2026-09-20).
 ///
 /// The layering is **display only**. `session` is a value on its way to the frontend; nothing here
@@ -1360,7 +1360,7 @@ impl BackendGreeting {
     /// than 16 -- that doc explains the extra one). Measured at 1.74 ms hot and 5.92 ms cold over
     /// this machine's 16 largest sessions.
     /// **It must stay a fixed-size read**: parsing those files whole would swap a bounded read of
-    /// Neovibe's own records for one that grows with a file this project neither writes nor knows a
+    /// Eitri's own records for one that grows with a file this project neither writes nor knows a
     /// bound for, and it would do it here, on the loop that draws the editor.
     pub fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
         // Keyed on the CANONICAL directory, matching what `AgentConversation` persists -- otherwise
@@ -1482,7 +1482,7 @@ mod tests {
         }
     }
 
-    /// A release build (legacy not compiled in) refuses `--legacy` and `NEOVIBE_AGENT_BACKEND=legacy`
+    /// A release build (legacy not compiled in) refuses `--legacy` and `EITRI_AGENT_BACKEND=legacy`
     /// alike, `Err` naming `LEGACY_NOT_IN_BUILD` and which of the two asked -- and the refusal does
     /// not depend on whether a sidecar artifact happens to be installed.
     #[test]
@@ -1493,14 +1493,14 @@ mod tests {
 
         let by_var = BackendKind::choose(Some("legacy"), false, Runnable, false).unwrap_err();
         assert!(by_var.message.contains(agent::LEGACY_NOT_IN_BUILD), "{by_var:?}");
-        assert!(by_var.message.contains("NEOVIBE_AGENT_BACKEND=legacy"), "{by_var:?}");
+        assert!(by_var.message.contains("EITRI_AGENT_BACKEND=legacy"), "{by_var:?}");
 
         // Not "an artifact happens to be missing" -- it refuses with one available too, above.
         assert!(BackendKind::choose(None, true, Missing, false).is_err());
     }
 
     /// A development build (legacy compiled in) grants `--legacy` regardless of the environment,
-    /// and the flag beats a conflicting `NEOVIBE_AGENT_BACKEND=sidecar` -- it is the more explicit
+    /// and the flag beats a conflicting `EITRI_AGENT_BACKEND=sidecar` -- it is the more explicit
     /// act, made on this invocation's own command line, where the env var could be an inherited
     /// leftover nobody meant to set today.
     #[test]
@@ -1568,7 +1568,7 @@ mod tests {
     /// without the other fails here rather than producing a button whose mode is never honored.
     ///
     /// Since R07 every offered mode needs the same thing from a backend: its interactive gate. Both
-    /// modes run the CLI gated; bypass is neovibe answering `allow`, not a CLI posture, so the
+    /// modes run the CLI gated; bypass is Eitri answering `allow`, not a CLI posture, so the
     /// backend's own `bypass_permission_mode` is no longer what honours it. That half is a constant
     /// and is asserted at compile time beside `LEGACY_CAPABILITIES`; what is left here is that
     /// every offered string is a mode at all.
@@ -1609,7 +1609,7 @@ mod tests {
         // again here would be a constant assertion, which is what the previous version of this
         // test was.
         // The greeting offers "bypass" as a real choice, and since R07 what honours it is the
-        // interactive gate (neovibe answers `allow` under it), not a CLI bypass mode the legacy
+        // interactive gate (Eitri answers `allow` under it), not a CLI bypass mode the legacy
         // backend no longer has -- both halves asserted at compile time beside the constant.
         let modes: Vec<&str> = greeting.permission_modes.to_vec();
         assert_eq!(modes, vec!["auto", "bypass"]);
@@ -1725,7 +1725,7 @@ mod tests {
     fn a_claude_projects_root() -> &'static std::path::Path {
         static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         ROOT.get_or_init(|| {
-            let root = std::env::temp_dir().join(format!("neovibe-core-claude-{}", std::process::id()));
+            let root = std::env::temp_dir().join(format!("eitri-core-claude-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("projects")).expect("creating the fake config root should succeed");
             std::env::set_var("CLAUDE_CONFIG_DIR", &root);
@@ -1737,7 +1737,7 @@ mod tests {
 
     /// A workspace holding one offerable record, and optionally a transcript beside it.
     ///
-    /// `recorded_title` is what Neovibe itself wrote at write time; `ai_title` is what the CLI
+    /// `recorded_title` is what Eitri itself wrote at write time; `ai_title` is what the CLI
     /// wrote into its own transcript. Either can be absent, which is what makes the three levels of
     /// the ladder reachable from one helper.
     fn a_workspace_with(recorded_title: Option<&str>, ai_title: Option<&str>) -> PathBuf {
@@ -1778,14 +1778,14 @@ mod tests {
         greeting.resumable.into_iter().next().expect("checked just above")
     }
 
-    /// Level 1 of the ladder: the CLI's own title is layered ABOVE Neovibe's own, at display time.
+    /// Level 1 of the ladder: the CLI's own title is layered ABOVE Eitri's own, at display time.
     /// Both exist here, and the CLI's wins -- which is the owner's ruling (2026-09-20) and the only
     /// thing this change buys, since 37 of this machine's 44 sessions already have one on disk while
-    /// Neovibe's own `title` only exists for sessions started after 2026-09-19.
+    /// Eitri's own `title` only exists for sessions started after 2026-09-19.
     #[test]
     fn the_clis_own_title_is_what_a_row_shows_when_the_transcript_has_one() {
         let row = the_only_row(a_workspace_with(
-            Some("what neovibe recorded"),
+            Some("what eitri recorded"),
             Some("what the CLI recorded"),
         ));
         assert_eq!(row.title.as_deref(), Some("what the CLI recorded"));
@@ -1793,17 +1793,17 @@ mod tests {
 
     /// **The negative control, and the whole promise of the fallback** (invariant 17). The same
     /// record with no transcript beside it must read EXACTLY as it did before this change: the
-    /// title Neovibe recorded, then the bare id. Without this pair, "it degrades back to today's
+    /// title Eitri recorded, then the bare id. Without this pair, "it degrades back to today's
     /// behaviour" would only be a sentence -- and the degradation is silent, so nothing else would
     /// notice the day the CLI stops writing that line.
     #[test]
     fn with_no_ai_title_a_row_reads_exactly_as_it_did_before() {
-        // Level 2: Neovibe's own recorded title.
+        // Level 2: Eitri's own recorded title.
         assert_eq!(
-            the_only_row(a_workspace_with(Some("what neovibe recorded"), None))
+            the_only_row(a_workspace_with(Some("what eitri recorded"), None))
                 .title
                 .as_deref(),
-            Some("what neovibe recorded")
+            Some("what eitri recorded")
         );
         // Level 3: no title at all -- the row falls back to its id and timestamps, and invents
         // nothing.
@@ -1812,11 +1812,11 @@ mod tests {
         // a control rather than a restatement.
         assert_ne!(
             the_only_row(a_workspace_with(
-                Some("what neovibe recorded"),
+                Some("what eitri recorded"),
                 Some("what the CLI recorded")
             ))
             .title,
-            the_only_row(a_workspace_with(Some("what neovibe recorded"), None)).title
+            the_only_row(a_workspace_with(Some("what eitri recorded"), None)).title
         );
     }
 
@@ -1825,8 +1825,8 @@ mod tests {
     /// `title_from_prompt` as every other title, and a blank one declines.
     #[test]
     fn an_unusable_ai_title_falls_through_to_the_recorded_one() {
-        let row = the_only_row(a_workspace_with(Some("what neovibe recorded"), Some("   ")));
-        assert_eq!(row.title.as_deref(), Some("what neovibe recorded"));
+        let row = the_only_row(a_workspace_with(Some("what eitri recorded"), Some("   ")));
+        assert_eq!(row.title.as_deref(), Some("what eitri recorded"));
     }
 
     /// **Invariant 16: nothing read from a transcript is ever persisted.** The record on disk is
@@ -1834,7 +1834,7 @@ mod tests {
     /// `title`'s own first-one-wins rule and cannot move `updated_at`.
     #[test]
     fn building_the_picker_never_writes_the_clis_title_into_the_record() {
-        let workspace = a_workspace_with(Some("what neovibe recorded"), Some("what the CLI recorded"));
+        let workspace = a_workspace_with(Some("what eitri recorded"), Some("what the CLI recorded"));
         let canonical = workspace.canonicalize().expect("the workspace canonicalizes");
         let records = agent::state_dirs::redirect_state_to_a_test_root()
             .join("conversations")
@@ -1852,11 +1852,11 @@ mod tests {
             before,
             "reading a title must leave the record byte-identical"
         );
-        // And what stayed there is Neovibe's own title, unchanged by the one the row showed.
+        // And what stayed there is Eitri's own title, unchanged by the one the row showed.
         assert!(
             before
                 .iter()
-                .any(|(_, bytes)| String::from_utf8_lossy(bytes).contains("what neovibe recorded")),
+                .any(|(_, bytes)| String::from_utf8_lossy(bytes).contains("what eitri recorded")),
             "the record on disk still holds the title this project recorded"
         );
         assert!(
@@ -1932,7 +1932,7 @@ mod tests {
     #[test]
     fn user_prompt_event_records_what_was_typed_not_what_went_on_the_wire() {
         let typed = "what does this do?";
-        // `crate::`, not `neovibe_core::` -- this module IS that crate, and its own unit tests
+        // `crate::`, not `eitri_core::` -- this module IS that crate, and its own unit tests
         // cannot address it by its external name the way `shell` does.
         let wire = crate::editor_context::compose_turn_text(
             typed,
@@ -2501,7 +2501,7 @@ mod tests {
         backend.shutdown();
     }
 
-    // ---- R07/S2: bypass is neovibe answering every request itself, and `approve_pending` -------
+    // ---- R07/S2: bypass is Eitri answering every request itself, and `approve_pending` -------
 
     /// The owner's whole definition of bypass in one assertion: nothing reaches the panel as a
     /// card, and both requests really were answered -- the in-root write and the out-of-root read

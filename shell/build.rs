@@ -41,26 +41,26 @@ fn main() {
     for path in web_build_watch_paths(&web_dir) {
         println!("cargo:rerun-if-changed={}", path.display());
     }
-    println!("cargo:rerun-if-env-changed=NEOVIBE_WEB_CLEAN_BUILD");
-    let clean_build = std::env::var("NEOVIBE_WEB_CLEAN_BUILD").as_deref() == Ok("1");
+    println!("cargo:rerun-if-env-changed=EITRI_WEB_CLEAN_BUILD");
+    let clean_build = std::env::var("EITRI_WEB_CLEAN_BUILD").as_deref() == Ok("1");
     ensure_web_bundle_built(&web_dir, None, clean_build);
 }
 
-/// Bakes `NEOVIBE_BUILD_COMMIT`, `NEOVIBE_FORK_REV` and `NEOVIBE_VERDANDI_REV` into the binary via
+/// Bakes `EITRI_BUILD_COMMIT`, `EITRI_FORK_REV` and `EITRI_VERDANDI_REV` into the binary via
 /// `cargo:rustc-env`, for `shell/src/version.rs`'s `env!` reads. Each falls back to the literal
 /// string `"unknown"` rather than failing the build -- `--version` is meant to work even from a
 /// tree this can't fully identify (a shallow clone, a source tarball with `.git` stripped out).
 fn emit_build_info(workspace_root: &Path) {
-    // `NEOVIBE_BUILD_COMMIT`: set by `release.sh` to the public clone's `HEAD` (spec §4.1), or by
+    // `EITRI_BUILD_COMMIT`: set by `release.sh` to the public clone's `HEAD` (spec §4.1), or by
     // a rebuild from the source asset (which has no `.git`) to the commit `SOURCE` names; falls
     // back to this tree's own `git rev-parse` for an ordinary developer build.
-    println!("cargo:rerun-if-env-changed=NEOVIBE_BUILD_COMMIT");
-    let commit = std::env::var("NEOVIBE_BUILD_COMMIT")
+    println!("cargo:rerun-if-env-changed=EITRI_BUILD_COMMIT");
+    let commit = std::env::var("EITRI_BUILD_COMMIT")
         .ok()
         .filter(|value| !value.is_empty())
         .or_else(|| git_rev_parse_head(workspace_root))
         .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=NEOVIBE_BUILD_COMMIT={commit}");
+    println!("cargo:rustc-env=EITRI_BUILD_COMMIT={commit}");
 
     // The other two identities come from `Cargo.lock`'s own record of what this build resolved,
     // not from a second, possibly-disagreeing source -- see `parse_git_rev_from_lockfile`.
@@ -69,18 +69,18 @@ fn emit_build_info(workspace_root: &Path) {
     let lockfile = std::fs::read_to_string(&lockfile_path).unwrap_or_default();
 
     // The public tree's `neovide/` submodule is a path dependency, which `Cargo.lock` records with
-    // no `source` line at all -- then `NEOVIBE_BUILD_FORK_COMMIT` (the source asset has no `.git`
+    // no `source` line at all -- then `EITRI_BUILD_FORK_COMMIT` (the source asset has no `.git`
     // in `neovide/`, so a rebuild from it sets this as `SOURCE` says), then that checkout itself.
-    println!("cargo:rerun-if-env-changed=NEOVIBE_BUILD_FORK_COMMIT");
-    let fork_rev = resolve_fork_rev(&lockfile, std::env::var("NEOVIBE_BUILD_FORK_COMMIT").ok(), || {
+    println!("cargo:rerun-if-env-changed=EITRI_BUILD_FORK_COMMIT");
+    let fork_rev = resolve_fork_rev(&lockfile, std::env::var("EITRI_BUILD_FORK_COMMIT").ok(), || {
         git_rev_parse_head(&workspace_root.join("neovide"))
     })
     .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=NEOVIBE_FORK_REV={fork_rev}");
+    println!("cargo:rustc-env=EITRI_FORK_REV={fork_rev}");
 
     let verdandi_rev =
         parse_git_rev_from_lockfile(&lockfile, "claude-runtime-protocol").unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=NEOVIBE_VERDANDI_REV={verdandi_rev}");
+    println!("cargo:rustc-env=EITRI_VERDANDI_REV={verdandi_rev}");
 }
 
 /// `git rev-parse HEAD` in `dir`, or `None` if `dir` doesn't exist, isn't the root of its own git
@@ -90,11 +90,11 @@ fn emit_build_info(workspace_root: &Path) {
 /// **The root of its own checkout, not merely inside one.** `git` climbs to the nearest enclosing
 /// repository, so without this check a tree with no `.git` of its own -- the source asset, unpacked
 /// anywhere (spec §4.3), or its `neovide/` directory -- would report whatever repository happens to
-/// contain it as neovibe's commit or the fork's rev. `--show-toplevel` must name `dir` itself.
+/// contain it as Eitri's commit or the fork's rev. `--show-toplevel` must name `dir` itself.
 ///
 /// Also registers `dir`'s HEAD with cargo ([`watch_git_head`]), so a development build reruns this
 /// script when HEAD moves and `--version` names the commit it was built from. Before that, the
-/// script reran only on `NEOVIBE_BUILD_COMMIT`, `Cargo.lock` and the web sources, and a build after
+/// script reran only on `EITRI_BUILD_COMMIT`, `Cargo.lock` and the web sources, and a build after
 /// a commit kept printing the commit the script last ran at.
 fn git_rev_parse_head(dir: &Path) -> Option<String> {
     if !dir.is_dir() {

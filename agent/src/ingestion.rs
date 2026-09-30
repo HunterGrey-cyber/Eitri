@@ -316,7 +316,7 @@ impl ConversationIngest {
             let state = Arc::clone(&state);
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
-                .name("neovibe-agent-ingest".to_string())
+                .name("eitri-agent-ingest".to_string())
                 .spawn(move || ingest_loop(provider, state, stop, context))
                 .expect("spawning the agent ingestion thread")
         };
@@ -588,7 +588,7 @@ fn adopt_provider_session(
         Err(e @ crate::lease::LeaseError::AlreadyHeld) => {
             eprintln!(
                 "agent: could not take the session lease for {provider_session_id}: {e} -- \
-                 continuing without it; another Neovibe window may be driving the same session"
+                 continuing without it; another Eitri window may be driving the same session"
             );
             None
         }

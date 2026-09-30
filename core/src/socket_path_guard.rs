@@ -16,7 +16,7 @@ const NEVER_BOUND: &[(&str, &str)] = &[
     // Every path actually built from them goes through `in_dir` at its own construction site.
     (
         "src/instance_dir.rs",
-        "stale_instance_dir_pid(\"neovibe-supervisor.sock\"",
+        "stale_instance_dir_pid(\"eitri-supervisor.sock\"",
     ),
     (
         "src/instance_dir.rs",

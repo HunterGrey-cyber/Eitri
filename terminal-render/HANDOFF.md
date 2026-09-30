@@ -2,7 +2,7 @@
 > `docs/superpowers/specs/2026-09-23-bottom-terminal-design.md`, decision 4.1(a)). Paths, revisions and pins
 > below are Verdandi's as of that commit; here the crate is the workspace member `terminal-render/`.
 
-# PaintOp handoff — Verdandi → Neovibe
+# PaintOp handoff — Verdandi → Eitri
 
 **Verdandi revision:** `296c894` on branch `worktree-terminal-runtime-engine`
 (pushed to `origin`; pin this rev, do not use a path dep into a live worktree).
@@ -205,7 +205,7 @@ worse — backpressure reaches the child process.)
 Project a frame under whatever lock owns `Term`, then release it and build/paint
 off that snapshot.
 
-## 11. What must NOT be reimplemented in Neovibe
+## 11. What must NOT be reimplemented in Eitri
 
 - **No second emulator.** One child, one PTY, one authoritative
   `alacritty_terminal::Term`. No xterm.js, no second VT parser, no replay into
@@ -231,7 +231,7 @@ gives you projection from a `Term` you already have; `terminal-sidecar` is
 TypeScript and moves raw bytes over `terminal.runtime.v1` for a *different*
 consumer — it holds no `Term`.
 
-Intended shape: **Neovibe links `terminal-frame`/`terminal-render` in-process and
+Intended shape: **Eitri links `terminal-frame`/`terminal-render` in-process and
 Verdandi supplies the session type that owns the PTY and the authoritative
 `Term`.** That crate is the next Verdandi task. Until it lands, build the backend,
 metrics, pane and input plumbing against a `PaintList` you construct in tests —

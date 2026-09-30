@@ -46,8 +46,8 @@
 
 use std::collections::BTreeMap;
 
+use eitri_core::layout::ModuleId;
 use gtk4::prelude::*;
-use neovibe_core::layout::ModuleId;
 
 use crate::module_grid::ModuleHosts;
 

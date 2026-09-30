@@ -1,23 +1,23 @@
-# AppArmor profile for neovibe's `shell` (packaging/apparmor/neovibe).
+# AppArmor profile for Eitri's `shell` (packaging/apparmor/eitri).
 #
 # Ubuntu 23.10 and later set kernel.apparmor_restrict_unprivileged_userns=1: a program may create a
 # user namespace only while an AppArmor profile that grants `userns` confines it. WebKitGTK 6.0 runs
 # its web and network processes in a bwrap sandbox, which needs one, so without this profile the
 # agent panel cannot start. The profile grants that and nothing else: it is unconfined otherwise,
 # the same shape as the profiles Ubuntu's own apparmor package ships for its WebKit applications
-# (epiphany, for one). Every process neovibe starts inherits it.
+# (epiphany, for one). Every process Eitri starts inherits it.
 #
-# The .deb installs this file as /etc/apparmor.d/neovibe and loads nothing (it has no maintainer
-# scripts): `sudo apparmor_parser -r /etc/apparmor.d/neovibe`, or the next restart, loads it. For
-# any other install, the curl installer and neovibe itself write this same text with that install's
+# The .deb installs this file as /etc/apparmor.d/eitri and loads nothing (it has no maintainer
+# scripts): `sudo apparmor_parser -r /etc/apparmor.d/eitri`, or the next restart, loads it. For
+# any other install, the curl installer and Eitri itself write this same text with that install's
 # own path and a profile name of its own.
 
 abi <abi/4.0>,
 include <tunables/global>
 
-profile neovibe "/usr/lib/neovibe/shell" flags=(unconfined) {
+profile eitri "/usr/lib/eitri/shell" flags=(unconfined) {
   userns,
 
   # Site-specific additions and overrides. See local/README for details.
-  include if exists <local/neovibe>
+  include if exists <local/eitri>
 }

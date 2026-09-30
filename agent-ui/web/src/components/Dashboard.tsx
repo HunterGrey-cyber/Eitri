@@ -127,7 +127,7 @@ type Props = {
   prefix: string;
 };
 
-/** The empty tab's dashboard (panel round 2 plan, Task 12; spec §7): a centred `neovibe`, the
+/** The empty tab's dashboard (panel round 2 plan, Task 12; spec §7): a centred `Eitri`, the
  *  where-line, one row per `dashItems(hello)`, the selected mode's consequence line, what every
  *  message also carries from the editor (v1 picks Task 11), and the first-run hint.
  *
@@ -143,7 +143,7 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix }: Props
   const consequence = MODE_CONSEQUENCE[mode];
   return (
     <div className="dashboard">
-      <div className="dash-title">neovibe</div>
+      <div className="dash-title">Eitri</div>
       <div className="dash-where">{whereLine(hello, narrow)}</div>
       <div className="dash-items">
         {items.map((item, index) => (
@@ -188,7 +188,7 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix }: Props
       </div>
       {/* V1 P11 (spec §10.1): one first-run hint line, shown on every empty tab rather than once --
           the empty tab is seen only when nothing else is, so it costs nothing and needs no "first
-          run" state file. neovibe's own; the three keys are the audit's §5 item 5. */}
+          run" state file. Eitri's own; the three keys are the audit's §5 item 5. */}
       <div className="dash-hint">
         {`Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · ${prefix}  window keys · ?  all keys`}
       </div>

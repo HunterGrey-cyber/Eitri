@@ -41,7 +41,7 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             // permission_mode_switchable added at 133dc03. `false` is what every session built
             // before this field existed sends -- this smoke test does not exercise switching.
             permission_mode_switchable: false,
-            // provider_permission_prompts added at b3aa188; stated `true` (what neovibe's own
+            // provider_permission_prompts added at b3aa188; stated `true` (what Eitri's own
             // `build_create_request` sends when the handshake advertises it) so the assertion below
             // proves the generated field carries a value, not merely that it compiles.
             provider_permission_prompts: true,

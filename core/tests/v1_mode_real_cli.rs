@@ -6,7 +6,7 @@
 //! ```sh
 //! claude --version    # record the build; nothing prints it for you
 //! XDG_STATE_HOME=$HOME/.cache/nv-v1mode-t5/state \
-//!     cargo test -p neovibe-core --test v1_mode_real_cli -- --ignored --nocapture --test-threads=1
+//!     cargo test -p eitri-core --test v1_mode_real_cli -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! The four legacy tests (2, 3 on legacy, 5 on legacy twice) exist only in a build with the legacy
@@ -15,7 +15,7 @@
 //! The test-account wrapper sets `VERDANDI_CLAUDE_CLI_PATH` to the `claude-wrapper` launcher, which is what
 //! decides the sidecar's CLI (CLAUDE.md, the environment table); `PATH` alone does not.
 //!
-//! **What these prove, and what they only record.** R07/S2 say bypass is neovibe's own `allow`
+//! **What these prove, and what they only record.** R07/S2 say bypass is Eitri's own `allow`
 //! under a CLI that always runs gated -- never `bypassPermissions` on the wire. Tests 1/1b/2/6 assert
 //! that: no `PermissionRequested` a bypass tab answers itself is ever delivered to the panel, the
 //! resolution still arrives (sidecar) or is silently dropped with the request (legacy, D4's own
@@ -32,10 +32,10 @@
 //! lines each prints before recording any figure or branch.
 
 use agent::{AgentDomainEvent, PermissionDecision, PermissionMode, PermissionOutcome, PrefixRules};
-use neovibe_core::agent_backend::{AgentBackend, BackendKind};
-use neovibe_core::agent_bridge::SessionModeChoice;
-use neovibe_core::tab_set::{ConfirmOutcome, ModeCycle, TabBackend, TabSet};
-use neovibe_core::tabs::TabId;
+use eitri_core::agent_backend::{AgentBackend, BackendKind};
+use eitri_core::agent_bridge::SessionModeChoice;
+use eitri_core::tab_set::{ConfirmOutcome, ModeCycle, TabBackend, TabSet};
+use eitri_core::tabs::TabId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -1008,7 +1008,7 @@ fn a_subagent_tool_call_reaches_the_host_on_legacy() {
 /// Test 4 (O3, 2026-09-27): `Write` into `.claude/` and `.git/` inside a real git repo -- the CLI's own
 /// sensitive-file check asks about each even after the gate allowed it, and a real
 /// `bypassPermissions` session runs them. First recorded here as refused (the O3 trigger); since
-/// Verdandi b3aa188 routes that ask to the host (`provider_permission_prompts`), neovibe answers it.
+/// Verdandi b3aa188 routes that ask to the host (`provider_permission_prompts`), Eitri answers it.
 ///
 /// - **Bypass** (O3 ruling 4): both writes SUCCEED with no card -- the file is on disk, the tool
 ///   result is not an error, nothing reached the panel as a request.
@@ -1019,7 +1019,7 @@ fn a_subagent_tool_call_reaches_the_host_on_legacy() {
 ///   answered by the host, so the mechanism really ran rather than the CLI not asking at all.
 ///
 /// Needs a sidecar advertising `provider_permission_prompts` (b3aa188 or later):
-/// `NEOVIBE_SIDECAR_BINARY=<that artifact>`.
+/// `EITRI_SIDECAR_BINARY=<that artifact>`.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn protected_paths_under_default_with_hook_allow() {

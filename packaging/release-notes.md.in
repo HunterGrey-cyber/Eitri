@@ -1,4 +1,4 @@
-neovibe @VERSION@ -- Neovim, embedded as a real component, with a Claude agent panel beside it.
+Eitri @VERSION@ -- Neovim, embedded as a real component, with a Claude agent panel beside it.
 Built from commit @COMMIT@ in the Ubuntu 24.04 release container. It runs on glibc 2.39, GTK 4.14
 and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 
@@ -8,26 +8,26 @@ downgrade over it -- uninstall it first (`sh install.sh --uninstall`, or remove 
 
 ## Install
 
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/neovibe/releases/download/v@VERSION@/install.sh | sh -s -- --version @VERSION@
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/download/v@VERSION@/install.sh | sh -s -- --version @VERSION@
 
-or install `neovibe_@VERSION@_amd64.deb` / `neovibe-@VERSION@-1.x86_64.rpm` and run `neovibe setup`
-once, or install from `neovibe-@VERSION@-x86_64-linux.tar.gz` with
-`sh install.sh --tarball neovibe-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig`
-(or unpack it and run its own `bin/neovibe setup` from inside the extracted directory).
+or install `eitri_@VERSION@_amd64.deb` / `eitri-@VERSION@-1.x86_64.rpm` and run `eitri setup`
+once, or install from `eitri-@VERSION@-x86_64-linux.tar.gz` with
+`sh install.sh --tarball eitri-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig`
+(or unpack it and run its own `bin/eitri setup` from inside the extracted directory).
 
-neovibe needs `nvim` >= 0.10 somewhere it can find one -- either on `PATH`, or its own private copy
-under `XDG_DATA_HOME/neovibe/nvim` (never placed on `PATH`; none of the packages depend on a system
+Eitri needs `nvim` >= 0.10 somewhere it can find one -- either on `PATH`, or its own private copy
+under `XDG_DATA_HOME/eitri/nvim` (never placed on `PATH`; none of the packages depend on a system
 nvim). Ubuntu 24.04's own package is 0.9.5, below that floor. `install.sh` (the curl command above)
 offers to fetch the official nvim release for you at install time if none new enough is found; run
-`neovibe setup --nvim-only` on its own at any later time -- after a `.deb`/`.rpm`/tarball install,
+`eitri setup --nvim-only` on its own at any later time -- after a `.deb`/`.rpm`/tarball install,
 or again -- to get the same offer.
 
 ## The agent backend is built on your machine
 
-No asset here contains Anthropic's Claude Agent SDK. `neovibe setup` downloads it from npm and
+No asset here contains Anthropic's Claude Agent SDK. `eitri setup` downloads it from npm and
 builds the agent backend (the sidecar) on your own machine, from `@VERDANDI_ASSET@` (the public
 Verdandi at @VERDANDI_REV@) and the official Node release pinned in `RELEASE`. The SDK is not open
-source; its own licence applies to your copy of it, and `neovibe setup` shows where to read it.
+source; its own licence applies to your copy of it, and `eitri setup` shows where to read it.
 
 ## Licences and source
 
@@ -35,7 +35,7 @@ This program statically links nvim-rs @NVIM_RS_VERSION@, which is licensed under
 its use is covered by that licence. The Corresponding Source for this release is
 `@SOURCE_ASSET@` on this page -- **not** GitHub's automatic "Source code" archives, which lack the
 Neovide fork submodule, the vendored Rust dependencies and the Skia archive the build linked. It
-rebuilds offline, and `SOURCE` (installed at `share/licenses/neovibe/SOURCE`) gives the exact recipe
+rebuilds offline, and `SOURCE` (installed at `share/licenses/eitri/SOURCE`) gives the exact recipe
 for relinking against a modified nvim-rs. `THIRD-PARTY-LICENSES`, beside it, carries every other
 notice.
 
@@ -47,25 +47,25 @@ notice.
 
 ## 简体中文
 
-neovibe @VERSION@ -- 将 Neovim 作为真正的组件嵌入，旁边配有 Claude 代理面板。基于提交 @COMMIT@，在 Ubuntu 24.04 发布容器中构建。运行环境需要 glibc 2.39、GTK 4.14 以及 WebKitGTK 2.40（webkitgtk-6.0 API）或更新版本。
+Eitri @VERSION@ -- 将 Neovim 作为真正的组件嵌入，旁边配有 Claude 代理面板。基于提交 @COMMIT@，在 Ubuntu 24.04 发布容器中构建。运行环境需要 glibc 2.39、GTK 4.14 以及 WebKitGTK 2.40（webkitgtk-6.0 API）或更新版本。
 
 **0.2.0 是首个公开发行版**，此前有一个未公开的预发布版本 0.1.0。如果你安装过编号为 `1.0.0-rc.N` 的测试构建，它在版本排序上高于本次发布，安装程序会拒绝降级——请先卸载它（`sh install.sh --uninstall`，或者移除对应的软件包）。
 
 ### 安装
 
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/neovibe/releases/download/v@VERSION@/install.sh | sh -s -- --version @VERSION@
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/download/v@VERSION@/install.sh | sh -s -- --version @VERSION@
 
-或者安装 `neovibe_@VERSION@_amd64.deb` / `neovibe-@VERSION@-1.x86_64.rpm` 并运行一次 `neovibe setup`；或者用 `sh install.sh --tarball neovibe-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig` 从 `neovibe-@VERSION@-x86_64-linux.tar.gz` 安装（或者解压后，在解压出的目录里运行它自己的 `bin/neovibe setup`）。
+或者安装 `eitri_@VERSION@_amd64.deb` / `eitri-@VERSION@-1.x86_64.rpm` 并运行一次 `eitri setup`；或者用 `sh install.sh --tarball eitri-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig` 从 `eitri-@VERSION@-x86_64-linux.tar.gz` 安装（或者解压后，在解压出的目录里运行它自己的 `bin/eitri setup`）。
 
-neovibe 需要能找到 `nvim` >= 0.10 -- 既可以是 `PATH` 上的，也可以是它自己的私有副本，位于 `XDG_DATA_HOME/neovibe/nvim`（这个私有副本从不会被放进 `PATH`；所有安装包都不依赖系统自带的 nvim）。Ubuntu 24.04 自带的包是 0.9.5，低于这个下限。`install.sh`（上面的 curl 命令）在安装时如果没有找到足够新的版本，会主动提出为你获取官方 nvim 发行版；之后任何时候单独运行 `neovibe setup --nvim-only`（不论是在 `.deb`/`.rpm`/tar 包安装之后，还是再次运行）都能得到同样的提示。
+Eitri 需要能找到 `nvim` >= 0.10 -- 既可以是 `PATH` 上的，也可以是它自己的私有副本，位于 `XDG_DATA_HOME/eitri/nvim`（这个私有副本从不会被放进 `PATH`；所有安装包都不依赖系统自带的 nvim）。Ubuntu 24.04 自带的包是 0.9.5，低于这个下限。`install.sh`（上面的 curl 命令）在安装时如果没有找到足够新的版本，会主动提出为你获取官方 nvim 发行版；之后任何时候单独运行 `eitri setup --nvim-only`（不论是在 `.deb`/`.rpm`/tar 包安装之后，还是再次运行）都能得到同样的提示。
 
 ### 代理后端在你自己的机器上构建
 
-这里的任何资源都不包含 Anthropic 的 Claude Agent SDK。`neovibe setup` 会从 npm 下载它，并在你自己的机器上，基于 `@VERDANDI_ASSET@`（公开的 Verdandi，版本 @VERDANDI_REV@）和 `RELEASE` 中固定的官方 Node 发行版，构建代理后端（sidecar）。该 SDK 不是开源软件；你拿到的这份副本适用其自身的许可证，`neovibe setup` 会告诉你在哪里可以读到它。
+这里的任何资源都不包含 Anthropic 的 Claude Agent SDK。`eitri setup` 会从 npm 下载它，并在你自己的机器上，基于 `@VERDANDI_ASSET@`（公开的 Verdandi，版本 @VERDANDI_REV@）和 `RELEASE` 中固定的官方 Node 发行版，构建代理后端（sidecar）。该 SDK 不是开源软件；你拿到的这份副本适用其自身的许可证，`eitri setup` 会告诉你在哪里可以读到它。
 
 ### 许可证与源代码
 
-本程序静态链接了 nvim-rs @NVIM_RS_VERSION@，其许可证为 GNU LGPL-3.0；对它的使用受该许可证约束。本次发布对应的 Corresponding Source 就是本页面上的 `@SOURCE_ASSET@` -- **不是** GitHub 自动生成的 "Source code" 压缩包，后者缺少 Neovide fork 子模块、vendored 的 Rust 依赖，以及构建时链接的 Skia 归档。它可以离线重新构建，`SOURCE`（安装在 `share/licenses/neovibe/SOURCE`）给出了针对修改版 nvim-rs 重新链接的精确步骤。旁边的 `THIRD-PARTY-LICENSES` 收录了其余全部声明。
+本程序静态链接了 nvim-rs @NVIM_RS_VERSION@，其许可证为 GNU LGPL-3.0；对它的使用受该许可证约束。本次发布对应的 Corresponding Source 就是本页面上的 `@SOURCE_ASSET@` -- **不是** GitHub 自动生成的 "Source code" 压缩包，后者缺少 Neovide fork 子模块、vendored 的 Rust 依赖，以及构建时链接的 Skia 归档。它可以离线重新构建，`SOURCE`（安装在 `share/licenses/eitri/SOURCE`）给出了针对修改版 nvim-rs 重新链接的精确步骤。旁边的 `THIRD-PARTY-LICENSES` 收录了其余全部声明。
 
 ### 验证下载
 

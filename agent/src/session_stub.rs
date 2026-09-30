@@ -1,7 +1,7 @@
-//! neovibe-only: the legacy backend's `AgentSession` in a build without it (the `legacy-backend`
+//! eitri-only: the legacy backend's `AgentSession` in a build without it (the `legacy-backend`
 //! feature off, which is every release: spec 2026-09-27-v1-dist-design.md §10, D16).
 //!
-//! **Uninhabited, with the real type's public surface.** `neovibe-core`'s
+//! **Uninhabited, with the real type's public surface.** `eitri-core`'s
 //! `AgentBackend::Legacy(AgentSession)` arm and its call sites in `core` and `shell` compile
 //! unchanged against this, so the `cfg` stays inside `agent` (and out of
 //! `core/src/agent_backend.rs`); but no value of this type can exist, so that arm can never be

@@ -75,7 +75,7 @@ run_wrapper() {
 run_wrapper_with_verdandi_checkout() {
 	_vc=$1
 	shift
-	env -i HOME="$HOME" PATH="$PATH" NEOVIBE_VERDANDI_CHECKOUT="$_vc" "$ROOT/install.sh" "$@" 2>&1
+	env -i HOME="$HOME" PATH="$PATH" EITRI_VERDANDI_CHECKOUT="$_vc" "$ROOT/install.sh" "$@" 2>&1
 }
 
 echo "== plain './install.sh' still builds from source, unchanged =="
@@ -84,7 +84,7 @@ assert_contains "$out" "STUB_ARG:--from-source" "the default is still --from-sou
 assert_contains "$out" "STUB_ARG:--checkout" "the default is still --checkout"
 assert_contains "$out" "STUB_ARG:$ROOT" "--checkout names this checkout"
 
-echo "== NEOVIBE_VERDANDI_CHECKOUT still threads through --verdandi-checkout on the default path =="
+echo "== EITRI_VERDANDI_CHECKOUT still threads through --verdandi-checkout on the default path =="
 out=$(run_wrapper_with_verdandi_checkout "$SCRATCH_ROOT/verdandi-src")
 assert_contains "$out" "STUB_ARG:--verdandi-checkout" "--verdandi-checkout was added"
 assert_contains "$out" "STUB_ARG:$SCRATCH_ROOT/verdandi-src" "it names the given directory"
@@ -188,7 +188,7 @@ else
 	echo "ok - the root install.sh's header points at no private design document"
 fi
 
-echo "== a mode flag bypasses NEOVIBE_VERDANDI_CHECKOUT too (it is a --from-source-only concern) =="
+echo "== a mode flag bypasses EITRI_VERDANDI_CHECKOUT too (it is a --from-source-only concern) =="
 out=$(run_wrapper_with_verdandi_checkout "$SCRATCH_ROOT/verdandi-src" --uninstall)
 assert_contains "$out" "STUB_ARG:--uninstall" "--uninstall reached the stub"
 assert_not_contains "$out" "STUB_ARG:--verdandi-checkout" "--verdandi-checkout was not added for --uninstall"

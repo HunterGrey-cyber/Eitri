@@ -90,7 +90,7 @@ impl SpawnedSidecar {
 
 /// The Verdandi revision this client is developed and verified against.
 ///
-/// Not a hard pin -- `NEOVIBE_VERDANDI_CHECKOUT` exists precisely so a Verdandi feature branch or a
+/// Not a hard pin -- `EITRI_VERDANDI_CHECKOUT` exists precisely so a Verdandi feature branch or a
 /// protocol migration can be tested against an unreleased sidecar, and hard-failing on a different
 /// revision would defeat that. It is a BASELINE: when the checkout is at a different revision, that
 /// fact is surfaced as a startup diagnostic instead of being silent, so "which sidecar build was
@@ -102,7 +102,7 @@ impl SpawnedSidecar {
 /// equal, because the generated wire types this crate compiles against come from exactly that
 /// revision, so it is the revision "verified against" can honestly refer to. (The checkout actually
 /// RUNNING may differ; that is what the drift warning below reports, and what
-/// `NEOVIBE_VERDANDI_CHECKOUT` is for.)
+/// `EITRI_VERDANDI_CHECKOUT` is for.)
 ///
 /// The value earns its way here by the real suite, never by a version bump: the whole `#[ignore]`d
 /// real-sidecar set is re-run against the exact pushed revision first (multi-turn with a content
@@ -152,7 +152,7 @@ impl SpawnedSidecar {
 /// ahead of `executable_host_cli`). `ResolvePermissionRequest` is unchanged.
 pub const EXPECTED_VERDANDI_REVISION: &str = "22400e8";
 
-/// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
+/// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.
 #[derive(Debug)]
 pub(crate) struct VerdandiCheckout {
@@ -160,7 +160,7 @@ pub(crate) struct VerdandiCheckout {
     /// `git rev-parse --short HEAD`, or `None` when the checkout is not a git repo or `git` is
     /// unavailable. Best-effort diagnostics only -- never a reason to refuse to start.
     pub(crate) revision: Option<String>,
-    /// True when `NEOVIBE_VERDANDI_CHECKOUT` chose this path rather than the default.
+    /// True when `EITRI_VERDANDI_CHECKOUT` chose this path rather than the default.
     pub(crate) from_override: bool,
     /// A release artifact this checkout has ALREADY built for this machine, if any.
     ///
@@ -231,7 +231,7 @@ const DEFAULT_CHECKOUT_UNDER_HOME: &str = "src/verdandi";
 
 /// Locates a real Verdandi checkout.
 ///
-/// `$NEOVIBE_VERDANDI_CHECKOUT` is a **supported development/integration override**, not a
+/// `$EITRI_VERDANDI_CHECKOUT` is a **supported development/integration override**, not a
 /// temporary hack: it is how this client is pointed at a Verdandi feature branch, a protocol
 /// migration, or an isolated checkout while the default one is mid-work. It takes precedence over
 /// the default `$HOME/src/verdandi` and is validated the same way, so a typo'd path
@@ -257,7 +257,7 @@ fn locate_verdandi_checkout(explicit: Option<&str>, home: Option<&OsStr>) -> std
             let home = home.ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    "HOME is unset and NEOVIBE_VERDANDI_CHECKOUT was not provided",
+                    "HOME is unset and EITRI_VERDANDI_CHECKOUT was not provided",
                 )
             })?;
             (PathBuf::from(home).join(DEFAULT_CHECKOUT_UNDER_HOME), false)
@@ -268,7 +268,7 @@ fn locate_verdandi_checkout(explicit: Option<&str>, home: Option<&OsStr>) -> std
     // reached `ensure_sidecar_built` and failed somewhere much less informative.
     if !path.join("apps/claude-sidecar/package.json").exists() {
         let origin = if from_override {
-            "NEOVIBE_VERDANDI_CHECKOUT points at"
+            "EITRI_VERDANDI_CHECKOUT points at"
         } else {
             "no Verdandi checkout found at the default"
         };
@@ -276,7 +276,7 @@ fn locate_verdandi_checkout(explicit: Option<&str>, home: Option<&OsStr>) -> std
             std::io::ErrorKind::NotFound,
             format!(
                 "{origin} {path:?}, which has no apps/claude-sidecar/package.json -- \
-                 set NEOVIBE_VERDANDI_CHECKOUT to a real Verdandi checkout"
+                 set EITRI_VERDANDI_CHECKOUT to a real Verdandi checkout"
             ),
         ));
     }
@@ -322,7 +322,7 @@ fn git_short_revision(checkout: &Path) -> Option<String> {
 /// that is always on is not a warning.
 fn describe_checkout(checkout: &VerdandiCheckout) -> (String, Vec<String>) {
     let source = if checkout.from_override {
-        "NEOVIBE_VERDANDI_CHECKOUT"
+        "EITRI_VERDANDI_CHECKOUT"
     } else {
         "default path"
     };
@@ -344,7 +344,7 @@ fn describe_checkout(checkout: &VerdandiCheckout) -> (String, Vec<String>) {
             warnings.push(format!(
                 "Verdandi baseline drift: running {actual}, this client was verified against \
                  {EXPECTED_VERDANDI_REVISION}. Not an error -- testing a Verdandi branch is exactly \
-                 what NEOVIBE_VERDANDI_CHECKOUT is for -- but if behavior looks wrong, this is the \
+                 what EITRI_VERDANDI_CHECKOUT is for -- but if behavior looks wrong, this is the \
                  first thing to check."
             ));
         }
@@ -368,7 +368,7 @@ fn root_build_script_for_claude(checkout: &Path) -> Option<String> {
     let manifest = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
     let scripts = manifest.get("scripts")?;
     // `build:claude` first, deliberately. Verdandi's root `build` is
-    // `build:terminal && build:claude`, and the terminal half is a workspace neovibe does not
+    // `build:terminal && build:claude`, and the terminal half is a workspace Eitri does not
     // consume and does not build against -- its `node-pty` is a native module a checkout can
     // easily be missing. Running the whole fan-out makes a failure in code this crate never loads
     // into a failure to start the agent panel at all, which is what it did on 2026-09-15:
@@ -435,7 +435,7 @@ fn run_command(dir: &Path, program: &str, args: &[&str]) -> std::io::Result<()> 
 }
 
 /// The text shown to the user when the sidecar cannot be found at all -- today only when
-/// `NEOVIBE_SIDECAR_BINARY` names a path that is not a file, but per this plan's §15 (the P3 seam)
+/// `EITRI_SIDECAR_BINARY` names a path that is not a file, but per this plan's §15 (the P3 seam)
 /// whoever later turns "no sidecar, no legacy fallback" into a hard error hands this same text to
 /// the panel as the tab's failure, rather than writing a second version of it.
 ///
@@ -449,7 +449,7 @@ pub fn sidecar_missing_message(searched: &[PathBuf]) -> String {
         message.push_str(&format!("  - {}\n", path.display()));
     }
     message.push_str(&format!(
-        "Install the neovibe package that ships it ({PACKAGED_SIDECAR_BINARY}), or point NEOVIBE_SIDECAR_BINARY at a real one."
+        "Install the eitri package that ships it ({PACKAGED_SIDECAR_BINARY}), or point EITRI_SIDECAR_BINARY at a real one."
     ));
     message
 }
@@ -472,7 +472,7 @@ const PACKAGED_SIDECAR_BINARY: &str = "verdandi-claude-sidecar";
 #[derive(Debug)]
 enum SidecarProgram {
     /// A shipped, self-contained executable -- normally a sibling of the running binary, the same
-    /// convention `agent-hook`, `neovibe-supervisor` and `neovibe-tmux-shim` already follow.
+    /// convention `agent-hook`, `eitri-supervisor` and `eitri-tmux-shim` already follow.
     Packaged(PathBuf),
     /// A Verdandi checkout, run through `node`.
     Checkout(VerdandiCheckout),
@@ -482,9 +482,9 @@ enum SidecarProgram {
 /// process environment, so the precedence is testable without mutating it.
 ///
 /// Precedence (v1-dist spec §5.2), and each step earns its place:
-/// 1. `NEOVIBE_SIDECAR_BINARY` -- an explicit artifact wins over everything, including a checkout,
+/// 1. `EITRI_SIDECAR_BINARY` -- an explicit artifact wins over everything, including a checkout,
 ///    because someone who names a binary is testing that binary.
-/// 2. `NEOVIBE_VERDANDI_CHECKOUT` -- an explicit checkout beats an installed artifact for the same
+/// 2. `EITRI_VERDANDI_CHECKOUT` -- an explicit checkout beats an installed artifact for the same
 ///    reason in the other direction: a developer pointing at a branch wants that branch, and
 ///    silently preferring the shipped artifact would make that override look broken. This is also
 ///    the ONLY branch that may build (`ensure_sidecar_built`, called from `invocation_for`'s
@@ -495,7 +495,7 @@ enum SidecarProgram {
 ///    `EXPECTED_VERDANDI_REVISION` and warns on a mismatch (`sibling_rev_skew_warning`), the same
 ///    warning the checkout path gives for its own drift.
 /// 4. **New:** a per-user build at `user_sidecar_path`'s exact rev-keyed location (D3) -- what
-///    `neovibe setup` (Task 9) leaves behind. Keyed by `EXPECTED_VERDANDI_REVISION`, so a build for a
+///    `eitri setup` (Task 9) leaves behind. Keyed by `EXPECTED_VERDANDI_REVISION`, so a build for a
 ///    DIFFERENT revision, sitting in its own directory, is never found -- never "almost right".
 /// 5. The default checkout, **and only when it already holds a prebuilt artifact** for this machine.
 ///    It never builds: before P3, this branch was reachable only by someone who had already chosen
@@ -511,7 +511,7 @@ enum SidecarProgram {
 ///    trusting that shape without re-checking it.
 ///
 /// Nothing found by any of the five: `Err`, naming `NO_SIDECAR_HINT` plus the exact path a
-/// `neovibe setup` run would use (`no_sidecar_message`).
+/// `eitri setup` run would use (`no_sidecar_message`).
 fn resolve_sidecar_program(
     explicit_binary: Option<&str>,
     explicit_checkout: Option<&str>,
@@ -559,16 +559,16 @@ fn resolve_sidecar_program(
 }
 
 /// What a session start will find, as far as backend selection's one startup line cares
-/// (`neovibe_core::agent_backend::BackendKind::choose`).
+/// (`eitri_core::agent_backend::BackendKind::choose`).
 ///
 /// **Correction (2026-09-27, v1-dist lane A's whole-branch review; spec §10, D10, D16): this
 /// decides nothing any more.** It was `packaged_sidecar_available() -> bool`, and it decided the
-/// default backend when `NEOVIBE_AGENT_BACKEND` was unset: `true` selected the sidecar, `false` fell
+/// default backend when `EITRI_AGENT_BACKEND` was unset: `true` selected the sidecar, `false` fell
 /// back to legacy. Legacy is compiled out of every release now and is never a fallback, so every
 /// build selects the sidecar whatever this answers, and the answer only picks the sentence `choose`
 /// prints. It became three-way, ranked exactly like `resolve_sidecar_program`, because the `bool`
-/// made that sentence read "not installed. Run neovibe setup" to a developer whose named
-/// `NEOVIBE_VERDANDI_CHECKOUT` the spawn was about to build. The paragraphs below are why
+/// made that sentence read "not installed. Run eitri setup" to a developer whose named
+/// `EITRI_VERDANDI_CHECKOUT` the spawn was about to build. The paragraphs below are why
 /// [`SidecarAvailability::Runnable`] means "with nothing to build"; the backend they name as the
 /// fallback is the one that no longer is.
 ///
@@ -588,7 +588,7 @@ fn resolve_sidecar_program(
 ///
 /// **Widened again, v1-dist Task 3:** a per-user build at `user_sidecar_path`'s location counts too,
 /// for the same reason the checkout case does -- running it involves no build. Without it, a machine
-/// that had already run `neovibe setup` would have fallen back to legacy at backend-selection time
+/// that had already run `eitri setup` would have fallen back to legacy at backend-selection time
 /// (before Task 5), and since Task 5 would print the "not installed" line above a session that then
 /// starts fine from step 4.
 pub fn sidecar_availability() -> SidecarAvailability {
@@ -597,13 +597,13 @@ pub fn sidecar_availability() -> SidecarAvailability {
     // until this fix, `checkout_path_for`'s own `var`) made them two independent sources of truth
     // that could disagree on a non-UTF-8 `HOME` -- `var` fails closed on one, `var_os` never does.
     let home = std::env::var_os("HOME");
-    let explicit_checkout = std::env::var("NEOVIBE_VERDANDI_CHECKOUT").ok();
+    let explicit_checkout = std::env::var("EITRI_VERDANDI_CHECKOUT").ok();
     let checkout_is_explicit = explicit_checkout
         .as_deref()
         .map(str::trim)
         .is_some_and(|c| !c.is_empty());
     sidecar_availability_in(
-        std::env::var("NEOVIBE_SIDECAR_BINARY").ok().as_deref(),
+        std::env::var("EITRI_SIDECAR_BINARY").ok().as_deref(),
         std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(Path::to_path_buf))
@@ -619,10 +619,10 @@ pub fn sidecar_availability() -> SidecarAvailability {
 /// selects the sidecar backend, and each only picks the line `BackendKind::choose` prints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidecarAvailability {
-    /// Something runs with nothing to build: a named `NEOVIBE_SIDECAR_BINARY` that is a file, the
+    /// Something runs with nothing to build: a named `EITRI_SIDECAR_BINARY` that is a file, the
     /// packaged sibling, the per-user build, or a checkout holding a prebuilt artifact.
     Runnable,
-    /// `NEOVIBE_VERDANDI_CHECKOUT` names a checkout with nothing prebuilt for this machine, so the
+    /// `EITRI_VERDANDI_CHECKOUT` names a checkout with nothing prebuilt for this machine, so the
     /// first session start builds it there (`npm`, discovery step 2) -- naming a checkout is the act
     /// that authorizes that build. Only an explicit checkout can be this; the default one never
     /// builds (step 5).
@@ -642,7 +642,7 @@ pub enum SidecarAvailability {
 /// beside an installed artifact while the spawn built that checkout; that was harmless while the
 /// answer only chose the default backend, and wrong once it chose the words. `checkout` is
 /// `checkout_path_for`'s answer and `checkout_is_explicit` says whether it came from
-/// `NEOVIBE_VERDANDI_CHECKOUT` (step 2) or the default location (step 5).
+/// `EITRI_VERDANDI_CHECKOUT` (step 2) or the default location (step 5).
 fn sidecar_availability_in(
     named_binary: Option<&str>,
     exe_dir: Option<&Path>,
@@ -694,11 +694,11 @@ fn checkout_path_for(explicit: Option<&str>, home: Option<&OsStr>) -> Option<Pat
     home.map(|home| PathBuf::from(home).join(DEFAULT_CHECKOUT_UNDER_HOME))
 }
 
-/// `$XDG_DATA_HOME/neovibe/sidecar/<rev>/verdandi-claude-sidecar` (D3, v1-dist spec §5.2): where a
-/// sidecar this MACHINE built for itself, with `neovibe setup`, lives -- keyed by the exact revision
+/// `$XDG_DATA_HOME/eitri/sidecar/<rev>/verdandi-claude-sidecar` (D3, v1-dist spec §5.2): where a
+/// sidecar this MACHINE built for itself, with `eitri setup`, lives -- keyed by the exact revision
 /// it was built for so a build for a different revision is never picked up as "close enough" (spec:
 /// "the binary looks only in its own rev's directory"). Falls back to
-/// `<home>/.local/share/neovibe/sidecar/<rev>/verdandi-claude-sidecar` when `XDG_DATA_HOME` is
+/// `<home>/.local/share/eitri/sidecar/<rev>/verdandi-claude-sidecar` when `XDG_DATA_HOME` is
 /// unset, empty or not an absolute path -- the same three-case rule
 /// `core::layout::persist::state_subdir` uses for `XDG_STATE_HOME` (`state_dir`, that module's own
 /// call site). Reproduced here rather than shared: `core` depends on `agent`, never the reverse, so
@@ -716,12 +716,12 @@ pub fn user_sidecar_path(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>, re
             _ => return None,
         },
     };
-    Some(base.join("neovibe/sidecar").join(rev).join(PACKAGED_SIDECAR_BINARY))
+    Some(base.join("eitri/sidecar").join(rev).join(PACKAGED_SIDECAR_BINARY))
 }
 
 /// The fixed hint printed whenever the sidecar backend is selected -- unconditionally, since P3 --
 /// but nothing this client can run is found by any of v1-dist spec §5.2's five discovery steps.
-/// `pub` and shared verbatim with `neovibe_core::agent_backend::BackendKind::choose` (v1-dist plan
+/// `pub` and shared verbatim with `eitri_core::agent_backend::BackendKind::choose` (v1-dist plan
 /// Task 5, imported rather than copied), which prints exactly this line at backend-selection time,
 /// before any resolution or spawn is even attempted -- so a user sees the identical words whichever
 /// moment actually catches the failure.
@@ -734,23 +734,23 @@ pub fn user_sidecar_path(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>, re
 /// sentence from this file's own source. Before this fix, step 5's fallthrough -- a fresh
 /// public-release user with nothing built, spec §5.2's most common failure -- carried a different
 /// opening sentence and reached the panel as unrecognised raw text with no headline or remedy at
-/// all: `sidecar_missing_message`'s own remedy ("Install the neovibe package that ships it") is
-/// specific to that function's one call site (an explicitly named `NEOVIBE_SIDECAR_BINARY` that is
+/// all: `sidecar_missing_message`'s own remedy ("Install the Eitri package that ships it") is
+/// specific to that function's one call site (an explicitly named `EITRI_SIDECAR_BINARY` that is
 /// not a file) and would have been the wrong remedy to show here even if the sentence had matched,
 /// which is why the fix reuses the sentence rather than the whole function.
 ///
-/// Deliberately does NOT carry the filesystem path a `neovibe setup` run would use: that path needs
+/// Deliberately does NOT carry the filesystem path an `eitri setup` run would use: that path needs
 /// `$XDG_DATA_HOME`/`$HOME`, readable only at runtime, and this is a `const`. Nor does it carry
 /// `EXPECTED_VERDANDI_REVISION` -- `concat!` takes literal tokens, not a `const` identifier, so
 /// splicing the revision in here would mean a second string-literal copy of it, a second source of
 /// truth. `no_sidecar_message` (below) is a runtime `format!` and appends both when they can be
 /// computed; Task 5's caller, which has no specific resolution attempt to report a path for, prints
 /// this constant alone.
-pub const NO_SIDECAR_HINT: &str = "The agent sidecar is not installed. Run \"neovibe setup\" -- it builds one for you.";
+pub const NO_SIDECAR_HINT: &str = "The agent sidecar is not installed. Run \"eitri setup\" -- it builds one for you.";
 
 /// The full message for `resolve_sidecar_program`'s last resort (step 5 finding no prebuilt
 /// checkout, after steps 1-4 already found nothing): `NO_SIDECAR_HINT` plus the pinned revision and
-/// the exact path `neovibe setup` would write to -- the same path `user_sidecar_path` (step 4) just
+/// the exact path `eitri setup` would write to -- the same path `user_sidecar_path` (step 4) just
 /// looked at and did not find. Falls back to naming what is missing, rather than silently omitting
 /// the path, when neither `$XDG_DATA_HOME` nor `$HOME` gives that function anywhere to answer.
 fn no_sidecar_message(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> String {
@@ -772,10 +772,10 @@ fn no_sidecar_message(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> St
 /// `packages/claude-runtime/src/account.ts` resolves it **once for the sidecar process** and then
 /// sets the full `CLAUDE_PROFILE`/`CLAUDE_CONFIG_DIR`/`CLAUDE_SECURESTORAGE_CONFIG_DIR`/
 /// `ANTHROPIC_CONFIG_DIR` tuple on every `claude` it spawns -- overriding whatever this process
-/// inherited. So neovibe hands over the *name* and lets the sidecar derive the rest: writing the
+/// inherited. So Eitri hands over the *name* and lets the sidecar derive the rest: writing the
 /// tuple here as well would be a second copy of a convention that already lives on one side, and
 /// the copy that drifted would win silently on some hosts and lose on others. There is no proto
-/// field for this and none is needed -- it is a property of the process neovibe itself starts.
+/// field for this and none is needed -- it is a property of the process Eitri itself starts.
 ///
 /// With no account configured this sets exactly what it always set, and the sidecar's own account
 /// support does not engage at all (`VERDANDI_CLAUDE_ACCOUNT` unset is its shipped default).
@@ -803,7 +803,7 @@ fn sidecar_command(
 }
 
 /// True when `path` is exactly discovery step 3's candidate -- `current_exe()`'s sibling -- rather
-/// than an explicitly named `NEOVIBE_SIDECAR_BINARY` (step 1) or the per-user rev-keyed path (step
+/// than an explicitly named `EITRI_SIDECAR_BINARY` (step 1) or the per-user rev-keyed path (step
 /// 4). Compared by path instead of adding a third `SidecarProgram::Packaged` shape to every match
 /// arm and existing test in this file, for a distinction only `sibling_rev_skew_warning`'s call site
 /// needs.
@@ -848,7 +848,7 @@ fn sibling_rev_skew_warning(artifact_path: &Path) -> Vec<String> {
 /// fact rather than an untested implementation detail. Before this, `resolve_sidecar_program`
 /// returning `Err` for a present-but-unbuilt *default* checkout (step 5) was tested, but nothing
 /// pinned that a `Checkout{prebuilt: None}` that DOES reach this point (only possible from the
-/// explicit `NEOVIBE_VERDANDI_CHECKOUT` branch, step 2) still triggers a build -- a later edit to
+/// explicit `EITRI_VERDANDI_CHECKOUT` branch, step 2) still triggers a build -- a later edit to
 /// `spawn()`'s wiring could have silently stopped building for that case, or started building for a
 /// case that should not, with no test failing either way. The tests on this function now assert
 /// both directions with a fake closure, no real `npm`/`node` and no process-env mutation.
@@ -860,7 +860,7 @@ fn invocation_for(
     Ok(match program {
         SidecarProgram::Packaged(path) => {
             // Only a discovery-step-3 sibling of THIS binary carries an optional `.rev` file to
-            // check (spec §5.2) -- an explicitly named `NEOVIBE_SIDECAR_BINARY` was chosen on
+            // check (spec §5.2) -- an explicitly named `EITRI_SIDECAR_BINARY` was chosen on
             // purpose, and the per-user path (step 4) is already keyed by rev in its own directory
             // name, so neither needs this warning.
             let warnings = if is_exe_sibling_artifact(&path, exe_dir) {
@@ -904,8 +904,8 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME");
     let home = std::env::var_os("HOME");
     let program = resolve_sidecar_program(
-        std::env::var("NEOVIBE_SIDECAR_BINARY").ok().as_deref(),
-        std::env::var("NEOVIBE_VERDANDI_CHECKOUT").ok().as_deref(),
+        std::env::var("EITRI_SIDECAR_BINARY").ok().as_deref(),
+        std::env::var("EITRI_VERDANDI_CHECKOUT").ok().as_deref(),
         exe_dir.as_deref(),
         xdg_data_home.as_deref(),
         home.as_deref(),
@@ -1094,7 +1094,7 @@ mod tests {
         let err = resolve_sidecar_program(Some("/no/such/sidecar/binary"), None, None, None, None)
             .expect_err("a named artifact that is absent must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert!(err.to_string().contains("NEOVIBE_SIDECAR_BINARY"), "{err}");
+        assert!(err.to_string().contains("EITRI_SIDECAR_BINARY"), "{err}");
         // `sidecar_missing_message` is what built that text now (spec §10.2's "sidecar missing"
         // row) -- pinned here so a future edit to either the error path or the message itself
         // cannot silently stop naming the searched path.
@@ -1113,11 +1113,11 @@ mod tests {
         assert!(message.contains("/a/b/sidecar"), "{message}");
         assert!(message.contains("/c/d/sidecar"), "{message}");
         assert!(message.contains(PACKAGED_SIDECAR_BINARY), "{message}");
-        assert!(message.contains("NEOVIBE_SIDECAR_BINARY"), "{message}");
+        assert!(message.contains("EITRI_SIDECAR_BINARY"), "{message}");
     }
 
     /// A sibling artifact is used when nothing was named -- the shape a real install has, and the
-    /// same `current_exe()`-sibling convention `agent-hook` and `neovibe-supervisor` already follow.
+    /// same `current_exe()`-sibling convention `agent-hook` and `eitri-supervisor` already follow.
     #[test]
     fn a_sibling_artifact_is_found_when_nothing_is_named() {
         let dir = std::env::temp_dir().join(format!("nv-sidecar-dir-{}", uuid::Uuid::new_v4()));
@@ -1133,8 +1133,8 @@ mod tests {
     }
 
     /// An explicit checkout beats a sibling artifact. A developer pointing at a branch wants that
-    /// branch; preferring the shipped artifact would make `NEOVIBE_VERDANDI_CHECKOUT` look broken
-    /// on exactly the machines where both exist -- which, once neovibe ships the artifact, is every
+    /// branch; preferring the shipped artifact would make `EITRI_VERDANDI_CHECKOUT` look broken
+    /// on exactly the machines where both exist -- which, once Eitri ships the artifact, is every
     /// developer machine.
     #[test]
     fn an_explicit_checkout_beats_a_sibling_artifact() {
@@ -1152,7 +1152,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An empty override is treated as absent. `NEOVIBE_SIDECAR_BINARY=` in a wrapper script is a
+    /// An empty override is treated as absent. `EITRI_SIDECAR_BINARY=` in a wrapper script is a
     /// way of saying "not set", and honouring it literally would fail every spawn with a path that
     /// is the empty string.
     #[test]
@@ -1213,7 +1213,7 @@ mod tests {
     ///
     /// **v1-dist Task 3 (fix round 1):** stopped building a default checkout on demand -- `spawn`
     /// now needs a sidecar it can run with nothing to build (a prebuilt artifact, a user-path build,
-    /// or an explicit `NEOVIBE_VERDANDI_CHECKOUT` pointed at a checkout with nothing built, which
+    /// or an explicit `EITRI_VERDANDI_CHECKOUT` pointed at a checkout with nothing built, which
     /// still builds through the explicit branch). Running this against a bare, unbuilt default
     /// checkout now fails with `NO_SIDECAR_HINT` rather than building one.
     #[test]
@@ -1238,8 +1238,8 @@ mod tests {
     }
 
     /// The packaging scripts hardcode the same default checkout this code computes, and nothing
-    /// else keeps the two equal. They were not equal: `packaging/neovibe.launcher.sh`,
-    /// `install.sh` and `try-neovibe.sh` all said `~/src/verdandi-old-checkout` -- the
+    /// else keeps the two equal. They were not equal: `packaging/eitri.launcher.sh`,
+    /// `install.sh` and `try-eitri.sh` all said `~/src/verdandi-old-checkout` -- the
     /// detached checkout used while Verdandi's protocol-3 merge was outstanding -- while this file
     /// said `~/src/verdandi`. Both directories exist on the machine that wrote them,
     /// so the disagreement was invisible: the launcher's own guard would pass against one
@@ -1248,15 +1248,15 @@ mod tests {
     /// Asserted on the literal text rather than by running the scripts, because the value has to be
     /// right on a machine where neither directory exists.
     ///
-    /// `packaging/neovibe.launcher.sh` left this list on 2026-09-27 (v1 dist, Task 8, spec sec 8):
+    /// `packaging/eitri.launcher.sh` left this list on 2026-09-27 (v1 dist, Task 8, spec sec 8):
     /// the rewritten launcher no longer names any default checkout at all -- the sidecar is either
     /// found (an explicit override, a packaged sibling, or the per-user rev-keyed path Task 3
-    /// introduces) or the launcher prints a "run neovibe setup" hint, never a checkout guess -- so
+    /// introduces) or the launcher prints a "run eitri setup" hint, never a checkout guess -- so
     /// there is nothing left in that file for this default to agree with.
     ///
     /// The root `install.sh` left it the same day, later (v1 dist, Task 11, spec sec 6.2, D11): it
     /// became a thin wrapper over `packaging/install.sh --from-source --checkout`, which passes
-    /// `--verdandi-checkout` only `if` `NEOVIBE_VERDANDI_CHECKOUT` is set -- an `if`, never a `:-`
+    /// `--verdandi-checkout` only `if` `EITRI_VERDANDI_CHECKOUT` is set -- an `if`, never a `:-`
     /// default, so there is nothing in that file for this default to agree with either. A stranger
     /// with no `~/src/verdandi` now gets the pinned public Verdandi source instead of a
     /// guess at a path that only exists on the owner's own machine.
@@ -1265,17 +1265,17 @@ mod tests {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("agent/ has a parent");
-        let expected = format!("${{NEOVIBE_VERDANDI_CHECKOUT:-$HOME/{DEFAULT_CHECKOUT_UNDER_HOME}}}");
+        let expected = format!("${{EITRI_VERDANDI_CHECKOUT:-$HOME/{DEFAULT_CHECKOUT_UNDER_HOME}}}");
 
         for script in [
-            "try-neovibe.sh",
+            "try-eitri.sh",
             // publish.sh (the private deploy script) does not ship publicly.
         ] {
             let path = repo_root.join(script);
             let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
             let uses = text
                 .lines()
-                .filter(|l| l.contains("NEOVIBE_VERDANDI_CHECKOUT:-"))
+                .filter(|l| l.contains("EITRI_VERDANDI_CHECKOUT:-"))
                 .collect::<Vec<_>>();
             // At least one, and EVERY one agreeing -- not "exactly one". This asserted exactly one
             // and went red on `c3375e0`, which legitimately added a second use to `install.sh`
@@ -1296,9 +1296,9 @@ mod tests {
         }
     }
 
-    /// The other half of the change above: `neovibe.launcher.sh` does not merely stop AGREEING
-    /// with this default -- it stops naming `NEOVIBE_VERDANDI_CHECKOUT` as a default for anything
-    /// at all. A stray `NEOVIBE_VERDANDI_CHECKOUT:-...` line re-added there (e.g. by a bad merge
+    /// The other half of the change above: `eitri.launcher.sh` does not merely stop AGREEING
+    /// with this default -- it stops naming `EITRI_VERDANDI_CHECKOUT` as a default for anything
+    /// at all. A stray `EITRI_VERDANDI_CHECKOUT:-...` line re-added there (e.g. by a bad merge
     /// with an older revision of this file) would silently reintroduce the exact drift the test
     /// above exists to catch, one script at a time -- while itself passing, since a script this
     /// test no longer scans can drift freely.
@@ -1307,11 +1307,11 @@ mod tests {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("agent/ has a parent");
-        let path = repo_root.join("packaging/neovibe.launcher.sh");
+        let path = repo_root.join("packaging/eitri.launcher.sh");
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         assert!(
-            !text.contains("NEOVIBE_VERDANDI_CHECKOUT:-"),
-            "packaging/neovibe.launcher.sh still defaults NEOVIBE_VERDANDI_CHECKOUT to a path"
+            !text.contains("EITRI_VERDANDI_CHECKOUT:-"),
+            "packaging/eitri.launcher.sh still defaults EITRI_VERDANDI_CHECKOUT to a path"
         );
     }
 
@@ -1319,7 +1319,7 @@ mod tests {
     /// wrapper over `packaging/install.sh --from-source --checkout`, passing `--verdandi-checkout`
     /// only `if` the variable is set -- never defaulted to a guessed path (a stranger's checkout has
     /// no `~/src/verdandi`) the way the old script's own default silently disagreed with
-    /// this file. `${NEOVIBE_VERDANDI_CHECKOUT:-}` (an empty-string default, just to test whether it
+    /// this file. `${EITRI_VERDANDI_CHECKOUT:-}` (an empty-string default, just to test whether it
     /// is set) is not the thing being ruled out here and is expected to appear.
     #[test]
     fn the_root_install_sh_no_longer_defaults_the_verdandi_checkout() {
@@ -1329,10 +1329,9 @@ mod tests {
         let path = repo_root.join("install.sh");
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         assert!(
-            !text.contains(&format!(
-                "NEOVIBE_VERDANDI_CHECKOUT:-$HOME/{DEFAULT_CHECKOUT_UNDER_HOME}"
-            )) && !text.contains("NEOVIBE_VERDANDI_CHECKOUT:-$HOME"),
-            "the root install.sh still defaults NEOVIBE_VERDANDI_CHECKOUT to a guessed path"
+            !text.contains(&format!("EITRI_VERDANDI_CHECKOUT:-$HOME/{DEFAULT_CHECKOUT_UNDER_HOME}"))
+                && !text.contains("EITRI_VERDANDI_CHECKOUT:-$HOME"),
+            "the root install.sh still defaults EITRI_VERDANDI_CHECKOUT to a guessed path"
         );
         assert!(
             text.contains("--from-source") && text.contains("--checkout"),
@@ -1506,7 +1505,7 @@ mod tests {
         // in the crate that invents a socket path (`socket_path`'s own scanner enforces that).
         let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "account-test").unwrap();
         let command = sidecar_command(
-            Path::new("/usr/lib/neovibe/verdandi-claude-sidecar"),
+            Path::new("/usr/lib/eitri/verdandi-claude-sidecar"),
             &[],
             &socket,
             Some(&account),
@@ -1550,12 +1549,7 @@ mod tests {
     #[test]
     fn with_no_account_the_child_gets_exactly_the_socket_and_nothing_else() {
         let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "account-test").unwrap();
-        let command = sidecar_command(
-            Path::new("/usr/lib/neovibe/verdandi-claude-sidecar"),
-            &[],
-            &socket,
-            None,
-        );
+        let command = sidecar_command(Path::new("/usr/lib/eitri/verdandi-claude-sidecar"), &[], &socket, None);
         let keys: Vec<String> = command
             .get_envs()
             .map(|(k, _)| k.to_string_lossy().to_string())
@@ -1572,7 +1566,7 @@ mod tests {
             .expect("an absolute XDG_DATA_HOME resolves");
         assert_eq!(
             path,
-            Path::new("/data/neovibe/sidecar/abc1234").join(PACKAGED_SIDECAR_BINARY)
+            Path::new("/data/eitri/sidecar/abc1234").join(PACKAGED_SIDECAR_BINARY)
         );
     }
 
@@ -1585,7 +1579,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("home should still resolve for {unusable:?}"));
             assert_eq!(
                 path,
-                Path::new("/home/x/.local/share/neovibe/sidecar/abc1234").join(PACKAGED_SIDECAR_BINARY),
+                Path::new("/home/x/.local/share/eitri/sidecar/abc1234").join(PACKAGED_SIDECAR_BINARY),
                 "{unusable:?}"
             );
         }
@@ -1795,7 +1789,7 @@ mod tests {
     /// above pins that `resolve_sidecar_program` never *returns* a buildable `Checkout` for the
     /// default-checkout case, but nothing had pinned the wiring on the other side -- that a
     /// `Checkout{prebuilt: None}` `spawn()` DOES receive (only possible from the explicit
-    /// `NEOVIBE_VERDANDI_CHECKOUT` branch, step 2) actually reaches the build step. `invocation_for`
+    /// `EITRI_VERDANDI_CHECKOUT` branch, step 2) actually reaches the build step. `invocation_for`
     /// exists so that wiring is this directly testable, with a fake `build` closure standing in for
     /// `ensure_sidecar_built` -- no real `npm`/`node`, no process-env mutation.
     #[test]
@@ -1851,7 +1845,7 @@ mod tests {
     /// And when there is no default checkout at all (a fresh machine, or `$HOME` pointing nowhere
     /// useful), resolution ends the same way -- not with `locate_verdandi_checkout`'s own "no
     /// checkout found" wording, which would name a path nobody asked about -- and the message names
-    /// exactly the path a `neovibe setup` run would use.
+    /// exactly the path an `eitri setup` run would use.
     #[test]
     fn nothing_found_at_all_gives_the_shared_hint_and_the_exact_user_path() {
         let xdg_data_home = std::env::temp_dir().join(format!("nv-xdg-nothing-{}", uuid::Uuid::new_v4()));
@@ -1879,7 +1873,7 @@ mod tests {
     }
 
     /// `sidecar_availability_in` (behind `sidecar_availability`, whose answer `BackendKind::choose`
-    /// prints) must count the user path too -- otherwise a machine that has already run `neovibe
+    /// prints) must count the user path too -- otherwise a machine that has already run `eitri
     /// setup` is told at startup that no sidecar is installed, above a session that then starts fine
     /// from step 4. Before v1-dist Task 5 the same miss fell back to legacy, the shape of bug the
     /// 2026-09-18 correction on `sidecar_availability`'s own doc had already fixed once for the
@@ -1918,9 +1912,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&xdg_data_home);
     }
 
-    /// A named `NEOVIBE_VERDANDI_CHECKOUT` with nothing prebuilt is the one case the spawn builds
+    /// A named `EITRI_VERDANDI_CHECKOUT` with nothing prebuilt is the one case the spawn builds
     /// (step 2), so availability says so rather than "not installed" -- the line a developer running
-    /// `try-neovibe.sh` against an unbuilt checkout used to see above an `npm` build. And it ranks
+    /// `try-eitri.sh` against an unbuilt checkout used to see above an `npm` build. And it ranks
     /// like `resolve_sidecar_program`: an installed sibling or a per-user build below it does not
     /// turn the answer into "runnable", because the spawn still builds the named checkout.
     #[test]
@@ -1958,7 +1952,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&exe_dir);
     }
 
-    /// A named `NEOVIBE_SIDECAR_BINARY` decides alone (step 1), and one that is not a file is
+    /// A named `EITRI_SIDECAR_BINARY` decides alone (step 1), and one that is not a file is
     /// missing -- `resolve_sidecar_program` refuses it with `sidecar_missing_message` -- even when a
     /// sibling artifact sits right there.
     #[test]

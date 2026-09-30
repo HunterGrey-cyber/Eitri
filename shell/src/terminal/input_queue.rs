@@ -18,7 +18,7 @@
 
 use std::collections::VecDeque;
 
-use neovibe_terminal::mouse::MouseInput;
+use eitri_terminal::mouse::MouseInput;
 use terminal_input::NormalizedInput;
 
 /// One paste's place in line, handed out by [`InputQueue::begin_paste`].
@@ -111,7 +111,7 @@ impl InputQueue {
 
 #[cfg(test)]
 mod tests {
-    use neovibe_terminal::mouse::{Button, MouseKind, MouseMods};
+    use eitri_terminal::mouse::{Button, MouseKind, MouseMods};
 
     use super::*;
 

@@ -44,8 +44,7 @@ pub(crate) const NVIM_KEYS_LUA: &str = include_str!("nvim_keys.lua");
 /// The one `--cmd`. It checks the path before `dofile`, because `dofile(nil)` reads stdin -- which
 /// under `--embed` is the RPC pipe -- and wraps the load in `pcall`, so a broken snippet costs the
 /// panel its nvim keys, never the editor.
-pub(crate) const LOADER_CMD: &str =
-    "lua local p = vim.env.NEOVIBE_KEYS_LUA; if p and p ~= '' then pcall(dofile, p) end";
+pub(crate) const LOADER_CMD: &str = "lua local p = vim.env.EITRI_KEYS_LUA; if p and p ~= '' then pcall(dofile, p) end";
 
 pub struct NvimKeysFeed {
     dir: PathBuf,
@@ -113,11 +112,8 @@ impl NvimKeysFeed {
     /// Set on the nvim child only.
     pub fn child_env(&self) -> Vec<(String, String)> {
         vec![
-            (
-                "NEOVIBE_KEYS_SOCKET".to_string(),
-                self.socket_path.display().to_string(),
-            ),
-            ("NEOVIBE_KEYS_LUA".to_string(), self.lua_path.display().to_string()),
+            ("EITRI_KEYS_SOCKET".to_string(), self.socket_path.display().to_string()),
+            ("EITRI_KEYS_LUA".to_string(), self.lua_path.display().to_string()),
         ]
     }
 
@@ -270,7 +266,7 @@ mod tests {
     #[test]
     fn the_loader_checks_its_path_before_dofile() {
         assert!(LOADER_CMD.starts_with("lua "));
-        assert!(LOADER_CMD.contains("NEOVIBE_KEYS_LUA"));
+        assert!(LOADER_CMD.contains("EITRI_KEYS_LUA"));
         assert!(LOADER_CMD.contains("if p and p ~= ''"));
         assert!(LOADER_CMD.contains("pcall(dofile, p)"));
     }
@@ -289,7 +285,7 @@ mod tests {
             "rhs =",
             "desc =",
             "callback =",
-            "NEOVIBE_KEYS_SOCKET",
+            "EITRI_KEYS_SOCKET",
             "keytrans",
         ] {
             assert!(
@@ -305,10 +301,10 @@ mod tests {
         let env = feed.child_env();
         assert!(env
             .iter()
-            .any(|(k, v)| k == "NEOVIBE_KEYS_SOCKET" && v.ends_with(&format!("/{SOCKET_NAME}"))));
+            .any(|(k, v)| k == "EITRI_KEYS_SOCKET" && v.ends_with(&format!("/{SOCKET_NAME}"))));
         assert!(env
             .iter()
-            .any(|(k, v)| k == "NEOVIBE_KEYS_LUA" && v.ends_with("/nvim_keys.lua")));
+            .any(|(k, v)| k == "EITRI_KEYS_LUA" && v.ends_with("/nvim_keys.lua")));
         assert_eq!(feed.nvim_args(), vec!["--cmd".to_string(), LOADER_CMD.to_string()]);
         feed.cleanup();
     }

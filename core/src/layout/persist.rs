@@ -1,6 +1,6 @@
 //! The layout a project was left in, kept between launches (modules spec §4.6).
 //!
-//! **Where:** `$XDG_STATE_HOME/neovibe/layout/<first 16 hex of sha256(canonical project root)>.json`
+//! **Where:** `$XDG_STATE_HOME/eitri/layout/<first 16 hex of sha256(canonical project root)>.json`
 //! (`~/.local/state` when `XDG_STATE_HOME` is unset, as `agent::state_dirs` resolves its own two).
 //! The hash is `agent::conversation_id_for_cwd`'s, cut to 16: the same digest of the same canonical
 //! path. Nothing is written into the project directory -- the rule since `4a6a933`.
@@ -156,28 +156,28 @@ impl NodeFile {
     }
 }
 
-/// `<state home>/neovibe/<sub>`: the rule `state_dir` states, for any of neovibe's state
+/// `<state home>/eitri/<sub>`: the rule `state_dir` states, for any of Eitri's state
 /// directories (`layout`, and the session tabs' `agent`).
 pub fn state_subdir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>, sub: &str) -> Option<PathBuf> {
     match (xdg_state_home, home) {
-        (Some(state), _) if Path::new(state).is_absolute() => Some(PathBuf::from(state).join("neovibe").join(sub)),
+        (Some(state), _) if Path::new(state).is_absolute() => Some(PathBuf::from(state).join("eitri").join(sub)),
         (_, Some(home)) if Path::new(home).is_absolute() => {
-            Some(PathBuf::from(home).join(".local/state/neovibe").join(sub))
+            Some(PathBuf::from(home).join(".local/state/eitri").join(sub))
         }
         _ => None,
     }
 }
 
-/// Creates `dir` -- a [`state_subdir`], `<state home>/neovibe/<sub>` -- and anything missing above
-/// it 0700, and tightens `dir` and its `neovibe` parent to 0700 where an older build left either
-/// open (ruling R5; `agent::private_fs`'s module doc). Every writer of neovibe's own state in this
+/// Creates `dir` -- a [`state_subdir`], `<state home>/eitri/<sub>` -- and anything missing above
+/// it 0700, and tightens `dir` and its `eitri` parent to 0700 where an older build left either
+/// open (ruling R5; `agent::private_fs`'s module doc). Every writer of Eitri's own state in this
 /// crate creates its directory through this, and writes its files 0600
 /// (`agent::private_fs::write_private`).
 pub fn create_state_dir(dir: &Path) -> std::io::Result<()> {
     agent::private_fs::create_private_dir_all(dir, dir.parent().unwrap_or(dir))
 }
 
-/// `<state home>/neovibe/layout`, from the two variables that decide it: `XDG_STATE_HOME`, else
+/// `<state home>/eitri/layout`, from the two variables that decide it: `XDG_STATE_HOME`, else
 /// `$HOME/.local/state` (the XDG spec's own default). An `XDG_STATE_HOME` that is empty or not an
 /// absolute path is ignored, as the XDG spec says to. A `HOME` that is empty or not absolute is
 /// refused too, as `agent::state_dirs` refuses a relative home directory: relative, it would resolve
@@ -433,11 +433,11 @@ mod tests {
     }
 
     /// Into a state directory that does not exist yet -- the owner's first save: his
-    /// `~/.local/state/neovibe` has `conversations/` and `history/` and no `layout/` (the
+    /// `~/.local/state/eitri` has `conversations/` and `history/` and no `layout/` (the
     /// whole-branch review's M1, which deleted `create_dir_all` and failed nothing).
     #[test]
     fn save_then_load_round_trips_and_leaves_no_temporary_file() {
-        let dir = a_dir("layout-persist").join("neovibe/layout");
+        let dir = a_dir("layout-persist").join("eitri/layout");
         assert!(!dir.exists());
         let (layout, lua) = left_as();
         let path = save(&dir, &root(), &layout).unwrap();
@@ -449,16 +449,16 @@ mod tests {
         assert_eq!(names_in(&dir), [file_name(&root())]);
     }
 
-    /// Local-IPC review finding 8 (ruling R5): every writer of neovibe's own state in this crate --
+    /// Local-IPC review finding 8 (ruling R5): every writer of Eitri's own state in this crate --
     /// the layout, the prompt history, the permission rules, the empty tab's mode -- creates its
-    /// directory 0700 and its file 0600, and tightens the `neovibe` root an older build left at
+    /// directory 0700 and its file 0600, and tightens the `eitri` root an older build left at
     /// `0755`. Under the usual umask 022 each of these was `0755`/`0644` before, readable by every
     /// local user wherever the path down to the state home is traversable.
     #[test]
     fn every_state_writer_here_keeps_its_directory_and_file_private() {
         use std::os::unix::fs::PermissionsExt;
         let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
-        let state = a_dir("state-modes").join("neovibe");
+        let state = a_dir("state-modes").join("eitri");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (layout, _) = left_as();
@@ -480,7 +480,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(mode(&state), 0o700, "the neovibe root an older build left open");
+        assert_eq!(mode(&state), 0o700, "the eitri root an older build left open");
         for sub in ["layout", "history", "permissions", "agent"] {
             assert_eq!(mode(&state.join(sub)), 0o700, "{sub}/");
         }
@@ -637,20 +637,20 @@ mod tests {
         assert_ne!(name, file_name(Path::new("/home/user/other")));
         assert_eq!(
             state_dir(Some(OsStr::new("/s")), Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/s/neovibe/layout"))
+            Some(PathBuf::from("/s/eitri/layout"))
         );
         assert_eq!(
             state_dir(None, Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/h/.local/state/neovibe/layout"))
+            Some(PathBuf::from("/h/.local/state/eitri/layout"))
         );
         assert_eq!(
             state_dir(Some(OsStr::new("")), Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/h/.local/state/neovibe/layout")),
+            Some(PathBuf::from("/h/.local/state/eitri/layout")),
             "an empty XDG_STATE_HOME is unset"
         );
         assert_eq!(
             state_dir(Some(OsStr::new("state")), Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/h/.local/state/neovibe/layout")),
+            Some(PathBuf::from("/h/.local/state/eitri/layout")),
             "a relative XDG_STATE_HOME is ignored, as the XDG spec says"
         );
         assert_eq!(state_dir(None, None), None);

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# packaging/aur/bump-bin.sh -- fills packaging/aur/neovibe-bin/PKGBUILD's pkgver, _verdandi_source,
+# packaging/aur/bump-bin.sh -- fills packaging/aur/eitri-bin/PKGBUILD's pkgver, _verdandi_source,
 # _nodever and sha256sums from a real release directory (RELEASE + SHA256SUMS, plan Task 12's
 # release.sh output), then regenerates .SRCINFO. Never runs git -- it only ever *prints* the commit an
 # operator would run by hand, because the AUR is public git with visible authorship and the
@@ -8,21 +8,21 @@
 # Usage: packaging/aur/bump-bin.sh <release-dir> [--allow-prerelease] [--pkgbuild-dir DIR]
 #
 #   <release-dir>        holds RELEASE and SHA256SUMS (plan Task 12's release.sh output, e.g.
-#                         ~/.cache/neovibe-release/v0.2.0/).
-#   --allow-prerelease    Fill the PKGBUILD/.SRCINFO anyway when the release's own NEOVIBE_VERSION
+#                         ~/.cache/eitri-release/v0.2.0/).
+#   --allow-prerelease    Fill the PKGBUILD/.SRCINFO anyway when the release's own EITRI_VERSION
 #                         is a prerelease (contains "-rc."). Only ever pass this for
-#                         packaging/aur/test-in-container.sh's own use: neovibe-bin is not
+#                         packaging/aur/test-in-container.sh's own use: eitri-bin is not
 #                         published to the AUR for a prerelease version (see the note at the top
-#                         of neovibe-bin/PKGBUILD, and
+#                         of eitri-bin/PKGBUILD, and
 #                         the private review notes #3) -- pacman's
 #                         own version comparison sorts a `-rc.N` pkgver ABOVE the final release
 #                         that follows it, stranding every rc installer with no upgrade path.
-#   --pkgbuild-dir DIR    Operate on DIR instead of the sibling neovibe-bin/ directory (testing
+#   --pkgbuild-dir DIR    Operate on DIR instead of the sibling eitri-bin/ directory (testing
 #                         only -- keeps a prerelease bump from dirtying the tracked PKGBUILD).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PKGBUILD_DIR="$SCRIPT_DIR/neovibe-bin"
+PKGBUILD_DIR="$SCRIPT_DIR/eitri-bin"
 ALLOW_PRERELEASE=0
 RELEASE_DIR=""
 
@@ -107,7 +107,7 @@ sum_of() {
 	printf '%s\n' "$v"
 }
 
-VERSION="$(kv NEOVIBE_VERSION)"
+VERSION="$(kv EITRI_VERSION)"
 VERDANDI_SOURCE="$(kv VERDANDI_SOURCE)"
 NODE_VERSION="$(kv NODE_VERSION)"
 NODE_SHA256_X64="$(kv NODE_SHA256_linux_x64)"
@@ -129,7 +129,7 @@ esac
 
 if [ "$IS_PRERELEASE" = 1 ] && [ "$ALLOW_PRERELEASE" != 1 ]; then
 	cat >&2 <<EOF
-bump-bin.sh: $VERSION is a prerelease (-rc.N). neovibe-bin is never published to the AUR for a
+bump-bin.sh: $VERSION is a prerelease (-rc.N). eitri-bin is never published to the AUR for a
 prerelease version: its pkgver ('-' -> '_') sorts ABOVE the eventual final release under pacman's
 own vercmp (vercmp 0.2.0_rc.1-1 0.2.0-1 => 1), stranding every -rc.N installer above 0.2.0 with no
 upgrade path (the private review notes #3).
@@ -140,7 +140,7 @@ EOF
 	exit 1
 fi
 
-TARBALL_SHA="$(sum_of "neovibe-${VERSION}-x86_64-linux.tar.gz")"
+TARBALL_SHA="$(sum_of "eitri-${VERSION}-x86_64-linux.tar.gz")"
 VERDANDI_SHA="$(sum_of "$VERDANDI_SOURCE")"
 
 PKGVER="${VERSION//-/_}"
@@ -207,7 +207,7 @@ fi
 cat <<EOF
 $PKGBUILD_FILE and $SRCINFO_FILE updated for $VERSION.
 
-To publish, in a clone of ssh://aur@aur.archlinux.org/neovibe-bin.git (a separate git history --
+To publish, in a clone of ssh://aur@aur.archlinux.org/eitri-bin.git (a separate git history --
 never this repo):
 
   cp $PKGBUILD_FILE $SRCINFO_FILE <that clone>/
@@ -216,7 +216,7 @@ never this repo):
   GIT_AUTHOR_NAME='Hunter Grey' GIT_AUTHOR_EMAIL=71165939+HunterGrey-cyber@users.noreply.github.com \\
   GIT_COMMITTER_NAME='Hunter Grey' GIT_COMMITTER_EMAIL=71165939+HunterGrey-cyber@users.noreply.github.com \\
     git -c core.hooksPath=/dev/null -c commit.gpgsign=false -c commit.template= \\
-    commit --no-verify -m "neovibe-bin $VERSION"
+    commit --no-verify -m "eitri-bin $VERSION"
   [ "\$(git log -1 --format='%an|%ae|%cn|%ce')" = \\
     'Hunter Grey|71165939+HunterGrey-cyber@users.noreply.github.com|Hunter Grey|71165939+HunterGrey-cyber@users.noreply.github.com' ] \\
     || { echo 'IDENTITY MISMATCH -- do not push' >&2; exit 1; }

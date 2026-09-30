@@ -10,7 +10,7 @@
 //! written against `8b13773`) -- unchanged in substance, just placed under this crate's own
 //! `tests/` the way its other integration tests are.
 
-use neovibe_terminal::{PtySize, Screen, ScrollRequest, TerminalColors};
+use eitri_terminal::{PtySize, Screen, ScrollRequest, TerminalColors};
 use terminal_render::PaintOp;
 
 #[test]

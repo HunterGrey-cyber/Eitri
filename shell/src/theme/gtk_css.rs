@@ -2,7 +2,7 @@
 
 use gtk4::CssProvider;
 
-use neovibe_core::theme::tokens::{ThemeTokens, PROSE_FONT_STACK};
+use eitri_core::theme::tokens::{ThemeTokens, PROSE_FONT_STACK};
 
 /// Overrides GTK/Adwaita on every class the shell draws, so none of the default theme leaks
 /// through. Class names are unchanged from the placeholder palette this replaced; restyling the
@@ -20,7 +20,7 @@ pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     let hover = tokens.cursorline.hex();
     let error = tokens.error.hex();
     // The global `f` HINT's label pair (nvim's IncSearch). `hint_fg` is guarded for text against
-    // `hint_bg` only (`neovibe_core::theme::tokens`), so it is used nowhere but on its own fill.
+    // `hint_bg` only (`eitri_core::theme::tokens`), so it is used nowhere but on its own fill.
     let hint_bg = tokens.hint_bg.hex();
     let hint_fg = tokens.hint_fg.hex();
     let font = PROSE_FONT_STACK;
@@ -262,7 +262,7 @@ impl ThemeCss {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neovibe_core::theme::payload::{HlAttrs, NvimOptions, NvimThemePayload, PAYLOAD_VERSION};
+    use eitri_core::theme::payload::{HlAttrs, NvimOptions, NvimThemePayload, PAYLOAD_VERSION};
 
     fn dawn() -> ThemeTokens {
         ThemeTokens::derive(&NvimThemePayload {
@@ -438,7 +438,7 @@ mod tests {
 
     /// A web module's `WebHost` exists only to hold its `WebView` at (0,0) (`web_host`'s module doc)
     /// and must add nothing around it: the host's rectangle is the module's and the `WebView`'s. No
-    /// rule here names the host's node, so neovibe's own stylesheet gives it no padding, border or
+    /// rule here names the host's node, so Eitri's own stylesheet gives it no padding, border or
     /// background of its own.
     #[test]
     fn no_rule_names_the_web_host() {

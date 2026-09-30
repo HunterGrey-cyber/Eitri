@@ -4,9 +4,9 @@ version.workspace = true
 edition = "2021"
 publish = false
 license = "MIT"
-# Moved from Verdandi (`crates/terminal-frame` @ e5f9cc3) into neovibe on 2026-09-23, the owner's decision 4.1(a)
-# in docs/superpowers/specs/2026-09-23-bottom-terminal-design.md: neovibe is its only product consumer.
-# Verdandi stated no licence for it; it is the owner's own code, MIT with the rest of neovibe from here.
+# Moved from Verdandi (`crates/terminal-frame` @ e5f9cc3) into Eitri on 2026-09-23, the owner's decision 4.1(a)
+# in docs/superpowers/specs/2026-09-23-bottom-terminal-design.md: Eitri is its only product consumer.
+# Verdandi stated no licence for it; it is the owner's own code, MIT with the rest of Eitri from here.
 description = "TerminalFrame: the stable Verdandi presentation contract, its projection from an authoritative alacritty_terminal::Term, and the wire encodings it is measured with."
 
 # alacritty_terminal is the ONLY dependency. `vte` is reached through

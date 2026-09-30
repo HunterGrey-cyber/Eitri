@@ -1,4 +1,4 @@
-//! `neovibe-terminal`: the engine of the bottom terminal (spec
+//! `eitri-terminal`: the engine of the bottom terminal (spec
 //! `docs/superpowers/specs/2026-09-23-bottom-terminal-design.md`).
 //!
 //! One terminal is one `TerminalSession`: a thread that owns the PTY, the child, the
@@ -6,8 +6,8 @@
 //! screen. The host (`shell/src/terminal/`, GTK) sends it `SessionCommand`s, is woken when there is
 //! a new frame, and paints that frame with [`paint`].
 //!
-//! **GTK-free by construction**, the same way `neovibe-core` is: `src/manifest_guard.rs` fails on a
-//! manifest that names `gtk4`/`glib`/`gdk`/`webkit6`. Unix-only, like `neovibe-core`: PTYs are.
+//! **GTK-free by construction**, the same way `eitri-core` is: `src/manifest_guard.rs` fails on a
+//! manifest that names `gtk4`/`glib`/`gdk`/`webkit6`. Unix-only, like `eitri-core`: PTYs are.
 //!
 //! Where the pieces came from, so the history is findable:
 //! - `paint.rs` and `metrics.rs` are the frozen `terminal-pane/src/{backend,metrics}.rs` from

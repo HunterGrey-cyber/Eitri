@@ -584,7 +584,7 @@ body,
    file at six values, so "make the panel bigger" meant editing thirty-one numbers and hoping the
    proportions survived. `--nv-font-size` is emitted by Rust with every other `--nv-*`
    (`core/src/theme/tokens.rs`, `DEFAULT_PANEL_FONT_SIZE_PX`) and set from `init.lua`'s
-   `neovibe.config.set("agent.font_size", "16")`. Unset, it is 14px and nothing here moves.
+   `eitri.config.set("agent.font_size", "16")`. Unset, it is 14px and nothing here moves.
 
    The ratios are written as the fraction they came from -- `* 12.5 / 14`, not `* 0.893` -- so each
    one still says what it was when the base was 14, and none of them drifts by rounding. Six steps
@@ -1323,7 +1323,7 @@ textarea,
 }
 
 /* --- Panel round 2 plan Task 12: the empty tab's dashboard (spec §7) ------------------------- */
-/* LazyVim's start screen (snacks.nvim), `mock: empty.html` C: a centred `neovibe`, the where-line,
+/* LazyVim's start screen (snacks.nvim), `mock: empty.html` C: a centred `Eitri`, the where-line,
    one row per `dashItems`, the selected mode's consequence line. Replaces the eight resume rows
    (`.empty-tab-resume` above is now dead JSX-wise -- kept only because `indexCss.test.ts`'s
    "keeps the empty tab inside its column" test still renders a synthetic `.empty-tab-resume

@@ -160,7 +160,7 @@ pub struct CursorCell {
     pub visible: bool,
 }
 
-/// The `Term` configuration every neovibe terminal runs with. A function, so a test can pin it.
+/// The `Term` configuration every Eitri terminal runs with. A function, so a test can pin it.
 ///
 /// - `osc52: OnlyCopy` -- a program may SET the clipboard (nvim's `"+y`), never READ it (spec §4.6).
 ///   `Term` enforces this itself, before any event reaches the listener.
@@ -442,7 +442,7 @@ impl Screen {
         }
     }
 
-    /// The whole visible screen. `focused` picks a solid or a hollow cursor -- neovibe's rule that a
+    /// The whole visible screen. `focused` picks a solid or a hollow cursor -- Eitri's rule that a
     /// solid cursor means the keys go here (`shell/src/pane_focus.rs`).
     ///
     /// Outside an open synchronized update, `term` is always quiescent (`open_update() == None`
@@ -687,7 +687,7 @@ mod tests {
 
     /// Review 2026-09-23, finding 3 (the other half): `Term` really is the layer that refuses a
     /// read, not merely `Screen`'s listener happening to agree. Under `Osc52::CopyPaste` (the
-    /// negative control -- never neovibe's own config), alacritty's `clipboard_load` (verified
+    /// negative control -- never Eitri's own config), alacritty's `clipboard_load` (verified
     /// against `alacritty_terminal-0.26.0/src/term/mod.rs`) DOES emit `Event::ClipboardLoad`; only
     /// our listener's own, separate, unconditional no-op then drops it. So the refusal is real and
     /// double-layered, as the module doc claims -- neither layer alone is a coincidence.
@@ -730,7 +730,7 @@ mod tests {
             assert_eq!(
                 record(Osc52::CopyPaste, read),
                 1,
-                "{name}: under a config neovibe never uses, Term does emit ClipboardLoad -- \
+                "{name}: under a config Eitri never uses, Term does emit ClipboardLoad -- \
                  proving OnlyCopy's silence above is Term's own refusal, not an artifact of this test"
             );
         }
@@ -1120,7 +1120,7 @@ mod tests {
     /// under the fix it does zero projections during `feed` at all, only per-byte bookkeeping.
     /// `#[ignore]`d for the same reason Task 1's `delta_equals_full` is: a timing-sensitive,
     /// multi-second-when-red test in every debug workspace run costs more than it buys. Run with
-    /// `cargo test -p neovibe-terminal --lib -- --ignored`.
+    /// `cargo test -p eitri-terminal --lib -- --ignored`.
     #[test]
     #[ignore = "timing-sensitive; run with --ignored to confirm no per-read projection cost"]
     fn feeding_a_plain_flood_pays_no_per_read_projection_cost() {

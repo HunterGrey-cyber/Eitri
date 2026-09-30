@@ -32,7 +32,7 @@ pub(crate) struct TopBar {
     pub(crate) items: Vec<gtk4::Widget>,
     /// Minimize/maximize/close. Hidden whenever the window is fullscreen (`window_mode`).
     pub(crate) controls: gtk4::Widget,
-    /// The `neovibe` label, drawn as a solid block while the `Ctrl+a` prefix waits (`prefix`).
+    /// The `Eitri` label, drawn as a solid block while the `Ctrl+a` prefix waits (`prefix`).
     pub(crate) app_name: gtk4::Label,
     /// Where the prefix strip goes, right of the app name (`prefix_strip`, modules P2).
     pub(crate) strip: gtk4::Box,
@@ -65,7 +65,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     bar.add_css_class("topbar");
     bar.set_valign(gtk4::Align::Fill);
 
-    let app_name = gtk4::Label::new(Some("neovibe"));
+    let app_name = gtk4::Label::new(Some("Eitri"));
     app_name.add_css_class("topbar-app-name");
 
     let project_name = gtk4::Label::new(Some(&project_display_name(project_root)));

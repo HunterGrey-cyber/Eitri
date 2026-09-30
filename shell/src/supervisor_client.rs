@@ -1,7 +1,7 @@
-//! `shell`'s client of the cross-window agent-status dashboard (`neovibe-supervisor`). Connects
+//! `shell`'s client of the cross-window agent-status dashboard (`eitri-supervisor`). Connects
 //! once at startup to a supervisor that is already listening, registers this instance, and pushes
 //! a status update whenever the derived status actually changes. It does NOT start one: since
-//! 2026-09-19 that needs `NEOVIBE_SUPERVISOR=1`, because a window appearing on screen is a thing
+//! 2026-09-19 that needs `EITRI_SUPERVISOR=1`, because a window appearing on screen is a thing
 //! the user asks for (see `spawn_requested`). See
 //! docs/superpowers/specs/2026-09-08-supervisor-cross-window-agent-status-design.md.
 
@@ -58,7 +58,7 @@ pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> Agen
     AgentStatus::Idle
 }
 
-/// A live connection to `neovibe-supervisor`, or the deliberate absence of one. Every method is
+/// A live connection to `eitri-supervisor`, or the deliberate absence of one. Every method is
 /// best-effort: a failure anywhere in this client (spawn fails, connect fails, write fails)
 /// degrades to "this shell window just doesn't appear in the dashboard" rather than propagating
 /// an error `shell`'s own startup or main loop would need to handle -- this is a nice-to-have
@@ -98,7 +98,7 @@ fn retry_schedule() -> Vec<u64> {
     vec![25, 50, 100, 200, 400, 800, 1600, 1600, 1600, 1600]
 }
 
-/// Whether this window may *start* `neovibe-supervisor` when none is listening.
+/// Whether this window may *start* `eitri-supervisor` when none is listening.
 ///
 /// **Default: no, changed 2026-09-19 at the owner's request** ("supervisor 的窗口能不能先隐藏").
 /// Until then, the first `shell` launch on a machine put a second, unasked-for GTK window on the
@@ -124,7 +124,7 @@ fn spawn_requested(raw: Option<&str>) -> bool {
 }
 
 impl SupervisorClient {
-    /// Connects to the well-known socket, spawning `neovibe-supervisor` first if nothing is
+    /// Connects to the well-known socket, spawning `eitri-supervisor` first if nothing is
     /// listening. Never blocks the caller for longer than one connect attempt: when a spawn is
     /// needed, the retry loop runs on a worker thread and the result arrives over the returned
     /// channel, which `agent_panel`'s existing 33ms pump drains -- the same shape it already uses
@@ -142,7 +142,7 @@ impl SupervisorClient {
         // Nothing is listening, and that is where this used to spawn one. It no longer does by
         // default -- see `spawn_requested`. Registering with a dashboard somebody opened and
         // OPENING one are different acts, and only the first is this window's business.
-        if !spawn_requested(std::env::var("NEOVIBE_SUPERVISOR").ok().as_deref()) {
+        if !spawn_requested(std::env::var("EITRI_SUPERVISOR").ok().as_deref()) {
             return PendingSupervisor::Ready(None);
         }
 
@@ -179,7 +179,7 @@ impl SupervisorClient {
                 }
             }
             Err(e) => {
-                eprintln!("shell: could not locate neovibe-supervisor binary: {e}");
+                eprintln!("shell: could not locate eitri-supervisor binary: {e}");
                 return PendingSupervisor::Ready(None);
             }
         }
@@ -201,7 +201,7 @@ impl SupervisorClient {
                 }
             }
             eprintln!(
-                "shell: neovibe-supervisor did not accept a connection after spawning and \
+                "shell: eitri-supervisor did not accept a connection after spawning and \
                  {attempts} retries over {total_ms}ms"
             );
             let _ = tx.send(None);
@@ -286,7 +286,7 @@ impl SupervisorClient {
                     match serde_json::from_str::<SupervisorMessage>(trimmed) {
                         Ok(SupervisorMessage::Activate) => activated = true,
                         Err(e) => {
-                            eprintln!("shell: unparseable message from neovibe-supervisor: {e} -- raw: {trimmed}")
+                            eprintln!("shell: unparseable message from eitri-supervisor: {e} -- raw: {trimmed}")
                         }
                     }
                     continue;
@@ -436,7 +436,7 @@ mod tests {
             assert!(spawn_requested(Some(yes)), "{yes:?} should ask for a supervisor");
         }
         // Empty and "0" are the two a caller is most likely to produce by accident -- an unset
-        // variable expanded by a shell (`NEOVIBE_SUPERVISOR=$UNSET`), and someone turning it off
+        // variable expanded by a shell (`EITRI_SUPERVISOR=$UNSET`), and someone turning it off
         // the obvious way. Neither may be read as consent.
         for no in ["", "0", "false", "no", "yes please", "TRUE", "on"] {
             assert!(!spawn_requested(Some(no)), "{no:?} should not start anything");

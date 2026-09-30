@@ -1,10 +1,10 @@
-//! The permission policy judges a path in neovibe's own process; the CLI child that then writes or
-//! reads it runs with the project root as its cwd (`agent::process` sets `current_dir`), and neovibe
+//! The permission policy judges a path in Eitri's own process; the CLI child that then writes or
+//! reads it runs with the project root as its cwd (`agent::process` sets `current_dir`), and Eitri
 //! itself never changes directory. So `/proc/self/cwd` names a different directory in each: started
-//! as `cd ~/proj/src && neovibe ~/proj`, neovibe's is `~/proj/src` and the CLI's `~/proj`.
+//! as `cd ~/proj/src && eitri ~/proj`, Eitri's is `~/proj/src` and the CLI's `~/proj`.
 //!
 //! Item 4A's third review (2026-09-28, BLOCKING) reproduced it: a cloned repository holding
-//! `d -> /proc/self/cwd/..` made `Write d/.config/autostart/evil.desktop` resolve, in neovibe, to
+//! `d -> /proc/self/cwd/..` made `Write d/.config/autostart/evil.desktop` resolve, in Eitri, to
 //! `~/proj/.config/autostart/evil.desktop` -- inside the project, allowed with no card -- while the
 //! CLI wrote `~/.config/autostart/evil.desktop`. The same resolver judges `Read`, so a read escaped
 //! the same way.
@@ -16,7 +16,7 @@
 
 #[cfg(target_os = "linux")]
 #[test]
-fn a_link_through_proc_self_cwd_cards_wherever_neovibe_was_started() {
+fn a_link_through_proc_self_cwd_cards_wherever_eitri_was_started() {
     use agent::{classify_permission_request, PermissionVerdict};
     use serde_json::json;
     use std::path::PathBuf;
@@ -35,7 +35,7 @@ fn a_link_through_proc_self_cwd_cards_wherever_neovibe_was_started() {
     std::fs::write(root.join("nb.ipynb"), "{}\n").unwrap();
     std::os::unix::fs::symlink("/proc/self/cwd/..", root.join("d")).unwrap();
 
-    // `cd ~/proj/src && neovibe ~/proj`.
+    // `cd ~/proj/src && eitri ~/proj`.
     let started_in = std::env::current_dir().unwrap();
     std::env::set_current_dir(root.join("src")).unwrap();
     assert_eq!(

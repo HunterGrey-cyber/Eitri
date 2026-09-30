@@ -3,7 +3,7 @@
 //!
 //! The two older tests are `#[ignore]`d, as they were when this file was written; the v1-hardening
 //! ones are not, because that plan ignores only a test that needs a display. So **`cargo test -p
-//! neovibe-core` needs `nvim` on PATH** since Task 6. None of them spends tokens, touches the
+//! eitri-core` needs `nvim` on PATH** since Task 6. None of them spends tokens, touches the
 //! network, opens a window or needs a display.
 //!
 //! Every other real-nvim test in this crate drives `nvim --headless` with no UI attached and reads
@@ -13,7 +13,7 @@
 //! actually block, in mode `r?`, so this talks real msgpack-RPC instead: a small client over `rmpv`,
 //! since nothing else in this crate needs one.
 //!
-//! Run the ignored ones too: `cargo test -p neovibe-core --test editor_quit_with_real_nvim -- --include-ignored`
+//! Run the ignored ones too: `cargo test -p eitri-core --test editor_quit_with_real_nvim -- --include-ignored`
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -23,7 +23,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use neovibe_core::layout::kill::editor_quit_lua;
+use eitri_core::layout::kill::editor_quit_lua;
 use rmpv::Value;
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -167,7 +167,7 @@ fn spawn_nvim_with(scratch: &Path, socket_path: &Path, extra: &[&str]) -> Child 
         .env("XDG_STATE_HOME", scratch.join("state"))
         .env("XDG_DATA_HOME", scratch.join("data"))
         .env("XDG_CONFIG_HOME", scratch.join("config"))
-        .env("NEOVIBE_PANE_SWITCH_SOCKET", socket_path)
+        .env("EITRI_PANE_SWITCH_SOCKET", socket_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -6,12 +6,12 @@
 //! controller with `set_im_context`, so GTK runs the input method on every key BEFORE `key-pressed`
 //! and a key it consumes (a composition in progress) never reaches the terminal's own key path.
 //! Composed text arrives through `commit`; the pane draws the unfinished composition itself
-//! (`preedit-changed`, `neovibe_terminal::layout_preedit`) and tells the input method where it is
+//! (`preedit-changed`, `eitri_terminal::layout_preedit`) and tells the input method where it is
 //! (`set_cursor_location`). The GTK wiring is `pane.rs`'s; the decisions are here, pure, and tested
 //! with synthetic signals.
 //!
 //! **A commit reaches the shell only while the terminal holds the keys, and never out of the pane's
-//! own reset.** neovibe's keys are taken before the input method sees them -- the `Ctrl+a` prefix,
+//! own reset.** Eitri's keys are taken before the input method sees them -- the `Ctrl+a` prefix,
 //! `Ctrl+h/j/k/l`, HINT and the app accelerators are all capture phase -- so a composition can be
 //! cut off by anything that moves the keys elsewhere: `Ctrl+k`, `Ctrl+a t`, a HINT label, a click in
 //! another module, alt-tab. **GTK then focuses the input method out itself, from inside the focus
@@ -27,13 +27,13 @@
 //! of them already false -- which one depends on how the keys left), and not only what `pane_focus`
 //! last reported; any of the three saying no drops the commit. That text is
 //! half-typed pinyin, or a candidate the owner never chose: garbage to a shell. **Dropping it is
-//! neovibe's choice, not fcitx5's convention:** in his other GTK4 apps the same click away inserts
+//! Eitri's choice, not fcitx5's convention:** in his other GTK4 apps the same click away inserts
 //! the raw `ni hao` (the plan's owner decision 1). The same holds while the pane resets the input
 //! method for a reason of its own: a paste or a `Ctrl+a` literal cutting into a composition discards
 //! it, then goes to the shell (fcitx5-gtk commits out of `reset` too, `fcitximcontext.cpp:1119`).
 //!
 //! **What asking GTK covers:** every focus-out GTK itself starts, which is every way the keys leave
-//! (neovibe's own moves, a click, alt-tab). Not one the fcitx5 server starts: its `NotifyFocusOut`
+//! (Eitri's own moves, a click, alt-tab). Not one the fcitx5 server starts: its `NotifyFocusOut`
 //! (fcitx5 5.1.22, `dbusfrontend.cpp:626-634`) makes fcitx5-gtk commit if it still believes it has
 //! focus (`fcitximcontext.cpp:708-715`). That reaches the shell only if the server focuses the
 //! terminal's input context out while GTK says the terminal has the keys, or if a stale one meets

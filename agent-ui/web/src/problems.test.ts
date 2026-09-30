@@ -30,15 +30,15 @@ describe("classify (spec §10.2)", () => {
     // project's own Rust rather than something the sidecar or CLI printed.
     const text =
       "The agent sidecar is not installed. Looked for it at:\n" +
-      "  - /home/user/.local/lib/neovibe/verdandi-claude-sidecar\n" +
-      "Install the neovibe package that ships it (verdandi-claude-sidecar), or point NEOVIBE_SIDECAR_BINARY at a real one.";
+      "  - /home/user/.local/lib/eitri/verdandi-claude-sidecar\n" +
+      "Install the eitri package that ships it (verdandi-claude-sidecar), or point EITRI_SIDECAR_BINARY at a real one.";
     const problem = classify(text);
     expect(problem).toEqual({
       headline: "The agent sidecar is not installed.",
       remedy:
         "Looked for it at:\n" +
-        "  - /home/user/.local/lib/neovibe/verdandi-claude-sidecar\n" +
-        "Install the neovibe package that ships it (verdandi-claude-sidecar), or point NEOVIBE_SIDECAR_BINARY at a real one.",
+        "  - /home/user/.local/lib/eitri/verdandi-claude-sidecar\n" +
+        "Install the eitri package that ships it (verdandi-claude-sidecar), or point EITRI_SIDECAR_BINARY at a real one.",
     });
   });
 

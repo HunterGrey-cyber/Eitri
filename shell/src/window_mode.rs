@@ -134,7 +134,7 @@ impl WindowModes {
             }
         });
         app.add_action(&action);
-        app.set_accels_for_action("app.fullscreen", neovibe_core::keymap::root::accels("fullscreen"));
+        app.set_accels_for_action("app.fullscreen", eitri_core::keymap::root::accels("fullscreen"));
 
         // The compositor answering. Which of the three things it can mean is `classify_window_notify`'s
         // job; the one that moves the mode is a change nothing here asked for.

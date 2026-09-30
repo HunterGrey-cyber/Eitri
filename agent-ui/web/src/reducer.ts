@@ -129,7 +129,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // `event.kind` is narrowed to "text" here, the only other member of the union.
       // `transcript` holds assistant MESSAGES, not content events. Under partial streaming a single
       // 600-word reply arrives as 400+ deltas; pushing each as its own entry renders 400 separate
-      // bubbles, each markdown-parsed in isolation -- and a fragment like "`neovibe_" or "**bold"
+      // bubbles, each markdown-parsed in isolation -- and a fragment like "`eitri_" or "**bold"
       // is not valid standalone markdown, so every streamed reply's formatting breaks.
       //
       // MUST stay identical to `AgentSessionProjection::apply` in agent/src/projection.rs: the two

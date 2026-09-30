@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{size, spec};
-use neovibe_terminal::{child_environment, PtyChild, PtySize};
+use eitri_terminal::{child_environment, PtyChild, PtySize};
 
 /// Reads the child's output until its side of the PTY is closed.
 fn read_to_end(child: &mut PtyChild) -> Vec<u8> {
@@ -76,10 +76,7 @@ fn the_child_gets_exactly_the_hosts_environment_minus_tmux_plus_three() {
             .collect(),
     );
     assert_eq!(got, want);
-    assert_eq!(
-        got.get(&OsString::from("TERM_PROGRAM")),
-        Some(&OsString::from("neovibe"))
-    );
+    assert_eq!(got.get(&OsString::from("TERM_PROGRAM")), Some(&OsString::from("eitri")));
     assert!(!got.contains_key(&OsString::from("TMUX")) && !got.contains_key(&OsString::from("TMUX_PANE")));
     // The owned spawn injects nothing of its own -- unlike `alacritty_terminal::tty`, which sets
     // `ALACRITTY_WINDOW_ID` unconditionally. A host that happens to run this test *inside*
@@ -149,7 +146,7 @@ fn eof_then_wait_gives_the_exit_code_and_leaves_no_zombie() {
 /// panic and not a pane that silently never shows anything (Review Focus 1).
 #[test]
 fn a_program_that_does_not_exist_is_an_error() {
-    let err = PtyChild::spawn(&spec("/nonexistent/neovibe-shell", &[]), size(80, 24))
+    let err = PtyChild::spawn(&spec("/nonexistent/eitri-shell", &[]), size(80, 24))
         .err()
         .expect("spawning a missing program fails");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -249,7 +246,7 @@ fn the_child_inherits_no_stray_descriptor() {
 #[test]
 #[ignore = "run only by no_orphan_survives_the_host_being_killed"]
 fn orphan_helper() {
-    if std::env::var_os("NEOVIBE_TERMINAL_ORPHAN_HELPER").is_none() {
+    if std::env::var_os("EITRI_TERMINAL_ORPHAN_HELPER").is_none() {
         return;
     }
     let child = PtyChild::spawn(&common::plain_sh(), size(80, 24)).unwrap();
@@ -257,7 +254,7 @@ fn orphan_helper() {
     std::thread::sleep(Duration::from_secs(60));
 }
 
-/// neovibe dying abruptly (a crash, a SIGKILL) must not leave the shell running: the kernel closes
+/// Eitri dying abruptly (a crash, a SIGKILL) must not leave the shell running: the kernel closes
 /// the master fd with the process, which hangs up the tty and SIGHUPs its session.
 #[cfg(target_os = "linux")]
 #[test]
@@ -270,7 +267,7 @@ fn no_orphan_survives_the_host_being_killed() {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("NEOVIBE_TERMINAL_ORPHAN_HELPER", "1")
+        .env("EITRI_TERMINAL_ORPHAN_HELPER", "1")
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();

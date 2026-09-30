@@ -27,7 +27,7 @@
 //! 4.22.5). [`WebHost::new`] also clears the child's margins and sets its alignment to `Fill`, the two
 //! things `gtk_widget_allocate` adds to the position a parent gives a child and
 //! `gtk_widget_get_allocation` (what WebKit reads) reports back (`gtkwidget.c`, 4.22.5). The grid
-//! allocates the host where the module goes, and WebKit then adds (0,0). No rule in neovibe's
+//! allocates the host where the module goes, and WebKit then adds (0,0). No rule in Eitri's
 //! stylesheet names the host's node, [`CSS_NAME`] (`theme::gtk_css`'s tests hold that), and CSS margin,
 //! border or padding on either widget would not move the child anyway: `gtk_widget_get_allocation`
 //! subtracts the child's own CSS boxes again, and the host's are outside its children's coordinates.
@@ -42,7 +42,7 @@
 //! window resize that moves the panel but not its caret therefore leaves fcitx5 holding the rectangle
 //! translated at the panel's old position until the next caret move or focus-in, so the first
 //! composition after such a change can still open where the panel used to be. The sandbox measured
-//! it (a `prefix z` zoom, then typing: no new rectangle sent at all). neovibe cannot reach WebKit's
+//! it (a `prefix z` zoom, then typing: no new rectangle sent at all). Eitri cannot reach WebKit's
 //! private input method context to make it send again.
 //!
 //! **Focus.** The host is not focusable, and GTK's default grab refuses a widget that is not
@@ -79,7 +79,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for WebHost {
-        const NAME: &'static str = "NeovibeWebHost";
+        const NAME: &'static str = "EitriWebHost";
         type Type = super::WebHost;
         type ParentType = gtk4::Widget;
 

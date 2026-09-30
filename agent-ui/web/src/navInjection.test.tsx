@@ -31,7 +31,7 @@ let posted: Array<Record<string, unknown>>;
 beforeEach(() => {
   posted = [];
   (window as unknown as { webkit: unknown }).webkit = {
-    messageHandlers: { neovibeAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } },
+    messageHandlers: { eitriAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } },
   };
   vi.useFakeTimers();
 });
@@ -43,7 +43,7 @@ afterEach(() => {
 
 function dispatch(payload: unknown) {
   act(() => {
-    window.__neovibeDispatch!(JSON.stringify(payload));
+    window.__eitriDispatch!(JSON.stringify(payload));
   });
 }
 const HELLO: Hello = {

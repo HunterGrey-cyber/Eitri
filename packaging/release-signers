@@ -1,13 +1,13 @@
-# neovibe release signers (spec 2026-09-27-v1-dist-design.md §6.4, decisions D5 and D13).
+# Eitri release signers (spec 2026-09-27-v1-dist-design.md §6.4, decisions D5 and D13).
 #
 # ssh-keygen's allowed_signers format. packaging/install.sh embeds this file byte for byte (a test
 # holds the two equal) and checks a release's SHA256SUMS.sig with exactly:
 #
-#   ssh-keygen -Y verify -f <this file> -I release@neovibe -n neovibe-release -s SHA256SUMS.sig < SHA256SUMS
+#   ssh-keygen -Y verify -f <this file> -I release@eitri -n eitri-release -s SHA256SUMS.sig < SHA256SUMS
 #
 # A key line looks like this, with no comment field after the key:
 #
-#   release@neovibe namespaces="neovibe-release" ssh-ed25519 AAAA...
+#   release@eitri namespaces="eitri-release" ssh-ed25519 AAAA...
 #
 # There is no key line yet. The owner adds the dedicated release key's public half here before the
 # first final release (spec §4.4); it must not be an everyday login key, and release.sh refuses one

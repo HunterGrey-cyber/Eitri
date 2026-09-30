@@ -1,4 +1,4 @@
-//! `neovibe.on(event_name, handler)` -- subscribe a Lua function to a named event. v1 ships
+//! `eitri.on(event_name, handler)` -- subscribe a Lua function to a named event. v1 ships
 //! exactly one real event, `"shell:ready"` (fired once, after `init.lua` has loaded and the
 //! window is presented) -- more get added incrementally as real plugins need them, matching
 //! this project's stated "small set of concrete extension points, expanded as needed" approach
@@ -29,13 +29,13 @@ impl EventBus {
 }
 
 /// `pub`: `LuaEngine::new` calls this.
-pub fn install(lua: &Lua, neovibe: &Table, bus: Rc<RefCell<EventBus>>) -> mlua::Result<()> {
+pub fn install(lua: &Lua, eitri: &Table, bus: Rc<RefCell<EventBus>>) -> mlua::Result<()> {
     let on_fn = lua.create_function(move |lua, (event_name, handler): (String, mlua::Function)| {
         let key = lua.create_registry_value(handler)?;
         bus.borrow_mut().subscribe(event_name, key);
         Ok(())
     })?;
-    neovibe.set("on", on_fn)?;
+    eitri.set("on", on_fn)?;
     Ok(())
 }
 
@@ -47,7 +47,7 @@ pub fn install(lua: &Lua, neovibe: &Table, bus: Rc<RefCell<EventBus>>) -> mlua::
 /// Takes `bus: &RefCell<EventBus>` (not an already-borrowed `&EventBus`) so it can control its
 /// own borrow's lifetime: the borrow is taken only long enough to clone out the `Rc<RegistryKey>`
 /// handles for `event_name`, then dropped *before* any handler function is actually called. This
-/// is required, not just tidy -- a handler that itself calls `neovibe.on(...)` (subscribing
+/// is required, not just tidy -- a handler that itself calls `eitri.on(...)` (subscribing
 /// another handler, possibly to this same event) needs `EventBus::subscribe`'s
 /// `bus.borrow_mut()` to succeed, which would panic with `BorrowMutError` if this function's own
 /// borrow of `bus` were still held while the handler ran. Same reentrancy hazard, and the same
@@ -80,15 +80,15 @@ mod tests {
     #[test]
     fn subscribed_handler_runs_on_emit() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let bus = Rc::new(RefCell::new(EventBus::default()));
-        install(&lua, &neovibe, bus.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, bus.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         lua.load(
             r#"
             handler_ran = false
-            neovibe.on("test_event", function() handler_ran = true end)
+            eitri.on("test_event", function() handler_ran = true end)
             "#,
         )
         .exec()
@@ -109,7 +109,7 @@ mod tests {
     }
 
     /// Regression test for the reentrancy panic the final review reproduced: a handler for
-    /// `"test_event"` that itself calls `neovibe.on("test_event", ...)` -- subscribing another
+    /// `"test_event"` that itself calls `eitri.on("test_event", ...)` -- subscribing another
     /// handler to the very event currently being emitted -- must not panic with `BorrowMutError`.
     /// Before the fix, `emit` held `bus.borrow()` for the entire loop (including while each
     /// handler ran), so `EventBus::subscribe`'s `bus.borrow_mut()` from inside the handler would
@@ -118,16 +118,16 @@ mod tests {
     #[test]
     fn handler_that_subscribes_another_handler_to_the_same_event_does_not_panic() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let bus = Rc::new(RefCell::new(EventBus::default()));
-        install(&lua, &neovibe, bus.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, bus.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         lua.load(
             r#"
             second_handler_ran = false
-            neovibe.on("test_event", function()
-                neovibe.on("test_event", function()
+            eitri.on("test_event", function()
+                eitri.on("test_event", function()
                     second_handler_ran = true
                 end)
             end)

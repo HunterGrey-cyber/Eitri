@@ -186,7 +186,7 @@ fn translate_one(event: ProtoSessionEvent) -> Option<Vec<AgentDomainEvent>> {
         // `Bypass =>` pattern below is the wire guard's one allowlisted entry: it decodes a report
         // the sidecar sends; it never constructs a request.
         //
-        // INTERACTIVE and VERDANDI_RULES are both neovibe's `Auto` (`capabilities_from_handshake`'s
+        // INTERACTIVE and VERDANDI_RULES are both Eitri's `Auto` (`capabilities_from_handshake`'s
         // note on verdandi_rules); UNSPECIFIED is not a mode anybody chose, so it is dropped, loudly
         // -- after the provider-mode check, which never depends on it.
         ProtoEvent::PermissionModeChanged(changed) => {
@@ -215,7 +215,7 @@ fn translate_one(event: ProtoSessionEvent) -> Option<Vec<AgentDomainEvent>> {
                 return None;
             };
             if changed.bypass_default_deny_applied {
-                // Neovibe states `unrestricted` on every session (owner, 2026-09-20: bypass denies
+                // Eitri states `unrestricted` on every session (owner, 2026-09-20: bypass denies
                 // nothing), so this must never happen. If it does, Verdandi now denies
                 // Bash/Write/Edit/NotebookEdit.
                 eprintln!("agent: ClaudeSidecarProvider: entering bypass applied Verdandi's conservative floor");

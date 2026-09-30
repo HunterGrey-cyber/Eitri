@@ -1,5 +1,5 @@
 //! The GTK half of the nvim keys feed (panel round 2 plan Task 6, spec §3): a `glib` timer that
-//! drains `neovibe_core::nvim_keys::feed`'s socket and hands each new report to `main.rs`.
+//! drains `eitri_core::nvim_keys::feed`'s socket and hands each new report to `main.rs`.
 //!
 //! Deliberately simpler than `shell::editor_context`, which caches the latest value for the panel
 //! to read lazily: here the caller (`main.rs`'s `send_keymap`) wants to react the moment a report
@@ -8,8 +8,8 @@
 
 use gtk4::glib;
 
-use neovibe_core::nvim_keys::feed::{NvimKeysFeed, NvimKeysReader, POLL_INTERVAL};
-use neovibe_core::nvim_keys::NvimReport;
+use eitri_core::nvim_keys::feed::{NvimKeysFeed, NvimKeysReader, POLL_INTERVAL};
+use eitri_core::nvim_keys::NvimReport;
 
 /// Starts draining the feed, calling `on_report` for every new report the reader returns.
 ///

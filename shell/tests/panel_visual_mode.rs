@@ -141,16 +141,16 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use agent::{AgentDomainEvent, AgentSessionProjection, ContentKind, TurnOutcome};
-use gtk4::glib;
-use gtk4::prelude::*;
-use neovibe_core::agent_backend::{BackendGreeting, BackendKind, ProjectionRef, CLIENT_IMPLEMENTED_PERMISSION_MODES};
-use neovibe_core::agent_bridge::{
+use eitri_core::agent_backend::{BackendGreeting, BackendKind, ProjectionRef, CLIENT_IMPLEMENTED_PERMISSION_MODES};
+use eitri_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_events_for_js, serialize_hello_for_js,
     serialize_hint_collect_for_js, serialize_hint_land_for_js, serialize_pane_focus_for_js, serialize_snapshot_for_js,
     serialize_tabs_for_js, serialize_theme_for_js, InboundMessage, SessionModeChoice, SnapshotView, TabStateWire,
     TabView,
 };
-use neovibe_core::theme::ThemeTokens;
+use eitri_core::theme::ThemeTokens;
+use gtk4::glib;
+use gtk4::prelude::*;
 use serde_json::json;
 use webkit6::prelude::*;
 use webkit6::{UserContentManager, WebView};
@@ -163,7 +163,7 @@ mod own_x_server;
 /// this crate has no `[lib]` target an integration test can reach a private item through, the same
 /// reason `panel_stream_scroll.rs` duplicates `themed_document` rather than importing it.
 /// `panel_base_uri_matches_product` (below) pins the two equal.
-const PANEL_BASE_URI: &str = "https://neovibe.invalid/";
+const PANEL_BASE_URI: &str = "https://eitri.invalid/";
 
 /// `Harness::clear_clipboard`'s own marker: a string no real copy in this replay could ever produce.
 const CLIPBOARD_SENTINEL: &str = "\u{2039}panel_visual_mode: cleared before this case\u{203a}";
@@ -331,13 +331,13 @@ impl Harness {
         let queue: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(replay));
         let started = Rc::new(Cell::new(false));
         let posted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        content_manager.register_script_message_handler("neovibeAgent", None);
+        content_manager.register_script_message_handler("eitriAgent", None);
         {
             let queue = queue.clone();
             let started = started.clone();
             let posted = posted.clone();
             let webview_weak = webview.downgrade();
-            content_manager.connect_script_message_received(Some("neovibeAgent"), move |_manager, js_value| {
+            content_manager.connect_script_message_received(Some("eitriAgent"), move |_manager, js_value| {
                 let Some(webview) = webview_weak.upgrade() else { return };
                 let raw = js_value.to_str().to_string();
                 posted.borrow_mut().push(raw.clone());
@@ -651,7 +651,7 @@ impl Harness {
 
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
     let script = format!(
-        "window.__neovibeDispatch({});",
+        "window.__eitriDispatch({});",
         serde_json::to_string(json_payload).unwrap_or_default()
     );
     webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
@@ -711,7 +711,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
         account: None,
     };
     let snapshot = serialize_snapshot_for_js(
-        neovibe_core::tabs::TabId(1),
+        eitri_core::tabs::TabId(1),
         &SnapshotView {
             backend: "sidecar",
             conversation_id: Some("conversation-visual-mode-test"),
@@ -738,7 +738,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
     // before its first keystroke ("the replay's conversation never rendered within 15 s"). One tab,
     // live, matching the fixed id every fixture builds its snapshot for.
     let tabs = vec![TabView {
-        id: neovibe_core::tabs::TabId(1),
+        id: eitri_core::tabs::TabId(1),
         number: 1,
         label: "1".into(),
         name: None,
@@ -753,7 +753,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
     vec![
         serialize_hello_for_js(&greeting),
         serialize_theme_for_js(&tokens),
-        serialize_tabs_for_js(neovibe_core::tabs::TabId(1), &tabs, SessionModeChoice::Auto),
+        serialize_tabs_for_js(eitri_core::tabs::TabId(1), &tabs, SessionModeChoice::Auto),
         snapshot,
         serialize_pane_focus_for_js(true),
     ]
@@ -865,7 +865,7 @@ fn streaming_reply_steps() -> StreamingReply {
         projection.apply(event);
     }
     let setup = serialize_events_for_js(
-        neovibe_core::tabs::TabId(1),
+        eitri_core::tabs::TabId(1),
         setup_from,
         projection.last_revision,
         &setup_events,
@@ -884,7 +884,7 @@ fn streaming_reply_steps() -> StreamingReply {
         let from = projection.last_revision;
         projection.apply(&event);
         deltas.push(serialize_events_for_js(
-            neovibe_core::tabs::TabId(1),
+            eitri_core::tabs::TabId(1),
             from,
             projection.last_revision,
             std::slice::from_ref(&event),

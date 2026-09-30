@@ -1,4 +1,4 @@
-//! Persistent `neovibe_conversation_id -> provider_session_id` identity (design doc §8.1),
+//! Persistent `eitri_conversation_id -> provider_session_id` identity (design doc §8.1),
 //! surviving process restarts and reboots -- deliberately NOT under `$XDG_RUNTIME_DIR` (tmpfs,
 //! cleared on logout; correct for the lease in `lease.rs`, wrong here) or `std::env::temp_dir()`.
 //! Small JSON files, no database -- matches this project's own established "small file per key, no
@@ -316,7 +316,7 @@ fn read_legacy_record(dir: &Path) -> Option<ConversationRecord> {
     serde_json::from_str(&std::fs::read_to_string(legacy).ok()?).ok()
 }
 
-/// `$XDG_STATE_HOME/neovibe/conversations/` -- see `state_dirs` for the full rule, and for the one
+/// `$XDG_STATE_HOME/eitri/conversations/` -- see `state_dirs` for the full rule, and for the one
 /// redirect this crate's tests use so a `cargo test` run never writes into the developer's real
 /// state directory.
 pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
@@ -377,7 +377,7 @@ pub fn save_conversation_record(record: &ConversationRecord) -> std::io::Result<
 }
 
 /// Creates `dir`, which lies under `kind_dir` (`conversations_dir()` or `history_dir()`), 0700 all
-/// the way down from neovibe's own state root -- `kind_dir`'s parent, `<state home>/neovibe` -- and
+/// the way down from Eitri's own state root -- `kind_dir`'s parent, `<state home>/eitri` -- and
 /// tightens those that an older build left open (`private_fs`'s module doc; ruling R5).
 pub(crate) fn create_private_state_dir(dir: &Path, kind_dir: PathBuf) -> std::io::Result<()> {
     let root = kind_dir.parent().map(Path::to_path_buf).unwrap_or(kind_dir);

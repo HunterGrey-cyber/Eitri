@@ -12,7 +12,7 @@
 //! ([`ModuleGrid::add`]), so a GUI pass reads that invariant off the log instead of trusting it.
 //!
 //! **What it decides and what it does not.** The rectangles come from
-//! `neovibe_core::layout::arrange`; this file only measures children (their minimum sizes feed the
+//! `eitri_core::layout::arrange`; this file only measures children (their minimum sizes feed the
 //! geometry), allocates what the geometry says, holds web hosts at their settled size while they
 //! are being resized ([`throttle`]), and turns a divider drag back into a ratio.
 
@@ -27,7 +27,7 @@ use gtk4::graphene;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
-use neovibe_core::layout::{
+use eitri_core::layout::{
     arrange, Axis, Direction, Divider, Frame, Layout, LayoutError, ModuleId, Nav, Rect, Reopen, Size, ZoomChange,
 };
 
@@ -109,7 +109,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for ModuleGrid {
-        const NAME: &'static str = "NeovibeModuleGrid";
+        const NAME: &'static str = "EitriModuleGrid";
         type Type = super::ModuleGrid;
         type ParentType = gtk4::Widget;
 
@@ -140,7 +140,7 @@ mod imp {
     impl WidgetImpl for ModuleGrid {
         fn measure(&self, orientation: gtk4::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
             // The window decides the size and the tree divides it; the grid asks only for what is on
-            // screen needs at the least (`neovibe_core::layout::min_size`), so the window cannot be
+            // screen needs at the least (`eitri_core::layout::min_size`), so the window cannot be
             // made smaller than a module's floor -- the paneds' `shrink = false` did the same.
             let min = self.obj().layout_min_size();
             let length = match orientation {
@@ -321,7 +321,7 @@ impl ModuleGrid {
                 };
                 // A ratio on a ratio split, pixels on a pinned one (`move_divider`): a dragged bottom
                 // row keeps the height it was dragged to when the window grows.
-                let moved = neovibe_core::layout::move_divider(&mut grid.layout().borrow_mut(), &now, first_px);
+                let moved = eitri_core::layout::move_divider(&mut grid.layout().borrow_mut(), &now, first_px);
                 if moved.is_ok() {
                     grid.queue_allocate();
                     grid.notify_changed();
@@ -420,24 +420,24 @@ impl ModuleGrid {
     }
 
     /// `Ctrl+a \ <key>` / `Ctrl+a " <key>`: `module` into a new split after `target` along `axis`,
-    /// moved there if it is elsewhere, shown if hidden (`neovibe_core::layout::place`). The layout
+    /// moved there if it is elsewhere, shown if hidden (`eitri_core::layout::place`). The layout
     /// gives `module` the keys; the caller gives it GTK focus.
     pub(crate) fn place_module(&self, module: &ModuleId, target: &ModuleId, axis: Axis) -> Result<(), LayoutError> {
         let hosted: Vec<ModuleId> = self.hosts().into_iter().map(|(id, _)| id).collect();
         placeable(&hosted, module)?;
-        neovibe_core::layout::place(&mut self.layout().borrow_mut(), module, target, axis)?;
+        eitri_core::layout::place(&mut self.layout().borrow_mut(), module, target, axis)?;
         self.apply();
         Ok(())
     }
 
-    /// `Ctrl+a H/J/K/L` (`neovibe_core::layout::swap`). The neighbour, if they swapped.
+    /// `Ctrl+a H/J/K/L` (`eitri_core::layout::swap`). The neighbour, if they swapped.
     pub(crate) fn swap_modules(&self, focused: &ModuleId, direction: Direction) -> Option<ModuleId> {
         let size = self.size();
         let swapped = {
             let layout = self.layout();
             let mut layout = layout.borrow_mut();
             self.with_frame(size, |frame| {
-                neovibe_core::layout::swap(&mut layout, focused, direction, frame)
+                eitri_core::layout::swap(&mut layout, focused, direction, frame)
             })
         };
         if swapped.is_some() {
@@ -446,12 +446,12 @@ impl ModuleGrid {
         swapped
     }
 
-    /// `swap.prev`/`swap.next` (`neovibe_core::layout::swap_adjacent`).
+    /// `swap.prev`/`swap.next` (`eitri_core::layout::swap_adjacent`).
     pub(crate) fn swap_adjacent(&self, focused: &ModuleId, forward: bool) -> Option<ModuleId> {
         let swapped = {
             let layout = self.layout();
             let mut layout = layout.borrow_mut();
-            neovibe_core::layout::swap_adjacent(&mut layout, focused, forward)
+            eitri_core::layout::swap_adjacent(&mut layout, focused, forward)
         };
         if swapped.is_some() {
             self.apply();
@@ -459,9 +459,9 @@ impl ModuleGrid {
         swapped
     }
 
-    /// `Ctrl+a |` / `Ctrl+a _` (`neovibe_core::layout::even`).
+    /// `Ctrl+a |` / `Ctrl+a _` (`eitri_core::layout::even`).
     pub(crate) fn even_modules(&self, axis: Axis) {
-        neovibe_core::layout::even(&mut self.layout().borrow_mut(), axis);
+        eitri_core::layout::even(&mut self.layout().borrow_mut(), axis);
         self.apply();
     }
 
@@ -488,7 +488,7 @@ impl ModuleGrid {
         let Ok(layout) = layout.try_borrow() else {
             return Size::default();
         };
-        self.with_frame(self.size(), |frame| neovibe_core::layout::min_size(&layout, frame))
+        self.with_frame(self.size(), |frame| eitri_core::layout::min_size(&layout, frame))
     }
 
     /// A module's minimum size, as its host measures it.
@@ -537,14 +537,14 @@ impl ModuleGrid {
         ended
     }
 
-    /// `Ctrl+a h/j/k/l` around `target` by `px` (`neovibe_core::layout::resize`).
+    /// `Ctrl+a h/j/k/l` around `target` by `px` (`eitri_core::layout::resize`).
     pub(crate) fn resize(&self, target: &ModuleId, direction: Direction, px: i32) {
         let size = self.size();
         let moved = {
             let layout = self.layout();
             let mut layout = layout.borrow_mut();
             self.with_frame(size, |frame| {
-                neovibe_core::layout::resize(&mut layout, target, direction, px, frame)
+                eitri_core::layout::resize(&mut layout, target, direction, px, frame)
             })
         };
         if moved {
@@ -553,13 +553,13 @@ impl ModuleGrid {
     }
 
     /// Where `Ctrl+h/j/k/l` from `from` goes, on the geometry the grid is allocated with
-    /// (`neovibe_core::layout::navigate`). Decides only; the caller unzooms and moves focus.
+    /// (`eitri_core::layout::navigate`). Decides only; the caller unzooms and moves focus.
     pub(crate) fn navigate(&self, from: &ModuleId, direction: Direction) -> Nav {
         let size = self.size();
         let layout = self.layout();
         let layout = layout.borrow();
         self.with_frame(size, |frame| {
-            neovibe_core::layout::navigate(&layout, from, direction, frame)
+            eitri_core::layout::navigate(&layout, from, direction, frame)
         })
     }
 
@@ -567,7 +567,7 @@ impl ModuleGrid {
     /// **before** `id` is unmapped (S3 change 3: GTK's own focus chain handed them to the WebView).
     /// The order is [`hide_then_unmap`]'s, which a test without a display holds; this method only
     /// hands it the grid's frame and its two GTK effects. Every hide goes through it: `Ctrl+a x`, a
-    /// module key held by the module with the keys, `Ctrl+a t`, and `neovibe.layout.hide`.
+    /// module key held by the module with the keys, `Ctrl+a t`, and `eitri.layout.hide`.
     pub(crate) fn hide_module(&self, id: &ModuleId, focus: &dyn Fn(&ModuleId) -> bool) -> Result<(), LayoutError> {
         let size = self.size();
         let layout = self.layout();
@@ -584,7 +584,7 @@ impl ModuleGrid {
         })
     }
 
-    /// `prefix x` (`neovibe_core::layout::kill`): `id` leaves the screen as a hide does -- the keys to
+    /// `prefix x` (`eitri_core::layout::kill`): `id` leaves the screen as a hide does -- the keys to
     /// the module the layout chooses first, then the unmap, in [`hide_then_unmap`]'s order -- and is
     /// left where `reopen` says. Ending what ran in it is the caller's.
     pub(crate) fn kill_module(
@@ -598,7 +598,7 @@ impl ModuleGrid {
         self.with_frame(size, |frame| {
             leave_then_unmap(
                 &layout,
-                |layout| neovibe_core::layout::kill(layout, id, reopen, frame),
+                |layout| eitri_core::layout::kill(layout, id, reopen, frame),
                 |next| {
                     focus(next);
                 },
@@ -632,7 +632,7 @@ impl ModuleGrid {
         {
             let settled = self.layout().try_borrow_mut().is_ok_and(|mut layout| {
                 self.with_frame(Size { w: width, h: height }, |frame| {
-                    neovibe_core::layout::settle_pins(&mut layout, frame)
+                    eitri_core::layout::settle_pins(&mut layout, frame)
                 })
             });
             if settled {
@@ -750,7 +750,7 @@ impl ModuleGrid {
 }
 
 /// [`ModuleGrid::hide_module`]'s order, with its two GTK effects passed in so that a test without a
-/// display can see it. `neovibe_core::layout::hide` records the hide and chooses who gets the keys
+/// display can see it. `eitri_core::layout::hide` records the hide and chooses who gets the keys
 /// (the most recent module next to `id`, if `id` holds them). Then `focus` gives that module the
 /// keys, and only then does `unmap` take `id` off the screen (`ModuleGrid::apply`,
 /// `set_child_visible(false)`).
@@ -771,7 +771,7 @@ fn hide_then_unmap(
 ) -> Result<(), LayoutError> {
     leave_then_unmap(
         layout,
-        |layout| neovibe_core::layout::hide(layout, id, frame),
+        |layout| eitri_core::layout::hide(layout, id, frame),
         focus,
         unmap,
     )
@@ -819,7 +819,7 @@ fn focus_target_of<'a, W>(hosts: &'a [Host<W>], id: &ModuleId) -> Option<&'a W> 
 
 /// Whether `module` may be placed into the tree: only a module this window has a host for. The
 /// layout accepts any id `ModuleId::parse` does -- a typo'd `lua:x`, or `canvas` before P3 builds it,
-/// through `neovibe.layout.split` -- and a leaf with no host is a hole: half the target's space
+/// through `eitri.layout.split` -- and a leaf with no host is a hole: half the target's space
 /// empty, one divider short, and the keys on a module with no widget (the plan review's finding 2).
 /// The grid is the one place that knows which modules exist; P3 adds the canvas's host before it
 /// places the canvas.
@@ -852,7 +852,7 @@ fn dragged_first_px(begin: &Divider, now: &Divider, dx: f64, dy: f64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neovibe_core::layout::{Arrangement, Node};
+    use eitri_core::layout::{Arrangement, Node};
 
     /// A key pressed before the window is laid out (`Ctrl+a h` in the first frame, a shim letter
     /// racing the first allocation) still meets a real geometry, not a 0x0 one in which every
@@ -887,7 +887,7 @@ mod tests {
         assert_eq!(arrange(&layout, &frame).dividers[0].rect.x, pointer_start + 400);
 
         let elsewhere = Divider {
-            path: vec![neovibe_core::layout::Branch::First],
+            path: vec![eitri_core::layout::Branch::First],
             ..begin.clone()
         };
         assert_eq!(dragged_first_px(&begin, &elsewhere, 5.0, 0.0), None, "another split");
@@ -948,12 +948,12 @@ mod tests {
     /// each Lua panel in the order it was registered -- over the layout `main.rs` builds, with the
     /// terminal hidden, or shown as the first `Ctrl+a t` leaves it.
     fn layout_and_add_order(
-        panels: &[(&str, neovibe_core::layout::Placement)],
+        panels: &[(&str, eitri_core::layout::Placement)],
         terminal_shown: bool,
     ) -> (Layout, Vec<ModuleId>) {
-        let decls: Vec<neovibe_core::layout::ModuleDecl> = panels
+        let decls: Vec<eitri_core::layout::ModuleDecl> = panels
             .iter()
-            .map(|(id, placement)| neovibe_core::layout::ModuleDecl {
+            .map(|(id, placement)| eitri_core::layout::ModuleDecl {
                 id: ModuleId::lua(id),
                 placement: *placement,
             })
@@ -977,8 +977,8 @@ mod tests {
     /// column -- the item 11 regression. The negative control below reproduces it on the model.
     #[test]
     fn a_press_on_any_divider_reaches_its_handle_in_every_p1_layout() {
-        use neovibe_core::layout::Placement::{BelowRoot, InPlaceOfEditor, RightOfRoot};
-        let layouts: &[&[(&str, neovibe_core::layout::Placement)]] = &[
+        use eitri_core::layout::Placement::{BelowRoot, InPlaceOfEditor, RightOfRoot};
+        let layouts: &[&[(&str, eitri_core::layout::Placement)]] = &[
             &[],
             &[("main1", InPlaceOfEditor)],
             &[("side1", RightOfRoot)],
@@ -1202,10 +1202,10 @@ mod tests {
         let result = leave_then_unmap(
             &layout,
             |l| {
-                neovibe_core::layout::kill(
+                eitri_core::layout::kill(
                     l,
                     &id,
-                    Reopen::At(neovibe_core::layout::Placement::BelowEditor),
+                    Reopen::At(eitri_core::layout::Placement::BelowEditor),
                     &Frame::new(UNALLOCATED, 1),
                 )
             },
@@ -1243,7 +1243,7 @@ mod tests {
         assert!(effects.is_empty(), "{effects:?}");
 
         let mut alone = Layout::initial(&[]).unwrap();
-        neovibe_core::layout::hide(&mut alone, &ModuleId::agent(), &Frame::new(UNALLOCATED, 1)).unwrap();
+        eitri_core::layout::hide(&mut alone, &ModuleId::agent(), &Frame::new(UNALLOCATED, 1)).unwrap();
         let alone = RefCell::new(alone);
         let (result, effects) = hide_and_record(&alone, &ModuleId::editor());
         assert_eq!(result, Err(LayoutError::LastVisible(ModuleId::editor())));
@@ -1276,7 +1276,7 @@ mod tests {
     /// starts at 0 -- so an implementation adding the offset to `rect.x` passed it.
     #[test]
     fn a_dragged_divider_inside_a_nested_split_stays_under_the_pointer() {
-        use neovibe_core::layout::{Branch, Node};
+        use eitri_core::layout::{Branch, Node};
         let l = ModuleId::lua;
         let root = Node::split(
             Axis::Row,
@@ -1315,7 +1315,7 @@ mod tests {
         let mut layout = crate::terminal::initial_layout(&[]).unwrap();
         layout.show(&ModuleId::terminal()).unwrap();
         let frame = Frame::new(UNALLOCATED, 1);
-        assert!(neovibe_core::layout::settle_pins(&mut layout, &frame));
+        assert!(eitri_core::layout::settle_pins(&mut layout, &frame));
         let terminal_divider = |layout: &Layout| {
             arrange(layout, &frame)
                 .dividers
@@ -1330,10 +1330,10 @@ mod tests {
             let now = terminal_divider(&layout);
             let dy = f64::from(pointer - now.rect.y);
             let first_px = dragged_first_px(&begin, &now, 0.0, dy).unwrap();
-            neovibe_core::layout::move_divider(&mut layout, &now, first_px).unwrap();
+            eitri_core::layout::move_divider(&mut layout, &now, first_px).unwrap();
         }
         assert_eq!(terminal_divider(&layout).rect.y, 380);
-        let taller = Frame::new(neovibe_core::layout::Size { w: 1280, h: 1041 }, 1);
+        let taller = Frame::new(eitri_core::layout::Size { w: 1280, h: 1041 }, 1);
         assert_eq!(
             arrange(&layout, &taller).rect_of(&ModuleId::terminal()).map(|r| r.h),
             Some(340),
@@ -1341,7 +1341,7 @@ mod tests {
         );
     }
 
-    /// `neovibe.layout.split("canvas", ..)` before P3, or a typo'd `lua:` id: refused, as a module
+    /// `eitri.layout.split("canvas", ..)` before P3, or a typo'd `lua:` id: refused, as a module
     /// that is not in the layout is refused everywhere else, rather than placed as a leaf with no host.
     #[test]
     fn only_a_module_with_a_host_can_be_placed() {

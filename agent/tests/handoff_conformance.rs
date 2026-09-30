@@ -1,13 +1,13 @@
-//! Real, `#[ignore]`d: proves the Neovibe->CLI handoff mechanism this plan builds actually works
+//! Real, `#[ignore]`d: proves the Eitri->CLI handoff mechanism this plan builds actually works
 //! end to end against a real sidecar, a real `claude` CLI, and a real spawned
-//! `neovibe-claude-handoff` process. Real API cost: 1 real turn (to give the session real content
+//! `eitri-claude-handoff` process. Real API cost: 1 real turn (to give the session real content
 //! worth resuming). Does NOT drive the resumed `claude --resume` process's own interactive
 //! session -- this plan's own scope stops at "the handoff genuinely started the right real
 //! process holding the right real lease"; asserting what that process does next needs the
-//! CLI->Neovibe return direction this plan explicitly defers (design doc §8.4, blocked on
+//! CLI->Eitri return direction this plan explicitly defers (design doc §8.4, blocked on
 //! Verdandi's `ResumeSession` RPC).
 
-use agent::handoff::prepare_neovibe_to_cli_handoff;
+use agent::handoff::prepare_eitri_to_cli_handoff;
 use agent::lease::{LeaseError, SessionLease};
 use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest};
 
@@ -99,15 +99,15 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
         })
         .unwrap();
 
-    // The handoff itself: acquire the lease, spawn neovibe-claude-handoff, confirm it's really
+    // The handoff itself: acquire the lease, spawn eitri-claude-handoff, confirm it's really
     // running the real claude binary and really holding the lease.
-    let outcome = prepare_neovibe_to_cli_handoff("claude", &cwd, &provider_session_id).unwrap();
+    let outcome = prepare_eitri_to_cli_handoff("claude", &cwd, &provider_session_id).unwrap();
     assert!(outcome.child_pid > 0);
 
     // Confirm the real spawned process is genuinely `claude` (or its exec target), not something
     // else -- read /proc/<pid>/comm, a real, direct process-tree check, not an assumption.
     //
-    // This MUST run before the `AlreadyHeld` assertion below, not after: `neovibe-claude-handoff`
+    // This MUST run before the `AlreadyHeld` assertion below, not after: `eitri-claude-handoff`
     // deliberately `exec`s rather than staying alive as a supervising parent (a disclosed
     // departure from spec §8.3's "live parent" wording -- see the binary's own module doc and
     // this plan's MANUAL_VERIFICATION.md), so the lock's survival depends specifically on the

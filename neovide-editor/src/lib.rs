@@ -630,7 +630,7 @@ const NVIM_INSTALL_URL: &str = "https://github.com/neovim/neovim/wiki/Installing
 /// - **too old**: `"Neovide requires nvim version {major}.{minor}.{patch} or higher, but {found} was
 ///   detected. Download the latest version here <url>"` -- [`detected_nvim_version`] pulls `{found}`
 ///   back out, since the raw text names the *fork's* floor as bare numbers with no mention of what
-///   neovibe itself needs.
+///   Eitri itself needs.
 /// - **missing, or any other launch failure** (`nvim` absent from `PATH`, a spawn error, a socket
 ///   that never opens): `.context("Could not locate or start neovim process")`'s own chain, which
 ///   never names a version or a place to get one at all.
@@ -640,11 +640,11 @@ const NVIM_INSTALL_URL: &str = "https://github.com/neovim/neovim/wiki/Installing
 fn build_start_failure_message(raw_error: &str) -> String {
     match detected_nvim_version(raw_error) {
         Some(found) => format!(
-            "nvim {found} is older than neovibe's floor ({NVIM_VERSION_FLOOR} or newer). Get a newer \
+            "nvim {found} is older than Eitri's floor ({NVIM_VERSION_FLOOR} or newer). Get a newer \
              nvim: {NVIM_INSTALL_URL}"
         ),
         None => format!(
-            "nvim could not be started (neovibe needs {NVIM_VERSION_FLOOR} or newer): {raw_error}. \
+            "nvim could not be started (Eitri needs {NVIM_VERSION_FLOOR} or newer): {raw_error}. \
              Install it: {NVIM_INSTALL_URL}"
         ),
     }
@@ -1483,7 +1483,7 @@ impl NeovideEditorPane {
                             // new rows leave a band at the bottom. Nothing else asks for a frame
                             // once the pane is idle, so ask for one here; it re-snaps, and the
                             // tick's resync fixes the row count. The second frame sees the scale
-                            // already applied, so this does not loop. neovibe-only.
+                            // already applied, so this does not loop. eitri-only.
                             session.wants_frame.set(true);
                         }
                         // Wave 4, R5: the editor's own cell height is what `shell` puts into
@@ -2549,7 +2549,7 @@ mod tests {
     // are the fixtures. ---
 
     /// The too-old shape: the fork's own sentence names the found version; the built message must
-    /// name it too, plus neovibe's own floor and where to get a newer nvim.
+    /// name it too, plus Eitri's own floor and where to get a newer nvim.
     #[test]
     fn a_too_old_nvim_names_the_version_that_was_found() {
         // The real shape: the fork puts `:version`'s whole first line, "NVIM v0.9.5", into {found}

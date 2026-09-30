@@ -47,7 +47,7 @@ use gtk4::prelude::*;
 /// A class no rule names (`gtk_css`'s tests hold that). Adding and then removing it leaves a widget's
 /// classes as they were and its style marked for recomputation: a class change is one of GTK's
 /// "radical" changes (`GTK_CSS_RADICAL_CHANGE`), which always recomputes from the current providers.
-pub(crate) const RESTYLE_CLASS: &str = "neovibe-restyle";
+pub(crate) const RESTYLE_CLASS: &str = "eitri-restyle";
 
 /// Marks every widget under `root` (`root` included) that has never been realized for a fresh style
 /// from the current stylesheet, so that when it is next drawn it is drawn in the current theme and

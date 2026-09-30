@@ -8,13 +8,13 @@ publish.workspace = true
 name = "supervisor"
 
 [[bin]]
-name = "neovibe-supervisor"
-path = "src/bin/neovibe_supervisor.rs"
+name = "eitri-supervisor"
+path = "src/bin/eitri_supervisor.rs"
 required-features = ["gui"]
 
 [features]
 # On by default so `cargo build --workspace`, `shell`'s dependency on this crate, and anything a
-# developer or CI runs today keeps building `neovibe-supervisor` exactly as before -- this crate
+# developer or CI runs today keeps building `eitri-supervisor` exactly as before -- this crate
 # adds an *option* (`--no-default-features` for a GTK-free lib-only build, needed on macOS, which
 # has no GTK), it does not change what a plain `cargo build` produces.
 default = ["gui"]

@@ -33,7 +33,7 @@ it(
     expect(notice.getAttribute("role")).toBe("alert");
     expect(notice.textContent).toContain("The panel stopped drawing (render exploded)");
     expect(notice.textContent).toContain("prefix r");
-    expect(notice.textContent).toContain("the conversation lives in neovibe");
+    expect(notice.textContent).toContain("the conversation lives in Eitri");
   },
   // Importing the entry point pulls in React DOM and the whole stylesheet: slow on a busy machine.
   20_000,

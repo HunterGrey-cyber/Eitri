@@ -94,7 +94,7 @@ const DISPLAYS_TO_TRY: u32 = 100;
 /// The session bus every guarded test runs with: a socket path that cannot exist, since `/dev/null`
 /// is not a directory (`connect` fails with `ENOTDIR`), so nothing started under it can reach a bus,
 /// D-Bus-activate a service on one, or have one appear there later.
-pub const NO_SESSION_BUS: &str = "unix:path=/dev/null/neovibe-test-has-no-session-bus";
+pub const NO_SESSION_BUS: &str = "unix:path=/dev/null/eitri-test-has-no-session-bus";
 
 /// Why [`OwnXServer::start_on`] did not start a server on the number it was given.
 enum StartError {

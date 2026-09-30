@@ -14,7 +14,7 @@ import fixture from "./fixtures/p1a2-mid-stream.json";
  * The fixture is not hand-typed. It is written by the Rust test
  * `core/src/tab_set.rs`, `tests::with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both`
  * (its own `writtenBy` field says so too), which compares it on every run and rewrites it only
- * under `NEOVIBE_WRITE_FIXTURES=1` when it differs. For each of the two shapes -- `midStream`, the
+ * under `EITRI_WRITE_FIXTURES=1` when it differs. For each of the two shapes -- `midStream`, the
  * audit's (text folded with no tick since the last one), and `foldAfterADrain`, round 2's (text
  * folded right after a tick's drain, before the snapshot read) -- it holds the real snapshot that
  * `TabSet::active_state_payloads` sent, the real `events` of the tick after it (`nextEvents`), and

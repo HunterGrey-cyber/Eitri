@@ -11,7 +11,7 @@
 //! has no layout and Chromium never moves the view, so neither can express this; only the engine
 //! `shell` really links can. This drives that engine (`webkit6`, `/usr/lib/libwebkitgtk-6.0.so.4`)
 //! with the exact document `agent_panel.rs` embeds and envelopes serialized by the same
-//! `neovibe_core::agent_bridge::serialize_*_for_js` functions the product calls, one
+//! `eitri_core::agent_bridge::serialize_*_for_js` functions the product calls, one
 //! `evaluate_javascript` per 33ms tick, the pump's own cadence.
 //!
 //! **Scenarios** (root-cause.md §4.2), each on a 560x740 and a 519x480 CSS-px panel (the latter the
@@ -147,15 +147,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use agent::{AgentDomainEvent, AgentSessionProjection, ContentKind, TurnOutcome};
-use gtk4::glib;
-use gtk4::prelude::*;
-use neovibe_core::agent_backend::{BackendGreeting, BackendKind, ProjectionRef, CLIENT_IMPLEMENTED_PERMISSION_MODES};
-use neovibe_core::agent_bridge::{
+use eitri_core::agent_backend::{BackendGreeting, BackendKind, ProjectionRef, CLIENT_IMPLEMENTED_PERMISSION_MODES};
+use eitri_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_events_for_js, serialize_hello_for_js,
     serialize_pane_focus_for_js, serialize_snapshot_for_js, serialize_tabs_for_js, serialize_theme_for_js,
     InboundMessage, SessionModeChoice, SnapshotView, TabStateWire, TabView,
 };
-use neovibe_core::theme::ThemeTokens;
+use eitri_core::theme::ThemeTokens;
+use gtk4::glib;
+use gtk4::prelude::*;
 use serde_json::{json, Value};
 use webkit6::prelude::*;
 use webkit6::{UserContentInjectedFrames, UserContentManager, UserScript, UserScriptInjectionTime, WebView};
@@ -527,7 +527,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
         account: None,
     };
     // Interim (session tabs plan Task 4): one tab until Task 6 moves the panel onto TabSet.
-    let sole_tab = neovibe_core::tabs::TabId(1);
+    let sole_tab = eitri_core::tabs::TabId(1);
     let snapshot = serialize_snapshot_for_js(
         sole_tab,
         &SnapshotView {
@@ -687,7 +687,7 @@ fn themed_document(vars: &[(String, String)]) -> String {
 /// `agent_panel::evaluate_js_dispatch`, exactly.
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
     let script = format!(
-        "window.__neovibeDispatch({});",
+        "window.__eitriDispatch({});",
         serde_json::to_string(json_payload).unwrap_or_default()
     );
     webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
@@ -704,7 +704,7 @@ fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
 /// Records, per animation frame, the list's scroll geometry, the elapsed counter's text, the
 /// document's own scroll offset, and the text under a fixed reading point 40px below the list's top
 /// edge with its offset; and every `scroll` event on `.message-list`. It wraps
-/// `window.__neovibeDispatch` only to timestamp what arrived -- the panel receives the identical
+/// `window.__eitriDispatch` only to timestamp what arrived -- the panel receives the identical
 /// string -- and performs the scenario's own reader actions. `window.__probe()` returns it all.
 const INSTRUMENT: &str = r#"
 (() => {
@@ -864,7 +864,7 @@ const INSTRUMENT: &str = r#"
     }
     return real(json);
   }
-  Object.defineProperty(window, "__neovibeDispatch", {
+  Object.defineProperty(window, "__eitriDispatch", {
     configurable: true,
     get() { return real === undefined ? undefined : dispatch; },
     set(fn) { real = fn; },
@@ -966,7 +966,7 @@ fn run_one(config: Config, scenario: Scenario, replay: &Replay) -> Result<Value,
         &[],
         &[],
     ));
-    // As `build_agent_panel` builds it: default settings, one `neovibeAgent` handler.
+    // As `build_agent_panel` builds it: default settings, one `eitriAgent` handler.
     let webview = WebView::builder().user_content_manager(&content_manager).build();
     webview.set_hexpand(true);
     webview.set_vexpand(true);
@@ -975,12 +975,12 @@ fn run_one(config: Config, scenario: Scenario, replay: &Replay) -> Result<Value,
 
     let queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
     let started = Rc::new(Cell::new(false));
-    content_manager.register_script_message_handler("neovibeAgent", None);
+    content_manager.register_script_message_handler("eitriAgent", None);
     {
         let queue = queue.clone();
         let started = started.clone();
         let on_ready = replay.on_ready.clone();
-        content_manager.connect_script_message_received(Some("neovibeAgent"), move |_manager, js_value| {
+        content_manager.connect_script_message_received(Some("eitriAgent"), move |_manager, js_value| {
             if let Some(InboundMessage::Ready { request_id }) = parse_inbound_message(&js_value.to_str()) {
                 if !started.replace(true) {
                     let mut q = queue.borrow_mut();
@@ -2323,8 +2323,8 @@ fn judge_self_test() -> Result<usize, String> {
 // tool-result box (`.tool-result-body`'s own max-height + overflow-y) takes the box-first
 // precedence over the list while it has room, and a real re-home moves the cursor once a scroll
 // large enough carries its row off screen. It reuses this file's own bring-up (`Replay`, `Step`,
-// `themed_document`, the `on_ready`/`neovibeAgent` handshake) and the real `agent`/
-// `neovibe_core::agent_bridge` wire the scenarios above use, but has none of their follow-during-
+// `themed_document`, the `on_ready`/`eitriAgent` handshake) and the real `agent`/
+// `eitri_core::agent_bridge` wire the scenarios above use, but has none of their follow-during-
 // streaming machinery (no `INSTRUMENT`, no `Scenario`, no `judge`) -- there is nothing here for
 // that judge to weigh, only a handful of direct assertions against one settled history.
 // ---------------------------------------------------------------------------------------------
@@ -2399,7 +2399,7 @@ fn ctrl_e_y_replay() -> Replay {
         resumable: Vec::new(),
         account: None,
     };
-    let sole_tab = neovibe_core::tabs::TabId(1);
+    let sole_tab = eitri_core::tabs::TabId(1);
     let snapshot = serialize_snapshot_for_js(
         sole_tab,
         &SnapshotView {
@@ -2507,12 +2507,12 @@ fn run_ctrl_e_y(config: Config) -> Result<Value, String> {
 
     let queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
     let started = Rc::new(Cell::new(false));
-    content_manager.register_script_message_handler("neovibeAgent", None);
+    content_manager.register_script_message_handler("eitriAgent", None);
     {
         let queue = queue.clone();
         let started = started.clone();
         let on_ready = replay.on_ready;
-        content_manager.connect_script_message_received(Some("neovibeAgent"), move |_manager, js_value| {
+        content_manager.connect_script_message_received(Some("eitriAgent"), move |_manager, js_value| {
             if let Some(InboundMessage::Ready { request_id }) = parse_inbound_message(&js_value.to_str()) {
                 if !started.replace(true) {
                     let mut q = queue.borrow_mut();
@@ -2695,7 +2695,7 @@ fn trace_dir() -> PathBuf {
 /// guard's own verification. `panel_visual_mode.rs` found and fixed the same harness bug on
 /// 2026-09-28 (its `on_ready_batch`); this is that envelope. One live tab, the id every snapshot
 /// here is built for.
-fn sole_tab_envelope(sole_tab: neovibe_core::tabs::TabId) -> String {
+fn sole_tab_envelope(sole_tab: eitri_core::tabs::TabId) -> String {
     let tabs = vec![TabView {
         id: sole_tab,
         number: 1,

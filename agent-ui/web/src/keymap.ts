@@ -983,7 +983,7 @@ export const INPUT_KEYS: KeyHelp[] = [
 ];
 
 /** `shell`'s own keys, which nothing on this page can read: sent by `shell` in a `keymap` envelope
- *  on every `ready`, generated from `neovibe_core::keymap` (the root table and the effective prefix
+ *  on every `ready`, generated from `eitri_core::keymap` (the root table and the effective prefix
  *  table after `init.lua`). `prefix` is the prefix as a person reads it (`Ctrl+b`).
  *
  *  `panel` and `newTabChord` are the panel round 2 plan's own additions (Task 5/6):

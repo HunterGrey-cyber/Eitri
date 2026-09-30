@@ -15,7 +15,7 @@
 //!   pane), but changing the *trigger* in `prefix()` would not touch that row's key at all, so pinning
 //!   `bindings()` alone cannot catch a changed trigger. Rust/shell-only, fixture at
 //!   `tests/fixtures/v1-frozen-prefix-keys.json`.
-//! - The panel (leader/which-key) table, `neovibe_core::keymap::default_bindings()` -- shared with
+//! - The panel (leader/which-key) table, `eitri_core::keymap::default_bindings()` -- shared with
 //!   `agent-ui/web`'s `keymap.v1Freeze.test.ts` via one fixture, `docs/keymap/v1-frozen-panel-keys.json`,
 //!   because `PanelSeq::wire()` already produces the exact `keys: string[]` shape the frontend's
 //!   `PanelBinding` uses on the wire (`serialize_keymap_for_js`), so one JSON file is the freeze for
@@ -26,14 +26,14 @@
 //! `cells: 5`, `up: false` -> `up: true`) still counts as a changed meaning.
 //!
 //! Regenerate (only for a deliberate, owner-approved addition -- never to silence a real
-//! regression): `cargo test -p neovibe-core --test keymap_v1_freeze -- --ignored regenerate_fixtures`,
+//! regression): `cargo test -p eitri-core --test keymap_v1_freeze -- --ignored regenerate_fixtures`,
 //! then read the diff by hand against `docs/superpowers/specs/2026-09-27-v1-decisions.md` before
 //! committing -- this test cannot tell an intended change from a bug, only that one happened.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use neovibe_core::keymap::{self, Action, Keymap, OptValue};
+use eitri_core::keymap::{self, Action, Keymap, OptValue};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -120,7 +120,7 @@ fn current_panel_rows() -> Vec<PanelFixtureRow> {
 fn read_fixture<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Vec<T> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
         panic!(
-            "{}: {e} (generate it first: cargo test -p neovibe-core --test keymap_v1_freeze -- \
+            "{}: {e} (generate it first: cargo test -p eitri-core --test keymap_v1_freeze -- \
              --ignored regenerate_fixtures)",
             path.display()
         )
@@ -133,7 +133,7 @@ fn prefix_table_keeps_every_pinned_binding() {
     let fixture: PrefixFixture = {
         let text = std::fs::read_to_string(prefix_fixture_path()).unwrap_or_else(|e| {
             panic!(
-                "{}: {e} (generate it first: cargo test -p neovibe-core --test keymap_v1_freeze -- \
+                "{}: {e} (generate it first: cargo test -p eitri-core --test keymap_v1_freeze -- \
                  --ignored regenerate_fixtures)",
                 prefix_fixture_path().display()
             )

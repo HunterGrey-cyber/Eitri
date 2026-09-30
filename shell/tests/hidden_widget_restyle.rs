@@ -34,9 +34,9 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
+use eitri_core::attention::Attention;
+use eitri_core::layout::{Axis, Layout, ModuleId, Node};
 use gtk4::prelude::*;
-use neovibe_core::attention::Attention;
-use neovibe_core::layout::{Axis, Layout, ModuleId, Node};
 
 // The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
 #[path = "support/own_x_server.rs"]

@@ -7,15 +7,15 @@
 //! matcher is CORRECT and is not what this module changes: "the host sees every call" is the right
 //! layering, because the policy of what needs a human belongs to the product that has the human.
 //!
-//! What was wrong is that neovibe equated "the host was asked" with "the user must answer", and
+//! What was wrong is that Eitri equated "the host was asked" with "the user must answer", and
 //! forwarded every single call to a GUI card. On 2026-09-19 the owner reported the consequence in
 //! four words -- "auto mode, 一直弹窗" -- a card for every `Read`, every `Grep`, every time. His
 //! stated rule for the fix was to match the real Claude CLI: "auto mode 我的想法不应该是和 claude cli
 //! 一样吗，你看下 claude cli 是什么规则，尽量做到行为一样".
 //!
-//! # Why it lives in `agent` and not in `neovibe-core`
+//! # Why it lives in `agent` and not in `eitri-core`
 //!
-//! Both crates can reach it either way (`neovibe-core` depends on `agent`, never the reverse), so
+//! Both crates can reach it either way (`eitri-core` depends on `agent`, never the reverse), so
 //! the tie is broken by what the code is ABOUT. This is a statement about Claude's own tool
 //! vocabulary -- `Read`'s `file_path`, `Bash`'s `command`, the CLI's own default-mode rules -- and
 //! every other Claude-specific fact in this workspace lives in `agent`. It also puts the policy in
@@ -32,7 +32,7 @@
 //! 2026-09-19: `Read` allowed, `Write` denied and the file really not created; `ls`, `cat a.txt`
 //! and `git status --short` allowed; `echo hi > c.txt`, `rm b.txt` and `git commit` denied.
 //!
-//! Note that `--permission-mode auto` -- which is the flag neovibe passes, and which this change
+//! Note that `--permission-mode auto` -- which is the flag Eitri passes, and which this change
 //! does not touch -- is a different thing again: it auto-approves and has a separate classifier
 //! model review actions in the background. The rules reproduced here are `default`'s.
 //!
@@ -61,8 +61,8 @@
 //! minified bundle, not memory -- read via `/scratch/auto-parity/cli-2.1.283.strings`).
 //!
 //! **Fix round 3 (2026-09-28), BLOCKING: "resolves inside" is judged in the wrong process.** This
-//! module resolves a path in neovibe; the CLI child writes it, with the root as its cwd, while
-//! neovibe's cwd is wherever it was started. `/proc/self/cwd`, `/proc/self/root`, `/proc/self/fd/*`,
+//! module resolves a path in Eitri; the CLI child writes it, with the root as its cwd, while
+//! Eitri's cwd is wherever it was started. `/proc/self/cwd`, `/proc/self/root`, `/proc/self/fd/*`,
 //! `/dev/fd`, `/dev/stdin` -- every per-process link -- leads somewhere different in the two, so a
 //! project holding `d -> /proc/self/cwd/..` could get a write to `~/.config/autostart/` allowed as
 //! "inside". The shared resolver now never looks anything up under `/proc`, `/sys` or `/dev`
@@ -85,7 +85,7 @@
 //! already requires ("every uncertainty resolves toward a card"): the CLI's own check carves
 //! `.claude/skills`, `.claude/agents`, `.claude/commands`, `.claude/scheduled_tasks.json` and
 //! `.claude/worktrees` back OUT of its own `.claude` protection, for personalization features
-//! neovibe does not have. That carve-out is not reproduced here, so the whole of `.claude` cards
+//! Eitri does not have. That carve-out is not reproduced here, so the whole of `.claude` cards
 //! in this module even where the real CLI would not ask -- a deliberate simplification, not an
 //! oversight, and the safe direction to simplify in.
 //!
@@ -114,7 +114,7 @@
 //! deny rule ends the call there ("Hook returned 'allow' ... but deny rule overrides"). An `Edit(...)`
 //! ask rule makes the tool's own `checkPermissions` (`Lb`) return an ask, which `DR` hands back
 //! (`Pve`) and `EQn` then puts to `canUseTool` instead of taking the hook's allow: on the sidecar an
-//! O3 provider prompt carrying `matched_ask_rule`, which `neovibe-core` cards in every mode
+//! O3 provider prompt carrying `matched_ask_rule`, which `eitri-core` cards in every mode
 //! (`ProviderPrompt::needs_a_human`; pinned for an edit the fast path allowed by
 //! `agent_backend::tests::a_users_own_ask_rule_still_cards_an_edit_the_fast_path_allowed`); on the
 //! legacy backend, under `--print` with no prompt tool, a refusal. Before item 4A every edit carded
@@ -421,7 +421,7 @@ struct Surroundings<'a> {
 
 /// The one entry point. `tool_name` and `input` are the `PermissionRequested` event's own fields,
 /// verbatim; `project_root` is the session's canonical project directory
-/// (`neovibe_core::project_root`), which is the boundary `Read`/`Grep`/`Glob` are judged against.
+/// (`eitri_core::project_root`), which is the boundary `Read`/`Grep`/`Glob` are judged against.
 ///
 /// Total: every input produces a verdict, and every path that is not a positive, confident match
 /// produces [`PermissionVerdict::AskTheUser`].
@@ -547,8 +547,8 @@ fn classify_within_budget(
 /// Two ways it cannot, and the second is the one that matters (review finding, 2026-09-19 later):
 /// - it does not resolve on disk -- if the boundary is unknown, nothing can be judged against it;
 /// - it IS the home directory, or an ancestor of it (`/` included). `project_root` falls back to
-///   the process cwd when no directory is given (`neovibe_core::project_root`), and the packaged
-///   `.desktop` entry passes `%f`, which is empty when neovibe is started from the app menu -- so a
+///   the process cwd when no directory is given (`eitri_core::project_root`), and the packaged
+///   `.desktop` entry passes `%f`, which is empty when Eitri is started from the app menu -- so a
 ///   menu launch can make `$HOME` the "project", and then every `Read` of `~/.ssh/id_ed25519` and
 ///   every `cat .credentials/...` would count as "inside the project". Whether a menu launch really
 ///   starts with cwd `$HOME` was NOT observed; the check does not depend on it.
@@ -683,7 +683,7 @@ const REASON_SEARCH_PATH_RESPELLED: &str = "the CLI searches this path under ano
 /// white space at either end cards -- as `char::is_whitespace` sees it, plus U+FEFF, which together
 /// cover every character JavaScript's `trim` removes. What is left the CLI searches as `cwd/path` (or
 /// `path`, absolute) with only `.` and repeated `/` settled, the same place [`resolve_in_root`]
-/// walks to here. Not reachable on 2.1.283 as neovibe launches it: the CLI offers neither tool
+/// walks to here. Not reachable on 2.1.283 as Eitri launches it: the CLI offers neither tool
 /// unless `--tools`/`--allowedTools` names it, and neither backend does. `Read` and the edit tools
 /// are not affected: their hook input is already `Ye`'s spelling, the one the tool opens.
 fn classify_search_path(input: &Value, root: &Path) -> Classification {
@@ -856,8 +856,8 @@ const PROTECTED_EDIT_FILE_BASENAMES: &[&str] = &[
 /// still contains only the resolved path; that pre-existing shape is recorded, not changed here.
 ///
 /// **Fix round 3 (2026-09-28), BLOCKING: both spellings inside the root was not enough**, because
-/// "inside" was decided by resolving in neovibe's process, and the CLI child writes. With `d ->
-/// /proc/self/cwd/..` in the project and neovibe started in `<root>/src`, `Write
+/// "inside" was decided by resolving in Eitri's process, and the CLI child writes. With `d ->
+/// /proc/self/cwd/..` in the project and Eitri started in `<root>/src`, `Write
 /// d/.config/autostart/evil.desktop` is spelled inside, resolved here to `<root>/.config/...`, and
 /// written by the CLI (cwd `<root>`) to `<root>/../.config/...`. The target is now resolved by
 /// [`resolve_in_root`]: nothing under `/proc`, `/sys` or `/dev`, and no link that sits outside the
@@ -2369,7 +2369,7 @@ fn trim_line_ends(bytes: &[u8]) -> &[u8] {
 // ---- Bounded work (round-3 follow-up, 2026-09-28) ---------------------------------------------
 //
 // Classification runs on the GTK main loop (`TabSet::pump` -> `take_revised_ui_delivery` ->
-// `answer_what_needs_no_human`, both in `neovibe-core`'s `agent_backend`), so what it costs is how
+// `answer_what_needs_no_human`, both in `eitri-core`'s `agent_backend`), so what it costs is how
 // long the whole window freezes. Every path the project or its `.git`
 // shapes used to go through `canonicalize` -- glibc's `realpath`, one system call per component --
 // and nothing bounded how many: a 39-hop chain padded with `d/../` to ~4 KB a hop cost 21 ms per
@@ -2448,7 +2448,7 @@ const MAX_RESOLVED_DEPTH: usize = 128;
 /// The kernel's own trees (fix round 3, 2026-09-28). What a path through one of them names depends
 /// on WHICH process looks it up -- `/proc/self`, `/proc/thread-self`, `/proc/<pid>/cwd`,
 /// `/proc/<pid>/root`, `/proc/<pid>/fd/<n>`, `/dev/fd` and `/dev/stdin` all lead somewhere
-/// different in neovibe, which judges a path, and in the CLI child, which writes or reads it -- so no
+/// different in Eitri, which judges a path, and in the CLI child, which writes or reads it -- so no
 /// resolution here looks anything up under one of them at all ([`Resolution::ThroughAKernelTree`]).
 /// No per-process link is known in `/sys` or `/dev/shm`; they are refused with the rest rather than
 /// sorted entry by entry, which would be the partial reading this module refuses.
@@ -2526,7 +2526,7 @@ fn components_to_resolve(path: &[u8], own: bool) -> Vec<(Vec<u8>, bool)> {
 /// Since fix round 3 (2026-09-28) nothing under [`KERNEL_TREES`] is looked up
 /// ([`Resolution::ThroughAKernelTree`]), for every caller: this process is not the one that will
 /// open the path, and those are the trees whose links say which process opens them. That is what
-/// makes the answer the same in neovibe and in the CLI child (or git), given the same `base`.
+/// makes the answer the same in Eitri and in the CLI child (or git), given the same `base`.
 /// Paths judged against the project root go through [`resolve_in_root`], which also confines links.
 fn resolve(base: &Path, path: &Path) -> Resolution {
     resolve_confined(base, path, None)
@@ -2543,9 +2543,9 @@ fn resolve(base: &Path, path: &Path) -> Resolution {
 /// link, a component may be anywhere -- `..` of a directory that is not a link is physical, the same
 /// in every process -- and the caller's own containment judges where the path ends.
 ///
-/// Why, reproduced by the item-4A review: the policy runs in neovibe, the write in the CLI child,
-/// whose cwd is the root while neovibe's is wherever it was started. A project holding `d ->
-/// /proc/self/cwd/..`, opened as `cd ~/proj/src && neovibe ~/proj`, made `Write
+/// Why, reproduced by the item-4A review: the policy runs in Eitri, the write in the CLI child,
+/// whose cwd is the root while Eitri's is wherever it was started. A project holding `d ->
+/// /proc/self/cwd/..`, opened as `cd ~/proj/src && eitri ~/proj`, made `Write
 /// d/.config/autostart/evil.desktop` resolve here to `~/proj/.config/...` (allowed, no card) while the
 /// CLI wrote `~/.config/autostart/evil.desktop`. [`KERNEL_TREES`] closes that shape; this closes the
 /// rest of "out and back in", where the answer hangs on what lies outside the project.
@@ -4440,7 +4440,7 @@ mod tests {
             .collect()
     }
 
-    /// Fix round 3 (2026-09-28), BLOCKING: the policy resolves a path in NEOVIBE's process, but the
+    /// Fix round 3 (2026-09-28), BLOCKING: the policy resolves a path in EITRI's process, but the
     /// write (or read) happens in the CLI child's, and a link through `/proc` or `/dev` names a
     /// different place in each. `/proc/self/fd/<n>` is this process's descriptor `<n>` -- in the CLI
     /// it is the CLI's own `<n>`, or nothing; `/dev/fd` is a link to it; `/proc/self/root` and

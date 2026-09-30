@@ -9,7 +9,7 @@ Task 1).
 Fixtures are built at run time: real tarballs (`tarfile`), a real `.deb`-shaped archive (a small ar
 writer below, then extracted with the host's real `dpkg-deb -x`), a real `.rpm` (the host's real
 nfpm, then extracted with the host's real `bsdtar -xf`), and tiny throwaway git repositories (`git
-init` in scratch). Nothing here needs Docker, a network connection, or a built neovibe release --
+init` in scratch). Nothing here needs Docker, a network connection, or a built Eitri release --
 every fixture is planted by the test itself. Scratch lives under ~/.cache, never /tmp (a small
 shared tmpfs on this project's own dev machines, not this test's call to assume otherwise
 elsewhere).
@@ -35,7 +35,7 @@ _spec = importlib.util.spec_from_file_location("release_check", os.path.join(_PA
 rc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rc)
 
-_SCRATCH_ROOT = os.path.expanduser("~/.cache/neovibe-release-check-tests")
+_SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-release-check-tests")
 _run_root = None
 
 
@@ -187,8 +187,8 @@ def _init_git_repo(files):
 # --- 1. RELEASE field set --------------------------------------------------------------------
 
 _GOOD_RELEASE_FIELDS = {
-    "NEOVIBE_VERSION": "1.0.0-rc.1",
-    "NEOVIBE_COMMIT": "a" * 40,
+    "EITRI_VERSION": "1.0.0-rc.1",
+    "EITRI_COMMIT": "a" * 40,
     "NEOVIDE_FORK_COMMIT": "b" * 40,
     "VERDANDI_REV": "c" * 40,
     "VERDANDI_SOURCE": "verdandi-1234567-source.tar.gz",
@@ -223,8 +223,8 @@ class ReleaseFieldsTests(unittest.TestCase):
 
     def test_a_non_hex40_commit_fails(self):
         fields = dict(_GOOD_RELEASE_FIELDS)
-        fields["NEOVIBE_COMMIT"] = "not-40-hex"
-        with self.assertRaisesRegex(rc.ReleaseCheckError, "NEOVIBE_COMMIT"):
+        fields["EITRI_COMMIT"] = "not-40-hex"
+        with self.assertRaisesRegex(rc.ReleaseCheckError, "EITRI_COMMIT"):
             rc.validate_release(fields)
 
     def test_a_non_hex64_sha_fails(self):
@@ -235,8 +235,8 @@ class ReleaseFieldsTests(unittest.TestCase):
 
     def test_a_bad_version_fails(self):
         fields = dict(_GOOD_RELEASE_FIELDS)
-        fields["NEOVIBE_VERSION"] = "v1.0"
-        with self.assertRaisesRegex(rc.ReleaseCheckError, "NEOVIBE_VERSION"):
+        fields["EITRI_VERSION"] = "v1.0"
+        with self.assertRaisesRegex(rc.ReleaseCheckError, "EITRI_VERSION"):
             rc.validate_release(fields)
 
     def test_a_bad_verdandi_source_name_fails(self):
@@ -246,12 +246,12 @@ class ReleaseFieldsTests(unittest.TestCase):
             rc.validate_release(fields)
 
     def test_every_problem_is_reported_together(self):
-        fields = {"NEOVIBE_VERSION": "bad"}
+        fields = {"EITRI_VERSION": "bad"}
         with self.assertRaises(rc.ReleaseCheckError) as ctx:
             rc.validate_release(fields)
         message = str(ctx.exception)
         self.assertIn("missing field", message)
-        self.assertIn("NEOVIBE_VERSION", message)
+        self.assertIn("EITRI_VERSION", message)
 
     def test_parse_release_text_round_trips_a_real_file_shape(self):
         text = "\n".join(f"{k}={v}" for k, v in _GOOD_RELEASE_FIELDS.items()) + "\n"
@@ -260,8 +260,8 @@ class ReleaseFieldsTests(unittest.TestCase):
         rc.validate_release(fields)  # must not raise
 
     def test_parse_release_text_skips_blank_lines_and_comments(self):
-        text = "# a comment\n\nNEOVIBE_VERSION=1.0.0\n"
-        self.assertEqual(rc.parse_release_text(text), {"NEOVIBE_VERSION": "1.0.0"})
+        text = "# a comment\n\nEITRI_VERSION=1.0.0\n"
+        self.assertEqual(rc.parse_release_text(text), {"EITRI_VERSION": "1.0.0"})
 
     def test_a_line_with_no_equals_fails_to_parse(self):
         with self.assertRaises(rc.ReleaseCheckError):
@@ -297,10 +297,10 @@ class AssetNameTests(unittest.TestCase):
     def test_the_nine_names_of_spec_section_4_3(self):
         names = rc.asset_names("1.0.0-rc.1", "a2f194a")
         self.assertEqual(names, [
-            "neovibe-1.0.0-rc.1-x86_64-linux.tar.gz",
-            "neovibe_1.0.0-rc.1_amd64.deb",
-            "neovibe-1.0.0-rc.1-1.x86_64.rpm",
-            "neovibe-1.0.0-rc.1-source.tar.gz",
+            "eitri-1.0.0-rc.1-x86_64-linux.tar.gz",
+            "eitri_1.0.0-rc.1_amd64.deb",
+            "eitri-1.0.0-rc.1-1.x86_64.rpm",
+            "eitri-1.0.0-rc.1-source.tar.gz",
             "verdandi-a2f194a-source.tar.gz",
             "install.sh",
             "RELEASE",
@@ -313,7 +313,7 @@ class AssetNameTests(unittest.TestCase):
 
     def test_a_bare_release_version_also_works(self):
         names = rc.asset_names("1.0.0", "0000000")
-        self.assertIn("neovibe-1.0.0-x86_64-linux.tar.gz", names)
+        self.assertIn("eitri-1.0.0-x86_64-linux.tar.gz", names)
 
     def test_a_bad_version_is_refused(self):
         with self.assertRaises(rc.ReleaseCheckError):
@@ -325,7 +325,7 @@ class AssetNameTests(unittest.TestCase):
 
     def test_a_name_with_a_space_fails_validation(self):
         with self.assertRaises(rc.ReleaseCheckError):
-            rc.validate_asset_name("neovibe 1.0.0.tar.gz")
+            rc.validate_asset_name("eitri 1.0.0.tar.gz")
 
     def test_a_name_with_a_slash_fails_validation(self):
         with self.assertRaises(rc.ReleaseCheckError):
@@ -335,7 +335,7 @@ class AssetNameTests(unittest.TestCase):
 # --- 3. The printed `gh release create` line --------------------------------------------------
 
 class GhReleaseCommandTests(unittest.TestCase):
-    REPO = "HunterGrey-cyber/neovibe"
+    REPO = "HunterGrey-cyber/eitri"
 
     def argv(self, version, assets=("a.tar.gz",)):
         return rc.gh_release_command(version, list(assets), "Title", "notes.md", self.REPO)
@@ -362,20 +362,20 @@ class GhReleaseCommandTests(unittest.TestCase):
     def test_a_bad_version_or_repository_is_refused(self):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.gh_release_command("not-a-version", [], "Title", "notes.md", self.REPO)
-        for repo in ("", "neovibe", "https://github.com/HunterGrey-cyber/neovibe", "a/b c"):
+        for repo in ("", "eitri", "https://github.com/HunterGrey-cyber/eitri", "a/b c"):
             with self.assertRaises(rc.ReleaseCheckError):
                 rc.gh_release_command("1.0.0", [], "Title", "notes.md", repo)
 
     def test_the_cli_needs_the_repository_and_prints_one_shell_line(self):
         script = os.path.join(_PACKAGING, "release_check.py")
-        base = ["python3", script, "gh-release-command", "1.0.0-rc.1", "--title", "neovibe 1.0.0-rc.1",
+        base = ["python3", script, "gh-release-command", "1.0.0-rc.1", "--title", "Eitri 1.0.0-rc.1",
                 "--notes-file", "n.md", "a.tar.gz"]
         missing = subprocess.run(base, capture_output=True, text=True)
         self.assertEqual(missing.returncode, 2, missing.stderr)
         ok = subprocess.run(base + ["--repo", self.REPO], capture_output=True, text=True)
         self.assertEqual(ok.returncode, 0, ok.stderr)
-        self.assertEqual(ok.stdout, "gh release create v1.0.0-rc.1 --repo HunterGrey-cyber/neovibe a.tar.gz "
-                                    "--verify-tag --prerelease --title 'neovibe 1.0.0-rc.1' --notes-file n.md\n")
+        self.assertEqual(ok.stdout, "gh release create v1.0.0-rc.1 --repo HunterGrey-cyber/eitri a.tar.gz "
+                                    "--verify-tag --prerelease --title 'Eitri 1.0.0-rc.1' --notes-file n.md\n")
 
 
 # --- 4. Extraction plus content scans -----------------------------------------------------------
@@ -397,14 +397,14 @@ class TarGzScanTests(unittest.TestCase):
     def test_the_sea_sentinel_is_found_by_content_whatever_the_file_is_named(self):
         payload = (rc.SEA_SENTINEL + " padding padding padding").encode("ascii")
         files = self._extract([
-            ("lib/neovibe/helper-utility", payload),  # a deliberately innocuous name (M5/step 9)
-            ("lib/neovibe/shell", b"not the sidecar at all"),
+            ("lib/eitri/helper-utility", payload),  # a deliberately innocuous name (M5/step 9)
+            ("lib/eitri/shell", b"not the sidecar at all"),
         ])
         hits = rc.find_sentinel_hits(files)
-        self.assertEqual(hits, ["lib/neovibe/helper-utility"])
+        self.assertEqual(hits, ["lib/eitri/helper-utility"])
 
     def test_a_file_with_no_sentinel_is_not_a_hit(self):
-        files = self._extract([("lib/neovibe/shell", b"an ordinary binary, no sentinel here")])
+        files = self._extract([("lib/eitri/shell", b"an ordinary binary, no sentinel here")])
         self.assertEqual(rc.find_sentinel_hits(files), [])
 
     def test_anthropic_node_modules_path_is_found(self):
@@ -421,67 +421,67 @@ class TarGzScanTests(unittest.TestCase):
 
     def test_a_verdandi_claude_sidecar_named_file_is_found(self):
         files = self._extract([
-            ("lib/neovibe/verdandi-claude-sidecar", b"x"),
-            ("lib/neovibe/verdandi-claude-sidecar-linux-x64", b"x"),
-            ("lib/neovibe/shell", b"x"),
+            ("lib/eitri/verdandi-claude-sidecar", b"x"),
+            ("lib/eitri/verdandi-claude-sidecar-linux-x64", b"x"),
+            ("lib/eitri/shell", b"x"),
         ])
         hits = rc.find_verdandi_sidecar_filenames(files)
         self.assertEqual(sorted(hits), [
-            "lib/neovibe/verdandi-claude-sidecar",
-            "lib/neovibe/verdandi-claude-sidecar-linux-x64",
+            "lib/eitri/verdandi-claude-sidecar",
+            "lib/eitri/verdandi-claude-sidecar-linux-x64",
         ])
 
     def test_an_exact_agent_hook_basename_is_found_but_the_source_file_is_not(self):
         files = self._extract([
-            ("lib/neovibe/agent-hook", b"a compiled legacy-gate relay binary"),
+            ("lib/eitri/agent-hook", b"a compiled legacy-gate relay binary"),
             ("src/agent/src/bin/agent-hook.rs", b"fn main() {}"),  # M16: source file is fine
         ])
         hits = rc.find_agent_hook_binaries(files)
-        self.assertEqual(hits, ["lib/neovibe/agent-hook"])
+        self.assertEqual(hits, ["lib/eitri/agent-hook"])
 
     def test_a_home_path_inside_an_elf_is_found(self):
         elf_payload = b"\x7fELF" + b"\x00" * 12 + b"/home/someuser/.cargo/registry/src/foo.rs\x00"
-        files = self._extract([("lib/neovibe/shell", elf_payload)])
+        files = self._extract([("lib/eitri/shell", elf_payload)])
         hits = rc.find_home_paths_in_elves(files)
-        self.assertIn("lib/neovibe/shell", hits)
-        self.assertTrue(any("/home/someuser" in m for m in hits["lib/neovibe/shell"]))
+        self.assertIn("lib/eitri/shell", hits)
+        self.assertTrue(any("/home/someuser" in m for m in hits["lib/eitri/shell"]))
 
     def test_a_home_path_inside_a_non_elf_file_is_not_reported(self):
         """M3's own narrowing: the check runs over extracted ELF files, not every extracted
         shipped file -- a text file (a doc, install.sh itself) legitimately mentions such paths in
         prose and examples."""
-        files = self._extract([("lib/neovibe/README.txt", b"see /home/someuser/project for an example")])
+        files = self._extract([("lib/eitri/README.txt", b"see /home/someuser/project for an example")])
         self.assertEqual(rc.find_home_paths_in_elves(files), {})
 
     def test_users_and_root_paths_are_also_matched(self):
         payload = b"\x7fELF" + b"\x00" * 12 + b"C:/Users/dev/build /root/.cargo\x00"
-        files = self._extract([("lib/neovibe/shell", payload)])
+        files = self._extract([("lib/eitri/shell", payload)])
         hits = rc.find_home_paths_in_elves(files)
-        self.assertIn("lib/neovibe/shell", hits)
+        self.assertIn("lib/eitri/shell", hits)
 
     def test_an_sdk_mention_is_found_unless_allowed(self):
         files = self._extract([
-            ("lib/neovibe/neovibe-setup", b"this build fetches claude-agent-sdk on your own machine\n"),
-            ("lib/neovibe/shell", b"claude-agent-sdk should not be inside a compiled binary either"),
+            ("lib/eitri/eitri-setup", b"this build fetches claude-agent-sdk on your own machine\n"),
+            ("lib/eitri/shell", b"claude-agent-sdk should not be inside a compiled binary either"),
         ])
         all_hits = rc.find_sdk_mentions(files)
-        self.assertEqual(sorted(all_hits), ["lib/neovibe/neovibe-setup", "lib/neovibe/shell"])
+        self.assertEqual(sorted(all_hits), ["lib/eitri/eitri-setup", "lib/eitri/shell"])
 
-        allowed_hits = rc.find_sdk_mentions(files, is_allowed=lambda rel: rel.endswith("neovibe-setup"))
-        self.assertEqual(allowed_hits, ["lib/neovibe/shell"])
+        allowed_hits = rc.find_sdk_mentions(files, is_allowed=lambda rel: rel.endswith("eitri-setup"))
+        self.assertEqual(allowed_hits, ["lib/eitri/shell"])
 
     def test_anthropic_pbc_is_also_a_marker(self):
-        files = self._extract([("lib/neovibe/shell", b"Copyright Anthropic PBC, embedded")])
-        self.assertEqual(rc.find_sdk_mentions(files), ["lib/neovibe/shell"])
+        files = self._extract([("lib/eitri/shell", b"Copyright Anthropic PBC, embedded")])
+        self.assertEqual(rc.find_sdk_mentions(files), ["lib/eitri/shell"])
 
     def test_install_sh_mentioning_the_sdk_passes_when_allowed(self):
-        """The one allowed-fixture case Task 1's own brief names by name: neovibe-setup/install.sh
+        """The one allowed-fixture case Task 1's own brief names by name: eitri-setup/install.sh
         mentioning the SDK passes (M2)."""
         files = self._extract([
             ("install.sh", b"# fetches and builds claude-agent-sdk locally, per I2\n"),
-            ("lib/neovibe/neovibe-setup", b"# fetches and builds claude-agent-sdk locally, per I2\n"),
+            ("lib/eitri/eitri-setup", b"# fetches and builds claude-agent-sdk locally, per I2\n"),
         ])
-        allow = {"install.sh", "lib/neovibe/neovibe-setup"}
+        allow = {"install.sh", "lib/eitri/eitri-setup"}
         self.assertEqual(rc.find_sdk_mentions(files, is_allowed=lambda rel: rel in allow), [])
 
 
@@ -494,20 +494,20 @@ class DebExtractionTests(unittest.TestCase):
         archive = os.path.join(_scratch_dir(), "fixture.deb")
         payload = (rc.SEA_SENTINEL + " padding padding padding").encode("ascii")
         _make_deb(archive, [
-            ("/usr/lib/neovibe/helper-utility", payload),
-            ("/usr/lib/neovibe/neovibe-setup", b"fetches claude-agent-sdk on your own machine\n"),
+            ("/usr/lib/eitri/helper-utility", payload),
+            ("/usr/lib/eitri/eitri-setup", b"fetches claude-agent-sdk on your own machine\n"),
         ])
         rc.extract_deb(archive, dest)
         files = rc.iter_files(dest)
-        self.assertEqual(rc.find_sentinel_hits(files), ["usr/lib/neovibe/helper-utility"])
-        sdk_hits = rc.find_sdk_mentions(files, is_allowed=lambda rel: rel.endswith("neovibe-setup"))
+        self.assertEqual(rc.find_sentinel_hits(files), ["usr/lib/eitri/helper-utility"])
+        sdk_hits = rc.find_sdk_mentions(files, is_allowed=lambda rel: rel.endswith("eitri-setup"))
         self.assertEqual(sdk_hits, [])
 
     def test_a_clean_deb_has_no_hits(self):
         dest = _scratch_dir()
         self.addCleanup(shutil.rmtree, dest, ignore_errors=True)
         archive = os.path.join(_scratch_dir(), "fixture.deb")
-        _make_deb(archive, [("/usr/lib/neovibe/shell", b"an ordinary compiled binary\n")])
+        _make_deb(archive, [("/usr/lib/eitri/shell", b"an ordinary compiled binary\n")])
         rc.extract_deb(archive, dest)
         files = rc.iter_files(dest)
         self.assertEqual(rc.find_sentinel_hits(files), [])
@@ -525,18 +525,18 @@ class RpmExtractionTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, dest, ignore_errors=True)
         archive = os.path.join(_scratch_dir(), "fixture.rpm")
         _make_rpm(archive, [
-            ("/usr/lib/neovibe/verdandi-claude-sidecar", b"a renamed-in-fixture sidecar shape"),
-            ("/usr/lib/neovibe/shell", b"an ordinary compiled binary"),
+            ("/usr/lib/eitri/verdandi-claude-sidecar", b"a renamed-in-fixture sidecar shape"),
+            ("/usr/lib/eitri/shell", b"an ordinary compiled binary"),
         ])
         rc.extract_rpm(archive, dest)
         files = rc.iter_files(dest)
-        self.assertEqual(rc.find_verdandi_sidecar_filenames(files), ["usr/lib/neovibe/verdandi-claude-sidecar"])
+        self.assertEqual(rc.find_verdandi_sidecar_filenames(files), ["usr/lib/eitri/verdandi-claude-sidecar"])
 
     def test_a_clean_rpm_has_no_agent_hook(self):
         dest = _scratch_dir()
         self.addCleanup(shutil.rmtree, dest, ignore_errors=True)
         archive = os.path.join(_scratch_dir(), "fixture.rpm")
-        _make_rpm(archive, [("/usr/lib/neovibe/shell", b"an ordinary compiled binary")])
+        _make_rpm(archive, [("/usr/lib/eitri/shell", b"an ordinary compiled binary")])
         rc.extract_rpm(archive, dest)
         files = rc.iter_files(dest)
         self.assertEqual(rc.find_agent_hook_binaries(files), [])
@@ -588,8 +588,8 @@ class TreeEqualityTests(unittest.TestCase):
             rc.compare_tree_to_git_archive(extracted, repo, head)
         self.assertIn("sneaked-in.txt", ctx.exception.unexpected)
 
-    def test_the_neovibe_source_assets_known_additions_are_allowed(self):
-        """M2's ruling: the neovibe source asset equals `git archive HEAD` except exactly
+    def test_the_eitri_source_assets_known_additions_are_allowed(self):
+        """M2's ruling: the Eitri source asset equals `git archive HEAD` except exactly
         vendor/, skia/, neovide/, proto/, .cargo/config.toml, agent-ui/web/dist/index.html,
         agent-ui/web/dist/.inputs-sha256 (v1-dist plan Task 6, P4-A1), THIRD-PARTY-LICENSES and
         SOURCE."""
@@ -613,7 +613,7 @@ class TreeEqualityTests(unittest.TestCase):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(data)
-        rc.compare_tree_to_git_archive(extracted, repo, head, rc.KNOWN_NEOVIBE_SOURCE_ADDITIONS)  # not raise
+        rc.compare_tree_to_git_archive(extracted, repo, head, rc.KNOWN_EITRI_SOURCE_ADDITIONS)  # not raise
 
     def test_an_addition_outside_the_known_list_still_fails(self):
         repo, head = _init_git_repo({"core/lib.rs": b"fn f() {}\n"})
@@ -626,7 +626,7 @@ class TreeEqualityTests(unittest.TestCase):
         with open(os.path.join(extracted, "not-a-known-addition", "x"), "wb") as f:
             f.write(b"x\n")
         with self.assertRaises(rc.TreeMismatch) as ctx:
-            rc.compare_tree_to_git_archive(extracted, repo, head, rc.KNOWN_NEOVIBE_SOURCE_ADDITIONS)
+            rc.compare_tree_to_git_archive(extracted, repo, head, rc.KNOWN_EITRI_SOURCE_ADDITIONS)
         self.assertIn("not-a-known-addition/x", ctx.exception.unexpected)
 
 
@@ -752,7 +752,7 @@ class BuildOutputTests(unittest.TestCase):
             rc.release_executables(lines)
 
     def test_a_missing_binary_fails(self):
-        with self.assertRaisesRegex(rc.ReleaseCheckError, "did not build: neovibe-tmux-shim"):
+        with self.assertRaisesRegex(rc.ReleaseCheckError, "did not build: eitri-tmux-shim"):
             rc.release_executables([_artifact(p) for p in self.FOUR if not p.endswith("tmux-shim")])
 
     def test_the_skia_bindings_out_dir_in_either_package_id_spelling(self):
@@ -821,17 +821,17 @@ class RelinkRecipeTests(unittest.TestCase):
         # Whole-branch review (lane D): proof (a) sets exactly these before its offline rebuild, so
         # the rebuilt --version names the fork commit the shipped one does, not "unknown".
         self.assertEqual(rc.parse_rebuild_env(self.source_text()),
-                         {"NEOVIBE_BUILD_COMMIT": "a" * 40, "NEOVIBE_BUILD_FORK_COMMIT": "c" * 40})
+                         {"EITRI_BUILD_COMMIT": "a" * 40, "EITRI_BUILD_FORK_COMMIT": "c" * 40})
 
     def test_a_rebuild_env_missing_doubled_short_or_unknown_fails(self):
         text = self.source_text()
-        fork_line = "    NEOVIBE_BUILD_FORK_COMMIT=" + "c" * 40 + "\n"
+        fork_line = "    EITRI_BUILD_FORK_COMMIT=" + "c" * 40 + "\n"
         self.assertIn(fork_line, text)
         for broken, why in ((text.replace(fork_line, ""), "0 times"),
                             (text.replace(fork_line, fork_line * 2), "2 times"),
-                            (text.replace(fork_line, "    NEOVIBE_BUILD_FORK_COMMIT=ccccccc\n"), "not a full commit"),
-                            (text.replace(fork_line, fork_line + "    NEOVIBE_BUILD_OTHER=" + "d" * 40 + "\n"),
-                             "unexpected NEOVIBE_BUILD_OTHER")):
+                            (text.replace(fork_line, "    EITRI_BUILD_FORK_COMMIT=ccccccc\n"), "not a full commit"),
+                            (text.replace(fork_line, fork_line + "    EITRI_BUILD_OTHER=" + "d" * 40 + "\n"),
+                             "unexpected EITRI_BUILD_OTHER")):
             with self.subTest(why=why), self.assertRaisesRegex(rc.ReleaseCheckError, why):
                 rc.parse_rebuild_env(broken)
 
@@ -931,7 +931,7 @@ class ThirdPartyLicensesScanAllowTests(unittest.TestCase):
             self.skipTest("publish/scan.sh is not in this checkout")
         root = _scratch_dir()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        _plant(root, {"share/licenses/neovibe/THIRD-PARTY-LICENSES": text.encode()})
+        _plant(root, {"share/licenses/eitri/THIRD-PARTY-LICENSES": text.encode()})
         return subprocess.run(["bash", scan, root], capture_output=True, text=True)
 
     def test_third_party_addresses_pass(self):
@@ -993,18 +993,18 @@ class BinaryAssetTreeTests(unittest.TestCase):
 
     def test_only_the_deb_carries_the_apparmor_profile(self):
         """docs/superpowers/plans/2026-09-28-v1-dist-ubuntu-userns.md: the .deb's layout is the
-        .rpm's plus /etc/apparmor.d/neovibe; a .deb without it, or an .rpm with it, fails."""
-        self.assertEqual(rc.deb_roles(), {**rc.package_roles(), "apparmor": "etc/apparmor.d/neovibe"})
+        .rpm's plus /etc/apparmor.d/eitri; a .deb without it, or an .rpm with it, fails."""
+        self.assertEqual(rc.deb_roles(), {**rc.package_roles(), "apparmor": "etc/apparmor.d/eitri"})
         deb, rpm = rc.deb_roles(), rc.package_roles()
         root = self.tree(deb)
         os.remove(os.path.join(root, deb["apparmor"]))
-        self.assertTrue(any("missing: etc/apparmor.d/neovibe" in p for p in rc.check_binary_asset("x", root, deb)))
-        problems = rc.check_binary_asset("x", self.tree(rpm, {"etc/apparmor.d/neovibe": b"profile\n"}), rpm)
-        self.assertTrue(any("files no release ships: etc/apparmor.d/neovibe" in p for p in problems), problems)
+        self.assertTrue(any("missing: etc/apparmor.d/eitri" in p for p in rc.check_binary_asset("x", root, deb)))
+        problems = rc.check_binary_asset("x", self.tree(rpm, {"etc/apparmor.d/eitri": b"profile\n"}), rpm)
+        self.assertTrue(any("files no release ships: etc/apparmor.d/eitri" in p for p in problems), problems)
 
     def test_an_extra_file_such_as_agent_hook_fails(self):
         roles = rc.package_roles()
-        problems = rc.check_binary_asset("x", self.tree(roles, {"usr/lib/neovibe/agent-hook": _fake_elf()}), roles)
+        problems = rc.check_binary_asset("x", self.tree(roles, {"usr/lib/eitri/agent-hook": _fake_elf()}), roles)
         self.assertTrue(any("files no release ships" in p for p in problems), problems)
         self.assertTrue(any("agent-hook binary" in p for p in problems), problems)
 
@@ -1014,12 +1014,12 @@ class BinaryAssetTreeTests(unittest.TestCase):
         os.remove(os.path.join(root, roles["SOURCE"]))
         self.assertTrue(any("missing" in p for p in rc.check_binary_asset("x", root, roles)))
 
-    def test_the_sdk_name_outside_neovibe_setup_fails(self):
+    def test_the_sdk_name_outside_eitri_setup_fails(self):
         roles = rc.package_roles()
         root = self.tree(roles, overrides={roles["shell"]: _fake_elf(b"claude-agent-sdk")})
         problems = rc.check_binary_asset("x", root, roles)
         self.assertEqual(len(problems), 1, problems)
-        self.assertIn("usr/lib/neovibe/shell", problems[0])
+        self.assertIn("usr/lib/eitri/shell", problems[0])
 
     def test_a_home_path_in_a_binary_fails(self):
         roles = rc.package_roles()
@@ -1097,7 +1097,7 @@ class WebBundleFingerprintTests(unittest.TestCase):
     comments), kept in step only by those doc comments and by whatever exercises each one --
     nothing else compares them against each other directly, so a change to either one that
     silently drifted from the other would otherwise only surface as every real release's source
-    asset failing `check_neovibe_source_tree` (v1-dist Task 12 fix round 1, finding #3)."""
+    asset failing `check_eitri_source_tree` (v1-dist Task 12 fix round 1, finding #3)."""
 
     PINNED_SHA256 = "ae53f67ca66e61114b0f5453e451fa06c6ed8d9f8d44bee54b35d51b23fe3408"
 
@@ -1108,7 +1108,7 @@ class WebBundleFingerprintTests(unittest.TestCase):
         self.assertEqual(rc.web_bundle_fingerprint(root), self.PINNED_SHA256)
 
 
-class NeovibeSourceTreeTests(unittest.TestCase):
+class EitriSourceTreeTests(unittest.TestCase):
     SKIA = "skia-binaries-k.tar.gz"
     SKIA_BYTES = b"skia archive"
 
@@ -1136,13 +1136,13 @@ class NeovibeSourceTreeTests(unittest.TestCase):
         })
         # shell/build_web.rs writes this beside the bundle after a successful build (v1-dist plan
         # Task 6, P4-A1) -- a fresh fingerprint over the fixture's own web sources, exactly as a real
-        # release build would compute it, is what check_neovibe_source_tree now requires matches.
+        # release build would compute it, is what check_eitri_source_tree now requires matches.
         self.web_dir = os.path.join(self.root, "agent-ui/web")
         _plant(self.root, {"agent-ui/web/dist/.inputs-sha256": rc.web_bundle_fingerprint(self.web_dir).encode()})
 
     def check(self):
         sha = hashlib.sha256(self.SKIA_BYTES).hexdigest()
-        return rc.check_neovibe_source_tree(self.root, self.src, self.verdandi, self.vhead, self.SKIA, sha)
+        return rc.check_eitri_source_tree(self.root, self.src, self.verdandi, self.vhead, self.SKIA, sha)
 
     def test_the_assembled_tree_passes(self):
         self.assertEqual(self.check(), [])
@@ -1212,8 +1212,8 @@ class ReleaseAssetsTests(unittest.TestCase):
     SKIA = "skia-binaries-k.tar.gz"
     SKIA_BYTES = b"skia archive"
     INSTALL = b"#!/bin/sh\n# builds the sidecar, which downloads claude-agent-sdk on your machine\n"
-    APPARMOR = b"abi <abi/4.0>,\nprofile neovibe \"/usr/lib/neovibe/shell\" flags=(unconfined) {\n  userns,\n}\n"
-    RELEASE = b"NEOVIBE_VERSION=1.0.0-rc.1\n"
+    APPARMOR = b"abi <abi/4.0>,\nprofile eitri \"/usr/lib/eitri/shell\" flags=(unconfined) {\n  userns,\n}\n"
+    RELEASE = b"EITRI_VERSION=1.0.0-rc.1\n"
     NOTICES = {"THIRD-PARTY-LICENSES": b"notices\n", "SOURCE": b"the source is the source asset\n"}
 
     @classmethod
@@ -1226,7 +1226,7 @@ class ReleaseAssetsTests(unittest.TestCase):
         })
         cls.src, _ = _init_git_repo({"Cargo.toml": b"[workspace]\n", "agent-ui/web/src/a.ts": b"x\n",
                                      "packaging/install.sh": cls.INSTALL, "LICENSE": b"MIT\n",
-                                     "packaging/apparmor/neovibe": cls.APPARMOR})
+                                     "packaging/apparmor/eitri": cls.APPARMOR})
         fork, _ = _init_git_repo({"Cargo.toml": b"[package]\n"})
         shutil.copytree(fork, os.path.join(cls.src, "neovide"))
         shutil.rmtree(fork, ignore_errors=True)
@@ -1312,16 +1312,16 @@ class ReleaseAssetsTests(unittest.TestCase):
             return lambda c: c.__setitem__(key, data)
 
         cases = [
-            ("tarball", plant("tarball", rc.tarball_top(self.VERSION) + "/lib/neovibe/agent-hook", _fake_elf()),
+            ("tarball", plant("tarball", rc.tarball_top(self.VERSION) + "/lib/eitri/agent-hook", _fake_elf()),
              ["{tarball}: files no release ships", "agent-hook"]),
-            ("deb", plant("deb", "usr/lib/neovibe/verdandi-claude-sidecar", _fake_elf()),
+            ("deb", plant("deb", "usr/lib/eitri/verdandi-claude-sidecar", _fake_elf()),
              ["{deb}: files no release ships", "verdandi-claude-sidecar"]),
-            ("rpm", plant("rpm", "usr/lib/neovibe/agent-hook", _fake_elf()),
+            ("rpm", plant("rpm", "usr/lib/eitri/agent-hook", _fake_elf()),
              ["{rpm}: files no release ships"]),
-            ("rpm apparmor", plant("rpm", "etc/apparmor.d/neovibe", self.APPARMOR),
-             ["{rpm}: files no release ships", "etc/apparmor.d/neovibe"]),
-            ("deb apparmor bytes", plant("deb", "etc/apparmor.d/neovibe", b"another profile\n"),
-             ["not byte-identical", "{deb}:etc/apparmor.d/neovibe"]),
+            ("rpm apparmor", plant("rpm", "etc/apparmor.d/eitri", self.APPARMOR),
+             ["{rpm}: files no release ships", "etc/apparmor.d/eitri"]),
+            ("deb apparmor bytes", plant("deb", "etc/apparmor.d/eitri", b"another profile\n"),
+             ["not byte-identical", "{deb}:etc/apparmor.d/eitri"]),
             ("rpm bytes", plant("rpm", shell, _fake_elf(b"another build")),
              ["not byte-identical", "{rpm}:" + shell]),
             ("source", plant("source", top + "stray.txt", b"x\n"), ["source asset vs git archive HEAD", "stray.txt"]),
@@ -1333,7 +1333,7 @@ class ReleaseAssetsTests(unittest.TestCase):
             ("verdandi", plant("verdandi", "bin/tool", _fake_elf()), ["Verdandi asset: an ELF file", "bin/tool"]),
             ("install.sh", replace("install.sh", b"#!/bin/sh\n# another installer\n"),
              ["not byte-identical", "install.sh="]),
-            ("RELEASE", replace("RELEASE", b"NEOVIBE_VERSION=1.0.0\n"), ["not byte-identical", "{tarball}:RELEASE"]),
+            ("RELEASE", replace("RELEASE", b"EITRI_VERSION=1.0.0\n"), ["not byte-identical", "{tarball}:RELEASE"]),
             ("missing", replace("verdandi", None), ["asset missing: {verdandi}"]),
         ]
         names = {k: v for k, v in self.names().items() if "." not in k and k != "RELEASE"}
@@ -1553,16 +1553,16 @@ class ReleaseSignersAgreementTests(unittest.TestCase):
     packaging/install.sh's embedded_release_signers() heredoc must stay byte-identical to the
     tracked packaging/release-signers -- a hand-kept copy that drifts is the defect the report
     found (spec sec 4.4, D5/D13). These tests plant a minimal install.sh shape carrying the real
-    heredoc marker (`NEOVIBE_RELEASE_SIGNERS`) rather than reading the real 130KB file, since only
+    heredoc marker (`EITRI_RELEASE_SIGNERS`) rather than reading the real 130KB file, since only
     the marker shape and the block between the two marker lines matter here."""
 
     @staticmethod
     def install_sh(block):
-        return "#!/bin/sh\nembedded_release_signers() {\n\tcat <<'NEOVIBE_RELEASE_SIGNERS'\n" + block \
-            + "NEOVIBE_RELEASE_SIGNERS\n}\n"
+        return "#!/bin/sh\nembedded_release_signers() {\n\tcat <<'EITRI_RELEASE_SIGNERS'\n" + block \
+            + "EITRI_RELEASE_SIGNERS\n}\n"
 
     def test_extract_embedded_signers_returns_exactly_the_heredoc_body(self):
-        block = '# a comment\nrelease@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAkeydata\n'
+        block = '# a comment\nrelease@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n'
         self.assertEqual(rc.extract_embedded_signers(self.install_sh(block)), block)
 
     def test_equal_and_empty_passes(self):
@@ -1570,12 +1570,12 @@ class ReleaseSignersAgreementTests(unittest.TestCase):
         rc.check_release_signers_agree(self.install_sh(block), block)  # must not raise
 
     def test_equal_with_a_key_passes(self):
-        block = '# a comment\nrelease@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAkeydata\n'
+        block = '# a comment\nrelease@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n'
         rc.check_release_signers_agree(self.install_sh(block), block)  # must not raise
 
     def test_a_difference_is_reported_with_each_sides_key_lines(self):
         embedded = "# no key line yet\n"
-        tracked = '# a comment\nrelease@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAkeydata\n'
+        tracked = '# a comment\nrelease@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n'
         with self.assertRaises(rc.ReleaseCheckError) as caught:
             rc.check_release_signers_agree(self.install_sh(embedded), tracked)
         message = str(caught.exception)
@@ -1584,12 +1584,12 @@ class ReleaseSignersAgreementTests(unittest.TestCase):
         self.assertIn("no key line", message)
 
     def test_missing_markers_is_reported(self):
-        with self.assertRaisesRegex(rc.ReleaseCheckError, "NEOVIBE_RELEASE_SIGNERS"):
+        with self.assertRaisesRegex(rc.ReleaseCheckError, "EITRI_RELEASE_SIGNERS"):
             rc.check_release_signers_agree("#!/bin/sh\necho hi\n", "# no key\n")
 
     def test_only_an_opening_marker_is_reported(self):
-        broken = "#!/bin/sh\n\tcat <<'NEOVIBE_RELEASE_SIGNERS'\n# no key\n"
-        with self.assertRaisesRegex(rc.ReleaseCheckError, "NEOVIBE_RELEASE_SIGNERS"):
+        broken = "#!/bin/sh\n\tcat <<'EITRI_RELEASE_SIGNERS'\n# no key\n"
+        with self.assertRaisesRegex(rc.ReleaseCheckError, "EITRI_RELEASE_SIGNERS"):
             rc.check_release_signers_agree(broken, "# no key\n")
 
 
@@ -1618,19 +1618,19 @@ class CheckReleaseSignersCliIsByteExact(unittest.TestCase):
         return code, buf_out.getvalue(), buf_err.getvalue()
 
     def test_lf_install_sh_against_lf_signers_matches(self):
-        block = 'release@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAkeydata\n'
+        block = 'release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n'
         install_sh = self.write("install.sh",
-                                 "#!/bin/sh\nembedded_release_signers() {\n\tcat <<'NEOVIBE_RELEASE_SIGNERS'\n"
-                                 + block + "NEOVIBE_RELEASE_SIGNERS\n}\n")
+                                 "#!/bin/sh\nembedded_release_signers() {\n\tcat <<'EITRI_RELEASE_SIGNERS'\n"
+                                 + block + "EITRI_RELEASE_SIGNERS\n}\n")
         signers = self.write("release-signers", block)
         code, _, err = self.run_cli(install_sh, signers)
         self.assertEqual(code, 0, err)
 
     def test_a_crlf_copy_of_release_signers_is_not_treated_as_matching_an_lf_install_sh(self):
-        block = 'release@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAkeydata\n'
+        block = 'release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n'
         install_sh = self.write("install.sh",
-                                 "#!/bin/sh\nembedded_release_signers() {\n\tcat <<'NEOVIBE_RELEASE_SIGNERS'\n"
-                                 + block + "NEOVIBE_RELEASE_SIGNERS\n}\n")
+                                 "#!/bin/sh\nembedded_release_signers() {\n\tcat <<'EITRI_RELEASE_SIGNERS'\n"
+                                 + block + "EITRI_RELEASE_SIGNERS\n}\n")
         # The exact same key line, but the tracked file on disk is CRLF -- not byte-identical to
         # what install.sh embeds, even though a universal-newline read would collapse the two.
         signers = self.write("release-signers", block.replace("\n", "\r\n"))
@@ -1685,7 +1685,7 @@ class RewritesNoOpTests(unittest.TestCase):
             self.assertNotIn(
                 rc.SEA_SENTINEL.encode("ascii"), content,
                 f"the joined SEA sentinel literal must not appear in {os.path.relpath(path, _PACKAGING)} "
-                "(M5) -- it would flag the neovibe source asset's own copy of this file",
+                "(M5) -- it would flag the Eitri source asset's own copy of this file",
             )
 
 

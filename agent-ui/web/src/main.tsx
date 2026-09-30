@@ -17,7 +17,7 @@ createRoot(container).render(
       fallback={(e) => (
         <div className="panel-crashed" role="alert">
           The panel stopped drawing ({e.message}). prefix r (Ctrl+b r by default) reloads it; the conversation lives in
-          neovibe and comes back.
+          Eitri and comes back.
         </div>
       )}
     >

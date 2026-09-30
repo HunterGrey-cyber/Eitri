@@ -86,7 +86,7 @@ pub const CLIENT_IMPLEMENTS_RESUME: bool = true;
 /// both, not before.
 const CLIENT_IMPLEMENTS_FORK: bool = false;
 /// True since O3 (2026-09-27): a provider prompt is translated with its origin
-/// (`translate::provider_prompt_of`), answered by `neovibe_core::agent_backend` on the rules O3 set
+/// (`translate::provider_prompt_of`), answered by `eitri_core::agent_backend` on the rules O3 set
 /// (bypass allows it unless the user's own ask rule forced it; Auto allows it only after the human
 /// approved the same call), and drawn as a card with the CLI's own reason otherwise. Before that a
 /// session that asked for these would have had its prompts judged as if the gate had asked.
@@ -599,7 +599,7 @@ fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo)
     Err(ProviderError::Provider {
         code: ProviderErrorCode::InvalidConfiguration,
         message: format!(
-            "this provider does not offer a gated (interactive) mode, the only one neovibe runs a \
+            "this provider does not offer a gated (interactive) mode, the only one Eitri runs a \
              session in; it advertises: {}",
             if info.advertised_permission_modes.is_empty() {
                 "none".to_string()
@@ -634,7 +634,7 @@ fn build_create_request(
         policy: Some(ClaudeHostPolicy {
             configuration: ConfigurationProfile::Native as i32,
             // Always gated (R07): the CLI runs `default` under Verdandi's `PreToolUse` broker, and
-            // bypass is neovibe answering `allow`, never a policy sent here.
+            // bypass is Eitri answering `allow`, never a policy sent here.
             permissions: ProtoPermissionMode::Interactive as i32,
             persistence: PersistenceMode::HostCli as i32,
             executable: ExecutableSource::HostCli as i32,
@@ -653,7 +653,7 @@ fn build_create_request(
             // to prevent.
             //
             // `Native` stays: it is the tier set below that decides what loads, and this field is
-            // the axis that distinguishes a real project from an isolated one. Neovibe has no
+            // the axis that distinguishes a real project from an isolated one. Eitri has no
             // product answer for `Isolated` yet (no UI, config or Lua seam picks it), and there is a
             // trap waiting there -- see `agent/MANUAL_VERIFICATION.md`.
             setting_sources: Some(SettingSourceSelection {
@@ -674,7 +674,7 @@ fn build_create_request(
             // `Options.tools` -- the real restriction list, not `allowedTools`, which is a
             // PRE-APPROVAL list a field named `allow` would have quietly widened access through.
             // Absent means "do not touch the base tool set"; present-and-empty would mean "no
-            // built-in tools at all", stated. Neovibe has no allowlist to express, so it says
+            // built-in tools at all", stated. Eitri has no allowlist to express, so it says
             // nothing rather than saying the empty set.
             tool_policy: Some(ToolPolicy {
                 deny: denied.iter().map(|t| (*t).to_string()).collect(),
@@ -908,7 +908,7 @@ mod tests {
     /// creates -- all of them gated -- exactly when the handshake advertised the capability, and the
     /// flag is the ONLY thing that moves: the policy is otherwise the one `every_request_is_gated_...`
     /// pins, `allow` still absent (Verdandi refuses an allow list naming the three prompt tools the
-    /// flag would add, and neovibe has none).
+    /// flag would add, and Eitri has none).
     #[test]
     fn the_clis_own_prompts_are_asked_for_exactly_when_the_sidecar_offers_them() {
         assert!(provider_prompts_from_handshake(&real_handshake_today()));

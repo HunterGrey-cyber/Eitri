@@ -8,7 +8,7 @@ use super::module::ModuleId;
 use super::tree::{Axis, Branch, Layout, LayoutError, Node, Pin, MAX_RATIO, MIN_RATIO};
 
 /// `Ctrl+a \ <key>` (`Axis::Row`: right of `target`) and `Ctrl+a " <key>` (`Axis::Column`: below
-/// it), and `neovibe.layout.split` (spec §4.3). `module` goes into a new split after `target`, at
+/// it), and `eitri.layout.split` (spec §4.3). `module` goes into a new split after `target`, at
 /// half of `target`'s space, as tmux's `split-window` makes one. A module already in the tree is
 /// MOVED, as tmux's `join-pane` moves a pane -- never duplicated: its old leaf goes, and its sibling
 /// takes that space, pin and all. A hidden module is shown by being placed; a module never placed

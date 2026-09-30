@@ -14,8 +14,8 @@ pub use compose::{compose_turn_text, EditorContext, Selection, CONTENT_LIMIT, TR
 /// from one place, as the resume-history design (§3.1.2) specifies.
 ///
 /// It is *defined* in `agent::history::composed_block` rather than in [`compose`] for a reason the
-/// crate graph forces: `neovibe-core` depends on `agent`, and the transcript reader that needs the
-/// inverse lives in `agent`, so defining it here would require `agent -> neovibe-core -> agent`.
+/// crate graph forces: `eitri-core` depends on `agent`, and the transcript reader that needs the
+/// inverse lives in `agent`, so defining it here would require `agent -> eitri-core -> agent`.
 /// The property that ties the two together -- `strip(compose(t, ctx)) == t` -- is asserted in
 /// [`compose`]'s own tests, beside the cases for the forward direction.
 pub use agent::history::strip_composed_block;

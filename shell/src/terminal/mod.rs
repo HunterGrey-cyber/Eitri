@@ -1,9 +1,9 @@
 //! The bottom terminal's GTK half (spec docs/superpowers/specs/2026-09-23-bottom-terminal-design.md).
-//! The engine -- PTY, session thread, emulator, paint -- is `neovibe-terminal`, which has no GTK.
+//! The engine -- PTY, session thread, emulator, paint -- is `eitri-terminal`, which has no GTK.
 //!
 //! This module holds the widget ([`TerminalPane`]) and the few decisions `main.rs` makes about it,
 //! each as a pure function so it is tested without a display: what `Ctrl+a t` does, where
-//! `Ctrl+a Ctrl+a` goes, which chords the terminal gives up to neovibe, and its colours.
+//! `Ctrl+a Ctrl+a` goes, which chords the terminal gives up to Eitri, and its colours.
 //!
 //! **A module since the modules design's P1** (docs/superpowers/specs/
 //! 2026-09-23-modules-and-canvas-design.md; its plan's Task 11 re-homed it). It is
@@ -11,7 +11,7 @@
 //! the owner: "同意，默认放到编辑器下面"; not below the editor and the agent together, as it was
 //! before -- a Lua `bottom` panel still goes under everything instead of replacing anything) and
 //! hidden in the layout until the first `Ctrl+a t`. Where it goes, what shows it, who gets the keys
-//! when it hides and where `Ctrl+h/j/k/l` from it lead are the layout's (`neovibe_core::layout`,
+//! when it hides and where `Ctrl+h/j/k/l` from it lead are the layout's (`eitri_core::layout`,
 //! `ModuleGrid`), not a slot index's: this module keeps only the decisions that are the terminal's
 //! own.
 
@@ -25,17 +25,17 @@ pub(crate) mod pointer;
 
 pub(crate) use pane::TerminalPane;
 
+use eitri_core::layout::{Frame, Layout, LayoutError, ModuleDecl, ModuleId, ModuleKind, Placement};
+use eitri_core::theme::ThemeTokens;
+use eitri_terminal::{ExitInfo, TerminalColors};
 use gtk4::gdk::{Key, ModifierType};
-use neovibe_core::layout::{Frame, Layout, LayoutError, ModuleDecl, ModuleId, ModuleKind, Placement};
-use neovibe_core::theme::ThemeTokens;
-use neovibe_terminal::{ExitInfo, TerminalColors};
 use terminal_render::RgbColor;
 
 use crate::layout::Direction;
 
 /// The first-launch layout with the terminal in it (v1 trial item 6, 2026-09-28): `Layout::initial`
 /// over the terminal first -- below the editor's own leaf only, via
-/// [`neovibe_core::layout::Placement::BelowEditor`], so the agent panel (and any Lua `side` panel)
+/// [`eitri_core::layout::Placement::BelowEditor`], so the agent panel (and any Lua `side` panel)
 /// keep the whole window's height -- then `lua`, in the order they were registered. The terminal is
 /// hidden before anything is built from the layout, so its host is never on screen until
 /// `Ctrl+a t`, and the window looks exactly as it did without it (the pinned split nested inside the
@@ -57,7 +57,7 @@ use crate::layout::Direction;
 /// and a `Row` split never touches height). Either panel can also be the module that takes the keys
 /// when the terminal hides, if it had them more recently than the editor or the agent.
 ///
-/// Hidden through `neovibe_core::layout::hide`, the only door (`Layout::hide_unfocused` is private
+/// Hidden through `eitri_core::layout::hide`, the only door (`Layout::hide_unfocused` is private
 /// to the layout so nothing hides the module with the keys without choosing where they go). At
 /// startup the keys are on the editor or a Lua `main` panel, never on the terminal, so `hide` reads
 /// no geometry and the frame it is given is only a formality.
@@ -68,7 +68,7 @@ pub(crate) fn initial_layout(lua: &[ModuleDecl]) -> Result<Layout, LayoutError> 
     }];
     decls.extend_from_slice(lua);
     let mut layout = Layout::initial(&decls)?;
-    neovibe_core::layout::hide(
+    eitri_core::layout::hide(
         &mut layout,
         &ModuleId::terminal(),
         &Frame::new(crate::module_grid::UNALLOCATED, 1),
@@ -149,7 +149,7 @@ impl ToggleAction {
 /// A shell that never started (an exec error) is not an end at all -- the pane shows the error in
 /// its own frame (`pane::ensure_session`) and never reaches this.
 ///
-/// As the last module on screen, this is not the layout's kill to make (`neovibe_core::layout::kill`
+/// As the last module on screen, this is not the layout's kill to make (`eitri_core::layout::kill`
 /// refuses the last one, as a hide does): it closes the window instead, tmux's own last-pane rule,
 /// through the ordinary close path -- `close window? N running (y/n)` when a tab runs, and `n`
 /// leaves everything, this terminal and its notice included ([`OnExit`], task 6, 2026-09-26).
@@ -158,7 +158,7 @@ pub(crate) fn closes_on_exit(exit: &ExitInfo) -> bool {
 }
 
 /// What a shell's own end does with the module ([`closes_on_exit`]'s `true` case), by
-/// `neovibe_core::layout::can_kill`'s answer for it: another module is on screen, so the layout can
+/// `eitri_core::layout::can_kill`'s answer for it: another module is on screen, so the layout can
 /// take this one off it ([`KillScope::Module`]); or it is the last one, so ending it closes the
 /// window instead and the module itself is left alone until that really happens
 /// ([`KillScope::Window`]) -- `main.rs`'s `on_shell_exit` reads this rather than repeating the
@@ -169,8 +169,8 @@ pub(crate) enum OnExit {
     CloseWindow,
 }
 
-pub(crate) fn on_exit(scope: neovibe_core::layout::KillScope) -> OnExit {
-    use neovibe_core::layout::KillScope;
+pub(crate) fn on_exit(scope: eitri_core::layout::KillScope) -> OnExit {
+    use eitri_core::layout::KillScope;
     match scope {
         KillScope::Module => OnExit::CloseModule,
         KillScope::Window => OnExit::CloseWindow,
@@ -199,7 +199,7 @@ pub(crate) fn literal_target(focused: Option<ModuleKind>) -> LiteralTarget {
     }
 }
 
-/// `Ctrl+h/j/k/l` with nothing else held: the chords neovibe takes from the terminal before its own
+/// `Ctrl+h/j/k/l` with nothing else held: the chords Eitri takes from the terminal before its own
 /// key controller sees them ("neovibe的按键优先"). Claimed even with no module in that direction, so
 /// what the shell receives never depends on the layout. `Shift`, `Alt` or `Super` held means it is
 /// not one of these, and the terminal gets it.
@@ -230,7 +230,7 @@ pub(crate) fn copy_mode_entry(focused: Option<ModuleKind>) -> bool {
 /// a pale cell. With `None` the cursor takes the covered cell's colours swapped, as foot does; on
 /// the theme's own default cells that is the same foreground block as before.
 pub(crate) fn colors_from(tokens: &ThemeTokens) -> TerminalColors {
-    let rgb = |c: neovibe_core::theme::color::Rgb| RgbColor::new(c.r, c.g, c.b);
+    let rgb = |c: eitri_core::theme::color::Rgb| RgbColor::new(c.r, c.g, c.b);
     TerminalColors {
         background: rgb(tokens.bg),
         foreground: rgb(tokens.fg),
@@ -242,7 +242,7 @@ pub(crate) fn colors_from(tokens: &ThemeTokens) -> TerminalColors {
 mod tests {
     use super::*;
     use crate::module_grid::UNALLOCATED;
-    use neovibe_core::layout::{arrange, hide, navigate, Nav, Rect, ZoomChange};
+    use eitri_core::layout::{arrange, hide, navigate, Nav, Rect, ZoomChange};
 
     fn editor() -> ModuleId {
         ModuleId::editor()
@@ -313,7 +313,7 @@ mod tests {
 
     /// `Ctrl+a t`'s show/focus/hide cycle and the keys around it, over the layout the grid
     /// allocates -- the same calls `main.rs` makes through `ModuleGrid` (`show_module` is
-    /// `Layout::show`; `hide_module` is `neovibe_core::layout::hide`, then the focus it returns,
+    /// `Layout::show`; `hide_module` is `eitri_core::layout::hide`, then the focus it returns,
     /// then the unmap). What `main`'s `PaneLayout` did for the terminal, each point checked here,
     /// updated for v1 trial item 6 (2026-09-28: below the editor's own column, not below everything):
     /// the first show a third of the editor column's height, and only as wide as the editor
@@ -390,7 +390,7 @@ mod tests {
         let divider = shown
             .dividers
             .iter()
-            .find(|d| d.axis == neovibe_core::layout::Axis::Column)
+            .find(|d| d.axis == eitri_core::layout::Axis::Column)
             .unwrap()
             .clone();
         layout.set_ratio(&divider.path, divider.ratio_for(400)).unwrap();
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn on_exit_reads_can_kills_scope() {
-        use neovibe_core::layout::KillScope;
+        use eitri_core::layout::KillScope;
         assert_eq!(on_exit(KillScope::Module), OnExit::CloseModule);
         assert_eq!(on_exit(KillScope::Window), OnExit::CloseWindow);
     }

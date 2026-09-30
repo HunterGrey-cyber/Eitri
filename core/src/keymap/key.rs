@@ -277,7 +277,7 @@ impl Chord {
                 "Control" | "Ctrl" | "Primary" => chord.ctrl = true,
                 "Alt" | "Mod1" => chord.alt = true,
                 "Shift" => chord.shift = true,
-                other => return Err(format!("{accel:?} holds <{other}>, a modifier neovibe does not read")),
+                other => return Err(format!("{accel:?} holds <{other}>, a modifier Eitri does not read")),
             }
             rest = &rest[end + 2..];
         }
@@ -437,7 +437,7 @@ mod tests {
         assert!(Chord::from_gtk("<Control><Shift>f").unwrap().shift);
         assert_eq!(Chord::from_gtk("<Control>KP_Add").unwrap().key, "KP_Add");
         assert!(Chord::from_gtk("<Control>").is_err(), "no key");
-        assert!(Chord::from_gtk("<Super>x").is_err(), "a modifier neovibe does not read");
+        assert!(Chord::from_gtk("<Super>x").is_err(), "a modifier Eitri does not read");
         assert_eq!(Chord::from_gtk("<Control>equal").unwrap().human(), "Ctrl+=");
     }
 }

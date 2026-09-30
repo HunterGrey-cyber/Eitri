@@ -21,8 +21,8 @@
 
 mod fixture;
 
+use eitri_terminal::{paint, TerminalMetrics};
 use fixture::{load_scenarios, Scenario};
-use neovibe_terminal::{paint, TerminalMetrics};
 use skia_safe::{surfaces, Color, ISize};
 
 /// Big enough cells that a glyph has room to be unambiguously present or absent, and that sampling

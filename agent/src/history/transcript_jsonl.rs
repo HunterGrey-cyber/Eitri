@@ -75,7 +75,7 @@ pub const HISTORY_MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// Measured: `typed` + `suggestion_accepted` + `queued` is 442 lines, exactly matching the 442
 /// lines carrying the independent field `origin.kind == "human"` -- two fields corroborating each
 /// other rather than one field asserting itself. **`sdk` is not optional**: every prompt in the six
-/// sessions Neovibe itself drove carries `promptSource: "sdk"` and no `origin` field at all, so an
+/// sessions Eitri itself drove carries `promptSource: "sdk"` and no `origin` field at all, so an
 /// allow-list of "human" alone would return nothing in the only situation this feature exists for.
 ///
 /// What it misses, knowingly: a bare `/compact` and other slash commands, which carry no
@@ -140,7 +140,7 @@ pub struct HistoryCounts {
     /// Lines longer than [`HISTORY_MAX_LINE_BYTES`], discarded without being buffered.
     pub oversized_lines: u64,
     /// `attachment` lines. The single biggest thing this module throws away: 21% of the bytes in a
-    /// session file, and 13-24 of the 19-69 lines in a Neovibe-driven one.
+    /// session file, and 13-24 of the 19-69 lines in an Eitri-driven one.
     pub attachment_lines: u64,
     /// `system` lines, all ten subtypes, `compact_boundary` included.
     pub system_lines: u64,
@@ -1197,7 +1197,7 @@ mod tests {
     // The editor-context block
     // ---------------------------------------------------------------------------------------
 
-    /// The prompt on disk is the WIRE turn. Two of the six Neovibe-driven sessions on this machine
+    /// The prompt on disk is the WIRE turn. Two of the six Eitri-driven sessions on this machine
     /// carry a block this project's own `compose_turn_text` appended, and
     /// `UserPromptSubmitted::text` is documented as what the user typed, not what went on the wire.
     #[test]

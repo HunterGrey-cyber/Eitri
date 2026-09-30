@@ -43,7 +43,7 @@ const SOCKET_NAME: &str = "t.sock";
 
 /// The snippet's own file name. Not shortened with the others: it is `dofile`d and named by an
 /// environment variable, never bound, so no `sockaddr_un` limit applies to it and legibility in a
-/// `--cmd` line and in `:echo $NEOVIBE_THEME_LUA` is worth more than the four bytes.
+/// `--cmd` line and in `:echo $EITRI_THEME_LUA` is worth more than the four bytes.
 const LUA_NAME: &str = "theme.lua";
 
 /// Every `(directory prefix, socket file)` pair this module has ever used, current first. The
@@ -64,8 +64,7 @@ pub(crate) const NVIM_THEME_LUA: &str = include_str!("nvim_theme.lua");
 /// The one `--cmd` handed to nvim. It checks the path before `dofile`, because `dofile(nil)` reads
 /// stdin -- which under `--embed` is the RPC pipe -- and wraps the load in `pcall`, so a broken
 /// snippet costs the theme, never the editor.
-pub(crate) const LOADER_CMD: &str =
-    "lua local p = vim.env.NEOVIBE_THEME_LUA; if p and p ~= '' then pcall(dofile, p) end";
+pub(crate) const LOADER_CMD: &str = "lua local p = vim.env.EITRI_THEME_LUA; if p and p ~= '' then pcall(dofile, p) end";
 
 pub struct ThemeFeed {
     dir: PathBuf,
@@ -136,11 +135,8 @@ impl ThemeFeed {
     /// Set on the nvim child only, through `NeovideEditorPaneOptions::child_env`.
     pub fn child_env(&self) -> Vec<(String, String)> {
         vec![
-            (
-                "NEOVIBE_THEME_SOCKET".to_string(),
-                self.socket_path.display().to_string(),
-            ),
-            ("NEOVIBE_THEME_LUA".to_string(), self.lua_path.display().to_string()),
+            ("EITRI_THEME_SOCKET".to_string(), self.socket_path.display().to_string()),
+            ("EITRI_THEME_LUA".to_string(), self.lua_path.display().to_string()),
         ]
     }
 
@@ -283,8 +279,8 @@ mod tests {
     fn a_feed_owns_a_private_directory_with_its_socket_and_snippet() {
         let feed = ThemeFeed::new().expect("feed");
         let env: std::collections::HashMap<_, _> = feed.child_env().into_iter().collect();
-        let socket = std::path::PathBuf::from(&env["NEOVIBE_THEME_SOCKET"]);
-        let lua = std::path::PathBuf::from(&env["NEOVIBE_THEME_LUA"]);
+        let socket = std::path::PathBuf::from(&env["EITRI_THEME_SOCKET"]);
+        let lua = std::path::PathBuf::from(&env["EITRI_THEME_LUA"]);
         assert!(socket.starts_with(&feed.dir) && lua.starts_with(&feed.dir));
         assert_eq!(std::fs::read_to_string(&lua).unwrap(), NVIM_THEME_LUA);
         use std::os::unix::fs::PermissionsExt;
@@ -417,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spawns a real nvim; run with: cargo test -p neovibe-core theme::feed -- --ignored"]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn a_real_nvim_pushes_its_colorscheme() {
         let mut feed = ThemeFeed::new().expect("feed");
         let mut reader = reader_for(&mut feed);
@@ -449,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spawns a real nvim; run with: cargo test -p neovibe-core theme::feed -- --ignored"]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn a_busy_nvim_main_loop_does_not_lose_a_payload() {
         // A user's own VimEnter handler (session restore, a dashboard) runs after ours, which `--cmd`
         // registered first. `nvim_theme.lua`'s own `send` is synchronous specifically so its write
@@ -500,7 +496,7 @@ mod tests {
     /// snapshot already went out) overrides `Normal.fg`. The periodic re-snapshot must catch it
     /// within a bounded window rather than leaving the panel on `retrobox`'s real colour forever.
     #[test]
-    #[ignore = "spawns a real nvim, and sleeps past the resnapshot interval; run with: cargo test -p neovibe-core theme::feed -- --ignored"]
+    #[ignore = "spawns a real nvim, and sleeps past the resnapshot interval; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn a_late_highlight_override_is_eventually_caught_by_the_periodic_resnapshot() {
         let mut feed = ThemeFeed::new().expect("feed");
         let mut reader = reader_for(&mut feed);
@@ -544,7 +540,7 @@ mod tests {
     /// idle window (measured: connections at 0.01/3.01/6.01/9.01 s, one distinct payload). With
     /// nothing changing after startup, no connection may arrive after the startup sends.
     #[test]
-    #[ignore = "spawns a real nvim, and waits past two resnapshot intervals; run with: cargo test -p neovibe-core theme::feed -- --ignored"]
+    #[ignore = "spawns a real nvim, and waits past two resnapshot intervals; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn an_unchanged_theme_is_not_resent_by_the_periodic_resnapshot() {
         let mut feed = ThemeFeed::new().expect("feed");
         let listener = feed.take_listener().expect("listener");

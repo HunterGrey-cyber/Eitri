@@ -1,5 +1,5 @@
 // agent/src/history/store.rs
-//! **A**: Neovibe's own copy of a conversation's history, written beside its conversation records.
+//! **A**: Eitri's own copy of a conversation's history, written beside its conversation records.
 //!
 //! Design: `docs/superpowers/specs/2026-09-20-resume-history-design.md` §6. This is the FALLBACK
 //! under [`super::transcript_jsonl`], which reads the real Claude CLI's own transcript. B wins
@@ -33,7 +33,7 @@ use std::path::PathBuf;
 /// version is refused whole by [`load`]; that is the point of having the number.
 pub const HISTORY_FORMAT_VERSION: u32 = 1;
 
-/// One conversation's history as Neovibe recorded it.
+/// One conversation's history as Eitri recorded it.
 ///
 /// Deliberately not a serialized projection. It holds the three collections that ARE history and
 /// nothing that is live state: no `status`, no `active_turn_id`, no `session_id`/
@@ -257,13 +257,13 @@ fn tool_call_chars(call: &ToolCallRecord) -> usize {
     call.name.chars().count() + super::transcript_jsonl::value_chars(&call.input) + result
 }
 
-/// `$XDG_STATE_HOME/neovibe/history/<conversation_id>/`.
+/// `$XDG_STATE_HOME/eitri/history/<conversation_id>/`.
 fn conversation_history_dir(conversation_id: &str) -> std::io::Result<PathBuf> {
     crate::persistence::validate_path_component("conversation_id", conversation_id)?;
     Ok(crate::state_dirs::history_dir()?.join(conversation_id))
 }
 
-/// `$XDG_STATE_HOME/neovibe/history/<conversation_id>/<provider_session_id>.json`.
+/// `$XDG_STATE_HOME/eitri/history/<conversation_id>/<provider_session_id>.json`.
 ///
 /// Both components go through `persistence`'s own validator: they are joined into a path with no
 /// other checking, so a value shaped like `../../../etc` would otherwise escape the history

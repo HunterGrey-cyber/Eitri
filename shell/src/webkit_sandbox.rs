@@ -6,7 +6,7 @@
 //! Ubuntu 23.10+ desktop the `apparmor` package sets `kernel.apparmor_restrict_unprivileged_userns=1`,
 //! so a process may create a user namespace only while an AppArmor profile that grants `userns`
 //! confines it. With no such profile `bwrap` fails ("setting up uid map: Permission denied") and
-//! WebKit aborts the whole of neovibe with SIGTRAP on its first `WebView`, printing nothing a user
+//! WebKit aborts the whole of Eitri with SIGTRAP on its first `WebView`, printing nothing a user
 //! would see -- the release-blocking crash the rc.1 VM pass found (`shell/MANUAL_VERIFICATION.md`,
 //! "Ubuntu 24.04: the AppArmor user-namespace restriction (2026-09-28)").
 //!
@@ -34,17 +34,17 @@
 //! because `main()` decides before any thread exists) and return a new `Decision` variant that allows
 //! `WebView`s -- no other file would need to change.
 //!
-//! **The profile.** `packaging/apparmor/neovibe` is the one text: the `.deb` installs it as
-//! `/etc/apparmor.d/neovibe` for `/usr/lib/neovibe/shell` (config, no maintainer script, so a
+//! **The profile.** `packaging/apparmor/eitri` is the one text: the `.deb` installs it as
+//! `/etc/apparmor.d/eitri` for `/usr/lib/eitri/shell` (config, no maintainer script, so a
 //! restart or one `apparmor_parser -r` loads it); for any other install [`render_profile`] writes the
-//! same text with that install's own resolved path and the profile name `neovibe-user-<uid>` -- one
+//! same text with that install's own resolved path and the profile name `eitri-user-<uid>` -- one
 //! name per user, so two users' per-user installs never replace each other's profile, and a literal
 //! path rather than an `@{HOME}` glob (which works, measured) so the grant covers this user's own
 //! install and nobody else's. `packaging/install.sh` renders it too (`apparmor_render`), and
 //! [`tests::the_installer_renders_the_same_profile_and_commands`] holds the two to the same bytes.
 //!
 //! **Known limit:** WebKit itself skips `bwrap` inside Flatpak, Snap and Docker. The probe runs only
-//! where the AppArmor restriction is on, and does not mirror those checks, so neovibe run inside such
+//! where the AppArmor restriction is on, and does not mirror those checks, so Eitri run inside such
 //! a container on an Ubuntu host would show the notice where WebKit would have run unsandboxed.
 
 use std::ffi::OsStr;
@@ -64,21 +64,21 @@ pub(crate) const ESCAPE_HATCH: &str = "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"
 pub(crate) const RESTRICTION_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
 
 /// Where the `.deb`/`.rpm` put `shell`, and where the `.deb` puts its profile.
-const PACKAGED_SHELL: &str = "/usr/lib/neovibe/shell";
+const PACKAGED_SHELL: &str = "/usr/lib/eitri/shell";
 const APPARMOR_D: &str = "/etc/apparmor.d";
-const PACKAGED_PROFILE_NAME: &str = "neovibe";
+const PACKAGED_PROFILE_NAME: &str = "eitri";
 
-/// The one profile text (`packaging/apparmor/neovibe`), and the two lines [`render_profile`]
+/// The one profile text (`packaging/apparmor/eitri`), and the two lines [`render_profile`]
 /// replaces in it. Each must occur exactly once (`tests::the_template_has_each_rendered_line_once`).
-const PROFILE_TEMPLATE: &str = include_str!("../../packaging/apparmor/neovibe");
-const TEMPLATE_ATTACHMENT: &str = "profile neovibe \"/usr/lib/neovibe/shell\" flags=(unconfined) {";
-const TEMPLATE_LOCAL: &str = "include if exists <local/neovibe>";
+const PROFILE_TEMPLATE: &str = include_str!("../../packaging/apparmor/eitri");
+const TEMPLATE_ATTACHMENT: &str = "profile eitri \"/usr/lib/eitri/shell\" flags=(unconfined) {";
+const TEMPLATE_LOCAL: &str = "include if exists <local/eitri>";
 
 /// The probe never holds startup up for longer than this: a `bwrap` that has not finished by then
 /// is killed (by the pid this process spawned) and the probe tells nothing.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// What neovibe does about `WebView`s in this process.
+/// What Eitri does about `WebView`s in this process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decision {
     /// WebKit's sandbox can start here, or nothing here restricts it: `WebView`s are built as always.
@@ -270,16 +270,16 @@ pub(crate) fn data_home(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> 
     }
 }
 
-/// The profile name for `exe`: the package's own for `/usr/lib/neovibe/shell`, else one per user.
+/// The profile name for `exe`: the package's own for `/usr/lib/eitri/shell`, else one per user.
 pub(crate) fn profile_name(exe: &Path, uid: u32) -> String {
     if exe == Path::new(PACKAGED_SHELL) {
         PACKAGED_PROFILE_NAME.to_string()
     } else {
-        format!("neovibe-user-{uid}")
+        format!("eitri-user-{uid}")
     }
 }
 
-/// `packaging/apparmor/neovibe` for `exe` under `name`. The path is always quoted, and AppArmor's
+/// `packaging/apparmor/eitri` for `exe` under `name`. The path is always quoted, and AppArmor's
 /// glob characters and the quote itself are escaped with a backslash (a path holding a space and
 /// `[]{}*?^@"` loaded and attached on the VM). `None` for a path this cannot write into a profile:
 /// not UTF-8, or holding a control character.
@@ -322,7 +322,7 @@ pub(crate) fn shell_quote(s: &str) -> String {
 }
 
 /// The fix for `exe` (this process's own resolved path). `packaged_profile_exists`: whether
-/// `/etc/apparmor.d/neovibe` is there, which matters only for `/usr/lib/neovibe/shell`.
+/// `/etc/apparmor.d/eitri` is there, which matters only for `/usr/lib/eitri/shell`.
 pub(crate) fn plan_fix(exe: &Path, packaged_profile_exists: bool, data_home: Option<&Path>, uid: u32) -> Option<Fix> {
     let name = profile_name(exe, uid);
     let target = Path::new(APPARMOR_D).join(&name);
@@ -334,7 +334,7 @@ pub(crate) fn plan_fix(exe: &Path, packaged_profile_exists: bool, data_home: Opt
             write: None,
         });
     }
-    let source = data_home?.join("neovibe/apparmor").join(&name);
+    let source = data_home?.join("eitri/apparmor").join(&name);
     let text = render_profile(&name, exe)?;
     Some(Fix {
         commands: vec![
@@ -354,20 +354,18 @@ pub(crate) fn plan_fix(exe: &Path, packaged_profile_exists: bool, data_home: Opt
 /// fix; the escape hatch. `write_error`: the rendered profile could not be written.
 pub(crate) fn notice(reason: &str, fix: Option<&Fix>, write_error: Option<&str>) -> String {
     let mut text = format!(
-        "neovibe's agent panel is off: this system does not let WebKit start its sandbox (Ubuntu's AppArmor \
+        "Eitri's agent panel is off: this system does not let WebKit start its sandbox (Ubuntu's AppArmor \
          restriction on unprivileged user namespaces; bwrap said \"{reason}\"). The editor and the terminal work \
          as usual.\n\n"
     );
     match fix {
         Some(fix) if fix.write.is_none() => text.push_str(
-            "To fix it once, load the AppArmor profile the neovibe package installed (or restart the computer), \
-             then reopen neovibe:\n\n",
+            "To fix it once, load the AppArmor profile the Eitri package installed (or restart the computer), \
+             then reopen Eitri:\n\n",
         ),
-        Some(_) => {
-            text.push_str("To fix it once, install and load neovibe's AppArmor profile, then reopen neovibe:\n\n")
-        }
+        Some(_) => text.push_str("To fix it once, install and load Eitri's AppArmor profile, then reopen Eitri:\n\n"),
         None => text.push_str(
-            "neovibe cannot name an AppArmor profile for this install: one that grants `userns` to this program \
+            "Eitri cannot name an AppArmor profile for this install: one that grants `userns` to this program \
              fixes it.\n",
         ),
     }
@@ -379,11 +377,11 @@ pub(crate) fn notice(reason: &str, fix: Option<&Fix>, write_error: Option<&str>)
         }
         text.push_str(&format!("\nThe profile: {}\n", fix.profile.display()));
         if let Some(error) = write_error {
-            text.push_str(&format!("(neovibe could not write it: {error})\n"));
+            text.push_str(&format!("(Eitri could not write it: {error})\n"));
         }
     }
     text.push_str(&format!(
-        "\nStarting neovibe with {ESCAPE_HATCH}=1 also works, but it removes the operating system's sandbox from \
+        "\nStarting Eitri with {ESCAPE_HATCH}=1 also works, but it removes the operating system's sandbox from \
          the process that renders the model's output.\n"
     ));
     text
@@ -569,20 +567,18 @@ mod tests {
     #[test]
     fn rendering_the_packaged_path_gives_the_shipped_file() {
         assert_eq!(
-            render_profile("neovibe", Path::new("/usr/lib/neovibe/shell")).as_deref(),
+            render_profile("eitri", Path::new("/usr/lib/eitri/shell")).as_deref(),
             Some(PROFILE_TEMPLATE)
         );
     }
 
     #[test]
     fn a_per_user_profile_names_its_own_path_and_name() {
-        let text = render_profile("neovibe-user-1000", Path::new("/home/a b/.local/lib/neovibe/shell")).unwrap();
-        assert!(
-            text.contains("\nprofile neovibe-user-1000 \"/home/a b/.local/lib/neovibe/shell\" flags=(unconfined) {\n")
-        );
-        assert!(text.contains("include if exists <local/neovibe-user-1000>\n"));
-        assert!(!text.contains("<local/neovibe>"));
-        assert!(!text.contains("\"/usr/lib/neovibe/shell\""));
+        let text = render_profile("eitri-user-1000", Path::new("/home/a b/.local/lib/eitri/shell")).unwrap();
+        assert!(text.contains("\nprofile eitri-user-1000 \"/home/a b/.local/lib/eitri/shell\" flags=(unconfined) {\n"));
+        assert!(text.contains("include if exists <local/eitri-user-1000>\n"));
+        assert!(!text.contains("<local/eitri>"));
+        assert!(!text.contains("\"/usr/lib/eitri/shell\""));
     }
 
     /// The escaping that loaded and attached on the VM (a path with a space and `[]{}*?^@"`).
@@ -622,8 +618,8 @@ mod tests {
     #[test]
     fn shell_quoting_leaves_plain_words_alone() {
         assert_eq!(
-            shell_quote("/etc/apparmor.d/neovibe-user-1000"),
-            "/etc/apparmor.d/neovibe-user-1000"
+            shell_quote("/etc/apparmor.d/eitri-user-1000"),
+            "/etc/apparmor.d/eitri-user-1000"
         );
         assert_eq!(shell_quote("/home/a b/x"), "'/home/a b/x'");
         assert_eq!(shell_quote("/home/it's/x"), r"'/home/it'\''s/x'");
@@ -633,23 +629,23 @@ mod tests {
     #[test]
     fn the_package_with_its_profile_needs_one_command() {
         let fix = plan_fix(
-            Path::new("/usr/lib/neovibe/shell"),
+            Path::new("/usr/lib/eitri/shell"),
             true,
             Some(Path::new("/home/u/.local/share")),
             UID,
         )
         .unwrap();
-        assert_eq!(fix.profile, PathBuf::from("/etc/apparmor.d/neovibe"));
-        assert_eq!(fix.commands, ["sudo apparmor_parser -r /etc/apparmor.d/neovibe"]);
+        assert_eq!(fix.profile, PathBuf::from("/etc/apparmor.d/eitri"));
+        assert_eq!(fix.commands, ["sudo apparmor_parser -r /etc/apparmor.d/eitri"]);
         assert_eq!(fix.write, None);
     }
 
-    /// A package without the file (an older one): the same `neovibe` profile, rendered -- the same
+    /// A package without the file (an older one): the same `eitri` profile, rendered -- the same
     /// bytes the package would have installed -- and installed by hand.
     #[test]
     fn the_package_without_its_profile_gets_the_same_file_by_hand() {
         let fix = plan_fix(
-            Path::new("/usr/lib/neovibe/shell"),
+            Path::new("/usr/lib/eitri/shell"),
             false,
             Some(Path::new("/home/u/.local/share")),
             UID,
@@ -658,8 +654,8 @@ mod tests {
         assert_eq!(
             fix.commands,
             [
-                "sudo install -m 0644 /home/u/.local/share/neovibe/apparmor/neovibe /etc/apparmor.d/neovibe",
-                "sudo apparmor_parser -r /etc/apparmor.d/neovibe",
+                "sudo install -m 0644 /home/u/.local/share/eitri/apparmor/eitri /etc/apparmor.d/eitri",
+                "sudo apparmor_parser -r /etc/apparmor.d/eitri",
             ]
         );
         assert_eq!(fix.write.unwrap().1, PROFILE_TEMPLATE);
@@ -667,21 +663,21 @@ mod tests {
 
     #[test]
     fn a_per_user_install_gets_its_own_profile_and_two_commands() {
-        let exe = Path::new("/home/a b/.local/lib/neovibe/shell");
+        let exe = Path::new("/home/a b/.local/lib/eitri/shell");
         let fix = plan_fix(exe, true, Some(Path::new("/home/a b/.local/share")), UID).unwrap();
-        let source = PathBuf::from("/home/a b/.local/share/neovibe/apparmor/neovibe-user-1000");
+        let source = PathBuf::from("/home/a b/.local/share/eitri/apparmor/eitri-user-1000");
         assert_eq!(fix.profile, source);
         assert_eq!(
             fix.commands,
             [
-                "sudo install -m 0644 '/home/a b/.local/share/neovibe/apparmor/neovibe-user-1000' \
-                 /etc/apparmor.d/neovibe-user-1000",
-                "sudo apparmor_parser -r /etc/apparmor.d/neovibe-user-1000",
+                "sudo install -m 0644 '/home/a b/.local/share/eitri/apparmor/eitri-user-1000' \
+                 /etc/apparmor.d/eitri-user-1000",
+                "sudo apparmor_parser -r /etc/apparmor.d/eitri-user-1000",
             ]
         );
         assert_eq!(
             fix.write,
-            Some((source, render_profile("neovibe-user-1000", exe).unwrap()))
+            Some((source, render_profile("eitri-user-1000", exe).unwrap()))
         );
         assert_eq!(
             plan_fix(exe, true, None, UID),
@@ -693,7 +689,7 @@ mod tests {
     #[test]
     fn the_notice_says_what_happened_the_fix_and_the_escape_hatch() {
         let fix = plan_fix(
-            Path::new("/home/u/.local/lib/neovibe/shell"),
+            Path::new("/home/u/.local/lib/eitri/shell"),
             false,
             Some(Path::new("/home/u/.local/share")),
             UID,
@@ -706,20 +702,20 @@ mod tests {
         for command in &fix.commands {
             assert!(text.contains(&format!("\n    {command}\n")), "{text}");
         }
-        assert!(text.contains("The profile: /home/u/.local/share/neovibe/apparmor/neovibe-user-1000\n"));
+        assert!(text.contains("The profile: /home/u/.local/share/eitri/apparmor/eitri-user-1000\n"));
         assert!(text.contains("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 also works"));
         assert!(
             text.contains("removes the operating system's sandbox from the process that renders the model's output")
         );
         assert!(!text.contains("could not write"));
 
-        let packaged = plan_fix(Path::new("/usr/lib/neovibe/shell"), true, None, UID).unwrap();
+        let packaged = plan_fix(Path::new("/usr/lib/eitri/shell"), true, None, UID).unwrap();
         let text = notice("x", Some(&packaged), None);
-        assert!(text.contains("load the AppArmor profile the neovibe package installed (or restart the computer)"));
-        assert!(text.contains("\n    sudo apparmor_parser -r /etc/apparmor.d/neovibe\n"));
+        assert!(text.contains("load the AppArmor profile the Eitri package installed (or restart the computer)"));
+        assert!(text.contains("\n    sudo apparmor_parser -r /etc/apparmor.d/eitri\n"));
 
         let text = notice("x", Some(&fix), Some("disk full"));
-        assert!(text.contains("(neovibe could not write it: disk full)"));
+        assert!(text.contains("(Eitri could not write it: disk full)"));
         let text = notice("x", None, None);
         assert!(text.contains("cannot name an AppArmor profile") && text.contains(ESCAPE_HATCH));
     }
@@ -727,7 +723,7 @@ mod tests {
     #[test]
     fn a_rendered_profile_is_written_only_when_it_changed() {
         let dir = std::env::temp_dir().join(format!("nv-webkit-sandbox-{}", uuid::Uuid::new_v4()));
-        let path = dir.join("neovibe/apparmor/neovibe-user-1000");
+        let path = dir.join("eitri/apparmor/eitri-user-1000");
         write_if_changed(&path, "one").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
         use std::os::unix::fs::PermissionsExt;
@@ -744,13 +740,13 @@ mod tests {
     fn the_installer_renders_the_same_profile_and_commands() {
         let installer = concat!(env!("CARGO_MANIFEST_DIR"), "/../packaging/install.sh");
         for (exe, data) in [
-            ("/home/tester/.local/lib/neovibe/shell", "/home/tester/.local/share"),
-            ("/home/a b/it's [x]/.local/lib/neovibe/shell", "/home/a b/it's [x]/data"),
+            ("/home/tester/.local/lib/eitri/shell", "/home/tester/.local/share"),
+            ("/home/a b/it's [x]/.local/lib/eitri/shell", "/home/a b/it's [x]/data"),
             (
-                r#"/home/q"uo*te\b{c}?^@/.local/lib/neovibe/shell"#,
+                r#"/home/q"uo*te\b{c}?^@/.local/lib/eitri/shell"#,
                 r#"/home/q"uo*te\b{c}?^@/.local/share"#,
             ),
-            ("/usr/lib/neovibe/shell", "/home/tester/.local/share"),
+            ("/usr/lib/eitri/shell", "/home/tester/.local/share"),
         ] {
             let script = r#"
                 data=$1 exe=$2
@@ -764,7 +760,7 @@ mod tests {
             "#;
             let out = Command::new("sh")
                 .args(["-c", script, installer, data, exe])
-                .env_remove("NEOVIBE_INSTALL_TEST")
+                .env_remove("EITRI_INSTALL_TEST")
                 .output()
                 .expect("sh runs");
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

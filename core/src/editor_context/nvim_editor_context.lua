@@ -1,11 +1,11 @@
--- neovibe editor-context feed (wire 1). Loaded by `shell` with `--cmd`, before the user's own
+-- Eitri editor-context feed (wire 1). Loaded by `shell` with `--cmd`, before the user's own
 -- config, so it only installs autocommands and a timer; it changes no setting and no keymap.
 --
--- It writes one JSON line per update to NEOVIBE_EDITOR_SOCKET: which file is focused, where the
+-- It writes one JSON line per update to EITRI_EDITOR_SOCKET: which file is focused, where the
 -- cursor is, and -- only while a visual selection is actually live -- the selected lines and their
 -- text.
 
-local socket = vim.env.NEOVIBE_EDITOR_SOCKET
+local socket = vim.env.EITRI_EDITOR_SOCKET
 if not socket or socket == "" then
   return
 end
@@ -102,7 +102,7 @@ end
 local function selection()
   local mode = vim.fn.mode()
   -- Visual (v), visual-line (V) and visual-block (\22) only. `'<` and `'>` are deliberately not
-  -- consulted: they are a side effect of LEAVING visual mode, and in neovibe the user never leaves
+  -- consulted: they are a side effect of LEAVING visual mode, and in Eitri the user never leaves
   -- it -- they click the WebView, and nvim is never told it lost focus. Measured: the marks stay
   -- [0,0,0,0] for the whole life of a live selection.
   if mode ~= "v" and mode ~= "V" and mode ~= "\22" then
@@ -183,7 +183,7 @@ local function send()
   end)
 end
 
-local group = vim.api.nvim_create_augroup("NeovibeEditorContext", { clear = true })
+local group = vim.api.nvim_create_augroup("EitriEditorContext", { clear = true })
 vim.api.nvim_create_autocmd(
   { "CursorMoved", "CursorMovedI", "ModeChanged", "BufEnter", "BufFilePost", "VimEnter" },
   {

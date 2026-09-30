@@ -405,7 +405,7 @@ pub struct Tripped {
 pub fn ungated_cli_mode_reason(reported: &str, detail: &str) -> String {
     format!(
         "the CLI reports permission mode '{reported}' ({detail}) — a project's permissions.defaultMode? \
-         neovibe runs only sessions it gates itself; the session was closed"
+         Eitri runs only sessions it gates itself; the session was closed"
     )
 }
 
@@ -2350,7 +2350,7 @@ mod tests {
         assert_eq!(snapshot["tab"], background.0);
         // The projection still holds both until the Read's resolution returns (`answer_what_needs_no_human`'s
         // remaining honest gap), but D9/`host_answered` closes the OTHER half that used to be
-        // documented here: the Read neovibe already answered is now hidden from the snapshot too,
+        // documented here: the Read Eitri already answered is now hidden from the snapshot too,
         // not only from the tray -- only the Write, still genuinely waiting, is shown.
         assert_eq!(
             snapshot["state"]["pendingPermissions"].as_array().unwrap().len(),
@@ -2545,7 +2545,7 @@ mod tests {
     /// real snapshot and the real `events` of the tick after it, with the filter and without --
     /// never a hand-typed guess at their shape.
     ///
-    /// Compared on every run, rewritten only under `NEOVIBE_WRITE_FIXTURES=1` and only when it
+    /// Compared on every run, rewritten only under `EITRI_WRITE_FIXTURES=1` and only when it
     /// differs: a test in this crate writing into `../agent-ui/web/src` dirtied a tracked file
     /// whenever it went red, and a newer file under `src` sets off `shell/build.rs`'s npm rebuild. A
     /// checkout without the web tree skips the comparison, having no reducer test to feed.
@@ -2591,7 +2591,7 @@ mod tests {
         };
         let fixture = serde_json::json!({
             "writtenBy": "core/src/tab_set.rs, tests::with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both \
-                          -- compared on every run; NEOVIBE_WRITE_FIXTURES=1 rewrites it",
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
             "midStream": record("P1-unique-text", p1a2_mid_stream(false), p1a2_mid_stream(true)),
             "foldAfterADrain": record("<between>", p1a2_fold_after_a_drain(false), p1a2_fold_after_a_drain(true)),
         });
@@ -2602,13 +2602,13 @@ mod tests {
         if committed.as_deref() == Some(fixture_json.as_str()) {
             return;
         }
-        if std::env::var_os("NEOVIBE_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
             std::fs::write(&fixture_path, &fixture_json).expect("write the p1a2 reducer fixture");
         } else if let Some(committed) = committed {
             assert_eq!(
                 committed, fixture_json,
                 "the committed p1a2 reducer fixture is not what this test produces; if the change is \
-                 intended, regenerate it with NEOVIBE_WRITE_FIXTURES=1"
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
             );
         }
     }
@@ -3265,7 +3265,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    // ---- R07/S2: entering bypass asks first, and neovibe answers everything once in it --------
+    // ---- R07/S2: entering bypass asks first, and Eitri answers everything once in it --------
 
     #[test]
     fn entering_bypass_on_a_live_tab_asks_and_changes_nothing_until_confirmed() {
@@ -5154,7 +5154,7 @@ mod tests {
         let tab = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        let input = serde_json::json!({ "file_path": "/etc/neovibe-out.txt", "content": "x" });
+        let input = serde_json::json!({ "file_path": "/etc/eitri-out.txt", "content": "x" });
         provider.queue(started("t1"));
         provider.queue(call_started("toolu_out", "Write", input.clone()));
         provider.queue(AgentDomainEvent::PermissionRequested {

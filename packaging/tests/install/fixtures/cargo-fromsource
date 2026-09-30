@@ -3,7 +3,7 @@
 # agent -p supervisor --bins` recipe --from-source runs (plan 2026-09-27-v1-dist, Task 11, spec
 # §6.2): no test here ever runs a real multi-crate release compile. Records its argv (one line per
 # call) to <scratch>/logs/cargo.log and, on a `build` call, writes the four binaries install.sh's own
-# NV_BINARIES names into <target-dir>/release/. NEOVIBE_INSTALL_TEST_CARGO_MODE selects the
+# NV_BINARIES names into <target-dir>/release/. EITRI_INSTALL_TEST_CARGO_MODE selects the
 # behaviour (default "ok"): "fail" makes the build call exit 1, so nothing after it in
 # do_from_source ever runs. "skip" (M4 minor follow-up / F3 fix-round-1 coverage gap, v1-dist
 # whole-branch review, fix round 2, 2026-09-28) exits 0 without writing anything at all into
@@ -29,7 +29,7 @@ S=$(cd "$(dirname "$0")/.." && pwd)
 } >>"$S/logs/cargo.log"
 case $1 in
 build)
-	case ${NEOVIBE_INSTALL_TEST_CARGO_MODE:-ok} in
+	case ${EITRI_INSTALL_TEST_CARGO_MODE:-ok} in
 	fail)
 		echo "cargo-fromsource-stub: simulated build failure" >&2
 		exit 1
@@ -46,7 +46,7 @@ build)
 	done
 	if [ -z "$_cfs_target_dir" ]; then _cfs_target_dir=${CARGO_TARGET_DIR:-target}; fi
 	mkdir -p "$_cfs_target_dir/release" || exit 1
-	for b in shell neovibe-supervisor neovibe-tmux-shim neovibe-claude-handoff agent-hook; do
+	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff agent-hook; do
 		printf '#!/bin/sh\necho "stub %s (from-source test build)"\n' "$b" >"$_cfs_target_dir/release/$b" || exit 1
 		chmod 0755 "$_cfs_target_dir/release/$b" || exit 1
 	done

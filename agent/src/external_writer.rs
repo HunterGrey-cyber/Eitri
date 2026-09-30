@@ -1,8 +1,8 @@
-//! Detects an unexpected write to a session's own transcript file while Neovibe believes it is
-//! the exclusive writer (design doc §8.5's honest boundary: Neovibe can only DETECT a concurrent
+//! Detects an unexpected write to a session's own transcript file while Eitri believes it is
+//! the exclusive writer (design doc §8.5's honest boundary: Eitri can only DETECT a concurrent
 //! raw-CLI writer, never prevent one -- there is no lock both sides observe). Polls the
-//! transcript's own mtime; a change Neovibe itself did not just cause (this module has no way to
-//! distinguish "Neovibe's own last write" from "someone else's" by mtime alone -- see this
+//! transcript's own mtime; a change Eitri itself did not just cause (this module has no way to
+//! distinguish "Eitri's own last write" from "someone else's" by mtime alone -- see this
 //! module's own doc on `ExternalWriterCheck::Changed` below for the honest caveat) is reported to
 //! the caller to act on.
 

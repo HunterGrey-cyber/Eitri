@@ -1,12 +1,12 @@
 //! The shell's embedded Lua extension kernel -- a separate, independent runtime from Neovim's
 //! own internal Lua (see docs/canonical/neovibe_architecture_decisions.md §3). Exposes exactly four v1
-//! extension points under a `neovibe` global table: `panel.register`, `command.register`, `on`,
+//! extension points under an `eitri` global table: `panel.register`, `command.register`, `on`,
 //! `config.get`/`config.set`, plus `keymap.prefix`/`keymap.set`/`keymap.del` (keymap spec §2.3).
 
 mod panel;
 
-pub(crate) use neovibe_core::lua::command::CommandRegistry;
-pub(crate) use neovibe_core::lua::panel::PanelSlot;
+pub(crate) use eitri_core::lua::command::CommandRegistry;
+pub(crate) use eitri_core::lua::panel::PanelSlot;
 pub(crate) use panel::PanelRegistry;
 
 use mlua::{Lua, Table, Value};
@@ -18,22 +18,22 @@ pub(crate) struct LuaEngine {
     lua: Lua,
     pub(crate) panels: Rc<RefCell<PanelRegistry>>,
     pub(crate) commands: Rc<RefCell<CommandRegistry>>,
-    events: Rc<RefCell<neovibe_core::lua::event::EventBus>>,
+    events: Rc<RefCell<eitri_core::lua::event::EventBus>>,
     /// Kept as a field since 2026-09-21, and the comment in `new()` that said it need not be says
     /// why the reason changed: the shell itself now reads a key out of it (`agent.account`) after
     /// `init.lua` has run.
-    pub(crate) config: Rc<RefCell<neovibe_core::lua::config::ConfigStore>>,
-    /// `neovibe.layout.*` (modules P2): `init.lua`'s default tree, and the requests commands queue.
-    pub(crate) layout: Rc<RefCell<neovibe_core::lua::layout::LayoutStore>>,
-    /// `neovibe.keymap.*` (keymap spec §2.3): the calls `init.lua` made, applied by `main()` once it
-    /// has run (`neovibe_core::keymap::Keymap::apply_user`).
-    pub(crate) keymap: Rc<RefCell<neovibe_core::lua::keymap::KeymapStore>>,
+    pub(crate) config: Rc<RefCell<eitri_core::lua::config::ConfigStore>>,
+    /// `eitri.layout.*` (modules P2): `init.lua`'s default tree, and the requests commands queue.
+    pub(crate) layout: Rc<RefCell<eitri_core::lua::layout::LayoutStore>>,
+    /// `eitri.keymap.*` (keymap spec §2.3): the calls `init.lua` made, applied by `main()` once it
+    /// has run (`eitri_core::keymap::Keymap::apply_user`).
+    pub(crate) keymap: Rc<RefCell<eitri_core::lua::keymap::KeymapStore>>,
 }
 
 impl LuaEngine {
     pub(crate) fn new(config_dir: PathBuf) -> mlua::Result<Self> {
         let lua = Lua::new();
-        let neovibe = lua.create_table()?;
+        let eitri = lua.create_table()?;
 
         // `Lua::new()` (mlua's vendored lua54) leaves `package.path` at its compiled-in default,
         // whose entries include `./?.lua;./?/init.lua` -- i.e. Lua's own `require` searches the
@@ -50,9 +50,9 @@ impl LuaEngine {
         // entries by string-interpolating `config_dir` straight into `package.path`'s own
         // `;`-and-`?`-separated pattern syntax (`"{config_dir}/lua/?.lua;..."`). A `config_dir`
         // that itself contains a literal `;` -- an entirely ordinary Unix path character, and
-        // exactly what a misconfigured `NEOVIBE_CONFIG_DIR` could contain -- splits into an
+        // exactly what a misconfigured `EITRI_CONFIG_DIR` could contain -- splits into an
         // extra, *relative* search entry once Lua parses that string, reopening precisely the
-        // cwd-search hole this function exists to close (e.g. `NEOVIBE_CONFIG_DIR=
+        // cwd-search hole this function exists to close (e.g. `EITRI_CONFIG_DIR=
         // "/home/user/config;plugins"` leaves a `plugins/lua/?.lua` entry that resolves against
         // the launch cwd, not the config dir). `package.path` is no longer built by string
         // interpolation at all -- it is emptied, and a Rust closure is installed as the "Lua
@@ -108,24 +108,24 @@ impl LuaEngine {
 
         let panels = Rc::new(RefCell::new(PanelRegistry::default()));
         let commands = Rc::new(RefCell::new(CommandRegistry::default()));
-        let events = Rc::new(RefCell::new(neovibe_core::lua::event::EventBus::default()));
+        let events = Rc::new(RefCell::new(eitri_core::lua::event::EventBus::default()));
         // Kept as a field now, and the note this replaces is worth keeping in view: the store is
         // held alive regardless by the `get`/`set` closures `config::install` registers on the
-        // `neovibe.config` table, which `lua` (a real field below) owns for as long as
+        // `eitri.config` table, which `lua` (a real field below) owns for as long as
         // `LuaEngine` lives. So this field exists for a reader, not for a lifetime -- `main()`
         // reads `agent.account` out of it once `init.lua` has run.
-        let config = Rc::new(RefCell::new(neovibe_core::lua::config::ConfigStore::default()));
+        let config = Rc::new(RefCell::new(eitri_core::lua::config::ConfigStore::default()));
 
-        panel::install(&lua, &neovibe, panels.clone(), config_dir)?;
-        neovibe_core::lua::command::install(&lua, &neovibe, commands.clone())?;
-        neovibe_core::lua::event::install(&lua, &neovibe, events.clone())?;
-        neovibe_core::lua::config::install(&lua, &neovibe, config.clone())?;
-        let layout = Rc::new(RefCell::new(neovibe_core::lua::layout::LayoutStore::default()));
-        neovibe_core::lua::layout::install(&lua, &neovibe, layout.clone())?;
-        let keymap = Rc::new(RefCell::new(neovibe_core::lua::keymap::KeymapStore::default()));
-        neovibe_core::lua::keymap::install(&lua, &neovibe, keymap.clone())?;
+        panel::install(&lua, &eitri, panels.clone(), config_dir)?;
+        eitri_core::lua::command::install(&lua, &eitri, commands.clone())?;
+        eitri_core::lua::event::install(&lua, &eitri, events.clone())?;
+        eitri_core::lua::config::install(&lua, &eitri, config.clone())?;
+        let layout = Rc::new(RefCell::new(eitri_core::lua::layout::LayoutStore::default()));
+        eitri_core::lua::layout::install(&lua, &eitri, layout.clone())?;
+        let keymap = Rc::new(RefCell::new(eitri_core::lua::keymap::KeymapStore::default()));
+        eitri_core::lua::keymap::install(&lua, &eitri, keymap.clone())?;
 
-        lua.globals().set("neovibe", neovibe)?;
+        lua.globals().set("eitri", eitri)?;
 
         Ok(Self {
             lua,
@@ -139,13 +139,13 @@ impl LuaEngine {
     }
 
     pub(crate) fn emit(&self, event_name: &str) {
-        neovibe_core::lua::event::emit(&self.lua, &self.events, event_name, Value::Nil);
+        eitri_core::lua::event::emit(&self.lua, &self.events, event_name, Value::Nil);
     }
 
-    /// Same reentrancy hazard and same fix as `neovibe_core::lua::event::emit` (see that function's doc comment):
+    /// Same reentrancy hazard and same fix as `eitri_core::lua::event::emit` (see that function's doc comment):
     /// the command's `action` key is cloned out of `self.commands` under a scoped borrow, which
     /// is dropped *before* the action is actually called -- so an action that itself calls
-    /// `neovibe.command.register(...)` (registering another command, from inside a command's own
+    /// `eitri.command.register(...)` (registering another command, from inside a command's own
     /// action) doesn't hit `CommandRegistry`'s `borrow_mut()` while this function's own borrow is
     /// still held.
     pub(crate) fn invoke_command(&self, id: &str) {
@@ -167,15 +167,15 @@ impl LuaEngine {
     /// logs and the shell continues with whatever it registered before the error (the editor and
     /// the agent are not registered here at all: every window has them).
     ///
-    /// **One exception, a startup failure: a command id `neovibe.command.register` refused**
-    /// (sw-lua-5, `CommandRegistry::refused`). It is a config value neovibe validates, and like
+    /// **One exception, a startup failure: a command id `eitri.command.register` refused**
+    /// (sw-lua-5, `CommandRegistry::refused`). It is a config value Eitri validates, and like
     /// `agent.font_size` or a keybinding collision (`main.rs`) it exits 1 naming itself -- rather
     /// than a window that silently lacks everything init.lua registered after it, the account pin
     /// among them. Checked after the file has run, so a `pcall` around the call changes nothing.
     pub(crate) fn load_init_file(&self, path: &std::path::Path) {
         self.run_init_file(path);
         if let Some(refused) = self.commands.borrow().refused() {
-            eprintln!("neovibe: {} ({})", refused, path.display());
+            eprintln!("eitri: {} ({})", refused, path.display());
             std::process::exit(1);
         }
     }
@@ -204,19 +204,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constructs_and_exposes_an_empty_neovibe_table() {
-        let engine = LuaEngine::new(PathBuf::from("/tmp/neovibe-test-config")).unwrap();
-        let ty: String = engine.lua.load("return type(neovibe)").eval().unwrap();
+    fn constructs_and_exposes_an_empty_eitri_table() {
+        let engine = LuaEngine::new(PathBuf::from("/tmp/eitri-test-config")).unwrap();
+        let ty: String = engine.lua.load("return type(eitri)").eval().unwrap();
         assert_eq!(ty, "table");
     }
 
     #[test]
-    fn neovibe_keymap_is_installed_and_records_into_the_engines_store() {
-        let engine = LuaEngine::new(PathBuf::from("/tmp/neovibe-test-config")).unwrap();
-        engine.lua.load(r#"neovibe.keymap.prefix("C-a")"#).exec().unwrap();
+    fn eitri_keymap_is_installed_and_records_into_the_engines_store() {
+        let engine = LuaEngine::new(PathBuf::from("/tmp/eitri-test-config")).unwrap();
+        engine.lua.load(r#"eitri.keymap.prefix("C-a")"#).exec().unwrap();
         assert_eq!(
             engine.keymap.borrow().ops(),
-            [neovibe_core::keymap::KeymapOp::Prefix { key: "C-a".into() }]
+            [eitri_core::keymap::KeymapOp::Prefix { key: "C-a".into() }]
         );
     }
 
@@ -306,7 +306,7 @@ mod tests {
     /// Regression test for a codex-sweep round-1 finding on sw-lua-1's own fix: the first cut
     /// built `package.path` by string-interpolating `config_dir` into `;`-and-`?`-separated
     /// pattern syntax. A `config_dir` containing a literal `;` (a perfectly ordinary Unix path
-    /// character -- the finding's own example is `NEOVIBE_CONFIG_DIR="/home/user/config;plugins"`)
+    /// character -- the finding's own example is `EITRI_CONFIG_DIR="/home/user/config;plugins"`)
     /// then split into an extra, *relative* search entry once Lua parsed that string, reopening
     /// exactly the cwd-search hole sw-lua-1 was meant to close. Plants the module the old bug's
     /// injected relative entry (`plugins/lua/?.lua`, resolved against the launch cwd) would have

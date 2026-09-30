@@ -16,14 +16,14 @@ describe("installDispatch", () => {
   it("demuxes a command_result envelope with ok:true", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "command_result", requestId: "req-1", ok: true }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "command_result", requestId: "req-1", ok: true }));
     expect(handler).toHaveBeenCalledWith({ kind: "command_result", requestId: "req-1", ok: true });
   });
 
   it("demuxes a command_result envelope with ok:false and an error message", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "command_result", requestId: "req-2", ok: false, error: "boom" }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "command_result", requestId: "req-2", ok: false, error: "boom" }));
     expect(handler).toHaveBeenCalledWith({ kind: "command_result", requestId: "req-2", ok: false, error: "boom" });
   });
 
@@ -31,7 +31,7 @@ describe("installDispatch", () => {
     const handler = vi.fn();
     installDispatch(handler);
     const events = [{ type: "turn_started", turn_id: "t1" }];
-    window.__neovibeDispatch!(JSON.stringify({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events }));
     expect(handler).toHaveBeenCalledWith({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events });
   });
 
@@ -42,7 +42,7 @@ describe("installDispatch", () => {
       sessionId: "abc", model: "m", cwd: "/tmp", transcript: [], toolCalls: [],
       status: { kind: "running" }, activeTurnId: null, pendingPermissions: [],
     };
-    window.__neovibeDispatch!(JSON.stringify({ kind: "snapshot", tab: 1, throughRevision: 7, state }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "snapshot", tab: 1, throughRevision: 7, state }));
     expect(handler).toHaveBeenCalledWith({ kind: "snapshot", tab: 1, throughRevision: 7, state });
   });
 
@@ -59,21 +59,21 @@ describe("installDispatch", () => {
       cwd: "/home/user/project",
       providerSessionId: "1857dcd5-973b-46a2",
     };
-    window.__neovibeDispatch!(JSON.stringify(envelope));
+    window.__eitriDispatch!(JSON.stringify(envelope));
     expect(handler).toHaveBeenCalledWith(envelope);
   });
 
   it("demuxes a theme envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "theme", vars: { "--nv-bg": "#faf4ed" } }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "theme", vars: { "--nv-bg": "#faf4ed" } }));
     expect(handler).toHaveBeenCalledWith({ kind: "theme", vars: { "--nv-bg": "#faf4ed" } });
   });
 
   it("demuxes an enter_input envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "enter_input" }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "enter_input" }));
     expect(handler).toHaveBeenCalledWith({ kind: "enter_input" });
   });
 
@@ -84,28 +84,28 @@ describe("installDispatch", () => {
   ])("demuxes a $kind envelope", (payload) => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify(payload));
+    window.__eitriDispatch!(JSON.stringify(payload));
     expect(handler).toHaveBeenCalledWith(payload);
   });
 
   it("no longer accepts select_all", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "select_all" }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "select_all" }));
     expect(handler).not.toHaveBeenCalledWith({ kind: "select_all" });
   });
 
   it("demuxes a pane_focus envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "pane_focus", focused: true }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "pane_focus", focused: true }));
     expect(handler).toHaveBeenCalledWith({ kind: "pane_focus", focused: true });
   });
 
   it("demuxes an error envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "error", tab: 1, message: "boom" }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "error", tab: 1, message: "boom" }));
     expect(handler).toHaveBeenCalledWith({ kind: "error", tab: 1, message: "boom" });
   });
 
@@ -113,7 +113,7 @@ describe("installDispatch", () => {
     const seen: string[] = [];
     installDispatch((p) => seen.push(p.kind));
     for (const kind of ["tabs", "tab_detail", "chooser", "confirm_close", "begin_rename"]) {
-      window.__neovibeDispatch!(JSON.stringify({ kind, tab: 1, active: 1, tabs: [], rows: [], launch: false, open: [], records: [], lines: [], current: null }));
+      window.__eitriDispatch!(JSON.stringify({ kind, tab: 1, active: 1, tabs: [], rows: [], launch: false, open: [], records: [], lines: [], current: null }));
     }
     expect(seen).toEqual(["tabs", "tab_detail", "chooser", "confirm_close", "begin_rename"]);
   });
@@ -121,8 +121,8 @@ describe("installDispatch", () => {
   it("demuxes an editor_typing envelope, and drops nothing of it", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "editor_typing", typing: true, periodMs: 500 }));
-    window.__neovibeDispatch!(JSON.stringify({ kind: "editor_typing", typing: false, periodMs: 500 }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "editor_typing", typing: true, periodMs: 500 }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "editor_typing", typing: false, periodMs: 500 }));
     expect(handler).toHaveBeenNthCalledWith(1, { kind: "editor_typing", typing: true, periodMs: 500 });
     expect(handler).toHaveBeenNthCalledWith(2, { kind: "editor_typing", typing: false, periodMs: 500 });
   });
@@ -130,8 +130,8 @@ describe("installDispatch", () => {
   it("demuxes a nav_key envelope, down and up", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "nav_key", direction: "down" }));
-    window.__neovibeDispatch!(JSON.stringify({ kind: "nav_key", direction: "up" }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "nav_key", direction: "down" }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "nav_key", direction: "up" }));
     expect(handler).toHaveBeenNthCalledWith(1, { kind: "nav_key", direction: "down" });
     expect(handler).toHaveBeenNthCalledWith(2, { kind: "nav_key", direction: "up" });
   });
@@ -140,7 +140,7 @@ describe("installDispatch", () => {
     const handler = vi.fn();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     installDispatch(handler);
-    expect(() => window.__neovibeDispatch!(JSON.stringify({ kind: "something_future" }))).not.toThrow();
+    expect(() => window.__eitriDispatch!(JSON.stringify({ kind: "something_future" }))).not.toThrow();
     expect(handler).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
@@ -150,7 +150,7 @@ describe("installDispatch", () => {
     const handler = vi.fn();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     installDispatch(handler);
-    expect(() => window.__neovibeDispatch!("not json {{{")).not.toThrow();
+    expect(() => window.__eitriDispatch!("not json {{{")).not.toThrow();
     expect(handler).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
@@ -159,7 +159,7 @@ describe("installDispatch", () => {
   it("demuxes hint_collect envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "hint_collect", sessionId: 7 }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "hint_collect", sessionId: 7 }));
     expect(handler).toHaveBeenCalledWith({ kind: "hint_collect", sessionId: 7 });
   });
 
@@ -167,28 +167,28 @@ describe("installDispatch", () => {
     const handler = vi.fn();
     installDispatch(handler);
     const envelope = { kind: "hint_show", sessionId: 7, labels: ["a", "s", "d"] };
-    window.__neovibeDispatch!(JSON.stringify(envelope));
+    window.__eitriDispatch!(JSON.stringify(envelope));
     expect(handler).toHaveBeenCalledWith(envelope);
   });
 
   it("demuxes hint_prefix envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "hint_prefix", sessionId: 7, typed: "a" }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "hint_prefix", sessionId: 7, typed: "a" }));
     expect(handler).toHaveBeenCalledWith({ kind: "hint_prefix", sessionId: 7, typed: "a" });
   });
 
   it("demuxes hint_land envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "hint_land", sessionId: 7, index: 2 }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "hint_land", sessionId: 7, index: 2 }));
     expect(handler).toHaveBeenCalledWith({ kind: "hint_land", sessionId: 7, index: 2 });
   });
 
   it("demuxes hint_end envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "hint_end", sessionId: 7 }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "hint_end", sessionId: 7 }));
     expect(handler).toHaveBeenCalledWith({ kind: "hint_end", sessionId: 7 });
   });
 
@@ -196,7 +196,7 @@ describe("installDispatch", () => {
     const handler = vi.fn();
     installDispatch(handler);
     const envelope = { kind: "confirm_bypass", tab: 3, scope: "tab", nonce: 17, lines: ["Switch to bypass and approve the 2 waiting cards? (y/n)"] };
-    window.__neovibeDispatch!(JSON.stringify(envelope));
+    window.__eitriDispatch!(JSON.stringify(envelope));
     expect(handler).toHaveBeenCalledWith(envelope);
   });
 
@@ -204,7 +204,7 @@ describe("installDispatch", () => {
     const handler = vi.fn();
     installDispatch(handler);
     const envelope = { kind: "confirm_bypass", tab: null, scope: "default", nonce: 18, lines: ["Start new sessions in bypass? (y/n)"] };
-    window.__neovibeDispatch!(JSON.stringify(envelope));
+    window.__eitriDispatch!(JSON.stringify(envelope));
     expect(handler).toHaveBeenCalledWith(envelope);
   });
 
@@ -214,7 +214,7 @@ describe("installDispatch", () => {
     const handler = vi.fn();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "confirm_bypass", tab: 3, scope: "tab", lines: ["?"] }));
+    window.__eitriDispatch!(JSON.stringify({ kind: "confirm_bypass", tab: 3, scope: "tab", lines: ["?"] }));
     expect(handler).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
@@ -233,7 +233,7 @@ describe("installDispatch", () => {
       { kind: "scratch", tab: 1, editing: true },
       { kind: "notice", text: "no such file" },
     ];
-    for (const envelope of envelopes) window.__neovibeDispatch!(JSON.stringify(envelope));
+    for (const envelope of envelopes) window.__eitriDispatch!(JSON.stringify(envelope));
     expect(handler.mock.calls.map((c) => c[0])).toEqual(envelopes);
   });
 });

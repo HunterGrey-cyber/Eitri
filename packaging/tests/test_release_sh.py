@@ -30,7 +30,7 @@ _spec = importlib.util.spec_from_file_location("release_check", os.path.join(_PA
 rc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rc)
 
-_SCRATCH_ROOT = os.path.expanduser("~/.cache/neovibe-release-sh-tests")
+_SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-release-sh-tests")
 _VERDANDI_REV = "0123456789abcdef0123456789abcdef01234567"
 _NVIM_PIN = "NVIM_VERSION=0.11.4\nNVIM_SHA256_linux_x86_64=" + "ab" * 32 + "\n"
 _DOCKER_EXIT = 97
@@ -48,8 +48,8 @@ def _install_sh_fixture(block=_SIGNERS_BLOCK):
     """A minimal packaging/install.sh stand-in: release.sh's own preflight only reads this file's
     embedded_release_signers() heredoc (packaging/release_check.py's check-release-signers), never
     runs it, so the fixture need not be a working installer."""
-    return ("#!/bin/sh\nembedded_release_signers() {\n\tcat <<'NEOVIBE_RELEASE_SIGNERS'\n" + block
-            + "NEOVIBE_RELEASE_SIGNERS\n}\n")
+    return ("#!/bin/sh\nembedded_release_signers() {\n\tcat <<'EITRI_RELEASE_SIGNERS'\n" + block
+            + "EITRI_RELEASE_SIGNERS\n}\n")
 
 
 # Task 5 (v1-dist, lane D): release_check.py's `twins` check (wired into preflight, below) requires
@@ -123,7 +123,7 @@ class _Env:
             "GIT_CONFIG_GLOBAL": gitconfig,
             "GIT_CONFIG_NOSYSTEM": "1",
             "LANG": "C.UTF-8",
-            "NEOVIBE_PUBLIC_REPO_URL": self.public,
+            "EITRI_PUBLIC_REPO_URL": self.public,
         }
         subprocess.run(["git", "init", "-q", "--bare", self.public], check=True, capture_output=True, env=self.vars)
 
@@ -272,7 +272,7 @@ class PositiveControls(ReleaseShTestCase):
     def test_a_signed_candidate_with_a_test_signers_file_reaches_the_image_build(self):
         key, pub = self.env.keypair("rc-key")
         signers = os.path.join(self.scratch, "rc-signers")
-        _write(signers, f'release@neovibe namespaces="neovibe-release" {" ".join(pub.split()[:2])}\n')
+        _write(signers, f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
         proc = self.run_release("--sign", key, "--release-signers", signers)
         self.assertReachedDocker(proc)
         self.assertIn("--release-signers", proc.stderr)
@@ -280,7 +280,7 @@ class PositiveControls(ReleaseShTestCase):
     def test_a_final_version_signed_by_a_committed_signer_reaches_the_image_build(self):
         key, pub = self.env.keypair("release-key")
         self.edit("Cargo.toml", 'version = "1.0.0-rc.1"', 'version = "1.0.0"')
-        self.write_signers(f'release@neovibe namespaces="neovibe-release" {" ".join(pub.split()[:2])}\n')
+        self.write_signers(f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
         self.commit()
         self.assertReachedDocker(self.run_release("--sign", key, version="1.0.0"))
 
@@ -392,7 +392,7 @@ class Refusals(ReleaseShTestCase):
         # The login key's own copy carries a comment the release key's does not: field 2 decides.
         _write(os.path.join(self.env.home, ".ssh", "id_ed25519.pub"), f"{kind} {blob} someone@laptop\n")
         signers = os.path.join(self.scratch, "signers")
-        _write(signers, f'release@neovibe namespaces="neovibe-release" {kind} {blob}\n')
+        _write(signers, f'release@eitri namespaces="eitri-release" {kind} {blob}\n')
         self.assertRefused(self.run_release("--sign", key, "--release-signers", signers), "everyday login key")
 
     def test_a_sign_key_whose_pub_file_is_missing_is_read_with_ssh_keygen(self):
@@ -439,7 +439,7 @@ class EmbeddedSignersRule(ReleaseShTestCase):
         # The tracked file gains a key; install.sh's fixture is left as it was -- the drift itself,
         # independent of whether this version needs a key at all.
         _write(os.path.join(self.clone, "packaging", "release-signers"),
-               'release@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAdrifted\n')
+               'release@eitri namespaces="eitri-release" ssh-ed25519 AAAAdrifted\n')
         self.commit()
         self.assertRefused(self.run_release("--unsigned"), "embedded release-signers block")
 
@@ -447,7 +447,7 @@ class EmbeddedSignersRule(ReleaseShTestCase):
         key, pub = self.env.keypair("release-key")
         self.edit("Cargo.toml", 'version = "1.0.0-rc.1"', 'version = "1.0.0"')
         _write(os.path.join(self.clone, "packaging", "release-signers"),
-               f'release@neovibe namespaces="neovibe-release" {" ".join(pub.split()[:2])}\n')
+               f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
         # install.sh's fixture is left holding the old (empty) block: drift, not a missing-key
         # question -- refused before release.sh ever looks at --sign's key.
         self.commit()
@@ -468,7 +468,7 @@ class EmbeddedSignersRule(ReleaseShTestCase):
         key, _ = self.env.keypair("release-key")
         _, other_pub = self.env.keypair("other-key")
         self.edit("Cargo.toml", 'version = "1.0.0-rc.1"', 'version = "1.0.0"')
-        self.write_signers(f'release@neovibe namespaces="neovibe-release" {" ".join(other_pub.split()[:2])}\n')
+        self.write_signers(f'release@eitri namespaces="eitri-release" {" ".join(other_pub.split()[:2])}\n')
         self.commit()
         self.assertRefused(self.run_release("--sign", key, version="1.0.0"), "is not listed in")
 
@@ -486,7 +486,7 @@ class EmbeddedKeyBindsRcSigning(ReleaseShTestCase):
 
     def commit_a_real_key(self):
         key, pub = self.env.keypair("release-key")
-        self.write_signers(f'release@neovibe namespaces="neovibe-release" {" ".join(pub.split()[:2])}\n')
+        self.write_signers(f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
         self.commit()
         return key
 
@@ -499,7 +499,7 @@ class EmbeddedKeyBindsRcSigning(ReleaseShTestCase):
         self.commit_a_real_key()
         throwaway, pub = self.env.keypair("throwaway")
         override = os.path.join(self.scratch, "throwaway-signers")
-        _write(override, f'release@neovibe namespaces="neovibe-release" {" ".join(pub.split()[:2])}\n')
+        _write(override, f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
         proc = self.run_release("--sign", throwaway, "--release-signers", override)
         self.assertRefused(proc, "not listed there")
         self.assertIn("packaging/release-signers already holds a release key", proc.stderr)
@@ -599,7 +599,7 @@ class PublicCommitsRule(ReleaseShTestCase):
     message, was built, signed and pushed. Preflight now holds HEAD to publish/commit.sh's public
     identity and scans HEAD and every commit reachable from HEAD or main and from no branch the public
     repo has, raw object and all, with publish/scan.sh. Fix round 1: the public repo's branches are
-    read from it (git ls-remote; here the fixture's bare repo, through NEOVIBE_PUBLIC_REPO_URL), never
+    read from it (git ls-remote; here the fixture's bare repo, through EITRI_PUBLIC_REPO_URL), never
     from the clone's own refs/remotes/origin/*, and HEAD is scanned even when the public repo has it."""
 
     # Something publish/scan.sh refuses in a commit message: an invented address (its email rule), in two
@@ -675,7 +675,7 @@ class PublicCommitsRule(ReleaseShTestCase):
 
     def test_a_public_repo_that_cannot_be_read_is_refused(self):
         self.commit_as("Release candidate 1.0.0-rc.1")
-        self.env.vars["NEOVIBE_PUBLIC_REPO_URL"] = os.path.join(self.scratch, "no-such-repo.git")
+        self.env.vars["EITRI_PUBLIC_REPO_URL"] = os.path.join(self.scratch, "no-such-repo.git")
         self.assertRefused(self.run_release("--unsigned"), "cannot read the branches of")
 
     def stand_in(self, rev, message, ref_base="refs/replace/"):
@@ -755,7 +755,7 @@ class RehearsalRule(ReleaseShTestCase):
     def test_a_rehearsal_only_unsigned(self):
         key, pub = self.env.keypair("k")
         signers = os.path.join(self.scratch, "signers")
-        _write(signers, f'release@neovibe namespaces="neovibe-release" {" ".join(pub.split()[:2])}\n')
+        _write(signers, f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
         self.assertRefused(self.run_release("--sign", key, "--release-signers", signers, "--rehearsal"),
                            "--rehearsal runs --unsigned only")
 
@@ -839,14 +839,14 @@ class SignAndVerify(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
         self.env = _Env(self.scratch)
         self.rel = os.path.join(self.scratch, "rel")
-        _write(os.path.join(self.rel, "neovibe-1.0.0-rc.1-x86_64-linux.tar.gz"), "tarball\n")
+        _write(os.path.join(self.rel, "eitri-1.0.0-rc.1-x86_64-linux.tar.gz"), "tarball\n")
         _write(os.path.join(self.rel, "install.sh"), "installer\n")
         self.key, pub = self.env.keypair("rc-key")
         self.signers = os.path.join(self.scratch, "rc-signers")
-        _write(self.signers, f'release@neovibe namespaces="neovibe-release" {" ".join(pub.split()[:2])}\n')
+        _write(self.signers, f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
 
     def sign(self):
-        return _bash(f'write_sums "{self.rel}" neovibe-1.0.0-rc.1-x86_64-linux.tar.gz install.sh; '
+        return _bash(f'write_sums "{self.rel}" eitri-1.0.0-rc.1-x86_64-linux.tar.gz install.sh; '
                      f'sign_sums "{self.key}" "{self.rel}"', self.env.vars, self.scratch)
 
     def test_sums_are_plain_two_space_lines_in_the_order_given(self):
@@ -855,7 +855,7 @@ class SignAndVerify(unittest.TestCase):
         with open(os.path.join(self.rel, "SHA256SUMS"), encoding="utf-8") as f:
             lines = f.read().splitlines()
         self.assertEqual([line.split("  ")[1] for line in lines],
-                         ["neovibe-1.0.0-rc.1-x86_64-linux.tar.gz", "install.sh"])
+                         ["eitri-1.0.0-rc.1-x86_64-linux.tar.gz", "install.sh"])
         for line in lines:
             self.assertRegex(line, r"^[0-9a-f]{64}  [A-Za-z0-9._+-]+$")
 
@@ -865,8 +865,8 @@ class SignAndVerify(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         # The installer's own command, verbatim (spec sec 6.4), agrees.
         with open(os.path.join(self.rel, "SHA256SUMS"), "rb") as sums:
-            direct = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", self.signers, "-I", "release@neovibe",
-                                     "-n", "neovibe-release", "-s", os.path.join(self.rel, "SHA256SUMS.sig")],
+            direct = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", self.signers, "-I", "release@eitri",
+                                     "-n", "eitri-release", "-s", os.path.join(self.rel, "SHA256SUMS.sig")],
                                     stdin=sums, capture_output=True, env=self.env.vars)
         self.assertEqual(direct.returncode, 0, direct.stderr)
 
@@ -881,7 +881,7 @@ class SignAndVerify(unittest.TestCase):
         self.assertEqual(self.sign().returncode, 0)
         _, other = self.env.keypair("other")
         other_signers = os.path.join(self.scratch, "other-signers")
-        _write(other_signers, f'release@neovibe namespaces="neovibe-release" {" ".join(other.split()[:2])}\n')
+        _write(other_signers, f'release@eitri namespaces="eitri-release" {" ".join(other.split()[:2])}\n')
         proc = _bash(f'verify_sums "{other_signers}" "{self.rel}"', self.env.vars, self.scratch)
         self.assertNotEqual(proc.returncode, 0)
 
@@ -905,7 +905,7 @@ class VerifyReleaseSignature(unittest.TestCase):
         self.key, pub = self.env.keypair("release-key")
         self.pubkey = " ".join(pub.split()[:2])
         self.override = os.path.join(self.scratch, "override-signers")
-        _write(self.override, f'release@neovibe namespaces="neovibe-release" {self.pubkey}\n')
+        _write(self.override, f'release@eitri namespaces="eitri-release" {self.pubkey}\n')
         self.source = os.path.join(self.scratch, "clone")
         self.tracked = os.path.join(self.source, "packaging", "release-signers")
         proc = _bash(f'write_sums "{self.rel}" install.sh; sign_sums "{self.key}" "{self.rel}"',
@@ -917,7 +917,7 @@ class VerifyReleaseSignature(unittest.TestCase):
         return _bash(f'verify_release_signature "{self.rel}"', env, self.scratch)
 
     def test_an_override_whose_blob_the_tracked_file_lists_under_another_principal_is_refused(self):
-        _write(self.tracked, f'someone@else namespaces="neovibe-release" {self.pubkey}\n')
+        _write(self.tracked, f'someone@else namespaces="eitri-release" {self.pubkey}\n')
         # Both checks preflight and the old host_main made pass: the blob is listed in the tracked
         # file, and the signature verifies against the override.
         self.assertEqual(subprocess.run(["bash", "-c", f'source "{_RELEASE_SH}"; '
@@ -931,13 +931,13 @@ class VerifyReleaseSignature(unittest.TestCase):
         self.assertIn(self.tracked, proc.stderr)
 
     def test_an_override_whose_blob_the_tracked_file_lists_under_another_namespace_is_refused(self):
-        _write(self.tracked, f'release@neovibe namespaces="something-else" {self.pubkey}\n')
+        _write(self.tracked, f'release@eitri namespaces="something-else" {self.pubkey}\n')
         proc = self.verify(self.override)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("its own installer would refuse", proc.stderr)
 
     def test_an_override_agreeing_with_the_tracked_key_verifies(self):
-        _write(self.tracked, f'release@neovibe namespaces="neovibe-release" {self.pubkey}\n')
+        _write(self.tracked, f'release@eitri namespaces="eitri-release" {self.pubkey}\n')
         proc = self.verify(self.override)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
@@ -951,7 +951,7 @@ class VerifyReleaseSignature(unittest.TestCase):
         _, other = self.env.keypair("other-key")
         _write(self.tracked, "# no key line yet\n")
         other_signers = os.path.join(self.scratch, "other-signers")
-        _write(other_signers, f'release@neovibe namespaces="neovibe-release" {" ".join(other.split()[:2])}\n')
+        _write(other_signers, f'release@eitri namespaces="eitri-release" {" ".join(other.split()[:2])}\n')
         proc = self.verify(other_signers)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("does not verify against " + other_signers, proc.stderr)
@@ -1047,7 +1047,7 @@ class ReleaseNotes(unittest.TestCase):
         self.assertIn("nvim-rs 0.9.2", notes)
         self.assertIn("nvim` >= 0.10", notes)
         self.assertIn("--nvim-only", notes)
-        self.assertNotIn("@", notes.replace("release@neovibe", ""))
+        self.assertNotIn("@", notes.replace("release@eitri", ""))
 
     def test_no_release_signers_file_at_all_renders_the_no_key_variant(self):
         # No packaging/release-signers in the fixture (the default rc.1 shape before Task 1's own
@@ -1084,10 +1084,10 @@ class ReleaseNotes(unittest.TestCase):
         # verify_release_signature (VerifyReleaseSignature, above) are what guarantee the signing
         # key is the embedded one by the time fill_notes runs for real; fill_notes
         # itself does not re-open RS_SIGN_KEY, so any non-empty path stands in for it here.
-        notes = self.render(signers_text='release@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAkeydata\n',
+        notes = self.render(signers_text='release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n',
                              RS_SIGN_KEY="/does/not/matter/to/fill_notes")
         self.assertIn("built into it", notes)
-        self.assertIn("ssh-keygen -Y verify -f release-signers -I release@neovibe -n neovibe-release "
+        self.assertIn("ssh-keygen -Y verify -f release-signers -I release@eitri -n eitri-release "
                        "-s SHA256SUMS.sig < SHA256SUMS", notes)
         self.assertNotIn("carries no release key", notes)
 
@@ -1098,7 +1098,7 @@ class ReleaseNotes(unittest.TestCase):
         # verifies it itself, with the release key built into it" for a build with no
         # SHA256SUMS.sig. Nor (fix round 2) "carries no release key ... checks SHA256SUMS only":
         # this build's install.sh embeds the key and refuses a release whose signature is missing.
-        notes = self.render(signers_text='release@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAkeydata\n',
+        notes = self.render(signers_text='release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n',
                              RS_SIGN_KEY="")
         self.assertIn("has no `SHA256SUMS.sig`", notes)
         self.assertIn("refuses", notes)
@@ -1119,10 +1119,10 @@ class ReleaseNotesBilingual(unittest.TestCase):
 
     def test_the_page_has_both_halves_in_order_and_no_leftover_placeholder(self):
         notes = self.render()
-        self.assertIn("neovibe 1.0.0-rc.1 -- Neovim, embedded as a real component", notes)
+        self.assertIn("Eitri 1.0.0-rc.1 -- Neovim, embedded as a real component", notes)
         self.assertIn("\n---\n\n## 简体中文\n", notes)
-        self.assertLess(notes.index("## 简体中文"), notes.index("neovibe 1.0.0-rc.1 -- 将 Neovim 作为真正的组件嵌入"))
-        self.assertNotIn("@", notes.replace("release@neovibe", ""))
+        self.assertLess(notes.index("## 简体中文"), notes.index("Eitri 1.0.0-rc.1 -- 将 Neovim 作为真正的组件嵌入"))
+        self.assertNotIn("@", notes.replace("release@eitri", ""))
 
     def test_the_chinese_half_names_the_same_release_facts_as_the_english_one(self):
         notes = self.render()
@@ -1134,7 +1134,7 @@ class ReleaseNotesBilingual(unittest.TestCase):
         self.assertIn("nvim-rs 0.9.2", zh)
         self.assertIn(">= 0.10", zh)
         self.assertIn("--nvim-only", zh)
-        self.assertIn("XDG_DATA_HOME/neovibe/nvim", zh)
+        self.assertIn("XDG_DATA_HOME/eitri/nvim", zh)
 
     def test_the_chinese_verify_section_renders_the_no_key_variant(self):
         notes = self.render()
@@ -1143,17 +1143,17 @@ class ReleaseNotesBilingual(unittest.TestCase):
         self.assertNotIn("内置的发布密钥", zh)
 
     def test_the_chinese_verify_section_renders_the_keyed_and_signed_variant(self):
-        notes = self.render(signers_text='release@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAkeydata\n',
+        notes = self.render(signers_text='release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n',
                              RS_SIGN_KEY="/does/not/matter/to/fill_notes")
         zh = notes.split("## 简体中文", 1)[1]
         self.assertIn("已签名", zh)
         self.assertIn("内置的发布密钥", zh)
-        self.assertIn("ssh-keygen -Y verify -f release-signers -I release@neovibe -n neovibe-release "
+        self.assertIn("ssh-keygen -Y verify -f release-signers -I release@eitri -n eitri-release "
                        "-s SHA256SUMS.sig < SHA256SUMS", zh)
         self.assertNotIn("没有发布密钥", zh)
 
     def test_the_chinese_verify_section_renders_the_keyed_but_unsigned_variant(self):
-        notes = self.render(signers_text='release@neovibe namespaces="neovibe-release" ssh-ed25519 AAAAkeydata\n',
+        notes = self.render(signers_text='release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n',
                              RS_SIGN_KEY="")
         zh = notes.split("## 简体中文", 1)[1]
         self.assertIn("没有 `SHA256SUMS.sig`", zh)

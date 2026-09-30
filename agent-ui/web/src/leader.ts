@@ -18,7 +18,7 @@ export const WHICH_KEY_DELAY_MS = 200;
  *  never a sequence start on its own -- `resolveKey`'s `{kind:"pending"}` machinery owns it.
  *  `Ctrl+w` (v1 picks, Task 6), the fifth prefix, is deliberately not listed: it is a chord, so
  *  `App.tsx` never asks `startSequence` about it (no sequence starts on a Ctrl key), and no table
- *  binding can begin with it (`neovibe_core::keymap::panel::parse_seq` refuses `<C-w>`). */
+ *  binding can begin with it (`eitri_core::keymap::panel::parse_seq` refuses `<C-w>`). */
 const PENDING_FIRST = new Set(["g", "z", "[", "]"]);
 
 /** The result of one key against the sequence engine, at a node identified by `typed` (the keys

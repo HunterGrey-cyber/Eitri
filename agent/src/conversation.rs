@@ -13,7 +13,7 @@
 //!
 //! | identity              | whose        | where it comes from                               |
 //! |-----------------------|--------------|---------------------------------------------------|
-//! | `conversation_id`     | Neovibe's    | derived here, stable for a workspace              |
+//! | `conversation_id`     | Eitri's    | derived here, stable for a workspace              |
 //! | `session_id`          | Verdandi's   | `CreateSessionResponse.session_id`                |
 //! | `provider_session_id` | Claude's     | `SessionReady.provider_session_id`, via an event  |
 //!
@@ -32,7 +32,7 @@
 //!   the same Claude session, which is the exact hazard the lease exists to prevent.
 //!
 //! **There is deliberately no lease on the DIRECTORY.** One was written and withdrawn on
-//! 2026-09-15: it delivered prohibition (a second Neovibe window in one project refused to start)
+//! 2026-09-15: it delivered prohibition (a second Eitri window in one project refused to start)
 //! where the requirement is isolation, and it broke `agent`'s own security baseline test, which now
 //! asserts that two sessions in one directory each see only their own `PreToolUse` hook. That
 //! isolation is real and lives elsewhere -- the hook config travels in the CLI's own argv
@@ -91,10 +91,10 @@ pub enum ConversationError {
     /// provider substituting one. Collapsing them would lose exactly the distinction worth alerting
     /// on.
     ResumeIdentityMismatch { requested: String, actual: String },
-    /// Another Neovibe-participating client already holds this provider session.
+    /// Another Eitri-participating client already holds this provider session.
     ///
     /// Advisory, and honestly so: the lease binds clients that take part in this protocol. A raw
-    /// `claude --resume` started outside Neovibe is NOT blocked by it, and this crate never claims
+    /// `claude --resume` started outside Eitri is NOT blocked by it, and this crate never claims
     /// otherwise (design doc §8.5).
     LeaseHeld { provider_session_id: String },
     /// The lease could not be taken for a reason other than contention.
@@ -132,11 +132,11 @@ impl std::fmt::Display for ConversationError {
             ConversationError::NoSession => write!(f, "no active session"),
             ConversationError::Cwd(e) => write!(f, "could not resolve the working directory: {e}"),
             // States the advisory boundary rather than implying a guarantee the lock cannot give
-            // (design doc §8.5): it binds Neovibe windows only.
+            // (design doc §8.5): it binds Eitri windows only.
             ConversationError::LeaseHeld { provider_session_id } => write!(
                 f,
-                "session {provider_session_id} is already open in another Neovibe window -- close it \
-                 there first, or start a new conversation. This only binds Neovibe windows: a \
+                "session {provider_session_id} is already open in another Eitri window -- close it \
+                 there first, or start a new conversation. This only binds Eitri windows: a \
                  `claude --resume` you start by hand is not stopped by it"
             ),
             ConversationError::Lease(e) => write!(f, "could not take the session lease: {e}"),
@@ -169,7 +169,7 @@ impl From<ProviderError> for ConversationError {
     }
 }
 
-/// Neovibe's own stable id for the conversation belonging to a workspace directory.
+/// Eitri's own stable id for the conversation belonging to a workspace directory.
 ///
 /// Hashed rather than derived from the path text: `persistence::save_conversation_record` writes
 /// `<conversation_id>.json`, and a raw path would need escaping to be a filename at all -- the same
@@ -427,7 +427,7 @@ impl AgentConversation {
     ///   5. only then resume, and persist the mapping.
     ///
     /// The lease is advisory and this crate says so plainly: it binds clients that participate in
-    /// this protocol. A raw `claude --resume` run outside Neovibe is not blocked by it, and nothing
+    /// this protocol. A raw `claude --resume` run outside Eitri is not blocked by it, and nothing
     /// here pretends otherwise (design doc §8.5).
     pub fn resume(
         provider: Arc<dyn AgentProvider + Send + Sync>,
@@ -459,7 +459,7 @@ impl AgentConversation {
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);
 
         // Design §4.2: here, and nowhere else. The stability probe has just confirmed nothing is
-        // writing the transcript (step 3), the lease is in hand so no other Neovibe window is
+        // writing the transcript (step 3), the lease is in hand so no other Eitri window is
         // driving this session (step 4), and the provider has not yet produced a byte -- so the
         // file cannot move under this read and no live event can precede what it restores.
         //
@@ -1011,7 +1011,7 @@ mod tests {
     ///   same `session_opened()`, whose `provider_session_id` is a fixed string);
     /// - `state_dirs::test_workspace_dir` calls `redirect_state_to_a_test_root()`, which is what
     ///   stops those records and leases being written into the developer's own
-    ///   `~/.local/state/neovibe/` and `$XDG_RUNTIME_DIR/neovibe/`. That write happens on the
+    ///   `~/.local/state/eitri/` and `$XDG_RUNTIME_DIR/eitri/`. That write happens on the
     ///   INGESTION thread, so no amount of care on this thread avoids it -- only the redirect does.
     fn unique_dir() -> PathBuf {
         crate::state_dirs::test_workspace_dir("conversation")
@@ -1200,7 +1200,7 @@ mod tests {
     /// `ConversationIngest::start` a `default()` projection and every one of those tests would
     /// still pass.
     ///
-    /// The transcript (B) cannot exist for a fresh uuid, so this exercises the fallback to Neovibe's
+    /// The transcript (B) cannot exist for a fresh uuid, so this exercises the fallback to Eitri's
     /// own copy, which is also the only half a test can set up without writing under
     /// `$CLAUDE_CONFIG_DIR` -- something this feature never does (invariant 11).
     #[test]
@@ -1293,7 +1293,7 @@ mod tests {
 
         let projection = conversation.projection();
         let notice = projection.history.clone().expect("the stored copy was restored");
-        assert_eq!(notice.source, crate::HistorySource::NeovibeCopy);
+        assert_eq!(notice.source, crate::HistorySource::EitriCopy);
         assert_eq!(notice.restored_items, 2);
         assert_eq!(
             projection
@@ -1364,7 +1364,7 @@ mod tests {
         let writer = crate::ingestion::tests::HISTORY_WRITER_THREAD.lock().unwrap().clone();
         let writer = writer.expect("a history write must have been recorded");
         assert_eq!(
-            writer, "neovibe-agent-ingest",
+            writer, "eitri-agent-ingest",
             "the write must not be on the caller's thread"
         );
         assert_ne!(
@@ -1631,7 +1631,7 @@ mod tests {
         let second = Arc::new(FakeProvider::new());
         assert!(
             conversation_in(second.clone(), &dir).is_ok(),
-            "a second Neovibe window in one project must not be refused -- see this test's doc comment"
+            "a second Eitri window in one project must not be refused -- see this test's doc comment"
         );
         assert_eq!(
             second.calls(),
@@ -1675,7 +1675,7 @@ mod tests {
                 vec![]
             }
         }
-        let result = AgentConversation::create(Arc::new(Never), Path::new("/definitely/does/not/exist/neovibe-test"));
+        let result = AgentConversation::create(Arc::new(Never), Path::new("/definitely/does/not/exist/eitri-test"));
         // `AgentConversation` is deliberately not Debug (it owns a Box<dyn AgentProvider>), so
         // match the error out rather than formatting the whole Result.
         match result {

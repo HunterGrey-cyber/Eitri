@@ -27,7 +27,7 @@
 //!   `-D`. A trailing `-Z` (`g:tmux_navigator_preserve_zoom`, not set in this config) is
 //!   tolerated, as is any other flag ordering, because only the direction token is extracted.
 //! - Sends that one direction letter to `shell` over the Unix socket named by
-//!   `NEOVIBE_PANE_SWITCH_SOCKET`, then exits.
+//!   `EITRI_PANE_SWITCH_SOCKET`, then exits.
 //! - **Always exits 0**, including when the socket is missing, unreachable, or the argv shape is
 //!   unrecognized. This is a UX-enhancement channel, not a security gate like `agent-hook`: the
 //!   plugin discards this process's stdout and exit code entirely (`silent call s:TmuxCommand`),
@@ -87,14 +87,14 @@ fn notice_for(
         return None;
     }
     Some(format!(
-        "neovibe: this `tmux` is neovibe's pane-switch shim (TMUX is set for nvim inside neovibe).\n\
+        "eitri: this `tmux` is Eitri's pane-switch shim (TMUX is set for nvim inside Eitri).\n\
          Run the real tmux with:  env -u TMUX {}",
         real_tmux_after(path_var, own_dir, shim)
     ))
 }
 
-/// The shim's own directory, from something that does not move: `NEOVIBE_PANE_SWITCH_SOCKET`'s
-/// parent joined with `bin`, the channel's own layout (`neovibe_core::pane_switch`: the socket and
+/// The shim's own directory, from something that does not move: `EITRI_PANE_SWITCH_SOCKET`'s
+/// parent joined with `bin`, the channel's own layout (`eitri_core::pane_switch`: the socket and
 /// the `bin/tmux` symlink sit in one private directory). `PATH`'s leading entry is only the
 /// fallback when that variable is gone: it is the shim's directory for the nvim child itself
 /// (`PaneSwitchChannel::child_env` prepends it), but not inside nvim's `:terminal` once an
@@ -143,7 +143,7 @@ fn main() {
 
     let path_var = std::env::var("PATH").ok();
     let own_dir = own_dir_from(
-        std::env::var_os("NEOVIBE_PANE_SWITCH_SOCKET").as_deref(),
+        std::env::var_os("EITRI_PANE_SWITCH_SOCKET").as_deref(),
         path_var.as_deref(),
     );
     let shim = std::env::current_exe().ok().and_then(|exe| exe.canonicalize().ok());
@@ -164,19 +164,19 @@ fn main() {
         return;
     };
 
-    let Ok(socket_path) = std::env::var("NEOVIBE_PANE_SWITCH_SOCKET") else {
-        eprintln!("neovibe-tmux-shim: NEOVIBE_PANE_SWITCH_SOCKET not set, ignoring {direction}");
+    let Ok(socket_path) = std::env::var("EITRI_PANE_SWITCH_SOCKET") else {
+        eprintln!("eitri-tmux-shim: EITRI_PANE_SWITCH_SOCKET not set, ignoring {direction}");
         return;
     };
 
     match UnixStream::connect(&socket_path) {
         Ok(mut stream) => {
             if let Err(e) = writeln!(stream, "{direction}") {
-                eprintln!("neovibe-tmux-shim: failed to write {direction} to {socket_path}: {e}");
+                eprintln!("eitri-tmux-shim: failed to write {direction} to {socket_path}: {e}");
             }
         }
         Err(e) => {
-            eprintln!("neovibe-tmux-shim: failed to connect to {socket_path}: {e}");
+            eprintln!("eitri-tmux-shim: failed to connect to {socket_path}: {e}");
         }
     }
 }
@@ -193,7 +193,7 @@ mod tests {
     fn extracts_the_direction_from_the_real_plugin_invocation() {
         // Exactly what `s:TmuxCommand` builds for `TmuxNavigateRight` with this project's config
         // (`shellescape($TMUX_PANE)`'s quotes are stripped by the shell before we see argv).
-        let a = args(&["-S", "/tmp/neovibe/switch.sock", "select-pane", "-t", "%0", "-R"]);
+        let a = args(&["-S", "/tmp/eitri/switch.sock", "select-pane", "-t", "%0", "-R"]);
         assert_eq!(direction_from_args(&a), Some('R'));
 
         assert_eq!(
@@ -292,9 +292,7 @@ mod tests {
         let a = args(&["-S", "/s", "display-message", "-p", "x"]);
         let notice = notice_for(&a, true, Some(&path_var), &own_dir, None).expect("a notice on a real tty call");
         assert!(
-            notice.starts_with(
-                "neovibe: this `tmux` is neovibe's pane-switch shim (TMUX is set for nvim inside neovibe)."
-            ),
+            notice.starts_with("eitri: this `tmux` is Eitri's pane-switch shim (TMUX is set for nvim inside Eitri)."),
             "got {notice:?}"
         );
         assert!(
@@ -364,7 +362,7 @@ mod tests {
         for dir in [&own_dir, &local, &real_dir] {
             std::fs::create_dir_all(dir).expect("fixture");
         }
-        let shim = root.join("neovibe-tmux-shim");
+        let shim = root.join("eitri-tmux-shim");
         std::fs::write(&shim, b"").expect("fixture");
         std::os::unix::fs::symlink(&shim, own_dir.join("tmux")).expect("fixture");
         std::fs::write(real_dir.join("tmux"), b"").expect("fixture");

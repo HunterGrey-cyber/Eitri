@@ -120,8 +120,8 @@ export type PermissionDecision = "allow" | "deny";
 
 declare global {
   interface Window {
-    webkit?: { messageHandlers?: { neovibeAgent?: { postMessage: (msg: string) => void } } };
-    __neovibeDispatch?: (json: string) => void;
+    webkit?: { messageHandlers?: { eitriAgent?: { postMessage: (msg: string) => void } } };
+    __eitriDispatch?: (json: string) => void;
   }
 }
 
@@ -135,7 +135,7 @@ export function nextRequestId(): string {
 }
 
 export function postToRust(message: OutboundMessage): void {
-  const handler = window.webkit?.messageHandlers?.neovibeAgent;
+  const handler = window.webkit?.messageHandlers?.eitriAgent;
   if (!handler) {
     console.warn("agent-ui: no WebKitGTK message handler present, message dropped", message);
     return;
@@ -269,12 +269,12 @@ type InboundHandler = (
 export type InboundPayload = Parameters<InboundHandler>[0];
 
 export function installDispatch(handler: InboundHandler): void {
-  window.__neovibeDispatch = (json: string) => {
+  window.__eitriDispatch = (json: string) => {
     let parsed: unknown;
     try {
       parsed = JSON.parse(json);
     } catch (e) {
-      console.warn("agent-ui: __neovibeDispatch received invalid JSON from Rust", json, e);
+      console.warn("agent-ui: __eitriDispatch received invalid JSON from Rust", json, e);
       return;
     }
     if (parsed && typeof parsed === "object" && "kind" in parsed) {
@@ -284,7 +284,7 @@ export function installDispatch(handler: InboundHandler): void {
       // envelope is -- warned about and dropped -- rather than reaching `App.tsx` as a confirm this
       // side would have to guess a nonce for.
       if (obj.kind === "confirm_bypass" && typeof (obj as { nonce?: unknown }).nonce !== "number") {
-        console.warn("agent-ui: __neovibeDispatch received a malformed confirm_bypass envelope (no nonce)", parsed);
+        console.warn("agent-ui: __eitriDispatch received a malformed confirm_bypass envelope (no nonce)", parsed);
         return;
       }
       if (
@@ -329,6 +329,6 @@ export function installDispatch(handler: InboundHandler): void {
         return;
       }
     }
-    console.warn("agent-ui: __neovibeDispatch received an unrecognized envelope shape", parsed);
+    console.warn("agent-ui: __eitriDispatch received an unrecognized envelope shape", parsed);
   };
 }

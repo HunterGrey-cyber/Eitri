@@ -22,7 +22,7 @@
 //! is itself test support -- nothing else calls either, so hidden-from-docs is an honest signal.
 //!
 //! `pid_is_alive` is deliberately NOT `#[doc(hidden)]` (removed 2026-09-17, L2 T3 follow-up): since
-//! T3, `neovibe-core`'s `instance_dir::sweep_stale_instance_dirs` -- real product code, not test
+//! T3, `eitri-core`'s `instance_dir::sweep_stale_instance_dirs` -- real product code, not test
 //! support -- reads its `false` as permission to delete a directory. See its own doc for the
 //! contract that puts on it; a safety-critical contract a product path depends on belongs where its
 //! callers will actually look for it, not hidden from the docs alongside two functions that really
@@ -36,7 +36,7 @@
 /// someone else, so it counts as alive; `ESRCH` means it does not exist.
 ///
 /// **Load-bearing contract: `false` must only ever mean ESRCH, never "could not determine".**
-/// `neovibe-core`'s `instance_dir::sweep_stale_instance_dirs` reads a `false` from this function as
+/// `eitri-core`'s `instance_dir::sweep_stale_instance_dirs` reads a `false` from this function as
 /// permission to `remove_dir_all` a directory -- so a `false` that actually means "unknown" would
 /// delete a live instance's state. The consequence follows directly: a platform this crate cannot
 /// answer the question on must fail to COMPILE, not silently return `false`. `libc::kill` below is

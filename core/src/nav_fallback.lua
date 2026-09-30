@@ -1,11 +1,11 @@
--- neovibe nav fallback (spec 2026-09-27-v1-ui-design.md §5, P1 and P14). Loaded with --cmd before
+-- Eitri nav fallback (spec 2026-09-27-v1-ui-design.md §5, P1 and P14). Loaded with --cmd before
 -- the user's config, like the theme and nvim-keys feeds. It sets no option and no mapping at load:
 -- it only installs autocommands, and at VimEnter (scheduled), User VeryLazy and User LazyLoad it
 -- gives each of <C-h>/<C-j>/<C-k>/<C-l>, in Normal and Visual mode, a way out of the editor --
 -- but only where the global slot is empty, nvim's own default, or a plain window move. Anything
 -- else (vim-tmux-navigator, a lazy.nvim key stub, smart-splits, a user's own mapping) is left
 -- alone, and buffer-local mappings are never touched.
-local socket = vim.env.NEOVIBE_PANE_SWITCH_SOCKET
+local socket = vim.env.EITRI_PANE_SWITCH_SOCKET
 if not socket or socket == "" then
   return
 end
@@ -18,7 +18,7 @@ local KEYS = {
   { lhs = "<C-k>", dir = "k", letter = "U", name = "up" },
   { lhs = "<C-l>", dir = "l", letter = "R", name = "right" },
 }
-local DESC = "neovibe: window or pane "
+local DESC = "eitri: window or pane "
 
 -- Synchronous, like `core/src/layout/kill.rs`'s `editor_quit_lua` and
 -- `core/src/theme/nvim_theme.lua`'s own `send()`. Before this (P5-A1, the pane half --
@@ -54,7 +54,7 @@ local function normal(key)
   end
 end
 
--- Visual (P14; neovibe-only -- the plugin maps Normal mode only). The mapping runs like <Cmd>, so
+-- Visual (P14; eitri-only -- the plugin maps Normal mode only). The mapping runs like <Cmd>, so
 -- Visual mode is not ended: at nvim's edge (`winnr('<dir>') == winnr()`, :h winnr()) the letter is
 -- sent and the selection stays, as the editor context the panel shows. Otherwise Visual is left
 -- (<Esc>) and the window changes, as the plugin's `:<C-U>` form does in Normal mode.
@@ -150,6 +150,6 @@ local function schedule_check()
   end)
 end
 
-local group = vim.api.nvim_create_augroup("neovibe_nav", { clear = true })
+local group = vim.api.nvim_create_augroup("eitri_nav", { clear = true })
 vim.api.nvim_create_autocmd("VimEnter", { group = group, callback = schedule_check })
 vim.api.nvim_create_autocmd("User", { group = group, pattern = { "VeryLazy", "LazyLoad" }, callback = schedule_check })

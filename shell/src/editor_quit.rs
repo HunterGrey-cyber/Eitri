@@ -26,7 +26,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Instant;
 
-use neovibe_core::layout::{KillScope, LayoutError};
+use eitri_core::layout::{KillScope, LayoutError};
 use neovide_editor::CallWatch;
 
 use crate::kill_pane::{self, Asked, EditorQuit, QuitInFlight, QuitRequest, Reveal};
@@ -49,12 +49,12 @@ pub(crate) const UNREACHABLE_NVIM: &str = "nvim's launcher exited and nvim still
 
 /// What a retired editor's refusals say (P8's toast, and the decline path's): nvim ended -- a
 /// `prefix x`, a `:qa`, a crash, which this cannot tell apart -- and this window cannot start
-/// another one (`neovibe_core::layout::kill`'s module doc: one winit event loop per process). A
-/// relaunch shows the editor again (`neovibe_core::layout::Layout::saved_hidden`), so this says so
+/// another one (`eitri_core::layout::kill`'s module doc: one winit event loop per process). A
+/// relaunch shows the editor again (`eitri_core::layout::Layout::saved_hidden`), so this says so
 /// without naming a cause it does not know (the Opus review's T6-5: "the editor was closed (:qa or
 /// prefix x)" was also shown for a crash).
 pub(crate) const RETIRED_EDITOR_TEXT: &str =
-    "nvim exited and cannot restart in this window \u{2014} relaunch neovibe to get the editor back";
+    "nvim exited and cannot restart in this window \u{2014} relaunch Eitri to get the editor back";
 
 /// What nvim's quit-cancelled letter did ([`EditorQuitting::cancelled`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +118,7 @@ pub(crate) trait QuitHost {
     fn show_chat(&self) -> Result<(), LayoutError>;
     /// The window close's y/n was answered `y` (`ClosePrompt::confirmed`).
     fn close_confirmed(&self) -> bool;
-    /// The window close's prompt as it stands now (`neovibe_core::tabs::window_close_prompt`).
+    /// The window close's prompt as it stands now (`eitri_core::tabs::window_close_prompt`).
     fn window_close_prompt(&self) -> Option<String>;
     /// Asks the window close's y/n.
     fn ask_to_close_window(&self, text: &str);
@@ -527,7 +527,7 @@ impl EditorQuitting {
         }
     }
 
-    /// `prefix x` on the editor, once its y/n was answered: `scope` from `neovibe_core::layout::
+    /// `prefix x` on the editor, once its y/n was answered: `scope` from `eitri_core::layout::
     /// can_kill`, `confirmed` the window close's prompt as it stood when `x` asked.
     pub(crate) fn kill_editor(self: &Rc<Self>, scope: KillScope, confirmed: Option<String>) -> Result<(), String> {
         let host = &self.host;
@@ -578,7 +578,7 @@ impl EditorQuitting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neovibe_core::layout::ModuleId;
+    use eitri_core::layout::ModuleId;
     use std::time::Duration;
 
     /// A fake world: what the flow asks is answered from these cells, and what it does is logged.
@@ -1061,7 +1061,7 @@ mod tests {
     fn the_retired_editors_text_claims_no_cause() {
         assert!(!RETIRED_EDITOR_TEXT.contains(":qa"));
         assert!(!RETIRED_EDITOR_TEXT.contains("prefix x"));
-        assert!(RETIRED_EDITOR_TEXT.contains("relaunch neovibe"));
+        assert!(RETIRED_EDITOR_TEXT.contains("relaunch Eitri"));
     }
 
     /// Round 4 (codex's round-3 finding (a)-(c) under the new rule): a `nvim` launcher that does not

@@ -1,7 +1,7 @@
 //! Moved from `terminal-pane/src/input.rs` on `freeze/terminal-stack` @ `1e715ab` (2026-09-23),
-//! unchanged above the `neovibe additions` marker but for one function: [`location_for`] now says
+//! unchanged above the `Eitri additions` marker but for one function: [`location_for`] now says
 //! which side a modifier is on (GUI pass 2026-09-23, defect 2). Where it says "the caller" or "a
-//! session", read `neovibe-terminal`'s `TerminalSession`, which encodes on its own thread against
+//! session", read `eitri-terminal`'s `TerminalSession`, which encodes on its own thread against
 //! the live mode.
 //!
 //! GTK keyboard events, normalised into `terminal_input::NormalizedInput`.
@@ -50,9 +50,9 @@
 //! genuinely needs a live GDK display is filling in `unmodified_keyval`, which is why that is a
 //! caller-supplied field and not something this function goes and fetches.
 
+use eitri_terminal::ScrollRequest;
 use gtk4::gdk::{Key as GdkKey, ModifierType};
 use gtk4::glib::translate::IntoGlib;
-use neovibe_terminal::ScrollRequest;
 use terminal_input::keys::{ElementState, Key, KeyEvent, KeyLocation, ModifiersState, NamedKey};
 use terminal_input::NormalizedInput;
 
@@ -418,7 +418,7 @@ mod tests {
     /// one, one character as text, anything else refused.
     #[test]
     fn a_literal_is_a_ctrl_letter_or_one_character() {
-        let k = |s: &str| neovibe_core::keymap::KeySpec::parse(s).unwrap();
+        let k = |s: &str| eitri_core::keymap::KeySpec::parse(s).unwrap();
         assert_eq!(literal(&k("C-a")), Some(control_letter('a').to_vec()));
         assert_eq!(literal(&k("C-b")), Some(control_letter('b').to_vec()));
         assert_eq!(literal(&k("x")), Some(vec![normalize_commit("x")]));
@@ -701,7 +701,7 @@ mod tests {
     }
 }
 
-// ---- neovibe additions (2026-09-23): what the bottom terminal needs beyond the frozen module ----
+// ---- Eitri additions (2026-09-23): what the bottom terminal needs beyond the frozen module ----
 
 /// Which of foot's two clipboard chords a key is ([`clipboard_chord`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,8 +763,8 @@ pub(crate) fn control_letter(letter: char) -> [NormalizedInput; 2] {
 /// What `send-prefix`/`send-keys` hand the terminal for `key` (keymap spec §2.6, ruling 3): a Ctrl
 /// letter exactly as [`control_letter`] sends a typed one, or one unmodified character as text.
 /// `None` for anything else, which the caller logs.
-pub(crate) fn literal(key: &neovibe_core::keymap::KeySpec) -> Option<Vec<NormalizedInput>> {
-    use neovibe_core::keymap::KeyName;
+pub(crate) fn literal(key: &eitri_core::keymap::KeySpec) -> Option<Vec<NormalizedInput>> {
+    use eitri_core::keymap::KeyName;
     match key.key {
         KeyName::Char(c) if key.ctrl && !key.meta && c.is_ascii_lowercase() => Some(control_letter(c).to_vec()),
         KeyName::Char(c) if !key.ctrl && !key.meta => Some(vec![normalize_commit(c.to_string())]),
@@ -864,7 +864,7 @@ pub(crate) fn copy_mode_commit(text: &str) -> CopyModeKey {
 }
 
 #[cfg(test)]
-mod neovibe_tests {
+mod eitri_tests {
     use super::*;
 
     fn press(keyval: GdkKey, state: ModifierType) -> RawKey {

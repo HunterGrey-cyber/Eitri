@@ -16,7 +16,7 @@ ARG GID=1000
 # Fedora's own hint row (spec sec 6.3): gtk4, webkitgtk6.0. Plus curl/xz/ca-certificates for the
 # installer's own downloads (Fedora ships curl already; named explicitly so a minimal base image
 # change cannot silently drop it) and openssh-clients for ssh-keygen (codex verdict #5). Package
-# lists are not cleaned afterward: the pkg-flow scenario (`dnf install ./neovibe-*.rpm` as root)
+# lists are not cleaned afterward: the pkg-flow scenario (`dnf install ./eitri-*.rpm` as root)
 # runs later in the same image and re-touches dnf's metadata cache regardless.
 RUN dnf install -y --setopt=install_weak_deps=False \
 		gtk4 webkitgtk6.0 curl xz ca-certificates openssh-clients shadow-utils \

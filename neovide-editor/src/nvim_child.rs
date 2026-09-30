@@ -1,4 +1,4 @@
-//! The embedded nvim's own process, and how neovibe ends it (v1 hardening Task 6 and its fix
+//! The embedded nvim's own process, and how Eitri ends it (v1 hardening Task 6 and its fix
 //! rounds; codex pre-release review part 1, finding 2).
 //!
 //! **Ending nvim, never `:qa!`** (round 4, the main session's ruling, 2026-09-27). `:qa!` discards
@@ -209,7 +209,7 @@ pub(crate) enum Ended {
     Unknown,
 }
 
-/// The schedule neovibe ends nvim on (the round-4 ruling, 2026-09-27; [`end`]): stdin closed at
+/// The schedule Eitri ends nvim on (the round-4 ruling, 2026-09-27; [`end`]): stdin closed at
 /// once, SIGTERM from 1 s, SIGKILL at 5 s.
 pub(crate) const SCHEDULE: Schedule = Schedule {
     hang_up_after: Duration::ZERO,
@@ -255,7 +255,7 @@ pub(crate) fn schedule(may_be_in_a_prompt: bool) -> Schedule {
 /// (the fork's `LiveHarness::hang_up`); it is called once, at `hang_up_after`, or sooner when nvim
 /// is gone or no process is known to be nvim -- a caller that closes stdin itself passes a no-op.
 ///
-/// Never `:qa!`, which neovibe never sends (the round-4 ruling; `tests/no_force_quit.rs`): on EOF
+/// Never `:qa!`, which Eitri never sends (the round-4 ruling; `tests/no_force_quit.rs`): on EOF
 /// idle nvim exits keeping the swap files of modified buffers, and writes what it had not synced
 /// into them (measured on 0.12.5, `an_idle_nvim_exits_on_the_hang_up_keeping_its_edit`). SIGTERM
 /// from `term_after`, once per `term_every`: nvim's own deadly-signal handler answers it as it
@@ -1100,7 +1100,7 @@ mod tests {
         }
     }
 
-    /// nvim as the pinned fork starts it for neovibe, with an edit made half a second before its
+    /// nvim as the pinned fork starts it for Eitri, with an edit made half a second before its
     /// ending: `--embed` over the fork's own session (whose `HangUp` closes stdin while the
     /// connection lives), the fork's `lua/init.lua` run as `setup_neovide_specific_state` runs it, a
     /// UI attached with the fork's options and answering as the fork does. `a.txt` holds "original"

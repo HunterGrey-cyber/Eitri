@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{ctrl, plain_sh, size, spec, Harness, WAIT};
-use neovibe_terminal::mouse::{Button, MouseInput, MouseKind, MouseMods};
-use neovibe_terminal::pty::HANGUP_GRACE;
-use neovibe_terminal::session::SYNC_UPDATE_TIMEOUT;
-use neovibe_terminal::{CursorCell, SessionCommand, SessionConfig, TerminalColors, REPLY_CAP};
+use eitri_terminal::mouse::{Button, MouseInput, MouseKind, MouseMods};
+use eitri_terminal::pty::HANGUP_GRACE;
+use eitri_terminal::session::SYNC_UPDATE_TIMEOUT;
+use eitri_terminal::{CursorCell, SessionCommand, SessionConfig, TerminalColors, REPLY_CAP};
 use terminal_input::NormalizedInput;
 use terminal_render::RgbColor;
 
@@ -172,11 +172,11 @@ fn every_frame_says_where_the_cursor_is_even_when_it_is_hidden() {
 #[test]
 fn the_title_reaches_the_host() {
     let mut h = Harness::start(
-        spec("/bin/sh", &["-c", r"printf '\033]2;neovibe-title\007'"]),
+        spec("/bin/sh", &["-c", r"printf '\033]2;eitri-title\007'"]),
         size(80, 5),
     );
     h.wait_for(WAIT, |h| h.exited.is_some());
-    assert_eq!(h.events.title, Some(Some("neovibe-title".to_string())));
+    assert_eq!(h.events.title, Some(Some("eitri-title".to_string())));
 }
 
 /// Idle output costs nothing: after the first frames, a child that prints nothing causes no render,

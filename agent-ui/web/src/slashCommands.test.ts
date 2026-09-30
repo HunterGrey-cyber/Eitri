@@ -111,7 +111,7 @@ describe("heldBackSlashCommand (spec §9.2)", () => {
 
 describe("slashCommandFlashText", () => {
   it("matches spec §9.2's own wording", () => {
-    expect(slashCommandFlashText("login")).toBe("/login does not work in neovibe — ? lists the ones that do");
+    expect(slashCommandFlashText("login")).toBe("/login does not work in Eitri — ? lists the ones that do");
   });
 });
 

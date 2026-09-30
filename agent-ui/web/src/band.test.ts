@@ -3,7 +3,7 @@ import { bandLayout, cardSummary, textWidth, usageSegment, type BandFacts } from
 import type { TokenUsage } from "./types";
 
 const running: BandFacts = { mode: "input", pill: "⏵⏵ auto", showcmd: null, message: null, prompt: null, warn: null,
-  unread: "↓3", cards: 1, queued: 1, context: { file: "neovibe.zsh", lines: [3, 9] }, position: "14/30", model: "sonnet-5", usage: null };
+  unread: "↓3", cards: 1, queued: 1, context: { file: "eitri.zsh", lines: [3, 9] }, position: "14/30", model: "sonnet-5", usage: null };
 const idle: BandFacts = { ...running, mode: "browse", unread: null, cards: 0, queued: 0, context: null };
 const ids = (w: number, f: BandFacts) => bandLayout(f, w, 7.2).map((s) => s.id);
 
@@ -20,8 +20,8 @@ describe("the band degrades by priority (spec §5.3)", () => {
   });
   it("shortens context to the file before dropping it", () => {
     const seg = bandLayout(running, 330, 7.2).find((s) => s.id === "context");
-    expect(seg?.text === "⧉ neovibe.zsh" || seg === undefined).toBe(true);
-    expect(bandLayout(running, 520, 7.2).find((s) => s.id === "context")!.text).toBe("⧉ neovibe.zsh:3-9");
+    expect(seg?.text === "⧉ eitri.zsh" || seg === undefined).toBe(true);
+    expect(bandLayout(running, 520, 7.2).find((s) => s.id === "context")!.text).toBe("⧉ eitri.zsh:3-9");
   });
   it("a y/n prompt takes everything right of the mode", () => {
     expect(ids(520, { ...running, prompt: "close 2 \"docs\"? (y/n)" })).toEqual(["mode", "prompt"]);
@@ -108,7 +108,7 @@ describe("usage (R5)", () => {
     const withUsage: BandFacts = { ...running, usage: { text: "1.2M tok $0.42", title: "" } };
     expect(ids(900, withUsage)).toEqual(["mode", "pill", "cards", "queue", "context", "model", "usage", "position", "unread"]);
     expect(ids(520, withUsage)).toEqual(["mode", "pill", "cards", "queue", "context", "model", "position", "unread"]);
-    expect(bandLayout(withUsage, 520, 7.2).find((s) => s.id === "context")!.text).toBe("⧉ neovibe.zsh:3-9");
+    expect(bandLayout(withUsage, 520, 7.2).find((s) => s.id === "context")!.text).toBe("⧉ eitri.zsh:3-9");
   });
   it("is never in a y/n prompt's band, and the segment carries the text it was given", () => {
     const withUsage: BandFacts = { ...running, usage: { text: "1.2M tok $0.42", title: "t" } };

@@ -29,7 +29,7 @@ neovide = { path = "../neovide" }
 nvim-rs = { version = "0.9.2", features = ["use_tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process"] }
 # `tests/no_force_quit.rs` reads `cargo metadata` to find the pinned fork's source. Already in
-# Cargo.lock through `neovibe-core`, so nothing new is downloaded.
+# Cargo.lock through `eitri-core`, so nothing new is downloaded.
 serde_json = "1"
 # msgpack for `nvim_child`'s ending tests, which talk to nvim over a pipe they can close. In
 # Cargo.lock through the fork already.

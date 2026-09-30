@@ -2,12 +2,12 @@
 //!
 //! Every other check of the property this crate exists to guarantee -- L2's whole point,
 //! "让编译器来守边界" (let the compiler guard the boundary) -- has so far been a human running
-//! `cargo tree -p neovibe-core | grep -ci gtk` by hand and writing the result down in a commit
+//! `cargo tree -p eitri-core | grep -ci gtk` by hand and writing the result down in a commit
 //! message or a doc comment. That checks the code, correctly: nothing in `core/src` can name
 //! `gtk4`, because nothing here depends on it. But it checks nothing about the *manifest* --
 //! there is nothing today stopping someone from adding `gtk4 = "0.11"` to `core/Cargo.toml` and
 //! never having a single `use gtk4::...` line to trip a compiler error over. This crate existing
-//! at all is what makes the macOS port possible (`shell` cannot build there; `neovibe-core` must
+//! at all is what makes the macOS port possible (`shell` cannot build there; `eitri-core` must
 //! be able to); a GTK dependency slipping into the manifest, whether used or not, would silently
 //! undo the one property the whole L2 effort was for. This test makes that failure loud and
 //! immediate -- a red `cargo test` on the commit that adds it, not a fact someone has to remember
@@ -60,7 +60,7 @@ enum Table {
 /// **Known gaps, not covered here:** a dotted-key rename (`[dependencies]\nui.package = "gtk4"`)
 /// and a `package = "..."` whose value contains the substring `"package"` earlier in the same line
 /// (this scan's `package_rename` finds the first `package` token, not necessarily the key). Both
-/// are TOML-legal and neither trips this scan. `cargo tree -p neovibe-core -e normal | grep -E
+/// are TOML-legal and neither trips this scan. `cargo tree -p eitri-core -e normal | grep -E
 /// 'gtk|gdk|glib|webkit'` is the backstop that catches what this text scan does not: it asks Cargo
 /// itself, after it has resolved every rename and dotted key, rather than parsing TOML by hand.
 fn forbidden_dependencies(manifest: &str) -> Vec<String> {
@@ -113,7 +113,7 @@ fn manifest_declares_no_gtk_or_webkit_dependency() {
     let offenders = forbidden_dependencies(MANIFEST);
     assert!(
         offenders.is_empty(),
-        "neovibe-core's whole reason to exist is having no GTK/WebKit dependency -- this crate \
+        "eitri-core's whole reason to exist is having no GTK/WebKit dependency -- this crate \
          is what the macOS port builds instead of `shell`, and a toolkit dependency here (used or \
          not) would silently break that:\n{}",
         offenders.join("\n")

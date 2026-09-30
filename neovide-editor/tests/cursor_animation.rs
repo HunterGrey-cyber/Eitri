@@ -48,7 +48,7 @@
 //! the three resizes and the re-realize (`presentation counts:`, `NeovideEditorPane::presentation_counts`,
 //! never reset). `-- --ignored --expect-own-buffers` fails if a single one of those frames went
 //! through `GtkGLArea`'s texture or the own-buffer path failed even once -- a fallback that a later
-//! re-realize or size change recovered from included; `NEOVIBE_EDITOR_DMABUF=0 ... -- --ignored
+//! re-realize or size change recovered from included; `EITRI_EDITOR_DMABUF=0 ... -- --ignored
 //! --expect-fallback` forces the fallback and fails if any frame was drawn into the own buffers, so
 //! both paths pass the same pixel checks.
 //!
@@ -2364,7 +2364,7 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let scratch = PathBuf::from(format!("/tmp/neovibe-cursor-animation-{}", std::process::id()));
+    let scratch = PathBuf::from(format!("/tmp/eitri-cursor-animation-{}", std::process::id()));
     std::fs::create_dir(&scratch).expect("create unique test scratch directory");
     let socket = scratch.join("nvim.sock");
     let init = concat!(
@@ -2397,7 +2397,7 @@ fn main() {
     pane.widget().set_size_request(820, 560);
     fixed.put(pane.widget(), 0.0, 0.0);
     let window = Window::builder()
-        .title("neovibe cursor animation regression")
+        .title("Eitri cursor animation regression")
         .default_width(1000)
         .default_height(700)
         .child(&fixed)

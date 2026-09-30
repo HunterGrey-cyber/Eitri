@@ -3,7 +3,7 @@
 //! This is the test that did not exist, for the reason it matters: in standalone Neovide the
 //! variable is applied by `window_wrapper.rs`, and an embedding never goes through that file. So
 //! until fork commit `LiveHarness::apply_scale_factor_setting` (2026-09-22) the variable was
-//! **stored and never applied** -- a `:let` inside neovibe changed nothing on screen, in either
+//! **stored and never applied** -- a `:let` inside Eitri changed nothing on screen, in either
 //! pane. `shell` makes the agent panel follow this variable (`Ctrl+=` zooms both panes); that is
 //! worthless if the editor itself does not move, and only `grid_scale()` can say whether it did.
 //!

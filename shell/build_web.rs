@@ -17,10 +17,10 @@
 // every top-level `vite.config.*`/`tsconfig*.json` -- is written beside the bundle
 // (`dist/.inputs-sha256`) after a successful build; missing or differing forces a rebuild. `npm ci`
 // runs only when `node_modules` is missing or the lockfile's own sha256 differs from the one
-// recorded when `node_modules` was last installed (`node_modules/.neovibe-lock-sha256`, written
+// recorded when `node_modules` was last installed (`node_modules/.eitri-lock-sha256`, written
 // after a successful `npm ci`) -- so editing `package.json` alone (no lockfile change) rebuilds
 // without reinstalling, matching what an `npm ci`-clean tree would actually need.
-// `NEOVIBE_WEB_CLEAN_BUILD=1` forces both, even when nothing changed: `release.sh` sets it for the
+// `EITRI_WEB_CLEAN_BUILD=1` forces both, even when nothing changed: `release.sh` sets it for the
 // build of the shipped binaries, so a release never embeds a bundle (or a `node_modules`) left over
 // from an earlier, unrelated build in the same tree. It is deliberately not tied to
 // `PROFILE=release` -- the LGPL source asset's offline rebuild (spec sec 4(d)(0)) is itself a
@@ -37,7 +37,7 @@ use std::io;
 /// Where the fingerprint is written, relative to `web_dir`.
 const FINGERPRINT_REL: &str = "dist/.inputs-sha256";
 /// Where the lockfile's own sha256 is recorded after a successful `npm ci`, relative to `web_dir`.
-const LOCK_SHA_REL: &str = "node_modules/.neovibe-lock-sha256";
+const LOCK_SHA_REL: &str = "node_modules/.eitri-lock-sha256";
 
 /// What `ensure_web_bundle_built` decided, from facts it already gathered off the filesystem --
 /// this function itself touches nothing, which is what makes it the thing a test drives directly
@@ -181,7 +181,7 @@ fn hex(bytes: &[u8]) -> String {
 /// command failure or a missing `dist/index.html` after a build: a build script has no better way
 /// to report either.
 ///
-/// `clean_build` is `NEOVIBE_WEB_CLEAN_BUILD=1`, read by the one real caller (`build.rs`'s `main`)
+/// `clean_build` is `EITRI_WEB_CLEAN_BUILD=1`, read by the one real caller (`build.rs`'s `main`)
 /// so this function itself never touches process environment -- `tests/web_bundle_freshness.rs`
 /// passes it as a plain argument instead, which is what lets its eight cases run with Rust's
 /// default parallel test execution rather than needing every test to serialize on a shared env var.

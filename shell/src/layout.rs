@@ -1,7 +1,7 @@
 //! What `shell` keeps of the two-`GtkPaned` layout that `module_grid` replaced (modules design P1,
 //! docs/superpowers/specs/2026-09-23-modules-and-canvas-design.md §5): the pixel size of a resize
-//! step, the bottom modules' floor, and `Direction`, which is `neovibe-core`'s now.
-//! Which divider moves, and how a zoom hides the rest, is `neovibe_core::layout`'s; the old
+//! step, the bottom modules' floor, and `Direction`, which is `eitri-core`'s now.
+//! Which divider moves, and how a zoom hides the rest, is `eitri_core::layout`'s; the old
 //! `hidden_for_zoom`/`resize_target` tables live on as its tests
 //! (`navigation_reproduces_todays_dispatch_*`, `resize_moves_the_divider_todays_resize_target_moved`).
 //!
@@ -13,7 +13,7 @@
 //! ratio, the first show giving it `BELOW_ROOT_SHARE`'s third (`show_puts_a_module_back_where_it_was`,
 //! `the_terminal_hides_and_shows_as_ctrl_a_t_did_on_main`).
 
-pub(crate) use neovibe_core::layout::Direction;
+pub(crate) use eitri_core::layout::Direction;
 
 /// A cell's size, in logical px, when the editor cannot say (not ready yet, or hidden since
 /// before nvim started).
@@ -26,7 +26,7 @@ pub(crate) const FALLBACK_CELL: (f64, f64) = (8.0, 16.0);
 pub(crate) const BOTTOM_MIN_HEIGHT: i32 = 80;
 
 /// One resize step in pixels: `cells` editor cells, across for left/right, down for up/down. The
-/// sign is the geometry's (`neovibe_core::layout::resize`).
+/// sign is the geometry's (`eitri_core::layout::resize`).
 pub(crate) fn resize_px(direction: Direction, cell: (f64, f64), cells: u16) -> i32 {
     let along = match direction {
         Direction::Left | Direction::Right => cell.0,

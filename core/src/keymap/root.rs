@@ -232,7 +232,7 @@ mod tests {
     /// claims either chord, so the WebView's own key event decides. A root chord (an accelerator or
     /// a capture-phase navigation key) or the default prefix on `Ctrl+y` would take it before the
     /// page ever saw it, and the band would advertise a key that does nothing. A user's own
-    /// `neovibe.keymap` can still take it; that is theirs to choose.
+    /// `eitri.keymap` can still take it; that is theirs to choose.
     #[test]
     fn ctrl_y_stays_the_agent_panels() {
         let ctrl_y = Chord::of(&super::super::key::KeySpec::parse("C-y").expect("C-y parses"));

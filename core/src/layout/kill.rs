@@ -52,7 +52,7 @@ use super::tree::{place_new, Layout, LayoutError};
 /// `pcall(vim.cmd, 'confirm qall')` returns only when nvim did NOT exit (a genuine quit ends the
 /// process before any Lua after it can run) -- cancelled, interrupted with `Ctrl+c`, or stopped by a
 /// user `QuitPre`/`ExitPre` autocommand that errors, all three swallowed by the `pcall` the same way.
-/// Only then is the generation written, on the pane-switch socket (`NEOVIBE_PANE_SWITCH_SOCKET`,
+/// Only then is the generation written, on the pane-switch socket (`EITRI_PANE_SWITCH_SOCKET`,
 /// already set on the nvim child for `vim-tmux-navigator`) rather than a socket of its own -- the
 /// Global Constraints forbid adding a new one -- mirroring `core/src/theme/nvim_theme.lua`'s own
 /// `send()`: `pcall(vim.fn.sockconnect, 'pipe', p, {rpc = false})`, then a `pcall`-wrapped
@@ -62,7 +62,7 @@ use super::tree::{place_new, Layout, LayoutError};
 pub fn editor_quit_lua(generation: u32) -> String {
     format!(
         "pcall(vim.cmd, 'confirm qall') \
-         local p = os.getenv('NEOVIBE_PANE_SWITCH_SOCKET') \
+         local p = os.getenv('EITRI_PANE_SWITCH_SOCKET') \
          if p then local ok, c = pcall(vim.fn.sockconnect, 'pipe', p, {{rpc = false}}) \
          if ok and c ~= 0 then pcall(vim.fn.chansend, c, 'Q {generation}\\n') pcall(vim.fn.chanclose, c) end end"
     )
@@ -83,7 +83,7 @@ pub enum KillScope {
     /// Another module is on screen: [`kill`] takes this one off it.
     Module,
     /// It is the last module on screen: the kill closes the window, which is the whole of this
-    /// neovibe process. The layout is not changed; `shell` closes the window instead.
+    /// Eitri process. The layout is not changed; `shell` closes the window instead.
     Window,
 }
 

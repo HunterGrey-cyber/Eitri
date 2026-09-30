@@ -1,6 +1,6 @@
 #!/bin/sh
 # Test double for mv: runs the real mv, and right after the swap's second rename
-# (.local/lib/neovibe.new -> .local/lib/neovibe) has succeeded, sends SIGTERM to the installer --
+# (.local/lib/eitri.new -> .local/lib/eitri) has succeeded, sends SIGTERM to the installer --
 # an interrupt in the moment after the new install is in place and before it is finished.
 real=
 for m in /usr/bin/mv /bin/mv; do
@@ -18,5 +18,5 @@ for a do
 		;;
 	esac
 done
-case $src in */.local/lib/neovibe.new) kill -TERM "$PPID" ;; esac
+case $src in */.local/lib/eitri.new) kill -TERM "$PPID" ;; esac
 exit 0

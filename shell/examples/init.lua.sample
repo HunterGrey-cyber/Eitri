@@ -1,12 +1,12 @@
--- neovibe example init.lua
+-- Eitri example init.lua
 --
 -- `shell` loads `<config dir>/init.lua` once at startup, after its two built-in panels
 -- (the editor on the left, the agent-panel placeholder on the right) are already registered
--- but before the window is presented. The config dir defaults to `~/.config/neovibe`; it can be
--- overridden with the `NEOVIBE_CONFIG_DIR` environment variable (mainly useful for testing a
+-- but before the window is presented. The config dir defaults to `~/.config/eitri`; it can be
+-- overridden with the `EITRI_CONFIG_DIR` environment variable (mainly useful for testing a
 -- config without touching your real one).
 --
--- Copy this file to `~/.config/neovibe/init.lua` and edit it to try the extension kernel
+-- Copy this file to `~/.config/eitri/init.lua` and edit it to try the extension kernel
 -- yourself, or use it as a starting point for your own plugin-style config. If no `init.lua` is
 -- present at all, `shell` starts normally with just the two built-in panels -- nothing here is
 -- required.
@@ -14,37 +14,37 @@
 -- This is a genuinely separate Lua runtime from Neovim's own `:lua`/`init.lua` -- it runs inside
 -- `shell`'s own embedded `mlua` interpreter, not inside the `nvim --embed` process the editor
 -- pane drives. There is currently no bridge between the two: you cannot call `vim.*` APIs from
--- here, and Neovim's own Lua cannot call `neovibe.*` (see
+-- here, and Neovim's own Lua cannot call `eitri.*` (see
 -- docs/canonical/neovibe_architecture_decisions.md §3). That bridge -- an `EditorContext` exposed to the
 -- agent side via Neovim RPC -- is separate, not-yet-built work.
 --
--- Everything below lives under one global table, `neovibe`, with exactly four extension points
+-- Everything below lives under one global table, `eitri`, with exactly four extension points
 -- in this first version: `config`, `on`, `command`, and `panel`.
 
 -- ---------------------------------------------------------------------------------------------
--- 1. neovibe.config.set(key, value) / neovibe.config.get(key)
+-- 1. eitri.config.set(key, value) / eitri.config.get(key)
 -- ---------------------------------------------------------------------------------------------
 -- A small, in-memory key/value store, scoped to this one running `shell` process. Both key and
 -- value must be strings in this version -- no numbers, booleans, or tables yet, and nothing is
 -- persisted to disk across a restart. It exists so config values set early in this file (or by a
 -- command's own action, below) can be read back later by an event handler or another command,
 -- without every extension point needing its own separate state-passing mechanism.
-neovibe.config.set("greeting", "hello from init.lua")
+eitri.config.set("greeting", "hello from init.lua")
 
 -- ---------------------------------------------------------------------------------------------
--- 2. neovibe.on(event_name, handler)
+-- 2. eitri.on(event_name, handler)
 -- ---------------------------------------------------------------------------------------------
 -- Subscribes a function to a named event. This version ships exactly one real event,
 -- "shell:ready", fired once after this file has finished loading and the window has been
 -- presented -- a good place to do anything that should happen "once the shell is up," like
 -- logging a startup confirmation or kicking off some one-time setup. More events will be added
 -- as real plugins need them, rather than a speculative event taxonomy being designed up front.
-neovibe.on("shell:ready", function()
-    print("[init.lua] shell:ready fired, greeting = " .. neovibe.config.get("greeting"))
+eitri.on("shell:ready", function()
+    print("[init.lua] shell:ready fired, greeting = " .. eitri.config.get("greeting"))
 end)
 
 -- ---------------------------------------------------------------------------------------------
--- 3. neovibe.command.register({ id, title, keybinding, action })
+-- 3. eitri.command.register({ id, title, keybinding, action })
 -- ---------------------------------------------------------------------------------------------
 -- Registers a named, invocable action. `id` and `title` are required; `action` is the function
 -- that runs when the command fires. `keybinding` is optional -- a command with none is still
@@ -54,18 +54,18 @@ end)
 -- own platform-independent modifier name, prefer it over hardcoding `<Control>`) and gets wired
 -- to a real `gio::SimpleAction` + accelerator by `shell` at startup, so pressing the key really
 -- does fire the Lua callback below.
-neovibe.command.register({
+eitri.command.register({
     id = "example-command",
     title = "Example Command",
     keybinding = "<primary>t",
     action = function()
-        neovibe.config.set("greeting", "the example command ran")
+        eitri.config.set("greeting", "the example command ran")
         print("[init.lua] example-command invoked")
     end,
 })
 
 -- ---------------------------------------------------------------------------------------------
--- 4. neovibe.panel.register({ id, title, position, content })
+-- 4. eitri.panel.register({ id, title, position, content })
 -- ---------------------------------------------------------------------------------------------
 -- Registers a panel into one of the two named layout slots, "main" (left, today the editor) or
 -- "side" (right, today the agent-panel placeholder). This version has exactly those two slots --
@@ -79,7 +79,7 @@ neovibe.command.register({
 -- `content` must currently be `{ type = "webview", url = "..." }` -- the only supported panel
 -- content model in this version is a WebKitGTK WebView pointed at a URL. `url` can be:
 --   - a bare relative filename, resolved under `<config dir>/panels/` (e.g. "my-panel.html"
---     loads `~/.config/neovibe/panels/my-panel.html`);
+--     loads `~/.config/eitri/panels/my-panel.html`);
 --   - an absolute path (starting with `/`);
 --   - or anything already carrying a URI scheme (`http://`, `https://`, `file://`, `data:`, ...),
 --     used exactly as given. The `data:` URI below is the simplest possible way to try this
@@ -92,7 +92,7 @@ neovibe.command.register({
 -- hypothetical "my:panel.html") would be misclassified as already-a-URL instead of being resolved
 -- under `panels/`. Avoid colons in panel filenames if you hit this; it has not been fixed because
 -- no real plugin has needed a colon in a filename yet.
-neovibe.panel.register({
+eitri.panel.register({
     id = "example-panel",
     title = "Example Panel",
     position = "side",

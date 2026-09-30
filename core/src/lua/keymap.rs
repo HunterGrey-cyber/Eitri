@@ -1,6 +1,6 @@
-//! `neovibe.keymap.prefix(key)`, `.set(table, key, action, opts)`, `.del(table, key)` (keymap spec
+//! `eitri.keymap.prefix(key)`, `.set(table, key, action, opts)`, `.del(table, key)` (keymap spec
 //! §2.3). Each call is **recorded, never applied or checked here**: `shell` hands the recording to
-//! `neovibe_core::keymap::Keymap::apply_user` once `init.lua` has run, so every mistake -- a bad
+//! `eitri_core::keymap::Keymap::apply_user` once `init.lua` has run, so every mistake -- a bad
 //! key, an unknown action, a collision -- is a startup failure naming the call. A Lua error raised
 //! from here would only be logged (`LuaEngine::load_init_file`), and the window would open with a
 //! keymap the user did not write. That includes an argument of the wrong type: it is recorded as
@@ -55,7 +55,7 @@ fn opts(lua: &Lua, value: &Value) -> Result<Vec<(String, OptValue)>, String> {
 }
 
 /// `pub`: `shell::lua::LuaEngine::new` calls this.
-pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<KeymapStore>>) -> mlua::Result<()> {
+pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlua::Result<()> {
     let keymap = lua.create_table()?;
 
     let s = store.clone();
@@ -65,7 +65,7 @@ pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<KeymapStore>>) -> m
             let op = match text(lua, &key) {
                 Some(key) => KeymapOp::Prefix { key },
                 None => KeymapOp::Invalid(format!(
-                    "neovibe.keymap.prefix(…): the key must be a string, not a {}",
+                    "eitri.keymap.prefix(…): the key must be a string, not a {}",
                     key.type_name()
                 )),
             };
@@ -88,12 +88,11 @@ pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<KeymapStore>>) -> m
                             opts,
                         },
                         Err(why) => {
-                            KeymapOp::Invalid(format!("neovibe.keymap.set({table:?}, {key:?}, {action:?}, …): {why}"))
+                            KeymapOp::Invalid(format!("eitri.keymap.set({table:?}, {key:?}, {action:?}, …): {why}"))
                         }
                     },
                     _ => KeymapOp::Invalid(
-                        "neovibe.keymap.set(table, key, action, opts): table, key and action must be strings"
-                            .to_string(),
+                        "eitri.keymap.set(table, key, action, opts): table, key and action must be strings".to_string(),
                     ),
                 };
                 s.borrow_mut().ops.push(op);
@@ -108,14 +107,14 @@ pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<KeymapStore>>) -> m
         lua.create_function(move |lua, (table, key): (Value, Value)| {
             let op = match (text(lua, &table), text(lua, &key)) {
                 (Some(table), Some(key)) => KeymapOp::Del { table, key },
-                _ => KeymapOp::Invalid("neovibe.keymap.del(table, key): table and key must be strings".to_string()),
+                _ => KeymapOp::Invalid("eitri.keymap.del(table, key): table and key must be strings".to_string()),
             };
             s.borrow_mut().ops.push(op);
             Ok(())
         })?,
     )?;
 
-    neovibe.set("keymap", keymap)?;
+    eitri.set("keymap", keymap)?;
     Ok(())
 }
 
@@ -127,10 +126,10 @@ mod tests {
 
     fn run(source: &str) -> Vec<KeymapOp> {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let store = Rc::new(RefCell::new(KeymapStore::default()));
-        install(&lua, &neovibe, store.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
         lua.load(source).exec().unwrap();
         let ops = store.borrow().ops().to_vec();
         ops
@@ -141,9 +140,9 @@ mod tests {
     #[test]
     fn calls_are_recorded_in_order_with_their_options() {
         let ops = run(r#"
-            neovibe.keymap.prefix("C-a")
-            neovibe.keymap.del("prefix", "C-b")
-            neovibe.keymap.set("prefix", "h", "resize.left", { cells = 5, repeatable = true })
+            eitri.keymap.prefix("C-a")
+            eitri.keymap.del("prefix", "C-b")
+            eitri.keymap.set("prefix", "h", "resize.left", { cells = 5, repeatable = true })
         "#);
         assert_eq!(ops[0], KeymapOp::Prefix { key: "C-a".into() });
         assert_eq!(
@@ -182,20 +181,20 @@ mod tests {
     #[test]
     fn a_call_with_a_wrong_argument_is_recorded_as_invalid_naming_the_call() {
         for source in [
-            "neovibe.keymap.prefix(3)",
-            "neovibe.keymap.set('prefix', 'g')",
-            "neovibe.keymap.set('prefix', 'g', 'zoom', 'fast')",
-            "neovibe.keymap.set('prefix', 'g', 'zoom', { [1] = true })",
-            "neovibe.keymap.del('prefix')",
+            "eitri.keymap.prefix(3)",
+            "eitri.keymap.set('prefix', 'g')",
+            "eitri.keymap.set('prefix', 'g', 'zoom', 'fast')",
+            "eitri.keymap.set('prefix', 'g', 'zoom', { [1] = true })",
+            "eitri.keymap.del('prefix')",
         ] {
             let ops = run(source);
             let [KeymapOp::Invalid(message)] = ops.as_slice() else {
                 panic!("{source}: {ops:?}")
             };
-            assert!(message.starts_with("neovibe.keymap."), "{source}: {message}");
+            assert!(message.starts_with("eitri.keymap."), "{source}: {message}");
             assert!(Keymap::apply_user(&ops, &[]).is_err());
         }
-        let ops = run("neovibe.keymap.set('prefix', 'g', 'zoom', { cells = {} })");
+        let ops = run("eitri.keymap.set('prefix', 'g', 'zoom', { cells = {} })");
         let KeymapOp::Set { opts, .. } = &ops[0] else { panic!() };
         assert_eq!(
             opts[0].1,
@@ -204,11 +203,11 @@ mod tests {
         );
     }
 
-    /// Task 3: `neovibe.keymap.set("panel", ...)` is recorded the same way as the prefix table, and
+    /// Task 3: `eitri.keymap.set("panel", ...)` is recorded the same way as the prefix table, and
     /// `Keymap::apply_user` accepts it.
     #[test]
     fn a_panel_table_set_is_recorded_and_accepted() {
-        let ops = run(r#"neovibe.keymap.set("panel", "<leader>tn", "tab.new")"#);
+        let ops = run(r#"eitri.keymap.set("panel", "<leader>tn", "tab.new")"#);
         let KeymapOp::Set {
             table,
             key,

@@ -1,7 +1,7 @@
 //! Invoked synchronously by the real `claude` CLI as a `PreToolUse` hook command (see
 //! `agent::settings` for how the hook config naming this binary gets generated). Reads the
 //! hook's real JSON from its own stdin, forwards it verbatim to the parent long-lived `agent`
-//! process over a per-conversation Unix socket (path from `NEOVIBE_AGENT_HOOK_SOCKET`), blocks
+//! process over a per-conversation Unix socket (path from `EITRI_AGENT_HOOK_SOCKET`), blocks
 //! for that process's real decision, then prints it to stdout and exits 0. The CLI itself
 //! enforces the hook's configured timeout -- this binary has no timeout logic of its own.
 //!
@@ -47,15 +47,15 @@ use std::os::unix::net::UnixStream;
 /// around.
 fn block(reason: &str) -> ! {
     eprintln!(
-        "agent-hook: refusing this tool call because neovibe's permission gate could not be \
+        "agent-hook: refusing this tool call because Eitri's permission gate could not be \
          reached: {reason}"
     );
     std::process::exit(2);
 }
 
 fn main() {
-    let socket_path = std::env::var("NEOVIBE_AGENT_HOOK_SOCKET")
-        .unwrap_or_else(|_| block("NEOVIBE_AGENT_HOOK_SOCKET is not set in this hook's environment"));
+    let socket_path = std::env::var("EITRI_AGENT_HOOK_SOCKET")
+        .unwrap_or_else(|_| block("EITRI_AGENT_HOOK_SOCKET is not set in this hook's environment"));
 
     let mut stdin_json = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut stdin_json) {

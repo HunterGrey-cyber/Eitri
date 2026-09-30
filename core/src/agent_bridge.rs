@@ -647,7 +647,7 @@ pub fn serialize_focus_permission_for_js(tab: crate::tabs::TabId) -> String {
 }
 
 /// `{"kind":"keymap", ...}`: the `?` overlay's two `shell` sections, generated from
-/// `neovibe_core::keymap` (keymap spec §2.9) -- `window` from the root table, `prefixKeys` from the
+/// `eitri_core::keymap` (keymap spec §2.9) -- `window` from the root table, `prefixKeys` from the
 /// effective prefix table -- and the prefix as a person reads it, for the heading `After <prefix>`.
 /// Sent on every `ready`.
 ///
@@ -795,7 +795,7 @@ pub struct CallNotes {
     /// was raised (v1 polish F22): the card says it creates a file rather than warning about
     /// overwriting one it cannot see.
     pub creates_file: BTreeMap<String, Option<String>>,
-    /// Tool-use id -> the note for a call whose CLI prompt neovibe answered without a card (O3 review
+    /// Tool-use id -> the note for a call whose CLI prompt Eitri answered without a card (O3 review
     /// item 7): "Claude Code safety check — allowed in bypass" / "— allowed with your approval".
     pub prompt_notes: BTreeMap<String, String>,
     /// Tool-use ids of a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered without a
@@ -904,7 +904,7 @@ pub struct SnapshotView<'a> {
     /// copy of a whole conversation.
     pub projection: crate::agent_backend::ProjectionRef<'a>,
     /// Permission ids `serialize_snapshot_for_js` must omit from `pendingPermissions` (D9, R07/S2):
-    /// requests neovibe itself already answered (`Tab::host_answered`) and is waiting on the
+    /// requests Eitri itself already answered (`Tab::host_answered`) and is waiting on the
     /// provider's resolution for. `None` only in tests that build a bare `SnapshotView` literal
     /// directly and have no such set to hide.
     pub hidden_pending: Option<&'a BTreeSet<String>>,
@@ -912,7 +912,7 @@ pub struct SnapshotView<'a> {
 
 impl<'a> SnapshotView<'a> {
     /// `hidden` is `Tab::host_answered`: every id in it is dropped from `pendingPermissions` (never
-    /// from tool calls or the transcript) so a request neovibe answered on the user's behalf never
+    /// from tool calls or the transcript) so a request Eitri answered on the user's behalf never
     /// draws a card, and the tray never counts it either (D9).
     pub fn of(backend: &'a crate::agent_backend::AgentBackend, hidden: &'a BTreeSet<String>) -> Self {
         Self {
@@ -935,7 +935,7 @@ impl<'a> SnapshotView<'a> {
 /// function is the one place that difference is bridged).
 ///
 /// Takes a `SnapshotView` rather than the projection alone, because two of the three identities
-/// live outside it: `conversationId` is Neovibe's own and `providerSessionId` is Claude's, while the
+/// live outside it: `conversationId` is Eitri's own and `providerSessionId` is Claude's, while the
 /// projection's `sessionId` is Verdandi's. Collapsing them would defeat the entire point of keeping
 /// them apart -- and would eventually send Claude's id back as a session_id, which the sidecar
 /// answers with SESSION_NOT_FOUND. `tab` names the session tab it is about; the panel drops it
@@ -1102,7 +1102,7 @@ pub fn serialize_snapshot_with_notes_for_js(
         json!({
             "source": match notice.source {
                 agent::HistorySource::ClaudeTranscript => "claude_transcript",
-                agent::HistorySource::NeovibeCopy => "neovibe_copy",
+                agent::HistorySource::EitriCopy => "eitri_copy",
             },
             "restoredItems": notice.restored_items,
             "omittedItems": notice.omitted_items,
@@ -1173,7 +1173,7 @@ pub fn serialize_snapshot_with_notes_for_js(
 /// Dispatched only AFTER the real session shutdown has completed (`agent_panel`'s
 /// `collect_pending_handoff`), so the ordering design doc §8.3 requires -- close and flush before
 /// the CLI starts -- holds by construction rather than by hope: the command has not been shown yet
-/// while Neovibe is still driving the session.
+/// while Eitri is still driving the session.
 ///
 /// `providerSessionId` is read back out of the command's own argv rather than passed in beside it,
 /// so the id the panel displays and the id the command resumes are the same value by construction.
@@ -2032,7 +2032,7 @@ mod tests {
             advertised_capabilities: vec!["handshake".into()],
             advertised_permission_modes: vec!["bypass".into()],
             event_buffer_policy: "bounded-1000".into(),
-            build_description: Some("Verdandi checkout: /x @ eb70aa3 (via NEOVIBE_VERDANDI_CHECKOUT)".into()),
+            build_description: Some("Verdandi checkout: /x @ eb70aa3 (via EITRI_VERDANDI_CHECKOUT)".into()),
             startup_diagnostics: vec!["claude CLI 2.1.269 is untested".into()],
         };
         let view = SnapshotView {
@@ -2404,11 +2404,11 @@ mod tests {
             text: "what did we say?".into(),
         });
         projection.history = Some(agent::HistoryNotice {
-            source: agent::HistorySource::NeovibeCopy,
+            source: agent::HistorySource::EitriCopy,
             restored_items: 314,
             omitted_items: Some(1431),
             upto_seq: projection.last_revision,
-            source_path: "/state/neovibe/history/conv/sess.json".into(),
+            source_path: "/state/eitri/history/conv/sess.json".into(),
             attempted_transcript_path: Some("/claude/projects/p/sess.jsonl".into()),
             fallback_reason: Some("transcript file not found".into()),
             writer_version: None,
@@ -2431,11 +2431,11 @@ mod tests {
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let history = &parsed["state"]["history"];
-        assert_eq!(history["source"], "neovibe_copy");
+        assert_eq!(history["source"], "eitri_copy");
         assert_eq!(history["restoredItems"], 314);
         assert_eq!(history["omittedItems"], 1431);
         assert_eq!(history["uptoSeq"], 1);
-        assert_eq!(history["sourcePath"], "/state/neovibe/history/conv/sess.json");
+        assert_eq!(history["sourcePath"], "/state/eitri/history/conv/sess.json");
         assert_eq!(history["attemptedTranscriptPath"], "/claude/projects/p/sess.jsonl");
         assert_eq!(history["fallbackReason"], "transcript file not found");
         assert!(history["writerVersion"].is_null());

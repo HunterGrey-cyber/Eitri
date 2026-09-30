@@ -14,7 +14,7 @@
 //! key's. The fallback's connect() is issued inside the mapping, so a stray letter from the first
 //! key would be queued on the listener ahead of it.
 //!
-//! Run: `cargo test -p neovibe-core --test nav_fallback_with_real_nvim -- --ignored`
+//! Run: `cargo test -p eitri-core --test nav_fallback_with_real_nvim -- --ignored`
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixListener;
@@ -23,7 +23,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use neovibe_core::pane_switch::{PaneMessage, PaneSwitchChannel, PaneSwitchReader};
+use eitri_core::pane_switch::{PaneMessage, PaneSwitchChannel, PaneSwitchReader};
 use rmpv::Value;
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -38,7 +38,7 @@ const KEYS: [(&str, &str, &str); 4] = [
 ];
 
 fn fallback_desc(name: &str) -> String {
-    format!("neovibe: window or pane {name}")
+    format!("eitri: window or pane {name}")
 }
 
 /// A msgpack-RPC client over `nvim --embed`'s stdio -- the same ~60 lines as
@@ -98,11 +98,11 @@ impl Client {
 enum Loader {
     /// `channel.child_env()` whole: the product shape.
     Installed,
-    /// `NEOVIBE_NAV_LUA` absent from the env (spec step (g)).
+    /// `EITRI_NAV_LUA` absent from the env (spec step (g)).
     NavLuaUnset,
-    /// `NEOVIBE_NAV_LUA` present but empty.
+    /// `EITRI_NAV_LUA` present but empty.
     NavLuaEmpty,
-    /// `NEOVIBE_NAV_LUA` set but `NEOVIBE_PANE_SWITCH_SOCKET` absent: the Lua itself must stand down.
+    /// `EITRI_NAV_LUA` set but `EITRI_PANE_SWITCH_SOCKET` absent: the Lua itself must stand down.
     SocketUnset,
 }
 
@@ -125,7 +125,7 @@ impl Nvim {
 
         // The shim binary is only the fake `tmux` symlink's target, which nothing here runs.
         let mut channel =
-            PaneSwitchChannel::bind(Path::new("/nonexistent/neovibe-tmux-shim")).expect("the channel must bind");
+            PaneSwitchChannel::bind(Path::new("/nonexistent/eitri-tmux-shim")).expect("the channel must bind");
         let listener = channel.take_listener().expect("a fresh channel has its listener");
 
         let mut command = Command::new("nvim");
@@ -137,20 +137,20 @@ impl Nvim {
         for cmd in after {
             command.args(["--cmd", cmd]);
         }
-        command.env_remove("NEOVIBE_NAV_LUA");
-        command.env_remove("NEOVIBE_PANE_SWITCH_SOCKET");
+        command.env_remove("EITRI_NAV_LUA");
+        command.env_remove("EITRI_PANE_SWITCH_SOCKET");
         for (k, v) in channel.child_env() {
             let skip = match loader {
                 Loader::Installed => false,
-                Loader::NavLuaUnset | Loader::NavLuaEmpty => k == "NEOVIBE_NAV_LUA",
-                Loader::SocketUnset => k == "NEOVIBE_PANE_SWITCH_SOCKET",
+                Loader::NavLuaUnset | Loader::NavLuaEmpty => k == "EITRI_NAV_LUA",
+                Loader::SocketUnset => k == "EITRI_PANE_SWITCH_SOCKET",
             };
             if !skip {
                 command.env(k, v);
             }
         }
         if let Loader::NavLuaEmpty = loader {
-            command.env("NEOVIBE_NAV_LUA", "");
+            command.env("EITRI_NAV_LUA", "");
         }
         let mut child = command
             .current_dir(&scratch)
@@ -507,8 +507,8 @@ fn visual_mode_leaves_at_the_edge_and_keeps_its_selection() {
     nvim.quit();
 }
 
-/// (g) The loader is a no-op without `NEOVIBE_NAV_LUA` (absent or empty), and the snippet itself
-/// stands down without `NEOVIBE_PANE_SWITCH_SOCKET`: no augroup, no mapping, nvim's default `<C-L>`
+/// (g) The loader is a no-op without `EITRI_NAV_LUA` (absent or empty), and the snippet itself
+/// stands down without `EITRI_PANE_SWITCH_SOCKET`: no augroup, no mapping, nvim's default `<C-L>`
 /// still in place -- even after a `User VeryLazy` and a scheduled round trip.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
@@ -522,7 +522,7 @@ fn without_its_environment_the_loader_installs_nothing() {
         nvim.wait_until("VimEnter", |nvim| nvim.eval("v:vim_did_enter").as_i64() == Some(1));
         nvim.command("doautocmd User VeryLazy");
         nvim.flush_scheduled();
-        assert_eq!(nvim.eval("exists('#neovibe_nav')").as_i64(), Some(0), "{case}");
+        assert_eq!(nvim.eval("exists('#eitri_nav')").as_i64(), Some(0), "{case}");
         assert_eq!(
             nvim.maparg("<C-l>", "n").0.as_deref(),
             Some(":help CTRL-L-default"),
@@ -561,7 +561,7 @@ fn the_letter_is_already_written_before_the_mapping_returns_even_if_nvim_dies_ri
     let marker = scratch.join("mapping-returned");
 
     let mut channel =
-        PaneSwitchChannel::bind(Path::new("/nonexistent/neovibe-tmux-shim")).expect("the channel must bind");
+        PaneSwitchChannel::bind(Path::new("/nonexistent/eitri-tmux-shim")).expect("the channel must bind");
     let listener = channel.take_listener().expect("a fresh channel has its listener");
     let mut reader = PaneSwitchReader::new(listener);
 

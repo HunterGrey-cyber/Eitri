@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! claude --version
-//! NEOVIBE_VERDANDI_CHECKOUT=$HOME/src/verdandi-old-checkout \
+//! EITRI_VERDANDI_CHECKOUT=$HOME/src/verdandi-old-checkout \
 //!   cargo test -p agent --lib runtime_policy -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
@@ -58,7 +58,7 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("neovibe-{label}-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("eitri-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("scratch dir");
         Scratch(path)
     }

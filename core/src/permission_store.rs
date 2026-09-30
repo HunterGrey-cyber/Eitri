@@ -1,5 +1,5 @@
-//! D7's rules, per project (keymap/tabs spec §4.1): `$XDG_STATE_HOME/neovibe/permissions/<16 hex>.json`.
-//! Claude Code writes `.claude/settings.local.json` into the repository; neovibe writes nothing into
+//! D7's rules, per project (keymap/tabs spec §4.1): `$XDG_STATE_HOME/eitri/permissions/<16 hex>.json`.
+//! Claude Code writes `.claude/settings.local.json` into the repository; Eitri writes nothing into
 //! the project. Removing a rule is editing this file; `prefix i` shows its path. An unusable file is
 //! set aside as `.json.unusable` and read as no rules, which fails toward more cards.
 
@@ -152,7 +152,7 @@ mod tests {
     fn it_lives_under_permissions_named_like_the_layout_file() {
         assert_eq!(
             state_dir(Some(OsStr::new("/s")), None),
-            Some(PathBuf::from("/s/neovibe/permissions"))
+            Some(PathBuf::from("/s/eitri/permissions"))
         );
         assert_eq!(
             path(Path::new("/d"), &root()),

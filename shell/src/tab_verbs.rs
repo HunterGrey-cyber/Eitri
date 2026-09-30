@@ -1,9 +1,9 @@
 //! What a tab verb after the prefix does to the keys (session tabs spec §3.4). Pure, so the table
 //! the spec gives is a test rather than a reading of `main.rs`.
 
-use neovibe_core::keymap::TabAction;
-use neovibe_core::layout::ModuleKind;
-use neovibe_core::tabs::{next_prev_target, NextPrevTarget};
+use eitri_core::keymap::TabAction;
+use eitri_core::layout::ModuleKind;
+use eitri_core::tabs::{next_prev_target, NextPrevTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TabVerb {
@@ -62,8 +62,8 @@ pub(crate) fn plan(action: TabAction, keys_in: Option<ModuleKind>, terminals: us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neovibe_core::keymap::TabAction;
-    use neovibe_core::layout::ModuleKind;
+    use eitri_core::keymap::TabAction;
+    use eitri_core::layout::ModuleKind;
 
     #[test]
     fn creating_and_the_verbs_that_need_the_keys_take_them_switching_does_not() {

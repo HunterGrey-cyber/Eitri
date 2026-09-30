@@ -51,7 +51,7 @@ pub fn hook_settings_arg(socket_path: &Path) -> std::io::Result<String> {
 /// module's tests can build the genuine configuration without a built binary to point at.
 fn hook_settings_arg_with_hook_path(socket_path: &Path, agent_hook_path: &Path) -> String {
     let command = format!(
-        "NEOVIBE_AGENT_HOOK_SOCKET={} {}",
+        "EITRI_AGENT_HOOK_SOCKET={} {}",
         socket_path.display(),
         agent_hook_path.display()
     );
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn the_argument_is_a_pretooluse_hook_on_every_tool_naming_this_conversations_socket() {
-        let socket_path = Path::new("/tmp/neovibe-agent-hook-abc123.sock");
+        let socket_path = Path::new("/tmp/eitri-agent-hook-abc123.sock");
         let arg = hook_settings_arg_with_hook_path(socket_path, FAKE_HOOK.as_ref());
 
         let parsed: serde_json::Value = serde_json::from_str(&arg).unwrap();
@@ -131,8 +131,8 @@ mod tests {
 
         let hook_entry = &parsed["hooks"]["PreToolUse"][0]["hooks"][0];
         let command = hook_entry["command"].as_str().unwrap();
-        assert!(command.contains("NEOVIBE_AGENT_HOOK_SOCKET"));
-        assert!(command.contains("/tmp/neovibe-agent-hook-abc123.sock"));
+        assert!(command.contains("EITRI_AGENT_HOOK_SOCKET"));
+        assert!(command.contains("/tmp/eitri-agent-hook-abc123.sock"));
         assert!(command.contains("fake-agent-hook"));
         assert!(hook_entry["timeout"].as_u64().unwrap() >= 300);
     }
@@ -176,7 +176,7 @@ mod tests {
     }
 
     fn tempfile_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("neovibe-settings-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("eitri-settings-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

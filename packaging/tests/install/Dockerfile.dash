@@ -3,9 +3,9 @@
 # image build -- the container's package manager, never the host's.
 #
 # Built and run by packaging/test_install.py (spec §2.4's container hygiene):
-#   docker build --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" -t neovibe-install-dash \
+#   docker build --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" -t eitri-install-dash \
 #       -f packaging/tests/install/Dockerfile.dash packaging/tests/install
-#   docker run --rm --user "$(id -u):$(id -g)" --network none --mount type=bind,... neovibe-install-dash \
+#   docker run --rm --user "$(id -u):$(id -g)" --network none --mount type=bind,... eitri-install-dash \
 #       /bin/sh <worktree>/packaging/tests/install/harness.sh --sh /bin/sh --scratch ...
 FROM ubuntu:24.04
 ARG UID=1000

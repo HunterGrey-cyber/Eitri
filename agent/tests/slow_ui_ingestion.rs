@@ -105,7 +105,7 @@ impl AgentProvider for ScriptedProvider {
 /// Load-bearing rather than tidiness: these tests fold a real `SessionOpened`, and that is what
 /// makes `AgentConversation`'s ingestion thread take a session lease and write a conversation
 /// record. `test_workspace_dir` redirects both away from the developer's own
-/// `~/.local/state/neovibe/` and `$XDG_RUNTIME_DIR/neovibe/` (see `agent::state_dirs`), and a
+/// `~/.local/state/eitri/` and `$XDG_RUNTIME_DIR/eitri/` (see `agent::state_dirs`), and a
 /// distinct cwd per conversation keeps these tests from sharing a lease key with each other.
 fn conversation(provider: Arc<ScriptedProvider>) -> AgentConversation {
     let dir = agent::state_dirs::test_workspace_dir("slow-ui");

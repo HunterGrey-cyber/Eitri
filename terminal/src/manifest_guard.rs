@@ -1,6 +1,6 @@
 //! Asserts this crate's own `Cargo.toml` never grows a GTK/WebKit dependency.
 //!
-//! The same guard `neovibe-core` has (`core/src/manifest_guard.rs`), for the same reason: the
+//! The same guard `eitri-core` has (`core/src/manifest_guard.rs`), for the same reason: the
 //! property that matters is that a non-GTK host can build this crate -- the macOS track's NSView,
 //! or a future right-side terminal backend -- and a toolkit dependency slipping into the manifest,
 //! used or not, would break that silently. The compiler catches a `use gtk4::...` in `src/`; only
@@ -11,7 +11,7 @@
 //! only four names; a `[dependencies.gtk4]` sub-table is caught as well as a `gtk4 = ...` line; and so
 //! are a dotted key (`gtk4.version = ...`) and a rename (`ui = { package = "gtk4" }`). What it still
 //! cannot see is a toolkit arriving transitively through another dependency; `cargo tree -p
-//! neovibe-terminal -e normal` is the check for that (the plan's Task 2 runs it).
+//! eitri-terminal -e normal` is the check for that (the plan's Task 2 runs it).
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
@@ -109,7 +109,7 @@ fn manifest_declares_no_gtk_or_webkit_dependency() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "neovibe-terminal must build without a toolkit -- `shell/src/terminal/` is where GTK goes:\n{}",
+        "eitri-terminal must build without a toolkit -- `shell/src/terminal/` is where GTK goes:\n{}",
         offenders.join("\n")
     );
 }

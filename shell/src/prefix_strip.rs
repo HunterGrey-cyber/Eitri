@@ -9,8 +9,8 @@
 //! `| _ even  H J K L swap`. The same pass saw the last run touch the project name
 //! (`H J K L swapproj`); `.prefix-strip`'s right margin (`theme::gtk_css`) is that half.
 
+use eitri_core::layout::{Axis, ModuleId, StripEntry};
 use gtk4::prelude::*;
-use neovibe_core::layout::{Axis, ModuleId, StripEntry};
 
 use crate::prefix::Waiting;
 
@@ -36,8 +36,8 @@ pub(crate) enum StripPiece {
 }
 
 /// The strip's pieces, left to right. `entries` are the module keys for `waiting`: the keys that reach
-/// each module now while armed (`neovibe_core::layout::strip_direct`), the fixed module keys after a
-/// split key (`neovibe_core::layout::strip`). `focus_title` names the module with the keys (where `\`/`"`
+/// each module now while armed (`eitri_core::layout::strip_direct`), the fixed module keys after a
+/// split key (`eitri_core::layout::strip`). `focus_title` names the module with the keys (where `\`/`"`
 /// put the next module); `title` names any module.
 pub(crate) fn strip_pieces(
     waiting: Waiting,
@@ -163,7 +163,7 @@ mod tests {
     /// The strip as it would read: each piece's text, a heading and a run as themselves, a `·` as
     /// itself, a dimmed run in brackets; joined by one space.
     fn verbs() -> Vec<String> {
-        neovibe_core::keymap::Keymap::defaults().strip_verbs()
+        eitri_core::keymap::Keymap::defaults().strip_verbs()
     }
 
     fn reads(pieces: &[StripPiece]) -> String {

@@ -1,5 +1,5 @@
 //! A layout that came from outside this process -- the state file (modules spec §4.6) or `init.lua`'s
-//! `neovibe.layout.default` (§4.4) -- rebuilt against the modules this window actually has.
+//! `eitri.layout.default` (§4.4) -- rebuilt against the modules this window actually has.
 //!
 //! What it does, in order (spec §4.6, "On load, `reconcile`"):
 //! 1. drops every leaf this window has no module for -- a Lua panel no longer registered, or the
@@ -82,7 +82,7 @@ pub fn reconcile(
     reconcile_with(root, hidden, focus, lua, false)
 }
 
-/// `init.lua`'s `neovibe.layout.default` tree, which has nothing hidden and no focus: [`reconcile`],
+/// `init.lua`'s `eitri.layout.default` tree, which has nothing hidden and no focus: [`reconcile`],
 /// and its bottom rows pinned (the module doc's step 3).
 pub fn reconcile_default(root: Node, lua: &[ModuleDecl]) -> Result<Reconciled, ReconcileError> {
     reconcile_with(root, &BTreeSet::new(), None, lua, true)
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(r.layout.focus(), &editor());
     }
 
-    /// `init.lua`'s `neovibe.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7},
+    /// `init.lua`'s `eitri.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7},
     /// {'terminal'} }` -- the natural way to ask for a bottom terminal -- is a plain `Column` split;
     /// pinned here, its terminal keeps its height through `F11` as a first launch's does (the plan
     /// review's finding 7). A module below the root that a first launch does not place there -- the
@@ -532,7 +532,7 @@ mod tests {
         );
     }
 
-    /// `init.lua`'s `neovibe.layout.default{ 'row', {'agent', 0.4}, {'editor'} }` -- the chat on the
+    /// `init.lua`'s `eitri.layout.default{ 'row', {'agent', 0.4}, {'editor'} }` -- the chat on the
     /// left, the natural way to ask for it -- carries no focus: the keys go to the editor, as every
     /// first launch gives them, not to the first leaf (the plan review's second round, finding 2). A
     /// focus the tree does not have is no better. With the editor hidden, a Lua `main` panel in its

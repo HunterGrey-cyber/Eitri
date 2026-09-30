@@ -26,7 +26,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("generated_handler_methods.rs");
 
-    // neovibe (2026-09-23): only `tests/forwarding.rs` includes the generated file -- the library
+    // Eitri (2026-09-23): only `tests/forwarding.rs` includes the generated file -- the library
     // never does. So failing to LOCATE vte (no lockfile where this crate expected one, an offline or
     // `cargo vendor` build, a registry somewhere else) must not fail the library build, which every
     // `shell` build now goes through. It fails exactly the one test that needs the file, by
@@ -62,7 +62,7 @@ fn main() {
 // ---------------------------------------------------------------------------------------------
 
 /// The lockfile cargo resolved this build with: this crate's own when it is built standalone, the
-/// workspace root's when it is a workspace member (which is what it is inside neovibe, where it has
+/// workspace root's when it is a workspace member (which is what it is inside Eitri, where it has
 /// none of its own). The first `Cargo.lock` walking up from the manifest directory is that file.
 fn find_lockfile(manifest_dir: &Path) -> Result<PathBuf, String> {
     manifest_dir
@@ -77,7 +77,7 @@ fn find_lockfile(manifest_dir: &Path) -> Result<PathBuf, String> {
 ///
 /// The vte that matters is the one `alacritty_terminal` resolved -- the one `Handler` comes from --
 /// not merely the first `vte` in the file: a workspace lockfile can hold several versions once any
-/// other dependency pulls in its own (neovibe, 2026-09-23). A lockfile names a dependency with its
+/// other dependency pulls in its own (Eitri, 2026-09-23). A lockfile names a dependency with its
 /// version only when that name is ambiguous, so a bare `"vte"` means the file's only vte.
 fn vte_version_from_lockfile(lock: &Path) -> Result<String, String> {
     let text = fs::read_to_string(lock).map_err(|e| format!("cannot read {} ({e})", lock.display()))?;

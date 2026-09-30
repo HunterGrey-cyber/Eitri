@@ -150,7 +150,7 @@ describe("Composer and slash commands (P10)", () => {
     expect(onSend).not.toHaveBeenCalled();
     expect(textarea.value).toBe("/login");
     expect(container.querySelector(".composer-slash-flash")!.textContent).toBe(
-      "/login does not work in neovibe — ? lists the ones that do",
+      "/login does not work in Eitri — ? lists the ones that do",
     );
   });
 

@@ -196,7 +196,7 @@ describe("MessageList interleaves the conversation in its real order", () => {
 /* The Critical finding this sanitization closed: model output is rendered with
    `dangerouslySetInnerHTML`, and model output is attacker-influenceable (a repository file, a web
    page the model fetched, a tool result). Script execution inside THIS document is not a contained
-   XSS -- the panel holds `window.webkit.messageHandlers.neovibeAgent`, the same bridge that relays
+   XSS -- the panel holds `window.webkit.messageHandlers.eitriAgent`, the same bridge that relays
    permission decisions to Rust, so a script here can approve its own tool calls. These tests assert
    the stripping for real rather than trusting that the DOMPurify call is still in place. */
 describe("MessageList sanitizes model output", () => {

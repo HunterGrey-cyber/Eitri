@@ -1,13 +1,13 @@
 //! Pointer geometry for the bottom terminal (bottom-terminal phase 3b, Task 8): turning a widget-
-//! relative pixel and a click count into what [`neovibe_terminal::SelectCommand`] needs. GTK-free
+//! relative pixel and a click count into what [`eitri_terminal::SelectCommand`] needs. GTK-free
 //! (no `gtk4`/`gdk` type anywhere in this file), so it is tested without a display, the same as
 //! `crate::wheel_zoom`.
 //!
 //! Task 9 (mouse reporting) reuses [`cell_at`] for the same reason: a program's own mouse mode
 //! needs the identical pixel -> cell mapping this selection code does.
 
-use neovibe_terminal::mouse::{Button, MouseInput, MouseKind, MouseModes, MouseMods};
-use neovibe_terminal::SelectKind;
+use eitri_terminal::mouse::{Button, MouseInput, MouseKind, MouseModes, MouseMods};
+use eitri_terminal::SelectKind;
 
 /// One pixel axis (x or y) turned into a clamped cell index, and whether the point falls in that
 /// cell's right (or bottom) half. A point at or before `0.0` is the left/top half of cell `0`; one
@@ -32,8 +32,8 @@ fn axis_cell(pos: f64, cell: f64, count: u16) -> (u16, bool) {
 }
 
 /// A widget-relative pixel `(x, y)` -> `(absolute grid line, column, right half)`. `top_line` is
-/// [`neovibe_terminal::Screen::top_line`] -- the same absolute-line space
-/// [`neovibe_terminal::SelectCommand`] and `neovibe_terminal::scroll::ScrollView` already use, so a
+/// [`eitri_terminal::Screen::top_line`] -- the same absolute-line space
+/// [`eitri_terminal::SelectCommand`] and `eitri_terminal::scroll::ScrollView` already use, so a
 /// drag made while scrolled back names the same cells the render it was made against showed.
 /// Clamped to the grid on every edge: a point outside the pane (a drag that leaves the widget while
 /// the button is still down, which GTK's `GestureDrag` keeps delivering) never produces a line or

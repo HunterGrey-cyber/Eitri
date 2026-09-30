@@ -11,8 +11,8 @@
 #   HOME       --home, and XDG_DATA_HOME / XDG_CACHE_HOME / XDG_STATE_HOME / XDG_CONFIG_HOME under
 #              it (each overridable with --set, or dropped with --unset);
 #   LANG       the caller's, else C.UTF-8;
-#   whatever --set names, which must be NEOVIBE_INSTALL_TEST or a NEOVIBE_INSTALL_TEST_* variable,
-#              an XDG_*_HOME, LANG, NEOVIBE_CONFIG_DIR (the purge test's), or CARGO_TARGET_DIR (F3's
+#   whatever --set names, which must be EITRI_INSTALL_TEST or an EITRI_INSTALL_TEST_* variable,
+#              an XDG_*_HOME, LANG, EITRI_CONFIG_DIR (the purge test's), or CARGO_TARGET_DIR (F3's
 #              own reproduction: a caller's CARGO_TARGET_DIR must not move where --from-source's
 #              build lands, since staging always reads <src>/target/release).
 # Nothing else is inherited: this host exports VERDANDI_CLAUDE_CLI_PATH and VERDANDI_CLAUDE_ACCOUNT,
@@ -21,7 +21,7 @@
 # Two guards, each fatal (exit 98 / 97) rather than a failure a caller could overlook:
 #   - `claude` must resolve to a stub under the new PATH, so the host's real claude can never run;
 #   - with --guard-real-home DIR, a find listing (names and mtimes, never contents) of DIR's
-#     .local/state/neovibe, .config/neovibe and .local/share/neovibe is hashed before and after the
+#     .local/state/eitri, .config/eitri and .local/share/eitri is hashed before and after the
 #     command and must not change. Only the two hashes are kept, in memory.
 #
 # stdin passes through (the piped-install test feeds the script on it). POSIX sh: it runs under
@@ -59,8 +59,8 @@ while [ $# -gt 0 ]; do
 		--cwd) W_CWD=$2 ;;
 		--set)
 			case $2 in
-			NEOVIBE_INSTALL_TEST=* | NEOVIBE_INSTALL_TEST_*=* | XDG_DATA_HOME=* | XDG_CACHE_HOME=* | \
-				XDG_STATE_HOME=* | XDG_CONFIG_HOME=* | LANG=* | NEOVIBE_CONFIG_DIR=* | CARGO_TARGET_DIR=*) ;;
+			EITRI_INSTALL_TEST=* | EITRI_INSTALL_TEST_*=* | XDG_DATA_HOME=* | XDG_CACHE_HOME=* | \
+				XDG_STATE_HOME=* | XDG_CONFIG_HOME=* | LANG=* | EITRI_CONFIG_DIR=* | CARGO_TARGET_DIR=*) ;;
 			*) die "--set $2: not an allowlisted variable" ;;
 			esac
 			W_SETS=$W_SETS$2$NL
@@ -98,7 +98,7 @@ if [ "$W_CLAUDE_OK" != 1 ]; then
 fi
 
 real_home_digest() {
-	for W_R in "$W_GUARD/.local/state/neovibe" "$W_GUARD/.config/neovibe" "$W_GUARD/.local/share/neovibe"; do
+	for W_R in "$W_GUARD/.local/state/eitri" "$W_GUARD/.config/eitri" "$W_GUARD/.local/share/eitri"; do
 		if [ -e "$W_R" ] || [ -L "$W_R" ]; then
 			find "$W_R" -printf '%p %T@\n' 2>&1
 		else
@@ -140,7 +140,7 @@ W_RC=$?
 if [ -n "$W_GUARD" ]; then
 	W_AFTER=$(real_home_digest)
 	if [ "$W_BEFORE" != "$W_AFTER" ]; then
-		printf "run-in-env: the real HOME's neovibe directories changed during this run\n" >&2
+		printf "run-in-env: the real HOME's Eitri directories changed during this run\n" >&2
 		exit 97
 	fi
 fi

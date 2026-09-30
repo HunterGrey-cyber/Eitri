@@ -18,7 +18,7 @@ use agent::{
 use std::time::{Duration, Instant};
 
 /// Asks for a tool the model cannot answer from memory, so `PreToolUse` actually fires.
-const TOOL_PROMPT: &str = "run: echo neovibe_permission_probe, and tell me the exact output";
+const TOOL_PROMPT: &str = "run: echo eitri_permission_probe, and tell me the exact output";
 
 fn conversation() -> (AgentConversation, u32) {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
@@ -147,7 +147,7 @@ fn a_decision_that_takes_a_minute_is_still_honored() {
         })
         .collect();
     assert!(
-        text.contains("neovibe_permission_probe"),
+        text.contains("eitri_permission_probe"),
         "the tool never actually ran after the late approval. got: {text}"
     );
     conversation.shutdown();

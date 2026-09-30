@@ -7,7 +7,7 @@
 //! for him to veto.
 //!
 //! **A flood must not strobe.** A `cat` of a binary file rings on most reads. The session already
-//! folds bells to at most one per rendered frame (`neovibe-terminal`'s
+//! folds bells to at most one per rendered frame (`eitri-terminal`'s
 //! `a_bell_flood_is_coalesced_to_about_one_host_wake_per_frame`); here a new flash can start only
 //! [`MIN_INTERVAL`] after the last one started, so a flood is at most two flashes a second.
 //!

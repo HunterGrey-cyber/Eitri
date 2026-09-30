@@ -1,0 +1,3 @@
+#!/bin/sh
+# Another Eitri earlier on PATH (a distro package's /usr/bin/eitri, say).
+echo other eitri

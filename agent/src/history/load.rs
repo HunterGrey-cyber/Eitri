@@ -18,7 +18,7 @@
 //!    reply is appended to the last historical assistant message and the two render as one.
 //! 4. **B wins whenever it can be read at all, and a fall to A is always said out loud.** No
 //!    merging, no difference detection, no silent degradation: the two records can genuinely
-//!    differ (the CLI compacts its own context and Neovibe's copy does not), and a user with
+//!    differ (the CLI compacts its own context and Eitri's copy does not), and a user with
 //!    `claude --resume` open in a terminal beside this panel must be able to see which one they are
 //!    looking at.
 //!
@@ -39,7 +39,7 @@ use super::transcript_jsonl::{read_transcript_history, TranscriptHistory};
 ///
 /// Called from `AgentConversation::resume` after the lease is held and before the provider is asked
 /// for anything (§4.2): the stability probe has just confirmed nothing else is writing the
-/// transcript, the lease means no other Neovibe window is driving this session, and the provider has
+/// transcript, the lease means no other Eitri window is driving this session, and the provider has
 /// not yet produced a single byte.
 ///
 /// Never fails. Every way of not getting history -- no transcript, no permission, a format nothing
@@ -73,7 +73,7 @@ pub(crate) fn seed_from(
         BOutcome::Failed { path, reason } => {
             eprintln!(
                 "agent: Claude's own transcript for session {provider_session_id} was not used \
-                 ({reason}); falling back to Neovibe's own copy"
+                 ({reason}); falling back to Eitri's own copy"
             );
             load_stored(&mut projection, conversation_id, provider_session_id, path, reason);
         }
@@ -269,7 +269,7 @@ fn load_stored(
         // stored copy. §7.3 -- no notice, no row, the panel is simply the one it is today.
         Err(HistoryLoadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            eprintln!("agent: Neovibe's own history for session {provider_session_id} could not be read: {e}");
+            eprintln!("agent: Eitri's own history for session {provider_session_id} could not be read: {e}");
             return;
         }
     };
@@ -306,7 +306,7 @@ fn load_stored(
         }
     }
     projection.history = Some(HistoryNotice {
-        source: HistorySource::NeovibeCopy,
+        source: HistorySource::EitriCopy,
         restored_items: restorable_item_count(projection) - items_before,
         // Counted in STORED items, not in rows: it is what this load's own truncation dropped,
         // and a dropped item has no row to be counted as. See `restorable_item_count`'s note on
@@ -705,7 +705,7 @@ mod tests {
         store_copy(
             &conversation_id,
             "sess-x",
-            vec![prompt(1, "what neovibe kept")],
+            vec![prompt(1, "what eitri kept")],
             vec![],
             vec![],
         );
@@ -713,7 +713,7 @@ mod tests {
 
         let projection = seed_from(Ok(path.clone()), &conversation_id, "sess-x");
         let notice = projection.history.clone().expect("the stored copy was restored");
-        assert_eq!(notice.source, HistorySource::NeovibeCopy);
+        assert_eq!(notice.source, HistorySource::EitriCopy);
         assert_eq!(
             notice.fallback_reason.as_deref(),
             Some("nothing in it could be restored (written by claude 2.1.272)")
@@ -728,7 +728,7 @@ mod tests {
                 .iter()
                 .map(|p| p.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["what neovibe kept"]
+            vec!["what eitri kept"]
         );
     }
 
@@ -819,7 +819,7 @@ mod tests {
             "sess-nopath",
         );
         let notice = projection.history.clone().expect("the stored copy was restored");
-        assert_eq!(notice.source, HistorySource::NeovibeCopy);
+        assert_eq!(notice.source, HistorySource::EitriCopy);
         assert_eq!(notice.attempted_transcript_path, None);
         assert!(notice
             .fallback_reason
@@ -1047,7 +1047,7 @@ mod tests {
 
         let projection = seed_from(Ok(not_a_file.clone()), &conversation_id, "sess-a");
         let notice = projection.history.clone().expect("the stored copy was restored");
-        assert_eq!(notice.source, HistorySource::NeovibeCopy);
+        assert_eq!(notice.source, HistorySource::EitriCopy);
         assert_eq!(
             notice.fallback_reason.as_deref(),
             Some("the transcript path is not a regular file")

@@ -3,7 +3,7 @@
 //! move here yet -- constructing it installs the panel-registration closure, which builds a real
 //! `webkit6::WebView` -- so `shell`'s own `lua` module stays the caller of everything below.
 //!
-//! `panel` here is only the pure validation/resolution half of `neovibe.panel.register`.
+//! `panel` here is only the pure validation/resolution half of `eitri.panel.register`.
 //! `PanelEntry`, `PanelRegistry` and the real widget-constructing `install` stay in
 //! `shell::lua::panel`, because `PanelEntry` holds a `gtk4::Widget`.
 

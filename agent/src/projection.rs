@@ -224,19 +224,19 @@ pub enum AgentDomainEvent {
         /// the provider's OWN vocabulary, kept for diagnostics rather than collapsed into `mode`.
         provider_mode: String,
         /// True when entering bypass applied Verdandi's conservative floor
-        /// (`PermissionModeChanged.bypass_default_deny_applied`). Neovibe states `unrestricted` on
+        /// (`PermissionModeChanged.bypass_default_deny_applied`). Eitri states `unrestricted` on
         /// every session (`build_create_request`), so this must never happen in practice; see the
         /// translate-side match arm for what a `true` here means.
         floor_applied: bool,
     },
-    /// The CLI reported a permission mode less restrictive than the `default` neovibe asks for
+    /// The CLI reported a permission mode less restrictive than the `default` Eitri asks for
     /// (`crate::classify_cli_mode` said `Ungated`; spec §2.3, D12) -- most likely a project's own
     /// `permissions.defaultMode`. Under such a mode a hook that gives no answer lets the tool run,
     /// which R07 says must never be possible, so the session has to be closed.
     ///
     /// Both backends produce it: the sidecar from `SessionReady.permission_mode` or a
     /// `PermissionModeChanged`, legacy from a `PreToolUse` hook payload (whose call was already
-    /// denied). `neovibe_core::tab_set::TabSet::pump` is the one place that closes the session and
+    /// denied). `eitri_core::tab_set::TabSet::pump` is the one place that closes the session and
     /// fails the tab.
     UngatedCliMode {
         /// The mode as the CLI named it, verbatim (`bypassPermissions`, `acceptEdits`, ...).
@@ -358,7 +358,7 @@ pub struct PermissionRequestRecord {
 /// `provider_permission_prompts`; `the private review notes`).
 ///
 /// **Why it exists (O3).** Every v1 session is gated: the CLI runs `default` and a `PreToolUse` hook
-/// asks neovibe about every call. The CLI can still ask on its OWN after that hook allowed a call --
+/// asks Eitri about every call. The CLI can still ask on its OWN after that hook allowed a call --
 /// its sensitive-file safety check on a `Write` under `.git/` or `.claude/` is the measured case --
 /// and neither a hook `allow` nor a session rule silences it. With nobody to ask, a headless CLI
 /// refused the write that a real `bypassPermissions` session runs. With the capability, that ask
@@ -368,7 +368,7 @@ pub struct PermissionRequestRecord {
 /// **It is never the permission policy's to answer** (O3 ruling 3): `classify_permission_request`
 /// and the saved prefix rules judge the gate's request only. The CLI flagged this call after the gate
 /// allowed it, and the CLI itself does not let a rule silence the check. Who answers it is
-/// `neovibe_core::agent_backend`'s decision (bypass, or the human's own earlier approval of the same
+/// `eitri_core::agent_backend`'s decision (bypass, or the human's own earlier approval of the same
 /// call), never the classifier's.
 ///
 /// Every field is the CLI's own, verbatim, and any may be absent. `reason` is English prose ("Claude
@@ -383,7 +383,7 @@ pub struct ProviderPrompt {
     pub blocked_path: Option<String>,
     /// Present when one of the user's own `permissions.ask` rules forced this prompt. Such a prompt
     /// is meant for a human, and the SDK's guidance is that a host auto-approving must not approve
-    /// it: neovibe draws it as a card in every mode, bypass included (O3 ruling 4).
+    /// it: Eitri draws it as a card in every mode, bypass included (O3 ruling 4).
     pub matched_ask_rule: Option<MatchedAskRule>,
     /// Set, to the raw wire value, when the sidecar named an `origin` this build does not know (a
     /// sidecar newer than this client). Such a prompt is a card in every mode, like one an ask rule
@@ -489,7 +489,7 @@ pub struct UsageInfo {
     pub model: Option<String>,
 }
 
-/// Neovibe's sole product-state authority for one conversation (design doc §10.3). `pending_permissions`
+/// Eitri's sole product-state authority for one conversation (design doc §10.3). `pending_permissions`
 /// is a map (not the old `Vec`) so a caller can look up/remove one specific request by id in O(1)
 /// -- exactly what answering one permission card needs, and exactly what the design doc's own
 /// "pending permissions map" wording asks for.
@@ -545,7 +545,7 @@ pub struct AgentSessionProjection {
     /// Load-bearing since partial streaming landed. `transcript` means "assistant messages", not
     /// "content events": with `StreamingPreference::Partial` a single 600-word reply arrives as 400+
     /// `ContentDelta`s, and pushing each as its own entry would render 400 separate message bubbles,
-    /// each markdown-parsed IN ISOLATION -- so a fragment like "`neovibe_" or "**bold" is not valid
+    /// each markdown-parsed IN ISOLATION -- so a fragment like "`eitri_" or "**bold" is not valid
     /// standalone markdown and the formatting of every streamed reply breaks.
     ///
     /// Anything that can only occur BETWEEN assistant messages closes the run: a tool call, a
@@ -572,7 +572,7 @@ pub struct AgentSessionProjection {
     /// Kept rather than folded away because the event alone does not survive a
     /// `UiDelivery::Resync`: an overflowing UI queue drops its events and the host rebuilds from
     /// this projection, and a tripwire that vanished there would leave an ungated session running
-    /// until its next report. `neovibe_core`'s pump reads this after every delivery. It changes
+    /// until its next report. `eitri_core`'s pump reads this after every delivery. It changes
     /// nothing a view draws -- the status is untouched and it is not serialized; closing the session
     /// is the host's to do.
     #[serde(skip)]
@@ -583,15 +583,15 @@ pub struct AgentSessionProjection {
 ///
 /// The distinction is user-facing on purpose (§7.2, §8): the two can genuinely differ -- Claude's
 /// own transcript is what the CLI maintains and what a `claude --resume` in a terminal shows, while
-/// Neovibe's copy is this side's unilateral record. A user with both open must be able to see at a
+/// Eitri's copy is this side's unilateral record. A user with both open must be able to see at a
 /// glance which one the panel is showing, so this is never silently degraded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistorySource {
     /// B: the real Claude CLI's own `<uuid>.jsonl`.
     ClaudeTranscript,
-    /// A: `history::store`, Neovibe's own copy, used only when B could not be read.
-    NeovibeCopy,
+    /// A: `history::store`, Eitri's own copy, used only when B could not be read.
+    EitriCopy,
 }
 
 /// Everything the panel needs to say one honest line about a restored history.
@@ -623,7 +623,7 @@ pub struct HistoryNotice {
     /// The Claude transcript that was looked for and not used. `None` when `source` is
     /// `ClaudeTranscript` (it would repeat `source_path`) and when no path could be built at all.
     pub attempted_transcript_path: Option<String>,
-    /// Why B was not used, in the user's own terms. `Some` exactly when `source` is `NeovibeCopy`.
+    /// Why B was not used, in the user's own terms. `Some` exactly when `source` is `EitriCopy`.
     pub fallback_reason: Option<String>,
     /// The CLI version that wrote the transcript, from the file itself. B only -- A has no such
     /// concept. **Not a schema version**; nothing branches on it.

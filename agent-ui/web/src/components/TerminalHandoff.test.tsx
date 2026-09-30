@@ -213,7 +213,7 @@ describe("HandoffCommandCard", () => {
 
   /* The resumed session is an ordinary `claude`, with none of the flags `agent` spawns its own
      with -- notably not the `PreToolUse` gate that produces this panel's permission cards. */
-  it("says the terminal session uses the user's own settings rather than Neovibe's gate", () => {
+  it("says the terminal session uses the user's own settings rather than Eitri's gate", () => {
     const { container } = render(<HandoffCommandCard handoff={HANDOFF} />);
     expect(container.textContent).toContain("your own Claude Code settings");
   });

@@ -1,4 +1,4 @@
-//! shell: the real neovibe product window -- custom chrome, the module grid (a layout that is data:
+//! shell: the real Eitri product window -- custom chrome, the module grid (a layout that is data:
 //! docs/superpowers/specs/2026-09-23-modules-and-canvas-design.md), the neovide-editor crate
 //! embedded as the real editor pane, and the real agent-ui panel (a WebView-hosted frontend bridged
 //! to a lazily-started `agent::AgentSession`). See
@@ -50,49 +50,48 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
-use lua::{LuaEngine, PanelSlot};
-use module_grid::{HostKind, ModuleGrid};
-use neovibe_core::keymap::{Action, SwapTarget, TabAction};
-use neovibe_core::layout::{
+use eitri_core::keymap::{Action, SwapTarget, TabAction};
+use eitri_core::layout::{
     Axis, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Reopen,
 };
+use lua::{LuaEngine, PanelSlot};
+use module_grid::{HostKind, ModuleGrid};
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
 use web_host::WebHost;
 
-const APP_ID: &str = "cn.huntergrey.neovibe";
+const APP_ID: &str = "cn.huntergrey.eitri";
 
 /// How long the top bar's app name shows the prefix indicator's block when a layout verb is refused
 /// (spec §3.2: "The refusal flashes the top bar, the same way the prefix indicator shows").
 const REFUSAL_FLASH: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// `NEOVIBE_CONFIG_DIR` overrides the config directory (used by sandboxed/manual verification
-/// runs so they don't touch a real `~/.config/neovibe`); otherwise the real per-user config dir.
+/// `EITRI_CONFIG_DIR` overrides the config directory (used by sandboxed/manual verification
+/// runs so they don't touch a real `~/.config/eitri`); otherwise the real per-user config dir.
 fn config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("NEOVIBE_CONFIG_DIR") {
+    if let Ok(dir) = std::env::var("EITRI_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var("HOME").expect("HOME must be set");
-    PathBuf::from(home).join(".config").join("neovibe")
+    PathBuf::from(home).join(".config").join("eitri")
 }
 
 fn main() -> glib::ExitCode {
     // Collected once, before anything else, and consulted through `flag_given` -- never a raw
     // `args_os().any(|a| a == "...")` -- by every early flag scan below (`--version`, `--legacy`,
     // `--clean`). `flag_given` stops at the first `--`, the same end-of-flags rule
-    // `neovibe_core::project_root::select_root_source` applies to the project-directory argument
+    // `eitri_core::project_root::select_root_source` applies to the project-directory argument
     // itself; before this, each scan ran its own ad-hoc `.any()` with no notion of `--` at all, so
     // `shell -- --version` printed the version line instead of opening a directory literally named
     // `--version`, and `shell -- --legacy` was refused on a release build instead of reaching the
     // directory step (v1-dist verdict #5). `args_os`, not `args`, and skipping argv[0] (never a
     // flag), for the same non-UTF-8-safety reason `project_root` gives for its own `args_os` use.
     let early_args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let has_flag =
-        |flag: &str| neovibe_core::project_root::flag_given(early_args.iter().map(OsString::as_os_str), flag);
+    let has_flag = |flag: &str| eitri_core::project_root::flag_given(early_args.iter().map(OsString::as_os_str), flag);
 
     // `--version` (v1-dist plan Task 1, spec §3), before anything else -- including the stdin
     // detach right below, which is otherwise the very first thing this binary does: printing a
     // version line must never touch GTK, a display, or nvim's stdin.
-    // `neovibe_core::project_root::KNOWN_FLAGS` also lists `--version`, so `shell --version
+    // `eitri_core::project_root::KNOWN_FLAGS` also lists `--version`, so `shell --version
     // /some/project` is never a startup failure even though `main()` never reaches `resolve()` on
     // this path -- see that module's own tests.
     if has_flag("--version") {
@@ -102,15 +101,15 @@ fn main() -> glib::ExitCode {
 
     // The backend this launch uses (v1-dist plan Task 5, spec §10, D10, D16), decided here -- before
     // any window exists, and before the stdin detach right below -- so `--legacy` (or
-    // `NEOVIBE_AGENT_BACKEND=legacy`) on a build that did not compile the legacy backend in (every
+    // `EITRI_AGENT_BACKEND=legacy`) on a build that did not compile the legacy backend in (every
     // release) exits with its reason and touches nothing else: no GTK, no display, no nvim stdin.
-    // `--legacy` joins `--clean` in `neovibe_core::project_root::KNOWN_FLAGS` for the same reason
+    // `--legacy` joins `--clean` in `eitri_core::project_root::KNOWN_FLAGS` for the same reason
     // `--clean` is there -- so a release still names the real reason rather than "unknown option".
     let legacy_flag = has_flag("--legacy");
-    let backend_kind = match neovibe_core::agent_backend::BackendKind::from_env(legacy_flag) {
+    let backend_kind = match eitri_core::agent_backend::BackendKind::from_env(legacy_flag) {
         Ok(kind) => kind,
         Err(err) => {
-            eprintln!("neovibe: {}", err.message);
+            eprintln!("eitri: {}", err.message);
             return glib::ExitCode::FAILURE;
         }
     };
@@ -132,26 +131,26 @@ fn main() -> glib::ExitCode {
     //
     // `args_os`, not `args`, throughout this function: `std::env::args()` panics on an argument
     // that is not valid UTF-8, and `shell <dir>` makes a path a supported argument -- see
-    // `neovibe_core::project_root`'s own module doc. A flag match is a byte-for-byte comparison
+    // `eitri_core::project_root`'s own module doc. A flag match is a byte-for-byte comparison
     // either way.
     //
-    // Every flag matched here must also appear in `neovibe_core::project_root`'s own (private)
+    // Every flag matched here must also appear in `eitri_core::project_root`'s own (private)
     // `KNOWN_FLAGS` list, which is the only place that can tell a flag from a project directory;
     // one missing from that list makes passing it a hard startup failure rather than a silently
     // wrong project root.
     let want_clean = has_flag("--clean");
 
     // Resolved once, here, and then carried as a value into every pane that needs it -- see
-    // `neovibe_core::project_root`'s own module doc for why three separate `current_dir()` reads
+    // `eitri_core::project_root`'s own module doc for why three separate `current_dir()` reads
     // were one process-global too many.
-    let project_root = match neovibe_core::project_root::resolve() {
+    let project_root = match eitri_core::project_root::resolve() {
         Ok(root) => root,
         Err(message) => {
-            eprintln!("neovibe: {message}");
+            eprintln!("eitri: {message}");
             return glib::ExitCode::FAILURE;
         }
     };
-    println!("neovibe: project root {}", project_root.display());
+    println!("eitri: project root {}", project_root.display());
 
     // Which nvim the forked Neovide runtime spawns (v1-dist plan Task 6, spec §7). Resolved and
     // acted on here -- before `build_application`/`app.run_with_args` bring up GTK's own threads,
@@ -160,11 +159,11 @@ fn main() -> glib::ExitCode {
     // *this* process's own environment: the pinned fork's `CmdLineSettings` reads `NEOVIM_BIN`
     // through clap's `env = "NEOVIM_BIN"` (`cmd_line.rs:229`) while `LiveHarness::with_options`
     // builds its settings, before any `child_env` map ever reaches a `Command` -- see
-    // `neovibe_core::nvim_bin`'s own module doc for the full reasoning, including why this is a
+    // `eitri_core::nvim_bin`'s own module doc for the full reasoning, including why this is a
     // deliberate, narrow exception to `pane_switch`'s "never mutate this process's environment"
     // rule (unlike `TMUX`/`TMUX_PANE`, leaking `NEOVIM_BIN` to every other child is harmless: only
     // Neovide reads it, and the bottom terminal's shell removes it itself).
-    match neovibe_core::nvim_bin::resolve() {
+    match eitri_core::nvim_bin::resolve() {
         Ok(choice) => {
             println!("{}", choice.describe());
             if let Some(path) = choice.neovim_bin_to_set() {
@@ -172,12 +171,12 @@ fn main() -> glib::ExitCode {
                 // environment. `resolve()`'s own version probe (if it ran one) never calls
                 // `.env`/`.env_clear` on the `Command` it spawns, so it never calls `getenv` and
                 // cannot race this `setenv` even if, past its own 2s deadline, it is still running
-                // in the background (see `neovibe_core::nvim_bin::version_of_binary`'s own doc).
-                unsafe { std::env::set_var(neovibe_core::nvim_bin::NEOVIM_BIN_ENV, path) };
+                // in the background (see `eitri_core::nvim_bin::version_of_binary`'s own doc).
+                unsafe { std::env::set_var(eitri_core::nvim_bin::NEOVIM_BIN_ENV, path) };
             }
         }
         Err(message) => {
-            eprintln!("neovibe: {message}");
+            eprintln!("eitri: {message}");
             return glib::ExitCode::FAILURE;
         }
     }
@@ -212,7 +211,7 @@ fn main() -> glib::ExitCode {
 /// ever designed to share. `shell` is a per-project window (its own nvim child, its own agent
 /// session, its own project root), so two launches must genuinely be two processes.
 ///
-/// `supervisor/src/bin/neovibe_supervisor.rs` solves the same collision the opposite way, with an
+/// `supervisor/src/bin/eitri_supervisor.rs` solves the same collision the opposite way, with an
 /// `app.windows().first()` guard that raises the existing window instead. That is right *there*
 /// and wrong here: exactly one dashboard is the supervisor's design, whereas a guard in `shell`
 /// would make `shell ~/other-project` silently raise the window for the project already open and
@@ -230,7 +229,7 @@ fn build_ui(
     app: &Application,
     want_clean: bool,
     project_root: &Path,
-    backend_kind: neovibe_core::agent_backend::BackendKind,
+    backend_kind: eitri_core::agent_backend::BackendKind,
     panel_notice: Option<&str>,
 ) {
     // Ruling S3 (D4, `docs/superpowers/plans/2026-09-27-v1-scale.md`): before anything else, so
@@ -238,7 +237,7 @@ fn build_ui(
     // it. See `xft_dpi`'s module doc.
     xft_dpi::ensure_xft_dpi();
     // Painted with the built-in fallback until the embedded nvim sends its first snapshot.
-    let theme_css = theme::gtk_css::ThemeCss::install(&neovibe_core::theme::ThemeTokens::fallback());
+    let theme_css = theme::gtk_css::ThemeCss::install(&eitri_core::theme::ThemeTokens::fallback());
     // Built before the editor pane for the same reason `pane_switch` is: its env and `--cmd` reach
     // nvim only at spawn. `None` (logged) leaves the window on the fallback colours.
     let mut theme_feed = theme::feed::ThemeFeed::new();
@@ -256,7 +255,7 @@ fn build_ui(
     // and Normal-mode maps, built here for the same reason the other three are -- its `child_env()`
     // and `--cmd` must reach the editor pane's constructor, which cannot be handed to an already
     // running child.
-    let mut nvim_keys_feed = neovibe_core::nvim_keys::feed::NvimKeysFeed::new();
+    let mut nvim_keys_feed = eitri_core::nvim_keys::feed::NvimKeysFeed::new();
     let mut nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
     nvim_child_env.extend(theme_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     nvim_child_env.extend(context_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
@@ -272,9 +271,9 @@ fn build_ui(
     // because the only reload trigger a normal Neovim config installs is `FocusGained`, and nothing
     // in this shell ever tells nvim it lost or gained focus. Without this a `git checkout`, a
     // formatter, or an edit made anywhere else never reaches the buffer.
-    nvim_extra_args.extend(neovibe_core::buffer_reload::nvim_args());
+    nvim_extra_args.extend(eitri_core::buffer_reload::nvim_args());
     // The two nvim round trips (phase 3 ruling 18): env and `--cmd` reach nvim only at spawn.
-    let scratch_dir = neovibe_core::scratch::ScratchDir::new();
+    let scratch_dir = eitri_core::scratch::ScratchDir::new();
     nvim_child_env.extend(scratch_dir.as_ref().map(|dir| dir.child_env()).unwrap_or_default());
     nvim_extra_args.extend(scratch_dir.as_ref().map(|dir| dir.nvim_args()).unwrap_or_default());
     let scratch_path = scratch_dir.as_ref().map(|dir| dir.path().to_path_buf());
@@ -313,9 +312,9 @@ fn build_ui(
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
     // Which local Claude account this window spends. Two sources, and the environment wins:
-    // `neovibe --account <name>` (and this host's own `VERDANDI_CLAUDE_ACCOUNT`, exported for
-    // Verdandi and inherited by every `neovibe` started from a terminal) arrives as that variable,
-    // and `init.lua`'s `neovibe.config.set("agent.account", "<name>")` is the per-machine default
+    // `eitri --account <name>` (and this host's own `VERDANDI_CLAUDE_ACCOUNT`, exported for
+    // Verdandi and inherited by every `eitri` started from a terminal) arrives as that variable,
+    // and `init.lua`'s `eitri.config.set("agent.account", "<name>")` is the per-machine default
     // underneath it -- which is what pins the account for a launch from the app menu, where no
     // shell configuration has run. Read here, once: this is the first point where `init.lua` has
     // run, and still before anything reads a transcript or starts a sidecar (the panel computes its
@@ -334,36 +333,36 @@ fn build_ui(
     // Out of range is a startup failure naming the key, the same discipline as `agent.account`
     // above: silently clamping a number someone typed is how a knob gets reported as broken.
     let panel_font_size = match lua_engine.config.borrow().get("agent.font_size").map(str::to_owned) {
-        None => neovibe_core::theme::DEFAULT_PANEL_FONT_SIZE_PX,
+        None => eitri_core::theme::DEFAULT_PANEL_FONT_SIZE_PX,
         Some(raw) => match raw.trim().parse::<f32>() {
-            Ok(px) if neovibe_core::theme::PANEL_FONT_SIZE_RANGE_PX.contains(&px) => {
+            Ok(px) if eitri_core::theme::PANEL_FONT_SIZE_RANGE_PX.contains(&px) => {
                 eprintln!("[panel] font size {px}px (init.lua's agent.font_size)");
                 px
             }
             Ok(px) => {
                 eprintln!(
-                    "neovibe: neovibe.config.set(\"agent.font_size\", {raw:?}): {px} is outside {:?}",
-                    neovibe_core::theme::PANEL_FONT_SIZE_RANGE_PX
+                    "eitri: eitri.config.set(\"agent.font_size\", {raw:?}): {px} is outside {:?}",
+                    eitri_core::theme::PANEL_FONT_SIZE_RANGE_PX
                 );
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!("neovibe: neovibe.config.set(\"agent.font_size\", {raw:?}): not a number ({e})");
+                eprintln!("eitri: eitri.config.set(\"agent.font_size\", {raw:?}): not a number ({e})");
                 std::process::exit(1);
             }
         },
     };
 
     // How often the agent panel's stream reaches its page while the user types in the editor
-    // (owner decision #37: an even cadence, not a hold; `neovibe_core::panel_cadence`). Unset is
+    // (owner decision #37: an even cadence, not a hold; `eitri_core::panel_cadence`). Unset is
     // `DEFAULT_CADENCE_HZ` (5) a second; `"off"` is today's full rate; anything else is a startup failure naming the key, like
     // `agent.font_size` above.
-    let typing_cadence = match neovibe_core::panel_cadence::parse_config(
-        lua_engine.config.borrow().get(neovibe_core::panel_cadence::CADENCE_KEY),
+    let typing_cadence = match eitri_core::panel_cadence::parse_config(
+        lua_engine.config.borrow().get(eitri_core::panel_cadence::CADENCE_KEY),
     ) {
         Ok(cadence) => cadence,
         Err(message) => {
-            eprintln!("neovibe: {message}");
+            eprintln!("eitri: {message}");
             std::process::exit(1);
         }
     };
@@ -376,15 +375,15 @@ fn build_ui(
     // What a card for a hidden chat does (modules P2, spec §3.3, decision b): the tray's chip and a
     // toast, or with `reveal` the chat itself. Anything but `badge`/`reveal` is a startup failure
     // naming the key, like `agent.font_size` above.
-    let on_permission = match neovibe_core::attention::ChatOnPermission::parse(
+    let on_permission = match eitri_core::attention::ChatOnPermission::parse(
         lua_engine
             .config
             .borrow()
-            .get(neovibe_core::attention::ChatOnPermission::KEY),
+            .get(eitri_core::attention::ChatOnPermission::KEY),
     ) {
         Ok(policy) => policy,
         Err(message) => {
-            eprintln!("neovibe: {message}");
+            eprintln!("eitri: {message}");
             std::process::exit(1);
         }
     };
@@ -407,13 +406,13 @@ fn build_ui(
         }
         Ok(None) => {}
         Err(err) => {
-            eprintln!("neovibe: the configured claude account is unusable: {err}");
+            eprintln!("eitri: the configured claude account is unusable: {err}");
             std::process::exit(1);
         }
     }
 
     // The keymap (keymap spec §2.3): stock tmux's defaults, prefix `Ctrl+b`, with `init.lua`'s
-    // `neovibe.keymap` calls applied. A bad key, an unknown action or option, or a collision is a
+    // `eitri.keymap` calls applied. A bad key, an unknown action or option, or a collision is a
     // startup failure naming both sides, as `agent.font_size` is -- never a keymap nobody wrote.
     let lua_panel_ids: Vec<String> = lua_engine
         .panels
@@ -422,18 +421,18 @@ fn build_ui(
         .iter()
         .map(|e| e.id.clone())
         .collect();
-    let keymap = match neovibe_core::keymap::Keymap::apply_user(lua_engine.keymap.borrow().ops(), &lua_panel_ids) {
+    let keymap = match eitri_core::keymap::Keymap::apply_user(lua_engine.keymap.borrow().ops(), &lua_panel_ids) {
         Ok(keymap) => Rc::new(keymap),
         Err(err) => {
-            eprintln!("neovibe: {err}");
+            eprintln!("eitri: {err}");
             std::process::exit(1);
         }
     };
     // Collision rule 4: a Lua command's accelerator that is the prefix or a root chord would never fire.
     for (id, entry) in lua_engine.commands.borrow().iter() {
         if let Some(keybinding) = &entry.keybinding {
-            if let Err(err) = neovibe_core::keymap::check_command_keybinding(id, keybinding, &keymap) {
-                eprintln!("neovibe: {err}");
+            if let Err(err) = eitri_core::keymap::check_command_keybinding(id, keybinding, &keymap) {
+                eprintln!("eitri: {err}");
                 std::process::exit(1);
             }
         }
@@ -513,7 +512,7 @@ fn build_ui(
     let module_keys = match ModuleKeys::build(&lua_keys, &keymap) {
         Ok(keys) => Rc::new(keys),
         Err(err) => {
-            eprintln!("neovibe: {err}");
+            eprintln!("eitri: {err}");
             std::process::exit(1);
         }
     };
@@ -533,8 +532,8 @@ fn build_ui(
     // that leaves the merged table unchanged costs no dispatch and no repeated log line.
     let latest: Rc<
         RefCell<(
-            Option<neovibe_core::nvim_keys::NvimReport>,
-            Option<neovibe_core::keymap::PanelKeymap>,
+            Option<eitri_core::nvim_keys::NvimReport>,
+            Option<eitri_core::keymap::PanelKeymap>,
         )>,
     > = Rc::new(RefCell::new((None, None)));
     let send_keymap: Rc<dyn Fn()> = {
@@ -546,14 +545,14 @@ fn build_ui(
         Rc::new(move || {
             let mut latest_ref = latest.borrow_mut();
             let report = latest_ref.0.clone();
-            let (panel_keymap, log) = neovibe_core::keymap::panel::effective(keymap.panel_user(), report.as_ref());
+            let (panel_keymap, log) = eitri_core::keymap::panel::effective(keymap.panel_user(), report.as_ref());
             for line in log {
                 println!("{line}");
             }
             if latest_ref.1.as_ref() != Some(&panel_keymap) {
-                agent_panel_handle.set_keymap_help(neovibe_core::agent_bridge::serialize_keymap_for_js(
+                agent_panel_handle.set_keymap_help(eitri_core::agent_bridge::serialize_keymap_for_js(
                     &keymap.prefix().human(),
-                    &neovibe_core::keymap::root::help_rows(),
+                    &eitri_core::keymap::root::help_rows(),
                     &keymap.help(&module_keys),
                     &panel_keymap,
                     &new_tab_chord,
@@ -572,24 +571,24 @@ fn build_ui(
         });
     }
     // The layout this window opens with (modules P2, spec §4.4, §4.6): this project's state file if
-    // it can be used, else `init.lua`'s `neovibe.layout.default`, else the first launch. A malformed
+    // it can be used, else `init.lua`'s `eitri.layout.default`, else the first launch. A malformed
     // default is a startup failure naming the call; a state file that cannot be used is not, since it
     // is state rather than config -- it is logged and the default opens.
     let lua_default = match lua_engine.layout.borrow().default_tree().cloned() {
         Some(Ok(tree)) => Some(tree),
         Some(Err(message)) => {
-            eprintln!("neovibe: {message}");
+            eprintln!("eitri: {message}");
             std::process::exit(1);
         }
         None => None,
     };
-    let state_dir = neovibe_core::layout::persist::state_dir(
+    let state_dir = eitri_core::layout::persist::state_dir(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     );
     let loaded = state_dir
         .as_deref()
-        .map(|dir| neovibe_core::layout::persist::load(dir, project_root, &decls));
+        .map(|dir| eitri_core::layout::persist::load(dir, project_root, &decls));
     // The key that shows the editor, as the keymap binds it: named by the note a layout that hides
     // the editor prints, the way the toast names its own way back.
     let show_editor: Option<String> = keymap
@@ -605,7 +604,7 @@ fn build_ui(
                 Rc::new(RefCell::new(layout))
             }
             Err(message) => {
-                eprintln!("neovibe: {message}");
+                eprintln!("eitri: {message}");
                 std::process::exit(1);
             }
         };
@@ -650,7 +649,7 @@ fn build_ui(
         grid.add(id.clone(), &WebHost::new(widget), widget, web_host);
     }
     // The terminal's shell starts the first time it is shown, however it got there -- `Ctrl+a t`,
-    // `Ctrl+a \ t`, its tray chip, `neovibe.layout.show`, a saved layout -- rather than only on the
+    // `Ctrl+a \ t`, its tray chip, `eitri.layout.show`, a saved layout -- rather than only on the
     // `Ctrl+a t` path. `start` does nothing once a shell is running or has exited.
     {
         let module_layout = module_layout.clone();
@@ -721,7 +720,7 @@ fn build_ui(
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("neovibe")
+        .title("Eitri")
         .default_width(1280)
         .default_height(760)
         // No HeaderBar: decorated(false) suppresses GTK's own CSD titlebar entirely -- the
@@ -744,7 +743,7 @@ fn build_ui(
     // outside the rect the renderer paints. Left at that crate's default it is a near-black line
     // under the top bar -- the same defect the `CONTENT_MARGIN` removal fixed -- so it follows
     // `bg`, and is then the same colour as the first text row below it.
-    let editor_clear = |tokens: &neovibe_core::theme::ThemeTokens| {
+    let editor_clear = |tokens: &eitri_core::theme::ThemeTokens| {
         let bg = tokens.bg;
         (bg.r, bg.g, bg.b)
     };
@@ -769,10 +768,10 @@ fn build_ui(
     let panel_tokens = {
         let panel_px = panel_px.clone();
         let editor_row = editor_row.clone();
-        move |payload: Option<&neovibe_core::theme::payload::NvimThemePayload>| {
+        move |payload: Option<&eitri_core::theme::payload::NvimThemePayload>| {
             let mut tokens = match payload {
-                Some(p) => neovibe_core::theme::ThemeTokens::derive(p),
-                None => neovibe_core::theme::ThemeTokens::fallback(),
+                Some(p) => eitri_core::theme::ThemeTokens::derive(p),
+                None => eitri_core::theme::ThemeTokens::fallback(),
             };
             tokens.font_size_px = text_size::live_panel_font_size_px(&panel_px);
             // known limit (item 3g, 2026-09-23): `live_panel_font_size_px` is unit-tested in
@@ -785,8 +784,8 @@ fn build_ui(
         }
     };
     agent_panel_handle.set_theme(&panel_tokens(None));
-    pane.set_clear_color(editor_clear(&neovibe_core::theme::ThemeTokens::fallback()));
-    terminal.set_colors(terminal::colors_from(&neovibe_core::theme::ThemeTokens::fallback()));
+    pane.set_clear_color(editor_clear(&eitri_core::theme::ThemeTokens::fallback()));
+    terminal.set_colors(terminal::colors_from(&eitri_core::theme::ThemeTokens::fallback()));
     // Wave 4, R5: the moment the editor reports a cell height (or it changes -- a colorscheme's
     // `guifont`, a zoom), record it for `panel_tokens` (so a later colorscheme change keeps it) and
     // push it into the panel's live theme the same way `text_size_controller` pushes a font-size
@@ -831,7 +830,7 @@ fn build_ui(
         let pane_for_theme = pane.clone();
         let terminal = terminal.clone();
         theme::feed::listen(feed, move |payload| {
-            let tokens = neovibe_core::theme::ThemeTokens::derive(&payload);
+            let tokens = eitri_core::theme::ThemeTokens::derive(&payload);
             println!(
                 "[theme] following nvim colorscheme {:?} (background={})",
                 payload.options.colors_name, payload.options.background
@@ -937,9 +936,9 @@ fn build_ui(
     // The module that held the keys before the one holding them now: `prefix ;`'s target (tmux's
     // `last-pane`). Real history, fed by the same owner reports that write the layout's `focus`
     // below: the layout's own MRU list starts in tree order, so its second entry can name a module
-    // nobody visited (`neovibe_core::layout::FocusHistory`). The tracker below and the prefix each
+    // nobody visited (`eitri_core::layout::FocusHistory`). The tracker below and the prefix each
     // hold a clone.
-    let focus_history = Rc::new(RefCell::new(neovibe_core::layout::FocusHistory::default()));
+    let focus_history = Rc::new(RefCell::new(eitri_core::layout::FocusHistory::default()));
 
     // Which module has the keys. One tracker drives the editor's cursor (solid, or not drawn,
     // via Neovide itself) and the agent panel's cursor and mode block, so they cannot disagree. See
@@ -1051,8 +1050,8 @@ fn build_ui(
         // already dropped, so this is safe and never re-enters a held `RefCell`.
         let agent_panel_handle_for_toast = agent_panel_handle.clone();
         agent_panel_handle.on_attention(move |before, after| {
-            let place = neovibe_core::layout::agent_place(&module_layout.borrow());
-            let reaction = neovibe_core::attention::react(on_permission, before, after, place);
+            let place = eitri_core::layout::agent_place(&module_layout.borrow());
+            let reaction = eitri_core::attention::react(on_permission, before, after, place);
             println!("[attention] agent {after:?} ({place:?}) -> {reaction:?}");
             tray.refresh(&module_layout.borrow(), after);
             if reaction.reveal {
@@ -1074,12 +1073,12 @@ fn build_ui(
     }
     // The three ways a verb brings a module to the user, each written once and shared by every route
     // that does it -- `Ctrl+a <key>` and its tray chip (`open_module` below), `Ctrl+a \`/`"`, and
-    // `neovibe.layout.*` -- so a change to one reaches them all (the whole-branch review's finding 7:
+    // `eitri.layout.*` -- so a change to one reaches them all (the whole-branch review's finding 7:
     // three inlined copies had grown). Each returns the layout's refusal for its caller to report:
     // the prefix and a chip flash the app name, a Lua call logs it.
     //
     // A zoom ends only when it would keep the module off screen (`Layout::zoom_hides`): `Ctrl+a a`,
-    // a chip, or `neovibe.layout.focus` onto the zoomed chat itself leaves it zoomed, as tmux's
+    // a chip, or `eitri.layout.focus` onto the zoomed chat itself leaves it zoomed, as tmux's
     // `select-pane` onto the zoomed pane does (the whole-branch review's finding 3).
     //
     // `focus_and_arrive`: gives `id` the keys and arrives (`arrive`). Refused before anything moves
@@ -1106,7 +1105,7 @@ fn build_ui(
         })
     };
     // `show_on_screen`: shows `id` where it was hidden from, the keys staying where they are
-    // (`neovibe.layout.show`, and the first half of `Ctrl+a <key>` on a hidden module). A zoom that
+    // (`eitri.layout.show`, and the first half of `Ctrl+a <key>` on a hidden module). A zoom that
     // would keep it off screen ends first, as `Ctrl+a e`/`a` have always ended it: a module shown is a
     // module on screen (Task 12's review, minor 2 -- `show` used to log success and leave it behind
     // the zoom).
@@ -1160,7 +1159,7 @@ fn build_ui(
     }
     // `place_and_arrive`: `id` into a new split after the module with the keys, along `axis`, moved
     // there if it is elsewhere, and the keys to it (`Ctrl+a \`/`"` + a key, `Ctrl+a <key>` for a
-    // module never placed, `neovibe.layout.split`).
+    // module never placed, `eitri.layout.split`).
     let place_and_arrive: Rc<dyn Fn(&ModuleId, Axis) -> Result<(), LayoutError>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
@@ -1176,7 +1175,7 @@ fn build_ui(
         })
     };
 
-    // `Ctrl+a <key>`'s four cases for a module (modules spec §4.3, `neovibe_core::layout::key_action`),
+    // `Ctrl+a <key>`'s four cases for a module (modules spec §4.3, `eitri_core::layout::key_action`),
     // for the prefix and the tray's chips; a refusal flashes the app name (spec §3.2).
     let open_module: Rc<dyn Fn(&ModuleId, KeyAction)> = {
         let grid = grid.clone();
@@ -1255,7 +1254,7 @@ fn build_ui(
         let killed = killed.clone();
         let editor_quitting = editor_quitting.clone();
         Rc::new(move |id, confirmed| {
-            let scope = neovibe_core::layout::can_kill(&module_layout.borrow(), id).map_err(|e| e.to_string())?;
+            let scope = eitri_core::layout::can_kill(&module_layout.borrow(), id).map_err(|e| e.to_string())?;
             if scope == KillScope::Window {
                 if id.kind() == ModuleKind::Editor {
                     // nvim first, as for any kill of the editor: its exit closes the window.
@@ -1301,7 +1300,7 @@ fn build_ui(
         })
     };
     // A killed module shown again, however it got there -- its key, its tray chip,
-    // `neovibe.layout.show`, a split key -- comes back fresh: the chat opens its session chooser, a
+    // `eitri.layout.show`, a split key -- comes back fresh: the chat opens its session chooser, a
     // Lua panel loads its page again. (The terminal's shell starts through the hook above, which
     // starts one whenever it is shown and none runs.)
     {
@@ -1348,7 +1347,7 @@ fn build_ui(
     // The shell ending by itself -- `exit`, `Ctrl+d`, a signal -- closes the terminal as `prefix x`
     // does, without asking (owner, 2026-09-26: "底下终端exit应该是直接关闭terminal窗口";
     // `terminal::closes_on_exit` says which ends). As the last module on screen, tmux's own rule
-    // (closing the last pane closes the window) applies instead: `neovibe_core::layout::can_kill`
+    // (closing the last pane closes the window) applies instead: `eitri_core::layout::can_kill`
     // says which (`terminal::on_exit`), and a `Window` scope closes the window through its own
     // ordinary path -- `close window? N running (y/n)` when a tab runs -- rather than the module,
     // leaving the terminal's notice on screen until the window really goes.
@@ -1361,7 +1360,7 @@ fn build_ui(
         terminal.on_shell_exit(move || {
             let Some(grid) = grid.upgrade() else { return false };
             let id = ModuleId::terminal();
-            let scope = match neovibe_core::layout::can_kill(&module_layout.borrow(), &id) {
+            let scope = match eitri_core::layout::can_kill(&module_layout.borrow(), &id) {
                 Ok(scope) => scope,
                 Err(err) => {
                     println!("[terminal] the shell ended, and the terminal stays: {err}");
@@ -1370,7 +1369,7 @@ fn build_ui(
             };
             match terminal::on_exit(scope) {
                 terminal::OnExit::CloseWindow => {
-                    println!("[terminal] the shell ended; the last module on screen closes neovibe");
+                    println!("[terminal] the shell ended; the last module on screen closes Eitri");
                     window.close();
                     false
                 }
@@ -1395,7 +1394,7 @@ fn build_ui(
         let open_module = open_module.clone();
         let module_layout = module_layout.clone();
         tray.on_activate(move |id| {
-            let action = neovibe_core::layout::key_action(&module_layout.borrow(), id, false);
+            let action = eitri_core::layout::key_action(&module_layout.borrow(), id, false);
             open_module(id, action);
         });
     }
@@ -1539,7 +1538,7 @@ fn build_ui(
             // A switch from elsewhere shows a hidden chat where it was, keys unmoved;
             // under a zoom only the tray chip changes (spec §3.4).
             if !plan.takes_the_keys
-                && neovibe_core::tabs::reveal_on_switch(neovibe_core::layout::agent_place(&module_layout.borrow()))
+                && eitri_core::tabs::reveal_on_switch(eitri_core::layout::agent_place(&module_layout.borrow()))
             {
                 if let Err(err) = grid.show_module(&chat) {
                     eprintln!("[tabs] could not reveal the chat: {err}");
@@ -1635,7 +1634,7 @@ fn build_ui(
                     Action::SelectNext => {
                         let next = {
                             let layout = module_layout.borrow();
-                            neovibe_core::layout::next_on_screen(&layout, layout.focus())
+                            eitri_core::layout::next_on_screen(&layout, layout.focus())
                         };
                         match next {
                             Some(id) => {
@@ -1697,13 +1696,13 @@ fn build_ui(
                             return;
                         }
                         let has_keys = focused().as_ref() == Some(&id);
-                        let action = neovibe_core::layout::key_action(&module_layout.borrow(), &id, has_keys);
+                        let action = eitri_core::layout::key_action(&module_layout.borrow(), &id, has_keys);
                         open_module(&id, action);
                     }
                     Action::ModuleHide => open_module(&target(), KeyAction::Hide),
                     Action::ModuleKill => {
                         let id = target();
-                        let scope = match neovibe_core::layout::can_kill(&module_layout.borrow(), &id) {
+                        let scope = match eitri_core::layout::can_kill(&module_layout.borrow(), &id) {
                             Ok(scope) => scope,
                             Err(err) => {
                                 refuse(&refused_name, &toast, &err);
@@ -1713,7 +1712,7 @@ fn build_ui(
                         let (running, queued) = (agent.running_count(), agent.queued_count());
                         let text = kill_pane::prompt(&id, &kill_title(&id), scope, running, queued);
                         // What `y` also answers for the window close, if this kill closes it.
-                        let confirmed = neovibe_core::tabs::window_close_prompt(running, queued);
+                        let confirmed = eitri_core::tabs::window_close_prompt(running, queued);
                         let Some(prompt) = kill_prompt.get() else {
                             return;
                         };
@@ -1790,9 +1789,9 @@ fn build_ui(
                     // (ruling 8).
                     let entries = match waiting {
                         prefix::Waiting::Command => {
-                            neovibe_core::layout::strip_direct(&strip_keys, &strip_keymap, &layout)
+                            eitri_core::layout::strip_direct(&strip_keys, &strip_keymap, &layout)
                         }
-                        _ => neovibe_core::layout::strip(&strip_keys, &layout),
+                        _ => eitri_core::layout::strip(&strip_keys, &layout),
                     };
                     prefix_strip::strip_pieces(
                         waiting,
@@ -1883,8 +1882,8 @@ fn build_ui(
                     return false;
                 }
                 let direction = match direction {
-                    Direction::Down => neovibe_core::agent_bridge::NavKeyDirection::Down,
-                    Direction::Up => neovibe_core::agent_bridge::NavKeyDirection::Up,
+                    Direction::Down => eitri_core::agent_bridge::NavKeyDirection::Down,
+                    Direction::Up => eitri_core::agent_bridge::NavKeyDirection::Up,
                     Direction::Left | Direction::Right => {
                         unreachable!("claims() only claims Down (in Browse) or Up (in Input)")
                     }
@@ -1903,7 +1902,7 @@ fn build_ui(
         }
     }
 
-    // --- Ctrl+h/j/k/l in the terminal: neovibe's, always (owner, 2026-09-23: "neovibe的按键优先").
+    // --- Ctrl+h/j/k/l in the terminal: Eitri's, always (owner, 2026-09-23: "neovibe的按键优先").
     // Capture phase on its own widget, like the web modules' controllers above, so the chord is
     // claimed before the terminal's key controller hands it to the shell. Unlike theirs, all four
     // are swallowed even with no module that way, so what the shell receives never depends on the
@@ -2038,7 +2037,7 @@ fn build_ui(
         });
     }
 
-    // `neovibe.layout.show/hide/focus/split` from a command or an event handler (modules P2, spec
+    // `eitri.layout.show/hide/focus/split` from a command or an event handler (modules P2, spec
     // §4.5): queued by the Lua half while the handler runs, carried out here once it returns, so no
     // layout change happens under a Lua call. Each refusal is logged, as a handler's own error is.
     let apply_layout_requests: Rc<dyn Fn()> = {
@@ -2051,7 +2050,7 @@ fn build_ui(
         Rc::new(move || {
             let requests = lua_engine.layout.borrow_mut().take_requests();
             for request in requests {
-                use neovibe_core::lua::layout::LayoutRequest;
+                use eitri_core::lua::layout::LayoutRequest;
                 println!("[lua] layout: {request:?}");
                 // The same three helpers `Ctrl+a` uses, so the two cannot drift apart.
                 let result = match &request {
@@ -2111,12 +2110,12 @@ fn build_ui(
 
     // The one real v1 event: fires once the window is actually up, so any Lua handler reacting
     // to it sees a fully-built shell (panels registered, commands bound, window shown).
-    // `neovibe.layout.show` and the rest work from here on, `shell:ready` handlers included.
+    // `eitri.layout.show` and the rest work from here on, `shell:ready` handlers included.
     lua_engine.layout.borrow_mut().accept_requests();
     lua_engine.emit("shell:ready");
     apply_layout_requests();
 
-    // Polls for a cross-window "come to the front" request from `neovibe-supervisor` -- e.g. the
+    // Polls for a cross-window "come to the front" request from `eitri-supervisor` -- e.g. the
     // dashboard's own UI, or another shell instance, asking this window to raise itself. Cloning
     // `agent_panel_handle` here (rather than after) is load-bearing: the `connect_close_request`
     // closure below takes ownership of the original `agent_panel_handle` by move, so anything
@@ -2247,7 +2246,7 @@ fn flash(app_name: &gtk4::Label) {
 /// editor's quit flow no test reaches (`editor_quit`'s module doc; the GUI checklist covers it).
 struct ShellQuitHost {
     pane: Rc<NeovideEditorPane>,
-    module_layout: Rc<RefCell<neovibe_core::layout::Layout>>,
+    module_layout: Rc<RefCell<eitri_core::layout::Layout>>,
     grid: glib::WeakRef<ModuleGrid>,
     show_on_screen: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>>,
     focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
@@ -2317,7 +2316,7 @@ impl editor_quit::QuitHost for ShellQuitHost {
         self.prompt.get().is_some_and(|prompt| prompt.confirmed())
     }
     fn window_close_prompt(&self) -> Option<String> {
-        neovibe_core::tabs::window_close_prompt(self.agent.running_count(), self.agent.queued_count())
+        eitri_core::tabs::window_close_prompt(self.agent.running_count(), self.agent.queued_count())
     }
     fn ask_to_close_window(&self, text: &str) {
         match self.prompt.get() {
@@ -2388,8 +2387,8 @@ fn refuse(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, err: &LayoutError) {
 /// claimed for the composer -- every other combination goes to `move_focus` exactly as before. Pure
 /// so the full table is a unit test with no display; `install_module_nav`'s agent-only `intercept`
 /// closure is the only caller.
-fn claims(mirror: neovibe_core::agent_bridge::PanelKeys, dir: Direction) -> bool {
-    use neovibe_core::agent_bridge::PanelKeys;
+fn claims(mirror: eitri_core::agent_bridge::PanelKeys, dir: Direction) -> bool {
+    use eitri_core::agent_bridge::PanelKeys;
     matches!(
         (dir, mirror),
         (Direction::Down, PanelKeys::Browse) | (Direction::Up, PanelKeys::Input)
@@ -2562,7 +2561,7 @@ mod tests {
         found
     }
 
-    /// Spec §2.9: every accelerator is registered from `neovibe_core::keymap::root`, so an
+    /// Spec §2.9: every accelerator is registered from `eitri_core::keymap::root`, so an
     /// accelerator-shaped literal anywhere in `shell/src` is one registered around the keymap --
     /// and one the no-`Ctrl+Shift` check in core never saw. `is_accel` is exercised directly, so
     /// this cannot pass because the scanner went blind.
@@ -2583,7 +2582,7 @@ mod tests {
         assert_eq!(
             found_accelerators(),
             Vec::<(String, String)>::new(),
-            "register it through neovibe_core::keymap::root instead"
+            "register it through eitri_core::keymap::root instead"
         );
     }
 
@@ -2601,12 +2600,12 @@ mod tests {
         );
     }
 
-    /// The overlay's "Anywhere in the window" rows come from `neovibe_core::keymap::root`, and its
+    /// The overlay's "Anywhere in the window" rows come from `eitri_core::keymap::root`, and its
     /// `Ctrl+j` row exists only because of the terminal: every chord the terminal gives up to
-    /// neovibe (`terminal::navigation`, asked about each letter) must be named there.
+    /// Eitri (`terminal::navigation`, asked about each letter) must be named there.
     #[test]
     fn every_chord_the_terminal_gives_up_is_in_the_root_help() {
-        let documented: std::collections::HashSet<String> = neovibe_core::keymap::root::help_rows()
+        let documented: std::collections::HashSet<String> = eitri_core::keymap::root::help_rows()
             .into_iter()
             .flat_map(|row| row.keys.split(" / ").map(str::to_string).collect::<Vec<_>>())
             .collect();
@@ -2629,7 +2628,7 @@ mod tests {
     /// and every other combination, which must fall through to `move_focus` unclaimed.
     #[test]
     fn claims_only_down_in_browse_and_up_in_input() {
-        use neovibe_core::agent_bridge::PanelKeys;
+        use eitri_core::agent_bridge::PanelKeys;
         for dir in [Direction::Left, Direction::Down, Direction::Up, Direction::Right] {
             for mirror in [PanelKeys::Browse, PanelKeys::Input, PanelKeys::Other] {
                 let expected = matches!(
@@ -2650,7 +2649,7 @@ mod tests {
         assert_eq!(
             gone_editor_toast_text(&LayoutError::Gone(ModuleId::editor())),
             Some(
-                "nvim exited and cannot restart in this window \u{2014} relaunch neovibe to get the editor back"
+                "nvim exited and cannot restart in this window \u{2014} relaunch Eitri to get the editor back"
                     .to_string()
             )
         );

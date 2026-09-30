@@ -1,12 +1,12 @@
 #!/bin/sh
-# Builds and installs neovibe from THIS checkout, exactly as it is on disk right now (uncommitted
-# changes included) -- the development loop for working on neovibe itself; a release is installed
+# Builds and installs Eitri from THIS checkout, exactly as it is on disk right now (uncommitted
+# changes included) -- the development loop for working on Eitri itself; a release is installed
 # with packaging/install.sh (the same script a release publishes as install.sh) instead. This is a
 # thin wrapper over `packaging/install.sh --from-source --checkout`, not a
 # second implementation: this repo used to carry its own separate build-and-install script here, and
 # it drifted from packaging/install.sh's own checks and defaults more than once (different binary
 # lists, different sidecar-artifact detection, no signature/checksum discipline at all). One
-# installer that everyone -- a stranger running `curl | sh`, `neovibe setup`, and this repo's own
+# installer that everyone -- a stranger running `curl | sh`, `eitri setup`, and this repo's own
 # owner -- goes through is what keeps that from happening again.
 #
 #   ./install.sh                          build and install this checkout
@@ -21,7 +21,7 @@
 # There is deliberately no default Verdandi checkout here (the old script's own default, a path
 # under the original developer's home directory, is gone): a stranger cloning this repository has no
 # such directory, and packaging/install.sh's own --checkout path already falls back to the pinned public
-# Verdandi source when NEOVIBE_VERDANDI_CHECKOUT names nothing -- silently trying a path that only
+# Verdandi source when EITRI_VERDANDI_CHECKOUT names nothing -- silently trying a path that only
 # exists on the owner's own machine would be the wrong default for everyone else. When it IS set,
 # it is passed through explicitly (an `if`, never a `:-` default), so this script's behaviour never
 # depends on which shell happens to have it exported.
@@ -41,9 +41,9 @@ for _nv_a in "$@"; do
 	case $_nv_a in
 	-h | --help)
 		cat <<'EOF'
-./install.sh is for working on neovibe itself.
+./install.sh is for working on Eitri itself.
 With no option, it builds and installs this checkout from source, as it is on disk now
-(packaging/install.sh --from-source --checkout <this checkout>). NEOVIBE_VERDANDI_CHECKOUT, when
+(packaging/install.sh --from-source --checkout <this checkout>). EITRI_VERDANDI_CHECKOUT, when
 set, names a local Verdandi checkout to build the sidecar from. With one of packaging/install.sh's
 other modes (--uninstall, --nvim-only, --nvim-offer, --sidecar-only, --build-sidecar-into), it runs
 packaging/install.sh with that mode instead.
@@ -59,8 +59,8 @@ EOF
 		;;
 	esac
 done
-if [ -n "${NEOVIBE_VERDANDI_CHECKOUT:-}" ]; then
+if [ -n "${EITRI_VERDANDI_CHECKOUT:-}" ]; then
 	exec sh "$here/packaging/install.sh" --from-source --checkout "$here" \
-		--verdandi-checkout "$NEOVIBE_VERDANDI_CHECKOUT" "$@"
+		--verdandi-checkout "$EITRI_VERDANDI_CHECKOUT" "$@"
 fi
 exec sh "$here/packaging/install.sh" --from-source --checkout "$here" "$@"

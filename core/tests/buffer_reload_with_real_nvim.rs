@@ -7,9 +7,9 @@
 //! actually fires, and both of the mistakes those tests describe (a fast-event `vim.cmd`, a
 //! collected handle) fail at RUNTIME and only sometimes. So this runs it.
 //!
-//! Run: `cargo test -p neovibe-core --test buffer_reload_with_real_nvim -- --ignored`
+//! Run: `cargo test -p eitri-core --test buffer_reload_with_real_nvim -- --ignored`
 
-use neovibe_core::buffer_reload::{nvim_args, RELOAD_INTERVAL_MS};
+use eitri_core::buffer_reload::{nvim_args, RELOAD_INTERVAL_MS};
 
 /// Edits `file`, rewrites it on disk from inside nvim, waits out one timer period, and returns what
 /// the buffer holds afterwards.
@@ -25,7 +25,7 @@ fn buffer_after_a_disk_change(extra_args: &[String], modify_buffer_first: bool) 
     let mut command = std::process::Command::new("nvim");
     // `--clean`: the user's own config is irrelevant here and, on this machine, actively misleading
     // -- LazyVim installs a `checktime` autocommand of its own, on `FocusGained`, which cannot fire
-    // in neovibe but CAN fire in some other harness and would make this pass for the wrong reason.
+    // in Eitri but CAN fire in some other harness and would make this pass for the wrong reason.
     command.arg("--headless").arg("--clean");
     for arg in extra_args {
         command.arg(arg);

@@ -1,4 +1,4 @@
-//! `neovibe.panel.register({ id, title, position, content })` -- registers a plugin panel.
+//! `eitri.panel.register({ id, title, position, content })` -- registers a plugin panel.
 //! `content` must be `{ type = "webview", url = "..." }` in v1 (see the spec's "Panel content
 //! model" section); this is validated here, not left to fail confusingly deep in GTK code.
 //!
@@ -10,13 +10,13 @@
 //! leaf of one layout" -- `main.rs` turns this registry into `ModuleDecl`s.
 //!
 //! The pure parts -- `PanelSlot`, `ParsedPanelSpec`, `parse_panel_spec`, `resolve_panel_url` --
-//! moved to `neovibe_core::lua::panel` (L2 T4): no GTK/WebKit touched there. What stays here is
+//! moved to `eitri_core::lua::panel` (L2 T4): no GTK/WebKit touched there. What stays here is
 //! only what actually needs a display: `PanelEntry` (holds a `gtk4::Widget`) and `install`
 //! (builds a real `webkit6::WebView`).
 
+use eitri_core::lua::panel::{parse_panel_spec, resolve_panel_url, PanelSlot};
 use gtk4::prelude::*;
 use mlua::{Lua, Table};
-use neovibe_core::lua::panel::{parse_panel_spec, resolve_panel_url, PanelSlot};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -82,7 +82,7 @@ impl<W> PanelRegistry<W> {
 
 pub(crate) fn install(
     lua: &Lua,
-    neovibe: &Table,
+    eitri: &Table,
     registry: Rc<RefCell<PanelRegistry>>,
     config_dir: PathBuf,
 ) -> mlua::Result<()> {
@@ -126,7 +126,7 @@ pub(crate) fn install(
         Ok(())
     })?;
     panel_table.set("register", register_fn)?;
-    neovibe.set("panel", panel_table)?;
+    eitri.set("panel", panel_table)?;
     Ok(())
 }
 

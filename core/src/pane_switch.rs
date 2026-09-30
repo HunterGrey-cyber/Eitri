@@ -119,7 +119,7 @@ pub(crate) const NAV_FALLBACK_LUA: &str = include_str!("nav_fallback.lua");
 /// `dofile`, because `dofile(nil)` reads stdin -- under `--embed`, the RPC pipe -- and the load is
 /// `pcall`ed, so a broken snippet costs the fallback, never the editor.
 pub(crate) const NAV_LOADER_CMD: &str =
-    "lua local p = vim.env.NEOVIBE_NAV_LUA; if p and p ~= '' then pcall(dofile, p) end";
+    "lua local p = vim.env.EITRI_NAV_LUA; if p and p ~= '' then pcall(dofile, p) end";
 
 /// A live pane-switch channel: a private directory holding the fake-`tmux` symlink, the Unix
 /// socket and the nav fallback's snippet, plus the bound listener.
@@ -135,7 +135,7 @@ pub struct PaneSwitchChannel {
     dir: PathBuf,
     socket_path: PathBuf,
     /// `None` when the snippet could not be written: the channel still serves the shim, and nvim
-    /// simply gets no fallback (neither `NEOVIBE_NAV_LUA` nor the loader).
+    /// simply gets no fallback (neither `EITRI_NAV_LUA` nor the loader).
     nav_lua: Option<PathBuf>,
     listener: Option<UnixListener>,
 }
@@ -254,7 +254,7 @@ impl PaneSwitchChannel {
     /// part is load-bearing (that substring is what the plugin's `s:TmuxOrTmateExecutable` tests
     /// to decide whether to invoke `tmate` instead of `tmux`).
     ///
-    /// `NEOVIBE_NAV_LUA` names the nav fallback's snippet, which [`Self::nvim_args`]'s loader runs;
+    /// `EITRI_NAV_LUA` names the nav fallback's snippet, which [`Self::nvim_args`]'s loader runs;
     /// it is absent when the snippet could not be written, and the loader is then a no-op.
     pub fn child_env(&self) -> Vec<(String, String)> {
         let bin_dir = self.dir.join("bin");
@@ -270,12 +270,12 @@ impl PaneSwitchChannel {
             ("TMUX_PANE".to_string(), "%0".to_string()),
             ("PATH".to_string(), path),
             (
-                "NEOVIBE_PANE_SWITCH_SOCKET".to_string(),
+                "EITRI_PANE_SWITCH_SOCKET".to_string(),
                 self.socket_path.display().to_string(),
             ),
         ];
         if let Some(nav_lua) = &self.nav_lua {
-            env.push(("NEOVIBE_NAV_LUA".to_string(), nav_lua.display().to_string()));
+            env.push(("EITRI_NAV_LUA".to_string(), nav_lua.display().to_string()));
         }
         env
     }
@@ -314,7 +314,7 @@ impl PaneSwitchChannel {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 
-    /// The bound socket's path. Only the `TMUX`/`NEOVIBE_PANE_SWITCH_SOCKET` env pairs need it in
+    /// The bound socket's path. Only the `TMUX`/`EITRI_PANE_SWITCH_SOCKET` env pairs need it in
     /// production; tests read it to connect.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
@@ -694,8 +694,8 @@ mod tests {
             listener: None,
         };
         let env: std::collections::HashMap<String, String> = channel.child_env().into_iter().collect();
-        assert_eq!(env["NEOVIBE_NAV_LUA"], dir.join(NAV_LUA_NAME).display().to_string());
-        assert!(std::env::var_os("NEOVIBE_NAV_LUA").is_none());
+        assert_eq!(env["EITRI_NAV_LUA"], dir.join(NAV_LUA_NAME).display().to_string());
+        assert!(std::env::var_os("EITRI_NAV_LUA").is_none());
 
         assert_eq!(env["TMUX_PANE"], "%0");
         // Non-empty (so `vim-tmux-navigator` takes its tmux-aware branch at all) and free of the
@@ -708,7 +708,7 @@ mod tests {
             channel.socket_path.display().to_string()
         );
         assert_eq!(
-            env["NEOVIBE_PANE_SWITCH_SOCKET"],
+            env["EITRI_PANE_SWITCH_SOCKET"],
             channel.socket_path.display().to_string()
         );
 
@@ -722,7 +722,7 @@ mod tests {
 
         // The whole point: none of this is visible to the host process itself.
         assert!(std::env::var_os("TMUX").is_none() || std::env::var("TMUX").unwrap() != env["TMUX"]);
-        assert!(std::env::var_os("NEOVIBE_PANE_SWITCH_SOCKET").is_none());
+        assert!(std::env::var_os("EITRI_PANE_SWITCH_SOCKET").is_none());
 
         // `channel` was built by hand and owns no real directory; make sure Drop's remove_dir_all
         // can't take out anything real if this test's temp path ever happened to exist.
@@ -730,7 +730,7 @@ mod tests {
     }
 
     /// A channel whose snippet could not be written still serves the shim, and hands nvim neither
-    /// half of the fallback -- a loader with no `NEOVIBE_NAV_LUA` would be a no-op anyway, but an
+    /// half of the fallback -- a loader with no `EITRI_NAV_LUA` would be a no-op anyway, but an
     /// argument that does nothing is one more thing to misread in `ps`.
     #[test]
     fn without_its_snippet_the_channel_hands_nvim_no_fallback() {
@@ -741,7 +741,7 @@ mod tests {
             dir: dir.clone(),
             listener: None,
         };
-        assert!(channel.child_env().iter().all(|(k, _)| k != "NEOVIBE_NAV_LUA"));
+        assert!(channel.child_env().iter().all(|(k, _)| k != "EITRI_NAV_LUA"));
         assert!(channel.nvim_args().is_empty());
         std::mem::forget(channel);
     }
@@ -751,9 +751,9 @@ mod tests {
     #[test]
     fn bind_writes_the_nav_fallback_beside_the_socket() {
         // The shim is only a symlink's target here; nothing runs it.
-        let channel = PaneSwitchChannel::bind(Path::new("/nonexistent/neovibe-tmux-shim")).expect("bind");
+        let channel = PaneSwitchChannel::bind(Path::new("/nonexistent/eitri-tmux-shim")).expect("bind");
         let env: std::collections::HashMap<String, String> = channel.child_env().into_iter().collect();
-        let nav = PathBuf::from(&env["NEOVIBE_NAV_LUA"]);
+        let nav = PathBuf::from(&env["EITRI_NAV_LUA"]);
         assert_eq!(nav.parent(), channel.socket_path().parent());
         assert_eq!(nav.file_name().unwrap(), NAV_LUA_NAME);
         assert_eq!(std::fs::read_to_string(&nav).unwrap(), NAV_FALLBACK_LUA);
@@ -772,7 +772,7 @@ mod tests {
     fn the_shim_directory_and_the_nav_snippet_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
-        let channel = PaneSwitchChannel::bind(Path::new("/nonexistent/neovibe-tmux-shim")).expect("bind");
+        let channel = PaneSwitchChannel::bind(Path::new("/nonexistent/eitri-tmux-shim")).expect("bind");
         let dir = channel.socket_path().parent().unwrap().to_path_buf();
         assert_eq!(mode(&dir), 0o700, "the instance directory");
         assert_eq!(mode(&dir.join("bin")), 0o700, "bin/, first on nvim's PATH");
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn the_nav_loader_checks_its_path_before_dofile() {
         assert!(NAV_LOADER_CMD.starts_with("lua "));
-        assert!(NAV_LOADER_CMD.contains("vim.env.NEOVIBE_NAV_LUA"));
+        assert!(NAV_LOADER_CMD.contains("vim.env.EITRI_NAV_LUA"));
         assert!(NAV_LOADER_CMD.contains("if p and p ~= ''"));
         assert!(NAV_LOADER_CMD.contains("pcall(dofile, p)"));
     }
@@ -802,9 +802,9 @@ mod tests {
             );
         }
         for needle in [
-            "vim.env.NEOVIBE_PANE_SWITCH_SOCKET",
+            "vim.env.EITRI_PANE_SWITCH_SOCKET",
             "letter .. \"\\n\"",
-            "neovibe: window or pane ",
+            "eitri: window or pane ",
             "\"VimEnter\"",
             "\"VeryLazy\", \"LazyLoad\"",
             "vim.schedule(",

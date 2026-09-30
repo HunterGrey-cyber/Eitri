@@ -2,9 +2,9 @@
 //! appendix, verdict SUPPORTED in `the private review notes`):
 //! "Resolved dependency graphs for core, agent and terminal contain no GTK/GDK/GLib/WebKit packages".
 //! K3's own check (`the private review notes`) ran
-//! `cargo tree -p {neovibe-core,agent,neovibe-terminal} --locked --offline -e normal --prefix none`
+//! `cargo tree -p {eitri-core,agent,eitri-terminal} --locked --offline -e normal --prefix none`
 //! by hand; this is the same check, as a real test, extended to all seven crates the fitness
-//! function's brief names: `neovibe-core`, `agent`, `neovibe-terminal`, `terminal-render`,
+//! function's brief names: `eitri-core`, `agent`, `eitri-terminal`, `terminal-render`,
 //! `terminal-frame`, `terminal-sync`, `terminal-input`.
 //!
 //! For each target crate, runs `cargo tree -p <crate> -e normal --offline --locked --prefix none`
@@ -22,13 +22,13 @@
 //! afterward, as the first version of this test did -- requires cargo to have already read the
 //! manifest of every package reachable from EVERY workspace member, including `shell`'s own
 //! `gtk4`/`webkit6`. On a machine whose registry cache holds only what `cargo build -p
-//! neovibe-core` itself needed -- precisely the macOS M2 scenario this fitness function exists for
+//! eitri-core` itself needed -- precisely the macOS M2 scenario this fitness function exists for
 //! (`docs/superpowers/specs/2026-09-16-macos-path-design.md`) -- whole-workspace `cargo metadata
 //! --offline --locked` fails with an unrelated-looking "failed to download `ab_glyph`... --offline
 //! was specified" before this test's own GTK check ever runs, so the very host it is meant to
 //! protect could never get a real answer from it. Reproduced 2026-09-28 with an isolated
-//! `CARGO_HOME` fetched only via `cargo build -p neovibe-core`: whole-workspace `cargo metadata
-//! --offline --locked` failed exactly that way against it, while `cargo tree -p neovibe-core -e
+//! `CARGO_HOME` fetched only via `cargo build -p eitri-core`: whole-workspace `cargo metadata
+//! --offline --locked` failed exactly that way against it, while `cargo tree -p eitri-core -e
 //! normal --offline --locked` against the SAME limited cache succeeded -- `cargo tree -p` resolves
 //! only the named package's own closure and does not need the rest of the workspace fetched.
 //!
@@ -58,9 +58,9 @@ const BANNED_SUBSTRINGS: &[&str] = &[
 ];
 
 const TARGET_CRATES: &[&str] = &[
-    "neovibe-core",
+    "eitri-core",
     "agent",
-    "neovibe-terminal",
+    "eitri-terminal",
     "terminal-render",
     "terminal-frame",
     "terminal-sync",
@@ -151,7 +151,7 @@ fn no_toolkit_in_the_normal_dependency_closure_of_the_toolkit_free_crates() {
         failures.is_empty(),
         "F1 (\"no toolkit below the shell\"): the normal-dependency closure of a toolkit-free crate \
          reaches a GTK/GDK/GLib/WebKit package:\n{}\n\
-         neovibe-core, agent, neovibe-terminal and the four terminal-{{render,frame,sync,input}} \
+         eitri-core, agent, eitri-terminal and the four terminal-{{render,frame,sync,input}} \
          crates must build and link on a host with no GTK (the macOS track's M1/M2 depend on this; \
          docs/superpowers/specs/2026-09-16-macos-path-design.md).",
         {

@@ -1,7 +1,7 @@
 # Building the sidecar (plan 2026-09-27-v1-dist, Task 10, spec §5.3, §5.2, §6.2, §6.5 steps 3-4).
 # Sourced by harness.sh. Every test here that wants a real (stubbed) build redirects Node's own
 # download to the local fixture server with sc_inst_net/sc_inst_setup -- by default (plain
-# inst/inst_net, used by every other test file) NEOVIBE_INSTALL_TEST_NODE_BASE_URL is unset, and
+# inst/inst_net, used by every other test file) EITRI_INSTALL_TEST_NODE_BASE_URL is unset, and
 # node_dist_base's own test-mode default (http://127.0.0.1:1, nothing listening) makes the very first
 # download refuse instantly, so every pre-existing test's sidecar-less installs are unaffected by
 # this file.
@@ -16,7 +16,7 @@
 # for exactly this reason) is satisfied by always appending our own -- --base-url ... afterwards,
 # which also supplies the normal network install's --base-url/--release-signers.
 sc_inst_net() {
-	inst --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" "$@" \
+	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" "$@" \
 		-- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 }
 
@@ -26,21 +26,21 @@ sc_inst_net() {
 # installer arguments (--sidecar-only, --release-file, ...) come through in "$@"; --base-url is
 # appended after them, landing on the installer side regardless.
 sc_inst_setup() {
-	inst --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" "$@" \
+	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" "$@" \
 		--base-url "http://127.0.0.1:$PORT"
 }
 
-# sc_setup_release VERSION REV: an installed-style lib/neovibe/{neovibe-setup,RELEASE} under this
+# sc_setup_release VERSION REV: an installed-style lib/eitri/{eitri-setup,RELEASE} under this
 # test's own directory, from the release fixture mk_release already built -- so --sidecar-only's
 # "RELEASE beside dirname $0" rule (spec §6.2) has something real to find. Sets INSTALLER_UNDER_TEST,
 # which inst() reads.
 sc_setup_release() {
-	_ssr_dir=$T/setup-$1/lib/neovibe
+	_ssr_dir=$T/setup-$1/lib/eitri
 	mkdir -p "$_ssr_dir"
-	cp "$INSTALLER" "$_ssr_dir/neovibe-setup"
-	chmod 0755 "$_ssr_dir/neovibe-setup"
+	cp "$INSTALLER" "$_ssr_dir/eitri-setup"
+	chmod 0755 "$_ssr_dir/eitri-setup"
 	cp "$S/fix/v$1/RELEASE" "$_ssr_dir/RELEASE"
-	INSTALLER_UNDER_TEST=$_ssr_dir/neovibe-setup
+	INSTALLER_UNDER_TEST=$_ssr_dir/eitri-setup
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -51,7 +51,7 @@ t_sidecar_placement_and_atomic_swap() {
 	serve 1.0.0
 	sc_inst_net
 	expect_rc 0
-	d=$(data_of)/neovibe/sidecar/aaaaaaa
+	d=$(data_of)/eitri/sidecar/aaaaaaa
 	bin=$d/verdandi-claude-sidecar
 	expect_exec "$bin"
 	expect_file "$d/BUILD"
@@ -65,7 +65,7 @@ t_sidecar_placement_and_atomic_swap() {
 	# ETXTBSY (spec §5.3 step 6: "never copy onto the final path").
 	before_ino=$(stat -c %i "$bin")
 	rm -f "$d/BUILD"
-	sc_inst_net --set NEOVIBE_INSTALL_TEST_BUILD_STAMP=deadbeefcafebabe
+	sc_inst_net --set EITRI_INSTALL_TEST_BUILD_STAMP=deadbeefcafebabe
 	expect_rc 0
 	after_ino=$(stat -c %i "$bin")
 	if [ "$before_ino" = "$after_ino" ]; then fail "the sidecar binary kept its inode across a rebuild: not replaced by rename"; fi
@@ -81,7 +81,7 @@ t_sidecar_node_checksum_refuses() {
 	mkdir -p "$S/srv/dist-bad-node/$NODE_FIXTURE_VERSION"
 	head -c 4096 /dev/urandom >"$S/srv/dist-bad-node/$NODE_FIXTURE_VERSION/node-$NODE_FIXTURE_VERSION-linux-x64.tar.xz"
 	before=$(snap_but_staging "$TH")
-	sc_inst_net --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist-bad-node"
+	sc_inst_net --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist-bad-node"
 	expect_fail "a wrong Node checksum"
 	expect_out "checksum mismatch for node-$NODE_FIXTURE_VERSION-linux-x64.tar.xz"
 	expect_eq "$(snap_but_staging "$TH")" "$before" "nothing installed after a refused sidecar build"
@@ -118,7 +118,7 @@ TESTS="$TESTS t_sidecar_artifact_rejected_bad_protocol"
 t_sidecar_artifact_rejected_bad_protocol() {
 	serve 1.0.0
 	before=$(snap_but_staging "$TH")
-	sc_inst_net --set NEOVIBE_INSTALL_TEST_NPM_MODE=bad-protocol
+	sc_inst_net --set EITRI_INSTALL_TEST_NPM_MODE=bad-protocol
 	expect_fail "a bad protocol number"
 	expect_out 'not protocol 3'
 	expect_eq "$(snap_but_staging "$TH")" "$before" "nothing installed after a rejected artifact"
@@ -127,7 +127,7 @@ t_sidecar_artifact_rejected_bad_protocol() {
 TESTS="$TESTS t_sidecar_artifact_rejected_bad_node"
 t_sidecar_artifact_rejected_bad_node() {
 	serve 1.0.0
-	sc_inst_net --set NEOVIBE_INSTALL_TEST_NPM_MODE=bad-node
+	sc_inst_net --set EITRI_INSTALL_TEST_NPM_MODE=bad-node
 	expect_fail "a wrong node version"
 	expect_out "not protocol 3 with node $NODE_FIXTURE_VERSION"
 }
@@ -135,7 +135,7 @@ t_sidecar_artifact_rejected_bad_node() {
 TESTS="$TESTS t_sidecar_artifact_rejected_sdk_bundled"
 t_sidecar_artifact_rejected_sdk_bundled() {
 	serve 1.0.0
-	sc_inst_net --set NEOVIBE_INSTALL_TEST_NPM_MODE=sdk-bundled
+	sc_inst_net --set EITRI_INSTALL_TEST_NPM_MODE=sdk-bundled
 	expect_fail "sdk_bundled served"
 	expect_out 'not host_cli only'
 }
@@ -149,7 +149,7 @@ t_sidecar_rebuilds_when_not_present() {
 	serve 1.0.0
 	sc_inst_net
 	expect_rc 0
-	d=$(data_of)/neovibe/sidecar/aaaaaaa
+	d=$(data_of)/eitri/sidecar/aaaaaaa
 	rm -f "$d/BUILD"
 	sc_inst_net
 	expect_rc 0
@@ -169,14 +169,14 @@ t_sidecar_workdir_layout_and_cleanup() {
 	serve 1.0.0
 	sc_inst_net
 	expect_rc 0
-	expect_absent "$TH/.cache/neovibe/sidecar-build/aaaaaaa"
+	expect_absent "$TH/.cache/eitri/sidecar-build/aaaaaaa"
 	serve 1.1.0 1.0.0
 	# --keep-build is install.sh's own option, so it must sit after inst()'s -- boundary, not before
 	# it like a --set (sc_inst_net's own convention assumes only extra --sets are passed through).
-	inst --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
 		-- --keep-build --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 0
-	wd=$TH/.cache/neovibe/sidecar-build/bbbbbbb
+	wd=$TH/.cache/eitri/sidecar-build/bbbbbbb
 	expect_dir "$wd"
 	expect_dir "$wd/repo/apps/claude-sidecar/build/node-cache"
 	expect_file "$wd/repo/apps/claude-sidecar/build/node-cache/node-$NODE_FIXTURE_VERSION-linux-x64.tar.xz"
@@ -192,14 +192,14 @@ t_sidecar_npm_ci_failure_blocks_upgrade() {
 	serve 1.0.0
 	sc_inst_net
 	expect_rc 0
-	before=$(snap "$TH/.local/lib/neovibe")
+	before=$(snap "$TH/.local/lib/eitri")
 	serve 1.1.0 1.0.0
-	sc_inst_net --set NEOVIBE_INSTALL_TEST_NPM_MODE=fail-ci
+	sc_inst_net --set EITRI_INSTALL_TEST_NPM_MODE=fail-ci
 	expect_fail "a failing npm ci during an upgrade"
 	expect_out 'npm-sidecar-stub: simulated npm ci failure'
 	expect_eq "$(installed_version)" 1.0.0 "the old install after a refused sidecar build"
-	expect_eq "$(snap "$TH/.local/lib/neovibe")" "$before" "the old install is byte-identical"
-	expect_absent "$TH/.local/lib/neovibe.new"
+	expect_eq "$(snap "$TH/.local/lib/eitri")" "$before" "the old install is byte-identical"
+	expect_absent "$TH/.local/lib/eitri.new"
 }
 
 TESTS="$TESTS t_sidecar_build_binary_failure_blocks_upgrade"
@@ -208,7 +208,7 @@ t_sidecar_build_binary_failure_blocks_upgrade() {
 	sc_inst_net
 	expect_rc 0
 	serve 1.1.0 1.0.0
-	sc_inst_net --set NEOVIBE_INSTALL_TEST_NPM_MODE=fail-build
+	sc_inst_net --set EITRI_INSTALL_TEST_NPM_MODE=fail-build
 	expect_fail "a failing npm run build:binary during an upgrade"
 	expect_out 'npm-sidecar-stub: simulated build failure'
 	expect_eq "$(installed_version)" 1.0.0 "the old install after a refused sidecar build"
@@ -228,15 +228,15 @@ t_sidecar_upgrade_node_unreachable_refuses() {
 	serve 1.0.0
 	sc_inst_net
 	expect_rc 0
-	before=$(snap "$TH/.local/lib/neovibe")
+	before=$(snap "$TH/.local/lib/eitri")
 	serve 1.1.0 1.0.0
 	# node_dist_base's own test-mode default is this same http://127.0.0.1:1 -- nothing listens on
 	# port 1, so the download refuses instantly with no fixture server needed.
-	inst_net --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:1/dist" --
+	inst_net --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:1/dist" --
 	expect_fail "an upgrade whose new sidecar's Node download cannot be reached, with a working install already in place"
 	expect_eq "$(installed_version)" 1.0.0 "the old install after a refused sidecar swap"
-	expect_eq "$(snap "$TH/.local/lib/neovibe")" "$before" "the old install is byte-identical"
-	sc=$(data_of)/neovibe/sidecar
+	expect_eq "$(snap "$TH/.local/lib/eitri")" "$before" "the old install is byte-identical"
+	sc=$(data_of)/eitri/sidecar
 	expect_dir "$sc/aaaaaaa"
 	expect_absent "$sc/bbbbbbb"
 }
@@ -244,14 +244,14 @@ t_sidecar_upgrade_node_unreachable_refuses() {
 TESTS="$TESTS t_sidecar_first_install_node_unreachable_still_succeeds"
 t_sidecar_first_install_node_unreachable_still_succeeds() {
 	# The other half of F1's fix: TOLERANT is still 1 on a first install (there is no working
-	# install being replaced), so a machine with no network to nodejs.org still gets neovibe, with a
+	# install being replaced), so a machine with no network to nodejs.org still gets Eitri, with a
 	# warning, exactly as spec §5.2 step 4 promises.
 	serve 1.0.0
-	inst_net --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:1/dist" --
+	inst_net --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:1/dist" --
 	expect_rc 0
-	expect_out 'neovibe is installed without one'
+	expect_out 'Eitri is installed without one'
 	expect_eq "$(installed_version)" 1.0.0
-	expect_absent "$(data_of)/neovibe/sidecar/aaaaaaa"
+	expect_absent "$(data_of)/eitri/sidecar/aaaaaaa"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -262,10 +262,10 @@ t_sidecar_prune_after_real_build() {
 	serve 1.0.0
 	sc_inst_net
 	expect_rc 0
-	sc=$(data_of)/neovibe/sidecar
+	sc=$(data_of)/eitri/sidecar
 	expect_dir "$sc/aaaaaaa"
 	# A second, planted RELEASE (the test system RELEASE) survives.
-	printf 'NEOVIBE_VERSION=0.9.0\nVERDANDI_REV=ddddddd000000000000000000000000000000000\n' >"$S/system/RELEASE"
+	printf 'EITRI_VERSION=0.9.0\nVERDANDI_REV=ddddddd000000000000000000000000000000000\n' >"$S/system/RELEASE"
 	mkdir -p "$sc/ddddddd" "$sc/eeeeeee"
 	serve 1.1.0 1.0.0
 	sc_inst_net
@@ -286,14 +286,14 @@ TESTS="$TESTS t_prune_sidecars_symlinked_root_refused"
 t_prune_sidecars_symlinked_root_refused() {
 	# M3 (v1-dist whole-branch review, 2026-09-28): the same symlinked-sidecar-root gap as
 	# do_uninstall's own (t_uninstall_symlinked_sidecar_root, test_uninstall.sh), reachable here in
-	# a normal upgrade's own prune step. A symlinked $XDG_DATA_HOME/neovibe/sidecar, planted by the
+	# a normal upgrade's own prune step. A symlinked $XDG_DATA_HOME/eitri/sidecar, planted by the
 	# user in their own data directory, was followed with no check at all: any 7-hex-named directory
 	# behind the link that is not this upgrade's own new/old/system rev -- a user's own, unrelated
 	# directory that merely happens to be named like a short git sha -- was removed.
 	serve 1.0.0
 	sc_inst_net
 	expect_rc 0
-	sc=$(data_of)/neovibe/sidecar
+	sc=$(data_of)/eitri/sidecar
 	expect_dir "$sc/aaaaaaa"
 	rm -rf "$sc"
 	mkdir -p "$TH/backup/abcdef0"
@@ -317,7 +317,7 @@ t_sidecar_only_never_prunes() {
 	serve 1.0.0
 	sc_inst_net
 	expect_rc 0
-	sc=$(data_of)/neovibe/sidecar
+	sc=$(data_of)/eitri/sidecar
 	mkdir -p "$sc/eeeeeee"
 	rm -rf "$sc/aaaaaaa"
 	sc_setup_release 1.0.0 "$REV_A"
@@ -334,16 +334,16 @@ TESTS="$TESTS t_sidecar_only_dirname_release"
 t_sidecar_only_dirname_release() {
 	serve 1.0.0
 	sc_setup_release 1.0.0 "$REV_A"
-	# A different RELEASE planted in ~/.local/lib/neovibe/ and at the test system path is not read.
-	mkdir -p "$TH/.local/lib/neovibe"
-	printf 'NEOVIBE_VERSION=9.9.9\nVERDANDI_REV=fffffff000000000000000000000000000000000\n' >"$TH/.local/lib/neovibe/RELEASE"
-	printf 'NEOVIBE_VERSION=8.8.8\nVERDANDI_REV=eeeeeee000000000000000000000000000000000\n' >"$S/system/RELEASE"
+	# A different RELEASE planted in ~/.local/lib/eitri/ and at the test system path is not read.
+	mkdir -p "$TH/.local/lib/eitri"
+	printf 'EITRI_VERSION=9.9.9\nVERDANDI_REV=fffffff000000000000000000000000000000000\n' >"$TH/.local/lib/eitri/RELEASE"
+	printf 'EITRI_VERSION=8.8.8\nVERDANDI_REV=eeeeeee000000000000000000000000000000000\n' >"$S/system/RELEASE"
 	sc_inst_setup -- --sidecar-only
 	expect_rc 0
 	rm -f "$S/system/RELEASE"
-	expect_dir "$(data_of)/neovibe/sidecar/aaaaaaa"
-	expect_absent "$(data_of)/neovibe/sidecar/fffffff"
-	expect_absent "$(data_of)/neovibe/sidecar/eeeeeee"
+	expect_dir "$(data_of)/eitri/sidecar/aaaaaaa"
+	expect_absent "$(data_of)/eitri/sidecar/fffffff"
+	expect_absent "$(data_of)/eitri/sidecar/eeeeeee"
 }
 
 TESTS="$TESTS t_sidecar_only_release_file"
@@ -351,7 +351,7 @@ t_sidecar_only_release_file() {
 	serve 1.0.0
 	sc_inst_setup -- --sidecar-only --release-file "$(served 1.0.0)/RELEASE"
 	expect_rc 0
-	expect_dir "$(data_of)/neovibe/sidecar/aaaaaaa"
+	expect_dir "$(data_of)/eitri/sidecar/aaaaaaa"
 }
 
 TESTS="$TESTS t_sidecar_only_needs_a_release"
@@ -400,13 +400,13 @@ t_tarball_install_builds_sidecar_from_beside_file() {
 	# NV_VERDANDI_SOURCE_TARBALL_OVERRIDE.
 	d=$S/fix/v1.0.0
 	srv_mark
-	inst --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		-- --tarball "$d/neovibe-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
+	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		-- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
 		--release-signers "$SIGNERS"
 	expect_rc 0
-	expect_out "installed neovibe 1.0.0 into"
+	expect_out "installed Eitri 1.0.0 into"
 	expect_out "using the Verdandi source beside"
-	expect_exec "$(data_of)/neovibe/sidecar/aaaaaaa/verdandi-claude-sidecar"
+	expect_exec "$(data_of)/eitri/sidecar/aaaaaaa/verdandi-claude-sidecar"
 	if srv_paths | grep -F verdandi- >/dev/null; then fail "the Verdandi source was fetched over the network: $(srv_paths)"; fi
 }
 
@@ -425,17 +425,17 @@ t_tarball_verdandi_source_beside_file_copied_before_use() {
 	# --tarball/--sums races use for sha256sum/cat.
 	d=$T/tarball-race
 	mkdir -p "$d"
-	cp -- "$S/fix/v1.0.0/neovibe-1.0.0-x86_64-linux.tar.gz" "$S/fix/v1.0.0/SHA256SUMS" \
+	cp -- "$S/fix/v1.0.0/eitri-1.0.0-x86_64-linux.tar.gz" "$S/fix/v1.0.0/SHA256SUMS" \
 		"$S/fix/v1.0.0/SHA256SUMS.sig" "$S/fix/v1.0.0/verdandi-aaaaaaa-source.tar.gz" "$d/"
 	printf 'evil: this must never reach npm ci or npm run build:binary\n' >"$T/evil-verdandi-source.tar.gz"
 	printf '%s\n%s\n' "$d/verdandi-aaaaaaa-source.tar.gz" "$T/evil-verdandi-source.tar.gz" >"$S/logs/swap-verdandi"
-	inst --stubs "$S/stubs-cpswap" --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		-- --tarball "$d/neovibe-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
+	inst --stubs "$S/stubs-cpswap" --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		-- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
 		--release-signers "$SIGNERS"
 	expect_rc 0
-	expect_out "installed neovibe 1.0.0 into"
+	expect_out "installed Eitri 1.0.0 into"
 	expect_out "using the Verdandi source beside"
-	expect_exec "$(data_of)/neovibe/sidecar/aaaaaaa/verdandi-claude-sidecar"
+	expect_exec "$(data_of)/eitri/sidecar/aaaaaaa/verdandi-claude-sidecar"
 	if [ ! -s "$S/logs/swap-verdandi.log" ]; then fail "the beside file was never swapped: the test did not run the race"; fi
 	if [ -e "$d/verdandi-aaaaaaa-source.tar.gz" ] && ! grep -q evil "$d/verdandi-aaaaaaa-source.tar.gz" 2>/dev/null; then
 		fail "the beside file was not actually corrupted after the read: the stub did not fire as intended"
@@ -453,21 +453,21 @@ t_tarball_install_falls_back_to_network_without_beside_file() {
 	# (github.com) -- the curl-mirror stub (stubs-net) strips scheme and host from any URL and
 	# serves its path from $S/srv, so staging the genuine asset at that literal path lets this run
 	# with no real network access, exactly as the report's own suggested fix says.
-	mkdir -p "$S/srv/HunterGrey-cyber/neovibe/releases/download/v1.0.0"
+	mkdir -p "$S/srv/HunterGrey-cyber/eitri/releases/download/v1.0.0"
 	cp -- "$S/fix/v1.0.0/verdandi-aaaaaaa-source.tar.gz" \
-		"$S/srv/HunterGrey-cyber/neovibe/releases/download/v1.0.0/verdandi-aaaaaaa-source.tar.gz"
+		"$S/srv/HunterGrey-cyber/eitri/releases/download/v1.0.0/verdandi-aaaaaaa-source.tar.gz"
 	d=$T/tarball-only
 	mkdir -p "$d"
-	cp -- "$S/fix/v1.0.0/neovibe-1.0.0-x86_64-linux.tar.gz" "$S/fix/v1.0.0/SHA256SUMS" \
+	cp -- "$S/fix/v1.0.0/eitri-1.0.0-x86_64-linux.tar.gz" "$S/fix/v1.0.0/SHA256SUMS" \
 		"$S/fix/v1.0.0/SHA256SUMS.sig" "$d/"
-	inst --stubs "$S/stubs-net" --set "NEOVIBE_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
-		-- --tarball "$d/neovibe-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
+	inst --stubs "$S/stubs-net" --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		-- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
 		--release-signers "$SIGNERS"
 	expect_rc 0
-	expect_out "installed neovibe 1.0.0 into"
+	expect_out "installed Eitri 1.0.0 into"
 	expect_no_out "using the Verdandi source beside"
-	expect_exec "$(data_of)/neovibe/sidecar/aaaaaaa/verdandi-claude-sidecar"
-	if ! grep -qF 'HunterGrey-cyber/neovibe/releases/download/v1.0.0/verdandi-aaaaaaa-source.tar.gz' "$S/logs/curl.log"; then
+	expect_exec "$(data_of)/eitri/sidecar/aaaaaaa/verdandi-claude-sidecar"
+	if ! grep -qF 'HunterGrey-cyber/eitri/releases/download/v1.0.0/verdandi-aaaaaaa-source.tar.gz' "$S/logs/curl.log"; then
 		fail "the Verdandi source was not fetched through the network fallback: $(cat "$S/logs/curl.log")"
 	fi
 }
@@ -512,7 +512,7 @@ t_build_sidecar_into_node_cache_versioned_name() {
 		--verdandi-source "$(served 1.0.0)/verdandi-aaaaaaa-source.tar.gz"
 	expect_rc 0
 	expect_exec "$dest/verdandi-claude-sidecar"
-	wd=$TH/.cache/neovibe/sidecar-build/aaaaaaa
+	wd=$TH/.cache/eitri/sidecar-build/aaaaaaa
 	expect_file "$wd/repo/apps/claude-sidecar/build/node-cache/node-$NODE_FIXTURE_VERSION-linux-x64.tar.xz"
 }
 

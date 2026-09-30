@@ -1,4 +1,4 @@
-//! `neovibe-core`: the GTK-free half of `shell` -- the agent stack, theme token derivation, the
+//! `eitri-core`: the GTK-free half of `shell` -- the agent stack, theme token derivation, the
 //! process/filesystem plumbing under them, and the Lua kernel's pure half -- extracted so the
 //! compiler enforces the boundary (no `gtk4`/`webkit6`/`glib` dependency here -- see
 //! docs/superpowers/specs/2026-09-16-macos-path-design.md, L2). `shell` depends on this crate;

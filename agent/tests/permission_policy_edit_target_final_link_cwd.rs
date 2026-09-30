@@ -2,7 +2,7 @@
 //! `Resolution::ThroughAKernelTree => Err(REASON_THROUGH_A_KERNEL_TREE)`, in
 //! `agent/src/permission_policy.rs` -- had no test that told it apart from
 //! `resolve_missing_edit_target`'s own defensive copy of the same arm. Every existing test
-//! (`a_link_through_proc_self_cwd_cards_wherever_neovibe_was_started` in
+//! (`a_link_through_proc_self_cwd_cards_wherever_eitri_was_started` in
 //! `permission_policy_process_cwd.rs`, `a_link_through_proc_or_dev_cards_for_every_path_tool` in
 //! `permission_policy.rs` itself) puts the `/proc`/`/dev` link as a NON-final path component
 //! (`d/.config/autostart/evil.desktop`, `via-proc-self-fd/page.md`): when
@@ -58,7 +58,7 @@ fn a_kernel_tree_link_as_the_edit_targets_own_last_component_cards() {
     let root = scratch.0.join("proj").canonicalize().unwrap();
     // What the two `/proc/self/cwd` links resolve to in THIS process, once cwd moves to
     // `root/src`: `cwd/..` is `root` itself, so both land on a real file inside the root here --
-    // "exists in neovibe's view" is what keeps this a real escape shape rather than a resolution
+    // "exists in Eitri's view" is what keeps this a real escape shape rather than a resolution
     // failure the policy would card for an unrelated reason.
     std::fs::write(root.join("escaped.txt"), "escaped\n").unwrap();
     std::fs::write(root.join("escaped.ipynb"), "{}\n").unwrap();
@@ -66,7 +66,7 @@ fn a_kernel_tree_link_as_the_edit_targets_own_last_component_cards() {
     std::os::unix::fs::symlink("/proc/self/cwd/../escaped.ipynb", root.join("nb.ipynb")).unwrap();
     std::os::unix::fs::symlink("/dev/fd/0", root.join("stdin.txt")).unwrap();
 
-    // `cd <root>/src && neovibe <root>`, the review's own shape.
+    // `cd <root>/src && Eitri <root>`, the review's own shape.
     let started_in = std::env::current_dir().unwrap();
     std::env::set_current_dir(root.join("src")).unwrap();
     assert_eq!(

@@ -1,5 +1,5 @@
 //! The child on a pseudo-terminal: opened, spawned, resized, hung up and reaped here, and nowhere
-//! else in neovibe.
+//! else in Eitri.
 //!
 //! **Owned, not `alacritty_terminal::tty`.** That module works, and the spike used it, but each of
 //! its five behaviours below is wrong inside a GTK application that also runs nvim, WebKit and a
@@ -45,7 +45,7 @@ use rustix::termios::{self, InputModes, OptionalActions, Winsize};
 
 use crate::metrics::TerminalMetrics;
 
-/// Removed from the child's environment. A neovibe started from inside tmux would otherwise make
+/// Removed from the child's environment. An Eitri started from inside tmux would otherwise make
 /// every program in its terminal believe it is inside THAT tmux: nested-session refusals,
 /// vim-tmux-navigator driving the wrong server, `claude-wrapper` checking the wrong socket.
 /// `NEOVIM_BIN` joins the other two (v1-dist plan Task 6, spec §7): `shell`'s own choice of which
@@ -54,11 +54,11 @@ use crate::metrics::TerminalMetrics;
 pub const REMOVED_ENV: [&str; 3] = ["TMUX", "TMUX_PANE", "NEOVIM_BIN"];
 
 /// Set on the child, replacing whatever the host had. `TERM` is what the owner's own `foot.ini`
-/// sets; `TERM_PROGRAM=neovibe` is what his `.zshrc` keys neovibe-only remaps on.
+/// sets; `TERM_PROGRAM=eitri` is what his `.zshrc` keys eitri-only remaps on.
 pub const SET_ENV: [(&str, &str); 3] = [
     ("TERM", "xterm-256color"),
     ("COLORTERM", "truecolor"),
-    ("TERM_PROGRAM", "neovibe"),
+    ("TERM_PROGRAM", "eitri"),
 ];
 
 /// How long a hung-up child gets to exit before it is killed by its pid.
@@ -419,7 +419,7 @@ mod tests {
             ("WAYLAND_DISPLAY", "wayland-0"),
             // v1-dist plan Task 6, spec §7: `shell`'s own choice of `nvim` for the *editor* pane
             // must never reach a `neovide`/script run inside this terminal.
-            ("NEOVIM_BIN", "/home/x/.local/share/neovibe/nvim/0.11.4/bin/nvim"),
+            ("NEOVIM_BIN", "/home/x/.local/share/eitri/nvim/0.11.4/bin/nvim"),
         ]);
         let mut env = child_environment(host);
         env.sort();
@@ -429,7 +429,7 @@ mod tests {
                 ("COLORTERM", "truecolor"),
                 ("PATH", "/usr/bin"),
                 ("TERM", "xterm-256color"),
-                ("TERM_PROGRAM", "neovibe"),
+                ("TERM_PROGRAM", "eitri"),
                 ("WAYLAND_DISPLAY", "wayland-0"),
             ])
         );

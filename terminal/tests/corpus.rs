@@ -6,7 +6,7 @@
 //! - **synthetic streams**, written here, which run in every `cargo test`: each is a behaviour a
 //!   daily program depends on, with an exact assertion;
 //! - **the owner's recorded streams** (`examples/record.rs`), `#[ignore]`d because they live outside
-//!   git: `NEOVIBE_TERMINAL_CORPUS=<dir> cargo test -p neovibe-terminal --test corpus -- --ignored
+//!   git: `EITRI_TERMINAL_CORPUS=<dir> cargo test -p eitri-terminal --test corpus -- --ignored
 //!   --nocapture`. Each replay writes `<name>.png` and `<name>.txt` beside its `.bytes` and reports
 //!   what vte could not handle -- its own `[unhandled ...]` debug records, counted here.
 
@@ -15,7 +15,7 @@ mod common;
 use std::sync::Mutex;
 
 use common::{metrics, screen_text, Raster};
-use neovibe_terminal::{PtySize, Screen, TerminalColors};
+use eitri_terminal::{PtySize, Screen, TerminalColors};
 use terminal_render::{PaintList, PaintOp, RgbColor};
 
 /// Every `log` record vte or alacritty_terminal emits about a sequence they did not handle.
@@ -149,9 +149,9 @@ fn synthetic_streams_render_as_daily_programs_expect() {
 }
 
 #[test]
-#[ignore = "needs NEOVIBE_TERMINAL_CORPUS=<dir> of recordings; see the module doc"]
+#[ignore = "needs EITRI_TERMINAL_CORPUS=<dir> of recordings; see the module doc"]
 fn the_owners_recorded_streams_replay() {
-    let dir = std::path::PathBuf::from(std::env::var_os("NEOVIBE_TERMINAL_CORPUS").expect("NEOVIBE_TERMINAL_CORPUS"));
+    let dir = std::path::PathBuf::from(std::env::var_os("EITRI_TERMINAL_CORPUS").expect("EITRI_TERMINAL_CORPUS"));
     listen_for_unhandled();
     let mut names: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()

@@ -1,9 +1,9 @@
-//! Records what a program writes to a neovibe terminal, byte for byte, for the corpus replay
+//! Records what a program writes to an Eitri terminal, byte for byte, for the corpus replay
 //! (`tests/corpus.rs`). The program runs in a real `TerminalSession` -- the product's PTY, the
 //! host's environment, and a `Term` that answers its queries -- so the recording is what the
 //! program really says to this terminal, not to foot.
 //!
-//!     cargo run -p neovibe-terminal --example record -- OUT_DIR NAME COLSxROWS [--send MS TEXT]... -- PROGRAM [ARGS]...
+//!     cargo run -p eitri-terminal --example record -- OUT_DIR NAME COLSxROWS [--send MS TEXT]... -- PROGRAM [ARGS]...
 //!
 //! writes `OUT_DIR/NAME.COLSxROWS.bytes`. `--send MS TEXT` types TEXT into the program MS
 //! milliseconds after it starts (`\e` is Escape, `\r` Enter, `\n` a newline); that is how an
@@ -17,7 +17,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use neovibe_terminal::{PtySize, SessionCommand, SessionConfig, SpawnSpec, TerminalColors, TerminalSession};
+use eitri_terminal::{PtySize, SessionCommand, SessionConfig, SpawnSpec, TerminalColors, TerminalSession};
 use terminal_input::NormalizedInput;
 
 const MAX_RUN: Duration = Duration::from_secs(30);
