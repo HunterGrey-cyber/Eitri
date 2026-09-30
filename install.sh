@@ -1,6 +1,6 @@
 #!/bin/sh
-# Builds and installs eitri from this checkout as it is on disk, uncommitted changes included:
-# the development loop for working on eitri itself. A release is installed with
+# Builds and installs Eitri from this checkout as it is on disk, uncommitted changes included:
+# the development loop for working on Eitri itself. A release is installed with
 # packaging/install.sh instead (the same script a release publishes as install.sh). This is a thin
 # wrapper over `packaging/install.sh --from-source --checkout`, not a second implementation: a
 # separate build-and-install script drifts from packaging/install.sh's checks and defaults (binary
@@ -36,7 +36,7 @@ for _nv_a in "$@"; do
 	case $_nv_a in
 	-h | --help)
 		cat <<'EOF'
-./install.sh is for working on eitri itself.
+./install.sh is for working on Eitri itself.
 With no option, it builds and installs this checkout from source, as it is on disk now
 (packaging/install.sh --from-source --checkout <this checkout>). EITRI_VERDANDI_CHECKOUT, when
 set, names a local Verdandi checkout to build the sidecar from. With one of packaging/install.sh's

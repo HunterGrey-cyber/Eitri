@@ -279,7 +279,7 @@ if [ -x "$NVIM_DIR/bin/nvim" ]; then
 fi
 if [ "$EXPECT_DISTRO_NVIM" = 1 ]; then
 	DISTRO_NVIM_SHA_AFTER=$(sha256sum "$DISTRO_NVIM" | awk '{print $1}')
-	[ "$DISTRO_NVIM_SHA_BEFORE" = "$DISTRO_NVIM_SHA_AFTER" ] || fail "$DISTRO_NVIM changed sha256 during install: eitri touched the distro nvim"
+	[ "$DISTRO_NVIM_SHA_BEFORE" = "$DISTRO_NVIM_SHA_AFTER" ] || fail "$DISTRO_NVIM changed sha256 during install: Eitri touched the distro nvim"
 	command -v nvim >/dev/null 2>&1 && [ "$(command -v nvim)" = "$DISTRO_NVIM" ] || fail "nvim no longer resolves to the distro copy on PATH"
 fi
 
@@ -289,7 +289,7 @@ if ! sh install.sh --base-url "$BASE_URL" --release-signers "$SIGNERS" --yes --w
 	fail "the second install exited non-zero"
 fi
 cat second-install.log
-grep -qF "eitri $VERSION is up to date" second-install.log || fail "the second run did not say 'up to date'"
+grep -qF "Eitri $VERSION is up to date" second-install.log || fail "the second run did not say 'up to date'"
 
 say "=== eitri --legacy / EITRI_AGENT_BACKEND=legacy ==="
 set +e

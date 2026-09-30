@@ -1,4 +1,4 @@
-# eitri release signers.
+# Eitri release signers.
 #
 # ssh-keygen's allowed_signers format. packaging/install.sh embeds this file byte for byte (a test
 # holds the two equal) and checks a release's SHA256SUMS.sig with exactly:

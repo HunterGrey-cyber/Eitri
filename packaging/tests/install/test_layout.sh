@@ -45,8 +45,8 @@ t_fresh_layout() {
 	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/eitri.desktop")" \
 		"Exec=\"$TH/.local/bin/eitri\" --quiet %f" "the desktop Exec line"
 	expect_absent "$TH/.cache"
-	expect_out 'installed eitri 1.0.0'
-	expect_no_out 'restart open eitri windows'
+	expect_out 'installed Eitri 1.0.0'
+	expect_no_out 'restart open Eitri windows'
 }
 
 TESTS="$TESTS t_symlinked_bindir_launches"
@@ -65,7 +65,7 @@ t_symlinked_bindir_launches() {
 	serve 1.0.0
 	inst_net
 	expect_rc 0
-	expect_out 'installed eitri 1.0.0'
+	expect_out 'installed Eitri 1.0.0'
 	# The install must not have replaced the planted symlink with a real directory -- otherwise a
 	# later change to the installer could make this test stop exercising F5 at all without ever
 	# going red.
@@ -127,7 +127,7 @@ t_rerun_up_to_date() {
 	sleep 1
 	inst_net
 	expect_rc 0
-	expect_out 'eitri 1.0.0 is up to date'
+	expect_out 'Eitri 1.0.0 is up to date'
 	expect_eq "$(snap "$TH")" "$before" "the home after an up-to-date re-run (mtimes included)"
 }
 
@@ -147,7 +147,7 @@ t_rerun_finishes_incomplete_install() {
 		inst_net
 		expect_rc 0
 		expect_no_out 'is up to date'
-		expect_out 'installed eitri 1.0.0'
+		expect_out 'installed Eitri 1.0.0'
 		expect_file "$f"
 	done
 	# A launcher without the marker is not this install's: not finished either.
@@ -158,7 +158,7 @@ t_rerun_finishes_incomplete_install() {
 	if ! grep -Fqx '# eitri-launcher v1' "$TH/.local/bin/eitri"; then fail "the launcher was not reinstalled"; fi
 	inst_net
 	expect_rc 0
-	expect_out 'eitri 1.0.0 is up to date'
+	expect_out 'Eitri 1.0.0 is up to date'
 }
 
 TESTS="$TESTS t_same_version_without_sidecar_reinstalls"
@@ -172,7 +172,7 @@ t_same_version_without_sidecar_reinstalls() {
 	inst_net
 	expect_rc 0
 	expect_no_out 'is up to date'
-	expect_out 'installed eitri 1.0.0'
+	expect_out 'installed Eitri 1.0.0'
 }
 
 TESTS="$TESTS t_upgrade_swap"
@@ -184,8 +184,8 @@ t_upgrade_swap() {
 	inst_net
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.1.0 "the version after the upgrade"
-	expect_out 'installed eitri 1.1.0'
-	expect_out 'restart open eitri windows'
+	expect_out 'installed Eitri 1.1.0'
+	expect_out 'restart open Eitri windows'
 	expect_absent "$TH/.local/lib/eitri.old"
 	expect_absent "$TH/.local/lib/eitri.new"
 	expect_eq "$(tree "$TH")" "$EXPECTED_TREE" "the tree after an upgrade"

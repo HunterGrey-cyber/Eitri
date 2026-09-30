@@ -152,7 +152,7 @@ COPYLEFT_ACK = {
 # Exactly these. Anything else without a classifiable licence and a findable text fails.
 ALLOWLIST = {
     ("cargo", "claude-runtime-protocol"): (
-        "Verdandi's own generated gRPC types, same owner as eitri. Its own Cargo.toml declares no "
+        "Verdandi's own generated gRPC types, same owner as Eitri. Its own Cargo.toml declares no "
         "`license` field. cargo_texts()'s git-checkout walk falls back to the checkout's own root "
         "LICENSE when the crate's own directory ships none -- which is present (MIT) on the public "
         "Verdandi mirror and absent on at least one private checkout, so whether a licence text is "
@@ -162,12 +162,12 @@ ALLOWLIST = {
         "allowlisted\" even where a root LICENSE happens to be found. Re-check only once "
         "claude-runtime-protocol's own Cargo.toml declares `license = \"MIT\"`."),
     ("npm", "@verdandi/claude-sidecar"): (
-        "Verdandi's own sidecar, same owner as eitri; no licence stated yet (to be MIT)."),
+        "Verdandi's own sidecar, same owner as Eitri; no licence stated yet (to be MIT)."),
     ("npm", "@verdandi/claude-runtime"): (
-        "Verdandi's own runtime package, same owner as eitri; no licence stated yet (to be MIT)."),
+        "Verdandi's own runtime package, same owner as Eitri; no licence stated yet (to be MIT)."),
     ("npm", "@anthropic-ai/claude-agent-sdk"): (
         "NOT open source. Bundled into the sidecar knowingly. "
-        "Its own LICENSE.md is reproduced verbatim; eitri's MIT licence does not and cannot "
+        "Its own LICENSE.md is reproduced verbatim; Eitri's MIT licence does not and cannot "
         "cover it."),
 }
 
@@ -177,20 +177,20 @@ ALLOWLIST = {
 WORKSPACE_THIRD_PARTY = {
     "terminal-input": (
         "derived from Alacritty (commit 94e7c8874e526b1e67b349d9ba30ddf81669119e) and Apache-2.0, "
-        "which cannot be relicensed. Moved into eitri from Verdandi with its LICENSE-APACHE and its "
+        "which cannot be relicensed. Moved into Eitri from Verdandi with its LICENSE-APACHE and its "
         "NOTICE, both reproduced as Apache-2.0 section 4 requires."),
 }
 
 
 def own_code(name, license):
-    """Whether workspace member `name` is eitri's own code, covered by LICENSE and not listed here.
+    """Whether workspace member `name` is Eitri's own code, covered by LICENSE and not listed here.
     A member declaring anything but MIT (or nothing) must be in WORKSPACE_THIRD_PARTY -- a moved-in
-    crate that kept its own licence must never be skipped as if it were eitri's."""
+    crate that kept its own licence must never be skipped as if it were Eitri's."""
     if name in WORKSPACE_THIRD_PARTY:
         return False
     if license in (None, "MIT"):
         return True
-    raise Fail(f"workspace member {name} declares {license!r}: not eitri's MIT, and not in "
+    raise Fail(f"workspace member {name} declares {license!r}: not Eitri's MIT, and not in "
                "WORKSPACE_THIRD_PARTY")
 
 
@@ -362,7 +362,7 @@ def cargo_packages(repo=REPO):
             raise Fail(f"cargo tree names {nv[0]} {nv[1]}, which matches {len(cands)} packages in cargo metadata")
         p = cands[0]
         if p["id"] in workspace and own_code(p["name"], p["license"]):
-            continue  # eitri's own code: covered by LICENSE, not by this file
+            continue  # Eitri's own code: covered by LICENSE, not by this file
         out.append({
             "eco": "cargo", "name": p["name"], "version": p["version"], "license": p["license"],
             "dir": os.path.dirname(p["manifest_path"]), "source": p["source"] or "",
@@ -454,7 +454,7 @@ def resolve(pkg, by_nv, counts):
             raise Fail(f"an override names {n} {v} but the tree has {ver}; re-check the text and update it")
 
     if eco == "cargo" and name in WORKSPACE_THIRD_PARTY:
-        note = "in eitri's own repository, under its own licence: " + WORKSPACE_THIRD_PARTY[name]
+        note = "in Eitri's own repository, under its own licence: " + WORKSPACE_THIRD_PARTY[name]
 
     lic = pkg["license"]
     if key in ALLOWLIST:
@@ -1265,12 +1265,12 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
         raise Fail("no nvim-rs entry in copyleft: the LGPL-3.0 sec 4(a) notice has no version to name")
     # LGPL-3.0 4(a) asks for a prominent notice that the library is used, so the nvim-rs notice
     # comes first in both profiles: both ship the same statically linked `shell`.
-    L = [RULE, "eitri -- third-party licences", RULE, "", nvim_rs_lgpl_notice(nvim_rs["version"]), ""]
+    L = [RULE, "Eitri -- third-party licences", RULE, "", nvim_rs_lgpl_notice(nvim_rs["version"]), ""]
     L += [
-        "eitri's own code is MIT-licensed: see LICENSE, installed beside this file.",
+        "Eitri's own code is MIT-licensed: see LICENSE, installed beside this file.",
         "",
         "This package also contains other people's code, each part under its own licence,",
-        "reproduced below. MIT covers eitri's code only; it does not relicense any of this.",
+        "reproduced below. MIT covers Eitri's code only; it does not relicense any of this.",
     ]
     if not no_sidecar:
         L += [
@@ -1289,7 +1289,7 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
     for e in copyleft:
         L.append(f"  {e['title']} [{e['license']}]  https://crates.io/crates/{e['name']}/{e['version']}")
     L += [
-        f"eitri's own source is at {source_url}.",
+        f"Eitri's own source is at {source_url}.",
         "",
         "Libraries this package links dynamically from your system (GTK 4, WebKitGTK, GLib and",
         "their dependencies) are not redistributed here and are not listed.",
@@ -1436,7 +1436,7 @@ def write_source_notice(path, version, commit, url, skia_archive, skia_sha256, n
     the modified-nvim-rs relink recipe release.sh proves offline. `url` is
     printed exactly as given -- this function never derives or guesses a download URL; the caller
     (release.sh, via --source-url) is the one that knows the release's real asset link. `version` is
-    eitri's own (the `shell` package's) version; `nvim_rs_version` is nvim-rs's, resolved from the
+    Eitri's own (the `shell` package's) version; `nvim_rs_version` is nvim-rs's, resolved from the
     same dependency tree collect() already read rather than assumed. `commit` and `fork_commit` are
     what the shipped `--version` names; a rebuild from the asset (no .git anywhere in it) gets them
     back only through the two EITRI_BUILD_* lines printed here, which release.sh's proof (a)
@@ -1464,7 +1464,7 @@ def write_source_notice(path, version, commit, url, skia_archive, skia_sha256, n
         "",
         f"    {url}",
         "",
-        f"for eitri {version}, built from commit {commit}. That asset contains:",
+        f"for Eitri {version}, built from commit {commit}. That asset contains:",
         "  - this project's source tree at that commit (`git archive`);",
         f"  - the Neovide fork submodule, at its pinned commit {fork_commit};",
         "  - this project's Rust dependencies, vendored (`cargo vendor --locked`), nvim-rs's own",

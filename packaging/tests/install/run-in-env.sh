@@ -133,7 +133,7 @@ W_RC=$?
 if [ -n "$W_GUARD" ]; then
 	W_AFTER=$(real_home_digest)
 	if [ "$W_BEFORE" != "$W_AFTER" ]; then
-		printf "run-in-env: the real HOME's eitri directories changed during this run\n" >&2
+		printf "run-in-env: the real HOME's Eitri directories changed during this run\n" >&2
 		exit 97
 	fi
 fi

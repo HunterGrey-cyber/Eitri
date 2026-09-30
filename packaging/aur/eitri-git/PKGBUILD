@@ -1,6 +1,6 @@
 # Maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
 #
-# eitri-git -- built from source: the public eitri repo, its neovide fork submodule and the
+# eitri-git -- built from source: the public Eitri repo, its neovide fork submodule and the
 # public Verdandi repo (for the sidecar's source), plus Node for the Node SEA build. See
 # packaging/aur/eitri-bin/PKGBUILD's own header for the licence note this package repeats below
 #.
@@ -72,7 +72,7 @@ prepare() {
 	# The dependency pin must be a full commit id before checking out the matching source.
 	_at_line=$(grep -E '^claude-runtime-protocol[[:space:]]*=' agent/Cargo.toml | head -n1)
 	if [ -z "$_at_line" ]; then
-		printf '==> ERROR: %s\n' "agent/Cargo.toml has no claude-runtime-protocol dependency: not the eitri tree this PKGBUILD expects" >&2
+		printf '==> ERROR: %s\n' "agent/Cargo.toml has no claude-runtime-protocol dependency: not the Eitri tree this PKGBUILD expects" >&2
 		return 1
 	fi
 	_verdandi_rev=$(printf '%s\n' "$_at_line" | sed -n 's/.*rev[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')

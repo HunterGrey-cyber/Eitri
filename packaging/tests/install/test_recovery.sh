@@ -28,7 +28,7 @@ t_recover_old_moved_back() {
 	expect_rc 0
 	expect_out "restoring $TH/.local/lib/eitri from $TH/.local/lib/eitri.old"
 	# Moved back first, so the same version is then up to date and nothing else changes.
-	expect_out 'eitri 1.0.0 is up to date'
+	expect_out 'Eitri 1.0.0 is up to date'
 	expect_absent "$TH/.local/lib/eitri.old"
 	expect_eq "$(snap "$TH/.local/lib/eitri")" "$before" "the restored install"
 }
@@ -68,7 +68,7 @@ t_lock_live_refuses() {
 	kill "$holder" 2>/dev/null
 	wait "$holder" 2>/dev/null
 	expect_fail "a lock held by a live pid"
-	expect_out "another eitri installer (pid $holder) is running"
+	expect_out "another Eitri installer (pid $holder) is running"
 	expect_absent "$TH/.local/lib/eitri"
 	# The lock belongs to the live holder: a refused run leaves it.
 	expect_file "$TH/.cache/eitri/lock/pid"
@@ -113,7 +113,7 @@ t_lock_takeover_blocked_while_live() {
 	expect_fail "a stale lock whose own takeover another run is already mid-way through"
 	# Contention for lock.takeover only shows that another run is checking the lock.
 	# The message must not claim the outer lock is stale before this run has checked it.
-	expect_out "another eitri installer (pid $holder) is already checking the lock $TH/.cache/eitri/lock"
+	expect_out "another Eitri installer (pid $holder) is already checking the lock $TH/.cache/eitri/lock"
 	expect_absent "$TH/.local/lib/eitri"
 	# Neither lock was disturbed: the stale one still has its own original (dead) pid, and the
 	# takeover sub-lock still has the other run's (then-live) one -- nothing was renamed, restored
@@ -217,7 +217,7 @@ t_swap_fails_restores() {
 	inst_net --stubs "$S/stubs-mvfail" --
 	expect_fail "a failed swap"
 	expect_out 'mv: simulated failure of the swap'
-	expect_no_out 'installed eitri 1.1.0'
+	expect_no_out 'installed Eitri 1.1.0'
 	expect_eq "$(installed_version)" 1.0.0 "the version after a failed swap"
 	expect_eq "$(snap_but_staging "$TH")" "$before" "the home after a failed swap"
 }
@@ -249,7 +249,7 @@ t_set_e_tar_fails() {
 	expect_fail "tar failing inside a function"
 	expect_out 'tar: simulated failure'
 	expect_out 'could not unpack'
-	expect_no_out 'installed eitri 1.1.0'
+	expect_no_out 'installed Eitri 1.1.0'
 	expect_eq "$(snap "$TH")" "$before" "the home after tar failed"
 }
 
@@ -356,7 +356,7 @@ t_upgrade_unwritable_bindir() {
 	chmod 0755 "$TH/.local/bin"
 	expect_fail "an upgrade with an unwritable ~/.local/bin"
 	expect_out "cannot write $TH/.local/bin/.eitri.tmp."
-	expect_no_out 'installed eitri 1.1.0'
+	expect_no_out 'installed Eitri 1.1.0'
 	expect_eq "$(installed_version)" 1.0.0 "the version after the refused upgrade"
 	expect_eq "$(snap_but_staging "$TH")" "$before" "the home after the refused upgrade"
 	# Once the directory is writable, the same run goes through.
@@ -381,14 +381,14 @@ t_interrupted_after_swap_rerun_finishes() {
 	inst_net
 	expect_rc 0
 	expect_no_out 'is up to date'
-	expect_out 'installed eitri 1.0.0'
+	expect_out 'installed Eitri 1.0.0'
 	expect_exec "$TH/.local/bin/eitri"
 	expect_file "$(data_of)/applications/eitri.desktop"
 	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do expect_file "$(data_of)/licenses/eitri/$f"; done
 	# And now it is finished, a re-run is up to date.
 	inst_net
 	expect_rc 0
-	expect_out 'eitri 1.0.0 is up to date'
+	expect_out 'Eitri 1.0.0 is up to date'
 }
 
 TESTS="$TESTS t_interrupted_upgrade_stale_old_files_not_up_to_date"
@@ -412,10 +412,10 @@ t_interrupted_upgrade_stale_old_files_not_up_to_date() {
 	inst_net --version 1.1.0
 	expect_rc 0
 	expect_no_out 'is up to date'
-	expect_out 'installed eitri 1.1.0'
+	expect_out 'installed Eitri 1.1.0'
 	expect_eq "$(sed -n 's/^SOURCE for //p' "$(data_of)/licenses/eitri/SOURCE")" 1.1.0 "SOURCE, now the new release's own"
 	# And now it really is finished: a further re-run is up to date.
 	inst_net --version 1.1.0
 	expect_rc 0
-	expect_out 'eitri 1.1.0 is up to date'
+	expect_out 'Eitri 1.1.0 is up to date'
 }

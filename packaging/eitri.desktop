@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=eitri
+Name=Eitri
 Comment=Neovim, embedded, with a Claude agent panel
 Exec=/usr/bin/eitri --quiet %f
 Terminal=false

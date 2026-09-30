@@ -8,7 +8,7 @@ t_root_refused() {
 	serve 1.0.0
 	inst_net --stubs "$S/stubs-root" --
 	expect_fail "running as root"
-	expect_out 'do not run this as root: run it as the user who will run eitri'
+	expect_out 'do not run this as root: run it as the user who will run Eitri'
 	expect_out '--allow-root'
 	expect_absent "$TH/.local/lib/eitri"
 	inst --stubs "$S/stubs-root" -- --uninstall
@@ -156,7 +156,7 @@ t_gtk_412_ubuntu_hint() {
 	serve 1.0.0
 	inst_net --set "EITRI_INSTALL_TEST_LIBDIRS=$S/libs/gtk412" --set "EITRI_INSTALL_TEST_OS_RELEASE=$S/osrel/ubuntu-22.04" --
 	expect_fail "GTK 4.12"
-	expect_out 'this system has GTK 4.12.3, and eitri needs GTK 4.14 or newer'
+	expect_out 'this system has GTK 4.12.3, and Eitri needs GTK 4.14 or newer'
 	expect_out 'Ubuntu 22.04 ships GTK 4.12.3; Ubuntu 24.04 or newer has 4.14: upgrade to it'
 	expect_absent "$TH/.local/lib/eitri"
 	expect_absent "$TH/.cache"

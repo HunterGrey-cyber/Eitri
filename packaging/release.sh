@@ -705,7 +705,7 @@ host_main() {
 	trap cleanup_containers EXIT
 	trap 'cleanup_containers; exit 130' INT TERM
 	local started=$SECONDS names=() name
-	say "releasing eitri $RS_VERSION from $RS_SOURCE at $RS_COMMIT (neovide $RS_FORK_COMMIT, Verdandi $RS_VERDANDI_REV) into $RS_REL"
+	say "releasing Eitri $RS_VERSION from $RS_SOURCE at $RS_COMMIT (neovide $RS_FORK_COMMIT, Verdandi $RS_VERDANDI_REV) into $RS_REL"
 	build_image
 	phase_f
 	phase_b
@@ -731,7 +731,7 @@ host_main() {
 	local gh_line paths=()
 	for name in "${names[@]}"; do paths+=("$RS_REL/$name"); done
 	gh_line="$(python3 "$RS_SOURCE/packaging/release_check.py" gh-release-command "$RS_VERSION" \
-		--repo "${RS_PUBLIC_REPO#https://github.com/}" --title "eitri $RS_VERSION" --notes-file "$RS_NOTES" \
+		--repo "${RS_PUBLIC_REPO#https://github.com/}" --title "Eitri $RS_VERSION" --notes-file "$RS_NOTES" \
 		"${paths[@]}")"
 	echo
 	if [ "$RS_NO_LEAK_SCAN" = 1 ]; then
@@ -742,7 +742,7 @@ host_main() {
 		[ -n "$RS_NVIM_VERSION" ] || echo "REHEARSAL -- RELEASE has no NVIM_VERSION/NVIM_SHA256_linux_x86_64: pins.env has no nvim pin yet."
 		[ -z "$RS_VERDANDI_MIRROR" ] || echo "REHEARSAL -- Verdandi $RS_VERDANDI_REV was read from $RS_VERDANDI_MIRROR, not its public URL."
 	fi
-	echo "eitri $RS_VERSION is in $RS_REL ($(( (SECONDS - started) / 60 )) min); logs in $RS_LOGS."
+	echo "Eitri $RS_VERSION is in $RS_REL ($(( (SECONDS - started) / 60 )) min); logs in $RS_LOGS."
 	echo "The rest is by hand, in this order -- this script runs none of it:"
 	echo "  publish/tag.sh $RS_SOURCE $RS_REL"
 	echo "  git -C $RS_SOURCE push origin HEAD:main"
@@ -935,7 +935,7 @@ ctr_phase_b() {
 	find "$tb/$tt" -exec touch -h -d "@$sde" {} +
 	ctr_tar "$tt" "$tb" "$out/$tt.tar.gz"
 
-	step "the eitri source asset: git archive, neovide, vendor/, proto/, the web bundle, Skia"
+	step "the Eitri source asset: git archive, neovide, vendor/, proto/, the web bundle, Skia"
 	local sa="eitri-$RS_VERSION-source" sd=/build/check/source-tree
 	rm -rf "$sd"; mkdir -p "$sd/$sa/neovide"
 	git archive --format=tar HEAD | tar -x -C "$sd/$sa"
@@ -1032,7 +1032,7 @@ ctr_proof() {
 	[ -n "$copy" ] && [ -n "$unlock" ] && [ -n "$build" ] && [ "${#patch[@]}" = 2 ] || ctr_die "cannot read SOURCE's relink recipe"
 	bash -c "$copy"
 	bash -c "$unlock"
-	printf '\n// eitri release proof: a trivial change (LGPL-3.0 sec 4(d)(0) relink recipe)\npub const EITRI_RELINK_PROOF: u32 = 1;\n' \
+	printf '\n// Eitri release proof: a trivial change (LGPL-3.0 sec 4(d)(0) relink recipe)\npub const EITRI_RELINK_PROOF: u32 = 1;\n' \
 		>> "$modified/src/lib.rs"
 	printf '\n%s\n' "${patch[@]}" >> Cargo.toml
 	bash -c "$build" 2>&1 | tee "$logs/proof-b-build.log"

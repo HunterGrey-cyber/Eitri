@@ -8,7 +8,7 @@
 #
 #   --sh           the shell every installer run uses (`bash`, or `/bin/sh` = dash in the image)
 #   --scratch      an empty or absent directory under ~/.cache (never /tmp); kept on failure
-#   --real-home    the real HOME, whose eitri directories run-in-env.sh guards on every run
+#   --real-home    the real HOME, whose Eitri directories run-in-env.sh guards on every run
 #                  (on the host; the image cannot see it, and test_install.py guards around it)
 #   --server-port  a fixture server already serving <scratch>/srv on 127.0.0.1, for a hand run
 #                  against a server of your own. Without it (how test_install.py runs both halves:

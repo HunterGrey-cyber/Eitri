@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch eitri on your real desktop, with the account and the backend stated rather than inherited.
+# Launch Eitri on your real desktop, with the account and the backend stated rather than inherited.
 #
 #   ./try-eitri.sh                      # sidecar backend, your own project dir (cwd)
 #   ./try-eitri.sh ~/some/project       # sidecar backend, that project

@@ -89,7 +89,7 @@ contents:
   # The .deb only: no rpm-based distribution restricts user namespaces this way. A conffile
   # (config|noreplace), so a site's edit survives an upgrade, and nothing loads it -- this package has
   # no maintainer scripts: the next restart does, or `sudo apparmor_parser -r /etc/apparmor.d/eitri`,
-  # which eitri itself prints in the agent panel's place until it is loaded.
+  # which Eitri itself prints in the agent panel's place until it is loaded.
   - src: ./packaging/apparmor/eitri
     dst: /etc/apparmor.d/eitri
     type: config|noreplace
@@ -97,7 +97,7 @@ contents:
     file_info:
       mode: 0644
 
-  # eitri's own licence, the notices for everything else this package links or bundles
+  # Eitri's own licence, the notices for everything else this package links or bundles
   # (packaging/collect-licenses.py --no-sidecar), and the LGPL-3.0 sec 4(d)(0) /
   # GPL-3.0 sec 6(d) Corresponding Source notice naming the source asset and the exact relink
   # recipe. All three are the public release's own files (release.sh writes them before staging

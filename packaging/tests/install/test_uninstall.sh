@@ -37,7 +37,7 @@ t_uninstall_exact() {
 	inst -- --uninstall
 	expect_rc 0
 	expect_eq "$(tree "$TH")" "$KEPT_TREE" "the tree after --uninstall"
-	expect_out 'eitri is uninstalled'
+	expect_out 'Eitri is uninstalled'
 	expect_out "kept your settings ($TH/.config/eitri) and state ($TH/.local/state/eitri)"
 	# Again: nothing left to remove.
 	inst -- --uninstall
@@ -127,7 +127,7 @@ refused_with_system_release() {
 	inst -- --uninstall
 	expect_fail "an uninstall with a system RELEASE of [$1]"
 	expect_out "$S/system/RELEASE names no valid VERDANDI_REV"
-	expect_out 'reinstall or remove the eitri package that owns it'
+	expect_out 'reinstall or remove the Eitri package that owns it'
 	expect_eq "$(snap_but_lock "$TH")" "$before" "the home after a refused uninstall ([$1])"
 	serve 1.1.0 1.0.0
 	srv_mark
@@ -244,7 +244,7 @@ TESTS="$TESTS t_xdg_newline_refused"
 t_xdg_newline_refused() {
 	# An XDG_DATA_HOME/XDG_CACHE_HOME/XDG_STATE_HOME holding a newline once split the uninstall's
 	# newline-joined target list: XDG_DATA_HOME="$HOME/Documents<NL>$HOME/y" removed ~/Documents,
-	# with nothing of eitri installed at all. It is refused as a newline in HOME is -- never
+	# with nothing of Eitri installed at all. It is refused as a newline in HOME is -- never
 	# replaced by the default, where the Rust side, which takes the value as given, would disagree.
 	populate
 	mkdir -p "$TH/Documents" "$TH/y"
@@ -289,7 +289,7 @@ t_uninstall_through_foreign_symlink() {
 	if [ ! -L "$(data_of)/eitri" ]; then fail "the link itself was removed"; fi
 	expect_absent "$TH/.local/lib/eitri"
 	expect_absent "$TH/.local/bin/eitri"
-	# A link that leads to a directory named eitri (eitri's data moved elsewhere) is followed.
+	# A link that leads to a directory named eitri (Eitri's data moved elsewhere) is followed.
 	rm "$(data_of)/eitri"
 	mkdir -p "$T/elsewhere/eitri/nvim/0.11.4" "$T/elsewhere/eitri/sidecar/aaaaaaa"
 	ln -s "$T/elsewhere/eitri" "$(data_of)/eitri"
@@ -307,7 +307,7 @@ t_uninstall_symlinked_sidecar_root() {
 	# symlinked sidecar root, planted by the user in their own $XDG_DATA_HOME, was followed with no
 	# check, so a 7-hex-named directory BEHIND the link (a user's own, unrelated directory that
 	# merely happens to be named like a short git sha, e.g. a backup folder) was removed as if it
-	# were one of eitri's own sidecars. Reproduced (the verifier's
+	# were one of Eitri's own sidecars. Reproduced (the verifier's
 	# t_vprobe_symlinked_sidecar_root_uninstall): ~/backup/abcdef0/ was deleted.
 	serve 1.0.0
 	inst_net
@@ -337,7 +337,7 @@ t_uninstall_symlinked_sidecar_root() {
 
 TESTS="$TESTS t_uninstall_outside_cache_untouched"
 t_uninstall_outside_cache_untouched() {
-	# With XDG_CACHE_HOME outside HOME and eitri's cache directories there, uninstall refuses and
+	# With XDG_CACHE_HOME outside HOME and Eitri's cache directories there, uninstall refuses and
 	# says nothing was removed -- and nothing is: its exit cleanup once removed the download and
 	# unpack directories it had just refused to touch. Once they are gone (removed by hand, as the
 	# message says), the uninstall goes through.
@@ -348,7 +348,7 @@ t_uninstall_outside_cache_untouched() {
 		echo keep >"$oc/eitri/$p/keep"
 	done
 	inst --set "XDG_CACHE_HOME=$oc" -- --uninstall
-	expect_fail "an uninstall with eitri's cache outside HOME"
+	expect_fail "an uninstall with Eitri's cache outside HOME"
 	expect_out 'Nothing was removed'
 	expect_out "'$oc/eitri/download'"
 	for p in download unpack sidecar-build; do expect_file "$oc/eitri/$p/keep"; done
@@ -357,7 +357,7 @@ t_uninstall_outside_cache_untouched() {
 	rm -rf "$oc/eitri"
 	inst --set "XDG_CACHE_HOME=$oc" -- --uninstall
 	expect_rc 0
-	expect_out 'eitri is uninstalled'
+	expect_out 'Eitri is uninstalled'
 	expect_absent "$TH/.local/lib/eitri"
 	expect_absent "$oc/eitri"
 	expect_dir "$oc"

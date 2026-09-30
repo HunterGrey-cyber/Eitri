@@ -8,7 +8,7 @@ access.
 Fixtures are built at run time: real tarballs (`tarfile`), a real `.deb`-shaped archive (a small ar
 writer below, then extracted with the host's real `dpkg-deb -x`), a real `.rpm` (the host's real
 nfpm, then extracted with the host's real `bsdtar -xf`), and tiny throwaway git repositories (`git
-init` in scratch). Nothing here needs Docker, a network connection, or a built eitri release --
+init` in scratch). Nothing here needs Docker, a network connection, or a built Eitri release --
 every fixture is planted by the test itself. Scratch lives under ~/.cache, never /tmp (a small
 shared tmpfs on this project's own dev machines, not this test's call to assume otherwise
 elsewhere).
@@ -367,14 +367,14 @@ class GhReleaseCommandTests(unittest.TestCase):
 
     def test_the_cli_needs_the_repository_and_prints_one_shell_line(self):
         script = os.path.join(_PACKAGING, "release_check.py")
-        base = ["python3", script, "gh-release-command", "1.0.0-rc.1", "--title", "eitri 1.0.0-rc.1",
+        base = ["python3", script, "gh-release-command", "1.0.0-rc.1", "--title", "Eitri 1.0.0-rc.1",
                 "--notes-file", "n.md", "a.tar.gz"]
         missing = subprocess.run(base, capture_output=True, text=True)
         self.assertEqual(missing.returncode, 2, missing.stderr)
         ok = subprocess.run(base + ["--repo", self.REPO], capture_output=True, text=True)
         self.assertEqual(ok.returncode, 0, ok.stderr)
         self.assertEqual(ok.stdout, "gh release create v1.0.0-rc.1 --repo HunterGrey-cyber/eitri a.tar.gz "
-                                    "--verify-tag --prerelease --title 'eitri 1.0.0-rc.1' --notes-file n.md\n")
+                                    "--verify-tag --prerelease --title 'Eitri 1.0.0-rc.1' --notes-file n.md\n")
 
 
 # --- 4. Extraction plus content scans -----------------------------------------------------------
@@ -588,7 +588,7 @@ class TreeEqualityTests(unittest.TestCase):
         self.assertIn("sneaked-in.txt", ctx.exception.unexpected)
 
     def test_the_eitri_source_assets_known_additions_are_allowed(self):
-        """The eitri source asset equals `git archive HEAD` except exactly
+        """The Eitri source asset equals `git archive HEAD` except exactly
         vendor/, skia/, neovide/, proto/, .cargo/config.toml, agent-ui/web/dist/index.html,
         agent-ui/web/dist/.inputs-sha256, THIRD-PARTY-LICENSES and
         SOURCE."""
@@ -1676,7 +1676,7 @@ class RewritesNoOpTests(unittest.TestCase):
             self.assertNotIn(
                 rc.SEA_SENTINEL.encode("ascii"), content,
                 f"the joined SEA sentinel literal must not appear in {os.path.relpath(path, _PACKAGING)} "
-                "(M5) -- it would flag the eitri source asset's own copy of this file",
+                "(M5) -- it would flag the Eitri source asset's own copy of this file",
             )
 
 

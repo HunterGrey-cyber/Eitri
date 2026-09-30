@@ -150,7 +150,7 @@ t_from_source_clone_head_match_builds_and_installs() {
 		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --version 9.9.2 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 0
-	expect_out "building eitri 9.9.2 from source"
+	expect_out "building Eitri 9.9.2 from source"
 	if [ "$(grep -c '^cargo build ' "$S/logs/cargo.log")" != 1 ]; then
 		fail "cargo build did not run exactly once: $(cat "$S/logs/cargo.log")"
 	fi
@@ -248,7 +248,7 @@ t_from_source_older_version_refused() {
 		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
 		-- --from-source --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_fail "a from-source downgrade without --version"
-	expect_out 'eitri 9.9.10 is installed, and the release offered is older (9.9.9): refusing to downgrade silently'
+	expect_out 'Eitri 9.9.10 is installed, and the release offered is older (9.9.9): refusing to downgrade silently'
 	expect_out '--version 9.9.9'
 	expect_eq "$(snap "$TH")" "$before" "the home after a refused from-source downgrade"
 	if [ -f "$S/logs/cargo.log" ] && grep -q '^cargo build ' "$S/logs/cargo.log"; then
@@ -598,7 +598,7 @@ TESTS="$TESTS t_verdandi_checkout_rev_mismatch_refuses"
 t_verdandi_checkout_rev_mismatch_refuses() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
 	fs_verdandi_checkout "$T/verdandi-src"
-	# The eitri checkout pins a DIFFERENT rev than $T/verdandi-src is actually at.
+	# The Eitri checkout pins a DIFFERENT rev than $T/verdandi-src is actually at.
 	fs_repo 1.0.0 ssh://git@example.invalid/grey/verdandi.git ffffffff00000000000000000000000000000000
 	PRE_STUBS=$(fs_cargo_stubs)
 	inst -- --from-source --checkout "$FS_DIR" --verdandi-checkout "$T/verdandi-src"

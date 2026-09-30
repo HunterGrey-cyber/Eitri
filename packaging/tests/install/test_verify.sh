@@ -55,7 +55,7 @@ t_file_listed_twice() {
 	relatest 1.0.0
 	inst_net
 	expect_fail "a tarball listed twice"
-	expect_out 'SHA256SUMS lists more than one eitri tarball'
+	expect_out 'SHA256SUMS lists more than one Eitri tarball'
 	expect_absent "$TH/.local/lib/eitri"
 	# A second line for the same file that the version pattern does not see (one space, not two):
 	# the per-file rule -- exactly one line whose second field is the name -- refuses it.
@@ -80,7 +80,7 @@ t_two_tarball_lines() {
 	relatest 1.1.0
 	inst_net
 	expect_fail "two tarball lines"
-	expect_out 'SHA256SUMS lists more than one eitri tarball'
+	expect_out 'SHA256SUMS lists more than one Eitri tarball'
 	expect_absent "$TH/.local/lib/eitri"
 }
 
@@ -112,7 +112,7 @@ t_older_version_refused() {
 	before=$(snap "$TH")
 	inst_net
 	expect_fail "a downgrade without --version"
-	expect_out 'eitri 1.1.0 is installed, and the release offered is older (1.0.0)'
+	expect_out 'Eitri 1.1.0 is installed, and the release offered is older (1.0.0)'
 	expect_out '--version 1.0.0'
 	expect_eq "$(snap "$TH")" "$before" "the home after a refused downgrade"
 	inst_net --version 1.0.0

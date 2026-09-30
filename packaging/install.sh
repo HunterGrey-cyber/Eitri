@@ -23,7 +23,7 @@ set -eu
 NV_DEFAULT_BASE_URL='https://github.com/HunterGrey-cyber/eitri'
 NV_LAUNCHER_MARKER='# eitri-launcher v1'
 # The second line of the launcher the old root install.sh wrote: recognised as
-# eitri's own and replaced, although it predates the marker.
+# Eitri's own and replaced, although it predates the marker.
 NV_OLD_LAUNCHER_LINE2='# neovibe, installed by install.sh. Everything it decides is printed before the window opens.'
 NV_SIGNER_IDENTITY='release@eitri'
 NV_SIGNATURE_NAMESPACE='eitri-release'
@@ -41,7 +41,7 @@ NV_ISSUES='https://github.com/HunterGrey-cyber/eitri/issues'
 NV_SIDECAR_PROTOCOL_MAJOR=3
 NV_NODE_DIST_BASE=https://nodejs.org/dist
 NV_SIDECAR_BUILD_MIN_KIB=614400
-# The nvim offer. Never eitri's own release server -- this is neovim's own GitHub
+# The nvim offer. Never Eitri's own release server -- this is neovim's own GitHub
 # releases. nvim_dist_base's own test-mode default (a refused loopback port) keeps every test that
 # forgets to redirect it from reaching the real host, the same discipline as node_dist_base.
 NV_NVIM_DIST_BASE=https://github.com/neovim/neovim/releases/download
@@ -119,7 +119,7 @@ die() {
 
 usage() {
 	cat <<'EOF'
-eitri installer -- installs eitri for the user running it, into ~/.local.
+Eitri installer -- installs Eitri for the user running it, into ~/.local.
 
 usage: sh install.sh [options]
 
@@ -130,16 +130,16 @@ usage: sh install.sh [options]
                                non-interactive answers to the prompt offering to install a private
                                copy of nvim; --yes is the generic affirmative, --no-nvim/--with-nvim
                                answer it by name
-  --nvim-only                  the nvim offer alone, for an already-installed eitri (reads RELEASE
+  --nvim-only                  the nvim offer alone, for an already-installed Eitri (reads RELEASE
                                beside this script, or --release-file FILE); always fetches unless
                                that exact nvim is already installed privately, and a download
                                failure is fatal
   --nvim-offer                 the same nvim offer a normal install runs, for an already-installed
-                               eitri -- skipped when the nvim already on PATH is new enough, when
+                               Eitri -- skipped when the nvim already on PATH is new enough, when
                                the release's nvim is already installed privately, or with --no-nvim;
                                a download failure only warns
   --from-source [--checkout DIR] [--verdandi-checkout DIR [--allow-verdandi-rev-mismatch]]
-                               build eitri from source, then install exactly like a prebuilt
+                               build Eitri from source, then install exactly like a prebuilt
                                release. Without --checkout: clone the public repo at the chosen
                                version's tag and refuse unless its HEAD matches the verified
                                release's EITRI_COMMIT. With --checkout DIR: build DIR as it is,
@@ -158,11 +158,11 @@ usage: sh install.sh [options]
   --release-signers FILE       check SHA256SUMS.sig against FILE instead of the key built into this
                                installer (release candidates, tests); warns every time
   --allow-root                 run as root anyway (containers)
-  --uninstall [--purge]        remove eitri; --purge also removes ~/.config/eitri and its state
+  --uninstall [--purge]        remove Eitri; --purge also removes ~/.config/eitri and its state
   --dry-run                    print every action without doing it
   --keep-build                 keep the sidecar build directory
   --sidecar-only [--release-file FILE]
-                               build the sidecar alone, for an already-installed eitri; reads
+                               build the sidecar alone, for an already-installed Eitri; reads
                                RELEASE from beside this script, or FILE. `eitri setup` with no
                                mode flag runs this, then --nvim-offer above
   --build-sidecar-into DIR --node TARBALL --verdandi-source TARBALL [--release-file FILE]
@@ -321,7 +321,7 @@ set_paths() {
 	NV_SYSTEM_RELEASE=/usr/lib/eitri/RELEASE
 	# What rev_of_release tells the user to do about a system RELEASE it cannot use: that file is a
 	# package's, which this installer never touches.
-	NV_SYSTEM_REMEDY='reinstall or remove the eitri package that owns it (this installer never changes it)'
+	NV_SYSTEM_REMEDY='reinstall or remove the Eitri package that owns it (this installer never changes it)'
 	NV_OS_RELEASE=/etc/os-release
 	NV_TEST_LIBDIRS=
 	if [ "${EITRI_INSTALL_TEST-}" = 1 ]; then
@@ -342,7 +342,7 @@ set_paths() {
 check_data_home() {
 	_cdh_ok=$(under_home "$NV_DATA")
 	if [ "$_cdh_ok" != 1 ]; then
-		die "XDG_DATA_HOME resolves to $NV_DATA, which is not inside $NV_HOME: eitri writes its desktop entry, licences, private nvim and sidecar there, and --uninstall can only ever remove paths inside \$HOME. Set XDG_DATA_HOME to a directory under \$HOME (or unset it) and re-run"
+		die "XDG_DATA_HOME resolves to $NV_DATA, which is not inside $NV_HOME: Eitri writes its desktop entry, licences, private nvim and sidecar there, and --uninstall can only ever remove paths inside \$HOME. Set XDG_DATA_HOME to a directory under \$HOME (or unset it) and re-run"
 	fi
 }
 
@@ -597,7 +597,7 @@ check_root() {
 		warn "running as root (--allow-root): everything is installed into root's own home, $NV_HOME"
 		return 0
 	fi
-	die "do not run this as root: run it as the user who will run eitri (the sidecar is built per user into \$XDG_DATA_HOME, and as root npm would run every dependency's install script as root). In a container, pass --allow-root."
+	die "do not run this as root: run it as the user who will run Eitri (the sidecar is built per user into \$XDG_DATA_HOME, and as root npm would run every dependency's install script as root). In a container, pass --allow-root."
 }
 
 check_platform() {
@@ -608,7 +608,7 @@ check_platform() {
 	# --from-source, which always failed later at the Skia fetch (the only pinned archive is
 	# x86_64) -- v1 builds x86_64 only, full stop, and do_from_source now refuses the same
 	# architectures up front for the same reason, so this no longer points anywhere that works.
-	*) die "prebuilt eitri releases are for x86_64 Linux only, and this is $_cp. v1 builds x86_64 only: there is no working install path for another architecture yet" ;;
+	*) die "prebuilt Eitri releases are for x86_64 Linux only, and this is $_cp. v1 builds x86_64 only: there is no working install path for another architecture yet" ;;
 	esac
 }
 
@@ -620,13 +620,13 @@ check_glibc() {
 		_cg=$(ldd --version 2>&1 | head -n 1) || _cg=
 		case $_cg in
 		*GNU*libc* | *GLIBC*) _cg=${_cg##* } ;;
-		*) die "eitri's prebuilt binaries need glibc $NV_GLIBC_FLOOR or newer, and this system does not appear to use glibc: build from source instead (sh install.sh --from-source)" ;;
+		*) die "Eitri's prebuilt binaries need glibc $NV_GLIBC_FLOOR or newer, and this system does not appear to use glibc: build from source instead (sh install.sh --from-source)" ;;
 		esac
 		;;
 	esac
 	_cg_c=$(dotted_cmp "$_cg" "$NV_GLIBC_FLOOR")
 	if [ "$_cg_c" = -1 ]; then
-		die "eitri's prebuilt binaries need glibc $NV_GLIBC_FLOOR or newer (they are built on Ubuntu 24.04), and this system has $_cg. Releases that have it: Ubuntu 24.04, Debian 13, Fedora 40, RHEL 10, Arch. Upgrade, or build from source (sh install.sh --from-source)."
+		die "Eitri's prebuilt binaries need glibc $NV_GLIBC_FLOOR or newer (they are built on Ubuntu 24.04), and this system has $_cg. Releases that have it: Ubuntu 24.04, Debian 13, Fedora 40, RHEL 10, Arch. Upgrade, or build from source (sh install.sh --from-source)."
 	fi
 }
 
@@ -733,18 +733,18 @@ check_gtk_webkit() {
 	done
 	_gw_hint=$(runtime_hint)
 	if [ -z "$_gw_ver" ]; then
-		die "GTK 4 (libgtk-4.so.1) was not found; eitri needs GTK 4.14 or newer and WebKitGTK 6.0: $_gw_hint"
+		die "GTK 4 (libgtk-4.so.1) was not found; Eitri needs GTK 4.14 or newer and WebKitGTK 6.0: $_gw_hint"
 	fi
 	_gw_minor=${_gw_ver#4.}
 	_gw_minor=${_gw_minor%%.*}
 	if [ "$_gw_minor" -lt "$NV_GTK_FLOOR_MINOR" ]; then
 		_gw_old=$(gtk_too_old_hint "$_gw_ver")
-		die "this system has GTK $_gw_ver, and eitri needs GTK 4.$NV_GTK_FLOOR_MINOR or newer: its binaries are built against 4.$NV_GTK_FLOOR_MINOR's API on Ubuntu 24.04. $_gw_old."
+		die "this system has GTK $_gw_ver, and Eitri needs GTK 4.$NV_GTK_FLOOR_MINOR or newer: its binaries are built against 4.$NV_GTK_FLOOR_MINOR's API on Ubuntu 24.04. $_gw_old."
 	fi
 	lib_dirs_for libwebkitgtk-6.0.so.4
 	_gw_wk=$LD_DIRS
 	if [ -z "$_gw_wk" ]; then
-		die "WebKitGTK 6.0 (libwebkitgtk-6.0.so.4) was not found; eitri's agent panel needs it: $_gw_hint"
+		die "WebKitGTK 6.0 (libwebkitgtk-6.0.so.4) was not found; Eitri's agent panel needs it: $_gw_hint"
 	fi
 	say "GTK $_gw_ver and WebKitGTK 6.0: ok"
 }
@@ -755,19 +755,19 @@ check_gtk_webkit() {
 nvim_check() {
 	NV_NVIM_OK=0
 	if ! command -v nvim >/dev/null 2>&1; then
-		warn "nvim was not found on PATH. eitri needs nvim $NV_NVIM_FLOOR or newer: install it from your distribution or https://github.com/neovim/neovim/releases"
+		warn "nvim was not found on PATH. Eitri needs nvim $NV_NVIM_FLOOR or newer: install it from your distribution or https://github.com/neovim/neovim/releases"
 		return 0
 	fi
 	_rn=$(nvim --version 2>/dev/null | head -n 1) || _rn=
 	_rn_v=${_rn#NVIM v}
 	_rn_v=${_rn_v%%[!0-9.]*}
 	if [ -z "$_rn_v" ]; then
-		warn "could not parse nvim's version ($_rn); eitri needs nvim $NV_NVIM_FLOOR or newer"
+		warn "could not parse nvim's version ($_rn); Eitri needs nvim $NV_NVIM_FLOOR or newer"
 		return 0
 	fi
 	_rn_c=$(dotted_cmp "$_rn_v" "$NV_NVIM_FLOOR")
 	if [ "$_rn_c" = -1 ]; then
-		warn "nvim $_rn_v is older than $NV_NVIM_FLOOR, which eitri needs (its editor refuses older ones): install a newer nvim from https://github.com/neovim/neovim/releases"
+		warn "nvim $_rn_v is older than $NV_NVIM_FLOOR, which Eitri needs (its editor refuses older ones): install a newer nvim from https://github.com/neovim/neovim/releases"
 	else
 		say "nvim $_rn_v: ok"
 		NV_NVIM_OK=1
@@ -775,7 +775,7 @@ nvim_check() {
 }
 
 # nvim_dist_base: where the pinned nvim release tarball is fetched from -- neovim's own GitHub
-# releases, never eitri's release server. Fixed in production; test mode redirects it to
+# releases, never Eitri's release server. Fixed in production; test mode redirects it to
 # a fixture server, and -- deliberately, the same discipline as node_dist_base -- an unset override
 # does NOT fall back to the real github.com: a test that forgets to set it must fail fast against a
 # refused loopback port, never spend real time downloading a real nvim release.
@@ -813,7 +813,7 @@ install_nvim_version() {
 	curl_get "$(nvim_dist_base)/v$_inv_version/nvim-linux-x86_64.tar.gz" "$_inv_tar.part"
 	if [ "$CG_OK" != 1 ]; then
 		if [ "$_inv_tolerant" = 1 ]; then
-			warn "could not download nvim $_inv_version ($CG_ERR): eitri is installed without a private copy; run \"eitri setup --nvim-only\" once you have network access"
+			warn "could not download nvim $_inv_version ($CG_ERR): Eitri is installed without a private copy; run \"eitri setup --nvim-only\" once you have network access"
 			return 0
 		fi
 		die "could not download nvim $_inv_version: $CG_ERR"
@@ -840,7 +840,7 @@ install_nvim_version() {
 	mv -- "$_inv_tmp" "$_inv_dest" || die "cannot move the extracted nvim into $_inv_dest"
 	NV_NVIM_TMP_DEST=
 	rm -rf -- "$_inv_workdir" || :
-	say "installed nvim $_inv_version into $_inv_dest (never on PATH; eitri finds it on its own)"
+	say "installed nvim $_inv_version into $_inv_dest (never on PATH; Eitri finds it on its own)"
 }
 
 # maybe_offer_nvim: offer nvim after unpack_new or from_source_stage has provided a parsed
@@ -857,7 +857,7 @@ maybe_offer_nvim() {
 	# architecture's binary and nvim_bin.rs then preferred it over a perfectly good system nvim. F4
 	# made the --from-source route here unreachable off
 	# x86_64 too (do_from_source now refuses non-x86_64 up front, before this is ever called), so
-	# --nvim-offer (a real caller: eitri's own post-install "run eitri setup" path) is the only
+	# --nvim-offer (a real caller: Eitri's own post-install "run eitri setup" path) is the only
 	# way left to reach this function on another architecture -- this check still guards it.
 	_mon_uname=$(uname -m) || _mon_uname=
 	if [ "$_mon_uname" != x86_64 ]; then
@@ -913,7 +913,7 @@ maybe_offer_nvim() {
 # the present sidecar says it supports.
 report_claude() {
 	if ! command -v claude >/dev/null 2>&1; then
-		warn "the claude CLI was not found on PATH; eitri's agent panel runs it. Install it with Anthropic's installer: curl -fsSL https://claude.ai/install.sh | bash"
+		warn "the claude CLI was not found on PATH; Eitri's agent panel runs it. Install it with Anthropic's installer: curl -fsSL https://claude.ai/install.sh | bash"
 		return 0
 	fi
 	_rc=$(claude --version 2>/dev/null | head -n 1) || _rc=
@@ -1025,8 +1025,8 @@ sums_hash() {
 tarball_version() {
 	_tv=$(printf '%s\n' "$NV_SUMS_TEXT" | grep -E "^[0-9a-f]{64}  eitri-$NV_VERSION_ERE-x86_64-linux\\.tar\\.gz\$") || _tv=
 	case $_tv in
-	'') die "SHA256SUMS lists no eitri-<version>-x86_64-linux.tar.gz: this is not a eitri release (check --base-url or --version)" ;;
-	*"$NV_NL"*) die "SHA256SUMS lists more than one eitri tarball, so which version it is cannot be told: refusing. Report it at $NV_ISSUES" ;;
+	'') die "SHA256SUMS lists no eitri-<version>-x86_64-linux.tar.gz: this is not an Eitri release (check --base-url or --version)" ;;
+	*"$NV_NL"*) die "SHA256SUMS lists more than one Eitri tarball, so which version it is cannot be told: refusing. Report it at $NV_ISSUES" ;;
 	esac
 	_tv=${_tv#*  eitri-}
 	printf '%s\n' "${_tv%-x86_64-linux.tar.gz}"
@@ -1077,7 +1077,7 @@ curl_get() {
 }
 
 # node_arch: sets NV_NODE_ARCH from uname -m, matching how packaging/pins.env and buildBinary.mjs
-# name the two Node platforms eitri pins (x64/arm64, not uname's own x86_64/aarch64).
+# name the two Node platforms Eitri pins (x64/arm64, not uname's own x86_64/aarch64).
 node_arch() {
 	NV_NODE_ARCH=
 	_na=$(uname -m) || die "uname failed"
@@ -1122,7 +1122,7 @@ check_sidecar_build_space() {
 # (the heredoc's own). packaging/tests/install/ asserts the block is byte-equal to that file.
 embedded_release_signers() {
 	cat <<'EITRI_RELEASE_SIGNERS'
-# eitri release signers.
+# Eitri release signers.
 #
 # ssh-keygen's allowed_signers format. packaging/install.sh embeds this file byte for byte (a test
 # holds the two equal) and checks a release's SHA256SUMS.sig with exactly:
@@ -1517,7 +1517,7 @@ acquire_lock() {
 			if [ -z "$_al_tk_pid" ]; then
 				# A holder that dies between mkdir and writing its pid can leave a permanently stuck sub-lock.
 				# Name $_al_takeover in the error so the user can remove it after checking no installer runs.
-				die "$_al_takeover holds no pid, so whether another eitri installer is using or recovering the lock $NV_LOCK cannot be told: if none is running, remove $_al_takeover and re-run"
+				die "$_al_takeover holds no pid, so whether another Eitri installer is using or recovering the lock $NV_LOCK cannot be told: if none is running, remove $_al_takeover and re-run"
 			fi
 			_al_tk_dead=0
 			_al_tk_live=$(pid_alive "$_al_tk_pid")
@@ -1525,10 +1525,10 @@ acquire_lock() {
 			if [ "$_al_tk_dead" != 1 ]; then
 				# Two runs can contend for $_al_takeover while NV_LOCK is either live or stale.
 				# This run has not checked NV_LOCK yet, so the message must not call it stale.
-				die "another eitri installer (pid $_al_tk_pid) is already checking the lock $NV_LOCK: wait a moment and re-run"
+				die "another Eitri installer (pid $_al_tk_pid) is already checking the lock $NV_LOCK: wait a moment and re-run"
 			fi
 			if ! rm -rf -- "$_al_takeover" 2>/dev/null || ! mkdir -- "$_al_takeover" 2>/dev/null; then
-				die "another eitri installer is already checking the lock $NV_LOCK: wait a moment and re-run"
+				die "another Eitri installer is already checking the lock $NV_LOCK: wait a moment and re-run"
 			fi
 		fi
 		printf '%s\n' "$$" >"$_al_takeover/pid" 2>/dev/null || :
@@ -1542,7 +1542,7 @@ acquire_lock() {
 			# Worded like the other collisions on $_al_takeover above, not "recovering the stale
 			# lock": NV_LOCK's own pid has not been read yet at this point (that happens below), so
 			# whether it is actually stale is not yet known here either.
-			die "another eitri installer is also checking the lock $NV_LOCK right now: wait a moment and re-run"
+			die "another Eitri installer is also checking the lock $NV_LOCK right now: wait a moment and re-run"
 		fi
 		# From here to the fresh mkdir below runs under that sub-lock: the pid is read fresh (never
 		# an outer read a concurrent run's own takeover might have raced against) and NV_LOCK is
@@ -1557,12 +1557,12 @@ acquire_lock() {
 		fi
 		if [ -z "$_al_pid" ]; then
 			rm -rf -- "$_al_takeover" || :
-			die "the lock $NV_LOCK holds no pid, so whether another eitri installer is using it cannot be told: if none is running, remove $NV_LOCK and re-run"
+			die "the lock $NV_LOCK holds no pid, so whether another Eitri installer is using it cannot be told: if none is running, remove $NV_LOCK and re-run"
 		fi
 		_al_live=$(pid_alive "$_al_pid")
 		if [ "$_al_live" = 1 ]; then
 			rm -rf -- "$_al_takeover" || :
-			die "another eitri installer (pid $_al_pid) is running: wait for it to finish and re-run. If none is running, remove $NV_LOCK and re-run"
+			die "another Eitri installer (pid $_al_pid) is running: wait for it to finish and re-run. If none is running, remove $NV_LOCK and re-run"
 		fi
 		warn "taking over a lock left by an installer that is no longer running (pid $_al_pid)"
 		# Removed directly, never renamed aside first: nothing else can be modifying NV_LOCK while
@@ -1576,7 +1576,7 @@ acquire_lock() {
 			# exist) landing in the instant between the rm -rf above and this mkdir. Reported the
 			# same way an ordinary lock collision always is, never treated as corruption.
 			rm -rf -- "$_al_takeover" || :
-			die "another eitri installer took the lock $NV_LOCK just now: wait for it to finish and re-run"
+			die "another Eitri installer took the lock $NV_LOCK just now: wait for it to finish and re-run"
 		fi
 		rm -rf -- "$_al_takeover" || :
 	fi
@@ -1703,7 +1703,7 @@ sidecar_download_node() {
 	curl_get "$_sdn_url" "$_sdn_out.part"
 	if [ "$CG_OK" != 1 ]; then
 		if [ "$2" = 1 ]; then
-			warn "could not download the pinned Node runtime ($_sdn_url), needed to build the sidecar: $CG_ERR. eitri is installed without one; run \"eitri setup\" once you have network access to nodejs.org"
+			warn "could not download the pinned Node runtime ($_sdn_url), needed to build the sidecar: $CG_ERR. Eitri is installed without one; run \"eitri setup\" once you have network access to nodejs.org"
 			return 0
 		fi
 		die "could not download the pinned Node runtime ($_sdn_url): $CG_ERR"
@@ -2133,14 +2133,14 @@ verdandi_repo_url() {
 # A plain statement: this can die.
 checkout_version() {
 	_cv_shell=$1/shell/Cargo.toml
-	if [ ! -f "$_cv_shell" ]; then die "$1 has no shell/Cargo.toml: not a eitri checkout"; fi
+	if [ ! -f "$_cv_shell" ]; then die "$1 has no shell/Cargo.toml: not an Eitri checkout"; fi
 	_cv_line=$(grep -E '^version[[:space:]]*=|^version\.workspace[[:space:]]*=' "$_cv_shell" | head -n 1) || _cv_line=
 	case $_cv_line in
 	*workspace*) _cv_line=$(grep -E '^version[[:space:]]*=' "$1/Cargo.toml" | head -n 1) || _cv_line= ;;
 	esac
 	CV_VERSION=$(printf '%s\n' "$_cv_line" | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
 	if ! printf '%s\n' "$CV_VERSION" | grep -Eqx "$NV_VERSION_ERE"; then
-		die "could not determine a version from $1 (shell/Cargo.toml, or [workspace.package] in its root Cargo.toml): not a eitri checkout, or its version field is not a plain quoted string"
+		die "could not determine a version from $1 (shell/Cargo.toml, or [workspace.package] in its root Cargo.toml): not an Eitri checkout, or its version field is not a plain quoted string"
 	fi
 }
 
@@ -2149,7 +2149,7 @@ checkout_version() {
 # whose --version could be queried. Call as a plain statement because this can fail fatally.
 lockfile_rev() {
 	_lr_lock=$1/Cargo.lock
-	if [ ! -f "$_lr_lock" ]; then die "$1 has no Cargo.lock: not a eitri checkout, or it has not been resolved (run cargo generate-lockfile first)"; fi
+	if [ ! -f "$_lr_lock" ]; then die "$1 has no Cargo.lock: not an Eitri checkout, or it has not been resolved (run cargo generate-lockfile first)"; fi
 	_lr_rev=$(awk -v pkg="$2" '
 		$0 == "name = \"" pkg "\"" { want = 1; next }
 		want && /^source = / { sub(/^source = "/, ""); sub(/"$/, ""); print; exit }
@@ -2160,7 +2160,7 @@ lockfile_rev() {
 	*) LR_REV= ;;
 	esac
 	if ! printf '%s\n' "$LR_REV" | grep -Eqx '[0-9a-f]{40}'; then
-		die "could not determine $2's commit from $_lr_lock: not a eitri checkout with a git dependency on $2, or Cargo.lock is stale"
+		die "could not determine $2's commit from $_lr_lock: not an Eitri checkout with a git dependency on $2, or Cargo.lock is stale"
 	fi
 }
 
@@ -2173,7 +2173,7 @@ lockfile_rev() {
 checkout_fork_rev() {
 	_cfr_dir=$1
 	_cfr_lock=$_cfr_dir/Cargo.lock
-	if [ ! -f "$_cfr_lock" ]; then die "$_cfr_dir has no Cargo.lock: not a eitri checkout, or it has not been resolved (run cargo generate-lockfile first)"; fi
+	if [ ! -f "$_cfr_lock" ]; then die "$_cfr_dir has no Cargo.lock: not an Eitri checkout, or it has not been resolved (run cargo generate-lockfile first)"; fi
 	_cfr_src=$(awk '
 		$0 == "name = \"neovide\"" { want = 1; next }
 		want && /^source = / { sub(/^source = "/, ""); sub(/"$/, ""); print; exit }
@@ -2188,7 +2188,7 @@ checkout_fork_rev() {
 	_cfr_link=$(git -C "$_cfr_dir" ls-tree HEAD neovide 2>/dev/null) || _cfr_link=
 	case $_cfr_link in
 	"160000 commit "*) CFR_REV=$(printf '%s\n' "$_cfr_link" | awk '{ print $3 }') ;;
-	*) die "could not determine neovide's commit in $_cfr_dir: Cargo.lock names no git source for it and HEAD records no neovide submodule -- not a eitri checkout" ;;
+	*) die "could not determine neovide's commit in $_cfr_dir: Cargo.lock names no git source for it and HEAD records no neovide submodule -- not an Eitri checkout" ;;
 	esac
 	if ! printf '%s\n' "$CFR_REV" | grep -Eqx '[0-9a-f]{40}'; then
 		die "the neovide submodule commit HEAD records in $_cfr_dir is not 40 hex: $CFR_REV"
@@ -2215,10 +2215,10 @@ checkout_fork_rev() {
 # A plain statement: this can die.
 agent_toml_verdandi() {
 	_atv_file=$1/agent/Cargo.toml
-	if [ ! -f "$_atv_file" ]; then die "$1 has no agent/Cargo.toml: not a eitri checkout"; fi
+	if [ ! -f "$_atv_file" ]; then die "$1 has no agent/Cargo.toml: not an Eitri checkout"; fi
 	_atv_line=$(grep -E '^claude-runtime-protocol[[:space:]]*=' "$_atv_file" | head -n 1) || _atv_line=
 	if [ -z "$_atv_line" ]; then
-		die "$_atv_file names no claude-runtime-protocol dependency: not a eitri checkout, or it no longer pins Verdandi the way this installer expects"
+		die "$_atv_file names no claude-runtime-protocol dependency: not an Eitri checkout, or it no longer pins Verdandi the way this installer expects"
 	fi
 	AT_GIT_URL=$(printf '%s\n' "$_atv_line" | sed -n 's/.*git[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
 	AT_REV=$(printf '%s\n' "$_atv_line" | sed -n 's/.*rev[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
@@ -2331,7 +2331,7 @@ synthesize_release_from_checkout() {
 		die "agent/Cargo.toml in $_src_dir pins Verdandi from a private source ($AT_GIT_URL), so its source cannot be fetched publicly: pass --verdandi-checkout DIR (a local checkout of it), or set EITRI_VERDANDI_CHECKOUT"
 	fi
 	_src_pins=$_src_dir/packaging/pins.env
-	if [ ! -f "$_src_pins" ]; then die "$_src_dir has no packaging/pins.env: not a eitri checkout"; fi
+	if [ ! -f "$_src_pins" ]; then die "$_src_dir has no packaging/pins.env: not an Eitri checkout"; fi
 	REL_VERDANDI_REV=$AT_REV
 	resolve_verdandi_source
 	if [ -z "$NV_VERDANDI_SOURCE_TARBALL_OVERRIDE" ]; then
@@ -2440,7 +2440,7 @@ from_source_stage() {
 			die "cannot write a placeholder LICENSE"
 	fi
 	{
-		printf 'This copy of eitri was built directly from source (sh install.sh --from-source),\n'
+		printf 'This copy of Eitri was built directly from source (sh install.sh --from-source),\n'
 		printf 'not from a signed release build, so this file is a placeholder rather than the\n'
 		printf 'generated third-party licence text a release build carries.\n\n'
 		printf 'source tree:          %s\n' "$_fss_src"
@@ -2480,9 +2480,9 @@ finish_install() {
 		say "dry run: nothing was changed"
 		return 0
 	fi
-	say "installed eitri $NV_VERSION into $NV_LIB; run it with: eitri [project directory]"
+	say "installed Eitri $NV_VERSION into $NV_LIB; run it with: eitri [project directory]"
 	if [ -n "$NV_INSTALLED_VERSION" ]; then
-		say "restart open eitri windows: they keep running, but new tabs and the handoff need the new install"
+		say "restart open Eitri windows: they keep running, but new tabs and the handoff need the new install"
 	fi
 	# Last, so the one-time sudo steps are the last thing on screen.
 	apparmor_note
@@ -2493,14 +2493,14 @@ finish_install() {
 #
 # Ubuntu 23.10+ sets kernel.apparmor_restrict_unprivileged_userns=1: a program may create a user
 # namespace only while an AppArmor profile granting `userns` confines it, and WebKitGTK's bwrap
-# sandbox needs one. Without it eitri shows the fix in the agent panel's place instead of the
+# sandbox needs one. Without it Eitri shows the fix in the agent panel's place instead of the
 # panel (shell/src/webkit_sandbox.rs). This installer never runs sudo, so it writes the profile for
 # this install under its own data directory and prints the two commands that install and load it.
 #
 # The profile is packaging/apparmor/eitri with this install's own resolved path, always quoted and
 # with AppArmor's glob characters escaped, and a name of its own -- eitri-user-<uid>, so no two
 # users' per-user profiles replace each other in the kernel. A literal path rather than an @{HOME}
-# glob (which works too): the grant covers this user's install and nobody else's. eitri itself
+# glob (which works too): the grant covers this user's install and nobody else's. Eitri itself
 # renders the same bytes and names the same commands (shell/src/webkit_sandbox.rs; its test sources
 # this file and compares), so the steps printed here and the ones the panel's place shows agree.
 
@@ -2551,18 +2551,18 @@ apparmor_plan() {
 apparmor_render() {
 	_arn_path=$(apparmor_escape "$2")
 	cat <<'EOF'
-# AppArmor profile for eitri's `shell` (packaging/apparmor/eitri).
+# AppArmor profile for Eitri's `shell` (packaging/apparmor/eitri).
 #
 # Ubuntu 23.10 and later set kernel.apparmor_restrict_unprivileged_userns=1: a program may create a
 # user namespace only while an AppArmor profile that grants `userns` confines it. WebKitGTK 6.0 runs
 # its web and network processes in a bwrap sandbox, which needs one, so without this profile the
 # agent panel cannot start. The profile grants that and nothing else: it is unconfined otherwise,
 # the same shape as the profiles Ubuntu's own apparmor package ships for its WebKit applications
-# (epiphany, for one). Every process eitri starts inherits it.
+# (epiphany, for one). Every process Eitri starts inherits it.
 #
 # The .deb installs this file as /etc/apparmor.d/eitri and loads nothing (it has no maintainer
 # scripts): `sudo apparmor_parser -r /etc/apparmor.d/eitri`, or the next restart, loads it. For
-# any other install, the curl installer and eitri itself write this same text with that install's
+# any other install, the curl installer and Eitri itself write this same text with that install's
 # own path and a profile name of its own.
 
 abi <abi/4.0>,
@@ -2580,7 +2580,7 @@ EOF
 
 # apparmor_note: where the restriction is on, write this install's profile under $NV_DATA and say
 # how to install and load it (a dry run only says where it would go). Never fatal: the install is
-# complete by now, and eitri writes the same file and shows the same steps itself.
+# complete by now, and Eitri writes the same file and shows the same steps itself.
 apparmor_note() {
 	apparmor_restricted
 	if [ "$AA_RESTRICTED" != 1 ]; then return 0; fi
@@ -2589,16 +2589,16 @@ apparmor_note() {
 	_an_exe=$_an_lib/shell
 	_an_uid=$(id -u 2>/dev/null) || _an_uid=
 	_an_why="this system restricts unprivileged user namespaces (Ubuntu's AppArmor rule), so the agent panel's sandbox (WebKit's bwrap) needs an AppArmor profile for this install"
-	_an_hatch="until then eitri shows these steps in the agent panel's place; starting it with WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 also works, but that removes the operating system's sandbox from the process that renders the model's output"
+	_an_hatch="until then Eitri shows these steps in the agent panel's place; starting it with WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 also works, but that removes the operating system's sandbox from the process that renders the model's output"
 	case $_an_uid in
 	'' | *[!0-9]*)
-		warn "$_an_why, and \`id -u\` gave no user id to name it by: eitri shows the steps in the agent panel's place"
+		warn "$_an_why, and \`id -u\` gave no user id to name it by: Eitri shows the steps in the agent panel's place"
 		return 0
 		;;
 	esac
 	case $_an_exe in
 	*[[:cntrl:]]*)
-		warn "$_an_why, and $NV_LIB holds a control character, which no profile can name: install eitri under a plainer HOME, or $_an_hatch"
+		warn "$_an_why, and $NV_LIB holds a control character, which no profile can name: install Eitri under a plainer HOME, or $_an_hatch"
 		return 0
 		;;
 	esac
@@ -2612,7 +2612,7 @@ apparmor_note() {
 		! printf '%s\n' "$_an_text" >"$AA_SRC.tmp.$$" ||
 		! mv -- "$AA_SRC.tmp.$$" "$AA_SRC"; then
 		rm -f -- "$AA_SRC.tmp.$$"
-		warn "$_an_why, and it could not be written to $AA_SRC (see the message above): eitri writes it itself and shows the steps in the agent panel's place"
+		warn "$_an_why, and it could not be written to $AA_SRC (see the message above): Eitri writes it itself and shows the steps in the agent panel's place"
 		return 0
 	fi
 	_an_have=
@@ -2638,7 +2638,7 @@ fetch_skia_binaries() {
 	_fsb_url=$(kv_get "$_fsb_pins" SKIA_BINARIES_URL_UPSTREAM)
 	_fsb_sha=$(kv_get "$_fsb_pins" SKIA_BINARIES_SHA256)
 	if [ -z "$_fsb_url" ] || [ -z "$_fsb_sha" ]; then
-		die "$_fsb_pins names no SKIA_BINARIES_URL_UPSTREAM/SKIA_BINARIES_SHA256: not a eitri checkout's pins.env. Report it at $NV_ISSUES"
+		die "$_fsb_pins names no SKIA_BINARIES_URL_UPSTREAM/SKIA_BINARIES_SHA256: not an Eitri checkout's pins.env. Report it at $NV_ISSUES"
 	fi
 	_fsb_name=${_fsb_url##*/}
 	# In test mode, redirected to a fixture server the same way node_dist_base is -- deliberately
@@ -2716,7 +2716,7 @@ do_from_source() {
 		if [ -n "$NV_INSTALLED_VERSION" ]; then
 			_dfs_c=$(semver_cmp "$NV_VERSION" "$NV_INSTALLED_VERSION")
 			if [ "$_dfs_c" = -1 ] && [ -z "$OPT_VERSION" ]; then
-				die "eitri $NV_INSTALLED_VERSION is installed, and the release offered is older ($NV_VERSION): refusing to downgrade silently (a stale mirror or a withdrawn release would look like this). To install $NV_VERSION anyway: --version $NV_VERSION"
+				die "Eitri $NV_INSTALLED_VERSION is installed, and the release offered is older ($NV_VERSION): refusing to downgrade silently (a stale mirror or a withdrawn release would look like this). To install $NV_VERSION anyway: --version $NV_VERSION"
 			fi
 		fi
 		fetch_verified_release
@@ -2739,7 +2739,7 @@ do_from_source() {
 	mkdir -p -- "$_dfs_skia_workdir" || die "cannot create $_dfs_skia_workdir"
 	fetch_skia_binaries "$_dfs_skia_workdir" "$NV_FROM_SOURCE_DIR/packaging/pins.env"
 
-	say "building eitri $NV_VERSION from source in $NV_FROM_SOURCE_DIR"
+	say "building Eitri $NV_VERSION from source in $NV_FROM_SOURCE_DIR"
 	# from_source_stage reads <src>/target/release. --target-dir overrides CARGO_TARGET_DIR and
 	# the build.target-dir configuration so cargo writes where staging expects. Remove each shipped
 	# binary before building to prevent a skipped build from staging stale binaries under a new RELEASE.
@@ -2814,19 +2814,19 @@ unpack_new() {
 		return 0
 	fi
 	mkdir -p -- "$NV_STAGE" || die "cannot create $NV_STAGE"
-	tar -xzf "$NV_TARBALL" -C "$NV_STAGE" || die "could not unpack $NV_TARBALL_NAME: it is not a valid eitri release. Nothing was changed and your current install is untouched; report it at $NV_ISSUES"
+	tar -xzf "$NV_TARBALL" -C "$NV_STAGE" || die "could not unpack $NV_TARBALL_NAME: it is not a valid Eitri release. Nothing was changed and your current install is untouched; report it at $NV_ISSUES"
 	for _un_f in bin/eitri share/applications/eitri.desktop; do
-		if [ ! -f "$_un_top/$_un_f" ]; then die "$NV_TARBALL_NAME has no $_un_f: it is not a valid eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+		if [ ! -f "$_un_top/$_un_f" ]; then die "$NV_TARBALL_NAME has no $_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
 	for _un_f in $NV_BINARIES eitri-setup; do
 		if [ ! -f "$_un_top/lib/eitri/$_un_f" ] || [ ! -x "$_un_top/lib/eitri/$_un_f" ]; then
-			die "$NV_TARBALL_NAME has no executable lib/eitri/$_un_f: it is not a valid eitri release. Nothing was changed; report it at $NV_ISSUES"
+			die "$NV_TARBALL_NAME has no executable lib/eitri/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"
 		fi
 	done
 	for _un_f in $NV_LICENCE_FILES; do
-		if [ ! -f "$_un_top/share/licenses/eitri/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/licenses/eitri/$_un_f: it is not a valid eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+		if [ ! -f "$_un_top/share/licenses/eitri/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/licenses/eitri/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
-	if [ ! -f "$_un_top/lib/eitri/RELEASE" ]; then die "$NV_TARBALL_NAME has no lib/eitri/RELEASE: it is not a valid eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+	if [ ! -f "$_un_top/lib/eitri/RELEASE" ]; then die "$NV_TARBALL_NAME has no lib/eitri/RELEASE: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	parse_release "$_un_top/lib/eitri/RELEASE"
 	if [ "$REL_VERSION" != "$NV_VERSION" ]; then
 		die "$NV_TARBALL_NAME's RELEASE says $REL_VERSION, not $NV_VERSION: refusing. Report it at $NV_ISSUES"
@@ -2914,7 +2914,7 @@ commit_files() {
 	if [ "$OPT_DRY_RUN" = 1 ]; then return 0; fi
 	# The new lib is in place from here on: a failure leaves the install unfinished, and a re-run
 	# finishes it (install_complete keeps it from saying "up to date" instead).
-	_cf_fin="eitri $NV_VERSION is in $NV_LIB but not finished: fix this and re-run the installer to finish it"
+	_cf_fin="Eitri $NV_VERSION is in $NV_LIB but not finished: fix this and re-run the installer to finish it"
 	mv -- "$NV_TMP_LAUNCHER" "$_cf_dst" || die "cannot move the launcher into $_cf_dst; $_cf_fin"
 	mv -- "$NV_DATA/applications/.eitri.desktop.tmp.$$" "$NV_DATA/applications/eitri.desktop" ||
 		die "cannot write $NV_DATA/applications/eitri.desktop; $_cf_fin"
@@ -2966,13 +2966,13 @@ prune_sidecars() {
 	# user, in their own $XDG_DATA_HOME -- nothing this installer would make) used to be followed
 	# with no check at all, so a 7-hex-named directory BEHIND the link -- a user's own, unrelated
 	# directory that merely happens to be named like a short git sha -- was removed as if it were
-	# one of eitri's own sidecars. The same rule $NV_DATA/eitri already holds in do_uninstall:
+	# one of Eitri's own sidecars. The same rule $NV_DATA/eitri already holds in do_uninstall:
 	# a link is fine as long as it leads to a real directory actually named "sidecar".
 	_ps_real=$(cd -P -- "$NV_SIDECAR_ROOT" 2>/dev/null && pwd -P) || _ps_real=
 	case $_ps_real in
 	*/sidecar) ;;
 	*)
-		warn "$NV_SIDECAR_ROOT leads to ${_ps_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what eitri put there yourself if you no longer need it"
+		warn "$NV_SIDECAR_ROOT leads to ${_ps_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what Eitri put there yourself if you no longer need it"
 		return 0
 		;;
 	esac
@@ -2988,7 +2988,7 @@ prune_sidecars() {
 			# Only a dry run that could not read the new RELEASE gets here (dry_run_new_rev).
 			say "removing the sidecar for verdandi $_pr_n, unless the new release uses it (this dry run could not tell)"
 		else
-			say "removing the sidecar for verdandi $_pr_n: no installed eitri uses it"
+			say "removing the sidecar for verdandi $_pr_n: no installed Eitri uses it"
 		fi
 		run rm -rf -- "$_pr_d"
 	done
@@ -3051,13 +3051,13 @@ do_install() {
 	if [ -n "$NV_INSTALLED_VERSION" ]; then
 		_di_c=$(semver_cmp "$NV_VERSION" "$NV_INSTALLED_VERSION")
 		if [ "$_di_c" = -1 ] && [ -z "$OPT_VERSION" ]; then
-			die "eitri $NV_INSTALLED_VERSION is installed, and the release offered is older ($NV_VERSION): refusing to downgrade silently (a stale mirror or a withdrawn release would look like this). To install $NV_VERSION anyway: --version $NV_VERSION"
+			die "Eitri $NV_INSTALLED_VERSION is installed, and the release offered is older ($NV_VERSION): refusing to downgrade silently (a stale mirror or a withdrawn release would look like this). To install $NV_VERSION anyway: --version $NV_VERSION"
 		fi
 		if [ "$_di_c" = 0 ]; then
 			sidecar_state "$NV_OLD_REV7"
 			install_complete
 			if [ "$NV_SIDECAR_PRESENT" = 1 ] && [ "$NV_COMPLETE" = 1 ]; then
-				say "eitri $NV_VERSION is up to date"
+				say "Eitri $NV_VERSION is up to date"
 				# this branch used to `return 0`
 				# straight after, so re-running the same installer with --with-nvim/--yes after a
 				# --no-nvim install (or simply once an adequate nvim's absence is noticed, or
@@ -3086,7 +3086,7 @@ do_install() {
 				return 0
 			fi
 			if [ "$NV_COMPLETE" != 1 ]; then
-				say "eitri $NV_VERSION is installed but not finished (its launcher, desktop entry or licences are missing): installing it again"
+				say "Eitri $NV_VERSION is installed but not finished (its launcher, desktop entry or licences are missing): installing it again"
 			fi
 		fi
 	fi
@@ -3110,7 +3110,7 @@ do_install() {
 		download_verified "$NV_TARBALL_NAME"
 		NV_TARBALL=$NV_DL/$NV_TARBALL_NAME
 	fi
-	say "installing eitri $NV_VERSION${NV_INSTALLED_VERSION:+ (replacing $NV_INSTALLED_VERSION)}"
+	say "installing Eitri $NV_VERSION${NV_INSTALLED_VERSION:+ (replacing $NV_INSTALLED_VERSION)}"
 	unpack_new
 	if [ "$OPT_DRY_RUN" != 1 ]; then use_verdandi_source_beside_tarball; fi
 	finish_install
@@ -3171,7 +3171,7 @@ do_uninstall() {
 		*/eitri) ;;
 		*)
 			_du_ours=0
-			_du_link_note="$NV_DATA/eitri leads to ${_du_real:-a directory that cannot be entered}, not to a directory named eitri, so nothing under it (an nvim, sidecars) was removed: this installer never made that link. Remove what eitri put there yourself if you no longer need it"
+			_du_link_note="$NV_DATA/eitri leads to ${_du_real:-a directory that cannot be entered}, not to a directory named eitri, so nothing under it (an nvim, sidecars) was removed: this installer never made that link. Remove what Eitri put there yourself if you no longer need it"
 			;;
 		esac
 	fi
@@ -3184,14 +3184,14 @@ do_uninstall() {
 		# symlinked sidecar root, planted by the user in their own $XDG_DATA_HOME, was followed
 		# with no check at all, so a 7-hex-named directory BEHIND the link (a user's own,
 		# unrelated directory merely named like a short git sha) was removed as if it were one of
-		# eitri's own sidecars. Same rule, same shape: a link is fine as long as it leads to a
+		# Eitri's own sidecars. Same rule, same shape: a link is fine as long as it leads to a
 		# real directory actually named "sidecar".
 		_du_sidecar_ours=0
 		if [ -d "$NV_SIDECAR_ROOT" ]; then
 			_du_sidecar_real=$(cd -P -- "$NV_SIDECAR_ROOT" 2>/dev/null && pwd -P) || _du_sidecar_real=
 			case $_du_sidecar_real in
 			*/sidecar) _du_sidecar_ours=1 ;;
-			*) _du_sidecar_link_note="$NV_SIDECAR_ROOT leads to ${_du_sidecar_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what eitri put there yourself if you no longer need it" ;;
+			*) _du_sidecar_link_note="$NV_SIDECAR_ROOT leads to ${_du_sidecar_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what Eitri put there yourself if you no longer need it" ;;
 			esac
 		fi
 		if [ "$_du_sidecar_ours" = 1 ]; then
@@ -3245,7 +3245,7 @@ do_uninstall() {
 		if [ "$_du_ok" != 1 ]; then _du_bad="$_du_bad '$_du_p'"; fi
 	done
 	if [ -n "$_du_bad" ]; then
-		die "refusing to uninstall: these paths are not inside $NV_HOME, and this installer only removes paths inside it:$_du_bad. Nothing was removed. They are eitri's own: remove them yourself if you no longer need them, then re-run to remove the rest"
+		die "refusing to uninstall: these paths are not inside $NV_HOME, and this installer only removes paths inside it:$_du_bad. Nothing was removed. They are Eitri's own: remove them yourself if you no longer need them, then re-run to remove the rest"
 	fi
 	acquire_lock
 
@@ -3279,9 +3279,9 @@ do_uninstall() {
 	if [ "$OPT_DRY_RUN" = 1 ]; then
 		say "dry run: nothing was changed"
 	elif [ "$_du_n" = 0 ]; then
-		say "nothing to remove: eitri is not installed here"
+		say "nothing to remove: Eitri is not installed here"
 	else
-		say "eitri is uninstalled"
+		say "Eitri is uninstalled"
 	fi
 	if [ "$OPT_PURGE" != 1 ]; then
 		say "kept your settings ($NV_HOME/.config/eitri) and state ($NV_STATE/eitri); --uninstall --purge removes them too"

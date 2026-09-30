@@ -3,7 +3,7 @@
 The tests themselves are shell functions in packaging/tests/install/test_*.sh, run by harness.sh in
 two shells: bash on the host, and dash inside an Ubuntu 24.04 image (Dockerfile.dash) -- this host
 has no dash and must not install one. This file runs both halves, shellcheck, and guards the real
-HOME's eitri directories around the container run (inside it they are not visible; on the host
+HOME's Eitri directories around the container run (inside it they are not visible; on the host
 run-in-env.sh guards every single installer run).
 
 Scratch lives under ~/.cache/nv-v1dist-t9/<pid> (never /tmp) and is removed after a passing half. The
@@ -30,7 +30,7 @@ IMAGE = "eitri-install-dash"
 
 
 def real_home_state():
-    """Every path and mtime under the real HOME's eitri directories (never file contents)."""
+    """Every path and mtime under the real HOME's Eitri directories (never file contents)."""
     home = pathlib.Path.home()
     state = []
     for rel in (".local/state/eitri", ".config/eitri", ".local/share/eitri"):
@@ -116,7 +116,7 @@ def test_harness_under_bash():
         ["bash", str(HARNESS), "--sh", "bash", "--scratch", str(scratch), "--real-home", str(pathlib.Path.home())],
         capture_output=True, text=True,
     )
-    assert real_home_state() == before, "the real HOME's eitri directories changed"
+    assert real_home_state() == before, "the real HOME's Eitri directories changed"
     assert proc.returncode == 0, report(proc)
     assert "# installer shell: bash" in proc.stdout
     assert " 0 failed" in proc.stdout, report(proc)
@@ -159,7 +159,7 @@ def test_harness_under_dash_in_ubuntu():
          IMAGE, "/bin/sh", str(HARNESS), "--sh", "/bin/sh", "--scratch", str(scratch)],
         capture_output=True, text=True,
     )
-    assert real_home_state() == before, "the real HOME's eitri directories changed"
+    assert real_home_state() == before, "the real HOME's Eitri directories changed"
     assert proc.returncode == 0, report(proc)
     assert "# installer shell: /bin/sh (/usr/bin/dash)" in proc.stdout, report(proc)
     assert " 0 failed" in proc.stdout, report(proc)

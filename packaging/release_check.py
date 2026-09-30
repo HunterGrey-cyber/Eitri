@@ -278,7 +278,7 @@ def find_anthropic_node_modules(files: Iterable[tuple[str, str]]) -> list[str]:
 
 def find_node_modules_dirs(files: Iterable[tuple[str, str]]) -> list[str]:
     """relpaths under any node_modules/ directory at all -- in either source asset (Verdandi's or
-    eitri's), no node_modules/ of any kind may ship (sec 4.2 step 9)."""
+    Eitri's), no node_modules/ of any kind may ship (sec 4.2 step 9)."""
     return [rel for rel, _ in files if re.search(r"(^|/)node_modules/", rel)]
 
 
@@ -291,7 +291,7 @@ def find_verdandi_sidecar_filenames(files: Iterable[tuple[str, str]]) -> list[st
 def find_agent_hook_binaries(files: Iterable[tuple[str, str]]) -> list[str]:
     """relpaths whose basename is EXACTLY 'agent-hook' (M16) -- the compiled legacy-gate relay
     binary, which no release build compiles (no --features anywhere) and no asset may carry.
-    A source file such as agent/src/bin/agent-hook.rs, legitimately present in the eitri source
+    A source file such as agent/src/bin/agent-hook.rs, legitimately present in the Eitri source
     asset, has a different basename ('agent-hook.rs') and is not a hit."""
     return [rel for rel, _ in files if os.path.basename(rel) == "agent-hook"]
 
@@ -677,7 +677,7 @@ _REBUILD_ENV_RE = re.compile(r"^    (EITRI_BUILD_[A-Z_]+)=(.*)$")
 
 def parse_rebuild_env(source_text: str) -> dict[str, str]:
     """The environment SOURCE tells a rebuild from the source asset to set, so the rebuilt
-    `shell --version` names the same eitri and Neovide fork commits as the shipped one: each of
+    `shell --version` names the same Eitri and Neovide fork commits as the shipped one: each of
     REBUILD_ENV_NAMES exactly once, as a full 40-hex commit, nothing else (with only the first,
     a rebuild would say "neovide fork unknown")."""
     found: dict[str, list[str]] = {}
@@ -863,7 +863,7 @@ def check_same_bytes(named_paths: dict[str, str]) -> list[str]:
 
 def check_eitri_source_tree(root: str, src_repo: str, verdandi_repo: str, verdandi_rev: str,
                               skia_archive: str, skia_sha256: str) -> list[str]:
-    """The extracted eitri source asset's top directory (M2): `git archive HEAD` of src_repo byte
+    """The extracted Eitri source asset's top directory (M2): `git archive HEAD` of src_repo byte
     for byte plus only the known additions; neovide/ equal to the submodule's own `git archive HEAD`;
     proto/ equal to the public Verdandi's; skia/ exactly the pinned archive; .cargo/config.toml
     pointing at vendor/; the shipped `dist/.inputs-sha256` matches a fresh fingerprint over the
@@ -872,7 +872,7 @@ def check_eitri_source_tree(root: str, src_repo: str, verdandi_repo: str, verdan
     first version), which a tar extraction or `SOURCE_DATE_EPOCH` normalization could satisfy or
     fail independently of whether the bundle's content ever matched its sources. The content rules
     run over the whole tree for the sentinel and node_modules, and over the additions only for the
-    SDK's name (eitri's own tracked source legitimately names it)."""
+    SDK's name (Eitri's own tracked source legitimately names it)."""
     problems = []
     try:
         compare_tree_to_git_archive(root, src_repo, "HEAD", KNOWN_EITRI_SOURCE_ADDITIONS)

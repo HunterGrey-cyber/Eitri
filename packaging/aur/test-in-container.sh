@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
-# Build, check, install and run --version for both binary and git packages in clean
-# archlinux:latest containers. Override source= only in the test copies of the PKGBUILDs.
-# Release archives are served from --release-dir over loopback, so those containers need
-# --network host. The pinned Node archive still comes from its normal upstream source.
-# Git sources are local repositories mounted read-only at /mirrors/ and fetched through
-# container-local git+file URLs. Tag a throwaway clone with --tag; check that the mirrors
-# contain the required branch, submodule commit and pinned dependency revision before starting.
-# Cargo still fetches the pinned crate from its normal upstream source.
-# For another release, supply its archives with --release-dir and use matching checkouts
-# and mirrors.
+# packaging/aur/test-in-container.sh: builds, checks and installs both eitri-bin and eitri-git
+# in clean archlinux:latest containers and runs --version in each.
+#
+# Every source= in both PKGBUILDs points at a GitHub location that may not exist yet (the AUR
+# entries track published releases and tags), so every run overrides source= with a local,
+# test-only location that is never committed:
+#
+#   eitri-bin   the two release assets (the tarball and the verdandi source archive) are served
+#                 from --release-dir by a `python3 -m http.server` on 127.0.0.1, reached with
+#                 --network host. Node still comes from the real nodejs.org.
+#   eitri-git   the three git sources (Eitri, neovide, verdandi) come from local repositories,
+#                 bind-mounted read-only at /mirrors/ with source= rewritten to
+#                 git+file:///mirrors/...: --eitri-checkout (tagged with --tag in a throwaway
+#                 clone, since the public repository may carry no tag yet), --neovide-mirror (must
+#                 carry neovibe-integration with the checkout's submodule commit on it) and
+#                 --verdandi-mirror (must hold agent/Cargo.toml's pinned rev). Neither mirror needs
+#                 a tag; both are checked before the container starts. Node is the same nodejs.org
+#                 download as -bin's, and cargo still fetches the pinned Verdandi crate from its
+#                 public URL.
+#
+# Usage:
+#   test-in-container.sh --release-dir DIR --eitri-checkout DIR --neovide-mirror DIR \
+#       --verdandi-mirror DIR [--tag TAG] [--work DIR] [--only bin|git] [--jobs N]
+#
+# To test a later release, change only --release-dir (release.sh's default --out, for example
+# ~/.cache/eitri-release/v0.2.0/) and keep --eitri-checkout, --neovide-mirror and
+# --verdandi-mirror pointed at the public clone and mirrors that match that release.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -217,7 +234,7 @@ test_git() {
 	fi
 
 	# Fail here, in seconds, rather than an hour into the container build: the two mirrors must
-	# hold what this eitri commit pins (prepare() checks both out by commit, and makepkg checks
+	# hold what this Eitri commit pins (prepare() checks both out by commit, and makepkg checks
 	# the neovide mirror out by the PKGBUILD's #branch=neovibe-integration).
 	local fork_commit verdandi_rev
 	fork_commit="$(git -C "$WORK/eitri-tagged.git" rev-parse "$head:neovide")"

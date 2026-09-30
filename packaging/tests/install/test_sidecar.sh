@@ -243,7 +243,7 @@ t_sidecar_first_install_node_unreachable_still_succeeds() {
 	serve 1.0.0
 	inst_net --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:1/dist" --
 	expect_rc 0
-	expect_out 'eitri is installed without one'
+	expect_out 'Eitri is installed without one'
 	expect_eq "$(installed_version)" 1.0.0
 	expect_absent "$(data_of)/eitri/sidecar/aaaaaaa"
 }
@@ -398,7 +398,7 @@ t_tarball_install_builds_sidecar_from_beside_file() {
 		-- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
 		--release-signers "$SIGNERS"
 	expect_rc 0
-	expect_out "installed eitri 1.0.0 into"
+	expect_out "installed Eitri 1.0.0 into"
 	expect_out "using the Verdandi source beside"
 	expect_exec "$(data_of)/eitri/sidecar/aaaaaaa/verdandi-claude-sidecar"
 	if srv_paths | grep -F verdandi- >/dev/null; then fail "the Verdandi source was fetched over the network: $(srv_paths)"; fi
@@ -427,7 +427,7 @@ t_tarball_verdandi_source_beside_file_copied_before_use() {
 		-- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
 		--release-signers "$SIGNERS"
 	expect_rc 0
-	expect_out "installed eitri 1.0.0 into"
+	expect_out "installed Eitri 1.0.0 into"
 	expect_out "using the Verdandi source beside"
 	expect_exec "$(data_of)/eitri/sidecar/aaaaaaa/verdandi-claude-sidecar"
 	if [ ! -s "$S/logs/swap-verdandi.log" ]; then fail "the beside file was never swapped: the test did not run the race"; fi
@@ -458,7 +458,7 @@ t_tarball_install_falls_back_to_network_without_beside_file() {
 		-- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
 		--release-signers "$SIGNERS"
 	expect_rc 0
-	expect_out "installed eitri 1.0.0 into"
+	expect_out "installed Eitri 1.0.0 into"
 	expect_no_out "using the Verdandi source beside"
 	expect_exec "$(data_of)/eitri/sidecar/aaaaaaa/verdandi-claude-sidecar"
 	if ! grep -qF 'HunterGrey-cyber/eitri/releases/download/v1.0.0/verdandi-aaaaaaa-source.tar.gz' "$S/logs/curl.log"; then

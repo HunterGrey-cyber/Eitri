@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# eitri. Everything it decides is printed before the window opens.
+# Eitri. Everything it decides is printed before the window opens.
 #
 #   eitri                  open the current directory
 #   eitri ~/some/project   open that project

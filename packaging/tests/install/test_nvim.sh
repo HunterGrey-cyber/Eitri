@@ -149,7 +149,7 @@ t_nvim_offer_network_failure_warns_install_still_succeeds() {
 		-- --with-nvim --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 0
 	expect_out "could not download nvim $NVIM_FIXTURE_VERSION"
-	expect_out "installed eitri 1.0.0 into"
+	expect_out "installed Eitri 1.0.0 into"
 	expect_absent "$(data_of)/eitri/nvim"
 	# This is install.sh:776's own recovery hint. Its exact command,
 	# `eitri setup --nvim-only`, used to die "--sidecar-only and --nvim-only cannot be combined"
@@ -224,7 +224,7 @@ t_nvim_only_reads_release_beside_the_running_script() {
 # ---------------------------------------------------------------------------------------------
 # --nvim-offer:
 # the SAME conditional offer a normal install runs, reachable standalone against an already
-# -installed eitri -- what plain `eitri setup`'s second call runs since the fix, replacing the
+# -installed Eitri -- what plain `eitri setup`'s second call runs since the fix, replacing the
 # old --nvim-only there. Contrast every test here with --nvim-only's own tests just above: the
 # report's own repro was plain `eitri setup` on a machine with an already-adequate PATH nvim
 # printing "installed nvim ... into ..." (repro 1) and, with the network unreachable, dying "could
@@ -352,7 +352,7 @@ t_nvim_offer_upgrade_skips_when_private_copy_present() {
 	srv_mark
 	nv_inst_net --with-nvim
 	expect_rc 0
-	expect_out "installed eitri 1.1.0 into"
+	expect_out "installed Eitri 1.1.0 into"
 	expect_out "nvim $NVIM_FIXTURE_VERSION: already installed at $bin"
 	expect_no_out "installed nvim $NVIM_FIXTURE_VERSION into"
 	if srv_paths | grep -F nvim-releases >/dev/null; then
@@ -367,7 +367,7 @@ t_nvim_offer_up_to_date_still_offers() {
 	# the "up to date" branch used to return before
 	# maybe_offer_nvim ever ran at all, so re-running the same installer with --with-nvim/--yes
 	# after a --no-nvim install fetched nothing and said nothing. Reproduced (the
-	# verifier's t_vprobe_with_nvim_when_up_to_date): "nvim 0.9.5 is older...", then "eitri 1.0.0
+	# verifier's t_vprobe_with_nvim_when_up_to_date): "nvim 0.9.5 is older...", then "Eitri 1.0.0
 	# is up to date", rc=0, no private nvim. The sidecar must genuinely be present after the first
 	# install (via NODE_BASE_URL, like sc_inst_net) so the second run actually reaches the fast
 	# "up to date" path (NV_SIDECAR_PRESENT=1 && NV_COMPLETE=1) rather than the ordinary reinstall
@@ -387,7 +387,7 @@ t_nvim_offer_up_to_date_still_offers() {
 		--set "EITRI_INSTALL_TEST_NVIM_BASE_URL=http://127.0.0.1:$PORT/nvim-releases" \
 		-- --with-nvim --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_rc 0
-	expect_out "eitri 1.0.0 is up to date"
+	expect_out "Eitri 1.0.0 is up to date"
 	expect_out "installed nvim $NVIM_FIXTURE_VERSION into"
 	expect_exec "$(nvim_private_bin "$NVIM_FIXTURE_VERSION")"
 	if ! srv_paths | grep -F nvim-releases >/dev/null; then
@@ -448,5 +448,5 @@ t_nvim_offer_piped_with_real_tty_accepts() {
 	cp "$OUT" "$T/out.$RUNS"
 	expect_rc 0 "the piped, real-tty install (SH-3)"
 	expect_exec "$(nvim_private_bin "$NVIM_FIXTURE_VERSION")"
-	expect_out "installed eitri 1.0.0 into"
+	expect_out "installed Eitri 1.0.0 into"
 }

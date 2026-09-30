@@ -57,13 +57,13 @@ t_apparmor_steps_when_restricted() {
 	expect_out "eitri:     sudo apparmor_parser -r $(aa_q "$T/apparmor.d/$name")"
 	expect_out 'WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 also works, but that removes the operating system'"'"'s sandbox from the process that renders the model'"'"'s output'
 	# At the end: after the line that says the install is done, and nothing after the steps.
-	installed=$(line_of 'installed eitri 1.0.0 into')
+	installed=$(line_of 'installed Eitri 1.0.0 into')
 	steps=$(line_of 'sudo install -m 0644')
 	if [ -z "$installed" ] || [ -z "$steps" ] || [ "$installed" -ge "$steps" ]; then
 		fail "the steps are not after the install's last line (installed at ${installed:-none}, steps at ${steps:-none})"
 	fi
 	case $(tail -n 1 "$OUT") in
-	'eitri: until then eitri shows these steps in the agent panel'*) ;;
+	'eitri: until then Eitri shows these steps in the agent panel'*) ;;
 	*) fail "the last line is not the steps' own: $(tail -n 1 "$OUT")" ;;
 	esac
 	# Nothing else in the tree: the three entries of the profile's own directory.
@@ -126,18 +126,18 @@ t_apparmor_up_to_date_rerun_says_it_again() {
 	rm -r "$TH/.local/share/eitri/apparmor"
 	aa_inst --
 	expect_rc 0
-	expect_out 'eitri 1.0.0 is up to date'
+	expect_out 'Eitri 1.0.0 is up to date'
 	expect_file "$src"
 	expect_out "eitri:     sudo install -m 0644 $(aa_q "$src") $(aa_q "$T/apparmor.d/$name")"
 	case $(tail -n 1 "$OUT") in
-	'eitri: until then eitri shows these steps in the agent panel'*) ;;
+	'eitri: until then Eitri shows these steps in the agent panel'*) ;;
 	*) fail "the last line is not the steps' own: $(tail -n 1 "$OUT")" ;;
 	esac
 	# Once the steps were run: the same re-run says the profile is in place, and no steps.
 	cp "$src" "$T/apparmor.d/$name"
 	aa_inst --
 	expect_rc 0
-	expect_out 'eitri 1.0.0 is up to date'
+	expect_out 'Eitri 1.0.0 is up to date'
 	expect_out "the AppArmor profile $T/apparmor.d/$name for this install is in place"
 	expect_no_out 'sudo install'
 }

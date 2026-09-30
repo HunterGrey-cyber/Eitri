@@ -1,4 +1,4 @@
-eitri @VERSION@ -- Neovim, embedded as a real component, with a Claude agent panel beside it.
+Eitri @VERSION@ -- Neovim, embedded as a real component, with a Claude agent panel beside it.
 Built from commit @COMMIT@ in the Ubuntu 24.04 release container. It runs on glibc 2.39, GTK 4.14
 and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 
@@ -15,7 +15,7 @@ once, or install from `eitri-@VERSION@-x86_64-linux.tar.gz` with
 `sh install.sh --tarball eitri-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig`
 (or unpack it and run its own `bin/eitri setup` from inside the extracted directory).
 
-eitri needs `nvim` >= 0.10 somewhere it can find one -- either on `PATH`, or its own private copy
+Eitri needs `nvim` >= 0.10 somewhere it can find one -- either on `PATH`, or its own private copy
 under `XDG_DATA_HOME/eitri/nvim` (never placed on `PATH`; none of the packages depend on a system
 nvim). Ubuntu 24.04's own package is 0.9.5, below that floor. `install.sh` (the curl command above)
 offers to fetch the official nvim release for you at install time if none new enough is found; run
@@ -47,7 +47,7 @@ notice.
 
 ## 简体中文
 
-eitri @VERSION@ -- 将 Neovim 作为真正的组件嵌入，旁边配有 Claude 代理面板。基于提交 @COMMIT@，在 Ubuntu 24.04 发布容器中构建。运行环境需要 glibc 2.39、GTK 4.14 以及 WebKitGTK 2.40（webkitgtk-6.0 API）或更新版本。
+Eitri @VERSION@ -- 将 Neovim 作为真正的组件嵌入，旁边配有 Claude 代理面板。基于提交 @COMMIT@，在 Ubuntu 24.04 发布容器中构建。运行环境需要 glibc 2.39、GTK 4.14 以及 WebKitGTK 2.40（webkitgtk-6.0 API）或更新版本。
 
 **0.2.0 是首个公开发行版**，此前有一个未公开的预发布版本 0.1.0。如果你安装过编号为 `1.0.0-rc.N` 的测试构建，它在版本排序上高于本次发布，安装程序会拒绝降级——请先卸载它（`sh install.sh --uninstall`，或者移除对应的软件包）。
 
@@ -57,7 +57,7 @@ eitri @VERSION@ -- 将 Neovim 作为真正的组件嵌入，旁边配有 Claude 
 
 或者安装 `eitri_@VERSION@_amd64.deb` / `eitri-@VERSION@-1.x86_64.rpm` 并运行一次 `eitri setup`；或者用 `sh install.sh --tarball eitri-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig` 从 `eitri-@VERSION@-x86_64-linux.tar.gz` 安装（或者解压后，在解压出的目录里运行它自己的 `bin/eitri setup`）。
 
-eitri 需要能找到 `nvim` >= 0.10 -- 既可以是 `PATH` 上的，也可以是它自己的私有副本，位于 `XDG_DATA_HOME/eitri/nvim`（这个私有副本从不会被放进 `PATH`；所有安装包都不依赖系统自带的 nvim）。Ubuntu 24.04 自带的包是 0.9.5，低于这个下限。`install.sh`（上面的 curl 命令）在安装时如果没有找到足够新的版本，会主动提出为你获取官方 nvim 发行版；之后任何时候单独运行 `eitri setup --nvim-only`（不论是在 `.deb`/`.rpm`/tar 包安装之后，还是再次运行）都能得到同样的提示。
+Eitri 需要能找到 `nvim` >= 0.10 -- 既可以是 `PATH` 上的，也可以是它自己的私有副本，位于 `XDG_DATA_HOME/eitri/nvim`（这个私有副本从不会被放进 `PATH`；所有安装包都不依赖系统自带的 nvim）。Ubuntu 24.04 自带的包是 0.9.5，低于这个下限。`install.sh`（上面的 curl 命令）在安装时如果没有找到足够新的版本，会主动提出为你获取官方 nvim 发行版；之后任何时候单独运行 `eitri setup --nvim-only`（不论是在 `.deb`/`.rpm`/tar 包安装之后，还是再次运行）都能得到同样的提示。
 
 ### 代理后端在你自己的机器上构建
 

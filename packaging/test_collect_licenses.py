@@ -698,10 +698,10 @@ class BuildHeaderProfiles(unittest.TestCase):
         text = "\n".join(lines)
         # RULE, title, RULE, "" precede the notice: it is the header's first substantive line.
         self.assertEqual(lines[4], cl.nvim_rs_lgpl_notice("0.9.2"))
-        self.assertIn("eitri's own code is MIT-licensed: see LICENSE, installed beside this file.", text)
+        self.assertIn("Eitri's own code is MIT-licensed: see LICENSE, installed beside this file.", text)
         self.assertNotIn("NOT OPEN SOURCE", text)
         self.assertNotIn("/usr/lib/eitri/verdandi-claude-sidecar", text)
-        self.assertIn("eitri's own source is at https://example.invalid/release-asset.tar.gz.", text)
+        self.assertIn("Eitri's own source is at https://example.invalid/release-asset.tar.gz.", text)
         self.assertNotIn("part 4", text)
         # The Contents list must include the Skia archive section.
         self.assertIn("components inside the Skia prebuilt archive in the source asset      (9)", text)
@@ -724,7 +724,7 @@ class BuildHeaderProfiles(unittest.TestCase):
                                  {"LGPL-3.0": 1, "MIT": 2}, {}, {"MIT": 5})
         text = "\n".join(lines)
         self.assertEqual(lines[4], cl.nvim_rs_lgpl_notice("0.9.2"))
-        self.assertIn("eitri's own code is MIT-licensed: see LICENSE, installed beside this file.", text)
+        self.assertIn("Eitri's own code is MIT-licensed: see LICENSE, installed beside this file.", text)
         self.assertIn("ONE PART IS NOT OPEN SOURCE", text)
         self.assertIn("/usr/lib/eitri/verdandi-claude-sidecar", text)
         self.assertIn("part 4  the sidecar: Node.js v22.23.2 and its npm packages", text)
@@ -762,7 +762,7 @@ class WriteSourceNotice(unittest.TestCase):
             self.text)
 
     def test_names_the_version_it_was_built_for(self):
-        self.assertIn("eitri 1.0.0-rc.1", self.text)
+        self.assertIn("Eitri 1.0.0-rc.1", self.text)
 
     def test_the_nvim_rs_version_in_the_notice_is_the_given_one_not_a_hardcoded_default(self):
         d = _scratch_dir()
