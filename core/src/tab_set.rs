@@ -3336,9 +3336,11 @@ mod tests {
 
         provider.queue(write("p5"));
         provider.queue(read("p6"));
+        // Both halves are waited for: the ingestion thread may deliver p5 and p6 in different polls,
+        // so p5's card being up does not yet mean p6 was answered (seen once under a loaded host).
         until("p5 cards and p6 is answered", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().attention.attention().pending == 1
+            set.get(tab).unwrap().attention.attention().pending == 1 && !provider.resolutions().is_empty()
         });
         assert_eq!(provider.resolutions(), vec![("p6".to_string(), true)]);
         shut_down_all(&mut set);
