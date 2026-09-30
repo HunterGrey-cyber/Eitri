@@ -1320,7 +1320,7 @@ textarea,
 }
 
 /* --- The empty tab's dashboard ------------------------- */
-/* LazyVim's start screen (snacks.nvim), `mock: empty.html` C: a centred `eitri`, the where-line,
+/* LazyVim's start screen (snacks.nvim), `mock: empty.html` C: a centred `Eitri`, the where-line,
    one row per `dashItems`, the selected mode's consequence line. Replaces the eight resume rows
    (`.empty-tab-resume` above is now dead JSX-wise -- kept only because `indexCss.test.ts`'s
    "keeps the empty tab inside its column" test still renders a synthetic `.empty-tab-resume

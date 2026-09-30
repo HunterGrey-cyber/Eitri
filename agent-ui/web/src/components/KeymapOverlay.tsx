@@ -235,8 +235,8 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           ...INPUT_KEYS,
           // The pane-motion row lists only Ctrl+h/l. Ctrl+j/k have their own meanings in the rows
           // below, so including them here would give conflicting descriptions.
-          { keys: "Ctrl+h / l", what: "Move between panes (eitri keeps these)" },
-          { keys: prefixLabel, what: "The prefix (eitri keeps it)" },
+          { keys: "Ctrl+h / l", what: "Move between panes (Eitri keeps these)" },
+          { keys: prefixLabel, what: "The prefix (Eitri keeps it)" },
           // V1 C1: Rust's mirror (`install_module_nav`) claims these two ahead of
           // `Composer` itself, the same reason the two rows above are spliced in here rather than
           // added to `INPUT_KEYS` -- that constant is tied to `COMPOSER_CHORDS` both ways

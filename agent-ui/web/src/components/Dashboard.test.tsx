@@ -67,7 +67,7 @@ describe("Dashboard", () => {
    *  it carries nothing. The backend stays reachable in `prefix i`. */
   it("draws the centred name and the where-line with no backend, account omitted when null", () => {
     const { getByText, container } = renderDash();
-    getByText("eitri");
+    getByText("Eitri");
     getByText("~/Documents/eitri · work");
     const noAccount = { ...HELLO, account: null };
     const { getByText: getByTextNoAccount } = renderDash({ hello: noAccount });

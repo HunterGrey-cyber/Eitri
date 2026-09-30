@@ -110,7 +110,7 @@ type Props = {
   prefix: string;
 };
 
-/** The empty tab's dashboard: a centred `eitri`, the
+/** The empty tab's dashboard: a centred `Eitri`, the
  *  where-line, one row per `dashItems(hello)`, the selected mode's consequence line, what every
  *  message also carries from the editor, and the first-run hint.
  *
@@ -126,7 +126,7 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix }: Props
   const consequence = MODE_CONSEQUENCE[mode];
   return (
     <div className="dashboard">
-      <div className="dash-title">eitri</div>
+      <div className="dash-title">Eitri</div>
       <div className="dash-where">{whereLine(hello, narrow)}</div>
       <div className="dash-items">
         {items.map((item, index) => (

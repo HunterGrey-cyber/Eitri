@@ -108,7 +108,7 @@ describe("heldBackSlashCommand", () => {
 
 describe("slashCommandFlashText", () => {
   it("explains that /login is unavailable and points to ?", () => {
-    expect(slashCommandFlashText("login")).toBe("/login does not work in eitri — ? lists the ones that do");
+    expect(slashCommandFlashText("login")).toBe("/login does not work in Eitri — ? lists the ones that do");
   });
 });
 

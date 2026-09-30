@@ -421,7 +421,7 @@ export type AgentDomainEvent =
   | { type: "session_unavailable"; reason: string }
   | { type: "session_closed"; reason: string }
   /** The sidecar's own acknowledgement of a `set_permission_mode` RPC (a
-   *  synchronous unary call issued on the GTK thread, never optimistic). `mode` is eitri's own
+   *  synchronous unary call issued on the GTK thread, never optimistic). `mode` is Eitri's own
    *  `PermissionModeChoice`; `provider_mode` is Verdandi's raw string (diagnostics only); `floor_applied`
    *  is `true` exactly when Verdandi's bypass floor (`usesDefaultBypassDeny`) still restricted
    *  the session (a deny list) despite `unrestricted: true` -- logged loudly, never silently. **The reducer ignores

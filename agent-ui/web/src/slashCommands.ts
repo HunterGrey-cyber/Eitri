@@ -95,7 +95,7 @@ export function barePickerCommand(text: string): "model" | "effort" | null {
 
 /** Flash text for a blocked slash command, pointing to `?` for commands that work. */
 export function slashCommandFlashText(name: string): string {
-  return `/${name} does not work in eitri — ? lists the ones that do`;
+  return `/${name} does not work in Eitri — ? lists the ones that do`;
 }
 
 /** Lists `works` entries in `SLASH_COMMANDS` order for the `?` overlay.
