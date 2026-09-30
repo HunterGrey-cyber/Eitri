@@ -379,7 +379,7 @@ fn tool_activity_interleaves_with_partial_assistant_updates() {
         &provider,
         &session_id,
         "First say a sentence about what you are about to do. Then run the bash command \
-         `echo neovibe_partial_marker_4d1c`. Then say a sentence about its output.",
+         `echo eitri_partial_marker_4d1c`. Then say a sentence about its output.",
         120,
     );
     timeline.report("tool + partial assistant updates");
@@ -425,7 +425,7 @@ fn tool_activity_interleaves_with_partial_assistant_updates() {
 
     // The marker only exists in the tool's real output, so this proves the result reached the model.
     assert!(
-        timeline.accumulated().contains("neovibe_partial_marker_4d1c"),
+        timeline.accumulated().contains("eitri_partial_marker_4d1c"),
         "the tool's output never reached the assistant text. got: {:?}",
         timeline.accumulated()
     );

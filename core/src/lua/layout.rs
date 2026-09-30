@@ -35,7 +35,7 @@ use mlua::{Lua, Table, Value};
 use crate::layout::tree::{MAX_RATIO, MIN_RATIO};
 use crate::layout::{Axis, ModuleId, Node};
 
-/// One `neovibe.layout.show/hide/focus/split` call, for `shell` to carry out.
+/// One `eitri.layout.show/hide/focus/split` call, for `shell` to carry out.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayoutRequest {
     Show(ModuleId),
@@ -45,7 +45,7 @@ pub enum LayoutRequest {
     Split(ModuleId, Axis),
 }
 
-/// What `neovibe.layout.*` recorded.
+/// What `eitri.layout.*` recorded.
 #[derive(Debug, Default)]
 pub struct LayoutStore {
     default: Option<Result<Node, String>>,
@@ -54,7 +54,7 @@ pub struct LayoutStore {
 }
 
 impl LayoutStore {
-    /// `neovibe.layout.default`'s tree, or why it is not one. `None` if `init.lua` never called it.
+    /// `eitri.layout.default`'s tree, or why it is not one. `None` if `init.lua` never called it.
     pub fn default_tree(&self) -> Option<&Result<Node, String>> {
         self.default.as_ref()
     }
@@ -71,7 +71,7 @@ impl LayoutStore {
 }
 
 /// `pub`: `shell`'s `LuaEngine::new` calls this.
-pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<LayoutStore>>) -> mlua::Result<()> {
+pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlua::Result<()> {
     let table = lua.create_table()?;
 
     let default_store = store.clone();
@@ -80,13 +80,13 @@ pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<LayoutStore>>) -> m
         lua.create_function(move |_, tree: Value| {
             if default_store.borrow().accepting {
                 return Err(mlua::Error::RuntimeError(
-                    "neovibe.layout.default: only in init.lua, before the window exists".to_string(),
+                    "eitri.layout.default: only in init.lua, before the window exists".to_string(),
                 ));
             }
-            let parsed = parse_default(&tree).map_err(|e| format!("neovibe.layout.default: {e}"));
+            let parsed = parse_default(&tree).map_err(|e| format!("eitri.layout.default: {e}"));
             let mut store = default_store.borrow_mut();
             if store.default.is_some() {
-                eprintln!("[lua] neovibe.layout.default called again -- the later call replaces the earlier");
+                eprintln!("[lua] eitri.layout.default called again -- the later call replaces the earlier");
             }
             store.default = Some(parsed.clone());
             parsed.map(|_| ()).map_err(mlua::Error::RuntimeError)
@@ -119,7 +119,7 @@ pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<LayoutStore>>) -> m
                 "below" => Axis::Column,
                 other => {
                     return Err(mlua::Error::RuntimeError(format!(
-                        "neovibe.layout.split: {other:?} is not 'right' or 'below'"
+                        "eitri.layout.split: {other:?} is not 'right' or 'below'"
                     )))
                 }
             };
@@ -127,27 +127,27 @@ pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<LayoutStore>>) -> m
         })?,
     )?;
 
-    neovibe.set("layout", table)?;
+    eitri.set("layout", table)?;
     Ok(())
 }
 
 fn module_arg(call: &str, id: &str) -> mlua::Result<ModuleId> {
-    ModuleId::parse(id).map_err(|e| mlua::Error::RuntimeError(format!("neovibe.layout.{call}: {e}")))
+    ModuleId::parse(id).map_err(|e| mlua::Error::RuntimeError(format!("eitri.layout.{call}: {e}")))
 }
 
 fn queue(store: &RefCell<LayoutStore>, call: &str, request: LayoutRequest) -> mlua::Result<()> {
     let mut store = store.borrow_mut();
     if !store.accepting {
         return Err(mlua::Error::RuntimeError(format!(
-            "neovibe.layout.{call}: only once the window exists (in a command or an event handler); \
-             neovibe.layout.default shapes the first window"
+            "eitri.layout.{call}: only once the window exists (in a command or an event handler); \
+             eitri.layout.default shapes the first window"
         )));
     }
     store.requests.push(request);
     Ok(())
 }
 
-/// `neovibe.layout.default`'s argument as a tree (the module doc's grammar).
+/// `eitri.layout.default`'s argument as a tree (the module doc's grammar).
 pub fn parse_default(value: &Value) -> Result<Node, String> {
     let Value::Table(table) = value else {
         return Err(format!("expected a table, got {}", value.type_name()));
@@ -289,10 +289,10 @@ mod tests {
 
     fn engine() -> (Lua, Rc<RefCell<LayoutStore>>) {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let store = Rc::new(RefCell::new(LayoutStore::default()));
-        install(&lua, &neovibe, store.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
         (lua, store)
     }
 
@@ -310,9 +310,8 @@ mod tests {
     /// The editor takes a 0.6 share beside a column with the agent above the canvas.
     #[test]
     fn the_specs_example_is_a_tree() {
-        let tree =
-            default_of("neovibe.layout.default{ 'row', {'editor', 0.6}, {'column', {'agent'}, {'canvas', 0.5}} }")
-                .unwrap();
+        let tree = default_of("eitri.layout.default{ 'row', {'editor', 0.6}, {'column', {'agent'}, {'canvas', 0.5}} }")
+            .unwrap();
         assert_eq!(
             tree,
             Node::split(
@@ -353,13 +352,13 @@ mod tests {
                 .is_some_and(|(_, p)| p)
         };
         assert!(pinned(
-            "neovibe.layout.default{ 'column', {'editor'}, {'agent'}, {'terminal'} }"
+            "eitri.layout.default{ 'column', {'editor'}, {'agent'}, {'terminal'} }"
         ));
         assert!(pinned(
-            "neovibe.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7}, {'terminal'} }"
+            "eitri.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7}, {'terminal'} }"
         ));
         assert!(
-            !pinned("neovibe.layout.default{ 'column', {'editor'}, {'terminal'}, {'agent'} }"),
+            !pinned("eitri.layout.default{ 'column', {'editor'}, {'terminal'}, {'agent'} }"),
             "a terminal in the middle is not a bottom row"
         );
     }
@@ -367,7 +366,7 @@ mod tests {
     /// tmux's n cells: three children with no shares are a third each, as a chain of two splits.
     #[test]
     fn children_without_a_share_divide_what_is_left_equally() {
-        let tree = default_of("neovibe.layout.default{ 'row', {'editor'}, {'agent'}, {'lua:notes'} }").unwrap();
+        let tree = default_of("eitri.layout.default{ 'row', {'editor'}, {'agent'}, {'lua:notes'} }").unwrap();
         let Node::Split { ratio, second, .. } = &tree else {
             panic!("a leaf")
         };
@@ -377,7 +376,7 @@ mod tests {
         };
         assert!((ratio - 0.5).abs() < 1e-6, "{ratio}");
         let tree =
-            default_of("neovibe.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7}, {'terminal'} }")
+            default_of("eitri.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7}, {'terminal'} }")
                 .unwrap();
         let Node::Split { axis, ratio, .. } = &tree else {
             panic!("a leaf")
@@ -389,63 +388,60 @@ mod tests {
     #[test]
     fn a_malformed_tree_is_an_error_naming_the_call_and_the_problem() {
         let cases = [
-            ("neovibe.layout.default('row')", "expected a table, got string"),
+            ("eitri.layout.default('row')", "expected a table, got string"),
             (
-                "neovibe.layout.default{ 'row', {'editor'} }",
+                "eitri.layout.default{ 'row', {'editor'} }",
                 "a row needs two or more items",
             ),
             (
-                "neovibe.layout.default{ 'rows', {'editor'}, {'agent'} }",
+                "eitri.layout.default{ 'rows', {'editor'}, {'agent'} }",
                 "unknown module 'rows'",
             ),
             (
-                "neovibe.layout.default{ 'row', {'editor', 1.2}, {'agent'} }",
+                "eitri.layout.default{ 'row', {'editor', 1.2}, {'agent'} }",
                 "between 0 and 1, got 1.2",
             ),
             (
-                "neovibe.layout.default{ 'row', {'editor', 0.7}, {'agent', 0.5} }",
+                "eitri.layout.default{ 'row', {'editor', 0.7}, {'agent', 0.5} }",
                 "add up to 1.2",
             ),
             (
-                "neovibe.layout.default{ 'row', {'editor', 0.6}, {'agent', 0.4}, {'terminal'} }",
+                "eitri.layout.default{ 'row', {'editor', 0.6}, {'agent', 0.4}, {'terminal'} }",
                 "leaving nothing",
             ),
             (
-                "neovibe.layout.default{ 'row', {'editor', 0.97}, {'agent', 0.03} }",
+                "eitri.layout.default{ 'row', {'editor', 0.97}, {'agent', 0.03} }",
                 "0.05 to 0.95",
             ),
             (
-                "neovibe.layout.default{ 'row', {'editor'}, {'editor'} }",
+                "eitri.layout.default{ 'row', {'editor'}, {'editor'} }",
                 "'editor' appears twice",
             ),
+            ("eitri.layout.default{ 'row', {'editor'}, {'terminal'} }", "no 'agent'"),
             (
-                "neovibe.layout.default{ 'row', {'editor'}, {'terminal'} }",
-                "no 'agent'",
-            ),
-            (
-                "neovibe.layout.default{ 'row', {'editor', 0.5, 'x'}, {'agent'} }",
+                "eitri.layout.default{ 'row', {'editor', 0.5, 'x'}, {'agent'} }",
                 "{'editor'} or {'editor', share}",
             ),
             (
-                "neovibe.layout.default{ 'row', {'editor'}, 'agent' }",
+                "eitri.layout.default{ 'row', {'editor'}, 'agent' }",
                 "expected a table, got string",
             ),
             (
-                "neovibe.layout.default{ 'row', {'editor', 'wide'}, {'agent'} }",
+                "eitri.layout.default{ 'row', {'editor', 'wide'}, {'agent'} }",
                 "a share is a number",
             ),
             (
-                "neovibe.layout.default{ 'row', {'editor', share = 0.6}, {'agent'} }",
+                "eitri.layout.default{ 'row', {'editor', share = 0.6}, {'agent'} }",
                 "a module's share is its second item, {'editor', 0.6}",
             ),
             (
-                "neovibe.layout.default{ 'row', {'editor'}, {'agent'}, shares = 0.7 }",
+                "eitri.layout.default{ 'row', {'editor'}, {'agent'}, shares = 0.7 }",
                 "unknown field shares",
             ),
         ];
         for (source, why) in cases {
             let err = default_of(source).unwrap_err();
-            assert!(err.starts_with("neovibe.layout.default: "), "{source}: {err}");
+            assert!(err.starts_with("eitri.layout.default: "), "{source}: {err}");
             assert!(err.contains(why), "{source}: expected {why:?} in {err:?}");
         }
     }
@@ -454,21 +450,21 @@ mod tests {
     #[test]
     fn a_malformed_tree_raises_in_lua_too() {
         let (lua, _) = engine();
-        let err = lua.load("neovibe.layout.default{ 'row' }").exec().unwrap_err();
-        assert!(err.to_string().contains("neovibe.layout.default"), "{err}");
+        let err = lua.load("eitri.layout.default{ 'row' }").exec().unwrap_err();
+        assert!(err.to_string().contains("eitri.layout.default"), "{err}");
     }
 
     #[test]
     fn requests_wait_for_the_window_then_queue_in_order() {
         let (lua, store) = engine();
-        let err = lua.load("neovibe.layout.hide('agent')").exec().unwrap_err();
+        let err = lua.load("eitri.layout.hide('agent')").exec().unwrap_err();
         assert!(err.to_string().contains("only once the window exists"), "{err}");
         assert!(store.borrow_mut().take_requests().is_empty());
 
         store.borrow_mut().accept_requests();
         lua.load(
-            "neovibe.layout.hide('agent'); neovibe.layout.show('terminal'); \
-             neovibe.layout.focus('lua:notes'); neovibe.layout.split('agent', 'below')",
+            "eitri.layout.hide('agent'); eitri.layout.show('terminal'); \
+             eitri.layout.focus('lua:notes'); eitri.layout.split('agent', 'below')",
         )
         .exec()
         .unwrap();
@@ -484,10 +480,10 @@ mod tests {
         assert!(store.borrow_mut().take_requests().is_empty(), "taken once");
 
         for (source, why) in [
-            ("neovibe.layout.show('chat')", "unknown module 'chat'"),
-            ("neovibe.layout.split('agent', 'left')", "not 'right' or 'below'"),
+            ("eitri.layout.show('chat')", "unknown module 'chat'"),
+            ("eitri.layout.split('agent', 'left')", "not 'right' or 'below'"),
             (
-                "neovibe.layout.default{ 'row', {'editor'}, {'agent'} }",
+                "eitri.layout.default{ 'row', {'editor'}, {'agent'} }",
                 "only in init.lua",
             ),
         ] {

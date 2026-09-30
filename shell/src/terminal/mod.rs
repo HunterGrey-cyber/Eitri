@@ -20,32 +20,33 @@ pub(crate) mod pointer;
 
 pub(crate) use pane::TerminalPane;
 
+use eitri_core::layout::{Frame, Layout, LayoutError, ModuleDecl, ModuleId, ModuleKind, Placement};
+use eitri_core::theme::ThemeTokens;
+use eitri_terminal::{ExitInfo, TerminalColors};
 use gtk4::gdk::{Key, ModifierType};
-use neovibe_core::layout::{Frame, Layout, LayoutError, ModuleDecl, ModuleId, ModuleKind, Placement};
-use neovibe_core::theme::ThemeTokens;
-use neovibe_terminal::{ExitInfo, TerminalColors};
 use terminal_render::RgbColor;
 
 use crate::layout::Direction;
 
-/// Builds the first-launch layout with the terminal below the editor's own leaf, using
-/// `Placement::BelowEditor`, then adds Lua panels in registration order. The agent and Lua
-/// `side` panels keep the full window height. The terminal is hidden before the layout is
-/// built into widgets, so it appears only after `Ctrl+a t`. Its hidden split collapses to
-/// the editor's leaf and leaves the visible layout unchanged.
+/// Builds the initial layout with the terminal below the editor's own leaf through
+/// [`eitri_core::layout::Placement::BelowEditor`], then adds Lua panels in registration
+/// order. The agent and Lua side panels keep the window's full height.
+/// The terminal is hidden before widgets are built and first appears on `Ctrl+a t`.
+/// Its hidden split takes no space, leaving the editor its usual leaf.
 ///
-/// The terminal is always exactly the editor's width. In the default 1280px window, its
-/// first show is 760px wide and a third of the editor column's height. A Lua `side` panel
-/// reduces that width along with the editor's share. A Lua `bottom` panel uses
-/// `Placement::BelowRoot` and wraps the whole tree, including the editor's nested terminal
-/// and the agent. The two vertical splits compound, so the terminal's first show under a
-/// `bottom` panel is 160px high rather than 240px. A `Row` split does not change height.
-/// Either Lua panel can receive focus when the terminal hides if it held the keys more
+/// The terminal always has the editor's width. In the default 1280px window its first
+/// show is 760px wide, from `DEFAULT_EDITOR_SHARE`, and one third of the editor column's
+/// height. A Lua side panel narrows the editor and terminal together.
+/// A Lua bottom panel uses `Placement::BelowRoot` and wraps the whole tree at full width.
+/// Its outer split and the terminal's inner split give the terminal an initial height
+/// of 160px under that panel. A row split does not change height.
+/// Either Lua panel can receive focus when the terminal hides if it was focused more
 /// recently than the editor or agent.
 ///
-/// Hides the terminal through `layout::hide`, which chooses a focus destination before
-/// hiding a focused module. At startup the editor or a Lua `main` panel holds the keys,
-/// so hiding the terminal reads no geometry and the supplied frame is only a placeholder.
+/// Hides the terminal through `eitri_core::layout::hide`, which chooses a focus target
+/// before hiding a focused module; `Layout::hide_unfocused` is private to the layout.
+/// At startup the editor or a Lua main panel has focus, so hiding the terminal reads
+/// no geometry and the supplied frame is only a formality.
 pub(crate) fn initial_layout(lua: &[ModuleDecl]) -> Result<Layout, LayoutError> {
     let mut decls = vec![ModuleDecl {
         id: ModuleId::terminal(),
@@ -53,7 +54,7 @@ pub(crate) fn initial_layout(lua: &[ModuleDecl]) -> Result<Layout, LayoutError> 
     }];
     decls.extend_from_slice(lua);
     let mut layout = Layout::initial(&decls)?;
-    neovibe_core::layout::hide(
+    eitri_core::layout::hide(
         &mut layout,
         &ModuleId::terminal(),
         &Frame::new(crate::module_grid::UNALLOCATED, 1),
@@ -128,7 +129,7 @@ impl ToggleAction {
 /// A shell that never started (an exec error) is not an end at all -- the pane shows the error in
 /// its own frame (`pane::ensure_session`) and never reaches this.
 ///
-/// As the last module on screen, this is not the layout's kill to make (`neovibe_core::layout::kill`
+/// As the last module on screen, this is not the layout's kill to make (`eitri_core::layout::kill`
 /// refuses the last one, as a hide does): it closes the window instead, tmux's own last-pane rule,
 /// through the ordinary close path -- `close window? N running (y/n)` when a tab runs, and `n`
 /// leaves everything, this terminal and its notice included ([`OnExit`]).
@@ -137,7 +138,7 @@ pub(crate) fn closes_on_exit(exit: &ExitInfo) -> bool {
 }
 
 /// What a shell's own end does with the module ([`closes_on_exit`]'s `true` case), by
-/// `neovibe_core::layout::can_kill`'s answer for it: another module is on screen, so the layout can
+/// `eitri_core::layout::can_kill`'s answer for it: another module is on screen, so the layout can
 /// take this one off it ([`KillScope::Module`]); or it is the last one, so ending it closes the
 /// window instead and the module itself is left alone until that really happens
 /// ([`KillScope::Window`]) -- `main.rs`'s `on_shell_exit` reads this rather than repeating the
@@ -148,8 +149,8 @@ pub(crate) enum OnExit {
     CloseWindow,
 }
 
-pub(crate) fn on_exit(scope: neovibe_core::layout::KillScope) -> OnExit {
-    use neovibe_core::layout::KillScope;
+pub(crate) fn on_exit(scope: eitri_core::layout::KillScope) -> OnExit {
+    use eitri_core::layout::KillScope;
     match scope {
         KillScope::Module => OnExit::CloseModule,
         KillScope::Window => OnExit::CloseWindow,
@@ -203,7 +204,7 @@ pub(crate) fn copy_mode_entry(focused: Option<ModuleKind>) -> bool {
 /// a pale cell. With `None` the cursor takes the covered cell's colours swapped, as foot does; on
 /// the theme's own default cells that is the same foreground block as before.
 pub(crate) fn colors_from(tokens: &ThemeTokens) -> TerminalColors {
-    let rgb = |c: neovibe_core::theme::color::Rgb| RgbColor::new(c.r, c.g, c.b);
+    let rgb = |c: eitri_core::theme::color::Rgb| RgbColor::new(c.r, c.g, c.b);
     TerminalColors {
         background: rgb(tokens.bg),
         foreground: rgb(tokens.fg),
@@ -215,7 +216,7 @@ pub(crate) fn colors_from(tokens: &ThemeTokens) -> TerminalColors {
 mod tests {
     use super::*;
     use crate::module_grid::UNALLOCATED;
-    use neovibe_core::layout::{arrange, hide, navigate, Nav, Rect, ZoomChange};
+    use eitri_core::layout::{arrange, hide, navigate, Nav, Rect, ZoomChange};
 
     fn editor() -> ModuleId {
         ModuleId::editor()
@@ -355,7 +356,7 @@ mod tests {
         let divider = shown
             .dividers
             .iter()
-            .find(|d| d.axis == neovibe_core::layout::Axis::Column)
+            .find(|d| d.axis == eitri_core::layout::Axis::Column)
             .unwrap()
             .clone();
         layout.set_ratio(&divider.path, divider.ratio_for(400)).unwrap();
@@ -424,7 +425,7 @@ mod tests {
 
     #[test]
     fn on_exit_reads_can_kills_scope() {
-        use neovibe_core::layout::KillScope;
+        use eitri_core::layout::KillScope;
         assert_eq!(on_exit(KillScope::Module), OnExit::CloseModule);
         assert_eq!(on_exit(KillScope::Window), OnExit::CloseWindow);
     }

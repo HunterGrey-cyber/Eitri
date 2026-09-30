@@ -50,7 +50,7 @@ fn main() {
     // `$TMPDIR` (`/tmp` when unset), like every other test in this workspace that needs a throwaway
     // directory -- this project's own dev-scratch convention (`~/.cache/nv-v1dist-*`) is for a human
     // running commands, not for a test's own temporary files, and nothing here is a build artifact.
-    let scratch = std::env::temp_dir().join(format!("neovibe-nvim-bin-override-test-{}", std::process::id()));
+    let scratch = std::env::temp_dir().join(format!("eitri-nvim-bin-override-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("creating the scratch dir must succeed");
     let marker = scratch.join("wrapper-argv.txt");

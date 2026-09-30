@@ -1,11 +1,11 @@
 #!/bin/sh
-# Builds and installs neovibe from this checkout as it is on disk, uncommitted changes included:
-# the development loop for working on neovibe itself. A release is installed with
+# Builds and installs eitri from this checkout as it is on disk, uncommitted changes included:
+# the development loop for working on eitri itself. A release is installed with
 # packaging/install.sh instead (the same script a release publishes as install.sh). This is a thin
 # wrapper over `packaging/install.sh --from-source --checkout`, not a second implementation: a
 # separate build-and-install script drifts from packaging/install.sh's checks and defaults (binary
 # lists, sidecar-artifact detection, signature and checksum checks). One installer behind
-# `curl | sh`, `neovibe setup` and this script keeps every route the same.
+# `curl | sh`, `eitri setup` and this script keeps every route the same.
 #
 #   ./install.sh                          build and install this checkout
 #   ./install.sh --allow-verdandi-rev-mismatch --verdandi-checkout DIR
@@ -18,7 +18,7 @@
 #
 # There is no default Verdandi checkout here: a fresh clone has no such directory, and
 # packaging/install.sh's --checkout path falls back to the pinned public Verdandi source when
-# NEOVIBE_VERDANDI_CHECKOUT names nothing. When it is set, it is passed through explicitly (an `if`, never a
+# EITRI_VERDANDI_CHECKOUT names nothing. When it is set, it is passed through explicitly (an `if`, never a
 # `:-` default), so this script's behaviour never depends on which shell has it exported.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd) || exit 1
@@ -36,9 +36,9 @@ for _nv_a in "$@"; do
 	case $_nv_a in
 	-h | --help)
 		cat <<'EOF'
-./install.sh is for working on neovibe itself.
+./install.sh is for working on eitri itself.
 With no option, it builds and installs this checkout from source, as it is on disk now
-(packaging/install.sh --from-source --checkout <this checkout>). NEOVIBE_VERDANDI_CHECKOUT, when
+(packaging/install.sh --from-source --checkout <this checkout>). EITRI_VERDANDI_CHECKOUT, when
 set, names a local Verdandi checkout to build the sidecar from. With one of packaging/install.sh's
 other modes (--uninstall, --nvim-only, --nvim-offer, --sidecar-only, --build-sidecar-into), it runs
 packaging/install.sh with that mode instead.
@@ -54,8 +54,8 @@ EOF
 		;;
 	esac
 done
-if [ -n "${NEOVIBE_VERDANDI_CHECKOUT:-}" ]; then
+if [ -n "${EITRI_VERDANDI_CHECKOUT:-}" ]; then
 	exec sh "$here/packaging/install.sh" --from-source --checkout "$here" \
-		--verdandi-checkout "$NEOVIBE_VERDANDI_CHECKOUT" "$@"
+		--verdandi-checkout "$EITRI_VERDANDI_CHECKOUT" "$@"
 fi
 exec sh "$here/packaging/install.sh" --from-source --checkout "$here" "$@"

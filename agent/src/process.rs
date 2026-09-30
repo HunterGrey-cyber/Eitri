@@ -107,15 +107,14 @@ pub fn disallowed_tools() -> &'static [&'static str] {
 pub const SETTING_SOURCES_NOTE: &str =
     "project + local only (.claude/ and CLAUDE.md here); ~/.claude's settings, hooks, plugins and CLAUDE.md are not loaded";
 
-/// Controls whether the application answers every permission request `allow`. This mode is
-/// never sent to the CLI. Both backends keep their permission gates: legacy uses
-/// `--permission-mode default` with the `PreToolUse` hook, and the sidecar uses `INTERACTIVE`.
-///
-/// Keeping this mode out of session requests prevents it from being silently ignored or
-/// enabling CLI `bypassPermissions` instead of application-level answers.
+/// The host's answer mode: whether Eitri answers every permission request `allow` itself.
+/// This mode is not sent to the CLI. Both backends run gated: `--permission-mode default` with the
+/// `PreToolUse` hook on legacy, and `INTERACTIVE` on the sidecar. The host uses this mode only where
+/// it answers requests. Sending it as a session parameter would either silently ignore the requested
+/// mode or allow the CLI to bypass the gate.
 ///
 /// Serialized on `AgentDomainEvent::PermissionModeChanged` for the panel's JSON snapshot.
-/// `rename_all = "snake_case"` matches the event enums' wire convention.
+/// `rename_all = "snake_case"` matches the other wire-facing enums in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
@@ -133,7 +132,7 @@ pub enum PermissionMode {
 /// without a hook answer, so less restrictive or unknown reported modes stop the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliModeReport {
-    /// `default`: what neovibe asked for.
+    /// `default`: what Eitri asked for.
     Default,
     /// `plan` or `dontAsk`: stricter than `default` -- a non-answer still denies. Noted once, the
     /// session continues.
@@ -316,7 +315,7 @@ fn spawn_hook_listener(
                 write_fail_closed_deny(
                     &stream,
                     &format!(
-                        "the CLI reports permission mode '{reported}' -- neovibe runs only sessions \
+                        "the CLI reports permission mode '{reported}' -- Eitri runs only sessions \
                          it gates itself; this call is denied and the session is being closed"
                     ),
                 );
@@ -1008,7 +1007,7 @@ mod deny_list_tests {
             assert!(
                 !list.contains(&tool),
                 "{tool} must be offered: the PreToolUse hook gates every call, \
-                 and bypass, neovibe's own allow, denies nothing (2026-09-20, R07)"
+                 and bypass, Eitri's own allow, denies nothing (2026-09-20, R07)"
             );
         }
         // Empty, and that is the whole list: an empty list is what makes the legacy spawn omit
@@ -1043,7 +1042,7 @@ mod deny_list_tests {
     /// statement: it owns no tool namespace, and a hardcoded list of real tool names on its side
     /// would rot. So it is named as a known hole in its own proto comment rather than fixed there.
     ///
-    /// This list is the statement neovibe sends. Lowercasing one entry here would disarm the floor
+    /// This list is the statement Eitri sends. Lowercasing one entry here would disarm the floor
     /// over there, install no hook, and emit no notice — nothing anywhere would say so. This repo
     /// owns this list, so this is the one place the hole can be closed: an edit has to be
     /// deliberate enough to update an assertion that spells the consequence out.
@@ -1708,7 +1707,7 @@ mod tests {
         }
     }
 
-    /// `default` is what neovibe asked for: an ordinary request, filed, and nothing noted.
+    /// `default` is what Eitri asked for: an ordinary request, filed, and nothing noted.
     #[test]
     fn a_hook_call_in_default_is_an_ordinary_request() {
         let socket_path = temp_socket_path();

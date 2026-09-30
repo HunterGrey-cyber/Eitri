@@ -116,7 +116,7 @@ pub struct CursorCell {
     pub visible: bool,
 }
 
-/// The `Term` configuration every neovibe terminal runs with. A function, so a test can pin it.
+/// The `Term` configuration every Eitri terminal runs with. A function, so a test can pin it.
 ///
 /// - `osc52: OnlyCopy` -- a program may SET the clipboard (nvim's `"+y`), never READ it.
 ///   `Term` enforces this itself, before any event reaches the listener.
@@ -653,7 +653,7 @@ mod tests {
             assert_eq!(
                 record(Osc52::CopyPaste, read),
                 1,
-                "{name}: under a config neovibe never uses, Term does emit ClipboardLoad -- \
+                "{name}: under a config Eitri never uses, Term does emit ClipboardLoad -- \
                  proving OnlyCopy's silence above is Term's own refusal, not an artifact of this test"
             );
         }

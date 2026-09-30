@@ -564,11 +564,11 @@ const NVIM_INSTALL_URL: &str = "https://github.com/neovim/neovim/wiki/Installing
 fn build_start_failure_message(raw_error: &str) -> String {
     match detected_nvim_version(raw_error) {
         Some(found) => format!(
-            "nvim {found} is older than neovibe's floor ({NVIM_VERSION_FLOOR} or newer). Get a newer \
+            "nvim {found} is older than Eitri's floor ({NVIM_VERSION_FLOOR} or newer). Get a newer \
              nvim: {NVIM_INSTALL_URL}"
         ),
         None => format!(
-            "nvim could not be started (neovibe needs {NVIM_VERSION_FLOOR} or newer): {raw_error}. \
+            "nvim could not be started (Eitri needs {NVIM_VERSION_FLOOR} or newer): {raw_error}. \
              Install it: {NVIM_INSTALL_URL}"
         ),
     }
@@ -2368,7 +2368,7 @@ mod tests {
     // construct a real `LiveHarness::with_options` error.
 
     /// The too-old shape: the fork's own sentence names the found version; the built message must
-    /// name it too, plus neovibe's own floor and where to get a newer nvim.
+    /// name it too, plus Eitri's own floor and where to get a newer nvim.
     #[test]
     fn a_too_old_nvim_names_the_version_that_was_found() {
         // The error's `{found}` contains `:version`'s full first line, "NVIM v0.9.5".

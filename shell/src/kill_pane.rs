@@ -33,19 +33,19 @@
 
 use std::time::{Duration, Instant};
 
-use neovibe_core::layout::{KillScope, Layout, ModuleDecl, ModuleId, ModuleKind, Placement, Reopen};
+use eitri_core::layout::{KillScope, Layout, ModuleDecl, ModuleId, ModuleKind, Placement, Reopen};
 use neovide_editor::CallWatch;
 
 /// The y/n `prefix x` asks. `title` is the module's name as the tray and the strip show it;
 /// `running`/`queued` are the agent's tabs with a turn or a connect in flight and its queued
 /// messages (the window-close prompt's two counts). For [`KillScope::Module`] they are the agent's
 /// own consequences, ignored for any other module; for [`KillScope::Window`] -- the last module on
-/// screen, whose kill closes neovibe -- they are the window close's, for every module, so this one
+/// screen, whose kill closes eitri -- they are the window close's, for every module, so this one
 /// question stands in for that one too.
 pub(crate) fn prompt(id: &ModuleId, title: &str, scope: KillScope, running: usize, queued: usize) -> String {
     let mut consequences = Vec::new();
     if scope == KillScope::Window {
-        consequences.push("closes neovibe".to_string());
+        consequences.push("closes eitri".to_string());
         if running > 0 {
             consequences.push(format!("{running} running"));
         }
@@ -140,7 +140,7 @@ pub(crate) struct Reveal {
     /// the keys, letting the next `n` or `d` answer an unseen prompt.
     pub(crate) show: bool,
     /// Hidden (not merely zoomed away): hidden again if nvim quits. A zoom is not saved
-    /// (`neovibe_core::layout::persist`), so ending one changes nothing the window keeps.
+    /// (`eitri_core::layout::persist`), so ending one changes nothing the window keeps.
     pub(crate) rehide: bool,
 }
 
@@ -272,7 +272,7 @@ pub(crate) fn retire_on_declined_close(nvim_exited: bool, editor_gone: bool) -> 
 }
 
 /// Whether a window close after a `y` to [`KillScope::Window`] may skip its own y/n. `confirmed` is
-/// the window close's prompt (`neovibe_core::tabs::window_close_prompt`) as it stood when the kill
+/// the window close's prompt (`eitri_core::tabs::window_close_prompt`) as it stood when the kill
 /// was asked, `now` as it stands at the close: the editor's close waits for nvim, whose own
 /// `:confirm qall` may be answered much later. Nothing worth asking about now, or exactly what was
 /// said yes to: no second question. Anything else is asked.
@@ -280,7 +280,7 @@ pub(crate) fn close_is_confirmed(confirmed: Option<&str>, now: Option<&str>) -> 
     now.is_none() || now == confirmed
 }
 
-/// Where the layout leaves a killed module (`neovibe_core::layout::Reopen`). `decls` are the Lua
+/// Where the layout leaves a killed module (`eitri_core::layout::Reopen`). `decls` are the Lua
 /// panels as `init.lua` registered them.
 pub(crate) fn reopen(id: &ModuleId, decls: &[ModuleDecl]) -> Reopen {
     match id.kind() {
@@ -296,8 +296,8 @@ pub(crate) fn reopen(id: &ModuleId, decls: &[ModuleDecl]) -> Reopen {
     }
 }
 
-/// The Lua nvim is asked to run to quit the editor (`neovibe_core::layout::kill::editor_quit_lua`).
-pub(crate) use neovibe_core::layout::kill::editor_quit_lua;
+/// The Lua nvim is asked to run to quit the editor (`eitri_core::layout::kill::editor_quit_lua`).
+pub(crate) use eitri_core::layout::kill::editor_quit_lua;
 
 #[cfg(test)]
 mod tests {
@@ -484,7 +484,7 @@ mod tests {
     /// hidden before the prompt, do not hide it afterwards.
     #[test]
     fn a_hidden_or_zoomed_away_editor_is_brought_on_screen_for_the_prompt() {
-        use neovibe_core::layout::{hide, Frame, Size};
+        use eitri_core::layout::{hide, Frame, Size};
         let editor = ModuleId::editor();
         let mut layout = Layout::initial(&[]).unwrap();
         assert_eq!(
@@ -592,25 +592,25 @@ mod tests {
         );
     }
 
-    /// The last module on screen: the kill closes neovibe, and the one question also carries the
+    /// The last module on screen: the kill closes eitri, and the one question also carries the
     /// window close's own `N running, M queued` (it is not asked a second time), for every module.
     #[test]
-    fn the_last_modules_prompt_says_it_closes_neovibe_and_what_is_running() {
+    fn the_last_modules_prompt_says_it_closes_eitri_and_what_is_running() {
         assert_eq!(
             prompt(&ModuleId::editor(), "editor", KillScope::Window, 0, 0),
-            "kill-pane editor? closes neovibe (y/n)"
+            "kill-pane editor? closes eitri (y/n)"
         );
         assert_eq!(
             prompt(&ModuleId::editor(), "editor", KillScope::Window, 2, 1),
-            "kill-pane editor? closes neovibe, 2 running, 1 queued (y/n)"
+            "kill-pane editor? closes eitri, 2 running, 1 queued (y/n)"
         );
         assert_eq!(
             prompt(&ModuleId::terminal(), "terminal", KillScope::Window, 1, 0),
-            "kill-pane terminal? closes neovibe, 1 running (y/n)"
+            "kill-pane terminal? closes eitri, 1 running (y/n)"
         );
         assert_eq!(
             prompt(&ModuleId::agent(), "agent", KillScope::Window, 0, 3),
-            "kill-pane agent? closes neovibe, 3 queued (y/n)"
+            "kill-pane agent? closes eitri, 3 queued (y/n)"
         );
     }
 

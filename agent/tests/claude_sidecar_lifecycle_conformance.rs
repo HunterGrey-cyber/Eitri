@@ -393,7 +393,7 @@ fn real_gated_session_runs_a_tool_once_the_host_allows_it() {
     let events = run_turn(
         &provider,
         &session_id,
-        "Run the bash command `echo neovibe_bypass_marker_9f3a` and reply with its exact output.",
+        "Run the bash command `echo eitri_bypass_marker_9f3a` and reply with its exact output.",
         90,
     );
 
@@ -423,7 +423,7 @@ fn real_gated_session_runs_a_tool_once_the_host_allows_it() {
 
     let reply = text_of(&events);
     assert!(
-        reply.contains("neovibe_bypass_marker_9f3a"),
+        reply.contains("eitri_bypass_marker_9f3a"),
         "the model never reported the tool's real output, so the tool result did not reach it. got: {reply:?}"
     );
 

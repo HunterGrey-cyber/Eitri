@@ -26,7 +26,7 @@
 /// someone else, so it counts as alive; `ESRCH` means it does not exist.
 ///
 /// **Load-bearing contract: `false` must only ever mean ESRCH, never "could not determine".**
-/// `neovibe-core`'s `instance_dir::sweep_stale_instance_dirs` reads a `false` from this function as
+/// `eitri-core`'s `instance_dir::sweep_stale_instance_dirs` reads a `false` from this function as
 /// permission to `remove_dir_all` a directory -- so a `false` that actually means "unknown" would
 /// delete a live instance's state. The consequence follows directly: a platform this crate cannot
 /// answer the question on must fail to COMPILE, not silently return `false`. `libc::kill` below is

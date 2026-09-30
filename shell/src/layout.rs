@@ -7,7 +7,7 @@
 //! never shows it. Hiding the zoomed module ends the zoom (`Layout::hide_unfocused`). Showing a
 //! module restores its ratio; the first show gives it `BELOW_ROOT_SHARE`'s third.
 
-pub(crate) use neovibe_core::layout::Direction;
+pub(crate) use eitri_core::layout::Direction;
 
 /// A cell's size, in logical px, when the editor cannot say (not ready yet, or hidden since
 /// before nvim started).
@@ -20,7 +20,7 @@ pub(crate) const FALLBACK_CELL: (f64, f64) = (8.0, 16.0);
 pub(crate) const BOTTOM_MIN_HEIGHT: i32 = 80;
 
 /// One resize step in pixels: `cells` editor cells, across for left/right, down for up/down. The
-/// sign is the geometry's (`neovibe_core::layout::resize`).
+/// sign is the geometry's (`eitri_core::layout::resize`).
 pub(crate) fn resize_px(direction: Direction, cell: (f64, f64), cells: u16) -> i32 {
     let along = match direction {
         Direction::Left | Direction::Right => cell.0,

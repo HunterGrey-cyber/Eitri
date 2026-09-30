@@ -4,7 +4,7 @@
 mod common;
 
 use common::{metrics, size, spec, Harness, Raster, WAIT};
-use neovibe_terminal::{layout_preedit, Screen, SessionCommand, SessionConfig, TerminalColors};
+use eitri_terminal::{layout_preedit, Screen, SessionCommand, SessionConfig, TerminalColors};
 use terminal_render::RgbColor;
 
 const BG: RgbColor = RgbColor::new(0xfa, 0xf4, 0xed); // rose-pine dawn's base, a LIGHT background
@@ -36,16 +36,17 @@ fn start_colored(script: &str, focused: bool, colors: TerminalColors) -> Harness
 
 #[test]
 fn printed_text_paints_ink_in_every_cell_on_the_themes_background() {
-    let mut h = start("printf 'hello-neovibe\\n'; exec sleep 5", true);
-    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "hello-neovibe"));
+    const HELLO: &str = "hello-eitri";
+    let mut h = start(&format!("printf '{HELLO}\\n'; exec sleep 5"), true);
+    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == HELLO));
     let list = h.frame.clone().unwrap();
     assert_eq!(list.surface_background, BG, "the theme's background, not xterm's black");
     let m = metrics();
     let r = Raster::of(&list, &m);
     let bg = (BG.r, BG.g, BG.b);
     assert_eq!(r.at(r.width - 1, r.height - 1), bg);
-    for col in 0..13 {
-        assert!(r.ink(&m, 0, col, 1, bg) > 0, "no ink in cell {col} of 'hello-neovibe'");
+    for col in 0..HELLO.len() as u16 {
+        assert!(r.ink(&m, 0, col, 1, bg) > 0, "no ink in cell {col} of '{HELLO}'");
     }
     assert!(r.ink(&m, 1, 0, 1, bg) > 0, "the cursor on row 1");
 }

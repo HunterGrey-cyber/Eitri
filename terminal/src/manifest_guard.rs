@@ -103,7 +103,7 @@ fn manifest_declares_no_gtk_or_webkit_dependency() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "neovibe-terminal must build without a toolkit -- `shell/src/terminal/` is where GTK goes:\n{}",
+        "eitri-terminal must build without a toolkit -- `shell/src/terminal/` is where GTK goes:\n{}",
         offenders.join("\n")
     );
 }

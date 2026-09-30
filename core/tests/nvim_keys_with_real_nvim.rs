@@ -11,13 +11,13 @@
 //! test drives `FocusLost` by hand. Lines are counted off a raw listener, not the newest-wins
 //! reader, so "nothing re-sent" is observable.
 //!
-//! Run: `cargo test -p neovibe-core --test nvim_keys_with_real_nvim -- --ignored`
+//! Run: `cargo test -p eitri-core --test nvim_keys_with_real_nvim -- --ignored`
 
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::UnixListener;
 
-use neovibe_core::nvim_keys::feed::NvimKeysFeed;
-use neovibe_core::nvim_keys::parse_report;
+use eitri_core::nvim_keys::feed::NvimKeysFeed;
+use eitri_core::nvim_keys::parse_report;
 
 /// Accepts until `WouldBlock` and reads each connection to EOF. nvim has exited by the time this
 /// runs, so every sender has already written and closed.

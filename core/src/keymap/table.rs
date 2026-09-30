@@ -37,7 +37,7 @@ pub struct Binding {
 
 /// The effective prefix table: the prefix chord and what each key after it does, plus
 /// `init.lua`'s recorded `"panel"` table ops -- unmerged with nvim's own mappings or the panel
-/// defaults here; `neovibe_core::keymap::panel::effective` does that merge.
+/// defaults here; `eitri_core::keymap::panel::effective` does that merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keymap {
     prefix: KeySpec,
@@ -45,7 +45,7 @@ pub struct Keymap {
     panel_user: PanelUserTable,
 }
 
-/// One `neovibe.keymap` call, as `core::lua::keymap` recorded it -- raw, so every error is found
+/// One `eitri.keymap` call, as `core::lua::keymap` recorded it -- raw, so every error is found
 /// here, after `init.lua` has run, and becomes a hard startup failure rather than a Lua error
 /// `shell` only logs.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,9 +71,9 @@ impl KeymapOp {
     /// The call as the user wrote it, for an error message.
     pub fn call(&self) -> String {
         match self {
-            KeymapOp::Prefix { key } => format!("neovibe.keymap.prefix({key:?})"),
-            KeymapOp::Set { table, key, .. } => format!("neovibe.keymap.set({table:?}, {key:?}, …)"),
-            KeymapOp::Del { table, key } => format!("neovibe.keymap.del({table:?}, {key:?})"),
+            KeymapOp::Prefix { key } => format!("eitri.keymap.prefix({key:?})"),
+            KeymapOp::Set { table, key, .. } => format!("eitri.keymap.set({table:?}, {key:?}, …)"),
+            KeymapOp::Del { table, key } => format!("eitri.keymap.del({table:?}, {key:?})"),
             KeymapOp::Invalid(message) => message.clone(),
         }
     }
@@ -142,7 +142,7 @@ impl fmt::Display for KeymapError {
                 let key = key.to_string();
                 write!(
                     f,
-                    "{call}: {key:?} is already bound to {bound_to} ({source}); neovibe.keymap.del(\"prefix\", {key:?}) first"
+                    "{call}: {key:?} is already bound to {bound_to} ({source}); eitri.keymap.del(\"prefix\", {key:?}) first"
                 )
             }
             KeymapError::NotBound { call, key } => {
@@ -168,7 +168,7 @@ impl fmt::Display for KeymapError {
                 hits,
             } => write!(
                 f,
-                "neovibe.command.register{{ id = {command:?}, keybinding = {keybinding:?} }}: {keybinding} is {hits}"
+                "eitri.command.register{{ id = {command:?}, keybinding = {keybinding:?} }}: {keybinding} is {hits}"
             ),
             KeymapError::Panel { call, why } => write!(f, "{call}: {why}"),
         }
@@ -450,15 +450,15 @@ impl Keymap {
     }
 }
 
-/// Collision rule 4: a `neovibe.command.register{ keybinding }` accelerator that is the prefix chord
+/// Collision rule 4: an `eitri.command.register{ keybinding }` accelerator that is the prefix chord
 /// or a root chord would never fire (the prefix and the root controllers see the key first). An
-/// accelerator `Chord` cannot read uses a modifier neovibe never binds, so it cannot collide.
+/// accelerator `Chord` cannot read uses a modifier Eitri never binds, so it cannot collide.
 pub fn check_command_keybinding(command: &str, keybinding: &str, keymap: &Keymap) -> Result<(), KeymapError> {
     let Ok(chord) = Chord::from_gtk(keybinding) else {
         return Ok(());
     };
     let hits = if chord == Chord::of(keymap.prefix()) {
-        Some(format!("the prefix, {} (neovibe.keymap)", keymap.prefix().human()))
+        Some(format!("the prefix, {} (eitri.keymap)", keymap.prefix().human()))
     } else {
         root::chords()
             .into_iter()
@@ -590,21 +590,21 @@ mod tests {
         assert!(map.bindings().iter().all(|b| b.source == Source::Default));
     }
 
-    /// Every default key is stock tmux's, with stock's `-r`, unless the spec marks it neovibe-only.
+    /// Every default key is stock tmux's, with stock's `-r`, unless the spec marks it eitri-only.
     #[test]
-    fn every_default_is_a_stock_tmux_key_or_marked_neovibe_only() {
+    fn every_default_is_a_stock_tmux_key_or_marked_eitri_only() {
         // `[` and `PPage` are stock tmux's own keys too (both non-repeatable, like our `copy-mode`
-        // bindings), so they need no entry here even though neovibe's action differs from tmux's.
-        const NEOVIBE_ONLY: [&str; 7] = ["C-l", "C-h", "C-j", "C-k", "F11", "e", "a"];
+        // bindings), so they need no entry here even though Eitri's action differs from tmux's.
+        const EITRI_ONLY: [&str; 7] = ["C-l", "C-h", "C-j", "C-k", "F11", "e", "a"];
         for binding in Keymap::defaults().bindings() {
             let name = binding.key.to_string();
-            if NEOVIBE_ONLY.contains(&name.as_str()) {
+            if EITRI_ONLY.contains(&name.as_str()) {
                 continue;
             }
             let (_, repeat, _) = STOCK_TMUX_PREFIX
                 .iter()
                 .find(|(key, _, _)| *key == name)
-                .unwrap_or_else(|| panic!("{name} is neither stock tmux's nor marked neovibe-only"));
+                .unwrap_or_else(|| panic!("{name} is neither stock tmux's nor marked eitri-only"));
             assert_eq!(binding.repeatable, *repeat, "{name}: tmux binds it with -r = {repeat}");
         }
     }
@@ -615,8 +615,8 @@ mod tests {
         let err = Keymap::apply_user(&[set("l", "resize.right")], &[]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "neovibe.keymap.set(\"prefix\", \"l\", …): \"l\" is already bound to tab.last (default); \
-             neovibe.keymap.del(\"prefix\", \"l\") first"
+            "eitri.keymap.set(\"prefix\", \"l\", …): \"l\" is already bound to tab.last (default); \
+             eitri.keymap.del(\"prefix\", \"l\") first"
         );
     }
 
@@ -646,7 +646,7 @@ mod tests {
     fn del_of_an_unbound_key_fails_naming_it() {
         let err = Keymap::apply_user(&[del("q")], &[]).unwrap_err().to_string();
         assert!(
-            err.contains("neovibe.keymap.del(\"prefix\", \"q\")") && err.contains("not bound"),
+            err.contains("eitri.keymap.del(\"prefix\", \"q\")") && err.contains("not bound"),
             "{err}"
         );
     }
@@ -656,7 +656,7 @@ mod tests {
     fn a_prefix_that_is_a_root_chord_fails_naming_both() {
         let err = Keymap::apply_user(&[prefix("C-h")], &[]).unwrap_err().to_string();
         assert!(
-            err.contains("neovibe.keymap.prefix(\"C-h\")") && err.contains("Ctrl+h (move to the module left)"),
+            err.contains("eitri.keymap.prefix(\"C-h\")") && err.contains("Ctrl+h (move to the module left)"),
             "{err}"
         );
         let err = Keymap::apply_user(&[prefix("C-=")], &[]).unwrap_err().to_string();
@@ -713,8 +713,8 @@ mod tests {
 
     #[test]
     fn a_call_lua_could_not_record_is_the_error() {
-        let err = Keymap::apply_user(&[KeymapOp::Invalid("neovibe.keymap.set(...): boom".into())], &[]).unwrap_err();
-        assert_eq!(err.to_string(), "neovibe.keymap.set(...): boom");
+        let err = Keymap::apply_user(&[KeymapOp::Invalid("eitri.keymap.set(...): boom".into())], &[]).unwrap_err();
+        assert_eq!(err.to_string(), "eitri.keymap.set(...): boom");
     }
 
     /// Collision rule 4.
@@ -736,7 +736,7 @@ mod tests {
         assert!(check_command_keybinding("x", "<Control>g", &map).is_ok());
         assert!(
             check_command_keybinding("x", "<Super>x", &map).is_ok(),
-            "a chord neovibe never binds"
+            "a chord Eitri never binds"
         );
         let custom = Keymap::apply_user(&[prefix("C-a")], &[]).unwrap();
         assert!(check_command_keybinding("x", "<Control>a", &custom).is_err());

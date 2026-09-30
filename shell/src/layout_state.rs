@@ -42,13 +42,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use eitri_core::layout::persist::{self, Loaded};
+use eitri_core::layout::{reconcile_default, Layout, ModuleDecl, ModuleId, Node};
 use gtk4::glib;
-use neovibe_core::layout::persist::{self, Loaded};
-use neovibe_core::layout::{reconcile_default, Layout, ModuleDecl, ModuleId, Node};
 
 /// The layout a window opens with, and the lines to log about how it was chosen.
 ///
-/// - `default`: `neovibe.layout.default`'s tree, if `init.lua` gave one; an error there is the
+/// - `default`: `eitri.layout.default`'s tree, if `init.lua` gave one; an error there is the
 ///   caller's startup failure, not handled here.
 /// - `loaded`: this project's state file, if the state directory is known.
 ///
@@ -72,8 +72,8 @@ pub(crate) fn choose_startup_layout(
     let first_launch = |notes: &mut Vec<String>| -> Result<Layout, String> {
         match default {
             Some(tree) => {
-                let r = reconcile_default(tree.clone(), lua).map_err(|e| format!("neovibe.layout.default: {e}"))?;
-                notes.extend(r.notes.into_iter().map(|n| format!("neovibe.layout.default: {n}")));
+                let r = reconcile_default(tree.clone(), lua).map_err(|e| format!("eitri.layout.default: {e}"))?;
+                notes.extend(r.notes.into_iter().map(|n| format!("eitri.layout.default: {n}")));
                 Ok(r.layout)
             }
             None => crate::terminal::initial_layout(lua).map_err(|e| e.to_string()),
@@ -84,8 +84,7 @@ pub(crate) fn choose_startup_layout(
             notes.extend(r.notes);
             notes.push("reopened as it was left".to_string());
             if default.is_some() {
-                notes
-                    .push("neovibe.layout.default shapes a project with no saved layout; this one has one".to_string());
+                notes.push("eitri.layout.default shapes a project with no saved layout; this one has one".to_string());
             }
             r.layout
         }
@@ -302,10 +301,10 @@ impl LayoutSaver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neovibe_core::layout::{Axis, Direction, Frame, ModuleId, Placement, Size};
+    use eitri_core::layout::{Axis, Direction, Frame, ModuleId, Placement, Size};
 
     fn restored(layout: Layout) -> Loaded {
-        Loaded::Restored(neovibe_core::layout::Reconciled {
+        Loaded::Restored(eitri_core::layout::Reconciled {
             layout,
             notes: vec!["a note".to_string()],
         })
@@ -330,7 +329,7 @@ mod tests {
             [
                 "a note",
                 "reopened as it was left",
-                "neovibe.layout.default shapes a project with no saved layout; this one has one"
+                "eitri.layout.default shapes a project with no saved layout; this one has one"
             ]
         );
     }
@@ -373,10 +372,10 @@ mod tests {
     fn a_layout_that_hides_the_editor_says_what_waits_for_it() {
         let mut left = crate::terminal::initial_layout(&[]).unwrap();
         left.set_focus(&ModuleId::agent()).unwrap();
-        neovibe_core::layout::hide(
+        eitri_core::layout::hide(
             &mut left,
             &ModuleId::editor(),
-            &neovibe_core::layout::Frame::new(neovibe_core::layout::Size { w: 1280, h: 721 }, 1),
+            &eitri_core::layout::Frame::new(eitri_core::layout::Size { w: 1280, h: 721 }, 1),
         )
         .unwrap();
         let (layout, notes) = choose_startup_layout(None, Some(restored(left.clone())), &[], Some("Ctrl+b e")).unwrap();
@@ -554,7 +553,7 @@ mod tests {
         let second_saver = saver_for(&dir, &second);
 
         first.borrow_mut().show(&ModuleId::terminal()).unwrap();
-        neovibe_core::layout::swap(&mut first.borrow_mut(), &ModuleId::editor(), Direction::Right, &frame()).unwrap();
+        eitri_core::layout::swap(&mut first.borrow_mut(), &ModuleId::editor(), Direction::Right, &frame()).unwrap();
         first_saver.save_now();
         let firsts = written_by(&first);
         assert_eq!(file_text(&dir), firsts);
@@ -562,7 +561,7 @@ mod tests {
         second_saver.save_now();
         assert_eq!(file_text(&dir), firsts, "the second window's click: nothing written");
 
-        neovibe_core::layout::hide(&mut second.borrow_mut(), &ModuleId::agent(), &frame()).unwrap();
+        eitri_core::layout::hide(&mut second.borrow_mut(), &ModuleId::agent(), &frame()).unwrap();
         second_saver.save_now();
         let seconds = written_by(&second);
         assert_ne!(seconds, firsts);
@@ -621,7 +620,7 @@ mod tests {
             choose_startup_layout(Some(&bottom_row_default()), Some(Loaded::Missing), &[], None).unwrap();
         let layout = Rc::new(RefCell::new(startup));
         let saver = saver_for(&dir, &layout);
-        assert!(neovibe_core::layout::settle_pins(&mut layout.borrow_mut(), &frame()));
+        assert!(eitri_core::layout::settle_pins(&mut layout.borrow_mut(), &frame()));
         saver.settled();
         layout.borrow_mut().toggle_zoom(&ModuleId::editor());
         saver.save_now();
@@ -629,7 +628,7 @@ mod tests {
         saver.save_now();
         assert!(!path.exists(), "the first frame and a zoom: nothing to keep");
 
-        assert!(neovibe_core::layout::resize(
+        assert!(eitri_core::layout::resize(
             &mut layout.borrow_mut(),
             &ModuleId::editor(),
             Direction::Down,
@@ -640,7 +639,7 @@ mod tests {
         assert!(path.exists(), "Ctrl+a j moved the bottom row");
     }
 
-    /// `neovibe.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7}, {'terminal'} }`:
+    /// `eitri.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7}, {'terminal'} }`:
     /// a bottom row pinned with no length yet.
     fn bottom_row_default() -> Node {
         Node::split(
@@ -670,13 +669,13 @@ mod tests {
         assert!(before.contains("\"px\": null"), "{before}");
         let layout = opened(&dir, &[]);
         let saver = saver_for(&dir, &layout);
-        assert!(neovibe_core::layout::settle_pins(&mut layout.borrow_mut(), &frame()));
+        assert!(eitri_core::layout::settle_pins(&mut layout.borrow_mut(), &frame()));
         saver.settled();
         layout.borrow_mut().set_focus(&ModuleId::terminal()).unwrap();
         saver.save_now();
         assert_eq!(file_text(&dir), before, "a settled length and a click: untouched");
 
-        assert!(neovibe_core::layout::resize(
+        assert!(eitri_core::layout::resize(
             &mut layout.borrow_mut(),
             &ModuleId::editor(),
             Direction::Down,
@@ -701,7 +700,7 @@ mod tests {
         let second_saver = saver_for(&dir, &second);
         first.borrow_mut().show(&ModuleId::terminal()).unwrap();
         first_saver.save_now();
-        neovibe_core::layout::even(&mut second.borrow_mut(), Axis::Column);
+        eitri_core::layout::even(&mut second.borrow_mut(), Axis::Column);
         second_saver.save_now();
         let aside = dir.join(format!("{}.unusable", persist::file_name(root())));
         assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{ a typo");
@@ -746,7 +745,7 @@ mod tests {
             std::fs::read_to_string(&aside).unwrap(),
             "{ \"version\": 1, a typo made in nvim"
         );
-        neovibe_core::layout::hide(&mut layout.borrow_mut(), &ModuleId::terminal(), &frame()).unwrap();
+        eitri_core::layout::hide(&mut layout.borrow_mut(), &ModuleId::terminal(), &frame()).unwrap();
         saver.save_now();
         assert_eq!(std::fs::read_to_string(&aside).unwrap(), "garbage");
         assert_eq!(file_text(&dir), written_by(&layout));
@@ -937,14 +936,14 @@ mod tests {
         let mut start = crate::terminal::initial_layout(&lua).unwrap();
         start.show(&ModuleId::terminal()).unwrap();
         if start.is_shown(&logs) {
-            neovibe_core::layout::hide(&mut start, &logs, &frame()).unwrap();
+            eitri_core::layout::hide(&mut start, &logs, &frame()).unwrap();
         }
-        neovibe_core::layout::settle_pins(&mut start, &frame());
+        eitri_core::layout::settle_pins(&mut start, &frame());
         let layout = Rc::new(RefCell::new(start));
         let saver = LayoutSaver::new(Some(dir.clone()), root(), layout.clone(), lua);
 
         layout.borrow_mut().set_focus(&ModuleId::terminal()).unwrap();
-        assert!(neovibe_core::layout::resize(
+        assert!(eitri_core::layout::resize(
             &mut layout.borrow_mut(),
             &ModuleId::terminal(),
             Direction::Up,
@@ -953,11 +952,11 @@ mod tests {
         ));
         layout.borrow_mut().show(&logs).unwrap();
         assert!(
-            neovibe_core::layout::settle_pins(&mut layout.borrow_mut(), &frame()),
+            eitri_core::layout::settle_pins(&mut layout.borrow_mut(), &frame()),
             "the panel's pin settled: the hook runs"
         );
         saver.settled();
-        neovibe_core::layout::hide(&mut layout.borrow_mut(), &logs, &frame()).unwrap();
+        eitri_core::layout::hide(&mut layout.borrow_mut(), &logs, &frame()).unwrap();
         saver.save_now();
         assert!(path.exists(), "the terminal's new height is a change, and is written");
         assert_eq!(file_text(&dir), written_by(&layout));
@@ -990,7 +989,7 @@ mod tests {
         let mut shown = layout.clone();
         shown.show(&ModuleId::terminal()).unwrap();
         let mut even = layout.clone();
-        neovibe_core::layout::even(&mut even, Axis::Row);
+        eitri_core::layout::even(&mut even, Axis::Row);
         assert_eq!(Arrangement::of(&keys), base, "a click");
         assert_eq!(Arrangement::of(&zoomed), base, "a zoom");
         assert_ne!(Arrangement::of(&shown), base, "a module shown");
@@ -1017,8 +1016,8 @@ mod tests {
         assert_eq!(
             notes,
             [
-                "neovibe.layout.default: left out 'lua:gone': this window has no such module",
-                "neovibe.layout.default: placed 'terminal' below the editor, hidden, as a first launch does"
+                "eitri.layout.default: left out 'lua:gone': this window has no such module",
+                "eitri.layout.default: placed 'terminal' below the editor, hidden, as a first launch does"
             ]
         );
     }

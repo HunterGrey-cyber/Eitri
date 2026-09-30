@@ -188,7 +188,7 @@ function SlashCommands() {
  * The full `?` keymap: the two key-table groups come from the one source of truth
  * `BROWSE_KEYS`/`INPUT_KEYS` in `./keymap`, so this list can neither promise a key the panel does
  * not have nor omit one it does. "Anywhere in the window" and "After <prefix>" come from `shell`'s
- * own `keymap` envelope, generated from the core crate's keymap: nothing on this page can read what
+ * own `keymap` envelope, generated from `eitri_core::keymap`: nothing on this page can read what
  * GTK binds. It draws only; `App.tsx` decides when it is open, swallows every key while it is (so
  * `a`/`d` cannot reach a card hidden underneath) and scrolls it on `j`/`k` through the forwarded
  * ref. The one thing this component decides for itself is a click on its own backdrop, which also
@@ -235,8 +235,8 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           ...INPUT_KEYS,
           // The pane-motion row lists only Ctrl+h/l. Ctrl+j/k have their own meanings in the rows
           // below, so including them here would give conflicting descriptions.
-          { keys: "Ctrl+h / l", what: "Move between panes (neovibe keeps these)" },
-          { keys: prefixLabel, what: "The prefix (neovibe keeps it)" },
+          { keys: "Ctrl+h / l", what: "Move between panes (eitri keeps these)" },
+          { keys: prefixLabel, what: "The prefix (eitri keeps it)" },
           // V1 C1: Rust's mirror (`install_module_nav`) claims these two ahead of
           // `Composer` itself, the same reason the two rows above are spliced in here rather than
           // added to `INPUT_KEYS` -- that constant is tied to `COMPOSER_CHORDS` both ways

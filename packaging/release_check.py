@@ -71,8 +71,8 @@ _SKIA_ARCHIVE_RE = re.compile(r"^skia-binaries-\S+\.tar\.gz$")
 # Allowed RELEASE keys and their value patterns, including source asset checksums
 # and the binary archive name/checksum pair also used in packaging/pins.env.
 RELEASE_FIELDS: dict[str, re.Pattern] = {
-    "NEOVIBE_VERSION": VERSION_RE,
-    "NEOVIBE_COMMIT": _HEX40,
+    "EITRI_VERSION": VERSION_RE,
+    "EITRI_COMMIT": _HEX40,
     "NEOVIDE_FORK_COMMIT": _HEX40,
     "VERDANDI_REV": _HEX40,
     "VERDANDI_SOURCE": _VERDANDI_SOURCE_RE,
@@ -168,10 +168,10 @@ def asset_names(version: str, verdandi_rev7: str) -> list[str]:
     if not _VERDANDI_REV7_RE.match(verdandi_rev7):
         raise ReleaseCheckError(f"not a 7-hex Verdandi revision: {verdandi_rev7!r}")
     return [
-        f"neovibe-{version}-x86_64-linux.tar.gz",
-        f"neovibe_{version}_amd64.deb",
-        f"neovibe-{version}-1.x86_64.rpm",
-        f"neovibe-{version}-source.tar.gz",
+        f"eitri-{version}-x86_64-linux.tar.gz",
+        f"eitri_{version}_amd64.deb",
+        f"eitri-{version}-1.x86_64.rpm",
+        f"eitri-{version}-source.tar.gz",
         f"verdandi-{verdandi_rev7}-source.tar.gz",
         "install.sh",
         "RELEASE",
@@ -278,7 +278,7 @@ def find_anthropic_node_modules(files: Iterable[tuple[str, str]]) -> list[str]:
 
 def find_node_modules_dirs(files: Iterable[tuple[str, str]]) -> list[str]:
     """relpaths under any node_modules/ directory at all -- in either source asset (Verdandi's or
-    neovibe's), no node_modules/ of any kind may ship (sec 4.2 step 9)."""
+    eitri's), no node_modules/ of any kind may ship (sec 4.2 step 9)."""
     return [rel for rel, _ in files if re.search(r"(^|/)node_modules/", rel)]
 
 
@@ -291,7 +291,7 @@ def find_verdandi_sidecar_filenames(files: Iterable[tuple[str, str]]) -> list[st
 def find_agent_hook_binaries(files: Iterable[tuple[str, str]]) -> list[str]:
     """relpaths whose basename is EXACTLY 'agent-hook' (M16) -- the compiled legacy-gate relay
     binary, which no release build compiles (no --features anywhere) and no asset may carry.
-    A source file such as agent/src/bin/agent-hook.rs, legitimately present in the neovibe source
+    A source file such as agent/src/bin/agent-hook.rs, legitimately present in the eitri source
     asset, has a different basename ('agent-hook.rs') and is not a hit."""
     return [rel for rel, _ in files if os.path.basename(rel) == "agent-hook"]
 
@@ -344,7 +344,7 @@ def find_sdk_mentions(
 ) -> list[str]:
     """relpaths whose content mentions the Claude Agent SDK by package name or Anthropic's legal
     name, and are not exempted by `is_allowed(relpath)`. release.sh supplies the concrete
-    allowlist: legitimate only in neovibe-setup and the
+    allowlist: legitimate only in eitri-setup and the
     install.sh asset (which print the SDK line, I2/I2src), and possibly THIRD-PARTY-LICENSES; in
     the Verdandi source asset, its package.json files, package-lock.json, and the sentinel's own
     definition in apps/claude-sidecar/scripts/buildBinary.mjs."""
@@ -450,7 +450,7 @@ def git_archive_hashes(repo_dir: str, rev: str) -> dict[str, str]:
 
 # Allowed additions to the source asset beyond git archive HEAD.
 # Every extra path in the extracted tree must fall under one of these entries.
-KNOWN_NEOVIBE_SOURCE_ADDITIONS = (
+KNOWN_EITRI_SOURCE_ADDITIONS = (
     "vendor/",
     "skia/",
     "neovide/",
@@ -547,7 +547,7 @@ def check_no_legacy_symbols(nm_c_text: str) -> None:
 # A reused target directory may contain binaries left by a development build, such as
 # `agent-hook`, that were not produced by this release build.
 
-RELEASE_BINARIES = ("shell", "neovibe-supervisor", "neovibe-tmux-shim", "neovibe-claude-handoff")
+RELEASE_BINARIES = ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff")
 
 
 def _json_messages(lines: Iterable[str]) -> list[dict]:
@@ -671,13 +671,13 @@ def parse_relink_recipe(source_text: str) -> RelinkRecipe:
     return RelinkRecipe(copy, unlock, "\n".join(patch_lines), build, modified_dir)
 
 
-REBUILD_ENV_NAMES = ("NEOVIBE_BUILD_COMMIT", "NEOVIBE_BUILD_FORK_COMMIT")
-_REBUILD_ENV_RE = re.compile(r"^    (NEOVIBE_BUILD_[A-Z_]+)=(.*)$")
+REBUILD_ENV_NAMES = ("EITRI_BUILD_COMMIT", "EITRI_BUILD_FORK_COMMIT")
+_REBUILD_ENV_RE = re.compile(r"^    (EITRI_BUILD_[A-Z_]+)=(.*)$")
 
 
 def parse_rebuild_env(source_text: str) -> dict[str, str]:
     """The environment SOURCE tells a rebuild from the source asset to set, so the rebuilt
-    `shell --version` names the same neovibe and Neovide fork commits as the shipped one: each of
+    `shell --version` names the same eitri and Neovide fork commits as the shipped one: each of
     REBUILD_ENV_NAMES exactly once, as a full 40-hex commit, nothing else (with only the first,
     a rebuild would say "neovide fork unknown")."""
     found: dict[str, list[str]] = {}
@@ -758,34 +758,34 @@ def make_scan_view(src_root: str, dest_root: str,
 # --- 13. Every asset, extracted, checked as a whole ----------------------
 
 def tarball_top(version: str) -> str:
-    return f"neovibe-{version}-x86_64-linux"
+    return f"eitri-{version}-x86_64-linux"
 
 
 def source_top(version: str) -> str:
-    return f"neovibe-{version}-source"
+    return f"eitri-{version}-source"
 
 
 # Map roles to paths under the tarball's top directory and from / in the .deb/.rpm.
 # Each role must contain identical bytes in all three packages built from the staging tree.
 _TARBALL_ROLES = {
-    "launcher": "bin/neovibe",
-    **{b: f"lib/neovibe/{b}" for b in RELEASE_BINARIES},
-    "setup": "lib/neovibe/neovibe-setup",
-    "RELEASE": "lib/neovibe/RELEASE",
-    "desktop": "share/applications/neovibe.desktop",
-    "LICENSE": "share/licenses/neovibe/LICENSE",
-    "THIRD-PARTY-LICENSES": "share/licenses/neovibe/THIRD-PARTY-LICENSES",
-    "SOURCE": "share/licenses/neovibe/SOURCE",
+    "launcher": "bin/eitri",
+    **{b: f"lib/eitri/{b}" for b in RELEASE_BINARIES},
+    "setup": "lib/eitri/eitri-setup",
+    "RELEASE": "lib/eitri/RELEASE",
+    "desktop": "share/applications/eitri.desktop",
+    "LICENSE": "share/licenses/eitri/LICENSE",
+    "THIRD-PARTY-LICENSES": "share/licenses/eitri/THIRD-PARTY-LICENSES",
+    "SOURCE": "share/licenses/eitri/SOURCE",
 }
 _PACKAGE_ROLES = {
-    "launcher": "usr/bin/neovibe",
-    **{b: f"usr/lib/neovibe/{b}" for b in RELEASE_BINARIES},
-    "setup": "usr/lib/neovibe/neovibe-setup",
-    "RELEASE": "usr/lib/neovibe/RELEASE",
-    "desktop": "usr/share/applications/neovibe.desktop",
-    "LICENSE": "usr/share/licenses/neovibe/LICENSE",
-    "THIRD-PARTY-LICENSES": "usr/share/licenses/neovibe/THIRD-PARTY-LICENSES",
-    "SOURCE": "usr/share/licenses/neovibe/SOURCE",
+    "launcher": "usr/bin/eitri",
+    **{b: f"usr/lib/eitri/{b}" for b in RELEASE_BINARIES},
+    "setup": "usr/lib/eitri/eitri-setup",
+    "RELEASE": "usr/lib/eitri/RELEASE",
+    "desktop": "usr/share/applications/eitri.desktop",
+    "LICENSE": "usr/share/licenses/eitri/LICENSE",
+    "THIRD-PARTY-LICENSES": "usr/share/licenses/eitri/THIRD-PARTY-LICENSES",
+    "SOURCE": "usr/share/licenses/eitri/SOURCE",
 }
 
 
@@ -798,7 +798,7 @@ def tarball_roles(version: str) -> dict[str, str]:
 # restrictions. check_release_assets compares it byte for byte with the source asset's
 # copy. The .rpm carries no profile.
 _DEB_ONLY_ROLES = {
-    "apparmor": "etc/apparmor.d/neovibe",
+    "apparmor": "etc/apparmor.d/eitri",
 }
 
 
@@ -833,7 +833,7 @@ def _content_problems(label: str, files: list[tuple[str, str]], sdk_allowed: Cal
 def check_binary_asset(label: str, root: str, roles: dict[str, str]) -> list[str]:
     """One extracted tarball/.deb/.rpm: exactly the files `roles` names (M6's layout; anything else
     -- an agent-hook, a sidecar, a stray build product -- is a problem), and the content rules. The
-    SDK's name is allowed only in neovibe-setup (the installer, which prints the SDK line)."""
+    SDK's name is allowed only in eitri-setup (the installer, which prints the SDK line)."""
     files = iter_files(root)
     present = {rel for rel, _ in files}
     expected = set(roles.values())
@@ -861,9 +861,9 @@ def check_same_bytes(named_paths: dict[str, str]) -> list[str]:
     return problems
 
 
-def check_neovibe_source_tree(root: str, src_repo: str, verdandi_repo: str, verdandi_rev: str,
+def check_eitri_source_tree(root: str, src_repo: str, verdandi_repo: str, verdandi_rev: str,
                               skia_archive: str, skia_sha256: str) -> list[str]:
-    """The extracted neovibe source asset's top directory: `git archive HEAD` of src_repo byte
+    """The extracted eitri source asset's top directory (M2): `git archive HEAD` of src_repo byte
     for byte plus only the known additions; neovide/ equal to the submodule's own `git archive HEAD`;
     proto/ equal to the public Verdandi's; skia/ exactly the pinned archive; .cargo/config.toml
     pointing at vendor/; the shipped `dist/.inputs-sha256` matches a fresh fingerprint over the
@@ -872,10 +872,10 @@ def check_neovibe_source_tree(root: str, src_repo: str, verdandi_repo: str, verd
     first version), which a tar extraction or `SOURCE_DATE_EPOCH` normalization could satisfy or
     fail independently of whether the bundle's content ever matched its sources. The content rules
     run over the whole tree for the sentinel and node_modules, and over the additions only for the
-    SDK's name (neovibe's own tracked source legitimately names it)."""
+    SDK's name (eitri's own tracked source legitimately names it)."""
     problems = []
     try:
-        compare_tree_to_git_archive(root, src_repo, "HEAD", KNOWN_NEOVIBE_SOURCE_ADDITIONS)
+        compare_tree_to_git_archive(root, src_repo, "HEAD", KNOWN_EITRI_SOURCE_ADDITIONS)
     except TreeMismatch as e:
         problems.append(f"source asset vs git archive HEAD: {e}")
     for sub, repo, rev, subpath in (("neovide", os.path.join(src_repo, "neovide"), "HEAD", None),
@@ -1021,20 +1021,20 @@ def check_release_assets(out_dir: str, check_dir: str, version: str, verdandi_re
     if top_level != [source_top(version)]:
         problems.append(f"{source}: top level is {top_level}, expected [{source_top(version)!r}]")
     else:
-        problems += check_neovibe_source_tree(src_root, src_repo, verdandi_repo, verdandi_rev,
+        problems += check_eitri_source_tree(src_root, src_repo, verdandi_repo, verdandi_rev,
                                               skia_archive, skia_sha256)
     problems += check_verdandi_source_tree(x["verdandi"], verdandi_repo, verdandi_rev)
     # The .deb's AppArmor profile is the tracked file, not a copy of its own.
     problems += check_same_bytes({
         f"{deb}:{_DEB_ONLY_ROLES['apparmor']}": os.path.join(x["deb"], _DEB_ONLY_ROLES["apparmor"]),
-        f"{source}:packaging/apparmor/neovibe": os.path.join(src_root, "packaging", "apparmor", "neovibe"),
+        f"{source}:packaging/apparmor/eitri": os.path.join(src_root, "packaging", "apparmor", "eitri"),
     })
     # Compare the installer asset with the tarball's setup script, the .deb's setup script,
     # and the source asset's packaging/install.sh.
     problems += check_same_bytes({
         install_sh: os.path.join(out_dir, install_sh),
-        f"{tarball}:neovibe-setup": os.path.join(x["tarball"], troles["setup"]),
-        f"{deb}:neovibe-setup": os.path.join(x["deb"], proles["setup"]),
+        f"{tarball}:eitri-setup": os.path.join(x["tarball"], troles["setup"]),
+        f"{deb}:eitri-setup": os.path.join(x["deb"], proles["setup"]),
         f"{source}:packaging/install.sh": os.path.join(src_root, "packaging", "install.sh"),
     })
     problems += check_same_bytes({
@@ -1054,18 +1054,18 @@ def check_release_assets(out_dir: str, check_dir: str, version: str, verdandi_re
 # --- 14. The embedded release-signers block --------
 #
 # packaging/install.sh's embedded_release_signers() carries packaging/release-signers verbatim
-# inside a heredoc, between its own two marker lines (`cat <<'NEOVIBE_RELEASE_SIGNERS'` and a bare
-# `NEOVIBE_RELEASE_SIGNERS` line). A hand-kept copy that drifts from the tracked file is exactly
+# inside a heredoc, between its own two marker lines (`cat <<'EITRI_RELEASE_SIGNERS'` and a bare
+# `EITRI_RELEASE_SIGNERS` line). A hand-kept copy that drifts from the tracked file is exactly
 # the risk here: release.sh checks `--sign`'s key against release-signers,
 # never against what install.sh actually ships, so the two can disagree with no error.
 
-_SIGNERS_HEREDOC_MARKER = "NEOVIBE_RELEASE_SIGNERS"
+_SIGNERS_HEREDOC_MARKER = "EITRI_RELEASE_SIGNERS"
 _SIGNERS_HEREDOC_OPEN = f"<<'{_SIGNERS_HEREDOC_MARKER}'"
 
 
 def extract_embedded_signers(install_sh_text: str) -> str:
-    """The exact text between packaging/install.sh's own two `NEOVIBE_RELEASE_SIGNERS` heredoc
-    marker lines (the opening line carries `<<'NEOVIBE_RELEASE_SIGNERS'` -- with whatever heredoc
+    """The exact text between packaging/install.sh's own two `EITRI_RELEASE_SIGNERS` heredoc
+    marker lines (the opening line carries `<<'EITRI_RELEASE_SIGNERS'` -- with whatever heredoc
     command and indentation precede it -- and the closing line is that marker alone, which is what
     a real, non-`<<-` heredoc requires). Raises ReleaseCheckError if the markers are not found, in
     order, exactly one of each."""

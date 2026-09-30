@@ -151,7 +151,7 @@ mod tests {
     fn it_lives_under_permissions_named_like_the_layout_file() {
         assert_eq!(
             state_dir(Some(OsStr::new("/s")), None),
-            Some(PathBuf::from("/s/neovibe/permissions"))
+            Some(PathBuf::from("/s/eitri/permissions"))
         );
         assert_eq!(
             path(Path::new("/d"), &root()),

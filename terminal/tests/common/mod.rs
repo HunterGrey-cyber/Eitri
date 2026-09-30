@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use neovibe_terminal::{
+use eitri_terminal::{
     paint, paint_ops, CursorCell, ExitInfo, HostEvents, MouseModes, PtySize, SessionCommand, SessionConfig, SpawnSpec,
     TerminalColors, TerminalMetrics, TerminalSession,
 };

@@ -63,7 +63,7 @@ export function ContinueInTerminal({ open, onClose, providerSessionId, turnInPro
     return (
       <div className="handoff-confirm" data-nav-stop="handoff">
         <p>
-          Neovibe will <strong>close this conversation here</strong> first, and then show you the
+          Eitri will <strong>close this conversation here</strong> first, and then show you the
           command that continues it in your own terminal.
         </p>
         {!canResume && (
@@ -104,7 +104,7 @@ export function HandoffCommandCard({ handoff }: { handoff: HandoffCommand }) {
     // relative to `.handoff-card` itself has not moved. `bodyClassName` is `Row`'s own way of
     // saying that (`./Row`), rather than this file re-writing the two-cell grid by hand.
     <Row kind="handoff" sign="→" role="status" bodyClassName="handoff-card">
-      <strong>This conversation is closed in Neovibe.</strong>
+      <strong>This conversation is closed in Eitri.</strong>
       <p>Run this in your own terminal to continue it:</p>
       {/* <pre>, so it can be selected and copied character for character. */}
       <pre className="handoff-command">{handoff.command}</pre>
@@ -115,7 +115,7 @@ export function HandoffCommandCard({ handoff }: { handoff: HandoffCommand }) {
           on. */}
       <div className="row-hint">Press y to copy.</div>
       <p className="warning">
-        Neovibe took <strong>no lock</strong> on this session and is not watching it. If anything
+        Eitri took <strong>no lock</strong> on this session and is not watching it. If anything
         else resumes the same session while your terminal has it open, both write into the{" "}
         <strong>same transcript</strong>.
       </p>

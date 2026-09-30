@@ -18,7 +18,7 @@ use std::thread;
 
 use neovide_editor::fd_watch;
 
-const SCENARIO: &str = "NEOVIBE_FD_WATCH_THREAD_SCENARIO";
+const SCENARIO: &str = "EITRI_FD_WATCH_THREAD_SCENARIO";
 
 /// Runs `scenario` in a child and returns (exited successfully, stderr).
 fn run_child(test_name: &str, scenario: &str) -> (bool, String) {

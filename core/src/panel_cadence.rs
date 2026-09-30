@@ -1,7 +1,24 @@
-//! Copied from `poc/shell_chrome/src/theme.rs` verbatim, to avoid a cross-crate dependency for
-//! this throwaway probe crate. See that crate for the original doc comments.
+//! Paces the agent panel's stream while the user types in the editor. Added panel latency
+//! is acceptable, but updates should stay even.
 //!
-//! Placeholder `Theme` palette for the feasibility probe, not a real design system.
+//! GDK shares one frame clock across the toplevel. A WebKit frame caused by the panel can delay
+//! the editor's next frame by up to one refresh. There is no API here to start a cycle early,
+//! so pacing reduces and spaces panel frames while the user types.
+//!
+//! While the editor holds the keys and a key was pressed within [`TYPING_WINDOW`],
+//! [`PanelCadence`] holds [`EnvelopeClass::Stream`] envelopes and releases them at a fixed cadence
+//! (default [`DEFAULT_CADENCE_HZ`] = 5/s, every 200 ms), whole and in order. Outside that window,
+//! the stream runs at full rate. Release slots advance each period, so repeated keys cannot
+//! keep postponing a release.
+//!
+//! [`EnvelopeClass::Immediate`] includes permission cards and resolutions, turn and session
+//! boundaries, snapshots, notes, tab changes, greetings, replies, and anything beyond plain stream
+//! content. Everything is immediate while the panel holds the keys. Immediate delivery first
+//! flushes pending content ([`Route::FlushPendingThenSend`]) to preserve wire order. When in doubt,
+//! classify an envelope as `Immediate`.
+//!
+//! This module has no clock of its own or GTK dependency: each method takes an `Instant`, so
+//! pacing is testable without a display. `shell/src/panel_pacer.rs` owns the WebView.
 
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
@@ -9,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use agent::AgentDomainEvent;
 
-/// The config key (`init.lua`: `neovibe.config.set("agent.typing_cadence_hz", "5")`).
+/// The config key (`init.lua`: `eitri.config.set("agent.typing_cadence_hz", "5")`).
 pub const CADENCE_KEY: &str = "agent.typing_cadence_hz";
 
 /// Default pushes per second while typing when `init.lua` supplies no value.
@@ -45,7 +62,7 @@ pub fn parse_config(value: Option<&str>) -> Result<Option<u32>, String> {
     match text.parse::<u32>() {
         Ok(hz) if CADENCE_HZ_RANGE.contains(&hz) => Ok(Some(hz)),
         _ => Err(format!(
-            "neovibe.config.set(\"{CADENCE_KEY}\", {raw:?}): must be a whole number from {} to {} \
+            "eitri.config.set(\"{CADENCE_KEY}\", {raw:?}): must be a whole number from {} to {} \
              (panel updates per second while typing in the editor) or \"off\"",
             CADENCE_HZ_RANGE.start(),
             CADENCE_HZ_RANGE.end(),
@@ -302,20 +319,20 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
         let lua = mlua::Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let store = Rc::new(RefCell::new(ConfigStore::default()));
-        install(&lua, &neovibe, store.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
         for (script, expected) in [
-            (r#"neovibe.config.set("agent.typing_cadence_hz", "5")"#, Ok(Some(5))),
+            (r#"eitri.config.set("agent.typing_cadence_hz", "5")"#, Ok(Some(5))),
             // A Lua number is stored as its text.
-            (r#"neovibe.config.set("agent.typing_cadence_hz", 12)"#, Ok(Some(12))),
-            (r#"neovibe.config.set("agent.typing_cadence_hz", "off")"#, Ok(None)),
+            (r#"eitri.config.set("agent.typing_cadence_hz", 12)"#, Ok(Some(12))),
+            (r#"eitri.config.set("agent.typing_cadence_hz", "off")"#, Ok(None)),
         ] {
             lua.load(script).exec().unwrap();
             assert_eq!(parse_config(store.borrow().get(CADENCE_KEY)), expected, "{script}");
         }
-        lua.load(r#"neovibe.config.set("agent.typing_cadence_hz", 0)"#)
+        lua.load(r#"eitri.config.set("agent.typing_cadence_hz", 0)"#)
             .exec()
             .unwrap();
         assert!(parse_config(store.borrow().get(CADENCE_KEY)).is_err());

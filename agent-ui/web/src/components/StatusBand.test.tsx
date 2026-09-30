@@ -39,7 +39,7 @@ const RUNNING: BandFacts = {
   unread: "↓3",
   cards: 1,
   queued: 1,
-  context: { file: "neovibe.zsh", lines: [3, 9] },
+  context: { file: "eitri.zsh", lines: [3, 9] },
   position: "14/30",
   model: "sonnet-5",
   usage: null,

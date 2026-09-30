@@ -20,20 +20,20 @@
 {
 set -eu
 
-NV_DEFAULT_BASE_URL='https://github.com/HunterGrey-cyber/neovibe'
-NV_LAUNCHER_MARKER='# neovibe-launcher v1'
+NV_DEFAULT_BASE_URL='https://github.com/HunterGrey-cyber/eitri'
+NV_LAUNCHER_MARKER='# eitri-launcher v1'
 # The second line of the launcher the old root install.sh wrote: recognised as
-# neovibe's own and replaced, although it predates the marker.
+# eitri's own and replaced, although it predates the marker.
 NV_OLD_LAUNCHER_LINE2='# neovibe, installed by install.sh. Everything it decides is printed before the window opens.'
-NV_SIGNER_IDENTITY='release@neovibe'
-NV_SIGNATURE_NAMESPACE='neovibe-release'
+NV_SIGNER_IDENTITY='release@eitri'
+NV_SIGNATURE_NAMESPACE='eitri-release'
 NV_GTK_FLOOR_MINOR=14
 NV_GLIBC_FLOOR='2.39'
 NV_NVIM_FLOOR='0.10.0'
-NV_BINARIES='shell neovibe-supervisor neovibe-tmux-shim neovibe-claude-handoff'
+NV_BINARIES='shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff'
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 NV_VERSION_ERE='[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?'
-NV_ISSUES='https://github.com/HunterGrey-cyber/neovibe/issues'
+NV_ISSUES='https://github.com/HunterGrey-cyber/eitri/issues'
 # The sidecar build. The protocol major matches Verdandi's own
 # apps/claude-sidecar/src/runtimeServiceImpl.ts PROTOCOL_MAJOR, checked against a built artifact's
 # own --version rather than assumed. Node's dist base is fixed in production; test mode replaces it
@@ -41,14 +41,14 @@ NV_ISSUES='https://github.com/HunterGrey-cyber/neovibe/issues'
 NV_SIDECAR_PROTOCOL_MAJOR=3
 NV_NODE_DIST_BASE=https://nodejs.org/dist
 NV_SIDECAR_BUILD_MIN_KIB=614400
-# The nvim offer. Never neovibe's own release server -- this is neovim's own GitHub
+# The nvim offer. Never eitri's own release server -- this is neovim's own GitHub
 # releases. nvim_dist_base's own test-mode default (a refused loopback port) keeps every test that
 # forgets to redirect it from reaching the real host, the same discipline as node_dist_base.
 NV_NVIM_DIST_BASE=https://github.com/neovim/neovim/releases/download
 # --from-source: the public repositories it clones. Overridable only in test mode
-# (NEOVIBE_INSTALL_TEST_REPO_URL / NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL), which the
-# NEOVIBE_INSTALL_TEST_* pattern in run-in-env.sh's allowlist already covers -- no new entry there.
-NV_NEOVIBE_REPO_URL=https://github.com/HunterGrey-cyber/neovibe.git
+# (EITRI_INSTALL_TEST_REPO_URL / EITRI_INSTALL_TEST_VERDANDI_REPO_URL), which the
+# EITRI_INSTALL_TEST_* pattern in run-in-env.sh's allowlist already covers -- no new entry there.
+NV_EITRI_REPO_URL=https://github.com/HunterGrey-cyber/eitri.git
 NV_VERDANDI_REPO_URL=https://github.com/HunterGrey-cyber/verdandi.git
 NV_MIN_RUSTC=1.96.0
 NV_NL='
@@ -58,17 +58,17 @@ NV_NL='
 NV_PROC=/proc
 NV_APPARMOR_D=/etc/apparmor.d
 
-# Test mode (packaging/tests/install/ only). With NEOVIBE_INSTALL_TEST=1 -- and only then -- three
+# Test mode (packaging/tests/install/ only). With EITRI_INSTALL_TEST=1 -- and only then -- three
 # more variables are read, each standing in for a file of the host the harness must not depend on:
-#   NEOVIBE_INSTALL_TEST_LIBDIRS          colon-separated directories searched for the GTK and
+#   EITRI_INSTALL_TEST_LIBDIRS          colon-separated directories searched for the GTK and
 #                                         WebKit sonames instead of `ldconfig -p` and the usual lib
 #                                         directories; a directory's `ldconfig-p.txt` is read as
 #                                         fake `ldconfig -p` output;
-#   NEOVIBE_INSTALL_TEST_SYSTEM_RELEASE   read instead of /usr/lib/neovibe/RELEASE;
-#   NEOVIBE_INSTALL_TEST_OS_RELEASE       read instead of /etc/os-release;
-#   NEOVIBE_INSTALL_TEST_PROC             a directory read instead of /proc (only its
+#   EITRI_INSTALL_TEST_SYSTEM_RELEASE   read instead of /usr/lib/eitri/RELEASE;
+#   EITRI_INSTALL_TEST_OS_RELEASE       read instead of /etc/os-release;
+#   EITRI_INSTALL_TEST_PROC             a directory read instead of /proc (only its
 #                                         sys/kernel/apparmor_restrict_unprivileged_userns);
-#   NEOVIBE_INSTALL_TEST_APPARMOR_D       a directory standing in for /etc/apparmor.d.
+#   EITRI_INSTALL_TEST_APPARMOR_D       a directory standing in for /etc/apparmor.d.
 # The last two default, in test mode, to directories that do not exist, so a test that does not set
 # them never reads this host's own restriction or profiles.
 # None of them touches the trust anchor: the release key is never taken from the environment (only
@@ -110,16 +110,16 @@ NV_NVIM_TMP_DEST=
 NV_VERDANDI_SOURCE_TARBALL_OVERRIDE=
 NV_SIDECAR_ACTUAL_VERDANDI_REV=
 
-say() { printf 'neovibe: %s\n' "$*"; }
-warn() { printf 'neovibe: warning: %s\n' "$*" >&2; }
+say() { printf 'eitri: %s\n' "$*"; }
+warn() { printf 'eitri: warning: %s\n' "$*" >&2; }
 die() {
-	printf 'neovibe: error: %s\n' "$*" >&2
+	printf 'eitri: error: %s\n' "$*" >&2
 	exit 1
 }
 
 usage() {
 	cat <<'EOF'
-neovibe installer -- installs neovibe for the user running it, into ~/.local.
+eitri installer -- installs eitri for the user running it, into ~/.local.
 
 usage: sh install.sh [options]
 
@@ -130,19 +130,19 @@ usage: sh install.sh [options]
                                non-interactive answers to the prompt offering to install a private
                                copy of nvim; --yes is the generic affirmative, --no-nvim/--with-nvim
                                answer it by name
-  --nvim-only                  the nvim offer alone, for an already-installed neovibe (reads RELEASE
+  --nvim-only                  the nvim offer alone, for an already-installed eitri (reads RELEASE
                                beside this script, or --release-file FILE); always fetches unless
                                that exact nvim is already installed privately, and a download
                                failure is fatal
   --nvim-offer                 the same nvim offer a normal install runs, for an already-installed
-                               neovibe -- skipped when the nvim already on PATH is new enough, when
+                               eitri -- skipped when the nvim already on PATH is new enough, when
                                the release's nvim is already installed privately, or with --no-nvim;
                                a download failure only warns
   --from-source [--checkout DIR] [--verdandi-checkout DIR [--allow-verdandi-rev-mismatch]]
-                               build neovibe from source, then install exactly like a prebuilt
+                               build eitri from source, then install exactly like a prebuilt
                                release. Without --checkout: clone the public repo at the chosen
                                version's tag and refuse unless its HEAD matches the verified
-                               release's NEOVIBE_COMMIT. With --checkout DIR: build DIR as it is,
+                               release's EITRI_COMMIT. With --checkout DIR: build DIR as it is,
                                synthesizing a RELEASE from its own version, HEAD, agent/Cargo.toml's
                                Verdandi rev and packaging/pins.env (a local development build).
                                --verdandi-checkout DIR builds the sidecar's source from a local
@@ -158,16 +158,16 @@ usage: sh install.sh [options]
   --release-signers FILE       check SHA256SUMS.sig against FILE instead of the key built into this
                                installer (release candidates, tests); warns every time
   --allow-root                 run as root anyway (containers)
-  --uninstall [--purge]        remove neovibe; --purge also removes ~/.config/neovibe and its state
+  --uninstall [--purge]        remove eitri; --purge also removes ~/.config/eitri and its state
   --dry-run                    print every action without doing it
   --keep-build                 keep the sidecar build directory
   --sidecar-only [--release-file FILE]
-                               build the sidecar alone, for an already-installed neovibe; reads
-                               RELEASE from beside this script, or FILE. `neovibe setup` with no
+                               build the sidecar alone, for an already-installed eitri; reads
+                               RELEASE from beside this script, or FILE. `eitri setup` with no
                                mode flag runs this, then --nvim-offer above
   --build-sidecar-into DIR --node TARBALL --verdandi-source TARBALL [--release-file FILE]
                                build the sidecar from files already on disk and install it into DIR
-                               instead of the per-user path (the neovibe-bin AUR package's build())
+                               instead of the per-user path (the eitri-bin AUR package's build())
   -h, --help                   this text
 EOF
 }
@@ -306,7 +306,7 @@ xdg_dir() {
 
 set_paths() {
 	NV_LIBROOT=$NV_HOME/.local/lib
-	NV_LIB=$NV_LIBROOT/neovibe
+	NV_LIB=$NV_LIBROOT/eitri
 	NV_BINDIR=$NV_HOME/.local/bin
 	xdg_dir data
 	NV_DATA=$XD_DIR
@@ -314,23 +314,23 @@ set_paths() {
 	NV_CACHE=$XD_DIR
 	xdg_dir state
 	NV_STATE=$XD_DIR
-	NV_CACHE_NV=$NV_CACHE/neovibe
+	NV_CACHE_NV=$NV_CACHE/eitri
 	NV_DL=$NV_CACHE_NV/download
 	NV_STAGE=$NV_CACHE_NV/unpack
-	NV_SIDECAR_ROOT=$NV_DATA/neovibe/sidecar
-	NV_SYSTEM_RELEASE=/usr/lib/neovibe/RELEASE
+	NV_SIDECAR_ROOT=$NV_DATA/eitri/sidecar
+	NV_SYSTEM_RELEASE=/usr/lib/eitri/RELEASE
 	# What rev_of_release tells the user to do about a system RELEASE it cannot use: that file is a
 	# package's, which this installer never touches.
-	NV_SYSTEM_REMEDY='reinstall or remove the neovibe package that owns it (this installer never changes it)'
+	NV_SYSTEM_REMEDY='reinstall or remove the eitri package that owns it (this installer never changes it)'
 	NV_OS_RELEASE=/etc/os-release
 	NV_TEST_LIBDIRS=
-	if [ "${NEOVIBE_INSTALL_TEST-}" = 1 ]; then
+	if [ "${EITRI_INSTALL_TEST-}" = 1 ]; then
 		NV_TEST_MODE=1
-		NV_SYSTEM_RELEASE=${NEOVIBE_INSTALL_TEST_SYSTEM_RELEASE-$NV_SYSTEM_RELEASE}
-		NV_OS_RELEASE=${NEOVIBE_INSTALL_TEST_OS_RELEASE-$NV_OS_RELEASE}
-		NV_TEST_LIBDIRS=${NEOVIBE_INSTALL_TEST_LIBDIRS-}
-		NV_PROC=${NEOVIBE_INSTALL_TEST_PROC-/nonexistent/neovibe-test-proc}
-		NV_APPARMOR_D=${NEOVIBE_INSTALL_TEST_APPARMOR_D-/nonexistent/neovibe-test-apparmor.d}
+		NV_SYSTEM_RELEASE=${EITRI_INSTALL_TEST_SYSTEM_RELEASE-$NV_SYSTEM_RELEASE}
+		NV_OS_RELEASE=${EITRI_INSTALL_TEST_OS_RELEASE-$NV_OS_RELEASE}
+		NV_TEST_LIBDIRS=${EITRI_INSTALL_TEST_LIBDIRS-}
+		NV_PROC=${EITRI_INSTALL_TEST_PROC-/nonexistent/eitri-test-proc}
+		NV_APPARMOR_D=${EITRI_INSTALL_TEST_APPARMOR_D-/nonexistent/eitri-test-apparmor.d}
 	fi
 }
 
@@ -342,7 +342,7 @@ set_paths() {
 check_data_home() {
 	_cdh_ok=$(under_home "$NV_DATA")
 	if [ "$_cdh_ok" != 1 ]; then
-		die "XDG_DATA_HOME resolves to $NV_DATA, which is not inside $NV_HOME: neovibe writes its desktop entry, licences, private nvim and sidecar there, and --uninstall can only ever remove paths inside \$HOME. Set XDG_DATA_HOME to a directory under \$HOME (or unset it) and re-run"
+		die "XDG_DATA_HOME resolves to $NV_DATA, which is not inside $NV_HOME: eitri writes its desktop entry, licences, private nvim and sidecar there, and --uninstall can only ever remove paths inside \$HOME. Set XDG_DATA_HOME to a directory under \$HOME (or unset it) and re-run"
 	fi
 }
 
@@ -487,15 +487,15 @@ parse_release() {
 # pinned build inputs from packaging/pins.env. Check the source archive against REL_REV7
 # so it cannot name a different revision. Missing required fields mean a damaged release.
 parse_release_text() {
-	REL_VERSION=$(kv_value "$1" NEOVIBE_VERSION)
-	REL_NEOVIBE_COMMIT=$(kv_value "$1" NEOVIBE_COMMIT)
+	REL_VERSION=$(kv_value "$1" EITRI_VERSION)
+	REL_EITRI_COMMIT=$(kv_value "$1" EITRI_COMMIT)
 	REL_NEOVIDE_FORK_COMMIT=$(kv_value "$1" NEOVIDE_FORK_COMMIT)
 	REL_VERDANDI_REV=$(kv_value "$1" VERDANDI_REV)
 	if ! printf '%s\n' "$REL_VERSION" | grep -Eqx "$NV_VERSION_ERE"; then
-		die "$2 names no valid NEOVIBE_VERSION: the release is damaged. Report it at $NV_ISSUES"
+		die "$2 names no valid EITRI_VERSION: the release is damaged. Report it at $NV_ISSUES"
 	fi
-	if ! printf '%s\n' "$REL_NEOVIBE_COMMIT" | grep -Eqx '[0-9a-f]{40}'; then
-		die "$2 names no valid NEOVIBE_COMMIT (40 hex): the release is damaged. Report it at $NV_ISSUES"
+	if ! printf '%s\n' "$REL_EITRI_COMMIT" | grep -Eqx '[0-9a-f]{40}'; then
+		die "$2 names no valid EITRI_COMMIT (40 hex): the release is damaged. Report it at $NV_ISSUES"
 	fi
 	if ! printf '%s\n' "$REL_NEOVIDE_FORK_COMMIT" | grep -Eqx '[0-9a-f]{40}'; then
 		die "$2 names no valid NEOVIDE_FORK_COMMIT (40 hex): the release is damaged. Report it at $NV_ISSUES"
@@ -535,9 +535,9 @@ parse_release_text() {
 	# Optional, and absent from every real (downloaded) RELEASE -- release.sh
 	# never writes it. Only synthesize_release_from_checkout sets it, to mark a RELEASE whose own
 	# VERDANDI_SOURCE_SHA256 is a `git archive` hash rather than the real release asset's, so a
-	# later, separate `neovibe setup` run (which has no override tarball of its own) can tell why it
+	# later, separate `eitri setup` run (which has no override tarball of its own) can tell why it
 	# cannot fetch that asset instead of trying and reporting a checksum mismatch as tampering.
-	REL_BUILT_FROM_CHECKOUT=$(kv_value "$1" NEOVIBE_BUILT_FROM_CHECKOUT)
+	REL_BUILT_FROM_CHECKOUT=$(kv_value "$1" EITRI_BUILT_FROM_CHECKOUT)
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -574,7 +574,7 @@ runtime_hint() {
 	case $OS_FAMILY in
 	debian) printf '%s\n' "install them with: sudo apt install libgtk-4-1 libwebkitgtk-6.0-4" ;;
 	fedora) printf '%s\n' "install them with: sudo dnf install gtk4 webkitgtk6.0 (on RHEL 10, from EPEL)" ;;
-	arch) printf '%s\n' "install them with: sudo pacman -S gtk4 webkitgtk-6.0 (or use the AUR package neovibe-bin)" ;;
+	arch) printf '%s\n' "install them with: sudo pacman -S gtk4 webkitgtk-6.0 (or use the AUR package eitri-bin)" ;;
 	opensuse) printf '%s\n' "install them with: sudo zypper install gtk4 libwebkitgtk-6_0-4 (package name unverified)" ;;
 	*) printf '%s\n' "install GTK 4 (4.14 or newer, libgtk-4.so.1) and WebKitGTK 6.0 (libwebkitgtk-6.0.so.4) from your distribution" ;;
 	esac
@@ -597,7 +597,7 @@ check_root() {
 		warn "running as root (--allow-root): everything is installed into root's own home, $NV_HOME"
 		return 0
 	fi
-	die "do not run this as root: run it as the user who will run neovibe (the sidecar is built per user into \$XDG_DATA_HOME, and as root npm would run every dependency's install script as root). In a container, pass --allow-root."
+	die "do not run this as root: run it as the user who will run eitri (the sidecar is built per user into \$XDG_DATA_HOME, and as root npm would run every dependency's install script as root). In a container, pass --allow-root."
 }
 
 check_platform() {
@@ -608,7 +608,7 @@ check_platform() {
 	# --from-source, which always failed later at the Skia fetch (the only pinned archive is
 	# x86_64) -- v1 builds x86_64 only, full stop, and do_from_source now refuses the same
 	# architectures up front for the same reason, so this no longer points anywhere that works.
-	*) die "prebuilt neovibe releases are for x86_64 Linux only, and this is $_cp. v1 builds x86_64 only: there is no working install path for another architecture yet" ;;
+	*) die "prebuilt eitri releases are for x86_64 Linux only, and this is $_cp. v1 builds x86_64 only: there is no working install path for another architecture yet" ;;
 	esac
 }
 
@@ -620,13 +620,13 @@ check_glibc() {
 		_cg=$(ldd --version 2>&1 | head -n 1) || _cg=
 		case $_cg in
 		*GNU*libc* | *GLIBC*) _cg=${_cg##* } ;;
-		*) die "neovibe's prebuilt binaries need glibc $NV_GLIBC_FLOOR or newer, and this system does not appear to use glibc: build from source instead (sh install.sh --from-source)" ;;
+		*) die "eitri's prebuilt binaries need glibc $NV_GLIBC_FLOOR or newer, and this system does not appear to use glibc: build from source instead (sh install.sh --from-source)" ;;
 		esac
 		;;
 	esac
 	_cg_c=$(dotted_cmp "$_cg" "$NV_GLIBC_FLOOR")
 	if [ "$_cg_c" = -1 ]; then
-		die "neovibe's prebuilt binaries need glibc $NV_GLIBC_FLOOR or newer (they are built on Ubuntu 24.04), and this system has $_cg. Releases that have it: Ubuntu 24.04, Debian 13, Fedora 40, RHEL 10, Arch. Upgrade, or build from source (sh install.sh --from-source)."
+		die "eitri's prebuilt binaries need glibc $NV_GLIBC_FLOOR or newer (they are built on Ubuntu 24.04), and this system has $_cg. Releases that have it: Ubuntu 24.04, Debian 13, Fedora 40, RHEL 10, Arch. Upgrade, or build from source (sh install.sh --from-source)."
 	fi
 }
 
@@ -733,18 +733,18 @@ check_gtk_webkit() {
 	done
 	_gw_hint=$(runtime_hint)
 	if [ -z "$_gw_ver" ]; then
-		die "GTK 4 (libgtk-4.so.1) was not found; neovibe needs GTK 4.14 or newer and WebKitGTK 6.0: $_gw_hint"
+		die "GTK 4 (libgtk-4.so.1) was not found; eitri needs GTK 4.14 or newer and WebKitGTK 6.0: $_gw_hint"
 	fi
 	_gw_minor=${_gw_ver#4.}
 	_gw_minor=${_gw_minor%%.*}
 	if [ "$_gw_minor" -lt "$NV_GTK_FLOOR_MINOR" ]; then
 		_gw_old=$(gtk_too_old_hint "$_gw_ver")
-		die "this system has GTK $_gw_ver, and neovibe needs GTK 4.$NV_GTK_FLOOR_MINOR or newer: its binaries are built against 4.$NV_GTK_FLOOR_MINOR's API on Ubuntu 24.04. $_gw_old."
+		die "this system has GTK $_gw_ver, and eitri needs GTK 4.$NV_GTK_FLOOR_MINOR or newer: its binaries are built against 4.$NV_GTK_FLOOR_MINOR's API on Ubuntu 24.04. $_gw_old."
 	fi
 	lib_dirs_for libwebkitgtk-6.0.so.4
 	_gw_wk=$LD_DIRS
 	if [ -z "$_gw_wk" ]; then
-		die "WebKitGTK 6.0 (libwebkitgtk-6.0.so.4) was not found; neovibe's agent panel needs it: $_gw_hint"
+		die "WebKitGTK 6.0 (libwebkitgtk-6.0.so.4) was not found; eitri's agent panel needs it: $_gw_hint"
 	fi
 	say "GTK $_gw_ver and WebKitGTK 6.0: ok"
 }
@@ -755,19 +755,19 @@ check_gtk_webkit() {
 nvim_check() {
 	NV_NVIM_OK=0
 	if ! command -v nvim >/dev/null 2>&1; then
-		warn "nvim was not found on PATH. neovibe needs nvim $NV_NVIM_FLOOR or newer: install it from your distribution or https://github.com/neovim/neovim/releases"
+		warn "nvim was not found on PATH. eitri needs nvim $NV_NVIM_FLOOR or newer: install it from your distribution or https://github.com/neovim/neovim/releases"
 		return 0
 	fi
 	_rn=$(nvim --version 2>/dev/null | head -n 1) || _rn=
 	_rn_v=${_rn#NVIM v}
 	_rn_v=${_rn_v%%[!0-9.]*}
 	if [ -z "$_rn_v" ]; then
-		warn "could not parse nvim's version ($_rn); neovibe needs nvim $NV_NVIM_FLOOR or newer"
+		warn "could not parse nvim's version ($_rn); eitri needs nvim $NV_NVIM_FLOOR or newer"
 		return 0
 	fi
 	_rn_c=$(dotted_cmp "$_rn_v" "$NV_NVIM_FLOOR")
 	if [ "$_rn_c" = -1 ]; then
-		warn "nvim $_rn_v is older than $NV_NVIM_FLOOR, which neovibe needs (its editor refuses older ones): install a newer nvim from https://github.com/neovim/neovim/releases"
+		warn "nvim $_rn_v is older than $NV_NVIM_FLOOR, which eitri needs (its editor refuses older ones): install a newer nvim from https://github.com/neovim/neovim/releases"
 	else
 		say "nvim $_rn_v: ok"
 		NV_NVIM_OK=1
@@ -775,13 +775,13 @@ nvim_check() {
 }
 
 # nvim_dist_base: where the pinned nvim release tarball is fetched from -- neovim's own GitHub
-# releases, never neovibe's release server. Fixed in production; test mode redirects it to
+# releases, never eitri's release server. Fixed in production; test mode redirects it to
 # a fixture server, and -- deliberately, the same discipline as node_dist_base -- an unset override
 # does NOT fall back to the real github.com: a test that forgets to set it must fail fast against a
 # refused loopback port, never spend real time downloading a real nvim release.
 nvim_dist_base() {
 	if [ "$NV_TEST_MODE" = 1 ]; then
-		printf '%s\n' "${NEOVIBE_INSTALL_TEST_NVIM_BASE_URL:-http://127.0.0.1:1}"
+		printf '%s\n' "${EITRI_INSTALL_TEST_NVIM_BASE_URL:-http://127.0.0.1:1}"
 	else
 		printf '%s\n' "$NV_NVIM_DIST_BASE"
 	fi
@@ -792,7 +792,7 @@ nvim_dist_base() {
 # This keeps --nvim-only and repeated offers from fetching the same version again.
 nvim_private_state() {
 	NV_NVIM_PRIVATE_PRESENT=0
-	NV_NVIM_PRIVATE_BIN=$NV_DATA/neovibe/nvim/$1/bin/nvim
+	NV_NVIM_PRIVATE_BIN=$NV_DATA/eitri/nvim/$1/bin/nvim
 	if [ -n "$1" ] && [ -x "$NV_NVIM_PRIVATE_BIN" ]; then NV_NVIM_PRIVATE_PRESENT=1; fi
 }
 
@@ -813,7 +813,7 @@ install_nvim_version() {
 	curl_get "$(nvim_dist_base)/v$_inv_version/nvim-linux-x86_64.tar.gz" "$_inv_tar.part"
 	if [ "$CG_OK" != 1 ]; then
 		if [ "$_inv_tolerant" = 1 ]; then
-			warn "could not download nvim $_inv_version ($CG_ERR): neovibe is installed without a private copy; run \"neovibe setup --nvim-only\" once you have network access"
+			warn "could not download nvim $_inv_version ($CG_ERR): eitri is installed without a private copy; run \"eitri setup --nvim-only\" once you have network access"
 			return 0
 		fi
 		die "could not download nvim $_inv_version: $CG_ERR"
@@ -830,8 +830,8 @@ install_nvim_version() {
 	if [ ! -x "$_inv_extract/bin/nvim" ]; then
 		die "nvim-linux-x86_64.tar.gz did not extract to bin/nvim: report it at $NV_ISSUES"
 	fi
-	mkdir -p -- "$NV_DATA/neovibe/nvim" || die "cannot create $NV_DATA/neovibe/nvim"
-	_inv_dest=$NV_DATA/neovibe/nvim/$_inv_version
+	mkdir -p -- "$NV_DATA/eitri/nvim" || die "cannot create $NV_DATA/eitri/nvim"
+	_inv_dest=$NV_DATA/eitri/nvim/$_inv_version
 	_inv_tmp=$_inv_dest.tmp.$$
 	NV_NVIM_TMP_DEST=$_inv_tmp
 	rm -rf -- "$_inv_tmp" || die "cannot remove the stale $_inv_tmp"
@@ -840,7 +840,7 @@ install_nvim_version() {
 	mv -- "$_inv_tmp" "$_inv_dest" || die "cannot move the extracted nvim into $_inv_dest"
 	NV_NVIM_TMP_DEST=
 	rm -rf -- "$_inv_workdir" || :
-	say "installed nvim $_inv_version into $_inv_dest (never on PATH; neovibe finds it on its own)"
+	say "installed nvim $_inv_version into $_inv_dest (never on PATH; eitri finds it on its own)"
 }
 
 # maybe_offer_nvim: offer nvim after unpack_new or from_source_stage has provided a parsed
@@ -857,7 +857,7 @@ maybe_offer_nvim() {
 	# architecture's binary and nvim_bin.rs then preferred it over a perfectly good system nvim. F4
 	# made the --from-source route here unreachable off
 	# x86_64 too (do_from_source now refuses non-x86_64 up front, before this is ever called), so
-	# --nvim-offer (a real caller: neovibe's own post-install "run neovibe setup" path) is the only
+	# --nvim-offer (a real caller: eitri's own post-install "run eitri setup" path) is the only
 	# way left to reach this function on another architecture -- this check still guards it.
 	_mon_uname=$(uname -m) || _mon_uname=
 	if [ "$_mon_uname" != x86_64 ]; then
@@ -882,10 +882,10 @@ maybe_offer_nvim() {
 	# all (this container, a bare `curl | sh`), dash treats the open failure on /dev/tty as fatal
 	# to the CURRENT shell -- exit 2, no message, `set -e`'s if/elif exemption does not save it --
 	# and takes the whole script down with it, `2>/dev/null` and all (reproduced: dash 0.5.12,
-	# under `docker run … neovibe-install-dash`). A subshell dying the same way only ends the
+	# under `docker run … eitri-install-dash`). A subshell dying the same way only ends the
 	# subshell; its exit status is all `elif` ever sees.
 	elif ( : </dev/tty ) 2>/dev/null; then
-		printf 'neovibe: fetch the pinned nvim release into XDG_DATA_HOME/neovibe/nvim/ (never put on PATH)? [y/N] ' >&2
+		printf 'eitri: fetch the pinned nvim release into XDG_DATA_HOME/eitri/nvim/ (never put on PATH)? [y/N] ' >&2
 		_mon_ans=
 		read -r _mon_ans </dev/tty || _mon_ans=
 		case $_mon_ans in
@@ -903,7 +903,7 @@ maybe_offer_nvim() {
 		return 0
 	fi
 	if [ "$OPT_DRY_RUN" = 1 ]; then
-		say "would install nvim $REL_NVIM_VERSION into $NV_DATA/neovibe/nvim/$REL_NVIM_VERSION"
+		say "would install nvim $REL_NVIM_VERSION into $NV_DATA/eitri/nvim/$REL_NVIM_VERSION"
 		return 0
 	fi
 	install_nvim_version "$REL_NVIM_VERSION" "$REL_NVIM_SHA256_LINUX_X86_64" 1
@@ -913,7 +913,7 @@ maybe_offer_nvim() {
 # the present sidecar says it supports.
 report_claude() {
 	if ! command -v claude >/dev/null 2>&1; then
-		warn "the claude CLI was not found on PATH; neovibe's agent panel runs it. Install it with Anthropic's installer: curl -fsSL https://claude.ai/install.sh | bash"
+		warn "the claude CLI was not found on PATH; eitri's agent panel runs it. Install it with Anthropic's installer: curl -fsSL https://claude.ai/install.sh | bash"
 		return 0
 	fi
 	_rc=$(claude --version 2>/dev/null | head -n 1) || _rc=
@@ -1023,12 +1023,12 @@ sums_hash() {
 # tarball_version: the version named by the one tarball line of SHA256SUMS. The
 # version comes from here, not from any API call.
 tarball_version() {
-	_tv=$(printf '%s\n' "$NV_SUMS_TEXT" | grep -E "^[0-9a-f]{64}  neovibe-$NV_VERSION_ERE-x86_64-linux\\.tar\\.gz\$") || _tv=
+	_tv=$(printf '%s\n' "$NV_SUMS_TEXT" | grep -E "^[0-9a-f]{64}  eitri-$NV_VERSION_ERE-x86_64-linux\\.tar\\.gz\$") || _tv=
 	case $_tv in
-	'') die "SHA256SUMS lists no neovibe-<version>-x86_64-linux.tar.gz: this is not a neovibe release (check --base-url or --version)" ;;
-	*"$NV_NL"*) die "SHA256SUMS lists more than one neovibe tarball, so which version it is cannot be told: refusing. Report it at $NV_ISSUES" ;;
+	'') die "SHA256SUMS lists no eitri-<version>-x86_64-linux.tar.gz: this is not a eitri release (check --base-url or --version)" ;;
+	*"$NV_NL"*) die "SHA256SUMS lists more than one eitri tarball, so which version it is cannot be told: refusing. Report it at $NV_ISSUES" ;;
 	esac
-	_tv=${_tv#*  neovibe-}
+	_tv=${_tv#*  eitri-}
 	printf '%s\n' "${_tv%-x86_64-linux.tar.gz}"
 }
 
@@ -1077,7 +1077,7 @@ curl_get() {
 }
 
 # node_arch: sets NV_NODE_ARCH from uname -m, matching how packaging/pins.env and buildBinary.mjs
-# name the two Node platforms neovibe pins (x64/arm64, not uname's own x86_64/aarch64).
+# name the two Node platforms eitri pins (x64/arm64, not uname's own x86_64/aarch64).
 node_arch() {
 	NV_NODE_ARCH=
 	_na=$(uname -m) || die "uname failed"
@@ -1089,14 +1089,14 @@ node_arch() {
 }
 
 # node_dist_base: where the pinned Node tarball is fetched from. Fixed in production
-# (NV_NODE_DIST_BASE); in test mode, NEOVIBE_INSTALL_TEST_NODE_BASE_URL redirects it to a fixture
+# (NV_NODE_DIST_BASE); in test mode, EITRI_INSTALL_TEST_NODE_BASE_URL redirects it to a fixture
 # server, and -- deliberately -- an unset override does NOT fall back to the real nodejs.org: this
 # host (like the harness's own) can reach the real internet, and a test suite that forgets to set
 # the override must fail fast against a refused loopback port, never spend real time downloading a
 # real Node tarball from every test that reaches this point.
 node_dist_base() {
 	if [ "$NV_TEST_MODE" = 1 ]; then
-		printf '%s\n' "${NEOVIBE_INSTALL_TEST_NODE_BASE_URL:-http://127.0.0.1:1}"
+		printf '%s\n' "${EITRI_INSTALL_TEST_NODE_BASE_URL:-http://127.0.0.1:1}"
 	else
 		printf '%s\n' "$NV_NODE_DIST_BASE"
 	fi
@@ -1121,17 +1121,17 @@ check_sidecar_build_space() {
 # embedded_release_signers: packaging/release-signers, verbatim, between the two marker lines
 # (the heredoc's own). packaging/tests/install/ asserts the block is byte-equal to that file.
 embedded_release_signers() {
-	cat <<'NEOVIBE_RELEASE_SIGNERS'
-# neovibe release signers.
+	cat <<'EITRI_RELEASE_SIGNERS'
+# eitri release signers.
 #
 # ssh-keygen's allowed_signers format. packaging/install.sh embeds this file byte for byte (a test
 # holds the two equal) and checks a release's SHA256SUMS.sig with exactly:
 #
-#   ssh-keygen -Y verify -f <this file> -I release@neovibe -n neovibe-release -s SHA256SUMS.sig < SHA256SUMS
+#   ssh-keygen -Y verify -f <this file> -I release@eitri -n eitri-release -s SHA256SUMS.sig < SHA256SUMS
 #
 # A key line looks like this, with no comment field after the key:
 #
-#   release@neovibe namespaces="neovibe-release" ssh-ed25519 AAAA...
+#   release@eitri namespaces="eitri-release" ssh-ed25519 AAAA...
 #
 # There is no key line yet. Add the dedicated release key's public half here before the
 # first final release; it must not be an everyday login key, and release.sh refuses one
@@ -1139,7 +1139,7 @@ embedded_release_signers() {
 # refuses a release whose SHA256SUMS.sig is missing or does not verify. Until then an
 # installer built from this tree says it carries no release key, and its checksums only detect
 # corruption.
-NEOVIBE_RELEASE_SIGNERS
+EITRI_RELEASE_SIGNERS
 }
 
 # prepare_signers: sets NV_SIGNERS (a file) and NV_SIGNERS_HAVE_KEY. A signers file that cannot
@@ -1175,7 +1175,7 @@ prepare_signers() {
 	*) die "grep could not scan $NV_SIGNERS (it exited $_ps_rc), so the release signature cannot be checked: refusing. Make the file readable and re-run" ;;
 	esac
 	if [ -n "$OPT_SIGNERS" ] && [ "$NV_SIGNERS_HAVE_KEY" != 1 ]; then
-		die "--release-signers $OPT_SIGNERS lists no key, so it would switch signature checking off: give a file holding the release key's line (release@neovibe namespaces=\"neovibe-release\" ssh-ed25519 ...), or leave the option out"
+		die "--release-signers $OPT_SIGNERS lists no key, so it would switch signature checking off: give a file holding the release key's line (release@eitri namespaces=\"eitri-release\" ssh-ed25519 ...), or leave the option out"
 	fi
 }
 
@@ -1246,7 +1246,7 @@ obtain_release() {
 		if [ -n "$OPT_VERSION" ] && [ "$OPT_VERSION" != "$NV_VERSION" ]; then
 			die "--version $OPT_VERSION, but $OPT_SUMS is for $NV_VERSION"
 		fi
-		NV_TARBALL_NAME=neovibe-$NV_VERSION-x86_64-linux.tar.gz
+		NV_TARBALL_NAME=eitri-$NV_VERSION-x86_64-linux.tar.gz
 		if [ "${OPT_TARBALL##*/}" != "$NV_TARBALL_NAME" ]; then
 			die "--tarball must be the file named $NV_TARBALL_NAME that SHA256SUMS lists (it is ${OPT_TARBALL##*/})"
 		fi
@@ -1277,7 +1277,7 @@ obtain_release() {
 	if [ -n "$OPT_VERSION" ] && [ "$OPT_VERSION" != "$NV_VERSION" ]; then
 		die "asked for $OPT_VERSION, but the release's SHA256SUMS is for $NV_VERSION: check --version and --base-url"
 	fi
-	NV_TARBALL_NAME=neovibe-$NV_VERSION-x86_64-linux.tar.gz
+	NV_TARBALL_NAME=eitri-$NV_VERSION-x86_64-linux.tar.gz
 	# From here on every file comes from releases/download/v<X>/, so a release published between
 	# two requests cannot mix files.
 	NV_REL_URL=$NV_BASE/releases/download/v$NV_VERSION
@@ -1319,7 +1319,7 @@ obtain_release() {
 
 run() {
 	if [ "$OPT_DRY_RUN" = 1 ]; then
-		printf 'neovibe: would run:'
+		printf 'eitri: would run:'
 		printf " '%s'" "$@"
 		printf '\n'
 		return 0
@@ -1334,7 +1334,7 @@ run_in() {
 	_ri_dir=$1
 	shift
 	if [ "$OPT_DRY_RUN" = 1 ]; then
-		printf 'neovibe: would run (in %s):' "$_ri_dir"
+		printf 'eitri: would run (in %s):' "$_ri_dir"
 		printf " '%s'" "$@"
 		printf '\n'
 		return 0
@@ -1354,8 +1354,8 @@ pid_alive() {
 	printf '%s\n' "$_pa"
 }
 
-# acquire_lock: a mkdir lock in <cache>/neovibe/, so two runs never share
-# neovibe.new, the download directory or a sidecar build. A lock left by a dead pid is taken over.
+# acquire_lock: a mkdir lock in <cache>/eitri/, so two runs never share
+# eitri.new, the download directory or a sidecar build. A lock left by a dead pid is taken over.
 # own_private_group DIR: sets OPG=1 when DIR's group is this user's own user-private group -- the
 # user's primary group, named after the user, with no other members: the USERGROUPS_ENAB convention
 # of Debian, Ubuntu and Fedora, whose umask 002 routinely leaves a self-owned ~/.cache at 0775.
@@ -1415,7 +1415,7 @@ acquire_lock() {
 		say "would take the lock $NV_LOCK"
 		return 0
 	fi
-	# A symlinked <cache>/neovibe is refused outright,
+	# A symlinked <cache>/eitri is refused outright,
 	# before `mkdir -p` (which is a silent no-op on one already pointing at an existing directory,
 	# so it would otherwise never even reach a permission check). Another user, in a shared sticky
 	# directory such as /tmp, can plant one and repoint it after any check that only looked at the
@@ -1459,7 +1459,7 @@ acquire_lock() {
 		die "other users can write to $NV_CACHE_NV, so a download checked there could be replaced before it is used: run chmod go-w '$NV_CACHE_NV' (or set XDG_CACHE_HOME to a directory of your own) and re-run"
 	fi
 	# A parent (<cache> itself) that anyone can write to, without the sticky bit, lets another user
-	# rename this directory away and put their own "neovibe" in its place between any two checks --
+	# rename this directory away and put their own "eitri" in its place between any two checks --
 	# the two checks above only ever looked at NV_CACHE_NV's own permissions.
 	# that check alone still missed three cases --
 	# a group-writable (0770) non-sticky <cache> (only ever checked -perm -0002, other-write); a
@@ -1480,7 +1480,7 @@ acquire_lock() {
 		_al_parent_bad=$(find -H "$NV_CACHE" -maxdepth 0 \( -perm -0002 -o -perm -0020 \) ! -perm -1000 -print 2>/dev/null) || _al_parent_bad=
 		if [ -n "$_al_parent_bad" ]; then
 			# rc.2's e2e (2026-09-28): refusing every group-writable <cache> refused a default Ubuntu
-			# user's own 0775 ~/.cache, so `neovibe setup` failed after a plain .deb install. Group-write
+			# user's own 0775 ~/.cache, so `eitri setup` failed after a plain .deb install. Group-write
 			# alone, on this user's own private group, lets no one else in (own_private_group).
 			_al_parent_upg=$(find -H "$NV_CACHE" -maxdepth 0 ! -perm -0002 -perm -0020 -print 2>/dev/null) || _al_parent_upg=
 			OPG=0
@@ -1517,7 +1517,7 @@ acquire_lock() {
 			if [ -z "$_al_tk_pid" ]; then
 				# A holder that dies between mkdir and writing its pid can leave a permanently stuck sub-lock.
 				# Name $_al_takeover in the error so the user can remove it after checking no installer runs.
-				die "$_al_takeover holds no pid, so whether another neovibe installer is using or recovering the lock $NV_LOCK cannot be told: if none is running, remove $_al_takeover and re-run"
+				die "$_al_takeover holds no pid, so whether another eitri installer is using or recovering the lock $NV_LOCK cannot be told: if none is running, remove $_al_takeover and re-run"
 			fi
 			_al_tk_dead=0
 			_al_tk_live=$(pid_alive "$_al_tk_pid")
@@ -1525,10 +1525,10 @@ acquire_lock() {
 			if [ "$_al_tk_dead" != 1 ]; then
 				# Two runs can contend for $_al_takeover while NV_LOCK is either live or stale.
 				# This run has not checked NV_LOCK yet, so the message must not call it stale.
-				die "another neovibe installer (pid $_al_tk_pid) is already checking the lock $NV_LOCK: wait a moment and re-run"
+				die "another eitri installer (pid $_al_tk_pid) is already checking the lock $NV_LOCK: wait a moment and re-run"
 			fi
 			if ! rm -rf -- "$_al_takeover" 2>/dev/null || ! mkdir -- "$_al_takeover" 2>/dev/null; then
-				die "another neovibe installer is already checking the lock $NV_LOCK: wait a moment and re-run"
+				die "another eitri installer is already checking the lock $NV_LOCK: wait a moment and re-run"
 			fi
 		fi
 		printf '%s\n' "$$" >"$_al_takeover/pid" 2>/dev/null || :
@@ -1542,7 +1542,7 @@ acquire_lock() {
 			# Worded like the other collisions on $_al_takeover above, not "recovering the stale
 			# lock": NV_LOCK's own pid has not been read yet at this point (that happens below), so
 			# whether it is actually stale is not yet known here either.
-			die "another neovibe installer is also checking the lock $NV_LOCK right now: wait a moment and re-run"
+			die "another eitri installer is also checking the lock $NV_LOCK right now: wait a moment and re-run"
 		fi
 		# From here to the fresh mkdir below runs under that sub-lock: the pid is read fresh (never
 		# an outer read a concurrent run's own takeover might have raced against) and NV_LOCK is
@@ -1557,12 +1557,12 @@ acquire_lock() {
 		fi
 		if [ -z "$_al_pid" ]; then
 			rm -rf -- "$_al_takeover" || :
-			die "the lock $NV_LOCK holds no pid, so whether another neovibe installer is using it cannot be told: if none is running, remove $NV_LOCK and re-run"
+			die "the lock $NV_LOCK holds no pid, so whether another eitri installer is using it cannot be told: if none is running, remove $NV_LOCK and re-run"
 		fi
 		_al_live=$(pid_alive "$_al_pid")
 		if [ "$_al_live" = 1 ]; then
 			rm -rf -- "$_al_takeover" || :
-			die "another neovibe installer (pid $_al_pid) is running: wait for it to finish and re-run. If none is running, remove $NV_LOCK and re-run"
+			die "another eitri installer (pid $_al_pid) is running: wait for it to finish and re-run. If none is running, remove $NV_LOCK and re-run"
 		fi
 		warn "taking over a lock left by an installer that is no longer running (pid $_al_pid)"
 		# Removed directly, never renamed aside first: nothing else can be modifying NV_LOCK while
@@ -1576,7 +1576,7 @@ acquire_lock() {
 			# exist) landing in the instant between the rm -rf above and this mkdir. Reported the
 			# same way an ordinary lock collision always is, never treated as corruption.
 			rm -rf -- "$_al_takeover" || :
-			die "another neovibe installer took the lock $NV_LOCK just now: wait for it to finish and re-run"
+			die "another eitri installer took the lock $NV_LOCK just now: wait for it to finish and re-run"
 		fi
 		rm -rf -- "$_al_takeover" || :
 	fi
@@ -1605,9 +1605,9 @@ on_exit() {
 			rmdir -- "$NV_LIBROOT" 2>/dev/null || :
 		fi
 		# The temporary names a write goes through before its `mv` (none is left on success).
-		for _oe_t in "$NV_BINDIR/.neovibe.tmp.$$" "$NV_DATA/applications/.neovibe.desktop.tmp.$$" \
-			"$NV_DATA/licenses/neovibe/.LICENSE.tmp.$$" "$NV_DATA/licenses/neovibe/.THIRD-PARTY-LICENSES.tmp.$$" \
-			"$NV_DATA/licenses/neovibe/.SOURCE.tmp.$$" "$NV_DATA/licenses/neovibe/.installed-version.tmp.$$"; do
+		for _oe_t in "$NV_BINDIR/.eitri.tmp.$$" "$NV_DATA/applications/.eitri.desktop.tmp.$$" \
+			"$NV_DATA/licenses/eitri/.LICENSE.tmp.$$" "$NV_DATA/licenses/eitri/.THIRD-PARTY-LICENSES.tmp.$$" \
+			"$NV_DATA/licenses/eitri/.SOURCE.tmp.$$" "$NV_DATA/licenses/eitri/.installed-version.tmp.$$"; do
 			rm -f -- "$_oe_t" 2>/dev/null || :
 		done
 		if [ -n "${NV_SIDECAR_TMP-}" ]; then rm -f -- "$NV_SIDECAR_TMP" 2>/dev/null || :; fi
@@ -1703,7 +1703,7 @@ sidecar_download_node() {
 	curl_get "$_sdn_url" "$_sdn_out.part"
 	if [ "$CG_OK" != 1 ]; then
 		if [ "$2" = 1 ]; then
-			warn "could not download the pinned Node runtime ($_sdn_url), needed to build the sidecar: $CG_ERR. neovibe is installed without one; run \"neovibe setup\" once you have network access to nodejs.org"
+			warn "could not download the pinned Node runtime ($_sdn_url), needed to build the sidecar: $CG_ERR. eitri is installed without one; run \"eitri setup\" once you have network access to nodejs.org"
 			return 0
 		fi
 		die "could not download the pinned Node runtime ($_sdn_url): $CG_ERR"
@@ -1741,14 +1741,14 @@ sidecar_download_verdandi_source() {
 		SDV_TARBALL=$NV_VERDANDI_SOURCE_TARBALL_OVERRIDE
 		return 0
 	fi
-	# A RELEASE marked NEOVIBE_BUILT_FROM_CHECKOUT reached here with no override
-	# -- a separate, later run (`neovibe setup` beside a --checkout install's own RELEASE) rather
+	# A RELEASE marked EITRI_BUILT_FROM_CHECKOUT reached here with no override
+	# -- a separate, later run (`eitri setup` beside a --checkout install's own RELEASE) rather
 	# than the same one that built it, so resolve_verdandi_source never ran this time. Its
 	# VERDANDI_SOURCE_SHA256 is a `git archive` hash, which will never equal the real release
 	# asset's bytes: downloading and reporting that as a checksum mismatch would read as tampering,
 	# when the real reason is simply that this RELEASE cannot be resolved this way any more.
 	if [ "$REL_BUILT_FROM_CHECKOUT" = 1 ]; then
-		die "$NV_RELEASE_PATH was built from a --checkout tree (NEOVIBE_BUILT_FROM_CHECKOUT=1): its VERDANDI_SOURCE_SHA256 is a git-archive hash, not the real release asset's, so this cannot be fetched from $NV_REL_URL. Re-run sh install.sh --from-source --checkout DIR (the same tree, or one at the same commit) to rebuild it instead"
+		die "$NV_RELEASE_PATH was built from a --checkout tree (EITRI_BUILT_FROM_CHECKOUT=1): its VERDANDI_SOURCE_SHA256 is a git-archive hash, not the real release asset's, so this cannot be fetched from $NV_REL_URL. Re-run sh install.sh --from-source --checkout DIR (the same tree, or one at the same commit) to rebuild it instead"
 	fi
 	_sdv_url=$NV_REL_URL/$REL_VERDANDI_SOURCE
 	_sdv_out=$1/$REL_VERDANDI_SOURCE
@@ -1892,7 +1892,7 @@ ensure_sidecar() {
 		return 0
 	fi
 	if [ "$OPT_DRY_RUN" = 1 ]; then
-		say "would build the sidecar for verdandi $NV_NEW_REV7 into $NV_SIDECAR_ROOT/$NV_NEW_REV7 (needs network access to nodejs.org and the release server; run \"neovibe setup\" later if it cannot)"
+		say "would build the sidecar for verdandi $NV_NEW_REV7 into $NV_SIDECAR_ROOT/$NV_NEW_REV7 (needs network access to nodejs.org and the release server; run \"eitri setup\" later if it cannot)"
 		return 0
 	fi
 	# TOLERANT is 1 only when no WORKING install is
@@ -1910,9 +1910,9 @@ ensure_sidecar() {
 }
 
 # resolve_setup_release: --sidecar-only's and --build-sidecar-into's RELEASE: from
-# beside the running script (dirname "$0" -- a .deb/.rpm/tarball install's own neovibe-setup, or the
-# neovibe-bin PKGBUILD's copy of it), or --release-file. Deliberately never a hard-coded
-# ~/.local/lib/neovibe or /usr/lib/neovibe: a .deb install's neovibe-setup must never build against a
+# beside the running script (dirname "$0" -- a .deb/.rpm/tarball install's own eitri-setup, or the
+# eitri-bin PKGBUILD's copy of it), or --release-file. Deliberately never a hard-coded
+# ~/.local/lib/eitri or /usr/lib/eitri: a .deb install's eitri-setup must never build against a
 # tarball install's RELEASE lying around in ~/.local, or the reverse (spec: "it never searches
 # ~/.local and then /usr"). Sets REL_* (parse_release).
 resolve_setup_release() {
@@ -1924,14 +1924,14 @@ resolve_setup_release() {
 		if [ -n "$_rsr_dir" ] && [ -f "$_rsr_dir/RELEASE" ]; then NV_RELEASE_PATH=$_rsr_dir/RELEASE; fi
 	fi
 	if [ -z "$NV_RELEASE_PATH" ]; then
-		die "no RELEASE found beside $0, and no --release-file given: pass --release-file PATH, or run this as the neovibe-setup installed beside a RELEASE (a .deb, .rpm or tarball install)"
+		die "no RELEASE found beside $0, and no --release-file given: pass --release-file PATH, or run this as the eitri-setup installed beside a RELEASE (a .deb, .rpm or tarball install)"
 	fi
 	if [ ! -f "$NV_RELEASE_PATH" ]; then die "--release-file $NV_RELEASE_PATH: no such file"; fi
 	parse_release "$NV_RELEASE_PATH"
 }
 
-# do_sidecar_only: build the installed release's sidecar for --sidecar-only or setup.
-# Check each input against the resolved RELEASE without fetching SHA256SUMS.
+# do_sidecar_only: builds the sidecar for --sidecar-only or `eitri setup`.
+# No SHA256SUMS is fetched; each input is checked against the resolved RELEASE.
 do_sidecar_only() {
 	resolve_setup_release
 	if [ "$OPT_DRY_RUN" = 1 ]; then
@@ -1953,10 +1953,10 @@ do_sidecar_only() {
 	report_claude "$NV_SIDECAR_BIN"
 }
 
-# do_nvim_only: install the pinned nvim for an existing installation.
-# resolve_setup_release uses RELEASE beside this script or --release-file, avoiding metadata
-# from another installation. An adequate PATH nvim does not suppress this explicit request.
-# Download failure is fatal with TOLERANT=0, as it is for explicit sidecar setup.
+# do_nvim_only: installs the pinned nvim for an existing installation when explicitly requested.
+# resolve_setup_release uses RELEASE beside this script or --release-file, keeping setup tied
+# to this installation. An adequate PATH nvim does not suppress installation, and a download
+# failure is fatal (TOLERANT=0).
 do_nvim_only() {
 	resolve_setup_release
 	check_platform
@@ -1966,7 +1966,7 @@ do_nvim_only() {
 		return 0
 	fi
 	if [ "$OPT_DRY_RUN" = 1 ]; then
-		say "would install nvim $REL_NVIM_VERSION into $NV_DATA/neovibe/nvim/$REL_NVIM_VERSION (from $NV_RELEASE_PATH)"
+		say "would install nvim $REL_NVIM_VERSION into $NV_DATA/eitri/nvim/$REL_NVIM_VERSION (from $NV_RELEASE_PATH)"
 		return 0
 	fi
 	require_curl
@@ -1974,17 +1974,15 @@ do_nvim_only() {
 	install_nvim_version "$REL_NVIM_VERSION" "$REL_NVIM_SHA256_LINUX_X86_64" 0
 }
 
-# do_nvim_offer: run the conditional nvim offer after do_sidecar_only during setup.
-# Reuse nvim_check and maybe_offer_nvim so an adequate PATH nvim suppresses the offer,
-# prompts honor tty/--yes/--with-nvim/--no-nvim and network failures remain tolerable.
-# The explicit --nvim-only request instead ignores an adequate PATH nvim and fails on a
-# failed download. Here require_curl and acquire_lock are skipped for early exclusions
-# such as an adequate PATH nvim or --no-nvim. acquire_lock also supports --dry-run.
+# do_nvim_offer: offers nvim after do_sidecar_only during `eitri setup`.
+# Reuses nvim_check and maybe_offer_nvim, so an adequate PATH nvim suppresses the offer.
+# The tty, --yes, --with-nvim and --no-nvim behavior and tolerance of network failures match
+# finish_install. Skip require_curl and acquire_lock when nvim_check or --no-nvim means no
+# download is needed; acquire_lock also handles --dry-run.
 do_nvim_offer() {
 	resolve_setup_release
-	# Check the pinned per-user nvim first, as do_nvim_only does. If it is installed, there
-	# is nothing to offer, and warning about an older PATH nvim would be misleading because
-	# the runtime resolver prefers the per-user copy.
+	# Check the pinned nvim copy first. If it is installed, there is nothing to offer:
+	# the application uses it, so nvim_check must not warn about an older nvim on PATH.
 	nvim_private_state "$REL_NVIM_VERSION"
 	if [ "$NV_NVIM_PRIVATE_PRESENT" = 1 ]; then
 		say "nvim $REL_NVIM_VERSION: already installed at $NV_NVIM_PRIVATE_BIN"
@@ -1999,9 +1997,9 @@ do_nvim_offer() {
 	maybe_offer_nvim
 }
 
-# do_build_sidecar_into: build into DIR using local --node and --verdandi-source tarballs.
-# makepkg has already fetched these inputs through source= and sha256sums, but check both
-# against the resolved RELEASE before using them.
+# do_build_sidecar_into: builds into DIR with --node TARBALL and --verdandi-source TARBALL.
+# makepkg has already fetched both inputs, but each is still checked against the resolved
+# RELEASE before use.
 do_build_sidecar_into() {
 	resolve_setup_release
 	if [ "$OPT_DRY_RUN" = 1 ]; then
@@ -2111,19 +2109,19 @@ check_build_tools() {
 	say "build tools: ok"
 }
 
-# neovibe_repo_url / verdandi_repo_url: the public repositories --from-source clones. Test-only
-# overrides (matched by run-in-env.sh's NEOVIBE_INSTALL_TEST_* allowlist pattern already, no new
+# eitri_repo_url / verdandi_repo_url: the public repositories --from-source clones. Test-only
+# overrides (matched by run-in-env.sh's EITRI_INSTALL_TEST_* allowlist pattern already, no new
 # entry needed there) stand in for a local bare repo fixture; production always uses the real URL.
-neovibe_repo_url() {
-	if [ "$NV_TEST_MODE" = 1 ] && [ -n "${NEOVIBE_INSTALL_TEST_REPO_URL-}" ]; then
-		printf '%s\n' "$NEOVIBE_INSTALL_TEST_REPO_URL"
+eitri_repo_url() {
+	if [ "$NV_TEST_MODE" = 1 ] && [ -n "${EITRI_INSTALL_TEST_REPO_URL-}" ]; then
+		printf '%s\n' "$EITRI_INSTALL_TEST_REPO_URL"
 	else
-		printf '%s\n' "$NV_NEOVIBE_REPO_URL"
+		printf '%s\n' "$NV_EITRI_REPO_URL"
 	fi
 }
 verdandi_repo_url() {
-	if [ "$NV_TEST_MODE" = 1 ] && [ -n "${NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL-}" ]; then
-		printf '%s\n' "$NEOVIBE_INSTALL_TEST_VERDANDI_REPO_URL"
+	if [ "$NV_TEST_MODE" = 1 ] && [ -n "${EITRI_INSTALL_TEST_VERDANDI_REPO_URL-}" ]; then
+		printf '%s\n' "$EITRI_INSTALL_TEST_VERDANDI_REPO_URL"
 	else
 		printf '%s\n' "$NV_VERDANDI_REPO_URL"
 	fi
@@ -2135,14 +2133,14 @@ verdandi_repo_url() {
 # A plain statement: this can die.
 checkout_version() {
 	_cv_shell=$1/shell/Cargo.toml
-	if [ ! -f "$_cv_shell" ]; then die "$1 has no shell/Cargo.toml: not a neovibe checkout"; fi
+	if [ ! -f "$_cv_shell" ]; then die "$1 has no shell/Cargo.toml: not a eitri checkout"; fi
 	_cv_line=$(grep -E '^version[[:space:]]*=|^version\.workspace[[:space:]]*=' "$_cv_shell" | head -n 1) || _cv_line=
 	case $_cv_line in
 	*workspace*) _cv_line=$(grep -E '^version[[:space:]]*=' "$1/Cargo.toml" | head -n 1) || _cv_line= ;;
 	esac
 	CV_VERSION=$(printf '%s\n' "$_cv_line" | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
 	if ! printf '%s\n' "$CV_VERSION" | grep -Eqx "$NV_VERSION_ERE"; then
-		die "could not determine a version from $1 (shell/Cargo.toml, or [workspace.package] in its root Cargo.toml): not a neovibe checkout, or its version field is not a plain quoted string"
+		die "could not determine a version from $1 (shell/Cargo.toml, or [workspace.package] in its root Cargo.toml): not a eitri checkout, or its version field is not a plain quoted string"
 	fi
 }
 
@@ -2151,7 +2149,7 @@ checkout_version() {
 # whose --version could be queried. Call as a plain statement because this can fail fatally.
 lockfile_rev() {
 	_lr_lock=$1/Cargo.lock
-	if [ ! -f "$_lr_lock" ]; then die "$1 has no Cargo.lock: not a neovibe checkout, or it has not been resolved (run cargo generate-lockfile first)"; fi
+	if [ ! -f "$_lr_lock" ]; then die "$1 has no Cargo.lock: not a eitri checkout, or it has not been resolved (run cargo generate-lockfile first)"; fi
 	_lr_rev=$(awk -v pkg="$2" '
 		$0 == "name = \"" pkg "\"" { want = 1; next }
 		want && /^source = / { sub(/^source = "/, ""); sub(/"$/, ""); print; exit }
@@ -2162,7 +2160,7 @@ lockfile_rev() {
 	*) LR_REV= ;;
 	esac
 	if ! printf '%s\n' "$LR_REV" | grep -Eqx '[0-9a-f]{40}'; then
-		die "could not determine $2's commit from $_lr_lock: not a neovibe checkout with a git dependency on $2, or Cargo.lock is stale"
+		die "could not determine $2's commit from $_lr_lock: not a eitri checkout with a git dependency on $2, or Cargo.lock is stale"
 	fi
 }
 
@@ -2175,7 +2173,7 @@ lockfile_rev() {
 checkout_fork_rev() {
 	_cfr_dir=$1
 	_cfr_lock=$_cfr_dir/Cargo.lock
-	if [ ! -f "$_cfr_lock" ]; then die "$_cfr_dir has no Cargo.lock: not a neovibe checkout, or it has not been resolved (run cargo generate-lockfile first)"; fi
+	if [ ! -f "$_cfr_lock" ]; then die "$_cfr_dir has no Cargo.lock: not a eitri checkout, or it has not been resolved (run cargo generate-lockfile first)"; fi
 	_cfr_src=$(awk '
 		$0 == "name = \"neovide\"" { want = 1; next }
 		want && /^source = / { sub(/^source = "/, ""); sub(/"$/, ""); print; exit }
@@ -2190,7 +2188,7 @@ checkout_fork_rev() {
 	_cfr_link=$(git -C "$_cfr_dir" ls-tree HEAD neovide 2>/dev/null) || _cfr_link=
 	case $_cfr_link in
 	"160000 commit "*) CFR_REV=$(printf '%s\n' "$_cfr_link" | awk '{ print $3 }') ;;
-	*) die "could not determine neovide's commit in $_cfr_dir: Cargo.lock names no git source for it and HEAD records no neovide submodule -- not a neovibe checkout" ;;
+	*) die "could not determine neovide's commit in $_cfr_dir: Cargo.lock names no git source for it and HEAD records no neovide submodule -- not a eitri checkout" ;;
 	esac
 	if ! printf '%s\n' "$CFR_REV" | grep -Eqx '[0-9a-f]{40}'; then
 		die "the neovide submodule commit HEAD records in $_cfr_dir is not 40 hex: $CFR_REV"
@@ -2217,10 +2215,10 @@ checkout_fork_rev() {
 # A plain statement: this can die.
 agent_toml_verdandi() {
 	_atv_file=$1/agent/Cargo.toml
-	if [ ! -f "$_atv_file" ]; then die "$1 has no agent/Cargo.toml: not a neovibe checkout"; fi
+	if [ ! -f "$_atv_file" ]; then die "$1 has no agent/Cargo.toml: not a eitri checkout"; fi
 	_atv_line=$(grep -E '^claude-runtime-protocol[[:space:]]*=' "$_atv_file" | head -n 1) || _atv_line=
 	if [ -z "$_atv_line" ]; then
-		die "$_atv_file names no claude-runtime-protocol dependency: not a neovibe checkout, or it no longer pins Verdandi the way this installer expects"
+		die "$_atv_file names no claude-runtime-protocol dependency: not a eitri checkout, or it no longer pins Verdandi the way this installer expects"
 	fi
 	AT_GIT_URL=$(printf '%s\n' "$_atv_line" | sed -n 's/.*git[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
 	AT_REV=$(printf '%s\n' "$_atv_line" | sed -n 's/.*rev[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
@@ -2330,10 +2328,10 @@ synthesize_release_from_checkout() {
 	*) NV_VERDANDI_REV_IS_PUBLIC=0 ;;
 	esac
 	if [ "$NV_VERDANDI_REV_IS_PUBLIC" != 1 ] && [ -z "$OPT_VERDANDI_CHECKOUT" ]; then
-		die "agent/Cargo.toml in $_src_dir pins Verdandi from a private source ($AT_GIT_URL), so its source cannot be fetched publicly: pass --verdandi-checkout DIR (a local checkout of it), or set NEOVIBE_VERDANDI_CHECKOUT"
+		die "agent/Cargo.toml in $_src_dir pins Verdandi from a private source ($AT_GIT_URL), so its source cannot be fetched publicly: pass --verdandi-checkout DIR (a local checkout of it), or set EITRI_VERDANDI_CHECKOUT"
 	fi
 	_src_pins=$_src_dir/packaging/pins.env
-	if [ ! -f "$_src_pins" ]; then die "$_src_dir has no packaging/pins.env: not a neovibe checkout"; fi
+	if [ ! -f "$_src_pins" ]; then die "$_src_dir has no packaging/pins.env: not a eitri checkout"; fi
 	REL_VERDANDI_REV=$AT_REV
 	resolve_verdandi_source
 	if [ -z "$NV_VERDANDI_SOURCE_TARBALL_OVERRIDE" ]; then
@@ -2351,8 +2349,8 @@ synthesize_release_from_checkout() {
 	mkdir -p -- "$NV_CACHE_NV" || die "cannot create $NV_CACHE_NV"
 	_src_release=$NV_CACHE_NV/from-source-RELEASE.$$
 	{
-		printf 'NEOVIBE_VERSION=%s\n' "$NV_VERSION"
-		printf 'NEOVIBE_COMMIT=%s\n' "$_src_head"
+		printf 'EITRI_VERSION=%s\n' "$NV_VERSION"
+		printf 'EITRI_COMMIT=%s\n' "$_src_head"
 		printf 'NEOVIDE_FORK_COMMIT=%s\n' "$_src_fork"
 		printf 'VERDANDI_REV=%s\n' "$AT_REV"
 		printf 'VERDANDI_SOURCE=verdandi-%s-source.tar.gz\n' "$_src_rev7"
@@ -2364,9 +2362,9 @@ synthesize_release_from_checkout() {
 		printf 'NVIM_SHA256_linux_x86_64=%s\n' "$_src_pins_nvim_sha"
 		# This RELEASE's own VERDANDI_SOURCE_SHA256 is a `git archive` hash
 		# (resolve_verdandi_source, below), not the real release asset's -- a later, separate
-		# `neovibe setup` run has no way to reproduce those exact bytes, and must not be told its
+		# `eitri setup` run has no way to reproduce those exact bytes, and must not be told its
 		# download "changed" or was "tampered" when it is simply the wrong kind of RELEASE to ask.
-		printf 'NEOVIBE_BUILT_FROM_CHECKOUT=1\n'
+		printf 'EITRI_BUILT_FROM_CHECKOUT=1\n'
 	} >"$_src_release" || die "cannot write $_src_release"
 	NV_RELEASE_PATH=$_src_release
 	parse_release "$_src_release"
@@ -2376,15 +2374,15 @@ synthesize_release_from_checkout() {
 # obtain_release has verified SHA256SUMS and its signature, and fetch_verified_release has
 # checked RELEASE. Refuse unless HEAD matches the commit in RELEASE, so the source being built
 # matches the verified release. Sets NV_FROM_SOURCE_DIR.
-clone_public_neovibe() {
-	_cpn_url=$(neovibe_repo_url)
+clone_public_eitri() {
+	_cpn_url=$(eitri_repo_url)
 	_cpn_dir=$NV_CACHE_NV/src
 	rm -rf -- "$_cpn_dir" || die "cannot remove the stale $_cpn_dir"
 	git clone --quiet --branch "v$1" --recurse-submodules "$_cpn_url" "$_cpn_dir" ||
 		die "could not clone $_cpn_url at v$1: check your network connection and re-run"
 	_cpn_head=$(git -C "$_cpn_dir" rev-parse HEAD 2>/dev/null) || die "cannot determine HEAD in the cloned $_cpn_dir"
-	if [ "$_cpn_head" != "$REL_NEOVIBE_COMMIT" ]; then
-		die "the clone of $_cpn_url at v$1 is at $_cpn_head, not $REL_NEOVIBE_COMMIT (this release's own RELEASE): refusing to build from a tag that does not match the release it is signed and checksummed with. Report it at $NV_ISSUES"
+	if [ "$_cpn_head" != "$REL_EITRI_COMMIT" ]; then
+		die "the clone of $_cpn_url at v$1 is at $_cpn_head, not $REL_EITRI_COMMIT (this release's own RELEASE): refusing to build from a tag that does not match the release it is signed and checksummed with. Report it at $NV_ISSUES"
 	fi
 	NV_FROM_SOURCE_DIR=$_cpn_dir
 }
@@ -2418,50 +2416,50 @@ from_source_stage() {
 	_fss_src=$1
 	_fss_release=$2
 	rm -rf -- "$NV_STAGE" || die "cannot remove the stale $NV_STAGE"
-	_fss_top=$NV_STAGE/neovibe-$NV_VERSION-x86_64-linux
+	_fss_top=$NV_STAGE/eitri-$NV_VERSION-x86_64-linux
 	NV_STAGE_TOP=$_fss_top
-	mkdir -p -- "$_fss_top/bin" "$_fss_top/lib/neovibe" "$_fss_top/share/applications" "$_fss_top/share/licenses/neovibe" ||
+	mkdir -p -- "$_fss_top/bin" "$_fss_top/lib/eitri" "$_fss_top/share/applications" "$_fss_top/share/licenses/eitri" ||
 		die "cannot create $_fss_top"
-	cp -- "$_fss_src/packaging/neovibe.launcher.sh" "$_fss_top/bin/neovibe" || die "cannot stage the launcher"
-	chmod 0755 "$_fss_top/bin/neovibe" || die "cannot chmod the staged launcher"
+	cp -- "$_fss_src/packaging/eitri.launcher.sh" "$_fss_top/bin/eitri" || die "cannot stage the launcher"
+	chmod 0755 "$_fss_top/bin/eitri" || die "cannot chmod the staged launcher"
 	for _fss_b in $NV_BINARIES; do
 		if [ ! -x "$_fss_src/target/release/$_fss_b" ]; then
 			die "the build did not produce target/release/$_fss_b: report it at $NV_ISSUES"
 		fi
-		cp -- "$_fss_src/target/release/$_fss_b" "$_fss_top/lib/neovibe/$_fss_b" || die "cannot stage $_fss_b"
-		chmod 0755 "$_fss_top/lib/neovibe/$_fss_b" || die "cannot chmod $_fss_b"
+		cp -- "$_fss_src/target/release/$_fss_b" "$_fss_top/lib/eitri/$_fss_b" || die "cannot stage $_fss_b"
+		chmod 0755 "$_fss_top/lib/eitri/$_fss_b" || die "cannot chmod $_fss_b"
 	done
-	cp -- "$_fss_src/packaging/install.sh" "$_fss_top/lib/neovibe/neovibe-setup" || die "cannot stage neovibe-setup"
-	chmod 0755 "$_fss_top/lib/neovibe/neovibe-setup" || die "cannot chmod neovibe-setup"
-	cp -- "$_fss_release" "$_fss_top/lib/neovibe/RELEASE" || die "cannot stage RELEASE"
-	cp -- "$_fss_src/packaging/neovibe.desktop" "$_fss_top/share/applications/neovibe.desktop" || die "cannot stage the desktop entry"
+	cp -- "$_fss_src/packaging/install.sh" "$_fss_top/lib/eitri/eitri-setup" || die "cannot stage eitri-setup"
+	chmod 0755 "$_fss_top/lib/eitri/eitri-setup" || die "cannot chmod eitri-setup"
+	cp -- "$_fss_release" "$_fss_top/lib/eitri/RELEASE" || die "cannot stage RELEASE"
+	cp -- "$_fss_src/packaging/eitri.desktop" "$_fss_top/share/applications/eitri.desktop" || die "cannot stage the desktop entry"
 	if [ -f "$_fss_src/LICENSE" ]; then
-		cp -- "$_fss_src/LICENSE" "$_fss_top/share/licenses/neovibe/LICENSE" || die "cannot stage LICENSE"
+		cp -- "$_fss_src/LICENSE" "$_fss_top/share/licenses/eitri/LICENSE" || die "cannot stage LICENSE"
 	else
-		printf 'No LICENSE file was found in %s.\n' "$_fss_src" >"$_fss_top/share/licenses/neovibe/LICENSE" ||
+		printf 'No LICENSE file was found in %s.\n' "$_fss_src" >"$_fss_top/share/licenses/eitri/LICENSE" ||
 			die "cannot write a placeholder LICENSE"
 	fi
 	{
-		printf 'This copy of neovibe was built directly from source (sh install.sh --from-source),\n'
+		printf 'This copy of eitri was built directly from source (sh install.sh --from-source),\n'
 		printf 'not from a signed release build, so this file is a placeholder rather than the\n'
 		printf 'generated third-party licence text a release build carries.\n\n'
 		printf 'source tree:          %s\n' "$_fss_src"
-		printf 'commit:               %s\n' "$REL_NEOVIBE_COMMIT"
+		printf 'commit:               %s\n' "$REL_EITRI_COMMIT"
 		printf 'neovide fork commit:  %s\n\n' "$REL_NEOVIDE_FORK_COMMIT"
 		printf 'To generate the real text, run packaging/collect-licenses.py in that tree once its\n'
 		printf 'own build has produced target/release and agent-ui/web/node_modules -- see that\n'
 		printf 'script'"'"'s own --help.\n'
-	} >"$_fss_top/share/licenses/neovibe/THIRD-PARTY-LICENSES" || die "cannot write THIRD-PARTY-LICENSES"
-	cp -- "$_fss_top/share/licenses/neovibe/THIRD-PARTY-LICENSES" "$_fss_top/share/licenses/neovibe/SOURCE" ||
+	} >"$_fss_top/share/licenses/eitri/THIRD-PARTY-LICENSES" || die "cannot write THIRD-PARTY-LICENSES"
+	cp -- "$_fss_top/share/licenses/eitri/THIRD-PARTY-LICENSES" "$_fss_top/share/licenses/eitri/SOURCE" ||
 		die "cannot write SOURCE"
-	parse_release "$_fss_top/lib/neovibe/RELEASE"
+	parse_release "$_fss_top/lib/eitri/RELEASE"
 	if [ "$REL_VERSION" != "$NV_VERSION" ]; then
 		die "the RELEASE for this build says $REL_VERSION, not $NV_VERSION: refusing. Report it at $NV_ISSUES"
 	fi
 	NV_NEW_REV7=$REL_REV7
 	mkdir -p -- "$NV_LIBROOT" || die "cannot create $NV_LIBROOT"
 	NV_NEW_CREATED=1
-	cp -R -- "$_fss_top/lib/neovibe" "$NV_LIB.new" || die "cannot copy the new install to $NV_LIB.new (is the disk full?)"
+	cp -R -- "$_fss_top/lib/eitri" "$NV_LIB.new" || die "cannot copy the new install to $NV_LIB.new (is the disk full?)"
 }
 
 # finish_install: shared by do_install and do_from_source from the point each has produced NV_LIB.new
@@ -2482,9 +2480,9 @@ finish_install() {
 		say "dry run: nothing was changed"
 		return 0
 	fi
-	say "installed neovibe $NV_VERSION into $NV_LIB; run it with: neovibe [project directory]"
+	say "installed eitri $NV_VERSION into $NV_LIB; run it with: eitri [project directory]"
 	if [ -n "$NV_INSTALLED_VERSION" ]; then
-		say "restart open neovibe windows: they keep running, but new tabs and the handoff need the new install"
+		say "restart open eitri windows: they keep running, but new tabs and the handoff need the new install"
 	fi
 	# Last, so the one-time sudo steps are the last thing on screen.
 	apparmor_note
@@ -2495,14 +2493,14 @@ finish_install() {
 #
 # Ubuntu 23.10+ sets kernel.apparmor_restrict_unprivileged_userns=1: a program may create a user
 # namespace only while an AppArmor profile granting `userns` confines it, and WebKitGTK's bwrap
-# sandbox needs one. Without it neovibe shows the fix in the agent panel's place instead of the
+# sandbox needs one. Without it eitri shows the fix in the agent panel's place instead of the
 # panel (shell/src/webkit_sandbox.rs). This installer never runs sudo, so it writes the profile for
 # this install under its own data directory and prints the two commands that install and load it.
 #
-# The profile is packaging/apparmor/neovibe with this install's own resolved path, always quoted and
-# with AppArmor's glob characters escaped, and a name of its own -- neovibe-user-<uid>, so no two
+# The profile is packaging/apparmor/eitri with this install's own resolved path, always quoted and
+# with AppArmor's glob characters escaped, and a name of its own -- eitri-user-<uid>, so no two
 # users' per-user profiles replace each other in the kernel. A literal path rather than an @{HOME}
-# glob (which works too): the grant covers this user's install and nobody else's. neovibe itself
+# glob (which works too): the grant covers this user's install and nobody else's. eitri itself
 # renders the same bytes and names the same commands (shell/src/webkit_sandbox.rs; its test sources
 # this file and compares), so the steps printed here and the ones the panel's place shows agree.
 
@@ -2536,12 +2534,12 @@ apparmor_escape() {
 	printf '%s' "$1" | sed 's/[][\\{}*?^@"]/\\&/g'
 }
 
-# apparmor_plan EXE UID: the profile's name for EXE (the package's own for /usr/lib/neovibe/shell,
-# else neovibe-user-UID), where this installer writes it (AA_SRC), where it is installed
+# apparmor_plan EXE UID: the profile's name for EXE (the package's own for /usr/lib/eitri/shell,
+# else eitri-user-UID), where this installer writes it (AA_SRC), where it is installed
 # (AA_TARGET), and the two commands (AA_CMD1 installs it, AA_CMD2 loads it).
 apparmor_plan() {
-	if [ "$1" = /usr/lib/neovibe/shell ]; then AA_NAME=neovibe; else AA_NAME=neovibe-user-$2; fi
-	AA_SRC=$NV_DATA/neovibe/apparmor/$AA_NAME
+	if [ "$1" = /usr/lib/eitri/shell ]; then AA_NAME=eitri; else AA_NAME=eitri-user-$2; fi
+	AA_SRC=$NV_DATA/eitri/apparmor/$AA_NAME
 	AA_TARGET=$NV_APPARMOR_D/$AA_NAME
 	_ap_src=$(sh_quote "$AA_SRC")
 	_ap_dst=$(sh_quote "$AA_TARGET")
@@ -2549,22 +2547,22 @@ apparmor_plan() {
 	AA_CMD2="sudo apparmor_parser -r $_ap_dst"
 }
 
-# apparmor_render NAME EXE: the profile text (packaging/apparmor/neovibe, with NAME and EXE).
+# apparmor_render NAME EXE: the profile text (packaging/apparmor/eitri, with NAME and EXE).
 apparmor_render() {
 	_arn_path=$(apparmor_escape "$2")
 	cat <<'EOF'
-# AppArmor profile for neovibe's `shell` (packaging/apparmor/neovibe).
+# AppArmor profile for eitri's `shell` (packaging/apparmor/eitri).
 #
 # Ubuntu 23.10 and later set kernel.apparmor_restrict_unprivileged_userns=1: a program may create a
 # user namespace only while an AppArmor profile that grants `userns` confines it. WebKitGTK 6.0 runs
 # its web and network processes in a bwrap sandbox, which needs one, so without this profile the
 # agent panel cannot start. The profile grants that and nothing else: it is unconfined otherwise,
 # the same shape as the profiles Ubuntu's own apparmor package ships for its WebKit applications
-# (epiphany, for one). Every process neovibe starts inherits it.
+# (epiphany, for one). Every process eitri starts inherits it.
 #
-# The .deb installs this file as /etc/apparmor.d/neovibe and loads nothing (it has no maintainer
-# scripts): `sudo apparmor_parser -r /etc/apparmor.d/neovibe`, or the next restart, loads it. For
-# any other install, the curl installer and neovibe itself write this same text with that install's
+# The .deb installs this file as /etc/apparmor.d/eitri and loads nothing (it has no maintainer
+# scripts): `sudo apparmor_parser -r /etc/apparmor.d/eitri`, or the next restart, loads it. For
+# any other install, the curl installer and eitri itself write this same text with that install's
 # own path and a profile name of its own.
 
 abi <abi/4.0>,
@@ -2582,7 +2580,7 @@ EOF
 
 # apparmor_note: where the restriction is on, write this install's profile under $NV_DATA and say
 # how to install and load it (a dry run only says where it would go). Never fatal: the install is
-# complete by now, and neovibe writes the same file and shows the same steps itself.
+# complete by now, and eitri writes the same file and shows the same steps itself.
 apparmor_note() {
 	apparmor_restricted
 	if [ "$AA_RESTRICTED" != 1 ]; then return 0; fi
@@ -2591,16 +2589,16 @@ apparmor_note() {
 	_an_exe=$_an_lib/shell
 	_an_uid=$(id -u 2>/dev/null) || _an_uid=
 	_an_why="this system restricts unprivileged user namespaces (Ubuntu's AppArmor rule), so the agent panel's sandbox (WebKit's bwrap) needs an AppArmor profile for this install"
-	_an_hatch="until then neovibe shows these steps in the agent panel's place; starting it with WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 also works, but that removes the operating system's sandbox from the process that renders the model's output"
+	_an_hatch="until then eitri shows these steps in the agent panel's place; starting it with WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 also works, but that removes the operating system's sandbox from the process that renders the model's output"
 	case $_an_uid in
 	'' | *[!0-9]*)
-		warn "$_an_why, and \`id -u\` gave no user id to name it by: neovibe shows the steps in the agent panel's place"
+		warn "$_an_why, and \`id -u\` gave no user id to name it by: eitri shows the steps in the agent panel's place"
 		return 0
 		;;
 	esac
 	case $_an_exe in
 	*[[:cntrl:]]*)
-		warn "$_an_why, and $NV_LIB holds a control character, which no profile can name: install neovibe under a plainer HOME, or $_an_hatch"
+		warn "$_an_why, and $NV_LIB holds a control character, which no profile can name: install eitri under a plainer HOME, or $_an_hatch"
 		return 0
 		;;
 	esac
@@ -2610,11 +2608,11 @@ apparmor_note() {
 		return 0
 	fi
 	_an_text=$(apparmor_render "$AA_NAME" "$_an_exe")
-	if ! mkdir -p -- "$NV_DATA/neovibe/apparmor" ||
+	if ! mkdir -p -- "$NV_DATA/eitri/apparmor" ||
 		! printf '%s\n' "$_an_text" >"$AA_SRC.tmp.$$" ||
 		! mv -- "$AA_SRC.tmp.$$" "$AA_SRC"; then
 		rm -f -- "$AA_SRC.tmp.$$"
-		warn "$_an_why, and it could not be written to $AA_SRC (see the message above): neovibe writes it itself and shows the steps in the agent panel's place"
+		warn "$_an_why, and it could not be written to $AA_SRC (see the message above): eitri writes it itself and shows the steps in the agent panel's place"
 		return 0
 	fi
 	_an_have=
@@ -2640,14 +2638,14 @@ fetch_skia_binaries() {
 	_fsb_url=$(kv_get "$_fsb_pins" SKIA_BINARIES_URL_UPSTREAM)
 	_fsb_sha=$(kv_get "$_fsb_pins" SKIA_BINARIES_SHA256)
 	if [ -z "$_fsb_url" ] || [ -z "$_fsb_sha" ]; then
-		die "$_fsb_pins names no SKIA_BINARIES_URL_UPSTREAM/SKIA_BINARIES_SHA256: not a neovibe checkout's pins.env. Report it at $NV_ISSUES"
+		die "$_fsb_pins names no SKIA_BINARIES_URL_UPSTREAM/SKIA_BINARIES_SHA256: not a eitri checkout's pins.env. Report it at $NV_ISSUES"
 	fi
 	_fsb_name=${_fsb_url##*/}
 	# In test mode, redirected to a fixture server the same way node_dist_base is -- deliberately
 	# never falling back to the real GitHub URL when the override is unset, so a test that forgets
 	# to set it fails fast against a refused loopback port instead of downloading the real archive.
 	if [ "$NV_TEST_MODE" = 1 ]; then
-		_fsb_get=${NEOVIBE_INSTALL_TEST_SKIA_BASE_URL:-http://127.0.0.1:1}/$_fsb_name
+		_fsb_get=${EITRI_INSTALL_TEST_SKIA_BASE_URL:-http://127.0.0.1:1}/$_fsb_name
 	else
 		_fsb_get=$_fsb_url
 	fi
@@ -2695,7 +2693,7 @@ do_from_source() {
 	rev_of_release "$NV_SYSTEM_RELEASE" "$NV_SYSTEM_REMEDY"
 	NV_SYS_REV7=$RR_REV7
 	if [ -f "$NV_LIB/RELEASE" ]; then
-		NV_INSTALLED_VERSION=$(kv_get "$NV_LIB/RELEASE" NEOVIBE_VERSION)
+		NV_INSTALLED_VERSION=$(kv_get "$NV_LIB/RELEASE" EITRI_VERSION)
 		if ! printf '%s\n' "$NV_INSTALLED_VERSION" | grep -Eqx "$NV_VERSION_ERE"; then NV_INSTALLED_VERSION=; fi
 		rev_of_release "$NV_LIB/RELEASE" "remove $NV_LIB (only the program: your settings and state live elsewhere)"
 		NV_OLD_REV7=$RR_REV7
@@ -2718,11 +2716,11 @@ do_from_source() {
 		if [ -n "$NV_INSTALLED_VERSION" ]; then
 			_dfs_c=$(semver_cmp "$NV_VERSION" "$NV_INSTALLED_VERSION")
 			if [ "$_dfs_c" = -1 ] && [ -z "$OPT_VERSION" ]; then
-				die "neovibe $NV_INSTALLED_VERSION is installed, and the release offered is older ($NV_VERSION): refusing to downgrade silently (a stale mirror or a withdrawn release would look like this). To install $NV_VERSION anyway: --version $NV_VERSION"
+				die "eitri $NV_INSTALLED_VERSION is installed, and the release offered is older ($NV_VERSION): refusing to downgrade silently (a stale mirror or a withdrawn release would look like this). To install $NV_VERSION anyway: --version $NV_VERSION"
 			fi
 		fi
 		fetch_verified_release
-		clone_public_neovibe "$NV_VERSION"
+		clone_public_eitri "$NV_VERSION"
 		if [ -n "$OPT_VERDANDI_CHECKOUT" ]; then resolve_verdandi_source; fi
 	fi
 
@@ -2741,7 +2739,7 @@ do_from_source() {
 	mkdir -p -- "$_dfs_skia_workdir" || die "cannot create $_dfs_skia_workdir"
 	fetch_skia_binaries "$_dfs_skia_workdir" "$NV_FROM_SOURCE_DIR/packaging/pins.env"
 
-	say "building neovibe $NV_VERSION from source in $NV_FROM_SOURCE_DIR"
+	say "building eitri $NV_VERSION from source in $NV_FROM_SOURCE_DIR"
 	# from_source_stage reads <src>/target/release. --target-dir overrides CARGO_TARGET_DIR and
 	# the build.target-dir configuration so cargo writes where staging expects. Remove each shipped
 	# binary before building to prevent a skipped build from staging stale binaries under a new RELEASE.
@@ -2769,10 +2767,10 @@ do_from_source() {
 dry_run_new_rev() {
 	NV_NEW_REV7=
 	_dr_text=
-	_dr_top=neovibe-$NV_VERSION-x86_64-linux
+	_dr_top=eitri-$NV_VERSION-x86_64-linux
 	if [ -n "$OPT_TARBALL" ]; then
 		_dr_from="read from $NV_TARBALL_NAME"
-		for _dr_m in "$_dr_top/lib/neovibe/RELEASE" "./$_dr_top/lib/neovibe/RELEASE"; do
+		for _dr_m in "$_dr_top/lib/eitri/RELEASE" "./$_dr_top/lib/eitri/RELEASE"; do
 			_dr_text=$(tar -xzOf "$NV_TARBALL" "$_dr_m" 2>/dev/null) || _dr_text=
 			if [ -n "$_dr_text" ]; then break; fi
 		done
@@ -2808,35 +2806,35 @@ dry_run_new_rev() {
 
 # unpack_new: the verified tarball, unpacked in the cache and checked, becomes $NV_LIB.new.
 unpack_new() {
-	_un_top=$NV_STAGE/neovibe-$NV_VERSION-x86_64-linux
+	_un_top=$NV_STAGE/eitri-$NV_VERSION-x86_64-linux
 	NV_STAGE_TOP=$_un_top
 	if [ "$OPT_DRY_RUN" = 1 ]; then
-		say "would unpack $NV_TARBALL_NAME into $NV_STAGE, check its layout, and copy its lib/neovibe to $NV_LIB.new"
+		say "would unpack $NV_TARBALL_NAME into $NV_STAGE, check its layout, and copy its lib/eitri to $NV_LIB.new"
 		dry_run_new_rev
 		return 0
 	fi
 	mkdir -p -- "$NV_STAGE" || die "cannot create $NV_STAGE"
-	tar -xzf "$NV_TARBALL" -C "$NV_STAGE" || die "could not unpack $NV_TARBALL_NAME: it is not a valid neovibe release. Nothing was changed and your current install is untouched; report it at $NV_ISSUES"
-	for _un_f in bin/neovibe share/applications/neovibe.desktop; do
-		if [ ! -f "$_un_top/$_un_f" ]; then die "$NV_TARBALL_NAME has no $_un_f: it is not a valid neovibe release. Nothing was changed; report it at $NV_ISSUES"; fi
+	tar -xzf "$NV_TARBALL" -C "$NV_STAGE" || die "could not unpack $NV_TARBALL_NAME: it is not a valid eitri release. Nothing was changed and your current install is untouched; report it at $NV_ISSUES"
+	for _un_f in bin/eitri share/applications/eitri.desktop; do
+		if [ ! -f "$_un_top/$_un_f" ]; then die "$NV_TARBALL_NAME has no $_un_f: it is not a valid eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
-	for _un_f in $NV_BINARIES neovibe-setup; do
-		if [ ! -f "$_un_top/lib/neovibe/$_un_f" ] || [ ! -x "$_un_top/lib/neovibe/$_un_f" ]; then
-			die "$NV_TARBALL_NAME has no executable lib/neovibe/$_un_f: it is not a valid neovibe release. Nothing was changed; report it at $NV_ISSUES"
+	for _un_f in $NV_BINARIES eitri-setup; do
+		if [ ! -f "$_un_top/lib/eitri/$_un_f" ] || [ ! -x "$_un_top/lib/eitri/$_un_f" ]; then
+			die "$NV_TARBALL_NAME has no executable lib/eitri/$_un_f: it is not a valid eitri release. Nothing was changed; report it at $NV_ISSUES"
 		fi
 	done
 	for _un_f in $NV_LICENCE_FILES; do
-		if [ ! -f "$_un_top/share/licenses/neovibe/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/licenses/neovibe/$_un_f: it is not a valid neovibe release. Nothing was changed; report it at $NV_ISSUES"; fi
+		if [ ! -f "$_un_top/share/licenses/eitri/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/licenses/eitri/$_un_f: it is not a valid eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
-	if [ ! -f "$_un_top/lib/neovibe/RELEASE" ]; then die "$NV_TARBALL_NAME has no lib/neovibe/RELEASE: it is not a valid neovibe release. Nothing was changed; report it at $NV_ISSUES"; fi
-	parse_release "$_un_top/lib/neovibe/RELEASE"
+	if [ ! -f "$_un_top/lib/eitri/RELEASE" ]; then die "$NV_TARBALL_NAME has no lib/eitri/RELEASE: it is not a valid eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+	parse_release "$_un_top/lib/eitri/RELEASE"
 	if [ "$REL_VERSION" != "$NV_VERSION" ]; then
 		die "$NV_TARBALL_NAME's RELEASE says $REL_VERSION, not $NV_VERSION: refusing. Report it at $NV_ISSUES"
 	fi
 	NV_NEW_REV7=$REL_REV7
 	mkdir -p -- "$NV_LIBROOT" || die "cannot create $NV_LIBROOT"
 	NV_NEW_CREATED=1
-	cp -R -- "$_un_top/lib/neovibe" "$NV_LIB.new" || die "cannot copy the new install to $NV_LIB.new (is the disk full?)"
+	cp -R -- "$_un_top/lib/eitri" "$NV_LIB.new" || die "cannot copy the new install to $NV_LIB.new (is the disk full?)"
 }
 
 # swap_in: move the current install aside, put the staged tree in place, then remove the old tree.
@@ -2861,22 +2859,22 @@ desktop_exec_quote() {
 # escaped) and the licences, each written to a temporary name in its destination directory. This
 # runs before the swap, so a directory that cannot be written stops the run while the old install
 # is still in place and untouched: written after it, an unwritable ~/.local/bin left the new lib
-# with the old launcher and licences, and no neovibe.old to go back to.
+# with the old launcher and licences, and no eitri.old to go back to.
 # commit_files renames them into place after the swap; on_exit removes any left behind.
 stage_files() {
-	NV_TMP_LAUNCHER=$NV_BINDIR/.neovibe.tmp.$$
+	NV_TMP_LAUNCHER=$NV_BINDIR/.eitri.tmp.$$
 	_sf_apps=$NV_DATA/applications
-	_sf_lic=$NV_DATA/licenses/neovibe
-	_sf_exec=$(desktop_exec_quote "$NV_BINDIR/neovibe")
+	_sf_lic=$NV_DATA/licenses/eitri
+	_sf_exec=$(desktop_exec_quote "$NV_BINDIR/eitri")
 	run mkdir -p -- "$NV_BINDIR" "$_sf_apps" "$_sf_lic"
 	if [ "$OPT_DRY_RUN" = 1 ]; then
-		say "would write the launcher $NV_BINDIR/neovibe (from the tarball's bin/neovibe, with the line '$NV_LAUNCHER_MARKER')"
-		say "would write $_sf_apps/neovibe.desktop with Exec=$_sf_exec --quiet %f"
+		say "would write the launcher $NV_BINDIR/eitri (from the tarball's bin/eitri, with the line '$NV_LAUNCHER_MARKER')"
+		say "would write $_sf_apps/eitri.desktop with Exec=$_sf_exec --quiet %f"
 		for _sf_f in $NV_LICENCE_FILES; do say "would write $_sf_lic/$_sf_f"; done
 		return 0
 	fi
 	_sf_keep='nothing installed was changed: make it writable and re-run'
-	cat -- "$NV_STAGE_TOP/bin/neovibe" >"$NV_TMP_LAUNCHER" || die "cannot write $NV_TMP_LAUNCHER; $_sf_keep"
+	cat -- "$NV_STAGE_TOP/bin/eitri" >"$NV_TMP_LAUNCHER" || die "cannot write $NV_TMP_LAUNCHER; $_sf_keep"
 	if ! grep -Fqx -- "$NV_LAUNCHER_MARKER" "$NV_TMP_LAUNCHER"; then
 		# Appended, not inserted: the launcher's --help prints its own doc-comment lines near the
 		# top by a fixed line range, and inserting the marker there would shift it.
@@ -2886,10 +2884,10 @@ stage_files() {
 	NV_EXEC="$_sf_exec --quiet %f" awk '
 		/^Exec=/ { print "Exec=" ENVIRON["NV_EXEC"]; next }
 		/^TryExec=/ { next }
-		{ print }' "$NV_STAGE_TOP/share/applications/neovibe.desktop" >"$_sf_apps/.neovibe.desktop.tmp.$$" ||
-		die "cannot write $_sf_apps/.neovibe.desktop.tmp.$$; $_sf_keep"
+		{ print }' "$NV_STAGE_TOP/share/applications/eitri.desktop" >"$_sf_apps/.eitri.desktop.tmp.$$" ||
+		die "cannot write $_sf_apps/.eitri.desktop.tmp.$$; $_sf_keep"
 	for _sf_f in $NV_LICENCE_FILES; do
-		cp -- "$NV_STAGE_TOP/share/licenses/neovibe/$_sf_f" "$_sf_lic/.$_sf_f.tmp.$$" ||
+		cp -- "$NV_STAGE_TOP/share/licenses/eitri/$_sf_f" "$_sf_lic/.$_sf_f.tmp.$$" ||
 			die "cannot write $_sf_lic/.$_sf_f.tmp.$$; $_sf_keep"
 	done
 }
@@ -2898,7 +2896,7 @@ stage_files() {
 # $NV_LIB are written to temporary names, chmodded, then moved. A launcher with neither the
 # installer marker nor the old root install.sh signature is moved aside before replacement.
 commit_files() {
-	_cf_dst=$NV_BINDIR/neovibe
+	_cf_dst=$NV_BINDIR/eitri
 	if [ -L "$_cf_dst" ] || [ -e "$_cf_dst" ]; then
 		_cf_ours=0
 		if [ ! -L "$_cf_dst" ] && [ -f "$_cf_dst" ]; then
@@ -2907,7 +2905,7 @@ commit_files() {
 			if [ "$_cf_l2" = "$NV_OLD_LAUNCHER_LINE2" ]; then _cf_ours=1; fi
 		fi
 		if [ "$_cf_ours" = 0 ]; then
-			_cf_bak=$NV_BINDIR/neovibe.bak-$(date +%Y%m%d-%H%M%S)
+			_cf_bak=$NV_BINDIR/eitri.bak-$(date +%Y%m%d-%H%M%S)
 			if [ -e "$_cf_bak" ] || [ -L "$_cf_bak" ]; then _cf_bak=$_cf_bak-$$; fi
 			warn "$_cf_dst was not installed by this installer, so it is moved to $_cf_bak rather than overwritten; delete it once you no longer need it"
 			run mv -- "$_cf_dst" "$_cf_bak"
@@ -2916,13 +2914,13 @@ commit_files() {
 	if [ "$OPT_DRY_RUN" = 1 ]; then return 0; fi
 	# The new lib is in place from here on: a failure leaves the install unfinished, and a re-run
 	# finishes it (install_complete keeps it from saying "up to date" instead).
-	_cf_fin="neovibe $NV_VERSION is in $NV_LIB but not finished: fix this and re-run the installer to finish it"
+	_cf_fin="eitri $NV_VERSION is in $NV_LIB but not finished: fix this and re-run the installer to finish it"
 	mv -- "$NV_TMP_LAUNCHER" "$_cf_dst" || die "cannot move the launcher into $_cf_dst; $_cf_fin"
-	mv -- "$NV_DATA/applications/.neovibe.desktop.tmp.$$" "$NV_DATA/applications/neovibe.desktop" ||
-		die "cannot write $NV_DATA/applications/neovibe.desktop; $_cf_fin"
+	mv -- "$NV_DATA/applications/.eitri.desktop.tmp.$$" "$NV_DATA/applications/eitri.desktop" ||
+		die "cannot write $NV_DATA/applications/eitri.desktop; $_cf_fin"
 	for _cf_f in $NV_LICENCE_FILES; do
-		mv -- "$NV_DATA/licenses/neovibe/.$_cf_f.tmp.$$" "$NV_DATA/licenses/neovibe/$_cf_f" ||
-			die "cannot write $NV_DATA/licenses/neovibe/$_cf_f; $_cf_fin"
+		mv -- "$NV_DATA/licenses/eitri/.$_cf_f.tmp.$$" "$NV_DATA/licenses/eitri/$_cf_f" ||
+			die "cannot write $NV_DATA/licenses/eitri/$_cf_f; $_cf_fin"
 	done
 	# Written last, deliberately: an interrupt or a failed mv anywhere above
 	# leaves this stamp naming an OLDER version (or missing outright, on a first install), so
@@ -2930,10 +2928,10 @@ commit_files() {
 	# individual file it checks (the launcher, the desktop entry, the three licence files) can
 	# already exist, from a previous, complete install of a *different* version, and would
 	# otherwise pass every one of its existence checks on its own.
-	printf '%s\n' "$NV_VERSION" >"$NV_DATA/licenses/neovibe/.installed-version.tmp.$$" ||
-		die "cannot write $NV_DATA/licenses/neovibe/.installed-version.tmp.$$; $_cf_fin"
-	mv -- "$NV_DATA/licenses/neovibe/.installed-version.tmp.$$" "$NV_DATA/licenses/neovibe/.installed-version" ||
-		die "cannot write $NV_DATA/licenses/neovibe/.installed-version; $_cf_fin"
+	printf '%s\n' "$NV_VERSION" >"$NV_DATA/licenses/eitri/.installed-version.tmp.$$" ||
+		die "cannot write $NV_DATA/licenses/eitri/.installed-version.tmp.$$; $_cf_fin"
+	mv -- "$NV_DATA/licenses/eitri/.installed-version.tmp.$$" "$NV_DATA/licenses/eitri/.installed-version" ||
+		die "cannot write $NV_DATA/licenses/eitri/.installed-version; $_cf_fin"
 }
 
 # install_complete: NV_COMPLETE=1 when everything a finished install writes outside $NV_LIB is in
@@ -2947,13 +2945,13 @@ commit_files() {
 # stale files (notably SOURCE, which names a specific release) were never replaced.
 install_complete() {
 	NV_COMPLETE=0
-	if [ -L "$NV_BINDIR/neovibe" ] || [ ! -f "$NV_BINDIR/neovibe" ]; then return 0; fi
-	if ! grep -Fqx -- "$NV_LAUNCHER_MARKER" "$NV_BINDIR/neovibe"; then return 0; fi
-	if [ ! -f "$NV_DATA/applications/neovibe.desktop" ]; then return 0; fi
+	if [ -L "$NV_BINDIR/eitri" ] || [ ! -f "$NV_BINDIR/eitri" ]; then return 0; fi
+	if ! grep -Fqx -- "$NV_LAUNCHER_MARKER" "$NV_BINDIR/eitri"; then return 0; fi
+	if [ ! -f "$NV_DATA/applications/eitri.desktop" ]; then return 0; fi
 	for _ic_f in $NV_LICENCE_FILES; do
-		if [ ! -f "$NV_DATA/licenses/neovibe/$_ic_f" ]; then return 0; fi
+		if [ ! -f "$NV_DATA/licenses/eitri/$_ic_f" ]; then return 0; fi
 	done
-	_ic_stamp=$(cat -- "$NV_DATA/licenses/neovibe/.installed-version" 2>/dev/null) || _ic_stamp=
+	_ic_stamp=$(cat -- "$NV_DATA/licenses/eitri/.installed-version" 2>/dev/null) || _ic_stamp=
 	if [ "$_ic_stamp" != "$NV_VERSION" ]; then return 0; fi
 	NV_COMPLETE=1
 }
@@ -2968,13 +2966,13 @@ prune_sidecars() {
 	# user, in their own $XDG_DATA_HOME -- nothing this installer would make) used to be followed
 	# with no check at all, so a 7-hex-named directory BEHIND the link -- a user's own, unrelated
 	# directory that merely happens to be named like a short git sha -- was removed as if it were
-	# one of neovibe's own sidecars. The same rule $NV_DATA/neovibe already holds in do_uninstall:
+	# one of eitri's own sidecars. The same rule $NV_DATA/eitri already holds in do_uninstall:
 	# a link is fine as long as it leads to a real directory actually named "sidecar".
 	_ps_real=$(cd -P -- "$NV_SIDECAR_ROOT" 2>/dev/null && pwd -P) || _ps_real=
 	case $_ps_real in
 	*/sidecar) ;;
 	*)
-		warn "$NV_SIDECAR_ROOT leads to ${_ps_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what neovibe put there yourself if you no longer need it"
+		warn "$NV_SIDECAR_ROOT leads to ${_ps_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what eitri put there yourself if you no longer need it"
 		return 0
 		;;
 	esac
@@ -2990,13 +2988,13 @@ prune_sidecars() {
 			# Only a dry run that could not read the new RELEASE gets here (dry_run_new_rev).
 			say "removing the sidecar for verdandi $_pr_n, unless the new release uses it (this dry run could not tell)"
 		else
-			say "removing the sidecar for verdandi $_pr_n: no installed neovibe uses it"
+			say "removing the sidecar for verdandi $_pr_n: no installed eitri uses it"
 		fi
 		run rm -rf -- "$_pr_d"
 	done
 }
 
-# path_warning: which `neovibe` this PATH runs (the old install.sh's /usr/bin warning, generalised).
+# path_warning: which `eitri` this PATH runs (the old install.sh's /usr/bin warning, generalised).
 path_warning() {
 	_pw_first=
 	_pw_ifs=$IFS
@@ -3005,17 +3003,17 @@ path_warning() {
 	for _pw_d in $PATH; do
 		_pw_d=${_pw_d%/}
 		case $_pw_d in /*) ;; *) continue ;; esac
-		if [ -f "$_pw_d/neovibe" ] && [ -x "$_pw_d/neovibe" ]; then
-			_pw_first=$_pw_d/neovibe
+		if [ -f "$_pw_d/eitri" ] && [ -x "$_pw_d/eitri" ]; then
+			_pw_first=$_pw_d/eitri
 			break
 		fi
 	done
 	set +f
 	IFS=$_pw_ifs
 	if [ -z "$_pw_first" ]; then
-		warn "$NV_BINDIR is not on your PATH: add it (in your shell's profile: export PATH=\"\$HOME/.local/bin:\$PATH\"), or run $NV_BINDIR/neovibe"
-	elif [ "$_pw_first" != "$NV_BINDIR/neovibe" ]; then
-		warn "\`neovibe\` on this PATH runs $_pw_first, not the one just installed: put $NV_BINDIR before ${_pw_first%/neovibe} in PATH, remove the other install, or run $NV_BINDIR/neovibe"
+		warn "$NV_BINDIR is not on your PATH: add it (in your shell's profile: export PATH=\"\$HOME/.local/bin:\$PATH\"), or run $NV_BINDIR/eitri"
+	elif [ "$_pw_first" != "$NV_BINDIR/eitri" ]; then
+		warn "\`eitri\` on this PATH runs $_pw_first, not the one just installed: put $NV_BINDIR before ${_pw_first%/eitri} in PATH, remove the other install, or run $NV_BINDIR/eitri"
 	fi
 }
 
@@ -3041,7 +3039,7 @@ do_install() {
 	NV_INSTALLED_VERSION=
 	NV_OLD_REV7=
 	if [ -f "$NV_LIB/RELEASE" ]; then
-		NV_INSTALLED_VERSION=$(kv_get "$NV_LIB/RELEASE" NEOVIBE_VERSION)
+		NV_INSTALLED_VERSION=$(kv_get "$NV_LIB/RELEASE" EITRI_VERSION)
 		if ! printf '%s\n' "$NV_INSTALLED_VERSION" | grep -Eqx "$NV_VERSION_ERE"; then NV_INSTALLED_VERSION=; fi
 		rev_of_release "$NV_LIB/RELEASE" "remove $NV_LIB (only the program: your settings and state live elsewhere)"
 		NV_OLD_REV7=$RR_REV7
@@ -3053,19 +3051,19 @@ do_install() {
 	if [ -n "$NV_INSTALLED_VERSION" ]; then
 		_di_c=$(semver_cmp "$NV_VERSION" "$NV_INSTALLED_VERSION")
 		if [ "$_di_c" = -1 ] && [ -z "$OPT_VERSION" ]; then
-			die "neovibe $NV_INSTALLED_VERSION is installed, and the release offered is older ($NV_VERSION): refusing to downgrade silently (a stale mirror or a withdrawn release would look like this). To install $NV_VERSION anyway: --version $NV_VERSION"
+			die "eitri $NV_INSTALLED_VERSION is installed, and the release offered is older ($NV_VERSION): refusing to downgrade silently (a stale mirror or a withdrawn release would look like this). To install $NV_VERSION anyway: --version $NV_VERSION"
 		fi
 		if [ "$_di_c" = 0 ]; then
 			sidecar_state "$NV_OLD_REV7"
 			install_complete
 			if [ "$NV_SIDECAR_PRESENT" = 1 ] && [ "$NV_COMPLETE" = 1 ]; then
-				say "neovibe $NV_VERSION is up to date"
+				say "eitri $NV_VERSION is up to date"
 				# this branch used to `return 0`
 				# straight after, so re-running the same installer with --with-nvim/--yes after a
 				# --no-nvim install (or simply once an adequate nvim's absence is noticed, or
 				# network access to github.com came back) fetched nothing and said nothing --
 				# do_nvim_offer already runs exactly this offer standalone (what plain
-				# `neovibe setup`'s own second call does); the same offer now runs here too,
+				# `eitri setup`'s own second call does); the same offer now runs here too,
 				# before the early return, from the already-read $NV_LIB/RELEASE (the installed
 				# version and the one just offered are the same version here, so it is the right
 				# RELEASE to read REL_NVIM_VERSION from).
@@ -3088,7 +3086,7 @@ do_install() {
 				return 0
 			fi
 			if [ "$NV_COMPLETE" != 1 ]; then
-				say "neovibe $NV_VERSION is installed but not finished (its launcher, desktop entry or licences are missing): installing it again"
+				say "eitri $NV_VERSION is installed but not finished (its launcher, desktop entry or licences are missing): installing it again"
 			fi
 		fi
 	fi
@@ -3112,7 +3110,7 @@ do_install() {
 		download_verified "$NV_TARBALL_NAME"
 		NV_TARBALL=$NV_DL/$NV_TARBALL_NAME
 	fi
-	say "installing neovibe $NV_VERSION${NV_INSTALLED_VERSION:+ (replacing $NV_INSTALLED_VERSION)}"
+	say "installing eitri $NV_VERSION${NV_INSTALLED_VERSION:+ (replacing $NV_INSTALLED_VERSION)}"
 	unpack_new
 	if [ "$OPT_DRY_RUN" != 1 ]; then use_verdandi_source_beside_tarball; fi
 	finish_install
@@ -3155,45 +3153,45 @@ do_uninstall() {
 	# string and split again, which once let a newline in an XDG variable name any directory in
 	# $HOME.
 	set -- "$NV_LIB" "$NV_LIB.new" "$NV_LIB.old"
-	if [ -L "$NV_BINDIR/neovibe" ] || [ -e "$NV_BINDIR/neovibe" ]; then
-		if [ ! -L "$NV_BINDIR/neovibe" ] && [ -f "$NV_BINDIR/neovibe" ] && grep -Fqx -- "$NV_LAUNCHER_MARKER" "$NV_BINDIR/neovibe"; then
-			set -- "$@" "$NV_BINDIR/neovibe"
+	if [ -L "$NV_BINDIR/eitri" ] || [ -e "$NV_BINDIR/eitri" ]; then
+		if [ ! -L "$NV_BINDIR/eitri" ] && [ -f "$NV_BINDIR/eitri" ] && grep -Fqx -- "$NV_LAUNCHER_MARKER" "$NV_BINDIR/eitri"; then
+			set -- "$@" "$NV_BINDIR/eitri"
 		else
-			_du_launcher_note="$NV_BINDIR/neovibe was left alone: it was not installed by this installer (no '$NV_LAUNCHER_MARKER' line)"
+			_du_launcher_note="$NV_BINDIR/eitri was left alone: it was not installed by this installer (no '$NV_LAUNCHER_MARKER' line)"
 		fi
 	fi
-	set -- "$@" "$NV_DATA/applications/neovibe.desktop" "$NV_DATA/licenses/neovibe"
+	set -- "$@" "$NV_DATA/applications/eitri.desktop" "$NV_DATA/licenses/eitri"
 	# Remove nvim and sidecars only when the resolved data directory has the expected basename.
 	# Follow links to allow a data directory moved to another disk, but leave the contents untouched
 	# if a link resolves to a directory with a different name.
 	_du_ours=1
-	if [ -d "$NV_DATA/neovibe" ]; then
-		_du_real=$(cd -P -- "$NV_DATA/neovibe" 2>/dev/null && pwd -P) || _du_real=
+	if [ -d "$NV_DATA/eitri" ]; then
+		_du_real=$(cd -P -- "$NV_DATA/eitri" 2>/dev/null && pwd -P) || _du_real=
 		case $_du_real in
-		*/neovibe) ;;
+		*/eitri) ;;
 		*)
 			_du_ours=0
-			_du_link_note="$NV_DATA/neovibe leads to ${_du_real:-a directory that cannot be entered}, not to a directory named neovibe, so nothing under it (an nvim, sidecars) was removed: this installer never made that link. Remove what neovibe put there yourself if you no longer need it"
+			_du_link_note="$NV_DATA/eitri leads to ${_du_real:-a directory that cannot be entered}, not to a directory named eitri, so nothing under it (an nvim, sidecars) was removed: this installer never made that link. Remove what eitri put there yourself if you no longer need it"
 			;;
 		esac
 	fi
 	if [ "$_du_ours" = 1 ]; then
 		# The AppArmor profile apparmor_note wrote goes too; the copy installed under
 		# /etc/apparmor.d is root's, and the note below says how to remove it.
-		set -- "$@" "$NV_DATA/neovibe/nvim" "$NV_DATA/neovibe/apparmor"
+		set -- "$@" "$NV_DATA/eitri/nvim" "$NV_DATA/eitri/apparmor"
 		# the check just above only ever verified
-		# $NV_DATA/neovibe itself, not $NV_SIDECAR_ROOT (its own "sidecar" subdirectory) -- a
+		# $NV_DATA/eitri itself, not $NV_SIDECAR_ROOT (its own "sidecar" subdirectory) -- a
 		# symlinked sidecar root, planted by the user in their own $XDG_DATA_HOME, was followed
 		# with no check at all, so a 7-hex-named directory BEHIND the link (a user's own,
 		# unrelated directory merely named like a short git sha) was removed as if it were one of
-		# neovibe's own sidecars. Same rule, same shape: a link is fine as long as it leads to a
+		# eitri's own sidecars. Same rule, same shape: a link is fine as long as it leads to a
 		# real directory actually named "sidecar".
 		_du_sidecar_ours=0
 		if [ -d "$NV_SIDECAR_ROOT" ]; then
 			_du_sidecar_real=$(cd -P -- "$NV_SIDECAR_ROOT" 2>/dev/null && pwd -P) || _du_sidecar_real=
 			case $_du_sidecar_real in
 			*/sidecar) _du_sidecar_ours=1 ;;
-			*) _du_sidecar_link_note="$NV_SIDECAR_ROOT leads to ${_du_sidecar_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what neovibe put there yourself if you no longer need it" ;;
+			*) _du_sidecar_link_note="$NV_SIDECAR_ROOT leads to ${_du_sidecar_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what eitri put there yourself if you no longer need it" ;;
 			esac
 		fi
 		if [ "$_du_sidecar_ours" = 1 ]; then
@@ -3224,7 +3222,7 @@ do_uninstall() {
 		# Purge only the shell's fallback config directory and the state directory.
 		# The config override may point at another program's config, and the shell does not read
 		# XDG_CONFIG_HOME.
-		set -- "$@" "$NV_HOME/.config/neovibe" "$NV_STATE/neovibe"
+		set -- "$@" "$NV_HOME/.config/eitri" "$NV_STATE/eitri"
 	fi
 
 	# Only what exists is removed, so only what exists is checked: a path not there needs nothing,
@@ -3247,7 +3245,7 @@ do_uninstall() {
 		if [ "$_du_ok" != 1 ]; then _du_bad="$_du_bad '$_du_p'"; fi
 	done
 	if [ -n "$_du_bad" ]; then
-		die "refusing to uninstall: these paths are not inside $NV_HOME, and this installer only removes paths inside it:$_du_bad. Nothing was removed. They are neovibe's own: remove them yourself if you no longer need them, then re-run to remove the rest"
+		die "refusing to uninstall: these paths are not inside $NV_HOME, and this installer only removes paths inside it:$_du_bad. Nothing was removed. They are eitri's own: remove them yourself if you no longer need them, then re-run to remove the rest"
 	fi
 	acquire_lock
 
@@ -3262,7 +3260,7 @@ do_uninstall() {
 	done
 	if [ "$OPT_DRY_RUN" != 1 ]; then
 		if [ "$_du_ours" = 1 ]; then
-			for _du_p in "$NV_SIDECAR_ROOT" "$NV_DATA/neovibe"; do
+			for _du_p in "$NV_SIDECAR_ROOT" "$NV_DATA/eitri"; do
 				if [ -d "$_du_p" ]; then rmdir -- "$_du_p" 2>/dev/null || :; fi
 			done
 		fi
@@ -3274,19 +3272,19 @@ do_uninstall() {
 	# A profile this install's steps put under /etc/apparmor.d stays (this installer never runs
 	# sudo): it names a path nothing runs from any more, and removing it takes root.
 	_du_uid=$(id -u 2>/dev/null) || _du_uid=
-	if [ -n "$_du_uid" ] && [ -f "$NV_APPARMOR_D/neovibe-user-$_du_uid" ]; then
-		_du_aa=$(sh_quote "$NV_APPARMOR_D/neovibe-user-$_du_uid")
-		say "the AppArmor profile $NV_APPARMOR_D/neovibe-user-$_du_uid stays: remove it with: sudo apparmor_parser -R $_du_aa && sudo rm $_du_aa"
+	if [ -n "$_du_uid" ] && [ -f "$NV_APPARMOR_D/eitri-user-$_du_uid" ]; then
+		_du_aa=$(sh_quote "$NV_APPARMOR_D/eitri-user-$_du_uid")
+		say "the AppArmor profile $NV_APPARMOR_D/eitri-user-$_du_uid stays: remove it with: sudo apparmor_parser -R $_du_aa && sudo rm $_du_aa"
 	fi
 	if [ "$OPT_DRY_RUN" = 1 ]; then
 		say "dry run: nothing was changed"
 	elif [ "$_du_n" = 0 ]; then
-		say "nothing to remove: neovibe is not installed here"
+		say "nothing to remove: eitri is not installed here"
 	else
-		say "neovibe is uninstalled"
+		say "eitri is uninstalled"
 	fi
 	if [ "$OPT_PURGE" != 1 ]; then
-		say "kept your settings ($NV_HOME/.config/neovibe) and state ($NV_STATE/neovibe); --uninstall --purge removes them too"
+		say "kept your settings ($NV_HOME/.config/eitri) and state ($NV_STATE/eitri); --uninstall --purge removes them too"
 	fi
 }
 

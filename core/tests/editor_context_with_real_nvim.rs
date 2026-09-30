@@ -10,11 +10,11 @@
 //! running nvim catches those, and the no-selection arm below is a case measured to be actively
 //! dangerous -- `getregion` answers a plausible one-character region rather than erroring.
 //!
-//! Run: `cargo test -p neovibe-core --test editor_context_with_real_nvim -- --ignored`
+//! Run: `cargo test -p eitri-core --test editor_context_with_real_nvim -- --ignored`
 
-use neovibe_core::editor_context::compose::{compose_turn_text, TRUNCATION_MARKER};
-use neovibe_core::editor_context::feed::{EditorContextFeed, EditorContextReader};
-use neovibe_core::editor_context::EditorContext;
+use eitri_core::editor_context::compose::{compose_turn_text, TRUNCATION_MARKER};
+use eitri_core::editor_context::feed::{EditorContextFeed, EditorContextReader};
+use eitri_core::editor_context::EditorContext;
 
 /// Opens `file`, runs `normal_command`, and returns whatever the snippet sent.
 ///

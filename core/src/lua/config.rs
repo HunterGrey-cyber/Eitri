@@ -1,4 +1,4 @@
-//! `neovibe.config.get(key)` / `neovibe.config.set(key, value)`.
+//! `eitri.config.get(key)` / `eitri.config.set(key, value)`.
 //!
 //! v1 scope, deliberately minimal: in-memory only (nothing persists across a restart), and
 //! values are strings only (no numbers/booleans/tables). The spec left config persistence and
@@ -21,7 +21,7 @@ pub struct ConfigStore {
 impl ConfigStore {
     /// Reads a key from Rust. Added 2026-09-21 for `agent.account`: `init.lua` is where the host
     /// is configured, and the host has to be able to read what it was configured with. This is the
-    /// same store `neovibe.config.get` reads, not a parallel one -- a plugin and the shell see one
+    /// same store `eitri.config.get` reads, not a parallel one -- a plugin and the shell see one
     /// value for one key, which is the only arrangement that cannot drift.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(String::as_str)
@@ -29,7 +29,7 @@ impl ConfigStore {
 }
 
 /// `pub`: `LuaEngine::new` calls this.
-pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<ConfigStore>>) -> mlua::Result<()> {
+pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlua::Result<()> {
     let config_table = lua.create_table()?;
 
     let store_for_get = store.clone();
@@ -48,7 +48,7 @@ pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<ConfigStore>>) -> m
 
     config_table.set("get", get_fn)?;
     config_table.set("set", set_fn)?;
-    neovibe.set("config", config_table)?;
+    eitri.set("config", config_table)?;
     Ok(())
 }
 
@@ -59,25 +59,25 @@ mod tests {
     #[test]
     fn set_then_get_roundtrips_through_real_lua() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let store = Rc::new(RefCell::new(ConfigStore::default()));
-        install(&lua, &neovibe, store).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, store).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
-        lua.load(r#"neovibe.config.set("greeting", "hello")"#).exec().unwrap();
-        let value: String = lua.load(r#"return neovibe.config.get("greeting")"#).eval().unwrap();
+        lua.load(r#"eitri.config.set("greeting", "hello")"#).exec().unwrap();
+        let value: String = lua.load(r#"return eitri.config.get("greeting")"#).eval().unwrap();
         assert_eq!(value, "hello");
     }
 
     #[test]
     fn what_init_lua_set_is_readable_from_rust_through_the_same_store() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let store = Rc::new(RefCell::new(ConfigStore::default()));
-        install(&lua, &neovibe, store.clone()).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
-        lua.load(r#"neovibe.config.set("agent.account", "work")"#)
+        lua.load(r#"eitri.config.set("agent.account", "work")"#)
             .exec()
             .unwrap();
         assert_eq!(store.borrow().get("agent.account"), Some("work"));
@@ -87,13 +87,13 @@ mod tests {
     #[test]
     fn get_of_unset_key_returns_nil() {
         let lua = Lua::new();
-        let neovibe = lua.create_table().unwrap();
+        let eitri = lua.create_table().unwrap();
         let store = Rc::new(RefCell::new(ConfigStore::default()));
-        install(&lua, &neovibe, store).unwrap();
-        lua.globals().set("neovibe", neovibe).unwrap();
+        install(&lua, &eitri, store).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
 
         let is_nil: bool = lua
-            .load(r#"return neovibe.config.get("never_set") == nil"#)
+            .load(r#"return eitri.config.get("never_set") == nil"#)
             .eval()
             .unwrap();
         assert!(is_nil);

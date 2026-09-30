@@ -185,23 +185,23 @@ def _contents_by_dst(doc):
 # --- the four binaries every release ships (no agent-hook anywhere) ------------------------
 
 RELEASE_BINARY_DSTS = {
-    "/usr/lib/neovibe/shell",
-    "/usr/lib/neovibe/neovibe-supervisor",
-    "/usr/lib/neovibe/neovibe-tmux-shim",
-    "/usr/lib/neovibe/neovibe-claude-handoff",
+    "/usr/lib/eitri/shell",
+    "/usr/lib/eitri/eitri-supervisor",
+    "/usr/lib/eitri/eitri-tmux-shim",
+    "/usr/lib/eitri/eitri-claude-handoff",
 }
 
 # Only the private profile includes the sidecar binary and the .rev file that identifies
 # the source revision used to build it.
 PRIVATE_ONLY_DSTS = {
-    "/usr/lib/neovibe/verdandi-claude-sidecar",
-    "/usr/lib/neovibe/verdandi-claude-sidecar.rev",
+    "/usr/lib/eitri/verdandi-claude-sidecar",
+    "/usr/lib/eitri/verdandi-claude-sidecar.rev",
 }
 
 # Only the public profile includes the installer used by the setup subcommand.
 # The private profile has no installer entry.
 PUBLIC_ONLY_DSTS = {
-    "/usr/lib/neovibe/neovibe-setup",
+    "/usr/lib/eitri/eitri-setup",
 }
 
 
@@ -280,17 +280,17 @@ class NeitherProfileNamesAgentHook(unittest.TestCase):
 class ReleaseAndSourceAreInBoth(unittest.TestCase):
     def test_release_is_in_both_at_mode_0644(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
-            entry = _contents_by_dst(_load_yaml(path))["/usr/lib/neovibe/RELEASE"]
+            entry = _contents_by_dst(_load_yaml(path))["/usr/lib/eitri/RELEASE"]
             self.assertEqual(entry.get("file_info", {}).get("mode"), 0o644, (path, entry))
 
     def test_source_is_in_both(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
-            self.assertIn("/usr/share/licenses/neovibe/SOURCE", _contents_by_dst(_load_yaml(path)))
+            self.assertIn("/usr/share/licenses/eitri/SOURCE", _contents_by_dst(_load_yaml(path)))
 
 
 class TheTwoProfilesDifferOnlyInTheAllowedKeys(unittest.TestCase):
     """The profiles may differ only in "the sidecar
-    entry and its `.rev`; `neovibe-setup`; the dependency blocks; the licence and description
+    entry and its `.rev`; `eitri-setup`; the dependency blocks; the licence and description
     fields; maintainer/homepage." `version_schema` is a `nfpm-public.yaml`-only addition for
     prerelease ordering, which the private profile may adopt later
     as well; until then it is an allowed
@@ -336,13 +336,13 @@ class TheTwoProfilesDifferOnlyInTheAllowedKeys(unittest.TestCase):
             public["maintainer"],
             "Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>",
         )
-        self.assertEqual(public["homepage"], "https://github.com/HunterGrey-cyber/neovibe")
+        self.assertEqual(public["homepage"], "https://github.com/HunterGrey-cyber/eitri")
 
     def test_both_descriptions_end_with_the_source_url_placeholder(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
             description = _load_yaml(path)["description"]
             last_line = [line for line in description.splitlines() if line.strip()][-1]
-            self.assertIn("${NEOVIBE_SOURCE_URL}", last_line, (path, last_line))
+            self.assertIn("${EITRI_SOURCE_URL}", last_line, (path, last_line))
 
 
 # Package descriptions appear in apt, dnf and pacman output.
@@ -362,13 +362,13 @@ class DescriptionsCiteNoInternalRulingOrSpec(unittest.TestCase):
 
 # --- the AppArmor profile, .deb only ---
 
-APPARMOR_DST = "/etc/apparmor.d/neovibe"
-APPARMOR_SRC = "./packaging/apparmor/neovibe"
+APPARMOR_DST = "/etc/apparmor.d/eitri"
+APPARMOR_SRC = "./packaging/apparmor/eitri"
 
 
 class TheDebCarriesTheAppArmorProfile(unittest.TestCase):
     """Ubuntu 23.10+ lets WebKit's bwrap sandbox start only under an AppArmor profile granting
-    `userns`. Both profiles ship packaging/apparmor/neovibe to the .deb alone, as a conffile, and
+    `userns`. Both profiles ship packaging/apparmor/eitri to the .deb alone, as a conffile, and
     nothing loads it (no maintainer script)."""
 
     def test_both_profiles_ship_it_to_the_deb_only_as_a_conffile(self):
@@ -397,7 +397,7 @@ def _nfpm_tools_missing():
 @unittest.skipIf(_nfpm_tools_missing(), f"needs nfpm, dpkg-deb, rpm and bsdtar: missing {_nfpm_tools_missing()}")
 class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
     """Built for real with this host's nfpm from both profiles, over a stand-in for every other
-    file and the real packaging/apparmor/neovibe, then read back with the tools a user has: the
+    file and the real packaging/apparmor/eitri, then read back with the tools a user has: the
     .deb carries the profile, byte for byte, listed as a conffile, with no maintainer script; the
     .rpm (public) and the pacman package (private) carry none."""
 
@@ -407,7 +407,7 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
         import subprocess
         import tempfile
 
-        root = os.path.join(os.path.expanduser("~"), ".cache", "neovibe-test-nfpm-profiles")
+        root = os.path.join(os.path.expanduser("~"), ".cache", "eitri-test-nfpm-profiles")
         os.makedirs(root, exist_ok=True)
         cls.work = tempfile.mkdtemp(dir=root)
         cls.addClassCleanup(shutil.rmtree, cls.work, ignore_errors=True)
@@ -422,11 +422,11 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
                 src = os.path.join(stage, entry["src"])
                 os.makedirs(os.path.dirname(src), exist_ok=True)
                 if entry["src"] == APPARMOR_SRC:
-                    shutil.copyfile(os.path.join(_HERE, "apparmor", "neovibe"), src)
+                    shutil.copyfile(os.path.join(_HERE, "apparmor", "eitri"), src)
                 else:
                     with open(src, "w") as f:
                         f.write(f"stand-in for {entry['src']}\n")
-            env = {**os.environ, "VERSION": "1.0.0-rc.1", "NEOVIBE_SOURCE_URL": "https://example.com/source"}
+            env = {**os.environ, "VERSION": "1.0.0-rc.1", "EITRI_SOURCE_URL": "https://example.com/source"}
             for packager in packagers:
                 out = os.path.join(cls.work, f"{label}.{packager}")
                 cls.sh(["nfpm", "pkg", "--config", path, "--packager", packager, "--target", out],
@@ -442,11 +442,11 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
         return x, control
 
     def test_the_debs_carry_the_profile_as_a_conffile_and_no_maintainer_script(self):
-        with open(os.path.join(_HERE, "apparmor", "neovibe"), "rb") as f:
+        with open(os.path.join(_HERE, "apparmor", "eitri"), "rb") as f:
             shipped = f.read()
         for label in ("public", "private"):
             x, control = self._deb(label)
-            with open(os.path.join(x, "etc", "apparmor.d", "neovibe"), "rb") as f:
+            with open(os.path.join(x, "etc", "apparmor.d", "eitri"), "rb") as f:
                 self.assertEqual(f.read(), shipped, label)
             with open(os.path.join(control, "conffiles")) as f:
                 self.assertIn(APPARMOR_DST, f.read().split(), label)
@@ -456,10 +456,10 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
     def test_the_rpm_and_the_pacman_package_carry_none(self):
         rpm_files = self.sh(["rpm", "-qlp", self.built[("public", "rpm")]], text=True).stdout.split()
         self.assertNotIn(APPARMOR_DST, rpm_files)
-        self.assertIn("/usr/lib/neovibe/shell", rpm_files)
+        self.assertIn("/usr/lib/eitri/shell", rpm_files)
         pacman_files = self.sh(["bsdtar", "-tf", self.built[("private", "archlinux")]], text=True).stdout.split()
         self.assertNotIn(APPARMOR_DST.lstrip("/"), pacman_files)
-        self.assertIn("usr/lib/neovibe/shell", pacman_files)
+        self.assertIn("usr/lib/eitri/shell", pacman_files)
 
 
 if __name__ == "__main__":

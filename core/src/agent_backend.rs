@@ -14,7 +14,7 @@
 //! path's state is authoritative because it comes from the server. This enum keeps both callable
 //! from one place without pretending they are the same thing.
 //!
-//! Selected by `NEOVIBE_AGENT_BACKEND=legacy|sidecar`, defaulting to `legacy` until the sidecar
+//! Selected by `EITRI_AGENT_BACKEND=legacy|sidecar`, defaulting to `legacy` until the sidecar
 //! path clears its acceptance criteria.
 
 use agent::{
@@ -115,7 +115,7 @@ impl BackendKind {
     /// [`choose`]: Self::choose
     pub fn from_env(legacy_flag: bool) -> Result<Self, BackendChoiceError> {
         Self::choose(
-            std::env::var("NEOVIBE_AGENT_BACKEND").ok().as_deref().map(str::trim),
+            std::env::var("EITRI_AGENT_BACKEND").ok().as_deref().map(str::trim),
             legacy_flag,
             agent::sidecar_availability(),
             agent::LEGACY_BACKEND_COMPILED,
@@ -146,11 +146,11 @@ impl BackendKind {
             }
             // The flag is the more explicit act -- a decision made on this command line -- so it
             // wins the naming when both are somehow given at once (e.g. a launcher's leftover
-            // `NEOVIBE_AGENT_BACKEND=legacy` plus a freshly typed `--legacy`).
+            // `EITRI_AGENT_BACKEND=legacy` plus a freshly typed `--legacy`).
             let asked_via = if legacy_flag {
                 "--legacy"
             } else {
-                "NEOVIBE_AGENT_BACKEND=legacy"
+                "EITRI_AGENT_BACKEND=legacy"
             };
             return Err(BackendChoiceError {
                 message: format!("{asked_via}: {}", agent::LEGACY_NOT_IN_BUILD),
@@ -162,7 +162,7 @@ impl BackendKind {
         if let Some(other) = explicit {
             if other != "sidecar" && !other.is_empty() {
                 eprintln!(
-                    "[agent_backend] NEOVIBE_AGENT_BACKEND={other:?} is not recognized \
+                    "[agent_backend] EITRI_AGENT_BACKEND={other:?} is not recognized \
                      (expected \"legacy\" or \"sidecar\"); using sidecar"
                 );
             }
@@ -174,13 +174,13 @@ impl BackendKind {
             ),
             // Development only: naming a checkout is what authorizes the build (spawn step 2).
             agent::SidecarAvailability::BuildsNamedCheckout => eprintln!(
-                "[agent_backend] using the sidecar backend: NEOVIBE_VERDANDI_CHECKOUT names a \
+                "[agent_backend] using the sidecar backend: EITRI_VERDANDI_CHECKOUT names a \
                  checkout with no sidecar built for this machine, so the first session start \
                  builds it there (npm)"
             ),
             // Said every time, not once: this is the line that explains why the panel's greeting
             // names no session, and a reader who does not see it will look for the reason in the
-            // code. `NO_SIDECAR_HINT` names the way out (`neovibe setup`) because starting the
+            // code. `NO_SIDECAR_HINT` names the way out (`eitri setup`) because starting the
             // sidecar path anyway is about to fail with that identical sentence.
             agent::SidecarAvailability::Missing => {
                 eprintln!("[agent_backend] using the sidecar backend: {}", agent::NO_SIDECAR_HINT)
@@ -190,9 +190,9 @@ impl BackendKind {
     }
 }
 
-/// What [`BackendKind::choose`] returns when `--legacy`/`NEOVIBE_AGENT_BACKEND=legacy` asked for a
+/// What [`BackendKind::choose`] returns when `--legacy`/`EITRI_AGENT_BACKEND=legacy` asked for a
 /// backend this build did not compile in. `message` is a finished, human-readable sentence for
-/// `main()` to print before exiting -- the same contract `neovibe_core::project_root::resolve`'s
+/// `main()` to print before exiting -- the same contract `eitri_core::project_root::resolve`'s
 /// `Result<_, String>` keeps, as a dedicated type here only so the error case cannot be confused
 /// with a real `BackendKind` at the call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,7 +376,7 @@ impl AgentBackend {
         }
     }
 
-    /// Neovibe's own conversation identity. `None` for the legacy backend, which has no concept of
+    /// Eitri's own conversation identity. `None` for the legacy backend, which has no concept of
     /// one -- it never distinguished its three identities in the first place.
     pub fn conversation_id(&self) -> Option<&str> {
         match self {
@@ -1196,16 +1196,13 @@ fn client_implements_resume(kind: BackendKind) -> bool {
     }
 }
 
-/// Sets a picker row's display title from the CLI transcript, falling back to the stored
-/// session title, then no title.
+/// A picker row's display title: the CLI's own title, then the persisted title, then none.
+/// This only changes `session` on its way to the frontend. It does not write the conversation
+/// record, so `ConversationRecord::title` keeps its first-one-wins behavior and `updated_at`
+/// is unchanged. Each greeting reads the transcript again, so resuming refreshes the row.
 ///
-/// This only changes the value sent to the frontend. It does not write to disk, so
-/// `ConversationRecord::title` keeps its first-one-wins behavior and `updated_at` is unchanged.
-/// Each greeting reads the transcript again, so resuming refreshes the displayed title.
-///
-/// If the transcript cannot be found or read, has no `ai-title` within `AI_TITLE_TAIL_BYTES`,
-/// or has a title this code cannot render, `session.title` is left unchanged. No title is
-/// invented when neither source supplies one.
+/// A missing or unreadable transcript, no `ai-title` within `AI_TITLE_TAIL_BYTES`, or an
+/// unrenderable title leaves `session.title` unchanged. No title is invented.
 fn title_for(canonical_cwd: &str, mut session: ResumableSession) -> ResumableSession {
     if let Some(title) = agent::transcript::transcript_path(canonical_cwd, &session.provider_session_id)
         .ok()
@@ -1255,7 +1252,7 @@ impl BackendGreeting {
     /// than 16 -- that doc explains the extra one). Measured at 1.74 ms hot and 5.92 ms cold over
     /// this machine's 16 largest sessions.
     /// **It must stay a fixed-size read**: parsing those files whole would swap a bounded read of
-    /// Neovibe's own records for one that grows with a file this project neither writes nor knows a
+    /// Eitri's own records for one that grows with a file this project neither writes nor knows a
     /// bound for, and it would do it here, on the loop that draws the editor.
     pub fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
         // Keyed on the CANONICAL directory, matching what `AgentConversation` persists -- otherwise
@@ -1376,7 +1373,7 @@ mod tests {
         }
     }
 
-    /// A release build (legacy not compiled in) refuses `--legacy` and `NEOVIBE_AGENT_BACKEND=legacy`
+    /// A release build (legacy not compiled in) refuses `--legacy` and `EITRI_AGENT_BACKEND=legacy`
     /// alike, `Err` naming `LEGACY_NOT_IN_BUILD` and which of the two asked -- and the refusal does
     /// not depend on whether a sidecar artifact happens to be installed.
     #[test]
@@ -1387,14 +1384,14 @@ mod tests {
 
         let by_var = BackendKind::choose(Some("legacy"), false, Runnable, false).unwrap_err();
         assert!(by_var.message.contains(agent::LEGACY_NOT_IN_BUILD), "{by_var:?}");
-        assert!(by_var.message.contains("NEOVIBE_AGENT_BACKEND=legacy"), "{by_var:?}");
+        assert!(by_var.message.contains("EITRI_AGENT_BACKEND=legacy"), "{by_var:?}");
 
         // Not "an artifact happens to be missing" -- it refuses with one available too, above.
         assert!(BackendKind::choose(None, true, Missing, false).is_err());
     }
 
     /// A development build (legacy compiled in) grants `--legacy` regardless of the environment,
-    /// and the flag beats a conflicting `NEOVIBE_AGENT_BACKEND=sidecar` -- it is the more explicit
+    /// and the flag beats a conflicting `EITRI_AGENT_BACKEND=sidecar` -- it is the more explicit
     /// act, made on this invocation's own command line, where the env var could be an inherited
     /// leftover nobody meant to set today.
     #[test]
@@ -1613,7 +1610,7 @@ mod tests {
     fn a_claude_projects_root() -> &'static std::path::Path {
         static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         ROOT.get_or_init(|| {
-            let root = std::env::temp_dir().join(format!("neovibe-core-claude-{}", std::process::id()));
+            let root = std::env::temp_dir().join(format!("eitri-core-claude-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("projects")).expect("creating the fake config root should succeed");
             std::env::set_var("CLAUDE_CONFIG_DIR", &root);
@@ -1625,7 +1622,7 @@ mod tests {
 
     /// A workspace holding one offerable record, and optionally a transcript beside it.
     ///
-    /// `recorded_title` is what Neovibe itself wrote at write time; `ai_title` is what the CLI
+    /// `recorded_title` is what Eitri itself wrote at write time; `ai_title` is what the CLI
     /// wrote into its own transcript. Either can be absent, which is what makes the three levels of
     /// the ladder reachable from one helper.
     fn a_workspace_with(recorded_title: Option<&str>, ai_title: Option<&str>) -> PathBuf {
@@ -1666,12 +1663,12 @@ mod tests {
         greeting.resumable.into_iter().next().expect("checked just above")
     }
 
-    /// The CLI's transcript title takes precedence over the application's stored `title`
-    /// when both are present in a session row.
+    /// The CLI's title takes precedence over the persisted title at display time.
+    /// Both titles exist here, so the row must show the CLI's title.
     #[test]
     fn the_clis_own_title_is_what_a_row_shows_when_the_transcript_has_one() {
         let row = the_only_row(a_workspace_with(
-            Some("what neovibe recorded"),
+            Some("what eitri recorded"),
             Some("what the CLI recorded"),
         ));
         assert_eq!(row.title.as_deref(), Some("what the CLI recorded"));
@@ -1679,17 +1676,17 @@ mod tests {
 
     /// **The negative control, and the whole promise of the fallback** (invariant 17). The same
     /// record with no transcript beside it must read EXACTLY as it did before this change: the
-    /// title Neovibe recorded, then the bare id. Without this pair, "it degrades back to today's
+    /// title Eitri recorded, then the bare id. Without this pair, "it degrades back to today's
     /// behaviour" would only be a sentence -- and the degradation is silent, so nothing else would
     /// notice the day the CLI stops writing that line.
     #[test]
     fn with_no_ai_title_a_row_reads_exactly_as_it_did_before() {
-        // Level 2: Neovibe's own recorded title.
+        // Level 2: Eitri's own recorded title.
         assert_eq!(
-            the_only_row(a_workspace_with(Some("what neovibe recorded"), None))
+            the_only_row(a_workspace_with(Some("what eitri recorded"), None))
                 .title
                 .as_deref(),
-            Some("what neovibe recorded")
+            Some("what eitri recorded")
         );
         // Level 3: no title at all -- the row falls back to its id and timestamps, and invents
         // nothing.
@@ -1698,11 +1695,11 @@ mod tests {
         // a control rather than a restatement.
         assert_ne!(
             the_only_row(a_workspace_with(
-                Some("what neovibe recorded"),
+                Some("what eitri recorded"),
                 Some("what the CLI recorded")
             ))
             .title,
-            the_only_row(a_workspace_with(Some("what neovibe recorded"), None)).title
+            the_only_row(a_workspace_with(Some("what eitri recorded"), None)).title
         );
     }
 
@@ -1711,8 +1708,8 @@ mod tests {
     /// `title_from_prompt` as every other title, and a blank one declines.
     #[test]
     fn an_unusable_ai_title_falls_through_to_the_recorded_one() {
-        let row = the_only_row(a_workspace_with(Some("what neovibe recorded"), Some("   ")));
-        assert_eq!(row.title.as_deref(), Some("what neovibe recorded"));
+        let row = the_only_row(a_workspace_with(Some("what eitri recorded"), Some("   ")));
+        assert_eq!(row.title.as_deref(), Some("what eitri recorded"));
     }
 
     /// **Invariant 16: nothing read from a transcript is ever persisted.** The record on disk is
@@ -1720,7 +1717,7 @@ mod tests {
     /// `title`'s own first-one-wins rule and cannot move `updated_at`.
     #[test]
     fn building_the_picker_never_writes_the_clis_title_into_the_record() {
-        let workspace = a_workspace_with(Some("what neovibe recorded"), Some("what the CLI recorded"));
+        let workspace = a_workspace_with(Some("what eitri recorded"), Some("what the CLI recorded"));
         let canonical = workspace.canonicalize().expect("the workspace canonicalizes");
         let records = agent::state_dirs::redirect_state_to_a_test_root()
             .join("conversations")
@@ -1738,11 +1735,11 @@ mod tests {
             before,
             "reading a title must leave the record byte-identical"
         );
-        // And what stayed there is Neovibe's own title, unchanged by the one the row showed.
+        // And what stayed there is Eitri's own title, unchanged by the one the row showed.
         assert!(
             before
                 .iter()
-                .any(|(_, bytes)| String::from_utf8_lossy(bytes).contains("what neovibe recorded")),
+                .any(|(_, bytes)| String::from_utf8_lossy(bytes).contains("what eitri recorded")),
             "the record on disk still holds the title this project recorded"
         );
         assert!(
@@ -1818,7 +1815,7 @@ mod tests {
     #[test]
     fn user_prompt_event_records_what_was_typed_not_what_went_on_the_wire() {
         let typed = "what does this do?";
-        // `crate::`, not `neovibe_core::` -- this module IS that crate, and its own unit tests
+        // `crate::`, not `eitri_core::` -- this module IS that crate, and its own unit tests
         // cannot address it by its external name the way `shell` does.
         let wire = crate::editor_context::compose_turn_text(
             typed,

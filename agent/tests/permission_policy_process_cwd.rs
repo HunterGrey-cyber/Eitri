@@ -13,7 +13,7 @@
 
 #[cfg(target_os = "linux")]
 #[test]
-fn a_link_through_proc_self_cwd_cards_wherever_neovibe_was_started() {
+fn a_link_through_proc_self_cwd_cards_wherever_eitri_was_started() {
     use agent::{classify_permission_request, PermissionVerdict};
     use serde_json::json;
     use std::path::PathBuf;
@@ -32,7 +32,7 @@ fn a_link_through_proc_self_cwd_cards_wherever_neovibe_was_started() {
     std::fs::write(root.join("nb.ipynb"), "{}\n").unwrap();
     std::os::unix::fs::symlink("/proc/self/cwd/..", root.join("d")).unwrap();
 
-    // `cd ~/proj/src && neovibe ~/proj`.
+    // `cd ~/proj/src && eitri ~/proj`.
     let started_in = std::env::current_dir().unwrap();
     std::env::set_current_dir(root.join("src")).unwrap();
     assert_eq!(

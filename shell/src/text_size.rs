@@ -52,8 +52,8 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use eitri_core::layout::{ModuleId, ModuleKind};
 use gtk4::prelude::*;
-use neovibe_core::layout::{ModuleId, ModuleKind};
 use neovide_editor::NeovideEditorPane;
 
 use crate::agent_panel::AgentPanelHandle;
@@ -106,12 +106,12 @@ pub(crate) enum TextStep {
     Reset,
 }
 
-impl From<neovibe_core::keymap::TextChange> for TextStep {
-    fn from(change: neovibe_core::keymap::TextChange) -> Self {
+impl From<eitri_core::keymap::TextChange> for TextStep {
+    fn from(change: eitri_core::keymap::TextChange) -> Self {
         match change {
-            neovibe_core::keymap::TextChange::Larger => TextStep::Larger,
-            neovibe_core::keymap::TextChange::Smaller => TextStep::Smaller,
-            neovibe_core::keymap::TextChange::Reset => TextStep::Reset,
+            eitri_core::keymap::TextChange::Larger => TextStep::Larger,
+            eitri_core::keymap::TextChange::Smaller => TextStep::Smaller,
+            eitri_core::keymap::TextChange::Reset => TextStep::Reset,
         }
     }
 }
@@ -446,7 +446,7 @@ impl TextSizeController {
                 }
             });
             app.add_action(&action);
-            app.set_accels_for_action(&format!("app.{name}"), neovibe_core::keymap::root::accels(name));
+            app.set_accels_for_action(&format!("app.{name}"), eitri_core::keymap::root::accels(name));
         }
 
         if let Some(editor) = &this.editor {
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn a_keymap_text_change_is_the_same_step() {
-        use neovibe_core::keymap::TextChange;
+        use eitri_core::keymap::TextChange;
         assert_eq!(TextStep::from(TextChange::Larger), TextStep::Larger);
         assert_eq!(TextStep::from(TextChange::Smaller), TextStep::Smaller);
         assert_eq!(TextStep::from(TextChange::Reset), TextStep::Reset);
@@ -1223,7 +1223,7 @@ mod tests {
         assert_eq!(TEXT_SIZE_ACTIONS[2].1, TextStep::Reset);
         for (name, _) in TEXT_SIZE_ACTIONS.iter().copied() {
             assert!(
-                !neovibe_core::keymap::root::accels(name).is_empty(),
+                !eitri_core::keymap::root::accels(name).is_empty(),
                 "{name} has no root accelerator"
             );
         }

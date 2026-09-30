@@ -31,7 +31,7 @@ _spec.loader.exec_module(cl)
 
 # Scratch for fixtures this test file creates on the fly. Never /tmp: on this project's own dev
 # machines that is a small shared tmpfs, and it is not this test's call to assume otherwise elsewhere.
-_SCRATCH_ROOT = os.path.expanduser("~/.cache/neovibe-collect-licenses-tests")
+_SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-collect-licenses-tests")
 
 
 def _scratch_dir():
@@ -40,7 +40,7 @@ def _scratch_dir():
 
 
 class WorkspaceMembers(unittest.TestCase):
-    def test_neovibes_own_crates_are_left_to_license(self):
+    def test_eitris_own_crates_are_left_to_license(self):
         self.assertTrue(cl.own_code("shell", None))
         self.assertTrue(cl.own_code("terminal-render", "MIT"))
 
@@ -63,11 +63,11 @@ class WorkspaceMembers(unittest.TestCase):
 class ShippedTree(unittest.TestCase):
     """Needs `cargo` and the workspace's lockfile; no build."""
 
-    def test_the_shipped_tree_lists_terminal_input_and_none_of_neovibes_own(self):
+    def test_the_shipped_tree_lists_terminal_input_and_none_of_eitris_own(self):
         crates, _ = cl.cargo_packages()
         names = {p["name"] for p in crates}
         self.assertIn("terminal-input", names)
-        self.assertTrue(names.isdisjoint({"shell", "neovibe-terminal", "terminal-render", "terminal-frame",
+        self.assertTrue(names.isdisjoint({"shell", "eitri-terminal", "terminal-render", "terminal-frame",
                                           "terminal-sync"}), names)
 
     def test_shipped_binaries_has_four_entries_and_no_agent_hook(self):
@@ -331,10 +331,10 @@ _PINNED_SKIA_ARCHIVE_SHA256 = "ef41a8ff85bebeb06238df88e144eb04778a368fc1672a631
 # once release.sh kept its work/, proof/ and target/ there -- and took more than ten minutes
 #. Two entries once named a developer's own scratch disk explicitly
 # and were dropped because
-# `target/` (repo-relative, below) and a `~/.cache/neovibe-release` symlink already reach the same
+# `target/` (repo-relative, below) and a `~/.cache/eitri-release` symlink already reach the same
 # cache through paths this file never has to spell.
 _SKIA_CACHE_GLOBS = (
-    "~/.cache/neovibe-release/skia/skia-binaries-*.tar.gz",
+    "~/.cache/eitri-release/skia/skia-binaries-*.tar.gz",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                  "target/*/build/skia-bindings-*/out/.cache/skia-binaries-*.tar.gz"),
     "~/.cargo/target/*/build/skia-bindings-*/out/.cache/skia-binaries-*.tar.gz",
@@ -592,7 +592,7 @@ class SkiaArchiveNoticeEntries(unittest.TestCase):
         archive = self._fixture_tarball(os.path.join(self.dir, "input"))
         extract_dir = os.path.join(self.dir, "out")
         os.makedirs(extract_dir)
-        keep = os.path.join(extract_dir, "neovibe-1.0.0-x86_64.tar.gz")
+        keep = os.path.join(extract_dir, "eitri-1.0.0-x86_64.tar.gz")
         with open(keep, "w") as f:
             f.write("a release asset\n")
         root = cl._skia_archive_root(archive, extract_dir)
@@ -671,10 +671,10 @@ class CFileClassification(unittest.TestCase):
             self.assertIsNone(cl.classify_c_file(f, set()), f)
 
     def test_the_gcc_runtime_entry_carries_the_pinned_exception_text(self):
-        entry = cl.gcc_runtime_component({"shell", "neovibe-supervisor"})
+        entry = cl.gcc_runtime_component({"shell", "eitri-supervisor"})
         self.assertEqual(entry["title"], cl.GCC_RUNTIME_TITLE)
         self.assertEqual(entry["license"], "GPL-3.0-or-later WITH GCC-exception-3.1")
-        self.assertIn("neovibe-supervisor, shell", entry["note"])
+        self.assertIn("eitri-supervisor, shell", entry["note"])
         (name, text), = entry["files"]
         self.assertEqual(name, "COPYING.RUNTIME")
         self.assertTrue(text.startswith("GCC RUNTIME LIBRARY EXCEPTION\n\nVersion 3.1, 31 March 2009"))
@@ -698,10 +698,10 @@ class BuildHeaderProfiles(unittest.TestCase):
         text = "\n".join(lines)
         # RULE, title, RULE, "" precede the notice: it is the header's first substantive line.
         self.assertEqual(lines[4], cl.nvim_rs_lgpl_notice("0.9.2"))
-        self.assertIn("neovibe's own code is MIT-licensed: see LICENSE, installed beside this file.", text)
+        self.assertIn("eitri's own code is MIT-licensed: see LICENSE, installed beside this file.", text)
         self.assertNotIn("NOT OPEN SOURCE", text)
-        self.assertNotIn("/usr/lib/neovibe/verdandi-claude-sidecar", text)
-        self.assertIn("neovibe's own source is at https://example.invalid/release-asset.tar.gz.", text)
+        self.assertNotIn("/usr/lib/eitri/verdandi-claude-sidecar", text)
+        self.assertIn("eitri's own source is at https://example.invalid/release-asset.tar.gz.", text)
         self.assertNotIn("part 4", text)
         # The Contents list must include the Skia archive section.
         self.assertIn("components inside the Skia prebuilt archive in the source asset      (9)", text)
@@ -724,9 +724,9 @@ class BuildHeaderProfiles(unittest.TestCase):
                                  {"LGPL-3.0": 1, "MIT": 2}, {}, {"MIT": 5})
         text = "\n".join(lines)
         self.assertEqual(lines[4], cl.nvim_rs_lgpl_notice("0.9.2"))
-        self.assertIn("neovibe's own code is MIT-licensed: see LICENSE, installed beside this file.", text)
+        self.assertIn("eitri's own code is MIT-licensed: see LICENSE, installed beside this file.", text)
         self.assertIn("ONE PART IS NOT OPEN SOURCE", text)
-        self.assertIn("/usr/lib/neovibe/verdandi-claude-sidecar", text)
+        self.assertIn("/usr/lib/eitri/verdandi-claude-sidecar", text)
         self.assertIn("part 4  the sidecar: Node.js v22.23.2 and its npm packages", text)
 
     def test_the_notices_version_is_the_resolved_crate_version_not_a_hardcoded_one(self):
@@ -747,7 +747,7 @@ class WriteSourceNotice(unittest.TestCase):
         self.path = os.path.join(self.dir, "SOURCE")
         self.text = cl.write_source_notice(
             self.path, "1.0.0-rc.1", "cafef00dcafef00dcafef00dcafef00dcafef00d",
-            "https://github.com/HunterGrey-cyber/neovibe/releases/download/v1.0.0-rc.1/neovibe-1.0.0-rc.1-source.tar.gz",
+            "https://github.com/HunterGrey-cyber/eitri/releases/download/v1.0.0-rc.1/eitri-1.0.0-rc.1-source.tar.gz",
             "skia-binaries-abcdef0.tar.gz", "d34db33f" * 8, "0.9.2", "f0e1d2c3" * 5,
         )
 
@@ -758,11 +758,11 @@ class WriteSourceNotice(unittest.TestCase):
     def test_contains_the_4a_notice_with_the_given_nvim_rs_version_and_the_url_verbatim(self):
         self.assertTrue(self.text.startswith(cl.nvim_rs_lgpl_notice("0.9.2")))
         self.assertIn(
-            "https://github.com/HunterGrey-cyber/neovibe/releases/download/v1.0.0-rc.1/neovibe-1.0.0-rc.1-source.tar.gz",
+            "https://github.com/HunterGrey-cyber/eitri/releases/download/v1.0.0-rc.1/eitri-1.0.0-rc.1-source.tar.gz",
             self.text)
 
     def test_names_the_version_it_was_built_for(self):
-        self.assertIn("neovibe 1.0.0-rc.1", self.text)
+        self.assertIn("eitri 1.0.0-rc.1", self.text)
 
     def test_the_nvim_rs_version_in_the_notice_is_the_given_one_not_a_hardcoded_default(self):
         d = _scratch_dir()
@@ -776,12 +776,12 @@ class WriteSourceNotice(unittest.TestCase):
 
     def test_names_web_bundle_rebuild_and_the_commit_pin(self):
         self.assertIn("npm ci && npm run build", self.text)
-        self.assertIn("NEOVIBE_BUILD_COMMIT=cafef00dcafef00dcafef00dcafef00dcafef00d", self.text)
+        self.assertIn("EITRI_BUILD_COMMIT=cafef00dcafef00dcafef00dcafef00dcafef00d", self.text)
 
     def test_names_the_fork_commit_and_how_a_rebuild_gets_it_back(self):
         """The asset has no .git in neovide/, so a rebuild from it
         said "neovide fork unknown" unless SOURCE says which commit to set."""
-        self.assertIn("    NEOVIBE_BUILD_FORK_COMMIT=" + "f0e1d2c3" * 5 + "\n", self.text)
+        self.assertIn("    EITRI_BUILD_FORK_COMMIT=" + "f0e1d2c3" * 5 + "\n", self.text)
         self.assertIn("at its pinned commit " + "f0e1d2c3" * 5, self.text)
 
     def test_names_the_skia_archive_and_its_sha256(self):
@@ -915,10 +915,10 @@ class MainArgParsing(unittest.TestCase):
         notice_path = os.path.join(self.dir, "SOURCE")
         fake_meta = {"packages": [{"name": "shell", "version": "1.0.0-rc.1", "id": "shell 1.0.0-rc.1 (path+file:///x)"}],
                      "workspace_members": ["shell 1.0.0-rc.1 (path+file:///x)"]}
-        os.environ["NEOVIBE_BUILD_COMMIT"] = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-        self.addCleanup(os.environ.pop, "NEOVIBE_BUILD_COMMIT", None)
-        os.environ["NEOVIBE_BUILD_FORK_COMMIT"] = "f00d" * 10
-        self.addCleanup(os.environ.pop, "NEOVIBE_BUILD_FORK_COMMIT", None)
+        os.environ["EITRI_BUILD_COMMIT"] = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        self.addCleanup(os.environ.pop, "EITRI_BUILD_COMMIT", None)
+        os.environ["EITRI_BUILD_FORK_COMMIT"] = "f00d" * 10
+        self.addCleanup(os.environ.pop, "EITRI_BUILD_FORK_COMMIT", None)
         with mock.patch.object(cl, "collect", self._fake_collect(calls)), \
              mock.patch.object(cl, "load_metadata", lambda repo: fake_meta):
             rc = cl.main(["--out", self.out, "--source-notice", notice_path,
@@ -928,19 +928,19 @@ class MainArgParsing(unittest.TestCase):
         with open(notice_path, encoding="utf-8") as f:
             text = f.read()
         self.assertIn("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", text)
-        self.assertIn("NEOVIBE_BUILD_FORK_COMMIT=" + "f00d" * 10, text)
+        self.assertIn("EITRI_BUILD_FORK_COMMIT=" + "f00d" * 10, text)
         self.assertIn("skia-binaries-abc.tar.gz", text)
         self.assertIn("1.0.0-rc.1", cl.workspace_package_version(fake_meta, "shell"))
 
     def test_the_fork_commit_comes_from_neovide_s_own_checkout_never_an_enclosing_one(self):
-        """With no NEOVIBE_BUILD_FORK_COMMIT, SOURCE's fork commit is `git rev-parse HEAD` in
+        """With no EITRI_BUILD_FORK_COMMIT, SOURCE's fork commit is `git rev-parse HEAD` in
         --repo's neovide/ -- and only when that directory is its own checkout: a plain neovide/
         inside a repository must fail rather than name the enclosing repository's HEAD."""
         fake_meta = {"packages": [{"name": "shell", "version": "1.0.0-rc.1", "id": "shell 1.0.0-rc.1 (path+file:///x)"}],
                      "workspace_members": ["shell 1.0.0-rc.1 (path+file:///x)"]}
-        os.environ["NEOVIBE_BUILD_COMMIT"] = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-        self.addCleanup(os.environ.pop, "NEOVIBE_BUILD_COMMIT", None)
-        os.environ.pop("NEOVIBE_BUILD_FORK_COMMIT", None)
+        os.environ["EITRI_BUILD_COMMIT"] = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        self.addCleanup(os.environ.pop, "EITRI_BUILD_COMMIT", None)
+        os.environ.pop("EITRI_BUILD_FORK_COMMIT", None)
         git_env = {**os.environ, "GIT_AUTHOR_NAME": "f", "GIT_AUTHOR_EMAIL": "f@example.com",
                    "GIT_COMMITTER_NAME": "f", "GIT_COMMITTER_EMAIL": "f@example.com"}
         repo = os.path.join(self.dir, "repo")
@@ -972,7 +972,7 @@ class MainArgParsing(unittest.TestCase):
         rc, path = main("SOURCE-checkout")
         self.assertEqual(rc, 0)
         with open(path, encoding="utf-8") as f:
-            self.assertIn(f"NEOVIBE_BUILD_FORK_COMMIT={head}", f.read())
+            self.assertIn(f"EITRI_BUILD_FORK_COMMIT={head}", f.read())
 
 
 if __name__ == "__main__":

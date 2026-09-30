@@ -27,8 +27,8 @@ use gtk4::glib;
 use gtk4::graphene;
 use gtk4::prelude::*;
 
-use neovibe_core::hint::{order_targets, HintSession, HintStep, LabelPlan, Landing, Slot, TargetOrder, WindowLayout};
-use neovibe_core::layout::ModuleId;
+use eitri_core::hint::{order_targets, HintSession, HintStep, LabelPlan, Landing, Slot, TargetOrder, WindowLayout};
+use eitri_core::layout::ModuleId;
 use neovide_editor::NeovideEditorPane;
 
 use crate::agent_panel::{AgentPanelHandle, HintInbound};

@@ -4,7 +4,7 @@
 //! A stale index can remain in bounds yet point at different content, so checking bounds
 //! alone cannot prevent silent substitution of an evicted line without an expiry notice.
 
-use neovibe_terminal::{PtySize, Screen, ScrollRequest, TerminalColors};
+use eitri_terminal::{PtySize, Screen, ScrollRequest, TerminalColors};
 use terminal_render::PaintOp;
 
 #[test]

@@ -1,4 +1,4 @@
-# Contributing to neovibe
+# Contributing to Eitri
 
 Bug reports, small fixes and larger changes are all welcome. This file gets you from a clean clone
 to a green test suite; [README.md](README.md) is the map of what the project actually is and how
@@ -21,13 +21,13 @@ third-party build script with an error that never names this project:
 - **Network access on the first build**: `skia-safe` downloads a prebuilt Skia, and Cargo fetches
   the Verdandi protocol crate from GitHub.
 - At run time: **`nvim` ≥ 0.10** on `PATH`, a working OpenGL driver, a Wayland session, and Claude
-  Code installed and logged in — neovibe spends whatever account it runs under.
+  Code installed and logged in — Eitri spends whatever account it runs under.
 
 ## Building
 
 ```sh
-git clone --recurse-submodules https://github.com/HunterGrey-cyber/neovibe.git
-cd neovibe
+git clone --recurse-submodules https://github.com/HunterGrey-cyber/eitri.git
+cd eitri
 # cloned without --recurse-submodules?  git submodule update --init
 cargo build --locked
 ```
@@ -35,13 +35,13 @@ cargo build --locked
 `cargo build --locked` — **not** `--workspace` — is the product: the workspace's `default-members`
 (`shell`, `neovide-editor`, `agent`, `core`, `supervisor` and the terminal crates) at the GTK 4.14
 floor. `cargo build --workspace` also builds the frozen `poc/` crates below, which need GTK 4.18 and
-are not part of what ships — don't reach for it just to build neovibe itself.
+are not part of what ships — don't reach for it just to build Eitri itself.
 
 ## Tests
 
 ```sh
 cargo test                                                                    # GTK 4.14 floor
-cargo test -p agent -p neovibe-core -p shell --features shell/legacy-backend  # the legacy-backend pass
+cargo test -p agent -p eitri-core -p shell --features shell/legacy-backend  # the legacy-backend pass
 (cd agent-ui/web && npm ci && npx vitest run && npx tsc -b)
 python3 -m pytest packaging
 ```
@@ -64,11 +64,11 @@ looks unrelated, run `cargo fmt --all` again rather than hand-editing around it.
 
 ## The Verdandi dependency
 
-neovibe's agent talks to Claude Code through a sidecar, a Node service from the sibling project
+Eitri's agent talks to Claude Code through a sidecar, a Node service from the sibling project
 [Verdandi](https://github.com/HunterGrey-cyber/verdandi). `agent` depends on Verdandi's
 `claude-runtime-protocol` crate, pinned by revision in `agent/Cargo.toml` and fetched from GitHub by
-Cargo — *building* neovibe never needs a Verdandi checkout. *Running* the sidecar backend is a
-separate question with its own search order (a built binary, a Verdandi checkout, or `neovibe
+Cargo — *building* Eitri never needs a Verdandi checkout. *Running* the sidecar backend is a
+separate question with its own search order (a built binary, a Verdandi checkout, or `Eitri
 setup`'s own build) — see [README.md's Verdandi section](README.md#the-verdandi-dependency).
 
 If you need to change the protocol crate itself, don't re-pin the revision for a work-in-progress
@@ -80,12 +80,12 @@ your commits:
 claude-runtime-protocol = { path = "/path/to/your/verdandi/checkout/crates/claude-runtime-protocol" }
 ```
 
-Land the protocol change on the Verdandi side first, then open the neovibe side of it pointing at a
+Land the protocol change on the Verdandi side first, then open the Eitri side of it pointing at a
 real, pinned revision.
 
 ## The `poc/` crates
 
-`poc/` holds the frozen proof-of-concept crates from neovibe's feasibility stage. They are not the
+`poc/` holds the frozen proof-of-concept crates from Eitri's feasibility stage. They are not the
 product — `shell` is — and they deliberately keep bugs that were already fixed in the product
 crates, so a fix that makes `poc/` match `shell`/`neovide-editor` again is not what's wanted; fix
 the product instead. They pin GTK's `v4_18` feature (one point above the product's 4.14 floor),
@@ -94,12 +94,12 @@ which is why they sit outside the workspace's `default-members` and are only rea
 
 ## The legacy backend
 
-Before the sidecar, neovibe's agent panel spawned a `claude` process on `PATH` directly. That code
+Before the sidecar, Eitri's agent panel spawned a `claude` process on `PATH` directly. That code
 is still in the tree behind a cargo feature, `legacy-backend`, off by default: plain `cargo
-build`/`cargo test` never compile it, and no release build can select it (`neovibe --legacy` on a
+build`/`cargo test` never compile it, and no release build can select it (`Eitri --legacy` on a
 release exits 1, naming why). Build it in for local testing with `cargo build --features
 shell/legacy-backend` (or `cargo run -p shell --features shell/legacy-backend -- ...`), then select
-it with `--legacy` or `NEOVIBE_AGENT_BACKEND=legacy`. It needs Claude Code installed and logged in,
+it with `--legacy` or `EITRI_AGENT_BACKEND=legacy`. It needs Claude Code installed and logged in,
 same as the sidecar.
 
 ## Submitting a change
@@ -120,4 +120,4 @@ report, and any proof of concept, doesn't sit in public before a fix ships.
 Contributions are made under the licence that already covers the file you're editing: MIT for
 everything except `terminal-input/`, which is Apache-2.0 (derived from Alacritty; see its own
 `NOTICE`). See [README.md's Licence section](README.md#licence) for the full picture, including what
-neovibe statically links and why the agent sidecar isn't in any release artifact.
+Eitri statically links and why the agent sidecar isn't in any release artifact.

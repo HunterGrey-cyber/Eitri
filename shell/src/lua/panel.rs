@@ -11,9 +11,9 @@
 //! `PanelEntry`, which holds a `gtk4::Widget`, and `install`, which builds a
 //! `webkit6::WebView`.
 
+use eitri_core::lua::panel::{parse_panel_spec, resolve_panel_url, PanelSlot};
 use gtk4::prelude::*;
 use mlua::{Lua, Table};
-use neovibe_core::lua::panel::{parse_panel_spec, resolve_panel_url, PanelSlot};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -79,7 +79,7 @@ impl<W> PanelRegistry<W> {
 
 pub(crate) fn install(
     lua: &Lua,
-    neovibe: &Table,
+    eitri: &Table,
     registry: Rc<RefCell<PanelRegistry>>,
     config_dir: PathBuf,
 ) -> mlua::Result<()> {
@@ -123,7 +123,7 @@ pub(crate) fn install(
         Ok(())
     })?;
     panel_table.set("register", register_fn)?;
-    neovibe.set("panel", panel_table)?;
+    eitri.set("panel", panel_table)?;
     Ok(())
 }
 

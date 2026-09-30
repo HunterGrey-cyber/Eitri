@@ -30,7 +30,7 @@ Two more things are verbatim on purpose:
   conversation…"). It is a constant the CLI writes, not anyone's words, and it is the exact text
   that must never be rendered as the user's own prompt.
 - The editor-context block on the `sdk` prompt, with only the path and the selected text replaced.
-  Its template is this repository's own (`neovibe_core::editor_context::compose_turn_text`), and the
+  Its template is this repository's own (`eitri_core::editor_context::compose_turn_text`), and the
   fact that it is sitting on disk inside a stored prompt is the measured finding that
   `strip_composed_block` exists for.
 

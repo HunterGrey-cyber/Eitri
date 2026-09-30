@@ -1,5 +1,5 @@
 //! The guard two comments in this crate used to claim existed and did not: what
-//! `neovibe-claude-handoff` really `exec`s.
+//! `eitri-claude-handoff` really `exec`s.
 //!
 //! Before this file, `handoff.rs`'s unit test asserted `claude_resume_argv(x) == claude_resume_argv(x)`
 //! via `ClaudeResumeCommand::for_session`, plus a hardcoded string — a tautology and a literal,
@@ -47,7 +47,7 @@ fn stub_claude_in(dir: &std::path::Path) {
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("neovibe-handoff-argv-{}-{}-{}", tag, std::process::id(), n));
+    let dir = std::env::temp_dir().join(format!("eitri-handoff-argv-{}-{}-{}", tag, std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
@@ -55,7 +55,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 
 /// Runs the wrapper with a stub `claude` on `PATH` and returns its stdout lines.
 ///
-/// `NEOVIBE_LEASE_FD=1` is deliberate and is not a shortcut around the lease: the wrapper's own
+/// `EITRI_LEASE_FD=1` is deliberate and is not a shortcut around the lease: the wrapper's own
 /// check on that fd is `fcntl(fd, F_GETFD)`, i.e. "is this descriptor open", and fd 1 always is.
 /// That weakness is a real, separately-recorded property of the wrapper (a REUSED fd number passes
 /// it too) — it is not what this test is about, which is the argv the wrapper goes on to build.
@@ -63,16 +63,16 @@ fn run_wrapper(session_id: &str) -> (bool, Vec<String>, String) {
     let dir = temp_dir("stub");
     stub_claude_in(&dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_neovibe-claude-handoff"))
-        .env("NEOVIBE_LEASE_FD", "1")
-        .env("NEOVIBE_RESUME_SESSION_ID", session_id)
+    let output = Command::new(env!("CARGO_BIN_EXE_eitri-claude-handoff"))
+        .env("EITRI_LEASE_FD", "1")
+        .env("EITRI_RESUME_SESSION_ID", session_id)
         .env("PATH", &dir)
         .current_dir(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("run neovibe-claude-handoff");
+        .expect("run eitri-claude-handoff");
 
     let _ = std::fs::remove_dir_all(&dir);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

@@ -16,10 +16,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use eitri_core::layout::ModuleId;
 use gtk4::gdk::{ModifierType, ScrollUnit};
 use gtk4::glib;
 use gtk4::prelude::*;
-use neovibe_core::layout::ModuleId;
 
 use crate::text_size::{self, TextSizeController, TextSizeTarget, TextStep};
 

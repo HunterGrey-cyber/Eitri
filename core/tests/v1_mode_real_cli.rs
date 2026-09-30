@@ -6,7 +6,7 @@
 //! ```sh
 //! claude --version    # record the build; nothing prints it for you
 //! XDG_STATE_HOME=$HOME/.cache/nv-v1-mode/state \
-//!     cargo test -p neovibe-core --test v1_mode_real_cli -- --ignored --nocapture --test-threads=1
+//!     cargo test -p eitri-core --test v1_mode_real_cli -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! The four legacy tests (2, 3 on legacy, 5 on legacy twice) exist only in a build with the legacy
@@ -14,7 +14,7 @@
 //!
 //! The sidecar runs the CLI named by `VERDANDI_CLAUDE_CLI_PATH`; `PATH` alone does not select it.
 //!
-//! **What these prove, and what they only record.** Bypass is neovibe's own `allow` under a CLI
+//! **What these prove, and what they only record.** Bypass is Eitri's own `allow` under a CLI
 //! that always runs gated, never `bypassPermissions` on the wire. Tests 1/1b/2/6 assert that: no
 //! `PermissionRequested` a bypass tab answers itself is ever delivered to the panel, the resolution
 //! still arrives (sidecar) or is silently dropped with the request (legacy, a documented gap), and
@@ -29,10 +29,10 @@
 //! after the card as a trip. Read the raw lines each prints before recording any figure or branch.
 
 use agent::{AgentDomainEvent, PermissionDecision, PermissionMode, PermissionOutcome, PrefixRules};
-use neovibe_core::agent_backend::{AgentBackend, BackendKind};
-use neovibe_core::agent_bridge::SessionModeChoice;
-use neovibe_core::tab_set::{ConfirmOutcome, ModeCycle, TabBackend, TabSet};
-use neovibe_core::tabs::TabId;
+use eitri_core::agent_backend::{AgentBackend, BackendKind};
+use eitri_core::agent_bridge::SessionModeChoice;
+use eitri_core::tab_set::{ConfirmOutcome, ModeCycle, TabBackend, TabSet};
+use eitri_core::tabs::TabId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -996,7 +996,8 @@ fn a_subagent_tool_call_reaches_the_host_on_legacy() {
 /// The file must be written. At least one allowed resolution must name a permission id
 /// never delivered to the panel, proving that the host answered the CLI prompt.
 ///
-/// Requires a sidecar advertising `provider_permission_prompts`.
+/// Requires a sidecar advertising `provider_permission_prompts`, named with
+/// `EITRI_SIDECAR_BINARY=<that artifact>`.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn protected_paths_under_default_with_hook_allow() {

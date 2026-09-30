@@ -10,7 +10,7 @@
 # Prerelease builds are only for packaging/aur/test-in-container.sh, using a local source=
 # override that is never pushed.
 
-pkgname=neovibe-bin
+pkgname=eitri-bin
 pkgver=0.2.0
 pkgrel=1
 # _realver preserves the release's hyphenated version for tags, download URLs and asset names.
@@ -20,7 +20,7 @@ pkgrel=1
 _realver=0.2.0
 pkgdesc="Neovim, embedded as a real component, with a Claude agent panel beside it (prebuilt binaries; builds its own sidecar on install)"
 arch=('x86_64')
-url="https://github.com/HunterGrey-cyber/neovibe"
+url="https://github.com/HunterGrey-cyber/eitri"
 # Include the package's MIT, Apache-2.0, LGPL-3.0-only and MPL-2.0 notices, plus the
 # Claude Agent SDK licence after build() builds the sidecar. The SDK is not open source;
 # it is built locally by the user rather than redistributed with the release.
@@ -39,8 +39,8 @@ optdepends=(
 	'noto-fonts: the ⏵⏵ mode glyph'
 )
 makedepends=('curl' 'tar')
-provides=('neovibe')
-conflicts=('neovibe')
+provides=('eitri')
+conflicts=('eitri')
 
 # _verdandi_source: the exact release asset name (varies with the pinned Verdandi revision --
 # RELEASE's own VERDANDI_SOURCE key); bump-bin.sh rewrites only this line, so build()/package()
@@ -52,8 +52,8 @@ _verdandi_source=verdandi-0000000-source.tar.gz
 _nodever=v22.23.2
 
 source=(
-	"neovibe-${_realver}-x86_64-linux.tar.gz::https://github.com/HunterGrey-cyber/neovibe/releases/download/v${_realver}/neovibe-${_realver}-x86_64-linux.tar.gz"
-	"${_verdandi_source}::https://github.com/HunterGrey-cyber/neovibe/releases/download/v${_realver}/${_verdandi_source}"
+	"eitri-${_realver}-x86_64-linux.tar.gz::https://github.com/HunterGrey-cyber/eitri/releases/download/v${_realver}/eitri-${_realver}-x86_64-linux.tar.gz"
+	"${_verdandi_source}::https://github.com/HunterGrey-cyber/eitri/releases/download/v${_realver}/${_verdandi_source}"
 	"node-${_nodever}-linux-x64.tar.xz::https://nodejs.org/dist/${_nodever}/node-${_nodever}-linux-x64.tar.xz"
 )
 # The first two are filled by bump-bin.sh from a real release's SHA256SUMS; the third is RELEASE's
@@ -71,7 +71,7 @@ sha256sums=('0000000000000000000000000000000000000000000000000000000000000000'
 
 build() {
 	cd "$srcdir"
-	sh "neovibe-${_realver}-x86_64-linux/lib/neovibe/neovibe-setup" \
+	sh "eitri-${_realver}-x86_64-linux/lib/eitri/eitri-setup" \
 		--build-sidecar-into "$srcdir/sidecar" \
 		--node "$srcdir/node-${_nodever}-linux-x64.tar.xz" \
 		--verdandi-source "$srcdir/${_verdandi_source}"
@@ -79,29 +79,29 @@ build() {
 
 package() {
 	cd "$srcdir"
-	local top="neovibe-${_realver}-x86_64-linux"
+	local top="eitri-${_realver}-x86_64-linux"
 
 	# Keep the tarball's library layout, including RELEASE, and install the sidecar produced
 	# by build() alongside it.
-	install -d "$pkgdir/usr/lib/neovibe"
-	install -m0644 "$top/lib/neovibe/RELEASE" "$pkgdir/usr/lib/neovibe/RELEASE"
-	install -m0755 "$top/lib/neovibe/shell" "$pkgdir/usr/lib/neovibe/shell"
-	install -m0755 "$top/lib/neovibe/neovibe-supervisor" "$pkgdir/usr/lib/neovibe/neovibe-supervisor"
-	install -m0755 "$top/lib/neovibe/neovibe-tmux-shim" "$pkgdir/usr/lib/neovibe/neovibe-tmux-shim"
-	install -m0755 "$top/lib/neovibe/neovibe-claude-handoff" "$pkgdir/usr/lib/neovibe/neovibe-claude-handoff"
-	install -m0755 "$top/lib/neovibe/neovibe-setup" "$pkgdir/usr/lib/neovibe/neovibe-setup"
-	install -m0755 "$srcdir/sidecar/verdandi-claude-sidecar" "$pkgdir/usr/lib/neovibe/verdandi-claude-sidecar"
-	install -m0644 "$srcdir/sidecar/verdandi-claude-sidecar.rev" "$pkgdir/usr/lib/neovibe/verdandi-claude-sidecar.rev"
+	install -d "$pkgdir/usr/lib/eitri"
+	install -m0644 "$top/lib/eitri/RELEASE" "$pkgdir/usr/lib/eitri/RELEASE"
+	install -m0755 "$top/lib/eitri/shell" "$pkgdir/usr/lib/eitri/shell"
+	install -m0755 "$top/lib/eitri/eitri-supervisor" "$pkgdir/usr/lib/eitri/eitri-supervisor"
+	install -m0755 "$top/lib/eitri/eitri-tmux-shim" "$pkgdir/usr/lib/eitri/eitri-tmux-shim"
+	install -m0755 "$top/lib/eitri/eitri-claude-handoff" "$pkgdir/usr/lib/eitri/eitri-claude-handoff"
+	install -m0755 "$top/lib/eitri/eitri-setup" "$pkgdir/usr/lib/eitri/eitri-setup"
+	install -m0755 "$srcdir/sidecar/verdandi-claude-sidecar" "$pkgdir/usr/lib/eitri/verdandi-claude-sidecar"
+	install -m0644 "$srcdir/sidecar/verdandi-claude-sidecar.rev" "$pkgdir/usr/lib/eitri/verdandi-claude-sidecar.rev"
 
-	install -Dm0755 "$top/bin/neovibe" "$pkgdir/usr/bin/neovibe"
-	install -Dm0644 "$top/share/applications/neovibe.desktop" "$pkgdir/usr/share/applications/neovibe.desktop"
+	install -Dm0755 "$top/bin/eitri" "$pkgdir/usr/bin/eitri"
+	install -Dm0644 "$top/share/applications/eitri.desktop" "$pkgdir/usr/share/applications/eitri.desktop"
 
 	# Install the tarball's licences and SOURCE, plus the SDK's LICENSE.md and Node's licence.
 	# The setup script saves the latter two beside the sidecar when present.
 	install -d "$pkgdir/usr/share/licenses/$pkgname"
-	install -m0644 "$top/share/licenses/neovibe/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-	install -m0644 "$top/share/licenses/neovibe/THIRD-PARTY-LICENSES" "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES"
-	install -m0644 "$top/share/licenses/neovibe/SOURCE" "$pkgdir/usr/share/licenses/$pkgname/SOURCE"
+	install -m0644 "$top/share/licenses/eitri/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -m0644 "$top/share/licenses/eitri/THIRD-PARTY-LICENSES" "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES"
+	install -m0644 "$top/share/licenses/eitri/SOURCE" "$pkgdir/usr/share/licenses/$pkgname/SOURCE"
 	if [ -f "$srcdir/sidecar/LICENSE.md" ]; then
 		install -m0644 "$srcdir/sidecar/LICENSE.md" "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
 	fi

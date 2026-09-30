@@ -68,7 +68,7 @@ pub fn reconcile(
     reconcile_with(root, hidden, focus, lua, false)
 }
 
-/// `init.lua`'s `neovibe.layout.default` tree, which has nothing hidden and no focus: [`reconcile`],
+/// `init.lua`'s `eitri.layout.default` tree, which has nothing hidden and no focus: [`reconcile`],
 /// and its bottom rows pinned (the module doc's step 3).
 pub fn reconcile_default(root: Node, lua: &[ModuleDecl]) -> Result<Reconciled, ReconcileError> {
     reconcile_with(root, &BTreeSet::new(), None, lua, true)

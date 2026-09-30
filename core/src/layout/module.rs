@@ -41,7 +41,7 @@ impl ModuleId {
         ModuleId("terminal".to_string())
     }
 
-    /// A Lua webview panel, by the `id` its `neovibe.panel.register` call gave. Any non-empty
+    /// A Lua webview panel, by the `id` its `eitri.panel.register` call gave. Any non-empty
     /// string: `parse_panel_spec` refuses an empty id, because `lua:` alone is not a name
     /// [`ModuleId::parse`] accepts, so it would not round-trip.
     pub fn lua(panel_id: &str) -> Self {

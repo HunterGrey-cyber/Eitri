@@ -1,27 +1,26 @@
-//! Produces a raw/manual command to continue the conversation in a terminal.
+//! Eligibility and command construction for continuing a conversation in a terminal.
+//! This module produces a raw/manual command and takes no lease. The displayed command carries
+//! a concurrency warning because the same session can still be resumed elsewhere.
 //!
-//! This path starts no process and takes no lease. A lease-preserving handoff requires a
-//! host that owns a terminal and can pass its locked lease descriptor and stdio to a direct
-//! child. The GUI shell has no terminal under a desktop launcher. Under `cargo run`, it
-//! still writes diagnostics to its stdio, which would interfere with an interactive TUI.
+//! `agent::handoff::prepare_eitri_to_cli_handoff` launches `eitri-claude-handoff` as a direct
+//! child with an already-locked lease descriptor and the caller's stdio. The GUI has no terminal
+//! to give it: desktop-launcher stdio is not a terminal, and stdio under `cargo run` is still
+//! used by the GUI's diagnostics. Sharing it with an interactive child would mix their output.
 //!
-//! A terminal emulator does not guarantee that an unknown file descriptor survives the
-//! fork/exec that starts the command. A reused descriptor number is especially dangerous:
-//! `fcntl(fd, F_GETFD)` checks only whether it is open, so it cannot establish that the
-//! child still holds the intended lease.
+//! Passing a lease through an emulator requires assurance that its child inherits the same
+//! descriptor. `fcntl(fd, F_GETFD)` checks only whether a descriptor number is open; if that
+//! number is reused for another file, the check passes without proving the lease is held.
+//! This path does not launch an emulator or call the direct-child handoff helper.
 //!
-//! The command is shown explicitly as a raw/manual path with a concurrency warning.
-//! Without a lease, this workspace can resume the same session concurrently. A lease
-//! would not prevent an external `claude --resume` invocation either.
+//! `agent_panel` closes the active session and waits for shutdown before showing the command,
+//! so the panel has stopped driving the session when the user receives it. No projection or
+//! provider session ID is persisted on this path: the worker calls `AgentBackend::shutdown()`
+//! and drops the backend. The default legacy backend cannot resume and reports `resumable: None`
+//! from `BackendGreeting::for_kind`.
 //!
-//! `agent_panel` closes the session and waits for shutdown to finish before showing the
-//! command, so the shell is no longer driving the session when the user can run it.
-//! The worker calls `AgentBackend::shutdown()` and drops the backend without writing a
-//! projection. The default legacy backend cannot resume and reports `resumable: None`.
-//!
-//! `AgentPanelState::last_handoff` keeps the produced `ClaudeResumeCommand` in the Rust
-//! host, so a reloaded document receives it again. This preserves the command only;
-//! the conversation transcript is gone from the panel.
+//! `AgentPanelState::last_handoff` retains the resulting `ClaudeResumeCommand` in the Rust host
+//! and supplies it again after a document reload. This retains the command; the conversation
+//! transcript is no longer available in the panel.
 
 use agent::handoff::{ClaudeResumeCommand, ResumeCommandError};
 use std::path::Path;

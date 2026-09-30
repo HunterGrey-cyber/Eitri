@@ -1,5 +1,5 @@
 [package]
-name = "neovibe-core"
+name = "eitri-core"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

@@ -54,8 +54,8 @@ impl std::fmt::Display for LeaseError {
 impl std::error::Error for LeaseError {}
 
 /// Where the lock files live -- `state_dirs::leases_dir()`, i.e.
-/// `$XDG_RUNTIME_DIR/neovibe/session-leases/` on Linux and
-/// `~/Library/Application Support/neovibe/session-leases/` on macOS, unless a test has redirected it.
+/// `$XDG_RUNTIME_DIR/eitri/session-leases/` on Linux and
+/// `~/Library/Application Support/eitri/session-leases/` on macOS, unless a test has redirected it.
 ///
 /// The thread-local checked first is narrower still and belongs to this module's own tests: several
 /// of them acquire the SAME key (`claude`/`/tmp/project`/`prov-1`) to assert contention, so they
@@ -173,7 +173,7 @@ impl SessionLease {
         file.set_len(0).map_err(LeaseError::Io)?;
         let instance_id = uuid::Uuid::new_v4();
         // `owner_pid` records `std::process::id()` -- the pid of whichever process called
-        // `try_acquire`, i.e. the *host* process. After a Neovibe->CLI handoff (`handoff.rs`),
+        // `try_acquire`, i.e. the *host* process. After an Eitri->CLI handoff (`handoff.rs`),
         // sole ownership of the lock passes to the exec'd `claude` child, which never calls
         // `try_acquire` itself and so never updates this field. Someone debugging an unexpected
         // `AlreadyHeld` after a handoff will read `owner_pid` here and find the host process that

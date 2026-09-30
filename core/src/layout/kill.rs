@@ -43,7 +43,7 @@ use super::tree::{place_new, Layout, LayoutError};
 pub fn editor_quit_lua(generation: u32) -> String {
     format!(
         "pcall(vim.cmd, 'confirm qall') \
-         local p = os.getenv('NEOVIBE_PANE_SWITCH_SOCKET') \
+         local p = os.getenv('EITRI_PANE_SWITCH_SOCKET') \
          if p then local ok, c = pcall(vim.fn.sockconnect, 'pipe', p, {{rpc = false}}) \
          if ok and c ~= 0 then pcall(vim.fn.chansend, c, 'Q {generation}\\n') pcall(vim.fn.chanclose, c) end end"
     )
@@ -64,7 +64,7 @@ pub enum KillScope {
     /// Another module is on screen: [`kill`] takes this one off it.
     Module,
     /// It is the last module on screen: the kill closes the window, which is the whole of this
-    /// neovibe process. The layout is not changed; `shell` closes the window instead.
+    /// Eitri process. The layout is not changed; `shell` closes the window instead.
     Window,
 }
 

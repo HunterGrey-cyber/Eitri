@@ -9,9 +9,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use eitri_core::attention::Attention;
 use gtk4::glib;
 use gtk4::prelude::*;
-use neovibe_core::attention::Attention;
 
 /// How long a toast stays up; a new one restarts it.
 pub(crate) const TOAST_FOR: Duration = Duration::from_secs(4);

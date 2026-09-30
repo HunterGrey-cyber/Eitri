@@ -19,11 +19,12 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
   return activeTab !== null && payload.tab === activeTab;
 }
 
-/** The mode pill uses the panel's mode names from `hello.permissionModes`; `auto` differs from the CLI's.
- *  Every tab can attempt to cycle through `modeKeyRoute`. `cycleOffered` only controls the long form's hint.
- *  The bottom band uses `short = true` to omit "on" and the cycle hint when space is tight.
- *  The short bypass pill spells out `⏵⏵ bypass permissions on` so its effect is clear.
- *  Backend, model and the full pill are shown under `prefix i`. `short` defaults to `false` for long-form callers. */
+/** Format the permission-mode pill with the panel's mode names from `hello.permissionModes`; its
+ *  `auto` differs from the CLI mode. Every tab can attempt a mode change through `modeKeyRoute`.
+ *  `cycleOffered` controls the hint in the long form. The bottom band uses `short = true`,
+ *  omitting "on" and the hint to save room; backend, model and full mode details appear under
+ *  `prefix i`. The default remains the long form. In the short form, bypass spells out "bypass
+ *  permissions on" because it answers waiting permission cards automatically. */
 export function modePill(mode: PermissionModeChoice, cycleOffered: boolean, short = false): string {
   if (short) return mode === "bypass" ? "⏵⏵ bypass permissions on" : `⏵⏵ ${mode}`;
   // O2 (a): the key toggles auto and bypass, frozen as such -- "toggle", not Claude Code's "cycle".

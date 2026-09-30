@@ -1,9 +1,9 @@
 //! The Lua half of the scratch round trip, driven by a real `nvim --headless`. `#[ignore]`d: it needs
 //! `nvim` on PATH; it spends no tokens and needs no display.
 //!
-//! Run: `cargo test -p neovibe-core --test scratch_with_real_nvim -- --ignored`
+//! Run: `cargo test -p eitri-core --test scratch_with_real_nvim -- --ignored`
 
-use neovibe_core::scratch::{EditDone, ScratchDir};
+use eitri_core::scratch::{EditDone, ScratchDir};
 
 fn nvim(dir: &ScratchDir, commands: &[String]) {
     let mut command = std::process::Command::new("nvim");
@@ -28,7 +28,7 @@ fn nvim(dir: &ScratchDir, commands: &[String]) {
 }
 
 fn call(hex: &str) -> String {
-    format!("lua NeovibeScratch.call('{hex}')")
+    format!("lua EitriScratch.call('{hex}')")
 }
 
 #[test]

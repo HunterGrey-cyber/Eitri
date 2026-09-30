@@ -20,10 +20,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
+use eitri_core::panel_cadence::{EnvelopeClass, PanelCadence, Route, DEFAULT_CADENCE_HZ};
+use eitri_core::tabs::TabId;
 use gtk4::glib;
 use gtk4::prelude::*;
-use neovibe_core::panel_cadence::{EnvelopeClass, PanelCadence, Route, DEFAULT_CADENCE_HZ};
-use neovibe_core::tabs::TabId;
 use webkit6::prelude::*;
 use webkit6::WebView;
 
@@ -159,7 +159,7 @@ impl Pacer {
         if typing != self.typing_told {
             self.typing_told = typing;
             if let Some(period_ms) = self.cadence.page_needs_typing_state() {
-                sink.send(&neovibe_core::agent_bridge::serialize_editor_typing_for_js(
+                sink.send(&eitri_core::agent_bridge::serialize_editor_typing_for_js(
                     typing, period_ms,
                 ));
             }
@@ -171,7 +171,7 @@ impl Pacer {
     ///
     /// Returns the first-text markers of what was thrown away. That text will reach the new page
     /// inside the snapshot, which the page never reports a paint for, so the caller must tell each
-    /// turn's trace (`agent_panel::trace_discarded_first_texts`) or its `NEOVIBE_AGENT_TRACE` line
+    /// turn's trace (`agent_panel::trace_discarded_first_texts`) or its `EITRI_AGENT_TRACE` line
     /// waits for a report that is never sent and never prints.
     #[must_use = "the turn traces of the discarded first texts must be told (a line that never prints)"]
     pub(crate) fn discard_pending(&mut self) -> Vec<FirstText> {
@@ -200,7 +200,7 @@ pub(crate) struct WebViewSink<'a>(pub(crate) &'a WebView);
 impl Sink for WebViewSink<'_> {
     fn send(&self, payload: &str) {
         let script = format!(
-            "window.__neovibeDispatch({});",
+            "window.__eitriDispatch({});",
             serde_json::to_string(payload).unwrap_or_default()
         );
         self.0

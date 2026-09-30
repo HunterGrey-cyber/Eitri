@@ -149,9 +149,9 @@ mod tests {
     fn it_lives_beside_the_layout_and_agent_directories_as_jsonl() {
         assert_eq!(
             state_dir(Some(OsStr::new("/s")), None),
-            Some(PathBuf::from("/s/neovibe/history"))
+            Some(PathBuf::from("/s/eitri/history"))
         );
-        let name = path(Path::new("/s/neovibe/history"), &root());
+        let name = path(Path::new("/s/eitri/history"), &root());
         let layout_name = crate::layout::persist::file_name(&root());
         assert_eq!(
             name.file_name().unwrap().to_string_lossy(),

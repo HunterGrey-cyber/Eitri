@@ -52,8 +52,8 @@ while [ $# -gt 0 ]; do
 		--cwd) W_CWD=$2 ;;
 		--set)
 			case $2 in
-			NEOVIBE_INSTALL_TEST=* | NEOVIBE_INSTALL_TEST_*=* | XDG_DATA_HOME=* | XDG_CACHE_HOME=* | \
-				XDG_STATE_HOME=* | XDG_CONFIG_HOME=* | LANG=* | NEOVIBE_CONFIG_DIR=* | CARGO_TARGET_DIR=*) ;;
+			EITRI_INSTALL_TEST=* | EITRI_INSTALL_TEST_*=* | XDG_DATA_HOME=* | XDG_CACHE_HOME=* | \
+				XDG_STATE_HOME=* | XDG_CONFIG_HOME=* | LANG=* | EITRI_CONFIG_DIR=* | CARGO_TARGET_DIR=*) ;;
 			*) die "--set $2: not an allowlisted variable" ;;
 			esac
 			W_SETS=$W_SETS$2$NL
@@ -91,7 +91,7 @@ if [ "$W_CLAUDE_OK" != 1 ]; then
 fi
 
 real_home_digest() {
-	for W_R in "$W_GUARD/.local/state/neovibe" "$W_GUARD/.config/neovibe" "$W_GUARD/.local/share/neovibe"; do
+	for W_R in "$W_GUARD/.local/state/eitri" "$W_GUARD/.config/eitri" "$W_GUARD/.local/share/eitri"; do
 		if [ -e "$W_R" ] || [ -L "$W_R" ]; then
 			find "$W_R" -printf '%p %T@\n' 2>&1
 		else
@@ -133,7 +133,7 @@ W_RC=$?
 if [ -n "$W_GUARD" ]; then
 	W_AFTER=$(real_home_digest)
 	if [ "$W_BEFORE" != "$W_AFTER" ]; then
-		printf "run-in-env: the real HOME's neovibe directories changed during this run\n" >&2
+		printf "run-in-env: the real HOME's eitri directories changed during this run\n" >&2
 		exit 97
 	fi
 fi

@@ -384,7 +384,7 @@ pub struct Tripped {
 pub fn ungated_cli_mode_reason(reported: &str, detail: &str) -> String {
     format!(
         "the CLI reports permission mode '{reported}' ({detail}) — a project's permissions.defaultMode? \
-         neovibe runs only sessions it gates itself; the session was closed"
+         Eitri runs only sessions it gates itself; the session was closed"
     )
 }
 
@@ -2242,8 +2242,9 @@ mod tests {
         let snapshot: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         assert_eq!(snapshot["kind"], "snapshot");
         assert_eq!(snapshot["tab"], background.0);
-        // The projection holds both requests until the Read's resolution returns, but `host_answered`
-        // hides the answered Read from both snapshot and tray. Only the still-waiting Write is shown.
+        // The projection holds both requests until the Read's resolution returns.
+        // `host_answered` hides the already answered Read from the snapshot and tray, so only
+        // the Write that is still waiting is shown.
         assert_eq!(
             snapshot["state"]["pendingPermissions"].as_array().unwrap().len(),
             1,
@@ -2479,7 +2480,7 @@ mod tests {
         };
         let fixture = serde_json::json!({
             "writtenBy": "core/src/tab_set.rs, tests::with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both \
-                          -- compared on every run; NEOVIBE_WRITE_FIXTURES=1 rewrites it",
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
             "midStream": record("P1-unique-text", p1a2_mid_stream(false), p1a2_mid_stream(true)),
             "foldAfterADrain": record("<between>", p1a2_fold_after_a_drain(false), p1a2_fold_after_a_drain(true)),
         });
@@ -2490,13 +2491,13 @@ mod tests {
         if committed.as_deref() == Some(fixture_json.as_str()) {
             return;
         }
-        if std::env::var_os("NEOVIBE_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
             std::fs::write(&fixture_path, &fixture_json).expect("write the p1a2 reducer fixture");
         } else if let Some(committed) = committed {
             assert_eq!(
                 committed, fixture_json,
                 "the committed p1a2 reducer fixture is not what this test produces; if the change is \
-                 intended, regenerate it with NEOVIBE_WRITE_FIXTURES=1"
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
             );
         }
     }
@@ -3142,7 +3143,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    // Entering bypass asks first; once entered, the host answers pending requests.
+    // Entering bypass asks first; once entered, the host answers every request.
 
     #[test]
     fn entering_bypass_on_a_live_tab_asks_and_changes_nothing_until_confirmed() {
@@ -5014,7 +5015,7 @@ mod tests {
         let tab = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        let input = serde_json::json!({ "file_path": "/etc/neovibe-out.txt", "content": "x" });
+        let input = serde_json::json!({ "file_path": "/etc/eitri-out.txt", "content": "x" });
         provider.queue(started("t1"));
         provider.queue(call_started("toolu_out", "Write", input.clone()));
         provider.queue(AgentDomainEvent::PermissionRequested {

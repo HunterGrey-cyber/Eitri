@@ -18,7 +18,7 @@ S=$(cd "$(dirname "$0")/.." && pwd)
 } >>"$S/logs/cargo.log"
 case $1 in
 build)
-	case ${NEOVIBE_INSTALL_TEST_CARGO_MODE:-ok} in
+	case ${EITRI_INSTALL_TEST_CARGO_MODE:-ok} in
 	fail)
 		echo "cargo-fromsource-stub: simulated build failure" >&2
 		exit 1
@@ -35,7 +35,7 @@ build)
 	done
 	if [ -z "$_cfs_target_dir" ]; then _cfs_target_dir=${CARGO_TARGET_DIR:-target}; fi
 	mkdir -p "$_cfs_target_dir/release" || exit 1
-	for b in shell neovibe-supervisor neovibe-tmux-shim neovibe-claude-handoff agent-hook; do
+	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff agent-hook; do
 		printf '#!/bin/sh\necho "stub %s (from-source test build)"\n' "$b" >"$_cfs_target_dir/release/$b" || exit 1
 		chmod 0755 "$_cfs_target_dir/release/$b" || exit 1
 	done

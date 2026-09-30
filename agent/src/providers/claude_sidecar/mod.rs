@@ -84,7 +84,7 @@ pub const CLIENT_IMPLEMENTS_RESUME: bool = true;
 /// both, not before.
 const CLIENT_IMPLEMENTS_FORK: bool = false;
 /// True since O3 (2026-09-27): a provider prompt is translated with its origin
-/// (`translate::provider_prompt_of`), answered by `neovibe_core::agent_backend` on the rules O3 set
+/// (`translate::provider_prompt_of`), answered by `eitri_core::agent_backend` on the rules O3 set
 /// (bypass allows it unless the user's own ask rule forced it; Auto allows it only after the human
 /// approved the same call), and drawn as a card with the CLI's own reason otherwise. Before that a
 /// session that asked for these would have had its prompts judged as if the gate had asked.
@@ -577,7 +577,7 @@ fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo)
     Err(ProviderError::Provider {
         code: ProviderErrorCode::InvalidConfiguration,
         message: format!(
-            "this provider does not offer a gated (interactive) mode, the only one neovibe runs a \
+            "this provider does not offer a gated (interactive) mode, the only one Eitri runs a \
              session in; it advertises: {}",
             if info.advertised_permission_modes.is_empty() {
                 "none".to_string()
@@ -642,7 +642,7 @@ fn build_create_request(
             // `Options.tools` -- the real restriction list, not `allowedTools`, which is a
             // PRE-APPROVAL list a field named `allow` would have quietly widened access through.
             // Absent means "do not touch the base tool set"; present-and-empty would mean "no
-            // built-in tools at all", stated. Neovibe has no allowlist to express, so it says
+            // built-in tools at all", stated. Eitri has no allowlist to express, so it says
             // nothing rather than saying the empty set.
             tool_policy: Some(ToolPolicy {
                 deny: denied.iter().map(|t| (*t).to_string()).collect(),

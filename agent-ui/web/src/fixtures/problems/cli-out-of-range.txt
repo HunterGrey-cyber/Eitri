@@ -1,3 +1,3 @@
-claude-sidecar exited with exit status: 1 before binding "/tmp/neovibe-sc-a1b2c3d4e5f6789012345678deadbeef.sock"; its stderr said:
+claude-sidecar exited with exit status: 1 before binding "/tmp/eitri-sc-a1b2c3d4e5f6789012345678deadbeef.sock"; its stderr said:
 claude account: work (/home/user/.claude-work)
 refusing to start: host claude CLI version 3.0.0: claude CLI version 3.0.0 is outside this sidecar's supported range (>=2.1.252 <3.0.0). Install a claude CLI inside that range, or widen the range in apps/claude-sidecar/src/cliCompatibility.ts once a real-CLI test run has confirmed it works.

@@ -3,8 +3,8 @@
 //! like `crate::wheel_zoom`. Mouse reporting reuses [`cell_at`] to keep its pixel-to-cell
 //! mapping identical to selection.
 
-use neovibe_terminal::mouse::{Button, MouseInput, MouseKind, MouseModes, MouseMods};
-use neovibe_terminal::SelectKind;
+use eitri_terminal::mouse::{Button, MouseInput, MouseKind, MouseModes, MouseMods};
+use eitri_terminal::SelectKind;
 
 /// One pixel axis (x or y) turned into a clamped cell index, and whether the point falls in that
 /// cell's right (or bottom) half. A point at or before `0.0` is the left/top half of cell `0`; one
@@ -29,8 +29,8 @@ fn axis_cell(pos: f64, cell: f64, count: u16) -> (u16, bool) {
 }
 
 /// A widget-relative pixel `(x, y)` -> `(absolute grid line, column, right half)`. `top_line` is
-/// [`neovibe_terminal::Screen::top_line`] -- the same absolute-line space
-/// [`neovibe_terminal::SelectCommand`] and `neovibe_terminal::scroll::ScrollView` already use, so a
+/// [`eitri_terminal::Screen::top_line`] -- the same absolute-line space
+/// [`eitri_terminal::SelectCommand`] and `eitri_terminal::scroll::ScrollView` already use, so a
 /// drag made while scrolled back names the same cells the render it was made against showed.
 /// Clamped to the grid on every edge: a point outside the pane (a drag that leaves the widget while
 /// the button is still down, which GTK's `GestureDrag` keeps delivering) never produces a line or

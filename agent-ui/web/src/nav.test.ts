@@ -413,11 +413,11 @@ describe("webUrl and webLinks", () => {
       "docs/a.md", // relative: `new URL` without a base throws
       "/x",
       "#frag",
-      "https://neovibe.invalid/x", // the panel's own base, where every relative link points
-      "https://NEOVIBE.INVALID/x",
-      "https://%6eeovibe.invalid/x", // percent-encoded, decoded to it by the parser
-      String.raw`https:\\neovibe.invalid\x`, // backslashes are slashes to the parser
-      "https://neovibe.invalid./x", // the same host with a trailing dot
+      "https://eitri.invalid/x", // the panel's own base, where every relative link points
+      "https://EITRI.INVALID/x",
+      "https://%65itri.invalid/x", // percent-encoded, decoded to it by the parser
+      String.raw`https:\\eitri.invalid\x`, // backslashes are slashes to the parser
+      "https://eitri.invalid./x", // the same host with a trailing dot
       "https://user:pw@example.com/", // userinfo hides the real host behind a familiar one
       "https://example.com@evil.example/",
       "javascript:alert(1)",
@@ -650,7 +650,7 @@ describe("hintTargets: web links", () => {
     const root = withLinks(
       [
         '<a id="rel" href="docs/a.md">rel</a>',
-        '<a id="own" href="https://neovibe.invalid/x">own</a>',
+        '<a id="own" href="https://eitri.invalid/x">own</a>',
         '<a id="js" href="javascript:alert(1)">js</a>',
         '<a id="user" href="https://user:pw@example.com/">user</a>',
         '<a id="plain" href="https://example.com/ok">ok</a>',

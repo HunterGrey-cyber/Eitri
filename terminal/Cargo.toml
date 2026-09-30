@@ -1,5 +1,5 @@
 [package]
-name = "neovibe-terminal"
+name = "eitri-terminal"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

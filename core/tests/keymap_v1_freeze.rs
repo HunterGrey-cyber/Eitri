@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use neovibe_core::keymap::{self, Action, Keymap, OptValue};
+use eitri_core::keymap::{self, Action, Keymap, OptValue};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -108,7 +108,7 @@ fn current_panel_rows() -> Vec<PanelFixtureRow> {
 fn read_fixture<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Vec<T> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
         panic!(
-            "{}: {e} (generate it first: cargo test -p neovibe-core --test keymap_v1_freeze -- \
+            "{}: {e} (generate it first: cargo test -p eitri-core --test keymap_v1_freeze -- \
              --ignored regenerate_fixtures)",
             path.display()
         )
@@ -121,7 +121,7 @@ fn prefix_table_keeps_every_pinned_binding() {
     let fixture: PrefixFixture = {
         let text = std::fs::read_to_string(prefix_fixture_path()).unwrap_or_else(|e| {
             panic!(
-                "{}: {e} (generate it first: cargo test -p neovibe-core --test keymap_v1_freeze -- \
+                "{}: {e} (generate it first: cargo test -p eitri-core --test keymap_v1_freeze -- \
                  --ignored regenerate_fixtures)",
                 prefix_fixture_path().display()
             )

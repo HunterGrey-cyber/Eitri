@@ -105,7 +105,7 @@ fn real_pretooluse_hook_allow_end_to_end() {
 #[test]
 #[ignore]
 fn real_pretooluse_hook_deny_end_to_end() {
-    const DENY_REASON: &str = "neovibe test policy: shell commands are not permitted in this conversation";
+    const DENY_REASON: &str = "eitri test policy: shell commands are not permitted in this conversation";
 
     let dir = std::env::temp_dir().join(format!("agent-session-deny-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -373,7 +373,7 @@ fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_th
     let mut session = AgentSession::start(&dir, agent::disallowed_tools()).unwrap();
     session
         .send_turn(&format!(
-            "Use the Edit tool to change the word 'world' to 'neovibe' in {}. Do not use a shell.",
+            "Use the Edit tool to change the word 'world' to 'eitri' in {}. Do not use a shell.",
             target.display()
         ))
         .unwrap();
@@ -434,7 +434,7 @@ fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_th
     // Clause 4: approving really wrote it.
     let after = std::fs::read_to_string(&target).unwrap();
     assert!(
-        after.contains("neovibe"),
+        after.contains("eitri"),
         "the approved edit did not land; the file holds: {after:?}"
     );
     assert!(!after.contains("world"), "the old text survived: {after:?}");

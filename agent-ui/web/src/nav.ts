@@ -24,12 +24,12 @@ export const STOP_ATTR = "data-nav-stop";
 export const HINT_ALPHABET = "asdjklghweruio";
 
 /** a web link as `web_url` (`shell/src/agent_panel.rs`) will re-check it -- `http(s)`
- *  by the WHATWG parser with no base (the parser the browser opens it with, so `https://%6eeovibe.invalid/x`
- *  and `https:\\neovibe.invalid\x` are what they really are), no userinfo, a plain `[a-z0-9.-]` host with
- *  no trailing dot that is not the panel's own `neovibe.invalid` (where every relative link resolves), and
+ *  by the WHATWG parser with no base (the parser the browser opens it with, so `https://%65itri.invalid/x`
+ *  and `https:\\eitri.invalid\x` are what they really are), no userinfo, a plain `[a-z0-9.-]` host with
+ *  no trailing dot that is not the panel's own `eitri.invalid` (where every relative link resolves), and
  *  no backslash left anywhere in the address. Returns the normalized `href` -- what a pick shows and what
  *  `open_url` sends, never the spelling the reply wrote -- or `null`. The host rules are Rust's, restated:
- *  the parser alone keeps `neovibe.invalid.`, `a$b.com`, `my_host.x`, `[::1]` and a backslash in a query, and
+ *  the parser alone keeps `eitri.invalid.`, `a$b.com`, `my_host.x`, `[::1]` and a backslash in a query, and
  *  Rust refuses all of them, so a letter offered for one could only fail. */
 export function webUrl(href: string | null): string | null {
   let url: URL;
@@ -40,7 +40,7 @@ export function webUrl(href: string | null): string | null {
   }
   if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username !== "" || url.password !== "") return null;
   const host = url.hostname;
-  if (!/^[a-z0-9.-]+$/.test(host) || host.endsWith(".") || host === "neovibe.invalid" || url.href.includes("\\")) return null;
+  if (!/^[a-z0-9.-]+$/.test(host) || host.endsWith(".") || host === "eitri.invalid" || url.href.includes("\\")) return null;
   return url.href;
 }
 

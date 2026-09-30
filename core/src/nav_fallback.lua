@@ -3,7 +3,7 @@
 -- <C-h>/<C-j>/<C-k>/<C-l> in Normal and Visual mode a way out of the editor where the global
 -- mapping is empty, nvim's default, or a plain window move. Other mappings and all buffer-local
 -- mappings are left alone.
-local socket = vim.env.NEOVIBE_PANE_SWITCH_SOCKET
+local socket = vim.env.EITRI_PANE_SWITCH_SOCKET
 if not socket or socket == "" then
   return
 end
@@ -16,7 +16,7 @@ local KEYS = {
   { lhs = "<C-k>", dir = "k", letter = "U", name = "up" },
   { lhs = "<C-l>", dir = "l", letter = "R", name = "right" },
 }
-local DESC = "neovibe: window or pane "
+local DESC = "eitri: window or pane "
 
 -- Send synchronously so a busy callback or an editor exit cannot lose a queued letter.
 -- `vim.fn.sockconnect`, `chansend` and `chanclose` finish before the mapping returns.
@@ -142,6 +142,6 @@ local function schedule_check()
   end)
 end
 
-local group = vim.api.nvim_create_augroup("neovibe_nav", { clear = true })
+local group = vim.api.nvim_create_augroup("eitri_nav", { clear = true })
 vim.api.nvim_create_autocmd("VimEnter", { group = group, callback = schedule_check })
 vim.api.nvim_create_autocmd("User", { group = group, pattern = { "VeryLazy", "LazyLoad" }, callback = schedule_check })

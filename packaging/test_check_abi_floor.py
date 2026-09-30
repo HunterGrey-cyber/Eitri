@@ -174,7 +174,7 @@ class ScratchCompliantBinary(unittest.TestCase):
     def setUp(self):
         if not os.path.exists("/usr/bin/true"):
             self.skipTest("/usr/bin/true is not present on this host")
-        self._scratch = tempfile.mkdtemp(prefix="neovibe-abi-floor-compliant-stand-in-")
+        self._scratch = tempfile.mkdtemp(prefix="eitri-abi-floor-compliant-stand-in-")
         self.addCleanup(shutil.rmtree, self._scratch, ignore_errors=True)
         self.stand_in = os.path.join(self._scratch, "shell")
         shutil.copyfile("/usr/bin/true", self.stand_in)

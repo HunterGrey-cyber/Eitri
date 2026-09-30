@@ -1,3 +1,0 @@
-#!/bin/sh
-# Another neovibe earlier on PATH (a distro package's /usr/bin/neovibe, say).
-echo other neovibe

@@ -153,7 +153,7 @@ impl AttentionTracker {
     }
 }
 
-/// `init.lua`'s `neovibe.config.set("modules.chat.on_permission", ...)`.
+/// `init.lua`'s `eitri.config.set("modules.chat.on_permission", ...)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatOnPermission {
     /// The default: the chip and a toast. Nothing reveals itself.
@@ -173,7 +173,7 @@ impl ChatOnPermission {
             None | Some("badge") => Ok(ChatOnPermission::Badge),
             Some("reveal") => Ok(ChatOnPermission::Reveal),
             Some(other) => Err(format!(
-                "neovibe.config.set(\"{}\", {other:?}): must be \"badge\" or \"reveal\"",
+                "eitri.config.set(\"{}\", {other:?}): must be \"badge\" or \"reveal\"",
                 Self::KEY
             )),
         }
@@ -347,7 +347,7 @@ mod tests {
         let err = ChatOnPermission::parse(Some("popup")).unwrap_err();
         assert_eq!(
             err,
-            "neovibe.config.set(\"modules.chat.on_permission\", \"popup\"): must be \"badge\" or \"reveal\""
+            "eitri.config.set(\"modules.chat.on_permission\", \"popup\"): must be \"badge\" or \"reveal\""
         );
     }
 

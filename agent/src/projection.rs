@@ -214,7 +214,7 @@ pub enum AgentDomainEvent {
         /// the provider's OWN vocabulary, kept for diagnostics rather than collapsed into `mode`.
         provider_mode: String,
         /// True when entering bypass applied Verdandi's conservative floor
-        /// (`PermissionModeChanged.bypass_default_deny_applied`). Neovibe states `unrestricted` on
+        /// (`PermissionModeChanged.bypass_default_deny_applied`). Eitri states `unrestricted` on
         /// every session (`build_create_request`), so this must never happen in practice; see the
         /// translate-side match arm for what a `true` here means.
         floor_applied: bool,
@@ -364,7 +364,7 @@ pub struct ProviderPrompt {
     pub blocked_path: Option<String>,
     /// Present when one of the user's own `permissions.ask` rules forced this prompt. Such a prompt
     /// is meant for a human, and the SDK's guidance is that a host auto-approving must not approve
-    /// it: neovibe draws it as a card in every mode, bypass included.
+    /// it: Eitri draws it as a card in every mode, bypass included.
     pub matched_ask_rule: Option<MatchedAskRule>,
     /// Set, to the raw wire value, when the sidecar named an `origin` this build does not know (a
     /// sidecar newer than this client). Such a prompt is a card in every mode, like one an ask rule
@@ -470,7 +470,7 @@ pub struct UsageInfo {
     pub model: Option<String>,
 }
 
-/// Neovibe's sole product-state authority for one conversation. `pending_permissions`
+/// Eitri's sole product-state authority for one conversation. `pending_permissions`
 /// is a map (not the old `Vec`) so a caller can look up/remove one specific request by id in O(1)
 /// -- exactly what answering one permission card needs, and exactly what the design doc's own
 /// "pending permissions map" wording asks for.
@@ -521,7 +521,7 @@ pub struct AgentSessionProjection {
     /// Load-bearing since partial streaming landed. `transcript` means "assistant messages", not
     /// "content events": with `StreamingPreference::Partial` a single 600-word reply arrives as 400+
     /// `ContentDelta`s, and pushing each as its own entry would render 400 separate message bubbles,
-    /// each markdown-parsed IN ISOLATION -- so a fragment like "`neovibe_" or "**bold" is not valid
+    /// each markdown-parsed IN ISOLATION -- so a fragment like "`eitri_" or "**bold" is not valid
     /// standalone markdown and the formatting of every streamed reply breaks.
     ///
     /// Anything that can only occur BETWEEN assistant messages closes the run: a tool call, a
@@ -548,7 +548,7 @@ pub struct AgentSessionProjection {
     /// Kept rather than folded away because the event alone does not survive a
     /// `UiDelivery::Resync`: an overflowing UI queue drops its events and the host rebuilds from
     /// this projection, and a tripwire that vanished there would leave an ungated session running
-    /// until its next report. `neovibe_core`'s pump reads this after every delivery. It changes
+    /// until its next report. `eitri_core`'s pump reads this after every delivery. It changes
     /// nothing a view draws -- the status is untouched and it is not serialized; closing the session
     /// is the host's to do.
     #[serde(skip)]
@@ -565,8 +565,8 @@ pub struct AgentSessionProjection {
 pub enum HistorySource {
     /// B: the real Claude CLI's own `<uuid>.jsonl`.
     ClaudeTranscript,
-    /// A: `history::store`, Neovibe's own copy, used only when B could not be read.
-    NeovibeCopy,
+    /// A: `history::store`, Eitri's own copy, used only when B could not be read.
+    EitriCopy,
 }
 
 /// The information the panel displays about restored history: the conversation, its source,
@@ -594,7 +594,7 @@ pub struct HistoryNotice {
     /// The Claude transcript that was looked for and not used. `None` when `source` is
     /// `ClaudeTranscript` (it would repeat `source_path`) and when no path could be built at all.
     pub attempted_transcript_path: Option<String>,
-    /// Why B was not used, in the user's own terms. `Some` exactly when `source` is `NeovibeCopy`.
+    /// Why B was not used, in the user's own terms. `Some` exactly when `source` is `EitriCopy`.
     pub fallback_reason: Option<String>,
     /// The CLI version that wrote the transcript, from the file itself. B only -- A has no such
     /// concept. **Not a schema version**; nothing branches on it.

@@ -118,7 +118,7 @@ fn width_cmd(width: &str) -> Vec<String> {
     ]
 }
 
-/// What neovibe's editor pane passes: its own default, exactly as `NeovideEditorPane` builds it.
+/// What Eitri's editor pane passes: its own default, exactly as `NeovideEditorPane` builds it.
 fn pane_default() -> Vec<String> {
     vec![
         "--cmd".to_string(),
@@ -126,7 +126,7 @@ fn pane_default() -> Vec<String> {
     ]
 }
 
-const CASE_ENV: &str = "NEOVIBE_UNFOCUSED_CURSOR_CASE";
+const CASE_ENV: &str = "EITRI_UNFOCUSED_CURSOR_CASE";
 
 /// One launch. `insert` puts nvim in insert mode first, so the cursor is a vertical bar.
 struct Case {

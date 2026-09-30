@@ -17,7 +17,7 @@ fn agent_hook_relays_stdin_to_socket_and_prints_the_response() {
     // Spawn agent-hook as a real subprocess, matching exactly how the CLI itself will invoke it.
     let binary = env!("CARGO_BIN_EXE_agent-hook");
     let mut child = Command::new(binary)
-        .env("NEOVIBE_AGENT_HOOK_SOCKET", &socket_path)
+        .env("EITRI_AGENT_HOOK_SOCKET", &socket_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -63,10 +63,10 @@ fn spawn_hook(socket: Option<&std::path::Path>, payload: &str) -> std::process::
     let mut command = Command::new(binary);
     match socket {
         Some(path) => {
-            command.env("NEOVIBE_AGENT_HOOK_SOCKET", path);
+            command.env("EITRI_AGENT_HOOK_SOCKET", path);
         }
         None => {
-            command.env_remove("NEOVIBE_AGENT_HOOK_SOCKET");
+            command.env_remove("EITRI_AGENT_HOOK_SOCKET");
         }
     }
     let mut child = command
@@ -95,7 +95,7 @@ fn assert_blocked(output: &std::process::Output, because: &str) {
 #[test]
 fn an_unset_socket_variable_blocks_rather_than_letting_the_tool_run() {
     let output = spawn_hook(None, "{}");
-    assert_blocked(&output, "NEOVIBE_AGENT_HOOK_SOCKET");
+    assert_blocked(&output, "EITRI_AGENT_HOOK_SOCKET");
 }
 
 #[test]

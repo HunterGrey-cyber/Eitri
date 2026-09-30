@@ -5,7 +5,7 @@
 //! Every Neovim plugin's "reload after an external change" story is an autocommand on
 //! `FocusGained`. LazyVim's is exactly that: `{"FocusGained", "TermClose", "TermLeave"} -> checktime`.
 //!
-//! **`FocusGained` can never fire in neovibe.** The editor pane's `EventControllerFocus` drives the
+//! **`FocusGained` can never fire in Eitri.** The editor pane's `EventControllerFocus` drives the
 //! input method and nothing else (`neovide-editor/src/keyboard.rs`), so when the user clicks into
 //! the agent panel nvim is never told it lost focus -- and therefore never told it got it back.
 //! Verified by reading every `focus` site in that crate, not inferred. The same gap is why `'<` and
@@ -60,8 +60,8 @@ pub const RELOAD_INTERVAL_MS: u64 = 1000;
 ///   created at all, the `--cmd`'s error went by unread, and the unit test asserting
 ///   `contains("vim.g.")` passed the whole time. The integration test is what caught it.
 pub const RELOAD_CMD: &str = concat!(
-    "lua _G.neovibe_reload_timer = vim.uv.new_timer(); ",
-    "_G.neovibe_reload_timer:start(1000, 1000, function() ",
+    "lua _G.eitri_reload_timer = vim.uv.new_timer(); ",
+    "_G.eitri_reload_timer:start(1000, 1000, function() ",
     "vim.schedule(function() pcall(vim.cmd, 'checktime') end) end)"
 );
 

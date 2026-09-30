@@ -24,7 +24,7 @@
 //! `auto-render` on -- the only way the pane builds it.
 //!
 //! **When it falls back, and for how long** ([`Lifecycle`], per GL context, i.e. per realize):
-//! off by `NEOVIBE_EDITOR_DMABUF` or below GTK 4.16 (`dmabuf_target::decide`), or when the presenter
+//! off by `EITRI_EDITOR_DMABUF` or below GTK 4.16 (`dmabuf_target::decide`), or when the presenter
 //! cannot be set up (no EGL, GBM, or modifier both sides take -- nothing a new size changes): until
 //! the next realize. A frame that fails mid-run (an allocation, an import, an incomplete
 //! framebuffer, a texture GTK refuses): that frame is redrawn through `GtkGLArea`, which keeps
@@ -137,7 +137,7 @@ pub struct PresentationCounts {
     /// Frames drawn through `GtkGLArea`'s texture (the fallback, or a frame redrawn after a failure).
     pub fallback_frames: u64,
     /// Times the own-buffer path failed and fell back: a presenter that could not be set up, or a
-    /// frame that failed mid-run. Turning it off (`NEOVIBE_EDITOR_DMABUF`, GTK below 4.16) is not one.
+    /// frame that failed mid-run. Turning it off (`EITRI_EDITOR_DMABUF`, GTK below 4.16) is not one.
     pub failures: u32,
 }
 
@@ -158,7 +158,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for EditorGlArea {
-        const NAME: &'static str = "NeovibeEditorGlArea";
+        const NAME: &'static str = "EitriEditorGlArea";
         type Type = super::EditorGlArea;
         type ParentType = gtk4::GLArea;
     }
@@ -313,7 +313,7 @@ mod imp {
             }
         }
 
-        /// `NEOVIBE_EDITOR_DMABUF` and the runtime GTK version, once per GL context.
+        /// `EITRI_EDITOR_DMABUF` and the runtime GTK version, once per GL context.
         fn decide(&self) -> bool {
             let value = std::env::var_os(dmabuf_target::ENV);
             let gtk = (gtk4::major_version(), gtk4::minor_version(), gtk4::micro_version());

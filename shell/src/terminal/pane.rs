@@ -55,9 +55,9 @@ use gtk4::{
     GestureDrag, IMMulticontext, InputPurpose,
 };
 
-use neovibe_terminal::mouse::{Button as MouseButton, MouseKind, MouseModes, MouseMods, WheelDir};
-use neovibe_terminal::pty::{fallback_shell, passwd_shell};
-use neovibe_terminal::{
+use eitri_terminal::mouse::{Button as MouseButton, MouseKind, MouseModes, MouseMods, WheelDir};
+use eitri_terminal::pty::{fallback_shell, passwd_shell};
+use eitri_terminal::{
     layout_preedit, CursorCell, PreeditLayout, PtySize, Screen, ScrollRequest, SelectCommand, SessionCommand,
     SessionConfig, SpawnSpec, TerminalColors, TerminalMetrics, TerminalSession,
 };
@@ -900,10 +900,10 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
         };
         match frame.as_ref().zip(metrics.as_ref()) {
             Some((list, metrics)) => {
-                neovibe_terminal::paint(surface.canvas(), list, metrics);
+                eitri_terminal::paint(surface.canvas(), list, metrics);
                 // After the frame, over it: the input method's composition at the cursor (phase 2).
                 if let Some(preedit) = &preedit {
-                    neovibe_terminal::paint_ops(surface.canvas(), &preedit.ops, metrics);
+                    eitri_terminal::paint_ops(surface.canvas(), &preedit.ops, metrics);
                 }
                 // Over everything, for a moment: the bell (phase 2).
                 if flashing {
@@ -1175,7 +1175,7 @@ fn connect_pointer_motion(area: &GLArea, state: &Rc<RefCell<State>>) {
 }
 
 /// Which half of a `Start`/`Extend` pair [`send_select`] is sending: `Start` carries the click count
-/// `pointer::kind_for` turns into a [`neovibe_terminal::SelectKind`], `Extend` carries none.
+/// `pointer::kind_for` turns into a [`eitri_terminal::SelectKind`], `Extend` carries none.
 enum SelectStage {
     Start(i32),
     Extend,
@@ -1242,7 +1242,7 @@ fn copy_selection(state: &Rc<RefCell<State>>, area: &GLArea) {
 
 /// Grid lines scrolled per wheel notch. Reuse the terminal library's `LINES_PER_NOTCH`
 /// so scrollback and alternate-screen arrow-key repeats use the same multiplier.
-const LINES_PER_WHEEL_NOTCH: i32 = neovibe_terminal::mouse::LINES_PER_NOTCH as i32;
+const LINES_PER_WHEEL_NOTCH: i32 = eitri_terminal::mouse::LINES_PER_NOTCH as i32;
 
 /// One scroll event, in `unit`, folded into `wheel`'s carry-over state -- the same accumulator
 /// `crate::wheel_zoom::WheelZoom` uses for Ctrl+wheel text size, reused rather than reimplemented so
@@ -1321,7 +1321,7 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
     let keys = EventControllerKey::new();
     // GTK runs the input method on every key before `key-pressed`/`key-released` below, and a key it
     // consumes never reaches them (phase 2; the editor's own wiring, `neovide-editor/src/keyboard.rs`).
-    // neovibe's own chords never get this far: they are taken in the capture phase.
+    // eitri's own chords never get this far: they are taken in the capture phase.
     keys.set_im_context(Some(im));
     {
         let state = state.clone();
@@ -1371,7 +1371,7 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
             state.borrow_mut().delivered.mark(keyval);
             deliver(&state, raw_key(&area, keyval, keycode, modifier, true, repeat));
             // Claimed unconditionally: every key that reaches the terminal is the child's. The keys
-            // neovibe keeps were taken before this controller ever saw them.
+            // eitri keeps were taken before this controller ever saw them.
             glib::Propagation::Stop
         });
     }

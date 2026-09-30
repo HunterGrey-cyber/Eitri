@@ -14,18 +14,18 @@
 //! The WebView draws only the active tab. Background events update attention and mark
 //! the tab stale; switching tabs sends the new active tab's full snapshot.
 
-use gtk4::prelude::*;
-use gtk4::Application;
-use neovibe_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
-use neovibe_core::agent_bridge::{
+use eitri_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
+use eitri_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
     serialize_hello_for_js, serialize_nav_key_for_js, ChooserRecord, ChooserTab, DetailRow, InboundMessage,
     NavKeyDirection, PaneNavDirection, PanelKeys, TabVerbWire,
 };
-use neovibe_core::keymap::TabAction;
-use neovibe_core::layout::Direction;
-use neovibe_core::tab_set::{FirstTurn, PendingHandoff, PendingStart, ResumeRoute, StartCollected, Tab, TabBackend};
-use neovibe_core::tabs::TabId;
+use eitri_core::keymap::TabAction;
+use eitri_core::layout::Direction;
+use eitri_core::tab_set::{FirstTurn, PendingHandoff, PendingStart, ResumeRoute, StartCollected, Tab, TabBackend};
+use eitri_core::tabs::TabId;
+use gtk4::prelude::*;
+use gtk4::Application;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -53,7 +53,7 @@ const PUMP_POLL_INTERVAL_MS: u64 = 33;
 /// It is the legacy backend's real close time with room to spare (~0.8s of grace periods plus
 /// three thread joins) and is knowingly shorter than the sidecar path's documented worst case --
 /// this backstop's expiry only releases the application hold, it does not kill anything, so
-/// "knowingly short" here means neovibe's own process may exit before a still-reaping sidecar
+/// "knowingly short" here means eitri's own process may exit before a still-reaping sidecar
 /// finishes its cleanup, not that anything gets SIGKILLed early; `AgentPanelHandle::shutdown`'s
 /// handoff branch says what expiring costs.
 const HANDOFF_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
@@ -415,21 +415,21 @@ pub(crate) enum HintInbound {
 struct AgentPanelState {
     /// Every tab and which is active. Rust owns the tabs; the WebView
     /// draws the active one.
-    tabs: neovibe_core::tab_set::TabSet,
+    tabs: eitri_core::tab_set::TabSet,
     backend_kind: BackendKind,
     project_dir: PathBuf,
     /// `project_dir.canonicalize()`, read once: the `canonical_cwd` a session lease is keyed on
     /// (`agent::lease::SessionLease::is_held`), for resume routing and the chooser.
     canonical_project_dir: String,
-    /// `$XDG_STATE_HOME/neovibe/agent`, where the remembered mode is written. `None`
+    /// `$XDG_STATE_HOME/eitri/agent`, where the remembered mode is written. `None`
     /// with no state directory.
     prefs_dir: Option<PathBuf>,
     /// Where the user is, asked for at send time. Never stored across turns: what the editor was
     /// showing when the LAST turn went out is not context, it is a stale claim, and the composer
     /// has no way to tell the model which it is.
-    editor_context: neovibe_core::editor_context::ContextSource,
+    editor_context: eitri_core::editor_context::ContextSource,
     supervisor: Option<crate::supervisor_client::SupervisorClient>,
-    /// Set only while a freshly-spawned `neovibe-supervisor` is still coming up. The pump drains
+    /// Set only while a freshly-spawned `eitri-supervisor` is still coming up. The pump drains
     /// it into `supervisor` above. A window that spawns the supervisor cannot connect to it
     /// synchronously -- see `PendingSupervisor` for the failure that taught us that.
     supervisor_pending: Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
@@ -449,7 +449,7 @@ struct AgentPanelState {
     /// `AgentPanelHandle::set_theme`. Held as tokens rather than an envelope because it feeds three
     /// things: the `ready` batch, the `<style>` inlined into every `load_html`, and the WebView's
     /// own background colour.
-    theme: neovibe_core::theme::ThemeTokens,
+    theme: eitri_core::theme::ThemeTokens,
     /// The `?` overlay's rows (`serialize_keymap_for_js`), sent with the theme on every `ready` so
     /// a reloaded document is told the keymap it needs, not the one baked into a hand list.
     keymap_help: Option<String>,
@@ -471,9 +471,9 @@ struct AgentPanelState {
     /// The open provider sessions `hello` was last computed against.
     last_open_ids: Vec<String>,
     /// The per-window scratch directory, `None` if it could not be made.
-    scratch: Option<neovibe_core::scratch::ScratchDir>,
+    scratch: Option<eitri_core::scratch::ScratchDir>,
     /// Edits out in nvim, polled by the tick until their marker appears.
-    pending_edits: Vec<neovibe_core::scratch::PendingEdit>,
+    pending_edits: Vec<eitri_core::scratch::PendingEdit>,
     /// shows and focuses the editor, then hands it these keys; `Err` says why it could not.
     editor_request_hook: Option<EditorRequestHook>,
     /// An edit came back (or was discarded): the keys return to the chat, in INPUT.
@@ -508,7 +508,7 @@ struct AgentPanelState {
 }
 
 /// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
-type AttentionHook = Rc<dyn Fn(neovibe_core::attention::Attention, neovibe_core::attention::Attention)>;
+type AttentionHook = Rc<dyn Fn(eitri_core::attention::Attention, eitri_core::attention::Attention)>;
 
 /// `AgentPanelHandle::on_editor_request`: the keys to hand nvim; `Err` says why it could not.
 type EditorRequestHook = Rc<dyn Fn(&str) -> Result<(), String>>;
@@ -561,7 +561,7 @@ impl AgentPanelHandle {
                 (s.history_dir.clone(), s.project_dir.clone())
             };
             if let Some(dir) = dir {
-                if let Err(e) = neovibe_core::prompt_history::append(&dir, &root, &texts) {
+                if let Err(e) = eitri_core::prompt_history::append(&dir, &root, &texts) {
                     eprintln!("[history] the queue could not be kept: {e}");
                 }
             }
@@ -675,7 +675,7 @@ impl AgentPanelHandle {
         }
     }
 
-    /// Non-blocking: returns `true` if `neovibe-supervisor` asked this window to come to the
+    /// Non-blocking: returns `true` if `eitri-supervisor` asked this window to come to the
     /// front since the last call. `main.rs` polls this on its own timer and calls
     /// `window.present()` in response -- this handle has no `Window` reference of its own (see
     /// `AgentPanelHandle`'s own top-level doc: window lifecycle stays owned by `main.rs`).
@@ -697,13 +697,13 @@ impl AgentPanelHandle {
     ///
     /// Safe to call before the page has loaded: the dispatch is guarded, and the `ready` handshake
     /// sends the recorded envelope anyway, so neither ordering loses it.
-    pub(crate) fn set_theme(&self, tokens: &neovibe_core::theme::ThemeTokens) {
-        let payload = neovibe_core::agent_bridge::serialize_theme_for_js(tokens);
+    pub(crate) fn set_theme(&self, tokens: &eitri_core::theme::ThemeTokens) {
+        let payload = eitri_core::agent_bridge::serialize_theme_for_js(tokens);
         self.state.borrow_mut().theme = tokens.clone();
         let Some(webview) = &self.webview else { return };
         paint_webview_background(webview, tokens);
         let script = format!(
-            "window.__neovibeDispatch && window.__neovibeDispatch({});",
+            "window.__eitriDispatch && window.__eitriDispatch({});",
             serde_json::to_string(&payload).unwrap_or_default()
         );
         webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
@@ -752,7 +752,7 @@ impl AgentPanelHandle {
         // Behind whatever the typing cadence is holding, as `evaluate_js_dispatch` is.
         crate::panel_pacer::flush(webview);
         let script = format!(
-            "window.__neovibeDispatch && window.__neovibeDispatch({});",
+            "window.__eitriDispatch && window.__eitriDispatch({});",
             serde_json::to_string(&payload).unwrap_or_default()
         );
         webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, move |result| {
@@ -804,7 +804,7 @@ impl AgentPanelHandle {
             self.state.borrow_mut().tabs.drop_bypass_prompt();
         }
         self.dispatch(
-            neovibe_core::agent_bridge::serialize_pane_focus_for_js(focused),
+            eitri_core::agent_bridge::serialize_pane_focus_for_js(focused),
             "pane focus",
         );
     }
@@ -815,10 +815,7 @@ impl AgentPanelHandle {
     /// happens.
     pub(crate) fn enter_input(&self) {
         self.drop_bypass_prompt();
-        self.dispatch(
-            neovibe_core::agent_bridge::serialize_enter_input_for_js(),
-            "enter-input",
-        );
+        self.dispatch(eitri_core::agent_bridge::serialize_enter_input_for_js(), "enter-input");
     }
 
     /// Keyboard arrivals enter BROWSE on the last row with following resumed if it was active;
@@ -827,7 +824,7 @@ impl AgentPanelHandle {
     /// `enter_input`, so it is safe before the page loads.
     pub(crate) fn arrive(&self) {
         self.drop_bypass_prompt();
-        self.dispatch(neovibe_core::agent_bridge::serialize_arrive_for_js(), "arrive");
+        self.dispatch(eitri_core::agent_bridge::serialize_arrive_for_js(), "arrive");
     }
 
     /// Drops Rust's bypass prompt when GTK routes keys away before the WebView sees them.
@@ -863,10 +860,10 @@ impl AgentPanelHandle {
     }
 
     /// `send-prefix`/`send-keys` with the panel holding the keys.
-    pub(crate) fn literal_key(&self, key: &neovibe_core::keymap::KeySpec) {
+    pub(crate) fn literal_key(&self, key: &eitri_core::keymap::KeySpec) {
         self.drop_bypass_prompt();
         self.dispatch(
-            neovibe_core::agent_bridge::serialize_literal_key_for_js(&key.to_string()),
+            eitri_core::agent_bridge::serialize_literal_key_for_js(&key.to_string()),
             "literal-key",
         );
     }
@@ -874,10 +871,7 @@ impl AgentPanelHandle {
     /// `prefix ?`: open the `?` overlay.
     pub(crate) fn open_keymap(&self) {
         self.drop_bypass_prompt();
-        self.dispatch(
-            neovibe_core::agent_bridge::serialize_open_keymap_for_js(),
-            "open-keymap",
-        );
+        self.dispatch(eitri_core::agent_bridge::serialize_open_keymap_for_js(), "open-keymap");
     }
 
     /// Global `f` HINT. Each
@@ -886,31 +880,31 @@ impl AgentPanelHandle {
     pub(crate) fn hint_collect(&self, session_id: u64) {
         self.drop_bypass_prompt();
         self.dispatch(
-            neovibe_core::agent_bridge::serialize_hint_collect_for_js(session_id),
+            eitri_core::agent_bridge::serialize_hint_collect_for_js(session_id),
             "hint collect",
         );
     }
     pub(crate) fn hint_show(&self, session_id: u64, labels: &[String]) {
         self.dispatch(
-            neovibe_core::agent_bridge::serialize_hint_show_for_js(session_id, labels),
+            eitri_core::agent_bridge::serialize_hint_show_for_js(session_id, labels),
             "hint show",
         );
     }
     pub(crate) fn hint_prefix(&self, session_id: u64, typed: &str) {
         self.dispatch(
-            neovibe_core::agent_bridge::serialize_hint_prefix_for_js(session_id, typed),
+            eitri_core::agent_bridge::serialize_hint_prefix_for_js(session_id, typed),
             "hint prefix",
         );
     }
     pub(crate) fn hint_land(&self, session_id: u64, index: usize) {
         self.dispatch(
-            neovibe_core::agent_bridge::serialize_hint_land_for_js(session_id, index),
+            eitri_core::agent_bridge::serialize_hint_land_for_js(session_id, index),
             "hint land",
         );
     }
     pub(crate) fn hint_end(&self, session_id: u64) {
         self.dispatch(
-            neovibe_core::agent_bridge::serialize_hint_end_for_js(session_id),
+            eitri_core::agent_bridge::serialize_hint_end_for_js(session_id),
             "hint end",
         );
     }
@@ -937,7 +931,7 @@ impl AgentPanelHandle {
     /// `main.rs` installs this once.
     pub(crate) fn on_attention(
         &self,
-        hook: impl Fn(neovibe_core::attention::Attention, neovibe_core::attention::Attention) + 'static,
+        hook: impl Fn(eitri_core::attention::Attention, eitri_core::attention::Attention) + 'static,
     ) {
         self.state.borrow_mut().attention_hook = Some(Rc::new(hook));
     }
@@ -1004,7 +998,7 @@ impl AgentPanelHandle {
         self.switch_with(|tabs| tabs.select_last())
     }
 
-    fn switch_with(&self, select: impl FnOnce(&mut neovibe_core::tab_set::TabSet) -> Option<TabId>) -> bool {
+    fn switch_with(&self, select: impl FnOnce(&mut eitri_core::tab_set::TabSet) -> Option<TabId>) -> bool {
         let Some(webview) = self.live_page() else {
             return false;
         };
@@ -1025,7 +1019,7 @@ impl AgentPanelHandle {
         let payload = {
             let state = self.state.borrow();
             let tab = state.tabs.active_tab();
-            neovibe_core::agent_bridge::serialize_begin_rename_for_js(tab.id, tab.name.as_deref())
+            eitri_core::agent_bridge::serialize_begin_rename_for_js(tab.id, tab.name.as_deref())
         };
         self.dispatch(payload, "begin-rename");
     }
@@ -1041,10 +1035,7 @@ impl AgentPanelHandle {
             let state = self.state.borrow();
             let active = state.tabs.active();
             let facts = state.tabs.close_facts(active).expect("the active tab exists");
-            neovibe_core::agent_bridge::serialize_confirm_close_for_js(
-                active,
-                &neovibe_core::tabs::close_prompt(&facts),
-            )
+            eitri_core::agent_bridge::serialize_confirm_close_for_js(active, &eitri_core::tabs::close_prompt(&facts))
         };
         self.dispatch(payload, "confirm-close");
     }
@@ -1059,7 +1050,7 @@ impl AgentPanelHandle {
         let Some((tabs, prompt)) = self.state.borrow().tabs.close_others_plan() else {
             return;
         };
-        let payload = neovibe_core::agent_bridge::serialize_confirm_close_others_for_js(&tabs, &[prompt]);
+        let payload = eitri_core::agent_bridge::serialize_confirm_close_others_for_js(&tabs, &[prompt]);
         self.dispatch(payload, "confirm-close-others");
     }
 
@@ -1107,7 +1098,7 @@ impl AgentPanelHandle {
         };
         send_switch(&self.state, webview);
         self.dispatch(
-            neovibe_core::agent_bridge::serialize_focus_permission_for_js(target),
+            eitri_core::agent_bridge::serialize_focus_permission_for_js(target),
             "focus-permission",
         );
         true
@@ -1115,7 +1106,7 @@ impl AgentPanelHandle {
 
     /// What the chat owes the user now, summed over every tab: its pending permission
     /// cards, and whether a turn finished while it was off screen.
-    pub(crate) fn attention(&self) -> neovibe_core::attention::Attention {
+    pub(crate) fn attention(&self) -> eitri_core::attention::Attention {
         let state = self.state.borrow();
         if state.shutting_down {
             return Default::default();
@@ -1183,7 +1174,7 @@ impl AgentPanelHandle {
 
 /// Tells the attention hook, if the value changed. The hook is cloned out of the borrow first: it
 /// reaches the layout and the top bar, and must never find this panel's state borrowed.
-fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: neovibe_core::attention::Attention) {
+fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: eitri_core::attention::Attention) {
     let (after, hook) = {
         let state = state.borrow();
         if state.shutting_down {
@@ -1199,7 +1190,7 @@ fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: neovibe_core::
 }
 
 /// `backend_kind` is `main()`'s own choice: `BackendKind::from_env`
-/// is called there, before any window exists, so `--legacy`/`NEOVIBE_AGENT_BACKEND=legacy` on a
+/// is called there, before any window exists, so `--legacy`/`EITRI_AGENT_BACKEND=legacy` on a
 /// release build can exit 1 naming the reason before touching GTK at all. This function no longer
 /// makes that choice itself -- it only prints it.
 ///
@@ -1209,8 +1200,8 @@ fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: neovibe_core::
 /// same state with no page (`AgentPanelHandle::webview`'s own doc), no pump, no supervisor client.
 pub(crate) fn build_agent_panel(
     project_dir: PathBuf,
-    editor_context: neovibe_core::editor_context::ContextSource,
-    scratch: Option<neovibe_core::scratch::ScratchDir>,
+    editor_context: eitri_core::editor_context::ContextSource,
+    scratch: Option<eitri_core::scratch::ScratchDir>,
     backend_kind: BackendKind,
     unavailable: Option<&str>,
 ) -> (gtk4::Widget, AgentPanelHandle) {
@@ -1250,7 +1241,7 @@ pub(crate) fn build_agent_panel(
     // Even sanitized markdown can legitimately contain an external link (a click), and a script
     // that got past sanitization anyway (defense-in-depth) might try to redirect the page --
     // either way, navigating this WebView to a remote origin would hand that origin the same
-    // UserContentManager and therefore the same `neovibeAgent` bridge this panel uses to relay
+    // UserContentManager and therefore the same `eitriAgent` bridge this panel uses to relay
     // permission decisions. Hand link clicks to the system browser instead and keep this WebView
     // on its embedded document for the panel's whole lifetime.
     webview.connect_decide_policy(|_webview, decision, decision_type| {
@@ -1261,7 +1252,7 @@ pub(crate) fn build_agent_panel(
                         webkit6::NavigationType::LinkClicked => {
                             // A markdown link the model rendered -- never let the embedded panel
                             // itself navigate there (that origin would inherit the same
-                            // UserContentManager/neovibeAgent bridge); hand it to the system
+                            // UserContentManager/eitriAgent bridge); hand it to the system
                             // browser instead.
                             if let Some(uri) = action.request().and_then(|r| r.uri()) {
                                 gtk4::UriLauncher::new(&uri).launch(
@@ -1308,11 +1299,11 @@ pub(crate) fn build_agent_panel(
         supervisor_pending,
     )));
 
-    content_manager.register_script_message_handler("neovibeAgent", None);
+    content_manager.register_script_message_handler("eitriAgent", None);
     {
         let state = state.clone();
         let webview_for_handler = webview.clone();
-        content_manager.connect_script_message_received(Some("neovibeAgent"), move |_manager, js_value| {
+        content_manager.connect_script_message_received(Some("eitriAgent"), move |_manager, js_value| {
             let raw = js_value.to_str();
             handle_inbound_message(&raw, &state, &webview_for_handler);
         });
@@ -1365,30 +1356,30 @@ pub(crate) fn build_agent_panel(
 /// the tab set in the project's remembered mode, its prompt history and saved permission rules.
 fn panel_state(
     project_dir: PathBuf,
-    editor_context: neovibe_core::editor_context::ContextSource,
-    scratch: Option<neovibe_core::scratch::ScratchDir>,
+    editor_context: eitri_core::editor_context::ContextSource,
+    scratch: Option<eitri_core::scratch::ScratchDir>,
     backend_kind: BackendKind,
     supervisor: Option<crate::supervisor_client::SupervisorClient>,
     supervisor_pending: Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
 ) -> AgentPanelState {
     let state_home = std::env::var_os("XDG_STATE_HOME");
     let home = std::env::var_os("HOME");
-    let prefs_dir = neovibe_core::agent_prefs::state_dir(state_home.as_deref(), home.as_deref());
-    let (mode, notes) = neovibe_core::agent_prefs::startup_mode(prefs_dir.as_deref(), &project_dir);
+    let prefs_dir = eitri_core::agent_prefs::state_dir(state_home.as_deref(), home.as_deref());
+    let (mode, notes) = eitri_core::agent_prefs::startup_mode(prefs_dir.as_deref(), &project_dir);
     for note in notes {
         eprintln!("{note}");
     }
-    let history_dir = neovibe_core::prompt_history::state_dir(state_home.as_deref(), home.as_deref());
-    let rules_dir = neovibe_core::permission_store::state_dir(state_home.as_deref(), home.as_deref());
-    let (history, notes) = neovibe_core::prompt_history::startup(history_dir.as_deref(), &project_dir);
+    let history_dir = eitri_core::prompt_history::state_dir(state_home.as_deref(), home.as_deref());
+    let rules_dir = eitri_core::permission_store::state_dir(state_home.as_deref(), home.as_deref());
+    let (history, notes) = eitri_core::prompt_history::startup(history_dir.as_deref(), &project_dir);
     for note in notes {
         eprintln!("{note}");
     }
-    let (rules, notes) = neovibe_core::permission_store::startup(rules_dir.as_deref(), &project_dir);
+    let (rules, notes) = eitri_core::permission_store::startup(rules_dir.as_deref(), &project_dir);
     for note in notes {
         eprintln!("{note}");
     }
-    let mut tabs = neovibe_core::tab_set::TabSet::new(backend_kind, mode);
+    let mut tabs = eitri_core::tab_set::TabSet::new(backend_kind, mode);
     tabs.set_rules(rules);
     // The key a session lease is taken under (`AgentConversation` canonicalizes its cwd the same
     // way). `main.rs` already canonicalized the root; this only makes the string explicit.
@@ -1407,7 +1398,7 @@ fn panel_state(
         supervisor,
         supervisor_pending,
         shutting_down: false,
-        theme: neovibe_core::theme::ThemeTokens::fallback(),
+        theme: eitri_core::theme::ThemeTokens::fallback(),
         keymap_help: None,
         pane_focused: false,
         hint_hook: None,
@@ -1439,7 +1430,7 @@ fn panel_state(
 ///    answers what needs no human, so a tab that was not pumped would stall. The active tab's batch
 ///    goes to the panel as one `events{tab,fromRevision,throughRevision,events[]}` envelope; a
 ///    background tab's feeds its attention and marks it stale;
-/// 3. report the window's aggregated status to `neovibe-supervisor`.
+/// 3. report the window's aggregated status to `eitri-supervisor`.
 ///
 /// Then the `tabs` envelope and `hello` go out if what they describe changed.
 fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
@@ -1552,7 +1543,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 let class = if page_ready {
                     class
                 } else {
-                    neovibe_core::panel_cadence::EnvelopeClass::Immediate
+                    eitri_core::panel_cadence::EnvelopeClass::Immediate
                 };
                 pacer.send_stream(&sink, payload, first_text, class, now);
             }
@@ -1583,7 +1574,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
             let payload = {
                 let state_ref = state.borrow();
                 let tab = state_ref.tabs.active_tab();
-                neovibe_core::agent_bridge::serialize_rule_offers_for_js(tab.id, &tab.rule_offers)
+                eitri_core::agent_bridge::serialize_rule_offers_for_js(tab.id, &tab.rule_offers)
             };
             evaluate_js_dispatch(&webview, &payload);
         }
@@ -1630,7 +1621,7 @@ fn request_editor(state: &Rc<RefCell<AgentPanelState>>, keys: &str) -> Result<()
 /// C5's return half: every edit whose marker appeared goes back to the tab it came from (review
 /// focus 4), and the keys return to the chat.
 fn poll_scratch_edits(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
-    let finished: Vec<(neovibe_core::scratch::PendingEdit, neovibe_core::scratch::EditDone)> = {
+    let finished: Vec<(eitri_core::scratch::PendingEdit, eitri_core::scratch::EditDone)> = {
         let mut state_ref = state.borrow_mut();
         if state_ref.pending_edits.is_empty() {
             return;
@@ -1655,17 +1646,14 @@ fn poll_scratch_edits(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
         let active = state.borrow().tabs.active() == tab;
         if active {
             if let Some(text) = &draft {
-                evaluate_js_dispatch(webview, &neovibe_core::agent_bridge::serialize_draft_for_js(tab, text));
+                evaluate_js_dispatch(webview, &eitri_core::agent_bridge::serialize_draft_for_js(tab, text));
             }
-            evaluate_js_dispatch(
-                webview,
-                &neovibe_core::agent_bridge::serialize_scratch_for_js(tab, false),
-            );
+            evaluate_js_dispatch(webview, &eitri_core::agent_bridge::serialize_scratch_for_js(tab, false));
         }
-        if let neovibe_core::scratch::EditDone::Failed(why) = &result {
+        if let eitri_core::scratch::EditDone::Failed(why) = &result {
             evaluate_js_dispatch(
                 webview,
-                &neovibe_core::agent_bridge::serialize_notice_for_js(&format!("the nvim scratch buffer failed: {why}")),
+                &eitri_core::agent_bridge::serialize_notice_for_js(&format!("the nvim scratch buffer failed: {why}")),
             );
         }
     }
@@ -1698,8 +1686,8 @@ fn send_context_if_changed(state: &Rc<RefCell<AgentPanelState>>, webview: &WebVi
         let mut state_ref = state.borrow_mut();
         let state_ref = &mut *state_ref;
         let summary =
-            neovibe_core::agent_bridge::context_summary((state_ref.editor_context)().as_ref(), &state_ref.project_dir);
-        let now = neovibe_core::agent_bridge::serialize_editor_context_for_js(summary.as_ref());
+            eitri_core::agent_bridge::context_summary((state_ref.editor_context)().as_ref(), &state_ref.project_dir);
+        let now = eitri_core::agent_bridge::serialize_editor_context_for_js(summary.as_ref());
         changed_envelope(&mut state_ref.last_context_payload, now, state_ref.document_ready)
     };
     if let Some(payload) = payload {
@@ -1715,7 +1703,7 @@ fn remember_prompts(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tex
         (s.history_dir.clone(), s.project_dir.clone())
     };
     let Some(dir) = dir else { return };
-    match neovibe_core::prompt_history::append(&dir, &root, texts) {
+    match eitri_core::prompt_history::append(&dir, &root, texts) {
         Ok(entries) => {
             let ready = {
                 let mut s = state.borrow_mut();
@@ -1723,7 +1711,7 @@ fn remember_prompts(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tex
                 s.document_ready
             };
             if ready {
-                let payload = neovibe_core::agent_bridge::serialize_history_for_js(&state.borrow().history);
+                let payload = eitri_core::agent_bridge::serialize_history_for_js(&state.borrow().history);
                 evaluate_js_dispatch(webview, &payload);
             }
         }
@@ -1739,19 +1727,14 @@ fn send_queue(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: TabI
             return;
         }
         let t = s.tabs.get(tab).expect("the active tab exists");
-        neovibe_core::agent_bridge::serialize_queue_for_js(tab, &t.queue, t.queue_error.as_deref())
+        eitri_core::agent_bridge::serialize_queue_for_js(tab, &t.queue, t.queue_error.as_deref())
     };
     evaluate_js_dispatch(webview, &payload);
 }
 
 /// A flush's outcome: the same benign/fatal split a command gets, with no request to
 /// answer. A refusal leaves the queue and its `error` line; the queue envelope says so.
-fn apply_flush(
-    state: &Rc<RefCell<AgentPanelState>>,
-    webview: &WebView,
-    tab: TabId,
-    flush: neovibe_core::tab_set::Flush,
-) {
+fn apply_flush(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: TabId, flush: eitri_core::tab_set::Flush) {
     if flush.outcome.is_ok() {
         title_from_first_prompt(state, tab, &flush.typed);
     }
@@ -1815,8 +1798,8 @@ fn chooser_payload(state: &AgentPanelState) -> String {
             let facts = t.facts();
             ChooserTab {
                 tab: t.id,
-                label: neovibe_core::tabs::label(t.number, &t.label_name()),
-                marker: neovibe_core::tabs::marker(facts),
+                label: eitri_core::tabs::label(t.number, &t.label_name()),
+                marker: eitri_core::tabs::marker(facts),
                 pending: facts.pending,
                 resumable,
             }
@@ -1826,7 +1809,7 @@ fn chooser_payload(state: &AgentPanelState) -> String {
     let records = chooser_records(&greeting.resumable, &state.tabs.open_session_ids(), |id| {
         agent::lease::SessionLease::is_held("claude", canonical, id).unwrap_or(false)
     });
-    neovibe_core::agent_bridge::serialize_chooser_for_js(&open, &records)
+    eitri_core::agent_bridge::serialize_chooser_for_js(&open, &records)
 }
 
 /// The detail popover's envelope for `tab` (`prefix i`, `open_detail{tab}`).
@@ -1840,20 +1823,20 @@ fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
             state
                 .rules_dir
                 .as_ref()
-                .map(|d| neovibe_core::permission_store::path(d, &state.project_dir))
+                .map(|d| eitri_core::permission_store::path(d, &state.project_dir))
                 .as_deref(),
         ),
         None => Vec::new(),
     };
-    neovibe_core::agent_bridge::serialize_tab_detail_for_js(tab, &rows)
+    eitri_core::agent_bridge::serialize_tab_detail_for_js(tab, &rows)
 }
 
 /// The backend a tab command acts on, or the benign "no active session" refusal (an empty,
 /// starting or failed tab). Never another tab's.
 fn backend_for(
-    tabs: &mut neovibe_core::tab_set::TabSet,
+    tabs: &mut eitri_core::tab_set::TabSet,
     tab: TabId,
-) -> Result<&mut AgentBackend, neovibe_core::agent_backend::BackendError> {
+) -> Result<&mut AgentBackend, eitri_core::agent_backend::BackendError> {
     tabs.get_mut(tab)
         .and_then(|t| t.live_mut())
         .ok_or_else(no_session_error)
@@ -2123,7 +2106,7 @@ fn send_first_turn(
     let outcome = {
         let mut state_ref = state.borrow_mut();
         if let Some(t) = state_ref.tabs.get_mut(tab) {
-            t.turn_trace = neovibe_core::turn_trace::TurnTrace::start();
+            t.turn_trace = eitri_core::turn_trace::TurnTrace::start();
         }
         backend_for(&mut state_ref.tabs, tab).and_then(|backend| backend.send_turn(&turn.wire, &turn.typed))
     };
@@ -2203,7 +2186,7 @@ fn collect_pending_handoffs(state: &Rc<RefCell<AgentPanelState>>, webview: &WebV
 /// What one tick of the handoff collector found, as a value rather than as control flow.
 ///
 /// Split out because this is the sequencing the whole feature's honesty rests on -- the card says
-/// "This conversation is closed in Neovibe", which is true only because the command is not released
+/// "This conversation is closed in Eitri", which is true only because the command is not released
 /// until `AgentBackend::shutdown()` has returned -- and a property that load-bearing should be
 /// assertable without a `WebView`, a GTK loop or a real backend.
 #[derive(Debug, PartialEq, Eq)]
@@ -2239,7 +2222,7 @@ fn handoff_payloads(
     match outcome {
         HandoffCloseOutcome::StillClosing => Vec::new(),
         HandoffCloseOutcome::Closed => vec![
-            neovibe_core::agent_bridge::serialize_handoff_for_js(tab, command),
+            eitri_core::agent_bridge::serialize_handoff_for_js(tab, command),
             serialize_command_result_for_js(request_id, Ok(())),
         ],
         // The session is gone regardless -- it was handed to the worker before this. Saying so is
@@ -2325,7 +2308,7 @@ fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool
 /// A `permission_response`'s own fields, out of the message (see `answer_permission_response`).
 struct PermissionAnswer {
     permission_id: String,
-    decision: neovibe_core::agent_bridge::DecisionChoice,
+    decision: eitri_core::agent_bridge::DecisionChoice,
     reason: Option<String>,
     remember: bool,
 }
@@ -2356,7 +2339,7 @@ impl PermissionAnswer {
 /// the CLI's prompt for the same call can proceed without a second card. `Err` is a
 /// refusal shown by the panel, leaving the card usable; `Ok` contains the answer's outcome.
 fn answer_permission_response(
-    tabs: &mut neovibe_core::tab_set::TabSet,
+    tabs: &mut eitri_core::tab_set::TabSet,
     rules_dir: Option<&Path>,
     project_dir: &Path,
     tab: TabId,
@@ -2381,12 +2364,12 @@ fn answer_permission_response(
         let Some(dir) = rules_dir else {
             return Err("no state directory: the rule cannot be saved".to_string());
         };
-        match neovibe_core::permission_store::add(dir, project_dir, &rule) {
+        match eitri_core::permission_store::add(dir, project_dir, &rule) {
             Ok(rules) => {
                 eprintln!(
                     "[permission] rule saved: {} ({})",
                     rule.to_rule_string(),
-                    neovibe_core::permission_store::path(dir, project_dir).display()
+                    eitri_core::permission_store::path(dir, project_dir).display()
                 );
                 tabs.set_rules(rules);
             }
@@ -2408,14 +2391,14 @@ fn answer_permission_response(
 fn rule_to_remember(
     tab: &Tab,
     permission_id: &str,
-    decision: neovibe_core::agent_bridge::DecisionChoice,
+    decision: eitri_core::agent_bridge::DecisionChoice,
     remember: bool,
     still_pending: bool,
 ) -> Result<Option<agent::PrefixRule>, &'static str> {
     if !remember {
         return Ok(None);
     }
-    if decision != neovibe_core::agent_bridge::DecisionChoice::Allow {
+    if decision != eitri_core::agent_bridge::DecisionChoice::Allow {
         return Err("only an allow can be remembered");
     }
     if !still_pending {
@@ -2449,7 +2432,7 @@ fn now_ms() -> u64 {
 /// the success and failure paths diverged in the first place, and it makes the rule testable
 /// without a WebView.
 fn events_owed(
-    outcome: &Result<Vec<agent::AgentDomainEvent>, neovibe_core::agent_backend::BackendError>,
+    outcome: &Result<Vec<agent::AgentDomainEvent>, eitri_core::agent_backend::BackendError>,
 ) -> &[agent::AgentDomainEvent] {
     match outcome {
         Ok(events) => events,
@@ -2654,15 +2637,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 reset_nav_mode_for_ready(state_ref);
                 let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
                 let open = state_ref.tabs.open_session_ids();
-                let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
-                let context = neovibe_core::agent_bridge::context_summary(
+                let theme = eitri_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
+                let context = eitri_core::agent_bridge::context_summary(
                     (state_ref.editor_context)().as_ref(),
                     &state_ref.project_dir,
                 );
-                let context_payload = neovibe_core::agent_bridge::serialize_editor_context_for_js(context.as_ref());
+                let context_payload = eitri_core::agent_bridge::serialize_editor_context_for_js(context.as_ref());
                 state_ref.last_context_payload = Some(context_payload.clone());
                 let window = vec![
-                    neovibe_core::agent_bridge::serialize_history_for_js(&state_ref.history),
+                    eitri_core::agent_bridge::serialize_history_for_js(&state_ref.history),
                     context_payload,
                 ];
                 let tabs = tabs_payload_recorded(state_ref);
@@ -2677,7 +2660,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     state_ref.keymap_help.as_deref(),
                 );
                 // Last, so nothing the document draws from the payloads above can reset it.
-                payloads.push(neovibe_core::agent_bridge::serialize_pane_focus_for_js(
+                payloads.push(eitri_core::agent_bridge::serialize_pane_focus_for_js(
                     state_ref.pane_focused,
                 ));
                 state_ref.last_open_ids = open;
@@ -2707,7 +2690,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 // `send_turn` on either path. A `None` context means the turn goes out exactly as
                 // the user typed it.
                 let composed =
-                    neovibe_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
+                    eitri_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
                 let kind = state_ref.backend_kind;
                 let project_dir = state_ref.project_dir.clone();
                 let t = state_ref.tabs.get_mut(tab).expect("resolved above");
@@ -2720,7 +2703,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                         TabBackend::Live(backend) => {
                             // Stamped before the call, so the trace's zero is the user's action
                             // rather than the moment the backend got around to accepting it.
-                            let trace = neovibe_core::turn_trace::TurnTrace::start();
+                            let trace = eitri_core::turn_trace::TurnTrace::start();
                             // `&text` second, and it is the user's own: the panel shows what was
                             // typed, never the composed wire text.
                             let outcome = backend.send_turn(&composed, &text);
@@ -3051,7 +3034,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             // borrowed") once a tab could actually reach `Changed` by leaving bypass.
             let outcome = state.borrow_mut().tabs.cycle_mode(tab);
             match outcome {
-                Ok(neovibe_core::tab_set::ModeCycle::Changed(mode)) => {
+                Ok(eitri_core::tab_set::ModeCycle::Changed(mode)) => {
                     if was_empty {
                         let (prefs_dir, project_dir) = {
                             let state_ref = state.borrow();
@@ -3060,7 +3043,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                         // Remembered for the next empty tab and the next launch. A
                         // failure to write is logged, not refused: the mode itself did change.
                         if let Some(dir) = prefs_dir {
-                            if let Err(e) = neovibe_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
+                            if let Err(e) = eitri_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
                                 eprintln!("[agent_panel] could not remember the permission mode: {e}");
                             }
                         }
@@ -3068,10 +3051,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     send_tabs(state, webview);
                     ok(webview);
                 }
-                Ok(neovibe_core::tab_set::ModeCycle::Confirm(plan)) => {
+                Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => {
                     evaluate_js_dispatch(
                         webview,
-                        &neovibe_core::agent_bridge::serialize_confirm_bypass_for_js(&plan),
+                        &eitri_core::agent_bridge::serialize_confirm_bypass_for_js(&plan),
                     );
                     ok(webview);
                 }
@@ -3092,8 +3075,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 let mut state_ref = state.borrow_mut();
                 let state_ref = &mut *state_ref;
                 // Captured now: what the editor shows when Enter is pressed.
-                let wire =
-                    neovibe_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
+                let wire = eitri_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
                 state_ref.tabs.queue_message(tab, &text, wire, now_ms())
             };
             match queued {
@@ -3115,7 +3097,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let texts = state.borrow_mut().tabs.take_back_queue(tab);
             evaluate_js_dispatch(
                 webview,
-                &neovibe_core::agent_bridge::serialize_queue_taken_for_js(tab, &texts),
+                &eitri_core::agent_bridge::serialize_queue_taken_for_js(tab, &texts),
             );
             send_queue(state, webview, tab);
             ok(webview);
@@ -3125,8 +3107,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let result = {
                 let mut state_ref = state.borrow_mut();
                 let state_ref = &mut *state_ref;
-                let wire =
-                    neovibe_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
+                let wire = eitri_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
                 state_ref.tabs.send_now(tab, &text, wire, now_ms())
             };
             if !text.trim().is_empty() {
@@ -3134,11 +3115,11 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             }
             match result {
                 Err(why) => refuse(webview, &why),
-                Ok(neovibe_core::tab_set::SendNow::Interrupting(outcome)) => {
+                Ok(eitri_core::tab_set::SendNow::Interrupting(outcome)) => {
                     send_queue(state, webview, tab);
                     apply_command_outcome(state, webview, tab, &request_id, outcome);
                 }
-                Ok(neovibe_core::tab_set::SendNow::Flushed(flush)) => {
+                Ok(eitri_core::tab_set::SendNow::Flushed(flush)) => {
                     if let Some(flush) = flush {
                         apply_flush(state, webview, tab, flush);
                     }
@@ -3166,7 +3147,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 refuse(webview, &format!("no such file: {path}"));
                 return;
             }
-            let keys = neovibe_core::scratch::open_request(&resolved, line).input_keys();
+            let keys = eitri_core::scratch::open_request(&resolved, line).input_keys();
             match request_editor(state, &keys) {
                 Ok(()) => ok(webview),
                 Err(why) => refuse(webview, &why),
@@ -3204,17 +3185,14 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 let mut state_ref = state.borrow_mut();
                 state_ref
                     .tabs
-                    .finish_scratch_edit(edit.id, &neovibe_core::scratch::EditDone::Discarded);
+                    .finish_scratch_edit(edit.id, &eitri_core::scratch::EditDone::Discarded);
                 edit.cleanup();
                 drop(state_ref);
                 return refuse(webview, &why);
             }
             state.borrow_mut().tabs.set_draft(tab, &text);
             state.borrow_mut().pending_edits.push(edit);
-            evaluate_js_dispatch(
-                webview,
-                &neovibe_core::agent_bridge::serialize_scratch_for_js(tab, true),
-            );
+            evaluate_js_dispatch(webview, &eitri_core::agent_bridge::serialize_scratch_for_js(tab, true));
             ok(webview);
         }
         // `<leader>bd`: quiet unless `close_needs_confirm`; `prefix &` never comes through here.
@@ -3240,14 +3218,14 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             // `Shift+Tab` on the chooser's `New session` row or a saved session cycles the window default.
             // Like a tab's `CycleMode`, `Confirm` sends a y/n prompt answered by `confirm_bypass`.
             match cycle_default_mode(state) {
-                neovibe_core::tab_set::ModeCycle::Changed(_) => {
+                eitri_core::tab_set::ModeCycle::Changed(_) => {
                     send_tabs(state, webview);
                     ok(webview);
                 }
-                neovibe_core::tab_set::ModeCycle::Confirm(plan) => {
+                eitri_core::tab_set::ModeCycle::Confirm(plan) => {
                     evaluate_js_dispatch(
                         webview,
-                        &neovibe_core::agent_bridge::serialize_confirm_bypass_for_js(&plan),
+                        &eitri_core::agent_bridge::serialize_confirm_bypass_for_js(&plan),
                     );
                     ok(webview);
                 }
@@ -3321,7 +3299,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             Ok(scope) => {
                 let before = state.borrow().tabs.attention();
                 match apply_confirm_bypass(state, scope, nonce) {
-                    Ok(neovibe_core::tab_set::ConfirmOutcome::Entered { resolved, .. }) => {
+                    Ok(eitri_core::tab_set::ConfirmOutcome::Entered { resolved, .. }) => {
                         // The legacy CLI reports no event for a hook reply, so deliver the returned resolutions
                         // here to remove approved cards immediately. Otherwise they remain visible and counted
                         // until the next snapshot. Tab scope is always the active tab; window-default scope
@@ -3340,16 +3318,16 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                         report_attention(state, before);
                         ok(webview);
                     }
-                    Ok(neovibe_core::tab_set::ConfirmOutcome::AlreadyBypass) => {
+                    Ok(eitri_core::tab_set::ConfirmOutcome::AlreadyBypass) => {
                         send_tabs(state, webview);
                         ok(webview);
                     }
-                    Ok(neovibe_core::tab_set::ConfirmOutcome::Reprompt(plan)) => {
+                    Ok(eitri_core::tab_set::ConfirmOutcome::Reprompt(plan)) => {
                         // A card arrived while the prompt was open. Keep the mode unchanged and show the updated
                         // count with a fresh nonce.
                         evaluate_js_dispatch(
                             webview,
-                            &neovibe_core::agent_bridge::serialize_confirm_bypass_for_js(&plan),
+                            &eitri_core::agent_bridge::serialize_confirm_bypass_for_js(&plan),
                         );
                         ok(webview);
                     }
@@ -3364,15 +3342,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
 /// Bypass is never written to disk, and `Confirm` writes nothing here.
 /// A write failure is logged without refusing the mode change that already took effect.
 /// This body avoids the WebView for testing; the message handler sends tabs and the prompt.
-fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>) -> neovibe_core::tab_set::ModeCycle {
+fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>) -> eitri_core::tab_set::ModeCycle {
     let outcome = state.borrow_mut().tabs.cycle_default_mode();
-    if let neovibe_core::tab_set::ModeCycle::Changed(mode) = outcome {
+    if let eitri_core::tab_set::ModeCycle::Changed(mode) = outcome {
         let (prefs_dir, project_dir) = {
             let state_ref = state.borrow();
             (state_ref.prefs_dir.clone(), state_ref.project_dir.clone())
         };
         if let Some(dir) = prefs_dir {
-            if let Err(e) = neovibe_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
+            if let Err(e) = eitri_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
                 eprintln!("[agent_panel] could not remember the permission mode: {e}");
             }
         }
@@ -3385,9 +3363,9 @@ fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>) -> neovibe_core::tab
 /// Bypass is never persisted, so this wrapper only forwards the call.
 fn apply_confirm_bypass(
     state: &Rc<RefCell<AgentPanelState>>,
-    scope: neovibe_core::tab_set::BypassScope,
+    scope: eitri_core::tab_set::BypassScope,
     nonce: u64,
-) -> Result<neovibe_core::tab_set::ConfirmOutcome, String> {
+) -> Result<eitri_core::tab_set::ConfirmOutcome, String> {
     state.borrow_mut().tabs.confirm_bypass(scope, nonce)
 }
 
@@ -3463,7 +3441,7 @@ fn web_url(url: &str) -> Option<&str> {
     let (host, port) = authority.split_once(':').unwrap_or((authority, ""));
     let host_ok = !host.is_empty()
         && !host.ends_with('.')
-        && host != "neovibe.invalid"
+        && host != "eitri.invalid"
         && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
     (host_ok && port.chars().all(|c| c.is_ascii_digit())).then_some(url)
 }
@@ -3506,9 +3484,9 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: TabId
         return Err("this tab is still being handed off to a terminal; close it once that finishes");
     }
     let mut owed = Vec::new();
-    for step in neovibe_core::tabs::close_steps(&facts) {
+    for step in eitri_core::tabs::close_steps(&facts) {
         match step {
-            neovibe_core::tabs::CloseStep::Interrupt => {
+            eitri_core::tabs::CloseStep::Interrupt => {
                 let interrupted = backend_for(&mut state.borrow_mut().tabs, tab).and_then(|b| b.interrupt());
                 if let Err(e) = interrupted {
                     // The close goes on: the shutdown below ends the turn anyway.
@@ -3519,13 +3497,13 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: TabId
                 }
             }
             // Queued text is saved as history before the tab closes.
-            neovibe_core::tabs::CloseStep::QueueToHistory => {
+            eitri_core::tabs::CloseStep::QueueToHistory => {
                 let texts = state.borrow().tabs.queue_texts(tab);
                 remember_prompts(state, webview, &texts);
             }
             // Folded into `Remove`: `Retiring::tab` shuts the removed tab's backend down.
-            neovibe_core::tabs::CloseStep::Shutdown => {}
-            neovibe_core::tabs::CloseStep::Remove => {
+            eitri_core::tabs::CloseStep::Shutdown => {}
+            eitri_core::tabs::CloseStep::Remove => {
                 let mut state_ref = state.borrow_mut();
                 let state_ref = &mut *state_ref;
                 if let Some(removed) = state_ref.tabs.remove(tab) {
@@ -3553,10 +3531,10 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: TabId
 
 /// A command arriving with no session. Benign: the frontend's start screen is showing, or the
 /// session just ended -- either way the panel is healthy and there is nothing to tear down.
-fn no_session_error() -> neovibe_core::agent_backend::BackendError {
+fn no_session_error() -> eitri_core::agent_backend::BackendError {
     // `folded_events` empty for the same reason: with no session there is no projection, so this
     // command changed nothing the frontend is owed. See `BackendError::folded_events`.
-    neovibe_core::agent_backend::BackendError {
+    eitri_core::agent_backend::BackendError {
         message: "no active session".to_string(),
         benign: true,
         folded_events: Vec::new(),
@@ -3600,7 +3578,7 @@ fn themed_document(vars: &[(String, String)]) -> String {
 
 /// The WebView's own background, which shows before the web process has painted anything. WebKit
 /// defaults it to opaque white.
-fn paint_webview_background(webview: &WebView, tokens: &neovibe_core::theme::ThemeTokens) {
+fn paint_webview_background(webview: &WebView, tokens: &eitri_core::theme::ThemeTokens) {
     let bg = tokens.bg;
     webview.set_background_color(&gtk4::gdk::RGBA::new(
         f32::from(bg.r) / 255.0,
@@ -3614,7 +3592,7 @@ fn paint_webview_background(webview: &WebView, tokens: &neovibe_core::theme::The
 /// reaches the clipboard -- with no base the document's origin is opaque and it does not (GUI pass,
 /// 2026-09-25). `.invalid` never resolves (RFC 2606): nothing is ever fetched from it, and a
 /// relative link is still a `LinkClicked` that `connect_decide_policy` hands to the browser.
-const PANEL_BASE_URI: &str = "https://neovibe.invalid/";
+const PANEL_BASE_URI: &str = "https://eitri.invalid/";
 
 /// Rendered model content is untrusted. This CSP sets a floor the page cannot loosen, both as
 /// `WebView`'s `default-content-security-policy` in `build_agent_panel` and as the first element
@@ -3670,10 +3648,10 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
 mod tests {
     use super::*;
 
-    use neovibe_core::agent_bridge::SessionModeChoice;
-    use neovibe_core::tab_set::{TabBackend, TabSet};
-    use neovibe_core::tabs::TabId;
-    use neovibe_core::test_providers::RecordingProvider;
+    use eitri_core::agent_bridge::SessionModeChoice;
+    use eitri_core::tab_set::{TabBackend, TabSet};
+    use eitri_core::tabs::TabId;
+    use eitri_core::test_providers::RecordingProvider;
 
     /// Pins `SIDECAR_STOPPED_MARKER` against the Rust that actually produces it, the same way
     /// `agent-ui/web/src/problems.test.ts`'s own "matches watch.rs's own wording" test pins the
@@ -3723,7 +3701,7 @@ mod tests {
     /// reached the clipboard. `load_html(.., None)` gives the document an opaque origin, which is not
     /// a secure context, so WebKitGTK 2.52.6 has no `navigator.clipboard` and the optional chain
     /// did nothing. Measured in the sandbox with a bare WebKitGTK view: base `None`, nothing copied;
-    /// base `https://neovibe.invalid/`, `wl-paste` printed the text. Every `load_html` here must
+    /// base `https://eitri.invalid/`, `wl-paste` printed the text. Every `load_html` here must
     /// pass the secure base, and the base must stay one that never resolves (RFC 2606 `.invalid`):
     /// a relative link is still a `LinkClicked` the navigation guard hands to the browser.
     #[test]
@@ -3772,10 +3750,7 @@ mod tests {
     fn a_permission_answer_names_its_own_tab_not_the_active_one() {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("panel-permission-tab");
-        let mut set = TabSet::new(
-            BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
-        );
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let asking = set.active();
         let (asking_provider, backend) = live_backend(&dir);
         set.get_mut(asking).unwrap().backend = TabBackend::Live(backend);
@@ -3829,10 +3804,7 @@ mod tests {
     fn the_panels_approve_route_lets_the_clis_own_prompt_for_that_call_through() {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("panel-o3-approve-route");
-        let mut set = TabSet::new(
-            BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
-        );
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let tab = set.active();
         let (provider, backend) = live_backend(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
@@ -3901,10 +3873,7 @@ mod tests {
     fn a_closed_tabs_teardown_and_connect_are_kept_until_they_finish() {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("panel-retiring");
-        let mut set = TabSet::new(
-            BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
-        );
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let live = set.active();
         set.get_mut(live).unwrap().backend = TabBackend::Live(live_backend(&dir).1);
         let connecting = set.open();
@@ -3944,10 +3913,7 @@ mod tests {
 
     #[test]
     fn a_command_to_a_tab_with_no_session_is_a_benign_refusal() {
-        let mut set = TabSet::new(
-            BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
-        );
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let tab = set.active();
         let error = backend_for(&mut set, tab).err().expect("an empty tab has no backend");
         assert!(error.benign);
@@ -3968,7 +3934,7 @@ mod tests {
             supervisor: None,
             supervisor_pending: None,
             shutting_down: false,
-            theme: neovibe_core::theme::ThemeTokens::fallback(),
+            theme: eitri_core::theme::ThemeTokens::fallback(),
             keymap_help: None,
             pane_focused: false,
             hint_hook: None,
@@ -4010,7 +3976,7 @@ mod tests {
         handle.arrive();
         handle.enter_input();
         handle.nav_key(NavKeyDirection::Down);
-        handle.literal_key(&neovibe_core::keymap::KeySpec::parse("C-b").unwrap());
+        handle.literal_key(&eitri_core::keymap::KeySpec::parse("C-b").unwrap());
         handle.open_keymap();
         handle.set_keymap_help("{}".to_string());
         assert!(state.borrow().pane_focused);
@@ -4025,7 +3991,7 @@ mod tests {
         handle.hint_end(1);
 
         // Theme, zoom, reload and a crash report: recorded where there is state, nothing else.
-        let mut tokens = neovibe_core::theme::ThemeTokens::fallback();
+        let mut tokens = eitri_core::theme::ThemeTokens::fallback();
         tokens.font_size_px = 17.0;
         handle.set_theme(&tokens);
         assert_eq!(state.borrow().theme.font_size_px, 17.0);
@@ -4066,7 +4032,7 @@ mod tests {
     fn tab_verb_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_action() {
         let state = state_for_hooks(TabSet::new(
             BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         assert_eq!(run_tab_verb(&state, TabVerbWire::Close), Err("tab verbs are not wired"));
 
@@ -4097,7 +4063,7 @@ mod tests {
     fn tab_verb_hook_may_borrow_the_panel_state_mutably() {
         let state = state_for_hooks(TabSet::new(
             BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         let ran = Rc::new(RefCell::new(0usize));
         {
@@ -4119,7 +4085,7 @@ mod tests {
     fn a_panel_keys_message_updates_the_mirror_handle_inbound_message_records() {
         let state = state_for_hooks(TabSet::new(
             BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         assert_eq!(state.borrow().nav_mode.get(), PanelKeys::Other);
         for mode in [PanelKeys::Browse, PanelKeys::Input, PanelKeys::Other] {
@@ -4138,7 +4104,7 @@ mod tests {
     fn ready_resets_the_nav_mode_mirror_to_other() {
         let state = state_for_hooks(TabSet::new(
             BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         for stale in [PanelKeys::Input, PanelKeys::Browse] {
             state.borrow().nav_mode.set(stale);
@@ -4158,7 +4124,7 @@ mod tests {
     fn a_dead_pages_nav_mode_is_forgotten_before_any_ready() {
         let state = state_for_hooks(TabSet::new(
             BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         for stale in [PanelKeys::Input, PanelKeys::Browse] {
             state.borrow().nav_mode.set(stale);
@@ -4169,12 +4135,12 @@ mod tests {
 
     /// The same shape as `tab_verb_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_action`:
     /// a refusal naming why until `main.rs` installs a hook, then called with the mapped
-    /// `neovibe_core::layout::Direction` -- both wire values, not just one.
+    /// `eitri_core::layout::Direction` -- both wire values, not just one.
     #[test]
     fn nav_fallthrough_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_direction() {
         let state = state_for_hooks(TabSet::new(
             BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         assert_eq!(
             run_nav_fallthrough(&state, NavKeyDirection::Down),
@@ -4203,7 +4169,7 @@ mod tests {
     fn pane_nav_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_direction() {
         let state = state_for_hooks(TabSet::new(
             BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         for wire in [
             PaneNavDirection::Left,
@@ -4242,7 +4208,7 @@ mod tests {
     fn pane_nav_does_not_hold_the_state_borrowed_while_the_hook_runs() {
         let state = state_for_hooks(TabSet::new(
             BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         let reentrant = Rc::downgrade(&state);
         state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(move |_| {
@@ -4281,11 +4247,11 @@ mod tests {
             "javascript:alert(1)",
             "mailto:a@b",
             "docs/a.md",
-            "https://neovibe.invalid/x",
-            "https://NEOVIBE.invalid/x",
-            "https://neovibe.invalid./x",
-            "https://%6eeovibe.invalid/x",
-            r"https:\\neovibe.invalid\x",
+            "https://eitri.invalid/x",
+            "https://EITRI.invalid/x",
+            "https://eitri.invalid./x",
+            "https://%65itri.invalid/x",
+            r"https:\\eitri.invalid\x",
             r"https://example.com\@evil/",
             r"https://example.com/?a\b",
             "https://a b",
@@ -4335,7 +4301,7 @@ mod tests {
         state.borrow_mut().project_dir = project_dir.clone();
 
         let plan = match cycle_default_mode(&state) {
-            neovibe_core::tab_set::ModeCycle::Confirm(plan) => plan,
+            eitri_core::tab_set::ModeCycle::Confirm(plan) => plan,
             other => panic!("auto -> bypass must ask first: {other:?}"),
         };
         assert_eq!(
@@ -4344,8 +4310,8 @@ mod tests {
             "nothing moved yet"
         );
         assert_eq!(
-            neovibe_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
-            neovibe_core::agent_prefs::LoadedMode::Missing,
+            eitri_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            eitri_core::agent_prefs::LoadedMode::Missing,
             "nothing on disk yet"
         );
 
@@ -4353,7 +4319,7 @@ mod tests {
         // It updates the in-memory default and writes nothing to disk.
         assert_eq!(
             apply_confirm_bypass(&state, plan.scope, plan.nonce),
-            Ok(neovibe_core::tab_set::ConfirmOutcome::Entered {
+            Ok(eitri_core::tab_set::ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
             })
@@ -4363,20 +4329,20 @@ mod tests {
         // `confirm_bypass(Default, ..)` must not).
         assert_eq!(set_mode(&state, open_tab), SessionModeChoice::Auto);
         assert_eq!(
-            neovibe_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
-            neovibe_core::agent_prefs::LoadedMode::Missing,
+            eitri_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            eitri_core::agent_prefs::LoadedMode::Missing,
             "still nothing on disk while bypass"
         );
 
         // Leaving bypass changes the mode to Auto immediately and persists it.
         assert_eq!(
             cycle_default_mode(&state),
-            neovibe_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto)
+            eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto)
         );
         assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Auto);
         assert_eq!(
-            neovibe_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
-            neovibe_core::agent_prefs::LoadedMode::Remembered(SessionModeChoice::Auto)
+            eitri_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            eitri_core::agent_prefs::LoadedMode::Remembered(SessionModeChoice::Auto)
         );
     }
 
@@ -4402,20 +4368,20 @@ mod tests {
         state.borrow_mut().project_dir = project_dir.clone();
 
         let plan = match state.borrow_mut().tabs.cycle_mode(tab) {
-            Ok(neovibe_core::tab_set::ModeCycle::Confirm(plan)) => plan,
+            Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => plan,
             other => panic!("an empty auto tab must ask first: {other:?}"),
         };
         assert_eq!(
             apply_confirm_bypass(&state, plan.scope, plan.nonce),
-            Ok(neovibe_core::tab_set::ConfirmOutcome::Entered {
+            Ok(eitri_core::tab_set::ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
             })
         );
         assert_eq!(set_mode(&state, tab), SessionModeChoice::Bypass);
         assert_eq!(
-            neovibe_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
-            neovibe_core::agent_prefs::LoadedMode::Missing,
+            eitri_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            eitri_core::agent_prefs::LoadedMode::Missing,
             "bypass is never written, even the one apply_confirm_bypass itself enters"
         );
     }
@@ -4464,7 +4430,7 @@ mod tests {
         let state = state_for_hooks(set);
 
         let plan = match state.borrow_mut().tabs.cycle_mode(tab) {
-            Ok(neovibe_core::tab_set::ModeCycle::Confirm(plan)) => plan,
+            Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => plan,
             other => panic!("an empty auto tab must ask first: {other:?}"),
         };
 
@@ -4526,17 +4492,17 @@ mod tests {
 
     #[test]
     fn ready_sends_the_history_and_the_editor_context_before_the_tabs() {
-        let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
-        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js(
+        let theme = eitri_core::agent_bridge::serialize_theme_for_js(&eitri_core::theme::ThemeTokens::fallback());
+        let keymap = eitri_core::agent_bridge::serialize_keymap_for_js(
             "Ctrl+b",
             &[],
             &[],
-            &neovibe_core::keymap::panel::effective(&Default::default(), None).0,
+            &eitri_core::keymap::panel::effective(&Default::default(), None).0,
             "Ctrl+b c",
         );
         let window = vec![
-            neovibe_core::agent_bridge::serialize_history_for_js(&["earlier".into()]),
-            neovibe_core::agent_bridge::serialize_editor_context_for_js(None),
+            eitri_core::agent_bridge::serialize_history_for_js(&["earlier".into()]),
+            eitri_core::agent_bridge::serialize_editor_context_for_js(None),
         ];
         let payloads = ready_payloads(
             legacy_greeting(),
@@ -4557,11 +4523,8 @@ mod tests {
     /// Rust offered for the card rather than from the panel.
     #[test]
     fn remember_saves_only_the_rule_rust_offered_and_only_with_an_allow() {
-        use neovibe_core::agent_bridge::DecisionChoice;
-        let mut set = TabSet::new(
-            BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
-        );
+        use eitri_core::agent_bridge::DecisionChoice;
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let tab = set.active();
         set.get_mut(tab)
             .unwrap()
@@ -4594,11 +4557,8 @@ mod tests {
     /// Offers are only recomputed once per pump tick.
     #[test]
     fn a_no_longer_pending_request_saves_no_rule_even_if_still_offered() {
-        use neovibe_core::agent_bridge::DecisionChoice;
-        let mut set = TabSet::new(
-            BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
-        );
+        use eitri_core::agent_bridge::DecisionChoice;
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let tab = set.active();
         set.get_mut(tab)
             .unwrap()
@@ -4621,10 +4581,7 @@ mod tests {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("panel-permission-remember-race");
         let rules_dir = dir.join("rules");
-        let mut set = TabSet::new(
-            BackendKind::Sidecar,
-            neovibe_core::agent_bridge::SessionModeChoice::Auto,
-        );
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let tab = set.active();
         let (provider, backend) = live_backend(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
@@ -4698,8 +4655,8 @@ mod tests {
             answer_permission_response(&mut set, Some(&rules_dir), &dir, tab, response("perm-1", "allow", true));
         assert_eq!(replay.map(|_| ()), Err("this request was already answered".to_string()));
         assert_eq!(
-            neovibe_core::permission_store::load(&rules_dir, &dir),
-            neovibe_core::permission_store::LoadedRules::Missing,
+            eitri_core::permission_store::load(&rules_dir, &dir),
+            eitri_core::permission_store::LoadedRules::Missing,
             "no rule was saved"
         );
         assert_eq!(provider.resolutions().len(), 1, "and nothing more reached the provider");
@@ -4712,14 +4669,14 @@ mod tests {
 
     #[test]
     fn the_detail_popover_counts_the_queue_and_names_the_rules_file() {
-        let mut set = TabSet::new(BackendKind::Legacy, neovibe_core::agent_bridge::SessionModeChoice::Auto);
+        let mut set = TabSet::new(BackendKind::Legacy, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let tab = set.active();
-        set.get_mut(tab).unwrap().queue.push(neovibe_core::tab_set::Queued {
+        set.get_mut(tab).unwrap().queue.push(eitri_core::tab_set::Queued {
             text: "a".into(),
             wire: "a".into(),
             queued_at_ms: 0,
         });
-        let rules = std::path::Path::new("/s/neovibe/permissions/0123456789abcdef.json");
+        let rules = std::path::Path::new("/s/eitri/permissions/0123456789abcdef.json");
         let rows = detail_rows(
             set.active_tab(),
             BackendKind::Legacy,
@@ -4742,12 +4699,12 @@ mod tests {
 
     #[test]
     fn ready_sends_hello_theme_keymap_tabs_then_the_active_tabs_state() {
-        let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
-        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js(
+        let theme = eitri_core::agent_bridge::serialize_theme_for_js(&eitri_core::theme::ThemeTokens::fallback());
+        let keymap = eitri_core::agent_bridge::serialize_keymap_for_js(
             "Ctrl+b",
             &[],
             &[],
-            &neovibe_core::keymap::panel::effective(&Default::default(), None).0,
+            &eitri_core::keymap::panel::effective(&Default::default(), None).0,
             "Ctrl+b c",
         );
         let snapshot = r#"{"kind":"snapshot","tab":1,"throughRevision":3,"state":{}}"#.to_string();
@@ -4821,10 +4778,7 @@ mod tests {
 
     #[test]
     fn the_detail_popover_names_every_identity_and_the_account() {
-        let set = TabSet::new(
-            BackendKind::Legacy,
-            neovibe_core::agent_bridge::SessionModeChoice::Bypass,
-        );
+        let set = TabSet::new(BackendKind::Legacy, eitri_core::agent_bridge::SessionModeChoice::Bypass);
         let rows = detail_rows(
             set.active_tab(),
             BackendKind::Legacy,
@@ -4875,7 +4829,7 @@ mod tests {
     #[test]
     fn the_settings_row_is_the_same_on_an_empty_tab_and_on_either_backend() {
         for kind in [BackendKind::Legacy, BackendKind::Sidecar] {
-            let set = TabSet::new(kind, neovibe_core::agent_bridge::SessionModeChoice::Auto);
+            let set = TabSet::new(kind, eitri_core::agent_bridge::SessionModeChoice::Auto);
             let rows = detail_rows(set.active_tab(), kind, None, std::path::Path::new("/p"), None);
             let settings = rows
                 .iter()
@@ -5001,7 +4955,7 @@ mod tests {
         let folded = vec![agent::AgentDomainEvent::UserPromptSubmitted {
             text: "what does this do?".into(),
         }];
-        let refused: Result<Vec<agent::AgentDomainEvent>, _> = Err(neovibe_core::agent_backend::BackendError {
+        let refused: Result<Vec<agent::AgentDomainEvent>, _> = Err(eitri_core::agent_backend::BackendError {
             message: "a turn is already in progress".into(),
             benign: true,
             folded_events: folded.clone(),
@@ -5026,11 +4980,11 @@ mod tests {
     #[test]
     fn the_embedded_panel_document_carries_the_frontend_and_its_dispatch_entry_point() {
         assert!(
-            AGENT_UI_HTML.contains("__neovibeDispatch"),
+            AGENT_UI_HTML.contains("__eitriDispatch"),
             "the embedded document never installs the global Rust pushes into -- every envelope would be dropped"
         );
         assert!(
-            AGENT_UI_HTML.contains("neovibeAgent"),
+            AGENT_UI_HTML.contains("eitriAgent"),
             "the embedded document never posts through the script-message handler -- no command could reach Rust"
         );
     }
@@ -5039,7 +4993,7 @@ mod tests {
     /// is parsed before the script that renders anything, and nothing else in the document moves.
     #[test]
     fn the_panel_document_carries_its_theme_before_its_script() {
-        let tokens = neovibe_core::theme::ThemeTokens::fallback();
+        let tokens = eitri_core::theme::ThemeTokens::fallback();
         let html = themed_document(&tokens.css_vars());
         let csp_at = html
             .find("<meta http-equiv=\"Content-Security-Policy\"")
@@ -5069,7 +5023,7 @@ mod tests {
     /// so edits cannot silently make the document policy differ from the builder's policy.
     #[test]
     fn the_panel_documents_csp_meta_is_first_in_head_and_matches_the_policy_constant() {
-        let tokens = neovibe_core::theme::ThemeTokens::fallback();
+        let tokens = eitri_core::theme::ThemeTokens::fallback();
         let html = themed_document(&tokens.css_vars());
         let head_at = html.find("<head>").expect("the document has a <head>");
         let after_head = head_at + "<head>".len();
@@ -5211,7 +5165,7 @@ mod tests {
             &[],
             vec![],
             "{\"kind\":\"tabs\"}".to_string(),
-            vec![neovibe_core::agent_bridge::serialize_handoff_for_js(TabId(1), &command)],
+            vec![eitri_core::agent_bridge::serialize_handoff_for_js(TabId(1), &command)],
             None,
             None,
         );
@@ -5266,7 +5220,7 @@ mod tests {
     /// A reloaded document must get its colours back before anything it would draw with them.
     #[test]
     fn the_theme_follows_the_greeting_and_precedes_everything_else() {
-        let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
+        let theme = eitri_core::agent_bridge::serialize_theme_for_js(&eitri_core::theme::ThemeTokens::fallback());
         assert_eq!(
             kinds(&ready_payloads(
                 legacy_greeting(),
@@ -5295,12 +5249,12 @@ mod tests {
     /// document never shows a keymap it was not told.
     #[test]
     fn the_keymap_follows_the_theme() {
-        let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
-        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js(
+        let theme = eitri_core::agent_bridge::serialize_theme_for_js(&eitri_core::theme::ThemeTokens::fallback());
+        let keymap = eitri_core::agent_bridge::serialize_keymap_for_js(
             "Ctrl+b",
             &[],
             &[],
-            &neovibe_core::keymap::panel::effective(&Default::default(), None).0,
+            &eitri_core::keymap::panel::effective(&Default::default(), None).0,
             "Ctrl+b c",
         );
         assert_eq!(
@@ -5331,7 +5285,7 @@ mod tests {
         let greeting = BackendGreeting {
             kind: BackendKind::Sidecar,
             project_dir: PathBuf::from("/home/user/project"),
-            permission_modes: neovibe_core::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES,
+            permission_modes: eitri_core::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES,
             expected_verdandi_revision: None,
             resumable: vec![
                 agent::ResumableSession {

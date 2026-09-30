@@ -1,7 +1,7 @@
 -- The nvim-keys feed loads with --cmd before the user's config. It installs autocommands and
 -- one dict watcher, changing no setting or mapping. It writes one JSON line to the configured
 -- socket only when the report differs from the last one sent.
-local socket = vim.env.NEOVIBE_KEYS_SOCKET
+local socket = vim.env.EITRI_KEYS_SOCKET
 if not socket or socket == "" then
   return
 end
@@ -69,15 +69,15 @@ local function schedule()
     end
   end, 100)
 end
-_G.__neovibe_keys_schedule = schedule
+_G.__eitri_keys_schedule = schedule
 
-local group = vim.api.nvim_create_augroup("neovibe_keys", { clear = true })
+local group = vim.api.nvim_create_augroup("eitri_keys", { clear = true })
 vim.api.nvim_create_autocmd({ "VimEnter", "SourcePost", "FocusLost" }, { group = group, callback = schedule })
 vim.api.nvim_create_autocmd("User", { group = group, pattern = { "VeryLazy", "LazyLoad" }, callback = schedule })
 vim.api.nvim_create_autocmd("OptionSet", { group = group, pattern = { "timeoutlen", "timeout" }, callback = schedule })
 vim.cmd([[
-  function! NeovibeKeysLeaderChanged(d, k, z) abort
-    call v:lua.__neovibe_keys_schedule()
+  function! EitriKeysLeaderChanged(d, k, z) abort
+    call v:lua.__eitri_keys_schedule()
   endfunction
-  call dictwatcheradd(g:, 'mapleader', 'NeovibeKeysLeaderChanged')
+  call dictwatcheradd(g:, 'mapleader', 'EitriKeysLeaderChanged')
 ]])

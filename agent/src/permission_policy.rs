@@ -307,7 +307,7 @@ struct Surroundings<'a> {
 
 /// The one entry point. `tool_name` and `input` are the `PermissionRequested` event's own fields,
 /// verbatim; `project_root` is the session's canonical project directory
-/// (`neovibe_core::project_root`), which is the boundary `Read`/`Grep`/`Glob` are judged against.
+/// (`eitri_core::project_root`), which is the boundary `Read`/`Grep`/`Glob` are judged against.
 ///
 /// Total: every input produces a verdict, and every path that is not a positive, confident match
 /// produces [`PermissionVerdict::AskTheUser`].
@@ -667,21 +667,40 @@ const PROTECTED_EDIT_FILE_BASENAMES: &[&str] = &[
     "pyrightconfig.json",
 ];
 
-/// Classifies `Write`, `Edit` and `NotebookEdit` using the tool's path input in `field`.
-/// The acceptEdits fast path allows an unprotected target inside `root` without asking,
-/// provided it is not hard-linked. Both requested and resolved paths must be inside the
-/// root and pass [`DANGEROUS_DIRECTORIES`], [`DANGEROUS_RELATIVE_PATH`] and
-/// [`PROTECTED_EDIT_FILE_BASENAMES`]. Checking both spellings catches a protected name
-/// that is a symlink to an otherwise unprotected file.
-/// Missing targets use their nearest existing ancestor ([`resolve_missing_edit_target`]),
-/// so new files under unprotected directories can use the fast path. Raw paths containing
-/// `..` or starting with `~` card: the CLI normalizes these before the hook, and applying
-/// `..` lexically after a missing component could skip a real symlink or hard-link check.
-/// An outside requested spelling cards even if it resolves inside, since a link outside
-/// the root could be retargeted between classification and the write.
-/// [`resolve_in_root`] rejects `/proc`, `/sys` and `/dev` paths, links outside the root,
-/// and links that leave it even if they return. Process-dependent links can otherwise
-/// resolve inside here while sending the CLI child's write outside.
+/// Classifies `Write`, `Edit` and `NotebookEdit` using the path input named by `field`.
+/// The `acceptEdits` fast path allows a target only when both its requested and resolved
+/// paths are inside `root`, neither spelling matches [`DANGEROUS_DIRECTORIES`],
+/// [`DANGEROUS_RELATIVE_PATH`] or [`PROTECTED_EDIT_FILE_BASENAMES`], and the target
+/// is not a hard-linked file.
+///
+/// New targets resolve through their nearest existing ancestor with
+/// [`resolve_missing_edit_target`]. This allows new files in unprotected project
+/// directories while catching ancestor symlinks that leave the root.
+///
+/// Raw paths containing `..` or starting with `~` require a card. Applying a missing
+/// tail lexically can otherwise cancel a nonexistent component and skip resolving an
+/// existing symlink or checking a hard link, as in `nx/../escape/x` with `nx` absent.
+/// For these three tools, the CLI normalizes hook input through
+/// `backfillObservableInput`: trimming, expanding `~` and applying `path.resolve`.
+/// Rejecting these raw spellings therefore does not reject the CLI's normalized input.
+///
+/// Protected names are checked on the requested, root-joined spelling before any
+/// filesystem work, as well as on the resolved spelling. Otherwise, a protected path
+/// such as `/project/.npmrc` linked to `/project/config/npm-user.conf` could pass
+/// because the resolved basename alone is unprotected.
+///
+/// Containment also applies to both spellings. A path outside the root can resolve
+/// inside through a link controlled outside the project; retargeting that link could
+/// send the later write elsewhere. CLI 2.1.283's own fast path requires both spellings
+/// to be inside a working directory. A hook `allow` bypasses the ordinary working-directory
+/// ask, so this policy must enforce that boundary itself.
+///
+/// Both spellings being inside is insufficient for process-dependent links. The
+/// application resolves the target, but the CLI child writes it with the project root
+/// as cwd. A link through `/proc/self/cwd/..` can point to different directories in
+/// those processes. [`resolve_in_root`] refuses lookups under `/proc`, `/sys` or `/dev`
+/// and links outside or leaving the root, even if they return inside. Read paths use
+/// the same restriction, including for links that sit outside the root.
 fn classify_edit_target(input: &Value, field: &str, root: &Path) -> Classification {
     let raw = match input.get(field) {
         Some(Value::String(s)) if !s.is_empty() => s,
@@ -2183,7 +2202,7 @@ const MAX_RESOLVED_DEPTH: usize = 128;
 /// The kernel's own trees. What a path through one of them names depends
 /// on WHICH process looks it up -- `/proc/self`, `/proc/thread-self`, `/proc/<pid>/cwd`,
 /// `/proc/<pid>/root`, `/proc/<pid>/fd/<n>`, `/dev/fd` and `/dev/stdin` all lead somewhere
-/// different in neovibe, which judges a path, and in the CLI child, which writes or reads it -- so no
+/// different in Eitri, which judges a path, and in the CLI child, which writes or reads it -- so no
 /// resolution here looks anything up under one of them at all ([`Resolution::ThroughAKernelTree`]).
 /// No per-process link is known in `/sys` or `/dev/shm`; they are refused with the rest rather than
 /// sorted entry by entry, which would be the partial reading this module refuses.

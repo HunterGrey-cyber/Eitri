@@ -25,7 +25,7 @@ use std::io;
 /// Where the fingerprint is written, relative to `web_dir`.
 const FINGERPRINT_REL: &str = "dist/.inputs-sha256";
 /// Where the lockfile's own sha256 is recorded after a successful `npm ci`, relative to `web_dir`.
-const LOCK_SHA_REL: &str = "node_modules/.neovibe-lock-sha256";
+const LOCK_SHA_REL: &str = "node_modules/.eitri-lock-sha256";
 
 /// What `ensure_web_bundle_built` decided, from facts it already gathered off the filesystem --
 /// this function itself touches nothing, which is what makes it the thing a test drives directly
@@ -164,7 +164,7 @@ fn hex(bytes: &[u8]) -> String {
 /// command failure or a missing `dist/index.html` after a build: a build script has no better way
 /// to report either.
 ///
-/// `clean_build` is `NEOVIBE_WEB_CLEAN_BUILD=1`, read by the one real caller (`build.rs`'s `main`)
+/// `clean_build` is `EITRI_WEB_CLEAN_BUILD=1`, read by the one real caller (`build.rs`'s `main`)
 /// so this function itself never touches process environment -- `tests/web_bundle_freshness.rs`
 /// passes it as a plain argument instead, which is what lets its eight cases run with Rust's
 /// default parallel test execution rather than needing every test to serialize on a shared env var.

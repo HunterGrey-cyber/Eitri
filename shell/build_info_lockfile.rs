@@ -47,7 +47,7 @@ fn parse_git_rev_from_lockfile(lockfile: &str, package_name: &str) -> Option<Str
 
 /// The Neovide fork's commit for `--version`. `Cargo.lock`'s own record wins where it has one (the
 /// private tree, a git dependency). A path dependency -- the public tree's `neovide/` -- has none,
-/// so next comes `NEOVIBE_BUILD_FORK_COMMIT` (`env_override`, empty meaning unset): `release.sh`
+/// so next comes `EITRI_BUILD_FORK_COMMIT` (`env_override`, empty meaning unset): `release.sh`
 /// sets it, and so does a rebuild from the source asset following `SOURCE`, which has no `.git` in
 /// `neovide/` to ask. Last, `git_head`, that checkout's own `git rev-parse HEAD`. `None` when all
 /// three are silent.

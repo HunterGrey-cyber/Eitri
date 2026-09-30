@@ -212,7 +212,7 @@ pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f
 
 /// The 16 default rows, in table order: direct
 /// tab-as-buffer keys first, then the `<leader>` rows. Every row's source is the
-/// LazyVim/nvim/which-key line it copies, or `neovibe-only` with why (spec, "Rule for every line").
+/// LazyVim/nvim/which-key line it copies, or `eitri-only` with why (spec, "Rule for every line").
 pub fn default_bindings() -> Vec<PanelBinding> {
     vec![
         // lazyvim: config/keymaps.lua:34-35 (<S-h>/<S-l> = bprevious/bnext, "Prev/Next Buffer")
@@ -289,20 +289,20 @@ pub fn default_bindings() -> Vec<PanelBinding> {
             action: PanelAction::Search,
             source: PanelSource::Default,
         },
-        // neovibe-only: LazyVim has no session-info key; `i` is `prefix i`'s letter
+        // eitri-only: LazyVim has no session-info key; `i` is `prefix i`'s letter
         PanelBinding {
             seq: parse_seq("<leader>i").unwrap(),
             action: PanelAction::Tab(TabAction::Info),
             source: PanelSource::Default,
         },
-        // neovibe-only: the handoff button leaves the bottom; mock: bottom.html names
+        // eitri-only: the handoff button leaves the bottom; mock: bottom.html names
         // `Space t`
         PanelBinding {
             seq: parse_seq("<leader>t").unwrap(),
             action: PanelAction::Handoff,
             source: PanelSource::Default,
         },
-        // neovibe-only, the same effect as Shift+Tab (Claude Code, docs: permission-modes.md);
+        // eitri-only, the same effect as Shift+Tab (Claude Code, docs: permission-modes.md);
         // mock: leader.html draws `m ➜ mode: auto, fixed`
         PanelBinding {
             seq: parse_seq("<leader>m").unwrap(),
@@ -342,13 +342,13 @@ impl PanelUserTable {
             .find(|b| b.seq == seq && !self.dels.contains(&b.seq))
         {
             return Err(format!(
-                "{human} is already bound to {} (default); neovibe.keymap.del(\"panel\", {key:?}) first",
+                "{human} is already bound to {} (default); eitri.keymap.del(\"panel\", {key:?}) first",
                 default.action.name()
             ));
         }
         if let Some(existing) = self.sets.iter().find(|b| b.seq == seq) {
             return Err(format!(
-                "{human} is already bound to {} (set earlier in init.lua); neovibe.keymap.del(\"panel\", {key:?}) first",
+                "{human} is already bound to {} (set earlier in init.lua); eitri.keymap.del(\"panel\", {key:?}) first",
                 existing.action.name()
             ));
         }
@@ -360,7 +360,7 @@ impl PanelUserTable {
         Ok(())
     }
 
-    /// `neovibe.keymap.del("panel", key)`: removes an earlier `set`, or records a deletion of a
+    /// `eitri.keymap.del("panel", key)`: removes an earlier `set`, or records a deletion of a
     /// default; `"nothing binds {key}"` when neither binds it.
     pub fn del(&mut self, key: &str) -> Result<(), String> {
         let seq = parse_seq(key)?;

@@ -1,6 +1,6 @@
 //! GTK pacing probe; run only in the isolated GUI sandbox, with a release build.
 //! `cargo run --release -p neovide-editor --example frame_pacing -- [--user-config]`
-//! Optional NEOVIBE_PACING_WIDTH/HEIGHT override the 1200x800 logical-pixel window.
+//! Optional EITRI_PACING_WIDTH/HEIGHT override the 1200x800 logical-pixel window.
 //! after_paint is GTK completion, not presentation; entry-to-after_paint is an upper bound
 //! on render callback wall time, not GPU time or input-to-photon latency. No pixel readback.
 //! send_keys bypasses GDK/IME and queues a redraw; this measures drawing, not physical input.
@@ -121,19 +121,19 @@ fn main() {
     gtk4::init().expect("run inside the isolated GUI sandbox");
     let user_config = std::env::args().any(|arg| arg == "--user-config");
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let scratch = std::env::temp_dir().join(format!("neovibe-pacing-{}-{stamp}", std::process::id()));
+    let scratch = std::env::temp_dir().join(format!("eitri-pacing-{}-{stamp}", std::process::id()));
     std::fs::create_dir(&scratch).expect("create isolated nvim directory");
     let ready = scratch.join("ready");
     let init = concat!(
         "lua vim.o.wrap=false; vim.o.guicursor='a:block-blinkon0'; ",
         "local lines={}; for i=1,500 do lines[i]=string.format('%04d ',i)..string.rep('frame pacing text ',12) end; ",
         "vim.api.nvim_buf_set_lines(0,0,-1,false,lines); vim.api.nvim_win_set_cursor(0,{10,10}); ",
-        "vim.fn.writefile({'ready'},vim.env.NEOVIBE_PACING_READY)"
+        "vim.fn.writefile({'ready'},vim.env.EITRI_PACING_READY)"
     );
     let pane = Rc::new(NeovideEditorPane::with_options(NeovideEditorPaneOptions {
         clean: !user_config,
         cwd: Some(scratch.clone()),
-        child_env: vec![("NEOVIBE_PACING_READY".into(), ready.to_string_lossy().into_owned())],
+        child_env: vec![("EITRI_PACING_READY".into(), ready.to_string_lossy().into_owned())],
         extra_nvim_args: vec!["-i".into(), "NONE".into(), "-c".into(), init.into()],
     }));
     let size = |name, fallback| {
@@ -143,9 +143,9 @@ fn main() {
             .filter(|v| *v > 0)
             .unwrap_or(fallback)
     };
-    let (width, height) = (size("NEOVIBE_PACING_WIDTH", 1200), size("NEOVIBE_PACING_HEIGHT", 800));
+    let (width, height) = (size("EITRI_PACING_WIDTH", 1200), size("EITRI_PACING_HEIGHT", 800));
     let window = gtk4::Window::builder()
-        .title("Neovibe frame pacing probe")
+        .title("Eitri frame pacing probe")
         .default_width(width)
         .default_height(height)
         .child(pane.widget())

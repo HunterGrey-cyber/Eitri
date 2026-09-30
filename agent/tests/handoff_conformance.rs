@@ -4,7 +4,7 @@
 //! It does not drive the resumed `claude --resume` interactive session or test returning
 //! the conversation to the application.
 
-use agent::handoff::prepare_neovibe_to_cli_handoff;
+use agent::handoff::prepare_eitri_to_cli_handoff;
 use agent::lease::{LeaseError, SessionLease};
 use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest};
 
@@ -94,9 +94,9 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
         })
         .unwrap();
 
-    // The handoff itself: acquire the lease, spawn neovibe-claude-handoff, confirm it's really
+    // The handoff itself: acquire the lease, spawn eitri-claude-handoff, confirm it's really
     // running the real claude binary and really holding the lease.
-    let outcome = prepare_neovibe_to_cli_handoff("claude", &cwd, &provider_session_id).unwrap();
+    let outcome = prepare_eitri_to_cli_handoff("claude", &cwd, &provider_session_id).unwrap();
     assert!(outcome.child_pid > 0);
 
     // Read `/proc/<pid>/comm` to confirm the child has exec'd into `claude` before checking

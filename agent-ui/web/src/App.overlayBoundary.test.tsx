@@ -111,7 +111,7 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
   window.addEventListener("error", claimWindowError);
   (window as unknown as { webkit: unknown }).webkit = {
-    messageHandlers: { neovibeAgent: { postMessage: () => {} } },
+    messageHandlers: { eitriAgent: { postMessage: () => {} } },
   };
 });
 afterEach(() => {
@@ -125,7 +125,7 @@ afterEach(() => {
 
 function dispatch(payload: unknown) {
   act(() => {
-    window.__neovibeDispatch!(JSON.stringify(payload));
+    window.__eitriDispatch!(JSON.stringify(payload));
   });
 }
 

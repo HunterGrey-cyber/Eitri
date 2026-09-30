@@ -3,7 +3,7 @@
 # the real `ssh-keygen -Y verify` path actually runs. No sudo, no base-devel: this
 # is the prebuilt/curl install.sh path, which needs neither (the AUR packages build
 # separately and are not exercised here -- no archlinux target through nfpm, so there is no
-# neovibe pacman package to `pacman -U` in this image; arch's own e2e assertions are the curl flow
+# eitri pacman package to `pacman -U` in this image; arch's own e2e assertions are the curl flow
 # only, no apt/dnf-equivalent root-install step).
 #
 # Built and run by packaging/tests/e2e/run.sh: `docker build

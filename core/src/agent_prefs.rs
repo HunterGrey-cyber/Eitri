@@ -21,7 +21,7 @@ struct PrefsFile {
     permission_mode: SessionModeChoice,
 }
 
-/// `<state home>/neovibe/agent`.
+/// `<state home>/eitri/agent`.
 pub fn state_dir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     state_subdir(xdg_state_home, home, "agent")
 }
@@ -155,11 +155,11 @@ mod tests {
     fn it_lives_beside_the_layout_directory() {
         assert_eq!(
             state_dir(Some(OsStr::new("/s")), Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/s/neovibe/agent"))
+            Some(PathBuf::from("/s/eitri/agent"))
         );
         assert_eq!(
             state_dir(None, Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/h/.local/state/neovibe/agent"))
+            Some(PathBuf::from("/h/.local/state/eitri/agent"))
         );
         assert_eq!(state_dir(Some(OsStr::new("relative")), None), None);
     }

@@ -301,7 +301,7 @@ pub(crate) fn current_content_region(fb: (i32, i32), grid_scale: GridScale) -> P
 /// The remainder belongs above the grid so the bottom row reaches the pane's bottom. Sharing
 /// this calculation across rendering, resizing, tick resync, and hit testing keeps their
 /// geometry aligned instead of mixing GTK's framebuffer size with widget allocation dimensions.
-/// neovibe-only.
+/// eitri-only.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GridLayout {
     pub region: PixelRect<f32>,

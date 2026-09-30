@@ -4,10 +4,10 @@
 //! pane's widget is already in the module grid. Install the hidden label when adding the
 //! editor module so the callback can show the cause, minimum version, and where to get nvim.
 
+use eitri_core::layout::{Direction, ModuleId};
 use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 use gtk4::prelude::*;
-use neovibe_core::layout::{Direction, ModuleId};
 
 /// Wraps `editor` (the editor pane's own `GtkGLArea`, [`neovide_editor::NeovideEditorPane::widget`])
 /// in an `Overlay` carrying a hidden `Label` for the failure message. Return the overlay to register

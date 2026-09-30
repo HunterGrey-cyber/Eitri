@@ -1,30 +1,31 @@
-//! Focus handoff between the editor and neighbouring modules uses Neovim's navigation
-//! plugin so movement between Neovim splits happens before crossing a module boundary.
+//! Focus handoff from the editor through `vim-tmux-navigator`.
+//! Neovim first runs `wincmd h` or `wincmd l` between its own splits. Only when the
+//! window number stays unchanged does the plugin call `tmux select-pane`. This keeps
+//! pane focus changes from interrupting navigation within the editor.
 //!
-//! This module finds the shim binary, drains the socket with a `glib` timer and wires focus grabs.
-//! The shared channel handles the socket directory, `tmux` symlink, parser and cleanup,
-//! so another host can use the same protocol with its own event loop.
+//! `TMUX`, `TMUX_PANE` and a shim-prefixed `PATH` are set only on the embedded
+//! Neovim child. Process-global environment changes would leak into agent subprocesses
+//! and race concurrent environment reads. Other terminal sessions keep their own environment.
+//! The shim is exposed as `tmux` in a private directory and sends direction letters
+//! through a Unix socket. The core pane-switch module owns the directory, socket,
+//! parser and cleanup so each GUI can supply its own event loop.
 //!
-//! The navigation plugin first runs `wincmd`, then compares `winnr()` before and after.
-//! Only at a Neovim window boundary, and with `$TMUX` set, does it invoke
-//! `tmux -S <socket> select-pane -t <pane> -<L|R|U|D>`.
+//! This module locates the shim, polls the socket with a `glib` timer, and supplies
+//! the focus grabs wired in `main.rs`.
 //!
-//! `TMUX`, `TMUX_PANE` and the prefixed `PATH` are set only on the embedded nvim child through
-//! `child_env`. Process-global environment changes would affect agent subprocesses and race
-//! concurrent environment reads. The child's `PATH` finds a `tmux` symlink to the shim binary.
-//! The shim sends a direction letter to the Unix socket, which the GTK main loop drains into
-//! the host's callback. Other process trees keep their own environments.
+//! Messages arrive while the editor has focus, after Neovim reaches a split boundary.
+//! Each letter maps to a [`Direction`] through [`letter_direction`]; layout geometry
+//! selects the neighbouring module. With the default `[editor | agent]` layout, `R`
+//! focuses the agent, `U` focuses the top bar, and `L` or `D` at an edge does nothing.
+//! A module below the editor is reachable with `D`. A shown terminal is unzoomed and
+//! focused; a hidden terminal is absent from the geometry, so `D` does nothing there.
 //!
-//! Direction letters are mapped by [`letter_direction`] and routed using layout geometry.
-//! In the default `[editor | agent]` layout, `R` reaches the agent, `U` the top bar, and `L` or
-//! `D` does nothing at the outer edge. With a visible module below the editor, `D` unzooms and
-//! focuses it. A hidden bottom terminal is absent from the geometry, so `D` is an edge no-op.
+//! Navigation from a focused web module uses a GTK capture-phase key handler on its
+//! host ([`nav_direction`], wired in `main.rs`) and consults the same geometry.
 //!
-//! When a web module has focus, a capture-phase key handler on its host ([`nav_direction`],
-//! wired in `main.rs`) navigates using the same geometry.
-//!
-//! If the shim cannot be found or the socket cannot be bound, [`open`] returns `None` and no
-//! environment is injected. The editor still supports normal navigation between Neovim splits.
+//! If the shim cannot be found or the socket cannot be bound, [`open`] returns `None`.
+//! No environment is injected, and the plugin uses plain `wincmd` navigation without
+//! calling tmux. The editor continues to work without pane focus handoff.
 
 use std::path::{Path, PathBuf};
 
@@ -32,8 +33,8 @@ use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 
 use crate::layout::Direction;
-use neovibe_core::pane_switch::{sweep_stale_dirs, PaneSwitchReader, POLL_INTERVAL};
-pub(crate) use neovibe_core::pane_switch::{PaneMessage, PaneSwitchChannel};
+use eitri_core::pane_switch::{sweep_stale_dirs, PaneSwitchReader, POLL_INTERVAL};
+pub(crate) use eitri_core::pane_switch::{PaneMessage, PaneSwitchChannel};
 
 /// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
 /// else is not a direction (the shim only ever sends these four).
@@ -168,7 +169,7 @@ pub(crate) fn listen(channel: &mut PaneSwitchChannel, on_message: impl Fn(PaneMe
     });
 }
 
-/// Finds the `neovibe-tmux-shim` binary next to the currently-running executable. Both are
+/// Finds the `eitri-tmux-shim` binary next to the currently-running executable. Both are
 /// binaries of the same Cargo package, so they always land in the same directory -- `target/debug`
 /// during development, a single `bin/` directory for any real install.
 ///
@@ -182,7 +183,7 @@ fn locate_shim_binary() -> Option<PathBuf> {
             return None;
         }
     };
-    let candidate = exe.parent()?.join("neovibe-tmux-shim");
+    let candidate = exe.parent()?.join("eitri-tmux-shim");
     if !Path::new(&candidate).is_file() {
         eprintln!(
             "[pane_switch] {} not found -- Ctrl+h/j/k/l out of nvim disabled (build it with `cargo build -p shell`)",

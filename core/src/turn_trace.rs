@@ -1,31 +1,36 @@
-//! Traces a turn's latency from submission to the frame containing its first text.
-//! Enabled by `NEOVIBE_AGENT_TRACE=1`; writes one line per turn to stderr.
+//! Trace a turn's latency from submission to its first paint frame and completion.
+//! Enabled by `EITRI_AGENT_TRACE=1`; emits one line per turn to stderr.
 //!
-//! Provider-boundary timings omit the pump, bridge hop, and WebView rendering.
-//! These marks expose that part of the pipeline: submission when `send_message` is
-//! handled, the first provider event drained by the pump, the first assistant text
-//! drained by the pump, the first paint frame reported by the WebView, and completion
-//! when the pump drains `TurnCompleted`.
+//! Provider-boundary timing misses the panel pump, bridge and WebView rendering. These marks
+//! separate provider delay from the time spent delivering and drawing the reply:
 //!
-//! These timings describe request/response latency. They do not measure whether a
-//! continuous output stream can keep up, which requires throughput measurements.
-//! Server-side grpc-js queuing preserved events during a 20-second consumer stall;
-//! this is a correctness observation rather than a speed measurement.
+//! | mark | stamped where | means |
+//! | --- | --- | --- |
+//! | submitted | the `send_message` inbound message is handled | the user pressed Send |
+//! | first provider event | the pump drains any event of this turn | the provider emitted an event |
+//! | first presentation delta | the pump drains the first assistant text | the first text exists here |
+//! | first paint frame | reported back by the WebView | the frame containing the first text |
+//! | completed | the pump drains `TurnCompleted` | the turn is over |
 //!
-//! The WebView reports the duration from receiving a payload to its animation frame.
-//! Rust adds that duration to its dispatch instant because JS `performance.now()` and
-//! Rust `Instant` have unrelated epochs and cannot be subtracted from each other.
-//! The callback runs before compositor presentation, so this is the frame containing
-//! the text and a lower bound on perceived latency, not a measurement of presentation.
+//! These timings describe request/response latency. They do not measure whether transport
+//! can keep up with a continuous unsolicited stream; that requires throughput measurements.
+//! Server-side grpc-js queues also let a consumer stall for 20 seconds without losing events,
+//! which demonstrates delivery correctness rather than transport speed.
+//!
+//! The WebView reports the duration from receiving a payload to the animation frame that
+//! draws it. Add that span to Rust's dispatch instant. JS `performance.now()` and Rust
+//! `Instant` have unrelated epochs, so their timestamps cannot be subtracted directly.
+//! The frame callback runs before compositor presentation, making the paint mark a lower
+//! bound on perceived latency rather than a measurement of when pixels become visible.
 
 use agent::{AgentDomainEvent, ContentKind};
 use std::time::{Duration, Instant};
 
-/// True when `NEOVIBE_AGENT_TRACE=1`. Read once per turn rather than cached in a `static`, so it can
+/// True when `EITRI_AGENT_TRACE=1`. Read once per turn rather than cached in a `static`, so it can
 /// be flipped between runs of a long-lived process without a restart; a turn is far too coarse for
 /// one `std::env::var` to matter.
 fn enabled() -> bool {
-    matches!(std::env::var("NEOVIBE_AGENT_TRACE").as_deref(), Ok("1"))
+    matches!(std::env::var("EITRI_AGENT_TRACE").as_deref(), Ok("1"))
 }
 
 fn ms(duration: Duration) -> f64 {
@@ -68,7 +73,7 @@ impl TurnTrace {
         enabled().then(Self::started_now)
     }
 
-    /// A trace regardless of `NEOVIBE_AGENT_TRACE`, for this crate's tests.
+    /// A trace regardless of `EITRI_AGENT_TRACE`, for this crate's tests.
     pub(crate) fn started_now() -> Self {
         Self {
             submitted_at: Instant::now(),

@@ -2337,7 +2337,7 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let scratch = PathBuf::from(format!("/tmp/neovibe-cursor-animation-{}", std::process::id()));
+    let scratch = PathBuf::from(format!("/tmp/eitri-cursor-animation-{}", std::process::id()));
     std::fs::create_dir(&scratch).expect("create unique test scratch directory");
     let socket = scratch.join("nvim.sock");
     let init = concat!(
@@ -2370,7 +2370,7 @@ fn main() {
     pane.widget().set_size_request(820, 560);
     fixed.put(pane.widget(), 0.0, 0.0);
     let window = Window::builder()
-        .title("neovibe cursor animation regression")
+        .title("Eitri cursor animation regression")
         .default_width(1000)
         .default_height(700)
         .child(&fixed)

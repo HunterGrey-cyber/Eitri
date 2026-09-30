@@ -1,5 +1,6 @@
 //! Locates Claude CLI transcripts and reads conversation history for display after resume.
-//! [`claude_projects_dir`] resolves the projects directory using `CLAUDE_CONFIG_DIR` when set.
+//! [`claude_projects_dir`] uses the configured account's projects directory first,
+//! then `CLAUDE_CONFIG_DIR` when set.
 //! Resume stability depends only on the file's modification time ([`is_transcript_stable`]),
 //! never on transcript content.
 //!
@@ -41,7 +42,7 @@ use std::time::Duration;
 ///
 /// **Correction (2026-09-21): this process's own `CLAUDE_CONFIG_DIR` is the *fallback*, not the
 /// answer.** When [`crate::account`] has been given an account -- `init.lua`'s
-/// `neovibe.config.set("agent.account", ...)` -- the directory comes from that account's own
+/// `eitri.config.set("agent.account", ...)` -- the directory comes from that account's own
 /// convention instead, because this process's variable says only which account launched the
 /// window, while the account says which one the CLI is spending. The two were different on the
 /// host this was found on (`.claude-personal` inherited, `.claude-work` written), which is why a

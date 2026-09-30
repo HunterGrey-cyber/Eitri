@@ -14,7 +14,7 @@ for a do
 	esac
 done
 case $src in
-*/.local/lib/neovibe.new)
+*/.local/lib/eitri.new)
 	case $0 in */stubs-mvterm/*) kill -TERM "$PPID" ;; esac
 	echo "mv: simulated failure of the swap" >&2
 	exit 1

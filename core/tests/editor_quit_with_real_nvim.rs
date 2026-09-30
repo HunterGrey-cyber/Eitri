@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use neovibe_core::layout::kill::editor_quit_lua;
+use eitri_core::layout::kill::editor_quit_lua;
 use rmpv::Value;
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -161,7 +161,7 @@ fn spawn_nvim_with(scratch: &Path, socket_path: &Path, extra: &[&str]) -> Child 
         .env("XDG_STATE_HOME", scratch.join("state"))
         .env("XDG_DATA_HOME", scratch.join("data"))
         .env("XDG_CONFIG_HOME", scratch.join("config"))
-        .env("NEOVIBE_PANE_SWITCH_SOCKET", socket_path)
+        .env("EITRI_PANE_SWITCH_SOCKET", socket_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -9,7 +9,7 @@ afterEach(cleanup);
 
 const HELLO: Hello = {
   backend: "sidecar",
-  projectDir: "/home/user/Documents/neovibe",
+  projectDir: "/home/user/Documents/eitri",
   permissionModes: ["auto", "bypass"],
   resumableSessions: [],
   expectedVerdandiRevision: "28a5e4c",
@@ -67,18 +67,18 @@ describe("Dashboard", () => {
    *  it carries nothing. The backend stays reachable in `prefix i`. */
   it("draws the centred name and the where-line with no backend, account omitted when null", () => {
     const { getByText, container } = renderDash();
-    getByText("neovibe");
-    getByText("~/Documents/neovibe · work");
+    getByText("eitri");
+    getByText("~/Documents/eitri · work");
     const noAccount = { ...HELLO, account: null };
     const { getByText: getByTextNoAccount } = renderDash({ hello: noAccount });
-    getByTextNoAccount("~/Documents/neovibe");
-    expect(container.textContent).toContain("neovibe");
+    getByTextNoAccount("~/Documents/eitri");
+    expect(container.textContent).toContain("eitri");
     expect(container.textContent).not.toContain("sidecar");
   });
 
   it("cuts the cwd and drops the account when narrow, still with no backend", () => {
     const { getByText, queryByText } = renderDash({ narrow: true });
-    getByText("~/…/neovibe");
+    getByText("~/…/eitri");
     expect(queryByText(/work/)).toBeNull();
     expect(queryByText(/sidecar/)).toBeNull();
   });

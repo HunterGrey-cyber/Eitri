@@ -26,8 +26,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use eitri_core::theme::ThemeTokens;
 use gtk4::prelude::*;
-use neovibe_core::theme::ThemeTokens;
 use serde_json::Value;
 use webkit6::prelude::*;
 use webkit6::WebView;

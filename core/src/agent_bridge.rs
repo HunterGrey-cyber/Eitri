@@ -896,7 +896,7 @@ impl<'a> SnapshotView<'a> {
 /// function is the one place that difference is bridged).
 ///
 /// Takes a `SnapshotView` rather than the projection alone, because two of the three identities
-/// live outside it: `conversationId` is Neovibe's own and `providerSessionId` is Claude's, while the
+/// live outside it: `conversationId` is Eitri's own and `providerSessionId` is Claude's, while the
 /// projection's `sessionId` is Verdandi's. Collapsing them would defeat the entire point of keeping
 /// them apart -- and would eventually send Claude's id back as a session_id, which the sidecar
 /// answers with SESSION_NOT_FOUND. `tab` names the session tab it is about; the panel drops it
@@ -1062,7 +1062,7 @@ pub fn serialize_snapshot_with_notes_for_js(
         json!({
             "source": match notice.source {
                 agent::HistorySource::ClaudeTranscript => "claude_transcript",
-                agent::HistorySource::NeovibeCopy => "neovibe_copy",
+                agent::HistorySource::EitriCopy => "eitri_copy",
             },
             "restoredItems": notice.restored_items,
             "omittedItems": notice.omitted_items,
@@ -1976,7 +1976,7 @@ mod tests {
             advertised_capabilities: vec!["handshake".into()],
             advertised_permission_modes: vec!["bypass".into()],
             event_buffer_policy: "bounded-1000".into(),
-            build_description: Some("Verdandi checkout: /x @ eb70aa3 (via NEOVIBE_VERDANDI_CHECKOUT)".into()),
+            build_description: Some("Verdandi checkout: /x @ eb70aa3 (via EITRI_VERDANDI_CHECKOUT)".into()),
             startup_diagnostics: vec!["claude CLI 2.1.269 is untested".into()],
         };
         let view = SnapshotView {
@@ -2348,11 +2348,11 @@ mod tests {
             text: "what did we say?".into(),
         });
         projection.history = Some(agent::HistoryNotice {
-            source: agent::HistorySource::NeovibeCopy,
+            source: agent::HistorySource::EitriCopy,
             restored_items: 314,
             omitted_items: Some(1431),
             upto_seq: projection.last_revision,
-            source_path: "/state/neovibe/history/conv/sess.json".into(),
+            source_path: "/state/eitri/history/conv/sess.json".into(),
             attempted_transcript_path: Some("/claude/projects/p/sess.jsonl".into()),
             fallback_reason: Some("transcript file not found".into()),
             writer_version: None,
@@ -2375,11 +2375,11 @@ mod tests {
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let history = &parsed["state"]["history"];
-        assert_eq!(history["source"], "neovibe_copy");
+        assert_eq!(history["source"], "eitri_copy");
         assert_eq!(history["restoredItems"], 314);
         assert_eq!(history["omittedItems"], 1431);
         assert_eq!(history["uptoSeq"], 1);
-        assert_eq!(history["sourcePath"], "/state/neovibe/history/conv/sess.json");
+        assert_eq!(history["sourcePath"], "/state/eitri/history/conv/sess.json");
         assert_eq!(history["attemptedTranscriptPath"], "/claude/projects/p/sess.jsonl");
         assert_eq!(history["fallbackReason"], "transcript file not found");
         assert!(history["writerVersion"].is_null());

@@ -1,35 +1,33 @@
 /**
- * Permission keys are guarded because typed prose can arrive in BROWSE with the cursor on a
- * waiting card. A command letter may be the first, middle or last letter of a sentence.
+ * Keep typed prose from answering permission cards or triggering BROWSE actions.
+ * Arrivals land in BROWSE with the cursor on a waiting card, so the first letters of a
+ * sentence can arrive as command keys.
  *
- * `a`/`d`/`D` answer only when no other key occurs within `TYPING_GUARD_MS` before or after them.
- * They are deferred, and any keydown before the wait ends cancels them.
- * Enter on a focused card button requires a pause before it, unless the entire unbroken run
- * before it consists of `h`, `l`, Tab or Shift+Tab and began with a key standing alone.
- * Checking just the preceding key would let prose ending in `l` activate Approve: `l` from
- * its row moves to the card's first control, Approve (`PermissionCard.tsx`, `data-nav-order`).
- * A run made only of walk keys can still answer: `l` followed by Enter approves, and `ll`
- * followed by Enter denies. A pause of at least `TYPING_GUARD_MS` before a final `l` also
- * makes that `l` followed by Enter eligible.
- * A held key's repeat (`event.repeat`) never answers.
+ * - `a`/`d`/`D` require no other key within `TYPING_GUARD_MS` before or after them.
+ *   They are deferred, and any keydown before the wait ends cancels them. The wait after
+ *   the key protects the first letter of a sentence; the check before it protects later letters.
+ * - Enter on a focused card button requires a pause before it, unless the entire unbroken
+ *   run before it consists of `h`, `l`, Tab, or Shift+Tab and began with a key after a pause.
+ *   Checking only the last key would let "cancel" end with `l` walking onto Approve and
+ *   Enter approving it. A run of only walk keys can still act: "l" then Enter approves,
+ *   and "ll" then Enter denies. Pausing before the final `l` in prose also permits that walk.
+ *   Enter is claimed and deferred like `a`/`d`, with the walk exception still applied.
+ *   `App.tsx` presses the button only if the preceding key moved focus onto that button,
+ *   or a HINT landing focused it with no intervening key. Track landings where focus moves,
+ *   rather than inferring them from key names. The guard counts keys with `keyCount`;
+ *   `App.tsx` ties the landing to the key that caused it.
+ * - A held key's repeat (`event.repeat`) never answers.
+ * - `mayActAfterMotion` guards the leader and Enter/Space on Stop. They act only after a
+ *   pause or an unbroken run of motion keys (`j`/`k`/`h`/`l`/`g`/`G`/Tab) that began after one.
+ *   Otherwise prose can trigger leader commands or move from the last row to Stop with `j`
+ *   and interrupt with Space. Motion sequences such as `jj<Space>bd` remain usable.
+ * - The global HINT trigger `f` and single-key table bindings can be the first key of prose,
+ *   so checking preceding motions cannot protect them. They use `defer` and act only if no
+ *   other key arrives for `TYPING_GUARD_MS`. Otherwise a sentence starting with `f` can
+ *   start HINT, or one starting with `L` can switch tabs and send its remaining text elsewhere.
  *
- * Enter on a card button is also claimed and deferred, with the walk exception above.
- * `App.tsx` activates it only if the immediately preceding key actually focused that button
- * through `h`/`l` or Tab, or if HINT landed there with no key since. A key's name alone does
- * not prove a landing. This guard counts keys (`keyCount`); `App.tsx` records focus changes
- * and ties each landing to the key that made it.
- *
- * `mayActAfterMotion` guards the leader and Enter/Space on Stop. A Space in prose can start
- * a leader sequence, and `j` from the last row can put the next Space on Stop. These keys act
- * only after a pause or an unbroken run of `j`/`k`/`h`/`l`/`g`/`G`/Tab that began with a key
- * standing alone, so quick navigation can still end in an action.
- *
- * `f` and single-key table bindings can be the first letter typed, with no motion run to
- * check. They use `defer` to wait `TYPING_GUARD_MS` and act only if no further key arrives.
- * This prevents a sentence's first letter from opening HINT or switching the input target.
- *
- * Pure: it never reads the DOM. Timestamps come from the caller (`event.timeStamp`). Timers
- * are injectable and otherwise looked up globally at call time so fake timers apply.
+ * Pure: this never reads the DOM. Timestamps come from the caller's `event.timeStamp`.
+ * Timers are injectable and default to globals looked up at call time so fake timers apply.
  */
 
 /** The guard window before and after a key. Prose at 60 wpm is about 200 ms per key;

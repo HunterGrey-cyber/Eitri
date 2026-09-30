@@ -189,7 +189,7 @@ fn read_opts(opts: &[(String, OptValue)]) -> Result<Opts, ActionError> {
     Ok(out)
 }
 
-/// `name` and its options, as `neovibe.keymap.set` received them. `lua_panels` are the ids of the
+/// `name` and its options, as `eitri.keymap.set` received them. `lua_panels` are the ids of the
 /// Lua panels `init.lua` registered, which `module.<id>` may name.
 pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> Result<Parsed, ActionError> {
     let o = read_opts(opts)?;
@@ -300,7 +300,7 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
 }
 
 impl Action {
-    /// The Lua name `neovibe.keymap.set` takes, without options.
+    /// The Lua name `eitri.keymap.set` takes, without options.
     pub fn name(&self) -> String {
         match self {
             Action::SendPrefix => "send-prefix".into(),
@@ -383,7 +383,7 @@ impl Action {
             // Killing the last module closes the window (`KillScope::Window`), as tmux's `kill-pane` does
             // on its last pane. Hiding still refuses the last module.
             Action::ModuleKill => {
-                "Close this module and end what runs in it, after y/n (the last one on screen closes neovibe)".into()
+                "Close this module and end what runs in it, after y/n (the last one on screen closes Eitri)".into()
             }
             Action::Module(id) => match id.kind() {
                 ModuleKind::Editor => "Editor: show and focus it, or hide it when it has the keys".into(),
@@ -507,9 +507,9 @@ mod tests {
     /// The `?` overlay says killing the last module closes the window.
     /// Hiding still refuses the last module.
     #[test]
-    fn the_kill_row_says_the_last_module_closes_neovibe() {
+    fn the_kill_row_says_the_last_module_closes_eitri() {
         let kill = Action::ModuleKill.describe("Ctrl+b", "e / a / t");
-        assert!(kill.contains("the last one on screen closes neovibe"), "{kill}");
+        assert!(kill.contains("the last one on screen closes Eitri"), "{kill}");
         assert!(!kill.contains("not the last one"), "{kill}");
         assert!(Action::ModuleHide
             .describe("Ctrl+b", "e / a / t")

@@ -1081,7 +1081,7 @@ mod tests {
         }
     }
 
-    /// nvim as the pinned fork starts it for neovibe, with an edit made half a second before its
+    /// nvim as the pinned fork starts it for Eitri, with an edit made half a second before its
     /// ending: `--embed` over the fork's own session (whose `HangUp` closes stdin while the
     /// connection lives), the fork's `lua/init.lua` run as `setup_neovide_specific_state` runs it, a
     /// UI attached with the fork's options and answering as the fork does. `a.txt` holds "original"

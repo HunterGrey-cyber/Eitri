@@ -1,8 +1,8 @@
 //! The GTK half of wire 1: a `glib` timer that drains the editor-context socket
-//! `neovibe_core::editor_context::feed` owns, and a cache the agent panel reads at send time.
+//! `eitri_core::editor_context::feed` owns, and a cache the agent panel reads at send time.
 //!
 //! Split exactly like `shell::theme::feed`: everything portable -- the socket, the snippet, the
-//! parsing, the Lua<->Rust contract -- lives in `neovibe-core`, and what stays here is the part
+//! parsing, the Lua<->Rust contract -- lives in `eitri-core`, and what stays here is the part
 //! that names `gtk4`.
 
 use std::cell::RefCell;
@@ -10,9 +10,9 @@ use std::rc::Rc;
 
 use gtk4::glib;
 
-pub(crate) use neovibe_core::editor_context::feed::EditorContextFeed;
-use neovibe_core::editor_context::feed::{EditorContextReader, POLL_INTERVAL};
-use neovibe_core::editor_context::{ContextSource, EditorContext};
+pub(crate) use eitri_core::editor_context::feed::EditorContextFeed;
+use eitri_core::editor_context::feed::{EditorContextReader, POLL_INTERVAL};
+use eitri_core::editor_context::{ContextSource, EditorContext};
 
 /// Starts draining the feed and returns the source the panel reads.
 ///
@@ -37,7 +37,7 @@ pub(crate) fn listen(feed: &mut EditorContextFeed, scratch_dir: Option<std::path
         if let Some(context) = reader.poll() {
             let scratch = scratch_dir
                 .as_deref()
-                .is_some_and(|dir| neovibe_core::scratch::holds(dir, &context.file));
+                .is_some_and(|dir| eitri_core::scratch::holds(dir, &context.file));
             if !scratch {
                 *writer.borrow_mut() = Some(context);
             }
