@@ -93,6 +93,11 @@ export type PanelAction =
    *  -- nothing else since v1 S4 (spec 2026-09-27 §2.2; P1's "the only card, from any row" is gone).
    *  `App.tsx` answers only a key that stands alone (S1, `./typingGuard`). */
   | { kind: "answer"; decision: "allow" | "deny" }
+  /** INPUT's `Ctrl+y` (owner decision #39, 2026-09-30): approve the ACTIVE tab's OLDEST waiting card
+   *  -- the one a card landing takes (R11) -- without leaving INPUT. `App.tsx` answers it by that
+   *  card's own `permissionId`, `TYPING_GUARD_MS` later and only when the key stood alone (S1), and
+   *  leaves the composer as it was. No deny counterpart: deny stays where a reason can be typed. */
+  | { kind: "approve-oldest" }
   | { kind: "toggle-expand" }
   | { kind: "copy" }
   /** `Shift+Y` (N3): a tool row's whole result, uncut, never anything else's. */
@@ -729,6 +734,27 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   // `KeyLike` has carried these two fields since the table was first written; this is what makes
   // reading them, rather than deleting them, the correct fix once something actually checked whether
   // they were used.
+  // Owner decision #39 (2026-09-30, "input 直接ctrl y统一吧，不用两次"): INPUT's one added chord, ahead
+  // of the blanket refusal just below. Exactly Ctrl+y -- Shift, Alt, Meta, Super/Hyper (held on the
+  // event or by its own keydown, `hasSuperOrHyper`) or AltGraph held is nothing, the same modifier set
+  // `isPlainAnswerKey` refuses for `a`/`d`, with Ctrl required instead of refused; a composing input
+  // method already returned at the top of this function. `App.tsx` picks the card (the active tab's
+  // oldest waiting one) and runs S1's guard; this table only names the chord. BROWSE's own Ctrl+y
+  // (the one-line scroll) is the `mode !== "input"` block above and never reaches here. Fix round 1
+  // (Opus I-4): under Caps Lock GTK/WebKitGTK report the chord as key "Y" with Shift not held, so the
+  // letter is compared case-blind -- Shift itself is still refused just below.
+  if (
+    mode === "input" &&
+    event.key.toLowerCase() === "y" &&
+    event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    !hasSuperOrHyper(event) &&
+    !hasAltGraph(event)
+  ) {
+    return { kind: "approve-oldest" };
+  }
   if (event.ctrlKey || event.shiftKey) return null;
   if (mode === "input") {
     // An Esc mid-composition belongs to the input method -- fcitx uses it to cancel the preedit.
@@ -936,6 +962,8 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Ctrl+r", what: "Search earlier prompts (Enter puts one in the box)" },
   { keys: "Ctrl+w / Ctrl+u", what: "Delete a word / to the line's start" },
   { keys: "Ctrl+c", what: "Interrupt a running turn; idle, clear the box into history" },
+  // Owner decision #39 (2026-09-30): an added key. The band names the card it would approve.
+  { keys: "Ctrl+y", what: "Approve the oldest card waiting in this tab (the band names it); only a lone Ctrl+y answers" },
   { keys: "Ctrl+g", what: "Edit this in nvim (:wq brings it back, :q! changes nothing)" },
   { keys: "Ctrl+o", what: "Detailed view" },
   { keys: "Shift+Tab", what: "Toggle auto ⇄ bypass (entering bypass asks first)" },

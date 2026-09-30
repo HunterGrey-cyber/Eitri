@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bandLayout, textWidth, usageSegment, type BandFacts } from "./band";
+import { bandLayout, cardSummary, textWidth, usageSegment, type BandFacts } from "./band";
 import type { TokenUsage } from "./types";
 
 const running: BandFacts = { mode: "input", pill: "⏵⏵ auto", showcmd: null, message: null, prompt: null, warn: null,
@@ -151,5 +151,65 @@ describe("usage (R5)", () => {
     expect(usageSegment(u(Number.POSITIVE_INFINITY, null))).toBeNull();
     // What a `null` cost would arrive as if a non-finite float ever crossed the wire as JSON.
     expect(usageSegment(u(null as unknown as number, null))).toBeNull();
+  });
+});
+
+/** Owner decision #39 (2026-09-30): while a card waits and the composer has the keys, the band names
+ *  the card INPUT's Ctrl+y would approve -- the tool and a short summary -- and drops it by the same
+ *  priority order as everything else: shortened to the tool, then gone, after the context, model,
+ *  position and queue and before the `⚑N` count. */
+describe("#39: the Ctrl+y segment", () => {
+  const approving: BandFacts = { ...running, approve: { tool: "Bash", summary: "rm build" } };
+
+  it("names the tool and the summary, right after the card count, on the left", () => {
+    const segs = bandLayout(approving, 1400, 7.2);
+    expect(segs.map((s) => s.id).slice(0, 4)).toEqual(["mode", "pill", "cards", "approve"]);
+    const seg = segs.find((s) => s.id === "approve")!;
+    expect(seg.text).toBe("Ctrl+y approves Bash: rm build");
+    expect(seg.side).toBe("left");
+  });
+
+  it("is absent with nothing to approve, and under a y/n prompt", () => {
+    expect(ids(1400, running)).not.toContain("approve");
+    expect(ids(1400, { ...approving, approve: null })).not.toContain("approve");
+    expect(ids(1400, { ...approving, prompt: "close 2? (y/n)" })).toEqual(["mode", "prompt"]);
+  });
+
+  it("goes after context, model, position and queue, is shortened to the tool first, and goes before the card count", () => {
+    let sawShort = false;
+    for (let w = 1400; w >= 60; w -= 5) {
+      const segs = bandLayout(approving, w, 7.2);
+      const idsNow = segs.map((s) => s.id);
+      const seg = segs.find((s) => s.id === "approve");
+      if (seg === undefined || seg.text !== "Ctrl+y approves Bash: rm build") {
+        for (const gone of ["usage", "model", "position", "context", "queue"]) expect(idsNow, `width ${w}`).not.toContain(gone);
+      }
+      if (seg?.text === "Ctrl+y approves Bash") sawShort = true;
+      if (!idsNow.includes("cards")) expect(idsNow, `width ${w}`).not.toContain("approve");
+    }
+    expect(sawShort).toBe(true);
+  });
+
+  it("summarizes a card in one short line: the command or path first, whitespace collapsed, long input cut", () => {
+    expect(cardSummary({ command: "rm   build\n&& ls", description: "Remove the build dir" })).toBe("rm build && ls");
+    expect(cardSummary({ file_path: "/p/src/a.ts", content: "x" })).toBe("/p/src/a.ts");
+    expect(cardSummary({ url: "https://example.com/x" })).toBe("https://example.com/x");
+    const long = cardSummary({ command: "x".repeat(200) });
+    expect(long.length).toBe(40);
+    expect(long).toContain("…");
+    expect(cardSummary({ other: 1 })).toBe('{"other":1}');
+    expect(cardSummary(null)).toBe("null");
+  });
+});
+
+/** Fix round 1 (Opus M-3): a long command is cut in the middle, not at the end, so its tail -- often
+ *  the dangerous part (`| sudo bash`, `--force`) -- still shows on the band. */
+describe("#39 fix round 1: cardSummary keeps the tail", () => {
+  it("cuts a long command in the middle, keeping its head and its end", () => {
+    const s = cardSummary({ command: "curl -fsSL https://example.com/some/long/path/install.sh | sudo bash -s -- --force" });
+    expect(Array.from(s).length).toBe(40);
+    expect(s.startsWith("curl -fsSL")).toBe(true);
+    expect(s.endsWith("sudo bash -s -- --force")).toBe(true);
+    expect(s).toContain("…");
   });
 });

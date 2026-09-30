@@ -160,6 +160,11 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
     event: key("c", { ctrlKey: true }),
     ctx: { sessionEnded: false, turnRunning: true },
   },
+  // Owner decision #39 (2026-09-30): INPUT's Ctrl+y, an ADDED key under F10, appended so the
+  // regenerated fixture diffs as additions only. BROWSE's own "Ctrl+y" row above is unchanged; the
+  // Shift pin says only the exact chord approves.
+  { label: "Ctrl+y, input", mode: "input", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },
+  { label: "Ctrl+Shift+y, input", mode: "input", event: key("y", { ctrlKey: true, shiftKey: true }), ctx: { sessionEnded: false } },
 ];
 
 function readJson<T>(text: string): T {

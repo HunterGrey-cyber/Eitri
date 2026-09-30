@@ -165,6 +165,20 @@ function isWaitingCard(item: TimelineItem, answered: ReadonlySet<string>): boole
   return item.kind === "permission" && !answered.has(item.request.permissionId);
 }
 
+/** Owner decision #39: the card INPUT's `Ctrl+y` approves -- the timeline index of the OLDEST card
+ *  still waiting (lowest `seq`), the same rule a card landing uses (`oldestPendingPermission`, R11)
+ *  with the cards this panel has already answered left out, since those wait only for the provider.
+ *  `null` when none waits. `timeline` is the active tab's, so another tab's card is never a candidate. */
+export function oldestWaitingPermission(timeline: TimelineItem[], answered: ReadonlySet<string>): number | null {
+  let best: number | null = null;
+  timeline.forEach((item, index) => {
+    if (!isWaitingCard(item, answered)) return;
+    const current = best === null ? null : timeline[best];
+    if (current === null || (current.kind === "permission" && item.seq < current.seq)) best = index;
+  });
+  return best;
+}
+
 /** `]p` (+1) / `[p` (-1) (R7): the next waiting card after (before) `from`, wrapping as nvim's `]d`
  *  does (`vim.diagnostic.jump`'s default) -- unlike `[[`/`]]` (`promptIndex`), which stop at either end. A card
  *  this panel already answered is not waiting. With one card waiting, and `from` on it, the answer is `from`

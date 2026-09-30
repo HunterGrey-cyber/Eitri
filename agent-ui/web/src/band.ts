@@ -3,7 +3,7 @@ import type { UsageInfo } from "./types";
 
 /** One segment's identity, in the priority order spec §5.2 lists (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "queue" | "context" | "position" | "model" | "usage";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "position" | "model" | "usage";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (spec §5.2:
  *  left of the gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
@@ -44,7 +44,44 @@ export type BandFacts = {
    *  segment, `title` its tooltip. `null` until a turn has reported one, and always `null` on the
    *  empty tab. */
   usage: UsageFact | null;
+  /** Owner decision #39 (2026-09-30): the card INPUT's `Ctrl+y` would approve -- the active tab's
+   *  oldest waiting card -- set by `App.tsx` only while one waits and the composer has the keys, so
+   *  the band says which card that one key answers. Optional: absent (or `null`) is "nothing to
+   *  name", which every caller that predates #39 means. */
+  approve?: ApproveFact | null;
 };
+
+/** #39's segment: the card's tool name and a one-line summary of its input (`cardSummary`). */
+export type ApproveFact = { tool: string; summary: string };
+
+/** How long `cardSummary` lets a card's summary run on the band, the `…` included. */
+const CARD_SUMMARY_MAX = 40;
+
+/** Owner decision #39: a card in one short line for the band -- what the call acts on (its command,
+ *  file, path or URL, the fields a person checks before approving), else `summarizeInput`'s own
+ *  order's remaining fields, else compact JSON; whitespace collapsed; cut to `CARD_SUMMARY_MAX`
+ *  characters in the middle, head … tail (fix round 1). A `Bash` card's `description` is the
+ *  model's own words about the command, so the command itself comes first. */
+export function cardSummary(input: unknown): string {
+  let text: string | null = null;
+  if (input !== null && typeof input === "object") {
+    const fields = input as Record<string, unknown>;
+    for (const key of ["command", "file_path", "notebook_path", "path", "url", "pattern", "query", "description", "prompt", "name"]) {
+      if (typeof fields[key] === "string") {
+        text = fields[key] as string;
+        break;
+      }
+    }
+  }
+  const line = (text ?? JSON.stringify(input) ?? "").replace(/\s+/g, " ").trim();
+  const chars = Array.from(line);
+  if (chars.length <= CARD_SUMMARY_MAX) return line;
+  // Fix round 1 (Opus M-3): cut in the middle, not at the end -- the tail of a long command is often
+  // the part that matters (`| sudo bash`, `--force`), and it is what a person approving must see.
+  const tail = Math.floor((CARD_SUMMARY_MAX - 1) / 2) + 4;
+  const head = CARD_SUMMARY_MAX - 1 - tail;
+  return `${chars.slice(0, head).join("")}…${chars.slice(chars.length - tail).join("")}`;
+}
 
 /** The band's usage segment as `usageSegment` words it: the text drawn, and the tooltip carrying
  *  the breakdown the text has no room for. */
@@ -102,6 +139,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     mode,
     pill,
     ...(f.cards > 0 ? [{ id: "cards", text: `⚑${f.cards}`, side: "left" } as Seg] : []),
+    ...(f.approve ? [{ id: "approve", text: `Ctrl+y approves ${f.approve.tool}: ${f.approve.summary}`, side: "left" } as Seg] : []),
     ...(f.queued > 0 ? [{ id: "queue", text: `⧗${f.queued}`, side: "left" } as Seg] : []),
     ...(f.message ? [{ id: "message", text: f.message, side: "left" } as Seg] : []),
     ...(f.showcmd ? [{ id: "showcmd", text: f.showcmd, side: "right" } as Seg] : []),
@@ -122,6 +160,10 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     (s) => s.filter((x) => x.id !== "position"),
     (s) => s.filter((x) => x.id !== "context"),
     (s) => s.filter((x) => x.id !== "queue"),
+    // #39: the Ctrl+y segment keeps the tool it names before it goes, and goes before the card
+    // count -- `⚑N` is shorter, and still says a card waits.
+    (s) => s.map((x) => (x.id === "approve" && f.approve ? { ...x, text: `Ctrl+y approves ${f.approve.tool}` } : x)),
+    (s) => s.filter((x) => x.id !== "approve"),
     (s) => s.filter((x) => x.id !== "cards"),
     (s) => s.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x)),
   ];

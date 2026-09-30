@@ -229,9 +229,61 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("y"), ctx)).toEqual({ kind: "copy" });
     // Scrolling a dead session's transcript is still reading it, the same as Ctrl+d/Ctrl+u.
     expect(resolveKey("browse", key("e", { ctrlKey: true }), { sessionEnded: true })).toEqual({ kind: "scroll-line", delta: 1 });
-    // BROWSE only: INPUT's own Ctrl+e (end of line) and Ctrl+y are the composer's.
+    // BROWSE only: INPUT's own Ctrl+e (end of line) is the composer's. INPUT's Ctrl+y was unclaimed
+    // too until owner decision #39 (2026-09-30) ADDED it there as "approve the oldest waiting card"
+    // -- never a scroll (its own describe block below).
     expect(resolveKey("input", key("e", { ctrlKey: true }), ctx)).toBeNull();
-    expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).not.toEqual({ kind: "scroll-line", delta: -1 });
+  });
+
+  /* Owner decision #39 (2026-09-30, "input 直接ctrl y统一吧，不用两次"): an ADDED key -- in INPUT a
+     single Ctrl+y approves the active tab's oldest waiting card (`App.tsx` picks the card and runs
+     the S1 guard; this table only says which chord it is). Exactly Ctrl+y: Shift, Alt, AltGraph,
+     Meta, Super/Hyper, or an input method composing, and it is nothing. BROWSE's Ctrl+y stays the
+     one-line scroll above. There is no deny chord in INPUT. */
+  describe("#39: INPUT Ctrl+y", () => {
+    it("is approve-oldest in INPUT, and still the one-line scroll in BROWSE", () => {
+      expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "approve-oldest" });
+      expect(resolveKey("browse", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "scroll-line", delta: -1 });
+    });
+
+    it.each([
+      ["Shift (as Y)", key("Y", { ctrlKey: true, shiftKey: true })],
+      ["Shift (as y)", key("y", { ctrlKey: true, shiftKey: true })],
+      ["Alt", key("y", { ctrlKey: true, altKey: true })],
+      ["Meta", key("y", { ctrlKey: true, metaKey: true })],
+      ["Super", key("y", { ctrlKey: true, superKey: true })],
+      ["Hyper", key("y", { ctrlKey: true, hyperKey: true })],
+      ["AltGraph", key("y", { ctrlKey: true, altGraphKey: true })],
+      ["an input method composing", key("y", { ctrlKey: true, isComposing: true })],
+      ["keyCode 229", key("y", { ctrlKey: true, keyCode: 229 })],
+      ["no Ctrl at all", key("y")],
+    ])("Ctrl+y with %s is not approve-oldest in INPUT", (_name, ev) => {
+      expect(resolveKey("input", ev, ctx)).toBeNull();
+    });
+
+    it("is refused while Super is held by its own keydown (WebKitGTK's shape)", () => {
+      noteKey("keydown", { key: "Super", code: "OSLeft" });
+      try {
+        expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).toBeNull();
+      } finally {
+        noteKey("keyup", { key: "Super", code: "OSLeft" });
+      }
+      expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "approve-oldest" });
+    });
+
+    /* Fix round 1 (Opus I-4): under Caps Lock GTK/WebKitGTK report Ctrl+y as key "Y" with Shift not
+       held. BROWSE's own Ctrl+y is left as it was on this branch. */
+    it("accepts Caps Lock's Ctrl+Y (no Shift) in INPUT, and still refuses Ctrl+Shift+Y", () => {
+      expect(resolveKey("input", key("Y", { ctrlKey: true }), ctx)).toEqual({ kind: "approve-oldest" });
+      expect(resolveKey("input", key("Y", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
+    });
+
+    it("has its own row in INPUT_KEYS", () => {
+      const row = INPUT_KEYS.find((r) => r.keys === "Ctrl+y");
+      expect(row).toBeDefined();
+      expect(row!.what).toMatch(/oldest/);
+    });
   });
 
   /* v1 picks, Task 5 (decision #13, ruling R10): vim's `Ctrl+f` and the keyboard's own PageDown/PageUp

@@ -227,6 +227,36 @@ mod tests {
         );
     }
 
+    /// Owner decision #39 (2026-09-30): in the agent panel's INPUT, `Ctrl+y` approves the oldest
+    /// waiting card. The page handles it, the way it handles `Ctrl+Enter`: nothing in `shell`
+    /// claims either chord, so the WebView's own key event decides. A root chord (an accelerator or
+    /// a capture-phase navigation key) or the default prefix on `Ctrl+y` would take it before the
+    /// page ever saw it, and the band would advertise a key that does nothing. A user's own
+    /// `neovibe.keymap` can still take it; that is theirs to choose.
+    #[test]
+    fn ctrl_y_stays_the_agent_panels() {
+        let ctrl_y = Chord::of(&super::super::key::KeySpec::parse("C-y").expect("C-y parses"));
+        assert_eq!(
+            ctrl_y,
+            Chord {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                key: "y".into()
+            }
+        );
+        for (chord, what) in chords() {
+            assert_ne!(chord, ctrl_y, "{what} would take the agent panel's INPUT Ctrl+y (#39)");
+        }
+        let prefix = Chord::of(
+            &super::super::key::KeySpec::parse(super::super::stock::STOCK_PREFIX).expect("the stock prefix parses"),
+        );
+        assert_ne!(
+            prefix, ctrl_y,
+            "the default prefix would take the agent panel's INPUT Ctrl+y (#39)"
+        );
+    }
+
     #[test]
     fn spell_reads_an_accelerator_as_a_person_types_it() {
         assert_eq!(spell("F11"), "F11");

@@ -94,6 +94,9 @@ type Props = {
   editingInNvim?: boolean;
   /** `?` on an empty box opens the `?` keymap overlay. */
   onOpenKeymap?: () => void;
+  /** Owner decision #39, fix round 1: the keys the `Ctrl+r` search stops before they bubble, handed
+   *  to the host's typing guard (`HistorySearch`'s own `onLineKey`). */
+  onLineKey?: (event: React.KeyboardEvent<HTMLInputElement>) => void;
 };
 
 /** C2: the BROWSE stand-in's own draft preview, cut to two lines so it reads like a hint rather
@@ -127,6 +130,7 @@ export function Composer({
   onEditInNvim = () => {},
   editingInNvim = false,
   onOpenKeymap = () => {},
+  onLineKey,
 }: Props) {
   const [text, setText] = useState("");
   const [walk, setWalk] = useState<HistoryWalk>({ index: null, stash: "" });
@@ -334,6 +338,7 @@ export function Composer({
           {searching && (
             <HistorySearch
               history={history}
+              onLineKey={onLineKey}
               onAccept={(t) => {
                 setSearching(false);
                 setBox(t);
