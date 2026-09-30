@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=575d56a098bab59fc556d71e1acc5b39ebae275ed2eb29e39f50ee7d8dc53ac5 -->
+<!-- translated-from: INSTALL.md sha256=dc968e02e3260ae6808591609fadfd910a26664426e7d582e20c9b70e54d9990 -->
 
 # 安装 Eitri
 
@@ -146,13 +146,13 @@ $XDG_STATE_HOME/eitri/                       各项目的布局、提示词历�
 
 安装时几种常见的拒绝情形，用安装脚本自己的原话（有所删节）：
 
-- **`run this as the user who will run eitri`**——安装脚本拒绝以 root 身份运行（sidecar 是按用户构建的；以 root 身份执行 `npm ci` 会让每一个依赖的安装脚本都以 root 身份运行）。用你的普通用户身份运行；`--allow-root` 只是为容器环境准备的。
-- **`this system has GTK 4.N, and eitri needs GTK 4.14 or newer`** / **`WebKitGTK 6.0 … was not found`**——你发行版的 GTK4/WebKitGTK 太旧，或者缺少运行时库；错误信息里会给出你这个发行版系列对应的确切包名。Ubuntu 22.04 和 Debian 12 都在这条底线之下；在那上面从源码构建也一样行得通，只是前提是你另外装了足够新的开发包。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 都已经满足要求。
-- **`eitri's prebuilt binaries need glibc 2.39 or newer`**——和上面情况类似；预构建二进制需要一个不早于上面列出的那些发行版，否则就用 `--from-source`。
+- **`run this as the user who will run Eitri`**——安装脚本拒绝以 root 身份运行（sidecar 是按用户构建的；以 root 身份执行 `npm ci` 会让每一个依赖的安装脚本都以 root 身份运行）。用你的普通用户身份运行；`--allow-root` 只是为容器环境准备的。
+- **`this system has GTK 4.N, and Eitri needs GTK 4.14 or newer`** / **`WebKitGTK 6.0 … was not found`**——你发行版的 GTK4/WebKitGTK 太旧，或者缺少运行时库；错误信息里会给出你这个发行版系列对应的确切包名。Ubuntu 22.04 和 Debian 12 都在这条底线之下；在那上面从源码构建也一样行得通，只是前提是你另外装了足够新的开发包。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 都已经满足要求。
+- **`Eitri's prebuilt binaries need glibc 2.39 or newer`**——和上面情况类似；预构建二进制需要一个不早于上面列出的那些发行版，否则就用 `--from-source`。
 - **`checksum mismatch for …`**——下载损坏了，或者在传输过程中被改动过。不管是哪种情况，安装脚本都会拒绝安装，并且如果这个问题反复出现，会给出报告的地方；直接重新运行一次就好。
 - **`the signature on SHA256SUMS does not verify`**——直接拒绝；在一个正式发行版本上遇到这个，不要继续往下走。见[运行前先验证](#verify-before-running)。
 - **在 `PATH` 上找不到 `claude` CLI，或者版本不受支持**——这只是警告，不会拒绝安装：Eitri 照样会装上，但 agent 面板需要一个能用、已登录的 Claude Code 才能运行对话轮次。警告信息里会给出 Anthropic 自己的安装方式。
-- **`~/.local/bin` is not on your `PATH`**，或者 **`\`Eitri\` on this PATH runs <something else>`**——安装成功之后会打印出来；把 `~/.local/bin` 加到你 shell 的 `PATH` 里，或者把它排到当前其他响应 `eitri` 这个名字的东西前面（往往是早先某次 `.deb` 安装留下的 `/usr/bin/eitri`）。
+- **`~/.local/bin` is not on your `PATH`**，或者 **`\`eitri\` on this PATH runs <something else>`**——安装成功之后会打印出来；把 `~/.local/bin` 加到你 shell 的 `PATH` 里，或者把它排到当前其他响应 `eitri` 这个名字的东西前面（往往是早先某次 `.deb` 安装留下的 `/usr/bin/eitri`）。
 
 - **`… is writable by its group or by anyone, and not sticky`** — 安装器把下载的文件放在
   `$XDG_CACHE_HOME/eitri`（默认是 `~/.cache/eitri`）。如果其他用户能写这个缓存目录，他们就可能在

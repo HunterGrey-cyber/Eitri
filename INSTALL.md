@@ -3,7 +3,7 @@ English | [简体中文](INSTALL.zh-CN.md)
 # Installing Eitri
 
 Every route ends the same way: a per-user install under `~/.local` (or a system one from a
-`.deb`/`.rpm`), and a `eitri` launcher. `install.sh` builds the agent sidecar for your machine as
+`.deb`/`.rpm`), and an `eitri` launcher. `install.sh` builds the agent sidecar for your machine as
 part of installing — except the `.deb`/`.rpm` route, which runs no maintainer script and needs one
 explicit `eitri setup` afterwards (below). The `eitri` launcher itself never builds a sidecar: run
 before one exists, it still opens with no agent backend and a one-line hint to run `eitri setup`. See
@@ -177,7 +177,7 @@ for `--verdandi-checkout` and the other `--from-source` sub-options.
 It bundles Anthropic's `@anthropic-ai/claude-agent-sdk` ("© Anthropic PBC. All rights reserved"),
 which this project does not redistribute. `eitri setup` (and every route above) fetches it from the
 npm registry to your own machine, under Anthropic's own terms, and builds it from the pinned Verdandi
-revision this release names. The sidecar itself never ships inside a Eitri release artifact.
+revision this release names. The sidecar itself never ships inside an Eitri release artifact.
 
 ## Updating
 
@@ -208,7 +208,7 @@ sidecar revision except the one an installed `.deb`/`.rpm` still names in its `/
 history, saved permission rules) unless you pass `--purge`; nothing named `nvim`/`vim`/`vi` outside
 `$XDG_DATA_HOME/eitri/nvim` is ever touched. For a `.deb`/`.rpm` install, the package itself never
 owns the per-user sidecar or private nvim, so removing it (`sudo apt remove eitri` / `sudo dnf remove
-Eitri`) leaves both behind — **and order matters for cleaning them up**. `Eitri setup --uninstall`
+eitri`) leaves both behind — **and order matters for cleaning them up**. `eitri setup --uninstall`
 does not work for this: `eitri setup` is `/usr/lib/eitri/eitri-setup`, which the package removed
 along with `/usr/bin/eitri`; and running it *before* you remove the package keeps every sidecar revision the
 still-installed package's own `/usr/lib/eitri/RELEASE` names, since that file is how it tells "an
@@ -250,15 +250,15 @@ nvim copy is never placed on `PATH` and never replaces, links or removes anythin
 
 A few common install-time refusals, in the installer's own words (abridged):
 
-- **`run this as the user who will run eitri`** — the installer refuses to run as root (the sidecar
+- **`run this as the user who will run Eitri`** — the installer refuses to run as root (the sidecar
   is built per user; `npm ci` as root would run every dependency's install scripts as root). Run it as
   your normal user; `--allow-root` exists only for containers.
-- **`this system has GTK 4.N, and eitri needs GTK 4.14 or newer`** / **`WebKitGTK 6.0 … was not
+- **`this system has GTK 4.N, and Eitri needs GTK 4.14 or newer`** / **`WebKitGTK 6.0 … was not
   found`** — your distro's GTK4/WebKitGTK are too old or missing the runtime libraries; the message
   names the exact package for your distro family. Ubuntu 22.04 and Debian 12 are below the floor;
   build from source works there too only once you separately have new-enough dev packages.
   Ubuntu 24.04, Debian 13, Fedora 40+, RHEL 10 and Arch all have it.
-- **`eitri's prebuilt binaries need glibc 2.39 or newer`** — same shape as above; the prebuilt
+- **`Eitri's prebuilt binaries need glibc 2.39 or newer`** — same shape as above; the prebuilt
   binaries need a distro no older than the ones just listed, or `--from-source`.
 - **`checksum mismatch for …`** — a download is corrupt or was altered in transit. The installer
   refuses to install it either way and names where to report it if it keeps happening; just re-run.
@@ -267,7 +267,7 @@ A few common install-time refusals, in the installer's own words (abridged):
 - **the `claude` CLI was not found on `PATH`, or an unsupported version** — a warning, not a refusal:
   Eitri installs regardless, but the agent panel needs a working, logged-in Claude Code to run
   turns. The warning names Anthropic's own installer.
-- **`~/.local/bin` is not on your `PATH`**, or **`\`Eitri\` on this PATH runs <something else>`** —
+- **`~/.local/bin` is not on your `PATH`**, or **`\`eitri\` on this PATH runs <something else>`** —
   printed at the end of a successful install; add `~/.local/bin` to your shell's `PATH`, or put it
   before whatever else answers to `eitri` today (often `/usr/bin/eitri` from an earlier `.deb`).
 

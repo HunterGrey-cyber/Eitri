@@ -68,7 +68,7 @@ Eitri's agent talks to Claude Code through a sidecar, a Node service from the si
 [Verdandi](https://github.com/HunterGrey-cyber/verdandi). `agent` depends on Verdandi's
 `claude-runtime-protocol` crate, pinned by revision in `agent/Cargo.toml` and fetched from GitHub by
 Cargo — *building* Eitri never needs a Verdandi checkout. *Running* the sidecar backend is a
-separate question with its own search order (a built binary, a Verdandi checkout, or `Eitri
+separate question with its own search order (a built binary, a Verdandi checkout, or `eitri
 setup`'s own build) — see [README.md's Verdandi section](README.md#the-verdandi-dependency).
 
 If you need to change the protocol crate itself, don't re-pin the revision for a work-in-progress
@@ -96,7 +96,7 @@ which is why they sit outside the workspace's `default-members` and are only rea
 
 Before the sidecar, Eitri's agent panel spawned a `claude` process on `PATH` directly. That code
 is still in the tree behind a cargo feature, `legacy-backend`, off by default: plain `cargo
-build`/`cargo test` never compile it, and no release build can select it (`Eitri --legacy` on a
+build`/`cargo test` never compile it, and no release build can select it (`eitri --legacy` on a
 release exits 1, naming why). Build it in for local testing with `cargo build --features
 shell/legacy-backend` (or `cargo run -p shell --features shell/legacy-backend -- ...`), then select
 it with `--legacy` or `EITRI_AGENT_BACKEND=legacy`. It needs Claude Code installed and logged in,
