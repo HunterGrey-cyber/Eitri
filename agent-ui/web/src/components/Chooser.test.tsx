@@ -417,6 +417,23 @@ describe("Chooser", () => {
     expect(outer).not.toHaveBeenCalledWith(expect.objectContaining({ key: "g" }));
     expect(outer).not.toHaveBeenCalledWith(expect.objectContaining({ key: "G" }));
   });
+  /** rc.3 minors review: a `g` held with Ctrl, Alt or Meta is a chord meant for something else; it must
+   *  not arm the chooser's `gg` wait and so swallow the next plain key. */
+  it("a modified g does not arm gg, so the next j still moves", () => {
+    const { root } = renderChooser();
+    void root;
+    const current = () => document.querySelector(".chooser-row.current")!.textContent;
+    const el = () => document.querySelector<HTMLElement>(".chooser")!;
+    for (const mod of [{ altKey: true }, { metaKey: true }, { ctrlKey: true }]) {
+      fireEvent.keyDown(el(), { key: "G" });
+      fireEvent.keyDown(el(), { key: "g" });
+      fireEvent.keyDown(el(), { key: "g" });
+      expect(current()).toContain("New session");
+      fireEvent.keyDown(el(), { key: "g", ...mod });
+      fireEvent.keyDown(el(), { key: "j" });
+      expect(current()).toContain("1 fix-parser");
+    }
+  });
   /** Spec §6.1: the current row's sign cell is the panel's solid cursor holding `›`. The r2-gui GUI
    *  pass saw only the cursorline fill. */
   it("draws the current row's sign as › and no other row's", () => {
@@ -647,6 +664,50 @@ describe("Chooser: K03 and the list keys (v1 picks R1, R12)", () => {
     fireEvent.keyDown(root, { key: "Shift" });
     fireEvent.keyDown(root, { key: "x" });
     expect(props.onCloseTab).not.toHaveBeenCalled();
+    expect(currentRow(container)).toContain("1 fix-parser");
+  });
+});
+
+/** rc.3 minors (K01's cancel routes, for the chooser's own `g`): a lone `g` waits for its next key with
+ *  no timeout, so any route that ends a pending key elsewhere in the window has to end this one too --
+ *  Shift+Tab (the chooser sees it as a key of its own) and the window's cancel routes that reach it as
+ *  `dropKeysRequest` (a focus round trip, `arrive`, a HINT, a tab switch, an overlay). Left waiting, the
+ *  next `j` after either was swallowed as the cancel of a `g` nobody meant any more. */
+describe("Chooser: a waiting g ends on the window's cancel routes (K01)", () => {
+  const currentRow = (c: HTMLElement) => c.querySelector(".chooser-row.current")?.textContent ?? null;
+
+  it("Shift+Tab ends it: g, Shift+Tab, then j moves the cursor", () => {
+    const { root, container } = renderChooser({ active: 1 });
+    expect(currentRow(container)).toContain("1 fix-parser");
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    fireEvent.keyDown(root, { key: "j" });
+    expect(currentRow(container)).toContain("2 legacy");
+  });
+
+  it("Shift+Tab ends it: g, Shift+Tab, g is a fresh wait, not the second half of gg", () => {
+    const { root, container } = renderChooser({ active: 2 });
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    fireEvent.keyDown(root, { key: "g" });
+    expect(currentRow(container), "no gg happened").toContain("2 legacy");
+    fireEvent.keyDown(root, { key: "g" });
+    expect(currentRow(container), "a real gg still does").toContain("New session");
+  });
+
+  it("a bump of dropKeysRequest ends it: g, a cancel route, then j moves the cursor", () => {
+    const { root, container, props, rerender } = renderChooser({ active: 1, dropKeysRequest: 0 });
+    fireEvent.keyDown(root, { key: "g" });
+    rerender(<Chooser {...props} dropKeysRequest={1} />);
+    fireEvent.keyDown(root, { key: "j" });
+    expect(currentRow(container)).toContain("2 legacy");
+  });
+
+  it("without a bump the wait stands: g, a re-render, then j is still the swallowed cancel key", () => {
+    const { root, container, props, rerender } = renderChooser({ active: 1, dropKeysRequest: 3 });
+    fireEvent.keyDown(root, { key: "g" });
+    rerender(<Chooser {...props} dropKeysRequest={3} />);
+    fireEvent.keyDown(root, { key: "j" });
     expect(currentRow(container)).toContain("1 fix-parser");
   });
 });

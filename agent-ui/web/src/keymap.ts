@@ -568,11 +568,13 @@ export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNulla
 
 /** The key after a pending prefix (K01). A bare modifier is not a key yet. `Ctrl+c` keeps D1's
  *  meaning; `gv` stays D2's reservation and `[]`/`][` stay nothing, exactly as before.
- *  Fix round 2 (review): the second key reads the modifiers the way `g`/`z`/`[`/`]` themselves are
- *  read (`resolveKey`'s blanket refusal: Ctrl and Shift, never Alt or Meta), so the two halves of a
- *  pair agree. A pair typed with Alt or Meta held completes, as it did before K01 -- on a layout that
- *  types a bracket with Option (macOS German, French, Swiss), that is how `[[` and `]]` are typed at
- *  all -- and a key completing no pair still cancels, whatever it holds. */
+ *  Fix round 2 (review): the second key reads the modifiers the way `[`/`]` themselves are read
+ *  (`resolveKey`'s blanket refusal: Ctrl and Shift, never Alt or Meta), so the two halves of a
+ *  bracket pair agree. A pair typed with Alt or Meta held completes, as it did before K01 -- on a
+ *  layout that types a bracket with Option (macOS German, French, Swiss), that is how `[[` and `]]`
+ *  are typed at all -- and a key completing no pair still cancels, whatever it holds.
+ *  rc.3 minors 6: `g` and `z` no longer ARM with Alt or Meta held (no layout types them that way),
+ *  so for them only the second key still reads Alt/Meta -- a pair whose first half was plain. */
 function resolvePendingSecond(prefix: PendingPrefix, event: KeyLike, ctx: KeyContext): PanelAction {
   if (isModifierKey(event.key)) return null;
   if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning === true ? { kind: "interrupt" } : null;
@@ -785,8 +787,17 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   switch (event.key) {
     case "g":
     case "z":
+      // rc.3 minors 6: a chord meant for something else (Alt+g, Meta+z) must not arm a prefix that
+      // then swallows the next plain key. No layout types `g` or `z` with Alt or Meta held, unlike a
+      // bracket (next case), so a modified one is simply not this key -- the same test `v`, `D` and
+      // `a`/`d` apply. Unclaimed rather than cancelled: nothing is pending yet.
+      if (!isPlainAnswerKey(event)) return null;
+      return { kind: "pending", prefix: event.key };
     case "[":
     case "]":
+      // Armed with Alt or Meta held on purpose: `event.key` being a bracket while Option is down IS
+      // how a macOS German, French or Swiss layout types one, and `[[`/`]]` (completed by
+      // `resolvePendingSecond`, which reads Alt and Meta the same way) must keep jumping there.
       return { kind: "pending", prefix: event.key };
     case "i":
     case "o":

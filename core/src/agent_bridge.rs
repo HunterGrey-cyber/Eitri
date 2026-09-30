@@ -2727,7 +2727,8 @@ mod tests {
             scope: crate::tab_set::BypassScope::Tab(TabId(3)),
             nonce: 17,
             approve: vec!["p1".to_string(), "p2".to_string()],
-            lines: vec!["切到 bypass 并批准 2 张等待中的卡片？(y/n)".to_string()],
+            // The strings `TabSet` really sends (K09), not a paraphrase that can drift from them.
+            lines: vec![crate::tabs::bypass_prompt(crate::tabs::PromptScope::LiveTab, 2)],
             prompt: crate::tabs::PromptScope::LiveTab,
         };
         assert_eq!(
@@ -2737,7 +2738,7 @@ mod tests {
                 "tab": 3,
                 "scope": "tab",
                 "nonce": 17,
-                "lines": ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"],
+                "lines": ["Switch to bypass and approve the 2 waiting cards? (y/n)"],
             }),
             "approve must never reach the wire"
         );
@@ -2746,7 +2747,7 @@ mod tests {
             scope: crate::tab_set::BypassScope::Default,
             nonce: 18,
             approve: Vec::new(),
-            lines: vec!["新会话默认用 bypass？(y/n)".to_string()],
+            lines: vec![crate::tabs::bypass_prompt(crate::tabs::PromptScope::Default, 0)],
             prompt: crate::tabs::PromptScope::Default,
         };
         assert_eq!(
@@ -2756,7 +2757,7 @@ mod tests {
                 "tab": null,
                 "scope": "default",
                 "nonce": 18,
-                "lines": ["新会话默认用 bypass？(y/n)"],
+                "lines": ["Start new sessions in bypass? (y/n)"],
             })
         );
 

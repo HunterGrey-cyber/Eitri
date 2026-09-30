@@ -520,6 +520,71 @@ mod tests {
         }
     }
 
+    /// rc.3 minors fix round: the web tests carry hand-copied bypass prompts (a `confirm_bypass`
+    /// envelope's `lines`, the band's narrow-width fixtures), and K09's English wording left the Chinese
+    /// copies behind once already. Every double-quoted string in a `*.test.ts(x)` that mentions bypass
+    /// and ends in `(y/n)` must therefore be a string `bypass_prompt` really produces -- so the fixtures
+    /// can be shorter than the prompt they stand in for, but never a different wording. Read as text,
+    /// like the socket-path scanners: a paraphrase fails here instead of passing for a prompt.
+    #[test]
+    fn the_web_tests_use_only_the_bypass_prompts_this_file_produces() {
+        let mut real: Vec<String> = vec![
+            bypass_prompt(PromptScope::EmptyTab, 0),
+            bypass_prompt(PromptScope::Default, 0),
+        ];
+        real.extend((0..=99).map(|waiting| bypass_prompt(PromptScope::LiveTab, waiting)));
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".test.ts") || n.ends_with(".test.tsx"))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(
+            files.len() > 20,
+            "found only {} web test files under {}",
+            files.len(),
+            root.display()
+        );
+
+        let mut checked = 0;
+        let mut strangers = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for (number, line) in text.lines().enumerate() {
+                // The text between one pair of double quotes, per line: an odd-numbered piece of a split.
+                for literal in line.split('"').skip(1).step_by(2) {
+                    if literal.ends_with("(y/n)") && literal.to_ascii_lowercase().contains("bypass") {
+                        checked += 1;
+                        if !real.iter().any(|prompt| prompt == literal) {
+                            strangers.push(format!("{}:{}: {literal:?}", file.display(), number + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 10,
+            "the scan should find the web tests' bypass prompts, found {checked}"
+        );
+        assert!(
+            strangers.is_empty(),
+            "a web test's bypass prompt is not one `bypass_prompt` produces:\n{}",
+            strangers.join("\n")
+        );
+    }
+
     /// Only a live tab has cards to approve: the other two scopes read the same whatever count they
     /// are handed (a `NotStarted` tab has no session and the window default is no tab at all).
     #[test]

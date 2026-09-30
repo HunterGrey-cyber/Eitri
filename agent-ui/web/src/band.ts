@@ -104,8 +104,9 @@ export function textWidth(text: string): number {
 
 /** This module used to have a `cut(text, n)` truncator here, appending `…` to a message/prompt
  *  that did not fit (spec §5.3.3). **Removed 2026-09-27 (v1 sandbox GUI pass, defect 1):** at the
- *  owner's own WebKit zoom 1.5 (a 47-column band), it truncated the R06 bypass prompt to
- *  `切到 bypass 并批准 1 张等待中的卡…`, losing its own `(y/n)`, and did the same to the D11
+ *  owner's own WebKit zoom 1.5 (a 47-column band), it truncated the R06 bypass prompt (then in
+ *  Chinese; English since K09, `Switch to bypass and approve the 1 waiting card? (y/n)`, which is
+ *  wider than 47 columns too) mid-sentence, losing its own `(y/n)`, and did the same to the D11
  *  flash explaining what `y` does -- exactly the two things a y/n prompt/flash must stay legible
  *  for. Neither a prompt nor a message is ever cut any more; a segment that would have been reads
  *  `wraps: true` instead (below), and `StatusBand`/`index.css`'s `.status-band--wrap` let the band

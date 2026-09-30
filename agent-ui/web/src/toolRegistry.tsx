@@ -276,6 +276,9 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
     renderInvocation: (input) => <div className="tool-card tool-card-skill">Used skill: {commandOf(input)}</div>,
   },
   Task: oneLine("Task"),
+  // CLI 2.1.283+ spells the subagent tool `Agent` (the same tool, renamed -- see
+  // `agent/src/permission_policy.rs`'s `NEVER_ASK_TOOLS`); `Task` stays for an older CLI.
+  Agent: oneLine("Agent"),
   CronCreate: oneLine("CronCreate"),
   CronDelete: oneLine("CronDelete"),
   CronList: oneLine("CronList"),

@@ -20,6 +20,12 @@ type Props = {
    *  too (initial value 0 or otherwise -- the effect below always runs on mount, like the old
    *  mount-only effect it replaces). */
   focusRequest: number;
+  /** rc.3 minors (K01): bumped by `App.tsx`'s `dropPendingKeys()` on every cancel route this overlay
+   *  never sees as a key of its own -- a focus round trip (`pane_focus`), `arrive`, a HINT, a tab
+   *  switch, another overlay. It ends the chooser's own lone-`g` wait, as those routes end the
+   *  panel's waiting prefix, count and leader sequence (`Shift+Tab`, which the chooser does see, ends
+   *  it in `onKeyDown`). Optional, so this component's own tests need no stand-in. */
+  dropKeysRequest?: number;
   onSwitch: (tab: TabId) => void;
   onResume: (providerSessionId: string) => void;
   onNewSession: () => void;
@@ -176,6 +182,7 @@ export function Chooser({
   projectDir,
   newTabChord,
   focusRequest,
+  dropKeysRequest,
   onSwitch,
   onResume,
   onNewSession,
@@ -274,6 +281,11 @@ export function Chooser({
   // key does, so `gx` asked to close a tab and `gEnter` chose a row. A bare modifier is not "the next
   // key" (the Shift of a `G`).
   const pendingG = useRef(false);
+  // rc.3 minors (K01): the window's own cancel routes (`dropKeysRequest`'s doc). Also runs on mount,
+  // where there is nothing waiting yet.
+  useEffect(() => {
+    pendingG.current = false;
+  }, [dropKeysRequest]);
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (composing(event)) return;
     // v1, spec §3.4: a bypass (or window-close) confirm owns every key ahead of everything else in
@@ -289,6 +301,9 @@ export function Chooser({
     if (isShiftTab(event)) {
       event.preventDefault();
       event.stopPropagation();
+      // K01: Shift+Tab is a key after a waiting `g`, and (unlike a bare modifier) it does something
+      // here -- so it ends the wait, as it drops the panel's own pending keys (`App.tsx`).
+      pendingG.current = false;
       cycleMode(current);
       return;
     }
@@ -305,6 +320,9 @@ export function Chooser({
       if (key === "g") setCursor(0);
       return;
     }
+    // A `g` held with Ctrl, Alt or Meta is a chord for something else: it arms no `gg` wait, which would
+    // swallow the next plain key (rc.3 minors review, the same rule as the panel's own g/z/[/]).
+    if (key === "g" && (event.ctrlKey || event.altKey || event.metaKey)) return;
     if (key === "g" || key === "G") {
       event.preventDefault();
       event.stopPropagation();

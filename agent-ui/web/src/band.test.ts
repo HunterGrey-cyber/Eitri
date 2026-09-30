@@ -48,8 +48,8 @@ describe("the band degrades by priority (spec §5.3)", () => {
  *  a y/n prompt's own `(y/n)`, and the D11 flash's own explanation, to `bandLayout`'s old `cut()`. */
 describe("defect 1: a y/n prompt or a flash is never truncated", () => {
   const NARROW_BUDGET_WIDTH = 340; // floor(340 / 7.2) === 47
-  const R06_PROMPT = "切到 bypass 并批准 1 张等待中的卡片？(y/n)";
-  const EMPTY_TAB_PROMPT = "切到 bypass？本窗口之后的新会话也用 bypass (y/n)";
+  const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
+  const EMPTY_TAB_PROMPT = "Switch to bypass? New sessions in this window start in bypass too (y/n)";
   const D11_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
 
   it("keeps the R06 bypass prompt whole, (y/n) included, at a 47-column budget", () => {

@@ -180,7 +180,7 @@ function renderNarrow(facts: BandFacts) {
 }
 
 it("defect 1: a bypass prompt too wide for the band wraps instead of truncating, (y/n) intact", () => {
-  const R06_PROMPT = "切到 bypass 并批准 1 张等待中的卡片？(y/n)";
+  const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
   const { container } = renderNarrow({ ...RUNNING, prompt: R06_PROMPT, message: null });
   expect(container.querySelector(".status-band")!.classList.contains("status-band--wrap")).toBe(true);
   const prompt = container.querySelector(".band-prompt")!;

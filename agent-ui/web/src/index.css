@@ -393,9 +393,10 @@ body,
   white-space: nowrap;
 }
 /* Defect 1 (2026-09-27, v1 sandbox GUI pass): the owner's own WebKit zoom 1.5 measured a 47-column
-   band, where the R06 bypass prompt (`切到 bypass 并批准 1 张等待中的卡片？(y/n)`), the empty-tab
-   bypass prompt and the D11 flash (`y must be pressed on its own to enter bypass ...`) all lost
-   their own trailing `(y/n)`/explanation to the fixed-height, `overflow: hidden` row below. Neither
+   band, where the R06 bypass prompt (`Switch to bypass and approve the 1 waiting card? (y/n)`), the
+   empty-tab bypass prompt (`Switch to bypass? New sessions in this window start in bypass too (y/n)`)
+   and the D11 flash (`y must be pressed on its own to enter bypass ...`) all lost their own
+   trailing `(y/n)`/explanation to the fixed-height, `overflow: hidden` row below. Neither
    is truncated by `band.ts` any more (`Seg.wraps`); `StatusBand` adds this class only on a render
    that actually needs it (a segment `bandLayout` marked `wraps`), so a short prompt/flash still
    renders on the one fixed row exactly as before, and the moment `wraps` stops being set (the

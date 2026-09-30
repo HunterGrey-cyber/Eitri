@@ -327,6 +327,19 @@ describe("P2, P3, P4, R3 in the registry", () => {
     for (const name of offered) expect(lookupTool(name), name).toBeDefined();
   });
 
+  /* CLI 2.1.283 renamed `Task` to `Agent` (permission_policy.rs's NEVER_ASK_TOOLS keeps both for
+     the same reason). Registering only the old name drew every subagent launch on the new CLI as
+     the generic pretty-printed JSON fallback. */
+  it("draws the subagent tool as a one-line row under both its names (Task on CLI 2.1.272, Agent on 2.1.283+)", () => {
+    for (const name of ["Task", "Agent"]) {
+      expect(lookupTool(name), name).toBeDefined();
+      const out = html(renderToolCall({ seq: 1, toolUseId: "t", name, input: { description: "look around" }, result: null }));
+      expect(out, name).not.toContain("tool-card-generic");
+      expect(out, name).toContain(`${name}:`);
+      expect(out, name).toContain("look around");
+    }
+  });
+
   it("draws ToolSearch as one muted line with no result row", () => {
     const out = html(renderToolCall({ seq: 1, toolUseId: "t", name: "ToolSearch", input: { query: "select:Read" }, result: { content: "schema", isError: false } }));
     expect(out).toContain("tool-card-muted");

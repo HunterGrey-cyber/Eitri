@@ -613,7 +613,8 @@ describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs 
     expect(resolveKey("browse", key("o", { ctrlKey: true }), ctx)).toEqual({ kind: "detailed" });
     expect(resolveKey("input", key("o", { ctrlKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "detailed" });
   });
-  /* Fix round 2 (review): the first key arms a prefix with Alt or Meta held (the blanket refusal
+  /* Fix round 2 (review; the first key's half narrowed for g/z by rc.3 minors 6, next test): the
+     first key armed a prefix with Alt or Meta held (the blanket refusal
      reads only Ctrl and Shift), but the second key completed a pair only with neither held. So a
      pair typed with either on both keys cancelled where it had always completed. On a layout that
      types a bracket with Option (macOS German, French, Swiss), that is how `[[` and `]]` are typed.
@@ -623,7 +624,8 @@ describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs 
     for (const over of [{ altKey: true }, { metaKey: true }]) {
       const held = JSON.stringify(over);
       for (const prefix of ["g", "z", "[", "]"] as const) {
-        expect(resolveKey("browse", key(prefix, over), ctx), `${held} ${prefix} arms`).toEqual({ kind: "pending", prefix });
+        // rc.3 minors 6: only a bracket arms with Alt or Meta held (the next test); a pair typed
+        // after a prefix that armed plainly still completes with either held, as here.
         for (const [k, pair] of Object.entries(FIXED_PAIRS[prefix]))
           expect(resolveKey("browse", key(k, over), { ...ctx, pending: prefix }), `${prefix} then ${held} ${k}`).toEqual(pair);
       }
@@ -639,6 +641,29 @@ describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs 
     }
     for (const over of [{ ctrlKey: true }, { shiftKey: true }])
       expect(resolveKey("browse", key("[", over), { ...ctx, pending: "[" }), JSON.stringify(over)).toEqual({ kind: "cancel", why: "unbound" });
+  });
+  /* rc.3 minors 6: the FIRST key. `g` and `z` are letters no layout types with Alt or Meta held, so a
+     modified one is a chord meant for something else (the window manager, GTK, a future binding) and
+     arming a prefix from it swallowed the next plain key -- Alt+g, then `i`, never opened the
+     composer. BROWSE reads them as the region modes and `v`/`:`/`Ctrl+w` already do. A bracket is
+     the exception, because `event.key` being `[` or `]` with Option held IS how a macOS German,
+     French or Swiss layout types one (`[[`/`]]` above). Unclaimed, not cancelled: nothing is
+     pending, so nothing is there to cancel. */
+  it("arms g and z only unmodified, and a bracket even typed with Option (rc.3 minors 6)", () => {
+    for (const over of [{ altKey: true }, { metaKey: true }, { altKey: true, metaKey: true }]) {
+      const held = JSON.stringify(over);
+      for (const prefix of ["g", "z"] as const)
+        expect(resolveKey("browse", key(prefix, over), ctx), `${held} ${prefix}`).toBeNull();
+      for (const prefix of ["[", "]"] as const)
+        expect(resolveKey("browse", key(prefix, over), ctx), `${held} ${prefix}`).toEqual({ kind: "pending", prefix });
+    }
+    // Plain still arms, and a count in flight does not change that.
+    for (const prefix of ["g", "z", "[", "]"] as const) {
+      expect(resolveKey("browse", key(prefix), ctx), prefix).toEqual({ kind: "pending", prefix });
+      expect(resolveKey("browse", key(prefix), { ...ctx, count: 3 }), `3${prefix}`).toEqual({ kind: "pending", prefix });
+    }
+    // The key after a modified g is then its own key, not the second half of a `g` that was never armed.
+    expect(resolveKey("browse", key("i"), ctx)).toEqual({ kind: "mode", to: "input", caret: "kept" });
   });
 });
 

@@ -3856,6 +3856,7 @@ export default function App() {
               projectDir={hello?.projectDir ?? ""}
               newTabChord={keymapHelp.newTabChord}
               focusRequest={chooserFocusRequest}
+              dropKeysRequest={emptyDropKeys}
               onSwitch={onChooserSwitch}
               onResume={onChooserResume}
               onNewSession={onChooserNewSession}
@@ -5636,6 +5637,7 @@ export default function App() {
               projectDir={hello?.projectDir ?? ""}
               newTabChord={keymapHelp.newTabChord}
               focusRequest={chooserFocusRequest}
+              dropKeysRequest={emptyDropKeys}
               onSwitch={onChooserSwitch}
               onResume={onChooserResume}
               onNewSession={onChooserNewSession}
@@ -5762,57 +5764,92 @@ export default function App() {
       {/* N2/R4: `gf` with several paths, and the open `/` prompt, each still own every key
           (`onKeyDown`'s dedicated branches, above `resolveKey` entirely) -- only WHERE they draw
           moved, once `Footer`'s third slot stopped existing (panel round 2 plan, Task 10). */}
-      {pathPick !== null && <PathPick paths={pathPick} />}
-      {linkPick !== null && <LinkPick urls={linkPick} />}
+      {/* rc.3 minors (K03's rule, "the overlay closes with a flash", for the four this row of overlays
+          left out): each sits in its own `PanelErrorBoundary`, so a throw while it renders closes just
+          it and says so in the band rather than unmounting the panel. The two pickers hold no focus
+          (the root keeps the keys and reads the letter), so closing them is all it takes; the two
+          lines are inputs that DO hold it, so they hand the keys back the way their own Esc does. */}
+      {pathPick !== null && (
+        <PanelErrorBoundary name="path picker" onError={() => overlayFailed("path picker", () => setPathPick(null))}>
+          <PathPick paths={pathPick} />
+        </PanelErrorBoundary>
+      )}
+      {linkPick !== null && (
+        <PanelErrorBoundary name="link picker" onError={() => overlayFailed("link picker", () => setLinkPick(null))}>
+          <LinkPick urls={linkPick} />
+        </PanelErrorBoundary>
+      )}
       {search !== null && (
-        <SearchBar
-          query={search.query}
-          focusRequest={lineFocusRequest}
-          onChange={(query) => {
-            setSearch({ query, origin: search.origin });
-            const found = findMatch(timeline, query, search.origin, 1, true);
-            setCursor(found ?? search.origin);
-          }}
-          onAccept={(event) => {
-            noteLineKey(event);
-            lastSearchRef.current = search.query;
-            if (search.query !== "" && findMatch(timeline, search.query, search.origin, 1, true) === null) {
-              showFlash(`pattern not found: ${search.query}`);
+        <PanelErrorBoundary
+          name="search line"
+          onError={() =>
+            overlayFailed("search line", () => {
+              // Esc's own effect: the cursor goes back to where the search started.
               setCursor(search.origin);
-            }
-            setSearch(null);
-            containerRef.current?.focus({ preventScroll: true });
-          }}
-          onCancel={(event) => {
-            noteLineKey(event);
-            setCursor(search.origin);
-            setSearch(null);
-            containerRef.current?.focus({ preventScroll: true });
-          }}
-        />
+              setSearch(null);
+              returnKeysToRoot();
+            })
+          }
+        >
+          <SearchBar
+            query={search.query}
+            focusRequest={lineFocusRequest}
+            onChange={(query) => {
+              setSearch({ query, origin: search.origin });
+              const found = findMatch(timeline, query, search.origin, 1, true);
+              setCursor(found ?? search.origin);
+            }}
+            onAccept={(event) => {
+              noteLineKey(event);
+              lastSearchRef.current = search.query;
+              if (search.query !== "" && findMatch(timeline, search.query, search.origin, 1, true) === null) {
+                showFlash(`pattern not found: ${search.query}`);
+                setCursor(search.origin);
+              }
+              setSearch(null);
+              containerRef.current?.focus({ preventScroll: true });
+            }}
+            onCancel={(event) => {
+              noteLineKey(event);
+              setCursor(search.origin);
+              setSearch(null);
+              containerRef.current?.focus({ preventScroll: true });
+            }}
+          />
+        </PanelErrorBoundary>
       )}
       {/* K02 (ruling R4): the `:` command line, where vim draws it. It runs nothing -- Enter says
           so, Esc (and `Ctrl+[`, R9) closes it silently -- and exists so `:ls⏎`, `:l⏎` and `:d⏎`
           land here, never on a card. */}
       {exLine !== null && (
-        <SearchBar
-          lead=":"
-          label="Command line"
-          query={exLine}
-          focusRequest={lineFocusRequest}
-          onChange={setExLine}
-          onAccept={(event) => {
-            noteLineKey(event);
-            showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
-            setExLine(null);
-            returnKeysToRoot();
-          }}
-          onCancel={(event) => {
-            noteLineKey(event);
-            setExLine(null);
-            returnKeysToRoot();
-          }}
-        />
+        <PanelErrorBoundary
+          name="command line"
+          onError={() =>
+            overlayFailed("command line", () => {
+              setExLine(null);
+              returnKeysToRoot();
+            })
+          }
+        >
+          <SearchBar
+            lead=":"
+            label="Command line"
+            query={exLine}
+            focusRequest={lineFocusRequest}
+            onChange={setExLine}
+            onAccept={(event) => {
+              noteLineKey(event);
+              showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
+              setExLine(null);
+              returnKeysToRoot();
+            }}
+            onCancel={(event) => {
+              noteLineKey(event);
+              setExLine(null);
+              returnKeysToRoot();
+            }}
+          />
+        </PanelErrorBoundary>
       )}
       {/* The bottom band (panel round 2 plan, Task 10; spec §5): replaces `StatusRow`, `Footer`,
           `NewPill` and `ContextLine` with one vim-statusline row. `showcmd` reads the same `box`
