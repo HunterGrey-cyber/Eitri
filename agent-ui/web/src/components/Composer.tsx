@@ -4,6 +4,7 @@ import { HINT_COMPOSER_ATTR } from "../nav";
 import {
   caretOnFirstLine,
   caretOnLastLine,
+  enterNewline,
   growHeight,
   isImeKey,
   mergeTaken,
@@ -252,6 +253,14 @@ export function Composer({
     // handler.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      // Alt+Enter and Enter after a backslash at the caret are Claude Code's newline keys, so they
+      // insert a newline instead of sending. Skip this while `editingInNvim`: readOnly stops typing
+      // but not this handler, and nvim's later write would overwrite a newline added here.
+      const newline = editingInNvim ? null : enterNewline(el.value, el.selectionStart, el.selectionEnd, e);
+      if (newline !== null) {
+        setBox(newline.value, newline.caret);
+        return;
+      }
       submit(e.ctrlKey);
       return;
     }

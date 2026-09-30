@@ -17,7 +17,7 @@ import { Dashboard, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
 import { classify, failureEvidence, remedyNamesR } from "../problems";
-import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TypingGuard } from "../typingGuard";
+import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TypingGuard } from "../typingGuard";
 
 /** Below this width the dashboard's where-line cuts the cwd and drops the
  *  account. Measured the same way `StatusBand` measures its own box: a `ResizeObserver` on this
@@ -519,6 +519,14 @@ export function EmptyTab(props: EmptyTabProps) {
         return;
       }
     }
+    // Any non-modifier key within `TYPING_GUARD_MS` of a BROWSE `y` is swallowed as typing, and the
+    // band explains how to type. Check before focused controls so `y` then Enter is claimed too. A
+    // lone Enter after a pause is unaffected.
+    if (!isModifierKey(event.key) && typingGuard.afterCopy(typedAt)) {
+      event.preventDefault();
+      if (cancelled === null) props.onFlash?.(TYPE_HINT_FLASH);
+      return;
+    }
     // v1 hardening, codex-release-p1 #5: a pending sequence's own continuation must run BEFORE the
     // unconditional single-key handlers below, matching `App.tsx`'s own ordering (leader engine
     // before other single-key handling: `f` there reaches HINT only through `resolveKey`, well
@@ -561,10 +569,16 @@ export function EmptyTab(props: EmptyTabProps) {
       if (!waiting && !event.repeat) props.onFlash?.(hintTypingFlash());
       return;
     }
-    if (event.key === "y" && handoff !== null) {
-      event.preventDefault();
-      void navigator.clipboard?.writeText(handoff.command);
-      return;
+    if (event.key === "y" && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      // Every BROWSE `y` starts the typing guard window, even without a handoff command to copy.
+      // Otherwise `y` then Enter could run the selected action and `y` then `j` could move the
+      // cursor while typing.
+      typingGuard.noteCopy(typedAt);
+      if (handoff !== null) {
+        event.preventDefault();
+        void navigator.clipboard?.writeText(handoff.command);
+        return;
+      }
     }
     if (hello === null) return;
     // The leader/which-key engine also runs on starting and failed tabs so `mode.cycle` reaches
@@ -631,10 +645,17 @@ export function EmptyTab(props: EmptyTabProps) {
       if (item !== undefined) runItem(item);
       return;
     }
-    // Bare `m` is unbound so prose such as "make" does not cycle the mode before entering INPUT.
-    // The Mode item remains reachable by `j`/`k` then Enter, Shift+Tab through document capture,
-    // and `<leader>m`. `DASH_ITEM_KEY.mode` is display only.
-    // `o` is an alias of `i`; `A` opens the same composer with the caret at the end of the draft.
+    // Bare `m` is unbound so prose such as "make" cannot change the mode. The mode item remains
+    // reachable with `j`/`k` then Enter, Shift+Tab through `modeKey.ts`, or `<leader>m`;
+    // `DASH_ITEM_KEY.mode` is display only. `o` aliases `i`, while `A` opens the composer with the
+    // caret at the draft's end. `i`/`o`/`A` require a standalone key through `mayStartInput`, with
+    // a pause and no motion exception. Inside typed prose they are swallowed and flash a hint on
+    // how to type.
+    if ((event.key === "i" || event.key === "o" || event.key === "A") && !typingGuard.mayStartInput(typedAt, event.repeat)) {
+      event.preventDefault();
+      if (cancelled === null) props.onFlash?.(TYPE_HINT_FLASH);
+      return;
+    }
     if (event.key === "i" || event.key === "o") {
       event.preventDefault();
       runItem("new");

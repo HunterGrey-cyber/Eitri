@@ -25,6 +25,13 @@
  *   so checking preceding motions cannot protect them. They use `defer` and act only if no
  *   other key arrives for `TYPING_GUARD_MS`. Otherwise a sentence starting with `f` can
  *   start HINT, or one starting with `L` can switch tabs and send its remaining text elsewhere.
+ * - `mayStartInput` allows `i`/`o`/`A` to enter INPUT only after a pause, with no motion
+ *   exception. A word such as "look" must not walk with `l` and open INPUT with `o`.
+ *   A swallowed key shows `TYPE_HINT_FLASH`.
+ * - A BROWSE `y` opens a copy burst (`noteCopy`/`afterCopy`): keys within `TYPING_GUARD_MS`
+ *   of the copy are treated as typing, so `y i w` cannot open INPUT and insert `w`.
+ *   The copy still happens immediately and overwrites the clipboard. Text typed without
+ *   entering INPUT is still dropped; a lone `i` after a pause still works.
  *
  * Pure: this never reads the DOM. Timestamps come from the caller's `event.timeStamp`.
  * Timers are injectable and default to globals looked up at call time so fake timers apply.
@@ -63,6 +70,10 @@ const MODIFIER_KEYS = new Set([
   "Symbol",
   "SymbolLock",
 ]);
+
+/** The BROWSE placeholder text, also used by the band when the typing guard swallows `i`/`o`/`A`
+ *  or a key immediately after a BROWSE `y`. */
+export const TYPE_HINT_FLASH = "i or Ctrl+j to type";
 
 /** What the band says when the leader did not start a sequence because it came in the middle of
  *  typing (`TypingGuard.mayActAfterMotion`; the v1-ui GUI pass, 2026-09-27: "set up my" ran
@@ -128,6 +139,8 @@ export class TypingGuard {
   /** The count of keys recorded by `onKey`, excluding bare modifiers but including cancelling modifiers.
    *  `App.tsx` uses it to match a recorded focus landing to the key that made it. */
   private recorded = 0;
+  /** #26: when a BROWSE `y` last copied (its keydown's timestamp), for `afterCopy`. */
+  private copiedAt: number | null = null;
 
   constructor(private readonly timers: GuardTimers = GLOBAL_TIMERS) {}
 
@@ -156,6 +169,19 @@ export class TypingGuard {
     return this.recorded;
   }
 
+  /** Records a BROWSE copy at its keydown timestamp `t` and opens the burst checked by `afterCopy`.
+   *  Called where copying happens, never for a `y` typed in the composer or a text box. */
+  noteCopy(t: number): void {
+    this.copiedAt = t;
+  }
+
+  /** Whether the key just recorded at `t` falls within `TYPING_GUARD_MS` after `noteCopy`.
+   *  The caller treats it as typing, swallows it and shows `TYPE_HINT_FLASH`.
+   *  A timestamp before the copy is outside the burst. */
+  afterCopy(t: number): boolean {
+    return this.copiedAt !== null && t >= this.copiedAt && t - this.copiedAt < TYPING_GUARD_MS;
+  }
+
   /** Whether the key `onKey` just recorded (at `t`) may answer now: with nothing within the window
    *  before it, or, for Enter, when the whole unbroken run before it is a walk onto the button
    *  (`h`/`l`/Tab/Shift+Tab) back to a key that stood alone -- `l`⏎ and `l l`⏎ answer, `e`⏎,
@@ -177,6 +203,15 @@ export class TypingGuard {
     const before = this.previous;
     if (before === null || t - before.t >= TYPING_GUARD_MS) return true;
     return this.previousRunIsMotion;
+  }
+
+  /** BROWSE's `i`/`o`/`A` enter INPUT only after a pause: no key within `TYPING_GUARD_MS`
+   *  before the key `onKey` just recorded. Neither Enter's walk exception nor
+   *  `mayActAfterMotion`'s motion exception applies. A lone motion letter can start a word:
+   *  allowing `l` then `o` would turn "look at" into INPUT containing "ok at".
+   *  A fast `ji` therefore needs a pause before `i`. Repeats never enter INPUT. */
+  mayStartInput(t: number, repeat: boolean): boolean {
+    return this.mayAnswerNow("", t, repeat);
   }
 
   /** Defers `a`/`d`/`D`, `f`, single-key table bindings and Enter on a card button.

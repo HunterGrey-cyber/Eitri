@@ -2,7 +2,8 @@
 -- autocommands. At scheduled VimEnter, User VeryLazy and User LazyLoad, it gives
 -- <C-h>/<C-j>/<C-k>/<C-l> in Normal and Visual mode a way out of the editor where the global
 -- mapping is empty, nvim's default, or a plain window move. Other mappings and all buffer-local
--- mappings are left alone.
+-- mappings are left alone. Insert mode gets <C-l> only where its global mapping is empty;
+-- <C-h>/<C-j>/<C-k> keep their Insert meanings: backspace, newline and digraph.
 local socket = vim.env.EITRI_PANE_SWITCH_SOCKET
 if not socket or socket == "" then
   return
@@ -63,6 +64,20 @@ local function visual(key)
   end
 end
 
+-- Insert mode: leave Insert first, then navigate as in Normal mode. Move to a neighboring
+-- window, or send the direction letter to the next pane at nvim's edge.
+--
+-- `:stopinsert` takes effect after this callback returns. Moving inside the callback would
+-- end Insert in the destination window, step its cursor left and fire InsertLeave there,
+-- while leaving the source cursor unchanged. Schedule navigation so Insert ends in the
+-- source window before either moving focus or sending the letter.
+local function insert(key)
+  vim.cmd.stopinsert()
+  vim.schedule(function()
+    normal(key)
+  end)
+end
+
 -- `<...>` key notation compared case-insensitively (`<c-w>` and `<C-W>` are one key), everything
 -- else exactly: `<C-W>H` moves the window itself (:h CTRL-W_H), it is not `<C-W>h`.
 local function notation_lower(rhs)
@@ -107,13 +122,13 @@ local function is_plain_move(m, key)
     or rhs == ":wincmd " .. key.dir .. "<cr>"
 end
 
+local RUNNERS = { n = normal, x = visual, i = insert }
+
 local function install(mode, key)
-  local run = mode == "n" and function()
-    normal(key)
-  end or function()
-    visual(key)
-  end
-  vim.keymap.set(mode, key.lhs, run, { desc = DESC .. key.name, silent = true })
+  local runner = RUNNERS[mode]
+  vim.keymap.set(mode, key.lhs, function()
+    runner(key)
+  end, { desc = DESC .. key.name, silent = true })
 end
 
 local function check()
@@ -125,6 +140,13 @@ local function check()
         install(mode, key)
       end
     end
+  end
+  -- Insert: <C-l> only, and only into an empty global slot -- nothing of nvim's own to displace,
+  -- and a user's Insert <C-l> (a completion key, a cursor move) is theirs. The fallback's own
+  -- mapping is kept as it is.
+  local ctrl_l = KEYS[4]
+  if global_maps("i")[ctrl_l.lhs:lower()] == nil then
+    install("i", ctrl_l)
   end
 end
 

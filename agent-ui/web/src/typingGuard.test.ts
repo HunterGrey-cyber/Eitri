@@ -377,3 +377,68 @@ describe("K02: keyCount", () => {
     expect(ran).toBe(1);
   });
 });
+
+/* A BROWSE `y` opens a burst in which subsequent keys count as typing.
+   `noteCopy` records the copy; `afterCopy` checks the key most recently recorded by `onKey`. */
+describe("TypingGuard: the burst after a copy (#26, K15)", () => {
+  it("is false before any copy", () => {
+    expect(guard.afterCopy(Date.now())).toBe(false);
+  });
+
+  it("is true for a key inside the window after the copy, false from the window on", () => {
+    guard.noteCopy(Date.now());
+    vi.advanceTimersByTime(TYPING_GUARD_MS - 1);
+    expect(guard.afterCopy(Date.now())).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(guard.afterCopy(Date.now())).toBe(false);
+  });
+
+  it("a later copy restarts the burst", () => {
+    guard.noteCopy(Date.now());
+    vi.advanceTimersByTime(TYPING_GUARD_MS + 50);
+    guard.noteCopy(Date.now());
+    vi.advanceTimersByTime(100);
+    expect(guard.afterCopy(Date.now())).toBe(true);
+  });
+
+  it("never reads a key stamped before the copy as inside its burst", () => {
+    guard.noteCopy(1000);
+    expect(guard.afterCopy(900)).toBe(false);
+  });
+});
+
+/* `i`/`o`/`A` enter INPUT only after a pause, with no motion exception. A lone `l`, `h` or `G`
+   can begin a word as well as a motion; otherwise "look at" walks with `l` and opens INPUT
+   with `o`. */
+describe("TypingGuard.mayStartInput: i/o/A need a pause, never a motion run", () => {
+  function lastMayStart(text: string, gap: number, repeat = false): boolean {
+    const keys = [...text];
+    let may = false;
+    keys.forEach((k, i) => {
+      if (i > 0) vi.advanceTimersByTime(gap);
+      const t = Date.now();
+      guard.onKey(k, t);
+      may = guard.mayStartInput(t, i === keys.length - 1 && repeat);
+    });
+    return may;
+  }
+
+  it("a key standing alone may", () => {
+    expect(lastMayStart("i", 0)).toBe(true);
+  });
+
+  it("a key TYPING_GUARD_MS after the one before it stands alone again", () => {
+    expect(lastMayStart("ji", TYPING_GUARD_MS)).toBe(true);
+  });
+
+  it.each([["lo"], ["ho"], ["Go"], ["hi"], ["li"], ["ji"], ["jji"], ["ggo"], ["kkA"]])(
+    "%j at 80 ms a key: a motion run is no exception, so the last key may not",
+    (text) => {
+      expect(lastMayStart(text, 80)).toBe(false);
+    },
+  );
+
+  it("a held key's repeat never may", () => {
+    expect(lastMayStart("i", 0, true)).toBe(false);
+  });
+});

@@ -838,6 +838,8 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Enter", what: "Send; while a turn runs, queue it for the turn's end" },
   { keys: "Ctrl+Enter", what: "Send now: interrupts a running turn, then sends the queue and this" },
   { keys: "Shift+Enter", what: "New line" },
+  // Alt+Enter and backslash before Enter insert a newline, as in Claude Code, instead of sending the draft.
+  { keys: "Alt+Enter / \\ Enter", what: "New line (a backslash right before the caret is replaced by it)" },
   { keys: "↑ / ↓", what: "From the first / last line: the queue back, then earlier prompts" },
   { keys: "Ctrl+r", what: "Search earlier prompts (Enter puts one in the box)" },
   { keys: "Ctrl+w / Ctrl+u", what: "Delete a word / to the line's start" },

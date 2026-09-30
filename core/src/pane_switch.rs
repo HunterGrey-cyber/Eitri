@@ -4,8 +4,9 @@
 //! Toolkit-free.
 //!
 //! The directory also holds `nav_fallback.lua`, loaded with `--cmd`, which lets `Ctrl+h/j/k/l`
-//! leave the editor when vim-tmux-navigator is absent and from Visual mode.
-//! It writes the same direction letters to the same socket, so it lives beside the protocol.
+//! leave the editor when vim-tmux-navigator is absent and from Visual mode; `Ctrl+l` also leaves
+//! from Insert mode. It writes the same direction letters to the same socket, so it lives beside
+//! the protocol.
 //!
 //! `shell::pane_switch` owns the `glib::timeout_add_local` timer. It constructs a
 //! [`PaneSwitchReader`] once and calls [`PaneSwitchReader::poll`] each tick, applying focus

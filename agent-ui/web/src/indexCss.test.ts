@@ -2655,3 +2655,164 @@ describe("VISUAL mode", () => {
     expect(rowCurrentOverride!.body).toContain("background: none");
   });
 });
+
+/* An atomic inline-block keeps an inline code token such as --json together and moves it to the
+   next line when needed. Unlike white-space: nowrap alone, max-width: 100% with overflow-wrap
+   lets a span longer than the row break within the row. The selector leaves fenced pre code
+   alone. jsdom has no layout, so these tests check the declarations and that they reach the
+   markdown renderer's inline spans. Rendering needs to be checked in a browser. */
+describe("inline code never breaks inside a token (rc.4 item 6)", () => {
+  const rule = () => {
+    const found = splitRules(stripComments(css)).filter(
+      (r) => r.selector.trim() === ".row-assistant code:not(pre code)" && /display\s*:/.test(r.declarations),
+    );
+    expect(found, "one rule gives inline code its atomic layout").toHaveLength(1);
+    return found[0].declarations;
+  };
+
+  it("is an atomic inline no wider than its row, broken only when longer than the row", () => {
+    const declarations = rule();
+    expect(declarations).toMatch(/display\s*:\s*inline-block\s*;/);
+    expect(declarations).toMatch(/max-width\s*:\s*100%\s*;/);
+    expect(declarations).toMatch(/overflow-wrap\s*:\s*anywhere\s*;/);
+  });
+
+  it("never turns wrapping off, which would let a long span run out of the row", () => {
+    expect(rule()).not.toMatch(/white-space\s*:\s*(nowrap|pre)\b/);
+  });
+
+  it("reaches the code the markdown renderer emits for an inline span, and not a fenced block's", () => {
+    document.body.innerHTML = `<div class="row row-assistant">${renderMarkdown("I added a `--json` flag.\n\n```\nls --json\n```\n")}</div>`;
+    const selector = ".row-assistant code:not(pre code)";
+    const inline = Array.from(document.querySelectorAll("code")).filter((c) => c.parentElement?.tagName !== "PRE");
+    const fenced = Array.from(document.querySelectorAll("pre code"));
+    expect(inline.map((c) => c.textContent)).toEqual(["--json"]);
+    expect(fenced).toHaveLength(1);
+    expect(inline.every((c) => c.matches(selector))).toBe(true);
+    expect(fenced.some((c) => c.matches(selector))).toBe(false);
+  });
+});
+
+/* WebKitGTK's overlay horizontal scrollbar takes no layout space and can cover the last diff
+   line. Keep bottom padding in `.permission-card-diff` for it. `scrollbar-gutter` only reserves
+   space for the block-axis scrollbar. jsdom draws no scrollbar, so this checks the reserved space;
+   verifying the rendered overlap needs a display. */
+describe("an expanded diff keeps room under its last line for its scrollbar (rc.4 item 7)", () => {
+  /** The effective bottom padding, in px, of `.permission-card-diff`: its `padding` shorthand and `padding-bottom`
+   *  read in source order, as the cascade applies them within one rule. */
+  function bottomPaddingPx(): number {
+    const rules = splitRules(stripComments(css)).filter((r) => r.selector.trim() === ".permission-card-diff");
+    expect(rules, "one rule styles the diff box").toHaveLength(1);
+    let bottom = 0;
+    for (const declaration of rules[0].declarations.split(";")) {
+      const [name, ...rest] = declaration.split(":");
+      const value = rest.join(":").trim();
+      if (name.trim() === "padding") {
+        const parts = value.split(/\s+/).map((p) => (p === "0" ? 0 : parseFloat(p)));
+        bottom = parts.length === 1 ? parts[0] : parts.length === 2 ? parts[0] : parts[2];
+      } else if (name.trim() === "padding-bottom") {
+        bottom = value === "0" ? 0 : parseFloat(value);
+      }
+    }
+    return bottom;
+  }
+
+  it("still scrolls sideways, and keeps at least 10px under its last line", () => {
+    const rule = splitRules(stripComments(css)).find((r) => r.selector.trim() === ".permission-card-diff")!;
+    expect(rule.declarations).toMatch(/overflow-x\s*:\s*auto\s*;/);
+    expect(bottomPaddingPx()).toBeGreaterThanOrEqual(10);
+  });
+});
+
+/* The permission reason input fills the card and uses an ellipsis when its placeholder is
+   still too long. Approve/Deny use the panel's font face and `--fs-*` scale so the buttons grow
+   with the surrounding text instead of retaining the browser's default form-control font.
+   jsdom has no layout, so these checks cover the rules; rendered sizing needs a display. */
+describe("the permission card's reason box and buttons follow the panel (rc.4 item 8)", () => {
+  /** Every declaration block whose selector list names `selector` exactly, in source order. */
+  const declarationsFor = (selector: string): string => {
+    const blocks = splitRules(stripComments(css))
+      .filter((r) => r.selector.split(",").some((s) => s.trim() === selector))
+      .map((r) => r.declarations);
+    expect(blocks.length, `${selector} has a rule`).toBeGreaterThan(0);
+    return blocks.join("\n");
+  };
+
+  it("the reason box fills the card instead of its intrinsic width, and ends an over-long placeholder in an ellipsis", () => {
+    const declarations = declarationsFor(".permission-card input");
+    expect(declarations).toMatch(/width\s*:\s*100%\s*;/);
+    expect(declarations).toMatch(/box-sizing\s*:\s*border-box\s*;/);
+    expect(declarations).toMatch(/text-overflow\s*:\s*ellipsis\s*;/);
+  });
+
+  it("the reason box still takes the panel's face and scale", () => {
+    const declarations = declarationsFor(".permission-card input");
+    expect(declarations).toMatch(/font\s*:\s*inherit\s*;/);
+    expect(declarations).toMatch(/font-size\s*:\s*var\(--fs-base\)\s*;/);
+  });
+
+  it("Approve, Deny and the third button take the panel's face and --fs-base, not WebKit's form-control font", () => {
+    const declarations = declarationsFor(".permission-card-buttons button");
+    expect(declarations).toMatch(/font\s*:\s*inherit\s*;/);
+    expect(declarations).toMatch(/font-size\s*:\s*var\(--fs-base\)\s*;/);
+  });
+});
+
+/* The atomic inline layout needs exceptions for table cells and text decoration. A span's own
+   overflow-wrap: anywhere and max-width: 100% override a table cell's inherited wrapping, so
+   inline code in cells must restore whole words and remove the width cap. An inline-block does
+   not receive its ancestors' text decoration inside its box. Links and strike-through code
+   therefore need explicit decoration on the code span. inherit is insufficient when an
+   intervening strong element has computed text-decoration: none. winningDeclarationOn checks
+   the winning rules; jsdom does not render them. */
+describe("inline code keeps its cell's words and its links' decoration", () => {
+  afterEach(() => {
+    document.head.innerHTML = "";
+    document.body.innerHTML = "";
+  });
+  function mount(markdown: string): HTMLElement[] {
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML = `<div class="message-list"><div class="row row-assistant"><div class="row-body">${renderMarkdown(markdown)}</div></div></div>`;
+    return Array.from(document.querySelectorAll<HTMLElement>("code")).filter((c) => c.parentElement?.tagName !== "PRE");
+  }
+
+  it("inside a table cell the span is not broken and not capped: overflow-wrap normal, max-width none", () => {
+    const [code] = mount("| a |\n|---|\n| `supercalifragilistic-identifier --json` |");
+    expect(code.closest(".table-scroll td")).not.toBeNull();
+    expect(winningDeclarationOn(code, "overflow-wrap")).toBe("normal");
+    expect(winningDeclarationOn(code, "max-width")).toBe("none");
+  });
+
+  it("outside a table the span is still capped at the row and broken only when longer than it", () => {
+    const [code] = mount("a `--json` flag");
+    expect(code.closest(".table-scroll")).toBeNull();
+    expect(winningDeclarationOn(code, "overflow-wrap")).toBe("anywhere");
+    expect(winningDeclarationOn(code, "max-width")).toBe("100%");
+  });
+
+  it("code inside a link is underlined on its own box, nested in a <strong> or not", () => {
+    const [plain, nested] = mount("[`--json`](https://example.com/) and [**`--yaml`**](https://example.com/)");
+    expect(plain.closest("a")).not.toBeNull();
+    expect(nested.closest("strong")).not.toBeNull();
+    expect(winningDeclarationOn(plain, "text-decoration")).toBe("underline");
+    expect(winningDeclarationOn(nested, "text-decoration")).toBe("underline");
+  });
+
+  it("code inside ~~strike-through~~ is struck through on its own box", () => {
+    const [code] = mount("~~a `--json` flag~~");
+    expect(code.closest("del")).not.toBeNull();
+    expect(winningDeclarationOn(code, "text-decoration")).toBe("line-through");
+  });
+
+  it("code inside a struck-through link carries both", () => {
+    const [code] = mount("~~[`--json`](https://example.com/)~~");
+    expect(code.closest("del")).not.toBeNull();
+    expect(code.closest("a")).not.toBeNull();
+    expect(winningDeclarationOn(code, "text-decoration")).toBe("underline line-through");
+  });
+
+  it("plain inline code carries no decoration of its own", () => {
+    const [code] = mount("a `--json` flag");
+    expect(winningDeclarationOn(code, "text-decoration")).toBeNull();
+  });
+});

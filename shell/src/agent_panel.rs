@@ -874,6 +874,15 @@ impl AgentPanelHandle {
         self.dispatch(eitri_core::agent_bridge::serialize_open_keymap_for_js(), "open-keymap");
     }
 
+    /// `prefix :`: open the panel's `:` command line, which runs nothing.
+    pub(crate) fn open_command_line(&self) {
+        self.drop_bypass_prompt();
+        self.dispatch(
+            eitri_core::agent_bridge::serialize_open_command_line_for_js(),
+            "open-command-line",
+        );
+    }
+
     /// Global `f` HINT. Each
     /// is a one-line dispatch of the matching `serialize_hint_*_for_js` envelope; `shell::hint`
     /// drives the session, this handle only relays it to the WebView.
@@ -3978,6 +3987,7 @@ mod tests {
         handle.nav_key(NavKeyDirection::Down);
         handle.literal_key(&eitri_core::keymap::KeySpec::parse("C-b").unwrap());
         handle.open_keymap();
+        handle.open_command_line();
         handle.set_keymap_help("{}".to_string());
         assert!(state.borrow().pane_focused);
         assert_eq!(handle.panel_keys(), PanelKeys::Other);

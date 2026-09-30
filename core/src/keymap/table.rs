@@ -246,6 +246,8 @@ fn default_bindings() -> Vec<Binding> {
     bind("f", Action::Hint, false);
     bind("r", Action::PanelReload, false);
     bind("?", Action::PanelKeymap, false);
+    // Stock tmux's `command-prompt`, which opens the panel's `:` line.
+    bind(":", Action::PanelCommandLine, false);
     bind(
         "C-l",
         Action::SendKeys(KeySpec::parse("C-l").expect("C-l parses")),
@@ -547,6 +549,8 @@ mod tests {
         ("f", "hint", false),
         ("r", "panel.reload", false),
         ("?", "panel.keymap", false),
+        // tmux's `command-prompt`, here the panel's `:` line, which runs nothing.
+        (":", "panel.command-line", false),
         ("C-l", "send-keys keys=C-l", false),
         ("C-h", "send-keys keys=C-h", false),
         ("C-j", "send-keys keys=C-j", false),
@@ -588,6 +592,20 @@ mod tests {
             .collect();
         assert_eq!(got, want);
         assert!(map.bindings().iter().all(|b| b.source == Source::Default));
+    }
+
+    /// `prefix :` opens the panel's `:` line. Leaving it unbound would make the armed prefix swallow
+    /// it and let subsequent letters run as panel keys. The binding is not repeatable, matching tmux's
+    /// `command-prompt`, and the `?` overlay describes it in the prefix section.
+    #[test]
+    fn prefix_colon_opens_the_panels_command_line() {
+        let map = Keymap::defaults();
+        let bound = map
+            .lookup(&k(":"))
+            .unwrap_or_else(|| panic!("prefix : is unbound, so the armed prefix swallows it"));
+        assert_eq!(spelled(&bound.action), "panel.command-line");
+        assert!(!bound.repeatable);
+        assert_eq!(map.keys_for(&bound.action), vec![k(":")]);
     }
 
     /// Every default key is stock tmux's, with stock's `-r`, unless the spec marks it eitri-only.

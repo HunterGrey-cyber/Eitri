@@ -11,7 +11,7 @@ import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, star
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
+import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 import {
   compareCarets,
   copySelectionText,
@@ -1442,6 +1442,15 @@ export default function App() {
         tabMode: activeInfo?.mode ?? null,
       });
       if (route === "overlay") return;
+      // Shift+Tab within `TYPING_GUARD_MS` of a BROWSE `y` counts as typing. This capture handler must
+      // check before the bubble handler, claim and record the key, and show any cancellation flash.
+      // Only Shift+Tab after a pause cycles the mode.
+      const modeKeyAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+      if (modeRef.current === "browse" && typingGuard.afterCopy(modeKeyAt)) {
+        event.stopPropagation();
+        showFlash(typingGuard.onKey("Tab", modeKeyAt) ?? TYPE_HINT_FLASH);
+        return;
+      }
       // Shift+Tab follows any pending prefix, count or leader sequence, but `stopPropagation`
       // prevents `onKeyDown` from clearing them. Clear them here for both routes. This uses only
       // refs and state setters, so the listener installed once can call it.
@@ -2222,6 +2231,32 @@ export default function App() {
         exitRegion();
         setMode("browse");
         setKeymapOpen(true);
+      } else if (payload.kind === "open_command_line") {
+        // `prefix :` opens the same command line as BROWSE's `:`. GTK captures the chord, so handle
+        // its envelope here rather than letting subsequent letters run as panel keys. The line
+        // consumes keys but runs no command: Enter explains this and Esc closes it. An empty tab
+        // has no command line and shows a flash instead.
+        if (!sessionStartedRef.current) {
+          showFlash("no command line on this screen — ? lists this panel's keys");
+          return;
+        }
+        // A route away from a bypass prompt, from VISUAL, and from every overlay over the conversation,
+        // as `hint_collect` and `tab_detail` are: GTK's chord reaches no key handler here. The `/` prompt
+        // and this line are one command line, so opening one closes the other.
+        cancelBypassConfirm();
+        exitRegion();
+        setKeymapOpen(false);
+        setDetail(null);
+        setHandoffOpen(false);
+        setChooser(null);
+        setSlashPicker(null);
+        setSlashReply(null);
+        pendingSlashPickerRef.current = null;
+        dropPendingKeys();
+        setMode("browse");
+        setSearch(null);
+        setExLine("");
+        setLineFocusRequest((n) => n + 1);
       } else if (payload.kind === "hint_collect") {
         // Close overlays before collecting HINT targets so labels cannot land on hidden rows and
         // overlays cannot consume HINT keys. A HINT also ends VISUAL explicitly because this branch
@@ -4234,6 +4269,22 @@ export default function App() {
       showFlash(STOP_TYPING_FLASH);
       return;
     }
+    // Keys within `TYPING_GUARD_MS` after a BROWSE `y` are swallowed with a typing hint; the copy
+    // has already happened. Ignore bare modifiers and input-method composition. Check before
+    // the focused-control return so Enter or Space in the burst cannot activate a button; a
+    // lone Enter after a pause remains available to it.
+    if (
+      mode === "browse" &&
+      !isModifierKey(event.key) &&
+      !isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode }) &&
+      typingGuard.afterCopy(typedAt)
+    ) {
+      event.preventDefault();
+      // The wait this very key cancelled already said what did not happen, in its own words (and ends
+      // with this hint): that message stays.
+      if (cancelled === null) showFlash(TYPE_HINT_FLASH);
+      return;
+    }
     if (isActivatableControl(event.target) && (event.key === "Enter" || (event.key === " " && !onAnswerButton))) return;
     // The leader engine: a pending sequence owns
     // the next key, and only BROWSE ever starts one. An IME key is never a sequence key (Review
@@ -4387,7 +4438,7 @@ export default function App() {
         // on the first line does (`:h j`) -- only `j` names a route the reader might actually want next.
         if (action.delta === 1) {
           if (target === landing.from) {
-            if (!event.repeat || heldMoveRef.current) showFlash("i or Ctrl+j to type");
+            if (!event.repeat || heldMoveRef.current) showFlash(TYPE_HINT_FLASH);
             heldMoveRef.current = false;
           } else {
             heldMoveRef.current = true;
@@ -4424,6 +4475,14 @@ export default function App() {
     event.preventDefault();
     switch (action.kind) {
       case "mode":
+        // `i`/`o`/`A` enters INPUT only after an isolated key. `mayStartInput` requires a pause
+        // and has no motion exception: "look at" must not walk with `l` and enter INPUT with `o`.
+        // Letters inside prose are swallowed with a typing hint instead of opening the composer
+        // midword. A lone `i` after a pause works; a fast `ji` needs a pause before `i`.
+        if (action.to === "input" && !typingGuard.mayStartInput(typedAt, event.repeat)) {
+          if (cancelled === null) showFlash(TYPE_HINT_FLASH);
+          break;
+        }
         setMode(action.to);
         // C1a: entering INPUT (`i`/`o`/`A`) asks `Composer` to place the caret itself, rather than
         // leaving it to whatever a bare `autoFocus` on a freshly re-mounted, non-empty box happens
@@ -4481,6 +4540,8 @@ export default function App() {
         enterRegion(action.line, landedCode);
         break;
       case "copy": {
+        // `y` starts a burst in which subsequent keys count as typing.
+        typingGuard.noteCopy(typedAt);
         // After HINT landed on a code block: that block's code, not the whole message. Only while it
         // is still in the DOM and still inside the row under the cursor -- anything else and the
         // user is looking at something else now.

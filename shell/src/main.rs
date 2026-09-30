@@ -1729,6 +1729,17 @@ fn build_ui(
                         focus_module(&chat);
                         agent.open_keymap();
                     }
+                    // `prefix :` opens the chat with focus in its command line. Opening the line runs nothing, so
+                    // letters typed after the chord go into the entry instead of acting as panel keys.
+                    Action::PanelCommandLine => {
+                        let chat = ModuleId::agent();
+                        if let Err(err) = show_on_screen(&chat) {
+                            refuse(&refused_name, &toast, &err);
+                            return;
+                        }
+                        focus_module(&chat);
+                        agent.open_command_line();
+                    }
                     Action::WindowImmersive => window_modes.toggle_immersive(),
                     // `run_tab_action` is shared with the panel's `tab_verb` messages.
                     // It computes `keys_in` the same way `focused()` does here.

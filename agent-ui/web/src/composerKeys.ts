@@ -26,6 +26,24 @@ export function readlineEdit(
   return { value: value.slice(0, from) + value.slice(start), caret: from };
 }
 
+/** Claude Code's two newline keys. `Alt+Enter` replaces the selection with a newline. Plain
+ *  Enter with no selection and a backslash before the caret replaces that backslash with a
+ *  newline. Return `null` for other Enter keys: Ctrl+Enter, Meta+Enter and plain Enter without
+ *  that backslash still send. Shift+Enter is handled by the textarea's own newline behavior. */
+export function enterNewline(
+  value: string,
+  start: number,
+  end: number,
+  mods: { altKey: boolean; ctrlKey: boolean; metaKey: boolean },
+): { value: string; caret: number } | null {
+  if (mods.ctrlKey || mods.metaKey) return null;
+  if (mods.altKey) return { value: value.slice(0, start) + "\n" + value.slice(end), caret: start + 1 };
+  if (start === end && start > 0 && value[start - 1] === "\\") {
+    return { value: value.slice(0, start - 1) + "\n" + value.slice(end), caret: start };
+  }
+  return null;
+}
+
 export function caretOnFirstLine(value: string, caret: number): boolean {
   return !value.slice(0, caret).includes("\n");
 }
@@ -56,6 +74,8 @@ export const COMPOSER_CHORDS: string[] = [
   "Enter",
   "Ctrl+Enter",
   "Shift+Enter",
+  // A design decision: Claude Code's own two newline keys.
+  "Alt+Enter / \\ Enter",
   "↑ / ↓",
   "Ctrl+r",
   "Ctrl+w / Ctrl+u",
