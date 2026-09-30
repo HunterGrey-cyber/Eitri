@@ -504,8 +504,9 @@ mod tests {
     }
 
     /// v1 picks (2026-09-29): stock tmux's `last-pane` and `select-pane -t :.+`. Read from GDK's own
-    /// keyvals (`;` is `semicolon`; Shift+`;` types `:`, which stays unbound), and bound without
-    /// `-r`: pressed again with no prefix they are ordinary keys.
+    /// keyvals (`;` is `semicolon`; Shift+`;` types `:`), and bound without `-r`: pressed again with
+    /// no prefix they are ordinary keys. Since rc.4 (decision #28, K16) `:` is bound too: it opens
+    /// the panel's no-op `:` line, where stock tmux opens its command prompt.
     #[test]
     fn semicolon_and_o_classify_from_gdk_and_run_without_repeating() {
         let t = Instant::now();
@@ -525,8 +526,8 @@ mod tests {
         assert_eq!(colon, key(":"), "Shift+; is the character it types");
         assert_eq!(
             armed(defaults(), t).press(colon, K1, t),
-            Outcome::Swallow,
-            ": is command-prompt in stock tmux, which is not adopted"
+            run(Action::PanelCommandLine),
+            ": opens the panel's no-op command line (decision #28), not stock tmux's command-prompt"
         );
     }
 
