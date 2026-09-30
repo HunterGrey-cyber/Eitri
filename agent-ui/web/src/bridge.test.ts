@@ -118,6 +118,15 @@ describe("installDispatch", () => {
     expect(seen).toEqual(["tabs", "tab_detail", "chooser", "confirm_close", "begin_rename"]);
   });
 
+  it("demuxes an editor_typing envelope, and drops nothing of it", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "editor_typing", typing: true, periodMs: 500 }));
+    window.__neovibeDispatch!(JSON.stringify({ kind: "editor_typing", typing: false, periodMs: 500 }));
+    expect(handler).toHaveBeenNthCalledWith(1, { kind: "editor_typing", typing: true, periodMs: 500 });
+    expect(handler).toHaveBeenNthCalledWith(2, { kind: "editor_typing", typing: false, periodMs: 500 });
+  });
+
   it("demuxes a nav_key envelope, down and up", () => {
     const handler = vi.fn();
     installDispatch(handler);

@@ -85,6 +85,7 @@ import { shortModel, usageSegment } from "./band";
 import type { BandFacts } from "./band";
 import type { AgentUiState, HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope, ContextSummary, QueueItem, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
+import { applyEditorTyping } from "./typingCadence";
 
 /** The line `agent/src/providers/claude_sidecar/spawn.rs::describe_checkout` writes for version skew.
  *  Moved in from the deleted `statusRow.ts`: the band's `warn` fact
@@ -2003,6 +2004,11 @@ export default function App() {
       if (CANCELS_WAITING_ANSWER.has(payload.kind)) typingGuard.cancel();
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
+      } else if (payload.kind === "editor_typing") {
+        // Window-level and Rust's alone (a cadence slower than the meter's step): it slows the
+        // meter, never pauses it. Deliberately not among the envelopes that cancel a waiting answer
+        // or touch any other state -- it is not about the panel's own keys.
+        applyEditorTyping(document.documentElement, payload.typing, payload.periodMs);
       } else if (payload.kind === "pane_focus") {
         // A prefix is for the next key. GTK captures pane-switch keys before the WebView sees them,
         // so clear pending prefixes, counts, leader sequences and box timers here. Otherwise
@@ -2663,6 +2669,9 @@ export default function App() {
       }
     });
     requestHello();
+    // A page mounted again in the same document (a dev reload) starts unslowed; a real reload is a
+    // new document, which has no attribute to begin with, and Rust tells it again on `ready`.
+    return () => applyEditorTyping(document.documentElement, false, 0);
   }, []);
 
   /** Mirrors the composer's key mode. `browse`/`input` describe the live tab or empty tab without
