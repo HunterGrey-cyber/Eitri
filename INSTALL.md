@@ -104,13 +104,14 @@ does **not** protect a first `curl … | sh` against a compromised release page 
 the verifier and its key come from the same place `SHA256SUMS` does. **For a numbered release**,
 `install.sh` embeds the signing key and refuses a missing or bad signature outright — except that a
 missing `ssh-keygen` on your own machine only warns and falls back to checksums-only, since it cannot
-run the check itself. **For a release candidate** (like `rc.1`), the installer embeds no key at all —
-its checksums only detect corruption, never who published them — and the recipe above refuses it: an
-rc is signed with a throwaway key, never the release key (`packaging/release-signers` at `rc.1`'s tag
-has no key line at all). If you were handed that throwaway key's signers file out of band, pass it with
-`--release-signers FILE` (or use it as `release-signers` in the recipe); that only proves the files
+run the check itself. **For a release candidate** (like `rc.1`, published before the release key was listed), the
+installer embeds no key at all — its checksums only detect corruption, never who published them — and
+the recipe above refuses it: such an rc is signed with a throwaway key, never the release key
+(`packaging/release-signers` at `rc.1`'s tag has no key line at all; from the first numbered release
+on, it holds the release key). If you were handed that throwaway key's signers file out of band, pass it
+with `--release-signers FILE` (or use it as `release-signers` in the recipe); that only proves the files
 agree with each other, not that they came from the real maintainer — there is no published trust
-anchor for a release candidate yet.
+anchor for those release candidates.
 
 ## `.deb` / `.rpm`, then `eitri setup`
 

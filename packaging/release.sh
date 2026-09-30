@@ -114,10 +114,18 @@ signers_list_blob() {
 signers_has_key() { [ -f "$1" ] && grep -Eq '^[[:space:]]*[^#[:space:]]' "$1"; }
 
 # sign_sums KEY DIR: write DIR/SHA256SUMS.sig in ssh-keygen's signature format.
+# ssh-keygen reads a protected key's passphrase from /dev/tty, so piping output through tee
+# still works. Retry a failed signature up to three times: a mistyped passphrase would
+# otherwise end the build after SHA256SUMS is written, and prepare_dirs refuses to rebuild
+# that release in place.
 sign_sums() {
+	local attempt=1
 	rm -f -- "$2/SHA256SUMS.sig"
-	ssh-keygen -Y sign -q -f "$1" -n "$RS_SIGN_NAMESPACE" "$2/SHA256SUMS" \
-		|| die "ssh-keygen could not sign $2/SHA256SUMS with $1"
+	until ssh-keygen -Y sign -q -f "$1" -n "$RS_SIGN_NAMESPACE" "$2/SHA256SUMS"; do
+		[ "$attempt" -lt 3 ] || die "ssh-keygen could not sign $2/SHA256SUMS with $1 after 3 attempts (a passphrase-protected key needs a terminal on stdin, or the key loaded into ssh-agent with ssh-add)"
+		warn "ssh-keygen could not sign $2/SHA256SUMS with $1: trying again (attempt $((attempt + 1)) of 3)"
+		attempt=$((attempt + 1))
+	done
 	[ -s "$2/SHA256SUMS.sig" ] || die "ssh-keygen wrote no $2/SHA256SUMS.sig"
 }
 
