@@ -184,7 +184,8 @@ t_missing_ssh_keygen() {
 
 TESTS="$TESTS t_no_embedded_key"
 t_no_embedded_key() {
-	# The committed release-signers lists no key yet, so the embedded copy carries none.
+	# $INSTALLER is the harness's unkeyed copy (setup_keys): the committed release-signers lists the
+	# owner's release key, so the real install.sh carries one; this is the branch without a key.
 	serve 1.0.0
 	rm "$(served 1.0.0)/SHA256SUMS.sig"
 	srv_mark
@@ -210,29 +211,84 @@ t_embedded_signers_byte_equal() {
 		/^EITRI_RELEASE_SIGNERS$/ { inside = 0 }
 		inside { print }
 		/^[[:space:]]*cat <<.EITRI_RELEASE_SIGNERS.$/ { inside = 1; n++ }
-		END { if (n != 1) exit 1 }' "$INSTALLER" >"$T/embedded" || fail "not exactly one embedded signers block"
+		END { if (n != 1) exit 1 }' "$REAL_INSTALLER" >"$T/embedded" || fail "not exactly one embedded signers block"
 	if ! cmp -s "$T/embedded" "$PKG/release-signers"; then
 		fail "the embedded signers block differs from packaging/release-signers: $(diff "$T/embedded" "$PKG/release-signers")"
 	fi
-	# The committed file lists no key yet (spec §4.4: the owner adds it before the first final release).
-	if grep -E '^[[:space:]]*[^#[:space:]]' "$PKG/release-signers" >/dev/null; then
-		fail "packaging/release-signers lists a key line; this test's expectation needs updating with it"
+	# The committed file lists the release key (spec §4.4): exactly one key line, in the shape the
+	# file's own header gives -- identity, namespaces option, key type, key, and no comment field.
+	_eb_keys=$(grep -E '^[[:space:]]*[^#[:space:]]' "$PKG/release-signers")
+	expect_eq "$(printf '%s\n' "$_eb_keys" | grep -c .)" 1 "the number of key lines in packaging/release-signers"
+	expect_eq "$(printf '%s\n' "$_eb_keys" | awk '{ print NF, $1, $2, $3 }')" \
+		'4 release@eitri namespaces="eitri-release" ssh-ed25519' "the shape of the key line"
+}
+
+# The real install.sh, the file every release ships and the only one that holds the owner's key:
+# the keys its embedded block lists are exactly the key lines of packaging/release-signers, and run
+# with no --release-signers it checks a release against them alone. The harness's test key signs
+# every fixture release, so a release it signed must be refused, and so must an unsigned one.
+
+TESTS="$TESTS t_real_installer_embeds_the_listed_key"
+t_real_installer_embeds_the_listed_key() {
+	awk '
+		/^EITRI_RELEASE_SIGNERS$/ { inside = 0 }
+		inside { print }
+		/^[[:space:]]*cat <<.EITRI_RELEASE_SIGNERS.$/ { inside = 1 }' "$REAL_INSTALLER" |
+		grep -E '^[[:space:]]*[^#[:space:]]' >"$T/embedded-keys"
+	grep -E '^[[:space:]]*[^#[:space:]]' "$PKG/release-signers" >"$T/listed-keys"
+	if [ ! -s "$T/listed-keys" ]; then fail "packaging/release-signers lists no key: the first final release needs the owner's release key"; fi
+	if ! cmp -s "$T/embedded-keys" "$T/listed-keys"; then
+		fail "install.sh embeds $(cat "$T/embedded-keys"), release-signers lists $(cat "$T/listed-keys")"
 	fi
+	# The harness's own key, which signs every fixture release, is not among them.
+	if grep -F -f "$SIGNERS" "$T/embedded-keys" >/dev/null; then fail "the real installer embeds the harness's test key"; fi
+}
+
+TESTS="$TESTS t_real_installer_refuses_what_its_key_did_not_sign"
+t_real_installer_refuses_what_its_key_did_not_sign() {
+	INSTALLER_UNDER_TEST=$REAL_INSTALLER
+	# A release signed by the harness's test key, with no --release-signers to say otherwise.
+	serve 1.0.0
+	srv_mark
+	inst -- --base-url "http://127.0.0.1:$PORT"
+	expect_fail "a release signed by a key the real installer does not list"
+	expect_out 'the signature on SHA256SUMS does not verify'
+	expect_no_out 'carries no release key'
+	expect_absent "$TH/.local/lib/eitri"
+	if ! srv_paths | grep -F -x /releases/download/v1.0.0/SHA256SUMS.sig >/dev/null; then fail "no .sig was fetched: $(srv_paths)"; fi
+	# A release with no SHA256SUMS.sig at all.
+	serve 1.0.0
+	rm "$(served 1.0.0)/SHA256SUMS.sig" "$S/srv/releases/latest/download/SHA256SUMS.sig"
+	inst -- --base-url "http://127.0.0.1:$PORT"
+	expect_fail "an unsigned release under the real installer"
+	expect_out 'a release without a signature is refused'
+	expect_absent "$TH/.local/lib/eitri"
+	# The offline route: the test key's signature with --tarball, and --tarball with no --sig.
+	d=$S/fix/v1.0.0
+	tb=$d/eitri-1.0.0-x86_64-linux.tar.gz
+	inst -- --tarball "$tb" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig"
+	expect_fail "--sig by the test key under the real installer"
+	expect_out 'the signature on SHA256SUMS does not verify'
+	expect_absent "$TH/.local/lib/eitri"
+	inst -- --tarball "$tb" --sums "$d/SHA256SUMS"
+	expect_fail "--tarball without --sig under the real installer"
+	expect_out '--tarball needs --sig'
+	expect_absent "$TH/.local/lib/eitri"
 }
 
 TESTS="$TESTS t_no_check_novalidate"
 t_no_check_novalidate() {
-	if grep -n 'check-novalidate' "$INSTALLER"; then fail "the installer names check-novalidate"; fi
+	if grep -n 'check-novalidate' "$REAL_INSTALLER"; then fail "the installer names check-novalidate"; fi
 	# shellcheck disable=SC2016 # the literal line, variables and all
-	expect_eq "$(grep -c -F 'ssh-keygen -Y verify -f "$NV_SIGNERS" -I "$NV_SIGNER_IDENTITY" -n "$NV_SIGNATURE_NAMESPACE" -s "$2" <"$1"' "$INSTALLER")" 1 \
+	expect_eq "$(grep -c -F 'ssh-keygen -Y verify -f "$NV_SIGNERS" -I "$NV_SIGNER_IDENTITY" -n "$NV_SIGNATURE_NAMESPACE" -s "$2" <"$1"' "$REAL_INSTALLER")" 1 \
 		"the one pinned verify line"
-	expect_eq "$(sed -n "s/^NV_SIGNER_IDENTITY='\(.*\)'$/\1/p; s/^NV_SIGNATURE_NAMESPACE='\(.*\)'$/\1/p" "$INSTALLER" | tr '\n' ' ')" \
+	expect_eq "$(sed -n "s/^NV_SIGNER_IDENTITY='\(.*\)'$/\1/p; s/^NV_SIGNATURE_NAMESPACE='\(.*\)'$/\1/p" "$REAL_INSTALLER" | tr '\n' ' ')" \
 		'release@eitri eitri-release ' "the identity and namespace"
 }
 
 # The embedded-key branch (D13), the one every final release's installer takes: $KEYED_INSTALLER
-# is install.sh with the test key added to its signers block (harness.sh's setup_keys), run with no
-# --release-signers at all.
+# is the unkeyed installer with the test key added to its signers block (harness.sh's setup_keys),
+# run with no --release-signers at all.
 
 TESTS="$TESTS t_embedded_key_good_signature"
 t_embedded_key_good_signature() {

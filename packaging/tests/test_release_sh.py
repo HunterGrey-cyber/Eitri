@@ -886,6 +886,185 @@ class SignAndVerify(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
 
 
+class PassphraseKeySigning(unittest.TestCase):
+    """The release key is passphrase-protected: sign_sums must work with the passphrase typed on a
+    terminal, and survive one mistyped attempt. ssh-keygen -Y sign asks once and then dies, which at
+    the end of a whole build would leave SHA256SUMS written and prepare_dirs refusing to rebuild."""
+
+    def setUp(self):
+        self.scratch = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+        self.env = _Env(self.scratch)
+        self.rel = os.path.join(self.scratch, "rel")
+        _write(os.path.join(self.rel, "SHA256SUMS"), "0" * 64 + "  install.sh\n")
+        self.key = os.path.join(self.scratch, "eitri-release")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "testpass", "-C", "", "-f", self.key],
+                       check=True, capture_output=True, env=self.env.vars)
+        with open(self.key + ".pub", encoding="utf-8") as f:
+            pub = " ".join(f.read().split()[:2])
+        self.signers = os.path.join(self.scratch, "signers")
+        _write(self.signers, f'release@eitri namespaces="eitri-release" {pub}\n')
+        # No agent of the caller's may answer for the key, and no askpass program may stand in for a tty.
+        self.vars = {k: v for k, v in self.env.vars.items() if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS", "DISPLAY")}
+
+    def sign_on_a_tty(self, passphrases):
+        """sign_sums under a pseudo-terminal, typing each of `passphrases` at a prompt in turn.
+        Returns (exit status, everything the terminal showed)."""
+        import pty
+        import select
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.scratch)
+            os.execvpe("bash", ["bash", "-c", f'set -euo pipefail; source "{_RELEASE_SH}"; '
+                                              f'sign_sums "{self.key}" "{self.rel}"'], self.vars)
+        shown = b""
+        typed = 0
+        deadline = time.time() + 30
+        try:
+            while time.time() < deadline:
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if not ready:
+                    continue
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                shown += data
+                # Count prompts, not the word "passphrase": ssh-keygen's error says it too.
+                prompts = shown.count(b"Enter passphrase for")
+                if typed < len(passphrases) and prompts > typed and shown.rstrip().endswith(b":"):
+                    time.sleep(0.2)
+                    os.write(fd, (passphrases[typed] + "\n").encode())
+                    typed += 1
+        finally:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+            _, status = os.waitpid(pid, 0)
+        # A kill after a clean exit still reports the exit status, not the signal.
+        return os.waitstatus_to_exitcode(status), shown.decode(errors="replace")
+
+    def verify(self):
+        return _bash(f'verify_sums "{self.signers}" "{self.rel}"', self.env.vars, self.scratch)
+
+    def test_the_passphrase_typed_on_a_terminal_signs_and_the_signature_verifies(self):
+        code, shown = self.sign_on_a_tty(["testpass"])
+        self.assertEqual(code, 0, shown)
+        self.assertIn('Enter passphrase for "%s": ' % self.key, shown)
+        self.assertEqual(self.verify().returncode, 0)
+
+    def test_a_mistyped_passphrase_is_asked_for_again(self):
+        code, shown = self.sign_on_a_tty(["wrong", "testpass"])
+        self.assertEqual(code, 0, shown)
+        self.assertIn("incorrect passphrase", shown)
+        self.assertIn("trying again (attempt 2 of 3)", shown)
+        self.assertEqual(self.verify().returncode, 0)
+
+    def test_three_wrong_passphrases_end_the_run_naming_the_key(self):
+        code, shown = self.sign_on_a_tty(["a", "b", "c"])
+        self.assertNotEqual(code, 0, shown)
+        self.assertIn("after 3 attempts", shown)
+        self.assertFalse(os.path.exists(os.path.join(self.rel, "SHA256SUMS.sig")))
+
+    def test_no_terminal_and_no_agent_fails_naming_both_ways_out(self):
+        proc = subprocess.run(["setsid", "-w", "bash", "-c", f'set -euo pipefail; source "{_RELEASE_SH}"; '
+                                                            f'sign_sums "{self.key}" "{self.rel}"'],
+                              capture_output=True, text=True, env=self.vars, cwd=self.scratch,
+                              stdin=subprocess.DEVNULL, timeout=60)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("a terminal on stdin, or the key loaded into ssh-agent", proc.stderr)
+
+    def test_a_key_loaded_into_an_agent_signs_without_any_prompt(self):
+        sock = os.path.join(self.scratch, "agent.sock")
+        started = subprocess.run(["ssh-agent", "-a", sock, "-s"], capture_output=True, text=True, env=self.vars)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        agent_pid = int(started.stdout.split("SSH_AGENT_PID=")[1].split(";")[0])
+        self.addCleanup(os.kill, agent_pid, 15)
+        # ssh-add needs the passphrase once, on a terminal; the release then needs no terminal at all.
+        import pty
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvpe("ssh-add", ["ssh-add", self.key], dict(self.vars, SSH_AUTH_SOCK=sock))
+        seen = b""
+        deadline = time.time() + 30
+        sent = False
+        while time.time() < deadline:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            seen += data
+            if not sent and b"passphrase" in seen:
+                time.sleep(0.2)
+                os.write(fd, b"testpass\n")
+                sent = True
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0, seen)
+        proc = subprocess.run(["setsid", "-w", "bash", "-c", f'set -euo pipefail; source "{_RELEASE_SH}"; '
+                                                            f'sign_sums "{self.key}" "{self.rel}"'],
+                              capture_output=True, text=True, env=dict(self.vars, SSH_AUTH_SOCK=sock),
+                              cwd=self.scratch, stdin=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.verify().returncode, 0)
+
+
+class SignSumsRetries(unittest.TestCase):
+    """sign_sums's retry loop alone, with an ssh-keygen that fails a set number of times first."""
+
+    def setUp(self):
+        self.scratch = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+        self.env = _Env(self.scratch)
+        self.rel = os.path.join(self.scratch, "rel")
+        _write(os.path.join(self.rel, "SHA256SUMS"), "0" * 64 + "  install.sh\n")
+        self.key, _ = self.env.keypair("k")
+        self.count = os.path.join(self.scratch, "count")
+        real = shutil.which("ssh-keygen")
+        _write(os.path.join(self.scratch, "fakebin", "ssh-keygen"),
+               '#!/bin/sh\n'
+               f'n=$(cat "{self.count}" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "{self.count}"\n'
+               'if [ "$1" = -Y ] && [ "$2" = sign ] && [ "$n" -le "$FAILS" ]; then\n'
+               '\techo "Load key: incorrect passphrase supplied to decrypt private key" >&2; exit 255\n'
+               'fi\n'
+               f'exec "{real}" "$@"\n', 0o755)
+
+    def sign(self, fails):
+        env = dict(self.env.vars, FAILS=str(fails),
+                   PATH=os.path.join(self.scratch, "fakebin") + os.pathsep + self.env.vars["PATH"])
+        return _bash(f'sign_sums "{self.key}" "{self.rel}"', env, self.scratch)
+
+    def calls(self):
+        with open(self.count, encoding="utf-8") as f:
+            return int(f.read())
+
+    def test_a_signature_that_succeeds_first_time_is_not_repeated(self):
+        proc = self.sign(0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.calls(), 1)
+        self.assertNotIn("trying again", proc.stderr)
+
+    def test_two_failures_then_a_success(self):
+        proc = self.sign(2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.calls(), 3)
+        self.assertIn("trying again (attempt 2 of 3)", proc.stderr)
+        self.assertIn("trying again (attempt 3 of 3)", proc.stderr)
+        self.assertTrue(os.path.getsize(os.path.join(self.rel, "SHA256SUMS.sig")) > 0)
+
+    def test_three_failures_stop_after_exactly_three_attempts(self):
+        proc = self.sign(99)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.calls(), 3)
+        self.assertIn("ssh-keygen could not sign", proc.stderr)
+        self.assertIn("after 3 attempts", proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.rel, "SHA256SUMS.sig")))
+
+
 class VerifyReleaseSignature(unittest.TestCase):
     """verify_release_signature, which host_main runs right after sign_sums. Review of fix round 1:
     preflight's signers_list_blob matches a --release-signers override against packaging/

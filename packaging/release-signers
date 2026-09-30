@@ -9,9 +9,9 @@
 #
 #   release@eitri namespaces="eitri-release" ssh-ed25519 AAAA...
 #
-# There is no key line yet. The owner adds the dedicated release key's public half here before the
-# first final release (spec §4.4); it must not be an everyday login key, and release.sh refuses one
-# that matches any ~/.ssh/id_*.pub. Once a key is listed, every installer built from this tree
-# refuses a release whose SHA256SUMS.sig is missing or does not verify (D13). Until then an
-# installer built from this tree says it carries no release key, and its checksums only detect
-# corruption.
+# The release key is listed below: the dedicated release key's public half (spec §4.4), never an
+# everyday login key, and release.sh refuses one that matches any ~/.ssh/id_*.pub. Every installer
+# built from this tree embeds it and refuses a release whose SHA256SUMS.sig is missing or does not
+# verify (D13). The installer's --release-signers option replaces it, with a warning, for a
+# release candidate or a test.
+release@eitri namespaces="eitri-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIFlRZ1ATAMMp/5iH+/hSVNTlVHNC+7qpGuIPY88B8rw

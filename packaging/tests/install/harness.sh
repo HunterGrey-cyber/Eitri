@@ -22,7 +22,14 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 PKG=$(cd "$HERE/../.." && pwd)
-INSTALLER=$PKG/install.sh
+# REAL_INSTALLER is packaging/install.sh as committed, with the owner's release key embedded. Tests
+# that read the source (the embedded block, the pinned verify line) and the one test of the real
+# key's own behaviour use it. INSTALLER, which every other test runs, copies into a fixture release
+# or compares with an installed eitri-setup, is REAL_INSTALLER with the key lines taken out of its
+# signers block (setup_keys), so a test that means "an installer with no key" does not depend on
+# which key the owner has listed. Until setup_keys has run it is the real file.
+REAL_INSTALLER=$PKG/install.sh
+INSTALLER=$REAL_INSTALLER
 WRAP=$HERE/run-in-env.sh
 FIXTURES=$HERE/fixtures
 NL='
@@ -117,13 +124,33 @@ setup_keys() {
 		awk '{ print "release@eitri namespaces=\"eitri-release\" " $1 " " $2 }' "$S/keys/$k.pub" >"$S/keys/signers-$k"
 	done
 	SIGNERS=$S/keys/signers-release
+	# The installer with no key embedded (a fixture of this harness, never shipped): install.sh with
+	# every key line of its embedded signers block removed, so that "no key built in" stays
+	# deterministic now that the real file lists the owner's release key. Only key lines may go.
+	mkdir -p "$S/unkeyed"
+	awk '
+		/^[[:space:]]*cat <<.EITRI_RELEASE_SIGNERS.$/ { inside = 1; print; next }
+		/^EITRI_RELEASE_SIGNERS$/ { inside = 0 }
+		inside && /^[[:space:]]*[^#[:space:]]/ { next }
+		{ print }' "$REAL_INSTALLER" >"$S/unkeyed/install.sh"
+	chmod 0755 "$S/unkeyed/install.sh"
+	_sk_keys=$(grep -c -E '^[[:space:]]*[^#[:space:]]' "$PKG/release-signers")
+	_sk_removed=$(diff "$REAL_INSTALLER" "$S/unkeyed/install.sh" | grep -c '^<')
+	_sk_added=$(diff "$REAL_INSTALLER" "$S/unkeyed/install.sh" | grep -c '^>')
+	if [ "$_sk_removed" != "$_sk_keys" ] || [ "$_sk_added" != 0 ] ||
+		diff "$REAL_INSTALLER" "$S/unkeyed/install.sh" | grep '^<' | grep -v -E '^< [^#[:space:]]' >/dev/null; then
+		echo "harness: the unkeyed installer is not install.sh minus the $_sk_keys key line(s) of release-signers" >&2
+		exit 2
+	fi
+	INSTALLER=$S/unkeyed/install.sh
 	# The installer with the test key embedded in its signers block, as every final release's
-	# installer carries one (spec §6.4, D13): the branch that runs with no --release-signers.
+	# installer carries one (spec §6.4, D13): the branch that runs with no --release-signers. The
+	# unkeyed copy plus one line, so it carries the test key and never the owner's.
 	awk -v key="$(cat "$SIGNERS")" '/^EITRI_RELEASE_SIGNERS$/ { print key } { print }' \
 		"$INSTALLER" >"$S/install-keyed.sh"
 	KEYED_INSTALLER=$S/install-keyed.sh
 	if [ "$(diff "$INSTALLER" "$KEYED_INSTALLER" | grep -c '^[<>]')" != 1 ]; then
-		echo "harness: the keyed installer is not install.sh plus one key line" >&2
+		echo "harness: the keyed installer is not the unkeyed installer plus one key line" >&2
 		exit 2
 	fi
 }
@@ -263,6 +290,10 @@ mk_release() {
 		printf '#!/bin/sh\necho "stub %s %s"\n' "$bin" "$v" >"$b/lib/eitri/$bin"
 		chmod 0755 "$b/lib/eitri/$bin"
 	done
+	# The fixture release's eitri-setup and install.sh are the unkeyed copy, not the real file: the
+	# tests run them (the tarball's eitri-setup after an install, `eitri setup`) and compare the
+	# installed eitri-setup with $INSTALLER, and none of them may depend on the owner's real key.
+	# Nothing here stands in for what the real release ships; t_real_installer_* test that file.
 	cp "$INSTALLER" "$b/lib/eitri/eitri-setup"
 	chmod 0755 "$b/lib/eitri/eitri-setup"
 	mk_verdandi_source "$rev7" "$S/fix/v$v/verdandi-$rev7-source.tar.gz"
