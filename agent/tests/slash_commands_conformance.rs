@@ -132,7 +132,7 @@ fn run_probe_turn(provider: &ClaudeSidecarProvider, session_id: &str, text: &str
             }
             if let AgentDomainEvent::TurnCompleted { usage, .. } = &event {
                 result.final_status = "completed";
-                result.usage = *usage;
+                result.usage = usage.clone();
                 completed = true;
             }
             result.events.push(format!("{event:?}"));

@@ -128,7 +128,8 @@ type Props = {
 };
 
 /** The empty tab's dashboard (panel round 2 plan, Task 12; spec §7): a centred `neovibe`, the
- *  where-line, one row per `dashItems(hello)`, and the selected mode's consequence line.
+ *  where-line, one row per `dashItems(hello)`, the selected mode's consequence line, what every
+ *  message also carries from the editor (v1 picks Task 11), and the first-run hint.
  *
  * Items carry `data-nav-stop="dash"` for the same CSS/grid symmetry the rest of the panel's rows
  * have, but they are deliberately NOT `nav.ts` stops (`controlsOf`'s selector has no `[role=
@@ -172,6 +173,19 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix }: Props
         ))}
       </div>
       {consequence !== undefined && <div className="dash-consequence">{consequence}</div>}
+      {/* R13 (docs/superpowers/plans/2026-09-29-v1-picks.md, Task 11; owner decision d): what rides with
+          every message, said where the mode is chosen and a session starts. `compose_turn_text`
+          (core/src/editor_context/compose.rs) appends the editor's file name -- or, while a Visual
+          selection is live, those lines -- to each turn the panel sends. It is never the cursor: nvim
+          reports the cursor `line` and `feed.rs` parses it and drops it (the report this came from said
+          "cursor"; R13 corrects it), and the file's text is never sent either. So this names those two and
+          nothing more. Unconditional -- it is true of every mode and every width, so an unknown mode still
+          gets it; the exception, a turn the CLI runs as one of its own local commands (`/model`,
+          `/effort`: `CLI_LOCAL_COMMANDS`), goes without it, and the `?` overlay's "Typing" note says so
+          where there is room for it. Same tokens as `.dash-consequence`. */}
+      <div className="dash-context">
+        Each message also sends the editor's file name, or the lines you selected there in Visual mode.
+      </div>
       {/* V1 P11 (spec §10.1): one first-run hint line, shown on every empty tab rather than once --
           the empty tab is seen only when nothing else is, so it costs nothing and needs no "first
           run" state file. neovibe's own; the three keys are the audit's §5 item 5. */}

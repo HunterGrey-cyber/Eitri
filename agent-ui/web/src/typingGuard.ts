@@ -22,6 +22,14 @@
  *   began with a key standing alone -- a message of nothing but walk keys ("l⏎" approves, "ll⏎"
  *   denies), or prose paused for `TYPING_GUARD_MS` or more right before a final `l` whose Enter
  *   follows at once ("cance", a pause, "l⏎" approves, as it did under the spec's rule).
+ *   **K02 (v1 picks, 2026-09-29, ruling R3) narrows it again**: `:ls⏎` approved a card through
+ *   Enter's native activation, since `l` walked onto Approve and `s` was a pause away. Enter on a
+ *   card's own button is now claimed and waits like `a`/`d` (`defer`, told the key is Enter so the
+ *   walk exception above still applies), and `App.tsx` presses the button only when focus was put
+ *   on that very button by the key right before Enter -- an `h`/`l` that moved it, a Tab -- or by a
+ *   HINT landing with no key since. That landing is recorded where focus moves, never guessed from
+ *   a key's name: this guard decides no landing, it only counts keys (`keyCount`), so `App.tsx` can
+ *   tie the landing it saw to the key that made it.
  * - A held key's repeat (`event.repeat`) never answers.
  * - **The v1-ui GUI pass (2026-09-27) found two more ways typed prose acts after an arrival**, and
  *   `mayActAfterMotion` closes both. The leader (Space by default) starts a sequence wherever the
@@ -149,6 +157,10 @@ export class TypingGuard {
   /** The waiting action's timer, boxed so a timer handle that happens to be falsy still counts, and
    *  what the band says should a key cancel it (`defer`'s `cancelledFlash`). */
   private pending: { handle: unknown; flash: string } | null = null;
+  /** K02: how many keys `onKey` has recorded (bare modifiers excepted, the cancelling ones counted),
+   *  so `App.tsx` can tie a landing it saw to the key that made it -- never a guess from a key's
+   *  name. */
+  private recorded = 0;
 
   constructor(private readonly timers: GuardTimers = GLOBAL_TIMERS) {}
 
@@ -159,6 +171,7 @@ export class TypingGuard {
    *  `a`/`d` (the whole-branch review) -- or `null` when nothing was waiting. */
   onKey(key: string, t: number): string | null {
     if (isModifierKey(key) && !CANCELLING_MODIFIERS.has(key)) return null;
+    this.recorded += 1;
     const continuesRun = this.latest !== null && t - this.latest.t < TYPING_GUARD_MS;
     this.previousRunIsWalk = this.latestRunIsWalk;
     this.latestRunIsWalk = WALK_KEYS.has(key) && (!continuesRun || this.previousRunIsWalk);
@@ -167,6 +180,13 @@ export class TypingGuard {
     this.previous = this.latest;
     this.latest = { key, t };
     return this.drop();
+  }
+
+  /** K02: the number of keys `onKey` has recorded so far. The key being handled right now is the
+   *  last of them, so a landing recorded as `keyCount()` by one key is "the key right before" the
+   *  next one exactly when that next key reads `keyCount() - 1` for it. */
+  keyCount(): number {
+    return this.recorded;
   }
 
   /** Whether the key `onKey` just recorded (at `t`) may answer now: with nothing within the window
@@ -192,13 +212,15 @@ export class TypingGuard {
     return this.previousRunIsMotion;
   }
 
-  /** `a`/`d`/`D`, `f`, a single-key table binding: when the key `onKey` just recorded stands alone
-   *  before, runs `run` after `TYPING_GUARD_MS` unless another key (`onKey`) or `cancel` comes
-   *  first, and returns true. Otherwise runs nothing and returns false -- the caller flashes.
-   *  `cancelledFlash` is what `onKey` hands back should a key cancel this wait. */
-  defer(t: number, repeat: boolean, run: () => void, cancelledFlash: string): boolean {
+  /** `a`/`d`/`D`, `f`, a single-key table binding, and (K02) Enter on a card's own button: when the
+   *  key `onKey` just recorded stands alone before, runs `run` after `TYPING_GUARD_MS` unless another
+   *  key (`onKey`) or `cancel` comes first, and returns true. Otherwise runs nothing and returns
+   *  false -- the caller flashes. `cancelledFlash` is what `onKey` hands back should a key cancel
+   *  this wait. `key` is what `mayAnswerNow` judges: only `"Enter"` takes its walk exception, so
+   *  every caller but Enter's leaves it out. */
+  defer(t: number, repeat: boolean, run: () => void, cancelledFlash: string, key = ""): boolean {
     this.cancel();
-    if (!this.mayAnswerNow("", t, repeat)) return false;
+    if (!this.mayAnswerNow(key, t, repeat)) return false;
     const waiting: { handle: unknown; flash: string } = { handle: null, flash: cancelledFlash };
     waiting.handle = this.timers.setTimeout(() => {
       if (this.pending !== waiting) return;

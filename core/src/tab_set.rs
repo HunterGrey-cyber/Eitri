@@ -3315,7 +3315,7 @@ mod tests {
         set.select(first);
         let plan = plan(set.cycle_mode(first));
         assert_eq!(plan.approve, vec!["p1".to_string()]);
-        assert!(plan.lines[0].contains("1 张"), "{:?}", plan.lines);
+        assert!(plan.lines[0].contains("1 waiting card"), "{:?}", plan.lines);
 
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce),
@@ -3363,7 +3363,11 @@ mod tests {
         };
         assert_eq!(reprompted.approve, vec!["p1".to_string(), "p2".to_string()]);
         assert_ne!(reprompted.nonce, old_plan.nonce);
-        assert!(reprompted.lines[0].contains("2 张"), "{:?}", reprompted.lines);
+        assert!(
+            reprompted.lines[0].contains("2 waiting cards"),
+            "{:?}",
+            reprompted.lines
+        );
         assert_eq!(
             set.get(tab).unwrap().mode,
             SessionModeChoice::Auto,
@@ -3455,9 +3459,11 @@ mod tests {
 
         provider.queue(write("p5"));
         provider.queue(read("p6"));
+        // Both halves are waited for: the ingestion thread may deliver p5 and p6 in different polls,
+        // so p5's card being up does not yet mean p6 was answered (seen once under a loaded host).
         until("p5 cards and p6 is answered", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().attention.attention().pending == 1
+            set.get(tab).unwrap().attention.attention().pending == 1 && !provider.resolutions().is_empty()
         });
         assert_eq!(provider.resolutions(), vec![("p6".to_string(), true)]);
         shut_down_all(&mut set);
@@ -3470,7 +3476,7 @@ mod tests {
         let plan = plan(set.cycle_mode(tab));
         assert_eq!(plan.scope, BypassScope::Tab(tab));
         assert!(
-            plan.lines[0].contains("本窗口之后的新会话也用 bypass"),
+            plan.lines[0].contains("New sessions in this window start in bypass too"),
             "{:?}",
             plan.lines
         );
@@ -3563,7 +3569,7 @@ mod tests {
             assert_eq!(plan.approve, Vec::<String>::new());
             assert_eq!(
                 plan.lines,
-                vec!["切到 bypass？(y/n)".to_string()],
+                vec!["Switch to bypass? (y/n)".to_string()],
                 "a starting tab asks like a live one"
             );
             assert_eq!(
@@ -3956,7 +3962,7 @@ mod tests {
 
         let plan = plan(set.cycle_mode(tab));
         assert_eq!(plan.approve, vec!["real-card".to_string()]);
-        assert!(plan.lines[0].contains("1 张"), "{:?}", plan.lines);
+        assert!(plan.lines[0].contains("1 waiting card"), "{:?}", plan.lines);
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce),
             Ok(ConfirmOutcome::Entered {
@@ -4057,7 +4063,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// The whole-branch review (gate, important): a live tab's prompt (`切到 bypass？(y/n)`, which
+    /// The whole-branch review (gate, important): a live tab's prompt (`Switch to bypass? (y/n)`, which
     /// says nothing about new sessions) answered after a terminal handoff turned the tab into
     /// `NotStarted` used to move the WINDOW default into bypass too -- every later `prefix c` then
     /// opened in bypass with no `y` for it (spec §7.2). The plan now records which question it asked,
@@ -6596,9 +6602,9 @@ mod tests {
         assert_eq!(plan.approve, vec!["perm-write".to_string()]);
         // Review #6: the prompt says the card that will stay, on a line of its own after R06's.
         assert_eq!(plan.lines.len(), 2, "{:?}", plan.lines);
-        assert!(plan.lines[0].contains("批准 1 张"), "{:?}", plan.lines);
+        assert!(plan.lines[0].contains("approve the 1 waiting card"), "{:?}", plan.lines);
         assert!(
-            plan.lines[1].contains("1 张") && plan.lines[1].contains("保留"),
+            plan.lines[1].contains("1 card") && plan.lines[1].contains("stays waiting"),
             "{:?}",
             plan.lines
         );

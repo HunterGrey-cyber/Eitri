@@ -3,6 +3,7 @@
 //! a widget is. `shell::module_grid` is the GTK container that allocates what this computes; a
 //! macOS host would allocate the same rectangles into its own views.
 
+pub mod cycle;
 pub mod geometry;
 pub mod keys;
 pub mod kill;
@@ -13,6 +14,7 @@ pub mod reconcile;
 pub mod tray;
 pub mod tree;
 
+pub use cycle::{next_on_screen, FocusHistory};
 pub use geometry::{
     arrange, hide, min_size, move_divider, navigate, neighbor, resize, settle_pins, Arrangement, Direction, Divider,
     Frame, Nav, Rect, Size,

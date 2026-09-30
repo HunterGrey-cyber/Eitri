@@ -580,6 +580,70 @@ describe("EmptyTab (F3)", () => {
         fireEvent.keyDown(root, { key: "b" });
         expect(onPanelAction).toHaveBeenCalledTimes(2);
       });
+      it("K01: a reserved prefix swallows a key with no pair: g then i opens no composer", () => {
+        const rendered = renderEmpty({ panelTable: TABLE, onPanelAction: vi.fn() });
+        const root = toBrowse(rendered, rendered.props);
+        fireEvent.keyDown(root, { key: "g" });
+        fireEvent.keyDown(root, { key: "i" });
+        expect(rendered.container.querySelector("textarea")).toBeNull();
+        fireEvent.keyDown(root, { key: "i" });
+        expect(rendered.container.querySelector("textarea")).not.toBeNull();
+      });
+      /* Fix round 1 (review): a cancel route this screen never sees as a key -- Shift+Tab, which the
+         window's document-capture router stops before this handler, an overlay, a tab switch --
+         left its prefix and leader waiting, so `g`, Shift+Tab, `i` swallowed the `i`. The window
+         now says so through `dropKeysRequest`. */
+      it("K01: dropKeysRequest drops a waiting prefix and a leader sequence", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction, dropKeysRequest: 4 });
+          const root = toBrowse(rendered, rendered.props);
+          const at = (n: number) => rendered.rerender(<EmptyTab {...rendered.props} arriveRequest={1} dropKeysRequest={n} />);
+          // Control: an unchanged count is no request, so the `g` still waits and swallows the `i`.
+          fireEvent.keyDown(root, { key: "g" });
+          at(4);
+          fireEvent.keyDown(root, { key: "i" });
+          expect(rendered.container.querySelector("textarea"), "the i ended the g").toBeNull();
+          fireEvent.keyDown(root, { key: "g" });
+          at(5);
+          fireEvent.keyDown(root, { key: "i" });
+          expect(rendered.container.querySelector("textarea"), "the request dropped the g").not.toBeNull();
+          fireEvent.keyDown(rendered.container.querySelector("textarea")!, { key: "Escape" });
+          act(() => vi.advanceTimersByTime(1000));
+          fireEvent.keyDown(root, { key: " " });
+          act(() => vi.advanceTimersByTime(1000));
+          expect(rendered.container.querySelector(".which-key-box")).not.toBeNull();
+          at(6);
+          expect(rendered.container.querySelector(".which-key-box")).toBeNull();
+          fireEvent.keyDown(root, { key: "m" });
+          act(() => vi.advanceTimersByTime(1000));
+          expect(onPanelAction, "<leader>m never ran").not.toHaveBeenCalled();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+      it("K01: g, a pause, then f starts no HINT, and an input method's key drops the prefix", () => {
+        vi.useFakeTimers();
+        try {
+          const onHint = vi.fn();
+          const onPanelAction = vi.fn();
+          const table = { ...TABLE, bindings: [...TABLE.bindings, { keys: ["g", "t"], action: "tab.next" as const, desc: "tab.next", source: "default" as const }] };
+          const rendered = renderEmpty({ panelTable: table, onHint, onPanelAction });
+          const root = toBrowse(rendered, rendered.props);
+          fireEvent.keyDown(root, { key: "g" });
+          act(() => vi.advanceTimersByTime(400));
+          fireEvent.keyDown(root, { key: "f" }); // today: EmptyTab.tsx's `f` handler runs before the prefix check
+          act(() => vi.advanceTimersByTime(1000));
+          expect(onHint).not.toHaveBeenCalled();
+          fireEvent.keyDown(root, { key: "g" });
+          fireEvent.keyDown(root, { key: "d", isComposing: true }); // today: the IME return leaves `g` armed
+          fireEvent.keyDown(root, { key: "t" });
+          expect(onPanelAction).not.toHaveBeenCalled();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
 
       /** v1 polish F16: vim's `gt`/`gT` reach the table from the dashboard too, `gT` through a bare
        *  Shift keydown that must not drop the pending `g`. */

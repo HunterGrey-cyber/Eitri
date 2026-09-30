@@ -1,13 +1,14 @@
 import type { PanelMode } from "./keymap";
+import type { UsageInfo } from "./types";
 
 /** One segment's identity, in the priority order spec §5.2 lists (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "queue" | "context" | "position" | "model";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "queue" | "context" | "position" | "model" | "usage";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (spec §5.2:
  *  left of the gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
- *  model, position, `↓N`). `StatusBand` groups by `side` when it renders; `bandLayout` itself never
- *  reorders by side, only by priority. */
+ *  model, usage, position, `↓N`). `StatusBand` groups by `side` when it renders; `bandLayout` itself
+ *  never reorders by side, only by priority. */
 export type Seg = {
   id: SegId;
   text: string;
@@ -39,7 +40,15 @@ export type BandFacts = {
   context: { file: string; lines: [number, number] | null } | null;
   position: string | null;
   model: string | null;
+  /** R5: the active tab's last reported usage, already worded (`usageSegment`) -- `text` is the
+   *  segment, `title` its tooltip. `null` until a turn has reported one, and always `null` on the
+   *  empty tab. */
+  usage: UsageFact | null;
 };
+
+/** The band's usage segment as `usageSegment` words it: the text drawn, and the tooltip carrying
+ *  the breakdown the text has no room for. */
+export type UsageFact = { text: string; title: string };
 
 /** vim's East Asian Wide/Fullwidth ranges, counted twice (spec §5.3, Review Focus 3): a CJK file
  *  name or model name must not silently overrun the band's monospace budget. Not a full Unicode
@@ -99,11 +108,15 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.warn ? [{ id: "warn", text: "⚠", side: "right" } as Seg] : []),
     ...(ctxFull ? [{ id: "context", text: ctxFull, side: "right" } as Seg] : []),
     ...(f.model ? [{ id: "model", text: f.model, side: "right" } as Seg] : []),
+    ...(f.usage ? [{ id: "usage", text: f.usage.text, side: "right" } as Seg] : []),
     ...(f.position ? [{ id: "position", text: f.position, side: "right" } as Seg] : []),
     ...(f.unread ? [{ id: "unread", text: f.unread, side: "right" } as Seg] : []),
   ];
   const width = (s: Seg[]) => s.reduce((n, x) => n + textWidth(x.text) + PAD, 0);
   const steps: ((s: Seg[]) => Seg[])[] = [
+    // R5: the usage figure is the least urgent thing on the band -- it goes before even the context
+    // is shortened, so a narrow panel never trades the file it is showing for a running total.
+    (s) => s.filter((x) => x.id !== "usage"),
     (s) => s.map((x) => (x.id === "context" && f.context ? { ...x, text: `⧉ ${f.context.file}` } : x)),
     (s) => s.filter((x) => x.id !== "model"),
     (s) => s.filter((x) => x.id !== "position"),
@@ -131,4 +144,46 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
 export function shortModel(model: string | null): string | null {
   if (model === null) return null;
   return model.startsWith("claude-") ? model.slice("claude-".length) : model;
+}
+
+/** `1234` -> `1.2k`, `1_200_000` -> `1.2M`: one decimal, and no trailing `.0`. A figure that would
+ *  round up to `1000k` reads `1M` instead (`999_950` is the first such). */
+function tokens(n: number): string {
+  const scaled = (value: number, unit: string) => `${value.toFixed(1).replace(/\.0$/, "")}${unit}`;
+  if (n < 1000) return `${n}`;
+  return n < 999_950 ? scaled(n / 1e3, "k") : scaled(n / 1e6, "M");
+}
+
+/** Cents, except that a real cost below half a cent reads `<$0.01` rather than `$0.00`: a session that
+ *  spent something never looks like one that spent nothing. */
+function dollars(c: number): string {
+  return c > 0 && c < 0.005 ? "<$0.01" : `$${c.toFixed(2)}`;
+}
+
+/** One formatter for the tooltip: `toLocaleString` builds a new `Intl.NumberFormat` on every call,
+ *  and this runs on every render of the panel while a reply streams. */
+const GROUPED = new Intl.NumberFormat("en-US");
+
+/** R5: every token the provider counted (the prompt's three parts and the output) and the cost -- the
+ *  latest report, never a sum; `null` until one arrives, never `0 tok $0.00` for unknown. A backend that
+ *  reports a cost and no tokens (legacy) shows the cost alone. A cost that is not a finite number is no
+ *  measurement either (Rust drops such a report whole, `usage_from_proto`; this keeps one that slipped
+ *  through from throwing inside a render). */
+export function usageSegment(u: UsageInfo | null): UsageFact | null {
+  if (u === null || !Number.isFinite(u.total_cost_usd)) return null;
+  const t = u.tokens;
+  const total = t === null ? null : t.input + t.output + t.cache_creation + t.cache_read;
+  const text = total === null ? dollars(u.total_cost_usd) : `${tokens(total)} tok ${dollars(u.total_cost_usd)}`;
+  const parts =
+    t === null
+      ? []
+      : [
+          `input ${GROUPED.format(t.input)}`,
+          `output ${GROUPED.format(t.output)}`,
+          `cache write ${GROUPED.format(t.cache_creation)}`,
+          `cache read ${GROUPED.format(t.cache_read)}`,
+        ];
+  const what = "since this tab started or resumed; /clear starts it over; Claude Code's own estimate, not a bill";
+  const title = `${[...parts, `$${u.total_cost_usd.toFixed(4)}`].join(" · ")} — ${what}`;
+  return { text, title };
 }

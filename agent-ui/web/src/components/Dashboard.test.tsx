@@ -150,6 +150,45 @@ describe("Dashboard (panel round 2 plan, Task 12; spec §7)", () => {
   });
 });
 
+/** R13 (v1 picks Task 11, owner decision d): every turn carries what the editor is showing, and this
+ *  is where a person picks the mode and starts a session, so it says what goes with each message. What
+ *  goes is the editor's file name, or the lines selected in Visual mode -- never the file's text and
+ *  never the cursor (`core/src/editor_context/feed.rs` parses `line` and drops it), so the sentence
+ *  names those two and nothing else. It is a fact about every turn, not about the mode. */
+describe("Dashboard's context line (v1 picks Task 11, R13)", () => {
+  const CONTEXT_LINE = "Each message also sends the editor's file name, or the lines you selected there in Visual mode.";
+
+  it("says what each message carries from the editor, once, for auto and bypass", () => {
+    for (const mode of ["auto", "bypass"] as const) {
+      const { container } = renderDash({ mode });
+      const lines = container.querySelectorAll(".dash-context");
+      expect(lines).toHaveLength(1);
+      expect(lines[0].textContent).toBe(CONTEXT_LINE);
+    }
+  });
+
+  it("is drawn under the consequence line and above the first-run hint, which stays last", () => {
+    const { container } = renderDash({ mode: "auto" });
+    const consequence = container.querySelector(".dash-consequence")!;
+    const context = container.querySelector(".dash-context")!;
+    const hint = container.querySelector(".dash-hint")!;
+    expect(consequence.nextElementSibling).toBe(context);
+    expect(context.nextElementSibling).toBe(hint);
+    expect(hint.nextElementSibling).toBeNull();
+  });
+
+  it("does not hinge on the mode: a mode with no consequence line still says it", () => {
+    const { container } = renderDash({ mode: "future-mode" as PermissionModeChoice });
+    expect(container.querySelector(".dash-consequence")).toBeNull();
+    expect(container.querySelector(".dash-context")!.textContent).toBe(CONTEXT_LINE);
+  });
+
+  it("is drawn in a narrow panel too, in the same words", () => {
+    const { container } = renderDash({ narrow: true });
+    expect(container.querySelector(".dash-context")!.textContent).toBe(CONTEXT_LINE);
+  });
+});
+
 describe("Dashboard's first-run hint line (V1 P11, spec §10.1)", () => {
   it("shows the stock Ctrl+b prefix by default", () => {
     const { container } = renderDash();

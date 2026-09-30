@@ -87,6 +87,19 @@ pub enum NavKeyDirection {
     Up,
 }
 
+/// `Ctrl+w h/j/k/l`'s side (v1 picks, Task 6, ruling R11): which way the keys leave the panel, by
+/// geometry -- `h` left, `j` down, `k` up, `l` right, vim's own letters. Not [`NavKeyDirection`], which
+/// is `Ctrl+j`/`Ctrl+k`'s two-valued mirror of BROWSE and INPUT and must stay two-valued. The wire
+/// words are the side's names, never the letters, so a direction is read the same by both halves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneNavDirection {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundMessage {
@@ -290,6 +303,18 @@ pub enum InboundMessage {
         request_id: String,
         direction: NavKeyDirection,
     },
+    /// Ctrl+w h/j/k/l in BROWSE (v1 picks, R11): move the keys from the panel that way, by geometry.
+    PaneNav {
+        request_id: String,
+        direction: PaneNavDirection,
+    },
+    /// gx (R6): open this web link in the system browser. The page sends the WHATWG-normalized address
+    /// (`agent-ui/web/src/nav.ts#webUrl`); `shell` re-checks it (`agent_panel.rs#web_url`) before it reaches
+    /// `gtk4::UriLauncher`. No `serde(default)`: a message with no address is malformed, never "open nothing".
+    OpenUrl {
+        request_id: String,
+        url: String,
+    },
     /// `y`/`Y` to a `confirm_bypass` prompt (R06/S2, D1/D11): the panel's own answer, guarded by its
     /// typed-input rules (Task 4), naming the tab (or `null` for the window default) and the nonce
     /// it was shown so a stale prompt can never answer a newer one (D7). Window-level for routing
@@ -378,7 +403,9 @@ impl InboundMessage {
             // same reason `TabVerb` is window-level rather than routed by this generic mechanism.
             | InboundMessage::ConfirmBypass { .. }
             | InboundMessage::PanelKeys { .. }
-            | InboundMessage::NavFallthrough { .. } => return TabRef::WindowLevel,
+            | InboundMessage::NavFallthrough { .. }
+            | InboundMessage::PaneNav { .. }
+            | InboundMessage::OpenUrl { .. } => return TabRef::WindowLevel,
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
@@ -461,7 +488,9 @@ impl InboundMessage {
             | InboundMessage::CloseOthers { request_id }
             | InboundMessage::ConfirmBypass { request_id, .. }
             | InboundMessage::PanelKeys { request_id, .. }
-            | InboundMessage::NavFallthrough { request_id, .. } => request_id,
+            | InboundMessage::NavFallthrough { request_id, .. }
+            | InboundMessage::PaneNav { request_id, .. }
+            | InboundMessage::OpenUrl { request_id, .. } => request_id,
         }
     }
 }
@@ -1094,6 +1123,13 @@ pub fn serialize_snapshot_with_notes_for_js(
         // disagreed about whether the last transcript entry was still open. Sending the real bit
         // is what lets `applySnapshot` take it from the wire instead of guessing "closed".
         "assistantMessageOpen": projection.assistant_message_open,
+        // R5 (v1 picks, Task 13): the tab's last reported usage, so a tab switch or a panel reload
+        // shows the figure the band draws without waiting for the next turn to report one. An
+        // explicit `null` until a provider has reported something (never a zeroed object), then
+        // `agent::UsageInfo` as it derives: SNAKE_CASE inside, the same shape the `turn_completed`
+        // event carries -- the one place in `state` that is not camelCase, so the panel folds a
+        // live report and a snapshot's copy with one type (`types.ts`'s `UsageInfo`).
+        "usage": projection.usage,
         "capabilities": {
             "resume": capabilities.resume,
             "fork": capabilities.fork,
@@ -1640,6 +1676,100 @@ mod tests {
         );
     }
 
+    /// v1 picks, Task 6 (R11): `Ctrl+w h/j/k/l` in BROWSE. Window-level (the page names no tab: the keys
+    /// go from the panel, whichever tab it shows), all four sides, and the request id carried through.
+    #[test]
+    fn parses_pane_nav_in_all_four_directions_as_a_window_level_message() {
+        let msg = parse_inbound_message(r#"{"type":"pane_nav","request_id":"r","direction":"left"}"#).unwrap();
+        assert_eq!(msg.tab_ref(), TabRef::WindowLevel);
+        assert_eq!(msg.request_id(), "r");
+        assert!(matches!(
+            msg,
+            InboundMessage::PaneNav {
+                direction: PaneNavDirection::Left,
+                ..
+            }
+        ));
+        // The four strings `agent-ui/web/src/bridge.test.ts` pins `JSON.stringify` to, byte for byte.
+        for (json, id, want) in [
+            (
+                r#"{"type":"pane_nav","request_id":"req-1","direction":"left"}"#,
+                "req-1",
+                PaneNavDirection::Left,
+            ),
+            (
+                r#"{"type":"pane_nav","request_id":"req-2","direction":"down"}"#,
+                "req-2",
+                PaneNavDirection::Down,
+            ),
+            (
+                r#"{"type":"pane_nav","request_id":"req-3","direction":"up"}"#,
+                "req-3",
+                PaneNavDirection::Up,
+            ),
+            (
+                r#"{"type":"pane_nav","request_id":"req-4","direction":"right"}"#,
+                "req-4",
+                PaneNavDirection::Right,
+            ),
+        ] {
+            match parse_inbound_message(json) {
+                Some(InboundMessage::PaneNav { request_id, direction }) => {
+                    assert_eq!(direction, want, "{json}");
+                    assert_eq!(request_id, id, "{json}");
+                }
+                other => panic!("{json}: {other:?}"),
+            }
+        }
+    }
+
+    /// The same one-directional reasoning as `DecisionChoice`'s: a direction Rust does not know is a
+    /// parse failure, never a move some later `match` chose for it. `"sideways"` is the plan's own
+    /// example; `"Left"` and `"north"` are the near misses (case, and a compass instead of vim's keys),
+    /// and a message with no direction or no request id is malformed like any other.
+    #[test]
+    fn an_unknown_missing_or_misspelled_pane_nav_direction_fails_to_parse() {
+        for direction in ["sideways", "Left", "north", "", "h"] {
+            let json = format!(r#"{{"type":"pane_nav","request_id":"r","direction":"{direction}"}}"#);
+            assert!(parse_inbound_message(&json).is_none(), "{direction:?}");
+        }
+        assert!(parse_inbound_message(r#"{"type":"pane_nav","request_id":"r"}"#).is_none());
+        assert!(parse_inbound_message(r#"{"type":"pane_nav","direction":"left"}"#).is_none());
+        assert!(parse_inbound_message(r#"{"type":"pane_nav","request_id":"r","direction":null}"#).is_none());
+    }
+
+    /// v1 picks, Task 8 (R6): `gx` opens a web link. `open_url` is window-level (it names no tab: the link is
+    /// on whatever row the reader is on), carries the request id and the address the page chose, and is
+    /// exactly the string `agent-ui/web/src/bridge.test.ts` pins `JSON.stringify` to, byte for byte.
+    #[test]
+    fn parses_open_url_as_a_window_level_message() {
+        let json = r#"{"type":"open_url","request_id":"req-1","url":"https://example.com/a"}"#;
+        let msg = parse_inbound_message(json).unwrap();
+        assert_eq!(msg.tab_ref(), TabRef::WindowLevel);
+        assert_eq!(msg.request_id(), "req-1");
+        match msg {
+            InboundMessage::OpenUrl { request_id, url } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(url, "https://example.com/a");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A message with no address, a `null` one, a non-string one or no request id is malformed like any
+    /// other: never "open nothing", and never an address some later `match` invents for it.
+    #[test]
+    fn an_open_url_with_no_url_or_request_id_fails_to_parse() {
+        for bad in [
+            r#"{"type":"open_url","request_id":"r"}"#,
+            r#"{"type":"open_url","request_id":"r","url":null}"#,
+            r#"{"type":"open_url","request_id":"r","url":5}"#,
+            r#"{"type":"open_url","url":"https://example.com/"}"#,
+        ] {
+            assert!(parse_inbound_message(bad).is_none(), "{bad}");
+        }
+    }
+
     #[test]
     fn serializes_the_five_hint_envelopes() {
         let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
@@ -1937,6 +2067,100 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("untested"));
+    }
+
+    /// R5 (v1 picks, Task 13): a tab's last usage figure rides its snapshot, so a tab switch or a
+    /// panel reload shows it at once instead of waiting for the next turn to report one. `null` --
+    /// present as a key, never a zeroed object -- until a provider has reported something, and
+    /// replaced whole by each later report. Inside, snake_case: the same shape the `turn_completed`
+    /// event carries (`agent::UsageInfo`'s own derive), where the rest of `state` is camelCase.
+    #[test]
+    fn a_snapshot_carries_the_last_reported_usage_and_null_before_any() {
+        let usage_in_snapshot = |projection: &AgentSessionProjection| -> Value {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities {
+                    resume: false,
+                    fork: false,
+                    interrupt: true,
+                    bypass_permission_mode: true,
+                    interactive_permission_mode: true,
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            assert!(
+                parsed["state"].as_object().unwrap().contains_key("usage"),
+                "the key is always sent: `null` says nothing was reported, an absent key says this build predates it"
+            );
+            parsed["state"]["usage"].clone()
+        };
+        let completed = |usage: Option<agent::UsageInfo>| AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage,
+        };
+
+        let mut projection = AgentSessionProjection::default();
+        assert_eq!(
+            usage_in_snapshot(&projection),
+            Value::Null,
+            "a fresh session has reported nothing"
+        );
+
+        // A turn that reports nothing (interrupted, synthesized) is unknown, not a zero.
+        projection.apply(&completed(None));
+        assert_eq!(
+            usage_in_snapshot(&projection),
+            Value::Null,
+            "silence is not a measurement"
+        );
+
+        // The sidecar's shape: tokens and a model, no turn count.
+        projection.apply(&completed(Some(agent::UsageInfo {
+            total_cost_usd: 0.42,
+            num_turns: None,
+            tokens: Some(agent::TokenUsage {
+                input: 1,
+                output: 2,
+                cache_creation: 3,
+                cache_read: 4,
+            }),
+            model: Some("claude-sonnet-5".into()),
+        })));
+        assert_eq!(
+            usage_in_snapshot(&projection),
+            json!({
+                "total_cost_usd": 0.42,
+                "num_turns": null,
+                "tokens": {"input": 1, "output": 2, "cache_creation": 3, "cache_read": 4},
+                "model": "claude-sonnet-5",
+            })
+        );
+
+        // A later turn that reports nothing leaves the last figure standing...
+        projection.apply(&completed(None));
+        assert_eq!(usage_in_snapshot(&projection)["total_cost_usd"], 0.42);
+
+        // ...and one that does replaces it whole, a lower figure included (`/clear` resets the SDK's
+        // running total). Legacy's shape: a turn count, no tokens and no model.
+        projection.apply(&completed(Some(agent::UsageInfo {
+            total_cost_usd: 0.01,
+            num_turns: Some(3),
+            tokens: None,
+            model: None,
+        })));
+        assert_eq!(
+            usage_in_snapshot(&projection),
+            json!({"total_cost_usd": 0.01, "num_turns": 3, "tokens": null, "model": null})
+        );
     }
 
     /// sw-panel-render-2 (2026-09-27): a snapshot taken mid-reply used to say nothing at all about

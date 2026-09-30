@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { acceptsEnvelope, activeTabInfo, forgetClosed, markerGlyph, modePill, saveView, showTabBar, takeView, withoutHandoff } from "./tabs";
+import { acceptsEnvelope, activeTabInfo, countedTabTarget, forgetClosed, markerGlyph, modePill, saveView, showTabBar, takeView, withoutHandoff } from "./tabs";
 import type { TabViewState } from "./tabs";
-import type { TabInfo } from "./types";
+import type { TabInfo, TabsEnvelope } from "./types";
 
 const tab = (id: number, over: Partial<TabInfo> = {}): TabInfo => ({
   id, number: id, label: `${id} new`, name: null, state: "not_started", mode: "auto",
@@ -104,5 +104,28 @@ describe("withoutHandoff", () => {
     expect([...withoutHandoff(both, 2, "r2").entries()]).toEqual([[1, "r1"]]);
     expect(withoutHandoff(both, 2, "an older request")).toBe(both);
     expect(withoutHandoff(both, 3)).toBe(both);
+  });
+});
+
+/* Task 3 (v1 picks, R2): vim's `{N}gt` / `{N}gT` (`:help gt`). The ids are deliberately not the
+   numbers -- tab 5 is the bar's third -- so a target that returned the number would fail here. */
+describe("countedTabTarget (vim {N}gt / {N}gT)", () => {
+  const env: TabsEnvelope = { active: 2, tabs: [tab(1), tab(2), tab(5, { number: 3 })], defaultMode: "auto" };
+  it("gt goes to the tab numbered N, or nowhere", () => {
+    expect(countedTabTarget(env, "tab.next", 3)).toBe(5);
+    expect(countedTabTarget(env, "tab.next", 9)).toBeNull();
+  });
+  it("gT goes N back from the active tab, wrapping", () => {
+    expect(countedTabTarget(env, "tab.prev", 1)).toBe(1);
+    expect(countedTabTarget(env, "tab.prev", 2)).toBe(5);
+  });
+  it("gT with a count past the tab count keeps wrapping round the bar", () => {
+    // Three tabs, active the second: 4 back is one back, 7 back is one back too.
+    expect(countedTabTarget(env, "tab.prev", 4)).toBe(1);
+    expect(countedTabTarget(env, "tab.prev", 7)).toBe(1);
+    expect(countedTabTarget(env, "tab.prev", 3)).toBe(2);
+  });
+  it("gT has no target when the active tab is not in the list", () => {
+    expect(countedTabTarget({ ...env, active: 99 }, "tab.prev", 1)).toBeNull();
   });
 });

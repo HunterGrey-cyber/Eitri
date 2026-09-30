@@ -19,6 +19,11 @@ function overlay(onClose = () => {}, panel: PanelTable = EMPTY_PANEL_TABLE) {
   return render(<KeymapOverlay onClose={onClose} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+b" panel={panel} />);
 }
 
+/** A section by its own `<h2>`, so a test about one group's note cannot be satisfied by another's. */
+function sectionTitled(container: HTMLElement, title: string) {
+  return Array.from(container.querySelectorAll("section")).find((s) => s.querySelector("h2")?.textContent === title)!;
+}
+
 describe("KeymapOverlay", () => {
   it("renders the six groups, the leader between BROWSE and Typing, Slash commands between Typing and Anywhere, the last headed by the configured prefix", () => {
     const { container } = overlay();
@@ -87,6 +92,49 @@ describe("KeymapOverlay", () => {
     const panelSection = Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("This panel"))!;
     expect(panelSection.textContent).toContain("Ctrl+j");
     expect(panelSection.textContent).toContain("Type (the box below)");
+  });
+
+  // R9 (v1 picks Task 9): `Ctrl+[` is Esc is one listener on the document (`../ctrlBracket`), never a
+  // key `resolveKey` sees, so it cannot be a row of `BROWSE_KEYS` -- `keymap.test.ts` ties that table
+  // to `resolveKey` both ways and would fail on it. It is a note under the table instead, and a section
+  // without a note draws no `<p>` at all.
+  describe("the note under This panel (R9)", () => {
+    it("says Ctrl+[ is Esc, in a <p> after the table, and adds no row", () => {
+      const section = sectionTitled(overlay().container, "This panel");
+      expect(section.querySelectorAll("p")).toHaveLength(1);
+      const note = section.querySelector("p")!;
+      expect(note.textContent).toBe("Ctrl+[ is Esc everywhere in this panel.");
+      expect(section.querySelector("table")!.nextElementSibling).toBe(note);
+      // BROWSE_KEYS, plus the mirror's own `Ctrl+j` -- the same count the whole-container test pins.
+      expect(section.querySelectorAll("tr")).toHaveLength(BROWSE_KEYS.length + 1);
+    });
+
+    it("draws no <p> in a section that gives no note", () => {
+      const { container } = overlay();
+      expect(sectionTitled(container, "Anywhere in the window").querySelector("p")).toBeNull();
+      expect(sectionTitled(container, "After Ctrl+b").querySelector("p")).toBeNull();
+    });
+  });
+
+  // R13 (v1 picks Task 11, owner decision d): what rides with a sent message is one sentence about
+  // Enter, not a key of its own -- `Composer` sends it and `resolveKey` never sees it, so it cannot be a
+  // row of `INPUT_KEYS` (tied to `COMPOSER_CHORDS` both ways) -- and it is the note under "Typing", the
+  // same shape as R9's note under "This panel". The figures are the nvim snippet's own caps
+  // (`MAX_SELECTION_LINES = 400`, `CONTENT_LIMIT = 2000`); "not its text or cursor" is because
+  // `core/src/editor_context/feed.rs` drops the cursor line and the file's text is never sent.
+  describe("the note under Typing (R13)", () => {
+    it("says what Enter also sends from the editor, in a <p> after the table, and adds no row", () => {
+      const section = sectionTitled(overlay().container, "Typing");
+      expect(section.querySelectorAll("p")).toHaveLength(1);
+      const note = section.querySelector("p")!;
+      expect(note.textContent).toBe(
+        "Enter also sends the editor's file name — not its text or cursor — or the lines selected there in Visual mode (up to 400 lines and 2000 characters). /model, /effort and the CLI's other local commands go without it.",
+      );
+      expect(section.querySelector("table")!.nextElementSibling).toBe(note);
+      // INPUT_KEYS, plus the four rows this section splices in (the pane chord, the prefix, `Ctrl+k`,
+      // `Ctrl+j`) -- the same count the whole-container test pins.
+      expect(section.querySelectorAll("tr")).toHaveLength(INPUT_KEYS.length + 4);
+    });
   });
 
   it("closes on a click on its own backdrop, not on a click inside a table", () => {

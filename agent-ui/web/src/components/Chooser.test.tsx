@@ -406,9 +406,12 @@ describe("Chooser", () => {
     fireEvent.keyDown(el(), { key: "g" });
     fireEvent.keyDown(el(), { key: "g" });
     expect(current()).toContain("New session");
-    // A lone `g` then another key is not `gg`.
+    // A lone `g` then another key is not `gg` -- and (R1, K01) that key is swallowed, not run: the `j`
+    // after the `g` moves nothing, and only the wait is over.
     fireEvent.keyDown(el(), { key: "j" });
     fireEvent.keyDown(el(), { key: "g" });
+    fireEvent.keyDown(el(), { key: "j" });
+    expect(current()).toContain("1 fix-parser");
     fireEvent.keyDown(el(), { key: "j" });
     expect(current()).toContain("2 legacy");
     expect(outer).not.toHaveBeenCalledWith(expect.objectContaining({ key: "g" }));
@@ -448,5 +451,202 @@ describe("Chooser", () => {
       expect(answerConfirm).toHaveBeenCalledTimes(1);
       expect(props.onCycleMode).not.toHaveBeenCalled();
     });
+  });
+});
+
+/** v1 picks, Task 10 (K03, R1, R12). K03 (kbux 2026-09-29, S07.4b): a filter that matched nothing left no
+ *  row under the cursor, `modeLine` read `row.kind` on `undefined`, and the throw took the whole panel
+ *  with it. The list keys are R12's `↓` `↑` `Ctrl+n` `Ctrl+p`; the chooser's own `g` follows R1. */
+describe("Chooser: K03 and the list keys (v1 picks R1, R12)", () => {
+  const currentRow = (c: HTMLElement) => c.querySelector(".chooser-row.current")?.textContent ?? null;
+  /** ↓ ↑ Ctrl+n Ctrl+p, as the four keydowns a real keyboard sends. */
+  const FOUR = [
+    { key: "ArrowDown" },
+    { key: "ArrowUp" },
+    { key: "n", ctrlKey: true },
+    { key: "p", ctrlKey: true },
+  ];
+  const nothingHappened = (props: ReturnType<typeof renderChooser>["props"]) => {
+    for (const fn of [props.onSwitch, props.onResume, props.onNewSession, props.onCloseTab, props.onRenameTab, props.onLeave]) {
+      expect(fn).not.toHaveBeenCalled();
+    }
+  };
+
+  it("K03: a filter matching nothing keeps the chooser drawn, and Esc still leaves", () => {
+    const { root, container, props } = renderChooser();
+    fireEvent.keyDown(root, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    fireEvent.change(filter, { target: { value: "zzz" } });
+    expect(container.querySelector(".chooser-empty")?.textContent).toBe("nothing matches");
+    fireEvent.keyDown(filter, { key: "Escape" });
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(props.onLeave).toHaveBeenCalled();
+  });
+
+  it("K03: with no row under the cursor the mode line is empty, and Enter, x, Ctrl+r and Shift+Tab choose nothing", () => {
+    const { root, container, props } = renderChooser();
+    fireEvent.keyDown(root, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    fireEvent.change(filter, { target: { value: "zzz" } });
+    fireEvent.keyDown(filter, { key: "Enter" }); // back to the list; the filter and its empty result stay
+    expect(container.querySelector(".chooser-empty")).not.toBeNull();
+    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("");
+    for (const init of [{ key: "Enter" }, { key: "x" }, { key: "r", ctrlKey: true }, { key: "Tab", shiftKey: true }]) {
+      fireEvent.keyDown(root, init);
+    }
+    nothingHappened(props);
+    expect(props.onCycleMode).not.toHaveBeenCalled();
+    expect(props.onCycleTabMode).not.toHaveBeenCalled();
+    expect(container.querySelector(".chooser-rename")).toBeNull();
+  });
+
+  it("K03: clearing the filter after an empty result leaves a row under the cursor, never none", () => {
+    const { root, container } = renderChooser();
+    fireEvent.keyDown(root, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    fireEvent.change(filter, { target: { value: "zzz" } });
+    fireEvent.keyDown(filter, { key: "Enter" });
+    fireEvent.keyDown(root, { key: "j" }); // on an empty list: used to leave the cursor at -1
+    fireEvent.keyDown(root, { key: "ArrowDown" });
+    fireEvent.keyDown(root, { key: "/" });
+    fireEvent.keyDown(container.querySelector(".chooser-filter")!, { key: "Escape" }); // clears the filter
+    expect(currentRow(container)).toContain("New session");
+  });
+
+  it("↓ ↑ Ctrl+n Ctrl+p move the list, from the list and from the filter (R12)", () => {
+    const { root, container, props } = renderChooser();
+    fireEvent.keyDown(root, { key: "ArrowDown" });
+    fireEvent.keyDown(root, { key: "Enter" });
+    expect(props.onSwitch).toHaveBeenLastCalledWith(1);
+    fireEvent.keyDown(root, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    fireEvent.keyDown(filter, { key: "n", ctrlKey: true }); // tab 1 -> tab 2
+    fireEvent.keyDown(filter, { key: "ArrowUp" }); // -> tab 1
+    fireEvent.keyDown(filter, { key: "ArrowDown" }); // -> tab 2, still in the filter
+    expect(document.activeElement).toBe(filter);
+    fireEvent.keyDown(filter, { key: "Enter" }); // leaves the filter
+    fireEvent.keyDown(root, { key: "Enter" });
+    expect(props.onSwitch).toHaveBeenLastCalledWith(2);
+  });
+
+  it("each of the four keys moves one row and stops at both ends, from the list", () => {
+    const { root, container } = renderChooser(); // rows: New session, tab 1, tab 2, held one, free one
+    const press = (init: Record<string, unknown>) => fireEvent.keyDown(root, init);
+    press({ key: "ArrowUp" });
+    press({ key: "p", ctrlKey: true });
+    expect(currentRow(container), "already on the first row").toContain("New session");
+    press({ key: "n", ctrlKey: true });
+    expect(currentRow(container)).toContain("1 fix-parser");
+    press({ key: "ArrowDown" });
+    expect(currentRow(container)).toContain("2 legacy");
+    press({ key: "ArrowDown" });
+    press({ key: "ArrowDown" });
+    expect(currentRow(container)).toContain("free one");
+    press({ key: "n", ctrlKey: true });
+    press({ key: "ArrowDown" });
+    expect(currentRow(container), "already on the last row").toContain("free one");
+    press({ key: "ArrowUp" });
+    expect(currentRow(container)).toContain("held one");
+    press({ key: "p", ctrlKey: true });
+    expect(currentRow(container)).toContain("2 legacy");
+  });
+
+  it("in the filter box the four keys are claimed and move the list, while j, k, n and p stay typed text", () => {
+    const { root, container } = renderChooser();
+    fireEvent.keyDown(root, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    for (const key of ["j", "k", "n", "p"]) {
+      expect(fireEvent.keyDown(filter, { key }), `${key} is left to the box`).toBe(true);
+    }
+    expect(currentRow(container)).toContain("New session");
+    for (const init of FOUR) expect(fireEvent.keyDown(filter, init), JSON.stringify(init)).toBe(false);
+    // down, up, down, up: back where it began.
+    expect(currentRow(container)).toContain("New session");
+  });
+
+  it("the four keys never reach the panel under the chooser, from the list or from the filter", () => {
+    const outer = vi.fn();
+    const { props, rerender } = renderChooser();
+    rerender(
+      <div onKeyDown={(e) => outer(e.key)}>
+        <Chooser {...props} />
+      </div>,
+    );
+    const el = () => document.querySelector<HTMLElement>(".chooser")!;
+    for (const init of FOUR) expect(fireEvent.keyDown(el(), init), JSON.stringify(init)).toBe(false);
+    fireEvent.keyDown(el(), { key: "/" });
+    const filter = document.querySelector<HTMLInputElement>(".chooser-filter")!;
+    for (const init of FOUR) fireEvent.keyDown(filter, init);
+    expect(outer).not.toHaveBeenCalled();
+  });
+
+  it("while a tab is being renamed the four keys are the text field's own", () => {
+    const { root, container } = renderChooser({ active: 1 });
+    fireEvent.keyDown(root, { key: "r", ctrlKey: true });
+    const field = container.querySelector<HTMLInputElement>(".chooser-rename")!;
+    for (const init of FOUR) expect(fireEvent.keyDown(field, init), JSON.stringify(init)).toBe(true);
+    // The rename field lives in the row under the cursor: it is still there, so the cursor never moved.
+    expect(container.querySelector(".chooser-row.current .chooser-rename")).toBe(field);
+  });
+
+  it("a bare n or p does nothing on the list: only Ctrl+n and Ctrl+p move it", () => {
+    const { root, container, props } = renderChooser({ active: 1 });
+    expect(fireEvent.keyDown(root, { key: "n" }), "n is not claimed").toBe(true);
+    expect(fireEvent.keyDown(root, { key: "p" }), "p is not claimed").toBe(true);
+    expect(currentRow(container)).toContain("1 fix-parser");
+    nothingHappened(props);
+  });
+
+  it("g then a key that is not g does nothing (R1)", () => {
+    const { root, props } = renderChooser();
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "x" });
+    expect(props.onCloseTab).not.toHaveBeenCalled();
+  });
+
+  it("g then anything but g ends the wait and runs nothing: Enter, Esc, q, /, x, G, ↓ and Ctrl+n", () => {
+    for (const init of [
+      { key: "Enter" },
+      { key: "Escape" },
+      { key: "q" },
+      { key: "/" },
+      { key: "x" },
+      { key: "G" },
+      { key: "ArrowDown" },
+      { key: "n", ctrlKey: true },
+    ]) {
+      const { root, container, props } = renderChooser({ active: 1 });
+      fireEvent.keyDown(root, { key: "g" });
+      expect(fireEvent.keyDown(root, init), `${JSON.stringify(init)} is claimed`).toBe(false);
+      expect(currentRow(container), JSON.stringify(init)).toContain("1 fix-parser");
+      expect(container.querySelector(".chooser-filter"), JSON.stringify(init)).toBeNull();
+      nothingHappened(props);
+      // The wait is over, not stuck: the next key is an ordinary one again.
+      fireEvent.keyDown(root, { key: "j" });
+      expect(currentRow(container), JSON.stringify(init)).toContain("2 legacy");
+      cleanup();
+    }
+  });
+
+  it("g then g still goes to the first row, with a bare modifier between them or not", () => {
+    const { root, container } = renderChooser({ active: 2 });
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "g" });
+    expect(currentRow(container)).toContain("New session");
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyDown(root, { key: "g" });
+    for (const key of ["Shift", "Control", "Alt", "Meta"]) fireEvent.keyDown(root, { key });
+    fireEvent.keyDown(root, { key: "g" });
+    expect(currentRow(container)).toContain("New session");
+  });
+
+  it("g, a bare modifier, then a key that is not g still cancels (a bare modifier is not the next key)", () => {
+    const { root, container, props } = renderChooser({ active: 1 });
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "Shift" });
+    fireEvent.keyDown(root, { key: "x" });
+    expect(props.onCloseTab).not.toHaveBeenCalled();
+    expect(currentRow(container)).toContain("1 fix-parser");
   });
 });

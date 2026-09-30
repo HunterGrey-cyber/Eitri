@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { noteKey } from "./heldSuper";
-import { BROWSE_KEYS, CARET_KEYS, INPUT_KEYS, VISUAL_KEYS, isPlainAnswerKey, resolveKey } from "./keymap";
+import { BROWSE_KEYS, CARET_KEYS, FIXED_PAIRS, INPUT_KEYS, VISUAL_KEYS, isPlainAnswerKey, resolveKey } from "./keymap";
 import type { KeyContext, KeyLike, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 
 const key = (
@@ -42,16 +42,26 @@ const key = (
 const ctx = { sessionEnded: false };
 
 /** Turns one `BROWSE_KEYS[i].keys` TOKEN (after splitting on " / ") into what a person actually
- *  pressed, per spec §3.3: a two-key sequence (`gg`, `[[`, `]]`) is its second key with the first
- *  held as `pending`; `Ctrl+x` -> Ctrl held with `x`; `G`/`?` -> Shift held (that is how both arrive
- *  on a real keyboard); `1-9` -> a single representative digit; anything else is the key on its own.
+ *  pressed, per spec §3.3: a two-key sequence (`gg`, `[[`, `]]`, and the `Ctrl+w` prefix's `Ctrl+w h`)
+ *  is its second key with the first held as `pending`; `Ctrl+x` -> Ctrl held with `x`; `G`/`?` ->
+ *  Shift held (that is how both arrive on a real keyboard); `1-9` -> a single representative digit;
+ *  anything else is the key on its own.
  *  Shared by both directions of the table <-> `resolveKey` correspondence below, so the two can
  *  never silently parse a token two different ways. */
 function parseKeyToken(token: string): { ev: KeyLike; pending?: PendingPrefix } {
+  // v1 picks, Task 6: `Ctrl+w h` is `h` with the `Ctrl+w` prefix waiting -- this must come ahead of the
+  // `Ctrl+` branch below, which would otherwise read it as Ctrl held with a key named "w h".
+  const cw = /^Ctrl\+w ([hjkl])$/.exec(token);
+  if (cw) return { ev: key(cw[1]), pending: "C-w" };
   if (/^[gz\[\]].$/.test(token)) return { ev: key(token[1]), pending: token[0] as PendingPrefix };
   if (token === "1-9") return { ev: key("3") };
+  // v1 picks, Task 5: the help row spells the arrow keys as their glyphs (`↓ / ↑`), the keyboard
+  // reports them as `ArrowDown`/`ArrowUp`.
+  if (token === "↓") return { ev: key("ArrowDown") };
+  if (token === "↑") return { ev: key("ArrowUp") };
   if (token.startsWith("Ctrl+")) return { ev: key(token.slice("Ctrl+".length), { ctrlKey: true }) };
-  if (/^[A-Z?]$/.test(token)) return { ev: key(token, { shiftKey: true }) };
+  // `:` too: Shift+; on most layouts (K02).
+  if (/^[A-Z?:]$/.test(token)) return { ev: key(token, { shiftKey: true }) };
   return { ev: key(token) };
 }
 
@@ -182,7 +192,10 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("a", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("U", { shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("G", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
-    expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toBeNull();
+    // v1 picks, Task 5 (decision #13): Ctrl+f was pinned unclaimed here; it is a page now (its own
+    // test below), so what stays refused is the same letter with any other modifier set. `Ctrl+b` is
+    // the tmux prefix, and stays unclaimed with it.
+    expect(resolveKey("browse", key("f", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("b", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("p", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("J", { shiftKey: true }), ctx)).toBeNull();
@@ -219,6 +232,48 @@ describe("resolveKey", () => {
     // BROWSE only: INPUT's own Ctrl+e (end of line) and Ctrl+y are the composer's.
     expect(resolveKey("input", key("e", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).toBeNull();
+  });
+
+  /* v1 picks, Task 5 (decision #13, ruling R10): vim's `Ctrl+f` and the keyboard's own PageDown/PageUp
+     scroll a view, and the arrow keys are `j`/`k`. `Ctrl+f` is checked ahead of the plain-key switch for
+     the reason Ctrl+d/Ctrl+e are -- a browser reports `key === "f"` for it as for the bare `f`, and a
+     bare `f` starts a HINT. `Ctrl+b` is the tmux prefix, so PageUp is the only way back a page. */
+  it("names Ctrl+f and PageDown as a page down, PageUp as a page up, and the arrows as j and k", () => {
+    const cases: Array<[string, KeyLike, unknown]> = [
+      ["Ctrl+f", key("f", { ctrlKey: true }), { kind: "page", delta: 1 }],
+      ["PageDown", key("PageDown"), { kind: "page", delta: 1 }],
+      ["PageUp", key("PageUp"), { kind: "page", delta: -1 }],
+      ["ArrowDown", key("ArrowDown"), { kind: "move", delta: 1 }],
+      ["ArrowUp", key("ArrowUp"), { kind: "move", delta: -1 }],
+    ];
+    for (const [name, ev, want] of cases) {
+      expect(resolveKey("browse", ev, ctx), name).toEqual(want);
+      // Reading a dead session's transcript is still reading it, as Ctrl+d/Ctrl+e are.
+      expect(resolveKey("browse", ev, { sessionEnded: true }), `${name}, session ended`).toEqual(want);
+      // BROWSE only: in the composer they are the text box's own (a caret line, a history walk).
+      expect(resolveKey("input", ev, ctx), `${name} in INPUT`).toBeNull();
+      // An input method composing owns the key (C4): its candidate list pages with these very keys.
+      expect(resolveKey("browse", { ...ev, isComposing: true }, ctx), `${name} composing`).toBeNull();
+      expect(resolveKey("browse", { ...ev, keyCode: 229 }, ctx), `${name} keyCode 229`).toBeNull();
+    }
+    // The arrows are exactly `j`/`k`: the same action, so the same tall-row scroll and the same count.
+    expect(resolveKey("browse", key("ArrowDown"), ctx)).toEqual(resolveKey("browse", key("j"), ctx));
+    expect(resolveKey("browse", key("ArrowUp"), ctx)).toEqual(resolveKey("browse", key("k"), ctx));
+    expect(resolveKey("browse", key("ArrowDown"), { ...ctx, count: 3 })).toEqual({ kind: "move", delta: 1 });
+    expect(resolveKey("browse", key("PageDown"), { ...ctx, count: 3 })).toEqual({ kind: "page", delta: 1 });
+    // And the bare `f` is still HINT.
+    expect(resolveKey("browse", key("f"), ctx)).toEqual({ kind: "hint" });
+  });
+
+  it("leaves the page and arrow keys unclaimed under Shift or Ctrl, and Ctrl+Shift+f, as before", () => {
+    for (const over of [{ shiftKey: true }, { ctrlKey: true }, { ctrlKey: true, shiftKey: true }]) {
+      for (const k of ["PageDown", "PageUp", "ArrowDown", "ArrowUp"]) {
+        expect(resolveKey("browse", key(k, over), ctx), `${k} ${JSON.stringify(over)}`).toBeNull();
+      }
+    }
+    expect(resolveKey("browse", key("f", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
+    // `Ctrl+b` is the prefix, so nothing here pages back with it.
+    expect(resolveKey("browse", key("b", { ctrlKey: true }), ctx)).toBeNull();
   });
 
   it("names Shift+Y and Shift+D ahead of the modifier refusal", () => {
@@ -266,17 +321,20 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("g"), ctx)).toEqual({ kind: "pending", prefix: "g" });
     expect(resolveKey("browse", key("g"), { ...ctx, pending: null })).toEqual({ kind: "pending", prefix: "g" });
     expect(resolveKey("browse", key("g"), { ...ctx, pending: "g" })).toEqual({ kind: "jump", to: "first" });
-    // A pending g changes nothing about any other key.
-    expect(resolveKey("browse", key("j"), { ...ctx, pending: "g" })).toEqual({ kind: "move", delta: 1 });
+    // K01 (X-A-11): this used to pin the K01 leak (`g`, then `j` moved as a bare `j`); a pending
+    // g's next key now completes one of its pairs or cancels, as vim's `nv_g_cmd` does.
+    expect(resolveKey("browse", key("j"), { ...ctx, pending: "g" })).toEqual({ kind: "cancel", why: "unbound" });
     expect(resolveKey("input", key("g"), { ...ctx, pending: "g" })).toBeNull();
   });
 
   it("starts a global HINT on f in BROWSE, and does not in INPUT", () => {
     expect(resolveKey("browse", key("f"), ctx)).toEqual({ kind: "hint" });
     expect(resolveKey("input", key("f"), ctx)).toBeNull();
-    // Ctrl+Shift+F is shell's app-level accelerator (GTK takes it first); a Ctrl+f that does reach
-    // the page is not claimed here, and neither is a Shift+F.
-    expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toBeNull();
+    // Ctrl+Shift+F is shell's app-level accelerator (GTK takes it first); a Ctrl+Shift+f that does
+    // reach the page is not claimed here, and neither is a Shift+F. v1 picks, Task 5 (decision #13):
+    // a plain Ctrl+f used to be pinned unclaimed here too; it is vim's page down now, and never a HINT.
+    expect(resolveKey("browse", key("f", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toEqual({ kind: "page", delta: 1 });
     expect(resolveKey("browse", key("F", { shiftKey: true }), ctx)).toBeNull();
   });
 
@@ -306,7 +364,8 @@ describe("resolveKey, phase 3", () => {
     expect(resolveKey("browse", key("["), { ...ctx, pending: "[" })).toEqual({ kind: "prompt-jump", delta: -1 });
     expect(resolveKey("browse", key("]"), { ...ctx, pending: "]" })).toEqual({ kind: "prompt-jump", delta: 1 });
     expect(resolveKey("browse", key("]"), { ...ctx, pending: "[" }), "a mismatched pair is nothing").toBeNull();
-    expect(resolveKey("browse", key("j"), { ...ctx, pending: "[" }), "any other key cancels the prefix").toEqual({ kind: "move", delta: 1 });
+    // K01: this used to pin the leak (`[` then `j` moved); any other key now cancels, swallowed.
+    expect(resolveKey("browse", key("j"), { ...ctx, pending: "[" }), "any other key cancels the prefix").toEqual({ kind: "cancel", why: "unbound" });
   });
 
   it("collects a count from 1-9, then 0-9", () => {
@@ -334,12 +393,74 @@ describe("resolveKey, phase 3", () => {
     expect(resolveKey("input", key("/"), ctx)).toBeNull();
   });
 
+  /* K02 (ruling R4): `:` opens a vim-style command line that runs nothing, so `:ls⏎`, `:l⏎` and
+     `:d⏎` can never reach a card. Matched on `key`, with or without Shift (AZERTY types it
+     unshifted); held with Ctrl, Alt or Meta it is not `:`. After a pending prefix it cancels (K01),
+     INPUT types it, and CARET/VISUAL still end on it (D12). */
+  it("opens the : command line in BROWSE with or without Shift, and nowhere else (K02)", () => {
+    expect(resolveKey("browse", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "ex-line" });
+    expect(resolveKey("browse", key(":"), ctx)).toEqual({ kind: "ex-line" });
+    for (const over of [{ ctrlKey: true }, { altKey: true }, { metaKey: true }]) {
+      expect(resolveKey("browse", key(":", { shiftKey: true, ...over }), ctx), JSON.stringify(over)).toBeNull();
+      expect(resolveKey("browse", key(":", over), ctx), JSON.stringify(over)).toBeNull();
+    }
+    expect(resolveKey("input", key(":", { shiftKey: true }), ctx)).toBeNull();
+    expect(resolveKey("input", key(":"), ctx)).toBeNull();
+    // An input method's own key is never a command (C4), by either signal.
+    expect(resolveKey("browse", key(":", { shiftKey: true, isComposing: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key(":", { shiftKey: true, keyCode: 229 }), ctx)).toBeNull();
+    expect(resolveKey("browse", key(":", { shiftKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "cancel", why: "unbound" });
+    expect(resolveKey("caret", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "vend", key: ":" });
+    expect(resolveKey("visual", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "vend", key: ":" });
+  });
+
   it("toggles the detailed view on Ctrl+o in both modes, and scrolls a table on zh / zl", () => {
     expect(resolveKey("browse", key("o", { ctrlKey: true }), ctx)).toEqual({ kind: "detailed" });
     expect(resolveKey("input", key("o", { ctrlKey: true }), ctx)).toEqual({ kind: "detailed" });
     expect(resolveKey("browse", key("z"), ctx)).toEqual({ kind: "pending", prefix: "z" });
     expect(resolveKey("browse", key("h"), { ...ctx, pending: "z" })).toEqual({ kind: "table-scroll", delta: -1 });
     expect(resolveKey("browse", key("l"), { ...ctx, pending: "z" })).toEqual({ kind: "table-scroll", delta: 1 });
+  });
+
+  /* v1 picks, Task 4 (vim `:help zt`/`zz`/`zb` and `:help za`/`zo`/`zc`): six more pairs `z` completes,
+     each one row of `FIXED_PAIRS` -- so K01's rule holds for them without a line of its own: after
+     `z` the key completes a pair or cancels, and none of these ever falls through to its own
+     meaning (`za`/`zo` are not an answer key and a new session, `zc`/`zb` not a copy or a move). */
+  it("zt / zz / zb put the cursor's row at the top / middle / bottom, and za / zo / zc fold (Task 4)", () => {
+    const z = { ...ctx, pending: "z" as const };
+    expect(resolveKey("browse", key("t"), z)).toEqual({ kind: "scroll-row", where: "top" });
+    expect(resolveKey("browse", key("z"), z)).toEqual({ kind: "scroll-row", where: "center" });
+    expect(resolveKey("browse", key("b"), z)).toEqual({ kind: "scroll-row", where: "bottom" });
+    expect(resolveKey("browse", key("a"), z)).toEqual({ kind: "toggle-expand" });
+    expect(resolveKey("browse", key("o"), z)).toEqual({ kind: "fold", open: true });
+    expect(resolveKey("browse", key("c"), z)).toEqual({ kind: "fold", open: false });
+  });
+
+  /* A pair's key completes it bare, never under Ctrl or Shift (vim's `zA`/`zO`/`zC` are the recursive
+     variants, not built), so those cancel the `z` instead of running the pair -- and Shift+`a` is never
+     `za`. K01 fix round 2: Alt and Meta are read as `z` itself is read, which arms with them held, so
+     they complete the pair as the bare key does (K01's own "reads Alt and Meta" test). */
+  it("does not complete zt / zz / zb / za / zo / zc with Ctrl or Shift held: it cancels; Alt or Meta complete them", () => {
+    const z = { ...ctx, pending: "z" as const };
+    for (const k of ["t", "z", "b", "a", "o", "c"]) {
+      for (const over of [{ ctrlKey: true }, { shiftKey: true }]) {
+        // Ctrl+c alone keeps D1's meaning after a prefix (idle: unclaimed), as K01's own tests pin.
+        const idleCtrlC = k === "c" && over.ctrlKey === true;
+        expect(resolveKey("browse", key(k, over), z), `z ${k} with ${JSON.stringify(over)}`).toEqual(
+          idleCtrlC ? null : { kind: "cancel", why: "unbound" },
+        );
+      }
+      for (const over of [{ altKey: true }, { metaKey: true }])
+        expect(resolveKey("browse", key(k, over), z), `z ${k} with ${JSON.stringify(over)}`).toEqual(resolveKey("browse", key(k), z));
+    }
+  });
+
+  /* The six pairs are BROWSE-only: CARET/VISUAL never read a pending BROWSE prefix, and INPUT ignores
+     it, so a `z` typed there stays exactly what it was. */
+  it("leaves zt / zb / za / zo / zc alone in INPUT, where the pending prefix is never read", () => {
+    for (const k of ["t", "b", "a", "o", "c"]) {
+      expect(resolveKey("input", key(k), { ...ctx, pending: "z" }), k).toBeNull();
+    }
   });
 
   it("gives every key to the input method while it composes, in BROWSE too (C4)", () => {
@@ -377,11 +498,315 @@ describe("resolveKey with a panel table (panel round 2 plan, Task 7)", () => {
     const gT: PanelBinding = { keys: ["g", "T"], action: "tab.prev", desc: "previous tab", source: "default" };
     const table: PanelTable = { ...TABLE, bindings: [...TABLE.bindings, gT] };
     expect(resolveKey("browse", key("T", { shiftKey: true }), { ...ctx, pending: "g", table })).toEqual({ kind: "panel", binding: gT });
-    expect(resolveKey("browse", key("T", { ctrlKey: true, shiftKey: true }), { ...ctx, pending: "g", table })).toBeNull();
+    // K01: this used to pin the leak as `null` (unclaimed, so the chord reached whatever took it
+    // next); a Ctrl chord still never completes a pair, and now cancels the pending `g` instead.
+    expect(resolveKey("browse", key("T", { ctrlKey: true, shiftKey: true }), { ...ctx, pending: "g", table })).toEqual({ kind: "cancel", why: "unbound" });
     expect(resolveKey("input", key("T", { shiftKey: true }), { ...ctx, pending: "g", table })).toBeNull();
   });
-  it("resolves to null for [b without a table, exactly as today", () => {
-    expect(resolveKey("browse", key("b"), { ...ctx, pending: "[" })).toBeNull();
+  /* K01: this used to pin the leak -- `[b` with no table resolved to `null`, unclaimed. With no pair
+     for `b` under `[`, the key now cancels the prefix, swallowed, like any other non-pair key. */
+  it("cancels [b without a table (pinned the K01 leak until X-A-11)", () => {
+    expect(resolveKey("browse", key("b"), { ...ctx, pending: "[" })).toEqual({ kind: "cancel", why: "unbound" });
+  });
+});
+
+/* K01 (= X-A-11, kbux 2026-09-29): `g`, a pause, then `d` denied the card under the cursor -- a
+   reserved prefix's second key fell through to its own meaning whenever it completed no pair. vim
+   waits for a prefix's second key with no timeout and ends the command on a key it does not know
+   (`nv_g_cmd`, `nv_zet`, `nv_brackets`: `clearopbeep`); so does this table now (ruling R1). */
+describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs or cancels", () => {
+  // v1 picks, Task 5: the page and arrow keys are keys of their own now, and a prefix's next key
+  // never runs as itself -- `g`, a pause, PageDown pages nothing.
+  // v1 picks, Task 7: `p` too -- `gp`, `zp` and `Ctrl+w p` cancel, while `[p`/`]p` are pairs (skipped below).
+  // Task 8: and `x` -- `zx`, `[x`, `]x` and `Ctrl+w x` cancel, while `gx` is a pair.
+  const OTHER = ["a", "d", "j", "k", "i", "o", "y", "r", "n", "p", "x", "Enter", " ", "Escape", "3", "0", "/", "ArrowDown", "ArrowUp", "PageDown", "PageUp"];
+  it("never falls through to the key's own meaning", () => {
+    // v1 picks, Task 6: `Ctrl+w` is the fifth reserved prefix, and follows the same rule.
+    for (const prefix of ["g", "z", "[", "]", "C-w"] as const)
+      for (const k of OTHER) {
+        if (FIXED_PAIRS[prefix][k] !== undefined) continue;
+        expect(resolveKey("browse", key(k), { ...ctx, pending: prefix }), `${prefix} ${JSON.stringify(k)}`).toEqual({ kind: "cancel", why: "unbound" });
+      }
+  });
+  it("cancels Shift and Alt keys too: g D is never the reason box, g G never the last row", () => {
+    expect(resolveKey("browse", key("D", { shiftKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "cancel", why: "unbound" });
+    expect(resolveKey("browse", key("G", { shiftKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "cancel", why: "unbound" });
+    expect(resolveKey("browse", key("a", { altKey: true }), { ...ctx, pending: "]" })).toEqual({ kind: "cancel", why: "unbound" });
+  });
+  it("keeps every pair, gv's reservation, [] and Ctrl+c's own meaning, and waits through a bare modifier", () => {
+    expect(resolveKey("browse", key("g"), { ...ctx, pending: "g" })).toEqual({ kind: "jump", to: "first" });
+    expect(resolveKey("browse", key("f"), { ...ctx, pending: "g" })).toEqual({ kind: "open-path" });
+    expect(resolveKey("browse", key("v"), { ...ctx, pending: "g" })).toBeNull();
+    expect(resolveKey("browse", key("]"), { ...ctx, pending: "[" })).toBeNull();
+    expect(resolveKey("browse", key("c", { ctrlKey: true }), { ...ctx, pending: "g", turnRunning: true })).toEqual({ kind: "interrupt" });
+    expect(resolveKey("browse", key("Shift", { shiftKey: true }), { ...ctx, pending: "g" })).toBeNull();
+  });
+  it("refuses a, d and D after a count, and leaves j a counted move", () => {
+    for (const ev of [key("a"), key("d"), key("D", { shiftKey: true })])
+      expect(resolveKey("browse", ev, { ...ctx, count: 3 })).toEqual({ kind: "cancel", why: "count-on-answer" });
+    expect(resolveKey("browse", key("j"), { ...ctx, count: 3 })).toEqual({ kind: "move", delta: 1 });
+  });
+  /* Fix round 1 (review): `Ctrl+o` was matched ahead of the pending-prefix check, so `g` then
+     Ctrl+o toggled the detailed view. Every chord but Ctrl+c (D1) cancels a waiting prefix; INPUT
+     never reads one, so its own Ctrl+o is untouched. */
+  it("cancels every chord but Ctrl+c: g Ctrl+o never toggles the detailed view", () => {
+    // v1 picks, Task 6: `Ctrl+w` is a chord now (so `g Ctrl+w` cancels the `g` and arms nothing), and
+    // a prefix of its own (`Ctrl+w Ctrl+w` cancels, as `Ctrl+w Ctrl+o` does).
+    for (const prefix of ["g", "z", "[", "]", "C-w"] as const)
+      for (const k of ["o", "d", "u", "e", "y", "g", "f", "w"])
+        expect(resolveKey("browse", key(k, { ctrlKey: true }), { ...ctx, pending: prefix }), `${prefix} Ctrl+${k}`).toEqual({
+          kind: "cancel",
+          why: "unbound",
+        });
+    expect(resolveKey("browse", key("o", { ctrlKey: true }), ctx)).toEqual({ kind: "detailed" });
+    expect(resolveKey("input", key("o", { ctrlKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "detailed" });
+  });
+  /* Fix round 2 (review): the first key arms a prefix with Alt or Meta held (the blanket refusal
+     reads only Ctrl and Shift), but the second key completed a pair only with neither held. So a
+     pair typed with either on both keys cancelled where it had always completed. On a layout that
+     types a bracket with Option (macOS German, French, Swiss), that is how `[[` and `]]` are typed.
+     The two halves now read Alt and Meta the same way: not at all. A key that completes no pair
+     still cancels, whatever it holds, and Ctrl or Shift still never complete a fixed pair. */
+  it("reads Alt and Meta on a pair's second key as its first key does: [[ typed with Option still jumps", () => {
+    for (const over of [{ altKey: true }, { metaKey: true }]) {
+      const held = JSON.stringify(over);
+      for (const prefix of ["g", "z", "[", "]"] as const) {
+        expect(resolveKey("browse", key(prefix, over), ctx), `${held} ${prefix} arms`).toEqual({ kind: "pending", prefix });
+        for (const [k, pair] of Object.entries(FIXED_PAIRS[prefix]))
+          expect(resolveKey("browse", key(k, over), { ...ctx, pending: prefix }), `${prefix} then ${held} ${k}`).toEqual(pair);
+      }
+      // gv's reservation and a mismatched bracket pair stay nothing, as they were before K01.
+      expect(resolveKey("browse", key("v", over), { ...ctx, pending: "g" }), `g then ${held} v`).toBeNull();
+      expect(resolveKey("browse", key("]", over), { ...ctx, pending: "[" }), `[ then ${held} ]`).toBeNull();
+      expect(resolveKey("browse", key("[", over), { ...ctx, pending: "]" }), `] then ${held} [`).toBeNull();
+      for (const [prefix, k] of [["]", "a"], ["g", "d"], ["[", "j"], ["z", "i"]] as const)
+        expect(resolveKey("browse", key(k, over), { ...ctx, pending: prefix }), `${prefix} then ${held} ${k}`).toEqual({
+          kind: "cancel",
+          why: "unbound",
+        });
+    }
+    for (const over of [{ ctrlKey: true }, { shiftKey: true }])
+      expect(resolveKey("browse", key("[", over), { ...ctx, pending: "[" }), JSON.stringify(over)).toEqual({ kind: "cancel", why: "unbound" });
+  });
+});
+
+/* v1 picks, Task 6 (ruling R11): vim's `CTRL-W h/j/k/l` -- the window that way -- as the module that way.
+   `Ctrl+w` is a reserved prefix like `g`/`z`/`[`/`]`: it waits for its next key with no timeout, and
+   that key completes one of the four pairs or cancels (K01, ruling R1), so `Ctrl+w`, a pause, `d` can
+   never deny a card. A pair is one action, `pane`, which `App.tsx` posts to shell as `pane_nav`;
+   `resolveKey` only names the direction. BROWSE only: the composer's `Ctrl+w` (delete a word) and
+   CARET/VISUAL's swallowing of every chord are untouched. */
+describe("Ctrl+w h/j/k/l: the module that way (v1 picks, Task 6, R11)", () => {
+  const ctrlW = key("w", { ctrlKey: true });
+  const PAIRS = [
+    ["h", "left"],
+    ["j", "down"],
+    ["k", "up"],
+    ["l", "right"],
+  ] as const;
+
+  it("arms a prefix on a plain Ctrl+w, on a live session and on one that ended", () => {
+    expect(resolveKey("browse", ctrlW, ctx)).toEqual({ kind: "pending", prefix: "C-w" });
+    // A dead session's transcript is still a BROWSE panel with modules around it, as for Ctrl+d.
+    expect(resolveKey("browse", ctrlW, { sessionEnded: true })).toEqual({ kind: "pending", prefix: "C-w" });
+    // A count typed before it is the caller's to carry to the second key (`case "pending"`).
+    expect(resolveKey("browse", ctrlW, { ...ctx, count: 3 })).toEqual({ kind: "pending", prefix: "C-w" });
+  });
+
+  it("does not arm on any other Ctrl+w chord, nor on w alone", () => {
+    for (const over of [
+      { ctrlKey: true, shiftKey: true },
+      { ctrlKey: true, altKey: true },
+      { ctrlKey: true, metaKey: true },
+      { ctrlKey: true, superKey: true },
+      { ctrlKey: true, hyperKey: true },
+      { ctrlKey: true, altGraphKey: true },
+    ])
+      expect(resolveKey("browse", key("w", over), ctx), JSON.stringify(over)).toBeNull();
+    expect(resolveKey("browse", key("w"), ctx), "bare w is not a BROWSE key").toBeNull();
+    expect(resolveKey("browse", key("W", { shiftKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("w", { altKey: true }), ctx)).toBeNull();
+  });
+
+  it("completes h, j, k and l to a pane move: left, down, up, right", () => {
+    for (const [k, direction] of PAIRS) {
+      expect(resolveKey("browse", key(k), { ...ctx, pending: "C-w" }), `Ctrl+w ${k}`).toEqual({ kind: "pane", direction });
+      // The move does not need a live session either, and a count typed before the prefix is ignored.
+      expect(resolveKey("browse", key(k), { sessionEnded: true, pending: "C-w" }), `Ctrl+w ${k}, ended`).toEqual({ kind: "pane", direction });
+      expect(resolveKey("browse", key(k), { ...ctx, pending: "C-w", count: 3 }), `3 Ctrl+w ${k}`).toEqual({ kind: "pane", direction });
+    }
+  });
+
+  it("knows exactly those four pairs", () => {
+    expect(Object.keys(FIXED_PAIRS["C-w"]).sort()).toEqual(["h", "j", "k", "l"]);
+  });
+
+  /* K01, for this prefix: any other key -- the card-answer keys above all -- is swallowed, and runs
+     nothing as itself. Ctrl held on the second key (Ctrl+w Ctrl+l) is a chord, which cancels as every
+     chord does: shell claims Ctrl+l itself, before the page (`nav_key`), and drops the prefix. */
+  it("cancels every other key, so Ctrl+w then d is never a deny", () => {
+    for (const k of ["a", "d", "i", "o", "y", "r", "n", "f", "g", "w", "Enter", " ", "Escape", "3", "/", "ArrowDown", "PageDown"])
+      expect(resolveKey("browse", key(k), { ...ctx, pending: "C-w" }), `Ctrl+w ${JSON.stringify(k)}`).toEqual({ kind: "cancel", why: "unbound" });
+    for (const [k, over] of [
+      ["D", { shiftKey: true }],
+      ["H", { shiftKey: true }],
+      ["L", { shiftKey: true }],
+      ["l", { ctrlKey: true }],
+      ["h", { ctrlKey: true }],
+      ["j", { ctrlKey: true, shiftKey: true }],
+    ] as const)
+      expect(resolveKey("browse", key(k, over), { ...ctx, pending: "C-w" }), `Ctrl+w ${k} ${JSON.stringify(over)}`).toEqual({ kind: "cancel", why: "unbound" });
+    // A count typed after the prefix is not a pair either.
+    expect(resolveKey("browse", key("3"), { ...ctx, pending: "C-w" })).toEqual({ kind: "cancel", why: "unbound" });
+  });
+
+  it("waits through a bare modifier, and keeps Ctrl+c's own meaning after it", () => {
+    for (const k of ["Control", "Shift", "Alt", "Meta"])
+      expect(resolveKey("browse", key(k, { ctrlKey: k === "Control" }), { ...ctx, pending: "C-w" }), k).toBeNull();
+    expect(resolveKey("browse", key("c", { ctrlKey: true }), { ...ctx, pending: "C-w", turnRunning: true })).toEqual({ kind: "interrupt" });
+    expect(resolveKey("browse", key("c", { ctrlKey: true }), { ...ctx, pending: "C-w" })).toBeNull();
+  });
+
+  it("gives the key to an input method that is composing, after the prefix too (C4)", () => {
+    expect(resolveKey("browse", key("w", { ctrlKey: true, isComposing: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("w", { ctrlKey: true, keyCode: 229 }), ctx)).toBeNull();
+    for (const [k] of PAIRS) {
+      expect(resolveKey("browse", key(k, { isComposing: true }), { ...ctx, pending: "C-w" }), k).toBeNull();
+      expect(resolveKey("browse", key(k, { keyCode: 229 }), { ...ctx, pending: "C-w" }), k).toBeNull();
+    }
+  });
+
+  it("leaves INPUT and the selecting modes alone: Ctrl+w is the composer's, and CARET/VISUAL swallow it", () => {
+    expect(resolveKey("input", ctrlW, ctx), "the composer deletes a word").toBeNull();
+    for (const [k] of PAIRS) expect(resolveKey("input", key(k), { ...ctx, pending: "C-w" }), `INPUT never reads a prefix: ${k}`).toBeNull();
+    for (const mode of ["caret", "visual", "vline"] as const)
+      expect(resolveKey(mode, ctrlW, ctx), mode).toEqual({ kind: "vswallow" });
+  });
+
+  it("names the four pairs in one help row, tied to resolveKey by the round trip below", () => {
+    expect(BROWSE_KEYS).toContainEqual({
+      keys: "Ctrl+w h / Ctrl+w j / Ctrl+w k / Ctrl+w l",
+      what: "The keys to the module that way, as Ctrl+h/j/k/l; Ctrl+w j is the module below, never the box",
+    });
+  });
+});
+
+/* v1 picks, Task 7 (ruling R7): `]p` / `[p` -- vim's bracket pairs for "next / previous", here the next /
+   previous card waiting for an answer (nvim's own `]d` / `[d` are the model: they wrap). `resolveKey` only
+   names the motion, `{ kind: "card-jump", delta }`; which cards wait, and where the cursor goes, is
+   `App.tsx`'s (it knows the timeline, the answered ones and whether the session ended). It moves the
+   cursor and answers nothing: a lone `a` afterwards answers the card it landed on, S1 unchanged. */
+describe("]p / [p: the next / previous waiting card (v1 picks, Task 7, R7)", () => {
+  it("completes ] p to a forward jump and [ p to a backward one", () => {
+    expect(resolveKey("browse", key("p"), { ...ctx, pending: "]" })).toEqual({ kind: "card-jump", delta: 1 });
+    expect(resolveKey("browse", key("p"), { ...ctx, pending: "[" })).toEqual({ kind: "card-jump", delta: -1 });
+  });
+
+  it("is a motion, whatever the session or a count: App decides what waits", () => {
+    for (const [prefix, delta] of [["]", 1], ["[", -1]] as const) {
+      expect(resolveKey("browse", key("p"), { sessionEnded: true, pending: prefix }), `${prefix}p, ended`).toEqual({ kind: "card-jump", delta });
+      expect(resolveKey("browse", key("p"), { ...ctx, pending: prefix, count: 3 }), `3${prefix}p`).toEqual({ kind: "card-jump", delta });
+      expect(resolveKey("browse", key("p"), { ...ctx, pending: prefix, turnRunning: true }), `${prefix}p, running`).toEqual({ kind: "card-jump", delta });
+    }
+  });
+
+  it("reads Alt and Meta on the p as the other pairs do (a bracket typed with Option), and Ctrl or Shift never", () => {
+    for (const over of [{ altKey: true }, { metaKey: true }])
+      expect(resolveKey("browse", key("p", over), { ...ctx, pending: "]" }), JSON.stringify(over)).toEqual({ kind: "card-jump", delta: 1 });
+    expect(resolveKey("browse", key("p", { ctrlKey: true }), { ...ctx, pending: "]" })).toEqual({ kind: "cancel", why: "unbound" });
+    expect(resolveKey("browse", key("P", { shiftKey: true }), { ...ctx, pending: "]" })).toEqual({ kind: "cancel", why: "unbound" });
+    expect(resolveKey("browse", key("P", { shiftKey: true }), { ...ctx, pending: "[" })).toEqual({ kind: "cancel", why: "unbound" });
+  });
+
+  it("gives the p to an input method that is composing, on either bracket", () => {
+    for (const pending of ["[", "]"] as const) {
+      expect(resolveKey("browse", key("p", { isComposing: true }), { ...ctx, pending }), pending).toBeNull();
+      expect(resolveKey("browse", key("p", { keyCode: 229 }), { ...ctx, pending }), pending).toBeNull();
+    }
+  });
+
+  it("is BROWSE's: INPUT never reads a prefix, and CARET/VISUAL end at the bracket", () => {
+    expect(resolveKey("input", key("p"), { ...ctx, pending: "]" })).toBeNull();
+    expect(resolveKey("input", key("p"), { ...ctx, pending: "[" })).toBeNull();
+    for (const mode of ["caret", "visual", "vline"] as const) {
+      expect(resolveKey(mode, key("]"), ctx), `${mode} ]`).toEqual({ kind: "vend", key: "]" });
+      expect(resolveKey(mode, key("["), ctx), `${mode} [`).toEqual({ kind: "vend", key: "[" });
+    }
+  });
+
+  it("is the pair of two brackets only: gp, zp and Ctrl+w p cancel, and a bare p is not a BROWSE key", () => {
+    for (const prefix of ["g", "z", "C-w"] as const)
+      expect(resolveKey("browse", key("p"), { ...ctx, pending: prefix }), `${prefix} p`).toEqual({ kind: "cancel", why: "unbound" });
+    expect(resolveKey("browse", key("p"), ctx)).toBeNull();
+    expect(Object.keys(FIXED_PAIRS["["]).sort()).toEqual(["[", "p"]);
+    expect(Object.keys(FIXED_PAIRS["]"]).sort()).toEqual(["]", "p"]);
+    // The mismatched bracket pair stays nothing, as before.
+    expect(resolveKey("browse", key("]"), { ...ctx, pending: "[" })).toBeNull();
+  });
+
+  it("leaves a table pair under the same bracket alone: [b still reaches the panel table, and [p the card jump", () => {
+    expect(resolveKey("browse", key("b"), { ...ctx, pending: "[", table: TABLE })).toEqual({ kind: "panel", binding: TABLE.bindings[0] });
+    expect(resolveKey("browse", key("p"), { ...ctx, pending: "[", table: TABLE })).toEqual({ kind: "card-jump", delta: -1 });
+    expect(resolveKey("browse", key("p"), { ...ctx, pending: "]", table: TABLE })).toEqual({ kind: "card-jump", delta: 1 });
+  });
+
+  it("names both keys in one help row, tied to resolveKey by the round trips below", () => {
+    expect(BROWSE_KEYS).toContainEqual({
+      keys: "]p / [p",
+      what: "Next / previous card waiting for an answer (wraps; the cursor moves, nothing is answered)",
+    });
+  });
+});
+
+/* v1 picks, Task 8 (ruling R6): `gx` -- vim's "open the link under the cursor", here the web link(s) of the
+   row under the cursor. `resolveKey` only names the action, `{ kind: "open-link" }`; which links the row
+   holds, and whether one opens at once or waits for a letter, is `App.tsx`'s (it has the DOM). It is a
+   pair of the `g` prefix like `gf`, so K01's rule holds for it without a line of its own. */
+describe("gx: open this row's web link (v1 picks, Task 8, R6)", () => {
+  it("completes g x to the open-link action, whatever the session or a count", () => {
+    expect(resolveKey("browse", key("x"), { ...ctx, pending: "g" })).toEqual({ kind: "open-link" });
+    // Like `gf`: an ended session still has links to open, and a count is ignored by App, not refused here.
+    expect(resolveKey("browse", key("x"), { sessionEnded: true, pending: "g" })).toEqual({ kind: "open-link" });
+    expect(resolveKey("browse", key("x"), { ...ctx, pending: "g", count: 3 })).toEqual({ kind: "open-link" });
+    expect(resolveKey("browse", key("x"), { ...ctx, pending: "g", turnRunning: true })).toEqual({ kind: "open-link" });
+  });
+
+  it("reads Alt and Meta on the x as the other pairs do, and Ctrl or Shift never", () => {
+    for (const over of [{ altKey: true }, { metaKey: true }])
+      expect(resolveKey("browse", key("x", over), { ...ctx, pending: "g" }), JSON.stringify(over)).toEqual({ kind: "open-link" });
+    expect(resolveKey("browse", key("x", { ctrlKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "cancel", why: "unbound" });
+    expect(resolveKey("browse", key("X", { shiftKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "cancel", why: "unbound" });
+  });
+
+  it("gives the x to an input method that is composing", () => {
+    expect(resolveKey("browse", key("x", { isComposing: true }), { ...ctx, pending: "g" })).toBeNull();
+    expect(resolveKey("browse", key("x", { keyCode: 229 }), { ...ctx, pending: "g" })).toBeNull();
+  });
+
+  it("is a pair of g alone: zx, [x, ]x and Ctrl+w x cancel, and a bare x is not a BROWSE key", () => {
+    for (const prefix of ["z", "[", "]", "C-w"] as const)
+      expect(resolveKey("browse", key("x"), { ...ctx, pending: prefix }), `${prefix} x`).toEqual({ kind: "cancel", why: "unbound" });
+    expect(resolveKey("browse", key("x"), ctx)).toBeNull();
+    expect(Object.keys(FIXED_PAIRS.g).sort()).toEqual(["f", "g", "x"]);
+  });
+
+  it("is BROWSE's: INPUT never reads a prefix, and CARET/VISUAL end the region on the x", () => {
+    expect(resolveKey("input", key("x"), { ...ctx, pending: "g" })).toBeNull();
+    for (const mode of ["caret", "visual", "vline"] as const) {
+      // A region has no `gx`: its own `g` arms its own marker (`gg`), and any key it does not bind ends it.
+      expect(resolveKey(mode, key("x"), { ...ctx, pending: "g" }), `${mode} g x`).toEqual({ kind: "vend", key: "x" });
+      expect(resolveKey(mode, key("x"), ctx), `${mode} x`).toEqual({ kind: "vend", key: "x" });
+    }
+  });
+
+  it("names the key in a help row after gf's, and reads the HINT row as reaching links too", () => {
+    const keys = BROWSE_KEYS.map((row) => row.keys);
+    expect(keys.indexOf("gx")).toBe(keys.indexOf("gf") + 1);
+    expect(BROWSE_KEYS).toContainEqual({
+      keys: "gx",
+      what: "Open this row's web link (several, or a titled one: pick by letter, each shown in full)",
+    });
+    expect(BROWSE_KEYS).toContainEqual({ keys: "f", what: "HINT: jump anywhere in the window (links too; Enter opens one)" });
   });
 });
 
@@ -396,7 +821,11 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
         // `turnRunning: true` so `Ctrl+c`'s own row -- idle it resolves to nothing at all -- still
         // proves it does something, the same reason `sessionEnded` is set for `r`'s row below.
         const localCtx: KeyContext = { sessionEnded: token === "r", pending, turnRunning: true };
-        expect(resolveKey("browse", ev, localCtx), `"${token}" (from "${keys}")`).not.toBeNull();
+        const result = resolveKey("browse", ev, localCtx);
+        expect(result, `"${token}" (from "${keys}")`).not.toBeNull();
+        // K01: a key after a pending prefix that completes no pair resolves to `cancel` -- claimed, so
+        // not `null`, yet it does nothing. A row for such a key would promise what the table refuses.
+        expect(result?.kind, `"${token}" (from "${keys}") only cancels the prefix`).not.toBe("cancel");
       }
     }
   });
@@ -421,17 +850,42 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
       { token: "Ctrl+u", ev: key("u", { ctrlKey: true }) },
       { token: "Ctrl+e", ev: key("e", { ctrlKey: true }) },
       { token: "Ctrl+y", ev: key("y", { ctrlKey: true }) },
+      // v1 picks, Task 5: a page, and the arrow keys as `j`/`k` -- each must be spelled by a row.
+      { token: "Ctrl+f", ev: key("f", { ctrlKey: true }) },
+      { token: "PageDown", ev: key("PageDown") },
+      { token: "PageUp", ev: key("PageUp") },
+      { token: "↓", ev: key("ArrowDown") },
+      { token: "↑", ev: key("ArrowUp") },
       { token: "gg", ev: key("g"), pending: "g" },
       { token: "1-9", ev: key("3") },
       { token: "[[", ev: key("["), pending: "[" },
       { token: "]]", ev: key("]"), pending: "]" },
+      // v1 picks, Task 7 (R7): the next / previous waiting card -- one row, two tokens.
+      { token: "]p", ev: key("p"), pending: "]" },
+      { token: "[p", ev: key("p"), pending: "[" },
       { token: "Ctrl+c", ev: key("c", { ctrlKey: true }) },
       { token: "/", ev: key("/") },
+      { token: ":", ev: key(":", { shiftKey: true }) },
       { token: "N", ev: key("N", { shiftKey: true }) },
       { token: "Ctrl+o", ev: key("o", { ctrlKey: true }) },
       { token: "zh", ev: key("h"), pending: "z" },
       { token: "zl", ev: key("l"), pending: "z" },
+      // v1 picks, Task 4: the six pairs beyond `zh`/`zl` -- each a row of `FIXED_PAIRS`, so each must
+      // be spelled by a BROWSE_KEYS row (`zt / zz / zb`, `za / zo / zc`).
+      { token: "zt", ev: key("t"), pending: "z" },
+      { token: "zz", ev: key("z"), pending: "z" },
+      { token: "zb", ev: key("b"), pending: "z" },
+      { token: "za", ev: key("a"), pending: "z" },
+      { token: "zo", ev: key("o"), pending: "z" },
+      { token: "zc", ev: key("c"), pending: "z" },
       { token: "gf", ev: key("f"), pending: "g" },
+      // v1 picks, Task 8 (R6): open this row's web link -- a row of `BROWSE_KEYS`, beside `gf`'s.
+      { token: "gx", ev: key("x"), pending: "g" },
+      // v1 picks, Task 6: the four pairs `Ctrl+w` completes -- each spelled by the one row's tokens.
+      { token: "Ctrl+w h", ev: key("h"), pending: "C-w" },
+      { token: "Ctrl+w j", ev: key("j"), pending: "C-w" },
+      { token: "Ctrl+w k", ev: key("k"), pending: "C-w" },
+      { token: "Ctrl+w l", ev: key("l"), pending: "C-w" },
       { token: "Ctrl+g", ev: key("g", { ctrlKey: true }) },
       // A key named only by the panel's own which-key table (Task 7): the overlay's new section
       // (Task 8) names it, not BROWSE_KEYS, so it must resolve without needing a row here.

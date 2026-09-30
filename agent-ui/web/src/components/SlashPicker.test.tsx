@@ -52,6 +52,46 @@ describe("SlashPicker (owner trial item 2)", () => {
     expect(container.querySelector(".slash-picker-row.current")!.textContent).toContain("sonnet");
   });
 
+  /** v1 picks Task 10 (R12; idiom matrix P14: "the same keys as the chooser, so they inherit P2-P4"). */
+  it("↑ ↓ Ctrl+p Ctrl+n move the cursor, and Enter chooses where they landed (R12)", () => {
+    const { root, props } = renderPicker(); // current: haiku (row 2)
+    fireEvent.keyDown(root, { key: "ArrowUp" }); // -> opus
+    fireEvent.keyDown(root, { key: "p", ctrlKey: true }); // -> sonnet
+    fireEvent.keyDown(root, { key: "n", ctrlKey: true }); // -> opus
+    fireEvent.keyDown(root, { key: "ArrowDown" }); // -> haiku
+    fireEvent.keyDown(root, { key: "ArrowUp" }); // -> opus
+    fireEvent.keyDown(root, { key: "Enter" });
+    expect(props.onChoose).toHaveBeenCalledWith("opus");
+  });
+
+  it("the four keys stop at both ends, are claimed, and never reach the panel under the picker", () => {
+    const outer = vi.fn();
+    const { props, rerender } = renderPicker();
+    rerender(
+      <div onKeyDown={(e) => outer(e.key)}>
+        <SlashPicker {...props} />
+      </div>,
+    );
+    const el = () => document.querySelector<HTMLElement>(".slash-picker")!;
+    const row = () => document.querySelector(".slash-picker-row.current")!.textContent;
+    // current: haiku, the last option
+    expect(fireEvent.keyDown(el(), { key: "ArrowDown" }), "claimed").toBe(false);
+    fireEvent.keyDown(el(), { key: "n", ctrlKey: true });
+    expect(row()).toContain("haiku");
+    for (const init of [{ key: "ArrowUp" }, { key: "p", ctrlKey: true }, { key: "ArrowUp" }, { key: "p", ctrlKey: true }]) {
+      expect(fireEvent.keyDown(el(), init), JSON.stringify(init)).toBe(false);
+    }
+    expect(row()).toContain("sonnet");
+    expect(outer).not.toHaveBeenCalled();
+  });
+
+  it("a bare n or p is not a motion", () => {
+    const { root, container } = renderPicker();
+    expect(fireEvent.keyDown(root, { key: "n" })).toBe(true);
+    expect(fireEvent.keyDown(root, { key: "p" })).toBe(true);
+    expect(container.querySelector(".slash-picker-row.current")!.textContent).toContain("haiku");
+  });
+
   it("Enter chooses the option under the cursor", () => {
     const { root, props } = renderPicker();
     fireEvent.keyDown(root, { key: "k" });

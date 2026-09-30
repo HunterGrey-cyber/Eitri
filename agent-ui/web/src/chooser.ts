@@ -37,6 +37,17 @@ export function choosable(row: ChooserRow): boolean {
   return row.kind !== "record" || !row.record.heldElsewhere;
 }
 
+/** R12 (v1 picks; idiom matrix P2/P3/P14): the four keys that move a picker's list from anywhere in
+ *  it, its filter box included, where `j`/`k` would be typed into the box -- `↓` and `Ctrl+n` step
+ *  down, `↑` and `Ctrl+p` step up (fzf, telescope and Claude Code's own `/resume`). Shared by the
+ *  chooser and the `/model`/`/effort` pickers, which take "the same keys as the chooser". `null` for
+ *  every other key: `j`/`k` stay each picker's own (and `Ctrl+j`/`Ctrl+k`, matrix P4, are untouched). */
+export function pickerStep(event: { key: string; ctrlKey: boolean }): 1 | -1 | null {
+  if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "n")) return 1;
+  if (event.key === "ArrowUp" || (event.ctrlKey && event.key === "p")) return -1;
+  return null;
+}
+
 /** `prefix w`: `New session` first, then open tabs, then records open
  *  in no tab -- Rust's own order (spec §6.1). `tabs` joins each open row to its `TabInfo` for
  *  number/name/title/mode/state (spec §10.1: "The chooser's open rows join the `tabs` entry of the

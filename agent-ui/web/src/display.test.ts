@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildDisplay, indexOfKey, runSummary } from "./display";
+import { buildDisplay, indexOfKey, runKeyOf, runSummary } from "./display";
 import type { TimelineItem } from "./timeline";
 import type { ToolCallRecord } from "./types";
 
@@ -90,5 +90,44 @@ describe("P2 runs", () => {
     expect(indexOfKey(shown, "m-4")).toBe(2);
     expect(indexOfKey(shown, "t-3")).toBe(1);
     expect(indexOfKey(shown, "x")).toBeNull();
+  });
+});
+
+/* `zc` (v1 picks, Task 4): closing the fold a `t-<seq>` row was unfolded from needs the run's own key,
+   which `buildDisplay` derives from the run's FIRST call -- so it cannot be read off the row itself. */
+describe("runKeyOf (zc)", () => {
+  it("a call unfolded from a run names that run; anything else names none", () => {
+    const base = [tool(call(1, "Read")), tool(call(2, "Read")), tool(errorCall(3, "Bash")), msg(4)];
+    expect(runKeyOf(base, opts, "t-2")).toBe("r-1");
+    expect(runKeyOf(base, opts, "t-3"), "a failed call is in no run").toBeNull();
+    expect(runKeyOf(base, opts, "m-4")).toBeNull();
+    expect(runKeyOf(base, { ...opts, detailed: true }, "t-2"), "Ctrl+o folds nothing").toBeNull();
+  });
+
+  it("names the run whichever of its calls is asked about, and a run key is not a call", () => {
+    const base = [msg(1), tool(call(2, "Read")), tool(call(3, "Bash")), tool(call(4, "Read")), msg(5)];
+    for (const key of ["t-2", "t-3", "t-4"]) expect(runKeyOf(base, opts, key), key).toBe("r-2");
+    expect(runKeyOf(base, opts, "r-2"), "the run row itself is what a fold closes, not a call in it").toBeNull();
+    expect(runKeyOf(base, opts, "m-1")).toBeNull();
+    expect(runKeyOf(base, opts, "t-99"), "a seq no run holds").toBeNull();
+  });
+
+  it("finds the run as it would fold now, even while it is unfolded (expanded is ignored)", () => {
+    const base = [tool(call(1, "Read")), tool(call(2, "Read")), msg(3)];
+    expect(runKeyOf(base, { ...opts, expanded: { "r-1": true } }, "t-2")).toBe("r-1");
+  });
+
+  it("a lone call and the running turn's still-arriving tail are in no run", () => {
+    expect(runKeyOf([tool(call(1, "Read")), msg(2)], opts, "t-1")).toBeNull();
+    const tail = [tool(call(1, "Read")), tool(call(2, "Read"))];
+    expect(runKeyOf(tail, { ...opts, turnRunning: true }, "t-2")).toBeNull();
+    expect(runKeyOf(tail, opts, "t-2"), "the same calls once the turn is over").toBe("r-1");
+  });
+
+  it("an edit ends a run: it is in none, and the reads either side are in their own", () => {
+    const base = [tool(call(1, "Read")), tool(call(2, "Read")), tool(call(3, "Edit")), tool(call(4, "Read")), tool(call(5, "Read"))];
+    expect(runKeyOf(base, opts, "t-2")).toBe("r-1");
+    expect(runKeyOf(base, opts, "t-3")).toBeNull();
+    expect(runKeyOf(base, opts, "t-5")).toBe("r-4");
   });
 });

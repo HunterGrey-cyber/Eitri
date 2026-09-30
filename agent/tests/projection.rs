@@ -1,5 +1,6 @@
 use agent::{
-    AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus, TurnOutcome, UsageInfo,
+    AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus, TokenUsage,
+    TurnOutcome, UsageInfo,
 };
 use serde_json::json;
 
@@ -371,6 +372,18 @@ fn turn_completed_clears_active_turn_id_and_updates_usage_for_every_outcome() {
         TurnOutcome::Failed,
         TurnOutcome::LimitReached,
     ] {
+        // Every field set, so a projection that kept only the cost would fail here too.
+        let reported = UsageInfo {
+            total_cost_usd: 0.01,
+            num_turns: Some(1),
+            tokens: Some(TokenUsage {
+                input: 1,
+                output: 2,
+                cache_creation: 3,
+                cache_read: 4,
+            }),
+            model: Some("claude-sonnet-5".into()),
+        };
         let mut projection = AgentSessionProjection::default();
         projection.apply(&AgentDomainEvent::TurnStarted {
             turn_id: "turn-1".into(),
@@ -380,33 +393,25 @@ fn turn_completed_clears_active_turn_id_and_updates_usage_for_every_outcome() {
             outcome,
             result_text: "done".into(),
             stop_reason: None,
-            usage: Some(UsageInfo {
-                total_cost_usd: 0.01,
-                num_turns: 1,
-            }),
+            usage: Some(reported.clone()),
         });
         assert_eq!(
             projection.active_turn_id, None,
             "outcome {outcome:?} must clear active_turn_id"
         );
-        assert_eq!(
-            projection.usage,
-            Some(UsageInfo {
-                total_cost_usd: 0.01,
-                num_turns: 1
-            })
-        );
+        assert_eq!(projection.usage, Some(reported));
     }
 }
 
 /// A provider that reports no usage must leave the projection saying so, and must not be able to
 /// overwrite a figure another turn genuinely reported.
 ///
-/// This is the whole point of `usage` being an `Option`. `ClaudeSidecarProvider` sends `None` on
-/// every turn because its wire carries no usage fields; before this, its translation layer sent
-/// `0.0`/`0` and this arm assigned unconditionally, so a UI reading `usage` would have shown a
-/// confident zero for a session that had really spent money, with no way to tell that apart from a
-/// turn that was genuinely free.
+/// This is the whole point of `usage` being an `Option`. `ClaudeSidecarProvider` sends `None` for
+/// a turn whose `TurnCompleted` carries no `TurnUsage` (one the kernel synthesized, or from a sidecar
+/// older than the field); before this, its translation layer sent `0.0`/`0` for every turn and this
+/// arm assigned unconditionally, so a UI reading `usage` would have shown a confident zero for a
+/// session that had really spent money, with no way to tell that apart from a turn that was
+/// genuinely free.
 #[test]
 fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
     let mut projection = AgentSessionProjection::default();
@@ -424,15 +429,17 @@ fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
         "absence must stay absence, never become a measured zero"
     );
 
+    let real = UsageInfo {
+        total_cost_usd: 0.25,
+        num_turns: Some(2),
+        ..Default::default()
+    };
     projection.apply(&AgentDomainEvent::TurnCompleted {
         turn_id: "turn-2".into(),
         outcome: TurnOutcome::Completed,
         result_text: String::new(),
         stop_reason: None,
-        usage: Some(UsageInfo {
-            total_cost_usd: 0.25,
-            num_turns: 2,
-        }),
+        usage: Some(real.clone()),
     });
     projection.apply(&AgentDomainEvent::TurnCompleted {
         turn_id: "turn-3".into(),
@@ -443,11 +450,73 @@ fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
     });
     assert_eq!(
         projection.usage,
-        Some(UsageInfo {
-            total_cost_usd: 0.25,
-            num_turns: 2
-        }),
+        Some(real),
         "a silent turn must not zero out what an earlier turn actually reported"
+    );
+}
+
+/// R5: the SDK reports a running total and `/clear` resets it, so a smaller later figure is the truth.
+#[test]
+fn a_later_report_replaces_usage_whole_even_when_it_is_lower() {
+    let report = |cost: f64| AgentDomainEvent::TurnCompleted {
+        turn_id: "t".into(),
+        outcome: TurnOutcome::Completed,
+        result_text: String::new(),
+        stop_reason: None,
+        usage: Some(UsageInfo {
+            total_cost_usd: cost,
+            ..Default::default()
+        }),
+    };
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&report(0.50));
+    projection.apply(&report(0.02));
+    assert_eq!(projection.usage.as_ref().map(|u| u.total_cost_usd), Some(0.02));
+}
+
+/// The event's JSON (what the panel's `events` payload carries) for a reported usage, both shapes: the
+/// sidecar's (tokens and a model, no turn count) and legacy's (a turn count, no tokens, no model). A
+/// figure a backend does not have is `null` in its slot, never a zero.
+#[test]
+fn usage_serializes_with_tokens_and_a_model_for_the_sidecar_and_a_turn_count_for_legacy() {
+    let event = |usage| AgentDomainEvent::TurnCompleted {
+        turn_id: "t".into(),
+        outcome: TurnOutcome::Completed,
+        result_text: String::new(),
+        stop_reason: None,
+        usage: Some(usage),
+    };
+    let sidecar = serde_json::to_value(event(UsageInfo {
+        total_cost_usd: 0.42,
+        num_turns: None,
+        tokens: Some(TokenUsage {
+            input: 1,
+            output: 2,
+            cache_creation: 3,
+            cache_read: 4,
+        }),
+        model: Some("claude-sonnet-5".into()),
+    }))
+    .unwrap();
+    assert_eq!(
+        sidecar["usage"],
+        json!({
+            "total_cost_usd": 0.42,
+            "num_turns": null,
+            "tokens": {"input": 1, "output": 2, "cache_creation": 3, "cache_read": 4},
+            "model": "claude-sonnet-5",
+        })
+    );
+    let legacy = serde_json::to_value(event(UsageInfo {
+        total_cost_usd: 0.01,
+        num_turns: Some(3),
+        tokens: None,
+        model: None,
+    }))
+    .unwrap();
+    assert_eq!(
+        legacy["usage"],
+        json!({"total_cost_usd": 0.01, "num_turns": 3, "tokens": null, "model": null})
     );
 }
 
@@ -960,7 +1029,9 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             stop_reason: None,
             usage: Some(UsageInfo {
                 total_cost_usd: 0.01,
-                num_turns: 1,
+                num_turns: Some(1),
+                tokens: None,
+                model: None,
             }),
         },
         AgentDomainEvent::ResumeOutcome {

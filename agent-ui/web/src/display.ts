@@ -73,3 +73,13 @@ export function indexOfKey(items: TimelineItem[], key: string): number | null {
   const inRun = items.findIndex((item) => item.kind === "run" && item.calls.some((c) => c.seq === seq));
   return inRun === -1 ? null : inRun;
 }
+
+/** `zc` (v1 picks): the run a `t-<seq>` row was unfolded from -- `buildDisplay` keys a run by its
+ *  first call, so the same timeline folded with nothing expanded finds it. `null` for a row in no run. */
+export function runKeyOf(base: TimelineItem[], opts: Options, rowKey: string): string | null {
+  const seq = rowKey.startsWith("t-") ? Number(rowKey.slice(2)) : NaN;
+  const run = buildDisplay(base, { ...opts, expanded: {} }).find(
+    (it) => it.kind === "run" && it.calls.some((c) => c.seq === seq),
+  );
+  return run?.key ?? null;
+}

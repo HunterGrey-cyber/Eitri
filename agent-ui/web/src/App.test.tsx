@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import App, { accumulateMotionCount, HINT_PENDING_TIMEOUT_MS, MAX_MOTION_COUNT, statusWarning } from "./App";
-import { initialState } from "./reducer";
+import App, { accumulateMotionCount, HINT_PENDING_TIMEOUT_MS, jumpTarget, MAX_MOTION_COUNT, statusWarning } from "./App";
+import { applyEvent, initialState } from "./reducer";
 import { RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT } from "./follow";
-import type { AgentDomainEvent, AgentUiState, Hello, ProviderInfo } from "./types";
+import type { AgentDomainEvent, AgentUiState, Hello, ProviderInfo, UsageInfo } from "./types";
 import { WHICH_KEY_DELAY_MS } from "./leader";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
@@ -746,6 +746,106 @@ describe("App event folding", () => {
   });
 });
 
+/* R5 (v1 picks, Task 13): the band shows the ACTIVE tab's last reported usage -- every token and the
+ *  cost, right of the model. Absent until a turn reports one and never `0 tok $0.00` for unknown; each
+ *  report replaces the figure whole; and it is per tab, carried by the snapshot on a switch. The
+ *  formatting itself is `band.test.ts`'s; this pins the wiring from events and snapshots to the band. */
+describe("the band's usage segment (R5, v1 picks Task 13)", () => {
+  const TWO = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+  const REPORT: UsageInfo = { total_cost_usd: 0.042, num_turns: null, tokens: { input: 1000, output: 3300, cache_creation: 0, cache_read: 0 }, model: null };
+  const turnDone = (usage: UsageInfo | null, turn = "t1"): AgentDomainEvent => ({
+    type: "turn_completed", turn_id: turn, outcome: "completed", result_text: "", stop_reason: null, usage,
+  });
+  const usageText = (container: HTMLElement) => container.querySelector(".band-usage")?.textContent ?? null;
+
+  /** A live tab 1 with the band measured wide enough to draw every segment. */
+  function started(state: AgentUiState = snapshotState()) {
+    const widen = stubBandWidth();
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(state, 1);
+    act(() => widen(rendered.container));
+    return { ...rendered, widen };
+  }
+  function events(tab: number, ...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", tab, fromRevision: 0, throughRevision: list.length, events: list });
+  }
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("draws nothing before a report -- on an empty tab and on a live one that has reported nothing", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    act(() => widen(container));
+    expect(container.querySelector(".band-usage")).toBeNull();
+
+    dispatchLiveTab(snapshotState({ model: "claude-sonnet-5" }), 1);
+    act(() => widen(container));
+    // The band IS wide enough to draw the segment beside it: the model shows, the usage does not.
+    expect(container.querySelector(".band-model")?.textContent).toBe("sonnet-5");
+    expect(container.querySelector(".band-usage")).toBeNull();
+    // A turn that reports nothing (interrupted, synthesized) is not a zero either.
+    events(1, { type: "turn_started", turn_id: "t1" }, turnDone(null));
+    expect(container.querySelector(".band-usage")).toBeNull();
+  });
+
+  it("a turn_completed's report shows all its tokens and its cost, right of the model", () => {
+    const { container } = started(snapshotState({ model: "claude-sonnet-5" }));
+    events(1, { type: "turn_started", turn_id: "t1" }, turnDone(REPORT));
+    expect(usageText(container)).toBe("4.3k tok $0.04");
+    const right = Array.from(container.querySelectorAll(".band-right .band-seg")).map((el) => el.className.replace("band-seg ", ""));
+    expect(right.indexOf("band-usage")).toBe(right.indexOf("band-model") + 1);
+    expect(container.querySelector<HTMLElement>(".band-usage")!.title).toContain("since this tab started or resumed");
+    expect(container.querySelector<HTMLElement>(".band-usage")!.title).toContain("input 1,000 · output 3,300 · cache write 0 · cache read 0 · $0.0420");
+  });
+
+  it("a later turn that reports none keeps the figure, and a lower report replaces it (/clear)", () => {
+    const { container } = started();
+    events(1, turnDone(REPORT));
+    events(1, turnDone(null, "t2"));
+    expect(usageText(container)).toBe("4.3k tok $0.04");
+    events(1, turnDone({ ...REPORT, total_cost_usd: 0.0012, tokens: { input: 40, output: 60, cache_creation: 0, cache_read: 0 } }, "t3"));
+    expect(usageText(container)).toBe("100 tok <$0.01");
+  });
+
+  it("a legacy report -- a cost and a turn count, no tokens -- shows the cost alone", () => {
+    const { container } = started();
+    events(1, turnDone({ total_cost_usd: 1.5, num_turns: 4, tokens: null, model: null }));
+    expect(usageText(container)).toBe("$1.50");
+  });
+
+  it("is per tab: a switch shows the other tab's snapshot figure, and back again", () => {
+    const { container, widen } = started();
+    events(1, turnDone(REPORT));
+    expect(usageText(container)).toBe("4.3k tok $0.04");
+
+    // Tab 2 has reported nothing: no figure, and above all not tab 1's left over.
+    dispatch({ kind: "tabs", active: 2, tabs: TWO });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ usage: null }) });
+    act(() => widen(container));
+    expect(container.querySelector(".band-usage")).toBeNull();
+
+    // Back on tab 1, whose snapshot carries the figure the panel itself no longer holds.
+    dispatch({ kind: "tabs", active: 1, tabs: TWO });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ usage: REPORT }) });
+    act(() => widen(container));
+    expect(usageText(container)).toBe("4.3k tok $0.04");
+  });
+
+  it("a panel reload's first snapshot restores the figure at once", () => {
+    const { container } = started(snapshotState({ usage: { ...REPORT, total_cost_usd: 12.5 } }));
+    expect(usageText(container)).toBe("4.3k tok $12.50");
+  });
+
+  it("a report for a tab that is not on screen changes nothing here", () => {
+    const { container } = started();
+    dispatch({ kind: "tabs", active: 1, tabs: TWO });
+    events(2, turnDone(REPORT));
+    expect(container.querySelector(".band-usage")).toBeNull();
+  });
+});
+
 /* Owner trial item 2 (2026-09-28, `the private review notes` §2): a bare
  *  /model or /effort now sends as a turn (never held back), and the panel opens a picker from its
  *  reply -- `../slashPicker`'s own unit tests cover the parsing itself; this only pins the App-level
@@ -897,6 +997,7 @@ describe("slash command pickers (owner trial item 2, 2026-09-28)", () => {
     for (const [overlay, key, selector] of [
       ["?", "?", ".keymap-overlay"],
       ["the / prompt", "/", ".search-bar"],
+      ["the : line", ":", ".search-bar"],
     ] as const) {
       it(`a reply that lands under ${overlay} opens no picker over it`, () => {
         const { container } = startedApp();
@@ -926,6 +1027,90 @@ describe("slash command pickers (owner trial item 2, 2026-09-28)", () => {
         expect(document.activeElement).toBe(root(container));
       });
     }
+  });
+
+  /** K01 fix round 2 (review): the picker is a cancel route as the chooser is. Its keys return from
+   *  `onKeyDown` ahead of the read-and-reset of a waiting prefix and count, and opening it dropped
+   *  nothing, so a `g`/`z`/`[`/`]` typed while the reply was on its way took the first key after the
+   *  picker: `i` opened no composer, and `f` could have been `gf`. A count and the leader outlived it
+   *  the same way. Opening the picker now drops all three (`dropPendingKeys`). */
+  describe("the picker drops a waiting prefix, count or leader sequence (K01 fix round 2)", () => {
+    const REPLY = (): AgentDomainEvent[] => [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+    ];
+    const root = (container: HTMLElement) => container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    const current = (container: HTMLElement) => container.querySelector(".row-current .row-body")?.textContent ?? null;
+    const wait = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+    /** Sends a bare `/model`, then leaves the composer for BROWSE, where the keys under test go. */
+    function awaitingReply(container: HTMLElement) {
+      sendBareCommand(container, "/model");
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Escape" });
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(document.activeElement).toBe(root(container));
+      wait(1000);
+    }
+    function pickerClosedByEsc(container: HTMLElement) {
+      const picker = container.querySelector<HTMLElement>(".slash-picker");
+      expect(picker).not.toBeNull();
+      fireEvent.keyDown(picker!, { key: "Escape" });
+      expect(container.querySelector(".slash-picker")).toBeNull();
+      expect(document.activeElement).toBe(root(container));
+      wait(1000);
+    }
+
+    for (const prefix of ["g", "z", "[", "]"]) {
+      it(`${prefix}, then the reply's picker: its box closes, and after Esc, i opens the composer`, () => {
+        const { container } = startedApp();
+        awaitingReply(container);
+        fireEvent.keyDown(root(container), { key: prefix });
+        wait(1000);
+        expect(container.querySelector(".which-key-box")).not.toBeNull();
+        events(...REPLY());
+        expect(container.querySelector(".which-key-box")).toBeNull();
+        pickerClosedByEsc(container);
+        fireEvent.keyDown(root(container), { key: "i" });
+        expect(container.querySelector("textarea")).not.toBeNull();
+      });
+    }
+
+    it("a count, then the reply's picker: after Esc, G goes to the last row, never row 2", () => {
+      const { container } = startedApp();
+      events(
+        { type: "user_prompt_submitted", text: "r0" },
+        { type: "user_prompt_submitted", text: "r1" },
+        { type: "user_prompt_submitted", text: "r2" },
+      );
+      awaitingReply(container);
+      fireEvent.keyDown(root(container), { key: "2" });
+      events(...REPLY());
+      pickerClosedByEsc(container);
+      fireEvent.keyDown(root(container), { key: "G", shiftKey: true });
+      const bodies = container.querySelectorAll('.message-list [data-nav-stop="row"] .row-body');
+      expect(current(container)).not.toBe("r1");
+      expect(current(container)).toBe(bodies[bodies.length - 1].textContent);
+    });
+
+    it("the leader, then the reply's picker: its box closes, and m after Esc runs no <leader>m", () => {
+      const { container } = startedApp();
+      dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+      awaitingReply(container);
+      fireEvent.keyDown(root(container), { key: " " });
+      wait(WHICH_KEY_DELAY_MS + 100);
+      expect(container.querySelector(".which-key-box")).not.toBeNull();
+      events(...REPLY());
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      pickerClosedByEsc(container);
+      fireEvent.keyDown(root(container), { key: "m" });
+      wait(1000);
+      expect(posted.filter((m) => m.type === "cycle_mode")).toEqual([]);
+    });
   });
 
   /** Fix round (Codex review findings): `pendingSlashPickerRef` is a single flag, not scoped to a
@@ -1201,6 +1386,56 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
 
     fireEvent.keyDown(conversationRoot(container), { key: "Enter" });
     expect(container.querySelector('[data-folded="true"]')).not.toBeNull();
+  });
+
+  /* v1 picks, Task 4 (vim `:help za`/`zo`/`zc`): `za` flips the fold under the cursor exactly as Enter
+     does, `zo` opens it and `zc` closes it, and neither moves a fold that is already the way it asks. */
+  it("za toggles the folded tool result as Enter does; zo opens it and zc closes it, each idempotent", () => {
+    const { container } = startedApp();
+    events(
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "echo hi" } },
+      { type: "tool_call_completed", turn_id: "t1", tool_use_id: "toolu_1", content: "hi", is_error: false },
+    );
+    const z = (second: string) => {
+      fireEvent.keyDown(conversationRoot(container), { key: "z" });
+      fireEvent.keyDown(conversationRoot(container), { key: second });
+    };
+    const folded = () => container.querySelector('[data-folded="true"]') !== null;
+    expect(folded()).toBe(true);
+
+    z("a");
+    expect(folded(), "za opens a folded result").toBe(false);
+    z("a");
+    expect(folded(), "za closes an open one").toBe(true);
+
+    z("o");
+    expect(folded(), "zo opens it").toBe(false);
+    z("o");
+    expect(folded(), "zo again leaves it open").toBe(false);
+
+    z("c");
+    expect(folded(), "zc closes it").toBe(true);
+    z("c");
+    expect(folded(), "zc again leaves it closed").toBe(true);
+
+    fireEvent.keyDown(conversationRoot(container), { key: "Enter" });
+    expect(folded(), "Enter and za are one toggle: Enter opened it").toBe(false);
+    z("a");
+    expect(folded(), "...and za closes what Enter opened").toBe(true);
+  });
+
+  /* zo / zc on a row with no fold (a prompt) change nothing and break nothing, and the keys stay
+     where they were -- the row is still the cursor's. */
+  it("zo and zc on a row that folds nothing leave the conversation as it was", () => {
+    const { container } = startedApp();
+    events({ type: "user_prompt_submitted", text: "just a prompt" });
+    const before = container.querySelector(".message-list")!.innerHTML;
+    for (const second of ["o", "c", "a"]) {
+      fireEvent.keyDown(conversationRoot(container), { key: "z" });
+      fireEvent.keyDown(conversationRoot(container), { key: second });
+    }
+    expect(container.querySelector(".row-current .row-body")!.textContent).toBe("just a prompt");
+    expect(container.querySelector(".message-list")!.innerHTML).toBe(before);
   });
 
   /** v1 polish F18: a call a saved rule answered says which rule, from the events envelope's
@@ -1752,7 +1987,15 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
      "Approve was clicked" -- and a test that tried would have passed throughout the regression.
      What these pin is the GUARD, not the effect: the handler must not claim the key (its default
      survives, so a real browser's own activation runs) and must not do its own BROWSE action with
-     it either. The effect itself is a GUI check; `shell/MANUAL_VERIFICATION.md` owes it. */
+     it either. The effect itself is a GUI check; `shell/MANUAL_VERIFICATION.md` owes it.
+
+     **K02 (v1 picks, ruling R3) changed this for a card's own three buttons**: Enter there is now
+     claimed too (`:ls⏎` approved a card through the native activation), and the panel presses the
+     button itself, `TYPING_GUARD_MS` after an Enter that follows a landing on it (`h`/`l`/Tab onto
+     it, or a HINT). The regression stays closed, and is now pinned end to end -- jsdom does see a
+     press the panel makes itself -- by `v1: typing never answers a card`'s K02 tests. What is left
+     here: Enter with nothing landed on the button presses nothing, and every other control (Stop,
+     a `<summary>`) keeps the browser's own activation. */
   describe("leaves a focused control's own keys alone (the Approve-unreachable regression)", () => {
     function withAToolCallAndAPermission() {
       const rendered = startedApp();
@@ -1770,21 +2013,29 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
        buttons -- the regression this block pins -- but Space on them is now claimed and does
        nothing. Enter is pressed with no key just before it, since S1 refuses one right after typing
        (spec §2.1); that half is `v1: typing never answers a card`'s. */
-    it("does not preventDefault Enter on any of the card's own buttons, and claims Space there (v1 S5)", () => {
+    it("claims Enter and Space on the card's own buttons, and an Enter nothing landed presses nothing (K02, v1 S5)", () => {
       vi.useFakeTimers();
+      const widen = stubBandWidth();
       try {
         const { container } = withAToolCallAndAPermission();
+        act(() => widen(container));
         for (const label of ["Approve", "Deny"]) {
           const button = buttonLabelled(container, label)!;
           expect(button, `no button labelled ${label}`).toBeDefined();
           act(() => vi.advanceTimersByTime(300));
           // fireEvent returns false exactly when the default was prevented.
-          expect(fireEvent.keyDown(button, { key: "Enter" }), `${label} swallowed Enter`).toBe(true);
+          expect(fireEvent.keyDown(button, { key: "Enter" }), `${label} left Enter to the button`).toBe(false);
+          expect(container.querySelector(".band-message")?.textContent).toBe(
+            "Enter answers a card right after l, h or Tab onto its button",
+          );
           act(() => vi.advanceTimersByTime(300));
           expect(fireEvent.keyDown(button, { key: " " }), `${label} left Space to the button`).toBe(false);
         }
+        act(() => vi.advanceTimersByTime(1000));
+        expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
       } finally {
         vi.useRealTimers();
+        vi.unstubAllGlobals();
       }
     });
 
@@ -1799,13 +2050,14 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
        (`./nav`), a focused button is an ordinary place for the keys to be, so `h`/`j`/`k`/`l` from
        it must still navigate. What the original regression needs is narrower and is asserted
        directly: Enter and Space from a button are left to the button. */
-    it("leaves Enter on a focused Approve to the button, claims Space (v1 S5), and still navigates from it", () => {
+    it("claims Enter (K02) and Space (v1 S5) on a focused Approve, and still navigates from it", () => {
       const { container } = withAToolCallAndAPermission();
       const approve = buttonLabelled(container, "Approve")!;
       // `fireEvent` returns false when the handler called preventDefault, i.e. claimed the key.
-      expect(fireEvent.keyDown(approve, { key: "Enter" })).toBe(true);
+      expect(fireEvent.keyDown(approve, { key: "Enter" })).toBe(false);
       expect(fireEvent.keyDown(approve, { key: " " })).toBe(false);
       expect(fireEvent.keyDown(approve, { key: "k" })).toBe(false);
+      expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
     });
 
     /* `<summary>` is the third activatable shape in this panel (the generic tool card's
@@ -1912,6 +2164,237 @@ describe("App: the which-key box (panel round 2 plan, Task 10)", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  });
+});
+
+/* v1 picks, Task 6 (ruling R11): vim's `CTRL-W h/j/k/l` -- the keys to the module that way, from the live
+   conversation's BROWSE. `Ctrl+w` is a reserved prefix (K01, R1): it waits for its next key with no
+   timeout, and that key completes one of the four pairs -- posted to shell as `pane_nav`, which runs
+   the move `Ctrl+h/j/k/l` do -- or is swallowed. Nothing here reaches a card: the answer side of it (a
+   pause, then `a`/`d`; a landing, then Enter) is in "v1: typing never answers a card" below. */
+describe("Ctrl+w h/j/k/l in BROWSE: the keys to the module that way (v1 picks, Task 6, R11)", () => {
+  function started(overrides: Partial<AgentUiState> = {}) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(overrides), 0);
+    return rendered;
+  }
+  function events(...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+  }
+  function prompts(...texts: string[]) {
+    events(...texts.map((text): AgentDomainEvent => ({ type: "user_prompt_submitted", text })));
+  }
+  const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const press = (key: string, init: Record<string, unknown> = {}) =>
+    fireEvent.keyDown(document.activeElement ?? document.body, { key, ...init });
+  const ctrlW = () => press("w", { ctrlKey: true });
+  const current = (c: HTMLElement) => c.querySelector(".row-current .row-body")!.textContent;
+  const paneNavs = () => posted.filter((m) => m.type === "pane_nav");
+  /** BROWSE on a conversation with a few rows, the keys on it. */
+  function browsing() {
+    const rendered = started();
+    prompts("r0", "r1", "r2", "r3");
+    act(() => root(rendered.container).focus());
+    return rendered;
+  }
+
+  it.each([
+    ["h", "left"],
+    ["j", "down"],
+    ["k", "up"],
+    ["l", "right"],
+  ])("Ctrl+w then %s posts one pane_nav %s, and the prefix alone posts nothing", (second, direction) => {
+    browsing();
+    ctrlW();
+    expect(paneNavs()).toEqual([]);
+    press(second);
+    expect(paneNavs()).toEqual([{ type: "pane_nav", request_id: expect.any(String), direction }]);
+    // The prefix is spent: a plain second key is a plain key again, not another move.
+    press(second);
+    expect(paneNavs()).toHaveLength(1);
+  });
+
+  it("reads a real keyboard's key events: the bare Control keydown, Ctrl+w, Control released, then l", () => {
+    browsing();
+    press("Control", { ctrlKey: true });
+    ctrlW();
+    fireEvent.keyUp(document.activeElement ?? document.body, { key: "w" });
+    fireEvent.keyUp(document.activeElement ?? document.body, { key: "Control" });
+    press("l");
+    expect(lastOfType("pane_nav")).toMatchObject({ direction: "right" });
+    expect(paneNavs()).toHaveLength(1);
+  });
+
+  it("gives every move its own request id", () => {
+    browsing();
+    ctrlW();
+    press("l");
+    ctrlW();
+    press("h");
+    const ids = paneNavs().map((m) => m.request_id);
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(2);
+    expect(paneNavs().map((m) => m.direction)).toEqual(["right", "left"]);
+  });
+
+  it("a count typed before it is spent by it: 3 Ctrl+w l moves once, and the next j is one row", () => {
+    const { container } = browsing();
+    press("g");
+    press("g");
+    expect(current(container)).toBe("r0");
+    press("3");
+    ctrlW();
+    press("l");
+    expect(paneNavs()).toHaveLength(1);
+    press("j");
+    expect(current(container)).toBe("r1");
+  });
+
+  it("a key that completes no pair is swallowed with the prefix: Ctrl+w d, Ctrl+w Escape, Ctrl+w a post nothing", () => {
+    const { container } = browsing();
+    for (const k of ["d", "Escape", "a", "i", "y"]) {
+      ctrlW();
+      press(k);
+    }
+    expect(paneNavs()).toEqual([]);
+    // Nothing ran as itself: `i` would have entered INPUT, `y` would have copied.
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
+  });
+
+  it("does not arm on another Ctrl+w chord, so the l after it is a plain l", () => {
+    browsing();
+    for (const init of [{ ctrlKey: true, altKey: true }, { ctrlKey: true, metaKey: true }, { ctrlKey: true, shiftKey: true }]) {
+      press("w", init);
+      press("l");
+    }
+    expect(paneNavs()).toEqual([]);
+  });
+
+  it("a pane switch the page never saw as a key drops a waiting Ctrl+w, as it drops a g", () => {
+    browsing();
+    ctrlW();
+    dispatch({ kind: "pane_focus", focused: false });
+    dispatch({ kind: "pane_focus", focused: true });
+    press("l");
+    expect(paneNavs()).toEqual([]);
+  });
+
+  it("shell claiming a Ctrl+j after the prefix (nav_key) drops it too: nothing is posted as a pane move", () => {
+    const { container } = browsing();
+    ctrlW();
+    dispatch({ kind: "nav_key", direction: "down" });
+    // `Ctrl+j` ran as itself -- INPUT -- and the prefix went with it.
+    expect(container.querySelector("textarea")).not.toBeNull();
+    press("Escape");
+    press("l");
+    expect(paneNavs()).toEqual([]);
+  });
+
+  it("is BROWSE's: in INPUT the composer keeps Ctrl+w, and no prefix is left waiting behind it", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = browsing();
+      press("i");
+      expect(container.querySelector("textarea")).not.toBeNull();
+      ctrlW();
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS + 100));
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      press("l");
+      expect(paneNavs()).toEqual([]);
+      // Back in BROWSE the chord works again, and nothing is left over from INPUT.
+      press("Escape");
+      ctrlW();
+      press("l");
+      expect(paneNavs()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still moves from a session that ended: its transcript is a BROWSE panel with modules around it", () => {
+    browsing();
+    events({ type: "session_closed", reason: "provider exited" });
+    ctrlW();
+    press("h");
+    expect(lastOfType("pane_nav")).toMatchObject({ direction: "left" });
+  });
+
+  it("is swallowed under the ? overlay, which owns every key, and works again once it closes", () => {
+    const { container } = browsing();
+    press("?", { shiftKey: true });
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+    ctrlW();
+    press("l");
+    expect(paneNavs()).toEqual([]);
+    press("Escape");
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+    ctrlW();
+    press("l");
+    expect(paneNavs()).toHaveLength(1);
+  });
+
+  it("gives a composing key to the input method: Ctrl+w, then l while composing, moves nothing and spends the prefix", () => {
+    browsing();
+    ctrlW();
+    press("l", { isComposing: true });
+    press("l", { keyCode: 229 });
+    expect(paneNavs()).toEqual([]);
+    press("l");
+    expect(paneNavs()).toEqual([]);
+  });
+
+  describe("the which-key box after Ctrl+w (200 ms, titled Ctrl+w)", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const box = (c: HTMLElement) => c.querySelector(".which-key-box");
+
+    it("shows nothing before the delay, then the four moves under the title Ctrl+w, and clears on the next key", () => {
+      const { container } = browsing();
+      ctrlW();
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS - 1));
+      expect(box(container)).toBeNull();
+      act(() => vi.advanceTimersByTime(1));
+      expect(box(container)!.querySelector(".wk-title")!.textContent).toBe("Ctrl+w");
+      expect(Array.from(box(container)!.querySelectorAll(".wk-key")).map((k) => k.textContent)).toEqual(["h", "j", "k", "l"]);
+      expect(Array.from(box(container)!.querySelectorAll(".wk-entry")).map((e) => e.textContent)).toEqual([
+        "h➜module left",
+        "j➜module below",
+        "k➜module above",
+        "l➜module right",
+      ]);
+      press("k");
+      expect(box(container)).toBeNull();
+      expect(lastOfType("pane_nav")).toMatchObject({ direction: "up" });
+    });
+
+    it("Ctrl+w l inside the delay never shows it", () => {
+      const { container } = browsing();
+      ctrlW();
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS - 1));
+      press("l");
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS * 3));
+      expect(box(container)).toBeNull();
+      expect(paneNavs()).toHaveLength(1);
+    });
+
+    it("a click on a row does what typing its key would", () => {
+      const { container } = browsing();
+      ctrlW();
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      const entry = Array.from(box(container)!.querySelectorAll(".wk-entry")).find((e) => e.textContent?.startsWith("j"))!;
+      fireEvent.click(entry);
+      expect(paneNavs()).toEqual([{ type: "pane_nav", request_id: expect.any(String), direction: "down" }]);
+      expect(box(container)).toBeNull();
+    });
+
+    it("the g prefix's box keeps its own title, g", () => {
+      const { container } = browsing();
+      press("g");
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      expect(box(container)!.querySelector(".wk-title")!.textContent).toBe("g");
     });
   });
 });
@@ -2698,11 +3181,16 @@ describe("v1: typing never answers a card", () => {
     expect(document.activeElement?.textContent).toBe("Approve");
   });
 
+  /* K02: Enter on a card's own button is claimed, and the panel presses the button itself
+     TYPING_GUARD_MS later (`a`/`d`'s own wait) -- so these three read the answer after it. */
   it("Enter on a focused Approve after 300 ms idle approves", () => {
     arrivedOnACard();
     press("l");
     wait(300);
-    expect(pressOnButton("Enter")).toBe(true);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(249);
+    expect(answered()).toEqual([]);
+    wait(1);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
   });
 
@@ -2710,7 +3198,8 @@ describe("v1: typing never answers a card", () => {
     arrivedOnACard();
     press("l");
     wait(100);
-    expect(pressOnButton("Enter")).toBe(true);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(300);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
   });
 
@@ -2748,7 +3237,8 @@ describe("v1: typing never answers a card", () => {
     press("l");
     wait(80);
     expect(document.activeElement?.textContent).toBe("Deny");
-    expect(pressOnButton("Enter")).toBe(true);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(300);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "deny" })]);
   });
 
@@ -2866,6 +3356,1239 @@ describe("v1: typing never answers a card", () => {
     wait(1000);
     expect(document.activeElement).not.toBe(container.querySelector(".permission-card input"));
     expect(band(container)).toBe(TYPING);
+  });
+
+  /* K01 (kbux 2026-09-29, re-verified 2/2): a prefix, a pause past every timer, then an answer key. */
+  it.each([["g", "d"], ["g", "a"], ["]", "d"], ["[", "d"], ["z", "d"], ["g", "D"]])("K01: %s, a pause, then %s answers nothing", (first, second) => {
+    const { container } = arrivedOnACard();
+    wait(1000);
+    press(first);
+    wait(5000); // past WHICH_KEY_DELAY_MS, TYPING_GUARD_MS and any timeoutlen
+    press(second, second === "D" ? { shiftKey: true } : {});
+    wait(5000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".which-key-box")).toBeNull();
+    expect(document.activeElement?.closest(".permission-card input") ?? null).toBeNull();
+  });
+  it("K01: a count, a pause, then a answers nothing and says why", () => {
+    const { container } = arrivedOnACard();
+    wait(1000); press("3"); wait(5000); press("a");
+    // Read at once: a flash lasts 2 s (`showFlash`'s own timer), so 5 s on the band is empty again.
+    expect(band(container)).toBe("a / d / D take no count — press it on its own");
+    wait(5000);
+    expect(answered()).toEqual([]);
+  });
+  it("K01: g, a pause, then Enter on a focused Approve presses nothing", () => {
+    arrivedOnACard();
+    press("l"); wait(1000); press("g"); wait(5000);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+  it("K01: g then a held d never answers, and a lone a after a cancelled g still does", () => {
+    arrivedOnACard();
+    wait(1000); press("g"); wait(1000); press("d");
+    for (let i = 0; i < 3; i++) press("d", { repeat: true });
+    wait(1000);
+    expect(answered()).toEqual([]);
+    press("a"); wait(1000);
+    expect(answered()).toHaveLength(1);
+  });
+  it("K01: g then a key an input method is composing drops the prefix and answers nothing", () => {
+    arrivedOnACard();
+    wait(1000); press("g"); wait(1000); press("d", { isComposing: true }); press("d", { keyCode: 229 }); wait(1000);
+    expect(answered()).toEqual([]);
+  });
+  /* v1 picks, Task 4: `za` is a pair `z` completes now (toggle a fold, as Enter does), so the `a` after
+     a `z` is never the card's answer -- typed at once or after a pause -- and it spends the prefix: a
+     lone `a` afterwards still answers, 250 ms later. The cursor's row here is the card itself, which
+     folds nothing. */
+  it.each([[80], [5000]])("Task 4: z, %i ms, then a toggles a fold and answers nothing; a lone a after it still answers", (gap) => {
+    const { container } = arrivedOnACard();
+    wait(1000); press("z"); wait(gap); press("a"); wait(5000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".which-key-box")).toBeNull();
+    press("a"); wait(1000);
+    expect(answered()).toHaveLength(1);
+  });
+  /* Review Focus 2 for Task 4's own pair: `za` completes, so the `a` a held key repeats afterwards
+     arrives as the card-answer key -- and a repeat never answers (S1). */
+  it("Task 4: z then a held a toggles a fold once and never answers", () => {
+    arrivedOnACard();
+    wait(1000); press("z"); wait(1000); press("a");
+    for (let i = 0; i < 3; i++) press("a", { repeat: true });
+    wait(1000);
+    expect(answered()).toEqual([]);
+    press("a"); wait(1000);
+    expect(answered(), "and a lone a after the hold still answers").toHaveLength(1);
+  });
+  it.each([["o"], ["c"], ["t"], ["z"], ["b"]])("Task 4: z then %s on a waiting card answers nothing and leaves it waiting", (second) => {
+    const { container } = arrivedOnACard();
+    wait(1000); press("z"); wait(1000); press(second); wait(5000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+    expect(container.querySelector(".permission-card")).not.toBeNull();
+  });
+  /* v1 picks, Task 5: a page (Ctrl+f, PageDown, PageUp) and the arrow keys only scroll or move the
+     cursor -- pressed on a waiting card, at once or after a pause, they answer nothing and leave it
+     waiting; and, as keys, they cancel an answer deferred just before them like any other key (S1). */
+  const PAGE_AND_ARROW_KEYS: Array<[string, string, Record<string, unknown>]> = [
+    ["Ctrl+f", "f", { ctrlKey: true }],
+    ["PageDown", "PageDown", {}],
+    ["PageUp", "PageUp", {}],
+    ["ArrowDown", "ArrowDown", {}],
+    ["ArrowUp", "ArrowUp", {}],
+  ];
+  it.each(PAGE_AND_ARROW_KEYS)("Task 5: %s on a waiting card answers nothing, at once or after a pause", (_name, k, init) => {
+    const { container } = arrivedOnACard();
+    wait(1000); press(k, init); wait(5000); press(k, init); wait(10); press(k, init); wait(5000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".permission-card")).not.toBeNull();
+    expect(posted.some((m) => m.type === "interrupt")).toBe(false);
+  });
+  it.each(PAGE_AND_ARROW_KEYS)("Task 5: a, then %s within the guard window cancels the answer", (_name, k, init) => {
+    const { container } = arrivedOnACard();
+    wait(1000); press("a"); wait(100); press(k, init);
+    expect(band(container), "the cancelled wait says so").toBe(TYPING);
+    wait(5000);
+    expect(answered()).toEqual([]);
+  });
+  /* The other order: a key just BEFORE `a` -- an arrow the reader used to look around -- makes the `a`
+     one of a run, so it answers nothing either (the before-half of S1). Only a lone `a` answers. */
+  it.each(PAGE_AND_ARROW_KEYS)("Task 5: %s, then a within the guard window answers nothing", (_name, k, init) => {
+    arrivedOnACard();
+    wait(1000); press(k, init); wait(80); press("a"); wait(5000);
+    expect(answered()).toEqual([]);
+  });
+  /* And Enter on a button `l` put focus on (K02, R3): the landing has to be the key right before the
+     Enter. A page leaves focus on Approve while the card's row stays in view (this list has no layout,
+     so nothing scrolls it away), and an arrow moves it off; either is a key in between, so the Enter
+     presses nothing however long it waits. */
+  it.each(PAGE_AND_ARROW_KEYS)("Task 5: l onto Approve, then %s, then Enter answers nothing", (_name, k, init) => {
+    arrivedOnACard();
+    press("l"); wait(400);
+    expect(document.activeElement?.textContent).toBe("Approve");
+    press(k, init); wait(400);
+    pressOnButton("Enter"); wait(5000);
+    expect(answered()).toEqual([]);
+  });
+  /* Fix round 1 (review): the rest of the K01 Enter/Space rule. While a prefix waits, Enter/Space
+     on ANY focused control is swallowed (R1) -- Stop included, whose press interrupts the turn and
+     denies the waiting card with it; a count before Enter/Space on a card's own button cancels, and
+     says why (R2). */
+  it.each([["Enter"], [" "]])("K01: g, a pause, then %j on Stop interrupts nothing", (key) => {
+    arrivedOnACard();
+    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    act(() => stop.focus());
+    wait(1000); press("g"); wait(5000);
+    expect(document.activeElement).toBe(stop);
+    expect(pressOnButton(key)).toBe(false);
+    wait(1000);
+    expect(posted.some((m) => m.type === "interrupt")).toBe(false);
+    expect(answered()).toEqual([]);
+  });
+  it.each([["Enter"], [" "]])("K01: a count, a pause, then %j on a focused Approve answers nothing and says why", (key) => {
+    const { container } = arrivedOnACard();
+    press("l"); wait(1000); press("3"); wait(5000);
+    expect(document.activeElement?.textContent).toBe("Approve");
+    expect(pressOnButton(key)).toBe(false);
+    expect(band(container)).toBe("a / d / D take no count — press it on its own");
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+  /* Fix round 1 (review): a prefix's second key never starts a leader sequence (R1), so `g`, a
+     pause, Space is a cancelled `g`, and the `m` after it is a plain `m` -- never `<leader>m`. */
+  it("K01: g, a pause, then Space starts no leader sequence: g Space m never reaches <leader>m", () => {
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    wait(1000); press("g"); wait(5000); press(" "); wait(1000);
+    expect(container.querySelector(".which-key-box")).toBeNull();
+    press("m"); wait(1000);
+    expect(posted.filter((m) => m.type === "cycle_mode")).toEqual([]);
+    expect(answered()).toEqual([]);
+  });
+
+  /* v1 picks, Task 6 (R11): `Ctrl+w` is a reserved prefix, so the K01 rule holds for it as for `g`: the
+     key after it completes h/j/k/l or is swallowed -- never the card's answer, at once or after a
+     pause. Its own pairs move focus to another module and answer nothing either. */
+  it.each([["a", {}], ["d", {}], ["D", { shiftKey: true }]])("Task 6: Ctrl+w, a pause, then %s answers nothing", (second, init) => {
+    const { container } = arrivedOnACard();
+    wait(1000);
+    press("w", { ctrlKey: true });
+    wait(5000); // past WHICH_KEY_DELAY_MS, TYPING_GUARD_MS and any timeoutlen
+    press(second, init);
+    wait(5000);
+    expect(answered()).toEqual([]);
+    expect(posted.filter((m) => m.type === "pane_nav")).toEqual([]);
+    expect(container.querySelector(".which-key-box")).toBeNull();
+    expect(document.activeElement?.closest(".permission-card input") ?? null).toBeNull();
+    expect(container.querySelector(".permission-card")).not.toBeNull();
+  });
+  it("Task 6: Ctrl+w then a held d never answers, and a lone a after a cancelled Ctrl+w still does", () => {
+    arrivedOnACard();
+    wait(1000); press("w", { ctrlKey: true }); wait(1000); press("d");
+    for (let i = 0; i < 3; i++) press("d", { repeat: true });
+    wait(1000);
+    expect(answered()).toEqual([]);
+    press("a"); wait(1000);
+    expect(answered()).toHaveLength(1);
+  });
+  it("Task 6: Ctrl+w then a key an input method is composing drops the prefix and answers nothing", () => {
+    arrivedOnACard();
+    wait(1000); press("w", { ctrlKey: true }); wait(1000);
+    press("d", { isComposing: true }); press("d", { keyCode: 229 }); wait(1000);
+    press("l"); wait(1000);
+    expect(answered()).toEqual([]);
+    expect(posted.filter((m) => m.type === "pane_nav")).toEqual([]);
+  });
+  /* The pairs themselves: a pane move on a waiting card posts `pane_nav` and nothing else, and (as
+     keys) they are neighbours to the guard like any other -- an `a` right before or after one is one of
+     a run and answers nothing (S1), while a lone `a` after a pause still does. */
+  it("Task 6: Ctrl+w l on a waiting card moves the keys away and answers nothing", () => {
+    const { container } = arrivedOnACard();
+    wait(1000); press("w", { ctrlKey: true }); press("l"); wait(5000);
+    expect(posted.filter((m) => m.type === "pane_nav")).toEqual([expect.objectContaining({ direction: "right" })]);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".permission-card")).not.toBeNull();
+    press("a"); wait(1000);
+    expect(answered()).toHaveLength(1);
+  });
+  it("Task 6: a, then Ctrl+w within the guard window cancels the answer", () => {
+    const { container } = arrivedOnACard();
+    wait(1000); press("a"); wait(100); press("w", { ctrlKey: true });
+    expect(band(container), "the cancelled wait says so").toBe(TYPING);
+    wait(5000);
+    expect(answered()).toEqual([]);
+  });
+  it("Task 6: Ctrl+w j, then a within the guard window answers nothing (the before-half of S1)", () => {
+    arrivedOnACard();
+    wait(1000); press("w", { ctrlKey: true }); press("j"); wait(80); press("a"); wait(5000);
+    expect(answered()).toEqual([]);
+  });
+  /* K02's landing has to be the key right before Enter: `l` onto Approve, then a whole Ctrl+w pair, then
+     Enter presses nothing, however long it waits -- and so does a Ctrl+w left waiting before the Enter. */
+  it.each([["j"], ["h"]])("Task 6: l onto Approve, then Ctrl+w %s, then Enter answers nothing", (second) => {
+    arrivedOnACard();
+    press("l"); wait(400);
+    expect(document.activeElement?.textContent).toBe("Approve");
+    press("w", { ctrlKey: true }); press(second); wait(400);
+    pressOnButton("Enter"); wait(5000);
+    expect(answered()).toEqual([]);
+  });
+  it("Task 6: l onto Approve, Ctrl+w, a pause, then Enter on the focused Approve presses nothing", () => {
+    arrivedOnACard();
+    press("l"); wait(1000); press("w", { ctrlKey: true }); wait(5000);
+    expect(document.activeElement?.textContent).toBe("Approve");
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  /* K02 (kbux 2026-09-29: `:ls⏎` approved `rm -rf important`; ruling R3): a card's own button
+     decides only the way `a`/`d` do. Enter there is claimed, and the panel presses the button itself
+     `TYPING_GUARD_MS` later, only with S1's before-half, no modifier held, and focus put on that very
+     button by the key right before Enter (`h`/`l` moving it, a Tab) or by a HINT landing with no key
+     since. `pressOnButton` models the browser's own activation, so an answer read after it returned
+     false is the panel's own deferred press. */
+  const ENTER_LANDING = "Enter answers a card right after l, h or Tab onto its button";
+  it("K02: l, s, Enter at 400 ms a key approves nothing (the walk did not land the Enter)", () => {
+    const { container } = arrivedOnACard();
+    wait(1000); press("l"); wait(400); press("s"); wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(ENTER_LANDING);
+  });
+  it("K02: :ls Enter at 400 ms a key opens a command line and answers nothing", () => {
+    const { container } = arrivedOnACard();
+    wait(400); press(":", { shiftKey: true });
+    wait(400); press("l");
+    wait(400); press("s");
+    wait(400);
+    // A browser's own activation: a focused button clicks when Enter's default survives.
+    const target = document.activeElement as HTMLElement;
+    if (fireEvent.keyDown(target, { key: "Enter" }) && target.tagName === "BUTTON") fireEvent.click(target);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".search-bar")).toBeNull();
+  });
+  it("K02: l onto Approve, then :ls Enter at 400 ms a key: the line takes them, and nothing is answered", () => {
+    const { container } = arrivedOnACard();
+    press("l");
+    expect(document.activeElement?.textContent).toBe("Approve");
+    for (const key of [":", "l", "s"]) {
+      wait(400);
+      press(key, key === ":" ? { shiftKey: true } : {});
+    }
+    wait(400);
+    const target = document.activeElement as HTMLElement;
+    expect(target.tagName).toBe("INPUT");
+    if (fireEvent.keyDown(target, { key: "Enter" }) && target.tagName === "BUTTON") fireEvent.click(target);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".search-bar")).toBeNull();
+  });
+  it("K02: l onto Approve, then g h (a cancelled pair, no focus move) and Enter at 400 ms, approves nothing", () => {
+    arrivedOnACard();
+    press("l"); wait(400); press("g"); wait(400); press("h"); wait(400);
+    expect(document.activeElement?.textContent).toBe("Approve");
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+  it("K02: Tab onto Approve, then Enter, approves after S1's wait", () => {
+    const { container } = arrivedOnACard();
+    const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+    wait(400); press("Tab"); act(() => approve.focus()); // the browser's own Tab move
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(300);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+  });
+  it("K02: a Tab whose move left the page is no landing when focus comes back onto Approve", () => {
+    const { container } = arrivedOnACard();
+    const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+    wait(400); press("Tab");
+    // The browser's own Tab move went to another widget (focus left this page), then came back.
+    dispatch({ kind: "pane_focus", focused: false });
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => approve.focus());
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(ENTER_LANDING);
+  });
+  it("K02: focus no key put on Approve is no landing: Tab, x, then Approve focused from elsewhere", () => {
+    const { container } = arrivedOnACard();
+    const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+    wait(400); press("Tab"); wait(400); press("x"); act(() => approve.focus());
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(ENTER_LANDING);
+  });
+  it("K02: h from Deny back onto Approve, then Enter, approves after S1's wait", () => {
+    arrivedOnACard();
+    press("l"); press("l");
+    expect(document.activeElement?.textContent).toBe("Deny");
+    wait(300); press("h");
+    expect(document.activeElement?.textContent).toBe("Approve");
+    wait(300);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(300);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+  });
+  it("K02: Shift+, Alt+, Ctrl+ and Meta+Enter on a focused Approve answer nothing", () => {
+    const { container } = arrivedOnACard();
+    press("l"); wait(300);
+    const approve = document.activeElement as HTMLElement;
+    for (const mod of [{ shiftKey: true }, { altKey: true }, { ctrlKey: true }, { metaKey: true }]) {
+      if (fireEvent.keyDown(approve, { key: "Enter", ...mod })) fireEvent.click(approve);
+      expect(band(container), JSON.stringify(mod)).toBe("Enter with a modifier answers no card");
+      wait(1000);
+    }
+    expect(answered()).toEqual([]);
+  });
+  it("K02: a held Enter on a landed Approve: its repeat cancels the press, and nothing is answered", () => {
+    arrivedOnACard();
+    press("l"); wait(300);
+    expect(pressOnButton("Enter")).toBe(false);
+    for (let i = 0; i < 3; i++) {
+      wait(30);
+      // A repeat's default is claimed too, so the browser never activates the button either.
+      expect(fireEvent.keyDown(document.activeElement!, { key: "Enter", repeat: true })).toBe(false);
+    }
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+  it.each([
+    ["pane_focus false", () => dispatch({ kind: "pane_focus", focused: false })],
+    ["the ? overlay opening", () => dispatch({ kind: "open_keymap" })],
+    ["a switch to another tab", () => dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }] })],
+    [
+      "the card resolving",
+      () =>
+        dispatch({
+          kind: "events", tab: 1, fromRevision: 6, throughRevision: 7,
+          events: [{ type: "permission_resolved", permission_id: "perm-1", outcome: "allowed" }],
+        }),
+    ],
+  ])("K02: l, Enter on Approve, then %s before 250 ms: nothing is pressed", (_name, interrupt) => {
+    arrivedOnACard();
+    press("l"); wait(300);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(100);
+    interrupt();
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+  /* K02 fix round 3 (review): the switch above is caught by the button leaving the page. Here the new
+     tab's card sits at the same `p-<seq>` key and the switch and its snapshot land in one commit, as
+     one batch from Rust can, so React keeps the very button element -- connected and enabled, now
+     drawing the NEW tab's card -- and `isConnected` cannot stop the press. Three guards do: the
+     switch's own `typingGuard.cancel()`, the fire-time tab check behind it, and the switch landing the
+     keys on the root (focus leaves the button). The tab check is never the only one: `activeTabRef`
+     changes only in the `tabs` arm, which cancels the wait in the same branch. */
+  it("K02: l, Enter on Approve, then a switch to a tab whose card keeps the very same button: nothing is pressed", () => {
+    const { container } = arrivedOnACard();
+    press("l"); wait(300);
+    const approve = document.activeElement as HTMLButtonElement;
+    expect(approve.textContent).toBe("Approve");
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(100);
+    const other: AgentDomainEvent[] = [
+      { type: "user_prompt_submitted", text: "tidy up" },
+      { type: "turn_started", turn_id: "t9" },
+      { type: "tool_call_started", turn_id: "t9", tool_use_id: "toolu_9", name: "Bash", input: { command: "rm build" } },
+      { type: "permission_requested", permission_id: "perm-9", tool_use_id: "toolu_9", tool_name: "Bash", input: { command: "rm build" } },
+      { type: "content_delta", turn_id: "t9", kind: "text", text: "meanwhile" },
+      { type: "user_prompt_submitted", text: "and the docs" },
+    ];
+    const state = other.reduce(applyEvent, snapshotState({ capabilities: { ...initialState().capabilities, interrupt: true } }));
+    act(() => {
+      window.__neovibeDispatch!(
+        JSON.stringify({ kind: "tabs", active: 2, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 live" }] }),
+      );
+      window.__neovibeDispatch!(JSON.stringify({ kind: "snapshot", tab: 2, throughRevision: other.length, state }));
+    });
+    expect(approve.isConnected).toBe(true);
+    expect(container.querySelector('.permission-card [data-nav-action="allow"]')).toBe(approve);
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+  /* The `/` and `:` lines take their own Enter and Esc (`SearchBar` stops them there), so the guard
+     used to miss them: `:ls`, a pause, Enter, then `a` at once answered the cursor's card as a key
+     standing alone. */
+  it.each([
+    [":", "Enter"],
+    [":", "Escape"],
+    ["/", "Enter"],
+    ["/", "Escape"],
+  ])("K02: %s, then %s in its line, then a at 80 ms answers nothing (the line's own key counts)", (lead, closeKey) => {
+    const { container } = arrivedOnACard();
+    wait(400);
+    press(lead, lead === ":" ? { shiftKey: true } : {});
+    const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
+    expect(document.activeElement).toBe(input);
+    wait(400);
+    fireEvent.keyDown(input, { key: closeKey });
+    expect(container.querySelector(".search-bar")).toBeNull();
+    wait(80);
+    press("a");
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(TYPING);
+  });
+  it("K02: the : line closes silently on Esc and on pane_focus, and its Enter says what it is", () => {
+    const { container } = arrivedOnACard();
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    const line = () => container.querySelector<HTMLInputElement>(".search-bar input");
+    press(":", { shiftKey: true });
+    expect(line()?.getAttribute("aria-label")).toBe("Command line");
+    expect(container.querySelector(".search-bar")!.textContent).toBe(":");
+    expect(document.activeElement).toBe(line());
+    fireEvent.keyDown(line()!, { key: "Escape" });
+    expect(line()).toBeNull();
+    expect(band(container)).toBeNull();
+    expect(document.activeElement).toBe(root);
+    wait(300);
+    press(":", { shiftKey: true });
+    fireEvent.change(line()!, { target: { value: "ls" } });
+    fireEvent.keyDown(line()!, { key: "Enter" });
+    expect(line()).toBeNull();
+    expect(band(container)).toBe(":ls — no ex commands here; ? lists this panel's keys");
+    expect(document.activeElement).toBe(root);
+    wait(300);
+    press(":", { shiftKey: true });
+    expect(line()).not.toBeNull();
+    dispatch({ kind: "pane_focus", focused: false });
+    expect(line()).toBeNull();
+  });
+
+  /* K02 fix round 1 (review): two guards no test above reached. The press is checked again when it
+     fires, so focus moved off Approve by no key (a click elsewhere) within the wait presses nothing;
+     and a Tab's landing is used up by the first focus after it, so a second focus no key made is no
+     landing. */
+  it("K02: l, Enter, then focus moved off Approve by no key before 250 ms: nothing is pressed", () => {
+    const { container } = arrivedOnACard();
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    press("l");
+    wait(300);
+    expect(document.activeElement?.textContent).toBe("Approve");
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(100);
+    act(() => root.focus()); // a click on the conversation: no key, so the wait itself goes on
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+  it("K02: a Tab's landing is used up by the first focus after it: a second focus no key made is no landing", () => {
+    const { container } = arrivedOnACard();
+    const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+    const stop = container.querySelector<HTMLButtonElement>(".activity-line .stop")!;
+    wait(400);
+    press("Tab");
+    act(() => stop.focus()); // the browser's own Tab move, onto Stop
+    act(() => approve.focus()); // then a focus no key made (a click, an effect)
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(ENTER_LANDING);
+  });
+
+  /* K02 fix round 1 (review; there before K02): the chooser and the /model picker return from
+     `onKeyDown` ahead of the card-button rules, so Enter or Space on a card button that still had
+     focus under either -- a mouse pressed on Approve and dragged off it, so no click -- was the
+     browser's own activation. Both overlays are modal: those keys on a card's own buttons are
+     claimed there too now, and do nothing. */
+  const MODEL_REPLY =
+    "Current model: `Haiku 4.5` (effort: high)\nUsage: /model <name>. Available: sonnet, opus, haiku, or a full model ID.";
+  /** A live tab where a bare `/model` was sent and its reply opened the picker, with a card waiting. */
+  function pickerOverACard() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    enterInputMode(rendered.container);
+    const textarea = rendered.container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "/model" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    const list: AgentDomainEvent[] = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "rm build" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: { command: "rm build" } },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+    ];
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+    expect(rendered.container.querySelector(".slash-picker")).not.toBeNull();
+    return rendered;
+  }
+  it.each([
+    ["the chooser", ".chooser", () => {
+      const rendered = arrivedOnACard();
+      dispatch({ kind: "chooser", open: [], records: [] });
+      return rendered;
+    }],
+    ["the /model picker", ".slash-picker", pickerOverACard],
+  ])("K02: with %s open, Enter or Space on a card button that still has focus answers nothing", (_name, selector, setUp) => {
+    const { container } = setUp();
+    expect(document.activeElement).toBe(container.querySelector(selector));
+    const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+    act(() => approve.focus()); // a mouse pressed on Approve and dragged off it: focus, no click
+    for (const key of ["Enter", " "]) {
+      wait(400);
+      expect(pressOnButton(key), JSON.stringify(key)).toBe(false);
+      wait(1000);
+    }
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(selector)).not.toBeNull();
+  });
+
+  /* K02 fix round 1 (review): the `/` prompt and the `:` line are one command line, as vim's are --
+     opening either closes the other, so no second box is ever drawn without the keys, and a keyboard
+     arrival (`takeKeys`) hands the keys to the one on screen. */
+  it.each([
+    ["/", ":", "Command line"],
+    [":", "/", "Search the conversation"],
+  ])("K02: %s open, the keys back on the conversation, then %s: one line, the new one, holding the keys", (first, second, label) => {
+    const { container } = arrivedOnACard();
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    press(first, first === ":" ? { shiftKey: true } : {});
+    expect(container.querySelectorAll(".search-bar")).toHaveLength(1);
+    act(() => root.focus()); // a click back on the conversation
+    press(second, second === ":" ? { shiftKey: true } : {});
+    const lines = container.querySelectorAll<HTMLElement>(".search-bar");
+    expect(lines).toHaveLength(1);
+    const input = lines[0].querySelector("input")!;
+    expect(input.getAttribute("aria-label")).toBe(label);
+    expect(document.activeElement).toBe(input);
+    act(() => root.focus());
+    dispatch({ kind: "arrive" });
+    expect(document.activeElement).toBe(input);
+  });
+  it("K02: the : line open, the keys back on the conversation, then <leader>/: one line, the search", () => {
+    const { container } = arrivedOnACard();
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    const table: PanelTable = { ...TABLE, bindings: [...TABLE.bindings, binding(["<leader>", "/"], "panel.search", "search")] };
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: table, newTabChord: "Ctrl+b c" });
+    press(":", { shiftKey: true });
+    act(() => root.focus());
+    wait(400);
+    press(" ");
+    press("/");
+    const lines = container.querySelectorAll<HTMLElement>(".search-bar");
+    expect(lines).toHaveLength(1);
+    expect(lines[0].querySelector("input")!.getAttribute("aria-label")).toBe("Search the conversation");
+  });
+
+  /* K02 fix round 1 (Codex, blocking): `:` (or `/`), then `prefix w` and Esc out of the chooser --
+     or `prefix ,` and Esc out of a tab rename -- left the line drawn while that overlay's own exit
+     gave the keys to the conversation under it, so going on with "the command", `l` then Enter,
+     walked onto Approve and pressed it. Either overlay closes an open line as it takes the keys now,
+     as a pane switch, a HINT and a tab switch already did: nothing is drawn that the keys are not in. */
+  it.each([
+    [":", "the chooser", () => dispatch({ kind: "chooser", open: [], records: [] }), ".chooser"],
+    ["/", "the chooser", () => dispatch({ kind: "chooser", open: [], records: [] }), ".chooser"],
+    [":", "a tab rename", () => dispatch({ kind: "begin_rename", tab: 1, current: null }), ".tab-rename"],
+    ["/", "a tab rename", () => dispatch({ kind: "begin_rename", tab: 1, current: null }), ".tab-rename"],
+  ])("K02: %s open, then %s takes the keys: the line closes, and leaving it draws no line", (lead, _name, open, selector) => {
+    const { container } = arrivedOnACard();
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    wait(400);
+    press(lead, lead === ":" ? { shiftKey: true } : {});
+    expect(container.querySelector(".search-bar")).not.toBeNull();
+    open();
+    expect(container.querySelector(".search-bar")).toBeNull();
+    const overlay = container.querySelector<HTMLElement>(selector)!;
+    expect(document.activeElement).toBe(overlay);
+    fireEvent.keyDown(overlay, { key: "Escape" });
+    expect(container.querySelector(selector)).toBeNull();
+    expect(document.activeElement).toBe(root);
+    expect(container.querySelector(".search-bar")).toBeNull();
+  });
+
+  /* K02 fix round 2 (review): Tab in the `/` or `:` line was the browser's own focus move, onto the
+     band's `.band-open` right after it, so the line stayed drawn while BROWSE had the keys: `:`, Tab,
+     `l`, Enter walked onto Approve and pressed it, and a lone `a` answered. A line claims every Tab
+     now, as vim's command line never leaves on one. And `:` or `/` again on a line already open (the
+     keys moved off it by a click) only wiped it, so `l`, Enter went on to the card: it hands that
+     line the keys back now. */
+  /** Tab as a browser does it: the keydown, then -- only if its default survived -- focus onto the
+   *  next focusable element in document order (jsdom does neither itself). Returns whether it did. */
+  const tabOut = () => {
+    const from = document.activeElement as HTMLElement;
+    const survived = fireEvent.keyDown(from, { key: "Tab" });
+    if (survived) {
+      const stops = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+        ),
+      );
+      const next = stops.find(
+        (el) => !from.contains(el) && (from.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+      );
+      if (next !== undefined) act(() => next.focus());
+    }
+    return survived;
+  };
+  /** Enter wherever focus is, with a focused button's own activation modelled (`pressOnButton`). */
+  const enterAnywhere = () => {
+    const target = document.activeElement as HTMLElement;
+    if (fireEvent.keyDown(target, { key: "Enter" }) && target.tagName === "BUTTON") fireEvent.click(target);
+  };
+  const openLine = (lead: string) => press(lead, lead === ":" ? { shiftKey: true } : {});
+  it.each([":", "/"])("K02: %s, Tab, then l and Enter at 400 ms a key: the line keeps the keys, and nothing is answered", (lead) => {
+    const { container } = arrivedOnACard();
+    wait(400);
+    openLine(lead);
+    const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
+    wait(400);
+    const survived = tabOut();
+    const afterTab = document.activeElement;
+    wait(400);
+    press("l");
+    wait(400);
+    enterAnywhere();
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(survived).toBe(false);
+    expect(afterTab).toBe(input);
+    expect(container.querySelector(".search-bar")).toBeNull();
+  });
+  it.each([":", "/"])("K02: %s, Tab, then a lone a: the a is the line's, and nothing is answered", (lead) => {
+    const { container } = arrivedOnACard();
+    wait(400);
+    openLine(lead);
+    const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
+    wait(400);
+    tabOut();
+    wait(400);
+    press("a");
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(document.activeElement).toBe(input);
+    expect(container.querySelector(".search-bar")).not.toBeNull();
+  });
+  it("K02: :, l, Tab, :, l, Enter at 400 ms a key answers nothing", () => {
+    const { container } = arrivedOnACard();
+    wait(400);
+    openLine(":");
+    wait(400);
+    press("l");
+    wait(400);
+    tabOut();
+    for (const key of [":", "l"]) {
+      wait(400);
+      press(key, key === ":" ? { shiftKey: true } : {});
+    }
+    wait(400);
+    enterAnywhere();
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".search-bar")).toBeNull();
+  });
+  it.each([":", "/"])("K02: %s's line claims every Tab: modified, and Shift+Tab's other WebKitGTK shape", (lead) => {
+    const { container } = arrivedOnACard();
+    openLine(lead);
+    const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
+    for (const init of [
+      { key: "Tab" },
+      { key: "Tab", altKey: true },
+      { key: "Tab", ctrlKey: true },
+      { key: "Tab", metaKey: true },
+      { key: "Unidentified", code: "Tab", shiftKey: true, altKey: true },
+    ]) {
+      expect(fireEvent.keyDown(input, init), JSON.stringify(init)).toBe(false);
+    }
+    expect(document.activeElement).toBe(input);
+    expect(container.querySelector(".search-bar")).not.toBeNull();
+  });
+  it.each([":", "/"])("K02: %s open, the keys moved off it by a click, then that key again: its line takes the keys back", (lead) => {
+    const { container } = arrivedOnACard();
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    wait(400);
+    openLine(lead);
+    act(() => root.focus()); // a click back on the conversation
+    wait(400);
+    openLine(lead);
+    const lines = container.querySelectorAll<HTMLElement>(".search-bar");
+    expect(lines).toHaveLength(1);
+    const input = lines[0].querySelector("input")!;
+    expect(document.activeElement).toBe(input);
+    wait(400);
+    press("l");
+    wait(400);
+    enterAnywhere();
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".search-bar")).toBeNull();
+  });
+  it("K02: the / prompt open, the keys moved off it by a click, then <leader>/: the prompt takes the keys back", () => {
+    const { container } = arrivedOnACard();
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    const table: PanelTable = { ...TABLE, bindings: [...TABLE.bindings, binding(["<leader>", "/"], "panel.search", "search")] };
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: table, newTabChord: "Ctrl+b c" });
+    openLine("/");
+    act(() => root.focus()); // a click back on the conversation
+    wait(400);
+    press(" ");
+    press("/");
+    const lines = container.querySelectorAll<HTMLElement>(".search-bar");
+    expect(lines).toHaveLength(1);
+    expect(document.activeElement).toBe(lines[0].querySelector("input"));
+  });
+  it("K02: a Tab the line claimed is no landing: Approve focused by no key after it, then Enter, presses nothing", () => {
+    const { container } = arrivedOnACard();
+    const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+    wait(400);
+    openLine(":");
+    wait(400);
+    tabOut();
+    act(() => approve.focus()); // a mouse pressed on Approve and dragged off it: focus, no click
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(ENTER_LANDING);
+  });
+
+  /* K02 fix round 3 (review): fix round 2 read a Tab's default at the top of `onKeyDown`, ahead of the
+     branches further down that swallow a plain Tab too -- K01's cancel after a waiting `g`/`z`/`[`/`]`,
+     a key the leader's sequence does not bind. Such a Tab moves nothing, yet it armed the landing, so
+     the next focus no key made (a mouse pressed on Approve and dragged off it) became its landing, and
+     Enter pressed Approve. A Tab's default is judged once every handler has run now. */
+  it.each([["g"], ["z"], ["["], ["]"]])(
+    "K02: %s, then Tab (a cancelled pair: no focus move), then Approve focused by no key: Enter presses nothing",
+    (prefix) => {
+      const { container } = arrivedOnACard();
+      const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+      const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+      wait(400);
+      press(prefix);
+      wait(400);
+      expect(tabOut()).toBe(false);
+      expect(document.activeElement).toBe(root);
+      wait(400);
+      act(() => approve.focus()); // a mouse pressed on Approve and dragged off it: focus, no click
+      wait(400);
+      expect(pressOnButton("Enter")).toBe(false);
+      wait(1000);
+      expect(answered()).toEqual([]);
+      expect(band(container)).toBe(ENTER_LANDING);
+    },
+  );
+  it("K02: the leader, then Tab (a key its sequence does not bind), then Approve focused by no key: Enter presses nothing", () => {
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+    wait(400);
+    press(" ");
+    wait(400);
+    expect(tabOut()).toBe(false);
+    expect(document.activeElement).toBe(root);
+    wait(400);
+    act(() => approve.focus());
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(ENTER_LANDING);
+  });
+
+  /* K02 fix round 3 (review): a card's button decides only the card `a`/`d` would from the cursor --
+     the cursor's own, or the one gating the tool call it is on (`permissionTarget`, S4). A Tab walks
+     on from one card's buttons into the next card's, and `l`/`h` then walk that card's (`currentStop`
+     follows focus), while the row cursor stays where it was: Enter there answered a card the cursor
+     was not on, one `a` in the same state would not have answered. */
+  const ENTER_ELSEWHERE = "Enter answers the card under the cursor — j / k onto it first";
+  /** Two cards waiting: `perm-1` (`rm build`, gating `toolu_1`) and, below it, `perm-2`
+   *  (`rm -rf important`, gating `toolu_2`), the keys arrived on the oldest. Rows: the prompt 0,
+   *  `toolu_1` 1, `perm-1` 2, `toolu_2` 3, `perm-2` 4. */
+  function arrivedOnTheFirstOfTwoCards() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ capabilities: { ...initialState().capabilities, interrupt: true } }), 0);
+    const list: AgentDomainEvent[] = [
+      { type: "user_prompt_submitted", text: "tidy up" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "rm build" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: { command: "rm build" } },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_2", name: "Bash", input: { command: "rm -rf important" } },
+      {
+        type: "permission_requested", permission_id: "perm-2", tool_use_id: "toolu_2", tool_name: "Bash",
+        input: { command: "rm -rf important" },
+      },
+    ];
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(rendered.container));
+    const cards = Array.from(rendered.container.querySelectorAll<HTMLElement>(".permission-card"));
+    expect(cards).toHaveLength(2);
+    const controls = (card: HTMLElement) => ({
+      reason: card.querySelector<HTMLInputElement>("input")!,
+      approve: card.querySelector<HTMLButtonElement>('[data-nav-action="allow"]')!,
+      deny: card.querySelector<HTMLButtonElement>('[data-nav-action="deny"]')!,
+    });
+    return { ...rendered, first: controls(cards[0]), second: controls(cards[1]) };
+  }
+  it("K02: l l onto Deny, Tab Tab onto the next card's Approve, then Enter: answers nothing, and says why", () => {
+    const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+    press("l");
+    press("l");
+    expect(document.activeElement).toBe(first.deny);
+    wait(400);
+    tabOut();
+    expect(document.activeElement).toBe(second.reason);
+    wait(400);
+    tabOut();
+    expect(document.activeElement).toBe(second.approve);
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(ENTER_ELSEWHERE);
+  });
+  it("K02: Tab onto the next card's Approve, then l onto its Deny, then Enter: answers nothing", () => {
+    const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+    press("l");
+    press("l");
+    expect(document.activeElement).toBe(first.deny);
+    wait(400);
+    tabOut();
+    wait(400);
+    tabOut();
+    wait(400);
+    press("l");
+    expect(document.activeElement).toBe(second.deny);
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(ENTER_ELSEWHERE);
+  });
+  it("K02: j j onto the second card, then l and Enter: answers that card", () => {
+    const { second } = arrivedOnTheFirstOfTwoCards();
+    press("j");
+    press("j");
+    wait(400);
+    press("l");
+    expect(document.activeElement).toBe(second.approve);
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(300);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-2", decision: "allow" })]);
+  });
+  it("K02: the cursor on a tool call, Tab onto the Approve of the card gating it, then Enter: answers that card, as a does", () => {
+    const { container, second } = arrivedOnTheFirstOfTwoCards();
+    press("j");
+    expect(container.querySelector(".row-current")!.classList.contains("row-tool")).toBe(true);
+    act(() => second.reason.focus()); // a click into the card's reason box
+    wait(400);
+    tabOut();
+    expect(document.activeElement).toBe(second.approve);
+    wait(400);
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(300);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-2", decision: "allow" })]);
+  });
+
+  /* v1 picks, Task 7 (ruling R7): `]p` / `[p` move the CURSOR to the next / previous card that waits for
+     an answer in this tab, wrapping as nvim's `]d` does. They answer nothing, ever: no `permission_response`
+     is posted, no button is pressed, and the S1 guard is untouched -- a lone `a`, 250 ms later, answers the
+     card the cursor landed on (`permissionTarget`), and `a` typed hard on the heels of the jump answers
+     nothing. Rows in `arrivedOnTheFirstOfTwoCards`: prompt 0, toolu_1 1, perm-1 2, toolu_2 3, perm-2 4. */
+  describe("]p / [p: the cursor to the next / previous waiting card (v1 picks, Task 7, R7)", () => {
+    const NO_WAITING = "no card waiting here";
+    const COUNT_ANSWER = "a / d / D take no count — press it on its own";
+    const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    /** Which card the cursor is drawn on -- 1 or 2, by the Approve its row holds -- or 0 on neither. */
+    const cardAt = (c: HTMLElement, cards: { approve: HTMLElement }[]) =>
+      cards.findIndex((card) => c.querySelector(".row-current")!.contains(card.approve)) + 1;
+    /** `]p` / `[p` as a person types them: the bracket, then the p. */
+    const jump = (prefix: "]" | "[") => {
+      press(prefix);
+      press("p");
+    };
+    const top = () => {
+      press("g");
+      press("g");
+    };
+    /** The same conversation with no card in it at all. */
+    function noCards() {
+      const rendered = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "alpha" }, { seq: 2, text: "bravo" }] }), 3);
+      act(() => root(rendered.container).focus());
+      act(() => widen(rendered.container));
+      return rendered;
+    }
+
+    it("gg, then ]p lands on card 1, ]p on card 2, ]p wraps to card 1 and [p goes back to card 2: nothing is answered", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      const cards = [first, second];
+      top();
+      expect(cardAt(container, cards)).toBe(0);
+      expect(container.querySelector(".row-current")!.textContent).toContain("tidy up");
+      jump("]");
+      expect(cardAt(container, cards)).toBe(1);
+      jump("]");
+      expect(cardAt(container, cards)).toBe(2);
+      jump("]");
+      expect(cardAt(container, cards)).toBe(1);
+      jump("[");
+      expect(cardAt(container, cards)).toBe(2);
+      jump("[");
+      expect(cardAt(container, cards)).toBe(1);
+      wait(1000);
+      // Not one answer, not one press of a button, and the keys stayed with the row.
+      expect(answered()).toEqual([]);
+      expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
+      expect(document.activeElement).toBe(root(container));
+    });
+
+    it("[p from the top wraps to the last card, and a second [p goes on to the one before it", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      top();
+      jump("[");
+      expect(cardAt(container, [first, second])).toBe(2);
+      jump("[");
+      expect(cardAt(container, [first, second])).toBe(1);
+      expect(answered()).toEqual([]);
+    });
+
+    it("a count repeats it round the ring: 2]p from the top is card 2, 3]p card 1, 2[p card 1, 3[p card 2", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      const cards = [first, second];
+      for (const [digit, prefix, expected] of [["2", "]", 2], ["3", "]", 1], ["2", "[", 1], ["3", "[", 2]] as const) {
+        top();
+        press(digit);
+        jump(prefix);
+        expect(cardAt(container, cards), `${digit}${prefix}p`).toBe(expected);
+      }
+      wait(1000);
+      expect(answered()).toEqual([]);
+    });
+
+    it("the largest count costs no more than one lap: 9999]p is card 1 and 9998]p card 2, as odd and even laps would be", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      const cards = [first, second];
+      top();
+      for (const d of "9999") press(d);
+      jump("]");
+      expect(cardAt(container, cards)).toBe(1);
+      top();
+      for (const d of "9998") press(d);
+      jump("]");
+      expect(cardAt(container, cards)).toBe(2);
+    });
+
+    it("the count goes to ]p and not to a: 2]p, then a lone a answers card 2 -- and only card 2 -- with no count flash", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      top();
+      press("2");
+      jump("]");
+      expect(cardAt(container, [first, second])).toBe(2);
+      expect(answered()).toEqual([]);
+      wait(300);
+      press("a");
+      wait(300);
+      expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-2", decision: "allow" })]);
+      expect(band(container)).not.toBe(COUNT_ANSWER);
+    });
+
+    it("after a jump, a lone d denies the card it landed on, whichever card the cursor left", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      top();
+      jump("]");
+      jump("]");
+      expect(cardAt(container, [first, second])).toBe(2);
+      wait(300);
+      press("d");
+      wait(300);
+      expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-2", decision: "deny" })]);
+    });
+
+    it("waits for its p as long as it takes: ], a 400 ms pause, then p still jumps", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      top();
+      press("]");
+      wait(400);
+      press("p");
+      expect(cardAt(container, [first, second])).toBe(1);
+      expect(answered()).toEqual([]);
+    });
+
+    it("a d, or an a, after ] is swallowed with the prefix: ], d and ], a answer nothing and move nothing", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      for (const k of ["a", "d"]) {
+        press("]");
+        wait(400);
+        press(k);
+        wait(1000);
+      }
+      expect(answered()).toEqual([]);
+      expect(cardAt(container, [first, second])).toBe(1);
+    });
+
+    /* S1 is unchanged: the jump is a key like any other, so an `a` right behind it -- `]pa`, typed as prose
+       or a slip -- is refused with the typing flash, whichever card the cursor is on now. */
+    it("an a typed hard on the heels of the jump answers nothing and says why", () => {
+      const { container } = arrivedOnTheFirstOfTwoCards();
+      top();
+      jump("]");
+      wait(80);
+      press("a");
+      wait(1000);
+      expect(answered()).toEqual([]);
+      expect(band(container)).toBe(TYPING);
+    });
+
+    it("from a card's own button the keys come back to the row: l onto Approve, then ]p, and a answers the card landed on", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      press("l");
+      expect(document.activeElement).toBe(first.approve);
+      wait(400);
+      jump("]");
+      expect(cardAt(container, [first, second])).toBe(2);
+      expect(document.activeElement).toBe(root(container));
+      wait(300);
+      press("a");
+      wait(300);
+      // Never perm-1, whose Approve had the keys a moment ago.
+      expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-2", decision: "allow" })]);
+    });
+
+    /* K02's Enter on a card's button needs a landing on that very button by the key right before it: the jump
+       is neither, so an Enter after it -- on the row now, as the keys came back -- only folds or unfolds the
+       card, and the button that had the keys before it is not pressed. */
+    it("Enter right after a jump answers nothing: the keys are the row's, and the button they left is not pressed", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      press("l");
+      expect(document.activeElement).toBe(first.approve);
+      jump("]");
+      expect(cardAt(container, [first, second])).toBe(2);
+      expect(document.activeElement).toBe(root(container));
+      for (const pause of [0, 300]) {
+        wait(pause);
+        expect(pressOnButton("Enter")).toBe(false); // claimed by the panel (a fold), never a native activation
+      }
+      wait(1000);
+      expect(answered()).toEqual([]);
+    });
+
+    it("skips a card already answered from this panel, though it is still drawn", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      press("a");
+      wait(1000);
+      expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1" })]);
+      expect(first.approve.disabled).toBe(true);
+      top();
+      jump("]");
+      expect(cardAt(container, [first, second])).toBe(2);
+      // Card 2 is now the only one that waits: it is its own next and previous, and nothing flashes.
+      jump("]");
+      expect(cardAt(container, [first, second])).toBe(2);
+      jump("[");
+      expect(cardAt(container, [first, second])).toBe(2);
+      expect(band(container)).not.toBe(NO_WAITING);
+      expect(answered()).toHaveLength(1);
+    });
+
+    it("counts a card whose answer Rust refused as waiting again, with nothing to reset", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      press("a");
+      wait(1000);
+      const [firstAnswer] = answered();
+      dispatch({ kind: "command_result", requestId: firstAnswer.request_id as string, ok: false, error: "could not save the rule: Permission denied" });
+      top();
+      jump("]");
+      expect(cardAt(container, [first, second])).toBe(1);
+    });
+
+    it("with no card waiting -- every one answered -- flashes and leaves the cursor where it was", () => {
+      const { container } = arrivedOnACard();
+      press("a");
+      wait(1000);
+      expect(answered()).toHaveLength(1);
+      top();
+      expect(container.querySelector(".row-current")!.textContent).toContain("tidy up");
+      jump("]");
+      expect(band(container)).toBe(NO_WAITING);
+      expect(container.querySelector(".row-current")!.textContent).toContain("tidy up");
+      jump("[");
+      expect(band(container)).toBe(NO_WAITING);
+      expect(container.querySelector(".row-current")!.textContent).toContain("tidy up");
+      expect(answered()).toHaveLength(1);
+    });
+
+    it("with no card in the conversation at all, ]p and [p flash the same and leave the cursor", () => {
+      const { container } = noCards();
+      top();
+      expect(container.querySelector(".row-current")!.textContent).toContain("alpha");
+      jump("]");
+      expect(band(container)).toBe(NO_WAITING);
+      expect(container.querySelector(".row-current")!.textContent).toContain("alpha");
+      wait(2100);
+      expect(band(container)).toBeNull();
+      jump("[");
+      expect(band(container)).toBe(NO_WAITING);
+      expect(container.querySelector(".row-current")!.textContent).toContain("alpha");
+      expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
+    });
+
+    /* A card whose session ended is inert (`PermissionCard`'s `inert`; `a` on it does nothing): it does not
+       wait for an answer, so the jump does not land on it. */
+    it("does not count the inert cards of a session that ended: ]p flashes and the cursor stays", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      dispatch({ kind: "events", tab: 1, fromRevision: 6, throughRevision: 7, events: [{ type: "session_closed", reason: "provider exited" }] });
+      expect(first.approve.disabled).toBe(true);
+      expect(second.approve.disabled).toBe(true);
+      top();
+      expect(container.querySelector(".row-current")!.textContent).toContain("tidy up");
+      jump("]");
+      expect(band(container)).toBe(NO_WAITING);
+      expect(container.querySelector(".row-current")!.textContent).toContain("tidy up");
+      jump("[");
+      expect(cardAt(container, [first, second])).toBe(0);
+      expect(answered()).toEqual([]);
+    });
+
+    /* A scroll the panel makes is announced on the list first, and `up` stops the list following a streaming
+       reply (`./follow`): the way that counts is the cursor's, not the key's -- `]p` wrapping from the last
+       card round to the first goes UP the list, `[p` wrapping the other way goes DOWN. */
+    it("announces the way the cursor really travels: a wrapping ]p goes up, a wrapping [p goes down", () => {
+      const { container } = arrivedOnTheFirstOfTwoCards();
+      top();
+      const list = container.querySelector(".message-list")!;
+      const seen: unknown[] = [];
+      list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
+      jump("]"); // prompt -> card 1
+      jump("]"); // card 1 -> card 2
+      jump("]"); // card 2 -> card 1, round the ring
+      jump("["); // card 1 -> card 2, round the ring
+      jump("["); // card 2 -> card 1
+      expect(seen).toEqual(["down", "down", "up", "down", "up"]);
+    });
+
+    it("a jump that stays -- the one card waiting is the one the cursor is on -- says nothing, and still takes the keys back", () => {
+      const { container } = arrivedOnACard();
+      const list = container.querySelector(".message-list")!;
+      const seen: unknown[] = [];
+      list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
+      const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+      press("l");
+      expect(document.activeElement).toBe(approve);
+      wait(400);
+      seen.length = 0; // `l` announces itself; only the jump is on trial
+      jump("]");
+      expect(container.querySelector(".row-current")!.contains(approve)).toBe(true);
+      expect(seen).toEqual([]);
+      expect(band(container)).not.toBe(NO_WAITING);
+      // The keys are the row's again, so Enter cannot press the button they left, and a answers this card.
+      expect(document.activeElement).toBe(root(container));
+      wait(300);
+      press("a");
+      wait(300);
+      expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+    });
+
+    it("the which-key box after ] lists p under the prompt pair, and a click on it jumps as typing it would", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      top();
+      press("]");
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      const box = container.querySelector(".which-key-box")!;
+      expect(box.querySelector(".wk-title")!.textContent).toBe("]");
+      expect(Array.from(box.querySelectorAll(".wk-entry")).map((e) => e.textContent)).toEqual(["]➜next prompt", "p➜next waiting card"]);
+      fireEvent.click(Array.from(box.querySelectorAll(".wk-entry")).find((e) => e.textContent?.startsWith("p"))!);
+      expect(cardAt(container, [first, second])).toBe(1);
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      expect(answered()).toEqual([]);
+    });
+
+    it("the box after [ says the same for the way back", () => {
+      const { container } = arrivedOnTheFirstOfTwoCards();
+      press("[");
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      const box = container.querySelector(".which-key-box")!;
+      expect(Array.from(box.querySelectorAll(".wk-entry")).map((e) => e.textContent)).toEqual(["[➜previous prompt", "p➜previous waiting card"]);
+    });
+
+    it("gives a composing p to the input method: ], then p mid-composition moves nothing and spends the prefix", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      top();
+      press("]");
+      press("p", { isComposing: true });
+      press("p", { keyCode: 229 });
+      expect(cardAt(container, [first, second])).toBe(0);
+      // The prefix went with the composing key: a plain p afterwards is a plain p, not a jump.
+      press("p");
+      expect(cardAt(container, [first, second])).toBe(0);
+      expect(answered()).toEqual([]);
+    });
+
+    it("a held p goes once: the first p jumps, its auto-repeats are a bare p and do nothing", () => {
+      const { container, first, second } = arrivedOnTheFirstOfTwoCards();
+      top();
+      press("]");
+      press("p");
+      for (let i = 0; i < 4; i++) press("p", { repeat: true });
+      expect(cardAt(container, [first, second])).toBe(1);
+      expect(answered()).toEqual([]);
+    });
+
+    it("is BROWSE's: typed into the composer, ]p is text", () => {
+      const { container } = arrivedOnTheFirstOfTwoCards();
+      press("i");
+      const box = container.querySelector<HTMLTextAreaElement>("textarea")!;
+      expect(box).not.toBeNull();
+      const notPrevented = [fireEvent.keyDown(box, { key: "]" }), fireEvent.keyDown(box, { key: "p" })];
+      expect(notPrevented).toEqual([true, true]);
+      expect(answered()).toEqual([]);
+    });
   });
 });
 
@@ -3025,12 +4748,12 @@ describe("App global HINT: the panel's half", () => {
 
   /** A prompt, a reply carrying one fenced code block, and a tool call gated by a pending card (an
    *  Approve, a Deny and a reason box), on a provider that can interrupt so Stop shows too. */
-  function conversation() {
+  function conversation(replyTail = "then look.") {
     const rendered = started({ capabilities: { ...initialState().capabilities, interrupt: true } });
     events(
       { type: "user_prompt_submitted", text: "list it" },
       { type: "turn_started", turn_id: "t1" },
-      { type: "content_delta", turn_id: "t1", kind: "text", text: "Run this:\n\n```\nls -la\n```\n\nthen look." },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "Run this:\n\n```\nls -la\n```\n\n" + replyTail },
       { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { cmd: "ls" } },
       { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
     );
@@ -3450,6 +5173,40 @@ describe("App global HINT: the panel's half", () => {
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
   });
 
+  /* K02 (ruling R3): a HINT landing is a landing -- the Enter right after it presses the button,
+     `TYPING_GUARD_MS` later, as `l` then Enter does. A key in between makes it none. */
+  it("K02: a HINT landing on Approve, then Enter, approves after S1's wait", () => {
+    vi.useFakeTimers();
+    try {
+      conversation();
+      show(1, collect(1));
+      dispatch({ kind: "hint_land", sessionId: 1, index: AT.approve });
+      act(() => vi.advanceTimersByTime(300));
+      expect(fireEvent.keyDown(document.activeElement!, { key: "Enter" })).toBe(false);
+      expect(lastOfType("permission_response")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("permission_response")).toMatchObject({ decision: "allow" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("K02: a HINT landing on Approve, then x, then Enter, presses nothing", () => {
+    vi.useFakeTimers();
+    try {
+      conversation();
+      show(1, collect(1));
+      dispatch({ kind: "hint_land", sessionId: 1, index: AT.approve });
+      act(() => vi.advanceTimersByTime(300));
+      press("x");
+      act(() => vi.advanceTimersByTime(300));
+      expect(fireEvent.keyDown(document.activeElement!, { key: "Enter" })).toBe(false);
+      act(() => vi.advanceTimersByTime(1000));
+      expect(lastOfType("permission_response")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("hint_land on a button from INPUT leaves the button focused, not the root", () => {
     const { container } = conversation();
     show(1, collect(1));
@@ -3467,6 +5224,130 @@ describe("App global HINT: the panel's half", () => {
     dispatch({ kind: "hint_land", sessionId: 1, index: AT.reason });
     expect((document.activeElement as HTMLElement).tagName).toBe("INPUT");
     expect(document.activeElement!.closest(".row-permission")).not.toBeNull();
+  });
+
+  /* v1 picks, Task 8 (R6): a web link in a reply is a HINT target, after its row's code blocks and before
+     its controls. Landing FOCUSES the anchor (never clicks it) with the reply's row current in BROWSE, and
+     Enter on it is the browser's own activation -- the native `LinkClicked` path -- not a key this panel claims. */
+  describe("web links (v1 picks, Task 8, R6)", () => {
+    const REPLY = "then look at https://example.com/a.";
+    /** `conversation()` with the link in the reply, its anchor on screen. Returns the anchor and where it sits in the list. */
+    function withLink() {
+      const rendered = conversation(REPLY);
+      const anchor = rendered.container.querySelector<HTMLAnchorElement>('.row-assistant a[href]')!;
+      box(anchor, 500);
+      return { ...rendered, anchor, at: 3 };
+    }
+
+    it("counts one more target for a link on screen, and puts it right after the reply's code block", () => {
+      const { container, anchor, at } = withLink();
+      const count = collect(1);
+      expect(count).toBe(Object.keys(AT).length + 1);
+      show(1, count);
+      const kinds = labels(container).map((l) => l.className.split(" ")[1]);
+      expect(kinds[AT.code]).toBe("hint-code");
+      expect(kinds[at]).toBe("hint-link");
+      expect(kinds[at + 1]).toBe("hint-row"); // the tool call's row, which used to follow the code block
+      expect(anchor.isConnected).toBe(true);
+    });
+
+    it("counts no link that is not on screen, or not a web link", () => {
+      const { container, anchor } = withLink();
+      box(anchor, 5000); // scrolled off the list
+      expect(collect(1)).toBe(Object.keys(AT).length);
+      box(anchor, 500);
+      anchor.setAttribute("href", "docs/a.md");
+      expect(collect(2)).toBe(Object.keys(AT).length);
+      expect(container.querySelector(".hint-layer")).toBeNull();
+    });
+
+    it("hint_land on a link focuses the anchor and makes its row current in BROWSE, pressing nothing", () => {
+      const { container, anchor, at } = withLink();
+      show(1, collect(1));
+      dispatch({ kind: "hint_land", sessionId: 1, index: at });
+      expect(document.activeElement).toBe(anchor);
+      expect(container.querySelector(".row-current")!.classList.contains("row-assistant")).toBe(true);
+      expect(container.querySelector(".row-current")!.contains(anchor)).toBe(true);
+      expect(labels(container)).toHaveLength(0);
+      expect(posted.filter((m) => m.type === "open_url" || m.type === "permission_response")).toEqual([]);
+    });
+
+    it("Enter on the landed link is left to the browser: not prevented, and no open_url from the panel", () => {
+      const { anchor, at } = withLink();
+      show(1, collect(1));
+      dispatch({ kind: "hint_land", sessionId: 1, index: at });
+      expect(fireEvent.keyDown(document.activeElement!, { key: "Enter" })).toBe(true);
+      expect(posted.filter((m) => m.type === "open_url")).toEqual([]);
+      expect(anchor.isConnected).toBe(true);
+    });
+
+    it("Space on the landed link is the browser's too: not claimed, not the leader", () => {
+      const { at } = withLink();
+      show(1, collect(1));
+      dispatch({ kind: "hint_land", sessionId: 1, index: at });
+      expect(fireEvent.keyDown(document.activeElement!, { key: " " })).toBe(true);
+      expect(posted.filter((m) => m.type === "open_url")).toEqual([]);
+    });
+
+    it("a landed link is not a card button: Enter on it answers nothing, however long after", () => {
+      vi.useFakeTimers();
+      try {
+        const { at } = withLink();
+        show(1, collect(1));
+        dispatch({ kind: "hint_land", sessionId: 1, index: at });
+        act(() => vi.advanceTimersByTime(300));
+        fireEvent.keyDown(document.activeElement!, { key: "Enter" });
+        act(() => vi.advanceTimersByTime(1000));
+        expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("draws the label of a link on its first line: a link wrapped onto two lines is labelled where it starts", () => {
+      const { container, anchor, at } = withLink();
+      const first = { top: 610, left: 40, bottom: 630, right: 300, width: 260, height: 20, x: 40, y: 610 } as DOMRect;
+      const second = { top: 630, left: 0, bottom: 650, right: 90, width: 90, height: 20, x: 0, y: 630 } as DOMRect;
+      anchor.getClientRects = () => [first, second] as unknown as DOMRectList;
+      // The bounding box of a wrapped link starts at the row's left edge, on its first line.
+      anchor.getBoundingClientRect = () =>
+        ({ top: 610, bottom: 650, left: 0, right: 300, width: 300, height: 40, x: 0, y: 610 }) as DOMRect;
+      show(1, collect(1));
+      const origin = root(container).getBoundingClientRect();
+      const label = labels(container)[at];
+      expect(label.classList.contains("hint-link")).toBe(true);
+      expect(label.style.top).toBe(`${first.top - origin.top - 6}px`);
+      expect(label.style.left).toBe(`${first.left - origin.left - 6}px`);
+    });
+
+    it("labels a wrapped link on a line that is on screen: the first line scrolled above the list is not where it goes", () => {
+      // Fix round 1 (Codex): `hintVisible` takes the link's whole box, so a link whose first line has left
+      // the list but whose last line is in it is a target -- its label must sit on the visible line.
+      const { container, anchor, at } = withLink();
+      const first = { top: -30, left: 40, bottom: -10, right: 300, width: 260, height: 20, x: 40, y: -30 } as DOMRect;
+      const second = { top: 0, left: 0, bottom: 20, right: 90, width: 90, height: 20, x: 0, y: 0 } as DOMRect;
+      anchor.getClientRects = () => [first, second] as unknown as DOMRectList;
+      anchor.getBoundingClientRect = () =>
+        ({ top: -30, bottom: 20, left: 0, right: 300, width: 300, height: 50, x: 0, y: -30 }) as DOMRect;
+      const count = collect(1);
+      expect(count).toBe(Object.keys(AT).length + 1); // still a target: part of it is in view
+      show(1, count);
+      const origin = root(container).getBoundingClientRect();
+      const label = labels(container)[at];
+      expect(label.classList.contains("hint-link")).toBe(true);
+      expect(label.style.top).toBe(`${second.top - origin.top - 6}px`);
+      expect(label.style.left).toBe(`${second.left - origin.left - 6}px`);
+    });
+
+    it("falls back to the bounding box where the browser reports no line boxes", () => {
+      const { container, anchor, at } = withLink();
+      show(1, collect(1));
+      const origin = root(container).getBoundingClientRect();
+      const r = anchor.getBoundingClientRect();
+      expect(anchor.getClientRects()).toHaveLength(0); // jsdom measures none
+      expect(labels(container)[at].style.top).toBe(`${r.top - origin.top - 6}px`);
+      expect(labels(container)[at].style.left).toBe(`${r.left - origin.left - 6}px`);
+    });
   });
 
   it("hint_land on a code block makes the next y copy only that block's code, once", () => {
@@ -3703,6 +5584,177 @@ describe("App keyboard: scrolling through the conversation", () => {
 
     expect(current(container)).toBe("b");
     expect(list.scrollTop).toBe(690); // the very end of the list
+  });
+
+  it("K01: a pane switch drops a count, as it drops a prefix", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3");
+    press("g"); press("g"); press("3");
+    dispatch({ kind: "pane_focus", focused: false });
+    dispatch({ kind: "pane_focus", focused: true });
+    press("j");
+    expect(current(container)).toBe("r1");
+  });
+  /* Fix round 1 (review): Shift+Tab never reaches `onKeyDown` (`onModeKey` stops it), so it drops a
+     waiting prefix and a count itself -- the mode still cycles. */
+  it("K01: Shift+Tab drops a waiting prefix: g, Shift+Tab, g is no gg", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3");
+    press("k"); press("k");
+    expect(current(container)).toBe("r1");
+    press("g");
+    press("Tab", { shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    press("g");
+    expect(current(container)).toBe("r1");
+  });
+  it("K01: Shift+Tab drops a count: 2, Shift+Tab, j moves one row", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3");
+    press("g"); press("g");
+    expect(current(container)).toBe("r0");
+    press("2");
+    press("Tab", { shiftKey: true });
+    press("j");
+    expect(current(container)).toBe("r1");
+  });
+  /* Fix round 1 (review): R2, a count survives its prefix -- `case "pending"` keeps it for the second
+     key, and `prompt-jump` repeats (before K01, `3[[` jumped one prompt). */
+  it("K01 (R2): a count survives its prefix: 3[[ goes three prompts back, 2]] two forward", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4", "r5");
+    expect(current(container)).toBe("r5");
+    press("3"); press("["); press("[");
+    expect(current(container)).toBe("r2");
+    press("2"); press("]"); press("]");
+    expect(current(container)).toBe("r4");
+  });
+  /* K01 fix round 2 (review): `[`/`]` arm with Alt or Meta held, so their second key reads them the
+     same way and `[[`/`]]` typed with either on both keys still jump, as before K01 -- on a layout
+     that types a bracket with Option (macOS German, French, Swiss), both keys are typed that way. */
+  it("K01: [[ and ]] typed with Alt or Meta held on both keys still jump", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3");
+    expect(current(container)).toBe("r3");
+    const held = (key: string, over: { altKey?: boolean; metaKey?: boolean }) =>
+      fireEvent.keyDown(document.activeElement ?? document.body, { key, ...over });
+    held("[", { altKey: true }); held("[", { altKey: true });
+    expect(current(container)).toBe("r2");
+    held("[", { metaKey: true }); held("[", { metaKey: true });
+    expect(current(container)).toBe("r1");
+    held("]", { altKey: true }); held("]", { altKey: true });
+    expect(current(container)).toBe("r2");
+    held("]", { metaKey: true }); held("]", { metaKey: true });
+    expect(current(container)).toBe("r3");
+  });
+
+  /* Task 3 (v1 picks, R2): a count before `G`/`gg` is vim's `{N}G`/`{N}gg` (`:help G`, `:help gg`) --
+     row N, and before `gt`/`gT` (`:help gt`) the tab NUMBERED N / N tabs back. Every other pair
+     ignores it, and `[[`/`]]` already repeat it (K01's own test above). */
+  it("counts: 3G and 3gg go to row 3, 2]] two prompts on (R2)", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    press("3"); press("G", { shiftKey: true }); expect(current(container)).toBe("r2");
+    press("g"); press("g"); expect(current(container)).toBe("r0");
+    press("3"); press("g"); press("g"); expect(current(container)).toBe("r2");
+    press("g"); press("g"); press("2"); press("]"); press("]"); expect(current(container)).toBe("r2");
+  });
+
+  it("counts: 2gt goes to tab 2, 9gt says there is none, a bare gt still steps (R2)", () => {
+    const widen = stubBandWidth();
+    try {
+      const { container } = started();
+      act(() => widen(container));
+      dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }, { ...LIVE_TAB, id: 3, number: 3, label: "3 new" }] });
+      const pair = (k: string, action: string) => ({ keys: ["g", k], action, desc: action, source: "default" });
+      dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], newTabChord: "Ctrl+b c",
+        panel: { leader: " ", leaderLabel: "Space", leaderSource: "default", timeoutlen: 1000, timeout: true, groups: [], bindings: [pair("t", "tab.next"), pair("T", "tab.prev")] } });
+      posted = [];
+      press("2"); press("g"); press("t");
+      expect(lastOfType("select_tab")).toMatchObject({ tab: 2 });
+      expect(lastOfType("tab_verb")).toBeUndefined();
+      posted = [];
+      press("9"); press("g"); press("t");
+      expect(posted).toEqual([]);
+      expect(container.querySelector(".band-message")?.textContent).toBe("no tab 9");
+      press("g"); press("t");
+      expect(lastOfType("tab_verb")).toMatchObject({ verb: "next" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("counts: a count past the last row lands on the last row, and 1G returns to the first", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2");
+    press("g"); press("g");
+    expect(current(container)).toBe("r0");
+    // A real capital G puts a bare Shift keydown before it; that must not drop the count.
+    press("9"); press("9"); press("Shift", { shiftKey: true }); press("G", { shiftKey: true });
+    expect(current(container)).toBe("r2");
+    press("g"); press("g");
+    press("9"); press("g"); press("g");
+    expect(current(container)).toBe("r2");
+    press("1"); press("G", { shiftKey: true });
+    expect(current(container)).toBe("r0");
+  });
+
+  it("counts: {N}G brings row N on screen the way a j landing does, and never scrolls the list to an end", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [400, 990, 400]);
+    press("g"); press("g");
+    expect(list.scrollTop).toBe(0);
+    // "b" is taller than the 400px view and starts where the view ends: its top is aligned, as `j` does.
+    press("2"); press("G", { shiftKey: true });
+    expect(current(container)).toBe("b");
+    expect(list.scrollTop).toBe(400);
+    // A bare `G` still scrolls the list to its very end ...
+    press("G", { shiftKey: true });
+    expect(current(container)).toBe("c");
+    expect(list.scrollTop).toBe(1390);
+    // ... and `2gg` back onto "b" shows the edge it arrives from (its bottom), not the top of the list.
+    press("2"); press("g"); press("g");
+    expect(current(container)).toBe("b");
+    expect(list.scrollTop).toBe(990);
+  });
+
+  it("counts: {N}G onto a row that fits is revealed with scrollIntoView, leaving the list where it was", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [400, 990, 400]);
+    press("g"); press("g");
+    expect(list.scrollTop).toBe(0);
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoView.mockClear();
+    press("3"); press("G", { shiftKey: true });
+    expect(current(container)).toBe("c");
+    // The reveal is the cursor effect's -- the same call a `j` landing makes on a row that fits ...
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+    // ... and a bare `G` would have scrolled the list to its very end (1390) before it.
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it("counts: 3gt posts the tab's id, 2gT wraps back past the first tab, and a count before ]b is ignored (R2)", () => {
+    started();
+    const info = (id: number, number: number) => ({ ...LIVE_TAB, id, number, label: `${number} new` });
+    dispatch({ kind: "tabs", active: 1, tabs: [info(1, 1), info(2, 2), info(5, 3)] });
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], newTabChord: "Ctrl+b c",
+      panel: { ...TABLE, bindings: [binding(["g", "t"], "tab.next"), binding(["g", "T"], "tab.prev"), binding(["]", "b"], "tab.next")] } });
+    posted = [];
+    press("3"); press("g"); press("t");
+    // The third tab in the bar is tab id 5: the message names the id, never the number.
+    expect(lastOfType("select_tab")).toMatchObject({ tab: 5 });
+    expect(lastOfType("tab_verb")).toBeUndefined();
+    posted = [];
+    // A real `gT` puts a bare Shift keydown between `g` and `T`; it must not drop the count.
+    press("2"); press("g"); press("Shift", { shiftKey: true }); press("T", { shiftKey: true });
+    expect(lastOfType("select_tab")).toMatchObject({ tab: 2 });
+    expect(lastOfType("tab_verb")).toBeUndefined();
+    posted = [];
+    press("3"); press("]"); press("b");
+    expect(posted.filter((m) => m.type === "tab_verb").map((m) => m.verb)).toEqual(["next"]);
+    expect(lastOfType("select_tab")).toBeUndefined();
   });
 
   it("k is the mirror: lands on a tall row's BOTTOM and scrolls up through it before moving", () => {
@@ -3956,6 +6008,211 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(current(container)).toBe("r3"); // the LAST row still on screen
   });
 
+  /* v1 picks, Task 5 (decision #13, ruling R10; vim `:help CTRL-F`): a whole view down or up with two
+     text lines of the old one kept, counted. Rows of 300 in a 400px view and 20px lines, so one page is
+     400 - 2 x 20 = 360px. */
+  it("Ctrl+f, PageDown and PageUp scroll a view keeping two lines; a count repeats them", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    list.style.lineHeight = "20px";
+    press("g");
+    press("g");
+
+    press("f", { ctrlKey: true });
+    expect(list.scrollTop).toBe(360);
+    press("PageDown");
+    expect(list.scrollTop).toBe(720);
+    press("PageUp");
+    expect(list.scrollTop).toBe(360);
+    press("PageUp");
+    expect(list.scrollTop).toBe(0);
+
+    press("2");
+    press("f", { ctrlKey: true });
+    expect(list.scrollTop).toBe(720); // two pages in one press
+    press("2");
+    press("PageUp");
+    expect(list.scrollTop).toBe(0);
+    press("2");
+    press("PageDown");
+    expect(list.scrollTop).toBe(720);
+  });
+
+  /* The same trap Ctrl+e's own test names: a real `Ctrl+f` is a bare `Control` keydown FIRST, then `f`,
+     and that first key must not spend the count. */
+  it("a bare Control keydown between the count and Ctrl+f does not clear the count", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g");
+    press("g");
+
+    press("2");
+    press("Control", { ctrlKey: true });
+    press("f", { ctrlKey: true });
+    expect(list.scrollTop).toBe(720);
+  });
+
+  /* Two lines of what the reader READS: the cursor row's text (`.row-body`, which `fakeLayout` gives
+     20px), never the list's own line height -- `.message-list` sets none in `index.css`, so it reads
+     `normal`, well under the prose line (the finding Ctrl+e's own text-line test records). The list's
+     mismatched 999px here would leave one pixel of a page. */
+  it("a page keeps two lines of the row's TEXT, not of the list's own line height", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    list.style.lineHeight = "999px";
+    press("g");
+    press("g");
+
+    press("f", { ctrlKey: true });
+
+    expect(list.scrollTop).toBe(360);
+  });
+
+  /* A page never goes against its own direction. In a view shorter than the two lines it keeps (30px of
+     view, 20px lines: 30 - 40 = -10) a bare subtraction would make Ctrl+f scroll UP; the step is at
+     least one pixel instead, so the key still goes forward and PageUp still comes back. */
+  it("a page in a view shorter than its two kept lines still goes the way the key says", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2");
+    const list = fakeLayout(container, [300, 300, 300], 30);
+    press("g");
+    press("g");
+
+    press("f", { ctrlKey: true });
+    expect(list.scrollTop).toBe(1);
+    press("PageDown");
+    expect(list.scrollTop).toBe(2);
+    press("PageUp");
+    expect(list.scrollTop).toBe(1);
+  });
+
+  /* The cursor follows the view the way Ctrl+d's does: a row still (partly) on screen keeps it, one that
+     left is replaced by the NEAREST row on screen, and the view stays where the page put it. */
+  it("a page that carries the cursor's row off screen re-homes it to the nearest visible row", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g");
+    press("g");
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoView.mockClear();
+
+    press("f", { ctrlKey: true }); // 360: r0 (0-300) has left; r1 (300-600) is the first row on screen
+    expect(list.scrollTop).toBe(360);
+    expect(current(container)).toBe("r1");
+    press("PageDown"); // 720: r1 has left; r2 (600-900) is the first on screen
+    expect(list.scrollTop).toBe(720);
+    expect(current(container)).toBe("r2");
+    expect(scrollIntoView).not.toHaveBeenCalled(); // and the view stayed where the page put it
+    press("PageUp"); // 360: r2 is still partly on screen: the cursor stays
+    expect(list.scrollTop).toBe(360);
+    expect(current(container)).toBe("r2");
+
+    press("G", { shiftKey: true }); // cursor to r4, the view at the very end (1100)
+    expect(current(container)).toBe("r4");
+    press("PageUp"); // 740: r4 (1200-1500) is below the view; r3 (900-1200) is the LAST row on screen
+    expect(list.scrollTop).toBe(740);
+    expect(current(container)).toBe("r3");
+  });
+
+  it("a page that re-homes the cursor takes the keys back from a focused control", () => {
+    const { container } = started();
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+    );
+    prompts("r1", "r2", "r3");
+    const list = fakeLayout(container, [300, 300, 300, 300]);
+    press("g");
+    press("g");
+    const rows = list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
+    expect(rows[0].querySelector('[data-nav-action="allow"]')).not.toBeNull();
+    press("l"); // Approve on the card (row 0) has the keys
+    expect((document.activeElement as HTMLElement).closest('[data-nav-stop="row"]')).toBe(rows[0]);
+
+    press("f", { ctrlKey: true }); // 360: the card has left the view; the cursor re-homes to r1
+    expect(current(container)).toBe("r1");
+    // The root, so Enter now acts on r1 rather than natively activating an Approve nobody can see.
+    expect(document.activeElement).toBe(root(container));
+  });
+
+  /* The announcement the follow logic reads (`./follow`): a page down leaves the scroll's own
+     direction to decide (reaching the bottom re-arms following), a page up stops following at once. */
+  it("a page announces the scroll it makes: down for Ctrl+f and PageDown, up for PageUp", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g");
+    press("g");
+    const seen: unknown[] = [];
+    list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
+
+    press("f", { ctrlKey: true });
+    press("PageDown");
+    press("PageUp");
+
+    expect(seen).toEqual(["down", "down", "up"]);
+  });
+
+  it("a page with no rows at all does nothing and breaks nothing", () => {
+    const { container } = started();
+    const at = root(container);
+    expect(() => {
+      fireEvent.keyDown(at, { key: "f", ctrlKey: true });
+      fireEvent.keyDown(at, { key: "PageDown" });
+      fireEvent.keyDown(at, { key: "PageUp" });
+    }).not.toThrow();
+    expect(container.querySelector(".row-current")).toBeNull();
+  });
+
+  /* ArrowDown/ArrowUp are exactly `j`/`k` (ruling R10): the same action, so the same row-at-a-time
+     move, the same count, and the same walk through a row taller than the view. */
+  it("ArrowDown and ArrowUp move a row like j and k, and take a count", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3");
+    fakeLayout(container, [100, 100, 100, 100]);
+    press("g");
+    press("g");
+
+    press("ArrowDown");
+    expect(current(container)).toBe("r1");
+    press("ArrowDown");
+    expect(current(container)).toBe("r2");
+    press("ArrowUp");
+    expect(current(container)).toBe("r1");
+    press("2");
+    press("ArrowDown");
+    expect(current(container)).toBe("r3");
+    press("3");
+    press("ArrowUp");
+    expect(current(container)).toBe("r0");
+  });
+
+  it("ArrowDown scrolls through a tall row before moving on, exactly as j does", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [100, 990, 100]);
+    press("g");
+    press("g");
+
+    press("ArrowDown");
+    expect(current(container)).toBe("b");
+    expect(list.scrollTop).toBe(0);
+    // 690px of "b" is below the view: eleven 60px steps, then a 30px one -- j's own numbers.
+    const seen: number[] = [];
+    for (let i = 0; i < 12; i++) {
+      press("ArrowDown");
+      seen.push(list.scrollTop);
+    }
+    expect(current(container)).toBe("b");
+    expect(seen).toEqual([60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 690]);
+    press("ArrowDown");
+    expect(current(container)).toBe("c");
+  });
+
   it("G goes to the last row and the very end of the list; gg to the first row and the top", () => {
     const { container } = started();
     prompts("a", "b", "c");
@@ -3980,6 +6237,145 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(list.scrollTop).toBe(690);
   });
 
+  /* v1 picks, Task 4 (vim `:help zt`/`zz`/`zb`): the ROW goes to an edge of the view -- not a text
+     line -- and with a count, row N first (`3zt`: row 3 at the top, and the cursor on it). Rows of 300
+     in a 400px view, so r2 (600-900) is never on an edge by luck. */
+  it("zt / zb / zz put the cursor's row at the top / bottom / middle; 3zt row 3 at the top", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g"); press("g"); press("2"); press("j"); // r2: top 600, view 400
+    press("z"); press("t"); expect(list.scrollTop).toBe(600);
+    press("z"); press("b"); expect(list.scrollTop).toBe(500);
+    press("z"); press("z"); expect(list.scrollTop).toBe(550);
+    press("g"); press("g"); press("3"); press("z"); press("t");
+    expect(current(container)).toBe("r2");
+    expect(list.scrollTop).toBe(600);
+  });
+
+  it("zt / zb / zz never move the cursor without a count, and take the keys back for the row", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g"); press("g"); press("2"); press("j");
+    expect(current(container)).toBe("r2");
+    for (const second of ["t", "b", "z"]) {
+      // The keys are somewhere else (a control inside the panel, say): like every cursor command, the
+      // scroll hands them back to the row, or a stale focus would keep answering Enter for it.
+      act(() => root(container).blur());
+      expect(document.activeElement, `before z${second}`).not.toBe(root(container));
+      fireEvent.keyDown(root(container), { key: "z" });
+      fireEvent.keyDown(root(container), { key: second });
+      expect(current(container), `z${second}`).toBe("r2");
+      expect(document.activeElement, `z${second}`).toBe(root(container));
+    }
+    expect(list.scrollTop).toBe(550);
+  });
+
+  /* A row taller than the view is aligned by its own edge (its top for `zt`, its bottom for `zb`, its
+     middle for `zz`), never refused; and an edge the list cannot reach is where scrollTop clamps, as a
+     browser clamps it -- the first row's bottom above the view's bottom, the last row's top below the
+     view's top. */
+  it("zt / zb / zz align a row taller than the view, and clamp where the list ends", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [100, 990, 100]); // total 1190: scrollTop 0..790
+    press("g"); press("g");
+    press("z"); press("b");
+    expect(list.scrollTop, "a's bottom (100) cannot go below the top of the list").toBe(0);
+    press("j"); // "b": 100-1090
+    expect(current(container)).toBe("b");
+    press("z"); press("t"); expect(list.scrollTop).toBe(100);
+    press("z"); press("b"); expect(list.scrollTop).toBe(690); // 1090 - 400
+    press("z"); press("z"); expect(list.scrollTop).toBe(395); // its middle (595) at the view's middle (200)
+    press("G", { shiftKey: true });
+    expect(current(container)).toBe("c");
+    press("z"); press("t");
+    expect(list.scrollTop, "c's top (1090) is past what the list can scroll to").toBe(790);
+    expect(current(container)).toBe("c");
+  });
+
+  /* R2: a count is a row number (1-based), clamped to the rows there are, and the cursor lands on it
+     whichever edge it is put at. */
+  it("a count before zt / zz / zb names the row: 9zt clamps to the last, 2zz and 4zb land on theirs", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g"); press("g");
+    press("9"); press("z"); press("t");
+    expect(current(container)).toBe("r4");
+    expect(list.scrollTop, "r4's top (1200) is past the end").toBe(1100);
+
+    press("g"); press("g");
+    press("2"); press("z"); press("z");
+    expect(current(container)).toBe("r1");
+    expect(list.scrollTop).toBe(250); // r1 300-600: its middle (450) at the view's middle (200)
+
+    press("4"); press("z"); press("b");
+    expect(current(container)).toBe("r3");
+    expect(list.scrollTop).toBe(800); // r3 900-1200: its bottom at the view's bottom (400)
+  });
+
+  /* A row `zt` has just placed is not revealed again: the `[cursor]` effect that brings a moved cursor's
+     row on screen would otherwise `scrollIntoView` it (`block: "nearest"`) over the edge the key chose --
+     in jsdom that call is a mock, so what can be seen is whether it happened. */
+  it("a counted zt places the row itself: nothing reveals it again afterwards", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g"); press("g");
+    const reveal = Element.prototype.scrollIntoView as unknown as ReturnType<typeof vi.fn>;
+    reveal.mockClear();
+    press("3"); press("z"); press("t");
+    expect(current(container)).toBe("r2");
+    expect(list.scrollTop).toBe(600);
+    expect(reveal).not.toHaveBeenCalled();
+  });
+
+  it("3zt spends its count: the next j moves one row, not three", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g"); press("g");
+    press("3"); press("z"); press("t");
+    expect(current(container)).toBe("r2");
+    press("j");
+    expect(current(container)).toBe("r3");
+  });
+
+  /* The announcement the follow logic reads (`./follow`): a scroll the panel makes itself says which
+     way, so a `zb` that brings the view UP stops following at once instead of waiting for the scroll
+     event, and a `zt` that brings it down leaves the scroll's own direction to decide. */
+  it("zt / zb / zz announce the scroll they make: down when the view moves down, up when it moves up", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g"); press("g"); press("2"); press("j");
+    list.scrollTop = 0;
+    const seen: unknown[] = [];
+    list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
+    press("z"); // the first half says nothing
+    expect(seen).toEqual([]);
+    press("t"); // r2's top (600) is below the view's top: the view moves down (to 600)
+    press("z"); press("b"); // its bottom (900) is above the view's bottom (1000): up (to 500)
+    press("z"); press("z"); // its middle (750) is below the view's middle (700): down (to 550)
+    expect(seen).toEqual(["down", "up", "down"]);
+  });
+
+  it("zt / zz / zb and a counted 3zt with no rows at all do nothing and break nothing", () => {
+    const { container } = started();
+    const at = root(container);
+    expect(at).not.toBeNull();
+    const keys = (...list: string[]) => list.forEach((key) => fireEvent.keyDown(at, { key }));
+    expect(() => {
+      keys("z", "t", "z", "z", "z", "b", "3", "z", "t");
+    }).not.toThrow();
+    expect(container.querySelector(".row-current")).toBeNull();
+    // ...and the prefix was spent each time: the next key is a plain key again.
+    keys("i");
+    expect(container.querySelector("textarea")).not.toBeNull();
+  });
+
   it("a lone g does nothing, and any other key cancels it", () => {
     const { container } = started();
     prompts("a", "b", "c");
@@ -3994,6 +6390,10 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("g");
     expect(current(container)).toBe("a");
 
+    // K01 (X-A-11): the key that cancels a lone `g` is swallowed with it. This used to pin the leak
+    // -- that first `j` moved as a bare `j` -- which is how `g`, a pause, `d` denied a card.
+    press("j");
+    expect(current(container)).toBe("a");
     press("j");
     press("j");
     expect(current(container)).toBe("c");
@@ -4759,6 +7159,135 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
   });
 });
 
+/* R9 (idiom matrix E10; kbux pass 2026-09-29, row P15): `Ctrl+[` is Esc, as in vim, nvim and every
+   terminal. WebKitGTK 2.52.6 delivers it as `key "["`, `code BracketLeft`, `ctrlKey`, and nothing
+   here read that as Esc. One document-capture listener (`./ctrlBracket`, installed by `App`'s first
+   effect) re-dispatches it as a plain Escape keydown on the same target, so every place below is a
+   place the panel already reads Escape -- each test drives the real `App` with `Ctrl+[` where its
+   Escape tests drive it with `Escape`. The CARET/VISUAL half is in "BROWSE visual mode" further down. */
+describe("Ctrl+[ is Esc everywhere in the panel (R9, kbux P15)", () => {
+  const CTRL_BRACKET = { key: "[", code: "BracketLeft", ctrlKey: true };
+  const CHOOSER = {
+    kind: "chooser",
+    open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }],
+    records: [],
+  };
+  const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const modeOf = (c: HTMLElement) => c.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode;
+
+  function started() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    // The band names the mode only while this pane holds the keys (v1 polish F24).
+    dispatch({ kind: "pane_focus", focused: true });
+    return rendered;
+  }
+
+  it("INPUT, then Ctrl+[, lands in BROWSE, as Esc does", () => {
+    const { container } = started();
+    enterInputMode(container);
+    const textarea = container.querySelector("textarea")!;
+    expect(textarea).not.toBeNull();
+    expect(modeOf(container)).toBe("input");
+    expect(fireEvent.keyDown(textarea, CTRL_BRACKET), "the Ctrl+[ itself is claimed").toBe(false);
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(container.querySelector(".composer-browse-hint")).not.toBeNull();
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("closes the chooser", () => {
+    const { container } = started();
+    dispatch(CHOOSER);
+    expect(container.querySelector(".chooser")).not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".chooser")!, CTRL_BRACKET);
+    expect(container.querySelector(".chooser")).toBeNull();
+  });
+
+  it("closes the chooser's filter box, then the chooser, one Esc each", () => {
+    const { container } = started();
+    dispatch(CHOOSER);
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    expect(filter).not.toBeNull();
+    fireEvent.keyDown(filter, CTRL_BRACKET);
+    expect(container.querySelector(".chooser-filter"), "the first leaves the filter").toBeNull();
+    expect(container.querySelector(".chooser"), "and only the filter").not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".chooser")!, CTRL_BRACKET);
+    expect(container.querySelector(".chooser")).toBeNull();
+  });
+
+  it("closes the ? overlay", () => {
+    const { container } = started();
+    act(() => root(container).focus());
+    fireEvent.keyDown(root(container), { key: "?", shiftKey: true });
+    const overlay = container.querySelector<HTMLElement>(".keymap-overlay");
+    expect(overlay).not.toBeNull();
+    fireEvent.keyDown(overlay!, CTRL_BRACKET);
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+  });
+
+  it("closes the ? overlay on the empty tab's start screen too", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    act(() => dispatch({ kind: "open_keymap" }));
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".empty-tab")!, CTRL_BRACKET);
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+  });
+
+  it("closes the / prompt", () => {
+    const { container } = started();
+    fireEvent.keyDown(root(container), { key: "/" });
+    const input = container.querySelector<HTMLInputElement>(".search-bar input");
+    expect(input).not.toBeNull();
+    fireEvent.keyDown(input!, CTRL_BRACKET);
+    expect(container.querySelector(".search-bar")).toBeNull();
+  });
+
+  it("a composing Ctrl+[ does nothing: an input method's own key, as Esc is", () => {
+    const { container } = started();
+    enterInputMode(container);
+    const textarea = container.querySelector("textarea")!;
+    for (const composing of [{ isComposing: true }, { keyCode: 229 }]) {
+      expect(fireEvent.keyDown(textarea, { ...CTRL_BRACKET, ...composing }), "left to the input method").toBe(true);
+      expect(container.querySelector("textarea"), JSON.stringify(composing)).not.toBeNull();
+      expect(modeOf(container)).toBe("input");
+    }
+    // The same over an overlay: the ? overlay closes on a real Ctrl+[, not on a composing one.
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    fireEvent.keyDown(root(container), { key: "?", shiftKey: true });
+    const overlay = container.querySelector<HTMLElement>(".keymap-overlay")!;
+    fireEvent.keyDown(overlay, { ...CTRL_BRACKET, isComposing: true });
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+    fireEvent.keyDown(overlay, CTRL_BRACKET);
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+  });
+
+  it("only a plain Ctrl+[ leaves INPUT: with Shift, Alt or Meta held, or with no Ctrl, it does not", () => {
+    const { container } = started();
+    enterInputMode(container);
+    const textarea = container.querySelector("textarea")!;
+    for (const init of [
+      { key: "{", ctrlKey: true, shiftKey: true },
+      { ...CTRL_BRACKET, altKey: true },
+      { ...CTRL_BRACKET, metaKey: true },
+      { key: "[" },
+    ]) {
+      fireEvent.keyDown(textarea, init);
+      expect(container.querySelector("textarea"), JSON.stringify(init)).not.toBeNull();
+    }
+  });
+
+  it("stops claiming Ctrl+[ once the panel unmounts", () => {
+    const { unmount } = started();
+    expect(fireEvent.keyDown(document.body, CTRL_BRACKET), "claimed while mounted").toBe(false);
+    unmount();
+    expect(fireEvent.keyDown(document.body, CTRL_BRACKET), "not claimed once gone").toBe(true);
+  });
+});
+
 describe("V2/panel round 2: the activity line, the bottom band, and the detail popover (Task 10)", () => {
   it("puts the activity line above the composer, then the band -- and none of the components it replaced", () => {
     const { container } = render(<App />);
@@ -4856,6 +7385,25 @@ describe("the panel's own scroll keys announce themselves to the message list", 
       fireEvent.keyDown(root, key);
     }
     expect(seen).toEqual(["down", "up", "down", "up", "down", "up", "down", "up"]);
+  });
+
+  /* Task 3 (v1 picks, R2): `{N}G` / `{N}gg` go to row N, so the direction they announce is where that
+     row sits against the cursor -- not the end a bare `G`/`gg` names whatever the cursor is (above). */
+  it("says which way a counted jump goes: up to an earlier row, down to a later one", () => {
+    const { container } = startedApp();
+    const list = container.querySelector(".message-list")!;
+    const seen: unknown[] = [];
+    list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
+    const root = container.querySelector(".agent-ui-conversation")!;
+    // The snapshot lands the cursor on the last of the three rows.
+    for (const key of [
+      { key: "1" }, { key: "G", shiftKey: true }, // row 1, from row 3: up
+      { key: "3" }, { key: "G", shiftKey: true }, // row 3, from row 1: down
+      { key: "2" }, { key: "g" }, { key: "g" }, // row 2, from row 3: up (the first g says nothing)
+    ]) {
+      fireEvent.keyDown(root, key);
+    }
+    expect(seen).toEqual(["up", "down", "up"]);
   });
 
   it("says nothing for a key that cannot move the conversation", () => {
@@ -5452,6 +8000,30 @@ describe("accumulateMotionCount (v1 audit R4)", () => {
   });
 });
 
+/** Task 3 (v1 picks, R2): where `gg`/`G` land, bare and counted. Pure -- the keyboard wiring around
+ *  it is "counts: ..." in the scrolling describe. */
+describe("jumpTarget (vim {N}G / {N}gg)", () => {
+  it("is the first or the last row when bare", () => {
+    expect(jumpTarget("first", null, 5)).toBe(0);
+    expect(jumpTarget("last", null, 5)).toBe(4);
+  });
+  it("is row N, counted from 1, with a count -- gg and G alike", () => {
+    expect(jumpTarget("last", 3, 5)).toBe(2);
+    expect(jumpTarget("first", 3, 5)).toBe(2);
+    expect(jumpTarget("last", 1, 5)).toBe(0);
+    expect(jumpTarget("last", 5, 5)).toBe(4);
+  });
+  it("clamps a count past the last row onto it, as vim's {N}G does past the last line", () => {
+    expect(jumpTarget("last", 6, 5)).toBe(4);
+    expect(jumpTarget("first", 9999, 5)).toBe(4);
+  });
+  it("is row 0 when there are no rows, counted or not", () => {
+    expect(jumpTarget("first", null, 0)).toBe(0);
+    expect(jumpTarget("last", null, 0)).toBe(0);
+    expect(jumpTarget("last", 3, 0)).toBe(0);
+  });
+});
+
 describe("BROWSE: counts, prompt jumps and Ctrl+c", () => {
   it("3j moves three rows, and ]] / [[ go from prompt to prompt", () => {
     const { container } = render(<App />);
@@ -5739,6 +8311,109 @@ describe("P2 runs and R3 the detailed view", () => {
     expect(container.querySelectorAll(".row-tool")).toHaveLength(3);
     expect(container.querySelectorAll('[data-folded="true"]'), "the detailed view is the tab's own").toHaveLength(0);
   });
+
+  /* v1 picks, Task 4 (vim `zo`/`zc`): the fold Enter flips on a collapsed run, opened and closed by
+     name. `zc` closes the INNERMOST open fold -- a call's own open result before the run it sits in --
+     and from any of the run's calls, the cursor following the run back (`indexOfKey` finds a call at
+     its run). Two finished `Read`s, then a message, exactly as the Enter test above. */
+  function twoReadsThenAMessage() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    const done = { content: "ok", isError: false };
+    dispatchLiveTab(
+      snapshotState({
+        toolCalls: [
+          { seq: 1, toolUseId: "a", name: "Read", input: { file_path: "a.rs" }, result: done },
+          { seq: 2, toolUseId: "b", name: "Read", input: { file_path: "b.rs" }, result: done },
+        ],
+        transcript: [{ seq: 3, text: "done" }],
+      }),
+      4,
+    );
+    gg(rendered.container);
+    const root = rendered.container.querySelector(".agent-ui-conversation")!;
+    const z = (second: string) => {
+      fireEvent.keyDown(root, { key: "z" });
+      fireEvent.keyDown(root, { key: second });
+    };
+    const summary = () => rendered.container.querySelector(".row-tool-run")?.textContent ?? null;
+    const calls = () => rendered.container.querySelectorAll(".row-tool").length;
+    return { ...rendered, root, z, summary, calls };
+  }
+
+  it("zo on a collapsed run expands it, and zc on either of its calls collapses it again", () => {
+    const { container, root, z, summary, calls } = twoReadsThenAMessage();
+    expect(summary()).toContain("Read ×2");
+
+    z("o");
+    expect(summary(), "zo opened the run").toBeNull();
+    expect(calls()).toBe(2);
+
+    // The cursor is on the run's first call, whose own result is closed: zc there closes the run again,
+    // the cursor on it.
+    expect(container.querySelector(".row-current")!.textContent).toContain("a.rs");
+    z("c");
+    expect(summary()).toContain("Read ×2");
+    expect(calls()).toBe(0);
+    expect(container.querySelector(".row-current")!.classList.contains("row-tool-run")).toBe(true);
+    z("c");
+    expect(summary(), "zc on a run that is closed leaves it closed").toContain("Read ×2");
+
+    // ...and from its SECOND call the cursor follows the run back to where it folded.
+    z("o");
+    fireEvent.keyDown(root, { key: "j" });
+    expect(container.querySelector(".row-current")!.textContent).toContain("b.rs");
+    z("c");
+    expect(summary()).toContain("Read ×2");
+    expect(container.querySelector(".row-current")!.classList.contains("row-tool-run")).toBe(true);
+  });
+
+  it("zo on a call of an open run opens that call's own result, and the run stays open", () => {
+    const { container, z, summary, calls } = twoReadsThenAMessage();
+    z("o");
+    expect(container.querySelectorAll('[data-folded="true"]')).toHaveLength(2);
+    z("o"); // the cursor is on the first call now, not the run: the innermost closed fold is its result
+    expect(container.querySelectorAll('[data-folded="true"]')).toHaveLength(1);
+    expect(calls()).toBe(2);
+    expect(summary()).toBeNull();
+    z("o");
+    expect(container.querySelectorAll('[data-folded="true"]'), "zo on an open result leaves it open").toHaveLength(1);
+  });
+
+  it("zc closes a call's own open result before the run it sits in", () => {
+    const { container, root, z, summary, calls } = twoReadsThenAMessage();
+    z("o");
+    fireEvent.keyDown(root, { key: "Enter" }); // the first call's own result
+    expect(container.querySelectorAll('[data-folded="true"]')).toHaveLength(1);
+
+    z("c");
+    expect(calls(), "the run is still open").toBe(2);
+    expect(container.querySelectorAll('[data-folded="true"]'), "its result closed first").toHaveLength(2);
+    z("c");
+    expect(summary(), "the second zc closes the run").toContain("Read ×2");
+  });
+
+  it("Ctrl+o shows every call and zc folds nothing there -- not even a run opened before it", () => {
+    const { container, root, z, summary, calls } = twoReadsThenAMessage();
+    fireEvent.keyDown(root, { key: "o", ctrlKey: true });
+    expect(calls()).toBe(2);
+    expect(summary()).toBeNull();
+    z("c");
+    expect(calls(), "the detailed view has no run to fold").toBe(2);
+    expect(summary()).toBeNull();
+    fireEvent.keyDown(root, { key: "o", ctrlKey: true }); // back to the folded view: the run again
+    expect(summary()).toContain("Read ×2");
+    expect(container.querySelectorAll('[data-folded="true"]')).toHaveLength(0);
+
+    // A run opened first, then the detailed view: zc there must leave it open for when Ctrl+o ends.
+    z("o");
+    expect(summary()).toBeNull();
+    fireEvent.keyDown(root, { key: "o", ctrlKey: true });
+    z("c");
+    fireEvent.keyDown(root, { key: "o", ctrlKey: true });
+    expect(summary(), "zc in the detailed view closed nothing").toBeNull();
+    expect(calls()).toBe(2);
+  });
 });
 
 describe("N3 and P5 in the conversation", () => {
@@ -5891,6 +8566,465 @@ describe("N2 and R3: the editor round trips", () => {
     expect(container.querySelector(".band-message")!.textContent).toBe("the editor is not ready yet");
     expect(container.querySelector(".command-notice")).toBeNull();
     vi.unstubAllGlobals();
+  });
+});
+
+/* v1 picks, Task 8 (ruling R6): `gx` opens the web link of the row under the cursor. One link whose
+   visible text IS its address opens at once; several, or a titled one, or one nobody can see, wait for a
+   letter with each full address shown (Review Focus 3: a link in a model's reply is never opened without
+   the reader having seen where it goes). The page posts `open_url` with the WHATWG-normalized `href`;
+   Rust re-checks it (`agent_panel.rs#web_url`). jsdom lays nothing out, so `boxLinks` gives the
+   conversation, the list and each visible anchor a box -- what `hintVisible` reads as "on screen". */
+describe("gx: web links on a row (v1 picks, Task 8, R6)", () => {
+  function withReply(text: string) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text }] }), 2);
+    return rendered;
+  }
+  const boxOf = (el: Element, top: number, height: number) => {
+    (el as HTMLElement).getBoundingClientRect = () =>
+      ({ top, bottom: top + height, left: 0, right: 100, width: 100, height, x: 0, y: top }) as DOMRect;
+  };
+  /** Every anchor that is not `hidden` is on screen, one below the other. */
+  function boxLinks(container: HTMLElement) {
+    boxOf(container.querySelector(".agent-ui-conversation")!, 0, 1000);
+    boxOf(container.querySelector(".message-list")!, 0, 1000);
+    let y = 0;
+    for (const a of container.querySelectorAll(".row a[href]:not([hidden])")) {
+      boxOf(a, y, 10);
+      y += 10;
+    }
+  }
+  const rootOf = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const gx = (container: HTMLElement) => {
+    fireEvent.keyDown(rootOf(container), { key: "g" });
+    fireEvent.keyDown(rootOf(container), { key: "x" });
+  };
+  const opened = () => posted.filter((m) => m.type === "open_url");
+  const pick = (c: HTMLElement) => c.querySelector(".link-pick");
+
+  it("opens at once a link whose text is its own address, with no pick", () => {
+    const { container } = withReply("see https://example.com/a");
+    boxLinks(container);
+    gx(container);
+    expect(lastOfType("open_url")).toMatchObject({ type: "open_url", url: "https://example.com/a" });
+    expect(typeof lastOfType("open_url")!.request_id).toBe("string");
+    expect(pick(container)).toBeNull();
+    expect(opened()).toHaveLength(1);
+  });
+
+  it("opens a bare host at once, sending the address the browser will use (a trailing slash)", () => {
+    const { container } = withReply("see https://example.com");
+    boxLinks(container);
+    gx(container);
+    expect(lastOfType("open_url")).toMatchObject({ url: "https://example.com/" });
+  });
+
+  it("ignores a count, as gf does: 3gx is gx", () => {
+    const { container } = withReply("see https://example.com/a");
+    boxLinks(container);
+    fireEvent.keyDown(rootOf(container), { key: "3" });
+    gx(container);
+    expect(opened()).toHaveLength(1);
+  });
+
+  it("lists several links with letters and their full normalized addresses, and the letter opens one", () => {
+    const { container } = withReply("see https://example.com/a and [docs](https://EXAMPLE.com/b)");
+    boxLinks(container);
+    gx(container);
+    expect(pick(container)!.textContent).toBe("a https://example.com/a · s https://example.com/b");
+    expect(opened()).toEqual([]);
+    fireEvent.keyDown(rootOf(container), { key: "s" });
+    expect(lastOfType("open_url")).toMatchObject({ url: "https://example.com/b" });
+    expect(pick(container)).toBeNull();
+    expect(opened()).toHaveLength(1);
+  });
+
+  it("lists at most as many links as there are letters", () => {
+    const links = Array.from({ length: 16 }, (_, i) => `[l${i}](https://example.com/${i})`).join(" ");
+    const { container } = withReply(links);
+    boxLinks(container);
+    gx(container);
+    const shown = pick(container)!.textContent!.split(" · ");
+    expect(shown).toHaveLength(14);
+    expect(shown[0]).toBe("a https://example.com/0");
+    expect(shown[13]).toBe("o https://example.com/13");
+    // A letter past the list opens nothing and ends the pick.
+    fireEvent.keyDown(rootOf(container), { key: "o" });
+    expect(lastOfType("open_url")).toMatchObject({ url: "https://example.com/13" });
+  });
+
+  it("shows a titled link's address instead of opening it: text is not where it goes", () => {
+    const { container } = withReply("read [docs](https://evil.example/x)");
+    boxLinks(container);
+    gx(container);
+    expect(pick(container)!.textContent).toBe("a https://evil.example/x");
+    expect(opened()).toEqual([]);
+    fireEvent.keyDown(rootOf(container), { key: "a" });
+    expect(lastOfType("open_url")).toMatchObject({ url: "https://evil.example/x" });
+  });
+
+  it("shows the address a look-alike host really opens (punycode), never as typed", () => {
+    // Raw HTML, so the `href` reaches the page exactly as the reply wrote it (a markdown link's is
+    // percent-encoded by marked, which would already differ from its text): a Cyrillic "a" in apple.com.
+    const { container } = withReply('<a href="https://\u0430pple.com/">https://\u0430pple.com/</a>');
+    boxLinks(container);
+    const anchor = container.querySelector(".row a[href]")!;
+    expect(anchor.getAttribute("href")).toBe("https://\u0430pple.com/");
+    expect(anchor.textContent).toBe(anchor.getAttribute("href"));
+    gx(container);
+    expect(pick(container)!.textContent).toBe("a https://xn--pple-43d.com/");
+    expect(opened()).toEqual([]);
+    fireEvent.keyDown(rootOf(container), { key: "a" });
+    expect(lastOfType("open_url")).toMatchObject({ url: "https://xn--pple-43d.com/" });
+  });
+
+  it("shows a link nobody can see, even when its text is its address (a reply can carry a hidden anchor)", () => {
+    const { container } = withReply('<a hidden href="https://evil.example/">https://evil.example/</a>');
+    boxLinks(container); // the hidden one is left unboxed, as a browser measures it
+    expect(container.querySelector(".row a[hidden]")).not.toBeNull();
+    gx(container);
+    expect(pick(container)!.textContent).toBe("a https://evil.example/");
+    expect(opened()).toEqual([]);
+  });
+
+  it("shows a link whose visible text is only part of its address: hidden markup inside the text is not what the reader sees", () => {
+    // Fix round 1 (review, and Codex): DOMPurify keeps `hidden` and inline HTML inside link text, and
+    // `textContent` counts a hidden span -- so a reply could show `https://good.example/`, carry the real
+    // address `https://good.example.evil.example/` in the text too, and pass a text-equals-href test.
+    for (const reply of [
+      '<a href="https://good.example.evil.example/">https://good.example<span hidden>.evil.example</span>/</a>',
+      "[https://good.example<span hidden>.evil.example</span>/](https://good.example.evil.example/)",
+    ]) {
+      posted = [];
+      const { container, unmount } = withReply(reply);
+      boxLinks(container);
+      const anchor = container.querySelector(".row a[href]")!;
+      // The setup: the hidden span survived sanitizing, and the text reads as the real address to a test
+      // that only looks at `textContent`.
+      expect(anchor.querySelector("span[hidden]"), reply).not.toBeNull();
+      expect(anchor.textContent, reply).toBe(anchor.getAttribute("href"));
+      gx(container);
+      expect(opened(), reply).toEqual([]);
+      expect(pick(container)!.textContent, reply).toBe("a https://good.example.evil.example/");
+      fireEvent.keyDown(rootOf(container), { key: "a" });
+      expect(lastOfType("open_url"), reply).toMatchObject({ url: "https://good.example.evil.example/" });
+      unmount();
+    }
+  });
+
+  it("shows a link whose text sits inside another element, even when it reads as its address", () => {
+    const { container } = withReply('<a href="https://example.com/a"><b>https://example.com/a</b></a>');
+    boxLinks(container);
+    gx(container);
+    expect(pick(container)!.textContent).toBe("a https://example.com/a");
+    expect(opened()).toEqual([]);
+  });
+
+  it("never lets a link out of view open on its own: scrolled off the list, it waits for a letter", () => {
+    const { container } = withReply("see https://example.com/a");
+    boxLinks(container);
+    boxOf(container.querySelector(".row a[href]")!, 5000, 10); // far below the list's box
+    gx(container);
+    expect(pick(container)!.textContent).toBe("a https://example.com/a");
+    expect(opened()).toEqual([]);
+  });
+
+  it("says there is no web link on a row with only relative or non-web ones, and posts nothing", () => {
+    const widen = stubBandWidth();
+    try {
+      const { container } = withReply("see [docs](docs/a.md), [own](https://neovibe.invalid/x) and [mail](mailto:a@b)");
+      act(() => widen(container));
+      boxLinks(container);
+      gx(container);
+      expect(container.querySelector(".band-message")!.textContent).toBe("no web link on this row");
+      expect(pick(container)).toBeNull();
+      expect(opened()).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("says so on a row that has no link at all", () => {
+    const widen = stubBandWidth();
+    try {
+      const { container } = withReply("nothing to open here");
+      act(() => widen(container));
+      gx(container);
+      expect(container.querySelector(".band-message")!.textContent).toBe("no web link on this row");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("finds no link in your own prompt or a tool's output, which are plain text", () => {
+    const widen = stubBandWidth();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState(), 0);
+      dispatch({
+        kind: "events",
+        tab: 1,
+        fromRevision: 0,
+        throughRevision: 3,
+        events: [
+          { type: "user_prompt_submitted", text: "open https://example.com/a for me" },
+          { type: "turn_started", turn_id: "t1" },
+          { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "echo https://example.com/b" } },
+        ],
+      });
+      act(() => widen(container));
+      boxLinks(container);
+      expect(container.querySelector(".row a")).toBeNull();
+      gg(container); // the prompt
+      gx(container);
+      expect(container.querySelector(".band-message")!.textContent).toBe("no web link on this row");
+      fireEvent.keyDown(rootOf(container), { key: "G", shiftKey: true }); // the tool call
+      gx(container);
+      expect(container.querySelector(".band-message")!.textContent).toBe("no web link on this row");
+      expect(opened()).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reads only the row under the cursor, not the other rows' links", () => {
+    const widen = stubBandWidth(); // before the render that mounts the band
+    try {
+      const rendered = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first https://example.com/first" }, { seq: 2, text: "second: no links" }] }), 2);
+      act(() => widen(rendered.container));
+      boxLinks(rendered.container);
+      gx(rendered.container); // the cursor is on the last row, which has none
+      expect(opened()).toEqual([]);
+      expect(rendered.container.querySelector(".band-message")!.textContent).toBe("no web link on this row");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /* Review Focus 1, and the pick's own keys: only a plain letter chooses. A chord, an input method's key, or
+     a held `x`'s auto-repeat is not a choice -- the first two end the pick and open nothing, the repeat
+     leaves it waiting (it is the `x` of `gx` still held, not a second key). */
+  describe("the pick's keys", () => {
+    function openTwo() {
+      const rendered = withReply("see https://example.com/a and [docs](https://example.com/b)");
+      boxLinks(rendered.container);
+      gx(rendered.container);
+      expect(pick(rendered.container)).not.toBeNull();
+      return rendered;
+    }
+
+    it("closes on Ctrl+a, Alt+s, Meta+s and an input method's key, and opens nothing", () => {
+      for (const ev of [
+        { key: "a", ctrlKey: true },
+        { key: "s", altKey: true },
+        { key: "s", metaKey: true },
+        { key: "a", isComposing: true },
+        { key: "a", keyCode: 229 },
+      ]) {
+        posted = [];
+        const { container, unmount } = openTwo();
+        fireEvent.keyDown(rootOf(container), ev);
+        expect(pick(container), JSON.stringify(ev)).toBeNull();
+        expect(opened(), JSON.stringify(ev)).toEqual([]);
+        unmount();
+      }
+    });
+
+    it("does not treat an uppercase letter, a digit or Enter as a choice", () => {
+      for (const ev of [{ key: "A", shiftKey: true }, { key: "1" }, { key: "Enter" }, { key: "Escape" }, { key: "j" }]) {
+        posted = [];
+        const { container, unmount } = openTwo();
+        fireEvent.keyDown(rootOf(container), ev);
+        expect(pick(container), JSON.stringify(ev)).toBeNull();
+        expect(opened(), JSON.stringify(ev)).toEqual([]);
+        unmount();
+      }
+    });
+
+    it("leaves the pick waiting through a held x's repeat and a bare modifier", () => {
+      const { container } = openTwo();
+      fireEvent.keyDown(rootOf(container), { key: "x", repeat: true });
+      fireEvent.keyDown(rootOf(container), { key: "Shift", shiftKey: true });
+      fireEvent.keyDown(rootOf(container), { key: "Control", ctrlKey: true });
+      expect(pick(container)).not.toBeNull();
+      fireEvent.keyDown(rootOf(container), { key: "a" });
+      expect(lastOfType("open_url")).toMatchObject({ url: "https://example.com/a" });
+      expect(pick(container)).toBeNull();
+    });
+
+    it("swallows the key that ends it: a plain letter never also runs as a BROWSE key", () => {
+      const { container } = openTwo();
+      const notPrevented = fireEvent.keyDown(rootOf(container), { key: "j" });
+      expect(notPrevented).toBe(false);
+    });
+  });
+
+  /* Every route away closes it (`dropPendingKeys`, and the tab switch beside `setPathPick(null)`): a pick left
+     up would open a link on a later letter, over a conversation that no longer holds it. */
+  describe("every route away closes the pick", () => {
+    function openTwo() {
+      const rendered = withReply("see https://example.com/a and [docs](https://example.com/b)");
+      boxLinks(rendered.container);
+      gx(rendered.container);
+      expect(pick(rendered.container)).not.toBeNull();
+      return rendered;
+    }
+    const later = (container: HTMLElement) => {
+      expect(pick(container)).toBeNull();
+      fireEvent.keyDown(rootOf(container), { key: "a" });
+      expect(opened()).toEqual([]);
+    };
+
+    it("pane_focus false (the keys left the panel)", () => {
+      const { container } = openTwo();
+      dispatch({ kind: "pane_focus", focused: false });
+      later(container);
+    });
+
+    it("a global HINT starting", () => {
+      const { container } = openTwo();
+      dispatch({ kind: "hint_collect", sessionId: 1 });
+      later(container);
+    });
+
+    it("an arrival by keyboard", () => {
+      const { container } = openTwo();
+      dispatch({ kind: "arrive" });
+      later(container);
+    });
+
+    it("Ctrl+j/Ctrl+k, which GTK takes before the page", () => {
+      const { container } = openTwo();
+      dispatch({ kind: "nav_key", direction: "down" });
+      later(container);
+    });
+
+    /* Fix round 1 (Codex): the pick owns every key ahead of the key table, so anything else that takes the
+       keys must end it -- or the next letter typed there would open a link instead of being typed. */
+    it("the composer taking the keys (a click into it): its letters are typed, and open nothing", () => {
+      const { container } = openTwo();
+      act(() => container.querySelector<HTMLElement>(".composer-browse-hint")!.focus());
+      const textarea = container.querySelector("textarea")!;
+      expect(pick(container)).toBeNull();
+      expect(fireEvent.keyDown(textarea, { key: "a" })).toBe(true); // not prevented: the letter is typed
+      expect(opened()).toEqual([]);
+    });
+
+    it("a text field that has the keys with the composer still in BROWSE (a card's reason box)", () => {
+      const rendered = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(
+        snapshotState({
+          transcript: [{ seq: 1, text: "see https://example.com/a and [docs](https://example.com/b)" }],
+          pendingPermissions: [{ seq: 2, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "rm build" } }],
+        }),
+        2,
+      );
+      gg(rendered.container);
+      boxLinks(rendered.container);
+      gx(rendered.container);
+      expect(pick(rendered.container)).not.toBeNull();
+      const reason = rendered.container.querySelector<HTMLInputElement>(".row-permission input")!;
+      act(() => reason.focus());
+      // A letter typed there ends the pick and is the text field's own: not prevented, no link opened.
+      expect(fireEvent.keyDown(reason, { key: "a" })).toBe(true);
+      expect(pick(rendered.container)).toBeNull();
+      expect(opened()).toEqual([]);
+      expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
+    });
+
+    it("the ? overlay opening (prefix ?, which GTK takes)", () => {
+      const { container } = openTwo();
+      dispatch({ kind: "open_keymap" });
+      expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+      later(container);
+    });
+
+    it("an overlay drawn over the conversation (the chooser)", () => {
+      const { container } = openTwo();
+      dispatch({
+        kind: "chooser",
+        open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: false }],
+        records: [],
+      });
+      expect(container.querySelector(".chooser")).not.toBeNull();
+      expect(pick(container)).toBeNull();
+    });
+
+    it("switching tabs: no open_url on the new tab", () => {
+      const { container } = openTwo();
+      const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+      dispatch({ kind: "tabs", active: 2, tabs: two });
+      dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "second conversation" }] }) });
+      later(container);
+    });
+  });
+
+  it("tells Rust the panel does not hold the keys for its own composer while the pick waits", () => {
+    const { container } = withReply("see https://example.com/a and [docs](https://example.com/b)");
+    boxLinks(container);
+    dispatch({ kind: "pane_focus", focused: true });
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "browse" });
+    gx(container);
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "other" });
+    fireEvent.keyDown(rootOf(container), { key: "Escape" });
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "browse" });
+  });
+
+  it("flashes a refusal in the band, never in the banner that means the conversation is broken", () => {
+    const widen = stubBandWidth();
+    try {
+      const { container } = withReply("see https://example.com/a");
+      act(() => widen(container));
+      boxLinks(container);
+      gx(container);
+      const sent = lastOfType("open_url")!;
+      dispatch({ kind: "command_result", requestId: sent.request_id, ok: false, error: "not a web link" });
+      expect(container.querySelector(".band-message")!.textContent).toBe("not a web link");
+      expect(container.querySelector(".command-notice")).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("works on a session that has ended, as gf does", () => {
+    const { container } = withReply("see https://example.com/a");
+    boxLinks(container);
+    dispatch({ kind: "events", tab: 1, fromRevision: 2, throughRevision: 3, events: [{ type: "session_closed", reason: "provider exited" }] });
+    boxLinks(container);
+    gx(container);
+    expect(lastOfType("open_url")).toMatchObject({ url: "https://example.com/a" });
+  });
+
+  /* The pick's letters include `a` and `d`, which answer a card in BROWSE. The pick is modal -- its keys are
+     read ahead of the key table -- so with a card waiting elsewhere in the conversation, `a` opens the first
+     link and never allows the card, and `d` the second and never denies it. */
+  it("is not a card answer: with a card waiting, the pick's a and d open the first and third link and answer nothing", () => {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(
+      snapshotState({
+        transcript: [{ seq: 1, text: "see https://example.com/a, [docs](https://example.com/b) and [more](https://example.com/c)" }],
+        pendingPermissions: [{ seq: 2, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "rm build" } }],
+      }),
+      2,
+    );
+    gg(rendered.container);
+    boxLinks(rendered.container);
+    expect(rendered.container.querySelector(".row-current")!.classList.contains("row-assistant")).toBe(true);
+    gx(rendered.container);
+    fireEvent.keyDown(rootOf(rendered.container), { key: "a" });
+    expect(lastOfType("open_url")).toMatchObject({ url: "https://example.com/a" });
+    gx(rendered.container);
+    fireEvent.keyDown(rootOf(rendered.container), { key: "d" });
+    expect(opened().map((m) => m.url)).toEqual(["https://example.com/a", "https://example.com/c"]);
+    expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
+    expect(rendered.container.querySelector(".row-permission")).not.toBeNull();
   });
 });
 
@@ -6448,6 +9582,97 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
     expect(container.querySelector(".band-message")).toBeNull();
     vi.unstubAllGlobals();
+  });
+});
+
+/* K01 (ruling R1: "the empty tab's dashboard follows the same rule"), fix round 1 (review): the
+   empty tab keeps its own waiting prefix and leader sequence, which `dropPendingKeys()` did not
+   reach. A cancel route the dashboard never sees as a key of its own -- Shift+Tab (stopped by
+   `onModeKey`), the chooser, a switch to another empty tab, a bypass prompt -- left them armed, so
+   the next key was swallowed (`g`, Shift+Tab, `i` opened no composer) or completed the sequence. */
+describe("K01 on the empty tab: every cancel route drops its waiting prefix and leader", () => {
+  function emptyInBrowse() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    expect(rendered.container.querySelector(".empty-tab")!.contains(document.activeElement)).toBe(true);
+    expect(rendered.container.querySelector("textarea")).toBeNull();
+    return rendered;
+  }
+  const press = (key: string, init: Record<string, unknown> = {}) =>
+    fireEvent.keyDown(document.activeElement ?? document.body, { key, ...init });
+  const composer = (container: HTMLElement) => container.querySelector("textarea");
+
+  it("control: with nothing waiting, i opens the composer, and g then i does not", () => {
+    const { container } = emptyInBrowse();
+    press("g");
+    press("i");
+    expect(composer(container)).toBeNull();
+    press("i");
+    expect(composer(container)).not.toBeNull();
+  });
+  it("g, then Shift+Tab (the mode cycles), then i opens the composer", () => {
+    const { container } = emptyInBrowse();
+    press("g");
+    press("Tab", { shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    press("i");
+    expect(composer(container)).not.toBeNull();
+  });
+  it("Space, then Shift+Tab, then m never reaches <leader>m", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = emptyInBrowse();
+      dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+      act(() => vi.advanceTimersByTime(1000));
+      press(" ");
+      act(() => vi.advanceTimersByTime(1000));
+      expect(container.querySelector(".which-key-box")).not.toBeNull();
+      press("Tab", { shiftKey: true });
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      press("m");
+      act(() => vi.advanceTimersByTime(1000));
+      expect(posted.filter((m) => m.type === "cycle_mode"), "Shift+Tab's own, and no second").toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it.each<[string, () => void]>([
+    [
+      "the chooser, closed by Esc",
+      () => {
+        dispatch({ kind: "chooser", open: [], records: [] });
+        press("Escape");
+      },
+    ],
+    [
+      "a switch to another empty tab",
+      () =>
+        dispatch({
+          kind: "tabs",
+          active: 2,
+          tabs: [
+            { ...LIVE_TAB, state: "not_started" },
+            { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" },
+          ],
+        }),
+    ],
+    [
+      "a bypass prompt, answered n",
+      () => {
+        dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["bypass? (y/n)"] });
+        press("n");
+      },
+    ],
+  ])("g, then %s, then i opens the composer", (_name, route) => {
+    const { container } = emptyInBrowse();
+    press("g");
+    route();
+    expect(container.querySelector(".empty-tab")!.contains(document.activeElement)).toBe(true);
+    press("i");
+    expect(composer(container)).not.toBeNull();
   });
 });
 
@@ -7801,6 +11026,37 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     // D1: V-LINE's own Esc also goes back to CARET.
     fireEvent.keyDown(root, { key: "Escape" });
     expect(modeBlock()?.getAttribute("data-mode")).toBe("caret");
+  });
+
+  /** R9 (v1 picks Task 9; idiom matrix E10): `Ctrl+[` is Esc in the region too. Until then the region
+   *  read it as a modified key its table does not claim (`vswallow`: swallowed, nothing else), so a
+   *  vim user reaching for it saw CARET/VISUAL stay on -- the one region change of that plan. It
+   *  reaches `resolveKey` as the plain Escape `./ctrlBracket` turns it into, `repeat` and all. */
+  it("R9: Ctrl+[ is Esc in the region -- VISUAL and V-LINE back to CARET, CARET to BROWSE, and a held one steps back once", () => {
+    const { container, root } = startedOnPromptRow();
+    const modeBlock = () => container.querySelector('[data-testid="mode-block"]');
+    const mode = () => modeBlock()?.getAttribute("data-mode");
+    const ctrlBracket = { key: "[", code: "BracketLeft", ctrlKey: true };
+
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    expect(mode()).toBe("visual");
+    expect(fireEvent.keyDown(root, ctrlBracket), "claimed, not left to the browser").toBe(false);
+    expect(mode()).toBe("caret");
+    // D12: the key that stepped back swallows its own repeats. The Escape this becomes carries the
+    // original's `repeat`, so a held Ctrl+[ does not go on to end the whole region.
+    fireEvent.keyDown(root, { ...ctrlBracket, repeat: true });
+    expect(mode()).toBe("caret");
+    // A fresh press is a new key and ends it, as a fresh Esc does.
+    fireEvent.keyDown(root, ctrlBracket);
+    expect(mode()).toBe("browse");
+
+    fireEvent.keyDown(root, { key: "V", shiftKey: true });
+    expect(mode()).toBe("vline");
+    fireEvent.keyDown(root, ctrlBracket);
+    expect(mode()).toBe("caret");
+    fireEvent.keyDown(root, ctrlBracket);
+    expect(mode()).toBe("browse");
   });
 
   it("refuses to start with a flash when there is no row at all", () => {

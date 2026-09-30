@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
+import { pickerStep } from "../chooser";
 
 export type SlashPickerKind = "model" | "effort";
 
@@ -28,9 +29,9 @@ type Props = {
 /** Owner trial item 2 (2026-09-28): the picker a bare `/model`/`/effort` reply opens
  *  (`App.tsx`'s own wiring watches for the reply and parses it via `../slashPicker`). Copies the
  *  chooser's own keys (`./Chooser`, spec `docs/superpowers/specs/2026-09-26-panel-round2-design.md`
- *  §6): `j`/`k` move, `Enter` chooses, `Escape`/`q` cancel with nothing sent -- no new binding, the
- *  same table `prefix w` already uses. A click on a row chooses it directly, the same as a chooser
- *  row's own `onClick`. */
+ *  §6): `j`/`k` -- and, since v1 picks Task 10 (R12), `↓`/`↑` and `Ctrl+n`/`Ctrl+p` -- move, `Enter`
+ *  chooses, `Escape`/`q` cancel with nothing sent -- no new binding, the same table `prefix w` already
+ *  uses. A click on a row chooses it directly, the same as a chooser row's own `onClick`. */
 export function SlashPicker({ kind, options, current, focusRequest, onChoose, onCancel }: Props) {
   const startIndex = current === null ? -1 : options.indexOf(current);
   const [cursor, setCursor] = useState(startIndex === -1 ? 0 : startIndex);
@@ -48,7 +49,9 @@ export function SlashPicker({ kind, options, current, focusRequest, onChoose, on
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
-    const key = event.key;
+    // R12: `↓` and `Ctrl+n` are `j`, `↑` and `Ctrl+p` are `k` (`pickerStep`), before the allow-list.
+    const step = pickerStep(event);
+    const key = step === null ? event.key : step > 0 ? "j" : "k";
     if (!["j", "k", "Enter", "Escape", "q"].includes(key)) return;
     event.preventDefault();
     event.stopPropagation();

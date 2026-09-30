@@ -42,6 +42,7 @@ const RUNNING: BandFacts = {
   context: { file: "neovibe.zsh", lines: [3, 9] },
   position: "14/30",
   model: "sonnet-5",
+  usage: null,
 };
 
 /** Renders with a wide-enough band and a real character width, through the same fake observer
@@ -113,6 +114,43 @@ it("the showcmd segment carries data-testid=showcmd", () => {
   const { container } = renderWide(RUNNING);
   const showcmd = container.querySelector<HTMLElement>('[data-testid="showcmd"]')!;
   expect(showcmd.textContent).toBe("Space b…");
+});
+
+/** R5 (v1 picks, Task 13): `bandLayout` decides whether the usage segment is drawn and where; the
+ *  component's own job is the markup -- the text on the segment and the breakdown as its tooltip,
+ *  the way `⚠` carries its warning in `title`. */
+it("the usage segment carries the text and the breakdown as its title, right of the model", () => {
+  const usage = { text: "1.2M tok $0.42", title: "input 10 · output 5,000 · cache write 200,000 · cache read 1,000,000 · $0.4213 — since this tab started or resumed" };
+  const { container } = renderWide({ ...RUNNING, usage });
+  const seg = container.querySelector<HTMLElement>(".band-usage")!;
+  expect(seg).not.toBeNull();
+  expect(seg.textContent).toBe("1.2M tok $0.42");
+  expect(seg.title).toBe(usage.title);
+  expect(seg.classList.contains("band-seg")).toBe(true);
+  const right = Array.from(container.querySelectorAll(".band-right .band-seg")).map((el) => el.className.replace("band-seg ", ""));
+  expect(right.indexOf("band-usage")).toBe(right.indexOf("band-model") + 1);
+});
+
+it("no usage fact draws no usage segment, at any width", () => {
+  const { container } = renderWide(RUNNING);
+  expect(container.querySelector(".band-usage")).toBeNull();
+});
+
+it("a narrow band drops the usage segment first, keeping the model and the position", () => {
+  const usage = { text: "1.2M tok $0.42", title: "t" };
+  const observers = stubResizeObserver();
+  // No showcmd and no warning here, so that 72 columns (520 / 7.2) hold everything but the usage
+  // segment: 64 columns without it, 80 with it.
+  const { container } = render(<StatusBand facts={{ ...RUNNING, showcmd: null, warn: null, usage }} paneFocused={true} />);
+  const band = container.querySelector(".status-band")!;
+  const measure = container.querySelector(".band-measure")!;
+  act(() => {
+    resize(observers[0], measure, 7.2);
+    resize(observers[0], band, 520);
+  });
+  expect(container.querySelector(".band-usage")).toBeNull();
+  expect(container.querySelector(".band-model")).not.toBeNull();
+  expect(container.querySelector(".band-position")).not.toBeNull();
 });
 
 /** C1c (spec §3.4): the band stops being a `j`/`k` stop -- its own details stay reachable on

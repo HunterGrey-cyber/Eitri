@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { applyCallNotes, applyEvent, applySnapshot, keepAfterSidecarStop, initialState, resetToStartScreen } from "./reducer";
-import type { AgentDomainEvent, TurnOutcome } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, TurnOutcome, UsageInfo } from "./types";
 
 describe("applyEvent", () => {
   it("session_opened populates identity and sets status to running", () => {
@@ -51,7 +51,7 @@ describe("applyEvent", () => {
       expect(state.activeTurnId).toBe("t1");
       state = applyEvent(state, {
         type: "turn_completed", turn_id: "t1", outcome, result_text: "done",
-        stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1 },
+        stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1, tokens: null, model: null },
       });
       expect(state.activeTurnId).toBeNull();
     }
@@ -62,9 +62,99 @@ describe("applyEvent", () => {
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, {
       type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "done",
-      stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1 },
+      stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1, tokens: null, model: null },
     });
     expect(state.status).toEqual({ kind: "running" });
+  });
+
+  /* R5 (v1 picks, Task 13): the tab's last reported usage. Each report REPLACES the figure whole
+     (the SDK reports a running total and `/clear` resets it, so a lower later figure is the truth),
+     and a turn that reports none -- interrupted, synthesized -- leaves the last figure standing:
+     silence is not a measurement, and the band must never show an invented zero. Mirrors
+     `AgentSessionProjection::apply`'s `TurnCompleted` arm. */
+  describe("usage (R5)", () => {
+    const report = (cost: number, tokens: number | null): UsageInfo => ({
+      total_cost_usd: cost,
+      num_turns: null,
+      tokens: tokens === null ? null : { input: tokens, output: 0, cache_creation: 0, cache_read: 0 },
+      model: null,
+    });
+    const done = (usage: UsageInfo | null, turn = "t1", outcome: TurnOutcome = "completed"): AgentDomainEvent => ({
+      type: "turn_completed", turn_id: turn, outcome, result_text: "", stop_reason: null, usage,
+    });
+
+    it("is unknown until a turn reports one", () => {
+      expect(initialState().usage).toBeNull();
+      expect(applyEvent(initialState(), { type: "turn_started", turn_id: "t1" }).usage).toBeNull();
+      expect(applyEvent(initialState(), done(null)).usage).toBeNull();
+    });
+
+    it("a turn_completed with a usage sets state.usage, whole", () => {
+      const usage = report(0.42, 1234);
+      expect(applyEvent(initialState(), done(usage)).usage).toEqual(usage);
+    });
+
+    it("a later turn_completed with usage: null keeps the last figure", () => {
+      const usage = report(0.42, 1234);
+      let state = applyEvent(initialState(), done(usage));
+      state = applyEvent(state, done(null, "t2"));
+      expect(state.usage).toEqual(usage);
+    });
+
+    it("no outcome erases the figure: an interrupted, failed or limit-reached turn that reports none leaves it", () => {
+      const usage = report(0.42, 1234);
+      for (const outcome of ["interrupted", "failed", "limit_reached"] as const) {
+        const state = applyEvent(applyEvent(initialState(), done(usage)), done(null, "t2", outcome));
+        expect(state.usage, outcome).toEqual(usage);
+        // ...and one of them that DID report is a report like any other.
+        expect(applyEvent(state, done(report(0.5, 9), "t3", outcome)).usage, outcome).toEqual(report(0.5, 9));
+      }
+    });
+
+    it("a lower later report replaces the figure -- /clear resets the running total, it is not summed or maxed", () => {
+      let state = applyEvent(initialState(), done(report(0.5, 900_000)));
+      state = applyEvent(state, done(report(0.02, 3000), "t2"));
+      expect(state.usage).toEqual(report(0.02, 3000));
+    });
+
+    it("a legacy report (a cost and a turn count, no tokens) is kept as reported, tokens still unknown", () => {
+      const legacy: UsageInfo = { total_cost_usd: 0.01, num_turns: 3, tokens: null, model: null };
+      expect(applyEvent(initialState(), done(legacy)).usage).toEqual(legacy);
+    });
+
+    it("applySnapshot takes the snapshot's usage, and null when it carries none", () => {
+      const usage = report(0.42, 1234);
+      const reported = applyEvent(initialState(), done(usage));
+      const { nextSeq: _seq, turnThinking: _think, ...wire } = reported;
+      expect(applySnapshot(initialState(), wire, 5).usage).toEqual(usage);
+      // Another tab's snapshot that has reported nothing is not this tab's figure: a snapshot
+      // replaces the whole state, this field included.
+      const { nextSeq: _s2, turnThinking: _t2, ...none } = initialState();
+      expect(none.usage).toBeNull();
+      expect(applySnapshot(reported, none, 5).usage).toBeNull();
+    });
+
+    it("a snapshot that omits the key altogether reads as unknown, never as undefined", () => {
+      // Rust always sends the key (`null` or an object); this is the runtime defence for a payload
+      // that does not, since `usageSegment` reads `null` and would throw on `undefined`.
+      const { nextSeq: _seq, turnThinking: _think, usage: _usage, ...noKey } = initialState();
+      expect(applySnapshot(initialState(), noKey as unknown as AgentUiSnapshot, 0).usage).toBeNull();
+    });
+
+    it("a start-over is a new session: resetToStartScreen forgets the figure", () => {
+      const state = applyEvent(initialState(), done(report(0.42, 1234)));
+      expect(resetToStartScreen(state).usage).toBeNull();
+    });
+
+    it("a session that ends keeps its figure on screen -- what was spent is still spent", () => {
+      const usage = report(0.42, 1234);
+      let state = applyEvent(initialState(), done(usage));
+      state = applyEvent(state, { type: "session_unavailable", reason: "provider process exited unexpectedly" });
+      expect(state.usage).toEqual(usage);
+      // And the lost-session view a stopped sidecar leaves behind (v1 polish item 6).
+      const said = applyEvent(applyEvent(initialState(), done(usage)), { type: "content_delta", turn_id: "t2", kind: "text", text: "hi" });
+      expect(keepAfterSidecarStop(said, "the sidecar stopped")?.usage).toEqual(usage);
+    });
   });
 
   it("session_unavailable sets status to unavailable with a reason", () => {

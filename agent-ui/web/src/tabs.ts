@@ -65,6 +65,17 @@ export function activeTabInfo(tabs: TabsEnvelope | null): TabInfo | null {
   return tabs.tabs.find((t) => t.id === tabs.active) ?? null;
 }
 
+/** vim's `{N}gt` / `{N}gT` (`:help gt`): `tab.next` with a count is the tab numbered N -- the number
+ *  the bar shows and `prefix N` selects -- and `tab.prev` goes N tabs back in the bar's order,
+ *  wrapping. `null` when no tab has that number. */
+export function countedTabTarget(tabs: TabsEnvelope, action: "tab.next" | "tab.prev", count: number): TabId | null {
+  if (action === "tab.next") return tabs.tabs.find((t) => t.number === count)?.id ?? null;
+  const at = tabs.tabs.findIndex((t) => t.id === tabs.active);
+  if (at === -1) return null;
+  const n = tabs.tabs.length;
+  return tabs.tabs[(((at - count) % n) + n) % n].id;
+}
+
 /** What a tab's reader had on screen: kept in the WebView per tab (spec §3.1). Lost on `prefix r`,
  *  as today. Phase 3 moves the unsent composer text, with the queue, to Rust (ruling 6) -- it is no
  *  longer part of this store. `detailed` is the detailed-view toggle (Ctrl+o, R3, ruling 20). */

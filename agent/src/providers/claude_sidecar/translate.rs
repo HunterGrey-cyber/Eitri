@@ -5,7 +5,7 @@
 //! pure reducer/translator in isolation before any real-process integration test exercises it.
 
 use crate::process::{classify_cli_mode, CliModeReport};
-use crate::{AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TurnOutcome};
+use crate::{AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TokenUsage, TurnOutcome, UsageInfo};
 use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
 use claude_runtime_protocol::v1::{
     PermissionMode as ProtoPermissionMode, PermissionOrigin as ProtoPermissionOrigin,
@@ -144,16 +144,13 @@ fn translate_one(event: ProtoSessionEvent) -> Option<Vec<AgentDomainEvent>> {
                 outcome,
                 result_text: completed.result_text,
                 stop_reason: completed.stop_reason,
-                // No source data: the v1 sidecar proto's TurnCompleted carries no cost/usage fields
-                // at all (confirmed by reading proto/verdandi/claude/runtime/v1/runtime.proto
-                // directly -- the design doc's own §9.6 "suggested" UsageUpdated event was never
-                // implemented this round). `None` says exactly that, and is the whole reason the
-                // field is an `Option`: this site previously sent `0.0`/`0`, which the projection
-                // stored as a measured value indistinguishable from a real free turn. A Verdandi
-                // `TurnUsage` field is planned but does not exist, so do not reintroduce a
-                // placeholder here in anticipation of it -- send `Some` when there is something to
-                // put in it.
-                usage: None,
+                // Verdandi's `TurnUsage` (capability `turn_usage`, `TurnCompleted.usage`), when the
+                // SDK's result had a usable `modelUsage`. Unset -- a turn the kernel synthesized, or a
+                // sidecar older than the field -- stays `None`, which is unknown and is the whole
+                // reason the domain field is an `Option`: this site once sent `0.0`/`0` for every
+                // turn, which the projection stored as a measured value indistinguishable from a real
+                // free turn. Never put a placeholder here: send `Some` only for a figure that arrived.
+                usage: completed.usage.and_then(usage_from_proto),
             })
         }
         ProtoEvent::SessionClosed(closed) => one(AgentDomainEvent::SessionClosed {
@@ -266,6 +263,22 @@ fn provider_prompt_of(requested: &claude_runtime_protocol::v1::PermissionRequest
                 tool_name: rule.tool_name.clone(),
                 rule_content: rule.rule_content.clone(),
             }),
+    })
+}
+
+/// Verdandi's `TurnUsage` (capability `turn_usage`): session-cumulative, summed over every model
+/// (`runtime.proto:844-869`). A non-finite or negative cost is dropped whole -- never half a figure.
+fn usage_from_proto(u: claude_runtime_protocol::v1::TurnUsage) -> Option<UsageInfo> {
+    (u.total_cost_usd.is_finite() && u.total_cost_usd >= 0.0).then(|| UsageInfo {
+        total_cost_usd: u.total_cost_usd,
+        num_turns: None,
+        tokens: Some(TokenUsage {
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_creation: u.cache_creation_input_tokens,
+            cache_read: u.cache_read_input_tokens,
+        }),
+        model: (!u.model.is_empty()).then_some(u.model),
     })
 }
 
@@ -796,9 +809,10 @@ mod tests {
     }
 
     /// The usage half of this used to be named "...and_zeroes_usage", and asserted a `0.0`/`0` that
-    /// the wire never sent. `None` is the honest translation of a message with no usage fields, and
-    /// asserting it here is what stops a placeholder creeping back in ahead of a real
-    /// Verdandi-side usage field.
+    /// the wire never sent. `None` is the honest translation of a `TurnCompleted` whose `usage` is
+    /// unset (a kernel-synthesized one, or a result with no usable `modelUsage`), and asserting it
+    /// here is what stops a placeholder creeping back in. The mapped case, now that Verdandi's
+    /// `TurnUsage` exists, is `turn_completed_maps_turn_usage_and_keeps_an_absent_one_unknown`.
     #[test]
     fn turn_completed_translates_every_outcome_value_and_reports_usage_as_unknown() {
         let cases = [
@@ -829,6 +843,105 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// Verdandi's `TurnUsage` (capability `turn_usage`) reaches the domain event whole: every token
+    /// count, the cost, and the model that did the work. An unset `usage` stays unknown -- never a
+    /// zero -- and a cost that is not a measurement (NaN) drops the whole figure.
+    #[test]
+    fn turn_completed_maps_turn_usage_and_keeps_an_absent_one_unknown() {
+        use claude_runtime_protocol::v1::TurnUsage as ProtoTurnUsage;
+        let with = |usage| {
+            translate(wrap(ProtoEvent::TurnCompleted(TurnCompleted {
+                turn_id: "t".into(),
+                usage,
+                ..Default::default()
+            })))
+        };
+        let Some(AgentDomainEvent::TurnCompleted { usage, .. }) = with(Some(ProtoTurnUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 4000,
+            total_cost_usd: 0.0421,
+            model: "claude-sonnet-5".into(),
+        })) else {
+            panic!()
+        };
+        assert_eq!(
+            usage,
+            Some(UsageInfo {
+                total_cost_usd: 0.0421,
+                num_turns: None,
+                tokens: Some(TokenUsage {
+                    input: 10,
+                    output: 20,
+                    cache_creation: 300,
+                    cache_read: 4000
+                }),
+                model: Some("claude-sonnet-5".into()),
+            })
+        );
+        let Some(AgentDomainEvent::TurnCompleted { usage, .. }) = with(None) else {
+            panic!()
+        };
+        assert_eq!(usage, None, "no TurnUsage is unknown, never zero");
+        let Some(AgentDomainEvent::TurnCompleted { usage, .. }) = with(Some(ProtoTurnUsage {
+            total_cost_usd: f64::NAN,
+            ..Default::default()
+        })) else {
+            panic!()
+        };
+        assert_eq!(usage, None, "a non-finite cost is not a measurement");
+    }
+
+    /// The rest of `usage_from_proto`'s rule: a bad cost is dropped whole (no half a figure with the
+    /// tokens kept), and an honest report is kept whole -- a zero cost is a cost, and proto3's empty
+    /// `model` string is "no model", not a model called "".
+    #[test]
+    fn turn_usage_with_a_bad_cost_is_dropped_whole_and_an_honest_one_is_kept_whole() {
+        use claude_runtime_protocol::v1::TurnUsage as ProtoTurnUsage;
+        let usage_of = |u: ProtoTurnUsage| match translate(wrap(ProtoEvent::TurnCompleted(TurnCompleted {
+            turn_id: "t".into(),
+            usage: Some(u),
+            ..Default::default()
+        }))) {
+            Some(AgentDomainEvent::TurnCompleted { usage, .. }) => usage,
+            other => panic!("expected a TurnCompleted, got {other:?}"),
+        };
+        for bad in [-0.01, f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+            assert_eq!(
+                usage_of(ProtoTurnUsage {
+                    input_tokens: 5,
+                    output_tokens: 6,
+                    total_cost_usd: bad,
+                    model: "claude-sonnet-5".into(),
+                    ..Default::default()
+                }),
+                None,
+                "cost {bad} must drop the whole figure, tokens and model included"
+            );
+        }
+        assert_eq!(
+            usage_of(ProtoTurnUsage {
+                input_tokens: 7,
+                cache_read_input_tokens: 9,
+                total_cost_usd: 0.0,
+                ..Default::default()
+            }),
+            Some(UsageInfo {
+                total_cost_usd: 0.0,
+                num_turns: None,
+                tokens: Some(TokenUsage {
+                    input: 7,
+                    output: 0,
+                    cache_creation: 0,
+                    cache_read: 9
+                }),
+                model: None,
+            }),
+            "a zero cost is not a bad cost, and an empty model is None"
+        );
     }
 
     #[test]

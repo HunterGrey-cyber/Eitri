@@ -174,13 +174,15 @@ pub enum AgentDomainEvent {
         result_text: String,
         stop_reason: Option<String>,
         /// `None` means the provider reported no usage for this turn -- NOT a turn that cost
-        /// nothing. The distinction is load-bearing because the two backends genuinely differ:
-        /// the legacy Claude-CLI backend's own `result` line carries real cumulative figures, while
-        /// the sidecar's `verdandi.claude.runtime.v1` `TurnCompleted` message has no usage fields at
-        /// all. Before this was an `Option` the sidecar path filled in `0.0`/`0`, and the projection
-        /// then stored that zero as though it were measured -- so the same UI element would have
-        /// read as a real running cost on one backend and a confident, permanent "$0.00" on the
-        /// other, with nothing anywhere able to tell the two apart.
+        /// nothing. The distinction is load-bearing, and it is per turn: the legacy backend's own
+        /// `result` line always carries a cost and a turn count (and no tokens), while the sidecar's
+        /// `verdandi.claude.runtime.v1` `TurnCompleted` carries Verdandi's `TurnUsage` (capability
+        /// `turn_usage`) only when the SDK's result had a usable `modelUsage` -- not on a turn the
+        /// kernel synthesized, and not from a sidecar that predates the field. Before this was an
+        /// `Option` the sidecar path filled in `0.0`/`0`, and the projection then stored that zero
+        /// as though it were measured -- so the same UI element would have read as a real running
+        /// cost on one backend and a confident, permanent "$0.00" on the other, with nothing
+        /// anywhere able to tell the two apart.
         usage: Option<UsageInfo>,
     },
     /// The provider process is gone unexpectedly (a real, non-zero-exit `ProcessExited`) --
@@ -452,12 +454,39 @@ pub(crate) fn tool_use_link(id: impl Into<String>) -> Option<String> {
     }
 }
 
-/// What a provider actually reported about a turn's cost. Only ever constructed from figures a
-/// provider sent; a provider that sends none produces `None`, never a zeroed `UsageInfo`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+/// The token counts of one usage report, as Verdandi's `TurnUsage` carries them (capability
+/// `turn_usage`). The input side is three figures, not one, because the API bills them differently
+/// and Claude Code caches aggressively: on a large prompt `input` is typically single digits and
+/// nearly all of the prompt is `cache_creation` or `cache_read`, so "did my prompt arrive" is the sum
+/// of all three.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+}
+
+/// What a provider actually reported about a session's spend so far. Only ever constructed from
+/// figures a provider sent; a provider that sends none produces `None`, never a zeroed `UsageInfo`.
+///
+/// **A running total, not one turn's spend, on both backends:** the SDK's result carries the session
+/// so far ("read the latest result rather than summing across results"), a mid-session `/clear`
+/// resets it and a resumed session starts fresh, so a later report replaces an earlier one whole --
+/// even a lower one -- and is never added to it.
+///
+/// Each backend fills the half it really has and leaves the rest `None`, which is unknown, not zero:
+/// the sidecar carries tokens and a model but no turn count (`TurnUsage` has none); the legacy
+/// backend carries a turn count but no tokens or model (its `ResultLine` reads no token fields).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageInfo {
     pub total_cost_usd: f64,
-    pub num_turns: u32,
+    /// Legacy's `result.num_turns`; `None` from the sidecar, whose `TurnUsage` has none.
+    pub num_turns: Option<u32>,
+    /// `None` from legacy, whose `ResultLine` reads no token fields.
+    pub tokens: Option<TokenUsage>,
+    /// `TurnUsage.model`: the model with the most tokens; `None` when empty.
+    pub model: Option<String>,
 }
 
 /// Neovibe's sole product-state authority for one conversation (design doc §10.3). `pending_permissions`
@@ -504,12 +533,11 @@ pub struct AgentSessionProjection {
     pub transcript: Vec<TranscriptMessage>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub pending_permissions: HashMap<String, PermissionRequestRecord>,
-    /// The last usage a provider actually reported, or `None` if none ever has -- which is the
-    /// steady state on the `ClaudeSidecarProvider` path, whose wire carries no usage at all. A
-    /// consumer must render `None` as unknown; rendering it as zero re-tells the exact lie this
-    /// field was made an `Option` to stop. No consumer reads it yet
-    /// (`core/src/agent_bridge.rs::serialize_snapshot_for_js` does not emit it), so the first one
-    /// to do so inherits that obligation.
+    /// The last usage a provider actually reported, or `None` if none ever has -- the state of a
+    /// session before its first report, of one resumed from history (which seeds none), and of a
+    /// sidecar that predates `TurnUsage`. A consumer must render `None` as unknown; rendering it as
+    /// zero re-tells the exact lie this field was made an `Option` to stop. Each report replaces it
+    /// whole, even with a lower figure: the SDK reports a running total and `/clear` resets it.
     pub usage: Option<UsageInfo>,
     /// True while the last thing folded was assistant text, so the next chunk CONTINUES the same
     /// message instead of starting a new one.
@@ -746,9 +774,11 @@ impl AgentSessionProjection {
                 // Conditional, where this arm used to assign unconditionally -- which is how the
                 // sidecar path's fabricated zero reached the projection in the first place. A turn
                 // that reported no usage leaves whatever was last reported standing: silence is not
-                // a measurement, so it must not overwrite one.
+                // a measurement, so it must not overwrite one. A turn that DID report replaces the
+                // figure whole and never adds to it or keeps the larger: the SDK reports a running
+                // total that `/clear` resets, so a smaller later figure is the truth.
                 if let Some(reported) = usage {
-                    self.usage = Some(*reported);
+                    self.usage = Some(reported.clone());
                 }
             }
             // Both endings clear `active_turn_id`, and for one reason: no `TurnCompleted` is ever

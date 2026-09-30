@@ -162,6 +162,18 @@ pub fn disallowed_tools() -> &'static [&'static str] {
     &[]
 }
 
+/// What every session loads (R13), for `prefix i`: the sidecar asks for `[PROJECT, LOCAL]`
+/// (`build_create_request`) and legacy passes `--setting-sources project,local`. CLI 2.1.284 loads
+/// User memory (`~/.claude/CLAUDE.md`) only under `userSettings` (read from its code, not measured).
+///
+/// Compiled in every build, since both backends and the panel read it. Two tests hold the sentence
+/// to what the code does: `every_request_loads_project_and_local_settings_only_and_the_note_says_so`
+/// (the sidecar's request) and, in a build with the legacy backend, the argv assertion in
+/// `every_spawn_runs_default_under_the_gate_and_passes_no_deny_list` -- so a change to either
+/// selection has to change this text with it.
+pub const SETTING_SOURCES_NOTE: &str =
+    "project + local only (.claude/ and CLAUDE.md here); ~/.claude's settings, hooks, plugins and CLAUDE.md are not loaded";
+
 /// The host's answer mode — whether neovibe answers every permission request `allow` itself. Never
 /// sent to the CLI (R07).
 ///
@@ -2264,6 +2276,11 @@ exit 0"#,
         assert!(
             session_argv.contains("--permission-mode default"),
             "the CLI runs in `default` (D4, spec O1): {session_argv}"
+        );
+        assert!(
+            session_argv.contains("--setting-sources project,local"),
+            "legacy loads project and local settings only, which `SETTING_SOURCES_NOTE` tells the user \
+             on `prefix i` (R13): {session_argv}"
         );
         for ungated in [
             "bypassPermissions",

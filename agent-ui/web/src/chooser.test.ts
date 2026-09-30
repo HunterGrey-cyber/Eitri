@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { choosable, chooserRows, relativeWhen, resumeMode, tabStateWord } from "./chooser";
+import { choosable, chooserRows, pickerStep, relativeWhen, resumeMode, tabStateWord } from "./chooser";
 import type { ChooserEnvelope, TabInfo } from "./types";
 
 const TAB: TabInfo = {
@@ -100,5 +100,31 @@ describe("resumeMode", () => {
   });
   it("no active tab yet also lands in a new tab, in the default mode", () => {
     expect(resumeMode(null, "bypass")).toEqual({ mode: "bypass", into: "a new tab" });
+  });
+});
+
+/** R12 (v1 picks): the one place the four list-motion keys of a picker are named, shared by the chooser
+ *  (its list and its filter box) and the `/model`/`/effort` pickers. */
+describe("pickerStep", () => {
+  it("names ↓ and Ctrl+n as a step down, ↑ and Ctrl+p as a step up", () => {
+    expect(pickerStep({ key: "ArrowDown", ctrlKey: false })).toBe(1);
+    expect(pickerStep({ key: "n", ctrlKey: true })).toBe(1);
+    expect(pickerStep({ key: "ArrowUp", ctrlKey: false })).toBe(-1);
+    expect(pickerStep({ key: "p", ctrlKey: true })).toBe(-1);
+  });
+  it("is null for every other key: a bare n or p is typed text, and j, k, Ctrl+j, Ctrl+k stay the caller's own (P4)", () => {
+    for (const init of [
+      { key: "n", ctrlKey: false },
+      { key: "p", ctrlKey: false },
+      { key: "j", ctrlKey: false },
+      { key: "k", ctrlKey: false },
+      { key: "j", ctrlKey: true },
+      { key: "k", ctrlKey: true },
+      { key: "ArrowLeft", ctrlKey: false },
+      { key: "ArrowRight", ctrlKey: false },
+      { key: "Enter", ctrlKey: false },
+    ]) {
+      expect(pickerStep(init), JSON.stringify(init)).toBeNull();
+    }
   });
 });

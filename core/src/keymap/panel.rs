@@ -174,9 +174,15 @@ impl PanelSeq {
 /// (C1a, v1 hardening codex-release-p1 #8 = R2-5) joined `i` the same day as its own two INPUT
 /// aliases but were never added here, so a `neovibe.keymap.set("panel", "o"/"A", ...)` -- or an
 /// nvim `mapleader`/mapping on either -- silently shadowed a frozen key instead of being refused.
-const FIXED: &str = "jkhladioAyYDfrnNG/?0123456789";
+/// `:` (v1 picks, K02/ruling R4) opens the panel's own command line, so it is refused the same way.
+const FIXED: &str = "jkhladioAyYDfrnNG/?:0123456789";
 const PENDING: &str = "gz[]";
-const TAKEN_PAIRS: &[&str] = &["gg", "gf", "zh", "zl", "[[", "]]", "[]", "]["];
+/// The BROWSE pairs a reserved prefix already completes, or will (the web side's `FIXED_PAIRS`):
+/// `gx`, `zz`/`zt`/`zb`, `za`/`zo`/`zc` and `[p`/`]p` are reserved ahead of the keys that bind them
+/// (v1 picks, K01), so a table binding can never claim one first and change its meaning later.
+const TAKEN_PAIRS: &[&str] = &[
+    "gg", "gf", "gx", "zh", "zl", "zz", "zt", "zb", "za", "zo", "zc", "[[", "]]", "[]", "][", "[p", "]p",
+];
 
 /// Why `seq` may never be a panel binding (spec §2.3), or `None` when it is free.
 pub fn reserved(seq: &PanelSeq) -> Option<String> {
@@ -524,18 +530,21 @@ mod tests {
         // fixed BROWSE keys the same day as `i` (C1a: `o` is `i`'s exact alias, `A` opens INPUT with
         // the caret at the end) but FIXED was never updated, so `neovibe.keymap.set("panel", "o",
         // ...)` -- or an nvim `mapleader`/mapping of `o`/`A` -- silently shadowed a frozen key.
+        // K02 (v1 picks, ruling R4): `:` opens the panel's command line, so it is fixed too.
         for key in [
-            "j", "k", "h", "l", "a", "d", "i", "o", "A", "y", "Y", "D", "f", "r", "n", "N", "G", "/", "?", "5",
+            "j", "k", "h", "l", "a", "d", "i", "o", "A", "y", "Y", "D", "f", "r", "n", "N", "G", "/", "?", ":", "5",
         ] {
             assert!(reserved(&parse_seq(key).unwrap()).is_some(), "{key} alone");
             assert!(reserved(&parse_seq(&format!("{key}x")).unwrap()).is_some(), "{key}x");
         }
-        for taken in ["gg", "gf", "zh", "zl", "[[", "]]", "[]", "]["] {
+        for taken in [
+            "gg", "gf", "zh", "zl", "[[", "]]", "[]", "][", "gx", "zz", "zt", "zb", "za", "zo", "zc", "[p", "]p",
+        ] {
             assert!(reserved(&parse_seq(taken).unwrap()).is_some(), "{taken}");
         }
         assert!(reserved(&parse_seq("g").unwrap()).is_some(), "a lone pending key");
         assert!(reserved(&parse_seq("[bx").unwrap()).is_some(), "three keys after [");
-        for free in ["[b", "]b", "H", "L", "<leader>bd", "<Space>x", "gt", "gT", "zb"] {
+        for free in ["[b", "]b", "H", "L", "<leader>bd", "<Space>x", "gt", "gT", "zq"] {
             assert_eq!(reserved(&parse_seq(free).unwrap()), None, "{free}");
         }
     }

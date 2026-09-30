@@ -939,6 +939,37 @@ mod tests {
         }
     }
 
+    /// R13: `prefix i`'s `settings` row (`SETTING_SOURCES_NOTE`) says what every session loads, so
+    /// the request has to ask for exactly that. The sidecar is sent `[PROJECT, LOCAL]` and never
+    /// `USER` -- the operator's `~/.claude` settings, hooks, plugins and `CLAUDE.md` stay out -- on a
+    /// fresh, a resumed and a forked session alike, and the note names that directory. If this ever
+    /// has to change, the note changes with it: it is what the panel tells the user.
+    #[test]
+    fn every_request_loads_project_and_local_settings_only_and_the_note_says_so() {
+        for (shape, resume, fork) in [
+            ("fresh", None, false),
+            ("resume", Some("claude-id".to_string()), false),
+            ("fork", Some("claude-id".to_string()), true),
+        ] {
+            let policy = build_create_request("/p".into(), StreamingPreference::Partial, resume, fork, false)
+                .policy
+                .expect("a policy is always sent");
+            let sources = policy
+                .setting_sources
+                .expect("stated on every request, never left to the CLI's own default");
+            assert_eq!(
+                sources.sources,
+                vec![SettingSource::Project as i32, SettingSource::Local as i32],
+                "{shape}: project and local only, never user"
+            );
+        }
+        assert!(
+            crate::SETTING_SOURCES_NOTE.contains("~/.claude"),
+            "the note names what is not loaded: {}",
+            crate::SETTING_SOURCES_NOTE
+        );
+    }
+
     /// The shape the real sidecar returns at the revision this crate pins
     /// (`EXPECTED_VERDANDI_REVISION`, 133dc03) -- transcribed from
     /// `apps/claude-sidecar/src/runtimeServiceImpl.ts`'s handshake handler, not invented.

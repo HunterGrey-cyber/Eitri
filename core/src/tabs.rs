@@ -203,25 +203,36 @@ pub enum PromptScope {
     Default,
 }
 
-/// R06's exact texts (owner's Chinese, `？` full-width U+FF1F, `(y/n)` ASCII). `waiting` -- the
-/// number of delivered cards a `LiveTab` entry would approve -- is read only for `LiveTab`; the
-/// other two scopes never have cards to approve (a `NotStarted` tab has no session and the window
-/// default is not a tab at all).
+/// R06's four prompts, in English (K09, 2026-09-29). The band and every other prompt and flash it
+/// draws (`close 2 "docs"? (y/n)`, `close window? ...`) are English; these four, written in the
+/// owner's Chinese at first, and `bypass_staying_line` under them were the only text in it that was
+/// not. R06's structure is unchanged: what is asked and when, and `(y/n)` ends every one. `waiting`
+/// -- the number of delivered cards a `LiveTab` entry would approve -- is read only for `LiveTab`;
+/// the other two scopes never have cards to approve (a `NotStarted` tab has no session and the
+/// window default is not a tab at all).
 pub fn bypass_prompt(scope: PromptScope, waiting: usize) -> String {
     match scope {
-        PromptScope::LiveTab if waiting == 0 => "切到 bypass？(y/n)".to_string(),
-        PromptScope::LiveTab => format!("切到 bypass 并批准 {waiting} 张等待中的卡片？(y/n)"),
-        PromptScope::EmptyTab => "切到 bypass？本窗口之后的新会话也用 bypass (y/n)".to_string(),
-        PromptScope::Default => "新会话默认用 bypass？(y/n)".to_string(),
+        PromptScope::LiveTab if waiting == 0 => "Switch to bypass? (y/n)".to_string(),
+        PromptScope::LiveTab => {
+            let cards = if waiting == 1 { "card" } else { "cards" };
+            format!("Switch to bypass and approve the {waiting} waiting {cards}? (y/n)")
+        }
+        PromptScope::EmptyTab => "Switch to bypass? New sessions in this window start in bypass too (y/n)".to_string(),
+        PromptScope::Default => "Start new sessions in bypass? (y/n)".to_string(),
     }
 }
 
 /// The consequence line under a bypass prompt when cards stay waiting after `y` (O3 review #6): a
 /// CLI prompt the user's own ask rule forced, or one of a kind this build does not know, is a card
 /// in bypass too, and `y` does not approve it -- so the prompt says so rather than leaving it to be
-/// found afterwards.
+/// found afterwards. English like the prompt above it (K09); the verb agrees with the count.
 pub fn bypass_staying_line(staying: usize) -> String {
-    format!("{staying} 张须你亲自回答的卡片（ask 规则）不在其中，切换后仍保留")
+    let (cards, stay) = if staying == 1 {
+        ("card", "stays")
+    } else {
+        ("cards", "stay")
+    };
+    format!("{staying} {cards} your own ask rules force {stay} waiting after the switch")
 }
 
 /// tmux's `confirm-before`, plus a line for each consequence that applies (spec §3.5).
@@ -478,20 +489,72 @@ mod tests {
         );
     }
 
-    /// R06/S2: the owner's exact Chinese texts, byte for byte -- the full-width `？` and the ASCII
-    /// `(y/n)`.
+    /// K09: R06's four prompts, in English like the rest of the band, byte for byte -- one card is
+    /// "the 1 waiting card" and two are "the 2 waiting cards" -- and none carries any non-ASCII
+    /// character (the Chinese ones' full-width `？` included).
     #[test]
-    fn the_four_bypass_prompts_are_the_owners_text() {
-        assert_eq!(bypass_prompt(PromptScope::LiveTab, 0), "切到 bypass？(y/n)");
+    fn the_bypass_prompts_are_english_and_pluralize_the_card_count() {
+        assert_eq!(bypass_prompt(PromptScope::LiveTab, 0), "Switch to bypass? (y/n)");
+        assert_eq!(
+            bypass_prompt(PromptScope::LiveTab, 1),
+            "Switch to bypass and approve the 1 waiting card? (y/n)"
+        );
         assert_eq!(
             bypass_prompt(PromptScope::LiveTab, 2),
-            "切到 bypass 并批准 2 张等待中的卡片？(y/n)"
+            "Switch to bypass and approve the 2 waiting cards? (y/n)"
         );
         assert_eq!(
             bypass_prompt(PromptScope::EmptyTab, 0),
-            "切到 bypass？本窗口之后的新会话也用 bypass (y/n)"
+            "Switch to bypass? New sessions in this window start in bypass too (y/n)"
         );
-        assert_eq!(bypass_prompt(PromptScope::Default, 0), "新会话默认用 bypass？(y/n)");
+        assert_eq!(
+            bypass_prompt(PromptScope::Default, 0),
+            "Start new sessions in bypass? (y/n)"
+        );
+        for scope in [PromptScope::LiveTab, PromptScope::EmptyTab, PromptScope::Default] {
+            for waiting in [0, 1, 2, 12] {
+                let text = bypass_prompt(scope, waiting);
+                assert!(text.is_ascii(), "{scope:?}/{waiting}: {text:?}");
+                assert!(text.ends_with("(y/n)"), "{scope:?}/{waiting}: {text:?}");
+            }
+        }
+    }
+
+    /// Only a live tab has cards to approve: the other two scopes read the same whatever count they
+    /// are handed (a `NotStarted` tab has no session and the window default is no tab at all).
+    #[test]
+    fn only_a_live_tabs_prompt_reads_the_card_count() {
+        for waiting in [0, 1, 2, 12] {
+            assert_eq!(
+                bypass_prompt(PromptScope::EmptyTab, waiting),
+                bypass_prompt(PromptScope::EmptyTab, 0)
+            );
+            assert_eq!(
+                bypass_prompt(PromptScope::Default, waiting),
+                bypass_prompt(PromptScope::Default, 0)
+            );
+        }
+        assert_eq!(
+            bypass_prompt(PromptScope::LiveTab, 12),
+            "Switch to bypass and approve the 12 waiting cards? (y/n)"
+        );
+    }
+
+    /// The consequence line under the prompt (O3 review #6), in English and agreeing with its count:
+    /// one card "stays", several "stay".
+    #[test]
+    fn the_staying_line_agrees_with_its_count() {
+        assert_eq!(
+            bypass_staying_line(1),
+            "1 card your own ask rules force stays waiting after the switch"
+        );
+        assert_eq!(
+            bypass_staying_line(2),
+            "2 cards your own ask rules force stay waiting after the switch"
+        );
+        for staying in [1, 2, 7] {
+            assert!(bypass_staying_line(staying).is_ascii(), "{staying}");
+        }
     }
 
     #[test]

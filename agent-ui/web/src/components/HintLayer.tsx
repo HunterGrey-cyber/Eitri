@@ -18,7 +18,7 @@
  *  against each other in Rust (`tokens.rs`). */
 import { useLayoutEffect, useState } from "react";
 import type { CSSProperties } from "react";
-import { hintVisible } from "../nav";
+import { firstShownLine, hintVisible } from "../nav";
 import type { HintTarget } from "../nav";
 
 export type ShownHint = { target: HintTarget; label: string };
@@ -35,7 +35,13 @@ function place(root: HTMLElement, hints: ShownHint[]): Placement[] {
     const r = host.getBoundingClientRect();
     if (target.kind === "code") return { top: r.top - origin.top + 4, left: r.right - origin.left - 4, shift: true };
     if (target.kind === "row") return { top: r.top - origin.top, left: r.left - origin.left, width: r.width, height: r.height };
-    return { top: r.top - origin.top - 6, left: r.left - origin.left - 6 };
+    // A link (v1 picks, Task 8, R6) that wraps onto a second line has a bounding box starting at the row's
+    // left edge on its FIRST line, where its label would sit over unrelated text -- perhaps another link's.
+    // The first line box that is on screen is where its label belongs (`firstShownLine`: not simply the first,
+    // which may have scrolled out of the list while the link's last line is still in it). jsdom reports none,
+    // so the bounding box stays the fallback.
+    const at = target.kind === "link" ? firstShownLine(target.el, root) : r;
+    return { top: at.top - origin.top - 6, left: at.left - origin.left - 6 };
   });
 }
 

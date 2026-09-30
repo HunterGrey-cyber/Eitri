@@ -27,6 +27,14 @@ body,
   position: relative;
 }
 
+/* K03 (kbux 2026-09-29): what `main.tsx`'s `PanelErrorBoundary` draws in place of an empty `#root` when the
+   panel itself throws while rendering -- plain text on the page's own colours, so it reads even when nothing
+   else drew. */
+.panel-crashed {
+  padding: 12px;
+  color: var(--nv-fg);
+}
+
 /* winbar, the scrolling message list, the status line, the composer -- panel-as-document task 6
    split what used to be one `.session-header` row into a winbar (identity/model, above) and a
    status line (mode/status/position/Stop, directly above the composer).
@@ -277,6 +285,14 @@ body,
 .path-pick {
   font-family: var(--nv-font-mono);
   color: var(--nv-fg);
+}
+/* `gx` with several links (v1 picks, Task 8, R6): the same list as `.path-pick`, but every address is shown
+   in full -- a long one wraps rather than being cut, because the tail of a disguised link is the part a
+   reader needs to see. */
+.link-pick {
+  font-family: var(--nv-font-mono);
+  color: var(--nv-fg);
+  overflow-wrap: anywhere;
 }
 /* The queued lines (phase 3 ruling 1, 32): muted, one line each, directly above the composer in
    both layouts. V1's editor-context line used to sit here too (`.context-line`); panel round 2
@@ -1386,6 +1402,15 @@ textarea,
   padding: 0 5px;
 }
 .dash-consequence {
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+  margin-top: 4px;
+  max-width: 360px;
+}
+/* R13 (v1 picks Task 11): what every message also carries from the editor, drawn under the
+   consequence line -- the same declarations as `.dash-consequence` (existing tokens only, no new
+   ones), so the two read as one muted note; `.dash-hint` below stays the last line. */
+.dash-context {
   color: var(--nv-muted);
   font-size: var(--fs-sm);
   margin-top: 4px;

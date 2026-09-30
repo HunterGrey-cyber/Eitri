@@ -908,6 +908,13 @@ fn build_ui(
         agent_panel_handle.on_hint(move |message| coordinator.on_panel(message));
     }
 
+    // The module that held the keys before the one holding them now: `prefix ;`'s target (tmux's
+    // `last-pane`). Real history, fed by the same owner reports that write the layout's `focus`
+    // below: the layout's own MRU list starts in tree order, so its second entry can name a module
+    // nobody visited (`neovibe_core::layout::FocusHistory`). The tracker below and the prefix each
+    // hold a clone.
+    let focus_history = Rc::new(RefCell::new(neovibe_core::layout::FocusHistory::default()));
+
     // Which module has the keys. One tracker drives the editor's cursor (solid, or not drawn,
     // via Neovide itself) and the agent panel's cursor and mode block, so they cannot disagree. See
     // `pane_focus`'s module doc. The module that last held them is the layout's `focus`: where the
@@ -918,6 +925,7 @@ fn build_ui(
         let editor = pane.clone();
         let terminal = terminal.clone();
         let module_layout = module_layout.clone();
+        let focus_history = focus_history.clone();
         pane_focus::install(
             &window,
             grid.live_hosts(),
@@ -925,9 +933,12 @@ fn build_ui(
                 Ok(mut layout) => {
                     // Refused for a hidden module (`Layout::set_focus`): GTK can put focus in an
                     // unmapped widget, and the layout's `focus` -- what `Ctrl+j` from the top bar
-                    // returns to and the prefix acts on -- must stay on one that can be seen.
-                    if let Err(err) = layout.set_focus(id) {
-                        eprintln!("[pane_focus] {err}; the layout keeps {}", layout.focus());
+                    // returns to and the prefix acts on -- must stay on one that can be seen. The
+                    // history hears only what the layout accepted, so it never names a module the
+                    // keys could not have been on.
+                    match layout.set_focus(id) {
+                        Ok(()) => focus_history.borrow_mut().note(id),
+                        Err(err) => eprintln!("[pane_focus] {err}; the layout keeps {}", layout.focus()),
                     }
                 }
                 // Every writer of the layout releases it before touching focus (`ModuleGrid::apply`,
@@ -1370,6 +1381,26 @@ fn build_ui(
     }
     tray.refresh(&module_layout.borrow(), agent_panel_handle.attention());
 
+    // --- A module takes the keys by keyboard: `Ctrl+h/j/k/l` (`move_focus`, below) and `prefix ;`/
+    // `prefix o` (the prefix's `Action::SelectLast`/`SelectNext`) land the same way. A zoom ends
+    // first (spec §3.4), as tmux's `select-pane` does. Arriving in the agent lands in BROWSE, on the
+    // last row (panel round 2 plan spec §8, decision 4: reverses 2026-09-19's "control l直接闪cursor"),
+    // and `arrive` also drops a bypass prompt. A click on a row does not come through here and
+    // still lands in BROWSE on that row. `false`: the module did not take the keys.
+    let land_by_key: Rc<dyn Fn(&ModuleId) -> bool> = {
+        let grid = grid.clone();
+        let focus_module = focus_module.clone();
+        let agent_panel_handle = agent_panel_handle.clone();
+        Rc::new(move |to| {
+            grid.unzoom();
+            let grabbed = focus_module(to);
+            if grabbed && to.kind() == ModuleKind::Agent {
+                agent_panel_handle.arrive();
+            }
+            grabbed
+        })
+    };
+
     // --- Ctrl+h/j/k/l between modules, by geometry (modules design §6.2). One function for every
     // source: the editor's shim letters below, and each web module's capture-phase controller
     // below that. A move unzooms first, as tmux's `select-pane` does (spec §3.4); `Up` with nothing
@@ -1378,20 +1409,12 @@ fn build_ui(
     // is what the agent panel's `Ctrl+l`/`Ctrl+j` always did.
     let move_focus: Rc<dyn Fn(&ModuleId, Direction) -> bool> = {
         let grid = grid.clone();
-        let focus_module = focus_module.clone();
+        let land_by_key = land_by_key.clone();
         let focus_top_bar = focus_top_bar.clone();
-        let agent_panel_handle = agent_panel_handle.clone();
         Rc::new(move |from, direction| match grid.navigate(from, direction) {
             Nav::Module(to) => {
-                grid.unzoom();
-                let grabbed = focus_module(&to);
+                let grabbed = land_by_key(&to);
                 println!("[pane_switch] {from} {direction:?} -> {to} (grab_focus={grabbed})");
-                // Arriving by keyboard lands in BROWSE, on the last row (panel round 2 plan spec
-                // §8, decision 4: reverses 2026-09-19's "control l直接闪cursor"). A click on a row
-                // does not come through here and still lands in BROWSE on that row.
-                if grabbed && to.kind() == ModuleKind::Agent {
-                    agent_panel_handle.arrive();
-                }
                 true
             }
             Nav::TopBar => {
@@ -1517,6 +1540,8 @@ fn build_ui(
         let place_and_arrive = place_and_arrive.clone();
         let show_on_screen = show_on_screen.clone();
         let move_focus = move_focus.clone();
+        let land_by_key = land_by_key.clone();
+        let focus_history = focus_history.clone();
         let hint_coordinator = hint_coordinator.clone();
         let window_modes = window_modes.clone();
         let keymap_for_send = keymap.clone();
@@ -1558,6 +1583,38 @@ fn build_ui(
                     }
                     Action::Select(dir) => {
                         move_focus(&target(), dir);
+                    }
+                    // tmux's `last-pane` and `select-pane -t :.+` (v1 picks, 2026-09-29), landing the
+                    // way `Ctrl+h/j/k/l` do (`land_by_key`). No `RefCell` borrow is held across that
+                    // call: `on_owner` runs inside it and writes both the layout and the history.
+                    Action::SelectLast => {
+                        let previous = focus_history.borrow().previous().cloned();
+                        match previous.filter(|id| module_layout.borrow().can_focus(id).is_ok()) {
+                            Some(id) => {
+                                let grabbed = land_by_key(&id);
+                                println!("[prefix] select.last -> {id} (grab_focus={grabbed})");
+                            }
+                            None => {
+                                println!("[prefix] no last module");
+                                flash(&refused_name);
+                            }
+                        }
+                    }
+                    Action::SelectNext => {
+                        let next = {
+                            let layout = module_layout.borrow();
+                            neovibe_core::layout::next_on_screen(&layout, layout.focus())
+                        };
+                        match next {
+                            Some(id) => {
+                                let grabbed = land_by_key(&id);
+                                println!("[prefix] select.next -> {id} (grab_focus={grabbed})");
+                            }
+                            None => {
+                                println!("[prefix] no other module on screen");
+                                flash(&refused_name);
+                            }
+                        }
                     }
                     Action::SendPrefix | Action::SendKeys(_) => {
                         let Some(key) = prefix::literal_for(&action, &keymap_for_send) else {

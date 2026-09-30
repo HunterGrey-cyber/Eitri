@@ -55,6 +55,13 @@ pub enum Action {
         cells: u16,
     },
     Select(Direction),
+    /// tmux `last-pane`: give the keys back to the module that held them before the one holding them
+    /// now, and again to return (v1 picks, 2026-09-29). From real history only
+    /// (`crate::layout::FocusHistory`), never from the layout's MRU list, which starts in tree order.
+    SelectLast,
+    /// tmux `select-pane -t :.+`: the next module on screen in tree order, wrapping
+    /// (`crate::layout::next_on_screen`).
+    SelectNext,
     Swap(SwapTarget),
     /// `Row` is tmux's `even-horizontal` (every module side by side); `Column` is `even-vertical`.
     Even(Axis),
@@ -204,6 +211,9 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "split.right" => (Action::Split(Axis::Row), &[]),
         "split.below" => (Action::Split(Axis::Column), &[]),
         "zoom" => (Action::Zoom, &[]),
+        // Explicit, since the `select.` fallback below reads only a direction.
+        "select.last" => (Action::SelectLast, &[]),
+        "select.next" => (Action::SelectNext, &[]),
         "swap.prev" => (Action::Swap(SwapTarget::Prev), &[]),
         "swap.next" => (Action::Swap(SwapTarget::Next), &[]),
         "layout.even-horizontal" => (Action::Even(Axis::Row), &[]),
@@ -301,6 +311,8 @@ impl Action {
             Action::Zoom => "zoom".into(),
             Action::Resize { dir, .. } => format!("resize.{}", direction_name(*dir)),
             Action::Select(dir) => format!("select.{}", direction_name(*dir)),
+            Action::SelectLast => "select.last".into(),
+            Action::SelectNext => "select.next".into(),
             Action::Swap(SwapTarget::Prev) => "swap.prev".into(),
             Action::Swap(SwapTarget::Next) => "swap.next".into(),
             Action::Swap(SwapTarget::Toward(dir)) => format!("swap.{}", direction_name(*dir)),
@@ -360,6 +372,8 @@ impl Action {
             Action::Resize { cells: 1, .. } => "Move the nearest divider 1 cell that way".into(),
             Action::Resize { cells, .. } => format!("Move the nearest divider {cells} cells that way"),
             Action::Select(_) => "Move the keys to the module that way".into(),
+            Action::SelectLast => "Move the keys back to the module that had them before (again: return)".into(),
+            Action::SelectNext => "Move the keys to the next module on screen, in tree order".into(),
             Action::Swap(SwapTarget::Prev | SwapTarget::Next) => {
                 "Swap this module with the previous / next one on screen".into()
             }
@@ -502,6 +516,25 @@ mod tests {
         assert!(Action::ModuleHide
             .describe("Ctrl+b", "e / a / t")
             .contains("not the last one on screen"));
+    }
+
+    /// v1 picks (2026-09-29): tmux's `last-pane` and `select-pane -t :.+`. `parse`'s `select.`
+    /// fallback reads only a direction, so both names need arms of their own -- and the fallback must
+    /// keep reading the directions.
+    #[test]
+    fn select_last_and_next_parse_by_name_and_take_no_options() {
+        assert_eq!(parse("select.last", &[], &[]).unwrap().action, Action::SelectLast);
+        assert_eq!(parse("select.next", &[], &[]).unwrap().action, Action::SelectNext);
+        assert_eq!(
+            parse("select.left", &[], &[]).unwrap().action,
+            Action::Select(Direction::Left)
+        );
+        for name in ["select.last", "select.next"] {
+            let err = parse(name, &[("cells".into(), OptValue::Int(2))], &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("is not an option of {name}")), "{err}");
+        }
     }
 
     #[test]

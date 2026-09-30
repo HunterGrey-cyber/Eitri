@@ -110,13 +110,14 @@ fn print_event(event: &AgentDomainEvent) {
             usage,
             ..
         } => {
-            // "unknown", not "$0.0000": a backend that reports no usage (the sidecar provider, whose
-            // wire has no usage fields) must not print a figure it was never given.
-            let cost = match usage {
-                Some(usage) => format!("${:.4} turns={}", usage.total_cost_usd, usage.num_turns),
-                None => "unknown (this backend reports no usage)".to_string(),
+            // "unknown", not "$0.0000": a turn that reported no usage must not print a figure it was
+            // never given. `{:?}` because the two backends fill different halves of it (the sidecar:
+            // tokens and a model; the legacy backend: a turn count).
+            let usage_text = match usage {
+                Some(usage) => format!("{usage:?}"),
+                None => "unknown (this turn reported no usage)".to_string(),
             };
-            println!("\n[turn completed] outcome={outcome:?} cost={cost}\nresult: {result_text}\n");
+            println!("\n[turn completed] outcome={outcome:?} usage={usage_text}\nresult: {result_text}\n");
         }
         AgentDomainEvent::ResumeOutcome {
             requested_provider_session_id,

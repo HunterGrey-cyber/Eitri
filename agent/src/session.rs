@@ -385,12 +385,14 @@ pub(crate) fn translate_wire_event(
             // terminal `result` line, where `wire.rs::ResultLine` declares them as REQUIRED
             // (no `serde(default)`) -- a `result` line missing either one fails to deserialize
             // and becomes `AgentEvent::Unknown`, never a `TurnFinished`. So every value
-            // reaching here was genuinely reported. This backend has real session-cumulative
-            // figures; the sidecar backend has none, and sends `None` rather than a zero
-            // standing in for them.
+            // reaching here was genuinely reported. That line reads no token fields, so `tokens`
+            // and `model` are `None` -- unknown, not a zeroed `TokenUsage` -- where the sidecar
+            // backend, which has no turn count, reports the reverse.
             let usage = Some(crate::UsageInfo {
                 total_cost_usd,
-                num_turns,
+                num_turns: Some(num_turns),
+                tokens: None,
+                model: None,
             });
             vec![AgentDomainEvent::TurnCompleted {
                 turn_id,
@@ -695,6 +697,38 @@ mod tests {
         match event {
             AgentDomainEvent::PermissionRequested { tool_use_id, .. } => assert_eq!(tool_use_id, None),
             other => panic!("expected PermissionRequested, got {other:?}"),
+        }
+    }
+
+    /// What the CLI's own `result` line says, and nothing it does not: cost and a turn count. Its
+    /// `ResultLine` reads no token fields, so tokens and the model stay unknown (`None`) rather than
+    /// becoming a zeroed `TokenUsage`.
+    #[test]
+    fn a_legacy_result_line_reports_cost_and_turns_but_no_tokens_or_model() {
+        let produced = translate_wire_event(
+            AgentEvent::TurnFinished {
+                result_text: "done".to_string(),
+                is_error: false,
+                stop_reason: None,
+                total_cost_usd: 0.0123,
+                num_turns: 4,
+            },
+            Some("t1"),
+            &mut false,
+            &mut HashMap::new(),
+            &mut None,
+        );
+        match produced.as_slice() {
+            [AgentDomainEvent::TurnCompleted { usage, .. }] => assert_eq!(
+                *usage,
+                Some(crate::UsageInfo {
+                    total_cost_usd: 0.0123,
+                    num_turns: Some(4),
+                    tokens: None,
+                    model: None,
+                })
+            ),
+            other => panic!("expected one TurnCompleted, got {other:?}"),
         }
     }
 }

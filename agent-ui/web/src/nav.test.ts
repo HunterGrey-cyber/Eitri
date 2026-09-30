@@ -5,7 +5,9 @@ import {
   controlsOf,
   conversationRows,
   currentStop,
+  firstShownLine,
   hintTargets,
+  linkOpensAtOnce,
   nextControl,
   nextStop,
   permissionTarget,
@@ -13,6 +15,8 @@ import {
   rowOf,
   stopOf,
   stopsIn,
+  webLinks,
+  webUrl,
 } from "./nav";
 import type { AnswerableItem } from "./nav";
 
@@ -357,5 +361,314 @@ describe("a stop inside another stop is content, not a stop", () => {
       ["r3", 3],
     ]);
     expect(targets.filter((t) => t.kind === "composer").map((t) => t.el.id)).toEqual(["composer"]);
+  });
+});
+
+/* v1 picks, Task 8 (ruling R6): the web links `gx` and the global HINT reach. An href counts only as the
+   WHATWG parser (`new URL`, no base) reads it -- http(s), no userinfo, a plain host that is not the
+   panel's own `neovibe.invalid` -- and the NORMALIZED `href` is what a pick shows and `open_url` sends,
+   never the spelling the reply wrote. Fixtures are built with `setAttribute` (and `String.raw` for a
+   backslash), so what reaches the parser is exactly the string written here. */
+describe("webUrl and webLinks (v1 picks, Task 8, R6)", () => {
+  /** A row holding one anchor per href (an entry of `null` is an anchor with no `href` at all). */
+  function rowWithLinks(hrefs: (string | null)[]): HTMLElement {
+    const row = document.createElement("div");
+    row.setAttribute("data-nav-stop", "row");
+    hrefs.forEach((href, i) => {
+      const a = document.createElement("a");
+      a.id = `a${i}`;
+      if (href !== null) a.setAttribute("href", href);
+      a.textContent = href ?? "no href";
+      row.appendChild(a);
+    });
+    document.body.appendChild(row);
+    return row;
+  }
+
+  it("keeps http(s) links in document order, once per normalized address, as that address", () => {
+    const row = rowWithLinks([
+      "https://EXAMPLE.com",
+      "http://x.y:8080/p?q=1#frag",
+      "https://example.com/",
+      "https://example.com/other",
+      "https://xn--r8jz45g.jp/",
+    ]);
+    expect(webLinks(row).map((l) => [l.el.id, l.url])).toEqual([
+      ["a0", "https://example.com/"],
+      ["a1", "http://x.y:8080/p?q=1#frag"],
+      ["a3", "https://example.com/other"],
+      ["a4", "https://xn--r8jz45g.jp/"],
+    ]);
+  });
+
+  it("writes an internationalized host the way the browser will send it (punycode), never as typed", () => {
+    // A Cyrillic "a" (U+0430) in place of the Latin one: the address that opens is the punycode one.
+    const row = rowWithLinks(["https://\u0430pple.com/"]);
+    expect(webLinks(row).map((l) => l.url)).toEqual(["https://xn--pple-43d.com/"]);
+  });
+
+  it("drops what is not a plain http(s) address a person could recognise", () => {
+    const dropped: (string | null)[] = [
+      "docs/a.md", // relative: `new URL` without a base throws
+      "/x",
+      "#frag",
+      "https://neovibe.invalid/x", // the panel's own base, where every relative link points
+      "https://NEOVIBE.INVALID/x",
+      "https://%6eeovibe.invalid/x", // percent-encoded, decoded to it by the parser
+      String.raw`https:\\neovibe.invalid\x`, // backslashes are slashes to the parser
+      "https://neovibe.invalid./x", // the same host with a trailing dot
+      "https://user:pw@example.com/", // userinfo hides the real host behind a familiar one
+      "https://example.com@evil.example/",
+      "javascript:alert(1)",
+      "mailto:a@b",
+      "file:///etc/passwd",
+      "https://a$b.com/", // legal to the parser, not a plain host: Rust refuses it, so no letter may offer it
+      "https://my_host.x/",
+      "https://[::1]/",
+      "https://",
+      "",
+      String.raw`https://example.com/?a\b`, // a backslash left in the address
+      null, // an anchor with no href
+    ];
+    expect(webLinks(rowWithLinks(dropped))).toEqual([]);
+    for (const href of dropped) expect(webUrl(href), String(href)).toBeNull();
+  });
+
+  it("keeps a numeric address, a port and a query, which are plain enough", () => {
+    expect(webUrl("http://127.0.0.1:3000/")).toBe("http://127.0.0.1:3000/");
+    expect(webUrl("https://example.com/a?b=c&d=e#f")).toBe("https://example.com/a?b=c&d=e#f");
+    expect(webUrl("https://example.com/@user")).toBe("https://example.com/@user");
+    expect(webUrl("HTTPS://EXAMPLE.COM/A")).toBe("https://example.com/A");
+  });
+
+  it("looks only at anchors inside the row it is given", () => {
+    const row = rowWithLinks(["https://example.com/in"]);
+    const elsewhere = rowWithLinks(["https://example.com/out"]);
+    expect(webLinks(row).map((l) => l.url)).toEqual(["https://example.com/in"]);
+    expect(webLinks(elsewhere).map((l) => l.url)).toEqual(["https://example.com/out"]);
+  });
+});
+
+describe("linkOpensAtOnce (v1 picks, Task 8, R6, Review Focus 3)", () => {
+  /** One row in a root whose box is y 0..200, holding one anchor with `text` and `href`. */
+  function linkWith(href: string, text: string, box: [number, number] | null = [10, 20]) {
+    document.body.innerHTML = `<div id="root"><div data-nav-stop="row" id="row"><a id="link"></a></div></div>`;
+    const a = byId("link") as HTMLAnchorElement;
+    a.setAttribute("href", href);
+    a.textContent = text;
+    rect(byId("root"), 0, 200);
+    if (box !== null) rect(a, box[0], box[1]);
+    const [link] = webLinks(byId("row"));
+    return { link, root: byId("root") };
+  }
+
+  it("opens with no pick only a link whose visible text is exactly the address it goes to", () => {
+    for (const [href, text] of [
+      ["https://example.com/a", "https://example.com/a"],
+      ["https://example.com", "https://example.com"], // the browser's own `/` for a bare host
+      ["https://example.com/a", "  https://example.com/a \n"],
+    ]) {
+      const { link, root } = linkWith(href, text);
+      expect(linkOpensAtOnce(link, root), `${href} / ${JSON.stringify(text)}`).toBe(true);
+    }
+  });
+
+  it("picks when the text says something else, or says the same thing another way", () => {
+    for (const [href, text] of [
+      ["https://evil.example/x", "docs"],
+      ["https://example.com/x", "https://EXAMPLE.com/x"], // the address that opens is the lower-cased one
+      ["https://\u0430pple.com/", "https://\u0430pple.com/"], // looks like apple.com, opens xn--pple-43d.com
+      ["https://example.com/a", "https://example.com/a and more"],
+      ["https://example.com/a", ""],
+    ]) {
+      const { link, root } = linkWith(href, text);
+      expect(linkOpensAtOnce(link, root), `${href} / ${JSON.stringify(text)}`).toBe(false);
+    }
+  });
+
+  it("picks a link nobody can see, even when its text is its address", () => {
+    // DOMPurify keeps `hidden`: a reply can carry `<a hidden href=U>U</a>`, which must never open unseen.
+    const { link, root } = linkWith("https://evil.example/", "https://evil.example/", null);
+    expect(linkOpensAtOnce(link, root)).toBe(false);
+    rect(link.el, 500, 20); // below the root's own box
+    expect(linkOpensAtOnce(link, root)).toBe(false);
+    rect(link.el, 10, 20);
+    expect(linkOpensAtOnce(link, root)).toBe(true);
+  });
+
+  /** As `linkWith`, but the anchor's contents are `html`, as a reply's own inline HTML can make them. */
+  function linkWithHtml(href: string, html: string) {
+    document.body.innerHTML = `<div id="root"><div data-nav-stop="row" id="row"><a id="link"></a></div></div>`;
+    const a = byId("link") as HTMLAnchorElement;
+    a.setAttribute("href", href);
+    a.innerHTML = html;
+    rect(byId("root"), 0, 200);
+    rect(a, 10, 20);
+    const [link] = webLinks(byId("row"));
+    return { link, root: byId("root") };
+  }
+
+  it("picks a link whose text hides part of its address in an element a reader cannot see", () => {
+    // DOMPurify keeps `hidden` and inline HTML inside link text. `textContent` counts the hidden span, so
+    // it equals the real address while the reader is shown `https://good.example/`.
+    const { link, root } = linkWithHtml(
+      "https://good.example.evil.example/",
+      "https://good.example<span hidden>.evil.example</span>/",
+    );
+    expect(link.el.textContent).toBe(link.url);
+    expect(linkOpensAtOnce(link, root)).toBe(false);
+  });
+
+  it("picks a link whose text is wrapped in any element: only a run of plain text is what it reads", () => {
+    for (const html of [
+      "<b>https://example.com/a</b>",
+      "<code>https://example.com/a</code>",
+      "https://example.com/<span>a</span>",
+      "<span hidden></span>https://example.com/a",
+    ]) {
+      const { link, root } = linkWithHtml("https://example.com/a", html);
+      expect(link.el.textContent, html).toBe("https://example.com/a");
+      expect(linkOpensAtOnce(link, root), html).toBe(false);
+    }
+  });
+
+  it("still opens at once a link whose only contents are its text, comments aside (they render nothing)", () => {
+    const { link, root } = linkWithHtml("https://example.com/a", "https://example.com/a<!-- no element -->");
+    expect(linkOpensAtOnce(link, root)).toBe(true);
+  });
+
+  it("picks a link nobody can see, even when its text is its address", () => {
+    // DOMPurify keeps `hidden`: a reply can carry `<a hidden href=U>U</a>`, which must never open unseen.
+    const { link, root } = linkWith("https://evil.example/", "https://evil.example/", null);
+    expect(linkOpensAtOnce(link, root)).toBe(false);
+    rect(link.el, 500, 20); // below the root's own box
+    expect(linkOpensAtOnce(link, root)).toBe(false);
+    rect(link.el, 10, 20);
+    expect(linkOpensAtOnce(link, root)).toBe(true);
+  });
+});
+
+describe("firstShownLine (v1 picks, Task 8 fix round 1: where a wrapped link's HINT label sits)", () => {
+  const line = (top: number, height: number, left = 0, width = 100) =>
+    ({ top, bottom: top + height, left, right: left + width, width, height, x: left, y: top }) as DOMRect;
+  /** A root 0..200 holding a list 0..100 (which clips) holding an anchor whose line boxes are `lines`. */
+  function wrapped(lines: DOMRect[]) {
+    document.body.innerHTML = `<div id="root"><div class="message-list" id="list"><div data-nav-stop="row" id="row"><a id="link" href="https://example.com/">x</a></div></div></div>`;
+    rect(byId("root"), 0, 200);
+    rect(byId("list"), 0, 100);
+    const a = byId("link");
+    const top = Math.min(...lines.map((l) => l.top));
+    const bottom = Math.max(...lines.map((l) => l.bottom));
+    rect(a, top, bottom - top);
+    a.getClientRects = () => lines as unknown as DOMRectList;
+    return { a, root: byId("root") };
+  }
+
+  it("is the first line box when it is on screen", () => {
+    const first = line(40, 10, 30);
+    const { a, root } = wrapped([first, line(50, 10, 0, 60)]);
+    expect(firstShownLine(a, root)).toBe(first);
+  });
+
+  it("skips a first line scrolled above the list and takes the first one still in it", () => {
+    const second = line(-5, 10, 0, 60); // straddles the list's top edge
+    const { a, root } = wrapped([line(-15, 10, 30), second, line(5, 10, 0, 40)]);
+    expect(firstShownLine(a, root)).toBe(second);
+    const off = line(-20, 10, 30);
+    const on = line(0, 10, 0, 60);
+    const again = wrapped([off, on]);
+    expect(firstShownLine(again.a, again.root)).toBe(on);
+  });
+
+  it("skips a line the list clips away below it, which the root itself would still contain", () => {
+    const shown = line(90, 10, 30);
+    const { a, root } = wrapped([shown, line(110, 10, 0, 60)]);
+    expect(firstShownLine(a, root)).toBe(shown);
+    const gone = line(120, 10);
+    const other = wrapped([gone, line(130, 10)]);
+    // No line is on screen (the bounding box would not be either): the bounding box is the fallback.
+    expect(firstShownLine(other.a, other.root)).toEqual(other.a.getBoundingClientRect());
+  });
+
+  it("falls back to the bounding box where the browser reports no line boxes", () => {
+    const { a, root } = wrapped([line(40, 10)]);
+    a.getClientRects = () => [] as unknown as DOMRectList;
+    const box = a.getBoundingClientRect();
+    expect(firstShownLine(a, root)).toEqual(box);
+  });
+});
+
+describe("hintTargets: web links (v1 picks, Task 8, R6)", () => {
+  /** `hintDoc()` with `html` put in row r1 just after its code block, each anchor boxed inside the list. */
+  function withLinks(html: string, boxes: Record<string, [number, number]>): HTMLElement {
+    const root = hintDoc();
+    byId("code").insertAdjacentHTML("afterend", html);
+    for (const [id, [top, height]] of Object.entries(boxes)) rect(byId(id), top, height);
+    return root;
+  }
+
+  it("puts a link after its row's code blocks and before its controls", () => {
+    const root = withLinks('<p>look at <a id="link" href="https://example.com/a">https://example.com/a</a></p>', {
+      link: [50, 10],
+    });
+    const targets = hintTargets(root);
+    expect(targets.map((t) => `${t.kind}:${t.el.id}`)).toEqual([
+      "row:r0",
+      "row:r1",
+      "code:code",
+      "link:link",
+      "control:approve",
+      "control:stop",
+    ]);
+    expect(targets[3]).toEqual({ kind: "link", el: byId("link"), rowIndex: 1 });
+  });
+
+  it("lists it after the code block even when the reply wrote it before", () => {
+    const root = hintDoc();
+    byId("code").insertAdjacentHTML("beforebegin", '<p><a id="first" href="https://example.com/a">a</a></p>');
+    rect(byId("first"), 22, 2);
+    expect(hintTargets(root).map((t) => `${t.kind}:${t.el.id}`)).toEqual([
+      "row:r0",
+      "row:r1",
+      "code:code",
+      "link:first",
+      "control:approve",
+      "control:stop",
+    ]);
+  });
+
+  it("offers every visible copy of an address: the one scrolled away does not take the label from it", () => {
+    const root = withLinks(
+      '<a id="off" href="https://example.com/a">a</a> <a id="on" href="https://example.com/a">a</a>',
+      { off: [150, 10], on: [30, 10] }, // `off` is below the list's viewport (0..100)
+    );
+    expect(hintTargets(root).filter((t) => t.kind === "link").map((t) => t.el.id)).toEqual(["on"]);
+  });
+
+  it("never offers a relative link, the panel's own address, or a script", () => {
+    const root = withLinks(
+      [
+        '<a id="rel" href="docs/a.md">rel</a>',
+        '<a id="own" href="https://neovibe.invalid/x">own</a>',
+        '<a id="js" href="javascript:alert(1)">js</a>',
+        '<a id="user" href="https://user:pw@example.com/">user</a>',
+        '<a id="plain" href="https://example.com/ok">ok</a>',
+      ].join(" "),
+      { rel: [30, 5], own: [35, 5], js: [40, 5], user: [45, 5], plain: [50, 5] },
+    );
+    expect(hintTargets(root).filter((t) => t.kind === "link").map((t) => t.el.id)).toEqual(["plain"]);
+  });
+
+  it("does not offer a link that is not inside a conversation row (a stop that is not one has no reply text)", () => {
+    document.body.innerHTML = `
+      <div id="root"><div class="message-list" id="list"><div data-nav-stop="row" id="r0">prompt</div></div>
+      <div data-nav-stop="status" id="status"><a id="stray" href="https://example.com/a">x</a><button id="stop">Stop</button></div></div>`;
+    rect(byId("root"), 0, 200);
+    rect(byId("list"), 0, 100);
+    rect(byId("r0"), 0, 20);
+    rect(byId("status"), 150, 40);
+    rect(byId("stray"), 150, 10);
+    rect(byId("stop"), 160, 20);
+    expect(hintTargets(byId("root")).map((t) => `${t.kind}:${t.el.id}`)).toEqual(["row:r0", "control:stop"]);
   });
 });

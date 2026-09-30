@@ -19,8 +19,12 @@ type Props = {
 };
 
 /** One of the four groups (spec §3.2), rendered from the same tables `keymap.test.ts` binds to
- *  `resolveKey` both ways -- this component adds no keys of its own, only a title and a layout. */
-function Section({ title, rows }: { title: string; rows: KeyHelp[] }) {
+ *  `resolveKey` both ways -- this component adds no keys of its own, only a title and a layout.
+ *  `note` is a sentence under the table, for what is true of the whole group and is not one key's row
+ *  (a `<p>`, like the leader and "Selecting" sections' own): a rule `resolveKey` never sees -- `Ctrl+[`
+ *  is Esc is one listener on the document (`../ctrlBracket`) -- cannot be a row of a table
+ *  `keymap.test.ts` ties to `resolveKey` both ways. A section with no note draws no `<p>`. */
+function Section({ title, rows, note }: { title: string; rows: KeyHelp[]; note?: string }) {
   return (
     <section>
       <h2>{title}</h2>
@@ -36,6 +40,7 @@ function Section({ title, rows }: { title: string; rows: KeyHelp[] }) {
           ))}
         </tbody>
       </table>
+      {note !== undefined && <p>{note}</p>}
     </section>
   );
 }
@@ -228,12 +233,29 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           ahead of `resolveKey`, never `resolveKey` itself -- so it is spliced in here rather than
           added to `BROWSE_KEYS`, which `keymap.test.ts` ties to `resolveKey` both ways and would fail
           on a key that table never claims (`BROWSE_KEYS <-> resolveKey`, forward direction). The
-          "Typing" section below already does the same for its own two GTK-decided rows. */}
-      <Section title="This panel" rows={[...BROWSE_KEYS, { keys: "Ctrl+j", what: "Type (the box below)" }]} />
+          "Typing" section below already does the same for its own two GTK-decided rows. R9 (v1 picks
+          Task 9): "`Ctrl+[` is Esc" is one document listener (`../ctrlBracket`), not a key `resolveKey`
+          sees, so it is this group's `note` -- not a row of `BROWSE_KEYS` either. */}
+      <Section
+        title="This panel"
+        rows={[...BROWSE_KEYS, { keys: "Ctrl+j", what: "Type (the box below)" }]}
+        note="Ctrl+[ is Esc everywhere in this panel."
+      />
       <Selecting panel={panel} />
       <LeaderAndTabKeys panel={panel} />
+      {/* R13 (v1 picks Task 11, owner decision d): what Enter sends beyond the typed text is one sentence
+          about Enter, not a key of its own -- `Composer` sends it and `resolveKey` never sees it, so it
+          is this group's `note`, not a row of `INPUT_KEYS` (tied to `COMPOSER_CHORDS` both ways). It reads
+          off the code, not the brief: `compose_turn_text` (core/src/editor_context/compose.rs) adds the
+          editor's file name -- or, while a Visual selection is live, those lines -- and `feed.rs` drops
+          nvim's cursor `line`, so "not its text or cursor" is true; the caps are the nvim snippet's own
+          (`MAX_SELECTION_LINES = 400`, `CONTENT_LIMIT = 2000`, nvim_editor_context.lua); and a turn the
+          CLI runs as one of its own local commands goes without the block (`CLI_LOCAL_COMMANDS`, whose
+          `/model` and `/effort` are the two this panel itself sends bare). The dashboard says the short
+          form of the same fact (`Dashboard.tsx`'s `.dash-context`). */}
       <Section
         title="Typing"
+        note="Enter also sends the editor's file name — not its text or cursor — or the lines selected there in Visual mode (up to 400 lines and 2000 characters). /model, /effort and the CLI's other local commands go without it."
         rows={[
           ...INPUT_KEYS,
           // Fix round 1 (reviewer finding): narrowed from "Ctrl+h / j / k / l" -- `j`/`k` are no

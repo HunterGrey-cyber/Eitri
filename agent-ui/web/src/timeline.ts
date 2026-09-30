@@ -156,3 +156,52 @@ export function promptIndex(timeline: TimelineItem[], from: number, delta: 1 | -
   }
   return null;
 }
+
+/** Whether `item` is a card waiting for an answer from this panel: a permission item whose id is not in
+ *  `answered` -- the ids this tab has answered, by a card's button or by `a`/`d`, which stay drawn (inert)
+ *  until the provider resolves them. The one condition a timeline cannot know is whether the session still
+ *  lives (a dead session's cards are inert, `PermissionCard`): that is the caller's. */
+function isWaitingCard(item: TimelineItem, answered: ReadonlySet<string>): boolean {
+  return item.kind === "permission" && !answered.has(item.request.permissionId);
+}
+
+/** `]p` (+1) / `[p` (-1) (R7): the next waiting card after (before) `from`, wrapping as nvim's `]d`
+ *  does (`vim.diagnostic.jump`'s default) -- unlike `[[`/`]]` (`promptIndex`), which stop at either end. A card
+ *  this panel already answered is not waiting. With one card waiting, and `from` on it, the answer is `from`
+ *  itself (a lone diagnostic is its own next); `null` when none waits at all. `from` may lie outside the
+ *  timeline (it counts round the ring), so a cursor left one past a shortened list still finds a real row. */
+export function waitingCardIndex(
+  timeline: TimelineItem[],
+  from: number,
+  delta: 1 | -1,
+  answered: ReadonlySet<string>,
+): number | null {
+  const n = timeline.length;
+  for (let step = 1; step <= n; step++) {
+    const i = (((from + delta * step) % n) + n) % n;
+    if (isWaitingCard(timeline[i], answered)) return i;
+  }
+  return null;
+}
+
+/** `{N}]p` / `{N}[p`: `waitingCardIndex` taken `times` times, each step from the card the last one landed on
+ *  (a count repeats it, R7). The first step reaches a waiting card and every step after it only goes round the
+ *  ring of them, so a count is at most as many steps as there are waiting cards -- `times - 1` modulo that,
+ *  plus the first -- however large it is: it costs O(waiting x rows), where repeating the single step `times`
+ *  times cost O(times x rows), which for the panel's cap of 9999 over a long conversation with one card waiting
+ *  is a whole scan of it 9999 times inside one keydown. The same landing either way. `null` when no card waits. */
+export function waitingCardAfter(
+  timeline: TimelineItem[],
+  from: number,
+  delta: 1 | -1,
+  times: number,
+  answered: ReadonlySet<string>,
+): number | null {
+  let waiting = 0;
+  for (const item of timeline) if (isWaitingCard(item, answered)) waiting++;
+  if (waiting === 0) return null;
+  let target = from;
+  const steps = ((Math.max(1, times) - 1) % waiting) + 1;
+  for (let step = 0; step < steps; step++) target = waitingCardIndex(timeline, target, delta, answered) ?? target;
+  return target;
+}

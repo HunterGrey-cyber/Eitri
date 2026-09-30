@@ -248,6 +248,13 @@ export type AgentUiState = {
   activeTurnId: string | null; pendingPermissions: PermissionRequestRecord[];
   capabilities: Capabilities;
   provider: ProviderInfo | null;
+  /** The last usage this tab's provider reported, or `null` before it has (R5: what the band's usage
+   * segment reads). A turn that reports one replaces it whole -- a running total, so a lower figure is
+   * the truth after `/clear` -- and a turn that reports none leaves it (`reducer.ts`). On the wire: a
+   * snapshot carries it (an explicit `null` when nothing was reported), so a tab switch or a panel
+   * reload shows the figure without waiting for the next turn. A resumed tab shows none until its
+   * first turn after the resume, because history seeding reports no usage. */
+  usage: UsageInfo | null;
   /** What this session was seeded with before it produced anything of its own, or `null` when it
    * restored nothing -- which is every fresh session. On the wire, so it survives a resync and a
    * panel reload exactly as the four collections do. */
@@ -350,17 +357,33 @@ export type Hello = {
 
 export type TurnOutcome = "completed" | "interrupted" | "failed" | "limit_reached";
 
-/** What a provider reported about a turn's cost. Mirrors Rust's `agent::UsageInfo`, and the
- *  snake_case field names are deliberate -- `AgentDomainEvent` reaches the frontend through
- *  serde's own derive, not through `serialize_snapshot_for_js`'s camelCase re-shaping.
+/** The token counts of one usage report, as Verdandi's `TurnUsage` carries them (Rust's
+ *  `agent::TokenUsage`, snake_case as serde derives it). The prompt is three figures, not one: Claude
+ *  Code caches aggressively, so on a large prompt `input` is typically single digits and nearly all of
+ *  it is `cache_creation` or `cache_read`. What the session moved is the sum of all four. */
+export type TokenUsage = { input: number; output: number; cache_creation: number; cache_read: number };
+
+/** What a provider reported about a session's spend so far. Mirrors Rust's `agent::UsageInfo`, and the
+ *  snake_case field names are deliberate -- `AgentDomainEvent` reaches the frontend through serde's own
+ *  derive, and a snapshot's `usage` (`AgentUiState.usage`) carries this same object rather than
+ *  `serialize_snapshot_for_js`'s camelCase re-shaping, so a live report and a reload read one type.
  *
- *  `turn_completed.usage` is `null` whenever the backend reported nothing, which on the `sidecar`
- *  backend is EVERY turn: `verdandi.claude.runtime.v1`'s `TurnCompleted` message carries no usage
- *  fields at all. Anything that renders this must show `null` as unknown. Showing it as $0.00 would
- *  reinstate the bug that made the field nullable: this event used to arrive with
- *  `total_cost_usd: 0, num_turns: 0` hardcoded on that backend, so a cost readout would have been
- *  correct on `legacy` and confidently, permanently wrong on `sidecar`. Nothing renders it today. */
-export type UsageInfo = { total_cost_usd: number; num_turns: number };
+ *  **A running total, not one turn's spend** (R5): the SDK's result carries the session so far, a
+ *  mid-session `/clear` resets it, and a resumed session starts fresh -- so a later report replaces an
+ *  earlier one whole, even a lower one, and is never added to it (`reducer.ts`).
+ *
+ *  Each backend fills the half it really has. The sidecar (Verdandi's `TurnUsage`, capability
+ *  `turn_usage`) reports `tokens` and `model` and has no turn count; legacy's terminal `result` line
+ *  reports `num_turns` and reads no token fields. A `null` slot is unknown, never zero.
+ *
+ *  `turn_completed.usage` is itself `null` when the provider reported nothing for that turn -- an
+ *  interrupted or synthesized one, or a sidecar that predates `TurnUsage` -- which is NOT a turn that
+ *  cost nothing: it leaves the last report standing (`applyEvent`). Anything that renders this must show
+ *  `null` as unknown. Showing it as $0.00 would reinstate the bug that made the field nullable (this
+ *  event once arrived with `total_cost_usd: 0, num_turns: 0` hardcoded on the sidecar, so a cost readout
+ *  was right on `legacy` and confidently, permanently wrong there). `band.ts`'s `usageSegment` is the one
+ *  reader, and draws nothing for `null`. */
+export type UsageInfo = { total_cost_usd: number; num_turns: number | null; tokens: TokenUsage | null; model: string | null };
 export type AgentDomainEvent =
   | { type: "session_opened"; session_id: string; provider_session_id: string; model: string; cwd: string }
   | { type: "turn_started"; turn_id: string }

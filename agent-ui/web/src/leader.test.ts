@@ -1,6 +1,75 @@
 import { describe, expect, it } from "vitest";
-import { advanceSequence, boxEntries, sequenceTitle, startSequence } from "./leader";
+import { FIXED_PAIRS } from "./keymap";
+import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence } from "./leader";
 import { binding as b, TABLE } from "./testFixtures";
+
+/* K01, fix round 1 (review): `resolveKey` completes a prefix from `FIXED_PAIRS`, and the which-key
+   box drawn after the prefix lists `FIXED_PENDING_ENTRIES` -- two lists nothing tied together, so a
+   pair added to one alone would work unlisted, or be listed and cancel. */
+describe("the box after g / z / [ / ] / Ctrl+w (K01)", () => {
+  it("lists exactly the keys FIXED_PAIRS completes each prefix with, each with a label", () => {
+    expect(Object.keys(FIXED_PENDING_ENTRIES).sort()).toEqual(Object.keys(FIXED_PAIRS).sort());
+    // v1 picks, Task 6: `Ctrl+w` (`"C-w"`) is the fifth reserved prefix.
+    for (const prefix of ["g", "z", "[", "]", "C-w"] as const) {
+      const listed = FIXED_PENDING_ENTRIES[prefix].map((e) => e.key);
+      expect(listed.slice().sort(), prefix).toEqual(Object.keys(FIXED_PAIRS[prefix]).sort());
+      expect(new Set(listed).size, `${prefix}: each key once`).toBe(listed.length);
+      for (const e of FIXED_PENDING_ENTRIES[prefix]) expect(e.label, `${prefix}${e.key}`).not.toBe("");
+    }
+  });
+
+  /* v1 picks, Task 4: what the box says after `z` for the six pairs beyond `zh`/`zl`. */
+  it("names the six z pairs the fold and row-scroll keys add", () => {
+    const labels = Object.fromEntries(FIXED_PENDING_ENTRIES.z.map((e) => [e.key, e.label]));
+    expect(labels).toMatchObject({
+      t: "row to top",
+      z: "row to middle",
+      b: "row to bottom",
+      a: "toggle fold",
+      o: "open fold",
+      c: "close fold",
+    });
+  });
+
+  /* v1 picks, Task 8 (R6): what the box says after `g` -- its two older pairs, then `gx`. Listed in this
+     order: the box shows a prefix's pairs in table order. */
+  it("names gx after gg and gf", () => {
+    expect(FIXED_PENDING_ENTRIES.g.map((e) => [e.key, e.label])).toEqual([
+      ["g", "first row"],
+      ["f", "open path"],
+      ["x", "open link"],
+    ]);
+  });
+
+  /* v1 picks, Task 7 (R7): what the box says after a bracket -- the prompt pair it always had, then the
+     card pair `]p` / `[p` adds. Listed in this order: the box shows a prefix's pairs in table order. */
+  it("names the ]p and [p pairs after the prompt pairs", () => {
+    expect(FIXED_PENDING_ENTRIES["]"].map((e) => [e.key, e.label])).toEqual([
+      ["]", "next prompt"],
+      ["p", "next waiting card"],
+    ]);
+    expect(FIXED_PENDING_ENTRIES["["].map((e) => [e.key, e.label])).toEqual([
+      ["[", "previous prompt"],
+      ["p", "previous waiting card"],
+    ]);
+  });
+
+  /* v1 picks, Task 6: what the box says after `Ctrl+w`, its title being App.tsx's `Ctrl+w`. */
+  it("names the four Ctrl+w pairs by the module they move the keys to", () => {
+    expect(FIXED_PENDING_ENTRIES["C-w"].map((e) => [e.key, e.label])).toEqual([
+      ["h", "module left"],
+      ["j", "module below"],
+      ["k", "module above"],
+      ["l", "module right"],
+    ]);
+  });
+
+  /* A table binding cannot start with `Ctrl+w` (`neovibe.keymap.set("panel", ...)` parses no `<C-w>`),
+     so the box after it is these four rows and nothing the table adds. */
+  it("adds nothing from the panel table after Ctrl+w", () => {
+    expect(boxEntries(TABLE, ["C-w"], false)).toEqual([]);
+  });
+});
 
 describe("the sequence engine (spec §2.4, which-key's state.lua)", () => {
   it("runs a one-key binding at once", () => {

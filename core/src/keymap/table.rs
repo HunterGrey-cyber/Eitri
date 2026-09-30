@@ -225,6 +225,9 @@ fn default_bindings() -> Vec<Binding> {
     for (name, dir) in arrows {
         bind(name, Action::Select(dir), true);
     }
+    // Stock tmux's `last-pane` and `select-pane -t :.+`, neither with `-r` (v1 picks, 2026-09-29).
+    bind(";", Action::SelectLast, false);
+    bind("o", Action::SelectNext, false);
     bind("{", Action::Swap(SwapTarget::Prev), false);
     bind("}", Action::Swap(SwapTarget::Next), false);
     bind("M-1", Action::Even(Axis::Row), false);
@@ -519,6 +522,8 @@ mod tests {
         ("Down", "select.down", true),
         ("Left", "select.left", true),
         ("Right", "select.right", true),
+        (";", "select.last", false),
+        ("o", "select.next", false),
         ("{", "swap.prev", false),
         ("}", "swap.next", false),
         ("M-1", "layout.even-horizontal", false),
@@ -792,6 +797,42 @@ mod tests {
         );
     }
 
+    /// v1 picks (2026-09-29): `;` and `o` sit right after the arrows, whose row means something else
+    /// ("that way"); each says what it does and neither joins it.
+    #[test]
+    fn help_gives_the_last_and_next_module_keys_rows_of_their_own() {
+        let rows = Keymap::defaults().help(&ModuleKeys::built_in());
+        let find = |keys: &str| {
+            rows.iter()
+                .find(|r| r.keys == keys)
+                .unwrap_or_else(|| panic!("{keys}: {rows:?}"))
+        };
+        assert_eq!(
+            find("Ctrl+b ;").what,
+            "Move the keys back to the module that had them before (again: return)"
+        );
+        assert_eq!(
+            find("Ctrl+b o").what,
+            "Move the keys to the next module on screen, in tree order"
+        );
+        assert_eq!(
+            find("Ctrl+b Up / Down / Left / Right").what,
+            "Move the keys to the module that way (repeats within 500 ms)"
+        );
+    }
+
+    /// The v1 picks freeze table: a user `set` on either key now fails naming the default, until
+    /// the user frees the key with `del`, as for every other default.
+    #[test]
+    fn set_on_semicolon_or_o_names_the_default_it_would_shadow() {
+        for (key, action) in [(";", "select.last"), ("o", "select.next")] {
+            let err = Keymap::apply_user(&[set(key, "zoom")], &[]).unwrap_err().to_string();
+            assert!(err.contains(&format!("already bound to {action} (default)")), "{err}");
+            let map = Keymap::apply_user(&[del(key), set(key, "zoom")], &[]).unwrap();
+            assert_eq!(map.lookup(&k(key)).unwrap().action, Action::Zoom);
+        }
+    }
+
     #[test]
     fn the_strip_verbs_come_from_the_table() {
         assert_eq!(
@@ -833,7 +874,8 @@ mod tests {
         assert!(err(&[del("zz")]).contains("nothing binds"));
         // `gt` is a default since v1 polish F16, so rebinding it is refused until it is deleted.
         assert!(err(&[set("gt", "tab.new")]).contains("tab.next (default)"));
-        let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("zb", "tab.new")], &[]).unwrap();
+        // `zq`, not `zb`: `zb` is reserved for BROWSE since the v1 picks (panel.rs's TAKEN_PAIRS).
+        let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("zq", "tab.new")], &[]).unwrap();
         assert_eq!(ok.panel_user().sets.len(), 2);
         assert_eq!(ok.panel_user().dels.len(), 1);
     }

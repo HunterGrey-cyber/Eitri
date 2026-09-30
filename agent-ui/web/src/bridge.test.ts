@@ -243,3 +243,29 @@ describe("OutboundMessage: panel_keys and nav_fallthrough serialise exactly (Int
     expect(JSON.stringify(message)).toBe(wire);
   });
 });
+
+/* v1 picks, Task 6 (R11): `pane_nav`'s exact wire strings, all four sides, field order included -- the core
+   test `parses_pane_nav_in_all_four_directions_as_a_window_level_message` parses these same four
+   strings, so the two sides cannot drift apart on spelling (the words are the sides' names, never the
+   letters `h`/`j`/`k`/`l`). */
+describe("OutboundMessage: pane_nav serialises exactly (v1 picks, Task 6)", () => {
+  it.each<[OutboundMessage, string]>([
+    [{ type: "pane_nav", request_id: "req-1", direction: "left" }, '{"type":"pane_nav","request_id":"req-1","direction":"left"}'],
+    [{ type: "pane_nav", request_id: "req-2", direction: "down" }, '{"type":"pane_nav","request_id":"req-2","direction":"down"}'],
+    [{ type: "pane_nav", request_id: "req-3", direction: "up" }, '{"type":"pane_nav","request_id":"req-3","direction":"up"}'],
+    [{ type: "pane_nav", request_id: "req-4", direction: "right" }, '{"type":"pane_nav","request_id":"req-4","direction":"right"}'],
+  ])("%o -> %s", (message, wire) => {
+    expect(JSON.stringify(message)).toBe(wire);
+  });
+});
+
+/* v1 picks, Task 8 (R6): `open_url`'s exact wire string, field order included -- the core test
+   `parses_open_url_as_a_window_level_message` parses this same string, so the two sides cannot drift apart
+   on spelling. The page sends the WHATWG-normalized `href` (`nav.ts#webUrl`), and Rust re-checks it
+   (`agent_panel.rs#web_url`) before it reaches `UriLauncher`. */
+describe("OutboundMessage: open_url serialises exactly (v1 picks, Task 8)", () => {
+  it("names the type, the request id and the url, in that order", () => {
+    const message: OutboundMessage = { type: "open_url", request_id: "req-1", url: "https://example.com/a" };
+    expect(JSON.stringify(message)).toBe('{"type":"open_url","request_id":"req-1","url":"https://example.com/a"}');
+  });
+});

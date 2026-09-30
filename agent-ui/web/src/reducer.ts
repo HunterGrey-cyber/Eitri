@@ -21,6 +21,7 @@ export function initialState(): AgentUiState {
     pendingPermissions: [],
     capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
     provider: null,
+    usage: null,
     history: null,
     assistantMessageOpen: false,
     nextSeq: 0,
@@ -198,7 +199,13 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // The one authoritative source for "no turn is in flight" -- replaces the deleted
       // markTurnStarted's matching clear. v2 semantics unchanged from v1: a finished turn does
       // NOT end the conversation, only session_closed/session_unavailable do.
-      return { ...state, activeTurnId: null, assistantMessageOpen: false };
+      //
+      // `usage` (R5), mirroring `AgentSessionProjection::apply`: a report REPLACES the figure whole
+      // -- the SDK reports a running total that `/clear` resets, so a lower later figure is the
+      // truth, never summed or maxed -- and a turn that reported none (`null`: interrupted,
+      // synthesized, a sidecar without `TurnUsage`) leaves the last one standing. Silence is not a
+      // measurement, so it must neither erase a real figure nor become a zero.
+      return { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage };
     // Both endings clear activeTurnId, mirroring AgentSessionProjection exactly: no turn_completed
     // is ever coming, so leaving it set leaves App.tsx's turnInProgress true forever -- a spinner
     // on a dead session, next to a reply that may be truncated. Clearing it is not a local guess at
@@ -365,7 +372,12 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
   // this bit can only ever be LOST, and a resync/reload is one more way to lose it, degrading
   // `thinking` to `sent` (design §8.4). Unlike `assistantMessageOpen`, Rust never sends this one at
   // all, so there is nothing on `snapshot` to take it from.
-  return { ...snapshot, nextSeq: throughRevision, turnThinking: false };
+  //
+  // `usage` (R5) comes from the snapshot like every other field: it is per tab, so a tab that has
+  // reported nothing must not keep the figure of the one shown before it. `?? null` is the runtime
+  // defence for a payload without the key (Rust always sends it, `null` included): `usageSegment`
+  // reads `null` as unknown and would throw on `undefined`.
+  return { ...snapshot, usage: snapshot.usage ?? null, nextSeq: throughRevision, turnThinking: false };
 }
 
 /** Whether a `resume_outcome` confirms the session that was actually asked for -- the same

@@ -503,6 +503,33 @@ mod tests {
         }
     }
 
+    /// v1 picks (2026-09-29): stock tmux's `last-pane` and `select-pane -t :.+`. Read from GDK's own
+    /// keyvals (`;` is `semicolon`; Shift+`;` types `:`, which stays unbound), and bound without
+    /// `-r`: pressed again with no prefix they are ordinary keys.
+    #[test]
+    fn semicolon_and_o_classify_from_gdk_and_run_without_repeating() {
+        let t = Instant::now();
+        for (gdk, expected) in [(Key::semicolon, Action::SelectLast), (Key::o, Action::SelectNext)] {
+            let press = classify(gdk, ModifierType::empty());
+            let mut p = armed(defaults(), t);
+            assert_eq!(p.press(press, K1, t), run(expected), "{gdk:?}");
+            assert!(!p.is_armed(), "{gdk:?}");
+            p.release(K1);
+            assert_eq!(
+                p.press(press, K2, t + Duration::from_millis(100)),
+                Outcome::Pass,
+                "{gdk:?}: no `-r`, so no repeat window"
+            );
+        }
+        let colon = classify(Key::colon, ModifierType::SHIFT_MASK);
+        assert_eq!(colon, key(":"), "Shift+; is the character it types");
+        assert_eq!(
+            armed(defaults(), t).press(colon, K1, t),
+            Outcome::Swallow,
+            ": is command-prompt in stock tmux, which is not adopted"
+        );
+    }
+
     /// Review Focus 2.
     #[test]
     fn capslock_still_arms_and_shift_is_kept_on_named_keys() {

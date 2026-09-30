@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
+import { buildTimeline, oldestPendingPermission, promptIndex, waitingCardAfter, waitingCardIndex } from "./timeline";
+import type { TimelineItem } from "./timeline";
 import { initialState } from "./reducer";
 import type { AgentUiState, PermissionRequestRecord, ToolCallRecord, TranscriptMessage } from "./types";
 
@@ -233,5 +234,203 @@ describe("promptIndex (R4's [[ / ]])", () => {
     expect(promptIndex(timeline, 4, 1)).toBeNull();
     expect(promptIndex(timeline, 3, -1)).toBe(0);
     expect(promptIndex(timeline, 0, -1)).toBeNull();
+  });
+});
+
+/* v1 picks, Task 7 (R7): `]p` / `[p`, the next / previous card waiting for an answer in this tab. Wraps as
+   nvim's `]d` does (`vim.diagnostic.jump`'s default) where `[[`/`]]` (`promptIndex` above) never do; a card
+   this panel has already answered is not waiting, though it stays on screen until the provider resolves it. */
+describe("waitingCardIndex (R7's ]p / [p)", () => {
+  /** prompt 0, card p1 1, a message 2, card p2 3. */
+  const fixture = () =>
+    buildTimeline(
+      state({
+        userPrompts: [{ seq: 1, text: "go" }],
+        pendingPermissions: [perm(2, "p1", null), perm(4, "p2", null)],
+        transcript: [msg(3, "meanwhile")],
+      }),
+    );
+  const none: ReadonlySet<string> = new Set();
+
+  it("goes from the top to the first card, on to the second, and wraps from the last back to the first", () => {
+    const timeline = fixture();
+    expect(timeline.map((i) => i.kind)).toEqual(["prompt", "permission", "message", "permission"]);
+    expect(waitingCardIndex(timeline, 0, 1, none)).toBe(1);
+    expect(waitingCardIndex(timeline, 1, 1, none)).toBe(3);
+    expect(waitingCardIndex(timeline, 3, 1, none)).toBe(1);
+  });
+
+  it("goes back the same way: -1 from the first card wraps to the last, and from the top reaches the last too", () => {
+    const timeline = fixture();
+    expect(waitingCardIndex(timeline, 1, -1, none)).toBe(3);
+    expect(waitingCardIndex(timeline, 3, -1, none)).toBe(1);
+    expect(waitingCardIndex(timeline, 0, -1, none)).toBe(3);
+  });
+
+  it("starts from any row, a message between two cards included", () => {
+    const timeline = fixture();
+    expect(waitingCardIndex(timeline, 2, 1, none)).toBe(3);
+    expect(waitingCardIndex(timeline, 2, -1, none)).toBe(1);
+  });
+
+  it("skips a card this panel already answered", () => {
+    const timeline = fixture();
+    expect(waitingCardIndex(timeline, 0, 1, new Set(["p1"]))).toBe(3);
+    expect(waitingCardIndex(timeline, 0, -1, new Set(["p2"]))).toBe(1);
+    // From the answered card itself, the way on is the other one.
+    expect(waitingCardIndex(timeline, 1, 1, new Set(["p1"]))).toBe(3);
+    // The only waiting card is the one the search started from: it is its own next (nvim's `]d` on the
+    // lone diagnostic), rather than nothing.
+    expect(waitingCardIndex(timeline, 3, -1, new Set(["p1"]))).toBe(3);
+  });
+
+  it("is null when no card waits: none at all, all answered, or nothing in the timeline", () => {
+    expect(waitingCardIndex(buildTimeline(state({ transcript: [msg(1, "hi")] })), 0, 1, none)).toBeNull();
+    expect(waitingCardIndex(fixture(), 0, 1, new Set(["p1", "p2"]))).toBeNull();
+    expect(waitingCardIndex(fixture(), 2, -1, new Set(["p1", "p2"]))).toBeNull();
+    expect(waitingCardIndex([], 0, 1, none)).toBeNull();
+    expect(waitingCardIndex([], 0, -1, none)).toBeNull();
+  });
+
+  it("returns a lone card from itself, both ways", () => {
+    const timeline = buildTimeline(state({ userPrompts: [{ seq: 1, text: "go" }], pendingPermissions: [perm(2, "only", null)] }));
+    expect(waitingCardIndex(timeline, 1, 1, none)).toBe(1);
+    expect(waitingCardIndex(timeline, 1, -1, none)).toBe(1);
+    expect(waitingCardIndex(timeline, 0, 1, none)).toBe(1);
+  });
+
+  it("reads a display timeline too: a collapsed run of finished calls is not a card", () => {
+    const run: TimelineItem = { kind: "run", seq: 5, key: "r-5", calls: [] };
+    const timeline = [...fixture(), run];
+    expect(waitingCardIndex(timeline, 3, 1, none)).toBe(1);
+    expect(waitingCardIndex(timeline, 4, 1, none)).toBe(1);
+    expect(waitingCardIndex(timeline, 0, -1, none)).toBe(3);
+  });
+
+  it("is only ever a permission item: a tool call carrying a card's own id is not one", () => {
+    const timeline = buildTimeline(
+      state({
+        toolCalls: [tool(1, "toolu_1")],
+        pendingPermissions: [perm(2, "perm-1", "toolu_1")],
+      }),
+    );
+    // tool 0, card 1: the search never stops on the call the card gates.
+    expect(waitingCardIndex(timeline, 1, 1, none)).toBe(1);
+    expect(waitingCardIndex(timeline, 0, 1, none)).toBe(1);
+    expect(waitingCardIndex(timeline, 0, -1, none)).toBe(1);
+  });
+
+  /* The cursor is an index into the timeline it was set on; one row further than the timeline now has (a
+     row folded away) or a negative one must still come out as a real index, counted round the ring. */
+  it("counts a from outside the timeline round it, and never answers with an index that is not one", () => {
+    const timeline = fixture();
+    expect(waitingCardIndex(timeline, 9, 1, none)).toBe(3); // 9 is 1 mod 4: the card after p1
+    expect(waitingCardIndex(timeline, -4, -1, none)).toBe(3); // -4 is 0 mod 4: the card before the top
+  });
+});
+
+/* `{N}]p` / `{N}[p`: a count repeats the jump. It is the single step taken N times, but costs one lap of the
+   waiting cards at most, however large N is (the panel caps a count at 9999). */
+describe("waitingCardAfter (a count before ]p / [p)", () => {
+  /** prompt 0, card p1 1, a message 2, card p2 3. */
+  const fixture = () =>
+    buildTimeline(
+      state({
+        userPrompts: [{ seq: 1, text: "go" }],
+        pendingPermissions: [perm(2, "p1", null), perm(4, "p2", null)],
+        transcript: [msg(3, "meanwhile")],
+      }),
+    );
+  const none: ReadonlySet<string> = new Set();
+
+  it("is the single step for a count of one, and goes that many cards on for a larger one", () => {
+    const timeline = fixture();
+    expect(waitingCardAfter(timeline, 0, 1, 1, none)).toBe(waitingCardIndex(timeline, 0, 1, none));
+    expect(waitingCardAfter(timeline, 0, 1, 2, none)).toBe(3);
+    expect(waitingCardAfter(timeline, 0, 1, 3, none)).toBe(1); // round the ring
+    expect(waitingCardAfter(timeline, 0, -1, 2, none)).toBe(1);
+    expect(waitingCardAfter(timeline, 0, -1, 3, none)).toBe(3);
+  });
+
+  it("counts only the cards that wait: with p1 answered, every count lands on p2", () => {
+    const timeline = fixture();
+    for (const times of [1, 2, 3, 4, 9999]) expect(waitingCardAfter(timeline, 0, 1, times, new Set(["p1"])), `${times}`).toBe(3);
+  });
+
+  it("is null when no card waits, whatever the count", () => {
+    expect(waitingCardAfter(fixture(), 0, 1, 5, new Set(["p1", "p2"]))).toBeNull();
+    expect(waitingCardAfter([], 0, 1, 1, none)).toBeNull();
+    expect(waitingCardAfter(buildTimeline(state({ transcript: [msg(1, "hi")] })), 0, -1, 3, none)).toBeNull();
+  });
+
+  it("treats a count below one as one", () => {
+    const timeline = fixture();
+    expect(waitingCardAfter(timeline, 0, 1, 0, none)).toBe(1);
+    expect(waitingCardAfter(timeline, 0, 1, -3, none)).toBe(1);
+  });
+
+  it("is a lone card's own answer at every count", () => {
+    const timeline = buildTimeline(state({ userPrompts: [{ seq: 1, text: "go" }], pendingPermissions: [perm(2, "only", null)] }));
+    for (const times of [1, 2, 7, 9999]) {
+      expect(waitingCardAfter(timeline, 0, 1, times, none), `${times}`).toBe(1);
+      expect(waitingCardAfter(timeline, 1, -1, times, none), `${times}`).toBe(1);
+    }
+  });
+
+  /* The shortcut is only allowed to be a shortcut: against the plain loop it replaces, over many small
+     timelines, every start, both ways, counts past several laps, and answered subsets. */
+  it("lands where repeating the single step count times does, over a spread of timelines", () => {
+    let seed = 20260929;
+    const next = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    for (let round = 0; round < 400; round++) {
+      const rows = next(12);
+      const cards: { seq: number; id: string }[] = [];
+      const st = { userPrompts: [] as { seq: number; text: string }[], transcript: [] as TranscriptMessage[], perms: [] as PermissionRequestRecord[] };
+      for (let seq = 1; seq <= rows; seq++) {
+        const kind = next(3);
+        if (kind === 0) st.userPrompts.push({ seq, text: `u${seq}` });
+        else if (kind === 1) st.transcript.push(msg(seq, `m${seq}`));
+        else {
+          cards.push({ seq, id: `p${seq}` });
+          st.perms.push(perm(seq, `p${seq}`, null));
+        }
+      }
+      const timeline = buildTimeline(state({ userPrompts: st.userPrompts, transcript: st.transcript, pendingPermissions: st.perms }));
+      const answered = new Set(cards.filter(() => next(3) === 0).map((c) => c.id));
+      const from = next(rows + 6) - 3;
+      const times = 1 + next(40);
+      const delta = next(2) === 0 ? 1 : -1;
+      let expected: number | null = from;
+      for (let n = 0; n < times && expected !== null; n++) expected = waitingCardIndex(timeline, expected, delta, answered);
+      expect(waitingCardAfter(timeline, from, delta, times, answered), `round ${round}: from ${from}, ${delta > 0 ? "+" : "-"}${times}`).toBe(expected);
+    }
+  });
+
+  /* The cost bound, measured where it can be: how many cards the search looked at. The plain loop asks
+     `answered` about at least one card per step; this asks about a handful, however large the count. */
+  it("looks at a handful of cards for a count of 9999, not thousands", () => {
+    class Counting extends Set<string> {
+      asked = 0;
+      has(id: string) {
+        this.asked++;
+        return super.has(id);
+      }
+    }
+    const transcript = Array.from({ length: 600 }, (_, i) => msg(i + 2, `row ${i}`));
+    const timeline = buildTimeline(state({ transcript, pendingPermissions: [perm(1, "only", null), perm(500, "other", null)] }));
+    for (const delta of [1, -1] as const) {
+      const answered = new Counting();
+      const landed = waitingCardAfter(timeline, 300, delta, 9999, answered);
+      expect(landed).not.toBeNull();
+      expect(answered.asked, `delta ${delta}`).toBeLessThan(20);
+    }
+    // And still the lap the count comes to: two cards, an odd count, forwards from between them.
+    const cardRows = timeline.flatMap((item, i) => (item.kind === "permission" ? [i] : []));
+    expect(cardRows).toHaveLength(2);
+    expect(waitingCardAfter(timeline, cardRows[0] + 1, 1, 9999, new Set())).toBe(cardRows[1]);
+    expect(waitingCardAfter(timeline, cardRows[0] + 1, 1, 9998, new Set())).toBe(cardRows[0]);
   });
 });

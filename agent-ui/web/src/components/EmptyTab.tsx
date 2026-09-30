@@ -47,6 +47,14 @@ export type EmptyTabProps = {
    *  must never leave the keys on `document.body`). Landed on the composer (INPUT) or this screen's
    *  own root (BROWSE), whichever currently has the live control. */
   keysRequest: number;
+  /** K01 (ruling R1: "the empty tab's dashboard follows the same rule"), fix round 1: bumped by
+   *  `App.tsx`'s `dropPendingKeys()`, on every cancel route this screen never sees as a key of its
+   *  own -- Shift+Tab (`App.tsx`'s document-capture router claims it and stops it before this
+   *  screen's `onKeyDown`), an overlay (the chooser, a y/n prompt, a rename), a HINT, a tab switch,
+   *  `arrive`, `pane_focus`, `nav_key`. It drops this screen's own waiting prefix and leader
+   *  sequence, as those routes drop the live conversation's: `g`, Shift+Tab, `i` used to swallow the
+   *  `i`. Optional, so this component's own tests need no stand-in. */
+  dropKeysRequest?: number;
   /** Wave 3 Task 1: true while the `prefix w` chooser is drawn over this screen. Guards
    *  `focusRequest`/`arriveRequest`/`keysRequest` from stealing the keys out from under it -- the
    *  same `overlayOpen` `App.tsx` computes, threaded through since this screen has no
@@ -230,7 +238,8 @@ export function EmptyTab(props: EmptyTabProps) {
      see it. The reserved `g`/`z`/`[`/`]` prefixes get only their table half here
      (`pendingPrefixRef` below): `[b`/`]b` step tabs from the dashboard as from a live tab (spec §4,
      the whole-branch review), while `resolveKey`'s own fixed pairs (`gg`, `[[`, ...) have no rows
-     to act on on this screen and stay unimplemented. */
+     to act on on this screen and stay unimplemented -- so here every key but a table pair cancels
+     a waiting prefix (K01, ruling R1). */
   const pendingPrefixRef = useRef<string | null>(null);
   const seqRef = useRef<{ typed: string[]; ambiguous: PanelBinding | null } | null>(null);
   const [seq, setSeq] = useState<{ typed: string[]; ambiguous: PanelBinding | null } | null>(null);
@@ -312,6 +321,12 @@ export function EmptyTab(props: EmptyTabProps) {
     if (mode !== "browse" || starting || failed || !props.paneFocused) clearSequence();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, starting, failed, props.paneFocused]);
+  // K01: the window's own cancel routes (`dropKeysRequest`'s doc). Also run on mount, where there is
+  // nothing to drop yet -- as the `[panelTable]` effect above.
+  useEffect(() => {
+    clearSequence();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.dropKeysRequest]);
   useEffect(() => {
     return () => {
       cancelBoxTimer();
@@ -485,6 +500,11 @@ export function EmptyTab(props: EmptyTabProps) {
     // this used to be dropped, so the dashboard said nothing at all (the whole-branch review).
     const cancelled = typingGuard.onKey(event.key, typedAt);
     if (cancelled !== null) props.onFlash?.(cancelled);
+    // K01: every real key reads and drops a reserved prefix first; an input method's key and an
+    // INPUT key drop it too.
+    if (pendingPrefixRef.current !== null && isModifierKey(event.key)) return;
+    const prefix = pendingPrefixRef.current;
+    pendingPrefixRef.current = null;
     // An IME key is never a key of this screen's, the leader engine's below included: the same
     // `isImeKey` test App.tsx's own leader engine and the composer use, so WebKit's `keyCode` 229
     // (a key the input method consumed, reported without `isComposing`) is caught here as well.
@@ -505,6 +525,24 @@ export function EmptyTab(props: EmptyTabProps) {
         setMode("browse");
       }
       return;
+    }
+    // K01 (ruling R1): a reserved prefix typed a key ago (`[`) waits with no timeout; this key
+    // either completes one of its table pairs (`[b` -> tab.prev, `gT` through Shift, never through
+    // Ctrl/Alt: no table key is a chord) or cancels, swallowed, as vim ends an unfinished `g` --
+    // never read as an ordinary key, so neither `f`/`r`/`y`/`i`, the leader, nor a focused
+    // control's own Enter/Space (the line just below) runs past it. `Ctrl+c` alone still falls
+    // through, to the page's own native copy, as it does over a live tab (D1).
+    if (prefix !== null) {
+      const pair = event.ctrlKey || event.altKey ? null : pendingPairBinding(panelTable, prefix, event.key);
+      if (pair !== null) {
+        event.preventDefault();
+        props.onPanelAction?.(pair);
+        return;
+      }
+      if (!(event.ctrlKey && event.key === "c")) {
+        event.preventDefault();
+        return;
+      }
     }
     // v1 hardening, codex-release-p1 #5: a pending sequence's own continuation must run BEFORE the
     // unconditional single-key handlers below, matching `App.tsx`'s own ordering (leader engine
@@ -570,22 +608,9 @@ export function EmptyTab(props: EmptyTabProps) {
     // owner's table has them) takes it before the dashboard's own fixed `j`/`k`/`Enter`/letters
     // below ever see it -- the reserved-key list (Global Constraint) is what keeps those from ever
     // colliding with a real table entry.
-    // A reserved prefix typed a key ago (`[`): its table pair runs (`[b` -> tab.prev); anything
-    // else drops the prefix and is read as an ordinary key, as vim drops an unfinished `g` and as
-    // `resolveKey` does for a live tab.
-    // A bare modifier's keydown (the Shift of `gT`, v1 polish F16) waits with the prefix, as vim does.
-    if (pendingPrefixRef.current !== null && isModifierKey(event.key)) return;
-    const prefix = pendingPrefixRef.current;
-    pendingPrefixRef.current = null;
-    // Shift may complete a pair (`gT`, `:help gT`); Ctrl/Alt never do -- no table key is a chord.
-    if (prefix !== null && !event.ctrlKey && !event.altKey) {
-      const pair = pendingPairBinding(panelTable, prefix, event.key);
-      if (pair !== null) {
-        event.preventDefault();
-        props.onPanelAction?.(pair);
-        return;
-      }
-    }
+    // A reserved prefix (`g`/`z`/`[`/`]`) is armed here, and read at the top of this function, where
+    // its next key completes a table pair or cancels (ruling R1, K01) -- as `resolveKey` does for a
+    // live tab. A bare modifier's keydown (the Shift of `gT`, v1 polish F16) waits with it, as vim does.
     if (!event.ctrlKey && !event.altKey && !event.shiftKey && isPendingFirst(event.key)) {
       event.preventDefault();
       pendingPrefixRef.current = event.key;
