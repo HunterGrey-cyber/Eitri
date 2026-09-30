@@ -227,7 +227,7 @@ echo "== --version works and skips project/hint output =="
 reset_state
 EXTRA_ENV=()
 out="$(run_launcher --version)"
-assert_not_contains "$out" "eitri  project" "--version never resolves or prints a project"
+assert_not_contains "$out" "eitri    project" "--version never resolves or prints a project"
 assert_not_contains "$out" "no sidecar built yet" "--version never prints the sidecar hint"
 
 echo "== --legacy passes through to shell's argv, no env export =="
@@ -400,6 +400,26 @@ out="$(run_launcher -h)"
 assert_not_contains "$out" "D16" "the help text names no internal ruling id"
 assert_not_contains "$out" "LEGACY_NOT_IN_BUILD" "the help text names no internal constant"
 assert_contains "$out" "a release build refuses it" "the help text still says what a release build does, in plain words"
+
+echo "== the startup banner's project and account lines line up =="
+# The 2026-09-30 rename shortened the name to "eitri"; the account lines are indented to the
+# column "project" starts in, so the name's padding has to keep that column at 9.
+reset_state
+EXTRA_ENV=(VERDANDI_CLAUDE_ACCOUNT=work)
+out="$(run_launcher)"
+proj_line="$(printf '%s\n' "$out" | grep -m1 ' project ' || true)"
+acct_line="$(printf '%s\n' "$out" | grep -m1 ' account ' || true)"
+proj_col="${proj_line%%project*}"
+acct_col="${acct_line%%account*}"
+CHECKS=$((CHECKS + 1))
+if [[ -n "$proj_line" && -n "$acct_line" && ${#proj_col} -eq ${#acct_col} ]]; then
+	echo "ok - \"project\" and \"account\" start in the same column"
+else
+	echo "FAIL - \"project\" and \"account\" start in the same column"
+	echo "  project line: $proj_line"
+	echo "  account line: $acct_line"
+	FAILURES=$((FAILURES + 1))
+fi
 
 echo
 echo "$CHECKS checks, $FAILURES failed"

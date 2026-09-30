@@ -223,11 +223,11 @@ a sidecar revision once no install uses it, as [Updating](#updating) describes.
 ## Where things go
 
 ```
-~/.local/lib/eitri/                          the four binaries, eitri-setup, RELEASE      (tarball route)
-~/.local/bin/eitri                           the launcher, marked `# eitri-launcher v1`   (tarball route)
+~/.local/lib/eitri/                          the four binaries, eitri-setup, RELEASE         (tarball route)
+~/.local/bin/eitri                           the launcher, marked `# eitri-launcher v1`      (tarball route)
 ~/.local/share/applications/eitri.desktop    Exec = the launcher's absolute path             (tarball route)
 ~/.local/share/licenses/eitri/               LICENSE, THIRD-PARTY-LICENSES, SOURCE           (tarball route)
-/usr/lib/eitri/                              the same four binaries, eitri-setup, RELEASE  (.deb/.rpm)
+/usr/lib/eitri/                              the same four binaries, eitri-setup, RELEASE    (.deb/.rpm)
 /usr/bin/eitri                               the same launcher                               (.deb/.rpm)
 /usr/share/applications/eitri.desktop                                                        (.deb/.rpm)
 /usr/share/licenses/eitri/                                                                   (.deb/.rpm)

@@ -141,7 +141,7 @@ fi
 
 if [[ -z "$QUIET" ]]; then
 	{
-		echo "eitri  project $PROJECT"
+		echo "eitri    project $PROJECT"
 		if [[ -n "$ACCOUNT_FROM_FLAG" ]]; then
 			echo "         account $ACCOUNT (--account)"
 		elif [[ -n "$ACCOUNT" ]]; then

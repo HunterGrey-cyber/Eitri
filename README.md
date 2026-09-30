@@ -1,6 +1,6 @@
 English | [简体中文](README.zh-CN.md)
 
-# neovibe
+# Eitri
 
 **Your whole Neovim, unmodified, with a real rich agent panel beside it. Both halves are real, and
 the shell owns neither one's internals.**
@@ -11,7 +11,7 @@ text in a PTY — markdown that isn't rendered, diffs you read as plus and minus
 AI-editor forks and the panel is genuinely good, but the built-in "Vim mode" is an emulation of
 whichever parts someone had time to reimplement.
 
-neovibe refuses the trade. The editor pane is Neovide's own pipeline — keyboard and mouse → Neovim →
+Eitri refuses the trade. The editor pane is Neovide's own pipeline — keyboard and mouse → Neovim →
 Neovide's renderer → Skia → GPU — driving a real `nvim --embed` that loads your actual
 configuration, with your plugins, your LSP, your Treesitter and your keymaps. The agent panel is a
 React app in WebKitGTK, because that is still the sane way to render markdown, diffs and tool
@@ -35,7 +35,7 @@ GTK4 shell (gtk4-rs)
 ```
 
 - **GTK** provides windowing, layout, focus, IME and the WebKitGTK container. It is not the visual
-  style: the chrome is drawn by neovibe and follows your Neovim colorscheme.
+  style: the chrome is drawn by Eitri and follows your Neovim colorscheme.
 - **Neovim** keeps owning buffers, motions, LSP, completion, Treesitter and rendering. The shell
   never reimplements any of it.
 - **Agent state lives in the Rust host, not the WebView.** The panel is a pure view over a
@@ -63,11 +63,11 @@ GTK4 shell (gtk4-rs)
   and mouse reporting to programs that ask for it (`nvim`, `htop`, `less`).
 - **It inherits, it does not impose.** One `:colorscheme` in Neovim and the chrome, editor and panel
   all follow. Window keys default to stock tmux (prefix `Ctrl-b`) and are rebound in
-  `~/.config/neovibe/init.lua`, a real Lua kernel (`neovibe.keymap`, `neovibe.command`,
-  `neovibe.panel`, `neovibe.config`). A binding that collides with another is a startup error
+  `~/.config/eitri/init.lua`, a real Lua kernel (`eitri.keymap`, `eitri.command`,
+  `eitri.panel`, `eitri.config`). A binding that collides with another is a startup error
   naming both. An example `Ctrl-a` setup is in [`docs/keymap/`](docs/keymap/).
 
-![neovibe follows your colorscheme](demo/colorscheme.gif)
+![Eitri follows your colorscheme](demo/colorscheme.gif)
 
 ## Status — read this before trying it
 
@@ -92,11 +92,11 @@ One Cargo workspace at the repository root.
 |---|---|
 | `shell/` | **the application binary.** Window, chrome, focus, the module grid, the Lua kernel, theme following |
 | `neovide-editor/` | library: `NeovideEditorPane`, the forked Neovide renderer, input and runtime on a `GtkGLArea` |
-| `agent/` | library: Claude session backends (no GTK). Also builds `agent-hook` and `neovibe-claude-handoff` |
-| `core/` | library, package **`neovibe-core`**: the GTK-free half of the shell — backend selection, the Lua kernel, theme tokens, the per-window sockets, layout, keymap, session tabs |
+| `agent/` | library: Claude session backends (no GTK). Also builds `agent-hook` and `eitri-claude-handoff` |
+| `core/` | library, package **`eitri-core`**: the GTK-free half of the shell — backend selection, the Lua kernel, theme tokens, the per-window sockets, layout, keymap, session tabs |
 | `agent-ui/web/` | the panel's React/TypeScript frontend. Not a crate: `shell/build.rs` builds it with npm and embeds the single-file result |
-| `supervisor/` | `neovibe-supervisor`, a read-only cross-window agent-status dashboard |
-| `terminal/` | package **`neovibe-terminal`**: the bottom terminal's engine — PTY, session thread, terminal state, Skia paint |
+| `supervisor/` | `eitri-supervisor`, a read-only cross-window agent-status dashboard |
+| `terminal/` | package **`eitri-terminal`**: the bottom terminal's engine — PTY, session thread, terminal state, Skia paint |
 | `terminal-render/`, `terminal-frame/`, `terminal-sync/`, `terminal-input/` | the terminal's paint list, frame projection, synchronized-update barrier and key encoder. `terminal-input` is Apache-2.0 (derived from Alacritty); see its `NOTICE` |
 | `neovide/` | submodule: the Neovide fork ([HunterGrey-cyber/neovide](https://github.com/HunterGrey-cyber/neovide), branch `neovibe-integration`) |
 | `poc/` | frozen proof-of-concept crates from the feasibility stage. Not the product; they deliberately keep bugs fixed only in the product crates |
@@ -107,24 +107,24 @@ The agent talks to Claude Code through a **sidecar**, a Node service from the si
 [Verdandi](https://github.com/HunterGrey-cyber/verdandi) (`apps/claude-sidecar`), over gRPC on a
 per-window Unix socket. `agent` depends on Verdandi's `claude-runtime-protocol` crate, pinned by
 revision in `agent/Cargo.toml` and fetched from GitHub by Cargo; nothing else of Verdandi is needed
-to *build* neovibe.
+to *build* Eitri.
 
-To *run* the sidecar backend, neovibe needs the sidecar itself, found in this order: first
-`NEOVIBE_SIDECAR_BINARY` (a built executable), then — if that is unset — `NEOVIBE_VERDANDI_CHECKOUT`
+To *run* the sidecar backend, Eitri needs the sidecar itself, found in this order: first
+`EITRI_SIDECAR_BINARY` (a built executable), then — if that is unset — `EITRI_VERDANDI_CHECKOUT`
 (a development override pointing at a Verdandi checkout); then a `verdandi-claude-sidecar` beside
-the `shell` binary (what the packages and the AUR builds produce); then the artifact `neovibe setup`
-builds for your user, under `$XDG_DATA_HOME/neovibe/sidecar/<pinned revision>/` (or
+the `shell` binary (what the packages and the AUR builds produce); then the artifact `eitri setup`
+builds for your user, under `$XDG_DATA_HOME/eitri/sidecar/<pinned revision>/` (or
 `~/.local/share/…` if unset), keyed to the exact revision this build pins so an old release's build
 is never picked up by a newer one; and last, a Verdandi checkout at the default
 `~/src/verdandi`, but only if one is already sitting there with something built.
 Nothing here ever builds anything on its own — see [Install](#install) for why that build has to
-happen on your machine, and run through `neovibe setup`.
+happen on your machine, and run through `eitri setup`.
 
 **No release contains the legacy backend** that used to spawn the `claude` on your `PATH` directly.
 It stays in the tree as a development-only build option (`cargo build --features
 shell/legacy-backend`) for local testing and the project's own sandbox GUI passes; a release build
-cannot select it (`neovibe --legacy` on a release exits 1, naming why). Either way — sidecar or the
-legacy dev build — you need Claude Code installed and logged in; neovibe spends whatever account it
+cannot select it (`eitri --legacy` on a release exits 1, naming why). Either way — sidecar or the
+legacy dev build — you need Claude Code installed and logged in; Eitri spends whatever account it
 runs under.
 
 ## Install
@@ -132,26 +132,26 @@ runs under.
 The quick way — downloads and runs the installer over HTTPS, installing to `~/.local` with no `sudo`:
 
 ```sh
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/neovibe/releases/latest/download/install.sh | sh
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
 ```
 
 Read the script before piping it to a shell, or check it against its signed checksums first — see
 [`INSTALL.md`](INSTALL.md) for the full "verify before running" recipe, what verification does and
 does not protect, and every other route in detail:
 
-- **`.deb`/`.rpm`** from the [releases page](https://github.com/HunterGrey-cyber/neovibe/releases),
-  then run `neovibe setup` once — it builds the sidecar for this machine and offers to fetch a
+- **`.deb`/`.rpm`** from the [releases page](https://github.com/HunterGrey-cyber/eitri/releases),
+  then run `eitri setup` once — it builds the sidecar for this machine and offers to fetch a
   private `nvim` if yours is too old.
-- **AUR**: `yay -S neovibe-bin` (prebuilt binaries, sidecar built at install time) or
-  `yay -S neovibe-git` (everything, including neovibe itself, built from source).
-- **`--from-source`**: `sh install.sh --from-source` builds neovibe on your own machine — see
+- **AUR**: `yay -S eitri-bin` (prebuilt binaries, sidecar built at install time) or
+  `yay -S eitri-git` (everything, including Eitri itself, built from source).
+- **`--from-source`**: `sh install.sh --from-source` builds Eitri on your own machine — see
   [Building](#building) for the toolchain it needs. **0.2.0 is x86_64 only**; `--from-source`
   refuses on any other `uname -m` too, so it is not an ARM route.
 
 **Requirements**: GTK ≥ 4.14, WebKitGTK 6.0, glibc ≥ 2.39, x86_64 Linux — every route, prebuilt or
 from source. **nvim ≥ 0.10** — your own, on
-`PATH`, or let the installer fetch a private copy for neovibe alone
-(`$XDG_DATA_HOME/neovibe/nvim/<version>/`, never placed on `PATH` and never touching, replacing or
+`PATH`, or let the installer fetch a private copy for Eitri alone
+(`$XDG_DATA_HOME/eitri/nvim/<version>/`, never placed on `PATH` and never touching, replacing or
 removing anything named `nvim`/`vim`/`vi` anywhere else on your system). Claude Code, installed and
 logged in.
 
@@ -162,16 +162,16 @@ logged in.
 
 **Why the sidecar is built on your machine, not shipped.** It bundles Anthropic's
 `@anthropic-ai/claude-agent-sdk` ("© Anthropic PBC. All rights reserved"), which we do not
-redistribute. `neovibe setup` (and the installer's other routes, and an AUR package's own `build()`)
+redistribute. `eitri setup` (and the installer's other routes, and an AUR package's own `build()`)
 fetches it from the npm registry to your machine, under Anthropic's own terms, and builds the
-sidecar from the pinned Verdandi revision. The sidecar itself is not in any neovibe release
+sidecar from the pinned Verdandi revision. The sidecar itself is not in any Eitri release
 artifact.
 
 ## Building
 
 ```sh
-git clone --recurse-submodules https://github.com/HunterGrey-cyber/neovibe.git
-cd neovibe
+git clone --recurse-submodules https://github.com/HunterGrey-cyber/eitri.git
+cd eitri
 # cloned without --recurse-submodules?  git submodule update --init
 cargo build --locked
 ```
@@ -192,13 +192,13 @@ script with an error that never names this project:
 - **A C toolchain**: Lua 5.4 is built from source and statically linked.
 - **Network access on the first build**: `skia-safe` downloads a prebuilt Skia, and Cargo fetches
   the Verdandi protocol crate from GitHub.
-- At run time: **`nvim`** on `PATH` (or neovibe's own private copy, see [Install](#install)), a
+- At run time: **`nvim`** on `PATH` (or Eitri's own private copy, see [Install](#install)), a
   working OpenGL driver, a Wayland session, and Claude Code.
 
 ## Running
 
 ```sh
-cargo run -p shell -- /path/to/project     # or: NEOVIBE_PROJECT_DIR=..., or the current directory
+cargo run -p shell -- /path/to/project     # or: EITRI_PROJECT_DIR=..., or the current directory
 cargo run -p shell -- --clean /path        # start the embedded nvim with --clean
 ```
 
@@ -206,10 +206,10 @@ The project directory is resolved once and shared by the editor, the agent and t
 path that is not a directory, or an unknown option, is a startup error rather than silently ignored
 (`--` ends option parsing). Each launch is its own process with its own `nvim`.
 
-If you installed neovibe (see [Install](#install)), run it as `neovibe [project directory]`.
-`./try-neovibe.sh` in this repository launches a source build with the backend and account stated up
-front. Configuration lives in `~/.config/neovibe/init.lua` (`NEOVIBE_CONFIG_DIR` overrides it);
-per-project state (layout, history, saved permission rules) under `$XDG_STATE_HOME/neovibe/`.
+If you installed Eitri (see [Install](#install)), run it as `eitri [project directory]`.
+`./try-eitri.sh` in this repository launches a source build with the backend and account stated up
+front. Configuration lives in `~/.config/eitri/init.lua` (`EITRI_CONFIG_DIR` overrides it);
+per-project state (layout, history, saved permission rules) under `$XDG_STATE_HOME/eitri/`.
 
 The editor component alone, without the shell: `cargo run -p neovide-editor --example standalone`.
 
@@ -218,8 +218,8 @@ The editor component alone, without the shell: `cargo run -p neovide-editor --ex
 Everything defaults to stock tmux: prefix `Ctrl-b`, then a normal tmux/vim-shaped key (`c` a new
 session tab, `t` the bottom terminal, `z` zoom the pane with the keys, `x` close it, the arrow keys
 move between panes with the prefix). Pane navigation itself needs no prefix — `Ctrl-h`/`j`/`k`/`l`,
-vim-tmux-navigator style, as above. Rebind any of it in `~/.config/neovibe/init.lua`
-(`neovibe.keymap`); a binding that collides with another is a startup error naming both.
+vim-tmux-navigator style, as above. Rebind any of it in `~/.config/eitri/init.lua`
+(`eitri.keymap`); a binding that collides with another is a startup error naming both.
 
 **`prefix ?` shows every key bound today, in your build, with your own rebindings already applied.**
 That overlay, not this README, is the source of truth for a keymap that is still actively growing.
@@ -245,12 +245,12 @@ editor component.
 
 `shell` statically links [`nvim-rs`](https://crates.io/crates/nvim-rs) 0.9.2, which is
 **LGPL-3.0**. Every release carries the Corresponding Source as a separate asset on the same release
-page, `neovibe-<version>-source.tar.gz` (the exact public tree that was built, the `neovide` fork,
+page, `eitri-<version>-source.tar.gz` (the exact public tree that was built, the `neovide` fork,
 `cargo vendor` output and the pinned Skia archive), and a `SOURCE` file
-(`/usr/share/licenses/neovibe/SOURCE` in the installed packages) naming that asset and giving the
+(`/usr/share/licenses/eitri/SOURCE` in the installed packages) naming that asset and giving the
 exact recipe to modify `nvim-rs` and relink it into the shipped binary.
 
 `packaging/collect-licenses.py` generates the full third-party notices, `THIRD-PARTY-LICENSES`, that
 every package ships. **The sidecar — the only piece of this that touches Anthropic's Claude Agent
-SDK — is not in any neovibe release artifact**; see [Install](#install) for why and where it is
+SDK — is not in any Eitri release artifact**; see [Install](#install) for why and where it is
 built instead.

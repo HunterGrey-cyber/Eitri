@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=dc968e02e3260ae6808591609fadfd910a26664426e7d582e20c9b70e54d9990 -->
+<!-- translated-from: INSTALL.md sha256=99baa619a83285cc28f82e847024ce3f4831eb4528440c2f12480308adc3d782 -->
 
 # 安装 Eitri
 
@@ -124,11 +124,11 @@ sh install.sh --uninstall --purge    # 同时删除 ~/.config/eitri 和 $XDG_STA
 ## 文件都装到哪里去了
 
 ```
-~/.local/lib/eitri/                          四个二进制文件、eitri-setup、RELEASE           (tarball 方式)
-~/.local/bin/eitri                           启动器，带有标记 `# eitri-launcher v1`         (tarball 方式)
+~/.local/lib/eitri/                          四个二进制文件、eitri-setup、RELEASE             (tarball 方式)
+~/.local/bin/eitri                           启动器，带有标记 `# eitri-launcher v1`           (tarball 方式)
 ~/.local/share/applications/eitri.desktop    Exec = 启动器的绝对路径                          (tarball 方式)
 ~/.local/share/licenses/eitri/               LICENSE、THIRD-PARTY-LICENSES、SOURCE            (tarball 方式)
-/usr/lib/eitri/                              同样的四个二进制文件、eitri-setup、RELEASE      (.deb/.rpm)
+/usr/lib/eitri/                              同样的四个二进制文件、eitri-setup、RELEASE       (.deb/.rpm)
 /usr/bin/eitri                               同样的启动器                                     (.deb/.rpm)
 /usr/share/applications/eitri.desktop                                                         (.deb/.rpm)
 /usr/share/licenses/eitri/                                                                    (.deb/.rpm)
