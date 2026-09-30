@@ -83,6 +83,10 @@ export type PanelAction =
   /** `a`/`d`: answer only the permission card under the cursor or the one gating its tool call.
    *  `App.tsx` uses `./typingGuard` to answer only a key that stands alone. */
   | { kind: "answer"; decision: "allow" | "deny" }
+  /** INPUT's `Ctrl+y` approves the active tab's oldest waiting card without leaving INPUT.
+   *  `App.tsx` answers by `permissionId` after `TYPING_GUARD_MS`, only when the key stood alone,
+   *  and preserves the composer. Denial stays on the card so a reason can be typed. */
+  | { kind: "approve-oldest" }
   | { kind: "toggle-expand" }
   | { kind: "copy" }
   /** `Shift+Y`: copy a tool row's whole result, uncut, never anything else's. */
@@ -616,11 +620,29 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     if (isPlainAnswerKey(event) && event.shiftKey && event.key === "V") return { kind: "visual", line: true };
   }
   // A key carrying a modifier this table does not name is not claimed. Apart from the chords just
-  // above, no row needs Ctrl or Shift, so any other chord holding either falls through unclaimed --
+  // above, no row needs Ctrl or Shift, so any other chord holding either falls through unclaimed:
   // an ordinary Shift+letter, and any Ctrl+letter GTK or a future binding wants, both included.
-  // `KeyLike` has carried these two fields since the table was first written; this is what makes
-  // reading them, rather than deleting them, the correct fix once something actually checked whether
-  // they were used.
+  // INPUT's one added chord, Ctrl+y, comes ahead of the blanket refusal just below. Exactly
+  // Ctrl+y: Shift, Alt, Meta, Super/Hyper (held on the event or by its own keydown,
+  // `hasSuperOrHyper`) or AltGraph held is nothing, the same modifier set `isPlainAnswerKey`
+  // refuses for `a`/`d`, with Ctrl required instead of refused; a composing input method already
+  // returned at the top of this function. `App.tsx` picks the card (the active tab's oldest
+  // waiting one) and runs the typing guard; this table only names the chord. BROWSE's own Ctrl+y
+  // (the one-line scroll) is the `mode !== "input"` block above and never reaches here. Under Caps
+  // Lock GTK/WebKitGTK report the chord as key "Y" with Shift not held, so the letter is compared
+  // case-blind; Shift itself is still refused just below.
+  if (
+    mode === "input" &&
+    event.key.toLowerCase() === "y" &&
+    event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    !hasSuperOrHyper(event) &&
+    !hasAltGraph(event)
+  ) {
+    return { kind: "approve-oldest" };
+  }
   if (event.ctrlKey || event.shiftKey) return null;
   if (mode === "input") {
     // Esc during composition belongs to the input method, which uses it to cancel the preedit.
@@ -810,6 +832,8 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Ctrl+r", what: "Search earlier prompts (Enter puts one in the box)" },
   { keys: "Ctrl+w / Ctrl+u", what: "Delete a word / to the line's start" },
   { keys: "Ctrl+c", what: "Interrupt a running turn; idle, clear the box into history" },
+  // A design decision (2026-09-30): an added key. The band names the card it would approve.
+  { keys: "Ctrl+y", what: "Approve the oldest card waiting in this tab (the band names it); only a lone Ctrl+y answers" },
   { keys: "Ctrl+g", what: "Edit this in nvim (:wq brings it back, :q! changes nothing)" },
   { keys: "Ctrl+o", what: "Detailed view" },
   { keys: "Shift+Tab", what: "Toggle auto ⇄ bypass (entering bypass asks first)" },

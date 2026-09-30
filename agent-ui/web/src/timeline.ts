@@ -143,6 +143,19 @@ function isWaitingCard(item: TimelineItem, answered: ReadonlySet<string>): boole
   return item.kind === "permission" && !answered.has(item.request.permissionId);
 }
 
+/** The timeline index of the oldest waiting card (lowest `seq`), which the card input's `Ctrl+y` approves.
+ *  Cards already answered by this panel wait only for the provider and are excluded.
+ *  Returns `null` if none waits. The caller supplies the active tab's timeline, excluding other tabs. */
+export function oldestWaitingPermission(timeline: TimelineItem[], answered: ReadonlySet<string>): number | null {
+  let best: number | null = null;
+  timeline.forEach((item, index) => {
+    if (!isWaitingCard(item, answered)) return;
+    const current = best === null ? null : timeline[best];
+    if (current === null || (current.kind === "permission" && item.seq < current.seq)) best = index;
+  });
+  return best;
+}
+
 /** `]p` (+1) / `[p` (-1): the next waiting card after or before `from`, wrapping at either end.
  *  Cards already answered by this panel are excluded. A lone waiting card returns its own index,
  *  even when `from` is on it; no waiting cards returns `null`.

@@ -60,6 +60,9 @@ export const COMPOSER_CHORDS: string[] = [
   "Ctrl+r",
   "Ctrl+w / Ctrl+u",
   "Ctrl+c",
+  // A design decision: like `Ctrl+o`, left to bubble to `App`'s INPUT branch, which approves the
+  // oldest waiting card on it.
+  "Ctrl+y",
   "Ctrl+g",
   "Ctrl+o",
   "Shift+Tab",

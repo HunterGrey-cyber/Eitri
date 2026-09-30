@@ -2,11 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import { isImeKey } from "../composerKeys";
 import { searchHistory } from "../promptHistory";
 
-type Props = { history: string[]; onAccept: (text: string) => void; onCancel: () => void };
+type Props = {
+  history: string[];
+  onAccept: (text: string) => void;
+  onCancel: () => void;
+  /** Report Enter, Tab, and Escape before stopping them here. They never bubble to `App`'s
+   *  typing guard, so without this callback a following `Ctrl+y` could approve a card. This
+   *  matches the `/` and `:` input lines' use of `noteLineKey`. */
+  onLineKey?: (event: React.KeyboardEvent<HTMLInputElement>) => void;
+};
 
 /** readline's `(reverse-i-search)` line: typing narrows, `Ctrl+r` goes older,
  *  `Enter`/`Tab` put the match in the box without sending, `Esc` leaves the box as it was. */
-export function HistorySearch({ history, onAccept, onCancel }: Props) {
+export function HistorySearch({ history, onAccept, onCancel, onLineKey }: Props) {
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState<number | null>(null);
   const ref = useRef<HTMLInputElement>(null);
@@ -32,11 +40,13 @@ export function HistorySearch({ history, onAccept, onCancel }: Props) {
           } else if (e.key === "Enter" || e.key === "Tab") {
             e.preventDefault();
             e.stopPropagation();
+            onLineKey?.(e);
             if (match !== null) onAccept(match);
             else onCancel();
           } else if (e.key === "Escape") {
             e.preventDefault();
             e.stopPropagation();
+            onLineKey?.(e);
             onCancel();
           }
         }}

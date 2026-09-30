@@ -773,5 +773,15 @@
     "expected": {
       "kind": "interrupt"
     }
+  },
+  {
+    "label": "Ctrl+y, input",
+    "expected": {
+      "kind": "approve-oldest"
+    }
+  },
+  {
+    "label": "Ctrl+Shift+y, input",
+    "expected": null
   }
 ]

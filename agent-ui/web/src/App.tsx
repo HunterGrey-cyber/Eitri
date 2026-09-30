@@ -11,7 +11,7 @@ import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, star
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TypingGuard } from "./typingGuard";
+import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 import {
   compareCarets,
   copySelectionText,
@@ -28,7 +28,7 @@ import { appendQuote, formatQuote } from "./quote";
 import { installCtrlBracketAsEscape } from "./ctrlBracket";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
-import { buildTimeline, oldestPendingPermission, promptIndex, waitingCardAfter } from "./timeline";
+import { buildTimeline, oldestPendingPermission, oldestWaitingPermission, promptIndex, waitingCardAfter } from "./timeline";
 import { buildDisplay, indexOfKey, runKeyOf } from "./display";
 import { outputText, primaryText } from "./copyText";
 import { countCodePoints } from "./toolRegistry";
@@ -81,8 +81,8 @@ import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
 import { barePickerCommand } from "./slashCommands";
 import { parseEffortReply, parseModelReply } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, showTabBar } from "./tabs";
-import { shortModel, usageSegment } from "./band";
-import type { BandFacts } from "./band";
+import { cardSummary, shortModel, usageSegment } from "./band";
+import type { ApproveFact, BandFacts } from "./band";
 import type { AgentUiState, HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope, ContextSummary, QueueItem, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
@@ -181,6 +181,35 @@ const NO_WAITING_CARD_FLASH = "no card waiting here";
  *  Stop did not interrupt because it came in the middle of typing (`TypingGuard.mayActAfterMotion`)
  *  -- "just do it" typed after an arrival reached Stop with its `j` and interrupted the turn. */
 const STOP_TYPING_FLASH = "Stop takes a key only on its own — i or Ctrl+j to type";
+/** A design decision: what the band says when INPUT's `Ctrl+y` came within `TYPING_GUARD_MS` of
+ *  another key (readline's `Ctrl+u`/`Ctrl+w` then `Ctrl+y` yank, typing right after it, a held
+ *  key's repeat) and approved nothing. */
+const CTRL_Y_TYPING_FLASH = "Ctrl+y approves only on its own — pause, then press it again";
+/** Message shown when INPUT's `Ctrl+y` arrives before the target card has been stable
+ *  for `TYPING_GUARD_MS`, including a new card, a replacement or the next card after an approval. */
+const CTRL_Y_TARGET_FLASH = "Ctrl+y: the waiting card just changed — read it, then press again";
+/** Message shown when INPUT's `Ctrl+y` follows a composer kill key.
+ *  After `Ctrl+u`, `Ctrl+w` or `Ctrl+k`, it is a yank regardless of the pause. */
+const CTRL_Y_YANK_FLASH = "Ctrl+y right after Ctrl+u, Ctrl+w or Ctrl+k is a yank, not an answer — press it again";
+
+/** Whether the target is the composer's textarea, where INPUT's `Ctrl+y` can answer.
+ *  Search fields and card reason boxes do not qualify. */
+function isComposerBox(el: EventTarget | null): el is HTMLTextAreaElement {
+  return el instanceof HTMLTextAreaElement && el.closest(".composer") !== null;
+}
+
+/** Whether the key is an unmodified `Ctrl+u`, `Ctrl+w` or `Ctrl+k` in the composer.
+ *  These kill keys make a following `Ctrl+y` a yank. */
+function isKillKey(event: KeyboardEvent<HTMLElement>): boolean {
+  return (
+    isComposerBox(event.target) &&
+    event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    ["u", "w", "k"].includes(event.key.toLowerCase())
+  );
+}
 /** What an open `/model`/`/effort` picker shows. */
 type SlashPickerState = { kind: SlashPickerKind; options: string[]; current: string | null };
 
@@ -693,6 +722,26 @@ export default function App() {
    *  is no longer pending (the effect after `answerableItems`). */
   const [answeredPermissions, setAnsweredPermissions] = useState<ReadonlySet<string>>(() => new Set());
   const answeredRef = useRef<ReadonlySet<string>>(answeredPermissions);
+  /** The card INPUT's `Ctrl+y` would approve, as `<tab>:<permission id>`, and whether it has
+   *  been the target for `TYPING_GUARD_MS`. Updated by the layout effect after `ctrlYTargetKey`. */
+  const ctrlYTargetRef = useRef<{ key: string | null; settled: boolean }>({ key: null, settled: false });
+  /** Whether the last non-modifier key was a kill in the composer (`isKillKey`), so the next
+   *  `Ctrl+y` yanks text regardless of the pause. */
+  const lastKeyWasKillRef = useRef(false);
+  /** Whether the composer's textarea has focus, as required by the band's `Ctrl+y` segment and
+   *  `approveOldestByKey`. Tracked through `focusin`/`focusout`. */
+  const [composerBoxFocused, setComposerBoxFocused] = useState(false);
+  useEffect(() => {
+    const onIn = (event: FocusEvent) => setComposerBoxFocused(isComposerBox(event.target));
+    const onOut = (event: FocusEvent) => setComposerBoxFocused(isComposerBox(event.relatedTarget));
+    document.addEventListener("focusin", onIn);
+    document.addEventListener("focusout", onOut);
+    setComposerBoxFocused(isComposerBox(document.activeElement));
+    return () => {
+      document.removeEventListener("focusin", onIn);
+      document.removeEventListener("focusout", onOut);
+    };
+  }, []);
   /** The reason typed so far into each pending card's box, reported by the card as it changes, so
    *  `d` sends it exactly as the card's own Deny does. A ref, not state: typing in the
    *  box must not re-render the whole panel. */
@@ -1625,6 +1674,36 @@ export default function App() {
   /** The session is gone (lost or closed). Read before the start-screen branch below, because the
    *  effect under it is a hook and cannot live after a conditional return. */
   const sessionEnded = state.status.kind === "unavailable" || state.status.kind === "closed";
+  /** A design decision: the card INPUT's `Ctrl+y` would approve right now -- the active tab's oldest
+   *  waiting card (`approveOldestByKey` picks the same one) -- for the band to name, only while the
+   *  composer has the keys (INPUT, this pane focused) on a live session. `null` otherwise. */
+  const ctrlYCard: ApproveFact | null = (() => {
+    // Show the `Ctrl+y` target only while the composer box holds the keys, matching
+    // `approveOldestByKey`. A search field must not advertise an approval shortcut that would do
+    // nothing.
+    if (mode !== "input" || !paneFocused || sessionEnded || !composerBoxFocused) return null;
+    const index = oldestWaitingPermission(timeline, answeredPermissions);
+    const item = index === null ? undefined : timeline[index];
+    return item?.kind === "permission" ? { tool: item.request.toolName, summary: cardSummary(item.request.input) } : null;
+  })();
+  /** Identifies INPUT's `Ctrl+y` target by tab and permission id. Each target must stay unchanged
+   *  for `TYPING_GUARD_MS` before approval, so a quick second `Ctrl+y` cannot approve a new card.
+   *  Arrivals, withdrawals, tab switches and approvals that change the target restart the timer.
+   *  Uses a timer like `TypingGuard.defer`, without adding another clock. */
+  const ctrlYTargetKey: string | null = (() => {
+    if (sessionEnded) return null;
+    const index = oldestWaitingPermission(timeline, answeredPermissions);
+    const item = index === null ? undefined : timeline[index];
+    return item?.kind === "permission" ? `${activeTabRef.current}:${item.request.permissionId}` : null;
+  })();
+  useLayoutEffect(() => {
+    ctrlYTargetRef.current = { key: ctrlYTargetKey, settled: false };
+    if (ctrlYTargetKey === null) return;
+    const handle = setTimeout(() => {
+      if (ctrlYTargetRef.current.key === ctrlYTargetKey) ctrlYTargetRef.current = { key: ctrlYTargetKey, settled: true };
+    }, TYPING_GUARD_MS);
+    return () => clearTimeout(handle);
+  }, [ctrlYTargetKey]);
   /* INPUT on a dead session was a one-way trap, and the panel's own banners promised otherwise.
      The composer's textarea is `disabled` once the session ends, so `autoFocus` does nothing and
      focus stays on the root -- keys still ARRIVE, they are just dropped: `resolveKey`'s "input"
@@ -3007,6 +3086,8 @@ export default function App() {
    *  an immediate `a` after closing a line could answer a card as though it stood alone.
    *  Uses the same `event.timeStamp` clock as `onKeyDown`. */
   function noteLineKey(event: KeyboardEvent<HTMLInputElement>) {
+    // This key is not a kill, so a following `Ctrl+y` is judged on its own.
+    lastKeyWasKillRef.current = false;
     const cancelled = typingGuard.onKey(event.key, event.timeStamp > 0 ? event.timeStamp : performance.now());
     if (cancelled !== null) showFlash(cancelled);
   }
@@ -3443,6 +3524,68 @@ export default function App() {
       const reason = decision === "deny" ? permissionReasons.current.get(permissionId) || undefined : undefined;
       answerPermission(permissionId, decision, reason);
     });
+  }
+
+  /** INPUT's `Ctrl+y` approves the active tab's oldest waiting card without leaving INPUT.
+   *  Only the composer's box can trigger it; the `Ctrl+r` search field contains a query.
+   *  With no waiting card, leave the key to the box. Otherwise claim it so the text, caret and
+   *  history stay unchanged. Use `TypingGuard.defer` to require `TYPING_GUARD_MS` of quiet before
+   *  and after the key, and reject held-key repeats and a yank after `Ctrl+u` or `Ctrl+w`.
+   *  At fire time the same card must still wait in the same tab, the session must be live and
+   *  the panel must still be in INPUT. Answer by `permissionId` through `answerPermission`,
+   *  the same path the card's buttons and `a` use. */
+  function approveOldestByKey(event: KeyboardEvent<HTMLDivElement>, typedAt: number, afterKill: boolean) {
+    const box = event.target;
+    if (!isComposerBox(box)) return;
+    const index = sessionEnded ? null : oldestWaitingPermission(timeline, answeredRef.current);
+    const item = index === null ? undefined : timeline[index];
+    if (item?.kind !== "permission") return;
+    event.preventDefault();
+    const permissionId = item.request.permissionId;
+    const tab = activeTabRef.current;
+    const targetKey = `${tab}:${permissionId}`;
+    // Before waiting, refuse recent typing, a preceding composer kill regardless of the pause, or a
+    // card that has not stayed named in the band for `TYPING_GUARD_MS`. Each refusal explains
+    // why; an approval still advancing the band also fails the last check.
+    if (!typingGuard.mayAnswerNow("", typedAt, event.repeat)) {
+      showFlash(CTRL_Y_TYPING_FLASH);
+      return;
+    }
+    if (afterKill) {
+      showFlash(CTRL_Y_YANK_FLASH);
+      return;
+    }
+    const target = ctrlYTargetRef.current;
+    if (target.key !== targetKey || !target.settled) {
+      showFlash(CTRL_Y_TARGET_FLASH);
+      return;
+    }
+    const waiting = typingGuard.defer(
+      typedAt,
+      event.repeat,
+      () => {
+        const now = stateRef.current;
+        if (
+          activeTabRef.current !== tab ||
+          modeRef.current !== "input" ||
+          // The composer must still hold focus when the wait ends. Clicking into search or elsewhere
+          // produces no key to cancel the wait.
+          document.activeElement !== box ||
+          !box.isConnected ||
+          // The card must still be the one the band named when the key was pressed.
+          ctrlYTargetRef.current.key !== targetKey ||
+          answeredRef.current.has(permissionId) ||
+          now.status.kind === "unavailable" ||
+          now.status.kind === "closed" ||
+          !now.pendingPermissions.some((p) => p.permissionId === permissionId)
+        ) {
+          return;
+        }
+        answerPermission(permissionId, "allow");
+      },
+      CTRL_Y_TYPING_FLASH,
+    );
+    if (!waiting) showFlash(CTRL_Y_TYPING_FLASH);
   }
   // BROWSE visual mode is handled in the root's `onKeyDownCapture` before `onKeyDown`.
   // `resolveKey` resolves VISUAL/V-LINE keys here. Stopping propagation prevents cards,
@@ -3896,6 +4039,10 @@ export default function App() {
     // `f` or `L` says what did not happen, never the `a`/`d` text.
     const cancelled = typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, typedAt);
     if (cancelled !== null) showFlash(cancelled);
+    // Remember whether the preceding key killed text in the composer, then record whether this key
+    // does. Bare modifiers leave that state alone.
+    const afterKill = lastKeyWasKillRef.current;
+    if (!isModifierKey(event.key)) lastKeyWasKillRef.current = isKillKey(event);
     // A plain Tab can create a focus landing at this key count only if its default remains allowed.
     // Keep the native event so `onFocus` can check after all handlers run. A claimed Tab must
     // not turn a later mouse focus into a keyboard landing.
@@ -4153,6 +4300,12 @@ export default function App() {
       table: panelTable,
     });
     if (action === null) return;
+    // A design decision: INPUT's Ctrl+y. Handled here, ahead of the unconditional `preventDefault`
+    // further down, because with no card waiting the key stays the box's.
+    if (action.kind === "approve-oldest") {
+      approveOldestByKey(event, typedAt, afterKill);
+      return;
+    }
     // Accumulate digits into the count read by the next `j`/`k`/`[[`/`]]` through `countRef`.
     // Handle digits first and return so they cannot enter the scroll or row-motion code.
     // `accumulateMotionCount` caps each digit at `MAX_MOTION_COUNT`, so even an unfinished
@@ -4944,6 +5097,8 @@ export default function App() {
           setMode("browse");
           setKeymapOpen(true);
         }}
+        // The `Ctrl+r` search's Enter/Tab/Escape reach the typing guard.
+        onLineKey={noteLineKey}
       />
       {/* `gf` with several paths and the open `/` prompt each own every key through
           `onKeyDown` branches that run before `resolveKey`. Their placement here does not change that. */}
@@ -5022,6 +5177,8 @@ export default function App() {
           model: shortModel(state.model),
           // This tab's last reported usage, right of the model; nothing until one arrives.
           usage: usageSegment(state.usage),
+          // A design decision: the card INPUT's Ctrl+y would approve, while the box has the keys.
+          approve: ctrlYCard,
         }}
         paneFocused={paneFocused}
         onOpenDetail={() => post({ type: "open_detail" })}

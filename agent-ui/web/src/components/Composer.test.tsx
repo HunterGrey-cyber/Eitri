@@ -678,6 +678,17 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       fireEvent.keyDown(textarea, { key: "?", shiftKey: true });
       expect(onOpenKeymap).toHaveBeenCalledTimes(1);
     },
+    "Ctrl+y": () => {
+      // A design decision: `Composer` must leave it to bubble (its text untouched), and `App`'s
+      // INPUT branch approves the oldest waiting card on it (`App.inputCtrlY.test.tsx`).
+      const { textarea } = renderComposer();
+      typed(textarea, "keep");
+      expect(fireEvent.keyDown(textarea, { key: "y", ctrlKey: true })).toBe(true);
+      expect(textarea.value).toBe("keep");
+      expect(resolveKey("input", keyLike("y", { ctrlKey: true }), { sessionEnded: false })).toEqual({
+        kind: "approve-oldest",
+      });
+    },
   };
 
   it("covers exactly COMPOSER_CHORDS", () => {
