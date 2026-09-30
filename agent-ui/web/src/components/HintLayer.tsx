@@ -14,7 +14,10 @@
  *  its tag would be drawn over the winbar, the status line or the composer (whole-branch review).
  *  Its letter still lands on it, and landing reveals the row. A user's own wheel scroll does not
  *  come here: it cancels the whole HINT (`shell/src/hint.rs`'s window-level scroll controller, spec
- *  §2.5). None of this has been seen on a screen. The colour pair is `hint-bg`/`hint-fg`, guarded
+ *  §2.5). A row whose sign cell has no width or has scrolled away is labelled like a link, small, at the
+ *  row's visible top-left -- never sized to the row (rc.4 item 5); so does one whose sign cell only a sliver
+ *  of shows, and such a label is measured like any other and never covered by a later label (its fix round).
+ *  None of this has been seen on a screen. The colour pair is `hint-bg`/`hint-fg`, guarded
  *  against each other in Rust (`tokens.rs`). */
 import { useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
@@ -34,23 +37,45 @@ type Placement = { top: number; left: number; width?: number; height?: number; s
  *  jsdom measures nothing, so the fallback is also what its tests see. */
 export const LABEL_PX = 16;
 
-/** The largest label drawn in `layer` (a two-letter label is wider than a one-letter one), rows' aside, or
- *  `LABEL_PX` for a dimension nothing has been drawn to measure yet. The placement effect runs after
- *  every commit, so the first pass uses the fallback and the next one the measured size. */
+/** The height a label would have at its own font size, read off the style `index.css` gives every
+ *  `.hint-label` (`line-height: 1`, so one line is the font size, plus the vertical padding), for a label
+ *  whose box was set to a sign cell's and so says nothing about its natural size. `0` where the browser
+ *  reports nothing to read (jsdom loads no stylesheet). */
+function naturalHeight(label: HTMLElement): number {
+  const style = getComputedStyle(label);
+  const height = parseFloat(style.fontSize) + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  return Number.isFinite(height) ? height : 0;
+}
+
+/** The largest label drawn in `layer` (a two-letter label is wider than a one-letter one), or `LABEL_PX` for
+ *  a dimension nothing has been drawn to measure yet. The placement effect runs after every commit, so the
+ *  first pass uses the fallback and the next one the measured size. A row's label sized to its sign cell is
+ *  measured only for its height, by its style (`naturalHeight`): its box is the cell's, but a row's
+ *  FALLBACK label (no usable sign cell, `place`) has a box of its own and is measured like any other --
+ *  fix round, rc.4 item 5: they used to be left out, so at `agent.font_size` 32 a label of ~31px was
+ *  clamped as if it were 16 and spilled past the list. */
 function labelSize(layer: HTMLElement | null): { width: number; height: number } {
   let width = 0;
   let height = 0;
-  // A row's label is sized to its sign cell (`place`), so it says nothing about a label's own size.
-  for (const label of layer?.querySelectorAll<HTMLElement>(".hint-label:not(.hint-row)") ?? []) {
-    width = Math.max(width, label.offsetWidth);
-    height = Math.max(height, label.offsetHeight);
+  for (const label of layer?.querySelectorAll<HTMLElement>(".hint-label") ?? []) {
+    if (label.style.width === "") {
+      width = Math.max(width, label.offsetWidth);
+      height = Math.max(height, label.offsetHeight);
+    } else {
+      height = Math.max(height, naturalHeight(label));
+    }
   }
   return { width: width > 0 ? width : LABEL_PX, height: height > 0 ? height : LABEL_PX };
 }
 
+type Rect = { top: number; left: number; right: number; bottom: number };
+
 function place(root: HTMLElement, hints: ShownHint[], label: { width: number; height: number }): Placement[] {
   const origin = root.getBoundingClientRect();
-  return hints.map(({ target }) => {
+  // Each placed label's furthest right (root-relative), for the nudge below.
+  const limits: Array<number | null> = [];
+  const placed = hints.map(({ target }, i): Placement => {
+    limits[i] = null;
     if (!target.el.isConnected) return null;
     // K07: everything is placed on the part of the target that shows, and every label's top is clamped
     // into the box that part shows in, so a target scrolled half out of the list -- or a sliver at
@@ -60,14 +85,25 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
     const vis = visibleBox(target.el, root);
     const clip = vis === null ? null : clipBox(target.el, root);
     if (vis === null || clip === null) return null;
+    limits[i] = clip.right - label.width - origin.left;
     const clampTop = (want: number) => Math.max(clip.top, Math.min(want, clip.bottom - label.height)) - origin.top;
     // Fix round: sideways too -- a link in a wide table scrolled sideways starts left of its box.
     const clampLeft = (want: number) => Math.max(clip.left, Math.min(want, clip.right - label.width)) - origin.left;
     if (target.kind === "code") return { top: clampTop(vis.top + 4), left: vis.right - origin.left - 4, shift: true };
     if (target.kind === "row") {
       const sign = target.el.querySelector<HTMLElement>(".row-sign");
-      const cell = (sign === null ? null : visibleBox(sign, root)) ?? vis;
-      return { top: clampTop(cell.top), left: cell.left - origin.left, width: cell.width, height: cell.height };
+      const cell = sign === null ? null : visibleBox(sign, root);
+      // Fix round, rc.4 item 5: a sign cell that only a sliver of shows -- clipped, and what shows shorter
+      // than a label -- would squash its label to that sliver. It takes the fallback below instead.
+      const sliver = cell !== null && cell.height < label.height && cell.height < (sign?.getBoundingClientRect().height ?? 0);
+      if (cell !== null && !sliver) {
+        return { top: clampTop(cell.top), left: cell.left - origin.left, width: cell.width, height: cell.height };
+      }
+      // rc.4 item 5: a row with no usable sign cell -- a prose row's has no width, another's has scrolled out
+      // of the list, a third has none at all -- used to be labelled on the row's OWN box (`?? vis`), an opaque
+      // label the size of the row's whole visible part laid over its text. It gets a normal small label at
+      // the row's visible top-left instead, clamped into the clip box like every other one (K07).
+      return { top: clampTop(vis.top), left: clampLeft(vis.left) };
     }
     // A link (v1 picks, Task 8, R6) that wraps onto a second line has a bounding box starting at the row's
     // left edge on its FIRST line, where its label would sit over unrelated text -- perhaps another link's.
@@ -78,6 +114,26 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
     const at = target.kind === "link" ? firstShownLine(target.el, root) : r;
     return { top: clampTop(at.top - 6), left: clampLeft(at.left - 6) };
   });
+  // Fix round, rc.4 item 5 (Codex): a row's fallback label sits at the row's top-left and, once labels are
+  // big (`agent.font_size` 32, a zoom), reaches past the sign column into the text, where a link or control
+  // on the row's first line has its own label a few px to the right -- which, drawn later, hid the row
+  // label's last letter. A later label that would overlap an earlier fallback row label moves to its right
+  // edge (kept inside the clip box; with no room it stays), so neither is covered. Sized labels, which sit
+  // inside their sign column, and code labels, which hang left of the block's right edge, are left alone.
+  const rowLabels: Rect[] = [];
+  placed.forEach((p, i) => {
+    if (p === null || p.width !== undefined || p.shift === true) return;
+    if (hints[i].target.kind === "row") {
+      rowLabels.push({ top: p.top, left: p.left, right: p.left + label.width, bottom: p.top + label.height });
+      return;
+    }
+    for (const r of rowLabels) {
+      const hit = p.top < r.bottom && p.top + label.height > r.top && p.left < r.right && p.left + label.width > r.left;
+      const room = limits[i];
+      if (hit && room !== null && r.right <= room) p.left = r.right;
+    }
+  });
+  return placed;
 }
 
 export function HintLayer({ root, hints, typed }: { root: HTMLElement | null; hints: ShownHint[]; typed: string }) {

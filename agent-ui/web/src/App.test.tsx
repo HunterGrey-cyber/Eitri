@@ -14,7 +14,7 @@ import type { PanelTable } from "./keymap";
 import * as keymapModule from "./keymap";
 import { binding, TABLE } from "./testFixtures";
 import { modeFixedMessage } from "./modeKey";
-import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS } from "./typingGuard";
+import { hintTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS } from "./typingGuard";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
@@ -87,8 +87,30 @@ function lastOfType(type: string): Record<string, unknown> | undefined {
  *  table (`./keymap`) offers, rather than reaching for the textarea directly -- which is also what
  *  proves the wiring in `App.tsx`'s `onKeyDown` actually works, not just `resolveKey` in isolation. */
 function enterInputMode(container: HTMLElement) {
+  // A person's `i` stands alone (#26): whatever key the test pressed a moment ago is not in its burst.
+  if (vi.isFakeTimers()) vi.setSystemTime(Date.now() + TYPING_GUARD_MS + 50);
+  else keyGap();
   fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "i" });
 }
+
+/** #26: the typing guard reads each keydown's timestamp, which jsdom takes from `Date.now()`, so two keys a
+ *  test fires back to back are one burst -- `i` right after `g`, or any key right after `y`, is swallowed.
+ *  `keyGap()` moves that clock forward past the guard window, as a person pausing would, without fake timers
+ *  (the test's own timers keep running real). Undone after every test. */
+let clockSkew = 0;
+let clockSpy: { mockRestore: () => void } | null = null;
+function keyGap(ms: number = TYPING_GUARD_MS + 50) {
+  if (clockSpy === null) {
+    const real = Date.now.bind(Date);
+    clockSpy = vi.spyOn(Date, "now").mockImplementation(() => real() + clockSkew);
+  }
+  clockSkew += ms;
+}
+afterEach(() => {
+  clockSpy?.mockRestore();
+  clockSpy = null;
+  clockSkew = 0;
+});
 
 /** `navigator.clipboard` does not exist in jsdom at all -- both the conversation's `y` handler and
  *  the start screen's `handleStartScreenKeyDown` read it with `?.`. Stub-then-remove rather than a
@@ -1371,6 +1393,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     (first, held) => {
       const { container } = startedApp();
       fireEvent.keyDown(conversationRoot(container), { key: first, ...held });
+      keyGap(); // a lone `i` (#26): the chord is not what is under test here, the armed prefix is
       fireEvent.keyDown(conversationRoot(container), { key: "i" });
       expect(container.querySelector("textarea")).not.toBeNull();
     },
@@ -1397,6 +1420,8 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     fireEvent.keyDown(conversationRoot(container), { key: "y" });
     expect(clipboard.writeText).toHaveBeenCalledWith("second prompt");
 
+    // Any key within `TYPING_GUARD_MS` of a `y` is typing (#26, K15): the walk pauses after it.
+    keyGap();
     fireEvent.keyDown(conversationRoot(container), { key: "k" });
     fireEvent.keyDown(conversationRoot(container), { key: "y" });
     expect(clipboard.writeText).toHaveBeenCalledWith("first prompt");
@@ -2533,13 +2558,18 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
       act(() => widen(container));
       sendTable();
       act(() => root(container).focus());
-      for (const key of ["L", "o", "o", "k", "s"]) {
+      // The band says what did not happen right when the `o` cancelled the `L`. The second `o` is
+      // then swallowed by #26's guard (`i`/`o`/`A` mid-word), whose hint is what the band ends on.
+      let afterCancel: string | undefined;
+      for (const [n, key] of ["L", "o", "o", "k", "s"].entries()) {
         press(key);
+        if (n === 1) afterCancel = container.querySelector(".band-message")?.textContent ?? undefined;
         act(() => vi.advanceTimersByTime(80));
       }
       act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
       expect(tabVerbsPosted()).toEqual([]);
-      expect(container.querySelector(".band-message")?.textContent).toBe(tableKeyTypingFlash("L", "tab.next"));
+      expect(afterCancel).toBe(tableKeyTypingFlash("L", "tab.next"));
+      expect(container.querySelector(".band-message")?.textContent).toBe(TYPE_HINT_FLASH);
     } finally {
       vi.useRealTimers();
       vi.unstubAllGlobals();
@@ -2973,13 +3003,18 @@ describe("v1: typing never answers a card", () => {
 
   it("arrive, then a l s o at 80 ms a key: nothing is answered, and the band says how to type", () => {
     const { container } = arrivedOnACard();
-    for (const key of ["a", "l", "s", "o"]) {
+    // The band says how a card is answered right when the `l` cancels the `a`; the `o` after it is
+    // then swallowed by #26's guard, whose hint is what the band ends on.
+    let afterCancel: string | null = null;
+    for (const [n, key] of ["a", "l", "s", "o"].entries()) {
       press(key);
+      if (n === 1) afterCancel = band(container);
       wait(80);
     }
     wait(1000);
     expect(answered()).toEqual([]);
-    expect(band(container)).toBe(TYPING);
+    expect(afterCancel).toBe(TYPING);
+    expect(band(container)).toBe(TYPE_HINT_FLASH);
   });
 
   it("with no card waiting anywhere, a says there is no card here (F13)", () => {
@@ -4854,13 +4889,18 @@ describe("App global HINT: the panel's half", () => {
     try {
       const { container } = conversation();
       act(() => widen(container));
-      for (const key of ["f", "i", "x", " ", "t", "h", "i", "s"]) {
+      // Right when the `i` cancels the `f` the band names `f`; the second `i` is then swallowed by
+      // #26's guard, whose hint is what the band ends on.
+      let afterCancel: string | undefined;
+      for (const [n, key] of ["f", "i", "x", " ", "t", "h", "i", "s"].entries()) {
         press(key);
+        if (n === 1) afterCancel = container.querySelector(".band-message")?.textContent ?? undefined;
         act(() => vi.advanceTimersByTime(80));
       }
       act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
       expect(lastOfType("hint_request")).toBeUndefined();
-      expect(container.querySelector(".band-message")?.textContent).toBe(hintTypingFlash());
+      expect(afterCancel).toBe(hintTypingFlash());
+      expect(container.querySelector(".band-message")?.textContent).toBe(TYPE_HINT_FLASH);
     } finally {
       vi.useRealTimers();
       vi.unstubAllGlobals();
@@ -5397,7 +5437,9 @@ describe("App global HINT: the panel's half", () => {
     expect(container.querySelector(".row-current")!.classList.contains("row-assistant")).toBe(true);
     press("y");
     expect(clipboard.writeText).toHaveBeenLastCalledWith("ls -la");
-    // Only the next y: the one after copies the whole message again.
+    // Only the next y: the one after copies the whole message again (a pause later: any key within
+    // `TYPING_GUARD_MS` of a `y` is typing, #26).
+    keyGap();
     press("y");
     expect(clipboard.writeText).toHaveBeenLastCalledWith(expect.stringContaining("then look."));
   });
@@ -5552,6 +5594,160 @@ describe("App global HINT: the panel's half", () => {
       const rowLabels = Array.from(container.querySelectorAll<HTMLElement>(".hint-label.hint-row"));
       expect(rowLabels.length).toBeGreaterThan(0);
       for (const label of rowLabels) expect(topOf(label)).toBeGreaterThanOrEqual(0);
+    });
+    /* rc.4 item 5 (handoff 2026-09-30, `defect-hint-row-fill.png`): `prefix f` drew an opaque label the size
+       of the row's whole visible part over every assistant-prose row -- a prose row's sign cell has no width,
+       so `place()` fell back to the row's own box for the label's size and position -- and over any row whose
+       sign cell had scrolled away. Such a row's label is a normal small one at the row's visible top-left. */
+    const rowLabel = (c: HTMLElement, at: number) => {
+      const label = labels(c)[at];
+      expect(label.classList.contains("hint-row")).toBe(true);
+      return label;
+    };
+    const noBox = (el: Element, top: number) => {
+      (el as HTMLElement).getBoundingClientRect = () =>
+        ({ top, bottom: top, left: 0, right: 0, width: 0, height: 0, x: 0, y: top }) as DOMRect;
+    };
+    it("K07-5b: a prose row whose sign cell has no width gets a small label at its visible top-left", () => {
+      const { container } = labelled((c) => {
+        const reply = c.querySelector<HTMLElement>(".row-assistant")!;
+        box(reply, 100, 400);
+        noBox(reply.querySelector(".row-sign")!, 100);
+      });
+      const label = rowLabel(container, AT.reply);
+      expect(label.style.width).toBe("");
+      expect(label.style.height).toBe("");
+      expect(label.style.top).toBe("100px");
+      expect(label.style.left).toBe("0px");
+    });
+    it("K07-5c: a row whose sign cell is scrolled out of the list, its body still showing, gets a small label at the list's top", () => {
+      const { container } = labelled((c) => {
+        const reply = c.querySelector<HTMLElement>(".row-assistant")!;
+        box(reply, -300, 600);
+        box(reply.querySelector(".row-sign")!, -300, 20);
+      });
+      const label = rowLabel(container, AT.reply);
+      expect(label.style.width).toBe("");
+      expect(label.style.height).toBe("");
+      expect(label.style.top).toBe("0px");
+    });
+    it("K07-5d: a row with no sign cell at all is labelled the same way", () => {
+      const { container } = labelled((c) => {
+        const reply = c.querySelector<HTMLElement>(".row-assistant")!;
+        box(reply, 250, 300);
+        reply.querySelector(".row-sign")!.remove();
+      });
+      const label = rowLabel(container, AT.reply);
+      expect(label.style.width).toBe("");
+      expect(label.style.height).toBe("");
+      expect(label.style.top).toBe("250px");
+    });
+    it("K07-5e: a row whose sign cell shows is still labelled on the sign cell, at its size", () => {
+      const { container } = labelled((c) => {
+        const reply = c.querySelector<HTMLElement>(".row-assistant")!;
+        box(reply, 200, 400);
+        box(reply.querySelector(".row-sign")!, 204, 18);
+      });
+      const label = rowLabel(container, AT.reply);
+      expect(label.style.top).toBe("204px");
+      expect(label.style.width).toBe("100px");
+      expect(label.style.height).toBe("18px");
+    });
+    /* Fix round (Codex + Claude review of item 5, finding 4). jsdom lays nothing out, so a label's measured
+       size is stubbed the way a browser would report it: `offsetWidth`/`offsetHeight` of a `.hint-label` whose
+       box no inline size has set. A conversation of prose only has no code block, link or card, so the only
+       labels drawn are rows' -- which is where a fallback label's size has to come from. */
+    function proseOnly() {
+      const rendered = started();
+      events(
+        { type: "user_prompt_submitted", text: "hi" },
+        { type: "turn_started", turn_id: "t1" },
+        { type: "content_delta", turn_id: "t1", kind: "text", text: "a reply" },
+      );
+      layOut(rendered.container);
+      act(() => root(rendered.container).focus());
+      return rendered;
+    }
+    const measuredLabels = (width: number, height: number) => {
+      const size = (get: () => number) => function (this: HTMLElement) {
+        return this.classList.contains("hint-label") && this.style.width === "" ? get() : 0;
+      };
+      vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(size(() => width));
+      vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(size(() => height));
+    };
+    afterEach(() => vi.restoreAllMocks());
+    it("K07-5f: a fallback row label is measured, so at a big font it is clamped by its own size", () => {
+      measuredLabels(31, 31);
+      const { container } = proseOnly();
+      const reply = container.querySelectorAll<HTMLElement>(".row-assistant")[0];
+      box(reply, 990, 300);
+      noBox(reply.querySelector(".row-sign")!, 990);
+      show(1, collect(1));
+      const label = rowLabel(container, AT.reply);
+      expect(label.style.width).toBe("");
+      // 1000 (the list's bottom) - 31, not - 16: it stays inside the list.
+      expect(label.style.top).toBe("969px");
+    });
+    it("K07-5g: a sign cell only a few px into view gets the fallback label, not a squashed one", () => {
+      const { container } = labelled((c) => {
+        const reply = c.querySelector<HTMLElement>(".row-assistant")!;
+        box(reply, -12, 600);
+        box(reply.querySelector(".row-sign")!, -12, 20); // 8px of it shows, a label is 16
+      });
+      const label = rowLabel(container, AT.reply);
+      expect(label.style.width).toBe("");
+      expect(label.style.height).toBe("");
+      expect(label.style.top).toBe("0px");
+    });
+    it("K07-5h: a sign cell that is clipped but still as tall as a label keeps a label sized to what shows", () => {
+      const { container } = labelled((c) => {
+        const reply = c.querySelector<HTMLElement>(".row-assistant")!;
+        box(reply, -2, 600);
+        box(reply.querySelector(".row-sign")!, -2, 20); // 18px of it shows
+      });
+      const label = rowLabel(container, AT.reply);
+      expect(label.style.height).toBe("18px");
+    });
+    it("K07-5i: a small fully visible sign cell is still labelled on the cell, as it always was", () => {
+      const { container } = labelled(() => {}); // `layOut`: every sign cell is a whole 10px box
+      const label = rowLabel(container, AT.reply);
+      expect(label.style.height).toBe("10px");
+    });
+    it("K07-5j: a link label that would land on a fallback row label moves to its right edge", () => {
+      measuredLabels(31, 31);
+      const { container } = proseOnly();
+      const reply = container.querySelectorAll<HTMLElement>(".row-assistant")[0];
+      box(reply, 200, 100);
+      noBox(reply.querySelector(".row-sign")!, 200);
+      const link = document.createElement("a");
+      link.href = "https://example.com/";
+      link.textContent = "a link";
+      reply.querySelector(".row-body")!.appendChild(link);
+      link.getBoundingClientRect = () =>
+        ({ top: 206, bottom: 226, left: 32, right: 100, width: 68, height: 20, x: 32, y: 206 }) as DOMRect;
+      show(1, collect(1));
+      const all = labels(container);
+      const row = all.find((l) => l.classList.contains("hint-row") && l.style.width === "" && l.style.top === "200px")!;
+      const linkLabel = all.find((l) => l.classList.contains("hint-link"))!;
+      expect(row.style.left).toBe("0px");
+      // Its own place would be left 26 (link left - 6), inside the row label's 0..31.
+      expect(parseFloat(linkLabel.style.left)).toBeGreaterThanOrEqual(31);
+    });
+    it("K07-5k: a link label clear of the row label stays where it was", () => {
+      measuredLabels(16, 16);
+      const { container } = proseOnly();
+      const reply = container.querySelectorAll<HTMLElement>(".row-assistant")[0];
+      box(reply, 200, 100);
+      noBox(reply.querySelector(".row-sign")!, 200);
+      const link = document.createElement("a");
+      link.href = "https://example.com/";
+      link.textContent = "a link";
+      reply.querySelector(".row-body")!.appendChild(link);
+      link.getBoundingClientRect = () =>
+        ({ top: 206, bottom: 226, left: 32, right: 100, width: 68, height: 20, x: 32, y: 206 }) as DOMRect;
+      show(1, collect(1));
+      const linkLabel = labels(container).find((l) => l.classList.contains("hint-link"))!;
+      expect(linkLabel.style.left).toBe("26px");
     });
     it("K07-9: a link partly scrolled out gets its label inside the list", () => {
       const { container } = labelled(
@@ -6581,6 +6777,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     }).not.toThrow();
     expect(container.querySelector(".row-current")).toBeNull();
     // ...and the prefix was spent each time: the next key is a plain key again.
+    keyGap(); // a lone `i` (#26)
     keys("i");
     expect(container.querySelector("textarea")).not.toBeNull();
   });
@@ -9880,6 +10077,7 @@ describe("K01 on the empty tab: every cancel route drops its waiting prefix and 
     press("g");
     press("i");
     expect(composer(container)).toBeNull();
+    keyGap(); // a lone `i` (#26)
     press("i");
     expect(composer(container)).not.toBeNull();
   });
@@ -9888,6 +10086,7 @@ describe("K01 on the empty tab: every cancel route drops its waiting prefix and 
     press("g");
     press("Tab", { shiftKey: true });
     expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    keyGap(); // a lone `i` (#26: no motion exception for i/o/A)
     press("i");
     expect(composer(container)).not.toBeNull();
   });
@@ -9941,6 +10140,7 @@ describe("K01 on the empty tab: every cancel route drops its waiting prefix and 
     press("g");
     route();
     expect(container.querySelector(".empty-tab")!.contains(document.activeElement)).toBe(true);
+    keyGap(); // a lone `i` (#26)
     press("i");
     expect(composer(container)).not.toBeNull();
   });
@@ -10715,6 +10915,7 @@ describe("v1 C1: the composer mirror (spec §3.5)", () => {
     const root = conversationRoot(container);
     fireEvent.keyDown(root, { key: "i" });
     fireEvent.keyDown(container.querySelector("textarea")!, { key: "Escape" });
+    keyGap(); // a lone `i` (#26)
     fireEvent.keyDown(root, { key: "i" });
     fireEvent.keyDown(container.querySelector("textarea")!, { key: "Escape" });
     const mirrors = posted.filter((m) => m.type === "panel_keys").slice(before);
@@ -11004,6 +11205,7 @@ describe("v1 C1abc: o/A and the caret, j at the end, Esc while running", () => {
     const { container } = startedApp();
     const root = conversationRoot(container);
     typeAndLeaveCaretAt3(container, root);
+    keyGap(); // a lone `o` (#26)
     fireEvent.keyDown(root, { key: "o" });
     const textarea = container.querySelector("textarea");
     expect(textarea).not.toBeNull();
@@ -11015,6 +11217,7 @@ describe("v1 C1abc: o/A and the caret, j at the end, Esc while running", () => {
     const { container } = startedApp();
     const root = conversationRoot(container);
     typeAndLeaveCaretAt3(container, root);
+    keyGap(); // a lone `A` (#26)
     fireEvent.keyDown(root, { key: "A", shiftKey: true });
     const textarea = container.querySelector("textarea");
     expect(textarea).not.toBeNull();
@@ -12600,6 +12803,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
       "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], " +
       "fable[1m], opusplan, default, or a full model ID.";
     const { container, root } = startedOnPromptRow();
+    keyGap(); // a lone `i` (#26)
     fireEvent.keyDown(root, { key: "i" });
     const textarea = container.querySelector<HTMLTextAreaElement>("textarea")!;
     fireEvent.change(textarea, { target: { value: "/model" } });
@@ -12652,6 +12856,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
         "fable[1m], opusplan, default, or a full model ID.";
       const { container, root } = startedOnPromptRow();
       // The bare /model, sent first from an empty box.
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50)); // a lone `i` (#26)
       fireEvent.keyDown(root, { key: "i" });
       const firstBox = container.querySelector<HTMLTextAreaElement>("textarea")!;
       fireEvent.change(firstBox, { target: { value: "/model" } });
@@ -13291,6 +13496,7 @@ describe("#22: coming back restores where you were", () => {
   it("T11: a reader who left from INPUT comes back in BROWSE on their row, draft untouched", () => {
     const { container } = started();
     const list = parkOnRow3(container);
+    keyGap(); // a lone `i` (#26)
     press("i");
     const box = container.querySelector("textarea")!;
     fireEvent.change(box, { target: { value: "half a thought" } });
@@ -13301,6 +13507,7 @@ describe("#22: coming back restores where you were", () => {
     expect(current(container)).toBe("row 3");
     expect(list.scrollTop).toBe(600);
     act(() => rootOf(container).focus());
+    keyGap(); // a lone `i` (#26)
     press("i");
     expect(container.querySelector("textarea")!.value).toBe("half a thought");
   });
@@ -13446,5 +13653,333 @@ describe("#22: coming back restores where you were", () => {
     const { seen } = recording(() => dispatch({ kind: "arrive" }));
     expect(current(container)).toBe("row 5");
     expect(seen).toEqual(["resume"]);
+  });
+});
+
+/* Owner decision #26 (K12, K13, K15; keyboard proposal §3): BROWSE's `i`/`o`/`A` enter INPUT only on a
+   key that stands alone (or ends a quick motion run), and any key within `TYPING_GUARD_MS` of a
+   BROWSE `y` is typing, not a command. "explain" lost "expla" (K12), "follow-up" sent "llow-up one"
+   (K13), `yiw` typed the `w` (K15). Time is vitest's fake clock, as in the S1 describe above. */
+describe("#26: typing in BROWSE never starts INPUT mid-word", () => {
+  const HINT = "i or Ctrl+j to type";
+  let widen: (container: HTMLElement) => void;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    widen = stubBandWidth();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  function startedWithRows() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    const list: AgentDomainEvent[] = [
+      { type: "user_prompt_submitted", text: "one" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "two" },
+      { type: "user_prompt_submitted", text: "three" },
+    ];
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(rendered.container));
+    return rendered;
+  }
+  const press = (key: string, init: Record<string, unknown> = {}) =>
+    fireEvent.keyDown(document.activeElement ?? document.body, { key, ...init });
+  const wait = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  const modeOf = (container: HTMLElement) => container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode;
+  const band = (container: HTMLElement) => container.querySelector(".band-message")?.textContent ?? null;
+  const typeAt = (keys: string[], gap: number) => {
+    for (const key of keys) {
+      press(key);
+      wait(gap);
+    }
+  };
+
+  it("explain, typed at 80 ms a key, never enters INPUT, and the band says how to type", () => {
+    const { container } = startedWithRows();
+    wait(1000);
+    typeAt([..."explain"], 80);
+    expect(modeOf(container)).toBe("browse");
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(band(container)).toBe(HINT);
+  });
+
+  it("follow-up, typed at 80 ms a key, never enters INPUT (K13: the o)", () => {
+    const { container } = startedWithRows();
+    wait(1000);
+    typeAt([..."follow-up"], 80);
+    expect(modeOf(container)).toBe("browse");
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("A in the middle of typing is swallowed too", () => {
+    const { container } = startedWithRows();
+    wait(1000);
+    press("s");
+    wait(80);
+    press("A", { shiftKey: true });
+    expect(modeOf(container)).toBe("browse");
+    expect(band(container)).toBe(HINT);
+  });
+
+  it("a lone i, o or A after a pause still enters INPUT", () => {
+    for (const [key, init] of [["i", {}], ["o", {}], ["A", { shiftKey: true }]] as const) {
+      const { container, unmount } = startedWithRows();
+      press("j");
+      wait(300);
+      press(key, init);
+      expect(modeOf(container), key).toBe("input");
+      expect(container.querySelector("textarea"), key).not.toBeNull();
+      unmount();
+    }
+  });
+
+  // Fix round (Codex + Claude review, finding 1): unlike the leader, `i`/`o`/`A` have NO motion
+  // exception. A lone motion key is a word's first letter as much as a motion: "look at" walked with
+  // `l` and opened INPUT with `o` ("ok at"), and so did "how", "hi", "like", "join", "Good".
+  it.each([
+    ["look at the diff", [..."look at the diff"]],
+    ["how do I", [..."how do I"]],
+    ["Good", [..."Good"]],
+    ["hi", [..."hi"]],
+    ["like", [..."like"]],
+    ["join", [..."join"]],
+  ])("%s, typed at 80 ms a key, never enters INPUT even though its first letter is a motion key", (_, keys) => {
+    const { container } = startedWithRows();
+    wait(1000);
+    typeAt(keys, 80);
+    expect(modeOf(container)).toBe("browse");
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("a motion key then i within 80 ms no longer enters INPUT: a fast `ji` chord needs a pause", () => {
+    const { container } = startedWithRows();
+    wait(1000);
+    press("k");
+    wait(80);
+    press("i");
+    expect(modeOf(container)).toBe("browse");
+    expect(band(container)).toBe(HINT);
+    // After a pause the same `i` is a lone key again.
+    wait(TYPING_GUARD_MS + 50);
+    press("i");
+    expect(modeOf(container)).toBe("input");
+  });
+
+  it("y, then i and w within 250 ms: the copy happened, nothing else does, and the band says how to type", () => {
+    const clipboard = stubClipboard();
+    const { container } = startedWithRows();
+    wait(1000);
+    press("y");
+    expect(clipboard.writeText).toHaveBeenCalledTimes(1);
+    wait(60);
+    press("i");
+    wait(60);
+    press("w");
+    expect(modeOf(container)).toBe("browse");
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(clipboard.writeText).toHaveBeenCalledTimes(1);
+    expect(band(container)).toBe(HINT);
+  });
+
+  it("y, then any other key within 250 ms does nothing: j does not move the cursor", () => {
+    stubClipboard();
+    const { container } = startedWithRows();
+    wait(1000);
+    press("k");
+    wait(300);
+    const before = container.querySelector(".row-current")!.textContent;
+    press("y");
+    wait(80);
+    press("k");
+    expect(container.querySelector(".row-current")!.textContent).toBe(before);
+    expect(band(container)).toBe(HINT);
+    // Past the window the same key moves again.
+    wait(400);
+    press("k");
+    expect(container.querySelector(".row-current")!.textContent).not.toBe(before);
+  });
+
+  it("a lone i 300 ms after a y enters INPUT", () => {
+    stubClipboard();
+    const { container } = startedWithRows();
+    wait(1000);
+    press("y");
+    wait(300);
+    press("i");
+    expect(modeOf(container)).toBe("input");
+  });
+
+  // Fix round (Codex review, finding 2): the post-`y` window has to hold ahead of the handlers that used
+  // to run before it -- the document-capture Shift+Tab router and the focused-control early return.
+  it("y then Shift+Tab within 250 ms cycles nothing and says how to type; after a pause it cycles", () => {
+    stubClipboard();
+    const { container } = startedWithRows();
+    wait(1000);
+    press("y");
+    wait(60);
+    press("Tab", { shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(0);
+    expect(band(container)).toBe(HINT);
+    wait(TYPING_GUARD_MS + 50);
+    press("Tab", { shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+  });
+
+  it.each(["Enter", " "])(
+    "y then %j on a focused button within 250 ms is claimed, so the button is not activated; after a pause it is left to the button",
+    (key) => {
+      stubClipboard();
+      const { container } = startedWithRows();
+      dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 docs" }] });
+      const tabButton = container.querySelector<HTMLButtonElement>(".tab-bar button")!;
+      act(() => tabButton.focus());
+      wait(1000);
+      fireEvent.keyDown(tabButton, { key: "y" });
+      wait(60);
+      // `fireEvent` returns false when the handler called preventDefault, which is what stops a real
+      // browser from clicking the button.
+      expect(fireEvent.keyDown(tabButton, { key }), "claimed inside the burst").toBe(false);
+      expect(band(container)).toBe(HINT);
+      wait(TYPING_GUARD_MS + 50);
+      expect(fireEvent.keyDown(tabButton, { key }), "left native after the pause").toBe(true);
+    },
+  );
+
+  it("a bare Shift after y is not a key: y, Shift, A is swallowed as one burst, not skipped past", () => {
+    stubClipboard();
+    const { container } = startedWithRows();
+    wait(1000);
+    press("y");
+    wait(40);
+    press("Shift");
+    wait(40);
+    press("A", { shiftKey: true });
+    expect(modeOf(container)).toBe("browse");
+  });
+});
+
+/* Owner decision #28 (K16): `prefix :` (tmux `command-prompt`) was swallowed by the armed prefix, and the
+   letters typed after it ran as panel keys -- "kill-window -a" moved the cursor, entered INPUT and sent
+   "ll-window -a" as a turn. Rust binds it now (`panel.command-line`) and tells the panel with an
+   `open_command_line` envelope, which opens the same `:` line BROWSE's own `:` opens (K02, R4): it runs
+   nothing, Enter says so, Esc closes it. */
+describe("#28: prefix : opens the panel's command line", () => {
+  let widen: (container: HTMLElement) => void;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    widen = stubBandWidth();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  function startedWithRows() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    const list: AgentDomainEvent[] = [
+      { type: "user_prompt_submitted", text: "one" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "two" },
+      { type: "user_prompt_submitted", text: "three" },
+    ];
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(rendered.container));
+    return rendered;
+  }
+  const line = (container: HTMLElement) => container.querySelector<HTMLInputElement>(".search-bar input");
+  const band = (container: HTMLElement) => container.querySelector(".band-message")?.textContent ?? null;
+  const modeOf = (container: HTMLElement) => container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode;
+  const sent = () => posted.filter((m) => m.type === "send_message");
+
+  it("opens the : line with the keys in it, and what is typed there runs nothing and sends nothing", () => {
+    const { container } = startedWithRows();
+    const before = container.querySelector(".row-current")!.textContent;
+    dispatch({ kind: "open_command_line" });
+    expect(line(container)?.getAttribute("aria-label")).toBe("Command line");
+    expect(container.querySelector(".search-bar")!.textContent).toBe(":");
+    expect(document.activeElement).toBe(line(container));
+    // The very letters of K16's reproduction: each is text of the line, not a panel key.
+    for (const ch of "kill-window -a") {
+      const input = line(container)!;
+      if (fireEvent.keyDown(input, { key: ch })) fireEvent.change(input, { target: { value: input.value + ch } });
+    }
+    expect(line(container)!.value).toBe("kill-window -a");
+    fireEvent.keyDown(line(container)!, { key: "Enter" });
+    expect(line(container)).toBeNull();
+    expect(band(container)).toBe(":kill-window -a — no ex commands here; ? lists this panel's keys");
+    expect(sent()).toEqual([]);
+    expect(modeOf(container)).toBe("browse");
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(container.querySelector(".row-current")!.textContent).toBe(before);
+  });
+
+  it("Esc closes it silently and gives the keys back to the conversation", () => {
+    const { container } = startedWithRows();
+    dispatch({ kind: "open_command_line" });
+    fireEvent.keyDown(line(container)!, { key: "Escape" });
+    expect(line(container)).toBeNull();
+    expect(band(container)).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector(".agent-ui-conversation"));
+  });
+
+  it("from INPUT it leaves INPUT for BROWSE, the draft kept", () => {
+    const { container } = startedWithRows();
+    enterInputMode(container);
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "half a thought" } });
+    dispatch({ kind: "open_command_line" });
+    expect(line(container)).not.toBeNull();
+    expect(modeOf(container)).toBe("browse");
+    fireEvent.keyDown(line(container)!, { key: "Escape" });
+    enterInputMode(container);
+    expect(container.querySelector("textarea")!.value).toBe("half a thought");
+  });
+
+  it("closes what was open over the conversation: the ? overlay, and a / prompt", () => {
+    const { container } = startedWithRows();
+    dispatch({ kind: "open_keymap" });
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+    dispatch({ kind: "open_command_line" });
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+    expect(line(container)).not.toBeNull();
+    fireEvent.keyDown(line(container)!, { key: "Escape" });
+    act(() => container.querySelector<HTMLElement>(".agent-ui-conversation")!.focus());
+    fireEvent.keyDown(document.activeElement!, { key: "/" });
+    expect(container.querySelector(".search-bar")!.textContent).toBe("/");
+    dispatch({ kind: "open_command_line" });
+    expect(container.querySelector(".search-bar")!.textContent).toBe(":");
+    expect(container.querySelectorAll(".search-bar")).toHaveLength(1);
+  });
+
+  it("asked again while open, it wipes the line and takes the keys back, as vim's : does", () => {
+    const { container } = startedWithRows();
+    dispatch({ kind: "open_command_line" });
+    fireEvent.change(line(container)!, { target: { value: "half" } });
+    act(() => container.querySelector<HTMLElement>(".agent-ui-conversation")!.focus());
+    dispatch({ kind: "open_command_line" });
+    expect(line(container)!.value).toBe("");
+    expect(document.activeElement).toBe(line(container));
+  });
+
+  it("on the empty tab there is no line to open: it says so and the keys stay where they were", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => widen(container));
+    dispatch({ kind: "open_command_line" });
+    expect(line(container)).toBeNull();
+    expect(band(container)).toBe("no command line on this screen — ? lists this panel's keys");
+    expect(sent()).toEqual([]);
   });
 });

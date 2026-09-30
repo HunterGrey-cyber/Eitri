@@ -80,6 +80,7 @@ describe("installDispatch", () => {
   it.each([
     { kind: "literal_key", key: "C-a" },
     { kind: "open_keymap" },
+    { kind: "open_command_line" },
     { kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [] },
   ])("demuxes a $kind envelope", (payload) => {
     const handler = vi.fn();

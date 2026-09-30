@@ -26,6 +26,25 @@ export function readlineEdit(
   return { value: value.slice(0, from) + value.slice(start), caret: from };
 }
 
+/** Owner decision #27 (K14): Claude Code's two newline keys, which used to send the draft. `Alt+Enter`
+ *  inserts a newline in place of the selection; a plain Enter with a backslash right before the caret
+ *  (and no selection) removes that backslash and inserts a newline in its place. `null` for every other
+ *  Enter -- Ctrl+Enter and Meta+Enter keep sending (now), a plain Enter with no such backslash sends,
+ *  and Shift+Enter never gets here (it is the textarea's own newline). */
+export function enterNewline(
+  value: string,
+  start: number,
+  end: number,
+  mods: { altKey: boolean; ctrlKey: boolean; metaKey: boolean },
+): { value: string; caret: number } | null {
+  if (mods.ctrlKey || mods.metaKey) return null;
+  if (mods.altKey) return { value: value.slice(0, start) + "\n" + value.slice(end), caret: start + 1 };
+  if (start === end && start > 0 && value[start - 1] === "\\") {
+    return { value: value.slice(0, start - 1) + "\n" + value.slice(end), caret: start };
+  }
+  return null;
+}
+
 export function caretOnFirstLine(value: string, caret: number): boolean {
   return !value.slice(0, caret).includes("\n");
 }
@@ -58,6 +77,8 @@ export const COMPOSER_CHORDS: string[] = [
   "Enter",
   "Ctrl+Enter",
   "Shift+Enter",
+  // Owner decision #27: Claude Code's own two newline keys.
+  "Alt+Enter / \\ Enter",
   "↑ / ↓",
   "Ctrl+r",
   "Ctrl+w / Ctrl+u",

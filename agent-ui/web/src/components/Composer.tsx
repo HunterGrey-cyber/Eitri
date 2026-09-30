@@ -4,6 +4,7 @@ import { HINT_COMPOSER_ATTR } from "../nav";
 import {
   caretOnFirstLine,
   caretOnLastLine,
+  enterNewline,
   growHeight,
   isImeKey,
   mergeTaken,
@@ -259,6 +260,14 @@ export function Composer({
     // App.tsx's document-capture router (`modeKey.ts`) before it ever reaches this handler.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      // Owner decision #27 (K14): Alt+Enter and a backslash right before the caret are Claude Code's own
+      // newline keys, not a send. Not while nvim owns the draft (`editingInNvim`, fix round): `readOnly`
+      // stops typing but not this handler, and a newline added here would be lost to nvim's own write.
+      const newline = editingInNvim ? null : enterNewline(el.value, el.selectionStart, el.selectionEnd, e);
+      if (newline !== null) {
+        setBox(newline.value, newline.caret);
+        return;
+      }
       submit(e.ctrlKey);
       return;
     }

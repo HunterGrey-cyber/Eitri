@@ -203,6 +203,9 @@ type InboundHandler = (
     | { kind: "literal_key"; key: string }
     /** `prefix ?`: open the `?` overlay in BROWSE. */
     | { kind: "open_keymap" }
+    /** `prefix :` (tmux `command-prompt`, owner decision #28, K16): open the `:` command line, which runs
+     *  nothing. See `serialize_open_command_line_for_js` in `core/src/agent_bridge.rs`. */
+    | { kind: "open_command_line" }
     /** The chat was brought back to answer a card (its tray chip `agent ⚑N`, or `Ctrl+a a`): BROWSE,
      *  with the cursor on the oldest pending card. See `serialize_focus_permission_for_js` in
      *  `core/src/agent_bridge.rs`. */
@@ -301,6 +304,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "keymap" ||
         obj.kind === "literal_key" ||
         obj.kind === "open_keymap" ||
+        obj.kind === "open_command_line" ||
         obj.kind === "focus_permission" ||
         obj.kind === "hint_collect" ||
         obj.kind === "hint_show" ||

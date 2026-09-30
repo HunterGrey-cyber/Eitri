@@ -74,6 +74,10 @@ pub enum Action {
     Hint,
     PanelReload,
     PanelKeymap,
+    /// tmux `command-prompt` (`prefix :`, owner decision #28, K16): show the chat with the keys and
+    /// open the panel's `:` command line, which runs nothing. Before it was bound, an armed prefix
+    /// swallowed the `:` and the letters typed after it ran as panel keys.
+    PanelCommandLine,
     WindowImmersive,
     /// The pane with the keys only (spec §2.3: not bound by default).
     Text(TextChange),
@@ -240,6 +244,7 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "hint" => (Action::Hint, &[]),
         "panel.reload" => (Action::PanelReload, &[]),
         "panel.keymap" => (Action::PanelKeymap, &[]),
+        "panel.command-line" => (Action::PanelCommandLine, &[]),
         "window.immersive" => (Action::WindowImmersive, &[]),
         "text.larger" => (Action::Text(TextChange::Larger), &[]),
         "text.smaller" => (Action::Text(TextChange::Smaller), &[]),
@@ -337,6 +342,7 @@ impl Action {
             Action::Hint => "hint".into(),
             Action::PanelReload => "panel.reload".into(),
             Action::PanelKeymap => "panel.keymap".into(),
+            Action::PanelCommandLine => "panel.command-line".into(),
             Action::WindowImmersive => "window.immersive".into(),
             Action::Text(TextChange::Larger) => "text.larger".into(),
             Action::Text(TextChange::Smaller) => "text.smaller".into(),
@@ -413,6 +419,7 @@ impl Action {
             Action::Hint => "HINT: jump anywhere in the window".into(),
             Action::PanelReload => "Reload the agent panel (the session keeps running)".into(),
             Action::PanelKeymap => "Show the chat and this list".into(),
+            Action::PanelCommandLine => "Show the chat and its : command line (runs nothing)".into(),
             Action::WindowImmersive => "Immersive: fullscreen without the top bar".into(),
             Action::Text(TextChange::Larger) => "Text size larger, the pane with the keys only".into(),
             Action::Text(TextChange::Smaller) => "Text size smaller, the pane with the keys only".into(),

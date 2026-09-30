@@ -11,7 +11,7 @@ import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, star
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
+import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 import {
   compareCarets,
   copySelectionText,
@@ -1621,6 +1621,17 @@ export default function App() {
         tabMode: activeInfo?.mode ?? null,
       });
       if (route === "overlay") return;
+      // #26 fix round (Codex review, finding 2): any key within `TYPING_GUARD_MS` of a BROWSE `y` is
+      // typing -- and this capture-phase router runs ahead of `onKeyDown`'s own check of that, so
+      // `y` then Shift+Tab used to post `cycle_mode` (flipping auto and bypass) right after a copy. The
+      // key is claimed and recorded like any other (so a wait it cancels says so), and only a Shift+Tab
+      // after a pause cycles the mode.
+      const modeKeyAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+      if (modeRef.current === "browse" && typingGuard.afterCopy(modeKeyAt)) {
+        event.stopPropagation();
+        showFlash(typingGuard.onKey("Tab", modeKeyAt) ?? TYPE_HINT_FLASH);
+        return;
+      }
       // K01: Shift+Tab is a key after a waiting `g`/`z`/`[`/`]`, a count or a leader sequence, and
       // the `stopPropagation` below keeps it from `onKeyDown`, which would otherwise have dropped
       // them -- so both routes drop them here. Only refs and state setters: safe from a listener
@@ -2534,6 +2545,33 @@ export default function App() {
         exitRegion();
         setMode("browse");
         setKeymapOpen(true);
+      } else if (payload.kind === "open_command_line") {
+        // `prefix :` (tmux `command-prompt`, owner decision #28, K16). GTK took the chord, and before it
+        // was bound the armed prefix swallowed the `:` and the letters after it ran as panel keys ("kill-window
+        // -a" moved the cursor, entered INPUT and sent "ll-window -a"). This opens the same line BROWSE's own
+        // `:` opens (K02, R4): it runs nothing, Enter says so, Esc closes it, and it has the keys.
+        // The empty tab has no such line (its `:` is not a key either), so there it says so instead.
+        if (!sessionStartedRef.current) {
+          showFlash("no command line on this screen — ? lists this panel's keys");
+          return;
+        }
+        // A route away from a bypass prompt, from VISUAL, and from every overlay over the conversation,
+        // as `hint_collect` and `tab_detail` are: GTK's chord reaches no key handler here. The `/` prompt
+        // and this line are one command line, so opening one closes the other.
+        cancelBypassConfirm();
+        exitRegion();
+        setKeymapOpen(false);
+        setDetail(null);
+        setHandoffOpen(false);
+        setChooser(null);
+        setSlashPicker(null);
+        setSlashReply(null);
+        pendingSlashPickerRef.current = null;
+        dropPendingKeys();
+        setMode("browse");
+        setSearch(null);
+        setExLine("");
+        setLineFocusRequest((n) => n + 1);
       } else if (payload.kind === "hint_collect") {
         // A HINT started elsewhere in the window must not label rows hidden under this overlay
         // (spec §3.1). It also frees the keys `hint_collect`'s own reply is about to swallow --
@@ -4811,6 +4849,25 @@ export default function App() {
       showFlash(STOP_TYPING_FLASH);
       return;
     }
+    // Owner decision #26 (K15): any key within `TYPING_GUARD_MS` of a BROWSE `y` is typing -- vim's
+    // `y i w` copied the row, opened INPUT on the `i` and typed the `w`. The copy is frozen and already
+    // happened; what follows it inside the burst is swallowed and says how to type. A bare modifier is
+    // not a key (the Shift of a capital), and a key an input method composes is not this panel's.
+    // Fix round (Codex review, finding 2): this sits AHEAD of the focused-control early return just
+    // below, so `y` then Enter (or Space) on a focused button -- another tab's, Dismiss -- within the
+    // burst is claimed too instead of activating it; a lone Enter after a pause is left to the button.
+    if (
+      mode === "browse" &&
+      !isModifierKey(event.key) &&
+      !isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode }) &&
+      typingGuard.afterCopy(typedAt)
+    ) {
+      event.preventDefault();
+      // The wait this very key cancelled already said what did not happen, in its own words (and ends
+      // with this hint): that message stays.
+      if (cancelled === null) showFlash(TYPE_HINT_FLASH);
+      return;
+    }
     if (isActivatableControl(event.target) && (event.key === "Enter" || (event.key === " " && !onAnswerButton))) return;
     // The leader engine (`./leader`, panel round 2 plan Task 8; spec §2.4): a pending sequence owns
     // the next key, and only BROWSE ever starts one. An IME key is never a sequence key (Review
@@ -4982,7 +5039,7 @@ export default function App() {
         // on the first line does (`:h j`) -- only `j` names a route the reader might actually want next.
         if (action.delta === 1) {
           if (target === landing.from) {
-            if (!event.repeat || heldMoveRef.current) showFlash("i or Ctrl+j to type");
+            if (!event.repeat || heldMoveRef.current) showFlash(TYPE_HINT_FLASH);
             heldMoveRef.current = false;
           } else {
             heldMoveRef.current = true;
@@ -5022,6 +5079,16 @@ export default function App() {
     event.preventDefault();
     switch (action.kind) {
       case "mode":
+        // Owner decision #26 (K12, K13): `i`/`o`/`A` enter INPUT only on a key that stands alone
+        // (`mayStartInput`: a pure pause, and -- unlike the leader's `mayActAfterMotion` -- no motion
+        // exception, the review of #26: "look at" walked with `l` and opened INPUT with `o`). In the
+        // middle of typed prose the `i` of "explain" or the `o` of "follow-up" is swallowed and says how
+        // to type, instead of opening the composer halfway through the word. A lone `i` after a pause is
+        // unchanged; a fast `ji` chord now needs a pause.
+        if (action.to === "input" && !typingGuard.mayStartInput(typedAt, event.repeat)) {
+          if (cancelled === null) showFlash(TYPE_HINT_FLASH);
+          break;
+        }
         setMode(action.to);
         // C1a: entering INPUT (`i`/`o`/`A`) asks `Composer` to place the caret itself, rather than
         // leaving it to whatever a bare `autoFocus` on a freshly re-mounted, non-empty box happens
@@ -5084,6 +5151,8 @@ export default function App() {
         enterRegion(action.line, landedCode);
         break;
       case "copy": {
+        // Owner decision #26 (K15): a `y` opens a burst in which every other key is typing (above).
+        typingGuard.noteCopy(typedAt);
         // After HINT landed on a code block: that block's code, not the whole message. Only while it
         // is still in the DOM and still inside the row under the cursor -- anything else and the
         // user is looking at something else now.

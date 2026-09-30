@@ -6,8 +6,9 @@
 //!
 //! Since v1 (spec `2026-09-27-v1-ui-design.md` §5, P1/P14) the same directory also holds
 //! `nav_fallback.lua`, a `--cmd`-loaded snippet that gives `Ctrl+h/j/k/l` a way out of the editor
-//! when vim-tmux-navigator is absent, and from Visual mode, writing the same letters to the same
-//! socket as the shim. It lives here because leaving can only work where the socket does.
+//! when vim-tmux-navigator is absent, from Visual mode, and (`Ctrl+l` only, decision #24) from Insert
+//! mode, writing the same letters to the same socket as the shim. It lives here because leaving can
+//! only work where the socket does.
 //!
 //! The half that is **not** here is the polling driver: `shell::pane_switch` owns the
 //! `glib::timeout_add_local` timer that constructs a [`PaneSwitchReader`] once and calls

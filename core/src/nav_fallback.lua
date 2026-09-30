@@ -4,7 +4,9 @@
 -- gives each of <C-h>/<C-j>/<C-k>/<C-l>, in Normal and Visual mode, a way out of the editor --
 -- but only where the global slot is empty, nvim's own default, or a plain window move. Anything
 -- else (vim-tmux-navigator, a lazy.nvim key stub, smart-splits, a user's own mapping) is left
--- alone, and buffer-local mappings are never touched.
+-- alone, and buffer-local mappings are never touched. Insert mode gets <C-l> alone (owner
+-- decision #24, K05), and only where its global slot is empty: <C-h>/<C-j>/<C-k> keep vim's own
+-- Insert meanings (backspace, newline, digraph).
 local socket = vim.env.EITRI_PANE_SWITCH_SOCKET
 if not socket or socket == "" then
   return
@@ -71,6 +73,24 @@ local function visual(key)
   end
 end
 
+-- Insert (#24 / K05; eitri-only, like Visual -- vim-tmux-navigator and LazyVim map Normal mode only,
+-- so a plain nvim typed a literal ^L here and the keys never left the editor). Insert mode is left
+-- first, as <Esc> would, then the key does what Normal mode's does: move to the window beyond, or at
+-- nvim's edge send the letter to the pane beyond. Insert mode ends either way, since the keys are
+-- about to leave this pane.
+--
+-- `:stopinsert` only takes effect once this mapping's callback returns (it sets a flag the Insert loop
+-- reads), so moving the window inside the callback ended Insert mode in the DESTINATION window: its
+-- cursor stepped left a column, InsertLeave fired in its buffer, and the window the user was typing
+-- in never stepped back (review of #24). The move is scheduled instead, to run after Insert has ended
+-- where it started; at the edge the letter goes out from there too.
+local function insert(key)
+  vim.cmd.stopinsert()
+  vim.schedule(function()
+    normal(key)
+  end)
+end
+
 -- `<...>` key notation compared case-insensitively (`<c-w>` and `<C-W>` are one key), everything
 -- else exactly: `<C-W>H` moves the window itself (:h CTRL-W_H), it is not `<C-W>h`.
 local function notation_lower(rhs)
@@ -115,13 +135,13 @@ local function is_plain_move(m, key)
     or rhs == ":wincmd " .. key.dir .. "<cr>"
 end
 
+local RUNNERS = { n = normal, x = visual, i = insert }
+
 local function install(mode, key)
-  local run = mode == "n" and function()
-    normal(key)
-  end or function()
-    visual(key)
-  end
-  vim.keymap.set(mode, key.lhs, run, { desc = DESC .. key.name, silent = true })
+  local runner = RUNNERS[mode]
+  vim.keymap.set(mode, key.lhs, function()
+    runner(key)
+  end, { desc = DESC .. key.name, silent = true })
 end
 
 local function check()
@@ -133,6 +153,13 @@ local function check()
         install(mode, key)
       end
     end
+  end
+  -- Insert: <C-l> only, and only into an empty global slot -- nothing of nvim's own to displace,
+  -- and a user's Insert <C-l> (a completion key, a cursor move) is theirs. The fallback's own
+  -- mapping is kept as it is.
+  local ctrl_l = KEYS[4]
+  if global_maps("i")[ctrl_l.lhs:lower()] == nil then
+    install("i", ctrl_l)
   end
 end
 

@@ -17,7 +17,7 @@ import { Dashboard, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
 import { classify, failureEvidence, remedyNamesR } from "../problems";
-import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TypingGuard } from "../typingGuard";
+import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TypingGuard } from "../typingGuard";
 
 /** Below this width (spec §7, "At 360 px") the dashboard's where-line cuts the cwd and drops the
  *  account. Measured the same way `StatusBand` measures its own box: a `ResizeObserver` on this
@@ -569,6 +569,15 @@ export function EmptyTab(props: EmptyTabProps) {
         return;
       }
     }
+    // Owner decision #26 (K15): any key within `TYPING_GUARD_MS` of a BROWSE `y` (below) is typing, as
+    // over a live conversation (`App.tsx`): swallowed, and the band says how to type. A bare modifier
+    // is not a key. Fix round (Codex review, finding 2): ahead of the focused-control line below, so
+    // `y` then Enter on a focused dashboard control is claimed too; a lone Enter after a pause is not.
+    if (!isModifierKey(event.key) && typingGuard.afterCopy(typedAt)) {
+      event.preventDefault();
+      if (cancelled === null) props.onFlash?.(TYPE_HINT_FLASH);
+      return;
+    }
     // v1 hardening, codex-release-p1 #5: a pending sequence's own continuation must run BEFORE the
     // unconditional single-key handlers below, matching `App.tsx`'s own ordering (leader engine
     // before other single-key handling: `f` there reaches HINT only through `resolveKey`, well
@@ -616,10 +625,17 @@ export function EmptyTab(props: EmptyTabProps) {
       if (!waiting && !event.repeat) props.onFlash?.(hintTypingFlash());
       return;
     }
-    if (event.key === "y" && handoff !== null) {
-      event.preventDefault();
-      void navigator.clipboard?.writeText(handoff.command);
-      return;
+    if (event.key === "y" && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      // Fix round (Codex review, finding 3): every BROWSE `y` opens #26's burst, whether or not it copies
+      // anything -- vim's `y` is an operator whatever is under the cursor, and it is what a person types
+      // `yi` or `ys` after. It used to open only when a handoff command existed, so on an ordinary
+      // dashboard `y` then Enter ran the selected action and `y` then `j` moved the cursor.
+      typingGuard.noteCopy(typedAt);
+      if (handoff !== null) {
+        event.preventDefault();
+        void navigator.clipboard?.writeText(handoff.command);
+        return;
+      }
     }
     if (hello === null) return;
     // The leader/which-key engine runs on a `starting` or `failed` tab too (whole-branch review):
@@ -706,6 +722,15 @@ export function EmptyTab(props: EmptyTabProps) {
     // v1 hardening, codex-release-p1 #7 (C1a, keymap.ts:284-292): `o` is an exact alias of `i`
     // here too, and `A` opens the same composer with the caret forced to the end of the draft --
     // this screen had never grown either of the live tab's two frozen aliases.
+    // Owner decision #26 (K12, the very case this screen produced: "expla" lost to the `i` inside
+    // "explain"): `i`/`o`/`A` open the composer only on a key that stands alone (`mayStartInput`: a pure
+    // pause, no motion exception -- the review of #26: "look at" walked with `l` and opened it with `o`);
+    // in the middle of typed prose they are swallowed and say how to type.
+    if ((event.key === "i" || event.key === "o" || event.key === "A") && !typingGuard.mayStartInput(typedAt, event.repeat)) {
+      event.preventDefault();
+      if (cancelled === null) props.onFlash?.(TYPE_HINT_FLASH);
+      return;
+    }
     if (event.key === "i" || event.key === "o") {
       event.preventDefault();
       runItem("new");

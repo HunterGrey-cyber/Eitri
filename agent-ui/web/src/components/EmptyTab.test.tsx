@@ -11,6 +11,29 @@ import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS } from "../typing
 
 afterEach(cleanup);
 
+/** #26: the typing guard reads each keydown's timestamp (jsdom: `Date.now()`), so two keys a test fires
+ *  back to back are one burst. `keyGap()` moves the clock past the guard window, as a person pausing
+ *  would -- with the fake clock's `setSystemTime` (no timer fires) or, under real timers, a `Date.now`
+ *  offset undone after each test. */
+let clockSkew = 0;
+let clockSpy: { mockRestore: () => void } | null = null;
+function keyGap(ms: number = TYPING_GUARD_MS + 50) {
+  if (vi.isFakeTimers()) {
+    vi.setSystemTime(Date.now() + ms);
+    return;
+  }
+  if (clockSpy === null) {
+    const real = Date.now.bind(Date);
+    clockSpy = vi.spyOn(Date, "now").mockImplementation(() => real() + clockSkew);
+  }
+  clockSkew += ms;
+}
+afterEach(() => {
+  clockSpy?.mockRestore();
+  clockSpy = null;
+  clockSkew = 0;
+});
+
 const session = (n: number): ResumableSession => ({
   provider: "claude", providerSessionId: `id-${n}-0000000000`, createdAt: "1", updatedAt: "2", title: `about ${n}`, name: null,
 });
@@ -245,6 +268,7 @@ describe("EmptyTab (F3)", () => {
       fireEvent.keyUp(textarea, { key: "ArrowLeft" });
       fireEvent.keyDown(textarea, { key: "Escape" });
       expect(container.querySelector("textarea")).toBeNull();
+      keyGap(); // a lone `A` (#26)
       fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "A", shiftKey: true });
       expect(container.querySelector("textarea")!.selectionStart).toBe("hello world".length);
     });
@@ -586,6 +610,7 @@ describe("EmptyTab (F3)", () => {
         fireEvent.keyDown(root, { key: "g" });
         fireEvent.keyDown(root, { key: "i" });
         expect(rendered.container.querySelector("textarea")).toBeNull();
+        keyGap(); // a lone `i` (#26)
         fireEvent.keyDown(root, { key: "i" });
         expect(rendered.container.querySelector("textarea")).not.toBeNull();
       });
@@ -607,6 +632,7 @@ describe("EmptyTab (F3)", () => {
           expect(rendered.container.querySelector("textarea"), "the i ended the g").toBeNull();
           fireEvent.keyDown(root, { key: "g" });
           at(5);
+          keyGap(); // a lone `i` (#26)
           fireEvent.keyDown(root, { key: "i" });
           expect(rendered.container.querySelector("textarea"), "the request dropped the g").not.toBeNull();
           fireEvent.keyDown(rendered.container.querySelector("textarea")!, { key: "Escape" });
@@ -1047,6 +1073,7 @@ describe("EmptyTab (F3)", () => {
       const textarea = container.querySelector("textarea")!;
       fireEvent.change(textarea, { target: { value: "half a thought" } });
       fireEvent.keyDown(textarea, { key: "Escape" });
+      keyGap(); // a lone `i` (#26)
       fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "i" });
       expect(container.querySelector("textarea")!.value).toBe("half a thought");
     });
@@ -1256,5 +1283,195 @@ describe("EmptyTab: K04, a failure while the composer has the keys", () => {
     act(() => textarea.focus());
     rendered.rerender(<EmptyTab {...rendered.props} overlayOpen={true} tab={{ ...TAB, state: "failed" }} failure="boom" />);
     expect(document.activeElement).toBe(textarea);
+  });
+});
+
+/* Owner decision #26 (K12, K13, K15): the dashboard's own `i`/`o`/`A` enter INPUT only on a key that
+   stands alone (or ends a quick motion run), and any key within `TYPING_GUARD_MS` of a `y` that
+   copied the handoff command is typing. K12 happened right here: "expla" typed on the empty tab lost
+   its first letters to the `i` inside "explain". Time is vitest's fake clock. */
+describe("EmptyTab: #26, typing in BROWSE never starts INPUT mid-word", () => {
+  const HINT = "i or Ctrl+j to type";
+  const at = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  function inBrowse(over: Partial<EmptyTabProps> = {}) {
+    const rendered = renderEmpty({ onFlash: vi.fn(), ...over });
+    const root = toBrowse(rendered, rendered.props);
+    at(1000);
+    return { ...rendered, root };
+  }
+  const typeAt = (root: HTMLElement, keys: string[], gap: number) => {
+    for (const key of keys) {
+      fireEvent.keyDown(root, { key });
+      at(gap);
+    }
+  };
+
+  it("explain at 80 ms a key never opens the composer, and the band is told how to type", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root, props } = inBrowse();
+      typeAt(root, [..."explain"], 80);
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(props.onFlash).toHaveBeenCalledWith(HINT);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("follow-up (the o) and a capital A in the middle of typing are swallowed too", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = inBrowse();
+      typeAt(root, [..."follow-up"], 80);
+      expect(container.querySelector("textarea")).toBeNull();
+      at(1000);
+      fireEvent.keyDown(root, { key: "s" });
+      at(80);
+      fireEvent.keyDown(root, { key: "A", shiftKey: true });
+      expect(container.querySelector("textarea")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Fix round (Codex + Claude review, finding 1): no motion exception for `i`/`o`/`A` -- a lone `l`, `h`
+  // or `G` is a word's first letter, so "look at" walked and opened the composer with its `o`.
+  it.each(["look at the diff", "how do I", "Good", "hi", "like", "join"])(
+    "%s at 80 ms a key never opens the composer, even though its first letter is a motion key",
+    (text) => {
+      vi.useFakeTimers();
+      try {
+        const { container, root, props } = inBrowse();
+        typeAt(root, [...text], 80);
+        expect(container.querySelector("textarea")).toBeNull();
+        expect(props.onFlash).toHaveBeenCalledWith(HINT);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("a motion key then i within 80 ms no longer opens the composer; after a pause it does", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = inBrowse();
+      fireEvent.keyDown(root, { key: "k" });
+      at(80);
+      fireEvent.keyDown(root, { key: "i" });
+      expect(container.querySelector("textarea")).toBeNull();
+      at(TYPING_GUARD_MS + 50);
+      fireEvent.keyDown(root, { key: "i" });
+      expect(container.querySelector("textarea")).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a lone i, o or A after a pause still opens the composer", () => {
+    vi.useFakeTimers();
+    try {
+      for (const [key, init] of [["i", {}], ["o", {}], ["A", { shiftKey: true }]] as const) {
+        const { container, root, unmount } = inBrowse();
+        fireEvent.keyDown(root, { key: "x" });
+        at(300);
+        fireEvent.keyDown(root, { key, ...init });
+        expect(container.querySelector("textarea"), key).not.toBeNull();
+        unmount();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Fix round (Codex review, finding 3): the window opened only when a handoff command existed, so on an
+  // ordinary dashboard `y` then Enter ran the selected action and `j` moved the cursor.
+  it("y on a dashboard with no handoff still opens the window: Enter right after it runs nothing", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root, props } = inBrowse();
+      fireEvent.keyDown(root, { key: "y" });
+      at(60);
+      fireEvent.keyDown(root, { key: "Enter" });
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(props.onFlash).toHaveBeenCalledWith(HINT);
+      at(TYPING_GUARD_MS + 50);
+      fireEvent.keyDown(root, { key: "Enter" });
+      expect(container.querySelector("textarea")).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("y on a dashboard with no handoff: j within the window moves nothing, and does after it", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = inBrowse();
+      const cursor = () => container.querySelector("[aria-current=true]")?.textContent;
+      const before = cursor();
+      fireEvent.keyDown(root, { key: "y" });
+      at(60);
+      fireEvent.keyDown(root, { key: "j" });
+      expect(cursor()).toBe(before);
+      at(TYPING_GUARD_MS + 50);
+      fireEvent.keyDown(root, { key: "j" });
+      expect(cursor()).not.toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("y then Enter or Space on a focused dashboard control inside the window is claimed too", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = inBrowse();
+      const item = container.querySelector<HTMLElement>("[role=button]")!;
+      fireEvent.keyDown(root, { key: "y" });
+      at(60);
+      expect(fireEvent.keyDown(item, { key: "Enter" }), "Enter").toBe(false);
+      expect(fireEvent.keyDown(item, { key: " " }), "Space").toBe(false);
+      at(TYPING_GUARD_MS + 50);
+      expect(fireEvent.keyDown(item, { key: "Enter" }), "after the pause").toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a Ctrl+y is the page's own, and opens no window", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = inBrowse();
+      fireEvent.keyDown(root, { key: "y", ctrlKey: true });
+      at(60);
+      fireEvent.keyDown(root, { key: "Enter" });
+      expect(container.querySelector("textarea")).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("y on a handoff copies its command; an i and w within 250 ms of it do nothing", () => {
+    vi.useFakeTimers();
+    const writeText = vi.fn();
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    try {
+      const { container, root } = inBrowse({
+        handoff: { command: "cd /p && claude --resume abc", cwd: "/p", providerSessionId: "abc" },
+      });
+      fireEvent.keyDown(root, { key: "y" });
+      expect(writeText).toHaveBeenCalledTimes(1);
+      at(60);
+      fireEvent.keyDown(root, { key: "i" });
+      at(60);
+      fireEvent.keyDown(root, { key: "w" });
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(writeText).toHaveBeenCalledTimes(1);
+      // A lone i after the window opens the composer as before.
+      at(400);
+      fireEvent.keyDown(root, { key: "i" });
+      expect(container.querySelector("textarea")).not.toBeNull();
+    } finally {
+      delete (navigator as unknown as Record<string, unknown>).clipboard;
+      vi.useRealTimers();
+    }
   });
 });

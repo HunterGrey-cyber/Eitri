@@ -530,12 +530,173 @@ fn without_its_environment_the_loader_installs_nothing() {
         );
         for (lhs, _, _) in KEYS {
             assert_eq!(nvim.global_desc(lhs, "x"), None, "{case} x {lhs}");
+            assert_eq!(nvim.global_desc(lhs, "i"), None, "{case} i {lhs}");
             if lhs != "<C-l>" {
                 assert_eq!(nvim.global_desc(lhs, "n"), None, "{case} n {lhs}");
             }
         }
         nvim.quit();
     }
+}
+
+/// (h) #24 / K05. Insert mode: only `<C-l>` gets the fallback (leave Insert, then move right); `<C-h>`,
+/// `<C-j>` and `<C-k>` keep vim's own Insert meanings (backspace, newline, digraph), so nothing is
+/// mapped on them in Insert mode.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn insert_mode_gets_only_ctrl_l() {
+    let mut nvim = Nvim::start("h", Loader::Installed, &[], &[]);
+    nvim.wait_for_all_fallbacks("n");
+    nvim.wait_for_fallback("<C-l>", "i", "right");
+    for (lhs, _, _) in KEYS {
+        if lhs == "<C-l>" {
+            let (desc, _, buffer, callback) = nvim.maparg(lhs, "i");
+            assert_eq!(desc.as_deref(), Some(fallback_desc("right").as_str()));
+            assert_eq!((buffer, callback), (0, true));
+        } else {
+            assert_eq!(nvim.global_desc(lhs, "i"), None, "i {lhs} must stay vim's own");
+            assert_eq!(nvim.maparg(lhs, "i").0, None, "i {lhs} must stay vim's own");
+        }
+    }
+    nvim.quit();
+}
+
+/// (h, edge) In Insert mode at nvim's edge, `<C-l>` writes its letter and leaves Insert mode: the
+/// keys are about to go to another pane, so the editor must not be left typing.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn insert_ctrl_l_at_the_edge_writes_its_letter_and_leaves_insert() {
+    let mut nvim = Nvim::start("h-edge", Loader::Installed, &[], &[]);
+    nvim.wait_for_fallback("<C-l>", "i", "right");
+    nvim.input("ihello<C-l>");
+    assert_eq!(nvim.wait_for_letter(), "R\n");
+    nvim.wait_until("Normal mode", |nvim| nvim.mode() == "n");
+    // The typed text stayed, and no ^L was typed into it.
+    assert_eq!(nvim.eval("getline(1)").as_str(), Some("hello"));
+    nvim.quit();
+}
+
+/// (h, split) With a split, Insert `<C-l>` from the left window leaves Insert, moves to the right
+/// window and writes nothing; the sentinel `<C-k>` (Normal mode, the top edge) is then the first
+/// letter to arrive.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn insert_ctrl_l_between_windows_moves_and_writes_nothing() {
+    let mut nvim = Nvim::start("h-split", Loader::Installed, &[], &[]);
+    nvim.wait_for_fallback("<C-l>", "i", "right");
+    nvim.wait_for_all_fallbacks("n");
+    nvim.command("vsplit");
+    assert_eq!(nvim.winnr(), 1);
+    nvim.input("iab<C-l>");
+    nvim.wait_until("the cursor in the right window, in Normal mode", |nvim| {
+        nvim.winnr() == 2 && nvim.mode() == "n"
+    });
+    nvim.input("<C-k>");
+    assert_eq!(nvim.wait_for_letter(), "U\n", "the move must not have written a letter");
+    assert_eq!(nvim.eval("getline(1)").as_str(), Some("ab"));
+    nvim.quit();
+}
+
+/// (h, two buffers) Fix round (review of #24): `:stopinsert` only takes effect once the mapping's
+/// callback returns, so moving the window inside that callback ended Insert mode in the DESTINATION
+/// window: its cursor stepped left a column, `InsertLeave` fired in its buffer, and the source window's
+/// cursor was never stepped back. Insert must end in the window it was started in, then the key moves on.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn insert_ctrl_l_ends_insert_in_the_source_window_and_leaves_the_destination_cursor_alone() {
+    let mut nvim = Nvim::start("h-two-buffers", Loader::Installed, &[], &[]);
+    nvim.wait_for_fallback("<C-l>", "i", "right");
+    nvim.wait_for_all_fallbacks("n");
+    // Left window: 'abcdefgh' with the cursor before the 'd'. Right window: another buffer, cursor on the '5'.
+    nvim.command("vsplit");
+    nvim.command("wincmd l");
+    nvim.command("enew");
+    nvim.command("call setline(1, '12345678')");
+    nvim.command("call cursor(1, 5)");
+    nvim.command("wincmd h");
+    nvim.command("call setline(1, 'abcdefgh')");
+    nvim.command("call cursor(1, 4)");
+    assert_eq!(nvim.winnr(), 1);
+    let source_buf = nvim.eval("bufnr('%')").as_i64().expect("a buffer number");
+    let source_win = nvim.eval("win_getid()").as_i64().expect("a window id");
+    let destination_buf = nvim.eval("winbufnr(2)").as_i64().expect("a buffer number");
+    assert_ne!(source_buf, destination_buf);
+    nvim.lua(
+        "vim.g.leave_bufs = {} \
+         vim.api.nvim_create_autocmd('InsertLeave', { callback = function() \
+           local t = vim.g.leave_bufs t[#t + 1] = vim.api.nvim_get_current_buf() vim.g.leave_bufs = t \
+         end })",
+        vec![],
+    );
+    nvim.input("i<C-l>");
+    nvim.wait_until("the cursor in the right window, in Normal mode", |nvim| {
+        nvim.winnr() == 2 && nvim.mode() == "n"
+    });
+    nvim.flush_scheduled();
+    // The destination window's cursor stayed on its '5' (1-based column 5).
+    assert_eq!(
+        nvim.eval("getcurpos()[2]").as_i64(),
+        Some(5),
+        "the destination cursor must not shift left"
+    );
+    // Insert ended in the SOURCE buffer, once, before the move.
+    assert_eq!(
+        nvim.eval("g:leave_bufs")
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_i64).collect::<Vec<_>>()),
+        Some(vec![source_buf]),
+        "InsertLeave must fire once, in the source buffer"
+    );
+    // And the source window's cursor stepped back one column, as <Esc> would have: 0-based 3 -> 2.
+    let cursor = nvim.lua("return vim.api.nvim_win_get_cursor(...)", vec![Value::from(source_win)]);
+    assert_eq!(
+        cursor.as_array().and_then(|c| c[1].as_i64()),
+        Some(2),
+        "the source cursor steps back one"
+    );
+    nvim.quit();
+}
+
+/// (h, the user's own) An Insert `<C-l>` of the user's -- a plain mapping, a Lua callback, or a
+/// buffer-local one -- is never replaced, across a later `User LazyLoad` too.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_users_own_insert_ctrl_l_is_left_alone() {
+    let mut nvim = Nvim::start("h-own", Loader::Installed, &["inoremap <C-l> <Right>"], &[]);
+    nvim.wait_for_all_fallbacks("n");
+    nvim.wait_for_all_fallbacks("x");
+    assert_eq!(nvim.maparg("<C-l>", "i"), (None, Some("<Right>".to_string()), 0, false));
+    nvim.command("xunmap <C-l>");
+    nvim.command("doautocmd User LazyLoad");
+    nvim.wait_for_fallback("<C-l>", "x", "right");
+    assert_eq!(nvim.maparg("<C-l>", "i"), (None, Some("<Right>".to_string()), 0, false));
+    nvim.quit();
+
+    let mut nvim = Nvim::start(
+        "h-own-lua",
+        Loader::Installed,
+        &["lua vim.keymap.set('i', '<C-l>', function() end, { desc = 'a completion key' })"],
+        &[],
+    );
+    nvim.wait_for_all_fallbacks("n");
+    assert_eq!(
+        nvim.maparg("<C-l>", "i"),
+        (Some("a completion key".to_string()), None, 0, true)
+    );
+    nvim.quit();
+
+    let mut nvim = Nvim::start(
+        "h-own-buffer",
+        Loader::Installed,
+        &["autocmd VimEnter * inoremap <buffer> <C-l> <Right>"],
+        &[],
+    );
+    nvim.wait_for_all_fallbacks("n");
+    // The buffer-local mapping keeps winning in its buffer; the global slot beneath it is empty,
+    // so it gets the fallback.
+    nvim.wait_for_fallback("<C-l>", "i", "right");
+    assert_eq!(nvim.maparg("<C-l>", "i"), (None, Some("<Right>".to_string()), 1, false));
+    nvim.quit();
 }
 
 /// P5-A1, the pane half (`the private review notes`, "P5-A1"): `send()`'s

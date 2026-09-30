@@ -615,6 +615,17 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       expect(onSend).not.toHaveBeenCalled();
       expect(onQueue).not.toHaveBeenCalled();
     },
+    "Alt+Enter / \\ Enter": () => {
+      // Owner decision #27: Claude Code's own two newline keys. Nothing is sent.
+      const { textarea, onSend } = renderComposer();
+      typed(textarea, "line");
+      expect(fireEvent.keyDown(textarea, { key: "Enter", altKey: true })).toBe(false);
+      expect(textarea.value).toBe("line\n");
+      typed(textarea, "line\ntwo\\");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(textarea.value).toBe("line\ntwo\n");
+      expect(onSend).not.toHaveBeenCalled();
+    },
     "↑ / ↓": () => {
       const onTakeBackQueue = vi.fn();
       const { textarea } = renderComposer({ history: ["older prompt"] });
@@ -716,3 +727,114 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
 function keyLike(key: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean }> = {}) {
   return { key, ctrlKey: false, shiftKey: false, isComposing: false, ...over };
 }
+
+/* Owner decision #27 (K14; keyboard proposal §3): `Alt+Enter` and a trailing backslash then Enter send
+   the half-written draft today; Claude Code documents both as a newline, so both insert one (ruled a
+   bug fix). Plain Enter still sends, Shift+Enter is the textarea's own newline, Ctrl+Enter still sends
+   now. */
+describe("Alt+Enter and backslash+Enter insert a newline (#27, K14)", () => {
+  const place = (textarea: HTMLTextAreaElement, value: string, caret: number = value.length) => {
+    fireEvent.change(textarea, { target: { value } });
+    textarea.setSelectionRange(caret, caret);
+  };
+
+  it("Alt+Enter inserts a newline at the caret and sends nothing", () => {
+    const { textarea, onSend } = renderComposer();
+    place(textarea, "abcd", 2);
+    const notClaimed = fireEvent.keyDown(textarea, { key: "Enter", altKey: true });
+    expect(notClaimed, "the key is claimed, so the browser adds nothing of its own").toBe(false);
+    expect(textarea.value).toBe("ab\ncd");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("Alt+Enter replaces a selection with the newline", () => {
+    const { textarea, onSend } = renderComposer();
+    place(textarea, "abcd", 1);
+    textarea.setSelectionRange(1, 3);
+    fireEvent.keyDown(textarea, { key: "Enter", altKey: true });
+    expect(textarea.value).toBe("a\nd");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("Alt+Enter does not queue or send-now while a turn runs either", () => {
+    const onQueue = vi.fn();
+    const onSendNow = vi.fn();
+    const { textarea, onSend } = renderComposer({ running: true, onQueue, onSendNow });
+    place(textarea, "follow up");
+    fireEvent.keyDown(textarea, { key: "Enter", altKey: true });
+    expect(textarea.value).toBe("follow up\n");
+    expect([onSend, onQueue, onSendNow].map((f) => f.mock.calls.length)).toEqual([0, 0, 0]);
+  });
+
+  it("a backslash right before the caret, then Enter: the backslash goes, a newline takes its place", () => {
+    const { textarea, onSend } = renderComposer();
+    place(textarea, "first line\\");
+    const notClaimed = fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(notClaimed).toBe(false);
+    expect(textarea.value).toBe("first line\n");
+    expect(onSend).not.toHaveBeenCalled();
+    // ...with the caret after the newline, so the next line is typed where it belongs.
+    expect(textarea.selectionStart).toBe("first line\n".length);
+  });
+
+  it("the same in the middle of the text: only the backslash before the caret is taken", () => {
+    const { textarea, onSend } = renderComposer();
+    place(textarea, "ab\\cd", 3);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.value).toBe("ab\ncd");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("plain Enter still sends: no backslash before the caret, or one further back", () => {
+    const { textarea, onSend } = renderComposer();
+    place(textarea, "hello");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenLastCalledWith("hello");
+    place(textarea, "a\\b");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenLastCalledWith("a\\b");
+  });
+
+  it("Ctrl+Enter after a backslash still sends now, and Shift+Enter stays the textarea's own newline", () => {
+    const onSendNow = vi.fn();
+    const { textarea, onSend } = renderComposer({ running: true, onSendNow });
+    place(textarea, "now\\");
+    fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
+    expect(onSendNow).toHaveBeenCalledWith("now\\");
+    place(textarea, "x\\");
+    expect(fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true })).toBe(true);
+    expect(textarea.value).toBe("x\\");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("a backslash before a selection is not 'before the caret': Enter sends", () => {
+    const { textarea, onSend } = renderComposer();
+    place(textarea, "a\\bc", 2);
+    textarea.setSelectionRange(2, 3);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("a\\bc");
+  });
+
+  // Fix round (Claude review of #27): `readOnly` stops typing but not a keydown handler, so both newline
+  // keys edited a draft nvim owned for the length of a scratch round trip -- text nvim's own write would
+  // then replace, losing the newline.
+  it("while nvim owns the draft (editingInNvim), neither newline key touches it and nothing is sent", () => {
+    const { textarea, onSend } = renderComposer({ editingInNvim: true });
+    place(textarea, "abcd", 2);
+    fireEvent.keyDown(textarea, { key: "Enter", altKey: true });
+    expect(textarea.value).toBe("abcd");
+    place(textarea, "x\\");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.value).toBe("x\\");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("an input method's own Alt+Enter or Enter is left alone", () => {
+    const { textarea, onSend } = renderComposer();
+    place(textarea, "x\\");
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(textarea, { key: "Enter", altKey: true, keyCode: 229 });
+    expect(textarea.value).toBe("x\\");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+});

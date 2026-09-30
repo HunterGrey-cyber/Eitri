@@ -49,6 +49,16 @@
  *   the sentence into nvim, a shell or another session's composer. These use `defer` instead, the
  *   same forward-looking wait `a`/`d` already use (the review's "after-half of S1's rule"): the key
  *   acts `TYPING_GUARD_MS` later, only if nothing else was typed meanwhile.
+ * - **Owner decision #26 (K12, K13, K15, 2026-09-29) extends it to BROWSE's own entry into INPUT and to the
+ *   keys after a copy.** `i`/`o`/`A` enter INPUT only when `mayStartInput` allows it -- on a key that
+ *   stands alone (a pure pause, NO motion exception: the review of #26 found that with the leader's
+ *   `mayActAfterMotion` rule "look at" walked with `l` and opened INPUT with `o`) -- so "expla|in" no
+ *   longer loses "expla" to the `i` inside the word, and "follow-up" no longer sends "llow-up" after
+ *   its `o` opened the composer (a swallowed key says `TYPE_HINT_FLASH`). And `y` opens a burst
+ *   (`noteCopy`/`afterCopy`): any key within `TYPING_GUARD_MS` of a BROWSE `y` is typing, so vim's
+ *   `y i w` no longer copies the row, opens INPUT and types the `w`. The copy itself is frozen and
+ *   still happens at once, the clipboard still overwritten; text typed without `i` is still dropped.
+ *   A lone `i` after a pause is unchanged.
  *
  * Pure: it never reads the DOM. Timestamps are the caller's (`event.timeStamp`); the timers are
  * injectable and default to the global ones, looked up at call time so a test's fake timers apply.
@@ -88,6 +98,11 @@ const MODIFIER_KEYS = new Set([
   "Symbol",
   "SymbolLock",
 ]);
+
+/** The BROWSE placeholder's own words (S3, `Composer`'s hint line; C1c's flash when `j` cannot move),
+ *  which is also what the band says when #26's guard swallowed an `i`/`o`/`A` (or any key right after a
+ *  `y`) because it came in the middle of typing. */
+export const TYPE_HINT_FLASH = "i or Ctrl+j to type";
 
 /** What the band says when the leader did not start a sequence because it came in the middle of
  *  typing (`TypingGuard.mayActAfterMotion`; the v1-ui GUI pass, 2026-09-27: "set up my" ran
@@ -161,6 +176,8 @@ export class TypingGuard {
    *  so `App.tsx` can tie a landing it saw to the key that made it -- never a guess from a key's
    *  name. */
   private recorded = 0;
+  /** #26: when a BROWSE `y` last copied (its keydown's timestamp), for `afterCopy`. */
+  private copiedAt: number | null = null;
 
   constructor(private readonly timers: GuardTimers = GLOBAL_TIMERS) {}
 
@@ -189,6 +206,19 @@ export class TypingGuard {
     return this.recorded;
   }
 
+  /** #26 (K15): a BROWSE `y` copied, at `t` (its keydown's timestamp). Opens the burst `afterCopy` asks
+   *  about. Called where the copy happens, never for a `y` typed into the composer or a text box. */
+  noteCopy(t: number): void {
+    this.copiedAt = t;
+  }
+
+  /** #26 (K15): whether the key `onKey` just recorded (at `t`) came within `TYPING_GUARD_MS` after the
+   *  last `noteCopy` -- typing, not a command, so the caller swallows it and says `TYPE_HINT_FLASH`.
+   *  A key stamped before the copy is never inside its burst. */
+  afterCopy(t: number): boolean {
+    return this.copiedAt !== null && t >= this.copiedAt && t - this.copiedAt < TYPING_GUARD_MS;
+  }
+
   /** Whether the key `onKey` just recorded (at `t`) may answer now: with nothing within the window
    *  before it, or, for Enter, when the whole unbroken run before it is a walk onto the button
    *  (`h`/`l`/Tab/Shift+Tab) back to a key that stood alone -- `l`⏎ and `l l`⏎ answer, `e`⏎,
@@ -210,6 +240,17 @@ export class TypingGuard {
     const before = this.previous;
     if (before === null || t - before.t >= TYPING_GUARD_MS) return true;
     return this.previousRunIsMotion;
+  }
+
+  /** Fix round (Codex + Claude review of #26, finding 1): BROWSE's `i`/`o`/`A` enter INPUT only on a pure
+   *  pause -- nothing pressed within `TYPING_GUARD_MS` before the key `onKey` just recorded, exactly
+   *  `mayAnswerNow`'s rule with none of its Enter exception, and **none of `mayActAfterMotion`'s motion
+   *  exception either**. A lone `h`/`j`/`k`/`l`/`G` is as much the first letter of a word as a motion, so
+   *  with that exception "look at" walked with `l` and opened INPUT with `o` ("ok at"), and "how", "hi",
+   *  "like", "join" and "Good" did the same. The price, stated: a fast `ji` chord now needs a pause. A
+   *  repeat never may. */
+  mayStartInput(t: number, repeat: boolean): boolean {
+    return this.mayAnswerNow("", t, repeat);
   }
 
   /** `a`/`d`/`D`, `f`, a single-key table binding, and (K02) Enter on a card's own button: when the

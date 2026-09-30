@@ -279,8 +279,41 @@ body,
   text-decoration-color: var(--nv-muted);
   cursor: pointer;
 }
+/* rc.4 item 6: an inline code span is never broken inside a token (`--json` split between its hyphens).
+   A browser may break after a hyphen-minus and only `white-space: nowrap` stops that, which would let a long
+   span run out of the row; an atomic inline does both. As an `inline-block` its shrink-to-fit width is its
+   content's own, so nothing inside wraps and the whole span moves to the next line when it does not fit this
+   one; only a span longer than the whole row is capped at `max-width: 100%` and broken, anywhere. Fenced code
+   is `pre code`, which this leaves alone. */
 .row-assistant code:not(pre code) {
   cursor: pointer;
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+/* Fix round, item 6 (a): a table's cells keep their words whole and the table scrolls in its own box (T1,
+   `.table-scroll` above), so a span in a cell is neither broken nor capped at the cell's width -- the rule
+   above would otherwise beat the cell's inherited `overflow-wrap: normal` on the span's own box. */
+.row-assistant .table-scroll code:not(pre code) {
+  max-width: none;
+  overflow-wrap: normal;
+}
+/* Fix round, item 6 (b): an inline-block does not take its ancestors' text decoration into its own box
+   (CSS Text Decoration 3: not propagated to atomic inline-level descendants), so the span in a link lost
+   its underline and the span in `~~ ~~` its strike-through. Each is drawn on the span's own box, as a value
+   and not `inherit`: a `<strong>` between the link and the span has a computed `none`. */
+.row-assistant a code:not(pre code) {
+  text-decoration: underline;
+}
+.row-assistant del code:not(pre code),
+.row-assistant s code:not(pre code) {
+  text-decoration: line-through;
+}
+.row-assistant a del code:not(pre code),
+.row-assistant del a code:not(pre code),
+.row-assistant a s code:not(pre code),
+.row-assistant s a code:not(pre code) {
+  text-decoration: underline line-through;
 }
 .path-pick {
   font-family: var(--nv-font-mono);
@@ -1168,8 +1201,25 @@ textarea,
   margin-right: 6px;
   white-space: nowrap;
 }
+/* rc.4 item 8: Approve, Deny and the third button take the panel's face and scale like every other control
+   in it (the composer, the rename box, the reason box above them). They kept WebKit's own 13.33px
+   form-control font, so at a larger panel text size the prose, the card's title and the reason box grew and
+   the buttons did not (seen in the rc.3 sandbox screenshots). */
 .permission-card-buttons button {
   margin-right: 8px;
+  font: inherit;
+  font-size: var(--fs-base);
+}
+/* rc.4 item 8: the reason box fills the card. It kept the browser's intrinsic width -- about twenty
+   characters -- so its placeholder read "Reason (shown to the ag" (an rc.3 sandbox screenshot). Where even
+   the card's width is too narrow for it the placeholder ends in an ellipsis rather than a hard clip.
+   Its face and size are the combined rule further down's (`font: inherit` and `--fs-base`). */
+.permission-card input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 6px 0;
+  text-overflow: ellipsis;
 }
 
 .composer {
@@ -2180,7 +2230,10 @@ textarea,
   padding: 6px 8px; font-size: var(--fs-sm); color: var(--nv-muted);
   border-bottom: 1px solid var(--nv-border); border-left: 3px solid var(--nv-warn);
 }
-.permission-card-diff { margin: 0; padding: 0; font-family: var(--nv-font-mono); font-size: var(--fs-sm); overflow-x: auto; }
+/* rc.4 item 7: the bottom padding is room for the horizontal scrollbar, which is WebKitGTK's overlay one and
+   takes none of its own -- at panel text 0.9 it was drawn over a one-line diff's `+` line. `scrollbar-gutter`
+   reserves the block-axis scrollbar's room only, so the strip is plain padding. */
+.permission-card-diff { margin: 0; padding: 0 0 12px; font-family: var(--nv-font-mono); font-size: var(--fs-sm); overflow-x: auto; }
 .diff-line { display: flex; gap: 6px; padding: 0 8px; white-space: pre; color: var(--nv-fg); }
 .diff-gutter { width: 1ch; flex: none; color: var(--nv-muted); }
 .diff-added { border-left: 3px solid var(--nv-ok); }

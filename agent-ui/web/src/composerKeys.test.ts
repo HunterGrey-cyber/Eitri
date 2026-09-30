@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { caretOnFirstLine, caretOnLastLine, COMPOSER_CHORDS, growHeight, isImeKey, mergeTaken, readlineEdit } from "./composerKeys";
+import {
+  caretOnFirstLine,
+  caretOnLastLine,
+  COMPOSER_CHORDS,
+  enterNewline,
+  growHeight,
+  isImeKey,
+  mergeTaken,
+  readlineEdit,
+} from "./composerKeys";
 import { INPUT_KEYS } from "./keymap";
 
 describe("composer keys", () => {
@@ -15,6 +24,21 @@ describe("composer keys", () => {
     expect(readlineEdit("line one\nline two", 17, 17, "u")).toEqual({ value: "line one\n", caret: 9 });
     expect(readlineEdit("abc", 0, 0, "w")).toBeNull();
     expect(readlineEdit("abc def", 0, 7, "w"), "a selection is deleted whole").toEqual({ value: "", caret: 0 });
+  });
+
+  it("enterNewline: Alt+Enter and a backslash before the caret are newlines; every other Enter is not (#27)", () => {
+    const none = { altKey: false, ctrlKey: false, metaKey: false };
+    expect(enterNewline("abcd", 2, 2, { ...none, altKey: true })).toEqual({ value: "ab\ncd", caret: 3 });
+    expect(enterNewline("abcd", 1, 3, { ...none, altKey: true })).toEqual({ value: "a\nd", caret: 2 });
+    expect(enterNewline("line\\", 5, 5, none)).toEqual({ value: "line\n", caret: 5 });
+    expect(enterNewline("ab\\cd", 3, 3, none)).toEqual({ value: "ab\ncd", caret: 3 });
+    expect(enterNewline("hello", 5, 5, none)).toBeNull();
+    expect(enterNewline("a\\b", 3, 3, none), "a backslash further back").toBeNull();
+    expect(enterNewline("a\\bc", 2, 3, none), "a selection").toBeNull();
+    expect(enterNewline("x\\", 2, 2, { ...none, ctrlKey: true })).toBeNull();
+    expect(enterNewline("x\\", 2, 2, { ...none, metaKey: true })).toBeNull();
+    expect(enterNewline("x", 1, 1, { ...none, altKey: true, ctrlKey: true })).toBeNull();
+    expect(enterNewline("\\", 0, 0, none)).toBeNull();
   });
 
   it("knows whether the caret is on the box's first or last line", () => {

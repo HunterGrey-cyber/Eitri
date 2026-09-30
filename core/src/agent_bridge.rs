@@ -732,6 +732,13 @@ pub fn serialize_open_keymap_for_js() -> String {
     json!({ "kind": "open_keymap" }).to_string()
 }
 
+/// `{"kind":"open_command_line"}`: `prefix :` (tmux `command-prompt`, owner decision #28, K16) -- open
+/// the panel's `:` line, in BROWSE. The line runs nothing (Enter says so, Esc closes it); it exists so
+/// the letters typed after the chord land in a box instead of running as panel keys.
+pub fn serialize_open_command_line_for_js() -> String {
+    json!({ "kind": "open_command_line" }).to_string()
+}
+
 /// `{"kind":"nav_key","direction":"down"}` / `"up"`: C1's decision (spec §3.1, §3.5), made in Rust
 /// from the `panel_keys` mirror -- `Ctrl+j` claimed in BROWSE, or `Ctrl+k` claimed in INPUT. The page
 /// applies it against its own current state and, if that no longer matches, replies
@@ -1604,6 +1611,12 @@ mod tests {
         assert_eq!(value, serde_json::json!({ "kind": "literal_key", "key": "C-a" }));
         let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js()).unwrap();
         assert_eq!(value, serde_json::json!({ "kind": "open_keymap" }));
+    }
+
+    #[test]
+    fn serializes_open_command_line() {
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_command_line_for_js()).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "open_command_line" }));
     }
 
     // Field order isn't pinned byte-for-byte (`serde_json`'s default map isn't insertion-ordered --

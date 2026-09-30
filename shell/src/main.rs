@@ -1755,6 +1755,18 @@ fn build_ui(
                         focus_module(&chat);
                         agent.open_keymap();
                     }
+                    // `prefix :` (owner decision #28, K16): tmux's `command-prompt`. The chat comes up with the
+                    // keys and its `:` line opens, which runs nothing -- so the letters typed after the chord
+                    // land in a box instead of running as panel keys.
+                    Action::PanelCommandLine => {
+                        let chat = ModuleId::agent();
+                        if let Err(err) = show_on_screen(&chat) {
+                            refuse(&refused_name, &toast, &err);
+                            return;
+                        }
+                        focus_module(&chat);
+                        agent.open_command_line();
+                    }
                     Action::WindowImmersive => window_modes.toggle_immersive(),
                     // Panel round 2 plan Task 6: the body that used to live here is `run_tab_action`,
                     // shared with the panel's own `tab_verb` messages (spec §10.2). Unchanged
