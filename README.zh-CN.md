@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=1e1d08a96d45507b2cb6b4c0e7c75ab9505a0a77da5b6a88bb8f419a45ca4ca4 -->
+<!-- translated-from: README.md sha256=a57126ed4846f5af976e4fdf80436588c932f6a041a29ded85e0939c8a77fb1a -->
 
 # Eitri
 
@@ -58,7 +58,7 @@ its code block follow each switch. 1280x800, 6 seconds or less, under 3 MB. -->
 
 | | 编辑器 | agent | 你在哪里读 agent 的工作成果 |
 |---|---|---|---|
-| Eitri | Neovim（`nvim --embed`，你自己的配置） | Claude Code | 编辑器旁边一个渲染后的面板。它目前是一个独立的窗口；从你终端里正在用的 Neovim 打开它、关掉后回到原处，在路线图上。 |
+| Eitri | Neovim（`nvim --embed`，你自己的配置） | Claude Code | 渲染好的面板就在你自己的 Neovim 旁边，同在一个窗口里。 |
 | [avante.nvim](https://github.com/avante-corp/avante.nvim) | Neovim（插件） | 多家 LLM 提供商；ACP agent，其中包括 Claude Code | Neovim 窗口里的侧边栏聊天 |
 | [codecompanion.nvim](https://github.com/olimorris/codecompanion.nvim) | Neovim（插件） | LLM 适配器；ACP agent，其中包括 Claude Code | 一个聊天 buffer；较大的修改建议放在浮动窗口的 diff 里 |
 | [claude-code.nvim](https://github.com/greggh/claude-code.nvim) | Neovim（插件） | Claude Code | Neovim 窗口里的 Claude Code 终端界面 |

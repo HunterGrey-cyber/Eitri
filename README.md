@@ -83,7 +83,7 @@ Other ways to run a coding agent next to Neovim, as each project describes itsel
 
 | | Editor | Agent | Where you read the agent's work |
 |---|---|---|---|
-| Eitri | Neovim (`nvim --embed`, your config) | Claude Code | A rendered panel beside the editor. For now it is a window of its own; opening it from the Neovim you already run in a terminal, and landing back there when you close it, is on the roadmap. |
+| Eitri | Neovim (`nvim --embed`, your config) | Claude Code | A rendered panel beside your own Neovim, in one window. |
 | [avante.nvim](https://github.com/avante-corp/avante.nvim) | Neovim (plugin) | Many LLM providers; ACP agents, Claude Code among them | A sidebar chat in Neovim windows |
 | [codecompanion.nvim](https://github.com/olimorris/codecompanion.nvim) | Neovim (plugin) | LLM adapters; ACP agents, Claude Code among them | A chat buffer; larger proposed edits in a floating diff |
 | [claude-code.nvim](https://github.com/greggh/claude-code.nvim) | Neovim (plugin) | Claude Code | Claude Code's terminal UI in a Neovim window |
