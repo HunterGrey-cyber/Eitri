@@ -468,6 +468,14 @@ export default function App() {
    *  wheel or touch on the list, a press in the panel) or by a route that lands elsewhere (a switch,
    *  `enter_input`, `focus_permission`). */
   const arrivalParkRef = useRef<ArrivalPark | null>(null);
+  /** The typing guard's key count when an `arrive` or `focus_permission` envelope reached this page,
+   *  held until the landing it asked for has run. Both landings happen in effects, so only after React
+   *  has rendered the envelope; `shell` moves GTK focus here and sends the envelope at the same moment,
+   *  so the user's first key can be handled in between, against the panel as it is drawn. A landing
+   *  that ran over that key afterwards undid it -- the first `v` after `Ctrl+l` started CARET and the
+   *  landing ended it again before it was ever painted, so only a second `v` seemed to work. A landing
+   *  whose count no longer matches yields: the key that got there first already decided. */
+  const landingAtKeyRef = useRef<number | null>(null);
   /** Set by the `tabs` arm whenever `payload.active` names a different tab than before (mount
    *  included, the same condition that arm's own per-tab reset already runs on), and
    *  read-and-cleared by the `snapshot` arm right after: landing on a tab already
@@ -1776,6 +1784,11 @@ export default function App() {
     if (arriveRequest === 0) return;
     const park = arrivalParkRef.current;
     arrivalParkRef.current = null;
+    // A key handled since the envelope arrived already acted on the panel as drawn (`landingAtKeyRef`):
+    // the landing would undo it, so the key wins and nothing below runs.
+    const atKey = landingAtKeyRef.current;
+    landingAtKeyRef.current = null;
+    if (atKey !== null && atKey !== typingGuard.keyCount()) return;
     // End the region before an arrival changes mode or cursor. Otherwise `frozenSnapshot` can keep the
     // old tab's conversation visible over the new one. This is a no-op when no region is active.
     exitRegion();
@@ -1786,6 +1799,8 @@ export default function App() {
       return;
     }
     if (oldestPendingPermission(timeline) !== null) {
+      // The card landing is one more effect away; a key handled before it yields it the same way.
+      landingAtKeyRef.current = typingGuard.keyCount();
       setPermissionRequest((n) => n + 1);
       return;
     }
@@ -1829,6 +1844,12 @@ export default function App() {
      composer, as `enter_input` gives it. Keyed on the request alone, like `inputRequest`. */
   useEffect(() => {
     if (permissionRequest === 0) return;
+    // As in the `arrive` effect: a key handled since `focus_permission` (or `arrive`, which handed its
+    // landing on to this effect) arrived wins over the landing. A tab switch's own card landing sets no
+    // count and always lands.
+    const atKey = landingAtKeyRef.current;
+    landingAtKeyRef.current = null;
+    if (atKey !== null && atKey !== typingGuard.keyCount()) return;
     // End the region before landing directly on a permission card, as for `arrive`. A frozen snapshot
     // must not keep showing a different row.
     exitRegion();
@@ -2165,6 +2186,7 @@ export default function App() {
         // nothing about it -- the same reason `pane_focus` cancels both.
         dropPendingKeys();
         setEmptyLanding("browse");
+        landingAtKeyRef.current = typingGuard.keyCount();
         setArriveRequest((n) => n + 1);
       } else if (payload.kind === "focus_permission") {
         // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
@@ -2177,6 +2199,7 @@ export default function App() {
         setChooser(null);
         endKeyPrompts();
         arrivalParkRef.current = null; // #22: a card landing wins over a parked row
+        landingAtKeyRef.current = typingGuard.keyCount();
         setPermissionRequest((n) => n + 1);
       } else if (payload.kind === "nav_key") {
         // GTK claimed this key before the WebView could pass it to `answerConfirm`. Cancel the
