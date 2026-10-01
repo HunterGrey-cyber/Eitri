@@ -1,0 +1,62 @@
+name: Testing feedback
+description: "Your impressions after trying Eitri, not only bugs: what felt wrong, slow, confusing or missing."
+title: "[feedback] "
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying Eitri. A definite bug is better filed as a "Bug report"; this form is for the rest.
+        Fill in whatever you have something to say about and leave the rest empty.
+  - type: textarea
+    id: tried
+    attributes:
+      label: What did you try?
+      description: The project and language you opened, what you did in the editor, the panel and the terminal, and for how long.
+    validations:
+      required: true
+  - type: textarea
+    id: wrong
+    attributes:
+      label: What felt wrong, slow or confusing?
+  - type: dropdown
+    id: own-config
+    attributes:
+      label: Did your own init.lua and plugins work unchanged?
+      options:
+        - Haven't tried my own config
+        - Yes, unchanged
+        - Mostly, with changes
+        - No
+  - type: textarea
+    id: config-details
+    attributes:
+      label: If not unchanged, what broke or needed a change?
+      description: The plugin, option or mapping, and what it did inside Eitri.
+  - type: textarea
+    id: keys
+    attributes:
+      label: Key conflicts with your habits
+      description: Keys that clashed with your Neovim, tmux or terminal muscle memory, or that you expected to do something else.
+      placeholder: "e.g. the tmux-style prefix, Ctrl+h/j/k/l between panes, vim keys in the panel"
+  - type: textarea
+    id: panel
+    attributes:
+      label: Is the agent panel easy to read?
+      description: Markdown, code colours, diffs, permission cards, font size, what you could not find.
+  - type: textarea
+    id: missing
+    attributes:
+      label: Anything you expected that is missing?
+  - type: input
+    id: version
+    attributes:
+      label: eitri --version
+      placeholder: "eitri 0.2.0 (commit ..., neovide fork ..., verdandi ...)"
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup
+      description: Distro, desktop or compositor, Wayland or X11, GPU, monitor refresh rate and scale. Mainly useful for anything about speed or drawing.

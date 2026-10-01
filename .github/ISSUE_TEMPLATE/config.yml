@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/HunterGrey-cyber/eitri/discussions
+    about: How do I...? Would it be possible to...? Share your setup. Discussions is the place, not Issues.
+  - name: Known issues
+    url: https://github.com/HunterGrey-cyber/eitri/blob/main/docs/known-issues.md
+    about: What is unsupported or rough today. Please read it before filing a bug.
+  - name: Matrix chat (English)
+    url: https://matrix.to/#/#eitri:matrix.org
+    about: "#eitri:matrix.org, for a quick question or a chat."
+  - name: Telegram group (mostly Chinese)
+    url: https://t.me/eitri_cc
+    about: The same, mostly in Chinese.

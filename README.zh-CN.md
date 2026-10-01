@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=9036d454eda0d2b9725d859584e9e7034e03338d7a9684ca7ec8fe3f9350bf08 -->
+<!-- translated-from: README.md sha256=46353dc8b02d6e6e0e50dfd2dd97cbe9d66985fe5847245ffc3568128417c839 -->
 
 <div align="center">
 
@@ -54,6 +54,7 @@ eitri ~/path/to/project
 
 - [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions)：提问、建议、分享你的配置
 - [Telegram 群](https://t.me/eitri_cc)（中文）和 [Matrix 房间](https://matrix.to/#/#eitri:matrix.org) `#eitri:matrix.org`（英文）
+- [已知问题](docs/known-issues.zh-CN.md)：目前不支持的和还比较粗糙的地方，提 bug 之前值得先看一眼
 - Bug 请发到 [Issues](https://github.com/HunterGrey-cyber/eitri/issues)；构建和测试见 [CONTRIBUTING.md](CONTRIBUTING.md)（仅有英文版）
 - [Neovide fork](https://github.com/HunterGrey-cyber/neovide)（`neovibe-integration` 分支）和 [agent sidecar](https://github.com/HunterGrey-cyber/verdandi) 在各自的仓库里
 
