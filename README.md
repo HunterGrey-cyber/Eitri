@@ -159,7 +159,9 @@ In this order, no dates.
 3. Inline diffs: the agent's edit drawn in your Neovim buffer, taken or dropped hunk by hunk.
 4. Every file a turn changed in one view, and a way to roll the turn back.
 5. Start from your terminal: `:Eitri` in the Neovim you already run opens this window on the same
-   session, and closing the window puts you back in the terminal where you left off.
+   session, and closing the window puts you back in the terminal where you left off. Or keep Neovim in
+   your terminal for good and open only the agent panel as a window of its own, for Hyprland (or sway)
+   to tile beside it: Neovim runs at your terminal's own speed, and `Ctrl+h/j/k/l` moves between the two.
 
 ## Telemetry
 
