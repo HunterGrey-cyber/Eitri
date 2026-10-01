@@ -1,5 +1,5 @@
 pkgbase = eitri-git
-	pkgdesc = Neovim, embedded as a real component, with a Claude agent panel beside it (built from source)
+	pkgdesc = Your Neovim, with a readable Claude Code panel beside it (built from source)
 	pkgver = 0.2.0.r0.g0000000
 	pkgrel = 1
 	url = https://github.com/HunterGrey-cyber/eitri

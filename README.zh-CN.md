@@ -3,9 +3,9 @@
 
 # Eitri
 
-**你的 Neovim，旁边是 Claude Code。**
+**你的 Neovim，与 Claude Code 并肩。**
 
-一个你愿意读下去的 Claude Code：渲染好的 markdown 和 diff、权限卡片，全程不用去碰鼠标。Eitri 是一个 Linux 桌面窗口（MIT 许可），包在你自己的 Neovim 配置和你已安装的 `claude` 外面。
+一个真正好读的 Claude Code：排好版的回复和 diff，一张张权限卡片，全程不用碰鼠标。Eitri 是一个 Linux 桌面窗口（MIT 许可），包在你自己的 Neovim 配置和你已安装的 `claude` 外面。
 
 <!-- MEDIA: hero.png -- the whole window. Left: the editor on LazyVim, a file open, a Visual selection.
 Right: the panel mid-conversation: a markdown reply with a highlighted code block, a folded tool-call

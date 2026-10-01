@@ -1298,9 +1298,9 @@ class ReleaseNotesBilingual(unittest.TestCase):
 
     def test_the_page_has_both_halves_in_order_and_no_leftover_placeholder(self):
         notes = self.render()
-        self.assertIn("Eitri 1.0.0-rc.1 -- Neovim, embedded as a real component", notes)
+        self.assertIn("Eitri 1.0.0-rc.1 -- Your Neovim, with Claude Code beside it", notes)
         self.assertIn("\n---\n\n## 简体中文\n", notes)
-        self.assertLess(notes.index("## 简体中文"), notes.index("Eitri 1.0.0-rc.1 -- 将 Neovim 作为真正的组件嵌入"))
+        self.assertLess(notes.index("## 简体中文"), notes.index("Eitri 1.0.0-rc.1 -- 你的 Neovim，与 Claude Code 并肩"))
         self.assertNotIn("@", notes.replace("release@eitri", ""))
 
     def test_the_chinese_half_names_the_same_release_facts_as_the_english_one(self):

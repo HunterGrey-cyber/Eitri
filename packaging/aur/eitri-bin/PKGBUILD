@@ -31,7 +31,7 @@ pkgrel=1
 # contain a hyphen at all), so the two diverge for any prerelease and only _realver is right to use
 # in a download URL or an asset's on-disk name. bump-bin.sh sets both from the same RELEASE key.
 _realver=0.2.0
-pkgdesc="Neovim, embedded as a real component, with a Claude agent panel beside it (prebuilt binaries; builds its own sidecar on install)"
+pkgdesc="Your Neovim, with a readable Claude Code panel beside it (prebuilt binaries; builds its own sidecar on install)"
 arch=('x86_64')
 url="https://github.com/HunterGrey-cyber/eitri"
 # D15 (spec sec 9, sec 17 Q3): this package's own MIT/Apache-2.0/LGPL-3.0-only/MPL-2.0 notices,
