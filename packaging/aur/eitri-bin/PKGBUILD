@@ -18,7 +18,7 @@ pkgrel=1
 # Use _realver for download URLs and asset filenames. bump-bin.sh sets both values from the
 # same RELEASE key.
 _realver=0.2.0
-pkgdesc="Neovim, embedded as a real component, with a Claude agent panel beside it (prebuilt binaries; builds its own sidecar on install)"
+pkgdesc="Your Neovim, with a readable Claude Code panel beside it (prebuilt binaries; builds its own sidecar on install)"
 arch=('x86_64')
 url="https://github.com/HunterGrey-cyber/eitri"
 # Include the package's MIT, Apache-2.0, LGPL-3.0-only and MPL-2.0 notices, plus the

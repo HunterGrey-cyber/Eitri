@@ -4,8 +4,8 @@ version: ${VERSION}
 release: 1
 maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
 description: |
-  Neovim, embedded as a real component, with a Claude agent panel beside it.
-  Pre-MVP: the agent can read, search and talk, but cannot yet edit your files.
+  Your Neovim, with Claude Code beside it: a readable Claude Code panel next to your own Neovim.
+  It runs the Claude Code you installed; Eitri never touches your credentials.
   Source, including this package's own build recipe: ${EITRI_SOURCE_URL}
 homepage: https://github.com/HunterGrey-cyber/eitri
 # SPDX. The public expression (packaging/nfpm-public.yaml) plus

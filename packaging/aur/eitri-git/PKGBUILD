@@ -8,7 +8,7 @@
 pkgname=eitri-git
 pkgver=0.2.0.r0.g0000000
 pkgrel=1
-pkgdesc="Neovim, embedded as a real component, with a Claude agent panel beside it (built from source)"
+pkgdesc="Your Neovim, with a readable Claude Code panel beside it (built from source)"
 arch=('x86_64')
 url="https://github.com/HunterGrey-cyber/eitri"
 license=('MIT' 'Apache-2.0' 'LGPL-3.0-only' 'MPL-2.0' 'LicenseRef-Anthropic-Claude-Agent-SDK')
