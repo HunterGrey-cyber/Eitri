@@ -18,9 +18,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 PKG=$(cd "$HERE/../.." && pwd)
 WRAPPER=$PKG/../install.sh
 
-SCRATCH_ROOT=$HOME/.cache/nv-v1dist-t2/root-wrapper-test-$$
-rm -rf "$SCRATCH_ROOT"
-mkdir -p "$SCRATCH_ROOT"
+# A name no other run can share: a process id is not one (two runs in separate PID namespaces, or
+# a later run after a pid wrapped, can have the same $$ and would delete each other's scratch).
+mkdir -p "$HOME/.cache/nv-v1dist-t2"
+SCRATCH_ROOT=$(mktemp -d "$HOME/.cache/nv-v1dist-t2/root-wrapper-test-XXXXXX")
 trap 'rm -rf "$SCRATCH_ROOT"' EXIT
 
 ROOT=$SCRATCH_ROOT/checkout

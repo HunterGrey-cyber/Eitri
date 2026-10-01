@@ -14,9 +14,9 @@
 #
 # Two guards fail with exit 98 / 97:
 #   - `claude` must resolve to a stub under the new PATH, preventing a real CLI invocation.
-#   - With --guard-real-home DIR, a listing of the application's state, config and data directories
-#     under DIR is hashed before and after the command and must not change. The listing contains
-#     names and mtimes, never contents. Only the two hashes are kept in memory.
+#   - With --guard-real-home DIR, real-home-state.sh lists installer-managed files under DIR.
+#     Names, types, sizes and mtimes are hashed before and after the command and must not change.
+#     Runtime state, settings and file contents are excluded. Only the two hashes are kept in memory.
 #
 # stdin passes through for piped installs. The wrapper uses POSIX sh syntax.
 set -u
@@ -90,14 +90,10 @@ if [ "$W_CLAUDE_OK" != 1 ]; then
 	exit 98
 fi
 
+W_HERE=$(cd "$(dirname "$0")" && pwd) || die "cannot find this script's own directory"
+
 real_home_digest() {
-	for W_R in "$W_GUARD/.local/state/eitri" "$W_GUARD/.config/eitri" "$W_GUARD/.local/share/eitri"; do
-		if [ -e "$W_R" ] || [ -L "$W_R" ]; then
-			find "$W_R" -printf '%p %T@\n' 2>&1
-		else
-			printf 'absent %s\n' "$W_R"
-		fi
-	done | LC_ALL=C sort | sha256sum
+	sh "$W_HERE/real-home-state.sh" "$W_GUARD" 2>&1 | sha256sum
 }
 
 # The assignments, in order: the defaults, then --set (env lets a later assignment win), minus
@@ -133,7 +129,7 @@ W_RC=$?
 if [ -n "$W_GUARD" ]; then
 	W_AFTER=$(real_home_digest)
 	if [ "$W_BEFORE" != "$W_AFTER" ]; then
-		printf "run-in-env: the real HOME's Eitri directories changed during this run\n" >&2
+		printf "run-in-env: a path the installer can touch in the real HOME changed during this run\n" >&2
 		exit 97
 	fi
 fi
