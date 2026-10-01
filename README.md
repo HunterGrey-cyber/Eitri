@@ -95,8 +95,8 @@ Other ways to run a coding agent next to Neovim, as each project describes itsel
 
 ## Why not a plugin
 
-We live in the terminal too, and we are not asking you to move out. Eitri steps outside it for one
-thing terminal cells cannot draw: the reply laid out as a document. The Neovim plugins above and a tmux
+We work in the terminal ourselves, and we are not asking you to leave it. Eitri steps outside it for
+one thing terminal cells cannot draw: the reply laid out as a document. The Neovim plugins above and a tmux
 pane running `claude` keep you in the terminal, tmux and `ssh`; what Eitri adds is the reading. And if
 Neovide on its own was not a reason to leave the terminal, Eitri's editor half is not one either: the
 editor is the same Neovim, drawn the same way.
@@ -143,7 +143,8 @@ used on, and what was exercised only in the project's headless GUI sandbox. -->
 
 ## Requirements
 
-- Linux on x86_64, glibc ≥ 2.39, GTK ≥ 4.14, WebKitGTK ≥ 2.40 (the `webkitgtk-6.0` API): Ubuntu 24.04,
+- Linux on x86_64 with the `webkitgtk-6.0` API (WebKitGTK 2.40 or newer; required). The prebuilt
+  binaries are built against glibc 2.39 and GTK 4.14; older glibc and GTK are untested. Ubuntu 24.04,
   Debian 13, Fedora 40+, RHEL 10 and Arch meet these. A Wayland session and a working OpenGL driver.
 - Neovim ≥ 0.10 on `PATH`, or a private copy the installer fetches for Eitri alone (never on `PATH`).
 - Claude Code ≥ 2.1.252 and < 3.0, installed. Eitri does not bundle Claude Code; it runs yours.

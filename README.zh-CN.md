@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=a57126ed4846f5af976e4fdf80436588c932f6a041a29ded85e0939c8a77fb1a -->
+<!-- translated-from: README.md sha256=c51d97685dc8129b9189fc0f62462551ab608decc0c971222d575973e970e3ea -->
 
 # Eitri
 
@@ -70,7 +70,7 @@ its code block follow each switch. 1280x800, 6 seconds or less, under 3 MB. -->
 
 ## 为什么不是插件
 
-我们自己也住在终端里，也不打算劝你搬走。Eitri 走出终端只为一件事：把回复排成文档来读，这是终端的字符格子画不出来的。上面那些 Neovim 插件，以及 tmux 窗格里跑的 `claude`，都让你留在终端、tmux 和 `ssh` 里；Eitri 多出来的是“读”。而且，如果单是 Neovide 本身还不足以让你离开终端，那么 Eitri 的编辑器这一半同样不构成理由：编辑器就是同一个 Neovim，以同样的方式绘制。
+我们自己也是终端的重度用户，也不打算劝你离开终端。Eitri 走出终端只为一件事：把回复排成文档来读，这是终端的字符格子画不出来的。上面那些 Neovim 插件，以及 tmux 窗格里跑的 `claude`，都让你留在终端、tmux 和 `ssh` 里；Eitri 多出来的是“读”。而且，如果单是 Neovide 本身还不足以让你离开终端，那么 Eitri 的编辑器这一半同样不构成理由：编辑器就是同一个 Neovim，以同样的方式绘制。
 
 理由在另一半：读一读 agent 做了什么。在终端或 Neovim buffer 里，回复是画进一个单一字体的字符格子网格里的。Eitri 把它放进 WebView 里排版（正文、表格、代码块、diff），并让它周围的一切仍按 Vim 的方式运作：面板有模式、计数、`gg`/`G`、搜索和你的 leader 键；批准就是在卡片上按 `a`；整个窗口由 tmux 的按键驱动。Zed 和 Cursor 也会渲染 agent 的工作成果，只不过是围绕它们自己的编辑器。
 
@@ -95,7 +95,7 @@ used on, and what was exercised only in the project's headless GUI sandbox. -->
 
 ## 环境要求
 
-- x86_64 的 Linux，glibc ≥ 2.39，GTK ≥ 4.14，WebKitGTK ≥ 2.40（`webkitgtk-6.0` API）：Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 都满足这些要求。需要一个 Wayland 会话和可用的 OpenGL 驱动。
+- x86_64 的 Linux，并且有 `webkitgtk-6.0` API（WebKitGTK 2.40 或更新，必需）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的 glibc 和 GTK 没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 都满足这些要求。需要一个 Wayland 会话和可用的 OpenGL 驱动。
 - `PATH` 上的 Neovim ≥ 0.10，或者由安装脚本单独为 Eitri 获取的一份私有副本（永远不会放上 `PATH`）。
 - 已安装的 Claude Code ≥ 2.1.252 且 < 3.0。Eitri 不捆绑 Claude Code，它运行的是你自己装的那份。
 - 对于在安装时于你机器上构建的 agent sidecar：需要网络访问（安装脚本会获取 Verdandi 源码和它自己锁定版本的 Node.js；不使用系统的 Node 或 npm），以及约 600 MiB 的可用空间。
