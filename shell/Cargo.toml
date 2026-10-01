@@ -154,3 +154,11 @@ harness = false
 [[test]]
 name = "web_host_origin"
 harness = false
+
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. It starts an `Xvfb`
+# of its own (`tests/support/own_x_server.rs`) and refuses any other display, since it sends real keys
+# (see the file's header; needs `Xvfb` and `xdotool`). The agent panel's `j`/`k` over rows of very
+# different heights, measured in the real WebKitGTK at two view heights and two zoom levels.
+[[test]]
+name = "panel_jk_scroll"
+harness = false
