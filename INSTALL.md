@@ -226,8 +226,8 @@ theme directory stays, even one named like Eitri's in a size Eitri does not inst
 `$XDG_DATA_HOME/eitri/nvim` (a private nvim copy), the download cache, and every
 sidecar revision except the one an installed `.deb`/`.rpm` still names in its `/usr/lib/eitri/RELEASE`
 — so uninstalling a tarball install never takes a package install's sidecar with it. It always keeps
-`~/.config/eitri` (your `init.lua`) and `$XDG_STATE_HOME/eitri` (per-project layout, prompt
-history, saved permission rules) unless you pass `--purge`; nothing named `nvim`/`vim`/`vi` outside
+`~/.config/eitri` (your `init.lua`) and `$XDG_STATE_HOME/eitri` (per-project layout, open tabs,
+prompt history, saved permission rules) unless you pass `--purge`; nothing named `nvim`/`vim`/`vi` outside
 `$XDG_DATA_HOME/eitri/nvim` is ever touched. For a `.deb`/`.rpm` install, the package itself never
 owns the per-user sidecar or private nvim, so removing it (`sudo apt remove eitri` / `sudo dnf remove
 eitri`) leaves both behind — **and order matters for cleaning them up**. `eitri setup --uninstall`
@@ -258,7 +258,7 @@ a sidecar revision once no install uses it, as [Updating](#updating) describes.
 $XDG_DATA_HOME/eitri/sidecar/<rev>/                              the sidecar eitri setup built, per-user routes
 $XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               a private nvim copy, only if you accepted the offer
 ~/.config/eitri/init.lua                                         your own config (EITRI_CONFIG_DIR overrides the dir)
-$XDG_STATE_HOME/eitri/                                           per-project layout, prompt history, permission rules
+$XDG_STATE_HOME/eitri/                                           per-project layout, open tabs, prompt history, permission rules
 ```
 
 The sidecar row is per-user for every route above — **except AUR** (`eitri-bin`/`eitri-git`),
@@ -269,6 +269,30 @@ falls back to `~/.local/share`, `~/.cache` and `~/.local/state` respectively —
 itself uses, so the installer and the running program never disagree about where to look. The private
 nvim copy is never placed on `PATH` and never replaces, links or removes anything else named
 `nvim`/`vim`/`vi` on your system.
+
+## How a launch starts: two `init.lua` settings
+
+Both go in `~/.config/eitri/init.lua`, and a value other than the ones named here stops Eitri at
+startup with a message naming the setting.
+
+```lua
+eitri.config.set("agent.restore", "offer")        -- "offer" (the default), "auto" or "off"
+eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "bypass"
+```
+
+- **`agent.restore`** is what happens to the tabs the last window on this project had open. Eitri
+  keeps the tabs that have a Claude session (their order, names, modes and which one was on screen)
+  as it goes, and never records "no tabs" because you closed the window. With `"offer"` the empty
+  tab's dashboard shows a `Restore last session` line, `s`, while nothing in the window has started;
+  `"auto"` brings the tabs back at launch with no key pressed; `"off"` neither offers nor remembers.
+  Each tab is resumed (nothing is sent until you type), the one on screen last time is on screen
+  again, and one message says how many came back. A tab is skipped, and named, when its saved
+  record is gone or another window holds its session. A tab that was in bypass is never put back in
+  bypass without a yes: `s` asks first, and `n` (or `"auto"`) brings it back in auto.
+- **`agent.default_mode`** is the mode a new tab starts in, for a project where you have not left
+  bypass with `Shift+Tab` (that choice is remembered per project and keeps winning). Setting it to
+  `"bypass"` is the one way a window starts in bypass without asking, because you have said so in
+  your own file; it also lets saved bypass tabs come back in bypass without the question.
 
 ## Troubleshooting
 

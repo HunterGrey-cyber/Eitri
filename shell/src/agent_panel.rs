@@ -24,13 +24,18 @@
 
 use eitri_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
 use eitri_core::agent_bridge::{
-    parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
-    serialize_hello_for_js, serialize_nav_key_for_js, ChooserRecord, ChooserTab, DetailRow, InboundMessage,
-    NavKeyDirection, PaneNavDirection, PanelKeys, TabVerbWire,
+    parse_inbound_message, serialize_command_result_for_js, serialize_confirm_restore_for_js, serialize_error_for_js,
+    serialize_events_for_js, serialize_hello_with_restore_for_js, serialize_nav_key_for_js, ChooserRecord, ChooserTab,
+    DetailRow, InboundMessage, NavKeyDirection, PaneNavDirection, PanelKeys, SessionModeChoice, TabVerbWire,
 };
 use eitri_core::keymap::TabAction;
 use eitri_core::layout::Direction;
-use eitri_core::tab_set::{FirstTurn, PendingHandoff, PendingStart, ResumeRoute, StartCollected, Tab, TabBackend};
+use eitri_core::saved_tabs::{SavedTabs, TabMemory};
+use eitri_core::tab_restore::{RestoreOffer, RestorePolicy, RestoreRun};
+use eitri_core::tab_set::{
+    BypassPolicy, FirstTurn, PendingHandoff, PendingStart, RestoreGo, RestorePrompt, RestoreStep, ResumeRoute,
+    StartCollected, Tab, TabBackend,
+};
 use eitri_core::tabs::TabId;
 use gtk4::prelude::*;
 use gtk4::Application;
@@ -515,7 +520,33 @@ struct AgentPanelState {
     /// Re-armed by a manual recovery, never by the automatic path itself --
     /// `AgentPanelHandle::reload_document_by_hand`'s own doc says why.
     crash_guard: crate::webview_crash_guard::WebViewCrashGuard,
+    /// Keeps `$XDG_STATE_HOME/eitri/tabs/<project>.json` in step with the tabs, once per tick.
+    tab_memory: TabMemory,
+    /// This project's conversation id (`agent::conversation_id_for_cwd` of its canonical root), which
+    /// every saved tab carries.
+    conversation_id: String,
+    /// What the last window on this project left open, read once at launch. The launch dashboard
+    /// offers it, or `agent.restore = "auto"` brings it back; either way it is used up. `None` when
+    /// there was nothing, it was unusable, or `agent.restore` is `"off"`.
+    restore_source: Option<SavedTabs>,
+    /// `agent.restore`, as `init.lua` left it (applied once, after it ran).
+    restore_policy: RestorePolicy,
+    /// Whether `init.lua` made bypass the default mode: the one user whose saved bypass tabs come
+    /// back in bypass without being asked.
+    bypass_by_config: bool,
+    /// Whether this project remembers a mode Shift+Tab left, which the configured default yields to.
+    mode_remembered: bool,
+    /// A restore whose resumes have not all returned yet.
+    restore_run: Option<RestoreRun>,
+    /// Whether the hello last sent could carry the restore offer, so the tick sends a new one only
+    /// when that changes.
+    last_restore_offered: bool,
+    /// Where a restore's one-line result goes: `main.rs`'s window toast.
+    toast_hook: Option<ToastHook>,
 }
+
+/// [`AgentPanelState::toast_hook`]: shows one line in the window's toast.
+type ToastHook = Rc<dyn Fn(&str)>;
 
 /// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
 type AttentionHook = Rc<dyn Fn(eitri_core::attention::Attention, eitri_core::attention::Attention)>;
@@ -853,6 +884,36 @@ impl AgentPanelHandle {
                 .borrow_mut()
                 .set_cadence(cadence_hz);
         }
+    }
+
+    /// `agent.restore` as `init.lua` left it, applied once after it ran. `Off` also stops the tabs
+    /// being remembered at all and forgets what the last window left.
+    pub(crate) fn set_restore_policy(&self, policy: RestorePolicy) {
+        let mut state = self.state.borrow_mut();
+        state.restore_policy = policy;
+        if policy == RestorePolicy::Off {
+            state.tab_memory.disable();
+            state.restore_source = None;
+        }
+    }
+
+    /// `agent.default_mode` as `init.lua` left it (`None`: unset), applied once after it ran. A mode
+    /// Shift+Tab left for this project keeps winning; otherwise the empty tab the window already has,
+    /// and every new one, start in it. Naming bypass here is the user's own answer to the question
+    /// that is otherwise asked every time, so saved bypass tabs also come back in bypass unasked.
+    pub(crate) fn set_default_mode(&self, mode: Option<SessionModeChoice>) {
+        let mut state = self.state.borrow_mut();
+        state.bypass_by_config = mode == Some(SessionModeChoice::Bypass);
+        if let Some(mode) = mode {
+            if !state.mode_remembered {
+                state.tabs.apply_configured_default(mode);
+            }
+        }
+    }
+
+    /// Where a restore's one-line result goes. `main.rs` installs this once.
+    pub(crate) fn on_toast(&self, hook: impl Fn(&str) + 'static) {
+        self.state.borrow_mut().toast_hook = Some(Rc::new(hook));
     }
 
     /// Records whether this panel's pane has keyboard focus and tells the live document, which
@@ -1455,6 +1516,7 @@ fn panel_state(
     for note in notes {
         eprintln!("{note}");
     }
+    let mode_remembered = eitri_core::agent_prefs::remembers_a_choice(prefs_dir.as_deref(), &project_dir);
     let history_dir = eitri_core::prompt_history::state_dir(state_home.as_deref(), home.as_deref());
     let rules_dir = eitri_core::permission_store::state_dir(state_home.as_deref(), home.as_deref());
     let (history, notes) = eitri_core::prompt_history::startup(history_dir.as_deref(), &project_dir);
@@ -1469,13 +1531,24 @@ fn panel_state(
     tabs.set_rules(rules);
     // The key a session lease is taken under (`AgentConversation` canonicalizes its cwd the same
     // way). `main.rs` already canonicalized the root; this only makes the string explicit.
-    let canonical_project_dir = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.clone())
-        .to_string_lossy()
-        .into_owned();
+    let canonical_root = project_dir.canonicalize().unwrap_or_else(|_| project_dir.clone());
+    let canonical_project_dir = canonical_root.to_string_lossy().into_owned();
+    let tabs_dir = eitri_core::saved_tabs::state_dir(state_home.as_deref(), home.as_deref());
+    let (restore_source, notes) = eitri_core::saved_tabs::startup(tabs_dir.as_deref(), &project_dir);
+    for note in notes {
+        eprintln!("{note}");
+    }
     AgentPanelState {
         tabs,
+        tab_memory: TabMemory::new(tabs_dir, project_dir.clone()),
+        conversation_id: agent::conversation_id_for_cwd(&canonical_root),
+        restore_source,
+        restore_policy: RestorePolicy::Offer,
+        bypass_by_config: false,
+        mode_remembered,
+        restore_run: None,
+        last_restore_offered: false,
+        toast_hook: None,
         editor_context,
         backend_kind,
         project_dir,
@@ -1667,6 +1740,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         send_context_if_changed(&state, &webview);
         poll_scratch_edits(&state, &webview);
         send_tabs_if_changed(&state, &webview);
+        remember_tabs(&state);
         send_hello_if_open_sessions_changed(&state, &webview);
         // After the payload, not before it: a reaction that sends the panel an envelope -- one
         // that lands on a card, say -- must find the card it names already there (Task 10's
@@ -1861,15 +1935,245 @@ fn send_hello_if_open_sessions_changed(state: &Rc<RefCell<AgentPanelState>>, web
             return;
         }
         let open = state_ref.tabs.open_session_ids();
-        if open == state_ref.last_open_ids {
+        // The saved tabs are on offer only while nothing here has started: when that stops being
+        // true the dashboard's line has to go, though no session id changed with it.
+        let offered = restore_is_on_offer(&state_ref);
+        if open == state_ref.last_open_ids && offered == state_ref.last_restore_offered {
             return;
         }
         let mut greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
         greeting.resumable.retain(|r| !open.contains(&r.provider_session_id));
+        let offer = restore_offer(&state_ref, &greeting);
         state_ref.last_open_ids = open;
-        serialize_hello_for_js(&greeting)
+        state_ref.last_restore_offered = offered;
+        serialize_hello_with_restore_for_js(&greeting, offer.as_ref())
     };
     evaluate_js_dispatch(webview, &payload);
+}
+
+/// Whether the launch dashboard may offer to bring the last window's tabs back at all: the policy is
+/// to offer, there is something saved, no tab here has started a session and no restore is running.
+fn restore_is_on_offer(state: &AgentPanelState) -> bool {
+    state.restore_policy == RestorePolicy::Offer
+        && state.restore_source.is_some()
+        && state.restore_run.is_none()
+        && state.tabs.is_pristine()
+}
+
+/// What the dashboard says it can bring back: the saved tabs that still can be, `None` when that is
+/// none (a key that restores nothing is never offered).
+fn restore_offer(state: &AgentPanelState, greeting: &BackendGreeting) -> Option<RestoreOffer> {
+    if !restore_is_on_offer(state) {
+        return None;
+    }
+    restore_plan(state, greeting).offer()
+}
+
+/// Which of the saved tabs can come back, judged against the records and leases as they are now.
+fn restore_plan(state: &AgentPanelState, greeting: &BackendGreeting) -> eitri_core::tab_restore::RestorePlan {
+    let canonical = state.canonical_project_dir.as_str();
+    let saved = state.restore_source.clone().unwrap_or_default();
+    eitri_core::tab_restore::plan(&saved, &greeting.resumable, &state.tabs.open_session_ids(), |id| {
+        agent::lease::SessionLease::is_held("claude", canonical, id).unwrap_or(false)
+    })
+}
+
+/// Where a restore was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreAsk {
+    /// `s` on the launch dashboard: a saved bypass tab is asked about first.
+    Dashboard,
+    /// `agent.restore = "auto"`: nobody pressed a key, so nothing can be asked.
+    Launch,
+}
+
+/// What asking for, or answering, a restore did.
+enum RestoreResult {
+    /// Why nothing was started.
+    Refused(String),
+    /// A saved tab was in bypass; the page shows the question and answers it.
+    Question(RestorePrompt),
+    /// Every saved tab that could be has been started or skipped. `notice` is what the band says.
+    Started { notice: Option<String> },
+}
+
+/// Begins one resume: given a session and the lease already taken for it, the receiver its result
+/// will arrive on.
+type SpawnResume<'a> =
+    &'a mut dyn FnMut(&str, agent::lease::SessionLease) -> mpsc::Receiver<Result<AgentBackend, BackendError>>;
+
+/// A restore's resumes, as the real workers start them.
+fn resume_spawner(
+    state: &AgentPanelState,
+) -> impl FnMut(&str, agent::lease::SessionLease) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
+    let (kind, project_dir) = (state.backend_kind, state.project_dir.clone());
+    move |id, lease| spawn_connect_holding(kind, project_dir.clone(), Some(id.to_string()), Some(lease))
+}
+
+/// Asks for the last window's tabs back, into `from` (the empty tab the key was pressed in) and new
+/// tabs. Nothing is started unless this window has started nothing yet.
+fn ask_for_restore(state: &mut AgentPanelState, from: TabId, ask: RestoreAsk, spawn: SpawnResume<'_>) -> RestoreResult {
+    if state.backend_kind != BackendKind::Sidecar {
+        return RestoreResult::Refused("only the sidecar backend can resume sessions".to_string());
+    }
+    if state.restore_run.is_some() {
+        return RestoreResult::Refused("the last session's tabs are already being restored".to_string());
+    }
+    if !state.tabs.is_pristine() {
+        return RestoreResult::Refused(
+            "the last session's tabs can be restored only before a session has started".to_string(),
+        );
+    }
+    if state.restore_source.is_none() {
+        return RestoreResult::Refused("there are no saved tabs to restore".to_string());
+    }
+    let greeting = BackendGreeting::for_kind(state.backend_kind, state.project_dir.clone());
+    let plan = restore_plan(state, &greeting);
+    // A launch has one go at it, whatever comes of it: a reload of the page must not try again.
+    if ask == RestoreAsk::Launch {
+        state.restore_source = None;
+    }
+    let policy = if state.bypass_by_config {
+        BypassPolicy::Keep
+    } else if ask == RestoreAsk::Launch {
+        BypassPolicy::Downgrade
+    } else {
+        BypassPolicy::Ask
+    };
+    match state.tabs.begin_restore(plan, policy) {
+        RestoreStep::Confirm(prompt) => RestoreResult::Question(prompt),
+        RestoreStep::Go(go) => start_restore(state, from, go, spawn),
+    }
+}
+
+/// `y` or `n` to the question [`ask_for_restore`] raised.
+fn answer_restore_question(
+    state: &mut AgentPanelState,
+    nonce: u64,
+    keep_bypass: bool,
+    spawn: SpawnResume<'_>,
+) -> RestoreResult {
+    match state.tabs.answer_restore(nonce, keep_bypass) {
+        Err(why) => RestoreResult::Refused(why),
+        Ok(go) => {
+            let from = state.tabs.active();
+            start_restore(state, from, go, spawn)
+        }
+    }
+}
+
+/// Takes every lease first and only then starts the resumes, so that nothing -- a record pruned to
+/// make room for another session, another window -- can claim a saved session between the decision
+/// and its own resume. A session whose lease cannot be taken is skipped with the reason.
+fn start_restore(state: &mut AgentPanelState, from: TabId, go: RestoreGo, spawn: SpawnResume<'_>) -> RestoreResult {
+    let canonical = state.canonical_project_dir.clone();
+    let mut leases: std::collections::HashMap<String, Result<agent::lease::SessionLease, String>> = go
+        .session_ids()
+        .into_iter()
+        .map(|id| {
+            let lease = match agent::lease::SessionLease::try_acquire("claude", &canonical, &id) {
+                Ok(lease) => Ok(lease),
+                Err(agent::lease::LeaseError::AlreadyHeld) => Err(eitri_core::tab_restore::HELD_ELSEWHERE.to_string()),
+                Err(other) => Err(format!("its session lease could not be taken ({other})")),
+            };
+            (id, lease)
+        })
+        .collect();
+    let (downgraded, asked) = (go.downgraded, go.asked);
+    let run = state.tabs.start_restore(from, go, |id| match leases.remove(id) {
+        Some(Ok(lease)) => Ok(spawn(id, lease)),
+        Some(Err(reason)) => Err(reason),
+        None => Err("it was listed twice".to_string()),
+    });
+    state.restore_source = None;
+    state.restore_run = Some(run);
+    let notice = (downgraded > 0 && !asked).then(|| {
+        let tabs = if downgraded == 1 { "tab" } else { "tabs" };
+        format!("{downgraded} bypass {tabs} came back in auto; Shift+Tab then y switches")
+    });
+    RestoreResult::Started { notice }
+}
+
+/// Once every resume of a restore has returned, its one message: to the log and to the window's toast.
+fn finish_restore(state: &Rc<RefCell<AgentPanelState>>) {
+    let message = {
+        let mut state_ref = state.borrow_mut();
+        let AgentPanelState { restore_run, tabs, .. } = &mut *state_ref;
+        // A tab the user closed while it was still connecting will never report: it is not waited for.
+        if let Some(run) = restore_run.as_mut() {
+            run.forget_closed(|tab| tabs.get(tab).is_some());
+        }
+        let outcome = state_ref.restore_run.as_ref().and_then(|run| run.outcome());
+        outcome.map(|outcome| {
+            state_ref.restore_run = None;
+            outcome.message()
+        })
+    };
+    let Some(message) = message else { return };
+    eprintln!("[restore] {message}");
+    let hook = state.borrow().toast_hook.clone();
+    if let Some(hook) = hook {
+        hook(&message);
+    }
+}
+
+/// What a [`RestoreResult`] owes the page; `Err` is a refusal for the caller to report.
+fn deliver_restore(
+    state: &Rc<RefCell<AgentPanelState>>,
+    webview: &WebView,
+    result: RestoreResult,
+) -> Result<(), String> {
+    match result {
+        RestoreResult::Refused(why) => Err(why),
+        RestoreResult::Question(prompt) => {
+            evaluate_js_dispatch(webview, &serialize_confirm_restore_for_js(&prompt));
+            Ok(())
+        }
+        RestoreResult::Started { notice } => {
+            send_switch(state, webview);
+            if let Some(notice) = notice {
+                evaluate_js_dispatch(webview, &eitri_core::agent_bridge::serialize_notice_for_js(&notice));
+            }
+            finish_restore(state);
+            Ok(())
+        }
+    }
+}
+
+/// `agent.restore = "auto"`: on the first page that says `ready`, bring the last window's tabs back
+/// with no key pressed. Used up on its first go, so a reload of the page does not do it again.
+fn restore_at_launch(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let result = {
+        let mut state_ref = state.borrow_mut();
+        if state_ref.restore_policy != RestorePolicy::Auto || state_ref.restore_source.is_none() {
+            return;
+        }
+        let from = state_ref.tabs.active();
+        let mut spawn = resume_spawner(&state_ref);
+        ask_for_restore(&mut state_ref, from, RestoreAsk::Launch, &mut spawn)
+    };
+    if let Err(why) = deliver_restore(state, webview, result) {
+        eprintln!("[restore] not restored: {why}");
+    }
+}
+
+/// Keeps the saved-tabs file in step with the tabs: once per tick, cheap when nothing changed.
+fn remember_tabs(state: &Rc<RefCell<AgentPanelState>>) {
+    let mut state_ref = state.borrow_mut();
+    let state_ref = &mut *state_ref;
+    let snapshot = state_ref.tabs.saved_snapshot(&state_ref.conversation_id);
+    match state_ref.tab_memory.observe(snapshot) {
+        Some(Err(e)) => eprintln!("[tabs] could not save the open tabs: {e}"),
+        Some(Ok(written)) => {
+            if let Some(aside) = written.set_aside {
+                eprintln!(
+                    "[tabs] an unusable saved-tabs file was set aside as {}",
+                    aside.display()
+                );
+            }
+        }
+        None => {}
+    }
 }
 
 /// The chooser's envelope (`prefix w`): the open tabs in number order, then every record open
@@ -2043,9 +2347,20 @@ fn spawn_connect(
     project_dir: PathBuf,
     resume: Option<String>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
+    spawn_connect_holding(kind, project_dir, resume, None)
+}
+
+/// [`spawn_connect`] for a resume whose session lease is already held: the worker hands it to the
+/// resume, which keeps it for as long as the session lives.
+fn spawn_connect_holding(
+    kind: BackendKind,
+    project_dir: PathBuf,
+    resume: Option<String>,
+    lease: Option<agent::lease::SessionLease>,
+) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = AgentBackend::start(kind, &project_dir, resume.as_deref());
+        let result = AgentBackend::start_holding(kind, &project_dir, resume.as_deref(), lease);
         // The receiver is gone only if the tab or the panel was torn down mid-connect; dropping
         // the backend here is then the cleanup (`Retiring` normally holds the receiver instead).
         let _ = result_tx.send(result);
@@ -2150,12 +2465,16 @@ fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, webvi
 fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     let collected = state.borrow_mut().tabs.collect_starts();
     for result in collected {
+        let part_of_a_restore = account_for_restore(&mut state.borrow_mut(), &result);
         match result {
             StartCollected::Installed {
                 tab,
                 request_id,
                 first_turn,
             } => {
+                // A tab a restore started: nobody asked for this connect by name, so there is no
+                // `command_result` owed -- the restore reports once, when its last resume is back.
+                let restored = part_of_a_restore != RestoreStart::NotPartOfOne;
                 // The panel has been showing this tab as starting; give it the real projection at
                 // once rather than making it wait for the first event.
                 let payloads = {
@@ -2167,9 +2486,11 @@ fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, webview: &WebVie
                     }
                 };
                 dispatch_all(webview, payloads);
-                match first_turn {
-                    Some(turn) => send_first_turn(state, webview, tab, &request_id, turn),
-                    None => evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(()))),
+                if !restored {
+                    match first_turn {
+                        Some(turn) => send_first_turn(state, webview, tab, &request_id, turn),
+                        None => evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(()))),
+                    }
                 }
             }
             StartCollected::Failed { tab, request_id, error } => {
@@ -2177,6 +2498,14 @@ fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, webview: &WebVie
                     "[agent_panel] tab {}: backend failed to start: {}",
                     tab.0, error.message
                 );
+                // A tab a restore started is reported with the rest of the restore, and was tidied
+                // away by `account_for_restore`, rather than left on screen as a dead tab each.
+                if let RestoreStart::Failed { was_active } = part_of_a_restore {
+                    if was_active {
+                        send_switch(state, webview);
+                    }
+                    continue;
+                }
                 evaluate_js_dispatch(
                     webview,
                     &serialize_command_result_for_js(&request_id, Err(&error.message)),
@@ -2187,6 +2516,50 @@ fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, webview: &WebVie
                 }
             }
         }
+    }
+    finish_restore(state);
+}
+
+/// How one collected connect relates to the restore in progress, if there is one.
+#[derive(Debug, PartialEq, Eq)]
+enum RestoreStart {
+    /// An ordinary connect (a resume by hand, a first message): handled as it always was.
+    NotPartOfOne,
+    Installed,
+    /// A resume the restore started was refused. The tab is already tidied away; `was_active` says
+    /// the page was showing it, so it must be told which tab it is showing now.
+    Failed {
+        was_active: bool,
+    },
+}
+
+/// Counts a collected connect into the restore that started it. A refused one is also taken off the
+/// screen: an empty tab again if the restore began in it, gone if the restore made it.
+fn account_for_restore(state: &mut AgentPanelState, collected: &StartCollected) -> RestoreStart {
+    let AgentPanelState { restore_run, tabs, .. } = state;
+    let Some(run) = restore_run.as_mut() else {
+        return RestoreStart::NotPartOfOne;
+    };
+    match collected {
+        StartCollected::Installed { tab, .. } if run.owns(*tab) => {
+            run.note_installed(*tab);
+            RestoreStart::Installed
+        }
+        StartCollected::Failed { tab, error, .. } if run.owns(*tab) => {
+            let back_to = run.back_to(*tab);
+            run.note_failed(*tab, &error.message);
+            let was_active = tabs.active() == *tab;
+            tabs.discard_failed_restore(*tab, back_to);
+            // The tab on screen did not come back: the first that did (or is coming) takes its place,
+            // rather than leaving an empty dashboard over tabs that restored.
+            if was_active {
+                if let Some(survivor) = run.first_survivor() {
+                    tabs.select(survivor);
+                }
+            }
+            RestoreStart::Failed { was_active }
+        }
+        _ => RestoreStart::NotPartOfOne,
     }
 }
 
@@ -2343,6 +2716,8 @@ fn handoff_payloads(
 /// window-level envelopes in `window` (the history, then the editor context), then the
 /// `tabs` envelope, then the active tab's own state. The handoff card is now one of the active
 /// tab's own payloads (`TabSet::active_state_payloads`), as its snapshot is.
+// One parameter per thing the page is owed, in the order it receives them.
+#[allow(clippy::too_many_arguments)]
 fn ready_payloads(
     mut greeting: BackendGreeting,
     open: &[String],
@@ -2351,11 +2726,12 @@ fn ready_payloads(
     active: Vec<String>,
     theme: Option<&str>,
     keymap: Option<&str>,
+    restore: Option<&RestoreOffer>,
 ) -> Vec<String> {
     // Ruling 17: no session open in any tab, or handed off from one, is offered for resume -- the
     // lease refuses a second driver, and a handed-off one has a CLI writing it.
     greeting.resumable.retain(|r| !open.contains(&r.provider_session_id));
-    let mut payloads = vec![serialize_hello_for_js(&greeting)];
+    let mut payloads = vec![serialize_hello_with_restore_for_js(&greeting, restore)];
     payloads.extend(theme.map(str::to_string));
     payloads.extend(keymap.map(str::to_string));
     // Window-level state (the history, then the editor context), before the tabs that use it.
@@ -2755,26 +3131,60 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 ];
                 let tabs = tabs_payload_recorded(state_ref);
                 let active = state_ref.tabs.active_state_payloads();
+                // What the last window left open, if the dashboard may offer it: a reloaded page
+                // is told again, like everything else in the greeting.
+                let mut offered_greeting = greeting;
+                offered_greeting
+                    .resumable
+                    .retain(|r| !open.contains(&r.provider_session_id));
+                let offer = restore_offer(state_ref, &offered_greeting);
                 let mut payloads = ready_payloads(
-                    greeting,
+                    offered_greeting,
                     &open,
                     window,
                     tabs,
                     active,
                     Some(&theme),
                     state_ref.keymap_help.as_deref(),
+                    offer.as_ref(),
                 );
                 // Last, so nothing the document draws from the payloads above can reset it.
                 payloads.push(eitri_core::agent_bridge::serialize_pane_focus_for_js(
                     state_ref.pane_focused,
                 ));
                 state_ref.last_open_ids = open;
+                state_ref.last_restore_offered = restore_is_on_offer(state_ref);
                 // Ruling 38: from here on the tick may send into this document.
                 state_ref.document_ready = true;
                 payloads
             };
             dispatch_all(webview, payloads);
             ok(webview);
+            // `agent.restore = "auto"`: only once the page can take what it starts.
+            restore_at_launch(state, webview);
+        }
+        InboundMessage::RestoreLast { .. } => {
+            let tab = tab_of(target);
+            let result = {
+                let mut state_ref = state.borrow_mut();
+                let mut spawn = resume_spawner(&state_ref);
+                ask_for_restore(&mut state_ref, tab, RestoreAsk::Dashboard, &mut spawn)
+            };
+            match deliver_restore(state, webview, result) {
+                Ok(()) => ok(webview),
+                Err(why) => refuse(webview, &why),
+            }
+        }
+        InboundMessage::RestoreAnswer { nonce, keep_bypass, .. } => {
+            let result = {
+                let mut state_ref = state.borrow_mut();
+                let mut spawn = resume_spawner(&state_ref);
+                answer_restore_question(&mut state_ref, nonce, keep_bypass, &mut spawn)
+            };
+            match deliver_restore(state, webview, result) {
+                Ok(()) => ok(webview),
+                Err(why) => refuse(webview, &why),
+            }
         }
         InboundMessage::SendMessage { text, .. } => {
             let tab = tab_of(target);
@@ -4103,6 +4513,15 @@ mod tests {
             nav_mode: Cell::new(PanelKeys::Other),
             nav_fallthrough_hook: None,
             crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+            tab_memory: TabMemory::new(None, PathBuf::new()),
+            conversation_id: String::new(),
+            restore_source: None,
+            restore_policy: RestorePolicy::Offer,
+            bypass_by_config: false,
+            mode_remembered: false,
+            restore_run: None,
+            last_restore_offered: false,
+            toast_hook: None,
         }))
     }
 
@@ -4676,6 +5095,7 @@ mod tests {
             vec![],
             Some(&theme),
             Some(&keymap),
+            None,
         );
         assert_eq!(
             kinds(&payloads),
@@ -4884,6 +5304,7 @@ mod tests {
             vec![snapshot],
             Some(&theme),
             Some(&keymap),
+            None,
         );
         assert_eq!(kinds(&payloads), vec!["hello", "theme", "keymap", "tabs", "snapshot"]);
     }
@@ -4910,6 +5331,7 @@ mod tests {
             vec![],
             "{}".to_string(),
             vec![],
+            None,
             None,
             None,
         );
@@ -5351,6 +5773,7 @@ mod tests {
             vec![eitri_core::agent_bridge::serialize_handoff_for_js(TabId(1), &command)],
             None,
             None,
+            None,
         );
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         assert!(
@@ -5378,6 +5801,7 @@ mod tests {
                 "{\"kind\":\"tabs\"}".to_string(),
                 vec![],
                 None,
+                None,
                 None
             )),
             vec!["hello", "tabs"]
@@ -5394,6 +5818,7 @@ mod tests {
             vec![],
             "{\"kind\":\"tabs\"}".to_string(),
             vec![],
+            None,
             None,
             None
         ))
@@ -5412,6 +5837,7 @@ mod tests {
                 "{\"kind\":\"tabs\"}".to_string(),
                 vec![],
                 Some(&theme),
+                None,
                 None
             )),
             vec!["hello", "theme", "tabs"]
@@ -5423,6 +5849,7 @@ mod tests {
             "{\"kind\":\"tabs\"}".to_string(),
             vec![r#"{"kind":"snapshot","tab":1,"throughRevision":3,"state":{}}"#.to_string()],
             Some(&theme),
+            None,
             None,
         );
         assert_eq!(kinds(&payloads), vec!["hello", "theme", "tabs", "snapshot"]);
@@ -5448,7 +5875,8 @@ mod tests {
                 "{\"kind\":\"tabs\"}".to_string(),
                 vec![],
                 Some(&theme),
-                Some(&keymap)
+                Some(&keymap),
+                None
             )),
             vec!["hello", "theme", "keymap", "tabs"]
         );
@@ -5493,7 +5921,7 @@ mod tests {
         let command = a_command();
         // The tab set's `open_session_ids` includes a handed-off session (ruling 13).
         let open = vec![command.provider_session_id().to_string()];
-        let payloads = ready_payloads(greeting, &open, vec![], "{}".to_string(), vec![], None, None);
+        let payloads = ready_payloads(greeting, &open, vec![], "{}".to_string(), vec![], None, None, None);
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         let offered: Vec<&str> = hello["resumableSessions"]
             .as_array()
@@ -5547,5 +5975,685 @@ mod tests {
             !payloads.iter().any(|p| p.contains("1857dcd5-973b-46a2")),
             "a failed close leaked the resume command anyway: {payloads:?}"
         );
+    }
+
+    // ---- bringing the last window's tabs back --------------------------------------------------
+
+    /// A project directory with resumable records for `records` and a panel state whose last window
+    /// left `saved` open.
+    fn restore_panel(
+        label: &str,
+        saved: &[(&str, Option<&str>, SessionModeChoice)],
+        records: &[&str],
+    ) -> (Rc<RefCell<AgentPanelState>>, PathBuf) {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        let conversation_id = agent::conversation_id_for_cwd(&dir);
+        for id in records {
+            agent::persistence::save_conversation_record(&agent::persistence::ConversationRecord {
+                conversation_id: conversation_id.clone(),
+                provider: "claude".to_string(),
+                provider_session_id: id.to_string(),
+                canonical_cwd: dir.to_string_lossy().into_owned(),
+                created_at: "1".to_string(),
+                updated_at: "2".to_string(),
+                provider_advertised_resume: true,
+                title: Some(format!("title of {id}")),
+                name: None,
+            })
+            .unwrap();
+        }
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        {
+            let mut s = state.borrow_mut();
+            s.project_dir = dir.clone();
+            s.canonical_project_dir = dir.to_string_lossy().into_owned();
+            s.conversation_id = conversation_id.clone();
+            s.restore_source = Some(SavedTabs {
+                tabs: saved
+                    .iter()
+                    .map(|(id, name, mode)| eitri_core::saved_tabs::SavedTab {
+                        conversation_id: conversation_id.clone(),
+                        provider_session_id: id.to_string(),
+                        name: name.map(str::to_string),
+                        mode: *mode,
+                    })
+                    .collect(),
+                active: 0,
+            });
+        }
+        (state, dir)
+    }
+
+    /// Spawns nothing: records each session it is asked to resume and the lease it was handed, and
+    /// keeps the sender so the test decides how that resume ends.
+    #[derive(Default)]
+    struct FakeResumes {
+        asked: Vec<String>,
+        leases: Vec<agent::lease::SessionLease>,
+        senders: Vec<mpsc::Sender<Result<AgentBackend, BackendError>>>,
+        held_when_first_asked: Option<Vec<bool>>,
+        all: Vec<String>,
+    }
+
+    impl FakeResumes {
+        fn spawner(
+            &mut self,
+            canonical: String,
+        ) -> impl FnMut(&str, agent::lease::SessionLease) -> mpsc::Receiver<Result<AgentBackend, BackendError>> + '_
+        {
+            move |id, lease| {
+                if self.held_when_first_asked.is_none() {
+                    self.held_when_first_asked = Some(
+                        self.all
+                            .iter()
+                            .map(|other| {
+                                agent::lease::SessionLease::is_held("claude", &canonical, other).unwrap_or(false)
+                            })
+                            .collect(),
+                    );
+                }
+                self.asked.push(id.to_string());
+                self.leases.push(lease);
+                let (tx, rx) = mpsc::channel();
+                self.senders.push(tx);
+                rx
+            }
+        }
+    }
+
+    fn ask(state: &Rc<RefCell<AgentPanelState>>, resumes: &mut FakeResumes, how: RestoreAsk) -> RestoreResult {
+        let mut s = state.borrow_mut();
+        let from = s.tabs.active();
+        let canonical = s.canonical_project_dir.clone();
+        let mut spawn = resumes.spawner(canonical);
+        ask_for_restore(&mut s, from, how, &mut spawn)
+    }
+
+    fn answer(
+        state: &Rc<RefCell<AgentPanelState>>,
+        resumes: &mut FakeResumes,
+        nonce: u64,
+        keep: bool,
+    ) -> RestoreResult {
+        let mut s = state.borrow_mut();
+        let canonical = s.canonical_project_dir.clone();
+        let mut spawn = resumes.spawner(canonical);
+        answer_restore_question(&mut s, nonce, keep, &mut spawn)
+    }
+
+    fn started(result: RestoreResult) -> Option<String> {
+        match result {
+            RestoreResult::Started { notice } => notice,
+            RestoreResult::Refused(why) => panic!("refused: {why}"),
+            RestoreResult::Question(prompt) => panic!("asked: {:?}", prompt.lines),
+        }
+    }
+
+    fn mode(state: &Rc<RefCell<AgentPanelState>>, session: &str) -> SessionModeChoice {
+        let s = state.borrow();
+        s.tabs.get(s.tabs.tab_with_session(session).unwrap()).unwrap().mode()
+    }
+
+    use SessionModeChoice::{Auto, Bypass};
+
+    #[test]
+    fn the_dashboard_offers_the_saved_tabs_that_can_still_come_back() {
+        let (state, _dir) = restore_panel(
+            "restore-offer",
+            &[
+                ("s-a", None, Auto),
+                ("s-b", Some("api"), Bypass),
+                ("s-gone", None, Auto),
+            ],
+            &["s-a", "s-b"],
+        );
+        let s = state.borrow();
+        let greeting = BackendGreeting::for_kind(s.backend_kind, s.project_dir.clone());
+        assert!(restore_is_on_offer(&s));
+        let offer = restore_offer(&s, &greeting).expect("two tabs can come back");
+        assert_eq!(offer.labels, vec!["title of s-a".to_string(), "api".to_string()]);
+        assert_eq!(offer.bypass, 1);
+    }
+
+    #[test]
+    fn nothing_is_offered_after_a_session_started_under_another_policy_or_when_nothing_would_come_back() {
+        let (state, _dir) = restore_panel("restore-not-offered", &[("s-a", None, Auto)], &["s-a"]);
+        let greeting = {
+            let s = state.borrow();
+            BackendGreeting::for_kind(s.backend_kind, s.project_dir.clone())
+        };
+        assert!(restore_offer(&state.borrow(), &greeting).is_some());
+
+        state.borrow_mut().restore_policy = RestorePolicy::Auto;
+        assert!(
+            restore_offer(&state.borrow(), &greeting).is_none(),
+            "auto restores at launch, it does not offer"
+        );
+        state.borrow_mut().restore_policy = RestorePolicy::Off;
+        assert!(restore_offer(&state.borrow(), &greeting).is_none());
+        state.borrow_mut().restore_policy = RestorePolicy::Offer;
+
+        // A tab that has started a session: this is no longer a launch.
+        let started_tab = state.borrow().tabs.active();
+        let (_tx, rx) = mpsc::channel();
+        state.borrow_mut().tabs.get_mut(started_tab).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "r".into(),
+            result_rx: rx,
+            first_turn: None,
+            resume: None,
+            resumed_title: None,
+            resumed_name: None,
+        });
+        assert!(restore_offer(&state.borrow(), &greeting).is_none());
+        state.borrow_mut().tabs.get_mut(started_tab).unwrap().backend = TabBackend::NotStarted;
+        assert!(restore_offer(&state.borrow(), &greeting).is_some());
+
+        // Every saved tab skipped: a key that restores nothing is not offered.
+        let (nothing, _dir) = restore_panel("restore-nothing", &[("s-x", None, Auto)], &[]);
+        let greeting = {
+            let s = nothing.borrow();
+            BackendGreeting::for_kind(s.backend_kind, s.project_dir.clone())
+        };
+        assert!(restore_offer(&nothing.borrow(), &greeting).is_none());
+        // And no file, no offer.
+        nothing.borrow_mut().restore_source = None;
+        assert!(!restore_is_on_offer(&nothing.borrow()));
+    }
+
+    /// Every lease is held before the first resume is begun, so nothing can claim a saved session
+    /// -- or prune its record -- in between.
+    #[test]
+    fn every_lease_is_taken_before_the_first_resume_begins() {
+        let (state, dir) = restore_panel(
+            "restore-leases",
+            &[("s-1", None, Auto), ("s-2", None, Auto), ("s-3", None, Auto)],
+            &["s-1", "s-2", "s-3"],
+        );
+        let canonical = dir.to_string_lossy().into_owned();
+        let mut resumes = FakeResumes {
+            all: vec!["s-1".into(), "s-2".into(), "s-3".into()],
+            ..Default::default()
+        };
+        assert_eq!(started(ask(&state, &mut resumes, RestoreAsk::Dashboard)), None);
+        assert_eq!(resumes.asked, ["s-1", "s-2", "s-3"], "in order");
+        assert_eq!(resumes.held_when_first_asked, Some(vec![true, true, true]));
+        assert_eq!(resumes.leases.len(), 3);
+        assert!(state.borrow().restore_source.is_none(), "used up");
+        let numbers: Vec<Option<String>> = state
+            .borrow()
+            .tabs
+            .tabs()
+            .iter()
+            .map(|t| t.provider_session_id())
+            .collect();
+        assert_eq!(numbers, ["s-1", "s-2", "s-3"].map(|s| Some(s.to_string())));
+        drop(resumes.leases);
+        assert!(!agent::lease::SessionLease::is_held("claude", &canonical, "s-1").unwrap());
+    }
+
+    #[test]
+    fn a_session_another_window_takes_after_the_offer_is_skipped_and_said() {
+        let (state, dir) = restore_panel(
+            "restore-late-lease",
+            &[("s-1", None, Bypass), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        let canonical = dir.to_string_lossy().into_owned();
+        let mut resumes = FakeResumes::default();
+        let RestoreResult::Question(prompt) = ask(&state, &mut resumes, RestoreAsk::Dashboard) else {
+            panic!("a bypass tab is asked about")
+        };
+        // Another window opens s-2 while the question is on screen.
+        let theirs = agent::lease::SessionLease::try_acquire("claude", &canonical, "s-2").unwrap();
+        started(answer(&state, &mut resumes, prompt.nonce, true));
+        assert_eq!(resumes.asked, ["s-1"], "only the one that could be leased was begun");
+
+        let toasts = Rc::new(RefCell::new(Vec::<String>::new()));
+        state.borrow_mut().toast_hook = Some({
+            let toasts = toasts.clone();
+            Rc::new(move |text: &str| toasts.borrow_mut().push(text.to_string()))
+        });
+        let (_provider, backend) = live_backend(&dir);
+        resumes.senders[0].send(Ok(backend)).unwrap();
+        let collected = state.borrow_mut().tabs.collect_starts();
+        for result in &collected {
+            account_for_restore(&mut state.borrow_mut(), result);
+        }
+        finish_restore(&state);
+        assert_eq!(
+            *toasts.borrow(),
+            ["Restored 1 of 2 tabs; 1 could not be: title of s-2 (open in another window)"]
+        );
+        drop(theirs);
+        for mut tab in state.borrow_mut().tabs.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn a_saved_bypass_tab_asks_first_and_each_answer_has_its_own_result() {
+        let (state, _dir) = restore_panel(
+            "restore-bypass-ask",
+            &[("s-1", None, Auto), ("s-2", None, Bypass)],
+            &["s-1", "s-2"],
+        );
+        let mut resumes = FakeResumes::default();
+        let RestoreResult::Question(prompt) = ask(&state, &mut resumes, RestoreAsk::Dashboard) else {
+            panic!("asked")
+        };
+        assert_eq!(prompt.lines[0], "Restore 2 tabs (1 in bypass)? y/n");
+        assert!(resumes.asked.is_empty(), "nothing begins until the answer");
+        assert!(
+            state.borrow().restore_source.is_some(),
+            "and the offer is still there if it is cancelled"
+        );
+        assert!(matches!(
+            answer(&state, &mut resumes, prompt.nonce + 1, true),
+            RestoreResult::Refused(_)
+        ));
+
+        assert_eq!(
+            started(answer(&state, &mut resumes, prompt.nonce, false)),
+            None,
+            "an answered n needs no second telling"
+        );
+        assert_eq!(mode(&state, "s-2"), Auto, "n: the tab comes back in auto");
+        assert_eq!(state.borrow().tabs.default_mode(), Auto);
+
+        let (yes, _dir) = restore_panel(
+            "restore-bypass-yes",
+            &[("s-1", None, Auto), ("s-2", None, Bypass)],
+            &["s-1", "s-2"],
+        );
+        let mut resumes = FakeResumes::default();
+        let RestoreResult::Question(prompt) = ask(&yes, &mut resumes, RestoreAsk::Dashboard) else {
+            panic!("asked")
+        };
+        started(answer(&yes, &mut resumes, prompt.nonce, true));
+        assert_eq!(mode(&yes, "s-2"), Bypass, "y: as it was");
+        assert_eq!(mode(&yes, "s-1"), Auto);
+        assert_eq!(
+            yes.borrow().tabs.default_mode(),
+            Auto,
+            "the window's own default never moves"
+        );
+    }
+
+    #[test]
+    fn a_restore_at_launch_asks_nothing_downgrades_bypass_and_says_so() {
+        let (state, _dir) = restore_panel(
+            "restore-launch",
+            &[("s-1", None, Bypass), ("s-2", None, Bypass)],
+            &["s-1", "s-2"],
+        );
+        state.borrow_mut().restore_policy = RestorePolicy::Auto;
+        let mut resumes = FakeResumes::default();
+        let notice = started(ask(&state, &mut resumes, RestoreAsk::Launch)).expect("the band names it");
+        assert_eq!(notice, "2 bypass tabs came back in auto; Shift+Tab then y switches");
+        assert_eq!(mode(&state, "s-1"), Auto);
+        assert_eq!(mode(&state, "s-2"), Auto);
+        assert_eq!(resumes.asked.len(), 2);
+    }
+
+    #[test]
+    fn a_launch_has_one_go_whatever_comes_of_it() {
+        let (state, _dir) = restore_panel("restore-launch-once", &[("s-x", None, Auto)], &[]);
+        state.borrow_mut().restore_policy = RestorePolicy::Auto;
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Launch));
+        assert!(
+            state.borrow().restore_source.is_none(),
+            "a reload of the page does not try again"
+        );
+        assert!(resumes.asked.is_empty(), "the record is gone, so nothing was begun");
+        // And its message is already due: nothing is left to wait for.
+        let toasts = Rc::new(RefCell::new(Vec::<String>::new()));
+        state.borrow_mut().toast_hook = Some({
+            let toasts = toasts.clone();
+            Rc::new(move |text: &str| toasts.borrow_mut().push(text.to_string()))
+        });
+        finish_restore(&state);
+        assert_eq!(
+            *toasts.borrow(),
+            ["Restored 0 of 1 tab; 1 could not be: s-x (its saved record is gone)"]
+        );
+        finish_restore(&state);
+        assert_eq!(toasts.borrow().len(), 1, "said once");
+    }
+
+    #[test]
+    fn the_users_own_bypass_default_restores_bypass_tabs_without_asking() {
+        let (state, _dir) = restore_panel("restore-config-bypass", &[("s-1", None, Bypass)], &["s-1"]);
+        state.borrow_mut().bypass_by_config = true;
+        let mut resumes = FakeResumes::default();
+        assert_eq!(started(ask(&state, &mut resumes, RestoreAsk::Dashboard)), None);
+        assert_eq!(mode(&state, "s-1"), Bypass);
+    }
+
+    /// Only the sidecar resumes: a window on the legacy backend neither offers nor attempts a restore,
+    /// and says why if asked.
+    #[test]
+    fn the_legacy_backend_is_never_asked_to_restore() {
+        let (state, _dir) = restore_panel("restore-legacy", &[("s-1", None, Auto)], &["s-1"]);
+        state.borrow_mut().backend_kind = BackendKind::Legacy;
+        let mut resumes = FakeResumes::default();
+        assert!(matches!(
+            ask(&state, &mut resumes, RestoreAsk::Launch),
+            RestoreResult::Refused(_)
+        ));
+        assert!(resumes.asked.is_empty());
+    }
+
+    #[test]
+    fn a_restore_is_refused_when_it_would_be_stale() {
+        let (state, _dir) = restore_panel("restore-stale", &[("s-1", None, Auto)], &["s-1"]);
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
+        assert!(
+            matches!(
+                ask(&state, &mut resumes, RestoreAsk::Dashboard),
+                RestoreResult::Refused(_)
+            ),
+            "a second press: the tabs are already coming back"
+        );
+        let (none, _dir) = restore_panel("restore-none", &[], &[]);
+        none.borrow_mut().restore_source = None;
+        assert!(matches!(
+            ask(&none, &mut FakeResumes::default(), RestoreAsk::Dashboard),
+            RestoreResult::Refused(_)
+        ));
+    }
+
+    /// The glue the tick runs: each result counts into the restore, a refused tab is tidied away,
+    /// and one message ends it once the last resume is back.
+    #[test]
+    fn a_restore_ends_in_one_toast_once_the_last_resume_has_returned() {
+        let (state, dir) = restore_panel(
+            "restore-toast",
+            &[("s-1", None, Auto), ("s-2", None, Auto), ("s-3", None, Auto)],
+            &["s-1", "s-2", "s-3"],
+        );
+        let toasts = Rc::new(RefCell::new(Vec::<String>::new()));
+        state.borrow_mut().toast_hook = Some({
+            let toasts = toasts.clone();
+            Rc::new(move |text: &str| toasts.borrow_mut().push(text.to_string()))
+        });
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
+        finish_restore(&state);
+        assert!(toasts.borrow().is_empty(), "three resumes are still connecting");
+
+        let (_provider, backend) = live_backend(&dir);
+        resumes.senders[0].send(Ok(backend)).unwrap();
+        resumes.senders[1]
+            .send(Err(BackendError {
+                message: "could not continue the previous session: no such session".to_string(),
+                benign: false,
+                folded_events: Vec::new(),
+            }))
+            .unwrap();
+        let collected = state.borrow_mut().tabs.collect_starts();
+        let mut accounted = Vec::new();
+        for result in &collected {
+            accounted.push(account_for_restore(&mut state.borrow_mut(), result));
+        }
+        finish_restore(&state);
+        assert!(
+            accounted.contains(&RestoreStart::Installed)
+                && accounted.iter().any(|a| matches!(a, RestoreStart::Failed { .. })),
+            "{accounted:?}"
+        );
+        assert!(toasts.borrow().is_empty(), "the third is still connecting");
+        assert_eq!(state.borrow().tabs.tabs().len(), 2, "the refused tab is gone");
+
+        let (_provider, backend) = live_backend(&dir);
+        resumes.senders[2].send(Ok(backend)).unwrap();
+        let collected = state.borrow_mut().tabs.collect_starts();
+        for result in &collected {
+            account_for_restore(&mut state.borrow_mut(), result);
+        }
+        finish_restore(&state);
+        assert_eq!(
+            *toasts.borrow(),
+            ["Restored 2 of 3 tabs; 1 could not be: title of s-2 (could not continue the previous session: no such session)"]
+        );
+        for mut tab in state.borrow_mut().tabs.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    /// A restored tab the user closes before its resume returns is never going to report; the restore
+    /// must still end, and say nothing about it.
+    #[test]
+    fn closing_a_restored_tab_while_it_connects_does_not_hold_the_restore_open() {
+        let (state, dir) = restore_panel(
+            "restore-closed",
+            &[("s-1", None, Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        let toasts = Rc::new(RefCell::new(Vec::<String>::new()));
+        state.borrow_mut().toast_hook = Some({
+            let toasts = toasts.clone();
+            Rc::new(move |text: &str| toasts.borrow_mut().push(text.to_string()))
+        });
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
+        let second = state.borrow().tabs.tab_with_session("s-2").unwrap();
+        let (_provider, backend) = live_backend(&dir);
+        resumes.senders[0].send(Ok(backend)).unwrap();
+        let collected = state.borrow_mut().tabs.collect_starts();
+        for result in &collected {
+            account_for_restore(&mut state.borrow_mut(), result);
+        }
+        finish_restore(&state);
+        assert!(toasts.borrow().is_empty(), "s-2 is still connecting");
+        let closed = state.borrow_mut().tabs.remove(second);
+        assert!(closed.is_some());
+        finish_restore(&state);
+        assert_eq!(*toasts.borrow(), ["Restored 1 tab"]);
+        assert!(state.borrow().restore_run.is_none(), "so the restore is over");
+        for mut tab in state.borrow_mut().tabs.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    /// A restore that fails in the tab it began in leaves that tab as it found it: in the mode it had,
+    /// not in one only the restored session was cleared for.
+    /// The saved active tab is the one that does not come back: the screen goes to a tab that did, not
+    /// to an empty dashboard over them.
+    #[test]
+    fn when_the_tab_on_screen_fails_the_first_that_restored_takes_its_place() {
+        let (state, dir) = restore_panel(
+            "restore-survivor",
+            &[("s-1", None, Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
+        let first = state.borrow().tabs.tab_with_session("s-1").unwrap();
+        let second = state.borrow().tabs.tab_with_session("s-2").unwrap();
+        assert_eq!(state.borrow().tabs.active(), first, "the saved active tab is the first");
+        resumes.senders[0]
+            .send(Err(BackendError {
+                message: "refused".to_string(),
+                benign: false,
+                folded_events: Vec::new(),
+            }))
+            .unwrap();
+        let (_provider, backend) = live_backend(&dir);
+        resumes.senders[1].send(Ok(backend)).unwrap();
+        let collected = state.borrow_mut().tabs.collect_starts();
+        for result in &collected {
+            account_for_restore(&mut state.borrow_mut(), result);
+        }
+        assert_eq!(state.borrow().tabs.active(), second);
+        for mut tab in state.borrow_mut().tabs.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_restore_leaves_the_tab_it_began_in_in_its_old_mode() {
+        let (state, _dir) = restore_panel("restore-mode-back", &[("s-1", None, Bypass)], &["s-1"]);
+        state.borrow_mut().bypass_by_config = true; // the saved bypass tab comes back as saved
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
+        let tab = state.borrow().tabs.active();
+        assert_eq!(
+            state.borrow().tabs.get(tab).unwrap().mode(),
+            Bypass,
+            "while it connects"
+        );
+        resumes.senders[0]
+            .send(Err(BackendError {
+                message: "refused".to_string(),
+                benign: false,
+                folded_events: Vec::new(),
+            }))
+            .unwrap();
+        let collected = state.borrow_mut().tabs.collect_starts();
+        for result in &collected {
+            account_for_restore(&mut state.borrow_mut(), result);
+        }
+        let s = state.borrow();
+        assert!(matches!(s.tabs.get(tab).unwrap().backend, TabBackend::NotStarted));
+        assert_eq!(s.tabs.get(tab).unwrap().mode(), Auto, "an empty tab, in auto again");
+    }
+
+    #[test]
+    fn a_connect_that_is_not_part_of_a_restore_is_left_to_its_own_handling() {
+        let (state, _dir) = restore_panel("restore-unrelated", &[("s-1", None, Auto)], &["s-1"]);
+        let collected = StartCollected::Failed {
+            tab: state.borrow().tabs.active(),
+            request_id: "r".to_string(),
+            error: BackendError {
+                message: "x".to_string(),
+                benign: false,
+                folded_events: Vec::new(),
+            },
+        };
+        assert_eq!(
+            account_for_restore(&mut state.borrow_mut(), &collected),
+            RestoreStart::NotPartOfOne
+        );
+    }
+
+    /// Once per tick, the tabs are shown to the memory: a session adopted is written, and so is
+    /// nothing more until something changes.
+    #[test]
+    fn the_tick_keeps_the_saved_file_in_step_and_a_closing_window_leaves_it_alone() {
+        let (state, dir) = restore_panel("restore-remember", &[], &[]);
+        let files = agent::state_dirs::test_workspace_dir("restore-remember-files");
+        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        remember_tabs(&state);
+        assert!(
+            std::fs::read_dir(&files).unwrap().next().is_none(),
+            "an untouched launch writes nothing"
+        );
+
+        let tab = state.borrow().tabs.active();
+        let (provider, backend) = live_backend(&dir);
+        state.borrow_mut().tabs.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.open_session("s-live", &dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.borrow().tabs.get(tab).unwrap().provider_session_id().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the session id never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        remember_tabs(&state);
+        let loaded = match eitri_core::saved_tabs::load(&files, &dir) {
+            eitri_core::saved_tabs::Loaded::Saved(saved) => saved,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].provider_session_id, "s-live");
+        assert_eq!(loaded.tabs[0].conversation_id, state.borrow().conversation_id);
+
+        let taken = state.borrow_mut().tabs.take_all();
+        remember_tabs(&state);
+        assert_eq!(
+            eitri_core::saved_tabs::load(&files, &dir),
+            eitri_core::saved_tabs::Loaded::Saved(loaded)
+        );
+        for mut tab in taken {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    fn handle_for(state: &Rc<RefCell<AgentPanelState>>) -> AgentPanelHandle {
+        AgentPanelHandle {
+            state: state.clone(),
+            webview: None,
+        }
+    }
+
+    /// `agent.restore = "off"` is the whole feature off: nothing is offered, nothing is remembered.
+    #[test]
+    fn restore_off_offers_nothing_and_remembers_nothing() {
+        let (state, dir) = restore_panel("restore-off", &[("s-1", None, Auto)], &["s-1"]);
+        let files = agent::state_dirs::test_workspace_dir("restore-off-files");
+        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        handle_for(&state).set_restore_policy(RestorePolicy::Off);
+        assert!(state.borrow().restore_source.is_none());
+        assert!(!state.borrow().tab_memory.is_enabled());
+        assert!(!restore_is_on_offer(&state.borrow()));
+
+        let tab = state.borrow().tabs.active();
+        let (provider, backend) = live_backend(&dir);
+        state.borrow_mut().tabs.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.open_session("s-live", &dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.borrow().tabs.get(tab).unwrap().provider_session_id().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the session id never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        remember_tabs(&state);
+        assert!(std::fs::read_dir(&files).unwrap().next().is_none(), "nothing written");
+        for mut tab in state.borrow_mut().tabs.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    /// `agent.default_mode`: applied to the window's default and its empty tab, unless the project
+    /// remembers a mode Shift+Tab left; naming bypass is also what lets saved bypass tabs come back
+    /// unasked; naming nothing changes nothing.
+    #[test]
+    fn the_configured_default_mode_applies_unless_the_project_remembers_one() {
+        let (state, _dir) = restore_panel("default-mode", &[], &[]);
+        let handle = handle_for(&state);
+        handle.set_default_mode(None);
+        assert_eq!(state.borrow().tabs.default_mode(), Auto);
+        assert!(!state.borrow().bypass_by_config);
+
+        handle.set_default_mode(Some(Bypass));
+        assert_eq!(state.borrow().tabs.default_mode(), Bypass);
+        let tab = state.borrow().tabs.active();
+        assert_eq!(
+            state.borrow().tabs.get(tab).unwrap().mode(),
+            Bypass,
+            "the empty tab it already has"
+        );
+        assert!(state.borrow().bypass_by_config);
+
+        // A project that remembers a mode: the setting does not override it.
+        let (remembered, _dir) = restore_panel("default-mode-remembered", &[], &[]);
+        remembered.borrow_mut().mode_remembered = true;
+        handle_for(&remembered).set_default_mode(Some(Bypass));
+        assert_eq!(remembered.borrow().tabs.default_mode(), Auto);
+        let tab = remembered.borrow().tabs.active();
+        assert_eq!(remembered.borrow().tabs.get(tab).unwrap().mode(), Auto);
     }
 }

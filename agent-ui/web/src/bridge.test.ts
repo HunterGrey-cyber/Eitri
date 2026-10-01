@@ -221,6 +221,20 @@ describe("installDispatch", () => {
     warn.mockRestore();
   });
 
+  it("demuxes a confirm_restore envelope and rejects one with no nonce", () => {
+    const handler = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    installDispatch(handler);
+    const envelope = { kind: "confirm_restore", nonce: 4, lines: ["Restore 3 tabs (1 in bypass)? y/n"] };
+    window.__eitriDispatch!(JSON.stringify(envelope));
+    expect(handler).toHaveBeenCalledWith(envelope);
+    handler.mockClear();
+    window.__eitriDispatch!(JSON.stringify({ kind: "confirm_restore", lines: ["?"] }));
+    expect(handler).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it("passes every phase 3 envelope through the whitelist", () => {
     const handler = vi.fn();
     installDispatch(handler);

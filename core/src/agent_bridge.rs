@@ -315,6 +315,21 @@ pub enum InboundMessage {
         request_id: String,
         url: String,
     },
+    /// `s` on the launch dashboard: bring back the tabs the last window had open, the first into
+    /// this empty tab and the rest into new ones. Names the tab it was pressed in.
+    RestoreLast {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// `y` (`keep_bypass`) or `n` to the question a restore asked because a saved tab was in bypass.
+    /// Window-level, like `ConfirmBypass`; the nonce is the one the question was shown with, and has
+    /// no default for the same reason: only the exact prompt shown may be answered.
+    RestoreAnswer {
+        request_id: String,
+        nonce: u64,
+        keep_bypass: bool,
+    },
     /// `y`/`Y` to a `confirm_bypass` prompt (R06/S2, D1/D11): the panel's own answer, guarded by its
     /// typed-input rules (Task 4), naming the tab (or `null` for the window default) and the nonce
     /// it was shown so a stale prompt can never answer a newer one (D7). Window-level for routing
@@ -402,6 +417,7 @@ impl InboundMessage {
             // `ConfirmBypass` names its own tab in `scope`/`tab` (`BypassScopeWire::scope`), the
             // same reason `TabVerb` is window-level rather than routed by this generic mechanism.
             | InboundMessage::ConfirmBypass { .. }
+            | InboundMessage::RestoreAnswer { .. }
             | InboundMessage::PanelKeys { .. }
             | InboundMessage::NavFallthrough { .. }
             | InboundMessage::PaneNav { .. }
@@ -412,6 +428,7 @@ impl InboundMessage {
             | InboundMessage::HandoffToTerminal { tab, .. }
             | InboundMessage::PermissionResponse { tab, .. }
             | InboundMessage::Resume { tab, .. }
+            | InboundMessage::RestoreLast { tab, .. }
             | InboundMessage::SelectTab { tab, .. }
             | InboundMessage::RenameTab { tab, .. }
             | InboundMessage::CloseTab { tab, .. }
@@ -487,6 +504,8 @@ impl InboundMessage {
             | InboundMessage::CycleDefaultMode { request_id }
             | InboundMessage::CloseOthers { request_id }
             | InboundMessage::ConfirmBypass { request_id, .. }
+            | InboundMessage::RestoreLast { request_id, .. }
+            | InboundMessage::RestoreAnswer { request_id, .. }
             | InboundMessage::PanelKeys { request_id, .. }
             | InboundMessage::NavFallthrough { request_id, .. }
             | InboundMessage::PaneNav { request_id, .. }
@@ -558,6 +577,17 @@ pub fn serialize_command_result_for_js(request_id: &str, result: Result<(), &str
 /// fallback is that losing the CLI's line returns the picker silently to how it looks today.
 /// Nothing about the payload's SHAPE changes, and the no-invented-label rule is untouched.
 pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) -> String {
+    serialize_hello_with_restore_for_js(greeting, None)
+}
+
+/// [`serialize_hello_for_js`] plus what the launch dashboard may offer to bring back: `restore` is
+/// `{"labels":[...],"bypass":n}` -- the tabs the last window had open, in order, and how many of
+/// them were in bypass -- or `null` when nothing is on offer (always present, so the frontend reads
+/// one shape).
+pub fn serialize_hello_with_restore_for_js(
+    greeting: &crate::agent_backend::BackendGreeting,
+    restore: Option<&crate::tab_restore::RestoreOffer>,
+) -> String {
     json!({
         "kind": "hello",
         "backend": greeting.kind.as_str(),
@@ -578,6 +608,7 @@ pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) 
         "expectedVerdandiRevision": greeting.expected_verdandi_revision,
         // Panel round 2 plan's §7: `agent::account`'s configured name, `null` when none is set.
         "account": greeting.account,
+        "restore": restore.map(|offer| json!({ "labels": offer.labels, "bypass": offer.bypass })),
     })
     .to_string()
 }
@@ -1469,6 +1500,13 @@ pub fn serialize_confirm_bypass_for_js(plan: &crate::tab_set::BypassPlan) -> Str
         "lines": plan.lines,
     })
     .to_string()
+}
+
+/// `{"kind":"confirm_restore","nonce":...,"lines":[...]}`: the question a restore asks when a saved tab
+/// was in bypass. The panel shows `lines` and answers `restore_answer` with the nonce it was given;
+/// which tabs are in bypass stays on this side.
+pub fn serialize_confirm_restore_for_js(prompt: &crate::tab_set::RestorePrompt) -> String {
+    json!({ "kind": "confirm_restore", "nonce": prompt.nonce, "lines": prompt.lines }).to_string()
 }
 
 #[cfg(test)]
@@ -3441,5 +3479,70 @@ mod tests {
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let capabilities = parsed["state"]["capabilities"].as_object().unwrap();
         assert!(!capabilities.contains_key("modeSwitch"), "{capabilities:?}");
+    }
+
+    #[test]
+    fn hello_carries_what_the_launch_may_bring_back_or_null() {
+        let greeting = greeting_with(Vec::new());
+        let value: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        assert!(value["restore"].is_null(), "present, and null when nothing is on offer");
+        let offer = crate::tab_restore::RestoreOffer {
+            labels: vec!["api".to_string(), "docs".to_string()],
+            bypass: 1,
+        };
+        let value: Value = serde_json::from_str(&serialize_hello_with_restore_for_js(&greeting, Some(&offer))).unwrap();
+        assert_eq!(value["restore"], json!({ "labels": ["api", "docs"], "bypass": 1 }));
+        assert_eq!(value["kind"], "hello", "the rest of the hello is the same");
+        let none: Value = serde_json::from_str(&serialize_hello_with_restore_for_js(&greeting, None)).unwrap();
+        assert!(none["restore"].is_null());
+    }
+
+    #[test]
+    fn the_restore_messages_parse_and_know_their_tab() {
+        let last = parse_inbound_message(r#"{"type":"restore_last","request_id":"r1","tab":3}"#).unwrap();
+        assert!(
+            matches!(last.tab_ref(), TabRef::Named(TabId(3))),
+            "it is about the tab it was pressed in"
+        );
+        assert_eq!(last.request_id(), "r1");
+        let missing = parse_inbound_message(r#"{"type":"restore_last","request_id":"r1"}"#).unwrap();
+        assert!(matches!(missing.tab_ref(), TabRef::Missing), "never \"the active one\"");
+
+        let answer =
+            parse_inbound_message(r#"{"type":"restore_answer","request_id":"r2","nonce":9,"keep_bypass":false}"#)
+                .unwrap();
+        assert!(matches!(answer.tab_ref(), TabRef::WindowLevel));
+        assert_eq!(answer.request_id(), "r2");
+        match answer {
+            InboundMessage::RestoreAnswer { nonce, keep_bypass, .. } => assert_eq!((nonce, keep_bypass), (9, false)),
+            other => panic!("expected RestoreAnswer, got {other:?}"),
+        }
+        // No default for either: an answer with no nonce, or no yes/no, is a protocol error and
+        // never read as "the current prompt" or "yes".
+        assert!(parse_inbound_message(r#"{"type":"restore_answer","request_id":"r","keep_bypass":true}"#).is_none());
+        assert!(parse_inbound_message(r#"{"type":"restore_answer","request_id":"r","nonce":1}"#).is_none());
+        assert!(
+            parse_inbound_message(r#"{"type":"restore_answer","request_id":"r","nonce":"1","keep_bypass":true}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_restore_question_envelope_matches_the_wire_contract() {
+        let prompt = crate::tab_set::RestorePrompt {
+            nonce: 5,
+            lines: vec![
+                "Restore 3 tabs (1 in bypass)? y/n".to_string(),
+                "n brings the bypass tab back in auto".to_string(),
+            ],
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&serialize_confirm_restore_for_js(&prompt)).unwrap(),
+            json!({
+                "kind": "confirm_restore",
+                "nonce": 5,
+                "lines": ["Restore 3 tabs (1 in bypass)? y/n", "n brings the bypass tab back in auto"],
+            })
+        );
     }
 }

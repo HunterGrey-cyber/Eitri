@@ -434,6 +434,23 @@ impl AgentConversation {
         cwd: &Path,
         provider_session_id: &str,
     ) -> Result<Self, ConversationError> {
+        Self::resume_holding(provider, cwd, provider_session_id, None)
+    }
+
+    /// [`resume`](Self::resume) with the session's lease already taken by the caller, who took it
+    /// ahead of time so nothing could claim the session -- or prune its record -- between deciding
+    /// to resume it and the resume reaching step 4. The lease is used instead of a second
+    /// `try_acquire` (which would contend with it, since `flock` is per open file description), and
+    /// it is dropped with every early return, so a failed resume leaves the session free.
+    ///
+    /// A lease for another provider, directory or session is refused before the provider is asked
+    /// for anything: a resume must never drive a session it holds no lock on.
+    pub fn resume_holding(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        cwd: &Path,
+        provider_session_id: &str,
+        held: Option<SessionLease>,
+    ) -> Result<Self, ConversationError> {
         let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
         let capabilities = provider.capabilities();
         if !capabilities.resume {
@@ -446,14 +463,22 @@ impl AgentConversation {
 
         ensure_transcript_is_not_being_written(&cwd_string, provider_session_id)?;
 
-        let lease = match SessionLease::try_acquire(PROVIDER_NAME, &cwd_string, provider_session_id) {
-            Ok(lease) => lease,
-            Err(LeaseError::AlreadyHeld) => {
-                return Err(ConversationError::LeaseHeld {
-                    provider_session_id: provider_session_id.to_string(),
-                })
+        let lease = match held {
+            Some(lease) if lease.is_for(PROVIDER_NAME, &cwd_string, provider_session_id) => lease,
+            Some(_) => {
+                return Err(ConversationError::Lease(LeaseError::Io(std::io::Error::other(
+                    "the lease handed to this resume is for another session",
+                ))))
             }
-            Err(other) => return Err(ConversationError::Lease(other)),
+            None => match SessionLease::try_acquire(PROVIDER_NAME, &cwd_string, provider_session_id) {
+                Ok(lease) => lease,
+                Err(LeaseError::AlreadyHeld) => {
+                    return Err(ConversationError::LeaseHeld {
+                        provider_session_id: provider_session_id.to_string(),
+                    })
+                }
+                Err(other) => return Err(ConversationError::Lease(other)),
+            },
         };
 
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);
@@ -2069,6 +2094,147 @@ mod tests {
         assert!(
             SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-abc").is_ok(),
             "the lease must still be released once the conversation itself is dropped"
+        );
+    }
+
+    /// A provider that accepts a resume and says it attached, recording what it was asked.
+    struct AcceptingResume {
+        asked: Mutex<Vec<String>>,
+        events: Mutex<Vec<AgentDomainEvent>>,
+    }
+
+    impl AcceptingResume {
+        fn attaching_to(session: &str) -> Arc<Self> {
+            Arc::new(Self {
+                asked: Mutex::new(Vec::new()),
+                events: Mutex::new(vec![AgentDomainEvent::ResumeOutcome {
+                    requested_provider_session_id: session.to_string(),
+                    status: crate::ResumeStatus::Attached,
+                    attached_provider_session_id: Some(session.to_string()),
+                    forked: false,
+                    detail: None,
+                }]),
+            })
+        }
+    }
+
+    impl AgentProvider for AcceptingResume {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                resume: true,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            }
+        }
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo {
+                sidecar_version: "fake".into(),
+                protocol_major: 1,
+                ..Default::default()
+            }
+        }
+        fn create_session(&self, _r: CreateSessionRequest) -> Result<String, ProviderError> {
+            unreachable!("these tests only resume")
+        }
+        fn resume_session(&self, r: ResumeSessionRequest) -> Result<String, ProviderError> {
+            self.asked.lock().unwrap().push(r.provider_session_id);
+            Ok("verdandi-session-resumed".into())
+        }
+        fn send_turn(&self, _r: SendTurnRequest) -> Result<String, ProviderError> {
+            Ok("turn-1".into())
+        }
+        fn interrupt_turn(&self, _r: InterruptTurnRequest) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn resolve_permission(&self, _r: ResolvePermissionRequest) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn close_session(&self, _r: CloseSessionRequest) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn pump(&self) -> Vec<AgentDomainEvent> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    /// A lease taken before the resume is the one the resume keeps: it neither contends with it
+    /// (a plain `resume` of a session whose lease is already held is refused) nor lets go of it while
+    /// the conversation lives.
+    #[test]
+    fn a_resume_keeps_the_lease_it_was_handed_instead_of_contending_with_it() {
+        let dir = unique_dir();
+        let cwd = dir.to_string_lossy().to_string();
+        let session = "claude-uuid-held-ahead";
+
+        let lease = SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).unwrap();
+        let plain = AgentConversation::resume(AcceptingResume::attaching_to(session), &dir, session);
+        assert!(
+            matches!(plain, Err(ConversationError::LeaseHeld { .. })),
+            "a resume that takes its own lease cannot share the one already held"
+        );
+
+        let conversation =
+            AgentConversation::resume_holding(AcceptingResume::attaching_to(session), &dir, session, Some(lease))
+                .expect("the resume attaches under the lease it was handed");
+        assert!(
+            matches!(
+                SessionLease::try_acquire(PROVIDER_NAME, &cwd, session),
+                Err(LeaseError::AlreadyHeld)
+            ),
+            "the handed lease is still the one held while the conversation lives"
+        );
+        drop(conversation);
+        assert!(
+            SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).is_ok(),
+            "and it goes with the conversation"
+        );
+    }
+
+    /// A lease for some other session must never stand in for this one: nothing is asked of the
+    /// provider, and the session the lease was for is released with it.
+    #[test]
+    fn a_lease_for_another_session_is_refused_before_the_provider_is_asked() {
+        let dir = unique_dir();
+        let cwd = dir.to_string_lossy().to_string();
+        let provider = AcceptingResume::attaching_to("claude-uuid-asked-for");
+
+        let lease = SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-someone-else").unwrap();
+        let result = AgentConversation::resume_holding(provider.clone(), &dir, "claude-uuid-asked-for", Some(lease));
+        assert!(matches!(result, Err(ConversationError::Lease(_))), "{:?}", result.err());
+        assert!(
+            provider.asked.lock().unwrap().is_empty(),
+            "the provider was never asked"
+        );
+        assert!(
+            SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-someone-else").is_ok(),
+            "a refused lease is not kept"
+        );
+    }
+
+    /// A resume that fails gives its handed lease back, as one that took its own always did.
+    #[test]
+    fn a_failed_resume_releases_the_lease_it_was_handed() {
+        let dir = unique_dir();
+        let cwd = dir.to_string_lossy().to_string();
+        let session = "claude-uuid-rejected";
+        let provider = Arc::new(AcceptingResume {
+            asked: Mutex::new(Vec::new()),
+            events: Mutex::new(vec![AgentDomainEvent::ResumeOutcome {
+                requested_provider_session_id: session.to_string(),
+                status: crate::ResumeStatus::Rejected,
+                attached_provider_session_id: None,
+                forked: false,
+                detail: Some("no such session".into()),
+            }]),
+        });
+        let lease = SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).unwrap();
+        let result = AgentConversation::resume_holding(provider, &dir, session, Some(lease));
+        assert!(matches!(result, Err(ConversationError::ResumeRejected { .. })));
+        assert!(
+            SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).is_ok(),
+            "the session is free again once its resume failed"
         );
     }
 }

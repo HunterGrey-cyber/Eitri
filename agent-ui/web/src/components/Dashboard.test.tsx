@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
-import { Dashboard, MODE_CONSEQUENCE, dashItems } from "./Dashboard";
+import { DASH_ITEM_KEY, Dashboard, MODE_CONSEQUENCE, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import type { Hello, PermissionModeChoice, ResumableSession } from "../types";
 
@@ -50,6 +50,61 @@ describe("dashItems (spec §7)", () => {
   it("offers resume once a record exists", () => {
     const withRecord: Hello = { ...HELLO, resumableSessions: [session()] };
     expect(dashItems(withRecord)).toEqual(["new", "resume", "sessions", "mode", "keys"]);
+  });
+});
+
+describe("dashItems: restoring the last window's tabs", () => {
+  const OFFER = { labels: ["api", "docs"], bypass: 0 };
+  it("offers restore right after new, and only with something to bring back", () => {
+    expect(dashItems({ ...HELLO, restore: OFFER })).toEqual(["new", "restore", "sessions", "mode", "keys"]);
+    expect(dashItems({ ...HELLO, resumableSessions: [session()], restore: OFFER })).toEqual([
+      "new", "restore", "resume", "sessions", "mode", "keys",
+    ]);
+  });
+  it("never draws a dead key: no offer, a null one or an empty one shows nothing", () => {
+    expect(dashItems(HELLO)).not.toContain("restore");
+    expect(dashItems({ ...HELLO, restore: null })).not.toContain("restore");
+    expect(dashItems({ ...HELLO, restore: { labels: [], bypass: 0 } })).not.toContain("restore");
+  });
+  it("its key is s", () => {
+    expect(DASH_ITEM_KEY.restore).toBe("s");
+  });
+});
+
+describe("Dashboard: the restore line", () => {
+  const withOffer = (labels: string[]): Hello => ({ ...HELLO, restore: { labels, bypass: 0 } });
+  const restoreRow = (container: HTMLElement) => container.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]')[1];
+
+  it("names the tabs it would bring back, with the key on its own row", () => {
+    const { container } = renderDash({ hello: withOffer(["api", "docs", "tests"]) });
+    const row = restoreRow(container);
+    expect(row.querySelector(".dash-label")!.textContent).toBe("Restore last session (3 tabs: api, docs, tests)");
+    expect(row.querySelector(".dash-key")!.textContent).toBe("s");
+  });
+  it("says tab in the singular", () => {
+    const { container } = renderDash({ hello: withOffer(["api"]) });
+    expect(restoreRow(container).querySelector(".dash-label")!.textContent).toBe("Restore last session (1 tab: api)");
+  });
+  it("names the first three and shows there are more", () => {
+    const { container } = renderDash({ hello: withOffer(["a", "b", "c", "d", "e"]) });
+    expect(restoreRow(container).querySelector(".dash-label")!.textContent).toBe("Restore last session (5 tabs: a, b, c, …)");
+  });
+  it("cuts a long name to fit", () => {
+    const { container } = renderDash({ hello: withOffer(["a-very-long-tab-name-indeed-yes"]) });
+    const text = restoreRow(container).querySelector(".dash-label")!.textContent!;
+    expect(text).toContain("(1 tab: a-very-long-tab-nam…)");
+    expect(text).not.toContain("indeed");
+  });
+  it("says in the label when some of them were in bypass, ahead of the names so the count is not read as one", () => {
+    const { container } = renderDash({ hello: { ...HELLO, restore: { labels: ["api", "docs"], bypass: 1 } } });
+    expect(restoreRow(container).querySelector(".dash-label")!.textContent).toBe(
+      "Restore last session (2 tabs, 1 in bypass: api, docs)",
+    );
+  });
+  it("clicking it runs it", () => {
+    const { container, onItem } = renderDash({ hello: withOffer(["api"]) });
+    fireEvent.click(restoreRow(container));
+    expect(onItem).toHaveBeenCalledWith("restore");
   });
 });
 

@@ -20,6 +20,8 @@ use crate::agent_bridge::{
     serialize_tabs_for_js, CallNotes, SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView,
 };
 use crate::attention::{Attention, AttentionTracker};
+use crate::saved_tabs::{SavedTab, SavedTabs};
+use crate::tab_restore::{PlannedTab, RestorePlan, RestoreRun, Skipped};
 use crate::tabs::{self, TabFacts, TabId};
 
 /// The first turn of a session started by it (ruling 4), composed when Enter was pressed.
@@ -488,6 +490,65 @@ pub enum ConfirmOutcome {
     Reprompt(BypassPlan),
 }
 
+/// What a restore does with a tab that was saved in bypass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassPolicy {
+    /// Ask first ([`TabSet::begin_restore`] returns the question).
+    Ask,
+    /// Give it back as saved: only for a user whose own `init.lua` already made bypass the default.
+    Keep,
+    /// Give it back in auto.
+    Downgrade,
+}
+
+/// The question a restore asks when a saved tab was in bypass (`TabSet::begin_restore`), shown by
+/// the panel and answered with `TabSet::answer_restore`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePrompt {
+    /// Answers a stale prompt: only the exact one shown, by this nonce, may be accepted.
+    pub nonce: u64,
+    pub lines: Vec<String>,
+}
+
+struct PendingRestore {
+    nonce: u64,
+    plan: RestorePlan,
+}
+
+/// A saved tab cleared to be started, with the mode it will get. Only this module makes one, so the
+/// rule that a tab enters bypass only on a yes (or the user's own `init.lua`) cannot be skipped by
+/// whoever starts the restore.
+pub struct GrantedTab {
+    planned: PlannedTab,
+    mode: SessionModeChoice,
+}
+
+/// A restore that is cleared to start: [`TabSet::start_restore`].
+pub struct RestoreGo {
+    tabs: Vec<GrantedTab>,
+    skipped: Vec<Skipped>,
+    active_session: Option<String>,
+    /// How many tabs saved in bypass come back in auto.
+    pub downgraded: usize,
+    /// Whether the user was asked (a quiet downgrade says so afterwards; an answered `n` need not).
+    pub asked: bool,
+}
+
+impl RestoreGo {
+    /// The sessions to start, in order: what a caller that takes its leases ahead of time needs.
+    pub fn session_ids(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .map(|t| t.planned.provider_session_id.clone())
+            .collect()
+    }
+}
+
+pub enum RestoreStep {
+    Go(RestoreGo),
+    Confirm(RestorePrompt),
+}
+
 pub struct TabSet {
     tabs: Vec<Tab>,
     active: TabId,
@@ -506,6 +567,14 @@ pub struct TabSet {
     removed_arrived: u64,
     /// The project's D7 prefix rules, window-level: every tab's pump applies them (ruling 17).
     rules: agent::PrefixRules,
+    /// The tabs that were active, least recent first and each once: where the saved active tab falls
+    /// back to when the active one has no session to save.
+    recency: Vec<TabId>,
+    /// A restore's bypass question on screen, if any: at most one prompt at a time, as `pending_bypass`.
+    pending_restore: Option<PendingRestore>,
+    /// Set once the window has taken the tabs away to close them (`take_all`). A set that has none
+    /// left must not be mistaken for a user who closed every tab.
+    closing: bool,
     /// Test seam (P1-A2 round 2): run once, right after `pump`'s next drain of a live tab's queue,
     /// so a test folds an event exactly where the race is -- after a drain and before the next
     /// snapshot read, `active_state_payloads`' or the `Resync` arm's own a few lock cycles later --
@@ -529,13 +598,16 @@ pub struct TabSet {
 type BackendSeam = Box<dyn FnOnce(&AgentBackend)>;
 
 impl TabSet {
-    /// One empty tab 1 (D10: open tabs are not restored across launches).
+    /// One empty tab 1. Earlier windows' tabs are not brought back by this: they come back only when
+    /// asked for (`begin_restore`).
     ///
     /// **Never in bypass** (D3, R07/S2; the whole-branch review): a `Bypass` here is taken as `Auto`,
     /// with a log line, so "a launch never starts in bypass" holds by construction rather than
     /// because the one caller (`agent_panel`, passing `agent_prefs::startup_mode`) happens never to
     /// pass it. Without this, every tab of the window -- tab 1 and every later `open()` -- would sit
     /// in bypass with no `y` ever pressed, the one thing `Tab::mode` being private exists to stop.
+    /// The one way a window starts in bypass is the user's own `init.lua`
+    /// ([`TabSet::apply_configured_default`]), a separate call that says so.
     pub fn new(kind: BackendKind, default_mode: SessionModeChoice) -> Self {
         let default_mode = match default_mode {
             SessionModeChoice::Bypass => {
@@ -555,6 +627,9 @@ impl TabSet {
             next_nonce: 1,
             removed_arrived: 0,
             rules: agent::PrefixRules::default(),
+            recency: Vec::new(),
+            pending_restore: None,
+            closing: false,
             #[cfg(test)]
             after_drain: None,
             #[cfg(test)]
@@ -622,12 +697,18 @@ impl TabSet {
         if id != self.active {
             self.last_active = Some(self.active);
             self.active = id;
+            self.note_recent(id);
             // Spec §3.3: every method that MOVES the active tab drops a pending bypass prompt --
             // it was about the tab the user is leaving, and a `y` typed after switching away must
             // never land on it.
             self.drop_bypass_prompt();
         }
         true
+    }
+
+    fn note_recent(&mut self, id: TabId) {
+        self.recency.retain(|t| *t != id);
+        self.recency.push(id);
     }
 
     pub fn select_number(&mut self, number: u16) -> Option<TabId> {
@@ -656,6 +737,7 @@ impl TabSet {
         let before = self.active;
         let tab = self.tabs.remove(at);
         self.removed_arrived += tab.attention.attention().arrived;
+        self.recency.retain(|t| *t != id);
         if self.last_active == Some(id) {
             self.last_active = None;
         }
@@ -665,6 +747,8 @@ impl TabSet {
         } else if self.active == id {
             let fallback = self.tabs[at.min(self.tabs.len() - 1)].id;
             self.active = self.last_active.take().unwrap_or(fallback);
+            let now_active = self.active;
+            self.note_recent(now_active);
         }
         // `open()` above already dropped it through `select`; this covers the fallback path, which
         // assigns `self.active` directly (spec §3.3).
@@ -695,6 +779,7 @@ impl TabSet {
         // A fresh press supersedes whatever prompt was already open (D2); `Confirm` below stores a
         // new one if it builds one.
         self.pending_bypass = None;
+        self.pending_restore = None;
         let at = self
             .tabs
             .iter()
@@ -756,6 +841,7 @@ impl TabSet {
     /// mode. Every open tab keeps whatever mode it already has.
     pub fn cycle_default_mode(&mut self) -> ModeCycle {
         self.pending_bypass = None;
+        self.pending_restore = None;
         match self.default_mode {
             SessionModeChoice::Bypass => {
                 self.default_mode = SessionModeChoice::Auto;
@@ -917,6 +1003,7 @@ impl TabSet {
     /// user is no longer looking at. Task 3 additionally calls it when the panel loses focus.
     pub fn drop_bypass_prompt(&mut self) {
         self.pending_bypass = None;
+        self.pending_restore = None;
     }
 
     /// `r` (ruling 12): an ended or failed tab back to empty, keeping its number, name and mode.
@@ -1838,7 +1925,239 @@ impl TabSet {
     /// close path calls it, after setting `shutting_down`, and nothing reads the set after that
     /// (`shell::agent_panel` checks `shutting_down` first on every path that reaches the set).
     pub fn take_all(&mut self) -> Vec<Tab> {
+        self.closing = true;
         std::mem::take(&mut self.tabs)
+    }
+
+    /// Whether no tab of this window has started a session (or is starting one): the state a launch
+    /// is in until something is typed or resumed.
+    pub fn is_pristine(&self) -> bool {
+        self.tabs.iter().all(|t| matches!(t.backend, TabBackend::NotStarted))
+    }
+
+    /// The tabs worth bringing back next launch (`saved_tabs`), or `None` while the window is closing
+    /// and has handed its tabs over to be torn down -- closing every tab is not the user closing
+    /// them. A tab is listed when it has a Claude session, which includes one still being resumed.
+    /// Only the sidecar backend resumes, so a window on the legacy backend lists nothing.
+    ///
+    /// `conversation_id` is the project's (`agent::conversation_id_for_cwd`): every session of one
+    /// project shares it, and a tab whose backend has not been built yet has none of its own.
+    pub fn saved_snapshot(&self, conversation_id: &str) -> Option<SavedTabs> {
+        if self.closing {
+            return None;
+        }
+        if self.kind != BackendKind::Sidecar {
+            return Some(SavedTabs::default());
+        }
+        // `provider_session_id` is read in its own statement per tab (the lock-order rule above).
+        let listed: Vec<(TabId, SavedTab)> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let session = tab.provider_session_id().filter(|id| !id.is_empty())?;
+                Some((
+                    tab.id,
+                    SavedTab {
+                        conversation_id: conversation_id.to_string(),
+                        provider_session_id: session,
+                        name: tab.name.clone(),
+                        mode: tab.mode,
+                    },
+                ))
+            })
+            .collect();
+        // The tab on screen if it is listed, else the listed tab that was on screen most recently.
+        let active = listed
+            .iter()
+            .position(|(id, _)| *id == self.active)
+            .or_else(|| {
+                self.recency
+                    .iter()
+                    .rev()
+                    .find_map(|recent| listed.iter().position(|(id, _)| id == recent))
+            })
+            .unwrap_or(0);
+        Some(SavedTabs {
+            tabs: listed.into_iter().map(|(_, saved)| saved).collect(),
+            active,
+        })
+    }
+
+    /// The user's own `init.lua` choice of the mode new tabs start in (`agent.default_mode`): the
+    /// window's default, and every empty tab it has so far. This is the one route into bypass that
+    /// needs no question, because the question has been answered in a file the user wrote.
+    pub fn apply_configured_default(&mut self, mode: SessionModeChoice) {
+        self.default_mode = mode;
+        for tab in &mut self.tabs {
+            if matches!(tab.backend, TabBackend::NotStarted) {
+                tab.mode = mode;
+            }
+        }
+    }
+
+    /// A launch's saved tabs, ready to come back. A tab saved in bypass is not given back in bypass
+    /// unprompted: with [`BypassPolicy::Ask`] and any such tab this returns the question
+    /// ([`RestoreStep::Confirm`], answered by [`TabSet::answer_restore`]); otherwise it goes ahead.
+    pub fn begin_restore(&mut self, plan: RestorePlan, policy: BypassPolicy) -> RestoreStep {
+        self.pending_bypass = None;
+        self.pending_restore = None;
+        let in_bypass = plan
+            .items
+            .iter()
+            .filter(|i| i.saved_mode == SessionModeChoice::Bypass)
+            .count();
+        if policy == BypassPolicy::Ask && in_bypass > 0 {
+            let nonce = self.next_nonce;
+            self.next_nonce += 1;
+            let tabs = |n: usize| if n == 1 { "tab" } else { "tabs" };
+            let prompt = RestorePrompt {
+                nonce,
+                lines: vec![
+                    format!(
+                        "Restore {} {} ({in_bypass} in bypass)? y/n",
+                        plan.items.len(),
+                        tabs(plan.items.len())
+                    ),
+                    format!("n brings the bypass {} back in auto", tabs(in_bypass)),
+                ],
+            };
+            self.pending_restore = Some(PendingRestore { nonce, plan });
+            return RestoreStep::Confirm(prompt);
+        }
+        RestoreStep::Go(grant(plan, policy, false))
+    }
+
+    /// `y` (`keep_bypass`) or `n` to the question [`TabSet::begin_restore`] asked. Compared against the
+    /// stored prompt before it is taken, so an answer to an old prompt cannot cancel a newer one.
+    pub fn answer_restore(&mut self, nonce: u64, keep_bypass: bool) -> Result<RestoreGo, String> {
+        match &self.pending_restore {
+            Some(pending) if pending.nonce == nonce => {}
+            _ => return Err("that prompt is no longer current".to_string()),
+        }
+        let pending = self.pending_restore.take().expect("checked above");
+        let policy = if keep_bypass {
+            BypassPolicy::Keep
+        } else {
+            BypassPolicy::Downgrade
+        };
+        Ok(grant(pending.plan, policy, true))
+    }
+
+    /// Starts every cleared tab, in order: the first into `from` (the empty tab the restore began in)
+    /// and the rest into new tabs, by the rules a resume by hand follows (a session already open here
+    /// is never resumed twice). `connect` begins one resume and hands back where its result will
+    /// arrive, or says why it cannot (a session another window holds); it is called once per tab to
+    /// start, and a tab it refuses is skipped before any tab is made for it. Afterwards the saved
+    /// active tab is the one on screen, or the first that was started when that one was skipped.
+    ///
+    /// The returned [`RestoreRun`] is fed the results `collect_starts` reports and says when the last
+    /// resume has returned.
+    pub fn start_restore<F>(&mut self, from: TabId, go: RestoreGo, mut connect: F) -> RestoreRun
+    where
+        F: FnMut(&str) -> Result<mpsc::Receiver<Result<AgentBackend, BackendError>>, String>,
+    {
+        let total = go.tabs.len() + go.skipped.len();
+        let mut run = RestoreRun::new(
+            from,
+            self.get(from).map_or(self.default_mode, |t| t.mode),
+            total,
+            go.skipped,
+        );
+        let mut started: Vec<(String, TabId)> = Vec::new();
+        for (n, granted) in go.tabs.into_iter().enumerate() {
+            let GrantedTab { planned, mode } = granted;
+            let id = planned.provider_session_id.clone();
+            if let Some(open) = self.tab_with_session(&id) {
+                run.restored += 1;
+                started.push((id, open));
+                continue;
+            }
+            let result_rx = match connect(&id) {
+                Ok(rx) => rx,
+                Err(reason) => {
+                    run.failed.push(Skipped {
+                        label: planned.label,
+                        reason,
+                    });
+                    continue;
+                }
+            };
+            let ResumeRoute::StartIn(target) = self.route_resume(from, &id, false) else {
+                continue;
+            };
+            let tab = self.get_mut(target).expect("route_resume names a tab it has");
+            tab.mode = mode;
+            tab.backend = TabBackend::Starting(PendingStart {
+                request_id: format!("restore-{}", n + 1),
+                result_rx,
+                first_turn: None,
+                resume: Some(id.clone()),
+                resumed_title: planned.title,
+                resumed_name: planned.name,
+            });
+            run.pending.insert(target, planned.label);
+            run.order.push(target);
+            started.push((id, target));
+        }
+        let on_screen = go
+            .active_session
+            .as_ref()
+            .and_then(|wanted| started.iter().find(|(id, _)| id == wanted))
+            .or_else(|| started.first())
+            .map(|(_, tab)| *tab);
+        if let Some(tab) = on_screen {
+            self.select(tab);
+        }
+        run
+    }
+
+    /// A restored tab whose resume failed. `back_to` is [`RestoreRun::back_to`]: an empty tab again, in
+    /// the mode it had before the restore, if it is the one the restore began in; gone if the restore
+    /// made it. What went wrong is reported once for the whole restore, not left as a dead tab each.
+    pub fn discard_failed_restore(&mut self, tab: TabId, back_to: Option<SessionModeChoice>) {
+        if !matches!(self.get(tab).map(|t| &t.backend), Some(TabBackend::Failed { .. })) {
+            return;
+        }
+        match back_to {
+            Some(mode) => {
+                if let Some(t) = self.get_mut(tab) {
+                    t.backend = TabBackend::NotStarted;
+                    t.reported_start_failure = false;
+                    t.mode = mode;
+                }
+            }
+            None => {
+                self.remove(tab);
+            }
+        }
+    }
+}
+
+/// The modes a restore's tabs get: saved as they were, except that bypass is given back only when
+/// the policy says so.
+fn grant(plan: RestorePlan, policy: BypassPolicy, asked: bool) -> RestoreGo {
+    let mut downgraded = 0;
+    let tabs = plan
+        .items
+        .into_iter()
+        .map(|planned| {
+            let mode = match (planned.saved_mode, policy) {
+                (SessionModeChoice::Bypass, BypassPolicy::Keep) => SessionModeChoice::Bypass,
+                (SessionModeChoice::Bypass, _) => {
+                    downgraded += 1;
+                    SessionModeChoice::Auto
+                }
+                (mode, _) => mode,
+            };
+            GrantedTab { planned, mode }
+        })
+        .collect();
+    RestoreGo {
+        tabs,
+        skipped: plan.skipped,
+        active_session: plan.active_session,
+        downgraded,
+        asked,
     }
 }
 
@@ -6899,5 +7218,628 @@ mod tests {
             "Claude Code safety check — allowed in bypass"
         );
         shut_down_all(&mut set);
+    }
+
+    // ---- saving the tabs, and bringing them back --------------------------------------------
+
+    /// A tab holding a live session whose Claude id is `session` (waits for the id to be adopted).
+    fn give_session(set: &mut TabSet, tab: TabId, dir: &Path, session: &str) -> Arc<RecordingProvider> {
+        let (provider, backend) = live(dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.open_session(session, dir);
+        until("the session id", || {
+            set.get(tab).unwrap().provider_session_id().as_deref() == Some(session)
+        });
+        provider
+    }
+
+    const PROJECT: &str = "conv-0123456789abcdef";
+
+    fn refused(message: &str) -> BackendError {
+        BackendError {
+            message: message.to_string(),
+            benign: false,
+            folded_events: Vec::new(),
+        }
+    }
+
+    fn ids(saved: &SavedTabs) -> Vec<&str> {
+        saved.tabs.iter().map(|t| t.provider_session_id.as_str()).collect()
+    }
+
+    #[test]
+    fn only_tabs_with_a_session_are_listed_in_tab_bar_order_with_their_name_and_mode() {
+        let dir = workspace("tabs-snapshot");
+        let mut set = set();
+        assert_eq!(
+            set.saved_snapshot(PROJECT),
+            Some(SavedTabs::default()),
+            "a fresh window has nothing to save"
+        );
+        let first = set.active();
+        give_session(&mut set, first, &dir, "s-one");
+        set.rename(first, "api");
+        let empty = set.open();
+        let third = set.open();
+        give_session(&mut set, third, &dir, "s-three");
+        set.get_mut(third).unwrap().mode = SessionModeChoice::Bypass;
+
+        let saved = set.saved_snapshot(PROJECT).unwrap();
+        assert_eq!(ids(&saved), ["s-one", "s-three"], "the empty tab is not listed");
+        assert_eq!(saved.tabs[0].name.as_deref(), Some("api"));
+        assert_eq!(saved.tabs[0].mode, SessionModeChoice::Auto);
+        assert_eq!(saved.tabs[1].mode, SessionModeChoice::Bypass);
+        assert!(saved.tabs.iter().all(|t| t.conversation_id == PROJECT));
+        assert_eq!(saved.active, 1, "the tab on screen, among the listed ones");
+
+        set.select(empty);
+        assert_eq!(
+            set.saved_snapshot(PROJECT).unwrap().active,
+            1,
+            "an empty tab on screen falls back to the last listed one"
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn the_saved_active_tab_falls_back_to_the_listed_tab_that_was_active_most_recently() {
+        let dir = workspace("tabs-snapshot-recent");
+        let mut set = set();
+        let a = set.active();
+        give_session(&mut set, a, &dir, "s-a");
+        let b = set.open();
+        give_session(&mut set, b, &dir, "s-b");
+        let c = set.open(); // empty
+        let d = set.open(); // empty
+                            // a, b, c, d in that order; now b, then d: the empty d is on screen.
+        set.select(b);
+        set.select(d);
+        assert_eq!(
+            set.saved_snapshot(PROJECT).unwrap().active,
+            1,
+            "b was the last listed tab on screen"
+        );
+        set.select(a);
+        set.select(c);
+        assert_eq!(set.saved_snapshot(PROJECT).unwrap().active, 0, "now it was a");
+        // Closing the tab it fell back to hands the fallback to the one before it.
+        set.remove(a);
+        assert_eq!(set.saved_snapshot(PROJECT).unwrap().active, 0);
+        assert_eq!(ids(&set.saved_snapshot(PROJECT).unwrap()), ["s-b"]);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_tab_still_resuming_is_listed_and_a_failed_one_is_not() {
+        let mut set = set();
+        let resuming = set.active();
+        let (_tx, result_rx) = mpsc::channel();
+        set.get_mut(resuming).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "r".into(),
+            result_rx,
+            first_turn: None,
+            resume: Some("s-coming".into()),
+            resumed_title: None,
+            resumed_name: None,
+        });
+        let failed = set.open();
+        set.get_mut(failed).unwrap().backend = TabBackend::Failed { reason: "no".into() };
+        assert_eq!(ids(&set.saved_snapshot(PROJECT).unwrap()), ["s-coming"]);
+    }
+
+    #[test]
+    fn the_legacy_backend_resumes_nothing_so_it_lists_nothing() {
+        let dir = workspace("tabs-snapshot-legacy");
+        let mut legacy = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
+        let tab = legacy.active();
+        give_session(&mut legacy, tab, &dir, "s-legacy");
+        assert_eq!(legacy.saved_snapshot(PROJECT), Some(SavedTabs::default()));
+        shut_down_all(&mut legacy);
+    }
+
+    /// Closing the window takes every tab away to tear it down; that is not the user closing them.
+    #[test]
+    fn a_window_that_has_taken_its_tabs_to_close_them_has_no_snapshot() {
+        let dir = workspace("tabs-snapshot-closing");
+        let mut set = set();
+        let tab = set.active();
+        give_session(&mut set, tab, &dir, "s-one");
+        assert!(set.saved_snapshot(PROJECT).is_some());
+        let taken = set.take_all();
+        assert_eq!(set.saved_snapshot(PROJECT), None);
+        for mut tab in taken {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn a_pristine_window_has_no_tab_with_a_session_in_any_state() {
+        let mut set = set();
+        assert!(set.is_pristine());
+        set.open();
+        assert!(set.is_pristine(), "empty tabs do not count");
+        let tab = set.active();
+        set.get_mut(tab).unwrap().backend = TabBackend::Failed { reason: "x".into() };
+        assert!(!set.is_pristine(), "a start that was attempted does");
+        let (_tx, result_rx) = mpsc::channel();
+        set.get_mut(tab).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "r".into(),
+            result_rx,
+            first_turn: None,
+            resume: None,
+            resumed_title: None,
+            resumed_name: None,
+        });
+        assert!(!set.is_pristine());
+    }
+
+    #[test]
+    fn the_configured_default_mode_is_the_one_way_a_window_starts_in_bypass() {
+        let mut set = set();
+        set.apply_configured_default(SessionModeChoice::Bypass);
+        assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
+        assert_eq!(
+            set.active_tab().mode(),
+            SessionModeChoice::Bypass,
+            "the empty tab it already has"
+        );
+        let next = set.open();
+        assert_eq!(
+            set.get(next).unwrap().mode(),
+            SessionModeChoice::Bypass,
+            "and every new one"
+        );
+        // Leaving bypass is as it always was: at once, and the default goes with it.
+        let tab = set.active();
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)),);
+        assert_eq!(set.default_mode(), SessionModeChoice::Auto);
+    }
+
+    fn planned(id: &str, mode: SessionModeChoice) -> PlannedTab {
+        PlannedTab {
+            provider_session_id: id.to_string(),
+            name: None,
+            title: Some(format!("title of {id}")),
+            saved_mode: mode,
+            label: format!("title of {id}"),
+        }
+    }
+
+    fn plan_of(items: Vec<PlannedTab>, active: Option<&str>) -> RestorePlan {
+        RestorePlan {
+            items,
+            skipped: Vec::new(),
+            active_session: active.map(str::to_string),
+        }
+    }
+
+    fn mode_of(set: &TabSet, session: &str) -> SessionModeChoice {
+        set.get(set.tab_with_session(session).expect("the session has a tab"))
+            .unwrap()
+            .mode()
+    }
+
+    #[test]
+    fn tabs_saved_in_auto_go_ahead_without_a_question() {
+        let mut set = set();
+        let plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Auto),
+                planned("b", SessionModeChoice::Auto),
+            ],
+            None,
+        );
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing in bypass, nothing to ask")
+        };
+        assert_eq!((go.downgraded, go.asked), (0, false));
+    }
+
+    #[test]
+    fn a_tab_saved_in_bypass_asks_first_and_y_gives_it_back_in_bypass() {
+        let mut set = set();
+        let plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Auto),
+                planned("b", SessionModeChoice::Bypass),
+                planned("c", SessionModeChoice::Auto),
+            ],
+            None,
+        );
+        let RestoreStep::Confirm(prompt) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("a bypass tab is asked about")
+        };
+        assert_eq!(prompt.lines[0], "Restore 3 tabs (1 in bypass)? y/n");
+        assert!(
+            prompt.lines[1].contains("n brings the bypass tab back in auto"),
+            "{:?}",
+            prompt.lines
+        );
+        let go = set.answer_restore(prompt.nonce, true).unwrap();
+        assert_eq!((go.downgraded, go.asked), (0, true));
+        let from = set.active();
+        let mut asked = Vec::new();
+        set.start_restore(from, go, |id| {
+            asked.push(id.to_string());
+            Ok(mpsc::channel().1)
+        });
+        assert_eq!(asked, ["a", "b", "c"]);
+        assert_eq!(mode_of(&set, "a"), SessionModeChoice::Auto);
+        assert_eq!(mode_of(&set, "b"), SessionModeChoice::Bypass, "after a yes");
+        assert_eq!(mode_of(&set, "c"), SessionModeChoice::Auto);
+    }
+
+    #[test]
+    fn n_gives_the_bypass_tabs_back_in_auto_and_nothing_enters_bypass_without_a_yes() {
+        let mut set = set();
+        let plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Bypass),
+                planned("b", SessionModeChoice::Bypass),
+            ],
+            None,
+        );
+        let RestoreStep::Confirm(prompt) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("asked")
+        };
+        assert_eq!(prompt.lines[0], "Restore 2 tabs (2 in bypass)? y/n");
+        let go = set.answer_restore(prompt.nonce, false).unwrap();
+        assert_eq!(go.downgraded, 2);
+        let from = set.active();
+        set.start_restore(from, go, |_| Ok(mpsc::channel().1));
+        assert_eq!(mode_of(&set, "a"), SessionModeChoice::Auto);
+        assert_eq!(mode_of(&set, "b"), SessionModeChoice::Auto);
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Auto,
+            "the window's default never moved"
+        );
+    }
+
+    #[test]
+    fn a_stale_or_dropped_answer_restores_nothing_and_a_newer_question_replaces_an_older() {
+        let mut set = set();
+        let bypass = || plan_of(vec![planned("a", SessionModeChoice::Bypass)], None);
+        let RestoreStep::Confirm(first) = set.begin_restore(bypass(), BypassPolicy::Ask) else {
+            panic!("asked")
+        };
+        let RestoreStep::Confirm(second) = set.begin_restore(bypass(), BypassPolicy::Ask) else {
+            panic!("asked")
+        };
+        assert_ne!(first.nonce, second.nonce);
+        assert!(
+            set.answer_restore(first.nonce, true).is_err(),
+            "answers the question that was replaced"
+        );
+        assert!(set.answer_restore(0, true).is_err());
+        // Moving to another tab ends the question, as it does a bypass prompt.
+        let other = set.open();
+        let _ = other;
+        assert!(
+            set.answer_restore(second.nonce, true).is_err(),
+            "the question was about the tab that was left"
+        );
+        // And an answer is taken once.
+        let RestoreStep::Confirm(third) = set.begin_restore(bypass(), BypassPolicy::Ask) else {
+            panic!("asked")
+        };
+        assert!(set.answer_restore(third.nonce, false).is_ok());
+        assert!(set.answer_restore(third.nonce, false).is_err());
+    }
+
+    #[test]
+    fn a_quiet_restore_downgrades_bypass_and_says_so_and_the_users_own_default_keeps_it() {
+        let mut set = set();
+        let plan = || {
+            plan_of(
+                vec![
+                    planned("a", SessionModeChoice::Bypass),
+                    planned("b", SessionModeChoice::Auto),
+                ],
+                None,
+            )
+        };
+        let RestoreStep::Go(quiet) = set.begin_restore(plan(), BypassPolicy::Downgrade) else {
+            panic!("no question")
+        };
+        assert_eq!((quiet.downgraded, quiet.asked), (1, false));
+        let RestoreStep::Go(kept) = set.begin_restore(plan(), BypassPolicy::Keep) else {
+            panic!("no question")
+        };
+        assert_eq!((kept.downgraded, kept.asked), (0, false));
+        let from = set.active();
+        set.start_restore(from, kept, |_| Ok(mpsc::channel().1));
+        assert_eq!(
+            mode_of(&set, "a"),
+            SessionModeChoice::Bypass,
+            "init.lua said bypass is fine"
+        );
+    }
+
+    #[test]
+    fn restored_tabs_start_in_order_the_first_in_the_empty_tab_and_the_saved_active_one_is_shown() {
+        let mut set = set();
+        let from = set.active();
+        let plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Auto),
+                planned("b", SessionModeChoice::Auto),
+                planned("c", SessionModeChoice::Auto),
+            ],
+            Some("b"),
+        );
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        let run = set.start_restore(from, go, |_| Ok(mpsc::channel().1));
+        let numbers: Vec<(u16, Option<String>)> =
+            set.tabs().iter().map(|t| (t.number, t.provider_session_id())).collect();
+        assert_eq!(
+            numbers,
+            vec![
+                (1, Some("a".to_string())),
+                (2, Some("b".to_string())),
+                (3, Some("c".to_string()))
+            ],
+            "the first went into the tab the restore began in, the rest into new ones, in order"
+        );
+        assert_eq!(set.get(from).unwrap().provider_session_id().as_deref(), Some("a"));
+        assert_eq!(set.active_tab().provider_session_id().as_deref(), Some("b"));
+        assert!(run.owns(from) && run.began_in(from));
+        assert_eq!(run.outcome(), None, "nothing has connected yet");
+    }
+
+    #[test]
+    fn when_the_saved_active_tab_is_skipped_the_first_restored_tab_is_shown() {
+        let mut set = set();
+        let from = set.active();
+        let mut plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Auto),
+                planned("b", SessionModeChoice::Auto),
+            ],
+            Some("gone"),
+        );
+        plan.skipped.push(Skipped {
+            label: "gone".into(),
+            reason: "its saved record is gone".into(),
+        });
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        set.start_restore(from, go, |_| Ok(mpsc::channel().1));
+        assert_eq!(set.active_tab().provider_session_id().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_session_already_open_here_is_switched_to_and_never_resumed_twice() {
+        let dir = workspace("tabs-restore-dedupe");
+        let mut set = set();
+        let holder = set.active();
+        give_session(&mut set, holder, &dir, "s-open");
+        let from = set.open();
+        let plan = plan_of(
+            vec![
+                planned("s-open", SessionModeChoice::Auto),
+                planned("s-new", SessionModeChoice::Auto),
+            ],
+            None,
+        );
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        let mut connected = Vec::new();
+        let run = set.start_restore(from, go, |id| {
+            connected.push(id.to_string());
+            Ok(mpsc::channel().1)
+        });
+        assert_eq!(connected, ["s-new"], "the open one is not connected again");
+        assert_eq!(set.tab_with_session("s-open"), Some(holder));
+        assert_eq!(set.tabs().len(), 2, "and no tab was made for it");
+        assert_eq!(run.outcome(), None, "s-new is still connecting");
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_tab_that_cannot_connect_is_skipped_before_any_tab_is_made_for_it() {
+        let mut set = set();
+        let from = set.active();
+        let plan = plan_of(
+            vec![
+                planned("held", SessionModeChoice::Auto),
+                planned("free", SessionModeChoice::Auto),
+            ],
+            None,
+        );
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        let run = set.start_restore(from, go, |id| {
+            if id == "held" {
+                Err("open in another window".to_string())
+            } else {
+                Ok(mpsc::channel().1)
+            }
+        });
+        assert_eq!(
+            set.tabs().len(),
+            1,
+            "the one that connected took the empty tab; none was made for the other"
+        );
+        assert_eq!(set.get(from).unwrap().provider_session_id().as_deref(), Some("free"));
+        assert!(run.owns(from));
+        assert_eq!(run.failed.len(), 1);
+    }
+
+    /// The whole of a restore as the panel drives it: every resume reports through `collect_starts`,
+    /// and one message ends it.
+    #[test]
+    fn a_restore_ends_in_one_message_once_every_resume_has_returned() {
+        let dir = workspace("tabs-restore-outcome");
+        let mut set = set();
+        let from = set.active();
+        let mut plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Auto),
+                planned("b", SessionModeChoice::Auto),
+                planned("c", SessionModeChoice::Auto),
+            ],
+            Some("c"),
+        );
+        plan.skipped.push(Skipped {
+            label: "docs".into(),
+            reason: "open in another window".into(),
+        });
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        let mut senders = Vec::new();
+        let mut run = set.start_restore(from, go, |_| {
+            let (tx, rx) = mpsc::channel();
+            senders.push(tx);
+            Ok(rx)
+        });
+        assert_eq!(run.outcome(), None);
+
+        // a connects, b is refused, c has not answered yet.
+        let (_provider, backend) = live(&dir);
+        senders[0].send(Ok(backend)).unwrap();
+        senders[1]
+            .send(Err(refused("could not continue the previous session: no such session")))
+            .unwrap();
+        for collected in set.collect_starts() {
+            match collected {
+                StartCollected::Installed { tab, .. } => run.note_installed(tab),
+                StartCollected::Failed { tab, error, .. } => {
+                    run.note_failed(tab, &error.message);
+                    set.discard_failed_restore(tab, run.back_to(tab));
+                }
+            }
+        }
+        assert_eq!(run.outcome(), None, "c is still connecting");
+        assert_eq!(set.tabs().len(), 2, "the refused tab is gone, not left behind dead");
+        assert!(set.tab_with_session("b").is_none());
+
+        let (_provider, backend) = live(&dir);
+        senders[2].send(Ok(backend)).unwrap();
+        for collected in set.collect_starts() {
+            if let StartCollected::Installed { tab, .. } = collected {
+                run.note_installed(tab);
+            }
+        }
+        assert_eq!(
+            run.outcome().unwrap().message(),
+            "Restored 2 of 4 tabs; 2 could not be: docs (open in another window), title of b (could not continue the previous session: no such session)"
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn when_the_tab_the_restore_began_in_fails_it_is_an_empty_tab_again() {
+        let mut set = set();
+        let from = set.active();
+        let plan = plan_of(vec![planned("a", SessionModeChoice::Auto)], None);
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut rx = Some(rx);
+        let mut run = set.start_restore(from, go, |_| Ok(rx.take().unwrap()));
+        tx.send(Err(refused("refused"))).unwrap();
+        for collected in set.collect_starts() {
+            if let StartCollected::Failed { tab, error, .. } = collected {
+                run.note_failed(tab, &error.message);
+                set.discard_failed_restore(tab, run.back_to(tab));
+            }
+        }
+        assert!(matches!(set.get(from).unwrap().backend, TabBackend::NotStarted));
+        assert!(set.is_pristine());
+        assert_eq!(
+            run.outcome().unwrap().message(),
+            "Restored 0 of 1 tab; 1 could not be: title of a (refused)"
+        );
+    }
+
+    /// Only a failed restored tab is cleaned up: a live session is never closed by this.
+    #[test]
+    fn discarding_leaves_any_tab_that_is_not_failed_alone() {
+        let mut set = set();
+        let tab = set.active();
+        set.discard_failed_restore(tab, Some(SessionModeChoice::Auto));
+        let other = set.open();
+        set.discard_failed_restore(other, None);
+        assert_eq!(set.tabs().len(), 2);
+    }
+
+    /// What `shell` does every tick: show the memory the window's tabs. Each listed change reaches the
+    /// file once; an empty tab, a repeat and the window closing reach it not at all.
+    #[test]
+    fn the_saved_file_follows_the_tabs_and_never_records_the_window_closing() {
+        use crate::saved_tabs::{load, Loaded, TabMemory};
+        let dir = workspace("tabs-memory");
+        let state = crate::test_scratch_dir::ScratchDir::new("nv-tab-memory", "follows");
+        let root = PathBuf::from("/home/user/project");
+        let mut memory = TabMemory::new(Some(state.to_path_buf()), root.clone());
+        let mut set = set();
+        let show = |set: &TabSet, memory: &mut TabMemory| memory.observe(set.saved_snapshot(PROJECT)).is_some();
+        let on_disk = |state: &Path| match load(state, &root) {
+            Loaded::Saved(saved) => saved,
+            other => panic!("expected a saved file, found {other:?}"),
+        };
+
+        assert!(
+            !show(&set, &mut memory),
+            "a launch that has done nothing writes nothing"
+        );
+
+        let first = set.active();
+        give_session(&mut set, first, &dir, "s-one");
+        assert!(show(&set, &mut memory), "a session adopted");
+        assert_eq!(ids(&on_disk(&state)), ["s-one"]);
+        assert!(!show(&set, &mut memory), "the same tabs again");
+
+        set.rename(first, "api");
+        assert!(show(&set, &mut memory), "renamed");
+        assert_eq!(on_disk(&state).tabs[0].name.as_deref(), Some("api"));
+
+        let empty = set.open();
+        assert!(
+            !show(&set, &mut memory),
+            "an empty tab is not listed, and neither is its being active"
+        );
+        let second = set.open();
+        give_session(&mut set, second, &dir, "s-two");
+        assert!(show(&set, &mut memory), "a second session");
+        assert_eq!(on_disk(&state).active, 1);
+
+        set.select(first);
+        assert!(show(&set, &mut memory), "the active tab switched");
+        assert_eq!(on_disk(&state).active, 0);
+
+        set.get_mut(second).unwrap().mode = SessionModeChoice::Bypass;
+        assert!(show(&set, &mut memory), "its mode changed");
+        assert_eq!(on_disk(&state).tabs[1].mode, SessionModeChoice::Bypass);
+
+        let gone = set.remove(empty);
+        assert!(gone.is_some());
+        assert!(!show(&set, &mut memory), "closing an empty tab changes nothing listed");
+        set.remove(second);
+        assert!(show(&set, &mut memory), "a listed tab closed");
+        assert_eq!(ids(&on_disk(&state)), ["s-one"]);
+
+        // The window closing takes every tab to tear them down: nothing is recorded.
+        let before = std::fs::read_to_string(state.join(crate::layout::persist::file_name(&root))).unwrap();
+        let taken = set.take_all();
+        assert!(!show(&set, &mut memory));
+        for mut tab in taken {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+        assert!(!show(&set, &mut memory));
+        let after = std::fs::read_to_string(state.join(crate::layout::persist::file_name(&root))).unwrap();
+        assert_eq!(before, after, "the file still says what was open");
     }
 }

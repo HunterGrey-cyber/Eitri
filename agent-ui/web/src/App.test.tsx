@@ -10941,6 +10941,49 @@ describe("v1 mode fix round 1: the prompt and the chooser take the keys whole", 
     expect(lastOfType("queue_message")).toBeUndefined();
     expect(confirms()).toEqual([]);
   });
+
+  /** The keys MOVED into a text field after the prompt appeared (a click on the composer): what is typed
+   *  there is text. The first `y` of "you should" must not enter bypass just because the prompt was still
+   *  up, and the key goes to the field. */
+  it("a y typed after the keys moved into the composer is typed, not an answer: the prompt ends", () => {
+    fakeClock();
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 21, lines: ["Switch to bypass? (y/n)"] });
+    wait(300);
+    expect(container.querySelector(".band-prompt")).not.toBeNull();
+    // A click on the composer's BROWSE line focuses it, which opens the box and moves the keys into it.
+    act(() => container.querySelector<HTMLElement>(".composer-browse-hint")!.focus());
+    const box = container.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+    expect(document.activeElement).toBe(box);
+    expect(container.querySelector(".band-prompt"), "the question ended when the keys moved").toBeNull();
+    wait(300);
+    const left = fireEvent.keyDown(box, { key: "y" });
+    expect(left, "the key is left for the box").toBe(true);
+    expect(confirms()).toEqual([]);
+  });
+
+  /** The other way round, which is how an INPUT user answers: Shift+Tab in the composer, the keys never
+   *  leave it, and its `y` is the answer. */
+  it("a y typed in a composer that already had the keys when the prompt opened still answers it", () => {
+    fakeClock();
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    enterInputMode(container);
+    const box = container.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+    expect(document.activeElement).toBe(box);
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 22, lines: ["Switch to bypass? (y/n)"] });
+    wait(300);
+    expect(container.querySelector(".band-prompt")).not.toBeNull();
+    fireEvent.keyDown(box, { key: "y" });
+    expect(lastOfType("confirm_bypass")).toMatchObject({ tab: 1, scope: "tab", nonce: 22 });
+  });
 });
 
 /* Task 3 (v1 v1-ui plan): the page's own half of C1's mechanism (spec §3.5) -- the `panel_keys`
@@ -14221,5 +14264,204 @@ describe("rc.4 review: a route that hands the keys elsewhere ends every pending 
     expect(container.querySelector(".path-pick"), "the picker is gone").toBeNull();
     fireEvent.keyDown(conversationRoot(container), { key: "a" });
     expect(posted.filter((m) => m.type === "open_path")).toEqual([]);
+  });
+});
+
+/** Restoring the last window's tabs: `s` on the launch dashboard asks for them, and a saved tab that was in
+ *  bypass is asked about first -- `y` gives it back in bypass, `n` in auto, anything else cancels. Rust owns
+ *  every other rule (which tabs, which leases); what is checked here is what the page says and sends. */
+describe("restoring the last session's tabs", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const OFFER = { labels: ["api", "docs"], bypass: 1 };
+  const SIDECAR_HELLO: Hello = { ...HELLO, backend: "sidecar", restore: OFFER };
+
+  /** A fake clock for the on-screen wait a bypass `y` needs, as the bypass prompt's own tests use. */
+  function fakeClock() {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+  }
+
+  function emptyTabWithOffer(hello: Hello = SIDECAR_HELLO, options: { browse?: boolean } = {}) {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...hello });
+    dispatchEmptyTab();
+    if (options.browse !== false) dispatch({ kind: "arrive" });
+    act(() => widen(container));
+    return { container, root: container.querySelector(".empty-tab")! };
+  }
+
+  it("draws the line and `s` asks Rust for the tabs, naming the tab it was pressed in", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = emptyTabWithOffer();
+      const row = Array.from(container.querySelectorAll<HTMLElement>(".dash-item")).find((el) => el.textContent?.includes("Restore"))!;
+      expect(row.querySelector(".dash-label")!.textContent).toBe("Restore last session (2 tabs, 1 in bypass: api, docs)");
+      fireEvent.keyDown(root, { key: "s" });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(lastOfType("restore_last")).toMatchObject({ tab: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("draws no line, and `s` does nothing, once Rust stops offering", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = emptyTabWithOffer();
+      dispatch({ kind: "hello", ...SIDECAR_HELLO, restore: null });
+      expect(container.textContent).not.toContain("Restore last session");
+      fireEvent.keyDown(root, { key: "s" });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(lastOfType("restore_last")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a click on the line asks too", () => {
+    const { container } = emptyTabWithOffer();
+    const row = Array.from(container.querySelectorAll<HTMLElement>(".dash-item")).find((el) => el.textContent?.includes("Restore"))!;
+    fireEvent.click(row);
+    expect(lastOfType("restore_last")).toMatchObject({ tab: 1 });
+  });
+
+  it("draws Rust's question in the band, and a lone y after the wait restores in bypass, echoing the nonce", () => {
+    fakeClock();
+    try {
+      const { container, root } = emptyTabWithOffer();
+      dispatch({ kind: "confirm_restore", nonce: 4, lines: ["Restore 2 tabs (1 in bypass)? y/n", "n brings the bypass tab back in auto"] });
+      expect(container.querySelector(".band-prompt")!.textContent).toBe(
+        "Restore 2 tabs (1 in bypass)? y/n · n brings the bypass tab back in auto",
+      );
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "y" });
+      expect(lastOfType("restore_answer")).toMatchObject({ nonce: 4, keep_bypass: true });
+      expect(container.querySelector(".band-prompt")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("n restores in auto, at once and echoing the nonce", () => {
+    fakeClock();
+    try {
+      const { container, root } = emptyTabWithOffer();
+      dispatch({ kind: "confirm_restore", nonce: 5, lines: ["Restore 2 tabs (1 in bypass)? y/n"] });
+      fireEvent.keyDown(root, { key: "n" });
+      expect(lastOfType("restore_answer")).toMatchObject({ nonce: 5, keep_bypass: false });
+      expect(container.querySelector(".band-prompt")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["Escape", "q", "Enter"])("%s cancels and posts nothing", (key) => {
+    fakeClock();
+    try {
+      const { container, root } = emptyTabWithOffer();
+      dispatch({ kind: "confirm_restore", nonce: 6, lines: ["Restore 2 tabs (1 in bypass)? y/n"] });
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key });
+      expect(lastOfType("restore_answer")).toBeUndefined();
+      expect(container.querySelector(".band-prompt")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** A `y` that is part of typed prose, or arrives before the prompt could be read, must not enter bypass:
+   *  it cancels and says why, as the bypass prompt's own `y` does. */
+  it("a y too soon after the question appeared enters nothing and says why", () => {
+    fakeClock();
+    try {
+      const { container, root } = emptyTabWithOffer();
+      dispatch({ kind: "confirm_restore", nonce: 7, lines: ["Restore 2 tabs (1 in bypass)? y/n"] });
+      fireEvent.keyDown(root, { key: "y" });
+      expect(lastOfType("restore_answer")).toBeUndefined();
+      expect(container.querySelector(".band-prompt")).toBeNull();
+      expect(container.textContent).toContain("y must be pressed on its own");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a y with Ctrl held is an editing key, not an answer", () => {
+    fakeClock();
+    try {
+      const { root } = emptyTabWithOffer();
+      dispatch({ kind: "confirm_restore", nonce: 8, lines: ["Restore 2 tabs (1 in bypass)? y/n"] });
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "y", ctrlKey: true });
+      expect(lastOfType("restore_answer")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a newer question replaces an older one: the newest nonce is what is answered", () => {
+    fakeClock();
+    try {
+      const { root } = emptyTabWithOffer();
+      dispatch({ kind: "confirm_restore", nonce: 1, lines: ["Restore 2 tabs (1 in bypass)? y/n"] });
+      dispatch({ kind: "confirm_restore", nonce: 2, lines: ["Restore 2 tabs (1 in bypass)? y/n"] });
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "y" });
+      expect(posted.filter((m) => m.type === "restore_answer")).toHaveLength(1);
+      expect(lastOfType("restore_answer")).toMatchObject({ nonce: 2 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** The keys moved into the composer (a click on it, or on the row from INPUT) while the question was up:
+   *  what is typed there is text, not an answer, and the first `y` of "you should" must not give bypass. */
+  it("typing into the composer cancels the question instead of answering it, and the key is typed", () => {
+    fakeClock();
+    try {
+      const { container } = emptyTabWithOffer(SIDECAR_HELLO, { browse: false });
+      const box = container.querySelector("textarea")!;
+      dispatch({ kind: "confirm_restore", nonce: 12, lines: ["Restore 2 tabs (1 in bypass)? y/n"] });
+      act(() => vi.advanceTimersByTime(300));
+      const typed = fireEvent.keyDown(box, { key: "y" });
+      expect(typed, "the key is left for the box").toBe(true);
+      expect(lastOfType("restore_answer")).toBeUndefined();
+      expect(container.querySelector(".band-prompt")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the keys moving into the composer after the question appeared end it, and the next y is typed", () => {
+    fakeClock();
+    try {
+      const { container } = emptyTabWithOffer();
+      dispatch({ kind: "confirm_restore", nonce: 13, lines: ["Restore 2 tabs (1 in bypass)? y/n"] });
+      act(() => vi.advanceTimersByTime(300));
+      act(() => container.querySelector<HTMLElement>(".composer-browse-hint")!.focus());
+      const box = container.querySelector("textarea")!;
+      expect(document.activeElement).toBe(box);
+      expect(container.querySelector(".band-prompt")).toBeNull();
+      act(() => vi.advanceTimersByTime(300));
+      expect(fireEvent.keyDown(box, { key: "y" })).toBe(true);
+      expect(lastOfType("restore_answer")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the pane losing the keys drops the question, so a later y answers nothing", () => {
+    fakeClock();
+    try {
+      const { container, root } = emptyTabWithOffer();
+      dispatch({ kind: "confirm_restore", nonce: 9, lines: ["Restore 2 tabs (1 in bypass)? y/n"] });
+      dispatch({ kind: "pane_focus", focused: false });
+      dispatch({ kind: "pane_focus", focused: true });
+      expect(container.querySelector(".band-prompt")).toBeNull();
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "y" });
+      expect(lastOfType("restore_answer")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

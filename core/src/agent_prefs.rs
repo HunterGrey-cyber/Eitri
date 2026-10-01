@@ -97,6 +97,27 @@ pub fn set_aside(dir: &Path, project_root: &Path) -> std::io::Result<PathBuf> {
     Ok(aside)
 }
 
+/// The `init.lua` key: `eitri.config.set("agent.default_mode", "auto" | "bypass")`.
+pub const DEFAULT_MODE_KEY: &str = "agent.default_mode";
+
+/// The value of [`DEFAULT_MODE_KEY`] as `init.lua` left it: `None` for unset (new tabs start in
+/// auto, as ever), else the mode named. Anything but the two words is an error naming the key, as
+/// every other configuration key here is.
+pub fn parse_default_mode(value: Option<&str>) -> Result<Option<SessionModeChoice>, String> {
+    let Some(raw) = value else { return Ok(None) };
+    SessionModeChoice::parse(raw.trim())
+        .map(Some)
+        .ok_or_else(|| format!("eitri.config.set(\"{DEFAULT_MODE_KEY}\", {raw:?}): must be \"auto\" or \"bypass\""))
+}
+
+/// Whether this project has a remembered choice of mode that the configured default must not
+/// override: a readable file that says `auto` (the only thing [`save_mode`] writes, once Shift+Tab
+/// has left bypass). A file from before v1 that says bypass is not a choice anyone is still making,
+/// and a missing or unusable one says nothing.
+pub fn remembers_a_choice(dir: Option<&Path>, project_root: &Path) -> bool {
+    dir.is_some_and(|dir| load_mode(dir, project_root) == LoadedMode::Remembered(SessionModeChoice::Auto))
+}
+
 /// The mode new tabs take at launch, and what to log. `dir` is `None` when there is no state
 /// directory at all. The first mode `CLIENT_IMPLEMENTED_PERMISSION_MODES` offers is the default.
 pub fn startup_mode(dir: Option<&Path>, project_root: &Path) -> (SessionModeChoice, Vec<String>) {
@@ -289,5 +310,46 @@ mod tests {
         assert_eq!(SessionModeChoice::parse("bypass"), Some(SessionModeChoice::Bypass));
         assert_eq!(SessionModeChoice::parse("verdandi_rules"), None);
         assert_eq!(SessionModeChoice::Auto.as_str(), "auto");
+    }
+
+    #[test]
+    fn the_default_mode_key_reads_its_two_words_and_nothing_else() {
+        assert_eq!(parse_default_mode(None), Ok(None));
+        assert_eq!(parse_default_mode(Some("auto")), Ok(Some(SessionModeChoice::Auto)));
+        assert_eq!(
+            parse_default_mode(Some(" bypass ")),
+            Ok(Some(SessionModeChoice::Bypass))
+        );
+        for bad in ["", "Bypass", "yes", "plan", "bypassPermissions"] {
+            let err = parse_default_mode(Some(bad)).unwrap_err();
+            assert!(
+                err.contains("agent.default_mode") && err.contains(&format!("{bad:?}")),
+                "{err}"
+            );
+        }
+    }
+
+    /// The configured default yields to a mode Shift+Tab remembered, and only to that.
+    #[test]
+    fn only_an_auto_the_user_left_bypass_for_counts_as_a_remembered_choice() {
+        let dir = scratch("remembers");
+        assert!(!remembers_a_choice(None, &root()));
+        assert!(!remembers_a_choice(Some(&dir), &root()), "nothing written yet");
+        save_mode(&dir, &root(), SessionModeChoice::Auto).unwrap();
+        assert!(remembers_a_choice(Some(&dir), &root()));
+
+        let path = dir.join(crate::layout::persist::file_name(&root()));
+        let raw = format!(
+            "{{\"version\":1,\"project_root\":{:?},\"permission_mode\":\"bypass\"}}",
+            root().to_string_lossy()
+        );
+        std::fs::write(&path, raw).unwrap();
+        assert!(
+            !remembers_a_choice(Some(&dir), &root()),
+            "a pre-v1 bypass is not a choice"
+        );
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(!remembers_a_choice(Some(&dir), &root()));
+        assert!(path.exists(), "asking never moves the file");
     }
 }

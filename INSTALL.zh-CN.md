@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=b334d94c6e4e533a9dd2ad679aba76e72a6f99dd0458faf4895fec9d53a1bc36 -->
+<!-- translated-from: INSTALL.md sha256=7af6b10284821b93ebf1fe183b348b4ed0b308adf9aaada04110d54da69c968a -->
 
 # 安装 Eitri
 
@@ -122,7 +122,7 @@ sh install.sh --uninstall            # 保留 ~/.config/eitri 和各项目自己
 sh install.sh --uninstall --purge    # 同时删除 ~/.config/eitri 和 $XDG_STATE_HOME/eitri
 ```
 
-这会删除 `~/.local/lib/eitri`、`~/.local/bin/eitri` 启动器（只有当它带着 Eitri 自己的标记行时才会删；同名但无关的文件会被原样保留并被指出来）、desktop 条目（以及 0.2.0 的 `eitri.desktop`，只有当它与 0.2.0 的安装脚本写下的逐字节一致时才删）、[文件都装到哪里去了](#where-things-go)里列出的那九个图标文件，一个不多（你图标主题目录里你自己的文件都保留，即使它的名字和 Eitri 的一样、尺寸又是 Eitri 不装的）和许可证、`$XDG_DATA_HOME/eitri/nvim`（私有 nvim 副本）、下载缓存，以及除了某个已安装的 `.deb`/`.rpm` 在它的 `/usr/lib/eitri/RELEASE` 里仍然引用的那一个之外的所有 sidecar revision——所以卸载一份 tarball 安装，永远不会连带删掉软件包安装的 sidecar。除非你加上 `--purge`，否则它总是会保留 `~/.config/eitri`（你的 `init.lua`）和 `$XDG_STATE_HOME/eitri`（各项目的布局、提示词历史、已保存的权限规则）；`$XDG_DATA_HOME/eitri/nvim` 之外任何叫 `nvim`/`vim`/`vi` 的东西都不会被动到。对于 `.deb`/`.rpm` 安装，软件包本身从来不管那份按用户的 sidecar 或私有 nvim，所以移除软件包（`sudo apt remove eitri` / `sudo dnf remove eitri`）会把两者都留下——**而且清理它们的顺序很重要**。`eitri setup --uninstall` 对这种情况没用：`eitri setup` 就是 `/usr/lib/eitri/eitri-setup`，会随着 `/usr/bin/eitri` 一起被软件包删掉；而如果你在移除软件包*之前*运行它，它会保留下所有那些还在被这份已安装软件包自己的 `/usr/lib/eitri/RELEASE` 引用的 sidecar revision——这个文件正是它用来区分"某个已安装的 Eitri 还需要这个"和"没有谁需要它"的依据（同一份文件也决定了一次普通的[更新](#updating)）。所以：先用你的包管理器移除软件包，然后重新下载一份 `install.sh`（或者用你提前留好的一份副本），运行 `sh install.sh --uninstall`——软件包自己的 `RELEASE` 已经没了，这一次就没有什么能阻止它把 sidecar 和私有 nvim 一起删掉。这和上面是同一个 `--uninstall`，所以如果你在 `~/.local` 下还有一份 tarball 安装，它也会把那份安装连同它的 sidecar 一起删掉。想保留那份安装，就跳过这一步：它自己的更新会在某个 sidecar revision 不再被任何安装使用时把它删掉，见[更新](#updating)。
+这会删除 `~/.local/lib/eitri`、`~/.local/bin/eitri` 启动器（只有当它带着 Eitri 自己的标记行时才会删；同名但无关的文件会被原样保留并被指出来）、desktop 条目（以及 0.2.0 的 `eitri.desktop`，只有当它与 0.2.0 的安装脚本写下的逐字节一致时才删）、[文件都装到哪里去了](#where-things-go)里列出的那九个图标文件，一个不多（你图标主题目录里你自己的文件都保留，即使它的名字和 Eitri 的一样、尺寸又是 Eitri 不装的）和许可证、`$XDG_DATA_HOME/eitri/nvim`（私有 nvim 副本）、下载缓存，以及除了某个已安装的 `.deb`/`.rpm` 在它的 `/usr/lib/eitri/RELEASE` 里仍然引用的那一个之外的所有 sidecar revision——所以卸载一份 tarball 安装，永远不会连带删掉软件包安装的 sidecar。除非你加上 `--purge`，否则它总是会保留 `~/.config/eitri`（你的 `init.lua`）和 `$XDG_STATE_HOME/eitri`（各项目的布局、已打开的标签页、提示词历史、已保存的权限规则）；`$XDG_DATA_HOME/eitri/nvim` 之外任何叫 `nvim`/`vim`/`vi` 的东西都不会被动到。对于 `.deb`/`.rpm` 安装，软件包本身从来不管那份按用户的 sidecar 或私有 nvim，所以移除软件包（`sudo apt remove eitri` / `sudo dnf remove eitri`）会把两者都留下——**而且清理它们的顺序很重要**。`eitri setup --uninstall` 对这种情况没用：`eitri setup` 就是 `/usr/lib/eitri/eitri-setup`，会随着 `/usr/bin/eitri` 一起被软件包删掉；而如果你在移除软件包*之前*运行它，它会保留下所有那些还在被这份已安装软件包自己的 `/usr/lib/eitri/RELEASE` 引用的 sidecar revision——这个文件正是它用来区分"某个已安装的 Eitri 还需要这个"和"没有谁需要它"的依据（同一份文件也决定了一次普通的[更新](#updating)）。所以：先用你的包管理器移除软件包，然后重新下载一份 `install.sh`（或者用你提前留好的一份副本），运行 `sh install.sh --uninstall`——软件包自己的 `RELEASE` 已经没了，这一次就没有什么能阻止它把 sidecar 和私有 nvim 一起删掉。这和上面是同一个 `--uninstall`，所以如果你在 `~/.local` 下还有一份 tarball 安装，它也会把那份安装连同它的 sidecar 一起删掉。想保留那份安装，就跳过这一步：它自己的更新会在某个 sidecar revision 不再被任何安装使用时把它删掉，见[更新](#updating)。
 
 <a id="where-things-go"></a>
 ## 文件都装到哪里去了
@@ -141,12 +141,24 @@ sh install.sh --uninstall --purge    # 同时删除 ~/.config/eitri 和 $XDG_STA
 $XDG_DATA_HOME/eitri/sidecar/<rev>/                              eitri setup 构建出的 sidecar，按用户的各条路径
 $XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               私有 nvim 副本，仅在你接受该提议时才有
 ~/.config/eitri/init.lua                                         你自己的配置（EITRI_CONFIG_DIR 可覆盖该目录）
-$XDG_STATE_HOME/eitri/                                           各项目的布局、提示词历史、权限规则
+$XDG_STATE_HOME/eitri/                                           各项目的布局、已打开的标签页、提示词历史、权限规则
 ```
 
 除了 **AUR**（`eitri-bin`/`eitri-git`）之外，上面这些安装路径的 sidecar 都是按用户的——AUR 的 `build()` 会把它构建在 `/usr/lib/eitri/` 里（见 [AUR](#aur-arch)）。
 
 `$XDG_DATA_HOME`/`$XDG_CACHE_HOME`/`$XDG_STATE_HOME` 遵循通常的规则：未设置、为空或者是相对路径时，分别回退到 `~/.local/share`、`~/.cache` 和 `~/.local/state`——这和 Eitri 自己用的规则完全一样，所以安装脚本和运行中的程序永远不会在该去哪里找这件事上产生分歧。私有 nvim 副本永远不会被放上 `PATH`，也永远不会替换、链接或删除你系统里任何其他叫 `nvim`/`vim`/`vi` 的东西。
+
+## 一次启动怎样开始：`init.lua` 里的两个设置
+
+两个都写在 `~/.config/eitri/init.lua` 里；设成这里没列出的值，Eitri 会在启动时直接停下，并指出是哪个设置。
+
+```lua
+eitri.config.set("agent.restore", "offer")        -- "offer"（默认）、"auto" 或 "off"
+eitri.config.set("agent.default_mode", "auto")    -- "auto"（默认）或 "bypass"
+```
+
+- **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有 Claude 会话的标签页（它们的顺序、名字、模式，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成"没有标签页"。设为 `"offer"` 时，只要窗口里还没有任何会话开始，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来；`"off"` 既不提议也不记录。每个标签页都会被恢复（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。上次处于 bypass 的标签页，没有你的一句"是"，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。
+- **`agent.default_mode`** 是新标签页开始时所处的模式，针对你还没有用 `Shift+Tab` 离开过 bypass 的项目（那个选择按项目记住，并且始终优先）。设为 `"bypass"` 是唯一一种窗口不经询问就以 bypass 开始的方式，因为你已经在自己的文件里这么说了；它同时也让保存下来的 bypass 标签页不必回答那个问题就以 bypass 回来。
 
 ## 疑难排解
 

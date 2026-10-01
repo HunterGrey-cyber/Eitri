@@ -305,6 +305,73 @@ describe("EmptyTab (F3)", () => {
       }
     });
 
+    /** The last window's tabs: `s` brings them back, `TYPING_GUARD_MS` later like `r`, so typed prose
+     *  ("see the diff") cannot restore anything on its own `s`. */
+    describe("s restores the last window's tabs", () => {
+      const OFFERED: Hello = { ...HELLO, restore: { labels: ["api", "docs"], bypass: 0 } };
+
+      it("runs TYPING_GUARD_MS later, once, and not before", () => {
+        vi.useFakeTimers();
+        try {
+          const onRestoreLast = vi.fn();
+          const rendered = renderEmpty({ hello: OFFERED, onRestoreLast });
+          const root = toBrowse(rendered, rendered.props);
+          fireEvent.keyDown(root, { key: "s" });
+          expect(onRestoreLast).not.toHaveBeenCalled();
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+          expect(onRestoreLast).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("does nothing with no offer: a dead key is never drawn and never run", () => {
+        vi.useFakeTimers();
+        try {
+          const onRestoreLast = vi.fn();
+          const rendered = renderEmpty({ hello: { ...HELLO, restore: null }, onRestoreLast });
+          const root = toBrowse(rendered, rendered.props);
+          fireEvent.keyDown(root, { key: "s" });
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+          expect(onRestoreLast).not.toHaveBeenCalled();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('"see" at 80 ms a key restores nothing, and the band names s', () => {
+        vi.useFakeTimers();
+        try {
+          const onRestoreLast = vi.fn();
+          const onFlash = vi.fn();
+          const rendered = renderEmpty({ hello: OFFERED, onRestoreLast, onFlash });
+          const root = toBrowse(rendered, rendered.props);
+          for (const key of ["s", "e", "e"]) {
+            fireEvent.keyDown(root, { key });
+            act(() => vi.advanceTimersByTime(80));
+          }
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+          expect(onRestoreLast).not.toHaveBeenCalled();
+          expect(onFlash).toHaveBeenCalledWith(tableKeyTypingFlash("s", "restore the last session"));
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("Enter on its row runs it, and so does a click", () => {
+        const onRestoreLast = vi.fn();
+        const rendered = renderEmpty({ hello: OFFERED, onRestoreLast });
+        const root = toBrowse(rendered, rendered.props);
+        keyGap();
+        fireEvent.keyDown(root, { key: "j" }); // new -> restore
+        keyGap();
+        fireEvent.keyDown(root, { key: "Enter" });
+        expect(onRestoreLast).toHaveBeenCalledTimes(1);
+        fireEvent.click(rendered.container.querySelectorAll('[data-nav-stop="dash"]')[1]);
+        expect(onRestoreLast).toHaveBeenCalledTimes(2);
+      });
+    });
+
     it("w opens the chooser (spec §7: All sessions), TYPING_GUARD_MS later", () => {
       vi.useFakeTimers();
       try {

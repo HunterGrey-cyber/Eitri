@@ -1261,6 +1261,9 @@ export default function App() {
     | { kind: "close"; tab: TabId; lines: string[] }
     | { kind: "close_others"; lines: string[] }
     | { kind: "bypass"; tab: TabId | null; scope: "tab" | "default"; nonce: number; lines: string[]; openedAt: number }
+    // A restore found a tab saved in bypass and asks before giving it back: `y` as saved, `n` in auto.
+    // The same on-screen wait and lone-key guard as `bypass`, since a `y` here also enters bypass.
+    | { kind: "restore"; nonce: number; lines: string[]; openedAt: number }
     | null
   >(null);
   /** `prefix w` (spec §3.6): the open-tabs-then-records overlay, or `null` when closed. Set by a
@@ -1376,6 +1379,20 @@ export default function App() {
    *  render body, the same pattern `sessionStartedRef` above already uses. */
   const confirmOpenRef = useRef(false);
   confirmOpenRef.current = confirm !== null;
+  /* The keys MOVING into a text field after a bypass or restore question appeared (a click on the composer, a
+     rename field) end the question: what is typed there is text, and the `y` of "you should" must not give a tab
+     bypass just because the question was still up. Only a move counts -- a field that already had the keys when
+     the question opened (Shift+Tab pressed in the composer) is where an INPUT user answers, so its `y` still does. */
+  const confirmEntersBypass = confirm?.kind === "bypass" || confirm?.kind === "restore";
+  useEffect(() => {
+    if (!confirmEntersBypass) return;
+    function onFocusIn(event: FocusEvent) {
+      if (!isEditableElement(event.target)) return;
+      setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" ? null : c));
+    }
+    document.addEventListener("focusin", onFocusIn, true);
+    return () => document.removeEventListener("focusin", onFocusIn, true);
+  }, [confirmEntersBypass]);
   const chooserOpenRef = useRef(false);
   chooserOpenRef.current = chooser !== null;
   const tabsRef = useRef<TabsEnvelope | null>(null);
@@ -3137,6 +3154,15 @@ export default function App() {
         // restarting `openedAt` (and so the 250ms on-screen half of the guard) along with it --
         // unconditional, the same as every other confirm kind's `setConfirm` above.
         setConfirm({ kind: "bypass", tab: payload.tab, scope: payload.scope, nonce: payload.nonce, lines: payload.lines, openedAt: performance.now() });
+      } else if (payload.kind === "confirm_restore") {
+        // An overlay that takes the keys ends a pending sequence, as every confirm kind does.
+        dropPendingKeys();
+        exitRegion();
+        setDetail(null);
+        setHandoffOpen(false);
+        setKeymapOpen(false);
+        // A second envelope while one is open replaces it, restarting its on-screen wait.
+        setConfirm({ kind: "restore", nonce: payload.nonce, lines: payload.lines, openedAt: performance.now() });
       } else if (payload.kind === "chooser") {
         // Spec §2.4's cancel list (the chooser, a prompt, a landing on a card): an overlay that takes
         // the keys ends a pending sequence, box and reserved prefix included, so a key the overlay
@@ -3637,13 +3663,14 @@ export default function App() {
    *  branches below -- and, since v1-mode fix round 1, from every other route GTK claims before the
    *  WebView sees a key (`hint_collect`, `begin_rename`, `tab_detail`, `open_keymap`, `nav_key`,
    *  `literal_key`) and from a terminal handoff. Rust drops its own outstanding prompt on the same
-   *  routes, so a `y` that slipped through is refused by the nonce. Leaves a `close`/`close_others`
+   *  routes, so a `y` that slipped through is refused by the nonce. Ends a restore question too (it
+   *  is another way into bypass, and Rust drops its own the same way); leaves a `close`/`close_others`
    *  confirm alone. **Since the rc.4 review only three callers are left** -- losing the pane's focus, a switch to
    *  another active tab and the terminal handoff, routes that take the keys nowhere inside the panel: every route
    *  that hands the keys to something else calls `endKeyPrompts` (below) instead, which ends all three kinds of
    *  prompt, because a `y` typed into what such a route opens answered a close prompt too. */
   function cancelBypassConfirm() {
-    setConfirm((c) => (c?.kind === "bypass" ? null : c));
+    setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" ? null : c));
   }
 
   /** rc.4 review (Codex, then the coordinator): what a route that hands the keys to something else ends -- every
@@ -3705,6 +3732,13 @@ export default function App() {
    *  `confirm` is gone. A confirm that is NOT null (a fresh D7 reprompt arrived in between) skips
    *  this and reaches the branch below unchanged, which already treats a repeat as never counting. */
   function answerConfirm(event: KeyboardEvent<HTMLElement>): boolean {
+    // The keys have moved into a text field (a click on the composer, say) while the restore question
+    // was up: what is typed there is text, never an answer -- the `y` of "you should" must not give a
+    // tab bypass. The question ends and the key is left for the field.
+    if (confirm?.kind === "restore" && isEditableElement(event.target)) {
+      setConfirm(null);
+      return false;
+    }
     if (confirm === null) {
       if (promptSwallowKeyRef.current !== null && event.key === promptSwallowKeyRef.current && event.repeat) {
         event.preventDefault();
@@ -3746,6 +3780,33 @@ export default function App() {
             });
           } else {
             showFlash("y must be pressed on its own to enter bypass — Shift+Tab to ask again");
+          }
+        }
+        setConfirm(null);
+        return true;
+      }
+      if (confirm.kind === "restore") {
+        // `n` is always safe: it brings the bypass tabs back in auto. `y` gives them back in bypass, so
+        // it passes every test the bypass prompt's own `y` does: a plain key, not a repeat, and a
+        // moment after the prompt appeared with nothing typed around it. Any other key cancels.
+        const yes = event.key === "y" || event.key === "Y";
+        const no = event.key === "n" || event.key === "N";
+        if (yes || no) {
+          const plain = isPlainAnswerKey(event.nativeEvent as unknown as KeyLike);
+          const counts =
+            no ||
+            (plain &&
+              !event.repeat &&
+              bypassYesCounts({ now: performance.now(), openedAt: confirm.openedAt, lastKeyAt: lastKeyAtRef.current }));
+          if (counts) {
+            postToRust({
+              type: "restore_answer",
+              request_id: nextRequestId(),
+              nonce: confirm.nonce,
+              keep_bypass: yes,
+            });
+          } else {
+            showFlash("y must be pressed on its own to restore in bypass — n restores in auto");
           }
         }
         setConfirm(null);
@@ -3877,6 +3938,7 @@ export default function App() {
               sendMessage(text);
             }}
             onResume={(id) => post({ type: "resume", provider_session_id: id })}
+            onRestoreLast={() => post({ type: "restore_last" })}
             onCycleMode={() => post({ type: "cycle_mode" })}
             onReset={resetTab}
             onHint={requestHint}

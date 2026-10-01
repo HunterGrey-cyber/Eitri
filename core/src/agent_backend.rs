@@ -328,6 +328,18 @@ impl AgentBackend {
     /// read at the one point that answers requests (`take_ui_delivery_with_rules`), never sent to
     /// the CLI.
     pub fn start(kind: BackendKind, project_dir: &Path, resume: Option<&str>) -> Result<Self, BackendError> {
+        Self::start_holding(kind, project_dir, resume, None)
+    }
+
+    /// [`start`](Self::start) for a resume whose session lease the caller already holds
+    /// (`AgentConversation::resume_holding`): the lease goes to the conversation, and is released
+    /// with it or with a failed start. Ignored when nothing is being resumed.
+    pub fn start_holding(
+        kind: BackendKind,
+        project_dir: &Path,
+        resume: Option<&str>,
+        lease: Option<agent::lease::SessionLease>,
+    ) -> Result<Self, BackendError> {
         match kind {
             BackendKind::Legacy => {
                 if resume.is_some() {
@@ -350,11 +362,14 @@ impl AgentBackend {
                     BackendError::fatal(format!("failed to connect to the Verdandi sidecar: {e}"))
                 })?;
                 match resume {
-                    Some(provider_session_id) => {
-                        AgentConversation::resume(std::sync::Arc::new(provider), project_dir, provider_session_id)
-                            .map(|c| AgentBackend::Sidecar(Box::new(c)))
-                            .map_err(|e| BackendError::fatal(format!("could not continue the previous session: {e}")))
-                    }
+                    Some(provider_session_id) => AgentConversation::resume_holding(
+                        std::sync::Arc::new(provider),
+                        project_dir,
+                        provider_session_id,
+                        lease,
+                    )
+                    .map(|c| AgentBackend::Sidecar(Box::new(c)))
+                    .map_err(|e| BackendError::fatal(format!("could not continue the previous session: {e}"))),
                     None => AgentConversation::create(std::sync::Arc::new(provider), project_dir)
                         .map(|c| AgentBackend::Sidecar(Box::new(c)))
                         .map_err(|e| BackendError::fatal(format!("failed to create a Claude session: {e}"))),

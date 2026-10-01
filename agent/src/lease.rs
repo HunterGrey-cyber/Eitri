@@ -205,6 +205,19 @@ impl SessionLease {
         &self.path
     }
 
+    /// Whether this lease is the one for exactly this provider, directory and session. A caller that
+    /// took a lease ahead of time and hands it to a resume uses this so the resume never drives a
+    /// session it holds no lock on.
+    pub fn is_for(&self, provider: &str, canonical_cwd: &str, provider_session_id: &str) -> bool {
+        leases_dir().is_ok_and(|dir| {
+            self.path
+                == dir.join(format!(
+                    "{}.lock",
+                    lease_key_hash(provider, canonical_cwd, provider_session_id)
+                ))
+        })
+    }
+
     /// Whether some descriptor anywhere holds this lease right now, without taking it.
     ///
     /// Opens the lock file read-only and tries a shared, non-blocking `flock`, released at once.
@@ -369,5 +382,16 @@ mod tests {
         assert!(!SessionLease::is_held("claude", "/tmp/project", "prov-probe").unwrap());
         let _again = SessionLease::try_acquire("claude", "/tmp/project", "prov-probe")
             .expect("a probe must leave the lease free to take");
+    }
+
+    /// A lease handed to a resume must be the one for that very session: the resume would otherwise
+    /// drive a session it holds no lock on.
+    #[test]
+    fn a_lease_knows_which_session_it_is_for() {
+        let _dir = test_override::IsolatedLeasesDir::new();
+        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-own").unwrap();
+        assert!(lease.is_for("claude", "/tmp/project", "prov-own"));
+        assert!(!lease.is_for("claude", "/tmp/project", "prov-other"));
+        assert!(!lease.is_for("claude", "/tmp/elsewhere", "prov-own"));
     }
 }

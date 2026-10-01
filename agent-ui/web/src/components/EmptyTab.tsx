@@ -81,6 +81,9 @@ export type EmptyTabProps = {
   restoredDraft: RestoredDraft | null;
   onSend: (text: string) => void;
   onResume: (providerSessionId: string) => void;
+  /** The dashboard's `s` item / key: bring back the tabs the last window had open. Present with the
+   *  item (`hello.restore`); optional so this component's own tests need no stand-in. */
+  onRestoreLast?: () => void;
   onCycleMode: () => void;
   onReset: () => void;
   onHint: (repeat: boolean) => void;
@@ -496,6 +499,9 @@ export function EmptyTab(props: EmptyTabProps) {
         // calling `runItem("new")` itself.
         setComposerCaret("kept");
         break;
+      case "restore":
+        props.onRestoreLast?.();
+        break;
       case "resume": {
         const newest = hello?.resumableSessions[0];
         if (newest !== undefined) props.onResume(newest.providerSessionId);
@@ -738,7 +744,11 @@ export function EmptyTab(props: EmptyTabProps) {
       event.preventDefault();
       runItem("new");
       setComposerCaret("end");
-    } else if ((event.key === "r" && items.includes("resume")) || event.key === "w") {
+    } else if (
+      (event.key === "r" && items.includes("resume")) ||
+      (event.key === "s" && items.includes("restore")) ||
+      event.key === "w"
+    ) {
       // v1 hardening (the whole-branch review, the class of R2-1/R2-2): an arrival lands this
       // dashboard in BROWSE, so typed prose reached these at once -- "run the tests" resumed the
       // newest record into this tab on its own `r`, "what's next" opened the chooser on its `w`,
@@ -747,8 +757,11 @@ export function EmptyTab(props: EmptyTabProps) {
       // else was typed meanwhile and the dashboard is still here in BROWSE. S2 dropped the bare `m`
       // for the same collision; these keep their meaning.
       event.preventDefault();
-      const item: DashItem = event.key === "r" ? "resume" : "sessions";
-      const flash = tableKeyTypingFlash(event.key, item === "resume" ? "resume the newest session" : "all sessions");
+      const item: DashItem = event.key === "r" ? "resume" : event.key === "s" ? "restore" : "sessions";
+      const flash = tableKeyTypingFlash(
+        event.key,
+        item === "resume" ? "resume the newest session" : item === "restore" ? "restore the last session" : "all sessions",
+      );
       const waiting = typingGuard.defer(
         typedAt,
         event.repeat,

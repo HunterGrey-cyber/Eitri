@@ -4,7 +4,7 @@ import type { Hello, PermissionModeChoice } from "../types";
  *  (snacks.nvim's dashboard), a centred name and one key per action, in place of the eight resume
  *  rows this screen used to draw. `"resume"` is the newest remembered session -- `EmptyTab`'s own
  *  `r` used to walk all eight; the chooser (`w`/`prefix w`) is where every record still lives. */
-export type DashItem = "new" | "resume" | "sessions" | "mode" | "keys";
+export type DashItem = "new" | "restore" | "resume" | "sessions" | "mode" | "keys";
 
 /** The key each item runs on directly, spec §7's table -- also what `EmptyTab`'s `onKeyDown`
  *  dispatches on. Exported so that file and this one cannot silently disagree about which letter
@@ -16,6 +16,7 @@ export type DashItem = "new" | "resume" | "sessions" | "mode" | "keys";
  *  here) and `<leader>m`; `EmptyTab` never dispatches on this string, it is display only. */
 export const DASH_ITEM_KEY: Record<DashItem, string> = {
   new: "i",
+  restore: "s",
   resume: "r",
   sessions: "w",
   mode: "⇧Tab",
@@ -27,6 +28,9 @@ export const DASH_ITEM_KEY: Record<DashItem, string> = {
  *  workspace, and offering to resume nothing would be a dead key. */
 export function dashItems(hello: Hello): DashItem[] {
   const items: DashItem[] = ["new"];
+  // The last window's tabs, offered only while Rust says there are some to bring back -- a launch
+  // action, so a later empty tab beside live ones never has it (Rust stops sending the offer).
+  if ((hello.restore?.labels.length ?? 0) > 0) items.push("restore");
   if (hello.resumableSessions.length > 0) items.push("resume");
   items.push("sessions", "mode", "keys");
   return items;
@@ -53,6 +57,7 @@ export const MODE_CONSEQUENCE: Record<string, string> = {
 
 const ITEM_ICON: Record<DashItem, string> = {
   new: "+",
+  restore: "↻",
   resume: "↺",
   sessions: "☰",
   mode: "",
@@ -86,10 +91,33 @@ function whereLine(hello: Hello, narrow: boolean): string {
   return parts.join(" · ");
 }
 
+/** How many characters of one tab's name the restore line shows, and how many names. */
+const RESTORE_NAME_CHARS = 20;
+const RESTORE_NAMES_SHOWN = 3;
+
+/** `3 tabs: api, docs, tests`, names cut to fit and a trailing `…` when there are more than are shown;
+ *  `3 tabs, 1 in bypass: …` when some of them were, so the count never reads as a fourth name. The line
+ *  is one row of a narrow panel, and CSS cuts what is still too long. */
+function restoreSummary(offer: NonNullable<Hello["restore"]>): string {
+  const cut = (name: string) => (name.length > RESTORE_NAME_CHARS ? `${name.slice(0, RESTORE_NAME_CHARS - 1)}…` : name);
+  const names = offer.labels.slice(0, RESTORE_NAMES_SHOWN).map(cut);
+  if (offer.labels.length > RESTORE_NAMES_SHOWN) names.push("…");
+  const count = offer.labels.length;
+  const bypass = offer.bypass > 0 ? `, ${offer.bypass} in bypass` : "";
+  return `${count} ${count === 1 ? "tab" : "tabs"}${bypass}: ${names.join(", ")}`;
+}
+
 function ItemLabel({ item, hello, mode }: { item: DashItem; hello: Hello; mode: PermissionModeChoice }) {
   switch (item) {
     case "new":
       return <>New session</>;
+    case "restore":
+      return (
+        <>
+          Restore last session
+          {hello.restore && <span className="dash-resume-title"> ({restoreSummary(hello.restore)})</span>}
+        </>
+      );
     case "resume": {
       const newest = hello.resumableSessions[0] as Hello["resumableSessions"][number] | undefined;
       const title = newest?.name ?? newest?.title ?? null;
