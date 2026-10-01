@@ -261,7 +261,12 @@ for p in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-setup
 done
 [ -f "$LAUNCHER" ] || fail "missing launcher $LAUNCHER"
 grep -qF '# eitri-launcher v1' "$LAUNCHER" || fail "$LAUNCHER carries no marker line"
-[ -f "$HOME/.local/share/applications/eitri.desktop" ] || fail "missing the desktop entry"
+[ -f "$HOME/.local/share/applications/cn.huntergrey.eitri.desktop" ] || fail "missing the desktop entry"
+[ ! -e "$HOME/.local/share/applications/eitri.desktop" ] || fail "the old desktop entry name was installed"
+for p in hicolor/16x16/apps/cn.huntergrey.eitri.png hicolor/512x512/apps/cn.huntergrey.eitri.png \
+	hicolor/scalable/apps/cn.huntergrey.eitri.svg; do
+	[ -f "$HOME/.local/share/icons/$p" ] || fail "missing the icon $p"
+done
 for p in LICENSE THIRD-PARTY-LICENSES SOURCE; do
 	[ -f "$HOME/.local/share/licenses/eitri/$p" ] || fail "missing licences/$p"
 done
@@ -328,7 +333,9 @@ fi
 cat uninstall.log
 # Spec sec 6.6's own removal list, checked by name (never claims uninstall also prunes a now-empty
 # parent such as ~/.local/bin or ~/.local/share/applications, which it is not asked to and does not).
-for p in .local/lib/eitri .local/bin/eitri .local/share/applications/eitri.desktop \
+for p in .local/lib/eitri .local/bin/eitri .local/share/applications/cn.huntergrey.eitri.desktop \
+	.local/share/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg \
+	.local/share/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png \
 	.local/share/licenses/eitri .local/share/eitri; do
 	if [ -e "$HOME/$p" ] || [ -L "$HOME/$p" ]; then fail "uninstall left $HOME/$p behind"; fi
 done

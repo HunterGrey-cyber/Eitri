@@ -6,6 +6,12 @@ and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 installed test build numbered `1.0.0-rc.N`, it sorts above this release, so the installer refuses to
 downgrade over it -- uninstall it first (`sh install.sh --uninstall`, or remove the package).
 
+**Upgrading from 0.2.0:** Eitri has an icon now, and its desktop entry is named after its application
+id, `cn.huntergrey.eitri.desktop` (it was `eitri.desktop`). Updating removes the old entry, so if you
+had pinned Eitri to your dash or dock, pin it again once. If you rerun a saved 0.2.0 `install.sh` to
+upgrade, that works too, but it cannot install the icon: run this release's `install.sh` once more to get it
+(INSTALL.md, "Updating").
+
 ## Install
 
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/download/v@VERSION@/install.sh | sh -s -- --version @VERSION@
@@ -50,6 +56,8 @@ notice.
 Eitri @VERSION@ -- 你的 Neovim，与 Claude Code 并肩。基于提交 @COMMIT@，在 Ubuntu 24.04 发布容器中构建。运行环境需要 glibc 2.39、GTK 4.14 以及 WebKitGTK 2.40（webkitgtk-6.0 API）或更新版本。
 
 **0.2.0 是首个公开发行版**，此前有一个未公开的预发布版本 0.1.0。如果你安装过编号为 `1.0.0-rc.N` 的测试构建，它在版本排序上高于本次发布，安装程序会拒绝降级——请先卸载它（`sh install.sh --uninstall`，或者移除对应的软件包）。
+
+**从 0.2.0 升级：** Eitri 现在有图标了，它的 desktop 条目也改用应用 id 命名，叫 `cn.huntergrey.eitri.desktop`（原来是 `eitri.desktop`）。更新会移除旧条目，所以如果你之前把 Eitri 固定在了 dash 或 dock 上，需要重新固定一次。如果你重新运行存下来的 0.2.0 `install.sh` 来升级，也可以，但它装不上图标：再运行一次本次发布的 `install.sh` 就有了（见 INSTALL.md 的“更新”一节）。
 
 ### 安装
 

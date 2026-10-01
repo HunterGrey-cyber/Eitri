@@ -81,8 +81,32 @@ contents:
 
   - src: ./packaging/eitri.launcher.sh
     dst: /usr/bin/eitri
-  - src: ./packaging/eitri.desktop
-    dst: /usr/share/applications/eitri.desktop
+  # The desktop entry is named by the application id (`cn.huntergrey.eitri`, shell/src/main.rs's
+  # APP_ID), the name the compositor matches a window to; it replaced `eitri.desktop`, which an
+  # upgrade drops by this package no longer listing it. `Icon=` names the theme icon below.
+  - src: ./packaging/cn.huntergrey.eitri.desktop
+    dst: /usr/share/applications/cn.huntergrey.eitri.desktop
+
+  # The icon, in every size packaging/icons/hicolor holds, under the icon theme's own tree
+  # (packaging/icons/README.md; its notice, CC BY 4.0, is printed in THIRD-PARTY-LICENSES).
+  - src: ./packaging/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png
+    dst: /usr/share/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png
+  - src: ./packaging/icons/hicolor/24x24/apps/cn.huntergrey.eitri.png
+    dst: /usr/share/icons/hicolor/24x24/apps/cn.huntergrey.eitri.png
+  - src: ./packaging/icons/hicolor/32x32/apps/cn.huntergrey.eitri.png
+    dst: /usr/share/icons/hicolor/32x32/apps/cn.huntergrey.eitri.png
+  - src: ./packaging/icons/hicolor/48x48/apps/cn.huntergrey.eitri.png
+    dst: /usr/share/icons/hicolor/48x48/apps/cn.huntergrey.eitri.png
+  - src: ./packaging/icons/hicolor/64x64/apps/cn.huntergrey.eitri.png
+    dst: /usr/share/icons/hicolor/64x64/apps/cn.huntergrey.eitri.png
+  - src: ./packaging/icons/hicolor/128x128/apps/cn.huntergrey.eitri.png
+    dst: /usr/share/icons/hicolor/128x128/apps/cn.huntergrey.eitri.png
+  - src: ./packaging/icons/hicolor/256x256/apps/cn.huntergrey.eitri.png
+    dst: /usr/share/icons/hicolor/256x256/apps/cn.huntergrey.eitri.png
+  - src: ./packaging/icons/hicolor/512x512/apps/cn.huntergrey.eitri.png
+    dst: /usr/share/icons/hicolor/512x512/apps/cn.huntergrey.eitri.png
+  - src: ./packaging/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg
 
   # The AppArmor profile Ubuntu 23.10+'s user-namespace restriction needs before WebKit's sandbox
   # can start (packaging/apparmor/eitri; docs/superpowers/plans/2026-09-28-v1-dist-ubuntu-userns.md).

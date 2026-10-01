@@ -15,7 +15,36 @@ EXPECTED_TREE='./.local d
 ./.local/lib/eitri/shell f
 ./.local/share d
 ./.local/share/applications d
-./.local/share/applications/eitri.desktop f
+./.local/share/applications/cn.huntergrey.eitri.desktop f
+./.local/share/icons d
+./.local/share/icons/hicolor d
+./.local/share/icons/hicolor/128x128 d
+./.local/share/icons/hicolor/128x128/apps d
+./.local/share/icons/hicolor/128x128/apps/cn.huntergrey.eitri.png f
+./.local/share/icons/hicolor/16x16 d
+./.local/share/icons/hicolor/16x16/apps d
+./.local/share/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png f
+./.local/share/icons/hicolor/24x24 d
+./.local/share/icons/hicolor/24x24/apps d
+./.local/share/icons/hicolor/24x24/apps/cn.huntergrey.eitri.png f
+./.local/share/icons/hicolor/256x256 d
+./.local/share/icons/hicolor/256x256/apps d
+./.local/share/icons/hicolor/256x256/apps/cn.huntergrey.eitri.png f
+./.local/share/icons/hicolor/32x32 d
+./.local/share/icons/hicolor/32x32/apps d
+./.local/share/icons/hicolor/32x32/apps/cn.huntergrey.eitri.png f
+./.local/share/icons/hicolor/48x48 d
+./.local/share/icons/hicolor/48x48/apps d
+./.local/share/icons/hicolor/48x48/apps/cn.huntergrey.eitri.png f
+./.local/share/icons/hicolor/512x512 d
+./.local/share/icons/hicolor/512x512/apps d
+./.local/share/icons/hicolor/512x512/apps/cn.huntergrey.eitri.png f
+./.local/share/icons/hicolor/64x64 d
+./.local/share/icons/hicolor/64x64/apps d
+./.local/share/icons/hicolor/64x64/apps/cn.huntergrey.eitri.png f
+./.local/share/icons/hicolor/scalable d
+./.local/share/icons/hicolor/scalable/apps d
+./.local/share/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg f
 ./.local/share/licenses d
 ./.local/share/licenses/eitri d
 ./.local/share/licenses/eitri/.installed-version f
@@ -42,7 +71,7 @@ t_fresh_layout() {
 	fi
 	# eitri-setup is this installer, byte for byte (spec §4.3).
 	if ! cmp -s "$INSTALLER" "$TH/.local/lib/eitri/eitri-setup"; then fail "eitri-setup differs from install.sh"; fi
-	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/eitri.desktop")" \
+	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/cn.huntergrey.eitri.desktop")" \
 		"Exec=\"$TH/.local/bin/eitri\" --quiet %f" "the desktop Exec line"
 	expect_absent "$TH/.cache"
 	expect_out 'installed Eitri 1.0.0'
@@ -90,10 +119,10 @@ t_desktop_exec_space_percent() {
 	serve 1.0.0
 	inst_net
 	expect_rc 0
-	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/eitri.desktop")" \
+	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/cn.huntergrey.eitri.desktop")" \
 		"Exec=\"$T/my home 100%%/.local/bin/eitri\" --quiet %f" "the escaped Exec line"
 	# Every other line is the tarball's desktop file's.
-	if [ "$(grep -v '^Exec=' "$TH/.local/share/applications/eitri.desktop")" != "$(grep -v '^Exec=' "$PKG/eitri.desktop")" ]; then
+	if [ "$(grep -v '^Exec=' "$TH/.local/share/applications/cn.huntergrey.eitri.desktop")" != "$(grep -v '^Exec=' "$PKG/cn.huntergrey.eitri.desktop")" ]; then
 		fail "the desktop file differs from the tarball's in more than Exec"
 	fi
 }
@@ -111,7 +140,7 @@ t_desktop_exec_all_specials() {
 	# Quoting rule first (a backslash before each), then the string-value rule doubles every
 	# backslash, then % becomes %%.
 	# shellcheck disable=SC2016 # literal characters, deliberately unexpanded
-	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/eitri.desktop")" \
+	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/cn.huntergrey.eitri.desktop")" \
 		"Exec=\"$T/"'q\\"b\\`t\\$d\\\\s 5%%/.local/bin/eitri" --quiet %f' "the escaped Exec line"
 	expect_exec "$TH/.local/bin/eitri"
 	expect_eq "$(installed_version)" 1.0.0 "installed into a HOME with every special character"
@@ -140,7 +169,7 @@ t_rerun_finishes_incomplete_install() {
 	inst_net
 	expect_rc 0
 	plant_sidecar aaaaaaa
-	for f in "$TH/.local/bin/eitri" "$(data_of)/applications/eitri.desktop" \
+	for f in "$TH/.local/bin/eitri" "$(data_of)/applications/cn.huntergrey.eitri.desktop" \
 		"$(data_of)/licenses/eitri/LICENSE" "$(data_of)/licenses/eitri/THIRD-PARTY-LICENSES" \
 		"$(data_of)/licenses/eitri/SOURCE"; do
 		rm "$f"
@@ -276,7 +305,7 @@ t_dry_run_fresh() {
 	expect_out 'would unpack eitri-1.0.0-x86_64-linux.tar.gz'
 	expect_out "would run: 'mv' '--' '$TH/.local/lib/eitri.new' '$TH/.local/lib/eitri'"
 	expect_out "would write the launcher $TH/.local/bin/eitri"
-	expect_out "would write $TH/.local/share/applications/eitri.desktop"
+	expect_out "would write $TH/.local/share/applications/cn.huntergrey.eitri.desktop"
 	expect_out "would write $TH/.local/share/licenses/eitri/LICENSE"
 	expect_out 'would download http'
 	expect_out '/SHA256SUMS.sig and check it with ssh-keygen -Y verify'

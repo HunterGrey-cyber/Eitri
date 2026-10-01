@@ -392,6 +392,80 @@ class TheDebCarriesTheAppArmorProfile(unittest.TestCase):
                 self.assertNotIn("scripts", (doc.get("overrides") or {}).get(packager) or {}, (path, packager))
 
 
+# --- the desktop entry and the icon (app icon, 2026-10-01) ---------------------------------------
+
+DESKTOP_SRC = "./packaging/cn.huntergrey.eitri.desktop"
+DESKTOP_DST = "/usr/share/applications/cn.huntergrey.eitri.desktop"
+OLD_DESKTOP_DST = "/usr/share/applications/eitri.desktop"
+ICON_NAME = "cn.huntergrey.eitri"
+# Every file under packaging/icons/hicolor, as the package path it must land at.
+ICON_FILES = {
+    "16x16/apps/cn.huntergrey.eitri.png",
+    "24x24/apps/cn.huntergrey.eitri.png",
+    "32x32/apps/cn.huntergrey.eitri.png",
+    "48x48/apps/cn.huntergrey.eitri.png",
+    "64x64/apps/cn.huntergrey.eitri.png",
+    "128x128/apps/cn.huntergrey.eitri.png",
+    "256x256/apps/cn.huntergrey.eitri.png",
+    "512x512/apps/cn.huntergrey.eitri.png",
+    "scalable/apps/cn.huntergrey.eitri.svg",
+}
+
+
+def _icon_files_on_disk():
+    root = os.path.join(_HERE, "icons", "hicolor")
+    found = set()
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            found.add(os.path.relpath(os.path.join(dirpath, name), root))
+    return found
+
+
+class BothProfilesShipTheDesktopEntryAndTheIcon(unittest.TestCase):
+    """The desktop entry is named by the application id (`cn.huntergrey.eitri.desktop`, so the
+    compositor matches the window to it) and the icon is installed in every size, at the paths the
+    icon theme looks in. The old `eitri.desktop` is not shipped by either profile: a package
+    upgrade drops it simply by no longer listing it."""
+
+    def test_the_desktop_entry_has_the_application_ids_name_in_both(self):
+        for path in (PUBLIC_PATH, PRIVATE_PATH):
+            by_dst = _contents_by_dst(_load_yaml(path))
+            self.assertEqual(by_dst[DESKTOP_DST]["src"], DESKTOP_SRC, path)
+            self.assertNotIn(OLD_DESKTOP_DST, by_dst, path)
+            # packaging/legacy/eitri.desktop is for 0.2.0's installer, read from the release tarball
+            # alone: no package lists it, under any destination.
+            self.assertFalse([d for d, e in by_dst.items() if "legacy" in e.get("src", "")], path)
+
+    def test_every_icon_size_is_installed_under_hicolor_in_both(self):
+        for path in (PUBLIC_PATH, PRIVATE_PATH):
+            by_dst = _contents_by_dst(_load_yaml(path))
+            for rel in sorted(ICON_FILES):
+                entry = by_dst.get(f"/usr/share/icons/hicolor/{rel}")
+                self.assertIsNotNone(entry, (path, rel))
+                self.assertEqual(entry["src"], f"./packaging/icons/hicolor/{rel}", (path, rel))
+
+    def test_the_profile_lists_exactly_the_icon_files_that_are_committed(self):
+        # A size added under packaging/icons/hicolor without a profile entry would be installed by
+        # no package; an entry for a file that is not there fails nfpm only at release time.
+        self.assertEqual(_icon_files_on_disk(), ICON_FILES)
+        for path in (PUBLIC_PATH, PRIVATE_PATH):
+            shipped = {
+                dst[len("/usr/share/icons/hicolor/"):]
+                for dst in _contents_by_dst(_load_yaml(path))
+                if dst.startswith("/usr/share/icons/")
+            }
+            self.assertEqual(shipped, ICON_FILES, path)
+
+    def test_the_desktop_entry_names_the_icon_and_the_window_class_by_the_application_id(self):
+        with open(os.path.join(_HERE, "cn.huntergrey.eitri.desktop"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertIn(f"Icon={ICON_NAME}", lines)
+        self.assertIn(f"StartupWMClass={ICON_NAME}", lines)
+        self.assertIn("Comment=Your Neovim, with Claude Code beside it.", lines)
+        self.assertIn("Comment[zh_CN]=\u4f60\u7684 Neovim\uff0c\u4e0e Claude Code \u5e76\u80a9\u3002", lines)
+        self.assertFalse(os.path.exists(os.path.join(_HERE, "eitri.desktop")))
+
+
 def _nfpm_tools_missing():
     import shutil
 
@@ -427,6 +501,8 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
                 os.makedirs(os.path.dirname(src), exist_ok=True)
                 if entry["src"] == APPARMOR_SRC:
                     shutil.copyfile(os.path.join(_HERE, "apparmor", "eitri"), src)
+                elif entry["src"].startswith("./packaging/icons/") or entry["src"] == DESKTOP_SRC:
+                    shutil.copyfile(os.path.join(_HERE, entry["src"][len("./packaging/"):]), src)
                 else:
                     with open(src, "w") as f:
                         f.write(f"stand-in for {entry['src']}\n")
@@ -464,6 +540,38 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
         pacman_files = self.sh(["bsdtar", "-tf", self.built[("private", "archlinux")]], text=True).stdout.split()
         self.assertNotIn(APPARMOR_DST.lstrip("/"), pacman_files)
         self.assertIn("usr/lib/eitri/shell", pacman_files)
+
+    @staticmethod
+    def _paths(listing):
+        """The package paths in a `dpkg-deb -c`, `rpm -qlp` or `bsdtar -tf` listing, each as
+        `usr/...` (the last word of a line, without a leading `./` or `/`)."""
+        out = set()
+        for line in listing.splitlines():
+            if line.strip():
+                word = line.split()[-1]
+                out.add(word[2:] if word.startswith("./") else word.lstrip("/"))
+        return out
+
+    def test_every_package_carries_the_desktop_entry_and_the_icons_and_not_the_old_name(self):
+        want = {DESKTOP_DST.lstrip("/")} | {f"usr/share/icons/hicolor/{rel}" for rel in ICON_FILES}
+        listers = {
+            "deb": lambda out: self.sh(["dpkg-deb", "-c", out], text=True).stdout,
+            "rpm": lambda out: self.sh(["rpm", "-qlp", out], text=True).stdout,
+            "archlinux": lambda out: self.sh(["bsdtar", "-tf", out], text=True).stdout,
+        }
+        for (label, packager), out in sorted(self.built.items()):
+            paths = self._paths(listers[packager](out))
+            self.assertLessEqual(want, paths, (label, packager, sorted(want - paths)))
+            self.assertNotIn(OLD_DESKTOP_DST.lstrip("/"), paths, (label, packager))
+
+    def test_the_debs_icons_are_the_committed_files_byte_for_byte(self):
+        for label in ("public", "private"):
+            x, _control = self._deb(label)
+            for rel in sorted(ICON_FILES):
+                with open(os.path.join(_HERE, "icons", "hicolor", rel), "rb") as f:
+                    want = f.read()
+                with open(os.path.join(x, "usr", "share", "icons", "hicolor", rel), "rb") as f:
+                    self.assertEqual(f.read(), want, (label, rel))
 
 
 if __name__ == "__main__":

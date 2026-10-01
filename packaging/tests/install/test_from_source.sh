@@ -54,7 +54,8 @@ fs_scaffold() {
 		printf 'SKIA_BINARIES_SHA256=%s\n' "$SKIA_FIXTURE_SHA256"
 	} >"$_fs_dir/packaging/pins.env"
 	cp "$PKG/eitri.launcher.sh" "$_fs_dir/packaging/eitri.launcher.sh"
-	cp "$PKG/eitri.desktop" "$_fs_dir/packaging/eitri.desktop"
+	cp "$PKG/cn.huntergrey.eitri.desktop" "$_fs_dir/packaging/cn.huntergrey.eitri.desktop"
+	cp -R "$PKG/icons" "$_fs_dir/packaging/icons"
 	cp "$INSTALLER" "$_fs_dir/packaging/install.sh"
 	printf 'test fixture LICENSE: MIT-shaped, not the real text.\n' >"$_fs_dir/LICENSE"
 }
@@ -172,6 +173,16 @@ t_from_source_clone_head_match_builds_and_installs() {
 	done
 	if ! grep -q 'built directly from source' "$TH/.local/share/licenses/eitri/THIRD-PARTY-LICENSES"; then
 		fail "THIRD-PARTY-LICENSES does not say it is a from-source placeholder"
+	fi
+	# The desktop entry named by the application id, and the icon, from the checkout's packaging/; the
+	# placeholder licence file carries the logo's CC BY notice, which needs no generating.
+	expect_file "$(data_of)/applications/cn.huntergrey.eitri.desktop"
+	expect_absent "$(data_of)/applications/eitri.desktop"
+	for f in $(cd "$PKG/icons" && find hicolor -type f | LC_ALL=C sort); do
+		if ! cmp -s "$PKG/icons/$f" "$(data_of)/icons/$f"; then fail "the icon $f was not installed from the checkout"; fi
+	done
+	if ! grep -Fq "$(cat "$PKG/icons/LICENSE")" "$TH/.local/share/licenses/eitri/THIRD-PARTY-LICENSES"; then
+		fail "THIRD-PARTY-LICENSES lacks the logo's licence notice"
 	fi
 }
 
@@ -299,6 +310,30 @@ t_from_source_checkout_public_rev_builds_and_installs() {
 	if ! grep -Fqx 'EITRI_BUILT_FROM_CHECKOUT=1' "$TH/.local/lib/eitri/RELEASE"; then
 		fail "the installed RELEASE is not marked EITRI_BUILT_FROM_CHECKOUT: $(cat "$TH/.local/lib/eitri/RELEASE")"
 	fi
+}
+
+TESTS="$TESTS t_from_source_checkout_from_before_the_app_icon_refuses_with_a_pointer"
+t_from_source_checkout_from_before_the_app_icon_refuses_with_a_pointer() {
+	# A source tree whose desktop entry is still packaging/eitri.desktop (no icons): this installer does
+	# not lay it out, says so, and installs nothing.
+	FS_FORK_REV=eeeeeee111111111111111111111111111111111
+	fs_verdandi_checkout "$T/verdandi-src"
+	fs_repo 1.0.0 https://github.com/HunterGrey-cyber/verdandi.git "$FS_VC_HEAD"
+	mv "$FS_DIR/packaging/cn.huntergrey.eitri.desktop" "$FS_DIR/packaging/eitri.desktop"
+	rm -rf "$FS_DIR/packaging/icons"
+	PRE_STUBS=$(fs_cargo_stubs)
+	inst --set "EITRI_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+		-- --from-source --checkout "$FS_DIR"
+	expect_fail "a source tree from before the app icon"
+	expect_out 'is a source tree from before Eitri'"'"'s app icon'
+	expect_out 'packaging/eitri.desktop'
+	expect_out 'first run: eitri setup --uninstall (or, with this installer: sh install.sh --uninstall)'
+	expect_out "then install that tree with its own packaging/install.sh --from-source"
+	expect_absent "$TH/.local/lib/eitri"
+	expect_absent "$(data_of)/applications/cn.huntergrey.eitri.desktop"
+	expect_absent "$(data_of)/icons"
 }
 
 # F3 (v1-dist whole-branch review, 2026-09-28): from_source_stage always read <src>/target/release,

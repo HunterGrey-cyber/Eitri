@@ -741,6 +741,111 @@ class BuildHeaderProfiles(unittest.TestCase):
             cl.build_header(True, "https://example.invalid/x", [], 1, 1, 1, None, 0, {}, {}, {})
 
 
+class ArtworkNotice(unittest.TestCase):
+    """Eitri's icon is its own artwork under CC BY 4.0 (its colours from the Neovim logo, CC BY 3.0):
+    the collector prints the owner's notice into THIRD-PARTY-LICENSES, and fails -- rather than ships a
+    credit that is missing or no longer covers what is there -- when the notice or the file list is
+    wrong. The dependency classification is not loosened to make that pass."""
+
+    NOTICE = ("The Eitri logo (c) Hunter Grey, licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). "
+              "Its blue and green come from the Neovim logo by Jason Long (CC BY 3.0).")
+
+    def fixture(self, notice=None, extra=(), skip=()):
+        repo = _scratch_dir()
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        for rel in sorted(cl.ARTWORK_FILES):
+            if rel in skip:
+                continue
+            path = os.path.join(repo, cl.ARTWORK_DIR, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write((self.NOTICE if notice is None else notice) + "\n" if rel == "LICENSE" else "x\n")
+        for rel in extra:
+            path = os.path.join(repo, cl.ARTWORK_DIR, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("x\n")
+        return repo
+
+    def test_the_notice_constant_is_the_owners_sentence_verbatim(self):
+        self.assertEqual(cl.ARTWORK_NOTICE, self.NOTICE)
+
+    def test_this_repositorys_icon_directory_passes_and_prints_the_notice(self):
+        (entry,) = cl.artwork_entries(cl.REPO)
+        self.assertEqual(dict(entry["files"])["packaging/icons/LICENSE"].strip(), self.NOTICE)
+        lines = []
+        cl.render_entries([entry], {}, lines)
+        rendered = "\n".join(lines)
+        self.assertIn(self.NOTICE, rendered)
+        self.assertIn("CC-BY-4.0", rendered)
+
+    def test_the_listed_files_are_exactly_what_the_directory_holds(self):
+        # The listed set must match the real tree both ways: a new icon size not listed here would
+        # fail a release at collect time, which this catches in a unit test instead.
+        root = os.path.join(cl.REPO, cl.ARTWORK_DIR)
+        found = {os.path.relpath(os.path.join(d, n), root) for d, _, names in os.walk(root) for n in names}
+        self.assertEqual(found, cl.ARTWORK_FILES)
+
+    def test_a_fixture_with_the_notice_and_every_file_passes(self):
+        self.assertEqual(len(cl.artwork_entries(self.fixture())), 1)
+
+    def test_a_file_the_list_does_not_name_fails_naming_it(self):
+        with self.assertRaises(cl.Fail) as ctx:
+            cl.artwork_entries(self.fixture(extra=["somebody-elses.png"]))
+        self.assertIn("somebody-elses.png", str(ctx.exception))
+
+    def test_a_missing_listed_file_fails_naming_it(self):
+        with self.assertRaises(cl.Fail) as ctx:
+            cl.artwork_entries(self.fixture(skip=["hicolor/48x48/apps/cn.huntergrey.eitri.png"]))
+        self.assertIn("48x48", str(ctx.exception))
+
+    def test_a_missing_directory_fails(self):
+        with self.assertRaises(cl.Fail):
+            cl.artwork_entries(_scratch_dir())
+
+    def test_an_altered_notice_fails(self):
+        for changed in (self.NOTICE.replace("CC BY 4.0", "CC BY-NC 4.0"),
+                        self.NOTICE.replace("Hunter Grey", "Somebody Else"),
+                        self.NOTICE.split(". Its")[0] + ".",  # the Neovim credit dropped
+                        "to be decided"):
+            with self.subTest(changed=changed[:40]):
+                with self.assertRaises(cl.Fail) as ctx:
+                    cl.artwork_entries(self.fixture(notice=changed))
+                self.assertIn("exactly", str(ctx.exception))
+
+    def test_a_dependency_under_a_creative_commons_licence_still_fails_classification(self):
+        # The artwork's licences are checked on their own list; PERMISSIVE, which classifies every
+        # crate and npm package, is untouched.
+        for lic in ("CC-BY-4.0", "CC-BY-3.0"):
+            with self.subTest(lic=lic):
+                self.assertNotIn(lic, cl.PERMISSIVE)
+                with self.assertRaises(cl.Fail):
+                    cl.acceptable(lic)
+        self.assertEqual(cl.ARTWORK_LICENSES, {"CC-BY-4.0", "CC-BY-3.0"})
+
+    def test_the_header_names_the_artwork_only_when_there_is_one(self):
+        copyleft = [{"title": "nvim-rs 0.9.2", "license": "LGPL-3.0", "name": "nvim-rs", "version": "0.9.2"}]
+        with_art = "\n".join(cl.build_header(True, "https://example.invalid/x", copyleft, 3, 2, 1, None, 0,
+                                              {}, {}, {}, skia_archive_count=9, artwork_count=1))
+        without = "\n".join(cl.build_header(True, "https://example.invalid/x", copyleft, 3, 2, 1, None, 0,
+                                             {}, {}, {}, skia_archive_count=9))
+        self.assertIn("Eitri's own artwork, the icon files this package installs", with_art)
+        self.assertIn("CC BY 4.0", with_art)
+        self.assertNotIn("artwork", without)
+
+    def test_collect_prints_the_artwork_section_last_in_both_profiles(self):
+        # collect() itself needs release binaries; what it does with the artwork is its last step, read
+        # off the source so that moving the section ahead of PART 1-3 (which publish.sh compares for
+        # byte equality between the two profiles) fails here.
+        with open(os.path.join(_HERE, "collect-licenses.py"), encoding="utf-8") as f:
+            src = f.read()
+        body = src[src.index("def collect("):src.index("def neovide_checkout_head")]
+        self.assertLess(body.index("PART 3 -- "), body.index("Eitri's own artwork -- the icon files"))
+        self.assertLess(body.index("Components inside the Skia prebuilt archive in the source asset"),
+                        body.index("Eitri's own artwork -- the icon files"))
+        self.assertLess(body.index("PART 4 -- "), body.index("Eitri's own artwork -- the icon files"))
+
+
 class WriteSourceNotice(unittest.TestCase):
     def setUp(self):
         self.dir = _scratch_dir()
@@ -836,7 +941,7 @@ class MainArgParsing(unittest.TestCase):
                          skia_archive_path=skia_archive_path, skia_archive_extract_dir=skia_archive_extract_dir,
                          skia_archive_sha256=skia_archive_sha256)
             return "text\n", {"rust": {}, "native": [], "web": {}, "sidecar": {}, "excluded": [],
-                              "skia_archive": [], "nvim_rs_version": "0.9.2"}
+                              "skia_archive": [], "artwork": [], "nvim_rs_version": "0.9.2"}
         return fake
 
     def test_no_sidecar_and_sidecar_together_is_an_error(self):

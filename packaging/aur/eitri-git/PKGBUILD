@@ -184,7 +184,14 @@ package() {
 	install -m0644 "$srcdir/sidecar/verdandi-claude-sidecar.rev" "$pkgdir/usr/lib/eitri/verdandi-claude-sidecar.rev"
 
 	install -Dm0755 "packaging/eitri.launcher.sh" "$pkgdir/usr/bin/eitri"
-	install -Dm0644 "packaging/eitri.desktop" "$pkgdir/usr/share/applications/eitri.desktop"
+	# The desktop entry is named by the application id (it replaced eitri.desktop, which an upgrade drops
+	# by this package no longer listing it), and the icon is every file of packaging/icons/hicolor.
+	install -Dm0644 "packaging/cn.huntergrey.eitri.desktop" \
+		"$pkgdir/usr/share/applications/cn.huntergrey.eitri.desktop"
+	local _icon
+	while IFS= read -r _icon; do
+		install -Dm0644 "packaging/icons/$_icon" "$pkgdir/usr/share/icons/$_icon"
+	done < <(cd packaging/icons && find hicolor -type f | LC_ALL=C sort)
 
 	# D15: this tree's own LICENSE, plus the built SDK's and Node's licences. No
 	# THIRD-PARTY-LICENSES/SOURCE is written here at all -- unlike packaging/install.sh's own
@@ -193,6 +200,9 @@ package() {
 	# generated third-party attribution outright rather than shipping a placeholder saying so.
 	install -d "$pkgdir/usr/share/licenses/$pkgname"
 	install -m0644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	# The icon is the Eitri logo, which LICENSE's MIT does not cover: its CC BY 4.0 notice (and the credit
+	# for the colours) travels with it.
+	install -m0644 "packaging/icons/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-icon"
 	if [ -f "$srcdir/sidecar/LICENSE.md" ]; then
 		install -m0644 "$srcdir/sidecar/LICENSE.md" "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
 	fi

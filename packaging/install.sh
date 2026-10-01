@@ -45,6 +45,16 @@ NV_GLIBC_FLOOR='2.39'
 NV_NVIM_FLOOR='0.10.0'
 NV_BINARIES='shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff'
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
+# The desktop entry is named by the application id (the compositor matches a window to <id>.desktop;
+# the icon theme's icon name and the window's class, shell/src/main.rs's APP_ID, are the same string).
+# Releases before the app icon installed the entry as eitri.desktop; NV_OLD_DESKTOP is what an
+# install or an uninstall removes of it, and only when it is byte for byte what they wrote.
+NV_DESKTOP=cn.huntergrey.eitri.desktop
+NV_OLD_DESKTOP=eitri.desktop
+# The icon, one file per size under the icon theme's tree: each is in the release tarball at
+# share/icons/<this path> and goes to $XDG_DATA_HOME/icons/<this path> (packaging/release_check.py's
+# role table holds the tarball to exactly this set, and a test holds the two lists equal).
+NV_ICON_FILES='hicolor/16x16/apps/cn.huntergrey.eitri.png hicolor/24x24/apps/cn.huntergrey.eitri.png hicolor/32x32/apps/cn.huntergrey.eitri.png hicolor/48x48/apps/cn.huntergrey.eitri.png hicolor/64x64/apps/cn.huntergrey.eitri.png hicolor/128x128/apps/cn.huntergrey.eitri.png hicolor/256x256/apps/cn.huntergrey.eitri.png hicolor/512x512/apps/cn.huntergrey.eitri.png hicolor/scalable/apps/cn.huntergrey.eitri.svg'
 NV_VERSION_ERE='[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?'
 NV_ISSUES='https://github.com/HunterGrey-cyber/eitri/issues'
 # The sidecar build (spec §5.3). The protocol major matches Verdandi's own
@@ -350,7 +360,7 @@ set_paths() {
 }
 
 # check_data_home: spec §6.4 -- installer-claude-9. An absolute XDG_DATA_HOME outside $HOME makes
-# install write the desktop entry, licences, private nvim and sidecar somewhere --uninstall can
+# install write the desktop entry, icon, licences, private nvim and sidecar somewhere --uninstall can
 # never remove: under_home (below) refuses every target outside $HOME as a whole, so the in-$HOME
 # parts (NV_LIB, the cache) were left uninstallable too, with only a by-hand remedy. Refused here
 # instead, before anything is written, for every mode that writes under NV_DATA (do_install,
@@ -360,7 +370,7 @@ set_paths() {
 check_data_home() {
 	_cdh_ok=$(under_home "$NV_DATA")
 	if [ "$_cdh_ok" != 1 ]; then
-		die "XDG_DATA_HOME resolves to $NV_DATA, which is not inside $NV_HOME: Eitri writes its desktop entry, licences, private nvim and sidecar there, and --uninstall can only ever remove paths inside \$HOME. Set XDG_DATA_HOME to a directory under \$HOME (or unset it) and re-run"
+		die "XDG_DATA_HOME resolves to $NV_DATA, which is not inside $NV_HOME: Eitri writes its desktop entry, icon, licences, private nvim and sidecar there, and --uninstall can only ever remove paths inside \$HOME. Set XDG_DATA_HOME to a directory under \$HOME (or unset it) and re-run"
 	fi
 }
 
@@ -1655,10 +1665,13 @@ on_exit() {
 			rmdir -- "$NV_LIBROOT" 2>/dev/null || :
 		fi
 		# The temporary names a write goes through before its `mv` (none is left on success).
-		for _oe_t in "$NV_BINDIR/.eitri.tmp.$$" "$NV_DATA/applications/.eitri.desktop.tmp.$$" \
+		for _oe_t in "$NV_BINDIR/.eitri.tmp.$$" "$NV_DATA/applications/.$NV_DESKTOP.tmp.$$" \
 			"$NV_DATA/licenses/eitri/.LICENSE.tmp.$$" "$NV_DATA/licenses/eitri/.THIRD-PARTY-LICENSES.tmp.$$" \
 			"$NV_DATA/licenses/eitri/.SOURCE.tmp.$$" "$NV_DATA/licenses/eitri/.installed-version.tmp.$$"; do
 			rm -f -- "$_oe_t" 2>/dev/null || :
+		done
+		for _oe_i in $NV_ICON_FILES; do
+			rm -f -- "$NV_DATA/icons/${_oe_i%/*}/.${_oe_i##*/}.tmp.$$" 2>/dev/null || :
 		done
 		if [ -n "${NV_SIDECAR_TMP-}" ]; then rm -f -- "$NV_SIDECAR_TMP" 2>/dev/null || :; fi
 		if [ -n "${NV_NVIM_TMP_DEST-}" ]; then rm -rf -- "$NV_NVIM_TMP_DEST" 2>/dev/null || :; fi
@@ -2549,7 +2562,15 @@ from_source_stage() {
 	cp -- "$_fss_src/packaging/install.sh" "$_fss_top/lib/eitri/eitri-setup" || die "cannot stage eitri-setup"
 	chmod 0755 "$_fss_top/lib/eitri/eitri-setup" || die "cannot chmod eitri-setup"
 	cp -- "$_fss_release" "$_fss_top/lib/eitri/RELEASE" || die "cannot stage RELEASE"
-	cp -- "$_fss_src/packaging/eitri.desktop" "$_fss_top/share/applications/eitri.desktop" || die "cannot stage the desktop entry"
+	if [ ! -f "$_fss_src/packaging/$NV_DESKTOP" ]; then
+		die "$_fss_src has no packaging/$NV_DESKTOP: it is a source tree from before Eitri's app icon (its desktop entry is packaging/$NV_OLD_DESKTOP), which this installer does not lay out. $(before_icon_advice "that tree with its own packaging/install.sh --from-source")"
+	fi
+	cp -- "$_fss_src/packaging/$NV_DESKTOP" "$_fss_top/share/applications/$NV_DESKTOP" || die "cannot stage the desktop entry"
+	for _fss_i in $NV_ICON_FILES; do
+		if [ ! -f "$_fss_src/packaging/icons/$_fss_i" ]; then die "$_fss_src has no packaging/icons/$_fss_i: report it at $NV_ISSUES"; fi
+		mkdir -p -- "$_fss_top/share/icons/${_fss_i%/*}" || die "cannot create $_fss_top/share/icons/${_fss_i%/*}"
+		cp -- "$_fss_src/packaging/icons/$_fss_i" "$_fss_top/share/icons/$_fss_i" || die "cannot stage the icon $_fss_i"
+	done
 	if [ -f "$_fss_src/LICENSE" ]; then
 		cp -- "$_fss_src/LICENSE" "$_fss_top/share/licenses/eitri/LICENSE" || die "cannot stage LICENSE"
 	else
@@ -2566,6 +2587,12 @@ from_source_stage() {
 		printf 'To generate the real text, run packaging/collect-licenses.py in that tree once its\n'
 		printf 'own build has produced target/release and agent-ui/web/node_modules -- see that\n'
 		printf 'script'"'"'s own --help.\n'
+		# The one notice that needs no generating: the logo (the application icon) is not covered by
+		# LICENSE's MIT, and its CC BY credit travels with every copy of it.
+		if [ -f "$_fss_src/packaging/icons/LICENSE" ]; then
+			printf '\nThe application icon is the Eitri logo, which LICENSE does not cover:\n\n'
+			cat -- "$_fss_src/packaging/icons/LICENSE"
+		fi
 	} >"$_fss_top/share/licenses/eitri/THIRD-PARTY-LICENSES" || die "cannot write THIRD-PARTY-LICENSES"
 	cp -- "$_fss_top/share/licenses/eitri/THIRD-PARTY-LICENSES" "$_fss_top/share/licenses/eitri/SOURCE" ||
 		die "cannot write SOURCE"
@@ -2967,8 +2994,14 @@ unpack_new() {
 	fi
 	mkdir -p -- "$NV_STAGE" || die "cannot create $NV_STAGE"
 	tar -xzf "$NV_TARBALL" -C "$NV_STAGE" || die "could not unpack $NV_TARBALL_NAME: it is not a valid Eitri release. Nothing was changed and your current install is untouched; report it at $NV_ISSUES"
-	for _un_f in bin/eitri share/applications/eitri.desktop; do
+	if [ ! -f "$_un_top/share/applications/$NV_DESKTOP" ] && [ -f "$_un_top/share/applications/$NV_OLD_DESKTOP" ]; then
+		die "$NV_TARBALL_NAME is from a release before Eitri's app icon (its desktop entry is share/applications/$NV_OLD_DESKTOP, not $NV_DESKTOP), which this installer does not lay out. $(before_icon_advice 'that release with its own install.sh, a release asset')"
+	fi
+	for _un_f in bin/eitri "share/applications/$NV_DESKTOP"; do
 		if [ ! -f "$_un_top/$_un_f" ]; then die "$NV_TARBALL_NAME has no $_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+	done
+	for _un_f in $NV_ICON_FILES; do
+		if [ ! -f "$_un_top/share/icons/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/icons/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
 	for _un_f in $NV_BINARIES eitri-setup; do
 		if [ ! -f "$_un_top/lib/eitri/$_un_f" ] || [ ! -x "$_un_top/lib/eitri/$_un_f" ]; then
@@ -3008,11 +3041,120 @@ desktop_exec_quote() {
 	printf '"%s"\n' "$_dq"
 }
 
+# before_icon_advice WHAT: the way back to a release (or a source tree) from before the app icon, whose
+# layout -- the desktop entry eitri.desktop, no icons -- this installer does not lay out. Its own
+# installer would put eitri.desktop beside the cn.huntergrey.eitri.desktop and the icons this one put
+# there, so --uninstall comes first; WHAT is what to install after it. The list says what --uninstall
+# (do_uninstall, without --purge) removes and keeps.
+before_icon_advice() {
+	printf '%s' "Installing it with its own installer would leave any desktop entry and icons this installer installed beside its own. Nothing was changed. To go back to it, first run: eitri setup --uninstall (or, with this installer: sh install.sh --uninstall). It removes the launcher, the program in $NV_LIB, the desktop entries and icons, the licences, the private nvim and the sidecars Eitri built, and keeps your settings ($NV_HOME/.config/eitri) and state ($NV_STATE/eitri); then install $1"
+}
+
+# old_desktop_text: the eitri.desktop an installer before the app icon wrote for this user, byte for
+# byte: those releases' share/applications/eitri.desktop (packaging/legacy/eitri.desktop in this tree,
+# which a test holds equal to this text) with its Exec line rewritten, as stage_files does, to the
+# quoted launcher path and --quiet %f. Every release that installed the entry under that name wrote
+# exactly this.
+old_desktop_text() {
+	printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Eitri' \
+		'Comment=Neovim, embedded, with a Claude agent panel' \
+		"Exec=$(desktop_exec_quote "$NV_BINDIR/eitri") --quiet %f" \
+		'Terminal=false' 'Categories=Development;TextEditor;' 'MimeType=inode/directory;' 'StartupNotify=true'
+}
+
+# stdin_sha256: the SHA-256 of standard input, byte for byte (the output of old_desktop_text keeps its
+# trailing newline through the pipe, which a $(...) would not).
+stdin_sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		_ss_out=$(sha256sum) || die "sha256sum failed"
+	elif command -v shasum >/dev/null 2>&1; then
+		_ss_out=$(shasum -a 256) || die "shasum failed"
+	else
+		die "neither sha256sum nor shasum was found: install coreutils (or perl's shasum) and re-run"
+	fi
+	printf '%s\n' "${_ss_out%% *}"
+}
+
+# old_desktop_state: NV_OLD_DESKTOP_STATE is none, ours or foreign for $NV_DATA/applications/eitri.desktop,
+# the name earlier releases installed the desktop entry under (it is cn.huntergrey.eitri.desktop now).
+# "ours" is a regular file whose bytes are exactly old_desktop_text's: the whole file, compared by hash,
+# so a copy with a line removed, added, reordered or edited, or with another line ending, is not. Anything
+# else -- a symlink, a hand-written or edited entry, one for another launcher -- is foreign, and is never
+# removed: it is the user's, whatever it is called.
+old_desktop_state() {
+	NV_OLD_DESKTOP_STATE=none
+	_od_f=$NV_DATA/applications/$NV_OLD_DESKTOP
+	if [ ! -e "$_od_f" ] && [ ! -L "$_od_f" ]; then return 0; fi
+	NV_OLD_DESKTOP_STATE=foreign
+	if [ -L "$_od_f" ] || [ ! -f "$_od_f" ] || [ ! -r "$_od_f" ]; then return 0; fi
+	_od_have=$(file_sha256 "$_od_f")
+	_od_want=$(old_desktop_text | stdin_sha256)
+	if [ "$_od_have" = "$_od_want" ]; then NV_OLD_DESKTOP_STATE=ours; fi
+}
+
+# remove_old_desktop: an install over one from before the app icon removes the old eitri.desktop, when
+# it is ours (old_desktop_state), so the app grid does not show Eitri twice. A dock or dash entry
+# pinned from it is gone with it and has to be pinned again once: its desktop id changed.
+remove_old_desktop() {
+	old_desktop_state
+	case $NV_OLD_DESKTOP_STATE in
+	ours)
+		say "removing the old desktop entry $NV_DATA/applications/$NV_OLD_DESKTOP: Eitri's is $NV_DESKTOP now, so a launcher pinned to the dash or dock has to be pinned again once"
+		run rm -f -- "$NV_DATA/applications/$NV_OLD_DESKTOP"
+		;;
+	foreign)
+		say "$NV_DATA/applications/$NV_OLD_DESKTOP was left alone: it is not the entry an earlier Eitri installed (it is not byte for byte what an earlier installer wrote), so it may list Eitri a second time; remove it yourself if it is stale"
+		;;
+	esac
+}
+
+# refresh_icon_cache: gtk-update-icon-cache -f -t on this user's hicolor directory (only that one),
+# where the tool exists. -t is --ignore-theme-index: a user directory has no index.theme of its own.
+# Never fatal and never silent about a failure: the icon shows after the cache is rebuilt by anything,
+# and a desktop that scans the directories itself never needed it.
+refresh_icon_cache() {
+	if ! command -v gtk-update-icon-cache >/dev/null 2>&1; then return 0; fi
+	if [ "$OPT_DRY_RUN" = 1 ]; then
+		say "would run: gtk-update-icon-cache -f -t $NV_DATA/icons/hicolor"
+		return 0
+	fi
+	gtk-update-icon-cache -f -t "$NV_DATA/icons/hicolor" >/dev/null 2>&1 ||
+		warn "gtk-update-icon-cache failed on $NV_DATA/icons/hicolor: the icon appears once the cache is rebuilt (log out and in, or run it yourself)"
+}
+
+# tidy_icon_dirs: after --uninstall removed the icon files, the empty directories it emptied go (rmdir
+# only ever removes an empty one), and so does the cache gtk-update-icon-cache wrote -- when nothing
+# else is left in hicolor, which is then removed too. When another application's icons are there, the
+# cache is rebuilt for them instead.
+tidy_icon_dirs() {
+	_ti_h=$NV_DATA/icons/hicolor
+	if [ -L "$_ti_h" ] || [ ! -d "$_ti_h" ]; then return 0; fi
+	for _ti_a in "$_ti_h"/*/apps; do
+		if [ -d "$_ti_a" ]; then
+			rmdir -- "$_ti_a" 2>/dev/null || :
+			rmdir -- "${_ti_a%/apps}" 2>/dev/null || :
+		fi
+	done
+	_ti_left=$(ls -A -- "$_ti_h" 2>/dev/null) || _ti_left=
+	case $_ti_left in
+	icon-theme.cache)
+		rm -f -- "$_ti_h/icon-theme.cache" || :
+		rmdir -- "$_ti_h" 2>/dev/null || :
+		rmdir -- "$NV_DATA/icons" 2>/dev/null || :
+		;;
+	'')
+		rmdir -- "$_ti_h" 2>/dev/null || :
+		rmdir -- "$NV_DATA/icons" 2>/dev/null || :
+		;;
+	*) refresh_icon_cache ;;
+	esac
+}
+
 # stage_files: the launcher (with its marker line, spec §6.5, MIN-2), the desktop entry (its Exec
-# escaped) and the licences, each written to a temporary name in its destination directory. This
-# runs before the swap, so a directory that cannot be written stops the run while the old install
-# is still in place and untouched: written after it, an unwritable ~/.local/bin left the new lib
-# with the old launcher and licences, and no eitri.old to go back to (Task 9 review).
+# escaped), the icon (every size) and the licences, each written to a temporary name in its destination
+# directory. This runs before the swap, so a directory that cannot be written stops the run while the
+# old install is still in place and untouched: written after it, an unwritable ~/.local/bin left the
+# new lib with the old launcher and licences, and no eitri.old to go back to (Task 9 review).
 # commit_files renames them into place after the swap; on_exit removes any left behind.
 stage_files() {
 	NV_TMP_LAUNCHER=$NV_BINDIR/.eitri.tmp.$$
@@ -3022,7 +3164,8 @@ stage_files() {
 	run mkdir -p -- "$NV_BINDIR" "$_sf_apps" "$_sf_lic"
 	if [ "$OPT_DRY_RUN" = 1 ]; then
 		say "would write the launcher $NV_BINDIR/eitri (from the tarball's bin/eitri, with the line '$NV_LAUNCHER_MARKER')"
-		say "would write $_sf_apps/eitri.desktop with Exec=$_sf_exec --quiet %f"
+		say "would write $_sf_apps/$NV_DESKTOP with Exec=$_sf_exec --quiet %f"
+		for _sf_f in $NV_ICON_FILES; do say "would write $NV_DATA/icons/$_sf_f"; done
 		for _sf_f in $NV_LICENCE_FILES; do say "would write $_sf_lic/$_sf_f"; done
 		return 0
 	fi
@@ -3037,11 +3180,16 @@ stage_files() {
 	NV_EXEC="$_sf_exec --quiet %f" awk '
 		/^Exec=/ { print "Exec=" ENVIRON["NV_EXEC"]; next }
 		/^TryExec=/ { next }
-		{ print }' "$NV_STAGE_TOP/share/applications/eitri.desktop" >"$_sf_apps/.eitri.desktop.tmp.$$" ||
-		die "cannot write $_sf_apps/.eitri.desktop.tmp.$$; $_sf_keep"
+		{ print }' "$NV_STAGE_TOP/share/applications/$NV_DESKTOP" >"$_sf_apps/.$NV_DESKTOP.tmp.$$" ||
+		die "cannot write $_sf_apps/.$NV_DESKTOP.tmp.$$; $_sf_keep"
 	for _sf_f in $NV_LICENCE_FILES; do
 		cp -- "$NV_STAGE_TOP/share/licenses/eitri/$_sf_f" "$_sf_lic/.$_sf_f.tmp.$$" ||
 			die "cannot write $_sf_lic/.$_sf_f.tmp.$$; $_sf_keep"
+	done
+	for _sf_f in $NV_ICON_FILES; do
+		mkdir -p -- "$NV_DATA/icons/${_sf_f%/*}" || die "cannot create $NV_DATA/icons/${_sf_f%/*}; $_sf_keep"
+		cp -- "$NV_STAGE_TOP/share/icons/$_sf_f" "$NV_DATA/icons/${_sf_f%/*}/.${_sf_f##*/}.tmp.$$" ||
+			die "cannot write $NV_DATA/icons/${_sf_f%/*}/.${_sf_f##*/}.tmp.$$; $_sf_keep"
 	done
 }
 
@@ -3064,17 +3212,28 @@ commit_files() {
 			run mv -- "$_cf_dst" "$_cf_bak"
 		fi
 	fi
-	if [ "$OPT_DRY_RUN" = 1 ]; then return 0; fi
+	if [ "$OPT_DRY_RUN" = 1 ]; then
+		remove_old_desktop
+		refresh_icon_cache
+		return 0
+	fi
 	# The new lib is in place from here on: a failure leaves the install unfinished, and a re-run
 	# finishes it (install_complete keeps it from saying "up to date" instead).
 	_cf_fin="Eitri $NV_VERSION is in $NV_LIB but not finished: fix this and re-run the installer to finish it"
 	mv -- "$NV_TMP_LAUNCHER" "$_cf_dst" || die "cannot move the launcher into $_cf_dst; $_cf_fin"
-	mv -- "$NV_DATA/applications/.eitri.desktop.tmp.$$" "$NV_DATA/applications/eitri.desktop" ||
-		die "cannot write $NV_DATA/applications/eitri.desktop; $_cf_fin"
+	mv -- "$NV_DATA/applications/.$NV_DESKTOP.tmp.$$" "$NV_DATA/applications/$NV_DESKTOP" ||
+		die "cannot write $NV_DATA/applications/$NV_DESKTOP; $_cf_fin"
+	for _cf_f in $NV_ICON_FILES; do
+		mv -- "$NV_DATA/icons/${_cf_f%/*}/.${_cf_f##*/}.tmp.$$" "$NV_DATA/icons/$_cf_f" ||
+			die "cannot write $NV_DATA/icons/$_cf_f; $_cf_fin"
+	done
 	for _cf_f in $NV_LICENCE_FILES; do
 		mv -- "$NV_DATA/licenses/eitri/.$_cf_f.tmp.$$" "$NV_DATA/licenses/eitri/$_cf_f" ||
 			die "cannot write $NV_DATA/licenses/eitri/$_cf_f; $_cf_fin"
 	done
+	# After the new entry is in place, so an interruption never leaves neither.
+	remove_old_desktop
+	refresh_icon_cache
 	# Written last, deliberately (installer-claude-5): an interrupt or a failed mv anywhere above
 	# leaves this stamp naming an OLDER version (or missing outright, on a first install), so
 	# install_complete below correctly reads the install as unfinished -- even though every
@@ -3100,7 +3259,10 @@ install_complete() {
 	NV_COMPLETE=0
 	if [ -L "$NV_BINDIR/eitri" ] || [ ! -f "$NV_BINDIR/eitri" ]; then return 0; fi
 	if ! grep -Fqx -- "$NV_LAUNCHER_MARKER" "$NV_BINDIR/eitri"; then return 0; fi
-	if [ ! -f "$NV_DATA/applications/eitri.desktop" ]; then return 0; fi
+	if [ ! -f "$NV_DATA/applications/$NV_DESKTOP" ]; then return 0; fi
+	for _ic_f in $NV_ICON_FILES; do
+		if [ ! -f "$NV_DATA/icons/$_ic_f" ]; then return 0; fi
+	done
 	for _ic_f in $NV_LICENCE_FILES; do
 		if [ ! -f "$NV_DATA/licenses/eitri/$_ic_f" ]; then return 0; fi
 	done
@@ -3239,7 +3401,7 @@ do_install() {
 				return 0
 			fi
 			if [ "$NV_COMPLETE" != 1 ]; then
-				say "Eitri $NV_VERSION is installed but not finished (its launcher, desktop entry or licences are missing): installing it again"
+				say "Eitri $NV_VERSION is installed but not finished (its launcher, desktop entry, icon or licences are missing): installing it again"
 			fi
 		fi
 	fi
@@ -3314,7 +3476,27 @@ do_uninstall() {
 			_du_launcher_note="$NV_BINDIR/eitri was left alone: it was not installed by this installer (no '$NV_LAUNCHER_MARKER' line)"
 		fi
 	fi
-	set -- "$@" "$NV_DATA/applications/eitri.desktop" "$NV_DATA/licenses/eitri"
+	set -- "$@" "$NV_DATA/applications/$NV_DESKTOP" "$NV_DATA/licenses/eitri"
+	# The entry earlier releases installed as eitri.desktop goes only if it is the one this installer
+	# wrote (old_desktop_state); a user's own file of that name is left, and named.
+	_du_desktop_note=
+	old_desktop_state
+	case $NV_OLD_DESKTOP_STATE in
+	ours) set -- "$@" "$NV_DATA/applications/$NV_OLD_DESKTOP" ;;
+	foreign) _du_desktop_note="$NV_DATA/applications/$NV_OLD_DESKTOP was left alone: it is not the entry an earlier Eitri installed (it is not byte for byte what an earlier installer wrote); remove it yourself if it is stale" ;;
+	esac
+	# The icon: exactly the files install writes (NV_ICON_FILES), by path -- never a pattern, which would
+	# also take a user's own icon of Eitri's name in a size or format this installer never writes
+	# (96x96, say). A path of the list holds the file this installer wrote when it is a regular file; a
+	# symlink or a directory there is the user's, left in place and named.
+	for _du_f in $NV_ICON_FILES; do
+		_du_if=$NV_DATA/icons/$_du_f
+		if [ -L "$_du_if" ] || { [ -e "$_du_if" ] && [ ! -f "$_du_if" ]; }; then
+			say "$_du_if was left alone: it is a symlink or a directory, not the icon file this installer wrote"
+		elif [ -e "$_du_if" ]; then
+			set -- "$@" "$_du_if"
+		fi
+	done
 	# What Eitri keeps under $NV_DATA/eitri (a private nvim, the sidecars) goes only when that
 	# really is a directory named eitri, wherever a link puts it (moved to another disk, say). A
 	# link to anything else -- ~/.config, once, whose nvim went with it -- was not made by this
@@ -3421,7 +3603,9 @@ do_uninstall() {
 			done
 		fi
 		if [ -d "$NV_DATA/licenses" ]; then rmdir -- "$NV_DATA/licenses" 2>/dev/null || :; fi
+		tidy_icon_dirs
 	fi
+	if [ -n "$_du_desktop_note" ]; then say "$_du_desktop_note"; fi
 	if [ -n "$_du_launcher_note" ]; then say "$_du_launcher_note"; fi
 	if [ -n "$_du_link_note" ]; then say "$_du_link_note"; fi
 	if [ -n "$_du_sidecar_link_note" ]; then say "$_du_sidecar_link_note"; fi

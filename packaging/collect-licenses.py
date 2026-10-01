@@ -21,7 +21,9 @@ It FAILS -- exit 1, and no output file -- rather than warn, on:
   * binaries built by a different rustc from the one whose standard-library notice it reads;
   * a sidecar artifact that does not match the Verdandi checkout it is reading the npm tree from;
   * an object member inside the Skia prebuilt archive (--no-sidecar's --skia-archive-path) that
-    belongs to no component it has a licence text for.
+    belongs to no component it has a licence text for;
+  * Eitri's own artwork (<repo>/packaging/icons, the application icon) when its LICENSE is not the
+    owner's CC BY 4.0 notice word for word, or the directory holds a file ARTWORK_FILES does not list.
 
 Deterministic by construction: every list is sorted, nothing reads the clock, and identical texts
 are printed once and referred to afterwards. Running it twice gives byte-identical output.
@@ -31,6 +33,7 @@ Inputs it expects to exist (publish.sh / release.sh produce all of them before c
     (or --binaries-dir DIR; no agent-hook -- it is not in any release, spec sec 10, D16)
   dist/verdandi-claude-sidecar                    (sidecar profile only; not read with --no-sidecar)
   agent-ui/web/node_modules                       (shell/build.rs runs npm ci there)
+  <repo>/packaging/icons/                         (the icon and its CC BY 4.0 notice, printed last)
   $EITRI_VERDANDI_CHECKOUT (default ~/src/verdandi), with node_modules installed and
   apps/claude-sidecar/build/node-cache/ holding the Node the artifact was built from (sidecar profile
   only)
@@ -195,6 +198,31 @@ def own_code(name, license):
         return True
     raise Fail(f"workspace member {name} declares {license!r}: not Eitri's MIT, and not in "
                "WORKSPACE_THIRD_PARTY")
+
+
+# Eitri's own artwork, packaging/icons: the logo installed as the application icon (under hicolor, as
+# cn.huntergrey.eitri.png/.svg). It is not code, so LICENSE's MIT does not cover it: the owner licenses
+# it CC BY 4.0, and its colours come from the Neovim logo by Jason Long (CC BY 3.0). Both are
+# attribution-only licences, and the notice below -- which names the licence, its URL and the credit --
+# is what CC BY asks to travel with a copy, so it is printed into THIRD-PARTY-LICENSES in both profiles.
+#
+# This is deliberately NOT done by adding CC-BY-4.0 to PERMISSIVE: that set classifies every dependency,
+# and a crate or npm package under a Creative Commons licence (a data set, say) must still fail the run
+# until someone looks at it. ARTWORK_LICENSES is checked only against this one entry.
+ARTWORK_DIR = os.path.join("packaging", "icons")
+ARTWORK_LICENSE = "CC-BY-4.0"
+ARTWORK_LICENSES = {"CC-BY-4.0", "CC-BY-3.0"}
+ARTWORK_NOTICE = (
+    "The Eitri logo (c) Hunter Grey, licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). "
+    "Its blue and green come from the Neovim logo by Jason Long (CC BY 3.0).")
+# Every file packaging/icons may hold, so a new one (another artist's work, say) cannot ship under this
+# notice without someone adding it here: an unlisted file fails the run, as does a missing listed one.
+ARTWORK_FILES = {
+    "LICENSE", "README.md", "eitri.svg", "eitri-16.svg",
+    *(f"hicolor/{size}/apps/cn.huntergrey.eitri.png"
+      for size in ("16x16", "24x24", "32x32", "48x48", "64x64", "128x128", "256x256", "512x512")),
+    "hicolor/scalable/apps/cn.huntergrey.eitri.svg",
+}
 
 
 # Allowlisted for its licence, NOT for its text: the header promises this one's own licence file
@@ -1255,6 +1283,37 @@ def vite_runtime(shipped, counts, repo=REPO):
              "files": [("LICENSE.md (Vite core licence section)", text[:cut])]}]
 
 
+def artwork_entries(repo=REPO):
+    """The one entry for Eitri's own artwork (ARTWORK_DIR under `repo`), or a Fail: the directory must
+    hold exactly ARTWORK_FILES, its LICENSE must be the owner's notice (ARTWORK_NOTICE) word for word,
+    and the licences it names must be ones ARTWORK_LICENSES classifies. The files themselves are not
+    read: a package ships them byte for byte (release_check.py's role table holds that)."""
+    root = os.path.join(repo, ARTWORK_DIR)
+    if not os.path.isdir(root):
+        raise Fail(f"{root} does not exist: Eitri's icon is shipped, and its licence notice lives there")
+    found = set()
+    for d, _dirs, names in os.walk(root):
+        found.update(os.path.relpath(os.path.join(d, n), root) for n in names)
+    if found - ARTWORK_FILES:
+        raise Fail(f"{ARTWORK_DIR} holds {sorted(found - ARTWORK_FILES)}, which ARTWORK_FILES does not list: "
+                   "the notice printed in THIRD-PARTY-LICENSES covers only the Eitri logo, so a new file needs "
+                   "its own licence checked and an entry here, or has to go")
+    if ARTWORK_FILES - found:
+        raise Fail(f"{ARTWORK_DIR} lacks {sorted(ARTWORK_FILES - found)}: restore it, or drop it from ARTWORK_FILES")
+    notice = read_text(os.path.join(root, "LICENSE"))
+    if notice.strip() != ARTWORK_NOTICE:
+        raise Fail(f"{os.path.join(ARTWORK_DIR, 'LICENSE')} is not the logo's licence notice the owner gave: it "
+                   f"must read exactly: {ARTWORK_NOTICE}")
+    for lic in (ARTWORK_LICENSE, "CC-BY-3.0"):
+        if lic not in ARTWORK_LICENSES:
+            raise Fail(f"artwork licence {lic!r} is not one ARTWORK_LICENSES classifies")
+    return [{"title": "The Eitri logo (the icon files this package installs under hicolor)", "name": "eitri-logo",
+             "version": "", "license": f"{ARTWORK_LICENSE}; its colours from the Neovim logo, CC-BY-3.0",
+             "status": None, "copyleft": False,
+             "note": "Eitri's own artwork, not covered by the MIT licence of LICENSE; packaging/icons/LICENSE",
+             "files": [("packaging/icons/LICENSE", notice)]}]
+
+
 # The exact LGPL-3.0 section 4(a) "prominent notice" sentence (spec sec 11.3's 4(a) row). Shared
 # between THIRD-PARTY-LICENSES (build_header) and SOURCE (write_source_notice) so the two files
 # never say it differently, and takes the real resolved version rather than a hardcoded one nothing
@@ -1266,12 +1325,13 @@ def nvim_rs_lgpl_notice(version):
 
 
 def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web_count, sc, sc_pkgs_count,
-                  counts_rust, counts_web, counts_sc, skia_archive_count=0):
+                  counts_rust, counts_web, counts_sc, skia_archive_count=0, artwork_count=0):
     """The prose block before PART 1, as its own function so a unit test can check the two profiles'
     shapes (spec sec 11.3 4(a); Review Focus 4/5) without a real build. `sc` is the sidecar_facts()
     dict, or None when no_sidecar. `skia_archive_count` (no_sidecar only) is the number of entries
     skia_archive_notice_entries() found, for the "Contents:" list below -- review minor 6: that list
-    used to stop at part 3/4 and never mentioned the archive-contents section at all."""
+    used to stop at part 3/4 and never mentioned the archive-contents section at all. `artwork_count`
+    is the number of entries artwork_entries() found (Eitri's own icon, under its own licence)."""
     nvim_rs = next((e for e in copyleft if e["name"] == "nvim-rs"), None)
     if nvim_rs is None:
         raise Fail("no nvim-rs entry in copyleft: the LGPL-3.0 sec 4(a) notice has no version to name")
@@ -1285,6 +1345,12 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
         "This package also contains other people's code, each part under its own licence,",
         "reproduced below. MIT covers Eitri's code only; it does not relicense any of this.",
     ]
+    if artwork_count:
+        L += [
+            "",
+            "The application icon is Eitri's own artwork, and is not MIT-licensed: it is under CC BY 4.0,",
+            "with the credit and the notice it asks for at the end of this file.",
+        ]
     if not no_sidecar:
         L += [
             "",
@@ -1317,6 +1383,8 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
         L.append(f"  part 4  the sidecar: Node.js {sc['node']} and its npm packages              ({sc_pkgs_count})")
     if no_sidecar:
         L.append(f"  also    components inside the Skia prebuilt archive in the source asset      ({skia_archive_count})")
+    if artwork_count:
+        L.append(f"  also    Eitri's own artwork, the icon files this package installs            ({artwork_count})")
     L.append("")
     parts = [("part 1", counts_rust), ("part 3", counts_web)]
     if not no_sidecar:
@@ -1388,8 +1456,9 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
             e["status"] = e["status"].replace(
                 "{binaries}", ", ".join(f"`{b}`" for b in nvim_rs_binaries))
 
+    artwork = artwork_entries(repo)
     L = build_header(no_sidecar, source_url, copyleft, len(rust), len(native), len(web), sc,
-                      len(sc_pkgs), counts_rust, counts_web, counts_sc, len(archive_entries))
+                      len(sc_pkgs), counts_rust, counts_web, counts_sc, len(archive_entries), len(artwork))
 
     printed = {}
     L += [RULE, "PART 1 -- Rust crates linked into the shipped binaries", RULE, ""]
@@ -1416,6 +1485,11 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
               "this build linked, not just the parts the binaries above actually reference -- so every",
               "component it contains needs a notice, whether or not it appears in PART 2.", ""]
         render_entries(archive_entries, printed, L)
+    # Last in both profiles, so publish.sh's byte-equality of parts 1-3 is not touched by it.
+    L += ["", RULE, "Eitri's own artwork -- the icon files this package installs", RULE, ""]
+    L += ["The application icon (hicolor/<size>/apps/cn.huntergrey.eitri.png and the scalable .svg) is not",
+          "code and is not under the MIT licence of LICENSE. Its licence notice, as the owner gave it:", ""]
+    render_entries(artwork, printed, L)
     nvim_rs = next((e for e in copyleft if e["name"] == "nvim-rs"), None)
     if nvim_rs is None:
         raise Fail("no nvim-rs entry in the resolved copyleft crates: the LGPL-3.0 sec 4(a) notice "
@@ -1424,6 +1498,7 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
                                                "web": counts_web, "sidecar": counts_sc,
                                                "excluded": [p["name"] for p in excluded],
                                                "skia_archive": [c["title"] for c in archive_entries],
+                                               "artwork": [e["title"] for e in artwork],
                                                "nvim_rs_version": nvim_rs["version"]}
 
 
@@ -1636,6 +1711,7 @@ def main(argv):
           f"excluded as not shipped: {', '.join(summary['excluded']) or 'none'}", file=sys.stderr)
     if summary["skia_archive"]:
         print(f"  Skia archive contents: {', '.join(summary['skia_archive'])}", file=sys.stderr)
+    print(f"  artwork: {', '.join(summary['artwork'])}", file=sys.stderr)
     if source_notice:
         print(f"collect-licenses: wrote {source_notice}", file=sys.stderr)
     return 0

@@ -991,6 +991,53 @@ class BinaryAssetTreeTests(unittest.TestCase):
         for roles in (rc.tarball_roles("1.0.0-rc.1"), rc.package_roles(), rc.deb_roles()):
             self.assertEqual(rc.check_binary_asset("x", self.tree(roles), roles), [])
 
+    def test_the_desktop_entry_and_the_icons_are_named_by_the_application_id(self):
+        """The compositor matches a window to `<application id>.desktop`, and the theme finds the icon
+        by the id: both are cn.huntergrey.eitri in the tarball and in both packages."""
+        self.assertEqual(rc.APP_ID, "cn.huntergrey.eitri")
+        t, p = rc.tarball_roles("1.0.0"), rc.package_roles()
+        self.assertEqual(t["desktop"], "eitri-1.0.0-x86_64-linux/share/applications/cn.huntergrey.eitri.desktop")
+        self.assertEqual(p["desktop"], "usr/share/applications/cn.huntergrey.eitri.desktop")
+        for size in ("16x16", "24x24", "32x32", "48x48", "64x64", "128x128", "256x256", "512x512"):
+            self.assertEqual(p[f"icon-{size}"], f"usr/share/icons/hicolor/{size}/apps/cn.huntergrey.eitri.png")
+            self.assertTrue(t[f"icon-{size}"].endswith(f"/share/icons/hicolor/{size}/apps/cn.huntergrey.eitri.png"))
+        self.assertEqual(p["icon-scalable"], "usr/share/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg")
+        self.assertEqual(len([r for r in p if r.startswith("icon-")]), 9)
+
+    def test_the_tracked_art_is_the_committed_desktop_entry_and_icons(self):
+        """TRACKED_ART names, for every desktop/icon role, a file that exists in the repository (a
+        rename of one without the other would otherwise fail only at release time)."""
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.assertEqual(sorted(rc.TRACKED_ART),
+                         sorted(["desktop", "legacy-desktop"] + [r for r in rc.package_roles() if r.startswith("icon-")]))
+        for role, path in rc.TRACKED_ART.items():
+            self.assertTrue(os.path.isfile(os.path.join(repo, path)), (role, path))
+
+    def test_the_tarball_alone_carries_the_legacy_desktop_entry_for_0_2_0s_installer(self):
+        """0.2.0's install.sh, which INSTALL.md tells a user to save and rerun to upgrade, refuses a
+        tarball that has no share/applications/eitri.desktop. The tarball therefore ships 0.2.0's own
+        entry at that path, byte for byte (packaging/legacy/eitri.desktop); no package ships it, and
+        this release's installer never reads it."""
+        top = "eitri-1.0.0-x86_64-linux/"
+        self.assertEqual(rc.tarball_roles("1.0.0")["legacy-desktop"], top + "share/applications/eitri.desktop")
+        for roles in (rc.package_roles(), rc.deb_roles()):
+            self.assertNotIn("legacy-desktop", roles)
+        self.assertEqual(rc.TRACKED_ART["legacy-desktop"], "packaging/legacy/eitri.desktop")
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        with open(os.path.join(repo, "packaging", "legacy", "eitri.desktop"), "rb") as f:
+            # The sha256 of packaging/eitri.desktop at main 4ce433a0, the tree 0.2.0 is cut from.
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(),
+                             "b58906bcaf3da9e06b3031b0b36d9298e11a7c227c90e36b50c0b7b68aa7f343")
+
+    def test_a_package_without_an_icon_or_with_the_old_desktop_name_fails(self):
+        roles = rc.package_roles()
+        root = self.tree(roles)
+        os.remove(os.path.join(root, roles["icon-scalable"]))
+        self.assertTrue(any("missing: usr/share/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg" in p
+                            for p in rc.check_binary_asset("x", root, roles)))
+        problems = rc.check_binary_asset("x", self.tree(roles, {"usr/share/applications/eitri.desktop": b"x"}), roles)
+        self.assertTrue(any("files no release ships: usr/share/applications/eitri.desktop" in p for p in problems), problems)
+
     def test_only_the_deb_carries_the_apparmor_profile(self):
         """docs/superpowers/plans/2026-09-28-v1-dist-ubuntu-userns.md: the .deb's layout is the
         .rpm's plus /etc/apparmor.d/eitri; a .deb without it, or an .rpm with it, fails."""
@@ -1226,7 +1273,10 @@ class ReleaseAssetsTests(unittest.TestCase):
         })
         cls.src, _ = _init_git_repo({"Cargo.toml": b"[workspace]\n", "agent-ui/web/src/a.ts": b"x\n",
                                      "packaging/install.sh": cls.INSTALL, "LICENSE": b"MIT\n",
-                                     "packaging/apparmor/eitri": cls.APPARMOR})
+                                     "packaging/apparmor/eitri": cls.APPARMOR,
+                                     # The tracked desktop entry and icons the release ships unmodified
+                                     # (rc.TRACKED_ART); each role's bytes are its own name, as below.
+                                     **{path: role.encode() for role, path in rc.TRACKED_ART.items()}})
         fork, _ = _init_git_repo({"Cargo.toml": b"[package]\n"})
         shutil.copytree(fork, os.path.join(cls.src, "neovide"))
         shutil.rmtree(fork, ignore_errors=True)
@@ -1261,8 +1311,9 @@ class ReleaseAssetsTests(unittest.TestCase):
         }.items()})
         return {
             "tarball": {troles[r]: b for r, b in role_bytes.items()},
-            "deb": {**{proles[r]: b for r, b in role_bytes.items()}, rc.deb_roles()["apparmor"]: self.APPARMOR},
-            "rpm": {proles[r]: b for r, b in role_bytes.items()},
+            "deb": {**{proles[r]: b for r, b in role_bytes.items() if r in proles},
+                    rc.deb_roles()["apparmor"]: self.APPARMOR},
+            "rpm": {proles[r]: b for r, b in role_bytes.items() if r in proles},
             "source": source,
             "verdandi": _archive_files(self.verdandi, self.vrev),
             "install.sh": self.INSTALL,
@@ -1298,6 +1349,12 @@ class ReleaseAssetsTests(unittest.TestCase):
         return rc.check_release_assets(out, os.path.join(out, "check"), self.VERSION, self.vrev, self.src,
                                        self.verdandi, self.SKIA, sha)
 
+    def set_everywhere(self, contents, role, data):
+        """Replace one role's bytes in the tarball, the .deb and the .rpm alike."""
+        contents["tarball"][rc.tarball_roles(self.VERSION)[role]] = data
+        for key in ("deb", "rpm"):
+            contents[key][rc.package_roles()[role]] = data
+
     def test_the_unbroken_release_passes(self):
         self.assertEqual(self.check(), [f"extracted and checked: {', '.join(self.names().values())}"])
 
@@ -1324,6 +1381,29 @@ class ReleaseAssetsTests(unittest.TestCase):
              ["not byte-identical", "{deb}:etc/apparmor.d/eitri"]),
             ("rpm bytes", plant("rpm", shell, _fake_elf(b"another build")),
              ["not byte-identical", "{rpm}:" + shell]),
+            ("the old desktop entry", plant("deb", "usr/share/applications/eitri.desktop", b"[Desktop Entry]\n"),
+             ["{deb}: files no release ships", "usr/share/applications/eitri.desktop"]),
+            ("an icon in no role", plant("tarball", rc.tarball_top(self.VERSION) + "/share/icons/hicolor/1024x1024/apps/"
+                                         "cn.huntergrey.eitri.png", b"png"),
+             ["{tarball}: files no release ships", "1024x1024"]),
+            ("a dropped icon", lambda c: c["rpm"].pop(rc.package_roles()["icon-48x48"]),
+             ["{rpm}: missing", "usr/share/icons/hicolor/48x48/apps/cn.huntergrey.eitri.png"]),
+            # All three assets agree with each other and not with the tracked file: only the
+            # comparison against the source asset's packaging/ tree can see it.
+            ("an icon that is not the tracked one", lambda c: self.set_everywhere(c, "icon-scalable", b"<svg/>"),
+             ["not byte-identical", "{source}:packaging/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg"]),
+            ("a desktop entry that is not the tracked one",
+             lambda c: self.set_everywhere(c, "desktop", b"[Desktop Entry]\nName=Other\n"),
+             ["not byte-identical", "{source}:packaging/cn.huntergrey.eitri.desktop"]),
+            ("a tarball without the legacy entry 0.2.0's installer needs",
+             lambda c: c["tarball"].pop(rc.tarball_roles(self.VERSION)["legacy-desktop"]),
+             ["{tarball}: missing", "share/applications/eitri.desktop"]),
+            ("a legacy entry that is not 0.2.0's",
+             lambda c: c["tarball"].update({rc.tarball_roles(self.VERSION)["legacy-desktop"]: b"[Desktop Entry]\n"}),
+             ["not byte-identical", "{source}:packaging/legacy/eitri.desktop"]),
+            ("the legacy entry in a package",
+             plant("rpm", "usr/share/applications/eitri.desktop", b"legacy"),
+             ["{rpm}: files no release ships", "usr/share/applications/eitri.desktop"]),
             ("source", plant("source", top + "stray.txt", b"x\n"), ["source asset vs git archive HEAD", "stray.txt"]),
             ("source sdk", plant("source", top + "vendor/x/README.md", b"see claude-agent-sdk\n"),
              ["the SDK's name in an added file", "vendor/x/README.md"]),

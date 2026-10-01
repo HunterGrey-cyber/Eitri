@@ -14,6 +14,7 @@ build. Scratch lives under ~/.cache, never /tmp.
 import hashlib
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -829,6 +830,63 @@ class PhaseFCopyRebuilds(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("ctr_copy_source /src /build/src", proc.stdout)
         self.assertNotIn("cp -a", proc.stdout)
+
+
+class StagesTheDesktopEntryAndIcons(unittest.TestCase):
+    """Phase B's ctr_stage_art and ctr_tarball_art (the app icon, 2026-10-01), run for real over this
+    repository's own packaging/ files: the staging dir holds every source nfpm-public.yaml names for the
+    desktop entry and the icons, and the tarball tree holds exactly the paths release_check.py's role
+    table expects -- no more (a stray file there fails check-assets), no fewer -- with the committed
+    bytes."""
+
+    def setUp(self):
+        self.scratch = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+        self.clone = os.path.join(self.scratch, "clone")
+        os.makedirs(os.path.join(self.clone, "packaging"))
+        shutil.copytree(os.path.join(_PACKAGING, "icons"), os.path.join(self.clone, "packaging", "icons"))
+        shutil.copy(os.path.join(_PACKAGING, "cn.huntergrey.eitri.desktop"), os.path.join(self.clone, "packaging"))
+        shutil.copytree(os.path.join(_PACKAGING, "legacy"), os.path.join(self.clone, "packaging", "legacy"))
+        self.st = os.path.join(self.scratch, "stage")
+        self.tree = os.path.join(self.scratch, "tarball", "top")
+        os.makedirs(os.path.join(self.st, "packaging"))
+        proc = _bash(f'ctr_stage_art "{self.st}"; ctr_tarball_art "{self.st}" "{self.tree}"', dict(os.environ),
+                     self.clone)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    @staticmethod
+    def files(root):
+        return {os.path.relpath(os.path.join(d, f), root) for d, _, names in os.walk(root) for f in names}
+
+    def test_the_staging_dir_holds_every_source_the_public_profile_names(self):
+        with open(os.path.join(_PACKAGING, "nfpm-public.yaml"), encoding="utf-8") as f:
+            srcs = re.findall(rf"^\s*- src: \./(packaging/(?:icons/|{re.escape(rc.APP_ID)}\.desktop)\S*)\s*$",
+                              f.read(), re.M)
+        self.assertEqual(len(srcs), 10, srcs)
+        for src in srcs:
+            self.assertTrue(os.path.isfile(os.path.join(self.st, src)), src)
+        # The staging dir also holds the legacy entry (for the tarball's own copy of it), which no
+        # profile names: a package never ships it.
+        self.assertEqual({p for p in self.files(self.st)}, set(srcs) | {"packaging/legacy/eitri.desktop"})
+        for profile in ("nfpm.yaml", "nfpm-public.yaml"):
+            with open(os.path.join(_PACKAGING, profile), encoding="utf-8") as f:
+                entries = [ln for ln in f.read().splitlines() if re.match(r"\s*(- )?(src|dst):", ln)]
+            self.assertEqual([ln for ln in entries if "packaging/legacy" in ln or "/eitri.desktop" in ln], [], profile)
+
+    def test_the_tarball_tree_is_exactly_the_roles_release_check_expects(self):
+        top = "eitri-1.0.0-x86_64-linux/"
+        roles = rc.tarball_roles("1.0.0")
+        want = {path[len(top):] for role, path in roles.items()
+                if role in ("desktop", "legacy-desktop") or role.startswith("icon-")}
+        self.assertIn("share/applications/eitri.desktop", want)
+        self.assertEqual(self.files(self.tree), want)
+        for role, tracked in rc.TRACKED_ART.items():
+            with open(os.path.join(_PACKAGING, "..", tracked), "rb") as a, \
+                    open(os.path.join(self.tree, roles[role][len(top):]), "rb") as b:
+                self.assertEqual(a.read(), b.read(), role)
+        # Modes: read, never executed (the nfpm packages and install.sh rely on a plain file).
+        for rel in self.files(self.tree):
+            self.assertEqual(os.stat(os.path.join(self.tree, rel)).st_mode & 0o777, 0o644, rel)
 
 
 class SignAndVerify(unittest.TestCase):

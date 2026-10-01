@@ -884,6 +884,35 @@ ctr_tar() {
 		--owner=0 --group=0 --numeric-owner -C "$2" -cf - "$1" | gzip -n -9 > "$3"
 }
 
+# ctr_stage_art ST: the desktop entry and the icon tree, copied from the clone (cwd) into the staging
+# dir at the paths nfpm-public.yaml names as their sources. The entry is named by the application id
+# (shell/src/main.rs's APP_ID), which the compositor matches a window to; the icons are every file under
+# packaging/icons/hicolor, found rather than listed so that release_check.py's role table is the one
+# list: a file it does not know fails check-assets, and nfpm-public.yaml's own entries are held to the
+# committed files by test_nfpm_profiles.py. packaging/legacy/eitri.desktop (0.2.0's own entry) is staged
+# too, for the tarball alone: no nfpm profile names it, so no package carries it.
+ctr_stage_art() {
+	local st="$1" f
+	install -m 0644 packaging/cn.huntergrey.eitri.desktop "$st/packaging/cn.huntergrey.eitri.desktop"
+	install -D -m 0644 packaging/legacy/eitri.desktop "$st/packaging/legacy/eitri.desktop"
+	while IFS= read -r f; do
+		install -D -m 0644 "packaging/icons/$f" "$st/packaging/icons/$f"
+	done < <(cd packaging/icons && find hicolor -type f | LC_ALL=C sort)
+}
+
+# ctr_tarball_art ST TREE: the same files, from the staging dir, at the tarball's own paths
+# (share/applications/..., share/icons/hicolor/...). The tarball also gets 0.2.0's desktop entry as
+# share/applications/eitri.desktop (packaging/legacy/README.md): 0.2.0's install.sh, which a user may
+# rerun to upgrade, refuses a tarball without it. Only that installer reads it; this release's ignores it.
+ctr_tarball_art() {
+	local st="$1" tree="$2" f
+	install -D -m 0644 "$st/packaging/cn.huntergrey.eitri.desktop" "$tree/share/applications/cn.huntergrey.eitri.desktop"
+	install -D -m 0644 "$st/packaging/legacy/eitri.desktop" "$tree/share/applications/eitri.desktop"
+	while IFS= read -r f; do
+		install -D -m 0644 "$st/packaging/icons/$f" "$tree/share/icons/$f"
+	done < <(cd "$st/packaging/icons" && find hicolor -type f | LC_ALL=C sort)
+}
+
 ctr_phase_b() {
 	ctr_env
 	export CARGO_NET_OFFLINE=true npm_config_offline=true
@@ -956,7 +985,7 @@ ctr_phase_b() {
 	chmod 0644 "$st/dist/RELEASE" "$st/dist/THIRD-PARTY-LICENSES" "$st/dist/SOURCE"
 	install -m 0755 packaging/install.sh "$st/packaging/install.sh"
 	install -m 0755 packaging/eitri.launcher.sh "$st/packaging/eitri.launcher.sh"
-	install -m 0644 packaging/eitri.desktop "$st/packaging/eitri.desktop"
+	ctr_stage_art "$st"
 	# The .deb's AppArmor profile (nfpm-public.yaml's `packager: deb` entry).
 	install -D -m 0644 packaging/apparmor/eitri "$st/packaging/apparmor/eitri"
 	install -m 0644 LICENSE "$st/LICENSE"
@@ -971,7 +1000,7 @@ ctr_phase_b() {
 	for b in "${RS_BINARIES[@]}"; do install -D -m 0755 "$st/target/release/$b" "$tb/$tt/lib/eitri/$b"; done
 	install -D -m 0755 "$st/packaging/install.sh" "$tb/$tt/lib/eitri/eitri-setup"
 	install -D -m 0644 "$st/dist/RELEASE" "$tb/$tt/lib/eitri/RELEASE"
-	install -D -m 0644 "$st/packaging/eitri.desktop" "$tb/$tt/share/applications/eitri.desktop"
+	ctr_tarball_art "$st" "$tb/$tt"
 	install -D -m 0644 "$st/LICENSE" "$tb/$tt/share/licenses/eitri/LICENSE"
 	install -D -m 0644 "$st/dist/THIRD-PARTY-LICENSES" "$tb/$tt/share/licenses/eitri/THIRD-PARTY-LICENSES"
 	install -D -m 0644 "$st/dist/SOURCE" "$tb/$tt/share/licenses/eitri/SOURCE"

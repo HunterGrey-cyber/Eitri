@@ -781,6 +781,27 @@ def source_top(version: str) -> str:
     return f"eitri-{version}-source"
 
 
+# The application id: the desktop entry's file name, the icon theme's icon name and the window's class
+# are all this one string (shell/src/main.rs's APP_ID; packaging/cn.huntergrey.eitri.desktop).
+APP_ID = "cn.huntergrey.eitri"
+
+# The icon theme tree packaging/icons/hicolor ships, role -> path under the hicolor directory. One
+# role per file, so a size dropped from a package (or one nobody listed) fails check_binary_asset.
+ICON_SIZES = ("16x16", "24x24", "32x32", "48x48", "64x64", "128x128", "256x256", "512x512")
+_ICON_HICOLOR = {
+    **{f"icon-{size}": f"{size}/apps/{APP_ID}.png" for size in ICON_SIZES},
+    "icon-scalable": f"scalable/apps/{APP_ID}.svg",
+}
+
+# Roles whose bytes must be the tracked file's (packaging/<path> in the source asset): shipped
+# unmodified by release.sh, in the tarball and in both packages alike.
+TRACKED_ART = {
+    "desktop": f"packaging/{APP_ID}.desktop",
+    # 0.2.0's own desktop entry, byte for byte, in the tarball only (see _TARBALL_ONLY_ROLES).
+    "legacy-desktop": "packaging/legacy/eitri.desktop",
+    **{role: f"packaging/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
+}
+
 # role -> path, for the tarball (under its top directory) and for the .deb/.rpm (from /). The same
 # role must hold the same bytes in all three (M6: one staging dir, packaged three ways).
 _TARBALL_ROLES = {
@@ -788,7 +809,8 @@ _TARBALL_ROLES = {
     **{b: f"lib/eitri/{b}" for b in RELEASE_BINARIES},
     "setup": "lib/eitri/eitri-setup",
     "RELEASE": "lib/eitri/RELEASE",
-    "desktop": "share/applications/eitri.desktop",
+    "desktop": f"share/applications/{APP_ID}.desktop",
+    **{role: f"share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
     "LICENSE": "share/licenses/eitri/LICENSE",
     "THIRD-PARTY-LICENSES": "share/licenses/eitri/THIRD-PARTY-LICENSES",
     "SOURCE": "share/licenses/eitri/SOURCE",
@@ -798,16 +820,27 @@ _PACKAGE_ROLES = {
     **{b: f"usr/lib/eitri/{b}" for b in RELEASE_BINARIES},
     "setup": "usr/lib/eitri/eitri-setup",
     "RELEASE": "usr/lib/eitri/RELEASE",
-    "desktop": "usr/share/applications/eitri.desktop",
+    "desktop": f"usr/share/applications/{APP_ID}.desktop",
+    **{role: f"usr/share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
     "LICENSE": "usr/share/licenses/eitri/LICENSE",
     "THIRD-PARTY-LICENSES": "usr/share/licenses/eitri/THIRD-PARTY-LICENSES",
     "SOURCE": "usr/share/licenses/eitri/SOURCE",
 }
 
 
+# The tarball alone also carries 0.2.0's desktop entry, at the path 0.2.0 installed it from
+# (packaging/legacy/eitri.desktop, see its README): 0.2.0's install.sh, which INSTALL.md tells a user to
+# save and rerun to upgrade, refuses a tarball without share/applications/eitri.desktop. Read only by that
+# installer -- this release's installer ignores it, and neither package (nor either AUR package) ships it,
+# so it is a role of the tarball and of no package.
+_TARBALL_ONLY_ROLES = {
+    "legacy-desktop": "share/applications/eitri.desktop",
+}
+
+
 def tarball_roles(version: str) -> dict[str, str]:
     top = tarball_top(version)
-    return {role: f"{top}/{rel}" for role, rel in _TARBALL_ROLES.items()}
+    return {role: f"{top}/{rel}" for role, rel in {**_TARBALL_ROLES, **_TARBALL_ONLY_ROLES}.items()}
 
 
 # The .deb alone also carries the AppArmor profile Ubuntu 23.10+'s user-namespace restriction needs
@@ -1028,6 +1061,8 @@ def check_release_assets(out_dir: str, check_dir: str, version: str, verdandi_re
     problems += check_binary_asset(deb, x["deb"], deb_roles())
     problems += check_binary_asset(rpm, x["rpm"], proles)
     for role in troles:
+        if role not in proles:
+            continue  # a tarball-only role (0.2.0's desktop entry): no package carries it
         problems += check_same_bytes({
             f"{tarball}:{troles[role]}": os.path.join(x["tarball"], troles[role]),
             f"{deb}:{proles[role]}": os.path.join(x["deb"], proles[role]),
@@ -1046,6 +1081,14 @@ def check_release_assets(out_dir: str, check_dir: str, version: str, verdandi_re
         f"{deb}:{_DEB_ONLY_ROLES['apparmor']}": os.path.join(x["deb"], _DEB_ONLY_ROLES["apparmor"]),
         f"{source}:packaging/apparmor/eitri": os.path.join(src_root, "packaging", "apparmor", "eitri"),
     })
+    # The desktop entry, 0.2.0's legacy entry and every icon are the tracked files, not copies of their
+    # own: the tarball's (and so both packages', checked equal to it above, for the roles they carry)
+    # against the source asset's packaging/ tree.
+    for role, tracked_path in TRACKED_ART.items():
+        problems += check_same_bytes({
+            f"{tarball}:{troles[role]}": os.path.join(x["tarball"], troles[role]),
+            f"{source}:{tracked_path}": os.path.join(src_root, tracked_path),
+        })
     # The installer, four copies (spec sec 6.4): the asset, the tarball's and both packages'
     # eitri-setup, and the source asset's packaging/install.sh.
     problems += check_same_bytes({

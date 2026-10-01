@@ -213,7 +213,7 @@ t_uninstall_dry_run() {
 	inst -- --uninstall --purge --dry-run
 	expect_rc 0
 	expect_eq "$(snap "$TH")" "$before" "the home after a dry-run uninstall"
-	for p in "$TH/.local/lib/eitri" "$TH/.local/bin/eitri" "$(data_of)/applications/eitri.desktop" \
+	for p in "$TH/.local/lib/eitri" "$TH/.local/bin/eitri" "$(data_of)/applications/cn.huntergrey.eitri.desktop" \
 		"$(data_of)/licenses/eitri" "$(data_of)/eitri/nvim" "$(data_of)/eitri/sidecar/aaaaaaa" \
 		"$TH/.cache/eitri/sidecar-build" "$TH/.config/eitri" "$TH/.local/state/eitri"; do
 		expect_out "would run: 'rm' '-rf' '--' '$p'"

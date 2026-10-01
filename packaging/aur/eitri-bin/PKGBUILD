@@ -110,7 +110,14 @@ package() {
 	install -m0644 "$srcdir/sidecar/verdandi-claude-sidecar.rev" "$pkgdir/usr/lib/eitri/verdandi-claude-sidecar.rev"
 
 	install -Dm0755 "$top/bin/eitri" "$pkgdir/usr/bin/eitri"
-	install -Dm0644 "$top/share/applications/eitri.desktop" "$pkgdir/usr/share/applications/eitri.desktop"
+	# The desktop entry is named by the application id (it replaced eitri.desktop, which an upgrade drops
+	# by this package no longer listing it), and the icon is every file of the tarball's hicolor tree.
+	install -Dm0644 "$top/share/applications/cn.huntergrey.eitri.desktop" \
+		"$pkgdir/usr/share/applications/cn.huntergrey.eitri.desktop"
+	local _icon
+	while IFS= read -r _icon; do
+		install -Dm0644 "$top/share/icons/$_icon" "$pkgdir/usr/share/icons/$_icon"
+	done < <(cd "$top/share/icons" && find hicolor -type f | LC_ALL=C sort)
 
 	# D15: the tarball's own licences and SOURCE, plus the built SDK's LICENSE.md and Node's own
 	# licence, which eitri-setup --build-sidecar-into saves beside the sidecar when present.

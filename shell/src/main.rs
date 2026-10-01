@@ -236,6 +236,11 @@ fn build_ui(
     // `gtk-xft-dpi` is never unset by the time the agent panel's (or a Lua panel's) `WebView` reads
     // it. See `xft_dpi`'s module doc.
     xft_dpi::ensure_xft_dpi();
+    // The application id is also the icon's name in the icon theme (`packaging/icons` installs it as
+    // `cn.huntergrey.eitri`). On Wayland the compositor takes a window's icon from the desktop entry of
+    // the same id (`packaging/cn.huntergrey.eitri.desktop`) and ignores this; an X11 session, and the
+    // docks that read the window's own icon name, use it.
+    gtk4::Window::set_default_icon_name(APP_ID);
     // Painted with the built-in fallback until the embedded nvim sends its first snapshot.
     let theme_css = theme::gtk_css::ThemeCss::install(&eitri_core::theme::ThemeTokens::fallback());
     // Built before the editor pane for the same reason `pane_switch` is: its env and `--cmd` reach
