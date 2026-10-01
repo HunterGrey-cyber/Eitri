@@ -1,17 +1,26 @@
 English | [简体中文](README.zh-CN.md)
 
-<img src="docs/images/logo.svg" width="96" height="96" alt="The Eitri logo: a window whose editor pane holds an E made of a blue gutter and three green code lines, a blank pane beside it, and a status bar">
+<div align="center">
 
-# Eitri
+<img src="docs/images/logo.svg" width="128" height="128" alt="The Eitri logo: a window whose editor pane holds an E made of a blue gutter and three green code lines, a blank pane beside it, and a status bar">
 
-**Your Neovim, with Claude Code beside it.**
+<h1>Eitri</h1>
+
+<p><b>Your Neovim, with Claude Code beside it.</b></p>
+
+<p>
+<a href="https://eitri.cc">Website</a> ·
+<a href="INSTALL.md">Install</a> ·
+<a href="https://github.com/HunterGrey-cyber/eitri/discussions">Discussions</a> ·
+<a href="https://matrix.to/#/#eitri:matrix.org">Matrix</a> ·
+<a href="https://t.me/eitri_cc">Telegram</a>
+</p>
 
 [![Release](https://img.shields.io/github/v/release/HunterGrey-cyber/eitri?label=release)](https://github.com/HunterGrey-cyber/eitri/releases/latest)
 [![AUR](https://img.shields.io/aur/version/eitri-bin?label=AUR&logo=archlinux&logoColor=white)](https://aur.archlinux.org/packages/eitri-bin)
-[![Matrix](https://img.shields.io/matrix/eitri%3Amatrix.org?label=Matrix&logo=matrix)](https://matrix.to/#/#eitri:matrix.org)
-[![Telegram](https://img.shields.io/badge/Telegram-eitri__cc-26A5E4?logo=telegram&logoColor=white)](https://t.me/eitri_cc)
-[![Discussions](https://img.shields.io/badge/GitHub-Discussions-181717?logo=github)](https://github.com/HunterGrey-cyber/eitri/discussions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+</div>
 
 A Neovim GUI for Linux. A Claude Code you'd actually want to read: rendered markdown and diffs,
 permission cards, all without reaching for the mouse. Eitri is a desktop window (MIT) around your own
