@@ -1,0 +1,129 @@
+name: Bug report
+description: Something crashed, rendered wrongly, or did not do what it should.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Eitri. Questions and ideas go to [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions);
+        impressions that are not bugs fit the "Testing feedback" form. The more of the boxes below you fill in,
+        the faster a bug can be reproduced.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A screenshot or a short screen recording helps a lot for anything visual.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The shortest sequence you know, starting from launching `eitri`. Say if it happens every time.
+      placeholder: |
+        1. eitri ~/some/project
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part of Eitri?
+      multiple: true
+      options:
+        - Editor (the Neovim pane)
+        - Agent panel
+        - Bottom terminal
+        - Window, layout or keys
+        - Install or update
+        - Not sure
+  - type: input
+    id: version
+    attributes:
+      label: eitri --version
+      description: Paste the whole line.
+      placeholder: "eitri 0.2.0 (commit ..., neovide fork ..., verdandi ...)"
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution and version
+      placeholder: "Arch, Ubuntu 24.04, Fedora 44, ..."
+    validations:
+      required: true
+  - type: dropdown
+    id: desktop
+    attributes:
+      label: Desktop or compositor
+      options:
+        - GNOME
+        - KDE Plasma
+        - sway
+        - Hyprland
+        - Other (name it under "What happened?")
+    validations:
+      required: true
+  - type: dropdown
+    id: session
+    attributes:
+      label: Session type
+      description: "`echo $XDG_SESSION_TYPE` prints it. X11 is untested; a report from X11 is still welcome."
+      options:
+        - Wayland
+        - X11
+        - Don't know
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU, driver, monitor refresh rate and scale
+      description: "Mainly for drawing, latency and scrolling problems. `lspci -k | grep -A2 -E 'VGA|3D'` shows the GPU and its driver."
+      placeholder: "Intel Arc, Mesa 25.1; 165 Hz at 150 %"
+  - type: input
+    id: nvim
+    attributes:
+      label: Neovim version
+      description: "Output of `nvim --version | head -1`. Eitri needs 0.10 or newer."
+      placeholder: "NVIM v0.11.4"
+  - type: input
+    id: claude
+    attributes:
+      label: Claude Code version
+      description: "Output of `claude --version`. Needed for anything in the agent panel."
+      placeholder: "2.1.283 (Claude Code)"
+  - type: dropdown
+    id: plain-nvim
+    attributes:
+      label: Does the same thing happen in plain Neovim or Neovide with your config?
+      description: Only for editor problems. It tells us whether the cause is Eitri or your setup.
+      options:
+        - Haven't tried
+        - Yes, it also happens there
+        - No, only in Eitri
+        - Not an editor problem
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output from the terminal
+      description: |
+        Eitri writes no log file. Start it from a terminal (`eitri ~/path/to/project`) and paste what that terminal
+        prints around the problem. For slow or odd agent replies, start it as `EITRI_AGENT_TRACE=1 eitri ...`,
+        which adds one timing line per agent turn.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before sending
+      options:
+        - label: I searched the existing issues and read the [known issues](https://github.com/HunterGrey-cyber/eitri/blob/main/docs/known-issues.md).
+          required: true
