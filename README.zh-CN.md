@@ -1,11 +1,18 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=0c2e2fa36eea122e96b0bd09e6165b3e10ccb32339d1ac3fdd04d37b060b617b -->
+<!-- translated-from: README.md sha256=f8a1b652602ce7439484d2162cf67554e919a47b0775c4e868c8e004c619d477 -->
 
 <img src="docs/images/logo.svg" width="96" height="96" alt="Eitri 的 logo：一个窗口，编辑区里是用蓝色行号栏和三行绿色代码拼成的 E，旁边是一栏空白，底部是状态栏">
 
 # Eitri
 
 **你的 Neovim，与 Claude Code 并肩。**
+
+[![Release](https://img.shields.io/github/v/release/HunterGrey-cyber/eitri?label=release)](https://github.com/HunterGrey-cyber/eitri/releases/latest)
+[![AUR](https://img.shields.io/aur/version/eitri-bin?label=AUR&logo=archlinux&logoColor=white)](https://aur.archlinux.org/packages/eitri-bin)
+[![Matrix](https://img.shields.io/matrix/eitri%3Amatrix.org?label=Matrix&logo=matrix)](https://matrix.to/#/#eitri:matrix.org)
+[![Telegram](https://img.shields.io/badge/Telegram-eitri__cc-26A5E4?logo=telegram&logoColor=white)](https://t.me/eitri_cc)
+[![Discussions](https://img.shields.io/badge/GitHub-Discussions-181717?logo=github)](https://github.com/HunterGrey-cyber/eitri/discussions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 一个真正好读的 Claude Code：排好版的回复和 diff，一张张权限卡片，全程不用碰鼠标。Eitri 是一个 Linux 桌面窗口（MIT 许可），包在你自己的 Neovim 配置和你已安装的 `claude` 外面。
 
@@ -132,6 +139,7 @@ Logo 的蓝绿两色取自 Jason Long 设计的 [Neovim logo](https://neovim.io)
 - [eitri.cc](https://eitri.cc/zh/)：官网
 - [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions)：提问、建议、分享你的配置
 - [Telegram 群](https://t.me/eitri_cc)：中文交流
+- [Matrix 房间](https://matrix.to/#/#eitri:matrix.org) `#eitri:matrix.org`：英文交流
 - [发布页面](https://github.com/HunterGrey-cyber/eitri/releases)、[issues](https://github.com/HunterGrey-cyber/eitri/issues)
 - [INSTALL.zh-CN.md](INSTALL.zh-CN.md)：每一种安装方式、验证下载、更新、卸载
 - [CONTRIBUTING.md](CONTRIBUTING.md)（仅有英文版）：从源码构建和运行测试

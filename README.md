@@ -6,6 +6,13 @@ English | [简体中文](README.zh-CN.md)
 
 **Your Neovim, with Claude Code beside it.**
 
+[![Release](https://img.shields.io/github/v/release/HunterGrey-cyber/eitri?label=release)](https://github.com/HunterGrey-cyber/eitri/releases/latest)
+[![AUR](https://img.shields.io/aur/version/eitri-bin?label=AUR&logo=archlinux&logoColor=white)](https://aur.archlinux.org/packages/eitri-bin)
+[![Matrix](https://img.shields.io/matrix/eitri%3Amatrix.org?label=Matrix&logo=matrix)](https://matrix.to/#/#eitri:matrix.org)
+[![Telegram](https://img.shields.io/badge/Telegram-eitri__cc-26A5E4?logo=telegram&logoColor=white)](https://t.me/eitri_cc)
+[![Discussions](https://img.shields.io/badge/GitHub-Discussions-181717?logo=github)](https://github.com/HunterGrey-cyber/eitri/discussions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 A Claude Code you'd actually want to read: rendered markdown and diffs, permission cards, all without
 reaching for the mouse. Eitri is a Linux desktop window (MIT) around your own Neovim configuration and
 the `claude` you have installed.
@@ -189,6 +196,7 @@ The logo's blue and green come from the [Neovim logo](https://neovim.io) by Jaso
 
 - [eitri.cc](https://eitri.cc): the homepage
 - [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions): questions, ideas, your setups
+- [Matrix room](https://matrix.to/#/#eitri:matrix.org) `#eitri:matrix.org` (English)
 - [Telegram group](https://t.me/eitri_cc) (mostly Chinese)
 - [Releases](https://github.com/HunterGrey-cyber/eitri/releases), [issues](https://github.com/HunterGrey-cyber/eitri/issues)
 - [INSTALL.md](INSTALL.md): every install route, verifying a download, updating, uninstalling
