@@ -149,7 +149,9 @@ build() {
 		cargo build --frozen --release -p shell -p agent -p supervisor --bins
 
 	# Build the sidecar from the clone prepared and archived by prepare(), using the same
-	# --build-sidecar-into entry point as the binary package.
+	# --build-sidecar-into entry point as the binary package. Print progress before installing
+	# the Agent SDK and building TypeScript and the executable, since those steps can be slow.
+	msg2 "Installing the Claude Agent SDK and building the sidecar (1-3 min)"
 	sh packaging/install.sh \
 		--build-sidecar-into "$srcdir/sidecar" \
 		--node "$srcdir/node-v22.23.2-linux-x64.tar.xz" \
