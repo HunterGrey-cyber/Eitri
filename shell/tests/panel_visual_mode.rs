@@ -45,7 +45,8 @@
 //! W0 checks trusted key delivery in both windows. W1 checks that `Selection.modify` and
 //! `caretRangeFromPoint` exist on the non-editable page.
 //! W2 exercises `vvey`, `vvwey`, `vv2ey` and `vvwwy` on the English prompt. The Chinese word-copy
-//! result is printed without an assertion that it matches Vim exactly.
+//! result is printed without an assertion that it matches Vim exactly. `w`, `e` and `b` now use
+//! Vim's word rules. The Chinese-copy case has not been rerun since that change.
 //! W3 checks that `Vjy` and `vVjy` copy both prompt and reply text without the prompt marker
 //! or button labels.
 //! W4 checks that `vv$y` copies one code line and `Vjy` copies two with one newline and no
@@ -151,8 +152,8 @@ fn panel_base_uri_matches_product() -> Result<(), String> {
     Ok(())
 }
 
-/// The Chinese paragraph used by W2 to log ICU word boundaries
-/// without asserting an exact vim-equivalent result.
+/// The Chinese paragraph used by W2. Word motions follow vim's word rules,
+/// but the copied text is only logged until the harness has run again.
 const CHINESE_PARAGRAPH: &str = "这是一段中文，用来记录 ICU 分词的实际结果。";
 
 const CODE_BLOCK_LANG: &str = "rust";
@@ -928,7 +929,8 @@ fn w2_english_and_chinese_words(h: &Harness) -> Result<(), String> {
     if fourth != "The quick b" {
         return Err(format!("vvwwy: expected \"The quick b\", got {fourth:?}"));
     }
-    // Log the copied Chinese text without a vim-exact assertion because WebKit uses ICU word boundaries.
+    // Word motions follow vim's word rules. Log the copied Chinese text without an exact
+    // boundary assertion until the harness has run again.
     h.clear_clipboard();
     h.xdotool_keys(&["g", "g", "j", "v", "v", "e", "y"]);
     let chinese = h
