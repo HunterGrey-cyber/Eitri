@@ -189,6 +189,7 @@ The logo's blue and green come from the [Neovim logo](https://neovim.io) by Jaso
 
 - [eitri.cc](https://eitri.cc): the homepage
 - [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions): questions, ideas, your setups
+- [Telegram group](https://t.me/eitri_cc) (mostly Chinese)
 - [Releases](https://github.com/HunterGrey-cyber/eitri/releases), [issues](https://github.com/HunterGrey-cyber/eitri/issues)
 - [INSTALL.md](INSTALL.md): every install route, verifying a download, updating, uninstalling
 - [CONTRIBUTING.md](CONTRIBUTING.md): building from source and running the tests

@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=04de8ab49d7d94849676806276a7a9d7dcaf82072f3f1bec41c30f2cf30367e3 -->
+<!-- translated-from: README.md sha256=0c2e2fa36eea122e96b0bd09e6165b3e10ccb32339d1ac3fdd04d37b060b617b -->
 
 <img src="docs/images/logo.svg" width="96" height="96" alt="Eitri 的 logo：一个窗口，编辑区里是用蓝色行号栏和三行绿色代码拼成的 E，旁边是一栏空白，底部是状态栏">
 
@@ -131,6 +131,7 @@ Logo 的蓝绿两色取自 Jason Long 设计的 [Neovim logo](https://neovim.io)
 
 - [eitri.cc](https://eitri.cc/zh/)：官网
 - [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions)：提问、建议、分享你的配置
+- [Telegram 群](https://t.me/eitri_cc)：中文交流
 - [发布页面](https://github.com/HunterGrey-cyber/eitri/releases)、[issues](https://github.com/HunterGrey-cyber/eitri/issues)
 - [INSTALL.zh-CN.md](INSTALL.zh-CN.md)：每一种安装方式、验证下载、更新、卸载
 - [CONTRIBUTING.md](CONTRIBUTING.md)（仅有英文版）：从源码构建和运行测试
