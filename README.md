@@ -28,6 +28,12 @@ Neovim configuration and the `claude` you have installed.
 
 **[eitri.cc](https://eitri.cc)** has the screenshots, the keys, how it compares, and the requirements and limits.
 
+> [!NOTE]
+> **Early release.** Eitri works, but expect rough edges, and the `init.lua` API and default keys may still change in
+> 0.x. Tell us in [Issues](https://github.com/HunterGrey-cyber/eitri/issues) or
+> [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions). The goal for 0.3: stable enough to be our own
+> everyday editor.
+
 ![Eitri: Neovim on the left with a Python file open; on the right, Claude Code's rendered reply with a highlighted code block, and the which-key box open from the leader key](docs/images/hero.webp)
 
 - **Your own Neovim.** A real `nvim --embed` with your `init.lua`, plugins, LSP and keymaps, drawn by a
@@ -48,8 +54,7 @@ Linux x86_64 on Wayland, with Neovim 0.10 or newer and Claude Code installed. On
 [`eitri-bin`](https://aur.archlinux.org/packages/eitri-bin) or [`eitri-git`](https://aur.archlinux.org/packages/eitri-git)
 from the AUR. `.deb`, `.rpm`, building from source and verifying a download: [INSTALL.md](INSTALL.md).
 
-0.2 is the first public release: expect rough edges, and the `init.lua` API and default keys may still
-change in 0.x. Known limits are on [eitri.cc](https://eitri.cc/#requirements); what comes next is on the
+Known limits are on [eitri.cc](https://eitri.cc/#requirements); what comes next is on the
 [roadmap](https://eitri.cc/#roadmap).
 
 ## Community

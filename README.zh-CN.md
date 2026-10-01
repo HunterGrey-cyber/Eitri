@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=4f5b59a794b83cb18f80b72d5de494d9ca0891bc2bec1c2753351ebb75ec1f8d -->
+<!-- translated-from: README.md sha256=9036d454eda0d2b9725d859584e9e7034e03338d7a9684ca7ec8fe3f9350bf08 -->
 
 <div align="center">
 
@@ -27,6 +27,11 @@
 
 **[eitri.cc](https://eitri.cc/zh/)** 上有截图、按键、和其他方案的对比，以及环境要求和限制。
 
+> [!NOTE]
+> **早期版本。** 已经能用，但难免有粗糙的地方，0.x 期间 `init.lua` 的 API 和默认按键还可能改动。遇到问题欢迎在
+> [Issues](https://github.com/HunterGrey-cyber/eitri/issues) 或 [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions)
+> 告诉我们。0.3 的目标：稳定到能当我们自己日常的主力编辑器。
+
 ![Eitri：左边是打开着 Python 文件的 Neovim；右边是排好版的 Claude Code 回复，带一个高亮代码块，以及按下 leader 键后弹出的 which-key 提示](docs/images/hero.webp)
 
 - **你自己的 Neovim。** 一个真正的 `nvim --embed`，加载你的 `init.lua`、插件、LSP 和按键映射，由 Neovide 渲染器的一个 fork 在 GPU 上绘制。
@@ -43,7 +48,7 @@ eitri ~/path/to/project
 
 需要 x86_64 的 Linux（Wayland），以及已安装的 Neovim 0.10 或更新版本和 Claude Code。Arch 用户可以从 AUR 安装 [`eitri-bin`](https://aur.archlinux.org/packages/eitri-bin) 或 [`eitri-git`](https://aur.archlinux.org/packages/eitri-git)。`.deb`、`.rpm`、从源码构建，以及如何验证下载的文件，见 [INSTALL.zh-CN.md](INSTALL.zh-CN.md)。
 
-0.2 是第一个公开版本：难免有粗糙的地方，0.x 期间 `init.lua` 的 API 和默认按键还可能改动。已知的限制见 [eitri.cc](https://eitri.cc/zh/#requirements)，接下来要做的见[路线图](https://eitri.cc/zh/#roadmap)。
+已知的限制见 [eitri.cc](https://eitri.cc/zh/#requirements)，接下来要做的见[路线图](https://eitri.cc/zh/#roadmap)。
 
 ## 社区
 
