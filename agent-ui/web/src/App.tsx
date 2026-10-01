@@ -5,6 +5,19 @@ import { applyCallNotes, applyEvent, applySnapshot, initialState, keepAfterSidec
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { NavKeyDirection, OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
+import {
+  cancelListScroll,
+  computedLineHeight,
+  decideLanding,
+  decidePress,
+  isListScrollAnimating,
+  readBoxState,
+  readRowGeometry,
+  rowTextElement,
+  scrollListTo,
+  settleListScroll,
+  STEP_LINES,
+} from "./jkScroll";
 import { EMPTY_PANEL_TABLE, isPlainAnswerKey, resolveKey } from "./keymap";
 import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from "./keymap";
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
@@ -243,68 +256,9 @@ type SlashPickerState = { kind: SlashPickerKind; options: string[]; current: str
  *  bubble-phase `onKeyDown` that feeds every OTHER key to `typingGuard.onKey` never runs for it. */
 const CANCELS_WAITING_ANSWER = new Set(["pane_focus", "arrive", "enter_input", "focus_permission", "hint_collect", "nav_key"]);
 
-/** Whether a pending `j`/`k` cursor move should instead scroll the CURSOR ROW's own overflow box
- *  -- today, only a tool result opened past its 260px fold (`.tool-result-body` in index.css; see
- *  `renderToolCall` in `../toolRegistry.tsx`). Before this, only a mouse wheel could reach that
- *  box: the owner's "j无法在长输出内部下滑" is really two defects (see the dated record), and this
- *  is the second one -- once such a box filled the viewport, `j` moved the cursor straight off the
- *  row while most of its own content stayed unseen and unreachable from the keyboard.
- *
- *  This is a DOM measurement (`scrollTop`/`scrollHeight`/`clientHeight`), which is exactly what
- *  `./keymap`'s pure table must never do -- see its own doc comment -- so it is checked here,
- *  after `resolveKey` has already decided the key means "move the cursor," and BEFORE that
- *  decision is applied.
- *
- *  Returns `false` -- let the cursor move, the ordinary case -- when the current row has no such
- *  box, or the box is already at the end of travel in the pressed direction. That is the vim rule
- *  this exists to reproduce: scroll the inner view to its own limit first, THEN move to the next
- *  row. Mutates `scrollTop` directly rather than `scrollBy`/`scrollIntoView`, neither of which can
- *  express "move by this many pixels, clamped at the box's own natural end" -- which is exactly
- *  what is wanted here.
- *
- *  jsdom implements no layout, so `scrollHeight`/`clientHeight` both read 0 for every element and
- *  this always returns `false` there unless a test overrides them -- `App.test.tsx`'s own tests
- *  for this function do exactly that to reach the `true` branch at all. */
-function scrollCursorRowBox(row: HTMLElement | null, direction: 1 | -1): boolean {
-  const box = row?.querySelector<HTMLElement>(".tool-result-body") ?? null;
-  if (row == null || box === null) return false;
-  // The box can be off screen: the user mouse-scrolled the list elsewhere while the cursor stayed
-  // on this row. Scrolling it then changes nothing visible, and since the cursor does not move the
-  // cursor-follow effect never brings it back -- `j` would look dead for many presses, the very
-  // symptom this function exists to fix (review finding, 2026-09-19 later). So the first press
-  // brings the cursor row back into view and is consumed; the next one scrolls the box as usual.
-  // Tests must mock both rects, because jsdom reports every rect as all zeros, which reads as
-  // "not visible" here. Not looked at on a screen.
-  const list = box.closest(".message-list");
-  if (list !== null) {
-    const b = box.getBoundingClientRect();
-    const l = list.getBoundingClientRect();
-    if (b.bottom <= l.top || b.top >= l.bottom) {
-      // Fix round 1 (Codex review, v1 trial item 5, finding 2): `scrollIntoView({block:"nearest"})`
-      // moves nothing when the ROW ITSELF already spans both edges of the viewport -- a multi-line
-      // command taller than the view, scrolled into it, with its result box further down still off
-      // screen. Claiming the press then (returning `true` unconditionally) ate every unit of a
-      // counted `Ctrl+e` with the conversation never moving. Checked on the ROW, which is what
-      // `scrollIntoView` is actually called on -- not the box, which is what decided whether to try
-      // in the first place: the "brings the row back into view" case just below needs the ROW to
-      // still be off screen too (it is, there), so this new check leaves it untouched.
-      //
-      // Whole-branch review finding 3 (Codex, v1 trial): inclusive, with the usual sub-pixel slack.
-      // A row whose top sits EXACTLY on the list's top (a tall row just scrolled to) spans the view
-      // just the same, and the strict `<` missed it -- `j` and every unit of a counted `Ctrl+e` went
-      // to a `scrollIntoView` that moved nothing.
-      const r = row.getBoundingClientRect();
-      if (r.top <= l.top + EDGE_SLACK_PX && r.bottom >= l.bottom - EDGE_SLACK_PX) return false;
-      row.scrollIntoView({ block: "nearest" });
-      return true;
-    }
-  }
-  return scrollBoxOneStep(box, direction);
-}
-
 /** One `TOOL_RESULT_SCROLL_STEP_PX` step of a tool result's capped box, or `false` when the box is
- *  already at the end of travel that way. Shared by `scrollCursorRowBox` (`j`/`k`) and
- *  `scrollVisibleRowBox` (`Ctrl+e`/`Ctrl+y`). */
+ *  already at the end of travel that way. Used by `scrollVisibleRowBox` (`Ctrl+e`/`Ctrl+y`); `j`/`k`
+ *  step the same box by three of its own lines (`stepWithinRow`). */
 function scrollBoxOneStep(box: HTMLElement, direction: 1 | -1): boolean {
   const atStart = box.scrollTop <= 0;
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 1;
@@ -317,12 +271,11 @@ function scrollBoxOneStep(box: HTMLElement, direction: 1 | -1): boolean {
  *  the unit only while at least part of it is on screen and it can still move that way -- where a
  *  mouse wheel over it would scroll it too. Otherwise `false`, and the unit scrolls the conversation.
  *
- *  Whole-branch review finding 3 (v1 trial, 2026-09-28): this used to be `scrollCursorRowBox`, `j`/
- *  `k`'s own helper, whose off-screen branch brings the cursor row back into view and claims the
- *  unit. That is right for a cursor MOTION and wrong for a view scroll -- vim's CTRL-E/CTRL-Y never
- *  move the view toward the cursor. With the box just below the view, held `Ctrl+y` jumped back down
- *  to the row each time it had scrolled it off, so it never got past the row, and `Ctrl+e` jumped a
- *  whole box height in one unit. */
+ *  It deliberately does not share `j`/`k`'s helper, whose off-screen branch brings the cursor row back
+ *  into view and claims the unit. That is right for a cursor MOTION and wrong for a view scroll --
+ *  vim's CTRL-E/CTRL-Y never move the view toward the cursor. With the box just below the view, held
+ *  `Ctrl+y` would jump back down to the row each time it had scrolled it off and never get past it,
+ *  and `Ctrl+e` would jump a whole box height. */
 function scrollVisibleRowBox(row: HTMLElement | null, direction: 1 | -1): boolean {
   const box = row?.querySelector<HTMLElement>(".tool-result-body") ?? null;
   const list = box?.closest(".message-list") ?? null;
@@ -333,47 +286,12 @@ function scrollVisibleRowBox(row: HTMLElement | null, direction: 1 | -1): boolea
   return scrollBoxOneStep(box, direction);
 }
 
-/** How many lines of the current row's own text one `j`/`k` press scrolls, when that row is taller
- *  than what is left of it on screen. Three reads as a step through the text rather than a jump,
- *  and is the owner's design (2026-09-19). Not looked at on a screen. */
-const ROW_SCROLL_LINES = 3;
-
-/** Sub-pixel slack for "this edge is on screen": fractional scaling leaves rects a fraction of a
- *  pixel off, and a row whose last line is 0.3px past the edge must not eat a keypress. */
-const EDGE_SLACK_PX = 1;
-
-/** The computed line height of `el`'s own text, in pixels -- ONE line. Shared by `rowScrollStep`
- *  (`ROW_SCROLL_LINES` of them, a tall row's own `j`/`k` step) and Ctrl+e/Ctrl+y's one-line scroll
- *  (v1 trial item 5, the `scroll-line` case below): `line-height: normal` (and jsdom, which computes
- *  nothing) has no pixel value, so it falls back to 1.2 x the font size, the usual `normal`; with no
- *  font size either, to a 16px font. */
-function computedLineHeight(el: HTMLElement): number {
-  const style = getComputedStyle(el);
-  let line = parseFloat(style.lineHeight);
-  if (!Number.isFinite(line) || line <= 0) {
-    const font = parseFloat(style.fontSize);
-    line = (Number.isFinite(font) && font > 0 ? font : 16) * 1.2;
-  }
-  return line;
-}
-
-/** The element whose text the reader actually reads on a row: `.row-body` (`Row.tsx`'s own text
- *  cell), which is the only part of a row `index.css` gives a font-size and line-height of its own
- *  (`--fs-prose`, `1.65`) -- `.row` itself (the sign-column grid wrapper `computedLineHeight` used to
- *  be called on directly) sets neither, so it read whatever was ambient there instead: `line-height:
- *  normal` on a 14px base is ~16.8px against `.row-body`'s real ~24.75px, well under one displayed
- *  line (Codex review, v1 trial item 5 fix round, finding 4). Falls back to `row` itself for
- *  anything with no `.row-body` child (there is always one on a real conversation row; this is only
- *  a safety net). */
-function rowTextElement(row: HTMLElement): HTMLElement {
-  return row.querySelector<HTMLElement>(".row-body") ?? row;
-}
-
-/** One `j`/`k` step inside a tall row: `ROW_SCROLL_LINES` of the row's own TEXT's computed line
+/** One step inside a row's own text, in whole pixels: `STEP_LINES` of the row's TEXT's computed line
  *  height (`rowTextElement`). Derived, not a pixel constant, so it follows the theme's font size and
- *  the display's scale. */
+ *  the display's scale. Used by the `?` overlay's own scrolling; the conversation's rows are stepped
+ *  by `./jkScroll`'s `decidePress`, which measures the same line. */
 function rowScrollStep(row: HTMLElement): number {
-  return ROW_SCROLL_LINES * computedLineHeight(rowTextElement(row));
+  return STEP_LINES * computedLineHeight(rowTextElement(row));
 }
 
 /** `j`/`k` while the `?` keymap overlay is open (spec §3.1): scrolls the overlay itself, by the
@@ -385,62 +303,73 @@ function scrollKeymapOverlay(el: HTMLDivElement | null, direction: 1 | -1) {
   el.scrollTop += direction * rowScrollStep(el);
 }
 
-/** Brings `row` on screen in `list` after the cursor has landed on it. A row that fits is revealed
- *  with `block: "nearest"`, which moves nothing when it is already fully visible. A row TALLER than
- *  the viewport shows the edge you are reading from: its top when you arrived with `j` (+1), its
- *  bottom when you arrived with `k` (-1) -- `"nearest"` on an element bigger than the scrollport
- *  aligns whichever edge happens to be closer, which for a long reply can be the middle of it.
- *  When that edge is already on screen, nothing moves.
- *  `direction` 0 (the cursor moved for some other reason) always means `"nearest"`. */
-function revealRow(list: HTMLElement | null, row: HTMLElement, direction: 1 | -1 | 0) {
-  if (list !== null && direction !== 0) {
-    const r = row.getBoundingClientRect();
-    const l = list.getBoundingClientRect();
-    const viewport = l.bottom - l.top;
-    if (viewport > 0 && r.bottom - r.top > viewport) {
-      // Already showing the edge you are reading from: move nothing, and let the next `j`/`k` step
-      // through the row (`scrollCursorRow`). Aligning it anyway jumped the view by up to a whole
-      // viewport in one press and pushed the tail of the row just read out of sight -- review.
-      const edgeShown = direction > 0 ? r.top >= l.top && r.top < l.bottom : r.bottom <= l.bottom && r.bottom > l.top;
-      if (!edgeShown) list.scrollTop += direction > 0 ? r.top - l.top : r.bottom - l.bottom;
-      return;
-    }
+/** Brings `row` on screen in `list` after the cursor has landed on it, by computing the `scrollTop`
+ *  itself (`./jkScroll`'s `decideLanding`) rather than asking the engine's `scrollIntoView`: WebKitGTK
+ *  2.52.6's `nearest` top-aligns any row taller than the view, which turned `k` into a row above into a
+ *  whole-view jump. `direction` is the key that moved the cursor (`1` for `j`, `-1` for `k`) or `0` for
+ *  any other way, which judges from where the row lies. `animate` eases the move out over 150ms.
+ *
+ *  With no layout to judge -- a panel that is not laid out yet, or jsdom -- it falls back to
+ *  `scrollIntoView`, which then does nothing a reader could see anyway. */
+function revealRow(list: HTMLElement | null, row: HTMLElement, direction: 1 | -1 | 0, animate = false) {
+  const geometry = list === null ? null : readRowGeometry(list, row);
+  if (list === null || geometry === null) {
+    row.scrollIntoView({ block: "nearest" });
+    return;
   }
-  row.scrollIntoView({ block: "nearest" });
+  const landing = decideLanding({ direction, ...geometry });
+  if (landing.how !== "stay") scrollListTo(list, landing.scrollTop, animate);
 }
 
-/** Whether a pending `j`/`k` should instead scroll the conversation within the CURRENT row, because
- *  that row still runs past the visible edge in the direction of travel. The owner, on an installed
- *  build: "现在jk没法在选中输出的时候滚动屏幕，特别是在最后输出很长的时候，没法滚动看下面的" --
- *  `j` jumped from a long reply straight to the next row, skipping everything between, and on the
- *  LAST row there was no next row at all, so the rest of the reply was unreachable from the keyboard.
+/** A tool result's box is entered at the end nearest the reader -- its start going down, its end going
+ *  up -- so it never carries the position it was last read to. Called when `j`/`k` land on the row. */
+function enterBoxAtNearEnd(row: HTMLElement, direction: 1 | -1) {
+  const box = row.querySelector<HTMLElement>(".tool-result-body");
+  if (box === null) return;
+  box.scrollTop = direction > 0 ? 0 : Math.max(0, box.scrollHeight - box.clientHeight);
+}
+
+/** What `j`/`k` do inside the cursor row before they move off it, up to `times` presses' worth (a count):
+ *  bring the row back if it is out of view, step its tool result's box if that is on screen, step the
+ *  conversation through the row while its end is past the margin -- `./jkScroll`'s `decidePress`, which
+ *  has the rules. Returns how many presses it spent, `0` when the first has nothing to scroll and the
+ *  cursor should simply move. A count stops spending itself the moment a press has nothing left to give,
+ *  and whatever remains moves rows.
  *
- *  Tried after `scrollCursorRowBox`, which keeps priority: a tool result's own capped box is the more
- *  specific scroller. The step is `rowScrollStep`, never more than what is left to reveal, so the
- *  press that finishes lands the row's edge exactly on the viewport's edge; the NEXT press moves on.
- *  Holding `j` on a long last reply therefore reads it to its end and then stops.
- *
- *  A row entirely off screen (the list was mouse-scrolled away from it) is brought back first, and
- *  that press is consumed -- the same rule `scrollCursorRowBox` follows, for the same reason.
- *
- *  Returns `false` when there is no layout to judge (a list with no height -- jsdom, or a panel not
- *  laid out yet), or when writing `scrollTop` did not move anything (already at the list's end):
- *  a press that can make no progress must fall through to the ordinary move, never be eaten. */
-function scrollCursorRow(row: HTMLElement | null, direction: 1 | -1): boolean {
+ *  Only a lone press eases; a held key's repeats and a count scroll at once, so a run of them is not a
+ *  run of animations restarting. Nothing here measures without a layout (`readRowGeometry`), so a panel
+ *  not yet laid out, or jsdom, spends nothing and the cursor moves. */
+function stepWithinRow(row: HTMLElement | null, direction: 1 | -1, times: number, animate: boolean): number {
   const list = row?.closest<HTMLElement>(".message-list") ?? null;
-  if (row == null || list === null) return false;
-  const r = row.getBoundingClientRect();
-  const l = list.getBoundingClientRect();
-  if (l.bottom - l.top <= 0) return false;
-  const before = list.scrollTop;
-  if (r.bottom <= l.top || r.top >= l.bottom) {
-    revealRow(list, row, direction);
-    return true;
+  if (row == null || list === null) return 0;
+  const easeOut = animate && times === 1;
+  let spent = 0;
+  while (spent < times) {
+    const geometry = readRowGeometry(list, row);
+    if (geometry === null) break;
+    const box = row.querySelector<HTMLElement>(".tool-result-body");
+    const press = decidePress({
+      direction,
+      view: geometry.view,
+      row: geometry.row,
+      line: geometry.line,
+      box: box === null ? null : readBoxState(list, box),
+      boxLine: box === null ? geometry.line : computedLineHeight(box),
+    });
+    if (press.kind === "move") break;
+    if (press.kind === "box") {
+      if (box === null) break;
+      const before = box.scrollTop;
+      box.scrollTop = press.boxScrollTop;
+      if (box.scrollTop === before) break;
+    } else {
+      const before = list.scrollTop;
+      scrollListTo(list, press.scrollTop, easeOut);
+      if (!easeOut && list.scrollTop === before) break;
+    }
+    spent++;
   }
-  const overflow = direction > 0 ? r.bottom - l.bottom : l.top - r.top;
-  if (overflow <= EDGE_SLACK_PX) return false;
-  list.scrollTop += direction * Math.min(rowScrollStep(row), overflow);
-  return list.scrollTop !== before;
+  return spent;
 }
 
 /** The conversation rows inside `list` that are at least partly on screen. */
@@ -503,6 +432,8 @@ type ArrivalPark = { tab: TabId; view: TabViewState; cursorKey: string | null; f
  *  re-arms following outright, as a send does; otherwise the write is announced as the user's, so
  *  `MessageList` does not fight it, and the list goes back to where it was. */
 function applyViewScroll(list: HTMLElement, view: TabViewState, follow: boolean, stop = false) {
+  // A restored view replaces whatever was easing, even one that began at the very position this writes.
+  cancelListScroll(list);
   if (follow) {
     resumeFollowing(list);
     return;
@@ -973,6 +904,9 @@ export default function App() {
    *  and reset by the cursor-follow effect, and only ever set when the cursor really changes -- an
    *  unchanged cursor runs no effect, and a stale value would misplace some later, unrelated move. */
   const landingRef = useRef<1 | -1 | 0 | "keep">(0);
+  /** Whether the view eases to the next landing (`revealRow`'s `animate`): set only by a lone `j`/`k`,
+   *  read and reset by the cursor-follow effect with `landingRef`. */
+  const landingAnimateRef = useRef(false);
   /** C1c: whether the last `j` moved, so the first repeat of a held `j` that then stops at the last
    *  stop still flashes once (the v1-ui GUI pass, 2026-09-27) -- see the move branch of `onKeyDown`. */
   const heldMoveRef = useRef(false);
@@ -1829,7 +1763,9 @@ export default function App() {
    *  on screen. That is a GUI check nobody has run yet. */
   useEffect(() => {
     const landing = landingRef.current;
+    const animate = landingAnimateRef.current;
     landingRef.current = 0;
+    landingAnimateRef.current = false;
     if (landing === "keep") return;
     // D11 (fix round 3, review finding): while VISUAL is on the list on screen is the frozen one,
     // and `cursor` indexes the LIVE timeline -- a prompt sent at a turn's end moved it to a row the
@@ -1840,7 +1776,10 @@ export default function App() {
     const root = containerRef.current;
     const row = root === null ? undefined : conversationRows(root)[cursor];
     if (row === undefined) return;
-    revealRow(row.closest<HTMLElement>(".message-list"), row, landing);
+    const list = row.closest<HTMLElement>(".message-list");
+    if (list !== null) settleListScroll(list);
+    if (landing !== 0) enterBoxAtNearEnd(row, landing);
+    revealRow(list, row, landing, animate);
   }, [cursor]);
   /** R1: a scroll the panel did not cause by moving the cursor -- a wheel, a drag, the browser's own
    *  scroll keys -- can leave the cursor's row off screen. Whenever that happens, the cursor moves to
@@ -1858,6 +1797,9 @@ export default function App() {
       // once a row arrives. VISUAL's own caret scrolls the list (D7); the row cursor is placed again,
       // by key, when VISUAL ends.
       if (frozenSnapshotRef.current !== null) return;
+      // While a `j`/`k` eases the view toward its target the cursor's row, still on its way in, can be
+      // wholly out of view for a frame; the target has it in view, so nothing is re-homed until it lands.
+      if (isListScrollAnimating(list)) return;
       const rows = conversationRows(list);
       const next = clampCursorToView(list, rows, cursorRefForScroll.current);
       if (next !== null && next !== cursorRefForScroll.current) {
@@ -2694,14 +2636,14 @@ export default function App() {
           // rather than waiting out the rest of its 300ms debounce against a tab nobody is reading.
           flushDraft();
           const previous = activeTabRef.current;
+          // A `j`/`k` still easing the view is finished first: the old tab's saved view is where that press
+          // was going, and the ease must not go on carrying the new tab toward the old one's target.
+          const leftList = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+          if (leftList !== null) settleListScroll(leftList);
           // The old tab's view is saved from the live refs -- BEFORE the resets below overwrite
           // the render state they mirror -- and only when there IS an old tab (not on mount).
           if (previous !== null) {
-            saveView(
-              viewStore.current,
-              previous,
-              captureView(containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null),
-            );
+            saveView(viewStore.current, previous, captureView(leftList));
           }
           // #22: an arrival park names a row of the tab just left.
           arrivalParkRef.current = null;
@@ -5096,6 +5038,9 @@ export default function App() {
     } else if (action.kind === "control") {
       noteUserScroll(messageList, "unknown");
     }
+    // A press that arrives while the last one is still easing starts from where that one was going,
+    // never from a frame in between: every decision below reads the list's geometry.
+    if (messageList !== null) settleListScroll(messageList);
     // A code block HINT landed on is "the item" for exactly the next `y`; any other key moves on.
     const landedCode = copyCodeRef.current;
     markLandedCode(null);
@@ -5104,24 +5049,26 @@ export default function App() {
     // HTML can carry either (v1 hardening, ruling R2). Read only by the keys that need it.
     const cursorRow = () => (root === null ? null : (conversationRows(root)[cursor] ?? null));
     // `j`/`k` scroll the cursor row's own overflow box (a long tool result) before they move off it
-    // -- the vim behaviour the owner expected; `scrollCursorRowBox`'s own doc says why this cannot
-    // live in `resolveKey`. Failing that, they scroll the conversation through a current row that
-    // is taller than what is on screen (`scrollCursorRow`). Only while the row cursor has the keys:
-    // from a banner's button, `j` is a move, not a scroll of a row that is not current.
-    if (
-      action.kind === "move" &&
-      !edgeFocused &&
-      (scrollCursorRowBox(cursorRow(), action.delta) || scrollCursorRow(cursorRow(), action.delta))
-    ) {
-      event.preventDefault();
-      // `j`/`k` are row motions. If a control inside the row had the keys (after `l` onto a card's
-      // Approve), scrolling the row could carry that control off screen while it still answered
-      // Enter -- found by the scrolling change's own fix round and left open there. So a scroll
-      // step hands the keys back to the row first, the same place `j`/`k` leave them after a move.
-      if (root !== null && document.activeElement !== root && root.contains(document.activeElement)) {
-        root.focus({ preventScroll: true });
+    // -- the vim behaviour -- and failing that scroll the conversation through a
+    // current row that is taller than what is left of it on screen (`stepWithinRow`, which holds the
+    // order and `./jkScroll` the rules). A count spends itself on those steps first; whatever it has
+    // left moves rows below. This is DOM measurement, which `resolveKey`'s pure table must never do,
+    // so it happens here, after the key already means "move the cursor". Only while the row cursor has
+    // the keys: from a banner's button, `j` is a move, not a scroll of a row that is not current.
+    let spentInRow = 0;
+    if (action.kind === "move" && !edgeFocused) {
+      spentInRow = stepWithinRow(cursorRow(), action.delta, times, !event.repeat);
+      if (spentInRow > 0) {
+        event.preventDefault();
+        // `j`/`k` are row motions. If a control inside the row had the keys (after `l` onto a card's
+        // Approve), scrolling the row could carry that control off screen while it still answered
+        // Enter -- found by the scrolling change's own fix round and left open there. So a scroll
+        // step hands the keys back to the row first, the same place `j`/`k` leave them after a move.
+        if (root !== null && document.activeElement !== root && root.contains(document.activeElement)) {
+          root.focus({ preventScroll: true });
+        }
+        if (spentInRow >= times) return;
       }
-      return;
     }
     if (action.kind === "move" || action.kind === "control" || action.kind === "answer") {
       event.preventDefault();
@@ -5133,7 +5080,7 @@ export default function App() {
         // is `countedStop`, which reads the tree once whatever `times` is (up to `MAX_MOTION_COUNT`)
         // and stops at a boundary, where a step makes no progress (`clampStep` clamps rather than
         // returning `null` -- the C1c comment below). Its own doc has the measurements.
-        const landing = countedStop(root, cursor, action.delta, times);
+        const landing = countedStop(root, cursor, action.delta, times - spentInRow);
         if (landing === null) return;
         const target = landing.stop;
         // C1c (spec §3.4): `j` that cannot move -- `nextStop` clamps rather than returning `null` at
@@ -5154,7 +5101,11 @@ export default function App() {
         }
         const finalRow = landing.row;
         if (finalRow !== null) {
-          if (finalRow !== cursor) landingRef.current = action.delta;
+          if (finalRow !== cursor) {
+            landingRef.current = action.delta;
+            // Only a lone press eases the view to the new row: a held key's repeats and a count land at once.
+            landingAnimateRef.current = !event.repeat && times === 1;
+          }
           setCursor(finalRow);
           root.focus({ preventScroll: true });
         } else {
@@ -5403,8 +5354,8 @@ export default function App() {
       case "scroll-line": {
         // v1 trial item 5 (owner: "能不能给browse 加上contrl e/y", copying vim's own `:help
         // CTRL-E`/`:help CTRL-Y`): one text line, not half a view -- and, unlike `half-page` just
-        // above, counted (`times`, R4's own count and cap). Box-first, the way `j`/`k` already are
-        // (`scrollCursorRowBox`): a long tool result's own capped view takes as many of the count's
+        // above, counted (`times`, R4's own count and cap). Box-first, the way `j`/`k` are
+        // (`stepWithinRow`): a long tool result's own capped view takes as many of the count's
         // units as it can make progress on -- using ITS OWN step, `TOOL_RESULT_SCROLL_STEP_PX`, not
         // this action's one-line step ("the way j/k do it" is reusing the box's own scroller, not
         // inventing a line-based one for it) -- before the rest fall through to the conversation

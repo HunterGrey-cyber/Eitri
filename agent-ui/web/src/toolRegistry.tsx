@@ -22,6 +22,9 @@ export type ToolRenderConfig = {
    * `opts.expanded` is P3's own addition: `editConfig` folds a diff to 6 lines when it is `false`
    * and shows the whole thing when it is `true`, which is the only renderer today that reads it. */
   renderInvocation: (input: unknown, opts: { expanded: boolean; createsFile?: boolean }) => ReactNode;
+  /** `false` for a tool whose own row already says what it did (`Edit`/`Write`/`NotebookEdit`: the diff),
+   *  so a folded success draws no result preview under it. A failure is previewed whatever this says. */
+  previewSuccess?: boolean;
 };
 
 /** How much of a tool result is rendered inline, head and tail respectively.
@@ -208,6 +211,7 @@ function oneLine(label: string): ToolRenderConfig {
 function editConfig(label: string, toolName: string, pathField = "file_path"): ToolRenderConfig {
   return {
     label,
+    previewSuccess: false,
     renderInvocation: (input, { expanded, createsFile }) => {
       const preview = editPreview(toolName, input);
       if (preview === null)
@@ -365,6 +369,71 @@ const ToolResult = memo(function ToolResult({
   );
 });
 
+/** How many lines of a folded result its row shows (Claude Code's own fold shows three). */
+export const PREVIEW_LINES = 3;
+
+/** The longest a previewed line is drawn, in UTF-16 units: a runaway line (a minified file, a base64 blob)
+ *  is cut here with an ellipsis, not put into the page whole for CSS to clip. */
+const PREVIEW_LINE_CHARS = 400;
+
+/** The first `limit` lines of `text` and how many lines it has in all, without splitting the whole
+ *  string: a build log can be megabytes and this runs for every finished call that is folded.
+ *
+ *  A line is what a person counts: a final newline ends the last line rather than starting another, a
+ *  Windows line ending is one break, and a result with nothing but whitespace has no lines at all. */
+export function previewLines(text: string, limit: number): { shown: string[]; total: number } {
+  if (!/\S/.test(text)) return { shown: [], total: 0 };
+  const shown: string[] = [];
+  let newlines = 0;
+  let start = 0;
+  for (let at = text.indexOf("\n"); at !== -1; at = text.indexOf("\n", start)) {
+    if (shown.length < limit) shown.push(cutLine(text.slice(start, at)));
+    newlines++;
+    start = at + 1;
+  }
+  if (start < text.length) {
+    if (shown.length < limit) shown.push(cutLine(text.slice(start)));
+    newlines++;
+  }
+  return { shown, total: newlines };
+}
+
+function cutLine(raw: string): string {
+  const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+  return line.length > PREVIEW_LINE_CHARS ? `${line.slice(0, headEnd(line, PREVIEW_LINE_CHARS - 1))}…` : line;
+}
+
+/** What a folded, finished call shows under its invocation: the first `PREVIEW_LINES` of its result, then
+ *  a muted count of the lines not shown and how to see them. A failure shows its first line only, in the
+ *  error treatment (`.tool-result-error`: the colour on the rule beside it, the text in the body colour --
+ *  a signal colour is never a text colour here). Nothing when the result has no lines at all. It never
+ *  scrolls and never holds focus: to `j`/`k` it is part of the row.
+ *
+ *  `memo` for the reason `ToolResult` is: every finished call would otherwise be split again on each
+ *  33ms pump while a turn streams. */
+const ToolResultPreview = memo(function ToolResultPreview({ result }: { result: NonNullable<ToolCallRecord["result"]> }) {
+  const { shown, total } = previewLines(formatResultContent(result.content), result.isError ? 1 : PREVIEW_LINES);
+  if (total === 0) return null;
+  const hidden = total - shown.length;
+  return (
+    <div
+      className={`tool-result-preview${result.isError ? " tool-result-error" : ""}`}
+      data-state={result.isError ? "error" : "done"}
+    >
+      {shown.map((line, i) => (
+        <div key={i} className="tool-result-preview-line">
+          {line === "" ? "\u00a0" : line}
+        </div>
+      ))}
+      {hidden > 0 && (
+        <div className="tool-result-preview-more">
+          {`… +${hidden.toLocaleString("en-US")} ${hidden === 1 ? "line" : "lines"} (Enter to expand, Ctrl+o for all)`}
+        </div>
+      )}
+    </div>
+  );
+});
+
 /** `showResult` folded by default, per spec §3.2. A parameter rather than a second exported
  *  renderer: `ToolResult` owns the head/tail truncation and nothing else should grow a copy.
  *
@@ -419,9 +488,10 @@ export function renderToolCall(
   // FINISHED call, which is also why the default `showResult = true` reproduces the pre-fold
   // behaviour exactly: `call.result === null || showResult` is then always true. The detailed view
   // (R3) never folds either, whatever the row's own expansion says.
-  // A folded result draws nothing (v1 polish F21): it used to be a line holding only `▸`, under every
-  // finished call. `data-folded` says so for `Enter` and for tests; the row itself is the handle, as
-  // a closed fold in vim is its one line and nothing more.
+  // A folded result draws no marker line of its own (v1 polish F21: it used to be a line holding only `▸`,
+  // under every finished call). It shows its first lines and how many more there are instead
+  // (`ToolResultPreview`), as Claude Code's fold does. `data-folded` says it is folded, for `Enter` and
+  // for tests; the row itself is the handle.
   // v1 polish F18: a call a saved prefix rule answered says so, muted, under its invocation -- it
   // otherwise looked exactly like one the user approved. Claude Code names the rule the same way
   // (`Bash(git log *)`, its own permission-rule syntax).
@@ -449,6 +519,9 @@ export function renderToolCall(
       {autoNote}
       {promptNote}
       {shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
+      {!shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
+        <ToolResultPreview result={call.result} />
+      )}
     </div>
   );
 }

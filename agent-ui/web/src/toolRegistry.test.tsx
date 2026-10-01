@@ -440,3 +440,139 @@ describe("P2, P3, P4, R3 in the registry", () => {
     expect(detailed.shown.endsWith("t".repeat(5000))).toBe(true);
   });
 });
+
+/* A folded tool row used to be its invocation alone, so nothing said how much output a finished
+   `Bash`/`Read` had produced or whether it failed. It now shows the first lines of the result and how many
+   more there are -- Claude Code's own fold: three lines, then a muted `… +N lines (Enter to expand,
+   Ctrl+o for all)`, and a failed call in the error colour with its first line. The preview never scrolls on
+   its own; `Enter` (the row's own expansion) and `Ctrl+o` (the detailed view) show the whole result. */
+describe("a folded result's preview", () => {
+  const lines = (n: number, prefix = "line") => Array.from({ length: n }, (_, i) => `${prefix} ${i + 1}`).join("\n");
+  const folded = (content: unknown, over: Partial<ToolCallRecord> = {}, isError = false) =>
+    render(<>{renderToolCall(call({ result: { content, isError }, ...over }), false)}</>).container;
+  const preview = (c: HTMLElement) => c.querySelector<HTMLElement>(".tool-result-preview");
+  const shownLines = (c: HTMLElement) =>
+    Array.from(c.querySelectorAll(".tool-result-preview-line")).map((el) => el.textContent);
+  const more = (c: HTMLElement) => c.querySelector(".tool-result-preview-more")?.textContent ?? null;
+
+  it("shows the first three lines and says how many more there are", () => {
+    const c = folded(lines(120));
+    expect(shownLines(c)).toEqual(["line 1", "line 2", "line 3"]);
+    expect(more(c)).toBe("… +117 lines (Enter to expand, Ctrl+o for all)");
+    expect(c.querySelector('[data-folded="true"]')).not.toBeNull();
+    expect(c.querySelector(".tool-result-body")).toBeNull();
+  });
+
+  it("says nothing more when the whole result fits in three lines", () => {
+    for (const n of [1, 2, 3]) {
+      cleanup();
+      const c = folded(lines(n));
+      expect(shownLines(c)).toHaveLength(n);
+      expect(more(c)).toBeNull();
+    }
+  });
+
+  it("counts one line past the three in the singular", () => {
+    expect(more(folded(lines(4)))).toBe("… +1 line (Enter to expand, Ctrl+o for all)");
+  });
+
+  it("does not count a trailing newline as a line", () => {
+    const c = folded("a\nb\nc\n");
+    expect(shownLines(c)).toEqual(["a", "b", "c"]);
+    expect(more(c)).toBeNull();
+    cleanup();
+    expect(more(folded("a\nb\nc\nd\n"))).toBe("… +1 line (Enter to expand, Ctrl+o for all)");
+  });
+
+  it("reads a Windows line ending as one line break", () => {
+    const c = folded("a\r\nb\r\nc\r\nd");
+    expect(shownLines(c)).toEqual(["a", "b", "c"]);
+    expect(more(c)).toContain("+1 line");
+  });
+
+  it("shows nothing extra for a result of no lines at all", () => {
+    for (const content of ["", "\n", "  \n \n"]) {
+      cleanup();
+      const c = folded(content);
+      expect(preview(c)).toBeNull();
+      expect(c.querySelector(".tool-result")).toBeNull();
+      expect(c.querySelector('[data-folded="true"]')).not.toBeNull();
+    }
+  });
+
+  it("draws a failed call in the error treatment, with its first line only", () => {
+    const c = folded("bash: nope: command not found\nsecond\nthird\nfourth", {}, true);
+    expect(preview(c)!.classList.contains("tool-result-error")).toBe(true);
+    expect(preview(c)!.getAttribute("data-state")).toBe("error");
+    expect(shownLines(c)).toEqual(["bash: nope: command not found"]);
+    expect(more(c)).toBe("… +3 lines (Enter to expand, Ctrl+o for all)");
+  });
+
+  it("a one-line failure is the line and nothing else", () => {
+    const c = folded("permission denied", {}, true);
+    expect(shownLines(c)).toEqual(["permission denied"]);
+    expect(more(c)).toBeNull();
+  });
+
+  it("marks a finished preview as done, so it reads differently from a running call", () => {
+    expect(preview(folded("ok"))!.getAttribute("data-state")).toBe("done");
+  });
+
+  it("is not drawn when the row is expanded, or in the detailed view: the whole result stands instead", () => {
+    const expanded = render(<>{renderToolCall(call({ result: { content: lines(10), isError: false } }), true)}</>).container;
+    expect(preview(expanded)).toBeNull();
+    expect(expanded.querySelector(".tool-result-body")).not.toBeNull();
+    cleanup();
+    const detailed = render(
+      <>{renderToolCall(call({ result: { content: lines(10), isError: false } }), false, { detailed: true })}</>,
+    ).container;
+    expect(preview(detailed)).toBeNull();
+    expect(detailed.querySelector(".tool-result-body")).not.toBeNull();
+  });
+
+  it("leaves a running call's own indicator alone", () => {
+    const c = render(<>{renderToolCall(call({ result: null }), false)}</>).container;
+    expect(preview(c)).toBeNull();
+    expect(c.querySelector(".tool-result")!.getAttribute("data-state")).toBe("running");
+  });
+
+  it("reads the result of any tool, and a result that is not a string, as the text it would show expanded", () => {
+    const c = folded([{ type: "text", text: "hello" }], { name: "SomeFutureTool" });
+    expect(shownLines(c).join("\n")).toContain('"type": "text"');
+    expect(more(c)).not.toBeNull(); // pretty-printed JSON runs past three lines
+  });
+
+  it("keeps a quiet tool's line to itself", () => {
+    const c = folded(lines(10), { name: "ToolSearch", input: { query: "x" } });
+    expect(preview(c)).toBeNull();
+  });
+
+  it("gives a diff-bearing tool no preview when it succeeded -- its row is the diff -- but shows its failure", () => {
+    const ok = folded("The file /p/a.rs has been updated successfully.", {
+      name: "Edit",
+      input: { file_path: "/p/a.rs", old_string: "a", new_string: "b" },
+    });
+    expect(preview(ok)).toBeNull();
+    cleanup();
+    const failed = folded(
+      "String to replace not found in file.",
+      { name: "Edit", input: { file_path: "/p/a.rs", old_string: "a", new_string: "b" } },
+      true,
+    );
+    expect(shownLines(failed)).toEqual(["String to replace not found in file."]);
+    expect(preview(failed)!.classList.contains("tool-result-error")).toBe(true);
+  });
+
+  it("keeps a runaway line, and a huge result, bounded in what it puts in the page", () => {
+    const longLine = "x".repeat(50_000);
+    const c = folded(`${longLine}\nsecond\nthird\nfourth`);
+    const first = shownLines(c)[0]!;
+    expect(first.length).toBeLessThan(1000);
+    expect(first.endsWith("…")).toBe(true);
+    expect(more(c)).toContain("+1 line");
+    cleanup();
+    const huge = folded(Array.from({ length: 200_000 }, (_, i) => `l${i}`).join("\n"));
+    expect(shownLines(huge)).toEqual(["l0", "l1", "l2"]);
+    expect(more(huge)).toBe("… +199,997 lines (Enter to expand, Ctrl+o for all)");
+  });
+});

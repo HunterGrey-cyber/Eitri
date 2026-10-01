@@ -2705,6 +2705,53 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     expect(containment(bash)).toBeNull();
   });
 
+  /** A folded call with a long first line, as the panel draws it: the preview under its invocation. */
+  function foldedPreview(extraCss = "", isError = false): HTMLElement {
+    const folded = renderToolCall(
+      {
+        seq: 1,
+        toolUseId: "t1",
+        name: "Bash",
+        input: { command: "cargo test" },
+        result: { content: `${"x".repeat(300)}\nsecond\nthird\nfourth`, isError },
+      },
+      false,
+    );
+    document.head.innerHTML = `<style>${css}${extraCss}</style>`;
+    document.body.innerHTML =
+      `<div class="message-list"><div class="row"><span class="row-sign"></span><div class="row-body">` +
+      renderToStaticMarkup(createElement("div", null, folded)) +
+      `</div></div></div>`;
+    return document.querySelector<HTMLElement>(".tool-result-preview")!;
+  }
+
+  it("cuts a folded result's lines at the edge with an ellipsis, so three lines stay three lines", () => {
+    const line = foldedPreview().querySelector<HTMLElement>(".tool-result-preview-line")!;
+    expect(winningDeclarationOn(line, "white-space")).toBe("pre");
+    expect(winningDeclarationOn(line, "overflow")).toBe("hidden");
+    expect(winningDeclarationOn(line, "text-overflow")).toBe("ellipsis");
+    // Negative control: without the clip the line is free to push the row wide.
+    const loose = foldedPreview(".tool-result-preview-line { overflow: visible; }").querySelector<HTMLElement>(
+      ".tool-result-preview-line",
+    )!;
+    expect(winningDeclarationOn(loose, "overflow")).toBe("visible");
+  });
+
+  it("holds the preview's lines in one zero-minimum track, which is what keeps a long line from widening the row", () => {
+    const preview = foldedPreview();
+    expect(winningDeclarationOn(preview, "display")).toBe("grid");
+    expect(winningDeclarationOn(preview, "grid-template-columns")).toBe("minmax(0, 1fr)");
+  });
+
+  it("draws the preview's count in the muted text colour and a failure beside the error rule, not in it", () => {
+    const ok = foldedPreview();
+    expect(winningDeclarationOn(ok.querySelector(".tool-result-preview-more")!, "color")).toBe("var(--nv-muted)");
+    const failed = foldedPreview("", true);
+    expect(failed.classList.contains("tool-result-error")).toBe(true);
+    expect(winningDeclarationOn(failed, "border-left")).toBe("2px solid var(--nv-error)");
+    expect(winningDeclarationOn(failed, "color")).toBe("var(--nv-fg)");
+  });
+
   it("scrolls a markdown table in its own box and keeps its words whole (T1)", () => {
     document.head.innerHTML = `<style>${css}</style>`;
     document.body.innerHTML = `<div class="message-list"><div class="row"><div class="row-body">${renderMarkdown("| a | b |\n|---|---|\n| supercalifragilistic | 2 |")}</div></div></div>`;

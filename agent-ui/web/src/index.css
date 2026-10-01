@@ -1118,6 +1118,29 @@ textarea,
   border-left: 2px solid var(--nv-error);
   padding-left: 6px;
 }
+/* A folded, finished call's result preview (`toolRegistry.tsx`'s `ToolResultPreview`): its first lines and
+   how many more there are, so a row says how much output a command made and whether it failed without
+   being opened. It stays inside the row's text track and never scrolls: each line is cut at the track's
+   edge with an ellipsis instead of wrapping, so three lines are three lines of height whatever the output
+   holds. The track is `minmax(0, 1fr)` so a long line cannot widen the row past the list (a grid track
+   with a zero minimum contributes nothing to its container's minimum width, which a plain block of
+   `white-space: pre` lines does). A failed call takes `.tool-result-error`'s own rule beside it. */
+.tool-result-preview {
+  margin-top: 4px;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+.tool-result-preview-line {
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tool-result-preview-more {
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+}
 .tool-result-body {
   background: var(--nv-bg);
   padding: 6px 8px;

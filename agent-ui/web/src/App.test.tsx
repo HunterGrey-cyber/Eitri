@@ -1710,11 +1710,16 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
 
     /* Review finding: with the box scrolled off screen (the user mouse-scrolled the list away), `j`
        used to scroll the hidden box and change nothing visible. Now the first press brings the row
-       back into view instead. */
+       back into view instead. The list is computed to the row (`jkScroll.ts`), not handed to the
+       engine's `scrollIntoView` (which top-aligns a row taller than the view in WebKitGTK 2.52.6):
+       the list stands 2500px down, the row (mocked 2000px above its top) at 500 in the content, and
+       the press moves the list up to it, leaving the box alone. */
     it("brings the row back into view, rather than scrolling a box that is off screen", () => {
       const { container } = startedAppWithExpandedResult();
       const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
       makeScrollable(box, { scrollHeight: 500, clientHeight: 260, boxTop: -2000 });
+      const list = box.closest(".message-list") as HTMLElement;
+      Object.defineProperty(list, "scrollTop", { value: 2500, configurable: true, writable: true });
       const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
       scrollIntoView.mockClear();
 
@@ -1722,7 +1727,9 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
 
       expect(box.scrollTop).toBe(0);
       expect(container.querySelector(".row-current")!.textContent).toContain("long");
-      expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+      expect(list.scrollTop).toBeLessThan(2500); // moved up toward the row
+      expect(list.scrollTop).toBeGreaterThan(0);
+      expect(scrollIntoView).not.toHaveBeenCalled();
     });
 
     it("scrolls the box upward on k, the same way", () => {
@@ -6019,15 +6026,17 @@ describe("App keyboard: scrolling through the conversation", () => {
     // just read stays in view (review: aligning it jumped the view by a quarter of it here).
     expect(list.scrollTop).toBe(0);
 
-    // 690px of it is below the view: eleven 60px steps, then a 30px one -- never past the edge.
+    // 730px of it is below the view's bottom margin line (a margin of two 20px lines since the j/k
+    // rework: the row's end rests 40px above the bottom edge, not flush on it, so the next row is
+    // already half in sight): eleven 60px steps, a 60px one to 720, then the last 10 -- never past it.
     const seen: number[] = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 13; i++) {
       press("j");
       seen.push(list.scrollTop);
     }
     expect(current(container)).toBe("b");
-    expect(seen).toEqual([60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 690]);
-    expect(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]')[1].getBoundingClientRect().bottom).toBe(400);
+    expect(seen).toEqual([60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720, 730]);
+    expect(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]')[1].getBoundingClientRect().bottom).toBe(360);
 
     press("j");
     expect(current(container)).toBe("c");
@@ -6180,34 +6189,38 @@ describe("App keyboard: scrolling through the conversation", () => {
     const list = fakeLayout(container, [400, 990, 400]);
     press("g"); press("g");
     expect(list.scrollTop).toBe(0);
-    // "b" is taller than the 400px view and starts where the view ends: its top is aligned, as `j` does.
+    // "b" is taller than the 400px view and starts where the view ends: its head goes to the reading
+    // line, a third of the way down (the j rework; it used to be aligned to the view's top, 400).
     press("2"); press("G", { shiftKey: true });
     expect(current(container)).toBe("b");
-    expect(list.scrollTop).toBe(400);
+    expect(list.scrollTop).toBe(267);
     // A bare `G` still scrolls the list to its very end ...
     press("G", { shiftKey: true });
     expect(current(container)).toBe("c");
     expect(list.scrollTop).toBe(1390);
-    // ... and `2gg` back onto "b" shows the edge it arrives from (its bottom), not the top of the list.
+    // ... and `2gg` back onto "b" shows the edge it arrives from (its end, two thirds of the way down:
+    // 1390 - 400 * 2 / 3), not the top of the list -- and not a whole view away (it used to be 990).
     press("2"); press("g"); press("g");
     expect(current(container)).toBe("b");
-    expect(list.scrollTop).toBe(990);
+    expect(list.scrollTop).toBe(1123);
   });
 
-  it("counts: {N}G onto a row that fits is revealed with scrollIntoView, leaving the list where it was", () => {
+  it("counts: {N}G onto a row that fits is brought in by the least scroll that leaves its margin, not to the list's end", () => {
     const { container } = started();
-    prompts("a", "b", "c");
-    const list = fakeLayout(container, [400, 990, 400]);
+    prompts("a", "b", "c", "d");
+    const list = fakeLayout(container, [400, 990, 100, 800]);
     press("g"); press("g");
     expect(list.scrollTop).toBe(0);
     const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
     scrollIntoView.mockClear();
     press("3"); press("G", { shiftKey: true });
     expect(current(container)).toBe("c");
-    // The reveal is the cursor effect's -- the same call a `j` landing makes on a row that fits ...
-    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
-    // ... and a bare `G` would have scrolled the list to its very end (1390) before it.
-    expect(list.scrollTop).toBe(0);
+    // The reveal is the cursor effect's -- the same computation a `j` landing makes on a row that fits:
+    // "c" (1390..1490) goes to the bottom margin line, 1490 - 400 + 40 ...
+    expect(list.scrollTop).toBe(1130);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    // ... and a bare `G` would have scrolled the list to its very end (1990) before it.
+    expect(list.scrollTop).toBeLessThan(1990);
   });
 
   it("counts: 3gt posts the tab's id, 2gT wraps back past the first tab, and a count before ]b is ignored (R2)", () => {
@@ -6239,46 +6252,49 @@ describe("App keyboard: scrolling through the conversation", () => {
     // R1 lands the cursor on "c" the moment it arrives; `gg` returns to the top.
     press("g");
     press("g");
-    for (let i = 0; i < 14; i++) press("j");
+    // one move onto "b", thirteen steps through it, one move onto "c"
+    for (let i = 0; i < 15; i++) press("j");
     expect(current(container)).toBe("c");
-    expect(list.scrollTop).toBe(690);
-    // "c" fits, so landing on it used `scrollIntoView({ block: "nearest" })` -- a mock here. Do what
-    // a browser would: bring "c" fully on screen, which is also the end of the list.
-    list.scrollTop = 790;
+    // "c" fits: it comes in by the least scroll that leaves its bottom margin, which is also the end of the list.
+    expect(list.scrollTop).toBe(790);
 
     press("k");
     expect(current(container)).toBe("b");
     expect(list.scrollTop).toBe(790); // its BOTTOM was already on screen (at 300): nothing moves
 
+    // The top margin line is the row's top (100) less two 20px lines: the last step stops there.
     const seen: number[] = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 13; i++) {
       press("k");
       seen.push(list.scrollTop);
     }
-    expect(seen).toEqual([730, 670, 610, 550, 490, 430, 370, 310, 250, 190, 130, 100]);
+    expect(seen).toEqual([730, 670, 610, 550, 490, 430, 370, 310, 250, 190, 130, 70, 60]);
     expect(current(container)).toBe("b");
 
     press("k");
     expect(current(container)).toBe("a");
   });
 
-  it("j onto a tall row whose top is NOT on screen aligns that top with the view's top; k mirrors it", () => {
+  it("j onto a tall row whose head is off screen puts it on the reading line, a third of the way down; k mirrors it", () => {
     const { container } = started();
     prompts("a", "b", "c");
-    const list = fakeLayout(container, [400, 990, 400]);
+    const list = fakeLayout(container, [360, 990, 400]);
     // R1 lands the cursor on "c" the moment it arrives; `gg` returns to the top.
     press("g");
     press("g");
 
-    press("j"); // "b" starts at 400, exactly where the 400px view ends
+    press("j"); // "b" starts at 360, on the bottom margin line of the 400px view
     expect(current(container)).toBe("b");
-    expect(list.scrollTop).toBe(400);
+    expect(list.scrollTop).toBe(227); // 360 - 400 / 3 (it used to be aligned to the view's top, 360)
 
-    press("G", { shiftKey: true }); // "c", view at the very end (1390)
-    expect(list.scrollTop).toBe(1390);
-    press("k"); // "b" ends at 1390, exactly where the view begins
+    press("G", { shiftKey: true }); // "c" fills the view, which is at the very end (1350)
+    expect(list.scrollTop).toBe(1350);
+    press("k"); // "c"'s top is on the view's edge: this press steps up through "c" by the margin
+    expect(current(container)).toBe("c");
+    expect(list.scrollTop).toBe(1310);
+    press("k"); // "b" ends 40px inside the view: its end goes two thirds of the way down
     expect(current(container)).toBe("b");
-    expect(list.scrollTop).toBe(990); // its bottom at the bottom of the view
+    expect(list.scrollTop).toBe(1083); // 1350 - 400 * 2 / 3 (it used to be 990, a whole view away)
   });
 
   it("from the Stop button, k moves back to the row rather than scrolling it", () => {
@@ -6676,14 +6692,14 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("ArrowDown");
     expect(current(container)).toBe("b");
     expect(list.scrollTop).toBe(0);
-    // 690px of "b" is below the view: eleven 60px steps, then a 30px one -- j's own numbers.
+    // 730px of "b" is below the bottom margin line: eleven 60px steps, a 60px one, then 10 -- j's own numbers.
     const seen: number[] = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 13; i++) {
       press("ArrowDown");
       seen.push(list.scrollTop);
     }
     expect(current(container)).toBe("b");
-    expect(seen).toEqual([60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 690]);
+    expect(seen).toEqual([60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720, 730]);
     press("ArrowDown");
     expect(current(container)).toBe("c");
   });
@@ -13368,19 +13384,21 @@ describe("#22: coming back restores where you were", () => {
   const FIVE = [300, 300, 300, 300, 300];
   const SEVEN = [300, 300, 300, 300, 300, 300, 300];
 
-  /** "Parked on row 3": at the bottom (R1 has the cursor on row 5), the reader scrolls up to 600 (R1's
-   *  clamp moves the cursor to row 4, the nearest visible), then `k` (row 3 fits and is on screen: the
-   *  mocked reveal moves nothing, and `k` stops following). */
+  /** "Parked on row 3": at the bottom (R1 has the cursor on row 5), the reader scrolls up to 560 (R1's
+   *  clamp moves the cursor to row 4, the nearest visible), then `k` (row 3 fits and sits inside the
+   *  view's two-line margins at 560, so the landing moves nothing, and `k` stops following). 560 rather
+   *  than 600 since the margin rule: at 600 row 3's top is on the view's edge and the landing would
+   *  scroll up 40px to give it its margin. */
   function parkOnRow3(c: HTMLElement) {
     const list = layOut(c, FIVE, 1100);
     act(() => rootOf(c).focus());
     expect(current(c)).toBe("row 5");
-    list.scrollTop = 600;
+    list.scrollTop = 560;
     fireEvent.scroll(list);
     expect(current(c)).toBe("row 4");
     press("k");
     expect(current(c)).toBe("row 3");
-    expect(list.scrollTop).toBe(600);
+    expect(list.scrollTop).toBe(560);
     return list;
   }
   const leave = () => dispatch({ kind: "pane_focus", focused: false });
@@ -13428,28 +13446,31 @@ describe("#22: coming back restores where you were", () => {
     const list = layOut(container, SEVEN, 0);
     const { seen } = recording(() => come(order));
     expect(current(container)).toBe("row 3");
-    expect(list.scrollTop).toBe(600);
+    expect(list.scrollTop).toBe(560);
     expect(seen).toEqual([]);
     expect(modeOf(container)).toBe("browse");
   });
 
   it("T2b: at the bottom with the cursor above the last row is not following: row and view stay, streaming does not carry them", () => {
     const { container } = started();
-    const first = layOut(container, FIVE, 1100);
+    // The last two rows are short, so with the view at the bottom (800) row 4 sits inside the view's
+    // two-line margins and `k` onto it moves nothing: the view stays at the bottom, the cursor above it.
+    const SHORT_END = [300, 300, 300, 150, 150];
+    const first = layOut(container, SHORT_END, 800);
     act(() => rootOf(container).focus());
     press("k");
     expect(current(container)).toBe("row 4");
-    expect(first.scrollTop).toBe(1100);
+    expect(first.scrollTop).toBe(800);
     leave();
     stream("row 6", "row 7");
-    const list = layOut(container, SEVEN, 1100);
+    const list = layOut(container, [...SHORT_END, 300, 300], 800);
     const { seen } = recording(() => {
       come();
       stream("row 8");
-      layOut(container, [...SEVEN, 300], 1100);
+      layOut(container, [...SHORT_END, 300, 300, 300], 800);
     });
     expect(current(container)).toBe("row 4");
-    expect(list.scrollTop).toBe(1100);
+    expect(list.scrollTop).toBe(800);
     expect(seen).toEqual([]);
   });
 
@@ -13458,13 +13479,13 @@ describe("#22: coming back restores where you were", () => {
     parkOnRow3(container);
     leave();
     stream("row 6", "row 7");
-    const list = layOut(container, SEVEN, 600);
+    const list = layOut(container, SEVEN, 560);
     list.scrollTop = 1500;
     fireEvent.scroll(list);
     expect(current(container)).toBe("row 6");
     come();
     expect(current(container)).toBe("row 3");
-    expect(list.scrollTop).toBe(600);
+    expect(list.scrollTop).toBe(560);
   });
 
   it("T4: a row removed above the cursor while away: the same row comes back, by key", () => {
@@ -13491,14 +13512,14 @@ describe("#22: coming back restores where you were", () => {
     parkOnRow3(container);
     leave();
     events({ type: "permission_requested", permission_id: "p9", tool_use_id: "toolu_9", tool_name: "Bash", input: {} });
-    layOut(container, [...FIVE, 300], 600);
+    layOut(container, [...FIVE, 300], 560);
     come();
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
     expect(modeOf(container)).toBe("browse");
     // The park is gone, not merely outranked by the card: with the card resolved, an arrive with no
     // leave in between restores nothing.
     events({ type: "permission_resolved", permission_id: "p9", outcome: "allowed" });
-    layOut(container, FIVE, 600);
+    layOut(container, FIVE, 560);
     const before = current(container);
     expect(before).not.toBe("row 3");
     dispatch({ kind: "arrive" });
@@ -13545,7 +13566,7 @@ describe("#22: coming back restores where you were", () => {
     const list = layOut(container, SEVEN, 0);
     come(order);
     expect(current(container)).toBe("row 3");
-    expect(list.scrollTop).toBe(600);
+    expect(list.scrollTop).toBe(560);
   });
 
   it("T7b: the card route (a tray chip agent ⚑N, prefix a with a card) lands on the card, and the park is gone", () => {
@@ -13553,12 +13574,12 @@ describe("#22: coming back restores where you were", () => {
     parkOnRow3(container);
     leave();
     events({ type: "permission_requested", permission_id: "p9", tool_use_id: "toolu_9", tool_name: "Bash", input: {} });
-    layOut(container, [...FIVE, 300], 600);
+    layOut(container, [...FIVE, 300], 560);
     dispatch({ kind: "pane_focus", focused: true });
     dispatch({ kind: "focus_permission", tab: 1 });
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
     events({ type: "permission_resolved", permission_id: "p9", outcome: "allowed" });
-    layOut(container, FIVE, 600);
+    layOut(container, FIVE, 560);
     const before = current(container);
     expect(before).not.toBe("row 3");
     dispatch({ kind: "arrive" });
@@ -13570,7 +13591,7 @@ describe("#22: coming back restores where you were", () => {
     parkOnRow3(container);
     leave();
     stream("row 6", "row 7");
-    const list = layOut(container, SEVEN, 600);
+    const list = layOut(container, SEVEN, 560);
     fireEvent.wheel(list, { deltaY: 300 });
     list.scrollTop = 1200;
     fireEvent.scroll(list);
@@ -13618,7 +13639,7 @@ describe("#22: coming back restores where you were", () => {
     come();
     expect(modeOf(container)).toBe("browse");
     expect(current(container)).toBe("row 3");
-    expect(list.scrollTop).toBe(600);
+    expect(list.scrollTop).toBe(560);
     act(() => rootOf(container).focus());
     keyGap(); // a lone `i` (#26)
     press("i");
@@ -13646,12 +13667,15 @@ describe("#22: coming back restores where you were", () => {
     parkOnRow3(container);
     leave();
     stream("row 6", "row 7");
-    layOut(container, [700, 700, 300, 300, 300, 300, 300], 600);
+    const list = layOut(container, [700, 700, 300, 300, 300, 300, 300], 560);
     const reveal = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
     reveal.mockClear();
     come();
     expect(current(container)).toBe("row 3");
-    expect(reveal.mock.contexts).toContain(rowsOf(container)[2]);
+    // Row 3 now stands at 1400..1700, below the view: the arrival computes the scroll to it (its bottom
+    // on the bottom margin line, 1700 - 400 + 40) rather than leaving that to the engine's `scrollIntoView`.
+    expect(list.scrollTop).toBe(1340);
+    expect(reveal.mock.contexts).not.toContain(rowsOf(container)[2]);
   });
 
   it("fix round, Codex 1: a parked reader stays parked even if the list re-armed following while away", () => {
@@ -13717,7 +13741,7 @@ describe("#22: coming back restores where you were", () => {
         kind: "snapshot", tab: 1, throughRevision: revision,
         state: snapshotState({ activeTurnId: "t", transcript: [row(1), row(2), row(3), row(4), row(5)] }),
       });
-      layOut(c, FIVE, 600); // the rows are new elements: lay them out again
+      layOut(c, FIVE, 560); // the rows are new elements: lay them out again
     }],
   ])("fix round: %s drops the park", (_name, drop) => {
     const { container } = started();
@@ -13733,10 +13757,10 @@ describe("#22: coming back restores where you were", () => {
     parkOnRow3(container);
     leave();
     events({ type: "permission_requested", permission_id: "p9", tool_use_id: "toolu_9", tool_name: "Bash", input: {} });
-    layOut(container, [...FIVE, 300], 600);
+    layOut(container, [...FIVE, 300], 560);
     dispatch({ kind: "focus_permission", tab: 1 });
     events({ type: "permission_resolved", permission_id: "p9", outcome: "allowed" });
-    layOut(container, FIVE, 600);
+    layOut(container, FIVE, 560);
     const before = driftAway(container);
     dispatch({ kind: "arrive" });
     expect(current(container)).toBe(before);
