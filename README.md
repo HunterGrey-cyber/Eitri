@@ -8,11 +8,11 @@ A Claude Code you'd actually want to read: rendered markdown and diffs, permissi
 reaching for the mouse. Eitri is a Linux desktop window (MIT) around your own Neovim configuration and
 the `claude` you have installed.
 
-<!-- MEDIA: hero.png -- the whole window. Left: the editor on LazyVim, a file open, a Visual selection.
-Right: the panel mid-conversation: a markdown reply with a highlighted code block, a folded tool-call
-row, and a waiting card with a line diff (auto runs in-project edits unasked, so stage the card with an
-edit outside the project or on a protected path such as `.git/`). Terminal hidden. 2560x1600 at scale
-2, shown at width 900; the caption names the desktop, session type and distribution. -->
+Website: **[eitri.cc](https://eitri.cc)**
+
+![Eitri: Neovim on the left with a Python file open; on the right, Claude Code's rendered reply with a highlighted code block, and the which-key box open from the leader key](docs/images/hero.webp)
+
+<sub>An Eitri 0.2.0 release candidate in a headless sway sandbox: the LazyVim starter, tokyonight-moon.</sub>
 
 - **Your own Neovim.** A real `nvim --embed` with your `init.lua`, plugins, LSP and keymaps, drawn by a
   fork of Neovide's GPU renderer; Eitri keeps only a few keys for itself.
@@ -54,9 +54,9 @@ verifying a final release are in [INSTALL.md](INSTALL.md).
   copy and a copy mode. One `:colorscheme` in Neovim recolours the chrome and the panel. Keys and
   options live in `~/.config/eitri/init.lua`; a colliding binding is a startup error naming both.
 
-<!-- MEDIA: colorscheme.webm (or .gif if the host renders no video) -- the same window as hero.png,
-switching `:colorscheme` three times (a light theme, a dark theme, back); the chrome, the panel and
-its code block follow each switch. 1280x800, 6 seconds or less, under 3 MB. -->
+<img src="docs/images/reading.webp" width="49%" alt="The panel close up: a reply laid out with headings, a list and a highlighted code block"> <img src="docs/images/card.webp" width="49%" alt="A permission card waiting for an answer, with Approve and Deny">
+
+![The same window after :colorscheme tokyonight-day: the editor, the window chrome and the panel all follow it](docs/images/colorscheme-light.webp)
 
 ## Keys
 
@@ -74,8 +74,7 @@ build, with your own rebindings applied; it, not this table, is the reference.**
 sees them (`prefix Ctrl+l` sends the literal). The panel's leader is your Neovim `mapleader`.
 [`docs/keymap/tmux-ctrl-a.lua`](docs/keymap/tmux-ctrl-a.lua) ports one full tmux configuration.
 
-<!-- MEDIA: hint.png -- after `prefix f`: jump labels over the editor, the panel and the tray.
-1600x1000 at scale 2, shown at width 800. -->
+![After prefix f: jump labels over the editor, the panel's rows and its buttons](docs/images/hint.webp)
 
 ## How it compares
 
@@ -184,6 +183,7 @@ Anthropic's own terms.
 
 ## Links
 
+- [eitri.cc](https://eitri.cc): the homepage
 - [Releases](https://github.com/HunterGrey-cyber/eitri/releases), [issues](https://github.com/HunterGrey-cyber/eitri/issues)
 - [INSTALL.md](INSTALL.md): every install route, verifying a download, updating, uninstalling
 - [CONTRIBUTING.md](CONTRIBUTING.md): building from source and running the tests

@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=c51d97685dc8129b9189fc0f62462551ab608decc0c971222d575973e970e3ea -->
+<!-- translated-from: README.md sha256=43cb1bad474bfca742c0c2b37b49329414ed4d6288a4a087dca5aebc0caf501b -->
 
 # Eitri
 
@@ -7,11 +7,11 @@
 
 一个真正好读的 Claude Code：排好版的回复和 diff，一张张权限卡片，全程不用碰鼠标。Eitri 是一个 Linux 桌面窗口（MIT 许可），包在你自己的 Neovim 配置和你已安装的 `claude` 外面。
 
-<!-- MEDIA: hero.png -- the whole window. Left: the editor on LazyVim, a file open, a Visual selection.
-Right: the panel mid-conversation: a markdown reply with a highlighted code block, a folded tool-call
-row, and a waiting card with a line diff (auto runs in-project edits unasked, so stage the card with an
-edit outside the project or on a protected path such as `.git/`). Terminal hidden. 2560x1600 at scale
-2, shown at width 900; the caption names the desktop, session type and distribution. -->
+官网：**[eitri.cc](https://eitri.cc/zh/)**
+
+![Eitri：左边是打开着 Python 文件的 Neovim；右边是排好版的 Claude Code 回复，带一个高亮代码块，以及按下 leader 键后弹出的 which-key 提示](docs/images/hero.webp)
+
+<sub>Eitri 0.2.0 发布候选版，在无头 sway 沙盒里拍摄：LazyVim starter，tokyonight-moon 配色。</sub>
 
 - **你自己的 Neovim。** 一个真正的 `nvim --embed`，加载你的 `init.lua`、插件、LSP 和按键映射，由 Neovide GPU 渲染器的一个 fork 绘制；Eitri 只为自己保留少数几个按键。
 - **读得下去的回复。** markdown、按你配色方案的语法颜色高亮的代码、结果可以折叠的工具调用，以及每一次编辑各占一行的 diff；编辑之后，你已打开且没改过的文件会在你的 Neovim 里重新加载。当前文件的文件名，以及 Visual 选区（如果有的话），会随每条提示一起发送。
@@ -33,9 +33,9 @@ eitri ~/path/to/project
 - **会话。** 每个标签页一段对话，全部同时运行。可以从选择器里恢复一个已记录的会话；`<leader>t` 会在这里关闭一段对话，并显示能在你的终端里接着这段对话的 `claude --resume` 命令。
 - **窗口。** 编辑器、面板和终端都是模块，可以用 tmux 的按键显示、隐藏、拆分、交换和放大。底部终端是自己的一个 PTY，运行你的 shell，支持括号粘贴（bracketed paste）、OSC 52 复制和复制模式。在 Neovim 里执行一次 `:colorscheme`，外壳和面板都会跟着换色。按键和选项写在 `~/.config/eitri/init.lua` 里；绑定冲突会导致启动报错，并指出冲突的两个绑定。
 
-<!-- MEDIA: colorscheme.webm (or .gif if the host renders no video) -- the same window as hero.png,
-switching `:colorscheme` three times (a light theme, a dark theme, back); the chrome, the panel and
-its code block follow each switch. 1280x800, 6 seconds or less, under 3 MB. -->
+<img src="docs/images/reading.webp" width="49%" alt="面板近景：带标题、列表和高亮代码块的回复"> <img src="docs/images/card.webp" width="49%" alt="一张等待回答的权限卡片，带 Approve 和 Deny 按钮">
+
+![执行 :colorscheme tokyonight-day 之后的同一个窗口：编辑器、窗口边框和面板都跟着换了配色](docs/images/colorscheme-light.webp)
 
 ## 按键
 
@@ -49,8 +49,7 @@ its code block follow each switch. 1280x800, 6 seconds or less, under 3 MB. -->
 
 `Ctrl+h/j/k/l` 在窗格之间移动：在 Neovim 的 Normal 和 Visual 模式下，先在它自己的分屏之间移动，走到边缘才移到别的窗格（如果你在用 vim-tmux-navigator，由它来判断边界）；在终端里则始终有效，终端里的 shell 永远收不到这几个键（`prefix Ctrl+l` 会把字面的 `Ctrl+l` 发过去）。面板的 leader 键就是你 Neovim 的 `mapleader`。[`docs/keymap/tmux-ctrl-a.lua`](docs/keymap/tmux-ctrl-a.lua) 移植了一整份 tmux 配置。
 
-<!-- MEDIA: hint.png -- after `prefix f`: jump labels over the editor, the panel and the tray.
-1600x1000 at scale 2, shown at width 800. -->
+![按下 prefix f 之后：编辑器、面板的每一行和按钮上都标出了跳转字母](docs/images/hint.webp)
 
 ## 与其他方案的比较
 
@@ -126,6 +125,7 @@ agent sidecar 打包了 Anthropic 的 Claude Agent SDK，它不是开源软件�
 
 ## 链接
 
+- [eitri.cc](https://eitri.cc/zh/)：官网
 - [发布页面](https://github.com/HunterGrey-cyber/eitri/releases)、[issues](https://github.com/HunterGrey-cyber/eitri/issues)
 - [INSTALL.zh-CN.md](INSTALL.zh-CN.md)：每一种安装方式、验证下载、更新、卸载
 - [CONTRIBUTING.md](CONTRIBUTING.md)（仅有英文版）：从源码构建和运行测试
