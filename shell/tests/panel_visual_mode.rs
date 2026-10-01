@@ -69,7 +69,9 @@
 //! - W0 (both windows; harness preflight): a real key reaches the page, trusted.
 //! - W1 (vacuity): `Selection.modify`/`caretRangeFromPoint` exist in this non-editable page at all.
 //! - W2: `vvey`/`vvwey`/`vv2ey`/`vvwwy` on the English prompt row (D3's inclusive semantics); `vvey`
-//!   on the Chinese paragraph copies one ICU word (R7, recorded rather than asserted vim-exact).
+//!   on the Chinese paragraph copies one ICU word (R7, recorded rather than asserted vim-exact;
+//!   2026-10-01: `w`/`e`/`b` now follow vim's word rules, so vim's answer is "这是一段中文" -- not
+//!   re-run since, still only recorded).
 //! - W3: `Vjy` over the prompt and the reply: both texts, no `›`, no button label (D6's chrome); 3a
 //!   adds `vVjy` (CARET, then `V` straight to V-LINE, D1's "the OTHER key switches to the sibling
 //!   one"), giving the same text.
@@ -199,7 +201,8 @@ fn panel_base_uri_matches_product() -> Result<(), String> {
 }
 
 /// The Chinese paragraph W2's ICU-word case reads, recorded rather than pinned to an exact
-/// vim-equivalent boundary (D4: "vim-like, not vim-exact").
+/// vim-equivalent boundary (D4: "vim-like, not vim-exact"; since 2026-10-01 `w`/`e`/`b` follow
+/// vim's word rules, under which `vvey` copies "这是一段中文" -- not re-run, so still recorded).
 const CHINESE_PARAGRAPH: &str = "这是一段中文，用来记录 ICU 分词的实际结果。";
 
 const CODE_BLOCK_LANG: &str = "rust";
@@ -981,7 +984,8 @@ fn w2_english_and_chinese_words(h: &Harness) -> Result<(), String> {
     if fourth != "The quick b" {
         return Err(format!("vvwwy: expected \"The quick b\", got {fourth:?}"));
     }
-    // Recorded, not asserted against a vim-exact answer (D4: word boundaries are WebKit's ICU).
+    // Recorded, not asserted against a vim-exact answer (D4: word boundaries were WebKit's ICU; since
+    // 2026-10-01 they are vim's, "这是一段中文" here -- pin it once this harness has run again).
     h.clear_clipboard();
     h.xdotool_keys(&["g", "g", "j", "v", "v", "e", "y"]);
     let chinese = h

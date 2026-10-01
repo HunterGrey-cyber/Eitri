@@ -1,12 +1,11 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import {
-  charAfterCaret,
   compareCarets,
   copySelectionText,
+  fallbackGraphemeStarts,
   firstSelectableCaret,
   isChromeNode,
-  isWhitespaceAfter,
   lastSelectableCaret,
   rebuildSelection,
   repeatMotion,
@@ -83,34 +82,8 @@ function textCaret(text: Text, offset: number): Caret {
   return { node: text, offset };
 }
 
-describe("visual.ts: whitespace and the D4 word table", () => {
-  it("isWhitespaceAfter reads the character right after the caret, not before it", () => {
-    const text = document.createTextNode("ab cd");
-    expect(isWhitespaceAfter(textCaret(text, 0))).toBe(false); // 'a'
-    expect(isWhitespaceAfter(textCaret(text, 2))).toBe(true); // ' '
-    expect(isWhitespaceAfter(textCaret(text, 5))).toBe(true); // past the end: treated as a boundary
-  });
-
-  it("charAfterCaret returns null past the end of a text node with no known next text", () => {
-    const text = document.createTextNode("x");
-    expect(charAfterCaret(textCaret(text, 1))).toBeNull();
-  });
-
-  it("w issues forward+backward word when on whitespace, forward+forward+backward otherwise (D4)", () => {
-    const onWhitespace = document.createTextNode(" rest");
-    const midWord = document.createTextNode("word rest");
-    const path = [textCaret(onWhitespace, 0), textCaret(onWhitespace, 1), textCaret(onWhitespace, 2)];
-
-    const sel1 = fakeSelection(path);
-    runMotion(sel1, textCaret(onWhitespace, 0), "w", null);
-    expect(sel1.calls).toEqual(["move forward word", "move backward word"]);
-
-    const sel2 = fakeSelection([textCaret(midWord, 0), textCaret(midWord, 1), textCaret(midWord, 2), textCaret(midWord, 3)]);
-    runMotion(sel2, textCaret(midWord, 0), "w", null);
-    expect(sel2.calls).toEqual(["move forward word", "move forward word", "move backward word"]);
-  });
-
-  it("h/l/e/b/0/$ each issue exactly the D4 table's own modify() calls", () => {
+describe("visual.ts: the D4 table's modify() calls", () => {
+  it("h/l/0/$ each issue exactly the D4 table's own modify() calls; w/e/b issue none (2026-10-01)", () => {
     const text = document.createTextNode("hello");
     const cursor = textCaret(text, 2);
     const path = [cursor, textCaret(text, 3), textCaret(text, 4)];
@@ -124,13 +97,13 @@ describe("visual.ts: whitespace and the D4 word table", () => {
     runMotion(l, cursor, "l", null);
     expect(l.calls).toEqual(["move forward character"]);
 
-    const e = fakeSelection(path);
-    runMotion(e, cursor, "e", null);
-    expect(e.calls).toEqual(["move forward character", "move forward word", "move backward character"]);
-
-    const b = fakeSelection(path);
-    runMotion(b, cursor, "b", null);
-    expect(b.calls).toEqual(["move backward word"]);
+    // w/e/b follow vim's own word rules over the DOM text (2026-10-01), never WebKit's `word`
+    // granularity, whose boundaries are not vim's (`has_flag` is one ICU word, `=`/`|` none).
+    for (const motion of ["w", "e", "b"] as const) {
+      const sel = fakeSelection(path);
+      runMotion(sel, cursor, motion, null);
+      expect(sel.calls, motion).toEqual([]);
+    }
 
     const zero = fakeSelection(path);
     runMotion(zero, cursor, "0", null);
@@ -821,5 +794,267 @@ describe("visual.ts: revealCaret, D8's least scroll (fix round 2)", () => {
     } finally {
       restore();
     }
+  });
+});
+
+/* CARET/VISUAL `w`/`e`/`b` follow vim's own word rules over the DOM text (2026-10-01). The owner,
+   on the real panel, in a code block showing the line below: the first `w` landed before `has`,
+   the second did not move -- WebKit's `Selection.modify(..., "word")` steps, composed, returned to
+   their start. Every expected sequence here is nvim's own, measured headless (`nvim --headless
+   --clean`, a `normal! w`/`e`/`b` loop printing the cursor until it stops moving) on the same text,
+   written in nvim's own `line:byte-col` form and converted to this DOM's UTF-16 offsets. */
+describe("visual.ts: w/e/b follow vim's word rules (2026-10-01)", () => {
+  /** A `.message-list` holding `html`, the shape every caller's `root` has. */
+  function listOf(html: string): HTMLElement {
+    const root = document.createElement("div");
+    root.className = "message-list";
+    root.innerHTML = html;
+    return root;
+  }
+
+  /** `caret`'s offset in `root`'s whole text (every text node before it, in document order). */
+  function globalOffset(root: Element, caret: Caret): number {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let total = 0;
+    for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+      if (node === caret.node) return total + caret.offset;
+      total += (node as Text).data.length;
+    }
+    throw new Error("caret not inside root");
+  }
+
+  /** The caret at global offset `at` of `root`'s text. */
+  function caretAt(root: Element, at: number): Caret {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let total = 0;
+    for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+      const length = (node as Text).data.length;
+      if (at < total + length) return { node, offset: at - total };
+      total += length;
+    }
+    throw new Error(`offset ${at} past root's text`);
+  }
+
+  /** nvim's `line:byte-col` positions, over `lines` joined by `separator` (`""` where the lines are
+   *  separate blocks with no text between them, `"\n"` inside one `<pre>`), as UTF-16 offsets. */
+  function fromVim(lines: string[], separator: string, positions: string): number[] {
+    const bytes = new TextEncoder();
+    return positions.split(" ").map((position) => {
+      const [line, col] = position.split(":").map(Number) as [number, number];
+      const text = lines[line - 1]!;
+      let units = 0;
+      while (bytes.encode(text.slice(0, units)).length < col) units++;
+      return lines.slice(0, line - 1).reduce((sum, l) => sum + l.length + separator.length, 0) + units;
+    });
+  }
+
+  /** Every landing of `motion` from offset `from` of `within`'s text (the whole list by default; the
+   *  `<code>` where a row sign precedes it), one `stepOnce` at a time in CARET, until a step makes no
+   *  progress (the same stop `repeatMotion` uses). The walk's own bound is always the whole list. */
+  function landings(root: Element, from: number, motion: "w" | "e" | "b", within: Element = root): number[] {
+    let model: VisualModel = { anchor: caretAt(within, from), cursor: caretAt(within, from), kind: "caret", goalX: null };
+    const seen: number[] = [];
+    for (let i = 0; i < 60; i++) {
+      const step = stepOnce(fakeSelection([model.cursor]), model, motion, root);
+      if (!step.moved) break;
+      model = step.model;
+      expect(model.anchor).toEqual(model.cursor); // CARET moves both ends (D5)
+      seen.push(globalOffset(within, model.cursor));
+    }
+    return seen;
+  }
+
+  const OWNER_LINE = "let has_flag = |flag: &str| flag_given(..., flag);";
+  // As highlight.js renders it inside a fenced code block: the keyword and the type in spans.
+  const OWNER_HTML =
+    '<div class="row"><span class="row-sign" aria-hidden="true">›</span><div class="row-body">' +
+    '<pre><code class="hljs language-rust"><span class="hljs-keyword">let</span> has_flag = |flag: &amp;' +
+    '<span class="hljs-type">str</span>| flag_given(..., flag);</code></pre></div></div>';
+
+  const code = (root: Element) => root.querySelector("code")!;
+
+  it("the owner's line: w from `let` visits every vim word, then clamps on the last character", () => {
+    const root = listOf(OWNER_HTML);
+    expect(root.querySelector("code")?.textContent).toBe(OWNER_LINE);
+    expect(landings(root, 0, "w", code(root))).toEqual(fromVim([OWNER_LINE], "", "1:4 1:13 1:15 1:16 1:20 1:22 1:23 1:26 1:28 1:38 1:44 1:48 1:49"));
+  });
+
+  it("the owner's line: e from `let` lands on every vim word's last character", () => {
+    const root = listOf(OWNER_HTML);
+    expect(landings(root, 0, "e", code(root))).toEqual(fromVim([OWNER_LINE], "", "1:2 1:11 1:13 1:15 1:19 1:20 1:22 1:25 1:26 1:37 1:42 1:47 1:49"));
+  });
+
+  it("the owner's line: b from the last character walks back to `let`", () => {
+    const root = listOf(OWNER_HTML);
+    expect(landings(root, OWNER_LINE.length - 1, "b", code(root))).toEqual(
+      fromVim([OWNER_LINE], "", "1:48 1:44 1:38 1:28 1:26 1:23 1:22 1:20 1:16 1:15 1:13 1:4 1:0"),
+    );
+  });
+
+  it("across two paragraphs, the block boundary separates words like a line break", () => {
+    const lines = ["alpha beta", "gamma delta"];
+    const root = listOf("<p>alpha beta</p><p>gamma delta</p>");
+    expect(landings(root, 0, "w")).toEqual(fromVim(lines, "", "1:6 2:0 2:6 2:10"));
+    expect(landings(root, 0, "e")).toEqual(fromVim(lines, "", "1:4 1:9 2:4 2:10"));
+    expect(landings(root, 20, "b")).toEqual(fromVim(lines, "", "2:6 2:0 1:6 1:0"));
+  });
+
+  it("across a code block's two lines", () => {
+    const lines = ["alpha beta", "gamma delta"];
+    const root = listOf("<pre><code>alpha beta\ngamma delta</code></pre>");
+    expect(landings(root, 0, "w")).toEqual(fromVim(lines, "\n", "1:6 2:0 2:6 2:10"));
+    expect(landings(root, 0, "e")).toEqual(fromVim(lines, "\n", "1:4 1:9 2:4 2:10"));
+    expect(landings(root, 21, "b")).toEqual(fromVim(lines, "\n", "2:6 2:0 1:6 1:0"));
+  });
+
+  it("non-ASCII letters are keyword characters; CJK ideographs are their own class, as in vim", () => {
+    const line = "café naïve 中文x  über_1";
+    const root = listOf(`<p>${line}</p>`);
+    expect(landings(root, 0, "w")).toEqual(fromVim([line], "", "1:6 1:13 1:19 1:22 1:28"));
+    expect(landings(root, 0, "e")).toEqual(fromVim([line], "", "1:3 1:11 1:16 1:19 1:28"));
+    // vim's own b reaches 1:0 too; here 1:0 is the start of the text, which it lands on.
+    expect(landings(root, line.length - 1, "b")).toEqual(fromVim([line], "", "1:22 1:19 1:13 1:6 1:0"));
+  });
+
+  it("Chinese: a run of hanzi is one word, split by fullwidth punctuation and from Latin letters", () => {
+    const line = "这是一段中文，用来记录 ICU 分词的实际结果。";
+    const root = listOf(`<p>${line}</p>`);
+    expect(landings(root, 0, "w")).toEqual(fromVim([line], "", "1:18 1:21 1:34 1:38 1:59"));
+    expect(landings(root, 0, "e")).toEqual(fromVim([line], "", "1:15 1:18 1:30 1:36 1:56 1:59"));
+  });
+
+  it("a combining mark belongs to its base character: never a word break, never a landing", () => {
+    const root = listOf("<p>café x́y z</p>");
+    expect(landings(root, 0, "w")).toEqual([6, 10]);
+    expect(landings(root, 0, "e")).toEqual([3, 8, 10]);
+  });
+
+  it("from whitespace, w and e go to the next word; b with no word before stays put", () => {
+    const line = "  lead  word";
+    const root = listOf(`<pre><code>${line}</code></pre>`);
+    expect(landings(root, 0, "w")).toEqual(fromVim([line], "", "1:2 1:8 1:11"));
+    expect(landings(root, 0, "e")).toEqual(fromVim([line], "", "1:5 1:11"));
+    // vim's b from 1:2 goes on to 1:0, a blank; this panel never lands a caret on one.
+    expect(landings(root, line.length - 1, "b")).toEqual(fromVim([line], "", "1:8 1:2"));
+  });
+
+  it("the last word: w and e clamp on the list's last character, then stop", () => {
+    const root = listOf("<p>one two</p>");
+    expect(landings(root, 4, "w")).toEqual([6]); // vim: w from the last word reaches its end
+    expect(landings(root, 6, "w")).toEqual([]);
+    expect(landings(root, 6, "e")).toEqual([]);
+    expect(landings(root, 0, "b")).toEqual([]);
+  });
+
+  it("a highlight span inside a word does not split it; chrome and rows separate words", () => {
+    const root = listOf(
+      '<div class="row"><span class="row-sign" aria-hidden="true">›</span><div class="row-body">' +
+        '<pre><code><span class="hljs-title">flag</span>_given(x)</code></pre></div></div>' +
+        '<div class="row"><span class="row-sign" aria-hidden="true">›</span><div class="row-body">' +
+        "<p>see <code>foo</code>bar<button>Copy</button>baz</p></div></div>",
+    );
+    const text = root.textContent ?? "";
+    const at = (s: string) => text.indexOf(s);
+    expect(landings(root, at("flag"), "w")).toEqual([at("(x)"), at("x)"), at(")"), at("see"), at("foobar"), at("baz"), at("baz") + 2]);
+    expect(landings(root, at("baz") + 2, "b")).toEqual([at("baz"), at("foobar"), at("see"), at(")"), at("x)"), at("(x)"), at("flag")]);
+  });
+
+  it("a caret at an element boundary or a text node's end walks from the next character", () => {
+    const root = listOf("<p>one</p><p>two three</p>");
+    const [first, second] = Array.from(root.querySelectorAll("p"));
+    const fromElement = runMotion(fakeSelection([{ node: second!, offset: 0 }]), { node: second!, offset: 0 }, "w", null, root);
+    expect(fromElement.caret).toEqual({ node: second!.firstChild, offset: 4 });
+    const fromEnd = runMotion(fakeSelection([{ node: first!.firstChild!, offset: 3 }]), { node: first!.firstChild!, offset: 3 }, "e", null, root);
+    expect(fromEnd.caret).toEqual({ node: second!.firstChild, offset: 2 });
+    const back = runMotion(fakeSelection([{ node: second!, offset: 0 }]), { node: second!, offset: 0 }, "b", null, root);
+    expect(back.caret).toEqual({ node: first!.firstChild, offset: 0 });
+  });
+
+  it("text that is not rendered is never walked: a hidden span, a closed details' body", () => {
+    const hidden = listOf("<p>one <span hidden>SECRET</span> two</p>");
+    const text = hidden.textContent ?? "";
+    expect(landings(hidden, 0, "w")).toEqual([text.indexOf("two"), text.indexOf("two") + 2]);
+    expect(landings(hidden, text.indexOf("two"), "b")).toEqual([0]);
+    expect(landings(hidden, 0, "e")).toEqual([2, text.indexOf("two") + 2]);
+
+    const details = listOf("<details><summary>sum</summary><p>body</p></details><p>after</p>");
+    const all = details.textContent ?? "";
+    expect(landings(details, 0, "w")).toEqual([all.indexOf("after"), all.indexOf("after") + 4]);
+    expect(landings(details, all.indexOf("after"), "b")).toEqual([0]);
+    // An open one is walked.
+    const open = listOf("<details open><summary>sum</summary><p>body</p></details>");
+    expect(landings(open, 0, "w")).toEqual([3, 6]);
+    // G and the end clamp agree: the last rendered character, never hidden text after it.
+    const tail = listOf('<p>shown</p><p hidden>gone</p><details><summary>s</summary>body</details>');
+    expect((lastSelectableCaret(tail)?.node as Text).data).toBe("s");
+    expect(firstSelectableCaret(listOf("<p hidden>gone</p><p>here</p>"))?.node.textContent).toBe("here");
+  });
+
+  it("a combining mark split into the next text node by highlight.js stays with its base", () => {
+    const line = "fn café() {}";
+    // highlight.js's own rendering of that line as Rust: the title span ends before the accent.
+    const root = listOf(
+      '<pre><code class="hljs language-rust"><span class="hljs-keyword">fn</span> ' +
+        '<span class="hljs-title function_">cafe</span>́() {}</code></pre>',
+    );
+    expect(code(root).textContent).toBe(line);
+    expect(landings(root, 0, "w", code(root))).toEqual(fromVim([line], "", "1:3 1:9 1:12 1:13"));
+    expect(landings(root, 0, "e", code(root))).toEqual(fromVim([line], "", "1:1 1:6 1:10 1:13"));
+    expect(landings(root, line.length - 1, "b", code(root))).toEqual(fromVim([line], "", "1:12 1:9 1:3 1:0"));
+  });
+
+  it("an emoji grapheme is one character, and emoji are their own class, as in vim", () => {
+    const zwj = "foo \u{1F469}‍\u{1F4BB} bar";
+    const root = listOf(`<p>${zwj}</p>`);
+    expect(landings(root, 0, "w")).toEqual(fromVim([zwj], "", "1:4 1:16 1:18"));
+    expect(landings(root, 0, "e")).toEqual(fromVim([zwj], "", "1:2 1:4 1:18"));
+    expect(landings(root, zwj.length - 1, "b")).toEqual(fromVim([zwj], "", "1:16 1:4 1:0"));
+
+    const flags = "a!\u{1F600}b \u{1F1EF}\u{1F1F5}x";
+    const second = listOf(`<p>${flags}</p>`);
+    expect(landings(second, 0, "w")).toEqual(fromVim([flags], "", "1:1 1:2 1:6 1:8 1:16"));
+    expect(landings(second, 0, "e")).toEqual(fromVim([flags], "", "1:1 1:2 1:6 1:8 1:16"));
+  });
+
+  it("the grapheme fallback (no Intl.Segmenter) splits as Intl.Segmenter does on marks, ZWJ, skin tones and flags", () => {
+    const segmenter = new (Intl as unknown as { Segmenter: new (l?: string, o?: { granularity: string }) => { segment(s: string): Iterable<{ index: number }> } }).Segmenter(undefined, { granularity: "grapheme" });
+    for (const text of ["cafe\u0301 x", "foo \u{1F469}\u200D\u{1F4BB} bar", "\u{1F44D}\u{1F3FD}!", "\u{1F1EF}\u{1F1F5}\u{1F1FA}\u{1F1F8}x", "a\uFE0Fb"]) {
+      expect(fallbackGraphemeStarts(text), text).toEqual(Array.from(segmenter.segment(text), (s) => s.index));
+    }
+  });
+
+  it("kana words keep vim's own classes: the prolonged sound mark, the voicing mark, the middle dot", () => {
+    const line = "カーキ ひらがな゛ ア・イ x";
+    const root = listOf(`<p>${line}</p>`);
+    expect(landings(root, 0, "w")).toEqual(fromVim([line], "", "1:10 1:26 1:36"));
+    expect(landings(root, 0, "e")).toEqual(fromVim([line], "", "1:6 1:22 1:32 1:36"));
+  });
+
+  it("b moves from a caret before a trailing textless element", () => {
+    for (const html of ["<p>one<br></p>", "<p>one<span></span></p>"]) {
+      const root = listOf(html);
+      const p = root.querySelector("p")!;
+      const back = runMotion(fakeSelection([{ node: p, offset: 1 }]), { node: p, offset: 1 }, "b", null, root);
+      expect(back.caret, html).toEqual({ node: p.firstChild, offset: 0 });
+    }
+  });
+
+  it("a textless block or a rule between two pieces of text separates words", () => {
+    for (const html of ["<div>one<hr>two</div>", "<div>one<div></div>two</div>", "<div>one<p></p>two</div>"]) {
+      const root = listOf(html);
+      expect(landings(root, 0, "w"), html).toEqual([3, 5]);
+      expect(landings(root, 5, "b"), html).toEqual([3, 0]);
+    }
+  });
+
+  it("VISUAL extends only the cursor end, and a count repeats w", () => {
+    const root = listOf(OWNER_HTML);
+    const start = caretAt(code(root), 0);
+    const model: VisualModel = { anchor: start, cursor: start, kind: "char", goalX: null };
+    const after = repeatMotion(fakeSelection([start]), model, "w", 3, root);
+    expect(after.anchor).toEqual(start);
+    expect(globalOffset(code(root), after.cursor)).toBe(15); // let -> has_flag -> = -> |
+    const toEnd = repeatMotion(fakeSelection([start]), model, "w", 999, root);
+    expect(globalOffset(code(root), toEnd.cursor)).toBe(OWNER_LINE.length - 1);
   });
 });
