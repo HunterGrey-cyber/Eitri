@@ -70,10 +70,12 @@ setup_stubs() {
 	mkdir -p "$S/logs" "$S/stubs" "$S/stubs-root" "$S/stubs-tarfail" "$S/stubs-net" "$S/stubs-wget" \
 		"$S/stubs-mvlog" "$S/stubs-oldglibc" "$S/stubs-patheitri" "$S/stubs-mvfail" "$S/stubs-mvterm" \
 		"$S/stubs-probeuname" "$S/stubs-swapcat" "$S/stubs-swapsha" "$S/stubs-mvafterswap" \
-		"$S/stubs-cargo" "$S/stubs-cpswap" "$S/stubs-fakeowner" \
-		"$S/helpers"
+		"$S/stubs-cargo" "$S/stubs-cpswap" "$S/stubs-fakeowner" "$S/stubs-iccache-fail" \
+		"$S/stubs-iccache-writes" "$S/helpers"
 	for c in sudo apt apt-get dnf pacman zypper; do cp "$FIXTURES/forbidden" "$S/stubs/$c"; done
-	cp "$FIXTURES/claude" "$FIXTURES/nvim" "$S/stubs/"
+	cp "$FIXTURES/claude" "$FIXTURES/nvim" "$FIXTURES/gtk-update-icon-cache" "$S/stubs/"
+	cp "$FIXTURES/gtk-update-icon-cache-fails" "$S/stubs-iccache-fail/gtk-update-icon-cache"
+	cp "$FIXTURES/gtk-update-icon-cache-writes" "$S/stubs-iccache-writes/gtk-update-icon-cache"
 	cp "$FIXTURES/id-root" "$S/stubs-root/id"
 	cp "$FIXTURES/tar-fail" "$S/stubs-tarfail/tar"
 	cp "$FIXTURES/curl-mirror" "$S/stubs-net/curl"
@@ -101,7 +103,7 @@ setup_stubs() {
 	chmod 0755 "$S"/stubs*/* "$S"/helpers/*
 	# A PATH tail without one tool: every entry of /usr/bin (and /bin when it is its own directory)
 	# linked, except the one left out. /usr/bin cannot be on such a PATH, since it holds the tool.
-	for tool in ssh-keygen curl cargo; do
+	for tool in ssh-keygen curl cargo gtk-update-icon-cache; do
 		d=$S/path-no-$tool
 		mkdir -p "$d"
 		for src in /usr/bin /bin; do
@@ -153,6 +155,26 @@ setup_keys() {
 		echo "harness: the keyed installer is not the unkeyed installer plus one key line" >&2
 		exit 2
 	fi
+}
+
+# setup_old_installer prepares fixtures/install-0.2.0.sh, the installer shipped in
+# 0.2.0. test_install.py pins its hash. Remove embedded signing keys, as for INSTALLER,
+# so signature checks use the test key. Run it through INSTALLER_UNDER_TEST to test
+# upgrading with a saved installer, using only fixture releases and scratch homes.
+setup_old_installer() {
+	awk '
+		/^[[:space:]]*cat <<.EITRI_RELEASE_SIGNERS.$/ { inside = 1; print; next }
+		/^EITRI_RELEASE_SIGNERS$/ { inside = 0 }
+		inside && /^[[:space:]]*[^#[:space:]]/ { next }
+		{ print }' "$FIXTURES/install-0.2.0.sh" >"$S/unkeyed/install-0.2.0.sh"
+	chmod 0755 "$S/unkeyed/install-0.2.0.sh"
+	_so_added=$(diff "$FIXTURES/install-0.2.0.sh" "$S/unkeyed/install-0.2.0.sh" | grep -c '^>')
+	if [ "$_so_added" != 0 ] ||
+		diff "$FIXTURES/install-0.2.0.sh" "$S/unkeyed/install-0.2.0.sh" | grep '^<' | grep -v -E '^< [^#[:space:]]' >/dev/null; then
+		echo "harness: the unkeyed 0.2.0 installer is not install-0.2.0.sh minus key lines" >&2
+		exit 2
+	fi
+	OLD_INSTALLER=$S/unkeyed/install-0.2.0.sh
 }
 
 setup_libs() {
@@ -268,8 +290,8 @@ mk_verdandi_source() {
 	MVS_SHA256=$(sha256sum <"$2" | cut -d' ' -f1)
 }
 
-# mk_release VERSION REV creates $S/fix/v$VERSION from stub binaries, the real launcher
-# and desktop file, the installer, a fixture sidecar source asset and shared runtime pins.
+# mk_release VERSION REV creates $S/fix/v$VERSION from stub binaries, the real launcher,
+# desktop file and icons, the installer, a fixture sidecar source asset and shared runtime pins.
 # Each fixture's RELEASE then has the inputs needed to attempt a sidecar build.
 mk_release() {
 	v=$1
@@ -278,7 +300,7 @@ mk_release() {
 	top=eitri-$v-x86_64-linux
 	b=$S/fix/build-$v/$top
 	rm -rf "$S/fix/build-$v" "$S/fix/v$v"
-	mkdir -p "$b/bin" "$b/lib/eitri" "$b/share/applications" "$b/share/licenses/eitri" "$S/fix/v$v"
+	mkdir -p "$b/bin" "$b/lib/eitri" "$b/share/applications" "$b/share/icons" "$b/share/licenses/eitri" "$S/fix/v$v"
 	cp "$PKG/eitri.launcher.sh" "$b/bin/eitri"
 	chmod 0755 "$b/bin/eitri"
 	for bin in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff; do
@@ -306,7 +328,12 @@ mk_release() {
 		echo "NVIM_SHA256_linux_x86_64=$NVIM_FIXTURE_SHA256"
 		echo "GTK_FLOOR=4.14"
 	} >"$b/lib/eitri/RELEASE"
-	cp "$PKG/eitri.desktop" "$b/share/applications/eitri.desktop"
+	cp "$PKG/cn.huntergrey.eitri.desktop" "$b/share/applications/cn.huntergrey.eitri.desktop"
+	# 0.2.0's own entry, as release.sh also puts it in the tarball (packaging/legacy/README.md): read only
+	# by 0.2.0's installer. Every test below that installs one of these releases with this installer
+	# therefore also holds that this installer never installs it.
+	cp "$PKG/legacy/eitri.desktop" "$b/share/applications/eitri.desktop"
+	cp -R "$PKG/icons/hicolor" "$b/share/icons/hicolor"
 	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do
 		echo "$f for $v" >"$b/share/licenses/eitri/$f"
 	done
@@ -501,10 +528,10 @@ snap_but_lock() {
 }
 
 # snap_but_staging DIR: snap, except directory mtimes changed by staging or a failed install.
-# This includes .local/lib, the launcher, desktop entry and licence staging directories, and
-# .local itself when unpack_new first creates .local/lib. File metadata and contents remain checked.
+# This includes .local/lib, the launcher, desktop entry, icon and licence staging directories,
+# and .local itself when unpack_new first creates .local/lib. File metadata and contents remain checked.
 snap_but_staging() {
-	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/eitri))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
+	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/eitri|share/icons(/hicolor(/[^/]+(/apps)?)?)?))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
 }
 
 # tree DIR: names and types only, excluding the planted editors.
@@ -573,6 +600,7 @@ TESTS=
 . "$HERE/test_nvim.sh"
 . "$HERE/test_from_source.sh"
 . "$HERE/test_apparmor.sh"
+. "$HERE/test_icon.sh"
 
 # The scratch must be new: only the fixture server's own files may already be there.
 for e in "$S"/* "$S"/.[!.]*; do
@@ -592,6 +620,7 @@ trap 'exit 130' INT TERM
 printf '# installer shell: %s (%s)\n' "$NV_SH" "$(readlink -f "$(command -v "$NV_SH")")"
 setup_stubs
 setup_keys
+setup_old_installer
 setup_libs
 setup_sidecar_fixtures
 setup_skia_fixture
@@ -609,7 +638,7 @@ for t in $TESTS; do
 	N=$((N + 1))
 	T=$S/t/$t
 	mkdir -p "$T/cwd"
-	for l in forbidden claude curl wget mv swap cargo swap-verdandi; do : >"$S/logs/$l.log"; done
+	for l in forbidden claude curl wget mv swap cargo swap-verdandi icon-cache; do : >"$S/logs/$l.log"; done
 	rm -f "$S/logs/swap" "$S/logs/swap-verdandi" "$S/logs/fake-owner-path"
 	(
 		FAILS=0

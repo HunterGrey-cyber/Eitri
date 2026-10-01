@@ -120,7 +120,7 @@ Download `eitri_<version>_amd64.deb` or `eitri-<version>-1.x86_64.rpm` from the
 manager: `sudo apt install ./eitri_<version>_amd64.deb`, or `sudo dnf install
 ./eitri-<version>-1.x86_64.rpm` (the `.rpm` command has been run for real, against `rc.1`'s own
 package, on a Fedora 44 VM). Neither package runs a maintainer script: it only unpacks the four binaries, the launcher,
-the desktop entry and the licences (see [Where things go](#where-things-go)) — building the sidecar as
+the desktop entry, the icon and the licences (see [Where things go](#where-things-go)) — building the sidecar as
 root would run every one of `npm ci`'s dependency install scripts as root, so nothing here does that.
 Neither package declares a hard dependency on a distro `neovim` (the `.deb` has none at all; the
 `.rpm` gets a soft `Recommends`): Ubuntu's own `neovim` is too old to meet the ≥ 0.10 floor, so
@@ -193,6 +193,24 @@ install, but a new tab or the agent handoff needs the new one. A `.deb`/`.rpm` u
 manager's own job; run `eitri setup` again afterwards only if the pinned sidecar revision changed
 (it is a no-op if the one already built for the current revision is still present).
 
+Eitri has an icon from 0.2.1 on, and its desktop entry is named after its application id,
+`cn.huntergrey.eitri.desktop` (it was `eitri.desktop`), which is how the desktop matches the window to
+its launcher. Updating over an older release removes the old entry — the tarball route's installer
+does it, and only when the file is byte for byte the one 0.2.0's installer wrote (an entry you edited
+stays, and is named); a package upgrade does it by no longer listing the file — so **if you had pinned
+Eitri to the dash or the dock, pin it again once** after updating.
+
+If you saved 0.2.0's `install.sh` and rerun *that* to upgrade, it still works: the release tarball also
+carries 0.2.0's own desktop entry as `share/applications/eitri.desktop`, which that installer insists on
+(this release's installer ignores it, and no package installs it). That old installer cannot lay out the
+icon, so you keep 0.2.0's entry and no icon until you run this release's `install.sh` once more, which
+replaces the old entry and installs the new entry and the icon files. Going the other way, back to 0.2.0
+from this release, is `eitri setup --uninstall` first — it removes the program, the launcher, the
+desktop entries and icons, the licences, the private nvim and the sidecars, and keeps `~/.config/eitri`
+and `$XDG_STATE_HOME/eitri` — and then 0.2.0's own `install.sh`; this release's `install.sh --version 0.2.0`
+refuses, with those same steps, because installing 0.2.0 over it would leave the new entry and the icons
+beside the old entry.
+
 ## Uninstalling
 
 ```sh
@@ -202,7 +220,10 @@ sh install.sh --uninstall --purge    # also remove ~/.config/eitri and $XDG_STAT
 
 This removes `~/.local/lib/eitri`, the `~/.local/bin/eitri` launcher (only if it carries
 Eitri's own marker line — an unrelated file of the same name is left alone and named), the desktop
-entry and licences, `$XDG_DATA_HOME/eitri/nvim` (a private nvim copy), the download cache, and every
+entry (and 0.2.0's `eitri.desktop`, only when it is byte for byte what 0.2.0's installer wrote), exactly
+the nine icon files listed under [Where things go](#where-things-go) (a file of your own in your icon
+theme directory stays, even one named like Eitri's in a size Eitri does not install) and licences,
+`$XDG_DATA_HOME/eitri/nvim` (a private nvim copy), the download cache, and every
 sidecar revision except the one an installed `.deb`/`.rpm` still names in its `/usr/lib/eitri/RELEASE`
 — so uninstalling a tarball install never takes a package install's sidecar with it. It always keeps
 `~/.config/eitri` (your `init.lua`) and `$XDG_STATE_HOME/eitri` (per-project layout, prompt
@@ -224,18 +245,20 @@ a sidecar revision once no install uses it, as [Updating](#updating) describes.
 ## Where things go
 
 ```
-~/.local/lib/eitri/                          the four binaries, eitri-setup, RELEASE         (tarball route)
-~/.local/bin/eitri                           the launcher, marked `# eitri-launcher v1`      (tarball route)
-~/.local/share/applications/eitri.desktop    Exec = the launcher's absolute path             (tarball route)
-~/.local/share/licenses/eitri/               LICENSE, THIRD-PARTY-LICENSES, SOURCE           (tarball route)
-/usr/lib/eitri/                              the same four binaries, eitri-setup, RELEASE    (.deb/.rpm)
-/usr/bin/eitri                               the same launcher                               (.deb/.rpm)
-/usr/share/applications/eitri.desktop                                                        (.deb/.rpm)
-/usr/share/licenses/eitri/                                                                   (.deb/.rpm)
-$XDG_DATA_HOME/eitri/sidecar/<rev>/          the sidecar eitri setup built, per-user routes
-$XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/           a private nvim copy, only if you accepted the offer
-~/.config/eitri/init.lua                     your own config (EITRI_CONFIG_DIR overrides the dir)
-$XDG_STATE_HOME/eitri/                       per-project layout, prompt history, permission rules
+~/.local/lib/eitri/                                              the four binaries, eitri-setup, RELEASE         (tarball route)
+~/.local/bin/eitri                                               the launcher, marked `# eitri-launcher v1`      (tarball route)
+~/.local/share/applications/cn.huntergrey.eitri.desktop          Exec = the launcher's absolute path             (tarball route)
+~/.local/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png the icon, 16 to 512 px, and scalable/…/….svg    (tarball route)
+~/.local/share/licenses/eitri/                                   LICENSE, THIRD-PARTY-LICENSES, SOURCE           (tarball route)
+/usr/lib/eitri/                                                  the same four binaries, eitri-setup, RELEASE    (.deb/.rpm)
+/usr/bin/eitri                                                   the same launcher                               (.deb/.rpm)
+/usr/share/applications/cn.huntergrey.eitri.desktop                                                              (.deb/.rpm)
+/usr/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png     the same icon files                             (.deb/.rpm)
+/usr/share/licenses/eitri/                                                                                       (.deb/.rpm)
+$XDG_DATA_HOME/eitri/sidecar/<rev>/                              the sidecar eitri setup built, per-user routes
+$XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               a private nvim copy, only if you accepted the offer
+~/.config/eitri/init.lua                                         your own config (EITRI_CONFIG_DIR overrides the dir)
+$XDG_STATE_HOME/eitri/                                           per-project layout, prompt history, permission rules
 ```
 
 The sidecar row is per-user for every route above — **except AUR** (`eitri-bin`/`eitri-git`),

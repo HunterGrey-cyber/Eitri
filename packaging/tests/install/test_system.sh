@@ -50,7 +50,7 @@ t_relative_xdg_data() {
 	use_home "$T/home2"
 	inst_net --set "XDG_DATA_HOME=$T/home2/xdg data" --
 	expect_rc 0
-	expect_file "$T/home2/xdg data/applications/eitri.desktop"
+	expect_file "$T/home2/xdg data/applications/cn.huntergrey.eitri.desktop"
 	expect_file "$T/home2/xdg data/licenses/eitri/LICENSE"
 	expect_absent "$T/home2/.local/share"
 }

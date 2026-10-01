@@ -1,0 +1,13 @@
+#!/bin/sh
+# gtk-update-icon-cache that writes its cache, as the real one does: <dir>/icon-theme.cache, <dir>
+# being the last argument. Records its argv in <scratch>/logs/icon-cache.log.
+S=$(cd "$(dirname "$0")/.." && pwd)
+last=
+for a do last=$a; done
+{
+	printf 'gtk-update-icon-cache'
+	printf ' %s' "$@"
+	printf '\n'
+} >>"$S/logs/icon-cache.log"
+printf 'cache of %s\n' "$last" >"$last/icon-theme.cache"
+exit 0

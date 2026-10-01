@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test double for gtk-update-icon-cache: the host's real one must not run from an installer test (it
+# writes icon-theme.cache, which would make the expected tree depend on whether the tool is installed).
+# Records its argv in <scratch>/logs/icon-cache.log and writes nothing.
+S=$(cd "$(dirname "$0")/.." && pwd)
+{
+	printf 'gtk-update-icon-cache'
+	printf ' %s' "$@"
+	printf '\n'
+} >>"$S/logs/icon-cache.log"
+exit 0

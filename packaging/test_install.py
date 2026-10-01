@@ -11,6 +11,7 @@ per-run directory matters: two runs from different worktrees at once used to sha
 and each one's fresh_scratch() deleted the other's stubs mid-run (run-in-env.sh then refused, rightly).
 """
 
+import hashlib
 import os
 import pathlib
 import re
@@ -76,11 +77,25 @@ def test_installer_shellcheck_clean():
     assert proc.returncode == 0, report(proc)
 
 
+def test_the_0_2_0_installer_fixture_is_the_file_0_2_0_shipped():
+    """fixtures/install-0.2.0.sh is what the harness runs as 0.2.0's own installer (a user who saved it
+    reruns it to upgrade, INSTALL.md): packaging/install.sh at main 4ce433a0, the tree 0.2.0 is cut from.
+    Pinned by hash, and against the commit itself where this checkout still has it."""
+    fixture = TESTS / "fixtures" / "install-0.2.0.sh"
+    assert hashlib.sha256(fixture.read_bytes()).hexdigest() == (
+        "1730da3265672918b14cc79a0ee9dd7ee44903ca28aab1624265a44dd8b82013"
+    )
+    show = subprocess.run(["git", "-C", str(HERE), "show", "4ce433a0:packaging/install.sh"], capture_output=True)
+    if show.returncode == 0:
+        assert show.stdout == fixture.read_bytes()
+
+
 def test_harness_shellcheck_clean():
     if shutil.which("shellcheck") is None:
         pytest.skip("shellcheck is not installed")
     files = [str(p) for p in sorted(TESTS.glob("*.sh"))]
-    files += [str(p) for p in sorted((TESTS / "fixtures").iterdir()) if p.name != "old-install-sh-launcher"]
+    files += [str(p) for p in sorted((TESTS / "fixtures").iterdir())
+              if p.name not in ("old-install-sh-launcher", "install-0.2.0.sh")]
     proc = subprocess.run(["shellcheck", "-s", "sh", "-x", *files], capture_output=True, text=True, cwd=TESTS)
     assert proc.returncode == 0, report(proc)
 
@@ -255,7 +270,7 @@ def test_desktop_exec_parses_back_with_glib():
     assert proc.returncode == 0, report(proc)
     t = scratch / "t" / "t_desktop_exec_all_specials"
     home = (t / "home-path").read_text().rstrip("\n")
-    desktop = pathlib.Path(home) / ".local/share/applications/eitri.desktop"
+    desktop = pathlib.Path(home) / ".local/share/applications/cn.huntergrey.eitri.desktop"
     keyfile = GLib.KeyFile()
     keyfile.load_from_file(str(desktop), GLib.KeyFileFlags.NONE)
     ok, argv = GLib.shell_parse_argv(keyfile.get_string("Desktop Entry", "Exec"))

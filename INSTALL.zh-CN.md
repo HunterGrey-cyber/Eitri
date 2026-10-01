@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=bc9acd5e65c9808654165dfa38b4befeddd293b213db449f753f4c822af5c233 -->
+<!-- translated-from: INSTALL.md sha256=b334d94c6e4e533a9dd2ad679aba76e72a6f99dd0458faf4895fec9d53a1bc36 -->
 
 # 安装 Eitri
 
@@ -71,7 +71,7 @@ sh install.sh
 
 ## `.deb` / `.rpm`，然后 `eitri setup`
 
-从[发布页面](https://github.com/HunterGrey-cyber/eitri/releases)下载 `eitri_<version>_amd64.deb` 或 `eitri-<version>-1.x86_64.rpm`，然后用你的包管理器安装：`sudo apt install ./eitri_<version>_amd64.deb`，或者 `sudo dnf install ./eitri-<version>-1.x86_64.rpm`（`.rpm` 这条命令已经在一台 Fedora 44 虚拟机上，针对 `rc.1` 自己的软件包实际跑过）。两种包都不会运行 maintainer script：它们只解包四个二进制文件、启动器、desktop 条目和许可证（见[文件都装到哪里去了](#where-things-go)）——如果以 root 身份构建 sidecar，会让 `npm ci` 的每一个依赖安装脚本都以 root 身份运行，所以这里完全不这么做。两种包都没有对发行版自带的 `neovim` 声明硬依赖（`.deb` 完全没有依赖；`.rpm` 只有一个软性的 `Recommends`）：Ubuntu 自带的 `neovim` 太旧，达不到 ≥ 0.10 这条底线，如果依赖它，反而会解析、安装成功，却在第一次启动时才失败，还给不出有用的错误信息。
+从[发布页面](https://github.com/HunterGrey-cyber/eitri/releases)下载 `eitri_<version>_amd64.deb` 或 `eitri-<version>-1.x86_64.rpm`，然后用你的包管理器安装：`sudo apt install ./eitri_<version>_amd64.deb`，或者 `sudo dnf install ./eitri-<version>-1.x86_64.rpm`（`.rpm` 这条命令已经在一台 Fedora 44 虚拟机上，针对 `rc.1` 自己的软件包实际跑过）。两种包都不会运行 maintainer script：它们只解包四个二进制文件、启动器、desktop 条目、图标和许可证（见[文件都装到哪里去了](#where-things-go)）——如果以 root 身份构建 sidecar，会让 `npm ci` 的每一个依赖安装脚本都以 root 身份运行，所以这里完全不这么做。两种包都没有对发行版自带的 `neovim` 声明硬依赖（`.deb` 完全没有依赖；`.rpm` 只有一个软性的 `Recommends`）：Ubuntu 自带的 `neovim` 太旧，达不到 ≥ 0.10 这条底线，如果依赖它，反而会解析、安装成功，却在第一次启动时才失败，还给不出有用的错误信息。
 
 然后，以你自己的用户身份，运行一次：
 
@@ -111,6 +111,10 @@ sh install.sh --from-source
 
 重新走一遍你当初用的那条安装路径就行。`sh install.sh`（不带 `--version`）会把你装好的版本和 sidecar revision 拿去和最新发行版比较：如果两者都已经是最新的，它会打印 "up to date" 然后什么都不动就退出。否则它会解包新版本，并且**在切换任何东西之前先把新版本的 sidecar 构建好**，这样一次失败的构建不会动到旧的安装；只有构建成功之后，才会原子性地把两者互换。你之前那个 sidecar revision 会被保留，而不是删掉——这样即便新的那个后来出了问题，这次切换也是可以信赖的；它（连同这台机器上任何一个不再被任何安装引用的 revision）要等到*下一次*更新时才会被移除。之后要重启已经打开的 Eitri 窗口——它们会继续用旧的安装跑下去，但新开的标签页或 agent 交接需要新版本才行。`.deb`/`.rpm` 的升级是你的包管理器自己的事；只有在锁定的 sidecar revision 变了的时候，才需要之后再运行一次 `eitri setup`（如果当前 revision 已经构建好了，这一步就是空操作）。
 
+从 0.2.1 起 Eitri 有了图标，它的 desktop 条目也改用应用 id 命名，叫 `cn.huntergrey.eitri.desktop`（原来是 `eitri.desktop`）；桌面环境正是靠这个名字把窗口和它的启动器对上。在旧版本上更新时会移除旧条目——tarball 方式由安装脚本来做，而且只有当那个文件与 0.2.0 的安装脚本写下的逐字节一致时才会删（你改过的条目会保留，并被指出来），软件包升级则是因为新包不再列出那个文件——所以**如果你之前把 Eitri 固定在了 dash 或 dock 上，更新之后需要重新固定一次**。
+
+如果你存了一份 0.2.0 的 `install.sh`，并且重新运行*它*来升级，也是可以的：发行版的 tarball 里仍然带着 0.2.0 自己的 desktop 条目，路径是 `share/applications/eitri.desktop`，那个安装脚本要求它必须存在（这个发行版的安装脚本会忽略它，也没有任何软件包会安装它）。那个旧安装脚本铺不出图标，所以在你再运行一次这个发行版的 `install.sh` 之前，你得到的是 0.2.0 的条目、没有图标；再运行一次会替换掉旧条目，并装上新条目和图标文件。反方向，也就是从这个发行版退回 0.2.0，要先运行 `eitri setup --uninstall`——它会删除程序、启动器、desktop 条目和图标、许可证、私有 nvim 和 sidecar，保留 `~/.config/eitri` 和 `$XDG_STATE_HOME/eitri`——然后再运行 0.2.0 自己的 `install.sh`；这个发行版的 `install.sh --version 0.2.0` 会拒绝，并给出同样的步骤，因为在它上面再装 0.2.0，会让新条目和图标与旧条目并存。
+
 ## 卸载
 
 ```sh
@@ -118,24 +122,26 @@ sh install.sh --uninstall            # 保留 ~/.config/eitri 和各项目自己
 sh install.sh --uninstall --purge    # 同时删除 ~/.config/eitri 和 $XDG_STATE_HOME/eitri
 ```
 
-这会删除 `~/.local/lib/eitri`、`~/.local/bin/eitri` 启动器（只有当它带着 Eitri 自己的标记行时才会删；同名但无关的文件会被原样保留并被指出来）、desktop 条目和许可证、`$XDG_DATA_HOME/eitri/nvim`（私有 nvim 副本）、下载缓存，以及除了某个已安装的 `.deb`/`.rpm` 在它的 `/usr/lib/eitri/RELEASE` 里仍然引用的那一个之外的所有 sidecar revision——所以卸载一份 tarball 安装，永远不会连带删掉软件包安装的 sidecar。除非你加上 `--purge`，否则它总是会保留 `~/.config/eitri`（你的 `init.lua`）和 `$XDG_STATE_HOME/eitri`（各项目的布局、提示词历史、已保存的权限规则）；`$XDG_DATA_HOME/eitri/nvim` 之外任何叫 `nvim`/`vim`/`vi` 的东西都不会被动到。对于 `.deb`/`.rpm` 安装，软件包本身从来不管那份按用户的 sidecar 或私有 nvim，所以移除软件包（`sudo apt remove eitri` / `sudo dnf remove eitri`）会把两者都留下——**而且清理它们的顺序很重要**。`eitri setup --uninstall` 对这种情况没用：`eitri setup` 就是 `/usr/lib/eitri/eitri-setup`，会随着 `/usr/bin/eitri` 一起被软件包删掉；而如果你在移除软件包*之前*运行它，它会保留下所有那些还在被这份已安装软件包自己的 `/usr/lib/eitri/RELEASE` 引用的 sidecar revision——这个文件正是它用来区分"某个已安装的 Eitri 还需要这个"和"没有谁需要它"的依据（同一份文件也决定了一次普通的[更新](#updating)）。所以：先用你的包管理器移除软件包，然后重新下载一份 `install.sh`（或者用你提前留好的一份副本），运行 `sh install.sh --uninstall`——软件包自己的 `RELEASE` 已经没了，这一次就没有什么能阻止它把 sidecar 和私有 nvim 一起删掉。这和上面是同一个 `--uninstall`，所以如果你在 `~/.local` 下还有一份 tarball 安装，它也会把那份安装连同它的 sidecar 一起删掉。想保留那份安装，就跳过这一步：它自己的更新会在某个 sidecar revision 不再被任何安装使用时把它删掉，见[更新](#updating)。
+这会删除 `~/.local/lib/eitri`、`~/.local/bin/eitri` 启动器（只有当它带着 Eitri 自己的标记行时才会删；同名但无关的文件会被原样保留并被指出来）、desktop 条目（以及 0.2.0 的 `eitri.desktop`，只有当它与 0.2.0 的安装脚本写下的逐字节一致时才删）、[文件都装到哪里去了](#where-things-go)里列出的那九个图标文件，一个不多（你图标主题目录里你自己的文件都保留，即使它的名字和 Eitri 的一样、尺寸又是 Eitri 不装的）和许可证、`$XDG_DATA_HOME/eitri/nvim`（私有 nvim 副本）、下载缓存，以及除了某个已安装的 `.deb`/`.rpm` 在它的 `/usr/lib/eitri/RELEASE` 里仍然引用的那一个之外的所有 sidecar revision——所以卸载一份 tarball 安装，永远不会连带删掉软件包安装的 sidecar。除非你加上 `--purge`，否则它总是会保留 `~/.config/eitri`（你的 `init.lua`）和 `$XDG_STATE_HOME/eitri`（各项目的布局、提示词历史、已保存的权限规则）；`$XDG_DATA_HOME/eitri/nvim` 之外任何叫 `nvim`/`vim`/`vi` 的东西都不会被动到。对于 `.deb`/`.rpm` 安装，软件包本身从来不管那份按用户的 sidecar 或私有 nvim，所以移除软件包（`sudo apt remove eitri` / `sudo dnf remove eitri`）会把两者都留下——**而且清理它们的顺序很重要**。`eitri setup --uninstall` 对这种情况没用：`eitri setup` 就是 `/usr/lib/eitri/eitri-setup`，会随着 `/usr/bin/eitri` 一起被软件包删掉；而如果你在移除软件包*之前*运行它，它会保留下所有那些还在被这份已安装软件包自己的 `/usr/lib/eitri/RELEASE` 引用的 sidecar revision——这个文件正是它用来区分"某个已安装的 Eitri 还需要这个"和"没有谁需要它"的依据（同一份文件也决定了一次普通的[更新](#updating)）。所以：先用你的包管理器移除软件包，然后重新下载一份 `install.sh`（或者用你提前留好的一份副本），运行 `sh install.sh --uninstall`——软件包自己的 `RELEASE` 已经没了，这一次就没有什么能阻止它把 sidecar 和私有 nvim 一起删掉。这和上面是同一个 `--uninstall`，所以如果你在 `~/.local` 下还有一份 tarball 安装，它也会把那份安装连同它的 sidecar 一起删掉。想保留那份安装，就跳过这一步：它自己的更新会在某个 sidecar revision 不再被任何安装使用时把它删掉，见[更新](#updating)。
 
 <a id="where-things-go"></a>
 ## 文件都装到哪里去了
 
 ```
-~/.local/lib/eitri/                          四个二进制文件、eitri-setup、RELEASE             (tarball 方式)
-~/.local/bin/eitri                           启动器，带有标记 `# eitri-launcher v1`           (tarball 方式)
-~/.local/share/applications/eitri.desktop    Exec = 启动器的绝对路径                          (tarball 方式)
-~/.local/share/licenses/eitri/               LICENSE、THIRD-PARTY-LICENSES、SOURCE            (tarball 方式)
-/usr/lib/eitri/                              同样的四个二进制文件、eitri-setup、RELEASE       (.deb/.rpm)
-/usr/bin/eitri                               同样的启动器                                     (.deb/.rpm)
-/usr/share/applications/eitri.desktop                                                         (.deb/.rpm)
-/usr/share/licenses/eitri/                                                                    (.deb/.rpm)
-$XDG_DATA_HOME/eitri/sidecar/<rev>/          eitri setup 构建出的 sidecar，按用户的各条路径
-$XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/           私有 nvim 副本，仅在你接受该提议时才有
-~/.config/eitri/init.lua                     你自己的配置（EITRI_CONFIG_DIR 可覆盖该目录）
-$XDG_STATE_HOME/eitri/                       各项目的布局、提示词历史、权限规则
+~/.local/lib/eitri/                                              四个二进制文件、eitri-setup、RELEASE             (tarball 方式)
+~/.local/bin/eitri                                               启动器，带有标记 `# eitri-launcher v1`           (tarball 方式)
+~/.local/share/applications/cn.huntergrey.eitri.desktop          Exec = 启动器的绝对路径                          (tarball 方式)
+~/.local/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png 图标，16 到 512 px，另有 scalable/…/….svg       (tarball 方式)
+~/.local/share/licenses/eitri/                                   LICENSE、THIRD-PARTY-LICENSES、SOURCE            (tarball 方式)
+/usr/lib/eitri/                                                  同样的四个二进制文件、eitri-setup、RELEASE       (.deb/.rpm)
+/usr/bin/eitri                                                   同样的启动器                                     (.deb/.rpm)
+/usr/share/applications/cn.huntergrey.eitri.desktop                                                               (.deb/.rpm)
+/usr/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png     同样的图标文件                                   (.deb/.rpm)
+/usr/share/licenses/eitri/                                                                                        (.deb/.rpm)
+$XDG_DATA_HOME/eitri/sidecar/<rev>/                              eitri setup 构建出的 sidecar，按用户的各条路径
+$XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               私有 nvim 副本，仅在你接受该提议时才有
+~/.config/eitri/init.lua                                         你自己的配置（EITRI_CONFIG_DIR 可覆盖该目录）
+$XDG_STATE_HOME/eitri/                                           各项目的布局、提示词历史、权限规则
 ```
 
 除了 **AUR**（`eitri-bin`/`eitri-git`）之外，上面这些安装路径的 sidecar 都是按用户的——AUR 的 `build()` 会把它构建在 `/usr/lib/eitri/` 里（见 [AUR](#aur-arch)）。

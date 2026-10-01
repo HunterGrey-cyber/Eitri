@@ -1,0 +1,11 @@
+#!/bin/sh
+# gtk-update-icon-cache that fails (a read-only or damaged theme directory): the installer must warn
+# and carry on. Records its argv in <scratch>/logs/icon-cache.log.
+S=$(cd "$(dirname "$0")/.." && pwd)
+{
+	printf 'gtk-update-icon-cache'
+	printf ' %s' "$@"
+	printf '\n'
+} >>"$S/logs/icon-cache.log"
+echo 'gtk-update-icon-cache: the stub is told to fail' >&2
+exit 1
