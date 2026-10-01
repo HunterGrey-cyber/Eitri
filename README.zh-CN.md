@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=4441ed568013cdae1f12c86fcef1eea7a2dea874e292da0da9fc56fa6d163b60 -->
+<!-- translated-from: README.md sha256=1e1d08a96d45507b2cb6b4c0e7c75ab9505a0a77da5b6a88bb8f419a45ca4ca4 -->
 
 # Eitri
 
@@ -109,6 +109,8 @@ used on, and what was exercised only in the project's headless GUI sandbox. -->
 3. 行内 diff：agent 的修改直接画在你的 Neovim buffer 里，逐块接受或丢弃。
 4. 一轮对话改过的文件一次看完，并能整轮回滚。
 5. 从终端出发：在你正在用的 Neovim 里敲 `:Eitri`，窗口接上同一个会话；关掉窗口，就回到终端里原来的位置。
+   也可以让 Neovim 一直留在终端里，只把 agent 面板开成单独的窗口，交给 Hyprland（或 sway）平铺在旁边：
+   Neovim 保持你终端原生的速度，`Ctrl+h/j/k/l` 在两者之间移动。
 
 ## 遥测
 
