@@ -1170,7 +1170,7 @@ embedded_release_signers() {
 # built from this tree embeds it and refuses a release whose SHA256SUMS.sig is missing or does not
 # verify (D13). The installer's --release-signers option replaces it, with a warning, for a
 # release candidate or a test.
-release@eitri namespaces="eitri-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIFlRZ1ATAMMp/5iH+/hSVNTlVHNC+7qpGuIPY88B8rw
+release@eitri namespaces="eitri-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICUZrObfSHuE2F8LBZj6YG8pgph6d5v/JEqb8RClBujR
 EITRI_RELEASE_SIGNERS
 }
 
