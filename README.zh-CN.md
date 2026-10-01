@@ -1,5 +1,7 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=43cb1bad474bfca742c0c2b37b49329414ed4d6288a4a087dca5aebc0caf501b -->
+<!-- translated-from: README.md sha256=04de8ab49d7d94849676806276a7a9d7dcaf82072f3f1bec41c30f2cf30367e3 -->
+
+<img src="docs/images/logo.svg" width="96" height="96" alt="Eitri 的 logo：一个窗口，编辑区里是用蓝色行号栏和三行绿色代码拼成的 E，旁边是一栏空白，底部是状态栏">
 
 # Eitri
 
@@ -123,9 +125,12 @@ MIT（[LICENSE](LICENSE)），`terminal-input/` 除外，它是 Apache-2.0（派
 
 agent sidecar 打包了 Anthropic 的 Claude Agent SDK，它不是开源软件。没有任何一个 Eitri 发行版本包含它：`eitri setup` 会从 npm 下载它，并在你的机器上构建 sidecar，适用 Anthropic 自己的条款。
 
+Logo 的蓝绿两色取自 Jason Long 设计的 [Neovim logo](https://neovim.io)（CC BY 3.0）。
+
 ## 链接
 
 - [eitri.cc](https://eitri.cc/zh/)：官网
+- [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions)：提问、建议、分享你的配置
 - [发布页面](https://github.com/HunterGrey-cyber/eitri/releases)、[issues](https://github.com/HunterGrey-cyber/eitri/issues)
 - [INSTALL.zh-CN.md](INSTALL.zh-CN.md)：每一种安装方式、验证下载、更新、卸载
 - [CONTRIBUTING.md](CONTRIBUTING.md)（仅有英文版）：从源码构建和运行测试

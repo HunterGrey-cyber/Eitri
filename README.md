@@ -1,5 +1,7 @@
 English | [简体中文](README.zh-CN.md)
 
+<img src="docs/images/logo.svg" width="96" height="96" alt="The Eitri logo: a window whose editor pane holds an E made of a blue gutter and three green code lines, a blank pane beside it, and a status bar">
+
 # Eitri
 
 **Your Neovim, with Claude Code beside it.**
@@ -181,9 +183,12 @@ The agent sidecar bundles Anthropic's Claude Agent SDK, which is not open source
 contains it: `eitri setup` downloads it from npm and builds the sidecar on your machine, under
 Anthropic's own terms.
 
+The logo's blue and green come from the [Neovim logo](https://neovim.io) by Jason Long (CC BY 3.0).
+
 ## Links
 
 - [eitri.cc](https://eitri.cc): the homepage
+- [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions): questions, ideas, your setups
 - [Releases](https://github.com/HunterGrey-cyber/eitri/releases), [issues](https://github.com/HunterGrey-cyber/eitri/issues)
 - [INSTALL.md](INSTALL.md): every install route, verifying a download, updating, uninstalling
 - [CONTRIBUTING.md](CONTRIBUTING.md): building from source and running the tests
