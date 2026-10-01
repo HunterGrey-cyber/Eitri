@@ -373,6 +373,41 @@ fn build_ui(
     }
     agent_panel_handle.set_typing_cadence(typing_cadence);
 
+    // Whether the launch offers the last window's tabs back (`agent.restore`: "offer", the default,
+    // "auto" or "off"), and the mode new tabs start in (`agent.default_mode`: "auto" or "bypass").
+    // Anything else is a startup failure naming the key, like `agent.font_size` above. Naming bypass
+    // here is the one way a window starts in bypass without asking, because the answer is in a file
+    // the user wrote.
+    let restore_policy = match eitri_core::tab_restore::RestorePolicy::parse(
+        lua_engine.config.borrow().get(eitri_core::tab_restore::RESTORE_KEY),
+    ) {
+        Ok(policy) => policy,
+        Err(message) => {
+            eprintln!("eitri: {message}");
+            std::process::exit(1);
+        }
+    };
+    agent_panel_handle.set_restore_policy(restore_policy);
+    let default_mode = match eitri_core::agent_prefs::parse_default_mode(
+        lua_engine
+            .config
+            .borrow()
+            .get(eitri_core::agent_prefs::DEFAULT_MODE_KEY),
+    ) {
+        Ok(mode) => mode,
+        Err(message) => {
+            eprintln!("eitri: {message}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(mode) = default_mode {
+        eprintln!(
+            "[agent] new tabs start in {} (init.lua's agent.default_mode)",
+            mode.as_str()
+        );
+    }
+    agent_panel_handle.set_default_mode(default_mode);
+
     // What a card for a hidden chat does: the tray's chip and a
     // toast, or with `reveal` the chat itself. Anything but `badge`/`reveal` is a startup failure
     // naming the key, like `agent.font_size` above.
@@ -1059,6 +1094,11 @@ fn build_ui(
                 ));
             }
         });
+    }
+    // The one-line result of bringing the last window's tabs back.
+    {
+        let toast = toast.clone();
+        agent_panel_handle.on_toast(move |text| toast.show(text));
     }
     // Share the three module arrival operations across module keys, tray chips,
     // split keys, and Lua layout calls so every route uses the same behavior.

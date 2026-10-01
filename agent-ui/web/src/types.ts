@@ -328,6 +328,12 @@ export type TurnClock = { turnId: string; since: number; exact: boolean };
 /** The handshake reply, before any session exists: which backend is behind the bridge and what it
  * genuinely offers. The start screen renders from this rather than hardcoding either backend's
  * shape. */
+/** What the launch dashboard may bring back: the tabs the last window on this project had open, in
+ *  tab-bar order, and how many of those were in bypass. Rust sends it only while this window has
+ *  started nothing and at least one saved tab can still be resumed, so its presence is the whole
+ *  reason to draw the line. */
+export type RestoreOffer = { labels: string[]; bypass: number };
+
 export type Hello = {
   backend: BackendKind;
   projectDir: string;
@@ -352,6 +358,9 @@ export type Hello = {
    *  (`serialize_hello_for_js`'s own `"account"` field). Read by the empty tab's dashboard
    *  (its cwd/backend/account line) and by nothing else yet. */
   account: string | null;
+  /** The saved tabs the dashboard offers back (`restore_last`), or `null` when there is nothing to
+   *  offer. Optional only so that a sender that predates it reads as "nothing". */
+  restore?: RestoreOffer | null;
 };
 
 export type TurnOutcome = "completed" | "interrupted" | "failed" | "limit_reached";

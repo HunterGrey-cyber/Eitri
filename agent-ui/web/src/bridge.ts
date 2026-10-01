@@ -72,6 +72,15 @@ export type OutboundMessage =
    *  cards still pending on that tab at that nonce; this side never chooses the cards. Maps to
    *  `InboundMessage::ConfirmBypass` in `core/src/agent_bridge.rs`. */
   | { type: "confirm_bypass"; request_id: string; tab: TabId | null; scope: "tab" | "default"; nonce: number }
+  /** `s` on the launch dashboard: bring back the tabs the last window had open, the first into this
+   *  empty tab and the rest into new ones. Names the tab it was pressed in. A saved tab that was in
+   *  bypass is asked about first (`confirm_restore`), never given back in bypass unasked.
+   *  `InboundMessage::RestoreLast`, `core/src/agent_bridge.rs`. */
+  | { type: "restore_last"; request_id: string; tab: TabId }
+  /** `y` (`keep_bypass: true`) or `n` to a `confirm_restore` prompt. `nonce` is the envelope's own,
+   *  echoed back so only the prompt that was shown can be answered. Window-level, like
+   *  `confirm_bypass`. `InboundMessage::RestoreAnswer`, `core/src/agent_bridge.rs`. */
+  | { type: "restore_answer"; request_id: string; nonce: number; keep_bypass: boolean }
   /** Mirror the window's effective mode whenever it changes and once after `ready`. Rust keeps one
    *  value per window because `install_module_nav`, which reads it, is installed once per window.
    *  The empty tab's menu and composer also count as browse and input. Use other for states that
@@ -230,6 +239,10 @@ type InboundHandler = (
      *  Rust can reject stale answers. A second envelope replaces an open prompt. Serialized by
      *  `serialize_confirm_bypass_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "confirm_bypass"; tab: TabId | null; scope: "tab" | "default"; nonce: number; lines: string[] }
+    /** A restore found a tab saved in bypass and asks before giving it back: `y` restores as saved,
+     *  `n` brings the bypass tabs back in auto. `nonce` is echoed back on either answer, as
+     *  `confirm_bypass`'s is. `serialize_confirm_restore_for_js`, `core/src/agent_bridge.rs`. */
+    | { kind: "confirm_restore"; nonce: number; lines: string[] }
     /** This tab's queue and the refusal reason if its last flush was refused. */
     | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null }
     /** Rust's mirror of the composer's own text, sent only on a switch, `ready`,
@@ -277,6 +290,11 @@ export function installDispatch(handler: InboundHandler): void {
         console.warn("agent-ui: __eitriDispatch received a malformed confirm_bypass envelope (no nonce)", parsed);
         return;
       }
+      // The same rule for the restore question: an answer can only echo a real nonce.
+      if (obj.kind === "confirm_restore" && typeof (obj as { nonce?: unknown }).nonce !== "number") {
+        console.warn("agent-ui: __eitriDispatch received a malformed confirm_restore envelope (no nonce)", parsed);
+        return;
+      }
       if (
         obj.kind === "hello" ||
         obj.kind === "command_result" ||
@@ -305,6 +323,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "confirm_close" ||
         obj.kind === "confirm_close_others" ||
         obj.kind === "confirm_bypass" ||
+        obj.kind === "confirm_restore" ||
         obj.kind === "begin_rename" ||
         obj.kind === "queue" ||
         obj.kind === "draft" ||

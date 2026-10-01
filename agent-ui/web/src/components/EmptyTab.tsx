@@ -75,6 +75,9 @@ export type EmptyTabProps = {
   restoredDraft: RestoredDraft | null;
   onSend: (text: string) => void;
   onResume: (providerSessionId: string) => void;
+  /** The dashboard's `s` item / key: bring back the tabs the last window had open. Present with the
+   *  item (`hello.restore`); optional so this component's own tests need no stand-in. */
+  onRestoreLast?: () => void;
   onCycleMode: () => void;
   onReset: () => void;
   onHint: (repeat: boolean) => void;
@@ -451,6 +454,9 @@ export function EmptyTab(props: EmptyTabProps) {
         // calling `runItem("new")` itself.
         setComposerCaret("kept");
         break;
+      case "restore":
+        props.onRestoreLast?.();
+        break;
       case "resume": {
         const newest = hello?.resumableSessions[0];
         if (newest !== undefined) props.onResume(newest.providerSessionId);
@@ -663,13 +669,20 @@ export function EmptyTab(props: EmptyTabProps) {
       event.preventDefault();
       runItem("new");
       setComposerCaret("end");
-    } else if ((event.key === "r" && items.includes("resume")) || event.key === "w") {
+    } else if (
+      (event.key === "r" && items.includes("resume")) ||
+      (event.key === "s" && items.includes("restore")) ||
+      event.key === "w"
+    ) {
       // Arrival puts the dashboard in BROWSE, where prose can accidentally trigger actions such as
       // `r` to resume or `w` to open the chooser. Defer these actions like `f` and `H`/`L` until
       // `TYPING_GUARD_MS` has passed without more typing and the dashboard is still in BROWSE.
       event.preventDefault();
-      const item: DashItem = event.key === "r" ? "resume" : "sessions";
-      const flash = tableKeyTypingFlash(event.key, item === "resume" ? "resume the newest session" : "all sessions");
+      const item: DashItem = event.key === "r" ? "resume" : event.key === "s" ? "restore" : "sessions";
+      const flash = tableKeyTypingFlash(
+        event.key,
+        item === "resume" ? "resume the newest session" : item === "restore" ? "restore the last session" : "all sessions",
+      );
       const waiting = typingGuard.defer(
         typedAt,
         event.repeat,
