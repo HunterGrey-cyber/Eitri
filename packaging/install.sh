@@ -1942,6 +1942,12 @@ install_sidecar_for_rev() {
 	mkdir -p -- "$_isr_workdir" || die "cannot create $_isr_workdir"
 	NV_SIDECAR_WORKDIR=$_isr_workdir
 	check_sidecar_build_space "$_isr_workdir"
+	# The one status line of the whole build, before its slow run (Node's download, npm ci's ~120 MB
+	# for the Agent SDK, the TypeScript build and the single binary: measured 2026-10-01 at about a
+	# minute on a ~25 Mbit/s link, cold npm cache, and network-bound -- hence the range). Every other
+	# step is quick and prints nothing. do_build_sidecar_into (the AUR's entry point) prints none:
+	# the PKGBUILD's own msg2 does, in makepkg's style.
+	say "downloading Node and the Claude Agent SDK, then building the sidecar (1-3 min)"
 	sidecar_download_node "$_isr_workdir" "$_isr_tolerant"
 	if [ "$SDN_OK" != 1 ]; then return 0; fi
 	sidecar_download_verdandi_source "$_isr_workdir"

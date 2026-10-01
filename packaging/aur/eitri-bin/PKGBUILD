@@ -87,6 +87,9 @@ sha256sums=('0000000000000000000000000000000000000000000000000000000000000000'
 
 build() {
 	cd "$srcdir"
+	# The only slow part here (npm's ~120 MB of the Agent SDK, then the TypeScript build and the single
+	# binary: about a minute at 25 Mbit/s, network-bound), so the only line added.
+	msg2 "Installing the Claude Agent SDK and building the sidecar (1-3 min)"
 	sh "eitri-${_realver}-x86_64-linux/lib/eitri/eitri-setup" \
 		--build-sidecar-into "$srcdir/sidecar" \
 		--node "$srcdir/node-${_nodever}-linux-x64.tar.xz" \

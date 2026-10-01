@@ -111,6 +111,9 @@ setup_stubs() {
 			for f in "$src"/*; do
 				b=${f##*/}
 				[ "$b" = "$tool" ] && continue
+				# A host's own Eitri (an AUR or .deb install puts /usr/bin/eitri there) never joins
+				# such a PATH: the installer would warn that it shadows the one just installed.
+				case $b in eitri | eitri-*) continue ;; esac
 				[ -e "$d/$b" ] || ln -s "$f" "$d/$b"
 			done
 		done

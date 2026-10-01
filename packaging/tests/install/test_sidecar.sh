@@ -111,6 +111,57 @@ t_sidecar_sdk_notice() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# One line before the slow run, and nothing for the quick steps (2026-10-01, owner: "不要打印太多,
+# 打印真正耗时的内容就行"). Measured with a cold npm cache: Node's download, npm ci (~120 MB) and the
+# TypeScript build plus the single binary take about a minute together, network-bound; every other
+# step (checksums, unpacking, copying) takes a second or two. So the installer says one line before
+# the downloads, covering the whole run, and nothing else of its own.
+
+SLOW_LINE='downloading Node and the Claude Agent SDK, then building the sidecar (1-3 min)'
+
+TESTS="$TESTS t_sidecar_one_line_before_the_slow_steps"
+t_sidecar_one_line_before_the_slow_steps() {
+	serve 1.0.0
+	sc_inst_net
+	expect_rc 0
+	expect_count "$SLOW_LINE" 1
+	# Exactly one status line of this kind in the whole run, and nothing else carrying a duration.
+	expect_count '(1-3 min)' 1
+	# Before the run it announces: the SDK notice is printed after npm ci, the "built" line after the build.
+	_ln_slow=$(grep -n -F -e "$SLOW_LINE" "$OUT" | head -n 1 | cut -d: -f1)
+	_ln_notice=$(grep -n -F -e "downloading Anthropic's claude-agent-sdk" "$OUT" | head -n 1 | cut -d: -f1)
+	_ln_built=$(grep -n -F -e 'built the sidecar for verdandi' "$OUT" | head -n 1 | cut -d: -f1)
+	if [ -z "$_ln_slow" ] || [ -z "$_ln_notice" ] || [ -z "$_ln_built" ]; then
+		fail "a line is missing (slow $_ln_slow, notice $_ln_notice, built $_ln_built); output:$NL$(sed 's/^/      | /' "$OUT")"
+	elif [ "$_ln_slow" -ge "$_ln_notice" ] || [ "$_ln_notice" -ge "$_ln_built" ]; then
+		fail "the lines are out of order (slow $_ln_slow, notice $_ln_notice, built $_ln_built)"
+	fi
+}
+
+TESTS="$TESTS t_sidecar_no_slow_line_when_nothing_is_built"
+t_sidecar_no_slow_line_when_nothing_is_built() {
+	serve 1.0.0
+	# A dry run builds nothing, so announces nothing.
+	inst_net --dry-run
+	expect_rc 0
+	expect_out 'would build the sidecar'
+	expect_no_out '(1-3 min)'
+	sc_inst_net
+	expect_rc 0
+	expect_count "$SLOW_LINE" 1
+	# A sidecar already present: nothing slow runs, so nothing is announced (--sidecar-only).
+	sc_setup_release 1.0.0 "$REV_A"
+	sc_inst_setup -- --sidecar-only
+	expect_rc 0
+	expect_out 'sidecar for verdandi aaaaaaa: present'
+	expect_no_out '(1-3 min)'
+	# The same install run again, now up to date: the sidecar is present, so nothing is announced.
+	sc_inst_net
+	expect_rc 0
+	expect_no_out '(1-3 min)'
+}
+
+# ---------------------------------------------------------------------------------------------
 # Artifact acceptance (spec §5.3 step 6): refused and not installed, and (being past Node's own
 # download) fatal to the whole run.
 
@@ -250,6 +301,8 @@ t_sidecar_first_install_node_unreachable_still_succeeds() {
 	inst_net --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:1/dist" --
 	expect_rc 0
 	expect_out 'Eitri is installed without one'
+	# The line is said before the download, so it is there even when the download then fails.
+	expect_count "$SLOW_LINE" 1
 	expect_eq "$(installed_version)" 1.0.0
 	expect_absent "$(data_of)/eitri/sidecar/aaaaaaa"
 }
@@ -489,6 +542,10 @@ t_build_sidecar_into() {
 	expect_file "$dest/LICENSE.md"
 	expect_file "$dest/NODE-LICENSE"
 	if ! grep -q 'Test double Node LICENSE' "$dest/NODE-LICENSE"; then fail "Node's own LICENSE was not copied"; fi
+	# The AUR's entry point announces nothing about the wait: the PKGBUILD's own msg2 does, once
+	# (packaging/tests/test_aur_pkgbuilds.py), so a line here would print it twice.
+	expect_no_out '(1-3 min)'
+	expect_no_out "$SLOW_LINE"
 }
 
 TESTS="$TESTS t_build_sidecar_into_node_cache_versioned_name"
