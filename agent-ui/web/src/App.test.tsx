@@ -7348,11 +7348,12 @@ describe("App: the ? keymap overlay", () => {
     const el = overlay(container);
     expect(el).not.toBeNull();
     const titles = Array.from(el!.querySelectorAll("h2")).map((h) => h.textContent);
-    // "Selecting" follows "This panel", then "Leader and tab keys" and "Typing".
+    // "Selecting" follows "This panel", then "Review (c)", "Leader and tab keys", and "Typing".
     // "Slash commands" sits between "Typing" and "Anywhere".
     expect(titles).toEqual([
       "This panel",
       "Selecting (v)",
+      "Review (c)",
       "Leader and tab keys",
       "Typing",
       "Slash commands",

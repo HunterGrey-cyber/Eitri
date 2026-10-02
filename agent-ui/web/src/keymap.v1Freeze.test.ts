@@ -103,6 +103,11 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   // Append new binding cases so regenerated fixture diffs show only additions.
   { label: "Ctrl+e", mode: "browse", event: key("e", { ctrlKey: true }), ctx: { sessionEnded: false } },
   { label: "Ctrl+y", mode: "browse", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },
+  // Turn review: `c` opens the overlay -- an added key, so the cases are appended and the regenerated
+  // fixture diffs as additions only. The same letter in INPUT stays a letter.
+  { label: "c, a live session", mode: "browse", event: key("c"), ctx: { sessionEnded: false } },
+  { label: "c, a session that ended", mode: "browse", event: key("c"), ctx: { sessionEnded: true } },
+  { label: "c, input", mode: "input", event: key("c"), ctx: { sessionEnded: false } },
   // Add cases for BROWSE's visual entry keys, the gv reservation, and each VISUAL_KEYS row
   // in VISUAL and V-LINE. Also pin keys that must never answer a card and Ctrl+c's interrupt.
   { label: "v", mode: "browse", event: key("v"), ctx: { sessionEnded: false } },
