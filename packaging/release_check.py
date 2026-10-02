@@ -802,6 +802,18 @@ _PLUGIN_FILES = {
     "plugin-doc": "doc/eitri.txt",
 }
 
+# The GNOME Shell extension (gnome-extension/ in the tree), role -> path under its directory: only the four
+# files the shell loads. testing.js, README.md and test/ are in the source asset and in no package, so a
+# release that carried one fails the role table. The tarball lays it out at
+# share/gnome-shell/extensions/eitri@huntergrey.cn, the packages under usr/ at the same path.
+GNOME_EXT_ID = "eitri@huntergrey.cn"
+_GNOME_EXT_FILES = {
+    "gnome-ext-metadata": "metadata.json",
+    "gnome-ext-extension": "extension.js",
+    "gnome-ext-direction": "direction.js",
+    "gnome-ext-policy": "policy.js",
+}
+
 # Roles whose bytes must be the tracked file's (the path in the source asset): shipped
 # unmodified by release.sh, in the tarball and in both packages alike.
 TRACKED_ART = {
@@ -809,6 +821,7 @@ TRACKED_ART = {
     # The companion panel's own entry, `eitri panel` (a second window class).
     "panel-desktop": f"packaging/{APP_ID}.Panel.desktop",
     **{role: f"nvim/eitri.nvim/{rel}" for role, rel in _PLUGIN_FILES.items()},
+    **{role: f"gnome-extension/{rel}" for role, rel in _GNOME_EXT_FILES.items()},
     # 0.2.0's own desktop entry, byte for byte, in the tarball only (see _TARBALL_ONLY_ROLES).
     "legacy-desktop": "packaging/legacy/eitri.desktop",
     **{role: f"packaging/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
@@ -824,6 +837,7 @@ _TARBALL_ROLES = {
     "desktop": f"share/applications/{APP_ID}.desktop",
     "panel-desktop": f"share/applications/{APP_ID}.Panel.desktop",
     **{role: f"share/eitri/eitri.nvim/{rel}" for role, rel in _PLUGIN_FILES.items()},
+    **{role: f"share/gnome-shell/extensions/{GNOME_EXT_ID}/{rel}" for role, rel in _GNOME_EXT_FILES.items()},
     **{role: f"share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
     "LICENSE": "share/licenses/eitri/LICENSE",
     "THIRD-PARTY-LICENSES": "share/licenses/eitri/THIRD-PARTY-LICENSES",
@@ -837,6 +851,7 @@ _PACKAGE_ROLES = {
     "desktop": f"usr/share/applications/{APP_ID}.desktop",
     "panel-desktop": f"usr/share/applications/{APP_ID}.Panel.desktop",
     **{role: f"usr/share/eitri/nvim/eitri.nvim/{rel}" for role, rel in _PLUGIN_FILES.items()},
+    **{role: f"usr/share/gnome-shell/extensions/{GNOME_EXT_ID}/{rel}" for role, rel in _GNOME_EXT_FILES.items()},
     **{role: f"usr/share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
     "LICENSE": "usr/share/licenses/eitri/LICENSE",
     "THIRD-PARTY-LICENSES": "usr/share/licenses/eitri/THIRD-PARTY-LICENSES",

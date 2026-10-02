@@ -9,6 +9,7 @@
 #   eitri --account work   bill a specific Claude account (and read its history)
 #   eitri panel --nvim ADDR [DIR]
 #                          open the agent panel beside the nvim at ADDR (:EitriPanel runs this)
+#   eitri split [DIR]      open the editor (Neovide) and the agent panel as two windows (needs Neovide)
 #   eitri --version        print the version and exit
 #   eitri setup [args]     build the sidecar (and offer nvim), or --nvim-only/--uninstall/
 #                            --sidecar-only for one of those alone (eitri setup --help)
@@ -115,6 +116,11 @@ MODE=window
 if [[ "${1:-}" == panel ]]; then
 	MODE=panel
 	shift
+elif [[ "${1:-}" == split ]]; then
+	# `eitri split` is the editor and the panel as two windows. It takes the project and the shared
+	# options and nothing else, like `panel`: the in-process editor's own flags do not apply.
+	MODE=split
+	shift
 fi
 
 ACCOUNT="${VERDANDI_CLAUDE_ACCOUNT:-}"
@@ -126,6 +132,7 @@ PANEL_ARGS=()
 # What an unknown option is reported as: `eitri: ...` for the window, `eitri panel: ...` for the panel.
 CMD_NAME=eitri
 [[ $MODE == panel ]] && CMD_NAME="eitri panel"
+[[ $MODE == split ]] && CMD_NAME="eitri split"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -134,19 +141,19 @@ while [[ $# -gt 0 ]]; do
 		# reasoning that already governs the sidecar's own discovery below. Unlike the old
 		# `EITRI_AGENT_BACKEND=legacy` export this replaced, this is plain argv: `shell` decides
 		# per invocation, so two launches of the same installed binary can disagree.
-		--legacy)  [[ $MODE == panel ]] && { echo "eitri panel: unknown option --legacy" >&2; exit 64; }
+		--legacy)  [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --legacy" >&2; exit 64; }
 		           SHELL_ARGS+=(--legacy); shift ;;
 		# Forwarded too: shell starts its nvim with --clean, the same as running it directly.
-		--clean)   [[ $MODE == panel ]] && { echo "eitri panel: unknown option --clean" >&2; exit 64; }
+		--clean)   [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --clean" >&2; exit 64; }
 		           SHELL_ARGS+=(--clean); shift ;;
 		# The panel attaches to an nvim that is already running; there is nothing to attach to in the
 		# one-window mode, which starts its own.
-		--nvim)    [[ $MODE == panel ]] || { echo "eitri: unknown option --nvim" >&2; exit 64; }
+		--nvim)    [[ $MODE == panel ]] || { echo "$CMD_NAME: unknown option --nvim" >&2; exit 64; }
 		           PANEL_ARGS+=(--nvim "${2:?--nvim needs an address}"); shift 2 ;;
 		--version) exec "$LIBDIR/shell" --version ;;
 		--account) ACCOUNT="${2:?--account needs a name}"; ACCOUNT_FROM_FLAG=1; shift 2 ;;
 		--quiet)   QUIET=1; shift ;;
-		-h|--help) sed -n '2,14p' "$0" | sed 's/^# \?//'; exit 0 ;;
+		-h|--help) sed -n '2,15p' "$0" | sed 's/^# \?//'; exit 0 ;;
 		--) shift; PROJECT="${1:-}"; break ;;
 		-*) echo "$CMD_NAME: unknown option $1" >&2; exit 64 ;;
 		*)  PROJECT="$1"; shift ;;
@@ -219,6 +226,9 @@ if [[ -z "$QUIET" ]]; then
 	} >&2
 fi
 
+if [[ $MODE == split ]]; then
+	exec "$LIBDIR/shell" split -- "$PROJECT"
+fi
 if [[ $MODE == panel ]]; then
 	exec "$LIBDIR/shell" panel "${PANEL_ARGS[@]}" -- "$PROJECT"
 fi

@@ -906,7 +906,13 @@ ctr_tar() {
 		--owner=0 --group=0 --numeric-owner -C "$2" -cf - "$1" | gzip -n -9 > "$3"
 }
 
-# ctr_stage_art ST: the desktop entries, the nvim plugin and the icon tree, copied from the clone (cwd)
+# The GNOME Shell extension's shipped files: an explicit list, never a find, so that testing.js, README.md and
+# test/ beside them stay in the source tree. release_check.py's role table and test_nfpm_profiles.py hold
+# this list, the nfpm entries and install.sh's NV_EXT_FILES to one another.
+GNOME_EXT_ID='eitri@huntergrey.cn'
+GNOME_EXT_FILES='metadata.json extension.js direction.js policy.js'
+
+# ctr_stage_art ST: the desktop entries, the nvim plugin, the GNOME Shell extension and the icon tree, copied from the clone (cwd)
 # into the staging dir at the paths nfpm-public.yaml names as their sources. The entry is named by the application id
 # (shell/src/main.rs's APP_ID), which the compositor matches a window to; the icons are every file under
 # packaging/icons/hicolor, found rather than listed so that release_check.py's role table is the one
@@ -921,6 +927,10 @@ ctr_stage_art() {
 	while IFS= read -r f; do
 		install -D -m 0644 "nvim/eitri.nvim/$f" "$st/nvim/eitri.nvim/$f"
 	done < <(cd nvim/eitri.nvim && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
+	# The GNOME Shell extension, at the path both nfpm profiles name as its source.
+	for f in $GNOME_EXT_FILES; do
+		install -D -m 0644 "gnome-extension/$f" "$st/gnome-extension/$f"
+	done
 	install -D -m 0644 packaging/legacy/eitri.desktop "$st/packaging/legacy/eitri.desktop"
 	while IFS= read -r f; do
 		install -D -m 0644 "packaging/icons/$f" "$st/packaging/icons/$f"
@@ -928,7 +938,7 @@ ctr_stage_art() {
 }
 
 # ctr_tarball_art ST TREE: the same files, from the staging dir, at the tarball's own paths
-# (share/applications/..., share/eitri/eitri.nvim/..., share/icons/hicolor/...). The tarball also gets
+# (share/applications/..., share/eitri/eitri.nvim/..., share/gnome-shell/extensions/..., share/icons/hicolor/...). The tarball also gets
 # 0.2.0's desktop entry as share/applications/eitri.desktop (packaging/legacy/README.md): 0.2.0's
 # install.sh, which a user may rerun to upgrade, refuses a tarball without it. Only that installer reads
 # it; this release's ignores it.
@@ -939,6 +949,9 @@ ctr_tarball_art() {
 	while IFS= read -r f; do
 		install -D -m 0644 "$st/nvim/eitri.nvim/$f" "$tree/share/eitri/eitri.nvim/$f"
 	done < <(cd "$st/nvim/eitri.nvim" && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
+	for f in $GNOME_EXT_FILES; do
+		install -D -m 0644 "$st/gnome-extension/$f" "$tree/share/gnome-shell/extensions/$GNOME_EXT_ID/$f"
+	done
 	install -D -m 0644 "$st/packaging/legacy/eitri.desktop" "$tree/share/applications/eitri.desktop"
 	while IFS= read -r f; do
 		install -D -m 0644 "$st/packaging/icons/$f" "$tree/share/icons/$f"

@@ -51,6 +51,7 @@ optdepends=(
 	'neovim: the editor (any nvim >= 0.10 on PATH)'
 	'claude-code: the Claude Code CLI the panel drives'
 	'noto-fonts: the ⏵⏵ mode glyph'
+	'neovide: eitri split'
 )
 makedepends=('curl' 'tar')
 provides=('eitri')
@@ -121,10 +122,16 @@ package() {
 	# lays out at share/eitri/eitri.nvim and the packages put at /usr/share/eitri/nvim/eitri.nvim.
 	install -Dm0644 "$top/share/applications/cn.huntergrey.eitri.Panel.desktop" \
 		"$pkgdir/usr/share/applications/cn.huntergrey.eitri.Panel.desktop"
-	local _icon _plugin
+	local _icon _plugin _ext
 	while IFS= read -r _plugin; do
 		install -Dm0644 "$top/share/eitri/eitri.nvim/$_plugin" "$pkgdir/usr/share/eitri/nvim/eitri.nvim/$_plugin"
 	done < <(cd "$top/share/eitri/eitri.nvim" && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
+	# The GNOME Shell extension a companion panel on GNOME uses: an explicit list of the four files the shell loads,
+	# never a find, so nothing else that ever lands beside them in the tarball is installed.
+	for _ext in metadata.json extension.js direction.js policy.js; do
+		install -Dm0644 "$top/share/gnome-shell/extensions/eitri@huntergrey.cn/$_ext" \
+			"$pkgdir/usr/share/gnome-shell/extensions/eitri@huntergrey.cn/$_ext"
+	done
 	while IFS= read -r _icon; do
 		install -Dm0644 "$top/share/icons/$_icon" "$pkgdir/usr/share/icons/$_icon"
 	done < <(cd "$top/share/icons" && find hicolor -type f | LC_ALL=C sort)

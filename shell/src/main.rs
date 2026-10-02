@@ -94,6 +94,9 @@ fn main() -> glib::ExitCode {
     if early_args.first().is_some_and(|a| a == "panel") {
         return companion::run(early_args[1..].to_vec());
     }
+    if early_args.first().is_some_and(|a| a == "split") {
+        return companion::run_split(early_args[1..].to_vec());
+    }
     // After the panel branch, which reads `$NVIM` as its default address; before anything that starts a
     // thread or a child. An Eitri started from an nvim `:terminal` would otherwise hand that editor's
     // RPC address -- and, if it is another window's nvim, that window's socket variables -- to the

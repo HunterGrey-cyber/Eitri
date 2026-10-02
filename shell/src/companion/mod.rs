@@ -4,22 +4,30 @@
 //!
 //! The command line is parsed here, before GTK, and the project is resolved from what is left, so
 //! `panel` is never read by the ordinary resolver as a directory (see `main`).
+//!
+//! `eitri split [DIR]` is the same window with an editor of its own: it starts upstream Neovide on a
+//! private nvim socket, attaches to that, and closes when that Neovide exits ([`run_split`]).
 
+mod close_watch;
+mod gnome_shell;
 mod link;
 pub(crate) mod prefix;
+mod requests;
 mod window;
 mod wm_runner;
 
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::time::Duration;
 
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::Application;
 
 use eitri_core::agent_backend::BackendKind;
-use eitri_core::panel_control::{self, Claim, ControlServer, Reply, Request};
+use eitri_core::panel_control::{self, Claim, CloseWith, ControlServer, Reply, Request};
 
 /// The panel is its own application, so it never collides with a full window's id.
 pub(crate) const PANEL_APP_ID: &str = "cn.huntergrey.eitri.Panel";
@@ -95,6 +103,9 @@ pub(crate) struct Start {
     /// The per-project control socket this window owns, taken by `build` (which runs from an `Fn`
     /// closure, so it cannot move it out of the `Start`).
     pub(crate) control: Cell<Option<ControlServer>>,
+    /// The editor this window is to close with, when `eitri split` started one: its identity, and
+    /// the `Child` to collect once it exits. Taken by `build`, like `control`.
+    pub(crate) close_with: Cell<Option<(CloseWith, Option<Child>)>>,
     pub(crate) backend_kind: BackendKind,
     /// Why this build shows no web panel, where WebKit's sandbox cannot start.
     pub(crate) panel_notice: Option<String>,
@@ -106,6 +117,24 @@ fn scrub(names: &[&str], remove: &dyn Fn(&str)) {
     for name in names {
         remove(name);
     }
+}
+
+/// What `eitri split` removes from its own environment, given how that environment reads (`get`):
+/// always the RPC address and the other window's sockets ([`inherited_editor_env`]), and
+/// `MYVIMRC`, `VIMRUNTIME` and `VIM` only when `$NVIM` is set, which is how a split started from an
+/// nvim's `:terminal` shows (the same test [`run`] reads first). Without it those three are the
+/// user's own exports, which the Neovide nvim started next needs (a `VIMRUNTIME` for a source or
+/// Nix build), and they pass through.
+fn split_scrub_names(get: &dyn Fn(&str) -> Option<OsString>) -> Vec<&'static str> {
+    let mut names = inherited_editor_env(get);
+    if get("NVIM").is_some() {
+        for name in ["MYVIMRC", "VIMRUNTIME", "VIM"] {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// For the full window: an Eitri started from an nvim `:terminal` inherits that editor's RPC address,
@@ -200,7 +229,10 @@ pub(crate) fn run(args: Vec<OsString>) -> glib::ExitCode {
         Err(message) => return fail(&message),
     };
     println!("eitri panel: project root {}", project_root.display());
-    let request = parsed.nvim.as_ref().map(|addr| Request::Attach(addr.clone()));
+    let request = parsed.nvim.as_ref().map(|addr| Request::Attach {
+        addr: addr.clone(),
+        close_with: None,
+    });
     if let Some(addr) = &parsed.nvim {
         // SAFETY: `geteuid` takes no arguments and cannot fail.
         if let Err(message) = panel_control::validate_nvim_addr(addr, unsafe { libc::geteuid() }) {
@@ -220,6 +252,149 @@ pub(crate) fn run(args: Vec<OsString>) -> glib::ExitCode {
         Ok(Claim::Unresponsive { pid }) => return fail(&unresponsive_message(pid)),
         Err(message) => return fail(&message),
     };
+    run_window(project_root, parsed.nvim, from_editor, server, None)
+}
+
+/// How long `eitri split` waits for the editor it started to listen.
+const EDITOR_LISTENS_WITHIN: Duration = Duration::from_secs(15);
+
+/// What `eitri split` prints and exits with for a failure. Its own parser and the core half already
+/// name the command; everything else gets the name here.
+fn split_failure_line(message: &str) -> String {
+    if message.starts_with("eitri split:") {
+        message.to_owned()
+    } else {
+        format!("eitri split: {message}")
+    }
+}
+
+fn fail_split(message: &str) -> glib::ExitCode {
+    eprintln!("{}", split_failure_line(message));
+    glib::ExitCode::FAILURE
+}
+
+/// What a split prints once the running panel for the project took its attach.
+fn split_forwarded_message(project_root: &Path) -> String {
+    format!(
+        "eitri split: the running panel for {} attached to this Neovide",
+        project_root.display()
+    )
+}
+
+/// What a split says when the running panel refused its attach. A panel that predates `close_with`
+/// answers a request of protocol 2 with "unsupported protocol version"; that one is told as what it
+/// is, since the way out is to close the old panel.
+fn split_refused_message(project_root: &Path, why: &str) -> String {
+    if why.starts_with("unsupported protocol version") {
+        format!(
+            "eitri split: the Eitri panel already open for {} is older than this eitri; close it and run eitri split again",
+            project_root.display()
+        )
+    } else {
+        format!("eitri split: the running panel refused: {why}")
+    }
+}
+
+/// The first executable file called `name` in `path`'s directories.
+fn find_in_path(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path).map(|dir| dir.join(name)).find(|candidate| {
+        candidate
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    })
+}
+
+/// Runs `eitri split`. `args` is the command line after `split`. Like [`run`], everything before the
+/// application is built happens on this one thread, with the `NVIM*` variables scrubbed before the
+/// editor starts: the split is often run from a shell inside an nvim, and neither this process nor
+/// the Neovide it starts may carry that nvim's address.
+///
+/// The editor is started first and the control socket claimed after it listens, so that the attach
+/// the claim forwards (or acts on) names an editor that exists. Every failure after the editor
+/// started leaves it running: it is the user's window now.
+pub(crate) fn run_split(args: Vec<OsString>) -> glib::ExitCode {
+    let parsed = match eitri_core::project_root::parse_split_args(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => return fail_split(&message),
+    };
+    // A split started from an nvim `:terminal`, even another Eitri window's, must hand neither that
+    // editor's address nor that window's sockets to Neovide, the panel or anything they start.
+    let names = split_scrub_names(&|name| std::env::var_os(name));
+    scrub(&names, &|name| {
+        // SAFETY: only this thread exists. Nothing above spawned one, and the editor, GTK and the
+        // panel have not started.
+        unsafe { std::env::remove_var(name) }
+    });
+    let project_root = match eitri_core::project_root::resolve_args(&parsed.rest) {
+        Ok(root) => root,
+        Err(message) => return fail_split(&message),
+    };
+    let program = match eitri_core::split::neovide_program(&|name| std::env::var_os(name), &|name| {
+        std::env::var_os("PATH").and_then(|path| find_in_path(&path, name))
+    }) {
+        Ok(program) => program,
+        Err(message) => return fail_split(&message),
+    };
+    println!("eitri split: project root {}", project_root.display());
+    let control_dir = panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir());
+    if let Err(message) = panel_control::ensure_dir(&control_dir) {
+        return fail_split(&message);
+    }
+    let sock = match eitri_core::split::fresh_socket_path(
+        &control_dir,
+        &project_root,
+        std::process::id(),
+        &mut eitri_core::split::random_nonce,
+    ) {
+        Ok(sock) => sock,
+        Err(message) => return fail_split(&message),
+    };
+    let mut child = match eitri_core::split::neovide_command(&program, &sock, &project_root).spawn() {
+        Ok(child) => child,
+        Err(e) => return fail_split(&format!("could not start {}: {e}", program.display())),
+    };
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if let Err(message) = eitri_core::split::wait_for_socket(&sock, &mut child, euid, EDITOR_LISTENS_WITHIN) {
+        return fail_split(&message);
+    }
+    let Some(start) = eitri_core::split::proc_start_time(child.id()) else {
+        return fail_split(&format!(
+            "could not read when neovide (pid {}) started, so the panel cannot close with it",
+            child.id()
+        ));
+    };
+    let close_with = CloseWith { pid: child.id(), start };
+    let request = Request::Attach {
+        addr: sock.clone(),
+        close_with: Some(close_with),
+    };
+    // One panel per project: when one is running, it takes this editor and this process is done.
+    match panel_control::claim(&control_dir, &project_root, Some(&request)) {
+        Ok(Claim::Ours(server)) => run_window(project_root, Some(sock), false, server, Some((close_with, Some(child)))),
+        Ok(Claim::Forwarded(Reply::Ok)) => {
+            println!("{}", split_forwarded_message(&project_root));
+            glib::ExitCode::SUCCESS
+        }
+        Ok(Claim::Forwarded(Reply::Refused(why))) => {
+            eprintln!("{}", split_refused_message(&project_root, &why));
+            glib::ExitCode::FAILURE
+        }
+        Ok(Claim::Unresponsive { pid }) => fail_split(&unresponsive_message(pid)),
+        Err(message) => fail_split(&message),
+    }
+}
+
+/// The part of [`run`] and [`run_split`] after the control socket is theirs: the backend and WebKit
+/// decisions, then the application.
+fn run_window(
+    project_root: PathBuf,
+    nvim: Option<PathBuf>,
+    from_editor: bool,
+    server: ControlServer,
+    close_with: Option<(CloseWith, Option<Child>)>,
+) -> glib::ExitCode {
     let backend_kind = match BackendKind::from_env(false) {
         Ok(kind) => kind,
         Err(err) => {
@@ -237,9 +412,10 @@ pub(crate) fn run(args: Vec<OsString>) -> glib::ExitCode {
     };
     let start = Start {
         project_root,
-        nvim: parsed.nvim,
+        nvim,
         from_editor,
         control: Cell::new(Some(server)),
+        close_with: Cell::new(close_with),
         backend_kind,
         panel_notice,
     };
@@ -262,6 +438,60 @@ mod tests {
     fn editor_env_list_names_nvims_rpc_address() {
         assert!(INHERITED_FROM_EDITOR.contains(&"NVIM"));
         assert!(INHERITED_FROM_EDITOR.contains(&"NVIM_LISTEN_ADDRESS"));
+    }
+
+    #[test]
+    fn a_split_failure_always_names_the_split() {
+        assert_eq!(
+            split_failure_line("eitri split: unknown option -x"),
+            "eitri split: unknown option -x"
+        );
+        assert_eq!(
+            split_failure_line("a panel for this project is running but not answering"),
+            "eitri split: a panel for this project is running but not answering"
+        );
+    }
+
+    #[test]
+    fn a_split_that_was_forwarded_says_the_running_panel_took_this_neovide() {
+        assert_eq!(
+            split_forwarded_message(Path::new("/work/proj")),
+            "eitri split: the running panel for /work/proj attached to this Neovide"
+        );
+    }
+
+    #[test]
+    fn an_older_panel_is_told_as_an_older_panel_and_any_other_refusal_as_it_was_said() {
+        assert_eq!(
+            split_refused_message(Path::new("/work/proj"), "unsupported protocol version 2"),
+            "eitri split: the Eitri panel already open for /work/proj is older than this eitri; \
+             close it and run eitri split again"
+        );
+        assert_eq!(
+            split_refused_message(Path::new("/work/proj"), "close_with is not the sender's child"),
+            "eitri split: the running panel refused: close_with is not the sender's child"
+        );
+    }
+
+    #[test]
+    fn the_path_search_finds_the_first_executable_file_and_skips_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("find-in-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (first, second) = (root.join("one"), root.join("two"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        // Present but not executable in the first directory, a directory of that name in the second.
+        std::fs::write(first.join("tool"), "").unwrap();
+        std::fs::create_dir(second.join("tool")).unwrap();
+        let third = root.join("three");
+        std::fs::create_dir_all(&third).unwrap();
+        std::fs::write(third.join("tool"), "").unwrap();
+        std::fs::set_permissions(third.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([&first, &second, &third]).unwrap();
+        assert_eq!(find_in_path(&path, "tool"), Some(third.join("tool")));
+        assert_eq!(find_in_path(&path, "absent"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -349,6 +579,37 @@ mod tests {
             Some(OsStr::new("s.sock"))
         ));
         assert!(!is_the_shims_tmux(Some(OsStr::new(",1,0")), Some(OsStr::new(""))));
+    }
+
+    #[test]
+    fn a_split_keeps_the_users_own_runtime_variables_unless_it_started_inside_an_nvim() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        // From a plain shell: the RPC address names are always on the list, the three are not.
+        let plain = split_scrub_names(&env(&[("VIMRUNTIME", "/src/nvim/runtime"), ("MYVIMRC", "/x/init.lua")]));
+        for name in EDITOR_RPC_ADDRESS {
+            assert!(plain.contains(&name), "{name}");
+        }
+        for name in ["MYVIMRC", "VIMRUNTIME", "VIM"] {
+            assert!(!plain.contains(&name), "{name} is the user's own here");
+        }
+        // From an nvim's `:terminal` (`$NVIM` set): those three describe that nvim.
+        let inside = split_scrub_names(&env(&[
+            ("NVIM", "/run/nvim.sock"),
+            ("VIMRUNTIME", "/usr/share/nvim/runtime"),
+        ]));
+        for name in INHERITED_FROM_EDITOR {
+            assert!(inside.contains(&name), "{name}");
+        }
+        // Another window's sockets go either way.
+        assert!(plain.contains(&"EITRI_PANE_SWITCH_SOCKET"));
+        assert_eq!(inside.iter().filter(|name| **name == "NVIM").count(), 1);
     }
 
     #[test]

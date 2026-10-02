@@ -513,9 +513,45 @@ out="$(run_launcher --quiet "$PROJECT_DIR")"
 args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
 assert_eq "$args" "STUB_ARG:$REAL_PROJECT " "without panel the shell gets only the project"
 
-echo "== -h lists the panel subcommand =="
+echo "== eitri split: the two-window command line =="
+# `eitri split [DIR]` hands the realpath of the project to `shell split`; the options that belong to
+# the integrated window or to the panel are refused by name, and --account still reaches the shell.
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher split --quiet "$PROJECT_DIR")"
+args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:split STUB_ARG:-- STUB_ARG:$REAL_PROJECT " "split execs shell split -- <realpath>"
+
+out="$(run_launcher split --quiet -- "$PROJECT_DIR")"
+args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:split STUB_ARG:-- STUB_ARG:$REAL_PROJECT " "a project after -- is taken the same way"
+
+for opt in --nvim --legacy --clean; do
+	if [[ $opt == --nvim ]]; then
+		out="$(run_launcher split --quiet --nvim /r/n.sock "$PROJECT_DIR")"
+	else
+		out="$(run_launcher split --quiet "$opt" "$PROJECT_DIR")"
+	fi
+	assert_contains "$out" "eitri split: unknown option $opt" "split refuses $opt by name"
+	assert_not_contains "$out" "STUB_ARG" "split $opt never reaches shell"
+	(cd "$PROJECT_DIR" && env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" split "$opt" >/dev/null 2>&1)
+	assert_eq "$?" "64" "split $opt exits 64"
+done
+
+out="$(run_launcher split --quiet --account work "$PROJECT_DIR")"
+assert_contains "$out" "STUB_ACCOUNT:work" "eitri split --account work exports VERDANDI_CLAUDE_ACCOUNT=work"
+assert_contains "$out" "STUB_ARG:split" "and still runs split"
+
+out="$(run_launcher split --quiet "$SPACED")"
+assert_contains "$out" "STUB_ARG:$(realpath -e -- "$SPACED")" "a project path with a space survives in split"
+
+out="$(env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" split 2>&1 </dev/null; true)"
+assert_contains "$out" "project" "split without --quiet prints the startup banner too"
+
+echo "== -h lists the panel and split subcommands =="
 out="$(run_launcher -h)"
 assert_contains "$out" "eitri panel" "the help text names eitri panel"
+assert_contains "$out" "eitri split" "the help text names eitri split"
 assert_contains "$out" "eitri setup [args]" "and still ends with the setup line"
 
 echo

@@ -405,6 +405,9 @@ DESKTOP_DSTS = [DESKTOP_DST, PANEL_DESKTOP_DST]
 # The nvim plugin: every file under nvim/eitri.nvim, at the same relative path under this directory.
 NVIM_PLUGIN_DST = "/usr/share/eitri/nvim/eitri.nvim"
 NVIM_PLUGIN_FILES = ["doc/eitri.txt", "lua/eitri/init.lua", "plugin/eitri.lua"]
+# The GNOME Shell extension: the four files the shell loads. testing.js, README.md and test/ are source only.
+GNOME_EXT_DST = "/usr/share/gnome-shell/extensions/eitri@huntergrey.cn"
+GNOME_EXT_FILES = ["metadata.json", "extension.js", "direction.js", "policy.js"]
 OLD_DESKTOP_DST = "/usr/share/applications/eitri.desktop"
 ICON_NAME = "cn.huntergrey.eitri"
 # Every file under packaging/icons/hicolor, as the package path it must land at.
@@ -460,6 +463,26 @@ class BothProfilesShipTheDesktopEntryAndTheIcon(unittest.TestCase):
             "Terminal=false",
         ):
             self.assertIn(line, lines)
+
+    def test_the_gnome_extension_ships_its_four_files_and_no_test_code(self):
+        root = os.path.join(_HERE, "..", "gnome-extension")
+        for rel in GNOME_EXT_FILES:
+            self.assertTrue(os.path.isfile(os.path.join(root, rel)), rel)
+        for path in (PUBLIC_PATH, PRIVATE_PATH):
+            by_dst = _contents_by_dst(_load_yaml(path))
+            for rel in GNOME_EXT_FILES:
+                entry = by_dst.get(f"{GNOME_EXT_DST}/{rel}")
+                self.assertIsNotNone(entry, (path, rel))
+                self.assertEqual(entry["src"], f"./gnome-extension/{rel}", (path, rel))
+                self.assertEqual(entry.get("file_info", {}).get("mode"), 0o644, (path, rel))
+            shipped = {d for d in by_dst if d.startswith("/usr/share/gnome-shell/")}
+            self.assertEqual(shipped, {f"{GNOME_EXT_DST}/{rel}" for rel in GNOME_EXT_FILES}, path)
+            for entry in by_dst.values():
+                src = entry.get("src", "")
+                if src.startswith("./gnome-extension/"):
+                    self.assertIn(src[len("./gnome-extension/"):], GNOME_EXT_FILES, (path, src))
+                    self.assertNotIn("testing.js", src)
+                    self.assertNotIn("/test/", src)
 
     def test_the_nvim_plugin_is_in_both_profiles_and_on_disk(self):
         root = os.path.join(_HERE, "..", "nvim", "eitri.nvim")
@@ -545,7 +568,7 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
                     shutil.copyfile(os.path.join(_HERE, "apparmor", "eitri"), src)
                 elif entry["src"].startswith("./packaging/icons/") or entry["src"] in DESKTOP_SRCS:
                     shutil.copyfile(os.path.join(_HERE, entry["src"][len("./packaging/"):]), src)
-                elif entry["src"].startswith("./nvim/eitri.nvim/"):
+                elif entry["src"].startswith(("./nvim/eitri.nvim/", "./gnome-extension/")):
                     shutil.copyfile(os.path.join(_HERE, "..", entry["src"][2:]), src)
                 else:
                     with open(src, "w") as f:

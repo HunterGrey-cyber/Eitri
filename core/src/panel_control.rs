@@ -7,6 +7,13 @@
 //! thread answers on its own and only then hands the request to the GTK side through a channel, so
 //! a panel that is busy, or has not polled yet, still answers its callers within a second.
 //!
+//! Version 2 adds one request, an attach that also names the editor process whose exit should close
+//! the panel: `{"v":2,"attach":"<nvim socket>","close_with":{"pid":N,"start":N}}`, `start` being that
+//! process's start time (field 22 of `/proc/<pid>/stat`). It is only sent when there is such a
+//! process, so every other request stays v1 and an older panel still understands it. The named
+//! process must be a child of the sender, checked before the reply: otherwise any process of this
+//! user could tie the panel to an arbitrary application.
+//!
 //! This is a local trust boundary that also deletes files, so every step is deliberately narrow:
 //!
 //! - The directory is `$XDG_RUNTIME_DIR/eitri` or `<tmp>/eitri-<uid>`, created 0700 and then required to
@@ -41,13 +48,20 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The only protocol version this build speaks. A request with another `v` is refused by name.
-pub const PROTOCOL_VERSION: u64 = 1;
+/// The version of every request that carries no `close_with`; a panel that predates `close_with`
+/// speaks only this one.
+pub const PROTOCOL_V1: u64 = 1;
+/// The version of an attach that carries `close_with`. A request with a `v` other than these two is
+/// refused by name.
+pub const PROTOCOL_V2: u64 = 2;
+/// How many ancestors of a sender are recorded with its attach. A process tree deeper than this is
+/// not one an editor window is found in.
+const SENDER_CHAIN_MAX: usize = 32;
 
 /// The longest request line, without its newline.
 const MAX_LINE: usize = 4096;
@@ -65,13 +79,36 @@ const MAX_CLAIM_ROUNDS: u32 = 6;
 /// How long the server thread sleeps when nobody is connecting.
 const IDLE_SLEEP: Duration = Duration::from_millis(50);
 
+/// A process named by its pid and its start time, so a pid that was reused names nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseWith {
+    pub pid: u32,
+    /// Field 22 of `/proc/<pid>/stat`: clock ticks since boot.
+    pub start: u64,
+}
+
 /// What a request asks the running panel to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Attach to the nvim listening on this socket path.
-    Attach(PathBuf),
+    /// Attach to the nvim listening on `addr`. With `close_with`, the panel closes when that process
+    /// exits; the process was verified to be the sender's child before the request was accepted.
+    Attach {
+        addr: PathBuf,
+        close_with: Option<CloseWith>,
+    },
     /// Bring the panel to the front; there is nothing to attach.
     Raise,
+}
+
+/// A request the control thread accepted, with what it learnt about the sender while the sender
+/// was still connected: by the time the GTK side looks, a forwarding process has usually exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Received {
+    pub request: Request,
+    /// For an attach, the process whose window belongs to the attached editor, nearest first: the
+    /// verified `close_with` pid alone when there is one, else the sender and its ancestors. Empty
+    /// for a raise, and when the platform does not say who the sender is.
+    pub sender_chain: Vec<u32>,
 }
 
 /// What the running panel answered.
@@ -121,6 +158,14 @@ pub fn socket_path(dir: &Path, project_root: &Path) -> io::Result<PathBuf> {
     agent::socket_path::in_dir(dir, &format!("p-{}.sock", key(project_root)))
 }
 
+/// `dir/split-<16 hex>-<pid>-<8 hex nonce>.sock`, where `eitri split` asks the editor it starts to
+/// listen, checked against the same limit. The nonce keeps a later split whose pid was reused from
+/// meeting a socket an earlier editor still listens on.
+pub fn split_socket_path(dir: &Path, project_root: &Path, pid: u32, nonce: u32) -> io::Result<PathBuf> {
+    let project = key(project_root);
+    agent::socket_path::in_dir(dir, &format!("split-{project}-{pid}-{nonce:08x}.sock"))
+}
+
 /// `dir/p-<16 hex>.pid`, the pid of the panel that owns the socket.
 pub fn pid_path(dir: &Path, project_root: &Path) -> PathBuf {
     dir.join(format!("p-{}.pid", key(project_root)))
@@ -140,7 +185,7 @@ pub(crate) fn euid() -> u32 {
 
 /// Creates `dir` 0700 if it is missing, then requires it to be a private directory of this user.
 /// A directory that already existed is judged, never changed.
-fn ensure_dir(dir: &Path) -> Result<(), String> {
+pub fn ensure_dir(dir: &Path) -> Result<(), String> {
     match DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {
             // Created just now, so narrowing it is ours to do: a strict umask may have taken bits
@@ -178,9 +223,29 @@ fn ensure_dir(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// The uid of the process on the other end of `stream`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// Who is on the other end of a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Peer {
+    uid: u32,
+    /// `None` where the platform does not say, and for a peer in a pid namespace this process
+    /// cannot see (the kernel reports pid 0 then).
+    pid: Option<u32>,
+}
+
+/// The uid of the process on the other end of `stream`, for a caller that needs no more of it.
 pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    peer(stream).map(|peer| peer.uid)
+}
+
+/// The pid of the process on the other end of `stream`, where the platform says (Linux does; the
+/// BSDs and macOS give only a uid here) and the process is visible from this pid namespace.
+pub(crate) fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    peer(stream).ok().and_then(|peer| peer.pid)
+}
+
+/// The credentials of the process on the other end of `stream`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer(stream: &UnixStream) -> io::Result<Peer> {
     // SAFETY: `ucred` is plain old data and `len` is its exact size; `getsockopt` fills at most that.
     unsafe {
         let mut cred: libc::ucred = std::mem::zeroed();
@@ -193,14 +258,59 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
             &mut len,
         );
         if rc == 0 {
-            Ok(cred.uid)
+            let pid = u32::try_from(cred.pid).ok().filter(|&pid| pid != 0);
+            Ok(Peer { uid: cred.uid, pid })
         } else {
             Err(io::Error::last_os_error())
         }
     }
 }
 
-/// The uid of the process on the other end of `stream`.
+/// A pidfd for the process that connected (`SO_PEERPIDFD`, Linux 6.5 and later), or `None` where the
+/// kernel has none. The pid `SO_PEERCRED` reports is a number taken at connect time: once that
+/// process exits and the number is reused, it names a stranger. A pidfd keeps naming the process
+/// that connected, and says when it is gone.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn peer_pidfd(stream: &UnixStream) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let mut fd: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` and `len` are valid out-pointers sized for the one int the option returns.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            &mut fd as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    // SAFETY: on success the kernel handed this process a new descriptor it now owns.
+    (rc == 0 && fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn peer_pidfd(_stream: &UnixStream) -> Option<std::os::fd::OwnedFd> {
+    None
+}
+
+/// Whether the process behind `pidfd` is still alive and still has `pid`: its `fdinfo` says
+/// `Pid:\t-1` once it has exited.
+pub(crate) fn pidfd_still_names(pidfd: &std::os::fd::OwnedFd, pid: u32) -> bool {
+    use std::os::fd::AsRawFd;
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).unwrap_or_default();
+    pidfd_info_pid(&info) == Some(i64::from(pid))
+}
+
+/// The `Pid:` field of a pidfd's `fdinfo`, `-1` for a process that has exited.
+fn pidfd_info_pid(info: &str) -> Option<i64> {
+    info.lines()
+        .find_map(|line| line.strip_prefix("Pid:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// The credentials of the process on the other end of `stream`. `getpeereid` gives no pid, so a
+/// `close_with` is never accepted here and an attach carries no sender chain.
 #[cfg(any(
     target_vendor = "apple",
     target_os = "freebsd",
@@ -208,11 +318,11 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     target_os = "netbsd",
     target_os = "dragonfly"
 ))]
-pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+fn peer(stream: &UnixStream) -> io::Result<Peer> {
     let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
     // SAFETY: both out-pointers are valid for the call.
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0 {
-        Ok(uid)
+        Ok(Peer { uid, pid: None })
     } else {
         Err(io::Error::last_os_error())
     }
@@ -290,13 +400,20 @@ fn read_line(stream: &UnixStream, deadline: Instant, max: usize) -> Result<Vec<u
 /// `request` as the one line it is sent as.
 fn encode(request: &Request) -> Result<String, String> {
     let value = match request {
-        Request::Attach(path) => {
-            let path = path
+        Request::Attach { addr, close_with } => {
+            let path = addr
                 .to_str()
-                .ok_or_else(|| format!("{} is not valid UTF-8", path.display()))?;
-            serde_json::json!({ "v": PROTOCOL_VERSION, "attach": path })
+                .ok_or_else(|| format!("{} is not valid UTF-8", addr.display()))?;
+            match close_with {
+                None => serde_json::json!({ "v": PROTOCOL_V1, "attach": path }),
+                Some(CloseWith { pid, start }) => serde_json::json!({
+                    "v": PROTOCOL_V2,
+                    "attach": path,
+                    "close_with": { "pid": pid, "start": start },
+                }),
+            }
         }
-        Request::Raise => serde_json::json!({ "v": PROTOCOL_VERSION, "raise": true }),
+        Request::Raise => serde_json::json!({ "v": PROTOCOL_V1, "raise": true }),
     };
     Ok(format!("{value}\n"))
 }
@@ -310,15 +427,68 @@ fn parse_request(line: &[u8]) -> Result<Request, String> {
         .get("v")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(malformed)?;
-    if version != PROTOCOL_VERSION {
-        return Err(format!("unsupported protocol version {version}"));
-    }
-    // Exactly one of the two shapes. Extra keys are refused too: this is a trust boundary, and a
+    // Exactly one shape per version. Extra keys are refused too: this is a trust boundary, and a
     // new capability is a new version.
-    match (object.len(), object.get("attach"), object.get("raise")) {
-        (2, Some(serde_json::Value::String(path)), None) => Ok(Request::Attach(PathBuf::from(path))),
-        (2, None, Some(serde_json::Value::Bool(true))) => Ok(Request::Raise),
-        _ => Err(malformed()),
+    match version {
+        PROTOCOL_V1 => match (object.len(), object.get("attach"), object.get("raise")) {
+            (2, Some(serde_json::Value::String(path)), None) => Ok(Request::Attach {
+                addr: PathBuf::from(path),
+                close_with: None,
+            }),
+            (2, None, Some(serde_json::Value::Bool(true))) => Ok(Request::Raise),
+            _ => Err(malformed()),
+        },
+        PROTOCOL_V2 => match (object.len(), object.get("attach"), object.get("close_with")) {
+            (3, Some(serde_json::Value::String(path)), Some(serde_json::Value::Object(close_with)))
+                if close_with.len() == 2 =>
+            {
+                let pid = close_with
+                    .get("pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok());
+                let start = close_with.get("start").and_then(serde_json::Value::as_u64);
+                match (pid, start) {
+                    (Some(pid), Some(start)) => Ok(Request::Attach {
+                        addr: PathBuf::from(path),
+                        close_with: Some(CloseWith { pid, start }),
+                    }),
+                    _ => Err(malformed()),
+                }
+            }
+            _ => Err(malformed()),
+        },
+        _ => Err(format!("unsupported protocol version {version}")),
+    }
+}
+
+/// Field 4 (the parent pid) and field 22 (the start time) of one `/proc/<pid>/stat` text. The
+/// fields are counted from the last `)`, because the command name before it may itself hold spaces
+/// and parentheses.
+pub(crate) fn stat_parent_and_start(stat: &str) -> Option<(u32, u64)> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    // `rest` starts at field 3, the state.
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let parent = fields.get(1)?.parse().ok()?;
+    let start = fields.get(19)?.parse().ok()?;
+    Some((parent, start))
+}
+
+/// Whether `close_with` names a live child of the peer, by pid and start time. Without the peer's
+/// pid nothing can be proved, so the answer is no.
+fn check_close_with(
+    close_with: CloseWith,
+    peer_pid: Option<u32>,
+    read_stat: &dyn Fn(u32) -> Option<String>,
+) -> Result<(), ()> {
+    let peer_pid = peer_pid.ok_or(())?;
+    let (parent, start) = read_stat(close_with.pid)
+        .as_deref()
+        .and_then(stat_parent_and_start)
+        .ok_or(())?;
+    if parent == peer_pid && start == close_with.start {
+        Ok(())
+    } else {
+        Err(())
     }
 }
 
@@ -586,11 +756,13 @@ fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf) -> Result<Con
         let stop = Arc::new(AtomicBool::new(false));
         let (requests_tx, requests) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
+        let accepted = Arc::new(AtomicU64::new(0));
         let thread_stop = Arc::clone(&stop);
+        let thread_accepted = Arc::clone(&accepted);
         std::thread::Builder::new()
             .name("eitri-panel-control".into())
             .spawn(move || {
-                run(listener, &thread_stop, &requests_tx);
+                run(listener, &thread_stop, &requests_tx, &thread_accepted);
                 let _ = done_tx.send(());
             })
             .map_err(|e| {
@@ -601,6 +773,7 @@ fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf) -> Result<Con
             stop,
             done,
             requests,
+            accepted,
             socket: sock.clone(),
             pid_file: pid_file.clone(),
             bound,
@@ -615,11 +788,11 @@ fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf) -> Result<Con
 
 /// The server thread: accept, serve one connection at a time, stop when told to. It never waits for
 /// the GTK side and never touches the files.
-fn run(listener: UnixListener, stop: &AtomicBool, requests: &Sender<Request>) {
+fn run(listener: UnixListener, stop: &AtomicBool, requests: &Sender<Received>, accepted: &AtomicU64) {
     let me = euid();
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _)) => serve_one(stream, requests, me),
+            Ok((stream, _)) => serve_one(stream, requests, accepted, me),
             // Nothing waiting, or a transient failure (descriptors exhausted, a connection that
             // went away): either way, never spin.
             Err(_) => std::thread::sleep(IDLE_SLEEP),
@@ -632,16 +805,22 @@ fn reply_line(stream: &UnixStream, line: &str) -> io::Result<()> {
     writer.write_all(format!("{line}\n").as_bytes())
 }
 
-fn serve_one(stream: UnixStream, requests: &Sender<Request>, me: u32) {
+fn serve_one(stream: UnixStream, requests: &Sender<Received>, accepted: &AtomicU64, me: u32) {
     // A socket accepted from a non-blocking listener inherits that flag on macOS and the BSDs, and
     // every read below would then fail at once.
     if stream.set_nonblocking(false).is_err() || stream.set_write_timeout(Some(Duration::from_secs(1))).is_err() {
         return;
     }
-    if !matches!(peer_uid(&stream), Ok(uid) if uid == me) {
-        let _ = reply_line(&stream, "refused: not your process");
-        return;
-    }
+    let peer = match peer(&stream) {
+        Ok(peer) if peer.uid == me => peer,
+        _ => {
+            let _ = reply_line(&stream, "refused: not your process");
+            return;
+        }
+    };
+    // Taken before the request is read, so it names the process that connected even if that one
+    // exits while its socket lives on in another process.
+    let peer_pidfd = peer_pidfd(&stream);
     let line = match read_line(&stream, Instant::now() + REQUEST_DEADLINE, MAX_LINE) {
         Ok(line) => line,
         Err(LineFail::TooLong) => {
@@ -655,23 +834,63 @@ fn serve_one(stream: UnixStream, requests: &Sender<Request>, me: u32) {
         Err(_) => return,
     };
     let request = match parse_request(&line) {
-        Ok(Request::Attach(path)) => match validate_nvim_addr(&path, me) {
-            Ok(()) => Request::Attach(path),
-            Err(why) => {
-                let _ = reply_line(&stream, &format!("refused: {why}"));
-                return;
-            }
-        },
-        Ok(raise) => raise,
+        Ok(request) => request,
         Err(why) => {
             let _ = reply_line(&stream, &format!("refused: {why}"));
             return;
         }
     };
+    let sender_chain = match &request {
+        Request::Raise => Vec::new(),
+        Request::Attach { addr, close_with } => {
+            if let Err(why) = validate_nvim_addr(addr, me) {
+                let _ = reply_line(&stream, &format!("refused: {why}"));
+                return;
+            }
+            // Read before the reply: the sender exits as soon as it has one, and once it is reaped
+            // its pid and its place in the process tree say nothing any more.
+            let chain = match close_with {
+                Some(close_with) => {
+                    if check_close_with(*close_with, peer.pid, &crate::wm::proc_stat).is_err() {
+                        let _ = reply_line(&stream, "refused: close_with is not the sender's child");
+                        return;
+                    }
+                    vec![close_with.pid]
+                }
+                None => peer
+                    .pid
+                    .map(|pid| crate::wm::ppid_chain(pid, &crate::wm::proc_stat, SENDER_CHAIN_MAX))
+                    .unwrap_or_default(),
+            };
+            // The process tree was read by pid. If the process that connected is still alive now,
+            // that pid was its own the whole time; if it is gone, the pid may already belong to
+            // someone else, and what was read proves nothing about the sender.
+            let sender_gone = match (&peer_pidfd, peer.pid) {
+                (Some(pidfd), Some(pid)) => !pidfd_still_names(pidfd, pid),
+                _ => false,
+            };
+            if sender_gone {
+                if close_with.is_some() {
+                    let _ = reply_line(&stream, "refused: close_with is not the sender's child");
+                    return;
+                }
+                Vec::new()
+            } else {
+                chain
+            }
+        }
+    };
     // Deliver only what the caller was told succeeded, so both sides agree on whether it happened.
     // The receiver may already be gone; that is not this thread's problem.
+    //
+    // Counted before the reply is written: the sender may read `ok` and act on it (exit, start an
+    // editor) before this thread gets to the send, and the GTK side must be able to tell from the
+    // count alone that a request is on its way. A reply that fails to write takes the count back.
+    accepted.fetch_add(1, Ordering::SeqCst);
     if reply_line(&stream, "ok").is_ok() {
-        let _ = requests.send(request);
+        let _ = requests.send(Received { request, sender_chain });
+    } else {
+        accepted.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -680,7 +899,8 @@ fn serve_one(stream: UnixStream, requests: &Sender<Request>, me: u32) {
 pub struct ControlServer {
     stop: Arc<AtomicBool>,
     done: Receiver<()>,
-    requests: Receiver<Request>,
+    requests: Receiver<Received>,
+    accepted: Arc<AtomicU64>,
     socket: PathBuf,
     pid_file: PathBuf,
     bound: (u64, u64),
@@ -690,8 +910,16 @@ pub struct ControlServer {
 impl ControlServer {
     /// The requests that were answered `ok`, in order. Poll it from the GTK thread; the server
     /// thread never waits on it.
-    pub fn requests(&self) -> &Receiver<Request> {
+    pub fn requests(&self) -> &Receiver<Received> {
         &self.requests
+    }
+
+    /// How many requests have been answered `ok` (or are being: the count goes up just before the
+    /// reply is written and comes back down if that write fails). A request is counted before its
+    /// sender can read `ok`, and delivered on [`requests`](Self::requests) after, so a reader that
+    /// has taken fewer than this many has one still on its way, or about to be withdrawn.
+    pub fn accepted(&self) -> u64 {
+        self.accepted.load(Ordering::SeqCst)
     }
 
     /// Stops the thread and removes the socket and the pid file, each only if it is still this
@@ -828,12 +1056,38 @@ mod tests {
         let dir = scratch.join("c");
         let first = ours(claim(&dir, &root(), None));
         let (nvim, _listener) = fake_nvim(&scratch);
-        let second = claim(&dir, &root(), Some(&Request::Attach(nvim.clone())));
+        let second = claim(&dir, &root(), Some(&attach(&nvim)));
         assert!(matches!(second, Ok(Claim::Forwarded(Reply::Ok))), "{second:?}");
         assert_eq!(
-            first.requests().recv_timeout(Duration::from_secs(2)),
-            Ok(Request::Attach(nvim))
+            first
+                .requests()
+                .recv_timeout(Duration::from_secs(2))
+                .map(|received| received.request),
+            Ok(attach(&nvim))
         );
+    }
+
+    #[test]
+    fn a_request_is_counted_before_its_sender_can_read_ok() {
+        let scratch = ScratchDir::new("eitri-pc", "counted");
+        let dir = scratch.join("c");
+        let first = ours(claim(&dir, &root(), None));
+        assert_eq!(first.accepted(), 0);
+        let (nvim, _listener) = fake_nvim(&scratch);
+        // `claim` returns once the reply was read: nothing of the request has been taken yet, and
+        // the count must already say it is coming.
+        let second = claim(&dir, &root(), Some(&attach(&nvim)));
+        assert!(matches!(second, Ok(Claim::Forwarded(Reply::Ok))), "{second:?}");
+        assert_eq!(first.accepted(), 1);
+        assert!(first.requests().recv_timeout(Duration::from_secs(2)).is_ok());
+        assert_eq!(first.accepted(), 1, "taking it does not change the count");
+        // A refused request is never counted.
+        let refused = claim(&dir, &root(), Some(&attach(Path::new("localhost:6666"))));
+        assert!(
+            matches!(refused, Ok(Claim::Forwarded(Reply::Refused(_)))),
+            "{refused:?}"
+        );
+        assert_eq!(first.accepted(), 1);
     }
 
     #[test]
@@ -844,7 +1098,10 @@ mod tests {
         let second = claim(&dir, &root(), None);
         assert!(matches!(second, Ok(Claim::Forwarded(Reply::Ok))), "{second:?}");
         assert_eq!(
-            first.requests().recv_timeout(Duration::from_secs(2)),
+            first
+                .requests()
+                .recv_timeout(Duration::from_secs(2))
+                .map(|received| received.request),
             Ok(Request::Raise)
         );
     }
@@ -866,7 +1123,7 @@ mod tests {
         let scratch = ScratchDir::new("eitri-pc", "refused");
         let dir = scratch.join("c");
         let first = ours(claim(&dir, &root(), None));
-        let second = claim(&dir, &root(), Some(&Request::Attach(PathBuf::from("localhost:6666"))));
+        let second = claim(&dir, &root(), Some(&attach(Path::new("localhost:6666"))));
         match second {
             Ok(Claim::Forwarded(Reply::Refused(why))) => assert!(why.contains("TCP"), "{why}"),
             other => panic!("{other:?}"),
@@ -1030,8 +1287,8 @@ mod tests {
         let cases: [(&[u8], &str); 6] = [
             (b"not json\n", "refused: malformed request\n"),
             (
-                b"{\"v\":2,\"raise\":true}\n",
-                "refused: unsupported protocol version 2\n",
+                b"{\"v\":3,\"raise\":true}\n",
+                "refused: unsupported protocol version 3\n",
             ),
             (b"{\"v\":1}\n", "refused: malformed request\n"),
             (b"{\"v\":1,\"raise\":false}\n", "refused: malformed request\n"),
@@ -1054,7 +1311,10 @@ mod tests {
         assert!(server.requests().try_recv().is_err());
         assert_eq!(raw(&sock, b"{\"v\":1,\"raise\":true}\n", false), "ok\n");
         assert_eq!(
-            server.requests().recv_timeout(Duration::from_secs(2)),
+            server
+                .requests()
+                .recv_timeout(Duration::from_secs(2))
+                .map(|received| received.request),
             Ok(Request::Raise)
         );
     }
@@ -1082,9 +1342,33 @@ mod tests {
     }
 
     #[test]
-    fn peer_uid_is_ours_for_a_local_connection() {
+    fn a_pidfds_fdinfo_names_its_pid_until_the_process_exits() {
+        assert_eq!(
+            pidfd_info_pid("pos:\t0\nflags:\t02000002\nPid:\t4242\nNSpid:\t4242\n"),
+            Some(4242)
+        );
+        assert_eq!(pidfd_info_pid("Pid:\t-1\nNSpid:\t-1\n"), Some(-1));
+        assert_eq!(pidfd_info_pid("flags:\t0\n"), None);
+    }
+
+    /// Where the kernel has `SO_PEERPIDFD`, the pidfd of a live peer names that peer's pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_peer_pidfd_names_a_live_peer() {
         let (a, _b) = UnixStream::pair().unwrap();
-        assert_eq!(peer_uid(&a).unwrap(), euid());
+        match peer_pidfd(&a) {
+            Some(pidfd) => assert!(pidfd_still_names(&pidfd, std::process::id())),
+            None => eprintln!("this kernel has no SO_PEERPIDFD; the pid-reuse guard is off here"),
+        }
+    }
+
+    #[test]
+    fn peer_credentials_are_ours_for_a_local_connection() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let peer = peer(&a).unwrap();
+        assert_eq!(peer.uid, euid());
+        #[cfg(target_os = "linux")]
+        assert_eq!(peer.pid, Some(std::process::id()));
     }
 
     #[test]
@@ -1112,6 +1396,197 @@ mod tests {
         server.cleanup();
         assert_eq!(sock.symlink_metadata().unwrap().ino(), theirs);
         assert!(!pid_path(&dir, &root()).exists());
+    }
+
+    fn attach(addr: &Path) -> Request {
+        Request::Attach {
+            addr: addr.to_owned(),
+            close_with: None,
+        }
+    }
+
+    #[test]
+    fn a_request_without_close_with_is_still_v1() {
+        // The exact bytes a panel built before `close_with` existed sent, so an older running panel
+        // still understands every request that does not need the new field.
+        assert_eq!(
+            encode(&attach(Path::new("/run/user/1000/nvim.1.0"))).unwrap(),
+            "{\"attach\":\"/run/user/1000/nvim.1.0\",\"v\":1}\n"
+        );
+        assert_eq!(encode(&Request::Raise).unwrap(), "{\"raise\":true,\"v\":1}\n");
+    }
+
+    #[test]
+    fn a_v2_attach_round_trips_and_extra_keys_are_refused() {
+        let request = Request::Attach {
+            addr: PathBuf::from("/run/user/1000/eitri/split-nvim"),
+            close_with: Some(CloseWith {
+                pid: 4242,
+                start: 123_456_789_012,
+            }),
+        };
+        let line = encode(&request).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "v": 2,
+                "attach": "/run/user/1000/eitri/split-nvim",
+                "close_with": { "pid": 4242, "start": 123_456_789_012u64 },
+            })
+        );
+        assert_eq!(parse_request(line.trim_end().as_bytes()), Ok(request));
+
+        let malformed: [&[u8]; 12] = [
+            br#"{"v":2,"attach":"/x"}"#,
+            br#"{"v":2,"close_with":{"pid":1,"start":2}}"#,
+            br#"{"v":2,"attach":"/x","close_with":{"pid":1,"start":2},"more":1}"#,
+            br#"{"v":2,"attach":"/x","close_with":{"pid":1}}"#,
+            br#"{"v":2,"attach":"/x","close_with":{"start":2}}"#,
+            br#"{"v":2,"attach":"/x","close_with":{"pid":1,"start":2,"more":1}}"#,
+            br#"{"v":2,"attach":"/x","close_with":null}"#,
+            br#"{"v":2,"attach":"/x","close_with":{"pid":-1,"start":2}}"#,
+            br#"{"v":2,"attach":"/x","close_with":{"pid":4294967296,"start":2}}"#,
+            br#"{"v":2,"attach":"/x","close_with":{"pid":1,"start":2.5}}"#,
+            br#"{"v":2,"attach":1,"close_with":{"pid":1,"start":2}}"#,
+            br#"{"v":2,"raise":true}"#,
+        ];
+        for line in malformed {
+            assert_eq!(
+                parse_request(line),
+                Err("malformed request".to_owned()),
+                "{}",
+                String::from_utf8_lossy(line)
+            );
+        }
+        // v1 never carries the field: it is a v2 capability, not an optional v1 key.
+        assert_eq!(
+            parse_request(br#"{"v":1,"attach":"/x","close_with":{"pid":1,"start":2}}"#),
+            Err("malformed request".to_owned())
+        );
+        assert_eq!(
+            parse_request(br#"{"v":3,"attach":"/x","close_with":{"pid":1,"start":2}}"#),
+            Err("unsupported protocol version 3".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_v1_server_shape_still_parses() {
+        assert_eq!(parse_request(br#"{"v":1,"attach":"/x"}"#), Ok(attach(Path::new("/x"))));
+        assert_eq!(parse_request(br#"{"attach":"/x","v":1}"#), Ok(attach(Path::new("/x"))));
+        assert_eq!(parse_request(br#"{"v":1,"raise":true}"#), Ok(Request::Raise));
+    }
+
+    #[test]
+    fn the_split_socket_is_under_the_cap_under_macos_tmpdir() {
+        // macOS's first account and its widest pid. A split needs a pidfd, so it runs on Linux only, where
+        // the runtime dir (or `/tmp/eitri-<uid>`) is far shorter; this keeps the name honest everywhere.
+        let dir = control_dir_for(None, Path::new(MACOS_TMP), 501);
+        let sock = split_socket_path(&dir, &root(), 99999, 0xffff_ffff).unwrap();
+        assert_eq!(sock.as_os_str().len(), 101);
+        assert_eq!(sock.extension(), Some(OsStr::new("sock")));
+        let stem = sock.file_stem().unwrap().to_str().unwrap();
+        assert_eq!(stem, format!("split-{}-99999-ffffffff", key(&root())));
+        // The nonce is always eight digits, so names never collide by width.
+        let small = split_socket_path(&dir, &root(), 7, 1).unwrap();
+        let small_stem = small.file_stem().unwrap().to_str().unwrap();
+        assert!(small_stem.ends_with("-7-00000001"), "{}", small.display());
+        assert_eq!(small.parent(), Some(dir.as_path()));
+    }
+
+    #[test]
+    fn the_stat_fields_are_read_after_the_last_parenthesis() {
+        // A command name may hold spaces and parentheses; field 4 is the parent, field 22 the start.
+        let tail: Vec<String> = (5..=52).map(|n| (n * 10).to_string()).collect();
+        let stat = format!("4242 (a) b (c) d) S 77 {}\n", tail.join(" "));
+        assert_eq!(stat_parent_and_start(&stat), Some((77, 220)));
+        assert_eq!(stat_parent_and_start("4242 (short) S 77 1 2"), None);
+        assert_eq!(stat_parent_and_start("no parenthesis at all"), None);
+    }
+
+    #[test]
+    fn close_with_is_judged_against_the_peer() {
+        let tail: Vec<String> = (5..=52).map(|n| n.to_string()).collect();
+        let stats = move |pid: u32| match pid {
+            // Parent 100, start time 22 (field 22 carries its own number in this table).
+            200 => Some(format!("200 (child) S 100 {}", tail.join(" "))),
+            _ => None,
+        };
+        let child = CloseWith { pid: 200, start: 22 };
+        assert_eq!(check_close_with(child, Some(100), &stats), Ok(()));
+        assert!(check_close_with(child, Some(101), &stats).is_err());
+        assert!(check_close_with(CloseWith { pid: 200, start: 23 }, Some(100), &stats).is_err());
+        assert!(check_close_with(CloseWith { pid: 201, start: 22 }, Some(100), &stats).is_err());
+        // No peer pid (macOS, or a peer in another pid namespace): nothing can be proved.
+        assert!(check_close_with(child, None, &stats).is_err());
+    }
+
+    /// The request a connection delivered, or the reply it got when it was refused.
+    fn exchange(sock: &Path, server: &ControlServer, request: &Request) -> Result<Received, String> {
+        let line = encode(request).unwrap();
+        let reply = raw(sock, line.as_bytes(), false);
+        if reply != "ok\n" {
+            assert!(server.requests().try_recv().is_err(), "refused yet delivered");
+            return Err(reply);
+        }
+        Ok(server.requests().recv_timeout(Duration::from_secs(2)).unwrap())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_attach_carries_its_senders_chain() {
+        let scratch = ScratchDir::new("eitri-pc", "chain");
+        let dir = scratch.join("c");
+        let server = ours(claim(&dir, &root(), None));
+        let sock = socket_path(&dir, &root()).unwrap();
+        let (nvim, _listener) = fake_nvim(&scratch);
+        let received = exchange(&sock, &server, &attach(&nvim)).unwrap();
+        assert_eq!(received.request, attach(&nvim));
+        assert_eq!(received.sender_chain.first(), Some(&std::process::id()));
+        assert_eq!(
+            received.sender_chain,
+            crate::wm::ppid_chain(std::process::id(), &crate::wm::proc_stat, 32)
+        );
+        // A raise names no editor, so it carries no chain.
+        let raised = exchange(&sock, &server, &Request::Raise).unwrap();
+        assert_eq!(raised.request, Request::Raise);
+        assert!(raised.sender_chain.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_close_with_that_is_not_the_senders_child_is_refused() {
+        let scratch = ScratchDir::new("eitri-pc", "closewith");
+        let dir = scratch.join("c");
+        let server = ours(claim(&dir, &root(), None));
+        let sock = socket_path(&dir, &root()).unwrap();
+        let (nvim, _listener) = fake_nvim(&scratch);
+        let start_of = |pid: u32| stat_parent_and_start(&crate::wm::proc_stat(pid).unwrap()).unwrap().1;
+        let with = |pid: u32, start: u64| Request::Attach {
+            addr: nvim.clone(),
+            close_with: Some(CloseWith { pid, start }),
+        };
+        let refused = "refused: close_with is not the sender's child\n".to_owned();
+
+        let me = std::process::id();
+        assert_eq!(exchange(&sock, &server, &with(me, start_of(me))), Err(refused.clone()));
+        let parent = std::os::unix::process::parent_id();
+        assert_eq!(
+            exchange(&sock, &server, &with(parent, start_of(parent))),
+            Err(refused.clone())
+        );
+
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let start = start_of(pid);
+        let wrong = exchange(&sock, &server, &with(pid, start + 1));
+        let right = exchange(&sock, &server, &with(pid, start));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(wrong, Err(refused));
+        let right = right.unwrap();
+        assert_eq!(right.request, with(pid, start));
+        assert_eq!(right.sender_chain, vec![pid]);
     }
 
     #[test]

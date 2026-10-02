@@ -1010,7 +1010,7 @@ class BinaryAssetTreeTests(unittest.TestCase):
         repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         self.assertEqual(sorted(rc.TRACKED_ART),
                          sorted(["desktop", "panel-desktop", "legacy-desktop"]
-                                + [r for r in rc.package_roles() if r.startswith(("icon-", "plugin-"))]))
+                                + [r for r in rc.package_roles() if r.startswith(("icon-", "plugin-", "gnome-ext-"))]))
         for role, path in rc.TRACKED_ART.items():
             self.assertTrue(os.path.isfile(os.path.join(repo, path)), (role, path))
 
@@ -1034,6 +1034,22 @@ class BinaryAssetTreeTests(unittest.TestCase):
                 on_disk.add(os.path.relpath(os.path.join(dirpath, name), os.path.join(repo, "nvim", "eitri.nvim")))
         self.assertEqual(on_disk, {path[len("nvim/eitri.nvim/"):] for role, path in rc.TRACKED_ART.items()
                                    if role.startswith("plugin-")})
+
+    def test_the_gnome_extension_is_four_files_in_the_tarball_and_both_packages(self):
+        """The extension's shipped set is the four files the shell loads; testing.js, README.md and test/
+        have no role, so a release carrying one fails the role table."""
+        top = "eitri-1.0.0-x86_64-linux/"
+        t, p = rc.tarball_roles("1.0.0"), rc.package_roles()
+        names = {"metadata.json", "extension.js", "direction.js", "policy.js"}
+        roles = {r for r in rc.TRACKED_ART if r.startswith("gnome-ext-")}
+        self.assertEqual(len(roles), 4)
+        self.assertEqual({rc.TRACKED_ART[r][len("gnome-extension/"):] for r in roles}, names)
+        for r in roles:
+            name = rc.TRACKED_ART[r][len("gnome-extension/"):]
+            self.assertEqual(t[r], top + f"share/gnome-shell/extensions/eitri@huntergrey.cn/{name}")
+            self.assertEqual(p[r], f"usr/share/gnome-shell/extensions/eitri@huntergrey.cn/{name}")
+        for path in list(t.values()) + list(p.values()):
+            self.assertNotIn("testing.js", path)
 
     def test_the_tarball_alone_carries_the_legacy_desktop_entry_for_0_2_0s_installer(self):
         """0.2.0's install.sh, which INSTALL.md tells a user to save and rerun to upgrade, refuses a

@@ -104,6 +104,14 @@ struct Shared {
     stream: UnixStream,
     next_id: AtomicU64,
     channel_id: u64,
+    /// The process holding the socket, as the kernel reported it when the connection was made; not
+    /// what that process says about itself. `None` where the platform gives no pid.
+    peer_pid: Option<u32>,
+    /// A pidfd for that process (Linux 6.5 and later), `None` on an older kernel. The pid is only a
+    /// number taken at connect time: a server can hand its socket to another process and exit, and
+    /// the number can then be reused by an unrelated program. The pidfd goes on naming the process
+    /// that was connected to, and says when it is gone.
+    peer_pidfd: Option<std::os::fd::OwnedFd>,
 }
 
 /// When the last [`NvimLink`] clone goes, the queued frames are written and the connection ends;
@@ -245,6 +253,8 @@ impl NvimLink {
             Ok(peer) => return Err(failed(&format!("the socket is held by another user (uid {peer})"))),
             Err(e) => return Err(failed(&format!("cannot tell who holds the socket: {e}"))),
         }
+        let peer_pid = crate::panel_control::peer_pid(&stream);
+        let peer_pidfd = crate::panel_control::peer_pidfd(&stream);
 
         // One buffered reader serves the handshake and then the reader thread, so bytes it already
         // took off the socket (a notification right behind the answer) are not lost.
@@ -324,7 +334,7 @@ impl NvimLink {
         stream.set_read_timeout(None).map_err(|e| failed(&e))?;
         stream.set_write_timeout(None).map_err(|e| failed(&e))?;
 
-        let link = start(reader, channel_id, events_tx).map_err(|e| failed(&e))?;
+        let link = start(reader, channel_id, peer_pid, peer_pidfd, events_tx).map_err(|e| failed(&e))?;
         Ok((link, events_rx))
     }
 
@@ -333,13 +343,30 @@ impl NvimLink {
     fn from_stream(stream: UnixStream, channel_id: u64) -> (NvimLink, Receiver<LinkEvent>) {
         let (events_tx, events_rx) = mpsc::channel();
         let source = Source { stream, deadline: None };
-        let link = start(BufReader::new(source), channel_id, events_tx).expect("threads start");
+        let peer_pid = crate::panel_control::peer_pid(&source.stream);
+        let peer_pidfd = crate::panel_control::peer_pidfd(&source.stream);
+        let link = start(BufReader::new(source), channel_id, peer_pid, peer_pidfd, events_tx).expect("threads start");
         (link, events_rx)
     }
 
     /// The channel id nvim gave this connection: what `rpcnotify` and `rpcrequest` address.
     pub fn channel_id(&self) -> u64 {
         self.shared().channel_id
+    }
+
+    /// The pid of the process that holds the socket, read from the kernel (`SO_PEERCRED`) when the
+    /// connection was made. Unlike the pid an editor reports about itself, a process cannot choose
+    /// it. `None` where the platform gives no pid, for a peer in a pid namespace this process cannot
+    /// see, and once the process that was connected to has exited (where the kernel gives a pidfd,
+    /// Linux 6.5 and later): the number may name a stranger by then. On an older kernel the pid is
+    /// returned as it was read.
+    pub fn peer_pid(&self) -> Option<u32> {
+        let shared = self.shared();
+        let still_named = shared
+            .peer_pid
+            .zip(shared.peer_pidfd.as_ref())
+            .map(|(pid, pidfd)| crate::panel_control::pidfd_still_names(pidfd, pid));
+        pid_while_named(shared.peer_pid, still_named)
     }
 
     /// Ask nvim to run `method`. Never touches the socket and never blocks: the request is queued
@@ -420,6 +447,12 @@ impl NvimLink {
     }
 }
 
+/// `pid` unless a pidfd said (`still_named == Some(false)`) that the process it was taken for has
+/// exited; `still_named` is `None` where there is no pidfd to ask.
+fn pid_while_named(pid: Option<u32>, still_named: Option<bool>) -> Option<u32> {
+    pid.filter(|_| still_named != Some(false))
+}
+
 /// One decoded frame, by what the protocol says it is.
 enum Frame {
     Request {
@@ -475,7 +508,13 @@ fn error_message(error: Value) -> String {
 }
 
 /// Start the two threads on a connection whose handshake is done.
-fn start(reader: BufReader<Source>, channel_id: u64, events: Sender<LinkEvent>) -> io::Result<NvimLink> {
+fn start(
+    reader: BufReader<Source>,
+    channel_id: u64,
+    peer_pid: Option<u32>,
+    peer_pidfd: Option<std::os::fd::OwnedFd>,
+    events: Sender<LinkEvent>,
+) -> io::Result<NvimLink> {
     let (frames_tx, frames_rx) = mpsc::channel::<Vec<u8>>();
     let alive = Arc::new(AtomicBool::new(true));
     let shared = Arc::new(Shared {
@@ -485,6 +524,8 @@ fn start(reader: BufReader<Source>, channel_id: u64, events: Sender<LinkEvent>) 
         stream: reader.get_ref().stream.try_clone()?,
         next_id: AtomicU64::new(1),
         channel_id,
+        peer_pid,
+        peer_pidfd,
     });
 
     // The writer must not hold `shared`: it owns the only `Receiver`, and `shared` owns the only
@@ -747,6 +788,16 @@ mod tests {
         write_value(&mut fake, response(id2, Value::from("boom"), Value::Nil));
         assert_eq!(typed.wait(T), Some(Err(RpcError::Nvim("boom".to_owned()))));
         assert_eq!(bare.wait(T), Some(Err(RpcError::Nvim("boom".to_owned()))));
+    }
+
+    #[test]
+    fn a_peer_pid_is_dropped_once_its_pidfd_says_the_process_is_gone() {
+        assert_eq!(pid_while_named(Some(7), Some(true)), Some(7));
+        assert_eq!(pid_while_named(Some(7), Some(false)), None);
+        // No pidfd (an older kernel): the pid as it was read.
+        assert_eq!(pid_while_named(Some(7), None), Some(7));
+        assert_eq!(pid_while_named(None, Some(true)), None);
+        assert_eq!(pid_while_named(None, None), None);
     }
 
     #[test]

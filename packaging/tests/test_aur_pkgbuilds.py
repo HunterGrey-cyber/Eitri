@@ -29,6 +29,10 @@ _SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-aur-pkgbuild-tests")
 DESKTOP = "cn.huntergrey.eitri.desktop"
 PANEL_DESKTOP = "cn.huntergrey.eitri.Panel.desktop"
 PLUGIN_ROOT = os.path.join(_REPO, "nvim", "eitri.nvim")
+EXTENSION_ROOT = os.path.join(_REPO, "gnome-extension")
+EXTENSION_ID = "eitri@huntergrey.cn"
+# The four files the shell loads; testing.js, README.md and test/ sit beside them in the source.
+EXTENSION_FILES = ["direction.js", "extension.js", "metadata.json", "policy.js"]
 # What makepkg's msg2 prints for the one line (the test's own stand-in msg2 prints "  -> text").
 SLOW_LINE = "  -> Installing the Claude Agent SDK and building the sidecar (1-3 min)"
 
@@ -74,6 +78,17 @@ class _PackageCase(unittest.TestCase):
         os.makedirs(self.pkgdir)
         _touch(os.path.join(self.srcdir, "sidecar", "verdandi-claude-sidecar"), mode=0o755)
         _touch(os.path.join(self.srcdir, "sidecar", "verdandi-claude-sidecar.rev"))
+
+    def test_neovide_is_an_optional_dependency_for_eitri_split(self):
+        """`eitri split` runs the user's Neovide, which Eitri does not bundle: optdepends names it."""
+        if not self.pkgbuild:
+            self.skipTest("the base class names no PKGBUILD")
+        script = f'set -euo pipefail; source "{self.pkgbuild}"; printf "%s\\n" "${{optdepends[@]}}"'
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("neovide: eitri split", proc.stdout.splitlines())
+        # The array holds the earlier entries as well: this one was added to it, not put in its place.
+        self.assertTrue(any(line.startswith("neovim:") for line in proc.stdout.splitlines()))
 
     def package(self, extra=""):
         """Run the PKGBUILD's package() with the scratch srcdir and pkgdir; return the CompletedProcess."""
@@ -123,6 +138,15 @@ class _PackageCase(unittest.TestCase):
             path = os.path.join(self.pkgdir, "usr/share/eitri/nvim/eitri.nvim", rel)
             self.assertEqual(_read(path), _read(os.path.join(PLUGIN_ROOT, rel)), rel)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o644, rel)
+        # The GNOME Shell extension: exactly its four files (testing.js and test/ never ride along).
+        self.assertEqual(
+            [p for p in got if p.startswith("usr/share/gnome-shell/")],
+            [f"usr/share/gnome-shell/extensions/{EXTENSION_ID}/{rel}" for rel in EXTENSION_FILES],
+        )
+        for rel in EXTENSION_FILES:
+            path = os.path.join(self.pkgdir, "usr/share/gnome-shell/extensions", EXTENSION_ID, rel)
+            self.assertEqual(_read(path), _read(os.path.join(EXTENSION_ROOT, rel)), rel)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644, rel)
         self.assertEqual(
             _read(os.path.join(self.pkgdir, "usr/share/applications", DESKTOP)),
             _read(os.path.join(_PACKAGING, DESKTOP)),
@@ -148,6 +172,12 @@ class EitriBinPackage(_PackageCase):
         shutil.copy(os.path.join(_PACKAGING, DESKTOP), os.path.join(top, "share", "applications", DESKTOP))
         shutil.copy(os.path.join(_PACKAGING, PANEL_DESKTOP), os.path.join(top, "share", "applications", PANEL_DESKTOP))
         shutil.copytree(PLUGIN_ROOT, os.path.join(top, "share", "eitri", "eitri.nvim"))
+        # A stray testing.js beside the four shipped files must not be installed (the git route's checkout,
+        # below, holds the whole directory and the package must leave the rest out the same way).
+        _touch(os.path.join(top, "share", "gnome-shell", "extensions", EXTENSION_ID, "testing.js"))
+        for rel in EXTENSION_FILES:
+            shutil.copy(os.path.join(EXTENSION_ROOT, rel),
+                        os.path.join(top, "share", "gnome-shell", "extensions", EXTENSION_ID, rel))
         # The release tarball also carries 0.2.0's own entry, for 0.2.0's installer alone: the package
         # must not install it (assert_desktop_and_icons checks eitri.desktop is absent).
         shutil.copy(os.path.join(_PACKAGING, "legacy", "eitri.desktop"), os.path.join(top, "share", "applications", "eitri.desktop"))
@@ -194,6 +224,7 @@ class EitriGitPackage(_PackageCase):
         shutil.copy(os.path.join(_PACKAGING, DESKTOP), os.path.join(tree, "packaging", DESKTOP))
         shutil.copy(os.path.join(_PACKAGING, PANEL_DESKTOP), os.path.join(tree, "packaging", PANEL_DESKTOP))
         shutil.copytree(PLUGIN_ROOT, os.path.join(tree, "nvim", "eitri.nvim"))
+        shutil.copytree(EXTENSION_ROOT, os.path.join(tree, "gnome-extension"))
         shutil.copytree(os.path.join(_PACKAGING, "icons"), os.path.join(tree, "packaging", "icons"))
         _touch(os.path.join(tree, "LICENSE"), b"MIT\n")
         _touch(os.path.join(self.srcdir, "release-for-sidecar.env"))

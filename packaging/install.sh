@@ -61,6 +61,14 @@ NV_OLD_DESKTOP=eitri.desktop
 # the private nvim versions this installer scans and removes. A test holds this list to the committed
 # files.
 NV_PLUGIN_FILES='plugin/eitri.lua lua/eitri/init.lua doc/eitri.txt'
+# The GNOME Shell extension a companion panel on GNOME uses to move focus to and from its editor: in the release
+# tarball at share/gnome-shell/extensions/<NV_EXT_ID>/<file>, and installed to
+# $XDG_DATA_HOME/gnome-shell/extensions/<NV_EXT_ID>/<file>, where the shell looks for a user's extensions.
+# Only the four files the shell loads: the extension's testing.js and test/ never ship. This installer puts
+# the files in place and never runs `gnome-extensions`: enabling is the user's own step. A test holds this
+# list to the committed files.
+NV_EXT_ID='eitri@huntergrey.cn'
+NV_EXT_FILES='metadata.json extension.js direction.js policy.js'
 # The icon, one file per size under the icon theme's tree: each is in the release tarball at
 # share/icons/<this path> and goes to $XDG_DATA_HOME/icons/<this path> (packaging/release_check.py's
 # role table holds the tarball to exactly this set, and a test holds the two lists equal).
@@ -1791,6 +1799,9 @@ on_exit() {
 		for _oe_i in $NV_PLUGIN_FILES; do
 			rm -f -- "$NV_DATA/eitri/eitri.nvim/${_oe_i%/*}/.${_oe_i##*/}.tmp.$$" 2>/dev/null || :
 		done
+		for _oe_i in $NV_EXT_FILES; do
+			rm -f -- "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID/.$_oe_i.tmp.$$" 2>/dev/null || :
+		done
 		if [ -n "${NV_SIDECAR_TMP-}" ]; then rm -f -- "$NV_SIDECAR_TMP" 2>/dev/null || :; fi
 		if [ -n "${NV_NVIM_TMP_DEST-}" ]; then rm -rf -- "$NV_NVIM_TMP_DEST" 2>/dev/null || :; fi
 		rm -rf -- "$NV_DL" "$NV_STAGE" 2>/dev/null || :
@@ -2672,7 +2683,7 @@ from_source_stage() {
 	rm -rf -- "$NV_STAGE" || die "cannot remove the stale $NV_STAGE"
 	_fss_top=$NV_STAGE/eitri-$NV_VERSION-x86_64-linux
 	NV_STAGE_TOP=$_fss_top
-	mkdir -p -- "$_fss_top/bin" "$_fss_top/lib/eitri" "$_fss_top/share/applications" "$_fss_top/share/licenses/eitri" "$_fss_top/share/eitri/eitri.nvim" ||
+	mkdir -p -- "$_fss_top/bin" "$_fss_top/lib/eitri" "$_fss_top/share/applications" "$_fss_top/share/licenses/eitri" "$_fss_top/share/eitri/eitri.nvim" "$_fss_top/share/gnome-shell/extensions/$NV_EXT_ID" ||
 		die "cannot create $_fss_top"
 	cp -- "$_fss_src/packaging/eitri.launcher.sh" "$_fss_top/bin/eitri" || die "cannot stage the launcher"
 	chmod 0755 "$_fss_top/bin/eitri" || die "cannot chmod the staged launcher"
@@ -2697,6 +2708,10 @@ from_source_stage() {
 		if [ ! -f "$_fss_src/nvim/eitri.nvim/$_fss_i" ]; then die "$_fss_src has no nvim/eitri.nvim/$_fss_i: report it at $NV_ISSUES"; fi
 		mkdir -p -- "$_fss_top/share/eitri/eitri.nvim/${_fss_i%/*}" || die "cannot create $_fss_top/share/eitri/eitri.nvim/${_fss_i%/*}"
 		cp -- "$_fss_src/nvim/eitri.nvim/$_fss_i" "$_fss_top/share/eitri/eitri.nvim/$_fss_i" || die "cannot stage the plugin file $_fss_i"
+	done
+	for _fss_i in $NV_EXT_FILES; do
+		if [ ! -f "$_fss_src/gnome-extension/$_fss_i" ]; then die "$_fss_src has no gnome-extension/$_fss_i: report it at $NV_ISSUES"; fi
+		cp -- "$_fss_src/gnome-extension/$_fss_i" "$_fss_top/share/gnome-shell/extensions/$NV_EXT_ID/$_fss_i" || die "cannot stage the extension file $_fss_i"
 	done
 	for _fss_i in $NV_ICON_FILES; do
 		if [ ! -f "$_fss_src/packaging/icons/$_fss_i" ]; then die "$_fss_src has no packaging/icons/$_fss_i: report it at $NV_ISSUES"; fi
@@ -3136,6 +3151,9 @@ unpack_new() {
 	for _un_f in $NV_PLUGIN_FILES; do
 		if [ ! -f "$_un_top/share/eitri/eitri.nvim/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/eitri/eitri.nvim/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
+	for _un_f in $NV_EXT_FILES; do
+		if [ ! -f "$_un_top/share/gnome-shell/extensions/$NV_EXT_ID/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/gnome-shell/extensions/$NV_EXT_ID/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+	done
 	for _un_f in $NV_ICON_FILES; do
 		if [ ! -f "$_un_top/share/icons/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/icons/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
@@ -3298,6 +3316,9 @@ desktop_exec_line() {
 # The plugin's directory, $NV_DATA/eitri/eitri.nvim, is written (and removed) only when it is not a
 # symlink: a link there is the user's own checkout of the plugin (a plugin manager's `dir =`, a
 # development tree), and writing through it would change their files. It is left alone, and named.
+# The GNOME Shell extension's directory, $NV_DATA/gnome-shell/extensions/$NV_EXT_ID, follows the same
+# rule: a symlink there is the user's own checkout of the extension and is not written, removed or
+# counted by install_complete.
 # stage_files: the launcher (with its marker line, spec §6.5, MIN-2), the desktop entries (their Exec
 # escaped), the nvim plugin, the icon (every size) and the licences, each written to a temporary name in its destination
 # directory. This runs before the swap, so a directory that cannot be written stops the run while the
@@ -3317,6 +3338,11 @@ stage_files() {
 			for _sf_f in $NV_PLUGIN_FILES; do say "would write $NV_DATA/eitri/eitri.nvim/$_sf_f"; done
 		else
 			say "would leave $NV_DATA/eitri/eitri.nvim alone: it is a symlink"
+		fi
+		if [ ! -L "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID" ]; then
+			for _sf_f in $NV_EXT_FILES; do say "would write $NV_DATA/gnome-shell/extensions/$NV_EXT_ID/$_sf_f"; done
+		else
+			say "would leave $NV_DATA/gnome-shell/extensions/$NV_EXT_ID alone: it is a symlink"
 		fi
 		for _sf_f in $NV_ICON_FILES; do say "would write $NV_DATA/icons/$_sf_f"; done
 		for _sf_f in $NV_LICENCE_FILES; do say "would write $_sf_lic/$_sf_f"; done
@@ -3346,6 +3372,15 @@ stage_files() {
 		done
 	else
 		warn "$NV_DATA/eitri/eitri.nvim is a symlink, so the plugin was not installed over it: it is yours, and it is left as it is"
+	fi
+	if [ ! -L "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID" ]; then
+		mkdir -p -- "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID" || die "cannot create $NV_DATA/gnome-shell/extensions/$NV_EXT_ID; $_sf_keep"
+		for _sf_f in $NV_EXT_FILES; do
+			cp -- "$NV_STAGE_TOP/share/gnome-shell/extensions/$NV_EXT_ID/$_sf_f" "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID/.$_sf_f.tmp.$$" ||
+				die "cannot write $NV_DATA/gnome-shell/extensions/$NV_EXT_ID/.$_sf_f.tmp.$$; $_sf_keep"
+		done
+	else
+		warn "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID is a symlink, so the GNOME Shell extension was not installed over it: it is yours, and it is left as it is"
 	fi
 	for _sf_f in $NV_LICENCE_FILES; do
 		cp -- "$NV_STAGE_TOP/share/licenses/eitri/$_sf_f" "$_sf_lic/.$_sf_f.tmp.$$" ||
@@ -3396,6 +3431,12 @@ commit_files() {
 				die "cannot write $NV_DATA/eitri/eitri.nvim/$_cf_f; $_cf_fin"
 		done
 	fi
+	if [ ! -L "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID" ]; then
+		for _cf_f in $NV_EXT_FILES; do
+			mv -- "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID/.$_cf_f.tmp.$$" "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID/$_cf_f" ||
+				die "cannot write $NV_DATA/gnome-shell/extensions/$NV_EXT_ID/$_cf_f; $_cf_fin"
+		done
+	fi
 	for _cf_f in $NV_ICON_FILES; do
 		mv -- "$NV_DATA/icons/${_cf_f%/*}/.${_cf_f##*/}.tmp.$$" "$NV_DATA/icons/$_cf_f" ||
 			die "cannot write $NV_DATA/icons/$_cf_f; $_cf_fin"
@@ -3438,6 +3479,11 @@ install_complete() {
 	if [ ! -L "$NV_DATA/eitri/eitri.nvim" ]; then
 		for _ic_f in $NV_PLUGIN_FILES; do
 			if [ ! -f "$NV_DATA/eitri/eitri.nvim/$_ic_f" ]; then return 0; fi
+		done
+	fi
+	if [ ! -L "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID" ]; then
+		for _ic_f in $NV_EXT_FILES; do
+			if [ ! -f "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID/$_ic_f" ]; then return 0; fi
 		done
 	fi
 	for _ic_f in $NV_ICON_FILES; do
@@ -3645,6 +3691,7 @@ do_uninstall() {
 	_du_launcher_note=
 	_du_link_note=
 	_du_sidecar_link_note=
+	_du_ext_note=
 	# The targets are this function's positional parameters, one path each: never joined into one
 	# string and split again, which once let a newline in an XDG variable name any directory in
 	# $HOME (Task 9 review; xdg_dir now refuses one as well).
@@ -3678,6 +3725,13 @@ do_uninstall() {
 			set -- "$@" "$_du_if"
 		fi
 	done
+	# The GNOME Shell extension's directory goes unless it is a symlink: then it is the user's own checkout.
+	_du_ext=$NV_DATA/gnome-shell/extensions/$NV_EXT_ID
+	if [ -L "$_du_ext" ]; then
+		_du_ext_note="$_du_ext is a symlink, so it was left alone: this installer never made that link"
+	else
+		set -- "$@" "$_du_ext"
+	fi
 	# What Eitri keeps under $NV_DATA/eitri (a private nvim, the sidecars) goes only when that
 	# really is a directory named eitri, wherever a link puts it (moved to another disk, say). A
 	# link to anything else -- ~/.config, once, whose nvim went with it -- was not made by this
@@ -3790,12 +3844,18 @@ do_uninstall() {
 			done
 		fi
 		if [ -d "$NV_DATA/licenses" ]; then rmdir -- "$NV_DATA/licenses" 2>/dev/null || :; fi
+		# $NV_DATA/gnome-shell/extensions is the shell's own directory for every extension of the user:
+		# it, and gnome-shell above it, go only when Eitri's was the last thing in them (rmdir removes an
+		# empty directory and nothing else, and never a symlink).
+		rmdir -- "$NV_DATA/gnome-shell/extensions" 2>/dev/null || :
+		rmdir -- "$NV_DATA/gnome-shell" 2>/dev/null || :
 		tidy_icon_dirs
 	fi
 	if [ -n "$_du_desktop_note" ]; then say "$_du_desktop_note"; fi
 	if [ -n "$_du_launcher_note" ]; then say "$_du_launcher_note"; fi
 	if [ -n "$_du_link_note" ]; then say "$_du_link_note"; fi
 	if [ -n "$_du_sidecar_link_note" ]; then say "$_du_sidecar_link_note"; fi
+	if [ -n "$_du_ext_note" ]; then say "$_du_ext_note"; fi
 	# A profile this install's steps put under /etc/apparmor.d stays (this installer never runs
 	# sudo): it names a path nothing runs from any more, and removing it takes root.
 	_du_uid=$(id -u 2>/dev/null) || _du_uid=

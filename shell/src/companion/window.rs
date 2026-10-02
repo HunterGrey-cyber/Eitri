@@ -14,6 +14,7 @@ use eitri_core::layout::{Direction, Layout, ModuleId, ModuleKeys, ModuleKind};
 use eitri_core::pane_switch::PaneSwitchChannel;
 use eitri_core::panel_control::{ControlServer, Request};
 
+use super::close_watch::{CloseWatcher, ExitDecision};
 use super::link::CompanionLink;
 use super::prefix::{self as companion_prefix, CompanionVerb};
 use super::wm_runner::WmRunner;
@@ -472,10 +473,11 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let attached = attached.clone();
         let agent_for_change = agent.clone();
         let agent_for_cancel = agent.clone();
+        let runner_for_change = runner.clone();
         CompanionLink::start(
             start.nvim.clone(),
             sockets,
-            move |state, band| {
+            move |state, band, peer_pid| {
                 let was = attached.get();
                 let now = matches!(state, LinkState::Attached { .. });
                 attached.set(now);
@@ -484,6 +486,19 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                 // makes the editor send its first context, and that line may be read just before.
                 if matches!(state, LinkState::Connecting { .. }) || (was && !now) {
                     reset_context();
+                }
+                // GNOME's extension is told which window the editor is once it is known, and that
+                // there is none once it is gone. A link still connecting or installing leaves the
+                // partner as it is: a request that just brought this panel forward named its own. The
+                // window is looked for from the pid of the process holding the editor's socket, not
+                // from the pid the editor reported about itself, and where the platform gives none
+                // there is no partner.
+                match state {
+                    LinkState::Attached { .. } => runner_for_change.set_partner_from(peer_pid),
+                    LinkState::NoEditor | LinkState::Detached { .. } | LinkState::Failed { .. } => {
+                        runner_for_change.set_partner_from(None)
+                    }
+                    LinkState::Connecting { .. } | LinkState::Attaching { .. } => {}
                 }
                 println!("[companion] link: {} {}", band.state, band.text);
                 agent_for_change.set_editor_link(band);
@@ -501,12 +516,13 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     // continue as a move toward the window beyond it. The channel carries no shim, so only a
     // navigator that was told the socket (the installed nvim glue) ever writes here.
     if let Some(channel) = pane_switch.borrow_mut().as_mut() {
-        let move_focus = move_focus.clone();
+        let runner = runner.clone();
+        let agent = agent.clone();
         crate::pane_switch::listen(channel, move |message| {
             if let crate::pane_switch::PaneMessage::Direction(letter) = message {
                 match crate::pane_switch::letter_direction(letter) {
                     Some(direction) => {
-                        move_focus(&ModuleId::agent(), direction);
+                        runner.editor_edge(direction, &|text| agent.show_notice(text));
                     }
                     None => println!("[pane_switch] unknown direction {letter:?}, ignoring"),
                 }
@@ -546,33 +562,111 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     // What a second `eitri panel` or `:EitriPanel` asked of this one, read off the control socket's
     // thread. Only the last attach counts: two inside one tick would otherwise connect twice.
     let server: Option<Rc<ControlServer>> = start.control.take().map(Rc::new);
-    if let Some(server) = server.clone() {
+    // The panel closes when the editor it was started with exits (`eitri split`). The watch belongs
+    // to the attachment the accepted requests chose, so the drain below feeds it every request.
+    let close_watcher = Rc::new(RefCell::new(CloseWatcher::new()));
+    // How many accepted requests this side has taken off the control thread's queue.
+    let taken = Rc::new(Cell::new(0u64));
+    // Takes what the control thread has already accepted and acts on it. It runs on a timer, and
+    // again the moment a watched editor exits: the control thread answers `ok` before this side
+    // reads the request, so an editor can exit between the two, and its exit must not close a panel
+    // that was just given another editor. `false` once the window is gone.
+    let drain_requests: Rc<dyn Fn() -> bool> = {
         let window = window.downgrade();
         let link = link.clone();
         let runner = runner.clone();
-        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        let close_watcher = Rc::downgrade(&close_watcher);
+        let server = server.clone();
+        let taken = taken.clone();
+        Rc::new(move || {
             let Some(window) = window.upgrade() else {
-                return gtk4::glib::ControlFlow::Break;
+                return false;
+            };
+            let (Some(server), Some(close_watcher)) = (&server, close_watcher.upgrade()) else {
+                return true;
             };
             let mut attach = None;
+            let mut partner = None;
             let mut present = false;
-            for request in server.requests().try_iter() {
-                match request {
-                    Request::Attach(addr) => {
+            for received in server.requests().try_iter() {
+                taken.set(taken.get() + 1);
+                // Taken before the request is taken apart; only the last attach counts, partner included.
+                let chain = super::requests::partner_chain(&received).map(<[u32]>::to_vec);
+                match received.request {
+                    Request::Attach { addr, close_with } => {
+                        close_watcher.borrow_mut().on_request(&addr, close_with);
                         attach = Some(addr);
+                        partner = chain;
                         present = true;
                     }
                     Request::Raise => present = true,
                 }
             }
+            // Read before the request is handed to the link: a request for the editor already attached
+            // changes nothing there, and the raise then has to give the partner back to that editor.
+            let editor_pid = attach.as_deref().and_then(|addr| link.attached_to(addr));
             if let Some(addr) = attach {
                 link.attach(addr);
             }
             if present {
                 window.present();
-                runner.raise_pid(std::process::id());
+                runner.raise_for_request(partner, editor_pid);
             }
-            gtk4::glib::ControlFlow::Continue
+            true
+        })
+    };
+    // The generation of an exit that is waiting for a request still on its way; decided again on
+    // each drain until that request is in. A request that replaces the watch makes it moot.
+    let waiting_exit: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+    // What an editor's exit means once the requests taken so far are known.
+    let settle_exit: Rc<dyn Fn(u64)> = {
+        let window = window.downgrade();
+        let watcher = Rc::downgrade(&close_watcher);
+        let server = server.clone();
+        let (taken, waiting_exit) = (taken.clone(), waiting_exit.clone());
+        Rc::new(move |generation| {
+            let Some(watcher) = watcher.upgrade() else { return };
+            let accepted = server.as_ref().map_or(0, |server| server.accepted());
+            let decision = watcher.borrow().exit_decision(generation, accepted, taken.get());
+            waiting_exit.set((decision == ExitDecision::Wait).then_some(generation));
+            if decision == ExitDecision::Close {
+                if let Some(window) = window.upgrade() {
+                    // The same close as the window's own: a running turn still asks first.
+                    window.close();
+                }
+            }
+        })
+    };
+    {
+        let drain_requests = drain_requests.clone();
+        let settle_exit = settle_exit.clone();
+        close_watcher.borrow_mut().set_on_exit(move |generation| {
+            // Requests that were already accepted come first: one of them may have replaced the
+            // watch that fired, and that editor's exit then says nothing about this panel. One the
+            // control thread answered `ok` but has not delivered yet defers the decision.
+            if drain_requests() {
+                settle_exit(generation);
+            }
+        });
+    }
+    if let (Some((close_with, child)), Some(addr)) = (start.close_with.take(), start.nvim.clone()) {
+        close_watcher.borrow_mut().install(addr, close_with, child);
+    }
+    // The one strong holder of the close watcher, for the window's life: everything else refers to
+    // it weakly, since it holds the exit callback that holds the drain.
+    {
+        let (drain_requests, settle_exit, waiting_exit) =
+            (drain_requests.clone(), settle_exit.clone(), waiting_exit.clone());
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            let _keeps = &close_watcher;
+            if drain_requests() {
+                if let Some(generation) = waiting_exit.get() {
+                    settle_exit(generation);
+                }
+                gtk4::glib::ControlFlow::Continue
+            } else {
+                gtk4::glib::ControlFlow::Break
+            }
         });
     }
 

@@ -26,6 +26,13 @@ EXPECTED_TREE='./.local d
 ./.local/share/eitri/eitri.nvim/lua/eitri/init.lua f
 ./.local/share/eitri/eitri.nvim/plugin d
 ./.local/share/eitri/eitri.nvim/plugin/eitri.lua f
+./.local/share/gnome-shell d
+./.local/share/gnome-shell/extensions d
+./.local/share/gnome-shell/extensions/eitri@huntergrey.cn d
+./.local/share/gnome-shell/extensions/eitri@huntergrey.cn/direction.js f
+./.local/share/gnome-shell/extensions/eitri@huntergrey.cn/extension.js f
+./.local/share/gnome-shell/extensions/eitri@huntergrey.cn/metadata.json f
+./.local/share/gnome-shell/extensions/eitri@huntergrey.cn/policy.js f
 ./.local/share/icons d
 ./.local/share/icons/hicolor d
 ./.local/share/icons/hicolor/128x128 d

@@ -66,7 +66,13 @@ one-window mode.
   of the same server instead of the one that holds your nvim.
 - **At sway's edge the key is consumed.** Eitri has to take or release `Ctrl+h/j/k/l` before it can ask sway
   whether a window lies that way, so at the edge the key does nothing, as tmux's own `select-pane` does at its edge.
-- **GNOME and KDE: no focus moves.** A Wayland client cannot take focus there; use the desktop's own window keys.
+- **KDE: no focus moves.** A Wayland client cannot take focus there; use the desktop's own window keys.
+- **GNOME needs the Eitri GNOME Shell extension** for focus moves, enabled by you and loaded at your next login
+  ([INSTALL](../INSTALL.md#gnome-the-extension)). With it: moves stay on the focused window's monitor; an X11 or
+  XWayland window never counts; moving back within about a third of a second of the previous move is refused; a
+  terminal that runs all its windows in one process (GNOME Terminal, Ptyxis) gets focus handed back to its most
+  recent window, which may not be nvim's; a forwarded `eitri split` does not bring the panel forward; and the
+  supervisor's "bring to front" does nothing.
 
 ## Security
 

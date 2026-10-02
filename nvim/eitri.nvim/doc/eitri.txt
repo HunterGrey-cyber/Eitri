@@ -113,7 +113,16 @@ manager. In `init.lua` (see the Eitri documentation):
   eitri.config.set("companion.wm", "auto")
 <
 Accepted values: "auto" (the default; detected from the session), "hyprland",
-"sway", "niri", and "none" (the panel never asks the window manager to move
-focus). Any other value stops the panel at start-up, naming the key.
+"sway", "niri", "gnome", and "none" (the panel never asks the window manager
+to move focus). Any other value stops the panel at start-up, naming the key.
+
+On GNOME the moves go through the Eitri GNOME Shell extension, which the
+packages install and you enable: `gnome-extensions enable eitri@huntergrey.cn`,
+then log in again. It moves focus only right after you press a key in the
+panel or in its editor.
+
+To start Neovide and the panel together, run `eitri split [DIR]` in a shell:
+it starts Neovide with nvim on a private socket and attaches the panel to it.
+The panel closes when that Neovide exits; closing the panel leaves Neovide.
 
 vim:tw=78:ts=8:ft=help:norl:

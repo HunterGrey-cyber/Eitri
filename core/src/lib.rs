@@ -34,6 +34,7 @@ pub mod project_root;
 pub mod prompt_history;
 pub mod saved_tabs;
 pub mod scratch;
+pub mod split;
 pub mod tab_restore;
 pub mod tab_set;
 pub mod tabs;

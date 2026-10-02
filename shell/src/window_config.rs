@@ -52,7 +52,7 @@ pub(crate) fn parse_panel_font_size(raw: Option<&str>) -> Result<f32, String> {
     }
 }
 
-/// `companion.wm`: `"auto"` (the default), `"hyprland"`, `"sway"`, `"niri"` or `"none"`; anything
+/// `companion.wm`: `"auto"` (the default), `"hyprland"`, `"sway"`, `"niri"`, `"gnome"` or `"none"`; anything
 /// else is a startup failure naming the key, like `agent.font_size`. `Err` is the text after
 /// "eitri: ".
 pub(crate) fn parse_companion_wm(raw: Option<&str>) -> Result<eitri_core::wm::WmChoice, String> {
@@ -269,6 +269,10 @@ mod tests {
         assert!(err.contains("companion.wm"), "{err}");
         assert!(err.contains("\"i3\""), "{err}");
         assert_eq!(parse_companion_wm(None), Ok(eitri_core::wm::WmChoice::Auto));
+        assert_eq!(
+            parse_companion_wm(Some("gnome")),
+            Ok(eitri_core::wm::WmChoice::Fixed(eitri_core::wm::Wm::Gnome))
+        );
         assert_eq!(
             parse_companion_wm(Some("sway")),
             Ok(eitri_core::wm::WmChoice::Fixed(eitri_core::wm::Wm::Sway))

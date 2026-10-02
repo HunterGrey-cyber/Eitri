@@ -1,0 +1,7 @@
+{
+  "uuid": "eitri@huntergrey.cn",
+  "name": "Eitri",
+  "description": "Lets the Eitri panel move keyboard focus between itself and its editor window with Ctrl+h/j/k/l.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/HunterGrey-cyber/eitri"
+}

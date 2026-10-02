@@ -58,6 +58,7 @@ fs_scaffold() {
 	cp "$PKG/cn.huntergrey.eitri.Panel.desktop" "$_fs_dir/packaging/cn.huntergrey.eitri.Panel.desktop"
 	mkdir -p "$_fs_dir/nvim"
 	cp -R "$PKG/../nvim/eitri.nvim" "$_fs_dir/nvim/eitri.nvim"
+	cp -R "$PKG/../gnome-extension" "$_fs_dir/gnome-extension"
 	cp -R "$PKG/icons" "$_fs_dir/packaging/icons"
 	cp "$INSTALLER" "$_fs_dir/packaging/install.sh"
 	printf 'test fixture LICENSE: MIT-shaped, not the real text.\n' >"$_fs_dir/LICENSE"
@@ -183,6 +184,9 @@ t_from_source_clone_head_match_builds_and_installs() {
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop"
 	for f in plugin/eitri.lua lua/eitri/init.lua doc/eitri.txt; do
 		if ! cmp -s "$PKG/../nvim/eitri.nvim/$f" "$(data_of)/eitri/eitri.nvim/$f"; then fail "the plugin file $f was not installed from the checkout"; fi
+	done
+	for f in metadata.json extension.js direction.js policy.js; do
+		if ! cmp -s "$PKG/../gnome-extension/$f" "$(data_of)/gnome-shell/extensions/eitri@huntergrey.cn/$f"; then fail "the extension file $f was not installed from the checkout"; fi
 	done
 	expect_absent "$(data_of)/applications/eitri.desktop"
 	for f in $(cd "$PKG/icons" && find hicolor -type f | LC_ALL=C sort); do

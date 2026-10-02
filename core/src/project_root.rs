@@ -201,6 +201,52 @@ pub fn parse_panel_args(args: &[OsString], nvim_env: Option<OsString>) -> Result
 
 const TWO_PROJECTS: &str = "eitri panel: takes at most one project directory";
 
+/// What `eitri split` took from its own command line: the project directory, in the form
+/// [`resolve_args`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitArgs {
+    /// At most one project directory; when it was given after `--` the `--` stays in front of it so
+    /// a directory named like a flag is still read as a path.
+    pub rest: Vec<OsString>,
+}
+
+/// `eitri split`'s command line: `[--] [DIR]`, nothing else. The split starts the editor itself, so
+/// there is no option to pass on to it: any `-...` before `--` is refused by name.
+pub fn parse_split_args(args: &[OsString]) -> Result<SplitArgs, String> {
+    const TWO: &str = "eitri split: takes at most one project directory";
+    let mut project: Option<(bool, OsString)> = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new(END_OF_FLAGS) {
+            if let Some(path) = args.next() {
+                if project.is_some() {
+                    return Err(TWO.to_string());
+                }
+                project = Some((true, path.clone()));
+            }
+            if args.next().is_some() {
+                return Err(TWO.to_string());
+            }
+            break;
+        }
+        if arg.as_bytes().first() == Some(&b'-') {
+            return Err(format!("eitri split: unknown option {}", arg.to_string_lossy()));
+        }
+        if project.is_some() {
+            return Err(TWO.to_string());
+        }
+        project = Some((false, arg.clone()));
+    }
+    let mut rest = Vec::new();
+    if let Some((after_dashes, path)) = project {
+        if after_dashes {
+            rest.push(OsString::from(END_OF_FLAGS));
+        }
+        rest.push(path);
+    }
+    Ok(SplitArgs { rest })
+}
+
 /// [`resolve`] with its three process-globals passed in, so the wiring between the two halves --
 /// which of them is consulted first, and that the chosen source is the one actually
 /// canonicalized -- is reachable from a test. A swap of `args` and `env` here would be invisible
@@ -604,6 +650,35 @@ mod tests {
         // What the resolver then does with it: the dashed name is read as a path, not refused.
         let err = resolve_args(&parsed_rest(&["--", "-no-such-eitri-dir"])).expect_err("not a directory");
         assert!(err.contains("-no-such-eitri-dir"), "got {err}");
+    }
+
+    #[test]
+    fn split_takes_no_directory_one_directory_or_one_after_double_dash() {
+        assert_eq!(parse_split_args(&[]).unwrap().rest, Vec::<OsString>::new());
+        assert_eq!(parse_split_args(&os(&["/p"])).unwrap().rest, os(&["/p"]));
+        assert_eq!(parse_split_args(&os(&["--", "/p"])).unwrap().rest, os(&["--", "/p"]));
+        assert_eq!(
+            parse_split_args(&os(&["--", "-odd"])).unwrap().rest,
+            os(&["--", "-odd"])
+        );
+        // A bare trailing `--` is no project at all.
+        assert_eq!(parse_split_args(&os(&["--"])).unwrap().rest, Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn split_refuses_two_directories_and_every_option_by_name() {
+        let two = Err("eitri split: takes at most one project directory".to_string());
+        assert_eq!(parse_split_args(&os(&["/a", "/b"])), two);
+        assert_eq!(parse_split_args(&os(&["/a", "--", "/b"])), two);
+        assert_eq!(parse_split_args(&os(&["--", "/a", "/b"])), two);
+        for option in ["--nvim", "--clean", "-x", "--legacy"] {
+            assert_eq!(
+                parse_split_args(&os(&[option, "/p"])),
+                Err(format!("eitri split: unknown option {option}"))
+            );
+        }
+        // After `--` a dashed token is a directory name, not an option.
+        assert!(parse_split_args(&os(&["--", "--nvim"])).is_ok());
     }
 
     fn parsed_rest(args: &[&str]) -> Vec<OsString> {
