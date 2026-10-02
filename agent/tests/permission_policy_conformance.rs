@@ -261,7 +261,8 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
 /// real CLI; this is that check, for an edit.
 ///
 /// The probe: the product's own CLI posture (`--permission-mode default`, `--setting-sources
-/// project,local`, a `PreToolUse` hook with matcher `*` that answers `allow` to every call -- what
+/// project,local` -- the opt-out selection, kept so the oracle does not depend on the machine's own
+/// user settings --, a `PreToolUse` hook with matcher `*` that answers `allow` to every call -- what
 /// the policy answers for this `Write`, asserted below), `Bash` withheld so the model cannot create
 /// the file another way the rule does not name, a project `.claude/settings.json` asking for
 /// `Edit(probe-asked.txt)`, and a request to create that file. The file must not exist afterwards.
@@ -733,7 +734,9 @@ fn run_the_cli(workspace: &Path, prompt: &str, extra_args: &[&str]) -> Vec<Obser
     let mut command = std::process::Command::new("claude");
     command
         .current_dir(workspace)
-        // `project,local`, as the product passes, and not the user tier: on 2026-09-25 the TEST
+        // `project,local`, the product's `agent.user_settings = false` selection, and not the user
+        // tier, which a default product session loads: this oracle compares the policy with the CLI's
+        // own rules and has to be independent of whoever runs it. On 2026-09-25 the TEST
         // profile's user settings (shared with the owner's) carried an `rtk hook claude`
         // `PreToolUse` hook that rewrote `ls` to `rtk ls`, which the CLI then refused as not
         // read-only -- a refusal of a command nobody asked for, reported as the CLI refusing `ls`.

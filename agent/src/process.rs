@@ -162,18 +162,6 @@ pub fn disallowed_tools() -> &'static [&'static str] {
     &[]
 }
 
-/// What every session loads (R13), for `prefix i`: the sidecar asks for `[PROJECT, LOCAL]`
-/// (`build_create_request`) and legacy passes `--setting-sources project,local`. CLI 2.1.284 loads
-/// User memory (`~/.claude/CLAUDE.md`) only under `userSettings` (read from its code, not measured).
-///
-/// Compiled in every build, since both backends and the panel read it. Two tests hold the sentence
-/// to what the code does: `every_request_loads_project_and_local_settings_only_and_the_note_says_so`
-/// (the sidecar's request) and, in a build with the legacy backend, the argv assertion in
-/// `every_spawn_runs_default_under_the_gate_and_passes_no_deny_list` -- so a change to either
-/// selection has to change this text with it.
-pub const SETTING_SOURCES_NOTE: &str =
-    "project + local only (.claude/ and CLAUDE.md here); ~/.claude's settings, hooks, plugins and CLAUDE.md are not loaded";
-
 /// The host's answer mode — whether Eitri answers every permission request `allow` itself. Never
 /// sent to the CLI (R07).
 ///
@@ -337,7 +325,8 @@ pub struct AgentProcess {
 /// is harmless. **Since R07 the flag is `--permission-mode default` (D4)**, under which a hook with
 /// no answer falls to the CLI's own permission flow rather than the classifier's call: a denial,
 /// headless -- **unless a project or local `permissions.allow` rule matches the call**, which that
-/// flow honours without prompting (`--setting-sources project,local` loads them on purpose). Not
+/// flow honours without prompting (`--setting-sources` loads them on purpose, and the user tier's
+/// `permissions.allow` counts too unless `agent.user_settings` is false). Not
 /// probed on a real CLI (v1-mode fix round 1, the whole-branch review); it was as true under `auto`.
 /// The explicit deny stays anyway, because a project's own settings can outrank the flag (the
 /// tripwire below).
@@ -645,7 +634,7 @@ fn build_can_use_tool_response_payload(request_id: &str, allow: bool, reason: Op
 #[cfg(feature = "legacy-backend")]
 impl AgentProcess {
     /// Spawns exactly one long-lived process for the whole conversation. `project_dir` is both
-    /// the CLI's cwd (so `--setting-sources project,local` resolves the project's own real
+    /// the CLI's cwd (so `--setting-sources` resolves the project's own real
     /// settings there) and the root this conversation operates on. This crate writes nothing into
     /// it: the hook configuration goes in argv and the per-conversation socket in the temp dir.
     ///
@@ -741,7 +730,7 @@ impl AgentProcess {
             .arg("stream-json")
             .arg("--verbose")
             .arg("--setting-sources")
-            .arg("project,local")
+            .arg(crate::setting_sources::configured_cli_argument())
             // `default`, never `auto` (D4, spec O1; decision kept by the owner 2026-09-27): under
             // `default` a hook that gives no answer -- the 600 s hook timeout on an unanswered card,
             // or any failure that escapes `write_fail_closed_deny` -- is a CLI denial (unless a
@@ -2278,9 +2267,9 @@ exit 0"#,
             "the CLI runs in `default` (D4, spec O1): {session_argv}"
         );
         assert!(
-            session_argv.contains("--setting-sources project,local"),
-            "legacy loads project and local settings only, which `SETTING_SOURCES_NOTE` tells the user \
-             on `prefix i` (R13): {session_argv}"
+            session_argv.contains("--setting-sources user,project,local"),
+            "legacy loads all three settings tiers unless `agent.user_settings` is false, which \
+             `setting_sources::note` tells the user on `prefix i`: {session_argv}"
         );
         for ungated in [
             "bypassPermissions",

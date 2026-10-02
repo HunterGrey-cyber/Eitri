@@ -145,8 +145,12 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
     }
 }
 
-/// **`setting_sources: [PROJECT, LOCAL]` really keeps the operator's own `~/.claude` out of a
-/// spawned session -- observed at runtime, not inferred from the field being sent.**
+/// **The tiers a session asks for really decide whether the operator's own `~/.claude` loads --
+/// observed at runtime, not inferred from the field being sent.** By default (`[USER, PROJECT,
+/// LOCAL]`, what the product sends) the user tier loads, as in a terminal; with
+/// `agent.user_settings = false` (`[PROJECT, LOCAL]`) it does not. Three arms: the control (the
+/// field absent, which under `NATIVE` means all three tiers) shows the user tier is observable at
+/// all; the product's own request must match it; the opt-out request must not.
 ///
 /// The observable is the **session model**, and the reason it is that rather than a hook is worth
 /// more than the result. The first version of this test installed its own `UserPromptSubmit` marker
@@ -158,7 +162,7 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
 /// account is pinned.**
 ///
 /// What that failure handed back is a better test. It measures the operator's *real* user tier --
-/// the actual thing the field exists to exclude, not a synthetic stand-in -- through a value that
+/// the actual thing the field selects, not a synthetic stand-in -- through a value that
 /// reaches `pump()`: `SessionOpened.model`. `settings.json`'s `model` key is a user-tier setting and
 /// nothing else in a fresh `cwd` supplies one.
 ///
@@ -172,7 +176,7 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
 /// never becomes a domain event, so it can be read in `--nocapture` output but not asserted.
 #[test]
 #[ignore]
-fn setting_sources_project_local_really_excludes_the_user_tier_at_runtime() {
+fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
     let cwd = Scratch::new("cwd");
 
     // The operator's real user tier, as the sidecar will resolve it for its subprocesses.
@@ -203,10 +207,32 @@ fn setting_sources_project_local_really_excludes_the_user_tier_at_runtime() {
         "user tier: {} declares model {declared_model:?} (family {family:?})",
         config_dir.display()
     );
+    // The second observable, and the decisive one when the declared model is also the CLI's own
+    // default (then the model cannot tell the arms apart): a sentence from the user tier's own
+    // CLAUDE.md. The user tier is what puts that file into the session's context, so asking the model
+    // whether it can see the sentence measures the thing a user notices -- their global instructions
+    // being there or not.
+    let memory = std::fs::read_to_string(config_dir.join("CLAUDE.md")).unwrap_or_else(|e| {
+        panic!(
+            "PREMISE FAILED: reading the user tier's CLAUDE.md at {}: {e}",
+            config_dir.display()
+        )
+    });
+    let marker = memory
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.starts_with('#') && !l.starts_with('@') && !l.starts_with('|') && l.chars().count() >= 20)
+        .map(|l| l.chars().take(120).collect::<String>())
+        .expect("PREMISE FAILED: the user tier's CLAUDE.md has no line long enough to quote");
+    let ask = format!(
+        "Answer with exactly one word, YES or NO. Is the following text part of the instructions or \
+         memory files in your context right now?\n\n{marker}"
+    );
+    eprintln!("marker from the user tier's CLAUDE.md: {marker:?}");
 
     // ---- CONTROL: setting_sources ABSENT. Under ConfigurationProfile::NATIVE that means all three
-    // tiers, so the user tier loads. Without this arm the test arm proves nothing: a tier that never
-    // loads looks exactly like a tier that is excluded.
+    // tiers, so the user tier loads. Without this arm the opt-out arm proves nothing: a tier that
+    // never loads looks exactly like a tier that is excluded.
     let control = connect();
     // Gated, as every product session is (R07); this turn uses no tool, so nothing is asked.
     let mut request = build_create_request(
@@ -221,7 +247,7 @@ fn setting_sources_project_local_really_excludes_the_user_tier_at_runtime() {
     control
         .send_turn(SendTurnRequest {
             session_id: session_id.clone(),
-            text: "Reply with exactly: ok".into(),
+            text: ask.clone(),
         })
         .expect("control turn");
     let control_events = drain_until(&control, 120, turn_finished);
@@ -230,6 +256,13 @@ fn setting_sources_project_local_really_excludes_the_user_tier_at_runtime() {
     drop(control);
 
     let control_model = model_of(&control_events).unwrap_or_default();
+    let control_answer = text_of(&control_events);
+    assert!(
+        says_yes(&control_answer),
+        "POSITIVE CONTROL FAILED: with setting_sources absent the user tier should have loaded, so the \
+         model should see the user CLAUDE.md sentence; it answered {control_answer:?}. Fix the control \
+         before believing any exclusion result below."
+    );
     assert!(
         control_model.contains(&family),
         "POSITIVE CONTROL FAILED: with setting_sources absent the user tier should have loaded and \
@@ -237,40 +270,115 @@ fn setting_sources_project_local_really_excludes_the_user_tier_at_runtime() {
          {control_model:?}. Fix the control before believing any exclusion result below."
     );
 
-    // ---- TEST: the real product path. `create_session` goes through `build_create_request`
-    // unmodified, which states [PROJECT, LOCAL] -- the only difference from the control above.
+    // ---- DEFAULT: the real product path. `create_session` goes through `build_create_request`
+    // unmodified, which states [USER, PROJECT, LOCAL] (nothing in this test configures the opt-out),
+    // so the session must run the operator's declared model, as the control did.
     let provider = connect();
     let session_id = provider
         .create_session(CreateSessionRequest {
             cwd: cwd.path().to_string_lossy().to_string(),
             streaming: StreamingPreference::Complete,
         })
-        .expect("test session");
+        .expect("default session");
     provider
         .send_turn(SendTurnRequest {
             session_id: session_id.clone(),
-            text: "Reply with exactly: ok".into(),
+            text: ask.clone(),
         })
-        .expect("test turn");
+        .expect("default turn");
     let events = drain_until(&provider, 120, turn_finished);
-    trace("test (setting_sources = [PROJECT, LOCAL])", &events);
+    trace("default (setting_sources = [USER, PROJECT, LOCAL])", &events);
     let _ = provider.close_session(CloseSessionRequest { session_id });
+    drop(provider);
 
-    // The turn really ran. Without this, "the user tier had no effect" is satisfied by a session
-    // that never got as far as starting one.
+    // The turn really ran. Without this, a model comparison is satisfied by a session that never
+    // got as far as starting one.
     assert!(
         turn_finished(&events) && !text_of(&events).trim().is_empty(),
-        "the test arm never completed a turn, so its result is not evidence; got: {events:?}"
+        "the default arm never completed a turn, so its result is not evidence; got: {events:?}"
     );
-    let test_model = model_of(&events).unwrap_or_default();
-    eprintln!("control model {control_model:?}  vs  test model {test_model:?}");
+    let default_model = model_of(&events).unwrap_or_default();
+    eprintln!("control model {control_model:?}  vs  default model {default_model:?}");
+    let default_answer = text_of(&events);
     assert!(
-        !test_model.contains(&family),
-        "setting_sources = [PROJECT, LOCAL] did NOT exclude the user tier: the session is running \
-         {test_model:?}, the model the operator's own ~/.claude declares ({declared_model:?}). That \
-         tier carries their hooks and plugins too, and this is the exact inheritance the field \
-         exists to prevent."
+        says_yes(&default_answer),
+        "the default request did NOT load the user tier: the model cannot see the user CLAUDE.md \
+         sentence (answered {default_answer:?}). The product's default selection is [USER, PROJECT, LOCAL]."
     );
+    assert!(
+        default_model.contains(&family),
+        "the default request did NOT load the user tier: the session is running {default_model:?}, \
+         not the model the operator's own ~/.claude declares ({declared_model:?}). The product's \
+         default selection is [USER, PROJECT, LOCAL]."
+    );
+
+    // ---- OPT-OUT: the request `agent.user_settings = false` produces. Built through the same
+    // function the product uses, with the user tier left out -- the only difference from the default.
+    let opted_out = connect();
+    let request = build_create_request_loading(
+        cwd.path().to_string_lossy().to_string(),
+        StreamingPreference::Complete,
+        None,
+        false,
+        opted_out.provider_prompts,
+        false,
+    );
+    let session_id = opted_out.open_session(request).expect("opt-out session");
+    opted_out
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: ask.clone(),
+        })
+        .expect("opt-out turn");
+    let events = drain_until(&opted_out, 120, turn_finished);
+    trace("opt-out (setting_sources = [PROJECT, LOCAL])", &events);
+    let _ = opted_out.close_session(CloseSessionRequest { session_id });
+
+    assert!(
+        turn_finished(&events) && !text_of(&events).trim().is_empty(),
+        "the opt-out arm never completed a turn, so its result is not evidence; got: {events:?}"
+    );
+    let opt_out_model = model_of(&events).unwrap_or_default();
+    eprintln!("control model {control_model:?}  vs  opt-out model {opt_out_model:?}");
+    let opt_out_answer = text_of(&events);
+    assert!(
+        says_no(&opt_out_answer),
+        "setting_sources = [PROJECT, LOCAL] did NOT exclude the user tier: the model can see the user \
+         CLAUDE.md sentence (answered {opt_out_answer:?}). `agent.user_settings = false` promises that \
+         tier stays out."
+    );
+    // The model is a second, independent observable only when the CLI's own default differs from
+    // the declared one; when they coincide (the CLI picked the same family by itself), it says
+    // nothing and is reported instead of asserted.
+    if opt_out_model.contains(&family) {
+        eprintln!(
+            "model check not conclusive here: the CLI's own default {opt_out_model:?} is the same \
+             family as the declared {declared_model:?}; the CLAUDE.md check above is the evidence"
+        );
+        return;
+    }
+    assert!(
+        !opt_out_model.contains(&family),
+        "setting_sources = [PROJECT, LOCAL] did NOT exclude the user tier: the session is running \
+         {opt_out_model:?}, the model the operator's own ~/.claude declares ({declared_model:?}). \
+         `agent.user_settings = false` promises that tier stays out."
+    );
+}
+
+/// Whether a one-word answer says yes (case and punctuation ignored).
+fn says_yes(answer: &str) -> bool {
+    answer
+        .trim()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .eq_ignore_ascii_case("yes")
+}
+
+/// Whether a one-word answer says no (case and punctuation ignored).
+fn says_no(answer: &str) -> bool {
+    answer
+        .trim()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .eq_ignore_ascii_case("no")
 }
 
 /// The model the provider reported for the session, from the first `SessionOpened`.

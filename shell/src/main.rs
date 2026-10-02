@@ -412,6 +412,27 @@ fn build_ui(
     }
     agent_panel_handle.set_default_mode(default_mode);
 
+    // Whether sessions load the user's own Claude Code configuration (`agent.user_settings`: true,
+    // the default, or false), pinned for the whole process before any session starts; the panel's
+    // `prefix i` note and both backends read the one answer. Anything else is a startup failure
+    // naming the key, like `agent.font_size` above.
+    let user_settings = match eitri_core::agent_prefs::parse_user_settings(
+        lua_engine
+            .config
+            .borrow()
+            .get(eitri_core::agent_prefs::USER_SETTINGS_KEY),
+    ) {
+        Ok(load) => load,
+        Err(message) => {
+            eprintln!("eitri: {message}");
+            std::process::exit(1);
+        }
+    };
+    agent::setting_sources::configure(user_settings);
+    if !user_settings {
+        eprintln!("[agent] sessions do not load the user's own settings (init.lua's agent.user_settings = false)");
+    }
+
     // What a card for a hidden chat does (modules P2, spec §3.3, decision b): the tray's chip and a
     // toast, or with `reveal` the chat itself. Anything but `badge`/`reveal` is a startup failure
     // naming the key, like `agent.font_size` above.

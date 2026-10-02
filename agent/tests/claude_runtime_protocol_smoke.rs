@@ -34,6 +34,7 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             }),
             setting_sources: Some(claude_runtime_protocol::v1::SettingSourceSelection {
                 sources: vec![
+                    claude_runtime_protocol::v1::SettingSource::User as i32,
                     claude_runtime_protocol::v1::SettingSource::Project as i32,
                     claude_runtime_protocol::v1::SettingSource::Local as i32,
                 ],
@@ -69,10 +70,11 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             .expect("a stated tier set must survive")
             .sources,
         vec![
+            claude_runtime_protocol::v1::SettingSource::User as i32,
             claude_runtime_protocol::v1::SettingSource::Project as i32,
             claude_runtime_protocol::v1::SettingSource::Local as i32,
         ],
-        "user is deliberately absent -- see build_create_request"
+        "all three tiers, in the enum's order, as build_create_request sends them by default"
     );
     assert_eq!(policy.configuration(), ConfigurationProfile::Native);
     assert_eq!(policy.permissions(), PermissionMode::Interactive);

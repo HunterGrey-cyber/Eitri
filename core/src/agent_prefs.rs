@@ -110,6 +110,25 @@ pub fn parse_default_mode(value: Option<&str>) -> Result<Option<SessionModeChoic
         .ok_or_else(|| format!("eitri.config.set(\"{DEFAULT_MODE_KEY}\", {raw:?}): must be \"auto\" or \"bypass\""))
 }
 
+/// The `init.lua` key: `eitri.config.set("agent.user_settings", true | false)`.
+pub const USER_SETTINGS_KEY: &str = "agent.user_settings";
+
+/// The value of [`USER_SETTINGS_KEY`] as `init.lua` left it: unset or `true` means sessions load the
+/// user's own Claude Code configuration (`~/.claude`), as the CLI does in a terminal; `false` leaves
+/// that tier out and keeps project and local. The store holds text, so a Lua boolean arrives as
+/// `"true"` / `"false"`. Anything else is an error naming the key, as every other configuration key
+/// here is.
+pub fn parse_user_settings(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(format!(
+            "eitri.config.set(\"{USER_SETTINGS_KEY}\", {:?}): must be true or false",
+            value.unwrap_or_default()
+        )),
+    }
+}
+
 /// Whether this project has a remembered choice of mode that the configured default must not
 /// override: a readable file that says `auto` (the only thing [`save_mode`] writes, once Shift+Tab
 /// has left bypass). A file from before v1 that says bypass is not a choice anyone is still making,
@@ -324,6 +343,20 @@ mod tests {
             let err = parse_default_mode(Some(bad)).unwrap_err();
             assert!(
                 err.contains("agent.default_mode") && err.contains(&format!("{bad:?}")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_user_settings_key_reads_true_and_false_and_nothing_else() {
+        assert_eq!(parse_user_settings(None), Ok(true));
+        assert_eq!(parse_user_settings(Some("true")), Ok(true));
+        assert_eq!(parse_user_settings(Some(" false ")), Ok(false));
+        for bad in ["", "False", "TRUE", "yes", "0", "1", "off", "nil"] {
+            let err = parse_user_settings(Some(bad)).unwrap_err();
+            assert!(
+                err.contains("agent.user_settings") && err.contains(&format!("{bad:?}")),
                 "{err}"
             );
         }

@@ -2323,7 +2323,7 @@ fn detail_rows(
         ("claude session", known(provider_session_id)),
         ("CLI", known(cli)),
         // R13: a fact about every session on either backend, so it is drawn on an empty tab too.
-        ("settings", agent::SETTING_SOURCES_NOTE.to_string()),
+        ("settings", agent::setting_sources::note().to_string()),
         ("Verdandi revision", known(revision)),
         ("resumable", resumable.to_string()),
         ("created", known(record.as_ref().map(|r| r.created_at.clone()))),
@@ -5407,11 +5407,10 @@ mod tests {
         let account = rows.iter().find(|r| r.label == "account").unwrap();
         assert_eq!(account.value, "work");
 
-        // R13: what every session loads -- and, said outright, what it does not. The value is the
-        // constant `build_create_request` and the legacy spawn are held to, not a copy of it, and the
-        // row sits right after the CLI it describes.
+        // What every session loads. The value is the sentence `build_create_request` and the legacy
+        // spawn are held to, not a copy of it, and the row sits right after the CLI it describes.
         let settings = rows.iter().find(|r| r.label == "settings").unwrap();
-        assert_eq!(settings.value, agent::SETTING_SOURCES_NOTE);
+        assert_eq!(settings.value, agent::setting_sources::note());
         let position = |label: &str| labels.iter().position(|l| *l == label).unwrap();
         assert_eq!(position("settings"), position("CLI") + 1, "{labels:?}");
     }
@@ -5427,7 +5426,7 @@ mod tests {
                 .iter()
                 .find(|r| r.label == "settings")
                 .expect("the row is always drawn");
-            assert_eq!(settings.value, agent::SETTING_SOURCES_NOTE, "{}", kind.as_str());
+            assert_eq!(settings.value, agent::setting_sources::note(), "{}", kind.as_str());
         }
     }
 
