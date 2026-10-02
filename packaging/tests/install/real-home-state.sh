@@ -15,6 +15,9 @@
 #     temporary name
 #   - $XDG_DATA_HOME/icons/hicolor: the icon files by name (never icon-theme.cache, which
 #     gtk-update-icon-cache rewrites but so does every other application that installs an icon)
+#   - $XDG_DATA_HOME/gnome-shell/extensions/eitri@huntergrey.cn (the GNOME Shell extension; never the
+#     other extensions beside it, which are the user's own), and whether gnome-shell and its extensions
+#     directory exist, since an uninstall removes them when they are left empty
 #   - $XDG_DATA_HOME/licenses/eitri, and $XDG_DATA_HOME/eitri (the private nvim, the sidecars, the
 #     AppArmor profile)
 #   - $XDG_CACHE_HOME/eitri: the downloads, the unpack and build directories, the lock
@@ -91,5 +94,7 @@ exists() {
 			-printf "$FMT" 2>&1
 	fi
 	tree "$DATA/licenses/eitri" "$DATA/eitri" "$CACHE/eitri"
+	tree "$DATA/gnome-shell/extensions/eitri@huntergrey.cn"
+	exists "$DATA/gnome-shell" "$DATA/gnome-shell/extensions"
 	exists "$H/.config/eitri" "$STATE/eitri"
 } | LC_ALL=C sort

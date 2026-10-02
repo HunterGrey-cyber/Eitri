@@ -3,7 +3,9 @@
 //! touches the desktop; the caller does that off the GTK thread and feeds the output back in.
 //!
 //! Only sway is asked whether a move would wrap (it wraps around the edge of the last window);
-//! Hyprland and niri have no such check.
+//! Hyprland and niri have no such check. GNOME has no command line to ask: a client there cannot
+//! list or focus windows, so `Wm::Gnome` is served by a Shell extension over D-Bus (the shell crate
+//! makes those calls) and every argv function here has nothing to say for it.
 
 use crate::layout::Direction;
 use std::ffi::OsString;
@@ -17,11 +19,18 @@ pub const CONFIG_KEY: &str = "companion.wm";
 
 pub const NO_ADAPTER_NOTICE: &str = "your desktop does not let Eitri move focus; use its own window keys";
 
+/// What a GNOME session without the Eitri Shell extension says in place of [`NO_ADAPTER_NOTICE`]:
+/// the extension is what lets focus move there, so the notice names it.
+pub const GNOME_NO_EXTENSION_NOTICE: &str = "your desktop does not let Eitri move focus; use its own window keys. \
+Install the Eitri GNOME Shell extension to move focus with Ctrl+h/j/k/l.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wm {
     Hyprland,
     Sway,
     Niri,
+    /// GNOME Shell, through the Eitri extension's D-Bus service. There is no argv for it.
+    Gnome,
     None,
 }
 
@@ -56,14 +65,22 @@ pub fn parse_config(value: Option<&str>) -> Result<WmChoice, String> {
         Some("hyprland") => Ok(WmChoice::Fixed(Wm::Hyprland)),
         Some("sway") => Ok(WmChoice::Fixed(Wm::Sway)),
         Some("niri") => Ok(WmChoice::Fixed(Wm::Niri)),
+        Some("gnome") => Ok(WmChoice::Fixed(Wm::Gnome)),
         Some("none") => Ok(WmChoice::Fixed(Wm::None)),
         Some(raw) => Err(format!(
-            "eitri.config.set(\"companion.wm\", {raw:?}): expected \"auto\", \"hyprland\", \"sway\", \"niri\" or \"none\""
+            "eitri.config.set(\"companion.wm\", {raw:?}): expected \"auto\", \"hyprland\", \"sway\", \"niri\", \"gnome\" or \"none\""
         )),
     }
 }
 
-/// Which compositor the environment names: Hyprland, then sway, then niri; an empty value is unset.
+/// Which compositor the environment names: Hyprland, then sway, then niri, then GNOME (a
+/// `:`-separated `XDG_CURRENT_DESKTOP` with a `GNOME` entry, as `ubuntu:GNOME` has) in a Wayland
+/// session; an empty value is unset. The compositor-specific variables come first because a session
+/// of another compositor can inherit a stale `XDG_CURRENT_DESKTOP`.
+///
+/// GNOME counts only under Wayland (`WAYLAND_DISPLAY` set, or `XDG_SESSION_TYPE` `wayland`): the
+/// extension moves focus to windows that had fresh input, which no X11 window can show it, so on an
+/// Xorg GNOME session every key would be claimed and then refused. There the usual notice is better.
 pub fn detect(env: &dyn Fn(&str) -> Option<OsString>) -> Wm {
     let set = |name: &str| env(name).is_some_and(|v| !v.is_empty());
     if set("HYPRLAND_INSTANCE_SIGNATURE") {
@@ -72,6 +89,10 @@ pub fn detect(env: &dyn Fn(&str) -> Option<OsString>) -> Wm {
         Wm::Sway
     } else if set("NIRI_SOCKET") {
         Wm::Niri
+    } else if env("XDG_CURRENT_DESKTOP").is_some_and(|v| v.to_string_lossy().split(':').any(|part| part == "GNOME"))
+        && (set("WAYLAND_DISPLAY") || env("XDG_SESSION_TYPE").is_some_and(|v| v == "wayland"))
+    {
+        Wm::Gnome
     } else {
         Wm::None
     }
@@ -117,7 +138,7 @@ pub fn move_focus_argv(wm: Wm, dir: Direction) -> Option<Vec<String>> {
             };
             argv(&["niri", "msg", "action", a])
         }
-        Wm::None => None,
+        Wm::Gnome | Wm::None => None,
     }
 }
 
@@ -126,7 +147,7 @@ pub fn list_windows_argv(wm: Wm) -> Option<Vec<String>> {
         Wm::Hyprland => argv(&["hyprctl", "clients", "-j"]),
         Wm::Sway => argv(&["swaymsg", "-t", "get_tree"]),
         Wm::Niri => argv(&["niri", "msg", "--json", "windows"]),
-        Wm::None => None,
+        Wm::Gnome | Wm::None => None,
     }
 }
 
@@ -148,7 +169,7 @@ pub fn focus_window_argv(wm: Wm, target: &WindowRef) -> Option<Vec<String>> {
                 .chain(std::iter::once(id.to_string()))
                 .collect()
         }),
-        Wm::None => None,
+        Wm::Gnome | Wm::None => None,
     }
 }
 
@@ -157,6 +178,7 @@ pub fn parse_windows(wm: Wm, json: &str) -> Result<Vec<WindowRef>, String> {
         Wm::Hyprland => hyprland::parse_windows(json),
         Wm::Sway => sway::parse_windows(json),
         Wm::Niri => niri::parse_windows(json),
+        Wm::Gnome => Err("GNOME has no window list a client can read".to_string()),
         Wm::None => Err("no window-manager adapter".to_string()),
     }
 }
@@ -246,19 +268,94 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_accepts_the_five_values_and_names_the_key_otherwise() {
+    fn parse_config_accepts_the_six_values_and_names_the_key_otherwise() {
         assert_eq!(parse_config(None), Ok(WmChoice::Auto));
         assert_eq!(parse_config(Some("auto")), Ok(WmChoice::Auto));
         assert_eq!(parse_config(Some("hyprland")), Ok(WmChoice::Fixed(Wm::Hyprland)));
         assert_eq!(parse_config(Some("sway")), Ok(WmChoice::Fixed(Wm::Sway)));
         assert_eq!(parse_config(Some("niri")), Ok(WmChoice::Fixed(Wm::Niri)));
+        assert_eq!(parse_config(Some("gnome")), Ok(WmChoice::Fixed(Wm::Gnome)));
         assert_eq!(parse_config(Some("none")), Ok(WmChoice::Fixed(Wm::None)));
         let err = parse_config(Some("i3")).unwrap_err();
         assert_eq!(
             err,
-            "eitri.config.set(\"companion.wm\", \"i3\"): expected \"auto\", \"hyprland\", \"sway\", \"niri\" or \"none\""
+            "eitri.config.set(\"companion.wm\", \"i3\"): expected \"auto\", \"hyprland\", \"sway\", \"niri\", \"gnome\" or \"none\""
         );
         assert!(err.contains(CONFIG_KEY));
+    }
+
+    #[test]
+    fn gnome_is_detected_last_from_a_colon_separated_desktop_name() {
+        let desktop = |value: &'static str| [("XDG_CURRENT_DESKTOP", value), ("WAYLAND_DISPLAY", "wayland-0")];
+        assert_eq!(detect(&env_of(&desktop("GNOME"))), Wm::Gnome);
+        assert_eq!(detect(&env_of(&desktop("ubuntu:GNOME"))), Wm::Gnome);
+        assert_eq!(detect(&env_of(&desktop("GNOME-Classic:GNOME"))), Wm::Gnome);
+        // A whole entry, in the variable's own case: neither a substring nor another spelling.
+        assert_eq!(detect(&env_of(&desktop("GNOME-Flashback:Unity"))), Wm::None);
+        assert_eq!(detect(&env_of(&desktop("gnome"))), Wm::None);
+        assert_eq!(detect(&env_of(&desktop("KDE"))), Wm::None);
+        assert_eq!(detect(&env_of(&desktop(""))), Wm::None);
+        // The compositors' own variables win over a desktop name an environment may have inherited.
+        let with = |name: &'static str| [(name, "x"), ("XDG_CURRENT_DESKTOP", "GNOME")];
+        assert_eq!(detect(&env_of(&with("HYPRLAND_INSTANCE_SIGNATURE"))), Wm::Hyprland);
+        assert_eq!(detect(&env_of(&with("SWAYSOCK"))), Wm::Sway);
+        assert_eq!(detect(&env_of(&with("NIRI_SOCKET"))), Wm::Niri);
+        assert_eq!(resolve(WmChoice::Auto, &env_of(&desktop("ubuntu:GNOME"))), Wm::Gnome);
+        assert_eq!(resolve(WmChoice::Fixed(Wm::None), &env_of(&desktop("GNOME"))), Wm::None);
+    }
+
+    #[test]
+    fn gnome_has_no_argv_and_no_window_list_and_a_notice_that_names_the_extension() {
+        let w = WindowRef {
+            pid: 1,
+            id: Some(1),
+            focused: false,
+            visible: true,
+            rect: None,
+        };
+        for dir in [Direction::Left, Direction::Right, Direction::Up, Direction::Down] {
+            assert_eq!(move_focus_argv(Wm::Gnome, dir), None);
+        }
+        assert_eq!(list_windows_argv(Wm::Gnome), None);
+        assert_eq!(focus_window_argv(Wm::Gnome, &w), None);
+        assert!(parse_windows(Wm::Gnome, "[]").is_err());
+        assert_eq!(
+            GNOME_NO_EXTENSION_NOTICE,
+            "your desktop does not let Eitri move focus; use its own window keys. \
+             Install the Eitri GNOME Shell extension to move focus with Ctrl+h/j/k/l."
+        );
+        assert!(GNOME_NO_EXTENSION_NOTICE.starts_with(NO_ADAPTER_NOTICE));
+    }
+
+    #[test]
+    fn gnome_is_detected_only_in_a_wayland_session() {
+        let gnome = ("XDG_CURRENT_DESKTOP", "ubuntu:GNOME");
+        // Wayland by the display variable, or by the session type alone.
+        assert_eq!(detect(&env_of(&[gnome, ("WAYLAND_DISPLAY", "wayland-0")])), Wm::Gnome);
+        assert_eq!(detect(&env_of(&[gnome, ("XDG_SESSION_TYPE", "wayland")])), Wm::Gnome);
+        // An Xorg session: no window passes the extension's fresh-input rule, so it is no adapter.
+        assert_eq!(detect(&env_of(&[gnome])), Wm::None);
+        assert_eq!(detect(&env_of(&[gnome, ("XDG_SESSION_TYPE", "x11")])), Wm::None);
+        assert_eq!(
+            detect(&env_of(&[gnome, ("XDG_SESSION_TYPE", "x11"), ("DISPLAY", ":0")])),
+            Wm::None
+        );
+        assert_eq!(detect(&env_of(&[gnome, ("WAYLAND_DISPLAY", "")])), Wm::None);
+        assert_eq!(
+            detect(&env_of(&[gnome, ("WAYLAND_DISPLAY", ""), ("XDG_SESSION_TYPE", "tty")])),
+            Wm::None
+        );
+        // A wayland session type with the display variable empty still counts (a stripped environment).
+        assert_eq!(
+            detect(&env_of(&[
+                gnome,
+                ("WAYLAND_DISPLAY", ""),
+                ("XDG_SESSION_TYPE", "wayland")
+            ])),
+            Wm::Gnome
+        );
+        // `companion.wm = "gnome"` still forces it on an X11 session.
+        assert_eq!(resolve(WmChoice::Fixed(Wm::Gnome), &env_of(&[gnome])), Wm::Gnome);
     }
 
     #[test]

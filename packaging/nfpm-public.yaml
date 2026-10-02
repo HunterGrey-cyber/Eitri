@@ -102,6 +102,24 @@ contents:
     dst: /usr/share/eitri/nvim/eitri.nvim/doc/eitri.txt
     file_info:
       mode: 0644
+  # The GNOME Shell extension a companion panel on GNOME uses to move focus to and from its editor. Only the four
+  # files the shell loads: testing.js and test/ are test code and stay out of the package.
+  - src: ./gnome-extension/metadata.json
+    dst: /usr/share/gnome-shell/extensions/eitri@huntergrey.cn/metadata.json
+    file_info:
+      mode: 0644
+  - src: ./gnome-extension/extension.js
+    dst: /usr/share/gnome-shell/extensions/eitri@huntergrey.cn/extension.js
+    file_info:
+      mode: 0644
+  - src: ./gnome-extension/direction.js
+    dst: /usr/share/gnome-shell/extensions/eitri@huntergrey.cn/direction.js
+    file_info:
+      mode: 0644
+  - src: ./gnome-extension/policy.js
+    dst: /usr/share/gnome-shell/extensions/eitri@huntergrey.cn/policy.js
+    file_info:
+      mode: 0644
 
   # The icon, in every size packaging/icons/hicolor holds, under the icon theme's own tree
   # (packaging/icons/README.md; its notice, CC BY 4.0, is printed in THIRD-PARTY-LICENSES).

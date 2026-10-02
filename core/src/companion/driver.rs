@@ -158,6 +158,24 @@ pub(crate) fn get_mode_blocking(answer: &Value) -> Option<bool> {
         .and_then(|(_, value)| value.as_bool())
 }
 
+/// `live_peer` (the pid of the live connection's peer) as the editor's pid, only in the attached
+/// state: in any other the connection is not yet, or no longer, the editor the panel follows.
+fn attached_peer(state: &LinkState, live_peer: Option<u32>) -> Option<u32> {
+    match state {
+        LinkState::Attached { .. } => live_peer,
+        _ => None,
+    }
+}
+
+/// The log line for an editor whose own report of its pid is not the pid of the process holding its
+/// socket; `None` when they agree or when the platform gave no peer pid to compare with.
+fn pid_mismatch_line(reported: u32, peer: Option<u32>) -> Option<String> {
+    let peer = peer.filter(|&peer| peer != reported)?;
+    Some(format!(
+        "[companion] the editor reported pid {reported}, its socket is held by {peer}; using {peer}"
+    ))
+}
+
 /// Why a call cannot go to the editor now; `None` when it can.
 pub fn not_attached_why(state: &LinkState) -> Option<&'static str> {
     match state {
@@ -254,6 +272,15 @@ impl LinkDriver {
             LinkState::Attached { nvim_pid, .. } => Some(*nvim_pid),
             _ => None,
         }
+    }
+
+    /// The pid of the process holding the editor's socket, while the link is attached: what the
+    /// kernel said when the connection was made, not the pid the editor reported about itself, which
+    /// any process that answers the install can make up. The editor's window is looked for from this
+    /// pid. `None` when not attached or when the platform gives no pid.
+    pub fn peer_pid(&self) -> Option<u32> {
+        let live_peer = self.live.as_ref().and_then(|live| live.link.peer_pid());
+        attached_peer(self.attacher.state(), live_peer)
     }
 
     /// Whether the last install loaded the part called `name`.
@@ -454,6 +481,8 @@ impl LinkDriver {
                         tick.logs.push(format!("[companion] {part} did not install: {why}"));
                     }
                     self.installed = report.installed.clone();
+                    let peer = self.live.as_ref().and_then(|live| live.link.peer_pid());
+                    tick.logs.extend(pid_mismatch_line(report.nvim_pid, peer));
                     if let (Some(live), Some(addr)) = (&self.live, self.current_addr()) {
                         for own in self.own_channels.iter_mut() {
                             if own.channel == live.channel && own.addr == addr {
@@ -642,6 +671,45 @@ mod tests {
         );
         assert!(log.borrow().is_empty());
         assert!(live.is_some());
+    }
+
+    #[test]
+    fn the_editors_pid_is_the_peers_and_only_while_attached() {
+        let addr = PathBuf::from("/r/a");
+        let attached = LinkState::Attached {
+            addr: addr.clone(),
+            channel: 1,
+            nvim_pid: 2,
+            in_tmux: false,
+        };
+        // The pid the editor reported (2) plays no part: the peer's does.
+        assert_eq!(attached_peer(&attached, Some(77)), Some(77));
+        // No peer pid (a platform that gives none): no editor pid, never the reported one.
+        assert_eq!(attached_peer(&attached, None), None);
+        for state in [
+            LinkState::NoEditor,
+            LinkState::Connecting { addr: addr.clone() },
+            LinkState::Attaching {
+                addr: addr.clone(),
+                waiting_for_key: false,
+            },
+            LinkState::Failed {
+                addr,
+                why: "x".to_owned(),
+            },
+        ] {
+            assert_eq!(attached_peer(&state, Some(77)), None);
+        }
+    }
+
+    #[test]
+    fn a_reported_pid_that_is_not_the_peers_is_logged_once() {
+        assert_eq!(
+            pid_mismatch_line(10, Some(20)).as_deref(),
+            Some("[companion] the editor reported pid 10, its socket is held by 20; using 20")
+        );
+        assert_eq!(pid_mismatch_line(20, Some(20)), None);
+        assert_eq!(pid_mismatch_line(10, None), None);
     }
 
     #[test]

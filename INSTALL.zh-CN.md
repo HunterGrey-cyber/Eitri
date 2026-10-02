@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=ae9fab052787a2f86f5ad584290560744c0785ed52493a68620047731ef0f5e2 -->
+<!-- translated-from: INSTALL.md sha256=5eff3afdae6d0e3f6862851dfb34bf5a7e05eb165d93ad82ff01e5e922e42e17 -->
 
 # 安装 Eitri
 
@@ -122,7 +122,7 @@ sh install.sh --uninstall            # 保留 ~/.config/eitri 和各项目自己
 sh install.sh --uninstall --purge    # 同时删除 ~/.config/eitri 和 $XDG_STATE_HOME/eitri
 ```
 
-这会删除 `~/.local/lib/eitri`、`~/.local/bin/eitri` 启动器（只有当它带着 Eitri 自己的标记行时才会删；同名但无关的文件会被原样保留并被指出来）、desktop 条目（以及 0.2.0 的 `eitri.desktop`，只有当它与 0.2.0 的安装脚本写下的逐字节一致时才删）、[文件都装到哪里去了](#where-things-go)里列出的那九个图标文件，一个不多（你图标主题目录里你自己的文件都保留，即使它的名字和 Eitri 的一样、尺寸又是 Eitri 不装的）和许可证、`$XDG_DATA_HOME/eitri/nvim`（私有 nvim 副本）、下载缓存，以及除了某个已安装的 `.deb`/`.rpm` 在它的 `/usr/lib/eitri/RELEASE` 里仍然引用的那一个之外的所有 sidecar revision——所以卸载一份 tarball 安装，永远不会连带删掉软件包安装的 sidecar。除非你加上 `--purge`，否则它总是会保留 `~/.config/eitri`（你的 `init.lua`）和 `$XDG_STATE_HOME/eitri`（各项目的布局、已打开的标签页、提示词历史、已保存的权限规则）；`$XDG_DATA_HOME/eitri/nvim` 之外任何叫 `nvim`/`vim`/`vi` 的东西都不会被动到。对于 `.deb`/`.rpm` 安装，软件包本身从来不管那份按用户的 sidecar 或私有 nvim，所以移除软件包（`sudo apt remove eitri` / `sudo dnf remove eitri`）会把两者都留下——**而且清理它们的顺序很重要**。`eitri setup --uninstall` 对这种情况没用：`eitri setup` 就是 `/usr/lib/eitri/eitri-setup`，会随着 `/usr/bin/eitri` 一起被软件包删掉；而如果你在移除软件包*之前*运行它，它会保留下所有那些还在被这份已安装软件包自己的 `/usr/lib/eitri/RELEASE` 引用的 sidecar revision——这个文件正是它用来区分"某个已安装的 Eitri 还需要这个"和"没有谁需要它"的依据（同一份文件也决定了一次普通的[更新](#updating)）。所以：先用你的包管理器移除软件包，然后重新下载一份 `install.sh`（或者用你提前留好的一份副本），运行 `sh install.sh --uninstall`——软件包自己的 `RELEASE` 已经没了，这一次就没有什么能阻止它把 sidecar 和私有 nvim 一起删掉。这和上面是同一个 `--uninstall`，所以如果你在 `~/.local` 下还有一份 tarball 安装，它也会把那份安装连同它的 sidecar 一起删掉。想保留那份安装，就跳过这一步：它自己的更新会在某个 sidecar revision 不再被任何安装使用时把它删掉，见[更新](#updating)。
+这会删除 `~/.local/lib/eitri`、`~/.local/bin/eitri` 启动器（只有当它带着 Eitri 自己的标记行时才会删；同名但无关的文件会被原样保留并被指出来）、desktop 条目（以及 0.2.0 的 `eitri.desktop`，只有当它与 0.2.0 的安装脚本写下的逐字节一致时才删）、[文件都装到哪里去了](#where-things-go)里列出的那九个图标文件，一个不多（你图标主题目录里你自己的文件都保留，即使它的名字和 Eitri 的一样、尺寸又是 Eitri 不装的）和许可证、GNOME Shell 扩展的目录（只有当它是真正的目录时才删：那里的符号链接是你自己的检出，会被保留；`$XDG_DATA_HOME/gnome-shell/extensions` 本身只在 Eitri 的是其中最后一样东西时才会被删；安装脚本从不运行 `gnome-extensions`，所以请先自己把扩展停用）、`$XDG_DATA_HOME/eitri/nvim`（私有 nvim 副本）、下载缓存，以及除了某个已安装的 `.deb`/`.rpm` 在它的 `/usr/lib/eitri/RELEASE` 里仍然引用的那一个之外的所有 sidecar revision——所以卸载一份 tarball 安装，永远不会连带删掉软件包安装的 sidecar。除非你加上 `--purge`，否则它总是会保留 `~/.config/eitri`（你的 `init.lua`）和 `$XDG_STATE_HOME/eitri`（各项目的布局、已打开的标签页、提示词历史、已保存的权限规则）；`$XDG_DATA_HOME/eitri/nvim` 之外任何叫 `nvim`/`vim`/`vi` 的东西都不会被动到。对于 `.deb`/`.rpm` 安装，软件包本身从来不管那份按用户的 sidecar 或私有 nvim，所以移除软件包（`sudo apt remove eitri` / `sudo dnf remove eitri`）会把两者都留下——**而且清理它们的顺序很重要**。`eitri setup --uninstall` 对这种情况没用：`eitri setup` 就是 `/usr/lib/eitri/eitri-setup`，会随着 `/usr/bin/eitri` 一起被软件包删掉；而如果你在移除软件包*之前*运行它，它会保留下所有那些还在被这份已安装软件包自己的 `/usr/lib/eitri/RELEASE` 引用的 sidecar revision——这个文件正是它用来区分"某个已安装的 Eitri 还需要这个"和"没有谁需要它"的依据（同一份文件也决定了一次普通的[更新](#updating)）。所以：先用你的包管理器移除软件包，然后重新下载一份 `install.sh`（或者用你提前留好的一份副本），运行 `sh install.sh --uninstall`——软件包自己的 `RELEASE` 已经没了，这一次就没有什么能阻止它把 sidecar 和私有 nvim 一起删掉。这和上面是同一个 `--uninstall`，所以如果你在 `~/.local` 下还有一份 tarball 安装，它也会把那份安装连同它的 sidecar 一起删掉。想保留那份安装，就跳过这一步：它自己的更新会在某个 sidecar revision 不再被任何安装使用时把它删掉，见[更新](#updating)。
 
 <a id="where-things-go"></a>
 ## 文件都装到哪里去了
@@ -134,12 +134,14 @@ sh install.sh --uninstall --purge    # 同时删除 ~/.config/eitri 和 $XDG_STA
 ~/.local/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png 图标，16 到 512 px，另有 scalable/…/….svg       (tarball 方式)
 ~/.local/share/licenses/eitri/                                   LICENSE、THIRD-PARTY-LICENSES、SOURCE            (tarball 方式)
 ~/.local/share/eitri/eitri.nvim/                                 :EitriPanel 插件                                 (tarball 方式)
+~/.local/share/gnome-shell/extensions/eitri@huntergrey.cn/       GNOME Shell 扩展，四个文件                       (tarball 方式)
 /usr/lib/eitri/                                                  同样的四个二进制文件、eitri-setup、RELEASE       (.deb/.rpm)
 /usr/bin/eitri                                                   同样的启动器                                     (.deb/.rpm)
 /usr/share/applications/cn.huntergrey.eitri.desktop                                                               (.deb/.rpm)
 /usr/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png     同样的图标文件                                   (.deb/.rpm)
 /usr/share/licenses/eitri/                                                                                        (.deb/.rpm)
 /usr/share/eitri/nvim/eitri.nvim/                                :EitriPanel 插件                                 (.deb/.rpm、AUR)
+/usr/share/gnome-shell/extensions/eitri@huntergrey.cn/           GNOME Shell 扩展，四个文件                       (.deb/.rpm、AUR)
 $XDG_DATA_HOME/eitri/sidecar/<rev>/                              eitri setup 构建出的 sidecar，按用户的各条路径
 $XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               私有 nvim 副本，仅在你接受该提议时才有
 ~/.config/eitri/init.lua                                         你自己的配置（EITRI_CONFIG_DIR 可覆盖该目录）
@@ -202,7 +204,7 @@ eitri panel [--nvim <addr>] [DIR]
 用的是哪个窗口管理器，由会话环境自动检测；想强制指定或者关掉它，在 `~/.config/eitri/init.lua` 里写（其他任何值都会让面板在启动时失败，并指出这个键）：
 
 ```lua
-eitri.config.set("companion.wm", "auto")   -- "auto"（默认）、"hyprland"、"sway"、"niri" 或 "none"
+eitri.config.set("companion.wm", "auto")   -- "auto"（默认）、"hyprland"、"sway"、"niri"、"gnome" 或 "none"
 ```
 
 | 桌面 | 检测依据 | Eitri 的做法 |
@@ -210,7 +212,8 @@ eitri.config.set("companion.wm", "auto")   -- "auto"（默认）、"hyprland"、
 | sway | `SWAYSOCK` | 用 `swaymsg` 移动焦点，移动前先检查那个方向上确实有一个可见窗口（任何输出上都算），所以 sway 默认的 focus wrapping 不会把你带到另一头。走到边缘时这个按键被吞掉 |
 | Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | 用 `hyprctl dispatch movefocus` 移动焦点；边缘上会怎样由 Hyprland 自己决定 |
 | niri | `NIRI_SOCKET` | 用 `niri msg action` 移动焦点；边缘上会怎样由 niri 自己决定 |
-| GNOME、KDE 及其他 | 以上都不是 | 不移动焦点：在那里 Wayland 客户端没法抢到焦点。状态条会提示一次，你的桌面不允许 Eitri 移动焦点，请用桌面自己的窗口键 |
+| GNOME | `XDG_CURRENT_DESKTOP` 含有 `GNOME`，且是 Wayland 会话 | 通过 [Eitri GNOME Shell 扩展](#gnome-the-extension)移动焦点，前提是你已经启用了它。没有它就不移动焦点（在 GNOME 上 Wayland 客户端没法自己抢到焦点），状态条会提示一次：你的桌面不允许 Eitri 移动焦点，并指出这个扩展 |
+| KDE 及其他 | 以上都不是 | 不移动焦点：在那里 Wayland 客户端没法抢到焦点。状态条会提示一次，你的桌面不允许 Eitri 移动焦点，请用桌面自己的窗口键 |
 
 **5. 在 tmux 里。** nvim 运行在 tmux 里时，nvim 的环境里什么都不会变，它的导航插件映射保持原样，tmux 窗格之间的移动照旧由你的 tmux 配置负责。tmux 窗格的边缘归 tmux 管：tmux 处理的按键永远到不了面板窗口，所以要跨过去需要在 tmux 一侧加一个绑定（或者用窗口管理器自己的按键）。从面板里打开文件时，编辑器的窗口不会被提到前面，因为在 tmux 里进程树通向的是 tmux server，而不是终端本身。
 
@@ -227,6 +230,38 @@ require("smart-splits").setup({
 ```
 
 nvim 里的 `:help eitri.nvim` 有同样的内容。还没有在真实硬件上试过的部分，见[已知问题](docs/known-issues.zh-CN.md#companion-mode)页面。
+
+## 一条命令开两个窗口：`eitri split`
+
+```sh
+eitri split [DIR]
+```
+
+把上游 Neovide 当作编辑器、把代理面板当作第二个窗口，两者互相附着，不需要任何别的设置。它接受项目目录（`DIR`，解析方式和 `eitri DIR` 一样）以及 `--account`/`--quiet`，不接受其他选项。**它需要 Neovide**，Eitri 并不自带：要么 `PATH` 上有 `neovide`，要么用 `EITRI_NEOVIDE` 指向那个文件（名字指向一个不存在的文件是报错，不会回退）。它自己运行 Neovide，让 nvim 监听一个私有的套接字，所以你的 `init.lua` 和插件照常加载；它用的不是单窗口 `eitri` 绘制时用的 Neovide 分支。
+
+关闭由 `eitri split` 启动的那个 Neovide，面板也会一起关闭（有回合还在运行时，和任何一次关闭一样会先问你）；只关面板则 Neovide 保持打开，因为那是你的编辑器，在里面运行 `:EitriPanel` 就能把面板找回来。两种情况下会话都会保留，下一次对该项目运行 `eitri split` 时按 `agent.restore` 恢复。[配合你自己的 nvim 使用](#use-it-beside-your-own-nvim)里写的一切，包括焦点键，都适用于它打开的面板。
+
+Neovide 运行在你启动 `eitri split` 的那个 shell 的前台，这和 Neovide 自己的默认行为一样：在那里按 `Ctrl+C`，或者关掉那个终端，Neovide 和面板都会结束。想让它们比终端活得更久，就脱离终端启动（`setsid eitri split DIR`，或者从启动器启动）。只有 `eitri split` 附着上的那个面板会随它的 Neovide 一起关闭：之后用 `:EitriPanel` 找回来的面板不会，而在另一个 nvim 里运行 `:EitriPanel` 会把面板移过去，并解除这层关联。
+
+<a id="gnome-the-extension"></a>
+## GNOME：扩展
+
+在 GNOME 上程序没法自己抢到焦点，所以要用 `Ctrl+h/j/k/l` 在面板和它的编辑器之间移动，需要一个很小的 GNOME Shell 扩展 `eitri@huntergrey.cn`（GNOME Shell 45 到 50）。`.deb`、`.rpm`、AUR 软件包和 tarball 安装脚本都会把它的四个文件放到位（见[文件都装到哪里去了](#where-things-go)）；**启用它是你自己的一步**，安装脚本从不替你做：
+
+```sh
+gnome-extensions enable eitri@huntergrey.cn
+```
+
+在 Wayland 上，shell 只读取登录时找到的扩展，所以在你已登录时装上的扩展要到下次登录才会生效。在那之前，以及没有启用它时，面板的表现和任何不支持移动焦点的桌面一样：不移动焦点，状态条会提示一次。
+
+它做什么、不做什么：它只在你刚在拥有焦点的那个窗口里按过一个键或点过一下之后才移动键盘焦点，而且只在那个窗口属于发出请求的程序、或者属于这个程序指定为伙伴的编辑器时才移动。面板正是这样把焦点从自己移到相邻窗口或移回它的编辑器，以及从编辑器移回自己。会话总线上的任何程序都可以按同样的规则请求它，所以一个后台程序至多能在你刚在它指定的窗口里打过字之后，把焦点拿到它自己的窗口上——面板做的也就是这件事——而拿到焦点之后，它能把焦点交给相邻窗口，或者交回你原来所在的窗口。它不报告标题、几何信息或进程号。
+
+值得知道的限制：
+- 焦点只在拥有焦点的窗口所在的那块显示器上移动；
+- X11 会话里的窗口或 XWayland 程序的窗口永远不算数，因为 X11 程序自己写自己的按键时间：请把编辑器当作 Wayland 窗口运行；
+- 所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）算作一个伙伴，所以把焦点交回编辑器时，会落到它最近使用的那个窗口；
+- 在上一次移动之后大约三分之一秒内再移回去，会按设计被拒绝；
+- 被转发的 `eitri split` 会让正在运行的面板附着上，但不会把面板带到前面（它新开的 Neovide 还没收到过按键），监视器的“带到前面”在 GNOME 上不起作用。
 
 ## 疑难排解
 

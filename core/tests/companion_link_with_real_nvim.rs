@@ -252,6 +252,11 @@ fn attach_install_and_nvim_quit_reach_detached_and_cancel_drafts_once() {
         |driver, _| matches!(driver.state(), LinkState::Attached { .. }).then_some(()),
     );
     assert_eq!(driver.nvim_pid(), Some(nvim.child.id()));
+    assert_eq!(
+        driver.peer_pid(),
+        Some(nvim.child.id()),
+        "the editor's pid is the socket holder's"
+    );
     assert!(driver.has_part("scratch"), "the scratch part loaded");
     assert_eq!(driver.band().state, "attached");
     assert_eq!(cancels, 0, "nothing was cut by attaching");

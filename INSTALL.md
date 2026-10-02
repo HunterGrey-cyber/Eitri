@@ -225,6 +225,9 @@ Eitri's own marker line — an unrelated file of the same name is left alone and
 entry (and 0.2.0's `eitri.desktop`, only when it is byte for byte what 0.2.0's installer wrote), exactly
 the nine icon files listed under [Where things go](#where-things-go) (a file of your own in your icon
 theme directory stays, even one named like Eitri's in a size Eitri does not install) and licences,
+the GNOME Shell extension's directory (only when it is a real directory: a symlink there is your own
+checkout of it and stays; `$XDG_DATA_HOME/gnome-shell/extensions` itself goes only if Eitri's was the last
+thing in it, and the installer never runs `gnome-extensions`, so disable it yourself first),
 `$XDG_DATA_HOME/eitri/nvim` (a private nvim copy), the download cache, and every
 sidecar revision except the one an installed `.deb`/`.rpm` still names in its `/usr/lib/eitri/RELEASE`
 — so uninstalling a tarball install never takes a package install's sidecar with it. It always keeps
@@ -253,12 +256,14 @@ a sidecar revision once no install uses it, as [Updating](#updating) describes.
 ~/.local/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png the icon, 16 to 512 px, and scalable/…/….svg    (tarball route)
 ~/.local/share/licenses/eitri/                                   LICENSE, THIRD-PARTY-LICENSES, SOURCE           (tarball route)
 ~/.local/share/eitri/eitri.nvim/                                 the :EitriPanel plugin                          (tarball route)
+~/.local/share/gnome-shell/extensions/eitri@huntergrey.cn/       the GNOME Shell extension, four files          (tarball route)
 /usr/lib/eitri/                                                  the same four binaries, eitri-setup, RELEASE    (.deb/.rpm)
 /usr/bin/eitri                                                   the same launcher                               (.deb/.rpm)
 /usr/share/applications/cn.huntergrey.eitri.desktop                                                              (.deb/.rpm)
 /usr/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png     the same icon files                             (.deb/.rpm)
 /usr/share/licenses/eitri/                                                                                       (.deb/.rpm)
 /usr/share/eitri/nvim/eitri.nvim/                                the :EitriPanel plugin                          (.deb/.rpm, AUR)
+/usr/share/gnome-shell/extensions/eitri@huntergrey.cn/           the GNOME Shell extension, four files          (.deb/.rpm, AUR)
 $XDG_DATA_HOME/eitri/sidecar/<rev>/                              the sidecar eitri setup built, per-user routes
 $XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               a private nvim copy, only if you accepted the offer
 ~/.config/eitri/init.lua                                         your own config (EITRI_CONFIG_DIR overrides the dir)
@@ -378,7 +383,7 @@ Which window manager is used is detected from the session; to force one or turn 
 `~/.config/eitri/init.lua` (any other value stops the panel at startup, naming the key):
 
 ```lua
-eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", "sway", "niri" or "none"
+eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", "sway", "niri", "gnome" or "none"
 ```
 
 | desktop | detected by | what Eitri does |
@@ -386,7 +391,8 @@ eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", 
 | sway | `SWAYSOCK` | moves focus with `swaymsg`, after checking that a visible window really lies in that direction (on any output), so sway's default focus wrapping does not carry you to the far side. At the edge the key is consumed |
 | Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | moves focus with `hyprctl dispatch movefocus`; what happens at the edge is Hyprland's own |
 | niri | `NIRI_SOCKET` | moves focus with `niri msg action`; what happens at the edge is niri's own |
-| GNOME, KDE, anything else | none of the above | no focus moves: a Wayland client cannot take focus there. The band says once that your desktop does not let Eitri move focus; use the desktop's own window keys |
+| GNOME | `XDG_CURRENT_DESKTOP` contains `GNOME`, in a Wayland session | moves focus through the [Eitri GNOME Shell extension](#gnome-the-extension), once you have enabled it. Without it no focus moves (a Wayland client cannot take focus on GNOME by itself), and the band says once that your desktop does not let Eitri move focus and names the extension |
+| KDE, anything else | none of the above | no focus moves: a Wayland client cannot take focus there. The band says once that your desktop does not let Eitri move focus; use the desktop's own window keys |
 
 **5. Inside tmux.** When nvim runs inside tmux, nothing in nvim's environment changes, its
 navigator maps are left alone, and your tmux setup keeps moving between tmux panes as it does today.
@@ -412,6 +418,64 @@ require("smart-splits").setup({
 
 `:help eitri.nvim` has the same in nvim. What has not been tried on real hardware yet is on the
 [known issues](docs/known-issues.md#companion-mode) page.
+
+## Two windows from one command: `eitri split`
+
+```sh
+eitri split [DIR]
+```
+
+Opens upstream Neovide as the editor and the agent panel as a second window, attached to each other, with
+nothing else to set up. It takes the project (`DIR`, resolved as for `eitri DIR`) and `--account`/`--quiet`,
+and no other option. **It needs Neovide**, which Eitri does not bundle: `neovide` on your `PATH`, or the
+file named by `EITRI_NEOVIDE` (a name that does not exist is an error, not a fallback). It runs
+Neovide itself with nvim listening on a private socket, so your `init.lua` and plugins load as they always
+do; it is not the Neovide fork the one-window `eitri` draws with.
+
+Closing the Neovide that `eitri split` started closes the panel too (it asks first when a turn is
+still running, as any close does); closing the panel leaves Neovide open, since that is your editor, and
+`:EitriPanel` in it brings a panel back. The sessions are kept either way, and the next `eitri split` for
+the project restores them under `agent.restore`. Everything under [Use it beside your own
+nvim](#use-it-beside-your-own-nvim) applies to the panel it opens, including the focus keys.
+
+Neovide runs in the foreground of the shell you started `eitri split` from, as Neovide itself does by
+default: `Ctrl+C` there, or closing that terminal, ends Neovide and the panel. Start it detached
+(`setsid eitri split DIR`, or from a launcher) when you want them to outlive the terminal. Only the panel
+that `eitri split` attached closes with its Neovide: a panel you bring back later with `:EitriPanel` does
+not, and `:EitriPanel` in another nvim moves the panel there and ends that tie.
+
+## GNOME: the extension
+
+On GNOME a program cannot take focus for itself, so moving between the panel and its editor with `Ctrl+h/j/k/l`
+needs a small GNOME Shell extension, `eitri@huntergrey.cn` (GNOME Shell 45 to 50). The `.deb`, the `.rpm`,
+the AUR packages and the tarball installer put its four files in place
+([Where things go](#where-things-go)); **turning it on is your step**, and the installer never does it:
+
+```sh
+gnome-extensions enable eitri@huntergrey.cn
+```
+
+On Wayland a shell only reads extensions it found at login, so an extension installed while you are
+logged in starts working at your next login. Until then, and when it is not enabled, the panel behaves as
+on any desktop with no focus support: no focus moves, and the band says so once.
+
+What it does, and what it does not. It moves keyboard focus only right after you pressed a key or clicked
+in the window that has focus, and only when that window belongs to the program asking or to the editor that
+program named as its partner. That is how the panel moves focus from itself to its neighbour or back to its
+editor, and from its editor to itself. Any program on your session bus may ask it, under the same rules, so
+a program in the background can at most take focus to its own window right after you typed in a window it
+named -- which is what the panel does -- and, once it has focus, hand it to a neighbour or back to the window
+you were in. It reports no titles, geometry or process ids.
+
+Limits worth knowing:
+- focus moves stay on the monitor of the focused window;
+- windows of an X11 session or an XWayland program never count, because an X11 program writes its own key
+  times: run the editor as a Wayland window;
+- a terminal that runs all its windows in one process (GNOME Terminal, Ptyxis) counts as one partner, so
+  handing focus back to the editor goes to its most recent window;
+- moving back within about a third of a second of the previous move is refused by design;
+- a forwarded `eitri split` attaches the running panel but does not bring it forward (its new Neovide has had no
+  key yet), and the supervisor's "bring to front" does nothing on GNOME.
 
 ## Troubleshooting
 

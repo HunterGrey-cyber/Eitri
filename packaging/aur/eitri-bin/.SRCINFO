@@ -18,6 +18,7 @@ pkgbase = eitri-bin
 	optdepends = neovim: the editor (any nvim >= 0.10 on PATH)
 	optdepends = claude-code: the Claude Code CLI the panel drives
 	optdepends = noto-fonts: the ⏵⏵ mode glyph
+	optdepends = neovide: eitri split
 	provides = eitri
 	conflicts = eitri
 	options = !strip

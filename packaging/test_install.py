@@ -29,6 +29,7 @@ INSTALLER = HERE / "install.sh"
 TESTS = HERE / "tests" / "install"
 HARNESS = TESTS / "harness.sh"
 PLUGIN = HERE.parent / "nvim" / "eitri.nvim"
+EXTENSION = HERE.parent / "gnome-extension"
 REAL_HOME_STATE = TESTS / "real-home-state.sh"
 RUN_IN_ENV = TESTS / "run-in-env.sh"
 ROOT_WRAPPER_TEST = TESTS / "test_root_wrapper.sh"
@@ -222,6 +223,8 @@ def test_harness_under_dash_in_ubuntu():
          "--mount", f"type=bind,src={HERE},dst={HERE},readonly",
          # The nvim plugin the installer lays out: the harness builds its fixture releases from it.
          "--mount", f"type=bind,src={PLUGIN},dst={PLUGIN},readonly",
+         # The GNOME Shell extension's files, which the fixture releases and the from-source checkout carry.
+         "--mount", f"type=bind,src={EXTENSION},dst={EXTENSION},readonly",
          image, "/bin/sh", str(HARNESS), "--sh", "/bin/sh", "--scratch", str(scratch)],
         capture_output=True, text=True,
     )
@@ -353,6 +356,8 @@ def _fake_home(name):
     _write(home / ".local/share/applications/cn.huntergrey.eitri.desktop")
     _write(home / ".local/share/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png")
     _write(home / ".local/share/licenses/eitri/LICENSE")
+    _write(home / ".local/share/gnome-shell/extensions/eitri@huntergrey.cn/extension.js")
+    _write(home / ".local/share/gnome-shell/extensions/other@example.org/metadata.json")
     _write(home / ".local/share/eitri/sidecar/abc1234/BUILD")
     _write(home / ".cache/eitri/download/tarball")
     _write(home / ".local/state/eitri/history/prompts", "one")
@@ -378,6 +383,8 @@ def test_real_home_guard_ignores_the_applications_own_state_and_settings():
     _write(home / ".local/share/icons/hicolor/16x16/apps/other.png")
     _write(home / ".local/lib/other/file")
     _write(home / ".cache/other/file")
+    _write(home / ".local/share/gnome-shell/extensions/other@example.org/metadata.json", "changed")
+    _write(home / ".local/share/gnome-shell/extensions/another@example.org/extension.js")
     assert real_home_state(home, _guard_env()) == before
 
 
@@ -407,6 +414,10 @@ def _installer_changes():
         "an icon": new_file(".local/share/icons/hicolor/48x48/apps/cn.huntergrey.eitri.png"),
         "an icon's temporary name": new_file(".local/share/icons/hicolor/16x16/apps/.cn.huntergrey.eitri.png.tmp.4242"),
         "the icon removed": lambda h: (h / ".local/share/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png").unlink(),
+        "an extension file": new_file(".local/share/gnome-shell/extensions/eitri@huntergrey.cn/extension.js"),
+        "an extension file's temporary name": new_file(
+            ".local/share/gnome-shell/extensions/eitri@huntergrey.cn/.extension.js.tmp.4242"),
+        "the extension removed": remove_tree(".local/share/gnome-shell/extensions/eitri@huntergrey.cn"),
         "a licence file": new_file(".local/share/licenses/eitri/THIRD-PARTY-LICENSES"),
         "a sidecar": new_file(".local/share/eitri/sidecar/bbbbbbb/verdandi-claude-sidecar"),
         "the private nvim": new_file(".local/share/eitri/nvim/v0.11.4/bin/nvim"),
@@ -444,6 +455,7 @@ def _xdg_env(home):
     "data/eitri/nvim/x",
     "data/applications/cn.huntergrey.eitri.desktop",
     "data/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png",
+    "data/gnome-shell/extensions/eitri@huntergrey.cn/extension.js",
     "cch/eitri/lock/pid",
 ])
 def test_real_home_guard_watches_the_xdg_directories_install_sh_would_write(rel):

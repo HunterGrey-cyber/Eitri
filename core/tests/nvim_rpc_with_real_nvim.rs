@@ -204,3 +204,23 @@ fn connect_to_a_dead_socket_fails_fast() {
     assert!(error.starts_with("connect "), "{error}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn the_peer_pid_is_the_nvim_that_holds_the_socket() {
+    let mut nvim = Nvim::start("peer");
+    let (link, _events) = nvim.connect();
+    assert_eq!(link.peer_pid(), Some(nvim.child.id()));
+    // What nvim says about itself agrees here; the point is that the first does not rest on it.
+    let own = answer(
+        &link.call("nvim_eval", vec![Value::from("getpid()")]),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert_eq!(own.as_u64(), Some(u64::from(nvim.child.id())));
+    // Once the process that was connected to is gone and reaped its number may name a stranger, so
+    // the link stops answering with it (this needs SO_PEERPIDFD, Linux 6.5 and later).
+    nvim.child.kill().unwrap();
+    nvim.child.wait().unwrap();
+    assert_eq!(link.peer_pid(), None);
+}
