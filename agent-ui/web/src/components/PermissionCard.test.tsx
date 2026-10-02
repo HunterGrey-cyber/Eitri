@@ -165,6 +165,35 @@ describe("P4: the Bash card", () => {
     const { container } = render(<PermissionCard request={{ ...REQUEST, toolName: "mcp__x__y", input: { k: "v" } }} sessionEnded={false} onAnswer={vi.fn()} />);
     expect(container.querySelector(".permission-card-input")!.textContent).toContain('"k": "v"');
   });
+
+  it("shows bidi and invisible characters in the command as visible escapes", () => {
+    const { container } = render(
+      <PermissionCard
+        request={{ ...REQUEST, input: { command: "cat a\u202Etxt.exe\u200B" } }}
+        sessionEnded={false}
+        onAnswer={vi.fn()}
+      />,
+    );
+    const pre = container.querySelector("pre.permission-card-command")!;
+    expect(pre.textContent).toBe("$ cat a⟨U+202E⟩txt.exe⟨U+200B⟩");
+    expect(pre.textContent).not.toContain("\u202E");
+    expect(pre.querySelectorAll(".permission-card-escape")).toHaveLength(2);
+    expect(container.querySelector(".permission-card-warning")!.textContent).toContain("2 invisible or direction-changing");
+  });
+
+  it("shows them escaped in the JSON view too, and warns only when there are any", () => {
+    const { container } = render(
+      <PermissionCard request={{ ...REQUEST, toolName: "mcp__x__y", input: { k: "a\u202Eb" } }} sessionEnded={false} onAnswer={vi.fn()} />,
+    );
+    const pre = container.querySelector("pre.permission-card-input")!;
+    expect(pre.textContent).toContain('"k": "a⟨U+202E⟩b"');
+    expect(pre.textContent).not.toContain("\u202E");
+    expect(container.querySelector(".permission-card-warning")!.textContent).toContain("1 invisible or direction-changing character,");
+    cleanup();
+    const plain = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={vi.fn()} />);
+    expect(plain.container.querySelector(".permission-card-warning")).toBeNull();
+    expect(plain.container.querySelector(".permission-card-escape")).toBeNull();
+  });
 });
 
 describe("Permission denial with a reason", () => {

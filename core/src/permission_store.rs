@@ -65,7 +65,7 @@ pub fn load(dir: &Path, project_root: &Path) -> LoadedRules {
         match PrefixRule::parse(&text) {
             Some(rule) => rules.push(rule),
             None => eprintln!(
-                "[permissions] {}: not a Bash(<words> *) rule, skipped: {text:?}",
+                "[permissions] {}: not a Bash(<words> *) rule a card could offer (a rule over env, sh, timeout... allows any program), skipped: {text:?}",
                 file.display()
             ),
         }
@@ -192,6 +192,27 @@ mod tests {
         assert_eq!(
             rules.rules().iter().map(|r| r.to_rule_string()).collect::<Vec<_>>(),
             vec!["Bash(npm ci *)"]
+        );
+    }
+
+    #[test]
+    fn a_rule_the_card_never_offers_is_skipped_on_load() {
+        let dir = scratch("wrapper");
+        let root = root();
+        std::fs::write(
+            path(&dir, &root),
+            format!(
+                "{{\"version\":1,\"project_root\":{:?},\"rules\":[\"Bash(env *)\",\"Bash(timeout *)\",\"Bash(git log *)\"]}}",
+                root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let LoadedRules::Rules(rules) = load(&dir, &root) else {
+            panic!("usable")
+        };
+        assert_eq!(
+            rules.rules().iter().map(|r| r.to_rule_string()).collect::<Vec<_>>(),
+            vec!["Bash(git log *)"]
         );
     }
 

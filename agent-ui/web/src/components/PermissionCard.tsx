@@ -4,6 +4,7 @@ import type { PermissionDecision } from "../bridge";
 import { editPreview } from "../diff";
 import { isUsableLink } from "../timeline";
 import { EditDiff } from "./EditDiff";
+import { countEscapes, revealHidden, type RevealedPiece } from "../revealHidden";
 
 type Props = {
   request: PermissionRequestRecord;
@@ -158,12 +159,55 @@ function ToolInput({ toolName, input, createsFile }: { toolName: string; input: 
   const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : null;
   if (toolName === "Bash" && fields && typeof fields.command === "string") {
     // Show the command as the shell will read it, including newlines.
+    // Draw characters that could reorder or hide text as escapes (`revealHidden`).
+    const pieces = revealHidden(fields.command);
     return (
       <>
-        <pre className="permission-card-command">$ {fields.command}</pre>
+        <pre className="permission-card-command">
+          {"$ "}
+          <Revealed pieces={pieces} />
+        </pre>
+        <HiddenWarning count={countEscapes(pieces)} what="command" />
         {typeof fields.description === "string" && <div className="permission-card-description">{fields.description}</div>}
       </>
     );
   }
-  return <pre className="permission-card-input">{JSON.stringify(input, null, 2)}</pre>;
+  // `JSON.stringify` escapes control characters but leaves bidi and zero-width ones raw, and this is
+  // the only view of an MCP or WebFetch call, so it gets the same treatment.
+  const pieces = revealHidden(JSON.stringify(input, null, 2) ?? "");
+  return (
+    <>
+      <pre className="permission-card-input">
+        <Revealed pieces={pieces} />
+      </pre>
+      <HiddenWarning count={countEscapes(pieces)} what="input" />
+    </>
+  );
+}
+
+function Revealed({ pieces }: { pieces: RevealedPiece[] }) {
+  return (
+    <>
+      {pieces.map((piece, i) =>
+        "text" in piece ? (
+          piece.text
+        ) : (
+          <span key={i} className="permission-card-escape">
+            {piece.escape}
+          </span>
+        ),
+      )}
+    </>
+  );
+}
+
+/** One line under the command saying why it shows `⟨U+…⟩`, only when it does. */
+function HiddenWarning({ count, what }: { count: number; what: string }) {
+  if (count === 0) return null;
+  const characters = count === 1 ? "character" : "characters";
+  return (
+    <div className="permission-card-warning">
+      the {what} holds {count} invisible or direction-changing {characters}, shown as ⟨U+…⟩
+    </div>
+  );
 }

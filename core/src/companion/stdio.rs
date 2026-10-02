@@ -182,4 +182,25 @@ mod tests {
         assert!(open_log(&dir, Path::new("/p")).is_none());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
     }
+
+    /// A FIFO planted where the log goes costs the panel its log, not its window: `open_log` returns
+    /// instead of waiting for a reader that will never come.
+    #[test]
+    fn a_fifo_in_the_logs_place_does_not_hang_the_start() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = scratch("fifo");
+        let dir = base.join("eitri/companion");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join(log_file_name(Path::new("/p")));
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_log(&dir, Path::new("/p")).is_none());
+        });
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("open_log blocked on a FIFO"));
+    }
 }

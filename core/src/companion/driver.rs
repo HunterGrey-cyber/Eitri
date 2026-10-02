@@ -8,6 +8,7 @@
 //! timeout on it and no timeout on a call made afterwards.
 
 use std::collections::VecDeque;
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -206,6 +207,8 @@ pub struct LinkDriver {
     first_effects: Vec<Effect>,
     last_state: LinkState,
     shut: bool,
+    /// Starts a connect's worker thread. A field so a test can make it fail.
+    spawn_thread: fn(Job) -> io::Result<()>,
 }
 
 impl LinkDriver {
@@ -228,6 +231,7 @@ impl LinkDriver {
             first_effects,
             last_state,
             shut: false,
+            spawn_thread: spawn_attach_thread,
         }
     }
 
@@ -421,14 +425,17 @@ impl LinkDriver {
         let tx = self.tx.clone();
         let current = Arc::clone(&self.current_gen);
         let sockets = self.sockets.clone();
+        let spawn_thread = self.spawn_thread;
         let mut spawn = move |gen: u64, addr: PathBuf| {
             let (tx, current, sockets) = (tx.clone(), Arc::clone(&current), sockets.clone());
-            // A thread that cannot start leaves the attach connecting for good, which is a fault
-            // worth a panic message in the log rather than a silent wait.
-            std::thread::Builder::new()
-                .name("eitri-attach".to_owned())
-                .spawn(move || worker(gen, addr, tx, current, sockets))
-                .expect("a thread for the attach");
+            let report = tx.clone();
+            let shown = addr.display().to_string();
+            // Out of threads is a failed connect like any other, reported through the channel the
+            // worker would have used, so this same poll reads it; a panic here would end the panel.
+            if let Err(e) = spawn_thread(Box::new(move || worker(gen, addr, tx, current, sockets))) {
+                let why = format!("could not start a thread to connect to {shown}: {e}");
+                let _ = report.send(WorkerMsg::Event(AttachEvent::ConnectFailed { gen, why }));
+            }
         };
         if run_effects(effects, &mut self.live, &self.current_gen, &mut spawn) {
             tick.cancel_drafts = true;
@@ -486,6 +493,16 @@ impl LinkDriver {
             debug_assert!(effects.is_empty());
         }
     }
+}
+
+/// What a connect's worker thread runs.
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+fn spawn_attach_thread(job: Job) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("eitri-attach".to_owned())
+        .spawn(job)
+        .map(drop)
 }
 
 /// One connect, for one generation. Ends when the connection does or when the driver is gone.
@@ -714,6 +731,19 @@ mod tests {
             },
         });
         assert!(!driver.is_own_earlier_channel(5), "pid 100 is not pid 200");
+    }
+
+    #[test]
+    fn a_thread_that_cannot_start_fails_the_connect() {
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        driver.spawn_thread = |_| Err(std::io::Error::other("no threads left"));
+        let tick = driver.poll(Instant::now());
+        assert!(tick.state_changed);
+        assert!(
+            matches!(driver.state(), LinkState::Failed { why, .. } if why.contains("no threads left") && why.contains("/r/a")),
+            "{:?}",
+            driver.state()
+        );
     }
 
     #[test]

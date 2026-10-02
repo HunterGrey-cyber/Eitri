@@ -8,6 +8,16 @@ describe("N2 paths", () => {
     expect(pathsIn(read)).toEqual([{ path: "/p/src/a.rs", line: null }]);
   });
 
+  it("offers no tool path holding a control character, so gf never sends one to the editor", () => {
+    const tool = (input: Record<string, unknown>): TimelineItem => ({ kind: "tool", seq: 1, key: "t-1", call: { seq: 1, toolUseId: "t", name: "Write", input, result: null } });
+    for (const c of ["\n", "\r", "\0", "\t", "\x1b", "\x7f"]) {
+      expect(pathsIn(tool({ file_path: `notes${c}lua(io.open)(x)` }))).toEqual([]);
+    }
+    const permission: TimelineItem = { kind: "permission", seq: 2, key: "p-2", request: { seq: 2, permissionId: "p", toolUseId: null, toolName: "Edit", input: { file_path: "a\nb", path: "/p/ok.rs" } } };
+    expect(pathsIn(permission)).toEqual([{ path: "/p/ok.rs", line: null }]);
+    expect(pathsIn(tool({ notebook_path: "/p/a b é.ipynb" }))).toEqual([{ path: "/p/a b é.ipynb", line: null }]);
+  });
+
   it("finds paths in prose: a slash or an extension, a :line, never a URL, each once", () => {
     const message: TimelineItem = {
       kind: "message", seq: 2, key: "m-2",

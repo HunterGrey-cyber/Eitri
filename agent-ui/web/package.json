@@ -9,7 +9,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "dompurify": "^3.4.15",
+    "dompurify": "^3.4.16",
     "highlight.js": "^11.12.0",
     "marked": "^13.0.3",
     "react": "^18.3.1",

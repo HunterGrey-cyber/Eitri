@@ -50,6 +50,12 @@ pub fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// This process's effective user id: the owner every file and directory it creates gets.
+fn euid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 /// Whether `path` is itself a real directory (a symlink is not followed) owned by this user.
 pub fn is_own_real_dir(path: &Path) -> bool {
     matches!(path.symlink_metadata(), Ok(meta) if meta.is_dir() && meta.uid() == current_uid())
@@ -66,14 +72,44 @@ pub fn is_own_real_dir(path: &Path) -> bool {
 /// above it is ever changed, because the state home and the home directory above it are shared
 /// with every other program. `dir` must be `root` or inside it; otherwise only `dir` is tightened
 /// (by path, the same single-component-`O_NOFOLLOW` protection [`tighten_own_dir`] always gave).
+///
+/// `dir`, or a directory between `root` and `dir`, that already exists and belongs to another user
+/// is refused (`PermissionDenied`) before anything is tightened or written: the state home may be
+/// shared, and whoever creates `eitri/...` there first would otherwise decide what this user's files
+/// sit next to. `root` itself is not judged unless it is `dir`: callers derive it as `dir`'s parent,
+/// which in a test (or any caller with a shared parent) is a directory nobody here owns.
 pub fn create_private_dir_all(dir: &Path, root: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(PRIVATE_DIR_MODE)
         .create(dir)?;
+    refuse_foreign_dirs(dir, root)?;
     match dir.strip_prefix(root) {
         Ok(below) => tighten_from_root(root, below),
         Err(_) => tighten_own_dir(dir),
+    }
+    Ok(())
+}
+
+/// Errors when `dir`, or any directory above it below `root`, is owned by another user. A symlink
+/// is looked through: what counts is the directory it leads to, which is where the files would go.
+/// Only `dir` is judged when it is not inside `root`.
+fn refuse_foreign_dirs(dir: &Path, root: &Path) -> std::io::Result<()> {
+    let inside = dir.starts_with(root);
+    for candidate in dir.ancestors() {
+        if inside && candidate == root && candidate != dir {
+            break;
+        }
+        let meta = std::fs::metadata(candidate)?;
+        if meta.uid() != euid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} is owned by uid {}, not this user", candidate.display(), meta.uid()),
+            ));
+        }
+        if !inside || candidate == root {
+            break;
+        }
     }
     Ok(())
 }
@@ -182,15 +218,28 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Opens `path` for writing as a 0600 file, creating or truncating it (see [`write_private`]). A
 /// symlink in `path`'s place is refused (`O_NOFOLLOW`), never written through.
+///
+/// What was opened must be a regular file owned by this user, or the open fails with
+/// `PermissionDenied`: a FIFO someone planted would otherwise block this `open` for good, and a
+/// file of another user is not ours to truncate. `O_NONBLOCK` makes a FIFO without a reader fail
+/// at once, and the type and owner are read from the open handle, so what is checked is what is
+/// written. Truncation happens after that check, never as part of the open.
 pub fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
         .mode(PRIVATE_FILE_MODE)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != euid() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a regular file of this user", path.display()),
+        ));
+    }
     fchmod(&file, PRIVATE_FILE_MODE)?;
+    file.set_len(0)?;
     Ok(file)
 }
 
@@ -324,6 +373,63 @@ mod tests {
             "a symlinked middle component must never be walked through to tighten what it points at"
         );
         assert_eq!(mode(&root), 0o700, "the control: root itself is still tightened");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A FIFO planted where a log file goes must be refused, not waited on: a blocking `open` for
+    /// writing never returns while nothing reads the other end.
+    #[test]
+    fn a_fifo_in_place_of_the_file_is_refused_without_blocking() {
+        let base = scratch("fifo");
+        let fifo = base.join("x.log");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_private(&path).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("open_private blocked on a FIFO");
+        assert!(refused, "a FIFO is not a regular file");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// An existing file that is not ours is refused before anything is truncated or changed.
+    #[test]
+    fn a_file_owned_by_someone_else_is_refused_untouched() {
+        if current_uid() == 0 {
+            return;
+        }
+        // `/etc/hostname` is not guaranteed; any root-owned, world-readable file will do.
+        let theirs = Path::new("/etc/passwd");
+        assert!(open_private(theirs).is_err());
+        assert!(std::fs::metadata(theirs).unwrap().len() > 0);
+    }
+
+    /// A directory that belongs to another user is not ours to put records in, nor to tighten.
+    #[test]
+    fn a_directory_owned_by_someone_else_is_refused() {
+        if current_uid() == 0 {
+            return;
+        }
+        let theirs = Path::new("/usr/share");
+        let err = create_private_dir_all(theirs, theirs).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        let err = create_private_dir_all(theirs, Path::new("/usr")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// The control: a directory this user made is accepted when it already exists.
+    #[test]
+    fn an_existing_directory_of_ours_is_accepted() {
+        let base = scratch("ours");
+        let root = base.join("eitri");
+        std::fs::create_dir(&root).unwrap();
+        create_private_dir_all(&root.join("a"), &root).unwrap();
+        create_private_dir_all(&root.join("a"), &root).unwrap();
         std::fs::remove_dir_all(&base).unwrap();
     }
 }
