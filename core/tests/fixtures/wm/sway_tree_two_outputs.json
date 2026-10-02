@@ -1,0 +1,51 @@
+{
+  "id": 1, "type": "root", "name": "root", "focused": false, "visible": false,
+  "rect": {"x": 0, "y": 0, "width": 3840, "height": 1080},
+  "nodes": [
+    {
+      "id": 2, "type": "output", "name": "DP-1", "focused": false, "visible": true,
+      "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+      "nodes": [
+        {
+          "id": 3, "type": "workspace", "name": "1", "focused": false, "visible": true,
+          "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+          "nodes": [
+            {
+              "id": 4, "type": "con", "name": "left screen", "pid": 5001, "focused": false, "visible": true,
+              "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+              "nodes": [], "floating_nodes": []
+            }
+          ],
+          "floating_nodes": []
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "id": 5, "type": "output", "name": "DP-2", "focused": false, "visible": true,
+      "rect": {"x": 1920, "y": 0, "width": 1920, "height": 1080},
+      "nodes": [
+        {
+          "id": 6, "type": "workspace", "name": "2", "focused": false, "visible": true,
+          "rect": {"x": 1920, "y": 0, "width": 1920, "height": 1080},
+          "nodes": [
+            {
+              "id": 7, "type": "con", "name": "right screen", "pid": 5002, "focused": true, "visible": true,
+              "rect": {"x": 1920, "y": 0, "width": 1920, "height": 1080},
+              "nodes": [], "floating_nodes": []
+            }
+          ],
+          "floating_nodes": [
+            {
+              "id": 8, "type": "floating_con", "name": "popup", "pid": 5003, "focused": false, "visible": true,
+              "rect": {"x": 2400, "y": 200, "width": 400, "height": 300},
+              "nodes": [], "floating_nodes": []
+            }
+          ]
+        }
+      ],
+      "floating_nodes": []
+    }
+  ],
+  "floating_nodes": []
+}

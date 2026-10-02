@@ -59,11 +59,14 @@ pub const RELOAD_INTERVAL_MS: u64 = 1000;
 ///   only values convertible to vimscript, and a uv handle is userdata. The timer was then never
 ///   created at all, the `--cmd`'s error went by unread, and the unit test asserting
 ///   `contains("vim.g.")` passed the whole time. The integration test is what caught it.
-pub const RELOAD_CMD: &str = concat!(
-    "lua _G.eitri_reload_timer = vim.uv.new_timer(); ",
-    "_G.eitri_reload_timer:start(1000, 1000, function() ",
-    "vim.schedule(function() pcall(vim.cmd, 'checktime') end) end)"
-);
+///
+/// The same text is also what an injector loads into an nvim that is already running: the chunk
+/// returns a function that stops the timer, and leaves `_G.eitri_reload_timer` alone if it no longer
+/// holds this chunk's own timer.
+pub const RELOAD_CMD: &str = concat!("lua ", include_str!("buffer_reload.lua"));
+
+/// The timer as a chunk: one line, so the `--cmd` above can carry it verbatim.
+pub(crate) const BUFFER_RELOAD_LUA: &str = include_str!("buffer_reload.lua");
 
 /// The two arguments to append to the nvim child's command line.
 pub fn nvim_args() -> Vec<String> {
@@ -73,6 +76,14 @@ pub fn nvim_args() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--cmd` carries one command, and a trailing `--` comment would swallow nothing but also
+    /// could never be told apart from code in `ps`: the chunk stays one comment-free line.
+    #[test]
+    fn the_chunk_is_one_line_with_no_comment() {
+        assert!(!BUFFER_RELOAD_LUA.contains('\n'));
+        assert!(!BUFFER_RELOAD_LUA.contains("--"));
+    }
 
     #[test]
     fn the_command_is_one_cmd_argument_carrying_lua() {

@@ -102,3 +102,66 @@ fn a_buffer_with_unsaved_edits_is_left_alone() {
         "a modified buffer must not be reloaded: {kept:?}"
     );
 }
+
+#[path = "support/embed_client.rs"]
+mod embed_client;
+
+/// Injected into a running nvim (what a companion panel does), the timer reloads a changed file, and
+/// the teardown it returns stops the timer and clears its global.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn injected_reload_timer_reloads_and_teardown_stops_it() {
+    use embed_client::{opts_map, Embed};
+    use rmpv::Value;
+
+    let scratch = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("br-inj-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    let file = scratch.join("f.txt");
+    std::fs::write(&file, "one\ntwo\n").unwrap();
+
+    let mut nvim = Embed::start(&scratch, &[], &[]);
+    nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
+    nvim.command(&format!("edit {}", file.display()));
+    let baseline = nvim.footprint_of(&[], &["eitri_reload_timer"]);
+    assert!(baseline.globals.is_empty(), "{baseline:?}");
+
+    nvim.inject(
+        eitri_core::buffer_reload::RELOAD_CMD.trim_start_matches("lua "),
+        opts_map(&[]),
+    );
+    let running = nvim.footprint_of(&[], &["eitri_reload_timer"]);
+    assert_eq!(running.active_timers, baseline.active_timers + 1, "{running:?}");
+    assert_eq!(running.globals, vec!["eitri_reload_timer".to_string()]);
+
+    let lines = |nvim: &mut Embed| -> Vec<String> {
+        nvim.request(
+            "nvim_buf_get_lines",
+            vec![Value::from(0), Value::from(0), Value::from(-1), Value::from(false)],
+        )
+        .as_array()
+        .expect("lines")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+    };
+    std::fs::write(&file, "DISK\nchange\n").unwrap();
+    nvim.wait_until("the timer's reload", |n| {
+        lines(n).first().map(String::as_str) == Some("DISK")
+    });
+
+    nvim.teardown();
+    let stopped = nvim.footprint_of(&[], &["eitri_reload_timer"]);
+    assert!(stopped.globals.is_empty(), "{stopped:?}");
+    assert_eq!(stopped.active_timers, baseline.active_timers, "{stopped:?}");
+
+    std::fs::write(&file, "LATER AND LONGER\nchange\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert_eq!(
+        lines(&mut nvim).first().map(String::as_str),
+        Some("DISK"),
+        "a stopped timer reloaded"
+    );
+    nvim.quit();
+    let _ = std::fs::remove_dir_all(&scratch);
+}

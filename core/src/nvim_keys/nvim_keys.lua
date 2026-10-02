@@ -1,13 +1,26 @@
 -- The nvim-keys feed loads with --cmd before the user's config. It installs autocommands and
 -- one dict watcher, changing no setting or mapping. It writes one JSON line to the configured
 -- socket only when the report differs from the last one sent.
-local socket = vim.env.EITRI_KEYS_SOCKET
+--
+-- Under `--cmd` (`dofile`, no arguments), use the socket from the spawn environment.
+-- When injected into a running nvim, take the socket from the argument table instead: inherited
+-- environment variables may name a different window and feed the wrong panel.
+-- An injected chunk returns a function that undoes it.
+local opts = ...
+local socket
+if type(opts) == "table" then
+  socket = opts.socket
+else
+  socket = vim.env.EITRI_KEYS_SOCKET
+end
 if not socket or socket == "" then
   return
 end
 
 local MAX_MAPS, MAX_TEXT = 2000, 200
 local last, scheduled = nil, false
+-- Set by the teardown: a debounce already waiting in `defer_fn` must send nothing afterwards.
+local torn = false
 
 local function cut(s)
   if type(s) ~= "string" then
@@ -61,6 +74,9 @@ local function schedule()
   end
   scheduled = true
   vim.defer_fn(function()
+    if torn then
+      return
+    end
     scheduled = false
     local ok, payload = pcall(report)
     if ok and payload ~= last then
@@ -81,3 +97,21 @@ vim.cmd([[
   endfunction
   call dictwatcheradd(g:, 'mapleader', 'EitriKeysLeaderChanged')
 ]])
+
+-- Injected into an nvim past VimEnter: that event has fired and will not again.
+if vim.v.vim_did_enter == 1 then
+  schedule()
+end
+
+return function()
+  torn = true
+  pcall(vim.api.nvim_del_augroup_by_id, group)
+  -- `vim.g` is not a Vimscript dictionary, so the watcher is removed from Vimscript, where it was added.
+  pcall(vim.cmd, [[
+    silent! call dictwatcherdel(g:, 'mapleader', 'EitriKeysLeaderChanged')
+    silent! delfunction EitriKeysLeaderChanged
+  ]])
+  if rawget(_G, "__eitri_keys_schedule") == schedule then
+    _G.__eitri_keys_schedule = nil
+  end
+end

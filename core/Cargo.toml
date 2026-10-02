@@ -16,15 +16,11 @@ legacy-backend = ["agent/legacy-backend"]
 agent = { path = "../agent" }
 libc = "0.2"
 mlua = { version = "0.12", features = ["lua54", "vendored"] }
+# msgpack-RPC to a user's own nvim (companion mode). Already linked into `shell` through the Neovide fork at
+# 1.3.1, so no new crate ships and the licence set does not change.
+rmpv = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Already linked through `agent`, so no new crate ships: the tmux import's fingerprint.
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
-
-[dev-dependencies]
-# msgpack-RPC for `editor_quit_with_real_nvim.rs`, which is the only real-nvim test here that needs
-# to talk RPC rather than read a socket the Lua side pushed to. Already resolved in Cargo.lock
-# (1.3.1) through the Neovide fork, so nothing new is downloaded, and it is a dev-dependency, so
-# `packaging/collect-licenses.py` is not involved.
-rmpv = "1"

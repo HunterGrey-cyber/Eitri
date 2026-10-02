@@ -96,7 +96,7 @@ import { parseEffortReply, parseModelReply } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, showTabBar } from "./tabs";
 import { cardSummary, shortModel, usageSegment } from "./band";
 import type { ApproveFact, BandFacts } from "./band";
-import type { AgentUiState, HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope, ContextSummary, QueueItem, ProviderInfo } from "./types";
+import type { AgentUiState, HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope, ContextSummary, EditorLink, QueueItem, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
 
@@ -728,6 +728,9 @@ export default function App() {
    *  box must not re-render the whole panel. */
   const permissionReasons = useRef(new Map<string, string>());
   const [editorContext, setEditorContext] = useState<ContextSummary | null>(null);
+  // Companion mode: where the panel stands with the editor beside it. `null` is the one-window mode,
+  // where Rust never sends one.
+  const [editorLink, setEditorLink] = useState<EditorLink | null>(null);
   /** The unread indicator reported by `MessageList` through `onUnreadChange`. `jump` starts as
    *  a no-op so the band can accept clicks before the first `updatePill`, including before any
    *  scroll on mount. */
@@ -2813,6 +2816,8 @@ export default function App() {
         setRuleOffers(payload.offers);
       } else if (payload.kind === "editor_context") {
         setEditorContext(payload.file === null ? null : { file: payload.file, lines: payload.lines });
+      } else if (payload.kind === "editor_link") {
+        setEditorLink({ state: payload.state, text: payload.text });
       } else if (payload.kind === "scratch") {
         setScratchEditing(payload.editing);
       } else if (payload.kind === "notice") {
@@ -3511,6 +3516,7 @@ export default function App() {
             cards: 0,
             queued: 0,
             context: contextFact(editorContext),
+            link: editorLink,
             position: null,
             model: null,
             usage: null,
@@ -5369,6 +5375,8 @@ export default function App() {
           cards: state.pendingPermissions.length,
           queued: queue.length,
           context: sessionEnded ? null : contextFact(editorContext),
+          // About the window, not the session: an ended session still has an editor beside it.
+          link: editorLink,
           position: timeline.length === 0 ? null : `${cursor + 1}/${timeline.length}`,
           model: shortModel(state.model),
           // This tab's last reported usage, right of the model; nothing until one arrives.

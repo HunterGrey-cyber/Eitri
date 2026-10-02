@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, HandoffCommand, Hello, QueueItem, TabId, TabsEnvelope } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, TabId, TabsEnvelope } from "./types";
 import type { KeymapHelp, PaneDirection } from "./keymap";
 
 export type OutboundMessage =
@@ -258,6 +258,9 @@ type InboundHandler = (
     | { kind: "rule_offers"; tab: TabId; offers: Record<string, string> }
     /** V1's editor-context line, window-scoped. */
     | ({ kind: "editor_context" } & ContextSummary)
+    /** Companion mode only (never sent by the one-window mode): where the panel stands with the
+     *  editor beside it. Window-scoped. `serialize_editor_link_for_js`, `core/src/agent_bridge.rs`. */
+    | { kind: "editor_link"; state: EditorLinkState; text: string }
     /** Whether the scratch editor currently has this tab's draft open. */
     | { kind: "scratch"; tab: TabId; editing: boolean }
     /** The footer's transient line, from Rust -- e.g. a `gf` refusal. */
@@ -331,6 +334,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "history" ||
         obj.kind === "rule_offers" ||
         obj.kind === "editor_context" ||
+        obj.kind === "editor_link" ||
         obj.kind === "scratch" ||
         obj.kind === "notice" ||
         obj.kind === "nav_key"

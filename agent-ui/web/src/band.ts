@@ -1,9 +1,9 @@
 import type { PanelMode } from "./keymap";
-import type { UsageInfo } from "./types";
+import type { EditorLink, UsageInfo } from "./types";
 
 /** A segment's identity, used for lookups.
  *  `bandLayout`'s construction order determines degrade order and render order. */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "position" | "model" | "usage";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage";
 
 /** One band segment's text and side of the gap. The left holds mode, pill, `⚑N`, `⧗N`, and
  *  message; the right holds showcmd, `⚠`, context, model, usage, position, and `↓N`.
@@ -43,6 +43,11 @@ export type BandFacts = {
    *  the band says which card that one key answers. Optional: absent (or `null`) is "nothing to
    *  name", which every caller that predates #39 means. */
   approve?: ApproveFact | null;
+  /** Companion mode: where the panel stands with the editor beside it. `null`, or absent, is the
+   *  one-window mode, which has no such thing and never sends one. While it is set and not
+   *  `attached`, its text takes the place of the context segment: with no editor attached no file
+   *  can be named. Optional so every caller that predates companion mode compiles unchanged. */
+  link?: EditorLink | null;
 };
 
 /** #39's segment: the card's tool name and a one-line summary of its input (`cardSummary`). */
@@ -117,6 +122,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     return [mode, { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt }];
   }
   const ctxFull = f.context && (f.context.lines ? `⧉ ${f.context.file}:${f.context.lines[0]}-${f.context.lines[1]}` : `⧉ ${f.context.file}`);
+  const link = f.link && f.link.state !== "attached" && f.link.text !== "" ? f.link : null;
   let segs: Seg[] = [
     mode,
     pill,
@@ -126,7 +132,8 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.message ? [{ id: "message", text: f.message, side: "left" } as Seg] : []),
     ...(f.showcmd ? [{ id: "showcmd", text: f.showcmd, side: "right" } as Seg] : []),
     ...(f.warn ? [{ id: "warn", text: "⚠", side: "right" } as Seg] : []),
-    ...(ctxFull ? [{ id: "context", text: ctxFull, side: "right" } as Seg] : []),
+    ...(link ? [{ id: "link", text: link.text, side: "right" } as Seg] : []),
+    ...(ctxFull && !link ? [{ id: "context", text: ctxFull, side: "right" } as Seg] : []),
     ...(f.model ? [{ id: "model", text: f.model, side: "right" } as Seg] : []),
     ...(f.usage ? [{ id: "usage", text: f.usage.text, side: "right" } as Seg] : []),
     ...(f.position ? [{ id: "position", text: f.position, side: "right" } as Seg] : []),
@@ -140,7 +147,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     (s) => s.map((x) => (x.id === "context" && f.context ? { ...x, text: `⧉ ${f.context.file}` } : x)),
     (s) => s.filter((x) => x.id !== "model"),
     (s) => s.filter((x) => x.id !== "position"),
-    (s) => s.filter((x) => x.id !== "context"),
+    (s) => s.filter((x) => x.id !== "context" && x.id !== "link"),
     (s) => s.filter((x) => x.id !== "queue"),
     // #39: the Ctrl+y segment keeps the tool it names before it goes, and goes before the card
     // count -- `⚑N` is shorter, and still says a card waits.

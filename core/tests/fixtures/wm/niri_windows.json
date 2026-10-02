@@ -1,0 +1,6 @@
+[
+  {"id": 12, "title": "editor", "app_id": "neovide", "pid": 7001, "workspace_id": 1,
+   "is_focused": false, "is_floating": false, "is_urgent": false},
+  {"id": 15, "title": "Eitri · demo", "app_id": "cn.huntergrey.eitri.Panel", "pid": 7002, "workspace_id": 1,
+   "is_focused": true, "is_floating": false, "is_urgent": false}
+]

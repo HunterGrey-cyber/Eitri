@@ -13,7 +13,7 @@ const DIR_PREFIX: &str = "nv-sc-";
 /// `Ctrl+g` with a notice, not a crash.
 const NO_SOCKET: &str = "none";
 const LUA_NAME: &str = "nvim_scratch.lua";
-const NVIM_SCRATCH_LUA: &str = include_str!("nvim_scratch.lua");
+pub(crate) const NVIM_SCRATCH_LUA: &str = include_str!("nvim_scratch.lua");
 
 pub const LOADER_CMD: &str = "lua local p = vim.env.EITRI_SCRATCH_LUA; if p and p ~= '' then pcall(dofile, p) end";
 
