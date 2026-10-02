@@ -1798,9 +1798,27 @@ textarea,
 }
 /* What the record says is partial or wrong about the turn, one line each, under the title. */
 .review-flag,
-.review-note {
+.review-note,
+.review-draft,
+.review-status,
+.review-question {
   color: var(--nv-muted);
   padding: 2px 0;
+}
+/* A comment of the draft, under the hunk it is on: its lines, then its text in the user's own words. */
+.review-comment-lines {
+  margin-right: 12px;
+  color: var(--nv-muted);
+  white-space: nowrap;
+}
+.review-comment-text {
+  word-break: break-word;
+}
+/* The message `s` would send, as the shell composed it: its own line breaks kept, nothing cut. */
+.review-preview-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 2px 0 2px calc(var(--row-gutter) + 2px);
 }
 .review-note {
   padding-left: calc(var(--row-gutter) + 2px);

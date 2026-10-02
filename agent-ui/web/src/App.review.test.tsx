@@ -325,7 +325,8 @@ describe("Enter, o, y, [ ] and S", () => {
     press(container, "j");
     expect(overlay(container)!.querySelector(".row-current")!.textContent).toContain("@@ -959,4 +965,9 @@");
     press(container, "o");
-    expect(requests("open_path")).toEqual([expect.objectContaining({ path: "core/src/x.rs", line: 966 })]);
+    expect(requests("open_in_editor")).toEqual([expect.objectContaining({ tab: 1, turn: 7, scope: "turn", path: "core/src/x.rs", line: 966 })]);
+    expect(requests("open_path"), "the review's own message, not the conversation's").toEqual([]);
     press(container, "y");
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith("core/src/x.rs:966");
   });
@@ -334,8 +335,9 @@ describe("Enter, o, y, [ ] and S", () => {
     const rendered = started();
     opened(rendered);
     press(rendered.container, "o");
-    const sent = requests("open_path")[0];
-    expect(sent).toMatchObject({ path: "core/src/x.rs" });
+    expect(requests("open_path")).toEqual([]);
+    const sent = requests("open_in_editor")[0];
+    expect(sent).toMatchObject({ tab: 1, turn: 7, scope: "turn", path: "core/src/x.rs" });
     expect(sent).not.toHaveProperty("line");
   });
 
@@ -425,5 +427,313 @@ describe("the status band's pointer", () => {
     dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events });
     dispatch({ kind: "review_hint", tab: 1, turn: 7, files: 3 });
     expect(bandText(container)).not.toContain("to review");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// x, u, i, s, recovery and `o`'s answer: what the overlay posts, and what it says of the answers
+
+const DRAFT = {
+  comments: [{ id: 1, turn: 7, path: "core/src/x.rs", from: 837, to: 837, anchor: ["let b = 2;"], text: "why?" }],
+  reverts: [{ id: 1, turn: 7, path: "core/src/x.rs", hunk: 1, header: "@@ -959,4 +965,9 @@", what: "hunk", lines: [966, 966], source: "panel", undone: false }],
+  canUndo: true,
+};
+
+/** The overlay open on `core/src/x.rs` with its patch loaded and the cursor on the first hunk. */
+function onHunk(rendered: ReturnType<typeof started>, over: Record<string, unknown> = {}) {
+  opened(rendered, over);
+  press(rendered.container, "Enter");
+  dispatch(diffEnvelope(requests("review_diff_request")[0].request_id));
+  press(rendered.container, "j");
+  expect(overlay(rendered.container)!.querySelector(".row-current")!.getAttribute("data-nav-stop")).toBe("hunk");
+}
+const status = (c: HTMLElement) => overlay(c)?.querySelector(".review-status")?.textContent ?? null;
+const commentBox = (c: HTMLElement) => overlay(c)?.querySelector<HTMLInputElement>(".review-prompt input") ?? null;
+
+describe("x", () => {
+  it("on a hunk posts the revert, naming the tab, turn, scope, path, hunk and header", () => {
+    const rendered = started();
+    onHunk(rendered);
+    press(rendered.container, "x");
+    expect(requests("review_revert")).toEqual([
+      expect.objectContaining({ tab: 1, turn: 7, scope: "turn", path: "core/src/x.rs", target: { hunk: 0, header: "@@ -830,6 +830,12 @@" } }),
+    ]);
+  });
+
+  it("on a file row asks, then y posts the whole-file revert and n posts nothing", () => {
+    const rendered = started();
+    opened(rendered);
+    press(rendered.container, "x");
+    expect(overlay(rendered.container)!.querySelector(".review-question")!.textContent).toBe("revert the whole file core/src/x.rs to before turn 7? y/n");
+    expect(requests("review_revert")).toEqual([]);
+    press(rendered.container, "n");
+    expect(requests("review_revert")).toEqual([]);
+    expect(overlay(rendered.container)!.querySelector(".review-question")).toBeNull();
+    press(rendered.container, "x");
+    press(rendered.container, "y");
+    expect(requests("review_revert")).toEqual([expect.objectContaining({ tab: 1, turn: 7, path: "core/src/x.rs", target: "file" })]);
+    expect(navigator.clipboard.writeText, "y answered the question, it did not copy").not.toHaveBeenCalled();
+  });
+
+  it("a refusal is the overlay's status line, in the shell's words", () => {
+    const rendered = started();
+    onHunk(rendered);
+    press(rendered.container, "x");
+    const request = requests("review_revert")[0];
+    dispatch({ kind: "command_result", requestId: request.request_id, ok: false, error: "changed since the turn ended; open it in the editor (o)" });
+    expect(status(rendered.container)).toBe("changed since the turn ended; open it in the editor (o)");
+    expect(rendered.container.querySelector(".banner, .command-notice")).toBeNull();
+    press(rendered.container, "j");
+    expect(status(rendered.container), "the next key clears it").toBeNull();
+  });
+
+  it("on a comment posts its removal; the draft that comes back replaces the row", () => {
+    const rendered = started();
+    onHunk(rendered, { draft: DRAFT });
+    press(rendered.container, "j");
+    expect(overlay(rendered.container)!.querySelector(".row-current")!.getAttribute("data-nav-stop")).toBe("comment");
+    press(rendered.container, "x");
+    const request = requests("review_comment_remove")[0];
+    expect(request).toMatchObject({ tab: 1, id: 1 });
+    dispatch({ kind: "review_draft", requestId: request.request_id, tab: 1, draft: { comments: [], reverts: DRAFT.reverts, canUndo: true } });
+    expect(overlay(rendered.container)!.querySelector('[data-nav-stop="comment"]')).toBeNull();
+    expect(overlay(rendered.container)!.querySelector(".row-current")!.getAttribute("data-nav-stop"), "the cursor did not jump to the top").toBe("hunk");
+  });
+});
+
+describe("u", () => {
+  it("posts the undo when the draft can, and says there is nothing when it cannot", () => {
+    const rendered = started();
+    opened(rendered);
+    press(rendered.container, "u");
+    expect(requests("review_undo")).toEqual([]);
+    expect(status(rendered.container)).toBe("nothing to undo");
+    dispatch(reviewEnvelope(requests("review_request").pop()!.request_id, { draft: DRAFT }));
+    press(rendered.container, "u");
+    expect(requests("review_undo")).toEqual([expect.objectContaining({ tab: 1 })]);
+  });
+
+  it("the shell's word on a success is shown", () => {
+    const rendered = started();
+    opened(rendered, { draft: DRAFT });
+    press(rendered.container, "u");
+    dispatch({ kind: "command_result", requestId: requests("review_undo")[0].request_id, ok: true, message: "undone" });
+    expect(status(rendered.container)).toBe("undone");
+  });
+});
+
+describe("i", () => {
+  it("opens a text box in the overlay, Enter posts the comment with the hunk's added lines and the user's own words", () => {
+    const rendered = started();
+    onHunk(rendered);
+    press(rendered.container, "i");
+    const box = commentBox(rendered.container)!;
+    expect(box).not.toBeNull();
+    expect(overlay(rendered.container)!.querySelector(".review-question")!.textContent).toBe("comment on core/src/x.rs:837");
+    fireEvent.change(box, { target: { value: "why is b 2?" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(requests("review_comment_add")).toEqual([
+      expect.objectContaining({ tab: 1, turn: 7, scope: "turn", path: "core/src/x.rs", from: 837, to: 837, text: "why is b 2?" }),
+    ]);
+    expect(commentBox(rendered.container)).toBeNull();
+    // The comment shows once the shell sends the draft back for that request.
+    const request = requests("review_comment_add")[0];
+    dispatch({ kind: "review_draft", requestId: request.request_id, tab: 1, draft: DRAFT });
+    expect(overlay(rendered.container)!.textContent).toContain("draft: 1 comment, 1 revert · s sends them to the agent");
+    expect(overlay(rendered.container)!.querySelector('[data-nav-stop="comment"]')!.textContent).toContain("why?");
+  });
+
+  it("Escape closes the input and leaves the overlay open and the comment unsent", () => {
+    const rendered = started();
+    onHunk(rendered);
+    press(rendered.container, "i");
+    const box = commentBox(rendered.container)!;
+    fireEvent.change(box, { target: { value: "never mind" } });
+    fireEvent.keyDown(box, { key: "Escape" });
+    expect(commentBox(rendered.container)).toBeNull();
+    expect(overlay(rendered.container)).not.toBeNull();
+    expect(requests("review_comment_add")).toEqual([]);
+  });
+
+  it("while it is open it owns the keys: a and d are letters in the box, and answer no card", () => {
+    const rendered = started({ withCard: true });
+    onHunk(rendered);
+    press(rendered.container, "i");
+    const box = commentBox(rendered.container)!;
+    for (const k of ["a", "d", "D", "q", "c", "j", "y"]) {
+      // `fireEvent` returns false when the default was prevented, which would stop the letter reaching the box.
+      expect(fireEvent.keyDown(box, { key: k, ...(k === "D" ? { shiftKey: true } : {}) }), `${k} is typed, not claimed`).toBe(true);
+      wait(TYPING_GUARD_MS + 50);
+    }
+    // Keys that reach the root while the box is open (focus was elsewhere) mean nothing either.
+    for (const k of ["a", "d", "D", "x", "s", "u"]) {
+      press(rendered.container, k, k === "D" ? { shiftKey: true } : {});
+      wait(TYPING_GUARD_MS + 50);
+    }
+    expect(answered()).toEqual([]);
+    expect(overlay(rendered.container)).not.toBeNull();
+    expect(commentBox(rendered.container)).not.toBeNull();
+    expect(requests("review_revert")).toEqual([]);
+    expect(requests("review_send")).toEqual([]);
+    // Escape reaching the root cancels the input and nothing else.
+    press(rendered.container, "Escape");
+    expect(commentBox(rendered.container)).toBeNull();
+    expect(overlay(rendered.container)).not.toBeNull();
+  });
+});
+
+describe("s", () => {
+  it("says there is nothing to send for an empty draft", () => {
+    const rendered = started();
+    opened(rendered);
+    press(rendered.container, "s");
+    expect(requests("review_send")).toEqual([]);
+    expect(status(rendered.container)).toBe("nothing to send");
+  });
+
+  it("asks for the preview, shows it, and y sends with its digest; the shell's word is the status", () => {
+    const rendered = started();
+    opened(rendered, { draft: DRAFT });
+    press(rendered.container, "s");
+    const ask = requests("review_send")[0];
+    expect(ask).toMatchObject({ tab: 1, confirm: null });
+    dispatch({
+      kind: "review_send_preview",
+      requestId: ask.request_id,
+      tab: 1,
+      digest: "9f2c4e1a0b7d3c55",
+      text: "Review of your last turn: 1 comment, 1 revert.",
+      notOnDisk: [{ id: 2, path: "core/src/y.rs", what: "hunk", lines: [10, 14], why: "only in the editor, not saved" }],
+      queued: true,
+    });
+    const text = overlay(rendered.container)!.textContent!;
+    expect(text).toContain("Review of your last turn: 1 comment, 1 revert.");
+    expect(text).toContain("core/src/y.rs lines 10-14: only in the editor, not saved");
+    expect(text).toContain("y queues it behind the running turn · n cancels");
+    press(rendered.container, "y");
+    const sent = requests("review_send")[1];
+    expect(sent).toMatchObject({ tab: 1, confirm: "9f2c4e1a0b7d3c55" });
+    dispatch({ kind: "command_result", requestId: sent.request_id, ok: true, message: "queued: it is sent when the running turn ends" });
+    expect(status(rendered.container)).toBe("queued: it is sent when the running turn ends");
+    expect(requests("review_send")).toHaveLength(2);
+  });
+
+  it("n sends nothing more, and a preview that arrives after it is ignored", () => {
+    const rendered = started();
+    opened(rendered, { draft: DRAFT });
+    press(rendered.container, "s");
+    const ask = requests("review_send")[0];
+    press(rendered.container, "n");
+    dispatch({ kind: "review_send_preview", requestId: ask.request_id, tab: 1, digest: "d", text: "late", notOnDisk: [], queued: false });
+    expect(overlay(rendered.container)!.textContent).not.toContain("late");
+    press(rendered.container, "y");
+    expect(requests("review_send")).toHaveLength(1);
+  });
+
+  it("a draft pushed while the preview is up cancels it, so the digest read is the digest sent", () => {
+    const rendered = started();
+    opened(rendered, { draft: DRAFT });
+    press(rendered.container, "s");
+    dispatch({ kind: "review_send_preview", requestId: requests("review_send")[0].request_id, tab: 1, digest: "d", text: "msg", notOnDisk: [], queued: false });
+    dispatch({ kind: "review_draft", requestId: null, tab: 1, draft: { ...DRAFT, comments: [] } });
+    expect(overlay(rendered.container)!.querySelector(".review-preview")).toBeNull();
+    press(rendered.container, "y");
+    expect(requests("review_send")).toHaveLength(1);
+  });
+
+  it("a review_draft for a tab that is not on screen is dropped", () => {
+    const rendered = started({ tabs: [TAB1, TAB2] });
+    opened(rendered);
+    dispatch({ kind: "review_draft", requestId: null, tab: 2, draft: DRAFT });
+    expect(overlay(rendered.container)!.querySelector(".review-draft")).toBeNull();
+  });
+
+  it("the draft is drawn again from the overview after the page starts over", () => {
+    const first = started();
+    opened(first, { draft: DRAFT });
+    expect(overlay(first.container)!.querySelector(".review-draft")!.textContent).toBe("draft: 1 comment, 1 revert · s sends them to the agent");
+    cleanup();
+    const second = started();
+    press(second.container, "c");
+    expect(overlay(second.container)!.querySelector(".review-draft"), "nothing was kept in the page").toBeNull();
+    dispatch(reviewEnvelope(requests("review_request").pop()!.request_id, { draft: DRAFT }));
+    expect(overlay(second.container)!.querySelector(".review-draft")!.textContent).toBe("draft: 1 comment, 1 revert · s sends them to the agent");
+  });
+});
+
+describe("an interrupted revert", () => {
+  const ENTRY = { id: "e-1", path: "core/src/x.rs", at: 1790000000000 };
+
+  it("is named in the band with the pointer off, and gone when the shell says it is resolved", () => {
+    const { container } = started();
+    expect(bandText(container)).not.toContain("interrupted");
+    dispatch({ kind: "review_recovery", entries: [ENTRY] });
+    expect(bandText(container)).toContain("an interrupted revert left core/src/x.rs · c to review");
+    expect(bandText(container)).not.toContain("files changed");
+    dispatch({ kind: "review_recovery", entries: [] });
+    expect(bandText(container)).not.toContain("interrupted");
+  });
+
+  it("is a window-level envelope: it shows for whichever tab is on screen", () => {
+    const rendered = started({ tabs: [TAB1, TAB2] });
+    dispatch({ kind: "review_recovery", entries: [ENTRY] });
+    dispatch({ kind: "tabs", active: 2, tabs: [TAB1, TAB2] });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 0, state: snapshotState() });
+    expect(bandText(rendered.container)).toContain("an interrupted revert left core/src/x.rs");
+  });
+
+  it("is a row at the top of the overlay; Enter asks, y restores, naming no tab", () => {
+    const rendered = started();
+    dispatch({ kind: "review_recovery", entries: [ENTRY] });
+    opened(rendered);
+    const first = overlay(rendered.container)!.querySelector(".row-current")!;
+    expect(first.getAttribute("data-nav-stop")).toBe("recovery");
+    press(rendered.container, "Enter");
+    expect(overlay(rendered.container)!.querySelector(".review-question")!.textContent).toBe(
+      "restore core/src/x.rs to its bytes from before the interrupted revert? the current bytes are kept in the review store. y restores · n forgets this",
+    );
+    press(rendered.container, "y");
+    const sent = requests("review_recover")[0];
+    expect(sent).toMatchObject({ entry: "e-1", answer: "restore" });
+    expect(sent).not.toHaveProperty("tab");
+  });
+
+  it("n forgets it, and an entry that arrives while the overlay is open is drawn", () => {
+    const rendered = started();
+    opened(rendered);
+    expect(overlay(rendered.container)!.querySelector('[data-nav-stop="recovery"]')).toBeNull();
+    dispatch({ kind: "review_recovery", entries: [ENTRY] });
+    press(rendered.container, "k");
+    press(rendered.container, "Enter");
+    press(rendered.container, "n");
+    expect(requests("review_recover")).toEqual([expect.objectContaining({ entry: "e-1", answer: "dismiss" })]);
+  });
+
+  it("a refusal to restore is on the overlay's status line", () => {
+    const rendered = started();
+    dispatch({ kind: "review_recovery", entries: [ENTRY] });
+    opened(rendered);
+    press(rendered.container, "Enter");
+    press(rendered.container, "y");
+    dispatch({ kind: "command_result", requestId: requests("review_recover")[0].request_id, ok: false, error: "an agent turn is running" });
+    expect(status(rendered.container)).toBe("an agent turn is running");
+  });
+});
+
+describe("o", () => {
+  it("a refusal from the editor is the overlay's status line, not a fading flash", () => {
+    const rendered = started();
+    opened(rendered);
+    press(rendered.container, "o");
+    dispatch({ kind: "command_result", requestId: requests("open_in_editor")[0].request_id, ok: false, error: "no editor is attached" });
+    expect(status(rendered.container)).toBe("no editor is attached");
+  });
+
+  it("says what opened, in the shell's words", () => {
+    const rendered = started();
+    opened(rendered);
+    press(rendered.container, "o");
+    dispatch({ kind: "command_result", requestId: requests("open_in_editor")[0].request_id, ok: true, message: "opened; 2 hunks no longer match this buffer" });
+    expect(status(rendered.container)).toBe("opened; 2 hunks no longer match this buffer");
   });
 });

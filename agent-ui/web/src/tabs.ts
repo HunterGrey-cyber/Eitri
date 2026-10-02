@@ -6,11 +6,13 @@ import type { PermissionModeChoice, TabId, TabInfo, TabMarker, TabsEnvelope } fr
  *  Phase 3: the queue, the draft mirror, the taken-back queue, the rule offers and the scratch
  *  state are each a tab's own (ruling 1, 6, 7, 16, plan ruling 18) -- `history`, `editor_context`,
  *  `editor_link` and `notice` are window-scoped and stay out of this set. The review overlay's two replies
- *  are the active tab's; `review_hint` is deliberately not here -- it is kept for the tab it names while
+ *  are the active tab's, as are its draft and the send preview (`review_recovery` is the project's journal, so
+ *  not); `review_hint` is deliberately not here -- it is kept for the tab it names while
  *  another is on screen. */
 const TAB_SCOPED = new Set([
   "events", "snapshot", "handoff", "error", "focus_permission", "tab_detail", "confirm_close", "begin_rename",
   "queue", "draft", "queue_taken", "rule_offers", "scratch", "review", "review_diff",
+  "review_draft", "review_send_preview",
 ]);
 
 /** The panel keeps only the active tab's state, so an envelope for another tab is dropped. That

@@ -6,7 +6,7 @@
 
 use std::rc::Rc;
 
-use crate::agent_panel::AgentPanelHandle;
+use crate::agent_panel::{AgentPanelHandle, ReviewConfig};
 use crate::lua::LuaEngine;
 
 /// What `init.lua` decided for this window.
@@ -22,6 +22,9 @@ pub(crate) struct WindowConfig {
     /// Which window manager the companion window asks to move focus (`companion.wm`). Read by every
     /// window so a bad value fails the same way everywhere; only the companion window uses it.
     pub(crate) companion_wm: eitri_core::wm::WmChoice,
+    /// `review.enabled` and `review.hint`: whether turn review runs, and whether a finished turn
+    /// puts a hint in the status band.
+    pub(crate) review: ReviewConfig,
 }
 
 /// How big the agent panel's text is. One number: every other size in `index.css` is a ratio of
@@ -223,6 +226,21 @@ pub(crate) fn load(lua_engine: &LuaEngine) -> Result<WindowConfig, String> {
 
     let companion_wm = parse_companion_wm(lua_engine.config.borrow().get(eitri_core::wm::CONFIG_KEY))?;
 
+    // Whether turn review runs (`review.enabled`, default true) and whether a finished turn puts a
+    // hint in the status band (`review.hint`, default false). Anything but true/false is a startup
+    // failure naming the key, like `agent.user_settings` above.
+    let review = ReviewConfig {
+        enabled: eitri_core::agent_prefs::parse_review_enabled(
+            lua_engine
+                .config
+                .borrow()
+                .get(eitri_core::agent_prefs::REVIEW_ENABLED_KEY),
+        )?,
+        hint: eitri_core::agent_prefs::parse_review_hint(
+            lua_engine.config.borrow().get(eitri_core::agent_prefs::REVIEW_HINT_KEY),
+        )?,
+    };
+
     Ok(WindowConfig {
         panel_font_size,
         typing_cadence,
@@ -233,16 +251,21 @@ pub(crate) fn load(lua_engine: &LuaEngine) -> Result<WindowConfig, String> {
         tmux_import,
         tmux_skipped,
         companion_wm,
+        review,
     })
 }
 
 impl WindowConfig {
-    /// The three settings that live on the panel itself: the typing cadence, the restore policy and
-    /// the default mode for new tabs.
+    /// The settings that live on the panel itself: the typing cadence, the restore policy, the
+    /// default mode for new tabs and the turn review switches.
     pub(crate) fn apply_to_panel(&self, panel: &AgentPanelHandle) {
         panel.set_typing_cadence(self.typing_cadence);
         panel.set_restore_policy(self.restore_policy);
         panel.set_default_mode(self.default_mode);
+        panel.set_review(ReviewConfig {
+            enabled: self.review.enabled,
+            hint: self.review.hint,
+        });
     }
 }
 
@@ -261,6 +284,30 @@ mod tests {
             err.starts_with("eitri.config.set(\"agent.font_size\", \"x\"): not a number ("),
             "{err}"
         );
+    }
+
+    /// `init.lua`'s review keys run through the real Lua engine: a boolean is read, a table is a
+    /// startup failure naming the key.
+    #[test]
+    fn window_config_reads_both_review_keys() {
+        let scratch = std::env::temp_dir().join(format!("eitri-review-keys-{}", uuid::Uuid::new_v4()));
+        let config_dir = scratch.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let run = |lines: &str| {
+            std::fs::write(config_dir.join("init.lua"), lines).unwrap();
+            let engine = crate::lua::LuaEngine::new(config_dir.clone()).unwrap();
+            engine.run_and_check_init_file(&config_dir.join("init.lua"))?;
+            let config = engine.config.borrow();
+            Ok::<_, String>((
+                eitri_core::agent_prefs::parse_review_enabled(config.get(eitri_core::agent_prefs::REVIEW_ENABLED_KEY))?,
+                eitri_core::agent_prefs::parse_review_hint(config.get(eitri_core::agent_prefs::REVIEW_HINT_KEY))?,
+            ))
+        };
+        assert_eq!(run("-- nothing set\n"), Ok((true, false)));
+        assert_eq!(run("eitri.config.set(\"review.hint\", true)\n"), Ok((true, true)));
+        assert_eq!(run("eitri.config.set(\"review.enabled\", false)\n"), Ok((false, false)));
+        assert!(run("eitri.config.set(\"review.hint\", {})\n").is_err());
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]

@@ -979,13 +979,17 @@ export const VISUAL_KEYS: KeyHelp[] = [
 /** The turn review overlay's keys (`c` opens it), everything `./review`'s `resolveReviewKey` claims. Tied to
  *  that function both ways by `review.test.ts`, the discipline `BROWSE_KEYS` is held to. The overlay owns
  *  every key while it is open, so `a`/`d` and the rest of BROWSE's table never reach a card underneath.
- *  `x`, `u`, `i` and `s` are not here and not bound: they are reserved for the changes the overlay does not
- *  make yet, and a row for a key that does nothing would promise it. */
+ *  While a one-line prompt is open it owns them instead: `y`/`n`/`Escape` on a question, and the comment
+ *  input's own text -- those are answers to the prompt, not rows of this table. */
 export const REVIEW_KEYS: KeyHelp[] = [
   { keys: "j / k", what: "Next / previous file or hunk; an open hunk's box scrolls first" },
   { keys: "gg / G", what: "First / last stop" },
   { keys: "Ctrl+d / Ctrl+u", what: "Several stops down / up" },
-  { keys: "Enter", what: "Open or close the file's hunks (on a hunk: close its file); on the folded group: open it" },
+  { keys: "Enter", what: "Open or close the file's hunks (on a hunk: close its file); on the folded group: open it; on an interrupted revert: restore it or forget it" },
+  { keys: "x", what: "On a hunk: revert it. On a file row: revert the whole file (asks y/n). On a comment: delete it" },
+  { keys: "u", what: "Undo the last revert made here" },
+  { keys: "i", what: "Comment on the hunk under the cursor: a one-line input (Enter saves, Esc cancels)" },
+  { keys: "s", what: "Send the draft's comments and reverts to the agent, after showing what will be sent (y sends, n cancels)" },
   { keys: "[ / ]", what: "Previous / next turn (turn scope)" },
   { keys: "S", what: "Switch between this turn and the whole session" },
   { keys: "o", what: "Open the file in the editor at the hunk's first line" },

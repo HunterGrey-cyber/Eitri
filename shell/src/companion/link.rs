@@ -14,6 +14,8 @@ use rmpv::Value;
 use eitri_core::companion::attach::{BandLink, LinkState};
 use eitri_core::companion::driver::LinkDriver;
 use eitri_core::companion::Sockets;
+use eitri_core::editor_rpc::EditorRpc;
+use eitri_core::nvim_rpc::Pending;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -75,15 +77,22 @@ impl CompanionLink {
         self.driver.borrow().attach(addr);
     }
 
-    /// Run Lua in the attached nvim without waiting for its answer. `Err` says why not.
-    #[allow(dead_code)] // `exec_lua_for` is the one the window uses; this is its plain form
-    pub(crate) fn exec_lua(&self, code: &str, args: Vec<Value>) -> Result<(), String> {
-        self.driver.borrow_mut().exec_lua(code, args)
+    /// Run Lua that needs the install's part `part` in the attached nvim, without waiting for its
+    /// answer. `Err` says why not.
+    pub(crate) fn exec_lua_for(&self, part: &str, code: &str, args: Vec<Value>) -> Result<(), String> {
+        // editor-rpc-scan: forwards a caller's constant
+        self.driver.borrow_mut().exec_lua_for(Some(part), code, args)
     }
 
-    /// [`CompanionLink::exec_lua`] for code that needs the install's part `part`.
-    pub(crate) fn exec_lua_for(&self, part: &str, code: &str, args: Vec<Value>) -> Result<(), String> {
-        self.driver.borrow_mut().exec_lua_for(Some(part), code, args)
+    /// Who owns the review module in the attached nvim: this panel, on its channel there. `None`
+    /// unless attached.
+    pub(crate) fn review_owner(&self) -> Option<eitri_core::review_editor::Owner> {
+        match self.driver.borrow().state() {
+            LinkState::Attached { channel, .. } => {
+                Some(eitri_core::review_editor::Owner::Companion { channel: *channel })
+            }
+            _ => None,
+        }
     }
 
     /// The editor's pid for finding its window: the process holding the socket, as the kernel says,
@@ -106,5 +115,18 @@ impl CompanionLink {
     /// written. Never waits.
     pub(crate) fn shutdown(&self) {
         self.driver.borrow_mut().shutdown();
+    }
+}
+
+/// The attached nvim, answered. The poll timer lets go of the driver before it calls anyone back,
+/// so a call from one of those callbacks finds it free.
+impl EditorRpc for CompanionLink {
+    fn exec_lua(&self, code: &'static str, args: Vec<Value>) -> Pending {
+        // editor-rpc-scan: forwards a caller's constant
+        self.driver.borrow_mut().exec_lua_answered(code, args)
+    }
+
+    fn target(&self) -> Option<u64> {
+        self.driver.borrow().generation()
     }
 }

@@ -46,6 +46,31 @@ describe("the band degrades by priority (spec §5.3)", () => {
     expect(seg(0)).toBeUndefined();
     expect(bandLayout({ ...idle, review: null }, 900, 7.2).map((s) => s.id)).not.toContain("review");
   });
+  it("names an interrupted revert whatever the review pointer says, with the key that opens it", () => {
+    const seg = (more: number) => bandLayout({ ...idle, review: null, recovery: { path: "core/src/x.rs", more } }, 900, 7.2).find((s) => s.id === "recovery");
+    expect(seg(0)).toEqual({ id: "recovery", text: "an interrupted revert left core/src/x.rs · c to review", side: "left" });
+    expect(seg(2)?.text).toBe("an interrupted revert left core/src/x.rs and 2 more · c to review");
+    expect(bandLayout({ ...idle, recovery: null }, 900, 7.2).map((s) => s.id)).not.toContain("recovery");
+    expect(bandLayout({ ...idle, review: { files: 2 }, recovery: { path: "a", more: 0 } }, 900, 7.2).map((s) => s.id)).toEqual(expect.arrayContaining(["review", "recovery"]));
+  });
+  it("keeps the recovery notice after the figures and pointers, shortens it to the file's name, and never over a prompt", () => {
+    const facts: BandFacts = { ...idle, review: { files: 3 }, recovery: { path: "core/src/deeply/nested/x.rs", more: 0 } };
+    // Narrow enough that the review pointer, the model and the position are gone: the notice is still there.
+    for (let width = 140; width <= 900; width += 10) {
+      const shown = bandLayout(facts, width, 7.2).map((s) => s.id);
+      if (shown.includes("review") || shown.includes("model")) expect(shown, `width ${width}`).toContain("recovery");
+    }
+    const texts = new Set<string>();
+    for (let width = 100; width <= 900; width += 5) {
+      const text = bandLayout(facts, width, 7.2).find((s) => s.id === "recovery")?.text;
+      if (text !== undefined) texts.add(text);
+    }
+    expect([...texts].sort()).toEqual([
+      "an interrupted revert left core/src/deeply/nested/x.rs · c to review",
+      "an interrupted revert left x.rs · c to review",
+    ]);
+    expect(ids(900, { ...facts, prompt: "close? (y/n)" })).toEqual(["mode", "prompt"]);
+  });
   it("drops the review pointer before the model, and never over a prompt", () => {
     const facts: BandFacts = { ...idle, review: { files: 3 } };
     expect(ids(900, facts)).toContain("review");

@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -27,6 +27,11 @@ use agent::AgentDomainEvent;
 
 use super::attribution::{origin, NamedPaths, Origin};
 use super::diff::{changed_files, file_hunks, Hunk, Side};
+use super::presence::PresenceGuard;
+use super::revert::{
+    AnchorJob, EditorClear, ExactHunksJob, RecoverAnswer, RecoverJob, RecoveriesJob, RevertJob, RevertTarget, Saved,
+    UndoJob,
+};
 use super::shadow::{
     review_dir_for, Limits, Shadow, SnapshotKind, SnapshotLabel, SnapshotOutcome, SnapshotRef, TurnMarks,
 };
@@ -343,15 +348,16 @@ impl fmt::Debug for ReviewOptions {
 
 /// Where the shadow is and how to open it: everything a worker or a job needs, and cheap to clone.
 #[derive(Debug, Clone)]
-struct ShadowSpec {
-    review_dir: Option<PathBuf>,
-    root: PathBuf,
-    excludes: Option<Option<PathBuf>>,
+pub(crate) struct ShadowSpec {
+    pub(crate) review_dir: Option<PathBuf>,
+    /// The canonical project root.
+    pub(crate) root: PathBuf,
+    pub(crate) excludes: Option<Option<PathBuf>>,
 }
 
 impl ShadowSpec {
     /// Opens (creating on first use) the store. Runs git: only ever called off the GTK thread.
-    fn open(&self) -> Result<Shadow, String> {
+    pub(crate) fn open(&self) -> Result<Shadow, String> {
         let dir = self
             .review_dir
             .as_deref()
@@ -522,6 +528,12 @@ impl TurnReview {
             tabs: BTreeMap::new(),
             pump: 0,
         }
+    }
+
+    /// The canonical project root this review was built for: the base every path handed to the
+    /// editor must be joined to, because a write refuses an editor check made for any other name.
+    pub fn project_root(&self) -> &Path {
+        &self.spec.root
     }
 
     /// Takes in one delivered event of `tab`. `session` is the tab's provider session as its
@@ -727,6 +739,110 @@ impl TurnReview {
             turn,
             scope,
             path: PathBuf::from(path),
+        }
+    }
+
+    /// One file's hunks in the review of `session` at `turn` in `scope`, with the lines of both
+    /// sides as the snapshots hold them, terminators and all. Built here without git.
+    pub fn exact_hunks_job(&self, session: &str, turn: u32, scope: Scope, path: &str) -> ExactHunksJob {
+        ExactHunksJob {
+            spec: self.spec.clone(),
+            session: session.to_owned(),
+            records: self.turns(session),
+            turn,
+            scope,
+            path: PathBuf::from(path),
+        }
+    }
+
+    /// Reverting one hunk or the whole of `path` to the base of `session`'s turn `turn` in
+    /// `scope`. It can only be built with this window's presence guard and the editor's word that
+    /// no buffer of the file has unsaved changes; `still_wanted` going false cancels it. Built
+    /// here without git or disk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn revert_job(
+        &self,
+        guard: PresenceGuard,
+        still_wanted: Arc<AtomicBool>,
+        session: &str,
+        turn: u32,
+        scope: Scope,
+        path: &str,
+        target: RevertTarget,
+        clear: EditorClear,
+    ) -> RevertJob {
+        RevertJob {
+            spec: self.spec.clone(),
+            guard,
+            wanted: still_wanted,
+            session: session.to_owned(),
+            records: self.turns(session),
+            turn,
+            scope,
+            path: PathBuf::from(path),
+            target,
+            clear,
+            final_hook: None,
+        }
+    }
+
+    /// Putting `path` back to `pre`, what it was before a revert that wrote `post`. Built here
+    /// without git or disk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn undo_job(
+        &self,
+        guard: PresenceGuard,
+        still_wanted: Arc<AtomicBool>,
+        session: &str,
+        path: &str,
+        pre: Saved,
+        post: Saved,
+        clear: EditorClear,
+    ) -> UndoJob {
+        UndoJob {
+            spec: self.spec.clone(),
+            guard,
+            wanted: still_wanted,
+            session: session.to_owned(),
+            path: PathBuf::from(path),
+            pre,
+            post,
+            clear,
+            final_hook: None,
+        }
+    }
+
+    /// The end side's lines `from..=to` (from 1) of `path`, as the text a comment quotes. Built
+    /// here without git.
+    pub fn anchor_job(&self, session: &str, turn: u32, scope: Scope, path: &str, from: u32, to: u32) -> AnchorJob {
+        AnchorJob {
+            spec: self.spec.clone(),
+            session: session.to_owned(),
+            records: self.turns(session),
+            turn,
+            scope,
+            path: PathBuf::from(path),
+            from,
+            to,
+        }
+    }
+
+    /// The interrupted reverts the journal holds. Built here without disk.
+    pub fn recoveries_job(&self) -> RecoveriesJob {
+        RecoveriesJob {
+            spec: self.spec.clone(),
+        }
+    }
+
+    /// Restoring or forgetting the interrupted revert `entry` (its journal id). Built here without
+    /// git or disk.
+    pub fn recover_job(&self, guard: PresenceGuard, entry: &str, answer: RecoverAnswer) -> RecoverJob {
+        RecoverJob {
+            spec: self.spec.clone(),
+            guard,
+            entry: entry.to_owned(),
+            answer,
+            final_hook: None,
         }
     }
 
@@ -1449,36 +1565,20 @@ pub struct DiffJob {
 impl DiffJob {
     pub fn run(self) -> Result<ReviewDiff, ReviewError> {
         let shadow = self.spec.open().map_err(ReviewError::Unavailable)?;
-        let turns = merged_turns(&shadow, &self.session, self.records)?;
-        let plan = plan(&turns, TurnRef::N(self.turn), self.scope)?;
-        let (from, to) = match plan.compare {
-            Compare::Between { from, to } => (from, to),
-            Compare::NoBaseline(reason) => return Err(ReviewError::NoBaseline(reason)),
-            Compare::NotReady => return Err(ReviewError::NotReady(NOTE_BASE_PENDING.into())),
-        };
-        if plan.too_large.contains(&self.path) {
+        let Resolved {
+            from,
+            to,
+            current,
+            too_large,
+        } = resolve_compare(&shadow, &self.session, &self.records, TurnRef::N(self.turn), self.scope)?;
+        if too_large.contains(&self.path) {
             return Err(ReviewError::TooLarge(self.path));
         }
         let failed = |e: super::shadow::ShadowError| ReviewError::Unavailable(e.to_string());
-        // The wire carries a path as text, so a file whose name is not valid UTF-8 is listed with
-        // replacement characters, and the same text names a different file that really has them.
-        // A name with one is served only when exactly one changed file reads that way and its
-        // bytes are the ones asked for.
-        if self.path.to_str().is_some_and(|p| p.contains('\u{FFFD}')) {
-            let wanted = self.path.to_string_lossy();
-            let same_text: Vec<PathBuf> = changed_files(&shadow, &from, &to)
-                .map_err(failed)?
-                .into_iter()
-                .map(|c| c.path)
-                .filter(|p| p.to_string_lossy() == wanted)
-                .collect();
-            if same_text != [self.path.clone()] {
-                return Err(ReviewError::AmbiguousPath(self.path));
-            }
-        }
+        check_unambiguous(&shadow, &from, &to, &self.path)?;
         match file_hunks(&shadow, &from, &to, &self.path, MAX_OVERVIEW_DIFF_LINES).map_err(failed)? {
             Some(diff) => Ok(ReviewDiff {
-                turn: plan.current,
+                turn: current,
                 path: self.path,
                 added: diff.added,
                 removed: diff.removed,
@@ -1498,7 +1598,7 @@ impl DiffJob {
                     .as_ref()
                     .map_or((0, 0, false), |c| (c.added, c.removed, c.binary));
                 Ok(ReviewDiff {
-                    turn: plan.current,
+                    turn: current,
                     path: self.path,
                     added,
                     removed,
@@ -1515,6 +1615,64 @@ impl DiffJob {
             }
         }
     }
+}
+
+/// What one file's review, revert or anchor compares, resolved from the snapshots the shadow keeps
+/// now rather than from a copy made when the review was opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Resolved {
+    /// The base side's commit.
+    pub(crate) from: String,
+    /// The end side: a snapshot, or the files on disk when the turn has no end snapshot.
+    pub(crate) to: Side,
+    /// The turn shown (for the session scope, the latest).
+    pub(crate) current: u32,
+    /// Files left out of a snapshot of the turns concerned for their size.
+    pub(crate) too_large: BTreeSet<PathBuf>,
+}
+
+/// The two sides of `session`'s review at `turn` in `scope`, with the shadow's own turns merged
+/// in. A turn with no baseline, or one still being taken, is an error: there is nothing to compare.
+pub(crate) fn resolve_compare(
+    shadow: &Shadow,
+    session: &str,
+    records: &[TurnRecord],
+    turn: TurnRef,
+    scope: Scope,
+) -> Result<Resolved, ReviewError> {
+    let turns = merged_turns(shadow, session, records.to_vec())?;
+    let plan = plan(&turns, turn, scope)?;
+    match plan.compare {
+        Compare::Between { from, to } => Ok(Resolved {
+            from,
+            to,
+            current: plan.current,
+            too_large: plan.too_large,
+        }),
+        Compare::NoBaseline(reason) => Err(ReviewError::NoBaseline(reason)),
+        Compare::NotReady => Err(ReviewError::NotReady(NOTE_BASE_PENDING.into())),
+    }
+}
+
+/// Refuses a path that cannot be told apart from another changed file's name. The wire carries a
+/// path as text, so a file whose name is not valid UTF-8 is listed with replacement characters,
+/// and the same text names a different file that really has them. A name with one is served only
+/// when exactly one changed file reads that way and its bytes are the ones asked for.
+pub(crate) fn check_unambiguous(shadow: &Shadow, from: &str, to: &Side, path: &Path) -> Result<(), ReviewError> {
+    if !path.to_str().is_some_and(|p| p.contains('\u{FFFD}')) {
+        return Ok(());
+    }
+    let wanted = path.to_string_lossy();
+    let same_text: Vec<PathBuf> = changed_files(shadow, from, to)
+        .map_err(|e| ReviewError::Unavailable(e.to_string()))?
+        .into_iter()
+        .map(|c| c.path)
+        .filter(|p| p.to_string_lossy() == wanted)
+        .collect();
+    if same_text != [path.to_path_buf()] {
+        return Err(ReviewError::AmbiguousPath(path.to_path_buf()));
+    }
+    Ok(())
 }
 
 /// What a review compares.
@@ -1931,8 +2089,13 @@ mod tests {
             let (mut overview, plan) = head("sess".into(), turns, at, scope, 0).unwrap();
             // What `OverviewJob::run` does once it has compared something.
             overview.compared = matches!(plan.compare, Compare::Between { .. });
-            let json = crate::agent_bridge::serialize_review_for_js(name, crate::tabs::TabId(3), &overview)
-                .replace(&late_at, "HH:MM:SS");
+            let json = crate::agent_bridge::serialize_review_for_js(
+                name,
+                crate::tabs::TabId(3),
+                &overview,
+                &crate::turn_review::ReviewDraft::default(),
+            )
+            .replace(&late_at, "HH:MM:SS");
             envelopes.insert(name.into(), serde_json::from_str(&json).unwrap());
         }
         let fixture = serde_json::json!({

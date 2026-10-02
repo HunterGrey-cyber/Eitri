@@ -945,6 +945,7 @@ name = "eitri-core"
 version = "0.2.0"
 dependencies = [
  "agent",
+ "eitri-core",
  "libc",
  "mlua",
  "rmpv",

@@ -36,10 +36,16 @@ pub(crate) static DEFAULT_CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::M
 
 pub use editor_area::PresentationCounts;
 pub use nvim_rpc::{CallWatch, NvimMode};
+
+/// What [`NeovideEditorPane::exec_lua`] calls with nvim's answer, on the call's own thread: the
+/// value, or the error text (nvim's, or why the connection could not answer). It must not touch
+/// anything that belongs to the GTK thread.
+pub type LuaReply = Box<dyn FnOnce(Result<rmpv::Value, String>) + Send + 'static>;
 pub use stdin::{detach_stdin_from_nvim, ForwardedStdin};
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -236,7 +242,13 @@ pub struct LiveSession {
     ending: Cell<Option<(Instant, nvim_child::Schedule)>>,
     /// Whether [`NeovideEditorPane::on_nvim_unreachable`]'s callback has fired for this session.
     unreachable_said: Cell<bool>,
+    /// Which session this is ([`NeovideEditorPane::session_serial`]), never reused in the process.
+    serial: u64,
 }
+
+/// The serial the next session takes. Process-wide, so the render callback that builds a session
+/// needs no counter handed to it, and no two sessions of any pane share a number.
+static NEXT_SESSION_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 impl Drop for LiveSession {
     fn drop(&mut self) {
@@ -278,6 +290,7 @@ impl LiveSession {
             watched: None,
             ending: Cell::new(None),
             unreachable_said: Cell::new(false),
+            serial: NEXT_SESSION_SERIAL.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -2130,6 +2143,47 @@ impl NeovideEditorPane {
                 eprintln!("[live] exec_lua_watched: could not start its thread ({err}) -- nothing sent");
                 false
             }
+        }
+    }
+
+    /// `nvim_exec_lua(code, args)` on a thread of its own; `reply` runs on that thread once nvim
+    /// answered (or the connection ended). `false`, `reply` dropped uncalled, when nvim is not
+    /// running or the thread could not start.
+    ///
+    /// The thread lives until nvim answers, which may be long: nvim queues a request while it
+    /// waits for a key, and answers after the key. So a caller keeps at most one call outstanding
+    /// for each thing it asks. Unlike [`exec_lua_watched`](Self::exec_lua_watched) this keeps no
+    /// record in the session and starts no watch: the quit and its watch stay the window's own.
+    pub fn exec_lua(&self, code: &'static str, args: Vec<rmpv::Value>, reply: LuaReply) -> bool {
+        let nvim = {
+            let live = self.live_state.borrow();
+            let LiveState::Ready(session) = &*live else {
+                return false;
+            };
+            if session.harness.has_neovim_exited() {
+                return false;
+            }
+            let Some(nvim) = session.harness.neovim_handler().clone_current_neovim() else {
+                return false;
+            };
+            nvim
+        };
+        let call = async move { nvim.exec_lua(code, args).await.map_err(|e| e.to_string()) };
+        match nvim_rpc::spawn_answered("exec_lua", call, reply) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("[live] exec_lua: could not start its thread ({err}) -- nothing sent");
+                false
+            }
+        }
+    }
+
+    /// Which nvim session this pane runs: a new number each time a session becomes Ready, `None`
+    /// while none is or once nvim has exited. An answer is about the session it was asked of.
+    pub fn session_serial(&self) -> Option<u64> {
+        match &*self.live_state.borrow() {
+            LiveState::Ready(session) if !session.harness.has_neovim_exited() => Some(session.serial),
+            _ => None,
         }
     }
 

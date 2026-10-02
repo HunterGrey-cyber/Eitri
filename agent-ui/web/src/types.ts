@@ -597,7 +597,46 @@ export type ReviewEnvelope = {
   /** Every line the review says about itself (its heading, a late or missing baseline, overlaps, a turn
    *  still running), worded by Rust. The overlay draws these and derives none from the turn flags. */
   notes: string[];
+  /** The tab's draft of comments and reverts. The only source the overlay draws it from, with
+   *  `review_draft`: nothing is kept in the page across a reload. Optional only so an envelope recorded
+   *  before the draft existed still draws, as an empty one. */
+  draft?: ReviewDraft;
 };
+/** One comment of the draft, by hunk-independent new-side line range; `anchor` is the quoted text. */
+export type ReviewComment = { id: number; turn: number; path: string; from: number; to: number; anchor: string[]; text: string };
+/** One revert of the draft. A whole-file revert has no `hunk`/`header`/`lines`. `source` says where it was
+ *  made (`panel` or `editor`); `undone` that the change is back. */
+export type ReviewRevert = {
+  id: number;
+  turn: number;
+  path: string;
+  hunk: number | null;
+  header: string | null;
+  what: "hunk" | "deleted" | "restored" | "file";
+  lines: [number, number] | null;
+  source: string;
+  undone: boolean;
+};
+export type ReviewDraft = { comments: ReviewComment[]; reverts: ReviewRevert[]; canUndo: boolean };
+/** The reply to `review_comment_add`/`review_comment_remove`, and pushed unasked (`requestId: null`) after a
+ *  change the panel did not ask for. */
+export type ReviewDraftEnvelope = { requestId: string | null; tab: TabId; draft: ReviewDraft };
+/** One revert the draft records that is not on disk as it says. `lines` is set only for a hunk; a
+ *  whole-file revert (`deleted`, `restored`, `file`) has none. */
+export type ReviewNotOnDisk = { id: number; path: string; what: ReviewRevert["what"]; lines: [number, number] | null; why: string };
+/** The reply to `review_send` with `confirm: null`: the message as it would go, and what it would leave out. */
+export type ReviewSendPreviewEnvelope = {
+  requestId: string;
+  tab: TabId;
+  digest: string;
+  text: string;
+  notOnDisk: ReviewNotOnDisk[];
+  /** A turn is running, so the message waits behind it. */
+  queued: boolean;
+};
+/** One interrupted revert the shell found in the journal; window-level. `at` is epoch milliseconds. */
+export type ReviewRecoveryEntry = { id: string; path: string; at: number };
+export type ReviewRecoveryEnvelope = { entries: ReviewRecoveryEntry[] };
 export type ReviewLine = {
   kind: "context" | "added" | "removed" | "no_newline";
   text: string;
@@ -614,6 +653,11 @@ export type ReviewDiffEnvelope = {
   removed: number;
   /** `null`: the patch is over the display cap. `added`/`removed` are still given. */
   hunks: ReviewHunk[] | null;
+  /** A binary file: it reverts only whole. Optional for the same reason as `ReviewEnvelope.draft`. */
+  binary?: boolean;
+  /** The turn created the file / deleted it. */
+  newFile?: boolean;
+  deletedFile?: boolean;
 };
 /** A finished turn changed `files` files on disk; `0` clears the hint. */
 export type ReviewHintEnvelope = { tab: TabId; turn: number; files: number };

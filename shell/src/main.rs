@@ -10,6 +10,7 @@ mod close_prompt;
 mod companion;
 mod editor_context;
 mod editor_quit;
+mod editor_rpc;
 mod editor_start_failure;
 mod hint;
 mod keys_help;
@@ -26,6 +27,7 @@ mod panel_pacer;
 mod panel_super;
 mod prefix;
 mod prefix_strip;
+mod review_editor;
 mod supervisor_client;
 mod tab_verbs;
 mod terminal;
@@ -1041,6 +1043,32 @@ fn build_ui(
             Ok(())
         });
     }
+    // Turn review's questions to the editor, with the same two refusals: the editor quit for good,
+    // or its nvim not running.
+    {
+        let editor_present: Rc<dyn Fn() -> bool> = {
+            let module_layout = module_layout.clone();
+            Rc::new(move || !module_layout.borrow().is_gone(&ModuleId::editor()))
+        };
+        agent_panel_handle.set_editor_rpc(Rc::new(editor_rpc::EmbeddedEditorRpc::new(
+            pane.clone(),
+            editor_present,
+        )));
+    }
+    // The review overlay in this window's own nvim: the module goes with the window, and a file the
+    // review opened there is shown and given the keys, as a draft being edited is.
+    {
+        agent_panel_handle.set_review_owner(|| Some(eitri_core::review_editor::Owner::Embedded));
+        let focus_module = focus_module.clone();
+        let show_on_screen = show_on_screen.clone();
+        agent_panel_handle.on_review_open(move || {
+            if let Err(err) = show_on_screen(&ModuleId::editor()) {
+                eprintln!("[review] could not show the editor: {err}");
+                return;
+            }
+            focus_module(&ModuleId::editor());
+        });
+    }
     {
         let focus_and_arrive = focus_and_arrive.clone();
         agent_panel_handle.on_editor_done(move || {
@@ -1888,9 +1916,17 @@ fn build_ui(
     // asked for (`editor_quit::EditorQuitting::nvim_exited`).
     {
         let editor_quitting_for_exit = editor_quitting.clone();
-        pane.on_exited_unrequested(move || editor_quitting_for_exit.nvim_exited());
+        let review_for_exit = agent_panel_handle.clone();
+        pane.on_exited_unrequested(move || {
+            review_for_exit.review_editor_lost();
+            editor_quitting_for_exit.nvim_exited()
+        });
         let editor_quitting = editor_quitting.clone();
-        pane.on_nvim_unreachable(move || editor_quitting.nvim_unreachable());
+        let review_for_unreachable = agent_panel_handle.clone();
+        pane.on_nvim_unreachable(move || {
+            review_for_unreachable.review_editor_lost();
+            editor_quitting.nvim_unreachable()
+        });
     }
 
     // R1-4: nvim failed to start (missing, or older than the fork's floor) -- say why in the

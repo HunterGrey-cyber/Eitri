@@ -271,6 +271,70 @@ pub enum InboundMessage {
         scope: ReviewScopeWire,
         path: String,
     },
+    /// `x` in the review overlay: put a hunk, or the whole file, back to how the turn found it.
+    /// Answered by a `command_result`.
+    ReviewRevert {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        turn: u32,
+        scope: ReviewScopeWire,
+        path: String,
+        target: ReviewRevertTargetWire,
+    },
+    /// `u` in the review overlay: undo the newest revert made there.
+    ReviewUndo {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// `i` in the review overlay: add a comment on lines of a file to the tab's draft. Answered by a
+    /// `review_draft` envelope carrying `request_id`, or by a failing `command_result`.
+    ReviewCommentAdd {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        turn: u32,
+        scope: ReviewScopeWire,
+        path: String,
+        from: u32,
+        to: u32,
+        text: String,
+    },
+    /// Remove one comment from the tab's draft. Answered like `review_comment_add`.
+    ReviewCommentRemove {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        id: u32,
+    },
+    /// `s` in the review overlay: without `confirm`, a preview of the message; with the digest the
+    /// preview showed, send it. The only way a review reaches the agent.
+    ReviewSend {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        #[serde(default)]
+        confirm: Option<String>,
+    },
+    /// Answer the question about a write that did not finish (restore it, or let it go). Window-level:
+    /// the journal belongs to the project, not to a tab.
+    ReviewRecover {
+        request_id: String,
+        entry: String,
+        answer: ReviewRecoverAnswerWire,
+    },
+    /// Show a file's turn changes in the user's editor.
+    OpenInEditor {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        turn: u32,
+        scope: ReviewScopeWire,
+        path: String,
+        #[serde(default)]
+        line: Option<u32>,
+    },
     /// `Ctrl+g` in BROWSE (R3): the row's full text in a read-only scratch buffer.
     ViewInEditor {
         request_id: String,
@@ -441,6 +505,7 @@ impl InboundMessage {
             | InboundMessage::PanelKeys { .. }
             | InboundMessage::NavFallthrough { .. }
             | InboundMessage::PaneNav { .. }
+            | InboundMessage::ReviewRecover { .. }
             | InboundMessage::OpenUrl { .. } => return TabRef::WindowLevel,
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
@@ -461,7 +526,13 @@ impl InboundMessage {
             | InboundMessage::Draft { tab, .. }
             | InboundMessage::EditDraft { tab, .. }
             | InboundMessage::ReviewRequest { tab, .. }
-            | InboundMessage::ReviewDiffRequest { tab, .. } => *tab,
+            | InboundMessage::ReviewDiffRequest { tab, .. }
+            | InboundMessage::ReviewRevert { tab, .. }
+            | InboundMessage::ReviewUndo { tab, .. }
+            | InboundMessage::ReviewCommentAdd { tab, .. }
+            | InboundMessage::ReviewCommentRemove { tab, .. }
+            | InboundMessage::ReviewSend { tab, .. }
+            | InboundMessage::OpenInEditor { tab, .. } => *tab,
         };
         match tab {
             Some(id) => TabRef::Named(crate::tabs::TabId(id)),
@@ -523,6 +594,13 @@ impl InboundMessage {
             | InboundMessage::OpenPath { request_id, .. }
             | InboundMessage::ReviewRequest { request_id, .. }
             | InboundMessage::ReviewDiffRequest { request_id, .. }
+            | InboundMessage::ReviewRevert { request_id, .. }
+            | InboundMessage::ReviewUndo { request_id, .. }
+            | InboundMessage::ReviewCommentAdd { request_id, .. }
+            | InboundMessage::ReviewCommentRemove { request_id, .. }
+            | InboundMessage::ReviewSend { request_id, .. }
+            | InboundMessage::ReviewRecover { request_id, .. }
+            | InboundMessage::OpenInEditor { request_id, .. }
             | InboundMessage::ViewInEditor { request_id, .. }
             | InboundMessage::TabVerb { request_id, .. }
             | InboundMessage::CycleDefaultMode { request_id }
@@ -563,6 +641,12 @@ pub fn serialize_command_result_for_js(request_id: &str, result: Result<(), &str
             json!({ "kind": "command_result", "requestId": request_id, "ok": false, "error": error }).to_string()
         }
     }
+}
+
+/// `{"kind":"command_result","requestId":...,"ok":true,"message":"..."}`: a success that has a word of
+/// its own to say (`sent`, `queued: ...`), which the panel shows.
+pub fn serialize_command_ok_with_message_for_js(request_id: &str, message: &str) -> String {
+    json!({ "kind": "command_result", "requestId": request_id, "ok": true, "message": message }).to_string()
 }
 
 /// `{"kind":"hello","backend":...,"permissionModes":[...],"resumableSessions":[...],...}` -- sent once,
@@ -885,6 +969,43 @@ impl From<ReviewScopeWire> for crate::turn_review::Scope {
     }
 }
 
+/// What a `review_revert` names: one hunk by its id and header (both must still match the turn's
+/// patch, so a revert of a hunk that has moved is refused), or the whole file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewRevertTargetWire {
+    Hunk { id: u32, header: String },
+    File,
+}
+
+impl<'de> Deserialize<'de> for ReviewRevertTargetWire {
+    /// The string `"file"` or `{"hunk": n, "header": "..."}`; anything else is a parse failure.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum FileTag {
+            File,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Tag(FileTag),
+            Hunk { hunk: u32, header: String },
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Tag(FileTag::File) => ReviewRevertTargetWire::File,
+            Raw::Hunk { hunk, header } => ReviewRevertTargetWire::Hunk { id: hunk, header },
+        })
+    }
+}
+
+/// The answer to the question a write that did not finish leaves: put the file back, or let it go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRecoverAnswerWire {
+    Restore,
+    Dismiss,
+}
+
 /// `{"kind":"review","requestId":...,"tab":...,"scope":...,"current":...,"turns":[...],"files":[...],
 /// "compared":...,"pendingNoResult":...,"notes":[...]}`: the answer to a `review_request`. It states what the
 /// snapshots measured -- files that changed on disk during the turn -- and `origin` carries the
@@ -896,10 +1017,13 @@ impl From<ReviewScopeWire> for crate::turn_review::Scope {
 /// `compared: false` means nothing was compared (no baseline, or one still being taken), so an
 /// empty `files` is no claim that nothing changed. `notes` are every line the review must say about
 /// itself, in order -- the panel draws them as they are and derives none from the turn flags.
+/// `draft` is the tab's comments and reverts, sent with every review so a panel that was reloaded
+/// draws them again.
 pub fn serialize_review_for_js(
     request_id: &str,
     tab: crate::tabs::TabId,
     overview: &crate::turn_review::Overview,
+    draft: &crate::turn_review::ReviewDraft,
 ) -> String {
     use crate::turn_review::Origin;
     let turns: Vec<Value> = overview
@@ -950,12 +1074,138 @@ pub fn serialize_review_for_js(
         "compared": overview.compared,
         "pendingNoResult": overview.pending_no_result,
         "notes": overview.notes,
+        "draft": draft_value(draft),
     })
     .to_string()
 }
 
+/// The draft as the panel draws it: its comments, its reverts and whether `u` has anything to undo.
+/// A revert's `lines` is the range it covers when it is a hunk, `null` for a whole-file revert.
+fn draft_value(draft: &crate::turn_review::ReviewDraft) -> Value {
+    use crate::turn_review::RevertShape;
+    let comments: Vec<Value> = draft
+        .comments()
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "turn": c.turn,
+                "path": c.path,
+                "from": c.from,
+                "to": c.to,
+                "anchor": c.anchor,
+                "text": c.text,
+            })
+        })
+        .collect();
+    let reverts: Vec<Value> = draft
+        .reverts()
+        .iter()
+        .map(|r| {
+            let (what, lines) = match r.new.shape {
+                RevertShape::Lines { from, to } => ("hunk", json!([from, to])),
+                RevertShape::Deleted => ("deleted", Value::Null),
+                RevertShape::Restored => ("restored", Value::Null),
+                RevertShape::WholeFile => ("file", Value::Null),
+            };
+            json!({
+                "id": r.id,
+                "turn": r.new.turn,
+                "path": r.new.path,
+                "hunk": r.new.hunk.as_ref().map(|(id, _)| id),
+                "header": r.new.hunk.as_ref().map(|(_, header)| header),
+                "what": what,
+                "lines": lines,
+                "source": match r.new.source {
+                    crate::turn_review::RevertSource::Panel => "panel",
+                    crate::turn_review::RevertSource::Editor => "editor",
+                },
+                "undone": r.undone,
+            })
+        })
+        .collect();
+    json!({
+        "comments": comments,
+        "reverts": reverts,
+        "canUndo": draft.last_undoable().is_some(),
+    })
+}
+
+/// `{"kind":"review_draft","requestId":...,"tab":...,"draft":{...}}`: the tab's draft after a change.
+/// `request_id` is the request that asked for the change, `null` for a change the panel did not ask
+/// for (a revert or undo landing, a revert made in the editor).
+pub fn serialize_review_draft_for_js(
+    request_id: Option<&str>,
+    tab: crate::tabs::TabId,
+    draft: &crate::turn_review::ReviewDraft,
+) -> String {
+    json!({
+        "kind": "review_draft",
+        "requestId": request_id,
+        "tab": tab.0,
+        "draft": draft_value(draft),
+    })
+    .to_string()
+}
+
+/// `{"kind":"review_send_preview","requestId":...,"tab":...,"digest":...,"text":...,"notOnDisk":[...],
+/// "queued":...}`: the message a `review_send` would send and every revert it leaves out, for the
+/// `y`/`n` the user answers. `what` is the revert's kind as the draft names it (`hunk`, `deleted`,
+/// `restored`, `file`); `lines` is its range when it is a hunk and `null` for a whole-file revert, so
+/// the page must word an entry without a range. `queued` says the tab is busy, so a confirmed send
+/// waits for the running turn to end.
+pub fn serialize_review_send_preview_for_js(
+    request_id: &str,
+    tab: crate::tabs::TabId,
+    draft: &crate::turn_review::ReviewDraft,
+    preview: &crate::turn_review::Preview,
+    queued: bool,
+) -> String {
+    use crate::turn_review::RevertShape;
+    let not_on_disk: Vec<Value> = preview
+        .not_on_disk
+        .iter()
+        .filter_map(|(id, status)| {
+            let record = draft.reverts().iter().find(|r| r.id == *id)?;
+            let (what, lines) = match record.new.shape {
+                RevertShape::Lines { from, to } => ("hunk", json!([from, to])),
+                RevertShape::Deleted => ("deleted", Value::Null),
+                RevertShape::Restored => ("restored", Value::Null),
+                RevertShape::WholeFile => ("file", Value::Null),
+            };
+            Some(json!({
+                "id": id,
+                "path": record.new.path,
+                "what": what,
+                "lines": lines,
+                "why": status.why(),
+            }))
+        })
+        .collect();
+    json!({
+        "kind": "review_send_preview",
+        "requestId": request_id,
+        "tab": tab.0,
+        "digest": preview.digest,
+        "text": preview.text,
+        "notOnDisk": not_on_disk,
+        "queued": queued,
+    })
+    .to_string()
+}
+
+/// `{"kind":"review_recovery","entries":[{"id":...,"path":...,"at":...}]}`: writes that did not finish,
+/// for the panel to ask about. `at` is when the write started, in milliseconds since the epoch.
+pub fn serialize_review_recovery_for_js(entries: &[crate::turn_review::JournalEntry]) -> String {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|entry| json!({ "id": entry.id, "path": entry.path.to_string_lossy(), "at": entry.at_ms }))
+        .collect();
+    json!({ "kind": "review_recovery", "entries": entries }).to_string()
+}
+
 /// `{"kind":"review_diff","requestId":...,"tab":...,"turn":...,"path":...,"added":...,"removed":...,
-/// "hunks":[...]}`: the answer to a `review_diff_request`. `hunks` is `null` when the patch is over
+/// "binary":...,"newFile":...,"deletedFile":...,"hunks":[...]}`: the answer to a `review_diff_request`. `hunks` is `null` when the patch is over
 /// the display cap -- refused, not cut -- and `added`/`removed` are still given.
 pub fn serialize_review_diff_for_js(
     request_id: &str,
@@ -996,6 +1246,9 @@ pub fn serialize_review_diff_for_js(
         "path": diff.path.to_string_lossy(),
         "added": diff.added,
         "removed": diff.removed,
+        "binary": diff.binary,
+        "newFile": diff.new_file,
+        "deletedFile": diff.deleted_file,
         "hunks": hunks,
     })
     .to_string()
@@ -2170,6 +2423,363 @@ mod tests {
         }
     }
 
+    /// Every line of the phase 2 protocol, as the panel sends it.
+    const REVIEW_PHASE2_LINES: [&str; 9] = [
+        r#"{"type":"review_revert","request_id":"r9","tab":3,"turn":7,"scope":"turn","path":"core/src/x.rs","target":{"hunk":2,"header":"@@ -830,6 +830,12 @@"}}"#,
+        r#"{"type":"review_revert","request_id":"r9","tab":3,"turn":7,"scope":"turn","path":"core/src/x.rs","target":"file"}"#,
+        r#"{"type":"review_undo","request_id":"r10","tab":3}"#,
+        r#"{"type":"review_comment_add","request_id":"r11","tab":3,"turn":7,"scope":"turn","path":"core/src/x.rs","from":837,"to":842,"text":"Why by turn id?"}"#,
+        r#"{"type":"review_comment_remove","request_id":"r12","tab":3,"id":1}"#,
+        r#"{"type":"review_send","request_id":"r13","tab":3,"confirm":null}"#,
+        r#"{"type":"review_send","request_id":"r14","tab":3,"confirm":"9f2c4e1a0b7d3c55"}"#,
+        r#"{"type":"review_recover","request_id":"r15","entry":"<uuid>","answer":"restore"}"#,
+        r#"{"type":"open_in_editor","request_id":"r16","tab":3,"turn":7,"scope":"turn","path":"core/src/x.rs","line":837}"#,
+    ];
+
+    #[test]
+    fn review_phase2_messages_deserialize() {
+        use crate::turn_review::Scope;
+        let parsed: Vec<InboundMessage> = REVIEW_PHASE2_LINES
+            .iter()
+            .map(|line| parse_inbound_message(line).unwrap_or_else(|| panic!("{line}")))
+            .collect();
+        let InboundMessage::ReviewRevert {
+            turn,
+            scope,
+            path,
+            target,
+            ..
+        } = &parsed[0]
+        else {
+            panic!("{:?}", parsed[0])
+        };
+        assert_eq!(
+            (*turn, Scope::from(*scope), path.as_str()),
+            (7, Scope::Turn, "core/src/x.rs")
+        );
+        assert_eq!(
+            *target,
+            ReviewRevertTargetWire::Hunk {
+                id: 2,
+                header: "@@ -830,6 +830,12 @@".into()
+            }
+        );
+        assert!(matches!(
+            &parsed[1],
+            InboundMessage::ReviewRevert {
+                target: ReviewRevertTargetWire::File,
+                ..
+            }
+        ));
+        assert!(matches!(&parsed[2], InboundMessage::ReviewUndo { .. }));
+        let InboundMessage::ReviewCommentAdd { from, to, text, .. } = &parsed[3] else {
+            panic!("{:?}", parsed[3])
+        };
+        assert_eq!((*from, *to, text.as_str()), (837, 842, "Why by turn id?"));
+        assert!(matches!(&parsed[4], InboundMessage::ReviewCommentRemove { id: 1, .. }));
+        assert!(matches!(&parsed[5], InboundMessage::ReviewSend { confirm: None, .. }));
+        let InboundMessage::ReviewSend { confirm, .. } = &parsed[6] else {
+            panic!("{:?}", parsed[6])
+        };
+        assert_eq!(confirm.as_deref(), Some("9f2c4e1a0b7d3c55"));
+        let InboundMessage::ReviewRecover { entry, answer, .. } = &parsed[7] else {
+            panic!("{:?}", parsed[7])
+        };
+        assert_eq!((entry.as_str(), *answer), ("<uuid>", ReviewRecoverAnswerWire::Restore));
+        let InboundMessage::OpenInEditor { line, path, .. } = &parsed[8] else {
+            panic!("{:?}", parsed[8])
+        };
+        assert_eq!((*line, path.as_str()), (Some(837), "core/src/x.rs"));
+        // An absent `confirm` and an absent `line` read as none; the other answer parses too.
+        assert!(matches!(
+            parse_inbound_message(r#"{"type":"review_send","request_id":"r","tab":3}"#),
+            Some(InboundMessage::ReviewSend { confirm: None, .. })
+        ));
+        assert!(matches!(
+            parse_inbound_message(
+                r#"{"type":"open_in_editor","request_id":"r","tab":3,"turn":1,"scope":"session","path":"a"}"#
+            ),
+            Some(InboundMessage::OpenInEditor { line: None, .. })
+        ));
+        assert!(matches!(
+            parse_inbound_message(r#"{"type":"review_recover","request_id":"r","entry":"e","answer":"dismiss"}"#),
+            Some(InboundMessage::ReviewRecover {
+                answer: ReviewRecoverAnswerWire::Dismiss,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_review_message_that_does_not_fit_fails_to_parse() {
+        for bad in [
+            r#"{"type":"review_revert","request_id":"r","tab":1,"turn":1,"scope":"turn","path":"a","target":"hunk"}"#,
+            r#"{"type":"review_revert","request_id":"r","tab":1,"turn":1,"scope":"turn","path":"a","target":{"hunk":1}}"#,
+            r#"{"type":"review_revert","request_id":"r","tab":1,"turn":1,"scope":"turn","path":"a"}"#,
+            r#"{"type":"review_comment_add","request_id":"r","tab":1,"turn":1,"scope":"turn","path":"a","from":1,"text":"t"}"#,
+            r#"{"type":"review_comment_remove","request_id":"r","tab":1}"#,
+            r#"{"type":"review_comment_remove","request_id":"r","tab":1,"id":-1}"#,
+            r#"{"type":"review_recover","request_id":"r","entry":"e","answer":"later"}"#,
+            r#"{"type":"review_recover","request_id":"r","entry":"e"}"#,
+        ] {
+            assert!(parse_inbound_message(bad).is_none(), "{bad}");
+        }
+    }
+
+    /// Tab routing: a revert, an undo, a comment or a send for "the active tab" would act on the
+    /// wrong session after a switch. Only the recovery, which belongs to the project, is window-level.
+    #[test]
+    fn a_review_command_naming_no_tab_is_refused() {
+        for line in REVIEW_PHASE2_LINES {
+            let named = parse_inbound_message(line).unwrap();
+            if matches!(named, InboundMessage::ReviewRecover { .. }) {
+                assert!(matches!(named.tab_ref(), TabRef::WindowLevel), "{line}");
+                continue;
+            }
+            assert!(matches!(named.tab_ref(), TabRef::Named(TabId(3))), "{line}");
+            let dropped = if line.contains(r#""tab":3,"#) {
+                line.replace(r#""tab":3,"#, "")
+            } else {
+                line.replace(r#","tab":3"#, "")
+            };
+            for without in [dropped, line.replace(r#""tab":3"#, r#""tab":null"#)] {
+                assert_ne!(without, line, "the line names a tab: {line}");
+                let message = parse_inbound_message(&without).unwrap_or_else(|| panic!("{without}"));
+                assert!(matches!(message.tab_ref(), TabRef::Missing), "{without}");
+            }
+        }
+    }
+
+    #[test]
+    fn request_ids_are_read_for_every_new_message() {
+        let ids: Vec<String> = REVIEW_PHASE2_LINES
+            .iter()
+            .map(|line| parse_inbound_message(line).unwrap().request_id().to_owned())
+            .collect();
+        assert_eq!(ids, ["r9", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "r16"]);
+    }
+
+    fn draft_with_everything() -> crate::turn_review::ReviewDraft {
+        use crate::turn_review::{NewRevert, RevertShape, RevertSource, ReviewDraft};
+        let mut draft = ReviewDraft::default();
+        draft
+            .add_comment(
+                7,
+                "core/src/x.rs",
+                837,
+                842,
+                vec!["let base = …;".into()],
+                "Why by turn id?",
+            )
+            .unwrap();
+        let revert = |path: &str, hunk: Option<(u32, String)>, shape, source| NewRevert {
+            turn: 7,
+            path: path.into(),
+            hunk,
+            shape,
+            source,
+            at_line: 120,
+            reverted_to: b"a\n".to_vec(),
+            replaced: b"b\n".to_vec(),
+            undo: None,
+        };
+        draft.record_revert(revert(
+            "core/src/foo.rs",
+            Some((2, "@@ -120,8 +120,12 @@".into())),
+            RevertShape::Lines { from: 120, to: 127 },
+            RevertSource::Panel,
+        ));
+        draft.record_revert(revert("new.rs", None, RevertShape::Deleted, RevertSource::Panel));
+        draft.record_revert(revert("old.rs", None, RevertShape::Restored, RevertSource::Editor));
+        let whole = draft.record_revert(revert("all.rs", None, RevertShape::WholeFile, RevertSource::Panel));
+        draft.mark_undone(whole);
+        draft
+    }
+
+    #[test]
+    fn review_draft_send_preview_and_recovery_serialize_exactly() {
+        use crate::turn_review::{compose, JournalEntry, RevertStatus};
+        let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        let draft = draft_with_everything();
+        let expected_draft = serde_json::json!({
+            "comments": [{"id": 1, "turn": 7, "path": "core/src/x.rs", "from": 837, "to": 842,
+                          "anchor": ["let base = …;"], "text": "Why by turn id?"}],
+            "reverts": [
+                {"id": 1, "turn": 7, "path": "core/src/foo.rs", "hunk": 2, "header": "@@ -120,8 +120,12 @@",
+                 "what": "hunk", "lines": [120, 127], "source": "panel", "undone": false},
+                {"id": 2, "turn": 7, "path": "new.rs", "hunk": null, "header": null,
+                 "what": "deleted", "lines": null, "source": "panel", "undone": false},
+                {"id": 3, "turn": 7, "path": "old.rs", "hunk": null, "header": null,
+                 "what": "restored", "lines": null, "source": "editor", "undone": false},
+                {"id": 4, "turn": 7, "path": "all.rs", "hunk": null, "header": null,
+                 "what": "file", "lines": null, "source": "panel", "undone": true},
+            ],
+            "canUndo": true,
+        });
+        assert_eq!(
+            v(serialize_review_draft_for_js(Some("r11"), TabId(3), &draft)),
+            serde_json::json!({"kind": "review_draft", "requestId": "r11", "tab": 3, "draft": expected_draft})
+        );
+        assert_eq!(
+            v(serialize_review_draft_for_js(None, TabId(3), &draft))["requestId"],
+            serde_json::Value::Null,
+            "a change the panel did not ask for carries no request id"
+        );
+        let empty = v(serialize_review_draft_for_js(
+            None,
+            TabId(3),
+            &crate::turn_review::ReviewDraft::default(),
+        ));
+        assert_eq!(
+            empty["draft"],
+            serde_json::json!({"comments": [], "reverts": [], "canUndo": false})
+        );
+
+        let statuses = [
+            (1, RevertStatus::OnDisk),
+            (2, RevertStatus::ChangedSince),
+            (3, RevertStatus::OnlyInEditor),
+            (4, RevertStatus::Undone),
+        ];
+        let preview = compose(&draft, &statuses, 7);
+        assert_eq!(
+            v(serialize_review_send_preview_for_js(
+                "r13",
+                TabId(3),
+                &draft,
+                &preview,
+                false
+            )),
+            serde_json::json!({
+                "kind": "review_send_preview", "requestId": "r13", "tab": 3,
+                "digest": preview.digest, "text": preview.text,
+                "notOnDisk": [
+                    {"id": 2, "path": "new.rs", "what": "deleted", "lines": null, "why": "changed since"},
+                    {"id": 3, "path": "old.rs", "what": "restored", "lines": null,
+                     "why": "only in the editor, not saved"},
+                    {"id": 4, "path": "all.rs", "what": "file", "lines": null, "why": "undone"},
+                ],
+                "queued": false,
+            })
+        );
+        assert_eq!(
+            v(serialize_review_send_preview_for_js(
+                "r13",
+                TabId(3),
+                &draft,
+                &preview,
+                true
+            ))["queued"],
+            true
+        );
+
+        let entry = JournalEntry {
+            id: "e1".into(),
+            path: "core/src/x.rs".into(),
+            pre: None,
+            intended: None,
+            mode: 0o644,
+            at_ms: 1_790_000_000_000,
+            pid: 1,
+            session: "s".into(),
+        };
+        assert_eq!(
+            v(serialize_review_recovery_for_js(&[entry])),
+            serde_json::json!({"kind": "review_recovery", "entries": [
+                {"id": "e1", "path": "core/src/x.rs", "at": 1_790_000_000_000u64}]})
+        );
+        assert_eq!(
+            v(serialize_review_recovery_for_js(&[])),
+            serde_json::json!({"kind": "review_recovery", "entries": []})
+        );
+    }
+
+    /// `agent-ui/web/src/fixtures/review-send-preview.json`: a send preview leaving out one revert of
+    /// every kind -- a hunk, a deleted file, a restored file and a whole file -- as this side sends it,
+    /// which the overlay's tests render, so an entry without a line range is drawn by the page's own
+    /// code and not only by a hand-written test value. Compared on every run;
+    /// `EITRI_WRITE_FIXTURES=1` rewrites it.
+    #[test]
+    fn the_review_send_preview_fixture_is_what_the_serializer_sends() {
+        use crate::turn_review::{compose, RevertStatus};
+        let draft = draft_with_everything();
+        let statuses = [
+            (1, RevertStatus::ChangedSince),
+            (2, RevertStatus::ChangedSince),
+            (3, RevertStatus::OnlyInEditor),
+            (4, RevertStatus::Undone),
+        ];
+        let preview = compose(&draft, &statuses, 7);
+        let envelope = serialize_review_send_preview_for_js("send-1", TabId(1), &draft, &preview, false);
+        let fixture = json!({
+            "writtenBy": "core/src/agent_bridge.rs, tests::the_review_send_preview_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "envelope": serde_json::from_str::<Value>(&envelope).unwrap(),
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent-ui/web/src/fixtures/review-send-preview.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the review send preview fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed review send preview fixture is not what this test produces; if the change \
+                 is intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
+    #[test]
+    fn review_carries_the_draft_and_review_diff_its_file_kind() {
+        use crate::turn_review::{Overview, ReviewDiff, Scope};
+        let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        let overview = Overview {
+            session: "s".into(),
+            scope: Scope::Turn,
+            current: 7,
+            turns: Vec::new(),
+            files: Vec::new(),
+            compared: true,
+            pending_no_result: 0,
+            notes: Vec::new(),
+        };
+        let draft = draft_with_everything();
+        let sent = v(serialize_review_for_js("r1", TabId(3), &overview, &draft));
+        assert_eq!(
+            sent["draft"],
+            v(serialize_review_draft_for_js(None, TabId(3), &draft))["draft"]
+        );
+
+        for (binary, new_file, deleted_file) in [(true, false, false), (false, true, false), (false, false, true)] {
+            let diff = ReviewDiff {
+                turn: 7,
+                path: "a".into(),
+                added: 0,
+                removed: 0,
+                binary,
+                new_file,
+                deleted_file,
+                mode_change: None,
+                hunks: None,
+            };
+            let sent = v(serialize_review_diff_for_js("r2", TabId(3), &diff));
+            assert_eq!(
+                (
+                    sent["binary"].as_bool(),
+                    sent["newFile"].as_bool(),
+                    sent["deletedFile"].as_bool()
+                ),
+                (Some(binary), Some(new_file), Some(deleted_file))
+            );
+        }
+    }
+
     fn review_turn(n: u32, state_end: crate::turn_review::Snap) -> crate::turn_review::TurnRecord {
         use crate::turn_review::{Snap, TurnRecord};
         TurnRecord {
@@ -2240,7 +2850,12 @@ mod tests {
             notes: vec!["changed on disk during this turn".into()],
         };
         assert_eq!(
-            v(serialize_review_for_js("r1", TabId(3), &overview)),
+            v(serialize_review_for_js(
+                "r1",
+                TabId(3),
+                &overview,
+                &crate::turn_review::ReviewDraft::default()
+            )),
             serde_json::json!({
                 "kind": "review", "requestId": "r1", "tab": 3, "scope": "turn", "current": 7,
                 "turns": [
@@ -2261,6 +2876,7 @@ mod tests {
                 "compared": true,
                 "pendingNoResult": 2,
                 "notes": ["changed on disk during this turn"],
+                "draft": {"comments": [], "reverts": [], "canUndo": false},
             })
         );
 
@@ -2312,7 +2928,7 @@ mod tests {
             v(serialize_review_diff_for_js("r2", TabId(3), &diff)),
             serde_json::json!({
                 "kind": "review_diff", "requestId": "r2", "tab": 3, "turn": 7, "path": "core/src/x.rs",
-                "added": 41, "removed": 6,
+                "added": 41, "removed": 6, "binary": false, "newFile": false, "deletedFile": false,
                 "hunks": [{"id": 0, "header": "@@ -830,6 +830,12 @@", "lines": [
                     {"kind": "context", "text": "keep", "oldNo": 830, "newNo": 830},
                     {"kind": "removed", "text": "old", "oldNo": 831, "newNo": null},

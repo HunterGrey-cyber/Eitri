@@ -493,8 +493,22 @@ struct AgentPanelState {
     /// Status-band hints not yet shown: the page was not ready (loading, or reloading) when they
     /// arrived. At most one per tab, the newest.
     review_hints: Vec<eitri_core::turn_review::ReviewHint>,
+    /// Whether a finished turn's hint reaches the status band (`review.hint`). Off until
+    /// `set_review` says otherwise: the review is still one key away.
+    review_hint: bool,
+    /// What `set_review` builds the turn review from: the state and home directories and the
+    /// canonical project root, read once when the state is made.
+    review_roots: ReviewRoots,
     /// shows and focuses the editor, then hands it these keys; `Err` says why it could not.
     editor_request_hook: Option<EditorRequestHook>,
+    /// How to ask the editor something and poll the answer: the embedded pane or the companion's
+    /// link. `None` until the window hands one over.
+    editor_rpc: Option<Rc<dyn eitri_core::editor_rpc::EditorRpc>>,
+    /// The review's reverts, undos, comments, sends and recoveries in flight; the tick drives it.
+    review_flow: eitri_core::turn_review::ReviewFlow,
+    /// What the window gives the flow's editor overlay: who owns the module in its nvim, and what to
+    /// do once a file opened there.
+    review_editor: crate::review_editor::ReviewEditor,
     /// An edit came back (or was discarded): the keys return to the chat, in INPUT.
     editor_done_hook: Option<Rc<dyn Fn()>>,
     /// Teardowns and connects of tabs that left while the window stays open, so the window-close
@@ -920,6 +934,14 @@ impl AgentPanelHandle {
         }
     }
 
+    /// `review.enabled` and `review.hint` as `init.lua` left them, applied once after it ran. Enabled
+    /// installs the turn review (the legacy backend has no turn boundaries to follow and says so);
+    /// disabled leaves none, and a request for one says why. The hint only decides whether a
+    /// finished turn writes to the status band.
+    pub(crate) fn set_review(&self, review: ReviewConfig) {
+        self.state.borrow_mut().apply_review(review);
+    }
+
     /// Where a restore's one-line result goes. `main.rs` installs this once.
     pub(crate) fn on_toast(&self, hook: impl Fn(&str) + 'static) {
         self.state.borrow_mut().toast_hook = Some(Rc::new(hook));
@@ -1068,6 +1090,36 @@ impl AgentPanelHandle {
         hook: impl Fn(&eitri_core::scratch::ScratchRequest) -> Result<(), String> + 'static,
     ) {
         self.state.borrow_mut().editor_request_hook = Some(Rc::new(hook));
+    }
+
+    /// The window's way to ask its editor something (the embedded pane, or the companion's link).
+    /// `main.rs` and the companion window install this once.
+    pub(crate) fn set_editor_rpc(&self, rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc>) {
+        self.state.borrow_mut().editor_rpc = Some(rpc);
+    }
+
+    /// Who owns the review module in this window's editor, asked before every review request: the
+    /// integrated window's own nvim, or the companion panel's channel. `None` from it: no editor.
+    pub(crate) fn set_review_owner(&self, owner: impl Fn() -> Option<eitri_core::review_editor::Owner> + 'static) {
+        self.state.borrow_mut().review_editor.set_owner(Rc::new(owner));
+    }
+
+    /// Called after the editor opened a file for the review: the window brings the editor to the
+    /// user (shows and focuses it, or raises the user's own window). `main.rs` and the companion
+    /// window install this once.
+    pub(crate) fn on_review_open(&self, hook: impl Fn() + 'static) {
+        self.state.borrow_mut().review_editor.set_opened(Rc::new(hook));
+    }
+
+    /// The editor went away, or its drafts were dropped: what the review overlay installed and
+    /// drew there is forgotten, and an open still waiting on it is told it will not be answered.
+    pub(crate) fn review_editor_lost(&self) {
+        let outs = self.state.borrow_mut().review_flow.editor_lost();
+        for out in outs {
+            if let eitri_core::turn_review::Out::Envelope(payload) = out {
+                self.dispatch(payload, "review");
+            }
+        }
     }
 
     /// Where the panel stands with the editor beside it (companion mode), kept so a document that
@@ -1584,6 +1636,58 @@ pub(crate) fn build_agent_panel(
     (webview.upcast(), handle)
 }
 
+/// The three values a turn review is built from.
+struct ReviewRoots {
+    state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    canonical_root: PathBuf,
+}
+
+/// `init.lua`'s two review keys, applied once after it ran.
+pub(crate) struct ReviewConfig {
+    pub(crate) enabled: bool,
+    pub(crate) hint: bool,
+}
+
+impl AgentPanelState {
+    /// The state half of [`AgentPanelHandle::set_review`], which needs no page.
+    fn apply_review(&mut self, review: ReviewConfig) {
+        self.review_hint = review.hint;
+        if review.enabled {
+            let roots = &self.review_roots;
+            let installed = eitri_core::turn_review::TurnReview::new(
+                roots.state_home.as_deref(),
+                roots.home.as_deref(),
+                &roots.canonical_root,
+            );
+            if let Err(why) = self.tabs.install_turn_review(installed) {
+                eprintln!("[agent_panel] {why}");
+            }
+        } else {
+            self.tabs.turn_review_off();
+            eprintln!("[review] turn review is off (init.lua's review.enabled = false)");
+        }
+    }
+}
+
+/// Holds this window's presence for every other window's reverts: its window file, and a file per
+/// running turn, kept by a thread of its own. It runs for every backend (the legacy one installs
+/// no review) and with the review switched off, because a window that reverts must be able to see
+/// this one either way. With no state directory nothing can be held, which is said once; every
+/// revert in this window is then refused as not holding the presence lock.
+fn hold_window_presence(
+    tabs: &mut eitri_core::tab_set::TabSet,
+    state_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    root: &Path,
+    pid: u32,
+) {
+    match eitri_core::turn_review::review_dir_for(state_home, home, root) {
+        Some(dir) => tabs.hold_presence(eitri_core::turn_review::PresenceHolder::start(dir, pid)),
+        None => eprintln!("[review] no state directory: this window holds no presence lock, so reverts are refused"),
+    }
+}
+
 /// The panel's state, the same with a page or without one (`build_agent_panel`'s `unavailable`):
 /// the tab set in the project's remembered mode, its prompt history and saved permission rules.
 fn panel_state(
@@ -1612,20 +1716,26 @@ fn panel_state(
     for note in notes {
         eprintln!("{note}");
     }
-    let mut tabs = eitri_core::tab_set::TabSet::new(backend_kind, mode);
-    tabs.set_rules(rules);
     // The key a session lease is taken under (`AgentConversation` canonicalizes its cwd the same
     // way). `main.rs` already canonicalized the root; this only makes the string explicit.
     let canonical_root = project_dir.canonicalize().unwrap_or_else(|_| project_dir.clone());
-    // Turn review follows every tab's turns from here on; the legacy backend has no turn
-    // boundaries to follow and says so.
-    if let Err(why) = tabs.install_turn_review(eitri_core::turn_review::TurnReview::new(
+    let mut tabs = eitri_core::tab_set::TabSet::new(backend_kind, mode);
+    tabs.set_rules(rules);
+    // Before anything review-related, and whatever the backend or `review.enabled` say: another
+    // window's revert has to see this window, and this window's running turns.
+    hold_window_presence(
+        &mut tabs,
         state_home.as_deref(),
         home.as_deref(),
         &canonical_root,
-    )) {
-        eprintln!("[agent_panel] {why}");
-    }
+        std::process::id(),
+    );
+    // Turn review is installed (or switched off) by `set_review`, once `init.lua` has run.
+    let review_roots = ReviewRoots {
+        state_home: state_home.clone(),
+        home: home.clone(),
+        canonical_root: canonical_root.clone(),
+    };
     let canonical_project_dir = canonical_root.to_string_lossy().into_owned();
     let tabs_dir = eitri_core::saved_tabs::state_dir(state_home.as_deref(), home.as_deref());
     let (restore_source, notes) = eitri_core::saved_tabs::startup(tabs_dir.as_deref(), &project_dir);
@@ -1662,7 +1772,12 @@ fn panel_state(
         pending_edits: Vec::new(),
         review_jobs: Vec::new(),
         review_hints: Vec::new(),
+        review_hint: false,
+        review_roots,
         editor_request_hook: None,
+        editor_rpc: None,
+        review_flow: eitri_core::turn_review::ReviewFlow::new(),
+        review_editor: crate::review_editor::ReviewEditor::default(),
         editor_done_hook: None,
         retiring: Retiring::default(),
         history_dir,
@@ -1832,6 +1947,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         let hints = {
             let mut state_ref = state.borrow_mut();
             let state_ref = &mut *state_ref;
+            let review_hints = hints_to_keep(state_ref.review_hint, review_hints);
             keep_newest_hint_per_tab(&mut state_ref.review_hints, review_hints);
             if state_ref.document_ready {
                 std::mem::take(&mut state_ref.review_hints)
@@ -1854,6 +1970,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         send_context_if_changed(&state, &webview);
         poll_scratch_edits(&state, &webview);
         poll_review_jobs(&state, &webview);
+        poll_review_flow(&state, &webview);
         send_tabs_if_changed(&state, &webview);
         remember_tabs(&state);
         send_hello_if_open_sessions_changed(&state, &webview);
@@ -1956,6 +2073,19 @@ fn finished_reviews(jobs: &mut Vec<PendingReview>) -> Vec<String> {
     payloads
 }
 
+/// The hints a finished turn may show: all of them with `review.hint` on, none otherwise, so a
+/// quiet window never queues or dispatches one.
+fn hints_to_keep(
+    hint_on: bool,
+    hints: Vec<eitri_core::turn_review::ReviewHint>,
+) -> Vec<eitri_core::turn_review::ReviewHint> {
+    if hint_on {
+        hints
+    } else {
+        Vec::new()
+    }
+}
+
 /// Adds `new` to the hints still waiting for the page, in order; a tab's older hint is dropped
 /// because the newer one (even `files: 0`, which clears) supersedes it.
 fn keep_newest_hint_per_tab(
@@ -1978,6 +2108,65 @@ fn poll_review_jobs(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
         finished_reviews(&mut state_ref.review_jobs)
     };
     dispatch_all(webview, payloads);
+}
+
+/// What the review flow owes the panel: an envelope goes out as it is, and a confirmed review that
+/// was sent is applied as any flush of a tab's queue is. Called with no borrow of the state held,
+/// because applying a flush takes it.
+fn dispatch_review_outs(
+    state: &Rc<RefCell<AgentPanelState>>,
+    webview: &WebView,
+    outs: Vec<eitri_core::turn_review::Out>,
+) {
+    use eitri_core::turn_review::Out;
+    for out in outs {
+        match out {
+            Out::Envelope(payload) => evaluate_js_dispatch(webview, &payload),
+            Out::Flushed(tab, flush) => apply_flush(state, webview, tab, flush),
+            Out::QueueChanged(tab) => send_queue(state, webview, tab),
+            Out::EditorOpened => {
+                let hook = state.borrow().review_editor.opened_hook();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+        }
+    }
+}
+
+/// One review message for the flow, with the window's editor handle if it has one.
+fn run_review_flow(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, message: InboundMessage) {
+    let outs = {
+        let mut state_ref = state.borrow_mut();
+        let state_ref = &mut *state_ref;
+        state_ref.review_editor.sync(&mut state_ref.review_flow);
+        state_ref.review_flow.handle(
+            message,
+            &mut state_ref.tabs,
+            state_ref.editor_rpc.as_deref(),
+            std::time::Instant::now(),
+        )
+    };
+    dispatch_review_outs(state, webview, outs);
+}
+
+/// The tick's half of the review flow: editor answers, workers that finished and tickets whose tab
+/// went away.
+fn poll_review_flow(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let outs = {
+        let mut state_ref = state.borrow_mut();
+        let state_ref = &mut *state_ref;
+        if state_ref.review_flow.is_idle() {
+            return;
+        }
+        state_ref.review_editor.sync(&mut state_ref.review_flow);
+        state_ref.review_flow.tick(
+            &mut state_ref.tabs,
+            state_ref.editor_rpc.as_deref(),
+            std::time::Instant::now(),
+        )
+    };
+    dispatch_review_outs(state, webview, outs);
 }
 
 /// C5's return half: every edit whose marker appeared goes back to the tab it came from (review
@@ -3398,6 +3587,13 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             };
             dispatch_all(webview, payloads);
             ok(webview);
+            // The interrupted reverts, offered once the page can show them (and again after a reload).
+            let owed = {
+                let mut state_ref = state.borrow_mut();
+                let state_ref = &mut *state_ref;
+                state_ref.review_flow.document_ready(&state_ref.tabs)
+            };
+            dispatch_review_outs(state, webview, owed);
             // `agent.restore = "auto"`: only once the page can take what it starts.
             restore_at_launch(state, webview);
         }
@@ -3908,12 +4104,20 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         // on a worker; the answer is an envelope carrying the request id, sent by the tick.
         InboundMessage::ReviewRequest { turn, scope, .. } => {
             let tab = tab_of(target);
-            let job = state.borrow().tabs.review_overview_job(tab, turn.into(), scope.into());
+            let (job, draft) = {
+                let state_ref = state.borrow();
+                // Memory only: the draft is cloned here, on the GTK thread, and moves to the worker.
+                (
+                    state_ref.tabs.review_overview_job(tab, turn.into(), scope.into()),
+                    state_ref.tabs.review_draft(tab).cloned(),
+                )
+            };
             let started = job.and_then(|job| {
+                let draft = draft?;
                 let id = request_id.clone();
                 start_review_job(state, &request_id, move || {
                     job.run()
-                        .map(|overview| eitri_core::agent_bridge::serialize_review_for_js(&id, tab, &overview))
+                        .map(|overview| eitri_core::agent_bridge::serialize_review_for_js(&id, tab, &overview, &draft))
                         .map_err(|why| why.to_string())
                 })
             });
@@ -3921,6 +4125,16 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 refuse(webview, &why);
             }
         }
+        // The panel's revert, undo, comment, send and recovery messages belong to the review flow,
+        // which checks, asks the editor and does the writing without ever waiting here. Its answers
+        // come back now or on a later tick.
+        InboundMessage::ReviewRevert { .. }
+        | InboundMessage::ReviewUndo { .. }
+        | InboundMessage::ReviewCommentAdd { .. }
+        | InboundMessage::ReviewCommentRemove { .. }
+        | InboundMessage::ReviewSend { .. }
+        | InboundMessage::ReviewRecover { .. }
+        | InboundMessage::OpenInEditor { .. } => run_review_flow(state, webview, message),
         InboundMessage::ReviewDiffRequest { turn, scope, path, .. } => {
             let tab = tab_of(target);
             let job = state.borrow().tabs.review_diff_job(tab, turn, scope.into(), &path);
@@ -3932,8 +4146,17 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                         .map_err(|why| why.to_string())
                 })
             });
-            if let Err(why) = started {
-                refuse(webview, &why);
+            match started {
+                Ok(()) => {
+                    // A file the editor draws moves to this turn with the panel.
+                    let mut state_ref = state.borrow_mut();
+                    let state_ref = &mut *state_ref;
+                    state_ref.review_editor.sync(&mut state_ref.review_flow);
+                    state_ref
+                        .review_flow
+                        .panel_shows(&state_ref.tabs, tab, turn, scope.into(), &path);
+                }
+                Err(why) => refuse(webview, &why),
             }
         }
         InboundMessage::ViewInEditor { title, text, .. } => {
@@ -4851,7 +5074,16 @@ mod tests {
             pending_edits: Vec::new(),
             review_jobs: Vec::new(),
             review_hints: Vec::new(),
+            review_hint: false,
+            review_roots: ReviewRoots {
+                state_home: None,
+                home: None,
+                canonical_root: PathBuf::new(),
+            },
             editor_request_hook: None,
+            editor_rpc: None,
+            review_flow: eitri_core::turn_review::ReviewFlow::new(),
+            review_editor: crate::review_editor::ReviewEditor::default(),
             editor_done_hook: None,
             retiring: Retiring::default(),
             history_dir: None,
@@ -4874,6 +5106,111 @@ mod tests {
             last_restore_offered: false,
             toast_hook: None,
         }))
+    }
+
+    /// `review.enabled` and `review.hint` reach the panel's state: enabled installs a review and the hint
+    /// follows its key; disabled leaves none and a request for one says why.
+    #[test]
+    fn the_review_keys_reach_the_panel_state() {
+        use eitri_core::turn_review::{Scope, TurnRef};
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled: true,
+            hint: false,
+        });
+        assert!(state.borrow().tabs.turn_review().is_some());
+        assert!(!state.borrow().review_hint);
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled: true,
+            hint: true,
+        });
+        assert!(state.borrow().review_hint);
+
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled: false,
+            hint: true,
+        });
+        let state = state.borrow();
+        assert!(state.tabs.turn_review().is_none());
+        let tab = state.tabs.active();
+        assert_eq!(
+            state
+                .tabs
+                .review_overview_job(tab, TurnRef::Latest, Scope::Turn)
+                .err()
+                .as_deref(),
+            Some(eitri_core::tab_set::TURN_REVIEW_OFF)
+        );
+    }
+
+    /// A scratch directory under the build's target directory, which is where tests of this crate
+    /// keep what they write.
+    fn scratch_under_target(label: &str) -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("review-flow-tests")
+            .join(format!(
+                "{label}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    /// What another window (a pid no real one here has) sees of the window that holds `dir`.
+    fn seen_from_another_window(dir: &Path) -> Option<eitri_core::turn_review::Busy> {
+        eitri_core::turn_review::busy_elsewhere(dir, 999_999).unwrap()
+    }
+
+    /// A window holds its presence from the moment its state is made, on every backend and with the
+    /// review off: the legacy backend installs no review at all, and `review.enabled = false`
+    /// installs none either, yet another window's revert must still see both.
+    #[test]
+    fn presence_is_held_from_window_start_on_every_backend() {
+        use eitri_core::turn_review::{review_dir_for, Busy, TurnReview};
+        let scratch = scratch_under_target("presence-every-backend");
+        let state_home = scratch.join("state");
+        let pid = std::process::id();
+        let wait_for_window = |dir: &Path| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while seen_from_another_window(dir) != Some(Busy::OtherWindow { pid }) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the window never showed in {dir:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+
+        let legacy_root = scratch.join("project");
+        let mut legacy = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
+        let refused = TurnReview::with_options(None, &legacy_root, Default::default());
+        assert!(
+            legacy.install_turn_review(refused).is_err(),
+            "the legacy backend installs no review"
+        );
+        hold_window_presence(&mut legacy, Some(state_home.as_os_str()), None, &legacy_root, pid);
+        assert!(legacy.presence_guard().is_some());
+        wait_for_window(&review_dir_for(Some(state_home.as_os_str()), None, &legacy_root).unwrap());
+
+        let off_root = scratch.join("off-project");
+        std::fs::create_dir_all(&off_root).unwrap();
+        let mut off = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        off.turn_review_off();
+        hold_window_presence(&mut off, Some(state_home.as_os_str()), None, &off_root, pid);
+        assert!(off.turn_review().is_none());
+        wait_for_window(&review_dir_for(Some(state_home.as_os_str()), None, &off_root).unwrap());
+
+        // With no state directory there is nothing to hold, and a revert is refused for it.
+        let mut nowhere = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        hold_window_presence(&mut nowhere, None, None, &legacy_root, pid);
+        assert!(nowhere.presence_guard().is_none());
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// v1-dist sub-plan 2026-09-28-v1-dist-ubuntu-userns: with no page (WebKit's sandbox cannot
@@ -5504,6 +5841,29 @@ mod tests {
         let link = eitri_core::agent_bridge::serialize_editor_link_for_js("none", "no editor attached");
         let some = window_payloads(history(), context(), Some(&link));
         assert_eq!(kinds(&some), vec!["history", "editor_context", "editor_link"]);
+    }
+
+    /// Without `review.hint` a finished turn's hint is dropped before it is queued, so nothing is
+    /// ever dispatched; with it, every hint passes.
+    #[test]
+    fn hints_are_dropped_unless_opted_in() {
+        use eitri_core::turn_review::ReviewHint;
+        let hints = || {
+            vec![
+                ReviewHint {
+                    tab: 1,
+                    turn: 1,
+                    files: 3,
+                },
+                ReviewHint {
+                    tab: 2,
+                    turn: 1,
+                    files: 0,
+                },
+            ]
+        };
+        assert!(hints_to_keep(false, hints()).is_empty());
+        assert_eq!(hints_to_keep(true, hints()), hints());
     }
 
     /// A hint that arrives while the page is not ready is kept for it, one per tab, the newest.

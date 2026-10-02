@@ -129,6 +129,38 @@ pub fn parse_user_settings(value: Option<&str>) -> Result<bool, String> {
     }
 }
 
+/// The `init.lua` key: `eitri.config.set("review.enabled", true | false)`.
+pub const REVIEW_ENABLED_KEY: &str = "review.enabled";
+
+/// The `init.lua` key: `eitri.config.set("review.hint", true | false)`.
+pub const REVIEW_HINT_KEY: &str = "review.hint";
+
+/// A true/false switch as `init.lua` left it: unset is `default`, else exactly `true` or `false`
+/// (the store holds text, so a Lua boolean arrives as one of those words). Anything else is an
+/// error naming the key.
+fn parse_switch(key: &str, value: Option<&str>, default: bool) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(format!(
+            "eitri.config.set(\"{key}\", {:?}): must be true or false",
+            value.unwrap_or_default()
+        )),
+    }
+}
+
+/// [`REVIEW_ENABLED_KEY`]: whether turn review runs at all. Unset means it does.
+pub fn parse_review_enabled(value: Option<&str>) -> Result<bool, String> {
+    parse_switch(REVIEW_ENABLED_KEY, value, true)
+}
+
+/// [`REVIEW_HINT_KEY`]: whether a finished turn that edited files puts a hint in the status band.
+/// Unset means it stays quiet; the review is still one key away.
+pub fn parse_review_hint(value: Option<&str>) -> Result<bool, String> {
+    parse_switch(REVIEW_HINT_KEY, value, false)
+}
+
 /// Whether this project has a remembered choice of mode that the configured default must not
 /// override: a readable file that says `auto` (the only thing [`save_mode`] writes, once Shift+Tab
 /// has left bypass). A file from before v1 that says bypass is not a choice anyone is still making,
@@ -357,6 +389,28 @@ mod tests {
             let err = parse_user_settings(Some(bad)).unwrap_err();
             assert!(
                 err.contains("agent.user_settings") && err.contains(&format!("{bad:?}")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_switches_parse_like_user_settings() {
+        assert_eq!(parse_review_enabled(None), Ok(true));
+        assert_eq!(parse_review_hint(None), Ok(false));
+        for (text, want) in [("true", true), ("false", false), (" false ", false)] {
+            assert_eq!(parse_review_enabled(Some(text)), Ok(want), "{text:?}");
+            assert_eq!(parse_review_hint(Some(text)), Ok(want), "{text:?}");
+        }
+        for bad in ["yes", "1", ""] {
+            let err = parse_review_enabled(Some(bad)).unwrap_err();
+            assert!(
+                err.contains("review.enabled") && err.contains(&format!("{bad:?}")),
+                "{err}"
+            );
+            let err = parse_review_hint(Some(bad)).unwrap_err();
+            assert!(
+                err.contains("review.hint") && err.contains(&format!("{bad:?}")),
                 "{err}"
             );
         }

@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewScope, TabId, TabsEnvelope } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope } from "./types";
 import type { KeymapHelp, PaneDirection } from "./keymap";
 
 export type OutboundMessage =
@@ -117,7 +117,26 @@ export type OutboundMessage =
   /** `Enter` on a file of the review overlay: that file's hunks, under the overlay's current scope. The
    *  reply is a `review_diff` envelope with the same `request_id`, or a `command_result` failure.
    *  `InboundMessage::ReviewDiffRequest`, `core/src/agent_bridge.rs`. */
-  | { type: "review_diff_request"; request_id: string; tab: TabId; turn: number; scope: ReviewScope; path: string };
+  | { type: "review_diff_request"; request_id: string; tab: TabId; turn: number; scope: ReviewScope; path: string }
+  /** `x` in the review overlay: revert one hunk of the turn shown (`target` names it by id and header, so a
+   *  hunk that moved is refused rather than guessed) or the whole file. Answered by a `command_result`.
+   *  `InboundMessage::ReviewRevert`, `core/src/agent_bridge.rs`. */
+  | { type: "review_revert"; request_id: string; tab: TabId; turn: number; scope: ReviewScope; path: string; target: "file" | { hunk: number; header: string } }
+  /** `u`: write back what the last revert made in this tab replaced. Answered by a `command_result`. */
+  | { type: "review_undo"; request_id: string; tab: TabId }
+  /** `i` then Enter: a comment on lines `from`-`to` of the file's new side. Answered by a `review_draft`. */
+  | { type: "review_comment_add"; request_id: string; tab: TabId; turn: number; scope: ReviewScope; path: string; from: number; to: number; text: string }
+  /** `x` on a comment. Answered by a `review_draft`. */
+  | { type: "review_comment_remove"; request_id: string; tab: TabId; id: number }
+  /** `s`: `confirm: null` asks for the preview (a `review_send_preview`); `y` on it sends the draft with the
+   *  preview's `digest`. A confirmed send is answered by a `command_result`. */
+  | { type: "review_send"; request_id: string; tab: TabId; confirm: string | null }
+  /** Enter on a recovery row: restore what an interrupted revert replaced, or forget it. Window-level: the
+   *  journal belongs to the project, so no tab. Answered by a `command_result`. */
+  | { type: "review_recover"; request_id: string; entry: string; answer: "restore" | "dismiss" }
+  /** `o` in the review overlay: open the file at the hunk's first line, drawing the turn's hunks in the editor
+   *  when the shell can. Answered by a `command_result`. */
+  | { type: "open_in_editor"; request_id: string; tab: TabId; turn: number; scope: ReviewScope; path: string; line?: number };
 
 /** The composer mirror's three states (spec §3.5). Distinct from `./keymap`'s `PanelMode`, which is
  *  this component's OWN mode ("hint" included, unreachable yet) -- this type is the wire value Rust
@@ -165,7 +184,8 @@ export function postToRust(message: OutboundMessage): void {
 type InboundHandler = (
   payload:
     | { kind: "hello" } & Hello
-    | { kind: "command_result"; requestId: string; ok: true }
+    /** `message` is the shell's own one-line word on what it did (`sent`, `queued: ...`), where it has one. */
+    | { kind: "command_result"; requestId: string; ok: true; message?: string }
     | { kind: "command_result"; requestId: string; ok: false; error: string }
     | {
         kind: "events";
@@ -299,7 +319,14 @@ type InboundHandler = (
     /** A finished turn changed `files` files: the band says so until the overlay is opened on that turn
      *  or a new turn starts. `files: 0` clears it. Names its tab and is kept for it even while another
      *  tab is on screen. */
-    | ({ kind: "review_hint" } & ReviewHintEnvelope),
+    | ({ kind: "review_hint" } & ReviewHintEnvelope)
+    /** The tab's draft, as the answer to a comment add/remove (`requestId` set) or pushed after a change the
+     *  panel did not ask for (`requestId: null`). Tab-scoped. */
+    | ({ kind: "review_draft" } & ReviewDraftEnvelope)
+    /** The reply to `review_send` with no confirmation. Tab-scoped. */
+    | ({ kind: "review_send_preview" } & ReviewSendPreviewEnvelope)
+    /** The interrupted reverts the journal holds. Window-level: the journal is the project's. */
+    | ({ kind: "review_recovery" } & ReviewRecoveryEnvelope),
 ) => void;
 
 /** The handler's own payload type, exported so callers (`tabs.ts`'s `acceptsEnvelope`, `App.tsx`)
@@ -372,7 +399,10 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "nav_key" ||
         obj.kind === "review" ||
         obj.kind === "review_diff" ||
-        obj.kind === "review_hint"
+        obj.kind === "review_hint" ||
+        obj.kind === "review_draft" ||
+        obj.kind === "review_send_preview" ||
+        obj.kind === "review_recovery"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);
         return;

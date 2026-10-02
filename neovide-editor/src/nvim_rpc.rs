@@ -181,6 +181,28 @@ impl Drop for WatchedCall {
     }
 }
 
+/// Runs `call` to completion with [`block_on`] on a thread of its own, then hands its output to
+/// `reply` on that same thread.
+///
+/// The future is owned by `block_on` alone and polled until it resolves, whoever still wants the
+/// answer: dropping an nvim-rs request before its response arrives ends the whole connection (the
+/// module doc), so a caller that stopped caring changes nothing here; `reply` simply delivers to
+/// nobody. A thread that cannot start returns the `Err` with `call` never polled -- and nvim-rs
+/// writes a request only when its future is first polled, so nothing was sent and no response can
+/// come back for it -- and `reply` dropped uncalled.
+pub(crate) fn spawn_answered<F>(name: &str, call: F, reply: crate::LuaReply) -> io::Result<()>
+where
+    F: Future<Output = Result<rmpv::Value, String>> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(format!("nvim-rpc {name}"))
+        .spawn(move || {
+            let result = block_on(call);
+            reply(result);
+        })
+        .map(drop)
+}
+
 /// Wakes the thread that is blocked in [`block_on`].
 struct Unpark(Thread);
 
@@ -218,6 +240,68 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn spawn_answered_delivers_the_value() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_answered(
+            "test",
+            async { Ok(rmpv::Value::from(3)) },
+            Box::new(move |result| {
+                let _ = tx.send(result);
+            }),
+        )
+        .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Ok(rmpv::Value::from(3))));
+    }
+
+    /// Nobody waits for the answer any more, and the call still runs to its end: the future is
+    /// never dropped half way.
+    #[test]
+    fn spawn_answered_runs_the_future_to_its_end_after_the_receiver_is_gone() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<rmpv::Value, String>>();
+        drop(rx);
+        let release = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let replied = Arc::new(AtomicBool::new(false));
+        let call = {
+            let (release, finished) = (release.clone(), finished.clone());
+            async move {
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                finished.store(true, Ordering::SeqCst);
+                Ok(rmpv::Value::Nil)
+            }
+        };
+        let reply = {
+            let replied = replied.clone();
+            Box::new(move |result| {
+                replied.store(true, Ordering::SeqCst);
+                let _ = tx.send(result);
+            })
+        };
+        spawn_answered("test", call, reply).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!finished.load(Ordering::SeqCst), "still waiting for its release");
+        release.store(true, Ordering::SeqCst);
+        wait_until("the future to finish", || finished.load(Ordering::SeqCst));
+        wait_until("the reply", || replied.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn spawn_answered_reports_an_error_as_err() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_answered(
+            "test",
+            async { Err("boom".to_owned()) },
+            Box::new(move |result| {
+                let _ = tx.send(result);
+            }),
+        )
+        .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Err("boom".to_owned())));
     }
 
     /// A future that is pending until another thread wakes it: `block_on` parks, and the wake

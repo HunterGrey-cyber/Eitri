@@ -2,12 +2,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { ReviewOverlay } from "./ReviewOverlay";
-import { applyReviewKey, failRequest, openReview, receiveDiff, receiveReview } from "../review";
+import { REVIEW_KEY_LINE, applyReviewKey, failRequest, openReview, receiveDiff, receivePreview, receiveRecovery, receiveReview, withStatus } from "../review";
 import type { ReviewAction, ReviewState } from "../review";
-import type { ReviewDiffEnvelope, ReviewEnvelope, ReviewFile, ReviewTurn } from "../types";
+import type { ReviewDiffEnvelope, ReviewDraft, ReviewEnvelope, ReviewFile, ReviewNotOnDisk, ReviewSendPreviewEnvelope, ReviewTurn } from "../types";
 /** What Rust really sends: `core/src/turn_review/lifecycle.rs` writes these envelopes from its own `plan`
  *  and serializer, and fails when this file is not what it would write. */
 import notesFixture from "../fixtures/review-notes.json";
+/** A send preview leaving out a revert of every kind, as `core/src/agent_bridge.rs` serializes it. */
+import previewFixture from "../fixtures/review-send-preview.json";
 
 afterEach(cleanup);
 
@@ -265,5 +267,225 @@ describe("ReviewOverlay over the envelopes Rust sends", () => {
       expect(text, name).not.toContain("no files changed on disk");
     }
     expect(shown("ok").text).toContain("no files changed on disk");
+  });
+});
+
+const COMMENT = { id: 1, turn: 7, path: "a.rs", from: 11, to: 11, anchor: ["new"], text: "why is this here?" };
+const REVERT = { id: 1, turn: 7, path: "a.rs", hunk: 1, header: "@@ -40,2 +41,2 @@", what: "hunk" as const, lines: [41, 41] as [number, number], source: "panel", undone: false };
+const draft = (over: Partial<ReviewDraft> = {}): ReviewDraft => ({ comments: [], reverts: [], canUndo: false, ...over });
+
+/** `a.rs` open, its patch arrived, and `d` as the draft the overview carried. */
+function withDraft(d: ReviewDraft): ReviewState {
+  let state = receiveReview(openReview(1, "req-1"), envelope({ draft: d }));
+  state = press(state, { kind: "toggle" });
+  const entry = state.diffs["a.rs"];
+  if (entry?.status !== "loading") throw new Error("no request");
+  return receiveDiff(state, { requestId: entry.requestId, tab: 1, turn: 7, path: "a.rs", added: 41, removed: 6, hunks: HUNKS });
+}
+
+describe("ReviewOverlay: the draft", () => {
+  it("draws a comment under the hunk that holds its line, as a stop of its own", () => {
+    const { container } = draw(withDraft(draft({ comments: [COMMENT] })));
+    const hunks = Array.from(container.querySelectorAll(".review-hunk"));
+    expect(hunks[0].querySelector('[data-nav-stop="comment"]')!.textContent).toContain("11");
+    expect(hunks[0].querySelector('[data-nav-stop="comment"]')!.textContent).toContain("why is this here?");
+    expect(hunks[1].querySelector('[data-nav-stop="comment"]')).toBeNull();
+    const names = new Set(Array.from(container.querySelectorAll("[data-nav-stop]")).map((e) => e.getAttribute("data-nav-stop")));
+    expect(names).toEqual(new Set(["file", "hunk", "comment", "group"]));
+    expect(container.querySelector('[data-nav-stop="row"]')).toBeNull();
+  });
+
+  it("puts the cursor on a comment when it is there", () => {
+    const state = { ...withDraft(draft({ comments: [COMMENT] })), cursor: "comment:a.rs:1" };
+    const current = draw(state).container.querySelector('[aria-current="true"]')!;
+    expect(current.getAttribute("data-nav-stop")).toBe("comment");
+  });
+
+  it("marks a reverted hunk, and says when the revert was undone", () => {
+    const marks = (d: ReviewDraft) => {
+      const rows = Array.from(draw(withDraft(d)).container.querySelectorAll('[data-nav-stop="hunk"]'));
+      cleanup();
+      return rows.map((r) => r.querySelector(".review-file-flag")?.textContent ?? null);
+    };
+    expect(marks(draft())).toEqual([null, null]);
+    expect(marks(draft({ reverts: [REVERT] }))).toEqual([null, "reverted"]);
+    expect(marks(draft({ reverts: [{ ...REVERT, undone: true }] }))).toEqual([null, "reverted, undone"]);
+  });
+
+  it("marks a file whose whole revert is recorded", () => {
+    const state = receiveReview(openReview(1, "req-1"), envelope({ draft: draft({ reverts: [{ ...REVERT, hunk: null, header: null, what: "file", lines: null }] }) }));
+    const rows = Array.from(draw(state).container.querySelectorAll('[data-nav-stop="file"]'));
+    expect(rows[0].textContent).toContain("reverted");
+    expect(rows[1].textContent).not.toContain("reverted");
+  });
+
+  it("says what the draft holds on a line of its own, only when it holds something", () => {
+    expect(draw(withDraft(draft())).container.querySelector(".review-draft")).toBeNull();
+    cleanup();
+    const line = draw(withDraft(draft({ comments: [COMMENT], reverts: [REVERT] }))).container.querySelector(".review-draft")!;
+    expect(line.textContent).toBe("draft: 1 comment, 1 revert · s sends them to the agent");
+  });
+
+  it("is drawn again from the review envelope after a reload, with nothing carried by the page", () => {
+    const d = draft({ comments: [COMMENT], reverts: [REVERT], canUndo: true });
+    const first = draw(receiveReview(openReview(1, "req-1"), envelope({ draft: d }))).container.querySelector(".review-draft")!.textContent;
+    cleanup();
+    // A reload starts the overlay over from `openReview`; nothing but the envelope Rust sends again fills it.
+    const fresh = openReview(1, "req-9");
+    expect(draw(fresh).container.querySelector(".review-draft")).toBeNull();
+    cleanup();
+    const again = draw(receiveReview(fresh, envelope({ requestId: "req-9", draft: d }))).container.querySelector(".review-draft")!.textContent;
+    expect(again).toBe(first);
+  });
+
+  it("draws an overview recorded before the draft existed, as an empty one", () => {
+    const old = notesFixture.envelopes.ok as unknown as ReviewEnvelope;
+    expect(draw(receiveReview(openReview(3, old.requestId), old)).container.querySelector(".review-draft")).toBeNull();
+  });
+});
+
+describe("ReviewOverlay: the line under the box", () => {
+  it("shows the key line the design gives, and the one-line status above it", () => {
+    const { container } = draw(withStatus(loaded(), "nothing to undo"));
+    expect(container.querySelector(".review-keys")!.textContent).toBe(REVIEW_KEY_LINE);
+    expect(REVIEW_KEY_LINE).toBe("j/k move · Enter open · x revert · u undo · i comment · s send · [ ] turn · o editor · q close");
+    expect(container.querySelector(".review-status")!.textContent).toBe("nothing to undo");
+    cleanup();
+    expect(draw(loaded()).container.querySelector(".review-status")).toBeNull();
+  });
+
+  it("asks the whole-file question on its own line", () => {
+    const state = press(loaded(), { kind: "revert" });
+    expect(draw(state).container.querySelector(".review-question")!.textContent).toBe("revert the whole file a.rs to before turn 7? y/n");
+  });
+});
+
+describe("ReviewOverlay: the send preview", () => {
+  const preview = (over: { queued?: boolean; notOnDisk?: ReviewNotOnDisk[] } = {}) => {
+    const asked = applyReviewKey(withDraft(draft({ comments: [COMMENT], reverts: [REVERT] })), { kind: "send" }, () => "send-1");
+    return receivePreview(asked.state, {
+      requestId: "send-1",
+      tab: 1,
+      digest: "9f2c4e1a0b7d3c55",
+      text: "Review of your last turn: 1 comment, 1 revert.\n\nComments:\n1. a.rs:11",
+      notOnDisk: over.notOnDisk ?? [],
+      queued: over.queued ?? false,
+    });
+  };
+
+  it("shows the message, a line per revert that is not on disk, and the question", () => {
+    const { container } = draw(
+      preview({
+        notOnDisk: [
+          { id: 2, path: "core/src/y.rs", what: "hunk", lines: [10, 14], why: "only in the editor, not saved" },
+          { id: 3, path: "core/src/z.rs", what: "hunk", lines: [7, 7], why: "undone" },
+        ],
+      }),
+    );
+    const box = container.querySelector(".review-preview")!;
+    expect(box.querySelector(".review-preview-text")!.textContent).toContain("Review of your last turn: 1 comment, 1 revert.");
+    expect(Array.from(box.querySelectorAll(".review-note")).map((n) => n.textContent)).toEqual([
+      "core/src/y.rs lines 10-14: only in the editor, not saved",
+      "core/src/z.rs line 7: undone",
+    ]);
+    expect(container.querySelector(".review-question")!.textContent).toBe("y sends · n cancels");
+  });
+
+  it("words a whole-file revert by what it did, with no line range, as Rust sends it", () => {
+    const sent = previewFixture.envelope as unknown as ReviewSendPreviewEnvelope & { kind: string };
+    const asked = applyReviewKey(withDraft(draft({ comments: [COMMENT], reverts: [REVERT] })), { kind: "send" }, () => sent.requestId);
+    const { container } = draw(receivePreview(asked.state, sent));
+    const box = container.querySelector(".review-preview")!;
+    expect(box.querySelector(".review-preview-text")!.textContent).toBe(sent.text);
+    expect(Array.from(box.querySelectorAll(".review-note")).map((n) => n.textContent)).toEqual([
+      "core/src/foo.rs lines 120-127: changed since",
+      "new.rs (deleted): changed since",
+      "old.rs (restored): only in the editor, not saved",
+      "all.rs (whole file): undone",
+    ]);
+  });
+
+  it("says it queues behind a running turn when it will", () => {
+    expect(draw(preview({ queued: true })).container.querySelector(".review-question")!.textContent).toBe("y queues it behind the running turn · n cancels");
+  });
+
+  it("says it is preparing while the preview has not arrived, and shows no box", () => {
+    const asked = applyReviewKey(withDraft(draft({ comments: [COMMENT] })), { kind: "send" }, () => "send-1").state;
+    const { container } = draw(asked);
+    expect(container.querySelector(".review-preview")).toBeNull();
+    expect(container.querySelector(".review-question")!.textContent).toBe("preparing what would be sent…");
+  });
+});
+
+describe("ReviewOverlay: the comment input", () => {
+  const typing = () => {
+    let state = withDraft(draft());
+    state = { ...state, cursor: "hunk:a.rs:0" };
+    return press(state, { kind: "comment" });
+  };
+
+  it("is a real text box in the overlay, naming the lines it comments on", () => {
+    const { container } = draw(typing());
+    const input = container.querySelector<HTMLInputElement>(".review-prompt input")!;
+    expect(input.getAttribute("aria-label")).toBe("Comment");
+    expect(container.querySelector(".review-question")!.textContent).toBe("comment on a.rs:11");
+  });
+
+  it("hands its text, its Enter and its Escape to the caller, and no other key", () => {
+    const onChange = vi.fn();
+    const onAccept = vi.fn();
+    const onCancel = vi.fn();
+    const { container } = render(<ReviewOverlay state={typing()} onClose={() => {}} onCommentChange={onChange} onCommentAccept={onAccept} onCommentCancel={onCancel} />);
+    const input = container.querySelector<HTMLInputElement>(".review-prompt input")!;
+    fireEvent.change(input, { target: { value: "ad" } });
+    expect(onChange).toHaveBeenCalledWith("ad");
+    fireEvent.keyDown(input, { key: "a" });
+    fireEvent.keyDown(input, { key: "d" });
+    expect(onAccept).not.toHaveBeenCalled();
+    expect(onCancel).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onAccept).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("has no input when no comment is being written", () => {
+    expect(draw(withDraft(draft())).container.querySelector(".review-prompt")).toBeNull();
+  });
+});
+
+describe("ReviewOverlay: the recovery rows", () => {
+  const entries = [{ id: "e-1", path: "core/src/x.rs", at: Date.UTC(2026, 0, 1, 11, 0, 0) }];
+
+  it("are stops of kind recovery at the top, above the files", () => {
+    const state = receiveReview(openReview(1, "req-1", entries), envelope());
+    const { container } = draw(state);
+    const stops = Array.from(container.querySelectorAll("[data-nav-stop]")).map((e) => e.getAttribute("data-nav-stop"));
+    expect(stops.slice(0, 2)).toEqual(["recovery", "file"]);
+    const row = container.querySelector('[data-nav-stop="recovery"]')!;
+    expect(row.textContent).toContain("an interrupted revert left core/src/x.rs");
+    expect(row.classList.contains("row-current")).toBe(true);
+  });
+
+  it("are drawn before an overview has arrived, and when the review compared nothing", () => {
+    expect(draw(openReview(1, "req-1", entries)).container.querySelector('[data-nav-stop="recovery"]')).not.toBeNull();
+    cleanup();
+    const nothing = receiveReview(openReview(1, "req-1", entries), envelope({ files: [], compared: false }));
+    expect(draw(nothing).container.querySelector('[data-nav-stop="recovery"]')).not.toBeNull();
+  });
+
+  it("go when the shell says they are resolved, and the question about one with them", () => {
+    let state = receiveReview(openReview(1, "req-1", entries), envelope());
+    state = press(state, { kind: "toggle" });
+    expect(draw(state).container.querySelector(".review-question")!.textContent).toContain("restore core/src/x.rs to its bytes from before the interrupted revert?");
+    cleanup();
+    const { container } = draw(receiveRecovery(state, []));
+    expect(container.querySelector('[data-nav-stop="recovery"]')).toBeNull();
+    expect(container.querySelector(".review-question")).toBeNull();
+  });
+
+  it("add no inline style: no colour of their own", () => {
+    const { container } = draw(receiveReview(openReview(1, "req-1", entries), envelope()));
+    expect(container.querySelectorAll("[style]")).toHaveLength(0);
   });
 });

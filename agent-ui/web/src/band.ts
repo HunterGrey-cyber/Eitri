@@ -4,7 +4,7 @@ import { turnEndingBandText } from "./turnEnding";
 
 /** One segment's identity, in the priority order spec §5.2 lists (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage" | "review" | "ending";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage" | "review" | "recovery" | "ending";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (spec §5.2:
  *  left of the gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
@@ -59,6 +59,11 @@ export type BandFacts = {
    *  or absent, says nothing. Never drawn over a prompt. A narrow band drops it right after the usage
    *  figure and the context's shortening, ahead of the model: it is a pointer, not a state. */
   review?: { files: number } | null;
+  /** A revert was interrupted and its journal entry is still there: the first one's `path`, and how many
+   *  more there are. A half-written file is not a diff notice, so this is drawn whatever `review` says (the
+   *  `review.hint` setting turns only the pointer off), and it outlasts every figure and pointer when the
+   *  band narrows. `null`, or absent, says nothing. */
+  recovery?: { path: string; more: number } | null;
   /** How this tab's latest turn ended when it did not complete (`latestTurnEnding`), until
    *  the next turn starts. `null`, or absent, says nothing: a completed turn, no turn yet, and the
    *  empty tab, which has no turns. On the left beside the state it describes, in the band's own colour like
@@ -70,6 +75,11 @@ export type BandFacts = {
  *  shows them. Says "changed", not who changed them -- the overlay carries the attribution. */
 export function reviewSegment(files: number): string {
   return `${files} ${files === 1 ? "file" : "files"} changed · c to review`;
+}
+
+/** The band's notice for an interrupted revert: which file, and that `c` opens the overlay that restores it. */
+export function recoverySegment(path: string, more: number): string {
+  return `an interrupted revert left ${path}${more > 0 ? ` and ${more} more` : ""} · c to review`;
 }
 
 /** #39's segment: the card's tool name and a one-line summary of its input (`cardSummary`). */
@@ -165,6 +175,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.approve ? [{ id: "approve", text: `Ctrl+y approves ${f.approve.tool}: ${f.approve.summary}`, side: "left" } as Seg] : []),
     ...(f.queued > 0 ? [{ id: "queue", text: `⧗${f.queued}`, side: "left" } as Seg] : []),
     ...(f.ending ? [{ id: "ending", text: turnEndingBandText(f.ending), side: "left" } as Seg] : []),
+    ...(f.recovery ? [{ id: "recovery", text: recoverySegment(f.recovery.path, f.recovery.more), side: "left" } as Seg] : []),
     ...(f.message ? [{ id: "message", text: f.message, side: "left" } as Seg] : []),
     ...(f.showcmd ? [{ id: "showcmd", text: f.showcmd, side: "right" } as Seg] : []),
     ...(f.warn ? [{ id: "warn", text: "⚠", side: "right" } as Seg] : []),
@@ -196,6 +207,10 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     // figure and pointer above and the card count too, and goes only just before the mode shrinks to
     // its letter: the row in the conversation says the same thing in full.
     (s) => s.filter((x) => x.id !== "ending"),
+    // Not a figure or a pointer but a file left half-written: it is shortened to the file's name before it
+    // goes, and goes last, with only the mode left.
+    (s) => s.map((x) => (x.id === "recovery" && f.recovery ? { ...x, text: recoverySegment(f.recovery.path.split("/").pop() ?? f.recovery.path, f.recovery.more) } : x)),
+    (s) => s.filter((x) => x.id !== "recovery"),
     (s) => s.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x)),
   ];
   for (const apply of steps) {

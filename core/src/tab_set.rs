@@ -10,7 +10,8 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Weak};
 
 use agent::{AgentDomainEvent, RevisedDelivery};
 
@@ -111,6 +112,34 @@ pub enum TabBackend {
     },
 }
 
+/// A revert's or an undo's claim on its tab: the write it waits for is wanted only while the tab
+/// exists with the same session and nobody cancelled it. Closing the tab cancels it at once
+/// ([`TabSet::remove`], [`TabSet::take_all`]), so a worker that has not reached its last check sees
+/// the flag without waiting for a tick.
+#[derive(Debug, Clone)]
+pub struct ReviewTicket {
+    pub tab: TabId,
+    pub session: String,
+    /// Shared with the job that does the write, which reads it right before it writes.
+    pub wanted: Arc<AtomicBool>,
+}
+
+impl ReviewTicket {
+    /// The tab exists, still holds the session the ticket was made under, and the ticket was not
+    /// cancelled.
+    pub fn is_current(&self, tabs: &TabSet) -> bool {
+        self.wanted.load(Ordering::SeqCst)
+            && tabs
+                .get(self.tab)
+                .and_then(Tab::provider_session_id)
+                .is_some_and(|session| session == self.session)
+    }
+
+    pub fn cancel(&self) {
+        self.wanted.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct Tab {
     pub id: TabId,
     pub number: u16,
@@ -146,6 +175,9 @@ pub struct Tab {
     pub rule_offers: std::collections::BTreeMap<String, agent::PrefixRule>,
     /// The scratch edit of the draft in nvim, when one is open (set by the shell's round trip).
     pub editing_draft: Option<u64>,
+    /// The comments and reverts collected in this tab's turn review. Held here, not in the WebView,
+    /// so a panel reload keeps it; it goes with the tab and is not saved.
+    pub review_draft: crate::turn_review::ReviewDraft,
     /// Whether a turn is running in what the pump has DELIVERED (a `TurnStarted` without its
     /// `TurnCompleted`), so it reports a turn's end exactly once (ruling 3a). Read off the event
     /// stream rather than re-read from `projection()` after the delivery: on the sidecar path the
@@ -231,6 +263,10 @@ pub struct Tab {
     /// pump that saw another id arrive. Pruned with `host_answered` once the id leaves the
     /// projection. Private for the reason `host_answered` is.
     user_answered: BTreeSet<String>,
+    /// The flags of the writes (a revert, an undo) waiting on this tab ([`TabSet::review_ticket`]).
+    /// Weak, so a finished write's flag goes with it; closing the tab clears every one that is
+    /// still alive. Private: only the ticket route registers or clears them.
+    review_watchers: Vec<Weak<AtomicBool>>,
 }
 
 impl Tab {
@@ -253,6 +289,7 @@ impl Tab {
             draft: String::new(),
             rule_offers: std::collections::BTreeMap::new(),
             editing_draft: None,
+            review_draft: crate::turn_review::ReviewDraft::default(),
             was_running: false,
             rule_offers_seen: Vec::new(),
             notes: CallNotes::default(),
@@ -264,6 +301,16 @@ impl Tab {
             human_allowed: crate::agent_backend::HumanApprovals::default(),
             prompt_note_candidates: std::collections::BTreeMap::new(),
             user_answered: BTreeSet::new(),
+            review_watchers: Vec::new(),
+        }
+    }
+
+    /// Tells every write waiting on this tab that it is no longer wanted.
+    fn cancel_review_watchers(&mut self) {
+        for watcher in self.review_watchers.drain(..) {
+            if let Some(flag) = watcher.upgrade() {
+                flag.store(false, Ordering::SeqCst);
+            }
         }
     }
 
@@ -582,6 +629,13 @@ pub struct TabSet {
     /// and never on the legacy backend, whose turn starts never pass through the pump. Only the
     /// pump and the tab bookkeeping feed it: no answer or send path reads it.
     turn_review: Option<crate::turn_review::TurnReview>,
+    /// The user switched turn review off (`review.enabled = false`): no review is installed and a
+    /// request for one says why, instead of the misleading "needs the sidecar".
+    turn_review_off: bool,
+    /// This window's presence for other windows' reverts: held for every backend and with review
+    /// on or off, since a window that merely has the project open, or runs a turn, blocks another
+    /// window's revert. `None` until [`TabSet::hold_presence`].
+    presence: Option<crate::turn_review::PresenceHolder>,
     /// Test seam (P1-A2 round 2): run once, right after `pump`'s next drain of a live tab's queue,
     /// so a test folds an event exactly where the race is -- after a drain and before the next
     /// snapshot read, `active_state_payloads`' or the `Resync` arm's own a few lock cycles later --
@@ -638,6 +692,8 @@ impl TabSet {
             pending_restore: None,
             closing: false,
             turn_review: None,
+            turn_review_off: false,
+            presence: None,
             #[cfg(test)]
             after_drain: None,
             #[cfg(test)]
@@ -664,6 +720,40 @@ impl TabSet {
         Ok(())
     }
 
+    /// Turns review off for good: nothing is installed, and a request for one answers
+    /// [`TURN_REVIEW_OFF`].
+    pub fn turn_review_off(&mut self) {
+        self.turn_review = None;
+        self.turn_review_off = true;
+    }
+
+    /// Holds this window's presence from now on: the tabs' running turns are handed to it by every
+    /// pump. Any backend, and independent of [`TabSet::install_turn_review`].
+    pub fn hold_presence(&mut self, holder: crate::turn_review::PresenceHolder) {
+        self.presence = Some(holder);
+        self.sync_presence();
+    }
+
+    /// What a revert's worker asks before it writes; `None` when no presence was ever held, so
+    /// that every write is refused.
+    pub fn presence_guard(&self) -> Option<crate::turn_review::PresenceGuard> {
+        self.presence.as_ref().map(crate::turn_review::PresenceHolder::guard)
+    }
+
+    /// Hands the presence the ids of the tabs whose turns run. Reads only the tabs and touches no
+    /// disk: the presence thread does that.
+    fn sync_presence(&self) {
+        if let Some(holder) = &self.presence {
+            let running = self
+                .tabs
+                .iter()
+                .filter(|tab| tab.turn_running())
+                .map(|tab| tab.id.0)
+                .collect();
+            holder.sync(&running);
+        }
+    }
+
     /// The installed turn review, for building review jobs.
     pub fn turn_review(&self) -> Option<&crate::turn_review::TurnReview> {
         self.turn_review.as_ref()
@@ -671,12 +761,46 @@ impl TabSet {
 
     /// The session `tab` reviews under and the review itself, or why there is neither.
     fn review_target(&self, tab: TabId) -> Result<(&crate::turn_review::TurnReview, String), String> {
+        if self.turn_review_off {
+            return Err(TURN_REVIEW_OFF.to_string());
+        }
         let review = self.turn_review.as_ref().ok_or(TURN_REVIEW_NEEDS_SIDECAR)?;
         let tab = self.get(tab).ok_or_else(|| format!("protocol: no tab {}", tab.0))?;
         let session = tab
             .provider_session_id()
             .ok_or_else(|| "this tab has no session yet, so there is no turn to review".to_string())?;
         Ok((review, session))
+    }
+
+    /// The review and the session `tab` reviews under, or why there is neither: what the review
+    /// flow asks before anything else, so a window with the review off or on the legacy backend
+    /// answers with the reason whatever the request was.
+    pub fn review_session(&self, tab: TabId) -> Result<(&crate::turn_review::TurnReview, String), String> {
+        self.review_target(tab)
+    }
+
+    /// Why this window has no turn review, if it has none; a question about no tab in particular.
+    pub fn review_unavailable(&self) -> Option<&'static str> {
+        if self.turn_review_off {
+            Some(TURN_REVIEW_OFF)
+        } else if self.turn_review.is_none() {
+            Some(TURN_REVIEW_NEEDS_SIDECAR)
+        } else {
+            None
+        }
+    }
+
+    /// A claim for a write on `tab`'s session. The tab must exist and hold a session. It is
+    /// registered with the tab, which cancels it when it closes.
+    pub fn review_ticket(&mut self, tab: TabId) -> Result<ReviewTicket, String> {
+        let found = self.get_mut(tab).ok_or_else(|| format!("protocol: no tab {}", tab.0))?;
+        let session = found
+            .provider_session_id()
+            .ok_or_else(|| "this tab has no session yet, so there is no turn to review".to_string())?;
+        found.review_watchers.retain(|watcher| watcher.strong_count() > 0);
+        let wanted = Arc::new(AtomicBool::new(true));
+        found.review_watchers.push(Arc::downgrade(&wanted));
+        Ok(ReviewTicket { tab, session, wanted })
     }
 
     /// A review of `tab`'s session at `turn` in `scope`, ready to run on a worker. It attributes
@@ -815,10 +939,14 @@ impl TabSet {
     pub fn remove(&mut self, id: TabId) -> Option<Tab> {
         let at = self.tabs.iter().position(|t| t.id == id)?;
         let before = self.active;
-        let tab = self.tabs.remove(at);
+        let mut tab = self.tabs.remove(at);
+        // First, before anything that can take time: a write that has not reached its last check
+        // must see that its tab is gone.
+        tab.cancel_review_watchers();
         if let Some(review) = self.turn_review.as_mut() {
             review.close_tab(id.0, wall_clock_ms());
         }
+        self.sync_presence();
         self.removed_arrived += tab.attention.attention().arrived;
         self.recency.retain(|t| *t != id);
         if self.last_active == Some(id) {
@@ -1189,6 +1317,8 @@ impl TabSet {
             tripped: Vec::new(),
             review_hints: Vec::new(),
         };
+        // A turn a send started since the last pump (a legacy turn begins this way) is seen here.
+        self.sync_presence();
         // Before this tick's events: a base that landed by now is not pending for them.
         if let Some(review) = self.turn_review.as_mut() {
             out.review_hints = review.poll();
@@ -1670,6 +1800,8 @@ impl TabSet {
                 out.turn_ended.push(tab.id);
             }
         }
+        // A `TurnStarted` folded in this pump.
+        self.sync_presence();
         out
     }
 
@@ -1941,6 +2073,30 @@ impl TabSet {
         Some(Flush { typed, outcome })
     }
 
+    /// The tab's review draft (memory only).
+    pub fn review_draft(&self, id: TabId) -> Result<&crate::turn_review::ReviewDraft, String> {
+        self.get(id)
+            .map(|t| &t.review_draft)
+            .ok_or_else(|| format!("no tab {}", id.0))
+    }
+
+    pub fn review_draft_mut(&mut self, id: TabId) -> Result<&mut crate::turn_review::ReviewDraft, String> {
+        self.get_mut(id)
+            .map(|t| &mut t.review_draft)
+            .ok_or_else(|| format!("no tab {}", id.0))
+    }
+
+    /// The user's confirmed review, sent as the user's own message: queued like a typed prompt and
+    /// flushed at once, with `text` as both what is sent and what the transcript shows. `Some` means
+    /// it went out now (whatever the backend answered, see `Flush::outcome`; a refused send stays
+    /// queued); `None` means it waits behind a running turn or a pending card.
+    ///
+    /// Only the review flow's confirmed send calls this. It adds nothing to the prompt history.
+    pub fn send_review(&mut self, id: TabId, text: &str, now_ms: u64) -> Result<Option<Flush>, String> {
+        self.queue_message(id, text, text.to_owned(), now_ms)?;
+        Ok(self.flush_queue(id))
+    }
+
     /// Ruling 8.
     pub fn send_now(&mut self, id: TabId, text: &str, wire: String, now_ms: u64) -> Result<SendNow, String> {
         if !text.trim().is_empty() {
@@ -2075,6 +2231,9 @@ impl TabSet {
     /// (`shell::agent_panel` checks `shutting_down` first on every path that reaches the set).
     pub fn take_all(&mut self) -> Vec<Tab> {
         self.closing = true;
+        for tab in &mut self.tabs {
+            tab.cancel_review_watchers();
+        }
         if let Some(review) = self.turn_review.as_mut() {
             let now = wall_clock_ms();
             for tab in &self.tabs {
@@ -2625,6 +2784,9 @@ fn observe_turn_clock(clock: &mut Option<(String, u64)>, active_turn_id: Option<
 
 /// Why [`TabSet::install_turn_review`] refused, as the panel says it.
 pub const TURN_REVIEW_NEEDS_SIDECAR: &str = "turn review needs the sidecar backend";
+
+/// What a request for a review says when `init.lua` switched turn review off.
+pub const TURN_REVIEW_OFF: &str = "turn review is off (init.lua: review.enabled = false)";
 
 /// Milliseconds since the Unix epoch: the same clock the panel's `Date.now()` reads.
 fn wall_clock_ms() -> u64 {
@@ -8217,6 +8379,25 @@ mod tests {
     }
 
     #[test]
+    fn a_review_with_review_off_says_so() {
+        use crate::turn_review::{Scope, TurnRef};
+        let mut set = set();
+        let tab = set.active();
+        set.turn_review_off();
+        assert_eq!(
+            set.review_overview_job(tab, TurnRef::Latest, Scope::Turn)
+                .err()
+                .as_deref(),
+            Some(TURN_REVIEW_OFF)
+        );
+        assert_eq!(
+            set.review_diff_job(tab, 1, Scope::Turn, "main.rs").err().as_deref(),
+            Some(TURN_REVIEW_OFF)
+        );
+        assert!(set.turn_review().is_none());
+    }
+
+    #[test]
     fn review_jobs_are_refused_without_a_review_a_tab_or_a_session() {
         use crate::turn_review::{Scope, TurnRef};
         let scratch = target_scratch("review-refused");
@@ -8333,6 +8514,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// A review directory for a presence test, in its own scratch directory.
+    fn presence_dir(label: &str) -> (PathBuf, PathBuf) {
+        let scratch = target_scratch(label);
+        let review = scratch.join("state/eitri/review/0123456789abcdef");
+        (scratch, review)
+    }
+
+    /// What another window (pid 100) finds when it looks at the directory.
+    fn seen_from_elsewhere(review: &Path) -> Option<crate::turn_review::Busy> {
+        crate::turn_review::busy_elsewhere(review, 100).unwrap()
+    }
+
+    #[test]
+    fn pump_feeds_presence_off_the_gtk_thread() {
+        use crate::turn_review::{Blocked, Busy, PresenceHolder};
+        let (scratch, review) = presence_dir("presence-pump");
+        let dir = scratch.join("project");
+        let mut set = set();
+        let (holder, release) = PresenceHolder::start_parked(review.clone(), 4242);
+        set.hold_presence(holder);
+        let guard = set.presence_guard().expect("held");
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        // The presence thread has not opened anything, and the pump that folds the turn start
+        // neither waits for it nor reads the disk.
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        assert!(!review.join("windows").exists(), "nothing was opened yet");
+        assert!(
+            matches!(guard.check(), Err(Blocked::NotHeld(_))),
+            "a window that holds nothing refuses"
+        );
+
+        release.send(()).unwrap();
+        until("the turn is seen elsewhere", || {
+            seen_from_elsewhere(&review) == Some(Busy::TurnRunning { pid: 4242 })
+        });
+        assert_eq!(guard.check(), Err(Blocked::TurnRunningHere));
+
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        pump_until_running(&mut set, &dir, tab, false);
+        until("the turn is over", || {
+            seen_from_elsewhere(&review) == Some(Busy::OtherWindow { pid: 4242 })
+        });
+        assert_eq!(guard.check(), Ok(()), "the count went back to nothing");
+        shut_down_all(&mut set);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_legacy_window_holds_presence_and_its_running_turn() {
+        use crate::turn_review::{Busy, PresenceHolder};
+        let (scratch, review) = presence_dir("presence-legacy");
+        let dir = scratch.join("project");
+        let mut set = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
+        let off = crate::turn_review::TurnReview::with_options(
+            None,
+            Path::new("/nonexistent"),
+            crate::turn_review::ReviewOptions::default(),
+        );
+        assert_eq!(set.install_turn_review(off), Err(TURN_REVIEW_NEEDS_SIDECAR));
+        set.hold_presence(PresenceHolder::start(review.clone(), 4242));
+        until("the window is seen elsewhere", || {
+            seen_from_elsewhere(&review) == Some(Busy::OtherWindow { pid: 4242 })
+        });
+
+        // A legacy turn begins in a send, with no event for the pump to fold: the projection just
+        // has an active turn by the next pump.
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        until("the projection has the turn", || set.get(tab).unwrap().turn_running());
+        set.pump(&dir, true);
+        until("the turn is seen elsewhere", || {
+            seen_from_elsewhere(&review) == Some(Busy::TurnRunning { pid: 4242 })
+        });
+        shut_down_all(&mut set);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn presence_needs_no_turn_review() {
+        use crate::turn_review::{Busy, PresenceHolder};
+        let (scratch, review) = presence_dir("presence-review-off");
+        let dir = scratch.join("project");
+        let mut set = set();
+        set.turn_review_off();
+        set.hold_presence(PresenceHolder::start(review.clone(), 4242));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        until("the turn is seen elsewhere", || {
+            seen_from_elsewhere(&review) == Some(Busy::TurnRunning { pid: 4242 })
+        });
+        assert!(
+            !review.join("git").exists(),
+            "presence does not make a shadow repository"
+        );
+        shut_down_all(&mut set);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_set_without_presence_has_no_guard() {
+        assert!(set().presence_guard().is_none());
+    }
+
+    #[test]
+    fn removing_a_running_tab_drops_its_running_file() {
+        use crate::turn_review::{Busy, PresenceHolder};
+        let (scratch, review) = presence_dir("presence-remove");
+        let dir = scratch.join("project");
+        let mut set = set();
+        set.hold_presence(PresenceHolder::start(review.clone(), 4242));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        until("the turn is seen elsewhere", || {
+            seen_from_elsewhere(&review) == Some(Busy::TurnRunning { pid: 4242 })
+        });
+        set.open();
+        let mut closed = set.remove(tab).unwrap();
+        if let TabBackend::Live(backend) = &mut closed.backend {
+            backend.shutdown();
+        }
+        until("the turn's file is gone", || {
+            seen_from_elsewhere(&review) == Some(Busy::OtherWindow { pid: 4242 })
+        });
+        shut_down_all(&mut set);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     #[test]
     fn the_legacy_backend_refuses_a_turn_review() {
         let mut set = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
@@ -8391,5 +8711,276 @@ mod tests {
         assert_eq!(kinds, vec!["base".to_string(), "end".to_string()]);
         shut_down_all(&mut set);
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    fn review_draft_revert(path: &str, undo: Option<crate::turn_review::UndoData>) -> crate::turn_review::NewRevert {
+        use crate::turn_review::{NewRevert, RevertShape, RevertSource};
+        NewRevert {
+            turn: 1,
+            path: path.into(),
+            hunk: None,
+            shape: RevertShape::Deleted,
+            source: RevertSource::Panel,
+            at_line: 1,
+            reverted_to: Vec::new(),
+            replaced: b"x\n".to_vec(),
+            undo,
+        }
+    }
+
+    #[test]
+    fn the_draft_survives_a_panel_reload() {
+        use crate::turn_review::{Overview, ReviewDraft, Scope};
+        let mut set = set();
+        let tab = set.active();
+        set.review_draft_mut(tab)
+            .unwrap()
+            .add_comment(1, "a.rs", 3, 4, vec!["let x = 1;".into()], "why?")
+            .unwrap();
+        let overview = Overview {
+            session: "s".into(),
+            scope: Scope::Turn,
+            current: 1,
+            turns: Vec::new(),
+            files: Vec::new(),
+            compared: false,
+            pending_no_result: 0,
+            notes: Vec::new(),
+        };
+        // A reload asks again: the answer carries what the tab holds, not what the WebView kept.
+        let sent = crate::agent_bridge::serialize_review_for_js("r1", tab, &overview, set.review_draft(tab).unwrap());
+        let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(sent["draft"]["comments"][0]["text"], "why?");
+        assert_eq!(sent["draft"]["comments"][0]["anchor"][0], "let x = 1;");
+        let empty = crate::agent_bridge::serialize_review_for_js("r2", tab, &overview, &ReviewDraft::default());
+        let empty: serde_json::Value = serde_json::from_str(&empty).unwrap();
+        assert_eq!(empty["draft"]["comments"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn undo_data_keeps_kind_and_mode() {
+        use crate::turn_review::{UndoData, UndoState};
+        let mut set = set();
+        let tab = set.active();
+        let undo = UndoData {
+            pre: UndoState::Regular {
+                blob: "pre".into(),
+                mode: 0o755,
+            },
+            post: UndoState::Absent,
+        };
+        let id = set
+            .review_draft_mut(tab)
+            .unwrap()
+            .record_revert(review_draft_revert("run.sh", Some(undo.clone())));
+        let draft = set.review_draft(tab).unwrap();
+        let last = draft.last_undoable().unwrap();
+        assert_eq!(last.id, id);
+        assert_eq!(last.new.undo, Some(undo));
+    }
+
+    #[test]
+    fn the_draft_is_dropped_with_its_tab() {
+        let mut set = set();
+        let first = set.active();
+        set.review_draft_mut(first)
+            .unwrap()
+            .record_revert(review_draft_revert("a", None));
+        let second = set.open();
+        assert!(set.review_draft(second).unwrap().is_empty(), "a new tab starts empty");
+        set.remove(first).unwrap();
+        assert!(set.review_draft(first).is_err(), "the draft went with its tab");
+        assert!(set.review_draft_mut(first).is_err());
+        assert!(set.review_draft(second).unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_review_folds_the_message_as_typed() {
+        let dir = workspace("tabs-send-review");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let text = "Review of your last turn: 1 comment, 0 reverts.\n\nComments:\n1. a.rs:3-4\n   > x\n   why?";
+        let flush = set
+            .send_review(tab, text, 5)
+            .unwrap()
+            .expect("an idle tab sends at once");
+        assert!(flush.outcome.is_ok());
+        assert_eq!(flush.typed, text);
+        assert_eq!(provider.turns(), vec![text.to_string()], "wire == typed == text");
+        until("the prompt in the transcript", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            let projection = backend.projection();
+            projection.user_prompts.last().is_some_and(|p| p.text == text)
+        });
+        assert!(set.get(tab).unwrap().queue.is_empty());
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn send_review_queues_behind_a_running_turn() {
+        let dir = workspace("tabs-send-review-queued");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+
+        assert!(
+            set.send_review(tab, "the review", 5).unwrap().is_none(),
+            "queued, not sent"
+        );
+        assert!(provider.turns().is_empty());
+        assert_eq!(set.queue_texts(tab), vec!["the review".to_string()]);
+
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        pump_until_running(&mut set, &dir, tab, false);
+        let flush = set.flush_queue(tab).expect("it goes out when the turn ends");
+        assert_eq!(flush.typed, "the review");
+        assert_eq!(provider.turns(), vec!["the review".to_string()]);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn send_review_on_a_tab_with_no_session_is_refused() {
+        let mut set = set();
+        let tab = set.active();
+        assert!(
+            set.send_review(tab, "the review", 5).is_err(),
+            "an empty tab has no session"
+        );
+        assert_eq!(set.queued_count(), 0, "nothing was left behind");
+        assert!(set.send_review(TabId(999), "the review", 5).is_err(), "no such tab");
+    }
+
+    #[test]
+    fn a_ticket_needs_a_tab_with_a_session_and_is_current_until_it_ends() {
+        let dir = target_scratch("ticket-current").join("project");
+        let mut set = set();
+        let tab = set.active();
+        assert!(set.review_ticket(tab).is_err(), "an empty tab has no session");
+        assert_eq!(
+            set.review_ticket(TabId(999)).unwrap_err(),
+            "protocol: no tab 999",
+            "the text a missing tab always gets"
+        );
+        give_session(&mut set, tab, &dir, "sess-ticket");
+        let ticket = set.review_ticket(tab).unwrap();
+        assert_eq!(ticket.session, "sess-ticket");
+        assert!(ticket.is_current(&set));
+        ticket.cancel();
+        assert!(!ticket.is_current(&set), "a cancelled ticket is never current");
+        assert!(!ticket.wanted.load(Ordering::SeqCst));
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_ticket_is_not_current_for_another_session_of_the_same_tab() {
+        let dir = target_scratch("ticket-session").join("project");
+        let mut set = set();
+        let tab = set.active();
+        give_session(&mut set, tab, &dir, "sess-one");
+        let ticket = set.review_ticket(tab).unwrap();
+        let old = std::mem::replace(&mut set.get_mut(tab).unwrap().backend, TabBackend::NotStarted);
+        if let TabBackend::Live(mut backend) = old {
+            backend.shutdown();
+        }
+        assert!(!ticket.is_current(&set), "the tab holds no session now");
+        give_session(&mut set, tab, &dir, "sess-two");
+        assert!(!ticket.is_current(&set), "another session is not the one asked about");
+        assert!(set.review_ticket(tab).unwrap().is_current(&set));
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn removing_a_tab_cancels_its_tickets() {
+        let dir = target_scratch("ticket-remove").join("project");
+        let mut set = set();
+        let tab = set.active();
+        give_session(&mut set, tab, &dir, "sess-remove");
+        let other = set.open();
+        let ticket = set.review_ticket(tab).unwrap();
+        let kept = set.review_ticket(tab).unwrap();
+        assert!(ticket.wanted.load(Ordering::SeqCst));
+        let mut closed = set.remove(tab).unwrap();
+        // Right after the removal, before any pump: the flag is what a worker's last check reads.
+        assert!(!ticket.wanted.load(Ordering::SeqCst));
+        assert!(
+            !kept.wanted.load(Ordering::SeqCst),
+            "every ticket of the tab, not the first"
+        );
+        assert!(!ticket.is_current(&set));
+        assert_eq!(set.active(), other);
+        if let TabBackend::Live(backend) = &mut closed.backend {
+            backend.shutdown();
+        }
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn removing_one_tab_leaves_another_tabs_tickets_alone() {
+        let dir = target_scratch("ticket-other").join("project");
+        let mut set = set();
+        let first = set.active();
+        give_session(&mut set, first, &dir, "sess-first");
+        let second = set.open();
+        give_session(&mut set, second, &dir, "sess-second");
+        let kept = set.review_ticket(second).unwrap();
+        let mut closed = set.remove(first).unwrap();
+        assert!(kept.is_current(&set));
+        if let TabBackend::Live(backend) = &mut closed.backend {
+            backend.shutdown();
+        }
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn take_all_cancels_every_ticket() {
+        let dir = target_scratch("ticket-take-all").join("project");
+        let mut set = set();
+        let first = set.active();
+        give_session(&mut set, first, &dir, "sess-a");
+        let second = set.open();
+        give_session(&mut set, second, &dir, "sess-b");
+        let a = set.review_ticket(first).unwrap();
+        let b = set.review_ticket(second).unwrap();
+        let tabs = set.take_all();
+        assert!(!a.wanted.load(Ordering::SeqCst));
+        assert!(!b.wanted.load(Ordering::SeqCst));
+        for mut tab in tabs {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn a_finished_ticket_leaves_no_watcher_behind() {
+        let dir = target_scratch("ticket-drop").join("project");
+        let mut set = set();
+        let tab = set.active();
+        give_session(&mut set, tab, &dir, "sess-drop");
+        for _ in 0..50 {
+            drop(set.review_ticket(tab).unwrap());
+        }
+        let _kept = set.review_ticket(tab).unwrap();
+        assert_eq!(
+            set.get(tab).unwrap().review_watchers.len(),
+            1,
+            "dropped tickets are swept the next time one is made"
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn the_availability_question_names_the_reason_without_a_tab() {
+        let mut set = set();
+        assert_eq!(set.review_unavailable(), Some(TURN_REVIEW_NEEDS_SIDECAR));
+        set.turn_review_off();
+        assert_eq!(set.review_unavailable(), Some(TURN_REVIEW_OFF));
+        let tab = set.active();
+        assert_eq!(set.review_session(tab).err().as_deref(), Some(TURN_REVIEW_OFF));
     }
 }

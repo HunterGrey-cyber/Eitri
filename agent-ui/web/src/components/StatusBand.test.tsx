@@ -230,3 +230,11 @@ it("a turn ending is a plain segment on the left, and no fact draws none", () =>
   cleanup();
   expect(renderWide({ ...RUNNING, ending: null }).container.querySelector(".band-ending")).toBeNull();
 });
+
+it("draws the interrupted-revert notice with the review pointer off, in the band's own colour", () => {
+  const { container } = renderWide({ ...RUNNING, review: null, recovery: { path: "core/src/x.rs", more: 0 } });
+  const notice = container.querySelector<HTMLElement>(".band-recovery")!;
+  expect(notice.textContent).toBe("an interrupted revert left core/src/x.rs · c to review");
+  expect(container.querySelector(".band-review")).toBeNull();
+  expect(container.querySelectorAll(".band-recovery[style]")).toHaveLength(0);
+});
