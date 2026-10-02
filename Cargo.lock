@@ -955,6 +955,7 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
 ]
 

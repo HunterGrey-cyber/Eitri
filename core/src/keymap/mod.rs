@@ -9,6 +9,7 @@ pub mod panel;
 pub mod root;
 pub mod stock;
 pub mod table;
+pub mod tmux;
 
 pub use action::{Action, ActionError, OptValue, Parsed, SwapTarget, TabAction, TextChange};
 pub use key::{Chord, KeyName, KeyParseError, KeySpec};
@@ -17,4 +18,4 @@ pub use panel::{
     PanelKeymap, PanelSeq, PanelSource, PanelUserTable, DEFAULT_GROUPS,
 };
 pub use root::HelpRow;
-pub use table::{check_command_keybinding, Binding, Keymap, KeymapError, KeymapOp, Source};
+pub use table::{check_command_keybinding, Binding, Keymap, KeymapError, KeymapOp, LuaClaims, Source, TmuxImport};

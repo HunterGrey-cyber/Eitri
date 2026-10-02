@@ -2232,6 +2232,7 @@ export default function App() {
           prefixKeys: payload.prefixKeys,
           panel: payload.panel,
           newTabChord: payload.newTabChord,
+          tmuxSkipped: payload.tmuxSkipped ?? [],
         });
       } else if (payload.kind === "literal_key") {
         // `send-prefix`/`send-keys` arrives from shell because WebKitGTK cannot receive the key
@@ -3566,6 +3567,7 @@ export default function App() {
               prefixKeys={keymapHelp.prefixKeys}
               prefixLabel={keymapHelp.prefix}
               panel={panelTable}
+              tmuxSkipped={keymapHelp.tmuxSkipped}
             />
           </PanelErrorBoundary>
         )}
@@ -5110,6 +5112,7 @@ export default function App() {
               prefixKeys={keymapHelp.prefixKeys}
               prefixLabel={keymapHelp.prefix}
               panel={panelTable}
+              tmuxSkipped={keymapHelp.tmuxSkipped}
             />
           </PanelErrorBoundary>
         )}

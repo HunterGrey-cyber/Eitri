@@ -16,6 +16,9 @@ use gtk4::prelude::*;
 /// How long a toast stays up; a new one restarts it.
 pub(crate) const TOAST_FOR: Duration = Duration::from_secs(4);
 
+/// How long a one-time notice stays up: it is a sentence read once, not a glance at a count.
+pub(crate) const NOTICE_FOR: Duration = Duration::from_secs(12);
+
 /// The toast's distance from the edge of what it sits over. Also `close_prompt`'s corner margin
 /// when the top bar is hidden (Immersive) -- the two overlay labels share one Immersive fallback.
 pub(crate) const TOAST_MARGIN: i32 = 8;
@@ -74,15 +77,24 @@ impl Toast {
     }
 
     pub(crate) fn show(self: &Rc<Self>, text: &str) {
-        self.label
-            .set_margin_top(toast_top(self.bar.is_visible(), self.bar.height()));
+        self.show_for(text, TOAST_FOR);
+    }
+
+    pub(crate) fn show_for(self: &Rc<Self>, text: &str, duration: Duration) {
+        // A toast raised while the window is still being built (the tmux import's notice) comes
+        // before the bar has a height; its natural height is the one it is about to get.
+        let bar_height = match self.bar.height() {
+            0 => self.bar.measure(gtk4::Orientation::Vertical, -1).1,
+            allocated => allocated,
+        };
+        self.label.set_margin_top(toast_top(self.bar.is_visible(), bar_height));
         self.label.set_label(text);
         self.label.set_visible(true);
         if let Some(source) = self.hide.borrow_mut().take() {
             source.remove();
         }
         let toast = Rc::downgrade(self);
-        let source = glib::timeout_add_local_once(TOAST_FOR, move || {
+        let source = glib::timeout_add_local_once(duration, move || {
             if let Some(toast) = toast.upgrade() {
                 toast.hide.borrow_mut().take();
                 toast.label.set_visible(false);

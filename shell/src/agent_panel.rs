@@ -4928,6 +4928,7 @@ mod tests {
             &[],
             &eitri_core::keymap::panel::effective(&Default::default(), None).0,
             "Ctrl+b c",
+            &[],
         );
         let window = vec![
             eitri_core::agent_bridge::serialize_history_for_js(&["earlier".into()]),
@@ -5136,6 +5137,7 @@ mod tests {
             &[],
             &eitri_core::keymap::panel::effective(&Default::default(), None).0,
             "Ctrl+b c",
+            &[],
         );
         let snapshot = r#"{"kind":"snapshot","tab":1,"throughRevision":3,"state":{}}"#.to_string();
         let payloads = ready_payloads(
@@ -5693,6 +5695,7 @@ mod tests {
             &[],
             &eitri_core::keymap::panel::effective(&Default::default(), None).0,
             "Ctrl+b c",
+            &[],
         );
         assert_eq!(
             kinds(&ready_payloads(
