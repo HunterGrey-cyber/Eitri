@@ -57,6 +57,36 @@ describe("renderToolCall", () => {
     expect(ruled.container.textContent).not.toContain("allowed by auto");
   });
 
+  /** The CLI's auto mode: a call its classifier refused says so on its row, muted like the other
+   *  notes, with the CLI's reason verbatim -- and names the kind of refusal only when it was not the
+   *  classifier's. A call nobody refused says nothing of the kind. */
+  it("says the CLI blocked a call, with its reason, and nothing of the kind otherwise", () => {
+    const { container } = render(
+      <>
+        {renderToolCall(
+          call({
+            input: { command: "git push --force origin main" },
+            result: { content: "Permission for this action was denied by the Claude Code auto mode classifier.", isError: true },
+            denied: { reasonType: "classifier", reason: "[Git Destructive]" },
+          }),
+        )}
+      </>,
+    );
+    const note = container.querySelector(".tool-denied-note");
+    expect(note?.textContent).toBe("blocked by auto: [Git Destructive]");
+    expect(note?.classList.contains("tool-rule-note")).toBe(true);
+    cleanup();
+    const ruled = render(<>{renderToolCall(call({ denied: { reasonType: "rule", reason: "Bash(git push *)" } }))}</>);
+    expect(ruled.container.querySelector(".tool-denied-note")?.textContent).toBe("blocked by auto: Bash(git push *) (rule)");
+    cleanup();
+    const bare = render(<>{renderToolCall(call({ denied: { reasonType: null, reason: null } }))}</>);
+    expect(bare.container.querySelector(".tool-denied-note")?.textContent).toBe("blocked by auto");
+    cleanup();
+    const plain = render(<>{renderToolCall(call({}))}</>);
+    expect(plain.container.querySelector(".tool-denied-note")).toBeNull();
+    expect(plain.container.textContent).not.toContain("blocked by auto");
+  });
+
   /** O3 review item 7: a call whose CLI prompt Eitri answered without a card says so, muted, the
    *  way a call a saved rule answered does; a call without one says nothing of the kind. */
   it("says when the CLI's own prompt for a call was answered without a card", () => {

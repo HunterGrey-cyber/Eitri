@@ -12,7 +12,7 @@
 //! struct's shape when whichever later phase actually needs one of those, not before.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +50,11 @@ pub enum PermissionOutcome {
     /// A permission request timed out waiting for a decision -- the sidecar proto's
     /// `PERMISSION_OUTCOME_EXPIRED`. No legacy-backend producer either.
     Expired,
+    /// This host answered `PermissionDecision::Defer` and the CLI's own permission handling decided
+    /// the call -- the sidecar proto's `PERMISSION_OUTCOME_DEFERRED`. Says nothing about whether the
+    /// call ran: a refusal arrives as `AgentDomainEvent::PermissionDenied` and as the call's error
+    /// result. No legacy-backend producer.
+    Deferred,
 }
 
 /// What the provider said about a resume. Mirrors the wire's `ResumeStatus`.
@@ -245,6 +250,43 @@ pub enum AgentDomainEvent {
         /// call`.
         detail: String,
     },
+    /// What the CLI said its permission mode is, on a session that asked for the CLI's own `auto`
+    /// under the gate (`ProviderCapabilities::cli_auto_mode`), each time it says it and it is a mode
+    /// that session accepts: `auto`, or `default` when the CLI could not run auto. Anything else
+    /// becomes `UngatedCliMode` instead. Never produced by a session that asked for `default`, so
+    /// every such session's events are what they were before this existed.
+    ///
+    /// Read by the host's answer path (`eitri_core::agent_backend`), which defers a request to the
+    /// CLI's classifier only while the latest report is `auto`: a CLI that fell back to `default`
+    /// gets Eitri's own policy, as a session that never asked for auto does.
+    CliPermissionMode {
+        /// The CLI's own word, verbatim.
+        reported: String,
+    },
+    /// The CLI refused a tool call on its own, before asking anyone (Verdandi `PermissionDenied`,
+    /// capability `permission_denied_events`): its auto-mode classifier, a deny rule in a loaded
+    /// settings tier, or its mode. The model already has the refusal as the call's error result;
+    /// this is what lets the panel say who refused it. Only a session that stated a CLI permission
+    /// mode receives these, and Eitri states one only when it asks for auto.
+    PermissionDenied {
+        /// The call it refused, the same id its `ToolCallStarted` carried; `None` when the CLI gave
+        /// none, which leaves nothing to attach it to.
+        tool_use_id: Option<String>,
+        tool_name: String,
+        /// What decided, in the CLI's own word (`classifier`, `rule`, `mode`, ...), when it said.
+        reason_type: Option<String>,
+        /// The deciding component's own words (`[Git Destructive]`), English, shown and never
+        /// parsed, when it gave any.
+        reason: Option<String>,
+    },
+}
+
+/// The CLI's own refusal of one tool call, as the projection keeps it on that call's record
+/// (`AgentDomainEvent::PermissionDenied`). Both fields are the CLI's words, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallDenial {
+    pub reason_type: Option<String>,
+    pub reason: Option<String>,
 }
 
 /// The first `UngatedCliMode` a session reported, as the projection keeps it. See
@@ -308,6 +350,11 @@ pub struct ToolCallRecord {
     /// because the frontend distinguishes `result: null` from an absent key.
     #[serde(default)]
     pub result: Option<ToolCallResult>,
+    /// Set when the CLI itself refused this call (`AgentDomainEvent::PermissionDenied`), its
+    /// auto-mode classifier most often. Absent on every other call, and on every call a history
+    /// file stored before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<ToolCallDenial>,
 }
 
 /// One unanswered permission request. Deliberately carries no `PermissionSource`
@@ -577,7 +624,24 @@ pub struct AgentSessionProjection {
     /// is the host's to do.
     #[serde(skip)]
     pub ungated_cli_mode: Option<UngatedCliModeRecord>,
+    /// The latest `AgentDomainEvent::CliPermissionMode` this session reported: `Some("auto")` while
+    /// the CLI runs its own auto mode under the gate, `Some("default")` when it fell back, `None`
+    /// before the first report and on every session that did not ask for auto. Not serialized: it
+    /// changes nothing a view draws, only how the host answers (`cli_runs_auto`).
+    #[serde(skip)]
+    pub cli_mode_reported: Option<String>,
+    /// CLI refusals whose call has not been folded yet, oldest first, by tool-use id, attached when
+    /// it is. In the one recorded run (CLI 2.1.284) the refusal followed the assistant message
+    /// carrying its call; this keeps a refusal that ever arrives first from being lost. Emptied at
+    /// every turn's end and whenever the session ends, since a refusal and its call share a turn;
+    /// holds at most [`MAX_HELD_DENIALS`], the oldest dropped first, because a refusal naming a call
+    /// that never comes would otherwise sit here for as long as the turn lasts.
+    #[serde(skip)]
+    pub denials_before_their_call: VecDeque<(String, ToolCallDenial)>,
 }
+
+/// How many refusals that arrived ahead of their call a projection holds at once.
+pub const MAX_HELD_DENIALS: usize = 64;
 
 /// Which of the two records a restored history was read from.
 ///
@@ -631,6 +695,32 @@ pub struct HistoryNotice {
 }
 
 impl AgentSessionProjection {
+    /// Keeps a refusal whose call has not been folded yet: a second one for the same id replaces
+    /// the first, and past [`MAX_HELD_DENIALS`] the oldest is dropped.
+    fn hold_denial(&mut self, tool_use_id: String, denial: ToolCallDenial) {
+        self.denials_before_their_call.retain(|(id, _)| id != &tool_use_id);
+        self.denials_before_their_call.push_back((tool_use_id, denial));
+        while self.denials_before_their_call.len() > MAX_HELD_DENIALS {
+            self.denials_before_their_call.pop_front();
+        }
+    }
+
+    /// Takes the refusal held for this call, if one arrived ahead of it.
+    fn take_held_denial(&mut self, tool_use_id: &str) -> Option<ToolCallDenial> {
+        let at = self
+            .denials_before_their_call
+            .iter()
+            .position(|(id, _)| id == tool_use_id)?;
+        self.denials_before_their_call.remove(at).map(|(_, denial)| denial)
+    }
+
+    /// Whether the CLI's latest report on this session says it runs its own `auto` mode under the
+    /// gate. False before any report, after a fallback to `default`, and on every session that did
+    /// not ask for auto (none of which ever reports one).
+    pub fn cli_runs_auto(&self) -> bool {
+        self.cli_mode_reported.as_deref() == Some("auto")
+    }
+
     /// The reducer: folds one event's effect into this projection, unconditionally bumping
     /// `last_revision` by exactly one regardless of whether the event has any other observable
     /// effect (an event with a real revision but no other effect -- e.g. a `ContentDelta` with
@@ -720,6 +810,7 @@ impl AgentSessionProjection {
                 // A tool call can only happen between assistant messages, so whatever text was
                 // streaming has ended; the text after it is a new message.
                 self.assistant_message_open = false;
+                let denied = self.take_held_denial(tool_use_id);
                 self.tool_calls.push(ToolCallRecord {
                     seq,
                     turn_id: turn_id.clone(),
@@ -727,6 +818,7 @@ impl AgentSessionProjection {
                     name: name.clone(),
                     input: input.clone(),
                     result: None,
+                    denied,
                 });
             }
             AgentDomainEvent::ToolCallCompleted {
@@ -771,6 +863,7 @@ impl AgentSessionProjection {
             AgentDomainEvent::TurnCompleted { usage, .. } => {
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
+                self.denials_before_their_call.clear();
                 // Conditional, where this arm used to assign unconditionally -- which is how the
                 // sidecar path's fabricated zero reached the projection in the first place. A turn
                 // that reported no usage leaves whatever was last reported standing: silence is not
@@ -807,6 +900,7 @@ impl AgentSessionProjection {
                 ) {
                     self.active_turn_id = None;
                     self.assistant_message_open = false;
+                    self.denials_before_their_call.clear();
                     self.status = ProjectionStatus::Unavailable {
                         reason: describe_failed_resume(
                             requested_provider_session_id,
@@ -820,11 +914,13 @@ impl AgentSessionProjection {
             AgentDomainEvent::SessionUnavailable { reason } => {
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
+                self.denials_before_their_call.clear();
                 self.status = ProjectionStatus::Unavailable { reason: reason.clone() };
             }
             AgentDomainEvent::SessionClosed { reason } => {
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
+                self.denials_before_their_call.clear();
                 self.status = ProjectionStatus::Closed { reason: reason.clone() };
             }
             // The host's answer mode is the tab's (`Tab::mode`), and nothing a provider reports moves
@@ -838,6 +934,29 @@ impl AgentSessionProjection {
                         reported: reported.clone(),
                         detail: detail.clone(),
                     });
+                }
+            }
+            // The latest report wins: the CLI re-reports its mode at every turn's start.
+            AgentDomainEvent::CliPermissionMode { reported } => {
+                self.cli_mode_reported = Some(reported.clone());
+            }
+            // On the call it refused, or held until that call is folded. A refusal naming no call
+            // has nothing to sit on and changes nothing; the call's own error result still says it.
+            AgentDomainEvent::PermissionDenied {
+                tool_use_id,
+                reason_type,
+                reason,
+                ..
+            } => {
+                if let Some(id) = tool_use_id {
+                    let denial = ToolCallDenial {
+                        reason_type: reason_type.clone(),
+                        reason: reason.clone(),
+                    };
+                    match self.tool_calls.iter_mut().find(|c| &c.tool_use_id == id) {
+                        Some(call) => call.denied = Some(denial),
+                        None => self.hold_denial(id.clone(), denial),
+                    }
                 }
             }
         }
@@ -913,5 +1032,162 @@ mod tests {
     #[test]
     fn a_whitespace_id_is_left_exactly_as_the_provider_sent_it() {
         assert_eq!(tool_use_link(" "), Some(" ".to_string()));
+    }
+
+    fn started(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: "t".into(),
+            tool_use_id: id.into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "git push --force origin main" }),
+        }
+    }
+
+    fn denied(id: Option<&str>) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionDenied {
+            tool_use_id: id.map(Into::into),
+            tool_name: "Bash".into(),
+            reason_type: Some("classifier".into()),
+            reason: Some("[Git Destructive]".into()),
+        }
+    }
+
+    fn git_destructive() -> Option<ToolCallDenial> {
+        Some(ToolCallDenial {
+            reason_type: Some("classifier".into()),
+            reason: Some("[Git Destructive]".into()),
+        })
+    }
+
+    /// The CLI's refusal lands on the call it refused, by tool-use id, and on no other; it creates
+    /// no item of its own, so the `seq` order is untouched.
+    #[test]
+    fn a_cli_refusal_lands_on_the_call_it_refused() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&started("toolu_a"));
+        p.apply(&started("toolu_b"));
+        p.apply(&denied(Some("toolu_b")));
+        assert_eq!(p.tool_calls[0].denied, None);
+        assert_eq!(p.tool_calls[1].denied, git_destructive());
+        assert_eq!(p.tool_calls.len(), 2);
+        assert_eq!(p.last_revision, 3, "one revision per event, as every event");
+        let json = serde_json::to_value(&p.tool_calls[1]).unwrap();
+        assert_eq!(json["denied"]["reason"], "[Git Destructive]");
+        assert!(
+            serde_json::to_value(&p.tool_calls[0]).unwrap().get("denied").is_none(),
+            "absent, not null, on a call nobody refused"
+        );
+    }
+
+    /// A refusal folded before its call is kept until the call arrives, and dropped at the turn's
+    /// end if it never does; one naming no call changes nothing.
+    #[test]
+    fn a_refusal_before_its_call_waits_for_it_and_one_naming_no_call_changes_nothing() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&denied(Some("toolu_late")));
+        p.apply(&denied(None));
+        p.apply(&started("toolu_late"));
+        assert_eq!(p.tool_calls[0].denied, git_destructive());
+        assert!(p.denials_before_their_call.is_empty());
+
+        p.apply(&denied(Some("toolu_never")));
+        p.apply(&AgentDomainEvent::TurnCompleted {
+            turn_id: "t".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        });
+        assert!(p.denials_before_their_call.is_empty());
+        p.apply(&started("toolu_never"));
+        assert_eq!(
+            p.tool_calls[1].denied, None,
+            "a later turn's call is not the one refused"
+        );
+    }
+
+    /// Refusals that arrive ahead of their calls are held up to a cap, oldest dropped first, and a
+    /// repeat for one id replaces rather than adds.
+    #[test]
+    fn refusals_held_for_calls_that_never_come_are_capped_oldest_first() {
+        let mut p = AgentSessionProjection::default();
+        for n in 0..MAX_HELD_DENIALS + 6 {
+            p.apply(&denied(Some(&format!("toolu_{n}"))));
+        }
+        assert_eq!(p.denials_before_their_call.len(), MAX_HELD_DENIALS);
+        p.apply(&denied(Some("toolu_69")));
+        assert_eq!(
+            p.denials_before_their_call.len(),
+            MAX_HELD_DENIALS,
+            "a repeat adds nothing"
+        );
+        // The six oldest are gone; the first one kept is still attached to its call, the dropped
+        // one is not.
+        p.apply(&started("toolu_0"));
+        p.apply(&started("toolu_5"));
+        p.apply(&started("toolu_6"));
+        assert_eq!(p.tool_calls[0].denied, None);
+        assert_eq!(p.tool_calls[1].denied, None);
+        assert_eq!(p.tool_calls[2].denied, git_destructive());
+    }
+
+    /// Whatever ends the turn or the session empties the held refusals: their calls can no longer
+    /// arrive, and a stale one must not attach to a later turn's call of the same id.
+    #[test]
+    fn held_refusals_are_cleared_when_the_turn_or_the_session_ends() {
+        let ends: [(&str, AgentDomainEvent); 4] = [
+            (
+                "turn completed",
+                AgentDomainEvent::TurnCompleted {
+                    turn_id: "t".into(),
+                    outcome: TurnOutcome::Completed,
+                    result_text: String::new(),
+                    stop_reason: None,
+                    usage: None,
+                },
+            ),
+            (
+                "session closed",
+                AgentDomainEvent::SessionClosed { reason: "bye".into() },
+            ),
+            (
+                "session unavailable",
+                AgentDomainEvent::SessionUnavailable { reason: "gone".into() },
+            ),
+            (
+                "a resume that did not continue",
+                AgentDomainEvent::ResumeOutcome {
+                    requested_provider_session_id: "sess-1".into(),
+                    status: ResumeStatus::Rejected,
+                    attached_provider_session_id: None,
+                    forked: false,
+                    detail: None,
+                },
+            ),
+        ];
+        for (what, end) in ends {
+            let mut p = AgentSessionProjection::default();
+            p.apply(&denied(Some("toolu_x")));
+            assert_eq!(p.denials_before_their_call.len(), 1, "{what}");
+            p.apply(&end);
+            assert!(p.denials_before_their_call.is_empty(), "{what}");
+            p.apply(&started("toolu_x"));
+            assert_eq!(p.tool_calls[0].denied, None, "{what}");
+        }
+    }
+
+    /// `cli_runs_auto` follows the latest report, and nothing but a report of exactly `auto` sets it.
+    #[test]
+    fn the_cli_runs_auto_only_while_its_latest_report_says_auto() {
+        let mut p = AgentSessionProjection::default();
+        assert!(!p.cli_runs_auto(), "no report yet");
+        p.apply(&AgentDomainEvent::CliPermissionMode {
+            reported: "auto".into(),
+        });
+        assert!(p.cli_runs_auto());
+        p.apply(&AgentDomainEvent::CliPermissionMode {
+            reported: "default".into(),
+        });
+        assert!(!p.cli_runs_auto(), "a fallback to default is not auto");
     }
 }

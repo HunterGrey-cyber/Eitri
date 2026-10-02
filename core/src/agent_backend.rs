@@ -42,6 +42,9 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     // Its interactive gate is the `PreToolUse` hook relay, which is this backend's primary,
     // end-to-end-verified permission mechanism -- not the leaky `can_use_tool` it also listens to.
     interactive_permission_mode: true,
+    // Its CLI always runs `default` (`--permission-mode default`), and its hook relay has no way
+    // to say "no decision": every request it raises is answered with Eitri's own policy.
+    cli_auto_mode: false,
 };
 
 // Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
@@ -67,6 +70,10 @@ const _: () = {
     assert!(
         !LEGACY_CAPABILITIES.bypass_permission_mode,
         "R07: the legacy backend never starts the CLI ungated"
+    );
+    assert!(
+        !LEGACY_CAPABILITIES.cli_auto_mode,
+        "the legacy backend never runs the CLI's auto mode and cannot defer"
     );
 };
 
@@ -811,6 +818,23 @@ impl AgentBackend {
     /// true of a call the CLI's `validateInput` failed before any hook ran (no gate at all), and of a
     /// gate a switch to bypass answered instead of the rule.
     ///
+    /// **On a session whose CLI runs its own auto mode under the gate, `Auto` defers** (2026-10-02,
+    /// Verdandi protocol 3.14). Such a session asked for it (`ProviderCapabilities::cli_auto_mode`:
+    /// the sidecar offered both `cli_auto_mode` and `permission_defer`) and the CLI's latest report
+    /// says `auto` (`AgentSessionProjection::cli_runs_auto`). There a gate request in `Auto` is
+    /// answered `allow` when a saved prefix rule allows it -- `agent::rule_that_allows`, the same
+    /// rule path `classify_with_rules` takes, with the same limits -- and otherwise
+    /// `PermissionDecision::Defer`: Eitri's own classifier is not consulted and no card is drawn, and
+    /// the CLI's classifier decides. A refusal comes back as `AgentDomainEvent::PermissionDenied`
+    /// and the call's error result. A deferral that fails to send is a card, like any failed answer.
+    /// The projection is read again immediately before each request, not once per batch: ingestion
+    /// keeps folding while the batch is answered, and a trip or a fallback to `default` it folds
+    /// there must reach the next request, which then is not deferred (a trip: not answered).
+    ///
+    /// Everything above is unchanged on such a session: the tripwire, the CLI's own prompts and
+    /// bypass. A session that did not ask for auto, or whose CLI fell back to `default`, is answered
+    /// exactly as before, by the classifier below.
+    ///
     /// Each event travels with its fold revision (`take_revised_ui_delivery`), untouched: a kept
     /// event keeps its own, a dropped one takes its with it.
     fn answer_what_needs_no_human(
@@ -826,9 +850,10 @@ impl AgentBackend {
             approvals,
             answered_for_you,
         } = cx;
-        // Its own statement, guard dropped before any answer: on the sidecar `projection()` holds
-        // the ingestion mutex and `respond_permission` locks it again (the 2026-09-15 GTK freeze).
-        let mut tripped = self.projection().ungated_cli_mode.is_some();
+        // What the batch's own events have shown so far; the projection is read again for every
+        // request below, because ingestion keeps folding while earlier answers of this batch are
+        // sent, and a trip or a fallback to `default` it folds there must reach the next request.
+        let mut tripped = false;
         let mut kept = Vec::with_capacity(events.len());
         for (revision, event) in events {
             tripped |= matches!(event, AgentDomainEvent::UngatedCliMode { .. });
@@ -843,6 +868,16 @@ impl AgentBackend {
                 kept.push((revision, event));
                 continue;
             };
+            // Read afresh for each request, as its own statement: on the sidecar `projection()`
+            // holds the ingestion mutex and `respond_permission` locks it again (the 2026-09-15 GTK
+            // freeze), so the guard is gone before any answer below. Both halves are needed for a
+            // deferral: the session asked for the CLI's auto mode, and the CLI says it is running it.
+            let (projection_tripped, cli_reports_auto) = {
+                let projection = self.projection();
+                (projection.ungated_cli_mode.is_some(), projection.cli_runs_auto())
+            };
+            tripped |= projection_tripped;
+            let defers_to_the_cli = self.capabilities().cli_auto_mode && cli_reports_auto;
             if tripped {
                 eprintln!("[permission] not answering {tool_name}: the CLI reported an ungated mode");
                 kept.push((revision, event));
@@ -922,6 +957,65 @@ impl AgentBackend {
                     Err(error) => {
                         eprintln!(
                             "[permission] could not allow {tool_name} in bypass, showing a card instead: {}",
+                            error.message
+                        );
+                        kept.push((revision, event));
+                    }
+                }
+                continue;
+            }
+            if defers_to_the_cli {
+                if host_answered.contains(permission_id) {
+                    // Already answered once (a duplicate delivery): never a second answer.
+                    continue;
+                }
+                let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
+                let call_id = named_call(tool_use_id);
+                // A saved rule still answers what it answers today, and says so on the row; it is
+                // the only allow this host gives an Auto call on such a session. Asked here rather
+                // than through `classify_with_rules`, whose classifier half is exactly what is not
+                // consulted.
+                let rule = agent::rule_that_allows(&tool_name, input, project_root, rules);
+                // Read before the answer, as on every other path: once it is sent the CLI may
+                // already have written the file. A display fact about the call, not a grant.
+                let creates_file = call_id
+                    .clone()
+                    .filter(|_| write_over_no_file(&tool_name, input, project_root));
+                let (decision, by_rule) = match rule {
+                    Some(rule) => (
+                        PermissionDecision::Allow,
+                        call_id.map(|id| RuleAnsweredForYou {
+                            tool_use_id: id,
+                            rule,
+                            tool_name: tool_name.clone(),
+                            input: input.clone(),
+                        }),
+                    ),
+                    None => (PermissionDecision::Defer, None),
+                };
+                let defers = decision.defers();
+                match self.respond_permission(&permission_id, decision) {
+                    Ok(_resolution) => {
+                        host_answered.insert(permission_id);
+                        answered_for_you.creates_file.extend(creates_file);
+                        answered_for_you.by_rule.extend(by_rule);
+                        if defers {
+                            eprintln!("[permission] left to the CLI's auto mode: {tool_name}");
+                        } else {
+                            eprintln!(
+                                "[permission] allowed without asking: {tool_name} ({})",
+                                agent::permission_policy::REASON_ALLOWED_BY_A_PROJECT_RULE
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[permission] could not {} {tool_name}, showing a card instead: {}",
+                            if defers {
+                                "leave to the CLI's auto mode"
+                            } else {
+                                "auto-answer"
+                            },
                             error.message
                         );
                         kept.push((revision, event));
@@ -3229,5 +3323,445 @@ mod tests {
         assert_eq!(answered.ids, vec!["perm-plain".to_string()]);
         assert_eq!(provider.resolutions(), vec![("perm-plain".to_string(), true)]);
         backend.shutdown();
+    }
+
+    // ---- The CLI's own auto mode under the gate (Verdandi 8f1d2f9, protocol 3.14) ---------------
+
+    fn auto_backend(dir: &Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {
+        let provider = std::sync::Arc::new(RecordingProvider::cli_auto());
+        let conversation = AgentConversation::create(provider.clone(), dir).unwrap();
+        (provider, AgentBackend::Sidecar(Box::new(conversation)))
+    }
+
+    fn cli_reports(mode: &str) -> AgentDomainEvent {
+        AgentDomainEvent::CliPermissionMode { reported: mode.into() }
+    }
+
+    fn gate(permission_id: &str, tool_use_id: &str, tool_name: &str, input: serde_json::Value) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: permission_id.into(),
+            tool_use_id: Some(tool_use_id.into()),
+            tool_name: tool_name.into(),
+            input,
+            provider_prompt: None,
+        }
+    }
+
+    /// Three gate requests the classifier judges three ways today: a `Read` it allows, a `Bash` it
+    /// cards ("not on the read-only list"), and a force push it cards. On an auto session in an Auto
+    /// tab all three are deferred to the CLI, none is allowed by Eitri, and none is a card.
+    fn three_gates() -> Vec<AgentDomainEvent> {
+        vec![
+            gate(
+                "perm-read",
+                "tu-r",
+                "Read",
+                serde_json::json!({ "file_path": "main.rs" }),
+            ),
+            gate(
+                "perm-build",
+                "tu-b",
+                "Bash",
+                serde_json::json!({ "command": "cargo build" }),
+            ),
+            gate(
+                "perm-push",
+                "tu-p",
+                "Bash",
+                serde_json::json!({ "command": "git push --force origin main" }),
+            ),
+        ]
+    }
+
+    /// One delivery, keeping everything `AnsweredForYou` recorded (`deliver` keeps the prompts only).
+    fn deliver_noting(
+        backend: &mut AgentBackend,
+        dir: &Path,
+        rules: &agent::PrefixRules,
+        mode: PermissionMode,
+        host_answered: &mut BTreeSet<String>,
+        approvals: &mut HumanApprovals,
+    ) -> (Vec<AgentDomainEvent>, AnsweredForYou) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let quiet = std::time::Duration::from_millis(100);
+        let mut answered = AnsweredForYou::default();
+        let mut delivered = Vec::new();
+        let mut last_new: Option<std::time::Instant> = None;
+        loop {
+            let now = std::time::Instant::now();
+            match backend.take_ui_delivery_with_approvals(dir, rules, mode, host_answered, approvals, &mut answered) {
+                UiDelivery::Events(events) if !events.is_empty() => {
+                    delivered.extend(events);
+                    last_new = Some(now);
+                }
+                _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => {
+                    return (delivered, answered)
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+    }
+
+    #[test]
+    fn an_auto_tab_on_an_auto_session_defers_every_gate_request_and_draws_no_card() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        let mut batch = vec![cli_reports("auto")];
+        batch.extend(three_gates());
+        provider.queue_all(batch);
+        let mut host_answered = BTreeSet::new();
+        let (delivered, answered) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut host_answered,
+            &mut HumanApprovals::default(),
+        );
+        for id in ["perm-read", "perm-build", "perm-push"] {
+            assert!(!carded(&delivered, id), "{id}: {delivered:?}");
+        }
+        assert_eq!(
+            provider.decisions(),
+            vec![
+                ("perm-read".to_string(), PermissionDecision::Defer),
+                ("perm-build".to_string(), PermissionDecision::Defer),
+                ("perm-push".to_string(), PermissionDecision::Defer),
+            ],
+            "the classifier's own allow for the Read is not given: the CLI decides"
+        );
+        assert_eq!(host_answered.len(), 3, "hidden from a resync like any host answer");
+        assert_eq!(
+            answered,
+            AnsweredForYou::default(),
+            "nothing was allowed by Eitri, so no row says it was"
+        );
+        backend.shutdown();
+    }
+
+    /// Bypass is unchanged on an auto session: every gate request is allowed, which also skips the
+    /// CLI's classifier (a hook allow does, measured on CLI 2.1.284).
+    #[test]
+    fn a_bypass_tab_on_an_auto_session_still_allows_every_gate_request() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        let mut batch = vec![cli_reports("auto")];
+        batch.extend(three_gates());
+        provider.queue_all(batch);
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Bypass,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert!(!carded(&delivered, "perm-push"), "{delivered:?}");
+        assert_eq!(
+            provider.decisions(),
+            ["perm-read", "perm-build", "perm-push"].map(|id| (id.to_string(), PermissionDecision::Allow))
+        );
+        backend.shutdown();
+    }
+
+    /// A saved prefix rule answers on an auto session exactly what it answers today, `allow`, with
+    /// its row note; a call the rule does not reach is deferred, and a rule never reaches past a
+    /// fail-closed check (`rule_that_allows`): `npm ci; rm -rf x` carries shell syntax, so even with
+    /// `Bash(npm ci *)` saved it is the CLI's to decide, never allowed here.
+    #[test]
+    fn a_saved_rule_allows_on_an_auto_session_and_everything_else_is_deferred() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap());
+        provider.queue_all(vec![
+            cli_reports("auto"),
+            gate("perm-ci", "tu-ci", "Bash", serde_json::json!({ "command": "npm ci" })),
+            gate(
+                "perm-chain",
+                "tu-chain",
+                "Bash",
+                serde_json::json!({ "command": "npm ci; rm -rf x" }),
+            ),
+            gate(
+                "perm-test",
+                "tu-test",
+                "Bash",
+                serde_json::json!({ "command": "npm test" }),
+            ),
+        ]);
+        let (_, answered) = deliver_noting(
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert_eq!(
+            provider.decisions(),
+            vec![
+                ("perm-ci".to_string(), PermissionDecision::Allow),
+                ("perm-chain".to_string(), PermissionDecision::Defer),
+                ("perm-test".to_string(), PermissionDecision::Defer),
+            ]
+        );
+        assert_eq!(
+            answered.by_rule,
+            vec![RuleAnsweredForYou {
+                tool_use_id: "tu-ci".into(),
+                rule: "Bash(npm ci *)".into(),
+                tool_name: "Bash".into(),
+                input: serde_json::json!({ "command": "npm ci" }),
+            }]
+        );
+        backend.shutdown();
+    }
+
+    /// The CLI's own prompts keep their rules on an auto session: never deferred (Verdandi refuses
+    /// that, and it is the CLI's own question already), a card in Auto without the human's approval
+    /// of the same call, allowed with it, allowed in bypass, and a card in every mode when only a
+    /// human may answer it.
+    #[test]
+    fn the_clis_own_prompts_are_answered_as_before_on_an_auto_session() {
+        let dir = a_workspace_holding_one_file();
+        let cat = serde_json::json!({ "command": "cat notes.txt" });
+        // Auto, no approval: a card.
+        let (provider, mut backend) = auto_backend(&dir);
+        provider.queue_all(vec![
+            cli_reports("auto"),
+            provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None),
+        ]);
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert!(carded(&delivered, "perm-prov"), "{delivered:?}");
+        assert!(provider.decisions().is_empty());
+        backend.shutdown();
+        // Auto, approved on a card: allowed once, never deferred.
+        let (provider, mut backend) = auto_backend(&dir);
+        provider.queue_all(vec![
+            cli_reports("auto"),
+            provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None),
+        ]);
+        let mut approvals = HumanApprovals::default();
+        approvals.record("tu-1", "Write", &probe_write());
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            &mut approvals,
+        );
+        assert!(!carded(&delivered, "perm-prov"), "{delivered:?}");
+        assert_eq!(
+            provider.decisions(),
+            vec![("perm-prov".to_string(), PermissionDecision::Allow)]
+        );
+        backend.shutdown();
+        // An ask rule's prompt: a card in both modes, even with the approval.
+        for mode in [PermissionMode::Auto, PermissionMode::Bypass] {
+            let (provider, mut backend) = auto_backend(&dir);
+            provider.queue_all(vec![
+                cli_reports("auto"),
+                provider_prompt("perm-ask", Some("tu-2"), "Bash", cat.clone(), Some("cat:*")),
+            ]);
+            let mut approvals = HumanApprovals::default();
+            approvals.record("tu-2", "Bash", &cat);
+            let (delivered, _) = deliver_noting(
+                &mut backend,
+                &dir,
+                &agent::PrefixRules::default(),
+                mode,
+                &mut BTreeSet::new(),
+                &mut approvals,
+            );
+            assert!(carded(&delivered, "perm-ask"), "{mode:?}: {delivered:?}");
+            assert!(provider.decisions().is_empty(), "{mode:?}");
+            backend.shutdown();
+        }
+    }
+
+    /// Today's policy, exactly, wherever the CLI is not known to run auto: a provider without the
+    /// capability (an older sidecar) even if something reported `auto`, a session whose CLI fell
+    /// back to `default`, and one whose CLI has not reported yet. The classifier allows the `Read`
+    /// and cards both `Bash` calls; nothing is deferred.
+    #[test]
+    fn without_auto_running_the_answers_are_todays() {
+        let dir = a_workspace_holding_one_file();
+        let cases: [(&str, bool, Option<&str>); 3] = [
+            ("an older sidecar", false, Some("auto")),
+            ("a fallback to default", true, Some("default")),
+            ("no report yet", true, None),
+        ];
+        for (case, capable, report) in cases {
+            let provider = std::sync::Arc::new(if capable {
+                RecordingProvider::cli_auto()
+            } else {
+                RecordingProvider::default()
+            });
+            let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+            let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+            let mut batch: Vec<AgentDomainEvent> = report.map(cli_reports).into_iter().collect();
+            batch.extend(three_gates());
+            provider.queue_all(batch);
+            let (delivered, _) = deliver_noting(
+                &mut backend,
+                &dir,
+                &agent::PrefixRules::default(),
+                PermissionMode::Auto,
+                &mut BTreeSet::new(),
+                &mut HumanApprovals::default(),
+            );
+            assert_eq!(
+                provider.decisions(),
+                vec![("perm-read".to_string(), PermissionDecision::Allow)],
+                "{case}"
+            );
+            assert!(!carded(&delivered, "perm-read"), "{case}: {delivered:?}");
+            assert!(carded(&delivered, "perm-build"), "{case}: {delivered:?}");
+            assert!(carded(&delivered, "perm-push"), "{case}: {delivered:?}");
+            backend.shutdown();
+        }
+    }
+
+    /// A deferral that does not reach the provider is a card, never a silent grant; and a session
+    /// whose CLI reported an ungated mode answers nothing, deferrals included.
+    #[test]
+    fn a_failed_deferral_is_a_card_and_a_tripped_auto_session_defers_nothing() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        provider.refuse_resolutions(true);
+        let mut batch = vec![cli_reports("auto")];
+        batch.extend(three_gates());
+        provider.queue_all(batch);
+        let mut host_answered = BTreeSet::new();
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut host_answered,
+            &mut HumanApprovals::default(),
+        );
+        for id in ["perm-read", "perm-build", "perm-push"] {
+            assert!(carded(&delivered, id), "{id}: {delivered:?}");
+        }
+        assert!(host_answered.is_empty());
+        backend.shutdown();
+
+        let (provider, mut backend) = auto_backend(&dir);
+        let mut batch = vec![
+            cli_reports("auto"),
+            AgentDomainEvent::UngatedCliMode {
+                reported: "acceptEdits".into(),
+                detail: "SessionReady".into(),
+            },
+        ];
+        batch.extend(three_gates());
+        provider.queue_all(batch);
+        for mode in [PermissionMode::Auto, PermissionMode::Bypass] {
+            let _ = deliver_noting(
+                &mut backend,
+                &dir,
+                &agent::PrefixRules::default(),
+                mode,
+                &mut BTreeSet::new(),
+                &mut HumanApprovals::default(),
+            );
+        }
+        assert!(provider.decisions().is_empty(), "{:?}", provider.decisions());
+        backend.shutdown();
+    }
+
+    /// Ingestion keeps folding while a batch is answered. If answering the first request is when
+    /// the CLI reports it fell back to `default`, the second request of the same batch is judged by
+    /// Eitri's own policy (a `Read` is allowed, not deferred): a deferral to a CLI that is no
+    /// longer in auto mode would be decided by its `default` mode instead of the classifier the
+    /// session was promised.
+    #[test]
+    fn a_fallback_to_default_folded_mid_batch_stops_deferring_the_next_request() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        provider.queue_all(vec![
+            cli_reports("auto"),
+            gate(
+                "perm-1",
+                "tu-1",
+                "Bash",
+                serde_json::json!({ "command": "cargo build" }),
+            ),
+            gate("perm-2", "tu-2", "Read", serde_json::json!({ "file_path": "main.rs" })),
+            gate(
+                "perm-3",
+                "tu-3",
+                "Bash",
+                serde_json::json!({ "command": "cargo build" }),
+            ),
+        ]);
+        provider.fold_after_next_resolution(vec![cli_reports("default")]);
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert_eq!(
+            provider.decisions(),
+            vec![
+                ("perm-1".to_string(), PermissionDecision::Defer),
+                ("perm-2".to_string(), PermissionDecision::Allow),
+            ],
+            "the first was deferred while the CLI ran auto; after the fallback the classifier answers"
+        );
+        assert!(carded(&delivered, "perm-3"), "{delivered:?}");
+        backend.shutdown();
+    }
+
+    /// The same, for a trip folded mid-batch: nothing after it is answered, deferrals included, and
+    /// the rest of the batch is cards.
+    #[test]
+    fn a_trip_folded_mid_batch_stops_answering_the_next_request() {
+        let dir = a_workspace_holding_one_file();
+        for mode in [PermissionMode::Auto, PermissionMode::Bypass] {
+            let (provider, mut backend) = auto_backend(&dir);
+            provider.queue_all(vec![
+                cli_reports("auto"),
+                gate(
+                    "perm-1",
+                    "tu-1",
+                    "Bash",
+                    serde_json::json!({ "command": "cargo build" }),
+                ),
+                gate("perm-2", "tu-2", "Read", serde_json::json!({ "file_path": "main.rs" })),
+            ]);
+            provider.fold_after_next_resolution(vec![AgentDomainEvent::UngatedCliMode {
+                reported: "acceptEdits".into(),
+                detail: "SessionReady".into(),
+            }]);
+            let (delivered, _) = deliver_noting(
+                &mut backend,
+                &dir,
+                &agent::PrefixRules::default(),
+                mode,
+                &mut BTreeSet::new(),
+                &mut HumanApprovals::default(),
+            );
+            let expected = if mode == PermissionMode::Auto {
+                PermissionDecision::Defer
+            } else {
+                PermissionDecision::Allow
+            };
+            assert_eq!(provider.decisions(), vec![("perm-1".to_string(), expected)], "{mode:?}");
+            assert!(carded(&delivered, "perm-2"), "{mode:?}: {delivered:?}");
+            backend.shutdown();
+        }
     }
 }

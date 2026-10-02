@@ -130,7 +130,10 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::SessionClosed { .. }
         | AgentDomainEvent::ResumeOutcome { .. }
         | AgentDomainEvent::PermissionModeChanged { .. }
-        | AgentDomainEvent::UngatedCliMode { .. } => false,
+        | AgentDomainEvent::UngatedCliMode { .. }
+        | AgentDomainEvent::CliPermissionMode { .. } => false,
+        // The CLI refused a call: the row's note says why, and the user may want to act on it.
+        AgentDomainEvent::PermissionDenied { .. } => false,
     }
 }
 

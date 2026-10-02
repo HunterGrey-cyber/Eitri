@@ -150,7 +150,18 @@ impl SpawnedSidecar {
 /// `PermissionRequested.origin` and the four `provider_*` fields (tags 5-9), `PermissionOrigin`,
 /// `MatchedAskRule`, and capability `provider_permission_prompts` (the handshake list grows by one,
 /// ahead of `executable_host_cli`). `ResolvePermissionRequest` is unchanged.
-pub const EXPECTED_VERDANDI_REVISION: &str = "22400e8";
+///
+/// Bumped 2026-10-02 from b3aa188 to 8f1d2f9 (protocol 3.14, the merge that runs the CLI's own
+/// auto mode under the gate). Proto diff +214/−10, additive only; the ten removed lines are all
+/// comments, reworded. New: `ClaudeHostPolicy.cli_permission_mode` (tag 11, `CliPermissionMode`),
+/// `ResolvePermissionRequest.defer` (tag 6), `PermissionOutcome.DEFERRED`, the `PermissionDenied`
+/// event (`SessionEvent` arm 23), and fields this client does not send or read
+/// (`await_account_identity`, `ToolAllowList.init_check`, the handshake's `egress_probe` and
+/// `structured_output_tools`, `SessionReady.effective_*`). Capabilities `cli_auto_mode`,
+/// `permission_defer` and `permission_denied_events` are new. `agent/Cargo.toml` names the full
+/// commit; this stays the 7-character prefix, because the per-user sidecar directory and the
+/// release checks are keyed by exactly that.
+pub const EXPECTED_VERDANDI_REVISION: &str = "8e0f7e1";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.

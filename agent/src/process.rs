@@ -197,26 +197,60 @@ pub enum PermissionMode {
 /// rule matching the call, which this tripwire does not see -- `spawn_hook_listener`'s doc), under a
 /// less restrictive mode the tool runs. So the report is checked wherever the CLI makes one, and
 /// anything not known to be at least as strict as `default` stops the session.
+///
+/// **A session that asked for the CLI's own auto mode** ([`RequestedCliMode::Auto`], a sidecar
+/// offering `cli_auto_mode` and `permission_defer`) is judged against what it asked for instead:
+/// `auto` is expected, `default` is the CLI's documented fallback when auto is unavailable to it,
+/// and everything else -- stricter modes and an empty report included, since a sidecar that offers
+/// auto always reports the mode -- stops the session. A session that did not ask for auto is
+/// judged as before, so `auto` there still stops it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliModeReport {
     /// `default`: what Eitri asked for.
     Default,
+    /// `auto` on a session that asked for it: the PreToolUse gate still sees every call, and a call
+    /// it defers is decided by the CLI's classifier, which only Eitri's own deferral reaches.
+    Auto,
+    /// `default` on a session that asked for `auto`: the CLI could not run auto (an unsupported
+    /// model or account, or Anthropic turned it off). Gated as any `default` session is; noted once,
+    /// the session continues, and Eitri answers its requests with its own policy, deferring none.
+    AutoUnavailable,
     /// `plan` or `dontAsk`: stricter than `default` -- a non-answer still denies. Noted once, the
     /// session continues.
     Stricter,
     /// Empty: a producer older than the field. Neither a downgrade nor an all-clear; noted once.
     Unreported,
-    /// Anything else -- `bypassPermissions`, `acceptEdits`, `auto`, or a value this build does not
-    /// know. The session is closed (D12): an unknown value resolves toward stopping.
+    /// Anything else -- `bypassPermissions`, `acceptEdits`, `auto` on a session that did not ask for
+    /// it, or a value this build does not know. The session is closed (D12): an unknown value
+    /// resolves toward stopping.
     Ungated,
 }
 
-/// Classifies one CLI-reported permission mode. See [`CliModeReport`].
+/// The permission mode a session asked the CLI to run in under the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestedCliMode {
+    /// `default`: every legacy session, and every sidecar session that cannot defer to auto.
+    #[default]
+    Default,
+    /// The CLI's own `auto` (Verdandi `CLI_PERMISSION_MODE_AUTO`).
+    Auto,
+}
+
+/// Classifies one CLI-reported permission mode on a session that asked for `default`. See
+/// [`CliModeReport`].
 pub fn classify_cli_mode(reported: &str) -> CliModeReport {
-    match reported {
-        "default" => CliModeReport::Default,
-        "plan" | "dontAsk" => CliModeReport::Stricter,
-        "" => CliModeReport::Unreported,
+    classify_reported_cli_mode(reported, RequestedCliMode::Default)
+}
+
+/// Classifies one CLI-reported permission mode against what the session asked for. See
+/// [`CliModeReport`].
+pub fn classify_reported_cli_mode(reported: &str, requested: RequestedCliMode) -> CliModeReport {
+    match (requested, reported) {
+        (RequestedCliMode::Default, "default") => CliModeReport::Default,
+        (RequestedCliMode::Default, "plan" | "dontAsk") => CliModeReport::Stricter,
+        (RequestedCliMode::Default, "") => CliModeReport::Unreported,
+        (RequestedCliMode::Auto, "auto") => CliModeReport::Auto,
+        (RequestedCliMode::Auto, "default") => CliModeReport::AutoUnavailable,
         _ => CliModeReport::Ungated,
     }
 }
@@ -402,7 +436,9 @@ fn spawn_hook_listener(
                     eprintln!("{line}");
                 }
             }
-            CliModeReport::Ungated => {
+            // The two auto readings only come from a session that asked for auto, which a legacy
+            // session never does; were one to appear here it is treated as the trip it would be.
+            CliModeReport::Ungated | CliModeReport::Auto | CliModeReport::AutoUnavailable => {
                 write_fail_closed_deny(
                     &stream,
                     &format!(
@@ -1165,6 +1201,44 @@ mod deny_list_tests {
         assert_eq!(classify_cli_mode(""), CliModeReport::Unreported);
         for ungated in ["bypassPermissions", "acceptEdits", "auto", "Default", "weird"] {
             assert_eq!(classify_cli_mode(ungated), CliModeReport::Ungated, "{ungated:?}");
+        }
+    }
+
+    /// D12 for a session that asked for the CLI's own auto mode: `auto` is what it asked for and
+    /// `default` is the CLI's fallback, both accepted; everything else stops it -- the modes a
+    /// `default` session tolerates (`plan`, `dontAsk`, an empty report) included. And asking for auto
+    /// is the only thing that makes `auto` acceptable: `classify_cli_mode`, the `default` request,
+    /// still trips on it (the test above).
+    #[test]
+    fn a_session_that_asked_for_auto_accepts_only_auto_or_the_default_fallback() {
+        let auto = RequestedCliMode::Auto;
+        assert_eq!(classify_reported_cli_mode("auto", auto), CliModeReport::Auto);
+        assert_eq!(
+            classify_reported_cli_mode("default", auto),
+            CliModeReport::AutoUnavailable
+        );
+        for tripping in [
+            "bypassPermissions",
+            "acceptEdits",
+            "plan",
+            "dontAsk",
+            "",
+            "Auto",
+            "auto ",
+            "weird",
+        ] {
+            assert_eq!(
+                classify_reported_cli_mode(tripping, auto),
+                CliModeReport::Ungated,
+                "{tripping:?}"
+            );
+        }
+        for reported in ["default", "plan", "dontAsk", "", "auto", "bypassPermissions"] {
+            assert_eq!(
+                classify_reported_cli_mode(reported, RequestedCliMode::Default),
+                classify_cli_mode(reported),
+                "{reported:?}: the default request is classify_cli_mode exactly"
+            );
         }
     }
 

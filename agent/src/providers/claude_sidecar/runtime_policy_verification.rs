@@ -241,6 +241,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         None,
         false,
         control.provider_prompts,
+        requested_cli_mode(&control.capabilities),
     );
     request.policy.as_mut().unwrap().setting_sources = None;
     let session_id = control.open_session(request).expect("control session");
@@ -322,6 +323,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         false,
         opted_out.provider_prompts,
         false,
+        requested_cli_mode(&opted_out.capabilities),
     );
     let session_id = opted_out.open_session(request).expect("opt-out session");
     opted_out

@@ -1,6 +1,6 @@
 import { memo } from "react";
 import type { ReactNode } from "react";
-import type { ToolCallRecord } from "./types";
+import type { ToolCallDenial, ToolCallRecord } from "./types";
 import { editPreview } from "./diff";
 import { EditDiff } from "./components/EditDiff";
 import { useProjectRelative } from "./projectPath";
@@ -434,6 +434,14 @@ const ToolResultPreview = memo(function ToolResultPreview({ result }: { result: 
   );
 });
 
+/** The row note for a call the CLI refused: "blocked by auto: [Git Destructive]", with the kind of
+ *  refusal appended when it was not the classifier's ("… (rule)"). */
+export function deniedNoteText(denied: ToolCallDenial): string {
+  const reason = denied.reason === null || denied.reason.trim() === "" ? "" : `: ${denied.reason}`;
+  const kind = denied.reasonType === null || denied.reasonType === "" || denied.reasonType === "classifier" ? "" : ` (${denied.reasonType})`;
+  return `blocked by auto${reason}${kind}`;
+}
+
 /** `showResult` folded by default, per spec §3.2. A parameter rather than a second exported
  *  renderer: `ToolResult` owns the head/tail truncation and nothing else should grow a copy.
  *
@@ -511,6 +519,10 @@ export function renderToolCall(
   // ever fires for these three tools, `agent::permission_policy`'s module doc), so this and
   // `ruleNote` are never both non-null for the same call.
   const autoNote = call.allowedByAuto === true ? <div className="tool-rule-note">allowed by auto</div> : null;
+  // The CLI refused this call on its own -- its auto-mode classifier, most often -- and the model was
+  // told so in the call's error result. Muted like the notes above; the CLI's reason verbatim, and
+  // the kind of refusal only when it was not the classifier's (a settings deny rule, the mode).
+  const deniedNote = call.denied === undefined ? null : <div className="tool-rule-note tool-denied-note">{deniedNoteText(call.denied)}</div>;
   const shown = call.result === null || showResult || opts.detailed === true;
   return (
     <div className="tool-call" data-tool-name={call.name} data-folded={shown ? undefined : "true"}>
@@ -518,6 +530,7 @@ export function renderToolCall(
       {ruleNote}
       {autoNote}
       {promptNote}
+      {deniedNote}
       {shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
       {!shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
         <ToolResultPreview result={call.result} />

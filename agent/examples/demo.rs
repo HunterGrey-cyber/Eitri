@@ -104,6 +104,13 @@ fn print_event(event: &AgentDomainEvent) {
         AgentDomainEvent::PermissionResolved { permission_id, outcome } => {
             println!("[permission resolved] id={permission_id} outcome={outcome:?}");
         }
+        AgentDomainEvent::CliPermissionMode { reported } => println!("[cli permission mode] {reported}"),
+        AgentDomainEvent::PermissionDenied {
+            tool_name,
+            reason_type,
+            reason,
+            ..
+        } => println!("[blocked by the CLI] tool={tool_name} kind={reason_type:?} reason={reason:?}"),
         AgentDomainEvent::TurnCompleted {
             result_text,
             outcome,

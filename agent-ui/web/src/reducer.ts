@@ -26,8 +26,13 @@ export function initialState(): AgentUiState {
     assistantMessageOpen: false,
     nextSeq: 0,
     turnThinking: false,
+    denialsBeforeTheirCall: [],
   };
 }
+
+/** How many refusals that arrived ahead of their call a state holds at once; the same cap as
+ * Rust's `MAX_HELD_DENIALS`, so a refusal naming a call that never comes cannot pile up. */
+export const MAX_HELD_DENIALS = 64;
 
 /** `r` on an ended session (or any other in-panel "start over"): drops back to the start screen.
  *
@@ -154,8 +159,18 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         result: null,
         turnId: event.turn_id,
       };
+      // A refusal that arrived before this call is attached now, as Rust's projection does.
+      const held = state.denialsBeforeTheirCall.find((d) => d.toolUseId === event.tool_use_id);
+      if (held !== undefined) record.denied = held.denied;
       // A tool call only happens between assistant messages, so the streaming text ended here.
-      return { ...state, toolCalls: [...state.toolCalls, record], assistantMessageOpen: false };
+      return {
+        ...state,
+        toolCalls: [...state.toolCalls, record],
+        assistantMessageOpen: false,
+        ...(held === undefined
+          ? {}
+          : { denialsBeforeTheirCall: state.denialsBeforeTheirCall.filter((d) => d.toolUseId !== event.tool_use_id) }),
+      };
     }
     case "tool_call_completed":
       return {
@@ -205,7 +220,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // truth, never summed or maxed -- and a turn that reported none (`null`: interrupted,
       // synthesized, a sidecar without `TurnUsage`) leaves the last one standing. Silence is not a
       // measurement, so it must neither erase a real figure nor become a zero.
-      return { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage };
+      return { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage, denialsBeforeTheirCall: [] };
     // Both endings clear activeTurnId, mirroring AgentSessionProjection exactly: no turn_completed
     // is ever coming, so leaving it set leaves App.tsx's turnInProgress true forever -- a spinner
     // on a dead session, next to a reply that may be truncated. Clearing it is not a local guess at
@@ -223,6 +238,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "unavailable", reason: describeFailedResume(event) },
         assistantMessageOpen: false,
+        denialsBeforeTheirCall: [],
       };
     }
     case "session_unavailable":
@@ -231,6 +247,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "unavailable", reason: event.reason },
         assistantMessageOpen: false,
+        denialsBeforeTheirCall: [],
       };
     case "session_closed":
       return {
@@ -238,7 +255,27 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "closed", reason: event.reason },
         assistantMessageOpen: false,
+        denialsBeforeTheirCall: [],
       };
+    case "cli_permission_mode":
+      // Rust's answer path reads it; the view draws nothing from it. `state`, so `nextSeq` keeps
+      // step with Rust's revision, which this event bumps like any other.
+      return state;
+    case "permission_denied": {
+      // On the call it refused, as `AgentSessionProjection::apply` puts it. A refusal naming no call
+      // changes nothing. One whose call this state does not hold yet is kept by its id and attached
+      // when the call starts (see `tool_call_started`), dropped when the turn or session ends, and
+      // capped, oldest first, exactly as Rust's projection does -- without it the row would lack its
+      // "blocked by auto" note until a snapshot.
+      const id = event.tool_use_id;
+      if (id === null || id === "") return state;
+      const denied = { reasonType: event.reason_type, reason: event.reason };
+      if (state.toolCalls.some((call) => call.toolUseId === id)) {
+        return { ...state, toolCalls: state.toolCalls.map((call) => (call.toolUseId === id ? { ...call, denied } : call)) };
+      }
+      const held = [...state.denialsBeforeTheirCall.filter((d) => d.toolUseId !== id), { toolUseId: id, denied }];
+      return { ...state, denialsBeforeTheirCall: held.slice(-MAX_HELD_DENIALS) };
+    }
     case "permission_mode_changed":
       // The mode lives on the tab (`tabs` envelope), not the projection: `TabInfo.mode` is what the
       // band and the box read, and Rust's own `tabs` envelope already reflects an acknowledged
@@ -340,6 +377,7 @@ export function keepAfterSidecarStop(state: AgentUiState, reason: string): Agent
     pendingPermissions: [],
     assistantMessageOpen: false,
     turnThinking: false,
+    denialsBeforeTheirCall: [],
   };
 }
 
@@ -354,9 +392,10 @@ export function keepAfterSidecarStop(state: AgentUiState, reason: string): Agent
  * `UiDelivery::Resync`, the two paths that throw this state away and rebuild it from here.
  */
 export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, throughRevision: number): AgentUiState {
-  // The snapshot carries neither `nextSeq` nor `turnThinking` -- both are reducer-internal on both
+  // The snapshot carries neither `nextSeq` nor `turnThinking` (nor `denialsBeforeTheirCall`, which
+  // Rust keeps in a field of its own that is not serialized) -- all reducer-internal on both
   // sides and deliberately not on the wire, which is why the parameter is typed `AgentUiSnapshot`
-  // (the `Omit` of exactly those two) rather than a full `AgentUiState` that would claim Rust sent
+  // (the `Omit` of exactly those) rather than a full `AgentUiState` that would claim Rust sent
   // them. Supplying them here is the only reason this function exists.
   //
   // `assistantMessageOpen` is NOT forced here (sw-panel-render-2, 2026-09-27): it comes from the
@@ -377,7 +416,7 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
   // reported nothing must not keep the figure of the one shown before it. `?? null` is the runtime
   // defence for a payload without the key (Rust always sends it, `null` included): `usageSegment`
   // reads `null` as unknown and would throw on `undefined`.
-  return { ...snapshot, usage: snapshot.usage ?? null, nextSeq: throughRevision, turnThinking: false };
+  return { ...snapshot, usage: snapshot.usage ?? null, nextSeq: throughRevision, turnThinking: false, denialsBeforeTheirCall: [] };
 }
 
 /** Whether a `resume_outcome` confirms the session that was actually asked for -- the same

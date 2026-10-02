@@ -136,12 +136,20 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "set_permission_mode",
         "text_delta_message_id",
         "provider_permission_prompts",
+        "init_check",
+        "await_account_identity",
+        "egress_probe",
+        "structured_output_tools",
+        "effective_tool_report",
+        "cli_auto_mode",
+        "permission_defer",
+        "permission_denied_events",
         "executable_host_cli",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
-    // Order and length included for the b3aa188 list, not just set membership: the fixture is
+    // Order and length included for the 8f1d2f9 list, not just set membership: the fixture is
     // transcribed from the sidecar's own literal, and this is what keeps the transcription honest.
     //
     // Two permitted differences, each transcribed from Verdandi's own handshake handler at its one
@@ -181,7 +189,7 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "the real sidecar's permission modes have moved; update real_handshake_today()"
     );
     assert_eq!(
-        info.sidecar_version, "0.1.0",
+        info.sidecar_version, "0.2.0",
         "SIDECAR_VERSION moved; update real_handshake_today()"
     );
     assert_eq!(

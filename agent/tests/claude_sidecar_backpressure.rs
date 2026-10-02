@@ -85,6 +85,8 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             // exhaustiveness.
             AgentDomainEvent::PermissionModeChanged { .. } => "PermissionModeChanged",
             AgentDomainEvent::UngatedCliMode { .. } => "UngatedCliMode",
+            AgentDomainEvent::CliPermissionMode { .. } => "CliPermissionMode",
+            AgentDomainEvent::PermissionDenied { .. } => "PermissionDenied",
         };
         *counts.entry(kind).or_default() += 1;
     }

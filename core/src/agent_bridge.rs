@@ -1055,6 +1055,12 @@ pub fn serialize_snapshot_with_notes_for_js(
             if let Some(note) = notes.prompt_notes.get(&call.tool_use_id) {
                 entry["promptNote"] = json!(note);
             }
+            // The CLI's own refusal of this call, from the projection itself (not a note: it is the
+            // provider's fact, not this host's bookkeeping). Absent on every call nobody refused,
+            // as in the events payload's `permission_denied`.
+            if let Some(denied) = &call.denied {
+                entry["denied"] = json!({ "reasonType": denied.reason_type, "reason": denied.reason });
+            }
             entry
         })
         .collect();
@@ -2111,6 +2117,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: Some(&provider),
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2179,6 +2186,7 @@ mod tests {
                     interrupt: true,
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
+                    cli_auto_mode: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
@@ -2267,6 +2275,7 @@ mod tests {
             interrupt: true,
             bypass_permission_mode: true,
             interactive_permission_mode: true,
+            cli_auto_mode: false,
         };
         let mut projection = AgentSessionProjection::default();
         projection.apply(&AgentDomainEvent::SessionOpened {
@@ -2349,6 +2358,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2359,6 +2369,45 @@ mod tests {
         assert_eq!(pending["permissionId"], "perm-1");
         assert_eq!(pending["toolUseId"], "toolu_01ABC");
         assert_eq!(pending["toolName"], "Bash");
+    }
+
+    /// The CLI's own refusal of a call reaches a rebuilt panel too: `denied` on that call's entry,
+    /// camelCase like the rest of the snapshot, the CLI's words verbatim -- and no such key on a call
+    /// nobody refused, so a snapshot without refusals reads as it did before the field existed.
+    #[test]
+    fn a_snapshot_carries_the_clis_refusal_on_the_call_it_refused() {
+        let mut projection = AgentSessionProjection::default();
+        for id in ["toolu_ok", "toolu_push"] {
+            projection.apply(&AgentDomainEvent::ToolCallStarted {
+                turn_id: "t".into(),
+                tool_use_id: id.into(),
+                name: "Bash".into(),
+                input: json!({ "command": "git push --force origin main" }),
+            });
+        }
+        projection.apply(&AgentDomainEvent::PermissionDenied {
+            tool_use_id: Some("toolu_push".into()),
+            tool_name: "Bash".into(),
+            reason_type: Some("classifier".into()),
+            reason: Some("[Git Destructive]".into()),
+        });
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities::default(),
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+        let calls = &parsed["state"]["toolCalls"];
+        assert!(calls[0].get("denied").is_none(), "{calls}");
+        assert_eq!(
+            calls[1]["denied"],
+            json!({ "reasonType": "classifier", "reason": "[Git Destructive]" })
+        );
     }
 
     /// O3: a reload or a tab switch rebuilds the panel from this snapshot, so the CLI's own prompt
@@ -2445,6 +2494,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2489,6 +2539,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2526,6 +2577,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2568,6 +2620,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2631,6 +2684,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2723,6 +2777,7 @@ mod tests {
                     interrupt: true,
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
+                    cli_auto_mode: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2774,6 +2829,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2892,6 +2948,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2960,6 +3017,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),

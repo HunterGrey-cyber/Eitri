@@ -22,6 +22,17 @@ pub struct RecordingProvider {
     interrupt_capable: bool,
     /// Every `close_session` that reached the provider: what a backend's shutdown does.
     closes: AtomicUsize,
+    /// Advertises `cli_auto_mode`: its sessions run the CLI's own auto mode, and it accepts a
+    /// deferral -- which, like the real provider, it refuses without this.
+    cli_auto: bool,
+    /// Every answer that reached the provider, with the decision itself (`resolved` keeps only
+    /// whether it allowed, which cannot tell a deferral from a denial).
+    decisions: std::sync::Mutex<Vec<(String, agent::PermissionDecision)>>,
+    /// Events to queue as the next accepted resolution is recorded, and to wait out until
+    /// ingestion has folded them: what background ingestion does while a batch is being answered.
+    after_resolution: std::sync::Mutex<Option<Vec<AgentDomainEvent>>>,
+    /// How many times ingestion has asked this provider for events.
+    pumps: AtomicUsize,
 }
 
 impl RecordingProvider {
@@ -55,6 +66,25 @@ impl RecordingProvider {
             ..Default::default()
         }
     }
+    /// A provider whose sessions run the CLI's own auto mode under the gate
+    /// (`ProviderCapabilities::cli_auto_mode`), so the host may defer to it.
+    pub fn cli_auto() -> Self {
+        RecordingProvider {
+            cli_auto: true,
+            ..Default::default()
+        }
+    }
+    /// Arms one-shot: when the next resolution is accepted, `events` are queued and the call
+    /// returns only once ingestion has folded them into the projection, so whoever answers next
+    /// reads the changed projection. Without it a test cannot make a fold land between two answers
+    /// of one batch deterministically.
+    pub fn fold_after_next_resolution(&self, events: Vec<AgentDomainEvent>) {
+        *self.after_resolution.lock().unwrap() = Some(events);
+    }
+    /// Every answer that reached the provider, in order, with its decision.
+    pub fn decisions(&self) -> Vec<(String, agent::PermissionDecision)> {
+        self.decisions.lock().unwrap().clone()
+    }
     /// How many times the session was closed -- non-zero once its backend was shut down.
     pub fn closes(&self) -> usize {
         self.closes.load(Ordering::SeqCst)
@@ -79,6 +109,7 @@ impl agent::AgentProvider for RecordingProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             interrupt: self.interrupt_capable,
+            cli_auto_mode: self.cli_auto,
             ..ProviderCapabilities::default()
         }
     }
@@ -112,10 +143,27 @@ impl agent::AgentProvider for RecordingProvider {
                 message: "resolutions refused by the test".into(),
             });
         }
+        if request.decision.defers() && !self.cli_auto {
+            return Err(agent::ProviderError::UnsupportedCapability("permission_defer"));
+        }
+        self.decisions
+            .lock()
+            .unwrap()
+            .push((request.permission_id.clone(), request.decision.clone()));
         self.resolved
             .lock()
             .unwrap()
             .push((request.permission_id, request.decision.allows()));
+        if let Some(events) = self.after_resolution.lock().unwrap().take() {
+            self.queue_all(events);
+            // The ingestion thread folds what a `pump` returned before it calls `pump` again, so
+            // two further calls mean the queued events have been taken and folded.
+            let until = self.pumps.load(Ordering::SeqCst) + 2;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.pumps.load(Ordering::SeqCst) < until && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         Ok(())
     }
     fn close_session(&self, _request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
@@ -123,6 +171,7 @@ impl agent::AgentProvider for RecordingProvider {
         Ok(())
     }
     fn pump(&self) -> Vec<AgentDomainEvent> {
+        self.pumps.fetch_add(1, Ordering::SeqCst);
         std::mem::take(&mut *self.queued.lock().unwrap())
     }
 }

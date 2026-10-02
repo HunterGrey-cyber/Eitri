@@ -404,6 +404,7 @@ mod tests {
             name: "Read".into(),
             input: serde_json::json!({"file_path": "/p/a.rs"}),
             result: None,
+            denied: None,
         }
     }
 

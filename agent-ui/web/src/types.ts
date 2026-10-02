@@ -46,7 +46,12 @@ export type ToolCallRecord = {
    *  rule-answered one (`allowedByRule`) included -- the two are mutually exclusive, since no rule
    *  ever fires for these three tools at all. */
   allowedByAuto?: boolean;
+  /** The CLI itself refused this call (Rust's `ToolCallDenial`, from a `permission_denied` event):
+   *  its auto-mode classifier most often, whose `reasonType` is `"classifier"`. Both strings are the
+   *  CLI's own, shown and never parsed; either may be `null`. Absent on every call nobody refused. */
+  denied?: ToolCallDenial;
 };
+export type ToolCallDenial = { reasonType: string | null; reason: string | null };
 /** `toolUseId` is the link back to the `ToolCallRecord` this request gates -- the same id that
  * call is keyed on.
  *
@@ -297,6 +302,11 @@ export type AgentUiState = {
    * rather than by a maintained list of event types that ought to clear it. Nothing may set it to
    * `true` anywhere but that one arm. */
   turnThinking: boolean;
+  /** Reducer-internal, never on the wire (Rust's `denials_before_their_call`): refusals by the CLI
+   * whose tool call has not been folded yet, oldest first, attached when its `tool_call_started`
+   * arrives. Emptied when the turn or the session ends, and capped at `MAX_HELD_DENIALS`. A snapshot
+   * resets it: Rust does not serialize its own held refusals, so there is nothing to seed it from. */
+  denialsBeforeTheirCall: ReadonlyArray<{ toolUseId: string; denied: ToolCallDenial }>;
 };
 
 /** A snapshot as it ACTUALLY arrives from Rust, which is not an `AgentUiState`.
@@ -313,7 +323,7 @@ export type AgentUiState = {
  * it used to be, on the theory that it was reducer-internal like the other two, but Rust's own
  * projection carries the same bit and disagreeing about it split a mid-stream reply across a
  * snapshot -- see that field's own doc comment on `AgentUiState`. */
-export type AgentUiSnapshot = Omit<AgentUiState, "nextSeq" | "turnThinking">;
+export type AgentUiSnapshot = Omit<AgentUiState, "nextSeq" | "turnThinking" | "denialsBeforeTheirCall">;
 
 /** How long a turn has been running, tracked in `App.tsx` alongside `AgentUiState` rather than
  * inside it: it is a UI-local clock, not part of the projection Rust serializes, and it does not
@@ -415,7 +425,7 @@ export type AgentDomainEvent =
       /** O3: the CLI's own prompt; omitted by Rust on the gate's own request. */
       provider_prompt?: WireProviderPrompt;
     }
-  | { type: "permission_resolved"; permission_id: string; outcome: "allowed" | "denied" | "cancelled_by_interrupt" | "cancelled_by_session_close" | "provider_failed" | "expired" }
+  | { type: "permission_resolved"; permission_id: string; outcome: "allowed" | "denied" | "cancelled_by_interrupt" | "cancelled_by_session_close" | "provider_failed" | "expired" | "deferred" }
   | { type: "turn_completed"; turn_id: string; outcome: TurnOutcome; result_text: string; stop_reason: string | null; usage: UsageInfo | null }
   /** The provider's verdict on a resume, stated once for a session that asked for one. Mirrors the
    *  Rust `AgentDomainEvent::ResumeOutcome`; the reducer must fold it the same way
@@ -437,7 +447,19 @@ export type AgentDomainEvent =
    *  the session (a deny list) despite `unrestricted: true` -- logged loudly, never silently. **The reducer ignores
    *  this event on purpose**: the mode a tab is in lives on the `tabs` envelope (`TabInfo.mode`), not
    *  on this per-session projection, so folding it here would just be a second, driftable copy. */
-  | { type: "permission_mode_changed"; mode: PermissionModeChoice; provider_mode: string; floor_applied: boolean };
+  | { type: "permission_mode_changed"; mode: PermissionModeChoice; provider_mode: string; floor_applied: boolean }
+  /** What the CLI says its permission mode is, on a session that asked for its own auto mode
+   *  (`AgentDomainEvent::CliPermissionMode`): read by Rust's answer path, nothing for the view. */
+  | { type: "cli_permission_mode"; reported: string }
+  /** The CLI refused a tool call on its own, before asking anyone (`AgentDomainEvent::PermissionDenied`).
+   *  Lands on that call's row as `ToolCallRecord.denied`. */
+  | {
+      type: "permission_denied";
+      tool_use_id: string | null;
+      tool_name: string;
+      reason_type: string | null;
+      reason: string | null;
+    };
 
 /** A session tab's identity for its whole life, and the bridge's (`eitri_core::tabs::TabId`). */
 export type TabId = number;

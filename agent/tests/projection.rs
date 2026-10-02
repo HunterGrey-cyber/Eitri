@@ -1056,6 +1056,15 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             reported: "acceptEdits".into(),
             detail: "SessionReady".into(),
         },
+        AgentDomainEvent::CliPermissionMode {
+            reported: "auto".into(),
+        },
+        AgentDomainEvent::PermissionDenied {
+            tool_use_id: Some("tu-1".into()),
+            tool_name: "Bash".into(),
+            reason_type: Some("classifier".into()),
+            reason: Some("[Git Destructive]".into()),
+        },
     ]
 }
 
@@ -1087,5 +1096,7 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::SessionClosed { .. } => "SessionClosed",
         AgentDomainEvent::PermissionModeChanged { .. } => "PermissionModeChanged",
         AgentDomainEvent::UngatedCliMode { .. } => "UngatedCliMode",
+        AgentDomainEvent::CliPermissionMode { .. } => "CliPermissionMode",
+        AgentDomainEvent::PermissionDenied { .. } => "PermissionDenied",
     }
 }

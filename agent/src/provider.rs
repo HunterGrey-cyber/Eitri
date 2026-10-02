@@ -83,19 +83,33 @@ pub enum PermissionDecision {
     /// than interrupting -- it is optional because the wire's own field is, not because it is
     /// unimportant.
     Deny { reason: Option<String> },
+    /// Make no decision: the CLI's own permission handling decides the call. Only meaningful on a
+    /// session whose CLI runs its own auto mode under the gate
+    /// (`ProviderCapabilities::cli_auto_mode`), where that handling is the CLI's classifier; Verdandi
+    /// carries it as `ResolvePermissionRequest.defer` (capability `permission_defer`). Never a
+    /// human's answer: no card offers it. A backend that cannot carry it refuses it rather than
+    /// sending something else in its place, and the legacy backend's hook relay cannot.
+    Defer,
 }
 
 impl PermissionDecision {
+    /// True only for `Allow`. A deferral is not an approval: whether the call runs is the CLI's
+    /// decision, not this host's.
     pub fn allows(&self) -> bool {
         matches!(self, PermissionDecision::Allow)
     }
 
-    /// The text the model is shown. Never `Some` for an approval: there is nowhere for it to go.
+    /// The text the model is shown. Never `Some` for an approval or a deferral: there is nowhere
+    /// for it to go.
     pub fn reason(&self) -> Option<&str> {
         match self {
-            PermissionDecision::Allow => None,
+            PermissionDecision::Allow | PermissionDecision::Defer => None,
             PermissionDecision::Deny { reason } => reason.as_deref(),
         }
+    }
+
+    pub fn defers(&self) -> bool {
+        matches!(self, PermissionDecision::Defer)
     }
 }
 
@@ -145,6 +159,16 @@ pub struct ProviderCapabilities {
     /// at session creation (`ClaudeSidecarProvider::require_interactive`), loudly -- never mapped
     /// onto whatever the provider does offer.
     pub interactive_permission_mode: bool,
+    /// Every session this provider creates asks the CLI to run its own `auto` mode under the gate
+    /// (Verdandi `ClaudeHostPolicy.cli_permission_mode = AUTO`), and a gate request on it may be
+    /// answered `PermissionDecision::Defer`, which leaves the call to the CLI's classifier.
+    ///
+    /// True only when the handshake advertised both `cli_auto_mode` and `permission_defer`: asking
+    /// for auto without being able to defer would leave the classifier nothing to decide, and
+    /// deferring without auto would hand the call to the CLI's ordinary ask. Without both the
+    /// request is exactly what it was before either existed. The gate is installed either way; this
+    /// changes only what a deferred call meets. False on the legacy backend.
+    pub cli_auto_mode: bool,
 }
 
 /// Descriptive, non-branching facts about the connected provider: versions to show a human, the

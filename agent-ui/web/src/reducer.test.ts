@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyCallNotes, applyEvent, applySnapshot, keepAfterSidecarStop, initialState, resetToStartScreen } from "./reducer";
+import { applyCallNotes, applyEvent, applySnapshot, keepAfterSidecarStop, initialState, MAX_HELD_DENIALS, resetToStartScreen } from "./reducer";
 import type { AgentDomainEvent, AgentUiSnapshot, TurnOutcome, UsageInfo } from "./types";
 
 describe("applyEvent", () => {
@@ -784,6 +784,105 @@ describe("resetToStartScreen", () => {
     expect(reset.transcript).toEqual([]);
     expect(reset.status).toEqual({ kind: "starting" });
     expect(reset.sessionId).toBeNull();
+  });
+});
+
+describe("the CLI's own auto mode", () => {
+  const started: AgentDomainEvent = {
+    type: "tool_call_started",
+    turn_id: "t",
+    tool_use_id: "toolu_push",
+    name: "Bash",
+    input: { command: "git push --force origin main" },
+  };
+  const other: AgentDomainEvent = { ...started, tool_use_id: "toolu_ok" } as AgentDomainEvent;
+  const denied: AgentDomainEvent = {
+    type: "permission_denied",
+    tool_use_id: "toolu_push",
+    tool_name: "Bash",
+    reason_type: "classifier",
+    reason: "[Git Destructive]",
+  };
+
+  it("puts the CLI's refusal on the call it refused, and on no other", () => {
+    let state = applyEvent(applyEvent(initialState(), other), started);
+    state = applyEvent(state, denied);
+    expect(state.toolCalls.map((c) => c.denied)).toEqual([undefined, { reasonType: "classifier", reason: "[Git Destructive]" }]);
+    expect(state.nextSeq).toBe(3);
+  });
+
+  it("changes nothing for a refusal naming no call it holds, nor for the CLI's mode report, but keeps step", () => {
+    const state = applyEvent(initialState(), started);
+    for (const event of [
+      { ...denied, tool_use_id: null },
+      { ...denied, tool_use_id: "toolu_elsewhere" },
+      { type: "cli_permission_mode", reported: "auto" },
+    ] as AgentDomainEvent[]) {
+      const next = applyEvent(state, event);
+      expect(next.toolCalls).toEqual(state.toolCalls);
+      expect(next.nextSeq).toBe(state.nextSeq + 1);
+    }
+  });
+});
+
+describe("a CLI refusal that arrives ahead of its call", () => {
+  const started = (id: string): AgentDomainEvent => ({
+    type: "tool_call_started",
+    turn_id: "t",
+    tool_use_id: id,
+    name: "Bash",
+    input: { command: "git push --force origin main" },
+  });
+  const denied = (id: string): AgentDomainEvent => ({
+    type: "permission_denied",
+    tool_use_id: id,
+    tool_name: "Bash",
+    reason_type: "classifier",
+    reason: "[Git Destructive]",
+  });
+  const note = { reasonType: "classifier", reason: "[Git Destructive]" };
+
+  it("is attached when its call starts, and held no longer", () => {
+    let state = applyEvent(initialState(), denied("toolu_late"));
+    expect(state.toolCalls).toEqual([]);
+    state = applyEvent(state, started("toolu_late"));
+    expect(state.toolCalls[0].denied).toEqual(note);
+    expect(state.denialsBeforeTheirCall).toEqual([]);
+    state = applyEvent(state, started("toolu_other"));
+    expect(state.toolCalls[1].denied).toBeUndefined();
+  });
+
+  it("still lands at once on a call the state already holds", () => {
+    let state = applyEvent(initialState(), started("toolu_a"));
+    state = applyEvent(state, denied("toolu_a"));
+    expect(state.toolCalls[0].denied).toEqual(note);
+    expect(state.denialsBeforeTheirCall).toEqual([]);
+  });
+
+  it("is dropped when the turn or the session ends, so a later call of that id is not marked", () => {
+    const ends: AgentDomainEvent[] = [
+      { type: "turn_completed", turn_id: "t", outcome: "completed", result_text: "", stop_reason: null, usage: null } as AgentDomainEvent,
+      { type: "session_closed", reason: "bye" },
+      { type: "session_unavailable", reason: "gone" },
+    ];
+    for (const end of ends) {
+      let state = applyEvent(initialState(), denied("toolu_never"));
+      expect(state.denialsBeforeTheirCall).toHaveLength(1);
+      state = applyEvent(state, end);
+      expect(state.denialsBeforeTheirCall).toEqual([]);
+      state = applyEvent(state, started("toolu_never"));
+      expect(state.toolCalls[0].denied).toBeUndefined();
+    }
+  });
+
+  it("is capped, the oldest dropped first, and a repeat for one id adds nothing", () => {
+    let state = initialState();
+    for (let n = 0; n < MAX_HELD_DENIALS + 6; n++) state = applyEvent(state, denied(`toolu_${n}`));
+    expect(state.denialsBeforeTheirCall).toHaveLength(MAX_HELD_DENIALS);
+    state = applyEvent(state, denied(`toolu_${MAX_HELD_DENIALS + 5}`));
+    expect(state.denialsBeforeTheirCall).toHaveLength(MAX_HELD_DENIALS);
+    state = applyEvent(applyEvent(applyEvent(state, started("toolu_0")), started("toolu_5")), started("toolu_6"));
+    expect(state.toolCalls.map((c) => c.denied)).toEqual([undefined, undefined, note]);
   });
 });
 

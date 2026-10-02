@@ -955,6 +955,7 @@ mod tests {
             Self {
                 capabilities: ProviderCapabilities {
                     interactive_permission_mode: true,
+                    cli_auto_mode: false,
                     resume: false,
                     fork: false,
                     interrupt: true,
@@ -1263,6 +1264,7 @@ mod tests {
                     interrupt: true,
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
+                    cli_auto_mode: false,
                 }
             }
             fn info(&self) -> ProviderInfo {
@@ -2126,6 +2128,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                cli_auto_mode: false,
             }
         }
         fn info(&self) -> ProviderInfo {

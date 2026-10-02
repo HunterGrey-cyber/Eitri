@@ -138,6 +138,15 @@ impl AgentSession {
         permission_id: &str,
         decision: PermissionDecision,
     ) -> std::io::Result<Vec<AgentDomainEvent>> {
+        // The hook relay can say allow or deny, nothing else; a deferral sent as either would be a
+        // decision nobody made. This backend never asks the CLI for its auto mode, so nothing here
+        // should ever defer -- and if something does, it is refused, and the card stays.
+        if decision.defers() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the legacy backend cannot leave a permission to the CLI: it has no deferring answer",
+            ));
+        }
         let Some(source) = self.pending_permission_sources.get(permission_id).copied() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,

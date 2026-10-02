@@ -21,12 +21,78 @@
 //!
 //! **Allowlist: exactly one entry**, matched by file and by the arm's own text, never by a line
 //! number -- see [`ALLOWED_ARM`].
+//!
+//! **The CLI's own auto mode (2026-10-02).** Since Verdandi protocol 3.14 a gated sidecar session
+//! may ask the CLI to run `auto` under the gate (`ClaudeHostPolicy.cli_permission_mode = AUTO`), so
+//! the CLI's mode is no longer the constant `default`. It is still never ungated: the gate stays
+//! installed, the session stays INTERACTIVE and unswitchable, and `bypassPermissions` stays
+//! unreachable. What this scan adds (rule 6) is that AUTO can only come from the handshake: every
+//! `ClaudeHostPolicy` literal states `cli_permission_mode` as UNSPECIFIED or as the one `match` on
+//! the requested mode, and each place that can produce the requested `Auto` -- the requested-mode
+//! constructor, the proto `Auto` constructor, a non-`false` `cli_auto_mode` capability -- is one of
+//! the [`AUTO_SITES`], by file and text. A new one fails until someone adds it there, on purpose.
+//!
+//! The requested `Auto` is searched for under every name the crate can give it: the enum's aliases
+//! (`use ... as R`, `type R = ...`, a re-export in any file), `Self::Auto` inside an `impl` of it, and
+//! the variants imported by name or by glob (refused at the import, since a bare `Auto` cannot be told
+//! from another type's). An assignment to a guarded field is any assignment operator, compound ones
+//! included, however the `.` and the operator are spaced.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The proto enum whose `Bypass` value is the sidecar's ungated policy.
 const PROTO_PERMISSION_MODE: &str = "claude_runtime_protocol::v1::PermissionMode";
+
+/// The proto enum whose `Auto` value asks the CLI for its own auto mode under the gate.
+const PROTO_CLI_PERMISSION_MODE: &str = "claude_runtime_protocol::v1::CliPermissionMode";
+
+/// Rule 6: every place that can make a session ask for the CLI's auto mode, as `(file, the text
+/// around it)`, collapsed as the scan collapses it. Each occurrence of one of the
+/// [`AUTO_NEEDLES`] must sit inside one of these, and each of these must be found exactly once: a
+/// site that moved or vanished is a stale entry, and fails like a new site does.
+///
+/// - the capability itself, true only when the handshake offered both `cli_auto_mode` and
+///   `permission_defer` (`capabilities_from_handshake`);
+/// - the one constructor of the requested `Auto`, from that capability (`requested_cli_mode`);
+/// - the one proto `Auto`, as the value of the `Auto` arm of the request's `match`
+///   (`build_create_request_loading`);
+/// - two patterns and a comparison, which construct nothing: D12's classification of what the CLI
+///   reported against what was asked for (`classify_reported_cli_mode`), and the translator's check
+///   that an auto session never reports a mode switch.
+const AUTO_SITES: &[(&str, &str)] = &[
+    (
+        "providers/claude_sidecar/mod.rs",
+        "cli_auto_mode: CLIENT_IMPLEMENTS_CLI_AUTO_MODE && has(CAP_CLI_AUTO_MODE) && has(CAP_PERMISSION_DEFER),",
+    ),
+    (
+        "providers/claude_sidecar/mod.rs",
+        "if capabilities.cli_auto_mode { crate::RequestedCliMode::Auto } else { crate::RequestedCliMode::Default }",
+    ),
+    (
+        "providers/claude_sidecar/mod.rs",
+        "cli_permission_mode: match cli_mode { crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32, \
+         crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32, },",
+    ),
+    (
+        "process.rs",
+        "(RequestedCliMode::Auto, \"auto\") => CliModeReport::Auto,",
+    ),
+    (
+        "process.rs",
+        "(RequestedCliMode::Auto, \"default\") => CliModeReport::AutoUnavailable,",
+    ),
+    (
+        "providers/claude_sidecar/translate.rs",
+        "if requested == RequestedCliMode::Auto {",
+    ),
+];
+
+/// What rule 6 looks for. `RequestedCliMode::Auto` and `cli_auto_mode:` are this crate's own names;
+/// the proto `Auto` is looked for under every name the file binds the enum to
+/// (`proto_aliases`). A `cli_auto_mode:` whose value is `false` (every other backend and test
+/// provider) or `bool` (the declaration) is not a site.
+const AUTO_NEEDLES: &[&str] = &["RequestedCliMode::Auto", "cli_auto_mode:"];
 
 /// The one place `<P>::Bypass` may appear: the `ProtoEvent::PermissionModeChanged` arm of the
 /// sidecar translator, as a match PATTERN (`<P>::Bypass =>`).
@@ -52,6 +118,8 @@ const FORBIDDEN_EXACT: &[&str] = &[
     "set_permission_mode_switchable(",
     "set_permission_mode(",
     "SetPermissionModeRequest",
+    // Rule 6: the CLI mode is stated in the one literal, never set on a policy afterwards.
+    "set_cli_permission_mode(",
 ];
 
 /// Whole words no production source may contain (rule 5). Each is a PRE-APPROVAL list: a tool on it
@@ -66,6 +134,8 @@ struct Report {
     scanned: BTreeSet<String>,
     skipped: BTreeSet<String>,
     allowlisted: usize,
+    /// How many times each [`AUTO_SITES`] entry was found, by its index.
+    auto_sites_found: BTreeMap<usize, usize>,
 }
 
 fn is_ident(ch: char) -> bool {
@@ -405,8 +475,14 @@ fn split_top_level(text: &str, sep: char) -> Vec<String> {
 /// Every name `code` can write `claude_runtime_protocol::v1::PermissionMode` as: the path itself,
 /// and whatever its `use` items bind to it or to a module above it.
 fn proto_mode_aliases(code: &str) -> Vec<String> {
-    let mut aliases = vec![PROTO_PERMISSION_MODE.to_string()];
+    proto_aliases(code, PROTO_PERMISSION_MODE)
+}
+
+/// Every `use` item in `code`, expanded to (full path, name it binds) pairs; a glob binds `*` and
+/// its path is the module it opens.
+fn use_bindings(code: &str) -> Vec<(String, String)> {
     let c: Vec<char> = code.chars().collect();
+    let mut bound = Vec::new();
     let mut i = 0;
     while i + 3 <= c.len() {
         let is_use = c[i..].starts_with(&['u', 's', 'e'])
@@ -418,24 +494,113 @@ fn proto_mode_aliases(code: &str) -> Vec<String> {
         }
         let rest: String = c[i + 3..].iter().collect();
         let Some(end) = rest.find(';') else { break };
-        let mut bound = Vec::new();
         expand_use(&rest[..end], "", &mut bound);
-        for (full, name) in bound {
-            if name == "*" {
-                if let Some(tail) = PROTO_PERMISSION_MODE.strip_prefix(&format!("{full}::")) {
-                    aliases.push(tail.to_string());
-                }
-            } else if full == PROTO_PERMISSION_MODE {
-                aliases.push(name);
-            } else if let Some(tail) = PROTO_PERMISSION_MODE.strip_prefix(&format!("{full}::")) {
-                aliases.push(format!("{name}::{tail}"));
-            }
-        }
         i += 3 + end;
+    }
+    bound
+}
+
+/// Every name `code` can write the proto path `path` as. See [`proto_mode_aliases`].
+fn proto_aliases(code: &str, path: &str) -> Vec<String> {
+    let mut aliases = vec![path.to_string()];
+    for (full, name) in use_bindings(code) {
+        if name == "*" {
+            if let Some(tail) = path.strip_prefix(&format!("{full}::")) {
+                aliases.push(tail.to_string());
+            }
+        } else if full == path {
+            aliases.push(name);
+        } else if let Some(tail) = path.strip_prefix(&format!("{full}::")) {
+            aliases.push(format!("{name}::{tail}"));
+        }
     }
     aliases.sort();
     aliases.dedup();
     aliases
+}
+
+/// The crate's own enum that says which mode a session asked the CLI for.
+const REQUESTED_MODE: &str = "RequestedCliMode";
+
+/// What one file's `use` items and `type` aliases do to [`REQUESTED_MODE`].
+#[derive(Debug, Default)]
+struct RequestedModeImports {
+    /// Names the enum is written as besides its own (`use ... as R`, `type R = ...`).
+    aliases: BTreeSet<String>,
+    /// The variants are imported as names of their own (`RequestedCliMode::*`, `{Auto}`), which no
+    /// `RequestedCliMode::Auto` needle can see.
+    variants_imported: bool,
+    /// A glob of a module that defines or re-exports the enum (`process`, `crate`, `super`, `self`):
+    /// a bare `Auto` after it is not provably some other type's.
+    opens_defining_module: bool,
+}
+
+fn last_segment(path: &str) -> &str {
+    path.rsplit("::").next().unwrap_or(path)
+}
+
+fn requested_mode_imports(code: &str) -> RequestedModeImports {
+    let mut found = RequestedModeImports::default();
+    for (full, name) in use_bindings(code) {
+        if name == "*" {
+            if last_segment(&full) == REQUESTED_MODE {
+                found.variants_imported = true;
+            } else if matches!(last_segment(&full), "process" | "crate" | "super" | "self") {
+                found.opens_defining_module = true;
+            }
+        } else if last_segment(&full) == REQUESTED_MODE {
+            if name != REQUESTED_MODE {
+                found.aliases.insert(name);
+            }
+        } else if full.ends_with(&format!("{REQUESTED_MODE}::Auto")) {
+            found.variants_imported = true;
+        }
+    }
+    // `type R = crate::RequestedCliMode;`
+    let mut rest = code;
+    while let Some(at) = rest.find("type ") {
+        let before = rest[..at].chars().next_back();
+        let tail = &rest[at + 5..];
+        if !before.is_some_and(is_ident) {
+            if let Some((name, value)) = tail.split_once('=') {
+                let value = value.split(';').next().unwrap_or("").trim();
+                let name = name.trim();
+                if !name.is_empty() && name.chars().all(is_ident) && last_segment(value) == REQUESTED_MODE {
+                    found.aliases.insert(name.to_string());
+                }
+            }
+        }
+        rest = tail;
+    }
+    found
+}
+
+/// The body spans of every `impl` block whose target is [`REQUESTED_MODE`] or one of `aliases`, so
+/// `Self::Auto` inside one is read as the enum's own variant.
+fn requested_mode_impl_bodies(code: &str, aliases: &BTreeSet<String>) -> Vec<std::ops::Range<usize>> {
+    let c: Vec<char> = code.chars().collect();
+    let byte_at: Vec<usize> = code.char_indices().map(|(b, _)| b).chain([code.len()]).collect();
+    let mut spans = Vec::new();
+    for at in whole_word_positions(code, "impl") {
+        let ci = code[..at].chars().count();
+        let mut j = ci + 4;
+        while j < c.len() && c[j] != '{' && c[j] != ';' {
+            j += 1;
+        }
+        if c.get(j) != Some(&'{') {
+            continue;
+        }
+        let header: String = c[ci + 4..j].iter().collect();
+        let header = header.split(" where ").next().unwrap_or("").trim();
+        let target = last_segment(header.rsplit(" for ").next().unwrap_or(header)).trim();
+        if target != REQUESTED_MODE && !aliases.contains(target) {
+            continue;
+        }
+        if let Some(close) = matching_close(&c, j) {
+            spans.push(byte_at[j]..byte_at[close]);
+        }
+    }
+    spans
 }
 
 /// Every position in `code` where `word` occurs with no identifier character before or after it.
@@ -484,6 +649,7 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
         let body: String = c[open + 1..close].iter().collect();
         let mut permissions = None;
         let mut switchable = None;
+        let mut cli_mode = None;
         for entry in split_top_level(&body, ',') {
             let entry = entry.trim();
             if entry.starts_with("..") {
@@ -501,6 +667,7 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
             match name.as_str() {
                 "permissions" => permissions = Some(value),
                 "permission_mode_switchable" => switchable = Some(value),
+                "cli_permission_mode" => cli_mode = Some(value),
                 _ => {}
             }
         }
@@ -520,7 +687,133 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
                 snippet(code, at)
             )),
         }
+        // Rule 6: stated, never left to a default or a `..` base, and only ever UNSPECIFIED (what a
+        // client before the field sends) or the request's one `match` on the mode it was asked for.
+        let cli_aliases = proto_aliases(code, PROTO_CLI_PERMISSION_MODE);
+        let accepted = cli_mode.as_deref().is_some_and(|value| {
+            cli_aliases.iter().any(|a| {
+                value == format!("{a}::Unspecified as i32")
+                    || value
+                        == format!(
+                            "match cli_mode {{ crate::RequestedCliMode::Auto => {a}::Auto as i32, \
+                             crate::RequestedCliMode::Default => {a}::Unspecified as i32, }}"
+                        )
+            })
+        });
+        if !accepted {
+            offenders.push(format!(
+                "{rel}: a ClaudeHostPolicy literal's `cli_permission_mode` is {cli_mode:?}, not \
+                 `<CliPermissionMode>::Unspecified as i32` or the request's `match cli_mode` (rule 6: the \
+                 CLI's auto mode only from the handshake): {}",
+                snippet(code, at)
+            ));
+        }
     }
+}
+
+/// Rule 6's site check over one file: every occurrence of an [`AUTO_NEEDLES`] entry, and of the
+/// proto `Auto` under any of its names, must lie inside one of this file's [`AUTO_SITES`]. Returns
+/// how many times each of this file's sites was found, for the stale-entry check over the tree.
+///
+/// The requested `Auto` is looked for under every name the crate writes the enum as
+/// (`crate_aliases`: the `use ... as R` and `type R = ...` of every file, since a re-export is
+/// reachable from all of them, plus this file's own), as `Self::Auto` inside an `impl` of it, and as
+/// a variant imported by name -- the last of which cannot be matched by text and is refused where it
+/// is imported.
+fn check_auto_sites(
+    rel: &str,
+    code: &str,
+    crate_aliases: &BTreeSet<String>,
+    offenders: &mut Vec<String>,
+) -> BTreeMap<usize, usize> {
+    let sites: Vec<(usize, &str)> = AUTO_SITES
+        .iter()
+        .enumerate()
+        .filter(|(_, (file, _))| *file == rel)
+        .map(|(i, (_, text))| (i, *text))
+        .collect();
+    let mut found = BTreeMap::new();
+    let mut spans = Vec::new();
+    for (i, text) in &sites {
+        for (at, _) in code.match_indices(text) {
+            spans.push(at..at + text.len());
+            *found.entry(*i).or_insert(0) += 1;
+        }
+    }
+    let proto_needles: Vec<String> = proto_aliases(code, PROTO_CLI_PERMISSION_MODE)
+        .into_iter()
+        .map(|a| format!("{a}::Auto"))
+        .collect();
+    let imports = requested_mode_imports(code);
+    let mut requested_aliases = crate_aliases.clone();
+    requested_aliases.extend(imports.aliases.iter().cloned());
+    let requested_needles: Vec<String> = requested_aliases.iter().map(|a| format!("{a}::Auto")).collect();
+    let mut needles: Vec<String> = AUTO_NEEDLES.iter().map(|n| n.to_string()).collect();
+    needles.extend(proto_needles.iter().cloned());
+    needles.extend(requested_needles.iter().cloned());
+    let own_impls = requested_mode_impl_bodies(code, &requested_aliases);
+    // `Self::Auto` is the enum's variant only inside an `impl` of the enum.
+    let self_auto = "Self::Auto".to_string();
+    needles.push(self_auto.clone());
+    for needle in &needles {
+        for (at, _) in code.match_indices(needle.as_str()) {
+            let before = code[..at].chars().next_back();
+            let after = code[at + needle.len()..].chars().next();
+            if before.is_some_and(is_ident) || (!needle.ends_with(':') && after.is_some_and(is_ident)) {
+                continue;
+            }
+            // The tail of a longer path: the alias that path is written with is a needle of its own,
+            // so the occurrence is reported once, and another crate's `…::CliPermissionMode` is not
+            // this one.
+            if proto_needles.contains(needle) && code[..at].ends_with("::") {
+                continue;
+            }
+            if *needle == self_auto && !own_impls.iter().any(|body| body.contains(&at)) {
+                continue;
+            }
+            // `a::cli_auto_mode:` is no field; `cli_auto_mode::` is a path.
+            if needle.ends_with(':') && (code[..at].ends_with("::") || after == Some(':')) {
+                continue;
+            }
+            if needle == "cli_auto_mode:" {
+                let value = code[at + needle.len()..].trim_start();
+                if ["false,", "false }", "false}", "bool,", "bool }", "bool}"]
+                    .iter()
+                    .any(|v| value.starts_with(v))
+                {
+                    continue;
+                }
+            }
+            if spans.iter().any(|span| span.contains(&at)) {
+                continue;
+            }
+            offenders.push(format!(
+                "{rel}: `{needle}` outside the listed sites (rule 6: the CLI's auto mode only from the \
+                 handshake; add a deliberate site to AUTO_SITES in agent/src/wire_guard.rs): {}",
+                snippet(code, at)
+            ));
+        }
+    }
+    if imports.variants_imported {
+        offenders.push(format!(
+            "{rel}: imports the variants of `{REQUESTED_MODE}` by name (rule 6: a bare `Auto` cannot be \
+             told from any other, so the requested mode is only ever written `{REQUESTED_MODE}::Auto` at \
+             a listed site)"
+        ));
+    }
+    if imports.opens_defining_module {
+        for at in whole_word_positions(code, "Auto") {
+            if code[..at].ends_with("::") || code[..at].ends_with('.') {
+                continue;
+            }
+            offenders.push(format!(
+                "{rel}: a bare `Auto` in a file that opens a module with a glob import (rule 6: it could \
+                 be `{REQUESTED_MODE}`'s; write the enum's name): {}",
+                snippet(code, at)
+            ));
+        }
+    }
+    found
 }
 
 /// `name: value` for a struct-literal field, splitting at the first `:` that is not half of `::`.
@@ -536,8 +829,26 @@ fn field_split(entry: &str) -> Option<(String, String)> {
     None
 }
 
+/// Whether `rest` begins with an assignment operator: `=` (not `==`) or any compound one. `=>` and
+/// the comparisons `==`, `!=`, `<=` and `>=` are not assignments; `=>` is counted anyway, as it
+/// always was, because no field is ever a match pattern and a false alarm there costs nothing.
+fn starts_an_assignment(rest: &str) -> bool {
+    const COMPOUND: &[&str] = &["+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>="];
+    COMPOUND.iter().any(|op| rest.starts_with(op)) || (rest.starts_with('=') && !rest.starts_with("=="))
+}
+
 /// Every rule, over one production file's comment-free, test-free, collapsed text.
-fn check_file(rel: &str, code: &str, allowlisted: &mut usize, offenders: &mut Vec<String>) {
+fn check_file(
+    rel: &str,
+    code: &str,
+    crate_aliases: &BTreeSet<String>,
+    allowlisted: &mut usize,
+    auto_sites_found: &mut BTreeMap<usize, usize>,
+    offenders: &mut Vec<String>,
+) {
+    for (site, n) in check_auto_sites(rel, code, crate_aliases, offenders) {
+        *auto_sites_found.entry(site).or_insert(0) += n;
+    }
     let lower = code.to_lowercase();
     for word in FORBIDDEN_ANY_CASE {
         if let Some(at) = lower.find(word) {
@@ -557,16 +868,23 @@ fn check_file(rel: &str, code: &str, allowlisted: &mut usize, offenders: &mut Ve
             ));
         }
     }
-    // Assigned rather than stated in a literal: rule 3's "anywhere" half.
-    for field in ["permission_mode_switchable", ".permissions"] {
-        for (at, _) in code.match_indices(field) {
-            let after = &code[at + field.len()..];
-            let before = code[..at].chars().next_back();
+    // Assigned rather than stated in a literal: rule 3's "anywhere" half, and rule 6's. Any
+    // assignment operator counts, compound ones included, and spaces around the `.` do not hide a
+    // field (`policy . cli_permission_mode = 2` is the same text to the compiler).
+    let tight = code.replace(" . ", ".").replace(" .", ".").replace(". ", ".");
+    for field in [
+        "permission_mode_switchable",
+        ".permissions",
+        ".cli_permission_mode",
+        ".cli_auto_mode",
+    ] {
+        for (at, _) in tight.match_indices(field) {
+            let after = &tight[at + field.len()..];
+            let before = tight[..at].chars().next_back();
             let whole = !after.chars().next().is_some_and(is_ident)
                 && (field.starts_with('.') || !before.is_some_and(is_ident));
-            let rest = after.trim_start();
-            if whole && rest.starts_with('=') && !rest.starts_with("==") {
-                offenders.push(format!("{rel}: `{field}` assigned: {}", snippet(code, at)));
+            if whole && starts_an_assignment(after.trim_start()) {
+                offenders.push(format!("{rel}: `{field}` assigned: {}", snippet(&tight, at)));
             }
         }
     }
@@ -616,13 +934,26 @@ fn scan_tree(files: &BTreeMap<String, String>) -> Report {
         }
         cleaned.insert(rel.clone(), code);
     }
+    // The names the enum is written as anywhere in the crate: a re-export is reachable from every
+    // file, not only the one that writes it.
+    let crate_aliases: BTreeSet<String> = cleaned
+        .values()
+        .flat_map(|code| requested_mode_imports(code).aliases)
+        .collect();
     for (rel, code) in &cleaned {
         if test_only.contains(rel) && !reached.contains(rel) {
             report.skipped.insert(rel.clone());
             continue;
         }
         report.scanned.insert(rel.clone());
-        check_file(rel, code, &mut report.allowlisted, &mut report.offenders);
+        check_file(
+            rel,
+            code,
+            &crate_aliases,
+            &mut report.allowlisted,
+            &mut report.auto_sites_found,
+            &mut report.offenders,
+        );
     }
     report
 }
@@ -680,6 +1011,14 @@ fn no_production_source_can_reach_an_ungated_cli() {
         "the allowlisted `PermissionModeChanged` decode arm in {} was not found",
         ALLOWED_ARM.0
     );
+    // And so is a stale auto site: each must be there, once.
+    for (i, (file, text)) in AUTO_SITES.iter().enumerate() {
+        assert_eq!(
+            report.auto_sites_found.get(&i).copied().unwrap_or(0),
+            1,
+            "AUTO_SITES entry in {file} must be found exactly once: {text}"
+        );
+    }
 }
 
 fn one(rel: &str, src: &str) -> Report {
@@ -687,11 +1026,209 @@ fn one(rel: &str, src: &str) -> Report {
 }
 
 fn policy(permissions: &str, switchable: &str) -> String {
+    policy_with_cli_mode(permissions, switchable, "CliPermissionMode::Unspecified as i32")
+}
+
+fn policy_with_cli_mode(permissions: &str, switchable: &str, cli_mode: &str) -> String {
     format!(
-        "use claude_runtime_protocol::v1::{{ClaudeHostPolicy, PermissionMode as ProtoPermissionMode}};\n\
+        "use claude_runtime_protocol::v1::{{ClaudeHostPolicy, CliPermissionMode, PermissionMode as ProtoPermissionMode}};\n\
          fn p() -> Option<ClaudeHostPolicy> {{\n    Some(ClaudeHostPolicy {{\n        configuration: 1,\n        \
-         permissions: {permissions},\n        permission_mode_switchable: {switchable},\n    }})\n}}\n"
+         permissions: {permissions},\n        permission_mode_switchable: {switchable},\n        \
+         cli_permission_mode: {cli_mode},\n    }})\n}}\n"
     )
+}
+
+/// Rule 6, the literal half: UNSPECIFIED passes, and so does the request's one `match` on the
+/// requested mode -- but only in `mod.rs`, where it is a listed site, since its proto `Auto` is a
+/// site. Anything else as the value fails: the proto `Auto` stated outright, DEFAULT, a number, a
+/// different `match`, or no statement at all.
+#[test]
+fn the_cli_mode_is_unspecified_or_the_one_gated_match() {
+    let interactive = "ProtoPermissionMode::Interactive as i32";
+    assert!(one("x.rs", &policy(interactive, "false")).offenders.is_empty());
+    let gated = "match cli_mode {\n crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32,\n \
+                 crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32,\n }";
+    let in_mod = one(
+        "providers/claude_sidecar/mod.rs",
+        &policy_with_cli_mode(interactive, "false", gated),
+    );
+    assert!(in_mod.offenders.is_empty(), "{:?}", in_mod.offenders);
+    assert_eq!(in_mod.auto_sites_found.values().sum::<usize>(), 1);
+    assert_eq!(
+        one("x.rs", &policy_with_cli_mode(interactive, "false", gated))
+            .offenders
+            .len(),
+        2,
+        "elsewhere, both the literal's gated match and its proto Auto are outside a site"
+    );
+    for value in [
+        "CliPermissionMode::Auto as i32",
+        "CliPermissionMode::Default as i32",
+        "2",
+        "match cli_mode { _ => CliPermissionMode::Unspecified as i32 }",
+    ] {
+        let report = one(
+            "providers/claude_sidecar/mod.rs",
+            &policy_with_cli_mode(interactive, "false", value),
+        );
+        assert!(
+            report.offenders.iter().any(|o| o.contains("cli_permission_mode")),
+            "{value}: {:?}",
+            report.offenders
+        );
+    }
+    // Not stated at all.
+    let unstated = "fn p() -> ClaudeHostPolicy { ClaudeHostPolicy { permissions: \
+                    claude_runtime_protocol::v1::PermissionMode::Interactive as i32, \
+                    permission_mode_switchable: false } }";
+    let report = one("x.rs", unstated);
+    assert_eq!(report.offenders.len(), 1, "{:?}", report.offenders);
+    assert!(report.offenders[0].contains("cli_permission_mode"));
+}
+
+/// Rule 6, the site half: the requested `Auto`, the proto `Auto` under any name, and a capability
+/// set to anything but `false` are each refused outside a listed site; assigning the mode or the
+/// capability after the fact is refused everywhere.
+#[test]
+fn auto_comes_only_from_a_listed_site() {
+    for src in [
+        "fn f() -> RequestedCliMode { RequestedCliMode::Auto }",
+        "fn f() -> crate::RequestedCliMode { crate::RequestedCliMode::Auto }",
+        "use claude_runtime_protocol::v1::CliPermissionMode as C;\nfn f() -> i32 { C::Auto as i32 }",
+        "fn f() -> i32 { claude_runtime_protocol::v1::CliPermissionMode::Auto as i32 }",
+        "fn c() -> ProviderCapabilities { ProviderCapabilities { cli_auto_mode: true, } }",
+        "fn c(x: bool) -> ProviderCapabilities { ProviderCapabilities { cli_auto_mode: x } }",
+        "fn f(p: &mut ClaudeHostPolicy) { p.cli_permission_mode = 2; }",
+        "fn f(c: &mut ProviderCapabilities) { c.cli_auto_mode = true; }",
+        "fn f(p: &mut ClaudeHostPolicy) { p.set_cli_permission_mode(m); }",
+    ] {
+        for file in ["x.rs", "providers/claude_sidecar/mod.rs"] {
+            assert_eq!(one(file, src).offenders.len(), 1, "{file}: {src}");
+        }
+    }
+    // Patterns and comparisons are refused too unless listed: a new reading of the mode is a site.
+    assert_eq!(
+        one(
+            "x.rs",
+            "fn f(r: RequestedCliMode) -> bool { r == RequestedCliMode::Auto }"
+        )
+        .offenders
+        .len(),
+        1
+    );
+    // A `false` capability, the declaration, and a mere path through the field name are not sites.
+    for src in [
+        "fn c() -> ProviderCapabilities { ProviderCapabilities { cli_auto_mode: false, } }",
+        "fn c() -> ProviderCapabilities { ProviderCapabilities { cli_auto_mode: false } }",
+        "pub struct ProviderCapabilities { pub cli_auto_mode: bool, }",
+        "fn f(c: ProviderCapabilities) -> bool { c.cli_auto_mode && c.resume }",
+    ] {
+        assert!(
+            one("x.rs", src).offenders.is_empty(),
+            "{src}: {:?}",
+            one("x.rs", src).offenders
+        );
+    }
+    // The listed capability site passes in its own file, and only there.
+    let site = "fn c() -> ProviderCapabilities { ProviderCapabilities { cli_auto_mode: \
+                CLIENT_IMPLEMENTS_CLI_AUTO_MODE && has(CAP_CLI_AUTO_MODE) && has(CAP_PERMISSION_DEFER), } }";
+    assert!(one("providers/claude_sidecar/mod.rs", site).offenders.is_empty());
+    assert_eq!(one("x.rs", site).offenders.len(), 1);
+    // Dropping one of the two capabilities is no longer the listed site.
+    let one_half = site.replace(" && has(CAP_PERMISSION_DEFER)", "");
+    assert_eq!(one("providers/claude_sidecar/mod.rs", &one_half).offenders.len(), 1);
+}
+
+/// Every assignment operator after a guarded field is an assignment, not only a plain `=`, and
+/// spaces around the `.` do not hide the field; the comparisons stay what they are.
+#[test]
+fn compound_assignments_and_spaced_fields_are_assignments() {
+    for field in [
+        "p.cli_permission_mode",
+        "p.permissions",
+        "p.permission_mode_switchable",
+        "c.cli_auto_mode",
+    ] {
+        for op in ["=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>="] {
+            let src = format!("fn f() {{ {field} {op} 1; }}");
+            assert_eq!(one("x.rs", &src).offenders.len(), 1, "{src}");
+        }
+    }
+    for src in [
+        "fn f(p: &mut ClaudeHostPolicy) { policy . cli_permission_mode = 2; }",
+        "fn f(p: &mut ClaudeHostPolicy) { policy\n    .\n    cli_permission_mode\n    |= 2; }",
+        "fn f(p: &mut ClaudeHostPolicy) { policy. permissions  += 3; }",
+        "fn f(p: &mut ClaudeHostPolicy) { policy .permission_mode_switchable ^= true; }",
+        "fn f(c: &mut ProviderCapabilities) { c . cli_auto_mode &= x; }",
+    ] {
+        assert_eq!(one("x.rs", src).offenders.len(), 1, "{src}");
+    }
+    // Reading the field is not assigning it.
+    for src in [
+        "fn f(p: &ClaudeHostPolicy) -> bool { p.permissions == 3 }",
+        "fn f(p: &ClaudeHostPolicy) -> bool { p . cli_permission_mode != 0 && p.permissions >= 1 }",
+        "fn f(p: &ClaudeHostPolicy) -> bool { p.permissions <= 2 || p.cli_permission_mode >> 1 > 0 }",
+    ] {
+        assert!(
+            one("x.rs", src).offenders.is_empty(),
+            "{src}: {:?}",
+            one("x.rs", src).offenders
+        );
+    }
+}
+
+/// The requested `Auto` under an alias of the enum, in the file that writes the alias and in any
+/// other file when the alias is a re-export; a variant imported by name or by glob; a glob of the
+/// defining module followed by a bare `Auto`; and `Self::Auto` inside an `impl` of the enum.
+#[test]
+fn the_requested_auto_cannot_hide_behind_an_alias_an_import_or_self() {
+    for src in [
+        "use crate::process::RequestedCliMode as R;\nfn f() -> R { R::Auto }",
+        "use crate::{process::{RequestedCliMode as R}};\nfn f() -> R { R::Auto }",
+        "use crate::process::RequestedCliMode::{self as R};\nfn f() -> R { R::Auto }",
+        "type R = crate::process::RequestedCliMode;\nfn f() -> R { R::Auto }",
+        "use crate::process::RequestedCliMode::*;\nfn f() -> RequestedCliMode { Auto }",
+        "use crate::process::RequestedCliMode::{Auto};\nfn f() -> RequestedCliMode { Auto }",
+        "use crate::process::RequestedCliMode::Auto as A;\nfn f() -> RequestedCliMode { A }",
+        "use crate::process::*;\nfn f() -> RequestedCliMode { Auto }",
+        "use super::*;\nfn f() -> RequestedCliMode { Auto }",
+        "impl RequestedCliMode { fn a() -> Self { Self::Auto } }",
+        "impl Default for RequestedCliMode { fn default() -> Self { Self::Auto } }",
+        "impl crate::process::RequestedCliMode { fn a() -> Self { if true { Self::Auto } else { Self::Default } } }",
+    ] {
+        for file in ["x.rs", "providers/claude_sidecar/mod.rs"] {
+            assert!(!one(file, src).offenders.is_empty(), "{file}: {src}");
+        }
+    }
+    // A re-export in one file is an alias in all of them.
+    let tree = BTreeMap::from([
+        (
+            "lib.rs".to_string(),
+            "pub use process::RequestedCliMode as Requested;".to_string(),
+        ),
+        (
+            "x.rs".to_string(),
+            "fn f() -> crate::Requested { crate::Requested::Auto }".to_string(),
+        ),
+    ]);
+    let report = scan_tree(&tree);
+    assert_eq!(report.offenders.len(), 1, "{:?}", report.offenders);
+    assert!(report.offenders[0].starts_with("x.rs"), "{:?}", report.offenders);
+    // Nothing else is caught by these: a glob with no bare `Auto`, an alias used for `Default`,
+    // `Self::Auto` in another type's `impl`, and the glob of a module outside the crate.
+    for src in [
+        "use crate::process::*;\nfn f() -> RequestedCliMode { RequestedCliMode::Default }",
+        "use crate::process::RequestedCliMode as R;\nfn f() -> R { R::Default }",
+        "impl CliModeReport { fn a() -> Self { Self::Auto } }",
+        "impl CliModeReport { fn a() -> Self { Self::Auto } }\nimpl Other for RequestedCliMode { fn b() {} }",
+        "use claude_runtime_protocol::v1::*;\nfn f() -> bool { Auto == 1 }",
+    ] {
+        assert!(
+            one("x.rs", src).offenders.is_empty(),
+            "{src}: {:?}",
+            one("x.rs", src).offenders
+        );
+    }
 }
 
 #[test]
@@ -731,11 +1268,13 @@ fn a_numeric_permissions_value_fails() {
     let report = one("x.rs", &policy("3", "false"));
     assert_eq!(report.offenders.len(), 1, "{:?}", report.offenders);
     assert!(report.offenders[0].contains("permissions"));
-    // A `..` base could carry anything.
+    // A `..` base could carry anything -- here an unstated CLI mode too, rule 6's own offence.
     let spread = "fn p(b: ClaudeHostPolicy) -> ClaudeHostPolicy { ClaudeHostPolicy { permissions: \
                   claude_runtime_protocol::v1::PermissionMode::Interactive as i32, \
                   permission_mode_switchable: false, ..b } }";
-    assert_eq!(one("x.rs", spread).offenders.len(), 1);
+    let report = one("x.rs", spread);
+    assert_eq!(report.offenders.len(), 2, "{:?}", report.offenders);
+    assert!(report.offenders[0].contains("..b"), "{:?}", report.offenders);
 }
 
 #[test]
