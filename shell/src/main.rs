@@ -407,6 +407,7 @@ fn build_ui(
         module_keys.clone(),
         agent_panel_handle.clone(),
         config.tmux_skipped.clone(),
+        crate::keys_help::HelpScope::Window,
     );
     keys_help.send();
     if let Some(feed) = nvim_keys_feed.as_mut() {

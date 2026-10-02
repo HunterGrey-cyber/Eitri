@@ -6,7 +6,7 @@
 //! `panel` is never read by the ordinary resolver as a directory (see `main`).
 
 mod link;
-mod prefix;
+pub(crate) mod prefix;
 mod window;
 mod wm_runner;
 

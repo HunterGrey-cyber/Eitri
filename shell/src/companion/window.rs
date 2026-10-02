@@ -329,6 +329,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         module_keys.clone(),
         agent.clone(),
         config.tmux_skipped.clone(),
+        crate::keys_help::HelpScope::Companion,
     );
     keys_help.send();
     if let Some(feed) = keys_feed.as_mut() {

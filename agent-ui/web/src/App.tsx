@@ -3442,6 +3442,7 @@ export default function App() {
             // Give the dashboard hint the live prefix instead of assuming the default. This is the
             // same value the `?` overlay shows as `prefixLabel`.
             prefix={keymapHelp.prefix}
+            editorLink={editorLink}
             focusRequest={inputRequest}
             arriveRequest={arriveRequest}
             // `EmptyTab` handles Composer focus and focuses its own root on `keysRequest`. Route focus requests
@@ -3574,6 +3575,7 @@ export default function App() {
               prefixLabel={keymapHelp.prefix}
               panel={panelTable}
               tmuxSkipped={keymapHelp.tmuxSkipped}
+              companion={editorLink !== null}
             />
           </PanelErrorBoundary>
         )}
@@ -5119,6 +5121,7 @@ export default function App() {
               prefixLabel={keymapHelp.prefix}
               panel={panelTable}
               tmuxSkipped={keymapHelp.tmuxSkipped}
+              companion={editorLink !== null}
             />
           </PanelErrorBoundary>
         )}

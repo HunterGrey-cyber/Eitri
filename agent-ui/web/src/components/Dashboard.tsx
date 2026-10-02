@@ -1,4 +1,4 @@
-import type { Hello, PermissionModeChoice } from "../types";
+import type { EditorLink, Hello, PermissionModeChoice } from "../types";
 
 /** One row of the empty tab's dashboard: LazyVim's start screen
  *  (snacks.nvim's dashboard), a centred name and one key per action, in place of the eight resume
@@ -136,6 +136,10 @@ type Props = {
    *  `EmptyTab`. Read it live so the hint reflects any reconfiguration in `init.lua`, such as
    *  Ctrl+a instead of the default Ctrl+b. */
   prefix: string;
+  /** Companion mode (`App.tsx`'s `editorLink`, `null` in the one-window mode): the start screen then
+   *  speaks for a window that holds only this panel. Optional so a caller with no editor beside it
+   *  needs no stand-in. */
+  editorLink?: EditorLink | null;
 };
 
 /** The empty tab's dashboard: a centred `Eitri`, the
@@ -149,7 +153,7 @@ type Props = {
  * here is ever really DOM-focused. A real, focused `<button>` would eat a `Space` keydown as
  * native activation before it ever reached the leader system (`App.tsx`'s root `onKeyDown`), which
  * is exactly the key this screen's own `j`/`k`/letters/`Enter` must never intercept from. */
-export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix }: Props) {
+export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix, editorLink = null }: Props) {
   const items = dashItems(hello);
   const consequence = MODE_CONSEQUENCE[mode];
   return (
@@ -189,13 +193,22 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix }: Props
           whole file's text. Show the hint at every width and in every mode. CLI-local commands such
           as `/model` and `/effort` omit this context, as the `?` overlay's Typing note explains.
           Use the same tokens as `.dash-consequence`. */}
+      {/* Companion form: the editor is another window, so the line says which file travels and, with no
+          editor attached, how to attach one. `editorLink` is `null` in the one-window mode, where
+          Rust never sends one. */}
       <div className="dash-context">
-        Each message also sends the editor's file name, or the lines you selected there in Visual mode.
+        {editorLink === null
+          ? "Each message also sends the editor's file name, or the lines you selected there in Visual mode."
+          : editorLink.state === "attached"
+            ? "Each message also sends the file open in your nvim, or the lines you selected there in Visual mode."
+            : "No editor is attached: run :EitriPanel in nvim to send its file with each message."}
       </div>
       {/* Show the key hint on every empty tab. It occupies otherwise empty space and needs no
           persistent first-run state. */}
       <div className="dash-hint">
-        {`Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · ${prefix}  window keys · ?  all keys`}
+        {editorLink === null
+          ? `Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · ${prefix}  window keys · ?  all keys`
+          : `Ctrl+h / Ctrl+l  leave the panel · i or Ctrl+j  type · ctrl+c  interrupt · ${prefix}  tab keys · ?  all keys`}
       </div>
     </div>
   );
