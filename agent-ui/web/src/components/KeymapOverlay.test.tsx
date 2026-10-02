@@ -299,6 +299,50 @@ describe("KeymapOverlay", () => {
    named the wrong key. It now follows the effective prefix (`prefixLabel`, the same source as the
    "After <prefix>" heading): the parenthesis says why vim's Ctrl+b is not the way back a page only when
    Ctrl+b IS the prefix. */
+describe("KeymapOverlay: the lines of the user's tmux config the import skipped", () => {
+  const SKIPPED: KeyHelp[] = [
+    { keys: "~/.config/tmux/base.conf:82", what: "bind P paste-buffer \u2014 no Eitri equivalent: paste-buffer" },
+    { keys: "~/.config/tmux/tmux.conf:11", what: "run '~/.config/tmux/plugins/tpm/tpm' \u2014 run-shell runs a shell command, which Eitri never does" },
+  ];
+
+  it("lists each skipped line last, under its own heading, with where it is and why", () => {
+    const { container } = render(
+      <KeymapOverlay
+        onClose={() => {}}
+        windowKeys={WINDOW}
+        prefixKeys={PREFIX}
+        prefixLabel="Ctrl+a"
+        panel={EMPTY_PANEL_TABLE}
+        tmuxSkipped={SKIPPED}
+      />,
+    );
+    const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);
+    expect(titles.slice(-2)).toEqual(["After Ctrl+a", "Skipped from tmux"]);
+    const section = sectionTitled(container, "Skipped from tmux");
+    for (const row of SKIPPED) {
+      expect(section.textContent).toContain(row.keys);
+      expect(section.textContent).toContain(row.what);
+    }
+  });
+
+  it("draws no such section when nothing was skipped or the import is off", () => {
+    for (const tmuxSkipped of [[], undefined]) {
+      const { container } = render(
+        <KeymapOverlay
+          onClose={() => {}}
+          windowKeys={WINDOW}
+          prefixKeys={PREFIX}
+          prefixLabel="Ctrl+b"
+          panel={EMPTY_PANEL_TABLE}
+          tmuxSkipped={tmuxSkipped}
+        />,
+      );
+      expect(sectionTitled(container, "Skipped from tmux")).toBeUndefined();
+      cleanup();
+    }
+  });
+});
+
 describe("KeymapOverlay: the PageUp row follows the configured prefix", () => {
   const pageUpRow = (container: HTMLElement) =>
     Array.from(sectionTitled(container, "This panel").querySelectorAll("tr, li, div")).find(

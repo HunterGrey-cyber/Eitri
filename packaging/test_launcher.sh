@@ -243,6 +243,16 @@ out="$(run_launcher --legacy "$PROJECT_DIR")"
 assert_contains "$out" "STUB_ARG:--legacy" "the stub received --legacy on argv"
 assert_not_contains "$out" "EITRI_AGENT_BACKEND" "no EITRI_AGENT_BACKEND is exported for --legacy"
 
+echo "== --clean passes through to shell's argv, before the project =="
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher --clean "$PROJECT_DIR")"
+assert_contains "$out" "STUB_ARG:--clean" "the stub received --clean on argv"
+assert_not_contains "$out" "unknown option" "--clean is not refused as an unknown option"
+out="$(run_launcher --clean --legacy "$PROJECT_DIR")"
+assert_contains "$out" "STUB_ARG:--clean" "--clean still reaches the stub beside --legacy"
+assert_contains "$out" "STUB_ARG:--legacy" "--legacy still reaches the stub beside --clean"
+
 echo "== no sidecar anywhere -> the hint is printed =="
 reset_state
 EXTRA_ENV=()
@@ -417,6 +427,8 @@ out="$(run_launcher -h)"
 assert_not_contains "$out" "D16" "the help text names no internal ruling id"
 assert_not_contains "$out" "LEGACY_NOT_IN_BUILD" "the help text names no internal constant"
 assert_contains "$out" "a release build refuses it" "the help text still says what a release build does, in plain words"
+assert_contains "$out" "--clean" "the help text lists --clean"
+assert_contains "$out" "eitri setup [args]" "the help text still ends with its last usage line"
 
 echo "== the startup banner's project and account lines line up =="
 # The 2026-09-30 rename shortened the name to "eitri"; the account lines are indented to the

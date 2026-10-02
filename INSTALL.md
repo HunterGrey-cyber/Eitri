@@ -294,6 +294,16 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "by
   `"bypass"` is the one way a window starts in bypass without asking, because you have said so in
   your own file; it also lets saved bypass tabs come back in bypass without the question.
 
+## Your tmux keys
+
+If you use tmux, Eitri picks up your prefix and your prefix-table bindings from the same files tmux
+reads (`/etc/tmux.conf`, `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`,
+`~/.config/tmux/tmux.conf`, and what they `source-file`), wherever an Eitri action matches the tmux
+command. It only reads them; it never starts or asks tmux. A one-time notice says what was taken,
+and `<prefix> ?` lists each line that was not, with the reason. To turn it off, put
+`eitri.config.set("keymap.from_tmux", "off")` in `~/.config/eitri/init.lua`; your own
+`eitri.keymap` calls there always win over what came from tmux.
+
 ## Troubleshooting
 
 A few common install-time refusals, in the installer's own words (abridged):

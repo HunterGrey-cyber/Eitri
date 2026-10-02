@@ -229,6 +229,12 @@ mod tests {
     #[test]
     fn the_owners_snippet_applies_cleanly_and_reproduces_his_tmux() {
         let map = Keymap::apply_user(&run(SNIPPET), &[]).unwrap_or_else(|e| panic!("{e}"));
+        reproduces_his_tmux(&map);
+    }
+
+    /// What his `~/.config/tmux/base.conf` binds, as Eitri has it: the snippet's result, and since
+    /// the import, also what reading his tmux config itself gives.
+    fn reproduces_his_tmux(map: &Keymap) {
         let k = |s: &str| KeySpec::parse(s).unwrap();
         let action = |s: &str| map.lookup(&k(s)).map(|b| (b.action.clone(), b.repeatable));
         assert_eq!(map.prefix(), &k("C-a"));
@@ -276,6 +282,97 @@ mod tests {
             Some((Action::SendKeys(k("C-l")), false)),
             "base.conf:73 is a default"
         );
+    }
+
+    /// A scratch home holding copies of the owner's two tmux files where his are
+    /// (`~/.config/tmux/tmux.conf`, which sources `~/.config/tmux/base.conf`). The copies in
+    /// `core/tests/fixtures/tmux/` are his files with every comment emptied and one script name changed,
+    /// line for line, so the snippet's `base.conf:NN` references still point at the right lines.
+    fn his_tmux_home() -> crate::test_scratch_dir::ScratchDir {
+        let home = crate::test_scratch_dir::ScratchDir::new("eitri-tmux", "owner");
+        let dir = home.join(".config/tmux");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tmux");
+        for name in ["tmux.conf", "base.conf"] {
+            std::fs::copy(fixtures.join(name), dir.join(name)).unwrap();
+        }
+        home
+    }
+
+    fn import_his_tmux(home: &std::path::Path) -> (Keymap, crate::keymap::TmuxImport) {
+        let env = crate::keymap::tmux::tests::env_for(home);
+        let read = crate::keymap::tmux::read(&env);
+        Keymap::with_tmux(&read, &crate::keymap::LuaClaims::default())
+    }
+
+    /// The bindings as `(key, action, repeatable)`, sorted: what two keymaps are compared by when
+    /// their bindings' sources and order may differ.
+    fn effect(map: &Keymap) -> Vec<(String, String, bool)> {
+        let mut rows: Vec<_> = map
+            .bindings()
+            .iter()
+            .map(|b| (b.key.to_string(), format!("{:?}", b.action), b.repeatable))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn importing_his_tmux_config_gives_what_his_snippet_gives() {
+        let home = his_tmux_home();
+        let (map, import) = import_his_tmux(&home);
+        reproduces_his_tmux(&map);
+        let snippet = Keymap::apply_user(&run(SNIPPET), &[]).unwrap();
+        assert_eq!(map.prefix(), snippet.prefix());
+        assert_eq!(
+            effect(&map),
+            effect(&snippet),
+            "every row, not only the ones asserted above"
+        );
+        assert_eq!(import.files, vec![home.join(".config/tmux/tmux.conf")]);
+        // What did not come across, and why: his run/if-shell lines, his copy-mode and root keys,
+        // the commands Eitri has no equivalent of.
+        let at = |file: &str, line: usize| {
+            import
+                .skipped
+                .iter()
+                .find(|s| s.origin.file.ends_with(file) && s.origin.line == line)
+                .unwrap_or_else(|| panic!("{file}:{line} not skipped: {:?}", import.skipped))
+                .reason
+                .clone()
+        };
+        assert!(at("tmux.conf", 7).contains("if-shell"));
+        assert!(at("tmux.conf", 11).contains("run-shell"));
+        assert!(at("tmux.conf", 16).contains("no Eitri equivalent: source-file"));
+        assert!(at("base.conf", 82).contains("paste-buffer"));
+        assert!(at("base.conf", 84).contains("copy-mode-vi"));
+        assert!(at("base.conf", 104).contains("more than one command"));
+        assert!(at("base.conf", 117).contains("root key"));
+        assert!(at("base.conf", 143).contains("run-shell"));
+        // The panel would drop it, so it is not taken from tmux; Eitri's own default binds the same.
+        assert!(at("base.conf", 73).contains("cannot send C-l"));
+        assert_eq!(import.skipped.len(), 27, "{:#?}", import.skipped);
+        assert_eq!(import.bindings.len(), 16);
+        assert_eq!(
+            crate::keymap::tmux::notice::toast_text(&import, &map, Some(&home)).as_deref(),
+            Some(
+                "Using your tmux keys from ~/.config/tmux/tmux.conf: prefix Ctrl+a, 16 keys (27 skipped). Ctrl+a ? \
+                 lists them; keymap.from_tmux = \"off\" turns this off."
+            )
+        );
+    }
+
+    /// His `init.lua` already carries the snippet; with the import on, it applies on top of the
+    /// import of the same file without a single error, and the keymap is the same.
+    #[test]
+    fn the_snippet_on_top_of_the_import_starts_and_gives_the_same_map() {
+        let home = his_tmux_home();
+        let (imported, _) = import_his_tmux(&home);
+        let layered = imported.then_user(&run(SNIPPET), &[]).unwrap_or_else(|e| panic!("{e}"));
+        reproduces_his_tmux(&layered);
+        let snippet = Keymap::apply_user(&run(SNIPPET), &[]).unwrap();
+        assert_eq!(layered.prefix(), snippet.prefix());
+        assert_eq!(effect(&layered), effect(&snippet));
     }
 
     /// Review Focus 3: the snippet's `pairs` loops run in an order Lua does not specify.

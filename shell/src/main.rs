@@ -451,9 +451,13 @@ fn build_ui(
         }
     }
 
-    // The keymap (keymap spec §2.3): stock tmux's defaults, prefix `Ctrl+b`, with `init.lua`'s
-    // `eitri.keymap` calls applied. A bad key, an unknown action or option, or a collision is a
-    // startup failure naming both sides, as `agent.font_size` is -- never a keymap nobody wrote.
+    // The keymap (keymap spec §2.3): stock tmux's defaults, prefix `Ctrl+b`, then the user's own
+    // tmux config read from tmux's files (unless `keymap.from_tmux` is "off"), then `init.lua`'s
+    // `eitri.keymap` calls. The tmux import never stops the window from opening: what it cannot
+    // take is listed in the `?` overlay. A bad key, an unknown action or option, or a collision in
+    // `init.lua` is a startup failure naming both sides, as `agent.font_size` is -- never a keymap
+    // nobody wrote. The import yields to what `init.lua` registered, so a config that started
+    // before it still starts.
     let lua_panel_ids: Vec<String> = lua_engine
         .panels
         .borrow()
@@ -461,13 +465,48 @@ fn build_ui(
         .iter()
         .map(|e| e.id.clone())
         .collect();
-    let keymap = match eitri_core::keymap::Keymap::apply_user(lua_engine.keymap.borrow().ops(), &lua_panel_ids) {
-        Ok(keymap) => Rc::new(keymap),
+    let lua_claims = eitri_core::keymap::LuaClaims {
+        panel_keys: lua_engine
+            .panels
+            .borrow()
+            .entries()
+            .iter()
+            .filter_map(|e| e.key.clone().map(|key| (e.id.clone(), key)))
+            .collect(),
+        command_keybindings: lua_engine
+            .commands
+            .borrow()
+            .iter()
+            .filter_map(|(id, entry)| entry.keybinding.clone().map(|k| (id.clone(), k)))
+            .collect(),
+    };
+    let from_tmux = lua_engine
+        .config
+        .borrow()
+        .get(eitri_core::keymap::tmux::SETTING)
+        .map(str::to_owned);
+    let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let (keymap, tmux_import) = match eitri_core::keymap::Keymap::for_startup(
+        lua_engine.keymap.borrow().ops(),
+        &lua_panel_ids,
+        from_tmux.as_deref(),
+        eitri_core::keymap::tmux::TmuxEnv::from_process,
+        &lua_claims,
+    ) {
+        Ok((keymap, import)) => (Rc::new(keymap), import),
         Err(err) => {
             eprintln!("eitri: {err}");
             std::process::exit(1);
         }
     };
+    eprintln!(
+        "{}",
+        eitri_core::keymap::tmux::notice::log_line(tmux_import.as_ref(), home_dir.as_deref())
+    );
+    let tmux_skipped: Vec<eitri_core::keymap::HelpRow> = tmux_import
+        .as_ref()
+        .map(|import| eitri_core::keymap::tmux::notice::skipped_rows(import, home_dir.as_deref()))
+        .unwrap_or_default();
     // Collision rule 4: a Lua command's accelerator that is the prefix or a root chord would never fire.
     for (id, entry) in lua_engine.commands.borrow().iter() {
         if let Some(keybinding) = &entry.keybinding {
@@ -582,6 +621,7 @@ fn build_ui(
         let module_keys = module_keys.clone();
         let agent_panel_handle = agent_panel_handle.clone();
         let new_tab_chord = new_tab_chord.clone();
+        let tmux_skipped = tmux_skipped.clone();
         Rc::new(move || {
             let mut latest_ref = latest.borrow_mut();
             let report = latest_ref.0.clone();
@@ -596,6 +636,7 @@ fn build_ui(
                     &keymap.help(&module_keys),
                     &panel_keymap,
                     &new_tab_chord,
+                    &tmux_skipped,
                 ));
                 latest_ref.1 = Some(panel_keymap);
             }
@@ -942,6 +983,31 @@ fn build_ui(
     hint_overlay.set_child(Some(&root));
     window.set_child(Some(&hint_overlay));
     let toast = toast::Toast::install(&hint_overlay, &top_bar.widget);
+    // The tmux import says it happened once: the first launch where it changes the keys, and again
+    // only when what it imports changes (its fingerprint, kept with Eitri's other state).
+    if let Some(import) = tmux_import.as_ref() {
+        if let Some(text) = eitri_core::keymap::tmux::notice::toast_text(import, &keymap, home_dir.as_deref()) {
+            let fingerprint = eitri_core::keymap::tmux::notice::fingerprint(import);
+            let state = eitri_core::keymap::tmux::notice::state_file(
+                std::env::var_os("XDG_STATE_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            );
+            if state
+                .as_deref()
+                .is_none_or(|file| eitri_core::keymap::tmux::notice::needs_notice(file, &fingerprint))
+            {
+                toast.show_for(&text, toast::NOTICE_FOR);
+                if let Some(file) = state.as_deref() {
+                    if let Err(err) = eitri_core::keymap::tmux::notice::remember(file, &fingerprint) {
+                        eprintln!(
+                            "[keymap] tmux: could not record the notice in {}: {err}",
+                            file.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // The global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md). Three
     // triggers reach the same toggle: `prefix f` (the keymap's `hint`, below), `f` on the top bar,

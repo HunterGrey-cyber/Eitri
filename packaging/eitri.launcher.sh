@@ -5,6 +5,7 @@
 #   eitri ~/some/project   open that project
 #   eitri --legacy ~/p     use the older in-process Claude backend (development builds only --
 #                            a release build refuses it, saying it is not in this build)
+#   eitri --clean ~/p      start nvim with --clean (no init.lua, no plugins) for this window
 #   eitri --account work   bill a specific Claude account (and read its history)
 #   eitri --version        print the version and exit
 #   eitri setup [args]     build the sidecar (and offer nvim), or --nvim-only/--uninstall/
@@ -119,10 +120,12 @@ while [[ $# -gt 0 ]]; do
 		# `EITRI_AGENT_BACKEND=legacy` export this replaced, this is plain argv: `shell` decides
 		# per invocation, so two launches of the same installed binary can disagree.
 		--legacy)  SHELL_ARGS+=(--legacy); shift ;;
+		# Forwarded too: shell starts its nvim with --clean, the same as running it directly.
+		--clean)   SHELL_ARGS+=(--clean); shift ;;
 		--version) exec "$LIBDIR/shell" --version ;;
 		--account) ACCOUNT="${2:?--account needs a name}"; ACCOUNT_FROM_FLAG=1; shift 2 ;;
 		--quiet)   QUIET=1; shift ;;
-		-h|--help) sed -n '2,11p' "$0" | sed 's/^# \?//'; exit 0 ;;
+		-h|--help) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
 		--) shift; PROJECT="${1:-}"; break ;;
 		-*) echo "eitri: unknown option $1" >&2; exit 64 ;;
 		*)  PROJECT="$1"; shift ;;

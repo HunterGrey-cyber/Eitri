@@ -15,6 +15,7 @@ use crate::layout::{Axis, Direction, ModuleId, ModuleKeys, ModuleKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Default,
+    Tmux,
     User,
 }
 
@@ -22,6 +23,7 @@ impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Source::Default => "default",
+            Source::Tmux => "from your tmux config",
             Source::User => "set earlier in init.lua",
         })
     }
@@ -44,6 +46,9 @@ pub struct Keymap {
     prefix: KeySpec,
     bindings: Vec<Binding>,
     panel_user: PanelUserTable,
+    /// The keys the tmux import unbound and left unbound: `init.lua`'s `del` of one is not an
+    /// error, since the user's own snippet may delete what their tmux config already deleted.
+    removed_by_import: Vec<KeySpec>,
 }
 
 /// One `eitri.keymap` call, as `core::lua::keymap` recorded it -- raw, so every error is found
@@ -275,19 +280,219 @@ fn default_bindings() -> Vec<Binding> {
     out
 }
 
+/// What `init.lua` registered that the tmux import must leave alone, so that a configuration that
+/// starts without the import still starts with it: each Lua panel's `(id, key)` (a panel whose key
+/// the prefix table binds is refused at startup) and each Lua command's `(id, keybinding)` (one
+/// that is the prefix chord is refused at startup).
+#[derive(Debug, Clone, Default)]
+pub struct LuaClaims {
+    pub panel_keys: Vec<(String, String)>,
+    pub command_keybindings: Vec<(String, String)>,
+}
+
+/// What the tmux import did: the files tmux would load that were read, the prefix it set (`None`
+/// when the config sets none Eitri could take), its bindings as they stood once the import was
+/// done, the keys it unbound and left unbound, and every line that did not come across.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TmuxImport {
+    pub files: Vec<std::path::PathBuf>,
+    pub prefix: Option<KeySpec>,
+    pub bindings: Vec<Binding>,
+    pub removed: Vec<KeySpec>,
+    pub skipped: Vec<super::tmux::Skipped>,
+}
+
+impl TmuxImport {
+    /// Whether the window's keys differ from the defaults because of it -- not merely whether a
+    /// config was read: one that only sets options, or rebinds a default key to what it already
+    /// does, changes nothing a notice would need to announce.
+    pub fn changes_anything(&self) -> bool {
+        let defaults = Keymap::defaults();
+        self.prefix.is_some_and(|p| p != defaults.prefix)
+            || !self.removed.is_empty()
+            || self.bindings.iter().any(|b| {
+                defaults
+                    .lookup(&b.key)
+                    .is_none_or(|d| d.action != b.action || d.repeatable != b.repeatable)
+            })
+    }
+}
+
+/// tmux's own actions, the ones the import maps commands to: what `unbind -a` removes from the
+/// defaults. The rest -- HINT, the module keys, the keymap overlay, the panel reload, text size,
+/// Immersive, and the tab keys tmux has no command for -- are Eitri's and stay.
+fn is_tmux_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::SendPrefix
+            | Action::SendKeys(_)
+            | Action::Split(_)
+            | Action::Zoom
+            | Action::Resize { .. }
+            | Action::Select(_)
+            | Action::SelectLast
+            | Action::SelectNext
+            | Action::Swap(_)
+            | Action::Even(_)
+            | Action::ModuleKill
+            | Action::PanelCommandLine
+            | Action::CopyMode { .. }
+            | Action::Tab(
+                TabAction::New
+                    | TabAction::Next
+                    | TabAction::Prev
+                    | TabAction::Last
+                    | TabAction::Rename
+                    | TabAction::Close
+                    | TabAction::Choose
+            )
+    )
+}
+
 impl Keymap {
+    /// The defaults with the user's tmux config applied on top, in tmux's order, and what that did.
+    /// Never fails: a key or prefix Eitri cannot take, or one `init.lua` already claimed, is
+    /// skipped with the reason and the rest still comes across.
+    pub fn with_tmux(read: &super::tmux::TmuxRead, claims: &LuaClaims) -> (Keymap, TmuxImport) {
+        use super::tmux::{Skipped, Step};
+        let mut map = Keymap::defaults();
+        let mut import = TmuxImport {
+            files: read.files.clone(),
+            skipped: read.skipped.clone(),
+            ..TmuxImport::default()
+        };
+        let mut removed: Vec<KeySpec> = Vec::new();
+        for (step, origin) in &read.steps {
+            let mut skip = |reason: String| {
+                import.skipped.push(Skipped {
+                    origin: origin.clone(),
+                    reason,
+                })
+            };
+            match step {
+                Step::Prefix(key) => {
+                    let keeps = format!("the prefix stays {}", map.prefix.human());
+                    let chord = Chord::of(key);
+                    if !(key.ctrl || key.meta || matches!(key.key, KeyName::F(_))) {
+                        skip(format!(
+                            "a prefix must be a chord (C- or M-) or a function key, or it would eat that key \
+                             everywhere; {keeps}"
+                        ));
+                    } else if let Some((_, named)) = root::chords().into_iter().find(|(c, _)| *c == chord) {
+                        skip(format!("the prefix would be a root key, {named}; {keeps}"));
+                    } else if let Some((id, _)) = claims
+                        .command_keybindings
+                        .iter()
+                        .find(|(_, accel)| Chord::from_gtk(accel).is_ok_and(|c| c == chord))
+                    {
+                        skip(format!("taken by init.lua: command {id}'s keybinding; {keeps}"));
+                    } else {
+                        map.prefix = *key;
+                        import.prefix = Some(*key);
+                    }
+                }
+                Step::Bind {
+                    key,
+                    action,
+                    repeatable,
+                } => {
+                    if key.as_char() == Some(crate::layout::keys::RESERVED_FOR_CANVAS) {
+                        skip("reserved for the canvas".to_string());
+                        continue;
+                    }
+                    if let Some((id, _)) = claims
+                        .panel_keys
+                        .iter()
+                        .find(|(_, k)| KeySpec::parse(k).is_ok_and(|k| k == *key))
+                    {
+                        skip(format!("taken by init.lua: the {id} panel's key"));
+                        continue;
+                    }
+                    let binding = Binding {
+                        key: *key,
+                        action: action.clone(),
+                        repeatable: *repeatable,
+                        source: Source::Tmux,
+                    };
+                    match map.bindings.iter().position(|b| b.key == *key) {
+                        Some(at) => map.bindings[at] = binding,
+                        None => map.bindings.push(binding),
+                    }
+                    removed.retain(|k| k != key);
+                }
+                Step::Unbind(key) => {
+                    if let Some(at) = map.bindings.iter().position(|b| b.key == *key) {
+                        map.bindings.remove(at);
+                        if !removed.contains(key) {
+                            removed.push(*key);
+                        }
+                    }
+                }
+                Step::UnbindAll => {
+                    map.bindings.retain(|b| {
+                        let goes = b.source == Source::Tmux || is_tmux_action(&b.action);
+                        if goes && !removed.contains(&b.key) {
+                            removed.push(b.key);
+                        }
+                        !goes
+                    });
+                }
+            }
+        }
+        import.bindings = map
+            .bindings
+            .iter()
+            .filter(|b| b.source == Source::Tmux)
+            .cloned()
+            .collect();
+        import.removed = removed.clone();
+        map.removed_by_import = removed;
+        (map, import)
+    }
+
+    /// The window's keymap at startup: the defaults, the tmux import unless `keymap.from_tmux` is
+    /// `"off"` (`from_tmux` is that setting as `init.lua` left it), then `init.lua`'s own calls.
+    /// `env` is asked for only when the import is on, so nothing about the environment can matter
+    /// to a window that turned the import off.
+    /// The import never fails; a bad setting or an `init.lua` mistake does, naming it.
+    pub fn for_startup(
+        ops: &[KeymapOp],
+        lua_panels: &[String],
+        from_tmux: Option<&str>,
+        env: impl FnOnce() -> super::tmux::TmuxEnv,
+        claims: &LuaClaims,
+    ) -> Result<(Keymap, Option<TmuxImport>), String> {
+        let (base, import) = if super::tmux::enabled(from_tmux)? {
+            let (map, import) = Keymap::with_tmux(&super::tmux::read(&env()), claims);
+            (map, Some(import))
+        } else {
+            (Keymap::defaults(), None)
+        };
+        let map = base.then_user(ops, lua_panels).map_err(|e| e.to_string())?;
+        Ok((map, import))
+    }
+
     /// Stock tmux's prefix `C-b` and spec §2.1's table.
     pub fn defaults() -> Keymap {
         Keymap {
             prefix: KeySpec::parse(super::stock::STOCK_PREFIX).expect("C-b parses"),
             bindings: default_bindings(),
             panel_user: PanelUserTable::default(),
+            removed_by_import: Vec::new(),
         }
     }
 
     /// The defaults with `ops` applied in order. `lua_panels`: the ids `module.<id>` may name.
     pub fn apply_user(ops: &[KeymapOp], lua_panels: &[String]) -> Result<Keymap, KeymapError> {
-        let mut map = Keymap::defaults();
+        Keymap::defaults().then_user(ops, lua_panels)
+    }
+
+    /// This keymap with `init.lua`'s `ops` applied in order. Every rule is strict, as for the
+    /// defaults alone, except toward what the tmux import did: a `set` on a key the import bound
+    /// replaces it, and a `del` of a key the import unbound is no error -- `init.lua` comes last
+    /// and wins, and a snippet written before the import existed still applies on top of it.
+    pub fn then_user(self, ops: &[KeymapOp], lua_panels: &[String]) -> Result<Keymap, KeymapError> {
+        let mut map = self;
         let mut prefix_call = None;
         for op in ops {
             match op {
@@ -315,20 +520,25 @@ impl Keymap {
                         let spec = parse_key(op, key)?;
                         let parsed = action::parse(action, opts, lua_panels)
                             .map_err(|error| KeymapError::Action { call: op.call(), error })?;
-                        if let Some(existing) = map.lookup(&spec) {
-                            return Err(KeymapError::AlreadyBound {
-                                call: op.call(),
-                                key: spec,
-                                bound_to: existing.action.name(),
-                                source: existing.source,
-                            });
-                        }
-                        map.bindings.push(Binding {
+                        let binding = Binding {
                             key: spec,
                             action: parsed.action,
                             repeatable: parsed.repeatable,
                             source: Source::User,
-                        });
+                        };
+                        match map.bindings.iter().position(|b| b.key == spec) {
+                            Some(at) if map.bindings[at].source == Source::Tmux => map.bindings[at] = binding,
+                            Some(at) => {
+                                let existing = &map.bindings[at];
+                                return Err(KeymapError::AlreadyBound {
+                                    call: op.call(),
+                                    key: spec,
+                                    bound_to: existing.action.name(),
+                                    source: existing.source,
+                                });
+                            }
+                            None => map.bindings.push(binding),
+                        }
                     }
                 }
                 KeymapOp::Del { table, key } => {
@@ -339,15 +549,18 @@ impl Keymap {
                     } else {
                         prefix_table(op, table)?;
                         let spec = parse_key(op, key)?;
-                        let at =
-                            map.bindings
-                                .iter()
-                                .position(|b| b.key == spec)
-                                .ok_or_else(|| KeymapError::NotBound {
+                        match map.bindings.iter().position(|b| b.key == spec) {
+                            Some(at) => {
+                                map.bindings.remove(at);
+                            }
+                            None if map.removed_by_import.contains(&spec) => {}
+                            None => {
+                                return Err(KeymapError::NotBound {
                                     call: op.call(),
                                     key: spec,
-                                })?;
-                        map.bindings.remove(at);
+                                })
+                            }
+                        }
                     }
                 }
             }
@@ -403,6 +616,9 @@ impl Keymap {
             let mut what = binding.action.describe(&prefix, &module_keys);
             if binding.repeatable {
                 what.push_str(" (repeats within 500 ms)");
+            }
+            if binding.source == Source::Tmux {
+                what.push_str(" (tmux)");
             }
             let key = binding.key.human();
             match rows.last_mut() {

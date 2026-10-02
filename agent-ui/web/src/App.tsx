@@ -2500,6 +2500,7 @@ export default function App() {
           prefixKeys: payload.prefixKeys,
           panel: payload.panel,
           newTabChord: payload.newTabChord,
+          tmuxSkipped: payload.tmuxSkipped ?? [],
         });
       } else if (payload.kind === "literal_key") {
         // `send-prefix`/`send-keys` from shell: WebKitGTK cannot be handed the key itself. `C-a` is
@@ -3983,6 +3984,7 @@ export default function App() {
               prefixKeys={keymapHelp.prefixKeys}
               prefixLabel={keymapHelp.prefix}
               panel={panelTable}
+              tmuxSkipped={keymapHelp.tmuxSkipped}
             />
           </PanelErrorBoundary>
         )}
@@ -5737,6 +5739,7 @@ export default function App() {
               prefixKeys={keymapHelp.prefixKeys}
               prefixLabel={keymapHelp.prefix}
               panel={panelTable}
+              tmuxSkipped={keymapHelp.tmuxSkipped}
             />
           </PanelErrorBoundary>
         )}

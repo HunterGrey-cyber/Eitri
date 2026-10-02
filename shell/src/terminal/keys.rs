@@ -426,6 +426,29 @@ mod tests {
         assert_eq!(literal(&k("M-1")), None);
     }
 
+    /// The tmux import takes a `send-keys` binding only for a key every pane can be handed, and
+    /// decides that without GTK (`eitri_core::keymap::tmux::every_pane_takes`); whatever it accepts,
+    /// the terminal must be able to deliver.
+    #[test]
+    fn the_tmux_import_sends_only_what_the_terminal_takes() {
+        let keys = [
+            "C-a", "C-l", "C-z", "a", "Q", "%", "\\", "é", "C-A", "C-=", "C-1", "M-a", "C-M-a", "Up", "C-Up", "S-Up",
+            "F5", "Enter", "Tab", "BSpace", "Space", "PPage", "M-Enter",
+        ];
+        for name in keys {
+            let key = eitri_core::keymap::KeySpec::parse(name).unwrap();
+            if eitri_core::keymap::tmux::every_pane_takes(&key) {
+                assert!(
+                    literal(&key).is_some(),
+                    "{name}: the import takes it, the terminal cannot send it"
+                );
+            }
+        }
+        assert!(eitri_core::keymap::tmux::every_pane_takes(
+            &eitri_core::keymap::KeySpec::parse("C-a").unwrap()
+        ));
+    }
+
     fn raw(keyval: GdkKey, state: ModifierType) -> RawKey {
         RawKey {
             keyval,

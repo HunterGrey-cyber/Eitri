@@ -16,6 +16,9 @@ type Props = {
   /** The panel's own which-key table (panel round 2 plan, Task 8), for the new "Leader and tab
    *  keys" section -- the same table the leader engine (`../leader`) and `resolveKey` read. */
   panel: PanelTable;
+  /** The lines of the user's tmux config the import did not take (`shell`'s `keymap` envelope,
+   *  `tmuxSkipped`): where each is, what it says and why. No section when there are none. */
+  tmuxSkipped?: KeyHelp[];
 };
 
 /** One of the four groups (spec §3.2), rendered from the same tables `keymap.test.ts` binds to
@@ -216,7 +219,7 @@ function SlashCommands() {
  * contains, so a click inside a table (reading a row, selecting text) never fires it.
  */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel },
+  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped },
   ref,
 ) {
   return (
@@ -275,6 +278,13 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
       <SlashCommands />
       <Section title="Anywhere in the window" rows={windowKeys} />
       <Section title={`After ${prefixLabel}`} rows={prefixKeys} />
+      {tmuxSkipped !== undefined && tmuxSkipped.length > 0 && (
+        <Section
+          title="Skipped from tmux"
+          rows={tmuxSkipped}
+          note={'The rows marked (tmux) above came from your tmux config; these lines did not. keymap.from_tmux = "off" in init.lua turns the import off.'}
+        />
+      )}
     </div>
   );
 });

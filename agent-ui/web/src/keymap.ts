@@ -992,4 +992,12 @@ export const INPUT_KEYS: KeyHelp[] = [
  *  `serialize_keymap_for_js` now also carries this panel's own which-key table (`panel`, spec
  *  §10.1, `defaults < nvim < init.lua`'s `effective()`) and the prefix chord that opens a new tab,
  *  spelled out for the chooser's "New session" row (e.g. `"Ctrl+b c"`). */
-export type KeymapHelp = { prefix: string; window: KeyHelp[]; prefixKeys: KeyHelp[]; panel: PanelTable; newTabChord: string };
+export type KeymapHelp = {
+  prefix: string;
+  window: KeyHelp[];
+  prefixKeys: KeyHelp[];
+  panel: PanelTable;
+  newTabChord: string;
+  /** The lines of the user's tmux config the import skipped, for the overlay's last section. */
+  tmuxSkipped?: KeyHelp[];
+};

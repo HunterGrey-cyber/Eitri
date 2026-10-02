@@ -7569,6 +7569,26 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     expect(overlay(container)!.textContent).toContain("Ctrl+b f");
   });
 
+  it("lists the tmux lines shell says the import skipped, last", () => {
+    const { container } = started();
+    act(() =>
+      dispatch({
+        kind: "keymap",
+        prefix: "Ctrl+a",
+        window: [],
+        prefixKeys: [{ keys: "Ctrl+a m", what: "Zoom (tmux)" }],
+        panel: TABLE,
+        newTabChord: "Ctrl+a c",
+        tmuxSkipped: [{ keys: "~/.tmux.conf:4", what: "bind P paste-buffer — no Eitri equivalent: paste-buffer" }],
+      }),
+    );
+    act(() => dispatch({ kind: "open_keymap" }));
+    const titles = Array.from(overlay(container)!.querySelectorAll("h2")).map((h) => h.textContent);
+    expect(titles[titles.length - 1]).toBe("Skipped from tmux");
+    expect(overlay(container)!.textContent).toContain("~/.tmux.conf:4");
+    expect(overlay(container)!.textContent).toContain("Zoom (tmux)");
+  });
+
   it("opens on shell's open_keymap, in BROWSE, even from INPUT", () => {
     const { container } = started();
     enterInputMode(container);

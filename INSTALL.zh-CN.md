@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=7af6b10284821b93ebf1fe183b348b4ed0b308adf9aaada04110d54da69c968a -->
+<!-- translated-from: INSTALL.md sha256=918b53776387553006e0d585cd2f88a5d5f90cf4eb88c373f9798356e26b9dad -->
 
 # 安装 Eitri
 
@@ -159,6 +159,10 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto"（默认）或 "bypa
 
 - **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有 Claude 会话的标签页（它们的顺序、名字、模式，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成"没有标签页"。设为 `"offer"` 时，只要窗口里还没有任何会话开始，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来；`"off"` 既不提议也不记录。每个标签页都会被恢复（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。上次处于 bypass 的标签页，没有你的一句"是"，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。
 - **`agent.default_mode`** 是新标签页开始时所处的模式，针对你还没有用 `Shift+Tab` 离开过 bypass 的项目（那个选择按项目记住，并且始终优先）。设为 `"bypass"` 是唯一一种窗口不经询问就以 bypass 开始的方式，因为你已经在自己的文件里这么说了；它同时也让保存下来的 bypass 标签页不必回答那个问题就以 bypass 回来。
+
+## 你的 tmux 键位
+
+如果你用 tmux，Eitri 会从 tmux 自己读的那几个文件（`/etc/tmux.conf`、`~/.tmux.conf`、`$XDG_CONFIG_HOME/tmux/tmux.conf`、`~/.config/tmux/tmux.conf`，以及它们 `source-file` 进来的文件）里读出你的前缀键和前缀表绑定，凡是有对应 Eitri 动作的 tmux 命令都会照搬过来。它只读这些文件，从不启动或询问 tmux。第一次生效时会有一条一次性提示说明拿到了什么；`<前缀> ?` 会逐行列出没能拿过来的那些行和原因。想关掉它，就在 `~/.config/eitri/init.lua` 里写上 `eitri.config.set("keymap.from_tmux", "off")`；你在那里写的 `eitri.keymap` 调用永远优先于从 tmux 拿来的键位。
 
 ## 疑难排解
 

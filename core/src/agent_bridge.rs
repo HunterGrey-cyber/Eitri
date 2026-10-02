@@ -686,12 +686,17 @@ pub fn serialize_focus_permission_for_js(tab: crate::tabs::TabId) -> String {
 /// §10.1, §3.6's `effective()`), and `newTabChord` -- the prefix chord that opens a new tab, spelled
 /// out for the chooser's `New session` row (spec §10.1: `Ctrl+b c`, "from the effective prefix
 /// table"). Sent again whenever `effective()`'s result changes, same as before.
+///
+/// `tmuxSkipped`: the lines of the user's tmux config the import did not take, each as
+/// `<file>:<line>` and what was written with why, for the overlay's "Skipped from tmux" section;
+/// empty when nothing was skipped or the import is off.
 pub fn serialize_keymap_for_js(
     prefix: &str,
     window: &[crate::keymap::HelpRow],
     prefix_keys: &[crate::keymap::HelpRow],
     panel: &crate::keymap::panel::PanelKeymap,
     new_tab_chord: &str,
+    tmux_skipped: &[crate::keymap::HelpRow],
 ) -> String {
     use crate::keymap::panel::{LeaderSource, PanelKey, PanelSource};
 
@@ -747,6 +752,7 @@ pub fn serialize_keymap_for_js(
         "prefixKeys": prefix_keys,
         "panel": panel_json,
         "newTabChord": new_tab_chord,
+        "tmuxSkipped": tmux_skipped,
     })
     .to_string()
 }
@@ -1559,6 +1565,10 @@ mod tests {
             &[row("Ctrl+b f", "HINT")],
             &panel,
             "Ctrl+b c",
+            &[row(
+                "~/.tmux.conf:3",
+                "bind P paste-buffer \u{2014} no Eitri equivalent: paste-buffer",
+            )],
         ))
         .unwrap();
         assert_eq!(value["kind"], "keymap");
@@ -1573,13 +1583,17 @@ mod tests {
         );
         assert_eq!(value["newTabChord"], "Ctrl+b c");
         assert!(value["panel"]["bindings"].is_array(), "the panel table travels too");
+        assert_eq!(
+            value["tmuxSkipped"],
+            serde_json::json!([{ "keys": "~/.tmux.conf:3", "what": "bind P paste-buffer \u{2014} no Eitri equivalent: paste-buffer" }])
+        );
     }
 
     #[test]
     fn the_keymap_envelope_carries_the_panel_table() {
         let (panel, _) = crate::keymap::panel::effective(&Default::default(), None);
         let v: serde_json::Value =
-            serde_json::from_str(&serialize_keymap_for_js("Ctrl+b", &[], &[], &panel, "Ctrl+b c")).unwrap();
+            serde_json::from_str(&serialize_keymap_for_js("Ctrl+b", &[], &[], &panel, "Ctrl+b c", &[])).unwrap();
         assert_eq!(v["newTabChord"], "Ctrl+b c");
         assert_eq!(v["panel"]["leader"], " ");
         assert_eq!(v["panel"]["leaderSource"], "default");
