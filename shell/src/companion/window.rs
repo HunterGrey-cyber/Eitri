@@ -134,6 +134,19 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             std::process::exit(1);
         }
     };
+    // The prefix. A companion window has no Lua panels, so the module keys are the built-in ones.
+    let module_keys = match ModuleKeys::build(&[], &config.keymap) {
+        Ok(keys) => Rc::new(keys),
+        Err(err) => {
+            eprintln!("eitri: {err}");
+            std::process::exit(1);
+        }
+    };
+    // Every start-up failure is behind us, and nothing has started a child yet (the sidecar, the
+    // window-manager tool, WebKit's processes), so none of them inherits a pipe from nvim.
+    if start.from_editor {
+        super::leave_editor_pipes(&start.project_root);
+    }
 
     // How focus moves to another window, and how a window is brought forward: through the window
     // manager's own tool, run off the GTK thread.
@@ -314,14 +327,6 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         agent.on_hint(move |message| hint.on_panel(message));
     }
 
-    // The prefix. A companion window has no Lua panels, so the module keys are the built-in ones.
-    let module_keys = match ModuleKeys::build(&[], &config.keymap) {
-        Ok(keys) => Rc::new(keys),
-        Err(err) => {
-            eprintln!("eitri: {err}");
-            std::process::exit(1);
-        }
-    };
     // The `?` overlay's window and prefix sections, re-sent whenever the attached editor's own keys
     // report changes.
     let keys_help = crate::keys_help::KeysHelp::new(

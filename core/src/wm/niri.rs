@@ -18,6 +18,8 @@ pub fn parse_windows(json: &str) -> Result<Vec<WindowRef>, String> {
             pid,
             id: w.get("id").and_then(Value::as_u64),
             focused: w.get("is_focused").and_then(Value::as_bool).unwrap_or(false),
+            // niri does not say; nothing reads it there, since only sway is asked about edges.
+            visible: true,
             rect: None,
         });
     }

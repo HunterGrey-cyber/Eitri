@@ -49,7 +49,13 @@ pub enum LinkState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachEvent {
+    /// Connect to this nvim, starting a new generation even when it is the one the panel is at.
     Attach(PathBuf),
+    /// Someone asked for this nvim (`:EitriPanel`, `eitri panel --nvim`). The plugin sends its own
+    /// nvim's address every time, so asking from the editor the panel already follows is how a user
+    /// brings the panel forward: that changes nothing here. Any other address, or the same one
+    /// after the link was lost or failed, is an [`AttachEvent::Attach`].
+    Requested(PathBuf),
     Connected {
         gen: u64,
         channel: u64,
@@ -84,7 +90,7 @@ impl AttachEvent {
     /// The generation the event was stamped with; `None` for [`AttachEvent::Attach`], which starts one.
     fn gen(&self) -> Option<u64> {
         match self {
-            AttachEvent::Attach(_) => None,
+            AttachEvent::Attach(_) | AttachEvent::Requested(_) => None,
             AttachEvent::Connected { gen, .. }
             | AttachEvent::Blocking { gen, .. }
             | AttachEvent::Installed { gen, .. }
@@ -151,9 +157,12 @@ impl Attacher {
     }
 
     pub fn handle(&mut self, event: AttachEvent) -> Vec<Effect> {
-        if let AttachEvent::Attach(addr) = event {
-            return self.attach(addr);
-        }
+        let event = match event {
+            AttachEvent::Attach(addr) => return self.attach(addr),
+            AttachEvent::Requested(addr) if self.follows(&addr) => return Vec::new(),
+            AttachEvent::Requested(addr) => return self.attach(addr),
+            event => event,
+        };
         if event.gen() != Some(self.gen) {
             return Vec::new();
         }
@@ -220,6 +229,16 @@ impl Attacher {
                 vec![Effect::Close { gen }, Effect::CancelDraftEdits]
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Whether the panel is connecting to, installing into or attached to `addr` right now.
+    fn follows(&self, addr: &std::path::Path) -> bool {
+        match &self.state {
+            LinkState::Connecting { addr: at }
+            | LinkState::Attaching { addr: at, .. }
+            | LinkState::Attached { addr: at, .. } => at == addr,
+            LinkState::NoEditor | LinkState::Detached { .. } | LinkState::Failed { .. } => false,
         }
     }
 
@@ -509,6 +528,76 @@ mod tests {
             assert_eq!(a.handle(event), vec![]);
             assert_eq!(*a.state(), LinkState::Connecting { addr: addr("b") });
         }
+    }
+
+    #[test]
+    fn asking_for_the_editor_already_followed_changes_nothing() {
+        // Attached: no teardown, no close, the drafts kept, the same generation.
+        let mut a = attached();
+        let before = a.state().clone();
+        assert_eq!(a.handle(AttachEvent::Requested(addr("a"))), vec![]);
+        assert_eq!(*a.state(), before);
+        assert_eq!(a.gen(), 1);
+        // Still connecting or installing: the attach under way goes on.
+        let (mut a, _) = Attacher::new(Some(addr("a")));
+        assert_eq!(a.handle(AttachEvent::Requested(addr("a"))), vec![]);
+        assert_eq!(*a.state(), LinkState::Connecting { addr: addr("a") });
+        let mut a = attaching();
+        assert_eq!(a.handle(AttachEvent::Requested(addr("a"))), vec![]);
+        assert_eq!(a.gen(), 1);
+    }
+
+    #[test]
+    fn asking_for_another_editor_or_after_the_link_ended_attaches() {
+        let mut a = attached();
+        assert_eq!(
+            a.handle(AttachEvent::Requested(addr("b"))),
+            vec![
+                Effect::ExplicitTeardown { gen: 1 },
+                Effect::Close { gen: 1 },
+                Effect::CancelDraftEdits,
+                Effect::Connect {
+                    gen: 2,
+                    addr: addr("b")
+                },
+            ]
+        );
+        // The same address once the editor went away, or the attach failed, is a fresh connect.
+        let mut a = attached();
+        a.handle(AttachEvent::Closed { gen: 1 });
+        assert_eq!(
+            a.handle(AttachEvent::Requested(addr("a"))),
+            vec![Effect::Connect {
+                gen: 2,
+                addr: addr("a")
+            }]
+        );
+        let mut a = attaching();
+        a.handle(AttachEvent::ConnectFailed {
+            gen: 1,
+            why: "x".into(),
+        });
+        assert_eq!(
+            a.handle(AttachEvent::Requested(addr("a"))),
+            vec![Effect::Connect {
+                gen: 2,
+                addr: addr("a")
+            }]
+        );
+        // A forced attach to the same address still starts again (the driver's own re-attach).
+        let mut a = attached();
+        assert_eq!(
+            a.handle(AttachEvent::Attach(addr("a"))),
+            vec![
+                Effect::ExplicitTeardown { gen: 1 },
+                Effect::Close { gen: 1 },
+                Effect::CancelDraftEdits,
+                Effect::Connect {
+                    gen: 2,
+                    addr: addr("a")
+                },
+            ]
+        );
     }
 
     #[test]

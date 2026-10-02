@@ -68,7 +68,8 @@ impl CompanionLink {
         (driver.state().clone(), driver.band())
     }
 
-    /// Aim the panel at another nvim; the change shows at the next poll.
+    /// Aim the panel at this nvim, leaving the one it already follows as it is; the change shows at
+    /// the next poll.
     pub(crate) fn attach(&self, addr: PathBuf) {
         self.driver.borrow().attach(addr);
     }

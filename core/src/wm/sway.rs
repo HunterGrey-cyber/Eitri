@@ -1,6 +1,7 @@
 //! sway's `swaymsg -t get_tree`: a tree of `output`/`workspace`/`con`/`floating_con` nodes. A window
-//! is a leaf (no children) that has a pid; one that is not on screen (another workspace, the
-//! hidden half of a tabbed container) is skipped, because nothing can be moved to it by direction.
+//! is a leaf (no children) that has a pid. One that is not on screen (another workspace, the
+//! hidden half of a tabbed container) is kept but marked not visible: nothing can be moved to it by
+//! direction, yet it can still be raised by its pid, which brings its workspace or tab forward.
 
 use super::{Rect, WindowRef};
 use serde_json::Value;
@@ -24,9 +25,7 @@ fn collect(node: &Value, out: &mut Vec<WindowRef>) {
     let floating = children(node, "floating_nodes");
     if nodes.is_empty() && floating.is_empty() {
         let kind = node.get("type").and_then(Value::as_str);
-        if matches!(kind, Some("con") | Some("floating_con"))
-            && node.get("visible").and_then(Value::as_bool) == Some(true)
-        {
+        if matches!(kind, Some("con") | Some("floating_con")) {
             if let Some(pid) = node
                 .get("pid")
                 .and_then(Value::as_u64)
@@ -36,6 +35,7 @@ fn collect(node: &Value, out: &mut Vec<WindowRef>) {
                     pid,
                     id: node.get("id").and_then(Value::as_u64),
                     focused: node.get("focused").and_then(Value::as_bool).unwrap_or(false),
+                    visible: node.get("visible").and_then(Value::as_bool) == Some(true),
                     rect: node.get("rect").and_then(rect),
                 });
             }

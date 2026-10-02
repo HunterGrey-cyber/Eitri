@@ -231,9 +231,10 @@ impl LinkDriver {
         }
     }
 
-    /// Aim the panel at another nvim. Takes effect at the next `poll`.
+    /// Aim the panel at this nvim; the one it already follows is left as it is (asking from it is how
+    /// the panel is brought forward). Takes effect at the next `poll`.
     pub fn attach(&self, addr: PathBuf) {
-        let _ = self.tx.send(WorkerMsg::Event(AttachEvent::Attach(addr)));
+        let _ = self.tx.send(WorkerMsg::Event(AttachEvent::Requested(addr)));
     }
 
     pub fn state(&self) -> &LinkState {

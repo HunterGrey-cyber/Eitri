@@ -13,6 +13,8 @@ function M.panel(dir)
   if addr == nil or addr == "" then
     addr = vim.fn.serverstart()
   end
+  -- Read only until the panel starts: from then on it writes to its own log, and its last line here
+  -- says where, which is what a later failure is reported with.
   local stderr = {}
   local ok, job = pcall(vim.fn.jobstart, { config.cmd, "panel", "--nvim", addr, "--", dir or vim.fn.getcwd() }, {
     detach = true,
@@ -21,7 +23,11 @@ function M.panel(dir)
     on_exit = function(_, code)
       if code ~= 0 then
         vim.schedule(function()
-          vim.notify("eitri panel: " .. vim.trim(table.concat(stderr, "\n")), vim.log.levels.ERROR)
+          local text = vim.trim(table.concat(stderr, "\n"))
+          if text == "" then
+            text = "exited with code " .. code
+          end
+          vim.notify("eitri panel: " .. text, vim.log.levels.ERROR)
         end)
       end
     end,

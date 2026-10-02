@@ -35,6 +35,8 @@ pub(crate) struct Start {
     pub(crate) project_root: PathBuf,
     /// The address of the nvim to attach to, from `--nvim` or `$NVIM`.
     pub(crate) nvim: Option<PathBuf>,
+    /// Started from inside an nvim (`$NVIM` was set): its standard streams may be that nvim's pipes.
+    pub(crate) from_editor: bool,
     /// The per-project control socket this window owns, taken by `build` (which runs from an `Fn`
     /// closure, so it cannot move it out of the `Start`).
     pub(crate) control: Cell<Option<ControlServer>>,
@@ -68,6 +70,29 @@ fn forwarded(project_root: &std::path::Path, attached: bool) -> glib::ExitCode {
     glib::ExitCode::SUCCESS
 }
 
+/// Moves the panel's standard streams off the pipes of the nvim that started it
+/// (`eitri_core::companion::stdio`), saying once where its output goes from now on. That line is the
+/// last the starter reads, so a panel that later exits with an error is reported with its log.
+pub(crate) fn leave_editor_pipes(project_root: &std::path::Path) {
+    use std::io::Write;
+    let dir = eitri_core::companion::stdio::log_dir(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    );
+    eitri_core::companion::stdio::leave_pipes(dir.as_deref(), project_root, &|log| {
+        // Not `eprintln!`: the nvim that started the panel may already be gone, and a failed write
+        // must not panic.
+        let _ = match log {
+            Some(path) => writeln!(
+                std::io::stderr(),
+                "eitri panel: running; its output goes to {}",
+                path.display()
+            ),
+            None => writeln!(std::io::stderr(), "eitri panel: running; its output is discarded"),
+        };
+    });
+}
+
 /// A panel for this project is running but does not answer. A pid of 0 means it is not known.
 fn unresponsive_message(pid: u32) -> String {
     let pid = if pid == 0 {
@@ -84,6 +109,7 @@ fn unresponsive_message(pid: u32) -> String {
 /// start no thread.
 pub(crate) fn run(args: Vec<OsString>) -> glib::ExitCode {
     let nvim_env = std::env::var_os("NVIM");
+    let from_editor = nvim_env.is_some();
     let parsed = match eitri_core::project_root::parse_panel_args(&args, nvim_env) {
         Ok(parsed) => parsed,
         Err(message) => return fail(&message),
@@ -136,6 +162,7 @@ pub(crate) fn run(args: Vec<OsString>) -> glib::ExitCode {
     let start = Start {
         project_root,
         nvim: parsed.nvim,
+        from_editor,
         control: Cell::new(Some(server)),
         backend_kind,
         panel_notice,

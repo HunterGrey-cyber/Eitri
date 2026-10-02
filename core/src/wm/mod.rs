@@ -44,6 +44,9 @@ pub struct WindowRef {
     pub pid: u32,
     pub id: Option<u64>,
     pub focused: bool,
+    /// On screen now. A window that is not (another workspace, a hidden tab) is no neighbour for a
+    /// directional move, but can still be raised.
+    pub visible: bool,
     pub rect: Option<Rect>,
 }
 
@@ -158,8 +161,8 @@ pub fn parse_windows(wm: Wm, json: &str) -> Result<Vec<WindowRef>, String> {
     }
 }
 
-/// Whether another window lies past the focused window's edge in `dir` and shares part of its span
-/// on the other axis. `None` when no focused window with a rectangle is known.
+/// Whether another visible window lies past the focused window's edge in `dir` and shares part of
+/// its span on the other axis. `None` when no focused window with a rectangle is known.
 pub fn has_neighbour(windows: &[WindowRef], dir: Direction) -> Option<bool> {
     let (fi, f) = windows
         .iter()
@@ -170,7 +173,7 @@ pub fn has_neighbour(windows: &[WindowRef], dir: Direction) -> Option<bool> {
         windows
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != fi)
+            .filter(|(i, w)| *i != fi && w.visible)
             .filter_map(|(_, w)| w.rect)
             .any(|r| match dir {
                 Direction::Left => r.x + r.w <= f.x && overlap(f.y, f.y + f.h, r.y, r.y + r.h),
@@ -316,6 +319,7 @@ mod tests {
             pid: 42,
             id: Some(7),
             focused: false,
+            visible: true,
             rect: None,
         };
         assert_eq!(
@@ -334,10 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn sway_tree_parses_visible_leaf_windows_with_pids() {
+    fn sway_tree_parses_leaf_windows_with_pids_and_marks_the_hidden_one() {
         let ws = parse_windows(Wm::Sway, &fixture("sway_tree_two_windows.json")).unwrap();
-        // The window on the other workspace is not visible and is left out.
-        assert_eq!(ws.len(), 2);
+        // The window on the other workspace is kept, marked not visible, so it can still be raised.
+        assert_eq!(ws.len(), 3);
+        assert_eq!((ws[2].pid, ws[2].visible, ws[2].focused), (4003, false, false));
+        assert!(ws[0].visible && ws[1].visible);
         assert_eq!(ws[0].pid, 4001);
         assert!(!ws[0].focused);
         assert_eq!(
@@ -384,12 +390,51 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_window_is_no_neighbour_but_can_be_raised() {
+        let r = |x, y, w, h| Some(Rect { x, y, w, h });
+        let panel = WindowRef {
+            pid: 2,
+            id: Some(2),
+            focused: true,
+            visible: true,
+            rect: r(960, 0, 960, 1080),
+        };
+        // The editor sits to the panel's left, but on a workspace that is not shown (sway keeps its
+        // last rectangle there), or behind another tab.
+        let editor = WindowRef {
+            pid: 1,
+            id: Some(1),
+            focused: false,
+            visible: false,
+            rect: r(0, 0, 960, 1080),
+        };
+        let ws = [editor, panel];
+        assert_eq!(has_neighbour(&ws, Direction::Left), Some(false));
+        assert_eq!(first_window_owner(&[300, 1], &ws).map(|w| w.pid), Some(1));
+        assert_eq!(
+            first_window_owner(&[300, 1], &ws).and_then(|w| focus_window_argv(Wm::Sway, w)),
+            Some(vec!["swaymsg".to_string(), "[pid=1] focus".to_string()])
+        );
+        // The same from the fixture's window on workspace 2.
+        let ws = parse_windows(Wm::Sway, &fixture("sway_tree_two_windows.json")).unwrap();
+        assert_eq!(first_window_owner(&[4003], &ws).map(|w| w.pid), Some(4003));
+        let h = parse_windows(
+            Wm::Hyprland,
+            r#"[{"mapped":true,"hidden":true,"pid":8,"focusHistoryID":3},{"mapped":false,"pid":9}]"#,
+        )
+        .unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!((h[0].pid, h[0].visible), (8, false));
+    }
+
+    #[test]
     fn has_neighbour_needs_the_other_axis_to_overlap() {
         let r = |x, y, w, h| Some(Rect { x, y, w, h });
         let w = |focused, rect| WindowRef {
             pid: 1,
             id: None,
             focused,
+            visible: true,
             rect,
         };
         // Beside the focused window's edge but entirely below its span: not a left neighbour.
@@ -398,6 +443,30 @@ mod tests {
         assert_eq!(has_neighbour(&ws, Direction::Down), Some(false));
         // Touching edges count as beyond.
         let ws = [w(true, r(500, 0, 500, 400)), w(false, r(0, 100, 500, 100))];
+        assert_eq!(has_neighbour(&ws, Direction::Left), Some(true));
+    }
+
+    #[test]
+    fn a_real_sway_tree_parses_and_the_left_edge_has_no_neighbour() {
+        // `swaymsg -t get_tree` recorded from a headless sway holding a terminal (pid 1955365, focused, left half)
+        // and a companion panel (pid 1955517, right half): every field the real thing sends, not a hand-cut subset.
+        let mut ws = parse_windows(Wm::Sway, &fixture("sway_tree_real_two_windows.json")).unwrap();
+        let pids: Vec<u32> = ws.iter().map(|w| w.pid).collect();
+        assert_eq!(pids, [1955365, 1955517]);
+        assert_eq!((ws[0].focused, ws[1].focused), (true, false));
+        assert_eq!(
+            ws[1].rect,
+            Some(Rect {
+                x: 800,
+                y: 0,
+                w: 800,
+                h: 900
+            })
+        );
+        assert_eq!(has_neighbour(&ws, Direction::Left), Some(false));
+        assert_eq!(has_neighbour(&ws, Direction::Right), Some(true));
+        ws[0].focused = false;
+        ws[1].focused = true;
         assert_eq!(has_neighbour(&ws, Direction::Left), Some(true));
     }
 
@@ -499,6 +568,7 @@ mod tests {
             pid,
             id: Some(pid as u64),
             focused,
+            visible: true,
             rect: None,
         }
     }

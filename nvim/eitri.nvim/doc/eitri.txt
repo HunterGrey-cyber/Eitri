@@ -47,10 +47,14 @@ Without a plugin manager, add the directory to 'runtimepath':
                         working directory. If nvim has no server address yet,
                         one is started. A second :EitriPanel while the first
                         panel is still starting attaches to it or raises it;
-                        it never opens a second window.
+                        it never opens a second window. From the nvim the
+                        panel is already attached to, it only raises the
+                        panel: drafts being edited here stay open.
 
 If `eitri` cannot be run, or the panel refuses, the reason is shown as an
-error message.
+error message. Once the panel is up it writes its output to a log file of its
+own (under `~/.local/state/eitri/companion/`), so it keeps running after this
+nvim quits; if it fails later, the message names that log.
 
 ==============================================================================
 3. SETUP                                                         *eitri-setup*
@@ -93,6 +97,12 @@ Inside tmux nothing in nvim's environment changes, the navigator maps are left
 alone, and your tmux setup keeps moving between panes as it does today. The
 panel is its own window; a move that reaches no window of the window manager
 raises nothing and says nothing.
+
+smart-splits inside tmux calls its `at_edge` callback only when tmux has no
+pane further that way, so |eitri.edge()| never takes a move tmux could make:
+at tmux's own edge it moves to the neighbouring window of your window manager
+(the panel, when it sits there). Leave `edge()` out of `at_edge` if a move
+should stop at tmux's edge instead.
 
 ==============================================================================
 6. WINDOW MANAGER                                                    *eitri-wm*

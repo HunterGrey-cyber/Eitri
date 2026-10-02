@@ -64,9 +64,33 @@ local ok = vim.wait(5000, function() return #msgs > 0 end, 20)
 assert(ok, "no error message after a failing launcher")
 assert(msgs[1][2] == vim.log.levels.ERROR, "the message is not an error")
 assert(msgs[1][1]:find("eitri panel", 1, true), "the message does not name the panel: " .. msgs[1][1])
+assert(msgs[1][1]:find("exited with code 1", 1, true), "a silent failure does not give its code: " .. msgs[1][1])
 io.stdout:write("OK\n")
 LUA
 check ":EitriPanel with a failing launcher notifies an error" "$SCRATCH/fail.lua"
+
+# A panel that started moves its output to a log, so the pipe ends early; a later failure is reported with the
+# last line it wrote before that (where its log is).
+cat >"$SCRATCH/late.lua" <<'LUA'
+local msgs = {}
+vim.notify = function(msg, level) table.insert(msgs, { msg, level }) end
+require("eitri").setup({ cmd = vim.env.EITRI_TEST_SCRIPT })
+vim.cmd("EitriPanel")
+assert(vim.wait(5000, function() return #msgs > 0 end, 20), "no error message after a late failure")
+assert(msgs[1][2] == vim.log.levels.ERROR)
+assert(msgs[1][1]:find("its output goes to /log/x.log", 1, true), "the log is not named: " .. msgs[1][1])
+io.stdout:write("OK\n")
+LUA
+cat >"$SCRATCH/late-eitri" <<'SH'
+#!/bin/sh
+echo "eitri panel: running; its output goes to /log/x.log" >&2
+exec 2>/dev/null
+sleep 0.3
+echo "lost" >&2
+exit 4
+SH
+chmod +x "$SCRATCH/late-eitri"
+EITRI_TEST_SCRIPT="$SCRATCH/late-eitri" check ":EitriPanel reports a failure after the panel left the pipe" "$SCRATCH/late.lua"
 
 cat >"$SCRATCH/missing.lua" <<'LUA'
 local msgs = {}
