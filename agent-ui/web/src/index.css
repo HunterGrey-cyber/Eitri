@@ -1743,6 +1743,71 @@ textarea,
   background: var(--nv-cursorline);
 }
 
+/* The turn review overlay (`c` in BROWSE; `components/ReviewOverlay.tsx`): shaped like `.keymap-overlay`
+   and `.detail-popover` above -- the same overlay over `.agent-ui-scroller`, the same surface -- so the winbar
+   and the status band stay visible. Its rows are the document's own `Row` (the sign column and the cursor
+   block come with it) and its patches the `.diff-*` rules further down, so nothing here sets a colour but
+   `--nv-fg` and `--nv-muted`: a new colour declaration on a signal token is a design error, and
+   `indexCss.test.ts`'s guard is what says so. */
+.review-overlay {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 16px 20px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+}
+.review-header {
+  margin-bottom: 8px;
+}
+.review-title {
+  font-size: var(--fs-md);
+}
+/* What the record says is partial or wrong about the turn, one line each, under the title. */
+.review-flag,
+.review-note {
+  color: var(--nv-muted);
+  padding: 2px 0;
+}
+.review-note {
+  padding-left: calc(var(--row-gutter) + 2px);
+}
+.review-path {
+  word-break: break-all;
+}
+.review-counts,
+.review-file-flag {
+  margin-left: 12px;
+  color: var(--nv-muted);
+  white-space: nowrap;
+}
+.review-hunk {
+  margin-left: var(--row-gutter);
+}
+.review-hunk-header {
+  color: var(--nv-muted);
+}
+/* One open hunk's lines. Past the height of a tool result's own box it scrolls inside itself, and `j`/`k`
+   scroll it before they move the cursor (`App.tsx`). */
+.review-hunk-lines {
+  margin-left: var(--row-gutter);
+  max-height: 260px;
+  overflow: auto;
+  padding-bottom: 4px;
+}
+.review-lineno {
+  width: 4ch;
+  flex: none;
+  text-align: right;
+  color: var(--nv-muted);
+}
+.review-keys {
+  margin-top: 12px;
+  color: var(--nv-muted);
+}
+
 /* `prefix w` (spec §3.6, session tabs Task 12): shaped exactly like
    `.keymap-overlay` and `.detail-popover` above -- same overlay, same surface, same positioning --
    over `.agent-ui-scroller` in the conversation layout and over `.agent-ui-root` (also

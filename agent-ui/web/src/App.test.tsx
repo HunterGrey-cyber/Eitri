@@ -7548,12 +7548,13 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     const el = overlay(container);
     expect(el).not.toBeNull();
     const titles = Array.from(el!.querySelectorAll("h2")).map((h) => h.textContent);
-    // "Selecting" (visual-mode spec, D2) sits right after "This panel"; "Leader and tab keys"
-    // (panel round 2 plan, Task 8) after that, then "Typing"; "Slash commands" (spec §9.2, P10)
+    // "Selecting" (visual-mode spec, D2) sits right after "This panel", "Review (c)" after it; "Leader and
+    // tab keys" (panel round 2 plan, Task 8) after that, then "Typing"; "Slash commands" (spec §9.2, P10)
     // sits between "Typing" and "Anywhere".
     expect(titles).toEqual([
       "This panel",
       "Selecting (v)",
+      "Review (c)",
       "Leader and tab keys",
       "Typing",
       "Slash commands",

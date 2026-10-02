@@ -13,6 +13,22 @@ describe("nextRequestId", () => {
 });
 
 describe("installDispatch", () => {
+  it("demuxes the turn review's three envelopes, and the requests the overlay posts type-check", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    const review = { kind: "review", requestId: "r1", tab: 3, scope: "turn", current: 7, turns: [], files: [], compared: true, pendingNoResult: 0, notes: [] };
+    const diff = { kind: "review_diff", requestId: "r2", tab: 3, turn: 7, path: "a.rs", added: 1, removed: 0, hunks: null };
+    const hint = { kind: "review_hint", tab: 3, turn: 7, files: 2 };
+    for (const envelope of [review, diff, hint]) window.__eitriDispatch!(JSON.stringify(envelope));
+    expect(handler.mock.calls.map((call) => call[0])).toEqual([review, diff, hint]);
+    const sent: OutboundMessage[] = [
+      { type: "review_request", request_id: "r1", tab: 3, turn: "latest", scope: "turn" },
+      { type: "review_request", request_id: "r2", tab: 3, turn: 6, scope: "session" },
+      { type: "review_diff_request", request_id: "r3", tab: 3, turn: 7, scope: "turn", path: "a.rs" },
+    ];
+    expect(sent).toHaveLength(3);
+  });
+
   it("demuxes a command_result envelope with ok:true", () => {
     const handler = vi.fn();
     installDispatch(handler);

@@ -39,6 +39,25 @@ describe("the band degrades by priority (spec §5.3)", () => {
     const link = { state: "none" as const, text: "no editor attached: run :EitriPanel in nvim" };
     expect(ids(330, { ...running, link })).not.toContain("link");
   });
+  it("shows the review pointer, worded as a count of files that changed and the key that opens them", () => {
+    const seg = (files: number) => bandLayout({ ...idle, review: { files } }, 900, 7.2).find((s) => s.id === "review");
+    expect(seg(3)).toEqual({ id: "review", text: "3 files changed · c to review", side: "right" });
+    expect(seg(1)?.text).toBe("1 file changed · c to review");
+    expect(seg(0)).toBeUndefined();
+    expect(bandLayout({ ...idle, review: null }, 900, 7.2).map((s) => s.id)).not.toContain("review");
+  });
+  it("drops the review pointer before the model, and never over a prompt", () => {
+    const facts: BandFacts = { ...idle, review: { files: 3 } };
+    expect(ids(900, facts)).toContain("review");
+    // Narrow enough that the model has to go too: the pointer went first.
+    const narrow = bandLayout(facts, 200, 7.2).map((s) => s.id);
+    expect(narrow).not.toContain("review");
+    for (let width = 100; width < 900; width += 10) {
+      const shown = bandLayout(facts, width, 7.2).map((s) => s.id);
+      if (shown.includes("review")) expect(shown, `width ${width}`).toContain("model");
+    }
+    expect(ids(900, { ...facts, prompt: "close? (y/n)" })).toEqual(["mode", "prompt"]);
+  });
   it("a y/n prompt takes everything right of the mode", () => {
     expect(ids(520, { ...running, prompt: "close 2 \"docs\"? (y/n)" })).toEqual(["mode", "prompt"]);
   });

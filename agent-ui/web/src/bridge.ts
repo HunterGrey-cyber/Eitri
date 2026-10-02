@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, TabId, TabsEnvelope } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewScope, TabId, TabsEnvelope } from "./types";
 import type { KeymapHelp, PaneDirection } from "./keymap";
 
 export type OutboundMessage =
@@ -107,7 +107,17 @@ export type OutboundMessage =
    *  wrote. Window-level, like `open_path`; Rust re-checks it (`agent_panel.rs#web_url`, http(s) and a plain
    *  host only) and answers with a `command_result`, an error when it is not a web link.
    *  `InboundMessage::OpenUrl`, `core/src/agent_bridge.rs`. */
-  | { type: "open_url"; request_id: string; url: string };
+  | { type: "open_url"; request_id: string; url: string }
+  /** `c` in BROWSE, and `[`/`]`/`S` inside the review overlay: the files that changed on disk during this
+   *  tab's turn (`"latest"`, or a turn number) or, with `scope: "session"`, since the session's first
+   *  baseline. Names the tab, as every tab-scoped command does; the reply is a `review` envelope carrying the
+   *  same `request_id`, or a `command_result` failure with the reason (no session, no such turn, git
+   *  unavailable). `InboundMessage::ReviewRequest`, `core/src/agent_bridge.rs`. */
+  | { type: "review_request"; request_id: string; tab: TabId; turn: "latest" | number; scope: ReviewScope }
+  /** `Enter` on a file of the review overlay: that file's hunks, under the overlay's current scope. The
+   *  reply is a `review_diff` envelope with the same `request_id`, or a `command_result` failure.
+   *  `InboundMessage::ReviewDiffRequest`, `core/src/agent_bridge.rs`. */
+  | { type: "review_diff_request"; request_id: string; tab: TabId; turn: number; scope: ReviewScope; path: string };
 
 /** The composer mirror's three states (spec §3.5). Distinct from `./keymap`'s `PanelMode`, which is
  *  this component's OWN mode ("hint" included, unreachable yet) -- this type is the wire value Rust
@@ -280,7 +290,16 @@ type InboundHandler = (
     /** V1 §3.5: `install_module_nav` claimed a bare `Ctrl+j`/`Ctrl+k` against the mirror this page
      *  last posted. Window-level, like `enter_input`/`arrive` -- there is no tab to name, since it
      *  is about which of BROWSE/INPUT has the keys, not about a tab's own state. */
-    | { kind: "nav_key"; direction: NavKeyDirection },
+    | { kind: "nav_key"; direction: NavKeyDirection }
+    /** The reply to `review_request`: the turns, the files and the notes (`serialize_review_for_js`,
+     *  `core/src/agent_bridge.rs`). Tab-scoped; matched to the overlay by `requestId`. */
+    | ({ kind: "review" } & ReviewEnvelope)
+    /** The reply to `review_diff_request`: one file's hunks, or `hunks: null` when over the cap. */
+    | ({ kind: "review_diff" } & ReviewDiffEnvelope)
+    /** A finished turn changed `files` files: the band says so until the overlay is opened on that turn
+     *  or a new turn starts. `files: 0` clears it. Names its tab and is kept for it even while another
+     *  tab is on screen. */
+    | ({ kind: "review_hint" } & ReviewHintEnvelope),
 ) => void;
 
 /** The handler's own payload type, exported so callers (`tabs.ts`'s `acceptsEnvelope`, `App.tsx`)
@@ -350,7 +369,10 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "editor_link" ||
         obj.kind === "scratch" ||
         obj.kind === "notice" ||
-        obj.kind === "nav_key"
+        obj.kind === "nav_key" ||
+        obj.kind === "review" ||
+        obj.kind === "review_diff" ||
+        obj.kind === "review_hint"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);
         return;

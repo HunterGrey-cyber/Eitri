@@ -1,0 +1,308 @@
+{
+  "envelopes": {
+    "basePending": {
+      "compared": false,
+      "current": 7,
+      "files": [],
+      "kind": "review",
+      "notes": [
+        "changed on disk during this turn",
+        "the baseline snapshot is still being taken"
+      ],
+      "pendingNoResult": 0,
+      "requestId": "basePending",
+      "scope": "turn",
+      "tab": 3,
+      "turns": [
+        {
+          "endedAt": 1790000560000,
+          "late": false,
+          "n": 9,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": null,
+          "startedAt": 1790000540000,
+          "state": "ok",
+          "turnId": "t9"
+        },
+        {
+          "endedAt": null,
+          "late": false,
+          "n": 7,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": null,
+          "startedAt": 1790000420000,
+          "state": "pending",
+          "turnId": "t7"
+        }
+      ]
+    },
+    "earlierRun": {
+      "compared": true,
+      "current": 6,
+      "files": [],
+      "kind": "review",
+      "notes": [
+        "changed on disk during this turn",
+        "this turn did not finish while Eitri was running"
+      ],
+      "pendingNoResult": 0,
+      "requestId": "earlierRun",
+      "scope": "turn",
+      "tab": 3,
+      "turns": [
+        {
+          "endedAt": null,
+          "late": false,
+          "n": 6,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": "this turn did not finish while Eitri was running",
+          "startedAt": 1790000360000,
+          "state": "unfinished",
+          "turnId": "t6"
+        }
+      ]
+    },
+    "endFailed": {
+      "compared": true,
+      "current": 5,
+      "files": [],
+      "kind": "review",
+      "notes": [
+        "changed on disk during this turn",
+        "no end snapshot (too many files to snapshot (20001, the limit is 20000)): compared with the files on disk now"
+      ],
+      "pendingNoResult": 0,
+      "requestId": "endFailed",
+      "scope": "turn",
+      "tab": 3,
+      "turns": [
+        {
+          "endedAt": 1790000320000,
+          "late": false,
+          "n": 5,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": "too many files to snapshot (20001, the limit is 20000)",
+          "startedAt": 1790000300000,
+          "state": "unfinished",
+          "turnId": "t5"
+        }
+      ]
+    },
+    "flagged": {
+      "compared": true,
+      "current": 3,
+      "files": [],
+      "kind": "review",
+      "notes": [
+        "changed on disk during this turn",
+        "baseline late: changes made before HH:MM:SS may be missing",
+        "may include the next turn's first changes",
+        "this turn overlapped another tab's turn"
+      ],
+      "pendingNoResult": 0,
+      "requestId": "flagged",
+      "scope": "turn",
+      "tab": 3,
+      "turns": [
+        {
+          "endedAt": 1790000560000,
+          "late": false,
+          "n": 9,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": null,
+          "startedAt": 1790000540000,
+          "state": "ok",
+          "turnId": "t9"
+        },
+        {
+          "endedAt": 1790000200000,
+          "late": true,
+          "n": 3,
+          "overlappedNext": true,
+          "overlappedTab": true,
+          "reason": null,
+          "startedAt": 1790000180000,
+          "state": "ok",
+          "turnId": "t3"
+        }
+      ]
+    },
+    "noBaseline": {
+      "compared": false,
+      "current": 4,
+      "files": [],
+      "kind": "review",
+      "notes": [
+        "changed on disk during this turn",
+        "no baseline: the snapshot took too long"
+      ],
+      "pendingNoResult": 0,
+      "requestId": "noBaseline",
+      "scope": "turn",
+      "tab": 3,
+      "turns": [
+        {
+          "endedAt": 1790000260000,
+          "late": false,
+          "n": 4,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": "the snapshot took too long",
+          "startedAt": 1790000240000,
+          "state": "no_baseline",
+          "turnId": "t4"
+        }
+      ]
+    },
+    "ok": {
+      "compared": true,
+      "current": 9,
+      "files": [],
+      "kind": "review",
+      "notes": [
+        "changed on disk during this turn"
+      ],
+      "pendingNoResult": 0,
+      "requestId": "ok",
+      "scope": "turn",
+      "tab": 3,
+      "turns": [
+        {
+          "endedAt": 1790000560000,
+          "late": false,
+          "n": 9,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": null,
+          "startedAt": 1790000540000,
+          "state": "ok",
+          "turnId": "t9"
+        }
+      ]
+    },
+    "running": {
+      "compared": true,
+      "current": 8,
+      "files": [],
+      "kind": "review",
+      "notes": [
+        "changed on disk during this turn",
+        "this turn is still running: compared with the files on disk now"
+      ],
+      "pendingNoResult": 0,
+      "requestId": "running",
+      "scope": "turn",
+      "tab": 3,
+      "turns": [
+        {
+          "endedAt": null,
+          "late": false,
+          "n": 8,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": null,
+          "startedAt": 1790000480000,
+          "state": "pending",
+          "turnId": "t8"
+        }
+      ]
+    },
+    "session": {
+      "compared": true,
+      "current": 8,
+      "files": [],
+      "kind": "review",
+      "notes": [
+        "changed on disk during this session",
+        "turn 3: baseline late: changes made before HH:MM:SS may be missing",
+        "turn 3: may include the next turn's first changes",
+        "turn 3: this turn overlapped another tab's turn",
+        "turn 5: no end snapshot (too many files to snapshot (20001, the limit is 20000)): compared with the files on disk now",
+        "turn 8: this turn is still running: compared with the files on disk now"
+      ],
+      "pendingNoResult": 0,
+      "requestId": "session",
+      "scope": "session",
+      "tab": 3,
+      "turns": [
+        {
+          "endedAt": 1790000200000,
+          "late": true,
+          "n": 3,
+          "overlappedNext": true,
+          "overlappedTab": true,
+          "reason": null,
+          "startedAt": 1790000180000,
+          "state": "ok",
+          "turnId": "t3"
+        },
+        {
+          "endedAt": 1790000320000,
+          "late": false,
+          "n": 5,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": "too many files to snapshot (20001, the limit is 20000)",
+          "startedAt": 1790000300000,
+          "state": "unfinished",
+          "turnId": "t5"
+        },
+        {
+          "endedAt": null,
+          "late": false,
+          "n": 8,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": null,
+          "startedAt": 1790000480000,
+          "state": "pending",
+          "turnId": "t8"
+        }
+      ]
+    },
+    "sessionNoBaseline": {
+      "compared": false,
+      "current": 7,
+      "files": [],
+      "kind": "review",
+      "notes": [
+        "changed on disk during this session",
+        "no baseline: no turn of this session has a baseline"
+      ],
+      "pendingNoResult": 0,
+      "requestId": "sessionNoBaseline",
+      "scope": "session",
+      "tab": 3,
+      "turns": [
+        {
+          "endedAt": 1790000260000,
+          "late": false,
+          "n": 4,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": "the snapshot took too long",
+          "startedAt": 1790000240000,
+          "state": "no_baseline",
+          "turnId": "t4"
+        },
+        {
+          "endedAt": null,
+          "late": false,
+          "n": 7,
+          "overlappedNext": false,
+          "overlappedTab": false,
+          "reason": null,
+          "startedAt": 1790000420000,
+          "state": "pending",
+          "turnId": "t7"
+        }
+      ]
+    }
+  },
+  "writtenBy": "core/src/turn_review/lifecycle.rs, tests::the_review_notes_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

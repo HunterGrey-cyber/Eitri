@@ -117,6 +117,11 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   // rather than inserted so the regenerated fixture diffs as additions only.
   { label: "Ctrl+e", mode: "browse", event: key("e", { ctrlKey: true }), ctx: { sessionEnded: false } },
   { label: "Ctrl+y", mode: "browse", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },
+  // Turn review: `c` opens the overlay -- an added key, so the cases are appended and the regenerated
+  // fixture diffs as additions only. The same letter in INPUT stays a letter.
+  { label: "c, a live session", mode: "browse", event: key("c"), ctx: { sessionEnded: false } },
+  { label: "c, a session that ended", mode: "browse", event: key("c"), ctx: { sessionEnded: true } },
+  { label: "c, input", mode: "input", event: key("c"), ctx: { sessionEnded: false } },
   // Visual-mode spec (docs/superpowers/specs/2026-09-28-browse-visual-mode-design.md) §2, additions
   // only: BROWSE's own entry keys, the reservation `gv` makes, one case per VISUAL_KEYS row in each
   // of VISUAL and V-LINE, and the review's own three "never an answer" pins (§7, finding 7) plus the

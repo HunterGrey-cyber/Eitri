@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { KeymapOverlay } from "./KeymapOverlay";
-import { BROWSE_KEYS, CARET_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS, VISUAL_KEYS } from "../keymap";
+import { BROWSE_KEYS, CARET_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS, REVIEW_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelTable } from "../keymap";
 import { binding, TABLE } from "../testFixtures";
 import { listedSlashCommands } from "../slashCommands";
@@ -31,6 +31,7 @@ describe("KeymapOverlay", () => {
     expect(titles).toEqual([
       "This panel",
       "Selecting (v)",
+      "Review (c)",
       "Leader and tab keys",
       "Typing",
       "Slash commands",
@@ -51,7 +52,7 @@ describe("KeymapOverlay", () => {
   it("lists every row it was given and every local row, none dropped", () => {
     const { container } = overlay();
     const text = container.textContent!;
-    for (const row of [...BROWSE_KEYS, ...CARET_KEYS, ...VISUAL_KEYS, ...INPUT_KEYS, ...WINDOW, ...PREFIX]) {
+    for (const row of [...BROWSE_KEYS, ...CARET_KEYS, ...VISUAL_KEYS, ...REVIEW_KEYS, ...INPUT_KEYS, ...WINDOW, ...PREFIX]) {
       expect(text).toContain(row.keys);
       expect(text).toContain(row.what);
     }
@@ -63,9 +64,9 @@ describe("KeymapOverlay", () => {
     // `resolveKey`/`COMPOSER_CHORDS` both ways (`keymap.test.ts`, `composerKeys.test.ts`). The leader
     // section adds none of its own -- `EMPTY_PANEL_TABLE` has no bindings. "Selecting" (visual-mode
     // spec, revised for 3a) adds `CARET_KEYS.length + VISUAL_KEYS.length` rows of its own -- no
-    // GTK-decided extra, since the region never reaches `shell`.
+    // GTK-decided extra, since the region never reaches `shell`. "Review (c)" adds `REVIEW_KEYS.length`.
     expect(container.querySelectorAll("tr").length).toBe(
-      BROWSE_KEYS.length + 1 + CARET_KEYS.length + VISUAL_KEYS.length + INPUT_KEYS.length + 4 + WINDOW.length + PREFIX.length,
+      BROWSE_KEYS.length + 1 + CARET_KEYS.length + VISUAL_KEYS.length + REVIEW_KEYS.length + INPUT_KEYS.length + 4 + WINDOW.length + PREFIX.length,
     );
   });
 

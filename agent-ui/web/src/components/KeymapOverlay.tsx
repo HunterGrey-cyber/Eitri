@@ -1,5 +1,5 @@
 import { forwardRef } from "react";
-import { browseKeys, CARET_KEYS, INPUT_KEYS, VISUAL_KEYS } from "../keymap";
+import { browseKeys, CARET_KEYS, INPUT_KEYS, REVIEW_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
@@ -248,6 +248,13 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         note="Ctrl+[ is Esc everywhere in this panel."
       />
       <Selecting panel={panel} />
+      {/* The review overlay (`c`): its keys are `./review`'s, not `resolveKey`'s, so they are a section of
+          their own, tied to that table both ways by `review.test.ts`. */}
+      <Section
+        title="Review (c)"
+        rows={REVIEW_KEYS}
+        note="Opened with c in BROWSE. It owns every key while it is open and changes nothing on disk."
+      />
       <LeaderAndTabKeys panel={panel} />
       {/* R13 (v1 picks Task 11, owner decision d): what Enter sends beyond the typed text is one sentence
           about Enter, not a key of its own -- `Composer` sends it and `resolveKey` never sees it, so it

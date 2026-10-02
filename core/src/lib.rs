@@ -38,6 +38,7 @@ pub mod tab_restore;
 pub mod tab_set;
 pub mod tabs;
 pub mod theme;
+pub mod turn_review;
 pub mod turn_trace;
 pub mod wm;
 

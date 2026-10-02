@@ -487,6 +487,12 @@ struct AgentPanelState {
     scratch: Option<eitri_core::scratch::ScratchDir>,
     /// Edits out in nvim, polled by the tick until their marker appears.
     pending_edits: Vec<eitri_core::scratch::PendingEdit>,
+    /// Reviews being worked out on worker threads, polled by the tick: git never runs on the GTK
+    /// thread, so the answer comes back through a channel the tick drains.
+    review_jobs: Vec<PendingReview>,
+    /// Status-band hints not yet shown: the page was not ready (loading, or reloading) when they
+    /// arrived. At most one per tab, the newest.
+    review_hints: Vec<eitri_core::turn_review::ReviewHint>,
     /// shows and focuses the editor, then hands it these keys; `Err` says why it could not.
     editor_request_hook: Option<EditorRequestHook>,
     /// An edit came back (or was discarded): the keys return to the chat, in INPUT.
@@ -1589,6 +1595,15 @@ fn panel_state(
     // The key a session lease is taken under (`AgentConversation` canonicalizes its cwd the same
     // way). `main.rs` already canonicalized the root; this only makes the string explicit.
     let canonical_root = project_dir.canonicalize().unwrap_or_else(|_| project_dir.clone());
+    // Turn review follows every tab's turns from here on; the legacy backend has no turn
+    // boundaries to follow and says so.
+    if let Err(why) = tabs.install_turn_review(eitri_core::turn_review::TurnReview::new(
+        state_home.as_deref(),
+        home.as_deref(),
+        &canonical_root,
+    )) {
+        eprintln!("[agent_panel] {why}");
+    }
     let canonical_project_dir = canonical_root.to_string_lossy().into_owned();
     let tabs_dir = eitri_core::saved_tabs::state_dir(state_home.as_deref(), home.as_deref());
     let (restore_source, notes) = eitri_core::saved_tabs::startup(tabs_dir.as_deref(), &project_dir);
@@ -1623,6 +1638,8 @@ fn panel_state(
         last_open_ids: Vec::new(),
         scratch,
         pending_edits: Vec::new(),
+        review_jobs: Vec::new(),
+        review_hints: Vec::new(),
         editor_request_hook: None,
         editor_done_hook: None,
         retiring: Retiring::default(),
@@ -1672,7 +1689,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
         // message handler takes the same `RefCell`, and anything that let it run during the
         // dispatch would panic on an already-borrowed cell rather than fail gracefully.
-        let (payload, class, first_text, turn_ended, offers_changed, tripped) = {
+        let (payload, class, first_text, turn_ended, offers_changed, tripped, review_hints) = {
             let mut state_ref = state.borrow_mut();
             let state_ref = &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
@@ -1734,6 +1751,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 out.turn_ended,
                 out.offers_changed,
                 out.tripped,
+                out.review_hints,
             )
         };
         // The CLI-mode tripwire failed these tabs (spec §2.3, D12): each session is shut down off
@@ -1786,6 +1804,22 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 apply_flush(&state, &webview, tab, flush);
             }
         }
+        // A turn's end snapshot landed: the status band's hint. A page that has not said `ready` (still
+        // loading, or reloading) has nothing to show it, so it waits here for the page; the review
+        // itself is asked for by `c`, never by this.
+        let hints = {
+            let mut state_ref = state.borrow_mut();
+            let state_ref = &mut *state_ref;
+            keep_newest_hint_per_tab(&mut state_ref.review_hints, review_hints);
+            if state_ref.document_ready {
+                std::mem::take(&mut state_ref.review_hints)
+            } else {
+                Vec::new()
+            }
+        };
+        for hint in &hints {
+            evaluate_js_dispatch(&webview, &eitri_core::agent_bridge::serialize_review_hint_for_js(hint));
+        }
         // The active tab's offers changed (a card arrived or went): the panel's third buttons follow.
         if offers_changed.contains(&state.borrow().tabs.active()) && state.borrow().document_ready {
             let payload = {
@@ -1797,6 +1831,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         }
         send_context_if_changed(&state, &webview);
         poll_scratch_edits(&state, &webview);
+        poll_review_jobs(&state, &webview);
         send_tabs_if_changed(&state, &webview);
         remember_tabs(&state);
         send_hello_if_open_sessions_changed(&state, &webview);
@@ -1838,6 +1873,89 @@ fn request_editor(
         Some(hook) => hook(request),
         None => Err("the editor is not connected to this panel".to_string()),
     }
+}
+
+/// The most reviews worked out at once. Each one runs git over the shadow repository, and a panel
+/// that asks again before an answer arrives is told to wait rather than queueing without bound.
+const MAX_REVIEW_JOBS: usize = 4;
+
+/// One review being worked out on a worker thread.
+struct PendingReview {
+    request_id: String,
+    /// The finished envelope, or why there is none.
+    rx: mpsc::Receiver<Result<String, String>>,
+}
+
+/// Runs `work` on a worker thread; the tick sends what it returns (see [`poll_review_jobs`]).
+/// Refused while [`MAX_REVIEW_JOBS`] are already out.
+fn start_review_job(
+    state: &Rc<RefCell<AgentPanelState>>,
+    request_id: &str,
+    work: impl FnOnce() -> Result<String, String> + Send + 'static,
+) -> Result<(), String> {
+    if state.borrow().review_jobs.len() >= MAX_REVIEW_JOBS {
+        return Err("reviews are still being worked out; try again in a moment".to_string());
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // A window closed in the meantime has dropped the receiver; the answer has nowhere to go.
+        let _ = tx.send(work());
+    });
+    state.borrow_mut().review_jobs.push(PendingReview {
+        request_id: request_id.to_string(),
+        rx,
+    });
+    Ok(())
+}
+
+/// What the finished jobs of `jobs` owe the panel, in order: an envelope for a review that was
+/// worked out, a failing `command_result` for one that could not be (or whose worker died). The
+/// finished ones leave `jobs`.
+fn finished_reviews(jobs: &mut Vec<PendingReview>) -> Vec<String> {
+    let mut payloads = Vec::new();
+    jobs.retain(|job| match job.rx.try_recv() {
+        Ok(Ok(envelope)) => {
+            payloads.push(envelope);
+            false
+        }
+        Ok(Err(why)) => {
+            payloads.push(serialize_command_result_for_js(&job.request_id, Err(&why)));
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            payloads.push(serialize_command_result_for_js(
+                &job.request_id,
+                Err("the review stopped before it finished"),
+            ));
+            false
+        }
+        Err(mpsc::TryRecvError::Empty) => true,
+    });
+    payloads
+}
+
+/// Adds `new` to the hints still waiting for the page, in order; a tab's older hint is dropped
+/// because the newer one (even `files: 0`, which clears) supersedes it.
+fn keep_newest_hint_per_tab(
+    waiting: &mut Vec<eitri_core::turn_review::ReviewHint>,
+    new: Vec<eitri_core::turn_review::ReviewHint>,
+) {
+    for hint in new {
+        waiting.retain(|old| old.tab != hint.tab);
+        waiting.push(hint);
+    }
+}
+
+/// The tick's half of a review: whatever a worker finished goes to the panel.
+fn poll_review_jobs(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let payloads = {
+        let mut state_ref = state.borrow_mut();
+        if state_ref.review_jobs.is_empty() {
+            return;
+        }
+        finished_reviews(&mut state_ref.review_jobs)
+    };
+    dispatch_all(webview, payloads);
 }
 
 /// C5's return half: every edit whose marker appeared goes back to the tab it came from (review
@@ -3770,6 +3888,38 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 Err(why) => refuse(webview, &why),
             }
         }
+        // `c` in BROWSE: the jobs are built here, from this tab's own session and edit calls, and run
+        // on a worker; the answer is an envelope carrying the request id, sent by the tick.
+        InboundMessage::ReviewRequest { turn, scope, .. } => {
+            let tab = tab_of(target);
+            let job = state.borrow().tabs.review_overview_job(tab, turn.into(), scope.into());
+            let started = job.and_then(|job| {
+                let id = request_id.clone();
+                start_review_job(state, &request_id, move || {
+                    job.run()
+                        .map(|overview| eitri_core::agent_bridge::serialize_review_for_js(&id, tab, &overview))
+                        .map_err(|why| why.to_string())
+                })
+            });
+            if let Err(why) = started {
+                refuse(webview, &why);
+            }
+        }
+        InboundMessage::ReviewDiffRequest { turn, scope, path, .. } => {
+            let tab = tab_of(target);
+            let job = state.borrow().tabs.review_diff_job(tab, turn, scope.into(), &path);
+            let started = job.and_then(|job| {
+                let id = request_id.clone();
+                start_review_job(state, &request_id, move || {
+                    job.run()
+                        .map(|diff| eitri_core::agent_bridge::serialize_review_diff_for_js(&id, tab, &diff))
+                        .map_err(|why| why.to_string())
+                })
+            });
+            if let Err(why) = started {
+                refuse(webview, &why);
+            }
+        }
         InboundMessage::ViewInEditor { title, text, .. } => {
             let prepared = match state.borrow_mut().scratch.as_mut() {
                 Some(dir) => dir
@@ -4599,6 +4749,8 @@ mod tests {
             last_open_ids: Vec::new(),
             scratch: None,
             pending_edits: Vec::new(),
+            review_jobs: Vec::new(),
+            review_hints: Vec::new(),
             editor_request_hook: None,
             editor_done_hook: None,
             retiring: Retiring::default(),
@@ -5216,6 +5368,68 @@ mod tests {
         let link = eitri_core::agent_bridge::serialize_editor_link_for_js("none", "no editor attached");
         let some = window_payloads(history(), context(), Some(&link));
         assert_eq!(kinds(&some), vec!["history", "editor_context", "editor_link"]);
+    }
+
+    /// A hint that arrives while the page is not ready is kept for it, one per tab, the newest.
+    #[test]
+    fn a_waiting_review_hint_is_replaced_only_by_the_same_tabs_newer_one() {
+        use eitri_core::turn_review::ReviewHint;
+        let hint = |tab, turn, files| ReviewHint { tab, turn, files };
+        let mut waiting = Vec::new();
+        keep_newest_hint_per_tab(&mut waiting, vec![hint(1, 1, 3), hint(2, 1, 1)]);
+        keep_newest_hint_per_tab(&mut waiting, vec![hint(1, 2, 0)]);
+        assert_eq!(waiting, vec![hint(2, 1, 1), hint(1, 2, 0)]);
+        keep_newest_hint_per_tab(&mut waiting, Vec::new());
+        assert_eq!(waiting.len(), 2);
+    }
+
+    /// A review's answer is the worker's envelope as it is; a job that failed or whose worker died
+    /// is a failing `command_result` for its own request; one still running is left in the list.
+    #[test]
+    fn finished_reviews_answer_each_request_once_and_leave_the_running_one() {
+        let (done_tx, done_rx) = mpsc::channel();
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let (died_tx, died_rx) = mpsc::channel::<Result<String, String>>();
+        let (_running_tx, running_rx) = mpsc::channel::<Result<String, String>>();
+        done_tx
+            .send(Ok(r#"{"kind":"review","requestId":"a"}"#.to_string()))
+            .unwrap();
+        failed_tx.send(Err("no such turn".to_string())).unwrap();
+        drop(died_tx);
+        let mut jobs = vec![
+            PendingReview {
+                request_id: "a".into(),
+                rx: done_rx,
+            },
+            PendingReview {
+                request_id: "b".into(),
+                rx: failed_rx,
+            },
+            PendingReview {
+                request_id: "c".into(),
+                rx: died_rx,
+            },
+            PendingReview {
+                request_id: "d".into(),
+                rx: running_rx,
+            },
+        ];
+        let payloads = finished_reviews(&mut jobs);
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads[0], r#"{"kind":"review","requestId":"a"}"#);
+        let failed: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
+        assert_eq!(
+            failed,
+            serde_json::json!({ "kind": "command_result", "requestId": "b", "ok": false, "error": "no such turn" })
+        );
+        let died: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
+        assert_eq!(
+            (died["requestId"].as_str(), died["ok"].as_bool()),
+            (Some("c"), Some(false))
+        );
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].request_id, "d");
+        assert!(finished_reviews(&mut jobs).is_empty(), "nothing is sent twice");
     }
 
     /// An editor that went away takes its pending draft edits with it: a body saved in nvim becomes

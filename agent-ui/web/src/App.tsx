@@ -87,6 +87,9 @@ import { ContinueInTerminal } from "./components/TerminalHandoff";
 import { HintLayer } from "./components/HintLayer";
 import type { ShownHint } from "./components/HintLayer";
 import { KeymapOverlay } from "./components/KeymapOverlay";
+import { ReviewOverlay } from "./components/ReviewOverlay";
+import { applyReviewKey, boxUnderCursor, failRequest, openReview, receiveDiff, receiveReview, resolveReviewKey, scrollBoxFirst } from "./review";
+import type { ReviewEffect, ReviewState } from "./review";
 import { Chooser } from "./components/Chooser";
 import { SlashPicker } from "./components/SlashPicker";
 import type { SlashPickerKind } from "./components/SlashPicker";
@@ -119,6 +122,15 @@ export function statusWarning(provider: ProviderInfo | null, failure: string | n
 function contextFact(context: ContextSummary | null): BandFacts["context"] {
   if (context === null || context.file === null) return null;
   return { file: context.file, lines: context.lines };
+}
+
+/** `hints` without `tab`'s entry -- the same object when it has none, so a clear that changes nothing
+ *  renders nothing. */
+function withoutHint(hints: Record<number, { turn: number; files: number }>, tab: number): Record<number, { turn: number; files: number }> {
+  if (hints[tab] === undefined) return hints;
+  const rest = { ...hints };
+  delete rest[tab];
+  return rest;
 }
 
 /** Whether `el` is an ordinary editable control -- an `<input>`, a `<textarea>`, or anything
@@ -573,9 +585,13 @@ export default function App() {
    *  `"send"`'s refusal restores it there; the picker's choice never touched the box at all
    *  (`chooseSlashOption` calls `sendMessage` directly, never through the composer), so restoring
    *  it into whatever the box happens to hold right then -- a draft the user quoted or typed for a
-   *  wholly unrelated reason -- would corrupt it. Its refusal is a footer flash alone. */
+   *  wholly unrelated reason -- would corrupt it. Its refusal is a footer flash alone.
+   *
+   *  `"review"` is the review overlay's `review_request`/`review_diff_request`: Rust refuses one with a
+   *  reason (no session, no such turn, git unavailable) and no envelope follows, so the overlay says it in
+   *  its own header rather than in the conversation's banner. */
   const inFlight = useRef<
-    Map<string, { kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send"; tab: TabId; text?: string; permissionId?: string }>
+    Map<string, { kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review"; tab: TabId; text?: string; permissionId?: string }>
   >(new Map());
   /** Monotonic, so two refusals of the same text are two distinct restores. */
   const restoreSeq = useRef(0);
@@ -1131,6 +1147,16 @@ export default function App() {
    *  `resolveKey` at all) and by the handful of places that must force it shut: the session ending,
    *  the start screen coming back, and a HINT starting elsewhere in the window. */
   const [keymapOpen, setKeymapOpen] = useState(false);
+  /** The turn review overlay (`c` in BROWSE), or `null` when it is closed. Like `?` it is drawn over the
+   *  conversation and owns every key while it is open; unlike `?` it is read-only state the shell fills in
+   *  (`./review` is the whole of its logic). Closed wherever `?` is forced shut, and by a switch of tab. */
+  const [review, setReview] = useState<ReviewState | null>(null);
+  /** The review overlay's own root, so `j`/`k` can scroll an open hunk's box before they move the cursor. */
+  const reviewOverlayRef = useRef<HTMLDivElement>(null);
+  /** Turn review: the finished turn of each tab that changed files, for the band -- kept per tab, because
+   *  the shell sends it for the tab it names even while another is on screen. Gone once the overlay is
+   *  opened on that turn, when a new turn starts, or when the shell sends `files: 0`. */
+  const [reviewHints, setReviewHints] = useState<Record<number, { turn: number; files: number }>>({});
   /** The detail popover's rows (session tabs spec §3.3), or `null` when it is closed. Set by a
    *  `tab_detail` envelope (the reply to `open_detail`, sent by the band and by `prefix i`);
    *  closed the same places `keymapOpen` is forced shut, since the two are mutually exclusive
@@ -1162,6 +1188,41 @@ export default function App() {
     const requestId = nextRequestId();
     inFlight.current.set(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
     postToRust({ type: "open_path", request_id: requestId, path: ref.path, ...(ref.line === null ? {} : { line: ref.line }) });
+  }
+  /** `c` in BROWSE: opens the review overlay on this tab's latest turn and asks the shell for it. The
+   *  overlay is drawn at once, saying it is loading, and filled in by the `review` envelope that answers
+   *  this request id (or told why not by the refusal). Recorded as `"review"`, so a refusal is the
+   *  overlay's own header and not the conversation's banner. */
+  function openReviewOverlay(tab: TabId) {
+    const requestId = nextRequestId();
+    inFlight.current.set(requestId, { kind: "review", tab });
+    setReview(openReview(tab, requestId));
+    postToRust({ type: "review_request", request_id: requestId, tab, turn: "latest", scope: "turn" });
+  }
+  /** What a key in the review overlay asked for beyond changing its own state. `tab` is the tab the overlay
+   *  was opened on, never "the active one": a request names its tab. */
+  function runReviewEffect(effect: ReviewEffect, tab: TabId) {
+    switch (effect.kind) {
+      case "close":
+        setReview(null);
+        return;
+      case "request":
+        inFlight.current.set(effect.requestId, { kind: "review", tab });
+        postToRust({ type: "review_request", request_id: effect.requestId, tab, turn: effect.turn, scope: effect.scope });
+        return;
+      case "request-diff":
+        inFlight.current.set(effect.requestId, { kind: "review", tab });
+        postToRust({ type: "review_diff_request", request_id: effect.requestId, tab, turn: effect.turn, scope: effect.scope, path: effect.path });
+        return;
+      case "open":
+        // The editor opens it at the hunk's first line when a patch has been loaded, else at the top.
+        openPath({ path: effect.path, line: effect.line });
+        return;
+      case "copy":
+        void navigator.clipboard?.writeText(effect.text);
+        showFlash(`copied ${effect.text}`);
+        return;
+    }
   }
   /** `gx` (R6): hands one address -- always a `webLinks` `url`, the normalized `href` the reader was shown -- to
    *  Rust, which re-checks it (`web_url`) and opens it in the system browser. Recorded as `"link"`, so a
@@ -1261,7 +1322,8 @@ export default function App() {
     slashPicker !== null ||
     renaming !== null ||
     (search !== null && sessionStarted) ||
-    (exLine !== null && sessionStarted);
+    (exLine !== null && sessionStarted) ||
+    review !== null;
   /** For the document replay (installed once): see its K04 fix-round note. */
   const overlayOpenRef = useRef(overlayOpen);
   overlayOpenRef.current = overlayOpen;
@@ -1430,6 +1492,36 @@ export default function App() {
     }
   }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, linkPick, confirm, overlayOpen]);
   useEffect(() => () => void typingGuard.cancel(), [typingGuard]);
+  /* The review overlay ends wherever something else takes the conversation area or the keys, whichever route
+     brought it: another overlay or prompt opening (the envelopes that open them also close it directly), a
+     click into the composer (INPUT is not BROWSE, and the overlay would swallow what is typed there), a
+     switch to another tab (it shows this tab's turns). */
+  const reviewCovered =
+    keymapOpen ||
+    detail !== null ||
+    handoffOpen ||
+    chooser !== null ||
+    slashPicker !== null ||
+    renaming !== null ||
+    search !== null ||
+    exLine !== null ||
+    pathPick !== null ||
+    linkPick !== null ||
+    confirm !== null ||
+    mode !== "browse";
+  useEffect(() => {
+    if (reviewCovered) setReview(null);
+  }, [reviewCovered]);
+  const activeTabId = tabs?.active ?? null;
+  useEffect(() => {
+    setReview((current) => (current !== null && current.tab !== activeTabId ? null : current));
+  }, [activeTabId]);
+  /* A new turn replaces the finished one the band's pointer was about. */
+  useEffect(() => {
+    if (state.activeTurnId === null) return;
+    const tab = activeTabRef.current;
+    if (tab !== null) setReviewHints((hints) => withoutHint(hints, tab));
+  }, [state.activeTurnId]);
   /* v1 picks, Task 8, fix round 1 (Codex): a `gx` pick owns every key ahead of the key table, so whatever
      else takes the keys must end it, whichever route it came by -- a click into the composer (its
      `onFocus` makes INPUT), the `?` overlay from `prefix ?`, the chooser, a `/` or `:` line, the rename
@@ -2392,6 +2484,7 @@ export default function App() {
         // leaving it up is how the review reproduced a dead keyboard: come back with `Ctrl+l`,
         // land in INPUT, and every keystroke is swallowed by the overlay's own branch (review).
         setKeymapOpen(false);
+        setReview(null); // the review overlay is over the same area, and ends where `?` does
         setDetail(null);
         setHandoffOpen(false);
         // R4: the `/` prompt is this panel's own, the same reason the `?` overlay closes here -- and
@@ -2437,6 +2530,7 @@ export default function App() {
         // §8, decision 4): this envelope's only sender is a brand-new tab now, so there is never a
         // card waiting for it to land on instead.
         setKeymapOpen(false);
+        setReview(null); // the review overlay is over the same area, and ends where `?` does
         setDetail(null);
         setHandoffOpen(false);
         endKeyPrompts(); // v1, D11/spec §3.4's cancel list
@@ -2448,6 +2542,7 @@ export default function App() {
         // -- and so land in INPUT -- now sends this instead, and lands BROWSE. The overlay would sit
         // over whatever this lands on, the same reason `enter_input` closes it above.
         setKeymapOpen(false);
+        setReview(null); // the review overlay is over the same area, and ends where `?` does
         setDetail(null);
         setHandoffOpen(false);
         endKeyPrompts(); // v1, D11/spec §3.4's cancel list
@@ -2464,6 +2559,7 @@ export default function App() {
         dropPendingKeys();
         // The overlay would cover the card the cursor is about to land on.
         setKeymapOpen(false);
+        setReview(null); // the review overlay is over the same area, and ends where `?` does
         setDetail(null);
         setHandoffOpen(false);
         setChooser(null);
@@ -2531,6 +2627,7 @@ export default function App() {
         exitRegion();
         setMode("browse");
         setKeymapOpen(true);
+        setReview(null); // the review overlay is over the same area, and ends where `?` does
       } else if (payload.kind === "open_command_line") {
         // `prefix :` (tmux `command-prompt`, owner decision #28, K16). GTK took the chord, and before it
         // was bound the armed prefix swallowed the `:` and the letters after it ran as panel keys ("kill-window
@@ -2550,6 +2647,7 @@ export default function App() {
         endKeyPrompts();
         exitRegion();
         setKeymapOpen(false);
+        setReview(null); // the review overlay is over the same area, and ends where `?` does
         setDetail(null);
         setHandoffOpen(false);
         setChooser(null);
@@ -2570,6 +2668,7 @@ export default function App() {
         // §7, finding 4).
         exitRegion();
         setKeymapOpen(false);
+        setReview(null); // the review overlay is over the same area, and ends where `?` does
         setDetail(null);
         setHandoffOpen(false);
         setChooser(null);
@@ -2745,6 +2844,7 @@ export default function App() {
         setDetailCursor(0);
         setMode("browse");
         setKeymapOpen(false);
+        setReview(null); // the review overlay is over the same area, and ends where `?` does
       } else if (payload.kind === "snapshot") {
         setState((s) => applySnapshot(s, payload.state, payload.throughRevision));
         // The view a switch saved for this tab (session tabs Task 11), if it had one -- cursor applies
@@ -2935,6 +3035,10 @@ export default function App() {
               // refusal is reported by name instead, with the full text so it is not lost.
               setCommandNotice(`A message to tab ${record.tab} was not sent (${payload.error}): ${record.text}`);
             }
+          } else if (record?.kind === "review") {
+            // The overlay's own request was refused (no session, no such turn, git unavailable): it says
+            // so in its header. Never the conversation's banner, which is for what breaks the conversation.
+            setReview((current) => (current === null ? current : failRequest(current, payload.requestId, payload.error)));
           } else if (record?.kind === "editor" || record?.kind === "link") {
             // A scratch-editor round trip's own refusal (Task 8/15), or `gx`'s address Rust would not
             // open (v1 picks, Task 8), is a footer nicety, not something that should fill the banner
@@ -3160,6 +3264,26 @@ export default function App() {
         setEditorLink({ state: payload.state, text: payload.text });
       } else if (payload.kind === "scratch") {
         setScratchEditing(payload.editing);
+      } else if (payload.kind === "review") {
+        // A review that was worked out is answered by this envelope alone, never by a `command_result`, so
+        // this is where its in-flight record ends.
+        inFlight.current.delete(payload.requestId);
+        // The reply to the overlay's newest `review_request`; `receiveReview` drops any other (a request
+        // the overlay has since replaced), and an overlay that was closed meanwhile takes nothing.
+        setReview((current) => (current === null ? current : receiveReview(current, payload)));
+        // Opened on that turn: the band's pointer to it has done its job.
+        setReviewHints((hints) => (hints[payload.tab] !== undefined && payload.current >= hints[payload.tab].turn ? withoutHint(hints, payload.tab) : hints));
+      } else if (payload.kind === "review_diff") {
+        inFlight.current.delete(payload.requestId);
+        setReview((current) => (current === null ? current : receiveDiff(current, payload)));
+      } else if (payload.kind === "review_hint") {
+        // Kept for the tab it names, shown only while that tab is on screen. One that arrives while a turn
+        // runs in the tab on screen is about the turn before it, which the new turn has already replaced.
+        if (payload.files <= 0 || (payload.tab === activeTabRef.current && stateRef.current.activeTurnId !== null)) {
+          setReviewHints((hints) => withoutHint(hints, payload.tab));
+        } else {
+          setReviewHints((hints) => ({ ...hints, [payload.tab]: { turn: payload.turn, files: payload.files } }));
+        }
       } else if (payload.kind === "notice") {
         showFlash(payload.text);
       }
@@ -4795,6 +4919,29 @@ export default function App() {
       }
       return;
     }
+    // The review overlay owns every key while it is open, the same way and for the same reason: `a`/`d` must
+    // not reach a permission card hidden underneath, and nothing else this table claims may act on a
+    // conversation the reader cannot see. Its own keys are `./review`'s, not `resolveKey`'s. A bare modifier
+    // is not a key (a held Shift on its way to `G`), and neither it nor an unbound key ends a waiting `g`
+    // except by being a different key.
+    if (review !== null) {
+      event.preventDefault();
+      if (isModifierKey(event.key)) return;
+      const action = resolveReviewKey(event.nativeEvent as unknown as KeyLike, review.pendingG);
+      if (action === null) {
+        if (review.pendingG) setReview({ ...review, pendingG: false });
+        return;
+      }
+      // An open hunk taller than its box scrolls inside it first, as a tall tool result does.
+      if (action.kind === "move" && scrollBoxFirst(boxUnderCursor(reviewOverlayRef.current), action.delta, TOOL_RESULT_SCROLL_STEP_PX)) {
+        if (review.pendingG) setReview({ ...review, pendingG: false });
+        return;
+      }
+      const next = applyReviewKey(review, action, nextRequestId);
+      setReview(next.state);
+      if (next.effect !== null) runReviewEffect(next.effect, review.tab);
+      return;
+    }
     // The detail popover, the same way: it owns every key while it is open, ahead of everything
     // below (spec §3.3: "j/k move, y copies a line, Esc/q close"). Panel round 2 (plan Task 10):
     // its trailing `Continue in a terminal…` row is one more stop past every fact row, so `j`/`k`
@@ -5268,6 +5415,13 @@ export default function App() {
         // render back to the empty tab -- there is no local start-screen reset any more.
         resetTab();
         break;
+      case "review": {
+        // Turn review. A tab with no session has nothing to review (the start screen never gets here, its
+        // keys are the empty tab's own), and a request always names its tab.
+        const tab = activeTabRef.current;
+        if (tab !== null && sessionStartedRef.current) openReviewOverlay(tab);
+        break;
+      }
       case "keymap":
         // Only ever reached with the overlay closed -- the `keymapOpen` branch above returns
         // before `resolveKey` runs at all once it is open, `?`/`Escape`/`q` included, so this is
@@ -5752,6 +5906,11 @@ export default function App() {
             />
           </PanelErrorBoundary>
         )}
+        {review !== null && (
+          <PanelErrorBoundary name="review overlay" onError={() => overlayFailed("review overlay", () => setReview(null))}>
+            <ReviewOverlay ref={reviewOverlayRef} state={review} onClose={() => setReview(null)} />
+          </PanelErrorBoundary>
+        )}
         {detail !== null && (
           <PanelErrorBoundary name="session details" onError={() => overlayFailed("session details", () => setDetail(null))}>
             <DetailPopover
@@ -6020,6 +6179,8 @@ export default function App() {
           usage: usageSegment(state.usage),
           // Owner decision #39: the card INPUT's Ctrl+y would approve, while the box has the keys.
           approve: ctrlYCard,
+          // A finished turn of this tab changed files on disk; `c` shows them.
+          review: activeTab !== null && reviewHints[activeTab.id] !== undefined ? { files: reviewHints[activeTab.id].files } : null,
         }}
         paneFocused={paneFocused}
         onOpenDetail={() => post({ type: "open_detail" })}

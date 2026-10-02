@@ -169,6 +169,10 @@ export type PanelAction =
   | { kind: "hint" }
   /** `?` in BROWSE: open or close the full keymap (spec §3). */
   | { kind: "keymap" }
+  /** `c` in BROWSE (turn review): open the overlay over what changed on disk during this tab's latest
+   *  turn. It decides nothing about the overlay's own keys -- those are `./review`'s -- and, like `?`, only
+   *  opens: closing is the overlay's. */
+  | { kind: "review" }
   /** `/` in BROWSE: open R4's incremental search (ruling 25). */
   | { kind: "search" }
   /** `:` in BROWSE (K02, ruling R4 of the v1 picks plan): open a vim-style command line in the
@@ -854,6 +858,12 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       return ctx.sessionEnded ? { kind: "restart" } : null;
     case "f":
       return { kind: "hint" };
+    case "c":
+      // Turn review. Named like `a`/`d`: Alt+c, Meta+c, Super+c and AltGr+c are some other chord (Ctrl and
+      // Shift never get here, the blanket refusal above), and `zc` is `FIXED_PAIRS`' own fold, resolved
+      // before any of this. INPUT's `c` is a letter (the INPUT branch above returns first). It is offered
+      // on an ended session too: what changed on disk is still there to read, and the overlay is read-only.
+      return isPlainAnswerKey(event) ? { kind: "review" } : null;
     case "/":
       return { kind: "search" };
     case "n":
@@ -912,6 +922,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "A", what: "Start typing at the end of the draft" },
   { keys: "f", what: "HINT: jump anywhere in the window (links too; Enter opens one)" },
   { keys: "r", what: "New session, once this one has ended" },
+  { keys: "c", what: "Review: the files that changed on disk during this tab's latest turn (read-only)" },
   { keys: "/", what: "Search the conversation (Enter keeps the match, Esc goes back)" },
   { keys: ":", what: "A command line, as in vim: nothing runs here yet; Enter or Esc closes it" },
   { keys: "n / N", what: "Next / previous match, wrapping" },
@@ -963,6 +974,23 @@ export const VISUAL_KEYS: KeyHelp[] = [
   { keys: "Esc", what: "Back to the caret, at the moving end" },
   { keys: "Ctrl+e / Ctrl+y", what: "Scroll the list one line down / up (a count repeats it); the selection stays put" },
   { keys: "?", what: "This list (any other key ends the region too, except Ctrl+e/Ctrl+y, which scroll instead)" },
+];
+
+/** The turn review overlay's keys (`c` opens it), everything `./review`'s `resolveReviewKey` claims. Tied to
+ *  that function both ways by `review.test.ts`, the discipline `BROWSE_KEYS` is held to. The overlay owns
+ *  every key while it is open, so `a`/`d` and the rest of BROWSE's table never reach a card underneath.
+ *  `x`, `u`, `i` and `s` are not here and not bound: they are reserved for the changes the overlay does not
+ *  make yet, and a row for a key that does nothing would promise it. */
+export const REVIEW_KEYS: KeyHelp[] = [
+  { keys: "j / k", what: "Next / previous file or hunk; an open hunk's box scrolls first" },
+  { keys: "gg / G", what: "First / last stop" },
+  { keys: "Ctrl+d / Ctrl+u", what: "Several stops down / up" },
+  { keys: "Enter", what: "Open or close the file's hunks (on a hunk: close its file); on the folded group: open it" },
+  { keys: "[ / ]", what: "Previous / next turn (turn scope)" },
+  { keys: "S", what: "Switch between this turn and the whole session" },
+  { keys: "o", what: "Open the file in the editor at the hunk's first line" },
+  { keys: "y", what: "Copy path:line" },
+  { keys: "q / Esc / c", what: "Close" },
 ];
 
 export const INPUT_KEYS: KeyHelp[] = [

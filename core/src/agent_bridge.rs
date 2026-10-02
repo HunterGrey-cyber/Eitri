@@ -251,6 +251,26 @@ pub enum InboundMessage {
         #[serde(default)]
         line: Option<u32>,
     },
+    /// `c` in BROWSE: the files that changed on disk during a turn of this tab's session, or during
+    /// the whole session. Answered by a `review` envelope carrying `request_id`, or by a failing
+    /// `command_result`; a success has no `command_result` of its own.
+    ReviewRequest {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        turn: ReviewTurnWire,
+        scope: ReviewScopeWire,
+    },
+    /// One file of a review, opened: its hunks. Answered by a `review_diff` envelope carrying
+    /// `request_id`, or by a failing `command_result`.
+    ReviewDiffRequest {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        turn: u32,
+        scope: ReviewScopeWire,
+        path: String,
+    },
     /// `Ctrl+g` in BROWSE (R3): the row's full text in a read-only scratch buffer.
     ViewInEditor {
         request_id: String,
@@ -439,7 +459,9 @@ impl InboundMessage {
             | InboundMessage::TakeBackQueue { tab, .. }
             | InboundMessage::SendNow { tab, .. }
             | InboundMessage::Draft { tab, .. }
-            | InboundMessage::EditDraft { tab, .. } => *tab,
+            | InboundMessage::EditDraft { tab, .. }
+            | InboundMessage::ReviewRequest { tab, .. }
+            | InboundMessage::ReviewDiffRequest { tab, .. } => *tab,
         };
         match tab {
             Some(id) => TabRef::Named(crate::tabs::TabId(id)),
@@ -499,6 +521,8 @@ impl InboundMessage {
             | InboundMessage::EditDraft { request_id, .. }
             | InboundMessage::HistoryPush { request_id, .. }
             | InboundMessage::OpenPath { request_id, .. }
+            | InboundMessage::ReviewRequest { request_id, .. }
+            | InboundMessage::ReviewDiffRequest { request_id, .. }
             | InboundMessage::ViewInEditor { request_id, .. }
             | InboundMessage::TabVerb { request_id, .. }
             | InboundMessage::CycleDefaultMode { request_id }
@@ -804,6 +828,183 @@ pub fn serialize_hint_land_for_js(session_id: u64, index: usize) -> String {
 }
 pub fn serialize_hint_end_for_js(session_id: u64) -> String {
     json!({ "kind": "hint_end", "sessionId": session_id }).to_string()
+}
+
+/// Which turn a `review_request` asks about: the newest one, or one by its number in the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewTurnWire {
+    Latest,
+    N(u32),
+}
+
+impl<'de> Deserialize<'de> for ReviewTurnWire {
+    /// `"latest"` or a non-negative integer; any other string, a negative or fractional number, or
+    /// `null` is a parse failure rather than a default.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Tag(LatestTag),
+            N(u32),
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LatestTag {
+            Latest,
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Tag(LatestTag::Latest) => ReviewTurnWire::Latest,
+            Raw::N(n) => ReviewTurnWire::N(n),
+        })
+    }
+}
+
+impl From<ReviewTurnWire> for crate::turn_review::TurnRef {
+    fn from(turn: ReviewTurnWire) -> Self {
+        match turn {
+            ReviewTurnWire::Latest => crate::turn_review::TurnRef::Latest,
+            ReviewTurnWire::N(n) => crate::turn_review::TurnRef::N(n),
+        }
+    }
+}
+
+/// One turn's changes, or the whole session's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewScopeWire {
+    Turn,
+    Session,
+}
+
+impl From<ReviewScopeWire> for crate::turn_review::Scope {
+    fn from(scope: ReviewScopeWire) -> Self {
+        match scope {
+            ReviewScopeWire::Turn => crate::turn_review::Scope::Turn,
+            ReviewScopeWire::Session => crate::turn_review::Scope::Session,
+        }
+    }
+}
+
+/// `{"kind":"review","requestId":...,"tab":...,"scope":...,"current":...,"turns":[...],"files":[...],
+/// "compared":...,"pendingNoResult":...,"notes":[...]}`: the answer to a `review_request`. It states what the
+/// snapshots measured -- files that changed on disk during the turn -- and `origin` carries the
+/// attribution: `agent` (named by the turn's own edit calls), `agent_only` (named, but unchanged
+/// on disk) or `workspace` (changed with no call naming it). A path that is not valid UTF-8 is
+/// sent lossily, and a `review_diff_request` for a name that reads like another changed file's is
+/// refused (`ReviewError::AmbiguousPath`), so a patch is never shown for the wrong file. A review
+/// that was worked out is answered by this envelope alone; only a failure is a `command_result`.
+/// `compared: false` means nothing was compared (no baseline, or one still being taken), so an
+/// empty `files` is no claim that nothing changed. `notes` are every line the review must say about
+/// itself, in order -- the panel draws them as they are and derives none from the turn flags.
+pub fn serialize_review_for_js(
+    request_id: &str,
+    tab: crate::tabs::TabId,
+    overview: &crate::turn_review::Overview,
+) -> String {
+    use crate::turn_review::Origin;
+    let turns: Vec<Value> = overview
+        .turns
+        .iter()
+        .map(|turn| {
+            let state = turn.state();
+            json!({
+                "n": turn.n,
+                "turnId": turn.turn_id,
+                "startedAt": turn.started_ms,
+                "endedAt": turn.ended_ms,
+                "state": state.as_str(),
+                "late": turn.late,
+                "overlappedNext": turn.overlapped_next,
+                "overlappedTab": turn.overlapped_tab,
+                "reason": state.reason(),
+            })
+        })
+        .collect();
+    let files: Vec<Value> = overview
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": file.path.to_string_lossy(),
+                "added": file.added,
+                "removed": file.removed,
+                "origin": match file.origin {
+                    Origin::Agent => "agent",
+                    Origin::AgentOnly => "agent_only",
+                    Origin::Workspace => "workspace",
+                },
+                "binary": file.binary,
+                "tooLarge": file.too_large,
+                "nested": file.nested,
+            })
+        })
+        .collect();
+    json!({
+        "kind": "review",
+        "requestId": request_id,
+        "tab": tab.0,
+        "scope": overview.scope.as_str(),
+        "current": overview.current,
+        "turns": turns,
+        "files": files,
+        "compared": overview.compared,
+        "pendingNoResult": overview.pending_no_result,
+        "notes": overview.notes,
+    })
+    .to_string()
+}
+
+/// `{"kind":"review_diff","requestId":...,"tab":...,"turn":...,"path":...,"added":...,"removed":...,
+/// "hunks":[...]}`: the answer to a `review_diff_request`. `hunks` is `null` when the patch is over
+/// the display cap -- refused, not cut -- and `added`/`removed` are still given.
+pub fn serialize_review_diff_for_js(
+    request_id: &str,
+    tab: crate::tabs::TabId,
+    diff: &crate::turn_review::ReviewDiff,
+) -> String {
+    use crate::turn_review::LineKind;
+    let hunks = diff.hunks.as_ref().map(|hunks| {
+        hunks
+            .iter()
+            .map(|hunk| {
+                let lines: Vec<Value> = hunk
+                    .lines
+                    .iter()
+                    .map(|line| {
+                        json!({
+                            "kind": match line.kind {
+                                LineKind::Context => "context",
+                                LineKind::Added => "added",
+                                LineKind::Removed => "removed",
+                                LineKind::NoNewline => "no_newline",
+                            },
+                            "text": line.text,
+                            "oldNo": line.old_no,
+                            "newNo": line.new_no,
+                        })
+                    })
+                    .collect();
+                json!({ "id": hunk.id, "header": hunk.header, "lines": lines })
+            })
+            .collect::<Vec<Value>>()
+    });
+    json!({
+        "kind": "review_diff",
+        "requestId": request_id,
+        "tab": tab.0,
+        "turn": diff.turn,
+        "path": diff.path.to_string_lossy(),
+        "added": diff.added,
+        "removed": diff.removed,
+        "hunks": hunks,
+    })
+    .to_string()
+}
+
+/// `{"kind":"review_hint","tab":...,"turn":...,"files":...}`: a turn ended with `files` files
+/// differing between its snapshots, for the status band. `files: 0` clears the hint.
+pub fn serialize_review_hint_for_js(hint: &crate::turn_review::ReviewHint) -> String {
+    json!({ "kind": "review_hint", "tab": hint.tab, "turn": hint.turn, "files": hint.files }).to_string()
 }
 
 /// `{"kind":"events","tab":...,"fromRevision":...,"throughRevision":...,"events":[<tagged AgentDomainEvent JSON>, ...]}`.
@@ -1872,6 +2073,272 @@ mod tests {
         ] {
             assert!(parse_inbound_message(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn review_request_deserializes() {
+        use crate::turn_review::{Scope, TurnRef};
+        let parse = |json: &str| parse_inbound_message(json).unwrap_or_else(|| panic!("{json} did not parse"));
+        for (turn_json, turn, scope_json, scope) in [
+            (r#""latest""#, TurnRef::Latest, "turn", Scope::Turn),
+            ("3", TurnRef::N(3), "session", Scope::Session),
+            ("0", TurnRef::N(0), "turn", Scope::Turn),
+        ] {
+            let message = parse(&format!(
+                r#"{{"type":"review_request","request_id":"r1","tab":3,"turn":{turn_json},"scope":"{scope_json}"}}"#
+            ));
+            assert_eq!(message.request_id(), "r1");
+            assert!(matches!(message.tab_ref(), TabRef::Named(TabId(3))));
+            let InboundMessage::ReviewRequest {
+                turn: got_turn,
+                scope: got_scope,
+                ..
+            } = message
+            else {
+                panic!("not a review_request")
+            };
+            assert_eq!(TurnRef::from(got_turn), turn);
+            assert_eq!(Scope::from(got_scope), scope);
+        }
+    }
+
+    #[test]
+    fn a_review_request_with_an_unknown_turn_or_scope_fails_to_parse() {
+        for bad in [
+            r#"{"type":"review_request","request_id":"r","tab":1,"turn":"newest","scope":"turn"}"#,
+            r#"{"type":"review_request","request_id":"r","tab":1,"turn":-1,"scope":"turn"}"#,
+            r#"{"type":"review_request","request_id":"r","tab":1,"turn":1.5,"scope":"turn"}"#,
+            r#"{"type":"review_request","request_id":"r","tab":1,"turn":null,"scope":"turn"}"#,
+            r#"{"type":"review_request","request_id":"r","tab":1,"turn":"latest","scope":"all"}"#,
+            r#"{"type":"review_request","request_id":"r","tab":1,"turn":"latest"}"#,
+            r#"{"type":"review_request","request_id":"r","tab":1,"scope":"turn"}"#,
+            r#"{"type":"review_diff_request","request_id":"r","tab":1,"turn":1,"path":"a"}"#,
+            r#"{"type":"review_diff_request","request_id":"r","tab":1,"turn":"latest","scope":"turn","path":"a"}"#,
+        ] {
+            assert!(parse_inbound_message(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn review_diff_request_deserializes() {
+        use crate::turn_review::Scope;
+        let message = parse_inbound_message(
+            r#"{"type":"review_diff_request","request_id":"r2","tab":3,"turn":7,"scope":"session","path":"core/src/x.rs"}"#,
+        )
+        .unwrap();
+        assert_eq!(message.request_id(), "r2");
+        assert!(matches!(message.tab_ref(), TabRef::Named(TabId(3))));
+        let InboundMessage::ReviewDiffRequest { turn, scope, path, .. } = message else {
+            panic!("not a review_diff_request")
+        };
+        assert_eq!(turn, 7);
+        assert_eq!(Scope::from(scope), Scope::Session);
+        assert_eq!(path, "core/src/x.rs");
+    }
+
+    /// Tab routing: a review of "the active tab" would show the wrong session's files after a switch.
+    #[test]
+    fn a_review_request_naming_no_tab_is_refused() {
+        for json in [
+            r#"{"type":"review_request","request_id":"a","turn":"latest","scope":"turn"}"#,
+            r#"{"type":"review_request","request_id":"a","tab":null,"turn":"latest","scope":"turn"}"#,
+            r#"{"type":"review_diff_request","request_id":"a","turn":1,"scope":"turn","path":"x"}"#,
+        ] {
+            let message = parse_inbound_message(json).unwrap();
+            assert!(matches!(message.tab_ref(), TabRef::Missing), "{json}");
+        }
+    }
+
+    fn review_turn(n: u32, state_end: crate::turn_review::Snap) -> crate::turn_review::TurnRecord {
+        use crate::turn_review::{Snap, TurnRecord};
+        TurnRecord {
+            n,
+            turn_id: format!("t{n}"),
+            tab: 3,
+            session: "sess".into(),
+            started_ms: 1_790_000_000_000,
+            ended_ms: Some(1_790_000_020_000),
+            base: Snap::Taken { commit: "b".into() },
+            base_taken_ms: Some(1_790_000_000_100),
+            end: state_end,
+            late: false,
+            overlapped_next: false,
+            overlapped_tab: false,
+            skipped_large: Vec::new(),
+            earlier_run: false,
+        }
+    }
+
+    #[test]
+    fn review_envelopes_serialize_exactly() {
+        use crate::turn_review::{
+            DiffLine, Hunk, LineKind, Origin, Overview, OverviewFile, ReviewDiff, ReviewHint, Scope, Snap,
+        };
+        let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        let mut unfinished = review_turn(8, Snap::Unavailable("it never ended".into()));
+        unfinished.ended_ms = None;
+        unfinished.late = true;
+        unfinished.overlapped_next = true;
+        unfinished.overlapped_tab = true;
+        let overview = Overview {
+            session: "sess".into(),
+            scope: Scope::Turn,
+            current: 7,
+            turns: vec![review_turn(7, Snap::Taken { commit: "e".into() }), unfinished],
+            files: vec![
+                OverviewFile {
+                    path: "core/src/x.rs".into(),
+                    added: 41,
+                    removed: 6,
+                    origin: Origin::Agent,
+                    binary: false,
+                    too_large: false,
+                    nested: false,
+                },
+                OverviewFile {
+                    path: "a.png".into(),
+                    added: 0,
+                    removed: 0,
+                    origin: Origin::AgentOnly,
+                    binary: true,
+                    too_large: true,
+                    nested: true,
+                },
+                OverviewFile {
+                    path: "Cargo.lock".into(),
+                    added: 2,
+                    removed: 1,
+                    origin: Origin::Workspace,
+                    binary: false,
+                    too_large: false,
+                    nested: false,
+                },
+            ],
+            compared: true,
+            pending_no_result: 2,
+            notes: vec!["changed on disk during this turn".into()],
+        };
+        assert_eq!(
+            v(serialize_review_for_js("r1", TabId(3), &overview)),
+            serde_json::json!({
+                "kind": "review", "requestId": "r1", "tab": 3, "scope": "turn", "current": 7,
+                "turns": [
+                    {"n": 7, "turnId": "t7", "startedAt": 1_790_000_000_000u64, "endedAt": 1_790_000_020_000u64,
+                     "state": "ok", "late": false, "overlappedNext": false, "overlappedTab": false, "reason": null},
+                    {"n": 8, "turnId": "t8", "startedAt": 1_790_000_000_000u64, "endedAt": null,
+                     "state": "unfinished", "late": true, "overlappedNext": true, "overlappedTab": true,
+                     "reason": "it never ended"},
+                ],
+                "files": [
+                    {"path": "core/src/x.rs", "added": 41, "removed": 6, "origin": "agent", "binary": false,
+                     "tooLarge": false, "nested": false},
+                    {"path": "a.png", "added": 0, "removed": 0, "origin": "agent_only", "binary": true,
+                     "tooLarge": true, "nested": true},
+                    {"path": "Cargo.lock", "added": 2, "removed": 1, "origin": "workspace", "binary": false,
+                     "tooLarge": false, "nested": false},
+                ],
+                "compared": true,
+                "pendingNoResult": 2,
+                "notes": ["changed on disk during this turn"],
+            })
+        );
+
+        let diff = ReviewDiff {
+            turn: 7,
+            path: "core/src/x.rs".into(),
+            added: 41,
+            removed: 6,
+            binary: false,
+            new_file: false,
+            deleted_file: false,
+            mode_change: None,
+            hunks: Some(vec![Hunk {
+                id: 0,
+                header: "@@ -830,6 +830,12 @@".into(),
+                old_start: 830,
+                old_len: 6,
+                new_start: 830,
+                new_len: 12,
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Context,
+                        text: "keep".into(),
+                        old_no: Some(830),
+                        new_no: Some(830),
+                    },
+                    DiffLine {
+                        kind: LineKind::Removed,
+                        text: "old".into(),
+                        old_no: Some(831),
+                        new_no: None,
+                    },
+                    DiffLine {
+                        kind: LineKind::Added,
+                        text: "new".into(),
+                        old_no: None,
+                        new_no: Some(837),
+                    },
+                    DiffLine {
+                        kind: LineKind::NoNewline,
+                        text: "\\ No newline at end of file".into(),
+                        old_no: None,
+                        new_no: None,
+                    },
+                ],
+            }]),
+        };
+        assert_eq!(
+            v(serialize_review_diff_for_js("r2", TabId(3), &diff)),
+            serde_json::json!({
+                "kind": "review_diff", "requestId": "r2", "tab": 3, "turn": 7, "path": "core/src/x.rs",
+                "added": 41, "removed": 6,
+                "hunks": [{"id": 0, "header": "@@ -830,6 +830,12 @@", "lines": [
+                    {"kind": "context", "text": "keep", "oldNo": 830, "newNo": 830},
+                    {"kind": "removed", "text": "old", "oldNo": 831, "newNo": null},
+                    {"kind": "added", "text": "new", "oldNo": null, "newNo": 837},
+                    {"kind": "no_newline", "text": "\\ No newline at end of file", "oldNo": null, "newNo": null},
+                ]}],
+            })
+        );
+
+        assert_eq!(
+            v(serialize_review_hint_for_js(&ReviewHint {
+                tab: 3,
+                turn: 7,
+                files: 3
+            })),
+            serde_json::json!({ "kind": "review_hint", "tab": 3, "turn": 7, "files": 3 })
+        );
+        assert_eq!(
+            v(serialize_review_hint_for_js(&ReviewHint {
+                tab: 3,
+                turn: 7,
+                files: 0
+            }))["files"],
+            0,
+            "zero clears the hint"
+        );
+    }
+
+    #[test]
+    fn hunks_null_over_the_cap() {
+        let diff = crate::turn_review::ReviewDiff {
+            turn: 2,
+            path: "big.rs".into(),
+            added: 1500,
+            removed: 900,
+            binary: false,
+            new_file: false,
+            deleted_file: false,
+            mode_change: None,
+            hunks: None,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serialize_review_diff_for_js("r", TabId(1), &diff)).unwrap();
+        assert!(value["hunks"].is_null(), "refused, not cut");
+        assert!(value.as_object().unwrap().contains_key("hunks"), "the key stays");
+        assert_eq!(value["added"], 1500);
+        assert_eq!(value["removed"], 900);
     }
 
     #[test]

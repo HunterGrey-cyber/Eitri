@@ -284,6 +284,22 @@
     }
   },
   {
+    "label": "c, a live session",
+    "expected": {
+      "kind": "review"
+    }
+  },
+  {
+    "label": "c, a session that ended",
+    "expected": {
+      "kind": "review"
+    }
+  },
+  {
+    "label": "c, input",
+    "expected": null
+  },
+  {
     "label": "v",
     "expected": {
       "kind": "caret"

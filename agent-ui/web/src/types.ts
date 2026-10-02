@@ -510,3 +510,74 @@ export type ChooserRecord = {
   heldElsewhere: boolean;
 };
 export type ChooserEnvelope = { open: ChooserTab[]; records: ChooserRecord[] };
+
+/** Turn review (the `review`, `review_diff` and `review_hint` envelopes; `core/src/agent_bridge.rs`).
+ *  Every attribution, count and state is decided in Rust; this side only draws what it is told. */
+export type ReviewScope = "turn" | "session";
+/** `no_baseline`: no snapshot of the turn's start exists, so nothing can be compared. `unfinished`: Eitri
+ *  exited mid-turn, so the review compares the base with the disk as it is now. `pending`: a snapshot
+ *  of this turn is still being taken. */
+export type ReviewTurnState = "ok" | "no_baseline" | "unfinished" | "pending";
+/** `agent`: a call of this tab named the file and it changed (`✓`). `agent_only`: named, unchanged
+ *  (`·`). `workspace`: changed but no call of this tab named it (`?`). */
+export type ReviewOrigin = "agent" | "agent_only" | "workspace";
+export type ReviewTurn = {
+  n: number;
+  turnId: string;
+  /** Epoch milliseconds. */
+  startedAt: number;
+  /** `null` while the turn has not ended. */
+  endedAt: number | null;
+  state: ReviewTurnState;
+  /** A tool call reached the host before the turn's baseline snapshot was done. */
+  late: boolean;
+  overlappedNext: boolean;
+  overlappedTab: boolean;
+  /** Why `state` is `no_baseline` or `unfinished`. */
+  reason: string | null;
+};
+export type ReviewFile = {
+  path: string;
+  added: number;
+  removed: number;
+  origin: ReviewOrigin;
+  binary: boolean;
+  tooLarge: boolean;
+  nested: boolean;
+};
+export type ReviewEnvelope = {
+  requestId: string;
+  tab: TabId;
+  scope: ReviewScope;
+  /** The turn number shown (the newest one, in session scope). */
+  current: number;
+  turns: ReviewTurn[];
+  files: ReviewFile[];
+  /** `false`: nothing was compared (no baseline, or one still being taken), so an empty `files` says
+   *  nothing about what changed and the list is not drawn. */
+  compared: boolean;
+  /** File-changing calls of this turn that have no result. */
+  pendingNoResult: number;
+  /** Every line the review says about itself (its heading, a late or missing baseline, overlaps, a turn
+   *  still running), worded by Rust. The overlay draws these and derives none from the turn flags. */
+  notes: string[];
+};
+export type ReviewLine = {
+  kind: "context" | "added" | "removed" | "no_newline";
+  text: string;
+  oldNo: number | null;
+  newNo: number | null;
+};
+export type ReviewHunk = { id: number; header: string; lines: ReviewLine[] };
+export type ReviewDiffEnvelope = {
+  requestId: string;
+  tab: TabId;
+  turn: number;
+  path: string;
+  added: number;
+  removed: number;
+  /** `null`: the patch is over the display cap. `added`/`removed` are still given. */
+  hunks: ReviewHunk[] | null;
+};
+/** A finished turn changed `files` files on disk; `0` clears the hint. */
+export type ReviewHintEnvelope = { tab: TabId; turn: number; files: number };

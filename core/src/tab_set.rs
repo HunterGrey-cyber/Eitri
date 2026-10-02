@@ -390,6 +390,9 @@ pub struct PumpOutput {
     /// D12), each with the backend taken out of it. The caller shuts each one down off the GTK
     /// thread exactly as it does a closed tab's (`shell::agent_panel`'s `Retiring::backend`).
     pub tripped: Vec<Tripped>,
+    /// Turns whose end snapshot landed this tick, for the status band (empty without a turn
+    /// review installed).
+    pub review_hints: Vec<crate::turn_review::ReviewHint>,
 }
 
 /// One tab the CLI-mode tripwire failed (spec §2.3, D12). See `PumpOutput::tripped`.
@@ -575,6 +578,10 @@ pub struct TabSet {
     /// Set once the window has taken the tabs away to close them (`take_all`). A set that has none
     /// left must not be mistaken for a user who closed every tab.
     closing: bool,
+    /// Watches every tab's turns and snapshots the project around them; `None` until installed,
+    /// and never on the legacy backend, whose turn starts never pass through the pump. Only the
+    /// pump and the tab bookkeeping feed it: no answer or send path reads it.
+    turn_review: Option<crate::turn_review::TurnReview>,
     /// Test seam (P1-A2 round 2): run once, right after `pump`'s next drain of a live tab's queue,
     /// so a test folds an event exactly where the race is -- after a drain and before the next
     /// snapshot read, `active_state_payloads`' or the `Resync` arm's own a few lock cycles later --
@@ -630,6 +637,7 @@ impl TabSet {
             recency: Vec::new(),
             pending_restore: None,
             closing: false,
+            turn_review: None,
             #[cfg(test)]
             after_drain: None,
             #[cfg(test)]
@@ -645,6 +653,78 @@ impl TabSet {
     pub fn kind(&self) -> BackendKind {
         self.kind
     }
+
+    /// Starts reviewing turns. Refused on the legacy backend: its turn starts are returned by the
+    /// send rather than delivered, so the review would never see a turn begin.
+    pub fn install_turn_review(&mut self, review: crate::turn_review::TurnReview) -> Result<(), &'static str> {
+        if self.kind == BackendKind::Legacy {
+            return Err(TURN_REVIEW_NEEDS_SIDECAR);
+        }
+        self.turn_review = Some(review);
+        Ok(())
+    }
+
+    /// The installed turn review, for building review jobs.
+    pub fn turn_review(&self) -> Option<&crate::turn_review::TurnReview> {
+        self.turn_review.as_ref()
+    }
+
+    /// The session `tab` reviews under and the review itself, or why there is neither.
+    fn review_target(&self, tab: TabId) -> Result<(&crate::turn_review::TurnReview, String), String> {
+        let review = self.turn_review.as_ref().ok_or(TURN_REVIEW_NEEDS_SIDECAR)?;
+        let tab = self.get(tab).ok_or_else(|| format!("protocol: no tab {}", tab.0))?;
+        let session = tab
+            .provider_session_id()
+            .ok_or_else(|| "this tab has no session yet, so there is no turn to review".to_string())?;
+        Ok((review, session))
+    }
+
+    /// A review of `tab`'s session at `turn` in `scope`, ready to run on a worker. It attributes
+    /// with the edit calls of `tab`'s own projection, for the turns the scope covers; a turn this
+    /// run has not seen has no calls here, so its files come out unattributed rather than credited
+    /// to the agent. Builds the job without git, waiting or touching the file system: the named
+    /// paths are made relative to the project by the job, on its worker.
+    pub fn review_overview_job(
+        &self,
+        tab: TabId,
+        turn: crate::turn_review::TurnRef,
+        scope: crate::turn_review::Scope,
+    ) -> Result<crate::turn_review::OverviewJob, String> {
+        use crate::turn_review::{Scope, TurnRef};
+        let (review, session) = self.review_target(tab)?;
+        let records = review.turns(&session);
+        let turn_ids: Vec<&str> = match scope {
+            Scope::Session => records.iter().map(|r| r.turn_id.as_str()).collect(),
+            Scope::Turn => match turn {
+                TurnRef::Latest => records.iter().max_by_key(|r| r.n),
+                TurnRef::N(n) => records.iter().find(|r| r.n == n),
+            }
+            .map(|r| vec![r.turn_id.as_str()])
+            .unwrap_or_default(),
+        };
+        let named = match self.get(tab).and_then(|t| t.live()) {
+            Some(backend) => {
+                // The projection's guard is dropped before anything else is read from the backend.
+                let projection = backend.projection();
+                crate::turn_review::named_paths(&projection.tool_calls, &turn_ids)
+            }
+            None => crate::turn_review::NamedPaths::default(),
+        };
+        Ok(review.overview_job(&session, turn, scope, named))
+    }
+
+    /// One file's patch in a review of `tab`'s session, ready to run on a worker.
+    pub fn review_diff_job(
+        &self,
+        tab: TabId,
+        turn: u32,
+        scope: crate::turn_review::Scope,
+        path: &str,
+    ) -> Result<crate::turn_review::DiffJob, String> {
+        let (review, session) = self.review_target(tab)?;
+        Ok(review.diff_job(&session, turn, scope, path))
+    }
+
     pub fn active(&self) -> TabId {
         self.active
     }
@@ -736,6 +816,9 @@ impl TabSet {
         let at = self.tabs.iter().position(|t| t.id == id)?;
         let before = self.active;
         let tab = self.tabs.remove(at);
+        if let Some(review) = self.turn_review.as_mut() {
+            review.close_tab(id.0, wall_clock_ms());
+        }
         self.removed_arrived += tab.attention.attention().arrived;
         self.recency.retain(|t| *t != id);
         if self.last_active == Some(id) {
@@ -1104,12 +1187,21 @@ impl TabSet {
             turn_ended: Vec::new(),
             offers_changed: Vec::new(),
             tripped: Vec::new(),
+            review_hints: Vec::new(),
         };
+        // Before this tick's events: a base that landed by now is not pending for them.
+        if let Some(review) = self.turn_review.as_mut() {
+            out.review_hints = review.poll();
+        }
         let rules = &self.rules;
+        let mut review = self.turn_review.as_mut();
         for tab in &mut self.tabs {
             let is_active = tab.id == active;
             let on_screen = panel_mapped && is_active;
             let TabBackend::Live(backend) = &mut tab.backend else {
+                if let Some(review) = review.as_deref_mut() {
+                    review.tab_has_no_session(tab.id.0, wall_clock_ms());
+                }
                 // No backend holds no card: the backstop `agent_panel` had for `session.is_none()`.
                 tab.attention.retain_pending(|_| false);
                 tab.was_running = false;
@@ -1242,6 +1334,7 @@ impl TabSet {
                 backend.projection().active_turn_id.as_deref(),
                 wall_clock_ms(),
             );
+            let mut resynced = false;
             match delivery {
                 RevisedDelivery::Nothing => {}
                 RevisedDelivery::Events(tagged) => {
@@ -1289,6 +1382,15 @@ impl TabSet {
                                 tab.host_answered.remove(permission_id);
                             }
                             _ => {}
+                        }
+                    }
+                    // The whole batch, what the snapshot already carried included: the review has
+                    // seen neither part. Only enqueues.
+                    if let Some(review) = review.as_deref_mut() {
+                        let session = backend.provider_session_id().unwrap_or_default();
+                        let now = wall_clock_ms();
+                        for event in &events {
+                            review.observe(tab.id.0, &session, event, now);
                         }
                     }
                     let fresh_notes = CallNotes {
@@ -1345,6 +1447,7 @@ impl TabSet {
                     }
                 }
                 RevisedDelivery::Resync => {
+                    resynced = true;
                     // The events are gone; the snapshot is what the panel is shown now.
                     //
                     // This arm drains (`take_revised_ui_delivery`, above) and then reads a fresh
@@ -1531,6 +1634,15 @@ impl TabSet {
                     } else {
                         tab.stale = true;
                     }
+                }
+            }
+            // After the resync, not inside it: the review learns from the rebuilt projection what
+            // the dropped events would have told it. Each read in its own statement (lock order).
+            if resynced {
+                if let Some(review) = review.as_deref_mut() {
+                    let session = backend.provider_session_id().unwrap_or_default();
+                    let running = backend.projection().active_turn_id.clone();
+                    review.observe_resync(tab.id.0, &session, running.as_deref(), wall_clock_ms());
                 }
             }
             // A trace with no dispatch to wait for is printed here once it finishes: a background
@@ -1963,6 +2075,12 @@ impl TabSet {
     /// (`shell::agent_panel` checks `shutting_down` first on every path that reaches the set).
     pub fn take_all(&mut self) -> Vec<Tab> {
         self.closing = true;
+        if let Some(review) = self.turn_review.as_mut() {
+            let now = wall_clock_ms();
+            for tab in &self.tabs {
+                review.close_tab(tab.id.0, now);
+            }
+        }
         std::mem::take(&mut self.tabs)
     }
 
@@ -2504,6 +2622,9 @@ fn observe_turn_clock(clock: &mut Option<(String, u64)>, active_turn_id: Option<
         Some(id) => *clock = Some((id.to_string(), now_ms)),
     }
 }
+
+/// Why [`TabSet::install_turn_review`] refused, as the panel says it.
+pub const TURN_REVIEW_NEEDS_SIDECAR: &str = "turn review needs the sidecar backend";
 
 /// Milliseconds since the Unix epoch: the same clock the panel's `Date.now()` reads.
 fn wall_clock_ms() -> u64 {
@@ -7929,5 +8050,343 @@ mod tests {
         assert!(!show(&set, &mut memory));
         let after = std::fs::read_to_string(state.join(crate::layout::persist::file_name(&root))).unwrap();
         assert_eq!(before, after, "the file still says what was open");
+    }
+
+    // ---- Turn review through the pump ------------------------------------------------------------
+
+    /// A directory of a test's own inside the target dir (beside the test binary), never under the
+    /// user's state directory.
+    fn target_scratch(label: &str) -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("turn-review-tests")
+            .join(format!(
+                "{label}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        std::fs::write(dir.join("project/main.rs"), "fn main() {}\n").unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    /// Holds the worker on its first base snapshot until released.
+    #[derive(Clone, Default)]
+    struct HeldBase(Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>);
+
+    impl HeldBase {
+        fn hook(&self) -> crate::turn_review::JobHook {
+            let held = self.clone();
+            Arc::new(move |event: &crate::turn_review::JobEvent| {
+                if let crate::turn_review::JobEvent::Starting {
+                    kind: crate::turn_review::SnapshotKind::Base,
+                    ..
+                } = event
+                {
+                    let (lock, cvar) = &*held.0;
+                    let mut state = lock.lock().unwrap();
+                    state.1 = true;
+                    cvar.notify_all();
+                    while state.0 {
+                        state = cvar.wait(state).unwrap();
+                    }
+                }
+            })
+        }
+        fn hold(&self) {
+            self.0 .0.lock().unwrap().0 = true;
+        }
+        fn release(&self) {
+            self.0 .0.lock().unwrap().0 = false;
+            self.0 .1.notify_all();
+        }
+        fn parked(&self) -> bool {
+            self.0 .0.lock().unwrap().1
+        }
+    }
+
+    /// One auto tab on a session whose CLI runs auto: a turn whose in-project `Write` is deferred to
+    /// the CLI, which removes the request from the batch. Returns the answers the provider got and,
+    /// with a review installed, the turn's record once its base landed.
+    fn auto_turn_through_the_pump(
+        scratch: &Path,
+        review: Option<crate::turn_review::TurnReview>,
+        held: &HeldBase,
+    ) -> (
+        Vec<(String, agent::PermissionDecision)>,
+        Option<crate::turn_review::TurnRecord>,
+    ) {
+        let dir = scratch.join("project");
+        let mut set = set();
+        let reviewing = review.is_some();
+        if let Some(review) = review {
+            set.install_turn_review(review).unwrap();
+        }
+        let tab = set.active();
+        let provider = Arc::new(RecordingProvider::cli_auto());
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Sidecar(Box::new(conversation)));
+        let input = serde_json::json!({ "file_path": dir.join("main.rs"), "content": "fn main() { }\n" });
+        provider.queue_all(vec![
+            AgentDomainEvent::CliPermissionMode {
+                reported: "auto".into(),
+            },
+            AgentDomainEvent::SessionOpened {
+                session_id: "fake-session".into(),
+                provider_session_id: "sess-auto".into(),
+                model: "m".into(),
+                cwd: dir.to_string_lossy().into_owned(),
+            },
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: "tu-w".into(),
+                name: "Write".into(),
+                input: input.clone(),
+            },
+            AgentDomainEvent::PermissionRequested {
+                permission_id: "perm-w".into(),
+                tool_use_id: Some("tu-w".into()),
+                tool_name: "Write".into(),
+                input,
+                provider_prompt: None,
+            },
+        ]);
+        until("the deferral", || {
+            set.pump(&dir, true);
+            !provider.decisions().is_empty()
+        });
+        let mut record = None;
+        if reviewing {
+            until("the base held on the worker", || held.parked());
+            held.release();
+            until("the base", || {
+                set.pump(&dir, true);
+                record = set.turn_review().unwrap().turns("sess-auto").into_iter().next();
+                record
+                    .as_ref()
+                    .is_some_and(|r| r.base != crate::turn_review::Snap::Pending)
+            });
+        }
+        let decisions = provider.decisions();
+        shut_down_all(&mut set);
+        (decisions, record)
+    }
+
+    #[test]
+    fn an_auto_answered_write_with_a_slow_base_is_marked_late_through_the_pump() {
+        let scratch = target_scratch("late-through-pump");
+        let held = HeldBase::default();
+        held.hold();
+        let review = crate::turn_review::TurnReview::with_options(
+            Some(scratch.join("state/review")),
+            &scratch.join("project"),
+            crate::turn_review::ReviewOptions {
+                excludes: Some(None),
+                on_job: Some(held.hook()),
+                trim_every: Duration::MAX,
+                ..Default::default()
+            },
+        );
+        let (with_review, record) = auto_turn_through_the_pump(&scratch, Some(review), &held);
+        let record = record.unwrap();
+        assert!(
+            matches!(record.base, crate::turn_review::Snap::Taken { .. }),
+            "{record:#?}"
+        );
+        assert!(
+            record.late,
+            "the deferred Write could have run before the base: {record:#?}"
+        );
+        assert_eq!(
+            with_review,
+            vec![("perm-w".to_string(), agent::PermissionDecision::Defer)],
+            "the CLI decided, no card was drawn"
+        );
+
+        // The review changes no answer: the same turn with none installed is answered the same.
+        let (without_review, _) = auto_turn_through_the_pump(&scratch, None, &HeldBase::default());
+        assert_eq!(with_review, without_review);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn review_jobs_are_refused_without_a_review_a_tab_or_a_session() {
+        use crate::turn_review::{Scope, TurnRef};
+        let scratch = target_scratch("review-refused");
+        let dir = scratch.join("project");
+        let mut set = set();
+        let tab = set.active();
+        let refused = |set: &TabSet, tab: TabId| {
+            (
+                set.review_overview_job(tab, TurnRef::Latest, Scope::Turn).err(),
+                set.review_diff_job(tab, 1, Scope::Turn, "main.rs").err(),
+            )
+        };
+        let (overview, diff) = refused(&set, tab);
+        assert_eq!(overview.as_deref(), Some(TURN_REVIEW_NEEDS_SIDECAR));
+        assert_eq!(diff.as_deref(), Some(TURN_REVIEW_NEEDS_SIDECAR));
+
+        set.install_turn_review(crate::turn_review::TurnReview::with_options(
+            Some(scratch.join("state/review")),
+            &dir,
+            crate::turn_review::ReviewOptions {
+                excludes: Some(None),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        let (overview, diff) = refused(&set, tab);
+        assert!(overview.unwrap().contains("no session yet"));
+        assert!(diff.unwrap().contains("no session yet"));
+        let (overview, _) = refused(&set, TabId(9999));
+        assert!(overview.unwrap().contains("no tab 9999"));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The whole route a review request takes in the shell, minus the GTK thread: the pump observes a
+    /// turn that edited a file, the tab builds the job from its own tool calls, and a worker runs it.
+    #[test]
+    fn a_review_job_attributes_with_the_tabs_own_edit_calls() {
+        use crate::turn_review::{Origin, Scope, TurnRef};
+        let scratch = target_scratch("review-job");
+        let dir = scratch.join("project");
+        let mut set = set();
+        set.install_turn_review(crate::turn_review::TurnReview::with_options(
+            Some(scratch.join("state/review")),
+            &dir,
+            crate::turn_review::ReviewOptions {
+                excludes: Some(None),
+                trim_every: Duration::MAX,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.open_session("sess-job", &dir);
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        until("the base", || {
+            set.pump(&dir, true);
+            set.turn_review()
+                .unwrap()
+                .turns("sess-job")
+                .first()
+                .is_some_and(|r| matches!(r.base, crate::turn_review::Snap::Taken { .. }))
+        });
+        // Two files change on disk during the turn; only one is named by a finished edit call.
+        std::fs::write(dir.join("main.rs"), "fn main() { run(); }\n").unwrap();
+        std::fs::write(dir.join("other.txt"), "from a shell command\n").unwrap();
+        let input = serde_json::json!({ "file_path": dir.join("main.rs"), "content": "x" });
+        provider.queue_all(vec![
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: "tu-w".into(),
+                name: "Write".into(),
+                input,
+            },
+            AgentDomainEvent::ToolCallCompleted {
+                turn_id: "t1".into(),
+                tool_use_id: "tu-w".into(),
+                content: serde_json::json!("ok"),
+                is_error: false,
+            },
+            completed("t1", agent::TurnOutcome::Completed),
+        ]);
+        until("the end", || {
+            set.pump(&dir, true);
+            set.turn_review()
+                .unwrap()
+                .turns("sess-job")
+                .first()
+                .is_some_and(|r| matches!(r.end, crate::turn_review::Snap::Taken { .. }))
+        });
+        let overview = set
+            .review_overview_job(tab, TurnRef::Latest, Scope::Turn)
+            .unwrap()
+            .run()
+            .unwrap();
+        let origin = |name: &str| {
+            overview
+                .files
+                .iter()
+                .find(|f| f.path == Path::new(name))
+                .unwrap_or_else(|| panic!("{name} not in {:#?}", overview.files))
+                .origin
+        };
+        assert_eq!(origin("main.rs"), Origin::Agent);
+        assert_eq!(origin("other.txt"), Origin::Workspace);
+        let diff = set
+            .review_diff_job(tab, overview.current, Scope::Turn, "main.rs")
+            .unwrap()
+            .run()
+            .unwrap();
+        assert!(diff.hunks.is_some_and(|h| !h.is_empty()));
+        shut_down_all(&mut set);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn the_legacy_backend_refuses_a_turn_review() {
+        let mut set = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
+        let review = crate::turn_review::TurnReview::with_options(
+            None,
+            Path::new("/nonexistent"),
+            crate::turn_review::ReviewOptions::default(),
+        );
+        assert_eq!(set.install_turn_review(review), Err(TURN_REVIEW_NEEDS_SIDECAR));
+        assert!(set.turn_review().is_none());
+    }
+
+    #[test]
+    fn closing_a_tab_ends_its_turn_in_the_review() {
+        let scratch = target_scratch("close-ends");
+        let dir = scratch.join("project");
+        let mut set = set();
+        let options = crate::turn_review::ReviewOptions {
+            excludes: Some(None),
+            trim_every: Duration::MAX,
+            ..Default::default()
+        };
+        set.install_turn_review(crate::turn_review::TurnReview::with_options(
+            Some(scratch.join("state/review")),
+            &dir,
+            options,
+        ))
+        .unwrap();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.open_session("sess-close", &dir);
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        until("the base", || {
+            set.pump(&dir, true);
+            set.turn_review()
+                .unwrap()
+                .turns("sess-close")
+                .first()
+                .is_some_and(|r| matches!(r.base, crate::turn_review::Snap::Taken { .. }))
+        });
+        let other = set.open();
+        let mut closed = set.remove(tab).unwrap();
+        if let TabBackend::Live(backend) = &mut closed.backend {
+            backend.shutdown();
+        }
+        assert_eq!(set.active(), other);
+        // The tab's session stays tracked until its end snapshot is reported.
+        until("the end", || {
+            set.pump(&dir, true);
+            set.turn_review().unwrap().turns("sess-close").is_empty()
+        });
+        let refs = std::fs::read_dir(scratch.join("state/review/git/refs/eitri/sess-close/1")).unwrap();
+        let mut kinds: Vec<String> = refs.map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        kinds.sort();
+        assert_eq!(kinds, vec!["base".to_string(), "end".to_string()]);
+        shut_down_all(&mut set);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

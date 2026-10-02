@@ -3,7 +3,7 @@ import type { EditorLink, UsageInfo } from "./types";
 
 /** One segment's identity, in the priority order spec §5.2 lists (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage" | "review";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (spec §5.2:
  *  left of the gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
@@ -54,7 +54,17 @@ export type BandFacts = {
    *  `attached`, its text takes the place of the context segment: with no editor attached no file
    *  can be named. Optional so every caller that predates companion mode compiles unchanged. */
   link?: EditorLink | null;
+  /** Turn review: a finished turn of this tab changed `files` files on disk, and `c` opens them. `null`,
+   *  or absent, says nothing. Never drawn over a prompt. A narrow band drops it right after the usage
+   *  figure and the context's shortening, ahead of the model: it is a pointer, not a state. */
+  review?: { files: number } | null;
 };
+
+/** The band's turn-review segment: how many files changed on disk during the last turn, and the key that
+ *  shows them. Says "changed", not who changed them -- the overlay carries the attribution. */
+export function reviewSegment(files: number): string {
+  return `${files} ${files === 1 ? "file" : "files"} changed · c to review`;
+}
 
 /** #39's segment: the card's tool name and a one-line summary of its input (`cardSummary`). */
 export type ApproveFact = { tool: string; summary: string };
@@ -153,6 +163,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.warn ? [{ id: "warn", text: "⚠", side: "right" } as Seg] : []),
     ...(link ? [{ id: "link", text: link.text, side: "right" } as Seg] : []),
     ...(ctxFull && !link ? [{ id: "context", text: ctxFull, side: "right" } as Seg] : []),
+    ...(f.review && f.review.files > 0 ? [{ id: "review", text: reviewSegment(f.review.files), side: "right" } as Seg] : []),
     ...(f.model ? [{ id: "model", text: f.model, side: "right" } as Seg] : []),
     ...(f.usage ? [{ id: "usage", text: f.usage.text, side: "right" } as Seg] : []),
     ...(f.position ? [{ id: "position", text: f.position, side: "right" } as Seg] : []),
@@ -164,6 +175,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     // is shortened, so a narrow panel never trades the file it is showing for a running total.
     (s) => s.filter((x) => x.id !== "usage"),
     (s) => s.map((x) => (x.id === "context" && f.context ? { ...x, text: `⧉ ${f.context.file}` } : x)),
+    (s) => s.filter((x) => x.id !== "review"),
     (s) => s.filter((x) => x.id !== "model"),
     (s) => s.filter((x) => x.id !== "position"),
     (s) => s.filter((x) => x.id !== "context" && x.id !== "link"),
