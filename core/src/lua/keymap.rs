@@ -284,8 +284,8 @@ mod tests {
 
     /// A scratch home holding copies of the two tmux files at their expected paths
     /// (`~/.config/tmux/tmux.conf`, which sources `~/.config/tmux/base.conf`). The copies in
-    /// `core/tests/fixtures/tmux/` have two host names in comments redacted, line for
-    /// line, so the snippet's `base.conf:NN` references still point at the right lines.
+    /// `core/tests/fixtures/tmux/` have every comment emptied and one script name changed,
+    /// line for line, so the snippet's `base.conf:NN` references still point at the right lines.
     fn his_tmux_home() -> crate::test_scratch_dir::ScratchDir {
         let home = crate::test_scratch_dir::ScratchDir::new("eitri-tmux", "owner");
         let dir = home.join(".config/tmux");
