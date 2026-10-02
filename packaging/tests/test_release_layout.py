@@ -1009,9 +1009,31 @@ class BinaryAssetTreeTests(unittest.TestCase):
         rename of one without the other would otherwise fail only at release time)."""
         repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         self.assertEqual(sorted(rc.TRACKED_ART),
-                         sorted(["desktop", "legacy-desktop"] + [r for r in rc.package_roles() if r.startswith("icon-")]))
+                         sorted(["desktop", "panel-desktop", "legacy-desktop"]
+                                + [r for r in rc.package_roles() if r.startswith(("icon-", "plugin-"))]))
         for role, path in rc.TRACKED_ART.items():
             self.assertTrue(os.path.isfile(os.path.join(repo, path)), (role, path))
+
+    def test_the_panel_entry_and_the_nvim_plugin_are_in_the_tarball_and_both_packages(self):
+        """`eitri panel`'s own desktop entry, and the plugin that adds :EitriPanel. The tarball's plugin
+        path is share/eitri/eitri.nvim (the user install puts it in eitri/eitri.nvim: eitri/nvim/ is the
+        private nvim versions' directory); the packages' is /usr/share/eitri/nvim/eitri.nvim."""
+        top = "eitri-1.0.0-x86_64-linux/"
+        t, p = rc.tarball_roles("1.0.0"), rc.package_roles()
+        self.assertEqual(t["panel-desktop"], top + "share/applications/cn.huntergrey.eitri.Panel.desktop")
+        self.assertEqual(p["panel-desktop"], "usr/share/applications/cn.huntergrey.eitri.Panel.desktop")
+        self.assertEqual(t["plugin-eitri-lua"], top + "share/eitri/eitri.nvim/plugin/eitri.lua")
+        self.assertEqual(p["plugin-eitri-lua"], "usr/share/eitri/nvim/eitri.nvim/plugin/eitri.lua")
+        self.assertEqual(p["plugin-module"], "usr/share/eitri/nvim/eitri.nvim/lua/eitri/init.lua")
+        self.assertEqual(p["plugin-doc"], "usr/share/eitri/nvim/eitri.nvim/doc/eitri.txt")
+        self.assertEqual(rc.TRACKED_ART["plugin-module"], "nvim/eitri.nvim/lua/eitri/init.lua")
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        on_disk = set()
+        for dirpath, _dirs, files in os.walk(os.path.join(repo, "nvim", "eitri.nvim")):
+            for name in files:
+                on_disk.add(os.path.relpath(os.path.join(dirpath, name), os.path.join(repo, "nvim", "eitri.nvim")))
+        self.assertEqual(on_disk, {path[len("nvim/eitri.nvim/"):] for role, path in rc.TRACKED_ART.items()
+                                   if role.startswith("plugin-")})
 
     def test_the_tarball_alone_carries_the_legacy_desktop_entry_for_0_2_0s_installer(self):
         """0.2.0's install.sh, which INSTALL.md tells a user to save and rerun to upgrade, refuses a

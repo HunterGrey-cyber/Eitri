@@ -793,10 +793,22 @@ _ICON_HICOLOR = {
     "icon-scalable": f"scalable/apps/{APP_ID}.svg",
 }
 
-# Roles whose bytes must be the tracked file's (packaging/<path> in the source asset): shipped
+# The nvim plugin that adds :EitriPanel (nvim/eitri.nvim in the tree), role -> path under it. The tarball
+# lays it out at share/eitri/eitri.nvim, the packages at usr/share/eitri/nvim/eitri.nvim (the user
+# install's eitri/nvim/ is the private nvim versions' directory, so the tarball's name differs).
+_PLUGIN_FILES = {
+    "plugin-eitri-lua": "plugin/eitri.lua",
+    "plugin-module": "lua/eitri/init.lua",
+    "plugin-doc": "doc/eitri.txt",
+}
+
+# Roles whose bytes must be the tracked file's (the path in the source asset): shipped
 # unmodified by release.sh, in the tarball and in both packages alike.
 TRACKED_ART = {
     "desktop": f"packaging/{APP_ID}.desktop",
+    # The companion panel's own entry, `eitri panel` (a second window class).
+    "panel-desktop": f"packaging/{APP_ID}.Panel.desktop",
+    **{role: f"nvim/eitri.nvim/{rel}" for role, rel in _PLUGIN_FILES.items()},
     # 0.2.0's own desktop entry, byte for byte, in the tarball only (see _TARBALL_ONLY_ROLES).
     "legacy-desktop": "packaging/legacy/eitri.desktop",
     **{role: f"packaging/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
@@ -810,6 +822,8 @@ _TARBALL_ROLES = {
     "setup": "lib/eitri/eitri-setup",
     "RELEASE": "lib/eitri/RELEASE",
     "desktop": f"share/applications/{APP_ID}.desktop",
+    "panel-desktop": f"share/applications/{APP_ID}.Panel.desktop",
+    **{role: f"share/eitri/eitri.nvim/{rel}" for role, rel in _PLUGIN_FILES.items()},
     **{role: f"share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
     "LICENSE": "share/licenses/eitri/LICENSE",
     "THIRD-PARTY-LICENSES": "share/licenses/eitri/THIRD-PARTY-LICENSES",
@@ -821,6 +835,8 @@ _PACKAGE_ROLES = {
     "setup": "usr/lib/eitri/eitri-setup",
     "RELEASE": "usr/lib/eitri/RELEASE",
     "desktop": f"usr/share/applications/{APP_ID}.desktop",
+    "panel-desktop": f"usr/share/applications/{APP_ID}.Panel.desktop",
+    **{role: f"usr/share/eitri/nvim/eitri.nvim/{rel}" for role, rel in _PLUGIN_FILES.items()},
     **{role: f"usr/share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
     "LICENSE": "usr/share/licenses/eitri/LICENSE",
     "THIRD-PARTY-LICENSES": "usr/share/licenses/eitri/THIRD-PARTY-LICENSES",

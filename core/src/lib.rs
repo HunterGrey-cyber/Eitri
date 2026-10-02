@@ -15,6 +15,7 @@ pub mod agent_bridge;
 pub mod agent_prefs;
 pub mod attention;
 pub mod buffer_reload;
+pub mod companion;
 pub mod editor_context;
 pub mod hint;
 pub mod instance_dir;
@@ -24,8 +25,10 @@ pub mod line_feed;
 pub mod lua;
 pub mod nvim_bin;
 pub mod nvim_keys;
+pub mod nvim_rpc;
 pub mod pane_switch;
 pub mod panel_cadence;
+pub mod panel_control;
 pub mod permission_store;
 pub mod project_root;
 pub mod prompt_history;
@@ -36,6 +39,7 @@ pub mod tab_set;
 pub mod tabs;
 pub mod theme;
 pub mod turn_trace;
+pub mod wm;
 
 /// Test doubles shared across this crate's tests, and with `shell`'s through the `test-support`
 /// feature.

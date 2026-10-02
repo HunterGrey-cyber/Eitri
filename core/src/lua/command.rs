@@ -43,6 +43,16 @@ impl CommandRegistry {
         }
     }
 
+    /// How many commands `init.lua` has registered.
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// Whether none has been registered.
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
     /// `pub`: `LuaEngine::invoke_command` calls this.
     pub fn get(&self, id: &str) -> Option<&CommandEntry> {
         self.commands.get(id)

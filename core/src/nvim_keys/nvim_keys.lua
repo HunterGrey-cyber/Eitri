@@ -1,13 +1,27 @@
 -- Eitri nvim-keys feed (spec 2026-09-26 §3). Loaded with --cmd before the user's config; installs
 -- autocommands and one dict watcher, changes no setting and no mapping. Writes one JSON line per
 -- report to EITRI_KEYS_SOCKET, only when the report differs from the last one sent.
-local socket = vim.env.EITRI_KEYS_SOCKET
+--
+-- Called two ways. Under `--cmd` (`dofile`, no arguments) the socket comes from the environment the
+-- host set at spawn. Injected into an already running nvim, the chunk gets a table instead and must
+-- not look at the environment at all: an nvim started inside another Eitri window inherits that
+-- window's variables, and reading them would feed the wrong panel. An injected chunk returns a
+-- function that undoes it.
+local opts = ...
+local socket
+if type(opts) == "table" then
+  socket = opts.socket
+else
+  socket = vim.env.EITRI_KEYS_SOCKET
+end
 if not socket or socket == "" then
   return
 end
 
 local MAX_MAPS, MAX_TEXT = 2000, 200
 local last, scheduled = nil, false
+-- Set by the teardown: a debounce already waiting in `defer_fn` must send nothing afterwards.
+local torn = false
 
 local function cut(s)
   if type(s) ~= "string" then
@@ -61,6 +75,9 @@ local function schedule()
   end
   scheduled = true
   vim.defer_fn(function()
+    if torn then
+      return
+    end
     scheduled = false
     local ok, payload = pcall(report)
     if ok and payload ~= last then
@@ -81,3 +98,21 @@ vim.cmd([[
   endfunction
   call dictwatcheradd(g:, 'mapleader', 'EitriKeysLeaderChanged')
 ]])
+
+-- Injected into an nvim past VimEnter: that event has fired and will not again.
+if vim.v.vim_did_enter == 1 then
+  schedule()
+end
+
+return function()
+  torn = true
+  pcall(vim.api.nvim_del_augroup_by_id, group)
+  -- `vim.g` is not a Vimscript dictionary, so the watcher is removed from Vimscript, where it was added.
+  pcall(vim.cmd, [[
+    silent! call dictwatcherdel(g:, 'mapleader', 'EitriKeysLeaderChanged')
+    silent! delfunction EitriKeysLeaderChanged
+  ]])
+  if rawget(_G, "__eitri_keys_schedule") == schedule then
+    _G.__eitri_keys_schedule = nil
+  end
+end

@@ -1,7 +1,8 @@
 -- Eitri's scratch buffers (keymap/tabs spec §4.2, R3 and C5; phase 3 ruling 18). Loaded by one
 -- `--cmd` like editor_context.lua. shell calls EitriScratch.call('<hex>') through nvim_input's
 -- <Cmd>; the hex is a JSON request, so nothing the request carries is ever read as keys.
-EitriScratch = {}
+-- Injected over RPC, it is given no options and returns the function that removes the global.
+local M = {}
 
 local function unhex(h)
   return (h:gsub('..', function(c) return string.char(tonumber(c, 16)) end))
@@ -30,7 +31,7 @@ local function split(path)
   return buf
 end
 
-function EitriScratch.call(hex)
+function M.call(hex)
   local ok, req = pcall(vim.json.decode, unhex(hex))
   if not ok or type(req) ~= 'table' then return end
   local ran, err = pcall(function()
@@ -59,4 +60,12 @@ function EitriScratch.call(hex)
   -- Known limit: `open` and `view` carry no `done`, so a failure of theirs (E37 from `:edit` over a
   -- modified buffer with 'nohidden', say) reaches only nvim's message area; the panel said `ok`.
   if not ran then mark(req.done, 'error: ' .. tostring(err)) end
+end
+
+EitriScratch = M
+
+return function()
+  if rawget(_G, "EitriScratch") == M then
+    EitriScratch = nil
+  end
 end

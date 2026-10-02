@@ -187,8 +187,9 @@ pub(crate) struct HintCoordinator {
     /// Wraps the window's root; labels are its overlay children.
     overlay: gtk4::Overlay,
     top_items: Vec<gtk4::Widget>,
-    editor: Rc<NeovideEditorPane>,
-    editor_widget: gtk4::Widget,
+    /// `None` in a window with no editor: the editor arm of a focus restore then matches nothing.
+    editor: Option<Rc<NeovideEditorPane>>,
+    editor_widget: Option<gtk4::Widget>,
     agent_widget: gtk4::Widget,
     /// [`HintWidgets::modules`].
     modules: ModuleHosts,
@@ -207,7 +208,7 @@ pub(crate) struct HintWidgets {
     pub(crate) window: gtk4::ApplicationWindow,
     pub(crate) overlay: gtk4::Overlay,
     pub(crate) top_items: Vec<gtk4::Widget>,
-    pub(crate) editor: Rc<NeovideEditorPane>,
+    pub(crate) editor: Option<Rc<NeovideEditorPane>>,
     /// The panel's `WebView` itself, which a panel landing grabs -- never its module host, a
     /// `WebHost` that refuses a grab (`web_host`'s module doc).
     pub(crate) agent_widget: gtk4::Widget,
@@ -228,7 +229,7 @@ fn visible(widget: &gtk4::Widget) -> bool {
 
 impl HintCoordinator {
     pub(crate) fn new(w: HintWidgets) -> Rc<Self> {
-        let editor_widget: gtk4::Widget = w.editor.widget().clone().upcast();
+        let editor_widget: Option<gtk4::Widget> = w.editor.as_ref().map(|editor| editor.widget().clone().upcast());
         let this = Rc::new(HintCoordinator {
             window: w.window,
             overlay: w.overlay,
@@ -646,7 +647,11 @@ impl HintCoordinator {
         }
         if restore {
             match active.restore_focus {
-                Some(w) if w == self.editor_widget => self.editor.grab_focus(),
+                Some(w) if Some(&w) == self.editor_widget.as_ref() => {
+                    if let Some(editor) = &self.editor {
+                        editor.grab_focus();
+                    }
+                }
                 Some(w) => {
                     w.grab_focus();
                 }

@@ -235,6 +235,12 @@ export type HistoryNotice = {
 export type QueueItem = { text: string; queuedAt: number };
 /** V1's editor-context line (phase 3 ruling 32): the file relative to the project root (or
  * absolute outside it), and the selected line range when there is a selection. */
+/** Where the panel stands with the editor beside it, in a companion window (`editor_link`,
+ *  `serialize_editor_link_for_js`, `core/src/agent_bridge.rs`). `text` is the band's own words and is
+ *  empty when `state` is `attached`. */
+export type EditorLinkState = "none" | "attaching" | "attached" | "detached" | "failed";
+export type EditorLink = { state: EditorLinkState; text: string };
+
 export type ContextSummary = { file: string | null; lines: [number, number] | null };
 
 export type AgentUiState = {

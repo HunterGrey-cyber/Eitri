@@ -15,7 +15,17 @@ EXPECTED_TREE='./.local d
 ./.local/lib/eitri/shell f
 ./.local/share d
 ./.local/share/applications d
+./.local/share/applications/cn.huntergrey.eitri.Panel.desktop f
 ./.local/share/applications/cn.huntergrey.eitri.desktop f
+./.local/share/eitri d
+./.local/share/eitri/eitri.nvim d
+./.local/share/eitri/eitri.nvim/doc d
+./.local/share/eitri/eitri.nvim/doc/eitri.txt f
+./.local/share/eitri/eitri.nvim/lua d
+./.local/share/eitri/eitri.nvim/lua/eitri d
+./.local/share/eitri/eitri.nvim/lua/eitri/init.lua f
+./.local/share/eitri/eitri.nvim/plugin d
+./.local/share/eitri/eitri.nvim/plugin/eitri.lua f
 ./.local/share/icons d
 ./.local/share/icons/hicolor d
 ./.local/share/icons/hicolor/128x128 d
@@ -306,6 +316,8 @@ t_dry_run_fresh() {
 	expect_out "would run: 'mv' '--' '$TH/.local/lib/eitri.new' '$TH/.local/lib/eitri'"
 	expect_out "would write the launcher $TH/.local/bin/eitri"
 	expect_out "would write $TH/.local/share/applications/cn.huntergrey.eitri.desktop"
+	expect_out "would write $TH/.local/share/applications/cn.huntergrey.eitri.Panel.desktop"
+	expect_out "would write $TH/.local/share/eitri/eitri.nvim/plugin/eitri.lua"
 	expect_out "would write $TH/.local/share/licenses/eitri/LICENSE"
 	expect_out 'would download http'
 	expect_out '/SHA256SUMS.sig and check it with ssh-keygen -Y verify'

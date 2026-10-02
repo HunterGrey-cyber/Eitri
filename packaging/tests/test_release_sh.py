@@ -846,6 +846,9 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
         os.makedirs(os.path.join(self.clone, "packaging"))
         shutil.copytree(os.path.join(_PACKAGING, "icons"), os.path.join(self.clone, "packaging", "icons"))
         shutil.copy(os.path.join(_PACKAGING, "cn.huntergrey.eitri.desktop"), os.path.join(self.clone, "packaging"))
+        shutil.copy(os.path.join(_PACKAGING, "cn.huntergrey.eitri.Panel.desktop"), os.path.join(self.clone, "packaging"))
+        shutil.copytree(os.path.join(_PACKAGING, "..", "nvim", "eitri.nvim"),
+                        os.path.join(self.clone, "nvim", "eitri.nvim"))
         shutil.copytree(os.path.join(_PACKAGING, "legacy"), os.path.join(self.clone, "packaging", "legacy"))
         self.st = os.path.join(self.scratch, "stage")
         self.tree = os.path.join(self.scratch, "tarball", "top")
@@ -860,9 +863,10 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
 
     def test_the_staging_dir_holds_every_source_the_public_profile_names(self):
         with open(os.path.join(_PACKAGING, "nfpm-public.yaml"), encoding="utf-8") as f:
-            srcs = re.findall(rf"^\s*- src: \./(packaging/(?:icons/|{re.escape(rc.APP_ID)}\.desktop)\S*)\s*$",
+            srcs = re.findall(rf"^\s*- src: \./((?:packaging/(?:icons/|{re.escape(rc.APP_ID)}(?:\.Panel)?\.desktop)|nvim/eitri\.nvim/)\S*)\s*$",
                               f.read(), re.M)
-        self.assertEqual(len(srcs), 10, srcs)
+        # The desktop entry, the panel's entry, nine icons and the plugin's three files.
+        self.assertEqual(len(srcs), 14, srcs)
         for src in srcs:
             self.assertTrue(os.path.isfile(os.path.join(self.st, src)), src)
         # The staging dir also holds the legacy entry (for the tarball's own copy of it), which no
@@ -877,7 +881,7 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
         top = "eitri-1.0.0-x86_64-linux/"
         roles = rc.tarball_roles("1.0.0")
         want = {path[len(top):] for role, path in roles.items()
-                if role in ("desktop", "legacy-desktop") or role.startswith("icon-")}
+                if role in ("desktop", "panel-desktop", "legacy-desktop") or role.startswith(("icon-", "plugin-"))}
         self.assertIn("share/applications/eitri.desktop", want)
         self.assertEqual(self.files(self.tree), want)
         for role, tracked in rc.TRACKED_ART.items():

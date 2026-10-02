@@ -1,0 +1,43 @@
+{
+  "id": 1, "type": "root", "name": "root", "focused": false, "visible": false, "pid": null,
+  "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+  "nodes": [
+    {
+      "id": 2, "type": "output", "name": "HEADLESS-1", "focused": false, "visible": true,
+      "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+      "nodes": [
+        {
+          "id": 3, "type": "workspace", "name": "1", "focused": false, "visible": true,
+          "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+          "nodes": [
+            {
+              "id": 4, "type": "con", "name": "editor", "pid": 4001, "focused": false, "visible": true,
+              "rect": {"x": 0, "y": 0, "width": 960, "height": 1080},
+              "nodes": [], "floating_nodes": []
+            },
+            {
+              "id": 5, "type": "con", "name": "panel", "pid": 4002, "focused": true, "visible": true,
+              "rect": {"x": 960, "y": 0, "width": 960, "height": 1080},
+              "nodes": [], "floating_nodes": []
+            }
+          ],
+          "floating_nodes": []
+        },
+        {
+          "id": 6, "type": "workspace", "name": "2", "focused": false, "visible": false,
+          "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+          "nodes": [
+            {
+              "id": 7, "type": "con", "name": "hidden", "pid": 4003, "focused": false, "visible": false,
+              "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+              "nodes": [], "floating_nodes": []
+            }
+          ],
+          "floating_nodes": []
+        }
+      ],
+      "floating_nodes": []
+    }
+  ],
+  "floating_nodes": []
+}

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { DASH_ITEM_KEY, Dashboard, MODE_CONSEQUENCE, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
-import type { Hello, PermissionModeChoice, ResumableSession } from "../types";
+import type { EditorLink, Hello, PermissionModeChoice, ResumableSession } from "../types";
 
 afterEach(cleanup);
 
@@ -29,7 +29,7 @@ function session(over: Partial<ResumableSession> = {}): ResumableSession {
 }
 
 function renderDash(
-  over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void; prefix?: string } = {},
+  over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void; prefix?: string; editorLink?: EditorLink | null } = {},
 ) {
   const onItem = over.onItem ?? vi.fn();
   const props = {
@@ -39,6 +39,7 @@ function renderDash(
     narrow: over.narrow ?? false,
     onItem,
     prefix: over.prefix ?? "Ctrl+b",
+    editorLink: over.editorLink ?? null,
   };
   return { onItem, ...render(<Dashboard {...props} />) };
 }
@@ -269,5 +270,33 @@ describe("Dashboard's first-run hint line (V1 P11, spec §10.1)", () => {
     expect(first.container.querySelector(".dash-hint")).not.toBeNull();
     const second = renderDash();
     expect(second.container.querySelector(".dash-hint")).not.toBeNull();
+  });
+});
+
+describe("Dashboard: companion hint and context lines", () => {
+  const HINT = "Ctrl+h / Ctrl+l  leave the panel · i or Ctrl+j  type · ctrl+c  interrupt · Ctrl+b  tab keys · ?  all keys";
+
+  it("companion hint and context lines, with an editor attached", () => {
+    const { container } = renderDash({ editorLink: { state: "attached", text: "" } });
+    expect(container.querySelector(".dash-hint")!.textContent).toBe(HINT);
+    expect(container.querySelector(".dash-context")!.textContent).toBe(
+      "Each message also sends the file open in your nvim, or the lines you selected there in Visual mode.",
+    );
+  });
+
+  it("companion hint and context lines, with no editor attached", () => {
+    for (const state of ["none", "attaching", "detached", "failed"] as const) {
+      const { container, unmount } = renderDash({ editorLink: { state, text: "x" } });
+      expect(container.querySelector(".dash-hint")!.textContent).toBe(HINT);
+      expect(container.querySelector(".dash-context")!.textContent).toBe(
+        "No editor is attached: run :EitriPanel in nvim to send its file with each message.",
+      );
+      unmount();
+    }
+  });
+
+  it("reads a configured prefix in the companion hint", () => {
+    const { container } = renderDash({ prefix: "Ctrl+a", editorLink: { state: "attached", text: "" } });
+    expect(container.querySelector(".dash-hint")!.textContent).toContain("Ctrl+a  tab keys");
   });
 });

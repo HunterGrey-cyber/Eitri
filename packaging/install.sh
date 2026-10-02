@@ -49,8 +49,18 @@ NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # the icon theme's icon name and the window's class, shell/src/main.rs's APP_ID, are the same string).
 # Releases before the app icon installed the entry as eitri.desktop; NV_OLD_DESKTOP is what an
 # install or an uninstall removes of it, and only when it is byte for byte what they wrote.
-NV_DESKTOP=cn.huntergrey.eitri.desktop
+#
+# NV_DESKTOP is every entry the release installs (a space-separated list: nothing in a name has a space);
+# NV_MAIN_DESKTOP is the one that is the application, named in messages. The other is the companion
+# panel's own entry (`eitri panel`, its own window class), hidden from menus.
+NV_MAIN_DESKTOP=cn.huntergrey.eitri.desktop
+NV_DESKTOP='cn.huntergrey.eitri.desktop cn.huntergrey.eitri.Panel.desktop'
 NV_OLD_DESKTOP=eitri.desktop
+# The nvim plugin that adds :EitriPanel: in the release tarball at share/eitri/eitri.nvim/<this path>, and
+# installed to $XDG_DATA_HOME/eitri/eitri.nvim/<this path>. Not under eitri/nvim/: that directory holds
+# the private nvim versions this installer scans and removes. A test holds this list to the committed
+# files.
+NV_PLUGIN_FILES='plugin/eitri.lua lua/eitri/init.lua doc/eitri.txt'
 # The icon, one file per size under the icon theme's tree: each is in the release tarball at
 # share/icons/<this path> and goes to $XDG_DATA_HOME/icons/<this path> (packaging/release_check.py's
 # role table holds the tarball to exactly this set, and a test holds the two lists equal).
@@ -1665,13 +1675,19 @@ on_exit() {
 			rmdir -- "$NV_LIBROOT" 2>/dev/null || :
 		fi
 		# The temporary names a write goes through before its `mv` (none is left on success).
-		for _oe_t in "$NV_BINDIR/.eitri.tmp.$$" "$NV_DATA/applications/.$NV_DESKTOP.tmp.$$" \
+		for _oe_t in "$NV_BINDIR/.eitri.tmp.$$" \
 			"$NV_DATA/licenses/eitri/.LICENSE.tmp.$$" "$NV_DATA/licenses/eitri/.THIRD-PARTY-LICENSES.tmp.$$" \
 			"$NV_DATA/licenses/eitri/.SOURCE.tmp.$$" "$NV_DATA/licenses/eitri/.installed-version.tmp.$$"; do
 			rm -f -- "$_oe_t" 2>/dev/null || :
 		done
 		for _oe_i in $NV_ICON_FILES; do
 			rm -f -- "$NV_DATA/icons/${_oe_i%/*}/.${_oe_i##*/}.tmp.$$" 2>/dev/null || :
+		done
+		for _oe_i in $NV_DESKTOP; do
+			rm -f -- "$NV_DATA/applications/.$_oe_i.tmp.$$" 2>/dev/null || :
+		done
+		for _oe_i in $NV_PLUGIN_FILES; do
+			rm -f -- "$NV_DATA/eitri/eitri.nvim/${_oe_i%/*}/.${_oe_i##*/}.tmp.$$" 2>/dev/null || :
 		done
 		if [ -n "${NV_SIDECAR_TMP-}" ]; then rm -f -- "$NV_SIDECAR_TMP" 2>/dev/null || :; fi
 		if [ -n "${NV_NVIM_TMP_DEST-}" ]; then rm -rf -- "$NV_NVIM_TMP_DEST" 2>/dev/null || :; fi
@@ -2554,7 +2570,7 @@ from_source_stage() {
 	rm -rf -- "$NV_STAGE" || die "cannot remove the stale $NV_STAGE"
 	_fss_top=$NV_STAGE/eitri-$NV_VERSION-x86_64-linux
 	NV_STAGE_TOP=$_fss_top
-	mkdir -p -- "$_fss_top/bin" "$_fss_top/lib/eitri" "$_fss_top/share/applications" "$_fss_top/share/licenses/eitri" ||
+	mkdir -p -- "$_fss_top/bin" "$_fss_top/lib/eitri" "$_fss_top/share/applications" "$_fss_top/share/licenses/eitri" "$_fss_top/share/eitri/eitri.nvim" ||
 		die "cannot create $_fss_top"
 	cp -- "$_fss_src/packaging/eitri.launcher.sh" "$_fss_top/bin/eitri" || die "cannot stage the launcher"
 	chmod 0755 "$_fss_top/bin/eitri" || die "cannot chmod the staged launcher"
@@ -2568,10 +2584,18 @@ from_source_stage() {
 	cp -- "$_fss_src/packaging/install.sh" "$_fss_top/lib/eitri/eitri-setup" || die "cannot stage eitri-setup"
 	chmod 0755 "$_fss_top/lib/eitri/eitri-setup" || die "cannot chmod eitri-setup"
 	cp -- "$_fss_release" "$_fss_top/lib/eitri/RELEASE" || die "cannot stage RELEASE"
-	if [ ! -f "$_fss_src/packaging/$NV_DESKTOP" ]; then
-		die "$_fss_src has no packaging/$NV_DESKTOP: it is a source tree from before Eitri's app icon (its desktop entry is packaging/$NV_OLD_DESKTOP), which this installer does not lay out. $(before_icon_advice "that tree with its own packaging/install.sh --from-source")"
+	if [ ! -f "$_fss_src/packaging/$NV_MAIN_DESKTOP" ]; then
+		die "$_fss_src has no packaging/$NV_MAIN_DESKTOP: it is a source tree from before Eitri's app icon (its desktop entry is packaging/$NV_OLD_DESKTOP), which this installer does not lay out. $(before_icon_advice "that tree with its own packaging/install.sh --from-source")"
 	fi
-	cp -- "$_fss_src/packaging/$NV_DESKTOP" "$_fss_top/share/applications/$NV_DESKTOP" || die "cannot stage the desktop entry"
+	for _fss_d in $NV_DESKTOP; do
+		if [ ! -f "$_fss_src/packaging/$_fss_d" ]; then die "$_fss_src has no packaging/$_fss_d: report it at $NV_ISSUES"; fi
+		cp -- "$_fss_src/packaging/$_fss_d" "$_fss_top/share/applications/$_fss_d" || die "cannot stage the desktop entry $_fss_d"
+	done
+	for _fss_i in $NV_PLUGIN_FILES; do
+		if [ ! -f "$_fss_src/nvim/eitri.nvim/$_fss_i" ]; then die "$_fss_src has no nvim/eitri.nvim/$_fss_i: report it at $NV_ISSUES"; fi
+		mkdir -p -- "$_fss_top/share/eitri/eitri.nvim/${_fss_i%/*}" || die "cannot create $_fss_top/share/eitri/eitri.nvim/${_fss_i%/*}"
+		cp -- "$_fss_src/nvim/eitri.nvim/$_fss_i" "$_fss_top/share/eitri/eitri.nvim/$_fss_i" || die "cannot stage the plugin file $_fss_i"
+	done
 	for _fss_i in $NV_ICON_FILES; do
 		if [ ! -f "$_fss_src/packaging/icons/$_fss_i" ]; then die "$_fss_src has no packaging/icons/$_fss_i: report it at $NV_ISSUES"; fi
 		mkdir -p -- "$_fss_top/share/icons/${_fss_i%/*}" || die "cannot create $_fss_top/share/icons/${_fss_i%/*}"
@@ -3000,11 +3024,15 @@ unpack_new() {
 	fi
 	mkdir -p -- "$NV_STAGE" || die "cannot create $NV_STAGE"
 	tar -xzf "$NV_TARBALL" -C "$NV_STAGE" || die "could not unpack $NV_TARBALL_NAME: it is not a valid Eitri release. Nothing was changed and your current install is untouched; report it at $NV_ISSUES"
-	if [ ! -f "$_un_top/share/applications/$NV_DESKTOP" ] && [ -f "$_un_top/share/applications/$NV_OLD_DESKTOP" ]; then
-		die "$NV_TARBALL_NAME is from a release before Eitri's app icon (its desktop entry is share/applications/$NV_OLD_DESKTOP, not $NV_DESKTOP), which this installer does not lay out. $(before_icon_advice 'that release with its own install.sh, a release asset')"
+	if [ ! -f "$_un_top/share/applications/$NV_MAIN_DESKTOP" ] && [ -f "$_un_top/share/applications/$NV_OLD_DESKTOP" ]; then
+		die "$NV_TARBALL_NAME is from a release before Eitri's app icon (its desktop entry is share/applications/$NV_OLD_DESKTOP, not $NV_MAIN_DESKTOP), which this installer does not lay out. $(before_icon_advice 'that release with its own install.sh, a release asset')"
 	fi
-	for _un_f in bin/eitri "share/applications/$NV_DESKTOP"; do
-		if [ ! -f "$_un_top/$_un_f" ]; then die "$NV_TARBALL_NAME has no $_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+	if [ ! -f "$_un_top/bin/eitri" ]; then die "$NV_TARBALL_NAME has no bin/eitri: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+	for _un_f in $NV_DESKTOP; do
+		if [ ! -f "$_un_top/share/applications/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/applications/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+	done
+	for _un_f in $NV_PLUGIN_FILES; do
+		if [ ! -f "$_un_top/share/eitri/eitri.nvim/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/eitri/eitri.nvim/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
 	for _un_f in $NV_ICON_FILES; do
 		if [ ! -f "$_un_top/share/icons/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/icons/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
@@ -3105,7 +3133,7 @@ remove_old_desktop() {
 	old_desktop_state
 	case $NV_OLD_DESKTOP_STATE in
 	ours)
-		say "removing the old desktop entry $NV_DATA/applications/$NV_OLD_DESKTOP: Eitri's is $NV_DESKTOP now, so a launcher pinned to the dash or dock has to be pinned again once"
+		say "removing the old desktop entry $NV_DATA/applications/$NV_OLD_DESKTOP: Eitri's is $NV_MAIN_DESKTOP now, so a launcher pinned to the dash or dock has to be pinned again once"
 		run rm -f -- "$NV_DATA/applications/$NV_OLD_DESKTOP"
 		;;
 	foreign)
@@ -3156,8 +3184,20 @@ tidy_icon_dirs() {
 	esac
 }
 
-# stage_files: the launcher (with its marker line, spec §6.5, MIN-2), the desktop entry (its Exec
-# escaped), the icon (every size) and the licences, each written to a temporary name in its destination
+# desktop_exec_line EXEC FILE: the Exec= line an installed desktop entry gets, EXEC being the launcher's
+# quoted absolute path. The panel's entry runs the `panel` subcommand, which has to come first.
+desktop_exec_line() {
+	case $2 in
+	cn.huntergrey.eitri.Panel.desktop) printf 'Exec=%s panel --quiet %%f\n' "$1" ;;
+	*) printf 'Exec=%s --quiet %%f\n' "$1" ;;
+	esac
+}
+
+# The plugin's directory, $NV_DATA/eitri/eitri.nvim, is written (and removed) only when it is not a
+# symlink: a link there is the user's own checkout of the plugin (a plugin manager's `dir =`, a
+# development tree), and writing through it would change their files. It is left alone, and named.
+# stage_files: the launcher (with its marker line, spec §6.5, MIN-2), the desktop entries (their Exec
+# escaped), the nvim plugin, the icon (every size) and the licences, each written to a temporary name in its destination
 # directory. This runs before the swap, so a directory that cannot be written stops the run while the
 # old install is still in place and untouched: written after it, an unwritable ~/.local/bin left the
 # new lib with the old launcher and licences, and no eitri.old to go back to (Task 9 review).
@@ -3170,7 +3210,12 @@ stage_files() {
 	run mkdir -p -- "$NV_BINDIR" "$_sf_apps" "$_sf_lic"
 	if [ "$OPT_DRY_RUN" = 1 ]; then
 		say "would write the launcher $NV_BINDIR/eitri (from the tarball's bin/eitri, with the line '$NV_LAUNCHER_MARKER')"
-		say "would write $_sf_apps/$NV_DESKTOP with Exec=$_sf_exec --quiet %f"
+		for _sf_f in $NV_DESKTOP; do say "would write $_sf_apps/$_sf_f with $(desktop_exec_line "$_sf_exec" "$_sf_f")"; done
+		if [ ! -L "$NV_DATA/eitri/eitri.nvim" ]; then
+			for _sf_f in $NV_PLUGIN_FILES; do say "would write $NV_DATA/eitri/eitri.nvim/$_sf_f"; done
+		else
+			say "would leave $NV_DATA/eitri/eitri.nvim alone: it is a symlink"
+		fi
 		for _sf_f in $NV_ICON_FILES; do say "would write $NV_DATA/icons/$_sf_f"; done
 		for _sf_f in $NV_LICENCE_FILES; do say "would write $_sf_lic/$_sf_f"; done
 		return 0
@@ -3183,11 +3228,23 @@ stage_files() {
 		printf '\n%s\n' "$NV_LAUNCHER_MARKER" >>"$NV_TMP_LAUNCHER" || die "cannot write $NV_TMP_LAUNCHER; $_sf_keep"
 	fi
 	chmod 0755 "$NV_TMP_LAUNCHER" || die "cannot chmod $NV_TMP_LAUNCHER; $_sf_keep"
-	NV_EXEC="$_sf_exec --quiet %f" awk '
-		/^Exec=/ { print "Exec=" ENVIRON["NV_EXEC"]; next }
-		/^TryExec=/ { next }
-		{ print }' "$NV_STAGE_TOP/share/applications/$NV_DESKTOP" >"$_sf_apps/.$NV_DESKTOP.tmp.$$" ||
-		die "cannot write $_sf_apps/.$NV_DESKTOP.tmp.$$; $_sf_keep"
+	for _sf_f in $NV_DESKTOP; do
+		_sf_line=$(desktop_exec_line "$_sf_exec" "$_sf_f")
+		NV_EXEC=$_sf_line awk '
+			/^Exec=/ { print ENVIRON["NV_EXEC"]; next }
+			/^TryExec=/ { next }
+			{ print }' "$NV_STAGE_TOP/share/applications/$_sf_f" >"$_sf_apps/.$_sf_f.tmp.$$" ||
+			die "cannot write $_sf_apps/.$_sf_f.tmp.$$; $_sf_keep"
+	done
+	if [ ! -L "$NV_DATA/eitri/eitri.nvim" ]; then
+		for _sf_f in $NV_PLUGIN_FILES; do
+			mkdir -p -- "$NV_DATA/eitri/eitri.nvim/${_sf_f%/*}" || die "cannot create $NV_DATA/eitri/eitri.nvim/${_sf_f%/*}; $_sf_keep"
+			cp -- "$NV_STAGE_TOP/share/eitri/eitri.nvim/$_sf_f" "$NV_DATA/eitri/eitri.nvim/${_sf_f%/*}/.${_sf_f##*/}.tmp.$$" ||
+				die "cannot write $NV_DATA/eitri/eitri.nvim/${_sf_f%/*}/.${_sf_f##*/}.tmp.$$; $_sf_keep"
+		done
+	else
+		warn "$NV_DATA/eitri/eitri.nvim is a symlink, so the plugin was not installed over it: it is yours, and it is left as it is"
+	fi
 	for _sf_f in $NV_LICENCE_FILES; do
 		cp -- "$NV_STAGE_TOP/share/licenses/eitri/$_sf_f" "$_sf_lic/.$_sf_f.tmp.$$" ||
 			die "cannot write $_sf_lic/.$_sf_f.tmp.$$; $_sf_keep"
@@ -3227,8 +3284,16 @@ commit_files() {
 	# finishes it (install_complete keeps it from saying "up to date" instead).
 	_cf_fin="Eitri $NV_VERSION is in $NV_LIB but not finished: fix this and re-run the installer to finish it"
 	mv -- "$NV_TMP_LAUNCHER" "$_cf_dst" || die "cannot move the launcher into $_cf_dst; $_cf_fin"
-	mv -- "$NV_DATA/applications/.$NV_DESKTOP.tmp.$$" "$NV_DATA/applications/$NV_DESKTOP" ||
-		die "cannot write $NV_DATA/applications/$NV_DESKTOP; $_cf_fin"
+	for _cf_f in $NV_DESKTOP; do
+		mv -- "$NV_DATA/applications/.$_cf_f.tmp.$$" "$NV_DATA/applications/$_cf_f" ||
+			die "cannot write $NV_DATA/applications/$_cf_f; $_cf_fin"
+	done
+	if [ ! -L "$NV_DATA/eitri/eitri.nvim" ]; then
+		for _cf_f in $NV_PLUGIN_FILES; do
+			mv -- "$NV_DATA/eitri/eitri.nvim/${_cf_f%/*}/.${_cf_f##*/}.tmp.$$" "$NV_DATA/eitri/eitri.nvim/$_cf_f" ||
+				die "cannot write $NV_DATA/eitri/eitri.nvim/$_cf_f; $_cf_fin"
+		done
+	fi
 	for _cf_f in $NV_ICON_FILES; do
 		mv -- "$NV_DATA/icons/${_cf_f%/*}/.${_cf_f##*/}.tmp.$$" "$NV_DATA/icons/$_cf_f" ||
 			die "cannot write $NV_DATA/icons/$_cf_f; $_cf_fin"
@@ -3265,7 +3330,14 @@ install_complete() {
 	NV_COMPLETE=0
 	if [ -L "$NV_BINDIR/eitri" ] || [ ! -f "$NV_BINDIR/eitri" ]; then return 0; fi
 	if ! grep -Fqx -- "$NV_LAUNCHER_MARKER" "$NV_BINDIR/eitri"; then return 0; fi
-	if [ ! -f "$NV_DATA/applications/$NV_DESKTOP" ]; then return 0; fi
+	for _ic_f in $NV_DESKTOP; do
+		if [ ! -f "$NV_DATA/applications/$_ic_f" ]; then return 0; fi
+	done
+	if [ ! -L "$NV_DATA/eitri/eitri.nvim" ]; then
+		for _ic_f in $NV_PLUGIN_FILES; do
+			if [ ! -f "$NV_DATA/eitri/eitri.nvim/$_ic_f" ]; then return 0; fi
+		done
+	fi
 	for _ic_f in $NV_ICON_FILES; do
 		if [ ! -f "$NV_DATA/icons/$_ic_f" ]; then return 0; fi
 	done
@@ -3482,7 +3554,8 @@ do_uninstall() {
 			_du_launcher_note="$NV_BINDIR/eitri was left alone: it was not installed by this installer (no '$NV_LAUNCHER_MARKER' line)"
 		fi
 	fi
-	set -- "$@" "$NV_DATA/applications/$NV_DESKTOP" "$NV_DATA/licenses/eitri"
+	for _du_f in $NV_DESKTOP; do set -- "$@" "$NV_DATA/applications/$_du_f"; done
+	set -- "$@" "$NV_DATA/licenses/eitri"
 	# The entry earlier releases installed as eitri.desktop goes only if it is the one this installer
 	# wrote (old_desktop_state); a user's own file of that name is left, and named.
 	_du_desktop_note=
@@ -3523,6 +3596,12 @@ do_uninstall() {
 		# The AppArmor profile apparmor_note wrote goes too; the copy installed under
 		# /etc/apparmor.d is root's, and the note below says how to remove it.
 		set -- "$@" "$NV_DATA/eitri/nvim" "$NV_DATA/eitri/apparmor"
+		# The plugin goes with them, unless that path is a link: then it is the user's own checkout.
+		if [ ! -L "$NV_DATA/eitri/eitri.nvim" ]; then
+			set -- "$@" "$NV_DATA/eitri/eitri.nvim"
+		else
+			_du_link_note="$_du_link_note$NV_DATA/eitri/eitri.nvim is a symlink, so it was left alone: this installer never made that link"
+		fi
 		# M3 (v1-dist whole-branch review, 2026-09-28): the check just above only ever verified
 		# $NV_DATA/eitri itself, not $NV_SIDECAR_ROOT (its own "sidecar" subdirectory) -- a
 		# symlinked sidecar root, planted by the user in their own $XDG_DATA_HOME, was followed

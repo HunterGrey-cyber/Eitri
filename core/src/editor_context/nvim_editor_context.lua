@@ -5,7 +5,18 @@
 -- cursor is, and -- only while a visual selection is actually live -- the selected lines and their
 -- text.
 
-local socket = vim.env.EITRI_EDITOR_SOCKET
+-- Called two ways. Under `--cmd` (`dofile`, no arguments) the socket comes from the environment the
+-- host set at spawn. Injected into an already running nvim, the chunk gets a table instead and must
+-- not look at the environment at all: an nvim started inside another Eitri window inherits that
+-- window's variables, and reading them would feed the wrong panel. An injected chunk returns a
+-- function that undoes it.
+local opts = ...
+local socket
+if type(opts) == "table" then
+  socket = opts.socket
+else
+  socket = vim.env.EITRI_EDITOR_SOCKET
+end
 if not socket or socket == "" then
   return
 end
@@ -28,6 +39,8 @@ local CONTENT_LIMIT = 2000
 local TRUNCATION_MARKER = "\n... (truncated)"
 
 local dirty = true
+-- Set first thing by the teardown: a send the timer queued just before it must write nothing.
+local torn = false
 
 -- A position's first and last display column, 1-based, as getregion's own blockwise rule reads
 -- them: virtcol() asks the same getvvcol(), with the position's 'virtualedit' offset (its fourth
@@ -157,6 +170,9 @@ local function selection()
 end
 
 local function send()
+  if torn then
+    return
+  end
   local ok, payload = pcall(function()
     local buf = vim.api.nvim_get_current_buf()
     return vim.json.encode({
@@ -204,3 +220,13 @@ timer:start(INTERVAL_MS, INTERVAL_MS, function()
   -- main loop first. Getting this wrong fails with E5560 at runtime, never at load.
   vim.schedule(send)
 end)
+
+-- Undoes this chunk: the autocommands and the timer.
+return function()
+  torn = true
+  pcall(vim.api.nvim_del_augroup_by_id, group)
+  if not timer:is_closing() then
+    timer:stop()
+    timer:close()
+  end
+end

@@ -107,6 +107,22 @@ contents:
   # upgrade drops by this package no longer listing it. `Icon=` names the theme icon below.
   - src: ./packaging/cn.huntergrey.eitri.desktop
     dst: /usr/share/applications/cn.huntergrey.eitri.desktop
+  # The panel's own entry: `eitri panel` is a second window class, so it gets its own (hidden) entry.
+  - src: ./packaging/cn.huntergrey.eitri.Panel.desktop
+    dst: /usr/share/applications/cn.huntergrey.eitri.Panel.desktop
+  # The nvim plugin that adds :EitriPanel (nvim/eitri.nvim/doc/eitri.txt says how to load it).
+  - src: ./nvim/eitri.nvim/plugin/eitri.lua
+    dst: /usr/share/eitri/nvim/eitri.nvim/plugin/eitri.lua
+    file_info:
+      mode: 0644
+  - src: ./nvim/eitri.nvim/lua/eitri/init.lua
+    dst: /usr/share/eitri/nvim/eitri.nvim/lua/eitri/init.lua
+    file_info:
+      mode: 0644
+  - src: ./nvim/eitri.nvim/doc/eitri.txt
+    dst: /usr/share/eitri/nvim/eitri.nvim/doc/eitri.txt
+    file_info:
+      mode: 0644
 
   # The icon, in every size packaging/icons/hicolor holds, under the icon theme's own tree
   # (packaging/icons/README.md; its notice, CC BY 4.0, is printed in THIRD-PARTY-LICENSES).

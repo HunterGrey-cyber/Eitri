@@ -362,3 +362,34 @@ describe("KeymapOverlay: the PageUp row follows the configured prefix", () => {
     expect(pageUpRow(container).textContent).toContain("A view up (Ctrl+b is the prefix)");
   });
 });
+
+describe("KeymapOverlay: a companion window", () => {
+  const NOTE = "A companion window has no layout keys: your window manager arranges windows.";
+  const COMPANION_ROOT: KeyHelp[] = [{ keys: "Ctrl+h / Ctrl+l", what: "leave the panel (your window manager moves focus)" }];
+  const COMPANION_PREFIX: KeyHelp[] = [{ keys: "Ctrl+b c", what: "New session tab" }];
+
+  it("companion note shown and module rows absent", () => {
+    const { container } = render(
+      <KeymapOverlay
+        onClose={() => {}}
+        windowKeys={COMPANION_ROOT}
+        prefixKeys={COMPANION_PREFIX}
+        prefixLabel="Ctrl+b"
+        panel={EMPTY_PANEL_TABLE}
+        companion
+      />,
+    );
+    const prefix = sectionTitled(container, "After Ctrl+b");
+    expect(prefix.querySelector("p")!.textContent).toBe(NOTE);
+    expect(prefix.textContent).toContain("New session tab");
+    // Only what the shell sent is listed: no module, split or layout row is added here.
+    expect(prefix.textContent).not.toContain("module");
+    expect(sectionTitled(container, "Anywhere in the window").textContent).toContain("leave the panel");
+  });
+
+  it("says nothing about layout keys in the one-window mode", () => {
+    const { container } = overlay();
+    expect(container.textContent).not.toContain(NOTE);
+    expect(sectionTitled(container, "After Ctrl+b").querySelector("p")).toBeNull();
+  });
+});

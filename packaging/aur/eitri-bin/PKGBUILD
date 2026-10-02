@@ -117,7 +117,14 @@ package() {
 	# by this package no longer listing it), and the icon is every file of the tarball's hicolor tree.
 	install -Dm0644 "$top/share/applications/cn.huntergrey.eitri.desktop" \
 		"$pkgdir/usr/share/applications/cn.huntergrey.eitri.desktop"
-	local _icon
+	# The panel's own entry (`eitri panel`), and the nvim plugin that adds :EitriPanel, which the tarball
+	# lays out at share/eitri/eitri.nvim and the packages put at /usr/share/eitri/nvim/eitri.nvim.
+	install -Dm0644 "$top/share/applications/cn.huntergrey.eitri.Panel.desktop" \
+		"$pkgdir/usr/share/applications/cn.huntergrey.eitri.Panel.desktop"
+	local _icon _plugin
+	while IFS= read -r _plugin; do
+		install -Dm0644 "$top/share/eitri/eitri.nvim/$_plugin" "$pkgdir/usr/share/eitri/nvim/eitri.nvim/$_plugin"
+	done < <(cd "$top/share/eitri/eitri.nvim" && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
 	while IFS= read -r _icon; do
 		install -Dm0644 "$top/share/icons/$_icon" "$pkgdir/usr/share/icons/$_icon"
 	done < <(cd "$top/share/icons" && find hicolor -type f | LC_ALL=C sort)

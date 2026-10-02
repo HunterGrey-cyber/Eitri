@@ -4,8 +4,8 @@ import type { PermissionModeChoice, TabId, TabInfo, TabMarker, TabsEnvelope } fr
 /** Envelopes about ONE tab (session tabs spec §3.1). Everything else is about the window.
  *
  *  Phase 3: the queue, the draft mirror, the taken-back queue, the rule offers and the scratch
- *  state are each a tab's own (ruling 1, 6, 7, 16, plan ruling 18) -- `history`, `editor_context`
- *  and `notice` are window-scoped and stay out of this set. */
+ *  state are each a tab's own (ruling 1, 6, 7, 16, plan ruling 18) -- `history`, `editor_context`,
+ *  `editor_link` and `notice` are window-scoped and stay out of this set. */
 const TAB_SCOPED = new Set([
   "events", "snapshot", "handoff", "error", "focus_permission", "tab_detail", "confirm_close", "begin_rename",
   "queue", "draft", "queue_taken", "rule_offers", "scratch",

@@ -162,10 +162,30 @@ fn socket_has_a_listener(socket: &Path, uid: u32) -> bool {
 /// socket fd is closed before returning in every case. (macOS never blocks here in the first place:
 /// its `connect()` to a full queue fails at once with `ECONNREFUSED`, which reads as no listener --
 /// harmless, since the pid check before this has no pid namespaces there to be fooled by.)
-fn nonblocking_connect_finds_a_listener(path: &Path) -> bool {
-    let Some(addr) = sockaddr_for(path) else { return false };
+pub(crate) fn nonblocking_connect_finds_a_listener(path: &Path) -> bool {
+    nonblocking_connect_outcome(path) == ConnectOutcome::Listener
+}
+
+/// What one non-blocking `connect()` to a socket path established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectOutcome {
+    /// `connect()` succeeded, or would block because the accept queue is full, or is in progress.
+    Listener,
+    /// `ECONNREFUSED` or `ENOENT`: the one proof that nothing listens there.
+    NoListener,
+    /// Any other failure (`EACCES`, `socket()` failing, a path too long): nothing was established
+    /// either way, so a caller that deletes on "no listener" must not delete on this.
+    Unknown,
+}
+
+/// [`nonblocking_connect_finds_a_listener`] with the "no" split in two: a refusal that proves nothing
+/// listens, and every other failure, which proves nothing.
+pub(crate) fn nonblocking_connect_outcome(path: &Path) -> ConnectOutcome {
+    let Some(addr) = sockaddr_for(path) else {
+        return ConnectOutcome::Unknown;
+    };
     let Some(fd) = nonblocking_unix_socket() else {
-        return false;
+        return ConnectOutcome::Unknown;
     };
     // SAFETY: `fd` is this call's own, freshly opened and still open; `addr` is a fully
     // initialized `sockaddr_un` and its exact size is passed.
@@ -176,14 +196,20 @@ fn nonblocking_connect_finds_a_listener(path: &Path) -> bool {
             std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
         )
     };
-    let has_a_listener = rc == 0
-        || matches!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK || e == libc::EINPROGRESS
-        );
+    let outcome = if rc == 0 {
+        ConnectOutcome::Listener
+    } else {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK || e == libc::EINPROGRESS => {
+                ConnectOutcome::Listener
+            }
+            Some(e) if e == libc::ECONNREFUSED || e == libc::ENOENT => ConnectOutcome::NoListener,
+            _ => ConnectOutcome::Unknown,
+        }
+    };
     // SAFETY: `fd` is this call's own descriptor, still open, closed exactly once here.
     unsafe { libc::close(fd) };
-    has_a_listener
+    outcome
 }
 
 /// A new `AF_UNIX` stream socket, non-blocking and close-on-exec, or `None`. Set with `fcntl`

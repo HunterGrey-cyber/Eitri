@@ -245,6 +245,7 @@ describe("installDispatch", () => {
       { kind: "history", entries: ["old"] },
       { kind: "rule_offers", tab: 1, offers: { "perm-1": "git push *" } },
       { kind: "editor_context", file: "src/a.rs", lines: [1, 2] },
+      { kind: "editor_link", state: "failed", text: "could not attach: no such socket" },
       { kind: "scratch", tab: 1, editing: true },
       { kind: "notice", text: "no such file" },
     ];

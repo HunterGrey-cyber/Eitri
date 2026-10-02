@@ -790,3 +790,277 @@ fn the_letter_is_already_written_before_the_mapping_returns_even_if_nvim_dies_ri
     channel.cleanup();
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+// ---- the snippet injected into a running nvim, and torn down again ------------------------------
+
+#[path = "support/embed_client.rs"]
+mod embed_client;
+
+use embed_client::{opts_map, Embed};
+
+const NAV_SRC: &str = include_str!("../src/nav_fallback.lua");
+
+/// The user's own configuration for the injection tests: `<C-h>` is a plain window move (LazyVim's),
+/// `<C-j>` is a callback of theirs.
+const INJECT_INIT: &str = r#"
+vim.keymap.set("n", "<C-h>", "<C-w>h", { remap = true })
+vim.keymap.set("n", "<C-j>", function() vim.g.user_cj = 1 end)
+"#;
+
+/// A scratch directory for an injected-nvim case, and a bound non-blocking listener inside it. The
+/// listener lives under `temp_dir` (a socket path is capped at 103 bytes, which a worktree's target
+/// directory runs past); everything else goes under the target directory.
+struct Inject {
+    nvim: Embed,
+    listener: UnixListener,
+    socket: String,
+    sockdir: PathBuf,
+}
+
+impl Inject {
+    fn start(case: &str, init: &str, env: &[(&str, &str)]) -> Self {
+        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("nav-inj-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        let init_path = scratch.join("init.lua");
+        std::fs::write(&init_path, init).expect("init.lua");
+        let (listener, socket, sockdir) = bound_listener(case, "a.sock");
+        let mut nvim = Embed::start(&scratch, &["-u", init_path.to_str().unwrap()], env);
+        nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
+        Self {
+            nvim,
+            listener,
+            socket,
+            sockdir,
+        }
+    }
+
+    fn inject(&mut self, opts: &[(&str, Value)]) {
+        let mut all = vec![("socket", Value::from(self.socket.as_str()))];
+        all.extend(opts.iter().map(|(k, v)| (*k, v.clone())));
+        self.nvim.inject(NAV_SRC, opts_map(&all));
+    }
+
+    fn finish(self) {
+        self.nvim.quit();
+        let _ = std::fs::remove_dir_all(&self.sockdir);
+    }
+}
+
+fn bound_listener(case: &str, name: &str) -> (UnixListener, String, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("nv-t1-{}-{case}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("socket dir");
+    let path = agent::socket_path::in_dir(&dir, name).expect("under the cap");
+    let listener = UnixListener::bind(&path).expect("bind");
+    listener.set_nonblocking(true).expect("non-blocking");
+    (listener, path.display().to_string(), dir)
+}
+
+fn letter_on(listener: &UnixListener) -> String {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).expect("blocking mode");
+                stream.set_read_timeout(Some(DEADLINE)).expect("read timeout");
+                let mut line = String::new();
+                stream.read_to_string(&mut line).expect("read the letter");
+                return line;
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "no letter arrived within {DEADLINE:?}");
+                std::thread::sleep(POLL);
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    }
+}
+
+/// What a global mapping is, as `maparg(lhs, mode, 0, 1)` reports it.
+#[derive(Debug, PartialEq, Eq)]
+struct Slot {
+    desc: Option<String>,
+    rhs: Option<String>,
+    noremap: i64,
+    callback: bool,
+}
+
+fn slot(nvim: &mut Embed, lhs: &str, mode: &str) -> Slot {
+    let v = nvim.lua(
+        "local lhs, mode = ... \
+         local m = vim.fn.maparg(lhs, mode, false, true) \
+         return { m.desc or vim.NIL, m.rhs or vim.NIL, m.noremap or 0, m.callback ~= nil }",
+        vec![Value::from(lhs), Value::from(mode)],
+    );
+    let items = v.as_array().expect("an array").clone();
+    Slot {
+        desc: items[0].as_str().map(str::to_string),
+        rhs: items[1].as_str().map(str::to_string),
+        noremap: items[2].as_i64().unwrap_or(0),
+        callback: items[3].as_bool().unwrap_or(false),
+    }
+}
+
+/// `maparg` hands the right-hand side back as it was typed (`<cr>` stays `<cr>`), so a comparison is
+/// made in lower case.
+fn rhs_lower(slot: &Slot) -> String {
+    slot.rhs.as_deref().unwrap_or_default().to_lowercase()
+}
+
+fn is_fallback(nvim: &mut Embed, lhs: &str, mode: &str, name: &str) -> bool {
+    slot(nvim, lhs, mode).desc.as_deref() == Some(fallback_desc(name).as_str())
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn injected_after_vimenter_installs_at_once_and_teardown_restores_every_slot() {
+    let mut t = Inject::start("restore", INJECT_INIT, &[]);
+    t.inject(&[]);
+    // <C-h> was a plain move, <C-k> and <C-l> were empty or nvim's own; <C-j> is the user's callback.
+    for (lhs, name, _) in [KEYS[0], KEYS[2], KEYS[3]] {
+        t.nvim
+            .wait_until(&format!("the fallback on n {lhs}"), |n| is_fallback(n, lhs, "n", name));
+    }
+    for (lhs, name, _) in KEYS {
+        t.nvim
+            .wait_until(&format!("the fallback on x {lhs}"), |n| is_fallback(n, lhs, "x", name));
+    }
+    let user_cj = slot(&mut t.nvim, "<C-j>", "n");
+    assert!(user_cj.callback && user_cj.desc.is_none(), "{user_cj:?}");
+
+    t.nvim.teardown();
+
+    let footprint = t.nvim.footprint(&["eitri_nav"]);
+    assert_eq!(footprint.autocmds, 0);
+    assert!(footprint.eitri_maps.is_empty(), "{footprint:?}");
+    let ch = slot(&mut t.nvim, "<C-h>", "n");
+    assert_eq!(ch.rhs.as_deref(), Some("<C-W>h"), "{ch:?}");
+    assert_eq!(ch.noremap, 0, "{ch:?}");
+    let cl = slot(&mut t.nvim, "<C-l>", "n");
+    let default_rhs = cl
+        .rhs
+        .as_deref()
+        .is_some_and(|rhs| rhs.to_lowercase() == "<cmd>nohlsearch<bar>diffupdate<bar>normal! <c-l><cr>");
+    assert!(
+        cl.desc.as_deref() == Some(":help CTRL-L-default") || default_rhs,
+        "nvim's own <C-l> must be back: {cl:?}"
+    );
+    for (lhs, _, _) in [KEYS[1], KEYS[2]] {
+        // <C-k> had no mapping in Normal mode: nothing may remain of ours.
+        let s = slot(&mut t.nvim, lhs, "n");
+        assert!(!s.desc.as_deref().unwrap_or("").starts_with("eitri"), "{lhs}: {s:?}");
+    }
+    let user_cj = slot(&mut t.nvim, "<C-j>", "n");
+    assert!(
+        user_cj.callback && user_cj.desc.is_none(),
+        "the user's <C-j> was lost: {user_cj:?}"
+    );
+    t.finish();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_slot_the_user_remapped_after_install_keeps_the_users_map() {
+    let mut t = Inject::start("remapped", INJECT_INIT, &[]);
+    t.inject(&[]);
+    t.nvim
+        .wait_until("the fallback on n <C-l>", |n| is_fallback(n, "<C-l>", "n", "right"));
+    t.nvim.lua("vim.keymap.set('n', '<C-l>', '<cmd>echo 1<cr>')", vec![]);
+    t.nvim.teardown();
+    let cl = slot(&mut t.nvim, "<C-l>", "n");
+    assert_eq!(rhs_lower(&cl), "<cmd>echo 1<cr>", "{cl:?}");
+    t.finish();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn with_opts_the_environment_is_never_read() {
+    let (a, a_socket, a_dir) = bound_listener("env-a", "a.sock");
+    let mut t = Inject::start("env", INJECT_INIT, &[("EITRI_PANE_SWITCH_SOCKET", a_socket.as_str())]);
+    t.inject(&[]);
+    t.nvim
+        .wait_until("the fallback on n <C-l>", |n| is_fallback(n, "<C-l>", "n", "right"));
+    t.nvim.input("<C-l>");
+    assert_eq!(
+        letter_on(&t.listener),
+        "R\n",
+        "the letter goes to the socket in the options"
+    );
+    match a.accept() {
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+        other => panic!("the environment's socket must receive nothing, got {other:?}"),
+    }
+    t.finish();
+    let _ = std::fs::remove_dir_all(a_dir);
+}
+
+const NAVIGATOR_INIT: &str = r#"
+vim.cmd([[command! TmuxNavigateLeft wincmd h]])
+vim.cmd([[nnoremap <silent> <c-h> :<C-U>TmuxNavigateLeft<cr>]])
+"#;
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn navigator_maps_are_plain_moves_only_for_a_companion_outside_tmux() {
+    // A companion outside tmux: the navigator's slot is taken, and given back on teardown.
+    let mut t = Inject::start("nav-companion", NAVIGATOR_INIT, &[]);
+    t.inject(&[("companion", Value::from(true))]);
+    t.nvim
+        .wait_until("the fallback on n <C-h>", |n| is_fallback(n, "<C-h>", "n", "left"));
+    t.nvim.teardown();
+    let ch = slot(&mut t.nvim, "<C-h>", "n");
+    assert_eq!(rhs_lower(&ch), ":<c-u>tmuxnavigateleft<cr>", "{ch:?}");
+    assert!(ch.desc.is_none(), "{ch:?}");
+    t.finish();
+
+    // Not a companion: the slot is left alone, though the check has demonstrably run.
+    let mut t = Inject::start("nav-plain", NAVIGATOR_INIT, &[]);
+    t.inject(&[]);
+    t.nvim
+        .wait_until("the fallback on n <C-k>", |n| is_fallback(n, "<C-k>", "n", "up"));
+    let ch = slot(&mut t.nvim, "<C-h>", "n");
+    assert_eq!(rhs_lower(&ch), ":<c-u>tmuxnavigateleft<cr>", "{ch:?}");
+    assert!(ch.desc.is_none(), "{ch:?}");
+    t.finish();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn inside_tmux_the_navigator_maps_are_left_alone() {
+    let mut t = Inject::start("nav-tmux", NAVIGATOR_INIT, &[("TMUX", "/tmp/x,1,0")]);
+    t.inject(&[("companion", Value::from(true))]);
+    t.nvim
+        .wait_until("the fallback on n <C-k>", |n| is_fallback(n, "<C-k>", "n", "up"));
+    let ch = slot(&mut t.nvim, "<C-h>", "n");
+    assert_eq!(rhs_lower(&ch), ":<c-u>tmuxnavigateleft<cr>", "{ch:?}");
+    assert!(ch.desc.is_none(), "{ch:?}");
+    t.finish();
+}
+
+/// The check the late install queues must not run after the teardown, and must not put the maps
+/// back. Both happen in one request, so nothing scheduled in between can run.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_teardown_before_the_scheduled_check_installs_nothing() {
+    let mut t = Inject::start("early-teardown", INJECT_INIT, &[]);
+    let mut before = Vec::new();
+    for mode in ["n", "x"] {
+        for (lhs, _, _) in KEYS {
+            before.push(slot(&mut t.nvim, lhs, mode));
+        }
+    }
+    t.nvim
+        .inject_and_teardown(NAV_SRC, opts_map(&[("socket", Value::from(t.socket.as_str()))]));
+    t.nvim.flush_scheduled();
+    let footprint = t.nvim.footprint(&["eitri_nav"]);
+    assert_eq!(footprint.autocmds, 0);
+    assert!(footprint.eitri_maps.is_empty(), "{footprint:?}");
+    let mut after = Vec::new();
+    for mode in ["n", "x"] {
+        for (lhs, _, _) in KEYS {
+            after.push(slot(&mut t.nvim, lhs, mode));
+        }
+    }
+    assert_eq!(before, after, "every slot must hold what it held before");
+    t.finish();
+}

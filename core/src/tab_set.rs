@@ -1873,6 +1873,43 @@ impl TabSet {
         Some((tab.id, draft))
     }
 
+    /// Ends every draft edit still out in nvim, oldest edit first, for an editor that went away.
+    /// `results` holds what each edit came back as, by edit id; a tab with no entry is treated as
+    /// discarded. A tab's `editing_draft` is cleared whether or not it has an entry, so the next
+    /// `Ctrl+g` on it works again (the limit `begin_scratch_edit` documents).
+    ///
+    /// A saved body replaces the draft and is returned; a body equal to the draft, or to it without
+    /// its final newline (the shell strips one before it hands the text over), saved nothing, so
+    /// the draft is left alone and `None` comes back.
+    pub fn cancel_scratch_edits(
+        &mut self,
+        results: &[(u64, crate::scratch::EditDone)],
+    ) -> Vec<(TabId, Option<String>)> {
+        let mut open: Vec<(u64, usize)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| tab.editing_draft.map(|id| (id, index)))
+            .collect();
+        open.sort_by_key(|(id, _)| *id);
+        let mut out = Vec::new();
+        for (id, index) in open {
+            let tab = &mut self.tabs[index];
+            tab.editing_draft = None;
+            let saved = match results.iter().find(|(result_id, _)| *result_id == id) {
+                Some((_, crate::scratch::EditDone::Written(text)))
+                    if *text != tab.draft && Some(text.as_str()) != tab.draft.strip_suffix('\n') =>
+                {
+                    tab.draft = text.clone();
+                    Some(text.clone())
+                }
+                _ => None,
+            };
+            out.push((tab.id, saved));
+        }
+        out
+    }
+
     /// Ruling 7: the whole queue, oldest first, for the panel to merge into the box.
     pub fn take_back_queue(&mut self, id: TabId) -> Vec<String> {
         let Some(tab) = self.get_mut(id) else { return Vec::new() };
@@ -6613,6 +6650,57 @@ mod tests {
             .unwrap();
         assert_eq!(draft, None, ":q! changes nothing");
         assert_eq!(set.get(second).unwrap().draft, "second's own");
+    }
+
+    #[test]
+    fn cancel_scratch_edits_takes_a_saved_body_and_keeps_the_draft_otherwise() {
+        use crate::scratch::EditDone;
+        let mut set = set();
+        let changed = set.active();
+        let identical = set.open();
+        let discarded = set.open();
+        let silent = set.open();
+        set.set_draft(changed, "old");
+        set.set_draft(identical, "same\n");
+        set.set_draft(discarded, "kept");
+        set.set_draft(silent, "also kept");
+        // Opened out of order: the answer is ordered by edit id.
+        set.begin_scratch_edit(silent, 40).unwrap();
+        set.begin_scratch_edit(changed, 10).unwrap();
+        set.begin_scratch_edit(discarded, 30).unwrap();
+        set.begin_scratch_edit(identical, 20).unwrap();
+        let out = set.cancel_scratch_edits(&[
+            (10, EditDone::Written("new".into())),
+            // The shell strips one trailing newline off a body; the draft still has it.
+            (20, EditDone::Written("same".into())),
+            (30, EditDone::Discarded),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                (changed, Some("new".to_string())),
+                (identical, None),
+                (discarded, None),
+                (silent, None),
+            ]
+        );
+        assert_eq!(set.get(changed).unwrap().draft, "new");
+        assert_eq!(set.get(identical).unwrap().draft, "same\n");
+        assert_eq!(set.get(discarded).unwrap().draft, "kept");
+        assert_eq!(set.get(silent).unwrap().draft, "also kept");
+        for tab in [changed, identical, discarded, silent] {
+            assert_eq!(set.get(tab).unwrap().editing_draft, None);
+        }
+    }
+
+    #[test]
+    fn after_cancel_ctrl_g_works_again() {
+        let mut set = set();
+        let tab = set.active();
+        set.begin_scratch_edit(tab, 7).unwrap();
+        assert!(set.begin_scratch_edit(tab, 12).is_err());
+        set.cancel_scratch_edits(&[]);
+        assert!(set.begin_scratch_edit(tab, 12).is_ok());
     }
 
     // ---- R07, D12: a CLI reporting an ungated mode closes the session ----

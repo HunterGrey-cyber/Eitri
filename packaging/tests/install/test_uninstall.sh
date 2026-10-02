@@ -281,6 +281,8 @@ t_uninstall_through_foreign_symlink() {
 	mkdir -p "$TH/.config/nvim" "$TH/.config/sidecar/aaaaaaa"
 	echo 'vim.o.number = true' >"$TH/.config/nvim/init.lua"
 	echo mine >"$TH/.config/sidecar/aaaaaaa/keep"
+	# The install made a real eitri directory (it holds the plugin); `ln -s` would put the link inside it.
+	rm -rf "$(data_of)/eitri"
 	ln -s "$TH/.config" "$(data_of)/eitri"
 	inst -- --uninstall
 	expect_rc 0

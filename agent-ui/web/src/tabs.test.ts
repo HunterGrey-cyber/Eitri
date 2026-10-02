@@ -30,7 +30,7 @@ describe("acceptsEnvelope", () => {
       expect(acceptsEnvelope({ kind, tab: 1 }, 2), kind).toBe(false);
       expect(acceptsEnvelope({ kind, tab: 2 }, 2), kind).toBe(true);
     }
-    for (const kind of ["history", "editor_context", "notice"]) expect(acceptsEnvelope({ kind }, 2), kind).toBe(true);
+    for (const kind of ["history", "editor_context", "editor_link", "notice"]) expect(acceptsEnvelope({ kind }, 2), kind).toBe(true);
   });
 });
 

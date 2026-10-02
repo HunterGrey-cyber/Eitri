@@ -139,6 +139,9 @@ pub struct PaneSwitchChannel {
     /// simply gets no fallback (neither `EITRI_NAV_LUA` nor the loader).
     nav_lua: Option<PathBuf>,
     listener: Option<UnixListener>,
+    /// Whether `bin/tmux` was linked in. Without it the child gets neither the fake `TMUX`
+    /// variables nor a `PATH` that leads into a directory that does not exist.
+    shim: bool,
 }
 
 /// Reclaims directories this module's earlier, now-dead processes left behind, under both the
@@ -160,6 +163,17 @@ impl PaneSwitchChannel {
     ///
     /// Does **not** sweep; call [`sweep_stale_dirs`] first.
     pub fn bind(shim: &Path) -> Option<Self> {
+        Self::bind_with(Some(shim))
+    }
+
+    /// The same channel without the fake `tmux`: no `bin/` directory, no symlink, and
+    /// [`Self::child_env`] leaves `TMUX`, `TMUX_PANE` and `PATH` alone. For a host that attaches to
+    /// an nvim it did not start and must never change that nvim's environment.
+    pub fn bind_without_shim() -> Option<Self> {
+        Self::bind_with(None)
+    }
+
+    fn bind_with(shim: Option<&Path>) -> Option<Self> {
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
         let bin_dir = dir.join("bin");
         // No `remove_dir_all` first: `instance_dir_path` returns a path that has never existed, so
@@ -182,19 +196,20 @@ impl PaneSwitchChannel {
             eprintln!("[pane_switch] {what} -- Ctrl+h/j/k/l out of nvim disabled");
             let _ = std::fs::remove_dir_all(&dir);
         };
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&bin_dir) {
-            fail(format!("could not create {}: {e}", bin_dir.display()));
-            return None;
-        }
-
         let fake_tmux = bin_dir.join("tmux");
-        if let Err(e) = std::os::unix::fs::symlink(shim, &fake_tmux) {
-            fail(format!(
-                "could not link {} -> {}: {e}",
-                fake_tmux.display(),
-                shim.display()
-            ));
-            return None;
+        if let Some(shim) = shim {
+            if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&bin_dir) {
+                fail(format!("could not create {}: {e}", bin_dir.display()));
+                return None;
+            }
+            if let Err(e) = std::os::unix::fs::symlink(shim, &fake_tmux) {
+                fail(format!(
+                    "could not link {} -> {}: {e}",
+                    fake_tmux.display(),
+                    shim.display()
+                ));
+                return None;
+            }
         }
 
         // Through `agent::socket_path::in_dir`, which is this workspace's one place that knows the
@@ -233,16 +248,21 @@ impl PaneSwitchChannel {
             }
         };
 
-        println!(
-            "[pane_switch] fake tmux at {}, socket at {}",
-            fake_tmux.display(),
-            socket_path.display()
-        );
+        if shim.is_some() {
+            println!(
+                "[pane_switch] fake tmux at {}, socket at {}",
+                fake_tmux.display(),
+                socket_path.display()
+            );
+        } else {
+            println!("[pane_switch] no fake tmux, socket at {}", socket_path.display());
+        }
         Some(Self {
             dir,
             socket_path,
             nav_lua,
             listener: Some(listener),
+            shim: shim.is_some(),
         })
     }
 
@@ -258,23 +278,24 @@ impl PaneSwitchChannel {
     /// `EITRI_NAV_LUA` names the nav fallback's snippet, which [`Self::nvim_args`]'s loader runs;
     /// it is absent when the snippet could not be written, and the loader is then a no-op.
     pub fn child_env(&self) -> Vec<(String, String)> {
-        let bin_dir = self.dir.join("bin");
-        let path = match std::env::var("PATH") {
-            Ok(existing) => format!("{}:{}", bin_dir.display(), existing),
-            Err(_) => bin_dir.display().to_string(),
-        };
-        let mut env = vec![
-            (
+        let mut env = Vec::new();
+        if self.shim {
+            let bin_dir = self.dir.join("bin");
+            let path = match std::env::var("PATH") {
+                Ok(existing) => format!("{}:{}", bin_dir.display(), existing),
+                Err(_) => bin_dir.display().to_string(),
+            };
+            env.push((
                 "TMUX".to_string(),
                 format!("{},{},0", self.socket_path.display(), std::process::id()),
-            ),
-            ("TMUX_PANE".to_string(), "%0".to_string()),
-            ("PATH".to_string(), path),
-            (
-                "EITRI_PANE_SWITCH_SOCKET".to_string(),
-                self.socket_path.display().to_string(),
-            ),
-        ];
+            ));
+            env.push(("TMUX_PANE".to_string(), "%0".to_string()));
+            env.push(("PATH".to_string(), path));
+        }
+        env.push((
+            "EITRI_PANE_SWITCH_SOCKET".to_string(),
+            self.socket_path.display().to_string(),
+        ));
         if let Some(nav_lua) = &self.nav_lua {
             env.push(("EITRI_NAV_LUA".to_string(), nav_lua.display().to_string()));
         }
@@ -693,6 +714,7 @@ mod tests {
             nav_lua: Some(dir.join(NAV_LUA_NAME)),
             dir: dir.clone(),
             listener: None,
+            shim: true,
         };
         let env: std::collections::HashMap<String, String> = channel.child_env().into_iter().collect();
         assert_eq!(env["EITRI_NAV_LUA"], dir.join(NAV_LUA_NAME).display().to_string());
@@ -741,10 +763,32 @@ mod tests {
             nav_lua: None,
             dir: dir.clone(),
             listener: None,
+            shim: true,
         };
         assert!(channel.child_env().iter().all(|(k, _)| k != "EITRI_NAV_LUA"));
         assert!(channel.nvim_args().is_empty());
         std::mem::forget(channel);
+    }
+
+    /// The companion's channel: no `bin/` directory, no symlink, and a child environment that
+    /// carries only the socket and the snippet -- never a fake `TMUX`, `TMUX_PANE` or `PATH`.
+    #[test]
+    fn a_channel_without_the_shim_has_no_bin_dir_and_no_tmux_env() {
+        let channel = PaneSwitchChannel::bind_without_shim().expect("bind");
+        let dir = channel.socket_path().parent().unwrap().to_path_buf();
+        assert!(!dir.join("bin").exists(), "no bin/ without a shim");
+        assert!(dir.join(NAV_LUA_NAME).exists(), "the snippet is still written");
+        let env: std::collections::HashMap<String, String> = channel.child_env().into_iter().collect();
+        for name in ["TMUX", "TMUX_PANE", "PATH"] {
+            assert!(!env.contains_key(name), "{name} must not be set: {env:?}");
+        }
+        assert_eq!(
+            env["EITRI_PANE_SWITCH_SOCKET"],
+            channel.socket_path().display().to_string()
+        );
+        assert_eq!(env["EITRI_NAV_LUA"], dir.join(NAV_LUA_NAME).display().to_string());
+        channel.cleanup();
+        assert!(!dir.exists());
     }
 
     /// `bind` writes the snippet into the channel's own directory, names it to the child, and
@@ -1196,6 +1240,28 @@ mod tests {
         let dir = macos_tmp.join(format!("{DIR_PREFIX}99999-{}", uuid::Uuid::new_v4().simple()));
         let path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("must fit");
         assert_eq!(path.as_os_str().len(), 100, "{path:?}");
+
+        // The companion's channel is named by the same two constants, so it spends the same bytes:
+        // rebuild its directory name at the macOS worst case from what `bind_without_shim` made.
+        let channel = PaneSwitchChannel::bind_without_shim().expect("bind");
+        let bound = channel.socket_path().to_path_buf();
+        assert_eq!(bound.file_name().unwrap(), SOCKET_NAME);
+        let name = bound
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let tail = name.strip_prefix(DIR_PREFIX).expect("directory prefix");
+        let (pid, uuid) = tail.split_once('-').expect("pid-uuid");
+        assert_eq!(pid, std::process::id().to_string());
+        assert_eq!(uuid.len(), 32, "{name}");
+        let companion_dir = macos_tmp.join(format!("{DIR_PREFIX}99999-{uuid}"));
+        let companion_path = agent::socket_path::in_dir(&companion_dir, SOCKET_NAME).expect("must fit");
+        assert_eq!(companion_path.as_os_str().len(), 100, "{companion_path:?}");
+        channel.cleanup();
 
         // And on whatever `TMPDIR` this host actually has, with its real pid.
         let here = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);

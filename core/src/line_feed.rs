@@ -23,6 +23,8 @@ pub(crate) const MAX_ACCEPTS_PER_POLL: usize = 16;
 pub(crate) const MAX_LINE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_READ_BYTES_PER_POLL: usize = 64 * 1024;
 pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(2);
+/// How many waiting connections one [`NewestLineReader::discard`] drops.
+const DISCARD_ACCEPTS: usize = 256;
 
 /// A non-blocking reader retained across the host's existing 100ms polls.
 ///
@@ -96,6 +98,22 @@ impl NewestLineReader {
             pending: Vec::new(),
             next_sequence: 1,
             published_sequence: 0,
+        }
+    }
+
+    /// Forgets every line not yet delivered: the connections already being read, and the ones
+    /// still waiting in the listener's backlog. A host that changes what is on the other end of
+    /// the socket calls this, so nothing the old end wrote reaches the new one. What a sender
+    /// writes after this call is delivered as usual.
+    pub fn discard(&mut self) {
+        self.pending.clear();
+        // Bounded: a sender that connects as fast as it is drained must not hold the caller.
+        for _ in 0..DISCARD_ACCEPTS {
+            match self.listener.accept() {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
         }
     }
 
@@ -237,6 +255,27 @@ mod tests {
         eprintln!("line-feed poll with four silent clients: {elapsed:?}");
         assert!(elapsed < Duration::from_millis(200), "poll blocked for {elapsed:?}");
         drop(clients);
+    }
+
+    #[test]
+    fn discard_drops_what_was_queued_and_what_was_half_read_but_not_what_comes_after() {
+        let mut feed = EditorContextFeed::new().expect("bind the test feed");
+        let mut reader = reader_for(&mut feed);
+        // Half read: accepted by a poll, the rest still to come.
+        let mut half = UnixStream::connect(feed.socket_path()).unwrap();
+        half.write_all(br#"{"v":1,"file":"/half"#).unwrap();
+        assert!(reader.poll().is_none());
+        // Complete but never polled: waiting in the listener's backlog.
+        let mut queued = UnixStream::connect(feed.socket_path()).unwrap();
+        queued.write_all(b"{\"v\":1,\"file\":\"/queued.rs\"}\n").unwrap();
+
+        reader.discard();
+        let _ = half.write_all(b".rs\"}\n");
+        assert!(reader.poll().is_none(), "nothing from before the discard is delivered");
+
+        let mut after = UnixStream::connect(feed.socket_path()).unwrap();
+        after.write_all(b"{\"v\":1,\"file\":\"/after.rs\"}\n").unwrap();
+        assert_eq!(reader.poll().unwrap().file, "/after.rs");
     }
 
     #[test]

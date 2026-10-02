@@ -395,6 +395,13 @@ impl Layout {
         })
     }
 
+    /// The companion panel's layout: the agent as the only leaf, focused. There is no editor module
+    /// here -- the user's own nvim is the editor -- so this is built with [`Layout::new`], which accepts
+    /// a one-leaf tree, and never with [`Layout::initial`] or a reconcile against the saved state.
+    pub fn companion() -> Layout {
+        Layout::new(Node::Leaf(ModuleId::agent()), ModuleId::agent()).expect("a one-leaf layout is valid")
+    }
+
     /// The first-launch layout (spec §4.4, §4.5): `Row(editor | agent)` at [`DEFAULT_EDITOR_SHARE`],
     /// then each of `extra` placed in order by its [`Placement`]. Focus is on the editor, or, if a
     /// module took the editor's place, on that module. A duplicate id (including `editor`/`agent`
@@ -664,6 +671,15 @@ mod tests {
 
     fn decl(id: &str, placement: Placement) -> ModuleDecl {
         ModuleDecl { id: lua(id), placement }
+    }
+
+    #[test]
+    fn companion_layout_is_one_agent_leaf() {
+        let layout = Layout::companion();
+        assert_eq!(layout.root().leaves(), vec![ModuleId::agent()]);
+        assert_eq!(layout.focus(), &ModuleId::agent());
+        assert!(layout.is_shown(&ModuleId::agent()));
+        assert!(!layout.is_shown(&ModuleId::editor()));
     }
 
     /// P1's acceptance test is sameness: the default split puts the divider where `main`'s

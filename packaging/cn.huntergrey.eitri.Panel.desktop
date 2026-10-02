@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Eitri panel
+Exec=eitri panel %f
+Icon=cn.huntergrey.eitri
+NoDisplay=true
+StartupWMClass=cn.huntergrey.eitri.Panel
+Terminal=false

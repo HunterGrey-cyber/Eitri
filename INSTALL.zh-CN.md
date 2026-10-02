@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=918b53776387553006e0d585cd2f88a5d5f90cf4eb88c373f9798356e26b9dad -->
+<!-- translated-from: INSTALL.md sha256=7e96a879372f6fd9bde0929500ddd2e4cd0ebf05e265eb4d25acab49fe091f91 -->
 
 # 安装 Eitri
 
@@ -133,11 +133,13 @@ sh install.sh --uninstall --purge    # 同时删除 ~/.config/eitri 和 $XDG_STA
 ~/.local/share/applications/cn.huntergrey.eitri.desktop          Exec = 启动器的绝对路径                          (tarball 方式)
 ~/.local/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png 图标，16 到 512 px，另有 scalable/…/….svg       (tarball 方式)
 ~/.local/share/licenses/eitri/                                   LICENSE、THIRD-PARTY-LICENSES、SOURCE            (tarball 方式)
+~/.local/share/eitri/eitri.nvim/                                 :EitriPanel 插件                                 (tarball 方式)
 /usr/lib/eitri/                                                  同样的四个二进制文件、eitri-setup、RELEASE       (.deb/.rpm)
 /usr/bin/eitri                                                   同样的启动器                                     (.deb/.rpm)
 /usr/share/applications/cn.huntergrey.eitri.desktop                                                               (.deb/.rpm)
 /usr/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png     同样的图标文件                                   (.deb/.rpm)
 /usr/share/licenses/eitri/                                                                                        (.deb/.rpm)
+/usr/share/eitri/nvim/eitri.nvim/                                :EitriPanel 插件                                 (.deb/.rpm、AUR)
 $XDG_DATA_HOME/eitri/sidecar/<rev>/                              eitri setup 构建出的 sidecar，按用户的各条路径
 $XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               私有 nvim 副本，仅在你接受该提议时才有
 ~/.config/eitri/init.lua                                         你自己的配置（EITRI_CONFIG_DIR 可覆盖该目录）
@@ -163,6 +165,68 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto"（默认）或 "bypa
 ## 你的 tmux 键位
 
 如果你用 tmux，Eitri 会从 tmux 自己读的那几个文件（`/etc/tmux.conf`、`~/.tmux.conf`、`$XDG_CONFIG_HOME/tmux/tmux.conf`、`~/.config/tmux/tmux.conf`，以及它们 `source-file` 进来的文件）里读出你的前缀键和前缀表绑定，凡是有对应 Eitri 动作的 tmux 命令都会照搬过来。它只读这些文件，从不启动或询问 tmux。第一次生效时会有一条一次性提示说明拿到了什么；`<前缀> ?` 会逐行列出没能拿过来的那些行和原因。想关掉它，就在 `~/.config/eitri/init.lua` 里写上 `eitri.config.set("keymap.from_tmux", "off")`；你在那里写的 `eitri.keymap` 调用永远优先于从 tmux 拿来的键位。
+
+<a id="use-it-beside-your-own-nvim"></a>
+## 配合你自己的 nvim 使用
+
+Eitri 也可以只运行 agent 面板：一个独立的窗口，放在你平时在终端里用的 nvim 旁边（在 tmux 里或不在都行），也可以是上游 Neovide 或其他任何 nvim 图形前端。面板通过 RPC socket 附着到那个 nvim 上，在里面装一小段胶水代码（你打开的文件和 Visual 选区会送给 agent；面板取用你的配色方案，并显示你的 which-key 按键；agent 改完文件后缓冲区会重新加载；可以从面板里按行号打开文件；`Ctrl+g` 在 nvim 里编辑草稿），面板一消失就把这些全部撤掉。你的 nvim 配置里不会被写入任何东西。编辑器保持它自己的速度和按键，两个窗口怎么摆由你的窗口管理器决定。
+
+**1. 装上插件。** `eitri.nvim` 只是一个很薄的启动器；面板在 nvim 里需要的一切都由面板自己装上，所以插件和已安装的 Eitri 的版本永远不必一致。软件包（`.deb`、`.rpm`、AUR）把它放在 `/usr/share/eitri/nvim/eitri.nvim`；tarball 安装脚本把它放在 `~/.local/share/eitri/eitri.nvim`（设置了 `$XDG_DATA_HOME` 时放在 `$XDG_DATA_HOME/eitri/` 下）。用 lazy.nvim 的话，让一条 spec 指向这个目录。
+
+```lua
+-- .deb、.rpm、AUR
+{ dir = "/usr/share/eitri/nvim/eitri.nvim", cmd = "EitriPanel" },
+
+-- tarball 安装脚本（install.sh）
+{ dir = vim.fn.expand("~/.local/share/eitri/eitri.nvim"), cmd = "EitriPanel" },
+```
+
+不用插件管理器的话，把这个目录加进 `runtimepath`：`set runtimepath+=/usr/share/eitri/nvim/eitri.nvim`。调用 `require("eitri").setup({ ... })` 是可选的：`mapping = "<leader>ep"` 给这条命令绑一个键，`cmd = "/path/to/eitri"` 在启动器不在 nvim 的 `PATH` 里时指明它的位置。
+
+**2. 打开面板。** 在 nvim 里运行 `:EitriPanel`，会为当前工作目录打开面板；`:EitriPanel ~/some/project` 则是另一个项目。如果 nvim 还没有 server 地址，插件会启动一个。在胶水代码装好之前，面板的状态条显示 `attaching…`，而且不会超时：等你按完正在等待的那个键或回答完提示之后，nvim 就会应答这个请求。
+
+**3. 或者从 shell 里启动。**
+
+```sh
+eitri panel [--nvim <addr>] [DIR]
+```
+
+`--nvim` 是要附着的那个 nvim 的地址（`:echo v:servername`），是一个属于你自己的 Unix socket 路径。它默认取 `$NVIM`——nvim 会为它的 `:terminal` 和 `jobstart()` 子进程设置这个变量；TCP 地址（`host:port`）会被拒绝。没有地址时面板以未附着的状态启动，并在状态条里说明；之后在 nvim 里运行 `:EitriPanel` 就会附着上去。`DIR` 是项目目录，解析方式和 `eitri DIR` 完全一样。
+
+每个项目只有一个面板。再次运行 `:EitriPanel`（无论来自同一个 nvim，还是同一项目里的另一个 nvim），会让正在运行的面板改为附着到它并把窗口提到前面，而不是再开第二个窗口；第一个 nvim 里的胶水代码会被撤掉。如果 nvim 退出了，面板保留它的会话，状态条显示 `editor detached: run :EitriPanel to attach again`。
+
+面板窗口的应用 id 是 `cn.huntergrey.eitri.Panel`，标题是 `Eitri · <项目目录名>`，所以窗口规则可以把它挑出来。它读的 `~/.config/eitri/init.lua` 和单窗口模式是同一个（`agent.account` 照常生效）；那里注册的 Lua 面板和命令不会显示，stderr 上会有一行说明漏掉了多少个。它没有编辑器、没有底部终端，也没有自己的布局：前缀键下的标签页键、`?`、`:` 和文字大小键都能用，布局相关的键会回应 `not in a companion window`。
+
+**4. 在两个窗口之间移动。** 在 nvim 里，`Ctrl+h/j/k/l` 走到 nvim 自己窗口的边缘时，会把这次移动交给面板，面板再请你的窗口管理器把焦点移到相邻的窗口。在面板里，`Ctrl+h` 和 `Ctrl+l` 总是离开窗口；`Ctrl+k` 在 BROWSE 下离开（在 INPUT 下是切换到 BROWSE），`Ctrl+j` 在 INPUT 下离开（在 BROWSE 下是切换到 INPUT）。前缀键的 `Select` 键做同样的事。从面板里打开文件会把编辑器的窗口提到前面，再运行一次 `:EitriPanel` 则会把面板提到前面。
+
+用的是哪个窗口管理器，由会话环境自动检测；想强制指定或者关掉它，在 `~/.config/eitri/init.lua` 里写（其他任何值都会让面板在启动时失败，并指出这个键）：
+
+```lua
+eitri.config.set("companion.wm", "auto")   -- "auto"（默认）、"hyprland"、"sway"、"niri" 或 "none"
+```
+
+| 桌面 | 检测依据 | Eitri 的做法 |
+|---|---|---|
+| sway | `SWAYSOCK` | 用 `swaymsg` 移动焦点，移动前先检查那个方向上确实有一个可见窗口（任何输出上都算），所以 sway 默认的 focus wrapping 不会把你带到另一头。走到边缘时这个按键被吞掉 |
+| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | 用 `hyprctl dispatch movefocus` 移动焦点；边缘上会怎样由 Hyprland 自己决定 |
+| niri | `NIRI_SOCKET` | 用 `niri msg action` 移动焦点；边缘上会怎样由 niri 自己决定 |
+| GNOME、KDE 及其他 | 以上都不是 | 不移动焦点：在那里 Wayland 客户端没法抢到焦点。状态条会提示一次，你的桌面不允许 Eitri 移动焦点，请用桌面自己的窗口键 |
+
+**5. 在 tmux 里。** nvim 运行在 tmux 里时，nvim 的环境里什么都不会变，它的导航插件映射保持原样，tmux 窗格之间的移动照旧由你的 tmux 配置负责。tmux 窗格的边缘归 tmux 管：tmux 处理的按键永远到不了面板窗口，所以要跨过去需要在 tmux 一侧加一个绑定（或者用窗口管理器自己的按键）。从面板里打开文件时，编辑器的窗口不会被提到前面，因为在 tmux 里进程树通向的是 tmux server，而不是终端本身。
+
+**6. 导航插件。** nvim 不在 tmux 里时，vim-tmux-navigator 不需要做任何事：面板附着期间，它的 `TmuxNavigate` 映射会被当作普通的窗口移动。用 smart-splits.nvim 的话，在它的 `at_edge` 钩子里把越过边缘的移动交给面板；没有面板附着时，`edge` 返回 `false`：
+
+```lua
+require("smart-splits").setup({
+  at_edge = function(ctx)
+    if not require("eitri").edge(ctx.direction) then
+      -- 没有面板附着：用你自己的回退方式，或者什么都不做
+    end
+  end,
+})
+```
+
+nvim 里的 `:help eitri.nvim` 有同样的内容。还没有在真实硬件上试过的部分，见[已知问题](docs/known-issues.zh-CN.md#companion-mode)页面。
 
 ## 疑难排解
 

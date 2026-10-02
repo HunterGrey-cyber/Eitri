@@ -156,6 +156,11 @@ impl EditorContextReader {
         Self(NewestLineReader::new(listener, "editor-context"))
     }
 
+    /// Forgets every update not yet returned (see [`NewestLineReader::discard`]).
+    pub fn discard(&mut self) {
+        self.0.discard();
+    }
+
     /// Returns the newest valid update available without waiting, or `None` for no news.
     pub fn poll(&mut self) -> Option<EditorContext> {
         self.0

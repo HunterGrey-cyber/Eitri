@@ -23,6 +23,22 @@ describe("the band degrades by priority (spec §5.3)", () => {
     expect(seg?.text === "⧉ eitri.zsh" || seg === undefined).toBe(true);
     expect(bandLayout(running, 520, 7.2).find((s) => s.id === "context")!.text).toBe("⧉ eitri.zsh:3-9");
   });
+  it("a link that is not attached replaces the context segment with its text", () => {
+    const link = { state: "detached" as const, text: "editor detached: run :EitriPanel to attach again" };
+    const segs = bandLayout({ ...running, link }, 900, 7.2);
+    expect(segs.map((s) => s.id)).toEqual(["mode", "pill", "cards", "queue", "link", "model", "position", "unread"]);
+    expect(segs.find((s) => s.id === "link")).toEqual({ id: "link", text: link.text, side: "right" });
+  });
+  it("shows the context when the editor is attached, and nothing changes without a link", () => {
+    const attached = { state: "attached" as const, text: "" };
+    expect(ids(520, { ...running, link: attached })).toEqual(ids(520, running));
+    expect(ids(520, { ...running, link: null })).toEqual(ids(520, running));
+    expect(ids(520, { ...running, link: attached })).toContain("context");
+  });
+  it("drops the link text with the context when the band is too narrow", () => {
+    const link = { state: "none" as const, text: "no editor attached: run :EitriPanel in nvim" };
+    expect(ids(330, { ...running, link })).not.toContain("link");
+  });
   it("a y/n prompt takes everything right of the mode", () => {
     expect(ids(520, { ...running, prompt: "close 2 \"docs\"? (y/n)" })).toEqual(["mode", "prompt"]);
   });

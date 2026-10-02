@@ -116,6 +116,12 @@ it("the showcmd segment carries data-testid=showcmd", () => {
   expect(showcmd.textContent).toBe("Space b…");
 });
 
+it("a link segment carries data-testid=band-link and its text", () => {
+  const link = { state: "none" as const, text: "no editor attached: run :EitriPanel in nvim" };
+  const { container } = renderWide({ ...RUNNING, context: null, link });
+  expect(container.querySelector<HTMLElement>('[data-testid="band-link"]')!.textContent).toBe(link.text);
+});
+
 /** R5 (v1 picks, Task 13): `bandLayout` decides whether the usage segment is drawn and where; the
  *  component's own job is the markup -- the text on the segment and the breakdown as its tooltip,
  *  the way `⚠` carries its warning in `title`. */

@@ -450,6 +450,74 @@ else
 	FAILURES=$((FAILURES + 1))
 fi
 
+echo "== eitri panel: the companion window's command line =="
+# `eitri panel --nvim ADDR [DIR]` hands the address and the realpath of the project to `shell panel`;
+# `--nvim` exists in panel mode only, and the one-window-only flags are refused there.
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher panel --quiet --nvim /r/n.sock "$PROJECT_DIR")"
+REAL_PROJECT="$(realpath -e -- "$PROJECT_DIR")"
+args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:panel STUB_ARG:--nvim STUB_ARG:/r/n.sock STUB_ARG:-- STUB_ARG:$REAL_PROJECT " "panel execs shell panel --nvim ADDR -- <realpath>"
+assert_contains "$out" "STUB_SELF:$ROOT/lib/eitri/shell" "panel runs the same shell binary"
+
+out="$(run_launcher panel --quiet --nvim /r/n.sock -- "$PROJECT_DIR")"
+args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:panel STUB_ARG:--nvim STUB_ARG:/r/n.sock STUB_ARG:-- STUB_ARG:$REAL_PROJECT " "a project after -- is taken the same way"
+
+out="$(run_launcher panel --quiet "$PROJECT_DIR")"
+args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:panel STUB_ARG:-- STUB_ARG:$REAL_PROJECT " "without --nvim no address is passed"
+
+out="$(run_launcher panel --quiet --legacy "$PROJECT_DIR")"
+assert_contains "$out" "eitri panel: unknown option --legacy" "panel refuses --legacy by name"
+assert_not_contains "$out" "STUB_ARG" "panel --legacy never reaches shell"
+(cd "$PROJECT_DIR" && env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" panel --legacy >/dev/null 2>&1)
+assert_eq "$?" "64" "panel --legacy exits 64"
+
+(cd "$PROJECT_DIR" && env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" panel --clean >/dev/null 2>&1)
+assert_eq "$?" "64" "panel --clean exits 64"
+out="$(run_launcher panel --quiet --clean)"
+assert_contains "$out" "eitri panel: unknown option --clean" "panel refuses --clean by name"
+
+out="$(run_launcher --nvim x "$PROJECT_DIR")"
+assert_contains "$out" "eitri: unknown option --nvim" "--nvim outside panel mode is an unknown option"
+(cd "$PROJECT_DIR" && env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" --nvim x >/dev/null 2>&1)
+assert_eq "$?" "64" "eitri --nvim x exits 64"
+
+EXTRA_ENV=()
+out="$(env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" panel --nvim /r/n.sock 2>&1 </dev/null; true)"
+assert_contains "$out" "project" "panel without --quiet prints the startup banner too"
+
+# --account keeps working in panel mode: the stub reports the variable it was started with.
+cat >"$ROOT/lib/eitri/shell" <<'STUB'
+#!/usr/bin/env bash
+echo "STUB_ACCOUNT:${VERDANDI_CLAUDE_ACCOUNT:-<unset>}"
+for a in "$@"; do
+	echo "STUB_ARG:$a"
+done
+STUB
+out="$(run_launcher panel --quiet --account work --nvim /r/n.sock "$PROJECT_DIR")"
+assert_contains "$out" "STUB_ACCOUNT:work" "eitri panel --account work exports VERDANDI_CLAUDE_ACCOUNT=work"
+assert_contains "$out" "STUB_ARG:panel" "and still runs the panel"
+
+# A project path with a space and a glob character survives as one argument.
+SPACED="$SCRATCH_ROOT/my project [x]"
+mkdir -p "$SPACED"
+out="$(run_launcher panel --quiet --nvim "/r/a b.sock" "$SPACED")"
+assert_contains "$out" "STUB_ARG:$(realpath -e -- "$SPACED")" "a project path with a space survives"
+assert_contains "$out" "STUB_ARG:/r/a b.sock" "an address with a space survives"
+
+# The one-window command line is unchanged.
+out="$(run_launcher --quiet "$PROJECT_DIR")"
+args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:$REAL_PROJECT " "without panel the shell gets only the project"
+
+echo "== -h lists the panel subcommand =="
+out="$(run_launcher -h)"
+assert_contains "$out" "eitri panel" "the help text names eitri panel"
+assert_contains "$out" "eitri setup [args]" "and still ends with the setup line"
+
 echo
 echo "$CHECKS checks, $FAILURES failed"
 [[ "$FAILURES" -eq 0 ]]

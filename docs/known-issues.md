@@ -46,6 +46,28 @@ there. The installer downloads from GitHub, so it can fail the same way. If you 
 way, `sh install.sh --tarball FILE --sums FILE --sig FILE` installs from them
 ([INSTALL.md](../INSTALL.md#quick-install)); the sidecar build still needs a network that reaches Node.js and npm.
 
+## Companion mode
+
+Companion mode is the agent panel as its own window beside your own nvim
+([INSTALL.md](../INSTALL.md#use-it-beside-your-own-nvim)). It is new, and less of it has been tried than of the
+one-window mode.
+
+- **Only sway with a terminal nvim has been tried.** Hyprland, niri, GNOME and upstream Neovide (or another nvim
+  GUI) as the host are not yet seen on real hardware. On Hyprland and niri the edge behaviour is the window
+  manager's own; Eitri does not check it.
+- **Inside tmux** the edge of tmux's panes stays tmux's, so there is no crossing from nvim to the panel window with
+  `Ctrl+h/j/k/l` unless you add a binding on the tmux side, and opening a file from the panel does not raise the
+  editor's window (the process tree from nvim leads to the tmux server, not to the terminal).
+- **A tmux server started before your window manager session** keeps that session's old `SWAYSOCK` or
+  `HYPRLAND_INSTANCE_SIGNATURE` in its environment, and a panel started from an nvim in it inherits the stale value:
+  focus moves and raising then do nothing. Restart the tmux server after logging in again, or start the panel from a
+  shell that has the current session's environment.
+- **`foot --server` clients share one pid**, so raising the editor by its process can bring up another foot window
+  of the same server instead of the one that holds your nvim.
+- **At sway's edge the key is consumed.** Eitri has to take or release `Ctrl+h/j/k/l` before it can ask sway
+  whether a window lies that way, so at the edge the key does nothing, as tmux's own `select-pane` does at its edge.
+- **GNOME and KDE: no focus moves.** A Wayland client cannot take focus there; use the desktop's own window keys.
+
 ## Stability
 
 0.2.0 was the first public release. The `init.lua` API and the default keys may change during 0.x; the goal for

@@ -1,0 +1,1 @@
+_G.eitri_reload_timer = vim.uv.new_timer(); local t = _G.eitri_reload_timer; _G.eitri_reload_timer:start(1000, 1000, function() vim.schedule(function() pcall(vim.cmd, 'checktime') end) end); return function() if not t:is_closing() then t:stop(); t:close() end; if _G.eitri_reload_timer == t then _G.eitri_reload_timer = nil end end

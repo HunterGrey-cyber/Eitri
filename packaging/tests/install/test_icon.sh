@@ -27,6 +27,11 @@ run_old_installer() {
 	INSTALLER_UNDER_TEST=
 }
 
+# The entries a release of this installer writes into the applications directory, in C order (what
+# `LC_ALL=C ls` prints): the application's own and the companion panel's.
+NEW_DESKTOPS='cn.huntergrey.eitri.Panel.desktop
+cn.huntergrey.eitri.desktop'
+
 # icon_tmps: any leftover temporary name under the data directory's icons.
 icon_tmps() { find "$(data_of)/icons" -name '*.tmp.*' 2>/dev/null; }
 
@@ -126,7 +131,7 @@ t_upgrade_from_before_the_icon_replaces_the_desktop_entry() {
 	plant_sidecar bbbbbbb
 	# The home an earlier release left: the entry under its old name, and no icons at all.
 	rm -rf "$(data_of)/icons"
-	rm "$(data_of)/applications/cn.huntergrey.eitri.desktop"
+	rm "$(data_of)/applications/cn.huntergrey.eitri.desktop" "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop"
 	plant_old_desktop
 	serve 1.1.0 1.0.0
 	inst_net
@@ -137,7 +142,7 @@ t_upgrade_from_before_the_icon_replaces_the_desktop_entry() {
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.desktop"
 	expect_file "$(data_of)/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg"
 	expect_eq "$(find "$(data_of)/icons" -type f | wc -l | tr -d ' ')" 9 "the icon files after the upgrade"
-	expect_eq "$(ls "$(data_of)/applications")" cn.huntergrey.eitri.desktop "the desktop entries after the upgrade"
+	expect_eq "$(LC_ALL=C ls "$(data_of)/applications")" "$NEW_DESKTOPS" "the desktop entries after the upgrade"
 	# The same re-run is up to date, and removes nothing more.
 	inst_net
 	expect_rc 0
@@ -219,8 +224,8 @@ t_old_desktop_entry_that_is_not_ours_is_left_alone() {
 		if [ -d "$old" ]; then
 			expect_dir "$old"
 		else
-			expect_eq "$(snap "$TH/.local/share/applications" | grep -v 'cn.huntergrey.eitri.desktop')" \
-				"$(printf '%s\n' "$before" | grep -v 'cn.huntergrey.eitri.desktop')" "the old entry ($variant)"
+			expect_eq "$(snap "$TH/.local/share/applications" | grep -v -e 'cn.huntergrey.eitri.desktop' -e 'cn.huntergrey.eitri.Panel.desktop')" \
+				"$(printf '%s\n' "$before" | grep -v -e 'cn.huntergrey.eitri.desktop' -e 'cn.huntergrey.eitri.Panel.desktop')" "the old entry ($variant)"
 		fi
 		expect_file "$TH/.local/share/applications/cn.huntergrey.eitri.desktop"
 		inst -- --uninstall
@@ -228,6 +233,7 @@ t_old_desktop_entry_that_is_not_ours_is_left_alone() {
 		expect_out "$old was left alone: it is not the entry an earlier Eitri installed"
 		if [ ! -e "$old" ] && [ ! -L "$old" ]; then fail "--uninstall removed a foreign $variant eitri.desktop"; fi
 		expect_absent "$TH/.local/share/applications/cn.huntergrey.eitri.desktop"
+		expect_absent "$TH/.local/share/applications/cn.huntergrey.eitri.Panel.desktop"
 	done
 }
 
@@ -329,7 +335,7 @@ t_the_tarball_carries_the_legacy_entry_and_this_installer_ignores_it() {
 	if ! cmp -s "$T/legacy.desktop" "$PKG/legacy/eitri.desktop"; then fail "the tarball's eitri.desktop is not packaging/legacy/eitri.desktop"; fi
 	inst_net
 	expect_rc 0
-	expect_eq "$(ls "$(data_of)/applications")" cn.huntergrey.eitri.desktop "the desktop entries this installer installed"
+	expect_eq "$(LC_ALL=C ls "$(data_of)/applications")" "$NEW_DESKTOPS" "the desktop entries this installer installed"
 	expect_no_out 'old desktop entry'
 	expect_no_out 'was left alone'
 	# A later run over a tarball that still carries it changes nothing.
@@ -385,7 +391,7 @@ t_0_2_0_installer_upgrades_over_a_release_with_the_legacy_entry_and_this_one_fin
 		expect_out 'installed but not finished'
 		expect_out "removing the old desktop entry $(data_of)/applications/eitri.desktop"
 		expect_no_out 'was left alone'
-		expect_eq "$(ls "$(data_of)/applications")" cn.huntergrey.eitri.desktop "$variant: the entries after this installer"
+		expect_eq "$(LC_ALL=C ls "$(data_of)/applications")" "$NEW_DESKTOPS" "$variant: the entries after this installer"
 		expect_eq "$(find "$(data_of)/icons" -type f | wc -l | tr -d ' ')" 9 "$variant: the icon files"
 		expect_eq "$(installed_version)" 1.1.0 "$variant: the installed version"
 		inst_net

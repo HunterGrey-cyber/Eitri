@@ -7,10 +7,12 @@
 mod agent_panel;
 mod chrome;
 mod close_prompt;
+mod companion;
 mod editor_context;
 mod editor_quit;
 mod editor_start_failure;
 mod hint;
+mod keys_help;
 mod kill_pane;
 mod layout;
 mod layout_state;
@@ -37,6 +39,7 @@ mod webkit_sandbox;
 mod webkit_zoom;
 mod webview_crash_guard;
 mod wheel_zoom;
+mod window_config;
 mod window_mode;
 mod xft_dpi;
 
@@ -86,6 +89,10 @@ fn main() -> glib::ExitCode {
     // directory step (v1-dist verdict #5). `args_os`, not `args`, and skipping argv[0] (never a
     // flag), for the same non-UTF-8-safety reason `project_root` gives for its own `args_os` use.
     let early_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // `eitri panel` is its own command line: the project resolver below would read `panel` as a directory.
+    if early_args.first().is_some_and(|a| a == "panel") {
+        return companion::run(early_args[1..].to_vec());
+    }
     let has_flag = |flag: &str| eitri_core::project_root::flag_given(early_args.iter().map(OsString::as_os_str), flag);
 
     // `--version` (v1-dist plan Task 1, spec §3), before anything else -- including the stdin
@@ -316,232 +323,15 @@ fn build_ui(
 
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
-    // Which local Claude account this window spends. Two sources, and the environment wins:
-    // `eitri --account <name>` (and this host's own `VERDANDI_CLAUDE_ACCOUNT`, exported for
-    // Verdandi and inherited by every `eitri` started from a terminal) arrives as that variable,
-    // and `init.lua`'s `eitri.config.set("agent.account", "<name>")` is the per-machine default
-    // underneath it -- which is what pins the account for a launch from the app menu, where no
-    // shell configuration has run. Read here, once: this is the first point where `init.lua` has
-    // run, and still before anything reads a transcript or starts a sidecar (the panel computes its
-    // greeting from a WebView `ready` signal, i.e. after the main loop starts).
-    //
-    // Nothing set anywhere is the shipped default and changes nothing. A name that is malformed or
-    // points at no directory is a hard startup failure naming the source -- never a silent fallback
-    // to "whichever shell launched this window", which is the accident that made a resumed session
-    // open empty on 2026-09-21 (see `agent::account`).
-    // How big the agent panel's text is. One number: every other size in `index.css` is a ratio of
-    // it, so this rescales the panel coherently instead of moving one label. It is NOT taken from
-    // nvim's `guifont` height, which is the editor's size for a MONOSPACE face while the panel is
-    // mostly proportional prose -- following it 1:1 would make the two panes disagree by however
-    // much the two faces disagree at the same nominal size. Unset changes nothing.
-    //
-    // Out of range is a startup failure naming the key, the same discipline as `agent.account`
-    // above: silently clamping a number someone typed is how a knob gets reported as broken.
-    let panel_font_size = match lua_engine.config.borrow().get("agent.font_size").map(str::to_owned) {
-        None => eitri_core::theme::DEFAULT_PANEL_FONT_SIZE_PX,
-        Some(raw) => match raw.trim().parse::<f32>() {
-            Ok(px) if eitri_core::theme::PANEL_FONT_SIZE_RANGE_PX.contains(&px) => {
-                eprintln!("[panel] font size {px}px (init.lua's agent.font_size)");
-                px
-            }
-            Ok(px) => {
-                eprintln!(
-                    "eitri: eitri.config.set(\"agent.font_size\", {raw:?}): {px} is outside {:?}",
-                    eitri_core::theme::PANEL_FONT_SIZE_RANGE_PX
-                );
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("eitri: eitri.config.set(\"agent.font_size\", {raw:?}): not a number ({e})");
-                std::process::exit(1);
-            }
-        },
-    };
-
-    // How often the agent panel's stream reaches its page while the user types in the editor
-    // (owner decision #37: an even cadence, not a hold; `eitri_core::panel_cadence`). Unset is
-    // `DEFAULT_CADENCE_HZ` (5) a second; `"off"` is today's full rate; anything else is a startup failure naming the key, like
-    // `agent.font_size` above.
-    let typing_cadence = match eitri_core::panel_cadence::parse_config(
-        lua_engine.config.borrow().get(eitri_core::panel_cadence::CADENCE_KEY),
-    ) {
-        Ok(cadence) => cadence,
+    let config = match window_config::load(&lua_engine) {
+        Ok(config) => config,
         Err(message) => {
             eprintln!("eitri: {message}");
             std::process::exit(1);
         }
     };
-    match typing_cadence {
-        Some(hz) => eprintln!("[panel] stream cadence while typing in the editor: {hz}/s"),
-        None => eprintln!("[panel] stream cadence while typing in the editor: off (full rate)"),
-    }
-    agent_panel_handle.set_typing_cadence(typing_cadence);
-
-    // Whether the launch offers the last window's tabs back (`agent.restore`: "offer", the default,
-    // "auto" or "off"), and the mode new tabs start in (`agent.default_mode`: "auto" or "bypass").
-    // Anything else is a startup failure naming the key, like `agent.font_size` above. Naming bypass
-    // here is the one way a window starts in bypass without asking, because the answer is in a file
-    // the user wrote.
-    let restore_policy = match eitri_core::tab_restore::RestorePolicy::parse(
-        lua_engine.config.borrow().get(eitri_core::tab_restore::RESTORE_KEY),
-    ) {
-        Ok(policy) => policy,
-        Err(message) => {
-            eprintln!("eitri: {message}");
-            std::process::exit(1);
-        }
-    };
-    agent_panel_handle.set_restore_policy(restore_policy);
-    let default_mode = match eitri_core::agent_prefs::parse_default_mode(
-        lua_engine
-            .config
-            .borrow()
-            .get(eitri_core::agent_prefs::DEFAULT_MODE_KEY),
-    ) {
-        Ok(mode) => mode,
-        Err(message) => {
-            eprintln!("eitri: {message}");
-            std::process::exit(1);
-        }
-    };
-    if let Some(mode) = default_mode {
-        eprintln!(
-            "[agent] new tabs start in {} (init.lua's agent.default_mode)",
-            mode.as_str()
-        );
-    }
-    agent_panel_handle.set_default_mode(default_mode);
-
-    // Whether sessions load the user's own Claude Code configuration (`agent.user_settings`: true,
-    // the default, or false), pinned for the whole process before any session starts; the panel's
-    // `prefix i` note and both backends read the one answer. Anything else is a startup failure
-    // naming the key, like `agent.font_size` above.
-    let user_settings = match eitri_core::agent_prefs::parse_user_settings(
-        lua_engine
-            .config
-            .borrow()
-            .get(eitri_core::agent_prefs::USER_SETTINGS_KEY),
-    ) {
-        Ok(load) => load,
-        Err(message) => {
-            eprintln!("eitri: {message}");
-            std::process::exit(1);
-        }
-    };
-    agent::setting_sources::configure(user_settings);
-    if !user_settings {
-        eprintln!("[agent] sessions do not load the user's own settings (init.lua's agent.user_settings = false)");
-    }
-
-    // What a card for a hidden chat does (modules P2, spec §3.3, decision b): the tray's chip and a
-    // toast, or with `reveal` the chat itself. Anything but `badge`/`reveal` is a startup failure
-    // naming the key, like `agent.font_size` above.
-    let on_permission = match eitri_core::attention::ChatOnPermission::parse(
-        lua_engine
-            .config
-            .borrow()
-            .get(eitri_core::attention::ChatOnPermission::KEY),
-    ) {
-        Ok(policy) => policy,
-        Err(message) => {
-            eprintln!("eitri: {message}");
-            std::process::exit(1);
-        }
-    };
-
-    let account_from_env = std::env::var("VERDANDI_CLAUDE_ACCOUNT").ok();
-    let account_from_config = lua_engine.config.borrow().get("agent.account").map(str::to_owned);
-    match agent::account::resolve_for(account_from_env.as_deref(), account_from_config.as_deref()) {
-        Ok(Some(account)) => {
-            let source = if agent::account::name_to_use(account_from_env.as_deref(), None).is_some() {
-                "VERDANDI_CLAUDE_ACCOUNT"
-            } else {
-                "init.lua's agent.account"
-            };
-            eprintln!(
-                "[account] claude account '{}' from {source} -> {}",
-                account.name(),
-                account.config_dir().display()
-            );
-            agent::account::configure(account);
-        }
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("eitri: the configured claude account is unusable: {err}");
-            std::process::exit(1);
-        }
-    }
-
-    // The keymap (keymap spec §2.3): stock tmux's defaults, prefix `Ctrl+b`, then the user's own
-    // tmux config read from tmux's files (unless `keymap.from_tmux` is "off"), then `init.lua`'s
-    // `eitri.keymap` calls. The tmux import never stops the window from opening: what it cannot
-    // take is listed in the `?` overlay. A bad key, an unknown action or option, or a collision in
-    // `init.lua` is a startup failure naming both sides, as `agent.font_size` is -- never a keymap
-    // nobody wrote. The import yields to what `init.lua` registered, so a config that started
-    // before it still starts.
-    let lua_panel_ids: Vec<String> = lua_engine
-        .panels
-        .borrow()
-        .entries()
-        .iter()
-        .map(|e| e.id.clone())
-        .collect();
-    let lua_claims = eitri_core::keymap::LuaClaims {
-        panel_keys: lua_engine
-            .panels
-            .borrow()
-            .entries()
-            .iter()
-            .filter_map(|e| e.key.clone().map(|key| (e.id.clone(), key)))
-            .collect(),
-        command_keybindings: lua_engine
-            .commands
-            .borrow()
-            .iter()
-            .filter_map(|(id, entry)| entry.keybinding.clone().map(|k| (id.clone(), k)))
-            .collect(),
-    };
-    let from_tmux = lua_engine
-        .config
-        .borrow()
-        .get(eitri_core::keymap::tmux::SETTING)
-        .map(str::to_owned);
-    let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let (keymap, tmux_import) = match eitri_core::keymap::Keymap::for_startup(
-        lua_engine.keymap.borrow().ops(),
-        &lua_panel_ids,
-        from_tmux.as_deref(),
-        eitri_core::keymap::tmux::TmuxEnv::from_process,
-        &lua_claims,
-    ) {
-        Ok((keymap, import)) => (Rc::new(keymap), import),
-        Err(err) => {
-            eprintln!("eitri: {err}");
-            std::process::exit(1);
-        }
-    };
-    eprintln!(
-        "{}",
-        eitri_core::keymap::tmux::notice::log_line(tmux_import.as_ref(), home_dir.as_deref())
-    );
-    let tmux_skipped: Vec<eitri_core::keymap::HelpRow> = tmux_import
-        .as_ref()
-        .map(|import| eitri_core::keymap::tmux::notice::skipped_rows(import, home_dir.as_deref()))
-        .unwrap_or_default();
-    // Collision rule 4: a Lua command's accelerator that is the prefix or a root chord would never fire.
-    for (id, entry) in lua_engine.commands.borrow().iter() {
-        if let Some(keybinding) = &entry.keybinding {
-            if let Err(err) = eitri_core::keymap::check_command_keybinding(id, keybinding, &keymap) {
-                eprintln!("eitri: {err}");
-                std::process::exit(1);
-            }
-        }
-    }
-    println!(
-        "[keymap] prefix {} ({} bindings)",
-        keymap.prefix(),
-        keymap.bindings().len()
-    );
+    config.apply_to_panel(&agent_panel_handle);
+    let keymap = config.keymap.clone();
 
     // The bottom terminal (docs/superpowers/specs/2026-09-23-bottom-terminal-design.md), a module
     // since the modules design's P1 re-homed it (its plan's Task 11). Hidden in a first launch, and
@@ -616,61 +406,20 @@ fn build_ui(
             std::process::exit(1);
         }
     };
-    // The `?` overlay's window and prefix sections, generated from the keymap (keymap spec §2.9).
-    // Panel round 2 plan Task 6: the panel table (spec §3.6's `effective()`) and the new-tab chord
-    // travel in the same envelope, and the panel table is recomputed -- and only re-sent when it
-    // actually changed -- every time nvim's own keys report changes (`nvim_keys::listen` below).
-    // The chord for `Action::Tab(TabAction::New)`, spelled the same way `show_editor`/`way_back`
-    // are below: the prefix as a person reads it, then the first key bound to the action.
-    let new_tab_chord = keymap
-        .keys_for(&Action::Tab(TabAction::New))
-        .first()
-        .map(|key| format!("{} {}", keymap.prefix().human(), key.human()))
-        .unwrap_or_default();
-    // `latest.0` is the last nvim report seen (`None` until the feed's first line, or forever if
-    // the feed could not start); `latest.1` is the last `PanelKeymap` actually sent, so a report
-    // that leaves the merged table unchanged costs no dispatch and no repeated log line.
-    let latest: Rc<
-        RefCell<(
-            Option<eitri_core::nvim_keys::NvimReport>,
-            Option<eitri_core::keymap::PanelKeymap>,
-        )>,
-    > = Rc::new(RefCell::new((None, None)));
-    let send_keymap: Rc<dyn Fn()> = {
-        let latest = latest.clone();
-        let keymap = keymap.clone();
-        let module_keys = module_keys.clone();
-        let agent_panel_handle = agent_panel_handle.clone();
-        let new_tab_chord = new_tab_chord.clone();
-        let tmux_skipped = tmux_skipped.clone();
-        Rc::new(move || {
-            let mut latest_ref = latest.borrow_mut();
-            let report = latest_ref.0.clone();
-            let (panel_keymap, log) = eitri_core::keymap::panel::effective(keymap.panel_user(), report.as_ref());
-            for line in log {
-                println!("{line}");
-            }
-            if latest_ref.1.as_ref() != Some(&panel_keymap) {
-                agent_panel_handle.set_keymap_help(eitri_core::agent_bridge::serialize_keymap_for_js(
-                    &keymap.prefix().human(),
-                    &eitri_core::keymap::root::help_rows(),
-                    &keymap.help(&module_keys),
-                    &panel_keymap,
-                    &new_tab_chord,
-                    &tmux_skipped,
-                ));
-                latest_ref.1 = Some(panel_keymap);
-            }
-        })
-    };
-    send_keymap();
+    // The `?` overlay's window and prefix sections, generated from the keymap (keymap spec §2.9);
+    // see `keys_help`. It is re-sent, only when the merged panel table changed, every time nvim's
+    // own keys report changes (`nvim_keys::listen` below).
+    let keys_help = keys_help::KeysHelp::new(
+        keymap.clone(),
+        module_keys.clone(),
+        agent_panel_handle.clone(),
+        config.tmux_skipped.clone(),
+        crate::keys_help::HelpScope::Window,
+    );
+    keys_help.send();
     if let Some(feed) = nvim_keys_feed.as_mut() {
-        let latest = latest.clone();
-        let send_keymap = send_keymap.clone();
-        nvim_keys::listen(feed, move |report| {
-            latest.borrow_mut().0 = Some(report);
-            send_keymap();
-        });
+        let keys_help = keys_help.clone();
+        nvim_keys::listen(feed, move |report| keys_help.nvim_report(report));
     }
     // The layout this window opens with (modules P2, spec §4.4, §4.6): this project's state file if
     // it can be used, else `init.lua`'s `eitri.layout.default`, else the first launch. A malformed
@@ -853,7 +602,7 @@ fn build_ui(
     // is kept current by `text_size_controller` below. `panel_tokens` reads this rather than the
     // captured `panel_font_size` so a colorscheme change re-derives every OTHER token but never
     // resets a zoom back to the un-zoomed base.
-    let panel_px = Rc::new(std::cell::Cell::new(panel_font_size));
+    let panel_px = Rc::new(std::cell::Cell::new(config.panel_font_size));
     // The editor's own cell height (wave 4, R5), reported by `neovide-editor`'s
     // `connect_cell_size_changed` below -- `None` until nvim has reported a font, same as
     // `--nv-editor-row` itself: see `panel_tokens`'s own use of this and the block that fills it in.
@@ -956,7 +705,7 @@ fn build_ui(
         // buffered by the pane (`ScaleWatch`).
         Some(pane.clone()),
         agent_panel_handle.clone(),
-        panel_font_size,
+        config.panel_font_size,
         panel_px,
     );
 
@@ -1006,7 +755,8 @@ fn build_ui(
     let toast = toast::Toast::install(&hint_overlay, &top_bar.widget);
     // The tmux import says it happened once: the first launch where it changes the keys, and again
     // only when what it imports changes (its fingerprint, kept with Eitri's other state).
-    if let Some(import) = tmux_import.as_ref() {
+    let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if let Some(import) = config.tmux_import.as_ref() {
         if let Some(text) = eitri_core::keymap::tmux::notice::toast_text(import, &keymap, home_dir.as_deref()) {
             let fingerprint = eitri_core::keymap::tmux::notice::fingerprint(import);
             let state = eitri_core::keymap::tmux::notice::state_file(
@@ -1037,7 +787,7 @@ fn build_ui(
         window: window.clone(),
         overlay: hint_overlay.clone(),
         top_items: top_items.clone(),
-        editor: pane.clone(),
+        editor: Some(pane.clone()),
         agent_widget: agent_widget.clone(),
         modules: {
             let grid = grid.clone();
@@ -1172,6 +922,7 @@ fn build_ui(
         let toast = toast.clone();
         let tray = tray.clone();
         let way_back = way_back.clone();
+        let on_permission = config.on_permission;
         // Cloned so the closure can call back into the handle for the tab that holds the newest
         // card: the hook fires from the pump (`report_attention`) after its own state borrow is
         // already dropped, so this is safe and never re-enters a held `RefCell`.
@@ -1265,7 +1016,7 @@ fn build_ui(
         let show_on_screen = show_on_screen.clone();
         let focus_module = focus_module.clone();
         let module_layout = module_layout.clone();
-        agent_panel_handle.on_editor_request(move |keys| {
+        agent_panel_handle.on_editor_request(move |request| {
             // `prefix x` quit it, and it cannot come back in this window (`kill_pane`).
             if module_layout.borrow().is_gone(&ModuleId::editor()) {
                 return Err(LayoutError::Gone(ModuleId::editor()).to_string());
@@ -1277,7 +1028,7 @@ fn build_ui(
             }
             show_on_screen(&ModuleId::editor()).map_err(|e| e.to_string())?;
             focus_module(&ModuleId::editor());
-            pane.send_keys(keys);
+            pane.send_keys(&request.input_keys());
             Ok(())
         });
     }
@@ -2020,21 +1771,7 @@ fn build_ui(
         .filter(|(id, _)| matches!(id.kind(), ModuleKind::Agent | ModuleKind::LuaWebview))
     {
         let intercept: Option<Rc<dyn Fn(Direction) -> bool>> = if id.kind() == ModuleKind::Agent {
-            let agent = agent_panel_handle.clone();
-            Some(Rc::new(move |direction: Direction| {
-                if !claims(agent.panel_keys(), direction) {
-                    return false;
-                }
-                let direction = match direction {
-                    Direction::Down => eitri_core::agent_bridge::NavKeyDirection::Down,
-                    Direction::Up => eitri_core::agent_bridge::NavKeyDirection::Up,
-                    Direction::Left | Direction::Right => {
-                        unreachable!("claims() only claims Down (in Browse) or Up (in Input)")
-                    }
-                };
-                agent.nav_key(direction);
-                true
-            }))
+            Some(agent_nav_intercept(agent_panel_handle.clone()))
         } else {
             None
         };
@@ -2524,6 +2261,26 @@ fn refuse(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, err: &LayoutError) {
     if let Some(text) = gone_editor_toast_text(err) {
         toast.show(&text);
     }
+}
+
+/// The agent host's `Ctrl+j`/`Ctrl+k` intercept for `install_module_nav`: a chord the panel's own
+/// `panel_keys` mirror claims goes to the panel as a nav key, every other falls through to
+/// `move_focus`.
+pub(crate) fn agent_nav_intercept(agent: agent_panel::AgentPanelHandle) -> Rc<dyn Fn(Direction) -> bool> {
+    Rc::new(move |direction: Direction| {
+        if !claims(agent.panel_keys(), direction) {
+            return false;
+        }
+        let direction = match direction {
+            Direction::Down => eitri_core::agent_bridge::NavKeyDirection::Down,
+            Direction::Up => eitri_core::agent_bridge::NavKeyDirection::Up,
+            Direction::Left | Direction::Right => {
+                unreachable!("claims() only claims Down (in Browse) or Up (in Input)")
+            }
+        };
+        agent.nav_key(direction);
+        true
+    })
 }
 
 /// C1's decision, in Rust (spec §3.5): only `Ctrl+j` (`Direction::Down`) while the panel's

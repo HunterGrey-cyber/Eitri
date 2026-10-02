@@ -384,3 +384,62 @@ fn a_capped_block_selection_keeps_its_display_columns_across_a_tab() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[path = "support/embed_client.rs"]
+mod embed_client;
+
+/// Injected into a running nvim (what a companion panel does), the snippet reports a selection, and
+/// its teardown removes its autocommands and its timer.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn injected_editor_context_reports_and_tears_down() {
+    use embed_client::{opts_map, Embed};
+    use rmpv::Value;
+
+    let scratch = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ec-inj-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    let file = scratch.join("t.txt");
+    std::fs::write(&file, "alpha\nbravo\ncharlie\ndelta\necho\n").unwrap();
+    // nvim reports the real path, and the target directory may be a symlink.
+    let file = file.canonicalize().unwrap();
+
+    // The feed only supplies a bound socket here; its environment and loader are not used.
+    let mut feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+
+    let mut nvim = Embed::start(&scratch, &[], &[]);
+    nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
+    nvim.command(&format!("edit {}", file.display()));
+    let baseline = nvim.footprint(&["EitriEditorContext"]).active_timers;
+
+    nvim.inject(
+        include_str!("../src/editor_context/nvim_editor_context.lua"),
+        opts_map(&[("socket", Value::from(feed.socket_path().display().to_string()))]),
+    );
+    assert_eq!(nvim.footprint(&["EitriEditorContext"]).active_timers, baseline + 1);
+    nvim.input("2GVj");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let context = loop {
+        match reader.poll() {
+            Some(context) if context.selection.is_some() => break context,
+            _ => {
+                assert!(std::time::Instant::now() < deadline, "no selection arrived");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+    assert_eq!(context.file, file.display().to_string());
+    let selection = context.selection.expect("a selection");
+    assert_eq!((selection.start_line, selection.end_line), (2, 3));
+    assert_eq!(selection.text, "bravo\ncharlie");
+
+    nvim.teardown();
+    let after = nvim.footprint(&["EitriEditorContext"]);
+    assert_eq!(after.autocmds, 0, "{after:?}");
+    assert_eq!(after.active_timers, baseline, "{after:?}");
+    nvim.quit();
+    feed.cleanup();
+    let _ = std::fs::remove_dir_all(&scratch);
+}

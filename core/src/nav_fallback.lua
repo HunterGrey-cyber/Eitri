@@ -7,7 +7,19 @@
 -- alone, and buffer-local mappings are never touched. Insert mode gets <C-l> alone (owner
 -- decision #24, K05), and only where its global slot is empty: <C-h>/<C-j>/<C-k> keep vim's own
 -- Insert meanings (backspace, newline, digraph).
-local socket = vim.env.EITRI_PANE_SWITCH_SOCKET
+--
+-- Called two ways. Under `--cmd` (`dofile`, no arguments) the socket comes from the environment the
+-- host set at spawn. Injected into an already running nvim, the chunk gets a table instead and must
+-- not look at the environment at all: an nvim started inside another Eitri window inherits that
+-- window's variables, and reading them would send the keys to the wrong panel. An injected chunk
+-- returns a function that undoes it.
+local opts = ...
+local socket
+if type(opts) == "table" then
+  socket = opts.socket
+else
+  socket = vim.env.EITRI_PANE_SWITCH_SOCKET
+end
 if not socket or socket == "" then
   return
 end
@@ -135,10 +147,32 @@ local function is_plain_move(m, key)
     or rhs == ":wincmd " .. key.dir .. "<cr>"
 end
 
+-- vim-tmux-navigator outside tmux is a plain window move: the plugin reads $TMUX once, when it
+-- loads, and with it empty defines its commands as bare `wincmd`. Only an nvim the panel attached
+-- to after startup can be in that state with Eitri around, and only outside tmux; inside tmux the
+-- plugin is tmux's, and the slot is left alone.
+local NAVIGATOR = { h = "Left", j = "Down", k = "Up", l = "Right" }
+local navigator_is_plain = type(opts) == "table" and opts.companion == true and (vim.env.TMUX or "") == ""
+
+local function is_plain_navigator(m, key)
+  if not navigator_is_plain or m.callback ~= nil or m.expr == 1 or m.rhs == nil then
+    return false
+  end
+  local cmd = "TmuxNavigate" .. NAVIGATOR[key.dir]
+  local rhs = notation_lower(m.rhs)
+  return rhs == ":<c-u>" .. cmd .. "<cr>" or rhs == "<cmd><c-u>" .. cmd .. "<cr>" or rhs == "<cmd>" .. cmd .. "<cr>"
+end
+
 local RUNNERS = { n = normal, x = visual, i = insert }
 
-local function install(mode, key)
+-- What each install displaced, by "<mode> <lhs>": the global mapping that held the slot (a nvim
+-- default or a plain window move), or false for an empty slot. Teardown puts it back.
+local installed = {}
+
+local function install(mode, key, displaced)
   local runner = RUNNERS[mode]
+  local slot = mode .. " " .. key.lhs
+  installed[slot] = displaced or false
   vim.keymap.set(mode, key.lhs, function()
     runner(key)
   end, { desc = DESC .. key.name, silent = true })
@@ -149,8 +183,14 @@ local function check()
     local maps = global_maps(mode)
     for _, key in ipairs(KEYS) do
       local m = maps[key.lhs:lower()]
-      if m == nil or (m.desc ~= DESC .. key.name and (is_nvim_default(m, key) or is_plain_move(m, key))) then
-        install(mode, key)
+      if
+        m == nil
+        or (
+          m.desc ~= DESC .. key.name
+          and (is_nvim_default(m, key) or is_plain_move(m, key) or is_plain_navigator(m, key))
+        )
+      then
+        install(mode, key, m)
       end
     end
   end
@@ -166,6 +206,10 @@ end
 -- Scheduled, so the check runs after every other handler of the same event: LazyVim sets its
 -- <C-h> -> <C-w>h in keymaps.lua on User VeryLazy, from an autocommand defined after this one.
 local pending = false
+-- Set first thing by the teardown. A check already queued (by the late install below, or by a
+-- VeryLazy or LazyLoad that fired just before the teardown) would otherwise run afterwards and put
+-- the mappings back.
+local torn = false
 local function schedule_check()
   if pending then
     return
@@ -173,6 +217,9 @@ local function schedule_check()
   pending = true
   vim.schedule(function()
     pending = false
+    if torn then
+      return
+    end
     pcall(check)
   end)
 end
@@ -180,3 +227,48 @@ end
 local group = vim.api.nvim_create_augroup("eitri_nav", { clear = true })
 vim.api.nvim_create_autocmd("VimEnter", { group = group, callback = schedule_check })
 vim.api.nvim_create_autocmd("User", { group = group, pattern = { "VeryLazy", "LazyLoad" }, callback = schedule_check })
+
+-- Injected after startup (companion mode): VimEnter, VeryLazy and LazyLoad have all fired already
+-- and none will fire again, so the check that those events would have scheduled runs now.
+if vim.v.vim_did_enter == 1 then
+  schedule_check()
+end
+
+-- Undoes this chunk: its autocommands, and each mapping it put in a slot -- restoring what the slot
+-- held, but only while the slot still holds Eitri's own mapping (a user who has remapped it since
+-- keeps theirs).
+return function()
+  torn = true
+  pcall(vim.api.nvim_del_augroup_by_id, group)
+  for slot, displaced in pairs(installed) do
+    local mode, lhs = slot:match("^(%S+) (.+)$")
+    local current
+    for _, m in ipairs(vim.api.nvim_get_keymap(mode)) do
+      if m.lhs:lower() == lhs:lower() then
+        current = m
+      end
+    end
+    if current ~= nil and current.desc ~= nil and current.desc:sub(1, #DESC) == DESC then
+      pcall(vim.keymap.del, mode, lhs)
+      if displaced then
+        local rhs = displaced.callback or displaced.rhs
+        if rhs ~= nil then
+          local restore = {
+            remap = displaced.noremap == 0,
+            silent = displaced.silent == 1,
+            expr = displaced.expr == 1,
+            nowait = displaced.nowait == 1,
+            script = displaced.script == 1,
+            desc = displaced.desc,
+          }
+          -- Only an expr mapping has keycodes to replace; vim.keymap.set refuses the option otherwise.
+          if displaced.expr == 1 then
+            restore.replace_keycodes = displaced.replace_keycodes == 1
+          end
+          pcall(vim.keymap.set, mode, displaced.lhs, rhs, restore)
+        end
+      end
+    end
+  end
+  installed = {}
+end

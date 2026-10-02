@@ -608,11 +608,18 @@ impl Keymap {
     /// (`ModuleKeys::build` refuses one the table binds) -- so without its own row the overlay would
     /// name it only inside the split rows' list of module keys.
     pub fn help(&self, keys: &ModuleKeys) -> Vec<HelpRow> {
+        self.help_where(keys, |_| true)
+    }
+
+    /// [`Keymap::help`] limited to the actions `keep` accepts: a window that runs only some of the
+    /// table's actions (a companion window has no layout) lists only those. A Lua panel's key row is
+    /// `Action::Module`'s, so `keep` decides it too.
+    pub fn help_where(&self, keys: &ModuleKeys, keep: impl Fn(&Action) -> bool) -> Vec<HelpRow> {
         let prefix = self.prefix.human();
         let listed: Vec<String> = keys.entries().iter().map(|(k, _)| k.to_string()).collect();
         let module_keys = listed.join(" / ");
         let mut rows: Vec<(Vec<String>, String)> = Vec::new();
-        for binding in &self.bindings {
+        for binding in self.bindings.iter().filter(|b| keep(&b.action)) {
             let mut what = binding.action.describe(&prefix, &module_keys);
             if binding.repeatable {
                 what.push_str(" (repeats within 500 ms)");
@@ -627,7 +634,7 @@ impl Keymap {
             }
         }
         for (key, id) in keys.entries() {
-            if id.kind() == ModuleKind::LuaWebview {
+            if id.kind() == ModuleKind::LuaWebview && keep(&Action::Module(id.clone())) {
                 rows.push((
                     vec![key.to_string()],
                     Action::Module(id.clone()).describe(&prefix, &module_keys),

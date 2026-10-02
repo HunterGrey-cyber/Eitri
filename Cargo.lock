@@ -3879,6 +3879,7 @@ dependencies = [
  "mlua",
  "neovide",
  "neovide-editor",
+ "rmpv",
  "serde_json",
  "sha2",
  "skia-safe",

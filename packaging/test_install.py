@@ -28,6 +28,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 INSTALLER = HERE / "install.sh"
 TESTS = HERE / "tests" / "install"
 HARNESS = TESTS / "harness.sh"
+PLUGIN = HERE.parent / "nvim" / "eitri.nvim"
 REAL_HOME_STATE = TESTS / "real-home-state.sh"
 RUN_IN_ENV = TESTS / "run-in-env.sh"
 ROOT_WRAPPER_TEST = TESTS / "test_root_wrapper.sh"
@@ -219,6 +220,8 @@ def test_harness_under_dash_in_ubuntu():
         ["docker", "run", "--rm", "--user", f"{uid}:{gid}", "--network", "none",
          "--mount", f"type=bind,src={scratch},dst={scratch}",
          "--mount", f"type=bind,src={HERE},dst={HERE},readonly",
+         # The nvim plugin the installer lays out: the harness builds its fixture releases from it.
+         "--mount", f"type=bind,src={PLUGIN},dst={PLUGIN},readonly",
          image, "/bin/sh", str(HARNESS), "--sh", "/bin/sh", "--scratch", str(scratch)],
         capture_output=True, text=True,
     )

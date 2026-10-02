@@ -3,8 +3,20 @@
 -- its colours from and writes one JSON line to EITRI_THEME_SOCKET.
 --
 -- The group list must cover `GROUPS_READ` in core/src/theme/tokens.rs; a Rust test checks it.
+--
+-- Called two ways. Under `--cmd` (`dofile`, no arguments) the socket comes from the environment the
+-- host set at spawn. Injected into an already running nvim, the chunk gets a table instead and must
+-- not look at the environment at all: an nvim started inside another Eitri window inherits that
+-- window's variables, and reading them would feed the wrong panel. An injected chunk returns a
+-- function that undoes it.
 
-local socket = vim.env.EITRI_THEME_SOCKET
+local opts = ...
+local socket
+if type(opts) == "table" then
+  socket = opts.socket
+else
+  socket = vim.env.EITRI_THEME_SOCKET
+end
 if not socket or socket == "" then
   return
 end
@@ -45,6 +57,9 @@ end
 -- handler lost both payloads with the async write, none with this one.)
 -- The last line this file got into the socket. Only the timer below reads it.
 local last_sent = nil
+-- Set by the teardown. A resnapshot the timer already queued with `schedule_wrap` still runs once
+-- after the timer is closed, and must write nothing then.
+local torn = false
 
 -- `only_if_changed` is the timer's: every payload the shell receives restyles the whole window and
 -- re-themes the panel on its GTK thread, and the shell does not deduplicate, so re-sending an
@@ -52,6 +67,9 @@ local last_sent = nil
 -- whole-branch review). An autocommand's send stays unconditional. `last_sent` is set only after
 -- `chansend` wrote the line, so a send that failed is retried by the next tick.
 local function send(only_if_changed)
+  if torn then
+    return
+  end
   local ok, line = pcall(snapshot)
   if not ok then
     return
@@ -96,3 +114,18 @@ local resnapshot_timer = vim.uv.new_timer()
 resnapshot_timer:start(RESNAPSHOT_INTERVAL_MS, RESNAPSHOT_INTERVAL_MS, vim.schedule_wrap(function()
   send(true)
 end))
+
+-- Injected into an nvim past VimEnter: that event has fired and will not again, so the first
+-- snapshot goes out now rather than at the first resnapshot tick.
+if vim.v.vim_did_enter == 1 then
+  send_now()
+end
+
+return function()
+  torn = true
+  pcall(vim.api.nvim_del_augroup_by_id, augroup)
+  if not resnapshot_timer:is_closing() then
+    resnapshot_timer:stop()
+    resnapshot_timer:close()
+  end
+end

@@ -19,6 +19,9 @@ type Props = {
   /** The lines of the user's tmux config the import did not take (`shell`'s `keymap` envelope,
    *  `tmuxSkipped`): where each is, what it says and why. No section when there are none. */
   tmuxSkipped?: KeyHelp[];
+  /** A companion window (`App.tsx`: the editor link is set): its prefix section lists only the tab and
+   *  panel keys, and says why the layout keys are missing. */
+  companion?: boolean;
 };
 
 /** One of the four groups (spec §3.2), rendered from the same tables `keymap.test.ts` binds to
@@ -219,7 +222,7 @@ function SlashCommands() {
  * contains, so a click inside a table (reading a row, selecting text) never fires it.
  */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped },
+  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false },
   ref,
 ) {
   return (
@@ -277,7 +280,11 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
       />
       <SlashCommands />
       <Section title="Anywhere in the window" rows={windowKeys} />
-      <Section title={`After ${prefixLabel}`} rows={prefixKeys} />
+      <Section
+        title={`After ${prefixLabel}`}
+        rows={prefixKeys}
+        note={companion ? "A companion window has no layout keys: your window manager arranges windows." : undefined}
+      />
       {tmuxSkipped !== undefined && tmuxSkipped.length > 0 && (
         <Section
           title="Skipped from tmux"

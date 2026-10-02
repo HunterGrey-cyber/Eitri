@@ -1,0 +1,119 @@
+*eitri.nvim*  Eitri's agent panel beside your terminal nvim
+
+==============================================================================
+CONTENTS                                                        *eitri-contents*
+
+  1. Install ............................ |eitri-install|
+  2. Commands ........................... |:EitriPanel|
+  3. Setup .............................. |eitri-setup|
+  4. Navigators ......................... |eitri.edge()|
+  5. Inside tmux ........................ |eitri-tmux|
+  6. Window manager ..................... |eitri-wm|
+
+==============================================================================
+1. INSTALL                                                      *eitri-install*
+
+The plugin is a thin launcher: it starts `eitri panel` and tells it which nvim
+to attach to. Everything the panel needs inside nvim, it installs itself when
+it attaches, so the plugin and the installed Eitri never have to match
+versions.
+
+Eitri ships the plugin with its packages and its tarball installer. With
+lazy.nvim, point a spec at the directory.
+
+Distribution packages (.deb, .rpm, AUR):
+>lua
+  { dir = "/usr/share/eitri/nvim/eitri.nvim" }
+<
+User install (the tarball installer puts it in `~/.local/share/eitri/eitri.nvim`,
+or under `$XDG_DATA_HOME/eitri/eitri.nvim` when that is set):
+>lua
+  { dir = vim.fn.stdpath("data"):gsub("nvim$", "eitri") .. "/eitri.nvim" }
+<
+The same path written out: `~/.local/share/eitri/eitri.nvim`. It is not under
+`eitri/nvim/`: that directory holds the private nvim versions `eitri setup`
+manages.
+
+Without a plugin manager, add the directory to 'runtimepath':
+>vim
+  set runtimepath+=/usr/share/eitri/nvim/eitri.nvim
+<
+==============================================================================
+2. COMMANDS                                                       *:EitriPanel*
+
+:EitriPanel [dir]       Open Eitri's agent panel beside this nvim, or attach
+                        the panel that is already open for this project.
+                        [dir] is the project; the default is the current
+                        working directory. If nvim has no server address yet,
+                        one is started. A second :EitriPanel while the first
+                        panel is still starting attaches to it or raises it;
+                        it never opens a second window. From the nvim the
+                        panel is already attached to, it only raises the
+                        panel: drafts being edited here stay open.
+
+If `eitri` cannot be run, or the panel refuses, the reason is shown as an
+error message. Once the panel is up it writes its output to a log file of its
+own (under `~/.local/state/eitri/companion/`), so it keeps running after this
+nvim quits; if it fails later, the message names that log.
+
+==============================================================================
+3. SETUP                                                         *eitri-setup*
+
+Calling setup is optional.
+>lua
+  require("eitri").setup({
+    cmd = "eitri",      -- the launcher to run
+    mapping = "<leader>ep",  -- a normal-mode map for :EitriPanel; none by default
+  })
+<
+==============================================================================
+4. NAVIGATORS                                                    *eitri.edge()*
+
+require("eitri").edge({direction})
+
+When the panel is attached, window-navigation plugins that work in nvim's
+windows can hand a move off the edge to Eitri, which moves focus to the panel
+(or to the neighbouring window of your window manager). {direction} is one of
+"left", "down", "up", "right". Returns true when a panel took the move, false
+when none is attached (nothing happens then).
+
+For smart-splits.nvim, call it from the `at_edge` callback:
+>lua
+  require("smart-splits").setup({
+    at_edge = function(ctx)
+      if not require("eitri").edge(ctx.direction) then
+        -- no panel attached: your own fallback, or nothing
+      end
+    end,
+  })
+<
+vim-tmux-navigator needs nothing here: when nvim is not inside tmux, the panel
+treats its TmuxNavigate maps as plain window moves.
+
+==============================================================================
+5. INSIDE TMUX                                                     *eitri-tmux*
+
+Inside tmux nothing in nvim's environment changes, the navigator maps are left
+alone, and your tmux setup keeps moving between panes as it does today. The
+panel is its own window; a move that reaches no window of the window manager
+raises nothing and says nothing.
+
+smart-splits inside tmux calls its `at_edge` callback only when tmux has no
+pane further that way, so |eitri.edge()| never takes a move tmux could make:
+at tmux's own edge it moves to the neighbouring window of your window manager
+(the panel, when it sits there). Leave `edge()` out of `at_edge` if a move
+should stop at tmux's edge instead.
+
+==============================================================================
+6. WINDOW MANAGER                                                    *eitri-wm*
+
+Moves between the nvim terminal window and the panel use your window
+manager. In `init.lua` (see the Eitri documentation):
+>lua
+  eitri.config.set("companion.wm", "auto")
+<
+Accepted values: "auto" (the default; detected from the session), "hyprland",
+"sway", "niri", and "none" (the panel never asks the window manager to move
+focus). Any other value stops the panel at start-up, naming the key.
+
+vim:tw=78:ts=8:ft=help:norl:

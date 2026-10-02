@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import type { NavKeyDirection } from "../bridge";
-import type { HandoffCommand, Hello, QueueItem, TabInfo } from "../types";
+import type { EditorLink, HandoffCommand, Hello, QueueItem, TabInfo } from "../types";
 import { EMPTY_PANEL_TABLE } from "../keymap";
 import type { PanelBinding, PanelMode, PanelTable } from "../keymap";
 import { advanceSequence, boxEntries, isPendingFirst, pendingPairBinding, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "../leader";
@@ -146,6 +146,9 @@ export type EmptyTabProps = {
    *  `keymapHelp` itself starts at before the `keymap` envelope arrives, so a caller (this
    *  component's own tests included) that never configured a prefix still gets a truthful hint. */
   prefix?: string;
+  /** Companion mode (`App.tsx`'s `editorLink`): passed through to `Dashboard`, whose words change when
+   *  the editor is another window. `null` (the default) is the one-window mode. */
+  editorLink?: EditorLink | null;
   /** The v1-ui GUI pass (2026-09-27): the panel's one typing guard (`App.tsx`'s own), so the leader
    *  here starts a sequence only on a key that stands alone or ends a quick motion, as it does over
    *  a live conversation -- "set up my" typed onto this dashboard ran `<leader>m` and flipped the
@@ -189,6 +192,7 @@ export function EmptyTab(props: EmptyTabProps) {
   const failureProblem = failed && failure !== null ? classify(failure, hello?.account ?? null) : null;
   const showDashboard = hello !== null && !starting && !failed;
   const prefix = props.prefix ?? "Ctrl+b";
+  const editorLink = props.editorLink ?? null;
   const [dashCursor, setDashCursor] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   /** F19 (spec §10.2): "The first start on a fresh Verdandi checkout also builds the sidecar." used
@@ -803,7 +807,7 @@ export function EmptyTab(props: EmptyTabProps) {
           `hello !== null` (not just `showDashboard`, which TS cannot narrow through) is what lets
           `Dashboard`'s `hello: Hello` prop take it without a non-null assertion. */}
       {hello !== null && showDashboard && (
-        <Dashboard hello={hello} mode={tab.mode} cursor={dashCursor} narrow={narrow} onItem={runItem} prefix={prefix} />
+        <Dashboard hello={hello} mode={tab.mode} cursor={dashCursor} narrow={narrow} onItem={runItem} prefix={prefix} editorLink={editorLink} />
       )}
       <QueueLines items={props.queue ?? []} error={props.queueError ?? null} />
       <Composer

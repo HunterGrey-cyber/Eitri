@@ -162,7 +162,7 @@ export function StatusBand({ facts, paneFocused, onOpenDetail, onJump }: Props) 
             );
           }
           return (
-            <span key={seg.id} className={`band-seg band-${seg.id}`} data-testid={seg.id === "showcmd" ? "showcmd" : undefined}>
+            <span key={seg.id} className={`band-seg band-${seg.id}`} data-testid={seg.id === "showcmd" ? "showcmd" : seg.id === "link" ? "band-link" : undefined}>
               {seg.text}
             </span>
           );

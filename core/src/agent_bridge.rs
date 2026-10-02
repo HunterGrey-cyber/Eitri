@@ -1485,6 +1485,13 @@ pub fn serialize_editor_context_for_js(summary: Option<&ContextSummary>) -> Stri
     .to_string()
 }
 
+/// Where the panel stands with the editor beside it (companion mode): `state` is one of
+/// `none`, `attaching`, `attached`, `detached`, `failed`, and `text` is the band's words, empty
+/// when attached. Window-level, like the editor context. A window with no companion never sends it.
+pub fn serialize_editor_link_for_js(state: &str, text: &str) -> String {
+    json!({ "kind": "editor_link", "state": state, "text": text }).to_string()
+}
+
 /// Whether this tab's draft is out in an nvim scratch buffer (C5).
 pub fn serialize_scratch_for_js(tab: crate::tabs::TabId, editing: bool) -> String {
     json!({ "kind": "scratch", "tab": tab.0, "editing": editing }).to_string()
@@ -3616,5 +3623,16 @@ mod tests {
                 "lines": ["Restore 3 tabs (1 in bypass)? y/n", "n brings the bypass tab back in auto"],
             })
         );
+    }
+
+    #[test]
+    fn editor_link_envelope_shape() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialize_editor_link_for_js("detached", "editor detached: x")).unwrap();
+        let object = parsed.as_object().unwrap();
+        assert_eq!(object.len(), 3);
+        assert_eq!(object["kind"], "editor_link");
+        assert_eq!(object["state"], "detached");
+        assert_eq!(object["text"], "editor detached: x");
     }
 }

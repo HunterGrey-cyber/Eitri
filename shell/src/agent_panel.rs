@@ -503,6 +503,9 @@ struct AgentPanelState {
     document_ready: bool,
     /// The last `editor_context` envelope sent (ruling 32).
     last_context_payload: Option<String>,
+    /// The last `editor_link` envelope (companion mode), kept so a fresh document is told on
+    /// `ready`. `None` in a window with no companion, which never sends one.
+    editor_link: Option<String>,
     /// Where a `tab_verb` message's mapped `TabAction` goes (panel round 2 plan Task 6). `None`
     /// until `main.rs`'s `AgentPanelHandle::on_tab_verb` installs one.
     tab_verb_hook: Option<Rc<dyn Fn(TabAction)>>,
@@ -551,8 +554,8 @@ type ToastHook = Rc<dyn Fn(&str)>;
 /// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
 type AttentionHook = Rc<dyn Fn(eitri_core::attention::Attention, eitri_core::attention::Attention)>;
 
-/// `AgentPanelHandle::on_editor_request`: the keys to hand nvim; `Err` says why it could not.
-type EditorRequestHook = Rc<dyn Fn(&str) -> Result<(), String>>;
+/// `AgentPanelHandle::on_editor_request`: the request to hand nvim; `Err` says why it could not.
+type EditorRequestHook = Rc<dyn Fn(&eitri_core::scratch::ScratchRequest) -> Result<(), String>>;
 
 /// A handle back into this panel's session state, held by `main.rs` alongside the `gtk4::Widget`
 /// so a real window close can shut down whatever `AgentSession` exists -- without this, the
@@ -1052,10 +1055,64 @@ impl AgentPanelHandle {
         self.state.borrow_mut().hint_hook = Some(Rc::new(hook));
     }
 
-    /// Where the scratch round trips (`Ctrl+g`, `gf`) hand nvim their keys. The hook shows and
-    /// focuses the editor, then sends them; `Err` says why it could not. `main.rs` installs this once.
-    pub(crate) fn on_editor_request(&self, hook: impl Fn(&str) -> Result<(), String> + 'static) {
+    /// Where the scratch round trips (`Ctrl+g`, `gf`) hand nvim their request. The hook shows and
+    /// focuses the editor, then sends its keys; `Err` says why it could not. `main.rs` installs this once.
+    pub(crate) fn on_editor_request(
+        &self,
+        hook: impl Fn(&eitri_core::scratch::ScratchRequest) -> Result<(), String> + 'static,
+    ) {
         self.state.borrow_mut().editor_request_hook = Some(Rc::new(hook));
+    }
+
+    /// Where the panel stands with the editor beside it (companion mode), kept so a document that
+    /// loads or reloads is told, and sent when it changes. Never called by the one-window mode.
+    pub(crate) fn set_editor_link(&self, link: eitri_core::companion::attach::BandLink) {
+        let payload = eitri_core::agent_bridge::serialize_editor_link_for_js(link.state, &link.text);
+        {
+            let mut state = self.state.borrow_mut();
+            if state.editor_link.as_ref() == Some(&payload) {
+                return;
+            }
+            state.editor_link = Some(payload.clone());
+        }
+        self.dispatch(payload, "editor link");
+    }
+
+    /// The editor went away or was swapped: every draft edit still out in it ends (a body saved in
+    /// nvim becomes the draft). The active tab is told now, the others when they are switched to.
+    /// Says so once if any edit was cut, and returns how many. It does not return the keys to the
+    /// chat: the editor left, so nothing should take the focus.
+    pub(crate) fn editor_detached(&self) -> usize {
+        let (ended, active) = {
+            let mut state = self.state.borrow_mut();
+            let ended = end_pending_edits(&mut state);
+            (ended, state.tabs.active())
+        };
+        for (tab, draft) in &ended {
+            if *tab != active {
+                continue;
+            }
+            if let Some(text) = draft {
+                self.dispatch(eitri_core::agent_bridge::serialize_draft_for_js(*tab, text), "draft");
+            }
+            self.dispatch(
+                eitri_core::agent_bridge::serialize_scratch_for_js(*tab, false),
+                "scratch",
+            );
+        }
+        if !ended.is_empty() {
+            self.dispatch(
+                eitri_core::agent_bridge::serialize_notice_for_js("draft editing stopped: the editor went away"),
+                "notice",
+            );
+        }
+        ended.len()
+    }
+
+    /// One line in the panel's band, in the notice's own style. Used by the companion window for what
+    /// it cannot say any other way (a desktop it cannot move focus on).
+    pub(crate) fn show_notice(&self, text: &str) {
+        self.dispatch(eitri_core::agent_bridge::serialize_notice_for_js(text), "notice");
     }
 
     /// Called when a draft edited in nvim came back (or was discarded): the keys return to the
@@ -1574,6 +1631,7 @@ fn panel_state(
         history,
         document_ready: false,
         last_context_payload: None,
+        editor_link: None,
         tab_verb_hook: None,
         nav_mode: Cell::new(PanelKeys::Other),
         nav_fallthrough_hook: None,
@@ -1770,11 +1828,14 @@ fn send_tabs(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     evaluate_js_dispatch(webview, &payload);
 }
 
-/// Hands nvim `keys` through `main.rs`'s hook, which shows and focuses the editor first.
-fn request_editor(state: &Rc<RefCell<AgentPanelState>>, keys: &str) -> Result<(), String> {
+/// Hands nvim `request` through `main.rs`'s hook, which shows and focuses the editor first.
+fn request_editor(
+    state: &Rc<RefCell<AgentPanelState>>,
+    request: &eitri_core::scratch::ScratchRequest,
+) -> Result<(), String> {
     let hook = state.borrow().editor_request_hook.clone();
     match hook {
-        Some(hook) => hook(keys),
+        Some(hook) => hook(request),
         None => Err("the editor is not connected to this panel".to_string()),
     }
 }
@@ -2741,6 +2802,42 @@ fn ready_payloads(
     payloads
 }
 
+/// The window-level envelopes of a fresh document, in order: the history, the editor context and,
+/// only in a window that has an editor to follow, where the panel stands with it. The one-window
+/// mode never sets a link, so its list is the two it always was.
+fn window_payloads(history: String, context: String, link: Option<&String>) -> Vec<String> {
+    let mut payloads = vec![history, context];
+    payloads.extend(link.cloned());
+    payloads
+}
+
+/// Ends every draft edit still out in nvim, for an editor that went away: the body file's text
+/// becomes the draft when it differs from what was handed out, else the draft keeps its own text.
+/// A marker nvim wrote wins; without one the body is read as it stands. Each edit's files go after
+/// it is read. Returns the tabs that had an edit out, oldest edit first, with the new draft where
+/// there is one.
+fn end_pending_edits(state: &mut AgentPanelState) -> Vec<(TabId, Option<String>)> {
+    use eitri_core::scratch::EditDone;
+    let edits = std::mem::take(&mut state.pending_edits);
+    let results: Vec<(u64, EditDone)> = edits
+        .iter()
+        .map(|edit| {
+            let done = edit
+                .poll()
+                .unwrap_or_else(|| match std::fs::read_to_string(&edit.body) {
+                    Ok(raw) => EditDone::Written(raw.strip_suffix('\n').unwrap_or(&raw).to_string()),
+                    Err(_) => EditDone::Discarded,
+                });
+            (edit.id, done)
+        })
+        .collect();
+    let ended = state.tabs.cancel_scratch_edits(&results);
+    for edit in &edits {
+        edit.cleanup();
+    }
+    ended
+}
+
 /// C1's mirror (spec §3.5, `AgentPanelState::nav_mode`'s own doc): called from the `Ready` arm on
 /// every `ready` -- the first one and every reload's alike -- so the mirror never survives a
 /// reload holding whatever mode the torn-down document last reported.
@@ -3125,10 +3222,11 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 );
                 let context_payload = eitri_core::agent_bridge::serialize_editor_context_for_js(context.as_ref());
                 state_ref.last_context_payload = Some(context_payload.clone());
-                let window = vec![
+                let window = window_payloads(
                     eitri_core::agent_bridge::serialize_history_for_js(&state_ref.history),
                     context_payload,
-                ];
+                    state_ref.editor_link.as_ref(),
+                );
                 let tabs = tabs_payload_recorded(state_ref);
                 let active = state_ref.tabs.active_state_payloads();
                 // What the last window left open, if the dashboard may offer it: a reloaded page
@@ -3666,8 +3764,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 refuse(webview, &format!("no such file: {path}"));
                 return;
             }
-            let keys = eitri_core::scratch::open_request(&resolved, line).input_keys();
-            match request_editor(state, &keys) {
+            let request = eitri_core::scratch::open_request(&resolved, line);
+            match request_editor(state, &request) {
                 Ok(()) => ok(webview),
                 Err(why) => refuse(webview, &why),
             }
@@ -3679,7 +3777,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     .map_err(|e| format!("could not write the scratch file: {e}")),
                 None => Err("the scratch directory could not be created at startup".to_string()),
             };
-            match prepared.and_then(|request| request_editor(state, &request.input_keys())) {
+            match prepared.and_then(|request| request_editor(state, &request)) {
                 Ok(()) => ok(webview),
                 Err(why) => refuse(webview, &why),
             }
@@ -3700,7 +3798,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 edit.cleanup();
                 return refuse(webview, &why);
             }
-            if let Err(why) = request_editor(state, &request.input_keys()) {
+            if let Err(why) = request_editor(state, &request) {
                 let mut state_ref = state.borrow_mut();
                 state_ref
                     .tabs
@@ -4509,6 +4607,7 @@ mod tests {
             history: Vec::new(),
             document_ready: false,
             last_context_payload: None,
+            editor_link: None,
             tab_verb_hook: None,
             nav_mode: Cell::new(PanelKeys::Other),
             nav_fallthrough_hook: None,
@@ -5102,6 +5201,62 @@ mod tests {
             kinds(&payloads),
             vec!["hello", "theme", "keymap", "history", "editor_context", "tabs"]
         );
+    }
+
+    #[test]
+    fn ready_sends_the_editor_link_only_when_one_was_set() {
+        let history = || eitri_core::agent_bridge::serialize_history_for_js(&[]);
+        let context = || eitri_core::agent_bridge::serialize_editor_context_for_js(None);
+        let none = window_payloads(history(), context(), None);
+        assert_eq!(
+            kinds(&none),
+            vec!["history", "editor_context"],
+            "the one-window list is unchanged"
+        );
+        let link = eitri_core::agent_bridge::serialize_editor_link_for_js("none", "no editor attached");
+        let some = window_payloads(history(), context(), Some(&link));
+        assert_eq!(kinds(&some), vec!["history", "editor_context", "editor_link"]);
+    }
+
+    /// An editor that went away takes its pending draft edits with it: a body saved in nvim becomes
+    /// the draft, an unsaved one leaves it alone, and the files are gone afterwards.
+    #[test]
+    fn ending_pending_edits_keeps_a_saved_body_and_removes_the_files() {
+        let dir = std::env::temp_dir().join(format!("ap-{}-edits", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
+        let saved = set.active();
+        let unsaved = set.open();
+        set.set_draft(saved, "old");
+        set.set_draft(unsaved, "kept\n");
+        let edit = |id: u64, body: &str| {
+            let edit = eitri_core::scratch::PendingEdit {
+                id,
+                body: dir.join(format!("{id}-draft.md")),
+                done: dir.join(format!("{id}-draft.done")),
+            };
+            std::fs::write(&edit.body, body).unwrap();
+            edit
+        };
+        let (first, second) = (edit(1, "new text\n"), edit(2, "kept\n"));
+        set.begin_scratch_edit(saved, 1).unwrap();
+        set.begin_scratch_edit(unsaved, 2).unwrap();
+        let state = state_for_hooks(set);
+        state.borrow_mut().pending_edits = vec![first.clone(), second.clone()];
+
+        let ended = end_pending_edits(&mut state.borrow_mut());
+
+        assert_eq!(ended, vec![(saved, Some("new text".to_string())), (unsaved, None)]);
+        let state = state.borrow();
+        assert!(state.pending_edits.is_empty());
+        assert_eq!(state.tabs.get(saved).unwrap().draft, "new text");
+        assert_eq!(state.tabs.get(unsaved).unwrap().draft, "kept\n");
+        assert!(
+            !first.body.exists() && !second.body.exists(),
+            "the scratch files are removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Ruling 16: the rule comes from what Rust offered for that card, never from the panel, and only

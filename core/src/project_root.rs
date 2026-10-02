@@ -130,6 +130,77 @@ pub fn resolve() -> Result<PathBuf, String> {
     )
 }
 
+/// [`resolve`] over an explicit argument list (argv[0] already stripped), for a command line that
+/// is not the process's own: `eitri panel` hands its leftover arguments here after taking its own
+/// options out. The environment and the cwd are the process's, exactly as in [`resolve`].
+pub fn resolve_args(args: &[OsString]) -> Result<PathBuf, String> {
+    resolve_from(
+        args.iter().map(OsString::as_os_str),
+        std::env::var_os(PROJECT_DIR_ENV),
+        std::env::current_dir(),
+    )
+}
+
+/// What `eitri panel` took from its own command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelArgs {
+    /// The address of the nvim this panel attaches to: `--nvim <addr>`, else `$NVIM`.
+    pub nvim: Option<PathBuf>,
+    /// What is left for [`resolve_args`]: at most one project directory, and when it was given after
+    /// `--` the `--` stays in front of it so a directory named like a flag is still read as a path.
+    pub rest: Vec<OsString>,
+}
+
+/// `eitri panel`'s own options. `--nvim <addr>` takes a value; `--` ends options and the next token
+/// is the project, verbatim; any other `-...` before `--` is refused. `nvim_env` is `$NVIM`, used when
+/// no `--nvim` was given (an empty value counts as none).
+///
+/// This is not [`select_root_source`]'s flag handling: the panel has no `--clean` or `--legacy`, so
+/// one of those is an error here rather than a skipped flag, and `--nvim` takes a separate value,
+/// which a membership test cannot express.
+pub fn parse_panel_args(args: &[OsString], nvim_env: Option<OsString>) -> Result<PanelArgs, String> {
+    let mut nvim: Option<PathBuf> = None;
+    let mut project: Option<(bool, OsString)> = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new(END_OF_FLAGS) {
+            if let Some(path) = args.next() {
+                if project.is_some() {
+                    return Err(TWO_PROJECTS.to_string());
+                }
+                project = Some((true, path.clone()));
+            }
+            if args.next().is_some() {
+                return Err(TWO_PROJECTS.to_string());
+            }
+            break;
+        }
+        if arg == OsStr::new("--nvim") {
+            let value = args.next().ok_or_else(|| "--nvim needs an address".to_string())?;
+            nvim = Some(PathBuf::from(value));
+            continue;
+        }
+        if arg.as_bytes().first() == Some(&b'-') {
+            return Err(format!("eitri panel: unknown option {}", arg.to_string_lossy()));
+        }
+        if project.is_some() {
+            return Err(TWO_PROJECTS.to_string());
+        }
+        project = Some((false, arg.clone()));
+    }
+    let nvim = nvim.or_else(|| nvim_env.filter(|value| !value.is_empty()).map(PathBuf::from));
+    let mut rest = Vec::new();
+    if let Some((after_dashes, path)) = project {
+        if after_dashes {
+            rest.push(OsString::from(END_OF_FLAGS));
+        }
+        rest.push(path);
+    }
+    Ok(PanelArgs { nvim, rest })
+}
+
+const TWO_PROJECTS: &str = "eitri panel: takes at most one project directory";
+
 /// [`resolve`] with its three process-globals passed in, so the wiring between the two halves --
 /// which of them is consulted first, and that the chosen source is the one actually
 /// canonicalized -- is reachable from a test. A swap of `args` and `env` here would be invisible
@@ -469,5 +540,105 @@ mod tests {
         let err = resolve_from(args.iter().map(OsString::as_os_str), None, Ok(std::env::temp_dir()))
             .expect_err("an unrecognized option must not be resolved past");
         assert!(err.contains("-myproj"), "got {err}");
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn panel_takes_nvim_with_a_value_and_hands_the_rest_on() {
+        let parsed = parse_panel_args(&os(&["--nvim", "/r/nvim-addr", "/p"]), None).unwrap();
+        assert_eq!(parsed.nvim, Some(PathBuf::from("/r/nvim-addr")));
+        assert_eq!(parsed.rest, os(&["/p"]));
+        // The option may come after the project too.
+        let parsed = parse_panel_args(&os(&["/p", "--nvim", "/r/nvim-addr"]), None).unwrap();
+        assert_eq!(
+            (parsed.nvim, parsed.rest),
+            (Some(PathBuf::from("/r/nvim-addr")), os(&["/p"]))
+        );
+    }
+
+    #[test]
+    fn panel_without_nvim_falls_back_to_the_env_and_ignores_an_empty_one() {
+        let parsed = parse_panel_args(&os(&["/p"]), Some(OsString::from("/env/nvim-addr"))).unwrap();
+        assert_eq!(parsed.nvim, Some(PathBuf::from("/env/nvim-addr")));
+        let parsed = parse_panel_args(&os(&["/p"]), Some(OsString::new())).unwrap();
+        assert_eq!(parsed.nvim, None);
+        assert_eq!(
+            parse_panel_args(&[], None).unwrap(),
+            PanelArgs {
+                nvim: None,
+                rest: vec![]
+            }
+        );
+        // The option beats the environment.
+        let parsed = parse_panel_args(&os(&["--nvim", "/a"]), Some(OsString::from("/env"))).unwrap();
+        assert_eq!(parsed.nvim, Some(PathBuf::from("/a")));
+    }
+
+    #[test]
+    fn a_missing_nvim_value_is_refused() {
+        assert_eq!(
+            parse_panel_args(&os(&["--nvim"]), None),
+            Err("--nvim needs an address".to_string())
+        );
+        assert_eq!(
+            parse_panel_args(&os(&["/p", "--nvim"]), Some(OsString::from("/env"))),
+            Err("--nvim needs an address".to_string())
+        );
+    }
+
+    #[test]
+    fn double_dash_makes_the_next_token_the_project_even_if_it_starts_with_a_dash() {
+        let parsed = parse_panel_args(&os(&["--", "-myproj"]), None).unwrap();
+        assert_eq!(parsed.rest, os(&["--", "-myproj"]));
+        // `--nvim` after `--` is a project name, not an option.
+        let parsed = parse_panel_args(&os(&["--", "--nvim"]), None).unwrap();
+        assert_eq!((parsed.nvim, parsed.rest), (None, os(&["--", "--nvim"])));
+        // A bare trailing `--` is no project at all.
+        assert_eq!(
+            parse_panel_args(&os(&["--"]), None).unwrap().rest,
+            Vec::<OsString>::new()
+        );
+        // What the resolver then does with it: the dashed name is read as a path, not refused.
+        let err = resolve_args(&parsed_rest(&["--", "-no-such-eitri-dir"])).expect_err("not a directory");
+        assert!(err.contains("-no-such-eitri-dir"), "got {err}");
+    }
+
+    fn parsed_rest(args: &[&str]) -> Vec<OsString> {
+        parse_panel_args(&os(args), None).unwrap().rest
+    }
+
+    #[test]
+    fn an_unknown_option_is_refused_by_name() {
+        assert_eq!(
+            parse_panel_args(&os(&["--clean"]), None),
+            Err("eitri panel: unknown option --clean".to_string())
+        );
+        assert_eq!(
+            parse_panel_args(&os(&["--legacy", "/p"]), None),
+            Err("eitri panel: unknown option --legacy".to_string())
+        );
+        assert_eq!(
+            parse_panel_args(&os(&["-x"]), None),
+            Err("eitri panel: unknown option -x".to_string())
+        );
+    }
+
+    #[test]
+    fn two_positionals_are_refused() {
+        assert!(parse_panel_args(&os(&["/a", "/b"]), None).is_err());
+        assert!(parse_panel_args(&os(&["/a", "--", "/b"]), None).is_err());
+        assert!(parse_panel_args(&os(&["--", "/a", "/b"]), None).is_err());
+    }
+
+    #[test]
+    fn resolve_args_canonicalizes_like_resolve() {
+        let real = std::env::temp_dir().canonicalize().expect("temp_dir exists");
+        let through_dot = real.join(".");
+        assert_eq!(resolve_args(&[through_dot.into_os_string()]), Ok(real));
+        let err = resolve_args(&os(&["/definitely/not/a/real/eitri/project"])).expect_err("a missing directory");
+        assert!(err.contains("/definitely/not/a/real/eitri/project"), "got {err}");
     }
 }

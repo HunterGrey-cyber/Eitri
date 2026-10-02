@@ -339,6 +339,10 @@ mk_release() {
 		echo "GTK_FLOOR=4.14"
 	} >"$b/lib/eitri/RELEASE"
 	cp "$PKG/cn.huntergrey.eitri.desktop" "$b/share/applications/cn.huntergrey.eitri.desktop"
+	cp "$PKG/cn.huntergrey.eitri.Panel.desktop" "$b/share/applications/cn.huntergrey.eitri.Panel.desktop"
+	# The nvim plugin, as the tarball lays it out: share/eitri/eitri.nvim (release.sh).
+	mkdir -p "$b/share/eitri"
+	cp -R "$PKG/../nvim/eitri.nvim" "$b/share/eitri/eitri.nvim"
 	# 0.2.0's own entry, as release.sh also puts it in the tarball (packaging/legacy/README.md): read only
 	# by 0.2.0's installer. Every test below that installs one of these releases with this installer
 	# therefore also holds that this installer never installs it.
@@ -539,12 +543,12 @@ snap_but_lock() {
 
 # snap_but_staging DIR: snap, except the mtimes of the directories a fresh install or an upgrade
 # that fails creates and removes its own entries in, leaving every file as it was: .local/lib
-# (eitri.new, a swap's renames), the ones the launcher, desktop entry, icons and licences are staged in
+# (eitri.new, a swap's renames), the ones the launcher, desktop entries, plugin, icons and licences are staged in
 # before the swap, and -- for a run against a HOME with no prior install at all -- .local itself,
 # whose own mtime changes the moment unpack_new's mkdir -p makes .local/lib the first time (plan
 # Task 10 review: reached once a fatal sidecar-build failure could die there too).
 snap_but_staging() {
-	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/eitri|share/icons(/hicolor(/[^/]+(/apps)?)?)?))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
+	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/eitri|share/eitri(/eitri.nvim(/[^/]+(/eitri)?)?)?|share/icons(/hicolor(/[^/]+(/apps)?)?)?))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
 }
 
 # tree DIR: names and types only, excluding the planted editors.
@@ -614,6 +618,7 @@ TESTS=
 . "$HERE/test_from_source.sh"
 . "$HERE/test_apparmor.sh"
 . "$HERE/test_icon.sh"
+. "$HERE/test_panel.sh"
 
 # The scratch must be new: only the fixture server's own files may already be there.
 for e in "$S"/* "$S"/.[!.]*; do

@@ -396,6 +396,15 @@ class TheDebCarriesTheAppArmorProfile(unittest.TestCase):
 
 DESKTOP_SRC = "./packaging/cn.huntergrey.eitri.desktop"
 DESKTOP_DST = "/usr/share/applications/cn.huntergrey.eitri.desktop"
+# The companion panel's own entry (`eitri panel %f`): hidden from menus, there so the panel window has an
+# application of its own to match.
+PANEL_DESKTOP_SRC = "./packaging/cn.huntergrey.eitri.Panel.desktop"
+PANEL_DESKTOP_DST = "/usr/share/applications/cn.huntergrey.eitri.Panel.desktop"
+DESKTOP_SRCS = [DESKTOP_SRC, PANEL_DESKTOP_SRC]
+DESKTOP_DSTS = [DESKTOP_DST, PANEL_DESKTOP_DST]
+# The nvim plugin: every file under nvim/eitri.nvim, at the same relative path under this directory.
+NVIM_PLUGIN_DST = "/usr/share/eitri/nvim/eitri.nvim"
+NVIM_PLUGIN_FILES = ["doc/eitri.txt", "lua/eitri/init.lua", "plugin/eitri.lua"]
 OLD_DESKTOP_DST = "/usr/share/applications/eitri.desktop"
 ICON_NAME = "cn.huntergrey.eitri"
 # Every file under packaging/icons/hicolor, as the package path it must land at.
@@ -430,11 +439,44 @@ class BothProfilesShipTheDesktopEntryAndTheIcon(unittest.TestCase):
     def test_the_desktop_entry_has_the_application_ids_name_in_both(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
             by_dst = _contents_by_dst(_load_yaml(path))
-            self.assertEqual(by_dst[DESKTOP_DST]["src"], DESKTOP_SRC, path)
+            for src, dst in zip(DESKTOP_SRCS, DESKTOP_DSTS):
+                self.assertEqual(by_dst[dst]["src"], src, path)
             self.assertNotIn(OLD_DESKTOP_DST, by_dst, path)
             # packaging/legacy/eitri.desktop is for 0.2.0's installer, read from the release tarball
             # alone: no package lists it, under any destination.
             self.assertFalse([d for d, e in by_dst.items() if "legacy" in e.get("src", "")], path)
+
+    def test_the_panel_desktop_entry_is_hidden_and_runs_the_panel(self):
+        with open(os.path.join(_HERE, "cn.huntergrey.eitri.Panel.desktop"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        for line in (
+            "[Desktop Entry]",
+            "Type=Application",
+            "Name=Eitri panel",
+            "Exec=eitri panel %f",
+            f"Icon={ICON_NAME}",
+            "NoDisplay=true",
+            "StartupWMClass=cn.huntergrey.eitri.Panel",
+            "Terminal=false",
+        ):
+            self.assertIn(line, lines)
+
+    def test_the_nvim_plugin_is_in_both_profiles_and_on_disk(self):
+        root = os.path.join(_HERE, "..", "nvim", "eitri.nvim")
+        on_disk = set()
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                on_disk.add(os.path.relpath(os.path.join(dirpath, name), root))
+        self.assertEqual(on_disk, set(NVIM_PLUGIN_FILES))
+        for path in (PUBLIC_PATH, PRIVATE_PATH):
+            by_dst = _contents_by_dst(_load_yaml(path))
+            for rel in NVIM_PLUGIN_FILES:
+                entry = by_dst.get(f"{NVIM_PLUGIN_DST}/{rel}")
+                self.assertIsNotNone(entry, (path, rel))
+                self.assertEqual(entry["src"], f"./nvim/eitri.nvim/{rel}", (path, rel))
+                self.assertEqual(entry.get("file_info", {}).get("mode"), 0o644, (path, rel))
+            shipped = {d for d in by_dst if d.startswith("/usr/share/eitri/")}
+            self.assertEqual(shipped, {f"{NVIM_PLUGIN_DST}/{rel}" for rel in NVIM_PLUGIN_FILES}, path)
 
     def test_every_icon_size_is_installed_under_hicolor_in_both(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
@@ -501,8 +543,10 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
                 os.makedirs(os.path.dirname(src), exist_ok=True)
                 if entry["src"] == APPARMOR_SRC:
                     shutil.copyfile(os.path.join(_HERE, "apparmor", "eitri"), src)
-                elif entry["src"].startswith("./packaging/icons/") or entry["src"] == DESKTOP_SRC:
+                elif entry["src"].startswith("./packaging/icons/") or entry["src"] in DESKTOP_SRCS:
                     shutil.copyfile(os.path.join(_HERE, entry["src"][len("./packaging/"):]), src)
+                elif entry["src"].startswith("./nvim/eitri.nvim/"):
+                    shutil.copyfile(os.path.join(_HERE, "..", entry["src"][2:]), src)
                 else:
                     with open(src, "w") as f:
                         f.write(f"stand-in for {entry['src']}\n")
@@ -553,7 +597,8 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
         return out
 
     def test_every_package_carries_the_desktop_entry_and_the_icons_and_not_the_old_name(self):
-        want = {DESKTOP_DST.lstrip("/")} | {f"usr/share/icons/hicolor/{rel}" for rel in ICON_FILES}
+        want = {d.lstrip("/") for d in DESKTOP_DSTS} | {f"usr/share/icons/hicolor/{rel}" for rel in ICON_FILES}
+        want |= {f"{NVIM_PLUGIN_DST.lstrip('/')}/{rel}" for rel in NVIM_PLUGIN_FILES}
         listers = {
             "deb": lambda out: self.sh(["dpkg-deb", "-c", out], text=True).stdout,
             "rpm": lambda out: self.sh(["rpm", "-qlp", out], text=True).stdout,
