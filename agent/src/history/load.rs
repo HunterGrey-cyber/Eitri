@@ -476,6 +476,7 @@ mod tests {
                 content: serde_json::json!(text),
                 is_error: false,
             }),
+            denied: None,
         }
     }
 

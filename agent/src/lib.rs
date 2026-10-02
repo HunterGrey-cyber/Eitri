@@ -65,7 +65,10 @@ pub use permission_rules::{PrefixRule, PrefixRules};
 pub use persistence::{resumable_sessions, NameUpdate, ResumableSession};
 #[cfg(feature = "legacy-backend")]
 pub use process::AgentProcess;
-pub use process::{classify_cli_mode, disallowed_tools, CliModeReport, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
+pub use process::{
+    classify_cli_mode, classify_reported_cli_mode, disallowed_tools, CliModeReport, PermissionMode, RequestedCliMode,
+    CONSERVATIVE_DISALLOWED_TOOLS,
+};
 #[cfg(feature = "legacy-backend")]
 pub use session::AgentSession;
 #[cfg(not(feature = "legacy-backend"))]
@@ -86,8 +89,8 @@ pub const LEGACY_NOT_IN_BUILD: &str =
 pub use projection::{
     describe_failed_resume, AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice, HistorySource,
     MatchedAskRule, PermissionOutcome, PermissionRequestRecord, ProjectionStatus, ProviderPrompt, ResumeStatus,
-    TokenUsage, ToolCallRecord, ToolCallResult, TranscriptMessage, TurnOutcome, UngatedCliModeRecord, UsageInfo,
-    UserPromptRecord,
+    TokenUsage, ToolCallDenial, ToolCallRecord, ToolCallResult, TranscriptMessage, TurnOutcome, UngatedCliModeRecord,
+    UsageInfo, UserPromptRecord,
 };
 pub use provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,

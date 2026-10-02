@@ -43,6 +43,9 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             // the handshake advertises it. The assertion checks that the generated field carries
             // the value, beyond merely compiling.
             provider_permission_prompts: true,
+            // `build_create_request` sends AUTO for `cli_permission_mode` when the handshake
+            // offers both `cli_auto_mode` and `permission_defer`.
+            cli_permission_mode: claude_runtime_protocol::v1::CliPermissionMode::Auto as i32,
         }),
         // Absent `model`, `effort`, `system_prompt` and `output_format` use the CLI defaults.
         // This smoke test does not exercise these options.
@@ -50,10 +53,16 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
         effort: None,
         system_prompt: None,
         output_format: None,
+        // `await_account_identity` is unexercised here.
+        await_account_identity: false,
     };
     assert_eq!(request.cwd, "/tmp/example");
     let policy = request.policy.unwrap();
     assert!(policy.provider_permission_prompts);
+    assert_eq!(
+        policy.cli_permission_mode(),
+        claude_runtime_protocol::v1::CliPermissionMode::Auto
+    );
     let tool_policy = policy.tool_policy.clone().expect("a stated tool policy must survive");
     assert_eq!(tool_policy.deny, vec!["Bash".to_string()]);
     assert!(

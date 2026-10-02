@@ -56,6 +56,36 @@ describe("renderToolCall", () => {
     expect(ruled.container.textContent).not.toContain("allowed by auto");
   });
 
+  /** The CLI's auto mode: a call its classifier refused says so on its row, muted like the other
+   *  notes, with the CLI's reason verbatim -- and names the kind of refusal only when it was not the
+   *  classifier's. A call nobody refused says nothing of the kind. */
+  it("says the CLI blocked a call, with its reason, and nothing of the kind otherwise", () => {
+    const { container } = render(
+      <>
+        {renderToolCall(
+          call({
+            input: { command: "git push --force origin main" },
+            result: { content: "Permission for this action was denied by the Claude Code auto mode classifier.", isError: true },
+            denied: { reasonType: "classifier", reason: "[Git Destructive]" },
+          }),
+        )}
+      </>,
+    );
+    const note = container.querySelector(".tool-denied-note");
+    expect(note?.textContent).toBe("blocked by auto: [Git Destructive]");
+    expect(note?.classList.contains("tool-rule-note")).toBe(true);
+    cleanup();
+    const ruled = render(<>{renderToolCall(call({ denied: { reasonType: "rule", reason: "Bash(git push *)" } }))}</>);
+    expect(ruled.container.querySelector(".tool-denied-note")?.textContent).toBe("blocked by auto: Bash(git push *) (rule)");
+    cleanup();
+    const bare = render(<>{renderToolCall(call({ denied: { reasonType: null, reason: null } }))}</>);
+    expect(bare.container.querySelector(".tool-denied-note")?.textContent).toBe("blocked by auto");
+    cleanup();
+    const plain = render(<>{renderToolCall(call({}))}</>);
+    expect(plain.container.querySelector(".tool-denied-note")).toBeNull();
+    expect(plain.container.textContent).not.toContain("blocked by auto");
+  });
+
   /** A call whose CLI prompt was answered without a card shows a muted note, like a call answered
    *  by a saved rule. Calls without that note show no such text. */
   it("says when the CLI's own prompt for a call was answered without a card", () => {

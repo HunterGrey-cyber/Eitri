@@ -26,8 +26,13 @@ export function initialState(): AgentUiState {
     assistantMessageOpen: false,
     nextSeq: 0,
     turnThinking: false,
+    denialsBeforeTheirCall: [],
   };
 }
+
+/** How many refusals that arrived ahead of their call a state holds at once; the same cap as
+ * Rust's `MAX_HELD_DENIALS`, so a refusal naming a call that never comes cannot pile up. */
+export const MAX_HELD_DENIALS = 64;
 
 /** `r` on an ended session (or any other in-panel "start over"): drops back to the start screen.
  *
@@ -143,8 +148,18 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         result: null,
         turnId: event.turn_id,
       };
+      // A refusal that arrived before this call is attached now, as Rust's projection does.
+      const held = state.denialsBeforeTheirCall.find((d) => d.toolUseId === event.tool_use_id);
+      if (held !== undefined) record.denied = held.denied;
       // A tool call only happens between assistant messages, so the streaming text ended here.
-      return { ...state, toolCalls: [...state.toolCalls, record], assistantMessageOpen: false };
+      return {
+        ...state,
+        toolCalls: [...state.toolCalls, record],
+        assistantMessageOpen: false,
+        ...(held === undefined
+          ? {}
+          : { denialsBeforeTheirCall: state.denialsBeforeTheirCall.filter((d) => d.toolUseId !== event.tool_use_id) }),
+      };
     }
     case "tool_call_completed":
       return {
@@ -188,7 +203,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // `AgentSessionProjection::apply` when updating usage: replace the entire figure because the
       // SDK reports a running total that `/clear` can reset. A lower report is valid. A turn with
       // no usage report keeps the last figure; missing data must not erase it or become zero.
-      return { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage };
+      return { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage, denialsBeforeTheirCall: [] };
     // Both endings clear activeTurnId, mirroring AgentSessionProjection exactly: no turn_completed
     // is ever coming, so leaving it set leaves App.tsx's turnInProgress true forever -- a spinner
     // on a dead session, next to a reply that may be truncated. Clearing it is not a local guess at
@@ -206,6 +221,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "unavailable", reason: describeFailedResume(event) },
         assistantMessageOpen: false,
+        denialsBeforeTheirCall: [],
       };
     }
     case "session_unavailable":
@@ -214,6 +230,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "unavailable", reason: event.reason },
         assistantMessageOpen: false,
+        denialsBeforeTheirCall: [],
       };
     case "session_closed":
       return {
@@ -221,7 +238,27 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "closed", reason: event.reason },
         assistantMessageOpen: false,
+        denialsBeforeTheirCall: [],
       };
+    case "cli_permission_mode":
+      // Rust's answer path reads it; the view draws nothing from it. `state`, so `nextSeq` keeps
+      // step with Rust's revision, which this event bumps like any other.
+      return state;
+    case "permission_denied": {
+      // On the call it refused, as `AgentSessionProjection::apply` puts it. A refusal naming no call
+      // changes nothing. One whose call this state does not hold yet is kept by its id and attached
+      // when the call starts (see `tool_call_started`), dropped when the turn or session ends, and
+      // capped, oldest first, exactly as Rust's projection does -- without it the row would lack its
+      // "blocked by auto" note until a snapshot.
+      const id = event.tool_use_id;
+      if (id === null || id === "") return state;
+      const denied = { reasonType: event.reason_type, reason: event.reason };
+      if (state.toolCalls.some((call) => call.toolUseId === id)) {
+        return { ...state, toolCalls: state.toolCalls.map((call) => (call.toolUseId === id ? { ...call, denied } : call)) };
+      }
+      const held = [...state.denialsBeforeTheirCall.filter((d) => d.toolUseId !== id), { toolUseId: id, denied }];
+      return { ...state, denialsBeforeTheirCall: held.slice(-MAX_HELD_DENIALS) };
+    }
     case "permission_mode_changed":
       // The mode lives on the tab (`tabs` envelope), not the projection: `TabInfo.mode` is what the
       // band and the box read, and Rust's own `tabs` envelope already reflects an acknowledged
@@ -319,6 +356,7 @@ export function keepAfterSidecarStop(state: AgentUiState, reason: string): Agent
     pendingPermissions: [],
     assistantMessageOpen: false,
     turnThinking: false,
+    denialsBeforeTheirCall: [],
   };
 }
 
@@ -333,15 +371,15 @@ export function keepAfterSidecarStop(state: AgentUiState, reason: string): Agent
  * `UiDelivery::Resync`, the two paths that throw this state away and rebuild it from here.
  */
 export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, throughRevision: number): AgentUiState {
-  // The snapshot omits `nextSeq` and `turnThinking`, which `AgentUiSnapshot` excludes as
-  // reducer-internal fields. Supply them here. Preserve `assistantMessageOpen` from the snapshot:
-  // Rust continues appending to an open reply, and resetting it would split that reply into two
-  // rows with broken markdown. Reset `turnThinking` because earlier thinking does not imply current
-  // activity. Resync or reload may degrade `thinking` to `sent` but must not invent activity. Take
-  // `usage` from this tab's snapshot so a tab with no report cannot retain the previous tab's
-  // figure. Default an absent key to `null`, which `usageSegment` treats as unknown; `undefined`
-  // would throw.
-  return { ...snapshot, usage: snapshot.usage ?? null, nextSeq: throughRevision, turnThinking: false };
+  // The snapshot omits `nextSeq`, `turnThinking` and `denialsBeforeTheirCall`, which
+  // `AgentUiSnapshot` excludes as reducer-internal fields. Supply them here. Preserve
+  // `assistantMessageOpen` from the snapshot: Rust continues appending to an open reply, and
+  // resetting it would split that reply into two rows with broken markdown. Reset `turnThinking`
+  // because earlier thinking does not imply current activity. Resync or reload may degrade
+  // `thinking` to `sent` but must not invent activity. Take `usage` from this tab's snapshot so a
+  // tab with no report cannot retain the previous tab's figure. Default an absent key to `null`,
+  // which `usageSegment` treats as unknown; `undefined` would throw.
+  return { ...snapshot, usage: snapshot.usage ?? null, nextSeq: throughRevision, turnThinking: false, denialsBeforeTheirCall: [] };
 }
 
 /** Whether `resume_outcome` confirms the requested session. Share this predicate with

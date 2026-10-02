@@ -1,7 +1,7 @@
 //! Translates sidecar wire `SessionEvent`s into provider-neutral `AgentDomainEvent`s.
 //! The translation has no I/O or async work, so unit tests can exercise it without a sidecar.
 
-use crate::process::{classify_cli_mode, CliModeReport};
+use crate::process::{classify_cli_mode, classify_reported_cli_mode, CliModeReport, RequestedCliMode};
 use crate::{AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TokenUsage, TurnOutcome, UsageInfo};
 use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
 use claude_runtime_protocol::v1::{
@@ -16,15 +16,20 @@ use claude_runtime_protocol::v1::{
 /// simply skips that one occurrence rather than tearing down the whole
 /// stream over one bad event.
 ///
-/// Usually one event. Two only when a `SessionReady` reports a CLI permission mode less restrictive
-/// than `default`: the session did open, AND it must be closed -- so both are said,
-/// in that order, rather than one hiding the other.
-pub(crate) fn translate(event: ProtoSessionEvent) -> Vec<AgentDomainEvent> {
-    translate_one(event).into_iter().flatten().collect()
+/// Usually one event. Two when a `SessionReady` reports a CLI permission mode that is not one the
+/// session accepts: the session did open, AND it must be closed -- so both are said,
+/// in that order, rather than one hiding the other. Two also on every `SessionReady` of a session
+/// that asked for the CLI's auto mode and got a mode it accepts: the opening, then the mode
+/// (`CliPermissionMode`), which the host's answer path reads.
+///
+/// `requested` is what this session asked the CLI to run in (`build_create_request`), and is what
+/// the CLI's report is judged against (`classify_reported_cli_mode`).
+pub(crate) fn translate(event: ProtoSessionEvent, requested: RequestedCliMode) -> Vec<AgentDomainEvent> {
+    translate_one(event, requested).into_iter().flatten().collect()
 }
 
 /// `translate`'s body: `None` is nothing, and `Some` is one or two events.
-fn translate_one(event: ProtoSessionEvent) -> Option<Vec<AgentDomainEvent>> {
+fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Option<Vec<AgentDomainEvent>> {
     // The ENVELOPE's session_id, captured before the oneof is destructured. This is the sidecar's
     // own session id -- the value `CreateSession` returned and the one every subsequent RPC must be
     // addressed with.
@@ -44,9 +49,10 @@ fn translate_one(event: ProtoSessionEvent) -> Option<Vec<AgentDomainEvent>> {
     let one = |event: AgentDomainEvent| Some(vec![event]);
     match event.event? {
         // `permission_mode` is the CLI's `system/init` report, sent again every turn.
-        // A project's `permissions.defaultMode` can set it because INTERACTIVE sends no CLI mode.
-        // A mode less restrictive than `default` must close the session.
-        // `CliModeNote` notes stricter and unreported values.
+        // For a session requesting `default`, a less restrictive mode must close the session;
+        // `CliModeNote` notes stricter and unreported values. For a session requesting auto mode,
+        // `auto` and its `default` fallback are reported through `CliPermissionMode`.
+        // Any other report closes a session that requested auto mode.
         ProtoEvent::SessionReady(ready) => {
             let reported = ready.permission_mode;
             let mut out = vec![AgentDomainEvent::SessionOpened {
@@ -55,11 +61,15 @@ fn translate_one(event: ProtoSessionEvent) -> Option<Vec<AgentDomainEvent>> {
                 model: ready.model,
                 cwd: ready.cwd,
             }];
-            if classify_cli_mode(&reported) == CliModeReport::Ungated {
-                out.push(AgentDomainEvent::UngatedCliMode {
+            match classify_reported_cli_mode(&reported, requested) {
+                CliModeReport::Ungated => out.push(AgentDomainEvent::UngatedCliMode {
                     reported,
                     detail: "SessionReady".to_string(),
-                });
+                }),
+                CliModeReport::Auto | CliModeReport::AutoUnavailable => {
+                    out.push(AgentDomainEvent::CliPermissionMode { reported })
+                }
+                CliModeReport::Default | CliModeReport::Stricter | CliModeReport::Unreported => {}
             }
             Some(out)
         }
@@ -182,6 +192,19 @@ fn translate_one(event: ProtoSessionEvent) -> Option<Vec<AgentDomainEvent>> {
         // The interactive and rule-based modes both map to `Auto`. An UNSPECIFIED enum is logged and dropped
         // after checking the provider mode name, which is checked independently of the enum.
         ProtoEvent::PermissionModeChanged(changed) => {
+            // A session created with the CLI's auto mode refuses every switch (the proto's
+            // `SetPermissionModeRequest`), so a report of one is a peer breaking that rule, and what
+            // the CLI runs in afterwards is unknown to the answer path: closed, whatever it names.
+            if requested == RequestedCliMode::Auto {
+                return one(AgentDomainEvent::UngatedCliMode {
+                    reported: if changed.permission_mode.is_empty() {
+                        "a mode switch".to_string()
+                    } else {
+                        changed.permission_mode
+                    },
+                    detail: "PermissionModeChanged".to_string(),
+                });
+            }
             let mode = match changed.mode() {
                 ProtoPermissionMode::Bypass => Some(crate::PermissionMode::Bypass),
                 ProtoPermissionMode::Interactive | ProtoPermissionMode::VerdandiRules => {
@@ -217,6 +240,16 @@ fn translate_one(event: ProtoSessionEvent) -> Option<Vec<AgentDomainEvent>> {
                 floor_applied: changed.bypass_default_deny_applied,
             })
         }
+        // Capability 'permission_denied_events', on a session that stated a CLI permission mode --
+        // which this client does only when it asks for auto. Informational: the CLI has already
+        // refused the call and the model already has the refusal as its error result. The strings
+        // are the CLI's, carried verbatim; an empty one is proto3's "unset", so it is no id.
+        ProtoEvent::PermissionDenied(denied) => one(AgentDomainEvent::PermissionDenied {
+            tool_use_id: crate::projection::tool_use_link(denied.tool_use_id),
+            tool_name: denied.tool_name,
+            reason_type: denied.reason_type,
+            reason: denied.reason,
+        }),
     }
 }
 
@@ -294,6 +327,7 @@ fn translate_permission_outcome(outcome: ProtoPermissionOutcome) -> PermissionOu
         ProtoPermissionOutcome::CancelledBySessionClose => PermissionOutcome::CancelledBySessionClose,
         ProtoPermissionOutcome::ProviderFailed => PermissionOutcome::ProviderFailed,
         ProtoPermissionOutcome::Expired => PermissionOutcome::Expired,
+        ProtoPermissionOutcome::Deferred => PermissionOutcome::Deferred,
         ProtoPermissionOutcome::Unspecified => {
             eprintln!(
                 "agent: ClaudeSidecarProvider: PermissionOutcome::Unspecified from the wire, treating as Expired"
@@ -377,12 +411,23 @@ impl MessageSplit {
 /// are worth one line, and `SessionReady` arrives every turn, so the line would otherwise repeat.
 ///
 /// Per session, alongside `MessageSplit`, in the watch loop; `translate` itself stays pure.
+///
+/// On a session that asked for the CLI's auto mode the one line due is the fallback: the CLI runs
+/// `default` instead, so Eitri's own policy answers its requests and none is deferred.
 #[derive(Default)]
 pub(crate) struct CliModeNote {
+    requested: RequestedCliMode,
     noted: bool,
 }
 
 impl CliModeNote {
+    pub(crate) fn new(requested: RequestedCliMode) -> Self {
+        Self {
+            requested,
+            noted: false,
+        }
+    }
+
     /// The line to print for this event, the first time one is due.
     pub(crate) fn observe(&mut self, event: &ProtoSessionEvent) -> Option<String> {
         let (reported, source) = match event.event.as_ref()? {
@@ -390,7 +435,7 @@ impl CliModeNote {
             ProtoEvent::PermissionModeChanged(changed) => (changed.permission_mode.as_str(), "PermissionModeChanged"),
             _ => return None,
         };
-        let line = match classify_cli_mode(reported) {
+        let line = match classify_reported_cli_mode(reported, self.requested) {
             CliModeReport::Stricter => {
                 format!("[permission] the CLI reports permission mode '{reported}' in {source}, not 'default'")
             }
@@ -398,7 +443,11 @@ impl CliModeNote {
                 "[permission] {source} reports no CLI permission mode (a sidecar older than the field): \
                  neither a downgrade nor an all-clear"
             ),
-            CliModeReport::Default | CliModeReport::Ungated => return None,
+            CliModeReport::AutoUnavailable => format!(
+                "[permission] the CLI reports permission mode '{reported}' in {source} although this session \
+                 asked for its auto mode (unavailable to it): Eitri's own policy answers, nothing is deferred"
+            ),
+            CliModeReport::Default | CliModeReport::Auto | CliModeReport::Ungated => return None,
         };
         if std::mem::replace(&mut self.noted, true) {
             return None;
@@ -421,7 +470,7 @@ mod tests {
     /// it. Every event but a tripping `SessionReady` still translates to at most one; that one is
     /// tested through `super::translate` itself.
     fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
-        let mut out = super::translate(event);
+        let mut out = super::translate(event, RequestedCliMode::Default);
         assert!(out.len() <= 1, "expected at most one event, got {out:?}");
         out.pop()
     }
@@ -770,6 +819,7 @@ mod tests {
             ),
             (ProtoPermOutcome::ProviderFailed, PermissionOutcome::ProviderFailed),
             (ProtoPermOutcome::Expired, PermissionOutcome::Expired),
+            (ProtoPermOutcome::Deferred, PermissionOutcome::Deferred),
         ];
         for (proto_outcome, expected) in cases {
             let event = wrap(ProtoEvent::PermissionResolved(PermissionResolved {
@@ -985,7 +1035,7 @@ mod tests {
     fn a_session_ready_reporting_a_less_restrictive_mode_opens_and_trips() {
         for reported in ["bypassPermissions", "acceptEdits", "auto", "weird"] {
             assert_eq!(
-                super::translate(ready(reported)),
+                super::translate(ready(reported), RequestedCliMode::Default),
                 vec![
                     opened(),
                     AgentDomainEvent::UngatedCliMode {
@@ -1001,7 +1051,11 @@ mod tests {
     #[test]
     fn a_session_ready_in_default_a_stricter_mode_or_none_only_opens() {
         for reported in ["default", "plan", "dontAsk", ""] {
-            assert_eq!(super::translate(ready(reported)), vec![opened()], "{reported:?}");
+            assert_eq!(
+                super::translate(ready(reported), RequestedCliMode::Default),
+                vec![opened()],
+                "{reported:?}"
+            );
         }
     }
 
@@ -1011,14 +1065,20 @@ mod tests {
     #[test]
     fn a_permission_mode_change_trips_unless_it_reports_default() {
         assert_eq!(
-            super::translate(mode_changed(ProtoPermissionMode::Bypass, "bypassPermissions")),
+            super::translate(
+                mode_changed(ProtoPermissionMode::Bypass, "bypassPermissions"),
+                RequestedCliMode::Default
+            ),
             vec![AgentDomainEvent::UngatedCliMode {
                 reported: "bypassPermissions".into(),
                 detail: "PermissionModeChanged".into(),
             }]
         );
         assert_eq!(
-            super::translate(mode_changed(ProtoPermissionMode::Interactive, "acceptEdits")),
+            super::translate(
+                mode_changed(ProtoPermissionMode::Interactive, "acceptEdits"),
+                RequestedCliMode::Default
+            ),
             vec![AgentDomainEvent::UngatedCliMode {
                 reported: "acceptEdits".into(),
                 detail: "PermissionModeChanged".into(),
@@ -1026,14 +1086,20 @@ mod tests {
         );
         // A contradictory report fails closed on the enum.
         assert_eq!(
-            super::translate(mode_changed(ProtoPermissionMode::Bypass, "default")),
+            super::translate(
+                mode_changed(ProtoPermissionMode::Bypass, "default"),
+                RequestedCliMode::Default
+            ),
             vec![AgentDomainEvent::UngatedCliMode {
                 reported: "BYPASS".into(),
                 detail: "PermissionModeChanged".into(),
             }]
         );
         assert_eq!(
-            super::translate(mode_changed(ProtoPermissionMode::Interactive, "default")),
+            super::translate(
+                mode_changed(ProtoPermissionMode::Interactive, "default"),
+                RequestedCliMode::Default
+            ),
             vec![AgentDomainEvent::PermissionModeChanged {
                 mode: crate::PermissionMode::Auto,
                 provider_mode: "default".into(),
@@ -1042,10 +1108,13 @@ mod tests {
         );
         // UNSPECIFIED with nothing ungated about it is still dropped, loudly.
         let none = wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged::default()));
-        assert_eq!(super::translate(none), vec![]);
+        assert_eq!(super::translate(none, RequestedCliMode::Default), vec![]);
         // And UNSPECIFIED never hides an ungated name.
         assert_eq!(
-            super::translate(mode_changed(ProtoPermissionMode::Unspecified, "bypassPermissions")),
+            super::translate(
+                mode_changed(ProtoPermissionMode::Unspecified, "bypassPermissions"),
+                RequestedCliMode::Default
+            ),
             vec![AgentDomainEvent::UngatedCliMode {
                 reported: "bypassPermissions".into(),
                 detail: "PermissionModeChanged".into(),
@@ -1074,6 +1143,124 @@ mod tests {
         assert!(other
             .observe(&mode_changed(ProtoPermissionMode::Interactive, "dontAsk"))
             .is_some_and(|l| l.contains("PermissionModeChanged")));
+    }
+
+    /// For a session requesting auto mode, `auto` and the `default` fallback open the session
+    /// and emit `CliPermissionMode` for the answer path. Any other report opens the session
+    /// and signals closure, including stricter modes and an empty report.
+    /// A session requesting `default` would only note those stricter or unreported values.
+    #[test]
+    fn a_session_that_asked_for_auto_accepts_auto_or_default_and_trips_on_anything_else() {
+        let auto = RequestedCliMode::Auto;
+        for accepted in ["auto", "default"] {
+            assert_eq!(
+                super::translate(ready(accepted), auto),
+                vec![
+                    opened(),
+                    AgentDomainEvent::CliPermissionMode {
+                        reported: accepted.into()
+                    }
+                ],
+                "{accepted}"
+            );
+        }
+        for reported in ["bypassPermissions", "acceptEdits", "plan", "dontAsk", "", "weird"] {
+            assert_eq!(
+                super::translate(ready(reported), auto),
+                vec![
+                    opened(),
+                    AgentDomainEvent::UngatedCliMode {
+                        reported: reported.into(),
+                        detail: "SessionReady".into(),
+                    },
+                ],
+                "{reported:?}"
+            );
+        }
+    }
+
+    /// The other half: a session that did not ask for auto never says `CliPermissionMode`, so the
+    /// answer path can never read an `auto` it did not ask for -- and `auto` there still trips (the
+    /// tests above, on `RequestedCliMode::Default`).
+    #[test]
+    fn a_session_that_asked_for_default_never_reports_a_cli_permission_mode() {
+        for reported in ["default", "plan", "dontAsk", "", "auto", "bypassPermissions"] {
+            assert!(
+                !super::translate(ready(reported), RequestedCliMode::Default)
+                    .iter()
+                    .any(|e| matches!(e, AgentDomainEvent::CliPermissionMode { .. })),
+                "{reported:?}"
+            );
+        }
+    }
+
+    /// A session created with the CLI's auto mode refuses every switch, so any report of one closes
+    /// it -- `default` included, which a `default` session folds as a no-op.
+    #[test]
+    fn any_permission_mode_change_on_an_auto_session_trips() {
+        for (mode, name, expected) in [
+            (ProtoPermissionMode::Interactive, "default", "default"),
+            (ProtoPermissionMode::Bypass, "bypassPermissions", "bypassPermissions"),
+            (ProtoPermissionMode::Unspecified, "", "a mode switch"),
+        ] {
+            assert_eq!(
+                super::translate(mode_changed(mode, name), RequestedCliMode::Auto),
+                vec![AgentDomainEvent::UngatedCliMode {
+                    reported: expected.into(),
+                    detail: "PermissionModeChanged".into(),
+                }],
+                "{mode:?} {name:?}"
+            );
+        }
+    }
+
+    /// The CLI's own refusal reaches the domain verbatim, tied to its call; proto3's empty strings
+    /// are no id (the shared link rule), and the optional fields stay absent when the CLI gave none.
+    #[test]
+    fn a_permission_denied_carries_the_clis_words_and_its_call() {
+        use claude_runtime_protocol::v1::PermissionDenied as ProtoPermissionDenied;
+        let event = wrap(ProtoEvent::PermissionDenied(ProtoPermissionDenied {
+            tool_use_id: "toolu_017CZ9vk9wjuHQmght9KZgQo".into(),
+            tool_name: "Bash".into(),
+            reason_type: Some("classifier".into()),
+            reason: Some("[Git Destructive]".into()),
+        }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::PermissionDenied {
+                tool_use_id: Some("toolu_017CZ9vk9wjuHQmght9KZgQo".into()),
+                tool_name: "Bash".into(),
+                reason_type: Some("classifier".into()),
+                reason: Some("[Git Destructive]".into()),
+            })
+        );
+        let bare = wrap(ProtoEvent::PermissionDenied(ProtoPermissionDenied {
+            tool_name: "Bash".into(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            translate(bare),
+            Some(AgentDomainEvent::PermissionDenied {
+                tool_use_id: None,
+                tool_name: "Bash".into(),
+                reason_type: None,
+                reason: None,
+            })
+        );
+    }
+
+    /// On an auto session the fallback to `default` is the one line due, once; `auto` itself earns
+    /// none.
+    #[test]
+    fn an_auto_session_notes_its_fallback_to_default_once() {
+        let mut note = CliModeNote::new(RequestedCliMode::Auto);
+        assert_eq!(note.observe(&ready("auto")), None);
+        let line = note.observe(&ready("default")).expect("the fallback is noted");
+        assert!(
+            line.contains("asked for its auto mode") && line.contains("'default'"),
+            "{line}"
+        );
+        assert_eq!(note.observe(&ready("default")), None, "once per session");
     }
 
     #[test]

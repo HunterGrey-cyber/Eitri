@@ -108,13 +108,23 @@ impl SpawnedSidecar {
 /// The baseline protocol includes `SetPermissionMode`, `PermissionModeChanged`,
 /// and `TextDelta.message_id`.
 ///
-/// The baseline sidecar explicitly passes `permissionMode: 'default'` for gated
-/// sessions to prevent local `.claude/settings.json` from widening permissions.
+/// For gated sessions using CLI `default`, the sidecar explicitly passes
+/// `permissionMode: 'default'` to prevent local `.claude/settings.json` from widening permissions.
 ///
 /// The protocol also includes `ClaudeHostPolicy.provider_permission_prompts`,
 /// `PermissionRequested.origin` and its `provider_*` fields, `PermissionOrigin`,
 /// `MatchedAskRule`, and the `provider_permission_prompts` capability.
-pub const EXPECTED_VERDANDI_REVISION: &str = "22400e8";
+///
+/// Protocol 3.14 supports CLI auto mode under the gate through
+/// `ClaudeHostPolicy.cli_permission_mode`, `ResolvePermissionRequest.defer`,
+/// `PermissionOutcome.DEFERRED`, and the `PermissionDenied` event.
+/// Its capabilities include `cli_auto_mode`, `permission_defer`, and
+/// `permission_denied_events`. This client does not send or read
+/// `await_account_identity`, `ToolAllowList.init_check`, the handshake fields
+/// `egress_probe` and `structured_output_tools`, or `SessionReady.effective_*`.
+/// Keep this value as the seven-character prefix of the full dependency revision:
+/// the per-user sidecar directory and release checks use that prefix.
+pub const EXPECTED_VERDANDI_REVISION: &str = "8e0f7e1";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.

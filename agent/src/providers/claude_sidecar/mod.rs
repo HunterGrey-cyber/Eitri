@@ -28,7 +28,7 @@ use crate::runtime_thread::RuntimeThread;
 use crate::AgentDomainEvent;
 use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use claude_runtime_protocol::v1::{
-    ClaudeHostPolicy, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
+    ClaudeHostPolicy, CliPermissionMode, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
     CreateSessionRequest as ProtoCreateSessionRequest, ErrorCode as ProtoErrorCode, ErrorDetail, ExecutableSource,
     HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
     PermissionMode as ProtoPermissionMode, PersistenceMode, ReplayStart,
@@ -65,6 +65,11 @@ const CAP_TEXT_DELTA_MESSAGE_ID: &str = "text_delta_message_id";
 /// with origin PROVIDER_PROMPT. `connect()` stores the capability in `provider_prompts`,
 /// which `build_create_request` sends.
 const CAP_PROVIDER_PERMISSION_PROMPTS: &str = "provider_permission_prompts";
+/// Capabilities for `ClaudeHostPolicy.cli_permission_mode` and `ResolvePermissionRequest.defer`.
+/// Use the protocol crate's generated constants so a renamed capability fails to compile
+/// instead of silently reading as absent.
+const CAP_CLI_AUTO_MODE: &str = claude_runtime_protocol::CAP_CLI_AUTO_MODE;
+const CAP_PERMISSION_DEFER: &str = claude_runtime_protocol::CAP_PERMISSION_DEFER;
 const PERMISSION_MODE_BYPASS: &str = "bypass";
 const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 
@@ -89,6 +94,11 @@ const CLIENT_IMPLEMENTS_FORK: bool = false;
 /// approved the same call), and drawn as a card with the CLI's own reason otherwise. Before that a
 /// session that asked for these would have had its prompts judged as if the gate had asked.
 const CLIENT_IMPLEMENTS_PROVIDER_PROMPTS: bool = true;
+/// True since 2026-10-02: a session asks for the CLI's own auto mode, a gate request on it is
+/// answered `PermissionDecision::Defer` by `eitri_core::agent_backend` when the tab is in Auto and no
+/// saved rule allows it, the CLI's `SessionReady` report is judged against the request
+/// (`translate::translate`), and its refusals are shown on their call (`PermissionDenied`).
+const CLIENT_IMPLEMENTS_CLI_AUTO_MODE: bool = true;
 
 /// Whether to request the CLI's own prompts: both the handshake advertisement and client
 /// support are required. Without this capability, the headless CLI refuses its own prompts
@@ -120,6 +130,17 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
             .permission_modes
             .iter()
             .any(|m| m == PERMISSION_MODE_INTERACTIVE),
+        // Both or neither: see `ProviderCapabilities::cli_auto_mode`.
+        cli_auto_mode: CLIENT_IMPLEMENTS_CLI_AUTO_MODE && has(CAP_CLI_AUTO_MODE) && has(CAP_PERMISSION_DEFER),
+    }
+}
+
+/// What every session this provider creates asks the CLI to run in under the gate.
+fn requested_cli_mode(capabilities: &ProviderCapabilities) -> crate::RequestedCliMode {
+    if capabilities.cli_auto_mode {
+        crate::RequestedCliMode::Auto
+    } else {
+        crate::RequestedCliMode::Default
     }
 }
 
@@ -370,6 +391,9 @@ impl ClaudeSidecarProvider {
         let events = Arc::clone(&self.events);
         let backpressure = Arc::clone(&self.backpressure);
         let splits_messages = self.splits_messages;
+        // The mode this session's `CreateSession` asked for, the one its CLI's reports are judged
+        // against: every session this provider creates asks for the same one.
+        let requested = requested_cli_mode(&self.capabilities);
         self.runtime.handle().spawn(async move {
             let mut tracker = watch::SequenceTracker::new();
             // One per session, outside the reconnect loop below: a reconnect must not forget which
@@ -378,7 +402,7 @@ impl ClaudeSidecarProvider {
             let mut split = translate::MessageSplit::new(splits_messages);
             // Per session, like `split`: a stricter or unreported CLI permission mode is noted once,
             // not on every turn's `SessionReady`.
-            let mut cli_mode_note = translate::CliModeNote::default();
+            let mut cli_mode_note = translate::CliModeNote::new(requested);
             // Counts only CONSECUTIVE failed attempts: a reconnect that actually delivered a new
             // event resets it, so the budget bounds "getting nowhere", not "reconnecting at all".
             let mut consecutive_failures = 0usize;
@@ -448,7 +472,7 @@ impl ClaudeSidecarProvider {
                                     if let Some(line) = cli_mode_note.observe(&event) {
                                         eprintln!("{line}");
                                     }
-                                    for domain_event in translate::translate(event) {
+                                    for domain_event in translate::translate(event, requested) {
                                         // A session that closes on its own terms is the one ending
                                         // that is not a loss -- recorded from the provider's own
                                         // terminal event, never inferred from the stream stopping.
@@ -593,14 +617,16 @@ fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo)
 /// Only values with distinct runtime behavior are sent. Equivalent permission and persistence
 /// values add no choice, and `executable` is not read by the sidecar. PARTIAL streaming has a
 /// measured effect, so the request sends it.
-/// `provider_prompts` also has an effect: `provider_prompts_from_handshake` selects it from the
-/// peer's advertised capabilities.
+/// `provider_prompts_from_handshake` selects `provider_prompts` from the peer's capabilities.
+/// `requested_cli_mode` selects `Auto` only when both `cli_auto_mode` and `permission_defer` are
+/// advertised. `Default` leaves the field unset, preserving the request sent to older sidecars.
 fn build_create_request(
     cwd: String,
     streaming: StreamingPreference,
     resume_provider_session_id: Option<String>,
     fork: bool,
     provider_prompts: bool,
+    cli_mode: crate::RequestedCliMode,
 ) -> ProtoCreateSessionRequest {
     build_create_request_loading(
         cwd,
@@ -609,6 +635,7 @@ fn build_create_request(
         fork,
         provider_prompts,
         crate::setting_sources::loads_user_settings(),
+        cli_mode,
     )
 }
 
@@ -634,14 +661,16 @@ fn build_create_request_loading(
     fork: bool,
     provider_prompts: bool,
     user_settings: bool,
+    cli_mode: crate::RequestedCliMode,
 ) -> ProtoCreateSessionRequest {
     let denied = crate::process::disallowed_tools();
     ProtoCreateSessionRequest {
         cwd,
         policy: Some(ClaudeHostPolicy {
             configuration: ConfigurationProfile::Native as i32,
-            // The CLI runs `default` under the sidecar's `PreToolUse` gate.
-            // The host implements bypass by answering `allow` through that gate.
+            // The sidecar's `PreToolUse` gate asks the host about every call; bypass is the host answering
+            // `allow` through that gate. The CLI runs `default` or its own `auto` mode, selected by
+            // `cli_permission_mode` below.
             permissions: ProtoPermissionMode::Interactive as i32,
             persistence: PersistenceMode::HostCli as i32,
             executable: ExecutableSource::HostCli as i32,
@@ -703,6 +732,16 @@ fn build_create_request_loading(
             // sent it (`provider_prompts_from_handshake`). Adds no tool: the sidecar disallows the
             // three the SDK's prompt channel brings with it, and `allow` above is absent.
             provider_permission_prompts: provider_prompts,
+            // `Auto`: the CLI runs its own auto mode under the gate, so a call this host defers
+            // (`PermissionDecision::Defer`) meets the CLI's classifier rather than its ordinary
+            // ask. Verdandi accepts it only with INTERACTIVE and not switchable, both fixed above.
+            // UNSPECIFIED otherwise, never DEFAULT: DEFAULT would opt a session that cannot defer
+            // into `PermissionDenied` events, so its request would no longer be the one sent
+            // before the field existed.
+            cli_permission_mode: match cli_mode {
+                crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32,
+                crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32,
+            },
         }),
         resume_provider_session_id,
         fork,
@@ -713,6 +752,8 @@ fn build_create_request_loading(
         effort: None,        // absent = the CLI's default reasoning effort
         system_prompt: None, // absent = Claude Code's own system prompt, unreplaced
         output_format: None, // absent = plain text, not schema-validated structured output
+        // false = `CreateSession` returns as soon as the session exists, as it always has.
+        await_account_identity: false,
     }
 }
 
@@ -735,6 +776,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             None,
             false,
             self.provider_prompts,
+            requested_cli_mode(&self.capabilities),
         ))
     }
 
@@ -767,6 +809,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             Some(request.provider_session_id),
             false,
             self.provider_prompts,
+            requested_cli_mode(&self.capabilities),
         ))
     }
 
@@ -793,16 +836,7 @@ impl AgentProvider for ClaudeSidecarProvider {
 
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError> {
         let mut client = self.client.clone();
-        // `PermissionDecision` is destructured here, at the wire, and nowhere else: the wire's
-        // `allow`/`reason` pair is the reason the enum has exactly these two variants. An approval
-        // sends no reason because there is no field on the far side that would ever show it.
-        let proto_request = ProtoResolvePermissionRequest {
-            session_id: request.session_id,
-            command_id: uuid::Uuid::new_v4().to_string(),
-            permission_id: request.permission_id,
-            allow: request.decision.allows(),
-            reason: request.decision.reason().unwrap_or_default().to_string(),
-        };
+        let proto_request = resolve_request_for(&self.capabilities, request)?;
         self.run_unary(async move { client.resolve_permission(proto_request).await })?;
         Ok(())
     }
@@ -820,6 +854,34 @@ impl AgentProvider for ClaudeSidecarProvider {
     fn pump(&self) -> Vec<AgentDomainEvent> {
         std::mem::take(&mut *self.events.lock().unwrap())
     }
+}
+
+/// The wire form of one answer, or the refusal to send it.
+///
+/// `PermissionDecision` is destructured here, at the wire, and nowhere else: the wire's
+/// `allow`/`reason`/`defer` fields are the reason the enum has exactly its three variants. An
+/// approval or a deferral sends no reason because there is no field on the far side that would ever
+/// show it.
+///
+/// A deferral goes only to a provider whose sessions asked for the CLI's auto mode: on any other it
+/// would hand the call to the CLI's ordinary ask, which is not what deferring means here, so it is
+/// refused rather than sent. Verdandi refuses one on a provider prompt, together with `allow`, or on
+/// a switchable session too; this is the host-side half.
+fn resolve_request_for(
+    capabilities: &ProviderCapabilities,
+    request: ResolvePermissionRequest,
+) -> Result<ProtoResolvePermissionRequest, ProviderError> {
+    if request.decision.defers() && !capabilities.cli_auto_mode {
+        return Err(ProviderError::UnsupportedCapability("permission_defer"));
+    }
+    Ok(ProtoResolvePermissionRequest {
+        session_id: request.session_id,
+        command_id: uuid::Uuid::new_v4().to_string(),
+        permission_id: request.permission_id,
+        allow: request.decision.allows(),
+        reason: request.decision.reason().unwrap_or_default().to_string(),
+        defer: request.decision.defers(),
+    })
 }
 
 /// Records how far behind production one delivered event was.
@@ -855,33 +917,44 @@ mod tests {
     /// default deny list from being added, so every tool can reach the gate.
     #[test]
     fn every_request_is_gated_never_switchable_and_restricts_no_tool() {
-        let shapes = [
-            (
-                "fresh",
-                build_create_request("/tmp/p".into(), StreamingPreference::Partial, None, false, true),
-            ),
-            (
-                "resume",
-                build_create_request(
-                    "/tmp/p".into(),
-                    StreamingPreference::Partial,
-                    Some("claude-id".into()),
-                    false,
-                    true,
+        let shapes = [crate::RequestedCliMode::Default, crate::RequestedCliMode::Auto].map(|cli_mode| {
+            [
+                (
+                    "fresh",
+                    build_create_request(
+                        "/tmp/p".into(),
+                        StreamingPreference::Partial,
+                        None,
+                        false,
+                        true,
+                        cli_mode,
+                    ),
                 ),
-            ),
-            (
-                "fork",
-                build_create_request(
-                    "/tmp/p".into(),
-                    StreamingPreference::Complete,
-                    Some("claude-id".into()),
-                    true,
-                    true,
+                (
+                    "resume",
+                    build_create_request(
+                        "/tmp/p".into(),
+                        StreamingPreference::Partial,
+                        Some("claude-id".into()),
+                        false,
+                        true,
+                        cli_mode,
+                    ),
                 ),
-            ),
-        ];
-        for (shape, request) in shapes {
+                (
+                    "fork",
+                    build_create_request(
+                        "/tmp/p".into(),
+                        StreamingPreference::Complete,
+                        Some("claude-id".into()),
+                        true,
+                        true,
+                        cli_mode,
+                    ),
+                ),
+            ]
+        });
+        for (shape, request) in shapes.into_iter().flatten() {
             let policy = request.policy.expect("a policy is always sent");
             assert_eq!(
                 policy.permissions,
@@ -924,9 +997,16 @@ mod tests {
                 ("resume", Some("claude-id".to_string()), false),
                 ("fork", Some("claude-id".to_string()), true),
             ] {
-                let policy = build_create_request("/tmp/p".into(), StreamingPreference::Partial, resume, fork, offered)
-                    .policy
-                    .expect("a policy is always sent");
+                let policy = build_create_request(
+                    "/tmp/p".into(),
+                    StreamingPreference::Partial,
+                    resume,
+                    fork,
+                    offered,
+                    crate::RequestedCliMode::Default,
+                )
+                .policy
+                .expect("a policy is always sent");
                 assert_eq!(policy.provider_permission_prompts, offered, "{shape}");
                 assert_eq!(policy.permissions, ProtoPermissionMode::Interactive as i32, "{shape}");
                 assert!(!policy.permission_mode_switchable, "{shape}");
@@ -975,6 +1055,7 @@ mod tests {
                     fork,
                     false,
                     user_settings,
+                    crate::RequestedCliMode::Default,
                 )
                 .policy
                 .expect("a policy is always sent");
@@ -995,9 +1076,16 @@ mod tests {
     /// request every session goes through loads the user tier, and the note says so.
     #[test]
     fn the_default_request_loads_the_user_tier_and_the_note_says_so() {
-        let policy = build_create_request("/p".into(), StreamingPreference::Partial, None, false, false)
-            .policy
-            .expect("a policy is always sent");
+        let policy = build_create_request(
+            "/p".into(),
+            StreamingPreference::Partial,
+            None,
+            false,
+            false,
+            crate::RequestedCliMode::Default,
+        )
+        .policy
+        .expect("a policy is always sent");
         assert_eq!(
             policy.setting_sources.expect("stated").sources,
             vec![
@@ -1024,8 +1112,9 @@ mod tests {
     fn real_handshake_today() -> HandshakeResponse {
         HandshakeResponse {
             protocol_major: 3,
-            protocol_minor: 0,
-            sidecar_version: "0.1.0".into(),
+            // The handshake reports the protocol minor from `capabilities.json`.
+            protocol_minor: 14,
+            sidecar_version: "0.2.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
             sdk_declared_claude_code_version: "2.1.269".into(),
             actual_claude_code_version: "2.1.269".into(),
@@ -1066,6 +1155,19 @@ mod tests {
                 // as `PermissionRequested` with origin PROVIDER_PROMPT. The handshake fixture places
                 // this capability before the executable entries.
                 "provider_permission_prompts",
+                // Protocol 3.13, all unread by this client (`build_create_request` sends neither
+                // `init_check` nor `await_account_identity`).
+                "init_check",
+                "await_account_identity",
+                "egress_probe",
+                "structured_output_tools",
+                "effective_tool_report",
+                // The CLI's own auto mode under the gate, deferred answers, and refusal events.
+                // The first two together provide `ProviderCapabilities::cli_auto_mode`.
+                // The entries follow `capabilities.json` order.
+                "cli_auto_mode",
+                "permission_defer",
+                "permission_denied_events",
                 // Executable sources are advertised as capabilities rather than a separate wire field.
                 // `executable_host_cli` is always present; checkout builds also offer `executable_sdk_bundled`.
                 // Packaged builds cannot offer it: the SDK uses `createRequire` to find its CLI, and the
@@ -1181,14 +1283,14 @@ mod tests {
         );
         assert_eq!(info.actual_claude_code_version, "2.1.269");
         assert_eq!(info.protocol_major, 3);
-        assert_eq!(info.sidecar_version, "0.1.0");
+        assert_eq!(info.sidecar_version, "0.2.0");
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        // Twenty-four capabilities in the packaged fixture returned by `real_handshake_today()`.
+        // Thirty-two capabilities in the packaged fixture returned by `real_handshake_today()`.
         // Checkout builds also advertise `executable_sdk_bundled`; a sidecar with egress
         // restrictions enabled additionally advertises `egress_restricted`.
-        assert_eq!(info.advertised_capabilities.len(), 24);
+        assert_eq!(info.advertised_capabilities.len(), 32);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }
@@ -1213,6 +1315,119 @@ mod tests {
     fn a_clean_startup_produces_no_diagnostics() {
         assert!(startup_diagnostics_from_stderr(&["nothing notable".to_string()]).is_empty());
         assert!(startup_diagnostics_from_stderr(&[]).is_empty());
+    }
+
+    /// The CLI's own auto mode is asked for exactly when the handshake offers both halves of it --
+    /// `cli_auto_mode` and `permission_defer` -- and never on the strength of one alone.
+    #[test]
+    fn the_clis_auto_mode_is_asked_for_only_when_the_sidecar_offers_both_halves() {
+        let today = capabilities_from_handshake(&real_handshake_today());
+        assert!(today.cli_auto_mode);
+        assert_eq!(requested_cli_mode(&today), crate::RequestedCliMode::Auto);
+        for missing in [CAP_CLI_AUTO_MODE, CAP_PERMISSION_DEFER] {
+            let mut older = real_handshake_today();
+            older.capabilities.retain(|c| c != missing);
+            let caps = capabilities_from_handshake(&older);
+            assert!(!caps.cli_auto_mode, "without {missing}");
+            assert_eq!(
+                requested_cli_mode(&caps),
+                crate::RequestedCliMode::Default,
+                "without {missing}"
+            );
+        }
+        assert_eq!(CAP_CLI_AUTO_MODE, "cli_auto_mode");
+        assert_eq!(CAP_PERMISSION_DEFER, "permission_defer");
+    }
+
+    /// A session that asks for auto differs from one that does not in exactly one field, and the one
+    /// that does not leaves it off the wire: an older sidecar is sent what it was always sent. The
+    /// gate is the same either way -- INTERACTIVE, never switchable, which is all Verdandi accepts
+    /// AUTO with.
+    #[test]
+    fn asking_for_auto_adds_one_field_and_the_default_request_is_byte_for_byte_unchanged() {
+        use prost::Message as _;
+        for (resume, fork) in [
+            (None, false),
+            (Some("claude-id".to_string()), false),
+            (Some("claude-id".to_string()), true),
+        ] {
+            let build = |cli_mode| {
+                build_create_request_loading(
+                    "/p".into(),
+                    StreamingPreference::Partial,
+                    resume.clone(),
+                    fork,
+                    true,
+                    true,
+                    cli_mode,
+                )
+            };
+            let default = build(crate::RequestedCliMode::Default);
+            let auto = build(crate::RequestedCliMode::Auto);
+            let default_policy = default.policy.clone().expect("a policy is always sent");
+            let auto_policy = auto.policy.clone().expect("a policy is always sent");
+            assert_eq!(
+                default_policy.cli_permission_mode,
+                CliPermissionMode::Unspecified as i32
+            );
+            assert_eq!(auto_policy.cli_permission_mode, CliPermissionMode::Auto as i32);
+            assert_eq!(auto_policy.permissions, ProtoPermissionMode::Interactive as i32);
+            assert!(!auto_policy.permission_mode_switchable);
+            assert!(!default.await_account_identity && !auto.await_account_identity);
+
+            // Unset again, the AUTO request is the default one exactly.
+            let mut reset = auto.clone();
+            reset.policy.as_mut().unwrap().cli_permission_mode = CliPermissionMode::Unspecified as i32;
+            assert_eq!(reset.encode_to_vec(), default.encode_to_vec());
+            // And the default policy carries no tag 11 at all: proto3 leaves a zero off the wire, so
+            // its bytes are what a request built before the field existed encodes to. AUTO adds the
+            // field's two bytes (key 0x58, value 2), and nothing else.
+            assert_eq!(
+                default_policy.encoded_len() + 2,
+                auto_policy.encoded_len(),
+                "{resume:?} {fork}"
+            );
+            assert_eq!(
+                &auto_policy.encode_to_vec()[default_policy.encoded_len()..],
+                &[0x58, 0x02],
+                "tag 11 comes last, so the AUTO policy is the default one plus these two bytes"
+            );
+        }
+    }
+
+    /// A deferral is sent only by a provider whose sessions asked for auto, and then as `defer` with
+    /// `allow` false and no reason; the other two answers are what they always were, `defer` false.
+    #[test]
+    fn a_deferral_is_sent_only_where_auto_was_asked_for() {
+        let request = |decision| ResolvePermissionRequest {
+            session_id: "s".into(),
+            permission_id: "p".into(),
+            decision,
+        };
+        let auto = capabilities_from_handshake(&real_handshake_today());
+        let wire = resolve_request_for(&auto, request(crate::PermissionDecision::Defer)).expect("sent");
+        assert!(wire.defer && !wire.allow && wire.reason.is_empty());
+
+        let mut older = real_handshake_today();
+        older.capabilities.retain(|c| c != CAP_PERMISSION_DEFER);
+        let without = capabilities_from_handshake(&older);
+        assert!(matches!(
+            resolve_request_for(&without, request(crate::PermissionDecision::Defer)),
+            Err(ProviderError::UnsupportedCapability("permission_defer"))
+        ));
+
+        for caps in [auto, without] {
+            let allow = resolve_request_for(&caps, request(crate::PermissionDecision::Allow)).unwrap();
+            assert!(allow.allow && !allow.defer);
+            let deny = resolve_request_for(
+                &caps,
+                request(crate::PermissionDecision::Deny {
+                    reason: Some("no".into()),
+                }),
+            )
+            .unwrap();
+            assert!(!deny.allow && !deny.defer && deny.reason == "no");
+        }
     }
 
     #[test]
