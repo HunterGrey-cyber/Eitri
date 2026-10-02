@@ -312,6 +312,153 @@ fn the_permission_and_send_paths_never_read_review_state() {
     }
 }
 
+/// Every `.rs` file under `dir` (relative to the crate), with its relative path.
+fn rust_files(dir: &str) -> Vec<(String, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+    let mut found = Vec::new();
+    let mut pending = vec![root];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap_or_else(|e| panic!("{}: {e}", next.display())) {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                found.push((path.display().to_string(), code_only(&text)));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// `code` with every one of `bodies` (slices of `code`, as `functions` returns them) blanked.
+fn without(code: &str, bodies: &[&str]) -> String {
+    let mut out = code.to_owned();
+    for body in bodies {
+        let start = body.as_ptr() as usize - code.as_ptr() as usize;
+        out.replace_range(start..start + body.len(), &" ".repeat(body.len()));
+    }
+    out
+}
+
+/// The names of what `body` calls: every identifier directly followed by `(`.
+fn called(body: &str) -> std::collections::BTreeSet<String> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut calls = std::collections::BTreeSet::new();
+    let chars: Vec<char> = body.chars().collect();
+    for (at, c) in chars.iter().enumerate() {
+        if *c != '(' {
+            continue;
+        }
+        let end = at;
+        let mut start = end;
+        while start > 0 && ident(chars[start - 1]) {
+            start -= 1;
+        }
+        if start < end {
+            calls.insert(chars[start..end].iter().collect());
+        }
+    }
+    calls
+}
+
+/// The only message a review sends is the one the user confirmed with `s` and `y`, and it takes the
+/// ordinary queue and flush: nothing else in the review code sends, queues or flushes a turn.
+#[test]
+fn only_the_confirmed_review_send_reaches_the_send_path() {
+    const SEND_PATH: [&str; 3] = ["send_turn", "queue_message", "flush_queue"];
+    // The confirmed send's function in `flow.rs`: where the review flow hands the confirmed text to
+    // `TabSet::send_review`.
+    const CONFIRMED_SEND: &str = "confirmed_send";
+
+    let files = rust_files("src/turn_review");
+    assert!(
+        files.iter().any(|(path, _)| path.ends_with("turn_review/draft.rs")),
+        "the scan found no review sources"
+    );
+    for (path, code) in &files {
+        let code = if path.ends_with("turn_review/flow.rs") {
+            without(code, &functions(code, CONFIRMED_SEND))
+        } else {
+            code.clone()
+        };
+        for name in SEND_PATH {
+            assert!(
+                word_ends(&code, name).is_empty(),
+                "{path} reaches `{name}`; only flow.rs's `{CONFIRMED_SEND}` may send a review"
+            );
+        }
+    }
+
+    // `TabSet::send_review` queues and flushes, and does nothing else.
+    let tabs = read("src/tab_set.rs");
+    let bodies = functions(&tabs, "send_review");
+    assert_eq!(bodies.len(), 1, "TabSet::send_review not found");
+    let calls = called(bodies[0]);
+    assert_eq!(
+        calls.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["Ok", "flush_queue", "queue_message", "to_owned"],
+        "send_review calls only queue_message and flush_queue (and what shapes their arguments)"
+    );
+    for word in FORBIDDEN {
+        assert!(!bodies[0].contains(word), "send_review reads review state (`{word}`)");
+    }
+
+    // And nothing on the answer and ordinary send paths reaches it.
+    let panel = read("../shell/src/agent_panel.rs");
+    let mut regions: Vec<&str> = Vec::new();
+    for name in [
+        "answer_card",
+        "confirm_bypass",
+        "flush_queue",
+        "send_now",
+        "queue_message",
+    ] {
+        regions.extend(functions(&tabs, name));
+    }
+    for name in ["answer_permission_response", "apply_confirm_bypass", "send_first_turn"] {
+        regions.extend(functions(&panel, name));
+    }
+    for variant in [
+        "SendMessage",
+        "SendNow",
+        "QueueMessage",
+        "PermissionResponse",
+        "ConfirmBypass",
+    ] {
+        regions.extend(arms(&panel, &format!("InboundMessage::{variant}")));
+    }
+    regions.extend(arms(&tabs, "RevisedDelivery::Resync"));
+    assert!(regions.len() >= 12, "the answer and send paths were not all found");
+    for region in regions {
+        assert!(
+            word_ends(region, "send_review").is_empty(),
+            "an answer or ordinary send path reaches send_review"
+        );
+    }
+}
+
+/// The scan's own helpers: an exception is by function name, and a call is found by its name.
+#[test]
+fn the_send_scan_blanks_one_function_and_reads_calls() {
+    let code = code_only("fn confirmed_send() { send_turn(); }\nfn other() { send_turn(); }\n");
+    let body = functions(&code, "confirmed_send");
+    assert_eq!(body.len(), 1);
+    let rest = without(&code, &body);
+    assert_eq!(
+        word_ends(&rest, "send_turn").len(),
+        1,
+        "only the other function still calls it"
+    );
+    assert_eq!(
+        called("{ self.queue_message(a, b.to_owned()); Ok(x) }")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["Ok", "queue_message", "to_owned"]
+    );
+}
+
 /// The scan itself: it sees a use however the item is formatted, and ignores comments and strings.
 #[test]
 fn the_scan_finds_a_use_and_ignores_comments_and_strings() {

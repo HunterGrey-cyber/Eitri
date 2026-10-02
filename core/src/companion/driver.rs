@@ -65,16 +65,25 @@ enum WorkerMsg {
     },
 }
 
-/// The two things a carried-out effect asks of a connection.
+/// What a carried-out effect and the driver's callers ask of a connection.
 pub(crate) trait Wire {
     fn exec_lua(&self, code: &str, args: Vec<Value>);
+    /// Like [`Wire::exec_lua`], keeping the answer for the caller.
+    fn exec_lua_answered(&self, code: &'static str, args: Vec<Value>) -> Pending;
     fn close_when_flushed(&self);
 }
 
 impl Wire for NvimLink {
     fn exec_lua(&self, code: &str, args: Vec<Value>) {
         // The answer is of no use to the caller; a link that has ended answers `Closed` to nobody.
+        // editor-rpc-scan: forwards a caller's constant
         drop(NvimLink::exec_lua(self, code, args));
+    }
+
+    fn exec_lua_answered(&self, code: &'static str, args: Vec<Value>) -> Pending {
+        // The inherent method, not this one: the path names the type's own `exec_lua`.
+        // editor-rpc-scan: forwards a caller's constant
+        NvimLink::exec_lua(self, code, args)
     }
 
     fn close_when_flushed(&self) {
@@ -158,6 +167,9 @@ pub(crate) fn get_mode_blocking(answer: &Value) -> Option<bool> {
         .and_then(|(_, value)| value.as_bool())
 }
 
+/// Why a call cannot go to an editor this panel holds no live connection to.
+const NOT_CONNECTED: &str = "the editor is not connected to this panel";
+
 /// `live_peer` (the pid of the live connection's peer) as the editor's pid, only in the attached
 /// state: in any other the connection is not yet, or no longer, the editor the panel follows.
 fn attached_peer(state: &LinkState, live_peer: Option<u32>) -> Option<u32> {
@@ -181,9 +193,7 @@ pub fn not_attached_why(state: &LinkState) -> Option<&'static str> {
     match state {
         LinkState::Attached { .. } => None,
         LinkState::Connecting { .. } | LinkState::Attaching { .. } => Some("the editor is still attaching"),
-        LinkState::NoEditor | LinkState::Detached { .. } | LinkState::Failed { .. } => {
-            Some("the editor is not connected to this panel")
-        }
+        LinkState::NoEditor | LinkState::Detached { .. } | LinkState::Failed { .. } => Some(NOT_CONNECTED),
     }
 }
 
@@ -294,6 +304,7 @@ impl LinkDriver {
 
     /// Run Lua in the attached nvim. The answer is not waited for. `Err` says why not.
     pub fn exec_lua(&mut self, code: &str, args: Vec<Value>) -> Result<(), String> {
+        // editor-rpc-scan: forwards a caller's constant
         self.exec_lua_for(None, code, args)
     }
 
@@ -308,11 +319,39 @@ impl LinkDriver {
         }
         match &self.live {
             Some(live) if live.link.is_alive() => {
+                // editor-rpc-scan: forwards a caller's constant
                 Wire::exec_lua(&live.link, code, args);
                 Ok(())
             }
-            _ => Err("the editor is not connected to this panel".to_owned()),
+            _ => Err(NOT_CONNECTED.to_owned()),
         }
+    }
+
+    /// Run Lua in the attached nvim and keep its answer. Refused, with the reason as
+    /// [`RpcError::Unavailable`], on the same grounds as [`LinkDriver::exec_lua_for`]; no install
+    /// part is needed, since code sent this way brings what it needs with it.
+    pub fn exec_lua_answered(&mut self, code: &'static str, args: Vec<Value>) -> Pending {
+        if let Some(why) = not_attached_why(self.attacher.state()) {
+            return Pending::failed(RpcError::Unavailable(why.to_owned()));
+        }
+        match &self.live {
+            Some(live) if live.link.is_alive() => {
+                // editor-rpc-scan: forwards a caller's constant
+                Wire::exec_lua_answered(&live.link, code, args)
+            }
+            _ => Pending::failed(RpcError::Unavailable(NOT_CONNECTED.to_owned())),
+        }
+    }
+
+    /// Which connection is the attached one: a new number with every connect, retarget and
+    /// re-attach, so an answer from one nvim is never taken for the next one's. `None` unless
+    /// attached over a link that is still up.
+    pub fn generation(&self) -> Option<u64> {
+        let attached = matches!(self.attacher.state(), LinkState::Attached { .. });
+        self.live
+            .as_ref()
+            .filter(|live| attached && live.gen == self.attacher.gen() && live.link.is_alive())
+            .map(|live| live.gen)
     }
 
     /// Lets go of the editor: the teardown is queued, then the connection closes once it is
@@ -496,7 +535,7 @@ impl LinkDriver {
             },
             Err(RpcError::Nvim(why)) => self.feed(AttachEvent::InstallFailed { gen, why }, tick),
             // The connection ended first; its own `Closed` says what the band says.
-            Err(RpcError::Closed | RpcError::Encode(_)) => {}
+            Err(RpcError::Closed | RpcError::Encode(_) | RpcError::Unavailable(_)) => {}
         }
     }
 
@@ -604,6 +643,11 @@ mod tests {
         fn exec_lua(&self, code: &str, args: Vec<Value>) {
             let which = if code == TEARDOWN_LUA { "TEARDOWN_LUA" } else { "other" };
             self.0.borrow_mut().push(format!("exec_lua({which},{args:?})"));
+        }
+
+        fn exec_lua_answered(&self, _code: &'static str, args: Vec<Value>) -> Pending {
+            self.0.borrow_mut().push(format!("exec_lua_answered({args:?})"));
+            Pending::failed(RpcError::Closed)
         }
 
         fn close_when_flushed(&self) {
@@ -812,6 +856,150 @@ mod tests {
             "{:?}",
             driver.state()
         );
+    }
+
+    /// A link over one half of a socket pair, and the other half standing in for nvim.
+    fn fake_link() -> (
+        NvimLink,
+        std::os::unix::net::UnixStream,
+        std::io::BufReader<std::os::unix::net::UnixStream>,
+    ) {
+        let (ours, fake) = std::os::unix::net::UnixStream::pair().unwrap();
+        fake.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let reader = std::io::BufReader::new(fake.try_clone().unwrap());
+        let (link, _events) = NvimLink::from_stream(ours, 3);
+        (link, fake, reader)
+    }
+
+    /// The next request the link wrote: `(id, method, params)`.
+    fn read_request(reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>) -> (u64, String, Vec<Value>) {
+        let value = rmpv::decode::read_value(reader).expect("a request from the link");
+        let items = value.as_array().expect("an array").clone();
+        (
+            items[1].as_u64().unwrap(),
+            items[2].as_str().unwrap().to_owned(),
+            items[3].as_array().unwrap().clone(),
+        )
+    }
+
+    fn write_value(fake: &mut std::os::unix::net::UnixStream, value: Value) {
+        use std::io::Write;
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &value).unwrap();
+        fake.write_all(&bytes).unwrap();
+    }
+
+    /// A driver aimed at `/r/a` whose generation 1 is attached over `link`.
+    fn attached_over(link: NvimLink) -> LinkDriver {
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        driver.attacher.handle(Ev::Connected { gen: 1, channel: 3 });
+        driver.attacher.handle(Ev::Installed {
+            gen: 1,
+            report: report(),
+        });
+        driver.live = Some(Live {
+            gen: 1,
+            link,
+            channel: 3,
+        });
+        driver
+    }
+
+    fn wait_dead(link: &NvimLink) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while link.is_alive() {
+            assert!(Instant::now() < deadline, "the link never saw its peer go");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn unavailable(why: &str) -> Option<Result<Value, RpcError>> {
+        Some(Err(RpcError::Unavailable(why.to_owned())))
+    }
+
+    #[test]
+    fn exec_lua_answered_is_refused_while_detached() {
+        let mut driver = LinkDriver::new(None, Sockets::default());
+        assert_eq!(
+            driver.exec_lua_answered("return 1", vec![]).try_take(),
+            unavailable("the editor is not connected to this panel")
+        );
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        assert_eq!(
+            driver.exec_lua_answered("return 1", vec![]).try_take(),
+            unavailable("the editor is still attaching")
+        );
+
+        let (link, fake, reader) = fake_link();
+        let mut driver = attached_over(link.clone());
+        drop((fake, reader));
+        wait_dead(&link);
+        assert_eq!(
+            driver.exec_lua_answered("return 1", vec![]).try_take(),
+            unavailable("the editor is not connected to this panel"),
+            "attached, but the link is gone"
+        );
+    }
+
+    #[test]
+    fn exec_lua_answered_returns_the_links_answer() {
+        let (link, mut fake, mut reader) = fake_link();
+        let mut driver = attached_over(link);
+        let pending = driver.exec_lua_answered("return ...", vec![Value::from(7)]);
+        let (id, method, params) = read_request(&mut reader);
+        assert_eq!(method, "nvim_exec_lua");
+        assert_eq!(
+            params,
+            vec![Value::from("return ..."), Value::Array(vec![Value::from(7)])]
+        );
+        assert_eq!(pending.try_take(), None, "not answered yet");
+        write_value(
+            &mut fake,
+            Value::Array(vec![Value::from(1), Value::from(id), Value::Nil, Value::from(7)]),
+        );
+        assert_eq!(pending.wait(Duration::from_secs(2)), Some(Ok(Value::from(7))));
+    }
+
+    #[test]
+    fn generation_follows_attach() {
+        assert_eq!(
+            LinkDriver::new(None, Sockets::default()).generation(),
+            None,
+            "no editor"
+        );
+        assert_eq!(
+            LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default()).generation(),
+            None,
+            "still connecting"
+        );
+
+        let (link, _fake, _reader) = fake_link();
+        let mut driver = attached_over(link);
+        assert_eq!(driver.generation(), Some(1));
+
+        driver.attacher.handle(Ev::Attach(PathBuf::from("/r/b")));
+        assert_eq!(
+            driver.generation(),
+            None,
+            "retargeted: the old link is not the editor any more"
+        );
+
+        let (link, fake, reader) = fake_link();
+        driver.attacher.handle(Ev::Connected { gen: 2, channel: 4 });
+        driver.attacher.handle(Ev::Installed {
+            gen: 2,
+            report: report(),
+        });
+        driver.live = Some(Live {
+            gen: 2,
+            link: link.clone(),
+            channel: 4,
+        });
+        assert_eq!(driver.generation(), Some(2));
+
+        drop((fake, reader));
+        wait_dead(&link);
+        assert_eq!(driver.generation(), None, "a dead link is no editor");
     }
 
     #[test]

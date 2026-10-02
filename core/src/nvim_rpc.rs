@@ -33,6 +33,8 @@ pub enum RpcError {
     Closed,
     /// The request could not be encoded.
     Encode(String),
+    /// There was no editor to send the call to; the text says why.
+    Unavailable(String),
 }
 
 impl fmt::Display for RpcError {
@@ -41,6 +43,7 @@ impl fmt::Display for RpcError {
             RpcError::Nvim(message) => f.write_str(message),
             RpcError::Closed => f.write_str("the connection to nvim closed"),
             RpcError::Encode(error) => write!(f, "could not encode the request: {error}"),
+            RpcError::Unavailable(why) => write!(f, "no editor to ask: {why}"),
         }
     }
 }
@@ -83,10 +86,29 @@ impl Pending {
         }
     }
 
-    fn failed(error: RpcError) -> Pending {
+    /// A call that never went out: its answer is `error`, already here.
+    pub fn failed(error: RpcError) -> Pending {
         let (tx, rx) = mpsc::channel();
         let _ = tx.send(Err(error));
         Pending(rx)
+    }
+
+    /// A `Pending` whose answer some other code will give, through the [`Answer`]. An `Answer`
+    /// dropped without sending reads as [`RpcError::Closed`], the same as a connection that ended.
+    pub fn pair() -> (Answer, Pending) {
+        let (tx, rx) = mpsc::channel();
+        (Answer(tx), Pending(rx))
+    }
+}
+
+/// The sending half of [`Pending::pair`]: what a transport other than [`NvimLink`] answers through.
+/// It may be moved to another thread, so the answer can come from wherever the call ran.
+pub struct Answer(Sender<Reply>);
+
+impl Answer {
+    /// Deliver the answer. A `Pending` that is already gone is no error: nobody wanted it any more.
+    pub fn send(self, reply: Result<Value, RpcError>) {
+        let _ = self.0.send(reply);
     }
 }
 
@@ -130,7 +152,9 @@ pub struct NvimLink(Arc<LinkInner>);
 
 const _: fn() = || {
     fn is_send_sync<T: Send + Sync>() {}
+    fn is_send<T: Send>() {}
     is_send_sync::<NvimLink>();
+    is_send::<Answer>();
 };
 
 /// A poisoned lock still holds a consistent map or queue here (nothing panics mid-update), and a
@@ -183,7 +207,7 @@ const HANDSHAKE_ID: u64 = 0;
 /// cap can still decode to some hundreds of MiB, and a larger cap would scale that up with it. The
 /// largest frame this link legitimately reads, the `nvim_get_api_info` answer, is tens of KiB; it
 /// never carries buffer text.
-const MAX_FRAME: u64 = 16 << 20;
+pub(crate) const MAX_FRAME: u64 = 16 << 20;
 
 /// One frame's read: hands the decoder at most [`MAX_FRAME`] bytes, then fails with
 /// `InvalidData` instead of reporting an end of file, so the link says why it ended. Build one per
@@ -340,7 +364,7 @@ impl NvimLink {
 
     /// A link over an already connected socket; the other end plays nvim.
     #[cfg(test)]
-    fn from_stream(stream: UnixStream, channel_id: u64) -> (NvimLink, Receiver<LinkEvent>) {
+    pub(crate) fn from_stream(stream: UnixStream, channel_id: u64) -> (NvimLink, Receiver<LinkEvent>) {
         let (events_tx, events_rx) = mpsc::channel();
         let source = Source { stream, deadline: None };
         let peer_pid = crate::panel_control::peer_pid(&source.stream);
@@ -637,6 +661,31 @@ mod tests {
 
     fn response(id: u64, err: Value, result: Value) -> Value {
         Value::Array(vec![Value::from(1), Value::from(id), err, result])
+    }
+
+    #[test]
+    fn a_pair_delivers_once_then_closed() {
+        let (answer, pending) = Pending::pair();
+        assert_eq!(pending.try_take(), None, "nothing sent yet");
+        answer.send(Ok(Value::from(4)));
+        assert_eq!(pending.try_take(), Some(Ok(Value::from(4))));
+        assert_eq!(pending.try_take(), Some(Err(RpcError::Closed)), "taken once");
+
+        let (answer, pending) = Pending::pair();
+        drop(answer);
+        assert_eq!(pending.try_take(), Some(Err(RpcError::Closed)), "dropped unsent");
+
+        let (answer, pending) = Pending::pair();
+        drop(pending);
+        answer.send(Ok(Value::Nil));
+    }
+
+    #[test]
+    fn a_failed_pending_answers_its_reason() {
+        let pending = Pending::failed(RpcError::Unavailable("x".to_owned()));
+        let reply = pending.try_take();
+        assert_eq!(reply, Some(Err(RpcError::Unavailable("x".to_owned()))));
+        assert_eq!(RpcError::Unavailable("x".to_owned()).to_string(), "no editor to ask: x");
     }
 
     #[test]

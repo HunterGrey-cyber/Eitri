@@ -21,6 +21,10 @@ skia-safe = { version = "0.153.3", features = ["gl"] }
 # should never silently change what a `cargo build` here actually compiles against. Bump the
 # `rev` deliberately (and re-verify) when the fork gains something this crate needs.
 neovide = { path = "../neovide" }
+# msgpack values: `NeovideEditorPane::exec_lua` takes its arguments and hands back its answer as
+# `rmpv::Value`, the type nvim-rs speaks (the fork already links this same version, so nothing new
+# is built or shipped). `nvim_child`'s ending tests use it too, to talk to nvim over a pipe.
+rmpv = "1"
 
 # `nvim_rpc`'s real-nvim test: a request and its watch made from plain threads over an nvim-rs
 # connection that lives on a tokio runtime, as the fork's does. Both crates are already in the tree
@@ -31,9 +35,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "process"] }
 # `tests/no_force_quit.rs` reads `cargo metadata` to find the pinned fork's source. Already in
 # Cargo.lock through `eitri-core`, so nothing new is downloaded.
 serde_json = "1"
-# msgpack for `nvim_child`'s ending tests, which talk to nvim over a pipe they can close. In
-# Cargo.lock through the fork already.
-rmpv = "1"
 # `tests/fd_watch_*.rs` need only GLib's main context, no display: they name the crate directly so the
 # display-guard scan (`shell/tests/own_display_scan.rs`) does not read them as opening one. The
 # version gtk4 0.11.4 already resolves.

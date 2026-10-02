@@ -1,6 +1,21 @@
 import { isPlainAnswerKey } from "./keymap";
 import type { KeyLike } from "./keymap";
-import type { ReviewDiffEnvelope, ReviewEnvelope, ReviewFile, ReviewHunk, ReviewScope, ReviewTurn, TabId } from "./types";
+import type {
+  ReviewComment,
+  ReviewDiffEnvelope,
+  ReviewDraft,
+  ReviewDraftEnvelope,
+  ReviewEnvelope,
+  ReviewFile,
+  ReviewHunk,
+  ReviewNotOnDisk,
+  ReviewRecoveryEntry,
+  ReviewRevert,
+  ReviewScope,
+  ReviewSendPreviewEnvelope,
+  ReviewTurn,
+  TabId,
+} from "./types";
 
 /** The turn review overlay's state and keys, with no DOM and no React: a pure reducer over what the shell
  *  sent and what was typed, so every rule is checkable without rendering. `App.tsx` owns the one
@@ -26,6 +41,16 @@ export type ReviewAction =
   | { kind: "scope" }
   | { kind: "open" }
   | { kind: "copy" }
+  | { kind: "revert" }
+  | { kind: "undo" }
+  | { kind: "comment" }
+  | { kind: "send" }
+  /** A one-line prompt's answer: `y`/`n` on a question, or `Escape` on any prompt (`cancel`). Only
+   *  `resolveReviewKey` with a prompt open produces it. */
+  | { kind: "answer"; answer: "yes" | "no" | "cancel" }
+  /** Enter in the comment input. The input is a real `<input>` that stops its own Enter, so this is
+   *  not a key `resolveReviewKey` returns: the overlay hands it over. */
+  | { kind: "accept" }
   /** The first `g` of `gg`: the caller remembers it and passes it back as `pendingG` for the next key. */
   | { kind: "pending" };
 
@@ -35,8 +60,11 @@ export type ReviewAction =
  *
  *  Only a plain key counts: Ctrl, Alt, Meta, Super/Hyper or AltGraph held make some other chord, which does
  *  nothing here -- except `Ctrl+d`/`Ctrl+u`, named first on their exact modifier set. */
-export function resolveReviewKey(event: KeyLike, pendingG: boolean): ReviewAction | null {
+export function resolveReviewKey(event: KeyLike, pendingG: boolean, prompt: ReviewPrompt | null = null): ReviewAction | null {
   if (event.isComposing || event.keyCode === 229) return null;
+  // A prompt owns the keys: the overlay's own table is not read while one is open, so `x` then `u` cannot
+  // run a second command under a question that has not been answered.
+  if (prompt !== null) return resolvePromptKey(event, prompt);
   if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && (event.key === "d" || event.key === "u")) {
     return pendingG ? null : { kind: "half-page", delta: event.key === "d" ? 1 : -1 };
   }
@@ -62,6 +90,14 @@ export function resolveReviewKey(event: KeyLike, pendingG: boolean): ReviewActio
       return { kind: "open" };
     case "y":
       return { kind: "copy" };
+    case "x":
+      return { kind: "revert" };
+    case "u":
+      return { kind: "undo" };
+    case "i":
+      return { kind: "comment" };
+    case "s":
+      return { kind: "send" };
     case "q":
     case "c":
     case "Escape":
@@ -71,11 +107,29 @@ export function resolveReviewKey(event: KeyLike, pendingG: boolean): ReviewActio
   }
 }
 
+/** What a key means while a prompt is open. A question takes `y`, `n` and `Escape` and nothing else; the
+ *  comment input is a text box that takes its own keys, so only an `Escape` that reached the overlay (focus
+ *  was somewhere else) means anything. A modified key is some other chord and does nothing. */
+function resolvePromptKey(event: KeyLike, prompt: ReviewPrompt): ReviewAction | null {
+  if (!isPlainAnswerKey(event)) return null;
+  if (event.key === "Escape") return { kind: "answer", answer: "cancel" };
+  if (prompt.kind === "comment") return null;
+  if (event.key === "y") return { kind: "answer", answer: "yes" };
+  if (event.key === "n") return { kind: "answer", answer: "no" };
+  return null;
+}
+
 /** One thing a key can land on. The names are the overlay's own and are never `row`: the session's rows
  *  are `data-nav-stop="row"`, still in the DOM under the overlay, and a second set of `row`s would be
  *  counted by `rowIndexOf` and the cursor's `querySelectorAll`. `group` is the folded "changed outside
  *  this tab's edits" header, a stop so that `Enter` can reach it. */
-export type ReviewStop = { kind: "file"; path: string } | { kind: "hunk"; path: string; id: number } | { kind: "group" };
+export type ReviewStop =
+  | { kind: "file"; path: string }
+  | { kind: "hunk"; path: string; id: number }
+  | { kind: "comment"; path: string; id: number }
+  /** An interrupted revert the journal still holds; `id` is the journal entry's. */
+  | { kind: "recovery"; id: string }
+  | { kind: "group" };
 
 export function stopKey(stop: ReviewStop): string {
   switch (stop.kind) {
@@ -85,6 +139,36 @@ export function stopKey(stop: ReviewStop): string {
       return `file:${stop.path}`;
     case "hunk":
       return `hunk:${stop.path}:${stop.id}`;
+    case "comment":
+      return `comment:${stop.path}:${stop.id}`;
+    case "recovery":
+      return `recovery:${stop.id}`;
+  }
+}
+
+/** What a one-line prompt is asking, kept in the state so a key means what the question says. */
+export type ReviewPrompt =
+  /** `x` on a file row: whole-file reverts ask first. `turn` is the number the sentence names. */
+  | { kind: "revert-file"; path: string; turn: number; scope: ReviewScope; shownTurn: number }
+  | { kind: "recover"; entry: string; path: string }
+  /** `i` on a hunk: the one-line input. `from`/`to` are the new-side lines it comments on. */
+  | { kind: "comment"; path: string; turn: number; scope: ReviewScope; from: number; to: number; text: string }
+  /** `s`: `preview` is `null` until the shell's `review_send_preview` for `requestId` arrives. */
+  | { kind: "send"; requestId: string; preview: ReviewPreview | null };
+
+export type ReviewPreview = { digest: string; text: string; notOnDisk: ReviewNotOnDisk[]; queued: boolean };
+
+/** The words of a question prompt (the comment input draws itself, as a text box). */
+export function promptText(prompt: ReviewPrompt): string {
+  switch (prompt.kind) {
+    case "revert-file":
+      return `revert the whole file ${prompt.path} to before turn ${prompt.turn}? y/n`;
+    case "recover":
+      return `restore ${prompt.path} to its bytes from before the interrupted revert? the current bytes are kept in the review store. y restores · n forgets this`;
+    case "comment":
+      return `comment on ${prompt.path}:${prompt.from === prompt.to ? prompt.from : `${prompt.from}-${prompt.to}`}`;
+    case "send":
+      return prompt.preview === null ? "preparing what would be sent…" : prompt.preview.queued ? "y queues it behind the running turn · n cancels" : "y sends · n cancels";
   }
 }
 
@@ -116,11 +200,39 @@ export type ReviewState = {
   diffs: Record<string, DiffEntry>;
   /** A `g` is waiting for its second key. */
   pendingG: boolean;
+  /** The tab's draft, from the `review` and `review_draft` envelopes only: nothing is kept across a reload. */
+  draft: ReviewDraft;
+  /** Interrupted reverts, from the journal (`review_recovery`); they are the project's, so they are held
+   *  whether or not an overview has arrived. */
+  recovery: ReviewRecoveryEntry[];
+  /** The question or input the overlay is waiting on; it owns the keys. */
+  prompt: ReviewPrompt | null;
+  /** One line about what a key just did or why it did nothing (`nothing to undo`, a refusal's text). Any
+   *  next key clears it. */
+  status: string | null;
 };
 
+export const EMPTY_DRAFT: ReviewDraft = { comments: [], reverts: [], canUndo: false };
+
 /** A fresh overlay asking for the tab's latest turn. */
-export function openReview(tab: TabId, requestId: string): ReviewState {
-  return { tab, scope: "turn", turn: "latest", requestId, envelope: null, error: null, cursor: null, expanded: [], groupOpen: false, diffs: {}, pendingG: false };
+export function openReview(tab: TabId, requestId: string, recovery: ReviewRecoveryEntry[] = []): ReviewState {
+  return {
+    tab,
+    scope: "turn",
+    turn: "latest",
+    requestId,
+    envelope: null,
+    error: null,
+    cursor: null,
+    expanded: [],
+    groupOpen: false,
+    diffs: {},
+    pendingG: false,
+    draft: EMPTY_DRAFT,
+    recovery,
+    prompt: null,
+    status: null,
+  };
 }
 
 /** The turn record the overview is about (turn scope), or `null`. */
@@ -149,19 +261,100 @@ export function hasPatch(file: ReviewFile): boolean {
   return !file.binary && !file.tooLarge && !file.nested;
 }
 
-/** The stops the cursor can be on, top to bottom: each named file, its open hunks under it; then the group
- *  header (only when there is something in it) and, once opened, its files. */
+/** The new-side line range a hunk covers, context included, or `null` for a hunk with no line on the new
+ *  side (everything in it was deleted). */
+export function hunkNewRange(hunk: ReviewHunk): [number, number] | null {
+  let lo: number | null = null;
+  let hi: number | null = null;
+  for (const line of hunk.lines) {
+    if (line.newNo === null) continue;
+    lo = lo === null ? line.newNo : Math.min(lo, line.newNo);
+    hi = hi === null ? line.newNo : Math.max(hi, line.newNo);
+  }
+  return lo === null || hi === null ? null : [lo, hi];
+}
+
+/** The new-side lines a comment on `hunk` is about: the added lines' first and last number. A hunk that only
+ *  deletes has none, so it is the context line right after the deleted ones, or at the end of the file the
+ *  one before them. `null` when the hunk has no line on the new side at all. */
+export function commentLines(hunk: ReviewHunk): [number, number] | null {
+  const added = hunk.lines.filter((l) => l.kind === "added" && l.newNo !== null).map((l) => l.newNo as number);
+  if (added.length > 0) return [Math.min(...added), Math.max(...added)];
+  const firstRemoved = hunk.lines.findIndex((l) => l.kind === "removed");
+  const context = (l: ReviewHunk["lines"][number]) => l.kind === "context" && l.newNo !== null;
+  for (let i = Math.max(firstRemoved, 0); i < hunk.lines.length; i++) if (context(hunk.lines[i])) return [hunk.lines[i].newNo as number, hunk.lines[i].newNo as number];
+  for (let i = (firstRemoved < 0 ? hunk.lines.length : firstRemoved) - 1; i >= 0; i--) if (context(hunk.lines[i])) return [hunk.lines[i].newNo as number, hunk.lines[i].newNo as number];
+  return null;
+}
+
+/** The loaded hunks of a file, or `null` while there are none to draw. */
+function loadedHunks(state: ReviewState, path: string): ReviewHunk[] | null {
+  const entry = state.diffs[path];
+  return entry?.status === "ready" ? entry.diff.hunks : null;
+}
+
+/** The draft's comments that sit under `hunk`: this turn's, on this file, whose first line is on the
+ *  hunk's new side. Ordered by line, then by when they were made. */
+export function commentsUnder(state: ReviewState, path: string, hunk: ReviewHunk): ReviewComment[] {
+  const envelope = state.envelope;
+  const range = hunkNewRange(hunk);
+  if (envelope === null || range === null) return [];
+  return state.draft.comments
+    .filter((c) => c.path === path && c.turn === envelope.current && c.from >= range[0] && c.from <= range[1])
+    .sort((a, b) => a.from - b.from || a.id - b.id);
+}
+
+/** The draft's newest revert of `hunk` (matched by turn, path, hunk id and header), or of a whole file when
+ *  `hunk` is `null`; `null` when there is none. The newest wins: a hunk reverted, undone and reverted again is
+ *  reverted. */
+export function revertOf(state: ReviewState, path: string, hunk: ReviewHunk | null): ReviewRevert | null {
+  const envelope = state.envelope;
+  if (envelope === null) return null;
+  let found: ReviewRevert | null = null;
+  for (const r of state.draft.reverts) {
+    if (r.turn !== envelope.current || r.path !== path) continue;
+    const same = hunk === null ? r.hunk === null : r.hunk === hunk.id && r.header === hunk.header;
+    if (same && (found === null || r.id > found.id)) found = r;
+  }
+  return found;
+}
+
+/** `reverted`, or `reverted, undone` once the change is back; `null` for a hunk or file not reverted. */
+export function revertMark(revert: ReviewRevert | null): string | null {
+  return revert === null ? null : revert.undone ? "reverted, undone" : "reverted";
+}
+
+/** The footer line about the draft, or `null` when it holds nothing. */
+export function draftLine(draft: ReviewDraft): string | null {
+  const c = draft.comments.length;
+  const r = draft.reverts.length;
+  if (c === 0 && r === 0) return null;
+  return `draft: ${c} ${c === 1 ? "comment" : "comments"}, ${r} ${r === 1 ? "revert" : "reverts"} · s sends them to the agent`;
+}
+
+/** The overlay's key line: what the keys are, in the order the design lists them. */
+export const REVIEW_KEY_LINE = "j/k move · Enter open · x revert · u undo · i comment · s send · [ ] turn · o editor · q close";
+
+/** What `x` on a hunk of a binary file says: nothing to revert piecemeal. */
+export const BINARY_HUNK_NOTE = "binary files revert only whole; x on the file row";
+
+/** The stops the cursor can be on, top to bottom: the interrupted reverts first (they are the project's, not
+ *  the turn's); then each named file with its open hunks under it and each hunk's comments under that; then
+ *  the group header (only when there is something in it) and, once opened, its files. */
 export function reviewStops(state: ReviewState): ReviewStop[] {
   const envelope = state.envelope;
-  if (envelope === null) return [];
+  const stops: ReviewStop[] = state.recovery.map((r) => ({ kind: "recovery", id: r.id }));
+  if (envelope === null) return stops;
   const { named, unnamed } = splitFiles(envelope);
-  const stops: ReviewStop[] = [];
   const addFile = (file: ReviewFile) => {
     stops.push({ kind: "file", path: file.path });
     if (!state.expanded.includes(file.path)) return;
-    const entry = state.diffs[file.path];
-    if (entry?.status !== "ready" || entry.diff.hunks === null) return;
-    for (const hunk of entry.diff.hunks) stops.push({ kind: "hunk", path: file.path, id: hunk.id });
+    const hunks = loadedHunks(state, file.path);
+    if (hunks === null) return;
+    for (const hunk of hunks) {
+      stops.push({ kind: "hunk", path: file.path, id: hunk.id });
+      for (const comment of commentsUnder(state, file.path, hunk)) stops.push({ kind: "comment", path: file.path, id: comment.id });
+    }
   };
   named.forEach(addFile);
   if (unnamed.length > 0) {
@@ -204,7 +397,62 @@ export function receiveReview(state: ReviewState, envelope: ReviewEnvelope): Rev
     groupOpen: false,
     diffs: {},
     pendingG: false,
+    draft: envelope.draft ?? EMPTY_DRAFT,
+    prompt: null,
+    status: null,
   };
+}
+
+/** Keeps the cursor near where it was when the stop it named is gone (a comment deleted, a recovery entry
+ *  resolved): the stop now at the old position, rather than the top of the overlay. */
+function keepCursorNear(before: ReviewState, after: ReviewState): ReviewState {
+  const was = reviewStops(before);
+  const now = reviewStops(after);
+  if (after.cursor === null || now.some((stop) => stopKey(stop) === after.cursor)) return after;
+  const index = Math.min(cursorIndex(before, was), now.length - 1);
+  return { ...after, cursor: index < 0 ? null : stopKey(now[index]) };
+}
+
+/** The tab's draft changed, asked for or not. A send preview on screen was made from the draft as it was, so
+ *  it is dropped: confirming it would send something other than what the user read. */
+export function receiveDraft(state: ReviewState, envelope: ReviewDraftEnvelope): ReviewState {
+  if (envelope.tab !== state.tab) return state;
+  const stale = state.prompt?.kind === "send";
+  const next: ReviewState = {
+    ...state,
+    draft: envelope.draft,
+    prompt: stale ? null : state.prompt,
+    status: stale ? "the draft changed; s shows what would be sent now" : state.status,
+  };
+  return keepCursorNear(state, next);
+}
+
+/** The shell's preview of what `s` would send. Taken only for the question that asked for it and only while
+ *  that question is still open; any other is stale. */
+export function receivePreview(state: ReviewState, envelope: ReviewSendPreviewEnvelope): ReviewState {
+  const prompt = state.prompt;
+  if (envelope.tab !== state.tab || prompt?.kind !== "send" || prompt.requestId !== envelope.requestId || prompt.preview !== null) return state;
+  const { digest, text, notOnDisk, queued } = envelope;
+  return { ...state, prompt: { ...prompt, preview: { digest, text, notOnDisk, queued } } };
+}
+
+/** The interrupted reverts the journal holds, as the shell lists them now. A question about one that is gone
+ *  is dropped. */
+export function receiveRecovery(state: ReviewState, entries: ReviewRecoveryEntry[]): ReviewState {
+  const prompt = state.prompt;
+  const gone = prompt?.kind === "recover" && !entries.some((e) => e.id === prompt.entry);
+  return keepCursorNear(state, { ...state, recovery: entries, prompt: gone ? null : state.prompt });
+}
+
+/** A command's outcome, in the shell's words, on the status line. `null` (an answer with nothing to say)
+ *  leaves the line as it is. */
+export function withStatus(state: ReviewState, text: string | null): ReviewState {
+  return text === null ? state : { ...state, status: text };
+}
+
+/** The comment input's text, as typed. Only while the comment input is the open prompt. */
+export function typeComment(state: ReviewState, text: string): ReviewState {
+  return state.prompt?.kind === "comment" ? { ...state, prompt: { ...state.prompt, text } } : state;
 }
 
 /** A patch arrived. Matched to its file by the request id it answers, so a reply for a turn the overlay has
@@ -244,8 +492,15 @@ export type ReviewEffect =
   | { kind: "close" }
   | { kind: "request"; requestId: string; turn: "latest" | number; scope: ReviewScope }
   | { kind: "request-diff"; requestId: string; turn: number; scope: ReviewScope; path: string }
-  | { kind: "open"; path: string; line: number | null }
-  | { kind: "copy"; text: string };
+  | { kind: "open"; path: string; line: number | null; turn: number; scope: ReviewScope }
+  | { kind: "copy"; text: string }
+  | { kind: "revert"; requestId: string; turn: number; scope: ReviewScope; path: string; target: "file" | { hunk: number; header: string } }
+  | { kind: "undo"; requestId: string }
+  | { kind: "comment-add"; requestId: string; turn: number; scope: ReviewScope; path: string; from: number; to: number; text: string }
+  | { kind: "comment-remove"; requestId: string; id: number }
+  /** `confirm: null` asks for the preview; a digest sends the draft that preview was made from. */
+  | { kind: "send"; requestId: string; confirm: string | null }
+  | { kind: "recover"; requestId: string; entry: string; answer: "restore" | "dismiss" };
 
 /** The first line of a hunk on the file's new side: the number `:edit +N` should land on. */
 export function hunkFirstNewLine(hunk: ReviewHunk): number | null {
@@ -254,12 +509,13 @@ export function hunkFirstNewLine(hunk: ReviewHunk): number | null {
 }
 
 /** Where `o` and `y` point for the stop under the cursor: its file and, when a patch is loaded, its hunk's
- *  first new line (a file row: its first hunk's). `null` on the group header, which is no file. */
+ *  first new line (a file row: its first hunk's; a comment: its first line). `null` on the group header and
+ *  on a recovery row, which name no line of the turn. */
 export function stopTarget(state: ReviewState, stop: ReviewStop | null): { path: string; line: number | null } | null {
-  if (stop === null || stop.kind === "group") return null;
-  const entry = state.diffs[stop.path];
-  const hunks = entry?.status === "ready" ? entry.diff.hunks : null;
-  if (hunks === null || hunks === undefined) return { path: stop.path, line: null };
+  if (stop === null || stop.kind === "group" || stop.kind === "recovery") return null;
+  if (stop.kind === "comment") return { path: stop.path, line: state.draft.comments.find((c) => c.id === stop.id)?.from ?? null };
+  const hunks = loadedHunks(state, stop.path);
+  if (hunks === null) return { path: stop.path, line: null };
   const hunk = stop.kind === "hunk" ? hunks.find((h) => h.id === stop.id) : hunks[0];
   return { path: stop.path, line: hunk === undefined ? null : hunkFirstNewLine(hunk) };
 }
@@ -267,7 +523,7 @@ export function stopTarget(state: ReviewState, stop: ReviewStop | null): { path:
 /** One key's effect on the overlay: the next state and, when the key asks for something outside it, the
  *  effect for `App.tsx` to carry out. `nextId` mints the request ids a new request needs. */
 export function applyReviewKey(state: ReviewState, action: ReviewAction, nextId: () => string): { state: ReviewState; effect: ReviewEffect | null } {
-  const idle = { ...state, pendingG: false };
+  const idle = { ...state, pendingG: false, status: null };
   const none = (next: ReviewState) => ({ state: next, effect: null });
   const stops = reviewStops(state);
   const at = cursorIndex(state, stops);
@@ -304,8 +560,27 @@ export function applyReviewKey(state: ReviewState, action: ReviewAction, nextId:
     }
     case "open": {
       const target = stopTarget(state, stops[at] ?? null);
-      return { state: idle, effect: target === null ? null : { kind: "open", ...target } };
+      const envelope = state.envelope;
+      if (target === null || envelope === null) return none(idle);
+      return { state: idle, effect: { kind: "open", ...target, turn: envelope.current, scope: envelope.scope } };
     }
+    case "revert":
+      return revert(idle, stops[at] ?? null, nextId);
+    case "undo": {
+      if (!state.draft.canUndo) return none({ ...idle, status: "nothing to undo" });
+      return { state: idle, effect: { kind: "undo", requestId: nextId() } };
+    }
+    case "comment":
+      return none(openComment(idle, stops[at] ?? null));
+    case "send": {
+      if (state.draft.comments.length === 0 && state.draft.reverts.length === 0) return none({ ...idle, status: "nothing to send" });
+      const requestId = nextId();
+      return { state: { ...idle, prompt: { kind: "send", requestId, preview: null } }, effect: { kind: "send", requestId, confirm: null } };
+    }
+    case "answer":
+      return answer(idle, action.answer, nextId);
+    case "accept":
+      return accept(idle, nextId);
     case "copy": {
       const target = stopTarget(state, stops[at] ?? null);
       if (target === null) return none(idle);
@@ -314,10 +589,85 @@ export function applyReviewKey(state: ReviewState, action: ReviewAction, nextId:
   }
 }
 
+type Applied = { state: ReviewState; effect: ReviewEffect | null };
+
+/** The turn number a whole-file revert's question names: the turn shown, or in session scope the first turn
+ *  of the session, since that is what the file goes back to. */
+function revertsBackTo(envelope: ReviewEnvelope): number {
+  return envelope.scope === "turn" ? envelope.current : envelope.turns.reduce((min, t) => Math.min(min, t.n), envelope.current);
+}
+
+/** `x`: revert the hunk under the cursor, ask about the whole file on a file row, delete a comment. */
+function revert(state: ReviewState, stop: ReviewStop | null, nextId: () => string): Applied {
+  const envelope = state.envelope;
+  if (stop === null || envelope === null) return { state, effect: null };
+  if (stop.kind === "comment") return { state, effect: { kind: "comment-remove", requestId: nextId(), id: stop.id } };
+  if (stop.kind === "file") {
+    const prompt: ReviewPrompt = { kind: "revert-file", path: stop.path, turn: revertsBackTo(envelope), scope: envelope.scope, shownTurn: envelope.current };
+    return { state: { ...state, prompt }, effect: null };
+  }
+  if (stop.kind !== "hunk") return { state, effect: null };
+  const entry = state.diffs[stop.path];
+  const binary = (entry?.status === "ready" && entry.diff.binary === true) || envelope.files.find((f) => f.path === stop.path)?.binary === true;
+  if (binary) return { state: { ...state, status: BINARY_HUNK_NOTE }, effect: null };
+  const hunk = loadedHunks(state, stop.path)?.find((h) => h.id === stop.id);
+  if (hunk === undefined) return { state, effect: null };
+  const target = { hunk: hunk.id, header: hunk.header };
+  return { state, effect: { kind: "revert", requestId: nextId(), turn: envelope.current, scope: envelope.scope, path: stop.path, target } };
+}
+
+/** `i` on a hunk: opens the comment input on the lines the hunk added. */
+function openComment(state: ReviewState, stop: ReviewStop | null): ReviewState {
+  const envelope = state.envelope;
+  if (stop === null || stop.kind !== "hunk" || envelope === null) return state;
+  const hunk = loadedHunks(state, stop.path)?.find((h) => h.id === stop.id);
+  if (hunk === undefined) return state;
+  const lines = commentLines(hunk);
+  if (lines === null) return { ...state, status: "this hunk has no line left in the file to comment on" };
+  return { ...state, prompt: { kind: "comment", path: stop.path, turn: envelope.current, scope: envelope.scope, from: lines[0], to: lines[1], text: "" } };
+}
+
+/** The answer to the open question. A question answered ends; `y` on a preview still being made waits. */
+function answer(state: ReviewState, which: "yes" | "no" | "cancel", nextId: () => string): Applied {
+  const prompt = state.prompt;
+  if (prompt === null) return { state, effect: null };
+  const cleared = { ...state, prompt: null };
+  if (which === "cancel") return { state: cleared, effect: null };
+  switch (prompt.kind) {
+    case "revert-file":
+      return which === "no"
+        ? { state: cleared, effect: null }
+        : { state: cleared, effect: { kind: "revert", requestId: nextId(), turn: prompt.shownTurn, scope: prompt.scope, path: prompt.path, target: "file" } };
+    case "recover":
+      return { state: cleared, effect: { kind: "recover", requestId: nextId(), entry: prompt.entry, answer: which === "yes" ? "restore" : "dismiss" } };
+    case "send":
+      if (which === "no") return { state: cleared, effect: null };
+      if (prompt.preview === null) return { state, effect: null };
+      return { state: cleared, effect: { kind: "send", requestId: nextId(), confirm: prompt.preview.digest } };
+    case "comment":
+      return { state, effect: null };
+  }
+}
+
+/** Enter in the comment input: a comment with text is saved; an empty one is the same as Escape. */
+function accept(state: ReviewState, nextId: () => string): Applied {
+  const prompt = state.prompt;
+  if (prompt?.kind !== "comment") return { state, effect: null };
+  const cleared = { ...state, prompt: null };
+  const text = prompt.text.trim();
+  if (text === "") return { state: cleared, effect: null };
+  const { turn, scope, path, from, to } = prompt;
+  return { state: cleared, effect: { kind: "comment-add", requestId: nextId(), turn, scope, path, from, to, text } };
+}
+
 function toggle(state: ReviewState, stops: ReviewStop[], at: number, nextId: () => string): { state: ReviewState; effect: ReviewEffect | null } {
   const stop = stops[at];
   const envelope = state.envelope;
-  if (stop === undefined || envelope === null) return { state, effect: null };
+  if (stop?.kind === "recovery") {
+    const entry = state.recovery.find((r) => r.id === stop.id);
+    return entry === undefined ? { state, effect: null } : { state: { ...state, prompt: { kind: "recover", entry: entry.id, path: entry.path } }, effect: null };
+  }
+  if (stop === undefined || envelope === null || stop.kind === "comment") return { state, effect: null };
   if (stop.kind === "group") return { state: { ...state, groupOpen: !state.groupOpen }, effect: null };
   const { path } = stop;
   if (state.expanded.includes(path) || stop.kind === "hunk") {

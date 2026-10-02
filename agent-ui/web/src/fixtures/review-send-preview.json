@@ -1,0 +1,44 @@
+{
+  "envelope": {
+    "digest": "1716821e355bf59f",
+    "kind": "review_send_preview",
+    "notOnDisk": [
+      {
+        "id": 1,
+        "lines": [
+          120,
+          127
+        ],
+        "path": "core/src/foo.rs",
+        "what": "hunk",
+        "why": "changed since"
+      },
+      {
+        "id": 2,
+        "lines": null,
+        "path": "new.rs",
+        "what": "deleted",
+        "why": "changed since"
+      },
+      {
+        "id": 3,
+        "lines": null,
+        "path": "old.rs",
+        "what": "restored",
+        "why": "only in the editor, not saved"
+      },
+      {
+        "id": 4,
+        "lines": null,
+        "path": "all.rs",
+        "what": "file",
+        "why": "undone"
+      }
+    ],
+    "queued": false,
+    "requestId": "send-1",
+    "tab": 1,
+    "text": "Review of your last turn: 1 comment, 0 reverts.\n\nComments:\n1. core/src/x.rs:837-842\n   > let base = …;\n   Why by turn id?"
+  },
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_review_send_preview_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

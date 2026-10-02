@@ -89,8 +89,23 @@ import { HintLayer } from "./components/HintLayer";
 import type { ShownHint } from "./components/HintLayer";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { ReviewOverlay } from "./components/ReviewOverlay";
-import { applyReviewKey, boxUnderCursor, failRequest, openReview, receiveDiff, receiveReview, resolveReviewKey, scrollBoxFirst } from "./review";
+import {
+  applyReviewKey,
+  boxUnderCursor,
+  failRequest,
+  openReview,
+  receiveDiff,
+  receiveDraft,
+  receivePreview,
+  receiveRecovery,
+  receiveReview,
+  resolveReviewKey,
+  scrollBoxFirst,
+  typeComment,
+  withStatus,
+} from "./review";
 import type { ReviewEffect, ReviewState } from "./review";
+import type { ReviewRecoveryEntry } from "./types";
 import { Chooser } from "./components/Chooser";
 import { SlashPicker } from "./components/SlashPicker";
 import type { SlashPickerKind } from "./components/SlashPicker";
@@ -540,10 +555,23 @@ export default function App() {
    *  rather than passing the refusal to the conversation error banner.
    *  `"picker-send"` calls `sendMessage` without clearing the composer, unlike an ordinary `"send"`.
    *  Its refusal only flashes; restoring its text into the composer would overwrite an unrelated draft.
+   *  `"review-command"` tracks overlay actions such as revert, undo, comment, send and recover.
+   *  Success or refusal uses the overlay status line. `review_draft` and `review_send_preview`
+   *  also complete their entries without a `command_result`.
    *  `"review"` tracks `review_request`/`review_diff_request`; refusals appear in the overlay header
    *  because no response envelope follows them. */
   const inFlight = useRef<
-    Map<string, { kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review"; tab: TabId; text?: string; permissionId?: string }>
+    Map<
+      string,
+      {
+        kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command";
+        tab: TabId;
+        text?: string;
+        permissionId?: string;
+        /** An `open_in_editor` from the review overlay: its answer, good or bad, is the overlay's status line. */
+        review?: true;
+      }
+    >
   >(new Map());
   /** Monotonic, so two refusals of the same text are two distinct restores. */
   const restoreSeq = useRef(0);
@@ -1071,6 +1099,10 @@ export default function App() {
    *  the shell sends it for the tab it names even while another is on screen. Gone once the overlay is
    *  opened on that turn, when a new turn starts, or when the shell sends `files: 0`. */
   const [reviewHints, setReviewHints] = useState<Record<number, { turn: number; files: number }>>({});
+  /** Interrupted reverts the journal still holds (`review_recovery`, the project's, so not a tab's). The band
+   *  names the first whatever the hint setting says, and an overlay opened later starts with them. Nothing
+   *  is kept here but what the shell last said. */
+  const [reviewRecovery, setReviewRecovery] = useState<ReviewRecoveryEntry[]>([]);
   /** The detail popover's rows, or `null` when it is closed. Set by a
    *  `tab_detail` envelope (the reply to `open_detail`, sent by the band and by `prefix i`);
    *  closed the same places `keymapOpen` is forced shut, since the two are mutually exclusive
@@ -1109,7 +1141,7 @@ export default function App() {
   function openReviewOverlay(tab: TabId) {
     const requestId = nextRequestId();
     inFlight.current.set(requestId, { kind: "review", tab });
-    setReview(openReview(tab, requestId));
+    setReview(openReview(tab, requestId, reviewRecovery));
     postToRust({ type: "review_request", request_id: requestId, tab, turn: "latest", scope: "turn" });
   }
   /** What a key in the review overlay asked for beyond changing its own state. `tab` is the tab the overlay
@@ -1127,9 +1159,46 @@ export default function App() {
         inFlight.current.set(effect.requestId, { kind: "review", tab });
         postToRust({ type: "review_diff_request", request_id: effect.requestId, tab, turn: effect.turn, scope: effect.scope, path: effect.path });
         return;
-      case "open":
-        // The editor opens it at the hunk's first line when a patch has been loaded, else at the top.
-        openPath({ path: effect.path, line: effect.line });
+      case "open": {
+        // The editor opens it at the hunk's first line when a patch has been loaded, else at the top. It
+        // is the shell that knows whether the turn's hunks are drawn there too, so it is asked, by turn.
+        const requestId = nextRequestId();
+        inFlight.current.set(requestId, { kind: "editor", tab, review: true });
+        postToRust({
+          type: "open_in_editor",
+          request_id: requestId,
+          tab,
+          turn: effect.turn,
+          scope: effect.scope,
+          path: effect.path,
+          ...(effect.line === null ? {} : { line: effect.line }),
+        });
+        return;
+      }
+      case "revert":
+        inFlight.current.set(effect.requestId, { kind: "review-command", tab });
+        postToRust({ type: "review_revert", request_id: effect.requestId, tab, turn: effect.turn, scope: effect.scope, path: effect.path, target: effect.target });
+        return;
+      case "undo":
+        inFlight.current.set(effect.requestId, { kind: "review-command", tab });
+        postToRust({ type: "review_undo", request_id: effect.requestId, tab });
+        return;
+      case "comment-add":
+        inFlight.current.set(effect.requestId, { kind: "review-command", tab });
+        postToRust({ type: "review_comment_add", request_id: effect.requestId, tab, turn: effect.turn, scope: effect.scope, path: effect.path, from: effect.from, to: effect.to, text: effect.text });
+        return;
+      case "comment-remove":
+        inFlight.current.set(effect.requestId, { kind: "review-command", tab });
+        postToRust({ type: "review_comment_remove", request_id: effect.requestId, tab, id: effect.id });
+        return;
+      case "send":
+        inFlight.current.set(effect.requestId, { kind: "review-command", tab });
+        postToRust({ type: "review_send", request_id: effect.requestId, tab, confirm: effect.confirm });
+        return;
+      case "recover":
+        // Window-level: the journal is the project's, so this names no tab.
+        inFlight.current.set(effect.requestId, { kind: "review-command", tab });
+        postToRust({ type: "review_recover", request_id: effect.requestId, entry: effect.entry, answer: effect.answer });
         return;
       case "copy":
         void navigator.clipboard?.writeText(effect.text);
@@ -1478,6 +1547,7 @@ export default function App() {
       containerRef.current?.querySelector<HTMLInputElement>(".search-bar input")?.focus();
       return;
     }
+
     if (containerRef.current !== null) {
       // A `pane_focus true` that follows a click on Approve, or a HINT landing on a control, must
       // not steal the keys back from it -- `document.activeElement` already being inside the root
@@ -2679,9 +2749,20 @@ export default function App() {
           // -- of the tab it was sent from, which need not be the one on screen now.
           setHandoffRequests((current) => withoutHandoff(current, record.tab, payload.requestId));
         }
+        if (payload.ok && payload.message !== undefined && (record?.kind === "review-command" || record?.review === true)) {
+          // The shell's own word on what it did (`sent`, `queued: ...`, `opened; 2 hunks no longer match`).
+          const message = payload.message;
+          setReview((current) => (current === null ? current : withStatus(current, message)));
+        }
         if (!payload.ok) {
           console.warn("agent-ui: command failed", payload.requestId, payload.error);
-          if (record?.kind === "picker-send") {
+          if (record?.kind === "review-command" || record?.review === true) {
+            // The overlay's own command was refused (a revert that no longer matches the disk, a running
+            // turn, no editor link): said on its status line, where the key was pressed. Not the
+            // conversation's banner, and not a flash that would fade before it was read.
+            const error = payload.error;
+            setReview((current) => (current === null ? current : withStatus(current, error)));
+          } else if (record?.kind === "picker-send") {
             // `chooseSlashOption` calls `sendMessage` directly without the composer's optimistic
             // clear, so a refused picker choice has no draft to restore. Flash the error without
             // changing any quoted or typed draft already in the box.
@@ -2936,6 +3017,17 @@ export default function App() {
       } else if (payload.kind === "review_diff") {
         inFlight.current.delete(payload.requestId);
         setReview((current) => (current === null ? current : receiveDiff(current, payload)));
+      } else if (payload.kind === "review_draft") {
+        // The answer to a comment add or remove (its record ends here), or the draft pushed after a change
+        // the panel did not ask for. An overlay that is closed keeps nothing: the next `review` carries it.
+        if (payload.requestId !== null) inFlight.current.delete(payload.requestId);
+        setReview((current) => (current === null ? current : receiveDraft(current, payload)));
+      } else if (payload.kind === "review_send_preview") {
+        inFlight.current.delete(payload.requestId);
+        setReview((current) => (current === null ? current : receivePreview(current, payload)));
+      } else if (payload.kind === "review_recovery") {
+        setReviewRecovery(payload.entries);
+        setReview((current) => (current === null ? current : receiveRecovery(current, payload.entries)));
       } else if (payload.kind === "review_hint") {
         // Kept for the tab it names, shown only while that tab is on screen. One that arrives while a turn
         // runs in the tab on screen is about the turn before it, which the new turn has already replaced.
@@ -4400,9 +4492,14 @@ export default function App() {
     // is not a key (a held Shift on its way to `G`), and neither it nor an unbound key ends a waiting `g`
     // except by being a different key.
     if (review !== null) {
+      // The comment input is a text box inside the overlay: what is typed in it is its own (an `a` or a `d`
+      // there is a letter, and reaches no card -- nothing below this branch runs). Its Enter and Escape
+      // never get here, the box stops them; every other key does nothing at the root.
+      const target = event.target;
+      if (target instanceof HTMLInputElement && reviewOverlayRef.current?.contains(target)) return;
       event.preventDefault();
       if (isModifierKey(event.key)) return;
-      const action = resolveReviewKey(event.nativeEvent as unknown as KeyLike, review.pendingG);
+      const action = resolveReviewKey(event.nativeEvent as unknown as KeyLike, review.pendingG, review.prompt);
       if (action === null) {
         if (review.pendingG) setReview({ ...review, pendingG: false });
         return;
@@ -5287,7 +5384,24 @@ export default function App() {
         )}
         {review !== null && (
           <PanelErrorBoundary name="review overlay" onError={() => overlayFailed("review overlay", () => setReview(null))}>
-            <ReviewOverlay ref={reviewOverlayRef} state={review} onClose={() => setReview(null)} />
+            <ReviewOverlay
+              ref={reviewOverlayRef}
+              state={review}
+              onClose={() => setReview(null)}
+              onCommentChange={(text) => setReview((current) => (current === null ? current : typeComment(current, text)))}
+              onCommentAccept={(event) => {
+                noteLineKey(event);
+                const next = applyReviewKey(review, { kind: "accept" }, nextRequestId);
+                setReview(next.state);
+                if (next.effect !== null) runReviewEffect(next.effect, review.tab);
+                returnKeysToRoot();
+              }}
+              onCommentCancel={(event) => {
+                noteLineKey(event);
+                setReview(applyReviewKey(review, { kind: "answer", answer: "cancel" }, nextRequestId).state);
+                returnKeysToRoot();
+              }}
+            />
           </PanelErrorBoundary>
         )}
         {detail !== null && (
@@ -5555,6 +5669,8 @@ export default function App() {
           approve: ctrlYCard,
           // A finished turn of this tab changed files on disk; `c` shows them.
           review: activeTab !== null && reviewHints[activeTab.id] !== undefined ? { files: reviewHints[activeTab.id].files } : null,
+          // An interrupted revert is named whatever `review.hint` says: a half-written file is not a diff notice.
+          recovery: reviewRecovery.length > 0 ? { path: reviewRecovery[0].path, more: reviewRecovery.length - 1 } : null,
         }}
         paneFocused={paneFocused}
         onOpenDetail={() => post({ type: "open_detail" })}

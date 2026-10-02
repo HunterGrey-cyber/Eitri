@@ -508,9 +508,26 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                 if cut > 0 {
                     println!("[companion] ended {cut} draft edit(s) out in the editor");
                 }
+                agent_for_cancel.review_editor_lost();
             },
         )
     };
+
+    // Turn review asks the attached nvim through the same link, and polls its answers.
+    agent.set_editor_rpc(link.clone());
+    {
+        let owner = link.clone();
+        agent.set_review_owner(move || owner.review_owner());
+        // A file the review opened is in the user's own window: bringing it forward is the window
+        // manager's job, as for a draft.
+        let link = link.clone();
+        let runner = runner.clone();
+        agent.on_review_open(move || {
+            if let Some(pid) = link.nvim_pid() {
+                runner.raise_editor(pid);
+            }
+        });
+    }
 
     // The edge letters nvim's own navigator sends when the cursor is at nvim's last window: they
     // continue as a move toward the window beyond it. The channel carries no shim, so only a

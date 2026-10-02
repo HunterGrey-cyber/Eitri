@@ -24,3 +24,8 @@ serde_json = "1"
 # Already linked through `agent`, so no new crate ships: the tmux import's fingerprint.
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# The crate's own test doubles (`PresenceGuard::for_tests`, `EditorClear::for_tests`) for its
+# integration tests, which see it only as an outside crate.
+eitri-core = { path = ".", features = ["test-support"] }

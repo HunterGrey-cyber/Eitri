@@ -185,11 +185,11 @@ fn parse_skipped_large(message: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(super) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
+pub(super) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     if text.len() % 2 != 0 || text.is_empty() {
         return None;
     }
@@ -262,6 +262,28 @@ pub struct Snapshot {
     pub skipped_large: Vec<PathBuf>,
 }
 
+/// What a path is in a snapshot, as [`Shadow::read_entry`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A regular file.
+    Blob,
+    /// A symbolic link; the entry's bytes are its target.
+    Symlink,
+    /// A nested repository's commit; the entry's bytes are the commit id, since its objects are not
+    /// in the shadow.
+    Gitlink,
+}
+
+/// One path of a snapshot: its kind, its permission bits and its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// Permission bits, ready to be given to a file: git records only 0644 and 0755 for a file; a
+    /// symlink is 0777 and a gitlink 0.
+    pub mode: u32,
+    pub kind: EntryKind,
+    pub bytes: Vec<u8>,
+}
+
 /// One snapshot ref as [`Shadow::snapshot_ref_ids`] lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotRef {
@@ -331,6 +353,8 @@ pub enum ShadowError {
     NoSuchCommit(String),
     /// A path that is absolute or empty where a work-tree-relative one is needed.
     InvalidPath(PathBuf),
+    /// A revert stamp, a journal id or a blob id that cannot be what it is meant to be.
+    InvalidName(String),
 }
 
 impl std::fmt::Display for ShadowError {
@@ -345,6 +369,7 @@ impl std::fmt::Display for ShadowError {
             ShadowError::InvalidSession(s) => write!(f, "session id {s:?} cannot name a snapshot"),
             ShadowError::NoSuchCommit(c) => write!(f, "no snapshot {c:?}"),
             ShadowError::InvalidPath(p) => write!(f, "{} is not a path inside the project", p.display()),
+            ShadowError::InvalidName(s) => write!(f, "{s:?} cannot name a stored revert"),
         }
     }
 }
@@ -377,7 +402,20 @@ pub fn review_dir_for(state_home: Option<&OsStr>, home: Option<&OsStr>, project_
 /// A held `flock` on the store's `lock` file, released on drop.
 #[derive(Debug)]
 pub struct ShadowLock {
-    _file: File,
+    file: File,
+}
+
+impl ShadowLock {
+    /// Whether `path` still names the file this lock is held on, as a regular file and not through
+    /// a symlink. A file another process unlinked or replaced after it was opened but before it was
+    /// locked is still locked, and nobody looking at the path would ever meet that lock.
+    pub(crate) fn names(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(held), Ok(named)) = (self.file.metadata(), std::fs::symlink_metadata(path)) else {
+            return false;
+        };
+        named.is_file() && held.dev() == named.dev() && held.ino() == named.ino()
+    }
 }
 
 /// One project's shadow repository. Cheap to clone; every method takes the lock it needs.
@@ -803,6 +841,178 @@ impl Shadow {
         Ok(Some(self.run_ok("cat-file", cat, None, deadline)?.stdout))
     }
 
+    /// Stores `bytes` as a blob, exactly as given (no filter or conversion runs over them), and
+    /// returns its id. Nothing refers to it yet: a collection may prune it once it is older than its
+    /// prune expiry, so a caller that needs it longer anchors it ([`anchor_revert`](Self::anchor_revert)).
+    pub fn store_blob(&self, bytes: &[u8]) -> Result<String, ShadowError> {
+        let deadline = Instant::now() + READ_TIMEOUT;
+        let _lock = self.lock_shared_until(deadline)?;
+        let mut hash = self.git(None);
+        hash.args(["hash-object", "-w", "--no-filters", "--stdin"]);
+        let output = self.run_ok("hash-object", hash, Some(bytes), deadline)?;
+        Ok(String::from_utf8_lossy(git::trim_newline(&output.stdout)).into_owned())
+    }
+
+    /// The bytes of the stored blob `blob`; `None` when the store has no blob of that id. Only a
+    /// full id is accepted: an abbreviation that is unique today may name two objects tomorrow.
+    pub fn read_stored(&self, blob: &str) -> Result<Option<Vec<u8>>, ShadowError> {
+        if !is_full_id(blob) {
+            return Err(ShadowError::InvalidName(blob.to_owned()));
+        }
+        let deadline = Instant::now() + READ_TIMEOUT;
+        let _lock = self.lock_shared_until(deadline)?;
+        let mut kind = self.git(None);
+        kind.args(["cat-file", "-t", blob]);
+        let kind = git::run(kind, remaining(deadline)?)?;
+        if !kind.status.success() || git::trim_newline(&kind.stdout) != b"blob" {
+            return Ok(None);
+        }
+        let mut cat = self.git(None);
+        cat.args(["cat-file", "blob", blob]);
+        Ok(Some(self.run_ok("cat-file", cat, None, deadline)?.stdout))
+    }
+
+    /// What `path` (relative to the work tree) is in snapshot `commit`: its kind, its mode and its
+    /// bytes. `None` when the snapshot has nothing there, or only a directory.
+    pub fn read_entry(&self, commit: &str, path: &Path) -> Result<Option<Entry>, ShadowError> {
+        if !is_hex_id(commit) {
+            return Err(ShadowError::NoSuchCommit(commit.to_owned()));
+        }
+        if path.as_os_str().is_empty() || path.is_absolute() {
+            return Err(ShadowError::InvalidPath(path.to_path_buf()));
+        }
+        let deadline = Instant::now() + READ_TIMEOUT;
+        let _lock = self.lock_shared_until(deadline)?;
+        // `top` and `literal` magic: the path is the path, from the top, never a pattern.
+        let mut spec = OsString::from(":(top,literal)");
+        spec.push(path.as_os_str());
+        let mut list = self.git(None);
+        list.args(["ls-tree", "-z", "--full-name", commit, "--"]).arg(&spec);
+        let listed = git::run(list, remaining(deadline)?)?;
+        if !listed.status.success() {
+            let mut verify = self.git(None);
+            verify.args(["rev-parse", "--verify", "-q", &format!("{commit}^{{commit}}")]);
+            if !git::run(verify, remaining(deadline)?)?.status.success() {
+                return Err(ShadowError::NoSuchCommit(commit.to_owned()));
+            }
+            GitError::check("ls-tree", listed)?;
+            return Ok(None);
+        }
+        let wanted = path.as_os_str().as_bytes();
+        let Some((mode, id)) = nul_separated(&listed.stdout).find_map(|record| {
+            let (meta, name) = split_once_byte(record, b'\t')?;
+            if name != wanted {
+                return None;
+            }
+            let mut fields = meta.split(|&b| b == b' ');
+            let (mode, _kind, id) = (fields.next()?, fields.next()?, fields.next()?);
+            Some((mode.to_vec(), String::from_utf8_lossy(id).into_owned()))
+        }) else {
+            return Ok(None);
+        };
+        let (kind, mode) = match mode.as_slice() {
+            b"120000" => (EntryKind::Symlink, 0o777),
+            b"160000" => {
+                return Ok(Some(Entry {
+                    mode: 0,
+                    kind: EntryKind::Gitlink,
+                    bytes: id.into_bytes(),
+                }))
+            }
+            b"100755" => (EntryKind::Blob, 0o755),
+            m if m.starts_with(b"100") => (EntryKind::Blob, 0o644),
+            _ => return Ok(None),
+        };
+        let mut cat = self.git(None);
+        cat.args(["cat-file", "blob", &id]);
+        let bytes = self.run_ok("cat-file", cat, None, deadline)?.stdout;
+        Ok(Some(Entry { mode, kind, bytes }))
+    }
+
+    /// Keeps the blobs a revert wrote over (`pre`) and wrote (`post`) for as long as retention keeps
+    /// revert anchors: `refs/eitri-revert/<session>/<stamp>/{pre,post}`, `stamp` being
+    /// `<ms>-<seq>`. A side given as `None` gets no ref.
+    pub fn anchor_revert(
+        &self,
+        session: &str,
+        stamp: &str,
+        pre: Option<&str>,
+        post: Option<&str>,
+    ) -> Result<(), ShadowError> {
+        validate_session(session)?;
+        if parse_stamp_ms(stamp).is_none() {
+            return Err(ShadowError::InvalidName(stamp.to_owned()));
+        }
+        let prefix = format!("refs/eitri-revert/{session}/{stamp}");
+        let input = ref_lines(
+            "update",
+            [(format!("{prefix}/pre"), pre), (format!("{prefix}/post"), post)],
+        )?;
+        if input.is_empty() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + READ_TIMEOUT;
+        let _lock = self.lock_shared_until(deadline)?;
+        let mut update = self.git(None);
+        update.args(["update-ref", "--stdin"]);
+        self.run_ok("update-ref", update, Some(input.as_bytes()), deadline)?;
+        Ok(())
+    }
+
+    /// Pins a journal entry's blobs under `refs/eitri-journal/<id>/{pre,intended}`, which retention
+    /// never ages out. `create` refuses a ref that exists and an object that does not, so a pin
+    /// that was made proves its blob is in the store. The caller holds the store's lock.
+    pub(crate) fn pin_journal_locked(
+        &self,
+        id: &str,
+        pre: Option<&str>,
+        intended: Option<&str>,
+    ) -> Result<(), ShadowError> {
+        if !is_journal_id(id) {
+            return Err(ShadowError::InvalidName(id.to_owned()));
+        }
+        let prefix = format!("refs/eitri-journal/{id}");
+        let input = ref_lines(
+            "create",
+            [(format!("{prefix}/pre"), pre), (format!("{prefix}/intended"), intended)],
+        )?;
+        if input.is_empty() {
+            return Ok(());
+        }
+        let mut update = self.git(None);
+        update.args(["update-ref", "--stdin"]);
+        self.run_ok(
+            "update-ref",
+            update,
+            Some(input.as_bytes()),
+            Instant::now() + READ_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    /// Removes a journal entry's pins. Removing a pin that is already gone is not an error.
+    pub(crate) fn unpin_journal(&self, id: &str) -> Result<(), ShadowError> {
+        let _lock = self.lock_shared_until(Instant::now() + READ_TIMEOUT)?;
+        self.unpin_journal_locked(id)
+    }
+
+    /// [`unpin_journal`](Self::unpin_journal) with the store's lock already held.
+    pub(crate) fn unpin_journal_locked(&self, id: &str) -> Result<(), ShadowError> {
+        if !is_journal_id(id) {
+            return Err(ShadowError::InvalidName(id.to_owned()));
+        }
+        let input = format!("delete refs/eitri-journal/{id}/pre\ndelete refs/eitri-journal/{id}/intended\n");
+        let mut update = self.git(None);
+        update.args(["update-ref", "--stdin"]);
+        self.run_ok(
+            "update-ref",
+            update,
+            Some(input.as_bytes()),
+            Instant::now() + READ_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
     /// Every snapshot ref, with its label (`None` when its message is not a label).
     pub fn snapshot_refs(&self) -> Result<Vec<(String, Option<SnapshotLabel>)>, ShadowError> {
         let _lock = self.lock_shared_until(Instant::now() + READ_TIMEOUT)?;
@@ -862,7 +1072,10 @@ impl Shadow {
     /// garbage, removing unreachable objects older than `prune_expiry` (a git date: production
     /// passes `1.hour.ago`, so an object a concurrent snapshot wrote moments ago is never removed
     /// before its ref exists). An index whose session has no snapshot left is removed too, so it
-    /// cannot point at objects the collection frees. Holds the lock exclusively throughout.
+    /// cannot point at objects the collection frees. Revert anchors (`refs/eitri-revert/`) older
+    /// than `max_age` by their stamp go too, whatever `keep` says; a journal entry's pins
+    /// (`refs/eitri-journal/`) are never aged out and go only once their entry is gone. Holds the
+    /// lock exclusively throughout.
     pub fn trim(&self, keep: usize, max_age: Duration, now_ms: u64, prune_expiry: &str) -> Result<(), ShadowError> {
         let _lock = self.lock_exclusive()?;
         // Collection is not bounded by the snapshot timeout: it runs in the background, and
@@ -900,6 +1113,7 @@ impl Shadow {
                 kept_sessions.insert(session);
             }
         }
+        delete.extend(self.expired_revert_refs_locked(oldest_kept, deadline)?);
         if !delete.is_empty() {
             let input: String = delete.iter().map(|name| format!("delete {name}\n")).collect();
             let mut update = self.git(None);
@@ -929,11 +1143,53 @@ impl Shadow {
         self.run_ok("gc", gc, None, deadline)?;
         Ok(())
     }
+
+    /// The revert anchors stamped before `oldest_kept`, and the journal pins whose entry no longer
+    /// exists. A journal pin is never judged by age: an interrupted in-place write's bytes must stay
+    /// for as long as its entry waits to be restored or dismissed, however long that is. The store
+    /// lock is held exclusively, so no entry is between being pinned and being written: a missing
+    /// entry is one that was removed, or whose writer died before it existed.
+    fn expired_revert_refs_locked(&self, oldest_kept: u64, deadline: Instant) -> Result<Vec<String>, ShadowError> {
+        let mut list = self.git(None);
+        list.args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/eitri-revert/",
+            "refs/eitri-journal/",
+        ]);
+        let output = self.run_ok("for-each-ref", list, None, deadline)?;
+        let journal = self.review_dir.join("journal");
+        let mut expired = Vec::new();
+        for name in String::from_utf8_lossy(&output.stdout).lines() {
+            let parts: Vec<&str> = name.split('/').collect();
+            match parts.as_slice() {
+                ["refs", "eitri-revert", _session, stamp, _side] => {
+                    // A stamp that does not parse is kept: nothing here says how old it is.
+                    if parse_stamp_ms(stamp).is_some_and(|ms| ms < oldest_kept) {
+                        expired.push(name.to_owned());
+                    }
+                }
+                ["refs", "eitri-journal", id, _side] if is_journal_id(id) => {
+                    match std::fs::symlink_metadata(journal.join(format!("{id}.json"))) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => expired.push(name.to_owned()),
+                        // Anything else, the entry itself included, keeps the pin.
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(expired)
+    }
 }
 
 /// Takes an `flock` (`operation`) on `path`, creating it 0600. With a `deadline` it polls and gives
 /// up with [`ShadowError::TimedOut`] there; without one it waits as long as it takes.
-fn flock_file(path: &Path, operation: libc::c_int, deadline: Option<Instant>) -> Result<ShadowLock, ShadowError> {
+pub(crate) fn flock_file(
+    path: &Path,
+    operation: libc::c_int,
+    deadline: Option<Instant>,
+) -> Result<ShadowLock, ShadowError> {
     if let Some(deadline) = deadline {
         remaining(deadline)?;
     }
@@ -953,7 +1209,7 @@ fn flock_file(path: &Path, operation: libc::c_int, deadline: Option<Instant>) ->
     loop {
         // SAFETY: the descriptor is `file`'s own and open for the call; `flock` takes no pointers.
         if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
-            return Ok(ShadowLock { _file: file });
+            return Ok(ShadowLock { file });
         }
         let err = std::io::Error::last_os_error();
         match err.raw_os_error() {
@@ -970,8 +1226,41 @@ fn flock_file(path: &Path, operation: libc::c_int, deadline: Option<Instant>) ->
     }
 }
 
+/// Tries to take `path`'s `flock` exclusively without creating it: `Some` when it was free (the
+/// caller now holds it), `None` when someone else holds it. A path that is missing, a symlink or
+/// not a regular file is [`std::io::ErrorKind::NotFound`]: there is nothing there to lock, and a
+/// FIFO or a device someone planted is never opened for reading.
+pub(crate) fn try_flock_existing(path: &Path) -> Result<Option<ShadowLock>, ShadowError> {
+    let not_a_lock_file = || ShadowError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "not a lock file"));
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        // `O_NOFOLLOW` on a symlink.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(not_a_lock_file()),
+        Err(e) => return Err(e.into()),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(not_a_lock_file());
+    }
+    loop {
+        // SAFETY: the descriptor is `file`'s own and open for the call; `flock` takes no pointers.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(ShadowLock { file }));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => return Ok(None),
+            _ => return Err(err.into()),
+        }
+    }
+}
+
 /// A session id is a file-name and ref component: ASCII letters, digits, `-` and `_`, at most 128.
-fn validate_session(session: &str) -> Result<(), ShadowError> {
+pub(crate) fn validate_session(session: &str) -> Result<(), ShadowError> {
     let ok = !session.is_empty()
         && session.len() <= 128
         && session
@@ -993,6 +1282,45 @@ fn wall_clock_ms() -> u64 {
 
 pub(super) fn is_hex_id(id: &str) -> bool {
     (4..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A whole object id, SHA-1 or SHA-256, in lower-case hex as git prints it.
+pub(super) fn is_full_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A journal entry's id: a simple UUID, 32 lower-case hex digits.
+pub(super) fn is_journal_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The milliseconds of a revert stamp `<ms>-<seq>`, when it has that shape.
+fn parse_stamp_ms(stamp: &str) -> Option<u64> {
+    let (ms, seq) = stamp.split_once('-')?;
+    let digits = |s: &str, max: usize| !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(ms, 20) || !digits(seq, 10) {
+        return None;
+    }
+    ms.parse().ok()
+}
+
+/// `update-ref --stdin` lines (`verb` is `update` or `create`) giving each named ref that has a
+/// blob that blob.
+fn ref_lines(verb: &str, refs: [(String, Option<&str>); 2]) -> Result<String, ShadowError> {
+    let mut input = String::new();
+    for (name, blob) in refs {
+        let Some(blob) = blob else { continue };
+        if !is_full_id(blob) {
+            return Err(ShadowError::InvalidName(blob.to_owned()));
+        }
+        input.push_str(&format!("{verb} {name} {blob}\n"));
+    }
+    Ok(input)
+}
+
+fn split_once_byte(bytes: &[u8], at: u8) -> Option<(&[u8], &[u8])> {
+    let i = bytes.iter().position(|&b| b == at)?;
+    Some((&bytes[..i], &bytes[i + 1..]))
 }
 
 pub(super) fn remaining(deadline: Instant) -> Result<Duration, ShadowError> {
@@ -1050,7 +1378,7 @@ fn remove_lock_files(dir: &Path, recursive: bool) -> std::io::Result<()> {
 /// `review_dir` is `<state home>/eitri/review/<key>`, so a state directory an older build left
 /// open is closed as every other state writer closes it; otherwise (a store placed anywhere else)
 /// only from `review_dir`'s parent down, never touching what is above.
-fn private_root(review_dir: &Path) -> &Path {
+pub(crate) fn private_root(review_dir: &Path) -> &Path {
     let parent = review_dir.parent().unwrap_or(review_dir);
     match parent.parent() {
         Some(eitri)

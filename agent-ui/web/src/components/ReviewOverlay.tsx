@@ -1,12 +1,21 @@
 import { forwardRef, useEffect } from "react";
+import type { KeyboardEvent } from "react";
 import { Row } from "./Row";
+import { SearchBar } from "./SearchBar";
 import {
+  REVIEW_KEY_LINE,
+  clock,
+  commentsUnder,
   counts,
   cursorIndex,
+  draftLine,
   fileFlags,
   hasPatch,
   hidesFiles,
   originSign,
+  promptText,
+  revertMark,
+  revertOf,
   reviewNotes,
   reviewStops,
   reviewTitle,
@@ -15,13 +24,19 @@ import {
   tooLargeNote,
 } from "../review";
 import type { ReviewState } from "../review";
-import type { ReviewFile, ReviewHunk, ReviewLine } from "../types";
+import type { ReviewFile, ReviewHunk, ReviewLine, ReviewNotOnDisk } from "../types";
 
 type Props = {
   /** What to draw; `App.tsx` owns it, and owns every key while the overlay is open. */
   state: ReviewState;
   /** A click on the backdrop. `q`, `Escape` and `c` close it from the keyboard, in `App.tsx`. */
   onClose: () => void;
+  /** The comment input's text, Enter and Escape. The input is a real text box that stops its own Enter and
+   *  Escape (as the `:` line's does), so `App.tsx` hears them here and not as keys. Absent in a test that only
+   *  draws. */
+  onCommentChange?: (text: string) => void;
+  onCommentAccept?: (event: KeyboardEvent<HTMLInputElement>) => void;
+  onCommentCancel?: (event: KeyboardEvent<HTMLInputElement>) => void;
 };
 
 /** The `.diff-*` class a patch line takes. A "no newline at end of file" marker is a note on the line
@@ -34,11 +49,28 @@ function lineGutter(line: ReviewLine): string {
   return line.kind === "added" ? "+" : line.kind === "removed" ? "-" : line.kind === "no_newline" ? "\\" : " ";
 }
 
-function Hunk({ hunk, path, current }: { hunk: ReviewHunk; path: string; current: boolean }) {
+/** A comment's lines as a person says them: `837`, or `837-842`. */
+function span(from: number, to: number): string {
+  return from === to ? `${from}` : `${from}-${to}`;
+}
+
+/** A revert the send leaves out: a hunk by its lines, a whole-file revert by what it did to the file. */
+function notOnDiskLine(entry: ReviewNotOnDisk): string {
+  if (entry.lines !== null) {
+    const [from, to] = entry.lines;
+    return `${entry.path} ${from === to ? "line" : "lines"} ${span(from, to)}: ${entry.why}`;
+  }
+  const what = entry.what === "deleted" ? "deleted" : entry.what === "restored" ? "restored" : "whole file";
+  return `${entry.path} (${what}): ${entry.why}`;
+}
+
+function Hunk({ hunk, path, state, cursor }: { hunk: ReviewHunk; path: string; state: ReviewState; cursor: string | null }) {
+  const mark = revertMark(revertOf(state, path, hunk));
   return (
     <div className="review-hunk" data-path={path}>
-      <Row kind="review-hunk" sign="▾" current={current} navStop="hunk">
+      <Row kind="review-hunk" sign="▾" current={cursor === stopKey({ kind: "hunk", path, id: hunk.id })} navStop="hunk">
         <span className="review-hunk-header">{hunk.header}</span>
+        {mark !== null && <span className="review-file-flag">{mark}</span>}
       </Row>
       <div className="review-hunk-lines">
         {hunk.lines.map((line, i) => (
@@ -52,6 +84,12 @@ function Hunk({ hunk, path, current }: { hunk: ReviewHunk; path: string; current
           </div>
         ))}
       </div>
+      {commentsUnder(state, path, hunk).map((comment) => (
+        <Row key={comment.id} kind="review-comment" sign="»" current={cursor === stopKey({ kind: "comment", path, id: comment.id })} navStop="comment">
+          <span className="review-comment-lines">{span(comment.from, comment.to)}</span>
+          <span className="review-comment-text">{comment.text}</span>
+        </Row>
+      ))}
     </div>
   );
 }
@@ -62,6 +100,7 @@ function FileEntry({ file, state, cursor }: { file: ReviewFile; state: ReviewSta
   const open = state.expanded.includes(file.path);
   const entry = state.diffs[file.path];
   const flags = fileFlags(file);
+  const mark = revertMark(revertOf(state, file.path, null));
   return (
     <div className="review-file" data-path={file.path}>
       <Row kind="review-file" sign={originSign(file)} current={cursor === stopKey({ kind: "file", path: file.path })} navStop="file">
@@ -72,6 +111,7 @@ function FileEntry({ file, state, cursor }: { file: ReviewFile; state: ReviewSta
             {flag}
           </span>
         ))}
+        {mark !== null && <span className="review-file-flag">{mark}</span>}
       </Row>
       {open && hasPatch(file) && (
         <div className="review-patch">
@@ -84,7 +124,7 @@ function FileEntry({ file, state, cursor }: { file: ReviewFile; state: ReviewSta
           ) : entry.diff.hunks.length === 0 ? (
             <div className="review-note">no changes to show as text</div>
           ) : (
-            entry.diff.hunks.map((hunk) => <Hunk key={hunk.id} hunk={hunk} path={file.path} current={cursor === stopKey({ kind: "hunk", path: file.path, id: hunk.id })} />)
+            entry.diff.hunks.map((hunk) => <Hunk key={hunk.id} hunk={hunk} path={file.path} state={state} cursor={cursor} />)
           )}
         </div>
       )}
@@ -104,7 +144,7 @@ function FileEntry({ file, state, cursor }: { file: ReviewFile; state: ReviewSta
  * shell would not send is refused with its counts. The words never say who changed a file: the header
  * says "changed on disk during this turn", and the signs carry the attribution.
  */
-export const ReviewOverlay = forwardRef<HTMLDivElement, Props>(function ReviewOverlay({ state, onClose }, ref) {
+export const ReviewOverlay = forwardRef<HTMLDivElement, Props>(function ReviewOverlay({ state, onClose, onCommentChange, onCommentAccept, onCommentCancel }, ref) {
   const stops = reviewStops(state);
   const at = cursorIndex(state, stops);
   const cursor = stops[at] === undefined ? null : stopKey(stops[at]);
@@ -141,6 +181,16 @@ export const ReviewOverlay = forwardRef<HTMLDivElement, Props>(function ReviewOv
             </div>
           ))}
       </header>
+      {state.recovery.length > 0 && (
+        <div className="review-recovery">
+          {state.recovery.map((entry) => (
+            <Row key={entry.id} kind="review-recovery" sign="!" current={cursor === stopKey({ kind: "recovery", id: entry.id })} navStop="recovery">
+              <span className="review-path">an interrupted revert left {entry.path}</span>
+              <span className="review-file-flag">{clock(entry.at)}</span>
+            </Row>
+          ))}
+        </div>
+      )}
       {envelope !== null && !hidesFiles(envelope) && (
         <div className="review-files">
           {named.length === 0 && unnamed.length === 0 && <div className="review-note">no files changed on disk</div>}
@@ -162,7 +212,34 @@ export const ReviewOverlay = forwardRef<HTMLDivElement, Props>(function ReviewOv
           )}
         </div>
       )}
-      <footer className="review-keys">j/k move · Enter open · [ ] turn · S scope · o editor · y copy · q close</footer>
+      {draftLine(state.draft) !== null && <div className="review-draft">{draftLine(state.draft)}</div>}
+      {state.prompt !== null && (
+        <div className="review-prompt">
+          {state.prompt.kind === "send" && state.prompt.preview !== null && (
+            <div className="review-preview">
+              <div className="review-preview-text">{state.prompt.preview.text}</div>
+              {state.prompt.preview.notOnDisk.map((entry) => (
+                <div key={entry.id} className="review-note">
+                  {notOnDiskLine(entry)}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="review-question">{promptText(state.prompt)}</div>
+          {state.prompt.kind === "comment" && (
+            <SearchBar
+              lead="comment: "
+              label="Comment"
+              query={state.prompt.text}
+              onChange={(text) => onCommentChange?.(text)}
+              onAccept={(event) => onCommentAccept?.(event)}
+              onCancel={(event) => onCommentCancel?.(event)}
+            />
+          )}
+        </div>
+      )}
+      {state.status !== null && <div className="review-status">{state.status}</div>}
+      <footer className="review-keys">{REVIEW_KEY_LINE}</footer>
     </div>
   );
 });

@@ -92,8 +92,9 @@ one-window mode.
 
 ## Turn review
 
-After an agent turn, `c` in the panel's BROWSE mode lists the files that changed on disk during the turn and their hunks. It is read-only in this
-release: there is no revert and no comments, and no overlay inside nvim.
+After an agent turn, `c` in the panel's BROWSE mode lists the files that changed on disk during the turn and their hunks. From there `x` reverts a hunk
+or a file to what it was before the turn and `u` undoes that, `i` and `s` send comments and your reverts back to the agent, and `o` draws the hunks over the
+file in your nvim.
 
 - **It keeps a copy of your project's files.** To tell what a turn changed, Eitri takes a snapshot before and after each turn into its own
   repository under `~/.local/state/eitri/review/` (directories 0700, files 0600). It copies every file your ignore rules do not exclude, up to 8 MiB
@@ -103,6 +104,14 @@ release: there is no revert and no comments, and no overlay inside nvim.
   copied either.
 - **"Changed on disk during this turn" is not "the agent changed".** A change you made by hand, or one made by `Bash` or another tab, shows as `?`
   next to the agent's own edits (`✓`); a turn that overlaps another one is labelled.
+- **A revert keeps the bytes it replaced** in that same store, under `~/.local/state/eitri/review/`, for 30 days, so `u` can bring them back.
+- **Another program writing the same file at the same instant can lose its write.** A revert checks the file just before it writes, but no lock exists
+  that other programs honour; `u` restores what was there.
+- **A window with `review.enabled = false`, or one on the legacy backend, still blocks reverts from another window.** Every Eitri window on a project
+  holds a small lock file while it is open, so one window cannot write under another window's unsaved buffers.
+- **A revert whose file sits behind a symbolic link to a directory is refused,** whether the link leads inside the project or outside it.
+- **An interrupted revert is offered back only in a window with turn review on.** If the window was killed in the middle of rewriting a file in place (one
+  with a second hard link, another owner or extended attributes), the next window with turn review on offers to restore the saved bytes.
 - **Limits:** a file over 8 MiB is listed as too large with no patch; a patch over 2,000 lines shows only its counts; a file name that is not valid
   UTF-8 is listed but its patch cannot be opened; a project inside a larger repository (opened below the repository's top level) honours neither
   the parent's `.gitignore` files above its own root nor the repository's `info/exclude`, so files excluded only there are copied into the store.
