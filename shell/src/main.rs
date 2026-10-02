@@ -21,6 +21,7 @@ mod module_grid;
 mod nvim_keys;
 mod pane_focus;
 mod pane_switch;
+mod panel_csp;
 mod panel_pacer;
 mod panel_super;
 mod prefix;
@@ -93,6 +94,11 @@ fn main() -> glib::ExitCode {
     if early_args.first().is_some_and(|a| a == "panel") {
         return companion::run(early_args[1..].to_vec());
     }
+    // After the panel branch, which reads `$NVIM` as its default address; before anything that starts a
+    // thread or a child. An Eitri started from an nvim `:terminal` would otherwise hand that editor's
+    // RPC address -- and, if it is another window's nvim, that window's socket variables -- to the
+    // agent, its tools and the bottom shell.
+    companion::drop_inherited_editor_env();
     let has_flag = |flag: &str| eitri_core::project_root::flag_given(early_args.iter().map(OsString::as_os_str), flag);
 
     // `--version` (v1-dist plan Task 1, spec §3), before anything else -- including the stdin
@@ -2499,6 +2505,32 @@ mod tests {
             src.matches(concat!(".arr", "ive()")).count() >= 2,
             "move_focus and arrive both use it"
         );
+    }
+
+    /// The full window drops the outer nvim's variables before anything can inherit them: after the
+    /// panel branch (which reads `$NVIM`), ahead of the backend check, the nvim probe and GTK. Byte
+    /// offsets, not lines, so the order holds however the lines are wrapped.
+    #[test]
+    fn main_drops_the_inherited_editor_env_before_any_child() {
+        // Split literals, so this test's own text is not counted.
+        let src = include_str!("main.rs");
+        let start = src.find(concat!("fn main() -> glib", "::ExitCode {")).expect("main");
+        let end = start
+            + src[start..]
+                .find(concat!("fn build_", "application"))
+                .expect("build_application");
+        let body = &src[start..end];
+        let call = concat!("drop_inherited", "_editor_env()");
+        assert_eq!(body.matches(call).count(), 1, "called exactly once in main");
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} in main"));
+        let order = [
+            at(concat!("companion::run(", "early_args")),
+            at(call),
+            at(concat!("BackendKind::", "from_env")),
+            at(concat!("nvim_bin::", "resolve()")),
+            at(concat!("build_", "application()")),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
     }
 
     /// The overlay's "Anywhere in the window" rows come from `eitri_core::keymap::root`, and its

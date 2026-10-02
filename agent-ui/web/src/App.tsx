@@ -44,6 +44,7 @@ import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, oldestWaitingPermission, promptIndex, waitingCardAfter } from "./timeline";
 import { buildDisplay, indexOfKey, runKeyOf } from "./display";
 import { outputText, primaryText } from "./copyText";
+import { codeBlockText, renderedText } from "./markdown";
 import { countCodePoints } from "./toolRegistry";
 import { findMatch } from "./search";
 import { SearchBar } from "./components/SearchBar";
@@ -5375,13 +5376,17 @@ export default function App() {
         // is still in the DOM and still inside the row under the cursor -- anything else and the
         // user is looking at something else now.
         if (landedCode !== null && landedCode.isConnected && cursorRow()?.contains(landedCode)) {
-          copied(landedCode.querySelector("code")?.textContent ?? landedCode.textContent ?? "", timeline[cursor]?.key);
+          copied(codeBlockText(landedCode), timeline[cursor]?.key);
           break;
         }
         // No item at the cursor (an empty timeline) writes NOTHING, rather than clobbering
         // whatever the user already had on the clipboard with "" -- found in review.
         const item = timeline[cursor];
-        if (item !== undefined) copied(primaryText(item), item.key);
+        if (item === undefined) break;
+        // A reply's row copies what is drawn, not the markdown it came from: the source can hold
+        // comments, raw HTML the sanitizer removed, and text that never reaches the screen.
+        const body = item.kind === "message" ? (cursorRow()?.querySelector<HTMLElement>(".row-body") ?? null) : null;
+        copied(body !== null ? renderedText(body) : primaryText(item), item.key);
         break;
       }
       case "copy-output": {

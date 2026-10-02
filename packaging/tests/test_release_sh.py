@@ -127,6 +127,18 @@ class _Env:
             "EITRI_PUBLIC_REPO_URL": self.public,
         }
         subprocess.run(["git", "init", "-q", "--bare", self.public], check=True, capture_output=True, env=self.vars)
+        # Upstream Neovide, which preflight reads to tell the fork's own commits from upstream's: a bare
+        # repo holding one commit by a contributor, unrelated to the fixture fork.
+        self.upstream = os.path.join(root, "upstream.git")
+        seed = os.path.join(root, "upstream-seed")
+        self.vars["EITRI_UPSTREAM_NEOVIDE_URL"] = self.upstream
+        subprocess.run(["git", "init", "-q", "--bare", self.upstream], check=True, capture_output=True, env=self.vars)
+        subprocess.run(["git", "init", "-q", seed], check=True, capture_output=True, env=self.vars)
+        _write(os.path.join(seed, "README"), "upstream\n")
+        contributor = dict(self.vars, GIT_AUTHOR_NAME="Upstream Dev", GIT_AUTHOR_EMAIL="dev@example.com",
+                           GIT_COMMITTER_NAME="Upstream Dev", GIT_COMMITTER_EMAIL="dev@example.com")
+        for argv in (["add", "-A"], ["commit", "-q", "-m", "upstream"], ["push", "-q", self.upstream, "HEAD:refs/heads/main"]):
+            subprocess.run(["git", "-C", seed, *argv], check=True, capture_output=True, env=contributor)
 
     def git(self, cwd, *args):
         subprocess.run(["git", "-C", cwd, *args], check=True, capture_output=True, env=self.vars)
@@ -723,6 +735,62 @@ class PublicCommitsRule(ReleaseShTestCase):
                                 script=os.path.join(self.clone, "packaging", "release.sh"))
         self.assertReachedDocker(proc)
         self.assertIn("not checked for a private identity or path", proc.stderr)
+
+
+class ForkHistoryRule(ReleaseShTestCase):
+    """The neovide submodule is published with every commit behind the commit the clone records for it,
+    and nothing read those commits' metadata: a fork commit made from a checkout with a private git
+    identity, or with an assistant trailer, shipped unseen. Preflight now hands the recorded commit to
+    publish/fork-guard.sh (upstream Neovide here is the fixture's bare repo, through
+    EITRI_UPSTREAM_NEOVIDE_URL). Nothing is rewritten: a refusal is the end of it."""
+
+    def fork_commit(self, message, author=None):
+        """A new commit in the submodule, recorded in the clone's own commit the way a real update is."""
+        sub = os.path.join(self.clone, "neovide")
+        env = dict(self.env.vars)
+        if author:
+            env.update(GIT_AUTHOR_NAME=author[0], GIT_AUTHOR_EMAIL=author[1])
+        with open(os.path.join(sub, "CHANGES"), "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+        for argv in (["add", "-A"], ["commit", "-q", "-m", message]):
+            subprocess.run(["git", "-C", sub, *argv], check=True, capture_output=True, env=env)
+        self.commit("Update the fork")
+
+    def test_a_fork_commit_by_a_foreign_identity_is_refused(self):
+        self.fork_commit("fork change", author=("Someone Else", "someone@example.com"))
+        self.assertRefused(self.run_release("--unsigned"), "neither the public identity nor an upstream contributor")
+
+    def test_a_claude_trailer_on_a_fork_commit_is_refused(self):
+        # The header is joined at run time: this file ships in the public tree, and the leak scan reads a
+        # literal trailer, or one written in pieces, as a real one.
+        trailer = "-".join(("Co", "Authored", "By"))
+        self.fork_commit(f"fork change\n\n{trailer}: Claude <noreply@example.com>")
+        self.assertRefused(self.run_release("--unsigned"), "attribution trailer")
+
+    def test_a_fork_commit_by_the_public_identity_passes(self):
+        self.fork_commit("fork change")
+        self.assertReachedDocker(self.run_release("--unsigned"))
+
+    def test_an_upstream_that_cannot_be_read_is_refused(self):
+        self.env.vars["EITRI_UPSTREAM_NEOVIDE_URL"] = os.path.join(self.scratch, "nowhere.git")
+        self.assertRefused(self.run_release("--unsigned"), "cannot fetch main")
+
+    def test_a_shallow_submodule_checkout_is_refused(self):
+        shallow = os.path.join(self.clone, "neovide", ".git")
+        with open(shallow, encoding="utf-8") as f:
+            gitdir = f.read().split("gitdir:")[1].strip()
+        gitdir = os.path.normpath(os.path.join(os.path.dirname(shallow), gitdir))
+        with open(os.path.join(gitdir, "shallow"), "w", encoding="utf-8") as f:
+            f.write(subprocess.run(["git", "-C", os.path.join(self.clone, "neovide"), "rev-parse", "HEAD"],
+                                   capture_output=True, text=True, env=self.env.vars).stdout)
+        self.assertRefused(self.run_release("--unsigned"), "is a shallow checkout")
+
+    def test_no_leak_scan_skips_it_with_the_rest_of_the_leak_scan(self):
+        self.fork_commit("fork change", author=("Someone Else", "someone@example.com"))
+        proc = self.run_release("--unsigned", "--no-leak-scan",
+                                script=os.path.join(self.clone, "packaging", "release.sh"))
+        self.assertReachedDocker(proc)
+        self.assertIn("the fork's commits are not checked", proc.stderr)
 
 
 class RehearsalRule(ReleaseShTestCase):

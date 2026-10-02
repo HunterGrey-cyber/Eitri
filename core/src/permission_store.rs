@@ -37,7 +37,7 @@ pub fn path(dir: &Path, project_root: &Path) -> PathBuf {
 
 pub fn load(dir: &Path, project_root: &Path) -> LoadedRules {
     let file = path(dir, project_root);
-    let text = match std::fs::read_to_string(&file) {
+    let text = match agent::private_fs::read_private_to_string(&file) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadedRules::Missing,
         Err(e) => return LoadedRules::Unusable(format!("{}: {e}", file.display())),
@@ -66,7 +66,7 @@ pub fn load(dir: &Path, project_root: &Path) -> LoadedRules {
         match PrefixRule::parse(&text) {
             Some(rule) => rules.push(rule),
             None => eprintln!(
-                "[permissions] {}: not a Bash(<words> *) rule, skipped: {text:?}",
+                "[permissions] {}: not a Bash(<words> *) rule a card could offer (a rule over env, sh, timeout... allows any program), skipped: {text:?}",
                 file.display()
             ),
         }
@@ -160,6 +160,36 @@ mod tests {
         );
     }
 
+    /// The rules file decides which calls are answered without a card, so only a regular file this
+    /// user owns is read: another user's file (here, a link to one) is unusable and loads no rules,
+    /// and a FIFO in its place neither blocks the launch nor yields any.
+    #[test]
+    fn a_rules_file_that_is_not_this_users_own_loads_no_rules() {
+        let dir = scratch("foreign");
+        std::fs::create_dir_all(&*dir).unwrap();
+        let file = path(&dir, &root());
+        if agent::private_fs::current_uid() != 0 {
+            std::os::unix::fs::symlink("/etc/passwd", &file).unwrap();
+            match load(&dir, &root()) {
+                LoadedRules::Unusable(why) => assert!(why.contains("not a regular file of this user"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+            std::fs::remove_file(&file).unwrap();
+        }
+        let c_path = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (d, r) = (dir.to_path_buf(), root());
+        std::thread::spawn(move || {
+            let _ = tx.send(matches!(load(&d, &r), LoadedRules::Unusable(_)));
+        });
+        let unusable = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("loading the rules blocked on a FIFO");
+        assert!(unusable);
+    }
+
     #[test]
     fn an_added_rule_is_read_back_and_not_stored_twice() {
         let dir = scratch("add");
@@ -193,6 +223,27 @@ mod tests {
         assert_eq!(
             rules.rules().iter().map(|r| r.to_rule_string()).collect::<Vec<_>>(),
             vec!["Bash(npm ci *)"]
+        );
+    }
+
+    #[test]
+    fn a_rule_the_card_never_offers_is_skipped_on_load() {
+        let dir = scratch("wrapper");
+        let root = root();
+        std::fs::write(
+            path(&dir, &root),
+            format!(
+                "{{\"version\":1,\"project_root\":{:?},\"rules\":[\"Bash(env *)\",\"Bash(timeout *)\",\"Bash(git log *)\"]}}",
+                root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let LoadedRules::Rules(rules) = load(&dir, &root) else {
+            panic!("usable")
+        };
+        assert_eq!(
+            rules.rules().iter().map(|r| r.to_rule_string()).collect::<Vec<_>>(),
+            vec!["Bash(git log *)"]
         );
     }
 

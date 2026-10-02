@@ -58,6 +58,19 @@ export { hljs };
 const defaultLink = Renderer.prototype.link;
 let linkDepth = 0;
 
+/* Which `<pre>` is a code block the renderer wrote, as opposed to one a reply's own raw HTML
+   claims to be. The panel's copy and HINT code paths treat a `pre.code-block` as "the fenced block
+   the reader is looking at", so that class must be something only the `code` renderer below can
+   produce: a reply's own `class="code-block"` is stripped by the class hook, and the renderer
+   instead emits `cb-<nonce>-<n>`, a class name a reply cannot know (the nonce is drawn once per page
+   load and never leaves this module). The hook swaps that marker for the real class and puts the
+   fence's own text on the element, so a copy takes the token's text and not whatever the DOM under
+   the element happens to hold by then. `fencedTexts` is the per-parse list the markers index into. */
+export const CODE_TEXT_ATTR = "data-code-text";
+const CODE_NONCE = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+const CODE_MARKER = new RegExp(`^cb-${CODE_NONCE}-(\\d+)$`);
+let fencedTexts: string[] = [];
+
 /* marked's own `cleanUrl` (not exported; `marked.esm.js`, used by its default `link` and `image`
    renderers): `encodeURI`, then un-double the `%` it encoded, and `null` for a destination
    `encodeURI` refuses (a lone surrogate). Copied so an image's destination is cleaned exactly as a
@@ -101,7 +114,8 @@ marked.use({
         language && hljs.getLanguage(language)
           ? hljs.highlight(text, { language, ignoreIllegals: true }).value
           : escapeHtml(text);
-      return `<pre class="code-block"><code>${body}</code></pre>`;
+      fencedTexts.push(text);
+      return `<pre class="cb-${CODE_NONCE}-${fencedTexts.length - 1}"><code>${body}</code></pre>`;
     },
     link(token: Tokens.Link) {
       linkDepth += 1;
@@ -157,7 +171,7 @@ marked.use({
    `class="row row-current"` (finding 1's adjacent probe) or anything else copied from `index.css`
    must not survive sanitizing -- DOMPurify's default `class` handling keeps any value verbatim. */
 const ALLOWED_CLASS_PREFIXES = ["hljs-", "language-"];
-const ALLOWED_CLASSES = new Set(["code-block", "table-scroll"]);
+const ALLOWED_CLASSES = new Set(["table-scroll"]);
 /* highlight.js's own tiered-scope convention (`core.js`'s `scopeToCSSClass`): a scope name like
    `title.class` becomes TWO space-separated classes on one element, `hljs-title` and a bare
    `class_` (one trailing underscore per nesting depth, so `title.function.invoke` -> `hljs-title`,
@@ -185,16 +199,26 @@ let sanitizeHooksInstalled = false;
 function installSanitizeHooks(): void {
   if (sanitizeHooksInstalled) return;
   sanitizeHooksInstalled = true;
-  DOMPurify.addHook("uponSanitizeAttribute", (_node, data) => {
+  DOMPurify.addHook("uponSanitizeAttribute", (node, data) => {
     if (data.attrName !== "class") return;
     const allowed = (token: string) =>
       ALLOWED_CLASSES.has(token) ||
       ALLOWED_HLJS_MODIFIER_CLASSES.has(token) ||
       ALLOWED_CLASS_PREFIXES.some((prefix) => token.startsWith(prefix));
-    const kept = data.attrValue
-      .split(/\s+/)
-      .filter((token) => token.length > 0)
-      .filter(allowed);
+    const kept: string[] = [];
+    for (const token of data.attrValue.split(/\s+/)) {
+      if (token.length === 0) continue;
+      const marker = CODE_MARKER.exec(token);
+      if (marker !== null) {
+        const text = fencedTexts[Number(marker[1])];
+        if (text !== undefined && node instanceof Element && node.tagName === "PRE") {
+          kept.push("code-block");
+          node.setAttribute(CODE_TEXT_ATTR, text);
+        }
+      } else if (allowed(token)) {
+        kept.push(token);
+      }
+    }
     data.attrValue = kept.join(" ");
     if (data.attrValue === "") data.keepAttr = false;
   });
@@ -234,16 +258,23 @@ function installSanitizeHooks(): void {
      and the invoker attributes name their target by id -- which could be one of the PANEL's own
      ids, since only the reply's own `id`s are forbidden above. `tabindex` would make part of a
      reply a stop for `Tab`, which is how the panel's own controls are reached. */
+/* What the reader sees is what a copy takes. A reply's own HTML can hold text that is in the DOM
+   but not seen in three ways this list closes: a `hidden` attribute (a `<span hidden>` tail on a
+   command), a collapsed `<details>` body, and a colour of its own -- `<font color>` matching the
+   background, or a `bgcolor` cell matching the text. `font` is dropped with its text kept, the
+   attributes are dropped, and a `details` body stays, in flow, as ordinary text. The copy paths
+   below still take rendered text, not `textContent`, which leaves out what CSS hides. */
 const SANITIZE_CONFIG = {
   ALLOW_DATA_ATTR: false,
   ALLOW_ARIA_ATTR: false,
   FORBID_TAGS: [
     "style", "picture", "source", "video", "audio", "input",
-    "iframe", "object", "embed", "svg", "image", "img", "math", "dialog",
+    "iframe", "object", "embed", "svg", "image", "img", "math", "dialog", "details", "summary", "font",
   ],
   FORBID_ATTR: [
     "style", "id", "name", "role", "form", "formaction", "background",
-    "popover", "popovertarget", "popovertargetaction", "commandfor", "command", "tabindex",
+    "popover", "popovertarget", "popovertargetaction", "commandfor", "command", "tabindex", "hidden",
+    "color", "bgcolor",
   ],
 };
 
@@ -290,8 +321,31 @@ export function renderMarkdown(text: string): string {
   if (hit !== undefined) return hit;
   parses += 1;
   installSanitizeHooks();
-  const html = DOMPurify.sanitize(wrapTables(marked.parse(text) as string), SANITIZE_CONFIG);
+  fencedTexts = [];
+  let html: string;
+  try {
+    html = DOMPurify.sanitize(wrapTables(marked.parse(text) as string), SANITIZE_CONFIG);
+  } finally {
+    fencedTexts = [];
+  }
   if (cache.size >= MARKDOWN_CACHE_LIMIT) cache.delete(cache.keys().next().value as string);
   cache.set(text, html);
   return html;
+}
+
+/** The text a reader sees in `el`: `innerText` skips whatever the page does not render (`hidden`,
+ *  `display: none`, a collapsed `<details>`), `textContent` does not. `innerText` is absent only
+ *  where nothing is laid out (jsdom), where the two coincide for the markup the sanitizer allows. */
+export function renderedText(el: HTMLElement): string {
+  return el.innerText ?? el.textContent ?? "";
+}
+
+/** The text of a fenced code block a copy should take. A block the renderer wrote carries its own
+ *  fence's text (`CODE_TEXT_ATTR`), which no later markup inside the element can change; only a block
+ *  without it (not one this module produced) falls back to what is rendered. */
+export function codeBlockText(block: HTMLElement): string {
+  const own = block.getAttribute(CODE_TEXT_ATTR);
+  if (own !== null) return own;
+  const code = block.querySelector<HTMLElement>("code");
+  return renderedText(code ?? block);
 }

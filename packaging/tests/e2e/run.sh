@@ -250,7 +250,7 @@ if ! grep -qF 'signature on SHA256SUMS: good (release@eitri)' first-install.log;
 	fail "no 'signature on SHA256SUMS: good' line: the real ssh-keygen -Y verify path did not run cleanly (codex verdict #5)"
 fi
 if grep -qi 'ssh-keygen was not found' first-install.log; then
-	fail "install.sh degraded to checksum-only (ssh-keygen missing) -- openssh-client is not doing its job"
+	fail "install.sh found no ssh-keygen (it refuses then, or installs unchecked with --insecure-skip-signature) -- openssh-client is not doing its job"
 fi
 
 say "disk usage after the first install (sidecar + nvim included, before --uninstall reclaims it): $(du -sh "$HOME" 2>/dev/null | awk '{print $1}')"

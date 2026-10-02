@@ -2385,7 +2385,7 @@ fn trim_line_ends(bytes: &[u8]) -> &[u8] {
 /// The work one classification may do, in units of about one directory entry listed (~0.16 us on
 /// this host, release build). Calibrated 2026-09-28 so that a classification spending all of it
 /// takes about 40 ms in a release build (the measurements are in the dated record); the owner's
-/// largest repository (muninn) spends about 4,000.
+/// largest repository spends about 4,000.
 const MAX_WORK_PER_CLASSIFICATION: usize = 200_000;
 /// One component looked up (`lstat`) or one link read (`readlink`) by [`resolve`].
 const WORK_PER_LOOKUP: usize = 16;

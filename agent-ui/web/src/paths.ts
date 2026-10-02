@@ -24,12 +24,18 @@ export function parsePath(text: string): PathRef | null {
   return m ? { path: m[1], line: m[2] ? Number(m[2]) : null } : null;
 }
 
+/** U+0000-U+001F and U+007F. A tool's path field is whatever the model or a repository put there,
+ *  and the editor is where it goes: no real file name needs one, and a newline in a name is how a
+ *  path would turn into a second command. */
+const CONTROL_RE = /[\u0000-\u001f\u007f]/;
+
 function fieldPaths(input: unknown): PathRef[] {
   if (!input || typeof input !== "object") return [];
   const fields = input as Record<string, unknown>;
-  return ["file_path", "path", "notebook_path"].flatMap((k) =>
-    typeof fields[k] === "string" && fields[k] !== "" ? [{ path: fields[k] as string, line: null }] : [],
-  );
+  return ["file_path", "path", "notebook_path"].flatMap((k) => {
+    const value = fields[k];
+    return typeof value === "string" && value !== "" && !CONTROL_RE.test(value) ? [{ path: value, line: null }] : [];
+  });
 }
 
 function prosePaths(text: string): PathRef[] {

@@ -273,7 +273,7 @@ fn read_conversation_records(conversation_id: &str) -> Vec<ConversationRecord> {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 return None;
             }
-            serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()
+            serde_json::from_str(&crate::private_fs::read_private_to_string(&path).ok()?).ok()
         })
         .collect();
     if let Some(legacy) = read_legacy_record(&dir) {
@@ -313,7 +313,7 @@ pub(crate) fn recorded_session_ids(conversation_id: &str) -> Vec<String> {
 /// records by failing to parse; it ranks by its real timestamp, and can legitimately sit above one.
 fn read_legacy_record(dir: &Path) -> Option<ConversationRecord> {
     let legacy = dir.with_extension("json");
-    serde_json::from_str(&std::fs::read_to_string(legacy).ok()?).ok()
+    serde_json::from_str(&crate::private_fs::read_private_to_string(&legacy).ok()?).ok()
 }
 
 /// `$XDG_STATE_HOME/eitri/conversations/` -- see `state_dirs` for the full rule, and for the one
@@ -470,7 +470,7 @@ fn prune(dir: &Path, keep: &Path) {
                 }
             }
             Some("json") if path != keep => {
-                let Ok(text) = std::fs::read_to_string(&path) else {
+                let Ok(text) = crate::private_fs::read_private_to_string(&path) else {
                     continue;
                 };
                 let Ok(record) = serde_json::from_str::<ConversationRecord>(&text) else {
@@ -514,7 +514,7 @@ pub fn load_conversation_record(
     provider_session_id: &str,
 ) -> std::io::Result<ConversationRecord> {
     let path = record_path(conversation_id, provider_session_id)?;
-    let contents = std::fs::read_to_string(path)?;
+    let contents = crate::private_fs::read_private_to_string(&path)?;
     serde_json::from_str(&contents).map_err(std::io::Error::other)
 }
 

@@ -25,9 +25,13 @@
 //! `EWOULDBLOCK` and `EINPROGRESS` all mean "a listener is there" (its queue is merely full or the
 //! connection is still completing), and everything else means it is not.
 
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// `tmp/<prefix><pid>-<32 hex uuid>`.
 ///
@@ -212,6 +216,113 @@ pub(crate) fn nonblocking_connect_outcome(path: &Path) -> ConnectOutcome {
     outcome
 }
 
+/// How long to wait before asking a full accept queue again.
+const FULL_QUEUE_RETRY: Duration = Duration::from_millis(20);
+
+/// A connected stream to the listener at `path`, or why not, giving up at `deadline`. A blocking
+/// `connect(2)` to a listener whose accept queue is full sleeps until the queue has room, which
+/// for a listener that never accepts is forever, and a thread left to wait it out is never
+/// reclaimed; this one never waits past `deadline` and needs no thread. A refused or missing socket
+/// fails at once, with the error `UnixStream::connect` would give. The stream comes back blocking.
+pub(crate) fn connect_by(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    let addr = sockaddr_for(path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the path is too long for a Unix socket address",
+        )
+    })?;
+    let raw = nonblocking_unix_socket().ok_or_else(io::Error::last_os_error)?;
+    // SAFETY: `raw` was just opened by this call and nothing else owns it; owning it at once closes
+    // it on every return below.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    loop {
+        // SAFETY: `fd` is open for the call; `addr` is a fully initialized `sockaddr_un` and its
+        // exact size is passed.
+        let rc = unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EISCONN) => break,
+            Some(libc::EINTR) => continue,
+            // Linux: the accept queue is full, and nothing is left pending on this socket, so the
+            // same socket may simply ask again.
+            Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                std::thread::sleep(remaining.min(FULL_QUEUE_RETRY));
+            }
+            // The connection is being made in the background (the BSDs may say so): wait for it.
+            Some(e) if e == libc::EINPROGRESS || e == libc::EALREADY => {
+                wait_until_connected(&fd, deadline)?;
+                break;
+            }
+            _ => return Err(error),
+        }
+    }
+    let stream = UnixStream::from(fd);
+    // Its callers bound their reads and writes with timeouts, which only a blocking socket obeys.
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+/// Waits for a connect in progress on `fd` to finish, up to `deadline`, and says how it ended.
+fn wait_until_connected(fd: &OwnedFd, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        // Rounded up, so a wait of less than a millisecond is not a busy loop of zero-length polls.
+        let millis = remaining.as_micros().div_ceil(1000).min(libc::c_int::MAX as u128) as libc::c_int;
+        let mut pollfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` for an fd open for the call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, millis) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            continue;
+        }
+        let mut status: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `status` and `len` are valid out-pointers of the size `SO_ERROR` fills.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut status as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return match status {
+            0 => Ok(()),
+            errno => Err(io::Error::from_raw_os_error(errno)),
+        };
+    }
+}
+
 /// A new `AF_UNIX` stream socket, non-blocking and close-on-exec, or `None`. Set with `fcntl`
 /// rather than `SOCK_NONBLOCK | SOCK_CLOEXEC` on `socket()`: macOS has neither flag, and this crate
 /// must build there (the macOS track's M2). The fd is the caller's to close.
@@ -283,7 +394,7 @@ fn pid_is_running(pid: u32) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -539,6 +650,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn connect_dir(case: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nvc{}-{case}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("build the fixture");
+        dir
+    }
+
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(2)
+    }
+
+    #[test]
+    fn connect_by_reports_a_missing_socket_at_once_with_its_errno() {
+        let dir = connect_dir("missing");
+        let sock = agent::socket_path::in_dir(&dir, "s.sock").expect("under the cap");
+        let started = std::time::Instant::now();
+        let error = connect_by(&sock, soon()).expect_err("nothing is there");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_by_reports_a_dead_socket_at_once_with_its_errno() {
+        let dir = connect_dir("dead");
+        let sock = agent::socket_path::in_dir(&dir, "s.sock").expect("under the cap");
+        drop(UnixListener::bind(&sock).expect("bind the fixture"));
+        let started = std::time::Instant::now();
+        let error = connect_by(&sock, soon()).expect_err("nothing listens");
+        assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_by_refuses_a_path_too_long_for_a_socket_address() {
+        let long = PathBuf::from(format!("/{}", "x".repeat(200)));
+        let error = connect_by(&long, soon()).expect_err("too long");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+    }
+
+    #[test]
+    fn connect_by_hands_back_a_blocking_stream_to_a_live_listener() {
+        let dir = connect_dir("live");
+        let sock = agent::socket_path::in_dir(&dir, "s.sock").expect("under the cap");
+        let _listener = UnixListener::bind(&sock).expect("bind the fixture");
+        let stream = connect_by(&sock, soon()).expect("a listener is there");
+        // Its callers read with timeouts, which a non-blocking stream ignores, answering at once.
+        // (A timed-out read says `WouldBlock` on Unix too, so the flag is what tells them apart.)
+        assert!(!stream_is_nonblocking(&stream), "the stream must block");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn stream_is_nonblocking(stream: &std::os::unix::net::UnixStream) -> bool {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `F_GETFL` on a descriptor `stream` owns and keeps open for the call.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        flags & libc::O_NONBLOCK != 0
+    }
+
     /// `sockaddr_un` for `path`, or panics: every fixture path here is already checked under
     /// [`agent::socket_path::MAX_SOCKET_PATH_BYTES`] by `in_dir`, so this never has to answer "no
     /// listener" for a path that does not fit -- unlike the production probe, which does.
@@ -550,7 +721,7 @@ mod tests {
     /// A blocking listener at `path` with the given `backlog`, built with raw libc so the test can
     /// pass `backlog = 0` -- `std::os::unix::net::UnixListener::bind` has no way to ask for that.
     #[cfg(target_os = "linux")]
-    fn raw_bind_listen(path: &Path, backlog: i32) -> std::os::raw::c_int {
+    pub(crate) fn raw_bind_listen(path: &Path, backlog: i32) -> std::os::raw::c_int {
         let addr = raw_sockaddr(path);
         // SAFETY: a fresh socket fd; `bind`/`listen` are given a valid, fully-initialized
         // `sockaddr_un` and its exact size, and `fd` is returned to the caller to own and close.
@@ -573,7 +744,7 @@ mod tests {
     /// `Err(errno)` otherwise -- closing the fd itself on any error, since the caller only wants a
     /// live one to hold the queue full.
     #[cfg(target_os = "linux")]
-    fn raw_nonblocking_connect(path: &Path) -> Result<std::os::raw::c_int, i32> {
+    pub(crate) fn raw_nonblocking_connect(path: &Path) -> Result<std::os::raw::c_int, i32> {
         let addr = raw_sockaddr(path);
         // SAFETY: a fresh non-blocking socket fd; `connect` is given a valid, fully-initialized
         // `sockaddr_un` and its exact size. The fd is closed here on every error path and otherwise

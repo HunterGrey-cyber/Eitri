@@ -9,10 +9,10 @@
 //!
 //! This is a local trust boundary that also deletes files, so every step is deliberately narrow:
 //!
-//! - The directory is `$XDG_RUNTIME_DIR/eitri` or `<tmp>/eitri`, created 0700 and then required to
+//! - The directory is `$XDG_RUNTIME_DIR/eitri` or `<tmp>/eitri-<uid>`, created 0700 and then required to
 //!   be a real directory of this user that nobody else can write to. A directory this code did not
 //!   create is never chmodded or removed; it is refused with a reason. When `XDG_RUNTIME_DIR` is
-//!   unset and `<tmp>/eitri` belongs to someone else, that is an error, not a reason to pick another
+//!   unset and `<tmp>/eitri-<uid>` belongs to someone else, that is an error, not a reason to pick another
 //!   shared directory.
 //! - Only a connection whose peer has this process's effective uid is served at all.
 //! - A request is one line of at most 4096 bytes that must arrive within one second in total, and it
@@ -96,11 +96,18 @@ pub enum Claim {
 }
 
 /// The directory the control files live in: `<runtime dir>/eitri` when the runtime dir is set,
-/// non-empty and absolute, else `<tmp>/eitri`.
+/// non-empty and absolute, else `<tmp>/eitri-<uid>`. The runtime dir already belongs to one user;
+/// `<tmp>` is shared, so the fallback carries the uid and another account creating the name first
+/// cannot lock this one out.
 pub fn control_dir(xdg_runtime_dir: Option<&OsStr>, tmp: &Path) -> PathBuf {
+    control_dir_for(xdg_runtime_dir, tmp, euid())
+}
+
+/// [`control_dir`] for an explicit uid.
+fn control_dir_for(xdg_runtime_dir: Option<&OsStr>, tmp: &Path, uid: u32) -> PathBuf {
     match xdg_runtime_dir {
         Some(runtime) if Path::new(runtime).is_absolute() => Path::new(runtime).join("eitri"),
-        _ => tmp.join("eitri"),
+        _ => tmp.join(format!("eitri-{uid}")),
     }
 }
 
@@ -126,7 +133,7 @@ fn lock_path(dir: &Path, project_root: &Path) -> PathBuf {
 
 /// This process's effective uid: what a socket file's owner and a peer's credentials both carry.
 /// (`agent::private_fs::current_uid` is the real uid, which differs under setuid.)
-fn euid() -> u32 {
+pub(crate) fn euid() -> u32 {
     // SAFETY: `geteuid` takes no arguments and cannot fail.
     unsafe { libc::geteuid() }
 }
@@ -173,7 +180,7 @@ fn ensure_dir(dir: &Path) -> Result<(), String> {
 
 /// The uid of the process on the other end of `stream`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     // SAFETY: `ucred` is plain old data and `len` is its exact size; `getsockopt` fills at most that.
     unsafe {
         let mut cred: libc::ucred = std::mem::zeroed();
@@ -201,7 +208,7 @@ fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     target_os = "netbsd",
     target_os = "dragonfly"
 ))]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
     // SAFETY: both out-pointers are valid for the call.
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0 {
@@ -762,16 +769,36 @@ mod tests {
             control_dir(Some(OsStr::new("/run/user/1000")), tmp),
             Path::new("/run/user/1000/eitri")
         );
+        let fallback = tmp.join(format!("eitri-{}", euid()));
         for unusable in [Some(OsStr::new("")), Some(OsStr::new("rel/dir")), None] {
-            assert_eq!(control_dir(unusable, tmp), Path::new("/tmp/eitri"));
+            assert_eq!(control_dir(unusable, tmp), fallback);
         }
     }
 
+    /// Two users on one machine get two different fallback directories, so one of them creating
+    /// the name first cannot lock the other out of companion mode.
     #[test]
-    fn the_socket_path_is_78_bytes_under_macos_tmpdir() {
-        let dir = control_dir(None, Path::new(MACOS_TMP));
-        assert_eq!(socket_path(&dir, &root()).unwrap().as_os_str().len(), 78);
-        assert!(pid_path(&dir, &root()).as_os_str().len() < 78);
+    fn the_fallback_directory_name_holds_the_uid() {
+        let tmp = Path::new("/tmp");
+        assert_eq!(control_dir_for(None, tmp, 1000), Path::new("/tmp/eitri-1000"));
+        assert_eq!(control_dir_for(None, tmp, 501), Path::new("/tmp/eitri-501"));
+        assert_ne!(control_dir_for(None, tmp, 1000), control_dir_for(None, tmp, 1001));
+        assert_eq!(
+            control_dir_for(Some(OsStr::new("/run/user/1000")), tmp, 1000),
+            Path::new("/run/user/1000/eitri"),
+            "a runtime dir is already per user"
+        );
+    }
+
+    #[test]
+    fn the_socket_path_is_82_bytes_under_macos_tmpdir_for_the_first_macos_user() {
+        // 501 is the first account macOS creates; every extra digit of the uid costs one byte.
+        let dir = control_dir_for(None, Path::new(MACOS_TMP), 501);
+        assert_eq!(socket_path(&dir, &root()).unwrap().as_os_str().len(), 82);
+        assert!(pid_path(&dir, &root()).as_os_str().len() < 82);
+        // A uid of the widest width (`uid_t` is 32 bits: ten digits) still fits under the cap.
+        let widest = control_dir_for(None, Path::new(MACOS_TMP), u32::MAX);
+        assert!(socket_path(&widest, &root()).is_ok());
     }
 
     #[test]

@@ -1427,8 +1427,8 @@ pub(crate) fn build_agent_panel(
         return (crate::webkit_sandbox::notice_widget(notice), handle);
     }
     let content_manager = UserContentManager::new();
-    // Finding 3 (panel-content review): a CSP floor the page cannot loosen, plus a network backstop
-    // behind it -- see `PANEL_CONTENT_SECURITY_POLICY` and `PANEL_NETWORK_PROXY_URI`'s doc comments.
+    // A CSP floor the page cannot loosen, plus a network backstop behind it -- see
+    // `panel_content_security_policy` and `PANEL_NETWORK_PROXY_URI`'s doc comments.
     let network_session = NetworkSession::new_ephemeral();
     network_session.set_proxy_settings(
         NetworkProxyMode::Custom,
@@ -1437,7 +1437,7 @@ pub(crate) fn build_agent_panel(
     let webview = WebView::builder()
         .user_content_manager(&content_manager)
         .network_session(&network_session)
-        .default_content_security_policy(PANEL_CONTENT_SECURITY_POLICY)
+        .default_content_security_policy(panel_content_security_policy())
         .build();
     webview.set_hexpand(true);
     webview.set_vexpand(true);
@@ -1449,7 +1449,7 @@ pub(crate) fn build_agent_panel(
     // UserContentManager and therefore the same `eitriAgent` bridge this panel uses to relay
     // permission decisions. Hand link clicks to the system browser instead and keep this WebView
     // on its embedded document for the panel's whole lifetime.
-    webview.connect_decide_policy(|_webview, decision, decision_type| {
+    webview.connect_decide_policy(|webview, decision, decision_type| {
         if decision_type == webkit6::PolicyDecisionType::NavigationAction {
             if let Some(nav_decision) = decision.downcast_ref::<webkit6::NavigationPolicyDecision>() {
                 if let Some(action) = nav_decision.navigation_action() {
@@ -1457,14 +1457,36 @@ pub(crate) fn build_agent_panel(
                         webkit6::NavigationType::LinkClicked => {
                             // A markdown link the model rendered -- never let the embedded panel
                             // itself navigate there (that origin would inherit the same
-                            // UserContentManager/eitriAgent bridge); hand it to the system
-                            // browser instead.
-                            if let Some(uri) = action.request().and_then(|r| r.uri()) {
-                                gtk4::UriLauncher::new(&uri).launch(
-                                    None::<&gtk4::Window>,
-                                    None::<&gtk4::gio::Cancellable>,
-                                    |_| {},
-                                );
+                            // UserContentManager/eitriAgent bridge). A web page or a mail draft
+                            // goes to the system's handler; nothing else is launched: `sms:`,
+                            // `tel:`, `xmpp:`, `ftp:` and the like hand the link's data to another
+                            // program on one click, and a relative link resolves to the panel's
+                            // own address, which goes nowhere. A refusal is logged (the address
+                            // through `{:?}`, which escapes anything a terminal would act on) and
+                            // flashed, so the click is not silently lost.
+                            let uri = action.request().and_then(|r| r.uri());
+                            match uri.as_deref().and_then(clicked_link_url) {
+                                Some(url) => {
+                                    let shown = url.to_string();
+                                    gtk4::UriLauncher::new(url).launch(
+                                        None::<&gtk4::Window>,
+                                        None::<&gtk4::gio::Cancellable>,
+                                        move |result| {
+                                            if let Err(error) = result {
+                                                eprintln!("[agent_panel] link click {shown}: {error}");
+                                            }
+                                        },
+                                    );
+                                }
+                                None => {
+                                    eprintln!("[agent_panel] link click refused: {uri:?}");
+                                    evaluate_js_dispatch(
+                                        webview,
+                                        &eitri_core::agent_bridge::serialize_notice_for_js(
+                                            "not opened: this link's address is not one Eitri opens",
+                                        ),
+                                    );
+                                }
                             }
                             nav_decision.ignore();
                             return true;
@@ -3872,16 +3894,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         }
         InboundMessage::OpenPath { path, line, .. } => {
             let project_dir = state.borrow().project_dir.clone();
-            let candidate = std::path::Path::new(&path);
-            let resolved = if candidate.is_absolute() {
-                candidate.to_path_buf()
-            } else {
-                project_dir.join(candidate)
+            let resolved = match open_path_target(&project_dir, &path) {
+                Ok(resolved) => resolved,
+                Err(why) => return refuse(webview, &why),
             };
-            if !resolved.exists() {
-                refuse(webview, &format!("no such file: {path}"));
-                return;
-            }
             let request = eitri_core::scratch::open_request(&resolved, line);
             match request_editor(state, &request) {
                 Ok(()) => ok(webview),
@@ -4193,6 +4209,26 @@ fn run_pane_nav(state: &Rc<RefCell<AgentPanelState>>, direction: PaneNavDirectio
     Ok(())
 }
 
+/// The file `gf` opens for a path the page sent: relative paths are under the project root. A path
+/// holding a control character is refused outright: the path reaches the editor, where a newline
+/// in a name has been able to end one command and start another, and no real file name the agent
+/// shows needs one.
+fn open_path_target(project_dir: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
+    if path.chars().any(|c| c.is_ascii_control()) {
+        return Err(format!("refused to open a path holding a control character: {path:?}"));
+    }
+    let candidate = std::path::Path::new(path);
+    let resolved = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        project_dir.join(candidate)
+    };
+    if !resolved.exists() {
+        return Err(format!("no such file: {path}"));
+    }
+    Ok(resolved)
+}
+
 /// `open_url` (R6): what a panel key may hand `UriLauncher`. The page sends a WHATWG-normalized
 /// `URL.href` (`nav.ts#webUrl`); no crate here parses the way a browser does (`url` is not a
 /// dependency), so this is a strict re-check instead of a parse: ASCII only, no whitespace, control
@@ -4219,6 +4255,27 @@ fn web_url(url: &str) -> Option<&str> {
         && host != "eitri.invalid"
         && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
     (host_ok && port.chars().all(|c| c.is_ascii_digit())).then_some(url)
+}
+
+/// What a click on a link in the panel may hand `UriLauncher`: a web address `web_url` accepts, or a
+/// `mailto:` one. Every other scheme is refused, and so is a relative link (it resolves to the panel's
+/// own base, which `web_url` refuses). The input comes back unchanged.
+fn clicked_link_url(uri: &str) -> Option<&str> {
+    web_url(uri).or_else(|| mail_url(uri))
+}
+
+/// A `mailto:` address with something after the scheme: ASCII only, no whitespace, control character or
+/// backslash anywhere. `%`, `?`, `&` and `=` stay allowed, since a real mail link carries
+/// `?subject=a%20b`; the mail client parses the rest, and all it can do is open a draft.
+fn mail_url(uri: &str) -> Option<&str> {
+    if uri
+        .chars()
+        .any(|c| !c.is_ascii() || c.is_ascii_whitespace() || c.is_ascii_control() || c == '\\')
+    {
+        return None;
+    }
+    let scheme = uri.get(..7)?;
+    (scheme.eq_ignore_ascii_case("mailto:") && uri.len() > 7).then_some(uri)
 }
 
 /// `tab_verb`'s wire shape to the `TabAction` the prefix's own `Action::Tab` arm runs (spec §10.2).
@@ -4328,11 +4385,14 @@ fn no_session_error() -> eitri_core::agent_backend::BackendError {
 /// The CSP `<meta>` goes in first, ahead of even the theme `<style>` -- a `<meta
 /// http-equiv="Content-Security-Policy">` only governs what loads *after* it in the document, so it
 /// must be the very first thing `<head>` contains, before the single-file build's own inlined
-/// `<script>`/`<style>`. See `PANEL_CONTENT_SECURITY_POLICY`.
+/// `<script>`/`<style>`. See `panel_content_security_policy`.
 fn themed_document(vars: &[(String, String)]) -> String {
     let declarations: String = vars.iter().map(|(name, value)| format!("{name}:{value};")).collect();
     let style = format!("<style id=\"nv-theme\">:root{{{declarations}}}</style>");
-    let csp_meta = format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{PANEL_CONTENT_SECURITY_POLICY}\">");
+    let csp_meta = format!(
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">",
+        panel_content_security_policy()
+    );
     match AGENT_UI_HTML.find("<head>") {
         Some(at) => {
             let insert = at + "<head>".len();
@@ -4369,28 +4429,40 @@ fn paint_webview_background(webview: &WebView, tokens: &eitri_core::theme::Theme
 /// relative link is still a `LinkClicked` that `connect_decide_policy` hands to the browser.
 const PANEL_BASE_URI: &str = "https://eitri.invalid/";
 
-/// Ruling R1 (rendered model content is untrusted) plus finding 3 of
-/// `docs/superpowers/reviews/2026-09-27-v1-hardening/codex-sec-panel-content-verdicts.md`: a CSP
-/// floor the page cannot loosen, applied two ways -- as the `WebView`'s own
-/// `default-content-security-policy` (`build_agent_panel`) and as the first element of `<head>`
-/// (`themed_document`), so it is in force before the single-file build's own inlined `<script>`/
-/// `<style>` run. This is defense in depth behind Task 1's sanitizer, for whatever gets past it.
+/// The panel's Content-Security-Policy: a floor the page cannot loosen, applied two ways -- as the
+/// `WebView`'s own `default-content-security-policy` (`build_agent_panel`) and as the first element
+/// of `<head>` (`themed_document`), so it is in force before the single-file build's own inlined
+/// `<script>`/`<style>` run. Model output rendered in the panel is untrusted; this is defence in
+/// depth behind the markdown sanitizer, for whatever gets past it. Both copies carry the same
+/// string: the browser enforces both, so a script allowed by only one would still be blocked.
 ///
-/// Checked what the panel legitimately loads before picking each directive: `agent-ui/web/src` has
-/// no `fetch`/`XMLHttpRequest`/`WebSocket`/`eval`/`new Function`, and `index.css` has no
+/// Scripts are pinned by the SHA-256 of the bundle's own inline script(s), with no `'unsafe-inline'`
+/// for scripts, so an injected inline handler, `javascript:` URL or `<script>` does not run -- and
+/// script in this page can answer permission cards, so that matters. Styles keep `'unsafe-inline'`:
+/// the theme block `themed_document` inserts and the bundle's own `<style>` need it, and a style
+/// cannot act on the host. The hash is computed from the embedded `AGENT_UI_HTML` at first use
+/// (`crate::panel_csp`), not carried in from the build script: `include_str!` follows the built
+/// file while the build script reruns only when its inputs change, so the two could describe
+/// different bundles, and the panel would silently never start. A document the extractor refuses
+/// gets `script-src 'none'` and a stderr line, never inline script by keyword.
+///
+/// Checked what the panel legitimately loads before picking each other directive: `agent-ui/web/src`
+/// has no `fetch`/`XMLHttpRequest`/`WebSocket`/`eval`/`new Function`, and `index.css` has no
 /// `@font-face`/`url(` -- every font is a locally-installed one named by `font-family`, resolved by
 /// WebKit's own font matching, never loaded as a resource. So `connect-src 'none'` and `media-src
 /// 'none'` cost the panel nothing today. `img-src data:`/`font-src data:` stay open only for a
-/// future inline `data:` use, never a remote load. `script-src`/`style-src 'unsafe-inline'` are what
-/// the single-file build's inlined `<script>`/`<style>` need (`vite-plugin-singlefile` leaves no
-/// hash or nonce to pin instead). `frame-src`/`object-src 'none'` and `form-action`/`base-uri 'none'`
-/// match `connect_decide_policy`'s existing navigation guard just above, which already refuses any
-/// `FormSubmitted`/`LinkClicked` navigation of this WebView itself.
+/// future inline `data:` use, never a remote load. `frame-src`/`object-src 'none'` and
+/// `form-action`/`base-uri 'none'` match `connect_decide_policy`'s existing navigation guard, which
+/// already refuses any `FormSubmitted`/`LinkClicked` navigation of this WebView itself.
 ///
 /// `evaluate_javascript` from Rust (`evaluate_js_dispatch`) bypasses CSP by design -- it is this
 /// panel's own push channel, not page-originated content -- so the dispatch path this panel relies
 /// on is unaffected.
-const PANEL_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
+fn panel_content_security_policy() -> &'static str {
+    static POLICY: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| crate::panel_csp::content_security_policy_for(AGENT_UI_HTML));
+    &POLICY
+}
 
 /// Finding 3's backstop, the same technique the (unbuilt) canvas design names for its own sandbox
 /// (`docs/superpowers/specs/2026-09-23-modules-and-canvas-design.md` §9.1): an ephemeral
@@ -4456,6 +4528,34 @@ mod tests {
     use eitri_core::tab_set::{TabBackend, TabSet};
     use eitri_core::tabs::TabId;
     use eitri_core::test_providers::RecordingProvider;
+
+    /// A path `gf` sends the editor is a file name, and no file name the agent shows needs a control
+    /// character; one holding a newline is refused before nvim sees it, whatever exists on disk.
+    #[test]
+    fn open_path_refuses_a_control_character_before_looking_at_the_disk() {
+        let dir = std::env::temp_dir().join(format!("eitri-open-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("plain.rs"), "").unwrap();
+        let hostile = "notes\nlua(io.open)(string.char(47),string.char(119))";
+        std::fs::write(dir.join(hostile), "").unwrap();
+
+        assert_eq!(open_path_target(&dir, "plain.rs"), Ok(dir.join("plain.rs")));
+        let absolute = dir.join("plain.rs");
+        assert_eq!(
+            open_path_target(&dir, &absolute.to_string_lossy()),
+            Ok(absolute.clone())
+        );
+        let refused = open_path_target(&dir, hostile).unwrap_err();
+        assert!(refused.contains("control character"), "{refused}");
+        for c in ['\0', '\r', '\t', '\x1b', '\x7f'] {
+            let path = format!("a{c}b.rs");
+            assert!(open_path_target(&dir, &path).is_err(), "{path:?}");
+        }
+        assert!(open_path_target(&dir, "missing.rs")
+            .unwrap_err()
+            .contains("no such file"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Pins `SIDECAR_STOPPED_MARKER` against the Rust that actually produces it, the same way
     /// `agent-ui/web/src/problems.test.ts`'s own "matches watch.rs's own wording" test pins the
@@ -5113,6 +5213,42 @@ mod tests {
     fn web_url_refuses_the_panels_own_base() {
         assert_eq!(web_url(PANEL_BASE_URI), None);
         assert_eq!(web_url(&format!("{PANEL_BASE_URI}docs/a.md")), None);
+    }
+
+    /// A click (or Enter on a focused link) launches a web page or a mail draft and nothing else: any
+    /// other scheme hands its data to another program on one click, and a relative link resolves to the
+    /// panel's own address, which goes nowhere.
+    #[test]
+    fn a_clicked_link_launches_only_web_and_mail_addresses() {
+        for uri in [
+            "https://example.com/a",
+            "http://x.y:8080/p",
+            "mailto:a@b.example",
+            "MAILTO:a@b",
+            "mailto:a@b?subject=a%20b",
+        ] {
+            assert_eq!(clicked_link_url(uri), Some(uri), "{uri}");
+        }
+        for uri in [
+            "ftp://x.example/",
+            "sms:123",
+            "tel:123",
+            "callto:x",
+            "xmpp:a@b",
+            "matrix:r/x:y",
+            "cid:x",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://eitri.invalid/docs/a.md",
+            "mailto:",
+            "mailto:a b",
+            "mailto:a@b\n",
+            r"mailto:a\b",
+            "mailto:例@x",
+            "",
+        ] {
+            assert_eq!(clicked_link_url(uri), None, "{uri:?}");
+        }
     }
 
     /// **Correction (R07/S2, D3):** the old version of this test asserted bypass remembered on
@@ -5989,10 +6125,9 @@ mod tests {
         assert_eq!(format!("{}{}", &html[..csp_at], &html[end..]), AGENT_UI_HTML);
     }
 
-    /// Ruling R1 / finding 3 (see `PANEL_CONTENT_SECURITY_POLICY`'s own doc comment): the CSP meta
-    /// is the very first thing inside `<head>` -- nothing (not even the theme style) may load before
-    /// it, and its `content` must be exactly the policy this test pins so a future edit to one copy
-    /// cannot silently drift from the other (`build_agent_panel`'s builder-level CSP).
+    /// The CSP meta is the very first thing inside `<head>` -- nothing (not even the theme style)
+    /// may load before it -- and its `content` is exactly the policy the WebView builder applies, so
+    /// the two copies cannot drift apart (see `panel_content_security_policy`).
     #[test]
     fn the_panel_documents_csp_meta_is_first_in_head_and_matches_the_policy_constant() {
         let tokens = eitri_core::theme::ThemeTokens::fallback();
@@ -6003,45 +6138,156 @@ mod tests {
             html[after_head..].starts_with("<meta http-equiv=\"Content-Security-Policy\""),
             "the CSP meta must be the very first thing after <head>, before even the theme style"
         );
-        let expected_meta =
-            format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{PANEL_CONTENT_SECURITY_POLICY}\">");
+        let expected_meta = format!(
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">",
+            panel_content_security_policy()
+        );
         assert!(html.contains(&expected_meta), "{html}");
         assert_eq!(html.matches("Content-Security-Policy").count(), 1);
     }
 
     /// Pins the policy string itself against silent drift, and each directive's presence against
-    /// the reasoning in `PANEL_CONTENT_SECURITY_POLICY`'s doc comment: `default-src 'none'` closes
-    /// everything not named, and nothing here reopens network access for the panel (`connect-src`,
-    /// `frame-src`, `object-src`, `media-src` all `'none'`; images/fonts limited to `data:`).
+    /// the reasoning in `panel_content_security_policy`'s doc comment: `default-src 'none'` closes
+    /// everything not named, scripts are only the bundle's own (by hash), and nothing here reopens
+    /// network access for the panel (`connect-src`, `frame-src`, `object-src`, `media-src` all
+    /// `'none'`; images/fonts limited to `data:`).
     #[test]
     fn the_panel_csp_closes_every_directive_it_does_not_explicitly_reopen() {
+        let policy = panel_content_security_policy();
+        let hashes = crate::panel_csp::inline_script_hashes(AGENT_UI_HTML)
+            .expect("the embedded bundle's scripts can be pinned")
+            .join(" ");
         assert_eq!(
-            PANEL_CONTENT_SECURITY_POLICY,
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; \
-             font-src data:; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; \
-             form-action 'none'; base-uri 'none'"
+            policy,
+            format!(
+                "default-src 'none'; script-src {hashes}; style-src 'unsafe-inline'; img-src data:; \
+                 font-src data:; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; \
+                 form-action 'none'; base-uri 'none'"
+            )
         );
-        assert!(PANEL_CONTENT_SECURITY_POLICY.starts_with("default-src 'none';"));
+        assert!(policy.starts_with("default-src 'none';"));
         for directive in [
             "connect-src 'none'",
             "frame-src 'none'",
             "object-src 'none'",
             "media-src 'none'",
         ] {
-            assert!(
-                PANEL_CONTENT_SECURITY_POLICY.contains(directive),
-                "{directive} missing from {PANEL_CONTENT_SECURITY_POLICY}"
-            );
+            assert!(policy.contains(directive), "{directive} missing from {policy}");
         }
-        // No directive allows an https:/http: remote load -- every source list is 'none', an inline
-        // keyword, or `data:`.
-        assert!(!PANEL_CONTENT_SECURITY_POLICY.contains("https:"));
-        assert!(!PANEL_CONTENT_SECURITY_POLICY.contains("http:"));
-        assert!(!PANEL_CONTENT_SECURITY_POLICY.contains('*'));
+        // No directive allows an https:/http: remote load -- every source list is 'none', a hash, an
+        // inline keyword for styles, or `data:`. Base64 has no `*`, so a hash cannot trip the last one.
+        assert!(!policy.contains("https:"));
+        assert!(!policy.contains("http:"));
+        assert!(!policy.contains('*'));
     }
 
-    /// The `WebView` itself must be built with the same policy as a floor the page cannot loosen
-    /// (finding 3's "No CSP" half) -- source-scanned the same way
+    /// The policy's `script-src` names exactly the bundle's inline script, by a hash computed here a
+    /// second time without the extractor: the first `<script` start tag's body, hashed with `sha2`
+    /// rather than GLib. If a rebuilt bundle and the pinned hash ever disagree, this fails instead of
+    /// the panel silently never starting.
+    #[test]
+    fn the_panel_csp_pins_the_embedded_bundles_script_by_hash() {
+        use sha2::Digest;
+        let tag_at = AGENT_UI_HTML.find("<script").expect("the bundle inlines a script");
+        let body_at = tag_at + AGENT_UI_HTML[tag_at..].find('>').expect("its start tag ends") + 1;
+        let body_end = body_at + AGENT_UI_HTML[body_at..].find("</script").expect("it is closed");
+        let expected = format!(
+            "'sha256-{}'",
+            gtk4::glib::base64_encode(&sha2::Sha256::digest(&AGENT_UI_HTML.as_bytes()[body_at..body_end]))
+        );
+        let hashes = crate::panel_csp::inline_script_hashes(AGENT_UI_HTML);
+        assert!(
+            matches!(&hashes, Ok(list) if !list.is_empty()),
+            "the embedded bundle's scripts cannot be pinned: {hashes:?}"
+        );
+        let policy = panel_content_security_policy();
+        let script_src = policy
+            .split(';')
+            .map(str::trim)
+            .find_map(|directive| directive.strip_prefix("script-src "))
+            .expect("the policy has a script-src directive");
+        let sources: Vec<&str> = script_src.split_whitespace().collect();
+        assert_eq!(sources.first().copied(), Some(expected.as_str()), "{policy}");
+        assert_eq!(Ok(sources.iter().map(|s| s.to_string()).collect::<Vec<_>>()), hashes);
+    }
+
+    /// Scripts are allowed only by hash: no keyword or scheme in `script-src` that would let an
+    /// injected inline handler, `javascript:` URL or `<script>` run.
+    #[test]
+    fn the_panel_csp_script_src_allows_nothing_but_hashes() {
+        let policy = panel_content_security_policy();
+        assert!(policy.starts_with("default-src 'none';"), "{policy}");
+        let script_src = policy
+            .split(';')
+            .map(str::trim)
+            .find_map(|directive| directive.strip_prefix("script-src "))
+            .expect("the policy has a script-src directive");
+        let sources: Vec<&str> = script_src.split_whitespace().collect();
+        assert!(!sources.is_empty(), "{policy}");
+        for source in sources {
+            for forbidden in [
+                "'unsafe-inline'",
+                "'unsafe-eval'",
+                "'unsafe-hashes'",
+                "'strict-dynamic'",
+            ] {
+                assert_ne!(source, forbidden, "{policy}");
+            }
+            let digest = source
+                .strip_prefix("'sha256-")
+                .and_then(|rest| rest.strip_suffix('\''))
+                .unwrap_or_else(|| panic!("script-src allows something other than a hash: {source} in {policy}"));
+            // A SHA-256 digest is 32 bytes: 44 base64 characters, the last one padding.
+            assert!(
+                digest.len() == 44
+                    && digest.ends_with('=')
+                    && digest
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')),
+                "not a SHA-256 digest: {source} in {policy}"
+            );
+        }
+    }
+
+    /// No source that builds the panel document or its policy may allow inline script by keyword:
+    /// the Rust sources of this crate, and the web frontend's own `index.html` and sources. Matches
+    /// on content only, so where a line ends does not matter; the needle is split so this test does
+    /// not find itself.
+    #[test]
+    fn no_shell_source_allows_inline_script_by_keyword() {
+        let needle = concat!("script-src ", "'unsafe-inline'");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut pending = vec![
+            root.join("src"),
+            root.join("../agent-ui/web/index.html"),
+            root.join("../agent-ui/web/src"),
+        ];
+        let mut scanned = 0;
+        let mut offenders = Vec::new();
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())) {
+                    pending.push(entry.expect("a directory entry").path());
+                }
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            scanned += 1;
+            if text.contains(needle) {
+                offenders.push(path.display().to_string());
+            }
+        }
+        assert!(scanned > 10, "the scan read only {scanned} files; its paths are wrong");
+        assert!(
+            offenders.is_empty(),
+            "inline script allowed by keyword in: {offenders:?}"
+        );
+    }
+
+    /// The `WebView` itself must be built with the same policy as a floor the page cannot loosen --
+    /// source-scanned the same way
     /// `the_panel_document_is_loaded_in_a_secure_context_that_never_resolves` pins `load_html`,
     /// since constructing a real `WebView` needs a running WebKitGTK display this crate's tests do
     /// not have.
@@ -6057,7 +6303,7 @@ mod tests {
             .expect("the builder chain ends in .build()");
         let chain = &source[builder_at..build_at];
         assert!(
-            chain.contains(".default_content_security_policy(PANEL_CONTENT_SECURITY_POLICY)"),
+            chain.contains(".default_content_security_policy(panel_content_security_policy())"),
             "the WebView builder chain never applies the panel's CSP: {chain}"
         );
     }

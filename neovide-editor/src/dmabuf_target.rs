@@ -46,7 +46,7 @@
 //!
 //! **The fallback itself can cost a download (2026-09-29).** On GTK 4.16+ with GSK's Vulkan
 //! renderer, a driver whose Vulkan cannot import `GtkGLArea`'s implicit-modifier export
-//! (`AB24:0xffffffffffffff`; Mesa RADV, seen in the 2026-09-28 arch-pc record) makes GSK download
+//! (`AB24:0xffffffffffffff`; Mesa RADV, seen in a 2026-09-28 measurement record) makes GSK download
 //! every frame through its GL renderer and upload it again: ~10 ms of main-thread CPU per frame at
 //! 2432x2482, i.e. about +10.75 ms typing at 165 Hz. The workaround is `GSK_RENDERER=gl` (`ngl`
 //! before GTK 4.18), which has GSK import the dmabuf through EGL; it is not yet measured on AMD.

@@ -304,7 +304,7 @@ pub fn save(history: &StoredHistory) -> std::io::Result<()> {
 /// fields this build would choke on, and "it did not deserialize" would report that as corruption.
 pub fn load(conversation_id: &str, provider_session_id: &str) -> Result<StoredHistory, HistoryLoadError> {
     let path = history_path(conversation_id, provider_session_id).map_err(HistoryLoadError::Io)?;
-    let text = std::fs::read_to_string(&path).map_err(HistoryLoadError::Io)?;
+    let text = crate::private_fs::read_private_to_string(&path).map_err(HistoryLoadError::Io)?;
     load_str(&text)
 }
 

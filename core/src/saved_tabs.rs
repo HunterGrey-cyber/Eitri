@@ -112,7 +112,7 @@ pub enum Loaded {
 /// Reads this project's file from `dir`.
 pub fn load(dir: &Path, project_root: &Path) -> Loaded {
     let path = dir.join(file_name(project_root));
-    match std::fs::read_to_string(&path) {
+    match agent::private_fs::read_private_to_string(&path) {
         Ok(text) => match decode(&text, project_root) {
             Ok(saved) => Loaded::Saved(saved),
             Err(why) => Loaded::Unusable(format!("{}: {why}", path.display())),

@@ -35,7 +35,7 @@ pub enum LoadedMode {
 
 pub fn load_mode(dir: &Path, project_root: &Path) -> LoadedMode {
     let path = dir.join(file_name(project_root));
-    let text = match std::fs::read_to_string(&path) {
+    let text = match agent::private_fs::read_private_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadedMode::Missing,
         Err(e) => return LoadedMode::Unusable(format!("{}: {e}", path.display())),

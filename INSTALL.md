@@ -102,9 +102,11 @@ that drops or weakens a check fails a test, not just a release.
 compromise), and anyone who checks `install.sh` by hand against `packaging/release-signers` in git. It
 does **not** protect a first `curl … | sh` against a compromised release page or GitHub account itself:
 the verifier and its key come from the same place `SHA256SUMS` does. **For a numbered release**,
-`install.sh` embeds the signing key and refuses a missing or bad signature outright — except that a
-missing `ssh-keygen` on your own machine only warns and falls back to checksums-only, since it cannot
-run the check itself. **For a release candidate** (like `rc.1`, published before the release key was listed), the
+`install.sh` embeds the signing key and refuses a missing or bad signature outright, and it refuses to
+run at all on a machine without `ssh-keygen` (OpenSSH's client), since it could not check the
+signature there. `--insecure-skip-signature` lets it go on without `ssh-keygen`, checking only the
+checksums, which catch a corrupt download but not a release someone else built; where `ssh-keygen` is
+installed the option changes nothing and the signature is checked anyway. **For a release candidate** (like `rc.1`, published before the release key was listed), the
 installer embeds no key at all — its checksums only detect corruption, never who published them — and
 the recipe above refuses it: such an rc is signed with a throwaway key, never the release key
 (`packaging/release-signers` at `rc.1`'s tag has no key line at all; from the first numbered release
@@ -429,6 +431,9 @@ A few common install-time refusals, in the installer's own words (abridged):
   refuses to install it either way and names where to report it if it keeps happening; just re-run.
 - **`the signature on SHA256SUMS does not verify`** — refuses outright; do not proceed past this on a
   real release. See [Verify before running](#verify-before-running).
+- **`ssh-keygen was not found, so the release signature cannot be checked`** — install OpenSSH's
+  client (`openssh-client` on Debian and Ubuntu, `openssh-clients` on Fedora, `openssh` on Arch) and
+  re-run. `--insecure-skip-signature` installs without the check; see above for what that gives up.
 - **the `claude` CLI was not found on `PATH`, or an unsupported version** — a warning, not a refusal:
   Eitri installs regardless, but the agent panel needs a working, logged-in Claude Code to run
   turns. The warning names Anthropic's own installer.
@@ -444,7 +449,13 @@ A few common install-time refusals, in the installer's own words (abridged):
   installer can only see the accounts your system lists: on a machine joined to a directory service
   that does not enumerate its users, it cannot rule out a directory account sharing that group, so
   there `chmod g-w ~/.cache`, or pointing `XDG_CACHE_HOME` at a directory of your own, is the safe
-  choice.
+  choice. The same holds for every directory above the cache, up to `/`: each must be yours or
+  root's, and writable by no one else unless it has the sticky bit (as `/tmp` does).
+- **`… is a symlink owned by another user`** — the cache directory itself (`$XDG_CACHE_HOME`, by
+  default `~/.cache`) may be a symbolic link of your own (or root's), such as a cache moved to another
+  disk and linked back: the installer resolves the path once, checks every directory on the resolved
+  path, and uses only that. A link that belongs to another user is refused, since its owner could point
+  it at a directory of theirs; set `XDG_CACHE_HOME` to a directory of your own.
 
 <!-- ubuntu-userns: revisit if the owner chooses the automatic sandbox-off option -->
 ### Ubuntu 23.10 and later

@@ -68,6 +68,22 @@ one-window mode.
   whether a window lies that way, so at the edge the key does nothing, as tmux's own `select-pane` does at its edge.
 - **GNOME and KDE: no focus moves.** A Wayland client cannot take focus there; use the desktop's own window keys.
 
+## Security
+
+- **No workspace-trust step yet.** Terminal Claude Code asks whether you trust a folder before it runs that
+  folder's own configuration; Eitri does not ask yet. An agent session in a project loads the project's own
+  `.claude/settings.json`, `.claude/settings.local.json` and `.mcp.json`, so a repository you did not write can
+  start its own hooks and MCP servers, as you, at the first message, before any permission card appears, and its
+  own allow rules can answer calls that would otherwise ask. Until the trust step exists, look at `.claude/` and
+  `.mcp.json` before you open a repository you do not know in Eitri. `agent.user_settings = false` does not
+  change this; it only leaves out your own user settings.
+- **The bottom terminal can write to your clipboard, by design.** A program running there can set the clipboard
+  or the primary selection with an OSC 52 escape sequence (the same default as Alacritty); Eitri shows no notice
+  when it happens, so what you paste next may not be what you copied. Reading the clipboard is refused.
+- **The agent panel's script policy is new and was checked in tests, not yet on a screen on every setup.** The
+  panel now allows only its own script by hash instead of any inline script. If the agent panel stays blank
+  after an update, please report it with your WebKitGTK version.
+
 ## Turn review
 
 After an agent turn, `c` in the panel's BROWSE mode lists the files that changed on disk during the turn and their hunks. It is read-only in this

@@ -17,6 +17,18 @@ import { modeFixedMessage } from "./modeKey";
 import { hintTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS } from "./typingGuard";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+/* A test that sets `unsanitized.on` renders a reply through marked alone: the sanitizer now strips
+   markup (a `hidden` attribute, say) that `nav.ts`'s own link and visibility checks still have to
+   cope with if it ever got through, and those checks are only exercised with it let through. */
+const unsanitized = vi.hoisted(() => ({ on: false }));
+vi.mock("./markdown", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./markdown")>();
+  const { marked } = await import("marked");
+  return { ...real, renderMarkdown: (text: string) => (unsanitized.on ? (marked.parse(text) as string) : real.renderMarkdown(text)) };
+});
+afterEach(() => {
+  unsanitized.on = false;
+});
 afterEach(cleanup);
 
 beforeAll(() => {
@@ -9195,6 +9207,7 @@ describe("gx: web links on a row (v1 picks, Task 8, R6)", () => {
   });
 
   it("shows a link nobody can see, even when its text is its address (a reply can carry a hidden anchor)", () => {
+    unsanitized.on = true;
     const { container } = withReply('<a hidden href="https://evil.example/">https://evil.example/</a>');
     boxLinks(container); // the hidden one is left unboxed, as a browser measures it
     expect(container.querySelector(".row a[hidden]")).not.toBeNull();
@@ -9212,10 +9225,11 @@ describe("gx: web links on a row (v1 picks, Task 8, R6)", () => {
       "[https://good.example<span hidden>.evil.example</span>/](https://good.example.evil.example/)",
     ]) {
       posted = [];
+      unsanitized.on = true;
       const { container, unmount } = withReply(reply);
       boxLinks(container);
       const anchor = container.querySelector(".row a[href]")!;
-      // The setup: the hidden span survived sanitizing, and the text reads as the real address to a test
+      // The setup: the hidden span is let through (the sanitizer is bypassed here), and the text reads as the real address to a test
       // that only looks at `textContent`.
       expect(anchor.querySelector("span[hidden]"), reply).not.toBeNull();
       expect(anchor.textContent, reply).toBe(anchor.getAttribute("href"));

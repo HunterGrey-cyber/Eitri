@@ -24,12 +24,19 @@ pub struct PrefixRule {
 impl PrefixRule {
     /// Claude Code's syntax, prefix form only. Whitespace inside is normalized; anything else is
     /// `None` -- the rules file's reader logs and skips it, which fails toward more cards.
+    ///
+    /// A rule whose first word is a program that runs another program (`env *`, `sh *`,
+    /// `timeout 5 *`, or an assignment such as `LC_ALL=C *`) is `None` too, even though the syntax is fine: it would allow whatever program
+    /// follows, so the card never offers one, and a hand-edited rules file must not add one either.
     pub fn parse(text: &str) -> Option<Self> {
         let inner = text.trim().strip_prefix("Bash(")?.strip_suffix(')')?;
         let inner = inner.trim_end();
         let body = inner.strip_suffix(" *")?;
         let words: Vec<String> = body.split_whitespace().map(str::to_string).collect();
         if words.is_empty() || words.iter().any(|w| w.contains('*')) {
+            return None;
+        }
+        if runs_another_program(&words[0]) {
             return None;
         }
         Some(PrefixRule { words })
@@ -104,6 +111,18 @@ const WRAPPERS: &[&str] = &[
     "timeout", "unbuffer", "watch", "xargs", "zsh",
 ];
 
+/// `env`, `/usr/bin/env` and `./env` all name a program that runs whatever follows, so the word's
+/// last path component is what is compared.
+///
+/// A first word holding `=` is refused too: the shell reads `LC_ALL=C rm -rf src` (and bash's
+/// `A+=x cmd`, `a[0]=x cmd`) as an assignment followed by the program that really runs, the same as
+/// `env LC_ALL=C rm -rf src`, so a rule over it would allow whatever program follows. Any `=` rather
+/// than only a valid name before it: a program whose own name holds `=` is rare enough that losing
+/// its offer costs one more card, not a gap.
+fn runs_another_program(first: &str) -> bool {
+    first.contains('=') || WRAPPERS.contains(&first.rsplit('/').next().unwrap_or(first))
+}
+
 fn is_bare_word(word: &str) -> bool {
     word.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
         && word
@@ -116,8 +135,9 @@ fn is_bare_word(word: &str) -> bool {
 ///
 /// Two narrowings of ruling 14, both toward fewer offers (the card's own `a` still answers the one
 /// call), from the phase 3 whole-branch review:
-/// - a first word in [`WRAPPERS`] suggests nothing: `timeout 5 cargo test` offered `timeout 5 *`,
-///   which would then allow `timeout 5 rm -rf src`;
+/// - a first word in [`WRAPPERS`] (by name or by path, `/usr/bin/timeout`) suggests nothing:
+///   `timeout 5 cargo test` offered `timeout 5 *`, which would then allow `timeout 5 rm -rf src`;
+///   nor does a first word that is an assignment (`LC_ALL=C cargo test`), for the same reason;
 /// - a second word that is not bare (an option) with a bare word anywhere after it suggests
 ///   nothing: the first word alone would span every subcommand the option was hiding, so
 ///   `git -C sub log` offered `git *`, which would then allow `git push --force`. With nothing bare
@@ -125,7 +145,7 @@ fn is_bare_word(word: &str) -> bool {
 pub fn suggest(command: &str) -> Option<PrefixRule> {
     let words: Vec<&str> = command.split_whitespace().collect();
     let first = *words.first()?;
-    if WRAPPERS.contains(&first) {
+    if runs_another_program(first) {
         return None;
     }
     let mut rule = vec![first.to_string()];
@@ -184,6 +204,39 @@ mod tests {
             "",
         ] {
             assert_eq!(PrefixRule::parse(text), None, "{text:?}");
+        }
+    }
+
+    /// A rules file is plain text a person may edit, so `parse` must refuse what the card would
+    /// never offer: a rule whose first word runs another program allows whatever program follows.
+    #[test]
+    fn a_rule_over_a_program_that_runs_another_is_never_read() {
+        for text in [
+            "Bash(env *)",
+            "Bash(sh *)",
+            "Bash(timeout *)",
+            "Bash(timeout 5 *)",
+            "Bash(sudo rm *)",
+            "Bash(/usr/bin/env *)",
+            "Bash(nohup cargo *)",
+            "Bash(LC_ALL=C *)",
+            "Bash(FOO=1 env *)",
+            "Bash(LC_ALL=C rm *)",
+            "Bash(A+=x *)",
+        ] {
+            assert_eq!(PrefixRule::parse(text), None, "{text:?}");
+        }
+        for wrapper in WRAPPERS {
+            let text = format!("Bash({wrapper} *)");
+            assert_eq!(PrefixRule::parse(&text), None, "{text:?}");
+        }
+        for text in [
+            "Bash(git log *)",
+            "Bash(cargo env *)",
+            "Bash(envsubst *)",
+            "Bash(git log --format=%H *)",
+        ] {
+            assert!(PrefixRule::parse(text).is_some(), "{text:?}");
         }
     }
 
@@ -248,7 +301,29 @@ mod tests {
         assert_eq!(suggest("git -C sub log"), None, "an option hides the subcommand");
         assert_eq!(bash("git -C sub log"), None, "an option hides the subcommand");
         assert_eq!(bash("timeout 5 cargo test"), None, "a wrapper runs whatever follows it");
+        assert_eq!(
+            suggest("/usr/bin/timeout 5 cargo test"),
+            None,
+            "a wrapper named by its path"
+        );
+        assert_eq!(suggest("/usr/bin/env cargo test"), None, "a wrapper named by its path");
         assert_eq!(bash("rm -rf sub"), None, "`rm *` is not what approving one rm meant");
+        // A leading assignment runs whatever program follows it, as `env` does. Each of these is a
+        // card for a replaceable reason, so only the suggestion stands between it and a rule.
+        for command in ["LC_ALL=C", "LC_ALL=C -x", "LC_ALL=C rm -rf sub", "FOO=1 env rm -rf sub"] {
+            let c = classify_permission_request("Bash", &json!({ "command": command }), &root);
+            if c.needs_a_human() && REPLACEABLE_BY_A_RULE.contains(&c.reason) {
+                assert_eq!(bash(command), None, "{command}: an assignment runs whatever follows");
+            }
+            assert_eq!(suggest(command), None, "{command}: an assignment runs whatever follows");
+        }
+        for command in ["LC_ALL=C", "LC_ALL=C -x"] {
+            let c = classify_permission_request("Bash", &json!({ "command": command }), &root);
+            assert!(
+                c.needs_a_human() && REPLACEABLE_BY_A_RULE.contains(&c.reason),
+                "{command}: {c:?}"
+            );
+        }
         for wrapper in [
             "nice", "nohup", "sudo", "env", "bash", "sh", "xargs", "command", "exec", "time",
         ] {

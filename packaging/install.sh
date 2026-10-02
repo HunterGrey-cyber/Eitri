@@ -130,6 +130,7 @@ OPT_VERDANDI_SOURCE_TARBALL=
 OPT_BUILD_SIDECAR_INTO=
 OPT_YES=0
 OPT_ALLOW_VERDANDI_REV_MISMATCH=0
+OPT_INSECURE_SKIP_SIGNATURE=0
 
 LOCK_HELD=0
 NV_LOCK=
@@ -190,6 +191,10 @@ usage: sh install.sh [options]
                                install from files already downloaded
   --release-signers FILE       check SHA256SUMS.sig against FILE instead of the key built into this
                                installer (release candidates, tests); warns every time
+  --insecure-skip-signature    on a machine without ssh-keygen, install without checking the
+                               release signature (refused otherwise). Only the checksums are then
+                               checked: they catch a corrupt download, not a release someone else
+                               built. Where ssh-keygen is installed the signature is checked anyway
   --allow-root                 run as root anyway (containers)
   --uninstall [--purge]        remove Eitri; --purge also removes ~/.config/eitri and its state
   --dry-run                    print every action without doing it
@@ -252,6 +257,7 @@ parse_args() {
 		--allow-verdandi-rev-mismatch) OPT_ALLOW_VERDANDI_REV_MISMATCH=1 ;;
 		--purge) OPT_PURGE=1 ;;
 		--allow-root) OPT_ALLOW_ROOT=1 ;;
+		--insecure-skip-signature) OPT_INSECURE_SKIP_SIGNATURE=1 ;;
 		--dry-run) OPT_DRY_RUN=1 ;;
 		*) die "unknown option: $1 (see --help)" ;;
 		esac
@@ -1231,9 +1237,36 @@ prepare_signers() {
 	fi
 }
 
+# require_ssh_keygen: with a key to check against, a machine without ssh-keygen is refused. Going on
+# with checksums alone would install whatever the assets' source served, and the cases the key is
+# there for are exactly the ones where that source is not the one this installer came from: a saved
+# installer re-run to upgrade, a --base-url mirror, files handed over with --tarball/--sums/--sig.
+# --insecure-skip-signature lets such a run go on, and says what that gives up. Sets RSK=1 when
+# ssh-keygen is there (the signature is checked), RSK=0 when the user chose to go on without it.
+# A variable, not an exit status, and a plain statement: rule 2 above.
+require_ssh_keygen() {
+	RSK=1
+	if command -v ssh-keygen >/dev/null 2>&1; then return 0; fi
+	RSK=0
+	if [ "$OPT_INSECURE_SKIP_SIGNATURE" = 1 ]; then
+		warn "ssh-keygen was not found, so the release signature cannot be checked: installing without checking the release signature (--insecure-skip-signature). The checksums only detect corruption, not who made the release: a mirror or files handed to you could carry a release someone else built, and nothing in this run would notice. Install OpenSSH's client and re-run without the option to have it checked"
+		return 0
+	fi
+	read_os_release
+	case $OS_FAMILY in
+	debian) _rsk=' (sudo apt install openssh-client)' ;;
+	fedora) _rsk=' (sudo dnf install openssh-clients)' ;;
+	arch) _rsk=' (sudo pacman -S openssh)' ;;
+	opensuse) _rsk=' (sudo zypper install openssh-clients)' ;;
+	*) _rsk= ;;
+	esac
+	die "ssh-keygen was not found, so the release signature cannot be checked, and this installer carries a release key to check it against: refusing, because without that check a release someone else built would install unnoticed. Install OpenSSH's client$_rsk and re-run; or, to install with only the checksums checked, re-run with --insecure-skip-signature"
+}
+
 # verify_signature SUMS SIG: D13 -- with a key listed, a missing or unfetchable SIG refuses and a
-# bad one refuses; only a missing ssh-keygen degrades, with a message. The command is exactly the
-# spec's; ssh-keygen's no-validate check mode is never used (it accepts a signature by any key).
+# bad one refuses, and so does a missing ssh-keygen unless --insecure-skip-signature
+# (require_ssh_keygen). The command is exactly the spec's; ssh-keygen's no-validate check mode is
+# never used (it accepts a signature by any key).
 verify_signature() {
 	if [ "$NV_SIGNERS_HAVE_KEY" != 1 ]; then
 		warn "this installer carries no release key: checksums only detect corruption, they do not show who made the release"
@@ -1242,10 +1275,8 @@ verify_signature() {
 	if [ ! -f "$2" ]; then
 		die "this release has no SHA256SUMS.sig, but this installer carries a release key and so requires one: refusing, because an unsigned release could have been altered. Report it at $NV_ISSUES"
 	fi
-	if ! command -v ssh-keygen >/dev/null 2>&1; then
-		warn "ssh-keygen was not found, so the release signature cannot be checked: checksums only detect corruption. Install OpenSSH's client (openssh-client / openssh) to have it checked"
-		return 0
-	fi
+	require_ssh_keygen
+	if [ "$RSK" != 1 ]; then return 0; fi
 	if [ "$OPT_DRY_RUN" = 1 ] && [ -z "$OPT_SIGNERS" ]; then
 		# prepare_signers writes the embedded key to $NV_SIGNERS only in a real run, and a dry run
 		# writes nothing: ssh-keygen would find no file and report a good signature as a bad one
@@ -1340,7 +1371,11 @@ obtain_release() {
 			if [ "$_or_v" != "$NV_VERSION" ]; then die "the release changed while it was being fetched: re-run"; fi
 		fi
 		if [ "$NV_SIGNERS_HAVE_KEY" = 1 ]; then
-			say "would download $NV_REL_URL/SHA256SUMS.sig and check it with ssh-keygen -Y verify (not checked in a dry run)"
+			# A dry run reports the refusal a real run would make.
+			require_ssh_keygen
+			if [ "$RSK" = 1 ]; then
+				say "would download $NV_REL_URL/SHA256SUMS.sig and check it with ssh-keygen -Y verify (not checked in a dry run)"
+			fi
 		else
 			verify_signature - -
 		fi
@@ -1425,12 +1460,13 @@ own_private_group() {
 	_opg_user=$(id -un 2>/dev/null) || return 0
 	_opg_group=$(id -gn 2>/dev/null) || return 0
 	if [ -z "$_opg_user" ] || [ "$_opg_user" != "$_opg_group" ]; then return 0; fi
-	[ -n "$(find -H "$1" -maxdepth 0 -gid "$_opg_gid" -print 2>/dev/null)" ] || return 0
+	[ -n "$(find "$1" -maxdepth 0 -type d -gid "$_opg_gid" -print 2>/dev/null)" ] || return 0
 	# An extended ACL can give a named user or group write access that the mode bits do not show (the
 	# group bits then report the ACL mask), so a directory with one never gets the allowance. GNU ls
-	# marks it with a '+' after the mode (-L: of what a symlinked cache points at, as find -H checks
-# above); getfacl, where it is installed, lists the entries themselves.
-	_opg_ls=$(ls -ldL -- "$1" 2>/dev/null) || return 0
+	# marks it with a '+' after the mode (of the directory itself: every caller passes a name already
+	# checked to be a directory, not a link, as the find above checks again); getfacl, where it is
+	# installed, lists the entries themselves.
+	_opg_ls=$(ls -ld -- "$1" 2>/dev/null) || return 0
 	case $_opg_ls in ??????????+*) return 0 ;; esac
 	if command -v getfacl >/dev/null 2>&1; then
 		_opg_acl=$(getfacl -cp -- "$1" 2>/dev/null) || return 0
@@ -1461,12 +1497,36 @@ own_private_group() {
 	if [ "$_opg_verdict" = ok ]; then OPG=1; fi
 }
 
+# foreign_cache_link NAME UID: sets FCL=1 when NAME is itself a symlink owned by neither UID nor
+# root, else FCL=0. find without -H or -L looks at the link, not at what it leads to. Never 1 for
+# uid 0, as the ownership checks in acquire_lock are skipped for it. Called as a plain statement
+# (rule 2 above).
+foreign_cache_link() {
+	FCL=0
+	if [ ! -L "$1" ] || [ "$2" = 0 ]; then return 0; fi
+	_fcl_hit=$(find "$1" -maxdepth 0 -type l ! -uid "$2" ! -uid 0 -print 2>/dev/null) || _fcl_hit=
+	if [ -n "$_fcl_hit" ]; then FCL=1; fi
+}
+
 acquire_lock() {
 	NV_LOCK=$NV_CACHE_NV/lock
-	if [ "$OPT_DRY_RUN" = 1 ]; then
-		say "would take the lock $NV_LOCK"
-		return 0
-	fi
+	# A cache root that is itself a symlink is followed: the path is resolved once below, only the
+	# resolved path is used from then on, and every directory on it is checked without following a
+	# link, so repointing the link afterwards changes nothing (a ~/.cache linked to another disk is
+	# common). One owned by another user (not you, and not root) is refused all the same: it would
+	# let them choose where this run creates its cache directory, before anything is resolved. The
+	# test is on the name without trailing slashes, which would make it look at the link's target.
+	_al_root=$NV_CACHE
+	while :; do
+		case $_al_root in
+		?*/) _al_root=${_al_root%/} ;;
+		*) break ;;
+		esac
+	done
+	_al_uid=$(id -u) || die "id -u failed"
+	_al_symlink_msg="$_al_root is a symlink owned by another user, who could point it at a directory of their own, so this installer refuses to keep downloads behind it. Set XDG_CACHE_HOME to a directory of your own and re-run"
+	foreign_cache_link "$_al_root" "$_al_uid"
+	if [ "$FCL" = 1 ]; then die "$_al_symlink_msg"; fi
 	# installer-claude-8 (+installer-codex-1): a symlinked <cache>/eitri is refused outright,
 	# before `mkdir -p` (which is a silent no-op on one already pointing at an existing directory,
 	# so it would otherwise never even reach a permission check). Another user, in a shared sticky
@@ -1475,13 +1535,39 @@ acquire_lock() {
 	if [ -L "$NV_CACHE_NV" ]; then
 		die "$NV_CACHE_NV is a symlink: a download checked there could be replaced by repointing it, and this installer refuses to use it. Remove it, or set XDG_CACHE_HOME to a directory of your own, and re-run"
 	fi
+	# A dry run stops here, after the two refusals above: they only look at names and change
+	# nothing, so it reports them as a real run would. Everything below creates or depends on what
+	# creating would leave.
+	if [ "$OPT_DRY_RUN" = 1 ]; then
+		say "would take the lock $NV_LOCK"
+		return 0
+	fi
 	# A cache directory this run creates is removed again with its contents (on_exit), so a run
 	# that installs nothing leaves nothing.
 	if [ ! -d "$NV_CACHE" ]; then NV_CACHE_CREATED=1; fi
 	# 0700 when this run creates it; the cache directory above keeps the user's umask.
 	# shellcheck disable=SC2174 # -m for the deepest directory only, deliberately
 	mkdir -p -m 0700 -- "$NV_CACHE_NV" || die "cannot create $NV_CACHE_NV: check that $NV_CACHE is writable"
-	_al_uid=$(id -u) || die "id -u failed"
+	# Again, now that it exists: a link could have been planted between the test above and mkdir.
+	foreign_cache_link "$_al_root" "$_al_uid"
+	if [ "$FCL" = 1 ]; then die "$_al_symlink_msg"; fi
+	# Resolved once, here, and only the resolved path is used from now on: every check below is on
+	# the directories that path names, and a symlink further up (a cache moved to another disk and
+	# linked from where it was) can no longer be repointed under a check that has already passed.
+	_al_real=$(cd -P -- "$NV_CACHE" && pwd -P) || die "cannot enter $NV_CACHE: check that it is a directory you can enter, and re-run"
+	case $_al_real in
+	*"$NV_NL"*) die "$NV_CACHE resolves to a path holding a newline: set XDG_CACHE_HOME to a plain directory of your own and re-run" ;;
+	/*) ;;
+	*) die "$NV_CACHE did not resolve to an absolute path ($_al_real): set XDG_CACHE_HOME to a directory of your own and re-run" ;;
+	esac
+	NV_CACHE=$_al_real
+	NV_CACHE_NV=${NV_CACHE%/}/eitri
+	NV_DL=$NV_CACHE_NV/download
+	NV_STAGE=$NV_CACHE_NV/unpack
+	NV_LOCK=$NV_CACHE_NV/lock
+	if [ -L "$NV_CACHE_NV" ]; then
+		die "$NV_CACHE_NV is a symlink: a download checked there could be replaced by repointing it, and this installer refuses to use it. Remove it, or set XDG_CACHE_HOME to a directory of your own, and re-run"
+	fi
 	# M2 (v1-dist whole-branch review, 2026-09-28): `mkdir -p` is a silent no-op on a directory that
 	# already exists, so a $NV_CACHE_NV planted in advance by another user (in a shared
 	# XDG_CACHE_HOME) was never checked for who owns it -- only for its own write bits, which say
@@ -1490,7 +1576,7 @@ acquire_lock() {
 	# state-changing step, npm's own install scripts included, runs as root), and ownership alone
 	# is not the boundary root's own unrestricted read/write access is checked against.
 	if [ "$_al_uid" != 0 ]; then
-		_al_nv_owner_bad=$(find -H "$NV_CACHE_NV" -maxdepth 0 ! -uid "$_al_uid" -print 2>/dev/null) || _al_nv_owner_bad=
+		_al_nv_owner_bad=$(find "$NV_CACHE_NV" -maxdepth 0 ! -uid "$_al_uid" -print 2>/dev/null) || _al_nv_owner_bad=
 		if [ -n "$_al_nv_owner_bad" ]; then
 			die "$NV_CACHE_NV is owned by another user, so a download checked there could already be under their control: remove it (or set XDG_CACHE_HOME to a directory of your own) and re-run"
 		fi
@@ -1499,10 +1585,10 @@ acquire_lock() {
 	# in advance under a shared XDG_CACHE_HOME such as /tmp), they could swap the download directory
 	# for their own between the two (Task 9 review). Both the other- and group-write bits are
 	# checked now (installer-claude-8: `-perm -0002` alone missed a group-writable 0770 directory).
-	_al_priv=$(find -H "$NV_CACHE_NV" -prune ! -perm -0002 ! -perm -0020 -print 2>/dev/null) || _al_priv=
+	_al_priv=$(find "$NV_CACHE_NV" -prune -type d ! -perm -0002 ! -perm -0020 -print 2>/dev/null) || _al_priv=
 	if [ -z "$_al_priv" ]; then
 		# Group-write alone, on this user's own private group (own_private_group), lets no one else in.
-		_al_upg=$(find -H "$NV_CACHE_NV" -prune ! -perm -0002 -perm -0020 -print 2>/dev/null) || _al_upg=
+		_al_upg=$(find "$NV_CACHE_NV" -prune -type d ! -perm -0002 -perm -0020 -print 2>/dev/null) || _al_upg=
 		OPG=0
 		if [ -n "$_al_upg" ]; then own_private_group "$NV_CACHE_NV"; fi
 		if [ "$OPG" = 1 ]; then _al_priv=$_al_upg; fi
@@ -1521,22 +1607,35 @@ acquire_lock() {
 	# being owned by someone else. Ownership and write-bits are now both checked, independently: even
 	# a root-owned, perfectly private-looking <cache> owned by someone else is refused, and even a
 	# <cache> we own but left group/other-writable without the sticky bit is refused.
-	if [ -d "$NV_CACHE" ]; then
+	# The same two checks hold for every directory above <cache> too, up to /: whoever can rename an
+	# entry in any of them can swap the whole path below it, and the check of <cache> alone never saw
+	# that. The resolved path held no symlink when it was resolved, but whoever owns a directory on it
+	# can still swap that directory for a link afterwards -- one leading back to the user's own cache
+	# while these checks run, and to their own files once the downloads are checked. So no check here
+	# follows a link (find without -H or -L), and each name must still be a directory: the owner
+	# check sees who owns the entry itself, and an entry that passes it is one only this user or root
+	# can replace from then on, since every directory above it passes the same checks.
+	_al_d=$NV_CACHE
+	while :; do
 		# Skipped for uid 0, the same reason as $NV_CACHE_NV's own ownership check above.
 		if [ "$_al_uid" != 0 ]; then
-			_al_parent_owner_bad=$(find -H "$NV_CACHE" -maxdepth 0 ! -uid "$_al_uid" ! -uid 0 -print 2>/dev/null) || _al_parent_owner_bad=
+			_al_parent_owner_bad=$(find "$_al_d" -maxdepth 0 ! -uid "$_al_uid" ! -uid 0 -print 2>/dev/null) || _al_parent_owner_bad=
 			if [ -n "$_al_parent_owner_bad" ]; then
-				die "$NV_CACHE is owned by another user (not you, and not root), so its owner could replace $NV_CACHE_NV between checks no matter its permissions: set XDG_CACHE_HOME to a directory of your own and re-run"
+				die "$_al_d is owned by another user (not you, and not root), so its owner could replace $NV_CACHE_NV between checks no matter its permissions: set XDG_CACHE_HOME to a directory of your own and re-run"
 			fi
 		fi
-		_al_parent_bad=$(find -H "$NV_CACHE" -maxdepth 0 \( -perm -0002 -o -perm -0020 \) ! -perm -1000 -print 2>/dev/null) || _al_parent_bad=
+		_al_parent_dir=$(find "$_al_d" -maxdepth 0 -type d -print 2>/dev/null) || _al_parent_dir=
+		if [ -z "$_al_parent_dir" ]; then
+			die "$_al_d is no longer a directory (a symlink now, or gone) although it was one when the cache path was resolved, so something on that path is being changed while this installer checks it: set XDG_CACHE_HOME to a directory of your own and re-run"
+		fi
+		_al_parent_bad=$(find "$_al_d" -maxdepth 0 \( -perm -0002 -o -perm -0020 \) ! -perm -1000 -print 2>/dev/null) || _al_parent_bad=
 		if [ -n "$_al_parent_bad" ]; then
 			# rc.2's e2e (2026-09-28): refusing every group-writable <cache> refused a default Ubuntu
 			# user's own 0775 ~/.cache, so `eitri setup` failed after a plain .deb install. Group-write
 			# alone, on this user's own private group, lets no one else in (own_private_group).
-			_al_parent_upg=$(find -H "$NV_CACHE" -maxdepth 0 ! -perm -0002 -perm -0020 -print 2>/dev/null) || _al_parent_upg=
+			_al_parent_upg=$(find "$_al_d" -maxdepth 0 -type d ! -perm -0002 -perm -0020 -print 2>/dev/null) || _al_parent_upg=
 			OPG=0
-			if [ -n "$_al_parent_upg" ]; then own_private_group "$NV_CACHE"; fi
+			if [ -n "$_al_parent_upg" ]; then own_private_group "$_al_d"; fi
 			if [ "$OPG" = 1 ]; then _al_parent_bad=; fi
 		fi
 		if [ -n "$_al_parent_bad" ]; then
@@ -1546,9 +1645,12 @@ acquire_lock() {
 			# a user-private-group system's umask 002 routinely leaves a self-owned ~/.cache at 0775,
 			# where the natural fix is removing the group-write bit we do not need, not adding a
 			# sticky bit meant for a directory shared with others.
-			die "$NV_CACHE is writable by its group or by anyone, and not sticky, so another user could replace $NV_CACHE_NV between checks: if you own $NV_CACHE and do not need to share write access to it, run chmod g-w '$NV_CACHE'; if it is meant to be shared, run chmod +t '$NV_CACHE' instead (or set XDG_CACHE_HOME to a directory of your own) and re-run"
+			die "$_al_d is writable by its group or by anyone, and not sticky, so another user could replace $NV_CACHE_NV between checks: if you own $_al_d and do not need to share write access to it, run chmod g-w '$_al_d'; if it is meant to be shared, run chmod +t '$_al_d' instead (or set XDG_CACHE_HOME to a directory of your own) and re-run"
 		fi
-	fi
+		if [ "$_al_d" = / ]; then break; fi
+		_al_d=${_al_d%/*}
+		if [ -z "$_al_d" ]; then _al_d=/; fi
+	done
 	if ! mkdir -- "$NV_LOCK" 2>/dev/null; then
 		# M4 (v1-dist whole-branch review, 2026-09-28): the stale-lock takeover below is now
 		# serialized by its own mkdir-based sub-lock, so at most one run at a time ever reaches it.

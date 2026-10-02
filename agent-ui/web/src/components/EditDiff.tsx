@@ -1,5 +1,7 @@
 import type { EditPreview } from "../diff";
 import { useProjectRelative } from "../projectPath";
+import { countEscapes, revealHidden } from "../revealHidden";
+import { HiddenWarning, Revealed } from "./Revealed";
 
 /** What an `Edit`/`Write` call would do, rendered for a person to review.
  *
@@ -12,10 +14,18 @@ import { useProjectRelative } from "../projectPath";
  * 3:1 for non-text UI, and drawing diff lines in them measured 2.05-3.84:1 on rose-pine dawn when
  * the same mistake was made in this file's banners. The `+`/`-` gutter carries the colour; the code
  * stays `--nv-fg`, and `indexCss.test.ts` enforces that.
+ *
+ * The file name and every line of the change are drawn through `revealHidden`, as a `Bash` card's
+ * command is: a card is raised for exactly the edits that need a human (outside the project, a
+ * protected path), and a right-to-left override in a file name could make it read as another file.
+ * `data-path` keeps the real path, so opening it opens the file the call names.
  */
 export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPreview; maxLines?: number; createsFile?: boolean }) {
   const shownPath = useProjectRelative(preview.filePath);
   const diff = preview.diff !== null && maxLines !== undefined && preview.diff.length > maxLines ? preview.diff.slice(0, maxLines) : preview.diff;
+  const pathPieces = revealHidden(shownPath);
+  const linePieces = diff?.map((line) => revealHidden(line.text)) ?? [];
+  const hidden = countEscapes(pathPieces) + linePieces.reduce((sum, pieces) => sum + countEscapes(pieces), 0);
   return (
     <div className="permission-card-edit">
       <div className="permission-card-edit-head">
@@ -23,7 +33,7 @@ export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPrev
             path is also a `gf`/click target; an empty one is not a path to open. */}
         {preview.filePath ? (
           <span className="permission-card-edit-path path-link" data-path={preview.filePath}>
-            {shownPath}
+            <Revealed pieces={pathPieces} />
           </span>
         ) : (
           <span className="permission-card-edit-path">(no file named)</span>
@@ -32,6 +42,7 @@ export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPrev
           +{preview.added} −{preview.removed}
         </span>
       </div>
+      <HiddenWarning count={hidden} what="change" />
       {preview.wholeFile &&
         (createsFile === true ? (
           /* v1 polish F22: Rust found nothing at the path when the card was raised, so nothing is
@@ -66,7 +77,9 @@ export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPrev
               <span className="diff-gutter" aria-hidden="true">
                 {line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}
               </span>
-              <span className="diff-text">{line.text}</span>
+              <span className="diff-text">
+                <Revealed pieces={linePieces[i]} />
+              </span>
             </div>
           ))}
         </pre>

@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=7e96a879372f6fd9bde0929500ddd2e4cd0ebf05e265eb4d25acab49fe091f91 -->
+<!-- translated-from: INSTALL.md sha256=ae9fab052787a2f86f5ad584290560744c0785ed52493a68620047731ef0f5e2 -->
 
 # 安装 Eitri
 
@@ -67,7 +67,7 @@ sh install.sh
 
 这份流程针对一个真实签名过的发行版本跑过一遍：把 `install.sh` 在签名完成后换成另一个文件（`SHA256SUMS`/`.sig` 原封不动，正是一个被攻陷的发布服务器或镜像会采取的手法），它会打印出 `install.sh does not match the verified SHA256SUMS: do not run it`，并且什么都不运行就退出。`packaging/tests/test_public_docs.py` 用它自己的一次性密钥，把这份流程钉死在这个行为上（还包括拒绝一份被篡改过的 `SHA256SUMS`），所以以后如果有改动删掉或削弱了某一步校验，挂掉的是一个测试，而不只是一个发行版本。
 
-**直白地说明一下，这套机制能保护什么、不能保护什么。** 签名能保护 `--base-url` 指向的镜像、`eitri setup`，以及从一份已经装好的副本上做的重新运行（它内嵌的密钥早于之后任何一次可能的入侵），也能保护那些手动拿 `install.sh` 去对照 git 里 `packaging/release-signers` 检查的人。但它**不能**保护第一次 `curl … | sh` 免受发布页面本身或 GitHub 账号被攻陷的影响：验证器和它用的密钥，和 `SHA256SUMS` 来自完全相同的地方。**对于一个正式编号的发行版本**，`install.sh` 内嵌了签名密钥，签名缺失或不对时会直接拒绝运行——但如果你自己机器上没有 `ssh-keygen`，那就只会给个警告，退回到只做校验和检查，因为它没法自己跑这项校验。**对于一个候选发行版本**（比如 `rc.1`，它发布时发布密钥还没有列入），安装脚本根本不内嵌任何密钥——它的校验和只能检测出损坏，永远无法证明是谁发布的——而且上面这份流程会拒绝它：这样的 rc 是用一把一次性密钥签名的，从来不是正式发布密钥（`rc.1` 那个 tag 上的 `packaging/release-signers` 里一行密钥都没有；从第一个正式编号的发行版本起，它里面就是发布密钥）。如果你是通过带外方式拿到了那把一次性密钥的签名者文件，用 `--release-signers FILE` 传进去（或者在上面的流程里把它当作 `release-signers` 使用）；但那只能证明这些文件彼此吻合，不能证明它们来自真正的维护者——这些候选发行版本没有已发布的信任锚点。
+**直白地说明一下，这套机制能保护什么、不能保护什么。** 签名能保护 `--base-url` 指向的镜像、`eitri setup`，以及从一份已经装好的副本上做的重新运行（它内嵌的密钥早于之后任何一次可能的入侵），也能保护那些手动拿 `install.sh` 去对照 git 里 `packaging/release-signers` 检查的人。但它**不能**保护第一次 `curl … | sh` 免受发布页面本身或 GitHub 账号被攻陷的影响：验证器和它用的密钥，和 `SHA256SUMS` 来自完全相同的地方。**对于一个正式编号的发行版本**，`install.sh` 内嵌了签名密钥，签名缺失或不对时会直接拒绝运行；机器上没有 `ssh-keygen`（OpenSSH 的客户端）时它也会拒绝运行，因为在那里它没法校验签名。`--insecure-skip-signature` 让它在没有 `ssh-keygen` 的情况下继续，只检查校验和——校验和能发现下载损坏，却发现不了别人构建的发行版本；装了 `ssh-keygen` 的机器上这个选项不起作用，签名照样会被校验。**对于一个候选发行版本**（比如 `rc.1`，它发布时发布密钥还没有列入），安装脚本根本不内嵌任何密钥——它的校验和只能检测出损坏，永远无法证明是谁发布的——而且上面这份流程会拒绝它：这样的 rc 是用一把一次性密钥签名的，从来不是正式发布密钥（`rc.1` 那个 tag 上的 `packaging/release-signers` 里一行密钥都没有；从第一个正式编号的发行版本起，它里面就是发布密钥）。如果你是通过带外方式拿到了那把一次性密钥的签名者文件，用 `--release-signers FILE` 传进去（或者在上面的流程里把它当作 `release-signers` 使用）；但那只能证明这些文件彼此吻合，不能证明它们来自真正的维护者——这些候选发行版本没有已发布的信任锚点。
 
 ## `.deb` / `.rpm`，然后 `eitri setup`
 
@@ -237,6 +237,7 @@ nvim 里的 `:help eitri.nvim` 有同样的内容。还没有在真实硬件上�
 - **`Eitri's prebuilt binaries need glibc 2.39 or newer`**——和上面情况类似；预构建二进制需要一个不早于上面列出的那些发行版，否则就用 `--from-source`。
 - **`checksum mismatch for …`**——下载损坏了，或者在传输过程中被改动过。不管是哪种情况，安装脚本都会拒绝安装，并且如果这个问题反复出现，会给出报告的地方；直接重新运行一次就好。
 - **`the signature on SHA256SUMS does not verify`**——直接拒绝；在一个正式发行版本上遇到这个，不要继续往下走。见[运行前先验证](#verify-before-running)。
+- **`ssh-keygen was not found, so the release signature cannot be checked`**——装上 OpenSSH 的客户端（Debian 和 Ubuntu 上是 `openssh-client`，Fedora 上是 `openssh-clients`，Arch 上是 `openssh`）再重新运行。`--insecure-skip-signature` 会跳过这项校验直接安装；这样会失去什么，见上文。
 - **在 `PATH` 上找不到 `claude` CLI，或者版本不受支持**——这只是警告，不会拒绝安装：Eitri 照样会装上，但 agent 面板需要一个能用、已登录的 Claude Code 才能运行对话轮次。警告信息里会给出 Anthropic 自己的安装方式。
 - **`~/.local/bin` is not on your `PATH`**，或者 **`\`eitri\` on this PATH runs <something else>`**——安装成功之后会打印出来；把 `~/.local/bin` 加到你 shell 的 `PATH` 里，或者把它排到当前其他响应 `eitri` 这个名字的东西前面（往往是早先某次 `.deb` 安装留下的 `/usr/bin/eitri`）。
 
@@ -246,7 +247,12 @@ nvim 里的 `:help eitri.nvim` 有同样的内容。还没有在真实硬件上�
   的私有组（Ubuntu、Debian 和 Fedora 的常见设置），就会被接受；但如果某条 ACL 或另一个 GID 相同的组让
   别人也能写，仍会拒绝。安装器只能看到系统列得出来的账号：机器加入了不列举用户的目录服务时，它无法排除
   有目录账号共用这个组，这时最稳妥的做法是 `chmod g-w ~/.cache`，或把 `XDG_CACHE_HOME` 指向一个只属于
-  你的目录。
+  你的目录。缓存目录之上直到 `/` 的每一级目录也一样：每一级都必须属于你或 root，而且除非带有 sticky 位
+  （像 `/tmp` 那样），不能让别人写。
+- **`… is a symlink owned by another user`** — 缓存目录本身（`$XDG_CACHE_HOME`，默认是 `~/.cache`）
+  可以是属于你自己（或 root）的符号链接，比如把缓存挪到另一块盘上再链接回来：安装器只解析一次路径，
+  检查解析后路径上的每一级目录，之后只用解析后的路径。属于别的用户的链接会被拒绝，因为它的所有者可以
+  把它改指到自己的目录；这时把 `XDG_CACHE_HOME` 设成一个只属于你的目录。
 
 <!-- ubuntu-userns: revisit if the owner chooses the automatic sandbox-off option -->
 <a id="ubuntu-2310-and-later"></a>

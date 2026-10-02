@@ -170,12 +170,59 @@ fn refusal(id: Value) -> Vec<u8> {
 /// The answer to the request that opens every connection. Request ids for calls start at 1.
 const HANDSHAKE_ID: u64 = 0;
 
+/// The most bytes one frame from nvim may take. Bytes on the wire are not the whole cost: a decoded
+/// value is a few dozen bytes even when its encoding was one (an array of nils), so a frame at this
+/// cap can still decode to some hundreds of MiB, and a larger cap would scale that up with it. The
+/// largest frame this link legitimately reads, the `nvim_get_api_info` answer, is tens of KiB; it
+/// never carries buffer text.
+const MAX_FRAME: u64 = 16 << 20;
+
+/// One frame's read: hands the decoder at most [`MAX_FRAME`] bytes, then fails with
+/// `InvalidData` instead of reporting an end of file, so the link says why it ended. Build one per
+/// frame. It caps the slice it hands to the buffered reader, so only bytes the decoder consumed are
+/// counted; what the buffer already holds of the next frame is left for that frame.
+struct Capped<'a, R> {
+    inner: &'a mut R,
+    left: u64,
+}
+
+impl<'a, R: Read> Capped<'a, R> {
+    fn frame(inner: &'a mut R) -> Capped<'a, R> {
+        Capped { inner, left: MAX_FRAME }
+    }
+}
+
+impl<R: Read> Read for Capped<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.left == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a frame from nvim is larger than {} MiB", MAX_FRAME >> 20),
+            ));
+        }
+        let take = buf.len().min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let read = self.inner.read(&mut buf[..take])?;
+        self.left -= read as u64;
+        Ok(read)
+    }
+}
+
 impl NvimLink {
     /// Connect to nvim's `--listen` socket and ask `nvim_get_api_info` (which nvim answers even
     /// while it waits for a key) for this connection's channel id. Blocks up to `timeout` for the
     /// whole of it; call it on a worker thread only. The `Receiver` carries what nvim sends that is
     /// not an answer.
     pub fn connect(addr: &Path, timeout: Duration) -> Result<(NvimLink, Receiver<LinkEvent>), String> {
+        Self::connect_expecting(addr, timeout, crate::panel_control::euid())
+    }
+
+    /// [`NvimLink::connect`] to a socket that must be held by a process of `uid`. The socket's path
+    /// was checked before this, but a directory others can write to lets the file be swapped
+    /// between that check and the connect, so the process actually on the other end is what counts.
+    fn connect_expecting(addr: &Path, timeout: Duration, uid: u32) -> Result<(NvimLink, Receiver<LinkEvent>), String> {
         let deadline = Instant::now() + timeout;
         let no_answer = || {
             format!(
@@ -186,21 +233,18 @@ impl NvimLink {
         };
         let failed = |error: &dyn fmt::Display| format!("connect {}: {error}", addr.display());
 
-        // `connect(2)` on a socket whose accept queue is full can block, so it runs on a helper
-        // thread that is simply abandoned if it outlives the deadline.
-        let (stream_tx, stream_rx) = mpsc::channel();
-        let target = addr.to_path_buf();
-        thread::Builder::new()
-            .name("nvim-rpc-connect".to_owned())
-            .spawn(move || {
-                let _ = stream_tx.send(UnixStream::connect(target));
-            })
-            .map_err(|e| failed(&e))?;
-        let stream = match stream_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(failed(&e)),
-            Err(_) => return Err(no_answer()),
-        };
+        // A blocking `connect(2)` to a socket whose accept queue is full waits for room, possibly
+        // forever; this one gives up at the deadline.
+        let stream = crate::instance_dir::connect_by(addr, deadline).map_err(|e| match e.kind() {
+            io::ErrorKind::TimedOut => no_answer(),
+            _ => failed(&e),
+        })?;
+        // Before a byte is written: an impostor learns nothing, not even the handshake.
+        match crate::panel_control::peer_uid(&stream) {
+            Ok(peer) if peer == uid => {}
+            Ok(peer) => return Err(failed(&format!("the socket is held by another user (uid {peer})"))),
+            Err(e) => return Err(failed(&format!("cannot tell who holds the socket: {e}"))),
+        }
 
         // One buffered reader serves the handshake and then the reader thread, so bytes it already
         // took off the socket (a notification right behind the answer) are not lost.
@@ -235,7 +279,7 @@ impl NvimLink {
 
         let channel_id = loop {
             // `Source` bounds every read by the deadline, so a frame sent in slow pieces ends here too.
-            let value = rmpv::decode::read_value(&mut reader).map_err(|e| match e.kind() {
+            let value = rmpv::decode::read_value(&mut Capped::frame(&mut reader)).map_err(|e| match e.kind() {
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => no_answer(),
                 io::ErrorKind::UnexpectedEof => failed(&"nvim closed the connection"),
                 _ => failed(&e),
@@ -473,10 +517,10 @@ fn write_frames(frames: Receiver<Vec<u8>>, mut stream: UnixStream, alive: Arc<At
 }
 
 fn read_frames(mut reader: BufReader<Source>, shared: Arc<Shared>, events: Sender<LinkEvent>) {
-    // Only an unreadable stream (end of file or bad encoding) ends the loop. A frame that decodes
-    // but means nothing to us is skipped, and so is a notification nobody is listening for: the
-    // replies behind them are still owed.
-    while let Ok(value) = rmpv::decode::read_value(&mut reader) {
+    // Only an unreadable stream (end of file, bad encoding, a frame over the cap) ends the loop. A
+    // frame that decodes but means nothing to us is skipped, and so is a notification nobody is
+    // listening for: the replies behind them are still owed.
+    while let Ok(value) = rmpv::decode::read_value(&mut Capped::frame(&mut reader)) {
         match classify(&value) {
             Frame::Response { id, error, result } => {
                 let waiter = lock(&shared.waiting).remove(&id);
@@ -912,6 +956,148 @@ mod tests {
         assert!(error.contains("no answer within 300 ms"), "{error}");
         fake.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_refuses_a_socket_held_by_another_uid() {
+        let dir = listener_dir("uid");
+        let sock = agent::socket_path::in_dir(&dir, "f.sock").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let fake = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(T)).unwrap();
+            let mut got = Vec::new();
+            let _ = stream.read_to_end(&mut got);
+            got.len()
+        });
+        let other = crate::panel_control::euid().wrapping_add(1);
+        let error = NvimLink::connect_expecting(&sock, T, other)
+            .err()
+            .expect("a peer of another uid is refused");
+        assert!(error.contains("another user"), "{error}");
+        assert_eq!(fake.join().unwrap(), 0, "nothing was sent to the impostor");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The start of a bin32 that claims `len` bytes.
+    fn bin32_header(len: u32) -> Vec<u8> {
+        let mut bytes = vec![0xc6];
+        bytes.extend(len.to_be_bytes());
+        bytes
+    }
+
+    /// Writes `head`, then zeros until the other end hangs up. Rust ignores SIGPIPE, so the end
+    /// is an `Err` from `write`, not a signal.
+    fn flood(mut stream: UnixStream, head: Vec<u8>) {
+        if stream.write_all(&head).is_err() {
+            return;
+        }
+        let zeros = vec![0u8; 64 * 1024];
+        while stream.write_all(&zeros).is_ok() {}
+    }
+
+    #[test]
+    fn an_oversized_frame_closes_the_link() {
+        let (link, events, fake, _reader) = linked();
+        let pending = link.call("x", vec![]);
+        let writer = std::thread::spawn(move || flood(fake, bin32_header(MAX_FRAME as u32)));
+        assert_eq!(events.recv_timeout(Duration::from_secs(5)), Ok(LinkEvent::Closed));
+        assert_eq!(pending.wait(T), Some(Err(RpcError::Closed)));
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn frames_below_the_cap_each_get_a_fresh_budget() {
+        let (link, _events, mut fake, mut reader) = linked();
+        let pendings: Vec<Pending> = (0..3).map(|_| link.call("m", vec![])).collect();
+        let ids: Vec<u64> = (0..3).map(|_| read_request(&mut reader).0).collect();
+        let half = vec![7u8; (MAX_FRAME / 2) as usize];
+        let for_writer = half.clone();
+        let writer = std::thread::spawn(move || {
+            for id in ids {
+                write_value(&mut fake, response(id, Value::Nil, Value::Binary(for_writer.clone())));
+            }
+            fake
+        });
+        for pending in &pendings {
+            assert_eq!(
+                pending.wait(Duration::from_secs(10)),
+                Some(Ok(Value::Binary(half.clone())))
+            );
+        }
+        assert!(link.is_alive());
+        let _fake = writer.join().unwrap();
+    }
+
+    #[test]
+    fn connect_deadline_covers_an_oversized_handshake_frame() {
+        let dir = listener_dir("big-handshake");
+        let sock = agent::socket_path::in_dir(&dir, "f.sock").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let fake = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(T)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let _ = read_request(&mut reader);
+            let mut head = vec![0x94, 0x01, 0x00, 0xc0];
+            head.extend(bin32_header(MAX_FRAME as u32));
+            flood(stream, head);
+        });
+        let started = Instant::now();
+        let error = NvimLink::connect(&sock, T).err().expect("an oversized answer");
+        assert!(started.elapsed() < T, "took {:?}", started.elapsed());
+        assert!(error.contains("larger than"), "{error}");
+        fake.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listener that never accepts, with its queue full: a blocking `connect(2)` to it would
+    /// sleep until the queue has room, which is never. Linux only: macOS refuses such a connect at
+    /// once, so there is nothing to wait out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_backlog_times_out_and_leaves_no_thread() {
+        use crate::instance_dir::tests::{raw_bind_listen, raw_nonblocking_connect};
+        let dir = listener_dir("backlog");
+        let sock = agent::socket_path::in_dir(&dir, "f.sock").unwrap();
+        let listener_fd = raw_bind_listen(&sock, 0);
+        let mut client_fds = Vec::new();
+        loop {
+            match raw_nonblocking_connect(&sock) {
+                Ok(fd) => client_fds.push(fd),
+                Err(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK => break,
+                Err(errno) => panic!("unexpected connect() errno {errno}"),
+            }
+            assert!(client_fds.len() < 4096, "the accept queue never filled");
+        }
+
+        let started = Instant::now();
+        let error = NvimLink::connect(&sock, Duration::from_millis(300))
+            .err()
+            .expect("a full queue never answers");
+        let elapsed = started.elapsed();
+
+        // Counting threads would race the tests running beside this one, so look for the one thing a
+        // connect left waiting on a helper thread would show: a thread named for it, still there
+        // ("nvim-rpc-connect", which `comm` cuts to 15 bytes).
+        let lingering: Vec<String> = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+            .map(|comm| comm.trim_end().to_owned())
+            .filter(|comm| comm == "nvim-rpc-connec")
+            .collect();
+
+        for fd in client_fds {
+            // SAFETY: each fd came from the fill loop above and is closed exactly once, here.
+            unsafe { libc::close(fd) };
+        }
+        // SAFETY: `listener_fd` came from `raw_bind_listen` above and is closed exactly once.
+        unsafe { libc::close(listener_fd) };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(error.contains("no answer within 300 ms"), "{error}");
+        assert!(elapsed < Duration::from_millis(600), "took {elapsed:?}");
+        assert!(lingering.is_empty(), "a connect thread was left behind: {lingering:?}");
     }
 
     #[test]

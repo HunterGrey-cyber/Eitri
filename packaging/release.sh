@@ -296,6 +296,27 @@ public_commits_check() {
 	rm -f -- "$dump"
 }
 
+# fork_history_check CLONE: the `neovide` submodule is published with every commit reachable from the
+# commit CLONE records for it, and neither public_commits_check nor the asset scans read those. Hand the
+# pinned commit to publish/fork-guard.sh, which refuses an author or committer that is neither the public
+# identity nor an upstream contributor, and an assistant trailer, among the commits upstream
+# Neovide lacks. EITRI_UPSTREAM_NEOVIDE_URL reads upstream from another URL, for tests, with a warning.
+# The guard never rewrites anything; a refusal means the fork's history needs the owner's attention.
+fork_history_check() {
+	local guard url="https://github.com/neovide/neovide.git"
+	guard="$(dirname "$RS_SCAN")/fork-guard.sh"
+	[ -x "$guard" ] || die "publish/fork-guard.sh is not beside publish/scan.sh ($guard): the fork's commit metadata cannot be checked without it"
+	if [ -n "${EITRI_UPSTREAM_NEOVIDE_URL:-}" ]; then
+		warn "reading upstream Neovide from $EITRI_UPSTREAM_NEOVIDE_URL (EITRI_UPSTREAM_NEOVIDE_URL, for tests), not $url"
+		url="$EITRI_UPSTREAM_NEOVIDE_URL"
+	fi
+	# A shallow checkout hides the older commits, which are exactly the ones this reads.
+	[ "$(git -C "$1/neovide" rev-parse --is-shallow-repository)" = false ] \
+		|| die "$1/neovide is a shallow checkout: its older commits cannot be checked (git -C $1/neovide fetch --unshallow)"
+	"$guard" --repo "$1/neovide" --rev "$RS_FORK_COMMIT" --upstream "$url" \
+		|| die "the commit history behind the neovide submodule does not pass publish/fork-guard.sh (nothing is rewritten here: the fork's history is the owner's to fix)"
+}
+
 # =================================================================================================
 # The host side: refusals, then the three container runs, then sums and signature.
 # =================================================================================================
@@ -516,8 +537,9 @@ preflight() {
 	# final version, and wherever publish/scan.sh exists) skips it with them.
 	if [ "$RS_NO_LEAK_SCAN" = 0 ]; then
 		public_commits_check "$RS_SOURCE"
+		fork_history_check "$RS_SOURCE"
 	else
-		warn "--no-leak-scan: $RS_SOURCE's HEAD and the commits a push would publish are not checked for a private identity or path"
+		warn "--no-leak-scan: $RS_SOURCE's HEAD, the commits a push would publish and the fork's commits are not checked for a private identity or path"
 	fi
 }
 

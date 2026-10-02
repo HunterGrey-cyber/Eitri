@@ -41,7 +41,7 @@ fn now_ms() -> u64 {
 }
 
 fn read_lines(file: &Path) -> Result<Option<Vec<Line>>, String> {
-    let text = match std::fs::read_to_string(file) {
+    let text = match agent::private_fs::read_private_to_string(file) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", file.display())),

@@ -1216,6 +1216,26 @@ textarea,
   font-family: var(--nv-font-mono);
   font-size: var(--fs-code);
 }
+/* The command, the JSON input and an edit's file name and diff are what a person approves, so they
+   are laid out in the order of their characters: direction controls are already drawn as escapes
+   (`revealHidden.ts`), and this also turns off the implicit reordering right-to-left letters cause
+   around them, as a terminal without bidi shows the same line. */
+.permission-card-command,
+.permission-card-input,
+.permission-card-edit-path,
+.permission-card-diff {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+}
+/* One escaped character (`⟨U+202E⟩`), and the line saying why there are any. The signal colour is a
+   border, never text (see the note above `.tool-result-error`). */
+.permission-card-escape {
+  outline: 1px solid var(--nv-warn);
+}
+.permission-card-warning {
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 6px;
+}
 .permission-card-description {
   color: var(--nv-surface-muted);
 }

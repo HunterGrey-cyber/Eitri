@@ -1384,6 +1384,17 @@ describe("index.css cascade (which rule actually wins)", () => {
     );
   });
 
+  it("lays a card's command and input out in the order of their characters", () => {
+    // Direction controls on the card are escaped; what remains is the implicit reordering of
+    // right-to-left letters, which this rule turns off so the line reads in byte order.
+    for (const selector of [".permission-card-command", ".permission-card-input", ".permission-card-edit-path", ".permission-card-diff"]) {
+      const cls = selector.slice(1);
+      const style = computed(`<pre class="${cls}">x</pre>`, selector);
+      expect(style.getPropertyValue("unicode-bidi"), selector).toBe("bidi-override");
+      expect(style.getPropertyValue("direction"), selector).toBe("ltr");
+    }
+  });
+
   it("widens the permission-card diff's own bordered box, not just the text inside it", () => {
     // `.permission-card-edit` sets `overflow: hidden` -- widening `.permission-card-diff`/
     // `.diff-line` INSIDE it without widening this box would just be clipped at its edge, so this

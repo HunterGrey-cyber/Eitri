@@ -4,6 +4,8 @@ import type { PermissionDecision } from "../bridge";
 import { editPreview } from "../diff";
 import { isUsableLink } from "../timeline";
 import { EditDiff } from "./EditDiff";
+import { countEscapes, revealHidden } from "../revealHidden";
+import { HiddenWarning, Revealed } from "./Revealed";
 
 type Props = {
   request: PermissionRequestRecord;
@@ -168,12 +170,28 @@ function ToolInput({ toolName, input, createsFile }: { toolName: string; input: 
   const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : null;
   if (toolName === "Bash" && fields && typeof fields.command === "string") {
     // P4: Claude Code's `Command:` line -- the command as the shell will read it, newlines and all.
+    // Characters that would reorder or hide part of it are drawn as escapes (`revealHidden`).
+    const pieces = revealHidden(fields.command);
     return (
       <>
-        <pre className="permission-card-command">$ {fields.command}</pre>
+        <pre className="permission-card-command">
+          {"$ "}
+          <Revealed pieces={pieces} />
+        </pre>
+        <HiddenWarning count={countEscapes(pieces)} what="command" />
         {typeof fields.description === "string" && <div className="permission-card-description">{fields.description}</div>}
       </>
     );
   }
-  return <pre className="permission-card-input">{JSON.stringify(input, null, 2)}</pre>;
+  // `JSON.stringify` escapes control characters but leaves bidi and zero-width ones raw, and this is
+  // the only view of an MCP or WebFetch call, so it gets the same treatment.
+  const pieces = revealHidden(JSON.stringify(input, null, 2) ?? "");
+  return (
+    <>
+      <pre className="permission-card-input">
+        <Revealed pieces={pieces} />
+      </pre>
+      <HiddenWarning count={countEscapes(pieces)} what="input" />
+    </>
+  );
 }
