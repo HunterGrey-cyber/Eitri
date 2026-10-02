@@ -27,6 +27,8 @@ _PACKAGING = os.path.dirname(_HERE)
 _REPO = os.path.dirname(_PACKAGING)
 _SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-aur-pkgbuild-tests")
 DESKTOP = "cn.huntergrey.eitri.desktop"
+PANEL_DESKTOP = "cn.huntergrey.eitri.Panel.desktop"
+PLUGIN_ROOT = os.path.join(_REPO, "nvim", "eitri.nvim")
 # What makepkg's msg2 prints for the one line (the test's own stand-in msg2 prints "  -> text").
 SLOW_LINE = "  -> Installing the Claude Agent SDK and building the sidecar (1-3 min)"
 
@@ -37,6 +39,12 @@ def _icon_files():
         os.path.relpath(os.path.join(d, f), root)
         for d, _dirs, files in os.walk(os.path.join(root, "hicolor"))
         for f in files
+    )
+
+
+def _plugin_files():
+    return sorted(
+        os.path.relpath(os.path.join(d, f), PLUGIN_ROOT) for d, _dirs, files in os.walk(PLUGIN_ROOT) for f in files
     )
 
 
@@ -100,6 +108,21 @@ class _PackageCase(unittest.TestCase):
             [f"usr/share/icons/{rel}" for rel in _icon_files()],
         )
         self.assertEqual(len(_icon_files()), 9)
+        # The panel's hidden entry, and the nvim plugin at the path the packages use.
+        self.assertIn(f"usr/share/applications/{PANEL_DESKTOP}", got)
+        self.assertEqual(
+            _read(os.path.join(self.pkgdir, "usr/share/applications", PANEL_DESKTOP)),
+            _read(os.path.join(_PACKAGING, PANEL_DESKTOP)),
+        )
+        self.assertEqual(len(_plugin_files()), 3)
+        self.assertEqual(
+            [p for p in got if p.startswith("usr/share/eitri/")],
+            [f"usr/share/eitri/nvim/eitri.nvim/{rel}" for rel in _plugin_files()],
+        )
+        for rel in _plugin_files():
+            path = os.path.join(self.pkgdir, "usr/share/eitri/nvim/eitri.nvim", rel)
+            self.assertEqual(_read(path), _read(os.path.join(PLUGIN_ROOT, rel)), rel)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644, rel)
         self.assertEqual(
             _read(os.path.join(self.pkgdir, "usr/share/applications", DESKTOP)),
             _read(os.path.join(_PACKAGING, DESKTOP)),
@@ -123,6 +146,8 @@ class EitriBinPackage(_PackageCase):
         _touch(os.path.join(top, "bin", "eitri"), mode=0o755)
         os.makedirs(os.path.join(top, "share", "applications"))
         shutil.copy(os.path.join(_PACKAGING, DESKTOP), os.path.join(top, "share", "applications", DESKTOP))
+        shutil.copy(os.path.join(_PACKAGING, PANEL_DESKTOP), os.path.join(top, "share", "applications", PANEL_DESKTOP))
+        shutil.copytree(PLUGIN_ROOT, os.path.join(top, "share", "eitri", "eitri.nvim"))
         # The release tarball also carries 0.2.0's own entry, for 0.2.0's installer alone: the package
         # must not install it (assert_desktop_and_icons checks eitri.desktop is absent).
         shutil.copy(os.path.join(_PACKAGING, "legacy", "eitri.desktop"), os.path.join(top, "share", "applications", "eitri.desktop"))
@@ -167,6 +192,8 @@ class EitriGitPackage(_PackageCase):
             _touch(os.path.join(tree, "packaging", name), mode=0o755)
         # The committed entry and icons, exactly as the repository holds them (and the notice).
         shutil.copy(os.path.join(_PACKAGING, DESKTOP), os.path.join(tree, "packaging", DESKTOP))
+        shutil.copy(os.path.join(_PACKAGING, PANEL_DESKTOP), os.path.join(tree, "packaging", PANEL_DESKTOP))
+        shutil.copytree(PLUGIN_ROOT, os.path.join(tree, "nvim", "eitri.nvim"))
         shutil.copytree(os.path.join(_PACKAGING, "icons"), os.path.join(tree, "packaging", "icons"))
         _touch(os.path.join(tree, "LICENSE"), b"MIT\n")
         _touch(os.path.join(self.srcdir, "release-for-sidecar.env"))

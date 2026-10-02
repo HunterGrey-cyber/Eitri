@@ -55,6 +55,9 @@ fs_scaffold() {
 	} >"$_fs_dir/packaging/pins.env"
 	cp "$PKG/eitri.launcher.sh" "$_fs_dir/packaging/eitri.launcher.sh"
 	cp "$PKG/cn.huntergrey.eitri.desktop" "$_fs_dir/packaging/cn.huntergrey.eitri.desktop"
+	cp "$PKG/cn.huntergrey.eitri.Panel.desktop" "$_fs_dir/packaging/cn.huntergrey.eitri.Panel.desktop"
+	mkdir -p "$_fs_dir/nvim"
+	cp -R "$PKG/../nvim/eitri.nvim" "$_fs_dir/nvim/eitri.nvim"
 	cp -R "$PKG/icons" "$_fs_dir/packaging/icons"
 	cp "$INSTALLER" "$_fs_dir/packaging/install.sh"
 	printf 'test fixture LICENSE: MIT-shaped, not the real text.\n' >"$_fs_dir/LICENSE"
@@ -177,6 +180,10 @@ t_from_source_clone_head_match_builds_and_installs() {
 	# The desktop entry named by the application id, and the icon, from the checkout's packaging/; the
 	# placeholder licence file carries the logo's CC BY notice, which needs no generating.
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.desktop"
+	expect_file "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop"
+	for f in plugin/eitri.lua lua/eitri/init.lua doc/eitri.txt; do
+		if ! cmp -s "$PKG/../nvim/eitri.nvim/$f" "$(data_of)/eitri/eitri.nvim/$f"; then fail "the plugin file $f was not installed from the checkout"; fi
+	done
 	expect_absent "$(data_of)/applications/eitri.desktop"
 	for f in $(cd "$PKG/icons" && find hicolor -type f | LC_ALL=C sort); do
 		if ! cmp -s "$PKG/icons/$f" "$(data_of)/icons/$f"; then fail "the icon $f was not installed from the checkout"; fi

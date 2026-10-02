@@ -67,10 +67,13 @@ t_apparmor_steps_when_restricted() {
 	*) fail "the last line is not the steps' own: $(tail -n 1 "$OUT")" ;;
 	esac
 	# Nothing else in the tree: the three entries of the profile's own directory.
-	expect_eq "$(tree "$TH" | grep -v '^\./\.local/share/eitri')" "$EXPECTED_TREE" "the rest of the tree"
+	expect_eq "$(tree "$TH" | grep -v '^\./\.local/share/eitri')" \
+		"$(printf '%s\n' "$EXPECTED_TREE" | grep -v '^\./\.local/share/eitri')" "the rest of the tree"
+	# What is under eitri/: the profile's own directory, then the plugin every install carries.
 	expect_eq "$(tree "$TH" | grep '^\./\.local/share/eitri')" "./.local/share/eitri d
 ./.local/share/eitri/apparmor d
-./.local/share/eitri/apparmor/$name f" "the profile's directory"
+./.local/share/eitri/apparmor/$name f
+$(printf '%s\n' "$EXPECTED_TREE" | grep '^\./\.local/share/eitri/eitri.nvim')" "the profile's directory"
 }
 
 TESTS="$TESTS t_apparmor_nothing_without_the_restriction"

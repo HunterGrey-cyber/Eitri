@@ -250,11 +250,13 @@ a sidecar revision once no install uses it, as [Updating](#updating) describes.
 ~/.local/share/applications/cn.huntergrey.eitri.desktop          Exec = the launcher's absolute path             (tarball route)
 ~/.local/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png the icon, 16 to 512 px, and scalable/…/….svg    (tarball route)
 ~/.local/share/licenses/eitri/                                   LICENSE, THIRD-PARTY-LICENSES, SOURCE           (tarball route)
+~/.local/share/eitri/eitri.nvim/                                 the :EitriPanel plugin                          (tarball route)
 /usr/lib/eitri/                                                  the same four binaries, eitri-setup, RELEASE    (.deb/.rpm)
 /usr/bin/eitri                                                   the same launcher                               (.deb/.rpm)
 /usr/share/applications/cn.huntergrey.eitri.desktop                                                              (.deb/.rpm)
 /usr/share/icons/hicolor/<size>/apps/cn.huntergrey.eitri.png     the same icon files                             (.deb/.rpm)
 /usr/share/licenses/eitri/                                                                                       (.deb/.rpm)
+/usr/share/eitri/nvim/eitri.nvim/                                the :EitriPanel plugin                          (.deb/.rpm, AUR)
 $XDG_DATA_HOME/eitri/sidecar/<rev>/                              the sidecar eitri setup built, per-user routes
 $XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               a private nvim copy, only if you accepted the offer
 ~/.config/eitri/init.lua                                         your own config (EITRI_CONFIG_DIR overrides the dir)
@@ -303,6 +305,111 @@ command. It only reads them; it never starts or asks tmux. A one-time notice say
 and `<prefix> ?` lists each line that was not, with the reason. To turn it off, put
 `eitri.config.set("keymap.from_tmux", "off")` in `~/.config/eitri/init.lua`; your own
 `eitri.keymap` calls there always win over what came from tmux.
+
+## Use it beside your own nvim
+
+Eitri can also run as the agent panel alone: a separate window next to the nvim you already use in
+a terminal (inside tmux or not), in upstream Neovide, or in any other nvim GUI. The panel attaches
+to that nvim over its RPC socket, installs a little glue inside it (the file you have open and your
+Visual selection go to the agent; the panel takes your colorscheme and shows your which-key keys;
+buffers reload after the agent edits them; a file opens at a line from the panel; `Ctrl+g` edits a
+draft in nvim), and removes all of it again when the panel goes away. Nothing is written to your
+nvim configuration. Your editor keeps its own speed and keys, and your window manager arranges the
+two windows.
+
+**1. Add the plugin.** `eitri.nvim` is a thin launcher; everything the panel needs inside nvim, the
+panel installs itself, so the plugin and the installed Eitri never have to match versions. The
+packages (`.deb`, `.rpm`, AUR) put it in `/usr/share/eitri/nvim/eitri.nvim`; the tarball installer
+puts it in `~/.local/share/eitri/eitri.nvim` (under `$XDG_DATA_HOME/eitri/` when that is set). With
+lazy.nvim, point a spec at the directory.
+
+```lua
+-- .deb, .rpm, AUR
+{ dir = "/usr/share/eitri/nvim/eitri.nvim", cmd = "EitriPanel" },
+
+-- the tarball installer (install.sh)
+{ dir = vim.fn.expand("~/.local/share/eitri/eitri.nvim"), cmd = "EitriPanel" },
+```
+
+Without a plugin manager, add the directory to `runtimepath`:
+`set runtimepath+=/usr/share/eitri/nvim/eitri.nvim`. Calling `require("eitri").setup({ ... })` is
+optional: `mapping = "<leader>ep"` binds a key to the command, and `cmd = "/path/to/eitri"` names the
+launcher when it is not on nvim's `PATH`.
+
+**2. Open the panel.** `:EitriPanel` in nvim opens the panel for the current working directory,
+`:EitriPanel ~/some/project` for another. If nvim has no server address yet, the plugin starts one.
+The panel's band says `attaching…` until the glue is in, and nothing times out: nvim answers the
+request once you finish a pending key or a prompt.
+
+**3. Or start it from a shell.**
+
+```sh
+eitri panel [--nvim <addr>] [DIR]
+```
+
+`--nvim` is the address of the nvim to attach to (`:echo v:servername`), a path to a Unix socket
+that you own. It defaults to `$NVIM`, which nvim sets for its `:terminal` and `jobstart()` children;
+TCP addresses (`host:port`) are refused. With no address the panel starts unattached and says so in
+its band; running `:EitriPanel` in nvim attaches it later. `DIR` is the project, resolved exactly
+as for `eitri DIR`.
+
+There is one panel per project. A second `:EitriPanel`, from the same nvim or another one in the
+same project, attaches the running panel to it and raises its window instead of opening a second
+one; the first nvim loses the glue. If the nvim quits, the panel keeps its sessions and its band
+says `editor detached: run :EitriPanel to attach again`.
+
+The panel window has the application id `cn.huntergrey.eitri.Panel` and the title
+`Eitri · <project directory name>`, so a window rule can pick it out. It reads the same
+`~/.config/eitri/init.lua` as the one-window mode (`agent.account` applies); Lua panels and commands
+registered there are not shown, and one line on stderr says how many were left out. It has no
+editor, no bottom terminal and no layout of its own: tab keys, `?`, `:` and the text size keys work
+under the prefix, and the layout keys answer `not in a companion window`.
+
+**4. Moving between the two windows.** In nvim, `Ctrl+h/j/k/l` at the edge of nvim's own windows
+hands the move to the panel, which asks your window manager to focus the neighbouring window. In the
+panel, `Ctrl+h` and `Ctrl+l` always leave the window; `Ctrl+k` leaves from BROWSE (in INPUT it
+switches to BROWSE), and `Ctrl+j` leaves from INPUT (in BROWSE it switches to INPUT). The prefix's
+`Select` keys do the same. Opening a file from the panel raises the editor's window, and a second
+`:EitriPanel` raises the panel.
+
+Which window manager is used is detected from the session; to force one or turn it off, put this in
+`~/.config/eitri/init.lua` (any other value stops the panel at startup, naming the key):
+
+```lua
+eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", "sway", "niri" or "none"
+```
+
+| desktop | detected by | what Eitri does |
+|---|---|---|
+| sway | `SWAYSOCK` | moves focus with `swaymsg`, after checking that a visible window really lies in that direction (on any output), so sway's default focus wrapping does not carry you to the far side. At the edge the key is consumed |
+| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | moves focus with `hyprctl dispatch movefocus`; what happens at the edge is Hyprland's own |
+| niri | `NIRI_SOCKET` | moves focus with `niri msg action`; what happens at the edge is niri's own |
+| GNOME, KDE, anything else | none of the above | no focus moves: a Wayland client cannot take focus there. The band says once that your desktop does not let Eitri move focus; use the desktop's own window keys |
+
+**5. Inside tmux.** When nvim runs inside tmux, nothing in nvim's environment changes, its
+navigator maps are left alone, and your tmux setup keeps moving between tmux panes as it does today.
+The edge of tmux's panes is tmux's: a key that tmux handles never reaches the panel window, so
+crossing to it needs a binding on the tmux side (or your window manager's keys). The editor's window
+is not raised when you open a file from the panel, because from inside tmux the process tree leads
+to the tmux server, not to the terminal.
+
+**6. Navigator plugins.** With nvim outside tmux, vim-tmux-navigator needs nothing: while the panel
+is attached, its `TmuxNavigate` maps are treated as plain window moves. With smart-splits.nvim, hand
+a move off the edge to the panel from its `at_edge` hook; `edge` returns `false` when no panel is
+attached:
+
+```lua
+require("smart-splits").setup({
+  at_edge = function(ctx)
+    if not require("eitri").edge(ctx.direction) then
+      -- no panel attached: your own fallback, or nothing
+    end
+  end,
+})
+```
+
+`:help eitri.nvim` has the same in nvim. What has not been tried on real hardware yet is on the
+[known issues](docs/known-issues.md#companion-mode) page.
 
 ## Troubleshooting
 

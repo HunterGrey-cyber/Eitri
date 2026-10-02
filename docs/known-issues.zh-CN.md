@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=f5877ae22f130abf6228654fe2b0d49876cdaf06adf1f0ac767e06d94ae22588 -->
+<!-- translated-from: known-issues.md sha256=75050aa6c6ac9ff04b4294e51684f2a25fcfa02d137fe08dec54a908a7effaaf -->
 
 # 已知问题与限制
 
@@ -27,6 +27,18 @@
 ## 在中国大陆访问 eitri.cc 和 GitHub
 
 一些中国运营商的用户反馈（目前收到的有：福建、江苏、河南的中国电信），到不在运营商白名单上的境外网站的连接会被重置，所以 eitri.cc 和 github.com 在那里可能根本打不开。安装脚本从 GitHub 下载，所以也可能同样失败。如果你能通过别的办法拿到发布文件，`sh install.sh --tarball FILE --sums FILE --sig FILE` 可以直接用它们安装（[INSTALL.zh-CN.md](../INSTALL.zh-CN.md#快速安装)）；构建 sidecar 时仍然需要一个能访问 Node.js 和 npm 的网络。
+
+<a id="companion-mode"></a>
+## Companion 模式
+
+Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的 nvim 旁边（[INSTALL.zh-CN.md](../INSTALL.zh-CN.md#use-it-beside-your-own-nvim)）。它比较新，试过的部分比单窗口模式少。
+
+- **只试过 sway 配合终端里的 nvim。** Hyprland、niri、GNOME，以及上游 Neovide（或别的 nvim 图形前端）作为宿主，还没有在真实硬件上见过。Hyprland 和 niri 上，边缘上的行为是窗口管理器自己的，Eitri 不去检查它。
+- **在 tmux 里**，tmux 窗格的边缘仍归 tmux 管，所以除非你在 tmux 一侧加一个绑定，否则没法用 `Ctrl+h/j/k/l` 从 nvim 跨到面板窗口；从面板里打开文件也不会把编辑器的窗口提到前面（从 nvim 往上的进程树通向的是 tmux server，而不是终端）。
+- **在窗口管理器会话之前启动的 tmux server** 会在它的环境里一直保留那个会话旧的 `SWAYSOCK` 或 `HYPRLAND_INSTANCE_SIGNATURE`，从它里面的 nvim 启动的面板会继承这个过期的值：移动焦点和提到前面都不会有任何效果。重新登录后请重启 tmux server，或者从带有当前会话环境的 shell 里启动面板。
+- **`foot --server` 的客户端共用同一个 pid**，所以按进程把编辑器提到前面时，可能提起同一个 server 的另一个 foot 窗口，而不是装着你那个 nvim 的窗口。
+- **在 sway 的边缘，这个按键会被吞掉。** Eitri 必须先接管或放行 `Ctrl+h/j/k/l`，才能去问 sway 那个方向上有没有窗口，所以在边缘上这个按键什么也不做，和 tmux 自己的 `select-pane` 在它的边缘上一样。
+- **GNOME 和 KDE：不移动焦点。** 在那里 Wayland 客户端没法抢到焦点；请用桌面自己的窗口键。
 
 ## 稳定性
 

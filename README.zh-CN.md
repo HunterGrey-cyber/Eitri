@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=46353dc8b02d6e6e0e50dfd2dd97cbe9d66985fe5847245ffc3568128417c839 -->
+<!-- translated-from: README.md sha256=19a2e78f49d81a873c1bb7532a8b21989bd3e97d7ce96ae9bc1a7cc5cdcce6c0 -->
 
 <div align="center">
 
@@ -37,7 +37,9 @@
 - **你自己的 Neovim。** 一个真正的 `nvim --embed`，加载你的 `init.lua`、插件、LSP 和按键映射，由 Neovide 渲染器的一个 fork 在 GPU 上绘制。
 - **读得下去的回复。** markdown、按你配色高亮的代码、可以折叠的工具调用，每一次编辑单独一行 diff。
 - **从头到尾用键盘。** 面板里用 vim 的按键，窗口用 tmux 的按键，`Ctrl+h/j/k/l` 在窗格之间移动。
-- **用 Lua 配置。** `~/.config/eitri/init.lua`，就像 Neovim 读你的配置一样。
+- **也可以放在你自己的 nvim 旁边。** `:EitriPanel` 只把 agent 面板作为一个独立窗口，开在你终端里的 Neovim 旁边。
+
+**更想把 Neovim 留在终端里？** companion 模式把同一个 agent 面板作为一个独立窗口，开在你已经在用的 nvim 旁边（在 tmux 里或不在，上游 Neovide 或别的图形前端都行）。它通过 nvim 自己的 RPC socket 附着上去，把你打开的文件和选区送给 agent，agent 改完后重新加载缓冲区，并能按行号打开文件；面板一消失，它装进去的东西就全部撤掉，你的配置不会被碰。两个窗口怎么摆由你的窗口管理器决定，sway、Hyprland 和 niri 还能用同样的 `Ctrl+h/j/k/l` 在它们之间移动焦点。装上 `eitri.nvim` 插件，运行 `:EitriPanel` 即可：见[配合你自己的 nvim 使用](INSTALL.zh-CN.md#use-it-beside-your-own-nvim)。
 
 ## 安装
 
