@@ -98,6 +98,7 @@ import { barePickerCommand } from "./slashCommands";
 import { parseEffortReply, parseModelReply } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, showTabBar } from "./tabs";
 import { cardSummary, shortModel, usageSegment } from "./band";
+import { latestTurnEnding } from "./turnEnding";
 import type { ApproveFact, BandFacts } from "./band";
 import type { AgentUiState, HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope, ContextSummary, EditorLink, QueueItem, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
@@ -4060,6 +4061,8 @@ export default function App() {
             position: null,
             model: null,
             usage: null,
+            // An empty tab has had no turns.
+            ending: null,
           }}
           paneFocused={paneFocused}
         />
@@ -6177,6 +6180,8 @@ export default function App() {
           model: shortModel(state.model),
           // R5: this tab's last reported usage, right of the model; nothing until one arrives.
           usage: usageSegment(state.usage),
+          // How the latest turn ended when it did not complete, until the next turn starts.
+          ending: latestTurnEnding(state),
           // Owner decision #39: the card INPUT's Ctrl+y would approve, while the box has the keys.
           approve: ctrlYCard,
           // A finished turn of this tab changed files on disk; `c` shows them.

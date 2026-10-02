@@ -5,7 +5,9 @@
 //! pure reducer/translator in isolation before any real-process integration test exercises it.
 
 use crate::process::{classify_cli_mode, classify_reported_cli_mode, CliModeReport, RequestedCliMode};
-use crate::{AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TokenUsage, TurnOutcome, UsageInfo};
+use crate::{
+    AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TokenUsage, TurnEndDetail, TurnOutcome, UsageInfo,
+};
 use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
 use claude_runtime_protocol::v1::{
     PermissionMode as ProtoPermissionMode, PermissionOrigin as ProtoPermissionOrigin,
@@ -149,9 +151,21 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
         }
         ProtoEvent::TurnCompleted(completed) => {
             let outcome = translate_turn_outcome(completed.outcome());
+            // Why it ended, for the row the panel draws where a turn did not complete. The text of
+            // an error result is in `errors` (its `result_text` is empty); an API error arrives as a
+            // "success" result whose `result_text` is the error. A negative status is not one.
+            let detail = TurnEndDetail::from_result(
+                outcome,
+                completed.is_error,
+                &completed.result_text,
+                completed.terminal_reason,
+                completed.api_error_status.and_then(|status| u32::try_from(status).ok()),
+                &completed.errors,
+            );
             one(AgentDomainEvent::TurnCompleted {
                 turn_id: completed.turn_id,
                 outcome,
+                detail,
                 result_text: completed.result_text,
                 stop_reason: completed.stop_reason,
                 // Verdandi's `TurnUsage` (capability `turn_usage`, `TurnCompleted.usage`), when the
@@ -878,8 +892,7 @@ mod tests {
                 result_text: "done".into(),
                 is_error: false,
                 stop_reason: Some("end_turn".into()),
-                // api_error_status, errors, result_subtype and the rest: added at 133dc03, read by
-                // nothing this translator maps yet.
+                // The rest of the result's fields: `turn_completed_carries_why_a_turn_did_not_complete`.
                 ..Default::default()
             }));
             assert_eq!(
@@ -890,9 +903,122 @@ mod tests {
                     result_text: "done".into(),
                     stop_reason: Some("end_turn".into()),
                     usage: None,
+                    detail: TurnEndDetail::from_result(expected, false, "done", None, None, &[]),
                 })
             );
         }
+    }
+
+    /// The shapes the SDK ends a turn with, as Verdandi relays them: what each leaves for the row the
+    /// panel draws where the turn ended.
+    #[test]
+    fn turn_completed_carries_why_a_turn_did_not_complete() {
+        let detail_of = |completed: TurnCompleted| match translate(wrap(ProtoEvent::TurnCompleted(completed))) {
+            Some(AgentDomainEvent::TurnCompleted { detail, .. }) => detail,
+            other => panic!("{other:?}"),
+        };
+        let detail = |reason: Option<&str>, api_error_status: Option<u32>, message: Option<&str>| TurnEndDetail {
+            reason: reason.map(str::to_string),
+            api_error_status,
+            message: message.map(str::to_string),
+        };
+
+        // A rejected token, as recorded from the real CLI: a "success" result whose text is the error.
+        assert_eq!(
+            detail_of(TurnCompleted {
+                outcome: ProtoTOutcome::Failed as i32,
+                result_text: "Failed to authenticate. API Error: 401 OAuth access token is invalid.".into(),
+                is_error: true,
+                terminal_reason: Some("api_error".into()),
+                api_error_status: Some(401),
+                result_subtype: Some("success".into()),
+                ..Default::default()
+            }),
+            detail(
+                Some("api_error"),
+                Some(401),
+                Some("Failed to authenticate. API Error: 401 OAuth access token is invalid.")
+            )
+        );
+        // An error result: no text, the words are in `errors`.
+        assert_eq!(
+            detail_of(TurnCompleted {
+                outcome: ProtoTOutcome::LimitReached as i32,
+                is_error: true,
+                terminal_reason: Some("max_turns".into()),
+                result_subtype: Some("error_max_turns".into()),
+                errors: vec!["Reached maximum number of turns (3)".into()],
+                ..Default::default()
+            }),
+            detail(Some("max_turns"), None, Some("Reached maximum number of turns (3)"))
+        );
+        assert_eq!(
+            detail_of(TurnCompleted {
+                outcome: ProtoTOutcome::LimitReached as i32,
+                is_error: true,
+                terminal_reason: Some("blocking_limit".into()),
+                errors: vec!["usage limit reached".into(), "  ".into(), "try again later".into()],
+                ..Default::default()
+            }),
+            detail(
+                Some("blocking_limit"),
+                None,
+                Some("usage limit reached\ntry again later")
+            )
+        );
+        // A turn a hook stopped is not an error, and its text is the reply, not a reason.
+        assert_eq!(
+            detail_of(TurnCompleted {
+                outcome: ProtoTOutcome::Failed as i32,
+                is_error: false,
+                result_text: "I stopped where the hook asked me to.".into(),
+                terminal_reason: Some("hook_stopped".into()),
+                ..Default::default()
+            }),
+            detail(Some("hook_stopped"), None, None)
+        );
+        // An interrupt is the user's own doing: its diagnostics are not shown.
+        assert_eq!(
+            detail_of(TurnCompleted {
+                outcome: ProtoTOutcome::Interrupted as i32,
+                is_error: true,
+                terminal_reason: Some("aborted_streaming".into()),
+                result_subtype: Some("error_during_execution".into()),
+                errors: vec!["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null".into()],
+                ..Default::default()
+            }),
+            detail(Some("aborted_streaming"), None, None)
+        );
+        // The end Verdandi synthesizes when the CLI died mid-turn says nothing more.
+        assert_eq!(
+            detail_of(TurnCompleted {
+                outcome: ProtoTOutcome::Failed as i32,
+                is_error: true,
+                ..Default::default()
+            }),
+            TurnEndDetail::default()
+        );
+        // A negative status is not an HTTP status.
+        assert_eq!(
+            detail_of(TurnCompleted {
+                outcome: ProtoTOutcome::Failed as i32,
+                api_error_status: Some(-1),
+                ..Default::default()
+            })
+            .api_error_status,
+            None
+        );
+        // A long message is cut, on a character boundary.
+        let long = "é".repeat(crate::MAX_TURN_END_MESSAGE_CHARS + 50);
+        let message = detail_of(TurnCompleted {
+            outcome: ProtoTOutcome::Failed as i32,
+            errors: vec![long],
+            ..Default::default()
+        })
+        .message
+        .unwrap();
+        assert_eq!(message.chars().count(), crate::MAX_TURN_END_MESSAGE_CHARS + 1);
+        assert!(message.ends_with('…'), "{message}");
     }
 
     /// Verdandi's `TurnUsage` (capability `turn_usage`) reaches the domain event whole: every token

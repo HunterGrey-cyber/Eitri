@@ -248,3 +248,36 @@ describe("#39 fix round 1: cardSummary keeps the tail", () => {
     expect(s).toContain("…");
   });
 });
+
+/** How the latest turn ended, while it is still the latest news: left side, muted, and one of the last
+ *  things a narrow band lets go. */
+describe("turn ending", () => {
+  const segOf = (f: BandFacts, w = 900) => bandLayout(f, w, 7.2).find((s) => s.id === "ending");
+  const end = (kind: "interrupted" | "failed" | "limit_reached" | "lost", reason: string | null = null, apiErrorStatus: number | null = null) => ({
+    kind,
+    reason,
+    apiErrorStatus,
+    message: null,
+  });
+  it("says nothing for none, and the kind's few words otherwise, on the left", () => {
+    expect(segOf(idle)).toBeUndefined();
+    expect(segOf({ ...idle, ending: null })).toBeUndefined();
+    expect(segOf({ ...idle, ending: end("interrupted") })).toEqual({ id: "ending", text: "interrupted", side: "left" });
+    expect(segOf({ ...idle, ending: end("failed") })?.text).toBe("turn failed");
+    expect(segOf({ ...idle, ending: end("limit_reached", "max_turns") })?.text).toBe("turn limit");
+    expect(segOf({ ...idle, ending: end("limit_reached", "blocking_limit") })?.text).toBe("context full");
+    expect(segOf({ ...idle, ending: end("lost") })?.text).toBe("turn did not finish");
+  });
+  it("sits after the card and queue counts, before a flash", () => {
+    const facts: BandFacts = { ...running, ending: end("failed"), message: "copied" };
+    expect(ids(900, facts)).toEqual(["mode", "pill", "cards", "queue", "ending", "message", "context", "model", "position", "unread"]);
+  });
+  it("outlasts the model, usage and context, the cards and the queue, and is never in a y/n prompt's band", () => {
+    const facts: BandFacts = { ...running, ending: end("failed"), usage: { text: "1k tok $0.01", title: "" } };
+    const narrow = ids(240, facts);
+    expect(narrow).toContain("ending");
+    expect(narrow).not.toContain("model");
+    expect(narrow).not.toContain("cards");
+    expect(ids(900, { ...facts, prompt: "close? (y/n)" })).toEqual(["mode", "prompt"]);
+  });
+});

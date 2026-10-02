@@ -1204,6 +1204,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         }
     }
 
@@ -1915,6 +1916,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         });
         settle(&fake, &conversation);
         assert_eq!(conversation.projection().active_turn_id, None);

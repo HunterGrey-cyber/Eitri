@@ -282,6 +282,7 @@ fn an_interrupt_during_a_stall_terminates_the_turn_exactly_once() {
         result_text: String::new(),
         stop_reason: None,
         usage: None,
+        detail: Default::default(),
     });
     settle(&provider, &conversation);
 

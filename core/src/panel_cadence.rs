@@ -685,6 +685,7 @@ mod tests {
                 result_text: String::new(),
                 stop_reason: None,
                 usage: None,
+                detail: Default::default(),
             },
             AgentDomainEvent::SessionUnavailable { reason: "x".into() },
             AgentDomainEvent::SessionClosed { reason: "x".into() },

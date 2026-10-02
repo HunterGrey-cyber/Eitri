@@ -27,4 +27,13 @@ describe("N3: what y and Y copy", () => {
     expect(outputText(tool("Read", {}, [{ type: "text", text: "a" }]))).toContain('"text": "a"');
     expect(outputText({ kind: "prompt", seq: 1, key: "u-1", text: "hi" })).toBeNull();
   });
+
+  it("y on a turn ending copies the sentence the row shows, the provider's words included", () => {
+    const ending: TimelineItem = {
+      kind: "ending", seq: 4, key: "e-4",
+      ending: { seq: 4, turnId: "t1", kind: "limit_reached", reason: "max_turns", apiErrorStatus: null, message: "Reached maximum number of turns (3)" },
+    };
+    expect(primaryText(ending)).toBe("stopped at the turn limit: Reached maximum number of turns (3)");
+    expect(outputText(ending)).toBeNull();
+  });
 });

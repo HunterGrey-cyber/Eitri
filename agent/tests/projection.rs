@@ -1,6 +1,6 @@
 use agent::{
     AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus, TokenUsage,
-    TurnOutcome, UsageInfo,
+    TurnEndDetail, TurnEndingKind, TurnOutcome, UsageInfo,
 };
 use serde_json::json;
 
@@ -364,6 +364,134 @@ fn permission_resolved_for_unknown_id_is_a_harmless_no_op() {
     assert!(projection.pending_permissions.is_empty());
 }
 
+fn ended(turn_id: &str, outcome: TurnOutcome, detail: TurnEndDetail) -> AgentDomainEvent {
+    AgentDomainEvent::TurnCompleted {
+        turn_id: turn_id.into(),
+        outcome,
+        result_text: String::new(),
+        stop_reason: None,
+        usage: None,
+        detail,
+    }
+}
+
+/// A turn that did not complete is an item where it ended, carrying what the provider said, and
+/// the latest one is what the band shows until the next turn starts. A completed turn adds nothing.
+#[test]
+fn a_turn_that_did_not_complete_is_an_item_where_it_ended() {
+    let failed = TurnEndDetail {
+        reason: Some("api_error".into()),
+        api_error_status: Some(529),
+        message: Some("API Error: 529 Overloaded".into()),
+    };
+    for (outcome, kind) in [
+        (TurnOutcome::Interrupted, Some(TurnEndingKind::Interrupted)),
+        (TurnOutcome::Failed, Some(TurnEndingKind::Failed)),
+        (TurnOutcome::LimitReached, Some(TurnEndingKind::LimitReached)),
+        (TurnOutcome::Completed, None),
+    ] {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        projection.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Text,
+            text: "half a reply".into(),
+        });
+        let seq = projection.last_revision;
+        projection.apply(&ended("t1", outcome, failed.clone()));
+
+        assert_eq!(projection.last_turn_ending, kind, "{outcome:?}");
+        match kind {
+            None => assert!(projection.turn_endings.is_empty(), "a completed turn adds nothing"),
+            Some(kind) => {
+                assert_eq!(projection.turn_endings.len(), 1, "{outcome:?}");
+                let ending = &projection.turn_endings[0];
+                assert_eq!((ending.seq, ending.turn_id.as_str(), ending.kind), (seq, "t1", kind));
+                assert_eq!(ending.detail, failed, "kept as the event carried it");
+                assert!(ending.seq > projection.transcript[0].seq, "after the partial reply");
+            }
+        }
+
+        // The next turn starts: the band forgets it, the transcript keeps it.
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        assert_eq!(projection.last_turn_ending, None);
+        assert_eq!(projection.turn_endings.len(), usize::from(kind.is_some()));
+    }
+}
+
+/// A session that ends while a turn runs, with no `TurnCompleted` for it, records that turn as
+/// lost -- once, and only when a turn was running.
+#[test]
+fn a_session_that_ends_mid_turn_records_the_turn_as_lost() {
+    let endings: [(&str, AgentDomainEvent); 3] = [
+        (
+            "unavailable",
+            AgentDomainEvent::SessionUnavailable {
+                reason: "the event stream ended".into(),
+            },
+        ),
+        (
+            "closed",
+            AgentDomainEvent::SessionClosed {
+                reason: "provider_exited".into(),
+            },
+        ),
+        (
+            "resume refused",
+            AgentDomainEvent::ResumeOutcome {
+                requested_provider_session_id: "prov-1".into(),
+                status: agent::ResumeStatus::Rejected,
+                attached_provider_session_id: None,
+                forked: false,
+                detail: None,
+            },
+        ),
+    ];
+    for (name, end) in endings {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        let seq = projection.last_revision;
+        projection.apply(&end);
+        assert_eq!(projection.turn_endings.len(), 1, "{name}");
+        let lost = &projection.turn_endings[0];
+        assert_eq!(
+            (lost.seq, lost.turn_id.as_str(), lost.kind),
+            (seq, "t1", TurnEndingKind::Lost),
+            "{name}"
+        );
+        assert_eq!(lost.detail, TurnEndDetail::default(), "{name}");
+        assert_eq!(projection.last_turn_ending, Some(TurnEndingKind::Lost), "{name}");
+
+        // Ending again, with no turn running, adds nothing.
+        projection.apply(&end);
+        assert_eq!(projection.turn_endings.len(), 1, "{name}");
+    }
+
+    // An idle session that ends has no turn to mark.
+    let mut idle = AgentSessionProjection::default();
+    idle.apply(&AgentDomainEvent::SessionClosed {
+        reason: "closed_by_host".into(),
+    });
+    assert!(idle.turn_endings.is_empty());
+    assert_eq!(idle.last_turn_ending, None);
+}
+
+/// What the sidecar sends when its CLI dies mid-turn: an end it synthesized (failed, nothing
+/// said), then the session closing. One failed item, not a second "lost" one -- the turn already
+/// ended when the session closed.
+#[test]
+fn a_cli_that_dies_mid_turn_on_the_sidecar_is_one_failed_ending() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&ended("t1", TurnOutcome::Failed, TurnEndDetail::default()));
+    projection.apply(&AgentDomainEvent::SessionClosed {
+        reason: "provider_failed".into(),
+    });
+    let kinds: Vec<_> = projection.turn_endings.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, [TurnEndingKind::Failed]);
+    assert_eq!(projection.last_turn_ending, Some(TurnEndingKind::Failed));
+}
+
 #[test]
 fn turn_completed_clears_active_turn_id_and_updates_usage_for_every_outcome() {
     for outcome in [
@@ -394,6 +522,7 @@ fn turn_completed_clears_active_turn_id_and_updates_usage_for_every_outcome() {
             result_text: "done".into(),
             stop_reason: None,
             usage: Some(reported.clone()),
+            detail: Default::default(),
         });
         assert_eq!(
             projection.active_turn_id, None,
@@ -423,6 +552,7 @@ fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
         result_text: String::new(),
         stop_reason: None,
         usage: None,
+        detail: Default::default(),
     });
     assert_eq!(
         projection.usage, None,
@@ -440,6 +570,7 @@ fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
         result_text: String::new(),
         stop_reason: None,
         usage: Some(real.clone()),
+        detail: Default::default(),
     });
     projection.apply(&AgentDomainEvent::TurnCompleted {
         turn_id: "turn-3".into(),
@@ -447,6 +578,7 @@ fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
         result_text: String::new(),
         stop_reason: None,
         usage: None,
+        detail: Default::default(),
     });
     assert_eq!(
         projection.usage,
@@ -467,6 +599,7 @@ fn a_later_report_replaces_usage_whole_even_when_it_is_lower() {
             total_cost_usd: cost,
             ..Default::default()
         }),
+        detail: Default::default(),
     };
     let mut projection = AgentSessionProjection::default();
     projection.apply(&report(0.50));
@@ -485,6 +618,7 @@ fn usage_serializes_with_tokens_and_a_model_for_the_sidecar_and_a_turn_count_for
         result_text: String::new(),
         stop_reason: None,
         usage: Some(usage),
+        detail: Default::default(),
     };
     let sidecar = serde_json::to_value(event(UsageInfo {
         total_cost_usd: 0.42,
@@ -646,6 +780,7 @@ fn a_tool_call_or_a_turn_boundary_starts_a_new_transcript_entry() {
         result_text: String::new(),
         stop_reason: None,
         usage: None,
+        detail: Default::default(),
     });
     projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
     projection.apply(&AgentDomainEvent::ContentDelta {
@@ -879,6 +1014,7 @@ fn every_seq_is_strictly_below_the_revision_a_snapshot_would_report() {
         .map(|m| m.seq)
         .chain(projection.tool_calls.iter().map(|c| c.seq))
         .chain(projection.pending_permissions.values().map(|p| p.seq))
+        .chain(projection.turn_endings.iter().map(|e| e.seq))
         .max()
         .unwrap();
     assert!(
@@ -915,6 +1051,7 @@ fn no_single_event_ever_creates_more_than_one_item() {
             .chain(projection.transcript.iter().map(|m| m.seq))
             .chain(projection.tool_calls.iter().map(|c| c.seq))
             .chain(projection.pending_permissions.values().map(|p| p.seq))
+            .chain(projection.turn_endings.iter().map(|e| e.seq))
             .collect();
         let before_dedup = seqs.len();
         seqs.sort_unstable();
@@ -929,7 +1066,7 @@ fn no_single_event_ever_creates_more_than_one_item() {
 
         assert!(
             before_dedup <= item_count + 1,
-            "applying {} grew the three collections by {}; at most one item per event is what makes \
+            "applying {} grew the collections by {}; at most one item per event is what makes \
              seq a total order",
             label(&event),
             before_dedup - item_count,
@@ -1024,7 +1161,7 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
         },
         AgentDomainEvent::TurnCompleted {
             turn_id: "t1".into(),
-            outcome: TurnOutcome::Completed,
+            outcome: TurnOutcome::Failed,
             result_text: "Done.".into(),
             stop_reason: None,
             usage: Some(UsageInfo {
@@ -1033,7 +1170,10 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
                 tokens: None,
                 model: None,
             }),
+            detail: Default::default(),
         },
+        // A second turn, so the session ending below finds one running and records it as lost.
+        AgentDomainEvent::TurnStarted { turn_id: "t2".into() },
         AgentDomainEvent::ResumeOutcome {
             requested_provider_session_id: "prov-1".into(),
             status: agent::ResumeStatus::Attached,

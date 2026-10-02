@@ -1365,6 +1365,23 @@ pub fn serialize_snapshot_with_notes_for_js(
         })
     });
 
+    // Turns that did not complete, each where it ended, spelled out for the same reason as the
+    // collections above.
+    let turn_endings: Vec<Value> = projection
+        .turn_endings
+        .iter()
+        .map(|ending| {
+            json!({
+                "seq": ending.seq,
+                "turnId": ending.turn_id,
+                "kind": ending.kind,
+                "reason": ending.detail.reason,
+                "apiErrorStatus": ending.detail.api_error_status,
+                "message": ending.detail.message,
+            })
+        })
+        .collect();
+
     let state = json!({
         "backend": view.backend,
         "history": history,
@@ -1377,6 +1394,10 @@ pub fn serialize_snapshot_with_notes_for_js(
         "userPrompts": user_prompts,
         "transcript": transcript,
         "toolCalls": tool_calls,
+        "turnEndings": turn_endings,
+        // How the latest turn ended when it did not complete, until the next one starts: the
+        // band's segment. `null` while a turn runs and after one that completed.
+        "lastTurnEnding": projection.last_turn_ending,
         "status": status,
         "activeTurnId": projection.active_turn_id,
         "pendingPermissions": pending_permissions,
@@ -2641,6 +2662,196 @@ mod tests {
             .contains("untested"));
     }
 
+    /// `agent-ui/web/src/fixtures/turn-endings.json`: for each way a turn can end other than by
+    /// completing, the events payload this side sends and the snapshot it sends after folding the
+    /// same events, which the panel's tests render. Compared on every run; `EITRI_WRITE_FIXTURES=1`
+    /// rewrites it.
+    #[test]
+    fn the_turn_endings_fixture_is_what_the_serializer_sends() {
+        use agent::{TurnEndDetail, TurnOutcome};
+        // Not recordings: only the 401 shape was ever recorded from the real CLI. Each case is the
+        // shape the SDK's result types and the CLI's own classification of its terminal reasons
+        // allow.
+        let ended = |outcome: TurnOutcome,
+                     is_error: bool,
+                     result_text: &str,
+                     reason: Option<&str>,
+                     status: Option<u32>,
+                     errors: &[&str]| {
+            let errors: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+            AgentDomainEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                outcome,
+                result_text: result_text.into(),
+                stop_reason: None,
+                usage: None,
+                detail: TurnEndDetail::from_result(
+                    outcome,
+                    is_error,
+                    result_text,
+                    reason.map(str::to_string),
+                    status,
+                    &errors,
+                ),
+            }
+        };
+        let cases: Vec<(&str, Vec<AgentDomainEvent>)> = vec![
+            (
+                "api_error",
+                vec![ended(
+                    TurnOutcome::Failed,
+                    true,
+                    "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+                    Some("api_error"),
+                    Some(529),
+                    &[],
+                )],
+            ),
+            (
+                "rate_limited",
+                vec![ended(
+                    TurnOutcome::Failed,
+                    true,
+                    "API Error: 429 rate_limit_error",
+                    Some("api_error"),
+                    Some(429),
+                    &[],
+                )],
+            ),
+            (
+                "context_full",
+                vec![ended(
+                    TurnOutcome::LimitReached,
+                    true,
+                    "Prompt is too long",
+                    Some("blocking_limit"),
+                    None,
+                    &[],
+                )],
+            ),
+            (
+                "max_turns",
+                vec![ended(
+                    TurnOutcome::LimitReached,
+                    true,
+                    "",
+                    Some("max_turns"),
+                    None,
+                    &["Reached maximum number of turns (3)"],
+                )],
+            ),
+            (
+                "hook_stopped",
+                vec![ended(
+                    TurnOutcome::Failed,
+                    false,
+                    "I stopped where the hook asked me to.",
+                    Some("hook_stopped"),
+                    None,
+                    &[],
+                )],
+            ),
+            (
+                "interrupt",
+                vec![ended(
+                    TurnOutcome::Interrupted,
+                    true,
+                    "",
+                    Some("aborted_streaming"),
+                    None,
+                    &["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],
+                )],
+            ),
+            (
+                "cli_crash_closed",
+                vec![
+                    ended(TurnOutcome::Failed, true, "", None, None, &[]),
+                    AgentDomainEvent::SessionClosed {
+                        reason: "provider_failed".into(),
+                    },
+                ],
+            ),
+            (
+                "stream_lost",
+                vec![AgentDomainEvent::SessionUnavailable {
+                    reason: "the sidecar's event stream ended without closing the session".into(),
+                }],
+            ),
+        ];
+
+        let mut written_cases = Vec::new();
+        for (name, ending) in cases {
+            let mut events = vec![
+                AgentDomainEvent::SessionOpened {
+                    session_id: "sess-1".into(),
+                    provider_session_id: "prov-1".into(),
+                    model: "claude-sonnet-5".into(),
+                    cwd: "/project".into(),
+                },
+                AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+                AgentDomainEvent::UserPromptSubmitted {
+                    text: "fix the parser".into(),
+                },
+                AgentDomainEvent::ContentDelta {
+                    turn_id: "t1".into(),
+                    kind: agent::ContentKind::Text,
+                    text: "Looking at the parser".into(),
+                },
+            ];
+            events.extend(ending);
+            let mut projection = AgentSessionProjection::default();
+            for event in &events {
+                projection.apply(event);
+            }
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: Some("sess-1"),
+                provider_session_id: Some("prov-1".into()),
+                capabilities: agent::ProviderCapabilities {
+                    resume: true,
+                    fork: false,
+                    interrupt: true,
+                    bypass_permission_mode: true,
+                    interactive_permission_mode: true,
+                    cli_auto_mode: false,
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
+            };
+            let events_payload = serialize_events_for_js(TabId(1), 0, projection.last_revision, &events);
+            let snapshot_payload = serialize_snapshot_for_js(TabId(1), &view, None);
+            written_cases.push(json!({
+                "name": name,
+                "events": serde_json::from_str::<Value>(&events_payload).unwrap(),
+                "snapshot": serde_json::from_str::<Value>(&snapshot_payload).unwrap(),
+            }));
+        }
+        let fixture = json!({
+            "writtenBy": "core/src/agent_bridge.rs, tests::the_turn_endings_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "cases": written_cases,
+        });
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/turn-endings.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the turn endings fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed turn endings fixture is not what this test produces; if the change is \
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
     /// R5 (v1 picks, Task 13): a tab's last usage figure rides its snapshot, so a tab switch or a
     /// panel reload shows it at once instead of waiting for the next turn to report one. `null` --
     /// present as a key, never a zeroed object -- until a provider has reported something, and
@@ -2679,6 +2890,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage,
+            detail: Default::default(),
         };
 
         let mut projection = AgentSessionProjection::default();

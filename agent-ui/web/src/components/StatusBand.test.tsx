@@ -220,3 +220,13 @@ it("before any measurement (Review Focus 3), only mode and pill show -- no crash
   expect(container.querySelector(".band-warn")).toBeNull();
   expect(container.querySelector(".band-unread")).toBeNull();
 });
+
+/** How the latest turn ended: a few words in the left group, drawn only while the fact is set. */
+it("a turn ending is a plain segment on the left, and no fact draws none", () => {
+  const { container } = renderWide({ ...RUNNING, ending: { kind: "limit_reached", reason: "budget_exhausted", apiErrorStatus: null, message: null } });
+  const seg = container.querySelector<HTMLElement>(".band-open .band-ending")!;
+  expect(seg.textContent).toBe("spending limit");
+  expect(seg.classList.contains("band-seg")).toBe(true);
+  cleanup();
+  expect(renderWide({ ...RUNNING, ending: null }).container.querySelector(".band-ending")).toBeNull();
+});

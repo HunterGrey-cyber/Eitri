@@ -4,6 +4,7 @@ import { renderToolCall } from "../toolRegistry";
 import { buildTimeline, isUsableLink } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
 import { renderMarkdown } from "../markdown";
+import { turnEndingText } from "../turnEnding";
 import { HistoryNotice } from "./HistoryNotice";
 import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
@@ -830,6 +831,18 @@ export function MessageList({
                     onAnswer={onAnswerPermission}
                     onReasonChange={onPermissionReason}
                   />
+                </Row>
+              );
+            }
+            case "ending": {
+              // Where a turn that did not complete stopped, in plain words (`turnEnding.ts`), muted and
+              // signed `·` like the other "this is over" rows. A `j`/`k` stop like every conversation
+              // row, so `y` copies what it says. Plain text, never markdown: the message is the
+              // provider's, and its line breaks are kept by the row's own CSS.
+              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
+              return (
+                <Row key={item.key} kind="ending" sign="·" current={current} className={yanked} navStop="row">
+                  {turnEndingText(item.ending)}
                 </Row>
               );
             }

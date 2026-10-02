@@ -701,6 +701,7 @@ pub(crate) mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         });
         assert!(state.history_dirty);
     }

@@ -1,14 +1,14 @@
-import type { AgentUiState, PermissionRequestRecord, Seq, ToolCallRecord } from "./types";
+import type { AgentUiState, PermissionRequestRecord, Seq, ToolCallRecord, TurnEnding } from "./types";
 
 /** One thing that happened in the conversation, ready to render in order.
  *
- * A view over the four collections rather than a fifth copy of them: `AgentUiState` stays the
+ * A view over the collections rather than a fifth copy of them: `AgentUiState` stays the
  * shape Rust's `AgentSessionProjection` serializes, and nothing here can drift out of sync with it
  * because nothing here is stored. */
 /** `key` is a React key, unique across the whole timeline and stable for as long as the item is.
  *
- * ALL FOUR kinds key on `seq` rather than on their own identity, which is what makes uniqueness
- * real rather than hoped for. `seq` is unique by construction across all four collections:
+ * Every kind keys on `seq` rather than on their own identity, which is what makes uniqueness
+ * real rather than hoped for. `seq` is unique by construction across all the collections:
  * `AgentSessionProjection::apply` assigns it once per event and no event creates two items
  * (`agent/tests/projection.rs::no_single_event_ever_creates_more_than_one_item` pins that half),
  * and `reducer.ts` continues the same counter from a snapshot's `throughRevision`.
@@ -29,6 +29,9 @@ export type TimelineItem =
   | { kind: "message"; seq: Seq; key: string; text: string }
   | { kind: "tool"; seq: Seq; key: string; call: ToolCallRecord }
   | { kind: "permission"; seq: Seq; key: string; request: PermissionRequestRecord }
+  /** Where a turn that did not complete stopped: failed, hit a limit, interrupted, or cut off by the
+   *  session ending. Keyed `e-<seq>` like the others, by the `seq` of the event that ended the turn. */
+  | { kind: "ending"; seq: Seq; key: string; ending: TurnEnding }
   /** P2: a collapsed run of finished tool calls, drawn as one row. Made by `display.ts`, never by
    *  `buildTimeline` -- this function's own ordering (by `seq`, cards anchored after their call)
    *  stays exactly as it was, and folding several rows into one is a DISPLAY decision layered on
@@ -56,7 +59,7 @@ export function isUsableLink(toolUseId: string | null): toolUseId is string {
 }
 
 /**
- * The four collections merged into the one sequence they actually formed.
+ * The collections merged into the one sequence they actually formed.
  *
  * Ordering comes from `seq`, which Rust's `AgentSessionProjection::apply` assigns and
  * `serialize_snapshot_for_js` ships -- this function sorts by an authoritative key, it does not
@@ -113,6 +116,7 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
     ...state.transcript.map((message): TimelineItem => ({ kind: "message", seq: message.seq, key: `m-${message.seq}`, text: message.text })),
     ...state.toolCalls.map((call): TimelineItem => ({ kind: "tool", seq: call.seq, key: `t-${call.seq}`, call })),
     ...unanchored.map((request): TimelineItem => ({ kind: "permission", seq: request.seq, key: `p-${request.seq}`, request })),
+    ...state.turnEndings.map((ending): TimelineItem => ({ kind: "ending", seq: ending.seq, key: `e-${ending.seq}`, ending })),
   ];
   base.sort((a, b) => a.seq - b.seq);
 

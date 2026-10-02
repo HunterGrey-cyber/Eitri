@@ -963,6 +963,17 @@ textarea,
 .row-ended .row-body {
   color: var(--nv-muted);
 }
+/* A turn that did not complete -- failed, hit a limit, was interrupted, or was cut off by the session
+   ending -- says so where it stopped. Muted like `.row-ended` and for the same reason: it is
+   information, and the glyph and the words carry it, so no signal colour is drawn on the text. The
+   provider's own message can hold line breaks and a long unbroken token (a URL, a request id):
+   `pre-line` keeps the breaks and wraps at spaces, `anywhere` lets a long token break instead of
+   widening the column. */
+.row-ending .row-body {
+  color: var(--nv-muted);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
 .row-hint {
   color: var(--nv-muted);
   font-size: var(--fs-code);

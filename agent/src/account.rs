@@ -202,12 +202,50 @@ impl ClaudeAccount {
 /// already moved where the CLI wrote while this side went on reading wherever the window's own
 /// `CLAUDE_CONFIG_DIR` pointed -- the same skew, arrived at from the other direction. Now one name
 /// decides both.
-pub fn name_to_use<'a>(from_environment: Option<&'a str>, from_config: Option<&'a str>) -> Option<&'a str> {
-    from_environment
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .or(from_config.map(str::trim).filter(|v| !v.is_empty()))
+pub fn name_to_use<'a>(
+    from_environment: Option<&'a str>,
+    from_config: Option<&'a str>,
+) -> Option<(&'a str, AccountSource)> {
+    let named = |value: Option<&'a str>| value.map(str::trim).filter(|v| !v.is_empty());
+    named(from_environment)
+        .map(|name| (name, AccountSource::Environment))
+        .or(named(from_config).map(|name| (name, AccountSource::InitLua)))
 }
+
+/// Where the account name came from. Every startup line and every refusal says which, because the
+/// two sources are set in different places (a shell profile or `eitri --account`, and `init.lua`)
+/// and a message that only says "the account" sends the reader to the wrong one half the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSource {
+    /// `VERDANDI_CLAUDE_ACCOUNT`: inherited, or exported by `eitri --account`.
+    Environment,
+    /// `eitri.config.set("agent.account", ...)` in `init.lua`.
+    InitLua,
+}
+
+impl std::fmt::Display for AccountSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Environment => "VERDANDI_CLAUDE_ACCOUNT",
+            Self::InitLua => "init.lua's agent.account",
+        })
+    }
+}
+
+/// An [`AccountError`] and the source of the name it is about.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConfiguredAccountError {
+    pub source: AccountSource,
+    pub error: AccountError,
+}
+
+impl std::fmt::Display for ConfiguredAccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.source, self.error)
+    }
+}
+
+impl std::error::Error for ConfiguredAccountError {}
 
 /// [`name_to_use`] and both halves of resolution, in order. Nothing from either source means
 /// `None` out and no filesystem touched, so a window that pins no account never pays for a feature
@@ -223,13 +261,24 @@ pub fn name_to_use<'a>(from_environment: Option<&'a str>, from_config: Option<&'
 pub fn resolve_for(
     from_environment: Option<&str>,
     from_config: Option<&str>,
-) -> Result<Option<ClaudeAccount>, AccountError> {
-    let Some(name) = name_to_use(from_environment, from_config) else {
+) -> Result<Option<(ClaudeAccount, AccountSource)>, ConfiguredAccountError> {
+    resolve_for_from(from_environment, from_config, |key| std::env::var(key).ok())
+}
+
+/// [`resolve_for`] with the rest of the environment (`HOME`, `VERDANDI_CLAUDE_CONFIG_DIR`) as a
+/// parameter too, so a test can resolve against a scratch home.
+pub fn resolve_for_from(
+    from_environment: Option<&str>,
+    from_config: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<(ClaudeAccount, AccountSource)>, ConfiguredAccountError> {
+    let Some((name, source)) = name_to_use(from_environment, from_config) else {
         return Ok(None);
     };
-    let account = ClaudeAccount::resolve(name)?;
-    account.check_config_dir()?;
-    Ok(Some(account))
+    let account = ClaudeAccount::resolve_from(name, env)
+        .and_then(|account| account.check_config_dir().map(|()| account))
+        .map_err(|error| ConfiguredAccountError { source, error })?;
+    Ok(Some((account, source)))
 }
 
 static ACCOUNT: OnceLock<ClaudeAccount> = OnceLock::new();
@@ -407,10 +456,11 @@ mod tests {
     /// the sidecar child and where transcripts are read.
     #[test]
     fn the_launchers_account_outranks_init_lua_and_init_lua_outranks_nothing() {
-        assert_eq!(name_to_use(Some("personal"), Some("work")), Some("personal"));
-        assert_eq!(name_to_use(None, Some("work")), Some("work"));
-        assert_eq!(name_to_use(Some("  "), Some("work")), Some("work"));
-        assert_eq!(name_to_use(Some("personal"), None), Some("personal"));
+        use AccountSource::{Environment, InitLua};
+        assert_eq!(name_to_use(Some("personal"), Some("work")), Some(("personal", Environment)));
+        assert_eq!(name_to_use(None, Some("work")), Some(("work", InitLua)));
+        assert_eq!(name_to_use(Some("  "), Some("work")), Some(("work", InitLua)));
+        assert_eq!(name_to_use(Some("personal"), None), Some(("personal", Environment)));
         assert_eq!(name_to_use(Some("  "), None), None);
     }
 
@@ -418,8 +468,29 @@ mod tests {
     fn a_misspelled_account_is_a_startup_error_carrying_the_name_and_the_path() {
         let err = resolve_for(None, Some("definitely-not-an-account-on-this-host")).unwrap_err();
         assert!(
-            matches!(err, AccountError::MissingConfigDir { .. }),
+            matches!(err.error, AccountError::MissingConfigDir { .. }),
             "expected the directory check to catch it, got {err:?}"
+        );
+    }
+
+    /// The refusal names where the bad name was set, for either source: the two are edited in
+    /// different files, and the message is all an app-menu launch leaves behind.
+    #[test]
+    fn a_refusal_names_the_source_it_came_from() {
+        let home = |key: &str| (key == "HOME").then(|| "/nonexistent-home".to_string());
+        let from_lua = resolve_for_from(None, Some("../x"), home).unwrap_err();
+        assert_eq!(from_lua.source, AccountSource::InitLua);
+        assert!(
+            from_lua
+                .to_string()
+                .starts_with("init.lua's agent.account: account name \"../x\""),
+            "{from_lua}"
+        );
+        let from_env = resolve_for_from(Some("nope"), Some("work"), home).unwrap_err();
+        assert_eq!(from_env.source, AccountSource::Environment);
+        assert!(
+            from_env.to_string().starts_with("VERDANDI_CLAUDE_ACCOUNT: claude account \"nope\" has no config directory at /nonexistent-home/.claude-nope"),
+            "{from_env}"
         );
     }
 

@@ -514,6 +514,7 @@ describe("MessageList: an abandoned tool result never spins forever (sw-panel-re
       result_text: "",
       stop_reason: null,
       usage: null,
+      detail: { reason: null, api_error_status: null, message: null },
     });
     let result = rendered(interrupted).querySelector(".tool-result")!;
     expect(result.getAttribute("data-state")).toBe("none");
@@ -1919,5 +1920,54 @@ describe("MessageList: the unread threshold is a seq, not an index (wave 3, Task
     );
     expect(lastUnread(onUnreadChange).label).toBe("↓3");
     expect(lastUnread(onUnreadChange).afterSeq).toBe(2);
+  });
+});
+
+/** A turn that did not complete says so where it stopped (`turnEnding.ts` words it). */
+describe("turn ending rows", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: vi.fn() };
+  const none = { reason: null, api_error_status: null, message: null };
+  /** prompt, a partial reply, the turn's end, then (optionally) a later prompt, folded by the real reducer. */
+  const conversation = (end: AgentDomainEvent, later = false): AgentUiState => {
+    const events: AgentDomainEvent[] = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_prompt_submitted", text: "first" },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "partial reply" },
+      end,
+      ...(later ? ([{ type: "user_prompt_submitted", text: "second" }, { type: "turn_started", turn_id: "t2" }] as AgentDomainEvent[]) : []),
+    ];
+    return events.reduce(applyEvent, initialState());
+  };
+  const failed: AgentDomainEvent = {
+    type: "turn_completed", turn_id: "t1", outcome: "failed", result_text: "", stop_reason: null, usage: null,
+    detail: { reason: "api_error", api_error_status: 500, message: "boom\nsecond line" },
+  };
+
+  it("draws a muted `·` row where the turn ended, after the partial reply and before a later prompt", () => {
+    const { container } = render(<MessageList state={conversation(failed, true)} {...props} />);
+    const rows = Array.from(container.querySelectorAll(".row")).map((r) => r.className.split(" ").find((c) => c.startsWith("row-") && c !== "row-current"));
+    expect(rows).toEqual(["row-prompt", "row-assistant", "row-ending", "row-prompt"]);
+    const ending = container.querySelector<HTMLElement>(".row-ending")!;
+    expect(ending.getAttribute("data-sign")).toBe("·");
+    expect(ending.getAttribute("data-nav-stop")).toBe("row");
+    expect(ending.querySelector(".row-body")!.textContent).toBe("the turn ended with an error (HTTP 500): boom\nsecond line");
+  });
+
+  it("a completed turn draws no such row, and an interrupted one says so in one word", () => {
+    const completed: AgentDomainEvent = { ...failed, outcome: "completed", detail: none } as AgentDomainEvent;
+    expect(render(<MessageList state={conversation(completed)} {...props} />).container.querySelector(".row-ending")).toBeNull();
+    cleanup();
+    const interrupted: AgentDomainEvent = { ...failed, outcome: "interrupted", detail: none } as AgentDomainEvent;
+    expect(render(<MessageList state={conversation(interrupted)} {...props} />).container.querySelector(".row-ending .row-body")!.textContent).toBe("interrupted");
+  });
+
+  it("a session that ends under a running turn leaves the lost row", () => {
+    const events: AgentDomainEvent[] = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "partial" },
+      { type: "session_unavailable", reason: "stream lost" },
+    ];
+    const { container } = render(<MessageList state={events.reduce(applyEvent, initialState())} {...props} sessionEnded />);
+    expect(container.querySelector(".row-ending .row-body")!.textContent).toBe("the turn did not finish: the session ended");
   });
 });

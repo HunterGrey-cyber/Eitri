@@ -224,7 +224,7 @@ function openModelPicker(container: HTMLElement, round = 1) {
   fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
   const events: AgentDomainEvent[] = [
     { type: "turn_started", turn_id: `t${round}` },
-    { type: "turn_completed", turn_id: `t${round}`, outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+    { type: "turn_completed", turn_id: `t${round}`, outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
   ];
   dispatch({ kind: "events", tab: 1, fromRevision: (round - 1) * 2, throughRevision: round * 2, events });
 }

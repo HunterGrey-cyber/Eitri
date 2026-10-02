@@ -167,16 +167,29 @@ impl LuaEngine {
     /// logs and the shell continues with whatever it registered before the error (the editor and
     /// the agent are not registered here at all: every window has them).
     ///
-    /// **One exception, a startup failure: a command id `eitri.command.register` refused**
-    /// (sw-lua-5, `CommandRegistry::refused`). It is a config value Eitri validates, and like
-    /// `agent.font_size` or a keybinding collision (`main.rs`) it exits 1 naming itself -- rather
-    /// than a window that silently lacks everything init.lua registered after it, the account pin
-    /// among them. Checked after the file has run, so a `pcall` around the call changes nothing.
+    /// **Two exceptions, startup failures: a command id `eitri.command.register` refused**
+    /// (`CommandRegistry::refused`), **and a value `eitri.config.set` could not store**
+    /// (`ConfigStore::refused`: a table, a function, a string that is not UTF-8, a key
+    /// that is not a string). Both are config values Eitri validates, and like `agent.font_size` or
+    /// a keybinding collision (`main.rs`) they exit 1 naming themselves -- rather than a window
+    /// that silently lacks everything init.lua registered after them, or runs on a key's default:
+    /// an `agent.account` that never reached the store spends whichever account launched the
+    /// window. Checked after the file has run, so a `pcall` around the call changes nothing.
     pub(crate) fn load_init_file(&self, path: &std::path::Path) {
-        self.run_init_file(path);
-        if let Some(refused) = self.commands.borrow().refused() {
-            eprintln!("eitri: {} ({})", refused, path.display());
+        if let Err(message) = self.run_and_check_init_file(path) {
+            eprintln!("eitri: {message}");
             std::process::exit(1);
+        }
+    }
+
+    /// [`Self::load_init_file`] without the exit: `Err` is the startup-failure text after "eitri: ".
+    pub(crate) fn run_and_check_init_file(&self, path: &std::path::Path) -> Result<(), String> {
+        self.run_init_file(path);
+        let commands = self.commands.borrow();
+        let config = self.config.borrow();
+        match commands.refused().or(config.refused()) {
+            Some(refused) => Err(format!("{} ({})", refused, path.display())),
+            None => Ok(()),
         }
     }
 

@@ -1,0 +1,786 @@
+{
+  "cases": [
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": 529,
+              "message": "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+              "reason": "api_error"
+            },
+            "outcome": "failed",
+            "result_text": "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "api_error",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "failed",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": 529,
+              "kind": "failed",
+              "message": "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+              "reason": "api_error",
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": 429,
+              "message": "API Error: 429 rate_limit_error",
+              "reason": "api_error"
+            },
+            "outcome": "failed",
+            "result_text": "API Error: 429 rate_limit_error",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "rate_limited",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "failed",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": 429,
+              "kind": "failed",
+              "message": "API Error: 429 rate_limit_error",
+              "reason": "api_error",
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": "Prompt is too long",
+              "reason": "blocking_limit"
+            },
+            "outcome": "limit_reached",
+            "result_text": "Prompt is too long",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "context_full",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "limit_reached",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "limit_reached",
+              "message": "Prompt is too long",
+              "reason": "blocking_limit",
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": "Reached maximum number of turns (3)",
+              "reason": "max_turns"
+            },
+            "outcome": "limit_reached",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "max_turns",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "limit_reached",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "limit_reached",
+              "message": "Reached maximum number of turns (3)",
+              "reason": "max_turns",
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": "hook_stopped"
+            },
+            "outcome": "failed",
+            "result_text": "I stopped where the hook asked me to.",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "hook_stopped",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "failed",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "failed",
+              "message": null,
+              "reason": "hook_stopped",
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": "aborted_streaming"
+            },
+            "outcome": "interrupted",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "interrupt",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "interrupted",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "interrupted",
+              "message": null,
+              "reason": "aborted_streaming",
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "failed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "reason": "provider_failed",
+            "type": "session_closed"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 6
+      },
+      "name": "cli_crash_closed",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "failed",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "closed",
+            "reason": "provider_failed"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "failed",
+              "message": null,
+              "reason": null,
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 6,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "reason": "the sidecar's event stream ended without closing the session",
+            "type": "session_unavailable"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "stream_lost",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "lost",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "unavailable",
+            "reason": "the sidecar's event stream ended without closing the session"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "lost",
+              "message": null,
+              "reason": null,
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null
+      }
+    }
+  ],
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_turn_endings_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

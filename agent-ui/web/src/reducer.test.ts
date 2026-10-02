@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { applyCallNotes, applyEvent, applySnapshot, keepAfterSidecarStop, initialState, MAX_HELD_DENIALS, resetToStartScreen } from "./reducer";
-import type { AgentDomainEvent, AgentUiSnapshot, TurnOutcome, UsageInfo } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, TurnEndDetail, TurnOutcome, UsageInfo } from "./types";
+/** What Rust really sends for the turn-ending cases; written from its serializer. */
+import fixture from "./fixtures/turn-endings.json";
 
 describe("applyEvent", () => {
   it("session_opened populates identity and sets status to running", () => {
@@ -51,7 +53,7 @@ describe("applyEvent", () => {
       expect(state.activeTurnId).toBe("t1");
       state = applyEvent(state, {
         type: "turn_completed", turn_id: "t1", outcome, result_text: "done",
-        stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1, tokens: null, model: null },
+        stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1, tokens: null, model: null }, detail: { reason: null, api_error_status: null, message: null },
       });
       expect(state.activeTurnId).toBeNull();
     }
@@ -62,7 +64,7 @@ describe("applyEvent", () => {
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, {
       type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "done",
-      stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1, tokens: null, model: null },
+      stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1, tokens: null, model: null }, detail: { reason: null, api_error_status: null, message: null },
     });
     expect(state.status).toEqual({ kind: "running" });
   });
@@ -80,7 +82,7 @@ describe("applyEvent", () => {
       model: null,
     });
     const done = (usage: UsageInfo | null, turn = "t1", outcome: TurnOutcome = "completed"): AgentDomainEvent => ({
-      type: "turn_completed", turn_id: turn, outcome, result_text: "", stop_reason: null, usage,
+      type: "turn_completed", turn_id: turn, outcome, result_text: "", stop_reason: null, usage, detail: { reason: null, api_error_status: null, message: null },
     });
 
     it("is unknown until a turn reports one", () => {
@@ -493,7 +495,7 @@ describe("partial assistant streaming", () => {
     let state = applyEvent(initialState(), opened);
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, delta("first"));
-    state = applyEvent(state, { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "first", stop_reason: null, usage: null });
+    state = applyEvent(state, { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "first", stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } });
     state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
     state = applyEvent(state, delta("second"));
     expect(state.transcript.map((m) => m.text)).toEqual(["first", "second"]);
@@ -605,7 +607,7 @@ describe("turnThinking", () => {
       { type: "tool_call_completed", turn_id: "t1", tool_use_id: "tu1", content: "hi", is_error: false },
       { type: "permission_requested", permission_id: "p1", tool_use_id: "tu1", tool_name: "Bash", input: {} },
       { type: "permission_resolved", permission_id: "p1", outcome: "allowed" },
-      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "done", stop_reason: null, usage: null },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "done", stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
       { type: "session_unavailable", reason: "provider crashed" },
       { type: "session_closed", reason: "provider exited" },
     ];
@@ -861,7 +863,7 @@ describe("a CLI refusal that arrives ahead of its call", () => {
 
   it("is dropped when the turn or the session ends, so a later call of that id is not marked", () => {
     const ends: AgentDomainEvent[] = [
-      { type: "turn_completed", turn_id: "t", outcome: "completed", result_text: "", stop_reason: null, usage: null } as AgentDomainEvent,
+      { type: "turn_completed", turn_id: "t", outcome: "completed", result_text: "", stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } } as AgentDomainEvent,
       { type: "session_closed", reason: "bye" },
       { type: "session_unavailable", reason: "gone" },
     ];
@@ -969,5 +971,123 @@ describe("keepAfterSidecarStop (v1 polish item 6)", () => {
     expect(kept.userPrompts).toEqual(state.userPrompts);
     expect(kept.pendingPermissions).toEqual([]);
     expect(kept.activeTurnId).toBeNull();
+  });
+});
+
+/** Turns that do not complete: the fold must be the one `AgentSessionProjection::apply` does. */
+describe("turn endings", () => {
+  const NONE: TurnEndDetail = { reason: null, api_error_status: null, message: null };
+  const ended = (outcome: TurnOutcome, detail = NONE, turn = "t1"): AgentDomainEvent => ({
+    type: "turn_completed", turn_id: turn, outcome, result_text: "", stop_reason: null, usage: null, detail,
+  });
+  const running = () => {
+    let state = applyEvent(initialState(), { type: "session_opened", session_id: "s", provider_session_id: "p", model: "m", cwd: "/w" });
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    return state;
+  };
+
+  it("a failed turn pushes one item with the detail's fields, at the event's own seq, and sets lastTurnEnding", () => {
+    const before = running();
+    const state = applyEvent(before, ended("failed", { reason: "api_error", api_error_status: 500, message: "boom" }));
+    expect(state.turnEndings).toEqual([{ seq: before.nextSeq, turnId: "t1", kind: "failed", reason: "api_error", apiErrorStatus: 500, message: "boom" }]);
+    expect(state.lastTurnEnding).toBe("failed");
+    expect(state.activeTurnId).toBeNull();
+  });
+
+  it.each(["interrupted", "limit_reached"] as const)("%s folds to an item of that kind", (outcome) => {
+    const state = applyEvent(running(), ended(outcome, { reason: "max_turns", api_error_status: null, message: null }));
+    expect(state.turnEndings.map((e) => [e.kind, e.reason])).toEqual([[outcome, "max_turns"]]);
+    expect(state.lastTurnEnding).toBe(outcome);
+  });
+
+  it("a completed turn adds nothing and leaves lastTurnEnding as it was", () => {
+    const state = applyEvent(running(), ended("completed"));
+    expect(state.turnEndings).toEqual([]);
+    expect(state.lastTurnEnding).toBeNull();
+  });
+
+  it("an event without a detail still folds, to an item with nothing to say", () => {
+    const bare = { ...ended("failed"), detail: undefined } as unknown as AgentDomainEvent;
+    expect(applyEvent(running(), bare).turnEndings[0]).toMatchObject({ kind: "failed", reason: null, apiErrorStatus: null, message: null });
+  });
+
+  it("turn_started clears lastTurnEnding and keeps the item", () => {
+    let state = applyEvent(running(), ended("failed"));
+    state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
+    expect(state.lastTurnEnding).toBeNull();
+    expect(state.turnEndings).toHaveLength(1);
+  });
+
+  it("nothing but turn_started clears it: later events leave a standing ending alone", () => {
+    let state = applyEvent(running(), ended("limit_reached"));
+    state = applyEvent(state, { type: "user_prompt_submitted", text: "again" });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "x" });
+    expect(state.lastTurnEnding).toBe("limit_reached");
+  });
+
+  describe("a session that ends under a running turn", () => {
+    const resumeFailed: AgentDomainEvent = {
+      type: "resume_outcome", requested_provider_session_id: "p", status: "rejected", attached_provider_session_id: null, forked: false, detail: null,
+    };
+    const events: [string, AgentDomainEvent][] = [
+      ["session_unavailable", { type: "session_unavailable", reason: "gone" }],
+      ["session_closed", { type: "session_closed", reason: "provider_failed" }],
+      ["a non-attaching resume_outcome", resumeFailed],
+    ];
+    it.each(events)("%s pushes a lost item for the active turn", (_name, event) => {
+      const before = running();
+      const state = applyEvent(before, event);
+      expect(state.turnEndings).toEqual([{ seq: before.nextSeq, turnId: "t1", kind: "lost", reason: null, apiErrorStatus: null, message: null }]);
+      expect(state.lastTurnEnding).toBe("lost");
+    });
+    it.each(events)("%s with no turn running pushes nothing", (_name, event) => {
+      const idle = applyEvent(running(), ended("completed"));
+      const state = applyEvent(idle, event);
+      expect(state.turnEndings).toEqual([]);
+      expect(state.lastTurnEnding).toBeNull();
+    });
+    it("a resume_outcome that attached is not an ending", () => {
+      const attached: AgentDomainEvent = { ...resumeFailed, status: "attached", attached_provider_session_id: "p" } as AgentDomainEvent;
+      expect(applyEvent(running(), attached).turnEndings).toEqual([]);
+    });
+    it("a failed turn that then closes the session has one failed item and no lost item", () => {
+      let state = applyEvent(running(), ended("failed"));
+      state = applyEvent(state, { type: "session_closed", reason: "provider_failed" });
+      expect(state.turnEndings.map((e) => e.kind)).toEqual(["failed"]);
+      expect(state.lastTurnEnding).toBe("failed");
+    });
+  });
+
+  it("applySnapshot takes turnEndings and lastTurnEnding from the wire, and defends against their absence", () => {
+    const snapshot = {
+      ...(initialState() as AgentUiSnapshot),
+      turnEndings: [{ seq: 4, turnId: "t1", kind: "lost", reason: null, apiErrorStatus: null, message: null }],
+      lastTurnEnding: "lost",
+    } as AgentUiSnapshot;
+    const state = applySnapshot(initialState(), snapshot, 9);
+    expect(state.turnEndings).toEqual(snapshot.turnEndings);
+    expect(state.lastTurnEnding).toBe("lost");
+    const bare = { ...snapshot, turnEndings: undefined, lastTurnEnding: undefined } as unknown as AgentUiSnapshot;
+    const defended = applySnapshot(state, bare, 9);
+    expect(defended.turnEndings).toEqual([]);
+    expect(defended.lastTurnEnding).toBeNull();
+  });
+
+  describe("the contract fixture (what Rust sends)", () => {
+    for (const c of fixture.cases) {
+      it(`${c.name}: folding the events gives what the snapshot carries`, () => {
+        let state = initialState();
+        for (const event of c.events.events as AgentDomainEvent[]) state = applyEvent(state, event);
+        const snap = c.snapshot.state as unknown as AgentUiSnapshot;
+        const loaded = applySnapshot(initialState(), snap, c.snapshot.throughRevision);
+        expect(state.turnEndings).toEqual(snap.turnEndings);
+        expect(state.lastTurnEnding).toBe(snap.lastTurnEnding);
+        expect(state.transcript).toEqual(snap.transcript);
+        expect(state.status).toEqual(snap.status);
+        expect(state.activeTurnId).toBe(snap.activeTurnId);
+        expect(loaded.turnEndings).toEqual(state.turnEndings);
+        expect(loaded.nextSeq).toBe(state.nextSeq);
+      });
+    }
   });
 });

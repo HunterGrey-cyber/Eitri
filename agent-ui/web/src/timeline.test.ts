@@ -29,6 +29,8 @@ function labels(s: AgentUiState): string[] {
         return `tool:${item.call.toolUseId}`;
       case "permission":
         return `perm:${item.request.permissionId}`;
+      case "ending":
+        return `ending:${item.ending.kind}`;
       case "run":
         // `buildTimeline` itself never produces this kind -- only `display.ts`'s `buildDisplay`
         // does, over `buildTimeline`'s own output -- but `TimelineItem`'s union includes it (Task
@@ -39,6 +41,22 @@ function labels(s: AgentUiState): string[] {
 }
 
 describe("buildTimeline", () => {
+  it("places a turn ending where its turn stopped, between the reply and the next prompt", () => {
+    const ending = { seq: 4, turnId: "t1", kind: "failed" as const, reason: null, apiErrorStatus: null, message: null };
+    const items = buildTimeline(
+      state({
+        userPrompts: [
+          { seq: 1, text: "first" },
+          { seq: 5, text: "second" },
+        ],
+        transcript: [msg(3, "partial")],
+        turnEndings: [ending],
+      }),
+    );
+    expect(items.map((i) => i.key)).toEqual(["u-1", "m-3", "e-4", "u-5"]);
+    expect(labels(state({ transcript: [msg(3, "partial")], turnEndings: [ending] }))).toEqual(["text:partial", "ending:failed"]);
+  });
+
   /* The defect this closes. Rendering the three collections one after another put every tool card
      below every assistant message, so a turn that went text/tool/text/tool read as text/text/tool/tool
      -- which is not what happened, and is the panel's most visible wrong statement about a turn. */

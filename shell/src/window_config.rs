@@ -59,6 +59,18 @@ pub(crate) fn parse_companion_wm(raw: Option<&str>) -> Result<eitri_core::wm::Wm
     eitri_core::wm::parse_config(raw)
 }
 
+/// The account this window spends, from `VERDANDI_CLAUDE_ACCOUNT` or else `init.lua`'s
+/// `agent.account`, with the rest of the environment (`HOME`, `VERDANDI_CLAUDE_CONFIG_DIR`) read
+/// through `env`. `Err` is the text after "eitri: " and names the source of the bad name.
+pub(crate) fn resolve_account(
+    config: &eitri_core::lua::config::ConfigStore,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<(agent::account::ClaudeAccount, agent::account::AccountSource)>, String> {
+    let from_env = env("VERDANDI_CLAUDE_ACCOUNT");
+    agent::account::resolve_for_from(from_env.as_deref(), config.get("agent.account"), env)
+        .map_err(|err| format!("the configured claude account is unusable: {err}"))
+}
+
 /// Reads every `init.lua` key a window needs, in today's order, logging what it logs today, and
 /// applies the two process-wide ones (`agent.user_settings`, `agent.account`). `Err` is the text
 /// after "eitri: ".
@@ -135,24 +147,13 @@ pub(crate) fn load(lua_engine: &LuaEngine) -> Result<WindowConfig, String> {
             .get(eitri_core::attention::ChatOnPermission::KEY),
     )?;
 
-    let account_from_env = std::env::var("VERDANDI_CLAUDE_ACCOUNT").ok();
-    let account_from_config = lua_engine.config.borrow().get("agent.account").map(str::to_owned);
-    match agent::account::resolve_for(account_from_env.as_deref(), account_from_config.as_deref()) {
-        Ok(Some(account)) => {
-            let source = if agent::account::name_to_use(account_from_env.as_deref(), None).is_some() {
-                "VERDANDI_CLAUDE_ACCOUNT"
-            } else {
-                "init.lua's agent.account"
-            };
-            eprintln!(
-                "[account] claude account '{}' from {source} -> {}",
-                account.name(),
-                account.config_dir().display()
-            );
-            agent::account::configure(account);
-        }
-        Ok(None) => {}
-        Err(err) => return Err(format!("the configured claude account is unusable: {err}")),
+    if let Some((account, source)) = resolve_account(&lua_engine.config.borrow(), |key| std::env::var(key).ok())? {
+        eprintln!(
+            "[account] claude account '{}' from {source} -> {}",
+            account.name(),
+            account.config_dir().display()
+        );
+        agent::account::configure(account);
     }
 
     // The keymap (keymap spec §2.3): stock tmux's defaults, prefix `Ctrl+b`, then the user's own
@@ -281,5 +282,90 @@ mod tests {
             Ok(eitri_core::theme::DEFAULT_PANEL_FONT_SIZE_PX)
         );
         assert_eq!(parse_panel_font_size(Some(" 14 ")), Ok(14.0));
+    }
+
+    /// `init.lua`'s `agent.account` run through the real Lua engine, from a scratch config
+    /// directory, resolved against a scratch home: every bad value is a startup failure that names
+    /// the key, never a window that quietly spends whichever account launched it.
+    #[test]
+    fn a_bad_agent_account_in_init_lua_is_a_startup_failure_naming_the_key() {
+        let scratch = std::env::temp_dir().join(format!("eitri-account-test-{}", uuid::Uuid::new_v4()));
+        let config_dir = scratch.join("config");
+        let home = scratch.join("home");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(home.join(".claude-scratch")).unwrap();
+        let home_text = home.to_string_lossy().into_owned();
+        let env = |key: &str| (key == "HOME").then(|| home_text.clone());
+
+        let run = |value: &str| {
+            std::fs::write(
+                config_dir.join("init.lua"),
+                format!("eitri.config.set(\"agent.account\", {value})\n"),
+            )
+            .unwrap();
+            let engine = crate::lua::LuaEngine::new(config_dir.clone()).unwrap();
+            engine.run_and_check_init_file(&config_dir.join("init.lua"))?;
+            let config = engine.config.borrow();
+            resolve_account(&config, env)
+                .map(|resolved| resolved.map(|(account, source)| (account.name().to_string(), source)))
+        };
+
+        let malformed = run("\"../x\"").unwrap_err();
+        assert!(malformed.contains("init.lua's agent.account"), "{malformed}");
+        assert!(malformed.contains("\"../x\""), "{malformed}");
+
+        let missing = run("\"nosuch\"").unwrap_err();
+        assert!(missing.contains("init.lua's agent.account"), "{missing}");
+        assert!(
+            missing.contains(&format!("{}/.claude-nosuch", home.display())),
+            "{missing}"
+        );
+
+        for not_a_string in ["{}", "function() end"] {
+            let refused = run(not_a_string).unwrap_err();
+            assert!(
+                refused.starts_with("eitri.config.set(\"agent.account\", ...): a "),
+                "{not_a_string}: {refused}"
+            );
+            assert!(refused.contains("init.lua"), "the file is named: {refused}");
+        }
+        // `nil` unsets, like an empty string: nothing pinned, nothing refused.
+        assert_eq!(run("nil"), Ok(None));
+        assert_eq!(run("\"\""), Ok(None));
+        // Lua turns these into text; neither names an account directory, so the check refuses them.
+        for coerced in ["42", "true"] {
+            let refused = run(coerced).unwrap_err();
+            assert!(refused.contains("init.lua's agent.account"), "{coerced}: {refused}");
+            assert!(refused.contains("has no config directory"), "{coerced}: {refused}");
+        }
+
+        assert_eq!(
+            run("\"scratch\"").unwrap(),
+            Some(("scratch".to_string(), agent::account::AccountSource::InitLua))
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// The launcher's variable still outranks `init.lua`, and its refusal names it rather than the
+    /// key it overrode.
+    #[test]
+    fn the_environment_outranks_init_lua_and_its_refusal_names_the_variable() {
+        let lua = mlua::Lua::new();
+        let eitri = lua.create_table().unwrap();
+        let store = Rc::new(std::cell::RefCell::new(eitri_core::lua::config::ConfigStore::default()));
+        eitri_core::lua::config::install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+        lua.load(r#"eitri.config.set("agent.account", "work")"#)
+            .exec()
+            .unwrap();
+
+        let env = |key: &str| match key {
+            "VERDANDI_CLAUDE_ACCOUNT" => Some("../x".to_string()),
+            "HOME" => Some("/nonexistent-home".to_string()),
+            _ => None,
+        };
+        let err = resolve_account(&store.borrow(), env).unwrap_err();
+        assert!(err.contains("VERDANDI_CLAUDE_ACCOUNT"), "{err}");
+        assert!(!err.contains("init.lua"), "{err}");
     }
 }

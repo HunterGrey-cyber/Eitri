@@ -403,12 +403,16 @@ pub(crate) fn translate_wire_event(
                 tokens: None,
                 model: None,
             });
+            // The CLI's `result` line as `wire.rs::ResultLine` reads it has no terminal reason, HTTP
+            // status or error list, so only the text of a failed result can say why.
+            let detail = crate::TurnEndDetail::from_result(outcome, is_error, &result_text, None, None, &[]);
             vec![AgentDomainEvent::TurnCompleted {
                 turn_id,
                 outcome,
                 result_text,
                 stop_reason,
                 usage,
+                detail,
             }]
         }
         AgentEvent::ProcessExited { success: true, .. } => {

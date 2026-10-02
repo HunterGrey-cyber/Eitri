@@ -697,6 +697,7 @@ fn finished_turn(turn_id: &str, prompt: &str, reply: String) -> Vec<AgentDomainE
             result_text: String::new(),
             stop_reason: Some("end_turn".into()),
             usage: None,
+            detail: Default::default(),
         },
     ]
 }
@@ -811,6 +812,7 @@ fn replay_main() -> Vec<String> {
             result_text: String::new(),
             stop_reason: Some("end_turn".into()),
             usage: None,
+            detail: Default::default(),
         },
     ] {
         projection.apply(&event);

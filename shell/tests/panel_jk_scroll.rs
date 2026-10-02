@@ -474,6 +474,7 @@ fn replay_fixture() -> Vec<String> {
             result_text: String::new(),
             stop_reason: Some("end_turn".into()),
             usage: None,
+            detail: Default::default(),
         },
     ];
     for event in &events {

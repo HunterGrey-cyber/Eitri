@@ -266,6 +266,12 @@ export type AgentUiState = {
    * reload shows the figure without waiting for the next turn. A resumed tab shows none until its
    * first turn after the resume, because history seeding reports no usage. */
   usage: UsageInfo | null;
+  /** The turns that ended without completing, oldest first: failed, hit a limit, interrupted, or cut off
+   *  by the session ending. Each is a muted row where the turn stopped. A turn that completed adds none. */
+  turnEndings: TurnEnding[];
+  /** How the latest turn ended while it is still the latest news -- the band says it until the next turn
+   *  starts. `null` before any turn ends badly, after a completed one's start, and from `turn_started` on. */
+  lastTurnEnding: TurnEndingKind | null;
   /** What this session was seeded with before it produced anything of its own, or `null` when it
    * restored nothing -- which is every fresh session. On the wire, so it survives a resync and a
    * panel reload exactly as the four collections do. */
@@ -382,6 +388,26 @@ export type Hello = {
 
 export type TurnOutcome = "completed" | "interrupted" | "failed" | "limit_reached";
 
+/** What a turn that did not complete carries beyond its outcome, as `turn_completed.detail` (snake_case,
+ *  as serde derives it). `message` is the provider's own words, already trimmed and capped by Rust, and is
+ *  the only place a reset time the CLI wrote into its text can appear: nothing here parses it. */
+export type TurnEndDetail = { reason: string | null; api_error_status: number | null; message: string | null };
+
+/** How a turn ended without completing: its outcome, or `lost` when the session ended under a turn that
+ *  was still running (no `turn_completed` was ever coming). */
+export type TurnEndingKind = "interrupted" | "failed" | "limit_reached" | "lost";
+
+/** One turn-ending row of the conversation. Ordered by `seq` with the other items; on the wire in a
+ *  snapshot's `turnEndings` (camelCase, like the other collections). */
+export type TurnEnding = {
+  seq: Seq;
+  turnId: string;
+  kind: TurnEndingKind;
+  reason: string | null;
+  apiErrorStatus: number | null;
+  message: string | null;
+};
+
 /** The token counts of one usage report, as Verdandi's `TurnUsage` carries them (Rust's
  *  `agent::TokenUsage`, snake_case as serde derives it). The prompt is three figures, not one: Claude
  *  Code caches aggressively, so on a large prompt `input` is typically single digits and nearly all of
@@ -432,7 +458,17 @@ export type AgentDomainEvent =
       provider_prompt?: WireProviderPrompt;
     }
   | { type: "permission_resolved"; permission_id: string; outcome: "allowed" | "denied" | "cancelled_by_interrupt" | "cancelled_by_session_close" | "provider_failed" | "expired" | "deferred" }
-  | { type: "turn_completed"; turn_id: string; outcome: TurnOutcome; result_text: string; stop_reason: string | null; usage: UsageInfo | null }
+  | {
+      type: "turn_completed";
+      turn_id: string;
+      outcome: TurnOutcome;
+      result_text: string;
+      stop_reason: string | null;
+      usage: UsageInfo | null;
+      /** What the provider said about how the turn ended; Rust always sends it, every field `null`
+       *  when there is nothing to say (see `TurnEndDetail`). */
+      detail: TurnEndDetail;
+    }
   /** The provider's verdict on a resume, stated once for a session that asked for one. Mirrors the
    *  Rust `AgentDomainEvent::ResumeOutcome`; the reducer must fold it the same way
    *  `AgentSessionProjection` does, or the two states diverge on a failed resume. */

@@ -1,9 +1,10 @@
 import type { PanelMode } from "./keymap";
-import type { EditorLink, UsageInfo } from "./types";
+import type { EditorLink, TurnEnding, UsageInfo } from "./types";
+import { turnEndingBandText } from "./turnEnding";
 
 /** One segment's identity, in the priority order spec §5.2 lists (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage" | "review";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage" | "review" | "ending";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (spec §5.2:
  *  left of the gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
@@ -58,6 +59,11 @@ export type BandFacts = {
    *  or absent, says nothing. Never drawn over a prompt. A narrow band drops it right after the usage
    *  figure and the context's shortening, ahead of the model: it is a pointer, not a state. */
   review?: { files: number } | null;
+  /** How this tab's latest turn ended when it did not complete (`latestTurnEnding`), until
+   *  the next turn starts. `null`, or absent, says nothing: a completed turn, no turn yet, and the
+   *  empty tab, which has no turns. On the left beside the state it describes, in the band's own colour like
+   *  its neighbours; the muted row in the conversation carries the detail. */
+  ending?: Pick<TurnEnding, "kind" | "reason" | "apiErrorStatus" | "message"> | null;
 };
 
 /** The band's turn-review segment: how many files changed on disk during the last turn, and the key that
@@ -158,6 +164,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.cards > 0 ? [{ id: "cards", text: `⚑${f.cards}`, side: "left" } as Seg] : []),
     ...(f.approve ? [{ id: "approve", text: `Ctrl+y approves ${f.approve.tool}: ${f.approve.summary}`, side: "left" } as Seg] : []),
     ...(f.queued > 0 ? [{ id: "queue", text: `⧗${f.queued}`, side: "left" } as Seg] : []),
+    ...(f.ending ? [{ id: "ending", text: turnEndingBandText(f.ending), side: "left" } as Seg] : []),
     ...(f.message ? [{ id: "message", text: f.message, side: "left" } as Seg] : []),
     ...(f.showcmd ? [{ id: "showcmd", text: f.showcmd, side: "right" } as Seg] : []),
     ...(f.warn ? [{ id: "warn", text: "⚠", side: "right" } as Seg] : []),
@@ -185,6 +192,10 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     (s) => s.map((x) => (x.id === "approve" && f.approve ? { ...x, text: `Ctrl+y approves ${f.approve.tool}` } : x)),
     (s) => s.filter((x) => x.id !== "approve"),
     (s) => s.filter((x) => x.id !== "cards"),
+    // A turn that ended badly is short and it explains why the panel went quiet, so it outlasts every
+    // figure and pointer above and the card count too, and goes only just before the mode shrinks to
+    // its letter: the row in the conversation says the same thing in full.
+    (s) => s.filter((x) => x.id !== "ending"),
     (s) => s.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x)),
   ];
   for (const apply of steps) {

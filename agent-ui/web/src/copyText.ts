@@ -1,5 +1,6 @@
 import { runSummary } from "./display";
 import type { TimelineItem } from "./timeline";
+import { turnEndingText } from "./turnEnding";
 import { formatResultContent } from "./toolRegistry";
 
 const PATH_TOOLS = new Set(["Read", "Edit", "Write", "NotebookEdit"]);
@@ -23,6 +24,8 @@ export function primaryText(item: TimelineItem): string {
       return toolPrimary(item.request.toolName, item.request.input);
     case "run":
       return runSummary(item.calls);
+    case "ending":
+      return turnEndingText(item.ending);
   }
 }
 
