@@ -5,6 +5,9 @@ import { ReviewOverlay } from "./ReviewOverlay";
 import { applyReviewKey, failRequest, openReview, receiveDiff, receiveReview } from "../review";
 import type { ReviewAction, ReviewState } from "../review";
 import type { ReviewDiffEnvelope, ReviewEnvelope, ReviewFile, ReviewTurn } from "../types";
+/** What Rust really sends: `core/src/turn_review/lifecycle.rs` writes these envelopes from its own `plan`
+ *  and serializer, and fails when this file is not what it would write. */
+import notesFixture from "../fixtures/review-notes.json";
 
 afterEach(cleanup);
 
@@ -29,6 +32,7 @@ function envelope(over: Partial<ReviewEnvelope> = {}): ReviewEnvelope {
     current: 7,
     turns: [TURN],
     files: [file("a.rs", { added: 41, removed: 6 }), file("b.md", { origin: "agent_only", added: 0 }), file("Cargo.lock", { origin: "workspace", added: 7, removed: 7 })],
+    compared: true,
     pendingNoResult: 0,
     notes: ["changed on disk during this turn"],
     ...over,
@@ -71,26 +75,21 @@ describe("ReviewOverlay", () => {
     expect(container.querySelectorAll(".review-flag")).toHaveLength(0);
   });
 
-  it("says what the record says is partial, one line each", () => {
+  it("draws the turn flags only through Rust's notes, never a second line of its own", () => {
     const { container } = draw(loaded({ turns: [{ ...TURN, late: true, overlappedNext: true, overlappedTab: true }] }));
-    const lines = Array.from(container.querySelectorAll(".review-flag")).map((el) => el.textContent);
-    expect(lines).toEqual([
-      "baseline late: changes made early in this turn may be missing",
-      "may include the next turn's first changes",
-      "overlapped another tab's turn",
-    ]);
+    expect(container.querySelectorAll(".review-flag")).toHaveLength(0);
   });
 
-  it("says a turn did not finish while Eitri was running", () => {
-    const { container } = draw(loaded({ turns: [{ ...TURN, state: "unfinished" }] }));
-    expect(container.querySelector(".review-header")!.textContent).toContain("this turn did not finish while Eitri was running");
-  });
-
-  it("shows a turn with no baseline's reason and no files", () => {
-    const { container } = draw(loaded({ turns: [{ ...TURN, state: "no_baseline", reason: "git is not installed" }] }));
-    expect(container.querySelector(".review-header")!.textContent).toContain("no baseline: git is not installed");
+  it("shows no file list, and never says nothing changed, when nothing was compared", () => {
+    const { container } = draw(loaded({ files: [], compared: false, notes: ["changed on disk during this turn", "the baseline snapshot is still being taken"] }));
+    expect(container.querySelector(".review-header")!.textContent).toContain("the baseline snapshot is still being taken");
+    expect(container.textContent).not.toContain("no files changed on disk");
     expect(container.querySelector(".review-file")).toBeNull();
     expect(container.querySelector('[data-nav-stop="group"]')).toBeNull();
+  });
+
+  it("says no files changed when two snapshots were compared and none differ", () => {
+    expect(draw(loaded({ files: [] })).container.textContent).toContain("no files changed on disk");
   });
 
   it("carries a note Rust adds beyond the header's own words", () => {
@@ -222,5 +221,49 @@ describe("ReviewOverlay", () => {
     const state = withPatch();
     const text = draw({ ...state, groupOpen: true }).container.textContent!;
     expect(text).not.toMatch(/agent changed|the agent|claude changed/i);
+  });
+});
+
+describe("ReviewOverlay over the envelopes Rust sends", () => {
+  const envelopes = notesFixture.envelopes as unknown as Record<string, ReviewEnvelope>;
+  const shown = (name: string) => {
+    const envelope = envelopes[name];
+    const { container } = draw(receiveReview(openReview(3, envelope.requestId), envelope));
+    const lines = Array.from(container.querySelectorAll(".review-flag")).map((el) => el.textContent ?? "");
+    const text = container.textContent ?? "";
+    cleanup();
+    return { envelope, lines, text };
+  };
+
+  it.each(Object.keys(envelopes))("%s: draws each of Rust's notes once and nothing else", (name) => {
+    const { envelope, lines, text } = shown(name);
+    expect(new Set(lines).size).toBe(lines.length);
+    const title = envelope.scope === "turn" ? "changed on disk during this turn" : "changed on disk during this session";
+    expect(lines).toEqual(envelope.notes.filter((note) => note !== title));
+    if (!envelope.compared) expect(text).not.toContain("no files changed on disk");
+  });
+
+  it("dates a late baseline once, in Rust's words", () => {
+    const { lines } = shown("flagged");
+    expect(lines).toEqual([
+      "baseline late: changes made before HH:MM:SS may be missing",
+      "may include the next turn's first changes",
+      "this turn overlapped another tab's turn",
+    ]);
+  });
+
+  it("does not say a turn whose end snapshot failed in this run did not finish", () => {
+    const { lines } = shown("endFailed");
+    expect(lines.join("\n")).not.toContain("did not finish");
+    expect(lines.some((line) => line.startsWith("no end snapshot (too many files"))).toBe(true);
+  });
+
+  it("shows no file list for a review that compared nothing", () => {
+    for (const name of ["noBaseline", "basePending", "sessionNoBaseline"]) {
+      expect(envelopes[name].compared, name).toBe(false);
+      const { text } = shown(name);
+      expect(text, name).not.toContain("no files changed on disk");
+    }
+    expect(shown("ok").text).toContain("no files changed on disk");
   });
 });

@@ -27,5 +27,5 @@ pub use lifecycle::{
 };
 pub use shadow::{
     review_dir_for, Limits, Shadow, ShadowError, ShadowLock, Snapshot, SnapshotKind, SnapshotLabel, SnapshotOutcome,
-    SnapshotRef,
+    SnapshotRef, TurnMarks,
 };

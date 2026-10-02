@@ -12,7 +12,7 @@ import {
   receiveDiff,
   receiveReview,
   resolveReviewKey,
-  reviewFlags,
+  reviewNotes,
   reviewStops,
   reviewTitle,
   scrollBoxFirst,
@@ -121,6 +121,7 @@ function envelope(over: Partial<ReviewEnvelope> = {}): ReviewEnvelope {
     current: 7,
     turns: [TURN6, TURN7],
     files: [file("a.rs", { added: 41, removed: 6 }), file("b.md", { origin: "agent_only", added: 0 }), file("Cargo.lock", { origin: "workspace" }), file("c.rs", { origin: "workspace" })],
+    compared: true,
     pendingNoResult: 0,
     notes: ["changed on disk during this turn"],
     ...over,
@@ -176,9 +177,12 @@ describe("the stops", () => {
     expect(reviewStops(state).map(stopKey)).toEqual(["file:a.rs"]);
   });
 
-  it("show no files for a turn with no baseline", () => {
-    const state = loaded({ turns: [TURN6, { ...TURN7, state: "no_baseline", reason: "git is not installed" }] });
+  it("show no files when nothing was compared", () => {
+    const state = loaded({ turns: [TURN6, { ...TURN7, state: "no_baseline", reason: "git is not installed" }], compared: false });
     expect(reviewStops(state)).toEqual([]);
+    // A session scope with no baseline anywhere, or a turn whose baseline is still being taken, too.
+    expect(reviewStops(loaded({ scope: "session", compared: false }))).toEqual([]);
+    expect(reviewStops(loaded({ turns: [TURN6, { ...TURN7, state: "pending" }], compared: false }))).toEqual([]);
   });
 });
 
@@ -372,26 +376,15 @@ describe("what the header says", () => {
     expect(reviewTitle(envelope({ scope: "session" }))).toMatch(/^review · session · 2 turns · \d\d:\d\d:\d\d → \d\d:\d\d:\d\d · changed on disk during this session$/);
   });
 
-  it("is quiet for a turn that is fine", () => {
-    expect(reviewFlags(envelope())).toEqual([]);
+  it("is quiet for a turn that is fine: the heading note is the title's own words", () => {
+    expect(reviewNotes(envelope())).toEqual([]);
   });
 
-  it.each([
-    ["a late baseline", { late: true, baselineAt: Date.UTC(2026, 0, 1, 11, 0, 5) }, /^baseline late: changes made before \d\d:\d\d:\d\d may be missing$/],
-    ["a late baseline with no time", { late: true }, /^baseline late: changes made early in this turn may be missing$/],
-    ["a turn that did not finish", { state: "unfinished" as const }, /^this turn did not finish while Eitri was running$/],
-    ["the next turn's first changes", { overlappedNext: true }, /^may include the next turn's first changes$/],
-    ["another tab's turn", { overlappedTab: true }, /^overlapped another tab's turn$/],
-    ["no baseline", { state: "no_baseline" as const, reason: "git is not installed" }, /^no baseline: git is not installed$/],
-  ])("says %s", (_name, over, expected) => {
-    const lines = reviewFlags(envelope({ turns: [TURN6, { ...TURN7, ...over }] }));
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatch(expected);
-  });
-
-  it("names the turn on each line in session scope", () => {
-    const lines = reviewFlags(envelope({ scope: "session", turns: [{ ...TURN6, overlappedTab: true }, { ...TURN7, state: "unfinished" }] }));
-    expect(lines).toEqual(["turn 6: overlapped another tab's turn", "turn 7: this turn did not finish while Eitri was running"]);
+  it("says only what Rust's notes say, never a line of its own from the turn flags", () => {
+    const flagged = envelope({ turns: [TURN6, { ...TURN7, late: true, overlappedNext: true, overlappedTab: true, state: "unfinished" }] });
+    expect(reviewNotes(flagged)).toEqual([]);
+    const notes = ["changed on disk during this turn", "may include the next turn's first changes"];
+    expect(reviewNotes({ ...flagged, notes })).toEqual(["may include the next turn's first changes"]);
   });
 
   it("says why a file has nothing to open", () => {

@@ -532,11 +532,8 @@ export type ReviewTurn = {
   late: boolean;
   overlappedNext: boolean;
   overlappedTab: boolean;
-  /** Why `state` is `no_baseline`. */
+  /** Why `state` is `no_baseline` or `unfinished`. */
   reason: string | null;
-  /** When the late baseline was actually taken (epoch ms), so the label can say what may be missing;
-   *  optional because a host that does not send it only loses the time, not the label. */
-  baselineAt?: number | null;
 };
 export type ReviewFile = {
   path: string;
@@ -555,8 +552,13 @@ export type ReviewEnvelope = {
   current: number;
   turns: ReviewTurn[];
   files: ReviewFile[];
+  /** `false`: nothing was compared (no baseline, or one still being taken), so an empty `files` says
+   *  nothing about what changed and the list is not drawn. */
+  compared: boolean;
   /** File-changing calls of this turn that have no result. */
   pendingNoResult: number;
+  /** Every line the review says about itself (its heading, a late or missing baseline, overlaps, a turn
+   *  still running), worded by Rust. The overlay draws these and derives none from the turn flags. */
   notes: string[];
 };
 export type ReviewLine = {

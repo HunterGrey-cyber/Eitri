@@ -544,6 +544,106 @@ fn turns_of_an_earlier_run_come_back_from_refs() {
     );
 }
 
+/// What a turn's review must say about its own precision survives a restart: a late baseline (and
+/// when it was taken), an overlap with the next turn learnt only after the turn's end was asked
+/// for, an overlap with another tab, and a file left out of the end snapshot for its size -- which,
+/// forgotten, would read as a file the turn deleted.
+#[test]
+fn an_earlier_runs_turn_keeps_its_marks_and_its_left_out_files() {
+    let scratch = Scratch::new("earlier-marks");
+    let big = scratch.project().join("big.bin");
+    std::fs::write(&big, "small\n").unwrap();
+    let jobs = Jobs::default();
+    let options = || {
+        let mut options = jobs.options();
+        options.limits.max_file_bytes = 64;
+        options
+    };
+    {
+        let mut run1 = TurnReview::with_options(Some(scratch.review_dir()), &scratch.project(), options());
+        jobs.hold(SnapshotKind::Base, 1);
+        run1.observe(1, "s1", &started("t1"), now());
+        run1.observe(1, "s1", &tool("t1"), now());
+        jobs.release(SnapshotKind::Base, 1);
+        poll_until(&mut run1, "s1", "the first base", |t| has_base(t, "t1"));
+        std::fs::write(&big, vec![b'x'; 200]).unwrap();
+        jobs.hold(SnapshotKind::End, 1);
+        run1.observe(1, "s1", &completed("t1"), now());
+        run1.observe(1, "s1", &started("t2"), now());
+        // Turn 1's end is still waiting when turn 2's first tool starts.
+        run1.observe(1, "s1", &tool("t2"), now());
+        run1.observe(2, "s2", &started("b1"), now());
+        jobs.release(SnapshotKind::End, 1);
+        run1.observe(1, "s1", &completed("t2"), now());
+        run1.observe(2, "s2", &completed("b1"), now());
+        poll_until(&mut run1, "s1", "both turns", |t| is_ok(t, "t1") && is_ok(t, "t2"));
+        poll_until(&mut run1, "s2", "the other tab's turn", |t| is_ok(t, "b1"));
+        let seen = run1.turns("s1");
+        let (one, two) = (turn(&seen, "t1"), turn(&seen, "t2"));
+        assert!(one.late && one.overlapped_next && !one.overlapped_tab, "{one:#?}");
+        assert!(two.late && two.overlapped_tab, "{two:#?}");
+        assert_eq!(one.skipped_large, vec![PathBuf::from("big.bin")]);
+        // Everything handed to the worker is done once the session is no longer tracked.
+        run1.close_tab(1, now());
+        run1.close_tab(2, now());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !run1.turns("s1").is_empty() {
+            assert!(Instant::now() < deadline, "the worker never finished");
+            run1.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let run2 = TurnReview::with_options(Some(scratch.review_dir()), &scratch.project(), options());
+    let job = run2.overview_job("s1", TurnRef::N(1), Scope::Turn, NamedPaths::default());
+    let overview = std::thread::spawn(move || job.run()).join().unwrap().unwrap();
+    let flags: Vec<(u32, bool, bool, bool, bool)> = overview
+        .turns
+        .iter()
+        .map(|t| (t.n, t.earlier_run, t.late, t.overlapped_next, t.overlapped_tab))
+        .collect();
+    assert_eq!(flags, vec![(1, true, true, true, false), (2, true, true, false, true)]);
+    assert!(overview.turns[0].base_taken_ms.is_some(), "{:#?}", overview.turns[0]);
+    assert!(
+        overview
+            .notes
+            .iter()
+            .any(|n| n.starts_with("baseline late: changes made before ")),
+        "{:?}",
+        overview.notes
+    );
+    assert!(
+        overview
+            .notes
+            .contains(&"may include the next turn's first changes".to_string()),
+        "{:?}",
+        overview.notes
+    );
+    let big_row = overview
+        .files
+        .iter()
+        .find(|f| f.path == Path::new("big.bin"))
+        .unwrap_or_else(|| panic!("big.bin is not listed: {:#?}", overview.files));
+    assert!(big_row.too_large, "listed as too large, not as deleted: {big_row:#?}");
+    assert_eq!((big_row.added, big_row.removed), (0, 0));
+    let diff = run2.diff_job("s1", 1, Scope::Turn, "big.bin");
+    let refused = std::thread::spawn(move || diff.run()).join().unwrap();
+    assert!(
+        matches!(refused, Err(eitri_core::turn_review::ReviewError::TooLarge(_))),
+        "{refused:?}"
+    );
+
+    let job = run2.overview_job("s1", TurnRef::N(2), Scope::Turn, NamedPaths::default());
+    let overview = std::thread::spawn(move || job.run()).join().unwrap().unwrap();
+    assert!(
+        overview
+            .notes
+            .contains(&"this turn overlapped another tab's turn".to_string()),
+        "{:?}",
+        overview.notes
+    );
+}
+
 #[test]
 fn turns_never_runs_git() {
     let scratch = Scratch::new("no-git");

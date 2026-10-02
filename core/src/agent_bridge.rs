@@ -856,13 +856,16 @@ impl From<ReviewScopeWire> for crate::turn_review::Scope {
 }
 
 /// `{"kind":"review","requestId":...,"tab":...,"scope":...,"current":...,"turns":[...],"files":[...],
-/// "pendingNoResult":...,"notes":[...]}`: the answer to a `review_request`. It states what the
+/// "compared":...,"pendingNoResult":...,"notes":[...]}`: the answer to a `review_request`. It states what the
 /// snapshots measured -- files that changed on disk during the turn -- and `origin` carries the
 /// attribution: `agent` (named by the turn's own edit calls), `agent_only` (named, but unchanged
 /// on disk) or `workspace` (changed with no call naming it). A path that is not valid UTF-8 is
 /// sent lossily, and a `review_diff_request` for a name that reads like another changed file's is
 /// refused (`ReviewError::AmbiguousPath`), so a patch is never shown for the wrong file. A review
 /// that was worked out is answered by this envelope alone; only a failure is a `command_result`.
+/// `compared: false` means nothing was compared (no baseline, or one still being taken), so an
+/// empty `files` is no claim that nothing changed. `notes` are every line the review must say about
+/// itself, in order -- the panel draws them as they are and derives none from the turn flags.
 pub fn serialize_review_for_js(
     request_id: &str,
     tab: crate::tabs::TabId,
@@ -914,6 +917,7 @@ pub fn serialize_review_for_js(
         "current": overview.current,
         "turns": turns,
         "files": files,
+        "compared": overview.compared,
         "pendingNoResult": overview.pending_no_result,
         "notes": overview.notes,
     })
@@ -2153,6 +2157,7 @@ mod tests {
                     nested: false,
                 },
             ],
+            compared: true,
             pending_no_result: 2,
             notes: vec!["changed on disk during this turn".into()],
         };
@@ -2175,6 +2180,7 @@ mod tests {
                     {"path": "Cargo.lock", "added": 2, "removed": 1, "origin": "workspace", "binary": false,
                      "tooLarge": false, "nested": false},
                 ],
+                "compared": true,
                 "pendingNoResult": 2,
                 "notes": ["changed on disk during this turn"],
             })

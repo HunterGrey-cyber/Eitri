@@ -128,10 +128,10 @@ export function currentTurn(envelope: ReviewEnvelope): ReviewTurn | null {
   return envelope.turns.find((t) => t.n === envelope.current) ?? null;
 }
 
-/** A turn with no base snapshot compares nothing: its overview shows the reason and no files. In session
- *  scope the turns that have a baseline still count, so this is turn scope only. */
+/** A review that compared nothing (no baseline, or one still being taken) has no file list to show: an
+ *  empty one would read as "nothing changed". The notes say why. */
 export function hidesFiles(envelope: ReviewEnvelope): boolean {
-  return envelope.scope === "turn" && currentTurn(envelope)?.state === "no_baseline";
+  return !envelope.compared;
 }
 
 /** Files that were named by a call of this tab (`✓`, `·`), then the ones nothing named (`?`). */
@@ -361,27 +361,13 @@ export function reviewTitle(envelope: ReviewEnvelope): string {
   return `review · turn ${envelope.current} of ${total}${span} · changed on disk during this turn`;
 }
 
-/** What the record says is wrong or partial about the turn(s) in view, one line each. A turn that is fine
- *  says nothing. In session scope each line names its turn. */
-export function reviewFlags(envelope: ReviewEnvelope): string[] {
-  const turns = envelope.scope === "turn" ? envelope.turns.filter((t) => t.n === envelope.current) : [...envelope.turns].sort((a, b) => a.n - b.n);
-  const lines: string[] = [];
-  for (const t of turns) {
-    const who = envelope.scope === "session" ? `turn ${t.n}: ` : "";
-    if (t.state === "no_baseline") lines.push(`${who}no baseline: ${t.reason ?? "no reason given"}`);
-    if (t.state === "unfinished") lines.push(`${who}this turn did not finish while Eitri was running`);
-    if (t.state === "pending") lines.push(`${who}this turn's snapshot is still being taken`);
-    if (t.late) {
-      lines.push(
-        t.baselineAt === null || t.baselineAt === undefined
-          ? `${who}baseline late: changes made early in this turn may be missing`
-          : `${who}baseline late: changes made before ${clock(t.baselineAt)} may be missing`,
-      );
-    }
-    if (t.overlappedNext) lines.push(`${who}may include the next turn's first changes`);
-    if (t.overlappedTab) lines.push(`${who}overlapped another tab's turn`);
-  }
-  return lines;
+/** The lines the header shows under its title: the review's own notes, as Rust worded them, less the one
+ *  the title already says. Rust is the only source of these, so a mark is never said twice in two
+ *  wordings, and a turn's state is described as it really is (an end snapshot that failed in this run is
+ *  not "did not finish"). */
+export function reviewNotes(envelope: ReviewEnvelope): string[] {
+  const title = reviewTitle(envelope);
+  return envelope.notes.filter((note) => !title.includes(note));
 }
 
 /** Why a file row has nothing to open, in the words the row shows. */

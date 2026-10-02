@@ -2923,12 +2923,16 @@ export default function App() {
       } else if (payload.kind === "scratch") {
         setScratchEditing(payload.editing);
       } else if (payload.kind === "review") {
+        // A review that was worked out is answered by this envelope alone, never by a `command_result`, so
+        // this is where its in-flight record ends.
+        inFlight.current.delete(payload.requestId);
         // The reply to the overlay's newest `review_request`; `receiveReview` drops any other (a request
         // the overlay has since replaced), and an overlay that was closed meanwhile takes nothing.
         setReview((current) => (current === null ? current : receiveReview(current, payload)));
         // Opened on that turn: the band's pointer to it has done its job.
         setReviewHints((hints) => (hints[payload.tab] !== undefined && payload.current >= hints[payload.tab].turn ? withoutHint(hints, payload.tab) : hints));
       } else if (payload.kind === "review_diff") {
+        inFlight.current.delete(payload.requestId);
         setReview((current) => (current === null ? current : receiveDiff(current, payload)));
       } else if (payload.kind === "review_hint") {
         // Kept for the tab it names, shown only while that tab is on screen. One that arrives while a turn

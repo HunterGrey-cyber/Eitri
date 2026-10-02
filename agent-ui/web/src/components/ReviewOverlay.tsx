@@ -7,7 +7,7 @@ import {
   hasPatch,
   hidesFiles,
   originSign,
-  reviewFlags,
+  reviewNotes,
   reviewStops,
   reviewTitle,
   splitFiles,
@@ -119,7 +119,6 @@ export const ReviewOverlay = forwardRef<HTMLDivElement, Props>(function ReviewOv
 
   const loading = envelope === null ? state.error === null : state.requestId !== envelope.requestId && state.error === null;
   const { named, unnamed } = envelope === null ? { named: [], unnamed: [] } : splitFiles(envelope);
-  const extraNotes = envelope === null ? [] : envelope.notes.filter((note) => !reviewTitle(envelope).includes(note));
 
   return (
     <div
@@ -135,12 +134,12 @@ export const ReviewOverlay = forwardRef<HTMLDivElement, Props>(function ReviewOv
         <div className="review-title">{envelope === null ? "review" : reviewTitle(envelope)}</div>
         {loading && <div className="review-flag">loading…</div>}
         {state.error !== null && <div className="review-flag">{state.error}</div>}
-        {envelope !== null && reviewFlags(envelope).map((line) => <div key={line} className="review-flag">{line}</div>)}
-        {extraNotes.map((note) => (
-          <div key={note} className="review-flag">
-            {note}
-          </div>
-        ))}
+        {envelope !== null &&
+          reviewNotes(envelope).map((note, i) => (
+            <div key={i} className="review-flag">
+              {note}
+            </div>
+          ))}
       </header>
       {envelope !== null && !hidesFiles(envelope) && (
         <div className="review-files">

@@ -134,7 +134,7 @@ const FILES = [
 ];
 const reviewEnvelope = (requestId: unknown, over: Record<string, unknown> = {}) => ({
   kind: "review", requestId, tab: 1, scope: "turn", current: 7, turns: [turn(6), turn(7)], files: FILES,
-  pendingNoResult: 0, notes: ["changed on disk during this turn"], ...over,
+  compared: true, pendingNoResult: 0, notes: ["changed on disk during this turn"], ...over,
 });
 const diffEnvelope = (requestId: unknown, over: Record<string, unknown> = {}) => ({
   kind: "review_diff", requestId, tab: 1, turn: 7, path: "core/src/x.rs", added: 41, removed: 6,

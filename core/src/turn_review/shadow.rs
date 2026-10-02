@@ -21,7 +21,9 @@
 //!   yet referenced.
 //!
 //! Each snapshot is a root commit under `refs/eitri/<session>/<turn>/<base|end|warm>`, its
-//! message the [`SnapshotLabel`] as `key: value` lines. There is no other state: the refs are the
+//! message the [`SnapshotLabel`] as `key: value` lines, then when it finished and the files it left
+//! out for their size. What a turn's review must say about its precision is a commit of the empty
+//! tree under `refs/eitri/<session>/<turn>/marks` ([`TurnMarks`]). There is no other state: the refs are the
 //! index of what exists, and deleting a ref really frees its snapshot, since no parent chain keeps
 //! it alive.
 
@@ -150,6 +152,103 @@ impl SnapshotLabel {
     }
 }
 
+/// What a snapshot's message says after its label: when it finished, and every file it left out for
+/// its size. A later run rebuilds a turn from its refs alone, and without these it would date a
+/// late baseline wrongly and show a file left out of one snapshot as added or deleted.
+fn snapshot_message(label: &SnapshotLabel, taken_ms: u64, skipped_large: &[PathBuf]) -> String {
+    let mut message = label.to_message();
+    message.push_str(&format!("taken: {taken_ms}\n"));
+    for path in skipped_large {
+        // Hex, because a file name may hold a line break or bytes that are not UTF-8.
+        message.push_str("skipped-large: ");
+        message.push_str(&hex_encode(path.as_os_str().as_bytes()));
+        message.push('\n');
+    }
+    message
+}
+
+/// The `taken` line of a snapshot's message, when it has one.
+fn parse_taken(message: &str) -> Option<u64> {
+    message
+        .lines()
+        .find_map(|line| line.strip_prefix("taken: "))
+        .and_then(|value| value.parse().ok())
+}
+
+/// The `skipped-large` lines of a snapshot's message. A line that does not decode is dropped.
+fn parse_skipped_large(message: &str) -> Vec<PathBuf> {
+    message
+        .lines()
+        .filter_map(|line| line.strip_prefix("skipped-large: "))
+        .filter_map(hex_decode)
+        .map(|bytes| PathBuf::from(OsString::from_vec(bytes)))
+        .collect()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 || text.is_empty() {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// What a turn's review must say about its own precision, kept beside its snapshots so a later run
+/// says it too. These are learnt while the turn runs, and some only after its end snapshot was
+/// asked for (the next turn starting on top of it, another tab's turn starting), so they are a ref
+/// of their own, `refs/eitri/<session>/<turn>/marks`, rewritten whole whenever one is learnt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnMarks {
+    /// A tool call ran before the base snapshot was done.
+    pub late: bool,
+    /// The next turn's tools started before the end snapshot was done.
+    pub overlapped_next: bool,
+    /// Another tab's turn on the same project ran at the same time.
+    pub overlapped_tab: bool,
+}
+
+impl TurnMarks {
+    pub fn any(&self) -> bool {
+        self.late || self.overlapped_next || self.overlapped_tab
+    }
+
+    fn to_message(self, turn: u32, turn_id: &str) -> String {
+        let turn_id: String = turn_id
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' || c == '\0' { ' ' } else { c })
+            .collect();
+        format!(
+            "kind: marks\nturn: {turn}\nturn-id: {turn_id}\nlate: {}\noverlapped-next: {}\noverlapped-tab: {}\n",
+            self.late, self.overlapped_next, self.overlapped_tab
+        )
+    }
+
+    /// Reads a message written by `to_message` back; `None` for any other message.
+    fn parse(message: &str) -> Option<TurnMarks> {
+        let mut fields = BTreeMap::new();
+        for line in message.lines() {
+            if let Some((key, value)) = line.split_once(": ") {
+                fields.insert(key, value);
+            }
+        }
+        if fields.get("kind") != Some(&"marks") {
+            return None;
+        }
+        let flag = |key: &str| fields.get(key) == Some(&"true");
+        Some(TurnMarks {
+            late: flag("late"),
+            overlapped_next: flag("overlapped-next"),
+            overlapped_tab: flag("overlapped-tab"),
+        })
+    }
+}
+
 /// One snapshot that was taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -172,19 +271,39 @@ pub struct SnapshotRef {
     pub commit: String,
     /// Its label, when the commit message is one.
     pub label: Option<SnapshotLabel>,
+    /// When the snapshot finished, when its message says.
+    pub taken_ms: Option<u64>,
+    /// The files the snapshot left out for their size, as its message lists them.
+    pub skipped_large: Vec<PathBuf>,
+    /// For a `marks` ref: what it says about its turn.
+    pub marks: Option<TurnMarks>,
 }
 
 impl SnapshotRef {
     /// `(session, turn, kind)` from the ref's name, when it has that shape.
     pub fn parts(&self) -> Option<(&str, u32, SnapshotKind)> {
+        let (session, turn, kind) = self.name_parts()?;
+        Some((session, turn, SnapshotKind::parse(kind)?))
+    }
+
+    /// `(session, turn)` of any ref under a turn, its `marks` included.
+    pub fn session_turn(&self) -> Option<(&str, u32)> {
+        let (session, turn, kind) = self.name_parts()?;
+        (SnapshotKind::parse(kind).is_some() || kind == MARKS).then_some((session, turn))
+    }
+
+    fn name_parts(&self) -> Option<(&str, u32, &str)> {
         let mut parts = self.name.strip_prefix("refs/eitri/")?.split('/');
         let (session, turn, kind) = (parts.next()?, parts.next()?, parts.next()?);
         if parts.next().is_some() {
             return None;
         }
-        Some((session, turn.parse().ok()?, SnapshotKind::parse(kind)?))
+        Some((session, turn.parse().ok()?, kind))
     }
 }
+
+/// The last component of a turn's marks ref.
+const MARKS: &str = "marks";
 
 /// What [`Shadow::snapshot`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,7 +616,7 @@ impl Shadow {
         };
         let mut commit = self.git(None);
         commit.args(["commit-tree", &tree, "-F", "-"]);
-        let message = label.to_message();
+        let message = snapshot_message(label, wall_clock_ms(), &skipped_large);
         let commit = self.run_ok("commit-tree", commit, Some(message.as_bytes()), deadline)?;
         let commit = String::from_utf8_lossy(git::trim_newline(&commit.stdout)).into_owned();
         let reference = format!("refs/eitri/{session}/{}/{}", label.turn, label.kind.as_str());
@@ -513,6 +632,32 @@ impl Shadow {
             reference,
             skipped_large,
         })
+    }
+
+    /// Records `marks` for turn `turn` of `session` (provider turn id `turn_id`), replacing what was
+    /// recorded before: a commit of the empty tree whose message holds them, under
+    /// `refs/eitri/<session>/<turn>/marks`. Retention removes it with the turn's snapshots.
+    pub fn write_marks(&self, session: &str, turn: u32, turn_id: &str, marks: TurnMarks) -> Result<(), ShadowError> {
+        let deadline = Instant::now() + READ_TIMEOUT;
+        validate_session(session)?;
+        let _lock = self.lock_shared_until(deadline)?;
+        let _session = self.lock_session_until(session, deadline)?;
+        let mut empty = self.git(None);
+        empty.arg("mktree");
+        let tree = self.run_ok("mktree", empty, Some(b""), deadline)?;
+        let tree = String::from_utf8_lossy(git::trim_newline(&tree.stdout)).into_owned();
+        let mut commit = self.git(None);
+        commit.args(["commit-tree", &tree, "-F", "-"]);
+        let message = marks.to_message(turn, turn_id);
+        let commit = self.run_ok("commit-tree", commit, Some(message.as_bytes()), deadline)?;
+        let commit = String::from_utf8_lossy(git::trim_newline(&commit.stdout)).into_owned();
+        let reference = format!("refs/eitri/{session}/{turn}/{MARKS}");
+        // Written only under the session's guard, like its snapshot refs, so a lock on it is stale.
+        remove_if_present(&lock_file_of(&self.git_dir.join(&reference)))?;
+        let mut update = self.git(None);
+        update.args(["update-ref", &reference, &commit]);
+        self.run_ok("update-ref", update, None, deadline)?;
+        Ok(())
     }
 
     /// The tree of the work tree as it is now, written to the store without a commit or a ref: what
@@ -699,10 +844,14 @@ impl Shadow {
             if name.is_empty() {
                 break;
             }
+            let message = String::from_utf8_lossy(message);
             refs.push(SnapshotRef {
                 name,
                 commit: String::from_utf8_lossy(commit).into_owned(),
-                label: SnapshotLabel::parse(&String::from_utf8_lossy(message)),
+                label: SnapshotLabel::parse(&message),
+                taken_ms: parse_taken(&message),
+                skipped_large: parse_skipped_large(&message),
+                marks: TurnMarks::parse(&message),
             });
         }
         Ok(refs)
@@ -835,6 +984,13 @@ fn validate_session(session: &str) -> Result<(), ShadowError> {
     }
 }
 
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub(super) fn is_hex_id(id: &str) -> bool {
     (4..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -958,6 +1114,57 @@ mod tests {
                 ..label
             }
         );
+    }
+
+    #[test]
+    fn a_snapshots_message_keeps_its_time_and_its_left_out_files() {
+        let label = SnapshotLabel {
+            turn: 2,
+            kind: SnapshotKind::Base,
+            turn_id: "t2".into(),
+            tab: 1,
+            time_ms: 5,
+        };
+        let odd = PathBuf::from(OsString::from_vec(b"big\nname\xff.bin".to_vec()));
+        let skipped = vec![PathBuf::from("assets/huge.bin"), odd];
+        let message = snapshot_message(&label, 1_790_000_000_123, &skipped);
+        assert_eq!(
+            SnapshotLabel::parse(&message),
+            Some(label),
+            "the label still reads back"
+        );
+        assert_eq!(parse_taken(&message), Some(1_790_000_000_123));
+        assert_eq!(parse_skipped_large(&message), skipped);
+        assert_eq!(TurnMarks::parse(&message), None);
+        // A message from before these lines existed reads as nothing taken, nothing left out.
+        let old = SnapshotLabel::parse(&message).unwrap().to_message();
+        assert_eq!(parse_taken(&old), None);
+        assert!(parse_skipped_large(&old).is_empty());
+    }
+
+    #[test]
+    fn marks_round_trip_and_are_no_snapshot_label() {
+        let marks = TurnMarks {
+            late: true,
+            overlapped_next: false,
+            overlapped_tab: true,
+        };
+        let message = marks.to_message(4, "t\n4");
+        assert_eq!(TurnMarks::parse(&message), Some(marks));
+        assert_eq!(SnapshotLabel::parse(&message), None);
+        let reference = |name: &str| SnapshotRef {
+            name: name.into(),
+            commit: String::new(),
+            label: None,
+            taken_ms: None,
+            skipped_large: Vec::new(),
+            marks: None,
+        };
+        let marks_ref = reference("refs/eitri/s1/4/marks");
+        assert_eq!(marks_ref.parts(), None);
+        assert_eq!(marks_ref.session_turn(), Some(("s1", 4)));
+        assert_eq!(reference("refs/eitri/s1/4/end").session_turn(), Some(("s1", 4)));
+        assert_eq!(reference("refs/eitri/s1/4/other").session_turn(), None);
     }
 
     #[test]

@@ -27,7 +27,9 @@ use agent::AgentDomainEvent;
 
 use super::attribution::{origin, NamedPaths, Origin};
 use super::diff::{changed_files, file_hunks, Hunk, Side};
-use super::shadow::{review_dir_for, Limits, Shadow, SnapshotKind, SnapshotLabel, SnapshotOutcome, SnapshotRef};
+use super::shadow::{
+    review_dir_for, Limits, Shadow, SnapshotKind, SnapshotLabel, SnapshotOutcome, SnapshotRef, TurnMarks,
+};
 
 /// A file patch longer than this many lines (context included) is refused, with its counts, rather
 /// than shown cut short.
@@ -47,6 +49,8 @@ pub const NOTE_UNFINISHED: &str = "this turn did not finish while Eitri was runn
 pub const NOTE_RUNNING: &str = "this turn is still running: compared with the files on disk now";
 /// A turn whose base snapshot has not finished yet.
 pub const NOTE_BASE_PENDING: &str = "the baseline snapshot is still being taken";
+/// A turn that ended and whose end snapshot has not finished yet.
+pub const NOTE_END_PENDING: &str = "the end snapshot is still being taken: compared with the files on disk now";
 
 /// One snapshot of a turn, as far as this side knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +149,15 @@ impl TurnRecord {
             (Snap::Taken { .. }, Snap::Unavailable(reason)) => TurnState::Unfinished(reason.clone()),
         }
     }
+
+    /// The marks kept beside the turn's snapshots for a later run.
+    fn kept_marks(&self) -> TurnMarks {
+        TurnMarks {
+            late: self.late,
+            overlapped_next: self.overlapped_next,
+            overlapped_tab: self.overlapped_tab,
+        }
+    }
 }
 
 /// What the status band shows after a turn: how many files differ between its two snapshots.
@@ -203,6 +216,10 @@ pub struct Overview {
     /// Every turn of the session this run knows and the shadow keeps, in order.
     pub turns: Vec<TurnRecord>,
     pub files: Vec<OverviewFile>,
+    /// Whether two snapshots (or a snapshot and the disk) were compared at all. `false` when the
+    /// turn has no baseline or its baseline is still being taken: `files` is then empty because
+    /// nothing was compared, not because nothing changed.
+    pub compared: bool,
     /// Edit calls with no result yet.
     pub pending_no_result: usize,
     /// What the review must say about itself, in order.
@@ -356,6 +373,16 @@ struct Job {
     time_ms: u64,
 }
 
+/// What a worker is handed: a snapshot to take, or a turn's marks to record.
+enum Task {
+    Snapshot(Job),
+    Marks {
+        position: u32,
+        turn_id: String,
+        marks: TurnMarks,
+    },
+}
+
 /// What a worker reports back.
 enum Done {
     /// The number the session's turns of earlier runs reached, read before the first snapshot
@@ -370,6 +397,8 @@ enum Done {
         /// For an end whose turn has both snapshots: how many files differ between them.
         files: Option<usize>,
     },
+    /// A marks task is done, written or not.
+    Marked,
 }
 
 /// One turn as this side tracks it.
@@ -381,11 +410,13 @@ struct Rec {
     ended: bool,
     /// The pump the end was observed in, valid once `ended`.
     ended_pump: u64,
+    /// The marks last handed to the worker for this turn.
+    marks_sent: TurnMarks,
 }
 
 /// One provider session: its worker and its turns.
 struct SessionTrack {
-    jobs: mpsc::Sender<Job>,
+    jobs: mpsc::Sender<Task>,
     /// Added to a turn's position to give its number; `None` until the worker has read it.
     offset: Option<u32>,
     numbering_failed: bool,
@@ -528,8 +559,10 @@ impl TurnReview {
             {
                 self.session_ended(tab, now_ms)
             }
-            _ => {}
+            // Nothing that starts, ends or marks a turn.
+            _ => return,
         }
+        self.flush_marks();
     }
 
     /// The tab has no live session (never started, failed, starting again): a turn it was running
@@ -537,6 +570,7 @@ impl TurnReview {
     /// its own id.
     pub fn tab_has_no_session(&mut self, tab: u64, now_ms: u64) {
         self.release(tab, now_ms, false);
+        self.flush_marks();
     }
 
     /// The tab's events were dropped and its state rebuilt from the projection, whose running turn
@@ -567,6 +601,7 @@ impl TurnReview {
             }
             (None, None) => {}
         }
+        self.flush_marks();
     }
 
     /// The tab is gone: a turn it was running is over, and its session's worker ends once its
@@ -574,6 +609,7 @@ impl TurnReview {
     pub fn close_tab(&mut self, tab: u64, now_ms: u64) {
         self.release(tab, now_ms, false);
         self.tabs.remove(&tab);
+        self.flush_marks();
     }
 
     /// Takes in what the workers finished, without waiting, and returns a hint for every turn whose
@@ -591,6 +627,7 @@ impl TurnReview {
                     track.numbering_failed = false;
                 }
                 Done::Numbering(Err(_)) => track.numbering_failed = true,
+                Done::Marked => track.outstanding = track.outstanding.saturating_sub(1),
                 Done::Snapshot {
                     kind,
                     position,
@@ -814,6 +851,7 @@ impl TurnReview {
             },
             ended: false,
             ended_pump: 0,
+            marks_sent: TurnMarks::default(),
         };
         match track.live_session().map(str::to_owned) {
             None => {
@@ -1043,26 +1081,58 @@ impl TurnReview {
         );
     }
 
-    /// Hands a job to the session's worker. The channel is unbounded, so this never waits; a
-    /// worker that is gone answers the job as unavailable at once.
+    /// Hands a snapshot job to the session's worker.
     fn send(&mut self, session: &str, job: Job) {
+        self.send_task(session, Task::Snapshot(job));
+    }
+
+    /// Hands a task to the session's worker. The channel is unbounded, so this never waits; a
+    /// worker that is gone answers a snapshot as unavailable at once.
+    fn send_task(&mut self, session: &str, task: Task) {
         let Some(s) = self.sessions.get_mut(session) else {
             return;
         };
         s.outstanding += 1;
-        let (kind, position) = (job.kind, job.position);
-        if s.jobs.send(job).is_err() {
-            let _ = self.done_tx.send((
-                session.to_owned(),
-                Done::Snapshot {
-                    kind,
-                    position,
+        if let Err(mpsc::SendError(task)) = s.jobs.send(task) {
+            let done = match task {
+                Task::Snapshot(job) => Done::Snapshot {
+                    kind: job.kind,
+                    position: job.position,
                     snap: Snap::Unavailable("the snapshot worker is not running".into()),
                     skipped_large: Vec::new(),
                     at_ms: wall_clock_ms(),
                     files: None,
                 },
-            ));
+                Task::Marks { .. } => Done::Marked,
+            };
+            let _ = self.done_tx.send((session.to_owned(), done));
+        }
+    }
+
+    /// Hands the worker the marks of every turn whose marks changed since they were last handed
+    /// over, so that a later run, which knows the turn only from the shadow, says what this one
+    /// says. Some are learnt after the turn's end snapshot was asked for, so they cannot simply
+    /// travel with a snapshot.
+    fn flush_marks(&mut self) {
+        let mut tasks = Vec::new();
+        for (session, track) in &mut self.sessions {
+            for rec in &mut track.records {
+                let marks = rec.record.kept_marks();
+                if marks != rec.marks_sent {
+                    rec.marks_sent = marks;
+                    tasks.push((
+                        session.clone(),
+                        Task::Marks {
+                            position: rec.position,
+                            turn_id: rec.record.turn_id.clone(),
+                            marks,
+                        },
+                    ));
+                }
+            }
+        }
+        for (session, task) in tasks {
+            self.send_task(&session, task);
         }
     }
 }
@@ -1090,23 +1160,36 @@ struct Worker {
 }
 
 impl Worker {
-    fn run(self, jobs: mpsc::Receiver<Job>) {
+    fn run(self, tasks: mpsc::Receiver<Task>) {
         let mut shadow: Option<Shadow> = None;
         let mut offset: Option<u32> = None;
         let mut bases: BTreeMap<u32, String> = BTreeMap::new();
-        for job in jobs {
-            let (kind, position) = (job.kind, job.position);
-            self.hook(JobEvent::Starting {
-                session: self.session.clone(),
-                kind,
-                position,
-            });
-            let done = self.take(&job, &mut shadow, &mut offset, &mut bases);
-            self.hook(JobEvent::Finished {
-                session: self.session.clone(),
-                kind,
-                position,
-            });
+        for task in tasks {
+            let done = match task {
+                Task::Snapshot(job) => {
+                    let (kind, position) = (job.kind, job.position);
+                    self.hook(JobEvent::Starting {
+                        session: self.session.clone(),
+                        kind,
+                        position,
+                    });
+                    let done = self.take(&job, &mut shadow, &mut offset, &mut bases);
+                    self.hook(JobEvent::Finished {
+                        session: self.session.clone(),
+                        kind,
+                        position,
+                    });
+                    done
+                }
+                Task::Marks {
+                    position,
+                    turn_id,
+                    marks,
+                } => {
+                    self.mark(position, &turn_id, marks, &mut shadow, &mut offset);
+                    Done::Marked
+                }
+            };
             let _ = self.done.send((self.session.clone(), done));
         }
     }
@@ -1132,43 +1215,10 @@ impl Worker {
             at_ms: wall_clock_ms(),
             files: None,
         };
-        if shadow.is_none() {
-            match self.spec.open() {
-                Ok(opened) => *shadow = Some(opened),
-                Err(reason) => {
-                    let _ = self
-                        .done
-                        .send((self.session.clone(), Done::Numbering(Err(reason.clone()))));
-                    return unavailable(reason);
-                }
-            }
-        }
-        let shadow = shadow.as_ref().expect("opened above");
-        // The numbers earlier runs of this session reached, read before this worker writes any
-        // ref: numbering from 1 again would overwrite their snapshots.
-        if offset.is_none() {
-            match shadow.snapshot_ref_ids() {
-                Ok(refs) => {
-                    let reached = refs
-                        .iter()
-                        .filter_map(|r| r.parts())
-                        .filter(|(session, _, _)| *session == self.session)
-                        .map(|(_, n, _)| n)
-                        .max()
-                        .unwrap_or(0);
-                    *offset = Some(reached);
-                    let _ = self.done.send((self.session.clone(), Done::Numbering(Ok(reached))));
-                }
-                Err(e) => {
-                    let reason = format!("earlier snapshots could not be read: {e}");
-                    let _ = self
-                        .done
-                        .send((self.session.clone(), Done::Numbering(Err(reason.clone()))));
-                    return unavailable(reason);
-                }
-            }
-        }
-        let offset = offset.expect("read above");
+        let (shadow, offset) = match self.ready(shadow, offset) {
+            Ok(ready) => ready,
+            Err(reason) => return unavailable(reason),
+        };
         let turn = match job.kind {
             SnapshotKind::Warm => 0,
             _ => offset + job.position,
@@ -1217,6 +1267,68 @@ impl Worker {
         }
     }
 
+    /// The opened store and the number this run's turns of the session count on from, opening and
+    /// reading them the first time. A failure is reported as the session's numbering failing.
+    fn ready<'a>(&self, shadow: &'a mut Option<Shadow>, offset: &mut Option<u32>) -> Result<(&'a Shadow, u32), String> {
+        if shadow.is_none() {
+            match self.spec.open() {
+                Ok(opened) => *shadow = Some(opened),
+                Err(reason) => {
+                    let _ = self
+                        .done
+                        .send((self.session.clone(), Done::Numbering(Err(reason.clone()))));
+                    return Err(reason);
+                }
+            }
+        }
+        let shadow = shadow.as_ref().expect("opened above");
+        // The numbers earlier runs of this session reached, read before this worker writes any
+        // ref: numbering from 1 again would overwrite their snapshots. A turn known only by its
+        // marks counts too.
+        if offset.is_none() {
+            match shadow.snapshot_ref_ids() {
+                Ok(refs) => {
+                    let reached = refs
+                        .iter()
+                        .filter_map(|r| r.session_turn())
+                        .filter(|(session, _)| *session == self.session)
+                        .map(|(_, n)| n)
+                        .max()
+                        .unwrap_or(0);
+                    *offset = Some(reached);
+                    let _ = self.done.send((self.session.clone(), Done::Numbering(Ok(reached))));
+                }
+                Err(e) => {
+                    let reason = format!("earlier snapshots could not be read: {e}");
+                    let _ = self
+                        .done
+                        .send((self.session.clone(), Done::Numbering(Err(reason.clone()))));
+                    return Err(reason);
+                }
+            }
+        }
+        Ok((shadow, offset.expect("read above")))
+    }
+
+    /// Records a turn's marks in the store. Losing them costs only what a later run can say about
+    /// the turn, so a failure is logged, not reported.
+    fn mark(
+        &self,
+        position: u32,
+        turn_id: &str,
+        marks: TurnMarks,
+        shadow: &mut Option<Shadow>,
+        offset: &mut Option<u32>,
+    ) {
+        let Ok((shadow, offset)) = self.ready(shadow, offset) else {
+            return;
+        };
+        let turn = offset + position;
+        if let Err(e) = shadow.write_marks(&self.session, turn, turn_id, marks) {
+            eprintln!("[turn-review] what turn {turn} must say about itself could not be kept: {e}");
+        }
+    }
+
     /// Runs retention when no worker of this project has in the last period. Here, on the
     /// worker, so the session's next base waits for it rather than racing it for the lock.
     fn retain(&self, shadow: &Shadow) {
@@ -1257,22 +1369,15 @@ impl OverviewJob {
     pub fn run(self) -> Result<Overview, ReviewError> {
         let shadow = self.spec.open().map_err(ReviewError::Unavailable)?;
         let turns = merged_turns(&shadow, &self.session, self.records)?;
-        let plan = plan(&turns, self.turn, self.scope)?;
+        // Made relative here, on the worker: it reads the file system.
         let named = self.named.relative_to(shadow.work_tree());
-        let mut overview = Overview {
-            session: self.session,
-            scope: self.scope,
-            current: plan.current,
-            turns,
-            files: Vec::new(),
-            pending_no_result: named.pending_no_result,
-            notes: plan.notes,
-        };
+        let (mut overview, plan) = head(self.session, turns, self.turn, self.scope, named.pending_no_result)?;
         let (from, to) = match plan.compare {
             Compare::Between { from, to } => (from, to),
             // Nothing is shown as the turn's change; the notes say why.
             Compare::NoBaseline(_) | Compare::NotReady => return Ok(overview),
         };
+        overview.compared = true;
         let changes = changed_files(&shadow, &from, &to).map_err(|e| ReviewError::Unavailable(e.to_string()))?;
         let mut rows: BTreeMap<PathBuf, OverviewFile> = BTreeMap::new();
         for change in changes {
@@ -1426,15 +1531,54 @@ struct Plan {
     too_large: BTreeSet<PathBuf>,
 }
 
+/// The review's head: the turns, the one shown and what the review must say about itself, with
+/// nothing compared yet (`files` empty, `compared` false).
+fn head(
+    session: String,
+    turns: Vec<TurnRecord>,
+    turn: TurnRef,
+    scope: Scope,
+    pending_no_result: usize,
+) -> Result<(Overview, Plan), ReviewError> {
+    let mut plan = plan(&turns, turn, scope)?;
+    let overview = Overview {
+        session,
+        scope,
+        current: plan.current,
+        turns,
+        files: Vec::new(),
+        compared: false,
+        pending_no_result,
+        notes: std::mem::take(&mut plan.notes),
+    };
+    Ok((overview, plan))
+}
+
+/// What the shadow keeps of one turn.
+#[derive(Default)]
+struct Kept {
+    base: Option<SnapshotRef>,
+    end: Option<SnapshotRef>,
+    marks: Option<TurnMarks>,
+}
+
 /// The turns of `session`: this run's records, and the turns the shadow keeps that this run did
-/// not see (earlier runs, or another window). A record whose snapshots retention has since removed
-/// is left out.
+/// not see (earlier runs, or another window), with the marks and left-out files they were kept
+/// with. A record whose snapshots retention has since removed is left out.
 fn merged_turns(shadow: &Shadow, session: &str, records: Vec<TurnRecord>) -> Result<Vec<TurnRecord>, ReviewError> {
     let refs = shadow
         .snapshot_ref_ids()
         .map_err(|e| ReviewError::Unavailable(format!("earlier snapshots could not be read: {e}")))?;
-    let mut kept: BTreeMap<u32, (Option<SnapshotRef>, Option<SnapshotRef>)> = BTreeMap::new();
+    let mut kept: BTreeMap<u32, Kept> = BTreeMap::new();
     for r in refs {
+        if let Some(marks) = r.marks {
+            if let Some((s, n)) = r.session_turn() {
+                if s == session && n != 0 {
+                    kept.entry(n).or_default().marks = Some(marks);
+                }
+            }
+            continue;
+        }
         let Some((s, n, kind)) = r.parts() else {
             continue;
         };
@@ -1443,21 +1587,30 @@ fn merged_turns(shadow: &Shadow, session: &str, records: Vec<TurnRecord>) -> Res
         }
         let entry = kept.entry(n).or_default();
         match kind {
-            SnapshotKind::Base => entry.0 = Some(r),
-            SnapshotKind::End => entry.1 = Some(r),
+            SnapshotKind::Base => entry.base = Some(r),
+            SnapshotKind::End => entry.end = Some(r),
             SnapshotKind::Warm => {}
         }
     }
+    let has_snapshot = |n: &u32| kept.get(n).is_some_and(|k| k.base.is_some() || k.end.is_some());
     let mut turns: BTreeMap<u32, TurnRecord> = BTreeMap::new();
     for record in records {
-        let trimmed = record.base.commit().is_some() && !kept.contains_key(&record.n);
+        let trimmed = record.base.commit().is_some() && !has_snapshot(&record.n);
         if !trimmed {
             turns.insert(record.n, record);
         }
     }
-    for (n, (base, end)) in kept {
-        if turns.contains_key(&n) {
+    for (n, Kept { base, end, marks }) in kept {
+        // A turn kept only by its marks has nothing to compare and no times to show.
+        if turns.contains_key(&n) || (base.is_none() && end.is_none()) {
             continue;
+        }
+        let marks = marks.unwrap_or_default();
+        let mut skipped_large: Vec<PathBuf> = Vec::new();
+        for path in base.iter().chain(end.iter()).flat_map(|r| r.skipped_large.iter()) {
+            if !skipped_large.contains(path) {
+                skipped_large.push(path.clone());
+            }
         }
         let label = base
             .as_ref()
@@ -1479,17 +1632,17 @@ fn merged_turns(shadow: &Shadow, session: &str, records: Vec<TurnRecord>) -> Res
                     },
                     None => Snap::Unavailable("no baseline snapshot was kept".into()),
                 },
-                base_taken_ms: None,
+                base_taken_ms: base.as_ref().and_then(|r| r.taken_ms),
                 end: match &end {
                     Some(r) => Snap::Taken {
                         commit: r.commit.clone(),
                     },
                     None => Snap::Unavailable(NOTE_UNFINISHED.into()),
                 },
-                late: false,
-                overlapped_next: false,
-                overlapped_tab: false,
-                skipped_large: Vec::new(),
+                late: marks.late,
+                overlapped_next: marks.overlapped_next,
+                overlapped_tab: marks.overlapped_tab,
+                skipped_large,
                 earlier_run: true,
             },
         );
@@ -1588,7 +1741,14 @@ fn marks(turn: &TurnRecord) -> Vec<String> {
         TurnState::Unfinished(reason) => notes.push(format!(
             "no end snapshot ({reason}): compared with the files on disk now"
         )),
-        TurnState::Pending if turn.base.commit().is_some() => notes.push(NOTE_RUNNING.into()),
+        TurnState::Pending if turn.base.commit().is_some() => notes.push(
+            if turn.ended_ms.is_some() {
+                NOTE_END_PENDING
+            } else {
+                NOTE_RUNNING
+            }
+            .into(),
+        ),
         _ => {}
     }
     notes
@@ -1695,6 +1855,107 @@ mod tests {
 
         let none = plan_of(&[first]);
         assert!(matches!(none.compare, Compare::NoBaseline(_)));
+    }
+
+    #[test]
+    fn an_ended_turn_whose_end_is_still_being_taken_does_not_say_it_is_running() {
+        let mut running = record(taken("a"), Snap::Pending);
+        assert_eq!(marks(&running), vec![NOTE_RUNNING.to_string()]);
+        running.ended_ms = Some(5);
+        assert_eq!(marks(&running), vec![NOTE_END_PENDING.to_string()]);
+    }
+
+    /// The panel draws a review's `notes` as they are and nothing from the turn flags, so what the
+    /// header says is exactly what these notes say. The envelopes are written to a fixture the web
+    /// tests render (`agent-ui/web/src/fixtures/review-notes.json`); this compares it on every run,
+    /// and `EITRI_WRITE_FIXTURES=1` rewrites it. The local clock time in a late-baseline note is
+    /// replaced by `HH:MM:SS`, so the file does not depend on the time zone it was written in.
+    #[test]
+    fn the_review_notes_fixture_is_what_the_serializer_sends() {
+        const AT: u64 = 1_790_000_000_000;
+        let turn = |n: u32, base: Snap, end: Snap| TurnRecord {
+            n,
+            turn_id: format!("t{n}"),
+            started_ms: AT + u64::from(n) * 60_000,
+            ended_ms: end.commit().map(|_| AT + u64::from(n) * 60_000 + 20_000),
+            base_taken_ms: base.commit().map(|_| AT + u64::from(n) * 60_000 + 300),
+            ..record(base, end)
+        };
+        let gone = |why: &str| Snap::Unavailable(why.into());
+        let mut flagged = turn(3, taken("b3"), taken("e3"));
+        flagged.late = true;
+        flagged.overlapped_next = true;
+        flagged.overlapped_tab = true;
+        let no_baseline = turn(4, gone("the snapshot took too long"), taken("e4"));
+        let mut end_failed = turn(
+            5,
+            taken("b5"),
+            gone("too many files to snapshot (20001, the limit is 20000)"),
+        );
+        end_failed.ended_ms = Some(AT + 5 * 60_000 + 20_000);
+        let mut earlier = turn(6, taken("b6"), gone(NOTE_UNFINISHED));
+        earlier.earlier_run = true;
+        let base_pending = turn(7, Snap::Pending, Snap::Pending);
+        let running = turn(8, taken("b8"), Snap::Pending);
+        let ok = turn(9, taken("b9"), taken("e9"));
+
+        let cases: Vec<(&str, Vec<TurnRecord>, TurnRef, Scope)> = vec![
+            ("flagged", vec![ok.clone(), flagged.clone()], TurnRef::N(3), Scope::Turn),
+            ("noBaseline", vec![no_baseline.clone()], TurnRef::Latest, Scope::Turn),
+            ("endFailed", vec![end_failed.clone()], TurnRef::Latest, Scope::Turn),
+            ("earlierRun", vec![earlier], TurnRef::Latest, Scope::Turn),
+            (
+                "basePending",
+                vec![ok.clone(), base_pending.clone()],
+                TurnRef::Latest,
+                Scope::Turn,
+            ),
+            ("running", vec![running.clone()], TurnRef::Latest, Scope::Turn),
+            ("ok", vec![ok.clone()], TurnRef::Latest, Scope::Turn),
+            (
+                "sessionNoBaseline",
+                vec![no_baseline, base_pending],
+                TurnRef::Latest,
+                Scope::Session,
+            ),
+            (
+                "session",
+                vec![flagged.clone(), end_failed, running],
+                TurnRef::Latest,
+                Scope::Session,
+            ),
+        ];
+        let late_at = clock_time(flagged.base_taken_ms.unwrap());
+        let mut envelopes = serde_json::Map::new();
+        for (name, turns, at, scope) in cases {
+            let (mut overview, plan) = head("sess".into(), turns, at, scope, 0).unwrap();
+            // What `OverviewJob::run` does once it has compared something.
+            overview.compared = matches!(plan.compare, Compare::Between { .. });
+            let json = crate::agent_bridge::serialize_review_for_js(name, crate::tabs::TabId(3), &overview)
+                .replace(&late_at, "HH:MM:SS");
+            envelopes.insert(name.into(), serde_json::from_str(&json).unwrap());
+        }
+        let fixture = serde_json::json!({
+            "writtenBy": "core/src/turn_review/lifecycle.rs, tests::the_review_notes_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "envelopes": envelopes,
+        });
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/review-notes.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the review notes fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed review notes fixture is not what this test produces; if the change is \
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
     }
 
     #[test]

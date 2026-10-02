@@ -68,6 +68,23 @@ one-window mode.
   whether a window lies that way, so at the edge the key does nothing, as tmux's own `select-pane` does at its edge.
 - **GNOME and KDE: no focus moves.** A Wayland client cannot take focus there; use the desktop's own window keys.
 
+## Turn review
+
+After an agent turn, `c` in the panel's BROWSE mode lists the files that changed on disk during the turn and their hunks. It is read-only in this
+release: there is no revert and no comments, and no overlay inside nvim.
+
+- **It keeps a copy of your project's files.** To tell what a turn changed, Eitri takes a snapshot before and after each turn into its own
+  repository under `~/.local/state/eitri/review/` (directories 0700, files 0600). It copies every file your ignore rules do not exclude, up to 8 MiB
+  per file and 20,000 files, so a project with large generated files outside `.gitignore` grows that store. Delete the directory to drop everything;
+  the next turn starts afresh. It keeps the newest 100 turns per project for 30 days. Nothing is written into your project, and your own `.git` is
+  never written: Eitri only asks git where your repository's git directory is and reads its `info/exclude`, so that what you exclude there is not
+  copied either.
+- **"Changed on disk during this turn" is not "the agent changed".** A change you made by hand, or one made by `Bash` or another tab, shows as `?`
+  next to the agent's own edits (`✓`); a turn that overlaps another one is labelled.
+- **Limits:** a file over 8 MiB is listed as too large with no patch; a patch over 2,000 lines shows only its counts; a file name that is not valid
+  UTF-8 is listed but its patch cannot be opened; a project inside a larger repository (opened below the repository's top level) honours neither
+  the parent's `.gitignore` files above its own root nor the repository's `info/exclude`, so files excluded only there are copied into the store.
+
 ## Stability
 
 0.2.0 was the first public release. The `init.lua` API and the default keys may change during 0.x; the goal for

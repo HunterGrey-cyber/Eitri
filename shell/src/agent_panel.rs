@@ -3792,11 +3792,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         // on a worker; the answer is an envelope carrying the request id, sent by the tick.
         InboundMessage::ReviewRequest { turn, scope, .. } => {
             let tab = tab_of(target);
-            let project_dir = state.borrow().project_dir.clone();
-            let job = state
-                .borrow()
-                .tabs
-                .review_overview_job(tab, turn.into(), scope.into(), &project_dir);
+            let job = state.borrow().tabs.review_overview_job(tab, turn.into(), scope.into());
             let started = job.and_then(|job| {
                 let id = request_id.clone();
                 start_review_job(state, &request_id, move || {

@@ -656,15 +656,15 @@ impl TabSet {
     }
 
     /// A review of `tab`'s session at `turn` in `scope`, ready to run on a worker. It attributes
-    /// with the edit calls of `tab`'s own projection (relative to `project_root`), for the turns the
-    /// scope covers; a turn this run has not seen has no calls here, so its files come out
-    /// unattributed rather than credited to the agent. Builds the job without git or waiting.
+    /// with the edit calls of `tab`'s own projection, for the turns the scope covers; a turn this
+    /// run has not seen has no calls here, so its files come out unattributed rather than credited
+    /// to the agent. Builds the job without git, waiting or touching the file system: the named
+    /// paths are made relative to the project by the job, on its worker.
     pub fn review_overview_job(
         &self,
         tab: TabId,
         turn: crate::turn_review::TurnRef,
         scope: crate::turn_review::Scope,
-        project_root: &Path,
     ) -> Result<crate::turn_review::OverviewJob, String> {
         use crate::turn_review::{Scope, TurnRef};
         let (review, session) = self.review_target(tab)?;
@@ -685,8 +685,7 @@ impl TabSet {
                 crate::turn_review::named_paths(&projection.tool_calls, &turn_ids)
             }
             None => crate::turn_review::NamedPaths::default(),
-        }
-        .relative_to(project_root);
+        };
         Ok(review.overview_job(&session, turn, scope, named))
     }
 
@@ -8049,7 +8048,7 @@ mod tests {
         let tab = set.active();
         let refused = |set: &TabSet, tab: TabId| {
             (
-                set.review_overview_job(tab, TurnRef::Latest, Scope::Turn, &dir).err(),
+                set.review_overview_job(tab, TurnRef::Latest, Scope::Turn).err(),
                 set.review_diff_job(tab, 1, Scope::Turn, "main.rs").err(),
             )
         };
@@ -8133,7 +8132,7 @@ mod tests {
                 .is_some_and(|r| matches!(r.end, crate::turn_review::Snap::Taken { .. }))
         });
         let overview = set
-            .review_overview_job(tab, TurnRef::Latest, Scope::Turn, &dir)
+            .review_overview_job(tab, TurnRef::Latest, Scope::Turn)
             .unwrap()
             .run()
             .unwrap();
