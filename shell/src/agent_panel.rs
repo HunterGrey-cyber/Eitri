@@ -2244,7 +2244,7 @@ fn detail_rows(
         ("claude session", known(provider_session_id)),
         ("CLI", known(cli)),
         // The settings sources apply to every session on either backend, including an empty tab.
-        ("settings", agent::SETTING_SOURCES_NOTE.to_string()),
+        ("settings", agent::setting_sources::note().to_string()),
         ("Verdandi revision", known(revision)),
         ("resumable", resumable.to_string()),
         ("created", known(record.as_ref().map(|r| r.created_at.clone()))),
@@ -5249,11 +5249,10 @@ mod tests {
         let account = rows.iter().find(|r| r.label == "account").unwrap();
         assert_eq!(account.value, "work");
 
-        // Check the settings sources each session loads and excludes. Use the shared constant
-        // `build_create_request` and the legacy spawn use, rather than a copy, and place the row
-        // immediately after the CLI it describes.
+        // What every session loads. The value is the sentence `build_create_request` and the legacy
+        // spawn are held to, not a copy of it, and the row sits right after the CLI it describes.
         let settings = rows.iter().find(|r| r.label == "settings").unwrap();
-        assert_eq!(settings.value, agent::SETTING_SOURCES_NOTE);
+        assert_eq!(settings.value, agent::setting_sources::note());
         let position = |label: &str| labels.iter().position(|l| *l == label).unwrap();
         assert_eq!(position("settings"), position("CLI") + 1, "{labels:?}");
     }
@@ -5269,7 +5268,7 @@ mod tests {
                 .iter()
                 .find(|r| r.label == "settings")
                 .expect("the row is always drawn");
-            assert_eq!(settings.value, agent::SETTING_SOURCES_NOTE, "{}", kind.as_str());
+            assert_eq!(settings.value, agent::setting_sources::note(), "{}", kind.as_str());
         }
     }
 

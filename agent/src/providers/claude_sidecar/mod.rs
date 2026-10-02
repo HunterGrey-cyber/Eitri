@@ -602,6 +602,39 @@ fn build_create_request(
     fork: bool,
     provider_prompts: bool,
 ) -> ProtoCreateSessionRequest {
+    build_create_request_loading(
+        cwd,
+        streaming,
+        resume_provider_session_id,
+        fork,
+        provider_prompts,
+        crate::setting_sources::loads_user_settings(),
+    )
+}
+
+/// The settings tiers a session asks for, in the proto enum's order. The user tier is the user's
+/// own `~/.claude` (hooks, plugins, skills, `CLAUDE.md`, permission rules); it is left out only
+/// when `agent.user_settings` is false.
+fn setting_sources_for(user_settings: bool) -> Vec<i32> {
+    let mut sources = Vec::with_capacity(3);
+    if user_settings {
+        sources.push(SettingSource::User as i32);
+    }
+    sources.push(SettingSource::Project as i32);
+    sources.push(SettingSource::Local as i32);
+    sources
+}
+
+/// [`build_create_request`] with the user tier named instead of read from the process-wide choice,
+/// so both selections can be built and compared in one process.
+fn build_create_request_loading(
+    cwd: String,
+    streaming: StreamingPreference,
+    resume_provider_session_id: Option<String>,
+    fork: bool,
+    provider_prompts: bool,
+    user_settings: bool,
+) -> ProtoCreateSessionRequest {
     let denied = crate::process::disallowed_tools();
     ProtoCreateSessionRequest {
         cwd,
@@ -625,10 +658,11 @@ fn build_create_request(
             // `Native` uses the selected tiers to choose what loads. `Isolated` has no
             // UI, config or Lua selector.
             setting_sources: Some(SettingSourceSelection {
-                // Not `user`: a spawned session must not inherit user-level
-                // configuration. Confirmed by a real reproduction on the legacy path before it was
-                // written down as a constraint.
-                sources: vec![SettingSource::Project as i32, SettingSource::Local as i32],
+                // The user tier by default, so a session behaves as `claude` does in a terminal:
+                // the user's own hooks, plugins, skills, `CLAUDE.md` and permission rules apply.
+                // `agent.user_settings = false` leaves it out. The permission gate does not depend
+                // on which is chosen: it comes from this request's `INTERACTIVE` policy.
+                sources: setting_sources_for(user_settings),
             }),
             // Bound once: `deny` and `unrestricted` are two statements about the same list, and the
             // sidecar refuses the pair if they disagree.
@@ -904,34 +938,75 @@ mod tests {
         }
     }
 
-    /// The `prefix i` settings row (`SETTING_SOURCES_NOTE`) must match what every session loads.
-    /// Fresh, resumed and forked sessions all request `[PROJECT, LOCAL]`, never `USER`, excluding
-    /// `~/.claude` settings, hooks, plugins and `CLAUDE.md`. If the request changes, update the note
-    /// so the panel continues to describe the loaded settings accurately.
+    /// `prefix i`'s `settings` row (`setting_sources::note`) says what every session loads, so the
+    /// request has to ask for exactly that. By default the sidecar is sent `[USER, PROJECT, LOCAL]`,
+    /// in the proto enum's order, on a fresh, a resumed and a forked session alike; with
+    /// `agent.user_settings = false` it is `[PROJECT, LOCAL]` and the note says the user's
+    /// `~/.claude` is not loaded. The selection is stated on every request, never left to the CLI's
+    /// own default. If either has to change, the note changes with it: it is what the panel tells
+    /// the user.
     #[test]
-    fn every_request_loads_project_and_local_settings_only_and_the_note_says_so() {
-        for (shape, resume, fork) in [
-            ("fresh", None, false),
-            ("resume", Some("claude-id".to_string()), false),
-            ("fork", Some("claude-id".to_string()), true),
+    fn every_request_loads_the_tiers_the_note_says() {
+        for (user_settings, expected, note_says) in [
+            (
+                true,
+                vec![
+                    SettingSource::User as i32,
+                    SettingSource::Project as i32,
+                    SettingSource::Local as i32,
+                ],
+                "user + project + local",
+            ),
+            (
+                false,
+                vec![SettingSource::Project as i32, SettingSource::Local as i32],
+                "project + local only",
+            ),
         ] {
-            let policy = build_create_request("/p".into(), StreamingPreference::Partial, resume, fork, false)
+            for (shape, resume, fork) in [
+                ("fresh", None, false),
+                ("resume", Some("claude-id".to_string()), false),
+                ("fork", Some("claude-id".to_string()), true),
+            ] {
+                let policy = build_create_request_loading(
+                    "/p".into(),
+                    StreamingPreference::Partial,
+                    resume,
+                    fork,
+                    false,
+                    user_settings,
+                )
                 .policy
                 .expect("a policy is always sent");
-            let sources = policy
-                .setting_sources
-                .expect("stated on every request, never left to the CLI's own default");
-            assert_eq!(
-                sources.sources,
-                vec![SettingSource::Project as i32, SettingSource::Local as i32],
-                "{shape}: project and local only, never user"
+                let sources = policy
+                    .setting_sources
+                    .expect("stated on every request, never left to the CLI's own default");
+                assert_eq!(sources.sources, expected, "{shape}, user_settings={user_settings}");
+            }
+            let note = crate::setting_sources::note_for(user_settings);
+            assert!(
+                note.starts_with(note_says),
+                "user_settings={user_settings}: the note says what loads: {note}"
             );
         }
-        assert!(
-            crate::SETTING_SOURCES_NOTE.contains("~/.claude"),
-            "the note names what is not loaded: {}",
-            crate::SETTING_SOURCES_NOTE
+    }
+
+    /// With nothing configured -- the state every test runs in, and the shipped default -- the
+    /// request every session goes through loads the user tier, and the note says so.
+    #[test]
+    fn the_default_request_loads_the_user_tier_and_the_note_says_so() {
+        let policy = build_create_request("/p".into(), StreamingPreference::Partial, None, false, false)
+            .policy
+            .expect("a policy is always sent");
+        assert_eq!(
+            policy.setting_sources.expect("stated").sources,
+            vec![
+                SettingSource::User as i32,
+                SettingSource::Project as i32,
+                SettingSource::Local as i32
+            ]
         );
+        assert_eq!(crate::setting_sources::note(), crate::setting_sources::NOTE_WITH_USER);
     }
 
     /// A manually maintained handshake fixture for testing capability and information mapping.

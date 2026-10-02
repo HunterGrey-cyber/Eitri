@@ -98,15 +98,6 @@ pub fn disallowed_tools() -> &'static [&'static str] {
     &[]
 }
 
-/// What every session loads, for `prefix i`: the sidecar asks for `[PROJECT, LOCAL]`
-/// (`build_create_request`) and legacy passes `--setting-sources project,local`. CLI 2.1.284 loads
-/// user memory (`~/.claude/CLAUDE.md`) only under `userSettings`, according to its code.
-///
-/// Compiled in every build because both backends and the panel read it. The request and argv tests
-/// check that the settings selection matches this note, so changes to either must update it.
-pub const SETTING_SOURCES_NOTE: &str =
-    "project + local only (.claude/ and CLAUDE.md here); ~/.claude's settings, hooks, plugins and CLAUDE.md are not loaded";
-
 /// The host's answer mode: whether Eitri answers every permission request `allow` itself.
 /// This mode is not sent to the CLI. Both backends run gated: `--permission-mode default` with the
 /// `PreToolUse` hook on legacy, and `INTERACTIVE` on the sidecar. The host uses this mode only where
@@ -240,9 +231,10 @@ pub struct AgentProcess {
 /// makes `agent-hook` exit successfully with no decision, which under `--permission-mode auto`
 /// lets the CLI decide whether to run the tool. Transport failures must not act as approval.
 /// In `default`, an unanswered hook enters the CLI's permission flow. Headless calls are denied
-/// unless project or local `permissions.allow` rules match. These settings load through
-/// `--setting-sources project,local`. This behavior has not been probed on a real CLI.
-/// Error paths still send an explicit denial because project settings can override the CLI flag.
+/// unless loaded `permissions.allow` rules match. `--setting-sources` loads project and local rules;
+/// user rules also count unless `agent.user_settings` is false. This behavior has not been probed
+/// on a real CLI. Error paths still send an explicit denial because project settings can override
+/// the CLI flag.
 ///
 /// Kept separate from `spawn` so stopping, stalled reads, error denials and successful parsing can
 /// be tested with a plain `UnixListener` without launching a CLI process.
@@ -543,7 +535,7 @@ fn build_can_use_tool_response_payload(request_id: &str, allow: bool, reason: Op
 #[cfg(feature = "legacy-backend")]
 impl AgentProcess {
     /// Spawns one long-lived process for the whole conversation. `project_dir` is the CLI's cwd,
-    /// where `--setting-sources project,local` finds project settings, and the root the conversation
+    /// where `--setting-sources` finds project settings, and the root the conversation
     /// operates on. This crate writes nothing there: hook settings go in argv and the socket goes in
     /// the temp directory. Every session uses `default` with the `PreToolUse` gate. The host decides
     /// whether to answer `allow` above this session API, so there is no mode parameter here.
@@ -636,7 +628,7 @@ impl AgentProcess {
             .arg("stream-json")
             .arg("--verbose")
             .arg("--setting-sources")
-            .arg("project,local")
+            .arg(crate::setting_sources::configured_cli_argument())
             // Use `default` so an unanswered hook enters the CLI's permission flow rather than its
             // classifier. Headless calls are denied unless a project/local `permissions.allow` rule matches;
             // that exception has not been probed on a real CLI. Under `auto`, the classifier was observed
@@ -2104,9 +2096,9 @@ exit 0"#,
             "the CLI runs in `default`: {session_argv}"
         );
         assert!(
-            session_argv.contains("--setting-sources project,local"),
-            "legacy loads project and local settings only, which `SETTING_SOURCES_NOTE` tells the user \
-             on `prefix i` (R13): {session_argv}"
+            session_argv.contains("--setting-sources user,project,local"),
+            "legacy loads all three settings tiers unless `agent.user_settings` is false, which \
+             `setting_sources::note` tells the user on `prefix i`: {session_argv}"
         );
         for ungated in [
             "bypassPermissions",

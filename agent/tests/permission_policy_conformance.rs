@@ -170,7 +170,8 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
 /// Under `--print` with no permission prompt tool, the expected result is a refusal.
 ///
 /// The probe uses `--permission-mode default`, `--setting-sources project,local`, and a
-/// `PreToolUse` hook with matcher `*` that answers `allow`. `Bash` is withheld so the model
+/// `PreToolUse` hook with matcher `*` that answers `allow`. This selection excludes machine-specific
+/// user settings so the probe is independent of them. `Bash` is withheld so the model
 /// cannot create the file through a tool the rule does not cover. The project's
 /// `.claude/settings.json` asks for `Edit(probe-asked.txt)`. The requested file must not exist
 /// afterwards.
@@ -618,7 +619,9 @@ fn run_the_cli(workspace: &Path, prompt: &str, extra_args: &[&str]) -> Vec<Obser
     let mut command = std::process::Command::new("claude");
     command
         .current_dir(workspace)
-        // `project,local`, as the product passes, and not the user tier: on 2026-09-25 the TEST
+        // `project,local`, the product's `agent.user_settings = false` selection, and not the user
+        // tier, which a default product session loads: this oracle compares the policy with the CLI's
+        // own rules and has to be independent of whoever runs it. On 2026-09-25 the TEST
         // profile's user settings carried an `rtk hook claude`
         // `PreToolUse` hook that rewrote `ls` to `rtk ls`, which the CLI then refused as not
         // read-only -- a refusal of a command nobody asked for, reported as the CLI refusing `ls`.

@@ -45,6 +45,7 @@ pub mod private_fs;
 #[doc(hidden)]
 pub mod process_probe;
 pub mod providers;
+pub mod setting_sources;
 #[cfg(feature = "legacy-backend")]
 pub mod settings;
 #[doc(hidden)]
@@ -64,10 +65,7 @@ pub use permission_rules::{PrefixRule, PrefixRules};
 pub use persistence::{resumable_sessions, NameUpdate, ResumableSession};
 #[cfg(feature = "legacy-backend")]
 pub use process::AgentProcess;
-pub use process::{
-    classify_cli_mode, disallowed_tools, CliModeReport, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS,
-    SETTING_SOURCES_NOTE,
-};
+pub use process::{classify_cli_mode, disallowed_tools, CliModeReport, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
 #[cfg(feature = "legacy-backend")]
 pub use session::AgentSession;
 #[cfg(not(feature = "legacy-backend"))]
