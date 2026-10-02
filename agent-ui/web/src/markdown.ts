@@ -222,21 +222,23 @@ function installSanitizeHooks(): void {
      permission cards, without a style attribute. Keep its contents in the reply's normal flow.
    - Forbid popover and command invoker attributes: their target ids could name panel controls.
      Markdown does not emit these attributes. Forbid `tabindex` so replies cannot add Tab stops. */
-/* What the reader sees is what a copy takes. `hidden` and `details`/`summary` are the two ways a
-   reply's own HTML can hold text that is in the DOM but not on screen: a `<span hidden>` tail on a
-   command, or a collapsed `<details>` body. Both are dropped (a `details` body stays, in flow, as
-   ordinary text), so nothing a reply writes is present and invisible; the copy paths below still
-   take rendered text, not `textContent`, for the same reason. */
+/* What the reader sees is what a copy takes. A reply's own HTML can hold text that is in the DOM
+   but not seen in three ways this list closes: a `hidden` attribute (a `<span hidden>` tail on a
+   command), a collapsed `<details>` body, and a colour of its own -- `<font color>` matching the
+   background, or a `bgcolor` cell matching the text. `font` is dropped with its text kept, the
+   attributes are dropped, and a `details` body stays, in flow, as ordinary text. The copy paths
+   below still take rendered text, not `textContent`, which leaves out what CSS hides. */
 const SANITIZE_CONFIG = {
   ALLOW_DATA_ATTR: false,
   ALLOW_ARIA_ATTR: false,
   FORBID_TAGS: [
     "style", "picture", "source", "video", "audio", "input",
-    "iframe", "object", "embed", "svg", "image", "img", "math", "dialog", "details", "summary",
+    "iframe", "object", "embed", "svg", "image", "img", "math", "dialog", "details", "summary", "font",
   ],
   FORBID_ATTR: [
     "style", "id", "name", "role", "form", "formaction", "background",
     "popover", "popovertarget", "popovertargetaction", "commandfor", "command", "tabindex", "hidden",
+    "color", "bgcolor",
   ],
 };
 

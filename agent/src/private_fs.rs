@@ -73,12 +73,20 @@ pub fn is_own_real_dir(path: &Path) -> bool {
 /// with every other program. `dir` must be `root` or inside it; otherwise only `dir` is tightened
 /// (by path, the same single-component-`O_NOFOLLOW` protection [`tighten_own_dir`] always gave).
 ///
-/// `dir`, or a directory between `root` and `dir`, that already exists and belongs to another user
-/// is refused (`PermissionDenied`) before anything is tightened or written: the state home may be
+/// `dir`, `root`, or a directory between them that already exists and belongs to another user is
+/// refused (`PermissionDenied`) before anything is tightened or written: the state home may be
 /// shared, and whoever creates `eitri/...` there first would otherwise decide what this user's files
-/// sit next to. `root` itself is not judged unless it is `dir`: callers derive it as `dir`'s parent,
-/// which in a test (or any caller with a shared parent) is a directory nobody here owns.
+/// sit next to -- the owner of `root` can rename any directory inside it away and put one of their
+/// own in its place, whatever the modes below it say.
 pub fn create_private_dir_all(dir: &Path, root: &Path) -> std::io::Result<()> {
+    // A `root` of someone else's is refused before anything is created inside it, not only after.
+    if dir.starts_with(root) {
+        match std::fs::metadata(root) {
+            Ok(meta) => refuse_foreign(root, &meta)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(PRIVATE_DIR_MODE)
@@ -91,27 +99,28 @@ pub fn create_private_dir_all(dir: &Path, root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Errors when `dir`, or any directory above it below `root`, is owned by another user. A symlink
+/// Errors when `dir`, `root`, or any directory between them is owned by another user. A symlink
 /// is looked through: what counts is the directory it leads to, which is where the files would go.
 /// Only `dir` is judged when it is not inside `root`.
 fn refuse_foreign_dirs(dir: &Path, root: &Path) -> std::io::Result<()> {
     let inside = dir.starts_with(root);
     for candidate in dir.ancestors() {
-        if inside && candidate == root && candidate != dir {
-            break;
-        }
-        let meta = std::fs::metadata(candidate)?;
-        if meta.uid() != euid() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("{} is owned by uid {}, not this user", candidate.display(), meta.uid()),
-            ));
-        }
+        refuse_foreign(candidate, &std::fs::metadata(candidate)?)?;
         if !inside || candidate == root {
             break;
         }
     }
     Ok(())
+}
+
+fn refuse_foreign(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    if meta.uid() == euid() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("{} is owned by uid {}, not this user", path.display(), meta.uid()),
+    ))
 }
 
 /// Walks from `root` to `below` (relative to `root`) entirely by open directory handles, tightening
@@ -241,6 +250,31 @@ pub fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
     fchmod(&file, PRIVATE_FILE_MODE)?;
     file.set_len(0)?;
     Ok(file)
+}
+
+/// Reads `path` whole as UTF-8, but only when it is a regular file owned by this user; anything
+/// else is refused with `PermissionDenied` before a byte is read (a missing file is still
+/// `NotFound`). Every loader of Eitri's own state reads through this: those files decide what is
+/// answered without a card and how a window comes back, so one that another user put in place --
+/// in a state home they could write to -- must not count, and a FIFO in a file's place must not
+/// block a launch. `O_NONBLOCK` makes opening a FIFO return at once, and the type and owner are
+/// read from the open handle, so what is checked is what is read.
+pub fn read_private_to_string(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != euid() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a regular file of this user", path.display()),
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -420,6 +454,67 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
         let err = create_private_dir_all(theirs, Path::new("/usr")).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// `root` itself is judged too: a `<state home>/eitri` that another user created first, open to
+    /// everyone, would let them swap a directory of ours inside it for one of their own.
+    #[test]
+    fn a_root_owned_by_someone_else_is_refused_even_below_it() {
+        let shared = Path::new("/tmp");
+        if current_uid() == 0
+            || std::fs::metadata(shared)
+                .map(|m| m.uid() == current_uid())
+                .unwrap_or(true)
+        {
+            return;
+        }
+        let ours = shared.join(format!("nv-private-fs-root-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&ours).unwrap();
+        let err = create_private_dir_all(&ours.join("permissions"), shared).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            !ours.join("permissions").exists(),
+            "nothing is created below a foreign root"
+        );
+        std::fs::remove_dir(&ours).unwrap();
+    }
+
+    /// What Eitri reads back must be a regular file of this user: a FIFO would block the read for
+    /// good, and another user's file is not state this user wrote.
+    #[test]
+    fn reading_refuses_a_fifo_without_blocking_and_a_file_of_someone_else() {
+        let base = scratch("read");
+        let fifo = base.join("rules.json");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_private_to_string(&path).map_err(|e| e.kind()));
+        });
+        let read = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("read_private_to_string blocked on a FIFO");
+        assert_eq!(read, Err(std::io::ErrorKind::PermissionDenied));
+        std::fs::remove_file(&fifo).unwrap();
+
+        let ours = base.join("ours.json");
+        write_private(&ours, b"{}").unwrap();
+        assert_eq!(read_private_to_string(&ours).unwrap(), "{}");
+        assert_eq!(
+            read_private_to_string(&base.join("missing.json")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        if current_uid() != 0 {
+            let theirs = base.join("theirs.json");
+            std::os::unix::fs::symlink("/etc/passwd", &theirs).unwrap();
+            assert_eq!(
+                read_private_to_string(&theirs).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// The control: a directory this user made is accepted when it already exists.

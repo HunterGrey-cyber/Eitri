@@ -249,6 +249,34 @@ describe("PermissionCard for a Write", () => {
   });
 });
 
+/** An edit card is drawn for the risky edits (outside the project, protected paths), so the file it
+ *  names and the change it shows get the same escapes as a command: a right-to-left override in a
+ *  file name could otherwise make it read as a different file. */
+describe("PermissionCard for an Edit with hidden characters", () => {
+  it("shows them escaped in the file path and in the diff, and warns", () => {
+    const { container } = render(
+      <PermissionCard
+        request={{
+          ...REQUEST,
+          toolName: "Edit",
+          input: { file_path: "/p/a\u202Etxt.sh", old_string: "x\u200By", new_string: "z" },
+        }}
+        sessionEnded={false}
+        onAnswer={vi.fn()}
+      />,
+    );
+    const path = container.querySelector(".permission-card-edit-path")!;
+    expect(path.textContent).toBe("/p/a⟨U+202E⟩txt.sh");
+    expect(path.getAttribute("data-path")).toBe("/p/a\u202Etxt.sh");
+    const diff = container.querySelector("pre.permission-card-diff")!;
+    expect(diff.textContent).toContain("x⟨U+200B⟩y");
+    expect(container.textContent).not.toContain("\u202E");
+    expect(container.textContent).not.toContain("\u200B");
+    expect(container.querySelectorAll(".permission-card-escape")).toHaveLength(2);
+    expect(container.querySelector(".permission-card-warning")!.textContent).toContain("2 invisible or direction-changing");
+  });
+});
+
 /** A CLI prompt raised after the gate answered appears in the same permission card.
  *  Show the CLI's sentence and label it as a safety check or a prompt forced by the user's ask rule.
  *  Use the same buttons, keys and permission id as any other card. */

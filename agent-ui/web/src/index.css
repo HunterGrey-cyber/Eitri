@@ -1213,12 +1213,14 @@ textarea,
   font-family: var(--nv-font-mono);
   font-size: var(--fs-code);
 }
-/* The command and the JSON input are what a person approves, so they are laid out in the order of
-   their characters: direction controls are already drawn as escapes (`revealHidden.ts`), and this
-   also turns off the implicit reordering right-to-left letters cause around them, as a terminal
-   without bidi shows the same line. */
+/* The command, the JSON input and an edit's file name and diff are what a person approves, so they
+   are laid out in the order of their characters: direction controls are already drawn as escapes
+   (`revealHidden.ts`), and this also turns off the implicit reordering right-to-left letters cause
+   around them, as a terminal without bidi shows the same line. */
 .permission-card-command,
-.permission-card-input {
+.permission-card-input,
+.permission-card-edit-path,
+.permission-card-diff {
   direction: ltr;
   unicode-bidi: bidi-override;
 }

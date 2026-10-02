@@ -451,10 +451,11 @@ A few common install-time refusals, in the installer's own words (abridged):
   there `chmod g-w ~/.cache`, or pointing `XDG_CACHE_HOME` at a directory of your own, is the safe
   choice. The same holds for every directory above the cache, up to `/`: each must be yours or
   root's, and writable by no one else unless it has the sticky bit (as `/tmp` does).
-- **`… is a symlink`** — the cache directory itself (`$XDG_CACHE_HOME`, by default `~/.cache`) may not
-  be a symbolic link, since whoever owns the link could repoint it after a download was checked. If
-  you moved it to another disk and linked it back, set `XDG_CACHE_HOME` to the directory it leads to;
-  a link further up the path is fine.
+- **`… is a symlink owned by another user`** — the cache directory itself (`$XDG_CACHE_HOME`, by
+  default `~/.cache`) may be a symbolic link of your own (or root's), such as a cache moved to another
+  disk and linked back: the installer resolves the path once, checks every directory on the resolved
+  path, and uses only that. A link that belongs to another user is refused, since its owner could point
+  it at a directory of theirs; set `XDG_CACHE_HOME` to a directory of your own.
 
 ### Ubuntu 23.10 and later
 

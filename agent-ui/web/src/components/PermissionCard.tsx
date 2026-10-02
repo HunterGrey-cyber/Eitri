@@ -4,7 +4,8 @@ import type { PermissionDecision } from "../bridge";
 import { editPreview } from "../diff";
 import { isUsableLink } from "../timeline";
 import { EditDiff } from "./EditDiff";
-import { countEscapes, revealHidden, type RevealedPiece } from "../revealHidden";
+import { countEscapes, revealHidden } from "../revealHidden";
+import { HiddenWarning, Revealed } from "./Revealed";
 
 type Props = {
   request: PermissionRequestRecord;
@@ -182,32 +183,5 @@ function ToolInput({ toolName, input, createsFile }: { toolName: string; input: 
       </pre>
       <HiddenWarning count={countEscapes(pieces)} what="input" />
     </>
-  );
-}
-
-function Revealed({ pieces }: { pieces: RevealedPiece[] }) {
-  return (
-    <>
-      {pieces.map((piece, i) =>
-        "text" in piece ? (
-          piece.text
-        ) : (
-          <span key={i} className="permission-card-escape">
-            {piece.escape}
-          </span>
-        ),
-      )}
-    </>
-  );
-}
-
-/** One line under the command saying why it shows `⟨U+…⟩`, only when it does. */
-function HiddenWarning({ count, what }: { count: number; what: string }) {
-  if (count === 0) return null;
-  const characters = count === 1 ? "character" : "characters";
-  return (
-    <div className="permission-card-warning">
-      the {what} holds {count} invisible or direction-changing {characters}, shown as ⟨U+…⟩
-    </div>
   );
 }

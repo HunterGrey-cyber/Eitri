@@ -781,38 +781,32 @@ t_cache_symlinked_parent_acl_refused_without_getfacl() {
 	PRE_STUBS=$T/stubs-getfacl
 	inst_net
 	expect_fail "a symlinked cache whose target has an ACL, with getfacl reporting none"
-	# A symlinked cache root is refused before its target is looked at at all.
-	expect_out "$TH/.cache is a symlink"
+	# The link is the user's own, so it is followed, and the directory it leads to is what is checked.
+	expect_out "$T/realcache is writable by its group or by anyone, and not sticky"
 	# Named directly, the same directory: ls is still the only check that sees its ACL.
 	inst_net --set "XDG_CACHE_HOME=$T/realcache" --
 	expect_fail "a cache whose directory has an ACL, with getfacl reporting none"
 	expect_out "$T/realcache is writable by its group or by anyone, and not sticky"
 }
 
-TESTS="$TESTS t_cache_root_symlinked_refused"
-t_cache_root_symlinked_refused() {
-	# A cache root that is itself a symlink -- planted in a shared sticky directory such as /tmp,
-	# pointing at the user's own private cache -- passes every check made through it, and whoever
-	# owns the link can repoint it after the downloads were checked. Nothing is created through it.
+TESTS="$TESTS t_cache_root_own_symlink_followed"
+t_cache_root_own_symlink_followed() {
+	# A cache root that is the user's own symlink (a ~/.cache moved to another disk and linked from
+	# where it was) is followed: the path is resolved once, every directory on the resolved path is
+	# checked, and only the resolved path is used after that.
 	serve 1.0.0
 	mkdir -p "$T/private-cache"
 	chmod 0700 "$T/private-cache"
 	rm -rf "$TH/.cache"
 	ln -s "$T/private-cache" "$TH/.cache"
 	inst_net
-	expect_fail "a symlinked cache root"
-	expect_out "$TH/.cache is a symlink"
-	expect_absent "$T/private-cache/eitri"
-	expect_absent "$TH/.local/lib/eitri"
-	# Named by the directory it led to, the same cache is fine.
-	inst_net --set "XDG_CACHE_HOME=$T/private-cache" --
 	expect_rc 0
-	expect_eq "$(installed_version)" 1.0.0 "the version once the cache root is named directly"
+	expect_eq "$(installed_version)" 1.0.0 "the version with a symlinked cache root of the user's own"
 }
 
-TESTS="$TESTS t_cache_root_symlinked_uninstall_refused"
-t_cache_root_symlinked_uninstall_refused() {
-	# --uninstall takes the same lock, so it refuses the same link, and removes nothing.
+TESTS="$TESTS t_cache_root_own_symlink_uninstall"
+t_cache_root_own_symlink_uninstall() {
+	# --uninstall takes the same lock, through the same link.
 	serve 1.0.0
 	inst_net
 	expect_rc 0
@@ -821,9 +815,27 @@ t_cache_root_symlinked_uninstall_refused() {
 	rm -rf "$TH/.cache"
 	ln -s "$T/private-cache" "$TH/.cache"
 	inst -- --uninstall
-	expect_fail "--uninstall with a symlinked cache root"
-	expect_out "$TH/.cache is a symlink"
-	expect_dir "$TH/.local/lib/eitri"
+	expect_rc 0 "--uninstall with a symlinked cache root of the user's own"
+	expect_absent "$TH/.local/lib/eitri"
+}
+
+TESTS="$TESTS t_cache_root_symlink_of_another_user_refused"
+t_cache_root_symlink_of_another_user_refused() {
+	# A cache root that is a link another user owns -- one planted in a shared sticky directory such
+	# as /tmp -- lets them choose where the cache directory is created, so it is refused before
+	# anything is created through it. find-fake-owner stands in for a real chown, as above.
+	serve 1.0.0
+	mkdir -p "$T/private-cache"
+	chmod 0700 "$T/private-cache"
+	rm -rf "$TH/.cache"
+	ln -s "$T/private-cache" "$TH/.cache"
+	printf '%s\n' "$TH/.cache" >"$S/logs/fake-owner-path"
+	inst --stubs "$S/stubs-fakeowner" -- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
+	expect_fail "a cache root that is another user's symlink"
+	expect_out "$TH/.cache is a symlink owned by another user"
+	expect_absent "$T/private-cache/eitri"
+	expect_absent "$TH/.local/lib/eitri"
+	rm -f "$S/logs/fake-owner-path"
 }
 
 TESTS="$TESTS t_cache_ancestor_symlink_followed"
@@ -839,27 +851,29 @@ t_cache_ancestor_symlink_followed() {
 	expect_eq "$(installed_version)" 1.0.0 "the version with a symlink above the cache root"
 }
 
-TESTS="$TESTS t_cache_root_symlinked_dry_run_refused"
-t_cache_root_symlinked_dry_run_refused() {
-	# A dry run makes the same refusal a real run would: the test is on the name alone, so it can be
+TESTS="$TESTS t_cache_root_symlink_of_another_user_dry_run_refused"
+t_cache_root_symlink_of_another_user_dry_run_refused() {
+	# A dry run makes the same refusal a real run would: the test is on the link alone, so it can be
 	# made without creating anything.
 	serve 1.0.0
 	mkdir -p "$T/private-cache"
 	chmod 0700 "$T/private-cache"
 	rm -rf "$TH/.cache"
 	ln -s "$T/private-cache" "$TH/.cache"
-	inst_net -- --dry-run
-	expect_fail "a dry run with a symlinked cache root"
-	expect_out "$TH/.cache is a symlink"
+	printf '%s\n' "$TH/.cache" >"$S/logs/fake-owner-path"
+	inst --stubs "$S/stubs-fakeowner" -- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS" --dry-run
+	expect_fail "a dry run with a cache root that is another user's symlink"
+	expect_out "$TH/.cache is a symlink owned by another user"
 	expect_no_out "would take the lock"
 	expect_absent "$T/private-cache/eitri"
+	rm -f "$S/logs/fake-owner-path"
 }
 
-TESTS="$TESTS t_cache_root_symlink_planted_at_mkdir_refused"
-t_cache_root_symlink_planted_at_mkdir_refused() {
-	# A cache root that did not exist yet can be planted as a link between the first symlink test and
-	# `mkdir -p`, which then creates the cache through it. A mkdir stub plants one at exactly that
-	# moment, pointing at a private directory of the user's own, so only the second test can see it.
+TESTS="$TESTS t_cache_root_symlink_of_another_user_planted_at_mkdir_refused"
+t_cache_root_symlink_of_another_user_planted_at_mkdir_refused() {
+	# A cache root that did not exist yet can be planted as another user's link between the first
+	# test and `mkdir -p`, which then creates the cache through it. A mkdir stub plants one at exactly
+	# that moment, and find-fake-owner reports it as another user's, so only the second test sees it.
 	serve 1.0.0
 	mkdir -p "$T/private-cache" "$T/stubs-plant"
 	chmod 0700 "$T/private-cache"
@@ -872,12 +886,15 @@ fi
 exec "$(command -v mkdir)" "\$@"
 STUB
 	chmod 0755 "$T/stubs-plant/mkdir"
+	printf '%s\n' "$T/late-cache" >"$S/logs/fake-owner-path"
 	PRE_STUBS=$T/stubs-plant
-	inst_net --set "XDG_CACHE_HOME=$T/late-cache" --
-	expect_fail "a cache root planted as a link while it was being created"
-	expect_out "$T/late-cache is a symlink"
+	inst --stubs "$S/stubs-fakeowner" --set "XDG_CACHE_HOME=$T/late-cache" -- \
+		--base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
+	expect_fail "a cache root planted as another user's link while it was being created"
+	expect_out "$T/late-cache is a symlink owned by another user"
 	if [ ! -L "$T/late-cache" ]; then fail "the mkdir stub planted no link at $T/late-cache"; fi
 	expect_absent "$TH/.local/lib/eitri"
+	rm -f "$S/logs/fake-owner-path"
 }
 
 TESTS="$TESTS t_cache_ancestor_repointed_after_lock_uses_resolved_path"

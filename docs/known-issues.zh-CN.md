@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=03f034904823bdb62a17357472893c93ae9e469b1f8df442000e9ca0588088fb -->
+<!-- translated-from: known-issues.md sha256=1beab54dd49357a2f09713082400aa529385fdc5294008f36b3d3aea89aa4c07 -->
 
 # 已知问题与限制
 
@@ -39,6 +39,12 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **`foot --server` 的客户端共用同一个 pid**，所以按进程把编辑器提到前面时，可能提起同一个 server 的另一个 foot 窗口，而不是装着你那个 nvim 的窗口。
 - **在 sway 的边缘，这个按键会被吞掉。** Eitri 必须先接管或放行 `Ctrl+h/j/k/l`，才能去问 sway 那个方向上有没有窗口，所以在边缘上这个按键什么也不做，和 tmux 自己的 `select-pane` 在它的边缘上一样。
 - **GNOME 和 KDE：不移动焦点。** 在那里 Wayland 客户端没法抢到焦点；请用桌面自己的窗口键。
+
+## 安全
+
+- **还没有「是否信任此工作区」这一步。** 终端里的 Claude Code 会先问你是否信任这个文件夹，再运行它自带的配置；Eitri 目前不问。一个项目里的 agent 会话会加载这个项目自己的 `.claude/settings.json`、`.claude/settings.local.json` 和 `.mcp.json`，所以一个不是你写的仓库，可以在你发出第一条消息时、在任何权限卡片出现之前，以你的身份启动它自己的 hook 和 MCP server，它自己的 allow 规则也可能直接回答本来要询问的调用。在这一步做出来之前，请先看一眼 `.claude/` 和 `.mcp.json`，再用 Eitri 打开你不熟悉的仓库。`agent.user_settings = false` 改变不了这一点，它只是不加载你自己的用户设置。
+- **底部终端可以写你的剪贴板，这是有意为之。** 在那里运行的程序可以用 OSC 52 转义序列设置剪贴板或主选区（和 Alacritty 的默认行为一样）；发生时 Eitri 不会提示，所以你接下来粘贴的内容可能不是你复制的。读取剪贴板则会被拒绝。
+- **agent 面板的脚本策略是新的，只在测试里检查过，还没有在每一种环境的屏幕上看过。** 面板现在只允许自己的那段脚本（按哈希），不再允许任意内联脚本。如果更新后 agent 面板一直是空白，请连同你的 WebKitGTK 版本一起报告。
 
 <a id="turn-review"></a>
 ## 回合审阅

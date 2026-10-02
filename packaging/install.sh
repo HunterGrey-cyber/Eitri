@@ -1464,11 +1464,24 @@ own_private_group() {
 	if [ "$_opg_verdict" = ok ]; then OPG=1; fi
 }
 
+# foreign_cache_link NAME UID: sets FCL=1 when NAME is itself a symlink owned by neither UID nor
+# root, else FCL=0. find without -H or -L looks at the link, not at what it leads to. Never 1 for
+# uid 0, as the ownership checks in acquire_lock are skipped for it. Called as a plain statement
+# (rule 2 above).
+foreign_cache_link() {
+	FCL=0
+	if [ ! -L "$1" ] || [ "$2" = 0 ]; then return 0; fi
+	_fcl_hit=$(find "$1" -maxdepth 0 -type l ! -uid "$2" ! -uid 0 -print 2>/dev/null) || _fcl_hit=
+	if [ -n "$_fcl_hit" ]; then FCL=1; fi
+}
+
 acquire_lock() {
 	NV_LOCK=$NV_CACHE_NV/lock
-	# The cache root itself must not be a symlink either. One planted in a shared sticky directory
-	# such as /tmp, pointing at the user's own private cache, passes every check made through it,
-	# and its owner can repoint it at a directory of their own once the downloads are checked. The
+	# A cache root that is itself a symlink is followed: the path is resolved once below, only the
+	# resolved path is used from then on, and every directory on it is checked without following a
+	# link, so repointing the link afterwards changes nothing (a ~/.cache linked to another disk is
+	# common). One owned by another user (not you, and not root) is refused all the same: it would
+	# let them choose where this run creates its cache directory, before anything is resolved. The
 	# test is on the name without trailing slashes, which would make it look at the link's target.
 	_al_root=$NV_CACHE
 	while :; do
@@ -1477,8 +1490,10 @@ acquire_lock() {
 		*) break ;;
 		esac
 	done
-	_al_symlink_msg="$_al_root is a symlink: whoever owns the link could repoint it after a download there was checked, so this installer refuses to keep downloads behind it. Set XDG_CACHE_HOME to the directory it leads to (or another directory of your own) and re-run"
-	if [ -L "$_al_root" ]; then die "$_al_symlink_msg"; fi
+	_al_uid=$(id -u) || die "id -u failed"
+	_al_symlink_msg="$_al_root is a symlink owned by another user, who could point it at a directory of their own, so this installer refuses to keep downloads behind it. Set XDG_CACHE_HOME to a directory of your own and re-run"
+	foreign_cache_link "$_al_root" "$_al_uid"
+	if [ "$FCL" = 1 ]; then die "$_al_symlink_msg"; fi
 	# A symlinked <cache>/eitri is refused outright,
 	# before `mkdir -p` (which is a silent no-op on one already pointing at an existing directory,
 	# so it would otherwise never even reach a permission check). Another user, in a shared sticky
@@ -1501,7 +1516,8 @@ acquire_lock() {
 	# shellcheck disable=SC2174 # -m for the deepest directory only, deliberately
 	mkdir -p -m 0700 -- "$NV_CACHE_NV" || die "cannot create $NV_CACHE_NV: check that $NV_CACHE is writable"
 	# Again, now that it exists: a link could have been planted between the test above and mkdir.
-	if [ -L "$_al_root" ]; then die "$_al_symlink_msg"; fi
+	foreign_cache_link "$_al_root" "$_al_uid"
+	if [ "$FCL" = 1 ]; then die "$_al_symlink_msg"; fi
 	# Resolved once, here, and only the resolved path is used from now on: every check below is on
 	# the directories that path names, and a symlink further up (a cache moved to another disk and
 	# linked from where it was) can no longer be repointed under a check that has already passed.
@@ -1519,7 +1535,6 @@ acquire_lock() {
 	if [ -L "$NV_CACHE_NV" ]; then
 		die "$NV_CACHE_NV is a symlink: a download checked there could be replaced by repointing it, and this installer refuses to use it. Remove it, or set XDG_CACHE_HOME to a directory of your own, and re-run"
 	fi
-	_al_uid=$(id -u) || die "id -u failed"
 	# `mkdir -p` is a silent no-op on a directory that
 	# already exists, so a $NV_CACHE_NV planted in advance by another user (in a shared
 	# XDG_CACHE_HOME) was never checked for who owns it -- only for its own write bits, which say

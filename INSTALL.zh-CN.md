@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=a1ae25ecbfb806882f89b0633371f3ed24494a0d8e967e867a08ebf4c1c8a9f4 -->
+<!-- translated-from: INSTALL.md sha256=ae9fab052787a2f86f5ad584290560744c0785ed52493a68620047731ef0f5e2 -->
 
 # 安装 Eitri
 
@@ -249,9 +249,10 @@ nvim 里的 `:help eitri.nvim` 有同样的内容。还没有在真实硬件上�
   有目录账号共用这个组，这时最稳妥的做法是 `chmod g-w ~/.cache`，或把 `XDG_CACHE_HOME` 指向一个只属于
   你的目录。缓存目录之上直到 `/` 的每一级目录也一样：每一级都必须属于你或 root，而且除非带有 sticky 位
   （像 `/tmp` 那样），不能让别人写。
-- **`… is a symlink`** — 缓存目录本身（`$XDG_CACHE_HOME`，默认是 `~/.cache`）不能是符号链接，因为
-  链接的所有者可以在下载校验之后把它改指到别处。如果你把它挪到了另一块盘上再链接回来，就把
-  `XDG_CACHE_HOME` 设成它指向的那个目录；路径上更高层的链接没有问题。
+- **`… is a symlink owned by another user`** — 缓存目录本身（`$XDG_CACHE_HOME`，默认是 `~/.cache`）
+  可以是属于你自己（或 root）的符号链接，比如把缓存挪到另一块盘上再链接回来：安装器只解析一次路径，
+  检查解析后路径上的每一级目录，之后只用解析后的路径。属于别的用户的链接会被拒绝，因为它的所有者可以
+  把它改指到自己的目录；这时把 `XDG_CACHE_HOME` 设成一个只属于你的目录。
 
 <a id="ubuntu-2310-and-later"></a>
 ### Ubuntu 23.10 及以后版本

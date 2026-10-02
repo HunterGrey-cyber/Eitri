@@ -1203,7 +1203,7 @@ describe("index.css cascade (which rule actually wins)", () => {
   it("lays a card's command and input out in the order of their characters", () => {
     // Direction controls on the card are escaped; what remains is the implicit reordering of
     // right-to-left letters, which this rule turns off so the line reads in byte order.
-    for (const selector of [".permission-card-command", ".permission-card-input"]) {
+    for (const selector of [".permission-card-command", ".permission-card-input", ".permission-card-edit-path", ".permission-card-diff"]) {
       const cls = selector.slice(1);
       const style = computed(`<pre class="${cls}">x</pre>`, selector);
       expect(style.getPropertyValue("unicode-bidi"), selector).toBe("bidi-override");

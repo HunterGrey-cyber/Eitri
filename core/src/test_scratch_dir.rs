@@ -15,33 +15,41 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 /// Owns a directory under the system temp dir and removes it (recursively) on drop.
-pub(crate) struct ScratchDir(PathBuf);
+///
+/// The path it hands out is `state` inside that directory, not the directory itself: the state
+/// writers judge the owner of the directory above theirs (`<state home>/eitri` in a real run), and
+/// the temp dir itself belongs to root, so the scratch directory stands in for `eitri`.
+pub(crate) struct ScratchDir {
+    outer: PathBuf,
+    dir: PathBuf,
+}
 
 impl ScratchDir {
-    /// Creates `<std::env::temp_dir()>/<prefix>-<label>-<uuid>` and returns a guard that removes it
-    /// on drop.
+    /// Creates `<std::env::temp_dir()>/<prefix>-<label>-<uuid>/state` and returns a guard that
+    /// removes the whole `<prefix>-<label>-<uuid>` directory on drop.
     pub(crate) fn new(prefix: &str, label: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("{prefix}-{label}-{}", uuid::Uuid::new_v4()));
+        let outer = std::env::temp_dir().join(format!("{prefix}-{label}-{}", uuid::Uuid::new_v4()));
+        let dir = outer.join("state");
         std::fs::create_dir_all(&dir).unwrap();
-        ScratchDir(dir)
+        ScratchDir { outer, dir }
     }
 }
 
 impl Deref for ScratchDir {
     type Target = Path;
     fn deref(&self) -> &Path {
-        &self.0
+        &self.dir
     }
 }
 
 impl AsRef<Path> for ScratchDir {
     fn as_ref(&self) -> &Path {
-        &self.0
+        &self.dir
     }
 }
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.outer);
     }
 }
