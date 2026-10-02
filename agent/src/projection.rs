@@ -22,10 +22,9 @@ pub enum ContentKind {
 }
 
 /// A turn's terminal state distinguishes completion, interruption, failure and a reached limit.
-/// `LimitReached` has no producer in this crate: the legacy CLI protocol has no signal
-/// equivalent to `terminal_reason` for `agent::session` to translate.
-/// Keeping the variant lets an SDK-backed runtime with that signal produce it without
-/// breaking consumers that already match on this type.
+/// `LimitReached` comes only from the sidecar, which maps the SDK's `terminal_reason`
+/// (`max_turns`, `blocking_limit`, `rapid_refill_breaker`, `budget_exhausted`) to it.
+/// The legacy backend's translation never chooses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnOutcome {
@@ -33,6 +32,99 @@ pub enum TurnOutcome {
     Interrupted,
     Failed,
     LimitReached,
+}
+
+/// What the provider said about a turn that did not simply complete, carried on
+/// [`AgentDomainEvent::TurnCompleted`] and kept on the [`TurnEndingRecord`] drawn where it ended.
+/// Every field is `None` when the provider said nothing: a completed turn, an end the sidecar
+/// synthesized after its CLI died, and most legacy results.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEndDetail {
+    /// The provider's terminal reason as it gave it (`max_turns`, `blocking_limit`, `api_error`,
+    /// ...). An open set: the panel words the ones it knows and shows the rest verbatim.
+    pub reason: Option<String>,
+    /// The HTTP status of the API error that ended the turn, when the provider reported one.
+    pub api_error_status: Option<u32>,
+    /// The provider's own words about the failure, trimmed and at most
+    /// [`MAX_TURN_END_MESSAGE_CHARS`] characters (cut with `…`). Never set for a completed or an
+    /// interrupted turn: an interrupt is the user's own doing, and the CLI's diagnostics for one
+    /// (`[ede_diagnostic] ...`) are noise to them.
+    pub message: Option<String>,
+}
+
+/// The longest provider message a turn's ending keeps. The row is meant to be one short line plus
+/// what the provider said; the SDK's own error list allows 8 entries of 2000 characters each,
+/// which would bury the conversation under it.
+pub const MAX_TURN_END_MESSAGE_CHARS: usize = 400;
+
+impl TurnEndDetail {
+    /// Builds the detail from what a result carried. The message is the provider's error list
+    /// when it gave one (an error result has no result text), else the result text of a result
+    /// that says it is an error (an API error arrives as a "success" result whose text is the
+    /// error). A result that is not an error -- a turn a hook stopped, say -- has the reply as its
+    /// text, which is not a reason and is not repeated.
+    pub fn from_result(
+        outcome: TurnOutcome,
+        is_error: bool,
+        result_text: &str,
+        reason: Option<String>,
+        api_error_status: Option<u32>,
+        errors: &[String],
+    ) -> Self {
+        let message = match outcome {
+            TurnOutcome::Completed | TurnOutcome::Interrupted => None,
+            TurnOutcome::Failed | TurnOutcome::LimitReached => {
+                let listed = errors
+                    .iter()
+                    .map(|e| e.trim())
+                    .filter(|e| !e.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let text = match (listed.is_empty(), is_error) {
+                    (false, _) => listed.as_str(),
+                    (true, true) => result_text.trim(),
+                    (true, false) => "",
+                };
+                (!text.is_empty()).then(|| cap_chars(text, MAX_TURN_END_MESSAGE_CHARS))
+            }
+        };
+        Self {
+            reason: reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()),
+            api_error_status,
+            message,
+        }
+    }
+}
+
+fn cap_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        None => text.to_string(),
+        Some((cut, _)) => format!("{}…", text[..cut].trim_end()),
+    }
+}
+
+/// How a turn ended when it did not simply complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEndingKind {
+    Interrupted,
+    Failed,
+    LimitReached,
+    /// The session ended (lost, closed, or a resume that did not continue) while the turn was
+    /// still running, and no `TurnCompleted` came for it.
+    Lost,
+}
+
+/// A turn that ended other than by completing, as an item of the transcript at the place it
+/// ended. Without it a failed, interrupted or limit-stopped turn read exactly like a finished one:
+/// the activity line went away and nothing said why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEndingRecord {
+    /// Ordering key, shared with the other four collections. See `AgentSessionProjection::apply`.
+    pub seq: u64,
+    pub turn_id: String,
+    pub kind: TurnEndingKind,
+    pub detail: TurnEndDetail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -183,6 +275,8 @@ pub enum AgentDomainEvent {
         /// cost on one backend and a confident, permanent "$0.00" on the other, with nothing
         /// anywhere able to tell the two apart.
         usage: Option<UsageInfo>,
+        /// Why the turn ended, in the provider's terms, when it did not simply complete.
+        detail: TurnEndDetail,
     },
     /// The provider process is gone unexpectedly (a real, non-zero-exit `ProcessExited`) --
     /// distinct from `SessionClosed`, which is an orderly end. No hook-relay/gRPC-crash producer
@@ -556,6 +650,12 @@ pub struct AgentSessionProjection {
     pub transcript: Vec<TranscriptMessage>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub pending_permissions: HashMap<String, PermissionRequestRecord>,
+    /// Turns that ended other than by completing, each where it ended (the fifth collection
+    /// ordered by `seq`).
+    pub turn_endings: Vec<TurnEndingRecord>,
+    /// How the latest turn ended when it did not complete, until the next turn starts: what the
+    /// panel's status band shows. `None` while a turn runs and after one that completed.
+    pub last_turn_ending: Option<TurnEndingKind>,
     /// The last usage a provider actually reported, or `None` if none ever has -- the state of a
     /// session before its first report, of one resumed from history (which seeds none), and of a
     /// sidecar that predates `TurnUsage`. A consumer must render `None` as unknown; rendering it as
@@ -676,6 +776,21 @@ impl AgentSessionProjection {
         }
     }
 
+    /// The session ended while a turn was running and no `TurnCompleted` came for it: one
+    /// [`TurnEndingKind::Lost`] item where it stopped. Nothing when no turn was running, so an
+    /// ordinary close after a finished turn adds nothing.
+    fn record_lost_turn(&mut self, seq: u64) {
+        if let Some(turn_id) = &self.active_turn_id {
+            self.turn_endings.push(TurnEndingRecord {
+                seq,
+                turn_id: turn_id.clone(),
+                kind: TurnEndingKind::Lost,
+                detail: TurnEndDetail::default(),
+            });
+            self.last_turn_ending = Some(TurnEndingKind::Lost);
+        }
+    }
+
     /// Takes the refusal held for this call, if one arrived ahead of it.
     fn take_held_denial(&mut self, tool_use_id: &str) -> Option<ToolCallDenial> {
         let at = self
@@ -734,6 +849,7 @@ impl AgentSessionProjection {
             AgentDomainEvent::TurnStarted { turn_id } => {
                 self.active_turn_id = Some(turn_id.clone());
                 self.assistant_message_open = false;
+                self.last_turn_ending = None;
             }
             AgentDomainEvent::UserPromptSubmitted { text } => {
                 self.user_prompts.push(UserPromptRecord {
@@ -831,7 +947,28 @@ impl AgentSessionProjection {
             AgentDomainEvent::PermissionResolved { permission_id, .. } => {
                 self.pending_permissions.remove(permission_id);
             }
-            AgentDomainEvent::TurnCompleted { usage, .. } => {
+            AgentDomainEvent::TurnCompleted {
+                turn_id,
+                outcome,
+                usage,
+                detail,
+                ..
+            } => {
+                let kind = match outcome {
+                    TurnOutcome::Completed => None,
+                    TurnOutcome::Interrupted => Some(TurnEndingKind::Interrupted),
+                    TurnOutcome::Failed => Some(TurnEndingKind::Failed),
+                    TurnOutcome::LimitReached => Some(TurnEndingKind::LimitReached),
+                };
+                if let Some(kind) = kind {
+                    self.turn_endings.push(TurnEndingRecord {
+                        seq,
+                        turn_id: turn_id.clone(),
+                        kind,
+                        detail: detail.clone(),
+                    });
+                    self.last_turn_ending = Some(kind);
+                }
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
                 self.denials_before_their_call.clear();
@@ -852,7 +989,8 @@ impl AgentSessionProjection {
             // check, so a killed provider showed up as a busy agent in the dashboard too. This is
             // not a synthesized `TurnCompleted`: no completion is recorded, no outcome is invented,
             // and no result text appears. The turn simply stops being in progress, because it is
-            // not.
+            // not -- and the transcript says so where it stopped (`record_lost_turn`), which states
+            // only that it did not finish.
             // A resume verdict is a provider-reported fact, and the two bad ones end the session's
             // usefulness whatever else follows. Turning them into a status here is not synthesizing
             // anything: the provider said it, and a conversation that did not continue what the user
@@ -869,6 +1007,7 @@ impl AgentSessionProjection {
                     attached_provider_session_id.as_deref(),
                     *forked,
                 ) {
+                    self.record_lost_turn(seq);
                     self.active_turn_id = None;
                     self.assistant_message_open = false;
                     self.denials_before_their_call.clear();
@@ -883,12 +1022,14 @@ impl AgentSessionProjection {
                 }
             }
             AgentDomainEvent::SessionUnavailable { reason } => {
+                self.record_lost_turn(seq);
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
                 self.denials_before_their_call.clear();
                 self.status = ProjectionStatus::Unavailable { reason: reason.clone() };
             }
             AgentDomainEvent::SessionClosed { reason } => {
+                self.record_lost_turn(seq);
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
                 self.denials_before_their_call.clear();
@@ -1068,6 +1209,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         });
         assert!(p.denials_before_their_call.is_empty());
         p.apply(&started("toolu_never"));
@@ -1115,6 +1257,7 @@ mod tests {
                     result_text: String::new(),
                     stop_reason: None,
                     usage: None,
+                    detail: Default::default(),
                 },
             ),
             (

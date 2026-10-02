@@ -154,6 +154,7 @@ describe("phaseOf", () => {
       result_text: "",
       stop_reason: null,
       usage: null,
+      detail: { reason: null, api_error_status: null, message: null },
     });
     state = applyEvent(state, { type: "user_prompt_submitted", text: "never mind, do X" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
@@ -182,6 +183,7 @@ describe("phaseOf", () => {
       result_text: "",
       stop_reason: null,
       usage: null,
+      detail: { reason: null, api_error_status: null, message: null },
     });
     state = applyEvent(state, { type: "user_prompt_submitted", text: "do X instead" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
@@ -203,6 +205,7 @@ describe("phaseOf", () => {
       result_text: "",
       stop_reason: null,
       usage: null,
+      detail: { reason: null, api_error_status: null, message: null },
     });
     state = applyEvent(state, { type: "user_prompt_submitted", text: "never mind, do X" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t2" });

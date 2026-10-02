@@ -4704,6 +4704,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         }
     }
 
@@ -6945,6 +6946,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         });
         until("the turn ends", || {
             set.pump(&dir, true);
@@ -7111,6 +7113,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         });
         provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
         for i in 0..300 {

@@ -776,7 +776,7 @@ describe("the band's usage segment", () => {
   const TWO = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
   const REPORT: UsageInfo = { total_cost_usd: 0.042, num_turns: null, tokens: { input: 1000, output: 3300, cache_creation: 0, cache_read: 0 }, model: null };
   const turnDone = (usage: UsageInfo | null, turn = "t1"): AgentDomainEvent => ({
-    type: "turn_completed", turn_id: turn, outcome: "completed", result_text: "", stop_reason: null, usage,
+    type: "turn_completed", turn_id: turn, outcome: "completed", result_text: "", stop_reason: null, usage, detail: { reason: null, api_error_status: null, message: null },
   });
   const usageText = (container: HTMLElement) => container.querySelector(".band-usage")?.textContent ?? null;
 
@@ -908,7 +908,7 @@ describe("slash command pickers", () => {
     sendBareCommand(container, "/model");
     events(
       { type: "turn_started", turn_id: "t1" },
-      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
     );
     const picker = container.querySelector(".slash-picker")!;
     expect(picker).not.toBeNull();
@@ -925,7 +925,7 @@ describe("slash command pickers", () => {
     sendBareCommand(container, "/model");
     events(
       { type: "turn_started", turn_id: "t1" },
-      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
     );
     const sentBefore = posted.filter((m) => m.type === "send_message").length;
     fireEvent.keyDown(container.querySelector(".slash-picker")!, { key: "Escape" });
@@ -939,7 +939,7 @@ describe("slash command pickers", () => {
     expect(lastOfType("send_message")!.text).toBe("/effort");
     events(
       { type: "turn_started", turn_id: "t1" },
-      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: EFFORT_REPLY, stop_reason: null, usage: null },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: EFFORT_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
     );
     const picker = container.querySelector(".slash-picker")!;
     expect(picker).not.toBeNull();
@@ -961,6 +961,7 @@ describe("slash command pickers", () => {
         result_text: "I don't understand that command.",
         stop_reason: null,
         usage: null,
+        detail: { reason: null, api_error_status: null, message: null },
       },
     );
     expect(container.querySelector(".slash-picker")).toBeNull();
@@ -972,7 +973,7 @@ describe("slash command pickers", () => {
     expect(lastOfType("send_message")!.text).toBe("/model sonnet");
     events(
       { type: "turn_started", turn_id: "t1" },
-      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
     );
     // The reply to `/model sonnet` never arms a picker: only a BARE send does.
     expect(container.querySelector(".slash-picker")).toBeNull();
@@ -984,7 +985,7 @@ describe("slash command pickers", () => {
   describe("the picker and the other overlays", () => {
     const REPLY = (): AgentDomainEvent[] => [
       { type: "turn_started", turn_id: "t1" },
-      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
     ];
     const CHOOSER = {
       kind: "chooser",
@@ -1055,7 +1056,7 @@ describe("slash command pickers", () => {
   describe("the picker drops a waiting prefix, count or leader sequence", () => {
     const REPLY = (): AgentDomainEvent[] => [
       { type: "turn_started", turn_id: "t1" },
-      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
     ];
     const root = (container: HTMLElement) => container.querySelector<HTMLElement>(".agent-ui-conversation")!;
     const current = (container: HTMLElement) => container.querySelector(".row-current .row-body")?.textContent ?? null;
@@ -1142,7 +1143,7 @@ describe("slash command pickers", () => {
       sendBareCommand(container, "/model");
       events(
         { type: "turn_started", turn_id: "t1" },
-        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
       );
       expect(container.querySelector(".slash-picker")).not.toBeNull();
       dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, TAB2] });
@@ -1166,7 +1167,7 @@ describe("slash command pickers", () => {
           { type: "turn_started", turn_id: "t2" },
           // Shaped exactly like a `/model` reply, on purpose: the point of this test is that a
           // stale ref would open a picker here even though tab 2 never sent a bare `/model` at all.
-          { type: "turn_completed", turn_id: "t2", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+          { type: "turn_completed", turn_id: "t2", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
         ],
       });
       expect(container.querySelector(".slash-picker")).toBeNull();
@@ -1223,7 +1224,7 @@ describe("the in-flight motion indicator's elapsed clock", () => {
     events({ type: "turn_started", turn_id: "t1" });
     events({
       type: "turn_completed", turn_id: "t1", outcome: "completed",
-      result_text: "", stop_reason: null, usage: null,
+      result_text: "", stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null },
     });
     expect(container.querySelector(".turn-activity")).toBeNull();
     events({ type: "turn_started", turn_id: "t2" });
@@ -3808,7 +3809,7 @@ describe("v1: typing never answers a card", () => {
       { type: "turn_started", turn_id: "t1" },
       { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "rm build" } },
       { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: { command: "rm build" } },
-      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
     ];
     dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
     expect(rendered.container.querySelector(".slash-picker")).not.toBeNull();
@@ -4930,7 +4931,7 @@ describe("App global HINT: the panel's half", () => {
     function reply() {
       events(
         { type: "turn_started", turn_id: "t1" },
-        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
       );
     }
     /** `idle()`, then a bare `/model` sent from INPUT, left in BROWSE with the keys on the root. */
@@ -12073,7 +12074,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
       fromRevision: 9,
       throughRevision: 11,
       events: [
-        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "", stop_reason: "end_turn", usage: null },
+        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "", stop_reason: "end_turn", usage: null, detail: { reason: null, api_error_status: null, message: null } },
         { type: "user_prompt_submitted", text: "a queued prompt" },
       ],
     });
@@ -12604,7 +12605,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
       throughRevision: 5,
       events: [
         { type: "turn_started", turn_id: "t1" },
-        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
       ],
     });
     expect(container.querySelector(".slash-picker"), "no picker opened over the region").toBeNull();
@@ -12656,7 +12657,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
         throughRevision: 5,
         events: [
           { type: "turn_started", turn_id: "t1" },
-          { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+          { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
         ],
       });
       const picker = container.querySelector<HTMLElement>(".slash-picker")!;

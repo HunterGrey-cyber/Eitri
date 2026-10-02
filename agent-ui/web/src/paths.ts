@@ -52,6 +52,7 @@ export function pathsIn(item: TimelineItem): PathRef[] {
     case "message":
       return prosePaths(item.text);
     case "run":
+    case "ending":
       return [];
   }
 }
@@ -80,5 +81,7 @@ export function viewText(item: TimelineItem): { title: string; text: string } {
       return { title: `${item.request.toolName} request`, text: primaryText(item) };
     case "run":
       return { title: "tool calls", text: primaryText(item) };
+    case "ending":
+      return { title: "turn ending", text: primaryText(item) };
   }
 }

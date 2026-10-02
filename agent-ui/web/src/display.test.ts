@@ -131,3 +131,12 @@ describe("runKeyOf (zc)", () => {
     expect(runKeyOf(base, opts, "t-5")).toBe("r-4");
   });
 });
+
+describe("a turn ending in a run of finished calls", () => {
+  it("is never folded into the run: the run stops at it, on both sides", () => {
+    const ending: TimelineItem = { kind: "ending", seq: 4, key: "e-4", ending: { seq: 4, turnId: "t", kind: "failed", reason: null, apiErrorStatus: null, message: null } };
+    const items = [tool(call(1, "Read")), tool(call(2, "Read")), tool(call(3, "Read")), ending, tool(call(5, "Read")), tool(call(6, "Read"))];
+    expect(buildDisplay(items, opts).map((i) => i.kind)).toEqual(["run", "ending", "run"]);
+    expect(buildDisplay(items, { ...opts, detailed: true }).map((i) => i.kind)).toEqual(items.map((i) => i.kind));
+  });
+});

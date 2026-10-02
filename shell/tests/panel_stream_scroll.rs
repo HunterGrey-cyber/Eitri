@@ -468,6 +468,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
                 result_text: String::new(),
                 stop_reason: Some("end_turn".into()),
                 usage: None,
+                detail: Default::default(),
             },
         ] {
             projection.apply(&event);
@@ -601,6 +602,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
             result_text: String::new(),
             stop_reason: Some("end_turn".into()),
             usage: None,
+            detail: Default::default(),
         }],
         &mut steps,
     );

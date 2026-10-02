@@ -368,6 +368,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         }]);
         assert!(trace.is_finished());
         assert!(
@@ -400,6 +401,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         }]);
         assert!(!trace.is_complete(), "waiting for a paint report");
         let turn = trace.submitted_at();
@@ -437,6 +439,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         }]);
         assert!(
             trace.is_complete(),
@@ -463,6 +466,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         }]);
         assert!(
             trace.is_finished(),
@@ -482,6 +486,7 @@ mod tests {
             result_text: String::new(),
             stop_reason: None,
             usage: None,
+            detail: Default::default(),
         }]);
         assert!(!trace.is_complete(), "the paint of text sent as events is still owed");
     }

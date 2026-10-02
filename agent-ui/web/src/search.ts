@@ -1,4 +1,5 @@
 import type { TimelineItem } from "./timeline";
+import { turnEndingText } from "./turnEnding";
 import { formatResultContent } from "./toolRegistry";
 
 /** Text `/` matches in a row, including content the row can show when expanded. */
@@ -15,6 +16,8 @@ export function rowSearchText(item: TimelineItem): string {
       ].join("\n");
     case "permission":
       return [item.request.toolName, JSON.stringify(item.request.input)].join("\n");
+    case "ending":
+      return turnEndingText(item.ending);
     case "run":
       // Search each folded call's name and input, since a collapsed run shows no invocation of its
       // own. This lets `/bash` find the run while it is collapsed.

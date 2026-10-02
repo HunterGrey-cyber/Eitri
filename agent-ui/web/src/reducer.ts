@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, ProviderPrompt, ToolCallRecord, WireProviderPrompt } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, ProviderPrompt, Seq, ToolCallRecord, TurnEnding, WireProviderPrompt } from "./types";
 
 /** The state before any snapshot arrives. `backend` defaults to "legacy" only because something
  * must be written here -- the real value always arrives with `hello` (before any session can exist)
@@ -22,6 +22,8 @@ export function initialState(): AgentUiState {
     capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
     provider: null,
     usage: null,
+    turnEndings: [],
+    lastTurnEnding: null,
     history: null,
     assistantMessageOpen: false,
     nextSeq: 0,
@@ -33,6 +35,18 @@ export function initialState(): AgentUiState {
 /** How many refusals that arrived ahead of their call a state holds at once; the same cap as
  * Rust's `MAX_HELD_DENIALS`, so a refusal naming a call that never comes cannot pile up. */
 export const MAX_HELD_DENIALS = 64;
+
+/** The "lost" ending, for an event that ends the session: when a turn was still running, no
+ *  `turn_completed` is ever coming for it, so the transcript would show a reply that just stops. This
+ *  pushes one turn-ending row for it, with the event's own `seq`, and the band's `lastTurnEnding` says
+ *  so. With no turn running there is nothing to report (a failed turn already ended before the session
+ *  did: that turn has its own row and this adds none). MUST stay identical to
+ *  `AgentSessionProjection::apply`, which does the same on the same three events. */
+function withLostTurn(state: AgentUiState, seq: Seq): AgentUiState {
+  if (state.activeTurnId === null) return state;
+  const ending: TurnEnding = { seq, turnId: state.activeTurnId, kind: "lost", reason: null, apiErrorStatus: null, message: null };
+  return { ...state, turnEndings: [...state.turnEndings, ending], lastTurnEnding: "lost" };
+}
 
 /** `r` on an ended session (or any other in-panel "start over"): drops back to the start screen.
  *
@@ -98,7 +112,9 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         assistantMessageOpen: false,
       };
     case "turn_started":
-      return { ...state, activeTurnId: event.turn_id, assistantMessageOpen: false };
+      // A new turn is newer news than however the last one ended: the band stops saying it. The row
+      // already in the transcript stays where it is.
+      return { ...state, activeTurnId: event.turn_id, assistantMessageOpen: false, lastTurnEnding: null };
     case "assistant_message_boundary":
       // Two messages with no tool call between them are two entries, as `AgentSessionProjection`
       // folds them (the phase-3 GUI pass, 2026-09-25).
@@ -197,13 +213,29 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // Rust sends `permission_resolved` when `AgentSession::respond_permission` or `interrupt()`
       // resolves the request. Remove the card from this event so its lifetime follows Rust state.
       return { ...state, pendingPermissions: state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id) };
-    case "turn_completed":
+    case "turn_completed": {
       // Clear the in-flight turn on `turn_completed`. Finishing a turn does not end the
       // conversation; `session_closed` and `session_unavailable` do. Match
       // `AgentSessionProjection::apply` when updating usage: replace the entire figure because the
       // SDK reports a running total that `/clear` can reset. A lower report is valid. A turn with
-      // no usage report keeps the last figure; missing data must not erase it or become zero.
-      return { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage, denialsBeforeTheirCall: [] };
+      // no usage report keeps the last figure; missing data must not erase it or become zero. A
+      // failed, limited or interrupted turn also leaves a row with the provider's explanation and
+      // updates the band until the next turn starts. A completed turn adds no ending row. Keep this
+      // behavior identical to `AgentSessionProjection::apply`. Use a fallback for absent `detail`
+      // so an event without it still produces a row.
+      const done = { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage, denialsBeforeTheirCall: [] };
+      if (event.outcome === "completed") return done;
+      const detail = event.detail ?? { reason: null, api_error_status: null, message: null };
+      const ending: TurnEnding = {
+        seq,
+        turnId: event.turn_id,
+        kind: event.outcome,
+        reason: detail.reason ?? null,
+        apiErrorStatus: detail.api_error_status ?? null,
+        message: detail.message ?? null,
+      };
+      return { ...done, turnEndings: [...state.turnEndings, ending], lastTurnEnding: event.outcome };
+    }
     // Both endings clear activeTurnId, mirroring AgentSessionProjection exactly: no turn_completed
     // is ever coming, so leaving it set leaves App.tsx's turnInProgress true forever -- a spinner
     // on a dead session, next to a reply that may be truncated. Clearing it is not a local guess at
@@ -217,7 +249,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // returns a different id.
       if (resumeAttached(event)) return state;
       return {
-        ...state,
+        ...withLostTurn(state, seq),
         activeTurnId: null,
         status: { kind: "unavailable", reason: describeFailedResume(event) },
         assistantMessageOpen: false,
@@ -226,7 +258,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
     }
     case "session_unavailable":
       return {
-        ...state,
+        ...withLostTurn(state, seq),
         activeTurnId: null,
         status: { kind: "unavailable", reason: event.reason },
         assistantMessageOpen: false,
@@ -234,7 +266,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       };
     case "session_closed":
       return {
-        ...state,
+        ...withLostTurn(state, seq),
         activeTurnId: null,
         status: { kind: "closed", reason: event.reason },
         assistantMessageOpen: false,
@@ -378,8 +410,18 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
   // because earlier thinking does not imply current activity. Resync or reload may degrade
   // `thinking` to `sent` but must not invent activity. Take `usage` from this tab's snapshot so a
   // tab with no report cannot retain the previous tab's figure. Default an absent key to `null`,
-  // which `usageSegment` treats as unknown; `undefined` would throw.
-  return { ...snapshot, usage: snapshot.usage ?? null, nextSeq: throughRevision, turnThinking: false, denialsBeforeTheirCall: [] };
+  // which `usageSegment` treats as unknown; `undefined` would throw. Restore `turnEndings` and
+  // `lastTurnEnding` from the snapshot, defaulting absent keys to `[]` and `null`, so reload
+  // preserves ending rows and the band's status.
+  return {
+    ...snapshot,
+    usage: snapshot.usage ?? null,
+    turnEndings: snapshot.turnEndings ?? [],
+    lastTurnEnding: snapshot.lastTurnEnding ?? null,
+    nextSeq: throughRevision,
+    turnThinking: false,
+    denialsBeforeTheirCall: [],
+  };
 }
 
 /** Whether `resume_outcome` confirms the requested session. Share this predicate with

@@ -177,6 +177,7 @@ fn completed(turn: &str) -> AgentDomainEvent {
         result_text: String::new(),
         stop_reason: None,
         usage: None,
+        detail: Default::default(),
     }
 }
 
