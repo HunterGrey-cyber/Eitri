@@ -49,7 +49,7 @@ pub use draft::{
 pub use flow::{saved_to_undo, show_hunk, undo_to_saved, Out, ReviewFlow};
 pub use journal::{Journal, JournalEntry, JournalNote};
 pub use lifecycle::{
-    DiffJob, JobEvent, JobHook, Overview, OverviewFile, OverviewJob, ReviewDiff, ReviewError, ReviewHint,
+    DiffJob, JobEvent, JobHook, LeftOutSides, Overview, OverviewFile, OverviewJob, ReviewDiff, ReviewError, ReviewHint,
     ReviewOptions, Scope, Snap, TurnRecord, TurnRef, TurnReview, TurnState, MAX_OVERVIEW_DIFF_LINES,
 };
 pub use message::{compose, Preview};
@@ -60,8 +60,8 @@ pub use revert::{
     Saved, UndoJob, BUFFER_STATE_LUA,
 };
 pub use shadow::{
-    review_dir_for, Entry, EntryKind, Limits, Shadow, ShadowError, ShadowLock, Snapshot, SnapshotKind, SnapshotLabel,
-    SnapshotOutcome, SnapshotRef, TurnMarks,
+    review_dir_for, Entry, EntryKind, FilePrint, LeftOut, Limits, Shadow, ShadowError, ShadowLock, Snapshot,
+    SnapshotKind, SnapshotLabel, SnapshotOutcome, SnapshotRef, TurnMarks,
 };
 pub use write::{
     decide_mode, read_current, replace, write_mode, Content, Current, FsHooks, InPlaceWhy, ProjectDir, Stage, Target,

@@ -32,7 +32,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -155,14 +155,20 @@ impl SnapshotLabel {
 /// What a snapshot's message says after its label: when it finished, and every file it left out for
 /// its size. A later run rebuilds a turn from its refs alone, and without these it would date a
 /// late baseline wrongly and show a file left out of one snapshot as added or deleted.
-fn snapshot_message(label: &SnapshotLabel, taken_ms: u64, skipped_large: &[PathBuf]) -> String {
+fn snapshot_message(label: &SnapshotLabel, taken_ms: u64, skipped_large: &[(PathBuf, Option<FilePrint>)]) -> String {
     let mut message = label.to_message();
     message.push_str(&format!("taken: {taken_ms}\n"));
-    for path in skipped_large {
+    for (path, print) in skipped_large {
         // Hex, because a file name may hold a line break or bytes that are not UTF-8.
+        let name = hex_encode(path.as_os_str().as_bytes());
         message.push_str("skipped-large: ");
-        message.push_str(&hex_encode(path.as_os_str().as_bytes()));
+        message.push_str(&name);
         message.push('\n');
+        // A line of its own, so a reader from before it existed still finds every `skipped-large`
+        // line it knows and ignores this one.
+        if let Some(print) = print {
+            message.push_str(&format!("skipped-print: {name} {}\n", print.to_field()));
+        }
     }
     message
 }
@@ -184,6 +190,84 @@ fn parse_skipped_large(message: &str) -> Vec<PathBuf> {
         .map(|bytes| PathBuf::from(OsString::from_vec(bytes)))
         .collect()
 }
+
+/// The files a snapshot's message says it left out for their size, each with the print it was
+/// taken with. A message from before prints were kept has none, so each file reads as one whose
+/// change cannot be ruled out; a `skipped-print` line that does not decode is dropped the same way.
+fn parse_left_out(message: &str) -> LeftOut {
+    let mut prints: BTreeMap<PathBuf, FilePrint> = BTreeMap::new();
+    for line in message.lines() {
+        let Some(rest) = line.strip_prefix("skipped-print: ") else {
+            continue;
+        };
+        let Some((name, fields)) = rest.split_once(' ') else {
+            continue;
+        };
+        if let (Some(name), Some(print)) = (hex_decode(name), FilePrint::from_field(fields)) {
+            prints.insert(PathBuf::from(OsString::from_vec(name)), print);
+        }
+    }
+    parse_skipped_large(message)
+        .into_iter()
+        .map(|path| {
+            let print = prints.get(&path).copied();
+            (path, print)
+        })
+        .collect()
+}
+
+/// What can be compared about a file without reading its bytes: its size, when its content and its
+/// inode last changed, and which inode it is. A snapshot keeps one for each file it leaves out for
+/// its size, so a later review can tell a file that was left out of both of a turn's snapshots and
+/// did not change from one that did. A write changes the modification time, and nothing a program
+/// can do without privileges sets the change time back; a replacement by rename changes the inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilePrint {
+    pub len: u64,
+    pub mtime: (i64, i64),
+    pub ctime: (i64, i64),
+    pub ino: u64,
+}
+
+impl FilePrint {
+    pub fn of(meta: &std::fs::Metadata) -> FilePrint {
+        FilePrint {
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+            ino: meta.ino(),
+        }
+    }
+
+    /// The print of `relative` under `work_tree` as it is now; `None` for a path that is not there
+    /// or not a regular file. Never follows a final symlink.
+    pub fn of_path(work_tree: &Path, relative: &Path) -> Option<FilePrint> {
+        let meta = work_tree.join(relative).symlink_metadata().ok()?;
+        meta.is_file().then(|| FilePrint::of(&meta))
+    }
+
+    fn to_field(self) -> String {
+        format!(
+            "{} {} {} {} {} {}",
+            self.len, self.mtime.0, self.mtime.1, self.ctime.0, self.ctime.1, self.ino
+        )
+    }
+
+    fn from_field(text: &str) -> Option<FilePrint> {
+        let mut parts = text.split(' ');
+        let print = FilePrint {
+            len: parts.next()?.parse().ok()?,
+            mtime: (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?),
+            ctime: (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?),
+            ino: parts.next()?.parse().ok()?,
+        };
+        parts.next().is_none().then_some(print)
+    }
+}
+
+/// The files one snapshot left out for their size, with the print each was taken with, `None` where
+/// the snapshot's record has none (one written before prints were kept).
+pub type LeftOut = BTreeMap<PathBuf, Option<FilePrint>>;
 
 pub(super) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -260,6 +344,8 @@ pub struct Snapshot {
     pub reference: String,
     /// Files over [`Limits::max_file_bytes`], relative to the work tree: left out of the tree.
     pub skipped_large: Vec<PathBuf>,
+    /// The same files with the print each had when the snapshot was taken.
+    pub left_out: LeftOut,
 }
 
 /// What a path is in a snapshot, as [`Shadow::read_entry`] reads it.
@@ -297,6 +383,8 @@ pub struct SnapshotRef {
     pub taken_ms: Option<u64>,
     /// The files the snapshot left out for their size, as its message lists them.
     pub skipped_large: Vec<PathBuf>,
+    /// The same files with their prints, where the message has them.
+    pub left_out: LeftOut,
     /// For a `marks` ref: what it says about its turn.
     pub marks: Option<TurnMarks>,
 }
@@ -642,7 +730,7 @@ impl Shadow {
         // left; left in place, it would fail every later snapshot of the session.
         remove_if_present(&lock_file_of(&index))?;
         self.sync_excludes_until(deadline)?;
-        let (tree, skipped_large) = match self.write_tree(&index, limits, deadline) {
+        let (tree, skipped) = match self.write_tree(&index, limits, deadline) {
             Ok(done) => done,
             // An index can point at objects a collection has since removed (a snapshot that never
             // got its ref, an hour or more ago); starting from an empty index rebuilds it.
@@ -654,7 +742,7 @@ impl Shadow {
         };
         let mut commit = self.git(None);
         commit.args(["commit-tree", &tree, "-F", "-"]);
-        let message = snapshot_message(label, wall_clock_ms(), &skipped_large);
+        let message = snapshot_message(label, wall_clock_ms(), &skipped);
         let commit = self.run_ok("commit-tree", commit, Some(message.as_bytes()), deadline)?;
         let commit = String::from_utf8_lossy(git::trim_newline(&commit.stdout)).into_owned();
         let reference = format!("refs/eitri/{session}/{}/{}", label.turn, label.kind.as_str());
@@ -668,7 +756,8 @@ impl Shadow {
             commit,
             tree,
             reference,
-            skipped_large,
+            skipped_large: skipped.iter().map(|(path, _)| path.clone()).collect(),
+            left_out: skipped.into_iter().collect(),
         })
     }
 
@@ -726,7 +815,7 @@ impl Shadow {
         index: &Path,
         limits: &Limits,
         deadline: Instant,
-    ) -> Result<(String, Vec<PathBuf>), ShadowError> {
+    ) -> Result<(String, Vec<(PathBuf, Option<FilePrint>)>), ShadowError> {
         let mut list = self.git(Some(index));
         list.args(["ls-files", "-z", "--others", "--modified", "--exclude-standard"]);
         let listed = self.run_ok("ls-files", list, None, deadline)?;
@@ -739,6 +828,7 @@ impl Shadow {
         }
 
         let mut large: Vec<&[u8]> = Vec::new();
+        let mut prints: Vec<FilePrint> = Vec::new();
         let mut left_out: Vec<&[u8]> = Vec::new();
         for entry in &entries {
             if let Some(dir) = entry.strip_suffix(b"/") {
@@ -753,6 +843,7 @@ impl Shadow {
             if let Ok(meta) = path.symlink_metadata() {
                 if meta.is_file() && meta.len() > limits.max_file_bytes {
                     large.push(entry);
+                    prints.push(FilePrint::of(&meta));
                 }
             }
         }
@@ -793,7 +884,8 @@ impl Shadow {
         let tree = String::from_utf8_lossy(git::trim_newline(&tree.stdout)).into_owned();
         let skipped = large
             .iter()
-            .map(|p| PathBuf::from(OsString::from_vec(p.to_vec())))
+            .zip(prints)
+            .map(|(p, print)| (PathBuf::from(OsString::from_vec(p.to_vec())), Some(print)))
             .collect();
         Ok((tree, skipped))
     }
@@ -1061,6 +1153,7 @@ impl Shadow {
                 label: SnapshotLabel::parse(&message),
                 taken_ms: parse_taken(&message),
                 skipped_large: parse_skipped_large(&message),
+                left_out: parse_left_out(&message),
                 marks: TurnMarks::parse(&message),
             });
         }
@@ -1454,7 +1547,17 @@ mod tests {
             time_ms: 5,
         };
         let odd = PathBuf::from(OsString::from_vec(b"big\nname\xff.bin".to_vec()));
-        let skipped = vec![PathBuf::from("assets/huge.bin"), odd];
+        let print = FilePrint {
+            len: 9 * 1024 * 1024,
+            mtime: (1_790_000_000, 123_456_789),
+            ctime: (1_790_000_001, 5),
+            ino: 4242,
+        };
+        let skipped = vec![
+            (PathBuf::from("assets/huge.bin"), Some(print)),
+            (odd.clone(), Some(FilePrint { ino: 7, ..print })),
+            (PathBuf::from("no-print.bin"), None),
+        ];
         let message = snapshot_message(&label, 1_790_000_000_123, &skipped);
         assert_eq!(
             SnapshotLabel::parse(&message),
@@ -1462,12 +1565,35 @@ mod tests {
             "the label still reads back"
         );
         assert_eq!(parse_taken(&message), Some(1_790_000_000_123));
-        assert_eq!(parse_skipped_large(&message), skipped);
+        assert_eq!(
+            parse_skipped_large(&message),
+            vec![PathBuf::from("assets/huge.bin"), odd, PathBuf::from("no-print.bin")]
+        );
+        assert_eq!(parse_left_out(&message), skipped.iter().cloned().collect::<LeftOut>());
         assert_eq!(TurnMarks::parse(&message), None);
         // A message from before these lines existed reads as nothing taken, nothing left out.
         let old = SnapshotLabel::parse(&message).unwrap().to_message();
         assert_eq!(parse_taken(&old), None);
         assert!(parse_skipped_large(&old).is_empty());
+        assert!(parse_left_out(&old).is_empty());
+    }
+
+    #[test]
+    fn a_message_from_before_prints_were_kept_lists_its_files_without_one() {
+        let message = format!(
+            "kind: base\nturn: 1\nturn-id: t1\ntab: 1\ntime: 5\ntaken: 9\nskipped-large: {}\n",
+            hex_encode(b"huge.txt")
+        );
+        assert_eq!(
+            parse_left_out(&message),
+            LeftOut::from([(PathBuf::from("huge.txt"), None)])
+        );
+        // A print line that does not read back is dropped, not guessed at.
+        let torn = format!("{message}skipped-print: {} 1 2 3\n", hex_encode(b"huge.txt"));
+        assert_eq!(
+            parse_left_out(&torn),
+            LeftOut::from([(PathBuf::from("huge.txt"), None)])
+        );
     }
 
     #[test]
@@ -1486,6 +1612,7 @@ mod tests {
             label: None,
             taken_ms: None,
             skipped_large: Vec::new(),
+            left_out: LeftOut::new(),
             marks: None,
         };
         let marks_ref = reference("refs/eitri/s1/4/marks");
