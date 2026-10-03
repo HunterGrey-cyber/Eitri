@@ -21,8 +21,13 @@ use agent::{AgentDomainEvent, AgentSession, CONSERVATIVE_DISALLOWED_TOOLS};
 
 fn main() {
     let project_dir = std::env::current_dir().expect("cwd");
-    let mut session = AgentSession::start(&project_dir, CONSERVATIVE_DISALLOWED_TOOLS)
-        .expect("failed to spawn `claude` -- is it installed and on PATH?");
+    // Trusted: the demo drives the real CLI on a project you point it at, with that project's own configuration.
+    let mut session = AgentSession::start(
+        &project_dir,
+        CONSERVATIVE_DISALLOWED_TOOLS,
+        agent::setting_sources::ProjectTrust::Trusted,
+    )
+    .expect("failed to spawn `claude` -- is it installed and on PATH?");
 
     println!("== agent v2 demo ==\n");
 

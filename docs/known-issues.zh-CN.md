@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=870b262cdb8ed0dcc0d9fa45740ad759d28045a276ce748d117cddf834552b57 -->
+<!-- translated-from: known-issues.md sha256=1a66315bf7ba2ee229403043b469674d83bf11a21a4c7deda3e87ead1ea0c1ad -->
 
 # 已知问题与限制
 
@@ -43,7 +43,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 
 ## 安全
 
-- **还没有「是否信任此工作区」这一步。** 终端里的 Claude Code 会先问你是否信任这个文件夹，再运行它自带的配置；Eitri 目前不问。一个项目里的 agent 会话会加载这个项目自己的 `.claude/settings.json`、`.claude/settings.local.json` 和 `.mcp.json`，所以一个不是你写的仓库，可以在你发出第一条消息时、在任何权限卡片出现之前，以你的身份启动它自己的 hook 和 MCP server，它自己的 allow 规则也可能直接回答本来要询问的调用。在这一步做出来之前，请先看一眼 `.claude/` 和 `.mcp.json`，再用 Eitri 打开你不熟悉的仓库。`agent.user_settings = false` 改变不了这一点，它只是不加载你自己的用户设置。
+- **Eitri 会先问一句，再加载项目自己的 Claude 配置，这一步有它的限度。** 在你信任一个项目之前，它的 agent 会话只加载你自己的用户设置，不加载项目里的 `.claude/settings.json`、`.claude/settings.local.json`、`.mcp.json` 和 `CLAUDE.md`，所以一个不是你写的仓库，没法在你发出第一条消息时启动它自己的 hook 和 MCP server，也没法预先批准工具调用。这个提问会列出找到的内容和确切的命令。信任按项目记住，并且和你看到的内容绑定：`.claude/`、`.mcp.json` 或 `CLAUDE.md` 有任何改动，Eitri 都会再问一次，包括终端里的 `claude` 做的改动（它的「不再询问」会改写 `settings.local.json`）。Eitri 不会导入终端 `claude` 自己的信任答案，所以你在终端里已经信任过的项目，在这里还会问一次。Eitri 检查不了的文件（超过 4 MiB、读不出来、管道，或者符号链接）会在提问里点名，你的回答只管这一次启动。hook 调用的、在 `.claude/` 之外的脚本，只通过 hook 的命令文本得到信任，所以信任一个项目，就是信任它的代码可以运行，和构建它一样。在真正的终端里继续一个对话，运行的是普通的 `claude`，适用它自己的信任提问。想忘掉所有回答，删掉 `~/.local/state/eitri/trust/`。
 - **底部终端可以写你的剪贴板，这是有意为之。** 在那里运行的程序可以用 OSC 52 转义序列设置剪贴板或主选区（和 Alacritty 的默认行为一样）；发生时 Eitri 不会提示，所以你接下来粘贴的内容可能不是你复制的。读取剪贴板则会被拒绝。
 - **agent 面板的脚本策略是新的，只在测试里检查过，还没有在每一种环境的屏幕上看过。** 面板现在只允许自己的那段脚本（按哈希），不再允许任意内联脚本。如果更新后 agent 面板一直是空白，请连同你的 WebKitGTK 版本一起报告。
 

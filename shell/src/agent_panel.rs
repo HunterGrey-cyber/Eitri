@@ -22,6 +22,8 @@
 //! **The WebView draws only the active tab.** A background tab's events feed its attention and mark
 //! it stale (`TabSet::pump`); a switch always sends the new active tab's full snapshot.
 
+use crate::trust_gate::{AnswerOutcome, CommandAnswer, GateEvent, Route, TrustGate};
+use agent::setting_sources::ProjectTrust;
 use eitri_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
 use eitri_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_confirm_restore_for_js, serialize_error_for_js,
@@ -33,8 +35,8 @@ use eitri_core::layout::Direction;
 use eitri_core::saved_tabs::{SavedTabs, TabMemory};
 use eitri_core::tab_restore::{RestoreOffer, RestorePolicy, RestoreRun};
 use eitri_core::tab_set::{
-    BypassPolicy, FirstTurn, PendingHandoff, PendingStart, RestoreGo, RestorePrompt, RestoreStep, ResumeRoute,
-    StartCollected, Tab, TabBackend,
+    AwaitingTrust, BypassPolicy, DeferredStart, FirstTurn, PendingHandoff, PendingStart, RestoreGo, RestorePrompt,
+    RestoreStep, ResumeRoute, StartCollected, Tab, TabBackend,
 };
 use eitri_core::tabs::TabId;
 use gtk4::prelude::*;
@@ -374,6 +376,8 @@ impl Retiring {
                 owed.push(pending.request_id);
                 self.connects.push(pending.result_rx);
             }
+            // Nothing was spawned, so there is nothing to stop; the command that asked is owed an answer.
+            TabBackend::AwaitingTrust(waiting) => owed.extend(waiting.start.request_id().map(str::to_owned)),
             TabBackend::NotStarted | TabBackend::Failed { .. } => {}
         }
         owed
@@ -566,6 +570,40 @@ struct AgentPanelState {
     last_restore_offered: bool,
     /// Where a restore's one-line result goes: `main.rs`'s window toast.
     toast_hook: Option<ToastHook>,
+    /// Whether a session about to start may load the project's own Claude configuration, and the
+    /// question that decides it. Every start goes through it (`start_deferred`).
+    trust: TrustGate,
+    /// What starts a session's backend: the real connect workers, or a test's stand-in.
+    spawner: Spawner,
+}
+
+/// How [`start_deferred`] begins a session.
+enum Spawner {
+    /// The connect workers (`spawn_connect`, `resume_spawner`).
+    Real,
+    /// A test's stand-in, told what would have been spawned.
+    #[cfg(test)]
+    Fake(Rc<RefCell<FakeSpawn>>),
+}
+
+/// A test's stand-in spawner: given what would have been started, the receiver its result arrives on.
+#[cfg(test)]
+type FakeSpawn = dyn FnMut(SpawnCall) -> mpsc::Receiver<Result<AgentBackend, BackendError>>;
+
+/// What a test's [`Spawner::Fake`] is asked to start.
+#[cfg(test)]
+enum SpawnCall {
+    /// A fresh session, or a resume by hand (`resume`).
+    Connect {
+        resume: Option<String>,
+        project: ProjectTrust,
+    },
+    /// One tab of a restore, with the lease already taken for it.
+    Resume {
+        id: String,
+        lease: agent::lease::SessionLease,
+        project: ProjectTrust,
+    },
 }
 
 /// [`AgentPanelState::toast_hook`]: shows one line in the window's toast.
@@ -675,7 +713,8 @@ impl AgentPanelHandle {
             match tab.backend {
                 TabBackend::Live(backend) => backends.push(backend),
                 TabBackend::Starting(pending) => watch_connect_holding_the_application(app, pending.result_rx),
-                TabBackend::NotStarted | TabBackend::Failed { .. } => {}
+                // A start still waiting for the trust question has spawned nothing.
+                TabBackend::NotStarted | TabBackend::AwaitingTrust(_) | TabBackend::Failed { .. } => {}
             }
         }
         tear_down_all_holding_the_application(app, "every session tab's teardown", backends);
@@ -1742,7 +1781,10 @@ fn panel_state(
     for note in notes {
         eprintln!("{note}");
     }
+    let trust = trust_gate_for(state_home.as_deref(), home.as_deref(), &canonical_root);
     AgentPanelState {
+        trust,
+        spawner: Spawner::Real,
         tabs,
         tab_memory: TabMemory::new(tabs_dir, project_dir.clone()),
         conversation_id: agent::conversation_id_for_cwd(&canonical_root),
@@ -1791,6 +1833,14 @@ fn panel_state(
         nav_fallthrough_hook: None,
         crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
     }
+}
+
+/// The window's trust gate over `root` (canonical), its record kept under the state home by the rule
+/// every other store follows. Touches no disk: the gate's worker does all of that.
+fn trust_gate_for(state_home: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>, root: &Path) -> TrustGate {
+    let store = eitri_core::project_trust::TrustStore::new(state_home, home);
+    let home = home.map(PathBuf::from).filter(|home| home.is_absolute());
+    TrustGate::new(store, root.to_path_buf(), home)
 }
 
 /// The panel's single main-loop tick, over EVERY tab (spec §3.1). Three jobs, in order:
@@ -1971,6 +2021,8 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         poll_scratch_edits(&state, &webview);
         poll_review_jobs(&state, &webview);
         poll_review_flow(&state, &webview);
+        // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
+        poll_trust(&state, &webview);
         send_tabs_if_changed(&state, &webview);
         remember_tabs(&state);
         send_hello_if_open_sessions_changed(&state, &webview);
@@ -2293,10 +2345,17 @@ fn apply_flush(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: Tab
     send_queue(state, webview, tab);
 }
 
-/// `tabs`, then the active tab's own state (ruling 18: always, not only when stale).
+/// `tabs`, then the active tab's own state (always, not only when stale), and the trust
+/// question again when the tab on screen waits for one: routing away took the old one off. A
+/// `:trust` question goes with any move, answered as not trusted.
 fn switch_payloads(state: &mut AgentPanelState) -> Vec<String> {
+    state.trust.drop_command_prompt();
     let mut payloads = vec![tabs_payload_recorded(state)];
     payloads.extend(state.tabs.active_state_payloads());
+    if state.trust.current_route() == Some(Route::Ask) {
+        let active = state.tabs.active();
+        payloads.extend(reroute_or_ask(state, active).payloads);
+    }
     payloads
 }
 
@@ -2385,29 +2444,40 @@ enum RestoreResult {
     Question(RestorePrompt),
     /// Every saved tab that could be has been started or skipped. `notice` is what the band says.
     Started { notice: Option<String> },
+    /// Cleared to start, and waiting for the trust question: `start_deferred` starts it.
+    Deferred,
 }
 
 /// Begins one resume: given a session and the lease already taken for it, the receiver its result
 /// will arrive on.
-type SpawnResume<'a> =
-    &'a mut dyn FnMut(&str, agent::lease::SessionLease) -> mpsc::Receiver<Result<AgentBackend, BackendError>>;
+type SpawnResume<'a> = &'a mut dyn FnMut(
+    &str,
+    agent::lease::SessionLease,
+    ProjectTrust,
+) -> mpsc::Receiver<Result<AgentBackend, BackendError>>;
 
-/// A restore's resumes, as the real workers start them.
+/// A restore's resumes, as the real workers start them. Only [`start_deferred`] calls it.
 fn resume_spawner(
     state: &AgentPanelState,
-) -> impl FnMut(&str, agent::lease::SessionLease) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
+) -> impl FnMut(&str, agent::lease::SessionLease, ProjectTrust) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (kind, project_dir) = (state.backend_kind, state.project_dir.clone());
-    move |id, lease| spawn_connect_holding(kind, project_dir.clone(), Some(id.to_string()), Some(lease))
+    move |id, lease, project| {
+        spawn_connect_holding(kind, project_dir.clone(), Some(id.to_string()), Some(lease), project)
+    }
 }
 
 /// Asks for the last window's tabs back, into `from` (the empty tab the key was pressed in) and new
-/// tabs. Nothing is started unless this window has started nothing yet.
-fn ask_for_restore(state: &mut AgentPanelState, from: TabId, ask: RestoreAsk, spawn: SpawnResume<'_>) -> RestoreResult {
+/// tabs. Nothing is started unless this window has started nothing yet; what is cleared waits for the
+/// trust question before anything is leased or started.
+fn ask_for_restore(state: &mut AgentPanelState, from: TabId, ask: RestoreAsk) -> RestoreResult {
     if state.backend_kind != BackendKind::Sidecar {
         return RestoreResult::Refused("only the sidecar backend can resume sessions".to_string());
     }
     if state.restore_run.is_some() {
         return RestoreResult::Refused("the last session's tabs are already being restored".to_string());
+    }
+    if restore_waits_for_trust(state) {
+        return RestoreResult::Refused("the last session's tabs are waiting for the trust question".to_string());
     }
     if !state.tabs.is_pristine() {
         return RestoreResult::Refused(
@@ -2432,30 +2502,55 @@ fn ask_for_restore(state: &mut AgentPanelState, from: TabId, ask: RestoreAsk, sp
     };
     match state.tabs.begin_restore(plan, policy) {
         RestoreStep::Confirm(prompt) => RestoreResult::Question(prompt),
-        RestoreStep::Go(go) => start_restore(state, from, go, spawn),
+        RestoreStep::Go(go) => gate_restore(state, from, go),
     }
 }
 
+/// Whether a cleared restore is holding a tab while the trust question is asked.
+fn restore_waits_for_trust(state: &AgentPanelState) -> bool {
+    state.tabs.tabs().iter().any(|t| {
+        matches!(
+            t.backend,
+            TabBackend::AwaitingTrust(AwaitingTrust {
+                start: DeferredStart::Restore { .. },
+                ..
+            })
+        )
+    })
+}
+
 /// `y` or `n` to the question [`ask_for_restore`] raised.
-fn answer_restore_question(
-    state: &mut AgentPanelState,
-    nonce: u64,
-    keep_bypass: bool,
-    spawn: SpawnResume<'_>,
-) -> RestoreResult {
+fn answer_restore_question(state: &mut AgentPanelState, nonce: u64, keep_bypass: bool) -> RestoreResult {
     match state.tabs.answer_restore(nonce, keep_bypass) {
         Err(why) => RestoreResult::Refused(why),
         Ok(go) => {
             let from = state.tabs.active();
-            start_restore(state, from, go, spawn)
+            gate_restore(state, from, go)
         }
+    }
+}
+
+/// A restore the bypass question (if any) has cleared waits in `from` for the trust question. It holds
+/// no lease while it waits: those are taken when it starts, so a question left unanswered blocks no
+/// other window.
+fn gate_restore(state: &mut AgentPanelState, from: TabId, go: RestoreGo) -> RestoreResult {
+    match gate_start(state, from, DeferredStart::Restore { go }) {
+        Ok(()) => RestoreResult::Deferred,
+        Err(why) => RestoreResult::Refused(why),
     }
 }
 
 /// Takes every lease first and only then starts the resumes, so that nothing -- a record pruned to
 /// make room for another session, another window -- can claim a saved session between the decision
-/// and its own resume. A session whose lease cannot be taken is skipped with the reason.
-fn start_restore(state: &mut AgentPanelState, from: TabId, go: RestoreGo, spawn: SpawnResume<'_>) -> RestoreResult {
+/// and its own resume. A session whose lease cannot be taken is skipped with the reason. Every resumed
+/// tab is given `project`: they all share the window's root, so one answer covers them.
+fn start_restore(
+    state: &mut AgentPanelState,
+    from: TabId,
+    go: RestoreGo,
+    spawn: SpawnResume<'_>,
+    project: ProjectTrust,
+) -> RestoreResult {
     let canonical = state.canonical_project_dir.clone();
     let mut leases: std::collections::HashMap<String, Result<agent::lease::SessionLease, String>> = go
         .session_ids()
@@ -2471,10 +2566,19 @@ fn start_restore(state: &mut AgentPanelState, from: TabId, go: RestoreGo, spawn:
         .collect();
     let (downgraded, asked) = (go.downgraded, go.asked);
     let run = state.tabs.start_restore(from, go, |id| match leases.remove(id) {
-        Some(Ok(lease)) => Ok(spawn(id, lease)),
+        Some(Ok(lease)) => Ok(spawn(id, lease, project)),
         Some(Err(reason)) => Err(reason),
         None => Err("it was listed twice".to_string()),
     });
+    // The tabs this restore just set connecting are the only starting ones without their tiers:
+    // every other start names them as it begins.
+    for tab in state.tabs.tabs().iter().map(|t| t.id).collect::<Vec<_>>() {
+        if let Some(t) = state.tabs.get_mut(tab) {
+            if matches!(t.backend, TabBackend::Starting(_)) && t.project_tiers.is_none() {
+                t.project_tiers = Some(project);
+            }
+        }
+    }
     state.restore_source = None;
     state.restore_run = Some(run);
     let notice = (downgraded > 0 && !asked).then(|| {
@@ -2527,24 +2631,422 @@ fn deliver_restore(
             finish_restore(state);
             Ok(())
         }
+        // The tab shows as starting while the question is asked; the tick's trust events go on.
+        RestoreResult::Deferred => {
+            send_tabs(state, webview);
+            Ok(())
+        }
     }
 }
 
 /// `agent.restore = "auto"`: on the first page that says `ready`, bring the last window's tabs back
 /// with no key pressed. Used up on its first go, so a reload of the page does not do it again.
 fn restore_at_launch(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
-    let result = {
-        let mut state_ref = state.borrow_mut();
-        if state_ref.restore_policy != RestorePolicy::Auto || state_ref.restore_source.is_none() {
-            return;
-        }
-        let from = state_ref.tabs.active();
-        let mut spawn = resume_spawner(&state_ref);
-        ask_for_restore(&mut state_ref, from, RestoreAsk::Launch, &mut spawn)
+    let Some(result) = launch_restore(&mut state.borrow_mut()) else {
+        return;
     };
     if let Err(why) = deliver_restore(state, webview, result) {
         eprintln!("[restore] not restored: {why}");
     }
+}
+
+/// The state half of [`restore_at_launch`]: `None` when the launch restores nothing.
+fn launch_restore(state: &mut AgentPanelState) -> Option<RestoreResult> {
+    if state.restore_policy != RestorePolicy::Auto || state.restore_source.is_none() {
+        return None;
+    }
+    let from = state.tabs.active();
+    Some(ask_for_restore(state, from, RestoreAsk::Launch))
+}
+
+/// What a trust step owes the page and the window: payloads to dispatch in order, a toast, and
+/// what a restore it started has to say.
+#[derive(Default)]
+struct TrustOut {
+    payloads: Vec<String>,
+    toast: Option<String>,
+    /// A restore was started: its one-line result for the band (`None` when it has nothing to say),
+    /// sent after the payloads, and then whether it is already over is checked.
+    restored: Option<Option<String>>,
+}
+
+impl TrustOut {
+    fn extend(&mut self, other: TrustOut) {
+        self.payloads.extend(other.payloads);
+        if other.toast.is_some() {
+            self.toast = other.toast;
+        }
+        if other.restored.is_some() {
+            self.restored = other.restored;
+        }
+    }
+
+    fn push(&mut self, payload: String) {
+        self.payloads.push(payload);
+    }
+}
+
+/// Dispatches a [`TrustOut`] once the state is no longer borrowed.
+fn deliver_trust(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, out: TrustOut) {
+    dispatch_all(webview, out.payloads);
+    if let Some(toast) = out.toast {
+        let hook = state.borrow().toast_hook.clone();
+        if let Some(hook) = hook {
+            hook(&toast);
+        }
+    }
+    if let Some(notice) = out.restored {
+        if let Some(notice) = notice {
+            evaluate_js_dispatch(webview, &eitri_core::agent_bridge::serialize_notice_for_js(&notice));
+        }
+        finish_restore(state);
+    }
+}
+
+/// Seconds since the epoch, for when a project was trusted.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Puts a session start off until the gate has checked the project: the tab holds what was asked
+/// for, and nothing is spawned or leased until the check (and, when it must, the user) says how.
+fn gate_start(state: &mut AgentPanelState, tab: TabId, start: DeferredStart) -> Result<(), String> {
+    state.tabs.defer_start(tab, start)?;
+    state.trust.wait_for(tab);
+    state.trust.begin_check();
+    Ok(())
+}
+
+/// Starts a session the gate let through, with the tiers it was given. The one place a session's
+/// backend is begun: a first message, a resume by hand and a restore all come here, after the trust
+/// check, so none of them can load the project's own configuration unasked.
+fn start_deferred(state: &mut AgentPanelState, tab: TabId, start: DeferredStart, project: ProjectTrust) -> TrustOut {
+    let mut out = TrustOut::default();
+    if state.tabs.get(tab).is_none() {
+        return out;
+    }
+    // A question the tab may still have had on screen is spent: the tab is starting.
+    state.trust.hide(tab);
+    let (kind, project_dir) = (state.backend_kind, state.project_dir.clone());
+    match start {
+        DeferredStart::FirstSend { request_id, first_turn } => {
+            let result_rx = match &state.spawner {
+                Spawner::Real => spawn_connect(kind, project_dir, None, project),
+                #[cfg(test)]
+                Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::Connect { resume: None, project }),
+            };
+            let t = state.tabs.get_mut(tab).expect("checked above");
+            t.project_tiers = Some(project);
+            t.backend = TabBackend::Starting(PendingStart {
+                request_id,
+                result_rx,
+                first_turn: Some(first_turn),
+                resume: None,
+                resumed_title: None,
+                resumed_name: None,
+            });
+            // The `command_result` is owed once the connect finishes and the first turn is sent
+            // (`collect_pending_starts`).
+            out.push(tabs_payload_recorded(state));
+        }
+        DeferredStart::Resume {
+            request_id,
+            provider_session_id,
+            resumed_title,
+            resumed_name,
+        } => {
+            let resume = Some(provider_session_id.clone());
+            let result_rx = match &state.spawner {
+                Spawner::Real => spawn_connect(kind, project_dir, resume, project),
+                #[cfg(test)]
+                Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::Connect { resume, project }),
+            };
+            let t = state.tabs.get_mut(tab).expect("checked above");
+            t.project_tiers = Some(project);
+            t.backend = TabBackend::Starting(PendingStart {
+                request_id,
+                result_rx,
+                first_turn: None,
+                resume: Some(provider_session_id),
+                resumed_title,
+                resumed_name,
+            });
+            // The command_result is owed once the connect finishes.
+            if state.tabs.active() == tab {
+                out.payloads.extend(switch_payloads(state));
+            } else {
+                out.push(tabs_payload_recorded(state));
+            }
+        }
+        DeferredStart::Restore { go } => {
+            let result = match &state.spawner {
+                Spawner::Real => {
+                    let mut spawn = resume_spawner(state);
+                    start_restore(state, tab, go, &mut spawn, project)
+                }
+                #[cfg(test)]
+                Spawner::Fake(fake) => {
+                    let fake = fake.clone();
+                    let mut spawn = move |id: &str, lease, project| {
+                        (fake.borrow_mut())(SpawnCall::Resume {
+                            id: id.to_string(),
+                            lease,
+                            project,
+                        })
+                    };
+                    start_restore(state, tab, go, &mut spawn, project)
+                }
+            };
+            out.payloads.extend(switch_payloads(state));
+            out.restored = Some(match result {
+                RestoreResult::Started { notice } => notice,
+                _ => None,
+            });
+        }
+    }
+    out
+}
+
+/// A tab waiting for the trust question, given what the gate knows now: started if the answer is
+/// already known, asked if it is on screen and its question is not, left waiting otherwise. Does
+/// nothing while its check or its record is still out.
+fn reroute_or_ask(state: &mut AgentPanelState, tab: TabId) -> TrustOut {
+    let mut out = TrustOut::default();
+    let asking = match state.tabs.get(tab).map(|t| &t.backend) {
+        Some(TabBackend::AwaitingTrust(AwaitingTrust {
+            recording: false,
+            asking,
+            ..
+        })) => *asking,
+        _ => return out,
+    };
+    if state.trust.is_waiting(tab) {
+        return out;
+    }
+    match state.trust.current_route() {
+        None => {}
+        Some(Route::Start(project)) => {
+            if let Some(start) = state.tabs.take_deferred(tab) {
+                out.extend(start_deferred(state, tab, start, project));
+            }
+        }
+        Some(Route::Ask) => {
+            if asking.is_some_and(|nonce| state.trust.is_shown(tab, nonce)) {
+                return out;
+            }
+            if state.tabs.active() != tab || !state.document_ready {
+                // Asked when it is next on screen.
+                state.trust.hide(tab);
+                return out;
+            }
+            let Ok(nonce) = state.tabs.ask_trust(tab) else {
+                return out;
+            };
+            if let Some(view) = state.trust.show(tab, nonce) {
+                out.push(eitri_core::agent_bridge::serialize_trust_prompt_for_js(&view));
+            }
+        }
+    }
+    out
+}
+
+/// [`reroute_or_ask`] for every waiting tab, in tab order.
+fn sweep_awaiting(state: &mut AgentPanelState) -> TrustOut {
+    let mut out = TrustOut::default();
+    for tab in state.tabs.awaiting_trust() {
+        out.extend(reroute_or_ask(state, tab));
+    }
+    out
+}
+
+/// The tick's half of the gate: what its worker finished, acted on. Never blocks.
+fn trust_events(state: &mut AgentPanelState) -> TrustOut {
+    use eitri_core::agent_bridge::{serialize_notice_for_js, serialize_trust_prompt_for_js};
+    let mut out = TrustOut::default();
+    for event in state.trust.poll() {
+        match event {
+            GateEvent::Route(tab, Route::Start(project)) => {
+                if let Some(start) = state.tabs.take_deferred(tab) {
+                    out.extend(start_deferred(state, tab, start, project));
+                }
+            }
+            // Asked by the sweep below, which knows whether the tab is on screen.
+            GateEvent::Route(_, Route::Ask) | GateEvent::Reask(_) => {}
+            GateEvent::Recorded { tab, notice } => {
+                if let Some(start) = state.tabs.take_recorded(tab) {
+                    out.extend(start_deferred(state, tab, start, ProjectTrust::Trusted));
+                    if let Some(notice) = notice {
+                        out.push(serialize_notice_for_js(&notice));
+                    }
+                }
+            }
+            GateEvent::RecordRefused { tab, notice } => {
+                out.push(serialize_notice_for_js(&notice));
+                // The `y` is spent; the tab waits for a new answer, asked by the sweep below.
+                if state.tabs.ask_trust(tab).is_ok() {
+                    state.trust.hide(tab);
+                }
+            }
+            GateEvent::CommandAsk { request_id, tab } => {
+                let shown = (state.tabs.active() == tab && state.document_ready)
+                    .then(|| state.trust.show_command(tab, &request_id))
+                    .flatten();
+                match shown {
+                    Some(view) => out.push(serialize_trust_prompt_for_js(&view)),
+                    // The tab is not on screen any more: `:trust` is answered on the next poll.
+                    None => state.trust.drop_command_prompt(),
+                }
+            }
+            GateEvent::CommandDone { request_id, ok, notice } => {
+                if let Some(notice) = &notice {
+                    out.push(serialize_notice_for_js(notice));
+                }
+                let error = notice.as_deref().unwrap_or(crate::trust_gate::NOT_TRUSTED);
+                out.push(serialize_command_result_for_js(
+                    &request_id,
+                    if ok { Ok(()) } else { Err(error) },
+                ));
+            }
+        }
+    }
+    out.extend(sweep_awaiting(state));
+    out
+}
+
+/// Drains the gate from the tick.
+fn poll_trust(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let out = trust_events(&mut state.borrow_mut());
+    deliver_trust(state, webview, out);
+}
+
+/// `y` or `n` to a trust question, a tab's or `:trust`'s. Only checks and queues: a `y` starts its
+/// session when the worker says the disk is unchanged since the prompt (and the record written, when
+/// one is kept), never here.
+fn answer_trust(
+    state: &mut AgentPanelState,
+    request_id: &str,
+    tab: TabId,
+    nonce: u64,
+    fingerprint: &str,
+    findings_digest: &str,
+    trust: bool,
+) -> TrustOut {
+    use eitri_core::agent_bridge::serialize_notice_for_js;
+    let mut out = TrustOut::default();
+    let now = now_unix();
+    if state.tabs.check_trust_answer(tab, nonce).is_ok() {
+        match state.trust.answer(tab, nonce, fingerprint, findings_digest, trust, now) {
+            AnswerOutcome::Start(project, notice) => {
+                let Ok(start) = state.tabs.take_answered(tab, nonce) else {
+                    out.push(serialize_command_result_for_js(
+                        request_id,
+                        Err(crate::trust_gate::NOT_CURRENT),
+                    ));
+                    return out;
+                };
+                out.extend(start_deferred(state, tab, start, project));
+                if let Some(notice) = notice {
+                    out.push(serialize_notice_for_js(&notice));
+                }
+                out.push(serialize_command_result_for_js(request_id, Ok(())));
+                // The window's answer may cover the other tabs waiting for it.
+                out.extend(sweep_awaiting(state));
+            }
+            AnswerOutcome::Recording => {
+                let marked = state.tabs.mark_recording(tab, nonce);
+                out.push(serialize_command_result_for_js(
+                    request_id,
+                    marked.as_ref().map(|_| ()).map_err(String::as_str),
+                ));
+            }
+            AnswerOutcome::Refused(why) => {
+                out.push(serialize_notice_for_js(&why));
+                out.push(serialize_command_result_for_js(request_id, Err(&why)));
+                // Asked again with what is on disk now, or started if there is nothing left to ask.
+                out.extend(reroute_or_ask(state, tab));
+            }
+        }
+        return out;
+    }
+    if state.tabs.active() == tab && state.trust.is_command_prompt(tab, nonce) {
+        match state
+            .trust
+            .answer_command(tab, nonce, fingerprint, findings_digest, trust, now)
+        {
+            Some(CommandAnswer::Done {
+                request_id: command,
+                ok,
+                notice,
+            }) => {
+                if let Some(notice) = &notice {
+                    out.push(serialize_notice_for_js(notice));
+                }
+                let error = notice.as_deref().unwrap_or(crate::trust_gate::NOT_TRUSTED);
+                out.push(serialize_command_result_for_js(
+                    &command,
+                    if ok { Ok(()) } else { Err(error) },
+                ));
+                out.push(serialize_command_result_for_js(request_id, Ok(())));
+            }
+            Some(CommandAnswer::Recording) => out.push(serialize_command_result_for_js(request_id, Ok(()))),
+            None => out.push(serialize_command_result_for_js(
+                request_id,
+                Err(crate::trust_gate::NOT_CURRENT),
+            )),
+        }
+        return out;
+    }
+    out.push(serialize_command_result_for_js(
+        request_id,
+        Err(crate::trust_gate::NOT_CURRENT),
+    ));
+    out
+}
+
+/// `Escape` on a trust question: the start is put off. A first message goes back to the composer; a
+/// resume or a restore is dropped and the toast says so. Nothing was leased, so nothing is released.
+fn cancel_trust_question(state: &mut AgentPanelState, request_id: &str, tab: TabId, nonce: u64) -> TrustOut {
+    use crate::trust_gate::{NOT_CURRENT, NOT_STARTED, NOT_TRUSTED, PUT_OFF};
+    let mut out = TrustOut::default();
+    if state.tabs.check_trust_answer(tab, nonce).is_err() {
+        if state.tabs.active() == tab {
+            if let Some(command) = state.trust.cancel_command(tab, nonce) {
+                out.push(serialize_command_result_for_js(&command, Err(NOT_TRUSTED)));
+                out.push(serialize_command_result_for_js(request_id, Ok(())));
+                return out;
+            }
+        }
+        out.push(serialize_command_result_for_js(request_id, Err(NOT_CURRENT)));
+        return out;
+    }
+    let Ok(start) = state.tabs.cancel_trust(tab, nonce) else {
+        out.push(serialize_command_result_for_js(request_id, Err(NOT_CURRENT)));
+        return out;
+    };
+    state.trust.hide(tab);
+    out.push(tabs_payload_recorded(state));
+    match start {
+        DeferredStart::FirstSend {
+            request_id: sent,
+            first_turn,
+        } => {
+            // The refused send first: the page puts a refused message back in its box itself, so
+            // the draft that follows only confirms it rather than adding it a second time.
+            state.tabs.set_draft(tab, &first_turn.typed);
+            out.push(serialize_command_result_for_js(&sent, Err(NOT_STARTED)));
+            out.push(eitri_core::agent_bridge::serialize_draft_for_js(tab, &first_turn.typed));
+        }
+        DeferredStart::Resume { request_id: asked, .. } => {
+            out.push(serialize_command_result_for_js(&asked, Err(PUT_OFF)));
+            out.toast = Some(PUT_OFF.to_string());
+        }
+        DeferredStart::Restore { .. } => out.toast = Some(PUT_OFF.to_string()),
+    }
+    out.push(serialize_command_result_for_js(request_id, Ok(())));
+    out
 }
 
 /// Keeps the saved-tabs file in step with the tabs: once per tick, cheap when nothing changed.
@@ -2606,6 +3108,8 @@ fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
                 .as_ref()
                 .map(|d| eitri_core::permission_store::path(d, &state.project_dir))
                 .as_deref(),
+            &state.trust.row(),
+            state.trust.next_session_trust(),
         ),
         None => Vec::new(),
     };
@@ -2644,7 +3148,8 @@ fn chooser_records(
         .collect()
 }
 
-/// `prefix i`'s rows for one tab, in spec §3.3's order, `—` for anything unknown.
+/// `prefix i`'s rows for one tab, in the order they are shown, `—` for anything unknown. `trust_row` is the
+/// window's latest trust check in words, and `next` the tiers a session started now would get.
 ///
 /// `provider_session_id()` is read into a local BEFORE `projection()` is taken: on the sidecar path
 /// both lock the same ingestion mutex (the 2026-09-15 GTK freeze; `tab_set`'s module doc).
@@ -2654,6 +3159,8 @@ fn detail_rows(
     account: Option<&str>,
     project_dir: &Path,
     rules_file: Option<&Path>,
+    trust_row: &str,
+    next: ProjectTrust,
 ) -> Vec<DetailRow> {
     const UNKNOWN: &str = "—";
     let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
@@ -2696,7 +3203,7 @@ fn detail_rows(
         BackendKind::Sidecar => "yes",
         BackendKind::Legacy => "no (legacy backend)",
     };
-    let rows: [(&str, String); 19] = [
+    let rows: [(&str, String); 20] = [
         ("name", known(tab.name.clone())),
         ("title", known(tab.title.clone())),
         ("state", tab.wire_state().as_str().to_string()),
@@ -2712,8 +3219,17 @@ fn detail_rows(
         ("verdandi session", known(session_id)),
         ("claude session", known(provider_session_id)),
         ("CLI", known(cli)),
-        // R13: a fact about every session on either backend, so it is drawn on an empty tab too.
-        ("settings", agent::setting_sources::note().to_string()),
+        // A fact about every session on either backend, so it is drawn on an empty tab too: a
+        // started tab says what its session was given, an empty one what its next would get.
+        (
+            "settings",
+            agent::setting_sources::note_for_session(
+                agent::setting_sources::loads_user_settings(),
+                tab.project_tiers.unwrap_or(next),
+            )
+            .to_string(),
+        ),
+        ("trust", trust_row.to_string()),
         ("Verdandi revision", known(revision)),
         ("resumable", resumable.to_string()),
         ("created", known(record.as_ref().map(|r| r.created_at.clone()))),
@@ -2736,8 +3252,9 @@ fn spawn_connect(
     kind: BackendKind,
     project_dir: PathBuf,
     resume: Option<String>,
+    project: ProjectTrust,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
-    spawn_connect_holding(kind, project_dir, resume, None)
+    spawn_connect_holding(kind, project_dir, resume, None, project)
 }
 
 /// [`spawn_connect`] for a resume whose session lease is already held: the worker hands it to the
@@ -2747,10 +3264,11 @@ fn spawn_connect_holding(
     project_dir: PathBuf,
     resume: Option<String>,
     lease: Option<agent::lease::SessionLease>,
+    project: ProjectTrust,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = AgentBackend::start_holding(kind, &project_dir, resume.as_deref(), lease);
+        let result = AgentBackend::start_holding(kind, &project_dir, resume.as_deref(), lease, project);
         // The receiver is gone only if the tab or the panel was torn down mid-connect; dropping
         // the backend here is then the cleanup (`Retiring` normally holds the receiver instead).
         let _ = result_tx.send(result);
@@ -3594,27 +4112,31 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 state_ref.review_flow.document_ready(&state_ref.tabs)
             };
             dispatch_review_outs(state, webview, owed);
+            // A fresh document has no trust question on screen: the tab waiting for one is asked
+            // again, and a fresh check gives `prefix i` its row.
+            let asked = {
+                let mut state_ref = state.borrow_mut();
+                let state_ref = &mut *state_ref;
+                state_ref.trust.drop_command_prompt();
+                let active = state_ref.tabs.active();
+                state_ref.trust.hide(active);
+                state_ref.trust.begin_check();
+                reroute_or_ask(state_ref, active)
+            };
+            deliver_trust(state, webview, asked);
             // `agent.restore = "auto"`: only once the page can take what it starts.
             restore_at_launch(state, webview);
         }
         InboundMessage::RestoreLast { .. } => {
             let tab = tab_of(target);
-            let result = {
-                let mut state_ref = state.borrow_mut();
-                let mut spawn = resume_spawner(&state_ref);
-                ask_for_restore(&mut state_ref, tab, RestoreAsk::Dashboard, &mut spawn)
-            };
+            let result = ask_for_restore(&mut state.borrow_mut(), tab, RestoreAsk::Dashboard);
             match deliver_restore(state, webview, result) {
                 Ok(()) => ok(webview),
                 Err(why) => refuse(webview, &why),
             }
         }
         InboundMessage::RestoreAnswer { nonce, keep_bypass, .. } => {
-            let result = {
-                let mut state_ref = state.borrow_mut();
-                let mut spawn = resume_spawner(&state_ref);
-                answer_restore_question(&mut state_ref, nonce, keep_bypass, &mut spawn)
-            };
+            let result = answer_restore_question(&mut state.borrow_mut(), nonce, keep_bypass);
             match deliver_restore(state, webview, result) {
                 Ok(()) => ok(webview),
                 Err(why) => refuse(webview, &why),
@@ -3628,7 +4150,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             state.borrow_mut().tabs.note_sent(tab);
             enum Plan {
                 Sent(Result<Vec<agent::AgentDomainEvent>, BackendError>),
-                Starting,
+                Defer(FirstTurn),
                 Refused(&'static str),
             }
             let plan = {
@@ -3640,8 +4162,6 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 // the user typed it.
                 let composed =
                     eitri_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
-                let kind = state_ref.backend_kind;
-                let project_dir = state_ref.project_dir.clone();
                 let t = state_ref.tabs.get_mut(tab).expect("resolved above");
                 if t.pending_handoff.is_some() {
                     // Starting here would spawn a second `claude` alongside the one still being
@@ -3659,22 +4179,14 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                             t.turn_trace = trace;
                             Plan::Sent(outcome)
                         }
-                        TabBackend::NotStarted => {
-                            let result_rx = spawn_connect(kind, project_dir, None);
-                            t.backend = TabBackend::Starting(PendingStart {
-                                request_id: request_id.clone(),
-                                result_rx,
-                                first_turn: Some(FirstTurn {
-                                    wire: composed,
-                                    typed: text.clone(),
-                                }),
-                                resume: None,
-                                resumed_title: None,
-                                resumed_name: None,
-                            });
-                            Plan::Starting
-                        }
+                        // The session waits for the trust check (and, when it must, the question)
+                        // before anything is spawned.
+                        TabBackend::NotStarted => Plan::Defer(FirstTurn {
+                            wire: composed,
+                            typed: text.clone(),
+                        }),
                         TabBackend::Starting(_) => Plan::Refused("the session is still starting"),
+                        TabBackend::AwaitingTrust(_) => Plan::Refused("waiting for the trust question"),
                         TabBackend::Failed { .. } => Plan::Refused("this tab's session failed; press r to start over"),
                     }
                 }
@@ -3687,8 +4199,17 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     apply_command_outcome(state, webview, tab, &request_id, outcome);
                 }
                 // The `command_result` is owed once the connect finishes and the first turn is
-                // sent (`collect_pending_starts`).
-                Plan::Starting => send_tabs(state, webview),
+                // sent (`collect_pending_starts`), or when the question is put off.
+                Plan::Defer(first_turn) => {
+                    let start = DeferredStart::FirstSend {
+                        request_id: request_id.clone(),
+                        first_turn,
+                    };
+                    match gate_start(&mut state.borrow_mut(), tab, start) {
+                        Ok(()) => send_tabs(state, webview),
+                        Err(why) => refuse(webview, &why),
+                    }
+                }
                 Plan::Refused(why) => refuse(webview, why),
             }
         }
@@ -3715,7 +4236,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 }
                 ResumeRoute::Refuse(why) => refuse(webview, &why),
                 ResumeRoute::StartIn(target_tab) => {
-                    {
+                    let deferred = {
                         let mut state_ref = state.borrow_mut();
                         let state_ref = &mut *state_ref;
                         let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
@@ -3728,26 +4249,25 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                             .find(|r| r.provider_session_id == provider_session_id)
                             .map(|r| (r.title.clone(), r.name.clone()))
                             .unwrap_or_default();
-                        let kind = state_ref.backend_kind;
-                        let project_dir = state_ref.project_dir.clone();
-                        let t = state_ref
-                            .tabs
-                            .get_mut(target_tab)
-                            .expect("route_resume names a tab it has");
-                        let result_rx = spawn_connect(kind, project_dir, Some(provider_session_id.clone()));
-                        t.backend = TabBackend::Starting(PendingStart {
+                        // The resume waits for the trust check like a first message: a resumed
+                        // session loads the project's configuration only as a new one would.
+                        let start = DeferredStart::Resume {
                             request_id: request_id.clone(),
-                            result_rx,
-                            first_turn: None,
-                            resume: Some(provider_session_id),
+                            provider_session_id,
                             resumed_title,
                             resumed_name,
-                        });
+                        };
+                        let deferred = gate_start(state_ref, target_tab, start);
                         // A new tab is already selected by `route_resume`; this is for the record.
                         state_ref.tabs.select(target_tab);
+                        deferred
+                    };
+                    match deferred {
+                        // The command_result is owed once the connect finishes, or when the question
+                        // is put off.
+                        Ok(()) => send_switch(state, webview),
+                        Err(why) => refuse(webview, &why),
                     }
-                    // The command_result is owed once the connect finishes.
-                    send_switch(state, webview);
                 }
             }
         }
@@ -3945,11 +4465,26 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         InboundMessage::ResetTab { .. } => {
             let tab = tab_of(target);
             let before = state.borrow().tabs.attention();
+            // A start put off for the trust question owes its command an answer; read before the
+            // reset drops it.
+            let owed = match state.borrow().tabs.get(tab).map(|t| &t.backend) {
+                Some(TabBackend::AwaitingTrust(waiting)) => waiting.start.request_id().map(str::to_owned),
+                _ => None,
+            };
             let reset = state.borrow_mut().tabs.reset(tab);
             match reset {
                 Ok(old) => {
                     if let Some(old) = old {
                         state.borrow_mut().retiring.backend(old);
+                    }
+                    state.borrow_mut().trust.forget_tab(tab);
+                    // Before the draft the reset carries: the page puts a refused message back in
+                    // its box itself, and the draft that follows then only confirms it.
+                    if let Some(owed) = owed {
+                        evaluate_js_dispatch(
+                            webview,
+                            &serialize_command_result_for_js(&owed, Err(crate::trust_gate::NOT_STARTED)),
+                        );
                     }
                     let payloads = {
                         let mut state_ref = state.borrow_mut();
@@ -4297,6 +4832,40 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 refuse(webview, "not a web link");
             }
         },
+        // `y`/`n` to a trust question. Only checked and queued here: no disk is touched, and a `y`
+        // starts its session from the tick, once the worker found the disk unchanged (and wrote the
+        // record, when one is kept).
+        InboundMessage::TrustAnswer {
+            nonce,
+            fingerprint,
+            findings_digest,
+            trust,
+            ..
+        } => {
+            let tab = tab_of(target);
+            let out = answer_trust(
+                &mut state.borrow_mut(),
+                &request_id,
+                tab,
+                nonce,
+                &fingerprint,
+                &findings_digest,
+                trust,
+            );
+            deliver_trust(state, webview, out);
+        }
+        InboundMessage::TrustCancel { nonce, .. } => {
+            let tab = tab_of(target);
+            let out = cancel_trust_question(&mut state.borrow_mut(), &request_id, tab, nonce);
+            deliver_trust(state, webview, out);
+        }
+        // `:trust` / `:untrust`: queued for the gate's worker; the notice and this command's
+        // `command_result` come from the tick when it is done.
+        InboundMessage::TrustCommand { action, .. } => {
+            let mut state_ref = state.borrow_mut();
+            let active = state_ref.tabs.active();
+            state_ref.trust.command(request_id.clone(), action, active);
+        }
         // R07/S2, Task 3: `y`/`Y` to the band's bypass prompt. D11's typed-input guard (the 250ms
         // `TYPING_GUARD_MS` rule, cancelling on every route away) is enforced client-side (spec
         // §3.4) -- this only re-validates the facts §3.3 names (the nonce, the active tab, exactly
@@ -4564,6 +5133,8 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: TabId
                 if let Some(removed) = state_ref.tabs.remove(tab) {
                     owed = state_ref.retiring.tab(removed);
                 }
+                // Its question goes with it: a record still being written for it starts nothing.
+                state_ref.trust.forget_tab(tab);
             }
         }
     }
@@ -4868,7 +5439,7 @@ mod tests {
 
     fn live_backend(dir: &std::path::Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = agent::AgentConversation::create(provider.clone(), dir).unwrap();
+        let conversation = agent::AgentConversation::create(provider.clone(), dir, ProjectTrust::Untrusted).unwrap();
         (provider, AgentBackend::Sidecar(Box::new(conversation)))
     }
 
@@ -5105,7 +5676,16 @@ mod tests {
             restore_run: None,
             last_restore_offered: false,
             toast_hook: None,
+            // No worker and no disk: every start goes on untrusted, as for a root with nothing to
+            // trust. A test about the question puts a real gate in its place.
+            trust: TrustGate::without_worker(PathBuf::new()),
+            spawner: spawn_nothing(),
         }))
+    }
+
+    /// A spawner whose every start fails at once (its sender is gone), so no test starts a process.
+    fn spawn_nothing() -> Spawner {
+        Spawner::Fake(Rc::new(RefCell::new(|_call: SpawnCall| mpsc::channel().1)))
     }
 
     /// `review.enabled` and `review.hint` reach the panel's state: enabled installs a review and the hint
@@ -6137,6 +6717,8 @@ mod tests {
             None,
             std::path::Path::new("/p"),
             Some(rules),
+            "not checked yet",
+            ProjectTrust::Untrusted,
         );
         let value = |label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
         assert_eq!(value("queued"), "1");
@@ -6147,6 +6729,8 @@ mod tests {
             None,
             std::path::Path::new("/p"),
             None,
+            "not checked yet",
+            ProjectTrust::Untrusted,
         );
         assert_eq!(rows.iter().find(|r| r.label == "permission rules").unwrap().value, "—");
     }
@@ -6242,6 +6826,8 @@ mod tests {
             Some("work"),
             std::path::Path::new("/p"),
             None,
+            "not checked yet",
+            ProjectTrust::Untrusted,
         );
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         for want in [
@@ -6275,7 +6861,10 @@ mod tests {
         // What every session loads. The value is the sentence `build_create_request` and the legacy
         // spawn are held to, not a copy of it, and the row sits right after the CLI it describes.
         let settings = rows.iter().find(|r| r.label == "settings").unwrap();
-        assert_eq!(settings.value, agent::setting_sources::note());
+        assert_eq!(
+            settings.value,
+            agent::setting_sources::note_for_session(true, ProjectTrust::Untrusted)
+        );
         let position = |label: &str| labels.iter().position(|l| *l == label).unwrap();
         assert_eq!(position("settings"), position("CLI") + 1, "{labels:?}");
     }
@@ -6286,12 +6875,25 @@ mod tests {
     fn the_settings_row_is_the_same_on_an_empty_tab_and_on_either_backend() {
         for kind in [BackendKind::Legacy, BackendKind::Sidecar] {
             let set = TabSet::new(kind, eitri_core::agent_bridge::SessionModeChoice::Auto);
-            let rows = detail_rows(set.active_tab(), kind, None, std::path::Path::new("/p"), None);
+            let rows = detail_rows(
+                set.active_tab(),
+                kind,
+                None,
+                std::path::Path::new("/p"),
+                None,
+                "not checked yet",
+                ProjectTrust::Untrusted,
+            );
             let settings = rows
                 .iter()
                 .find(|r| r.label == "settings")
                 .expect("the row is always drawn");
-            assert_eq!(settings.value, agent::setting_sources::note(), "{}", kind.as_str());
+            assert_eq!(
+                settings.value,
+                agent::setting_sources::note_for_session(true, ProjectTrust::Untrusted),
+                "{}",
+                kind.as_str()
+            );
         }
     }
 
@@ -6986,6 +7588,15 @@ mod tests {
             s.project_dir = dir.clone();
             s.canonical_project_dir = dir.to_string_lossy().into_owned();
             s.conversation_id = conversation_id.clone();
+            // A real gate over the project, its home the directory above it and its record kept
+            // beside it, so the restore waits for the check as it does in a window.
+            let workspaces = dir.parent().unwrap().to_path_buf();
+            let records = workspaces.join(format!("{}.trust", dir.file_name().unwrap().to_string_lossy()));
+            s.trust = TrustGate::new(
+                eitri_core::project_trust::TrustStore::at(Some(records)),
+                dir.clone(),
+                Some(workspaces),
+            );
             s.restore_source = Some(SavedTabs {
                 tabs: saved
                     .iter()
@@ -7008,6 +7619,7 @@ mod tests {
     struct FakeResumes {
         asked: Vec<String>,
         leases: Vec<agent::lease::SessionLease>,
+        trusts: Vec<ProjectTrust>,
         senders: Vec<mpsc::Sender<Result<AgentBackend, BackendError>>>,
         held_when_first_asked: Option<Vec<bool>>,
         all: Vec<String>,
@@ -7017,9 +7629,13 @@ mod tests {
         fn spawner(
             &mut self,
             canonical: String,
-        ) -> impl FnMut(&str, agent::lease::SessionLease) -> mpsc::Receiver<Result<AgentBackend, BackendError>> + '_
-        {
-            move |id, lease| {
+        ) -> impl FnMut(
+            &str,
+            agent::lease::SessionLease,
+            ProjectTrust,
+        ) -> mpsc::Receiver<Result<AgentBackend, BackendError>>
+               + '_ {
+            move |id, lease, project| {
                 if self.held_when_first_asked.is_none() {
                     self.held_when_first_asked = Some(
                         self.all
@@ -7032,6 +7648,7 @@ mod tests {
                 }
                 self.asked.push(id.to_string());
                 self.leases.push(lease);
+                self.trusts.push(project);
                 let (tx, rx) = mpsc::channel();
                 self.senders.push(tx);
                 rx
@@ -7040,11 +7657,12 @@ mod tests {
     }
 
     fn ask(state: &Rc<RefCell<AgentPanelState>>, resumes: &mut FakeResumes, how: RestoreAsk) -> RestoreResult {
-        let mut s = state.borrow_mut();
-        let from = s.tabs.active();
-        let canonical = s.canonical_project_dir.clone();
-        let mut spawn = resumes.spawner(canonical);
-        ask_for_restore(&mut s, from, how, &mut spawn)
+        let result = {
+            let mut s = state.borrow_mut();
+            let from = s.tabs.active();
+            ask_for_restore(&mut s, from, how)
+        };
+        settle(state, resumes, result)
     }
 
     fn answer(
@@ -7053,10 +7671,57 @@ mod tests {
         nonce: u64,
         keep: bool,
     ) -> RestoreResult {
-        let mut s = state.borrow_mut();
-        let canonical = s.canonical_project_dir.clone();
-        let mut spawn = resumes.spawner(canonical);
-        answer_restore_question(&mut s, nonce, keep, &mut spawn)
+        let result = answer_restore_question(&mut state.borrow_mut(), nonce, keep);
+        settle(state, resumes, result)
+    }
+
+    /// Puts `resumes` in as the panel's spawner for as long as `f` runs, and takes it back after.
+    fn with_resumes<T>(state: &Rc<RefCell<AgentPanelState>>, resumes: &mut FakeResumes, f: impl FnOnce() -> T) -> T {
+        let canonical = state.borrow().canonical_project_dir.clone();
+        let shared = Rc::new(RefCell::new(std::mem::take(resumes)));
+        let fake = shared.clone();
+        state.borrow_mut().spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| match call {
+            SpawnCall::Resume { id, lease, project } => {
+                let mut fake = fake.borrow_mut();
+                let mut spawn = fake.spawner(canonical.clone());
+                spawn(&id, lease, project)
+            }
+            SpawnCall::Connect { .. } => panic!("a restore resumes; it never connects afresh"),
+        })));
+        let result = f();
+        state.borrow_mut().spawner = spawn_nothing();
+        *resumes = Rc::try_unwrap(shared)
+            .ok()
+            .expect("the spawner was put back")
+            .into_inner();
+        result
+    }
+
+    /// The gate's tick, run until `done` says so (at most two seconds), with every step's output.
+    fn tick_until(state: &Rc<RefCell<AgentPanelState>>, done: impl Fn(&[TrustOut]) -> bool) -> Vec<TrustOut> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut seen = Vec::new();
+        loop {
+            seen.push(trust_events(&mut state.borrow_mut()));
+            if done(&seen) {
+                return seen;
+            }
+            assert!(std::time::Instant::now() < deadline, "the gate never got there");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A restore the gate holds is let through once its check comes back (these roots have nothing to
+    /// trust), with `resumes` as the spawner; what `start_restore` said is the result.
+    fn settle(state: &Rc<RefCell<AgentPanelState>>, resumes: &mut FakeResumes, result: RestoreResult) -> RestoreResult {
+        if !matches!(result, RestoreResult::Deferred) {
+            return result;
+        }
+        let seen = with_resumes(state, resumes, || {
+            tick_until(state, |seen| seen.iter().any(|o| o.restored.is_some()))
+        });
+        let notice = seen.into_iter().find_map(|o| o.restored).expect("restored");
+        RestoreResult::Started { notice }
     }
 
     fn started(result: RestoreResult) -> Option<String> {
@@ -7064,6 +7729,7 @@ mod tests {
             RestoreResult::Started { notice } => notice,
             RestoreResult::Refused(why) => panic!("refused: {why}"),
             RestoreResult::Question(prompt) => panic!("asked: {:?}", prompt.lines),
+            RestoreResult::Deferred => panic!("still waiting for the trust question"),
         }
     }
 
@@ -7156,6 +7822,11 @@ mod tests {
         assert_eq!(resumes.asked, ["s-1", "s-2", "s-3"], "in order");
         assert_eq!(resumes.held_when_first_asked, Some(vec![true, true, true]));
         assert_eq!(resumes.leases.len(), 3);
+        assert_eq!(
+            resumes.trusts,
+            [ProjectTrust::Untrusted; 3],
+            "no restored session loads the project's own configuration"
+        );
         assert!(state.borrow().restore_source.is_none(), "used up");
         let numbers: Vec<Option<String>> = state
             .borrow()
@@ -7632,5 +8303,627 @@ mod tests {
         assert_eq!(remembered.borrow().tabs.default_mode(), Auto);
         let tab = remembered.borrow().tabs.active();
         assert_eq!(remembered.borrow().tabs.get(tab).unwrap().mode(), Auto);
+    }
+
+    // ---- the trust gate on every session path ----------------------------------------------------
+
+    /// A project with its own home and state home, all under one scratch directory the test owns.
+    struct TrustFx {
+        outer: PathBuf,
+        state: PathBuf,
+        root: PathBuf,
+        /// Every start the panel's spawner was asked for: the session it resumes, if any, and the
+        /// tiers it was given.
+        spawned: Rc<RefCell<Vec<Spawned>>>,
+    }
+
+    /// One start a counting spawner was asked for: the session it resumes, if any, and its tiers.
+    type Spawned = (Option<String>, ProjectTrust);
+
+    impl TrustFx {
+        fn write(&self, relative: &str, bytes: &[u8]) {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        fn record_file(&self) -> PathBuf {
+            self.state
+                .join("eitri/trust")
+                .join(format!("{}.json", &agent::conversation_id_for_cwd(&self.root)[..16]))
+        }
+    }
+
+    impl Drop for TrustFx {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.outer);
+        }
+    }
+
+    const PROJECT_SETTINGS: &str = ".claude/settings.json";
+
+    fn session_start_hook(command: &str) -> Vec<u8> {
+        format!(r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"{command}"}}]}}]}}}}"#)
+            .into_bytes()
+    }
+
+    /// A panel over a fresh project below a fake home, with a real gate and a spawner that only
+    /// counts. The page is ready, so a question can be shown.
+    fn trust_panel(label: &str) -> (Rc<RefCell<AgentPanelState>>, TrustFx) {
+        let outer = agent::state_dirs::test_workspace_dir(label);
+        let home = outer.join("home");
+        let state_home = outer.join("state");
+        let root = home.join("p");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state_home).unwrap();
+        let spawned = Rc::new(RefCell::new(Vec::new()));
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        {
+            let mut s = state.borrow_mut();
+            s.project_dir = root.clone();
+            s.canonical_project_dir = root.to_string_lossy().into_owned();
+            s.document_ready = true;
+            s.trust = trust_gate_for(Some(state_home.as_os_str()), Some(home.as_os_str()), &root);
+            let counted = spawned.clone();
+            s.spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| {
+                counted.borrow_mut().push(match call {
+                    SpawnCall::Connect { resume, project } => (resume, project),
+                    SpawnCall::Resume { id, project, .. } => (Some(id), project),
+                });
+                mpsc::channel().1
+            })));
+        }
+        let fx = TrustFx {
+            outer,
+            state: state_home,
+            root,
+            spawned,
+        };
+        (state, fx)
+    }
+
+    /// One trust prompt as the page received it.
+    #[derive(Debug, Clone)]
+    struct Prompt {
+        tab: TabId,
+        nonce: u64,
+        fingerprint: String,
+        digest: String,
+        remember: String,
+    }
+
+    fn json_of(payload: &str) -> serde_json::Value {
+        serde_json::from_str(payload).unwrap()
+    }
+
+    fn prompts(payloads: &[String]) -> Vec<Prompt> {
+        payloads
+            .iter()
+            .map(|p| json_of(p))
+            .filter(|v| v["kind"] == "trust_prompt")
+            .map(|v| Prompt {
+                tab: TabId(v["tab"].as_u64().unwrap()),
+                nonce: v["nonce"].as_u64().unwrap(),
+                fingerprint: v["fingerprint"].as_str().unwrap().to_string(),
+                digest: v["findingsDigest"].as_str().unwrap().to_string(),
+                remember: v["remember"].as_str().unwrap().to_string(),
+            })
+            .collect()
+    }
+
+    fn all_payloads(seen: &[TrustOut]) -> Vec<String> {
+        seen.iter().flat_map(|o| o.payloads.iter().cloned()).collect()
+    }
+
+    /// The last prompt the tick sent, waiting for one.
+    fn next_prompt(state: &Rc<RefCell<AgentPanelState>>) -> Prompt {
+        let seen = tick_until(state, |seen| !prompts(&all_payloads(seen)).is_empty());
+        prompts(&all_payloads(&seen)).pop().unwrap()
+    }
+
+    /// The `command_result` for `request_id` among `payloads`: `Ok` or the error text.
+    fn result_for(payloads: &[String], request_id: &str) -> Option<Result<(), String>> {
+        payloads.iter().map(|p| json_of(p)).find_map(|v| {
+            (v["kind"] == "command_result" && v["requestId"] == request_id).then(|| {
+                if v["ok"] == true {
+                    Ok(())
+                } else {
+                    Err(v["error"].as_str().unwrap_or("").to_string())
+                }
+            })
+        })
+    }
+
+    fn notices(payloads: &[String]) -> Vec<String> {
+        payloads
+            .iter()
+            .map(|p| json_of(p))
+            .filter(|v| v["kind"] == "notice")
+            .map(|v| v["text"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn first_send(request_id: &str, text: &str) -> DeferredStart {
+        DeferredStart::FirstSend {
+            request_id: request_id.to_string(),
+            first_turn: FirstTurn {
+                wire: format!("wire: {text}"),
+                typed: text.to_string(),
+            },
+        }
+    }
+
+    fn answer_prompt(state: &Rc<RefCell<AgentPanelState>>, request_id: &str, p: &Prompt, trust: bool) -> TrustOut {
+        answer_trust(
+            &mut state.borrow_mut(),
+            request_id,
+            p.tab,
+            p.nonce,
+            &p.fingerprint,
+            &p.digest,
+            trust,
+        )
+    }
+
+    /// Outside `start_deferred` (and the connect workers it calls), nothing in the panel begins a
+    /// session: no other code calls the spawners or `start_restore`, sets a tab connecting, or
+    /// starts a backend. Read as text, formatting-insensitive.
+    #[test]
+    fn every_session_start_goes_through_the_trust_gate() {
+        use crate::trust_gate::scan;
+        let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_panel.rs")).unwrap();
+        let code = scan::code_only(&source);
+        let tests = scan::modules(&code, "tests");
+        assert_eq!(tests.len(), 1, "the tests module not found");
+        let gate = scan::functions(&code, "start_deferred");
+        assert_eq!(gate.len(), 1, "start_deferred not found");
+        for spawner in ["spawn_connect", "resume_spawner", "start_restore"] {
+            assert!(
+                scan::calls(gate[0], spawner) > 0,
+                "start_deferred no longer calls {spawner}; the scan would prove nothing"
+            );
+        }
+        assert!(gate[0].contains("TabBackend::Starting(PendingStart"));
+        let mut cut: Vec<&str> = tests;
+        cut.extend(gate);
+        for worker in ["spawn_connect", "resume_spawner", "spawn_connect_holding"] {
+            let found = scan::functions(&code, worker);
+            assert_eq!(found.len(), 1, "{worker} not found");
+            cut.extend(found);
+        }
+        let rest = scan::without(&code, &cut);
+        for name in [
+            "spawn_connect",
+            "spawn_connect_holding",
+            "resume_spawner",
+            "start_restore",
+        ] {
+            assert_eq!(scan::calls(&rest, name), 0, "{name} is called outside start_deferred");
+        }
+        let flat: String = rest.split_whitespace().collect();
+        assert!(
+            !flat.contains("TabBackend::Starting(PendingStart"),
+            "a tab is set connecting outside start_deferred"
+        );
+        assert!(
+            !flat.contains("AgentBackend::start"),
+            "a backend is started outside the connect worker"
+        );
+    }
+
+    #[test]
+    fn a_first_send_in_an_untrusted_root_spawns_nothing_until_answered() {
+        let (state, fx) = trust_panel("trust-first-send");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/never"));
+        let tab = state.borrow().tabs.active();
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let prompt = next_prompt(&state);
+        assert_eq!(prompt.tab, tab);
+        assert_eq!(prompt.remember, "yes");
+        assert!(fx.spawned.borrow().is_empty(), "nothing before the answer");
+
+        let out = answer_prompt(&state, "a1", &prompt, true);
+        assert_eq!(result_for(&out.payloads, "a1"), Some(Ok(())));
+        assert!(fx.spawned.borrow().is_empty(), "nothing before the record is written");
+        assert!(matches!(
+            state.borrow().tabs.get(tab).unwrap().backend,
+            TabBackend::AwaitingTrust(AwaitingTrust { recording: true, .. })
+        ));
+
+        tick_until(&state, |_| !fx.spawned.borrow().is_empty());
+        assert_eq!(*fx.spawned.borrow(), [(None, ProjectTrust::Trusted)]);
+        assert!(fx.record_file().is_file());
+        let s = state.borrow();
+        let t = s.tabs.get(tab).unwrap();
+        assert_eq!(t.project_tiers, Some(ProjectTrust::Trusted));
+        match &t.backend {
+            TabBackend::Starting(pending) => {
+                assert_eq!(pending.request_id, "r1");
+                let first = pending
+                    .first_turn
+                    .as_ref()
+                    .expect("the first message goes once connected");
+                assert_eq!((first.wire.as_str(), first.typed.as_str()), ("wire: hello", "hello"));
+            }
+            _ => panic!("the tab connects once the record is written"),
+        }
+    }
+
+    /// A resume by hand waits for the question like a first message, and an `n` resumes it without
+    /// the project's tiers.
+    #[test]
+    fn a_resume_waits_for_the_question_and_n_resumes_it_untrusted() {
+        let (state, fx) = trust_panel("trust-resume");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/never"));
+        let tab = state.borrow().tabs.active();
+        let resume = DeferredStart::Resume {
+            request_id: "r1".into(),
+            provider_session_id: "s-1".into(),
+            resumed_title: Some("about s-1".into()),
+            resumed_name: None,
+        };
+        gate_start(&mut state.borrow_mut(), tab, resume).unwrap();
+        let prompt = next_prompt(&state);
+        assert!(fx.spawned.borrow().is_empty());
+        let out = answer_prompt(&state, "n1", &prompt, false);
+        assert_eq!(result_for(&out.payloads, "n1"), Some(Ok(())));
+        assert_eq!(
+            *fx.spawned.borrow(),
+            [(Some("s-1".to_string()), ProjectTrust::Untrusted)]
+        );
+        let s = state.borrow();
+        match &s.tabs.get(tab).unwrap().backend {
+            TabBackend::Starting(pending) => {
+                assert_eq!(pending.resume.as_deref(), Some("s-1"));
+                assert_eq!(pending.resumed_title.as_deref(), Some("about s-1"));
+            }
+            _ => panic!("the resume connects on the answer"),
+        }
+    }
+
+    /// A check made for tab B (the hook changed meanwhile) takes A's prompt off; A's answer to what it
+    /// was shown before is refused and A is asked about what is there now. Nothing is recorded and
+    /// nothing starts.
+    #[test]
+    fn two_tabs_an_older_prompt_cannot_record_a_newer_discovery() {
+        let (state, fx) = trust_panel("trust-two-tabs");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/one"));
+        let (a, b) = {
+            let mut s = state.borrow_mut();
+            let a = s.tabs.active();
+            let b = s.tabs.open();
+            s.tabs.select(a);
+            (a, b)
+        };
+        gate_start(&mut state.borrow_mut(), a, first_send("ra", "to a")).unwrap();
+        let first = next_prompt(&state);
+        assert_eq!(first.tab, a);
+
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/two"));
+        gate_start(&mut state.borrow_mut(), b, first_send("rb", "to b")).unwrap();
+        let second = next_prompt(&state);
+        assert_eq!(second.tab, a, "the tab on screen is asked again at once");
+        assert_ne!(second.fingerprint, first.fingerprint);
+        assert!(!state.borrow().trust.is_waiting(b));
+
+        // The old prompt's nonce is spent.
+        let out = answer_prompt(&state, "x1", &first, true);
+        assert_eq!(
+            result_for(&out.payloads, "x1"),
+            Some(Err(crate::trust_gate::NOT_CURRENT.to_string()))
+        );
+        // The current nonce, echoing what the old prompt showed: refused, and asked again.
+        let stale_echo = Prompt {
+            nonce: second.nonce,
+            ..first.clone()
+        };
+        let out = answer_prompt(&state, "x2", &stale_echo, true);
+        assert_eq!(
+            result_for(&out.payloads, "x2"),
+            Some(Err(crate::trust_gate::OUT_OF_DATE.to_string()))
+        );
+        let again = prompts(&out.payloads);
+        assert_eq!(again.len(), 1, "{:?}", out.payloads);
+        assert_eq!(again[0].fingerprint, second.fingerprint);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        trust_events(&mut state.borrow_mut());
+        assert!(!fx.record_file().exists());
+        assert!(fx.spawned.borrow().is_empty());
+        for tab in [a, b] {
+            assert!(matches!(
+                state.borrow().tabs.get(tab).unwrap().backend,
+                TabBackend::AwaitingTrust(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_failed_record_is_said_in_the_panel_and_starts_nothing() {
+        let (state, fx) = trust_panel("trust-record-fails");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/never"));
+        std::fs::create_dir_all(fx.state.join("eitri")).unwrap();
+        std::fs::write(fx.state.join("eitri/trust"), b"not a directory\n").unwrap();
+        let tab = state.borrow().tabs.active();
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let prompt = next_prompt(&state);
+
+        let began = std::time::Instant::now();
+        let out = answer_prompt(&state, "a1", &prompt, true);
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(50),
+            "the handler only queues"
+        );
+        assert_eq!(result_for(&out.payloads, "a1"), Some(Ok(())));
+
+        let seen = tick_until(&state, |seen| !prompts(&all_payloads(seen)).is_empty());
+        let payloads = all_payloads(&seen);
+        let said = notices(&payloads);
+        assert!(
+            said.iter().any(|n| n.starts_with("trust could not be recorded (")
+                && n.ends_with("); asking again for this window only")),
+            "{said:?}"
+        );
+        let asked = prompts(&payloads).pop().unwrap();
+        assert_eq!(asked.remember, "window");
+        assert!(fx.spawned.borrow().is_empty());
+        assert!(!fx.record_file().exists());
+
+        // The window-only `y` also waits for the worker to find the disk unchanged: the handler
+        // starts nothing, the tick does, and says the trust lasts this window only.
+        let out = answer_prompt(&state, "a2", &asked, true);
+        assert_eq!(result_for(&out.payloads, "a2"), Some(Ok(())));
+        assert!(fx.spawned.borrow().is_empty(), "not started from the handler");
+        let seen = tick_until(&state, |_| !fx.spawned.borrow().is_empty());
+        assert_eq!(*fx.spawned.borrow(), vec![(None, ProjectTrust::Trusted)]);
+        assert!(
+            notices(&all_payloads(&seen))
+                .iter()
+                .any(|n| n.starts_with("trusted for this window only: ")),
+            "{seen:?}",
+            seen = all_payloads(&seen)
+        );
+        assert!(!fx.record_file().exists());
+    }
+
+    /// At launch nothing of an untrusted root starts and no saved session is leased while the
+    /// question waits; an `n` then brings every saved tab back without the project's tiers.
+    #[test]
+    fn automatic_restore_never_starts_an_untrusted_session() {
+        let (state, dir) = restore_panel(
+            "trust-restore-launch",
+            &[("s-1", None, Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        let canonical = dir.to_string_lossy().into_owned();
+        {
+            let mut s = state.borrow_mut();
+            s.restore_policy = RestorePolicy::Auto;
+            s.document_ready = true;
+        }
+        let mut resumes = FakeResumes::default();
+        let result = launch_restore(&mut state.borrow_mut());
+        assert!(matches!(result, Some(RestoreResult::Deferred)));
+        let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        assert!(resumes.asked.is_empty(), "nothing is resumed while the question waits");
+        for id in ["s-1", "s-2"] {
+            let lease = agent::lease::SessionLease::try_acquire("claude", &canonical, id);
+            assert!(lease.is_ok(), "{id} is not leased while the question waits");
+        }
+        assert!(
+            state.borrow().restore_source.is_none(),
+            "a launch has its one go, even while it waits"
+        );
+        assert!(
+            matches!(
+                ask_for_restore(&mut state.borrow_mut(), prompt.tab, RestoreAsk::Dashboard),
+                RestoreResult::Refused(_)
+            ),
+            "a second restore waits for the first"
+        );
+
+        let out = with_resumes(&state, &mut resumes, || answer_prompt(&state, "n1", &prompt, false));
+        assert!(out.restored.is_some(), "the restore starts on the answer");
+        assert_eq!(resumes.asked, ["s-1", "s-2"]);
+        assert_eq!(resumes.trusts, [ProjectTrust::Untrusted; 2]);
+        assert!(notices(&out.payloads).contains(&crate::trust_gate::NOT_LOADED.to_string()));
+        for t in state.borrow().tabs.tabs() {
+            assert_eq!(t.project_tiers, Some(ProjectTrust::Untrusted));
+        }
+    }
+
+    /// A saved bypass tab's question is answered first; only then is the trust question asked, and
+    /// still nothing has been leased.
+    #[test]
+    fn the_restore_bypass_question_comes_before_the_trust_question() {
+        let (state, dir) = restore_panel("trust-restore-bypass", &[("s-1", None, Bypass)], &["s-1"]);
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        state.borrow_mut().document_ready = true;
+        let from = state.borrow().tabs.active();
+        let RestoreResult::Question(question) = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard)
+        else {
+            panic!("a bypass tab is asked about first")
+        };
+        assert!(state.borrow().tabs.awaiting_trust().is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(prompts(&trust_events(&mut state.borrow_mut()).payloads).is_empty());
+
+        let answered = answer_restore_question(&mut state.borrow_mut(), question.nonce, true);
+        assert!(matches!(answered, RestoreResult::Deferred));
+        let mut resumes = FakeResumes::default();
+        let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        assert_eq!(prompt.tab, from);
+        assert!(resumes.asked.is_empty());
+        let canonical = dir.to_string_lossy().into_owned();
+        assert!(agent::lease::SessionLease::try_acquire("claude", &canonical, "s-1").is_ok());
+    }
+
+    #[test]
+    fn an_answer_for_another_tab_is_refused() {
+        let (state, fx) = trust_panel("trust-other-tab");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/never"));
+        let (a, b) = {
+            let mut s = state.borrow_mut();
+            let a = s.tabs.active();
+            let b = s.tabs.open();
+            s.tabs.select(a);
+            (a, b)
+        };
+        gate_start(&mut state.borrow_mut(), a, first_send("ra", "to a")).unwrap();
+        let prompt = next_prompt(&state);
+        // Named for the other tab: refused.
+        let other = Prompt {
+            tab: b,
+            ..prompt.clone()
+        };
+        let out = answer_prompt(&state, "x1", &other, true);
+        assert!(matches!(result_for(&out.payloads, "x1"), Some(Err(_))));
+        // The right tab, but no longer on screen: refused too.
+        state.borrow_mut().tabs.select(b);
+        let out = answer_prompt(&state, "x2", &prompt, true);
+        assert!(matches!(result_for(&out.payloads, "x2"), Some(Err(_))));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        trust_events(&mut state.borrow_mut());
+        assert!(fx.spawned.borrow().is_empty());
+        assert!(!fx.record_file().exists());
+    }
+
+    /// `Escape` on the question for a first message: the tab is empty again and the message is back in
+    /// the box, once: the refused send comes before the draft, so the page does not put it back twice.
+    #[test]
+    fn escape_returns_the_first_message_to_the_composer() {
+        let (state, fx) = trust_panel("trust-escape");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/never"));
+        let tab = state.borrow().tabs.active();
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let prompt = next_prompt(&state);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", tab, prompt.nonce);
+        assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
+        assert_eq!(
+            result_for(&out.payloads, "r1"),
+            Some(Err(crate::trust_gate::NOT_STARTED.to_string()))
+        );
+        let at = |kind: &str| out.payloads.iter().position(|p| json_of(p)["kind"] == kind).unwrap();
+        let refused = out
+            .payloads
+            .iter()
+            .position(|p| json_of(p)["requestId"] == "r1")
+            .unwrap();
+        assert!(refused < at("draft"), "{:?}", out.payloads);
+        let drafts: Vec<_> = out
+            .payloads
+            .iter()
+            .map(|p| json_of(p))
+            .filter(|v| v["kind"] == "draft")
+            .collect();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0]["text"], "hello");
+        let s = state.borrow();
+        let t = s.tabs.get(tab).unwrap();
+        assert!(matches!(t.backend, TabBackend::NotStarted));
+        assert_eq!(t.draft, "hello");
+        drop(s);
+
+        // A resume put off is dropped with a toast.
+        gate_start(
+            &mut state.borrow_mut(),
+            tab,
+            DeferredStart::Resume {
+                request_id: "r2".into(),
+                provider_session_id: "s-1".into(),
+                resumed_title: None,
+                resumed_name: None,
+            },
+        )
+        .unwrap();
+        let prompt = next_prompt(&state);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c2", tab, prompt.nonce);
+        assert_eq!(out.toast.as_deref(), Some(crate::trust_gate::PUT_OFF));
+        assert_eq!(
+            result_for(&out.payloads, "r2"),
+            Some(Err(crate::trust_gate::PUT_OFF.to_string()))
+        );
+        assert!(fx.spawned.borrow().is_empty());
+    }
+
+    /// `settings` says what the tab's own session was given once it has one, and what the next would
+    /// get before; `trust` (the window's latest check) sits right after it.
+    #[test]
+    fn the_settings_and_trust_rows_are_per_tab() {
+        let user = agent::setting_sources::loads_user_settings();
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let rows_for = |set: &TabSet, next: ProjectTrust| {
+            detail_rows(
+                set.active_tab(),
+                BackendKind::Sidecar,
+                None,
+                std::path::Path::new("/p"),
+                None,
+                "trusted since 2026-10-02",
+                next,
+            )
+        };
+        let value = |rows: &[DetailRow], label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
+
+        let rows = rows_for(&set, ProjectTrust::Trusted);
+        assert_eq!(
+            value(&rows, "settings"),
+            agent::setting_sources::note_for_session(user, ProjectTrust::Trusted),
+            "an empty tab: what its next session would get"
+        );
+        assert_eq!(value(&rows, "trust"), "trusted since 2026-10-02");
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        let position = |label: &str| labels.iter().position(|l| *l == label).unwrap();
+        assert_eq!(position("settings"), position("CLI") + 1, "{labels:?}");
+        assert_eq!(position("trust"), position("settings") + 1, "{labels:?}");
+        assert_eq!(rows.len(), 20);
+
+        set.active_tab_mut().project_tiers = Some(ProjectTrust::Untrusted);
+        let rows = rows_for(&set, ProjectTrust::Trusted);
+        assert_eq!(
+            value(&rows, "settings"),
+            agent::setting_sources::note_for_session(user, ProjectTrust::Untrusted),
+            "a started tab keeps what its session was given"
+        );
+    }
+
+    /// The companion window builds its panel with `build_agent_panel`, which builds the state with
+    /// `panel_state`, which puts in the gate over the window's own canonical root; and that gate is
+    /// about the root it was given.
+    #[test]
+    fn companion_mode_builds_the_same_gate() {
+        use crate::trust_gate::scan;
+        let src = |file: &str| {
+            scan::code_only(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap())
+        };
+        let companion = src("src/companion/window.rs");
+        let flat: String = companion.split_whitespace().collect();
+        assert!(flat.contains("crate::agent_panel::build_agent_panel("));
+        let panel = src("src/agent_panel.rs");
+        let build = scan::functions(&panel, "build_agent_panel");
+        assert_eq!(build.len(), 1);
+        assert!(scan::calls(build[0], "panel_state") > 0);
+        let state = scan::functions(&panel, "panel_state");
+        assert_eq!(state.len(), 1);
+        let flat: String = state[0].split_whitespace().collect();
+        assert!(
+            flat.contains("trust:trust") || flat.contains("trust,"),
+            "the state holds the gate"
+        );
+        assert!(flat.contains("trust_gate_for(state_home.as_deref(),home.as_deref(),&canonical_root)"));
+
+        let outer = agent::state_dirs::test_workspace_dir("trust-companion");
+        let root = outer.join("home/p");
+        std::fs::create_dir_all(&root).unwrap();
+        let gate = trust_gate_for(
+            Some(outer.join("state").as_os_str()),
+            Some(outer.join("home").as_os_str()),
+            &root,
+        );
+        assert_eq!(gate.root(), root.as_path());
+        let _ = std::fs::remove_dir_all(&outer);
     }
 }

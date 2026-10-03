@@ -2527,3 +2527,67 @@ textarea,
 .hint-off {
   opacity: 0.3;
 }
+
+/* The question before a project's own Claude configuration is loaded (`components/TrustPrompt.tsx`): shaped
+   like `.keymap-overlay` (same overlay, same surface, same backdrop rule), drawn over the conversation or the
+   start screen while `App.tsx` owns every key. Everything in it is text from a repository, so the blocks lay
+   out ltr with `bidi-override` the way a permission card's command does; the hidden characters it finds are
+   outlined by `.permission-card-escape`. Text colours are the plain surface's own pair. */
+.trust-prompt {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 16px 20px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+  z-index: 5;
+}
+.trust-prompt h2 {
+  margin: 0 0 8px;
+  font-size: var(--fs-md);
+}
+.trust-prompt h3 {
+  margin: 14px 0 4px;
+  font-size: var(--fs-sm);
+}
+.trust-prompt h4 {
+  margin: 6px 0 2px;
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.trust-prompt ul {
+  margin: 0;
+  padding-left: 18px;
+}
+.trust-root,
+.trust-item-text,
+.trust-paths li,
+.trust-file h3,
+.trust-note {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.trust-root {
+  margin: 2px 0;
+}
+.trust-key {
+  color: var(--nv-muted);
+}
+.trust-outside {
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 6px;
+  color: var(--nv-muted);
+}
+.trust-note {
+  margin: 14px 0 0;
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 6px;
+}
+.trust-footer {
+  margin: 14px 0 0;
+  color: var(--nv-muted);
+}

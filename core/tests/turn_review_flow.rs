@@ -306,7 +306,12 @@ fn until(what: &str, mut done: impl FnMut() -> bool) {
 
 fn live_backend(project: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
     let provider = Arc::new(RecordingProvider::default());
-    let conversation = AgentConversation::create(provider.clone(), project).unwrap();
+    let conversation = AgentConversation::create(
+        provider.clone(),
+        project,
+        agent::setting_sources::ProjectTrust::Untrusted,
+    )
+    .unwrap();
     (provider, AgentBackend::Sidecar(Box::new(conversation)))
 }
 

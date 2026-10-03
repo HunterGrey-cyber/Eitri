@@ -53,9 +53,11 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
     // the kind of real bug this plan's own "Verified facts" point 1 exists to prevent; do not
     // "simplify" this test by using one value for both.
     let session_id = provider
+        // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
         .create_session(CreateSessionRequest {
             cwd: cwd.clone(),
             streaming: agent::StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .unwrap();
 

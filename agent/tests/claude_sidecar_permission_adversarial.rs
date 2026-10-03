@@ -31,8 +31,13 @@ fn conversation() -> (AgentConversation, u32) {
     let cwd = agent::state_dirs::test_workspace_dir("permission-adversarial");
     // PermissionMode::Auto -> the sidecar's `interactive` policy. This is the mode the start screen
     // now offers on this backend, so it is the mode these tests must exercise.
-    let conversation = AgentConversation::create(std::sync::Arc::new(provider), &cwd)
-        .expect("creating a conversation in interactive mode should succeed");
+    // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
+    let conversation = AgentConversation::create(
+        std::sync::Arc::new(provider),
+        &cwd,
+        agent::setting_sources::ProjectTrust::Trusted,
+    )
+    .expect("creating a conversation in interactive mode should succeed");
     (conversation, pid)
 }
 

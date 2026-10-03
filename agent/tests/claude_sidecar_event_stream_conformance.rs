@@ -11,9 +11,11 @@ use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessio
 fn a_real_turn_s_reply_arrives_via_pump() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let session_id = provider
+        // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             streaming: agent::StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .unwrap();
 

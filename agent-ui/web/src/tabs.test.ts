@@ -16,6 +16,12 @@ describe("acceptsEnvelope", () => {
     expect(acceptsEnvelope({ kind: "focus_permission", tab: 1 }, 2)).toBe(false);
     expect(acceptsEnvelope({ kind: "error", tab: 3 }, 2)).toBe(false);
   });
+  it("scopes the trust question to its own tab", () => {
+    expect(acceptsEnvelope({ kind: "trust_prompt", tab: 2 }, 2)).toBe(true);
+    expect(acceptsEnvelope({ kind: "trust_prompt", tab: 1 }, 2)).toBe(false);
+    expect(acceptsEnvelope({ kind: "trust_prompt" }, 2)).toBe(false);
+    expect(acceptsEnvelope({ kind: "trust_prompt", tab: 1 }, null)).toBe(false);
+  });
   it("drops a session envelope with no tab, and one before any tabs envelope arrived", () => {
     expect(acceptsEnvelope({ kind: "snapshot" }, 2)).toBe(false);
     expect(acceptsEnvelope({ kind: "snapshot", tab: 1 }, null)).toBe(false);

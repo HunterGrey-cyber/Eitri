@@ -17,6 +17,7 @@ use crate::event::{AgentEvent, PermissionSource};
 use crate::process::AgentProcess;
 use crate::projection::{AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, TurnOutcome};
 use crate::provider::PermissionDecision;
+use crate::setting_sources::ProjectTrust;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -58,8 +59,10 @@ impl AgentSession {
     /// overwrite or delete the other's. `backend_conformance`'s
     /// `real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_hooks`
     /// asserts exactly that against the real CLI.
-    pub fn start(project_dir: &Path, disallowed_tools: &[&str]) -> std::io::Result<Self> {
-        let process = AgentProcess::spawn(project_dir, disallowed_tools)?;
+    ///
+    /// `project` decides whether the project's own settings tiers load; the caller states it.
+    pub fn start(project_dir: &Path, disallowed_tools: &[&str], project: ProjectTrust) -> std::io::Result<Self> {
+        let process = AgentProcess::spawn(project_dir, disallowed_tools, project)?;
         Ok(Self {
             process,
             projection: AgentSessionProjection::default(),

@@ -16,9 +16,11 @@ use agent::{AgentProvider, ClaudeSidecarProvider, CreateSessionRequest};
 fn create_session_returns_a_real_session_id() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let session_id = provider
+        // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             streaming: agent::StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .unwrap();
     assert!(!session_id.is_empty());
@@ -48,6 +50,7 @@ fn resume_is_now_advertised_and_an_empty_id_is_rejected_before_the_wire() {
         provider_session_id: "   ".into(),
         cwd: "/tmp".into(),
         streaming: agent::StreamingPreference::Partial,
+        project: agent::setting_sources::ProjectTrust::Trusted,
     });
     match result {
         Err(agent::ProviderError::Provider { code, .. }) => {

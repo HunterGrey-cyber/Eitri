@@ -70,7 +70,7 @@ impl std::error::Error for ResumeCommandError {}
 /// Deliberately none of the flags `agent` itself spawns `claude` with. The full list, as
 /// `AgentProcess::spawn_with_binary` really builds it (`crate::process`): `--print`,
 /// `--input-format stream-json`, `--output-format stream-json`, `--verbose`,
-/// `--setting-sources user,project,local` (`project,local` when `agent.user_settings` is false),
+/// `--setting-sources <the session's tiers>` (`setting_sources::for_session`: the project's only when it is trusted),
 /// `--permission-mode <mode>`, and -- conditionally -- `--disallowedTools <list>` and
 /// `--settings <json>`. This is an ordinary interactive session in a
 /// terminal, not another machine-driven one, so none of them belong.

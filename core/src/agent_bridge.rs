@@ -429,6 +429,37 @@ pub enum InboundMessage {
         // point is that only the exact prompt shown may be answered.
         nonce: u64,
     },
+    /// `y` or `n` to the workspace-trust question of one tab. The page echoes the prompt's
+    /// `fingerprint` and `findingsDigest` verbatim, so what is answered is exactly what was shown;
+    /// none of `tab`, `nonce`, `fingerprint` or `findings_digest` has a default, because an answer
+    /// that does not say which prompt it answers is a protocol error, never "the current one".
+    TrustAnswer {
+        request_id: String,
+        tab: u64,
+        nonce: u64,
+        fingerprint: String,
+        findings_digest: String,
+        trust: bool,
+    },
+    /// `Escape` on the trust question: the start it was holding is put off.
+    TrustCancel {
+        request_id: String,
+        tab: u64,
+        nonce: u64,
+    },
+    /// `:trust` / `:untrust`. Window-level: the root is the window's, not a tab's.
+    TrustCommand {
+        request_id: String,
+        action: TrustAction,
+    },
+}
+
+/// What a `trust_command` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustAction {
+    Trust,
+    Untrust,
 }
 
 /// The wire spelling of `crate::tab_set::BypassScope`. Kept separate from that type (rather than
@@ -506,7 +537,10 @@ impl InboundMessage {
             | InboundMessage::NavFallthrough { .. }
             | InboundMessage::PaneNav { .. }
             | InboundMessage::ReviewRecover { .. }
+            | InboundMessage::TrustCommand { .. }
             | InboundMessage::OpenUrl { .. } => return TabRef::WindowLevel,
+            // These two name their tab as a plain number: a message without one does not parse.
+            InboundMessage::TrustAnswer { tab, .. } | InboundMessage::TrustCancel { tab, .. } => Some(*tab),
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
@@ -611,6 +645,9 @@ impl InboundMessage {
             | InboundMessage::PanelKeys { request_id, .. }
             | InboundMessage::NavFallthrough { request_id, .. }
             | InboundMessage::PaneNav { request_id, .. }
+            | InboundMessage::TrustAnswer { request_id, .. }
+            | InboundMessage::TrustCancel { request_id, .. }
+            | InboundMessage::TrustCommand { request_id, .. }
             | InboundMessage::OpenUrl { request_id, .. } => request_id,
         }
     }
@@ -1729,6 +1766,168 @@ pub fn serialize_handoff_for_js(tab: crate::tabs::TabId, command: &agent::handof
 /// session tab it is about; the panel drops it unless that tab is active (session tabs spec §3.1).
 pub fn serialize_error_for_js(tab: crate::tabs::TabId, message: &str) -> String {
     json!({ "kind": "error", "tab": tab.0, "message": message }).to_string()
+}
+
+/// How many characters of one finding's value the trust prompt shows; the rest is counted, not sent.
+const TRUST_VALUE_CHARS: usize = 4096;
+
+/// Whether answering the trust question with `y` is remembered, and for how long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustRememberView {
+    /// A record on disk.
+    Yes,
+    /// This window only: no record could be kept.
+    Window,
+    /// This one start only: something could not be checked.
+    Session,
+}
+
+impl TrustRememberView {
+    fn as_str(self) -> &'static str {
+        match self {
+            TrustRememberView::Yes => "yes",
+            TrustRememberView::Window => "window",
+            TrustRememberView::Session => "session",
+        }
+    }
+}
+
+/// Why the question is being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustPromptState {
+    Untrusted,
+    Changed,
+}
+
+impl TrustPromptState {
+    fn as_str(self) -> &'static str {
+        match self {
+            TrustPromptState::Untrusted => "untrusted",
+            TrustPromptState::Changed => "changed",
+        }
+    }
+}
+
+/// What changed since the answer was recorded, as paths relative to the top of the walk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrustDiffView {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+}
+
+/// One thing the prompt shows. `value` is the raw text; the cut to [`TRUST_VALUE_CHARS`] happens where
+/// the prompt is serialized and digested, so both see the same thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustItemView {
+    pub what: &'static str,
+    pub file: String,
+    pub label: String,
+    pub value: String,
+    pub outside: bool,
+}
+
+/// The question a tab waits on, in the words the page draws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustPromptView {
+    pub tab: crate::tabs::TabId,
+    pub nonce: u64,
+    pub root: String,
+    pub top: String,
+    /// The shown discovery's fingerprint, in hex.
+    pub fingerprint: String,
+    pub state: TrustPromptState,
+    pub remember: TrustRememberView,
+    pub remember_note: Option<String>,
+    pub changed: Option<TrustDiffView>,
+    pub items: Vec<TrustItemView>,
+}
+
+/// Everything the page shows of a trust prompt, in the order the digest hashes it. Field order is the
+/// serialization order, so it is part of what the digest means.
+#[derive(Serialize)]
+struct TrustShown<'a> {
+    root: &'a str,
+    top: &'a str,
+    fingerprint: &'a str,
+    state: &'static str,
+    remember: &'static str,
+    #[serde(rename = "rememberNote")]
+    remember_note: Option<&'a str>,
+    changed: Option<&'a TrustDiffView>,
+    items: Vec<Value>,
+}
+
+/// A value as the page shows it: cut at [`TRUST_VALUE_CHARS`] characters with the rest counted.
+fn trust_value_as_shown(value: &str) -> String {
+    let total = value.chars().count();
+    if total <= TRUST_VALUE_CHARS {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(TRUST_VALUE_CHARS).collect();
+    format!("{kept}… ({} more characters)", total - TRUST_VALUE_CHARS)
+}
+
+impl TrustPromptView {
+    fn shown(&self) -> TrustShown<'_> {
+        TrustShown {
+            root: &self.root,
+            top: &self.top,
+            fingerprint: &self.fingerprint,
+            state: self.state.as_str(),
+            remember: self.remember.as_str(),
+            remember_note: self.remember_note.as_deref(),
+            changed: self.changed.as_ref(),
+            items: self
+                .items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "what": item.what,
+                        "file": item.file,
+                        "label": item.label,
+                        "value": trust_value_as_shown(&item.value),
+                        "outside": item.outside,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// The sha256 (64 hex) of the compact JSON of everything the page shows -- `root`, `top`,
+    /// `fingerprint`, `state`, `remember`, `rememberNote`, `changed`, `items`, in that order, with each
+    /// value cut as it is shown -- and not `tab` or `nonce`. An answer echoing it is an answer about
+    /// this text, not only about the bytes on disk.
+    pub fn findings_digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let compact = serde_json::to_string(&self.shown()).expect("a prompt's own fields always serialize");
+        let digest = Sha256::digest(compact.as_bytes());
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+/// `{"kind":"trust_prompt","tab":...,"nonce":...,"root":...,"top":...,"fingerprint":...,
+/// "findingsDigest":...,"state":...,"remember":...,"rememberNote":...,"changed":...,"items":[...]}` --
+/// the question a tab waits on before its session may load the project's own Claude configuration.
+/// Values are sent raw (serde escapes them); the page reveals hidden characters. `tab` names the tab
+/// it is about; the panel drops it unless that tab is active.
+pub fn serialize_trust_prompt_for_js(view: &TrustPromptView) -> String {
+    let shown = view.shown();
+    json!({
+        "kind": "trust_prompt",
+        "tab": view.tab.0,
+        "nonce": view.nonce,
+        "root": shown.root,
+        "top": shown.top,
+        "fingerprint": shown.fingerprint,
+        "findingsDigest": view.findings_digest(),
+        "state": shown.state,
+        "remember": shown.remember,
+        "rememberNote": shown.remember_note,
+        "changed": shown.changed,
+        "items": shown.items,
+    })
+    .to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4929,5 +5128,311 @@ mod tests {
         assert_eq!(object["kind"], "editor_link");
         assert_eq!(object["state"], "detached");
         assert_eq!(object["text"], "editor detached: x");
+    }
+    // ---- the workspace-trust protocol ----
+
+    const TRUST_ANSWER: &str = r#"{"type":"trust_answer","request_id":"r9","tab":3,"nonce":17,"fingerprint":"ab12","findings_digest":"cd34","trust":true}"#;
+    const TRUST_CANCEL: &str = r#"{"type":"trust_cancel","request_id":"r10","tab":3,"nonce":17}"#;
+
+    #[test]
+    fn trust_answer_deserializes() {
+        match parse_inbound_message(TRUST_ANSWER).unwrap() {
+            InboundMessage::TrustAnswer {
+                request_id,
+                tab,
+                nonce,
+                fingerprint,
+                findings_digest,
+                trust,
+            } => {
+                assert_eq!((request_id.as_str(), tab, nonce), ("r9", 3, 17));
+                assert_eq!((fingerprint.as_str(), findings_digest.as_str()), ("ab12", "cd34"));
+                assert!(trust);
+            }
+            other => panic!("expected TrustAnswer, got {other:?}"),
+        }
+        let no = TRUST_ANSWER.replace(r#""trust":true"#, r#""trust":false"#);
+        assert!(matches!(
+            parse_inbound_message(&no),
+            Some(InboundMessage::TrustAnswer { trust: false, .. })
+        ));
+        // Every field is required: an answer that does not say what it answers is not parsed.
+        for missing in [
+            r#""tab":3,"#,
+            r#""nonce":17,"#,
+            r#""fingerprint":"ab12","#,
+            r#""findings_digest":"cd34","#,
+            r#","trust":true"#,
+        ] {
+            let line = TRUST_ANSWER.replace(missing, "");
+            assert_ne!(line, TRUST_ANSWER, "{missing}");
+            assert!(parse_inbound_message(&line).is_none(), "{line}");
+        }
+        assert!(parse_inbound_message(&TRUST_ANSWER.replace(r#""tab":3"#, r#""tab":null"#)).is_none());
+        assert!(parse_inbound_message(&TRUST_ANSWER.replace(r#""trust":true"#, r#""trust":"yes""#)).is_none());
+    }
+
+    #[test]
+    fn trust_cancel_deserializes() {
+        assert!(matches!(
+            parse_inbound_message(TRUST_CANCEL).unwrap(),
+            InboundMessage::TrustCancel { tab: 3, nonce: 17, .. }
+        ));
+        for missing in [r#""tab":3,"#, r#","nonce":17"#] {
+            let line = TRUST_CANCEL.replace(missing, "");
+            assert_ne!(line, TRUST_CANCEL, "{missing}");
+            assert!(parse_inbound_message(&line).is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn trust_command_deserializes() {
+        for (word, want) in [("trust", TrustAction::Trust), ("untrust", TrustAction::Untrust)] {
+            let line = format!(r#"{{"type":"trust_command","request_id":"r11","action":"{word}"}}"#);
+            match parse_inbound_message(&line).unwrap() {
+                InboundMessage::TrustCommand { request_id, action } => {
+                    assert_eq!(request_id, "r11");
+                    assert_eq!(action, want);
+                }
+                other => panic!("expected TrustCommand, got {other:?}"),
+            }
+        }
+        assert!(parse_inbound_message(r#"{"type":"trust_command","request_id":"r11","action":"always"}"#).is_none());
+        assert!(parse_inbound_message(r#"{"type":"trust_command","request_id":"r11"}"#).is_none());
+    }
+
+    #[test]
+    fn trust_messages_have_request_ids() {
+        let lines = [
+            TRUST_ANSWER,
+            TRUST_CANCEL,
+            r#"{"type":"trust_command","request_id":"r11","action":"trust"}"#,
+        ];
+        let ids: Vec<String> = lines
+            .iter()
+            .map(|line| parse_inbound_message(line).unwrap().request_id().to_owned())
+            .collect();
+        assert_eq!(ids, ["r9", "r10", "r11"]);
+    }
+
+    /// CLAUDE.md "Tab routing": an answer is for the tab it names, through `TabSet::resolve`.
+    #[test]
+    fn trust_answer_naming_no_tab_or_a_gone_tab_is_refused() {
+        let set = crate::tab_set::TabSet::new(crate::agent_backend::BackendKind::Sidecar, SessionModeChoice::Auto);
+        let live = set.active().0;
+        for template in [TRUST_ANSWER, TRUST_CANCEL] {
+            let present = template.replace(r#""tab":3"#, &format!(r#""tab":{live}"#));
+            let message = parse_inbound_message(&present).unwrap();
+            assert_eq!(set.resolve(message.tab_ref()), Ok(Some(set.active())), "{present}");
+
+            let gone = template.replace(r#""tab":3"#, r#""tab":777"#);
+            let message = parse_inbound_message(&gone).unwrap();
+            assert!(matches!(message.tab_ref(), TabRef::Named(TabId(777))));
+            let why = set.resolve(message.tab_ref()).unwrap_err();
+            assert!(why.contains("no tab 777"), "{why}");
+
+            let nameless = template.replace(r#""tab":3,"#, "");
+            assert!(
+                parse_inbound_message(&nameless).is_none(),
+                "naming no tab does not parse: {nameless}"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_command_is_window_level() {
+        for word in ["trust", "untrust"] {
+            let line = format!(r#"{{"type":"trust_command","request_id":"r11","action":"{word}"}}"#);
+            assert!(matches!(
+                parse_inbound_message(&line).unwrap().tab_ref(),
+                TabRef::WindowLevel
+            ));
+        }
+        assert!(matches!(
+            parse_inbound_message(TRUST_ANSWER).unwrap().tab_ref(),
+            TabRef::Named(TabId(3))
+        ));
+        assert!(matches!(
+            parse_inbound_message(TRUST_CANCEL).unwrap().tab_ref(),
+            TabRef::Named(TabId(3))
+        ));
+    }
+
+    fn prompt() -> TrustPromptView {
+        TrustPromptView {
+            tab: TabId(3),
+            nonce: 17,
+            root: "/home/u/p/src".into(),
+            top: "/home/u/p".into(),
+            fingerprint: "f".repeat(64),
+            state: TrustPromptState::Untrusted,
+            remember: TrustRememberView::Yes,
+            remember_note: None,
+            changed: None,
+            items: vec![
+                TrustItemView {
+                    what: "hook",
+                    file: ".claude/settings.json".into(),
+                    label: "SessionStart".into(),
+                    value: "touch /tmp/m".into(),
+                    outside: false,
+                },
+                TrustItemView {
+                    what: "mcp_server",
+                    file: ".mcp.json".into(),
+                    label: "marker".into(),
+                    value: "sh -c 'touch /tmp/n; exec sleep 60'".into(),
+                    outside: false,
+                },
+                TrustItemView {
+                    what: "symlink",
+                    file: ".claude/hooks/run".into(),
+                    label: ".claude/hooks/run".into(),
+                    value: "/opt/x/run".into(),
+                    outside: true,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn trust_prompt_serializes_exactly() {
+        let view = prompt();
+        let digest = view.findings_digest();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(
+            serde_json::from_str::<Value>(&serialize_trust_prompt_for_js(&view)).unwrap(),
+            json!({
+                "kind": "trust_prompt",
+                "tab": 3,
+                "nonce": 17,
+                "root": "/home/u/p/src",
+                "top": "/home/u/p",
+                "fingerprint": "f".repeat(64),
+                "findingsDigest": digest,
+                "state": "untrusted",
+                "remember": "yes",
+                "rememberNote": null,
+                "changed": null,
+                "items": [
+                    {"what": "hook", "file": ".claude/settings.json", "label": "SessionStart",
+                     "value": "touch /tmp/m", "outside": false},
+                    {"what": "mcp_server", "file": ".mcp.json", "label": "marker",
+                     "value": "sh -c 'touch /tmp/n; exec sleep 60'", "outside": false},
+                    {"what": "symlink", "file": ".claude/hooks/run", "label": ".claude/hooks/run",
+                     "value": "/opt/x/run", "outside": true},
+                ],
+            })
+        );
+
+        // A value over the cut is shortened with the rest counted; the cut is by characters.
+        let mut long = prompt();
+        long.items = vec![TrustItemView {
+            what: "other_setting",
+            file: ".claude/settings.json".into(),
+            label: "x".into(),
+            value: "é".repeat(5000),
+            outside: false,
+        }];
+        let sent: Value = serde_json::from_str(&serialize_trust_prompt_for_js(&long)).unwrap();
+        let value = sent["items"][0]["value"].as_str().unwrap();
+        assert_eq!(value, format!("{}… (904 more characters)", "é".repeat(4096)));
+        let exactly: String = "a".repeat(4096);
+        long.items[0].value = exactly.clone();
+        let sent: Value = serde_json::from_str(&serialize_trust_prompt_for_js(&long)).unwrap();
+        assert_eq!(sent["items"][0]["value"], exactly, "a value at the limit is sent whole");
+
+        // A changed prompt, and one that cannot be remembered.
+        let mut changed = prompt();
+        changed.state = TrustPromptState::Changed;
+        changed.remember = TrustRememberView::Session;
+        changed.remember_note = Some("y trusts this start only; the next one asks again".into());
+        changed.changed = Some(TrustDiffView {
+            added: vec![".mcp.json".into()],
+            removed: vec![],
+            changed: vec![".claude/settings.json".into()],
+        });
+        let sent: Value = serde_json::from_str(&serialize_trust_prompt_for_js(&changed)).unwrap();
+        assert_eq!(sent["state"], "changed");
+        assert_eq!(sent["remember"], "session");
+        assert_eq!(
+            sent["rememberNote"],
+            "y trusts this start only; the next one asks again"
+        );
+        assert_eq!(
+            sent["changed"],
+            json!({"added": [".mcp.json"], "removed": [], "changed": [".claude/settings.json"]})
+        );
+
+        let mut window = prompt();
+        window.remember = TrustRememberView::Window;
+        window.remember_note = Some("no state directory".into());
+        let sent: Value = serde_json::from_str(&serialize_trust_prompt_for_js(&window)).unwrap();
+        assert_eq!(sent["remember"], "window");
+        assert_eq!(sent["rememberNote"], "no state directory");
+    }
+
+    #[test]
+    fn the_findings_digest_follows_what_is_shown() {
+        let base = prompt().findings_digest();
+        assert_eq!(base, prompt().findings_digest(), "stable");
+
+        // Not the tab or the nonce: they are not on screen.
+        let mut other = prompt();
+        other.tab = TabId(9);
+        other.nonce = 999;
+        assert_eq!(other.findings_digest(), base);
+
+        type Change = Box<dyn Fn(&mut TrustPromptView)>;
+        let changes: Vec<(&str, Change)> = vec![
+            ("root", Box::new(|v| v.root.push('x'))),
+            ("top", Box::new(|v| v.top.push('x'))),
+            ("fingerprint", Box::new(|v| v.fingerprint = "e".repeat(64))),
+            ("state", Box::new(|v| v.state = TrustPromptState::Changed)),
+            ("remember", Box::new(|v| v.remember = TrustRememberView::Window)),
+            ("note", Box::new(|v| v.remember_note = Some("why".into()))),
+            (
+                "changed",
+                Box::new(|v| {
+                    v.changed = Some(TrustDiffView {
+                        added: vec!["a".into()],
+                        removed: vec![],
+                        changed: vec![],
+                    })
+                }),
+            ),
+            ("value", Box::new(|v| v.items[0].value.push('!'))),
+            ("label", Box::new(|v| v.items[1].label.push('!'))),
+            ("file", Box::new(|v| v.items[2].file.push('!'))),
+            ("what", Box::new(|v| v.items[0].what = "env_key")),
+            ("outside", Box::new(|v| v.items[0].outside = true)),
+            ("an item added", Box::new(|v| v.items.push(v.items[0].clone()))),
+            ("an item dropped", Box::new(|v| drop(v.items.pop()))),
+            ("items swapped", Box::new(|v| v.items.swap(0, 1))),
+        ];
+        for (what, change) in &changes {
+            let mut v = prompt();
+            change(&mut v);
+            assert_ne!(v.findings_digest(), base, "{what}");
+        }
+
+        // The digest is over the value as shown: past the cut, what is hidden does not matter, and the
+        // count of what was cut does.
+        let mut long = prompt();
+        long.items[0].value = format!("{}A", "x".repeat(4096));
+        let first = long.findings_digest();
+        long.items[0].value = format!("{}B", "x".repeat(4096));
+        assert_eq!(
+            long.findings_digest(),
+            first,
+            "one hidden character is not told apart from another"
+        );
+        long.items[0].value = format!("{}BB", "x".repeat(4096));
+        assert_ne!(
+            long.findings_digest(),
+            first,
+            "the cut's own count is shown, so it is hashed"
+        );
     }
 }

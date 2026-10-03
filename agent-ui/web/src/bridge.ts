@@ -1,5 +1,7 @@
 import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope } from "./types";
 import type { KeymapHelp, PaneDirection } from "./keymap";
+import { isHex64, isTrustRemember } from "./trust";
+import type { TrustPromptEnvelope } from "./trust";
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
@@ -83,6 +85,18 @@ export type OutboundMessage =
    *  echoed back so only the prompt that was shown can be answered. Window-level, like
    *  `confirm_bypass`. `InboundMessage::RestoreAnswer`, `core/src/agent_bridge.rs`. */
   | { type: "restore_answer"; request_id: string; nonce: number; keep_bypass: boolean }
+  /** `y` or `n` to a `trust_prompt`, past the same guards as the bypass prompt's `y`. `tab` and `nonce` name the
+   *  prompt that was shown, and `fingerprint`/`findings_digest` are that envelope's `fingerprint` and
+   *  `findingsDigest` copied verbatim -- this side never computes either, so Rust can tell an answer to what is
+   *  on screen from one to something that has changed since. `InboundMessage::TrustAnswer`,
+   *  `core/src/agent_bridge.rs`. */
+  | { type: "trust_answer"; request_id: string; tab: TabId; nonce: number; fingerprint: string; findings_digest: string; trust: boolean }
+  /** `Escape` on a `trust_prompt`: put the start off. Starts nothing, so it carries no digest.
+   *  `InboundMessage::TrustCancel`, `core/src/agent_bridge.rs`. */
+  | { type: "trust_cancel"; request_id: string; tab: TabId; nonce: number }
+  /** `:trust` or `:untrust` on the command line. Window-level: the trust belongs to the window's project, not to
+   *  a tab. `InboundMessage::TrustCommand`, `core/src/agent_bridge.rs`. */
+  | { type: "trust_command"; request_id: string; action: "trust" | "untrust" }
   /** V1 §3.5's composer mirror: the effective mode this window is in, whenever it changes (and once
    *  after `ready`). Window-level, like `TabVerb` -- Rust keeps one value per window, not per tab,
    *  because the capture controller (`install_module_nav`) that reads it back is itself installed
@@ -283,6 +297,10 @@ type InboundHandler = (
      *  `n` brings the bypass tabs back in auto. `nonce` is echoed back on either answer, as
      *  `confirm_bypass`'s is. `serialize_confirm_restore_for_js`, `core/src/agent_bridge.rs`. */
     | { kind: "confirm_restore"; nonce: number; lines: string[] }
+    /** The question before a session loads this project's own Claude configuration, with what it would load.
+     *  Tab-scoped. A second one for the same tab replaces the first. `serialize_trust_prompt_for_js`,
+     *  `core/src/agent_bridge.rs`. */
+    | TrustPromptEnvelope
     /** This tab's queue, and its current refusal reason if the last flush was refused (phase 3
      *  ruling 3). */
     | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null }
@@ -333,6 +351,20 @@ type InboundHandler = (
  *  can name it without re-declaring the union. */
 export type InboundPayload = Parameters<InboundHandler>[0];
 
+function isWellFormedTrustPrompt(value: unknown): boolean {
+  const o = value as Partial<Record<keyof TrustPromptEnvelope, unknown>>;
+  return (
+    typeof o.tab === "number" &&
+    typeof o.nonce === "number" &&
+    isHex64(o.fingerprint) &&
+    isHex64(o.findingsDigest) &&
+    isTrustRemember(o.remember) &&
+    typeof o.root === "string" &&
+    typeof o.top === "string" &&
+    Array.isArray(o.items)
+  );
+}
+
 export function installDispatch(handler: InboundHandler): void {
   window.__eitriDispatch = (json: string) => {
     let parsed: unknown;
@@ -355,6 +387,13 @@ export function installDispatch(handler: InboundHandler): void {
       // The same rule for the restore question: an answer can only echo a real nonce.
       if (obj.kind === "confirm_restore" && typeof (obj as { nonce?: unknown }).nonce !== "number") {
         console.warn("agent-ui: __eitriDispatch received a malformed confirm_restore envelope (no nonce)", parsed);
+        return;
+      }
+      // The trust question can only be answered by echoing what it showed, so one that cannot be echoed is
+      // dropped here rather than drawn: a numeric nonce, both 64-hex digests, a known `remember` and the list
+      // it draws.
+      if (obj.kind === "trust_prompt" && !isWellFormedTrustPrompt(parsed)) {
+        console.warn("agent-ui: __eitriDispatch received a malformed trust_prompt envelope", parsed);
         return;
       }
       if (
@@ -386,6 +425,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "confirm_close_others" ||
         obj.kind === "confirm_bypass" ||
         obj.kind === "confirm_restore" ||
+        obj.kind === "trust_prompt" ||
         obj.kind === "begin_rename" ||
         obj.kind === "queue" ||
         obj.kind === "draft" ||

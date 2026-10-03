@@ -169,11 +169,13 @@ fn probe_which_slash_commands_do_something_through_the_sidecar() {
     let cwd = scratch_cwd().to_string_lossy().to_string();
 
     for command in COMMANDS {
+        // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
         let session_id = match provider.create_session(CreateSessionRequest {
             cwd: cwd.clone(),
             // Every session is gated since v1 (R07): this probe used to ask for BYPASS so a
             // command's tool calls ran unasked; now `run_probe_turn` answers each request `Allow`.
             streaming: StreamingPreference::Complete,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         }) {
             Ok(id) => id,
             Err(err) => {

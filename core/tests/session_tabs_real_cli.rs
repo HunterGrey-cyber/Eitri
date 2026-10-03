@@ -35,9 +35,15 @@ fn project() -> std::path::PathBuf {
 }
 
 fn start(dir: &std::path::Path) -> AgentBackend {
-    AgentBackend::start(BackendKind::Sidecar, dir, None)
-        .map_err(|e| e.message)
-        .expect("a sidecar session starts; is this running under a test-account wrapper?")
+    // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
+    AgentBackend::start(
+        BackendKind::Sidecar,
+        dir,
+        None,
+        agent::setting_sources::ProjectTrust::Trusted,
+    )
+    .map_err(|e| e.message)
+    .expect("a sidecar session starts; is this running under a test-account wrapper?")
 }
 
 fn transcript(set: &TabSet, tab: eitri_core::tabs::TabId) -> String {

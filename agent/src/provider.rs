@@ -10,6 +10,7 @@
 //! (Task 3). Streaming output (assistant text, tool calls, permission requests, ...) is never
 //! returned directly from these methods; it arrives via `pump()`, mirroring `AgentSession::pump()`.
 
+use crate::setting_sources::ProjectTrust;
 use crate::AgentDomainEvent;
 
 /// How much of an assistant reply the caller wants while it is still being produced.
@@ -37,6 +38,8 @@ pub enum StreamingPreference {
 pub struct CreateSessionRequest {
     pub cwd: String,
     pub streaming: StreamingPreference,
+    /// Whether the project's own settings tiers load (`crate::setting_sources::for_session`).
+    pub project: ProjectTrust,
 }
 
 /// Continue an existing provider (Claude) session rather than starting a fresh one.
@@ -50,6 +53,9 @@ pub struct ResumeSessionRequest {
     pub provider_session_id: String,
     pub cwd: String,
     pub streaming: StreamingPreference,
+    /// Whether the project's own settings tiers load. Stated afresh for every resume: the
+    /// conversation continues, but what the project may run is decided now, not when it began.
+    pub project: ProjectTrust,
 }
 
 #[derive(Debug, Clone)]

@@ -17,6 +17,7 @@
 //! Selected by `EITRI_AGENT_BACKEND=legacy|sidecar`, defaulting to `legacy` until the sidecar
 //! path clears its acceptance criteria.
 
+use agent::setting_sources::ProjectTrust;
 use agent::{
     AgentConversation, AgentDomainEvent, AgentSession, AgentSessionProjection, ClaudeSidecarProvider,
     ConversationError, PermissionDecision, PermissionMode, ProjectionGuard, ProviderCapabilities, ProviderInfo,
@@ -334,8 +335,17 @@ impl AgentBackend {
     /// No permission mode (R07): every session on both backends is gated, and the tab's mode is
     /// read at the one point that answers requests (`take_ui_delivery_with_rules`), never sent to
     /// the CLI.
-    pub fn start(kind: BackendKind, project_dir: &Path, resume: Option<&str>) -> Result<Self, BackendError> {
-        Self::start_holding(kind, project_dir, resume, None)
+    ///
+    /// `project` decides whether the project's own Claude configuration (its `.claude/`,
+    /// `.mcp.json`, `CLAUDE.md`) loads, on both backends. The caller states it for every session,
+    /// a resume included; nothing here defaults it.
+    pub fn start(
+        kind: BackendKind,
+        project_dir: &Path,
+        resume: Option<&str>,
+        project: ProjectTrust,
+    ) -> Result<Self, BackendError> {
+        Self::start_holding(kind, project_dir, resume, None, project)
     }
 
     /// [`start`](Self::start) for a resume whose session lease the caller already holds
@@ -346,6 +356,7 @@ impl AgentBackend {
         project_dir: &Path,
         resume: Option<&str>,
         lease: Option<agent::lease::SessionLease>,
+        project: ProjectTrust,
     ) -> Result<Self, BackendError> {
         match kind {
             BackendKind::Legacy => {
@@ -356,7 +367,7 @@ impl AgentBackend {
                             .to_string(),
                     ));
                 }
-                AgentSession::start(project_dir, agent::disallowed_tools())
+                AgentSession::start(project_dir, agent::disallowed_tools(), project)
                     .map(AgentBackend::Legacy)
                     .map_err(|e| BackendError::fatal(format!("failed to start the legacy Claude backend: {e}")))
             }
@@ -374,10 +385,11 @@ impl AgentBackend {
                         project_dir,
                         provider_session_id,
                         lease,
+                        project,
                     )
                     .map(|c| AgentBackend::Sidecar(Box::new(c)))
                     .map_err(|e| BackendError::fatal(format!("could not continue the previous session: {e}"))),
-                    None => AgentConversation::create(std::sync::Arc::new(provider), project_dir)
+                    None => AgentConversation::create(std::sync::Arc::new(provider), project_dir, project)
                         .map(|c| AgentBackend::Sidecar(Box::new(c)))
                         .map_err(|e| BackendError::fatal(format!("failed to create a Claude session: {e}"))),
                 }
@@ -2002,9 +2014,14 @@ mod tests {
     /// would hand the user a conversation with none of the history they picked it for.
     #[test]
     fn the_legacy_backend_refuses_a_resume_rather_than_starting_a_fresh_session() {
-        let error = AgentBackend::start(BackendKind::Legacy, Path::new("/tmp"), Some("claude-abc"))
-            .err()
-            .expect("the legacy backend must refuse a resume");
+        let error = AgentBackend::start(
+            BackendKind::Legacy,
+            Path::new("/tmp"),
+            Some("claude-abc"),
+            ProjectTrust::Untrusted,
+        )
+        .err()
+        .expect("the legacy backend must refuse a resume");
         assert!(
             !error.benign,
             "a refused resume ends the attempt; it is not an ordering complaint"
@@ -2133,8 +2150,9 @@ mod tests {
     fn a_rejected_sidecar_turn_still_leaves_the_prompt_recorded() {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("rejected-turn-keeps-prompt");
-        let conversation = AgentConversation::create(std::sync::Arc::new(RejectingProvider), &dir)
-            .expect("create_session succeeds on RejectingProvider; only send_turn is rigged to fail");
+        let conversation =
+            AgentConversation::create(std::sync::Arc::new(RejectingProvider), &dir, ProjectTrust::Untrusted)
+                .expect("create_session succeeds on RejectingProvider; only send_turn is rigged to fail");
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         let result = backend.send_turn("wire text with context composed in", "what does this do?");
@@ -2168,7 +2186,7 @@ mod tests {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("title-as-typed");
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let conversation_id = backend
             .conversation_id()
@@ -2205,7 +2223,7 @@ mod tests {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("name-before-adoption");
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let conversation_id = backend.conversation_id().unwrap().to_string();
 
@@ -2288,7 +2306,7 @@ mod tests {
     fn a_read_inside_the_project_is_answered_here_and_never_becomes_a_card() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -2334,7 +2352,7 @@ mod tests {
     fn a_write_still_reaches_the_user_and_is_answered_by_nobody_else() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -2369,7 +2387,7 @@ mod tests {
     fn a_read_outside_the_project_still_reaches_the_user() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -2397,7 +2415,7 @@ mod tests {
     fn a_project_rule_answers_a_bash_call_and_never_a_compound_one() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap());
         for (id, command) in [("perm-rule", "npm ci"), ("perm-compound", "npm ci && rm -rf .")] {
@@ -2437,7 +2455,7 @@ mod tests {
     fn a_hidden_chat_counts_the_card_it_holds_and_still_answers_what_needs_no_human() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let mut tracker = crate::attention::AttentionTracker::default();
 
@@ -2524,7 +2542,7 @@ mod tests {
     fn after_an_ungated_report_nothing_is_answered_automatically() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let read = |id: &str| AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
@@ -2575,7 +2593,7 @@ mod tests {
     fn a_tripwire_in_bypass_answers_nothing_either() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let read = |id: &str| AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
@@ -2620,7 +2638,7 @@ mod tests {
     fn in_bypass_every_request_is_answered_and_never_delivered() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let rules = agent::PrefixRules::default();
 
@@ -2688,7 +2706,7 @@ mod tests {
     fn the_classifier_records_what_it_answers() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let rules = agent::PrefixRules::default();
 
@@ -2728,7 +2746,7 @@ mod tests {
     fn approve_pending_skips_ids_no_longer_pending_and_returns_what_it_answered() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let write = |id: &str| AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
@@ -2829,7 +2847,7 @@ mod tests {
     fn approve_pending_answers_nothing_once_the_cli_reported_an_ungated_mode() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let write = |id: &str| AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
@@ -2872,7 +2890,7 @@ mod tests {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
         provider.refuse_resolutions(true);
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -2963,7 +2981,7 @@ mod tests {
 
     fn sidecar_backend(dir: &Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), dir, ProjectTrust::Untrusted).unwrap();
         (provider, AgentBackend::Sidecar(Box::new(conversation)))
     }
 
@@ -3329,7 +3347,7 @@ mod tests {
 
     fn auto_backend(dir: &Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {
         let provider = std::sync::Arc::new(RecordingProvider::cli_auto());
-        let conversation = AgentConversation::create(provider.clone(), dir).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), dir, ProjectTrust::Untrusted).unwrap();
         (provider, AgentBackend::Sidecar(Box::new(conversation)))
     }
 
@@ -3605,7 +3623,7 @@ mod tests {
             } else {
                 RecordingProvider::default()
             });
-            let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+            let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
             let mut backend = AgentBackend::Sidecar(Box::new(conversation));
             let mut batch: Vec<AgentDomainEvent> = report.map(cli_reports).into_iter().collect();
             batch.extend(three_gates());

@@ -241,7 +241,7 @@ fn strip_comments(src: &str) -> String {
 }
 
 /// Every run of whitespace, newlines included, as one space; and no space either side of `::`.
-fn collapse(src: &str) -> String {
+pub(super) fn collapse(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut pending_space = false;
     for ch in src.chars() {
@@ -918,9 +918,9 @@ fn check_file(
     check_host_policy_literals(rel, code, &aliases, offenders);
 }
 
-/// Scans a tree of sources keyed by their path relative to `src/` (`/`-separated).
-fn scan_tree(files: &BTreeMap<String, String>) -> Report {
-    let mut report = Report::default();
+/// Every source of a tree as the scans read it -- comment-free, collapsed, test modules removed --
+/// and, apart, the files reached only through a `#[cfg(test)] mod x;` declaration.
+fn clean_tree(files: &BTreeMap<String, String>) -> (BTreeMap<String, String>, BTreeSet<String>) {
     let mut cleaned = BTreeMap::new();
     let mut test_only = BTreeSet::new();
     let mut reached = BTreeSet::new();
@@ -934,6 +934,48 @@ fn scan_tree(files: &BTreeMap<String, String>) -> Report {
         }
         cleaned.insert(rel.clone(), code);
     }
+    let test_files: BTreeSet<String> = test_only.difference(&reached).cloned().collect();
+    let production = cleaned
+        .into_iter()
+        .filter(|(rel, _)| !test_files.contains(rel))
+        .collect();
+    (production, test_files)
+}
+
+/// This crate's production code under `root`, keyed by the path relative to it, as the scans read
+/// it: no comments, whitespace collapsed (so a line break never decides a verdict), no test
+/// modules, and no file that only a test module declares. For scans living in other modules.
+pub(super) fn production_code(root: &Path) -> BTreeMap<String, String> {
+    clean_tree(&read_tree(root)).0
+}
+
+/// `code` (as [`production_code`] gives it) with the body of the one `fn <name>` cut out. An error
+/// when there is no such function or more than one, so an exemption cannot outlive its function
+/// or cover a second one.
+pub(super) fn without_fn_body(code: &str, name: &str) -> Result<String, String> {
+    let needle = format!("fn {name}(");
+    let starts: Vec<usize> = code.match_indices(&needle).map(|(at, _)| at).collect();
+    let [start] = starts[..] else {
+        return Err(format!("expected exactly one `{needle}`, found {}", starts.len()));
+    };
+    let open = code[start..]
+        .find('{')
+        .map(|at| start + at)
+        .ok_or_else(|| format!("`{needle}` has no body"))?;
+    let c: Vec<char> = code.chars().collect();
+    // `matching_close` counts in chars; the byte offsets above are turned into char offsets first.
+    let open_char = code[..open].chars().count();
+    let close_char = matching_close(&c, open_char).ok_or_else(|| format!("`{needle}`'s body is not closed"))?;
+    let before: String = c[..open_char].iter().collect();
+    let after: String = c[close_char + 1..].iter().collect();
+    Ok(format!("{before}{{}}{after}"))
+}
+
+/// Scans a tree of sources keyed by their path relative to `src/` (`/`-separated).
+fn scan_tree(files: &BTreeMap<String, String>) -> Report {
+    let mut report = Report::default();
+    let (cleaned, test_files) = clean_tree(files);
+    report.skipped = test_files.into_iter().filter(|rel| files.contains_key(rel)).collect();
     // The names the enum is written as anywhere in the crate: a re-export is reachable from every
     // file, not only the one that writes it.
     let crate_aliases: BTreeSet<String> = cleaned
@@ -941,10 +983,6 @@ fn scan_tree(files: &BTreeMap<String, String>) -> Report {
         .flat_map(|code| requested_mode_imports(code).aliases)
         .collect();
     for (rel, code) in &cleaned {
-        if test_only.contains(rel) && !reached.contains(rel) {
-            report.skipped.insert(rel.clone());
-            continue;
-        }
         report.scanned.insert(rel.clone());
         check_file(
             rel,

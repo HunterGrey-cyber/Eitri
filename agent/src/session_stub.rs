@@ -21,6 +21,7 @@
 
 use crate::projection::{AgentDomainEvent, AgentSessionProjection};
 use crate::provider::PermissionDecision;
+use crate::setting_sources::ProjectTrust;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -47,7 +48,7 @@ impl AgentSession {
     /// Always fails: this build has no legacy backend. `io::ErrorKind::Unsupported`, carrying
     /// `LEGACY_NOT_IN_BUILD`, so the caller's "failed to start the legacy Claude backend: {e}"
     /// names the reason and the flag that brings it back.
-    pub fn start(_project_dir: &Path, _disallowed_tools: &[&str]) -> std::io::Result<Self> {
+    pub fn start(_project_dir: &Path, _disallowed_tools: &[&str], _project: ProjectTrust) -> std::io::Result<Self> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             crate::LEGACY_NOT_IN_BUILD,
@@ -109,7 +110,7 @@ mod tests {
     /// start, and says why in words a developer can act on.
     #[test]
     fn start_is_unsupported_and_names_the_feature_that_brings_legacy_back() {
-        let error = match AgentSession::start(Path::new("."), &[]) {
+        let error = match AgentSession::start(Path::new("."), &[], ProjectTrust::Untrusted) {
             Ok(_) => panic!("a build without the legacy backend must not start one"),
             Err(error) => error,
         };

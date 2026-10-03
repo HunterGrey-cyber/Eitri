@@ -53,6 +53,7 @@ use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest,
 };
+use crate::setting_sources::ProjectTrust;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -362,7 +363,13 @@ impl AgentConversation {
     ///
     /// No permission mode (R07): the session is gated whatever the tab's mode, and the host decides
     /// above this API whether to answer its requests `allow` itself.
-    pub fn create(provider: Arc<dyn AgentProvider + Send + Sync>, cwd: &Path) -> Result<Self, ConversationError> {
+    ///
+    /// `project` decides whether the project's own settings tiers load; the caller states it.
+    pub fn create(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        cwd: &Path,
+        project: ProjectTrust,
+    ) -> Result<Self, ConversationError> {
         let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
         let capabilities = provider.capabilities();
         let info = provider.info();
@@ -370,6 +377,7 @@ impl AgentConversation {
             cwd: canonical_cwd.to_string_lossy().to_string(),
             // A UI client always wants incremental presentation.
             streaming: crate::provider::StreamingPreference::Partial,
+            project,
         })?;
         Ok(Self::assembled(provider, canonical_cwd, capabilities, info, session_id))
     }
@@ -433,8 +441,9 @@ impl AgentConversation {
         provider: Arc<dyn AgentProvider + Send + Sync>,
         cwd: &Path,
         provider_session_id: &str,
+        project: ProjectTrust,
     ) -> Result<Self, ConversationError> {
-        Self::resume_holding(provider, cwd, provider_session_id, None)
+        Self::resume_holding(provider, cwd, provider_session_id, None, project)
     }
 
     /// [`resume`](Self::resume) with the session's lease already taken by the caller, who took it
@@ -445,11 +454,16 @@ impl AgentConversation {
     ///
     /// A lease for another provider, directory or session is refused before the provider is asked
     /// for anything: a resume must never drive a session it holds no lock on.
+    ///
+    /// `project` is the trust the caller states now. A resumed session never inherits the tiers
+    /// the conversation began with: the project may have changed, or been trusted or untrusted, in
+    /// between.
     pub fn resume_holding(
         provider: Arc<dyn AgentProvider + Send + Sync>,
         cwd: &Path,
         provider_session_id: &str,
         held: Option<SessionLease>,
+        project: ProjectTrust,
     ) -> Result<Self, ConversationError> {
         let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
         let capabilities = provider.capabilities();
@@ -512,6 +526,7 @@ impl AgentConversation {
             provider_session_id: provider_session_id.to_string(),
             cwd: cwd_string.clone(),
             streaming: crate::provider::StreamingPreference::Partial,
+            project,
         })?;
 
         let ingest = ConversationIngest::start(
@@ -948,6 +963,8 @@ mod tests {
         /// Every event ever queued. A test waits for ingestion to reach exactly this, which is a
         /// real condition rather than a sleep long enough to probably be fine.
         queued_total: std::sync::atomic::AtomicU64,
+        /// The trust each `create_session` was asked under, in order.
+        trusts: Mutex<Vec<ProjectTrust>>,
     }
 
     impl FakeProvider {
@@ -988,6 +1005,7 @@ mod tests {
             }
         }
         fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
+            self.trusts.lock().unwrap().push(request.project);
             self.calls
                 .lock()
                 .unwrap()
@@ -1050,6 +1068,14 @@ mod tests {
     }
 
     fn conversation_in(fake: Arc<FakeProvider>, dir: &Path) -> Result<AgentConversation, ConversationError> {
+        conversation_in_as(fake, dir, ProjectTrust::Untrusted)
+    }
+
+    fn conversation_in_as(
+        fake: Arc<FakeProvider>,
+        dir: &Path,
+        project: ProjectTrust,
+    ) -> Result<AgentConversation, ConversationError> {
         struct Shared(Arc<FakeProvider>);
         impl AgentProvider for Shared {
             fn capabilities(&self) -> ProviderCapabilities {
@@ -1080,7 +1106,7 @@ mod tests {
                 self.0.pump()
             }
         }
-        AgentConversation::create(Arc::new(Shared(fake)), dir)
+        AgentConversation::create(Arc::new(Shared(fake)), dir, project)
     }
 
     /// Waits for the ingestion thread to reach a state, or fails.
@@ -1315,7 +1341,7 @@ mod tests {
             ]),
         });
 
-        let conversation = AgentConversation::resume(provider, &dir, &session)
+        let conversation = AgentConversation::resume(provider, &dir, &session, ProjectTrust::Untrusted)
             .expect("the fake provider attaches to the session it was asked for");
         wait_for_ingest(&conversation, 2);
 
@@ -1703,7 +1729,11 @@ mod tests {
                 vec![]
             }
         }
-        let result = AgentConversation::create(Arc::new(Never), Path::new("/definitely/does/not/exist/eitri-test"));
+        let result = AgentConversation::create(
+            Arc::new(Never),
+            Path::new("/definitely/does/not/exist/eitri-test"),
+            ProjectTrust::Untrusted,
+        );
         // `AgentConversation` is deliberately not Debug (it owns a Box<dyn AgentProvider>), so
         // match the error out rather than formatting the whole Result.
         match result {
@@ -2104,6 +2134,8 @@ mod tests {
     /// A provider that accepts a resume and says it attached, recording what it was asked.
     struct AcceptingResume {
         asked: Mutex<Vec<String>>,
+        /// The trust each resume was asked under, in order.
+        trusts: Mutex<Vec<ProjectTrust>>,
         events: Mutex<Vec<AgentDomainEvent>>,
     }
 
@@ -2111,6 +2143,7 @@ mod tests {
         fn attaching_to(session: &str) -> Arc<Self> {
             Arc::new(Self {
                 asked: Mutex::new(Vec::new()),
+                trusts: Mutex::new(Vec::new()),
                 events: Mutex::new(vec![AgentDomainEvent::ResumeOutcome {
                     requested_provider_session_id: session.to_string(),
                     status: crate::ResumeStatus::Attached,
@@ -2144,6 +2177,7 @@ mod tests {
             unreachable!("these tests only resume")
         }
         fn resume_session(&self, r: ResumeSessionRequest) -> Result<String, ProviderError> {
+            self.trusts.lock().unwrap().push(r.project);
             self.asked.lock().unwrap().push(r.provider_session_id);
             Ok("verdandi-session-resumed".into())
         }
@@ -2174,15 +2208,25 @@ mod tests {
         let session = "claude-uuid-held-ahead";
 
         let lease = SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).unwrap();
-        let plain = AgentConversation::resume(AcceptingResume::attaching_to(session), &dir, session);
+        let plain = AgentConversation::resume(
+            AcceptingResume::attaching_to(session),
+            &dir,
+            session,
+            ProjectTrust::Untrusted,
+        );
         assert!(
             matches!(plain, Err(ConversationError::LeaseHeld { .. })),
             "a resume that takes its own lease cannot share the one already held"
         );
 
-        let conversation =
-            AgentConversation::resume_holding(AcceptingResume::attaching_to(session), &dir, session, Some(lease))
-                .expect("the resume attaches under the lease it was handed");
+        let conversation = AgentConversation::resume_holding(
+            AcceptingResume::attaching_to(session),
+            &dir,
+            session,
+            Some(lease),
+            ProjectTrust::Untrusted,
+        )
+        .expect("the resume attaches under the lease it was handed");
         assert!(
             matches!(
                 SessionLease::try_acquire(PROVIDER_NAME, &cwd, session),
@@ -2206,7 +2250,13 @@ mod tests {
         let provider = AcceptingResume::attaching_to("claude-uuid-asked-for");
 
         let lease = SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-someone-else").unwrap();
-        let result = AgentConversation::resume_holding(provider.clone(), &dir, "claude-uuid-asked-for", Some(lease));
+        let result = AgentConversation::resume_holding(
+            provider.clone(),
+            &dir,
+            "claude-uuid-asked-for",
+            Some(lease),
+            ProjectTrust::Untrusted,
+        );
         assert!(matches!(result, Err(ConversationError::Lease(_))), "{:?}", result.err());
         assert!(
             provider.asked.lock().unwrap().is_empty(),
@@ -2226,6 +2276,7 @@ mod tests {
         let session = "claude-uuid-rejected";
         let provider = Arc::new(AcceptingResume {
             asked: Mutex::new(Vec::new()),
+            trusts: Mutex::new(Vec::new()),
             events: Mutex::new(vec![AgentDomainEvent::ResumeOutcome {
                 requested_provider_session_id: session.to_string(),
                 status: crate::ResumeStatus::Rejected,
@@ -2235,11 +2286,34 @@ mod tests {
             }]),
         });
         let lease = SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).unwrap();
-        let result = AgentConversation::resume_holding(provider, &dir, session, Some(lease));
+        let result = AgentConversation::resume_holding(provider, &dir, session, Some(lease), ProjectTrust::Untrusted);
         assert!(matches!(result, Err(ConversationError::ResumeRejected { .. })));
         assert!(
             SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).is_ok(),
             "the session is free again once its resume failed"
         );
+    }
+
+    /// The trust a caller states reaches the provider as stated, on a fresh session and on a resume
+    /// alike; neither path picks one of its own.
+    #[test]
+    fn create_and_resume_hand_the_sessions_trust_to_the_provider() {
+        for project in [ProjectTrust::Trusted, ProjectTrust::Untrusted] {
+            let fake = Arc::new(FakeProvider::new());
+            let conversation =
+                conversation_in_as(Arc::clone(&fake), &unique_dir(), project).expect("create against the fake");
+            assert_eq!(*fake.trusts.lock().unwrap(), vec![project]);
+            drop(conversation);
+        }
+
+        for project in [ProjectTrust::Untrusted, ProjectTrust::Trusted] {
+            let dir = unique_dir();
+            let session = "claude-uuid-trust";
+            let provider = AcceptingResume::attaching_to(session);
+            let conversation = AgentConversation::resume_holding(provider.clone(), &dir, session, None, project)
+                .expect("the fake provider attaches");
+            assert_eq!(*provider.trusts.lock().unwrap(), vec![project]);
+            drop(conversation);
+        }
     }
 }

@@ -113,9 +113,15 @@ impl Drop for LiveSet {
 fn auto_tab(dir: &Path) -> (LiveSet, TabId) {
     let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
     let tab = set.active();
-    let backend = AgentBackend::start(BackendKind::Sidecar, dir, None)
-        .map_err(|e| e.message)
-        .expect("a session starts; is EITRI_VERDANDI_CHECKOUT set and is this running under a test-account wrapper?");
+    // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
+    let backend = AgentBackend::start(
+        BackendKind::Sidecar,
+        dir,
+        None,
+        agent::setting_sources::ProjectTrust::Trusted,
+    )
+    .map_err(|e| e.message)
+    .expect("a session starts; is EITRI_VERDANDI_CHECKOUT set and is this running under a test-account wrapper?");
     assert!(
         backend.capabilities().cli_auto_mode,
         "INCONCLUSIVE: this sidecar does not offer cli_auto_mode and permission_defer (Verdandi 8f1d2f9 or \

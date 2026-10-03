@@ -177,6 +177,9 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
 #[test]
 #[ignore]
 fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
+    // The control, default and opt-out arms are trusted sessions: they measure the user tier against
+    // the project tiers loaded, as this test always has. The last two arms are the untrusted
+    // selections, `[USER]` and `[]`, so all four `for_session` selections are exercised.
     let cwd = Scratch::new("cwd");
 
     // The operator's real user tier, as the sidecar will resolve it for its subprocesses.
@@ -242,6 +245,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         false,
         control.provider_prompts,
         requested_cli_mode(&control.capabilities),
+        ProjectTrust::Trusted,
     );
     request.policy.as_mut().unwrap().setting_sources = None;
     let session_id = control.open_session(request).expect("control session");
@@ -279,6 +283,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         .create_session(CreateSessionRequest {
             cwd: cwd.path().to_string_lossy().to_string(),
             streaming: StreamingPreference::Complete,
+            project: ProjectTrust::Trusted,
         })
         .expect("default session");
     provider
@@ -323,6 +328,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         false,
         opted_out.provider_prompts,
         false,
+        ProjectTrust::Trusted,
         requested_cli_mode(&opted_out.capabilities),
     );
     let session_id = opted_out.open_session(request).expect("opt-out session");
@@ -357,14 +363,94 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
             "model check not conclusive here: the CLI's own default {opt_out_model:?} is the same \
              family as the declared {declared_model:?}; the CLAUDE.md check above is the evidence"
         );
-        return;
+    } else {
+        assert!(
+            !opt_out_model.contains(&family),
+            "setting_sources = [PROJECT, LOCAL] did NOT exclude the user tier: the session is running \
+             {opt_out_model:?}, the model the operator's own ~/.claude declares ({declared_model:?}). \
+             `agent.user_settings = false` promises that tier stays out."
+        );
     }
-    assert!(
-        !opt_out_model.contains(&family),
-        "setting_sources = [PROJECT, LOCAL] did NOT exclude the user tier: the session is running \
-         {opt_out_model:?}, the model the operator's own ~/.claude declares ({declared_model:?}). \
-         `agent.user_settings = false` promises that tier stays out."
+
+    // ---- UNTRUSTED, user tier on: `[USER]`. The user tier is not gated, so the operator's own
+    // CLAUDE.md is in the context exactly as in the default arm; only the project's tiers are out
+    // (the scratch cwd holds none, so the project's side is measured by the real-CLI files in
+    // `core/tests/workspace_trust*_real_cli.rs`, which have a project that ships hooks).
+    let (answer, model) = ask_arm(
+        &cwd,
+        &ask,
+        true,
+        ProjectTrust::Untrusted,
+        "untrusted (setting_sources = [USER])",
     );
+    assert!(
+        says_yes(&answer),
+        "setting_sources = [USER] did NOT load the user tier: the model cannot see the user CLAUDE.md \
+         sentence (answered {answer:?}). An untrusted project must leave the user's own tier alone."
+    );
+    assert!(
+        model.contains(&family),
+        "setting_sources = [USER] did NOT load the user tier: the session is running {model:?}, not the \
+         model the operator's own ~/.claude declares ({declared_model:?})."
+    );
+
+    // ---- UNTRUSTED, user tier off: `[]`, sent as a present, empty selection. An absent one would
+    // mean "defer to configuration" and load all three tiers, so the user CLAUDE.md being gone is
+    // what tells the two apart.
+    let (answer, model) = ask_arm(
+        &cwd,
+        &ask,
+        false,
+        ProjectTrust::Untrusted,
+        "untrusted (setting_sources = [])",
+    );
+    assert!(
+        says_no(&answer),
+        "setting_sources = [] loaded the user tier: the model can see the user CLAUDE.md sentence \
+         (answered {answer:?}). An empty selection must be sent as present and empty, not left out."
+    );
+    if model.contains(&family) {
+        eprintln!(
+            "model check not conclusive here: the CLI's own default {model:?} is the same family as the \
+             declared {declared_model:?}; the CLAUDE.md check above is the evidence"
+        );
+    }
+}
+
+/// One session built exactly as the product builds it for `(user_settings, project)`, asked `ask`
+/// once; returns the answer and the model the session opened with. Fails if no turn completed.
+fn ask_arm(cwd: &Scratch, ask: &str, user_settings: bool, project: ProjectTrust, label: &str) -> (String, String) {
+    let provider = connect();
+    let request = build_create_request_loading(
+        cwd.path().to_string_lossy().to_string(),
+        StreamingPreference::Complete,
+        None,
+        false,
+        provider.provider_prompts,
+        user_settings,
+        project,
+        requested_cli_mode(&provider.capabilities),
+    );
+    let session_id = provider
+        .open_session(request)
+        .unwrap_or_else(|e| panic!("{label} session: {e:?}"));
+    provider
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: ask.to_string(),
+        })
+        .unwrap_or_else(|e| panic!("{label} turn: {e:?}"));
+    let events = drain_until(&provider, 120, turn_finished);
+    trace(label, &events);
+    let _ = provider.close_session(CloseSessionRequest { session_id });
+    assert!(
+        turn_finished(&events) && !text_of(&events).trim().is_empty(),
+        "the {label} arm never completed a turn, so its result is not evidence; got: {events:?}"
+    );
+    let answer = text_of(&events);
+    let model = model_of(&events).unwrap_or_default();
+    eprintln!("{label}: model {model:?}, answer {answer:?}");
+    (answer, model)
 }
 
 /// Whether a one-word answer says yes (case and punctuation ignored).

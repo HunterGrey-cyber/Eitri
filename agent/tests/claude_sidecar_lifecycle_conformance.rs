@@ -127,9 +127,11 @@ fn create_gated_session(provider: &ClaudeSidecarProvider) -> String {
 /// before/after measurement rather than two divergent copies of the setup.
 fn create_gated_session_with(provider: &ClaudeSidecarProvider, streaming: agent::StreamingPreference) -> String {
     provider
+        // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             streaming,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .expect("create_session should succeed")
 }
@@ -585,6 +587,7 @@ fn real_resume_continues_the_same_provider_session_with_its_history() {
             provider_session_id: provider_session_id.clone(),
             cwd,
             streaming: agent::StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .expect("resume_session should succeed against a real, closed session");
     assert_ne!(

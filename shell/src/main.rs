@@ -36,6 +36,7 @@ mod text_size;
 mod theme;
 mod toast;
 mod tray;
+mod trust_gate;
 mod version;
 mod web_host;
 mod webkit_sandbox;

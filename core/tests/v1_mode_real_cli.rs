@@ -151,7 +151,8 @@ fn bypass_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
         SessionModeChoice::Bypass,
         "D2/D13: confirmed before the backend even exists"
     );
-    let backend = AgentBackend::start(kind, dir, None)
+    // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
+    let backend = AgentBackend::start(kind, dir, None, agent::setting_sources::ProjectTrust::Trusted)
         .map_err(|e| e.message)
         .expect("a session starts; is this running under a test-account wrapper?");
     set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
@@ -162,7 +163,7 @@ fn bypass_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
 fn auto_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
     let mut set = TabSet::new(kind, SessionModeChoice::Auto);
     let tab = set.active();
-    let backend = AgentBackend::start(kind, dir, None)
+    let backend = AgentBackend::start(kind, dir, None, agent::setting_sources::ProjectTrust::Trusted)
         .map_err(|e| e.message)
         .expect("a session starts; is this running under a test-account wrapper?");
     set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
@@ -441,9 +442,14 @@ fn host_answer_latency_in_bypass() {
         std::fs::write(dir.join(format!("f{i}.txt")), format!("contents-{i}\n")).unwrap();
     }
     let mut backend = LiveBackend(
-        AgentBackend::start(BackendKind::Sidecar, &dir, None)
-            .map_err(|e| e.message)
-            .expect("a sidecar session starts; is this running under a test-account wrapper?"),
+        AgentBackend::start(
+            BackendKind::Sidecar,
+            &dir,
+            None,
+            agent::setting_sources::ProjectTrust::Trusted,
+        )
+        .map_err(|e| e.message)
+        .expect("a sidecar session starts; is this running under a test-account wrapper?"),
     );
     backend
         .send_turn(
@@ -1176,7 +1182,7 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
 
     let mut set = LiveSet(TabSet::new(kind, SessionModeChoice::Auto));
     let tab = set.active();
-    let backend = AgentBackend::start(kind, &dir, None)
+    let backend = AgentBackend::start(kind, &dir, None, agent::setting_sources::ProjectTrust::Trusted)
         .map_err(|e| e.message)
         .expect("a session starts; is this running under a test-account wrapper?");
     set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);

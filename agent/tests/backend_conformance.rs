@@ -32,7 +32,13 @@ use agent::{
 fn real_multi_turn_conversation_in_one_process() {
     let dir = std::env::temp_dir().join(format!("agent-session-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
+    // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
+    let mut session = AgentSession::start(
+        &dir,
+        CONSERVATIVE_DISALLOWED_TOOLS,
+        agent::setting_sources::ProjectTrust::Trusted,
+    )
+    .unwrap();
 
     session.send_turn("reply with exactly the word: pong").unwrap();
     let result1 = drain_until_finished(&mut session);
@@ -66,7 +72,7 @@ fn real_multi_turn_conversation_in_one_process() {
 fn real_pretooluse_hook_allow_end_to_end() {
     let dir = std::env::temp_dir().join(format!("agent-session-hook-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, &[]).unwrap();
+    let mut session = AgentSession::start(&dir, &[], agent::setting_sources::ProjectTrust::Trusted).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
     let mut gated_tool_use_id: Option<Option<String>> = None;
@@ -139,7 +145,7 @@ fn real_pretooluse_hook_deny_end_to_end() {
 
     let dir = std::env::temp_dir().join(format!("agent-session-deny-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, &[]).unwrap();
+    let mut session = AgentSession::start(&dir, &[], agent::setting_sources::ProjectTrust::Trusted).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
 
@@ -223,8 +229,8 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
     let dir = std::env::temp_dir().join(format!("agent-collision-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut session_a = AgentSession::start(&dir, &[]).unwrap();
-    let mut session_b = AgentSession::start(&dir, &[]).unwrap();
+    let mut session_a = AgentSession::start(&dir, &[], agent::setting_sources::ProjectTrust::Trusted).unwrap();
+    let mut session_b = AgentSession::start(&dir, &[], agent::setting_sources::ProjectTrust::Trusted).unwrap();
 
     // The mechanism, asserted before the behavior: starting two sessions must not have written
     // anything into the project. Under the old code this directory already held one
@@ -312,7 +318,7 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
 fn real_interrupt_mid_permission_denies_pending_requests_without_ending_the_session() {
     let dir = std::env::temp_dir().join(format!("agent-interrupt-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, &[]).unwrap();
+    let mut session = AgentSession::start(&dir, &[], agent::setting_sources::ProjectTrust::Trusted).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
 
@@ -412,7 +418,12 @@ fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_th
     let target = dir.join("greeting.txt");
     std::fs::write(&target, "hello world\n").unwrap();
 
-    let mut session = AgentSession::start(&dir, agent::disallowed_tools()).unwrap();
+    let mut session = AgentSession::start(
+        &dir,
+        agent::disallowed_tools(),
+        agent::setting_sources::ProjectTrust::Trusted,
+    )
+    .unwrap();
     session
         .send_turn(&format!(
             "Use the Edit tool to change the word 'world' to 'eitri' in {}. Do not use a shell.",

@@ -50,6 +50,46 @@ pub struct PendingStart {
     pub resumed_name: Option<String>,
 }
 
+/// A session start put off until the window has asked whether the project's own Claude configuration
+/// may load. Nothing is spawned and no lease is taken while it waits: it holds only what the user
+/// asked for, so that the answer (or an `Escape`) can carry it out or hand it back.
+pub enum DeferredStart {
+    /// The first message of an empty tab. The command's `command_result` is owed to `request_id`.
+    FirstSend { request_id: String, first_turn: FirstTurn },
+    /// A resume into this tab.
+    Resume {
+        request_id: String,
+        provider_session_id: String,
+        resumed_title: Option<String>,
+        resumed_name: Option<String>,
+    },
+    /// A restore of the last window's tabs, already cleared by its bypass question. It has taken no
+    /// lease yet: those are taken only when it starts.
+    Restore { go: RestoreGo },
+}
+
+impl DeferredStart {
+    /// The command this start owes a `command_result`, when it came from one.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            DeferredStart::FirstSend { request_id, .. } | DeferredStart::Resume { request_id, .. } => Some(request_id),
+            DeferredStart::Restore { .. } => None,
+        }
+    }
+}
+
+/// A tab holding a [`DeferredStart`] while the trust question is asked or answered.
+pub struct AwaitingTrust {
+    pub start: DeferredStart,
+    /// The nonce of the question on screen for this tab, if one is. Routing away from the tab clears
+    /// it, so an answer typed after leaving can never reach the question again.
+    pub asking: Option<u64>,
+    /// A `y` was accepted and the worker is checking the disk again (and writing the record, when one
+    /// is kept): the answer is spent, and the start waits for that result rather than for another
+    /// answer.
+    pub recording: bool,
+}
+
 /// A handoff whose session close is still running on a worker thread.
 ///
 /// The command is built BEFORE the session is taken -- it is derived from the session's own state,
@@ -104,6 +144,9 @@ pub enum TabBackend {
     /// send or resume.
     NotStarted,
     Starting(PendingStart),
+    /// A start that waits for the trust question; nothing has been spawned. Shown to the panel as
+    /// `starting`.
+    AwaitingTrust(AwaitingTrust),
     /// A backend, whether its session is running or has ended (the projection says which).
     Live(AgentBackend),
     /// Never worked: a start that failed, a session that never opened, or a fatal command (ruling 14).
@@ -154,6 +197,10 @@ pub struct Tab {
     /// write the field directly.
     mode: SessionModeChoice,
     pub backend: TabBackend,
+    /// Which of the project's own configuration tiers the session of this tab was given; set when
+    /// the session is spawned, so a later change of the window's answer leaves running sessions as
+    /// they were.
+    pub project_tiers: Option<agent::setting_sources::ProjectTrust>,
     pub attention: AttentionTracker,
     /// The WebView's copy is behind: this tab took events while it was not active (ruling 18).
     pub stale: bool,
@@ -278,6 +325,7 @@ impl Tab {
             title: None,
             mode,
             backend: TabBackend::NotStarted,
+            project_tiers: None,
             attention: AttentionTracker::default(),
             stale: false,
             turn_trace: None,
@@ -353,6 +401,12 @@ impl Tab {
         match &self.backend {
             TabBackend::Live(backend) => backend.provider_session_id(),
             TabBackend::Starting(pending) => pending.resume.clone(),
+            TabBackend::AwaitingTrust(AwaitingTrust {
+                start: DeferredStart::Resume {
+                    provider_session_id, ..
+                },
+                ..
+            }) => Some(provider_session_id.clone()),
             _ => None,
         }
     }
@@ -365,7 +419,7 @@ impl Tab {
     pub fn wire_state(&self) -> TabStateWire {
         match &self.backend {
             TabBackend::NotStarted => TabStateWire::NotStarted,
-            TabBackend::Starting(_) => TabStateWire::Starting,
+            TabBackend::Starting(_) | TabBackend::AwaitingTrust(_) => TabStateWire::Starting,
             TabBackend::Failed { .. } => TabStateWire::Failed,
             TabBackend::Live(backend) => {
                 let ended = matches!(
@@ -991,6 +1045,7 @@ impl TabSet {
         // new one if it builds one.
         self.pending_bypass = None;
         self.pending_restore = None;
+        self.drop_trust_questions();
         let at = self
             .tabs
             .iter()
@@ -1053,6 +1108,7 @@ impl TabSet {
     pub fn cycle_default_mode(&mut self) -> ModeCycle {
         self.pending_bypass = None;
         self.pending_restore = None;
+        self.drop_trust_questions();
         match self.default_mode {
             SessionModeChoice::Bypass => {
                 self.default_mode = SessionModeChoice::Auto;
@@ -1215,17 +1271,157 @@ impl TabSet {
     pub fn drop_bypass_prompt(&mut self) {
         self.pending_bypass = None;
         self.pending_restore = None;
+        self.drop_trust_questions();
+    }
+
+    /// Takes the question off every tab that waits for the trust answer: the tab keeps its start and
+    /// is asked again, with a fresh nonce, when it is next on screen. An answer to the old nonce is
+    /// refused from here on.
+    fn drop_trust_questions(&mut self) {
+        for tab in &mut self.tabs {
+            if let TabBackend::AwaitingTrust(waiting) = &mut tab.backend {
+                waiting.asking = None;
+            }
+        }
+    }
+
+    /// Puts a start off until the trust question is answered. Only an empty tab can wait: a tab with
+    /// a session, one that is connecting and one already waiting each have their own start.
+    pub fn defer_start(&mut self, tab: TabId, start: DeferredStart) -> Result<(), String> {
+        let t = self.get_mut(tab).ok_or_else(|| format!("no tab {}", tab.0))?;
+        match t.backend {
+            TabBackend::NotStarted => {}
+            TabBackend::AwaitingTrust(_) => return Err("this tab is already waiting for the trust question".into()),
+            _ => return Err("only an empty tab can wait for the trust question".into()),
+        }
+        t.backend = TabBackend::AwaitingTrust(AwaitingTrust {
+            start,
+            asking: None,
+            recording: false,
+        });
+        Ok(())
+    }
+
+    /// Opens a question for `tab` under a fresh nonce, replacing any earlier one. It also ends a
+    /// `recording` wait: a record that could not be written asks the tab again.
+    pub fn ask_trust(&mut self, tab: TabId) -> Result<u64, String> {
+        let nonce = self.next_nonce;
+        let t = self.get_mut(tab).ok_or_else(|| format!("no tab {}", tab.0))?;
+        let TabBackend::AwaitingTrust(waiting) = &mut t.backend else {
+            return Err("this tab is not waiting for the trust question".into());
+        };
+        waiting.asking = Some(nonce);
+        waiting.recording = false;
+        self.next_nonce += 1;
+        Ok(nonce)
+    }
+
+    /// Whether an answer carrying `nonce` may be taken for `tab` now: the tab is on screen, waiting,
+    /// not already recording, and the question it shows is this one. Changes nothing.
+    pub fn check_trust_answer(&self, tab: TabId, nonce: u64) -> Result<(), String> {
+        let t = self.get(tab).ok_or_else(|| format!("no tab {}", tab.0))?;
+        if tab != self.active {
+            return Err(format!("tab {} is not the one on screen", t.number));
+        }
+        let TabBackend::AwaitingTrust(waiting) = &t.backend else {
+            return Err("this tab is not waiting for the trust question".into());
+        };
+        if waiting.recording {
+            return Err("the answer is already being recorded".into());
+        }
+        if waiting.asking != Some(nonce) {
+            return Err("that question is no longer current".into());
+        }
+        Ok(())
+    }
+
+    /// An accepted `y`: the question is spent and the tab keeps its start until the worker's second
+    /// look at the disk (and the record, when one is kept) decides what happens to it.
+    pub fn mark_recording(&mut self, tab: TabId, nonce: u64) -> Result<(), String> {
+        self.check_trust_answer(tab, nonce)?;
+        if let Some(Tab {
+            backend: TabBackend::AwaitingTrust(waiting),
+            ..
+        }) = self.get_mut(tab)
+        {
+            waiting.asking = None;
+            waiting.recording = true;
+        }
+        Ok(())
+    }
+
+    /// An answer taken at once (an `n`, which loads nothing): hands the start over and returns the tab
+    /// to empty.
+    pub fn take_answered(&mut self, tab: TabId, nonce: u64) -> Result<DeferredStart, String> {
+        self.check_trust_answer(tab, nonce)?;
+        Ok(self.take_start(tab).expect("checked to be waiting"))
+    }
+
+    /// The start whose `y` the worker confirmed, even when the user has since moved to another tab.
+    pub fn take_recorded(&mut self, tab: TabId) -> Option<DeferredStart> {
+        match &self.get(tab)?.backend {
+            TabBackend::AwaitingTrust(AwaitingTrust { recording: true, .. }) => self.take_start(tab),
+            _ => None,
+        }
+    }
+
+    /// The route that asks nothing (the answer is already known): hands the start over. Refused
+    /// while a record is being written, whose result decides.
+    pub fn take_deferred(&mut self, tab: TabId) -> Option<DeferredStart> {
+        match &self.get(tab)?.backend {
+            TabBackend::AwaitingTrust(AwaitingTrust { recording: false, .. }) => self.take_start(tab),
+            _ => None,
+        }
+    }
+
+    /// `Escape` on the question: puts the start off and returns the tab to empty. The same checks as
+    /// an answer.
+    pub fn cancel_trust(&mut self, tab: TabId, nonce: u64) -> Result<DeferredStart, String> {
+        self.check_trust_answer(tab, nonce)?;
+        Ok(self.take_start(tab).expect("checked to be waiting"))
+    }
+
+    /// The tabs that hold a start for the trust question, in tab order.
+    pub fn awaiting_trust(&self) -> Vec<TabId> {
+        self.tabs
+            .iter()
+            .filter(|t| matches!(t.backend, TabBackend::AwaitingTrust(_)))
+            .map(|t| t.id)
+            .collect()
+    }
+
+    fn take_start(&mut self, tab: TabId) -> Option<DeferredStart> {
+        let t = self.get_mut(tab)?;
+        match std::mem::replace(&mut t.backend, TabBackend::NotStarted) {
+            TabBackend::AwaitingTrust(waiting) => Some(waiting.start),
+            other => {
+                t.backend = other;
+                None
+            }
+        }
     }
 
     /// `r` (ruling 12): an ended or failed tab back to empty, keeping its number, name and mode.
     pub fn reset(&mut self, id: TabId) -> Result<Option<AgentBackend>, String> {
         let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
+        let waiting = matches!(tab.backend, TabBackend::AwaitingTrust(_));
         match tab.wire_state() {
             TabStateWire::Ended | TabStateWire::Failed => {}
+            // A tab waiting for the trust question starts over too: its put-off start is dropped.
+            _ if waiting => {}
             _ => return Err("only an ended or failed tab starts over".to_string()),
         }
-        // Ruling 9: the queue and the unsent draft come back as the draft, oldest first.
-        let mut parts: Vec<String> = std::mem::take(&mut tab.queue).into_iter().map(|q| q.text).collect();
+        // Ruling 9: the queue and the unsent draft come back as the draft, oldest first. A first
+        // message that was put off comes back with them, ahead of the rest: it was typed first.
+        let mut parts: Vec<String> = Vec::new();
+        if let TabBackend::AwaitingTrust(AwaitingTrust {
+            start: DeferredStart::FirstSend { first_turn, .. },
+            ..
+        }) = &tab.backend
+        {
+            parts.push(first_turn.typed.clone());
+        }
+        parts.extend(std::mem::take(&mut tab.queue).into_iter().map(|q| q.text));
         if !tab.draft.trim().is_empty() {
             parts.push(std::mem::take(&mut tab.draft));
         }
@@ -1236,6 +1432,8 @@ impl TabSet {
         tab.user_answered.clear();
         tab.was_running = false;
         let old = std::mem::replace(&mut tab.backend, TabBackend::NotStarted);
+        // An empty tab shows what its next session would get, not what the last one had.
+        tab.project_tiers = None;
         tab.title = None;
         tab.attention.restart();
         tab.stale = false;
@@ -1988,8 +2186,11 @@ impl TabSet {
     /// things to lose are a running turn, a connect in flight, and queued messages -- the facts `close_prompt`
     /// names. `prefix &` does not ask this: it is tmux's `confirm-before` and always asks.
     pub fn close_needs_confirm(&self, id: TabId) -> bool {
-        self.get(id)
-            .is_some_and(|t| matches!(t.backend, TabBackend::Starting(_)) || t.turn_running() || !t.queue.is_empty())
+        self.get(id).is_some_and(|t| {
+            matches!(t.backend, TabBackend::Starting(_) | TabBackend::AwaitingTrust(_))
+                || t.turn_running()
+                || !t.queue.is_empty()
+        })
     }
 
     pub fn close_facts(&self, id: TabId) -> Option<tabs::CloseFacts> {
@@ -2011,7 +2212,12 @@ impl TabSet {
         let entries: Vec<(TabId, bool)> = self
             .tabs
             .iter()
-            .map(|t| (t.id, matches!(t.backend, TabBackend::Starting(_)) || t.turn_running()))
+            .map(|t| {
+                (
+                    t.id,
+                    matches!(t.backend, TabBackend::Starting(_) | TabBackend::AwaitingTrust(_)) || t.turn_running(),
+                )
+            })
             .collect();
         tabs::close_others(&entries, self.active())
     }
@@ -2814,7 +3020,8 @@ mod tests {
 
     fn live(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
         let provider = Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), dir).unwrap();
+        let conversation =
+            AgentConversation::create(provider.clone(), dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
         (provider, AgentBackend::Sidecar(Box::new(conversation)))
     }
 
@@ -4975,7 +5182,8 @@ mod tests {
 
     fn interruptible_live(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
         let provider = Arc::new(RecordingProvider::interruptible());
-        let conversation = AgentConversation::create(provider.clone(), dir).unwrap();
+        let conversation =
+            AgentConversation::create(provider.clone(), dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
         (provider, AgentBackend::Sidecar(Box::new(conversation)))
     }
 
@@ -8292,7 +8500,8 @@ mod tests {
         }
         let tab = set.active();
         let provider = Arc::new(RecordingProvider::cli_auto());
-        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let conversation =
+            AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
         set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Sidecar(Box::new(conversation)));
         let input = serde_json::json!({ "file_path": dir.join("main.rs"), "content": "fn main() { }\n" });
         provider.queue_all(vec![
@@ -8982,5 +9191,358 @@ mod tests {
         assert_eq!(set.review_unavailable(), Some(TURN_REVIEW_OFF));
         let tab = set.active();
         assert_eq!(set.review_session(tab).err().as_deref(), Some(TURN_REVIEW_OFF));
+    }
+    // ---- the trust question: a start put off, and who may answer it ----
+
+    fn first_send(request_id: &str, typed: &str) -> DeferredStart {
+        DeferredStart::FirstSend {
+            request_id: request_id.to_string(),
+            first_turn: FirstTurn {
+                wire: format!("wire: {typed}"),
+                typed: typed.to_string(),
+            },
+        }
+    }
+
+    fn resume_of(request_id: &str, session: &str) -> DeferredStart {
+        DeferredStart::Resume {
+            request_id: request_id.to_string(),
+            provider_session_id: session.to_string(),
+            resumed_title: Some("a title".into()),
+            resumed_name: None,
+        }
+    }
+
+    fn pending_connect() -> PendingStart {
+        PendingStart {
+            request_id: "r-pending".into(),
+            result_rx: mpsc::channel().1,
+            first_turn: None,
+            resume: None,
+            resumed_title: None,
+            resumed_name: None,
+        }
+    }
+
+    /// A set whose active tab waits for the trust question, already asked: `(set, tab, nonce)`.
+    fn asked(start: DeferredStart) -> (TabSet, TabId, u64) {
+        let mut set = set();
+        let tab = set.active();
+        set.defer_start(tab, start).unwrap();
+        let nonce = set.ask_trust(tab).unwrap();
+        (set, tab, nonce)
+    }
+
+    fn awaiting(set: &TabSet, tab: TabId) -> &AwaitingTrust {
+        match &set.get(tab).unwrap().backend {
+            TabBackend::AwaitingTrust(waiting) => waiting,
+            _ => panic!("the tab is not awaiting trust"),
+        }
+    }
+
+    #[test]
+    fn defer_start_needs_an_empty_tab() {
+        let dir = workspace("trust-defer-needs-empty");
+        let mut set = set();
+        let starting = set.active();
+        set.get_mut(starting).unwrap().backend = TabBackend::Starting(pending_connect());
+        assert!(set.defer_start(starting, first_send("r1", "hi")).is_err(), "Starting");
+        let running = set.open();
+        give_session(&mut set, running, &dir, "sess-live");
+        assert!(set.defer_start(running, first_send("r2", "hi")).is_err(), "Live");
+        let empty = set.open();
+        set.defer_start(empty, first_send("r3", "hi")).unwrap();
+        assert!(
+            set.defer_start(empty, first_send("r4", "again")).is_err(),
+            "AwaitingTrust"
+        );
+        assert!(
+            set.defer_start(TabId(999), first_send("r5", "hi")).is_err(),
+            "no such tab"
+        );
+        assert!(
+            matches!(set.get(starting).unwrap().backend, TabBackend::Starting(_)),
+            "a refused deferral changes nothing"
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_waiting_tab_is_shown_as_starting() {
+        let (set, tab, _) = asked(first_send("r1", "hi"));
+        assert_eq!(set.get(tab).unwrap().wire_state(), TabStateWire::Starting);
+        assert!(
+            set.close_needs_confirm(tab),
+            "closing it would lose the message it holds"
+        );
+    }
+
+    #[test]
+    fn ask_trust_rotates_the_nonce() {
+        let (mut set, tab, first) = asked(first_send("r1", "hi"));
+        let second = set.ask_trust(tab).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, 0, "0 is never a valid nonce");
+        assert_eq!(awaiting(&set, tab).asking, Some(second));
+        assert!(set.ask_trust(TabId(999)).is_err());
+        let empty = set.open();
+        assert!(set.ask_trust(empty).is_err(), "a tab with nothing to ask about");
+    }
+
+    #[test]
+    fn an_old_nonce_is_refused() {
+        let (mut set, tab, first) = asked(first_send("r1", "hi"));
+        let second = set.ask_trust(tab).unwrap();
+        assert!(set.check_trust_answer(tab, first).is_err());
+        assert!(set.mark_recording(tab, first).is_err());
+        assert!(set.take_answered(tab, first).is_err());
+        assert!(set.cancel_trust(tab, first).is_err());
+        assert!(
+            awaiting(&set, tab).asking == Some(second),
+            "refusals leave the question as it was"
+        );
+        assert!(set.check_trust_answer(tab, second).is_ok());
+        assert!(set.check_trust_answer(tab, 0).is_err());
+    }
+
+    #[test]
+    fn an_answer_for_a_tab_not_on_screen_is_refused() {
+        let (mut set, first, _) = asked(first_send("r1", "hi"));
+        let other = set.open();
+        assert_eq!(set.active(), other);
+        let nonce = set.ask_trust(first).unwrap();
+        let why = set.check_trust_answer(first, nonce).unwrap_err();
+        assert!(why.contains("not the one on screen"), "{why}");
+        assert!(set.mark_recording(first, nonce).is_err());
+        assert!(set.take_answered(first, nonce).is_err());
+        assert!(set.cancel_trust(first, nonce).is_err());
+        assert!(matches!(set.get(first).unwrap().backend, TabBackend::AwaitingTrust(_)));
+        assert!(
+            set.check_trust_answer(other, nonce).is_err(),
+            "and not for a tab that waits for nothing"
+        );
+        set.select(first);
+        let nonce = set.ask_trust(first).unwrap();
+        assert!(
+            set.check_trust_answer(first, nonce).is_ok(),
+            "on screen again, asked again"
+        );
+    }
+
+    #[test]
+    fn routing_away_invalidates_the_prompt() {
+        for how in ["select", "drop_bypass_prompt", "cycle_mode", "cycle_default_mode"] {
+            let (mut set, tab, nonce) = asked(first_send("r1", "hi"));
+            match how {
+                "select" => {
+                    let other = set.open();
+                    assert_ne!(other, tab);
+                    set.select(tab);
+                }
+                "drop_bypass_prompt" => set.drop_bypass_prompt(),
+                "cycle_mode" => {
+                    let _ = set.cycle_mode(tab);
+                }
+                _ => {
+                    let _ = set.cycle_default_mode();
+                }
+            }
+            assert!(
+                set.check_trust_answer(tab, nonce).is_err(),
+                "{how}: the old nonce is refused"
+            );
+            assert!(set.take_answered(tab, nonce).is_err(), "{how}");
+            let waiting = awaiting(&set, tab);
+            assert_eq!(waiting.asking, None, "{how}");
+            assert!(!waiting.recording, "{how}");
+            let fresh = set.ask_trust(tab).unwrap();
+            assert!(
+                set.check_trust_answer(tab, fresh).is_ok(),
+                "{how}: showing it again asks again"
+            );
+        }
+    }
+
+    #[test]
+    fn check_trust_answer_consumes_nothing() {
+        let (set, tab, nonce) = asked(first_send("r1", "hi"));
+        assert!(set.check_trust_answer(tab, nonce + 1).is_err());
+        assert!(set.check_trust_answer(tab, nonce).is_ok());
+        assert!(set.check_trust_answer(tab, nonce).is_ok(), "a second look still passes");
+        let waiting = awaiting(&set, tab);
+        assert_eq!(waiting.asking, Some(nonce));
+        assert!(!waiting.recording);
+        assert!(matches!(waiting.start, DeferredStart::FirstSend { .. }));
+    }
+
+    #[test]
+    fn an_accepted_answer_hands_the_start_over_once() {
+        let (mut set, tab, nonce) = asked(first_send("r1", "hi"));
+        let start = set.take_answered(tab, nonce).unwrap();
+        assert_eq!(start.request_id(), Some("r1"));
+        assert!(matches!(set.get(tab).unwrap().backend, TabBackend::NotStarted));
+        assert!(set.take_answered(tab, nonce).is_err(), "the answer is spent");
+
+        let (mut set, tab, nonce) = asked(resume_of("r2", "sess-9"));
+        let start = set.cancel_trust(tab, nonce).unwrap();
+        assert!(
+            matches!(start, DeferredStart::Resume { ref provider_session_id, .. } if provider_session_id == "sess-9")
+        );
+        assert!(matches!(set.get(tab).unwrap().backend, TabBackend::NotStarted));
+        assert!(set.awaiting_trust().is_empty());
+    }
+
+    #[test]
+    fn a_recording_tab_waits_for_its_record() {
+        let (mut set, tab, nonce) = asked(first_send("r1", "hi"));
+        set.mark_recording(tab, nonce).unwrap();
+        let waiting = awaiting(&set, tab);
+        assert!(waiting.recording);
+        assert_eq!(waiting.asking, None);
+        assert!(set.check_trust_answer(tab, nonce).is_err(), "the nonce is spent");
+        assert!(set.take_answered(tab, nonce).is_err());
+        assert!(set.cancel_trust(tab, nonce).is_err());
+        assert!(
+            set.mark_recording(tab, nonce).is_err(),
+            "no second record for one answer"
+        );
+        assert!(
+            set.take_deferred(tab).is_none(),
+            "the record's result decides, not the no-ask route"
+        );
+        assert!(matches!(set.get(tab).unwrap().backend, TabBackend::AwaitingTrust(_)));
+
+        // The user went to another tab meanwhile: the record's result still finds its start.
+        let other = set.open();
+        assert_eq!(set.active(), other);
+        let start = set.take_recorded(tab).expect("the start is still held");
+        assert_eq!(start.request_id(), Some("r1"));
+        assert!(matches!(set.get(tab).unwrap().backend, TabBackend::NotStarted));
+        assert!(set.take_recorded(tab).is_none(), "handed over once");
+
+        // A record that failed asks the tab again, which ends the wait.
+        let (mut set, tab, nonce) = asked(first_send("r2", "hi"));
+        set.mark_recording(tab, nonce).unwrap();
+        let again = set.ask_trust(tab).unwrap();
+        assert_ne!(again, nonce);
+        let waiting = awaiting(&set, tab);
+        assert!(!waiting.recording);
+        assert_eq!(waiting.asking, Some(again));
+        assert!(set.take_recorded(tab).is_none(), "nothing is being recorded any more");
+    }
+
+    #[test]
+    fn take_recorded_and_take_deferred_need_the_right_state() {
+        let mut set = set();
+        let tab = set.active();
+        assert!(set.take_deferred(tab).is_none(), "an empty tab holds nothing");
+        assert!(set.take_recorded(tab).is_none());
+        set.defer_start(tab, first_send("r1", "hi")).unwrap();
+        assert!(set.take_recorded(tab).is_none(), "not recording");
+        let start = set.take_deferred(tab).expect("the no-ask route needs no question");
+        assert_eq!(start.request_id(), Some("r1"));
+        assert!(matches!(set.get(tab).unwrap().backend, TabBackend::NotStarted));
+        assert!(set.take_deferred(TabId(999)).is_none());
+    }
+
+    #[test]
+    fn reset_hands_back_a_deferred_first_send() {
+        let (mut set, tab, _) = asked(first_send("r1", "fix the build"));
+        set.get_mut(tab).unwrap().draft = "and then the tests".into();
+        let old = set.reset(tab).expect("a waiting tab starts over");
+        assert!(old.is_none(), "nothing was spawned");
+        let t = set.get(tab).unwrap();
+        assert!(matches!(t.backend, TabBackend::NotStarted));
+        assert_eq!(
+            t.draft, "fix the build\n\nand then the tests",
+            "the typed text comes back first"
+        );
+        assert_eq!(t.project_tiers, None);
+        assert!(set.awaiting_trust().is_empty());
+
+        // A resume has no text to give back: it is dropped.
+        let (mut set, tab, _) = asked(resume_of("r2", "sess-1"));
+        assert!(set.reset(tab).unwrap().is_none());
+        assert!(set.get(tab).unwrap().draft.is_empty());
+        assert!(matches!(set.get(tab).unwrap().backend, TabBackend::NotStarted));
+    }
+
+    #[test]
+    fn closing_an_awaiting_tab_drops_its_start() {
+        let (mut set, tab, nonce) = asked(first_send("r1", "hi"));
+        let other = set.open();
+        let closed = set.remove(tab).expect("the tab closes");
+        match closed.backend {
+            TabBackend::AwaitingTrust(waiting) => assert_eq!(waiting.start.request_id(), Some("r1")),
+            _ => panic!("the tab was waiting"),
+        }
+        assert!(set.get(tab).is_none());
+        assert!(set.awaiting_trust().is_empty());
+        assert!(
+            set.check_trust_answer(tab, nonce).is_err(),
+            "no answer reaches a closed tab"
+        );
+        assert_eq!(set.active(), other);
+    }
+
+    #[test]
+    fn an_awaiting_tab_refuses_a_second_send_and_a_resume() {
+        let (mut set, tab, _) = asked(resume_of("r1", "sess-wait"));
+        assert!(
+            set.defer_start(tab, first_send("r2", "again")).is_err(),
+            "a second start"
+        );
+        assert_eq!(
+            set.get(tab).unwrap().provider_session_id().as_deref(),
+            Some("sess-wait"),
+            "the session it will resume is known"
+        );
+        let other = set.open();
+        // Resuming the same session again switches to the tab that already holds it: no second start.
+        assert!(matches!(set.route_resume(other, "sess-wait", false), ResumeRoute::SwitchTo(t) if t == tab));
+        // A tab with a message waiting is not "empty": a resume from it opens another tab.
+        let (mut set, waiting, _) = asked(first_send("r3", "hi"));
+        match set.route_resume(waiting, "sess-new", false) {
+            ResumeRoute::StartIn(target) => assert_ne!(target, waiting),
+            _ => panic!("expected a new tab"),
+        }
+        assert!(matches!(
+            set.get(waiting).unwrap().backend,
+            TabBackend::AwaitingTrust(_)
+        ));
+    }
+
+    #[test]
+    fn a_deferred_restore_starts_nothing() {
+        let mut set = set();
+        let from = set.active();
+        let plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Auto),
+                planned("b", SessionModeChoice::Auto),
+            ],
+            None,
+        );
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing in bypass, nothing to ask")
+        };
+        assert_eq!(go.session_ids(), ["a", "b"]);
+        set.defer_start(from, DeferredStart::Restore { go }).unwrap();
+        assert_eq!(set.awaiting_trust(), [from]);
+        assert_eq!(set.tabs().len(), 1, "no tab was opened for the sessions");
+        assert!(
+            set.tabs().iter().all(|t| !matches!(t.backend, TabBackend::Starting(_))),
+            "nothing is starting"
+        );
+        assert!(set.open_session_ids().is_empty(), "no lease or session is named yet");
+        let nonce = set.ask_trust(from).unwrap();
+        let DeferredStart::Restore { go } = set.take_answered(from, nonce).unwrap() else {
+            panic!("the restore comes back")
+        };
+        assert_eq!(
+            go.session_ids(),
+            ["a", "b"],
+            "intact, ready to start when the answer allows it"
+        );
     }
 }

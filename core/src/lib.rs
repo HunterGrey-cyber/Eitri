@@ -33,6 +33,7 @@ pub mod panel_cadence;
 pub mod panel_control;
 pub mod permission_store;
 pub mod project_root;
+pub mod project_trust;
 pub mod prompt_history;
 pub mod review_editor;
 pub mod saved_tabs;

@@ -26,6 +26,7 @@ use crate::provider::{
     StreamingPreference,
 };
 use crate::runtime_thread::RuntimeThread;
+use crate::setting_sources::{ProjectTrust, Source};
 use crate::AgentDomainEvent;
 use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use claude_runtime_protocol::v1::{
@@ -655,6 +656,7 @@ fn build_create_request(
     fork: bool,
     provider_prompts: bool,
     cli_mode: crate::RequestedCliMode,
+    project: ProjectTrust,
 ) -> ProtoCreateSessionRequest {
     build_create_request_loading(
         cwd,
@@ -663,25 +665,27 @@ fn build_create_request(
         fork,
         provider_prompts,
         crate::setting_sources::loads_user_settings(),
+        project,
         cli_mode,
     )
 }
 
-/// The settings tiers a session asks for, in the proto enum's order. The user tier is the user's
-/// own `~/.claude` (hooks, plugins, skills, `CLAUDE.md`, permission rules); it is left out only
-/// when `agent.user_settings` is false.
-fn setting_sources_for(user_settings: bool) -> Vec<i32> {
-    let mut sources = Vec::with_capacity(3);
-    if user_settings {
-        sources.push(SettingSource::User as i32);
-    }
-    sources.push(SettingSource::Project as i32);
-    sources.push(SettingSource::Local as i32);
+/// The settings tiers on the wire, in the order given. The one place the proto's tier names are
+/// written: every selection comes from `setting_sources::for_session`.
+fn proto_sources(sources: &[Source]) -> Vec<i32> {
     sources
+        .iter()
+        .map(|source| match source {
+            Source::User => SettingSource::User as i32,
+            Source::Project => SettingSource::Project as i32,
+            Source::Local => SettingSource::Local as i32,
+        })
+        .collect()
 }
 
 /// [`build_create_request`] with the user tier named instead of read from the process-wide choice,
-/// so both selections can be built and compared in one process.
+/// so every selection can be built and compared in one process.
+#[allow(clippy::too_many_arguments)]
 fn build_create_request_loading(
     cwd: String,
     streaming: StreamingPreference,
@@ -689,6 +693,7 @@ fn build_create_request_loading(
     fork: bool,
     provider_prompts: bool,
     user_settings: bool,
+    project: ProjectTrust,
     cli_mode: crate::RequestedCliMode,
 ) -> ProtoCreateSessionRequest {
     let denied = crate::process::disallowed_tools();
@@ -719,12 +724,17 @@ fn build_create_request_loading(
             // the axis that distinguishes a real project from an isolated one. Eitri has no
             // product answer for `Isolated` yet (no UI, config or Lua seam picks it), and there is a
             // trap waiting there -- see `agent/MANUAL_VERIFICATION.md`.
+            //
+            // Always present, even when the list is empty: an absent selection defers to the
+            // configuration, which loads all three tiers, so an untrusted session with the user
+            // tier off must say "none" rather than say nothing.
             setting_sources: Some(SettingSourceSelection {
                 // The user tier by default, so a session behaves as `claude` does in a terminal:
                 // the user's own hooks, plugins, skills, `CLAUDE.md` and permission rules apply.
-                // `agent.user_settings = false` leaves it out. The permission gate does not depend
-                // on which is chosen: it comes from this request's `INTERACTIVE` policy.
-                sources: setting_sources_for(user_settings),
+                // `agent.user_settings = false` leaves it out. The project and local tiers load
+                // only for a session started as trusted. The permission gate does not depend on
+                // which is chosen: it comes from this request's `INTERACTIVE` policy.
+                sources: proto_sources(crate::setting_sources::for_session(user_settings, project)),
             }),
             // Bound once: `deny` and `unrestricted` are two statements about the same list, and the
             // sidecar refuses the pair if they disagree.
@@ -790,6 +800,45 @@ fn build_create_request_loading(
     }
 }
 
+/// The wire request for a fresh session. Destructured whole, so a field added to the request has to
+/// be placed here rather than dropped on the way to the wire.
+fn fresh_request(
+    request: CreateSessionRequest,
+    provider_prompts: bool,
+    cli_mode: crate::RequestedCliMode,
+) -> ProtoCreateSessionRequest {
+    let CreateSessionRequest {
+        cwd,
+        streaming,
+        project,
+    } = request;
+    build_create_request(cwd, streaming, None, false, provider_prompts, cli_mode, project)
+}
+
+/// The wire request continuing a Claude session, under the trust the caller states now. Destructured
+/// whole, as [`fresh_request`] is.
+fn resume_request(
+    request: ResumeSessionRequest,
+    provider_prompts: bool,
+    cli_mode: crate::RequestedCliMode,
+) -> ProtoCreateSessionRequest {
+    let ResumeSessionRequest {
+        provider_session_id,
+        cwd,
+        streaming,
+        project,
+    } = request;
+    build_create_request(
+        cwd,
+        streaming,
+        Some(provider_session_id),
+        false,
+        provider_prompts,
+        cli_mode,
+        project,
+    )
+}
+
 impl AgentProvider for ClaudeSidecarProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities
@@ -803,11 +852,8 @@ impl AgentProvider for ClaudeSidecarProvider {
     /// another one.
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
         self.require_interactive()?;
-        self.open_session(build_create_request(
-            request.cwd,
-            request.streaming,
-            None,
-            false,
+        self.open_session(fresh_request(
+            request,
             self.provider_prompts,
             requested_cli_mode(&self.capabilities),
         ))
@@ -836,11 +882,8 @@ impl AgentProvider for ClaudeSidecarProvider {
         // Checked on this path too, not only on create: resuming does not inherit the policy the
         // original session ran under, and the resumed session is created gated like any other.
         self.require_interactive()?;
-        self.open_session(build_create_request(
-            request.cwd,
-            request.streaming,
-            Some(request.provider_session_id),
-            false,
+        self.open_session(resume_request(
+            request,
             self.provider_prompts,
             requested_cli_mode(&self.capabilities),
         ))
@@ -963,6 +1006,7 @@ mod tests {
                         false,
                         true,
                         cli_mode,
+                        ProjectTrust::Untrusted,
                     ),
                 ),
                 (
@@ -974,6 +1018,7 @@ mod tests {
                         false,
                         true,
                         cli_mode,
+                        ProjectTrust::Untrusted,
                     ),
                 ),
                 (
@@ -985,6 +1030,7 @@ mod tests {
                         true,
                         true,
                         cli_mode,
+                        ProjectTrust::Untrusted,
                     ),
                 ),
             ]
@@ -1040,6 +1086,7 @@ mod tests {
                     fork,
                     offered,
                     crate::RequestedCliMode::Default,
+                    ProjectTrust::Untrusted,
                 )
                 .policy
                 .expect("a policy is always sent");
@@ -1054,83 +1101,218 @@ mod tests {
         }
     }
 
-    /// `prefix i`'s `settings` row (`setting_sources::note`) says what every session loads, so the
-    /// request has to ask for exactly that. By default the sidecar is sent `[USER, PROJECT, LOCAL]`,
-    /// in the proto enum's order, on a fresh, a resumed and a forked session alike; with
-    /// `agent.user_settings = false` it is `[PROJECT, LOCAL]` and the note says the user's
-    /// `~/.claude` is not loaded. The selection is stated on every request, never left to the CLI's
-    /// own default. If either has to change, the note changes with it: it is what the panel tells
-    /// the user.
+    const SHAPES: [(&str, Option<&str>, bool); 3] = [
+        ("fresh", None, false),
+        ("resume", Some("claude-id"), false),
+        ("fork", Some("claude-id"), true),
+    ];
+
+    fn sources_sent(user_settings: bool, project: ProjectTrust, resume: Option<&str>, fork: bool) -> Option<Vec<i32>> {
+        build_create_request_loading(
+            "/p".into(),
+            StreamingPreference::Partial,
+            resume.map(str::to_string),
+            fork,
+            false,
+            user_settings,
+            project,
+            crate::RequestedCliMode::Default,
+        )
+        .policy
+        .expect("a policy is always sent")
+        .setting_sources
+        .map(|selection| selection.sources)
+    }
+
+    const ALL_THREE: [i32; 3] = [
+        SettingSource::User as i32,
+        SettingSource::Project as i32,
+        SettingSource::Local as i32,
+    ];
+
+    #[test]
+    fn an_untrusted_sidecar_request_names_only_user() {
+        for (shape, resume, fork) in SHAPES {
+            assert_eq!(
+                build_create_request_loading(
+                    "/p".into(),
+                    StreamingPreference::Partial,
+                    resume.map(str::to_string),
+                    fork,
+                    false,
+                    true,
+                    ProjectTrust::Untrusted,
+                    crate::RequestedCliMode::Default,
+                )
+                .policy
+                .expect("a policy is always sent")
+                .setting_sources,
+                Some(SettingSourceSelection {
+                    sources: vec![SettingSource::User as i32]
+                }),
+                "{shape}"
+            );
+        }
+    }
+
+    /// An absent selection defers to the configuration, which loads every tier, so "no tier" has to
+    /// be a present, empty list -- in the struct and after a trip over the wire.
+    #[test]
+    fn an_untrusted_request_without_user_settings_sends_a_present_empty_list() {
+        use prost::Message as _;
+        for (shape, resume, fork) in SHAPES {
+            let request = build_create_request_loading(
+                "/p".into(),
+                StreamingPreference::Partial,
+                resume.map(str::to_string),
+                fork,
+                false,
+                false,
+                ProjectTrust::Untrusted,
+                crate::RequestedCliMode::Default,
+            );
+            let selection = request.policy.clone().expect("a policy is always sent").setting_sources;
+            assert_ne!(selection, None, "{shape}: never absent");
+            assert_eq!(selection, Some(SettingSourceSelection { sources: vec![] }), "{shape}");
+
+            let decoded = ProtoCreateSessionRequest::decode(request.encode_to_vec().as_slice()).expect("decodes");
+            assert_eq!(
+                decoded.policy.expect("a policy is always sent").setting_sources,
+                Some(SettingSourceSelection { sources: vec![] }),
+                "{shape}: the empty selection is still present after encoding"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trusted_request_names_all_three() {
+        for (shape, resume, fork) in SHAPES {
+            assert_eq!(
+                sources_sent(true, ProjectTrust::Trusted, resume, fork),
+                Some(ALL_THREE.to_vec()),
+                "{shape}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trusted_request_without_user_names_project_and_local() {
+        for (shape, resume, fork) in SHAPES {
+            assert_eq!(
+                sources_sent(false, ProjectTrust::Trusted, resume, fork),
+                Some(vec![SettingSource::Project as i32, SettingSource::Local as i32]),
+                "{shape}"
+            );
+        }
+    }
+
+    /// A resume states the trust it is given now; nothing carries the original session's tiers
+    /// over. The fresh path is held to the same.
+    #[test]
+    fn a_resume_request_carries_the_sessions_trust() {
+        let resume = |project| {
+            resume_request(
+                ResumeSessionRequest {
+                    provider_session_id: "claude-id".into(),
+                    cwd: "/p".into(),
+                    streaming: StreamingPreference::Partial,
+                    project,
+                },
+                false,
+                crate::RequestedCliMode::Default,
+            )
+        };
+        let fresh = |project| {
+            fresh_request(
+                CreateSessionRequest {
+                    cwd: "/p".into(),
+                    streaming: StreamingPreference::Partial,
+                    project,
+                },
+                false,
+                crate::RequestedCliMode::Default,
+            )
+        };
+        let sources = |request: ProtoCreateSessionRequest| request.policy.unwrap().setting_sources.unwrap().sources;
+
+        let untrusted = resume(ProjectTrust::Untrusted);
+        assert_eq!(untrusted.resume_provider_session_id.as_deref(), Some("claude-id"));
+        assert!(!untrusted.fork);
+        assert_eq!(sources(untrusted), vec![SettingSource::User as i32]);
+        assert_eq!(sources(resume(ProjectTrust::Trusted)), ALL_THREE.to_vec());
+
+        let fresh_untrusted = fresh(ProjectTrust::Untrusted);
+        assert_eq!(fresh_untrusted.resume_provider_session_id, None);
+        assert_eq!(sources(fresh_untrusted), vec![SettingSource::User as i32]);
+        assert_eq!(sources(fresh(ProjectTrust::Trusted)), ALL_THREE.to_vec());
+    }
+
+    /// `prefix i`'s `settings` row (`setting_sources::note_for_session`) says what a session loads,
+    /// so the request has to ask for exactly that: for each of the four selections, on a fresh, a
+    /// resumed and a forked session alike, the tiers sent are the ones the sentence names, in the
+    /// proto enum's order, and the selection is stated on every request, never left to the CLI's
+    /// own default.
     #[test]
     fn every_request_loads_the_tiers_the_note_says() {
-        for (user_settings, expected, note_says) in [
+        for (user_settings, project, expected, note_says) in [
             (
                 true,
-                vec![
-                    SettingSource::User as i32,
-                    SettingSource::Project as i32,
-                    SettingSource::Local as i32,
-                ],
+                ProjectTrust::Trusted,
+                ALL_THREE.to_vec(),
                 "user + project + local",
             ),
             (
                 false,
+                ProjectTrust::Trusted,
                 vec![SettingSource::Project as i32, SettingSource::Local as i32],
                 "project + local only",
             ),
+            (
+                true,
+                ProjectTrust::Untrusted,
+                vec![SettingSource::User as i32],
+                "user only",
+            ),
+            (false, ProjectTrust::Untrusted, vec![], "nothing"),
         ] {
-            for (shape, resume, fork) in [
-                ("fresh", None, false),
-                ("resume", Some("claude-id".to_string()), false),
-                ("fork", Some("claude-id".to_string()), true),
-            ] {
-                let policy = build_create_request_loading(
-                    "/p".into(),
-                    StreamingPreference::Partial,
-                    resume,
-                    fork,
-                    false,
-                    user_settings,
-                    crate::RequestedCliMode::Default,
-                )
-                .policy
-                .expect("a policy is always sent");
-                let sources = policy
-                    .setting_sources
-                    .expect("stated on every request, never left to the CLI's own default");
-                assert_eq!(sources.sources, expected, "{shape}, user_settings={user_settings}");
+            for (shape, resume, fork) in SHAPES {
+                assert_eq!(
+                    sources_sent(user_settings, project, resume, fork),
+                    Some(expected.clone()),
+                    "{shape}, user_settings={user_settings}, {project:?}"
+                );
             }
-            let note = crate::setting_sources::note_for(user_settings);
+            let note = crate::setting_sources::note_for_session(user_settings, project);
             assert!(
                 note.starts_with(note_says),
-                "user_settings={user_settings}: the note says what loads: {note}"
+                "user_settings={user_settings}, {project:?}: the note says what loads: {note}"
             );
         }
     }
 
     /// With nothing configured -- the state every test runs in, and the shipped default -- the
-    /// request every session goes through loads the user tier, and the note says so.
+    /// request every session goes through loads the user tier, and the project's tiers only when
+    /// the session is trusted.
     #[test]
-    fn the_default_request_loads_the_user_tier_and_the_note_says_so() {
-        let policy = build_create_request(
-            "/p".into(),
-            StreamingPreference::Partial,
-            None,
-            false,
-            false,
-            crate::RequestedCliMode::Default,
-        )
-        .policy
-        .expect("a policy is always sent");
-        assert_eq!(
-            policy.setting_sources.expect("stated").sources,
-            vec![
-                SettingSource::User as i32,
-                SettingSource::Project as i32,
-                SettingSource::Local as i32
-            ]
-        );
-        assert_eq!(crate::setting_sources::note(), crate::setting_sources::NOTE_WITH_USER);
+    fn the_default_request_loads_the_user_tier_and_the_project_only_when_trusted() {
+        let sent = |project| {
+            build_create_request(
+                "/p".into(),
+                StreamingPreference::Partial,
+                None,
+                false,
+                false,
+                crate::RequestedCliMode::Default,
+                project,
+            )
+            .policy
+            .expect("a policy is always sent")
+            .setting_sources
+            .expect("stated")
+            .sources
+        };
+        assert_eq!(sent(ProjectTrust::Untrusted), vec![SettingSource::User as i32]);
+        assert_eq!(sent(ProjectTrust::Trusted), ALL_THREE.to_vec());
     }
 
     /// The shape the real sidecar returns at the revision this crate pins
@@ -1424,6 +1606,7 @@ mod tests {
                     fork,
                     true,
                     true,
+                    ProjectTrust::Untrusted,
                     cli_mode,
                 )
             };

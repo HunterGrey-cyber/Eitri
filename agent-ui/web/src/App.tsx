@@ -89,6 +89,9 @@ import { HintLayer } from "./components/HintLayer";
 import type { ShownHint } from "./components/HintLayer";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { ReviewOverlay } from "./components/ReviewOverlay";
+import { TrustPrompt } from "./components/TrustPrompt";
+import { parseTrustCommand, resolveTrustKey, scrollTarget, TRUST_BAND_PROMPT, TRUST_WAIT_FLASH, trustFooter } from "./trust";
+import type { TrustKeyEvent, TrustPromptEnvelope } from "./trust";
 import {
   applyReviewKey,
   boxUnderCursor,
@@ -610,12 +613,17 @@ export default function App() {
    *
    *  `"review"` is the review overlay's `review_request`/`review_diff_request`: Rust refuses one with a
    *  reason (no session, no such turn, git unavailable) and no envelope follows, so the overlay says it in
-   *  its own header rather than in the conversation's banner. */
+   *  its own header rather than in the conversation's banner.
+   *
+   *  `"trust"` is a trust question's answer or `Escape`, and `:trust`/`:untrust`. Rust says in a notice what
+   *  the user needs to know about one (out of date, asked again, could not be recorded); a refusal without
+   *  one is an `n`, an `Escape` or a move away from the question, which the user did themselves. Neither is
+   *  drawn again, and never in the banner reserved for what breaks the conversation. */
   const inFlight = useRef<
     Map<
       string,
       {
-        kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command";
+        kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust";
         tab: TabId;
         text?: string;
         permissionId?: string;
@@ -1334,6 +1342,11 @@ export default function App() {
     // A restore found a tab saved in bypass and asks before giving it back: `y` as saved, `n` in auto.
     // The same on-screen wait and lone-key guard as `bypass`, since a `y` here also enters bypass.
     | { kind: "restore"; nonce: number; lines: string[]; openedAt: number }
+    // The question before this tab's session loads the project's own Claude configuration. `view` is the
+    // envelope as shown, and an answer echoes its `fingerprint` and `findingsDigest` and nothing recomputed
+    // here. The same on-screen wait and lone-key guard as `bypass`, since a `y` loads a repository's hooks.
+    // `flashAfter` is the flash counter when it opened: only a flash made since then is about this question.
+    | { kind: "trust"; tab: TabId; nonce: number; view: TrustPromptEnvelope; lines: string[]; openedAt: number; flashAfter: number }
     | null
   >(null);
   /** `prefix w` (spec §3.6): the open-tabs-then-records overlay, or `null` when closed. Set by a
@@ -1490,6 +1503,47 @@ export default function App() {
    *  to do with any prompt) is never mistakenly swallowed just because this key answered a prompt
    *  once, earlier in the session. `null` when nothing consumed by a prompt is still physically held. */
   const promptSwallowKeyRef = useRef<string | null>(null);
+  /** The trust question's own scroll box, and whether the key before this one was the first `g` of `gg`. */
+  const trustOverlayRef = useRef<HTMLDivElement>(null);
+  const trustPendingGRef = useRef(false);
+  /** The trust question Rust sent last, until it can take the keys. */
+  const [heldTrust, setHeldTrust] = useState<TrustPromptEnvelope | null>(null);
+  /* A trust question opens only once no other prompt, field or picker holds the keys. A close, bypass or restore
+     prompt answers the next `y`, and the rename field, the chooser, the `:` line and the `gf` picker take typed
+     letters; opening over any of them would make the key meant for it an answer to this question, and a `y` here
+     loads a repository's hooks. So it waits, and opens with its own on-screen wait once they are gone. A route
+     away drops it (`cancelBypassConfirm`, `endKeyPrompts`); Rust asks again afterwards. Another trust question
+     on screen is replaced, with its own fingerprint and digest. */
+  const keysTakenElsewhere =
+    (confirm !== null && confirm.kind !== "trust") ||
+    renaming !== null ||
+    chooser !== null ||
+    exLine !== null ||
+    pathPick !== null;
+  useLayoutEffect(() => {
+    if (heldTrust === null || keysTakenElsewhere) return;
+    const payload = heldTrust;
+    setHeldTrust(null);
+    // An overlay that takes the keys ends a pending sequence, as every confirm kind does.
+    dropPendingKeys();
+    exitRegion();
+    setDetail(null);
+    setHandoffOpen(false);
+    setKeymapOpen(false);
+    // The keys must be somewhere that is not a text field: a first send leaves them in the composer, and
+    // a key typed into a field is never an answer.
+    (containerRef.current ?? startScreenRef.current)?.focus({ preventScroll: true });
+    trustPendingGRef.current = false;
+    setConfirm({
+      kind: "trust",
+      tab: payload.tab,
+      nonce: payload.nonce,
+      view: payload,
+      lines: [TRUST_BAND_PROMPT],
+      openedAt: performance.now(),
+      flashAfter: flashSeq.current,
+    });
+  }, [heldTrust, keysTakenElsewhere]);
   useEffect(() => {
     function clearPromptSwallow(event: globalThis.KeyboardEvent) {
       if (event.key === promptSwallowKeyRef.current) promptSwallowKeyRef.current = null;
@@ -3070,7 +3124,9 @@ export default function App() {
         }
         if (!payload.ok) {
           console.warn("agent-ui: command failed", payload.requestId, payload.error);
-          if (record?.kind === "review-command" || record?.review === true) {
+          if (record?.kind === "trust") {
+            // Already said, if it needed saying (see `inFlight`).
+          } else if (record?.kind === "review-command" || record?.review === true) {
             // The overlay's own command was refused (a revert that no longer matches the disk, a running
             // turn, no editor link): said on its status line, where the key was pressed. Not the
             // conversation's banner, and not a flash that would fade before it was read.
@@ -3297,6 +3353,12 @@ export default function App() {
         setKeymapOpen(false);
         // A second envelope while one is open replaces it, restarting its on-screen wait.
         setConfirm({ kind: "restore", nonce: payload.nonce, lines: payload.lines, openedAt: performance.now() });
+      } else if (payload.kind === "trust_prompt") {
+        // Not drawn here: the layout effect beside `heldTrust` opens it once nothing else holds the
+        // keys. Rust asks again whenever a tab waiting for the answer is on screen without its question,
+        // the moment after a close prompt, a rename field or the chooser took the keys included; drawn
+        // at once, it took the `y` meant for that prompt or typed into that field.
+        setHeldTrust(payload);
       } else if (payload.kind === "chooser") {
         // Spec §2.4's cancel list (the chooser, a prompt, a landing on a card): an overlay that takes
         // the keys ends a pending sequence, box and reserved prefix included, so a key the overlay
@@ -3837,7 +3899,8 @@ export default function App() {
    *  that hands the keys to something else calls `endKeyPrompts` (below) instead, which ends all three kinds of
    *  prompt, because a `y` typed into what such a route opens answered a close prompt too. */
   function cancelBypassConfirm() {
-    setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" ? null : c));
+    setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "trust" ? null : c));
+    setHeldTrust(null);
   }
 
   /** rc.4 review (Codex, then the coordinator): what a route that hands the keys to something else ends -- every
@@ -3855,6 +3918,7 @@ export default function App() {
   function endKeyPrompts() {
     setConfirm(null);
     setPathPick(null);
+    setHeldTrust(null);
   }
 
   /** The window-close prompt (ruling 7) owns every key ahead of everything else, in BOTH layouts:
@@ -3952,6 +4016,53 @@ export default function App() {
         setConfirm(null);
         return true;
       }
+      if (confirm.kind === "trust") {
+        // Escape alone works from inside a text field: it starts nothing. Every other key typed there is the
+        // field's text, so it is taken and never answers.
+        if (event.key !== "Escape" && isEditableElement(event.target)) {
+          showFlash(trustFooter(confirm.view.remember));
+          return true;
+        }
+        const pendingG = trustPendingGRef.current;
+        trustPendingGRef.current = false;
+        const action = resolveTrustKey(event.nativeEvent as unknown as TrustKeyEvent, {
+          now: performance.now(),
+          openedAt: confirm.openedAt,
+          lastKeyAt: lastKeyAtRef.current,
+          pendingG,
+        });
+        if (action.kind === "answer") {
+          // Echoes what was drawn: the page never computes either value, so an answer to anything other than
+          // the shown findings is refused by Rust.
+          const answerId = nextRequestId();
+          inFlight.current.set(answerId, { kind: "trust", tab: confirm.tab });
+          postToRust({
+            type: "trust_answer",
+            request_id: answerId,
+            tab: confirm.tab,
+            nonce: confirm.nonce,
+            fingerprint: confirm.view.fingerprint,
+            findings_digest: confirm.view.findingsDigest,
+            trust: action.trust,
+          });
+          setConfirm(null);
+        } else if (action.kind === "cancel") {
+          const cancelId = nextRequestId();
+          inFlight.current.set(cancelId, { kind: "trust", tab: confirm.tab });
+          postToRust({ type: "trust_cancel", request_id: cancelId, tab: confirm.tab, nonce: confirm.nonce });
+          setConfirm(null);
+        } else if (action.kind === "scroll") {
+          const box = trustOverlayRef.current;
+          if (box !== null) box.scrollTop = scrollTarget(action.by, box, rowScrollStep(box));
+        } else if (action.kind === "pending_g") {
+          trustPendingGRef.current = true;
+        } else if (action.kind === "wait") {
+          showFlash(TRUST_WAIT_FLASH);
+        } else {
+          showFlash(trustFooter(confirm.view.remember));
+        }
+        return true;
+      }
       if (confirm.kind === "restore") {
         // `n` is always safe: it brings the bypass tabs back in auto. `y` gives them back in bypass, so
         // it passes every test the bypass prompt's own `y` does: a plain key, not a repeat, and a
@@ -4014,6 +4125,34 @@ export default function App() {
         <button onClick={() => setFatalError(null)}>Dismiss</button>
       </div>
     );
+
+  /** The band's prompt segment. A prompt takes the whole band, so a flash made while the trust question is up
+   *  (a `y` that came too soon, a key it does not take) is drawn after the prompt, where it can be read. */
+  const confirmBandPrompt =
+    confirm === null
+      ? null
+      : confirm.kind === "trust" && flash !== null && flash.seq > confirm.flashAfter
+        ? `${confirm.lines.join(" · ")} · ${flash.text}`
+        : confirm.lines.join(" · ");
+
+  /** The trust question, over whichever layout is on screen. A render that throws puts the start off, as
+   *  `Escape` would: leaving the tab asking with nothing to answer would strand it. */
+  const trustOverlay =
+    confirm?.kind === "trust" ? (
+      <PanelErrorBoundary
+        name="trust prompt"
+        onError={() =>
+          overlayFailed("trust prompt", () => {
+            const cancelId = nextRequestId();
+            inFlight.current.set(cancelId, { kind: "trust", tab: confirm.tab });
+            postToRust({ type: "trust_cancel", request_id: cancelId, tab: confirm.tab, nonce: confirm.nonce });
+            setConfirm(null);
+          })
+        }
+      >
+        <TrustPrompt ref={trustOverlayRef} envelope={confirm.view} />
+      </PanelErrorBoundary>
+    ) : null;
 
   if (!sessionStarted) {
     // `errorBanner` deliberately stays out of this branch: a failed tab shows its own reason inside
@@ -4145,7 +4284,7 @@ export default function App() {
             pill: modePill(activeTab?.mode ?? "auto", true, true),
             showcmd: null,
             message: flash?.text ?? null,
-            prompt: confirm !== null ? confirm.lines.join(" · ") : null,
+            prompt: confirmBandPrompt,
             warn: null,
             unread: null,
             cards: 0,
@@ -4217,6 +4356,7 @@ export default function App() {
             />
           </PanelErrorBoundary>
         )}
+        {confirm?.kind === "trust" && trustOverlay}
         <HintLayer root={startScreenRef.current} hints={hints} typed={hintTyped} />
       </div>
     );
@@ -6012,6 +6152,7 @@ export default function App() {
             />
           </PanelErrorBoundary>
         )}
+        {confirm?.kind === "trust" && trustOverlay}
         {review !== null && (
           <PanelErrorBoundary name="review overlay" onError={() => overlayFailed("review overlay", () => setReview(null))}>
             <ReviewOverlay
@@ -6260,7 +6401,14 @@ export default function App() {
             onChange={setExLine}
             onAccept={(event) => {
               noteLineKey(event);
-              showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
+              const command = parseTrustCommand(exLine);
+              if (command !== null) {
+                const commandId = nextRequestId();
+                inFlight.current.set(commandId, { kind: "trust", tab: activeTabRef.current ?? 0 });
+                postToRust({ type: "trust_command", request_id: commandId, action: command });
+              } else {
+                showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
+              }
               setExLine(null);
               returnKeysToRoot();
             }}
@@ -6288,7 +6436,7 @@ export default function App() {
           pill: modePill(activeTab?.mode ?? "auto", true, true),
           showcmd: box !== null ? `${box.title}…` : null,
           message: flash?.text ?? null,
-          prompt: confirm !== null ? confirm.lines.join(" · ") : null,
+          prompt: confirmBandPrompt,
           warn: statusWarning(state.provider, activeTab?.failure ?? null),
           unread: unread.label,
           cards: state.pendingPermissions.length,

@@ -30,9 +30,11 @@ fn real_pretooluse_permission_allow_end_to_end() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
     let session_id = provider
+        // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
         .create_session(CreateSessionRequest {
             cwd,
             streaming: agent::StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .unwrap();
 
@@ -131,6 +133,7 @@ fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
         .create_session(CreateSessionRequest {
             cwd,
             streaming: agent::StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .unwrap();
 
@@ -200,6 +203,7 @@ fn real_close_session_fail_closes_a_pending_permission() {
         .create_session(CreateSessionRequest {
             cwd,
             streaming: agent::StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .unwrap();
 
@@ -262,6 +266,7 @@ fn real_edit_under_the_auto_gate_on_the_sidecar_path() {
         .create_session(CreateSessionRequest {
             cwd: dir.to_string_lossy().to_string(),
             streaming: agent::StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .unwrap();
     provider

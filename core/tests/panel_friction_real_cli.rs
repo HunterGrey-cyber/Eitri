@@ -28,7 +28,8 @@ fn live_set(dir: &std::path::Path) -> (TabSet, eitri_core::tabs::TabId) {
 fn live_set_on(kind: BackendKind, dir: &std::path::Path) -> (TabSet, eitri_core::tabs::TabId) {
     let mut set = TabSet::new(kind, SessionModeChoice::Auto);
     let tab = set.active();
-    let backend = AgentBackend::start(kind, dir, None)
+    // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
+    let backend = AgentBackend::start(kind, dir, None, agent::setting_sources::ProjectTrust::Trusted)
         .map_err(|e| e.message)
         .expect("a sidecar session starts; is this running under a test-account wrapper?");
     set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
