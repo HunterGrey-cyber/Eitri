@@ -2797,9 +2797,12 @@ fn trust_events(state: &mut AgentPanelState) -> TrustOut {
             }
             // Asked by the sweep below, which knows whether the tab is on screen.
             GateEvent::Route(_, Route::Ask) | GateEvent::Reask(_) => {}
-            GateEvent::Recorded { tab } => {
+            GateEvent::Recorded { tab, notice } => {
                 if let Some(start) = state.tabs.take_recorded(tab) {
                     out.extend(start_deferred(state, tab, start, ProjectTrust::Trusted));
+                    if let Some(notice) = notice {
+                        out.push(serialize_notice_for_js(&notice));
+                    }
                 }
             }
             GateEvent::RecordRefused { tab, notice } => {
@@ -2841,8 +2844,9 @@ fn poll_trust(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     deliver_trust(state, webview, out);
 }
 
-/// `y` or `n` to a trust question, a tab's or `:trust`'s. Only checks and queues: a `y` that needs a
-/// record starts its session when the worker says the record is written, never here.
+/// `y` or `n` to a trust question, a tab's or `:trust`'s. Only checks and queues: a `y` starts its
+/// session when the worker says the disk is unchanged since the prompt (and the record written, when
+/// one is kept), never here.
 fn answer_trust(
     state: &mut AgentPanelState,
     request_id: &str,
@@ -4729,7 +4733,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             }
         },
         // `y`/`n` to a trust question. Only checked and queued here: no disk is touched, and a `y`
-        // that needs a record starts its session from the tick, once the record is written.
+        // starts its session from the tick, once the worker found the disk unchanged (and wrote the
+        // record, when one is kept).
         InboundMessage::TrustAnswer {
             nonce,
             fingerprint,
@@ -8498,6 +8503,22 @@ mod tests {
         let asked = prompts(&payloads).pop().unwrap();
         assert_eq!(asked.remember, "window");
         assert!(fx.spawned.borrow().is_empty());
+        assert!(!fx.record_file().exists());
+
+        // The window-only `y` also waits for the worker to find the disk unchanged: the handler
+        // starts nothing, the tick does, and says the trust lasts this window only.
+        let out = answer_prompt(&state, "a2", &asked, true);
+        assert_eq!(result_for(&out.payloads, "a2"), Some(Ok(())));
+        assert!(fx.spawned.borrow().is_empty(), "not started from the handler");
+        let seen = tick_until(&state, |_| !fx.spawned.borrow().is_empty());
+        assert_eq!(*fx.spawned.borrow(), vec![(None, ProjectTrust::Trusted)]);
+        assert!(
+            notices(&all_payloads(&seen))
+                .iter()
+                .any(|n| n.starts_with("trusted for this window only: ")),
+            "{seen:?}",
+            seen = all_payloads(&seen)
+        );
         assert!(!fx.record_file().exists());
     }
 

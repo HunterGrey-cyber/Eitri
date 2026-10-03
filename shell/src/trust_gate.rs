@@ -11,9 +11,10 @@
 //!
 //! An answer is bound to what its prompt showed: the gate keeps, per tab, the discovery it built the
 //! prompt from, and accepts a `y` or `n` only when the page echoes that prompt's fingerprint and
-//! digest and the latest check still has that fingerprint. A `y` that needs a record writes the
-//! discovery that was shown, and only after the worker found the disk unchanged since: a check
-//! started for another tab can therefore never put a configuration nobody saw under the user's `y`.
+//! digest and the latest check still has that fingerprint. A `y` is taken only after the worker found
+//! the disk unchanged since the prompt, and one that needs a record writes the discovery that was
+//! shown: neither a check started for another tab nor an edit made while the prompt was being read
+//! can put a configuration nobody saw under the user's `y`.
 //!
 //! A configuration that could not be hashed entirely (a file too large or unreadable, a FIFO, a link
 //! where the CLI reads a file, a walk over its budget) can change while its fingerprint stays the
@@ -110,8 +111,10 @@ pub(crate) enum GateEvent {
     /// A newer check no longer has the fingerprint this tab's prompt showed: the prompt is gone and
     /// the tab is asked again.
     Reask(TabId),
-    /// The record for this tab's `y` is written.
-    Recorded { tab: TabId },
+    /// This tab's `y` is taken: its record is written, or, for a `y` that cannot outlive this window
+    /// or this start, the disk was found unchanged since the prompt. `notice`, when there is one, is
+    /// said in the panel once the session starts.
+    Recorded { tab: TabId, notice: Option<String> },
     /// Nothing was written for this tab's `y` (the disk changed since the prompt, the write failed,
     /// or a later `:untrust` overtook it); the tab is asked again.
     RecordRefused { tab: TabId, notice: String },
@@ -129,9 +132,11 @@ pub(crate) enum GateEvent {
 /// What [`TrustGate::answer`] decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AnswerOutcome {
-    /// Start the tab's session now, with these tiers, saying `notice` if there is one.
+    /// Start the tab's session now, with these tiers, saying `notice` if there is one. Only an `n`
+    /// starts at once: it loads nothing, so what is on disk now cannot matter to it.
     Start(ProjectTrust, Option<String>),
-    /// The record is queued; the session starts on [`GateEvent::Recorded`].
+    /// A `y`: the worker looks at the disk again (and writes the record, when one can be kept); the
+    /// session starts on [`GateEvent::Recorded`].
     Recording,
     /// Not taken; the tab is asked again with what is on disk now.
     Refused(String),
@@ -146,7 +151,8 @@ pub(crate) enum CommandAnswer {
         ok: bool,
         notice: Option<String>,
     },
-    /// The record is queued; `:trust` is answered by a later [`GateEvent::CommandDone`].
+    /// The worker reads the disk again (and writes the record, when one can be kept); `:trust` is
+    /// answered by a later [`GateEvent::CommandDone`].
     Recording,
 }
 
@@ -191,6 +197,13 @@ enum Job {
         epoch: u64,
         now: u64,
     },
+    /// A `y` that writes nothing: the disk is read again and must still be what was shown.
+    Confirm {
+        purpose: Purpose,
+        shown: Box<Discovery>,
+        epoch: u64,
+        kept: Kept,
+    },
     CommandCheck {
         request_id: String,
         tab: TabId,
@@ -209,6 +222,12 @@ enum Done {
     Recorded {
         purpose: Purpose,
         epoch: u64,
+        state: TrustState,
+    },
+    Confirmed {
+        purpose: Purpose,
+        epoch: u64,
+        kept: Kept,
         state: TrustState,
     },
     Moved {
@@ -230,6 +249,15 @@ enum Done {
         notice: String,
         state: TrustState,
     },
+}
+
+/// How long a `y` that writes no record lasts, and what the panel says once it is taken.
+#[derive(Debug, Clone)]
+struct Kept {
+    /// `Some(why)`: the window remembers the answer, the record having been impossible for `why`.
+    /// `None`: it covers this one start.
+    window_only: Option<String>,
+    notice: String,
 }
 
 /// Nonces of `:trust`'s own prompts start here, far from the tab set's, so the two can never be
@@ -373,7 +401,7 @@ impl TrustGate {
                         .push(GateEvent::Route(tab, Route::Start(ProjectTrust::Untrusted)));
                 }
             }
-            Job::Record { purpose, .. } => match purpose {
+            Job::Record { purpose, .. } | Job::Confirm { purpose, .. } => match purpose {
                 Purpose::ForTab(tab) => self.owed.push(GateEvent::RecordRefused {
                     tab,
                     notice: record_failed_notice(NO_WORKER),
@@ -420,8 +448,17 @@ impl TrustGate {
     }
 
     /// Whatever the worker finished, as events. Never blocks.
+    ///
+    /// Several results can arrive between two polls, and a later one may find the configuration
+    /// changed after an earlier one let a tab through. So nothing that would start a session is
+    /// decided from an earlier result in the batch: a waiting tab's route is worked out from the
+    /// newest result once the whole batch is in, and a taken `y` whose fingerprint the newest result
+    /// no longer has is refused and asked again.
     pub(crate) fn poll(&mut self) -> Vec<GateEvent> {
         let mut events = std::mem::take(&mut self.owed);
+        // Positions in `events` settled only once the batch is drained.
+        let mut routes: Vec<usize> = Vec::new();
+        let mut taken: Vec<(usize, Fingerprint)> = Vec::new();
         while let Ok(done) = self.done.try_recv() {
             match done {
                 Done::Checked { generation, state } => {
@@ -429,14 +466,15 @@ impl TrustGate {
                     let (resolved, kept): (Vec<_>, Vec<_>) =
                         self.waiting.drain(..).partition(|(_, g)| *g <= generation);
                     self.waiting = kept;
-                    let route = self.latest.as_ref().map(|state| self.route(state));
                     for (tab, _) in resolved {
-                        events.push(GateEvent::Route(tab, route.unwrap_or(Route::Ask)));
+                        routes.push(events.len());
+                        events.push(GateEvent::Route(tab, Route::Ask));
                     }
                 }
                 Done::Recorded { purpose, epoch, state } => {
                     if epoch == self.epoch {
-                        if let Some(fingerprint) = discovery_of(&state).map(|d| d.fingerprint) {
+                        let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
+                        if let Some(fingerprint) = fingerprint {
                             self.answered = Some(Answered {
                                 fingerprint,
                                 trust: ProjectTrust::Trusted,
@@ -445,8 +483,11 @@ impl TrustGate {
                         }
                         self.record_failure = None;
                         self.take_latest(state, &mut events);
+                        if let (Purpose::ForTab(_), Some(fingerprint)) = (&purpose, fingerprint) {
+                            taken.push((events.len(), fingerprint));
+                        }
                         events.push(match purpose {
-                            Purpose::ForTab(tab) => GateEvent::Recorded { tab },
+                            Purpose::ForTab(tab) => GateEvent::Recorded { tab, notice: None },
                             Purpose::Command(request_id) => GateEvent::CommandDone {
                                 request_id,
                                 ok: true,
@@ -458,6 +499,40 @@ impl TrustGate {
                         // command wins, so nothing here is trust.
                         events.push(refused(purpose, WITHDRAWN.to_string()));
                     }
+                }
+                Done::Confirmed {
+                    purpose,
+                    epoch,
+                    kept,
+                    state,
+                } => {
+                    if epoch != self.epoch {
+                        events.push(refused(purpose, WITHDRAWN.to_string()));
+                        continue;
+                    }
+                    let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
+                    if let (Some(why), Some(fingerprint)) = (kept.window_only.clone(), fingerprint) {
+                        self.answered = Some(Answered {
+                            fingerprint,
+                            trust: ProjectTrust::Trusted,
+                            window_only: Some(why),
+                        });
+                    }
+                    self.take_latest(state, &mut events);
+                    if let (Purpose::ForTab(_), Some(fingerprint)) = (&purpose, fingerprint) {
+                        taken.push((events.len(), fingerprint));
+                    }
+                    events.push(match purpose {
+                        Purpose::ForTab(tab) => GateEvent::Recorded {
+                            tab,
+                            notice: Some(kept.notice),
+                        },
+                        Purpose::Command(request_id) => GateEvent::CommandDone {
+                            request_id,
+                            ok: true,
+                            notice: Some(kept.notice),
+                        },
+                    });
                 }
                 Done::Moved { purpose, state } => {
                     self.take_latest(state, &mut events);
@@ -488,6 +563,23 @@ impl TrustGate {
                         ok,
                         notice: Some(notice),
                     });
+                }
+            }
+        }
+        let route = self.current_route().unwrap_or(Route::Ask);
+        for at in routes {
+            if let GateEvent::Route(_, r) = &mut events[at] {
+                *r = route;
+            }
+        }
+        let newest = self.latest.as_ref().and_then(discovery_of).map(|d| d.fingerprint);
+        for (at, fingerprint) in taken {
+            if newest != Some(fingerprint) {
+                if let GateEvent::Recorded { tab, .. } = events[at] {
+                    events[at] = GateEvent::RecordRefused {
+                        tab,
+                        notice: CHANGED_WHILE_READING.to_string(),
+                    };
                 }
             }
         }
@@ -662,7 +754,8 @@ impl TrustGate {
         Ok(())
     }
 
-    /// `y` (`trust`) or `n` to `tab`'s prompt. Touches no disk; may queue the record.
+    /// `y` (`trust`) or `n` to `tab`'s prompt. Touches no disk; a `y` queues the worker's second look
+    /// at it, and the record when one is kept.
     pub(crate) fn answer(
         &mut self,
         tab: TabId,
@@ -700,21 +793,37 @@ impl TrustGate {
             self.said_not_loaded = true;
             return AnswerOutcome::Start(ProjectTrust::Untrusted, notice);
         }
+        // Every `y` waits for the worker to read the disk again: the prompt may have been on screen
+        // for as long as it took to read it, and a configuration changed meanwhile must be asked
+        // about rather than loaded unseen, whether or not a record is written.
+        let epoch = self.epoch;
         match remember {
             Remember::SessionOnly(_) => {
-                AnswerOutcome::Start(ProjectTrust::Trusted, Some(session_only_notice(&shown.discovery)))
+                let notice = session_only_notice(&shown.discovery);
+                self.queue(Job::Confirm {
+                    purpose: Purpose::ForTab(tab),
+                    shown: Box::new(shown.discovery),
+                    epoch,
+                    kept: Kept {
+                        window_only: None,
+                        notice,
+                    },
+                });
+                AnswerOutcome::Recording
             }
             Remember::WindowOnly(why) => {
-                let notice = window_only_notice(&why);
-                self.answered = Some(Answered {
-                    fingerprint: shown.fingerprint,
-                    trust: ProjectTrust::Trusted,
-                    window_only: Some(why),
+                self.queue(Job::Confirm {
+                    purpose: Purpose::ForTab(tab),
+                    shown: Box::new(shown.discovery),
+                    epoch,
+                    kept: Kept {
+                        notice: window_only_notice(&why),
+                        window_only: Some(why),
+                    },
                 });
-                AnswerOutcome::Start(ProjectTrust::Trusted, Some(notice))
+                AnswerOutcome::Recording
             }
             Remember::Yes => {
-                let epoch = self.epoch;
                 self.queue(Job::Record {
                     purpose: Purpose::ForTab(tab),
                     shown: Box::new(shown.discovery),
@@ -812,13 +921,17 @@ impl TrustGate {
         Some(match self.remember_now() {
             Remember::SessionOnly(_) => done(false, Some(cannot_remember_notice(&command.shown.discovery))),
             Remember::WindowOnly(why) => {
-                let notice = format!("{TRUSTED_FROM_NOW} (this window only: {why})");
-                self.answered = Some(Answered {
-                    fingerprint: command.shown.fingerprint,
-                    trust: ProjectTrust::Trusted,
-                    window_only: Some(why),
+                // Nothing is written, but the disk is read again first, as for a tab's `y`.
+                self.queue(Job::Confirm {
+                    purpose: Purpose::Command(request_id.clone()),
+                    shown: Box::new(command.shown.discovery),
+                    epoch: self.epoch,
+                    kept: Kept {
+                        notice: format!("{TRUSTED_FROM_NOW} (this window only: {why})"),
+                        window_only: Some(why),
+                    },
                 });
-                done(true, Some(notice))
+                CommandAnswer::Recording
             }
             Remember::Yes => {
                 let epoch = self.epoch;
@@ -989,6 +1102,7 @@ fn item_of(finding: &Finding) -> TrustItemView {
             ..item("symlink", path, lossy(path), lossy(target))
         },
         Finding::OtherFiles { dir, count } => item("other_files", dir, "other files".to_string(), count.to_string()),
+        Finding::NotRead { path, reason } => item("not_read", path, "not read".to_string(), reason.clone()),
         Finding::Unreadable { path, reason } => {
             item("unreadable", path, "cannot be checked".to_string(), reason.clone())
         }
@@ -1055,6 +1169,27 @@ fn run_worker(
                             purpose,
                             reason: e.to_string(),
                         },
+                    }
+                }
+            }
+            Job::Confirm {
+                purpose,
+                shown,
+                epoch,
+                kept,
+            } => {
+                let fresh = eitri_core::project_trust::discover(&root, home, &Default::default());
+                if fresh.fingerprint != shown.fingerprint {
+                    Done::Moved {
+                        purpose,
+                        state: store.state(fresh),
+                    }
+                } else {
+                    Done::Confirmed {
+                        purpose,
+                        epoch,
+                        kept,
+                        state: store.state(fresh),
                     }
                 }
             }
@@ -1539,10 +1674,13 @@ mod tests {
         assert_eq!(view.remember, TrustRememberView::Window);
         let why = "no usable state directory (XDG_STATE_HOME/HOME)";
         assert_eq!(view.remember_note.as_deref(), Some(why));
-        assert_eq!(
-            answer(&mut gate, &view, true),
-            AnswerOutcome::Start(ProjectTrust::Trusted, Some(window_only_notice(why)))
-        );
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        drain(&mut gate, |seen| {
+            seen.contains(&GateEvent::Recorded {
+                tab: A,
+                notice: Some(window_only_notice(why)),
+            })
+        });
         assert_eq!(
             window_only_notice(why),
             "trusted for this window only: no usable state directory (XDG_STATE_HOME/HOME)"
@@ -1635,15 +1773,16 @@ mod tests {
         command(&mut gate, "r7", TrustAction::Trust);
         let view = gate.show_command(A, "r7").unwrap();
         let answered = gate.answer_command(A, view.nonce, &view.fingerprint, &view.findings_digest(), true, 1);
+        assert_eq!(answered, Some(CommandAnswer::Recording));
+        let seen = drain(&mut gate, |seen| command_done(seen, "r7").is_some());
         assert_eq!(
-            answered,
-            Some(CommandAnswer::Done {
-                request_id: "r7".into(),
-                ok: true,
-                notice: Some(format!(
+            command_done(&seen, "r7"),
+            Some((
+                true,
+                Some(format!(
                     "{TRUSTED_FROM_NOW} (this window only: no usable state directory (XDG_STATE_HOME/HOME))"
-                )),
-            })
+                ))
+            ))
         );
         assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Trusted));
         let seen = command(&mut gate, "r8", TrustAction::Untrust);
@@ -1732,7 +1871,9 @@ mod tests {
         start(&mut gate, A);
         let view = gate.show(A, 1).unwrap();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
-        drain(&mut gate, |seen| seen.contains(&GateEvent::Recorded { tab: A }));
+        drain(&mut gate, |seen| {
+            seen.contains(&GateEvent::Recorded { tab: A, notice: None })
+        });
         assert!(fx.record_file().is_file());
         assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Trusted));
         let seen = command(&mut gate, "u", TrustAction::Untrust);
@@ -1765,7 +1906,7 @@ mod tests {
             }),
             "{seen:?}"
         );
-        assert!(!seen.contains(&GateEvent::Recorded { tab: A }));
+        assert!(!seen.contains(&GateEvent::Recorded { tab: A, notice: None }));
         assert!(!fx.record_file().exists(), "the forget ran after the record");
         assert_eq!(start(&mut gate, B), Route::Ask, "no window answer survives");
     }
@@ -1794,6 +1935,9 @@ mod tests {
         start(&mut window, A);
         let view = window.show(A, 1).unwrap();
         answer(&mut window, &view, true);
+        drain(&mut window, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Recorded { tab: A, .. }))
+        });
         assert_eq!(
             window.row(),
             "trusted for this window only (no usable state directory (XDG_STATE_HOME/HOME))"
@@ -1935,13 +2079,13 @@ mod tests {
             "{:?}",
             view.items
         );
-        assert_eq!(
-            answer(&mut gate, &view, true),
-            AnswerOutcome::Start(
-                ProjectTrust::Trusted,
-                Some("trusted for this session only: .claude/settings.json cannot be checked".to_string())
-            )
-        );
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        drain(&mut gate, |seen| {
+            seen.contains(&GateEvent::Recorded {
+                tab: A,
+                notice: Some("trusted for this session only: .claude/settings.json cannot be checked".to_string()),
+            })
+        });
         assert!(!fx.record_file().exists());
         assert_eq!(start(&mut gate, B), Route::Ask, "the next start asks again");
         assert_eq!(gate.next_session_trust(), ProjectTrust::Untrusted);
@@ -1973,10 +2117,13 @@ mod tests {
         assert_eq!(start(&mut gate, A), Route::Ask);
         let view = gate.show(A, 1).unwrap();
         assert_eq!(view.remember, TrustRememberView::Session);
-        assert!(matches!(
-            answer(&mut gate, &view, true),
-            AnswerOutcome::Start(ProjectTrust::Trusted, Some(notice)) if notice.starts_with("trusted for this session only: ")
-        ));
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        drain(&mut gate, |seen| {
+            seen.iter().any(|e| {
+                matches!(e, GateEvent::Recorded { tab: A, notice: Some(notice) }
+                    if notice.starts_with("trusted for this session only: "))
+            })
+        });
         assert_eq!(start(&mut gate, B), Route::Ask, "the next start asks again");
         let view = gate.show(B, 2).unwrap();
         assert!(matches!(
@@ -2003,7 +2150,9 @@ mod tests {
         assert!(gate.poll().is_empty());
         assert!(!fx.record_file().exists());
         hold.open();
-        drain(&mut gate, |seen| seen.contains(&GateEvent::Recorded { tab: A }));
+        drain(&mut gate, |seen| {
+            seen.contains(&GateEvent::Recorded { tab: A, notice: None })
+        });
         assert!(fx.record_file().is_file());
     }
 
@@ -2032,7 +2181,7 @@ mod tests {
             .unwrap();
         assert!(notice.starts_with("trust could not be recorded ("), "{notice}");
         assert!(notice.ends_with("); asking again for this window only"), "{notice}");
-        assert!(!seen.contains(&GateEvent::Recorded { tab: A }));
+        assert!(!seen.contains(&GateEvent::Recorded { tab: A, notice: None }));
         let again = gate.show(A, 2).unwrap();
         assert_eq!(again.remember, TrustRememberView::Window);
         assert!(again
@@ -2040,11 +2189,227 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("trust could not be recorded ("));
-        // Its `y` now trusts the window without trying the record again.
-        assert!(matches!(
-            answer(&mut gate, &again, true),
-            AnswerOutcome::Start(ProjectTrust::Trusted, Some(_))
-        ));
+        // Its `y` now trusts the window without trying the record again, once the disk is found
+        // unchanged.
+        assert_eq!(answer(&mut gate, &again, true), AnswerOutcome::Recording);
+        drain(&mut gate, |seen| {
+            seen.iter().any(|e| {
+                matches!(
+                    e,
+                    GateEvent::Recorded {
+                        tab: A,
+                        notice: Some(_)
+                    }
+                )
+            })
+        });
+        assert!(!fx.record_file().exists());
+        assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Trusted));
+    }
+
+    /// A `y` that cannot be recorded still waits for the disk to be read again: a configuration
+    /// edited while the prompt was on screen is asked about, never loaded unseen, and the window
+    /// remembers nothing.
+    #[test]
+    fn a_window_only_y_whose_disk_changed_since_the_prompt_starts_nothing() {
+        let fx = Fx::new("window-moved");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let hold = WorkerHold::default();
+        let mut gate = TrustGate::new_held(
+            TrustStore::at(None),
+            fx.root.clone(),
+            Some(fx.home.clone()),
+            hold.clone(),
+        );
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let view = gate.show(A, 1).unwrap();
+        assert_eq!(view.remember, TrustRememberView::Window);
+        hold.close();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        fx.write(SETTINGS, &hook("touch /tmp/evil"));
+        hold.open();
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::RecordRefused { .. }))
+        });
+        assert!(seen.contains(&GateEvent::RecordRefused {
+            tab: A,
+            notice: CHANGED_WHILE_READING.to_string()
+        }));
+        assert!(
+            !seen.iter().any(|e| matches!(e, GateEvent::Recorded { .. })),
+            "{seen:?}"
+        );
+        assert_eq!(start(&mut gate, B), Route::Ask, "the window remembers nothing");
+        let again = gate.show(B, 2).unwrap();
+        assert_ne!(again.fingerprint, view.fingerprint, "asked about what is there now");
+        assert!(again.items.iter().any(|i| i.value == "touch /tmp/evil"));
+    }
+
+    /// The same for a `y` that covers one start, and for `:trust` in a window that cannot keep a
+    /// record.
+    #[test]
+    fn a_session_only_or_command_y_rereads_the_disk_first() {
+        let fx = Fx::new("session-moved");
+        fx.write(SETTINGS, &padded_hook("touch /tmp/a", 5 << 20));
+        fx.write(".mcp.json", br#"{"mcpServers":{}}"#);
+        let hold = WorkerHold::default();
+        let mut gate = fx.held(&hold);
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let view = gate.show(A, 1).unwrap();
+        assert_eq!(view.remember, TrustRememberView::Session);
+        hold.close();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        fx.write(".mcp.json", br#"{"mcpServers":{"m":{"command":"sh"}}}"#);
+        hold.open();
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::RecordRefused { .. }))
+        });
+        assert!(
+            !seen.iter().any(|e| matches!(e, GateEvent::Recorded { .. })),
+            "{seen:?}"
+        );
+
+        let fx = Fx::new("command-moved");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let mut gate = TrustGate::new_held(
+            TrustStore::at(None),
+            fx.root.clone(),
+            Some(fx.home.clone()),
+            hold.clone(),
+        );
+        command(&mut gate, "c1", TrustAction::Trust);
+        let view = gate.show_command(A, "c1").unwrap();
+        hold.close();
+        assert_eq!(
+            gate.answer_command(A, view.nonce, &view.fingerprint, &view.findings_digest(), true, 1),
+            Some(CommandAnswer::Recording)
+        );
+        fx.write(SETTINGS, &hook("touch /tmp/evil"));
+        hold.open();
+        let seen = drain(&mut gate, |seen| command_done(seen, "c1").is_some());
+        assert_eq!(
+            command_done(&seen, "c1"),
+            Some((false, Some(CHANGED_WHILE_READING.to_string())))
+        );
+        assert_eq!(start(&mut gate, B), Route::Ask, "the window remembers nothing");
+    }
+
+    /// Two checks that land between two polls: the earlier found the recorded configuration, the
+    /// later found it changed. The tab the earlier one answered is routed by the later, so it is
+    /// asked rather than started with the project's tiers.
+    #[test]
+    fn a_trusted_route_is_overtaken_by_a_newer_check_in_the_same_batch() {
+        let fx = Fx::new("batch-route");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        fx.trust_now(1_790_000_000);
+        let trusted = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
+        assert!(matches!(trusted, TrustState::Trusted { .. }));
+        fx.write(SETTINGS, &hook("touch /tmp/evil"));
+        let changed = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
+        assert!(matches!(changed, TrustState::Changed { .. }));
+
+        let (mut gate, _jobs, done) = TrustGate::detached(fx.root.clone());
+        gate.wait_for(A);
+        let first = gate.begin_check();
+        gate.wait_for(B);
+        let second = gate.begin_check();
+        done.send(Done::Checked {
+            generation: first,
+            state: trusted.clone(),
+        })
+        .unwrap();
+        done.send(Done::Checked {
+            generation: second,
+            state: changed,
+        })
+        .unwrap();
+        let seen = gate.poll();
+        assert!(seen.contains(&GateEvent::Route(A, Route::Ask)), "{seen:?}");
+        assert!(seen.contains(&GateEvent::Route(B, Route::Ask)), "{seen:?}");
+        assert!(
+            !seen.contains(&GateEvent::Route(A, Route::Start(ProjectTrust::Trusted))),
+            "{seen:?}"
+        );
+
+        // The other way round the newest result is the trusted one, and both start with it.
+        let (mut gate, _jobs, done) = TrustGate::detached(fx.root.clone());
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let untrusted_first = eitri_core::project_trust::for_root(&TrustStore::at(None), &fx.root, Some(&fx.home));
+        gate.wait_for(A);
+        let first = gate.begin_check();
+        gate.wait_for(B);
+        let second = gate.begin_check();
+        done.send(Done::Checked {
+            generation: first,
+            state: untrusted_first,
+        })
+        .unwrap();
+        done.send(Done::Checked {
+            generation: second,
+            state: trusted,
+        })
+        .unwrap();
+        assert_eq!(
+            gate.poll(),
+            vec![
+                GateEvent::Route(A, Route::Start(ProjectTrust::Trusted)),
+                GateEvent::Route(B, Route::Start(ProjectTrust::Trusted)),
+            ]
+        );
+    }
+
+    /// A record written for a tab's `y`, then, in the same batch, a check that finds the
+    /// configuration changed since: the tab is asked again rather than started with the tiers.
+    #[test]
+    fn a_record_overtaken_by_a_newer_check_in_the_same_batch_is_refused() {
+        let fx = Fx::new("batch-record");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let untrusted = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
+        let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
+        gate.wait_for(A);
+        let first = gate.begin_check();
+        done.send(Done::Checked {
+            generation: first,
+            state: untrusted,
+        })
+        .unwrap();
+        assert_eq!(gate.poll(), vec![GateEvent::Route(A, Route::Ask)]);
+        let view = gate.show(A, 1).unwrap();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let _ = jobs.try_recv();
+        let shown = eitri_core::project_trust::discover(&fx.root, Some(&fx.home), &Default::default());
+        fx.store().record(&shown, 1).unwrap();
+        fx.write(SETTINGS, &hook("touch /tmp/evil"));
+        let changed = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
+        gate.wait_for(B);
+        let second = gate.begin_check();
+        done.send(Done::Recorded {
+            purpose: Purpose::ForTab(A),
+            epoch: 0,
+            state: TrustState::Trusted {
+                since_unix: 1,
+                discovery: shown,
+            },
+        })
+        .unwrap();
+        done.send(Done::Checked {
+            generation: second,
+            state: changed,
+        })
+        .unwrap();
+        let seen = gate.poll();
+        assert!(
+            seen.contains(&GateEvent::RecordRefused {
+                tab: A,
+                notice: CHANGED_WHILE_READING.to_string()
+            }),
+            "{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, GateEvent::Recorded { .. })),
+            "{seen:?}"
+        );
+        assert!(seen.contains(&GateEvent::Route(B, Route::Ask)), "{seen:?}");
     }
 
     #[test]
@@ -2125,6 +2490,10 @@ mod tests {
                 dir: p(".claude/agents"),
                 count: 3,
             },
+            Finding::NotRead {
+                path: p(".claude/worktrees"),
+                reason: "kept apart".into(),
+            },
             Finding::Unreadable {
                 path: p(".claude/big"),
                 reason: "too large".into(),
@@ -2184,6 +2553,7 @@ mod tests {
                 ("claude_md", "CLAUDE.md", "memory file", "present", false),
                 ("symlink", ".claude/hooks/run", ".claude/hooks/run", "/opt/x/run", true),
                 ("other_files", ".claude/agents", "other files", "3", false),
+                ("not_read", ".claude/worktrees", "not read", "kept apart", false),
                 ("unreadable", ".claude/big", "cannot be checked", "too large", false),
                 ("over_budget", "", "over budget", "too many", false),
                 ("git_unverified", ".git", "git", "a link -> /elsewhere", false),

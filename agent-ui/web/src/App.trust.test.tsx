@@ -350,6 +350,96 @@ describe("the trust question", () => {
     expect(prompt(container)).toBeNull();
   });
 
+  /** Rust asks again the moment a tab waiting for the answer is on screen without its question, so a prompt
+   *  arrives right after a close prompt, a rename field or the chooser took the keys. It must wait for them:
+   *  drawn over them, it took the `y` meant for the close prompt, or the first letter of a name. */
+  it("a_prompt_arriving_over_a_close_prompt_waits_and_y_closes_the_tab", () => {
+    const { container } = asked();
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close tab 1? y/n"] });
+    expect(bandPrompt(container)).toBe("close tab 1? y/n");
+    dispatch(trustPrompt({ nonce: 18 }));
+    expect(bandPrompt(container)).toBe("close tab 1? y/n");
+    expect(prompt(container)).toBeNull();
+    wait(500);
+    press(container, "y");
+    expect(requests("close_tab")).toEqual([expect.objectContaining({ tab: 1 })]);
+    expect(requests("trust_answer")).toEqual([]);
+  });
+
+  it("a_held_prompt_opens_once_the_close_prompt_is_answered_n_with_its_own_wait", () => {
+    const { container } = asked();
+    for (const lines of [["close tab 1? y/n"], ["close 2 other tabs? (y/n)"]]) {
+      dispatch(lines[0].startsWith("close tab") ? { kind: "confirm_close", tab: 1, lines } : { kind: "confirm_close_others", tabs: [2], lines });
+      dispatch(trustPrompt({ nonce: 18 }));
+      wait(500);
+      press(container, "n");
+      expect(requests("close_tab")).toEqual([]);
+      expect(requests("close_others")).toEqual([]);
+      // The trust question is up now, and the key that ended the other prompt does not answer it.
+      expect(prompt(container)).not.toBeNull();
+      expect(bandPrompt(container)).toBe("trust? y/n");
+      press(container, "y");
+      expect(requests("trust_answer")).toEqual([]);
+      wait(TYPING_GUARD_MS + 50);
+      press(container, "Escape");
+      expect(requests("trust_cancel")).toHaveLength(1);
+      posted = [];
+    }
+  });
+
+  it("a_prompt_arriving_over_a_bypass_question_waits", () => {
+    const { container } = asked();
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 5, lines: ["bypass? y/n"] });
+    dispatch(trustPrompt({ nonce: 18 }));
+    expect(prompt(container)).toBeNull();
+    wait(500);
+    press(container, "y");
+    expect(requests("trust_answer")).toEqual([]);
+    expect(requests("confirm_bypass")).toHaveLength(1);
+  });
+
+  it("a_prompt_arriving_over_the_rename_field_leaves_the_name_to_the_field", () => {
+    const { container } = asked();
+    dispatch({ kind: "begin_rename", tab: 1, current: null });
+    const input = container.querySelector<HTMLInputElement>(".tab-rename")!;
+    input.focus();
+    dispatch(trustPrompt({ nonce: 18 }));
+    expect(prompt(container)).toBeNull();
+    expect(document.activeElement).toBe(input);
+    wait(500);
+    fireEvent.keyDown(input, { key: "y" });
+    fireEvent.change(input, { target: { value: "yarn" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(requests("trust_answer")).toEqual([]);
+    expect(requests("rename_tab")).toEqual([expect.objectContaining({ tab: 1, name: "yarn" })]);
+    // The field is gone, so the question opens, and only a later y past its own wait answers it.
+    expect(prompt(container)).not.toBeNull();
+    wait(TYPING_GUARD_MS + 50);
+    press(container, "y");
+    expect(requests("trust_answer")).toEqual([expect.objectContaining({ nonce: 18, trust: true })]);
+  });
+
+  it("a_route_away_drops_a_held_prompt", () => {
+    const { container } = asked({}, { tabs: [TAB1, TAB2] });
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close tab 1? y/n"] });
+    dispatch(trustPrompt({ nonce: 18 }));
+    dispatch({ kind: "tabs", active: 2, tabs: [TAB1, TAB2] });
+    dispatch({ kind: "tabs", active: 1, tabs: [TAB1, TAB2] });
+    expect(prompt(container)).toBeNull();
+    wait(TYPING_GUARD_MS + 50);
+    press(container, "y");
+    expect(requests("trust_answer")).toEqual([]);
+  });
+
+  it("a_refused_answer_is_not_a_conversation_banner", () => {
+    const { container } = asked();
+    wait(TYPING_GUARD_MS + 50);
+    press(container, "y");
+    const [sent] = requests("trust_answer");
+    dispatch({ kind: "command_result", requestId: sent.request_id, ok: false, error: "that prompt is no longer current" });
+    expect(container.querySelector(".command-notice")).toBeNull();
+  });
+
   it("drops a malformed prompt at the bridge: nothing is drawn", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { container } = asked({ fingerprint: "short" });
@@ -380,6 +470,14 @@ describe("the : line's trust commands", () => {
       );
     }
     expect(requests("trust_command")).toHaveLength(2);
+  });
+
+  it("a_trust_command_that_ends_untrusted_raises_no_banner", () => {
+    const { container } = started();
+    typed(container, "trust");
+    const [sent] = requests("trust_command");
+    dispatch({ kind: "command_result", requestId: sent.request_id, ok: false, error: "not trusted" });
+    expect(container.querySelector(".command-notice")).toBeNull();
   });
 
   it("carries no tab: the command is the window's", () => {

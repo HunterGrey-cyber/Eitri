@@ -117,9 +117,16 @@ impl Discovery {
             .collect()
     }
 
-    /// Nothing on the path from the root to the top level that the CLI would load.
+    /// Nothing on the path from the root to the top level that the CLI would load. A directory
+    /// discovery names and leaves unread is not configuration, so it alone is nothing to ask about.
     pub fn nothing_to_trust(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.iter().all(|entry| {
+            matches!(entry.kind, EntryKind::Dir)
+                && self
+                    .findings
+                    .iter()
+                    .any(|finding| matches!(finding, Finding::NotRead { path, .. } if *path == entry.path))
+        })
     }
 }
 
@@ -203,6 +210,13 @@ pub enum Finding {
     OtherFiles {
         dir: PathBuf,
         count: usize,
+    },
+    /// A directory that is named and deliberately not read, and why. It is not configuration the CLI
+    /// loads for this root, so it is not unchecked either: its name is in the fingerprint, its
+    /// content is not.
+    NotRead {
+        path: PathBuf,
+        reason: String,
     },
     /// Cannot be checked, and why.
     Unreadable {

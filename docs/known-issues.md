@@ -76,13 +76,18 @@ one-window mode.
 
 ## Security
 
-- **No workspace-trust step yet.** Terminal Claude Code asks whether you trust a folder before it runs that
-  folder's own configuration; Eitri does not ask yet. An agent session in a project loads the project's own
-  `.claude/settings.json`, `.claude/settings.local.json` and `.mcp.json`, so a repository you did not write can
-  start its own hooks and MCP servers, as you, at the first message, before any permission card appears, and its
-  own allow rules can answer calls that would otherwise ask. Until the trust step exists, look at `.claude/` and
-  `.mcp.json` before you open a repository you do not know in Eitri. `agent.user_settings = false` does not
-  change this; it only leaves out your own user settings.
+- **Eitri asks before it loads a project's own Claude configuration, and the step has limits.** Until you trust a
+  project, its agent sessions load only your own user settings, not the project's `.claude/settings.json`,
+  `.claude/settings.local.json`, `.mcp.json` or `CLAUDE.md`, so a repository you did not write cannot start its own
+  hooks or MCP servers, or pre-approve tool calls, at your first message. The question lists what it found, with the
+  exact commands. Trust is remembered per project and is tied to what you saw: Eitri asks again after any change to
+  `.claude/`, `.mcp.json` or `CLAUDE.md`, including one that terminal `claude` makes (its "don't ask again" rewrites
+  `settings.local.json`). It never imports terminal `claude`'s own trust answer, so a project you already trusted in
+  the terminal asks once more here. A file Eitri cannot check (larger than 4 MiB, unreadable, a pipe, or a symlink)
+  is named in the question, and your answer then covers that one start only. A script a hook calls from outside
+  `.claude/` is trusted only through the hook's command text, so trusting a project means trusting its code to run, as
+  building it does. Continuing a conversation in a real terminal runs plain `claude`, whose own trust question applies.
+  To forget every answer, delete `~/.local/state/eitri/trust/`.
 - **The bottom terminal can write to your clipboard, by design.** A program running there can set the clipboard
   or the primary selection with an OSC 52 escape sequence (the same default as Alacritty); Eitri shows no notice
   when it happens, so what you paste next may not be what you copied. Reading the clipboard is refused.

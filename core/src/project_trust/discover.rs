@@ -30,6 +30,13 @@ impl Role {
     }
 }
 
+/// Where Claude Code keeps whole git checkouts of its own worktrees, directly under `.claude/`. The
+/// CLI loads no configuration from them for a root outside them, and a root inside one has its own
+/// git top level and is discovered there; walking them would put thousands of unrelated files over
+/// the budget of every repository that has some, so each start would ask again.
+const WORKTREES_DIR: &[u8] = b"worktrees";
+const WORKTREES_REASON: &str = "Claude Code's own worktree checkouts, not read";
+
 struct Scan<'a> {
     top: PathBuf,
     limits: &'a Limits,
@@ -314,6 +321,13 @@ impl Scan<'_> {
                             break;
                         }
                         self.push(child.clone(), EntryKind::Dir);
+                        if depth == 0 && name.as_bytes() == WORKTREES_DIR {
+                            self.findings.push(Finding::NotRead {
+                                path: child,
+                                reason: WORKTREES_REASON.to_string(),
+                            });
+                            continue;
+                        }
                         if depth + 1 > self.limits.max_depth {
                             self.note_over_budget(format!(
                                 "deeper than {} directories under .claude/",

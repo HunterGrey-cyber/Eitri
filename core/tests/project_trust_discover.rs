@@ -843,3 +843,158 @@ fn an_uncheckable_entry_is_not_fully_hashed() {
         );
     }
 }
+
+const WORKTREES_REASON: &str = "Claude Code's own worktree checkouts, not read";
+
+/// Strictly below the `.claude/worktrees` entry (`starts_with` alone also matches the entry).
+fn below_worktrees(path: &Path) -> bool {
+    path.starts_with(".claude/worktrees") && path != Path::new(".claude/worktrees")
+}
+
+fn not_read(path: &str) -> Finding {
+    Finding::NotRead {
+        path: PathBuf::from(path),
+        reason: WORKTREES_REASON.to_string(),
+    }
+}
+
+#[test]
+fn claude_code_worktree_checkouts_are_named_and_not_read() {
+    let fx = Fixture::new("worktrees");
+    let repo = configured_repo(&fx);
+    let checkout = repo.join(".claude/worktrees/feature-a");
+    // Far more files than the entry budget allows: reading them would make every start ask again.
+    for i in 0..3000 {
+        write(&checkout.join(format!("src/f{i:04}.rs")), b"fn f() {}\n");
+    }
+    write(&checkout.join(".claude/settings.json"), HOOK_SETTINGS);
+    let found = fx.discover(&repo);
+    assert!(found.over_budget.is_none(), "{:?}", found.over_budget);
+    assert!(found.fully_hashed());
+    assert_eq!(
+        found
+            .findings
+            .iter()
+            .filter(|f| **f == not_read(".claude/worktrees"))
+            .count(),
+        1
+    );
+    let listed = paths(&found);
+    assert!(listed.contains(&PathBuf::from(".claude/worktrees")));
+    assert!(!listed.iter().any(|p| below_worktrees(p)), "{listed:?}");
+    assert!(listed.contains(&PathBuf::from(".claude/settings.json")));
+
+    write(&checkout.join("src/f0001.rs"), b"fn changed() {}\n");
+    write(&checkout.join(".claude/hooks/new.sh"), b"echo\n");
+    std::fs::remove_file(checkout.join("src/f0002.rs")).unwrap();
+    assert_eq!(fx.discover(&repo).fingerprint, found.fingerprint);
+
+    std::fs::write(repo.join(".claude/settings.json"), b"{}").unwrap();
+    assert_ne!(fx.discover(&repo).fingerprint, found.fingerprint);
+}
+
+#[test]
+fn the_worktrees_directory_appearing_or_going_is_visible_and_nothing_else() {
+    let fx = Fixture::new("worktrees-name");
+    let repo = configured_repo(&fx);
+    let without = fx.discover(&repo);
+    assert!(!without.findings.contains(&not_read(".claude/worktrees")));
+    write(&repo.join(".claude/worktrees/x/a"), b"a");
+    let with = fx.discover(&repo);
+    assert_ne!(with.fingerprint, without.fingerprint);
+    assert!(with.findings.contains(&not_read(".claude/worktrees")));
+    let others = |d: &Discovery| {
+        paths(d)
+            .into_iter()
+            .filter(|p| p != Path::new(".claude/worktrees"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(others(&with), others(&without));
+    std::fs::remove_dir_all(repo.join(".claude/worktrees")).unwrap();
+    assert_eq!(fx.discover(&repo).fingerprint, without.fingerprint);
+}
+
+#[test]
+fn a_worktrees_link_is_reported_and_not_followed() {
+    let fx = Fixture::new("worktrees-link");
+    let repo = configured_repo(&fx);
+    let elsewhere = fx.base.join("elsewhere");
+    write(&elsewhere.join("a/settings.json"), HOOK_SETTINGS);
+    symlink(&elsewhere, repo.join(".claude/worktrees")).unwrap();
+    let found = fx.discover(&repo);
+    let entry = found
+        .entries
+        .iter()
+        .find(|e| e.path == Path::new(".claude/worktrees"))
+        .expect("the link is an entry");
+    assert!(matches!(&entry.kind, EntryKind::Symlink { target, .. } if *target == elsewhere));
+    assert!(found
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::Symlink { path, .. } if path == Path::new(".claude/worktrees"))));
+    assert!(!found.findings.contains(&not_read(".claude/worktrees")));
+    assert!(!paths(&found).iter().any(|p| below_worktrees(p)));
+    // The content behind the link is not read, so changing it changes nothing.
+    write(&elsewhere.join("a/settings.json"), b"{}");
+    assert_eq!(fx.discover(&repo).fingerprint, found.fingerprint);
+}
+
+#[test]
+fn only_the_worktrees_entry_directly_in_dot_claude_is_skipped() {
+    let fx = Fixture::new("worktrees-near");
+    let repo = configured_repo(&fx);
+    write(&repo.join(".claude/worktreesX/a.md"), b"a");
+    write(&repo.join(".claude/agents/worktrees/b.md"), b"b");
+    write(&repo.join(".claude/hooks/worktrees/c.sh"), b"c");
+    let found = fx.discover(&repo);
+    let listed = paths(&found);
+    for wanted in [
+        ".claude/worktreesX",
+        ".claude/worktreesX/a.md",
+        ".claude/agents/worktrees",
+        ".claude/agents/worktrees/b.md",
+        ".claude/hooks/worktrees/c.sh",
+    ] {
+        assert!(
+            listed.contains(&PathBuf::from(wanted)),
+            "{wanted} missing from {listed:?}"
+        );
+    }
+    assert!(!found.findings.iter().any(|f| matches!(f, Finding::NotRead { .. })));
+    let before = found.fingerprint;
+    write(&repo.join(".claude/agents/worktrees/b.md"), b"changed");
+    assert_ne!(fx.discover(&repo).fingerprint, before);
+}
+
+#[test]
+fn a_root_inside_a_worktree_checkout_is_discovered_on_its_own() {
+    let fx = Fixture::new("worktrees-root");
+    let repo = configured_repo(&fx);
+    let checkout = repo.join(".claude/worktrees/wt");
+    fx.git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "wt", checkout.to_str().unwrap()],
+    );
+    write(&checkout.join(".claude/settings.json"), HOOK_SETTINGS);
+    write(&checkout.join("src/lib.rs"), b"\n");
+    let found = fx.discover(&checkout.join("src"));
+    assert_eq!(found.top, checkout);
+    assert_eq!(found.walked, vec![checkout.join("src"), checkout.clone()]);
+    assert!(paths(&found).contains(&PathBuf::from(".claude/settings.json")));
+    assert!(found.fully_hashed());
+    assert!(found.findings.iter().any(|f| matches!(f, Finding::Hook { .. })));
+    assert!(!found.findings.iter().any(|f| matches!(f, Finding::NotRead { .. })));
+}
+
+#[test]
+fn a_repository_with_only_worktree_checkouts_has_nothing_to_trust() {
+    let fx = Fixture::new("worktrees-only");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    write(&repo.join(".claude/worktrees/a/src/main.rs"), b"fn main() {}\n");
+    let found = fx.discover(&repo);
+    assert!(found.nothing_to_trust());
+    assert!(found.findings.contains(&not_read(".claude/worktrees")));
+    write(&repo.join(".claude/settings.json"), b"{}");
+    assert!(!fx.discover(&repo).nothing_to_trust());
+}

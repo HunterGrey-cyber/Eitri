@@ -84,8 +84,9 @@ pub struct AwaitingTrust {
     /// The nonce of the question on screen for this tab, if one is. Routing away from the tab clears
     /// it, so an answer typed after leaving can never reach the question again.
     pub asking: Option<u64>,
-    /// A `y` was accepted and the worker is writing the record: the answer is spent, and the start
-    /// waits for the record's result rather than for another answer.
+    /// A `y` was accepted and the worker is checking the disk again (and writing the record, when one
+    /// is kept): the answer is spent, and the start waits for that result rather than for another
+    /// answer.
     pub recording: bool,
 }
 
@@ -1301,8 +1302,8 @@ impl TabSet {
         Ok(())
     }
 
-    /// An accepted `y` that needs a record: the question is spent and the tab keeps its start until
-    /// the record's result decides what happens to it.
+    /// An accepted `y`: the question is spent and the tab keeps its start until the worker's second
+    /// look at the disk (and the record, when one is kept) decides what happens to it.
     pub fn mark_recording(&mut self, tab: TabId, nonce: u64) -> Result<(), String> {
         self.check_trust_answer(tab, nonce)?;
         if let Some(Tab {
@@ -1316,14 +1317,14 @@ impl TabSet {
         Ok(())
     }
 
-    /// An answer that needs no record (`n`, a window-only or one-start-only `y`): hands the start over
-    /// and returns the tab to empty.
+    /// An answer taken at once (an `n`, which loads nothing): hands the start over and returns the tab
+    /// to empty.
     pub fn take_answered(&mut self, tab: TabId, nonce: u64) -> Result<DeferredStart, String> {
         self.check_trust_answer(tab, nonce)?;
         Ok(self.take_start(tab).expect("checked to be waiting"))
     }
 
-    /// The start whose record was written, even when the user has since moved to another tab.
+    /// The start whose `y` the worker confirmed, even when the user has since moved to another tab.
     pub fn take_recorded(&mut self, tab: TabId) -> Option<DeferredStart> {
         match &self.get(tab)?.backend {
             TabBackend::AwaitingTrust(AwaitingTrust { recording: true, .. }) => self.take_start(tab),
