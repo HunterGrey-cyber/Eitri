@@ -449,6 +449,130 @@ describe("the trust question", () => {
   });
 });
 
+const EMPTY_TAB1 = { ...TAB1, state: "not_started", label: "1 new" } as const;
+const key = (el: Element | null, k: string, init: Record<string, unknown> = {}) => fireEvent.keyDown(el!, { key: k, ...init });
+const emptyTab = (c: HTMLElement) => c.querySelector<HTMLElement>(".empty-tab[tabindex]");
+
+/** The start screen (no session yet), the keys landed on it in BROWSE, then a trust question for the first send. */
+function askedOnStartScreen(
+  over: Record<string, unknown> = {},
+  tab: Record<string, unknown> = EMPTY_TAB1,
+  { typing = false }: { typing?: boolean } = {},
+) {
+  const rendered = render(<App />);
+  dispatch({ kind: "hello", ...HELLO });
+  dispatch({ kind: "tabs", active: 1, tabs: [tab] });
+  dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: EMPTY_PANEL_TABLE, newTabChord: "Ctrl+b c" });
+  dispatch({ kind: "pane_focus", focused: true });
+  dispatch({ kind: "arrive" });
+  act(() => widen(rendered.container));
+  wait(TYPING_GUARD_MS + 50);
+  if (typing) {
+    // A first send: the keys are in the composer, a message typed, when the question opens.
+    key(document.activeElement, "i");
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.change(rendered.container.querySelector("textarea")!, { target: { value: "hello" } });
+  }
+  dispatch(trustPrompt(over));
+  return rendered;
+}
+
+describe("the trust question on the start screen", () => {
+  it("leaves the status band outside the overlay's box, so the band's prompt and flashes can be read", () => {
+    const { container } = askedOnStartScreen();
+    const box = prompt(container)!;
+    const band = container.querySelector(".status-band")!;
+    expect(box).not.toBeNull();
+    expect(box.parentElement!.classList.contains("empty-stage")).toBe(true);
+    expect(box.parentElement!.contains(band)).toBe(false);
+    expect(bandPrompt(container)).toBe("trust? y/n");
+    // A flash made while it is up reads in the band, after the prompt.
+    key(document.activeElement, "j");
+    key(document.activeElement, "y");
+    expect(promptLine(container)).toContain("trust? y/n");
+    expect(promptLine(container)).toContain("wait a moment, then y or n");
+  });
+
+  it("takes no key from behind the overlay: the keys sit on the start screen's root", () => {
+    const { container } = askedOnStartScreen();
+    expect(document.activeElement).toBe(container.querySelector(".agent-ui-root"));
+    key(document.activeElement, "i");
+    expect(container.querySelector("textarea:focus")).toBeNull();
+    expect(posted.filter((m) => String(m.type).startsWith("trust_"))).toEqual([]);
+  });
+
+  it("opening over a typed first send leaves no field holding the keys", () => {
+    const { container } = askedOnStartScreen({}, EMPTY_TAB1, { typing: true });
+    wait(TYPING_GUARD_MS + 50);
+    // The composer is gone from behind the overlay, so no key can be typed into it and no key of the
+    // question's own is lost to it.
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector(".agent-ui-root"));
+    key(document.activeElement, "y");
+    expect(requests("trust_answer")).toEqual([expect.objectContaining({ trust: true })]);
+  });
+
+  it("escape_hands_the_keys_back_to_the_start_screen_so_i_enters_INPUT", () => {
+    const { container } = askedOnStartScreen();
+    key(document.activeElement, "Escape");
+    expect(requests("trust_cancel")).toHaveLength(1);
+    expect(prompt(container)).toBeNull();
+    // The keys must be on the element that handles them, not on the layout root above it.
+    expect(document.activeElement).toBe(emptyTab(container));
+    wait(TYPING_GUARD_MS + 50);
+    key(document.activeElement, "i");
+    expect(container.querySelector("textarea:focus")).not.toBeNull();
+  });
+
+  it("escape_over_a_typed_first_send_leaves_working_keys", () => {
+    const { container } = askedOnStartScreen({}, EMPTY_TAB1, { typing: true });
+    key(document.activeElement, "Escape");
+    expect(prompt(container)).toBeNull();
+    // Whichever mode the screen is in, the next key reaches its handler: Escape and `i` get to INPUT.
+    key(document.activeElement, "Escape");
+    wait(TYPING_GUARD_MS + 50);
+    key(document.activeElement, "i");
+    expect(container.querySelector("textarea:focus")).not.toBeNull();
+  });
+
+  it("n_hands_the_keys_back_too", () => {
+    const { container } = askedOnStartScreen();
+    wait(TYPING_GUARD_MS + 50);
+    key(document.activeElement, "n");
+    expect(requests("trust_answer")).toEqual([expect.objectContaining({ trust: false })]);
+    expect(prompt(container)).toBeNull();
+    expect(document.activeElement).toBe(emptyTab(container));
+  });
+
+  it("a key after the question closed answers nothing and posts no second answer", () => {
+    const { container } = askedOnStartScreen();
+    key(document.activeElement, "Escape");
+    posted = [];
+    key(document.activeElement, "y");
+    key(document.activeElement, "n");
+    key(document.activeElement, "a");
+    expect(posted.filter((m) => String(m.type).startsWith("trust_") || String(m.type).includes("permission"))).toEqual([]);
+    expect(prompt(container)).toBeNull();
+  });
+
+  it("a tab waiting for the answer says so, and never that a backend is starting", () => {
+    const waiting = { ...TAB1, state: "awaiting_trust" } as const;
+    const { container } = askedOnStartScreen({}, waiting);
+    const text = container.querySelector(".empty-tab")!.textContent!;
+    expect(text).toContain("Waiting for your answer to the trust question");
+    expect(text).not.toContain("Starting the agent backend");
+    wait(15_000);
+    expect(container.querySelector(".empty-tab")!.textContent).not.toContain("a first start from a Verdandi checkout");
+  });
+
+  it("a starting tab still says the backend is starting", () => {
+    const starting = { ...TAB1, state: "starting" } as const;
+    const { container } = askedOnStartScreen({}, starting);
+    expect(container.querySelector(".empty-tab")!.textContent).toContain("Starting the agent backend");
+    expect(container.querySelector(".empty-tab")!.textContent).not.toContain("trust question");
+  });
+});
+
 describe("the : line's trust commands", () => {
   function typed(container: HTMLElement, text: string) {
     dispatch({ kind: "open_command_line" });

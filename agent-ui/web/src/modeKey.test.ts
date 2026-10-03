@@ -28,8 +28,8 @@ describe("isModeCycleKey", () => {
 describe("modeKeyRoute (no canSwitch; ended/failed tabs stay fixed unless in bypass)", () => {
   const base = { confirmOpen: false, chooserOpen: false, tabState: "not_started" as const, tabMode: "auto" as const };
 
-  it("always cycles a not_started, starting or live tab", () => {
-    for (const tabState of ["not_started", "starting", "live"] as const) {
+  it("always cycles a not_started, starting, awaiting_trust or live tab", () => {
+    for (const tabState of ["not_started", "starting", "awaiting_trust", "live"] as const) {
       expect(modeKeyRoute({ ...base, tabState })).toBe("cycle");
     }
   });

@@ -1421,6 +1421,16 @@ export default function App() {
       flashAfter: flashSeq.current,
     });
   }, [heldTrust, keysTakenElsewhere]);
+  /* The question took the keys to the layout's root (a field must not hold them while it is up). On the start
+     screen that root is not what handles keys -- `.empty-tab` inside it is -- so whichever way the question
+     ended, the keys are asked for back, through the one path every other overlay's close uses. Reads this
+     render's overlays, so a prompt, picker or rename that opened in its place keeps them. */
+  const trustOpen = confirm?.kind === "trust";
+  const trustWasOpen = useRef(false);
+  useEffect(() => {
+    if (trustWasOpen.current && !trustOpen) setKeysRequest((n) => n + 1);
+    trustWasOpen.current = trustOpen;
+  }, [trustOpen]);
   useEffect(() => {
     function clearPromptSwallow(event: globalThis.KeyboardEvent) {
       if (event.key === promptSwallowKeyRef.current) promptSwallowKeyRef.current = null;
@@ -1708,7 +1718,7 @@ export default function App() {
         return;
       }
       const root =
-        containerRef.current ?? start?.querySelector<HTMLElement>(":scope > .empty-tab[tabindex]") ?? start;
+        containerRef.current ?? start?.querySelector<HTMLElement>(".empty-tab[tabindex]") ?? start;
       if (root === null) return;
       root.focus({ preventScroll: true });
       const replay = new globalThis.KeyboardEvent("keydown", {
@@ -2658,7 +2668,9 @@ export default function App() {
         activeTabRef.current = payload.active;
         // The banner belongs to the session that ended. Once the active tab is starting a new one
         // (`r`, a first send after a failure) or running it, that session's reason is not about this
-        // tab any more; a start that fails again sends its own `error`.
+        // tab any more; a start that fails again sends its own `error`. `awaiting_trust` is left out on
+        // purpose: nothing has started under it (the user may still put the start off), and a tab that
+        // waits draws no ended-session notice of its own.
         const activeState = payload.tabs.find((t) => t.id === payload.active)?.state;
         if (activeState === "starting" || activeState === "live") setFatalError(null);
         setTabs({ active: payload.active, tabs: payload.tabs, defaultMode: payload.defaultMode });
@@ -3788,79 +3800,84 @@ export default function App() {
           />
         )}
         {commandNoticeBanner}
-        {activeTab === null ? (
-          <div className="empty-tab">
-            <p className="connecting">Connecting to the shell…</p>
-          </div>
-        ) : (
-          <EmptyTab
-            hello={hello}
-            tab={activeTab}
-            handoff={handoff}
-            failure={activeTab.failure ?? fatalError}
-            paneFocused={paneFocused}
-            // Give the dashboard hint the live prefix instead of assuming the default. This is the
-            // same value the `?` overlay shows as `prefixLabel`.
-            prefix={keymapHelp.prefix}
-            editorLink={editorLink}
-            focusRequest={inputRequest}
-            arriveRequest={arriveRequest}
-            // `EmptyTab` handles Composer focus and focuses its own root on `keysRequest`. Route focus requests
-            // directly to it, including when a chooser covers an empty tab, because this layout has
-            // no `App` conversation `containerRef`.
-            keysRequest={emptyKeysRequest}
-            dropKeysRequest={emptyDropKeys}
-            overlayOpen={overlayOpen}
-            landing={emptyLanding}
-            onModeChange={setEmptyMode}
-            // V1 C1: only a `navKey` the effect above found no overlay owning the keys
-            // for -- this screen decides the rest itself (a starting/failed tab, its own menu vs.
-            // composer), reporting back through `onNavFallthrough` when it cannot apply one either.
-            navKeyRequest={emptyNavKey}
-            onNavFallthrough={(direction) => postToRust({ type: "nav_fallthrough", request_id: nextRequestId(), direction })}
-            restoredDraft={restoredDraft}
-            // `EmptyTab` keeps its own leader sequence and box state, alongside its local mode. It shares the
-            // pure panel table and `runPanelAction` with the live conversation.
-            panelTable={panelTable}
-            onPanelAction={runPanelAction}
-            typingGuard={typingGuard}
-            onFlash={showFlash}
-            // Whoever sends from here is typing, and the conversation this starts must open where
-            // they are: in INPUT. It mounted in BROWSE, so a second message typed straight away ran
-            // as BROWSE keys (the phase-3 GUI pass, 2026-09-25).
-            onSend={(text) => {
-              setMode("input");
-              sendMessage(text);
-            }}
-            onResume={(id) => post({ type: "resume", provider_session_id: id })}
-            onRestoreLast={() => post({ type: "restore_last" })}
-            onCycleMode={() => post({ type: "cycle_mode" })}
-            onReset={resetTab}
-            onHint={requestHint}
-            // The dashboard's `w` item: the same window-level
-            // `tab_verb choose` `runPanelAction`'s `tab.choose` case posts for `prefix w`.
-            onChooseSessions={() => postToRust({ type: "tab_verb", request_id: nextRequestId(), verb: "choose" })}
-            onDraftChange={mirrorDraft}
-            answerConfirm={answerConfirm}
-            onQueue={(text) => {
-              setMode("input");
-              queueMessage(text);
-            }}
-            history={history}
-            queueCount={queue.length}
-            queue={queue}
-            queueError={queueError}
-            onTakeBackQueue={() => post({ type: "take_back_queue" })}
-            queueTaken={queueTaken}
-            onHistoryPush={(t) => postToRust({ type: "history_push", request_id: nextRequestId(), text: t })}
-            onEditInNvim={(t) => post({ type: "edit_draft", text: t })}
-            editingInNvim={scratchEditing}
-            onOpenKeymap={() => {
-              setMode("browse");
-              setKeymapOpen(true);
-            }}
-          />
-        )}
+        {/* The stage is the trust question's containing block: it spans everything above the band, so the
+            band's own prompt and flashes stay readable while the question is up (an overlay over the whole
+            root hid them). Normal flow is the same as without it: one column, `.empty-tab` centred in it. */}
+        <div className="empty-stage">
+          {activeTab === null ? (
+            <div className="empty-tab">
+              <p className="connecting">Connecting to the shell…</p>
+            </div>
+          ) : (
+            <EmptyTab
+              hello={hello}
+              tab={activeTab}
+              handoff={handoff}
+              failure={activeTab.failure ?? fatalError}
+              paneFocused={paneFocused}
+              // The first-run hint reads the live prefix instead of assuming the default.
+              // This is the same value the `?` overlay shows as `prefixLabel`.
+              prefix={keymapHelp.prefix}
+              editorLink={editorLink}
+              focusRequest={inputRequest}
+              arriveRequest={arriveRequest}
+              // `EmptyTab` handles composer focus and root focus itself. Pass requests and overlay state
+              // directly because this layout has no `App` conversation `containerRef` to check.
+              keysRequest={emptyKeysRequest}
+              dropKeysRequest={emptyDropKeys}
+              overlayOpen={overlayOpen}
+              landing={emptyLanding}
+              onModeChange={setEmptyMode}
+              // V1 C1: only a `navKey` the effect above found no overlay owning the keys
+              // for -- this screen decides the rest itself (a starting/failed tab, its own menu vs.
+              // composer), reporting back through `onNavFallthrough` when it cannot apply one either.
+              navKeyRequest={emptyNavKey}
+              onNavFallthrough={(direction) => postToRust({ type: "nav_fallthrough", request_id: nextRequestId(), direction })}
+              restoredDraft={restoredDraft}
+              // `EmptyTab` keeps its own leader sequence and which-key box state, like its local mode. It
+              // shares the pure table and `runPanelAction` with the live conversation.
+              panelTable={panelTable}
+              onPanelAction={runPanelAction}
+              typingGuard={typingGuard}
+              onFlash={showFlash}
+              // Whoever sends from here is typing, and the conversation this starts must open where
+              // they are: in INPUT. It mounted in BROWSE, so a second message typed straight away ran
+              // as BROWSE keys (the phase-3 GUI pass, 2026-09-25).
+              onSend={(text) => {
+                setMode("input");
+                sendMessage(text);
+              }}
+              onResume={(id) => post({ type: "resume", provider_session_id: id })}
+              onRestoreLast={() => post({ type: "restore_last" })}
+              onCycleMode={() => post({ type: "cycle_mode" })}
+              onReset={resetTab}
+              onHint={requestHint}
+              // The dashboard's `w` item: the same window-level
+              // `tab_verb choose` `runPanelAction`'s `tab.choose` case posts for `prefix w`.
+              onChooseSessions={() => postToRust({ type: "tab_verb", request_id: nextRequestId(), verb: "choose" })}
+              onDraftChange={mirrorDraft}
+              answerConfirm={answerConfirm}
+              onQueue={(text) => {
+                setMode("input");
+                queueMessage(text);
+              }}
+              history={history}
+              queueCount={queue.length}
+              queue={queue}
+              queueError={queueError}
+              onTakeBackQueue={() => post({ type: "take_back_queue" })}
+              queueTaken={queueTaken}
+              onHistoryPush={(t) => postToRust({ type: "history_push", request_id: nextRequestId(), text: t })}
+              onEditInNvim={(t) => post({ type: "edit_draft", text: t })}
+              editingInNvim={scratchEditing}
+              onOpenKeymap={() => {
+                setMode("browse");
+                setKeymapOpen(true);
+              }}
+            />
+          )}
+          {confirm?.kind === "trust" && trustOverlay}
+        </div>
         {/* This screen has no `.agent-ui-scroller`. The status band and its `prefix &`
             window-close prompt sit directly under the empty tab; the composer lives inside
             `EmptyTab`. The band replaces the footer and shows editor context in its `context`
@@ -3941,7 +3958,6 @@ export default function App() {
             />
           </PanelErrorBoundary>
         )}
-        {confirm?.kind === "trust" && trustOverlay}
         <HintLayer root={startScreenRef.current} hints={hints} typed={hintTyped} />
       </div>
     );

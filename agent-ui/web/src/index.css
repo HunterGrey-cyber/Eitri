@@ -149,6 +149,18 @@ body,
    `.mode-selector` start screen. The mode-selector's own boxed Auto/Bypass buttons are gone with
    it -- there is no second `:not(.row-choice)` rule to keep in step, since this screen never draws
    a boxed button at all any more. */
+/* The start screen's body: everything between the tab bar and the status band. A flex column like the root
+   it sits in, so `.empty-tab`'s `margin: auto` centres it exactly as it did as the root's own child, and
+   `position: relative` makes it the containing block of the trust question, which must not cover the band
+   (the band shows that question's own prompt and flashes). `min-height` is left at its automatic value:
+   content taller than the screen overflows as before and never shrinks into the band. */
+.empty-stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  position: relative;
+}
+
 .empty-tab {
   margin: auto;
   padding: 24px;
