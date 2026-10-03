@@ -486,6 +486,46 @@ fn last_undoable_skips_editor_and_undone_reverts() {
     draft.mark_undone(99);
 }
 
+fn hunk_revert(id: u32, header: &str, source: RevertSource) -> NewRevert {
+    NewRevert {
+        hunk: Some((id, header.to_owned())),
+        ..lines_revert(7, "a.rs", 2, b"1\n", b"x\n", source)
+    }
+}
+
+#[test]
+fn an_editor_revert_whose_text_is_back_is_dropped_newest_first() {
+    let mut draft = ReviewDraft::default();
+    let panel = draft.record_revert(hunk_revert(1, "@@ -2 +2 @@", RevertSource::Panel));
+    let first = draft.record_revert(hunk_revert(1, "@@ -2 +2 @@", RevertSource::Editor));
+    let other_hunk = draft.record_revert(hunk_revert(2, "@@ -9 +9 @@", RevertSource::Editor));
+    let second = draft.record_revert(hunk_revert(1, "@@ -2 +2 @@", RevertSource::Editor));
+    let ids = |d: &ReviewDraft| d.reverts().iter().map(|r| r.id).collect::<Vec<_>>();
+
+    assert!(!draft.forget_editor_revert(8, "a.rs", 1, "@@ -2 +2 @@"), "another turn");
+    assert!(!draft.forget_editor_revert(7, "b.rs", 1, "@@ -2 +2 @@"), "another file");
+    assert!(
+        !draft.forget_editor_revert(7, "a.rs", 1, "@@ -3 +3 @@"),
+        "another header"
+    );
+    assert!(!draft.forget_editor_revert(7, "a.rs", 3, "@@ -2 +2 @@"), "another hunk");
+    assert_eq!(ids(&draft), vec![panel, first, other_hunk, second]);
+
+    assert!(draft.forget_editor_revert(7, "a.rs", 1, "@@ -2 +2 @@"));
+    assert_eq!(
+        ids(&draft),
+        vec![panel, first, other_hunk],
+        "the newest of that hunk goes"
+    );
+    assert!(draft.forget_editor_revert(7, "a.rs", 1, "@@ -2 +2 @@"));
+    assert_eq!(ids(&draft), vec![panel, other_hunk]);
+    assert!(
+        !draft.forget_editor_revert(7, "a.rs", 1, "@@ -2 +2 @@"),
+        "a revert made in the panel has its own undo and is never dropped here"
+    );
+    assert_eq!(ids(&draft), vec![panel, other_hunk]);
+}
+
 #[test]
 fn undo_data_is_kept_as_recorded() {
     let mut draft = ReviewDraft::default();

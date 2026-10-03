@@ -186,6 +186,27 @@ impl ReviewDraft {
             .find(|r| r.new.source == RevertSource::Panel && !r.undone)
     }
 
+    /// Drops the newest revert made in the editor of hunk `hunk_id` (shown under `header`) of
+    /// `path` in `turn`: its text is back in the buffer, so the draft no longer holds a revert for
+    /// it. Whether one was dropped; a revert made in the panel is never touched, it has its own
+    /// undo.
+    pub fn forget_editor_revert(&mut self, turn: u32, path: &str, hunk_id: u32, header: &str) -> bool {
+        let found = self.reverts.iter().rposition(|r| {
+            r.new.source == RevertSource::Editor
+                && !r.undone
+                && r.new.turn == turn
+                && r.new.path == path
+                && r.new.hunk.as_ref().is_some_and(|(id, h)| *id == hunk_id && h == header)
+        });
+        match found {
+            Some(at) => {
+                self.reverts.remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn mark_undone(&mut self, id: u32) {
         if let Some(record) = self.reverts.iter_mut().find(|r| r.id == id) {
             record.undone = true;

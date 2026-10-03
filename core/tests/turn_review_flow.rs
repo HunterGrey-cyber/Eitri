@@ -1760,6 +1760,74 @@ fn editor_reverts_reach_the_draft_in_order() {
     f.shut_down();
 }
 
+/// `event` with its kind changed: the module's `unrevert` carries the hunk exactly as its `revert` did.
+fn with_kind(mut event: Value, kind: &str) -> Value {
+    if let Value::Map(entries) = &mut event {
+        for (k, v) in entries.iter_mut() {
+            if k.as_str() == Some("kind") {
+                *v = Value::from(kind);
+            }
+        }
+    }
+    event
+}
+
+#[test]
+fn an_editor_revert_undone_in_the_editor_leaves_the_draft() {
+    let mut f = Fixture::new("editor-unrevert");
+    embedded(&mut f);
+    f.write("a.txt", b"one\ntwo\nthree\nfour\n", 0o644);
+    let n = f.turn(|f| f.write("a.txt", b"one\nTWO\nthree\nFOUR\n", 0o644));
+    let editor = ScriptedEditor::new();
+    f.run(editor.rpc(), "o1", open_in_editor("o1", f.tab, n, "a.txt"));
+    let panel_hunk = f
+        .tabs
+        .turn_review()
+        .unwrap()
+        .exact_hunks_job(SESSION, n, Scope::Turn, "a.txt")
+        .run()
+        .unwrap()
+        .hunks
+        .unwrap()
+        .remove(0);
+    let known = panel_hunk.id;
+    let drafts = |outs: &[Out]| shape(outs).iter().filter(|w| w.starts_with("review_draft")).count();
+
+    editor.queue_event(revert_event(&f, n, "a.txt", known, 2, "two", "TWO", "lf"));
+    editor.queue_event(revert_event(&f, n, "a.txt", known + 10, 4, "four", "FOUR", "lf"));
+    tick_until(&mut f, &editor, "the reverts", |outs| drafts(outs) == 1);
+    assert_eq!(f.draft().reverts().len(), 2);
+
+    // `u` in the editor brought the first hunk's text back: its revert leaves the draft, under the
+    // header the panel showed, and the panel is told.
+    editor.queue_event(with_kind(
+        revert_event(&f, n, "a.txt", known, 2, "two", "TWO", "lf"),
+        "unrevert",
+    ));
+    let outs = tick_until(&mut f, &editor, "the un-revert", |outs| drafts(outs) == 1);
+    assert_eq!(shape(&outs)[0], "review_draft:null");
+    let left = f.draft().reverts();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].new.hunk.as_ref().map(|h| h.0), Some(known + 10));
+
+    // One the draft no longer holds (sent, or never recorded) changes nothing and pushes nothing.
+    editor.queue_event(with_kind(
+        revert_event(&f, n, "a.txt", known, 2, "two", "TWO", "lf"),
+        "unrevert",
+    ));
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        f.pump();
+        seen.extend(
+            f.flow
+                .tick(&mut f.tabs, editor.rpc(), Instant::now() + Duration::from_secs(60)),
+        );
+    }
+    assert_eq!(drafts(&seen), 0, "{:?}", shape(&seen));
+    assert_eq!(f.draft().reverts().len(), 1);
+    f.shut_down();
+}
+
 #[test]
 fn show_hunk_converts_lf_crlf_and_a_missing_final_newline() {
     let mut f = Fixture::new("show-hunk");
