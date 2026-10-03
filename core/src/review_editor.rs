@@ -27,7 +27,7 @@ use crate::turn_review::{Scope, MAX_OVERVIEW_DIFF_LINES};
 pub const REVIEW_LUA: &str = include_str!("review.lua");
 
 /// Bumped whenever `review.lua` changes.
-pub const REVIEW_LUA_VERSION: i64 = 2;
+pub const REVIEW_LUA_VERSION: i64 = 3;
 
 /// Every call into an installed module first checks that one is there, and answers
 /// `{ missing = true }` when it is not (another panel's teardown, or nvim restarted) rather than
@@ -42,7 +42,8 @@ macro_rules! guarded {
 }
 
 /// Args `(abs_path: bin, meta: map, hunks: [map])`: draws into the buffer showing the file, if one
-/// is loaded. Answers `{drawn, skipped, notice?, active}`.
+/// is loaded. Answers `{drawn, kept, skipped, notice?, active}`; `kept` also counts hunks reverted
+/// in the buffer that the editor still follows.
 pub const SHOW_LUA: &str = guarded!("return r.show(...)");
 /// Args `(abs_path: bin, line: int|nil, meta: map, hunks: [map]|nil)`: opens the file (a split
 /// when the current buffer cannot be left), puts the cursor on `line` and shows `hunks`. Answers
@@ -54,7 +55,8 @@ pub const CLEAR_LUA: &str = guarded!("return r.clear(...)");
 pub const CLEAR_ALL_LUA: &str = guarded!("return r.clear_all()");
 /// No args: the oldest events since the last call, in order, as many as fit in one answer (at
 /// least one), and how many buffers have an overlay. Answers `{events, active, more}`; `more`
-/// says events are still waiting.
+/// says events are still waiting. An event is a `revert` or an `unrevert` (a hunk's lines, as
+/// [`parse_revert_event`] and [`parse_unrevert_event`] read them) or an `off`.
 pub const TAKE_EVENTS_LUA: &str = guarded!("return r.take_events()");
 
 /// Who installed the module, which decides who tears it down.
@@ -303,8 +305,18 @@ fn side(event: &Value, side: &str, len: u32) -> Result<Vec<BufferLine>, String> 
 /// A `revert` event from [`TAKE_EVENTS_LUA`]. Anything it cannot read exactly fails the event:
 /// an ending it does not know or a side whose arrays disagree would give bytes the file never had.
 pub fn parse_revert_event(event: &Value) -> Result<EditorRevertEvent, String> {
-    if field(event, "kind")?.as_str() != Some("revert") {
-        return Err("not a revert event".to_owned());
+    parse_hunk_event(event, "revert")
+}
+
+/// An `unrevert` event: a hunk reverted in the buffer has its text back there (an undo, or the
+/// user typing it again). It carries the hunk exactly as the `revert` event did.
+pub fn parse_unrevert_event(event: &Value) -> Result<EditorRevertEvent, String> {
+    parse_hunk_event(event, "unrevert")
+}
+
+fn parse_hunk_event(event: &Value, kind: &str) -> Result<EditorRevertEvent, String> {
+    if field(event, "kind")?.as_str() != Some(kind) {
+        return Err(format!("not a {kind} event"));
     }
     let scope = field(event, "scope")?
         .as_str()
@@ -393,6 +405,8 @@ pub enum OverlayOutcome {
     },
     /// Hunks the user reverted in a buffer since the last batch, in the order they did it.
     Reverts(Vec<EditorRevertEvent>),
+    /// Hunks reverted in a buffer whose text is back there: the revert no longer stands.
+    Unreverts(Vec<EditorRevertEvent>),
     /// Buffers that stopped showing a review.
     Off(Vec<OffEvent>),
 }
@@ -673,7 +687,11 @@ impl EditorOverlay {
         if was_drawn && self.active == 0 {
             self.drain_owed = true;
         }
-        let drawn = lookup(answer, "drawn").and_then(Value::as_u64);
+        // What the editor keeps over the file: the hunks drawn and those reverted in the buffer that
+        // it still follows (`kept`; an older module answers `drawn` alone).
+        let drawn = lookup(answer, "kept")
+            .or_else(|| lookup(answer, "drawn"))
+            .and_then(Value::as_u64);
         match call {
             OverlayCall::OpenAndShow { request_id, path, .. } => {
                 let opened = lookup(answer, "opened").and_then(Value::as_bool);
@@ -766,37 +784,60 @@ impl EditorOverlay {
         }
     }
 
-    /// The module's events, reverts as one batch and offs as another, each in order.
+    /// The module's events as batches of one kind each, in the order they happened: a revert, its
+    /// undo and a second revert of the same hunk must reach the draft in that order.
     fn events(&mut self, answer: &Value) {
+        enum Batch {
+            None,
+            Reverts(Vec<EditorRevertEvent>),
+            Unreverts(Vec<EditorRevertEvent>),
+            Offs(Vec<OffEvent>),
+        }
+        fn flush(batch: Batch, done: &mut Vec<OverlayOutcome>) {
+            match batch {
+                Batch::None => {}
+                Batch::Reverts(events) => done.push(OverlayOutcome::Reverts(events)),
+                Batch::Unreverts(events) => done.push(OverlayOutcome::Unreverts(events)),
+                Batch::Offs(offs) => done.push(OverlayOutcome::Off(offs)),
+            }
+        }
         let items: &[Value] = match lookup(answer, "events") {
             Some(Value::Array(items)) => items,
             _ => &[],
         };
-        let mut reverts = Vec::new();
-        let mut offs = Vec::new();
+        let mut batch = Batch::None;
         for item in items {
             let kind = lookup(item, "kind").and_then(Value::as_str);
             match kind {
                 Some("revert") => match parse_revert_event(item) {
-                    Ok(event) => reverts.push(event),
+                    Ok(event) => match &mut batch {
+                        Batch::Reverts(events) => events.push(event),
+                        other => flush(std::mem::replace(other, Batch::Reverts(vec![event])), &mut self.done),
+                    },
+                    Err(why) => eprintln!("eitri: a review event from the editor was dropped: {why}"),
+                },
+                Some("unrevert") => match parse_unrevert_event(item) {
+                    Ok(event) => match &mut batch {
+                        Batch::Unreverts(events) => events.push(event),
+                        other => flush(std::mem::replace(other, Batch::Unreverts(vec![event])), &mut self.done),
+                    },
                     Err(why) => eprintln!("eitri: a review event from the editor was dropped: {why}"),
                 },
                 Some("off") => match (text(item, "path"), text(item, "why")) {
                     (Ok(path), Ok(why)) => {
                         self.active_paths.remove(Path::new(OsStr::from_bytes(path.as_bytes())));
-                        offs.push(OffEvent { path, why });
+                        let off = OffEvent { path, why };
+                        match &mut batch {
+                            Batch::Offs(offs) => offs.push(off),
+                            other => flush(std::mem::replace(other, Batch::Offs(vec![off])), &mut self.done),
+                        }
                     }
                     _ => eprintln!("eitri: a review event from the editor was dropped: unreadable off event"),
                 },
                 _ => {}
             }
         }
-        if !reverts.is_empty() {
-            self.done.push(OverlayOutcome::Reverts(reverts));
-        }
-        if !offs.is_empty() {
-            self.done.push(OverlayOutcome::Off(offs));
-        }
+        flush(batch, &mut self.done);
     }
 
     /// A different nvim behind the handle: what was installed and drawn was in the old one.

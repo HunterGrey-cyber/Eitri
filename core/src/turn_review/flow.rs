@@ -976,6 +976,7 @@ impl ReviewFlow {
                     }
                 }
                 OverlayOutcome::Reverts(events) => self.record_editor_reverts(tabs, events, out),
+                OverlayOutcome::Unreverts(events) => self.forget_editor_reverts(tabs, events, out),
                 OverlayOutcome::Off(offs) => {
                     for OffEvent { path, .. } in offs {
                         self.shown.remove(Path::new(&path));
@@ -1007,9 +1008,49 @@ impl ReviewFlow {
         }
     }
 
-    fn record_editor_revert(&self, tabs: &mut TabSet, event: &EditorRevertEvent) -> Result<TabId, String> {
+    /// Hunks whose reverted text is back in the editor stop being reverts of their tab's draft, in
+    /// the order the editor said so. The draft is pushed once per tab after the batch.
+    fn forget_editor_reverts(&mut self, tabs: &mut TabSet, events: Vec<EditorRevertEvent>, out: &mut Vec<Out>) {
+        let mut touched: Vec<TabId> = Vec::new();
+        for event in events {
+            match self.forget_editor_revert(tabs, &event) {
+                Ok(Some(tab)) => {
+                    if !touched.contains(&tab) {
+                        touched.push(tab);
+                    }
+                }
+                // Already gone from the draft (sent, or never recorded): nothing to take back.
+                Ok(None) => {}
+                Err(why) => eprintln!(
+                    "[review] an undone revert made in the editor on {} was not taken back: {why}",
+                    event.path
+                ),
+            }
+        }
+        for tab in touched {
+            out.extend(draft_envelope(None, tab, tabs));
+        }
+    }
+
+    fn forget_editor_revert(&self, tabs: &mut TabSet, event: &EditorRevertEvent) -> Result<Option<TabId>, String> {
+        let (tab, rel, header) = self.editor_revert_target(tabs, event, "the undo was not recorded")?;
+        let draft = tabs.review_draft_mut(tab)?;
+        // The revert was recorded under the header the panel showed then; if the drawing has been
+        // replaced since, the header the hunk's own counts give is the other one it can carry.
+        let removed = draft.forget_editor_revert(event.meta.turn, &rel, event.hunk.id, &header)
+            || draft.forget_editor_revert(event.meta.turn, &rel, event.hunk.id, &header_of(&event.hunk));
+        Ok(removed.then_some(tab))
+    }
+
+    /// The tab, the project-relative path and the header of the hunk an editor event is about.
+    fn editor_revert_target(
+        &self,
+        tabs: &mut TabSet,
+        event: &EditorRevertEvent,
+        consequence: &str,
+    ) -> Result<(TabId, String, String), String> {
         let tab = TabId(event.meta.tab);
-        if let Some(why) = tab_gone(tabs, tab, &event.meta.session, "the revert was not recorded") {
+        if let Some(why) = tab_gone(tabs, tab, &event.meta.session, consequence) {
             return Err(why);
         }
         let root = tabs.review_session(tab)?.0.project_root().to_path_buf();
@@ -1027,6 +1068,11 @@ impl ReviewFlow {
             .and_then(|shown| shown.headers.get(&event.hunk.id))
             .cloned()
             .unwrap_or_else(|| header_of(&event.hunk));
+        Ok((tab, rel, header))
+    }
+
+    fn record_editor_revert(&self, tabs: &mut TabSet, event: &EditorRevertEvent) -> Result<TabId, String> {
+        let (tab, rel, header) = self.editor_revert_target(tabs, event, "the revert was not recorded")?;
         // The bytes are the file's own, rebuilt from the lines and endings the editor echoed, never
         // by joining text with a terminator of this file's own choosing.
         let reverted_to = event.hunk.old_bytes();

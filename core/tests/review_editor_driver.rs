@@ -561,17 +561,20 @@ fn events_come_back_in_order() {
         ),
     );
     let out = overlay.tick(&rpc, ms(t0, 1));
-    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(
+        out.len(),
+        3,
+        "a batch of one kind each, in the order the events came: {out:?}"
+    );
     match &out[0] {
         OverlayOutcome::Reverts(reverts) => {
-            let ids: Vec<u32> = reverts.iter().map(|r| r.hunk.id).collect();
-            assert_eq!(ids, vec![2, 1], "in the order they happened, not by id");
+            assert_eq!(reverts.len(), 1);
+            assert_eq!(reverts[0].hunk.id, 2);
             assert_eq!(reverts[0].path, "/p/a");
             assert_eq!(reverts[0].meta, meta());
             assert_eq!(reverts[0].at_line, 6, "where the lines are now, beside the header");
             assert_eq!(reverts[0].hunk.new_start, 5);
             assert_eq!(reverts[0].hunk.old_bytes(), b"two\n");
-            assert_eq!(reverts[1].hunk.new_bytes(), b"ONE\n");
         }
         other => panic!("{other:?}"),
     }
@@ -582,7 +585,97 @@ fn events_come_back_in_order() {
             why: "closed".to_owned()
         }])
     );
+    match &out[2] {
+        OverlayOutcome::Reverts(reverts) => {
+            assert_eq!(reverts.len(), 1);
+            assert_eq!(reverts[0].hunk.id, 1);
+            assert_eq!(reverts[0].hunk.new_bytes(), b"ONE\n");
+        }
+        other => panic!("{other:?}"),
+    }
     assert!(overlay.tick(&rpc, ms(t0, 2)).is_empty(), "taken once");
+}
+
+fn unrevert_event(path: &str, hunk: u32, old: &str, new: &str) -> Value {
+    let mut event = revert_event(path, hunk, old, new);
+    if let Value::Map(entries) = &mut event {
+        for (k, v) in entries.iter_mut() {
+            if k.as_str() == Some("kind") {
+                *v = Value::from("unrevert");
+            }
+        }
+    }
+    event
+}
+
+#[test]
+fn a_file_with_only_reverted_hunks_still_counts_as_shown() {
+    let rpc = FakeEditor::new();
+    let mut overlay = EditorOverlay::new(Owner::Embedded);
+    let t0 = Instant::now();
+    overlay.call(&rpc, show("/p/a"), t0);
+    rpc.answer(REVIEW_LUA, installed());
+    overlay.tick(&rpc, t0);
+    // Nothing is drawn, but the editor keeps following the hunk reverted in the buffer.
+    rpc.answer(
+        SHOW_LUA,
+        Ok(map(vec![
+            ("drawn", Value::from(0)),
+            ("kept", Value::from(1)),
+            ("skipped", Value::from(0)),
+            ("active", Value::from(1)),
+        ])),
+    );
+    overlay.tick(&rpc, t0);
+    assert!(overlay.active_paths().contains(Path::new("/p/a")));
+    assert!(overlay.wants_ticks(), "its events are still asked for");
+}
+
+#[test]
+fn a_revert_its_undo_and_the_revert_again_keep_their_order() {
+    let rpc = FakeEditor::new();
+    let mut overlay = EditorOverlay::new(Owner::Embedded);
+    let t0 = Instant::now();
+    overlay.call(&rpc, show("/p/a"), t0);
+    rpc.answer(REVIEW_LUA, installed());
+    overlay.tick(&rpc, t0);
+    rpc.answer(SHOW_LUA, answered_show(1, 1));
+    overlay.tick(&rpc, t0);
+
+    rpc.answer(
+        TAKE_EVENTS_LUA,
+        events_answer(
+            vec![
+                revert_event("/p/a", 1, "one", "ONE"),
+                unrevert_event("/p/a", 1, "one", "ONE"),
+                unrevert_event("/p/a", 2, "two", "TWO"),
+                revert_event("/p/a", 1, "one", "ONE"),
+                // A revert event is not an unrevert one: a malformed kind is dropped, not guessed.
+                map(vec![("kind", Value::from("unrevert"))]),
+            ],
+            1,
+        ),
+    );
+    let out = overlay.tick(&rpc, ms(t0, 1));
+    let shape: Vec<(&str, Vec<u32>)> = out
+        .iter()
+        .map(|o| match o {
+            OverlayOutcome::Reverts(r) => ("revert", r.iter().map(|e| e.hunk.id).collect()),
+            OverlayOutcome::Unreverts(r) => ("unrevert", r.iter().map(|e| e.hunk.id).collect()),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("revert", vec![1]), ("unrevert", vec![1, 2]), ("revert", vec![1])]
+    );
+    match &out[1] {
+        OverlayOutcome::Unreverts(events) => {
+            assert_eq!(events[0].hunk.old_bytes(), b"one\n");
+            assert_eq!(events[0].at_line, 6);
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
