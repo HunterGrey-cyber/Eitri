@@ -33,6 +33,28 @@ use std::time::Duration;
 /// (Verdandi's own test).
 pub const SIDECAR_EXIT_GRACE: Duration = Duration::from_secs(6);
 
+/// How long a started sidecar is given to bind its socket before the start is called failed.
+///
+/// Before it binds, the sidecar loads its own single-executable Node binary (about 105 MB), the
+/// Claude Agent SDK's module graph, and runs the host CLI's `--version` to check it, synchronously
+/// (through a launcher script on some machines). With a cold page cache after boot that took over
+/// three seconds, while the same sidecar warm binds in well under half a second: a 3 s budget made
+/// the first start of a session fail and the retry work. Fifteen seconds is five times the
+/// budget that proved too short, and only a slow start ever reaches it. A sidecar that refuses to
+/// start is not waited out: the loop notices a dead child at once, so this only bounds one that is
+/// alive and slow. The wait runs on the connect's own worker thread, never the GTK thread.
+const SIDECAR_BIND_BUDGET: Duration = Duration::from_secs(15);
+/// How often the socket is tried while the sidecar starts.
+const SIDECAR_BIND_POLL: Duration = Duration::from_millis(50);
+
+/// The timeout's summary line; it names the budget actually waited so the message cannot drift from it.
+fn bind_timeout_summary(socket_path: &std::path::Path, budget: Duration) -> String {
+    format!(
+        "claude-sidecar did not bind {socket_path:?} within {}ms",
+        budget.as_millis()
+    )
+}
+
 /// How many of the sidecar's most recent stderr lines are retained for diagnostics. Bounded on
 /// purpose: a long-lived sidecar can log indefinitely, and this buffer exists to explain a startup
 /// failure or carry a compatibility warning, not to be a second log file.
@@ -951,11 +973,8 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
         spawn_log_drain_thread(stderr, "stderr", Some(Arc::clone(&stderr_tail)));
     }
 
-    // 3s, not the former 1s. The old budget had no headroom over a cold Node start plus the Claude
-    // Agent SDK's own module graph, and its expiry was indistinguishable from a real refusal.
-    const RETRY_ATTEMPTS: u32 = 60;
-    const RETRY_DELAY: Duration = Duration::from_millis(50);
-    for _ in 0..RETRY_ATTEMPTS {
+    let started_waiting = std::time::Instant::now();
+    loop {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
             return Ok(SpawnedSidecar {
                 socket_path,
@@ -982,7 +1001,10 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
                 &stderr_tail,
             )));
         }
-        std::thread::sleep(RETRY_DELAY);
+        if started_waiting.elapsed() >= SIDECAR_BIND_BUDGET {
+            break;
+        }
+        std::thread::sleep(SIDECAR_BIND_POLL);
     }
     // Still running but never bound -- clean up rather than leaking a half-started process, then
     // report the failure with whatever it managed to say for itself.
@@ -991,13 +1013,7 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     let _ = child.wait();
     Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        describe_startup_failure(
-            &format!(
-                "claude-sidecar did not bind {socket_path:?} within {}ms",
-                RETRY_ATTEMPTS as u64 * RETRY_DELAY.as_millis() as u64
-            ),
-            &stderr_tail,
-        ),
+        describe_startup_failure(&bind_timeout_summary(&socket_path, SIDECAR_BIND_BUDGET), &stderr_tail),
     ))
 }
 
@@ -1179,6 +1195,17 @@ mod tests {
             "{resolved:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_bind_budget_outlasts_a_cold_start_and_the_timeout_names_it() {
+        // A cold start measured over 3 s; the budget must clear that with room, and stay a bound.
+        assert!(SIDECAR_BIND_BUDGET >= Duration::from_secs(10));
+        assert!(SIDECAR_BIND_BUDGET <= Duration::from_secs(30));
+        assert!(SIDECAR_BIND_POLL <= Duration::from_millis(100));
+        let message = bind_timeout_summary(std::path::Path::new("/run/x/endpoint"), SIDECAR_BIND_BUDGET);
+        assert!(message.contains("within 15000ms"), "{message}");
+        assert!(message.contains("did not bind"), "{message}");
     }
 
     /// Verdandi a1a41ae: the sidecar reaps its CLIs before exiting -- 250 ms, SIGTERM, SIGKILL 3 s later, give up

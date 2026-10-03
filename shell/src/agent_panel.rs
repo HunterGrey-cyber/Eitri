@@ -106,6 +106,13 @@ const SESSION_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_se
 /// than left running with nothing owning it. Three seconds is well past a warm connect and well
 /// short of a cold one (`npm ci` in a fresh Verdandi checkout is minutes), so it deliberately does
 /// not cover every case; what it must not do is cover none of them by exiting instantly.
+///
+/// The sidecar's own bind wait (`SIDECAR_BIND_BUDGET` in `agent`, 15 s) is longer than this on
+/// purpose. A window closed while a cold sidecar is still starting does not wait out that budget:
+/// the hold ends here and the process exits, the connect worker with it. The sidecar is left with
+/// its stdin pipe closed, which it reads as the host being gone, so no one waits on it. A longer
+/// hold would keep an invisible process alive for up to 15 s after the window closed, to save a
+/// session nobody is looking at.
 const CONNECT_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How often the main loop looks at a close that is running on a worker. A `try_recv` and an

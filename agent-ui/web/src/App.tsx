@@ -2953,6 +2953,11 @@ export default function App() {
           if (kept !== undefined) setState(kept);
         }
         activeTabRef.current = payload.active;
+        // The banner belongs to the session that ended. Once the active tab is starting a new one
+        // (`r`, a first send after a failure) or running it, that session's reason is not about this
+        // tab any more; a start that fails again sends its own `error`.
+        const activeState = payload.tabs.find((t) => t.id === payload.active)?.state;
+        if (activeState === "starting" || activeState === "live") setFatalError(null);
         setTabs({ active: payload.active, tabs: payload.tabs, defaultMode: payload.defaultMode });
         forgetClosed(
           viewStore.current,
@@ -3031,6 +3036,9 @@ export default function App() {
         // conversation nothing else remembers.
         setHandoff(null);
         setCommandNotice(null);
+        // Likewise the ended-session banner: a snapshot is a session that runs, so a reason left from
+        // an earlier session of this tab (a failed start that `r` then redid) is stale.
+        setFatalError(null);
         // A turn id first seen inside a SNAPSHOT (a page reload, or a resync mid-turn) gets
         // `exact: false` -- this panel cannot know how long it had already been running (design doc
         // §8.4). Untouched if the snapshot names the SAME turn already tracked (a resync must not

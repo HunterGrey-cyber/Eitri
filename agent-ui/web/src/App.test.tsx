@@ -12219,6 +12219,26 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(modeOf(container)).toBe("browse");
   });
 
+  it("a restarted tab does not keep the old session's \"agent session ended\" notice over the new conversation", () => {
+    const { container } = startedOnPromptRow();
+    dispatch({ kind: "error", tab: 1, message: "failed to connect to the Verdandi sidecar: did not bind" });
+    expect(container.querySelector(".fatal-error")).not.toBeNull();
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: "did not bind" }] });
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ userPrompts: [{ seq: 1, text: "a brand new conversation" }] }) });
+    expect(container.textContent).toContain("a brand new conversation");
+    expect(container.querySelector(".fatal-error")).toBeNull();
+    expect(container.textContent).not.toContain("The agent session ended.");
+  });
+
+  it("a tab that is live again does not show the previous start's failure before its first snapshot", () => {
+    const { container } = startedOnPromptRow();
+    dispatch({ kind: "error", tab: 1, message: "failed to connect to the Verdandi sidecar: did not bind" });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: "did not bind" }] });
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    expect(container.textContent).not.toContain("did not bind");
+  });
+
   it("fix round 2: an error during CARET ends it -- the restarted tab shows its own conversation, never the frozen one with the dead session's card", () => {
     const { container, root } = startedOnPromptRow();
     fireEvent.keyDown(root, { key: "v" });
