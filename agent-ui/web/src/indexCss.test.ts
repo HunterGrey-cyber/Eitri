@@ -2748,6 +2748,32 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     expect(winningDeclarationOn(loose, "overflow")).toBe("visible");
   });
 
+  it("wraps, muted and whole, the one line a refused call's folded failure shows (the CLI's own reason)", () => {
+    const reason = "Permission for this action was denied by the Claude Code auto mode classifier. Reason: " + "[Git Destructive] ".repeat(30);
+    const folded = renderToolCall(
+      {
+        seq: 1,
+        toolUseId: "t1",
+        name: "Bash",
+        input: { command: "git push --force origin main" },
+        result: { content: reason, isError: true },
+        denied: { reasonType: "classifier", reason: "[Git Destructive]" },
+      },
+      false,
+    );
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML =
+      `<div class="message-list"><div class="row"><span class="row-sign"></span><div class="row-body">` +
+      renderToStaticMarkup(createElement("div", null, folded)) +
+      `</div></div></div>`;
+    const line = document.querySelector<HTMLElement>(".tool-result-preview-line")!;
+    expect(line.textContent).toBe(reason);
+    expect(winningDeclarationOn(line, "white-space")).toBe("pre-wrap");
+    expect(winningDeclarationOn(line, "overflow")).toBe("visible");
+    expect(winningDeclarationOn(line, "text-overflow")).toBe("clip");
+    expect(winningDeclarationOn(line, "color")).toBe("var(--nv-muted)");
+  });
+
   it("holds the preview's lines in one zero-minimum track, which is what keeps a long line from widening the row", () => {
     const preview = foldedPreview();
     expect(winningDeclarationOn(preview, "display")).toBe("grid");

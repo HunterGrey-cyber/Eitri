@@ -202,7 +202,7 @@ describe("the stops", () => {
 
   it("are called file, hunk and group, never row", () => {
     const state = { ...loaded(), expanded: ["a.rs"], groupOpen: true };
-    const open = receiveDiff({ ...state, diffs: { "a.rs": { status: "loading", requestId: "d1" } } }, diffOf("d1", "a.rs"));
+    const open = receiveDiff({ ...state, diffs: new Map([["a.rs", { status: "loading", requestId: "d1" }]]) }, diffOf("d1", "a.rs"));
     const kinds = new Set(reviewStops(open).map((s) => s.kind));
     expect(kinds).toEqual(new Set(["file", "hunk", "group"]));
   });
@@ -245,9 +245,37 @@ describe("the cursor", () => {
     state = press(state, { kind: "toggle" }).state; // opens a.rs, asks for it
     state = press(state, { kind: "move", delta: 1 }).state; // on b.md while the patch loads
     expect(state.cursor).toBe("file:b.md");
-    const requestId = (Object.values(state.diffs)[0] as { requestId: string }).requestId;
+    const requestId = ([...state.diffs.values()][0] as { requestId: string }).requestId;
     state = receiveDiff(state, diffOf(requestId, "a.rs"));
     expect(cursorStop(state)).toEqual({ kind: "file", path: "b.md" });
+  });
+});
+
+describe("a path that is a member of Object.prototype", () => {
+  const NAMES = ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"];
+
+  it("opens, asks for its patch, receives it and fails like any other file", () => {
+    for (const name of NAMES) {
+      const state = loaded({ files: [file(name), file("b.md")] });
+      const first = press(state, { kind: "toggle" });
+      expect(first.effect, name).toMatchObject({ kind: "request-diff", path: name });
+      expect(first.state.expanded, name).toEqual([name]);
+      const entry = first.state.diffs.get(name);
+      if (entry?.status !== "loading") throw new Error(`${name}: no loading entry`);
+      const ready = receiveDiff(first.state, diffOf(entry.requestId, name));
+      expect(ready.diffs.get(name)?.status, name).toBe("ready");
+      expect(reviewStops(ready).map(stopKey), name).toEqual([`file:${name}`, "hunk:" + name + ":0", "hunk:" + name + ":1", "file:b.md"]);
+      // the other file is untouched, and asking for a patch finds no entry where none was made
+      expect(ready.diffs.get("b.md"), name).toBeUndefined();
+      const second = press(loaded({ files: [file(name), file("b.md")] }), { kind: "toggle" }).state;
+      const failed = failRequest(second, (second.diffs.get(name) as { requestId: string }).requestId, "git unavailable");
+      expect(failed.diffs.get(name), name).toEqual({ status: "failed", error: "git unavailable" });
+    }
+  });
+
+  it("is never found by a file that is not in the map", () => {
+    const state = loaded({ files: [file("a.rs")] });
+    for (const name of NAMES) expect(state.diffs.get(name), name).toBeUndefined();
   });
 });
 
@@ -270,9 +298,9 @@ describe("Enter", () => {
 
   it("asks again for a patch that failed", () => {
     let state = press(loaded(), { kind: "toggle" }).state;
-    const requestId = (Object.values(state.diffs)[0] as { requestId: string }).requestId;
+    const requestId = ([...state.diffs.values()][0] as { requestId: string }).requestId;
     state = failRequest(state, requestId, "git unavailable");
-    expect(state.diffs["a.rs"]).toEqual({ status: "failed", error: "git unavailable" });
+    expect(state.diffs.get("a.rs")).toEqual({ status: "failed", error: "git unavailable" });
     state = press(state, { kind: "toggle" }).state; // closes
     const again = press(state, { kind: "toggle" });
     expect(again.effect).toMatchObject({ kind: "request-diff", path: "a.rs" });
@@ -294,7 +322,7 @@ describe("Enter", () => {
     expect(state.groupOpen).toBe(true);
     state = loaded();
     state = press(state, { kind: "toggle" }).state;
-    const requestId = (Object.values(state.diffs)[0] as { requestId: string }).requestId;
+    const requestId = ([...state.diffs.values()][0] as { requestId: string }).requestId;
     state = receiveDiff(state, diffOf(requestId, "a.rs"));
     state = press(state, { kind: "move", delta: 1 }).state;
     expect(state.cursor).toBe("hunk:a.rs:0");
@@ -335,7 +363,7 @@ describe("replies", () => {
     const moved = press(state, { kind: "turn", delta: -1 });
     const next = receiveReview(moved.state, envelope({ requestId: moved.state.requestId, current: 6 }));
     expect(next.expanded).toEqual([]);
-    expect(next.diffs).toEqual({});
+    expect(next.diffs.size).toBe(0);
     expect(next.cursor).toBeNull();
     expect(next.turn).toBe(6);
   });
@@ -373,7 +401,7 @@ describe("o and y", () => {
   const withDiff = () => {
     let state = loaded();
     state = press(state, { kind: "toggle" }).state;
-    const requestId = (Object.values(state.diffs)[0] as { requestId: string }).requestId;
+    const requestId = ([...state.diffs.values()][0] as { requestId: string }).requestId;
     return receiveDiff(state, diffOf(requestId, "a.rs"));
   };
 
@@ -477,7 +505,7 @@ const draftOf = (over: Partial<ReviewDraft> = {}): ReviewDraft => ({ ...EMPTY_DR
 function opened(draft: ReviewDraft = EMPTY_DRAFT, diff: Partial<ReviewDiffEnvelope> = {}, over: Partial<ReviewEnvelope> = {}): ReviewState {
   let state = loaded({ draft, ...over });
   state = press(state, { kind: "toggle" }).state;
-  const entry = state.diffs["a.rs"];
+  const entry = state.diffs.get("a.rs");
   if (entry?.status !== "loading") throw new Error("no request");
   return receiveDiff(state, diffOf(entry.requestId, "a.rs", diff));
 }
@@ -716,13 +744,13 @@ describe("the draft", () => {
   it("puts a comment under the hunk whose new lines hold its first line, in this turn only", () => {
     const state = opened(draftOf({ comments: [COMMENT, { ...COMMENT, id: 2, from: 41, to: 41 }, { ...COMMENT, id: 3, turn: 6 }, { ...COMMENT, id: 4, path: "b.md" }] }));
     expect(reviewStops(state).map(stopKey)).toEqual(["file:a.rs", "hunk:a.rs:0", "comment:a.rs:1", "hunk:a.rs:1", "comment:a.rs:2", "file:b.md", "group"]);
-    const hunks = (state.diffs["a.rs"] as { diff: ReviewDiffEnvelope }).diff.hunks!;
+    const hunks = (state.diffs.get("a.rs") as { diff: ReviewDiffEnvelope }).diff.hunks!;
     expect(commentsUnder(state, "a.rs", hunks[0]).map((c) => c.id)).toEqual([1]);
   });
 
   it("marks a hunk reverted by turn, path, hunk id and header, and says when it was undone", () => {
     const state = opened(draftOf({ reverts: [REVERT] }));
-    const hunks = (state.diffs["a.rs"] as { diff: ReviewDiffEnvelope }).diff.hunks!;
+    const hunks = (state.diffs.get("a.rs") as { diff: ReviewDiffEnvelope }).diff.hunks!;
     expect(revertMark(revertOf(state, "a.rs", hunks[1]))).toBe("reverted");
     expect(revertOf(state, "a.rs", hunks[0]), "another hunk").toBeNull();
     expect(revertOf(state, "a.rs", { ...hunks[1], header: "@@ -40,2 +45,2 @@" }), "the same id with another header is another hunk").toBeNull();

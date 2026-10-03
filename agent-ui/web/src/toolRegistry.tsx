@@ -376,31 +376,35 @@ export const PREVIEW_LINES = 3;
  *  is cut here with an ellipsis, not put into the page whole for CSS to clip. */
 const PREVIEW_LINE_CHARS = 400;
 
+/** The same bound for a line drawn wrapped (a refusal's wording, see `ToolResultPreview`): it still ends
+ *  somewhere, but a sentence of the CLI's own is never what it cuts. */
+const WRAPPED_LINE_CHARS = 4000;
+
 /** The first `limit` lines of `text` and how many lines it has in all, without splitting the whole
  *  string: a build log can be megabytes and this runs for every finished call that is folded.
  *
  *  A line is what a person counts: a final newline ends the last line rather than starting another, a
  *  Windows line ending is one break, and a result with nothing but whitespace has no lines at all. */
-export function previewLines(text: string, limit: number): { shown: string[]; total: number } {
+export function previewLines(text: string, limit: number, lineChars = PREVIEW_LINE_CHARS): { shown: string[]; total: number } {
   if (!/\S/.test(text)) return { shown: [], total: 0 };
   const shown: string[] = [];
   let newlines = 0;
   let start = 0;
   for (let at = text.indexOf("\n"); at !== -1; at = text.indexOf("\n", start)) {
-    if (shown.length < limit) shown.push(cutLine(text.slice(start, at)));
+    if (shown.length < limit) shown.push(cutLine(text.slice(start, at), lineChars));
     newlines++;
     start = at + 1;
   }
   if (start < text.length) {
-    if (shown.length < limit) shown.push(cutLine(text.slice(start)));
+    if (shown.length < limit) shown.push(cutLine(text.slice(start), lineChars));
     newlines++;
   }
   return { shown, total: newlines };
 }
 
-function cutLine(raw: string): string {
+function cutLine(raw: string, chars: number): string {
   const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-  return line.length > PREVIEW_LINE_CHARS ? `${line.slice(0, headEnd(line, PREVIEW_LINE_CHARS - 1))}…` : line;
+  return line.length > chars ? `${line.slice(0, headEnd(line, chars - 1))}…` : line;
 }
 
 /** What a folded, finished call shows under its invocation: the first `PREVIEW_LINES` of its result, then
@@ -409,15 +413,25 @@ function cutLine(raw: string): string {
  *  a signal colour is never a text colour here). Nothing when the result has no lines at all. It never
  *  scrolls and never holds focus: to `j`/`k` it is part of the row.
  *
+ *  `wrapped` is for a call the CLI itself refused: the one line is the CLI's own reason for the refusal,
+ *  which is the whole point of the row, so it wraps (muted, as the note above it is) instead of being
+ *  cut at the track's edge.
+ *
  *  `memo` for the reason `ToolResult` is: every finished call would otherwise be split again on each
  *  33ms pump while a turn streams. */
-const ToolResultPreview = memo(function ToolResultPreview({ result }: { result: NonNullable<ToolCallRecord["result"]> }) {
-  const { shown, total } = previewLines(formatResultContent(result.content), result.isError ? 1 : PREVIEW_LINES);
+const ToolResultPreview = memo(function ToolResultPreview({
+  result,
+  wrapped = false,
+}: {
+  result: NonNullable<ToolCallRecord["result"]>;
+  wrapped?: boolean;
+}) {
+  const { shown, total } = previewLines(formatResultContent(result.content), result.isError ? 1 : PREVIEW_LINES, wrapped ? WRAPPED_LINE_CHARS : PREVIEW_LINE_CHARS);
   if (total === 0) return null;
   const hidden = total - shown.length;
   return (
     <div
-      className={`tool-result-preview${result.isError ? " tool-result-error" : ""}`}
+      className={`tool-result-preview${result.isError ? " tool-result-error" : ""}${wrapped ? " tool-result-preview-wrapped" : ""}`}
       data-state={result.isError ? "error" : "done"}
     >
       {shown.map((line, i) => (
@@ -533,7 +547,7 @@ export function renderToolCall(
       {deniedNote}
       {shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
       {!shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
-        <ToolResultPreview result={call.result} />
+        <ToolResultPreview result={call.result} wrapped={call.denied !== undefined && call.result.isError} />
       )}
     </div>
   );

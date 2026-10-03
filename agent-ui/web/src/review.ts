@@ -197,7 +197,7 @@ export type ReviewState = {
   expanded: string[];
   /** Whether the "changed outside this tab's edits" group is open. */
   groupOpen: boolean;
-  diffs: Record<string, DiffEntry>;
+  diffs: ReadonlyMap<string, DiffEntry>;
   /** A `g` is waiting for its second key. */
   pendingG: boolean;
   /** The tab's draft, from the `review` and `review_draft` envelopes only: nothing is kept across a reload. */
@@ -226,7 +226,7 @@ export function openReview(tab: TabId, requestId: string, recovery: ReviewRecove
     cursor: null,
     expanded: [],
     groupOpen: false,
-    diffs: {},
+    diffs: new Map(),
     pendingG: false,
     draft: EMPTY_DRAFT,
     recovery,
@@ -287,9 +287,23 @@ export function commentLines(hunk: ReviewHunk): [number, number] | null {
   return null;
 }
 
+/** `diffs` with one file's entry replaced. A `Map`, because a path is the user's own text: a file named
+ *  `constructor` or `__proto__` must not find a member of `Object.prototype` where its entry should be. */
+function withDiff(diffs: ReadonlyMap<string, DiffEntry>, path: string, entry: DiffEntry): ReadonlyMap<string, DiffEntry> {
+  const next = new Map(diffs);
+  next.set(path, entry);
+  return next;
+}
+
+/** The path whose patch request `requestId` is still waiting on, if any. */
+function pathOfLoading(state: ReviewState, requestId: string): string | undefined {
+  for (const [path, entry] of state.diffs) if (entry.status === "loading" && entry.requestId === requestId) return path;
+  return undefined;
+}
+
 /** The loaded hunks of a file, or `null` while there are none to draw. */
 function loadedHunks(state: ReviewState, path: string): ReviewHunk[] | null {
-  const entry = state.diffs[path];
+  const entry = state.diffs.get(path);
   return entry?.status === "ready" ? entry.diff.hunks : null;
 }
 
@@ -395,7 +409,7 @@ export function receiveReview(state: ReviewState, envelope: ReviewEnvelope): Rev
     cursor: null,
     expanded: [],
     groupOpen: false,
-    diffs: {},
+    diffs: new Map(),
     pendingG: false,
     draft: envelope.draft ?? EMPTY_DRAFT,
     prompt: null,
@@ -458,12 +472,9 @@ export function typeComment(state: ReviewState, text: string): ReviewState {
 /** A patch arrived. Matched to its file by the request id it answers, so a reply for a turn the overlay has
  *  since left finds no entry and is dropped. */
 export function receiveDiff(state: ReviewState, diff: ReviewDiffEnvelope): ReviewState {
-  const path = Object.keys(state.diffs).find((p) => {
-    const entry = state.diffs[p];
-    return entry.status === "loading" && entry.requestId === diff.requestId;
-  });
+  const path = pathOfLoading(state, diff.requestId);
   if (path === undefined) return state;
-  return { ...state, diffs: { ...state.diffs, [path]: { status: "ready", diff } } };
+  return { ...state, diffs: withDiff(state.diffs, path, { status: "ready", diff }) };
 }
 
 /** The shell refused a request this overlay made. The newest overview request's refusal is the overlay's
@@ -479,12 +490,9 @@ export function failRequest(state: ReviewState, requestId: string, error: string
       turn: shown !== null && shown.scope === "turn" ? shown.current : state.turn,
     };
   }
-  const path = Object.keys(state.diffs).find((p) => {
-    const entry = state.diffs[p];
-    return entry.status === "loading" && entry.requestId === requestId;
-  });
+  const path = pathOfLoading(state, requestId);
   if (path === undefined) return state;
-  return { ...state, diffs: { ...state.diffs, [path]: { status: "failed", error } } };
+  return { ...state, diffs: withDiff(state.diffs, path, { status: "failed", error }) };
 }
 
 /** What carrying a key out needs from outside the reducer. */
@@ -607,7 +615,7 @@ function revert(state: ReviewState, stop: ReviewStop | null, nextId: () => strin
     return { state: { ...state, prompt }, effect: null };
   }
   if (stop.kind !== "hunk") return { state, effect: null };
-  const entry = state.diffs[stop.path];
+  const entry = state.diffs.get(stop.path);
   const binary = (entry?.status === "ready" && entry.diff.binary === true) || envelope.files.find((f) => f.path === stop.path)?.binary === true;
   if (binary) return { state: { ...state, status: BINARY_HUNK_NOTE }, effect: null };
   const hunk = loadedHunks(state, stop.path)?.find((h) => h.id === stop.id);
@@ -678,11 +686,11 @@ function toggle(state: ReviewState, stops: ReviewStop[], at: number, nextId: () 
   const file = envelope.files.find((f) => f.path === path);
   if (file === undefined || !hasPatch(file)) return { state, effect: null };
   const open = { ...state, expanded: [...state.expanded, path] };
-  const entry = state.diffs[path];
+  const entry = state.diffs.get(path);
   if (entry !== undefined && entry.status !== "failed") return { state: open, effect: null };
   const requestId = nextId();
   return {
-    state: { ...open, diffs: { ...state.diffs, [path]: { status: "loading", requestId } } },
+    state: { ...open, diffs: withDiff(state.diffs, path, { status: "loading", requestId }) },
     effect: { kind: "request-diff", requestId, turn: envelope.current, scope: envelope.scope, path },
   };
 }

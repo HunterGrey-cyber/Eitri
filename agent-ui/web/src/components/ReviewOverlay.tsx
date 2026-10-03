@@ -98,7 +98,7 @@ function Hunk({ hunk, path, state, cursor }: { hunk: ReviewHunk; path: string; s
  *  file's own, so the cursor can walk them. */
 function FileEntry({ file, state, cursor }: { file: ReviewFile; state: ReviewState; cursor: string | null }) {
   const open = state.expanded.includes(file.path);
-  const entry = state.diffs[file.path];
+  const entry = state.diffs.get(file.path);
   const flags = fileFlags(file);
   const mark = revertMark(revertOf(state, file.path, null));
   return (

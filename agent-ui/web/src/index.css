@@ -1160,6 +1160,15 @@ textarea,
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* A refused call's reason is the CLI's own words: it wraps, muted like the "blocked by auto" note above it,
+   and the row is as tall as the text needs (the list measures its rows, as it does for any wrapped line). */
+.tool-result-preview-wrapped .tool-result-preview-line {
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  color: var(--nv-muted);
+}
 .tool-result-preview-more {
   color: var(--nv-muted);
   font-size: var(--fs-xs);

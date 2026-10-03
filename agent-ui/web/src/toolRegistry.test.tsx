@@ -87,6 +87,21 @@ describe("renderToolCall", () => {
     expect(plain.container.textContent).not.toContain("blocked by auto");
   });
 
+  /** The refusal's wording under the note is the CLI's reason, so it is drawn wrapped and whole; any other
+   *  failure keeps the one cut line. */
+  it("draws a refused call's failure wrapped and uncut, and another failure as before", () => {
+    const long = `Permission for this action was denied by the Claude Code auto mode classifier. Reason: ${"x".repeat(600)}`;
+    const refused = render(<>{renderToolCall(call({ result: { content: long, isError: true }, denied: { reasonType: "classifier", reason: "[Git Destructive]" } }), false)}</>);
+    const wrapped = refused.container.querySelector(".tool-result-preview")!;
+    expect(wrapped.classList.contains("tool-result-preview-wrapped")).toBe(true);
+    expect(wrapped.querySelector(".tool-result-preview-line")!.textContent).toBe(long);
+    cleanup();
+    const failed = render(<>{renderToolCall(call({ result: { content: long, isError: true } }), false)}</>);
+    const plain = failed.container.querySelector(".tool-result-preview")!;
+    expect(plain.classList.contains("tool-result-preview-wrapped")).toBe(false);
+    expect(plain.querySelector(".tool-result-preview-line")!.textContent!.endsWith("…")).toBe(true);
+  });
+
   /** O3 review item 7: a call whose CLI prompt Eitri answered without a card says so, muted, the
    *  way a call a saved rule answered does; a call without one says nothing of the kind. */
   it("says when the CLI's own prompt for a call was answered without a card", () => {

@@ -504,6 +504,11 @@ struct AgentPanelState {
     /// Status-band hints not yet shown: the page was not ready (loading, or reloading) when they
     /// arrived. At most one per tab, the newest.
     review_hints: Vec<eitri_core::turn_review::ReviewHint>,
+    /// The hints the page has been sent and has not since been told to drop, at most one per tab:
+    /// the page is only a view, so a document that replaces it (`prefix r`, a crashed WebView) is
+    /// owed these again. Dropped when the tab's next turn starts, when that tab's review is answered
+    /// with a review, and when a newer hint for the tab arrives.
+    shown_hints: Vec<eitri_core::turn_review::ReviewHint>,
     /// Whether a finished turn's hint reaches the status band (`review.hint`). Off until
     /// `set_review` says otherwise: the review is still one key away.
     review_hint: bool,
@@ -1821,6 +1826,7 @@ fn panel_state(
         pending_edits: Vec::new(),
         review_jobs: Vec::new(),
         review_hints: Vec::new(),
+        shown_hints: Vec::new(),
         review_hint: false,
         review_roots,
         editor_request_hook: None,
@@ -2004,6 +2010,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         let hints = {
             let mut state_ref = state.borrow_mut();
             let state_ref = &mut *state_ref;
+            forget_hints_of_running_or_closed_tabs(state_ref);
             let review_hints = hints_to_keep(state_ref.review_hint, review_hints);
             keep_newest_hint_per_tab(&mut state_ref.review_hints, review_hints);
             if state_ref.document_ready {
@@ -2012,6 +2019,9 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 Vec::new()
             }
         };
+        if !hints.is_empty() {
+            keep_shown_hints(&mut state.borrow_mut().shown_hints, &hints);
+        }
         for hint in &hints {
             evaluate_js_dispatch(&webview, &eitri_core::agent_bridge::serialize_review_hint_for_js(hint));
         }
@@ -2082,6 +2092,10 @@ struct PendingReview {
     request_id: String,
     /// The finished envelope, or why there is none.
     rx: mpsc::Receiver<Result<String, String>>,
+    /// The tab and turn whose status-band hint the page drops when this review's envelope arrives:
+    /// Rust forgets the remembered hint only then, since a refused or failed review leaves the hint
+    /// on the page.
+    clears_hint: Option<(u64, eitri_core::agent_bridge::ReviewTurnWire)>,
 }
 
 /// Runs `work` on a worker thread; the tick sends what it returns (see [`poll_review_jobs`]).
@@ -2089,6 +2103,7 @@ struct PendingReview {
 fn start_review_job(
     state: &Rc<RefCell<AgentPanelState>>,
     request_id: &str,
+    clears_hint: Option<(u64, eitri_core::agent_bridge::ReviewTurnWire)>,
     work: impl FnOnce() -> Result<String, String> + Send + 'static,
 ) -> Result<(), String> {
     if state.borrow().review_jobs.len() >= MAX_REVIEW_JOBS {
@@ -2102,18 +2117,23 @@ fn start_review_job(
     state.borrow_mut().review_jobs.push(PendingReview {
         request_id: request_id.to_string(),
         rx,
+        clears_hint,
     });
     Ok(())
 }
 
 /// What the finished jobs of `jobs` owe the panel, in order: an envelope for a review that was
 /// worked out, a failing `command_result` for one that could not be (or whose worker died). The
-/// finished ones leave `jobs`.
-fn finished_reviews(jobs: &mut Vec<PendingReview>) -> Vec<String> {
+/// finished ones leave `jobs`. The second list is the hints those envelopes clear on the page.
+fn finished_reviews(
+    jobs: &mut Vec<PendingReview>,
+) -> (Vec<String>, Vec<(u64, eitri_core::agent_bridge::ReviewTurnWire)>) {
     let mut payloads = Vec::new();
+    let mut cleared = Vec::new();
     jobs.retain(|job| match job.rx.try_recv() {
         Ok(Ok(envelope)) => {
             payloads.push(envelope);
+            cleared.extend(job.clears_hint);
             false
         }
         Ok(Err(why)) => {
@@ -2129,7 +2149,7 @@ fn finished_reviews(jobs: &mut Vec<PendingReview>) -> Vec<String> {
         }
         Err(mpsc::TryRecvError::Empty) => true,
     });
-    payloads
+    (payloads, cleared)
 }
 
 /// The hints a finished turn may show: all of them with `review.hint` on, none otherwise, so a
@@ -2157,6 +2177,54 @@ fn keep_newest_hint_per_tab(
     }
 }
 
+/// Records what the page was just sent, so a later document can be told again: a hint with files
+/// replaces its tab's, one with none clears it.
+fn keep_shown_hints(
+    shown: &mut Vec<eitri_core::turn_review::ReviewHint>,
+    sent: &[eitri_core::turn_review::ReviewHint],
+) {
+    for hint in sent {
+        shown.retain(|old| old.tab != hint.tab);
+        if hint.files > 0 {
+            shown.push(hint.clone());
+        }
+    }
+}
+
+/// The page clears `tab`'s hint on receiving that tab's review of a turn at least as new as the
+/// hint's, so a reload must not bring it back.
+fn forget_hint_for_review(
+    shown: &mut Vec<eitri_core::turn_review::ReviewHint>,
+    tab: u64,
+    asked: eitri_core::agent_bridge::ReviewTurnWire,
+) {
+    use eitri_core::agent_bridge::ReviewTurnWire;
+    shown.retain(|hint| {
+        hint.tab != tab
+            || match asked {
+                ReviewTurnWire::Latest => false,
+                ReviewTurnWire::N(turn) => turn < hint.turn,
+            }
+    });
+}
+
+/// Forgets the shown hints of a tab that closed or is running a turn: the page drops a tab's hint
+/// when a turn starts, and a turn that ends without a hint of its own would otherwise leave this
+/// record holding one the page no longer has.
+fn forget_hints_of_running_or_closed_tabs(state: &mut AgentPanelState) {
+    let tabs = &state.tabs;
+    state.shown_hints.retain(|hint| {
+        tabs.get(eitri_core::tabs::TabId(hint.tab))
+            .is_some_and(|tab| !tab.turn_running())
+    });
+}
+
+/// What a new document is owed of the hints the last one showed.
+fn hints_for_new_document(state: &mut AgentPanelState) -> Vec<eitri_core::turn_review::ReviewHint> {
+    forget_hints_of_running_or_closed_tabs(state);
+    state.shown_hints.clone()
+}
+
 /// The tick's half of a review: whatever a worker finished goes to the panel.
 fn poll_review_jobs(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     let payloads = {
@@ -2164,7 +2232,11 @@ fn poll_review_jobs(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
         if state_ref.review_jobs.is_empty() {
             return;
         }
-        finished_reviews(&mut state_ref.review_jobs)
+        let (payloads, cleared) = finished_reviews(&mut state_ref.review_jobs);
+        for (tab, turn) in cleared {
+            forget_hint_for_review(&mut state_ref.shown_hints, tab, turn);
+        }
+        payloads
     };
     dispatch_all(webview, payloads);
 }
@@ -4102,6 +4174,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     state_ref.keymap_help.as_deref(),
                     offer.as_ref(),
                 );
+                // The status-band hints the replaced document was showing.
+                for hint in hints_for_new_document(state_ref) {
+                    payloads.push(eitri_core::agent_bridge::serialize_review_hint_for_js(&hint));
+                }
                 // Last, so nothing the document draws from the payloads above can reset it.
                 payloads.push(eitri_core::agent_bridge::serialize_pane_focus_for_js(
                     state_ref.pane_focused,
@@ -4666,7 +4742,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let started = job.and_then(|job| {
                 let draft = draft?;
                 let id = request_id.clone();
-                start_review_job(state, &request_id, move || {
+                start_review_job(state, &request_id, Some((tab.0, turn)), move || {
                     job.run()
                         .map(|overview| eitri_core::agent_bridge::serialize_review_for_js(&id, tab, &overview, &draft))
                         .map_err(|why| why.to_string())
@@ -4691,7 +4767,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let job = state.borrow().tabs.review_diff_job(tab, turn, scope.into(), &path);
             let started = job.and_then(|job| {
                 let id = request_id.clone();
-                start_review_job(state, &request_id, move || {
+                start_review_job(state, &request_id, None, move || {
                     job.run()
                         .map(|diff| eitri_core::agent_bridge::serialize_review_diff_for_js(&id, tab, &diff))
                         .map_err(|why| why.to_string())
@@ -5668,6 +5744,7 @@ mod tests {
             pending_edits: Vec::new(),
             review_jobs: Vec::new(),
             review_hints: Vec::new(),
+            shown_hints: Vec::new(),
             review_hint: false,
             review_roots: ReviewRoots {
                 state_home: None,
@@ -6484,6 +6561,63 @@ mod tests {
         assert_eq!(waiting.len(), 2);
     }
 
+    /// What the page was sent is kept for the document that replaces it: a hint with files stands for its
+    /// tab until a newer one, and one with none clears it.
+    #[test]
+    fn a_shown_review_hint_is_kept_until_a_newer_one_for_its_tab_replaces_or_clears_it() {
+        use eitri_core::turn_review::ReviewHint;
+        let hint = |tab, turn, files| ReviewHint { tab, turn, files };
+        let mut shown = Vec::new();
+        keep_shown_hints(&mut shown, &[hint(1, 1, 2), hint(2, 1, 5)]);
+        keep_shown_hints(&mut shown, &[hint(1, 2, 3)]);
+        assert_eq!(shown, vec![hint(2, 1, 5), hint(1, 2, 3)]);
+        keep_shown_hints(&mut shown, &[hint(2, 2, 0)]);
+        assert_eq!(shown, vec![hint(1, 2, 3)]);
+        keep_shown_hints(&mut shown, &[]);
+        assert_eq!(shown, vec![hint(1, 2, 3)]);
+    }
+
+    /// Opening a tab's review of the turn the hint is about, or a newer one, is what clears the hint on the
+    /// page; a review of an older turn is not.
+    #[test]
+    fn asking_for_a_tabs_review_forgets_its_shown_hint_only_when_the_page_would_clear_it() {
+        use eitri_core::agent_bridge::ReviewTurnWire;
+        use eitri_core::turn_review::ReviewHint;
+        let hint = |tab, turn, files| ReviewHint { tab, turn, files };
+        let fresh = || vec![hint(1, 4, 2), hint(2, 4, 2)];
+        let mut shown = fresh();
+        forget_hint_for_review(&mut shown, 1, ReviewTurnWire::Latest);
+        assert_eq!(shown, vec![hint(2, 4, 2)]);
+        let mut shown = fresh();
+        forget_hint_for_review(&mut shown, 1, ReviewTurnWire::N(3));
+        assert_eq!(shown, fresh());
+        forget_hint_for_review(&mut shown, 1, ReviewTurnWire::N(4));
+        assert_eq!(shown, vec![hint(2, 4, 2)]);
+    }
+
+    /// A reloaded document is told again the hints the last one showed, for the tabs that still exist; a
+    /// closed tab's is forgotten, and asking twice (two reloads) gives the same answer.
+    #[test]
+    fn a_new_document_is_owed_the_hints_the_last_one_showed() {
+        use eitri_core::turn_review::ReviewHint;
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let tab = state.borrow().tabs.active().0;
+        let live = ReviewHint { tab, turn: 2, files: 3 };
+        keep_shown_hints(
+            &mut state.borrow_mut().shown_hints,
+            &[
+                live.clone(),
+                ReviewHint {
+                    tab: tab + 100,
+                    turn: 1,
+                    files: 1,
+                },
+            ],
+        );
+        assert_eq!(hints_for_new_document(&mut state.borrow_mut()), vec![live.clone()]);
+        assert_eq!(hints_for_new_document(&mut state.borrow_mut()), vec![live]);
+    }
+
     /// A review's answer is the worker's envelope as it is; a job that failed or whose worker died
     /// is a failing `command_result` for its own request; one still running is left in the list.
     #[test]
@@ -6501,21 +6635,27 @@ mod tests {
             PendingReview {
                 request_id: "a".into(),
                 rx: done_rx,
+                clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
             },
             PendingReview {
                 request_id: "b".into(),
                 rx: failed_rx,
+                clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
             },
             PendingReview {
                 request_id: "c".into(),
                 rx: died_rx,
+                clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
             },
             PendingReview {
                 request_id: "d".into(),
                 rx: running_rx,
+                clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
             },
         ];
-        let payloads = finished_reviews(&mut jobs);
+        let (payloads, cleared) = finished_reviews(&mut jobs);
+        // Only the review that was worked out clears a hint; a failed or dead one leaves it on the page.
+        assert_eq!(cleared, vec![(7, eitri_core::agent_bridge::ReviewTurnWire::Latest)]);
         assert_eq!(payloads.len(), 3);
         assert_eq!(payloads[0], r#"{"kind":"review","requestId":"a"}"#);
         let failed: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
@@ -6530,7 +6670,8 @@ mod tests {
         );
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].request_id, "d");
-        assert!(finished_reviews(&mut jobs).is_empty(), "nothing is sent twice");
+        let (again, cleared_again) = finished_reviews(&mut jobs);
+        assert!(again.is_empty() && cleared_again.is_empty(), "nothing is sent twice");
     }
 
     /// An editor that went away takes its pending draft edits with it: a body saved in nvim becomes

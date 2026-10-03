@@ -221,8 +221,6 @@ describe("closing", () => {
 
   it.each([
     ["hint_collect", { kind: "hint_collect", sessionId: 1 }],
-    ["pane_focus", { kind: "pane_focus", focused: false }],
-    ["pane_focus (regained)", { kind: "pane_focus", focused: true }],
     ["enter_input", { kind: "enter_input" }],
     ["arrive", { kind: "arrive" }],
     ["open_keymap", { kind: "open_keymap" }],
@@ -231,6 +229,18 @@ describe("closing", () => {
     opened(rendered);
     expect(overlay(rendered.container)).not.toBeNull();
     dispatch(envelope);
+    expect(overlay(rendered.container)).toBeNull();
+  });
+
+  it("the pane losing the keys and getting them back (a window focus round trip) leaves it open", () => {
+    const rendered = started();
+    opened(rendered);
+    dispatch({ kind: "pane_focus", focused: false });
+    expect(overlay(rendered.container)).not.toBeNull();
+    dispatch({ kind: "pane_focus", focused: true });
+    expect(overlay(rendered.container)).not.toBeNull();
+    expect(overlay(rendered.container)!.textContent).toContain("core/src/x.rs");
+    press(rendered.container, "q");
     expect(overlay(rendered.container)).toBeNull();
   });
 
@@ -541,6 +551,20 @@ describe("i", () => {
     dispatch({ kind: "review_draft", requestId: request.request_id, tab: 1, draft: DRAFT });
     expect(overlay(rendered.container)!.textContent).toContain("draft: 1 comment, 1 revert · s sends them to the agent");
     expect(overlay(rendered.container)!.querySelector('[data-nav-stop="comment"]')!.textContent).toContain("why?");
+  });
+
+  it("gets the keys back when the pane regains them with DOM focus lost (a window focus round trip)", () => {
+    const rendered = started();
+    onHunk(rendered);
+    press(rendered.container, "i");
+    const box = commentBox(rendered.container)!;
+    expect(document.activeElement).toBe(box);
+    dispatch({ kind: "pane_focus", focused: false });
+    box.blur();
+    expect(document.activeElement).not.toBe(box);
+    dispatch({ kind: "pane_focus", focused: true });
+    expect(commentBox(rendered.container)).toBe(box);
+    expect(document.activeElement).toBe(box);
   });
 
   it("Escape closes the input and leaves the overlay open and the comment unsent", () => {

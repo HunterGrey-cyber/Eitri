@@ -1747,6 +1747,12 @@ export default function App() {
       containerRef.current?.querySelector<HTMLInputElement>(".search-bar input")?.focus();
       return;
     }
+    // An open review comment input (a `SearchBar` too) keeps the keys through a window focus round trip, which
+    // the overlay now survives: the conversation root would leave what is typed to the overlay's key table.
+    if (review?.prompt?.kind === "comment") {
+      containerRef.current?.querySelector<HTMLInputElement>(".review-prompt .search-bar input")?.focus();
+      return;
+    }
 
     if (containerRef.current !== null) {
       // A `pane_focus true` that follows a click on Approve, or a HINT landing on a control, must
@@ -2621,7 +2627,10 @@ export default function App() {
         // leaving it up is how the review reproduced a dead keyboard: come back with `Ctrl+l`,
         // land in INPUT, and every keystroke is swallowed by the overlay's own branch (review).
         setKeymapOpen(false);
-        setReview(null); // the review overlay is over the same area, and ends where `?` does
+        // The review overlay is not closed here: this envelope also reports the window being deactivated
+        // and activated again (another window taking focus, a resize that comes with one), and an overlay
+        // the reader was in the middle of must survive that. A way back by key is an `arrive`, which closes
+        // it, and INPUT or any other overlay closes it through `reviewCovered`.
         setDetail(null);
         setHandoffOpen(false);
         // R4: the `/` prompt is this panel's own, the same reason the `?` overlay closes here -- and

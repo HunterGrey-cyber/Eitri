@@ -62,11 +62,28 @@ const HUNKS: ReviewDiffEnvelope["hunks"] = [
 /** `a.rs` opened and its patch arrived. */
 function withPatch(hunks: ReviewDiffEnvelope["hunks"] = HUNKS): ReviewState {
   let state = press(loaded(), { kind: "toggle" });
-  const entry = state.diffs["a.rs"];
+  const entry = state.diffs.get("a.rs");
   if (entry?.status !== "loading") throw new Error("no request");
   state = receiveDiff(state, { requestId: entry.requestId, tab: 1, turn: 7, path: "a.rs", added: 41, removed: 6, hunks });
   return state;
 }
+
+describe("ReviewOverlay with files named like Object.prototype members", () => {
+  it("opens each one, shows its patch once it arrives, and breaks nothing", () => {
+    for (const name of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      let state = loaded({ files: [file(name), file("b.md")] });
+      state = press(state, { kind: "toggle" });
+      expect(draw(state).container.querySelector(".review-note")!.textContent, name).toBe("loading…");
+      cleanup();
+      const entry = state.diffs.get(name);
+      if (entry?.status !== "loading") throw new Error(`${name}: no request`);
+      state = receiveDiff(state, { requestId: entry.requestId, tab: 1, turn: 7, path: name, added: 41, removed: 6, hunks: HUNKS });
+      const { container } = draw(state);
+      expect(container.querySelectorAll(".review-hunk, [data-nav-stop='hunk']").length, name).toBeGreaterThan(0);
+      cleanup();
+    }
+  });
+});
 
 describe("ReviewOverlay", () => {
   it("shows the header: the turn, its times, and what happened to the disk", () => {
@@ -190,7 +207,7 @@ describe("ReviewOverlay", () => {
     const loading = press(loaded(), { kind: "toggle" });
     expect(draw(loading).container.querySelector(".review-patch")!.textContent).toBe("loading…");
     cleanup();
-    const entry = loading.diffs["a.rs"];
+    const entry = loading.diffs.get("a.rs");
     if (entry?.status !== "loading") throw new Error("no request");
     const failed = failRequest(loading, entry.requestId, "git unavailable");
     expect(draw(failed).container.querySelector(".review-patch")!.textContent).toContain("could not load this file's changes: git unavailable");
@@ -278,7 +295,7 @@ const draft = (over: Partial<ReviewDraft> = {}): ReviewDraft => ({ comments: [],
 function withDraft(d: ReviewDraft): ReviewState {
   let state = receiveReview(openReview(1, "req-1"), envelope({ draft: d }));
   state = press(state, { kind: "toggle" });
-  const entry = state.diffs["a.rs"];
+  const entry = state.diffs.get("a.rs");
   if (entry?.status !== "loading") throw new Error("no request");
   return receiveDiff(state, { requestId: entry.requestId, tab: 1, turn: 7, path: "a.rs", added: 41, removed: 6, hunks: HUNKS });
 }
