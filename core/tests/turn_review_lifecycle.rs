@@ -1089,3 +1089,231 @@ fn a_path_that_reads_like_another_files_name_gets_no_patch() {
     assert_eq!(alone.path, Path::new(lossy));
     assert!(alone.hunks.is_some());
 }
+
+// ---- files too large to snapshot -------------------------------------------------------------
+
+/// A review whose per-file limit is 64 bytes, so a 200-byte file is "too large".
+fn small_limit_review(scratch: &Scratch, jobs: &Jobs) -> TurnReview {
+    let mut options = jobs.options();
+    options.limits.max_file_bytes = 64;
+    TurnReview::with_options(Some(scratch.review_dir()), &scratch.project(), options)
+}
+
+const LARGE: usize = 200;
+
+/// Runs one whole turn: `act` runs between its two snapshots.
+fn run_turn(review: &mut TurnReview, id: &str, act: impl FnOnce()) {
+    review.observe(1, "s1", &started(id), now());
+    review.observe(1, "s1", &tool(id), now());
+    poll_until(review, "s1", "the base", |t| has_base(t, id));
+    act();
+    review.observe(1, "s1", &completed(id), now());
+    poll_until(review, "s1", "the end", |t| is_ok(t, id));
+}
+
+/// The rows of a review of `turn` as `(path, too_large)`.
+fn rows(review: &TurnReview, turn: TurnRef, scope: Scope) -> Vec<(String, bool)> {
+    let job = review.overview_job("s1", turn, scope, NamedPaths::default());
+    let overview = std::thread::spawn(move || job.run()).join().unwrap().unwrap();
+    overview
+        .files
+        .iter()
+        .map(|f| (f.path.display().to_string(), f.too_large))
+        .collect()
+}
+
+/// Lets the file system's clock move on, so a rewrite within a turn cannot carry the time of the
+/// base snapshot's look at the file.
+fn tick() {
+    std::thread::sleep(Duration::from_millis(30));
+}
+
+fn row(path: &str) -> Vec<(String, bool)> {
+    vec![(path.to_string(), true)]
+}
+
+#[test]
+fn a_too_large_file_that_did_not_change_is_not_listed_as_changed() {
+    let scratch = Scratch::new("large-unchanged");
+    let big = scratch.project().join("huge.txt");
+    let jobs = Jobs::default();
+    let mut review = small_limit_review(&scratch, &jobs);
+
+    // Turn 1 creates it: left out of the end snapshot only, a change.
+    run_turn(&mut review, "t1", || std::fs::write(&big, vec![b'x'; LARGE]).unwrap());
+    assert_eq!(rows(&review, TurnRef::N(1), Scope::Turn), row("huge.txt"));
+
+    // Turns 2 and 3 do not touch it: left out of both snapshots, and the same file.
+    run_turn(&mut review, "t2", || {});
+    assert_eq!(rows(&review, TurnRef::N(2), Scope::Turn), vec![]);
+    run_turn(&mut review, "t3", || {
+        std::fs::write(scratch.project().join("a.txt"), "a\n").unwrap()
+    });
+    assert_eq!(
+        rows(&review, TurnRef::N(3), Scope::Turn),
+        vec![("a.txt".to_string(), false)]
+    );
+    // From the first base to the last end it did change: it is not in the base.
+    assert_eq!(
+        rows(&review, TurnRef::N(3), Scope::Session),
+        vec![("a.txt".to_string(), false), ("huge.txt".to_string(), true)]
+    );
+
+    // A window that never saw those turns reads the same from the shadow's refs.
+    let later = small_limit_review(&scratch, &jobs);
+    assert_eq!(rows(&later, TurnRef::N(2), Scope::Turn), vec![]);
+}
+
+#[test]
+fn a_too_large_file_that_changed_during_the_turn_is_listed() {
+    let scratch = Scratch::new("large-changed");
+    let big = scratch.project().join("huge.txt");
+    std::fs::write(&big, vec![b'x'; LARGE]).unwrap();
+    let jobs = Jobs::default();
+    let mut review = small_limit_review(&scratch, &jobs);
+
+    // Different size.
+    run_turn(&mut review, "t1", || {
+        tick();
+        std::fs::write(&big, vec![b'y'; LARGE + 50]).unwrap();
+    });
+    assert_eq!(rows(&review, TurnRef::N(1), Scope::Turn), row("huge.txt"));
+    // The same size, other bytes.
+    run_turn(&mut review, "t2", || {
+        tick();
+        std::fs::write(&big, vec![b'z'; LARGE + 50]).unwrap();
+    });
+    assert_eq!(rows(&review, TurnRef::N(2), Scope::Turn), row("huge.txt"));
+    // Replaced by a file of the same size and bytes: another inode.
+    run_turn(&mut review, "t3", || {
+        tick();
+        let copy = scratch.project().join("copy.tmp");
+        std::fs::write(&copy, vec![b'z'; LARGE + 50]).unwrap();
+        std::fs::rename(&copy, &big).unwrap();
+    });
+    assert_eq!(rows(&review, TurnRef::N(3), Scope::Turn), row("huge.txt"));
+    // Deleted.
+    run_turn(&mut review, "t4", || std::fs::remove_file(&big).unwrap());
+    assert_eq!(rows(&review, TurnRef::N(4), Scope::Turn), row("huge.txt"));
+    // A turn after that, with the file gone from both snapshots, says nothing about it.
+    run_turn(&mut review, "t5", || {});
+    assert_eq!(rows(&review, TurnRef::N(5), Scope::Turn), vec![]);
+}
+
+#[test]
+fn a_file_that_crosses_the_size_limit_either_way_is_listed() {
+    let scratch = Scratch::new("large-crossing");
+    let file = scratch.project().join("grows.txt");
+    std::fs::write(&file, "small\n").unwrap();
+    let jobs = Jobs::default();
+    let mut review = small_limit_review(&scratch, &jobs);
+
+    run_turn(&mut review, "t1", || std::fs::write(&file, vec![b'x'; LARGE]).unwrap());
+    assert_eq!(rows(&review, TurnRef::N(1), Scope::Turn), row("grows.txt"));
+    run_turn(&mut review, "t2", || std::fs::write(&file, "small again\n").unwrap());
+    assert_eq!(rows(&review, TurnRef::N(2), Scope::Turn), row("grows.txt"));
+}
+
+/// A snapshot taken before prints were kept lists the file and no print: the review cannot tell
+/// that it did not change, and says so as it always did.
+#[test]
+fn a_record_from_before_prints_were_kept_still_lists_the_file() {
+    let scratch = Scratch::new("large-old-record");
+    let big = scratch.project().join("huge.txt");
+    std::fs::write(&big, vec![b'x'; LARGE]).unwrap();
+    let jobs = Jobs::default();
+    let mut review = small_limit_review(&scratch, &jobs);
+    run_turn(&mut review, "t1", || {});
+    assert_eq!(
+        rows(&review, TurnRef::N(1), Scope::Turn),
+        vec![],
+        "prints known: unchanged"
+    );
+
+    // Rewrites both snapshots' messages the way an older build wrote them.
+    let git_dir = scratch.review_dir().join("git");
+    let git = |args: &[&str], stdin: Option<&str>| -> String {
+        use std::io::Write;
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("--git-dir")
+            .arg(&git_dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "eitri")
+            .env("GIT_AUTHOR_EMAIL", "eitri@localhost")
+            .env("GIT_COMMITTER_NAME", "eitri")
+            .env("GIT_COMMITTER_EMAIL", "eitri@localhost")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.unwrap_or("").as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim_end().to_string()
+    };
+    let refs = git(&["for-each-ref", "--format=%(refname)", "refs/eitri/"], None);
+    let mut rewritten = 0;
+    for name in refs.lines().filter(|n| n.ends_with("/base") || n.ends_with("/end")) {
+        let message = git(&["log", "-1", "--format=%B", name], None);
+        assert!(message.contains("skipped-print: "), "{message}");
+        let old: String = message
+            .lines()
+            .filter(|l| !l.starts_with("skipped-print: ") && !l.is_empty())
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(old.contains("skipped-large: "), "{old}");
+        let tree = git(&["rev-parse", &format!("{name}^{{tree}}")], None);
+        let commit = git(&["commit-tree", &tree, "-F", "-"], Some(&old));
+        git(&["update-ref", name, &commit], None);
+        rewritten += 1;
+    }
+    assert!(rewritten >= 2, "{refs}");
+
+    let later = small_limit_review(&scratch, &jobs);
+    assert_eq!(rows(&later, TurnRef::N(1), Scope::Turn), row("huge.txt"));
+}
+
+/// A turn still running, or one whose end snapshot failed, is compared with the disk: a file left
+/// out of its base is checked against the file as it is now.
+#[test]
+fn a_running_turn_lists_a_too_large_file_only_once_it_differs_from_its_base() {
+    let scratch = Scratch::new("large-vs-disk");
+    let big = scratch.project().join("huge.txt");
+    std::fs::write(&big, vec![b'x'; LARGE]).unwrap();
+    let jobs = Jobs::default();
+    let mut review = small_limit_review(&scratch, &jobs);
+
+    review.observe(1, "s1", &started("t1"), now());
+    poll_until(&mut review, "s1", "the base", |t| has_base(t, "t1"));
+    assert_eq!(rows(&review, TurnRef::Latest, Scope::Turn), vec![]);
+    tick();
+    std::fs::write(&big, vec![b'y'; LARGE]).unwrap();
+    assert_eq!(rows(&review, TurnRef::Latest, Scope::Turn), row("huge.txt"));
+}
+
+/// A file the turn's own calls named that is too large keeps its size warning even when nothing
+/// says it changed: its patch is refused, so the row must not offer one.
+#[test]
+fn a_named_too_large_file_that_did_not_change_keeps_its_size_flag() {
+    let scratch = Scratch::new("large-named");
+    std::fs::write(scratch.project().join("huge.txt"), vec![b'x'; LARGE]).unwrap();
+    let jobs = Jobs::default();
+    let mut review = small_limit_review(&scratch, &jobs);
+    run_turn(&mut review, "t1", || {});
+    let named = NamedPaths {
+        paths: BTreeSet::from([PathBuf::from("huge.txt")]),
+        pending_no_result: 0,
+    };
+    let job = review.overview_job("s1", TurnRef::N(1), Scope::Turn, named);
+    let overview = std::thread::spawn(move || job.run()).join().unwrap().unwrap();
+    let listed: Vec<(String, bool, Origin)> = overview
+        .files
+        .iter()
+        .map(|f| (f.path.display().to_string(), f.too_large, f.origin))
+        .collect();
+    assert_eq!(listed, vec![("huge.txt".to_string(), true, Origin::AgentOnly)]);
+}

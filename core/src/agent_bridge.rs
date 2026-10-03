@@ -2942,6 +2942,7 @@ mod tests {
             overlapped_next: false,
             overlapped_tab: false,
             skipped_large: Vec::new(),
+            left_out: Default::default(),
             earlier_run: false,
         }
     }

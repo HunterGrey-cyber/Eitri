@@ -33,7 +33,8 @@ use super::revert::{
     UndoJob,
 };
 use super::shadow::{
-    review_dir_for, Limits, Shadow, SnapshotKind, SnapshotLabel, SnapshotOutcome, SnapshotRef, TurnMarks,
+    review_dir_for, FilePrint, LeftOut, Limits, Shadow, SnapshotKind, SnapshotLabel, SnapshotOutcome, SnapshotRef,
+    TurnMarks,
 };
 
 /// A file patch longer than this many lines (context included) is refused, with its counts, rather
@@ -138,8 +139,18 @@ pub struct TurnRecord {
     pub overlapped_tab: bool,
     /// Files left out of a snapshot for their size, relative to the project root.
     pub skipped_large: Vec<PathBuf>,
+    /// The same files by the snapshot that left them out, each with its print: what tells a file
+    /// too large for both snapshots that did not change from one that did.
+    pub left_out: LeftOutSides,
     /// Known only from the shadow's refs, not from this run's events.
     pub earlier_run: bool,
+}
+
+/// The files a turn's base snapshot and its end snapshot each left out for their size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeftOutSides {
+    pub base: LeftOut,
+    pub end: LeftOut,
 }
 
 impl TurnRecord {
@@ -398,7 +409,7 @@ enum Done {
         kind: SnapshotKind,
         position: u32,
         snap: Snap,
-        skipped_large: Vec<PathBuf>,
+        left_out: LeftOut,
         at_ms: u64,
         /// For an end whose turn has both snapshots: how many files differ between them.
         files: Option<usize>,
@@ -644,7 +655,7 @@ impl TurnReview {
                     kind,
                     position,
                     snap,
-                    skipped_large,
+                    left_out,
                     at_ms,
                     files,
                 } => {
@@ -654,20 +665,22 @@ impl TurnReview {
                         continue;
                     };
                     let record = &mut rec.record;
-                    for path in skipped_large {
-                        if !record.skipped_large.contains(&path) {
-                            record.skipped_large.push(path);
+                    for path in left_out.keys() {
+                        if !record.skipped_large.contains(path) {
+                            record.skipped_large.push(path.clone());
                         }
                     }
                     match kind {
                         SnapshotKind::Warm => {}
                         SnapshotKind::Base => {
+                            record.left_out.base = left_out;
                             if matches!(snap, Snap::Taken { .. }) {
                                 record.base_taken_ms = Some(at_ms);
                             }
                             record.base = snap;
                         }
                         SnapshotKind::End => {
+                            record.left_out.end = left_out;
                             record.end = snap;
                             let both = record.state() == TurnState::Ok;
                             if let (true, Some(files), Some(offset)) = (both, files, offset) {
@@ -963,6 +976,7 @@ impl TurnReview {
                 overlapped_next: false,
                 overlapped_tab,
                 skipped_large: Vec::new(),
+                left_out: LeftOutSides::default(),
                 earlier_run: false,
             },
             ended: false,
@@ -1215,7 +1229,7 @@ impl TurnReview {
                     kind: job.kind,
                     position: job.position,
                     snap: Snap::Unavailable("the snapshot worker is not running".into()),
-                    skipped_large: Vec::new(),
+                    left_out: LeftOut::new(),
                     at_ms: wall_clock_ms(),
                     files: None,
                 },
@@ -1327,7 +1341,7 @@ impl Worker {
             kind: job.kind,
             position: job.position,
             snap: Snap::Unavailable(reason),
-            skipped_large: Vec::new(),
+            left_out: LeftOut::new(),
             at_ms: wall_clock_ms(),
             files: None,
         };
@@ -1346,14 +1360,14 @@ impl Worker {
             tab: job.tab,
             time_ms: job.time_ms,
         };
-        let (snap, skipped_large) = match shadow.snapshot(&self.session, &label, &self.options.limits) {
+        let (snap, left_out) = match shadow.snapshot(&self.session, &label, &self.options.limits) {
             SnapshotOutcome::Taken(snapshot) => (
                 Snap::Taken {
                     commit: snapshot.commit,
                 },
-                snapshot.skipped_large,
+                snapshot.left_out,
             ),
-            SnapshotOutcome::Unavailable(reason) => (Snap::Unavailable(reason), Vec::new()),
+            SnapshotOutcome::Unavailable(reason) => (Snap::Unavailable(reason), LeftOut::new()),
         };
         let at_ms = wall_clock_ms();
         let mut files = None;
@@ -1377,7 +1391,7 @@ impl Worker {
             kind: job.kind,
             position: job.position,
             snap,
-            skipped_large,
+            left_out,
             at_ms,
             files,
         }
@@ -1516,7 +1530,15 @@ impl OverviewJob {
                 },
             );
         }
-        for path in &plan.too_large {
+        // Left out of both snapshots, or of the base with the disk as the end: reported only when
+        // what can be compared without reading the file says it differs.
+        let mut unchanged = plan.large_unchanged.clone();
+        for (path, print) in &plan.large_vs_disk {
+            if FilePrint::of_path(shadow.work_tree(), path) == Some(*print) {
+                unchanged.insert(path.clone());
+            }
+        }
+        for path in plan.too_large.iter().filter(|p| !unchanged.contains(*p)) {
             let origin = if named.paths.contains(path) {
                 Origin::Agent
             } else {
@@ -1536,13 +1558,15 @@ impl OverviewJob {
             );
         }
         for path in &named.paths {
+            // A named file that is too large stays marked so, whether or not its prints say it
+            // changed: its patch is refused, and the row must not offer one.
             rows.entry(path.clone()).or_insert_with(|| OverviewFile {
                 path: path.clone(),
                 added: 0,
                 removed: 0,
                 origin: Origin::AgentOnly,
                 binary: false,
-                too_large: false,
+                too_large: plan.too_large.contains(path),
                 nested: false,
             });
         }
@@ -1686,7 +1710,52 @@ struct Plan {
     current: u32,
     compare: Compare,
     notes: Vec<String>,
+    /// Files left out of a snapshot being compared for their size: nothing can be shown of them,
+    /// and none can be reverted.
     too_large: BTreeSet<PathBuf>,
+    /// Of those, the ones both snapshots left out and whose prints are equal: no change to report.
+    large_unchanged: BTreeSet<PathBuf>,
+    /// When the end side is the disk (no end snapshot), the print each base-side file had; the job
+    /// reads the disk's own and drops those that match.
+    large_vs_disk: BTreeMap<PathBuf, FilePrint>,
+}
+
+/// What the files left out for size amount to between two compared sides. `end` is `None` when the
+/// end side is the disk, which is never left out of anything.
+///
+/// A file left out of one snapshot only is a change (it is in the other as a file, or gone). A file
+/// left out of both is a change unless both prints are known and equal; a record written before
+/// prints were kept has none, and then the file reads as possibly changed, as it did.
+fn large_files(base: &LeftOut, end: Option<&LeftOut>) -> LargeFiles {
+    let mut found = LargeFiles::default();
+    found.too_large.extend(base.keys().cloned());
+    match end {
+        Some(end) => {
+            found.too_large.extend(end.keys().cloned());
+            for (path, print) in base {
+                if let (Some(a), Some(Some(b))) = (print, end.get(path)) {
+                    if a == b {
+                        found.unchanged.insert(path.clone());
+                    }
+                }
+            }
+        }
+        None => {
+            for (path, print) in base {
+                if let Some(print) = print {
+                    found.vs_disk.insert(path.clone(), *print);
+                }
+            }
+        }
+    }
+    found
+}
+
+#[derive(Default)]
+struct LargeFiles {
+    too_large: BTreeSet<PathBuf>,
+    unchanged: BTreeSet<PathBuf>,
+    vs_disk: BTreeMap<PathBuf, FilePrint>,
 }
 
 /// The review's head: the turns, the one shown and what the review must say about itself, with
@@ -1770,6 +1839,10 @@ fn merged_turns(shadow: &Shadow, session: &str, records: Vec<TurnRecord>) -> Res
                 skipped_large.push(path.clone());
             }
         }
+        let left_out = LeftOutSides {
+            base: base.as_ref().map(|r| r.left_out.clone()).unwrap_or_default(),
+            end: end.as_ref().map(|r| r.left_out.clone()).unwrap_or_default(),
+        };
         let label = base
             .as_ref()
             .and_then(|r| r.label.clone())
@@ -1801,6 +1874,7 @@ fn merged_turns(shadow: &Shadow, session: &str, records: Vec<TurnRecord>) -> Res
                 overlapped_next: marks.overlapped_next,
                 overlapped_tab: marks.overlapped_tab,
                 skipped_large,
+                left_out,
                 earlier_run: true,
             },
         );
@@ -1838,11 +1912,17 @@ fn plan(turns: &[TurnRecord], turn: TurnRef, scope: Scope) -> Result<Plan, Revie
                         .map_or(Side::WorkTree, |end| Side::Snapshot(end.to_owned())),
                 },
             };
+            let large = large_files(
+                &current.left_out.base,
+                current.end.commit().map(|_| &current.left_out.end),
+            );
             Ok(Plan {
                 current: current.n,
                 compare,
                 notes,
-                too_large: current.skipped_large.iter().cloned().collect(),
+                too_large: large.too_large,
+                large_unchanged: large.unchanged,
+                large_vs_disk: large.vs_disk,
             })
         }
         Scope::Session => {
@@ -1855,6 +1935,8 @@ fn plan(turns: &[TurnRecord], turn: TurnRef, scope: Scope) -> Result<Plan, Revie
                     compare: Compare::NoBaseline(reason),
                     notes,
                     too_large: BTreeSet::new(),
+                    large_unchanged: BTreeSet::new(),
+                    large_vs_disk: BTreeMap::new(),
                 });
             };
             let covered: Vec<&TurnRecord> = turns.iter().filter(|t| t.n >= first.n).collect();
@@ -1865,6 +1947,9 @@ fn plan(turns: &[TurnRecord], turn: TurnRef, scope: Scope) -> Result<Plan, Revie
                 .end
                 .commit()
                 .map_or(Side::WorkTree, |end| Side::Snapshot(end.to_owned()));
+            // Only the two snapshots compared can leave a file out of the comparison: a file too large
+            // in a turn between them is in neither.
+            let large = large_files(&first.left_out.base, latest.end.commit().map(|_| &latest.left_out.end));
             Ok(Plan {
                 current: latest.n,
                 compare: Compare::Between {
@@ -1872,7 +1957,9 @@ fn plan(turns: &[TurnRecord], turn: TurnRef, scope: Scope) -> Result<Plan, Revie
                     to,
                 },
                 notes,
-                too_large: covered.iter().flat_map(|t| t.skipped_large.iter().cloned()).collect(),
+                too_large: large.too_large,
+                large_unchanged: large.unchanged,
+                large_vs_disk: large.vs_disk,
             })
         }
     }
@@ -1953,6 +2040,7 @@ mod tests {
             overlapped_next: false,
             overlapped_tab: false,
             skipped_large: Vec::new(),
+            left_out: LeftOutSides::default(),
             earlier_run: false,
         }
     }
