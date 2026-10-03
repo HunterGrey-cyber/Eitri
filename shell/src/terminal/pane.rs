@@ -299,6 +299,15 @@ impl State {
         }
     }
 
+    /// One command to the running shell's session, dropped when there is none. Callers write
+    /// `state.borrow().send_command(..)`, so no `if let` scrutinee has to hold the pane's `RefCell`
+    /// borrow across the send.
+    fn send_command(&self, command: SessionCommand) {
+        if let Some(session) = &self.session {
+            session.send(command);
+        }
+    }
+
     /// Ends one paste and sends what it was holding back. `false`: the paste had already been given
     /// up on (the timeout, or a restart), and its text is not sent.
     fn finish_paste(&mut self, ticket: PasteTicket, input: Option<NormalizedInput>) -> bool {
@@ -745,16 +754,12 @@ fn connect_visibility(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticon
         let im = im.clone();
         area.connect_map(move |area| {
             pump(&state, area, &im, false);
-            if let Some(session) = &state.borrow().session {
-                session.send(SessionCommand::Visible(true));
-            }
+            state.borrow().send_command(SessionCommand::Visible(true));
         });
     }
     let state = state.clone();
     area.connect_unmap(move |_| {
-        if let Some(session) = &state.borrow().session {
-            session.send(SessionCommand::Visible(false));
-        }
+        state.borrow().send_command(SessionCommand::Visible(false));
     });
 }
 
@@ -887,8 +892,8 @@ fn connect_resize(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext
             s.allocate(allocation)
         };
         area.queue_render();
-        if let (Some(size), Some(session)) = (resized, state.borrow().session.as_ref()) {
-            session.send(SessionCommand::Resize(size));
+        if let Some(size) = resized {
+            state.borrow().send_command(SessionCommand::Resize(size));
         }
         ensure_session(&state, area, &im);
     });
@@ -1075,9 +1080,9 @@ fn connect_pointer(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontex
             }
             if gesture.current_button() == BUTTON_PRIMARY {
                 send_select(&state, SelectStage::Extend, x, y);
-                if let Some(session) = &state.borrow().session {
-                    session.send(SessionCommand::Select(SelectCommand::Finish));
-                }
+                state
+                    .borrow()
+                    .send_command(SessionCommand::Select(SelectCommand::Finish));
             }
         });
     }
@@ -1340,9 +1345,7 @@ fn connect_scroll(area: &GLArea, state: &Rc<RefCell<State>>) {
             match pointer::wheel_route(shift_held(controller), modes) {
                 pointer::WheelRoute::Scrollback => {
                     if let Some(req) = scroll_request(notches) {
-                        if let Some(session) = &state.borrow().session {
-                            session.send(SessionCommand::Scroll(req));
-                        }
+                        state.borrow().send_command(SessionCommand::Scroll(req));
                     }
                 }
                 pointer::WheelRoute::Report | pointer::WheelRoute::Arrows => {
@@ -1404,9 +1407,7 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
                 return glib::Propagation::Stop;
             }
             if let Some(req) = keys::scroll_chord(keyval, modifier) {
-                if let Some(session) = &state.borrow().session {
-                    session.send(SessionCommand::Scroll(req));
-                }
+                state.borrow().send_command(SessionCommand::Scroll(req));
                 // Never forwarded to the child: `Shift+PageUp`/`Shift+PageDown`/`Shift+Home`/
                 // `Shift+End` are this pane's own scrollback chords (bottom-terminal phase 3a).
                 return glib::Propagation::Stop;

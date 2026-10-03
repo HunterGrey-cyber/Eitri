@@ -4438,13 +4438,16 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 drop(backend);
                 let _ = dropped_tx.send(());
             });
-            if let Some(t) = state.borrow_mut().tabs.get_mut(tab) {
-                t.pending_handoff = Some(PendingHandoff {
-                    request_id,
-                    command,
-                    closed_rx,
-                    dropped_rx,
-                });
+            {
+                let mut state_ref = state.borrow_mut();
+                if let Some(t) = state_ref.tabs.get_mut(tab) {
+                    t.pending_handoff = Some(PendingHandoff {
+                        request_id,
+                        command,
+                        closed_rx,
+                        dropped_rx,
+                    });
+                }
             }
             // No command_result yet -- `collect_pending_handoffs` owes it once the close finishes.
             send_tabs(state, webview);
@@ -4730,7 +4733,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 Ok(pair) => pair,
                 Err(why) => return refuse(webview, &why),
             };
-            if let Err(why) = state.borrow_mut().tabs.begin_scratch_edit(tab, edit.id) {
+            let begun = state.borrow_mut().tabs.begin_scratch_edit(tab, edit.id);
+            if let Err(why) = begun {
                 edit.cleanup();
                 return refuse(webview, &why);
             }
