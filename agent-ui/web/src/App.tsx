@@ -2656,6 +2656,11 @@ export default function App() {
           if (kept !== undefined) setState(kept);
         }
         activeTabRef.current = payload.active;
+        // The banner belongs to the session that ended. Once the active tab is starting a new one
+        // (`r`, a first send after a failure) or running it, that session's reason is not about this
+        // tab any more; a start that fails again sends its own `error`.
+        const activeState = payload.tabs.find((t) => t.id === payload.active)?.state;
+        if (activeState === "starting" || activeState === "live") setFatalError(null);
         setTabs({ active: payload.active, tabs: payload.tabs, defaultMode: payload.defaultMode });
         forgetClosed(
           viewStore.current,
@@ -2724,6 +2729,9 @@ export default function App() {
         // conversation nothing else remembers.
         setHandoff(null);
         setCommandNotice(null);
+        // Likewise the ended-session banner: a snapshot is a session that runs, so a reason left from
+        // an earlier session of this tab (a failed start that `r` then redid) is stale.
+        setFatalError(null);
         // A snapshot with `turnStartedAtMs` restores the start time and sets `exact: true`. Without
         // it, a newly seen turn starts an approximate clock at `0s+` because its earlier runtime is
         // unknown. Keep an already exact clock for the same turn, and do not restart an approximate
