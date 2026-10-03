@@ -78,8 +78,13 @@ local state = {
   augroup = nil,
   events = {},
   overlays = {},
+  -- Hunks reverted in a buffer whose overlay went away before their text came back, so nothing
+  -- followed them: `{ path, meta, hunk }`, oldest first. A later show that draws one over its new
+  -- text learns the revert was undone (`take_forgotten`).
+  forgotten = {},
   torn = false,
 }
+local MAX_FORGOTTEN = 256
 
 local function warn(msg)
   vim.notify(msg, vim.log.levels.WARN)
@@ -372,6 +377,14 @@ remove_overlay = function(buf, why)
     return
   end
   state.overlays[buf] = nil
+  for _, d in ipairs(ov.hunks) do
+    if d.ghost then
+      state.forgotten[#state.forgotten + 1] = { path = ov.path, meta = ov.meta, hunk = d.hunk }
+    end
+  end
+  while #state.forgotten > MAX_FORGOTTEN do
+    table.remove(state.forgotten, 1)
+  end
   pcall(api.nvim_buf_clear_namespace, buf, state.ns, 0, -1)
   restore_keys(buf, ov)
   if why then
@@ -663,6 +676,22 @@ local ACTIONS = {
 -- Draws `hunks` into `buf`, replacing the overlay it had (no event: the host asked). A hunk whose
 -- new side is not in the buffer as given is skipped, never drawn over other text; one with no new
 -- lines has nothing to draw over.
+-- Removes and returns whether `path` had `hunk` of review `meta` among the forgotten reverts.
+local function take_forgotten(path, meta, hunk)
+  for i, f in ipairs(state.forgotten) do
+    if f.path == path and f.meta.tab == meta.tab and f.meta.session == meta.session and f.meta.turn == meta.turn
+      and f.meta.scope == meta.scope and vim.deep_equal(f.hunk, hunk) then
+      table.remove(state.forgotten, i)
+      return true
+    end
+  end
+  return false
+end
+
+-- A hunk reverted here, whose overlay then went away, and which is drawn again over its new text
+-- (and not over its old one) has had its revert undone: an `unrevert` event says so, queued behind
+-- the events the host has not taken yet, so it never overtakes the revert it undoes. A hunk that
+-- was not reverted here says nothing.
 local function show_into(buf, path, meta, hunks)
   -- A hunk reverted in this buffer under the same review is carried over to the new overlay (the
   -- panel redraws it when the user opens another hunk of the file), so that its text coming back
@@ -680,7 +709,7 @@ local function show_into(buf, path, meta, hunks)
     end
   end
   remove_overlay(buf, nil)
-  local drawn, skipped, list = 0, 0, {}
+  local drawn, skipped, list, back = 0, 0, {}, {}
   local ok, err = pcall(function()
     for _, h in ipairs(hunks) do
       if h.new_len > 0 then
@@ -688,9 +717,15 @@ local function show_into(buf, path, meta, hunks)
         if holds_new_side(buf, row, h) then
           list[#list + 1] = draw_hunk(buf, row, h)
           drawn = drawn + 1
+          -- Its new side is there. Unless its old side is too (a hunk that removed lines at the end
+          -- of the file holds both, and cannot be told from its revert), its revert has been undone.
+          if h.old_len == 0 or not holds_side(buf, row, h.old_len, h.old_lines, h.old_eols) then
+            back[#back + 1] = { h = h, row = row }
+          end
         elseif carried[h.id] and vim.deep_equal(carried[h.id].hunk, h) then
           local d = { hunk = h, marks = {}, alive = false }
           make_ghost(buf, d, carried[h.id].row, carried[h.id].row2)
+          take_forgotten(path, meta, h)
           list[#list + 1] = d
         else
           skipped = skipped + 1
@@ -715,11 +750,22 @@ local function show_into(buf, path, meta, hunks)
     state.overlays[buf] = ov
     set_keys(buf, ov, ACTIONS)
     watch()
+    for _, b in ipairs(back) do
+      if take_forgotten(path, meta, b.h) then
+        state.events[#state.events + 1] = hunk_event('unrevert', ov, b.h, b.row)
+      end
+    end
   else
     -- Nothing is drawn or followed, so nothing is kept.
     pcall(api.nvim_buf_clear_namespace, buf, state.ns, 0, -1)
   end
-  return { drawn = drawn, kept = #list, skipped = skipped, notice = notice, active = active_count() }
+  return {
+    drawn = drawn,
+    kept = #list,
+    skipped = skipped,
+    notice = notice,
+    active = active_count(),
+  }
 end
 
 -- Only into a buffer that is already loaded: loading one here could stop at a swap-file prompt,

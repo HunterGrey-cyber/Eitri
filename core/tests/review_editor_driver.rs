@@ -1075,3 +1075,154 @@ fn round_trip_with_real_nvim() {
     drop(nvim);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A real nvim with the review module's `<localleader>` set, and a link to it.
+fn real_editor(name: &str) -> (std::path::PathBuf, embed_client::Embed, NvimLink) {
+    let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("files")).unwrap();
+    let sock = agent::socket_path::in_dir(&dir, "n.sock").unwrap();
+    let home = dir.join("nvim");
+    let mut nvim = embed_client::Embed::start(
+        &home,
+        &["--listen", sock.to_str().unwrap()],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    nvim.lua("vim.g.maplocalleader = ','", vec![]);
+    let connect_by = Instant::now() + Duration::from_secs(5);
+    let link = loop {
+        match NvimLink::connect(&sock, Duration::from_secs(1)) {
+            Ok((link, _events)) => break link,
+            Err(e) => {
+                assert!(Instant::now() < connect_by, "could not connect: {e}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    (dir, nvim, link)
+}
+
+/// Keys typed as the user would, executed before the call returns.
+fn type_keys(nvim: &mut embed_client::Embed, keys: &str) {
+    nvim.lua(
+        "local keys = ... vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'mx', false)",
+        vec![Value::from(keys)],
+    );
+}
+
+fn kinds(out: &[OverlayOutcome]) -> Vec<&'static str> {
+    out.iter()
+        .map(|o| match o {
+            OverlayOutcome::Reverts(_) => "revert",
+            OverlayOutcome::Unreverts(_) => "unrevert",
+            OverlayOutcome::Off(_) => "off",
+            OverlayOutcome::Answered { .. } => "answered",
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn an_undo_made_after_the_overlay_closed_reaches_the_host_after_the_revert_it_undoes() {
+    let (dir, mut nvim, link) = real_editor("rev-drv-order");
+    let rpc: &dyn EditorRpc = &link;
+    let base = numbered(&["a1", "a2", "a3", "a4", "a5"]);
+    let end = numbered(&["a1", "a2", "X3", "a4", "a5"]);
+    let path = dir.join("files").canonicalize().unwrap().join("f.txt");
+    std::fs::write(&path, &end).unwrap();
+    let hunk = ShowHunk::from_file_lines(1, (3, 1), (3, 1), &lines_of(&base, 3, 1), &lines_of(&end, 3, 1));
+    let show = |hunk: &ShowHunk| OverlayCall::Show {
+        path: path.clone(),
+        meta: meta(),
+        hunks: vec![hunk.clone()],
+    };
+
+    let mut overlay = EditorOverlay::new(Owner::Embedded);
+    overlay.call(
+        rpc,
+        OverlayCall::OpenAndShow {
+            request_id: "r1".to_owned(),
+            path: path.clone(),
+            line: Some(3),
+            meta: meta(),
+            hunks: Some(vec![hunk.clone()]),
+        },
+        Instant::now(),
+    );
+    let first = collect(&mut overlay, rpc, "the open's answer", |o| !o.is_empty());
+    assert_eq!(
+        kinds(&first),
+        vec!["answered"],
+        "a first draw says nothing about reverts"
+    );
+
+    // Revert, close, undo and draw again, all before the host asks for the editor's events again.
+    type_keys(&mut nvim, ",r");
+    type_keys(&mut nvim, ",q");
+    type_keys(&mut nvim, "u");
+    assert_eq!(nvim.eval("getline(3)").as_str(), Some("X3"));
+    overlay.call(rpc, show(&hunk), Instant::now());
+    let out = collect(&mut overlay, rpc, "the events", |o| kinds(o).contains(&"unrevert"));
+    assert_eq!(kinds(&out), vec!["revert", "off", "unrevert"], "{out:?}");
+    match (&out[0], &out[2]) {
+        (OverlayOutcome::Reverts(r), OverlayOutcome::Unreverts(u)) => {
+            assert_eq!(r[0].hunk, hunk);
+            assert_eq!(u[0].hunk, hunk);
+            assert_eq!(u[0].at_line, 3);
+        }
+        other => panic!("{other:?}"),
+    }
+    drop(nvim);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_trailing_deletion_reverted_and_drawn_again_without_an_undo_stays_reverted() {
+    let (dir, mut nvim, link) = real_editor("rev-drv-trailing");
+    let rpc: &dyn EditorRpc = &link;
+    // The file lost its last line: its new side is the old side's first three lines.
+    let base = numbered(&["a", "b", "c", "d"]);
+    let end = numbered(&["a", "b", "c"]);
+    let path = dir.join("files").canonicalize().unwrap().join("f.txt");
+    std::fs::write(&path, &end).unwrap();
+    let hunk = ShowHunk::from_file_lines(1, (1, 4), (1, 3), &lines_of(&base, 1, 4), &lines_of(&end, 1, 3));
+
+    let mut overlay = EditorOverlay::new(Owner::Embedded);
+    overlay.call(
+        rpc,
+        OverlayCall::OpenAndShow {
+            request_id: "r1".to_owned(),
+            path: path.clone(),
+            line: Some(2),
+            meta: meta(),
+            hunks: Some(vec![hunk.clone()]),
+        },
+        Instant::now(),
+    );
+    collect(&mut overlay, rpc, "the open's answer", |o| !o.is_empty());
+    type_keys(&mut nvim, ",r");
+    assert_eq!(
+        nvim.eval("line('$')").as_i64(),
+        Some(4),
+        "the last line is back in the buffer"
+    );
+    type_keys(&mut nvim, ",q");
+    overlay.call(
+        rpc,
+        OverlayCall::Show {
+            path: path.clone(),
+            meta: meta(),
+            hunks: vec![hunk],
+        },
+        Instant::now(),
+    );
+    // The new side is still there, as the old side's start, and so is the old side: nothing says
+    // the revert was undone.
+    let out = collect(&mut overlay, rpc, "the events", |o| kinds(o).contains(&"off"));
+    assert_eq!(kinds(&out), vec!["revert", "off"], "{out:?}");
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(overlay.tick(rpc, Instant::now()).is_empty());
+    drop(nvim);
+    let _ = std::fs::remove_dir_all(&dir);
+}
