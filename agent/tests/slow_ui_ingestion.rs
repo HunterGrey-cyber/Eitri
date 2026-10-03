@@ -110,7 +110,8 @@ impl AgentProvider for ScriptedProvider {
 /// distinct cwd per conversation keeps these tests from sharing a lease key with each other.
 fn conversation(provider: Arc<ScriptedProvider>) -> AgentConversation {
     let dir = agent::state_dirs::test_workspace_dir("slow-ui");
-    AgentConversation::create(provider, &dir).expect("create should succeed against the scripted provider")
+    AgentConversation::create(provider, &dir, agent::setting_sources::ProjectTrust::Untrusted)
+        .expect("create should succeed against the scripted provider")
 }
 
 fn text(text: &str) -> AgentDomainEvent {

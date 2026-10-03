@@ -35,9 +35,11 @@ fn connect() -> ClaudeSidecarProvider {
 
 fn open(provider: &ClaudeSidecarProvider) -> String {
     provider
+        // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             streaming: StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Trusted,
         })
         .expect("create_session should succeed")
 }

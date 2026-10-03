@@ -11,6 +11,7 @@ use crate::event::{AgentEvent, PermissionSource};
 use crate::process::AgentProcess;
 use crate::projection::{AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, TurnOutcome};
 use crate::provider::PermissionDecision;
+use crate::setting_sources::ProjectTrust;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -50,8 +51,10 @@ impl AgentSession {
     /// `PreToolUse` hook configuration through `--settings` in argv, so neither session can
     /// read, overwrite or delete the other's hook configuration.
     /// The real-CLI test in `backend_conformance` verifies this isolation.
-    pub fn start(project_dir: &Path, disallowed_tools: &[&str]) -> std::io::Result<Self> {
-        let process = AgentProcess::spawn(project_dir, disallowed_tools)?;
+    ///
+    /// `project` controls whether the project's settings tiers load.
+    pub fn start(project_dir: &Path, disallowed_tools: &[&str], project: ProjectTrust) -> std::io::Result<Self> {
+        let process = AgentProcess::spawn(project_dir, disallowed_tools, project)?;
         Ok(Self {
             process,
             projection: AgentSessionProjection::default(),

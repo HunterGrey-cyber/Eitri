@@ -158,6 +158,9 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
 #[test]
 #[ignore]
 fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
+    // Every arm is a trusted session: this measures the user tier against the project tiers
+    // loaded, which is what it has always measured, and the scratch cwd has no project
+    // configuration for an untrusted arm to leave out.
     let cwd = Scratch::new("cwd");
 
     // The operator's real user tier, as the sidecar will resolve it for its subprocesses.
@@ -223,6 +226,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         false,
         control.provider_prompts,
         requested_cli_mode(&control.capabilities),
+        ProjectTrust::Trusted,
     );
     request.policy.as_mut().unwrap().setting_sources = None;
     let session_id = control.open_session(request).expect("control session");
@@ -260,6 +264,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         .create_session(CreateSessionRequest {
             cwd: cwd.path().to_string_lossy().to_string(),
             streaming: StreamingPreference::Complete,
+            project: ProjectTrust::Trusted,
         })
         .expect("default session");
     provider
@@ -304,6 +309,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         false,
         opted_out.provider_prompts,
         false,
+        ProjectTrust::Trusted,
         requested_cli_mode(&opted_out.capabilities),
     );
     let session_id = opted_out.open_session(request).expect("opt-out session");

@@ -17,6 +17,8 @@ use crate::event::{AgentEvent, PermissionSource};
 #[cfg(feature = "legacy-backend")]
 use crate::hook_protocol::parse_pretooluse_input;
 #[cfg(feature = "legacy-backend")]
+use crate::setting_sources::ProjectTrust;
+#[cfg(feature = "legacy-backend")]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(feature = "legacy-backend")]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -571,8 +573,11 @@ impl AgentProcess {
     /// operates on. This crate writes nothing there: hook settings go in argv and the socket goes in
     /// the temp directory. Every session uses `default` with the `PreToolUse` gate. The host decides
     /// whether to answer `allow` above this session API, so there is no mode parameter here.
-    pub fn spawn(project_dir: &Path, disallowed_tools: &[&str]) -> std::io::Result<Self> {
-        Self::spawn_with_binary(project_dir, disallowed_tools, "claude")
+    ///
+    /// The caller's `project` value controls whether project settings tiers load through
+    /// `crate::setting_sources::for_session`.
+    pub fn spawn(project_dir: &Path, disallowed_tools: &[&str], project: ProjectTrust) -> std::io::Result<Self> {
+        Self::spawn_with_binary(project_dir, disallowed_tools, "claude", project)
     }
 
     /// The real body of [`spawn`](Self::spawn), parameterized only by which binary to exec.
@@ -592,7 +597,31 @@ impl AgentProcess {
     /// The hook configuration itself is an argv value (`--settings`), not a file, so there is no
     /// longer anything on disk to generate first or to restore afterwards -- see
     /// `crate::settings` for the real-CLI spike that forced that change.
-    fn spawn_with_binary(project_dir: &Path, disallowed_tools: &[&str], binary: &str) -> std::io::Result<Self> {
+    fn spawn_with_binary(
+        project_dir: &Path,
+        disallowed_tools: &[&str],
+        binary: &str,
+        project: ProjectTrust,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with_binary_loading(
+            project_dir,
+            disallowed_tools,
+            binary,
+            crate::setting_sources::loads_user_settings(),
+            project,
+        )
+    }
+
+    /// [`spawn_with_binary`](Self::spawn_with_binary) with the user tier named instead of read
+    /// from the process-wide choice, so this module's tests can spawn every selection in one
+    /// process.
+    fn spawn_with_binary_loading(
+        project_dir: &Path,
+        disallowed_tools: &[&str],
+        binary: &str,
+        user_settings: bool,
+        project: ProjectTrust,
+    ) -> std::io::Result<Self> {
         let conversation_id = Uuid::new_v4();
         // A configured account (`init.lua`'s `agent.account`) governs the SIDECAR child and where
         // this crate reads transcripts -- not this spawn. The `claude` on `PATH` here is, on the
@@ -659,8 +688,12 @@ impl AgentProcess {
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
+            // Always passed, the empty selection too (an argument of its own that is the empty
+            // string): without the flag the CLI would load every tier, the project's included.
             .arg("--setting-sources")
-            .arg(crate::setting_sources::configured_cli_argument())
+            .arg(crate::setting_sources::cli_argument_for(
+                crate::setting_sources::for_session(user_settings, project),
+            ))
             // Use `default` so an unanswered hook enters the CLI's permission flow rather than its
             // classifier. Headless calls are denied unless a project/local `permissions.allow` rule matches;
             // that exception has not been probed on a real CLI. Under `auto`, the classifier was observed
@@ -1162,7 +1195,8 @@ mod tests {
     fn real_two_turns_in_one_process_no_resume() {
         let dir = std::env::temp_dir().join(format!("agent-process-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut process = AgentProcess::spawn(&dir, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
+        // Trusted: these measure the real CLI with the project tiers loaded, as they always have.
+        let mut process = AgentProcess::spawn(&dir, CONSERVATIVE_DISALLOWED_TOOLS, ProjectTrust::Trusted).unwrap();
 
         process.send_turn("reply with exactly the word: pong").unwrap();
         let result1 = drain_until_turn_finished(&mut process);
@@ -1200,7 +1234,8 @@ mod tests {
     fn shutdown_after_interrupt_leaves_no_orphan() {
         let dir = std::env::temp_dir().join(format!("agent-process-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut process = AgentProcess::spawn(&dir, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
+        // Trusted: these measure the real CLI with the project tiers loaded, as they always have.
+        let mut process = AgentProcess::spawn(&dir, CONSERVATIVE_DISALLOWED_TOOLS, ProjectTrust::Trusted).unwrap();
         let pid = process.pid();
 
         process
@@ -1854,8 +1889,12 @@ mod tests {
         let sockets_before = temp_hook_socket_names();
         let threads_before = live_thread_count();
         for _ in 0..5 {
-            let outcome =
-                AgentProcess::spawn_with_binary(&dir, &[], "/nonexistent/definitely-not-a-real-claude-binary");
+            let outcome = AgentProcess::spawn_with_binary(
+                &dir,
+                &[],
+                "/nonexistent/definitely-not-a-real-claude-binary",
+                ProjectTrust::Untrusted,
+            );
             match outcome {
                 Ok(_) => panic!("spawning a nonexistent binary must fail"),
                 Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
@@ -2100,7 +2139,7 @@ exit 0"#,
         );
 
         let sockets_before = temp_hook_socket_names();
-        let outcome = AgentProcess::spawn_with_binary(&dir, &[], script.to_str().unwrap());
+        let outcome = AgentProcess::spawn_with_binary(&dir, &[], script.to_str().unwrap(), ProjectTrust::Untrusted);
         let err = outcome
             .err()
             .expect("spawn must fail when the resolved binary refuses the gate flag");
@@ -2143,8 +2182,13 @@ exit 0"#,
             record.display()
         ));
 
-        let mut process = AgentProcess::spawn_with_binary(&dir, disallowed_tools(), script.to_str().unwrap())
-            .expect("the fake binary accepts --settings, so the spawn succeeds");
+        let mut process = AgentProcess::spawn_with_binary(
+            &dir,
+            disallowed_tools(),
+            script.to_str().unwrap(),
+            ProjectTrust::Untrusted,
+        )
+        .expect("the fake binary accepts --settings, so the spawn succeeds");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let session_argv = loop {
             let text = std::fs::read_to_string(&record).unwrap_or_default();
@@ -2162,11 +2206,6 @@ exit 0"#,
         assert!(
             session_argv.contains("--permission-mode default"),
             "the CLI runs in `default`: {session_argv}"
-        );
-        assert!(
-            session_argv.contains("--setting-sources user,project,local"),
-            "legacy loads all three settings tiers unless `agent.user_settings` is false, which \
-             `setting_sources::note` tells the user on `prefix i`: {session_argv}"
         );
         for ungated in [
             "bypassPermissions",
@@ -2186,6 +2225,86 @@ exit 0"#,
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawns the fake binary at `script` through the real spawn path with a named selection and
+    /// returns the session invocation's argv, element by element. The recorder separates elements
+    /// with US (0x1f) and invocations with RS (0x1e), so an empty element stays visible as one.
+    fn recorded_session_argv(user_settings: bool, project: ProjectTrust) -> Vec<String> {
+        let _socket_guard = hook_socket_guard();
+        let dir = std::env::temp_dir().join(format!("agent-process-tiers-argv-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::settings::hook_settings_arg(&dir.join("probe.sock"))
+            .expect("agent-hook must be built for this test to exercise the real gate path");
+        let record = dir.join("argv.bin");
+        let script = fake_binary_script(&format!(
+            "for arg in \"$@\"; do printf '%s\\037' \"$arg\" >> '{rec}'; done\nprintf '\\036' >> '{rec}'\n\
+             for arg in \"$@\"; do [ \"$arg\" = --version ] && exit 0; done\nexec cat >/dev/null",
+            rec = record.display()
+        ));
+
+        let mut process =
+            AgentProcess::spawn_with_binary_loading(&dir, &[], script.to_str().unwrap(), user_settings, project)
+                .expect("the fake binary accepts --settings, so the spawn succeeds");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let argv = loop {
+            let bytes = std::fs::read(&record).unwrap_or_default();
+            let text = String::from_utf8(bytes).expect("the argv is UTF-8");
+            let session = text
+                .split('\u{1e}')
+                .map(|invocation| {
+                    let mut elements: Vec<String> = invocation.split('\u{1f}').map(str::to_string).collect();
+                    // Every element ends with US, so the split leaves one empty tail.
+                    elements.pop();
+                    elements
+                })
+                .find(|elements| elements.iter().any(|e| e == "--input-format"));
+            if let Some(argv) = session {
+                break argv;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session spawn never recorded its argv"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        process.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+        argv
+    }
+
+    /// The legacy argv states the session's tiers on every spawn: the project's tiers only when the
+    /// session is trusted, the user tier unless it is configured off, and the empty selection as an
+    /// empty argument of its own rather than a missing flag (which would load every tier).
+    #[test]
+    fn the_legacy_argv_follows_the_sessions_trust() {
+        for (user_settings, project, expected) in [
+            (true, ProjectTrust::Trusted, "user,project,local"),
+            (false, ProjectTrust::Trusted, "project,local"),
+            (true, ProjectTrust::Untrusted, "user"),
+            (false, ProjectTrust::Untrusted, ""),
+        ] {
+            let argv = recorded_session_argv(user_settings, project);
+            let flags: Vec<usize> = argv
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| *e == "--setting-sources")
+                .map(|(i, _)| i)
+                .collect();
+            let [at] = flags[..] else {
+                panic!("--setting-sources must appear exactly once: {argv:?}");
+            };
+            assert_eq!(
+                argv.get(at + 1).map(String::as_str),
+                Some(expected),
+                "user_settings={user_settings}, {project:?}: {argv:?}"
+            );
+            assert_eq!(
+                argv.get(at + 2).map(String::as_str),
+                Some("--permission-mode"),
+                "the value is one element, followed by the next flag: {argv:?}"
+            );
+        }
     }
 
     /// `resolve_binary_absolute_path` with a name (no `/`) must find it on `PATH`, exactly as
