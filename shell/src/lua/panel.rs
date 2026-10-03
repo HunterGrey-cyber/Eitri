@@ -165,7 +165,9 @@ fn install_crash_recovery(
             return;
         }
         use crate::webview_crash_guard::CrashResponse;
-        match guard_for_signal.borrow_mut().on_crash() {
+        // Taken before the `match`, so the guard's borrow is not held while the arms act.
+        let response = guard_for_signal.borrow_mut().on_crash();
+        match response {
             CrashResponse::Reload => {
                 eprintln!("[lua] panel '{id}': the web process terminated ({reason:?}); reloading it");
                 webview.load_uri(&url);
