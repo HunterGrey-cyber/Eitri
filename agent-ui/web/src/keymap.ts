@@ -157,8 +157,8 @@ export type PanelAction =
   /** `/` in BROWSE: open incremental search. */
   | { kind: "search" }
   /** `:` in BROWSE: open a vim-style command line in the
-   *  footer that runs no command -- Enter closes it with a flash, Esc silently -- so `:ls⏎`, `:l⏎`
-   *  and `:d⏎` land in it and never reach a card. */
+   *  footer that runs only `:trust` and `:untrust` -- any other line closes it with a flash, Esc
+   *  silently -- so `:ls⏎`, `:l⏎` and `:d⏎` land in it and never reach a card. */
   | { kind: "ex-line" }
   /** `n` (+1) / `Shift+N` (-1) in BROWSE: repeat the last `/` search, wrapping. */
   | { kind: "search-next"; delta: 1 | -1 }
@@ -793,7 +793,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "r", what: "New session, once this one has ended" },
   { keys: "c", what: "Review: the files that changed on disk during this tab's latest turn (read-only)" },
   { keys: "/", what: "Search the conversation (Enter keeps the match, Esc goes back)" },
-  { keys: ":", what: "A command line, as in vim: nothing runs here yet; Enter or Esc closes it" },
+  { keys: ":", what: "A command line, as in vim: :trust and :untrust" },
   { keys: "n / N", what: "Next / previous match, wrapping" },
   { keys: "Ctrl+o", what: "Detailed view: every result, longer cuts, no collapsed runs" },
   { keys: "zh / zl", what: "Scroll this row's table left / right" },

@@ -12,7 +12,7 @@ import type { PermissionModeChoice, TabId, TabInfo, TabMarker, TabsEnvelope } fr
 const TAB_SCOPED = new Set([
   "events", "snapshot", "handoff", "error", "focus_permission", "tab_detail", "confirm_close", "begin_rename",
   "queue", "draft", "queue_taken", "rule_offers", "scratch", "review", "review_diff",
-  "review_draft", "review_send_preview",
+  "review_draft", "review_send_preview", "trust_prompt",
 ]);
 
 /** The panel keeps only the active tab's state, so an envelope for another tab is dropped. That

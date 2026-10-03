@@ -410,9 +410,10 @@ describe("resolveKey, phase 3", () => {
     expect(resolveKey("input", key("/"), ctx)).toBeNull();
   });
 
-  /* `:` opens a command line that runs nothing, so `:ls`, `:l` and `:d` cannot answer a card.
-     Match `key` with or without Shift; AZERTY types it unshifted. Ctrl, Alt or Meta exclude it.
-     After a pending prefix it cancels; INPUT types it, and CARET/VISUAL end on it. */
+  /* `:` opens a command line that runs only `:trust` and `:untrust`, so `:ls`, `:l` and `:d`
+     cannot answer a card. Match `key` with or without Shift; AZERTY types it unshifted.
+     Ctrl, Alt or Meta exclude it. After a pending prefix it cancels; INPUT types it,
+     and CARET/VISUAL end on it. */
   it("opens the : command line in BROWSE with or without Shift, and nowhere else (K02)", () => {
     expect(resolveKey("browse", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "ex-line" });
     expect(resolveKey("browse", key(":"), ctx)).toEqual({ kind: "ex-line" });
@@ -428,6 +429,10 @@ describe("resolveKey, phase 3", () => {
     expect(resolveKey("browse", key(":", { shiftKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "cancel", why: "unbound" });
     expect(resolveKey("caret", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "vend", key: ":" });
     expect(resolveKey("visual", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "vend", key: ":" });
+  });
+
+  it("lists the : command line's two commands in the help", () => {
+    expect(BROWSE_KEYS.find((row) => row.keys === ":")?.what).toBe("A command line, as in vim: :trust and :untrust");
   });
 
   it("toggles the detailed view on Ctrl+o in both modes, and scrolls a table on zh / zl", () => {

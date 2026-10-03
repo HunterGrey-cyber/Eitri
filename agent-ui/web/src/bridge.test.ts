@@ -251,6 +251,68 @@ describe("installDispatch", () => {
     warn.mockRestore();
   });
 
+  describe("the trust question", () => {
+    const HEX = "a1".repeat(32);
+    const prompt = (over: Record<string, unknown> = {}) => ({
+      kind: "trust_prompt", tab: 3, nonce: 17, root: "/p/src", top: "/p", fingerprint: HEX, findingsDigest: HEX,
+      state: "untrusted", remember: "yes", rememberNote: null, changed: null, items: [], ...over,
+    });
+    const dispatched = (envelope: Record<string, unknown>) => {
+      const handler = vi.fn();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      installDispatch(handler);
+      window.__eitriDispatch!(JSON.stringify(envelope));
+      const warned = warn.mock.calls.length > 0;
+      warn.mockRestore();
+      return { handler, warned };
+    };
+
+    it("demuxes a well-formed trust_prompt, for each remember value", () => {
+      for (const remember of ["yes", "window", "session"]) {
+        const envelope = prompt({ remember, rememberNote: remember === "yes" ? null : "note" });
+        const { handler, warned } = dispatched(envelope);
+        expect(handler).toHaveBeenCalledWith(envelope);
+        expect(warned).toBe(false);
+      }
+    });
+
+    it("the_bridge_rejects_a_trust_prompt_without_a_numeric_nonce", () => {
+      for (const nonce of [undefined, "17", null]) {
+        const { handler, warned } = dispatched(prompt({ nonce }));
+        expect(handler).not.toHaveBeenCalled();
+        expect(warned).toBe(true);
+      }
+    });
+
+    it("rejects a trust_prompt whose fingerprint or digest is not 64 hex digits", () => {
+      const bad = [undefined, "", "a1".repeat(31), "A1".repeat(32), "zz".repeat(32), "a1".repeat(33), 5];
+      for (const value of bad) {
+        expect(dispatched(prompt({ fingerprint: value })).handler, `fingerprint ${String(value)}`).not.toHaveBeenCalled();
+        expect(dispatched(prompt({ findingsDigest: value })).handler, `digest ${String(value)}`).not.toHaveBeenCalled();
+      }
+    });
+
+    it("rejects a trust_prompt whose remember is not yes, window or session", () => {
+      for (const remember of [undefined, "no", "Yes", "forever", 1]) {
+        expect(dispatched(prompt({ remember })).handler, String(remember)).not.toHaveBeenCalled();
+      }
+    });
+
+    it("rejects a trust_prompt with no tab or no item list", () => {
+      expect(dispatched(prompt({ tab: undefined })).handler).not.toHaveBeenCalled();
+      expect(dispatched(prompt({ items: undefined })).handler).not.toHaveBeenCalled();
+    });
+
+    it("type-checks the three requests the prompt and the command line post", () => {
+      const sent: OutboundMessage[] = [
+        { type: "trust_answer", request_id: "r1", tab: 3, nonce: 17, fingerprint: HEX, findings_digest: HEX, trust: true },
+        { type: "trust_cancel", request_id: "r2", tab: 3, nonce: 17 },
+        { type: "trust_command", request_id: "r3", action: "untrust" },
+      ];
+      expect(sent.map((m) => m.type)).toEqual(["trust_answer", "trust_cancel", "trust_command"]);
+    });
+  });
+
   it("passes every phase 3 envelope through the whitelist", () => {
     const handler = vi.fn();
     installDispatch(handler);
