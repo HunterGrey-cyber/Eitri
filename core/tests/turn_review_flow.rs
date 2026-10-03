@@ -1829,6 +1829,47 @@ fn an_editor_revert_undone_in_the_editor_leaves_the_draft() {
 }
 
 #[test]
+fn a_revert_and_the_undo_the_editor_reports_together_leave_nothing_in_the_draft() {
+    let mut f = Fixture::new("editor-undo-after-close");
+    embedded(&mut f);
+    f.write("a.txt", b"one\ntwo\nthree\nfour\n", 0o644);
+    let n = f.turn(|f| f.write("a.txt", b"one\nTWO\nthree\nFOUR\n", 0o644));
+    let editor = ScriptedEditor::new();
+    f.run(editor.rpc(), "o1", open_in_editor("o1", f.tab, n, "a.txt"));
+    let known = f
+        .tabs
+        .turn_review()
+        .unwrap()
+        .exact_hunks_job(SESSION, n, Scope::Turn, "a.txt")
+        .run()
+        .unwrap()
+        .hunks
+        .unwrap()[0]
+        .id;
+    let drafts = |outs: &[Out]| shape(outs).iter().filter(|w| w.starts_with("review_draft")).count();
+
+    // The overlay closed and the user undid the revert, so the editor, which drew the hunk again on
+    // the panel's next `o`, says both in one answer, the revert first, as they happened.
+    editor.queue_event(revert_event(&f, n, "a.txt", known, 2, "two", "TWO", "lf"));
+    editor.queue_event(with_kind(
+        revert_event(&f, n, "a.txt", known, 2, "two", "TWO", "lf"),
+        "unrevert",
+    ));
+    // A second revert, of a hunk that stays reverted, is kept.
+    editor.queue_event(revert_event(&f, n, "a.txt", known + 10, 4, "four", "FOUR", "lf"));
+    tick_until(&mut f, &editor, "the events", |outs| drafts(outs) >= 1);
+    for _ in 0..5 {
+        f.pump();
+        f.flow
+            .tick(&mut f.tabs, editor.rpc(), Instant::now() + Duration::from_secs(60));
+    }
+    let left = f.draft().reverts();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].new.hunk.as_ref().map(|h| h.0), Some(known + 10));
+    f.shut_down();
+}
+
+#[test]
 fn show_hunk_converts_lf_crlf_and_a_missing_final_newline() {
     let mut f = Fixture::new("show-hunk");
     f.write("lf.txt", b"a\nb\nc\n", 0o644);

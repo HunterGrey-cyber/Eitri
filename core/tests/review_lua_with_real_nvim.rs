@@ -1441,6 +1441,91 @@ fn undoing_a_buffer_revert_draws_the_hunk_again_and_says_so() {
 
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn drawing_a_hunk_again_after_an_undo_made_with_the_overlay_closed_says_so_in_order() {
+    let mut fx = Fx::new("undo-after-close");
+    let t = two_hunks();
+    let path = fx.file("f.txt", &t.end);
+    fx.open(&path);
+    assert_eq!(count(&fx.show(&path, &meta(2), &t.hunks), "drawn"), 2);
+    assert!(fx.events().is_empty(), "a first draw says nothing");
+
+    fx.cursor(5);
+    fx.feed(",r");
+    // Closing the overlay ends the tracking: the undo below is seen by nobody.
+    fx.feed(",q");
+    fx.feed("u");
+    fx.nvim.flush_scheduled();
+    assert_eq!(fx.lines(), as_lines(&t.end));
+
+    // Drawn again, the hunk's text is found back: one `unrevert`, queued behind the `revert` and
+    // the close, and none for the hunk that was never reverted.
+    assert_eq!(count(&fx.show(&path, &meta(2), &t.hunks), "drawn"), 2);
+    let events = fx.events();
+    let kinds: Vec<String> = events.iter().map(|e| text(get(e, "kind"))).collect();
+    assert_eq!(kinds, vec!["revert", "off", "unrevert"]);
+    let back = parse_unrevert_event(&events[2]).expect("an unrevert event");
+    assert_eq!(back.hunk, t.hunks[0]);
+    assert_eq!(back.at_line, 2);
+
+    // Said once: another draw has nothing more to say.
+    assert_eq!(count(&fx.show(&path, &meta(2), &t.hunks), "drawn"), 2);
+    assert!(fx.events().is_empty());
+
+    // The same through an open, which is how the panel's `o` reaches the editor.
+    fx.cursor(5);
+    fx.feed(",r");
+    fx.feed(",q");
+    fx.feed("u");
+    fx.nvim.flush_scheduled();
+    fx.events();
+    let opened = fx.nvim.lua(
+        OPEN_AND_SHOW_LUA,
+        open_and_show_args(&path, Some(5), &meta(2), Some(&t.hunks)),
+    );
+    assert_eq!(get(&opened, "opened"), &Value::from(true), "{opened:?}");
+    assert_eq!(fx.event_kinds(), vec!["unrevert".to_owned()]);
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_hunk_still_reverted_when_drawn_again_is_not_reported_as_undone() {
+    let mut fx = Fx::new("reshow-still-reverted");
+    let t = two_hunks();
+    let path = fx.file("f.txt", &t.end);
+    fx.open(&path);
+    assert_eq!(count(&fx.show(&path, &meta(2), &t.hunks), "drawn"), 2);
+    fx.cursor(21);
+    fx.feed(",r");
+    fx.feed(",q");
+    // Its text is not back, so nothing is drawn over it and nothing is said.
+    let again = fx.show(&path, &meta(2), &t.hunks);
+    assert_eq!(count(&again, "drawn"), 1, "{again:?}");
+    assert_eq!(fx.event_kinds(), vec!["revert".to_owned(), "off".to_owned()]);
+
+    // A hunk that removed lines at the end of the file holds its new side and its old side at once:
+    // its revert and its undo cannot be told apart, so none is claimed.
+    let base = numbered(&["a", "b", "c", "d"]);
+    let end = numbered(&["a", "b", "c"]);
+    let hunk = hunk_of(1, &base, &end, (1, 4), (1, 3));
+    let tail = fx.file("tail.txt", &end);
+    fx.open(&tail);
+    assert_eq!(
+        count(&fx.show(&tail, &meta(2), std::slice::from_ref(&hunk)), "drawn"),
+        1
+    );
+    fx.cursor(2);
+    fx.feed(",r");
+    assert_eq!(fx.lines().len(), 4, "the last line is back");
+    fx.feed(",q");
+    fx.events();
+    fx.show(&tail, &meta(2), std::slice::from_ref(&hunk));
+    assert!(fx.events().is_empty());
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn redoing_an_undone_revert_reads_as_the_revert_again() {
     let mut fx = Fx::new("redo-follow");
     let t = two_hunks();

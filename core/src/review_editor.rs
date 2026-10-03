@@ -27,7 +27,7 @@ use crate::turn_review::{Scope, MAX_OVERVIEW_DIFF_LINES};
 pub const REVIEW_LUA: &str = include_str!("review.lua");
 
 /// Bumped whenever `review.lua` changes.
-pub const REVIEW_LUA_VERSION: i64 = 3;
+pub const REVIEW_LUA_VERSION: i64 = 5;
 
 /// Every call into an installed module first checks that one is there, and answers
 /// `{ missing = true }` when it is not (another panel's teardown, or nvim restarted) rather than
@@ -43,7 +43,9 @@ macro_rules! guarded {
 
 /// Args `(abs_path: bin, meta: map, hunks: [map])`: draws into the buffer showing the file, if one
 /// is loaded. Answers `{drawn, kept, skipped, notice?, active}`; `kept` also counts hunks reverted
-/// in the buffer that the editor still follows.
+/// in the buffer that the editor still follows. A hunk drawn over text that is its new side and
+/// not its old one is also queued as an `unrevert` event, behind any earlier event, since it may
+/// have been reverted while no overlay followed it.
 pub const SHOW_LUA: &str = guarded!("return r.show(...)");
 /// Args `(abs_path: bin, line: int|nil, meta: map, hunks: [map]|nil)`: opens the file (a split
 /// when the current buffer cannot be left), puts the cursor on `line` and shows `hunks`. Answers
@@ -695,6 +697,7 @@ impl EditorOverlay {
         match call {
             OverlayCall::OpenAndShow { request_id, path, .. } => {
                 let opened = lookup(answer, "opened").and_then(Value::as_bool);
+
                 let result = match opened {
                     Some(true) => {
                         match drawn {
