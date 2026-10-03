@@ -3930,9 +3930,11 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         return;
     }
     let request_id = message.request_id().to_string();
-    // Require each tab command to name its tab. A permission answer sent just after a
-    // switch must reach the tab that asked, rather than whichever tab is now active.
-    let target = match state.borrow().tabs.resolve(message.tab_ref()) {
+    // A tab command must name its tab so a permission answer after a switch reaches the tab that
+    // asked. Bind the resolution before the `match` to release the state borrow: a scrutinee's
+    // temporaries otherwise live until the end of the whole match.
+    let resolved = state.borrow().tabs.resolve(message.tab_ref());
+    let target = match resolved {
         Ok(target) => target,
         Err(protocol) => {
             eprintln!("[agent_panel] refused {request_id}: {protocol}");
@@ -4110,7 +4112,11 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                         request_id: request_id.clone(),
                         first_turn,
                     };
-                    match gate_start(&mut state.borrow_mut(), tab, start) {
+                    // Bound before the `match`: the borrow would otherwise stay held through the
+                    // arms, and `send_tabs` borrows the state again, which panics inside a WebKit
+                    // signal handler and aborts the window.
+                    let started = gate_start(&mut state.borrow_mut(), tab, start);
+                    match started {
                         Ok(()) => send_tabs(state, webview),
                         Err(why) => refuse(webview, &why),
                     }
@@ -4369,10 +4375,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let before = state.borrow().tabs.attention();
             // A start put off for the trust question owes its command an answer; read before the
             // reset drops it.
-            let owed = match state.borrow().tabs.get(tab).map(|t| &t.backend) {
-                Some(TabBackend::AwaitingTrust(waiting)) => waiting.start.request_id().map(str::to_owned),
+            let owed = state.borrow().tabs.get(tab).and_then(|t| match &t.backend {
+                TabBackend::AwaitingTrust(waiting) => waiting.start.request_id().map(str::to_owned),
                 _ => None,
-            };
+            });
             let reset = state.borrow_mut().tabs.reset(tab);
             match reset {
                 Ok(old) => {
@@ -4596,12 +4602,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             }
         }
         InboundMessage::ViewInEditor { title, text, .. } => {
-            let prepared = match state.borrow_mut().scratch.as_mut() {
-                Some(dir) => dir
-                    .prepare_view(&title, &text)
-                    .map_err(|e| format!("could not write the scratch file: {e}")),
-                None => Err("the scratch directory could not be created at startup".to_string()),
-            };
+            let prepared = state
+                .borrow_mut()
+                .scratch
+                .as_mut()
+                .map(|dir| {
+                    dir.prepare_view(&title, &text)
+                        .map_err(|e| format!("could not write the scratch file: {e}"))
+                })
+                .unwrap_or_else(|| Err("the scratch directory could not be created at startup".to_string()));
             match prepared.and_then(|request| request_editor(state, &request)) {
                 Ok(()) => ok(webview),
                 Err(why) => refuse(webview, &why),
@@ -4609,12 +4618,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         }
         InboundMessage::EditDraft { text, .. } => {
             let tab = tab_of(target);
-            let prepared = match state.borrow_mut().scratch.as_mut() {
-                Some(dir) => dir
-                    .prepare_edit(&text)
-                    .map_err(|e| format!("could not write the scratch file: {e}")),
-                None => Err("the scratch directory could not be created at startup".to_string()),
-            };
+            let prepared = state
+                .borrow_mut()
+                .scratch
+                .as_mut()
+                .map(|dir| {
+                    dir.prepare_edit(&text)
+                        .map_err(|e| format!("could not write the scratch file: {e}"))
+                })
+                .unwrap_or_else(|| Err("the scratch directory could not be created at startup".to_string()));
             let (request, edit) = match prepared {
                 Ok(pair) => pair,
                 Err(why) => return refuse(webview, &why),
@@ -6106,7 +6118,8 @@ mod tests {
         state.borrow_mut().prefs_dir = Some(prefs_dir.clone());
         state.borrow_mut().project_dir = project_dir.clone();
 
-        let plan = match state.borrow_mut().tabs.cycle_mode(tab) {
+        let cycled = state.borrow_mut().tabs.cycle_mode(tab);
+        let plan = match cycled {
             Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => plan,
             other => panic!("an empty auto tab must ask first: {other:?}"),
         };
@@ -6168,7 +6181,8 @@ mod tests {
         let tab = set.active();
         let state = state_for_hooks(set);
 
-        let plan = match state.borrow_mut().tabs.cycle_mode(tab) {
+        let cycled = state.borrow_mut().tabs.cycle_mode(tab);
+        let plan = match cycled {
             Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => plan,
             other => panic!("an empty auto tab must ask first: {other:?}"),
         };
