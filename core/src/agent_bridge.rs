@@ -3872,6 +3872,65 @@ mod tests {
         assert_eq!(pending["toolName"], "Bash");
     }
 
+    /// The CLI's own prompt for a call is a card of its own for the SAME call: its snapshot entry and its
+    /// event both carry the call's id next to the provider's words, so the panel can hang it under the
+    /// call and `a`/`d` on that call's row reach it. Without the id the card would be drawn by
+    /// sequence only and no key on the tool row could answer it.
+    #[test]
+    fn a_provider_prompt_keeps_the_tool_call_it_names_in_snapshot_and_event() {
+        let event = AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-cli".into(),
+            tool_use_id: Some("toolu_01ABC".into()),
+            tool_name: "Bash".into(),
+            input: json!({"command": "echo hi"}),
+            provider_prompt: Some(agent::ProviderPrompt {
+                reason: None,
+                description: Some("Print hi".into()),
+                blocked_path: None,
+                matched_ask_rule: Some(agent::MatchedAskRule {
+                    source: "projectSettings".into(),
+                    tool_name: "Bash".into(),
+                    rule_content: Some("echo:*".into()),
+                }),
+                unrecognized_origin: None,
+            }),
+        };
+        let on_the_wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(on_the_wire["tool_use_id"], "toolu_01ABC");
+        assert!(on_the_wire["provider_prompt"].is_object());
+
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_01ABC".into(),
+            name: "Bash".into(),
+            input: json!({"command": "echo hi"}),
+        });
+        projection.apply(&event);
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+                cli_auto_mode: true,
+            },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+        let pending = &parsed["state"]["pendingPermissions"][0];
+        assert_eq!(pending["toolUseId"], parsed["state"]["toolCalls"][0]["toolUseId"]);
+        assert_eq!(pending["toolUseId"], "toolu_01ABC");
+        assert_eq!(pending["providerPrompt"]["matchedAskRule"]["ruleContent"], "echo:*");
+    }
+
     /// The CLI's own refusal of a call reaches a rebuilt panel too: `denied` on that call's entry,
     /// camelCase like the rest of the snapshot, the CLI's words verbatim -- and no such key on a call
     /// nobody refused, so a snapshot without refusals reads as it did before the field existed.

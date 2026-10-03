@@ -4723,6 +4723,100 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     }
   });
 
+  /** The CLI's own prompt (`origin: provider_prompt`, here forced by a `permissions.ask` rule): the same
+   *  tool call, a card of its own carrying the call's id, with the provider's reasons on it. */
+  function withAProviderPromptAndStop() {
+    const rendered = started({ capabilities: { ...initialState().capabilities, interrupt: true } });
+    events(
+      { type: "user_prompt_submitted", text: "run it" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { cmd: "ls" } },
+      {
+        type: "permission_requested",
+        permission_id: "perm-1",
+        tool_use_id: "toolu_1",
+        tool_name: "Bash",
+        input: { cmd: "ls" },
+        provider_prompt: {
+          reason: null,
+          description: "list",
+          blocked_path: null,
+          matched_ask_rule: { source: "projectSettings", tool_name: "Bash", rule_content: "ls:*" },
+        },
+      },
+    );
+    act(() => root(rendered.container).focus());
+    return rendered;
+  }
+
+  /** The sequence that was reported as "a does nothing on the tool row": the user typed the prompt
+   *  (INPUT), the CLI's own prompt arrived, Esc, then one `j` lands on the tool call -- and `a` there
+   *  answers the provider prompt that names that call, by its own permission id. */
+  it("Esc, j onto the tool call, a: answers the CLI's own prompt for that call", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = withAProviderPromptAndStop();
+      press("i");
+      fireEvent.keyDown(container.querySelector<HTMLTextAreaElement>("textarea")!, { key: "Escape" });
+      act(() => vi.advanceTimersByTime(300));
+      press("j");
+      expect(container.querySelector(".row-current")!.classList.contains("row-tool")).toBe(true);
+      act(() => vi.advanceTimersByTime(300));
+      press("a");
+      act(() => vi.advanceTimersByTime(250));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("d on the tool call denies the CLI's own prompt for that call, and only that one", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = withAProviderPromptAndStop();
+      press("i");
+      fireEvent.keyDown(container.querySelector<HTMLTextAreaElement>("textarea")!, { key: "Escape" });
+      act(() => vi.advanceTimersByTime(300));
+      press("j");
+      act(() => vi.advanceTimersByTime(300));
+      press("d");
+      act(() => vi.advanceTimersByTime(250));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "deny" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** A prompt that names another call is not this call's card: `a` on the tool row of `toolu_1` must
+   *  not answer the one waiting on `toolu_2`, however near it sits. */
+  it("a on a tool call does not answer a provider prompt that names a different call", () => {
+    vi.useFakeTimers();
+    try {
+      const rendered = started({ capabilities: { ...initialState().capabilities, interrupt: true } });
+      events(
+        { type: "turn_started", turn_id: "t1" },
+        { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { cmd: "ls" } },
+        { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_2", name: "Bash", input: { cmd: "pwd" } },
+        {
+          type: "permission_requested",
+          permission_id: "perm-2",
+          tool_use_id: "toolu_2",
+          tool_name: "Bash",
+          input: { cmd: "pwd" },
+          provider_prompt: { reason: null, description: null, blocked_path: null, matched_ask_rule: null },
+        },
+      );
+      act(() => root(rendered.container).focus());
+      // The cursor starts on the first row, `toolu_1`'s call; its card is not the one that waits.
+      expect(rendered.container.querySelector(".row-current")!.classList.contains("row-tool")).toBe(true);
+      press("a");
+      act(() => vi.advanceTimersByTime(1000));
+      expect(lastOfType("permission_response")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("d on the card itself denies it", () => {
     vi.useFakeTimers();
     try {
