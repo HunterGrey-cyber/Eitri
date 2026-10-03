@@ -1934,6 +1934,9 @@ pub fn serialize_trust_prompt_for_js(view: &TrustPromptView) -> String {
 pub enum TabStateWire {
     NotStarted,
     Starting,
+    /// A start (a first send, a resume or a restore) put off until the user answers the workspace-trust
+    /// question: no session is being opened, so the panel must not say one is starting.
+    AwaitingTrust,
     Live,
     Ended,
     Failed,
@@ -1944,6 +1947,7 @@ impl TabStateWire {
         match self {
             TabStateWire::NotStarted => "not_started",
             TabStateWire::Starting => "starting",
+            TabStateWire::AwaitingTrust => "awaiting_trust",
             TabStateWire::Live => "live",
             TabStateWire::Ended => "ended",
             TabStateWire::Failed => "failed",

@@ -50,7 +50,14 @@ export type ModeKeyState = {
 export function modeKeyRoute(s: ModeKeyState): "overlay" | "cycle" | "fixed" | "none" {
   if (s.confirmOpen || s.chooserOpen) return "overlay";
   if (s.tabState === null) return "none";
-  if (s.tabState === "not_started" || s.tabState === "starting" || s.tabState === "live") return "cycle";
+  if (
+    s.tabState === "not_started" ||
+    s.tabState === "starting" ||
+    s.tabState === "awaiting_trust" ||
+    s.tabState === "live"
+  ) {
+    return "cycle";
+  }
   return s.tabMode === "bypass" ? "cycle" : "fixed";
 }
 

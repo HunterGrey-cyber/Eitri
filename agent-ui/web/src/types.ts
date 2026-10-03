@@ -505,8 +505,9 @@ export type AgentDomainEvent =
 
 /** A session tab's identity for its whole life, and the bridge's (`eitri_core::tabs::TabId`). */
 export type TabId = number;
-/** `eitri_core::agent_bridge::TabStateWire`. */
-export type TabState = "not_started" | "starting" | "live" | "ended" | "failed";
+/** `eitri_core::agent_bridge::TabStateWire`. `awaiting_trust`: a start is put off until the workspace-trust
+ *  question is answered; no session is being opened, so it is not `starting`. */
+export type TabState = "not_started" | "starting" | "awaiting_trust" | "live" | "ended" | "failed";
 /** `eitri_core::tabs::Marker::wire()`. Precedence is Rust's: ⚑ > ✕ > working > •. */
 export type TabMarker = "needs_input" | "ended" | "working" | "unread";
 export type TabInfo = {

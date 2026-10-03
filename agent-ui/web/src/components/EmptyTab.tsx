@@ -176,7 +176,11 @@ export function EmptyTab(props: EmptyTabProps) {
   // only on a count that changed after that.
   const focusAtMount = useRef(props.focusRequest);
   const arriveAtMount = useRef(props.arriveRequest);
-  const starting = tab.state === "starting";
+  /** A start put off until the trust question is answered. Everything that treats a starting tab as busy
+   *  (the composer queues behind it, no dashboard, no focus request) applies to it too, so `starting` stays
+   *  true for it; only what the screen SAYS differs. */
+  const awaitingTrust = tab.state === "awaiting_trust";
+  const starting = tab.state === "starting" || awaitingTrust;
   const failed = tab.state === "failed";
   /** See `modeRef`: `f`/`H`/`L` must still fire on a `failed` tab even though `mode` reads "input"
    *  there (`onKeyDown`'s own "Once the composer is disabled (failed) there is nothing left to type
@@ -203,13 +207,13 @@ export function EmptyTab(props: EmptyTabProps) {
    *  change: `tab.state` already said "starting", this only delays and rewords one sentence. */
   const [stillStarting, setStillStarting] = useState(false);
   useEffect(() => {
-    if (!starting) {
+    if (!starting || awaitingTrust) {
       setStillStarting(false);
       return;
     }
     const timer = setTimeout(() => setStillStarting(true), 10_000);
     return () => clearTimeout(timer);
-  }, [starting, tab.id]);
+  }, [starting, awaitingTrust, tab.id]);
   /** Wave 3 Task 1: what `Composer` actually reads, mirroring `App.tsx`'s own `composerFocusRequest`
    *  -- bumped only from the guarded `focusRequest`/`keysRequest` effects below, so an overlay drawn
    *  over this screen can never have its composer autofocused out from under it. */
@@ -792,7 +796,10 @@ export function EmptyTab(props: EmptyTabProps) {
           {!remedyNamesR(failureProblem) && <div className="row-hint">Press r to start a new session here.</div>}
         </Row>
       )}
-      {starting && (
+      {awaitingTrust && (
+        <p className="connecting">Waiting for your answer to the trust question — nothing has started</p>
+      )}
+      {starting && !awaitingTrust && (
         <>
           <p className="connecting">Starting the agent backend…</p>
           {/* F19 (spec §10.2): irrelevant on an installed build, where nothing gets built at all --

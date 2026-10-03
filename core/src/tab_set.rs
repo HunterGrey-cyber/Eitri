@@ -419,7 +419,8 @@ impl Tab {
     pub fn wire_state(&self) -> TabStateWire {
         match &self.backend {
             TabBackend::NotStarted => TabStateWire::NotStarted,
-            TabBackend::Starting(_) | TabBackend::AwaitingTrust(_) => TabStateWire::Starting,
+            TabBackend::Starting(_) => TabStateWire::Starting,
+            TabBackend::AwaitingTrust(_) => TabStateWire::AwaitingTrust,
             TabBackend::Failed { .. } => TabStateWire::Failed,
             TabBackend::Live(backend) => {
                 let ended = matches!(
@@ -2229,7 +2230,7 @@ impl TabSet {
             return Err("this tab is being handed off to a terminal".to_string());
         }
         match tab.wire_state() {
-            TabStateWire::Starting | TabStateWire::Live => {}
+            TabStateWire::Starting | TabStateWire::AwaitingTrust | TabStateWire::Live => {}
             TabStateWire::NotStarted => return Err("nothing is running to queue behind; Enter sends".to_string()),
             TabStateWire::Ended | TabStateWire::Failed => {
                 return Err("this tab's session has ended; press r to start over".to_string())
@@ -9268,9 +9269,10 @@ mod tests {
     }
 
     #[test]
-    fn a_waiting_tab_is_shown_as_starting() {
+    fn a_waiting_tab_is_shown_as_waiting_for_trust_not_as_starting() {
         let (set, tab, _) = asked(first_send("r1", "hi"));
-        assert_eq!(set.get(tab).unwrap().wire_state(), TabStateWire::Starting);
+        assert_eq!(set.get(tab).unwrap().wire_state(), TabStateWire::AwaitingTrust);
+        assert_eq!(TabStateWire::AwaitingTrust.as_str(), "awaiting_trust");
         assert!(
             set.close_needs_confirm(tab),
             "closing it would lose the message it holds"

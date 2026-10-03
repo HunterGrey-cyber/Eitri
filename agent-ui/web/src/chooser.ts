@@ -78,6 +78,8 @@ export function tabStateWord(info: TabInfo | null): string {
   if (info === null || info.state === "not_started") return "new";
   if (info.state === "failed") return "failed";
   if (info.state === "ended") return "ended";
+  // Nothing is idle about a tab whose start waits for the user's answer.
+  if (info.state === "awaiting_trust") return "trust?";
   if (info.marker === "working") return "running";
   if (info.marker === "needs_input") return "waiting";
   if (info.marker === "unread") return "done, unread";

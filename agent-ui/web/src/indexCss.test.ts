@@ -3201,3 +3201,15 @@ describe("inline code keeps its cell's words and its links' decoration (rc.4 ite
     expect(winningDeclarationOn(code, "text-decoration")).toBeNull();
   });
 });
+
+describe("the start screen's stage", () => {
+  it("is the trust question's containing block and a column like the root, so the band stays below the overlay", () => {
+    const html = '<div class="agent-ui-root"><div class="empty-stage"><div class="trust-prompt"></div></div></div>';
+    expect(winningDeclaration(html, ".empty-stage", "position")).toBe("relative");
+    expect(winningDeclaration(html, ".empty-stage", "display")).toBe("flex");
+    expect(winningDeclaration(html, ".empty-stage", "flex-direction")).toBe("column");
+    // Absolute against the stage (not the root), covering all of it.
+    expect(winningDeclaration(html, ".trust-prompt", "position")).toBe("absolute");
+    expect(winningDeclaration(html, ".trust-prompt", "inset")).toBe("0px");
+  });
+});
