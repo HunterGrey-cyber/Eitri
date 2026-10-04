@@ -702,79 +702,74 @@ impl AgentBackend {
         }
     }
 
-    /// Answers `PermissionRequested` events that need no human and returns events the UI should see.
+    /// Answers permission requests that need no human and returns the events the UI should see.
+    /// Both backends gate every tool call with `PreToolUse`, so the UI's permission policy is
+    /// applied here before deciding whether to show a card.
     ///
-    /// Both backends use a `PreToolUse` gate with matcher `*`. The legacy backend generates the
-    /// hook; the sidecar uses its broker. Permission policy is applied here so a gate request
-    /// need not show a user card for every call.
+    /// Successfully answered requests are hidden from the UI. `ToolCallStarted` and
+    /// `ToolCallCompleted` still show what ran. If sending an answer fails, the request is
+    /// delivered so the user can resolve it instead of leaving an invisible pending request.
     ///
-    /// A successfully answered request is removed from delivery, so no permission card is drawn.
-    /// `ToolCallStarted` and `ToolCallCompleted` still reach the transcript to show what ran.
-    /// If sending the answer fails, the request is delivered so the user can resolve it.
-    ///
-    /// For gate requests, `Bypass` sends `Allow` before classification. The CLI remains gated,
-    /// using `--permission-mode default` with the hook or the sidecar's INTERACTIVE mode.
+    /// `Bypass` allows gate requests before classification. The CLI remains gated, using
+    /// `--permission-mode default` with a hook or the sidecar's INTERACTIVE mode.
     /// The caller supplies `Tab::mode` on every pump; this function stores no mode of its own.
-    /// An id already in `host_answered` is dropped without answering it again.
+    /// An id already in `host_answered` is dropped without another answer or a card.
     ///
-    /// Nothing is answered after `UngatedCliMode`, whether it appears in this batch or was
-    /// already folded into the projection. This applies in both modes. `TabSet::pump` closes
-    /// such sessions and thereby denies pending requests; sending `Allow` here would grant
-    /// permission to a session that is about to close.
+    /// Nothing is answered after `UngatedCliMode`, whether it arrives in this batch or is
+    /// already in the projection. `TabSet::pump` closes the session and thereby denies pending
+    /// requests, so no automatic grant is sent to a session that must be closed.
     ///
-    /// The legacy backend's synchronous resolution is dropped along with its request.
-    /// The sidecar's `PermissionResolved` arrives on a later pump and is delivered even if
-    /// its request was hidden. Filtering `pendingPermissions` by that unseen id is a no-op.
-    /// `TabSet::pump` uses `host_answered` in `SnapshotView::of` and `AttentionTracker::resync`
-    /// to hide answered requests from resync snapshots and the attention tray. This prevents
-    /// an automatically answered request from reappearing as a card in either mode.
+    /// The legacy backend's synchronous resolution is hidden with the answered request.
+    /// The sidecar's `PermissionResolved` arrives on a later pump and is delivered even when
+    /// its request was hidden. Removing pending permissions by id makes this harmless.
     ///
-    /// CLI prompts with `provider_prompt: Some` are handled before gate requests. They can
-    /// follow a gate approval because CLI checks, such as sensitive-file checks, are not
-    /// silenced by a hook's `allow` or a session rule. The classifier and saved prefix rules
-    /// are not used for these prompts. `Bypass` allows them; `Auto` requires an entry in
-    /// `approvals` matching the call's id, tool and input, and consumes that approval.
-    /// Otherwise the prompt is delivered as a card. A prompt marked `needs_a_human`, either
-    /// forced by `permissions.ask` or of an unknown kind, is a card in every mode.
-    /// Each prompt answered without a card adds its row note to `answered_for_you`.
+    /// `host_answered` also keeps answered requests out of resync snapshots and the attention
+    /// tray through `TabSet::pump`, `SnapshotView::of`, and `AttentionTracker::resync`.
+    /// This prevents an answered request from reappearing as a card.
+    ///
+    /// The CLI's own prompts (`provider_prompt: Some`) are handled before gate requests.
+    /// They can ask for checks, such as sensitive files, that a hook allowance or session
+    /// rule does not silence. These prompts bypass the classifier and saved prefix rules.
+    /// In `Auto`, a prompt is allowed only when `approvals` contains the same id, tool and
+    /// input approved on a card; that approval is consumed. Otherwise a card is shown.
+    /// `Bypass` allows these prompts except those marked `needs_a_human`. Those always need
+    /// a card: the user's `permissions.ask` rule forced them, their kind is unknown, or they
+    /// give no reason for asking. A content-scoped ask rule can also give no reason.
+    /// Each prompt answered without a card is added to `answered_for_you` with its row note.
     ///
     /// After `respond_permission` succeeds, a `Write`, `Edit` or `NotebookEdit` allowed by
-    /// the acceptEdits fast path is added to `answered_for_you.by_the_fast_path` by tool-use id.
-    /// Saved prefix rules do not allow these tools. The entry also carries `(tool_name, input)`
-    /// because a later card for the same call may have no tool-use id, preventing removal by
-    /// id alone. An absent card cannot prove fast-path approval: `validateInput` may fail
-    /// before any hook runs, a request may lack a tool-use id, or a switch to bypass may answer
-    /// it. Requests without a tool-use id are answered but have no row to annotate.
+    /// the classifier is added to `answered_for_you.by_the_fast_path` by tool-use id.
+    /// Only the acceptEdits fast path allows these tools under the classifier; saved prefix
+    /// rules do not apply to them. The entry includes `(tool_name, input)` because a later
+    /// card can lack a tool-use id, preventing removal by id alone. Requests without a
+    /// tool-use id are still answered but have no row note.
     ///
-    /// For `Write`, existence at `file_path` is checked just before sending `allow`, before
-    /// the CLI can write the file. A write to a missing file is added to
-    /// `answered_for_you.creates_file` in both the fast path and bypass. `note_new_files`
-    /// only sees delivered cards, so it cannot annotate these automatic answers.
+    /// File existence at `file_path` is checked just before allowing a `Write`, before the
+    /// CLI can write it. A write to a missing file is added to `answered_for_you.creates_file`
+    /// in both the fast path and bypass. `note_new_files` only sees delivered cards, so it
+    /// cannot detect files created by these automatic answers.
     ///
-    /// `classify_with_rules` checks `agent::rule_that_allows` first. A result with
-    /// `classification.reason == REASON_ALLOWED_BY_A_PROJECT_RULE` identifies a saved prefix
-    /// rule as the reason for allowing the call. After `respond_permission` succeeds,
-    /// `agent::rule_that_allows` is called again for the rule's display string, which goes into
-    /// `answered_for_you.by_rule` by tool-use id. The entry includes `(tool_name, input)` to
-    /// match later cards that lack a tool-use id. A rule matching `ToolCallStarted` and no card
-    /// arriving do not prove rule approval: `validateInput` may have failed before the gate,
-    /// or a switch to bypass may have answered the request.
+    /// `classify_with_rules` checks `agent::rule_that_allows` first.
+    /// `REASON_ALLOWED_BY_A_PROJECT_RULE` identifies a saved prefix rule allowance.
+    /// After a successful answer, the rule's display string and `(tool_name, input)` are
+    /// stored in `answered_for_you.by_rule` by tool-use id. The arguments let a later card
+    /// remove the candidate even when that card lacks a tool-use id.
+    /// These notes track actual answers: the absence of a card alone can also mean input
+    /// validation failed before the hook ran, the request had no tool-use id, or bypass
+    /// answered the gate instead of the classifier or saved rule.
     ///
-    /// In `Auto`, gate requests can defer to the CLI's own auto mode. This requires
-    /// `ProviderCapabilities::cli_auto_mode`, both `cli_auto_mode` and `permission_defer` from
-    /// the sidecar, and a current `auto` report in `AgentSessionProjection::cli_runs_auto`.
-    /// A saved prefix rule still allows the request through `agent::rule_that_allows` with
-    /// the usual limits. Otherwise the answer is `PermissionDecision::Defer`: the CLI's
-    /// classifier decides, the local classifier is skipped, and no card is drawn. A refusal
-    /// returns `AgentDomainEvent::PermissionDenied` and the call's error result. If sending
-    /// the deferral fails, the request is delivered as a card.
-    /// The projection is read before each request because ingestion continues during the
-    /// batch. A fallback to `default` restores local classification for the next request;
-    /// an ungated-mode report stops answers. CLI prompts and bypass keep their behavior.
-    /// Sessions without CLI auto mode use the local classifier.
+    /// When the session requested CLI auto mode, the sidecar offered `cli_auto_mode` and
+    /// `permission_defer`, and `AgentSessionProjection::cli_runs_auto` is true, `Auto`
+    /// allows gate requests matched by `agent::rule_that_allows` and otherwise sends
+    /// `PermissionDecision::Defer`. The local classifier is skipped and the CLI's classifier
+    /// decides without a card. A refusal produces `AgentDomainEvent::PermissionDenied` and
+    /// the call's error result. A failed deferral is delivered as a card.
+    /// The projection is read before each request because ingestion can fold a trip or
+    /// fallback during the batch. A fallback to `default` restores local classification;
+    /// a trip stops answers. CLI prompts and bypass keep their behavior.
     ///
-    /// Each event keeps its fold revision from `take_revised_ui_delivery`. A kept event
-    /// retains its revision; a dropped event is removed together with its revision.
+    /// Each event keeps its fold revision from `take_revised_ui_delivery`.
+    /// Dropping an event also drops its revision.
     fn answer_what_needs_no_human(
         &mut self,
         events: Vec<(u64, AgentDomainEvent)>,
@@ -1082,9 +1077,10 @@ impl AgentBackend {
     /// before a resync, but `TabSet::confirm_bypass` calls directly between pumps. The
     /// projection can already contain the report before the tab is marked `Failed`.
     ///
-    /// Prompts forced by `permissions.ask` and unknown prompt kinds remain cards even in
-    /// bypass. `TabSet::waiting_cards` excludes them from the bypass count and list so the
-    /// confirmation count matches what is approved. This check also protects other callers.
+    /// Prompts forced by `permissions.ask`, unknown prompt kinds, and prompts with no reason
+    /// remain cards even in bypass. `TabSet::waiting_cards` excludes them from the bypass
+    /// count and list so the confirmation count matches what is approved. This check also
+    /// protects other callers.
     pub fn approve_pending(&mut self, ids: &[String], why: &str) -> Approved {
         // Its own statement, guard dropped before any answer -- the same lock-order rule the
         // collection below follows.
@@ -2995,7 +2991,7 @@ mod tests {
             answered,
             vec![PromptAnsweredForYou {
                 tool_use_id: "tu-1".into(),
-                note: "Claude Code safety check — allowed in bypass".into(),
+                note: "Claude Code asked — allowed in bypass".into(),
             }]
         );
         backend.shutdown();
@@ -3160,32 +3156,90 @@ mod tests {
             answered,
             vec![PromptAnsweredForYou {
                 tool_use_id: "tu-approved".into(),
-                note: "Claude Code safety check — allowed with your approval".into(),
+                note: "Claude Code asked — allowed with your approval".into(),
             }]
         );
         backend.shutdown();
     }
 
-    /// A prompt that gave no reason is not called a safety check on its row either (review #5).
+    /// A blocked path is not a reason: a path check can sit next to a user's own rule's decision, and the
+    /// prompt bypass may approve (the sensitive-file check) carries its reason and no path. So a prompt
+    /// with a path and no reason -- or an empty or blank reason, which a hook's ask can produce -- is a
+    /// card in bypass and in Auto, and a reason is what lets bypass answer it.
     #[test]
-    fn a_prompt_with_no_reason_is_noted_neutrally() {
+    fn a_prompt_without_a_real_reason_is_a_card_whatever_else_it_carries() {
         let dir = a_workspace_holding_one_file();
-        let (provider, mut backend) = sidecar_backend(&dir);
-        let mut event = provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None);
-        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
-            provider_prompt.as_mut().unwrap().reason = None;
+        let variants: [(&str, Option<&str>, Option<&str>); 3] = [
+            ("path only", None, Some("/p/.git/probe")),
+            ("empty reason", Some(""), Some("/p/.git/probe")),
+            ("blank reason", Some("  \n"), None),
+        ];
+        for (what, reason, blocked_path) in variants {
+            for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
+                let (provider, mut backend) = sidecar_backend(&dir);
+                let mut event = provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None);
+                if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
+                    let prompt = provider_prompt.as_mut().unwrap();
+                    prompt.reason = reason.map(str::to_string);
+                    prompt.blocked_path = blocked_path.map(str::to_string);
+                }
+                provider.queue(event);
+                let mut approvals = HumanApprovals::default();
+                approvals.record("tu-1", "Write", &probe_write());
+                let mut host_answered = BTreeSet::new();
+                let (delivered, answered) = deliver(
+                    &mut backend,
+                    &dir,
+                    &agent::PrefixRules::default(),
+                    mode,
+                    &mut host_answered,
+                    &mut approvals,
+                );
+                assert!(carded(&delivered, "perm-prov"), "{what} {mode:?}: {delivered:?}");
+                assert!(provider.resolutions().is_empty(), "{what} {mode:?}");
+                assert!(host_answered.is_empty() && answered.is_empty(), "{what} {mode:?}");
+                backend.shutdown();
+            }
         }
-        provider.queue(event);
-        let (_, answered) = deliver(
-            &mut backend,
-            &dir,
-            &agent::PrefixRules::default(),
-            PermissionMode::Bypass,
-            &mut BTreeSet::new(),
-            &mut HumanApprovals::default(),
-        );
-        assert_eq!(answered[0].note, "Claude Code asked — allowed in bypass");
-        backend.shutdown();
+    }
+
+    /// A user's content-scoped ask rule reaches Eitri with no reason, no matched rule and no blocked
+    /// path (the CLI names only a bare tool-name rule), so a prompt that explains nothing is a card in
+    /// every mode: not answered in bypass, and not on the strength of the human's approval of the
+    /// gate's card for the same call in Auto.
+    #[test]
+    fn a_prompt_that_explains_nothing_is_a_card_in_every_mode() {
+        let dir = a_workspace_holding_one_file();
+        let echo = serde_json::json!({ "command": "echo zebra" });
+        let mut silent = provider_prompt("perm-silent", Some("tu-1"), "Bash", echo.clone(), None);
+        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut silent {
+            let prompt = provider_prompt.as_mut().unwrap();
+            prompt.reason = None;
+            prompt.description = Some("Print the word zebra".into());
+        }
+        for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
+            let (provider, mut backend) = sidecar_backend(&dir);
+            provider.queue(silent.clone());
+            let mut approvals = HumanApprovals::default();
+            approvals.record("tu-1", "Bash", &echo);
+            let mut host_answered = BTreeSet::new();
+            let (delivered, answered) = deliver(
+                &mut backend,
+                &dir,
+                &agent::PrefixRules::default(),
+                mode,
+                &mut host_answered,
+                &mut approvals,
+            );
+            assert!(carded(&delivered, "perm-silent"), "{mode:?}: {delivered:?}");
+            assert!(provider.resolutions().is_empty(), "{mode:?}");
+            assert!(host_answered.is_empty() && answered.is_empty(), "{mode:?}");
+            assert!(
+                approvals.contains("tu-1"),
+                "{mode:?}: an approval a card kept is not used up"
+            );
+            backend.shutdown();
+        }
     }
 
     /// Fail toward a card, as every automatic answer here does: an allow of the CLI's own prompt that

@@ -509,30 +509,46 @@ pub struct ProviderPrompt {
     pub matched_ask_rule: Option<MatchedAskRule>,
     /// Set, to the raw wire value, when the sidecar named an `origin` this build does not know (a
     /// sidecar newer than this client). Such a prompt is a card in every mode, like one an ask rule
-    /// forced (O3 review #3): what a future kind of ask means cannot be judged here, so nothing
+    /// forced: what a future kind of ask means cannot be judged here, so nothing
     /// automatic answers it. `None` for every origin this build knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unrecognized_origin: Option<i32>,
 }
 
 impl ProviderPrompt {
-    /// Whether only a human may answer this prompt, in every mode: the user's own ask rule forced it
-    ///, or its kind is unknown to this build (review #3). Bypass, the Auto approval
-    /// rule, a bypass entry's `y` and the bypass resync sweep all leave such a prompt a card.
+    /// Whether only a human may answer this prompt, in every mode: the user's own ask rule forced it,
+    /// its kind is unknown to this build, or it does not say why it asked. The last case is what a
+    /// content-scoped ask rule (`Edit(file)`, `Bash(echo:*)`) looks like: the CLI names only a bare
+    /// tool-name rule (`matched_ask_rule`) and leaves its reason out for a rule it matched itself, so
+    /// such a prompt arrives with no reason and no matched rule, exactly like any other prompt that
+    /// explains nothing. A prompt that explains nothing is a card. Bypass, the Auto approval rule, a
+    /// bypass entry's `y` and the bypass resync sweep all leave such a prompt a card.
     pub fn needs_a_human(&self) -> bool {
-        self.matched_ask_rule.is_some() || self.unrecognized_origin.is_some()
+        self.matched_ask_rule.is_some() || self.unrecognized_origin.is_some() || self.says_nothing_about_why()
+    }
+
+    /// No matched ask rule and no reason of the CLI's own (an empty or blank one is none): nothing that
+    /// tells a prompt the CLI raised itself from the user's own rule. A blocked path is not a reason: a
+    /// path check can sit next to a rule's decision, and the measured prompt that bypass may approve
+    /// carries its reason and no path.
+    fn says_nothing_about_why(&self) -> bool {
+        self.matched_ask_rule.is_none() && self.reason.as_deref().is_none_or(|reason| reason.trim().is_empty())
     }
 
     /// Whose question this is, in the words a card and a row note use: the user's own ask rule when
-    /// one forced it; "Claude Code safety check" when the CLI gave its reason (every measured prompt
-    /// did: the sensitive-file check); otherwise the neutral "Claude Code asked" (review #5), which is
-    /// also what an unknown kind of prompt is called.
+    /// one forced it; when the CLI gave no reason, "Claude Code asked (maybe your ask rule)", since a
+    /// content-scoped ask rule of the user's looks exactly like that; and the neutral "Claude Code
+    /// asked" otherwise (a prompt of a kind this build does not know, or one that gave its reason,
+    /// which a card shows verbatim): the wire does not say whether a reason came from the CLI's own
+    /// check or from a hook of the user's, so the label claims no more.
     pub fn label(&self) -> String {
-        match (&self.matched_ask_rule, self.unrecognized_origin, &self.reason) {
-            (Some(rule), _, _) => format!("your ask rule: {}", rule.display()),
-            (None, None, Some(_)) => "Claude Code safety check".to_string(),
-            _ => "Claude Code asked".to_string(),
+        if let Some(rule) = &self.matched_ask_rule {
+            return format!("your ask rule: {}", rule.display());
         }
+        if self.unrecognized_origin.is_none() && self.says_nothing_about_why() {
+            return "Claude Code asked (maybe your ask rule)".to_string();
+        }
+        "Claude Code asked".to_string()
     }
 }
 

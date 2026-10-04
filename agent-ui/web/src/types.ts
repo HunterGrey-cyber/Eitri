@@ -38,8 +38,8 @@ export type ToolCallRecord = {
    *  raised at all, over a path that did not exist when the call started. Either way: a completed
    *  row reads "Creates a new file" rather than the overwrite warning. */
   createsFile?: boolean;
-  /** A display note for a CLI prompt answered without a card, in bypass or through user approval.
-   *  Absent on every other call. */
+  /** The CLI's own prompt for this call was answered without a card -- "Claude Code
+   *  asked — allowed in bypass" / "— allowed with your approval". Absent on every other call. */
   promptNote?: string;
   /** This `Write`/`Edit`/`NotebookEdit` was answered by the acceptEdits fast path
    *  (`agent::permission_policy`) with no card. Absent on every other call, a carded or

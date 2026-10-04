@@ -104,9 +104,9 @@ describe("renderToolCall", () => {
   /** A call whose CLI prompt was answered without a card shows a muted note, like a call answered
    *  by a saved rule. Calls without that note show no such text. */
   it("says when the CLI's own prompt for a call was answered without a card", () => {
-    const { container } = render(<>{renderToolCall(call({ name: "Write", promptNote: "Claude Code safety check — allowed in bypass" }))}</>);
+    const { container } = render(<>{renderToolCall(call({ name: "Write", promptNote: "Claude Code asked — allowed in bypass" }))}</>);
     const note = container.querySelector(".tool-prompt-note");
-    expect(note?.textContent).toBe("Claude Code safety check — allowed in bypass");
+    expect(note?.textContent).toBe("Claude Code asked — allowed in bypass");
     expect(note?.classList.contains("tool-rule-note")).toBe(true);
     cleanup();
     const plain = render(<>{renderToolCall(call({}))}</>);
