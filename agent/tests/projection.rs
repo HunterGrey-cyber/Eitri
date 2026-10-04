@@ -270,10 +270,11 @@ fn a_gate_request_serializes_unchanged_and_a_provider_prompt_carries_its_words()
     assert_eq!(json["provider_prompt"]["matched_ask_rule"]["rule_content"], "cat:*");
 }
 
-/// Which CLI prompts no automatic path may answer (O3 ruling 4 and review #3): one the user's own ask
-/// rule forced, and one whose origin this build does not know. A plain one (the sensitive-file check)
-/// is not among them. And the label a card and a row note use: the CLI's own check when it gave a
-/// reason, a neutral "Claude Code asked" when it gave none or its kind is unknown (review #5).
+/// Which CLI prompts no automatic path may answer: one the user's own ask rule forced, one whose
+/// origin this build does not know, and one that gives no reason (a content-scoped ask rule
+/// looks like that, and a blocked path is not a reason). A plain one (the sensitive-file check, which gives its reason) is not among
+/// them. And the label a card and a row note use: one that gave a reason does not claim to be a safety
+/// check, since a user's own hook can ask with a reason too.
 #[test]
 fn which_cli_prompts_need_a_human_and_what_they_are_called() {
     let plain = agent::ProviderPrompt {
@@ -281,11 +282,35 @@ fn which_cli_prompts_need_a_human_and_what_they_are_called() {
         ..Default::default()
     };
     assert!(!plain.needs_a_human());
-    assert_eq!(plain.label(), "Claude Code safety check");
+    assert_eq!(plain.label(), "Claude Code asked");
 
+    // The CLI names only a bare tool-name rule, so a content-scoped one (`Edit(file)`,
+    // `Bash(echo:*)`) arrives with no reason, no matched rule and no blocked path: indistinguishable
+    // from the user's own rule, so a human's.
     let silent = agent::ProviderPrompt::default();
-    assert!(!silent.needs_a_human());
-    assert_eq!(silent.label(), "Claude Code asked");
+    assert!(silent.needs_a_human());
+    assert_eq!(silent.label(), "Claude Code asked (maybe your ask rule)");
+    let described = agent::ProviderPrompt {
+        description: Some("first.txt".into()),
+        ..Default::default()
+    };
+    assert!(described.needs_a_human(), "a description says nothing about why");
+
+    // A blocked path is not a reason, and neither is an empty or blank one: a path check can sit
+    // beside a user's own rule's decision, and a hook's ask can carry an empty reason.
+    for reason in [None, Some(""), Some("  \n")] {
+        let no_reason = agent::ProviderPrompt {
+            reason: reason.map(str::to_string),
+            blocked_path: Some("/p/.git/probe".into()),
+            ..Default::default()
+        };
+        assert!(no_reason.needs_a_human(), "{reason:?}");
+        assert_eq!(
+            no_reason.label(),
+            "Claude Code asked (maybe your ask rule)",
+            "{reason:?}"
+        );
+    }
 
     let ruled = agent::ProviderPrompt {
         matched_ask_rule: Some(agent::MatchedAskRule {

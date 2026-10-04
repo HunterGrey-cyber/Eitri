@@ -775,6 +775,8 @@ mod tests {
         match translate(event) {
             Some(AgentDomainEvent::PermissionRequested { provider_prompt, .. }) => {
                 assert_eq!(provider_prompt, Some(crate::ProviderPrompt::default()));
+                // It names no reason, rule or path, so nothing tells it from the user's own rule.
+                assert!(provider_prompt.unwrap().needs_a_human());
             }
             other => panic!("expected a PermissionRequested, got {other:?}"),
         }

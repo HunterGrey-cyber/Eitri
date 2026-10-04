@@ -122,9 +122,8 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
   );
 }
 
-/** O3 ruling 6: whose question this card is when the CLI itself asked (after the gate had already
- *  answered the call): a small label -- Claude Code's own safety check, or the user's own ask rule
- *  when one forced the prompt -- and the CLI's own sentence, verbatim (it is prose, never parsed;
+/** Whose question this card is when the CLI itself asked (after the gate had already answered the
+ *  call): a small label -- Claude Code asking, or the user's own ask rule when one forced the prompt -- and the CLI's own sentence, verbatim (it is prose, never parsed;
  *  its path is the CLI's, absolute). Answered like any card: same buttons, keys and permission id. */
 function ProviderPromptLine({ prompt }: { prompt: ProviderPrompt }) {
   const rule = prompt.matchedAskRule;
@@ -139,11 +138,14 @@ function ProviderPromptLine({ prompt }: { prompt: ProviderPrompt }) {
 }
 
 /** Whose question it is (Rust's `ProviderPrompt::label`, which names the row notes too): the user's
- *  own ask rule; "Claude Code safety check" only when the CLI said why; otherwise -- no reason, or a
- *  kind of prompt this build does not know -- the neutral "Claude Code asked" (O3 review #5, #3). */
+ *  own ask rule; a prompt of a kind this build does not know is the neutral "Claude Code asked"; one
+ *  that gave no reason (an empty or blank one is none; a blocked path is not one) could be the user's
+ *  own content-scoped ask rule (the CLI does not name those), so it says so; anything else is the
+ *  neutral "Claude Code asked" too, the reason shown beside it. */
 function providerPromptLabel(prompt: ProviderPrompt): string {
   if (prompt.matchedAskRule) return `your ask rule: ${askRuleText(prompt.matchedAskRule)}`;
-  if (prompt.unrecognizedOrigin == null && prompt.reason) return "Claude Code safety check";
+  if (prompt.unrecognizedOrigin != null) return "Claude Code asked";
+  if (!prompt.reason?.trim()) return "Claude Code asked (maybe your ask rule)";
   return "Claude Code asked";
 }
 

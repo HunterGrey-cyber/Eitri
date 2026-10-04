@@ -1331,7 +1331,7 @@ pub struct CallNotes {
     /// overwriting one it cannot see.
     pub creates_file: BTreeMap<String, Option<String>>,
     /// Tool-use id -> the note for a call whose CLI prompt Eitri answered without a card (O3 review
-    /// item 7): "Claude Code safety check — allowed in bypass" / "— allowed with your approval".
+    /// item 7): "Claude Code asked — allowed in bypass" / "— allowed with your approval".
     pub prompt_notes: BTreeMap<String, String>,
     /// Tool-use ids of a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered without a
     /// card (v1 trial item 7, `agent::permission_policy`'s module doc, "The acceptEdits fast path").

@@ -40,8 +40,10 @@
 //! worlds card -- a project `permissions.ask` rule, or a path outside the project -- and the tests
 //! about "nothing runs ungated" accept an answer the host gave itself ([`GateTrace`]) as proof that
 //! the gate saw the call, where they used to look only for a card. A card an ask rule forces is the
-//! human's in every mode, so entering bypass leaves it waiting (test 6a); a card that entering bypass
-//! does approve needs the host's own policy to have raised it, which only legacy does (test 6b).
+//! human's in every mode, and so is one that explains nothing, which is how a content-scoped ask rule
+//! reaches the host on CLI 2.1.288, so entering bypass leaves either waiting and a bypass tab cards
+//! them (test 6a); a card that entering bypass does approve needs the host's own policy to have raised
+//! it, which only legacy does (test 6b).
 //!
 //! **A run that did not exercise what a test is about fails as INCONCLUSIVE** (v1-mode fix round 1,
 //! after Codex's findings 2-4): test 1b needs exactly five Reads each paired with its own resolution
@@ -232,7 +234,7 @@ fn events_from_payload(payload: Option<&str>) -> Vec<serde_json::Value> {
     }
     for note in value["promptNotes"].as_array().into_iter().flatten() {
         if let Some(id) = note["toolUseId"].as_str() {
-            events.push(serde_json::json!({ "type": "answered_prompt", "tool_use_id": id }));
+            events.push(serde_json::json!({ "type": "answered_prompt", "tool_use_id": id, "note": note["note"] }));
         }
     }
     events
@@ -260,6 +262,9 @@ struct GateTrace {
     answered: Vec<(String, Option<String>, String)>,
     /// Tool-use ids of calls whose CLI prompt (not the gate's request) the host answered.
     prompt_answered: BTreeSet<String>,
+    /// Tool-use id -> the row note of the CLI's own prompt the host answered for that call
+    /// ("Claude Code asked -- allowed in bypass"): its first words say whether the prompt gave a reason.
+    prompt_notes: BTreeMap<String, String>,
     /// Tool-use id -> tool name, for every call that started.
     calls: BTreeMap<String, String>,
     /// Tool-use id -> the input the call started with.
@@ -321,6 +326,7 @@ impl GateTrace {
             root: root.to_path_buf(),
             answered: Vec::new(),
             prompt_answered: BTreeSet::new(),
+            prompt_notes: BTreeMap::new(),
             calls: BTreeMap::new(),
             call_inputs: BTreeMap::new(),
             completed: BTreeMap::new(),
@@ -384,6 +390,12 @@ impl GateTrace {
                         self.resolved
                             .entry(id.to_string())
                             .or_insert_with(|| event["outcome"].as_str().unwrap_or_default().to_string());
+                    }
+                }
+                Some("answered_prompt") => {
+                    if let Some(id) = tool_use_id {
+                        self.prompt_notes
+                            .insert(id, event["note"].as_str().unwrap_or_default().to_string());
                     }
                 }
                 Some("answered_for_you") => {
@@ -1568,12 +1580,22 @@ fn protected_paths_under_default_with_hook_allow() {
         let ran = target.exists();
         println!(
             "[v1-mode] test4 bypass write {rel}: ran={ran} writes={:?} results={:?} requests_delivered={requested} \
-             host_answered={:?} prompt_answered={:?}",
+             host_answered={:?} prompt_answered={:?} prompt_notes={:?}",
             bypass_trace.writes_to(Path::new(rel)),
             bypass_trace.completed,
             bypass_trace.host_answered(),
-            bypass_trace.prompt_answered
+            bypass_trace.prompt_answered,
+            bypass_trace.prompt_notes
         );
+        // Bypass answers a CLI prompt only when it gives a reason: one that explains nothing could be the
+        // user's own ask rule and is a card, so any prompt answered here was labelled as a plain ask,
+        // never as "maybe your ask rule".
+        for (call, note) in &bypass_trace.prompt_notes {
+            assert!(
+                note.starts_with("Claude Code asked") && !note.contains("maybe your ask rule"),
+                "{rel}: bypass answered the CLI's own prompt for {call} though it gave no reason: {note:?}"
+            );
+        }
         assert_eq!(
             requested, 0,
             "{rel}: bypass draws no card, the CLI's own prompt included"
@@ -2052,27 +2074,61 @@ struct WaitingCard {
     prompt: Option<agent::ProviderPrompt>,
 }
 
-/// Pumps until the tab's session holds a pending request for a call that names `file`, and returns it,
-/// or panics saying which one never came. A card for any other call is not it. Read from the projection
-/// and copied out, so nothing is asserted while its lock is held: a panic then would poison it and turn
-/// the failure into an abort during teardown.
+/// Pumps until a card for a call that names `file` has been delivered to the panel, and returns it, or
+/// panics saying which one never came. A card for any other call is not it.
+///
+/// **Delivered, not merely pending.** On a session whose CLI runs its own `auto` the host defers the
+/// gate's request at once, and that request sits in the projection's pending set until the sidecar's
+/// resolution of it folds, tens of milliseconds later. Reading the pending set would sometimes return
+/// that request -- one nobody is ever asked, with no provider prompt -- instead of the CLI's own prompt
+/// that follows it. So the card is the one the pump itself delivered as a `permission_requested`
+/// event, and one the host has answered is skipped. Its fields are then read from the projection,
+/// copied out so nothing is asserted while its lock is held: a panic then would poison it and turn the
+/// failure into an abort during teardown.
 fn wait_for_the_card_for(set: &mut TabSet, dir: &Path, tab: TabId, file: &str, what: &str) -> WaitingCard {
     let deadline = Instant::now() + Duration::from_secs(120);
+    // Every card id delivered so far, over all pumps: a card delivered in one pump is looked up in a
+    // later one if the projection did not hold it yet, and one delivered inside a snapshot (a resync
+    // replaces the events) counts like one delivered as an event.
+    let mut delivered: BTreeSet<String> = BTreeSet::new();
     loop {
-        set.pump(dir, true);
-        let found = set
-            .get(tab)
-            .unwrap()
-            .live()
-            .unwrap()
-            .projection()
-            .pending_permissions
-            .values()
-            .find(|request| input_is_for(&request.input, dir, file))
-            .map(|request| WaitingCard {
-                permission_id: request.permission_id.clone(),
-                tool_use_id: request.tool_use_id.clone().filter(|t| !t.is_empty()),
-                prompt: request.provider_prompt.clone(),
+        let out = set.pump(dir, true);
+        delivered.extend(
+            events_from_payload(out.active_payload.as_deref())
+                .iter()
+                .filter(|event| event["type"] == "permission_requested" && input_is_for(&event["input"], dir, file))
+                .filter_map(|event| event["permission_id"].as_str().map(str::to_string)),
+        );
+        if let Some(payload) = out.active_payload.as_deref() {
+            let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+            if value["kind"] == "snapshot" {
+                delivered.extend(
+                    value["state"]["pendingPermissions"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|card| input_is_for(&card["input"], dir, file))
+                        .filter_map(|card| card["permissionId"].as_str().map(str::to_string)),
+                );
+            }
+        }
+        let tab_ref = set.get(tab).unwrap();
+        let host_answered: BTreeSet<&str> = tab_ref
+            .gate_answers()
+            .iter()
+            .map(|answer| answer.permission_id.as_str())
+            .collect();
+        let found = delivered
+            .iter()
+            .filter(|id| !host_answered.contains(id.as_str()))
+            .find_map(|id| {
+                let backend = tab_ref.live().unwrap();
+                let projection = backend.projection();
+                projection.pending_permissions.get(id).map(|request| WaitingCard {
+                    permission_id: request.permission_id.clone(),
+                    tool_use_id: request.tool_use_id.clone().filter(|t| !t.is_empty()),
+                    prompt: request.provider_prompt.clone(),
+                })
             });
         if let Some(card) = found {
             return card;
@@ -2125,20 +2181,18 @@ fn deny_cards_until_the_turn_ends(set: &mut TabSet, dir: &std::path::Path, tab: 
     }
 }
 
-/// Test 6a: entering bypass leaves a card the user's own `permissions.ask` rule forced exactly where
-/// it was. A bare `Write` rule is the spelling on CLI 2.1.288 whose prompt names the rule
-/// (`matched_ask_rule`), which makes it the human's in every mode: `cycle_mode` lists nothing to
-/// approve, says the card stays, `confirm_bypass` approves nothing and the write does not happen until
-/// the human answers. The opposite half, a card that entering bypass does approve, is test 6b.
-#[test]
-#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
-fn entering_bypass_leaves_an_ask_rule_card_waiting() {
-    let label = "mid-turn-bypass-ask-rule";
+/// What test 6a does for one spelling of the ask rule: entering bypass leaves a card the user's own
+/// `permissions.ask` rule forced exactly where it was. `cycle_mode` lists nothing to approve, says the
+/// card stays, `confirm_bypass` approves nothing and the write does not happen until the human answers.
+/// Whether the CLI names the rule in its prompt (`matched_ask_rule`) is printed, not asserted: a bare
+/// tool-name rule does on CLI 2.1.288 and a content-scoped one does not, and either way the prompt must
+/// be the human's.
+fn bypass_leaves_the_ask_rule_card_waiting(label: &str, ask_rule: &str) {
     let dir = project(label);
     std::fs::create_dir_all(dir.join(".claude")).unwrap();
     std::fs::write(
         dir.join(".claude/settings.json"),
-        serde_json::json!({ "permissions": { "ask": ["Write"] } }).to_string(),
+        serde_json::json!({ "permissions": { "ask": [ask_rule] } }).to_string(),
     )
     .unwrap();
     // Trusted (`auto_tab`), so the project's ask rule is loaded.
@@ -2161,9 +2215,16 @@ fn entering_bypass_leaves_an_ask_rule_card_waiting() {
     let prompt = card
         .prompt
         .unwrap_or_else(|| panic!("the card is the CLI's own prompt, not the host's policy"));
+    println!(
+        "[v1-mode] test6a {ask_rule}: prompt reason={:?} blocked_path={:?} matched_ask_rule={:?} label={:?}",
+        prompt.reason,
+        prompt.blocked_path,
+        prompt.matched_ask_rule,
+        prompt.label()
+    );
     assert!(
         prompt.needs_a_human(),
-        "the project's ask rule forced this prompt, so only a human answers it: {prompt:?}"
+        "the project's ask rule {ask_rule} forced this prompt, so only a human answers it: {prompt:?}"
     );
 
     let plan = match set.cycle_mode(tab).unwrap() {
@@ -2226,15 +2287,87 @@ fn entering_bypass_leaves_an_ask_rule_card_waiting() {
     assert!(!dir.join("first.txt").exists(), "denied: nothing written");
 }
 
+/// Test 6a, a bare tool-name rule: the spelling on CLI 2.1.288 whose prompt names the rule
+/// (`matched_ask_rule`), which makes it the human's in every mode. The opposite half, a card that
+/// entering bypass does approve, is test 6b.
+#[test]
+#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
+fn entering_bypass_leaves_an_ask_rule_card_waiting() {
+    bypass_leaves_the_ask_rule_card_waiting("mid-turn-bypass-ask-rule", "Write");
+}
+
+/// Test 6a, a content-scoped rule: on CLI 2.1.288 its prompt arrives with no reason, no matched rule
+/// and no blocked path, because the CLI leaves `decision_reason` out for a rule it matched itself and
+/// the Agent SDK drops the reason type. A prompt that explains nothing is a card in every mode, so it
+/// stays waiting here just as the bare rule's does. (Entering bypass used to approve it, and the write
+/// ran, in 4 of 4 runs.)
+#[test]
+#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
+fn entering_bypass_leaves_a_content_scoped_ask_rule_card_waiting() {
+    bypass_leaves_the_ask_rule_card_waiting("mid-turn-bypass-ask-rule-scoped", "Edit(first.txt)");
+}
+
+/// Test 6a, a content-scoped rule on a tab that is ALREADY in bypass: there is no confirm to leave the
+/// card out of, so this is the path that used to answer the CLI's prompt `allow` with no card at all.
+/// The call must still reach a card, and nothing is written until the human answers it.
+#[test]
+#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
+fn a_bypass_tab_cards_a_content_scoped_ask_rule_prompt() {
+    let dir = project("bypass-tab-ask-rule-scoped");
+    std::fs::create_dir_all(dir.join(".claude")).unwrap();
+    std::fs::write(
+        dir.join(".claude/settings.json"),
+        serde_json::json!({ "permissions": { "ask": ["Edit(first.txt)"] } }).to_string(),
+    )
+    .unwrap();
+    let (mut set, tab) = bypass_tab(BackendKind::Sidecar, &dir);
+    set.get_mut(tab)
+        .unwrap()
+        .live_mut()
+        .unwrap()
+        .send_turn(
+            "Use the Write tool to create a file named first.txt in the current directory containing \
+             the word ok.",
+            "first-write",
+        )
+        .map_err(|e| e.message)
+        .unwrap();
+    let card = wait_for_the_card_for(&mut set, &dir, tab, "first.txt", "the ask-rule card in a bypass tab");
+    let prompt = card
+        .prompt
+        .clone()
+        .unwrap_or_else(|| panic!("the card is the CLI's own prompt, not the host's policy"));
+    assert!(prompt.needs_a_human(), "{prompt:?}");
+    for _ in 0..30 {
+        set.pump(&dir, true);
+        std::thread::sleep(Duration::from_millis(33));
+    }
+    assert!(
+        !dir.join("first.txt").exists(),
+        "nothing is written before the human answers"
+    );
+    let _ = set.get_mut(tab).unwrap().live_mut().unwrap().respond_permission(
+        &card.permission_id,
+        PermissionDecision::Deny {
+            reason: Some("v1-mode probe".into()),
+        },
+    );
+    deny_cards_until_the_turn_ends(&mut set, &dir, tab, "after the denial");
+    assert!(!dir.join("first.txt").exists(), "denied: nothing written");
+}
+
 /// What test 6b does on either backend: a card is waiting, entering bypass lists exactly that card and
 /// approves it, the write lands, leaving bypass is immediate (D6), and a second such call cards again
 /// on the now-auto tab (denied, to leave nothing behind). `ask_rules` go into the project's settings
 /// (trusted, so loaded) when given.
 ///
 /// The waiting card must be one bypass may approve: the host's own policy raised it, or the CLI did
-/// for a reason that is not a user rule it can name (`needs_a_human` false). The precondition is
-/// asserted, so a CLI that changes what it reports fails here with that said, not as a plan that
-/// lists nothing.
+/// and said why (`needs_a_human` false). The precondition is asserted, so a CLI that changes what it
+/// reports fails here with that said, not as a plan that lists nothing. Only legacy has such a card to
+/// offer in a test: on a sidecar whose CLI runs `auto` the host defers every gate request, so no card
+/// of the host's exists, and the CLI's own sensitive-file prompt, the one that carries a reason, does
+/// not arise there (test 4 prints which); the one a CLI in `default` raises is checked by test 4 on a
+/// sidecar that does not offer the CLI's auto mode.
 fn bypass_approves_the_waiting_card(
     kind: BackendKind,
     label: &str,
@@ -2345,23 +2478,6 @@ fn bypass_approves_the_waiting_card(
         "a call for second.txt cards again now that the tab is back in auto (D6)"
     );
     assert!(!dir.join("second.txt").exists(), "denied: nothing written");
-}
-
-/// Test 6b, sidecar: `Edit(first.txt)` makes the CLI ask about the `Write` of `first.txt`, and on CLI
-/// 2.1.288 that prompt names no ask rule (`matched_ask_rule` is empty; a bare `Write` rule does name
-/// it, test 6a), so the host treats it as an ordinary CLI prompt: a card in Auto and one that entering
-/// bypass approves. A `Write(first.txt)` or a bare `Edit` rule draws no card at all on that build, so
-/// this spelling is the one that gives the sidecar a card to approve.
-#[test]
-#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
-fn entering_bypass_mid_turn_approves_the_waiting_card() {
-    bypass_approves_the_waiting_card(
-        BackendKind::Sidecar,
-        "mid-turn-bypass",
-        &["Edit(first.txt)", "Edit(second.txt)"],
-        "Use the Write tool to create a file named first.txt in the current directory containing the word ok.",
-        "Use the Write tool to create a file named second.txt in the current directory containing the word ok.",
-    );
 }
 
 /// Test 6b, legacy: Eitri's own policy answers the gate there, and a `Bash` command with a redirect

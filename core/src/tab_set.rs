@@ -2880,7 +2880,8 @@ fn note_new_files(
 /// Only `projection()` is read, once, and released before anything else is touched.
 /// The delivered cards this tab could approve right now (R06/S2, spec §3.3): its own attention
 /// tray, intersected with the projection's still-pending ids and with anything it has not already
-/// host-answered, less any CLI prompt the user's own ask rule forced (O3), `seq`-ordered (the order
+/// host-answered, less any CLI prompt only a human answers (the user's own ask rule's, one of unknown kind, or one
+/// that gives no reason), `seq`-ordered (the order
 /// the panel shows them in). Empty unless the tab is
 /// `Live` -- a `NotStarted`/`Starting`/`Failed` tab has no session to hold a pending request at all.
 ///
@@ -2900,8 +2901,8 @@ fn waiting_cards(tab: &Tab) -> Vec<String> {
             .pending_permissions
             .values()
             .filter(|p| cards.contains(&p.permission_id) && !tab.host_answered.contains(&p.permission_id))
-            // O3 ruling 4 / review #3: a CLI prompt only a human answers (an ask rule's, or one of
-            // unknown kind) is a card in bypass too, so entering bypass neither counts nor approves
+            // A CLI prompt only a human answers (an ask rule's, one of unknown kind, or one that gives
+            // no reason for asking) is a card in bypass too, so entering bypass neither counts nor approves
             // it (`approve_pending` would skip it); `staying_cards` counts it for the prompt instead.
             .filter(|p| !p.provider_prompt.as_ref().is_some_and(|prompt| prompt.needs_a_human()))
             .map(|p| (p.seq, p.permission_id.clone()))
@@ -7629,6 +7630,95 @@ mod tests {
         shut_down_all(&mut set);
     }
 
+    /// A user's content-scoped ask rule (`Edit(file)`, `Bash(echo:*)`) reaches Eitri as a prompt that
+    /// names no reason or rule. It is a card a bypass entry leaves waiting, and so is one that only
+    /// describes its subject or names a path; a prompt that gives its reason is still approved.
+    #[test]
+    fn entering_bypass_leaves_a_prompt_that_explains_nothing() {
+        let dir = workspace("bypass-entry-silent-prompt");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let silent = |id: &str, tool_use_id: &str, command: &str| {
+            let mut event = cli_prompt(id, tool_use_id, "Bash", serde_json::json!({ "command": command }), None);
+            if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
+                let prompt = provider_prompt.as_mut().unwrap();
+                prompt.reason = None;
+                prompt.description = Some("Print the word zebra".into());
+            }
+            event
+        };
+        provider.queue(silent("perm-silent", "toolu_s", "echo zebra"));
+        let mut by_path = cli_prompt(
+            "perm-path",
+            "toolu_p",
+            "Write",
+            serde_json::json!({ "file_path": ".git/x" }),
+            None,
+        );
+        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut by_path {
+            let prompt = provider_prompt.as_mut().unwrap();
+            prompt.reason = None;
+            prompt.blocked_path = Some("/p/.git/x".into());
+        }
+        provider.queue(by_path);
+        provider.queue(cli_prompt(
+            "perm-reason",
+            "toolu_r",
+            "Write",
+            serde_json::json!({ "file_path": ".git/y" }),
+            None,
+        ));
+        until("three cards", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 3
+        });
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(plan.approve, vec!["perm-reason".to_string()]);
+        assert!(
+            plan.lines
+                .iter()
+                .any(|l| l.contains("2 cards") && l.contains("stay waiting")),
+            "{:?}",
+            plan.lines
+        );
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 1,
+                resolved: Vec::new()
+            })
+        );
+        let resolved_ids: Vec<String> = provider.resolutions().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(resolved_ids, vec!["perm-reason".to_string()]);
+        assert!(set
+            .get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .pending_permissions
+            .contains_key("perm-silent"));
+        assert!(set
+            .get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .pending_permissions
+            .contains_key("perm-path"));
+
+        // In the bypass tab itself the same prompt is still a card, never answered unasked.
+        provider.queue(silent("perm-silent-2", "toolu_s2", "echo again"));
+        until("the second silent card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 3
+        });
+        assert!(!provider.resolutions().iter().any(|(id, _)| id == "perm-silent-2"));
+        shut_down_all(&mut set);
+    }
+
     /// `answer_card` names what it could not answer the way the panel's own path always did.
     #[test]
     fn answering_a_card_on_a_tab_with_no_session_is_refused() {
@@ -7809,12 +7899,12 @@ mod tests {
         });
         assert_eq!(
             notes,
-            serde_json::json!([{ "toolUseId": "toolu_n", "note": "Claude Code safety check — allowed in bypass" }])
+            serde_json::json!([{ "toolUseId": "toolu_n", "note": "Claude Code asked — allowed in bypass" }])
         );
         let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
         assert_eq!(
             snapshot["state"]["toolCalls"][0]["promptNote"],
-            "Claude Code safety check — allowed in bypass"
+            "Claude Code asked — allowed in bypass"
         );
         shut_down_all(&mut set);
     }

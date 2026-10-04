@@ -222,17 +222,19 @@ pub fn bypass_prompt(scope: PromptScope, waiting: usize) -> String {
     }
 }
 
-/// The consequence line under a bypass prompt when cards stay waiting after `y` (O3 review #6): a
-/// CLI prompt the user's own ask rule forced, or one of a kind this build does not know, is a card
-/// in bypass too, and `y` does not approve it -- so the prompt says so rather than leaving it to be
-/// found afterwards. English like the prompt above it (K09); the verb agrees with the count.
+/// The consequence line under a bypass prompt when cards stay waiting after `y`: a CLI prompt only a
+/// human answers (the user's own ask rule's, one that gives no reason for asking, or one of a kind
+/// this build does not know) is a card in bypass too, and `y` does not approve it -- so the prompt says
+/// so rather than leaving it to be found afterwards. It claims no more than Eitri knows: a prompt
+/// without a reason is only possibly the user's own rule. English like the prompt above it; the verb
+/// agrees with the count.
 pub fn bypass_staying_line(staying: usize) -> String {
     let (cards, stay) = if staying == 1 {
         ("card", "stays")
     } else {
         ("cards", "stay")
     };
-    format!("{staying} {cards} your own ask rules force {stay} waiting after the switch")
+    format!("{staying} {cards} only you can answer {stay} waiting after the switch")
 }
 
 /// tmux's `confirm-before`, plus a line for each consequence that applies (spec §3.5).
@@ -605,17 +607,17 @@ mod tests {
         );
     }
 
-    /// The consequence line under the prompt (O3 review #6), in English and agreeing with its count:
+    /// The consequence line under the prompt in English and agreeing with its count:
     /// one card "stays", several "stay".
     #[test]
     fn the_staying_line_agrees_with_its_count() {
         assert_eq!(
             bypass_staying_line(1),
-            "1 card your own ask rules force stays waiting after the switch"
+            "1 card only you can answer stays waiting after the switch"
         );
         assert_eq!(
             bypass_staying_line(2),
-            "2 cards your own ask rules force stay waiting after the switch"
+            "2 cards only you can answer stay waiting after the switch"
         );
         for staying in [1, 2, 7] {
             assert!(bypass_staying_line(staying).is_ascii(), "{staying}");

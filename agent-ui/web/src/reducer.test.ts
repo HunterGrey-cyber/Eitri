@@ -914,11 +914,11 @@ describe("applyCallNotes (v1 polish F18, F22)", () => {
     }
     const next = applyCallNotes(state, {
       promptNotes: [
-        { toolUseId: "toolu_2", note: "Claude Code safety check — allowed with your approval" },
+        { toolUseId: "toolu_2", note: "Claude Code asked — allowed with your approval" },
         { toolUseId: "toolu_gone", note: "x" },
       ],
     });
-    expect(next.toolCalls.map((c) => c.promptNote)).toEqual([undefined, "Claude Code safety check — allowed with your approval"]);
+    expect(next.toolCalls.map((c) => c.promptNote)).toEqual([undefined, "Claude Code asked — allowed with your approval"]);
     expect(next.toolCalls[0]).toBe(state.toolCalls[0]);
     expect(applyCallNotes(state, { promptNotes: [] })).toBe(state);
   });

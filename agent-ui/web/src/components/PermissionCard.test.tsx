@@ -293,11 +293,11 @@ describe("PermissionCard for the CLI's own prompt", () => {
     providerPrompt: { reason: REASON, description: ".git/probe", blockedPath: null, matchedAskRule: null, unrecognizedOrigin: null },
   };
 
-  it("shows the CLI's own sentence under a Claude Code safety check label", () => {
+  it("shows the CLI's own sentence under a Claude Code asked label", () => {
     const { container } = render(<PermissionCard request={prompt} sessionEnded={false} onAnswer={vi.fn()} />);
     const line = container.querySelector(".permission-card-provider")!;
     expect(line).not.toBeNull();
-    expect(line.querySelector(".permission-card-provider-label")!.textContent).toBe("Claude Code safety check");
+    expect(line.querySelector(".permission-card-provider-label")!.textContent).toBe("Claude Code asked");
     expect(line.querySelector(".permission-card-provider-reason")!.textContent).toBe(REASON);
   });
 
@@ -318,18 +318,33 @@ describe("PermissionCard for the CLI's own prompt", () => {
     const label = container.querySelector(".permission-card-provider-label")!;
     expect(label.textContent).toBe("your ask rule: Bash(cat:*)");
     expect(label.getAttribute("title")).toContain("projectSettings");
-    expect(container.textContent).not.toContain("Claude Code safety check");
+    expect(container.textContent).not.toContain("Claude Code asked");
     expect(container.querySelector(".permission-card-provider-reason")).toBeNull();
   });
 
-  /* O3 review #5: only a prompt that says why is called a safety check. One with no reason, and one
-     of a kind this build does not know, are "Claude Code asked" -- nothing is claimed for them. */
-  it("calls a prompt with no reason, or of an unknown kind, neutrally", () => {
+  /* A prompt that says nothing about why could be the user's own content-scoped ask rule, which the
+     CLI does not name, so it says so; one of a kind this build does not know is just "asked". */
+  it("calls a prompt with no real reason possibly the user's own rule, and an unknown kind neutrally", () => {
     const silent: PermissionRequestRecord = { ...prompt, providerPrompt: { ...prompt.providerPrompt!, reason: null } };
     const first = render(<PermissionCard request={silent} sessionEnded={false} onAnswer={vi.fn()} />);
-    expect(first.container.querySelector(".permission-card-provider-label")!.textContent).toBe("Claude Code asked");
+    expect(first.container.querySelector(".permission-card-provider-label")!.textContent).toBe(
+      "Claude Code asked (maybe your ask rule)",
+    );
     expect(first.container.querySelector(".permission-card-provider-reason")).toBeNull();
     first.unmount();
+    /* A blocked path is not a reason, and neither is an empty or blank one (Rust agrees, so a card and
+       what bypass answers never differ). */
+    const withoutReason = (reason: string | null, blockedPath: string | null): PermissionRequestRecord => ({
+      ...prompt,
+      providerPrompt: { ...prompt.providerPrompt!, reason, blockedPath },
+    });
+    for (const [reason, blockedPath] of [[null, "/p/.git/probe"], ["", "/p/.git/probe"], ["  \n", null]] as const) {
+      const view = render(<PermissionCard request={withoutReason(reason, blockedPath)} sessionEnded={false} onAnswer={vi.fn()} />);
+      expect(view.container.querySelector(".permission-card-provider-label")!.textContent).toBe(
+        "Claude Code asked (maybe your ask rule)",
+      );
+      view.unmount();
+    }
     const unknown: PermissionRequestRecord = { ...prompt, providerPrompt: { ...prompt.providerPrompt!, unrecognizedOrigin: 7 } };
     const { container } = render(<PermissionCard request={unknown} sessionEnded={false} onAnswer={vi.fn()} />);
     expect(container.querySelector(".permission-card-provider-label")!.textContent).toBe("Claude Code asked");

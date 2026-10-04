@@ -792,9 +792,10 @@ impl AgentBackend {
     /// see it (ruling 3); bypass allows it, because a real `bypassPermissions` session runs the call
     /// (ruling 4); in `Auto` it is allowed only when `approvals` holds the same call -- id, tool and
     /// input the user approved on a card -- and that approval is then used up; otherwise it is a card
-    /// (ruling 5). One that `needs_a_human` -- the user's own `permissions.ask` rule forced it, or its
-    /// kind is unknown to this build -- is a card in every mode: the SDK's guidance is that a host
-    /// auto-approving must not approve a rule-forced ask (ruling 4; review #3 for the unknown kind).
+    /// (ruling 5). One that `needs_a_human` -- the user's own `permissions.ask` rule forced it, its
+    /// kind is unknown to this build, or it gives no reason for asking (a content-scoped ask rule
+    /// looks like that) -- is a card in every mode: the SDK's guidance is that a host auto-approving
+    /// must not approve a rule-forced ask.
     /// Each answered without a card goes into `answered_for_you` with its row's note.
     ///
     /// **The acceptEdits fast path's own row note is recorded here too, never inferred elsewhere**
@@ -1166,8 +1167,8 @@ impl AgentBackend {
     /// but that pump has not yet turned into a `Failed` tab could otherwise still be approved here.
     ///
     /// **A CLI prompt only a human answers is never answered here** -- one the user's own
-    /// `permissions.ask` rule forced (O3 ruling 4), or one of a kind this build does not know (review
-    /// #3): it is a card in bypass too, answered only on the card itself. `TabSet::waiting_cards`
+    /// `permissions.ask` rule forced, one of a kind this build does not know, or one that gives no
+    /// reason for asking: it is a card in bypass too, answered only on the card itself. `TabSet::waiting_cards`
     /// leaves it out of what a bypass entry counts and lists, so the prompt's N matches what `y`
     /// approves; this skip is the backstop for any other caller.
     pub fn approve_pending(&mut self, ids: &[String], why: &str) -> Approved {
@@ -1307,7 +1308,7 @@ impl HumanApprovals {
 }
 
 /// A CLI prompt answered without a card, and the note its call's row shows (review item 7, the
-/// spike's row note): "Claude Code safety check — allowed in bypass" / "— allowed with your
+/// spike's row note): "Claude Code asked — allowed in bypass" / "— allowed with your
 /// approval" (`ProviderPrompt::label` names whose question it was).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptAnsweredForYou {
@@ -3135,7 +3136,7 @@ mod tests {
             answered,
             vec![PromptAnsweredForYou {
                 tool_use_id: "tu-1".into(),
-                note: "Claude Code safety check — allowed in bypass".into(),
+                note: "Claude Code asked — allowed in bypass".into(),
             }]
         );
         backend.shutdown();
@@ -3305,32 +3306,90 @@ mod tests {
             answered,
             vec![PromptAnsweredForYou {
                 tool_use_id: "tu-approved".into(),
-                note: "Claude Code safety check — allowed with your approval".into(),
+                note: "Claude Code asked — allowed with your approval".into(),
             }]
         );
         backend.shutdown();
     }
 
-    /// A prompt that gave no reason is not called a safety check on its row either (review #5).
+    /// A blocked path is not a reason: a path check can sit next to a user's own rule's decision, and the
+    /// prompt bypass may approve (the sensitive-file check) carries its reason and no path. So a prompt
+    /// with a path and no reason -- or an empty or blank reason, which a hook's ask can produce -- is a
+    /// card in bypass and in Auto, and a reason is what lets bypass answer it.
     #[test]
-    fn a_prompt_with_no_reason_is_noted_neutrally() {
+    fn a_prompt_without_a_real_reason_is_a_card_whatever_else_it_carries() {
         let dir = a_workspace_holding_one_file();
-        let (provider, mut backend) = sidecar_backend(&dir);
-        let mut event = provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None);
-        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
-            provider_prompt.as_mut().unwrap().reason = None;
+        let variants: [(&str, Option<&str>, Option<&str>); 3] = [
+            ("path only", None, Some("/p/.git/probe")),
+            ("empty reason", Some(""), Some("/p/.git/probe")),
+            ("blank reason", Some("  \n"), None),
+        ];
+        for (what, reason, blocked_path) in variants {
+            for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
+                let (provider, mut backend) = sidecar_backend(&dir);
+                let mut event = provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None);
+                if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
+                    let prompt = provider_prompt.as_mut().unwrap();
+                    prompt.reason = reason.map(str::to_string);
+                    prompt.blocked_path = blocked_path.map(str::to_string);
+                }
+                provider.queue(event);
+                let mut approvals = HumanApprovals::default();
+                approvals.record("tu-1", "Write", &probe_write());
+                let mut host_answered = BTreeSet::new();
+                let (delivered, answered) = deliver(
+                    &mut backend,
+                    &dir,
+                    &agent::PrefixRules::default(),
+                    mode,
+                    &mut host_answered,
+                    &mut approvals,
+                );
+                assert!(carded(&delivered, "perm-prov"), "{what} {mode:?}: {delivered:?}");
+                assert!(provider.resolutions().is_empty(), "{what} {mode:?}");
+                assert!(host_answered.is_empty() && answered.is_empty(), "{what} {mode:?}");
+                backend.shutdown();
+            }
         }
-        provider.queue(event);
-        let (_, answered) = deliver(
-            &mut backend,
-            &dir,
-            &agent::PrefixRules::default(),
-            PermissionMode::Bypass,
-            &mut BTreeSet::new(),
-            &mut HumanApprovals::default(),
-        );
-        assert_eq!(answered[0].note, "Claude Code asked — allowed in bypass");
-        backend.shutdown();
+    }
+
+    /// A user's content-scoped ask rule reaches Eitri with no reason, no matched rule and no blocked
+    /// path (the CLI names only a bare tool-name rule), so a prompt that explains nothing is a card in
+    /// every mode: not answered in bypass, and not on the strength of the human's approval of the
+    /// gate's card for the same call in Auto.
+    #[test]
+    fn a_prompt_that_explains_nothing_is_a_card_in_every_mode() {
+        let dir = a_workspace_holding_one_file();
+        let echo = serde_json::json!({ "command": "echo zebra" });
+        let mut silent = provider_prompt("perm-silent", Some("tu-1"), "Bash", echo.clone(), None);
+        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut silent {
+            let prompt = provider_prompt.as_mut().unwrap();
+            prompt.reason = None;
+            prompt.description = Some("Print the word zebra".into());
+        }
+        for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
+            let (provider, mut backend) = sidecar_backend(&dir);
+            provider.queue(silent.clone());
+            let mut approvals = HumanApprovals::default();
+            approvals.record("tu-1", "Bash", &echo);
+            let mut host_answered = BTreeSet::new();
+            let (delivered, answered) = deliver(
+                &mut backend,
+                &dir,
+                &agent::PrefixRules::default(),
+                mode,
+                &mut host_answered,
+                &mut approvals,
+            );
+            assert!(carded(&delivered, "perm-silent"), "{mode:?}: {delivered:?}");
+            assert!(provider.resolutions().is_empty(), "{mode:?}");
+            assert!(host_answered.is_empty() && answered.is_empty(), "{mode:?}");
+            assert!(
+                approvals.contains("tu-1"),
+                "{mode:?}: an approval a card kept is not used up"
+            );
+            backend.shutdown();
+        }
     }
 
     /// Fail toward a card, as every automatic answer here does: an allow of the CLI's own prompt that
