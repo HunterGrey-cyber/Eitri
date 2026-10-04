@@ -283,232 +283,27 @@ nvim copy is never placed on `PATH` and never replaces, links or removes anythin
 
 ## How a launch starts: two `init.lua` settings
 
-Both go in `~/.config/eitri/init.lua`, and a value other than the ones named here stops Eitri at
-startup with a message naming the setting.
-
-```lua
-eitri.config.set("agent.restore", "offer")        -- "offer" (the default), "auto" or "off"
-eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "bypass"
-```
-
-- **`agent.restore`** is what happens to the tabs the last window on this project had open. Eitri
-  keeps the tabs that have a Claude session (their order, names, modes and which one was on screen)
-  as it goes, and never records "no tabs" because you closed the window. With `"offer"` the empty
-  tab's dashboard shows a `Restore last session` line, `s`, while nothing in the window has started;
-  `"auto"` brings the tabs back at launch with no key pressed; `"off"` neither offers nor remembers.
-  Each tab is resumed (nothing is sent until you type), the one on screen last time is on screen
-  again, and one message says how many came back. A tab is skipped, and named, when its saved
-  record is gone or another window holds its session. A tab that was in bypass is never put back in
-  bypass without a yes: `s` asks first, and `n` (or `"auto"`) brings it back in auto.
-- **`agent.default_mode`** is the mode a new tab starts in, for a project where you have not left
-  bypass with `Shift+Tab` (that choice is remembered per project and keeps winning). Setting it to
-  `"bypass"` is the one way a window starts in bypass without asking, because you have said so in
-  your own file; it also lets saved bypass tabs come back in bypass without the question.
+This section moved to the guide: [How a launch starts](docs/guide/configuration.md#how-a-launch-starts).
 
 ## What an agent session loads
 
-Like `claude` in a terminal, every session loads your own Claude Code settings: your hooks, plugins,
-skills, `CLAUDE.md` and permission rules. To leave them out, put this in `~/.config/eitri/init.lua`:
-
-```lua
-eitri.config.set("agent.user_settings", false)    -- true (the default) or false
-```
-
-A project's own configuration -- its `.claude/` directory, `.mcp.json`, `CLAUDE.md` and `CLAUDE.local.md`,
-from the project directory up to the top of its git repository -- loads only once you trust it, because a
-repository you did not write could otherwise start its own hooks and MCP servers at your first message.
-The first session in such a project shows what Eitri found (each hook with its command, each MCP server
-with its command line, each allow rule) and asks `y` or `n`. `y` is remembered for the project until any
-of those files changes, and then Eitri asks again; `n` starts the session without them, for this window.
-`:trust` on the panel's command line (`:` in BROWSE) asks again, `:untrust` forgets the answer, and
-`<prefix> i` shows what a tab loaded. A change applies to sessions started afterwards. Its limits are in
-the [known issues](docs/known-issues.md#security).
-
-**Auto and bypass.** `Shift+Tab` switches a tab between auto and bypass, asking first on the way into
-bypass. In bypass Eitri approves tool calls itself. In auto it still sees every call: one your saved rules
-allow is approved, and the rest is left to Claude Code's own auto mode, whose refusals show on the tool's
-row as `blocked by auto: <reason>`; after repeated refusals Claude Code asks you itself, on a card. When
-Claude Code cannot run its auto mode, Eitri's own rules decide which calls need your card, as in 0.2.0.
-
-**Turn review** is on by default: after a turn, `c` in BROWSE shows what changed on disk during it.
-`eitri.config.set("review.enabled", false)` takes no snapshots and offers no review, and
-`eitri.config.set("review.hint", true)` adds a one-line hint to the status band after each turn. How it
-works and its limits: [known issues](docs/known-issues.md#turn-review).
+This section moved to the guide: [What an agent session loads](docs/guide/permissions.md#what-an-agent-session-loads).
 
 ## Your tmux keys
 
-If you use tmux, Eitri picks up your prefix and your prefix-table bindings from the same files tmux
-reads (`/etc/tmux.conf`, `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`,
-`~/.config/tmux/tmux.conf`, and what they `source-file`), wherever an Eitri action matches the tmux
-command. It only reads them; it never starts or asks tmux. A one-time notice says what was taken,
-and `<prefix> ?` lists each line that was not, with the reason. To turn it off, put
-`eitri.config.set("keymap.from_tmux", "off")` in `~/.config/eitri/init.lua`; your own
-`eitri.keymap` calls there always win over what came from tmux.
+This section moved to the guide: [Your tmux keys](docs/guide/keys.md#your-tmux-keys).
 
 ## Use it beside your own nvim
 
-Eitri can also run as the agent panel alone: a separate window next to the nvim you already use in
-a terminal (inside tmux or not), in upstream Neovide, or in any other nvim GUI. The panel attaches
-to that nvim over its RPC socket, installs a little glue inside it (the file you have open and your
-Visual selection go to the agent; the panel takes your colorscheme and shows your which-key keys;
-buffers reload after the agent edits them; a file opens at a line from the panel; `Ctrl+g` edits a
-draft in nvim), and removes all of it again when the panel goes away. Nothing is written to your
-nvim configuration. Your editor keeps its own speed and keys, and your window manager arranges the
-two windows.
-
-**1. Add the plugin.** `eitri.nvim` is a thin launcher; everything the panel needs inside nvim, the
-panel installs itself, so the plugin and the installed Eitri never have to match versions. The
-packages (`.deb`, `.rpm`, AUR) put it in `/usr/share/eitri/nvim/eitri.nvim`; the tarball installer
-puts it in `~/.local/share/eitri/eitri.nvim` (under `$XDG_DATA_HOME/eitri/` when that is set). With
-lazy.nvim, point a spec at the directory.
-
-```lua
--- .deb, .rpm, AUR
-{ dir = "/usr/share/eitri/nvim/eitri.nvim", cmd = "EitriPanel" },
-
--- the tarball installer (install.sh)
-{ dir = vim.fn.expand("~/.local/share/eitri/eitri.nvim"), cmd = "EitriPanel" },
-```
-
-Without a plugin manager, add the directory to `runtimepath`:
-`set runtimepath+=/usr/share/eitri/nvim/eitri.nvim`. Calling `require("eitri").setup({ ... })` is
-optional: `mapping = "<leader>ep"` binds a key to the command, and `cmd = "/path/to/eitri"` names the
-launcher when it is not on nvim's `PATH`.
-
-**2. Open the panel.** `:EitriPanel` in nvim opens the panel for the current working directory,
-`:EitriPanel ~/some/project` for another. If nvim has no server address yet, the plugin starts one.
-The panel's band says `attaching…` until the glue is in, and nothing times out: nvim answers the
-request once you finish a pending key or a prompt.
-
-**3. Or start it from a shell.**
-
-```sh
-eitri panel [--nvim <addr>] [DIR]
-```
-
-`--nvim` is the address of the nvim to attach to (`:echo v:servername`), a path to a Unix socket
-that you own. It defaults to `$NVIM`, which nvim sets for its `:terminal` and `jobstart()` children;
-TCP addresses (`host:port`) are refused. With no address the panel starts unattached and says so in
-its band; running `:EitriPanel` in nvim attaches it later. `DIR` is the project, resolved exactly
-as for `eitri DIR`.
-
-There is one panel per project. A second `:EitriPanel`, from the same nvim or another one in the
-same project, attaches the running panel to it and raises its window instead of opening a second
-one; the first nvim loses the glue. If the nvim quits, the panel keeps its sessions and its band
-says `editor detached: run :EitriPanel to attach again`.
-
-The panel window has the application id `cn.huntergrey.eitri.Panel` and the title
-`Eitri · <project directory name>`, so a window rule can pick it out. It reads the same
-`~/.config/eitri/init.lua` as the one-window mode (`agent.account` applies); Lua panels and commands
-registered there are not shown, and one line on stderr says how many were left out. It has no
-editor, no bottom terminal and no layout of its own: tab keys, `?`, `:` and the text size keys work
-under the prefix, and the layout keys answer `not in a companion window`.
-
-**4. Moving between the two windows.** In nvim, `Ctrl+h/j/k/l` at the edge of nvim's own windows
-hands the move to the panel, which asks your window manager to focus the neighbouring window. In the
-panel, `Ctrl+h` and `Ctrl+l` always leave the window; `Ctrl+k` leaves from BROWSE (in INPUT it
-switches to BROWSE), and `Ctrl+j` leaves from INPUT (in BROWSE it switches to INPUT). The prefix's
-`Select` keys do the same. Opening a file from the panel raises the editor's window, and a second
-`:EitriPanel` raises the panel.
-
-Which window manager is used is detected from the session; to force one or turn it off, put this in
-`~/.config/eitri/init.lua` (any other value stops the panel at startup, naming the key):
-
-```lua
-eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", "sway", "niri", "gnome" or "none"
-```
-
-| desktop | detected by | what Eitri does |
-|---|---|---|
-| sway | `SWAYSOCK` | moves focus with `swaymsg`, after checking that a visible window really lies in that direction (on any output), so sway's default focus wrapping does not carry you to the far side. At the edge the key is consumed |
-| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | moves focus with `hyprctl dispatch movefocus`; what happens at the edge is Hyprland's own |
-| niri | `NIRI_SOCKET` | moves focus with `niri msg action`; what happens at the edge is niri's own |
-| GNOME | `XDG_CURRENT_DESKTOP` contains `GNOME`, in a Wayland session | moves focus through the [Eitri GNOME Shell extension](#gnome-the-extension), once you have enabled it. Without it no focus moves (a Wayland client cannot take focus on GNOME by itself), and the band says once that your desktop does not let Eitri move focus and names the extension |
-| KDE, anything else | none of the above | no focus moves: a Wayland client cannot take focus there. The band says once that your desktop does not let Eitri move focus; use the desktop's own window keys |
-
-**5. Inside tmux.** When nvim runs inside tmux, nothing in nvim's environment changes, its
-navigator maps are left alone, and your tmux setup keeps moving between tmux panes as it does today.
-The edge of tmux's panes is tmux's. With vim-tmux-navigator there is no crossing to the panel window
-(use a binding on the tmux side, or your window manager's keys); with smart-splits.nvim, the `at_edge`
-hook below should hand a move at tmux's own edge to the panel. Neither has been tried yet. The editor's window
-is not raised when you open a file from the panel, because from inside tmux the process tree leads
-to the tmux server, not to the terminal.
-
-**6. Navigator plugins.** With nvim outside tmux, vim-tmux-navigator needs nothing: while the panel
-is attached, its `TmuxNavigate` maps are treated as plain window moves. With smart-splits.nvim, hand
-a move off the edge to the panel from its `at_edge` hook; `edge` returns `false` when no panel is
-attached:
-
-```lua
-require("smart-splits").setup({
-  at_edge = function(ctx)
-    if not require("eitri").edge(ctx.direction) then
-      -- no panel attached: your own fallback, or nothing
-    end
-  end,
-})
-```
-
-`:help eitri.nvim` has the same in nvim. What has not been tried on real hardware yet is on the
-[known issues](docs/known-issues.md#companion-mode) page.
+This section moved to the guide: [Using Eitri beside your own nvim](docs/guide/companion.md).
 
 ## Two windows from one command: `eitri split`
 
-```sh
-eitri split [DIR]
-```
-
-Opens upstream Neovide as the editor and the agent panel as a second window, attached to each other, with
-nothing else to set up. It takes the project (`DIR`, resolved as for `eitri DIR`) and `--account`/`--quiet`,
-and no other option. **It needs Neovide**, which Eitri does not bundle: `neovide` on your `PATH`, or the
-file named by `EITRI_NEOVIDE` (a name that does not exist is an error, not a fallback). It runs
-Neovide itself with nvim listening on a private socket, so your `init.lua` and plugins load as they always
-do; it is not the Neovide fork the one-window `eitri` draws with.
-
-Closing the Neovide that `eitri split` started closes the panel too (it asks first when a turn is
-still running, as any close does); closing the panel leaves Neovide open, since that is your editor, and
-`:EitriPanel` in it brings a panel back. The sessions are kept either way, and the next `eitri split` for
-the project restores them under `agent.restore`. Everything under [Use it beside your own
-nvim](#use-it-beside-your-own-nvim) applies to the panel it opens, including the focus keys.
-
-Neovide runs in the foreground of the shell you started `eitri split` from, as Neovide itself does by
-default: `Ctrl+C` there, or closing that terminal, ends Neovide and the panel. Start it detached
-(`setsid eitri split DIR`, or from a launcher) when you want them to outlive the terminal. Only the panel
-that `eitri split` attached closes with its Neovide: a panel you bring back later with `:EitriPanel` does
-not, and `:EitriPanel` in another nvim moves the panel there and ends that tie.
+This section moved to the guide: [Two windows from one command](docs/guide/companion.md#two-windows-from-one-command-eitri-split).
 
 ## GNOME: the extension
 
-On GNOME a program cannot take focus for itself, so moving between the panel and its editor with `Ctrl+h/j/k/l`
-needs a small GNOME Shell extension, `eitri@huntergrey.cn` (GNOME Shell 45 to 50). The `.deb`, the `.rpm`,
-the AUR packages and the tarball installer put its four files in place
-([Where things go](#where-things-go)); **turning it on is your step**, and the installer never does it:
-
-```sh
-gnome-extensions enable eitri@huntergrey.cn
-```
-
-On Wayland a shell only reads extensions it found at login, so an extension installed while you are
-logged in starts working at your next login. Until then, and when it is not enabled, the panel behaves as
-on any desktop with no focus support: no focus moves, and the band says so once.
-
-What it does, and what it does not. It moves keyboard focus only right after you pressed a key or clicked
-in the window that has focus, and only when that window belongs to the program asking or to the editor that
-program named as its partner. That is how the panel moves focus from itself to its neighbour or back to its
-editor, and from its editor to itself. Any program on your session bus may ask it, under the same rules, so
-a program in the background can at most take focus to its own window right after you typed in a window it
-named -- which is what the panel does -- and, once it has focus, hand it to a neighbour or back to the window
-you were in. It reports no titles, geometry or process ids.
-
-Limits worth knowing:
-- focus moves stay on the monitor of the focused window;
-- windows of an X11 session or an XWayland program never count, because an X11 program writes its own key
-  times: run the editor as a Wayland window;
-- a terminal that runs all its windows in one process (GNOME Terminal, Ptyxis) counts as one partner, so
-  handing focus back to the editor goes to its most recent window;
-- moving back within about a third of a second of the previous move is refused by design;
-- a forwarded `eitri split` attaches the running panel but does not bring it forward (its new Neovide has had no
-  key yet), and the supervisor's "bring to front" does nothing on GNOME.
+This section moved to the guide: [The GNOME extension](docs/guide/companion.md#gnome-the-extension).
 
 ## Troubleshooting
 
@@ -534,7 +329,7 @@ A few common install-time refusals, in the installer's own words (abridged):
 - **the `claude` CLI was not found on `PATH`, or an unsupported version** — a warning, not a refusal:
   Eitri installs regardless, but the agent panel needs a working, logged-in Claude Code to run
   turns. The warning names Anthropic's own installer.
-- **`~/.local/bin` is not on your `PATH`**, or **`\`eitri\` on this PATH runs <something else>`** —
+- **`~/.local/bin` is not on your `PATH`**, or **`` `eitri` on this PATH runs /usr/bin/eitri, not the one just installed ``** —
   printed at the end of a successful install; add `~/.local/bin` to your shell's `PATH`, or put it
   before whatever else answers to `eitri` today (often `/usr/bin/eitri` from an earlier `.deb`).
 

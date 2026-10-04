@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=4f79ed3b29ca9c3fd1da3ab59122b5f682a221763d42e897097d54e6caeb36ac -->
+<!-- translated-from: README.md sha256=08c29cf77f97d38f4ef7acd3a310060c78d2f998b971a88e65609cfc0bbe0465 -->
 
 <div align="center">
 
@@ -41,7 +41,7 @@
 - **用 Lua 配置。** `~/.config/eitri/init.lua`，和 Neovim 读你的配置的方式一样。
 - **也可以放在你自己的 nvim 旁边。** `:EitriPanel` 只把 agent 面板作为一个独立窗口，开在你终端里的 Neovim 旁边。
 
-**更想把 Neovim 留在终端里？** companion 模式把同一个 agent 面板作为一个独立窗口，开在你已经在用的 nvim 旁边（在 tmux 里或不在，上游 Neovide 或别的图形前端都行）。它通过 nvim 自己的 RPC socket 附着上去，把你打开的文件和选区送给 agent，agent 改完后重新加载缓冲区，并能按行号打开文件；面板一消失，它装进去的东西就全部撤掉，你的配置不会被碰。两个窗口怎么摆由你的窗口管理器决定，sway、Hyprland、niri 以及（装上随附扩展的）GNOME 还能用同样的 `Ctrl+h/j/k/l` 在它们之间移动焦点。装上 `eitri.nvim` 插件，运行 `:EitriPanel`，或者让 `eitri split` 把上游 Neovide 和面板一起打开：见[配合你自己的 nvim 使用](INSTALL.zh-CN.md#use-it-beside-your-own-nvim)。
+**更想把 Neovim 留在终端里？** companion 模式把同一个 agent 面板作为一个独立窗口，开在你已经在用的 nvim 旁边（在 tmux 里或不在，上游 Neovide 或别的图形前端都行）。它通过 nvim 自己的 RPC socket 附着上去，把你打开的文件和选区送给 agent，agent 改完后重新加载缓冲区，并能按行号打开文件；面板一消失，它装进去的东西就全部撤掉，你的配置不会被碰。两个窗口怎么摆由你的窗口管理器决定，sway、Hyprland、niri 以及（装上随附扩展的）GNOME 还能用同样的 `Ctrl+h/j/k/l` 在它们之间移动焦点。装上 `eitri.nvim` 插件，运行 `:EitriPanel`，或者让 `eitri split` 把上游 Neovide 和面板一起打开：见[配合你自己的 nvim 使用](docs/guide/companion.zh-CN.md)。
 
 ## 安装
 
@@ -56,6 +56,7 @@ eitri ~/path/to/project
 
 ## 社区
 
+- 文档：https://eitri.cc/docs/zh/
 - [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions)：提问、建议、分享你的配置
 - [Telegram 群](https://t.me/eitri_cc)（中文）和 [Matrix 房间](https://matrix.to/#/#eitri:matrix.org) `#eitri:matrix.org`（英文）
 - [已知问题](docs/known-issues.zh-CN.md)：目前不支持的和还比较粗糙的地方，提 bug 之前值得先看一眼

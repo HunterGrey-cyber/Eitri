@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=084c079887f2894ae82459b408840dcd953ffc50d92606438be7d4e2e8453497 -->
+<!-- translated-from: INSTALL.md sha256=5f5a9099bdf761ba66a69885f2c7594e0617a53cd9a29fc8e1b6925a10927df6 -->
 
 # 安装 Eitri
 
@@ -155,128 +155,29 @@ $XDG_STATE_HOME/eitri/                                           各项目的布
 
 ## 一次启动怎样开始：`init.lua` 里的两个设置
 
-两个都写在 `~/.config/eitri/init.lua` 里；设成这里没列出的值，Eitri 会在启动时直接停下，并指出是哪个设置。
-
-```lua
-eitri.config.set("agent.restore", "offer")        -- "offer"（默认）、"auto" 或 "off"
-eitri.config.set("agent.default_mode", "auto")    -- "auto"（默认）或 "bypass"
-```
-
-- **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有 Claude 会话的标签页（它们的顺序、名字、模式，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成"没有标签页"。设为 `"offer"` 时，只要窗口里还没有任何会话开始，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来；`"off"` 既不提议也不记录。每个标签页都会被恢复（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。上次处于 bypass 的标签页，没有你的一句"是"，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。
-- **`agent.default_mode`** 是新标签页开始时所处的模式，针对你还没有用 `Shift+Tab` 离开过 bypass 的项目（那个选择按项目记住，并且始终优先）。设为 `"bypass"` 是唯一一种窗口不经询问就以 bypass 开始的方式，因为你已经在自己的文件里这么说了；它同时也让保存下来的 bypass 标签页不必回答那个问题就以 bypass 回来。
+这一节已移到使用指南：[一次启动怎样开始](docs/guide/configuration.zh-CN.md#how-a-launch-starts)。
 
 ## 一个 agent 会话会加载什么
 
-和终端里的 `claude` 一样，每个会话都会加载你自己的 Claude Code 设置：你的 hook、插件、skill、`CLAUDE.md` 和权限规则。不想加载它们，就在 `~/.config/eitri/init.lua` 里写上：
-
-```lua
-eitri.config.set("agent.user_settings", false)    -- true（默认）或 false
-```
-
-项目自己的配置——它的 `.claude/` 目录、`.mcp.json`、`CLAUDE.md` 和 `CLAUDE.local.md`，从项目目录一直往上到它所在 git 仓库的顶层——只有在你信任它之后才会加载，否则一个不是你写的仓库，就能在你发出第一条消息时启动它自己的 hook 和 MCP server。在这样的项目里开第一个会话时，Eitri 会列出它找到的内容（每个 hook 和它的命令、每个 MCP server 和它的命令行、每条放行规则），然后问你 `y` 还是 `n`。`y` 按项目记住，直到其中任何一个文件发生变化，那时 Eitri 会再问一次；`n` 让会话不带这些配置启动，只对这个窗口有效。在面板的命令行里（BROWSE 里按 `:`），`:trust` 会再问一次，`:untrust` 会忘掉回答，`<前缀> i` 显示一个标签页加载了什么。改动只对之后启动的会话生效。它的限度见[已知问题](docs/known-issues.zh-CN.md#安全)。
-
-**Auto 和 bypass。** `Shift+Tab` 在 auto 和 bypass 之间切换一个标签页，进入 bypass 时会先问一句。在 bypass 下，Eitri 自己批准工具调用。在 auto 下，它仍然看得到每一次调用：你保存的规则放行的调用会被批准，其余的交给 Claude Code 自己的 auto 模式，被拒绝的会在该工具那一行显示为 `blocked by auto: <原因>`；连续多次被拒绝后，Claude Code 会自己用一张卡片来问你。Claude Code 运行不了它的 auto 模式时，由 Eitri 自己的规则决定哪些调用需要你的卡片，和 0.2.0 一样。
-
-**回合审阅**默认开启：一个回合结束后，在 BROWSE 里按 `c` 查看这个回合期间磁盘上改了什么。`eitri.config.set("review.enabled", false)` 不拍快照、也不提供审阅；`eitri.config.set("review.hint", true)` 会在每个回合之后在状态栏加一行提示。它怎么工作、有哪些限度，见[已知问题](docs/known-issues.zh-CN.md#turn-review)。
+这一节已移到使用指南：[一个 agent 会话会加载什么](docs/guide/permissions.zh-CN.md#what-an-agent-session-loads)。
 
 ## 你的 tmux 键位
 
-如果你用 tmux，Eitri 会从 tmux 自己读的那几个文件（`/etc/tmux.conf`、`~/.tmux.conf`、`$XDG_CONFIG_HOME/tmux/tmux.conf`、`~/.config/tmux/tmux.conf`，以及它们 `source-file` 进来的文件）里读出你的前缀键和前缀表绑定，凡是有对应 Eitri 动作的 tmux 命令都会照搬过来。它只读这些文件，从不启动或询问 tmux。第一次生效时会有一条一次性提示说明拿到了什么；`<前缀> ?` 会逐行列出没能拿过来的那些行和原因。想关掉它，就在 `~/.config/eitri/init.lua` 里写上 `eitri.config.set("keymap.from_tmux", "off")`；你在那里写的 `eitri.keymap` 调用永远优先于从 tmux 拿来的键位。
+这一节已移到使用指南：[你的 tmux 键位](docs/guide/keys.zh-CN.md#your-tmux-keys)。
 
 <a id="use-it-beside-your-own-nvim"></a>
 ## 配合你自己的 nvim 使用
 
-Eitri 也可以只运行 agent 面板：一个独立的窗口，放在你平时在终端里用的 nvim 旁边（在 tmux 里或不在都行），也可以是上游 Neovide 或其他任何 nvim 图形前端。面板通过 RPC socket 附着到那个 nvim 上，在里面装一小段胶水代码（你打开的文件和 Visual 选区会送给 agent；面板取用你的配色方案，并显示你的 which-key 按键；agent 改完文件后缓冲区会重新加载；可以从面板里按行号打开文件；`Ctrl+g` 在 nvim 里编辑草稿），面板一消失就把这些全部撤掉。你的 nvim 配置里不会被写入任何东西。编辑器保持它自己的速度和按键，两个窗口怎么摆由你的窗口管理器决定。
-
-**1. 装上插件。** `eitri.nvim` 只是一个很薄的启动器；面板在 nvim 里需要的一切都由面板自己装上，所以插件和已安装的 Eitri 的版本永远不必一致。软件包（`.deb`、`.rpm`、AUR）把它放在 `/usr/share/eitri/nvim/eitri.nvim`；tarball 安装脚本把它放在 `~/.local/share/eitri/eitri.nvim`（设置了 `$XDG_DATA_HOME` 时放在 `$XDG_DATA_HOME/eitri/` 下）。用 lazy.nvim 的话，让一条 spec 指向这个目录。
-
-```lua
--- .deb、.rpm、AUR
-{ dir = "/usr/share/eitri/nvim/eitri.nvim", cmd = "EitriPanel" },
-
--- tarball 安装脚本（install.sh）
-{ dir = vim.fn.expand("~/.local/share/eitri/eitri.nvim"), cmd = "EitriPanel" },
-```
-
-不用插件管理器的话，把这个目录加进 `runtimepath`：`set runtimepath+=/usr/share/eitri/nvim/eitri.nvim`。调用 `require("eitri").setup({ ... })` 是可选的：`mapping = "<leader>ep"` 给这条命令绑一个键，`cmd = "/path/to/eitri"` 在启动器不在 nvim 的 `PATH` 里时指明它的位置。
-
-**2. 打开面板。** 在 nvim 里运行 `:EitriPanel`，会为当前工作目录打开面板；`:EitriPanel ~/some/project` 则是另一个项目。如果 nvim 还没有 server 地址，插件会启动一个。在胶水代码装好之前，面板的状态条显示 `attaching…`，而且不会超时：等你按完正在等待的那个键或回答完提示之后，nvim 就会应答这个请求。
-
-**3. 或者从 shell 里启动。**
-
-```sh
-eitri panel [--nvim <addr>] [DIR]
-```
-
-`--nvim` 是要附着的那个 nvim 的地址（`:echo v:servername`），是一个属于你自己的 Unix socket 路径。它默认取 `$NVIM`——nvim 会为它的 `:terminal` 和 `jobstart()` 子进程设置这个变量；TCP 地址（`host:port`）会被拒绝。没有地址时面板以未附着的状态启动，并在状态条里说明；之后在 nvim 里运行 `:EitriPanel` 就会附着上去。`DIR` 是项目目录，解析方式和 `eitri DIR` 完全一样。
-
-每个项目只有一个面板。再次运行 `:EitriPanel`（无论来自同一个 nvim，还是同一项目里的另一个 nvim），会让正在运行的面板改为附着到它并把窗口提到前面，而不是再开第二个窗口；第一个 nvim 里的胶水代码会被撤掉。如果 nvim 退出了，面板保留它的会话，状态条显示 `editor detached: run :EitriPanel to attach again`。
-
-面板窗口的应用 id 是 `cn.huntergrey.eitri.Panel`，标题是 `Eitri · <项目目录名>`，所以窗口规则可以把它挑出来。它读的 `~/.config/eitri/init.lua` 和单窗口模式是同一个（`agent.account` 照常生效）；那里注册的 Lua 面板和命令不会显示，stderr 上会有一行说明漏掉了多少个。它没有编辑器、没有底部终端，也没有自己的布局：前缀键下的标签页键、`?`、`:` 和文字大小键都能用，布局相关的键会回应 `not in a companion window`。
-
-**4. 在两个窗口之间移动。** 在 nvim 里，`Ctrl+h/j/k/l` 走到 nvim 自己窗口的边缘时，会把这次移动交给面板，面板再请你的窗口管理器把焦点移到相邻的窗口。在面板里，`Ctrl+h` 和 `Ctrl+l` 总是离开窗口；`Ctrl+k` 在 BROWSE 下离开（在 INPUT 下是切换到 BROWSE），`Ctrl+j` 在 INPUT 下离开（在 BROWSE 下是切换到 INPUT）。前缀键的 `Select` 键做同样的事。从面板里打开文件会把编辑器的窗口提到前面，再运行一次 `:EitriPanel` 则会把面板提到前面。
-
-用的是哪个窗口管理器，由会话环境自动检测；想强制指定或者关掉它，在 `~/.config/eitri/init.lua` 里写（其他任何值都会让面板在启动时失败，并指出这个键）：
-
-```lua
-eitri.config.set("companion.wm", "auto")   -- "auto"（默认）、"hyprland"、"sway"、"niri"、"gnome" 或 "none"
-```
-
-| 桌面 | 检测依据 | Eitri 的做法 |
-|---|---|---|
-| sway | `SWAYSOCK` | 用 `swaymsg` 移动焦点，移动前先检查那个方向上确实有一个可见窗口（任何输出上都算），所以 sway 默认的 focus wrapping 不会把你带到另一头。走到边缘时这个按键被吞掉 |
-| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | 用 `hyprctl dispatch movefocus` 移动焦点；边缘上会怎样由 Hyprland 自己决定 |
-| niri | `NIRI_SOCKET` | 用 `niri msg action` 移动焦点；边缘上会怎样由 niri 自己决定 |
-| GNOME | `XDG_CURRENT_DESKTOP` 含有 `GNOME`，且是 Wayland 会话 | 通过 [Eitri GNOME Shell 扩展](#gnome-the-extension)移动焦点，前提是你已经启用了它。没有它就不移动焦点（在 GNOME 上 Wayland 客户端没法自己抢到焦点），状态条会提示一次：你的桌面不允许 Eitri 移动焦点，并指出这个扩展 |
-| KDE 及其他 | 以上都不是 | 不移动焦点：在那里 Wayland 客户端没法抢到焦点。状态条会提示一次，你的桌面不允许 Eitri 移动焦点，请用桌面自己的窗口键 |
-
-**5. 在 tmux 里。** nvim 运行在 tmux 里时，nvim 的环境里什么都不会变，它的导航插件映射保持原样，tmux 窗格之间的移动照旧由你的 tmux 配置负责。tmux 窗格的边缘归 tmux 管。用 vim-tmux-navigator 时没法跨到面板窗口（请在 tmux 一侧加一个绑定，或者用窗口管理器自己的按键）；用 smart-splits.nvim 时，下面的 `at_edge` 钩子应该能在 tmux 自己的边缘把移动交给面板。这两种情况都还没有试过。从面板里打开文件时，编辑器的窗口不会被提到前面，因为在 tmux 里进程树通向的是 tmux server，而不是终端本身。
-
-**6. 导航插件。** nvim 不在 tmux 里时，vim-tmux-navigator 不需要做任何事：面板附着期间，它的 `TmuxNavigate` 映射会被当作普通的窗口移动。用 smart-splits.nvim 的话，在它的 `at_edge` 钩子里把越过边缘的移动交给面板；没有面板附着时，`edge` 返回 `false`：
-
-```lua
-require("smart-splits").setup({
-  at_edge = function(ctx)
-    if not require("eitri").edge(ctx.direction) then
-      -- 没有面板附着：用你自己的回退方式，或者什么都不做
-    end
-  end,
-})
-```
-
-nvim 里的 `:help eitri.nvim` 有同样的内容。还没有在真实硬件上试过的部分，见[已知问题](docs/known-issues.zh-CN.md#companion-mode)页面。
+这一节已移到使用指南：[配合你自己的 nvim 使用](docs/guide/companion.zh-CN.md)。
 
 ## 一条命令开两个窗口：`eitri split`
 
-```sh
-eitri split [DIR]
-```
-
-把上游 Neovide 当作编辑器、把代理面板当作第二个窗口，两者互相附着，不需要任何别的设置。它接受项目目录（`DIR`，解析方式和 `eitri DIR` 一样）以及 `--account`/`--quiet`，不接受其他选项。**它需要 Neovide**，Eitri 并不自带：要么 `PATH` 上有 `neovide`，要么用 `EITRI_NEOVIDE` 指向那个文件（名字指向一个不存在的文件是报错，不会回退）。它自己运行 Neovide，让 nvim 监听一个私有的套接字，所以你的 `init.lua` 和插件照常加载；它用的不是单窗口 `eitri` 绘制时用的 Neovide 分支。
-
-关闭由 `eitri split` 启动的那个 Neovide，面板也会一起关闭（有回合还在运行时，和任何一次关闭一样会先问你）；只关面板则 Neovide 保持打开，因为那是你的编辑器，在里面运行 `:EitriPanel` 就能把面板找回来。两种情况下会话都会保留，下一次对该项目运行 `eitri split` 时按 `agent.restore` 恢复。[配合你自己的 nvim 使用](#use-it-beside-your-own-nvim)里写的一切，包括焦点键，都适用于它打开的面板。
-
-Neovide 运行在你启动 `eitri split` 的那个 shell 的前台，这和 Neovide 自己的默认行为一样：在那里按 `Ctrl+C`，或者关掉那个终端，Neovide 和面板都会结束。想让它们比终端活得更久，就脱离终端启动（`setsid eitri split DIR`，或者从启动器启动）。只有 `eitri split` 附着上的那个面板会随它的 Neovide 一起关闭：之后用 `:EitriPanel` 找回来的面板不会，而在另一个 nvim 里运行 `:EitriPanel` 会把面板移过去，并解除这层关联。
+这一节已移到使用指南：[一条命令开两个窗口](docs/guide/companion.zh-CN.md#two-windows-from-one-command-eitri-split)。
 
 <a id="gnome-the-extension"></a>
 ## GNOME：扩展
 
-在 GNOME 上程序没法自己抢到焦点，所以要用 `Ctrl+h/j/k/l` 在面板和它的编辑器之间移动，需要一个很小的 GNOME Shell 扩展 `eitri@huntergrey.cn`（GNOME Shell 45 到 50）。`.deb`、`.rpm`、AUR 软件包和 tarball 安装脚本都会把它的四个文件放到位（见[文件都装到哪里去了](#where-things-go)）；**启用它是你自己的一步**，安装脚本从不替你做：
-
-```sh
-gnome-extensions enable eitri@huntergrey.cn
-```
-
-在 Wayland 上，shell 只读取登录时找到的扩展，所以在你已登录时装上的扩展要到下次登录才会生效。在那之前，以及没有启用它时，面板的表现和任何不支持移动焦点的桌面一样：不移动焦点，状态条会提示一次。
-
-它做什么、不做什么：它只在你刚在拥有焦点的那个窗口里按过一个键或点过一下之后才移动键盘焦点，而且只在那个窗口属于发出请求的程序、或者属于这个程序指定为伙伴的编辑器时才移动。面板正是这样把焦点从自己移到相邻窗口或移回它的编辑器，以及从编辑器移回自己。会话总线上的任何程序都可以按同样的规则请求它，所以一个后台程序至多能在你刚在它指定的窗口里打过字之后，把焦点拿到它自己的窗口上——面板做的也就是这件事——而拿到焦点之后，它能把焦点交给相邻窗口，或者交回你原来所在的窗口。它不报告标题、几何信息或进程号。
-
-值得知道的限制：
-- 焦点只在拥有焦点的窗口所在的那块显示器上移动；
-- X11 会话里的窗口或 XWayland 程序的窗口永远不算数，因为 X11 程序自己写自己的按键时间：请把编辑器当作 Wayland 窗口运行；
-- 所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）算作一个伙伴，所以把焦点交回编辑器时，会落到它最近使用的那个窗口；
-- 在上一次移动之后大约三分之一秒内再移回去，会按设计被拒绝；
-- 被转发的 `eitri split` 会让正在运行的面板附着上，但不会把面板带到前面（它新开的 Neovide 还没收到过按键），监视器的“带到前面”在 GNOME 上不起作用。
+这一节已移到使用指南：[GNOME 扩展](docs/guide/companion.zh-CN.md#gnome-the-extension)。
 
 ## 疑难排解
 
@@ -289,7 +190,7 @@ gnome-extensions enable eitri@huntergrey.cn
 - **`the signature on SHA256SUMS does not verify`**——直接拒绝；在一个正式发行版本上遇到这个，不要继续往下走。见[运行前先验证](#verify-before-running)。
 - **`ssh-keygen was not found, so the release signature cannot be checked`**——装上 OpenSSH 的客户端（Debian 和 Ubuntu 上是 `openssh-client`，Fedora 上是 `openssh-clients`，Arch 上是 `openssh`）再重新运行。`--insecure-skip-signature` 会跳过这项校验直接安装；这样会失去什么，见上文。
 - **在 `PATH` 上找不到 `claude` CLI，或者版本不受支持**——这只是警告，不会拒绝安装：Eitri 照样会装上，但 agent 面板需要一个能用、已登录的 Claude Code 才能运行对话轮次。警告信息里会给出 Anthropic 自己的安装方式。
-- **`~/.local/bin` is not on your `PATH`**，或者 **`\`eitri\` on this PATH runs <something else>`**——安装成功之后会打印出来；把 `~/.local/bin` 加到你 shell 的 `PATH` 里，或者把它排到当前其他响应 `eitri` 这个名字的东西前面（往往是早先某次 `.deb` 安装留下的 `/usr/bin/eitri`）。
+- **`~/.local/bin` is not on your `PATH`**，或者 **`` `eitri` on this PATH runs /usr/bin/eitri, not the one just installed ``**——安装成功之后会打印出来；把 `~/.local/bin` 加到你 shell 的 `PATH` 里，或者把它排到当前其他响应 `eitri` 这个名字的东西前面（往往是早先某次 `.deb` 安装留下的 `/usr/bin/eitri`）。
 
 - **`… is writable by its group or by anyone, and not sticky`** — 安装器把下载的文件放在
   `$XDG_CACHE_HOME/eitri`（默认是 `~/.cache/eitri`）。如果其他用户能写这个缓存目录，他们就可能在

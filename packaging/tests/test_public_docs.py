@@ -481,6 +481,86 @@ class PublicDocsTwinsAreFresh(unittest.TestCase):
             )
 
 
+_GUIDE_DIR = os.path.join(_PUBLISH_FILES, "docs", "guide")
+# The guide's pages, so a page may link a sibling written in another branch before both are merged; the
+# check that every one of them (and its twin) exists runs on the merged tree (GuideCompleteTests).
+_GUIDE_PAGE_NAMES = ("README", "getting-started", "keys", "configuration", "companion", "turn-review", "permissions")
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_LINK_RE = re.compile(r"\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+
+
+def _guide_pages():
+    if not os.path.isdir(_GUIDE_DIR):
+        return []
+    return sorted(n for n in os.listdir(_GUIDE_DIR) if n.endswith(".md") and not n.endswith(".zh-CN.md"))
+
+
+def _outside_fences(text):
+    """The page's lines outside fenced code blocks, as (line number, line)."""
+    inside = False
+    for number, line in enumerate(text.splitlines(), 1):
+        if _FENCE_RE.match(line):
+            inside = not inside
+            continue
+        if not inside:
+            yield number, line
+
+
+def _resolves(page_dir_rel, target):
+    """A relative link from a guide page resolves to a file of the public tree: a public-only file under
+    publish/files/, or an exported repo file at the same path in the private tree."""
+    path = target.split("#", 1)[0]
+    if not path:
+        return True
+    rel = os.path.normpath(os.path.join(page_dir_rel, path))
+    if rel.startswith(".."):
+        return False
+    if os.path.dirname(rel) == "docs/guide" and os.path.basename(rel) in {f"{n}.md" for n in _GUIDE_PAGE_NAMES}:
+        return True
+    return os.path.isfile(os.path.join(_PUBLISH_FILES, rel)) or os.path.isfile(os.path.join(_REPO_ROOT, rel))
+
+
+class GuidePagesTests(unittest.TestCase):
+    """Every English guide page under docs/guide/: the language switch on line 1, one H1, and every
+    relative link landing on a file the public tree has (the site's importer refuses the same cases)."""
+
+    def test_the_guide_index_exists(self):
+        self.assertIn("README.md", _guide_pages())
+
+    def test_each_page_starts_with_its_language_switch(self):
+        for name in _guide_pages():
+            with open(os.path.join(_GUIDE_DIR, name), encoding="utf-8") as f:
+                first = f.readline().rstrip("\n")
+            self.assertEqual(first, f"English | [简体中文]({name[:-3]}.zh-CN.md)", name)
+
+    def test_each_page_has_exactly_one_h1(self):
+        for name in _guide_pages():
+            with open(os.path.join(_GUIDE_DIR, name), encoding="utf-8") as f:
+                h1 = [n for n, line in _outside_fences(f.read()) if line.startswith("# ")]
+            self.assertEqual(len(h1), 1, f"{name}: H1 on lines {h1}")
+
+    def test_every_relative_link_resolves(self):
+        for name in _guide_pages():
+            with open(os.path.join(_GUIDE_DIR, name), encoding="utf-8") as f:
+                text = f.read()
+            for number, line in _outside_fences(text):
+                if number == 1:
+                    continue  # the language switch, checked on its own; the twin is checked once the twins exist
+                for target in _LINK_RE.findall(line):
+                    if re.match(r"^[a-z][a-z0-9+.-]*:|^//|^#", target):
+                        continue
+                    self.assertTrue(_resolves("docs/guide", target), f"{name}:{number}: {target}")
+
+
+class GuideCompleteTests(unittest.TestCase):
+    """On the merged tree: every guide page the checks accept a link to exists, and has its Chinese twin."""
+
+    def test_every_guide_page_and_its_twin_exist(self):
+        for name in _GUIDE_PAGE_NAMES:
+            for file in (f"{name}.md", f"{name}.zh-CN.md"):
+                self.assertTrue(os.path.isfile(os.path.join(_GUIDE_DIR, file)), file)
+
+
 class PublicTreeLayoutTests(unittest.TestCase):
     """This suite ships in the public tree (publish/manifest.txt's `include packaging/*`) and must pass
     there too, where there is no publish/ at all and publish/files/ has been copied over the root by
@@ -523,6 +603,8 @@ class PublicTreeLayoutTests(unittest.TestCase):
             ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"),
         )
         shutil.copytree(_PUBLISH_FILES, root, dirs_exist_ok=True)
+        # The public tree also carries docs/keymap/ (publish/manifest.txt includes it), which guide pages link to.
+        shutil.copytree(os.path.join(_REPO_ROOT, "docs", "keymap"), os.path.join(root, "docs", "keymap"))
         self.assertFalse(os.path.lexists(os.path.join(root, "publish")))
 
         result = subprocess.run(
