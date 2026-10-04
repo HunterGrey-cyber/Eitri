@@ -13,6 +13,12 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 //!
+//! The legacy arms spawn `agent-hook`, a binary of the `agent` package that only a build with the
+//! legacy feature produces, and `cargo test -p eitri-core` does not build another package's binaries:
+//! build it first (`cargo build -p agent --features legacy-backend --bin agent-hook`) or name `-p agent`
+//! in the same `cargo test` invocation, or those arms fail with "agent-hook binary not found" before
+//! any turn runs.
+//!
 //! The test-account wrapper sets `VERDANDI_CLAUDE_CLI_PATH`, which is what decides the sidecar's `claude`.
 //! The legacy arms spawn the `claude` on `PATH`, which the same profile shims.
 //!
