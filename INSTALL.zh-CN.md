@@ -1,11 +1,11 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=5eff3afdae6d0e3f6862851dfb34bf5a7e05eb165d93ad82ff01e5e922e42e17 -->
+<!-- translated-from: INSTALL.md sha256=084c079887f2894ae82459b408840dcd953ffc50d92606438be7d4e2e8453497 -->
 
 # 安装 Eitri
 
 不管走哪条路径，结果都一样：一份按用户安装在 `~/.local` 下的安装（或者从 `.deb`/`.rpm` 装出的系统级安装），以及一个 `eitri` 启动器。`install.sh` 会在安装过程中顺带为你的机器构建 agent sidecar——除了 `.deb`/`.rpm` 这条路径：它不运行 maintainer script，需要你之后自己显式运行一次 `eitri setup`（见下文）。`eitri` 启动器本身从来不会构建 sidecar：在 sidecar 还没构建出来之前运行它，它照样会打开窗口，只是没有 agent 后端，并打印一行提示，让你运行 `eitri setup`。见下面的[为什么 sidecar 要在你自己的机器上构建](#why-the-sidecar-is-built-on-your-machine)。完整的选项列表见 `sh install.sh --help` 和 `eitri setup --help`；读完这一篇之后，权威来源就是那些输出，而不是这份文档。
 
-**环境要求**：GTK ≥ 4.14、WebKitGTK 6.0、glibc ≥ 2.39、x86_64 Linux。**0.2.0 只支持 x86_64**——从源码构建（见下文）也需要同样的架构，在其他任何架构上都会拒绝运行，所以目前还没有 ARM 路径。**nvim ≥ 0.10**——可以是你自己 `PATH` 上的那份，也可以让安装脚本为 Eitri 单独获取一份私有副本（见下文）。还需要安装并登录 Claude Code（缺失时只是警告，不会拒绝安装——只是在你补上之前，Eitri 没法运行对话轮次）。
+**环境要求**：GTK ≥ 4.14、WebKitGTK 6.0、glibc ≥ 2.39、x86_64 Linux。**Eitri 只支持 x86_64**——从源码构建（见下文）也需要同样的架构，在其他任何架构上都会拒绝运行，所以目前还没有 ARM 路径。**nvim ≥ 0.10**——可以是你自己 `PATH` 上的那份，也可以让安装脚本为 Eitri 单独获取一份私有副本（见下文）。还需要安装并登录 Claude Code（缺失时只是警告，不会拒绝安装——只是在你补上之前，Eitri 没法运行对话轮次）。
 
 ## 快速安装
 
@@ -17,7 +17,7 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 
 `--proto '=https' --proto-redir '=https'` 会拒绝纯 HTTP 的重定向，`-L` 则会跟随 GitHub 自己的 `releases/latest/download/…` → `releases/download/v<X>/…` 重定向——没有 `-L` 的话，单纯的 `curl -sSf` 会从重定向响应里拿到一个空响应体，什么都不会传给 `sh`，结果是什么都没装上，也什么都没提示（`curl -f` 只会在 4xx/5xx 状态码上出错，从不会因为 302 出错）。这几个正是 `install.sh` 自己的 `fetch()` 函数在每一次非本地环回（也就是真实）下载时使用的旗标（`packaging/install.sh` 的 `fetch()` 函数）。
 
-在 `--` 之后传选项：`curl … install.sh | sh -s -- --version 0.2.0 --yes`。
+在 `--` 之后传选项：`curl … install.sh | sh -s -- --version 0.2.1 --yes`。
 
 **如果你想在运行之前先读一遍**，可以先把它下载下来，而不是直接接进管道：
 
@@ -97,9 +97,9 @@ yay -S eitri-git    # 包括 eitri 本身在内的一切都从源码构建
 sh install.sh --from-source
 ```
 
-**0.2.0 只支持 x86_64**：在除 x86_64 之外的任何 `uname -m` 上都会立即拒绝——目前锁定的唯一 Skia 预构建包是 x86_64 版本，还没有为 ARM 锁定对应的包。
+**本版本只支持 x86_64**：在除 x86_64 之外的任何 `uname -m` 上都会立即拒绝——目前锁定的唯一 Skia 预构建包是 x86_64 版本，还没有为 ARM 锁定对应的包。
 
-在发行版本自己的 tag 上克隆公开仓库，如果它的 `HEAD` 和这个发行版本记录的 commit 对不上就拒绝继续，然后完全按照预构建路径的方式构建并安装。需要完整的工具链：**Rust 1.96 或更新版本**（2024 edition；安装脚本会拒绝更旧的 `rustc`）、**GTK 4.14+ 和 WebKitGTK 6.0 的开发包**外加 `pkg-config`、**Node.js 和 npm**、**`protoc`**、一套 **C 工具链**，以及第一次构建时需要的**联网**。`--checkout DIR` 会直接构建一份本地工作树，而不是重新克隆（这是作者自己的开发方式）——完整的前置条件列表和各发行版对应的包名，见 CONTRIBUTING.md 里的[前置条件](CONTRIBUTING.md#prerequisites)一节（仅有英文版）；`--verdandi-checkout` 和其他 `--from-source` 子选项见 `sh install.sh --help`。
+在发行版本自己的 tag 上克隆公开仓库，如果它的 `HEAD` 和这个发行版本记录的 commit 对不上就拒绝继续，然后完全按照预构建路径的方式构建并安装。它能构建 0.2.1 及以后的版本；0.2.0 见[已知问题](docs/known-issues.zh-CN.md#安装)。需要完整的工具链：**Rust 1.96 或更新版本**（2024 edition；安装脚本会拒绝更旧的 `rustc`）、**GTK 4.14+ 和 WebKitGTK 6.0 的开发包**外加 `pkg-config`、**Node.js 和 npm**、**`protoc`**、一套 **C 工具链**，以及第一次构建时需要的**联网**。`--checkout DIR` 会直接构建一份本地工作树，而不是重新克隆（这是作者自己的开发方式）——完整的前置条件列表和各发行版对应的包名，见 CONTRIBUTING.md 里的[前置条件](CONTRIBUTING.md#prerequisites)一节（仅有英文版）；`--verdandi-checkout` 和其他 `--from-source` 子选项见 `sh install.sh --help`。
 
 <a id="why-the-sidecar-is-built-on-your-machine"></a>
 ## 为什么 sidecar 要在你自己的机器上构建
@@ -109,7 +109,7 @@ sh install.sh --from-source
 <a id="updating"></a>
 ## 更新
 
-重新走一遍你当初用的那条安装路径就行。`sh install.sh`（不带 `--version`）会把你装好的版本和 sidecar revision 拿去和最新发行版比较：如果两者都已经是最新的，它会打印 "up to date" 然后什么都不动就退出。否则它会解包新版本，并且**在切换任何东西之前先把新版本的 sidecar 构建好**，这样一次失败的构建不会动到旧的安装；只有构建成功之后，才会原子性地把两者互换。你之前那个 sidecar revision 会被保留，而不是删掉——这样即便新的那个后来出了问题，这次切换也是可以信赖的；它（连同这台机器上任何一个不再被任何安装引用的 revision）要等到*下一次*更新时才会被移除。之后要重启已经打开的 Eitri 窗口——它们会继续用旧的安装跑下去，但新开的标签页或 agent 交接需要新版本才行。`.deb`/`.rpm` 的升级是你的包管理器自己的事；只有在锁定的 sidecar revision 变了的时候，才需要之后再运行一次 `eitri setup`（如果当前 revision 已经构建好了，这一步就是空操作）。
+重新走一遍你当初用的那条安装路径就行。`sh install.sh`（不带 `--version`）会把你装好的版本和 sidecar revision 拿去和最新发行版比较：如果两者都已经是最新的，它会打印 "up to date" 然后什么都不动就退出。否则它会解包新版本，并且**在切换任何东西之前先把新版本的 sidecar 构建好**，这样一次失败的构建不会动到旧的安装；只有构建成功之后，才会原子性地把两者互换。你之前那个 sidecar revision 会被保留，而不是删掉——这样即便新的那个后来出了问题，这次切换也是可以信赖的；它（连同这台机器上任何一个不再被任何安装引用的 revision）要等到*下一次*更新时才会被移除。之后要重启已经打开的 Eitri 窗口——它们会继续用旧的安装跑下去，但新开的标签页或 agent 交接需要新版本才行。`.deb`/`.rpm` 的升级是你的包管理器自己的事；只有在锁定的 sidecar revision 变了的时候，才需要之后再运行一次 `eitri setup`（0.2.1 就变了；如果当前 revision 已经构建好了，这一步就是空操作）。
 
 从 0.2.1 起 Eitri 有了图标，它的 desktop 条目也改用应用 id 命名，叫 `cn.huntergrey.eitri.desktop`（原来是 `eitri.desktop`）；桌面环境正是靠这个名字把窗口和它的启动器对上。在旧版本上更新时会移除旧条目——tarball 方式由安装脚本来做，而且只有当那个文件与 0.2.0 的安装脚本写下的逐字节一致时才会删（你改过的条目会保留，并被指出来），软件包升级则是因为新包不再列出那个文件——所以**如果你之前把 Eitri 固定在了 dash 或 dock 上，更新之后需要重新固定一次**。
 
@@ -145,7 +145,8 @@ sh install.sh --uninstall --purge    # 同时删除 ~/.config/eitri 和 $XDG_STA
 $XDG_DATA_HOME/eitri/sidecar/<rev>/                              eitri setup 构建出的 sidecar，按用户的各条路径
 $XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               私有 nvim 副本，仅在你接受该提议时才有
 ~/.config/eitri/init.lua                                         你自己的配置（EITRI_CONFIG_DIR 可覆盖该目录）
-$XDG_STATE_HOME/eitri/                                           各项目的布局、已打开的标签页、提示词历史、权限规则
+$XDG_STATE_HOME/eitri/                                           各项目的布局、已打开的标签页、提示词历史、权限规则、
+                                                                 信任回答、回合审阅快照
 ```
 
 除了 **AUR**（`eitri-bin`/`eitri-git`）之外，上面这些安装路径的 sidecar 都是按用户的——AUR 的 `build()` 会把它构建在 `/usr/lib/eitri/` 里（见 [AUR](#aur-arch)）。
@@ -163,6 +164,20 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto"（默认）或 "bypa
 
 - **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有 Claude 会话的标签页（它们的顺序、名字、模式，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成"没有标签页"。设为 `"offer"` 时，只要窗口里还没有任何会话开始，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来；`"off"` 既不提议也不记录。每个标签页都会被恢复（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。上次处于 bypass 的标签页，没有你的一句"是"，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。
 - **`agent.default_mode`** 是新标签页开始时所处的模式，针对你还没有用 `Shift+Tab` 离开过 bypass 的项目（那个选择按项目记住，并且始终优先）。设为 `"bypass"` 是唯一一种窗口不经询问就以 bypass 开始的方式，因为你已经在自己的文件里这么说了；它同时也让保存下来的 bypass 标签页不必回答那个问题就以 bypass 回来。
+
+## 一个 agent 会话会加载什么
+
+和终端里的 `claude` 一样，每个会话都会加载你自己的 Claude Code 设置：你的 hook、插件、skill、`CLAUDE.md` 和权限规则。不想加载它们，就在 `~/.config/eitri/init.lua` 里写上：
+
+```lua
+eitri.config.set("agent.user_settings", false)    -- true（默认）或 false
+```
+
+项目自己的配置——它的 `.claude/` 目录、`.mcp.json`、`CLAUDE.md` 和 `CLAUDE.local.md`，从项目目录一直往上到它所在 git 仓库的顶层——只有在你信任它之后才会加载，否则一个不是你写的仓库，就能在你发出第一条消息时启动它自己的 hook 和 MCP server。在这样的项目里开第一个会话时，Eitri 会列出它找到的内容（每个 hook 和它的命令、每个 MCP server 和它的命令行、每条放行规则），然后问你 `y` 还是 `n`。`y` 按项目记住，直到其中任何一个文件发生变化，那时 Eitri 会再问一次；`n` 让会话不带这些配置启动，只对这个窗口有效。在面板的命令行里（BROWSE 里按 `:`），`:trust` 会再问一次，`:untrust` 会忘掉回答，`<前缀> i` 显示一个标签页加载了什么。改动只对之后启动的会话生效。它的限度见[已知问题](docs/known-issues.zh-CN.md#安全)。
+
+**Auto 和 bypass。** `Shift+Tab` 在 auto 和 bypass 之间切换一个标签页，进入 bypass 时会先问一句。在 bypass 下，Eitri 自己批准工具调用。在 auto 下，它仍然看得到每一次调用：你保存的规则放行的调用会被批准，其余的交给 Claude Code 自己的 auto 模式，被拒绝的会在该工具那一行显示为 `blocked by auto: <原因>`；连续多次被拒绝后，Claude Code 会自己用一张卡片来问你。Claude Code 运行不了它的 auto 模式时，由 Eitri 自己的规则决定哪些调用需要你的卡片，和 0.2.0 一样。
+
+**回合审阅**默认开启：一个回合结束后，在 BROWSE 里按 `c` 查看这个回合期间磁盘上改了什么。`eitri.config.set("review.enabled", false)` 不拍快照、也不提供审阅；`eitri.config.set("review.hint", true)` 会在每个回合之后在状态栏加一行提示。它怎么工作、有哪些限度，见[已知问题](docs/known-issues.zh-CN.md#turn-review)。
 
 ## 你的 tmux 键位
 
@@ -215,7 +230,7 @@ eitri.config.set("companion.wm", "auto")   -- "auto"（默认）、"hyprland"、
 | GNOME | `XDG_CURRENT_DESKTOP` 含有 `GNOME`，且是 Wayland 会话 | 通过 [Eitri GNOME Shell 扩展](#gnome-the-extension)移动焦点，前提是你已经启用了它。没有它就不移动焦点（在 GNOME 上 Wayland 客户端没法自己抢到焦点），状态条会提示一次：你的桌面不允许 Eitri 移动焦点，并指出这个扩展 |
 | KDE 及其他 | 以上都不是 | 不移动焦点：在那里 Wayland 客户端没法抢到焦点。状态条会提示一次，你的桌面不允许 Eitri 移动焦点，请用桌面自己的窗口键 |
 
-**5. 在 tmux 里。** nvim 运行在 tmux 里时，nvim 的环境里什么都不会变，它的导航插件映射保持原样，tmux 窗格之间的移动照旧由你的 tmux 配置负责。tmux 窗格的边缘归 tmux 管：tmux 处理的按键永远到不了面板窗口，所以要跨过去需要在 tmux 一侧加一个绑定（或者用窗口管理器自己的按键）。从面板里打开文件时，编辑器的窗口不会被提到前面，因为在 tmux 里进程树通向的是 tmux server，而不是终端本身。
+**5. 在 tmux 里。** nvim 运行在 tmux 里时，nvim 的环境里什么都不会变，它的导航插件映射保持原样，tmux 窗格之间的移动照旧由你的 tmux 配置负责。tmux 窗格的边缘归 tmux 管。用 vim-tmux-navigator 时没法跨到面板窗口（请在 tmux 一侧加一个绑定，或者用窗口管理器自己的按键）；用 smart-splits.nvim 时，下面的 `at_edge` 钩子应该能在 tmux 自己的边缘把移动交给面板。这两种情况都还没有试过。从面板里打开文件时，编辑器的窗口不会被提到前面，因为在 tmux 里进程树通向的是 tmux server，而不是终端本身。
 
 **6. 导航插件。** nvim 不在 tmux 里时，vim-tmux-navigator 不需要做任何事：面板附着期间，它的 `TmuxNavigate` 映射会被当作普通的窗口移动。用 smart-splits.nvim 的话，在它的 `at_edge` 钩子里把越过边缘的移动交给面板；没有面板附着时，`edge` 返回 `false`：
 

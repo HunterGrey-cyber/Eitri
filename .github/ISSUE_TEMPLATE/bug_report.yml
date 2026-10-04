@@ -50,7 +50,7 @@ body:
     attributes:
       label: eitri --version
       description: Paste the whole line.
-      placeholder: "eitri 0.2.0 (commit ..., neovide fork ..., verdandi ...)"
+      placeholder: "eitri 0.2.1 (commit ..., neovide fork ..., verdandi ...)"
     validations:
       required: true
   - type: input
