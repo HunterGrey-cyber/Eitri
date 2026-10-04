@@ -70,6 +70,7 @@ Known limits are on [eitri.cc](https://eitri.cc/#requirements); what comes next 
 
 ## Community
 
+- Documentation: https://eitri.cc/docs/
 - [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions): questions, ideas, your setups
 - [Matrix](https://matrix.to/#/#eitri:matrix.org) `#eitri:matrix.org` (English) and [Telegram](https://t.me/eitri_cc) (mostly Chinese)
 - [Known issues](docs/known-issues.md): what is unsupported or rough today, worth a look before you file a bug
