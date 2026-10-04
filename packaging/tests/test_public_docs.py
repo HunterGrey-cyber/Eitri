@@ -551,6 +551,15 @@ class GuidePagesTests(unittest.TestCase):
                     self.assertTrue(_resolves("docs/guide", target), f"{name}:{number}: {target}")
 
 
+class GuideCompleteTests(unittest.TestCase):
+    """On the merged tree: every guide page the checks accept a link to exists, and has its Chinese twin."""
+
+    def test_every_guide_page_and_its_twin_exist(self):
+        for name in _GUIDE_PAGE_NAMES:
+            for file in (f"{name}.md", f"{name}.zh-CN.md"):
+                self.assertTrue(os.path.isfile(os.path.join(_GUIDE_DIR, file)), file)
+
+
 class PublicTreeLayoutTests(unittest.TestCase):
     """This suite ships in the public tree (publish/manifest.txt's `include packaging/*`) and must pass
     there too, where there is no publish/ at all and publish/files/ has been copied over the root by

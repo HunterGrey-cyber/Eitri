@@ -295,7 +295,7 @@ This section moved to the guide: [Your tmux keys](docs/guide/keys.md#your-tmux-k
 
 ## Use it beside your own nvim
 
-This section moved to the guide: [Using Eitri beside your own nvim](docs/guide/companion.md#eitri-panel).
+This section moved to the guide: [Using Eitri beside your own nvim](docs/guide/companion.md).
 
 ## Two windows from one command: `eitri split`
 

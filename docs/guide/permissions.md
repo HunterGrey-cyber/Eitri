@@ -98,8 +98,12 @@ Claude Code runs in its default mode, or from editing the rules file by hand.
 - **A rule never makes a command run that Eitri cannot read plainly.** A rule replaces only the verdict "this
   program is not on the read-only list". A command with a redirect, pipe, `;` or `&&`, glob, quotes or `$(...)`,
   a path outside the project, or `git -C` and similar options is not allowed by a rule even when the rule's words
-  match it; so is a command a rule was never offered for. Where Claude Code runs its auto mode (the usual case),
-  such a call is left to that mode's classifier, which may run it without any card; otherwise it is a card.
+  match it. Where Claude Code runs its auto mode (the usual case), such a call is left to that mode's classifier,
+  which may run it without any card; otherwise it is a card.
+- **A rule covers more than the button offers.** The button's caution decides only what it suggests. A saved
+  rule allows every plainly readable command that starts with its words, including ones the button would have
+  offered no rule for: with `cargo *` saved, `cargo -p helper run` runs without a card too. Save or write the
+  narrowest rule that does the job.
 - **Where rules apply.** In an Auto tab, in both cases above. In bypass no rule is needed. A rule never
   answers one of Claude Code's own questions (next section).
 - **Where they are stored.** Outside the project, one file per project under `~/.local/state/eitri/permissions/`

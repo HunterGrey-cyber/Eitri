@@ -173,5 +173,6 @@ set), in a private git repository of Eitri's own, one directory per project. Eit
 a project for up to 30 days, and each snapshot takes at most 20,000 files and 10 seconds. Files your
 `.gitignore`, `.git/info/exclude` (when the project is a repository's top level) or your global git excludes
 list are not snapshotted; ignore files above the project's own directory are not read when the project is a
-subdirectory of a larger repository. Deleting the directory loses the review history and nothing else: the next
-turn starts a new one.
+subdirectory of a larger repository. Deleting the directory loses the review history: the next turn starts a new one. Do not delete it while the
+status band offers to recover an interrupted revert (see above): the saved bytes that offer restores from live
+in that directory too.

@@ -52,7 +52,7 @@ line, and takes everything back out when the panel goes away; your configuration
 manager arranges the two windows, and sway, Hyprland, niri and (with the bundled extension) GNOME can move focus
 between them with the same `Ctrl+h/j/k/l`. Add the `eitri.nvim` plugin and run `:EitriPanel`, or let
 `eitri split` open upstream Neovide and the panel together: see
-[Use it beside your own nvim](INSTALL.md#use-it-beside-your-own-nvim).
+[Use it beside your own nvim](docs/guide/companion.md).
 
 ## Install
 
