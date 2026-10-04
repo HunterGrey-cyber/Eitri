@@ -8,6 +8,12 @@
 //! XDG_STATE_HOME=/tmp/nv-friction-real-state \
 //!     cargo test -p eitri-core --test panel_friction_real_cli -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! The one legacy arm (`--features legacy-backend`) spawns `agent-hook`, a binary of the `agent`
+//! package that only a build with the legacy feature produces, and `cargo test -p eitri-core` does not
+//! build another package's binaries: build it first (`cargo build -p agent --features legacy-backend
+//! --bin agent-hook`) or name `-p agent` in the same `cargo test` invocation, or that arm fails with
+//! "agent-hook binary not found" before any turn runs.
 
 use eitri_core::agent_backend::{AgentBackend, BackendKind};
 use eitri_core::agent_bridge::SessionModeChoice;

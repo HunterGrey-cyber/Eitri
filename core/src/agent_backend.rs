@@ -928,6 +928,13 @@ impl AgentBackend {
                 let (tool_use_id, label) = (tool_use_id.clone(), prompt.label());
                 match self.respond_permission(&permission_id, PermissionDecision::Allow) {
                     Ok(_resolution) => {
+                        answered_for_you.gate_answers.push(GateAnswer {
+                            origin: GateOrigin::ProviderPrompt,
+                            permission_id: permission_id.clone(),
+                            tool_use_id: named_call(&tool_use_id),
+                            tool_name: tool_name.clone(),
+                            deferred: false,
+                        });
                         host_answered.insert(permission_id);
                         if let Some(id) = tool_use_id {
                             // Used up (ruling 5, once per call): a later prompt under this id is a
@@ -962,6 +969,13 @@ impl AgentBackend {
                     named_call(tool_use_id).filter(|_| write_over_no_file(&tool_name, input, project_root));
                 match self.respond_permission(&permission_id, PermissionDecision::Allow) {
                     Ok(_resolution) => {
+                        answered_for_you.gate_answers.push(GateAnswer {
+                            origin: GateOrigin::GateRequest,
+                            permission_id: permission_id.clone(),
+                            tool_use_id: named_call(tool_use_id),
+                            tool_name: tool_name.clone(),
+                            deferred: false,
+                        });
                         host_answered.insert(permission_id);
                         answered_for_you.creates_file.extend(creates_file);
                         eprintln!("[permission] allowed in bypass: {tool_name}");
@@ -993,6 +1007,7 @@ impl AgentBackend {
                 let creates_file = call_id
                     .clone()
                     .filter(|_| write_over_no_file(&tool_name, input, project_root));
+                let gated_call = call_id.clone();
                 let (decision, by_rule) = match rule {
                     Some(rule) => (
                         PermissionDecision::Allow,
@@ -1008,6 +1023,13 @@ impl AgentBackend {
                 let defers = decision.defers();
                 match self.respond_permission(&permission_id, decision) {
                     Ok(_resolution) => {
+                        answered_for_you.gate_answers.push(GateAnswer {
+                            origin: GateOrigin::GateRequest,
+                            permission_id: permission_id.clone(),
+                            tool_use_id: gated_call,
+                            tool_name: tool_name.clone(),
+                            deferred: defers,
+                        });
                         host_answered.insert(permission_id);
                         answered_for_you.creates_file.extend(creates_file);
                         answered_for_you.by_rule.extend(by_rule);
@@ -1075,6 +1097,7 @@ impl AgentBackend {
             let rule = (classification.reason == agent::permission_policy::REASON_ALLOWED_BY_A_PROJECT_RULE)
                 .then(|| agent::rule_that_allows(&tool_name, input, project_root, rules))
                 .flatten();
+            let gated_call = call_id.clone();
             let by_rule = call_id.zip(rule).map(|(id, rule)| RuleAnsweredForYou {
                 tool_use_id: id,
                 rule,
@@ -1083,6 +1106,13 @@ impl AgentBackend {
             });
             match self.respond_permission(&permission_id, PermissionDecision::Allow) {
                 Ok(_resolution) => {
+                    answered_for_you.gate_answers.push(GateAnswer {
+                        origin: GateOrigin::GateRequest,
+                        permission_id: permission_id.clone(),
+                        tool_use_id: gated_call,
+                        tool_name: tool_name.clone(),
+                        deferred: false,
+                    });
                     answered_for_you.by_the_fast_path.extend(fast_path);
                     answered_for_you.creates_file.extend(creates_file);
                     answered_for_you.by_rule.extend(by_rule);
@@ -1334,6 +1364,34 @@ pub struct AnsweredForYou {
     /// whose `file_path` named nothing just before the answer was sent: the row says the call
     /// creates the file, never that it overwrites one it cannot see.
     pub creates_file: Vec<String>,
+    /// Every request this host answered itself in the batch, whichever way (a deferral, an `allow`
+    /// by rule, by the fast path, in bypass, or for the CLI's own prompt), recorded where the answer
+    /// is sent. The projection forgets a request the moment its resolution folds, which on the
+    /// sidecar can be before the next read, so a test that wants to know which calls the host
+    /// answered cannot rebuild that from the projection; this is the one record that cannot miss one.
+    pub gate_answers: Vec<GateAnswer>,
+}
+
+/// Which question the host answered: the `PreToolUse` gate's request, or the CLI's own permission
+/// prompt that follows an allowed call (its sensitive-file check). The second is a separate
+/// question the CLI asks after the gate has allowed the call, so it is no evidence that the gate
+/// saw the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOrigin {
+    GateRequest,
+    ProviderPrompt,
+}
+
+/// One request the host answered itself: see [`AnsweredForYou::gate_answers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateAnswer {
+    pub origin: GateOrigin,
+    pub permission_id: String,
+    /// The call the request gates, when it named one.
+    pub tool_use_id: Option<String>,
+    pub tool_name: String,
+    /// `true` for a deferral to the CLI's own auto mode, `false` for an `allow`.
+    pub deferred: bool,
 }
 
 /// The tools the acceptEdits fast path applies to -- `agent::permission_policy`'s own (private)
@@ -3449,8 +3507,33 @@ mod tests {
             "the classifier's own allow for the Read is not given: the CLI decides"
         );
         assert_eq!(host_answered.len(), 3, "hidden from a resync like any host answer");
+        // The record of what the host answered says all three were deferrals, in order.
+        assert!(
+            answered
+                .gate_answers
+                .iter()
+                .all(|a| a.origin == GateOrigin::GateRequest),
+            "every one of these is the gate's own request: {:?}",
+            answered.gate_answers
+        );
+        let answered_by_the_host: Vec<(String, bool)> = answered
+            .gate_answers
+            .iter()
+            .map(|a| (a.permission_id.clone(), a.deferred))
+            .collect();
         assert_eq!(
-            answered,
+            answered_by_the_host,
+            vec![
+                ("perm-read".to_string(), true),
+                ("perm-build".to_string(), true),
+                ("perm-push".to_string(), true),
+            ]
+        );
+        assert_eq!(
+            AnsweredForYou {
+                gate_answers: Vec::new(),
+                ..answered
+            },
             AnsweredForYou::default(),
             "nothing was allowed by Eitri, so no row says it was"
         );

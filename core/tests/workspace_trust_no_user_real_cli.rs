@@ -14,6 +14,12 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 //!
+//! The legacy arms spawn `agent-hook`, a binary of the `agent` package that only a build with the
+//! legacy feature produces, and `cargo test -p eitri-core` does not build another package's binaries:
+//! build it first (`cargo build -p agent --features legacy-backend --bin agent-hook`) or name `-p agent`
+//! in the same `cargo test` invocation, or those arms fail with "agent-hook binary not found" before
+//! any turn runs.
+//!
 //! This is a binary of its own because `agent::setting_sources::configure(false)` is process-wide
 //! and set once; `workspace_trust_real_cli` runs with the shipped default. The fixture and the
 //! measurement are the same as there: a scratch project with a `SessionStart` hook, a

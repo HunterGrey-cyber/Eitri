@@ -314,9 +314,21 @@ pub struct Tab {
     /// Weak, so a finished write's flag goes with it; closing the tab clears every one that is
     /// still alive. Private: only the ticket route registers or clears them.
     review_watchers: Vec<Weak<AtomicBool>>,
+    /// Every request this tab's host answered itself, in order, for tests that need to know which
+    /// calls the gate saw and who answered (`Tab::gate_answers`). Compiled only for tests: a long
+    /// session would otherwise grow it for nothing.
+    #[cfg(any(test, feature = "test-support"))]
+    gate_log: Vec<crate::agent_backend::GateAnswer>,
 }
 
 impl Tab {
+    /// Every request this tab's host answered itself (a deferral or an `allow`), recorded where the
+    /// answer was sent, so it holds one a resolution had already removed from the projection.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn gate_answers(&self) -> &[crate::agent_backend::GateAnswer] {
+        &self.gate_log
+    }
+
     fn new(id: TabId, number: u16, mode: SessionModeChoice) -> Self {
         Tab {
             id,
@@ -350,6 +362,8 @@ impl Tab {
             prompt_note_candidates: std::collections::BTreeMap::new(),
             user_answered: BTreeSet::new(),
             review_watchers: Vec::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            gate_log: Vec::new(),
         }
     }
 
@@ -1581,6 +1595,8 @@ impl TabSet {
             let covered = backend.take_ui_snapshot_revision();
             #[cfg(test)]
             let covered = covered.filter(|_| !self.redeliver_covered);
+            #[cfg(any(test, feature = "test-support"))]
+            tab.gate_log.extend(answered_for_you.gate_answers);
             tab.prompt_note_candidates.extend(
                 answered_for_you
                     .prompts
