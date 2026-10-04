@@ -593,6 +593,8 @@ class PublicTreeLayoutTests(unittest.TestCase):
             ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"),
         )
         shutil.copytree(_PUBLISH_FILES, root, dirs_exist_ok=True)
+        # The public tree also carries docs/keymap/, which guide pages link to.
+        shutil.copytree(os.path.join(_REPO_ROOT, "docs", "keymap"), os.path.join(root, "docs", "keymap"))
         self.assertFalse(os.path.lexists(os.path.join(root, "publish")))
 
         result = subprocess.run(
