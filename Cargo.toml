@@ -49,6 +49,6 @@ default-members = [
 # the owner reversed D1 -- the first public release is 0.2.0, not 1.0.0. Release candidates are
 # `0.2.0-rc.N`. "v1" stays the internal milestone name; this field only ever carries the public
 # SemVer.
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 publish = false

@@ -35,7 +35,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "claude-runtime-protocol",
  "hyper-util",
@@ -942,7 +942,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "eitri-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent",
  "eitri-core",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "eitri-terminal"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alacritty_terminal",
  "libc",
@@ -2556,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "neovide-editor"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "glib",
  "gtk4",
@@ -3867,7 +3867,7 @@ dependencies = [
 
 [[package]]
 name = "shell"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent",
  "alacritty_terminal",
@@ -4171,7 +4171,7 @@ dependencies = [
 
 [[package]]
 name = "supervisor"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "gtk4",
  "serde",
@@ -4275,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-frame"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alacritty_terminal",
  "bitflags 2.13.1",
@@ -4284,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-input"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alacritty_terminal",
  "bitflags 2.13.1",
@@ -4293,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-render"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alacritty_terminal",
  "terminal-frame",
@@ -4301,7 +4301,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-sync"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alacritty_terminal",
  "libc",

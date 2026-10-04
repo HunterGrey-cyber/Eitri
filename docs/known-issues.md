@@ -29,6 +29,12 @@ bug, and tell us if something here is wrong or has changed. The requirements are
   startup; the editor and the terminal still work, and the agent panel shows the one-time fix in its place. The
   fix needs `sudo` and has a cost, both spelled out in
   [INSTALL.md](../INSTALL.md#ubuntu-2310-and-later).
+- **`v0.2.0` cannot be built from git for much longer.** The Neovide fork's public history was rewritten after
+  0.2.0 (commit metadata only; the files are the same), so the `v0.2.0` tag and every earlier commit point at fork
+  commits no branch holds. Build 0.2.1 or later. For 0.2.0 itself, 0.2.0's own `install.sh` with `--from-source`
+  works only while GitHub still serves those old objects, and the `eitri-0.2.0-source.tar.gz` on its release page
+  rebuilds it for good; a later release's `install.sh` cannot build 0.2.0 from source. Packages, tarballs and
+  `install.sh` are not affected.
 
 ## Speed and drawing
 
@@ -37,6 +43,10 @@ bug, and tell us if something here is wrong or has changed. The requirements are
   (Intel laptop, GTK 4.22.5, a stand-in stream at the default 5 updates a second, 165 Hz and 60 Hz). A real reply
   has not been measured. If you see lag while typing during a reply, say so in the "Testing feedback" form, with
   your GPU and monitor refresh rate.
+- **At high refresh rates under load the editor drops frames.** At 165 Hz on an Intel laptop, with other work
+  keeping the machine 17-28 % busy, it drew 137-149 frames a second where native Neovide drew 160, and 111 at 34 %
+  busy, with one 83.6 ms frame in four runs. That was measured before 0.2.0's typing-latency fix and not since.
+  Typing itself is within 1 ms of native Neovide on the machines measured.
 
 ## Reaching eitri.cc and GitHub from mainland China
 
@@ -52,12 +62,15 @@ Companion mode is the agent panel as its own window beside your own nvim
 ([INSTALL.md](../INSTALL.md#use-it-beside-your-own-nvim)). It is new, and less of it has been tried than of the
 one-window mode.
 
-- **Only sway with a terminal nvim has been tried.** Hyprland, niri, GNOME and upstream Neovide (or another nvim
-  GUI) as the host are not yet seen on real hardware. On Hyprland and niri the edge behaviour is the window
-  manager's own; Eitri does not check it.
-- **Inside tmux** the edge of tmux's panes stays tmux's, so there is no crossing from nvim to the panel window with
-  `Ctrl+h/j/k/l` unless you add a binding on the tmux side, and opening a file from the panel does not raise the
-  editor's window (the process tree from nvim leads to the tmux server, not to the terminal).
+- **Tried only in an isolated, headless test session so far, not on real hardware:** sway with a terminal nvim,
+  `eitri split` with Neovide 0.16.2 on sway (also started from a shell inside tmux), and the GNOME Shell extension in a headless GNOME Shell
+  50. Hyprland, niri, other nvim GUIs and a real GNOME login with the extension have not been tried at all. On
+  Hyprland and niri the edge behaviour is the window manager's own; Eitri does not check it.
+- **nvim inside tmux has not been tried yet.** The edge of tmux's panes stays tmux's. With vim-tmux-navigator
+  there is no crossing from nvim to the panel window with `Ctrl+h/j/k/l`; with smart-splits.nvim and its
+  `at_edge` hook set as in [INSTALL](../INSTALL.md#use-it-beside-your-own-nvim), the move should reach the panel at
+  tmux's own edge, but that is untested. Opening a file from the panel does not raise the editor's window (the
+  process tree from nvim leads to the tmux server, not to the terminal).
 - **A tmux server started before your window manager session** keeps that session's old `SWAYSOCK` or
   `HYPRLAND_INSTANCE_SIGNATURE` in its environment, and a panel started from an nvim in it inherits the stale value:
   focus moves and raising then do nothing. Restart the tmux server after logging in again, or start the panel from a
@@ -88,6 +101,15 @@ one-window mode.
   `.claude/` is trusted only through the hook's command text, so trusting a project means trusting its code to run, as
   building it does. Continuing a conversation in a real terminal runs plain `claude`, whose own trust question applies.
   To forget every answer, delete `~/.local/state/eitri/trust/`.
+- **In an Auto tab, Claude Code's own auto mode can let the agent write under `.git/` without asking**, a new
+  git hook included. Turn review does not show changes under `.git/`, and the trust question watches `.claude/`,
+  `.mcp.json` and `CLAUDE.md`, not `.git/`. After a turn in a repository you care about, `ls .git/hooks` is worth a
+  look. An edit under `.claude/`, by contrast, makes Eitri ask the trust question again before the next session.
+- **A hook in your own Claude Code settings (or a trusted project's) can change a tool call after you approved
+  it.** Claude Code applies a hook's rewritten input after Eitri has seen the original; when Claude Code then
+  asks, its card shows the rewritten input and the tool's row the original. Hooks work this way in a terminal too.
+- **A trusted project's `permissions.allow` rules reach an Auto tab only if you have also trusted that directory
+  in terminal `claude`.** That is Claude Code's own rule; your user settings' rules always apply.
 - **The bottom terminal can write to your clipboard, by design.** A program running there can set the clipboard
   or the primary selection with an OSC 52 escape sequence (the same default as Alacritty); Eitri shows no notice
   when it happens, so what you paste next may not be what you copied. Reading the clipboard is refused.
@@ -123,8 +145,12 @@ file in your nvim.
 
 ## Stability
 
-0.2.0 was the first public release. The `init.lua` API and the default keys may change during 0.x; the goal for
-0.3 is a version stable enough to be our own everyday editor.
+0.2.0 was the first public release. Much of what 0.2.1 adds (companion mode, `eitri split`, the GNOME extension,
+turn review, the trust question, Auto tabs on Claude Code's own auto mode) has been seen working only in an
+isolated, headless test session, and restoring the last session's tabs, the tmux key import and the new `j`/`k`
+movement only in automated tests; reports from real desktops are especially welcome. The `init.lua` API and the
+default keys may change during 0.x; the goal for 0.3 is a version stable enough to be our own everyday editor,
+after real hardware and a week of daily use.
 
 ## Not on this list?
 

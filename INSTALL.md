@@ -11,7 +11,7 @@ before one exists, it still opens with no agent backend and a one-line hint to r
 option lists are `sh install.sh --help` and `eitri setup --help`; that output, not this file, is the
 source of truth once you've read this once.
 
-**Requirements**: GTK ≥ 4.14, WebKitGTK 6.0, glibc ≥ 2.39, x86_64 Linux. **0.2.0 is x86_64 only** —
+**Requirements**: GTK ≥ 4.14, WebKitGTK 6.0, glibc ≥ 2.39, x86_64 Linux. **Eitri is x86_64 only** —
 building from source (below) needs the same architecture and refuses on anything else, so there is
 no ARM route yet. **nvim ≥ 0.10** — your own, on `PATH`, or let the installer fetch a
 private copy for Eitri alone (below). Claude Code, installed and logged in (a warning, not a
@@ -32,7 +32,7 @@ nothing is said either way (`curl -f` only trips on a 4xx/5xx status, never a 30
 `install.sh`'s own `fetch()` flags for every non-loopback download (`packaging/install.sh`'s `fetch()`
 function).
 
-Pass options after `--`: `curl … install.sh | sh -s -- --version 0.2.0 --yes`.
+Pass options after `--`: `curl … install.sh | sh -s -- --version 0.2.1 --yes`.
 
 **If you'd rather read it before running it**, download it first instead of piping it:
 
@@ -167,7 +167,8 @@ sh install.sh --from-source
 archive is x86_64, and no ARM archive is pinned yet.
 
 Clones the public repository at the release's own tag, refuses unless its `HEAD` matches that
-release's recorded commit, then builds and installs exactly like the prebuilt route. Needs the full
+release's recorded commit, then builds and installs exactly like the prebuilt route. It builds 0.2.1 and
+later; for 0.2.0, see the [known issues](docs/known-issues.md#installing). Needs the full
 toolchain: **Rust 1.96 or newer** (edition 2024; the installer refuses an older `rustc`), **GTK
 4.14+ and WebKitGTK 6.0 development packages** plus `pkg-config`, **Node.js and npm**, **`protoc`**,
 a **C toolchain**, and **network access** on the first build. `--checkout DIR` builds a local
@@ -193,7 +194,7 @@ be trusted even if the new one turns out to be bad — it (and any other revisio
 install on this machine) is removed the *next* time you update. Restart open Eitri windows afterwards — they keep running against the old
 install, but a new tab or the agent handoff needs the new one. A `.deb`/`.rpm` upgrade is your package
 manager's own job; run `eitri setup` again afterwards only if the pinned sidecar revision changed
-(it is a no-op if the one already built for the current revision is still present).
+(it did in 0.2.1; it is a no-op if the one already built for the current revision is still present).
 
 Eitri has an icon from 0.2.1 on, and its desktop entry is named after its application id,
 `cn.huntergrey.eitri.desktop` (it was `eitri.desktop`), which is how the desktop matches the window to
@@ -267,7 +268,8 @@ a sidecar revision once no install uses it, as [Updating](#updating) describes.
 $XDG_DATA_HOME/eitri/sidecar/<rev>/                              the sidecar eitri setup built, per-user routes
 $XDG_DATA_HOME/eitri/nvim/<X.Y.Z>/                               a private nvim copy, only if you accepted the offer
 ~/.config/eitri/init.lua                                         your own config (EITRI_CONFIG_DIR overrides the dir)
-$XDG_STATE_HOME/eitri/                                           per-project layout, open tabs, prompt history, permission rules
+$XDG_STATE_HOME/eitri/                                           per-project layout, open tabs, prompt history, permission rules,
+                                                                 trust answers, turn review snapshots
 ```
 
 The sidecar row is per-user for every route above — **except AUR** (`eitri-bin`/`eitri-git`),
@@ -302,6 +304,36 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "by
   bypass with `Shift+Tab` (that choice is remembered per project and keeps winning). Setting it to
   `"bypass"` is the one way a window starts in bypass without asking, because you have said so in
   your own file; it also lets saved bypass tabs come back in bypass without the question.
+
+## What an agent session loads
+
+Like `claude` in a terminal, every session loads your own Claude Code settings: your hooks, plugins,
+skills, `CLAUDE.md` and permission rules. To leave them out, put this in `~/.config/eitri/init.lua`:
+
+```lua
+eitri.config.set("agent.user_settings", false)    -- true (the default) or false
+```
+
+A project's own configuration -- its `.claude/` directory, `.mcp.json`, `CLAUDE.md` and `CLAUDE.local.md`,
+from the project directory up to the top of its git repository -- loads only once you trust it, because a
+repository you did not write could otherwise start its own hooks and MCP servers at your first message.
+The first session in such a project shows what Eitri found (each hook with its command, each MCP server
+with its command line, each allow rule) and asks `y` or `n`. `y` is remembered for the project until any
+of those files changes, and then Eitri asks again; `n` starts the session without them, for this window.
+`:trust` on the panel's command line (`:` in BROWSE) asks again, `:untrust` forgets the answer, and
+`<prefix> i` shows what a tab loaded. A change applies to sessions started afterwards. Its limits are in
+the [known issues](docs/known-issues.md#security).
+
+**Auto and bypass.** `Shift+Tab` switches a tab between auto and bypass, asking first on the way into
+bypass. In bypass Eitri approves tool calls itself. In auto it still sees every call: one your saved rules
+allow is approved, and the rest is left to Claude Code's own auto mode, whose refusals show on the tool's
+row as `blocked by auto: <reason>`; after repeated refusals Claude Code asks you itself, on a card. When
+Claude Code cannot run its auto mode, Eitri's own rules decide which calls need your card, as in 0.2.0.
+
+**Turn review** is on by default: after a turn, `c` in BROWSE shows what changed on disk during it.
+`eitri.config.set("review.enabled", false)` takes no snapshots and offers no review, and
+`eitri.config.set("review.hint", true)` adds a one-line hint to the status band after each turn. How it
+works and its limits: [known issues](docs/known-issues.md#turn-review).
 
 ## Your tmux keys
 
@@ -396,8 +428,9 @@ eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", 
 
 **5. Inside tmux.** When nvim runs inside tmux, nothing in nvim's environment changes, its
 navigator maps are left alone, and your tmux setup keeps moving between tmux panes as it does today.
-The edge of tmux's panes is tmux's: a key that tmux handles never reaches the panel window, so
-crossing to it needs a binding on the tmux side (or your window manager's keys). The editor's window
+The edge of tmux's panes is tmux's. With vim-tmux-navigator there is no crossing to the panel window
+(use a binding on the tmux side, or your window manager's keys); with smart-splits.nvim, the `at_edge`
+hook below should hand a move at tmux's own edge to the panel. Neither has been tried yet. The editor's window
 is not raised when you open a file from the panel, because from inside tmux the process tree leads
 to the tmux server, not to the terminal.
 

@@ -2,15 +2,105 @@ Eitri @VERSION@ -- Your Neovim, with Claude Code beside it.
 Built from commit @COMMIT@ in the Ubuntu 24.04 release container. It runs on glibc 2.39, GTK 4.14
 and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 
-**0.2.0 is the first public release**, after an earlier non-public pre-release 0.1.0. If you have an
-installed test build numbered `1.0.0-rc.N`, it sorts above this release, so the installer refuses to
-downgrade over it -- uninstall it first (`sh install.sh --uninstall`, or remove the package).
+0.2.1 brings companion mode (the agent panel beside your own nvim), turn review and workspace trust, and
+Auto tabs now leave their decisions to Claude Code's own auto mode. Much of it is new enough that so far it has
+been tried only in an isolated test session, not on real hardware: see "How much of this has been tried"
+below.
 
-**Upgrading from 0.2.0:** Eitri has an icon now, and its desktop entry is named after its application
-id, `cn.huntergrey.eitri.desktop` (it was `eitri.desktop`). Updating removes the old entry, so if you
-had pinned Eitri to your dash or dock, pin it again once. If you rerun a saved 0.2.0 `install.sh` to
-upgrade, that works too, but it cannot install the icon: run this release's `install.sh` once more to get it
-(INSTALL.md, "Updating").
+## What's new in 0.2.1
+
+**Beside your own editor**
+
+- **Companion mode:** the agent panel as a window of its own, next to the nvim you already use (in a
+  terminal, in tmux, or in a Neovim GUI). Add the bundled `eitri.nvim` plugin and run `:EitriPanel`, or run
+  `eitri panel` from a shell (INSTALL.md, "Use it beside your own nvim").
+- **`eitri split [DIR]`** opens upstream Neovide and the panel side by side, attached to each other; closing
+  that Neovide closes the panel. It needs `neovide` on your `PATH`.
+- **`Ctrl+h/j/k/l` moves focus between the panel and its editor** on sway, Hyprland and niri, and on GNOME
+  with the bundled GNOME Shell extension, which you turn on yourself and which starts working at your next
+  login (INSTALL.md, "GNOME: the extension"). On KDE, Eitri cannot move focus, so there the keys do nothing.
+
+**The agent**
+
+- **Turn review:** after a turn, `c` in BROWSE lists the files that changed on disk during it, with their
+  hunks. `x` reverts a hunk or a file, `u` undoes that, `i` and `s` send comments and your reverts back to the
+  agent, and `o` draws the hunks over the file in your nvim. The snapshots it needs are kept under
+  `~/.local/state/eitri/`, never in your project; `review.enabled = false` turns it off.
+- **Auto tabs use Claude Code's own auto mode.** Eitri still sees every tool call; one your saved rules do not
+  allow is left to Claude Code's classifier, and what it refuses shows on the tool's row as
+  `blocked by auto: <reason>`. Where Claude Code cannot run its auto mode, Eitri's own rules answer, as in 0.2.0.
+- **Your own Claude Code configuration loads**, as it does in a terminal: your settings, hooks, plugins,
+  skills, `CLAUDE.md` and permission rules. `eitri.config.set("agent.user_settings", false)` leaves it out.
+- **A project's own Claude configuration loads only after you trust it.** The first session in a project
+  with a `.claude/` directory, a `.mcp.json` or a `CLAUDE.md` lists the hooks, MCP servers and allow rules it
+  found and asks `y`/`n`; a change to any of them asks again. `:trust` and `:untrust` on the panel's command line.
+- **A turn that fails, stops at a limit, is interrupted or is lost says so** where it ended.
+- **The last session's tabs come back** from the empty tab's dashboard (`s`), or at every launch with
+  `agent.restore = "auto"`.
+
+**Keys and the panel**
+
+- **Your tmux prefix and prefix-table bindings are picked up** from tmux's own configuration files;
+  `keymap.from_tmux = "off"` stops it.
+- `j`/`k` move evenly over replies of very different heights, and CARET's `w`/`e`/`b` follow vim's word rules.
+- Eitri has an app icon, and its desktop entry is now `cn.huntergrey.eitri.desktop`.
+
+**Security fixes**
+
+- A file whose name contained a line break could run a command in your nvim when it was opened from the
+  panel. File names now reach nvim only as data.
+- The panel runs only its own script (pinned by its hash); a link in a reply opens only `http`, `https` and
+  `mailto`; permission cards show invisible and direction-changing characters as `⟨U+XXXX⟩`; and a saved rule
+  can no longer start with a program that runs another one (`env`, `timeout`, `sh` and the like).
+- `install.sh` refuses a machine without `ssh-keygen`, since it could not check the release signature there;
+  `--insecure-skip-signature` goes on with the checksums alone.
+
+## Upgrading from 0.2.0
+
+- **The agent backend is rebuilt**, because it is pinned to a newer revision. `install.sh` does that as part
+  of the update; after a `.deb`/`.rpm` upgrade, run `eitri setup` once more.
+- **What a session loads changed.** 0.2.0 loaded a project's own `.claude/` settings, `.mcp.json` and
+  `CLAUDE.md` without asking, and not your own Claude Code settings. 0.2.1 loads yours, and the project's only
+  after the trust question, so each project with such files asks once.
+- **Eitri has an icon now**, and its desktop entry is named after its application id,
+  `cn.huntergrey.eitri.desktop` (it was `eitri.desktop`). Updating removes the old entry, so if you had pinned
+  Eitri to your dash or dock, pin it again once. If you rerun a saved 0.2.0 `install.sh` to upgrade, that
+  works too, but it cannot install the icon: run this release's `install.sh` once more to get it
+  (INSTALL.md, "Updating").
+
+**`v0.2.0` will stop building from git.** The public history of the Neovide fork was rewritten after 0.2.0
+(only commit metadata changed; the files are the same), so the `v0.2.0` tag and every earlier public commit
+point at fork commits that no branch holds any more. Build 0.2.1 or later from git. For 0.2.0 itself, its
+own `install.sh` (the 0.2.0 release asset) with `--from-source` works only until GitHub stops serving those
+old objects, and its `eitri-0.2.0-source.tar.gz` release asset, which carries the fork's files, rebuilds it
+for good; this release's `install.sh` cannot build 0.2.0 from source. The 0.2.0 packages, tarball and
+`install.sh` are not affected.
+
+## How much of this has been tried
+
+Everything new has automated tests, and the permission and trust paths were also run against the real
+`claude` (2.1.284 and 2.1.288). Beyond that:
+
+- **Seen working only in an isolated, headless test session** (scripted keys, not a person at a real
+  desktop): companion mode on sway with a terminal nvim; `eitri split` with Neovide 0.16.2 on sway; the GNOME
+  Shell extension in a headless GNOME Shell 50; turn review with its reverts and the nvim overlay; the trust
+  question; the `blocked by auto` rows; the panel's new script policy.
+- **Tests only, not yet seen on a screen:** restoring the last session's tabs, the tmux key import, the new
+  `j`/`k` movement, the wording of a turn stopped by a usage limit, and the icon in a real dock.
+- **Not tried at all yet:** Hyprland, niri, KDE, Neovim GUIs other than Neovide, and the extension in a real
+  GNOME login.
+
+None of it has been through real hardware and a person's hands yet; 0.3.0 waits for that and for a week of
+daily use. What you may run into is listed in the known issues (`docs/known-issues.md` in the repository).
+
+## Performance, against native Neovide
+
+Typing is within 1 ms of native Neovide at the median and at the 99th percentile on the two machines
+measured (an Intel laptop and an AMD desktop, GTK 4.22.5, 60 and 165 Hz; measured just before 0.2.0). Below
+GTK 4.16, and while a reply is streaming, see the known issues. **One known gap:** at 165 Hz on the Intel
+laptop, with other work keeping the machine 17-28 % busy, the editor drew 137-149 frames a second where
+native Neovide drew 160 (86-93 %), and 111 (69 %) at 34 % busy, with one 83.6 ms frame in four runs. That was
+measured before 0.2.0's typing-latency fix and has not been measured again since.
 
 ## Install
 
@@ -55,9 +145,58 @@ notice.
 
 Eitri @VERSION@ -- 你的 Neovim，与 Claude Code 并肩。基于提交 @COMMIT@，在 Ubuntu 24.04 发布容器中构建。运行环境需要 glibc 2.39、GTK 4.14 以及 WebKitGTK 2.40（webkitgtk-6.0 API）或更新版本。
 
-**0.2.0 是首个公开发行版**，此前有一个未公开的预发布版本 0.1.0。如果你安装过编号为 `1.0.0-rc.N` 的测试构建，它在版本排序上高于本次发布，安装程序会拒绝降级——请先卸载它（`sh install.sh --uninstall`，或者移除对应的软件包）。
+0.2.1 带来了 companion 模式（把 agent 面板放在你自己的 nvim 旁边）、回合审阅和工作区信任；Auto 标签页现在把判断交给 Claude Code 自己的 auto 模式。其中很多部分还很新，到目前为止只在一个隔离的测试会话里试过，还没有在真实硬件上试过：见下面的「哪些已经试过」。
 
-**从 0.2.0 升级：** Eitri 现在有图标了，它的 desktop 条目也改用应用 id 命名，叫 `cn.huntergrey.eitri.desktop`（原来是 `eitri.desktop`）。更新会移除旧条目，所以如果你之前把 Eitri 固定在了 dash 或 dock 上，需要重新固定一次。如果你重新运行存下来的 0.2.0 `install.sh` 来升级，也可以，但它装不上图标：再运行一次本次发布的 `install.sh` 就有了（见 INSTALL.md 的“更新”一节）。
+### 0.2.1 的新内容
+
+**放在你自己的编辑器旁边**
+
+- **Companion 模式：** 把 agent 面板作为一个独立窗口，开在你已经在用的 nvim 旁边（在终端里、在 tmux 里，或者在某个 Neovim 图形前端里）。装上随附的 `eitri.nvim` 插件后运行 `:EitriPanel`，或者在 shell 里运行 `eitri panel`（见 INSTALL.zh-CN.md 的「配合你自己的 nvim 使用」）。
+- **`eitri split [DIR]`** 把上游 Neovide 和面板并排打开，两者互相附着；关掉这个 Neovide，面板也会关闭。需要 `PATH` 里有 `neovide`。
+- **`Ctrl+h/j/k/l` 在面板和它的编辑器之间移动焦点**：sway、Hyprland 和 niri 上直接可用；GNOME 上需要随附的 GNOME Shell 扩展，由你自己启用，下次登录后生效（见 INSTALL.zh-CN.md 的「GNOME：扩展」）。在 KDE 上 Eitri 没法移动焦点，所以在那里这些键不起作用。
+
+**Agent**
+
+- **回合审阅：** 一个回合结束后，在 BROWSE 里按 `c`，列出这个回合期间磁盘上发生变化的文件和它们的 hunk。`x` 撤销一个 hunk 或一个文件，`u` 撤销这次撤销，`i` 和 `s` 把评论和你的撤销发回给 agent，`o` 在你的 nvim 里把这些 hunk 画在文件上。它需要的快照存放在 `~/.local/state/eitri/` 下，从不放进你的项目；`review.enabled = false` 可以关掉它。
+- **Auto 标签页使用 Claude Code 自己的 auto 模式。** Eitri 仍然看得到每一次工具调用；你保存的规则没有放行的调用，交给 Claude Code 的分类器决定，被它拒绝的会在该工具那一行显示为 `blocked by auto: <原因>`。Claude Code 运行不了它的 auto 模式时，由 Eitri 自己的规则来回答，和 0.2.0 一样。
+- **加载你自己的 Claude Code 配置**，和在终端里一样：你的设置、hook、插件、skill、`CLAUDE.md` 和权限规则。`eitri.config.set("agent.user_settings", false)` 可以不加载它们。
+- **项目自己的 Claude 配置，要你信任之后才加载。** 在一个带有 `.claude/` 目录、`.mcp.json` 或 `CLAUDE.md` 的项目里开第一个会话时，Eitri 会列出它找到的 hook、MCP server 和放行规则，并问你 `y`/`n`；其中任何一个有改动都会再问一次。面板的命令行里有 `:trust` 和 `:untrust`。
+- **失败、因限额停下、被中断或丢失的回合，会在它结束的地方说明。**
+- **上次会话的标签页可以找回来**：在空标签页的仪表盘上按 `s`，或者设 `agent.restore = "auto"`，每次启动时自动恢复。
+
+**按键与面板**
+
+- **会读取你的 tmux 前缀键和前缀表绑定**，来源是 tmux 自己的配置文件；`keymap.from_tmux = "off"` 可以关掉。
+- `j`/`k` 在高度相差很大的回复之间移动得更均匀；CARET 模式的 `w`/`e`/`b` 遵循 vim 的单词规则。
+- Eitri 有了应用图标，它的 desktop 条目现在叫 `cn.huntergrey.eitri.desktop`。
+
+**安全修复**
+
+- 文件名里带换行符的文件，从面板里打开时，可能在你的 nvim 里执行命令。现在文件名只作为数据传给 nvim。
+- 面板只运行它自己的那段脚本（按哈希固定）；回复里的链接只打开 `http`、`https` 和 `mailto`；权限卡片把不可见字符和改变文字方向的字符显示成 `⟨U+XXXX⟩`；保存的规则不能再以会去运行别的程序的程序开头（`env`、`timeout`、`sh` 之类）。
+- 在没有 `ssh-keygen` 的机器上，`install.sh` 会拒绝运行，因为它在那里没法检查发布签名；加上 `--insecure-skip-signature` 则只靠校验和继续。
+
+### 从 0.2.0 升级
+
+- **agent 后端会重新构建**，因为它固定到了一个更新的版本。`install.sh` 在更新时会顺带完成；`.deb`/`.rpm` 升级之后，请再运行一次 `eitri setup`。
+- **会话加载的内容变了。** 0.2.0 不经询问就加载项目自己的 `.claude/` 设置、`.mcp.json` 和 `CLAUDE.md`，却不加载你自己的 Claude Code 设置。0.2.1 加载你的设置，而项目的配置要等信任提问之后才加载，所以每个带有这些文件的项目都会问一次。
+- **Eitri 现在有图标了**，它的 desktop 条目也改用应用 id 命名，叫 `cn.huntergrey.eitri.desktop`（原来是 `eitri.desktop`）。更新会移除旧条目，所以如果你之前把 Eitri 固定在了 dash 或 dock 上，需要重新固定一次。如果你重新运行存下来的 0.2.0 `install.sh` 来升级，也可以，但它装不上图标：再运行一次本次发布的 `install.sh` 就有了（见 INSTALL.zh-CN.md 的“更新”一节）。
+
+**`v0.2.0` 将无法再从 git 构建。** 0.2.0 之后，Neovide fork 的公开历史被改写了（只改了提交的元数据，文件内容没有变），所以 `v0.2.0` 这个 tag 以及之前所有的公开提交，指向的都是已经没有任何分支持有的 fork 提交。请从 git 构建 0.2.1 或更新的版本。至于 0.2.0 本身：用它自己的 `install.sh`（0.2.0 的发布资源）加 `--from-source`，只在 GitHub 还提供那些旧对象时才能成功；用 0.2.0 发布页上的 `eitri-0.2.0-source.tar.gz` 则可以一直重新构建它，里面带着 fork 的文件。本次发布的 `install.sh` 没法从源码构建 0.2.0。0.2.0 的安装包、tar 包和 `install.sh` 不受影响。
+
+### 哪些已经试过
+
+所有新功能都有自动化测试，权限和信任相关的路径还在真实的 `claude`（2.1.284 和 2.1.288）上跑过。除此之外：
+
+- **只在一个隔离的、无界面的测试会话里见过它正常工作**（用脚本按键，不是一个人坐在真实桌面前）：sway 上配合终端 nvim 的 companion 模式；sway 上配合 Neovide 0.16.2 的 `eitri split`；无界面 GNOME Shell 50 里的 GNOME Shell 扩展；回合审阅及其撤销和 nvim 叠加层；信任提问；`blocked by auto` 行；面板新的脚本策略。
+- **只有测试，还没在屏幕上见过：** 恢复上次会话的标签页、tmux 键位导入、新的 `j`/`k` 移动、因用量限额停下的回合的提示文字，以及图标在真实 dock 里的样子。
+- **完全还没试过：** Hyprland、niri、KDE、Neovide 之外的 Neovim 图形前端，以及在真实 GNOME 登录会话里的扩展。
+
+这些都还没有经过真实硬件和真人的手；0.3.0 要等这一步，再加上一周的日常使用。你可能遇到的问题列在已知问题里（仓库中的 `docs/known-issues.zh-CN.md`）。
+
+### 性能：与原生 Neovide 对比
+
+在测过的两台机器上（一台 Intel 笔记本和一台 AMD 台式机，GTK 4.22.5，60 Hz 和 165 Hz；在 0.2.0 发布前不久测的），打字延迟的中位数和第 99 百分位都与原生 Neovide 相差不到 1 ms。GTK 低于 4.16 时，以及回复正在流式输出时，见已知问题。**一个已知差距：** 在那台 Intel 笔记本上，165 Hz、有其他工作让机器保持 17-28 % 繁忙时，编辑器每秒画 137-149 帧，而原生 Neovide 是 160 帧（86-93 %）；繁忙度 34 % 时是 111 帧（69 %），四次测量里出现过一帧 83.6 ms。这是在 0.2.0 的打字延迟修复之前测的，之后还没有重测。
 
 ### 安装
 
