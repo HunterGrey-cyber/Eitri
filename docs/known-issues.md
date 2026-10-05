@@ -54,12 +54,12 @@ Users on some Chinese ISPs (reported so far: China Telecom in Fujian, Jiangsu an
 foreign sites that are not on the ISP's whitelist are reset, so eitri.cc and github.com may not open at all
 there. The installer downloads from GitHub, so it can fail the same way. If you can get the release files another
 way, `sh install.sh --tarball FILE --sums FILE --sig FILE` installs from them
-([INSTALL.md](../INSTALL.md#quick-install)); the sidecar build still needs a network that reaches Node.js and npm.
+([INSTALL.md](../INSTALL.md#offline-from-release-files)); the sidecar build still needs a network that reaches Node.js and npm.
 
 ## Companion mode
 
 Companion mode is the agent panel as its own window beside your own nvim
-([INSTALL.md](../INSTALL.md#use-it-beside-your-own-nvim)). It is new, and less of it has been tried than of the
+([the guide](guide/companion.md)). It is new, and less of it has been tried than of the
 one-window mode.
 
 - **Tried only in an isolated, headless test session so far, not on real hardware:** sway with a terminal nvim,
@@ -68,7 +68,7 @@ one-window mode.
   Hyprland and niri the edge behaviour is the window manager's own; Eitri does not check it.
 - **nvim inside tmux has not been tried yet.** The edge of tmux's panes stays tmux's. With vim-tmux-navigator
   there is no crossing from nvim to the panel window with `Ctrl+h/j/k/l`; with smart-splits.nvim and its
-  `at_edge` hook set as in [INSTALL](../INSTALL.md#use-it-beside-your-own-nvim), the move should reach the panel at
+  `at_edge` hook set as in [the guide](guide/companion.md#navigator-plugins-and-tmux), the move should reach the panel at
   tmux's own edge, but that is untested. Opening a file from the panel does not raise the editor's window (the
   process tree from nvim leads to the tmux server, not to the terminal).
 - **A tmux server started before your window manager session** keeps that session's old `SWAYSOCK` or
@@ -81,7 +81,7 @@ one-window mode.
   whether a window lies that way, so at the edge the key does nothing, as tmux's own `select-pane` does at its edge.
 - **KDE: no focus moves.** A Wayland client cannot take focus there; use the desktop's own window keys.
 - **GNOME needs the Eitri GNOME Shell extension** for focus moves, enabled by you and loaded at your next login
-  ([INSTALL](../INSTALL.md#gnome-the-extension)). With it: moves stay on the focused window's monitor; an X11 or
+  ([the guide](guide/companion.md#gnome-the-extension)). With it: moves stay on the focused window's monitor; an X11 or
   XWayland window never counts; moving back within about a third of a second of the previous move is refused; a
   terminal that runs all its windows in one process (GNOME Terminal, Ptyxis) gets focus handed back to its most
   recent window, which may not be nvim's; a forwarded `eitri split` does not bring the panel forward; and the
