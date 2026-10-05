@@ -20,6 +20,16 @@ It installs into `~/.local`, without `sudo`, and builds the agent sidecar on you
 
 To check the download's signature before running it, see [Verify before running](#verify-before-running).
 
+## AUR (Arch)
+
+```sh
+yay -S eitri-bin    # prebuilt binaries; the sidecar is built while the package builds
+yay -S eitri-git    # everything built from source
+```
+
+Updates come with the rest of your system (`yay -Syu`). nvim and Claude Code are optional dependencies, so
+a self-built or `bob`-managed nvim is left alone.
+
 ## Other ways to install
 
 ### `.deb` / `.rpm`
@@ -36,15 +46,6 @@ eitri setup
 The packages run no install scripts, so `eitri setup` builds the sidecar and offers a private nvim if yours
 is older than 0.10. `eitri setup --help` lists its other modes. There is no package repository, so each
 update is a new download.
-
-### AUR (Arch)
-
-```sh
-yay -S eitri-bin    # prebuilt binaries; the sidecar is built while the package builds
-yay -S eitri-git    # everything built from source
-```
-
-nvim and Claude Code are optional dependencies, so a self-built or `bob`-managed nvim is left alone.
 
 ### From source
 
