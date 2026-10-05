@@ -27,7 +27,8 @@ Download the package from the [releases page](https://github.com/HunterGrey-cybe
 then run `eitri setup` once as your own user:
 
 ```sh
-sudo apt install ./eitri_<version>_amd64.deb      # or: sudo dnf install ./eitri-<version>-1.x86_64.rpm
+sudo apt install ./eitri_<version>_amd64.deb       # Debian, Ubuntu
+sudo dnf install ./eitri-<version>-1.x86_64.rpm    # Fedora, RHEL
 eitri setup
 ```
 

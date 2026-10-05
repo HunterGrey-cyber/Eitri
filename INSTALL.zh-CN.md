@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=6781ecf2794efac88ac40e876f7d34454e19c4b541d4574aee7974781aca7a60 -->
+<!-- translated-from: INSTALL.md sha256=b7c2df82ef71cbad30b3780d5418f0fc417de25ba8bf3165dbde345c4ff34312 -->
 
 # 安装 Eitri
 
@@ -24,7 +24,8 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 从[发布页面](https://github.com/HunterGrey-cyber/eitri/releases)下载软件包并安装，然后用你自己的用户身份运行一次 `eitri setup`：
 
 ```sh
-sudo apt install ./eitri_<version>_amd64.deb      # 或者：sudo dnf install ./eitri-<version>-1.x86_64.rpm
+sudo apt install ./eitri_<version>_amd64.deb       # Debian、Ubuntu
+sudo dnf install ./eitri-<version>-1.x86_64.rpm    # Fedora、RHEL
 eitri setup
 ```
 
