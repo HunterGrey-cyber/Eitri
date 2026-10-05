@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=b7c2df82ef71cbad30b3780d5418f0fc417de25ba8bf3165dbde345c4ff34312 -->
+<!-- translated-from: INSTALL.md sha256=c98ffe694a463e4fb4e2313ffa7f034017954634d09134d9cae3b1aa19f9d86c -->
 
 # 安装 Eitri
 
@@ -12,7 +12,7 @@
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
 ```
 
-装到 `~/.local`，不需要 `sudo`。安装时还会在你的机器上构建 agent sidecar（[原因](#why-the-sidecar-is-built-on-your-machine)），要几分钟，需要联网和大约 600 MiB 磁盘空间。选项写在 `sh -s --` 后面，例如 `… | sh -s -- --version 0.2.1 --yes`；全部选项见 `sh install.sh --help`。
+这是推荐的安装方式，适用于所有发行版；Arch 上用 [AUR 包](#aur-arch)更合适。装到 `~/.local`，不需要 `sudo`。安装时还会在你的机器上构建 agent sidecar（[原因](#why-the-sidecar-is-built-on-your-machine)），要几分钟，需要联网和大约 600 MiB 磁盘空间。选项写在 `sh -s --` 后面，例如 `… | sh -s -- --version 0.2.1 --yes`；全部选项见 `sh install.sh --help`。
 
 想在运行前先校验下载的签名，见[运行前先验证](#verify-before-running)。
 
@@ -29,7 +29,7 @@ sudo dnf install ./eitri-<version>-1.x86_64.rpm    # Fedora、RHEL
 eitri setup
 ```
 
-这两种包不运行任何安装脚本，所以由 `eitri setup` 来构建 sidecar；你的 nvim 低于 0.10 时，它还会提议装一份私有副本。它的其他模式见 `eitri setup --help`。
+这两种包不运行任何安装脚本，所以由 `eitri setup` 来构建 sidecar；你的 nvim 低于 0.10 时，它还会提议装一份私有副本。它的其他模式见 `eitri setup --help`。没有软件源，所以每次更新都要重新下载软件包。
 
 <a id="aur-arch"></a>
 ### AUR（Arch）
