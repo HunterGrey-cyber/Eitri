@@ -57,6 +57,7 @@ eitri panel [--nvim <addr>] [DIR]
 
 从面板里打开一个文件，会在你的 Neovim 里打开它，并把编辑器的窗口带到前面（在 tmux 里除外，见下）。第二次 `:EitriPanel` 会把面板带到前面。
 
+<a id="navigator-plugins-and-tmux"></a>
 ### 导航插件和 tmux
 
 Neovim 在 tmux 外面时，vim-tmux-navigator 什么都不用做：面板附着期间，它的 `TmuxNavigate` 映射被当作普通的窗口移动，所以在 Neovim 的边缘，`Ctrl+h/j/k/l` 会越过去到面板。
