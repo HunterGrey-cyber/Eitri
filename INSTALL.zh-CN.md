@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=c98ffe694a463e4fb4e2313ffa7f034017954634d09134d9cae3b1aa19f9d86c -->
+<!-- translated-from: INSTALL.md sha256=a0db1a05e007a42237bfe2a6dcbbea19a1c46f804e520e545920e37726803e3b -->
 
 # 安装 Eitri
 
@@ -16,6 +16,16 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 
 想在运行前先校验下载的签名，见[运行前先验证](#verify-before-running)。
 
+<a id="aur-arch"></a>
+## AUR（Arch）
+
+```sh
+yay -S eitri-bin    # 预构建二进制；sidecar 在打包过程中构建
+yay -S eitri-git    # 全部从源码构建
+```
+
+更新随系统一起（`yay -Syu`）。nvim 和 Claude Code 都是可选依赖，所以不会动你自己编译的或者由 `bob` 管理的 nvim。
+
 <a id="other-ways-to-install"></a>
 ## 其他安装方式
 
@@ -30,16 +40,6 @@ eitri setup
 ```
 
 这两种包不运行任何安装脚本，所以由 `eitri setup` 来构建 sidecar；你的 nvim 低于 0.10 时，它还会提议装一份私有副本。它的其他模式见 `eitri setup --help`。没有软件源，所以每次更新都要重新下载软件包。
-
-<a id="aur-arch"></a>
-### AUR（Arch）
-
-```sh
-yay -S eitri-bin    # 预构建二进制；sidecar 在打包过程中构建
-yay -S eitri-git    # 全部从源码构建
-```
-
-nvim 和 Claude Code 都是可选依赖，所以不会动你自己编译的或者由 `bob` 管理的 nvim。
 
 <a id="from-source"></a>
 ### 从源码构建
