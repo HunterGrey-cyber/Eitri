@@ -6,6 +6,7 @@ import type { ChooserRow } from "../chooser";
 import { shortId } from "./SessionRow";
 import { isShiftTab, modeFixedMessage, modeKeyRoute } from "../modeKey";
 import { isModifierKey } from "../typingGuard";
+import { NO_TEXT_ASSIST } from "../textField";
 
 type Props = {
   envelope: ChooserEnvelope;
@@ -345,6 +346,7 @@ export function Chooser({
       {filtering || filter !== "" ? (
         <input
           ref={filterRef}
+          {...NO_TEXT_ASSIST}
           className="chooser-filter"
           aria-label="Filter sessions"
           placeholder="filter by name or title"
@@ -471,6 +473,7 @@ function ChooserRowItem({
           {isRenaming ? (
             <input
               ref={renameRef}
+              {...NO_TEXT_ASSIST}
               className="chooser-rename"
               aria-label={`Rename tab ${row.tab.tab}`}
               value={renaming!.value}
