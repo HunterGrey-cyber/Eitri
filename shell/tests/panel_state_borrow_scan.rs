@@ -12,7 +12,10 @@
 //! helper call away from `send_tabs` (or from anything that emits a signal whose handler borrows
 //! `state`) is a latent abort even when it is harmless today.
 //!
-//! **What it reads.** Every `.rs` file under `shell/src` as text, comments and string and character
+//! **What it reads.** Every `.rs` file under the directories in `SCANNED` (relative to the workspace
+//! root; one that is missing or holds no such file fails the scan, and so does a missing anchor: the
+//! panel's state, its message handler and the terminal pane's `send_command`, so a scan whose code moved
+//! away cannot pass on what is left) as text, comments and string and character
 //! literals blanked out first (so a message or a doc comment that names the shape is not one). For
 //! each `match` keyword, and each `if` or `while` keyword followed by `let`, the scrutinee is
 //! everything up to the `{` that opens the arms or the body -- a brace inside parentheses or brackets
@@ -28,8 +31,7 @@
 //! its own cell again. A `let` that binds a guard (`let mut state_ref = state.borrow_mut();`) and an
 //! `if` condition (whose temporaries end before the body) are not scrutinees.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use eitri_core::source_scan as scan;
 
 /// Replaces comments and string and character literals with spaces, keeping every newline so the
 /// line numbers stay true.
@@ -276,37 +278,25 @@ fn offences(src: &str) -> Vec<(usize, Form, String)> {
     found
 }
 
-fn rust_files(dir: &Path, into: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display())) {
-        let path = entry.expect("a directory entry").path();
-        if path.is_dir() {
-            rust_files(&path, into);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            into.push(path);
-        }
-    }
-}
+/// Directories scanned, relative to the workspace root.
+const SCANNED: &[&str] = &["shell/src", "panel/src"];
 
 #[test]
 fn no_scrutinee_holds_a_state_borrow() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    rust_files(&root, &mut files);
-    assert!(
-        files.len() > 10,
-        "the scan found only {} files under {}",
-        files.len(),
-        root.display()
+    let read = scan::rust_sources(SCANNED);
+    // The panel's state, its message handler, and the terminal pane's own `state`.
+    scan::require_anchors(
+        &read,
+        &[
+            "struct AgentPanelState",
+            "fn handle_inbound_message(",
+            "fn send_command(",
+        ],
     );
     let mut problems = Vec::new();
-    for file in &files {
-        let src = fs::read_to_string(file).unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
-        for (line, form, scrut) in offences(&src) {
-            problems.push(format!(
-                "{}:{line}: `{} {scrut}`",
-                file.strip_prefix(&root).unwrap().display(),
-                form.keyword()
-            ));
+    for source in &read {
+        for (line, form, scrut) in offences(&source.text) {
+            problems.push(format!("{}:{line}: `{} {scrut}`", source.path, form.keyword()));
         }
     }
     assert!(

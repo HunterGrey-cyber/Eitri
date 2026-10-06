@@ -35,6 +35,7 @@ const BANNED_SUBSTRINGS: &[&str] = &[
 
 const TARGET_CRATES: &[&str] = &[
     "eitri-core",
+    "eitri-panel",
     "agent",
     "eitri-terminal",
     "terminal-render",

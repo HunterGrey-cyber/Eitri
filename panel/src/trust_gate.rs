@@ -1253,212 +1253,11 @@ impl WorkerHold {
     }
 }
 
-/// Reading Rust source as text for the scans here and in the panel: comments and literals blanked,
-/// items found by name and braces, so formatting can neither hide a call nor invent one.
-#[cfg(test)]
-pub(crate) mod scan {
-    /// `text` with every comment, string literal and character literal replaced by spaces (line
-    /// breaks kept), so neither a brace nor a word inside one counts.
-    pub(crate) fn code_only(text: &str) -> String {
-        let chars: Vec<char> = text.chars().collect();
-        let mut out: Vec<char> = Vec::with_capacity(chars.len());
-        let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
-        let ident = |c: char| c.is_alphanumeric() || c == '_';
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            let next = chars.get(i + 1).copied();
-            if c == '/' && next == Some('/') {
-                while i < chars.len() && chars[i] != '\n' {
-                    out.push(' ');
-                    i += 1;
-                }
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                let mut depth = 0;
-                while i < chars.len() {
-                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                        depth += 1;
-                        out.extend([' ', ' ']);
-                        i += 2;
-                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                        depth -= 1;
-                        out.extend([' ', ' ']);
-                        i += 2;
-                        if depth == 0 {
-                            break;
-                        }
-                    } else {
-                        out.push(blank(chars[i]));
-                        i += 1;
-                    }
-                }
-                continue;
-            }
-            let starts_word =
-                i == 0 || !ident(chars[i - 1]) || (chars[i - 1] == 'b' && (i < 2 || !ident(chars[i - 2])));
-            if c == 'r' && starts_word {
-                let mut j = i + 1;
-                while chars.get(j) == Some(&'#') {
-                    j += 1;
-                }
-                if chars.get(j) == Some(&'"') {
-                    let hashes = j - i - 1;
-                    out.extend(std::iter::repeat_n(' ', j - i + 1));
-                    i = j + 1;
-                    while i < chars.len() {
-                        if chars[i] == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#')) {
-                            out.extend(std::iter::repeat_n(' ', hashes + 1));
-                            i += hashes + 1;
-                            break;
-                        }
-                        out.push(blank(chars[i]));
-                        i += 1;
-                    }
-                    continue;
-                }
-            }
-            if c == '"' {
-                out.push(' ');
-                i += 1;
-                while i < chars.len() && chars[i] != '"' {
-                    if chars[i] == '\\' {
-                        out.push(' ');
-                        i += 1;
-                    }
-                    if i < chars.len() {
-                        out.push(blank(chars[i]));
-                        i += 1;
-                    }
-                }
-                out.push(' ');
-                i += 1;
-                continue;
-            }
-            if c == '\'' {
-                if next == Some('\\') {
-                    let mut j = i + 2;
-                    while j < chars.len() && chars[j] != '\'' {
-                        j += 1;
-                    }
-                    out.extend(std::iter::repeat_n(' ', j + 1 - i));
-                    i = j + 1;
-                    continue;
-                }
-                if chars.get(i + 2) == Some(&'\'') {
-                    out.extend([' ', ' ', ' ']);
-                    i += 3;
-                    continue;
-                }
-            }
-            out.push(c);
-            i += 1;
-        }
-        out.into_iter().collect()
-    }
-
-    /// The byte positions just after every whole-word occurrence of `word`.
-    pub(crate) fn word_ends(code: &str, word: &str) -> Vec<usize> {
-        let ident = |c: char| c.is_alphanumeric() || c == '_';
-        code.match_indices(word)
-            .filter(|(at, _)| !code[..*at].chars().next_back().is_some_and(ident))
-            .map(|(at, w)| at + w.len())
-            .filter(|end| !code[*end..].chars().next().is_some_and(ident))
-            .collect()
-    }
-
-    /// The text from the `{` at `open` to its matching `}`, inclusive.
-    pub(crate) fn braced(code: &str, open: usize) -> &str {
-        let mut depth = 0usize;
-        for (at, c) in code[open..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &code[open..=open + at];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("unbalanced braces from byte {open}");
-    }
-
-    /// The body of every `fn NAME`.
-    pub(crate) fn functions<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
-        word_ends(code, "fn")
-            .into_iter()
-            .filter_map(|after_fn| {
-                let rest = &code[after_fn..];
-                let trimmed = rest.trim_start();
-                if !trimmed.starts_with(name)
-                    || trimmed[name.len()..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                {
-                    return None;
-                }
-                let start = after_fn + (rest.len() - trimmed.len());
-                let open = start + code[start..].find('{')?;
-                Some(braced(code, open))
-            })
-            .collect()
-    }
-
-    /// The body of every `mod NAME`.
-    pub(crate) fn modules<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
-        word_ends(code, "mod")
-            .into_iter()
-            .filter_map(|after| {
-                let rest = &code[after..];
-                let trimmed = rest.trim_start();
-                let is_name = trimmed.starts_with(name)
-                    && !trimmed[name.len()..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
-                if !is_name {
-                    return None;
-                }
-                let start = after + (rest.len() - trimmed.len()) + name.len();
-                let next = code[start..].trim_start();
-                next.starts_with('{')
-                    .then(|| braced(code, start + (code[start..].len() - next.len())))
-            })
-            .collect()
-    }
-
-    /// `code` with every one of `bodies` (slices of `code`) blanked.
-    pub(crate) fn without(code: &str, bodies: &[&str]) -> String {
-        let mut out = code.to_owned();
-        for body in bodies {
-            let start = body.as_ptr() as usize - code.as_ptr() as usize;
-            out.replace_range(start..start + body.len(), &" ".repeat(body.len()));
-        }
-        out
-    }
-
-    /// Every call of `name` in `code`: the word followed (after blanks) by `(`, and not a definition
-    /// (`fn name`) or a method of something else (`.name(`).
-    pub(crate) fn calls(code: &str, name: &str) -> usize {
-        word_ends(code, name)
-            .into_iter()
-            .filter(|end| code[*end..].trim_start().starts_with('('))
-            .filter(|end| {
-                let before = code[..end - name.len()].trim_end();
-                !before.ends_with('.') && !before.ends_with("fn")
-            })
-            .count()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use eitri_core::project_trust::{Entry, EntryKind};
+    use eitri_core::source_scan as scan;
     use std::time::{Duration, Instant};
 
     /// A scratch directory holding a fake home with the project below it and a fake state home.
@@ -2607,9 +2406,15 @@ mod tests {
     /// the panel that wires it ever names that file.
     #[test]
     fn the_gate_never_names_the_accounts_config_file() {
-        for file in ["src/trust_gate.rs", "src/agent_panel.rs"] {
-            let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
-            assert!(!text.contains(concat!(".claude", ".json")), "{file} names it");
+        const SCANNED: &[&str] = &["shell/src", "panel/src"];
+        let read = scan::rust_sources(SCANNED);
+        for needle in ["struct TrustGate", "struct AgentPanelState"] {
+            let source = scan::file_with(&read, needle);
+            assert!(
+                !source.text.contains(concat!(".claude", ".json")),
+                "{} names it",
+                source.path
+            );
         }
     }
 }

@@ -28,7 +28,7 @@ pub(crate) const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(60);
 
 /// What the caller should do about one `web-process-terminated` signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CrashResponse {
+pub enum CrashResponse {
     /// Reload the page: still within the allowed rate.
     Reload,
     /// The crash rate just crossed the limit -- stop reloading and show the caller's own visible
@@ -43,7 +43,7 @@ pub(crate) enum CrashResponse {
 /// One guard per `WebView` -- construct it alongside the view and keep it for that view's whole
 /// lifetime. A fresh `WebView` (a killed-and-revived Lua panel gets a new `WebView` object) gets a
 /// fresh guard; there is no cross-view state.
-pub(crate) struct WebViewCrashGuard {
+pub struct WebViewCrashGuard {
     max: usize,
     window: Duration,
     /// Crash timestamps still inside `window`, oldest first.
@@ -62,7 +62,7 @@ impl WebViewCrashGuard {
     }
 
     /// [`MAX_CRASHES_PER_WINDOW`] crashes per [`CRASH_LOOP_WINDOW`] -- what both call sites use.
-    pub(crate) fn with_defaults() -> Self {
+    pub fn with_defaults() -> Self {
         Self::new(MAX_CRASHES_PER_WINDOW, CRASH_LOOP_WINDOW)
     }
 
@@ -83,7 +83,7 @@ impl WebViewCrashGuard {
     }
 
     /// [`on_crash_at`](Self::on_crash_at) against the real clock -- what the GTK call sites use.
-    pub(crate) fn on_crash(&mut self) -> CrashResponse {
+    pub fn on_crash(&mut self) -> CrashResponse {
         self.on_crash_at(Instant::now())
     }
 
@@ -101,7 +101,7 @@ impl WebViewCrashGuard {
     /// perform the manual recovery they are telling the user to try, never from inside the
     /// AUTOMATIC path (`on_crash`/`on_crash_at`'s own `Reload` branch), which must keep counting
     /// toward the very loop it exists to detect.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.crashes.clear();
         self.given_up = false;
     }
@@ -112,7 +112,7 @@ impl WebViewCrashGuard {
 /// crashed the real page. `recovery` names the affected caller's own way back to a live page by
 /// hand -- the agent panel's `\u{21bb}`/`prefix r`, or a Lua panel's `prefix x` then its own key --
 /// since the two differ and a message naming the wrong one would not help.
-pub(crate) fn crash_message_html(recovery: &str) -> String {
+pub fn crash_message_html(recovery: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0;padding:24px;\
 font-family:sans-serif;background:#1e1e1e;color:#d4d4d4;\"><p>This panel's web process kept crashing, \

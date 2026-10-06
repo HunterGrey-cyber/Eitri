@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { classify, failureEvidence, neverOpenedReason, sidecarStopped } from "./problems";
 import watchRs from "../../../agent/src/providers/claude_sidecar/watch.rs?raw";
-import agentPanelRs from "../../../shell/src/agent_panel.rs?raw";
+import agentPanelRs from "../../../panel/src/agent_panel.rs?raw";
 import cliMissingFixture from "./fixtures/problems/cli-missing.txt?raw";
 import cliOutOfRangeFixture from "./fixtures/problems/cli-out-of-range.txt?raw";
 import notLoggedInFixture from "./fixtures/problems/not-logged-in.txt?raw";

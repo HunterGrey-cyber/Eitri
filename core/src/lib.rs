@@ -48,6 +48,11 @@ pub mod wm;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_providers;
 
+/// Reading the workspace's own sources as text, for the tests that hold an invariant by scanning code,
+/// here and in `shell`'s and `eitri-panel`'s tests.
+#[cfg(any(test, feature = "test-support"))]
+pub mod source_scan;
+
 /// The crate-wide guard that every socket path here is built through `agent::socket_path`.
 /// Test-only, and in its own file so it can exclude itself from its own walk without excluding
 /// `lib.rs` -- exactly how `agent::socket_path`'s original does it.

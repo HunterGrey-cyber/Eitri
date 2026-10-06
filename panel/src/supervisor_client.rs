@@ -11,7 +11,7 @@ use std::path::Path;
 use supervisor::{AgentStatus, ShellMessage, SupervisorMessage};
 
 /// One status per window: the most urgent tab's status. The dashboard does not show per-tab rows.
-pub(crate) fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) -> AgentStatus {
+pub fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) -> AgentStatus {
     fn rank(status: AgentStatus) -> u8 {
         match status {
             AgentStatus::Blocked => 4,
@@ -30,7 +30,7 @@ pub(crate) fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) 
 /// Maps an optional session projection to dashboard status. A tab has no backend until its first
 /// send or resume, or after backend failure; `None` maps to `NoSession`.
 /// Called once per tab; `aggregate_status` picks the window's status.
-pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus {
+pub fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus {
     let Some(projection) = projection else {
         return AgentStatus::NoSession;
     };
@@ -59,7 +59,7 @@ pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> Agen
 /// degrades to "this shell window just doesn't appear in the dashboard" rather than propagating
 /// an error `shell`'s own startup or main loop would need to handle -- this is a nice-to-have
 /// integration, never a safety-critical one like `agent`'s own permission hook.
-pub(crate) struct SupervisorClient {
+pub struct SupervisorClient {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
     instance_id: String,
@@ -79,7 +79,7 @@ pub(crate) struct SupervisorClient {
 /// process to initialize and bind its socket -- far more than the 250ms this used to allow, so the
 /// window that spawned it was systematically the one window the dashboard never showed. Observed
 /// live on 2026-09-15, not theorized: two windows, and only the second one appeared.
-pub(crate) enum PendingSupervisor {
+pub enum PendingSupervisor {
     Ready(Option<SupervisorClient>),
     Connecting(std::sync::mpsc::Receiver<Option<SupervisorClient>>),
 }
@@ -117,7 +117,7 @@ impl SupervisorClient {
     ///
     /// Every failure degrades to "this window just doesn't appear in the dashboard", logged and
     /// never propagated, matching this crate's posture for non-critical integrations.
-    pub(crate) fn connect_or_spawn(instance_id: String, project_name: String, project_dir: &Path) -> PendingSupervisor {
+    pub fn connect_or_spawn(instance_id: String, project_name: String, project_dir: &Path) -> PendingSupervisor {
         let socket_path = supervisor::socket_path();
 
         if let Ok(stream) = UnixStream::connect(&socket_path) {
@@ -229,7 +229,7 @@ impl SupervisorClient {
     /// Sends a `Status` message only if `status` differs from the last one actually sent --
     /// called from `agent_panel.rs`'s existing 33ms pump timer, so without this dedup every tick
     /// would write to the socket regardless of whether anything changed.
-    pub(crate) fn send_status(&mut self, status: AgentStatus) {
+    pub fn send_status(&mut self, status: AgentStatus) {
         if self.dead || self.last_sent_status == Some(status) {
             return;
         }
@@ -250,7 +250,7 @@ impl SupervisorClient {
     /// Non-blocking: returns `true` if a `SupervisorMessage::Activate` arrived since the last
     /// call. Drains any buffered lines fully (a burst arriving between polls shouldn't be missed
     /// or double-counted), returning `true` if *any* of them was `Activate`.
-    pub(crate) fn poll_activate(&mut self) -> bool {
+    pub fn poll_activate(&mut self) -> bool {
         if self.dead {
             return false;
         }

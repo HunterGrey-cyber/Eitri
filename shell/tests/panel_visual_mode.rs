@@ -25,7 +25,7 @@
 //!
 //! The page loads with `PANEL_BASE_URI`. An opaque origin from `load_html(.., None)` has no
 //! `navigator.clipboard` in WebKitGTK. The constant is duplicated because `shell` has no library
-//! target exposing it; `panel_base_uri_matches_product` checks it against `agent_panel.rs`.
+//! target exposing it; `panel_base_uri_matches_product` checks it against `panel_document.rs`.
 //! Copies are read back through GDK's `Clipboard`. Flash text and wrapped `writeText` calls
 //! cannot prove the clipboard changed. Trusted input supplies the user activation that
 //! `navigator.clipboard.writeText` may require.
@@ -130,7 +130,7 @@ const W5_PINNED: Option<&str> = Some("a\tb\n1\t2\n3\t4");
 /// The document `shell/src/agent_panel.rs` embeds, byte for byte.
 const AGENT_UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../agent-ui/web/dist/index.html"));
 
-/// `agent_panel::themed_document`'s exact insertion rule (duplicated the same way
+/// `PanelDocument::themed`'s exact insertion rule (duplicated the same way
 /// `panel_stream_scroll.rs` does): the theme `<style>` goes directly after the first `<head>`.
 fn themed_document(vars: &[(String, String)]) -> String {
     let declarations: String = vars.iter().map(|(name, value)| format!("{name}:{value};")).collect();
@@ -139,14 +139,14 @@ fn themed_document(vars: &[(String, String)]) -> String {
     format!("{}{}{}", &AGENT_UI_HTML[..at], style, &AGENT_UI_HTML[at..])
 }
 
-/// Needs no display: reads `agent_panel.rs`'s own source as text and checks the literal this file
+/// Needs no display: reads `panel_document.rs`'s own source as text and checks the literal this file
 /// duplicated is still the same one. Runs every time, `--ignored` or not.
 fn panel_base_uri_matches_product() -> Result<(), String> {
-    let source = include_str!("../src/agent_panel.rs");
+    let source = include_str!("../../panel/src/panel_document.rs");
     let needle = format!("const PANEL_BASE_URI: &str = \"{PANEL_BASE_URI}\";");
     if !source.contains(&needle) {
         return Err(format!(
-            "agent_panel.rs's own PANEL_BASE_URI no longer reads {needle:?} -- update the copy in this file"
+            "panel_document.rs's own PANEL_BASE_URI no longer reads {needle:?} -- update the copy in this file"
         ));
     }
     Ok(())

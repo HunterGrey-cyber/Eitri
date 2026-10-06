@@ -18,7 +18,7 @@
 //! classify an envelope as `Immediate`.
 //!
 //! This module has no clock of its own or GTK dependency: each method takes an `Instant`, so
-//! pacing is testable without a display. `shell/src/panel_pacer.rs` owns the WebView.
+//! pacing is testable without a display. `panel/src/panel_pacer.rs` owns the WebView.
 
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;

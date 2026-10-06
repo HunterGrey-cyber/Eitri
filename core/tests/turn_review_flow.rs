@@ -2133,17 +2133,22 @@ fn a_new_owner_is_a_new_editor() {
 #[test]
 fn review_editor_never_types_keys() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = [
-        root.join("src/review_editor.rs"),
-        root.join("src/turn_review/flow.rs"),
-        root.join("../shell/src/review_editor.rs"),
-    ];
+    let files = [root.join("src/review_editor.rs"), root.join("src/turn_review/flow.rs")];
+    let shell_sources = eitri_core::source_scan::rust_sources(&["shell/src", "panel/src"]);
+    let shell_editor = eitri_core::source_scan::file_with(&shell_sources, "struct ReviewEditor");
     // Spelled in pieces so this file never contains what it looks for.
     let needles = [["send", "_keys"].concat(), ["input", "_keys"].concat()];
-    for file in files {
-        let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+    let mut texts: Vec<(String, String)> = files
+        .iter()
+        .map(|file| {
+            let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+            (file.display().to_string(), text)
+        })
+        .collect();
+    texts.push((shell_editor.path.clone(), shell_editor.text.clone()));
+    for (name, text) in &texts {
         for needle in &needles {
-            assert!(!text.contains(needle.as_str()), "{} mentions {needle}", file.display());
+            assert!(!text.contains(needle.as_str()), "{name} mentions {needle}");
         }
     }
 }

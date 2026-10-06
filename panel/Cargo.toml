@@ -1,0 +1,29 @@
+[package]
+name = "eitri-panel"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The agent panel's logic with no toolkit in it: tabs, sessions, the trust gate, turn review's panel side,
+# the page protocol's sending side and the pacer. A host (`shell` with WebKitGTK on Linux) supplies the page
+# and the process through `panel_page::{PageSurface, PanelHost}` and drives it. No GTK, GLib or WebKit crate
+# may appear here, directly or transitively (`src/manifest_guard.rs`, `core/tests/f1_no_toolkit_below_shell.rs`).
+
+[features]
+legacy-backend = ["eitri-core/legacy-backend"]
+
+[dependencies]
+agent = { path = "../agent" }
+eitri-core = { path = "../core" }
+# Without `gui`: the client side of the dashboard needs none of its window.
+supervisor = { path = "../supervisor", default-features = false }
+serde_json = "1"
+# The panel's CSP hash (`panel_csp.rs`) needs no GLib, so the page logic can leave GTK. Both are already in
+# the release graph (sha2 0.10.9 through `agent` and `eitri-core`, base64 0.22.1 the only base64 in
+# Cargo.lock), so this adds no crate.
+sha2 = "0.10"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+eitri-core = { path = "../core", features = ["test-support"] }

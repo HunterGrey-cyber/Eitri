@@ -20,30 +20,26 @@ mod module_grid;
 mod nvim_keys;
 mod pane_focus;
 mod pane_switch;
-mod panel_csp;
-mod panel_pacer;
 mod panel_super;
 mod prefix;
 mod prefix_strip;
-mod review_editor;
-mod supervisor_client;
 mod tab_verbs;
 mod terminal;
-mod terminal_handoff;
 mod text_size;
 mod theme;
 mod toast;
 mod tray;
-mod trust_gate;
 mod version;
 mod web_host;
 mod webkit_sandbox;
 mod webkit_zoom;
-mod webview_crash_guard;
 mod wheel_zoom;
 mod window_config;
 mod window_mode;
 mod xft_dpi;
+
+// The panel's crash guard lives in `eitri-panel`; the alias keeps `crate::webview_crash_guard::` working.
+use eitri_panel::webview_crash_guard;
 
 use std::cell::RefCell;
 use std::ffi::OsString;
@@ -2081,15 +2077,16 @@ fn build_ui(
         // was never left, this is a no-op. The session's `Rc<RefCell<AgentPanelState>>`
         // is otherwise held by internal closures that do not run on window close, so
         // this call ensures settings backup restoration, hook socket cleanup, and child SIGTERM.
-        // The panel uses a `gio` application hold while waiting for its children, so its
-        // shutdown call returns at once and the process stays alive after the window
-        // closes until teardown reports completion.
+        // The panel's `shutdown` starts teardown on workers and returns the remaining
+        // work. `hold_until_done` takes a `gio` application hold for it, so the panel's
+        // shutdown returns at once and the process stays alive after the window closes
+        // until teardown reports completion.
         //
         // `pane.shutdown()` above runs first on this thread and waits for nvim to exit.
         // The close path waits for nvim's `:confirm qall` before reaching this handler,
         // so nvim has already exited and that call returns at once. An nvim that cannot
         // be killed refuses the close instead of reaching this handler.
-        agent_panel_handle.shutdown(&app_for_close);
+        agent_panel::hold_until_done(&app_for_close, agent_panel_handle.shutdown());
         // `lua_engine` is otherwise unused past this point in this task, but referencing it
         // here is what keeps its `Rc` alive for the life of the window rather than dropping as
         // soon as `build_ui` returns -- nothing else in this function holds a reference past
@@ -2412,36 +2409,37 @@ mod tests {
         );
     }
 
-    /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module and its line comments cut
-    /// off -- so this test's own copies of the accelerators cannot satisfy it.
-    fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-        for entry in std::fs::read_dir(dir).expect("shell/src is readable") {
-            let path = entry.expect("a readable entry").path();
-            if path.is_dir() {
-                sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).expect("a readable source file");
-                let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+    /// Directories scanned, relative to the workspace root.
+    const SCANNED: &[&str] = &["shell/src", "panel/src"];
+
+    /// Every `.rs` file of [`SCANNED`], with its `#[cfg(test)]` module and its line comments cut
+    /// off -- so this test's own copies of the accelerators cannot satisfy it. Fails when a
+    /// directory is missing or the code the scan exists to cover is not in what it read.
+    fn sources() -> Vec<(String, String)> {
+        use eitri_core::source_scan as scan;
+        let read = scan::rust_sources(SCANNED);
+        scan::require_anchors(
+            &read,
+            &["fn build_ui(", "fn handle_inbound_message(", "struct TrustGate"],
+        );
+        read.into_iter()
+            .map(|source| {
+                let code = source.text.split("#[cfg(test)]").next().unwrap_or_default();
                 let code: String = code
                     .lines()
                     .map(|line| line.split("//").next().unwrap_or_default())
                     .collect::<Vec<_>>()
                     .join("\n");
-                out.push((path.display().to_string(), code));
-            }
-        }
+                (source.path, code)
+            })
+            .collect()
     }
 
     /// Every accelerator-shaped string literal in `shell/src`, cut from `.rs` files by
     /// [`sources`]/[`is_accel`]. Shared, so the two tests below scan the same tree the same way.
     fn found_accelerators() -> Vec<(String, String)> {
-        let mut files = Vec::new();
-        sources(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
         let mut found = Vec::new();
-        for (name, code) in &files {
+        for (name, code) in &sources() {
             for (index, chunk) in code.split('"').enumerate() {
                 if index % 2 == 1 && is_accel(chunk) {
                     found.push((name.clone(), chunk.to_string()));
@@ -2456,16 +2454,7 @@ mod tests {
     /// Exercise `is_accel` directly so a broken scanner cannot make this test pass.
     #[test]
     fn shell_src_writes_no_accelerator_literal() {
-        let mut files = Vec::new();
-        sources(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
-        assert!(
-            files.len() >= 20,
-            "only {} source files -- the walk is broken",
-            files.len()
-        );
+        sources();
         assert!(is_accel("<Control><Shift>f") && is_accel("F11") && is_accel("<Control>KP_Add"));
         assert!(!is_accel("<C-b>") && !is_accel("Ctrl+b"));
         assert_eq!(
