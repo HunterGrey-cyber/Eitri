@@ -114,8 +114,9 @@
 //! deny rule ends the call there ("Hook returned 'allow' ... but deny rule overrides"). An `Edit(...)`
 //! ask rule makes the tool's own `checkPermissions` (`Lb`) return an ask, which `DR` hands back
 //! (`Pve`) and `EQn` then puts to `canUseTool` instead of taking the hook's allow: on the sidecar an
-//! O3 provider prompt carrying `matched_ask_rule`, which `eitri-core` cards in every mode
-//! (`ProviderPrompt::needs_a_human`; pinned for an edit the fast path allowed by
+//! O3 provider prompt carrying `matched_ask_rule`, which `eitri-core` cards in Auto, and which a
+//! bypass tab answers like every other request (`ProviderPrompt::needs_its_own_card`; pinned for an
+//! edit the fast path allowed by
 //! `agent_backend::tests::a_users_own_ask_rule_still_cards_an_edit_the_fast_path_allowed`); on the
 //! legacy backend, under `--print` with no prompt tool, a refusal. Before item 4A every edit carded
 //! here, so this chain never mattered; now it is the only thing between a user's ask rule for an

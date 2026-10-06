@@ -39,11 +39,10 @@
 //! `answered_for_you` event). A test that needs a card in an Auto tab therefore uses a call both
 //! worlds card -- a project `permissions.ask` rule, or a path outside the project -- and the tests
 //! about "nothing runs ungated" accept an answer the host gave itself ([`GateTrace`]) as proof that
-//! the gate saw the call, where they used to look only for a card. A card an ask rule forces is the
-//! human's in every mode, and so is one that explains nothing, which is how a content-scoped ask rule
-//! reaches the host on CLI 2.1.288, so entering bypass leaves either waiting and a bypass tab cards
-//! them (test 6a); a card that entering bypass does approve needs the host's own policy to have raised
-//! it, which only legacy does (test 6b).
+//! the gate saw the call, where they used to look only for a card. A card an ask rule forces is a card
+//! of its own in an Auto tab, and so is one that explains nothing, which is how a content-scoped ask
+//! rule reaches the host on CLI 2.1.288; bypass approves both, on entering it and in a bypass tab
+//! (test 6a). A waiting card the host's own policy raised, which only legacy does, is test 6b.
 //!
 //! **A run that did not exercise what a test is about fails as INCONCLUSIVE** (v1-mode fix round 1,
 //! after Codex's findings 2-4): test 1b needs exactly five Reads each paired with its own resolution
@@ -1587,13 +1586,12 @@ fn protected_paths_under_default_with_hook_allow() {
             bypass_trace.prompt_answered,
             bypass_trace.prompt_notes
         );
-        // Bypass answers a CLI prompt only when it gives a reason: one that explains nothing could be the
-        // user's own ask rule and is a card, so any prompt answered here was labelled as a plain ask,
-        // never as "maybe your ask rule".
+        // Bypass answers every CLI prompt, whatever it says about why it asked, and each one answered
+        // here is noted on its call's row as allowed in bypass.
         for (call, note) in &bypass_trace.prompt_notes {
             assert!(
-                note.starts_with("Claude Code asked") && !note.contains("maybe your ask rule"),
-                "{rel}: bypass answered the CLI's own prompt for {call} though it gave no reason: {note:?}"
+                note.ends_with("— allowed in bypass"),
+                "{rel}: the CLI's own prompt for {call} was answered other than by bypass: {note:?}"
             );
         }
         assert_eq!(
@@ -2152,42 +2150,13 @@ fn call_result_is_error(set: &TabSet, tab: TabId, tool_use_id: &str) -> Option<b
         .and_then(|call| call.result.as_ref().map(|result| result.is_error))
 }
 
-/// Pumps until the tab's turn has ended, denying every card that is drawn on the way: after a refusal
-/// the model often tries the same call again, and an unanswered second card would hold the turn open
-/// until the deadline. Returns how many cards it denied.
-fn deny_cards_until_the_turn_ends(set: &mut TabSet, dir: &std::path::Path, tab: TabId, what: &str) -> usize {
-    let mut denied = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let out = set.pump(dir, true);
-        for event in events_from_payload(out.active_payload.as_deref()) {
-            if event["type"] == "permission_requested" {
-                if let Some(id) = event["permission_id"].as_str() {
-                    denied += 1;
-                    let _ = set.get_mut(tab).unwrap().live_mut().unwrap().respond_permission(
-                        id,
-                        PermissionDecision::Deny {
-                            reason: Some("v1-mode probe".into()),
-                        },
-                    );
-                }
-            }
-        }
-        if !set.get(tab).unwrap().turn_running() {
-            return denied;
-        }
-        assert!(Instant::now() < deadline, "{what}: the turn never ended");
-        std::thread::sleep(Duration::from_millis(33));
-    }
-}
-
-/// What test 6a does for one spelling of the ask rule: entering bypass leaves a card the user's own
-/// `permissions.ask` rule forced exactly where it was. `cycle_mode` lists nothing to approve, says the
-/// card stays, `confirm_bypass` approves nothing and the write does not happen until the human answers.
-/// Whether the CLI names the rule in its prompt (`matched_ask_rule`) is printed, not asserted: a bare
-/// tool-name rule does on CLI 2.1.288 and a content-scoped one does not, and either way the prompt must
-/// be the human's.
-fn bypass_leaves_the_ask_rule_card_waiting(label: &str, ask_rule: &str) {
+/// What test 6a does for one spelling of the ask rule: a card the user's own `permissions.ask` rule
+/// forced waits in an Auto tab (the CLI's own prompt, one Auto keeps as a card of its own even after an
+/// approval of the same call), and entering bypass lists it, approves it, the write lands, and the
+/// Write's row says it was allowed in bypass under the prompt's label. Whether
+/// the CLI names the rule in its prompt (`matched_ask_rule`) is printed, not asserted: a bare tool-name
+/// rule does on CLI 2.1.288 and a content-scoped one does not.
+fn bypass_approves_the_ask_rule_card(label: &str, ask_rule: &str) {
     let dir = project(label);
     std::fs::create_dir_all(dir.join(".claude")).unwrap();
     std::fs::write(
@@ -2214,6 +2183,7 @@ fn bypass_leaves_the_ask_rule_card_waiting(label: &str, ask_rule: &str) {
     let card_id = card.permission_id.clone();
     let prompt = card
         .prompt
+        .clone()
         .unwrap_or_else(|| panic!("the card is the CLI's own prompt, not the host's policy"));
     println!(
         "[v1-mode] test6a {ask_rule}: prompt reason={:?} blocked_path={:?} matched_ask_rule={:?} label={:?}",
@@ -2223,8 +2193,12 @@ fn bypass_leaves_the_ask_rule_card_waiting(label: &str, ask_rule: &str) {
         prompt.label()
     );
     assert!(
-        prompt.needs_a_human(),
-        "the project's ask rule {ask_rule} forced this prompt, so only a human answers it: {prompt:?}"
+        prompt.needs_its_own_card(),
+        "the project's ask rule {ask_rule} forced this prompt, so an Auto tab keeps it a card of its own: {prompt:?}"
+    );
+    assert!(
+        !dir.join("first.txt").exists(),
+        "nothing is written while the card waits in the Auto tab"
     );
 
     let plan = match set.cycle_mode(tab).unwrap() {
@@ -2232,88 +2206,89 @@ fn bypass_leaves_the_ask_rule_card_waiting(label: &str, ask_rule: &str) {
         other => panic!("entering bypass always asks first (D2), got {other:?}"),
     };
     assert!(
-        !plan.approve.contains(&card_id),
-        "an ask-rule card is never listed for approval: {:?}",
+        plan.approve.contains(&card_id),
+        "the ask-rule card {card_id} is listed for approval: {:?}",
         plan.approve
     );
-    assert!(
-        plan.lines.len() >= 2,
-        "the prompt says that the card stays waiting: {:?}",
-        plan.lines
-    );
+    assert_eq!(plan.lines.len(), 1, "no card stays waiting: {:?}", plan.lines);
     match set.confirm_bypass(plan.scope, plan.nonce).unwrap() {
         ConfirmOutcome::Entered { approved, .. } => {
-            assert_eq!(approved, plan.approve.len(), "only what the plan listed was approved")
+            assert_eq!(approved, plan.approve.len(), "every listed card was approved")
         }
         other => panic!("expected Entered, got {other:?}"),
     }
     assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Bypass);
 
-    // Give the CLI and the pump a moment to do whatever approving would have caused.
-    for _ in 0..30 {
-        set.pump(&dir, true);
+    // The rest of the turn runs in bypass: no card is drawn, whatever else the model does.
+    let mut trace = GateTrace::new(&dir);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let out = set.pump(&dir, true);
+        let events = events_from_payload(out.active_payload.as_deref());
+        trace.observe(&set, tab, &events);
+        assert!(
+            !events.iter().any(|e| e["type"] == "permission_requested"),
+            "a bypass tab draws no card: {events:#?}"
+        );
+        if !set.get(tab).unwrap().turn_running() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the approved call never finished");
         std::thread::sleep(Duration::from_millis(33));
     }
     assert!(
-        set.get(tab)
+        !set.get(tab)
             .unwrap()
             .live()
             .unwrap()
             .projection()
             .pending_permissions
             .contains_key(&card_id),
-        "the ask-rule card is still waiting after bypass was entered"
-    );
-    assert!(
-        !dir.join("first.txt").exists(),
-        "entering bypass must not have approved the ask-rule card"
+        "the ask-rule card was answered"
     );
     if let Some(call) = &card.tool_use_id {
-        assert_ne!(
+        assert_eq!(
             call_result_is_error(&set, tab, call),
             Some(false),
-            "the Write {call} behind the ask-rule card must not have run"
+            "the Write {call} behind the approved ask-rule card ran without error"
+        );
+        assert_eq!(
+            trace.prompt_notes.get(call).map(String::as_str),
+            Some(format!("{} — allowed in bypass", prompt.label()).as_str()),
+            "the Write {call}'s row says bypass answered the ask rule's prompt"
         );
     }
-
-    // The human's own answer is what ends it.
-    let _ = set.get_mut(tab).unwrap().live_mut().unwrap().respond_permission(
-        &card_id,
-        PermissionDecision::Deny {
-            reason: Some("v1-mode probe".into()),
-        },
-    );
-    deny_cards_until_the_turn_ends(&mut set, &dir, tab, "after the denial");
-    assert!(!dir.join("first.txt").exists(), "denied: nothing written");
+    assert!(dir.join("first.txt").exists(), "the approved write landed");
 }
 
 /// Test 6a, a bare tool-name rule: the spelling on CLI 2.1.288 whose prompt names the rule
-/// (`matched_ask_rule`), which makes it the human's in every mode. The opposite half, a card that
-/// entering bypass does approve, is test 6b.
+/// (`matched_ask_rule`). Entering bypass approves it like any other card. A waiting card the host's
+/// own policy raised is test 6b.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
-fn entering_bypass_leaves_an_ask_rule_card_waiting() {
-    bypass_leaves_the_ask_rule_card_waiting("mid-turn-bypass-ask-rule", "Write");
+fn entering_bypass_approves_an_ask_rule_card() {
+    bypass_approves_the_ask_rule_card("mid-turn-bypass-ask-rule", "Write");
 }
 
 /// Test 6a, a content-scoped rule: on CLI 2.1.288 its prompt arrives with no reason, no matched rule
 /// and no blocked path, because the CLI leaves `decision_reason` out for a rule it matched itself and
-/// the Agent SDK drops the reason type. A prompt that explains nothing is a card in every mode, so it
-/// stays waiting here just as the bare rule's does. (Entering bypass used to approve it, and the write
-/// ran, in 4 of 4 runs.)
+/// the Agent SDK drops the reason type. An Auto tab keeps such a prompt a card of its own; entering
+/// bypass approves it all the same.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
-fn entering_bypass_leaves_a_content_scoped_ask_rule_card_waiting() {
-    bypass_leaves_the_ask_rule_card_waiting("mid-turn-bypass-ask-rule-scoped", "Edit(first.txt)");
+fn entering_bypass_approves_a_content_scoped_ask_rule_card() {
+    bypass_approves_the_ask_rule_card("mid-turn-bypass-ask-rule-scoped", "Edit(first.txt)");
 }
 
-/// Test 6a, a content-scoped rule on a tab that is ALREADY in bypass: there is no confirm to leave the
-/// card out of, so this is the path that used to answer the CLI's prompt `allow` with no card at all.
-/// The call must still reach a card, and nothing is written until the human answers it.
+/// Test 6a, a content-scoped rule on a tab that is ALREADY in bypass: the gate's request is answered
+/// `allow`, the CLI then raises its own prompt for the rule, and bypass answers that too. No card is
+/// drawn, the host's answer to the CLI's own prompt for the Write is recorded (so the rule really
+/// fired), its row says it was allowed in bypass, and the file is written.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
-fn a_bypass_tab_cards_a_content_scoped_ask_rule_prompt() {
-    let dir = project("bypass-tab-ask-rule-scoped");
+fn a_bypass_tab_answers_a_content_scoped_ask_rule_prompt() {
+    let label = "bypass-tab-ask-rule-scoped";
+    let dir = project(label);
     std::fs::create_dir_all(dir.join(".claude")).unwrap();
     std::fs::write(
         dir.join(".claude/settings.json"),
@@ -2321,39 +2296,51 @@ fn a_bypass_tab_cards_a_content_scoped_ask_rule_prompt() {
     )
     .unwrap();
     let (mut set, tab) = bypass_tab(BackendKind::Sidecar, &dir);
-    set.get_mut(tab)
-        .unwrap()
-        .live_mut()
-        .unwrap()
-        .send_turn(
-            "Use the Write tool to create a file named first.txt in the current directory containing \
-             the word ok.",
-            "first-write",
-        )
-        .map_err(|e| e.message)
-        .unwrap();
-    let card = wait_for_the_card_for(&mut set, &dir, tab, "first.txt", "the ask-rule card in a bypass tab");
-    let prompt = card
-        .prompt
-        .clone()
-        .unwrap_or_else(|| panic!("the card is the CLI's own prompt, not the host's policy"));
-    assert!(prompt.needs_a_human(), "{prompt:?}");
-    for _ in 0..30 {
-        set.pump(&dir, true);
-        std::thread::sleep(Duration::from_millis(33));
-    }
-    assert!(
-        !dir.join("first.txt").exists(),
-        "nothing is written before the human answers"
-    );
-    let _ = set.get_mut(tab).unwrap().live_mut().unwrap().respond_permission(
-        &card.permission_id,
-        PermissionDecision::Deny {
-            reason: Some("v1-mode probe".into()),
+    let mut trace = GateTrace::new(&dir);
+    let mut requested = 0usize;
+    drive_turn(
+        &mut set,
+        &dir,
+        tab,
+        "Use the Write tool to create a file named first.txt in the current directory containing the word ok.",
+        label,
+        |set, new| {
+            trace.observe(set, tab, new);
+            requested += new.iter().filter(|e| e["type"] == "permission_requested").count();
         },
     );
-    deny_cards_until_the_turn_ends(&mut set, &dir, tab, "after the denial");
-    assert!(!dir.join("first.txt").exists(), "denied: nothing written");
+    let writes = trace.writes_to(Path::new("first.txt"));
+    println!(
+        "[v1-mode] test6a bypass tab: writes={writes:?} requests_delivered={requested} host_answered={:?} \
+         prompt_answered={:?} prompt_notes={:?}",
+        trace.host_answered(),
+        trace.prompt_answered,
+        trace.prompt_notes
+    );
+    assert_eq!(
+        requested, 0,
+        "a bypass tab draws no card, the CLI's own prompt included"
+    );
+    assert!(
+        !writes.is_empty(),
+        "INCONCLUSIVE: the model never made a Write of first.txt (calls: {:?})",
+        trace.calls
+    );
+    assert!(
+        writes.iter().any(|(id, _)| trace.prompt_answered.contains(id)),
+        "INCONCLUSIVE: the ask rule raised no CLI prompt for the Write that the host answered \
+         (prompt_answered {:?}, writes {writes:?})",
+        trace.prompt_answered
+    );
+    for (id, _) in writes.iter().filter(|(id, _)| trace.prompt_answered.contains(id)) {
+        let note = trace.prompt_notes.get(id).map(String::as_str);
+        assert!(
+            note.is_some_and(|note| note.ends_with("— allowed in bypass")),
+            "{id}: the row of a Write whose CLI prompt bypass answered says so: {note:?}"
+        );
+    }
+    trace.assert_target_writes_were_gated("first.txt", dir.join("first.txt").exists(), label);
+    assert!(dir.join("first.txt").exists(), "the Write the ask rule asked about ran");
 }
 
 /// What test 6b does on either backend: a card is waiting, entering bypass lists exactly that card and
@@ -2361,13 +2348,10 @@ fn a_bypass_tab_cards_a_content_scoped_ask_rule_prompt() {
 /// on the now-auto tab (denied, to leave nothing behind). `ask_rules` go into the project's settings
 /// (trusted, so loaded) when given.
 ///
-/// The waiting card must be one bypass may approve: the host's own policy raised it, or the CLI did
-/// and said why (`needs_a_human` false). The precondition is asserted, so a CLI that changes what it
-/// reports fails here with that said, not as a plan that lists nothing. Only legacy has such a card to
-/// offer in a test: on a sidecar whose CLI runs `auto` the host defers every gate request, so no card
-/// of the host's exists, and the CLI's own sensitive-file prompt, the one that carries a reason, does
-/// not arise there (test 4 prints which); the one a CLI in `default` raises is checked by test 4 on a
-/// sidecar that does not offer the CLI's auto mode.
+/// Only legacy has a waiting card of the host's own policy to offer in a test: on a sidecar whose CLI
+/// runs `auto` the host defers every gate request, so no card of the host's exists there, and the
+/// sidecar's entry is test 6a, with a card the CLI raised for an ask rule.
+#[cfg(feature = "legacy-backend")]
 fn bypass_approves_the_waiting_card(
     kind: BackendKind,
     label: &str,
@@ -2400,11 +2384,6 @@ fn bypass_approves_the_waiting_card(
         .tool_use_id
         .clone()
         .unwrap_or_else(|| panic!("the card names no tool call, so its result cannot be followed"));
-    assert!(
-        !card.prompt.as_ref().is_some_and(|prompt| prompt.needs_a_human()),
-        "this fixture must draw a card that bypass may approve, but a human-only one is waiting: {:?}",
-        card.prompt
-    );
 
     let plan = match set.cycle_mode(tab).unwrap() {
         ModeCycle::Confirm(plan) => plan,

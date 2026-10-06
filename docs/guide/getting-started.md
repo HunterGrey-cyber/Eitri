@@ -91,12 +91,11 @@ first letters of a sentence you are typing cannot answer a card by accident.
   a call the tool's row says `blocked by auto: <reason>`, and after repeated refusals Claude Code asks you
   itself, on a card. When your Claude Code cannot run its auto mode, Eitri's own rules decide which calls need
   a card instead.
-- **Bypass** makes Eitri approve tool calls itself, without cards for its own checks. Claude Code's own
-  questions that only a person may answer still arrive as cards: one forced by a `permissions.ask` rule of
-  yours, or one that does not say why it asks. Because bypass is a lot of trust, `Shift+Tab` into it asks
-  first (a `y/n` question whose wording says what else changes, for instance how many waiting cards it would
-  approve), and the `y` counts only when it is pressed alone and a moment after the question appears. Leaving
-  bypass needs no question.
+- **Bypass** makes Eitri approve every tool call itself, without a card: its own checks and Claude Code's own
+  questions alike, including those a `permissions.ask` rule of yours forces. Because bypass is a lot of trust,
+  `Shift+Tab` into it asks first (a `y/n` question whose wording says what else changes, for instance how many
+  waiting cards it would approve), and the `y` counts only when it is pressed alone and a moment after the
+  question appears. Leaving bypass needs no question.
 
 Exactly what each mode lets through, the saved rules, and how a project's own Claude Code configuration is
 trusted are in [Permissions](permissions.md).

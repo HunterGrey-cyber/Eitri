@@ -205,8 +205,8 @@ pub enum PromptScope {
 
 /// R06's four prompts, in English (K09, 2026-09-29). The band and every other prompt and flash it
 /// draws (`close 2 "docs"? (y/n)`, `close window? ...`) are English; these four, written in the
-/// owner's Chinese at first, and `bypass_staying_line` under them were the only text in it that was
-/// not. R06's structure is unchanged: what is asked and when, and `(y/n)` ends every one. `waiting`
+/// owner's Chinese at first, were the only text in it that was not. R06's structure is unchanged:
+/// what is asked and when, and `(y/n)` ends every one. `waiting`
 /// -- the number of delivered cards a `LiveTab` entry would approve -- is read only for `LiveTab`;
 /// the other two scopes never have cards to approve (a `NotStarted` tab has no session and the
 /// window default is not a tab at all).
@@ -220,21 +220,6 @@ pub fn bypass_prompt(scope: PromptScope, waiting: usize) -> String {
         PromptScope::EmptyTab => "Switch to bypass? New sessions in this window start in bypass too (y/n)".to_string(),
         PromptScope::Default => "Start new sessions in bypass? (y/n)".to_string(),
     }
-}
-
-/// The consequence line under a bypass prompt when cards stay waiting after `y`: a CLI prompt only a
-/// human answers (the user's own ask rule's, one that gives no reason for asking, or one of a kind
-/// this build does not know) is a card in bypass too, and `y` does not approve it -- so the prompt says
-/// so rather than leaving it to be found afterwards. It claims no more than Eitri knows: a prompt
-/// without a reason is only possibly the user's own rule. English like the prompt above it; the verb
-/// agrees with the count.
-pub fn bypass_staying_line(staying: usize) -> String {
-    let (cards, stay) = if staying == 1 {
-        ("card", "stays")
-    } else {
-        ("cards", "stay")
-    };
-    format!("{staying} {cards} only you can answer {stay} waiting after the switch")
 }
 
 /// tmux's `confirm-before`, plus a line for each consequence that applies (spec §3.5).
@@ -605,23 +590,6 @@ mod tests {
             bypass_prompt(PromptScope::LiveTab, 12),
             "Switch to bypass and approve the 12 waiting cards? (y/n)"
         );
-    }
-
-    /// The consequence line under the prompt in English and agreeing with its count:
-    /// one card "stays", several "stay".
-    #[test]
-    fn the_staying_line_agrees_with_its_count() {
-        assert_eq!(
-            bypass_staying_line(1),
-            "1 card only you can answer stays waiting after the switch"
-        );
-        assert_eq!(
-            bypass_staying_line(2),
-            "2 cards only you can answer stay waiting after the switch"
-        );
-        for staying in [1, 2, 7] {
-            assert!(bypass_staying_line(staying).is_ascii(), "{staying}");
-        }
     }
 
     #[test]

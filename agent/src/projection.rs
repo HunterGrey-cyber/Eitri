@@ -508,8 +508,8 @@ pub struct PermissionRequestRecord {
 /// **It is never the permission policy's to answer:** `classify_permission_request`
 /// and the saved prefix rules judge the gate's request only. The CLI flagged this call after the gate
 /// allowed it, and the CLI itself does not let a rule silence the check. Who answers it is
-/// `eitri_core::agent_backend`'s decision (bypass, or the human's own earlier approval of the same
-/// call), never the classifier's.
+/// `eitri_core::agent_backend`'s decision (bypass, which answers every one, or in Auto the human's
+/// own earlier approval of the same call), never the classifier's.
 ///
 /// Every field is the CLI's own, verbatim, and any may be absent. `reason` is English prose ("Claude
 /// requested permissions to edit <path> which is a sensitive file.") -- shown, never parsed.
@@ -521,34 +521,35 @@ pub struct ProviderPrompt {
     pub description: Option<String>,
     /// The SDK's `blockedPath`: the path that triggered the prompt.
     pub blocked_path: Option<String>,
-    /// Present when one of the user's own `permissions.ask` rules forced this prompt. Such a prompt
-    /// is meant for a human, and the SDK's guidance is that a host auto-approving must not approve
-    /// it: Eitri draws it as a card in every mode, bypass included.
+    /// Present when one of the user's own `permissions.ask` rules forced this prompt. In Auto it is a
+    /// card even after the user approved the same call's gate card; bypass answers it like any other.
     pub matched_ask_rule: Option<MatchedAskRule>,
     /// Set, to the raw wire value, when the sidecar named an `origin` this build does not know (a
-    /// sidecar newer than this client). Such a prompt is a card in every mode, like one an ask rule
-    /// forced: what a future kind of ask means cannot be judged here, so nothing
-    /// automatic answers it. `None` for every origin this build knows.
+    /// sidecar newer than this client). In Auto it is a card like one an ask rule forced: what a
+    /// future kind of ask means cannot be judged here, so no earlier approval answers it. Bypass
+    /// answers it like any other. `None` for every origin this build knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unrecognized_origin: Option<i32>,
 }
 
 impl ProviderPrompt {
-    /// Whether only a human may answer this prompt, in every mode: the user's own ask rule forced it,
-    /// its kind is unknown to this build, or it does not say why it asked. The last case is what a
-    /// content-scoped ask rule (`Edit(file)`, `Bash(echo:*)`) looks like: the CLI names only a bare
-    /// tool-name rule (`matched_ask_rule`) and leaves its reason out for a rule it matched itself, so
-    /// such a prompt arrives with no reason and no matched rule, exactly like any other prompt that
-    /// explains nothing. A prompt that explains nothing is a card. Bypass, the Auto approval rule, a
-    /// bypass entry's `y` and the bypass resync sweep all leave such a prompt a card.
-    pub fn needs_a_human(&self) -> bool {
+    /// Whether, in Auto, this prompt is a card of its own even when the user approved the gate's card
+    /// for the same call: the user's own ask rule forced it, its kind is unknown to this build, or it
+    /// does not say why it asked. The last case is what a content-scoped ask rule (`Edit(file)`,
+    /// `Bash(echo:*)`) looks like: the CLI names only a bare tool-name rule (`matched_ask_rule`) and
+    /// leaves its reason out for a rule it matched itself, so such a prompt arrives with no reason and
+    /// no matched rule, exactly like any other prompt that explains nothing.
+    ///
+    /// Bypass does not read it: a bypass tab answers every prompt `allow`, these included, and so do
+    /// a bypass entry's `y` and the bypass resync sweep.
+    pub fn needs_its_own_card(&self) -> bool {
         self.matched_ask_rule.is_some() || self.unrecognized_origin.is_some() || self.says_nothing_about_why()
     }
 
     /// No matched ask rule and no reason of the CLI's own (an empty or blank one is none): nothing that
     /// tells a prompt the CLI raised itself from the user's own rule. A blocked path is not a reason: a
-    /// path check can sit next to a rule's decision, and the measured prompt that bypass may approve
-    /// carries its reason and no path.
+    /// path check can sit next to a rule's decision, and the measured sensitive-file prompt carries its
+    /// reason and no path.
     fn says_nothing_about_why(&self) -> bool {
         self.matched_ask_rule.is_none() && self.reason.as_deref().is_none_or(|reason| reason.trim().is_empty())
     }

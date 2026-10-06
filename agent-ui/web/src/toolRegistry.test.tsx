@@ -114,6 +114,19 @@ describe("renderToolCall", () => {
     expect(plain.container.querySelector(".tool-prompt-note")).toBeNull();
   });
 
+  /** Bypass answers every CLI prompt, the user's own ask rule's and one that gave no reason included,
+   *  and the row names whose question it was, as Rust wrote it. */
+  it("shows bypass's answer to an ask rule's prompt or a reasonless one under its own label", () => {
+    for (const promptNote of [
+      "your ask rule: Edit(first.txt) — allowed in bypass",
+      "Claude Code asked (maybe your ask rule) — allowed in bypass",
+    ]) {
+      const { container } = render(<>{renderToolCall(call({ name: "Write", promptNote }))}</>);
+      expect(container.querySelector(".tool-prompt-note")?.textContent).toBe(promptNote);
+      cleanup();
+    }
+  });
+
   /** v1 polish F21: a path under the project root is drawn relative, one outside it absolute; the
    *  click/`gf` target stays the path as sent. A folded result draws no line of its own. */
   it("draws project paths relative, keeps others absolute, and folds without a lone marker line", () => {

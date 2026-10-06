@@ -332,8 +332,8 @@ describe("PermissionCard for the CLI's own prompt", () => {
     );
     expect(first.container.querySelector(".permission-card-provider-reason")).toBeNull();
     first.unmount();
-    /* A blocked path is not a reason, and neither is an empty or blank one (Rust agrees, so a card and
-       what bypass answers never differ). */
+    /* A blocked path is not a reason, and neither is an empty or blank one (Rust agrees, so the label
+       a card shows and the one its row note carries never differ). */
     const withoutReason = (reason: string | null, blockedPath: string | null): PermissionRequestRecord => ({
       ...prompt,
       providerPrompt: { ...prompt.providerPrompt!, reason, blockedPath },

@@ -47,15 +47,13 @@ Eitri cannot be sure about is a card.
 
 ### Bypass
 
-In bypass Eitri approves each call itself, without a card. Because that is a lot of trust, `Shift+Tab` into
-bypass asks first. The question is a `y/n` that says what else changes: if cards are waiting in the tab it reads
-"Switch to bypass and approve the N waiting cards?". The `y` counts only when it is pressed on its own and a
-moment after the question appears, and only the cards still waiting at that moment are approved. Leaving bypass
-needs no question.
-
-Bypass does not answer everything. Claude Code's own questions that only a person may answer stay cards in
-bypass; they are the subject of the [next section](#when-claude-code-itself-asks). When such a card is waiting,
-the bypass question says "N cards only you can answer stay waiting after the switch".
+In bypass Eitri approves every call itself, without a card. That includes Claude Code's own questions (the
+[next section](#when-claude-code-itself-asks)), even the ones your own `permissions.ask` rules force: in a bypass
+tab an ask rule stops nothing. Because that is a lot of trust, `Shift+Tab` into bypass asks first. The question is
+a `y/n` that says what else changes: if cards are waiting in the tab it reads "Switch to bypass and approve the N
+waiting cards?", and every waiting card is counted. The `y` counts only when it is pressed on its own and a moment
+after the question appears, and only the cards still waiting at that moment are approved. Leaving bypass needs no
+question.
 
 Starting in bypass without the question is possible only by saying so in advance, with
 `agent.default_mode = "bypass"` in your `init.lua`; see
@@ -114,11 +112,14 @@ Claude Code runs in its default mode, or from editing the rules file by hand.
 
 ## When Claude Code itself asks
 
-After Eitri lets a call through, Claude Code may still ask about it on its own. That arrives as a card whose
-label says who asked. Neither kind of question below is ever answered by a saved rule or handed to Claude Code's
-classifier.
+After Eitri lets a call through, Claude Code may still ask about it on its own. No such question is ever
+answered by a saved rule or handed to Claude Code's classifier.
 
-**Always a card, in every mode, bypass included:**
+**In a bypass tab every one is answered for you**, whatever it says about why it asks, and the tool's row says
+so under the question's label, for instance `your ask rule: Write — allowed in bypass`. Entering bypass approves
+the ones already waiting as well.
+
+**In an Auto tab it arrives as a card whose label says who asked.** These are always a card there:
 
 - A question forced by a `permissions.ask` rule of yours that names a tool. The card says "your ask rule:" and
   the tool, for instance `your ask rule: Write`.
@@ -127,17 +128,17 @@ classifier.
   Eitri as a question with no reason, so Eitri cannot tell it from any other unexplained question and shows it.
 - A question of a kind this version of Eitri does not recognise.
 
-**A question that gives its reason** (the card says "Claude Code asked" and shows the sentence): in a bypass
-tab Eitri answers it for you and the row says so. In an Auto tab Eitri answers it only if you approved that same
-call, with that same input, on a card a moment before, and only once; otherwise it is a card. Because in an Auto
+**A question that gives its reason** (the card says "Claude Code asked" and shows the sentence): in an Auto tab
+Eitri answers it only if you approved that same call, with that same input, on a card a moment before, and only
+once; otherwise it is a card. Because in an Auto
 tab Claude Code's own auto mode normally decides, there is usually no earlier approval, so such a question is
 a card there. Where Claude Code's auto mode is running, its check on sensitive files (`.git/`, `.claude/`) does
 not ask at all and its classifier decides; the sensitive-file question appears when Claude Code runs in its
 default mode.
 
 One limit to know about: Eitri cannot tell Claude Code's own reason from a reason a hook gave. A hook of yours
-(or of a trusted project) that asks with a reason is treated like any other question with a reason, so in a
-bypass tab it is answered for you.
+(or of a trusted project) that asks with a reason is treated like any other question with a reason, so in an
+Auto tab your approval of that same call on a card answers it too.
 
 ## Trusting a project
 
@@ -226,5 +227,7 @@ above is weaker than it may sound.
   directory in terminal `claude`.** That is Claude Code's own rule. The rules in your user settings always apply.
 - **Trusting a project means trusting its code to run.** A script a hook calls from outside `.claude/` is covered
   only through the hook's command text, as building the project is.
-- **A reason is not proof of origin.** In bypass, a question with a reason is answered for you, and Eitri cannot
-  tell Claude Code's own check from a hook that asks with a reason.
+- **Bypass answers your own ask rules too.** In a bypass tab a `permissions.ask` rule, yours or a trusted
+  project's, stops nothing: Eitri answers the question it raises like any other.
+- **A reason is not proof of origin.** In an Auto tab, a question with a reason is answered on your approval of
+  the same call, and Eitri cannot tell Claude Code's own check from a hook that asks with a reason.

@@ -1104,7 +1104,7 @@ impl TabSet {
                         let plan = BypassPlan {
                             scope: BypassScope::Tab(id),
                             nonce,
-                            lines: bypass_lines(scope_kind, tab, approve.len()),
+                            lines: vec![tabs::bypass_prompt(scope_kind, approve.len())],
                             approve,
                             prompt: scope_kind,
                         };
@@ -1188,7 +1188,7 @@ impl TabSet {
                     let fresh = BypassPlan {
                         scope,
                         nonce: fresh_nonce,
-                        lines: bypass_lines(scope_kind, &self.tabs[at], now.len()),
+                        lines: vec![tabs::bypass_prompt(scope_kind, now.len())],
                         approve: now,
                         prompt: scope_kind,
                     };
@@ -1209,6 +1209,13 @@ impl TabSet {
                     None => crate::agent_backend::Approved::default(),
                 };
                 tab.host_answered.extend(answered.ids.iter().cloned());
+                // The CLI's own prompts it answered say so on their calls' rows once those complete.
+                tab.prompt_note_candidates.extend(
+                    answered
+                        .prompts
+                        .into_iter()
+                        .map(|answered| (answered.tool_use_id, answered.note)),
+                );
                 let answered_set: BTreeSet<String> = answered.ids.iter().cloned().collect();
                 tab.attention.retain_pending(|id| !answered_set.contains(id));
                 let approved = answered.ids.len();
@@ -1936,6 +1943,12 @@ impl TabSet {
                         // is read after they were folded, so it already shows those cards answered.
                         let answered = backend.approve_pending(&sweep, "in bypass after a resync");
                         tab.host_answered.extend(answered.ids);
+                        tab.prompt_note_candidates.extend(
+                            answered
+                                .prompts
+                                .into_iter()
+                                .map(|answered| (answered.tool_use_id, answered.note)),
+                        );
                     }
                     tab.attention
                         .resync(pending.iter().filter(|id| !tab.host_answered.contains(*id)).cloned());
@@ -2880,9 +2893,8 @@ fn note_new_files(
 /// Only `projection()` is read, once, and released before anything else is touched.
 /// The delivered cards this tab could approve right now (R06/S2, spec §3.3): its own attention
 /// tray, intersected with the projection's still-pending ids and with anything it has not already
-/// host-answered, less any CLI prompt only a human answers (the user's own ask rule's, one of unknown kind, or one
-/// that gives no reason), `seq`-ordered (the order
-/// the panel shows them in). Empty unless the tab is
+/// host-answered, `seq`-ordered (the order the panel shows them in). The CLI's own prompts are among
+/// them whatever they say about why they asked: bypass approves every card. Empty unless the tab is
 /// `Live` -- a `NotStarted`/`Starting`/`Failed` tab has no session to hold a pending request at all.
 ///
 /// This one function builds every `BypassPlan::approve` and every D7 re-check `confirm_bypass`
@@ -2901,43 +2913,11 @@ fn waiting_cards(tab: &Tab) -> Vec<String> {
             .pending_permissions
             .values()
             .filter(|p| cards.contains(&p.permission_id) && !tab.host_answered.contains(&p.permission_id))
-            // A CLI prompt only a human answers (an ask rule's, one of unknown kind, or one that gives
-            // no reason for asking) is a card in bypass too, so entering bypass neither counts nor approves
-            // it (`approve_pending` would skip it); `staying_cards` counts it for the prompt instead.
-            .filter(|p| !p.provider_prompt.as_ref().is_some_and(|prompt| prompt.needs_a_human()))
             .map(|p| (p.seq, p.permission_id.clone()))
             .collect()
     };
     ordered.sort_by_key(|(seq, _)| *seq);
     ordered.into_iter().map(|(_, id)| id).collect()
-}
-
-/// The delivered cards a bypass entry leaves waiting (review #6): still pending, not host-answered,
-/// and only a human answers them (`ProviderPrompt::needs_a_human`). `waiting_cards`' complement among
-/// the tab's cards, counted so the prompt can say they stay.
-fn staying_cards(tab: &Tab) -> usize {
-    let Some(backend) = tab.live() else {
-        return 0;
-    };
-    let cards: BTreeSet<String> = tab.attention.card_ids().into_iter().collect();
-    let projection = backend.projection();
-    projection
-        .pending_permissions
-        .values()
-        .filter(|p| cards.contains(&p.permission_id) && !tab.host_answered.contains(&p.permission_id))
-        .filter(|p| p.provider_prompt.as_ref().is_some_and(|prompt| prompt.needs_a_human()))
-        .count()
-}
-
-/// A bypass entry's prompt lines for a tab: R06's own line, then one saying which cards stay, when
-/// any do (review #6; tmux `confirm-before` plus a consequence line, as `close_prompt` does).
-fn bypass_lines(scope: tabs::PromptScope, tab: &Tab, approving: usize) -> Vec<String> {
-    let mut lines = vec![tabs::bypass_prompt(scope, approving)];
-    let staying = staying_cards(tab);
-    if staying > 0 {
-        lines.push(tabs::bypass_staying_line(staying));
-    }
-    lines
 }
 
 /// v1 polish F18's twin for the CLI's own prompts (review item 7): a candidate whose call completes
@@ -4575,12 +4555,20 @@ mod tests {
         }
         provider.queue(write("lost1"));
         provider.queue(write("lost2"));
+        // The CLI's own prompt, forced by the user's ask rule: bypass sweeps it like the gate's own.
+        provider.queue(cli_prompt(
+            "lost-ask",
+            "toolu_lost_ask",
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+            Some("cat:*"),
+        ));
 
-        until("all three pending in the projection", || {
+        until("all four pending in the projection", || {
             let Some(backend) = set.get(tab).unwrap().live() else {
                 return false;
             };
-            backend.projection().pending_permissions.len() == 3
+            backend.projection().pending_permissions.len() == 4
         });
 
         let out = set.pump(&dir, true);
@@ -4592,7 +4580,12 @@ mod tests {
         resolved.sort();
         assert_eq!(
             resolved,
-            vec!["lost1".to_string(), "lost2".to_string(), "pre".to_string()]
+            vec![
+                "lost-ask".to_string(),
+                "lost1".to_string(),
+                "lost2".to_string(),
+                "pre".to_string()
+            ]
         );
         assert_eq!(
             provider.resolutions().iter().filter(|(id, _)| id == "pre").count(),
@@ -4603,6 +4596,15 @@ mod tests {
         assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
         let pending = snapshot["state"]["pendingPermissions"].as_array().unwrap();
         assert!(pending.is_empty(), "no swept id is drawn: {pending:?}");
+        assert_eq!(
+            set.get(tab)
+                .unwrap()
+                .prompt_note_candidates
+                .get("toolu_lost_ask")
+                .map(String::as_str),
+            Some("your ask rule: Bash(cat:*) — allowed in bypass"),
+            "the swept CLI prompt's call will say so on its row"
+        );
         shut_down_all(&mut set);
     }
 
@@ -6783,8 +6785,8 @@ mod tests {
         });
 
         // The CLI's own follow-up prompt for the same call, with NO tool-use id at all: the shape
-        // this review item is about. `needs_a_human()` is false (no ask rule, no unrecognized
-        // origin), and in Auto `HumanApprovals::matches` never matches an id-less prompt ("a prompt
+        // this review item is about. `needs_its_own_card()` is false (no ask rule, no unrecognized
+        // origin, a reason given), and in Auto `HumanApprovals::matches` never matches an id-less prompt ("a prompt
         // with no id matches nothing"), so this becomes a real card rather than being silently
         // re-answered by the rule a second time.
         provider.queue(resolved("perm-gate"));
@@ -7579,15 +7581,38 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// O3 ruling 4's exception at a bypass entry: a card the user's own ask rule forced is not among
-    /// the cards `y` approves -- it is not counted, not listed, and still waiting afterwards.
+    /// Entering bypass approves every waiting card, the CLI's own prompts included: one the user's own
+    /// ask rule forced, one of a kind this build does not know, one that gives no reason, one that
+    /// only describes its subject or names a path, and one that gives its reason are all counted,
+    /// listed in `seq` order and approved by `y`, beside the gate's own card. The prompt is R06's one
+    /// line: no card stays waiting, so there is nothing more to say. A call whose CLI prompt the entry
+    /// approved says so on its row once it completes, as one answered in a bypass tab does.
     #[test]
-    fn entering_bypass_leaves_a_card_the_users_ask_rule_forced() {
-        let dir = workspace("o3-bypass-entry-ask");
+    fn entering_bypass_approves_every_waiting_card_the_clis_own_prompts_included() {
+        let dir = workspace("bypass-entry-every-prompt");
         let mut set = set();
         let tab = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let changed = |id: &str, tool_use_id: &str, change: &dyn Fn(&mut agent::ProviderPrompt)| {
+            let mut event = cli_prompt(
+                id,
+                tool_use_id,
+                "Bash",
+                serde_json::json!({ "command": format!("echo {id}") }),
+                None,
+            );
+            if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
+                change(provider_prompt.as_mut().unwrap());
+            }
+            event
+        };
+        provider.queue(started("t1"));
+        provider.queue(call_started(
+            "toolu_g",
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+        ));
         provider.queue(cli_prompt(
             "perm-ask",
             "toolu_g",
@@ -7595,127 +7620,114 @@ mod tests {
             serde_json::json!({ "command": "cat notes.txt" }),
             Some("cat:*"),
         ));
+        provider.queue(changed("perm-unknown", "toolu_u", &|p| p.unrecognized_origin = Some(7)));
+        provider.queue(changed("perm-silent", "toolu_s", &|p| {
+            p.reason = None;
+            p.description = Some("Print the word zebra".into());
+        }));
+        provider.queue(changed("perm-path", "toolu_p", &|p| {
+            p.reason = None;
+            p.blocked_path = Some("/p/.git/x".into());
+        }));
+        provider.queue(changed("perm-reason", "toolu_r", &|_| {}));
         provider.queue(write("perm-write"));
-        until("both cards", || {
+        let all: Vec<String> = [
+            "perm-ask",
+            "perm-unknown",
+            "perm-silent",
+            "perm-path",
+            "perm-reason",
+            "perm-write",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        until("six cards", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().attention.attention().pending == 2
+            set.get(tab).unwrap().attention.attention().pending == 6
         });
         let plan = plan(set.cycle_mode(tab));
-        assert_eq!(plan.approve, vec!["perm-write".to_string()]);
-        // Review #6: the prompt says the card that will stay, on a line of its own after R06's.
-        assert_eq!(plan.lines.len(), 2, "{:?}", plan.lines);
-        assert!(plan.lines[0].contains("approve the 1 waiting card"), "{:?}", plan.lines);
-        assert!(
-            plan.lines[1].contains("1 card") && plan.lines[1].contains("stays waiting"),
-            "{:?}",
-            plan.lines
+        assert_eq!(plan.approve, all);
+        assert_eq!(
+            plan.lines,
+            vec!["Switch to bypass and approve the 6 waiting cards? (y/n)".to_string()]
         );
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce),
             Ok(ConfirmOutcome::Entered {
-                approved: 1,
+                approved: 6,
                 resolved: Vec::new()
             })
         );
-        assert_eq!(provider.resolutions(), vec![("perm-write".to_string(), true)]);
-        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 1);
-        assert!(set
-            .get(tab)
-            .unwrap()
-            .live()
-            .unwrap()
-            .projection()
-            .pending_permissions
-            .contains_key("perm-ask"));
+        assert_eq!(
+            provider.resolutions(),
+            all.iter().map(|id| (id.clone(), true)).collect::<Vec<_>>()
+        );
+        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+        assert!(all.iter().all(|id| set.get(tab).unwrap().host_answered.contains(id)));
+        provider.queue(call_done("toolu_g", false));
+        pump_until_done(&mut set, &dir, "toolu_g");
+        assert_eq!(
+            call_in_snapshot(&mut set, "toolu_g")["promptNote"],
+            "your ask rule: Bash(cat:*) — allowed in bypass"
+        );
+
+        // In the bypass tab itself such a prompt is answered at once and never drawn.
+        provider.queue(changed("perm-silent-2", "toolu_s2", &|p| p.reason = None));
+        until("the second silent prompt answered", || {
+            if let Some(payload) = set.pump(&dir, true).active_payload {
+                assert!(!payload.contains("perm-silent-2"), "never drawn: {payload}");
+            }
+            provider.resolutions().iter().any(|(id, _)| id == "perm-silent-2")
+        });
+        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
         shut_down_all(&mut set);
     }
 
-    /// A user's content-scoped ask rule (`Edit(file)`, `Bash(echo:*)`) reaches Eitri as a prompt that
-    /// names no reason or rule. It is a card a bypass entry leaves waiting, and so is one that only
-    /// describes its subject or names a path; a prompt that gives its reason is still approved.
+    /// A card that arrives while the bypass prompt is up, even one the user's own ask rule forced, is
+    /// never approved by the `y` of a prompt that did not count it: the confirm asks again, now
+    /// counting it (D7), and only that second `y` approves it.
     #[test]
-    fn entering_bypass_leaves_a_prompt_that_explains_nothing() {
-        let dir = workspace("bypass-entry-silent-prompt");
+    fn a_cli_prompt_arriving_under_an_open_bypass_prompt_asks_again() {
+        let dir = workspace("bypass-entry-late-ask");
         let mut set = set();
         let tab = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        let silent = |id: &str, tool_use_id: &str, command: &str| {
-            let mut event = cli_prompt(id, tool_use_id, "Bash", serde_json::json!({ "command": command }), None);
-            if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
-                let prompt = provider_prompt.as_mut().unwrap();
-                prompt.reason = None;
-                prompt.description = Some("Print the word zebra".into());
-            }
-            event
-        };
-        provider.queue(silent("perm-silent", "toolu_s", "echo zebra"));
-        let mut by_path = cli_prompt(
-            "perm-path",
-            "toolu_p",
-            "Write",
-            serde_json::json!({ "file_path": ".git/x" }),
-            None,
-        );
-        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut by_path {
-            let prompt = provider_prompt.as_mut().unwrap();
-            prompt.reason = None;
-            prompt.blocked_path = Some("/p/.git/x".into());
-        }
-        provider.queue(by_path);
-        provider.queue(cli_prompt(
-            "perm-reason",
-            "toolu_r",
-            "Write",
-            serde_json::json!({ "file_path": ".git/y" }),
-            None,
-        ));
-        until("three cards", || {
+        provider.queue(write("perm-write"));
+        until("the first card", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().attention.attention().pending == 3
+            set.get(tab).unwrap().attention.attention().pending == 1
         });
-        let plan = plan(set.cycle_mode(tab));
-        assert_eq!(plan.approve, vec!["perm-reason".to_string()]);
-        assert!(
-            plan.lines
-                .iter()
-                .any(|l| l.contains("2 cards") && l.contains("stay waiting")),
-            "{:?}",
-            plan.lines
-        );
+        let first = plan(set.cycle_mode(tab));
+        assert_eq!(first.approve, vec!["perm-write".to_string()]);
+        provider.queue(cli_prompt(
+            "perm-ask",
+            "toolu_late",
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+            Some("cat:*"),
+        ));
+        until("the late card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 2
+        });
+        let again = match set.confirm_bypass(first.scope, first.nonce) {
+            Ok(ConfirmOutcome::Reprompt(again)) => again,
+            other => panic!("a card the prompt did not count asks again, got {other:?}"),
+        };
+        assert!(provider.resolutions().is_empty(), "{:?}", provider.resolutions());
+        assert_eq!(again.approve, vec!["perm-write".to_string(), "perm-ask".to_string()]);
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(again.scope, again.nonce),
             Ok(ConfirmOutcome::Entered {
-                approved: 1,
+                approved: 2,
                 resolved: Vec::new()
             })
         );
-        let resolved_ids: Vec<String> = provider.resolutions().into_iter().map(|(id, _)| id).collect();
-        assert_eq!(resolved_ids, vec!["perm-reason".to_string()]);
-        assert!(set
-            .get(tab)
-            .unwrap()
-            .live()
-            .unwrap()
-            .projection()
-            .pending_permissions
-            .contains_key("perm-silent"));
-        assert!(set
-            .get(tab)
-            .unwrap()
-            .live()
-            .unwrap()
-            .projection()
-            .pending_permissions
-            .contains_key("perm-path"));
-
-        // In the bypass tab itself the same prompt is still a card, never answered unasked.
-        provider.queue(silent("perm-silent-2", "toolu_s2", "echo again"));
-        until("the second silent card", || {
-            set.pump(&dir, true);
-            set.get(tab).unwrap().attention.attention().pending == 3
-        });
-        assert!(!provider.resolutions().iter().any(|(id, _)| id == "perm-silent-2"));
+        assert_eq!(
+            provider.resolutions(),
+            vec![("perm-write".to_string(), true), ("perm-ask".to_string(), true)]
+        );
         shut_down_all(&mut set);
     }
 
