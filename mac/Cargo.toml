@@ -1,0 +1,31 @@
+[package]
+name = "eitri-mac"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The macOS host: Neovide's window with the agent panel beside the editor. This manifest carries the
+# host-neutral half (startup, paths, the layout policy), which builds and tests on any OS; the AppKit
+# half goes under a macOS target table. No GTK, GLib or WebKit crate may appear here, directly or
+# transitively (`src/manifest_guard.rs`, `core/tests/f1_no_toolkit_below_shell.rs`).
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "eitri-mac"
+path = "src/main.rs"
+
+[dependencies]
+agent = { path = "../agent" }
+eitri-core = { path = "../core" }
+eitri-panel = { path = "../panel" }
+# `dup2` and `fcntl` for the standard-input detach.
+libc = "0.2"
+
+[dev-dependencies]
+eitri-core = { path = "../core", features = ["test-support"] }
+tempfile = "3"
+# The real-nvim tests' own probe connection builds its calls from msgpack values.
+rmpv = "1"
+serde_json = "1"

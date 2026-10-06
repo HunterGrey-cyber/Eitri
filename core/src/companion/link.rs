@@ -75,6 +75,13 @@ impl CompanionLink {
         self.driver.borrow_mut().exec_lua_for(Some(part), code, args)
     }
 
+    /// Hand `keys` to the attached nvim as typed (`nvim_input`), without waiting for an answer. Unlike a Lua
+    /// call it is answered while nvim waits for a character, so it never lands after a later key. `Err` says
+    /// why not.
+    pub fn input(&self, keys: &str) -> Result<(), String> {
+        self.driver.borrow_mut().input(keys)
+    }
+
     /// Who owns the review module in the attached nvim: this panel, on its channel there. `None`
     /// unless attached.
     pub fn review_owner(&self) -> Option<crate::review_editor::Owner> {

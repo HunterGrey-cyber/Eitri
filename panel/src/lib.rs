@@ -4,6 +4,7 @@
 //! this crate; it must never name a toolkit: `src/manifest_guard.rs` fails on a GTK/WebKit manifest entry.
 
 pub mod agent_panel;
+pub mod keys_help;
 pub mod panel_csp;
 pub mod panel_document;
 pub mod panel_pacer;
@@ -13,6 +14,7 @@ pub mod supervisor_client;
 pub mod terminal_handoff;
 pub mod trust_gate;
 pub mod webview_crash_guard;
+pub mod window_config;
 
 #[cfg(test)]
 mod manifest_guard;

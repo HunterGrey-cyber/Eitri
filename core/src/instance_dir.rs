@@ -52,6 +52,20 @@ pub(crate) fn instance_dir_path(tmp: &Path, prefix: &str) -> PathBuf {
     ))
 }
 
+/// Sweeps the stale directories of `prefix` under `tmp`, then creates this instance's own,
+/// `tmp/<prefix><pid>-<uuid>`, mode 0700, and returns it.
+///
+/// For a host that needs the one directory a feed's constructor makes and nothing else. The creation is
+/// not recursive and not idempotent: a path that already exists, a symlink included, is an error and is
+/// never reused, so nothing planted in `tmp` can become this instance's directory.
+pub fn create_instance_dir(tmp: &Path, prefix: &str, socket_name: &str, log_tag: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    sweep_stale_instance_dirs(tmp, prefix, socket_name, log_tag);
+    let dir = instance_dir_path(tmp, prefix);
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
+}
+
 /// Deletes directories under `tmp` named `<prefix><pid>-<uuid>` (or the legacy `<prefix><pid>`)
 /// whose process is gone.
 ///
@@ -440,6 +454,34 @@ pub(crate) mod tests {
             32,
             "{name}"
         );
+    }
+
+    /// `create_instance_dir` makes a private directory of its own per call, named for this process, and
+    /// reclaims a dead process's leftover on the way.
+    #[test]
+    fn create_instance_dir_makes_a_fresh_private_directory_named_for_this_process() {
+        use std::os::unix::fs::MetadataExt;
+        const CID_PREFIX: &str = "nv-cid-";
+        let root = std::env::temp_dir().join(format!("nv-cid-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A directory of a dead pid with no socket in it: the sweep must reclaim it on the way.
+        let stale = root.join(format!("{CID_PREFIX}0-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&stale).unwrap();
+
+        let a = create_instance_dir(&root, CID_PREFIX, "n", "test").unwrap();
+        let b = create_instance_dir(&root, CID_PREFIX, "n", "test").unwrap();
+        assert_ne!(a, b);
+        for dir in [&a, &b] {
+            let meta = std::fs::symlink_metadata(dir).unwrap();
+            assert!(meta.is_dir());
+            assert_eq!(meta.mode() & 0o777, 0o700, "{dir:?}");
+            assert_eq!(dir.parent(), Some(root.as_path()));
+            let name = dir.file_name().unwrap().to_str().unwrap();
+            assert_eq!(stale_instance_dir_pid(name, CID_PREFIX), Some(std::process::id()));
+        }
+        assert!(!stale.exists(), "the stale directory was not swept");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// The sweep still recognises what a pre-L2-T5 build wrote. Without this, every directory an

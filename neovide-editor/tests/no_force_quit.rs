@@ -441,6 +441,7 @@ fn the_matcher_sees_every_spelling_and_nothing_else() {
 const SCANNED: &[&str] = &[
     "shell/src",
     "panel/src",
+    "mac/src",
     "core/src",
     "neovide-editor/src",
     "agent/src",

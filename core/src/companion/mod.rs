@@ -15,6 +15,7 @@ use rmpv::Value;
 
 pub mod attach;
 pub mod driver;
+pub mod env;
 pub mod link;
 pub mod stdio;
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { isImeKey } from "../composerKeys";
 import { searchHistory } from "../promptHistory";
+import { NO_TEXT_ASSIST } from "../textField";
 
 type Props = {
   history: string[];
@@ -26,6 +27,7 @@ export function HistorySearch({ history, onAccept, onCancel, onLineKey }: Props)
       <span className="history-search-label">(reverse-i-search)`</span>
       <input
         ref={ref}
+        {...NO_TEXT_ASSIST}
         aria-label="Search your earlier prompts"
         value={query}
         onChange={(e) => {

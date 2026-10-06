@@ -442,6 +442,13 @@ impl NvimLink {
         self.call("nvim_exec_lua", vec![Value::from(code), Value::Array(args)])
     }
 
+    /// `nvim_input`: hand `keys` to nvim as if typed. It is api-fast, so nvim answers it even while it waits for
+    /// a character (`f`, `r`, `q`, `<C-w>`, a hit-enter prompt); `nvim_exec_lua` is held back there and would
+    /// run after the keys the user types next.
+    pub fn input(&self, keys: &str) -> Pending {
+        self.call("nvim_input", vec![Value::from(keys)])
+    }
+
     /// False once the connection has ended or been closed.
     pub fn is_alive(&self) -> bool {
         self.shared().alive.load(Ordering::SeqCst)

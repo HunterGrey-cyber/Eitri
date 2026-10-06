@@ -404,7 +404,7 @@ fn scan(rel: &str, text: &str) -> Report {
 
 #[test]
 fn editor_rpc_callers_pass_only_constant_lua() {
-    let read = eitri_core::source_scan::rust_sources(&["core/src", "shell/src", "panel/src"]);
+    let read = eitri_core::source_scan::rust_sources(&["core/src", "shell/src", "panel/src", "mac/src"]);
     eitri_core::source_scan::require_anchors(
         &read,
         &[

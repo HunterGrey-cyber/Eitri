@@ -15,7 +15,7 @@ use webkit6::prelude::*;
 use webkit6::{NetworkProxyMode, NetworkProxySettings, NetworkSession, UserContentManager, WebView};
 
 // What the rest of `shell` reaches through `crate::agent_panel::`.
-pub(crate) use eitri_panel::agent_panel::{AgentPanelHandle, HintInbound, ReviewConfig};
+pub(crate) use eitri_panel::agent_panel::{AgentPanelHandle, HintInbound};
 
 /// The embedded, single-file `agent-ui/web` production build -- `shell/build.rs`
 /// guarantees this file exists and is current by the time `shell` itself compiles.

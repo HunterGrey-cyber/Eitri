@@ -70,6 +70,8 @@ pub(crate) trait Wire {
     fn exec_lua(&self, code: &str, args: Vec<Value>);
     /// Like [`Wire::exec_lua`], keeping the answer for the caller.
     fn exec_lua_answered(&self, code: &'static str, args: Vec<Value>) -> Pending;
+    /// Keys as typed, through `nvim_input`: never queued behind a pending key like `exec_lua`.
+    fn input(&self, keys: &str);
     fn close_when_flushed(&self);
 }
 
@@ -84,6 +86,10 @@ impl Wire for NvimLink {
         // The inherent method, not this one: the path names the type's own `exec_lua`.
         // editor-rpc-scan: forwards a caller's constant
         NvimLink::exec_lua(self, code, args)
+    }
+
+    fn input(&self, keys: &str) {
+        drop(NvimLink::input(self, keys));
     }
 
     fn close_when_flushed(&self) {
@@ -340,6 +346,20 @@ impl LinkDriver {
                 Wire::exec_lua_answered(&live.link, code, args)
             }
             _ => Pending::failed(RpcError::Unavailable(NOT_CONNECTED.to_owned())),
+        }
+    }
+
+    /// Hand `keys` to the attached nvim as typed (`nvim_input`), without waiting. `Err` says why not.
+    pub fn input(&mut self, keys: &str) -> Result<(), String> {
+        if let Some(why) = not_attached_why(self.attacher.state()) {
+            return Err(why.to_owned());
+        }
+        match &self.live {
+            Some(live) if live.link.is_alive() => {
+                Wire::input(&live.link, keys);
+                Ok(())
+            }
+            _ => Err(NOT_CONNECTED.to_owned()),
         }
     }
 
@@ -648,6 +668,10 @@ mod tests {
         fn exec_lua_answered(&self, _code: &'static str, args: Vec<Value>) -> Pending {
             self.0.borrow_mut().push(format!("exec_lua_answered({args:?})"));
             Pending::failed(RpcError::Closed)
+        }
+
+        fn input(&self, keys: &str) {
+            self.0.borrow_mut().push(format!("input({keys})"));
         }
 
         fn close_when_flushed(&self) {

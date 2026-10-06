@@ -9,6 +9,7 @@
 //! `| _ even  H J K L swap`. The same pass saw the last run touch the project name
 //! (`H J K L swapproj`); `.prefix-strip`'s right margin (`theme::gtk_css`) is that half.
 
+use eitri_core::keymap::companion::StripPiece;
 use eitri_core::layout::{Axis, ModuleId, StripEntry};
 use gtk4::prelude::*;
 
@@ -23,17 +24,6 @@ const DOT: &str = "\u{00b7}";
 /// 10px from run to run, what the strip had before the `·` -- so the armed bar's minimum width stays
 /// where it was: every run ellipsizes, the `·` does not.
 const PIECE_SPACING: i32 = 3;
-
-/// One piece of the strip, left to right.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StripPiece {
-    /// Where the next module goes, after `\`/`"`: `right of editor:`.
-    Heading(String),
-    /// A key and what it does, `e editor`; `dimmed` for a module that is hidden or not placed.
-    Run { text: String, dimmed: bool },
-    /// The `·` between two runs; never before the first, after the last, or after the heading.
-    Dot,
-}
 
 /// The strip's pieces, left to right. `entries` are the module keys for `waiting`: the keys that reach
 /// each module now while armed (`eitri_core::layout::strip_direct`), the fixed module keys after a

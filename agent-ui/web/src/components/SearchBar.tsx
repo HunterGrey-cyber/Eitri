@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { KeyboardEvent } from "react";
+import { NO_TEXT_ASSIST } from "../textField";
 
 type Props = {
   query: string;
@@ -42,6 +43,7 @@ export function SearchBar({
       {lead}
       <input
         ref={ref}
+        {...NO_TEXT_ASSIST}
         aria-label={label}
         value={query}
         onChange={(e) => onChange(e.target.value)}

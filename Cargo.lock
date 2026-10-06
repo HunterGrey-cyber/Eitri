@@ -956,6 +956,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eitri-mac"
+version = "0.2.1"
+dependencies = [
+ "agent",
+ "eitri-core",
+ "eitri-panel",
+ "libc",
+ "rmpv",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "eitri-panel"
 version = "0.2.1"
 dependencies = [

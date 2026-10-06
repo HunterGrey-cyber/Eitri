@@ -1331,6 +1331,27 @@ impl AgentPanelHandle {
         self.dispatch(serialize_nav_key_for_js(direction));
     }
 
+    /// The agent host's `Ctrl+j`/`Ctrl+k` intercept for a module-navigation controller: a chord the
+    /// panel's own `panel_keys` mirror claims goes to the panel as a nav key and the closure answers
+    /// `true`; every other direction answers `false`, so the host moves focus as it would without one.
+    pub fn nav_intercept(&self) -> Rc<dyn Fn(Direction) -> bool> {
+        let agent = self.clone();
+        Rc::new(move |direction: Direction| {
+            if !claims(agent.panel_keys(), direction) {
+                return false;
+            }
+            let direction = match direction {
+                Direction::Down => NavKeyDirection::Down,
+                Direction::Up => NavKeyDirection::Up,
+                Direction::Left | Direction::Right => {
+                    unreachable!("claims() only claims Down (in Browse) or Up (in Input)")
+                }
+            };
+            agent.nav_key(direction);
+            true
+        })
+    }
+
     /// The `?` overlay's rows (`serialize_keymap_for_js`): recorded for every later `ready`, and
     /// sent now to a document that is already up.
     pub fn set_keymap_help(&self, payload: String) {
@@ -3628,7 +3649,7 @@ fn end_pending_edits(state: &mut AgentPanelState) -> Vec<(TabId, Option<String>)
 ///
 /// Without this, a reload while the composer is open (`nav_mode == Input`) leaves the mirror at
 /// `Input` even though the fresh document starts in BROWSE. Before that document posts its own
-/// first `panel_keys` message, `main.rs`'s `claims(Input, Direction::Down)` is `false`, so a
+/// first `panel_keys` message, the host's `claims(Input, Direction::Down)` is `false`, so a
 /// `Ctrl+j` the user presses to enter the composer is not claimed and falls through to
 /// `move_focus` instead -- the opposite of what BROWSE + `Ctrl+j` must do.
 ///
@@ -5100,9 +5121,35 @@ fn no_session_error() -> eitri_core::agent_backend::BackendError {
     }
 }
 
+/// Which `Ctrl+j`/`Ctrl+k` the panel takes for its composer: only `Ctrl+j` (`Direction::Down`) while the
+/// `panel_keys` mirror reports `Browse`, or `Ctrl+k` (`Direction::Up`) while it reports `Input`; every
+/// other combination goes to the host's focus move exactly as it would without an intercept. Pure, so
+/// the whole table is a unit test with no display.
+fn claims(mirror: PanelKeys, dir: Direction) -> bool {
+    matches!(
+        (dir, mirror),
+        (Direction::Down, PanelKeys::Browse) | (Direction::Up, PanelKeys::Input)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The full decision table: the two claimed cells (`Down`+`Browse`, `Up`+`Input`) and every other
+    /// combination, which must fall through to the host's focus move unclaimed.
+    #[test]
+    fn claims_only_down_in_browse_and_up_in_input() {
+        for dir in [Direction::Left, Direction::Down, Direction::Up, Direction::Right] {
+            for mirror in [PanelKeys::Browse, PanelKeys::Input, PanelKeys::Other] {
+                let expected = matches!(
+                    (dir, mirror),
+                    (Direction::Down, PanelKeys::Browse) | (Direction::Up, PanelKeys::Input)
+                );
+                assert_eq!(claims(mirror, dir), expected, "{dir:?} + {mirror:?}");
+            }
+        }
+    }
 
     use crate::panel_page::PageSurface;
     use eitri_core::agent_bridge::SessionModeChoice;

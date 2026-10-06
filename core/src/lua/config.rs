@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// `pub`: `shell/src/lua/mod.rs::LuaEngine::new` constructs one directly
+/// `pub`: `Kernel::new` constructs one directly
 /// (`config::ConfigStore::default()`) to hand to `install`.
 #[derive(Default)]
 pub struct ConfigStore {
@@ -51,7 +51,7 @@ impl ConfigStore {
     /// that is not a string, a number, a boolean or `nil` (a table, a function), a string that is
     /// not UTF-8, or a key that is not a string never reaches the store, so every key Eitri reads
     /// would silently keep its default -- `agent.account` among them, which then spends whichever
-    /// account launched the window. `LuaEngine::load_init_file` makes it a startup failure once
+    /// account launched the window. `Kernel::load_init_file` makes it a startup failure once
     /// init.lua has run; it is remembered here because a `pcall` around the call swallows the Lua
     /// error.
     pub fn refused(&self) -> Option<&str> {
@@ -66,7 +66,7 @@ fn refuse(store: &RefCell<ConfigStore>, message: String) -> mlua::Error {
     mlua::Error::RuntimeError(message)
 }
 
-/// `pub`: `LuaEngine::new` calls this.
+/// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlua::Result<()> {
     let config_table = lua.create_table()?;
 

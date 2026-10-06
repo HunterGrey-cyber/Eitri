@@ -358,6 +358,19 @@ pub enum PaneMessage {
     QuitCancelled(u32),
 }
 
+/// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
+/// else is not a direction (the shim only ever sends these four).
+pub fn letter_direction(letter: char) -> Option<crate::layout::Direction> {
+    use crate::layout::Direction;
+    match letter {
+        'L' => Some(Direction::Left),
+        'R' => Some(Direction::Right),
+        'U' => Some(Direction::Up),
+        'D' => Some(Direction::Down),
+        _ => None,
+    }
+}
+
 /// Reads [`PaneMessage`]s off a pane-switch socket without ever blocking the caller on a slow or
 /// trickling sender (P3-A1, the pane-switch half; the theme feed's identical mechanism was already
 /// fixed as `sw-theme-1`). Construct once per channel and retain across polls -- a fresh reader
@@ -607,9 +620,20 @@ fn parse_message(line: &str) -> Option<PaneMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Direction;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::time::Instant;
+
+    #[test]
+    fn the_shims_four_letters_are_the_four_directions() {
+        assert_eq!(letter_direction('L'), Some(Direction::Left));
+        assert_eq!(letter_direction('R'), Some(Direction::Right));
+        assert_eq!(letter_direction('U'), Some(Direction::Up));
+        assert_eq!(letter_direction('D'), Some(Direction::Down));
+        assert_eq!(letter_direction('r'), None);
+        assert_eq!(letter_direction('X'), None);
+    }
 
     /// For a test asserting that **one** poll handles several connections (fix round 2, P1 audit).
     /// [`MAX_POLL_DURATION`] is a wall-clock backstop, so under it such an assertion depends on the

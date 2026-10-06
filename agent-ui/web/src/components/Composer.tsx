@@ -14,6 +14,7 @@ import type { HistoryWalk } from "../promptHistory";
 import { stepHistory } from "../promptHistory";
 import { heldBackSlashCommand, slashCommandFlashText } from "../slashCommands";
 import { HistorySearch } from "./HistorySearch";
+import { NO_TEXT_ASSIST } from "../textField";
 
 /** A draft the host is putting back into the box after a send was refused.
  *
@@ -368,6 +369,7 @@ export function Composer({
           </span>
           <textarea
             ref={textareaRef}
+            {...NO_TEXT_ASSIST}
             value={text}
             disabled={disabled}
             readOnly={editingInNvim}

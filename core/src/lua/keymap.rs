@@ -2,7 +2,7 @@
 //! §2.3). Each call is **recorded, never applied or checked here**: `shell` hands the recording to
 //! `eitri_core::keymap::Keymap::apply_user` once `init.lua` has run, so every mistake -- a bad
 //! key, an unknown action, a collision -- is a startup failure naming the call. A Lua error raised
-//! from here would only be logged (`LuaEngine::load_init_file`), and the window would open with a
+//! from here would only be logged (`Kernel::load_init_file`), and the window would open with a
 //! keymap the user did not write. That includes an argument of the wrong type: it is recorded as
 //! [`KeymapOp::Invalid`].
 
@@ -54,7 +54,7 @@ fn opts(lua: &Lua, value: &Value) -> Result<Vec<(String, OptValue)>, String> {
     Ok(out)
 }
 
-/// `pub`: `shell::lua::LuaEngine::new` calls this.
+/// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlua::Result<()> {
     let keymap = lua.create_table()?;
 

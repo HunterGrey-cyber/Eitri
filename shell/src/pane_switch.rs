@@ -76,19 +76,7 @@ use gtk4::gdk::{Key, ModifierType};
 
 use crate::layout::Direction;
 use eitri_core::pane_switch::sweep_stale_dirs;
-pub(crate) use eitri_core::pane_switch::{PaneMessage, PaneSwitchChannel};
-
-/// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
-/// else is not a direction (the shim only ever sends these four).
-pub(crate) fn letter_direction(letter: char) -> Option<Direction> {
-    match letter {
-        'L' => Some(Direction::Left),
-        'R' => Some(Direction::Right),
-        'U' => Some(Direction::Up),
-        'D' => Some(Direction::Down),
-        _ => None,
-    }
-}
+pub(crate) use eitri_core::pane_switch::{letter_direction, PaneMessage, PaneSwitchChannel};
 
 /// `Ctrl+h/j/k/l` in a web module or the bottom terminal (`terminal::navigation` is this): Control
 /// held and nothing else but CapsLock -- `Shift`, `Alt`, `Super` or `Meta` held means it is not a
@@ -220,16 +208,6 @@ fn locate_shim_binary() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_shims_four_letters_are_the_four_directions() {
-        assert_eq!(letter_direction('L'), Some(Direction::Left));
-        assert_eq!(letter_direction('R'), Some(Direction::Right));
-        assert_eq!(letter_direction('U'), Some(Direction::Up));
-        assert_eq!(letter_direction('D'), Some(Direction::Down));
-        assert_eq!(letter_direction('r'), None);
-        assert_eq!(letter_direction('X'), None);
-    }
 
     #[test]
     fn only_control_with_hjkl_and_nothing_else_held_moves() {

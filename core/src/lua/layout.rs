@@ -76,7 +76,7 @@ impl LayoutStore {
     }
 }
 
-/// `pub`: `shell`'s `LuaEngine::new` calls this.
+/// `pub`: `shell`'s `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlua::Result<()> {
     let table = lua.create_table()?;
 

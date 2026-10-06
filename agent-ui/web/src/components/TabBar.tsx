@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import type { TabId, TabInfo } from "../types";
 import { markerGlyph } from "../tabs";
+import { NO_TEXT_ASSIST } from "../textField";
 
 type Props = {
   tabs: TabInfo[];
@@ -97,6 +98,7 @@ function RenameField({
       {number}{" "}
       <input
         ref={ref}
+        {...NO_TEXT_ASSIST}
         className="tab-rename"
         aria-label={`Rename tab ${number}`}
         value={value}

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// `pub`: `shell/src/main.rs` reads `keybinding` off every entry `iter()` yields, and
-/// `LuaEngine::invoke_command` (`shell/src/lua/mod.rs`) reads `action`. `title` is read by
+/// `Kernel::invoke_command` reads `action`. `title` is read by
 /// neither yet (`#[allow(dead_code)]` below is original, not new) and stays `pub(crate)`.
 pub struct CommandEntry {
     #[allow(dead_code)] // read by a future command-palette UI; not consumed by this plan
@@ -19,13 +19,13 @@ pub struct CommandEntry {
     pub keybinding: Option<String>,
     // `Rc<RegistryKey>`, not a bare `RegistryKey`: `RegistryKey` doesn't implement `Clone`
     // (verified against the installed mlua 0.12.1's `src/types/registry_key.rs`), and
-    // `LuaEngine::invoke_command` needs to clone the handle *out* of a borrowed
+    // `Kernel::invoke_command` needs to clone the handle *out* of a borrowed
     // `CommandRegistry` before dropping that borrow, to avoid a reentrant `BorrowMutError` if
     // the action itself calls `eitri.command.register(...)`.
     pub action: Rc<RegistryKey>,
 }
 
-/// `pub`: `shell/src/lua/mod.rs` holds one behind an `Rc<RefCell<_>>` field and calls `install`.
+/// `pub`: `Kernel` holds one behind an `Rc<RefCell<_>>` field and calls `install`.
 #[derive(Default)]
 pub struct CommandRegistry {
     commands: HashMap<String, CommandEntry>,
@@ -53,13 +53,13 @@ impl CommandRegistry {
         self.commands.is_empty()
     }
 
-    /// `pub`: `LuaEngine::invoke_command` calls this.
+    /// `pub`: `Kernel::invoke_command` calls this.
     pub fn get(&self, id: &str) -> Option<&CommandEntry> {
         self.commands.get(id)
     }
 
     /// The message of the first command id `register` refused, or `None`. `pub`:
-    /// `LuaEngine::load_init_file` makes it a startup failure once init.lua has run.
+    /// `Kernel::load_init_file` makes it a startup failure once init.lua has run.
     pub fn refused(&self) -> Option<&str> {
         self.refused.as_deref()
     }
@@ -89,13 +89,13 @@ fn is_valid_command_id(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
-/// `pub`: `LuaEngine::new` calls this.
+/// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, registry: Rc<RefCell<CommandRegistry>>) -> mlua::Result<()> {
     let command_table = lua.create_table()?;
     let register_fn = lua.create_function(move |lua, spec: Table| {
         let id: String = spec.get("id")?;
         if !is_valid_command_id(&id) {
-            // Reported through `LuaEngine::load_init_file`'s existing error path, not a GTK abort
+            // Reported through `Kernel::load_init_file`'s existing error path, not a GTK abort
             // at startup. **Correction (codex-sweep round 1):** an earlier revision of this
             // comment said "an uncaught Lua error there is logged and init.lua keeps loading" --
             // wrong. `load_init_file` runs the whole file as one `.exec()`'d chunk, so an
@@ -110,7 +110,7 @@ pub fn install(lua: &Lua, eitri: &Table, registry: Rc<RefCell<CommandRegistry>>)
             // left one stderr line an app-menu launch never shows, skipped the rest of init.lua --
             // `agent.account` included -- and a `pcall` swallowed even that. The message is kept
             // (`CommandRegistry::refused`) whatever init.lua does with the error, and
-            // `LuaEngine::load_init_file` exits naming it, as every other validated config value does.
+            // `Kernel::load_init_file` exits naming it, as every other validated config value does.
             let message = format!(
                 "eitri.command.register: invalid command id {id:?} -- only ASCII letters, digits, \
                  '-' and '.' are allowed (an invalid id crashes the whole process once bound to a keybinding)"
@@ -195,7 +195,7 @@ mod tests {
     /// Regression test for the reentrancy panic the final review reproduced: a command action
     /// that itself calls `eitri.command.register(...)` -- registering another command from
     /// inside a command's own action -- must not panic with `BorrowMutError`. This mirrors
-    /// `LuaEngine::invoke_command`'s own borrow/call sequence rather than going through
+    /// `Kernel::invoke_command`'s own borrow/call sequence rather than going through
     /// `LuaEngine` directly, since this module (unlike `LuaEngine`) needs no display and is
     /// fully unit-testable on its own.
     #[test]
@@ -224,7 +224,7 @@ mod tests {
         .exec()
         .unwrap();
 
-        // Mirror `LuaEngine::invoke_command`'s clone-out-then-call pattern: resolve the action
+        // Mirror `Kernel::invoke_command`'s clone-out-then-call pattern: resolve the action
         // under a scoped borrow, drop the borrow, then call it. Before the fix (a bare
         // `RegistryKey` resolved and called while still holding `registry.borrow()`), the
         // action's own `eitri.command.register` call would panic with `BorrowMutError`.
@@ -319,7 +319,7 @@ mod tests {
     /// Regression test for a codex-sweep round-1 finding on this file's own comment: it claimed
     /// an uncaught error from an invalid id is "logged and init.lua keeps loading", implying
     /// later statements in the same file still run. A Lua chunk executed with `.exec()` (which
-    /// is exactly how `shell::lua::LuaEngine::load_init_file` runs a whole `init.lua`) unwinds at
+    /// is exactly how `Kernel::load_init_file` runs a whole `init.lua`) unwinds at
     /// its first uncaught error like any normal Lua script: nothing after the bad call in *that
     /// chunk* executes. This is standard Lua semantics, not anything `register` does specially,
     /// but the comment's wording was wrong about it, so this pins the real behaviour against
@@ -356,7 +356,7 @@ mod tests {
     /// (the keymap, panels, the `agent.account` pin) was skipped and the shell started anyway with
     /// one stderr line an app-menu launch never shows -- and an init.lua that wrapped the call in
     /// `pcall` swallowed even that. A refused id is now remembered however the error is handled, so
-    /// `LuaEngine::load_init_file` can make it a startup failure naming the id, as every other
+    /// `Kernel::load_init_file` can make it a startup failure naming the id, as every other
     /// config value Eitri validates is (`agent.font_size`, `agent.account`, a keybinding).
     #[test]
     fn a_refused_id_is_remembered_even_when_init_lua_catches_the_error() {

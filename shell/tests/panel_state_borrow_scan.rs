@@ -279,7 +279,7 @@ fn offences(src: &str) -> Vec<(usize, Form, String)> {
 }
 
 /// Directories scanned, relative to the workspace root.
-const SCANNED: &[&str] = &["shell/src", "panel/src"];
+const SCANNED: &[&str] = &["shell/src", "panel/src", "mac/src"];
 
 #[test]
 fn no_scrutinee_holds_a_state_borrow() {

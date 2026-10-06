@@ -8,13 +8,11 @@ mod agent_panel;
 mod chrome;
 mod close_prompt;
 mod companion;
-mod editor_context;
 mod editor_feeds;
 mod editor_quit;
 mod editor_rpc;
 mod editor_start_failure;
 mod hint;
-mod keys_help;
 mod kill_pane;
 mod layout;
 mod layout_state;
@@ -25,7 +23,6 @@ mod pane_switch;
 mod panel_super;
 mod prefix;
 mod prefix_strip;
-mod tab_verbs;
 mod terminal;
 mod text_size;
 mod theme;
@@ -57,6 +54,7 @@ use eitri_core::keymap::{Action, SwapTarget, TabAction};
 use eitri_core::layout::{
     Axis, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Reopen,
 };
+use eitri_core::tabs::TabVerb;
 use lua::{LuaEngine, PanelSlot};
 use module_grid::{HostKind, ModuleGrid};
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
@@ -100,7 +98,7 @@ fn main() -> glib::ExitCode {
     // thread or a child. An Eitri started from an nvim `:terminal` would otherwise hand that editor's
     // RPC address -- and, if it is another window's nvim, that window's socket variables -- to the
     // agent, its tools and the bottom shell.
-    companion::drop_inherited_editor_env();
+    eitri_core::companion::env::drop_inherited_editor_env();
     let has_flag = |flag: &str| eitri_core::project_root::flag_given(early_args.iter().map(OsString::as_os_str), flag);
 
     // `--version` (v1-dist plan Task 1, spec §3), before anything else -- including the stdin
@@ -272,7 +270,7 @@ fn build_ui(
     // wire 1's feed, built here for the same reason the other two are: its `child_env()` and its
     // `--cmd` must be handed to the editor pane's constructor, and neither can be added to a child
     // that is already running.
-    let mut context_feed = editor_context::EditorContextFeed::new();
+    let mut context_feed = eitri_core::editor_context::feed::EditorContextFeed::new();
     // Panel round 2 plan Task 6's fourth push socket (spec §3): nvim's `mapleader`, `timeoutlen`
     // and Normal-mode maps, built here for the same reason the other three are -- its `child_env()`
     // and `--cmd` must reach the editor pane's constructor, which cannot be handed to an already
@@ -419,12 +417,12 @@ fn build_ui(
     // The `?` overlay's window and prefix sections, generated from the keymap (keymap spec §2.9);
     // see `keys_help`. It is re-sent, only when the merged panel table changed, every time nvim's
     // own keys report changes (`FeedPump::listen_keys` below).
-    let keys_help = keys_help::KeysHelp::new(
+    let keys_help = eitri_panel::keys_help::KeysHelp::new(
         keymap.clone(),
         module_keys.clone(),
         agent_panel_handle.clone(),
         config.tmux_skipped.clone(),
-        crate::keys_help::HelpScope::Window,
+        eitri_panel::keys_help::HelpScope::Window,
     );
     keys_help.send();
     if let Some(feed) = nvim_keys_feed.as_mut() {
@@ -1409,7 +1407,7 @@ fn build_ui(
                 .as_ref()
                 .map(ModuleId::kind);
             // One terminal today; `n`/`p` there are swallowed (spec §3.4, D8).
-            let plan = tab_verbs::plan(tab_action, keys_in, 1);
+            let plan = eitri_core::tabs::plan(tab_action, keys_in, 1);
             if plan.takes_the_keys {
                 if let Err(err) = show_on_screen(&chat) {
                     refuse(&refused_name, &toast, &err);
@@ -1418,36 +1416,36 @@ fn build_ui(
                 focus_module(&chat);
             }
             let switched = match plan.verb {
-                tab_verbs::TabVerb::New => {
+                TabVerb::New => {
                     agent.new_tab();
                     agent.enter_input();
                     true
                 }
-                tab_verbs::TabVerb::Step(delta) => agent.step(delta),
-                tab_verbs::TabVerb::Last => agent.select_last(),
-                tab_verbs::TabVerb::Select(n) => agent.select_number(n),
-                tab_verbs::TabVerb::Rename => {
+                TabVerb::Step(delta) => agent.step(delta),
+                TabVerb::Last => agent.select_last(),
+                TabVerb::Select(n) => agent.select_number(n),
+                TabVerb::Rename => {
                     agent.begin_rename();
                     true
                 }
-                tab_verbs::TabVerb::Close => {
+                TabVerb::Close => {
                     agent.confirm_close();
                     true
                 }
-                tab_verbs::TabVerb::CloseOthers => {
+                TabVerb::CloseOthers => {
                     agent.confirm_close_others();
                     true
                 }
-                tab_verbs::TabVerb::Choose => {
+                TabVerb::Choose => {
                     agent.open_chooser();
                     true
                 }
-                tab_verbs::TabVerb::Info => {
+                TabVerb::Info => {
                     agent.open_detail();
                     true
                 }
-                tab_verbs::TabVerb::Flash => false,
-                tab_verbs::TabVerb::Nothing => return,
+                TabVerb::Flash => false,
+                TabVerb::Nothing => return,
             };
             if !switched {
                 // tmux: "can't find window" (ruling 10).
@@ -1807,7 +1805,7 @@ fn build_ui(
         .filter(|(id, _)| matches!(id.kind(), ModuleKind::Agent | ModuleKind::LuaWebview))
     {
         let intercept: Option<Rc<dyn Fn(Direction) -> bool>> = if id.kind() == ModuleKind::Agent {
-            Some(agent_nav_intercept(agent_panel_handle.clone()))
+            Some(agent_panel_handle.nav_intercept())
         } else {
             None
         };
@@ -2307,39 +2305,6 @@ fn refuse(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, err: &LayoutError) {
     }
 }
 
-/// The agent host's `Ctrl+j`/`Ctrl+k` intercept for `install_module_nav`: a chord the panel's own
-/// `panel_keys` mirror claims goes to the panel as a nav key, every other falls through to
-/// `move_focus`.
-pub(crate) fn agent_nav_intercept(agent: agent_panel::AgentPanelHandle) -> Rc<dyn Fn(Direction) -> bool> {
-    Rc::new(move |direction: Direction| {
-        if !claims(agent.panel_keys(), direction) {
-            return false;
-        }
-        let direction = match direction {
-            Direction::Down => eitri_core::agent_bridge::NavKeyDirection::Down,
-            Direction::Up => eitri_core::agent_bridge::NavKeyDirection::Up,
-            Direction::Left | Direction::Right => {
-                unreachable!("claims() only claims Down (in Browse) or Up (in Input)")
-            }
-        };
-        agent.nav_key(direction);
-        true
-    })
-}
-
-/// C1's decision, in Rust (spec §3.5): only `Ctrl+j` (`Direction::Down`) while the panel's
-/// `panel_keys` mirror reports `Browse`, or `Ctrl+k` (`Direction::Up`) while it reports `Input`, is
-/// claimed for the composer -- every other combination goes to `move_focus` exactly as before. Pure
-/// so the full table is a unit test with no display; `install_module_nav`'s agent-only `intercept`
-/// closure is the only caller.
-fn claims(mirror: eitri_core::agent_bridge::PanelKeys, dir: Direction) -> bool {
-    use eitri_core::agent_bridge::PanelKeys;
-    matches!(
-        (dir, mirror),
-        (Direction::Down, PanelKeys::Browse) | (Direction::Up, PanelKeys::Input)
-    )
-}
-
 /// `Ctrl+h/j/k/l` from a web module (the agent panel, a Lua panel), on its host: a capture-phase
 /// controller, because `vim-tmux-navigator` lives inside Neovim, which is not the focused widget
 /// here, so nothing would ever run; capture, not bubble, because a `WebView` handles key events
@@ -2550,7 +2515,7 @@ mod tests {
                 .find(concat!("fn build_", "application"))
                 .expect("build_application");
         let body = &src[start..end];
-        let call = concat!("drop_inherited", "_editor_env()");
+        let call = concat!("companion::env::drop_inherited", "_editor_env()");
         assert_eq!(body.matches(call).count(), 1, "called exactly once in main");
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} in main"));
         let order = [
@@ -2585,22 +2550,6 @@ mod tests {
             }
         }
         assert_eq!(taken, 4, "Ctrl+h/j/k/l, and nothing else");
-    }
-
-    /// C1's full decision table (spec §3.5): the two claimed cells (`Down`+`Browse`, `Up`+`Input`)
-    /// and every other combination, which must fall through to `move_focus` unclaimed.
-    #[test]
-    fn claims_only_down_in_browse_and_up_in_input() {
-        use eitri_core::agent_bridge::PanelKeys;
-        for dir in [Direction::Left, Direction::Down, Direction::Up, Direction::Right] {
-            for mirror in [PanelKeys::Browse, PanelKeys::Input, PanelKeys::Other] {
-                let expected = matches!(
-                    (dir, mirror),
-                    (Direction::Down, PanelKeys::Browse) | (Direction::Up, PanelKeys::Input)
-                );
-                assert_eq!(claims(mirror, dir), expected, "{dir:?} + {mirror:?}");
-            }
-        }
     }
 
     /// P8 (spec §7.2): `refuse` shows this text in the window's toast for a killed editor, and

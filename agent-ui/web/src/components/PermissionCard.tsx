@@ -6,6 +6,7 @@ import { isUsableLink } from "../timeline";
 import { EditDiff } from "./EditDiff";
 import { countEscapes, revealHidden } from "../revealHidden";
 import { HiddenWarning, Revealed } from "./Revealed";
+import { NO_TEXT_ASSIST } from "../textField";
 
 type Props = {
   request: PermissionRequestRecord;
@@ -82,6 +83,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
       <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />
       <input
         type="text"
+        {...NO_TEXT_ASSIST}
         data-nav-order={ruleOffer ? 4 : 3}
         placeholder="Reason (shown to the agent if you deny) — Enter denies"
         value={reason}

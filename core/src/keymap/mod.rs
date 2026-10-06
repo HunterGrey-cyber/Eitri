@@ -4,6 +4,7 @@
 //! registers what this says and looks keys up in it; a macOS host would do the same.
 
 pub mod action;
+pub mod companion;
 pub mod key;
 pub mod panel;
 pub mod prefix;

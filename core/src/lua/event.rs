@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// `pub`: `shell/src/lua/mod.rs::LuaEngine::new` constructs one directly
+/// `pub`: `Kernel::new` constructs one directly
 /// (`event::EventBus::default()`) to hand to `install`.
 #[derive(Default)]
 pub struct EventBus {
@@ -28,7 +28,7 @@ impl EventBus {
     }
 }
 
-/// `pub`: `LuaEngine::new` calls this.
+/// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, bus: Rc<RefCell<EventBus>>) -> mlua::Result<()> {
     let on_fn = lua.create_function(move |lua, (event_name, handler): (String, mlua::Function)| {
         let key = lua.create_registry_value(handler)?;
@@ -41,7 +41,7 @@ pub fn install(lua: &Lua, eitri: &Table, bus: Rc<RefCell<EventBus>>) -> mlua::Re
 
 /// Calls every handler subscribed to `event_name`, in registration order, with `payload`. A
 /// handler that errors is logged and skipped -- one broken plugin handler must not stop the
-/// rest, matching `LuaEngine::load_init_file`'s "never let Lua crash the shell" discipline
+/// rest, matching `Kernel::load_init_file`'s "never let Lua crash the shell" discipline
 /// (added in Task 6).
 ///
 /// Takes `bus: &RefCell<EventBus>` (not an already-borrowed `&EventBus`) so it can control its
@@ -54,7 +54,7 @@ pub fn install(lua: &Lua, eitri: &Table, bus: Rc<RefCell<EventBus>>) -> mlua::Re
 /// fix (resolve what's needed under the borrow, drop the borrow, then call out), as
 /// `neovide-editor`'s tick callback uses for its `exited_callback`.
 ///
-/// `pub`: `LuaEngine::emit` calls this.
+/// `pub`: `Kernel::emit` calls this.
 pub fn emit(lua: &Lua, bus: &RefCell<EventBus>, event_name: &str, payload: Value) {
     let keys: Vec<Rc<RegistryKey>> = {
         let bus = bus.borrow();
