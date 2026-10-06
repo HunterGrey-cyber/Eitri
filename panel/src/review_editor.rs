@@ -12,35 +12,35 @@ use eitri_core::turn_review::ReviewFlow;
 
 /// Who owns the module in the editor now: asked again before every request, because a companion
 /// panel's channel changes with each attach. `None`: there is no editor to show a review in.
-pub(crate) type OwnerSource = Rc<dyn Fn() -> Option<Owner>>;
+pub type OwnerSource = Rc<dyn Fn() -> Option<Owner>>;
 
 /// Brings the editor to the user once a file was opened in it.
-pub(crate) type OpenedHook = Rc<dyn Fn()>;
+pub type OpenedHook = Rc<dyn Fn()>;
 
 /// The window's side of the editor overlay.
 #[derive(Default)]
-pub(crate) struct ReviewEditor {
+pub struct ReviewEditor {
     owner: Option<OwnerSource>,
     opened: Option<OpenedHook>,
 }
 
 impl ReviewEditor {
-    pub(crate) fn set_owner(&mut self, owner: OwnerSource) {
+    pub fn set_owner(&mut self, owner: OwnerSource) {
         self.owner = Some(owner);
     }
 
-    pub(crate) fn set_opened(&mut self, hook: OpenedHook) {
+    pub fn set_opened(&mut self, hook: OpenedHook) {
         self.opened = Some(hook);
     }
 
     /// Tells `flow` who owns the module now. A window that gave no owner has no editor overlay.
-    pub(crate) fn sync(&self, flow: &mut ReviewFlow) {
+    pub fn sync(&self, flow: &mut ReviewFlow) {
         flow.set_editor_owner(self.owner.as_ref().and_then(|owner| owner()));
     }
 
     /// The hook to run after a file opened, if the window gave one. Returned rather than called so
     /// the caller can run it with no borrow of the panel's state held.
-    pub(crate) fn opened_hook(&self) -> Option<OpenedHook> {
+    pub fn opened_hook(&self) -> Option<OpenedHook> {
         self.opened.clone()
     }
 }

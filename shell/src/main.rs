@@ -9,6 +9,7 @@ mod chrome;
 mod close_prompt;
 mod companion;
 mod editor_context;
+mod editor_feeds;
 mod editor_quit;
 mod editor_rpc;
 mod editor_start_failure;
@@ -19,33 +20,28 @@ mod layout;
 mod layout_state;
 mod lua;
 mod module_grid;
-mod nvim_keys;
 mod pane_focus;
 mod pane_switch;
-mod panel_csp;
-mod panel_pacer;
 mod panel_super;
 mod prefix;
 mod prefix_strip;
-mod review_editor;
-mod supervisor_client;
 mod tab_verbs;
 mod terminal;
-mod terminal_handoff;
 mod text_size;
 mod theme;
 mod toast;
 mod tray;
-mod trust_gate;
 mod version;
 mod web_host;
 mod webkit_sandbox;
 mod webkit_zoom;
-mod webview_crash_guard;
 mod wheel_zoom;
 mod window_config;
 mod window_mode;
 mod xft_dpi;
+
+// The panel's crash guard lives in `eitri-panel`; the alias keeps `crate::webview_crash_guard::` working.
+use eitri_panel::webview_crash_guard;
 
 use std::cell::RefCell;
 use std::ffi::OsString;
@@ -264,6 +260,8 @@ fn build_ui(
     let theme_css = theme::gtk_css::ThemeCss::install(&eitri_core::theme::ThemeTokens::fallback());
     // Built before the editor pane for the same reason `pane_switch` is: its env and `--cmd` reach
     // nvim only at spawn. `None` (logged) leaves the window on the fallback colours.
+    // One timer for the four feeds below; each is read once its consumer calls `listen_*`.
+    let feed_pump = editor_feeds::FeedPump::start();
     let mut theme_feed = theme::feed::ThemeFeed::new();
 
     // Built before the editor pane, because its `child_env()` has to be handed to the pane's
@@ -322,7 +320,7 @@ fn build_ui(
     // A feed that failed to start yields a source that always answers `None`, so the panel needs no
     // branch: turns simply go out as the user typed them, exactly as before wire 1 existed.
     let editor_context_source = match context_feed.as_mut() {
-        Some(feed) => editor_context::listen(feed, scratch_path.clone()),
+        Some(feed) => feed_pump.listen_context(feed, scratch_path.clone()).0,
         None => std::rc::Rc::new(|| None),
     };
     let (agent_widget, agent_panel_handle) = agent_panel::build_agent_panel(
@@ -420,7 +418,7 @@ fn build_ui(
     };
     // The `?` overlay's window and prefix sections, generated from the keymap (keymap spec §2.9);
     // see `keys_help`. It is re-sent, only when the merged panel table changed, every time nvim's
-    // own keys report changes (`nvim_keys::listen` below).
+    // own keys report changes (`FeedPump::listen_keys` below).
     let keys_help = keys_help::KeysHelp::new(
         keymap.clone(),
         module_keys.clone(),
@@ -431,7 +429,7 @@ fn build_ui(
     keys_help.send();
     if let Some(feed) = nvim_keys_feed.as_mut() {
         let keys_help = keys_help.clone();
-        nvim_keys::listen(feed, move |report| keys_help.nvim_report(report));
+        feed_pump.listen_keys(feed, move |report| keys_help.nvim_report(report));
     }
     // The layout this window opens with (modules P2, spec §4.4, §4.6): this project's state file if
     // it can be used, else `init.lua`'s `eitri.layout.default`, else the first launch. A malformed
@@ -692,7 +690,7 @@ fn build_ui(
         let agent_panel_handle = agent_panel_handle.clone();
         let pane_for_theme = pane.clone();
         let terminal = terminal.clone();
-        theme::feed::listen(feed, move |payload| {
+        feed_pump.listen_theme(feed, move |payload| {
             let tokens = eitri_core::theme::ThemeTokens::derive(&payload);
             println!(
                 "[theme] following nvim colorscheme {:?} (background={})",
@@ -1769,7 +1767,7 @@ fn build_ui(
     if let Some(ps) = pane_switch.as_mut() {
         let move_focus = move_focus.clone();
         let editor_quitting = editor_quitting.clone();
-        pane_switch::listen(ps, move |message| match message {
+        feed_pump.listen_pane_switch(ps, move |message| match message {
             pane_switch::PaneMessage::Direction(letter) => match pane_switch::letter_direction(letter) {
                 Some(direction) => {
                     move_focus(&ModuleId::editor(), direction);
@@ -2122,10 +2120,10 @@ fn build_ui(
         // session is otherwise only reachable from closures internal to agent_panel.rs, none of
         // which run on window close on their own. See `AgentPanelHandle`'s own doc for the full
         // consequences (settings backup restore, hook socket cleanup, child SIGTERM) this closes.
-        // `app` travels in because the panel does not block this thread waiting for its children:
-        // it takes a `gio` application hold instead, so THE PANEL'S HALF returns at once and the
-        // process stays alive with no window on screen until the teardown reports. See
-        // `AgentPanelHandle::shutdown`.
+        // The panel does not block this thread waiting for its children: `shutdown` starts their
+        // teardowns on workers and returns what is left to wait for, and `hold_until_done` takes a
+        // `gio` application hold for it, so THE PANEL'S HALF returns at once and the process stays
+        // alive with no window on screen until the teardown reports. See `AgentPanelHandle::shutdown`.
         //
         // Not the whole handler, and the distinction matters to anyone debugging a slow close:
         // `pane.shutdown()` above runs FIRST and on this thread, and it spins until nvim exits
@@ -2133,7 +2131,7 @@ fn build_ui(
         // runs (the close waits for nvim's own `:confirm qall`, and an nvim that cannot be killed
         // refuses the close rather than reaching here), so it returns at once. Named because three
         // consecutive reviews of this path died on a comment that over-claimed.
-        agent_panel_handle.shutdown(&app_for_close);
+        agent_panel::hold_until_done(&app_for_close, agent_panel_handle.shutdown());
         // `lua_engine` is otherwise unused past this point in this task, but referencing it
         // here is what keeps its `Rc` alive for the life of the window rather than dropping as
         // soon as `build_ui` returns -- nothing else in this function holds a reference past
@@ -2469,36 +2467,37 @@ mod tests {
         );
     }
 
-    /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module and its line comments cut
-    /// off -- so this test's own copies of the accelerators cannot satisfy it.
-    fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-        for entry in std::fs::read_dir(dir).expect("shell/src is readable") {
-            let path = entry.expect("a readable entry").path();
-            if path.is_dir() {
-                sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).expect("a readable source file");
-                let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+    /// Directories scanned, relative to the workspace root.
+    const SCANNED: &[&str] = &["shell/src", "panel/src"];
+
+    /// Every `.rs` file of [`SCANNED`], with its `#[cfg(test)]` module and its line comments cut
+    /// off -- so this test's own copies of the accelerators cannot satisfy it. Fails when a
+    /// directory is missing or the code the scan exists to cover is not in what it read.
+    fn sources() -> Vec<(String, String)> {
+        use eitri_core::source_scan as scan;
+        let read = scan::rust_sources(SCANNED);
+        scan::require_anchors(
+            &read,
+            &["fn build_ui(", "fn handle_inbound_message(", "struct TrustGate"],
+        );
+        read.into_iter()
+            .map(|source| {
+                let code = source.text.split("#[cfg(test)]").next().unwrap_or_default();
                 let code: String = code
                     .lines()
                     .map(|line| line.split("//").next().unwrap_or_default())
                     .collect::<Vec<_>>()
                     .join("\n");
-                out.push((path.display().to_string(), code));
-            }
-        }
+                (source.path, code)
+            })
+            .collect()
     }
 
     /// Every accelerator-shaped string literal in `shell/src`, cut from `.rs` files by
     /// [`sources`]/[`is_accel`]. Shared, so the two tests below scan the same tree the same way.
     fn found_accelerators() -> Vec<(String, String)> {
-        let mut files = Vec::new();
-        sources(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
         let mut found = Vec::new();
-        for (name, code) in &files {
+        for (name, code) in &sources() {
             for (index, chunk) in code.split('"').enumerate() {
                 if index % 2 == 1 && is_accel(chunk) {
                     found.push((name.clone(), chunk.to_string()));
@@ -2514,16 +2513,7 @@ mod tests {
     /// this cannot pass because the scanner went blind.
     #[test]
     fn shell_src_writes_no_accelerator_literal() {
-        let mut files = Vec::new();
-        sources(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
-        assert!(
-            files.len() >= 20,
-            "only {} source files -- the walk is broken",
-            files.len()
-        );
+        sources();
         assert!(is_accel("<Control><Shift>f") && is_accel("F11") && is_accel("<Control>KP_Add"));
         assert!(!is_accel("<C-b>") && !is_accel("Ctrl+b"));
         assert_eq!(

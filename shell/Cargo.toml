@@ -14,6 +14,7 @@ sha2 = "0.10"
 neovide-editor = { path = "../neovide-editor" }
 agent = { path = "../agent" }
 eitri-core = { path = "../core" }
+eitri-panel = { path = "../panel" }
 supervisor = { path = "../supervisor" }
 gtk4 = { version = "0.11.4", features = ["v4_14"] }
 webkit6 = "0.6"
@@ -47,7 +48,7 @@ rmpv = "1"
 # that spends nothing), off by default so that no plain `cargo build` -- a release's, the AUR's, a
 # README reader's -- contains it (spec 2026-09-27-v1-dist-design.md §10, D16). Ask for it with
 # `cargo run -p shell --features shell/legacy-backend`; `agent` holds every `cfg`.
-legacy-backend = ["eitri-core/legacy-backend"]
+legacy-backend = ["eitri-core/legacy-backend", "eitri-panel/legacy-backend"]
 
 [dev-dependencies]
 # `tests/web_bundle_freshness.rs` `include!`s `build_web.rs` (the way `build_info_lockfile_parsing.rs`

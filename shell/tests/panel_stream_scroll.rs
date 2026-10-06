@@ -430,7 +430,7 @@ fn numbered_lines(prefix: &str, n: usize) -> String {
 }
 
 enum Step {
-    /// One envelope, delivered exactly as `agent_panel::evaluate_js_dispatch` delivers it.
+    /// One envelope, delivered by this file's own `evaluate_js_dispatch`, which mirrors the host's `PageSurface::send`.
     Dispatch(String),
     Idle,
     /// S9: the window resized to these fractions of the configuration's own size, the way a divider
@@ -678,7 +678,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
     Replay { on_ready, steps }
 }
 
-/// `agent_panel::themed_document`'s exact insertion rule: the theme `<style>` goes directly after
+/// `PanelDocument::themed`'s exact insertion rule (`panel/src/panel_document.rs`): the theme `<style>` goes directly after
 /// the first `<head>`, so the first frame is already in the panel's colours.
 fn themed_document(vars: &[(String, String)]) -> String {
     let declarations: String = vars.iter().map(|(name, value)| format!("{name}:{value};")).collect();
@@ -687,7 +687,7 @@ fn themed_document(vars: &[(String, String)]) -> String {
     format!("{}{}{}", &AGENT_UI_HTML[..at], style, &AGENT_UI_HTML[at..])
 }
 
-/// `agent_panel::evaluate_js_dispatch`, exactly.
+/// The host's `PageSurface::send` script, minus its guard for a page that has not installed its dispatcher.
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
     let script = format!(
         "window.__eitriDispatch({});",

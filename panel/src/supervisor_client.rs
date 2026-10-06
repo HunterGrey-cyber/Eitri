@@ -12,9 +12,8 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use supervisor::{AgentStatus, ShellMessage, SupervisorMessage};
 
-/// One status per window, now that a window holds several sessions (session tabs spec §3.7,
-/// ruling 19): the most urgent tab's. Per-tab rows in the dashboard are a follow-on.
-pub(crate) fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) -> AgentStatus {
+/// One status per window, now that a window holds several sessions: the most urgent tab's. Per-tab rows in the dashboard are a follow-on.
+pub fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) -> AgentStatus {
     fn rank(status: AgentStatus) -> u8 {
         match status {
             AgentStatus::Blocked => 4,
@@ -30,11 +29,11 @@ pub(crate) fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) 
         .unwrap_or(AgentStatus::NoSession)
 }
 
-/// The pure mapping from spec §4's table -- checked in the exact stated order. Takes
+/// The pure mapping from a session's projection to the dashboard's status, checked in the exact stated order. Takes
 /// `Option<&AgentSessionProjection>` rather than the state directly because a session tab has no
 /// backend until its first send or resume (and none once it failed); `None` here means exactly
-/// that (spec's `no_session` row). One call per tab; `aggregate_status` picks the window's.
-pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus {
+/// that (the `no_session` status). One call per tab; `aggregate_status` picks the window's.
+pub fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus {
     let Some(projection) = projection else {
         return AgentStatus::NoSession;
     };
@@ -63,7 +62,7 @@ pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> Agen
 /// degrades to "this shell window just doesn't appear in the dashboard" rather than propagating
 /// an error `shell`'s own startup or main loop would need to handle -- this is a nice-to-have
 /// integration, never a safety-critical one like `agent`'s own permission hook.
-pub(crate) struct SupervisorClient {
+pub struct SupervisorClient {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
     instance_id: String,
@@ -83,7 +82,7 @@ pub(crate) struct SupervisorClient {
 /// process to initialize and bind its socket -- far more than the 250ms this used to allow, so the
 /// window that spawned it was systematically the one window the dashboard never showed. Observed
 /// live on 2026-09-15, not theorized: two windows, and only the second one appeared.
-pub(crate) enum PendingSupervisor {
+pub enum PendingSupervisor {
     Ready(Option<SupervisorClient>),
     Connecting(std::sync::mpsc::Receiver<Option<SupervisorClient>>),
 }
@@ -100,7 +99,7 @@ fn retry_schedule() -> Vec<u64> {
 
 /// Whether this window may *start* `eitri-supervisor` when none is listening.
 ///
-/// **Default: no, changed 2026-09-19 at the owner's request** ("supervisor 的窗口能不能先隐藏").
+/// **Default: no (changed 2026-09-19).**
 /// Until then, the first `shell` launch on a machine put a second, unasked-for GTK window on the
 /// screen -- a dashboard nobody had opened, belonging to a feature the user had not invoked.
 ///
@@ -116,8 +115,8 @@ fn retry_schedule() -> Vec<u64> {
 ///
 /// Anything unrecognised is `false`. This is the safe direction and the opposite of the one
 /// `BackendKind::from_env` picks for its own typos, deliberately: a typo there still selects a
-/// *backend* (the sidecar, with a warning -- **correction, 2026-09-27, v1-dist Task 5: it used to
-/// fall to legacy instead, before legacy became the gated backend, D10**), so it warns; a typo here
+/// *backend* (the sidecar, with a warning -- it used to
+/// fall to legacy instead, before legacy became the gated backend), so it warns; a typo here
 /// silently declines to open a window, which the user can see and correct by looking at the screen.
 fn spawn_requested(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1" | "true" | "yes"))
@@ -132,7 +131,7 @@ impl SupervisorClient {
     ///
     /// Every failure degrades to "this window just doesn't appear in the dashboard", logged and
     /// never propagated, matching this crate's posture for non-critical integrations.
-    pub(crate) fn connect_or_spawn(instance_id: String, project_name: String, project_dir: &Path) -> PendingSupervisor {
+    pub fn connect_or_spawn(instance_id: String, project_name: String, project_dir: &Path) -> PendingSupervisor {
         let socket_path = supervisor::socket_path();
 
         if let Ok(stream) = UnixStream::connect(&socket_path) {
@@ -149,7 +148,7 @@ impl SupervisorClient {
         match supervisor::locate_supervisor_binary() {
             Ok(binary) => {
                 let mut command = std::process::Command::new(&binary);
-                // Spec §5: a detached, persistent background process -- `shell` never waits on
+                // A detached, persistent background process -- `shell` never waits on
                 // it directly and must not inherit its stdio (GTK/a11y noise landing in this
                 // process's own terminal) or its process group (a Ctrl+C in the launching
                 // terminal must not also kill the "persistent" supervisor).
@@ -245,7 +244,7 @@ impl SupervisorClient {
     /// Sends a `Status` message only if `status` differs from the last one actually sent --
     /// called from `agent_panel.rs`'s existing 33ms pump timer, so without this dedup every tick
     /// would write to the socket regardless of whether anything changed.
-    pub(crate) fn send_status(&mut self, status: AgentStatus) {
+    pub fn send_status(&mut self, status: AgentStatus) {
         if self.dead || self.last_sent_status == Some(status) {
             return;
         }
@@ -266,7 +265,7 @@ impl SupervisorClient {
     /// Non-blocking: returns `true` if a `SupervisorMessage::Activate` arrived since the last
     /// call. Drains any buffered lines fully (a burst arriving between polls shouldn't be missed
     /// or double-counted), returning `true` if *any* of them was `Activate`.
-    pub(crate) fn poll_activate(&mut self) -> bool {
+    pub fn poll_activate(&mut self) -> bool {
         if self.dead {
             return false;
         }

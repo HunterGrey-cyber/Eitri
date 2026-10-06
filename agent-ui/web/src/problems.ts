@@ -113,7 +113,7 @@ function classifySidecarStopped(text: string): Problem | null {
 }
 
 /** `shell`'s wrapper for a session that reached a terminal state before the provider reported it
- *  open (`report_sessions_that_never_opened`, shell/src/agent_panel.rs), split at its own words. A
+ *  open (`report_sessions_that_never_opened`, panel/src/agent_panel.rs), split at its own words. A
  *  resumed sidecar session reports itself open only at its first turn, so a sidecar that stops
  *  before one lands here too, and the wrapper's guess ("it most likely no longer exists") is then
  *  wrong. Returns the provider's own reason when `text` is exactly that wrapper, else `null`. */

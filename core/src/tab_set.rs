@@ -1,5 +1,5 @@
 //! One window's session tabs (session tabs spec §3.1): one conversation, and so one `AgentBackend`,
-//! per tab, every one of them running. GTK-free: `shell::agent_panel` spawns the connect and
+//! per tab, every one of them running. GTK-free: `eitri_panel::agent_panel` spawns the connect and
 //! handoff workers and hands this set their receivers; the 33 ms tick calls [`TabSet::pump`], which
 //! drains EVERY tab -- `take_ui_delivery` is where the permission policy answers what needs no
 //! human, so a tab that was not pumped would stall on its first `Read` (spec §3.1).
@@ -33,7 +33,7 @@ pub struct FirstTurn {
     pub typed: String,
 }
 
-/// A backend being constructed on a worker. See `shell::agent_panel`'s connect worker.
+/// A backend being constructed on a worker. See `eitri_panel::agent_panel`'s connect worker.
 pub struct PendingStart {
     /// The command (`send_message` or `resume`) whose `command_result` is owed when it finishes.
     pub request_id: String,
@@ -504,7 +504,7 @@ pub struct PumpOutput {
     pub offers_changed: Vec<TabId>,
     /// Tabs this tick failed because their CLI reported an ungated permission mode (spec §2.3,
     /// D12), each with the backend taken out of it. The caller shuts each one down off the GTK
-    /// thread exactly as it does a closed tab's (`shell::agent_panel`'s `Retiring::backend`).
+    /// thread exactly as it does a closed tab's (`eitri_panel::agent_panel`'s `Retiring::backend`).
     pub tripped: Vec<Tripped>,
     /// Turns whose end snapshot landed this tick, for the status band (empty without a turn
     /// review installed).
@@ -2464,7 +2464,7 @@ impl TabSet {
     ///
     /// `take_all` leaves the set without tabs, so `active_tab()` would panic afterwards. Only the
     /// close path calls it, after setting `shutting_down`, and nothing reads the set after that
-    /// (`shell::agent_panel` checks `shutting_down` first on every path that reaches the set).
+    /// (`eitri_panel::agent_panel` checks `shutting_down` first on every path that reaches the set).
     pub fn take_all(&mut self) -> Vec<Tab> {
         self.closing = true;
         for tab in &mut self.tabs {
@@ -3459,7 +3459,7 @@ mod tests {
 
     /// Round 1 (Codex, CONFIRMED, blocking), found against the catch-up drain this branch then had:
     /// a `TurnCompleted` a switch or reload took off the queue never reached
-    /// `PumpOutput::turn_ended` -- the only trigger `shell::agent_panel`'s ruling-3a flush has -- so
+    /// `PumpOutput::turn_ended` -- the only trigger `eitri_panel::agent_panel`'s queue flush has -- so
     /// a message queued behind the turn sat there until something else poked the tab. That drain is
     /// gone (round 2's review); what this holds now is that a `TurnCompleted` the snapshot carried,
     /// and the next tick therefore leaves out of its payload, is still folded by that tick into
@@ -3749,7 +3749,7 @@ mod tests {
             "the old session's snapshot covers more revisions than the new one will reach below"
         );
 
-        // As `shell::agent_panel` retires a session whose command failed fatally.
+        // As `eitri_panel::agent_panel` retires a session whose command failed fatally.
         let old = std::mem::replace(
             &mut set.get_mut(tab).unwrap().backend,
             TabBackend::Failed {

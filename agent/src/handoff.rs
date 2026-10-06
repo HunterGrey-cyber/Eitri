@@ -98,7 +98,7 @@ pub fn claude_resume_argv(provider_session_id: &str) -> Result<Vec<String>, Resu
 /// executed or to be shown to a human.
 ///
 /// Built by the shell's "continue this conversation in a terminal" action. Nothing here starts a
-/// process and nothing here takes a lease -- see `shell/src/terminal_handoff.rs` for what that
+/// process and nothing here takes a lease -- see `panel/src/terminal_handoff.rs` for what that
 /// action does and does not claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeResumeCommand {

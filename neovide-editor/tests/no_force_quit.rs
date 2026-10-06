@@ -437,19 +437,76 @@ fn the_matcher_sees_every_spelling_and_nothing_else() {
     assert!(force_quits("pcall(vim.cmd, 'confirm qall')").is_empty());
 }
 
+/// The product crates' source directories this scan reads.
+const SCANNED: &[&str] = &[
+    "shell/src",
+    "panel/src",
+    "core/src",
+    "neovide-editor/src",
+    "agent/src",
+    "terminal/src",
+    "supervisor/src",
+];
+
+/// Product crates whose sources this scan does not read, each with why. Copied terminal drawing
+/// libraries never start, drive or stop an nvim.
+const NOT_SCANNED: &[(&str, &str)] = &[
+    ("terminal-frame", "a terminal drawing library; it never talks to nvim"),
+    ("terminal-input", "a key encoder; it never talks to nvim"),
+    ("terminal-render", "a terminal drawing library; it never talks to nvim"),
+    ("terminal-sync", "a terminal drawing library; it never talks to nvim"),
+];
+
+/// The `default-members` of the workspace manifest, i.e. the product crates.
+fn default_members() -> Vec<String> {
+    let manifest = std::fs::read_to_string(workspace().join("Cargo.toml")).expect("the workspace manifest");
+    let start = manifest
+        .find("default-members = [")
+        .expect("default-members in the workspace manifest");
+    let list = &manifest[start..];
+    let list = &list[list.find('[').unwrap() + 1..list.find(']').expect("default-members closes")];
+    let members: Vec<String> = list
+        .lines()
+        .map(|l| {
+            l.split('#')
+                .next()
+                .unwrap()
+                .trim()
+                .trim_end_matches(',')
+                .trim_matches('"')
+                .to_string()
+        })
+        .filter(|m| !m.is_empty())
+        .collect();
+    assert!(members.len() >= 5, "default-members parsed to {members:?}");
+    members
+}
+
+#[test]
+fn every_product_crate_is_scanned_or_exempt() {
+    let members = default_members();
+    for member in &members {
+        let scanned = SCANNED.contains(&format!("{member}/src").as_str());
+        let exempt = NOT_SCANNED.iter().any(|(name, _)| name == member);
+        assert!(
+            scanned || exempt,
+            "{member} is a product crate this scan does not read; add `{member}/src` to SCANNED"
+        );
+    }
+    for (name, _) in NOT_SCANNED {
+        assert!(
+            members.iter().any(|m| m == name),
+            "NOT_SCANNED names {name}, which is no longer a product crate"
+        );
+    }
+}
+
 /// Eitri's own product code sends no force-quit to nvim.
 #[test]
 fn no_product_code_force_quits_nvim() {
     let root = workspace();
     let mut paths = Vec::new();
-    for crate_src in [
-        "shell/src",
-        "core/src",
-        "neovide-editor/src",
-        "agent/src",
-        "terminal/src",
-        "supervisor/src",
-    ] {
+    for crate_src in SCANNED {
         files(&root.join(crate_src), &mut paths);
     }
     assert!(paths.len() > 50, "only {} files -- the walk is broken", paths.len());

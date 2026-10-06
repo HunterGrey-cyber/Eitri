@@ -35,13 +35,13 @@
 //! A plain `main` (`harness = false`), because GTK must own the main thread, exactly the pattern
 //! `panel_stream_scroll.rs`/`hidden_widget_restyle.rs`/`close_prompt_placement.rs` already use.
 //!
-//! **Two differences from `panel_stream_scroll.rs`'s own harness** (spec §3, review finding 6):
+//! **Two differences from `panel_stream_scroll.rs`'s own harness**:
 //! - **The product's base URI, not `None`.** `panel_stream_scroll.rs` loads with `load_html(.., None)`,
 //!   an opaque origin where WebKitGTK has no `navigator.clipboard` at all -- fine for that file
 //!   (it never copies anything), fatal for this one. This file loads with `PANEL_BASE_URI`, the
-//!   literal `agent_panel.rs` uses (duplicated here, not imported -- `shell` has no `[lib]` target
+//!   literal `panel_document.rs` uses (duplicated here, not imported -- `shell` has no `[lib]` target
 //!   for an integration test to reach a private `const` through; `panel_base_uri_matches_product`
-//!   below pins the two equal by reading `agent_panel.rs`'s own source as text).
+//!   below pins the two equal by reading `panel_document.rs`'s own source as text).
 //! - **Every copy is asserted on the clipboard itself**, read back through GDK's `Clipboard`, never
 //!   on the flash text or a wrapped `writeText` -- a copy that did not happen fails red. Keys arrive
 //!   as real X key events (XTEST, above) -- a script-dispatched `KeyboardEvent` is untrusted and may
@@ -161,7 +161,7 @@ use webkit6::{UserContentManager, WebView};
 #[path = "support/own_x_server.rs"]
 mod own_x_server;
 
-/// `shell/src/agent_panel.rs`'s own private `const PANEL_BASE_URI`, duplicated (review finding 6):
+/// `panel/src/panel_document.rs`'s own `const PANEL_BASE_URI`, duplicated:
 /// this crate has no `[lib]` target an integration test can reach a private item through, the same
 /// reason `panel_stream_scroll.rs` duplicates `themed_document` rather than importing it.
 /// `panel_base_uri_matches_product` (below) pins the two equal.
@@ -178,7 +178,7 @@ const W5_PINNED: Option<&str> = Some("a\tb\n1\t2\n3\t4");
 /// The document `shell/src/agent_panel.rs` embeds, byte for byte.
 const AGENT_UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../agent-ui/web/dist/index.html"));
 
-/// `agent_panel::themed_document`'s exact insertion rule (duplicated the same way
+/// `PanelDocument::themed`'s exact insertion rule (duplicated the same way
 /// `panel_stream_scroll.rs` does): the theme `<style>` goes directly after the first `<head>`.
 fn themed_document(vars: &[(String, String)]) -> String {
     let declarations: String = vars.iter().map(|(name, value)| format!("{name}:{value};")).collect();
@@ -187,14 +187,14 @@ fn themed_document(vars: &[(String, String)]) -> String {
     format!("{}{}{}", &AGENT_UI_HTML[..at], style, &AGENT_UI_HTML[at..])
 }
 
-/// Needs no display: reads `agent_panel.rs`'s own source as text and checks the literal this file
+/// Needs no display: reads `panel_document.rs`'s own source as text and checks the literal this file
 /// duplicated is still the same one. Runs every time, `--ignored` or not.
 fn panel_base_uri_matches_product() -> Result<(), String> {
-    let source = include_str!("../src/agent_panel.rs");
+    let source = include_str!("../../panel/src/panel_document.rs");
     let needle = format!("const PANEL_BASE_URI: &str = \"{PANEL_BASE_URI}\";");
     if !source.contains(&needle) {
         return Err(format!(
-            "agent_panel.rs's own PANEL_BASE_URI no longer reads {needle:?} -- update the copy in this file"
+            "panel_document.rs's own PANEL_BASE_URI no longer reads {needle:?} -- update the copy in this file"
         ));
     }
     Ok(())
@@ -574,7 +574,7 @@ impl Harness {
         pump(30);
     }
 
-    /// Reads the GDK clipboard's own text back (R8, review finding 6): never the page's own
+    /// Reads the GDK clipboard's own text back: never the page's own
     /// `writeText` wrapper, never the flash.
     fn read_clipboard(&self, timeout_ms: u64) -> Option<String> {
         let display = gtk4::gdk::Display::default()?;
@@ -1328,7 +1328,7 @@ fn w7_permission_card(h: &Harness) -> Result<(), String> {
     if typed != serde_json::Value::Bool(true) {
         return Err(format!("W7: could not put text in the reason box: {typed}"));
     }
-    // Fix round 3 (review finding 6): the first version's `vjjy` never reached the card's controls
+    // The first version's `vjjy` never reached the card's controls
     // -- the card was the last row, and three lines from its top end in its diff -- so "no Approve,
     // Deny, Always allow" held of any copy at all. V-LINE from the card's first line, five `j` down:
     // across the diff, the reason box and the buttons, into the Bash row the replay puts after it.

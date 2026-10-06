@@ -642,7 +642,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   // reached the switch would land on `case "d"` and DENY a pending permission. Each chord is matched
   // on its exact modifier set -- Ctrl+Shift+d is none of them and is refused below like any other
   // chord. GTK claims none of these before the WebView (checked against `shell/src/main.rs` and
-  // `shell/src/agent_panel.rs`, 2026-09-19): only a user's own Lua `keybinding` could.
+  // `panel/src/agent_panel.rs`, 2026-09-19): only a user's own Lua `keybinding` could.
   if (mode !== "input") {
     if (event.ctrlKey && !event.shiftKey && (event.key === "d" || event.key === "u")) {
       return { kind: "half-page", delta: event.key === "d" ? 1 : -1 };

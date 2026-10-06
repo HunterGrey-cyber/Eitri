@@ -498,7 +498,7 @@ impl AgentBackend {
     /// for the sidecar path to "even that out" -- server-originated state is the authority.
     ///
     /// Two strings because they are two different things. `wire_text` is what goes to the model --
-    /// the user's text with wire 1's editor context composed in (`shell/src/agent_panel.rs`, the
+    /// the user's text with wire 1's editor context composed in (`panel/src/agent_panel.rs`, the
     /// one composition point). `as_typed` is what the user wrote, which is what a reader of the
     /// conversation is owed.
     ///

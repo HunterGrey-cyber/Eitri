@@ -1,11 +1,12 @@
-//! The GTK-side half of the panel's typing cadence (`eitri_core::panel_cadence`): every
-//! envelope bound for the agent panel's WebView passes through one [`Pacer`] per WebView, which
+//! The host-side half of the panel's typing cadence (`eitri_core::panel_cadence`): every
+//! envelope bound for the agent panel's page passes through the [`Pacer`] its `PanelPage` holds, which
 //! decides -- with the pure rules from that module -- whether it goes now or waits for the next
 //! slot, and keeps the wire order either way.
 //!
-//! **Where the funnel is.** `agent_panel::evaluate_js_dispatch` (the free function the whole
-//! module dispatches through) and `AgentPanelHandle::dispatch` (the guarded twin for the focus,
-//! HINT and arrival envelopes) both hand over whatever is waiting before they send, so nothing can
+//! **Where the funnel is.** `PanelPage::send` (the one call the whole module dispatches through)
+//! and `AgentPanelHandle::dispatch` (the guarded twin for the focus,
+//! HINT and arrival envelopes, which flushes through `PanelPage::flush` before it sends) both hand over
+//! whatever is waiting before they send, so nothing can
 //! overtake a held envelope -- in particular no snapshot (a tab switch, a `ready`) can be applied
 //! to the page before the events that came ahead of it, which would draw the same text twice
 //! (the P1-A2 class of bug). Only the pump's own stream payload is ever held
@@ -21,28 +22,22 @@
 //! at all, and the WebKit frames the released envelopes then cause. The rules are all in this
 //! file's tests, against a recording [`Sink`].
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::time::Instant;
 
-use eitri_core::panel_cadence::{EnvelopeClass, PanelCadence, Route, DEFAULT_CADENCE_HZ};
+use eitri_core::panel_cadence::{EnvelopeClass, PanelCadence, Route};
 use eitri_core::tabs::TabId;
-use gtk4::glib;
-use gtk4::prelude::*;
-use webkit6::prelude::*;
-use webkit6::WebView;
 
 /// Where a released envelope goes: the page, or a recording stand-in in a test.
-pub(crate) trait Sink {
+pub trait Sink {
     fn send(&self, payload: &str);
 }
 
 /// Whose first text a stream envelope carries: the tab it was pumped for and that tab's turn
 /// (the trace's `submitted_at`). Kept with the envelope because by the time a flush releases it the
-/// active tab, or the tab's turn, may be another one (fix round 1: a `tabs` dispatch after
+/// active tab, or the tab's turn, may be another one (a `tabs` dispatch after
 /// `prefix n` used to hand tab A's stamp to tab B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FirstText {
+pub struct FirstText {
     pub tab: TabId,
     pub turn: Instant,
 }
@@ -56,14 +51,14 @@ struct Paced {
 
 /// What reached the sink since the caller last asked ([`Pacer::take_sent`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct Sent {
+pub struct Sent {
     /// At least one stream envelope was sent.
     pub any: bool,
     /// The first texts among them, each with the moment it was handed to the page.
     pub first_text: Vec<(FirstText, Instant)>,
 }
 
-pub(crate) struct Pacer {
+pub struct Pacer {
     cadence: PanelCadence<Paced>,
     /// Mirrored so `set_cadence` can carry it over to the new pacer.
     editor_has_keys: bool,
@@ -83,7 +78,7 @@ impl Pacer {
     }
 
     /// Replaces the cadence (after `init.lua` ran) keeping what is held and the focus state.
-    pub(crate) fn set_cadence(&mut self, cadence_hz: Option<u32>) {
+    pub fn set_cadence(&mut self, cadence_hz: Option<u32>) {
         let held = self.cadence.drain_pending();
         self.cadence = PanelCadence::new(cadence_hz);
         self.cadence.set_editor_has_keys(self.editor_has_keys);
@@ -94,12 +89,12 @@ impl Pacer {
 
     /// A key was pressed in the editor and sent to nvim. O(1) and touches nothing else: it runs in
     /// the press's path.
-    pub(crate) fn note_editor_key(&mut self, now: Instant) {
+    pub fn note_editor_key(&mut self, now: Instant) {
         self.cadence.note_editor_key(now);
     }
 
     /// Whether the editor holds the window's keys (`pane_focus`).
-    pub(crate) fn set_editor_has_keys(&mut self, has: bool) {
+    pub fn set_editor_has_keys(&mut self, has: bool) {
         self.editor_has_keys = has;
         self.cadence.set_editor_has_keys(has);
     }
@@ -127,7 +122,7 @@ impl Pacer {
 
     /// The pump's stream payload, of `class`. Held for the next slot while the user types in the
     /// editor and the class allows it; otherwise sent now behind anything already held.
-    pub(crate) fn send_stream(
+    pub fn send_stream(
         &mut self,
         sink: &dyn Sink,
         payload: String,
@@ -154,7 +149,7 @@ impl Pacer {
     /// The typing message is sent on its own, not through [`send_immediate`](Self::send_immediate):
     /// it only sets an attribute, so it need not wait behind the stream, and handing the stream
     /// over with it would release the first envelopes of a burst the moment the burst begins.
-    pub(crate) fn poll(&mut self, sink: &dyn Sink, now: Instant, page_ready: bool) {
+    pub fn poll(&mut self, sink: &dyn Sink, now: Instant, page_ready: bool) {
         for item in self.cadence.due(now) {
             self.transmit(sink, item);
         }
@@ -180,95 +175,29 @@ impl Pacer {
     /// turn's trace (`agent_panel::trace_discarded_first_texts`) or its `EITRI_AGENT_TRACE` line
     /// waits for a report that is never sent and never prints.
     #[must_use = "the turn traces of the discarded first texts must be told (a line that never prints)"]
-    pub(crate) fn discard_pending(&mut self) -> Vec<FirstText> {
+    pub fn discard_pending(&mut self) -> Vec<FirstText> {
         let held = self.cadence.drain_pending();
         self.typing_told = false;
         held.into_iter().filter_map(|item| item.first_text).collect()
     }
 
     /// What reached the sink from a stream payload since the last call.
-    pub(crate) fn take_sent(&mut self) -> Sent {
+    pub fn take_sent(&mut self) -> Sent {
         std::mem::take(&mut self.sent)
     }
 
     /// Only the first-text stamps of [`take_sent`](Self::take_sent), leaving `any` for the pump:
     /// for a `turn_rendered` report, which can arrive before the next tick has applied them.
-    pub(crate) fn take_first_text(&mut self) -> Vec<(FirstText, Instant)> {
+    pub fn take_first_text(&mut self) -> Vec<(FirstText, Instant)> {
         std::mem::take(&mut self.sent.first_text)
     }
-}
-
-// ---- the WebView side -------------------------------------------------------------------------
-
-/// The panel's page as a [`Sink`]: the script `agent_panel::evaluate_js_dispatch` always ran.
-pub(crate) struct WebViewSink<'a>(pub(crate) &'a WebView);
-
-impl Sink for WebViewSink<'_> {
-    fn send(&self, payload: &str) {
-        let script = format!(
-            "window.__eitriDispatch({});",
-            serde_json::to_string(payload).unwrap_or_default()
-        );
-        self.0
-            .evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
-                if let Err(e) = result {
-                    eprintln!("[agent_panel] evaluate_javascript failed: {e}");
-                }
-            });
-    }
-}
-
-type Registry = Vec<(glib::WeakRef<WebView>, Rc<RefCell<Pacer>>)>;
-
-thread_local! {
-    /// One pacer per WebView, found by the WebView because the dispatch functions everywhere in
-    /// `agent_panel` take only that. GTK's main thread is the only one that dispatches.
-    static PACERS: RefCell<Registry> = const { RefCell::new(Vec::new()) };
-}
-
-/// `webview`'s pacer, made (at the default cadence) on first use. Entries whose WebView is gone are
-/// dropped here, so an address reused by a later WebView never finds a stale pacer.
-pub(crate) fn pacer_for(webview: &WebView) -> Rc<RefCell<Pacer>> {
-    PACERS.with(|pacers| {
-        let mut pacers = pacers.borrow_mut();
-        pacers.retain(|(weak, _)| weak.upgrade().is_some());
-        if let Some((_, pacer)) = pacers
-            .iter()
-            .find(|(weak, _)| weak.upgrade().is_some_and(|known| &known == webview))
-        {
-            return pacer.clone();
-        }
-        let pacer = Rc::new(RefCell::new(Pacer::new(Some(DEFAULT_CADENCE_HZ))));
-        pacers.push((webview.downgrade(), pacer.clone()));
-        pacer
-    })
-}
-
-/// Sends `payload` to the page, never delayed, behind anything held (`Pacer::send_immediate`). This
-/// is `agent_panel::evaluate_js_dispatch`. A re-entrant call -- the pacer is borrowed only across
-/// plain sink sends, so none is expected -- goes straight out rather than panicking the tick.
-pub(crate) fn send_immediate(webview: &WebView, payload: &str) {
-    let pacer = pacer_for(webview);
-    match pacer.try_borrow_mut() {
-        Ok(mut pacer) => pacer.send_immediate(&WebViewSink(webview), payload),
-        Err(_) => {
-            eprintln!("[panel_pacer] BUG: the pacer was borrowed when an envelope was sent; sending it unordered");
-            WebViewSink(webview).send(payload);
-        }
-    };
-}
-
-/// Hands the page whatever is held, for a caller that sends its own (guarded) script.
-pub(crate) fn flush(webview: &WebView) {
-    let pacer = pacer_for(webview);
-    if let Ok(mut pacer) = pacer.try_borrow_mut() {
-        pacer.flush(&WebViewSink(webview));
-    };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eitri_core::panel_cadence::DEFAULT_CADENCE_HZ;
+    use std::cell::RefCell;
     use std::time::Duration;
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
@@ -553,7 +482,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1: tab A's first text is held, `prefix n` switches to tab B and its `tabs`
+    /// Tab A's first text is held, `prefix n` switches to tab B and its `tabs`
     /// dispatch flushes A's text. The stamp names A (and A's turn), whatever tab is active when the
     /// pump reads it; and a `turn_rendered` handler can take it before that tick does, leaving the
     /// pump's `any` alone.
@@ -609,46 +538,6 @@ mod tests {
         pacer.set_editor_has_keys(false);
         pacer.poll(&sink, t0 + MS(33), true);
         assert_eq!(sink.take(), vec!["a"]);
-    }
-
-    /// The code lines of `source` (comments dropped) up to its test module.
-    fn code_lines(source: &str) -> Vec<&str> {
-        source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("split always yields one part")
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect()
-    }
-
-    #[test]
-    fn agent_panel_puts_envelopes_in_the_page_only_through_the_funnel() {
-        // `evaluate_js_dispatch` and `AgentPanelHandle::dispatch` hand over what the cadence holds
-        // before they send; `set_theme`'s own guarded send is the third and carries no stream
-        // state. A fourth direct `evaluate_javascript` would let an envelope overtake a held one --
-        // a snapshot ahead of the events before it draws them twice.
-        let code = code_lines(include_str!("agent_panel.rs"));
-        let direct = code
-            .iter()
-            .filter(|line| line.contains(".evaluate_javascript("))
-            .count();
-        assert_eq!(direct, 2, "agent_panel.rs sends to the page outside the funnel");
-        assert!(
-            code.iter()
-                .any(|line| line.contains("crate::panel_pacer::flush(webview)")),
-            "AgentPanelHandle::dispatch hands over what is held first"
-        );
-    }
-
-    #[test]
-    fn only_the_pumps_stream_payload_is_ever_held() {
-        let code = code_lines(include_str!("agent_panel.rs"));
-        let sites = code.iter().filter(|line| line.contains(".send_stream(")).count();
-        assert_eq!(
-            sites, 1,
-            "`send_stream` is the pump's alone; everything else is never delayed"
-        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use eitri_core::pane_switch::PaneSwitchChannel;
 use eitri_core::panel_control::{ControlServer, Request};
 
 use super::close_watch::{CloseWatcher, ExitDecision};
-use super::link::CompanionLink;
+use super::link::{self, CompanionLink};
 use super::prefix::{self as companion_prefix, CompanionVerb};
 use super::wm_runner::WmRunner;
 use super::Start;
@@ -158,6 +158,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     // The feeds are built before the panel so its context source can be handed over at
     // construction. Each sweeps its own stale directories. They carry no child environment: the
     // editor is the user's own, already running, and gets its sockets through the install.
+    let feed_pump = crate::editor_feeds::FeedPump::start();
     let mut theme_feed = crate::theme::feed::ThemeFeed::new();
     let mut context_feed = crate::editor_context::EditorContextFeed::new();
     let mut keys_feed = eitri_core::nvim_keys::feed::NvimKeysFeed::new();
@@ -181,7 +182,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     let attached = Rc::new(Cell::new(false));
     let (context_source, reset_context) = match context_feed.as_mut() {
         Some(feed) => {
-            let (source, reset) = crate::editor_context::listen_resettable(feed, scratch_path.clone());
+            let (source, reset) = feed_pump.listen_context(feed, scratch_path.clone());
             (source, reset)
         }
         None => (
@@ -340,7 +341,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     keys_help.send();
     if let Some(feed) = keys_feed.as_mut() {
         let keys_help = keys_help.clone();
-        crate::nvim_keys::listen(feed, move |report| keys_help.nvim_report(report));
+        feed_pump.listen_keys(feed, move |report| keys_help.nvim_report(report));
     }
     // The window's colours follow the attached editor's colourscheme, with the panel's own live size.
     if let Some(feed) = theme_feed.as_mut() {
@@ -348,7 +349,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let window = window.clone();
         let agent = agent.clone();
         let panel_px = panel_px.clone();
-        crate::theme::feed::listen(feed, move |payload| {
+        feed_pump.listen_theme(feed, move |payload| {
             let tokens = eitri_core::theme::ThemeTokens::derive(&payload);
             println!(
                 "[theme] following nvim colorscheme {:?} (background={})",
@@ -474,7 +475,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let agent_for_change = agent.clone();
         let agent_for_cancel = agent.clone();
         let runner_for_change = runner.clone();
-        CompanionLink::start(
+        link::start(
             start.nvim.clone(),
             sockets,
             move |state, band, peer_pid| {
@@ -535,7 +536,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     if let Some(channel) = pane_switch.borrow_mut().as_mut() {
         let runner = runner.clone();
         let agent = agent.clone();
-        crate::pane_switch::listen(channel, move |message| {
+        feed_pump.listen_pane_switch(channel, move |message| {
             if let crate::pane_switch::PaneMessage::Direction(letter) = message {
                 match crate::pane_switch::letter_direction(letter) {
                     Some(direction) => {
@@ -726,7 +727,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             if let Some(path) = &scratch_path {
                 let _ = std::fs::remove_dir_all(path);
             }
-            agent.shutdown(&app);
+            agent_panel::hold_until_done(&app, agent.shutdown());
             // Held for the window's life: GTK does not reliably free this closure before the
             // process ends, and both must outlive the panel's teardown.
             let _ = (&lua, &theme_css);

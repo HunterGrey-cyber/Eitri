@@ -517,7 +517,7 @@ impl AgentConversation {
         // and 513-519 ms in debug**. So release is about twice as fast as the Python number and
         // debug about 3.6x slower than it, and debug is what every `cargo test` and every
         // `cargo run -p shell` uses. It is still not a stall: this runs on the worker thread
-        // `AgentBackend::start` was spawned onto (`shell/src/agent_panel.rs`), never on the GTK
+        // `AgentBackend::start` was spawned onto (`panel/src/agent_panel.rs`), never on the GTK
         // main loop, so what it costs is the panel filling in that much later after a resume of
         // that one outsized session. Every other transcript here is a few milliseconds.
         let seed = crate::history::load::seed_for_resume(&cwd_string, &conversation_id, provider_session_id);
@@ -2079,8 +2079,8 @@ mod tests {
     /// (P5-A3, fix round 1): the row above proves the lease survives the ONE `shutdown()` call whose
     /// `close_session` actually failed. `shutdown` is documented as idempotent
     /// (`shutdown_closes_the_session_fail_closes_pending_permissions_and_is_idempotent` calls it
-    /// twice as a supported pattern) and every real caller (`shell/src/agent_panel.rs`'s
-    /// `tear_down_holding_the_application`/`tear_down_all_holding_the_application` and the handoff
+    /// twice as a supported pattern) and every real caller (`panel/src/agent_panel.rs`'s
+    /// `tear_down`/`tear_down_all` and the handoff
     /// path) is not the only conceivable one. A per-call local `close_failed` forgets the first
     /// call's failure: on the second call `self.session_id` is already `None` (taken by the first),
     /// so `close_session` is never retried, the local is freshly `false`, and the unconditional

@@ -1,5 +1,5 @@
 //! Locates, builds if necessary, and spawns Verdandi's `apps/claude-sidecar` Node.js process --
-//! deliberately NOT reusing `shell/src/supervisor_client.rs`'s spawn pattern wholesale. Two real,
+//! deliberately NOT reusing `panel/src/supervisor_client.rs`'s spawn pattern wholesale. Two real,
 //! verified differences from that pattern (see this plan's "Verified facts", points 5 and 6):
 //!
 //! 1. `apps/claude-sidecar/dist/` is gitignored in Verdandi, not committed -- a git-dependency
@@ -1077,7 +1077,7 @@ impl Drop for SpawnedSidecar {
     /// exiting -- a graceful exit lets the sidecar fail-close any pending permissions server-side
     /// before this process moves on), then escalate to SIGKILL if it still hasn't exited --
     /// matching design doc §12.1's shutdown escalation requirement. Deliberately simpler than
-    /// `shell/src/supervisor_client.rs::connect_or_spawn`'s own background-thread reaper: that
+    /// `panel/src/supervisor_client.rs::connect_or_spawn`'s own background-thread reaper: that
     /// pattern exists there because a *detached* supervisor process may run for an unbounded time
     /// after being spawned, so its eventual `wait()` has no natural bound to block on. Here, by the
     /// time `drop` runs, the sidecar is either already exiting gracefully (bounded by

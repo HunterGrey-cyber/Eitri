@@ -1,12 +1,12 @@
-//! A guard against a `WebView`-crash loop (v1 hardening review, R1-5/R1-6, 2026-09-27):
+//! A guard against a `WebView`-crash loop (2026-09-27):
 //! `webkit6::WebView::connect_web_process_terminated` fires whenever a hosted page's own render
 //! process dies (a real WebKit crash, or the host running out of memory), and the right response
 //! is to reload the page -- both the agent panel and a Lua panel already have a working "reload
-//! the document, keep everything else" recovery path (`shell::agent_panel::AgentPanelHandle::reload_document`,
-//! and `shell::lua::panel`'s revive-on-next-show `load_uri`), just never wired to this signal
-//! (R1-6, R1-5). Reloading unconditionally would turn a page that cannot even finish loading (a
+//! the document, keep everything else" recovery path (`eitri_panel::agent_panel::AgentPanelHandle::reload_document`,
+//! and `shell::lua::panel`'s revive-on-next-show `load_uri`), just never wired to this signal.
+//! Reloading unconditionally would turn a page that cannot even finish loading (a
 //! driver bug, a genuinely out-of-memory host) into a tight crash/reload loop that pins a CPU core
-//! forever and never leaves the owner anything to read.
+//! forever and never leaves the user anything to read.
 //!
 //! This module is the pure decision -- how many crashes in how long counts as "a loop", and what
 //! to do once that line is crossed -- kept apart from the GTK/WebKit call sites so it is
@@ -33,7 +33,7 @@ pub(crate) const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(60);
 
 /// What the caller should do about one `web-process-terminated` signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CrashResponse {
+pub enum CrashResponse {
     /// Reload the page: still within the allowed rate.
     Reload,
     /// The crash rate just crossed the limit -- stop reloading and show the caller's own visible
@@ -48,7 +48,7 @@ pub(crate) enum CrashResponse {
 /// One guard per `WebView` -- construct it alongside the view and keep it for that view's whole
 /// lifetime. A fresh `WebView` (a killed-and-revived Lua panel gets a new `WebView` object) gets a
 /// fresh guard; there is no cross-view state.
-pub(crate) struct WebViewCrashGuard {
+pub struct WebViewCrashGuard {
     max: usize,
     window: Duration,
     /// Crash timestamps still inside `window`, oldest first.
@@ -67,7 +67,7 @@ impl WebViewCrashGuard {
     }
 
     /// [`MAX_CRASHES_PER_WINDOW`] crashes per [`CRASH_LOOP_WINDOW`] -- what both call sites use.
-    pub(crate) fn with_defaults() -> Self {
+    pub fn with_defaults() -> Self {
         Self::new(MAX_CRASHES_PER_WINDOW, CRASH_LOOP_WINDOW)
     }
 
@@ -88,7 +88,7 @@ impl WebViewCrashGuard {
     }
 
     /// [`on_crash_at`](Self::on_crash_at) against the real clock -- what the GTK call sites use.
-    pub(crate) fn on_crash(&mut self) -> CrashResponse {
+    pub fn on_crash(&mut self) -> CrashResponse {
         self.on_crash_at(Instant::now())
     }
 
@@ -97,7 +97,7 @@ impl WebViewCrashGuard {
     /// by its own key (`main.rs`'s revive-on-next-show path). Clears `given_up` and the whole crash
     /// history.
     ///
-    /// **The bug this closes (fix round 1, v1 hardening review, R1-5/R1-6):** without this, once
+    /// **The bug this closes:** without this, once
     /// `given_up` is set it is permanent (see `after_giving_up_every_further_crash_is_ignored_even_much_later`
     /// below) -- so a page that crashed into a loop, was then successfully recovered by hand, and
     /// LATER suffers one more unrelated crash gets `CrashResponse::AlreadyGivenUp` for that later
@@ -106,7 +106,7 @@ impl WebViewCrashGuard {
     /// perform the manual recovery they are telling the user to try, never from inside the
     /// AUTOMATIC path (`on_crash`/`on_crash_at`'s own `Reload` branch), which must keep counting
     /// toward the very loop it exists to detect.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.crashes.clear();
         self.given_up = false;
     }
@@ -117,7 +117,7 @@ impl WebViewCrashGuard {
 /// crashed the real page. `recovery` names the affected caller's own way back to a live page by
 /// hand -- the agent panel's `\u{21bb}`/`prefix r`, or a Lua panel's `prefix x` then its own key --
 /// since the two differ and a message naming the wrong one would not help.
-pub(crate) fn crash_message_html(recovery: &str) -> String {
+pub fn crash_message_html(recovery: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0;padding:24px;\
 font-family:sans-serif;background:#1e1e1e;color:#d4d4d4;\"><p>This panel's web process kept crashing, \

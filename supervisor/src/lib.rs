@@ -1,6 +1,6 @@
 //! Shared protocol types and small helpers for the cross-window agent-status dashboard
 //! (`eitri-supervisor`, `src/bin/eitri_supervisor.rs`) and `shell`'s own client of it
-//! (`shell/src/supervisor_client.rs`). See
+//! (`panel/src/supervisor_client.rs`). See
 //! `docs/superpowers/specs/2026-09-08-supervisor-cross-window-agent-status-design.md`.
 
 use std::path::PathBuf;

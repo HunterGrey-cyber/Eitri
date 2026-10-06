@@ -52,7 +52,7 @@ use webkit6::{UserContentManager, WebView};
 #[path = "support/own_x_server.rs"]
 mod own_x_server;
 
-/// `shell/src/agent_panel.rs`'s own private `const PANEL_BASE_URI`, duplicated (this crate has no `[lib]`
+/// `panel/src/panel_document.rs`'s own `const PANEL_BASE_URI`, duplicated (this crate has no `[lib]`
 /// target an integration test can reach a private item through); `panel_base_uri_matches_product` pins the
 /// two equal.
 const PANEL_BASE_URI: &str = "https://eitri.invalid/";
@@ -60,7 +60,7 @@ const PANEL_BASE_URI: &str = "https://eitri.invalid/";
 /// The document `shell/src/agent_panel.rs` embeds, byte for byte.
 const AGENT_UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../agent-ui/web/dist/index.html"));
 
-/// `agent_panel::themed_document`'s exact insertion rule (duplicated the same way `panel_stream_scroll.rs`
+/// `PanelDocument::themed`'s exact insertion rule (duplicated the same way `panel_stream_scroll.rs`
 /// does): the theme `<style>` goes directly after the first `<head>`.
 fn themed_document(vars: &[(String, String)]) -> String {
     let declarations: String = vars.iter().map(|(name, value)| format!("{name}:{value};")).collect();
@@ -69,14 +69,14 @@ fn themed_document(vars: &[(String, String)]) -> String {
     format!("{}{}{}", &AGENT_UI_HTML[..at], style, &AGENT_UI_HTML[at..])
 }
 
-/// Needs no display: reads `agent_panel.rs`'s own source as text and checks the literal this file
+/// Needs no display: reads `panel_document.rs`'s own source as text and checks the literal this file
 /// duplicated is still the same one. Runs every time, `--ignored` or not.
 fn panel_base_uri_matches_product() -> Result<(), String> {
-    let source = include_str!("../src/agent_panel.rs");
+    let source = include_str!("../../panel/src/panel_document.rs");
     let needle = format!("const PANEL_BASE_URI: &str = \"{PANEL_BASE_URI}\";");
     if !source.contains(&needle) {
         return Err(format!(
-            "agent_panel.rs's own PANEL_BASE_URI no longer reads {needle:?} -- update the copy in this file"
+            "panel_document.rs's own PANEL_BASE_URI no longer reads {needle:?} -- update the copy in this file"
         ));
     }
     Ok(())

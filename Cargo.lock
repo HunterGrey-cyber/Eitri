@@ -956,6 +956,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eitri-panel"
+version = "0.2.1"
+dependencies = [
+ "agent",
+ "base64",
+ "eitri-core",
+ "serde_json",
+ "sha2",
+ "supervisor",
+ "uuid",
+]
+
+[[package]]
 name = "eitri-terminal"
 version = "0.2.1"
 dependencies = [
@@ -3872,6 +3885,7 @@ dependencies = [
  "agent",
  "alacritty_terminal",
  "eitri-core",
+ "eitri-panel",
  "eitri-terminal",
  "futures-channel",
  "gtk4",

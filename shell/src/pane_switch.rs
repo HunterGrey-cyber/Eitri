@@ -2,11 +2,11 @@
 //! *leveraging* the user's real `christoomey/vim-tmux-navigator` rather than intercepting the
 //! keys at the GTK level.
 //!
-//! This module is the GTK half: locating the shim binary, the `glib` timer that drains the socket,
-//! and the focus grabs `main.rs` wires to each direction. The protocol under it -- the private
+//! This module is the GTK half: locating the shim binary and the focus grabs `main.rs` wires to each
+//! direction; the socket is drained by `editor_feeds::FeedPump`. The protocol under it -- the private
 //! directory, the fake-`tmux` symlink, the socket, the parser, the cleanup -- is
 //! `eitri_core::pane_switch`, moved there in L2 T5 (2026-09-17) so a second host can reuse it
-//! with its own run-loop timer.
+//! with its own run-loop tick.
 //!
 //! # The mechanism, and why it is shaped this way
 //!
@@ -73,10 +73,9 @@
 use std::path::{Path, PathBuf};
 
 use gtk4::gdk::{Key, ModifierType};
-use gtk4::glib;
 
 use crate::layout::Direction;
-use eitri_core::pane_switch::{sweep_stale_dirs, PaneSwitchReader, POLL_INTERVAL};
+use eitri_core::pane_switch::sweep_stale_dirs;
 pub(crate) use eitri_core::pane_switch::{PaneMessage, PaneSwitchChannel};
 
 /// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
@@ -191,35 +190,6 @@ pub(crate) fn open() -> Option<PaneSwitchChannel> {
     sweep_stale_dirs();
     let shim = locate_shim_binary()?;
     PaneSwitchChannel::bind(&shim)
-}
-
-/// Starts polling the socket from the GTK main loop, invoking `on_message` with a direction letter
-/// or a quit-cancelled generation for each message the shim, or a cancelled `:confirm qall`, sends.
-///
-/// A poll loop on the main thread rather than a background thread with a blocking `accept()`:
-/// the callback has to touch GTK widgets (grabbing focus), which is main-thread-only anyway,
-/// and `agent`'s own hook listener already paid for the lesson that a blocking `accept()` with
-/// no stop signal is a real hang waiting to happen.
-///
-/// The [`PaneSwitchReader`] is built once and retained inside the timer closure (P3-A1): it keeps
-/// a slow or trickling sender's partial connection between polls instead of blocking the GTK
-/// thread's own timer callback on it -- see the reader's own doc for the mechanism and why it never
-/// lets a later message overtake an earlier, undelivered one.
-///
-/// Takes the channel's listener, so a second call on the same channel logs and does nothing rather
-/// than installing a second timer that would race the first for every connection.
-pub(crate) fn listen(channel: &mut PaneSwitchChannel, on_message: impl Fn(PaneMessage) + 'static) {
-    let Some(listener) = channel.take_listener() else {
-        eprintln!("[pane_switch] listen() called twice -- ignoring");
-        return;
-    };
-    let mut reader = PaneSwitchReader::new(listener);
-    glib::timeout_add_local(POLL_INTERVAL, move || {
-        for message in reader.poll() {
-            on_message(message);
-        }
-        glib::ControlFlow::Continue
-    });
 }
 
 /// Finds the `eitri-tmux-shim` binary next to the currently-running executable. Both are

@@ -16,6 +16,10 @@
 //! refused, and a refused document gets `script-src 'none'`: a panel that visibly fails to start is
 //! the failure that can be seen and fixed; quietly allowing inline script again is not.
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use sha2::{Digest as _, Sha256};
+
 /// Every directive after `script-src`, unchanged: styles stay inline (the theme block and the
 /// bundle's own `<style>`), images and fonts only as `data:`, and nothing that could reach the
 /// network, frame, embed, submit or rebase.
@@ -25,7 +29,7 @@ const AFTER_SCRIPT_SRC: &str = "style-src 'unsafe-inline'; img-src data:; font-s
 /// The policy for a document: `default-src 'none'`, then one `'sha256-…'` source per inline
 /// script in `html`, then [`AFTER_SCRIPT_SRC`]. A document the extractor refuses gets
 /// `script-src 'none'` and one stderr line naming why.
-pub(crate) fn content_security_policy_for(html: &str) -> String {
+pub fn content_security_policy_for(html: &str) -> String {
     let script_sources = match inline_script_hashes(html) {
         Ok(hashes) => hashes.join(" "),
         Err(reason) => {
@@ -39,7 +43,7 @@ pub(crate) fn content_security_policy_for(html: &str) -> String {
 /// One CSP source expression, `'sha256-<base64>'` with its quotes, per inline `<script>` element
 /// in `html`, in document order. The hash covers the element's text exactly as written: no trim,
 /// no newline change.
-pub(crate) fn inline_script_hashes(html: &str) -> Result<Vec<String>, String> {
+pub fn inline_script_hashes(html: &str) -> Result<Vec<String>, String> {
     // Only ASCII letters change case, so every byte offset in `lower` is the same in `html`.
     let lower = html.to_ascii_lowercase();
     let mut hashes = Vec::new();
@@ -124,12 +128,9 @@ fn has_src_attribute(attributes: &str) -> bool {
     })
 }
 
-fn sha256_base64(data: &[u8]) -> String {
-    // SHA-256 is always compiled into GLib; neither call needs GTK to be initialised.
-    let mut checksum =
-        gtk4::glib::Checksum::new(gtk4::glib::ChecksumType::Sha256).expect("GLib always provides SHA-256");
-    checksum.update(data);
-    gtk4::glib::base64_encode(&checksum.digest()).to_string()
+/// The standard-alphabet base64 of the SHA-256 of `data`, as a CSP hash source spells it.
+pub fn sha256_base64(data: &[u8]) -> String {
+    BASE64.encode(Sha256::digest(data))
 }
 
 #[cfg(test)]
@@ -137,10 +138,13 @@ mod tests {
     use super::*;
     use sha2::Digest;
 
+    /// The pinned source for `body`, computed without the extractor: `sha2` and the base64 crate directly.
+    /// The encoder's own independent check is the GLib oracle in `shell` (`the_hash_matches_glibs`).
     fn independent_sha256_source(body: &str) -> String {
+        use base64::Engine;
         format!(
             "'sha256-{}'",
-            gtk4::glib::base64_encode(&sha2::Sha256::digest(body.as_bytes()))
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(body.as_bytes()))
         )
     }
 

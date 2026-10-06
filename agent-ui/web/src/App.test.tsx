@@ -47,7 +47,7 @@ beforeEach(() => {
   };
 });
 
-/** Delivers one envelope the way `agent_panel.rs`'s `evaluate_js_dispatch` does: a JSON string into
+/** Delivers one envelope the way the host's `PageSurface::send` does: a JSON string into
  *  the global the page installed on mount. */
 function dispatch(payload: unknown) {
   act(() => {

@@ -226,6 +226,16 @@ fn arms<'a>(code: &'a str, path: &str) -> Vec<&'a str> {
     found
 }
 
+/// Directories (relative to the workspace root) that hold the panel's code.
+const PANEL_DIRS: &[&str] = &["shell/src", "panel/src"];
+
+/// The panel's code: the one file under `PANEL_DIRS` that handles the page's messages. Found by what it
+/// defines, not by its path, so the scan follows the panel when it moves and fails when it is gone.
+fn panel_code() -> String {
+    let read = eitri_core::source_scan::rust_sources(PANEL_DIRS);
+    code_only(&eitri_core::source_scan::file_with(&read, "fn handle_inbound_message(").text)
+}
+
 fn read(relative: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
     code_only(&std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
@@ -279,7 +289,7 @@ fn the_permission_and_send_paths_never_read_review_state() {
         "approve_pending",
     );
 
-    let panel = read("../shell/src/agent_panel.rs");
+    let panel = panel_code();
     check(
         "agent_panel's answer_permission_response",
         &functions(&panel, "answer_permission_response"),
@@ -406,7 +416,7 @@ fn only_the_confirmed_review_send_reaches_the_send_path() {
     }
 
     // And nothing on the answer and ordinary send paths reaches it.
-    let panel = read("../shell/src/agent_panel.rs");
+    let panel = panel_code();
     let mut regions: Vec<&str> = Vec::new();
     for name in [
         "answer_card",

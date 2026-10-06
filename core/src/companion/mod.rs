@@ -15,6 +15,7 @@ use rmpv::Value;
 
 pub mod attach;
 pub mod driver;
+pub mod link;
 pub mod stdio;
 
 /// The installer: `nvim_exec_lua(INSTALL_LUA, install_args(...))`.

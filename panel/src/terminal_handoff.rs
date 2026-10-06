@@ -2,8 +2,8 @@
 //! command it produces.
 //!
 //! **What this does NOT do, and why.** It starts nothing and it takes no lease. The supported,
-//! strongly-exclusive handoff the design doc describes (§8.3, and `agent::handoff::
-//! prepare_eitri_to_cli_handoff` which implements it) works by spawning
+//! strongly-exclusive handoff (`agent::handoff::
+//! prepare_eitri_to_cli_handoff` implements it) works by spawning
 //! `eitri-claude-handoff` as a direct child with the already-locked lease fd inherited and the
 //! host's own stdio inherited -- it hands the CALLER's terminal to `claude`. `shell` is a GUI
 //! process and has no terminal to hand over: under a desktop launcher its stdio is not a terminal
@@ -22,14 +22,14 @@
 //! `fcntl(fd, F_GETFD)`, which only asks whether the descriptor is open, so a reused number would
 //! pass it and `claude` would run believing it holds a lease it does not.
 //!
-//! So this takes the other path the design doc names, and names it the way the doc requires:
-//! design doc §8.3's closing paragraph allows handing the user the command to run themselves, on
+//! So this takes the other path that handoff design allows, and names it the way the design requires:
+//! it permits handing the user the command to run themselves, on
 //! the condition that it is "明确显示为 raw/manual 路径并带并发风险提示" -- shown explicitly as the
 //! raw/manual path, carrying a concurrency warning. That warning is not a formality here: with no
-//! lease taken, nothing prevents this workspace from also resuming the same session, and §8.5/§17.7
-//! reject any claim that a lease would stop an external `claude --resume` anyway.
+//! lease taken, nothing prevents this workspace from also resuming the same session, and the design
+//! rejects any claim that a lease would stop an external `claude --resume` anyway.
 //!
-//! What this module DOES enforce is the ordering §8.3 asks for, **steps 1-4 and only those**:
+//! What this module DOES enforce is the ordering that design asks for, **steps 1-4 and only those**:
 //! `agent_panel` closes the session for real and waits for that close to finish before the command
 //! is ever shown. The user cannot be looking at the command while Eitri is still driving the
 //! session.
@@ -54,7 +54,7 @@ use std::path::Path;
 /// Deliberately borrowed scalars rather than a `&AgentBackend`: the rule is then a pure function
 /// that a test can drive without constructing a backend, which would mean spawning a real `claude`
 /// or a real sidecar. Same reasoning as `agent_bridge::SnapshotView`.
-pub(crate) struct HandoffFacts<'a> {
+pub struct HandoffFacts<'a> {
     /// Claude's own session id, read from the backend rather than from the projection.
     ///
     /// The two can genuinely differ, but only for a RESUMED sidecar conversation: `IngestState` is
@@ -63,14 +63,14 @@ pub(crate) struct HandoffFacts<'a> {
     /// -- the field and the projection are set together, inside one lock, when `SessionOpened` is
     /// folded, so reading either would give the same answer. `None` means this conversation has
     /// never opened a provider session.
-    pub(crate) provider_session_id: Option<&'a str>,
+    pub provider_session_id: Option<&'a str>,
     /// `None` when no turn is running. Read from the projection, which is where the only
     /// authoritative answer lives.
-    pub(crate) active_turn_id: Option<&'a str>,
+    pub active_turn_id: Option<&'a str>,
     /// The cwd the provider reported for this session, when it has reported one.
-    pub(crate) reported_cwd: Option<&'a str>,
+    pub reported_cwd: Option<&'a str>,
     /// Whether the conversation is still live, as the projection reports its status.
-    pub(crate) liveness: ConversationLiveness,
+    pub liveness: ConversationLiveness,
 }
 
 /// Live or over, as the projection's own `ProjectionStatus` says.
@@ -80,7 +80,7 @@ pub(crate) struct HandoffFacts<'a> {
 /// "corrects" by adding the missing guard. A field nothing reads could not stop that and would not
 /// even compile without a `#[allow]`; an exhaustive match can, and a test can drive it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConversationLiveness {
+pub enum ConversationLiveness {
     Live,
     /// The projection reached `Unavailable` or `Closed`.
     Ended,
@@ -89,7 +89,7 @@ pub(crate) enum ConversationLiveness {
 impl ConversationLiveness {
     /// The one mapping from the projection's status, so the panel does not restate it at the call
     /// site.
-    pub(crate) fn of(status: &agent::ProjectionStatus) -> Self {
+    pub fn of(status: &agent::ProjectionStatus) -> Self {
         match status {
             agent::ProjectionStatus::Starting | agent::ProjectionStatus::Running => ConversationLiveness::Live,
             agent::ProjectionStatus::Unavailable { .. } | agent::ProjectionStatus::Closed { .. } => {
@@ -102,7 +102,7 @@ impl ConversationLiveness {
 /// Why a handoff cannot happen right now. Every variant is a real state a user can be in, and each
 /// one's `message()` is what they are shown instead of a control that looks broken.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum HandoffRefusal {
+pub enum HandoffRefusal {
     NoSession,
     /// The conversation has never taken a turn, so no Claude session id exists to resume.
     NoProviderSessionId,
@@ -113,7 +113,7 @@ pub(crate) enum HandoffRefusal {
 }
 
 impl HandoffRefusal {
-    pub(crate) fn message(&self) -> String {
+    pub fn message(&self) -> String {
         match self {
             HandoffRefusal::NoSession => "There is no conversation to continue.".to_string(),
             HandoffRefusal::NoProviderSessionId => {
@@ -135,7 +135,7 @@ impl HandoffRefusal {
 /// A session that has already ended is deliberately allowed through: continuing it elsewhere is
 /// arguably the case where this matters most. `liveness` is matched exhaustively below rather than
 /// left out, so that allowance is a decision in the code instead of an absence a test cannot see.
-pub(crate) fn prepare_handoff(
+pub fn prepare_handoff(
     project_dir: &Path,
     facts: Option<HandoffFacts<'_>>,
 ) -> Result<ClaudeResumeCommand, HandoffRefusal> {
@@ -215,7 +215,7 @@ mod tests {
         );
     }
 
-    /// Design doc §8.3 step 2: an in-flight turn is finished or interrupted BEFORE the session is
+    /// Handoff step 2: an in-flight turn is finished or interrupted BEFORE the session is
     /// closed. Handing off mid-turn would close the session out from under a running turn.
     #[test]
     fn a_turn_in_flight_blocks_the_handoff_rather_than_cutting_it_short() {

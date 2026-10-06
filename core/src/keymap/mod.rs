@@ -6,6 +6,7 @@
 pub mod action;
 pub mod key;
 pub mod panel;
+pub mod prefix;
 pub mod root;
 pub mod stock;
 pub mod table;

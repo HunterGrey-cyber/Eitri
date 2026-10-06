@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 /// How many session records one conversation keeps, newest-`updated_at` first.
 ///
 /// A cap rather than no cap because `resumable_sessions` reads the whole directory on the GTK main
-/// thread (`shell::agent_panel`'s `InboundMessage::Ready` handler), so an unbounded directory is an
+/// thread (`eitri_panel::agent_panel`'s `InboundMessage::Ready` handler), so an unbounded directory is an
 /// unbounded stall in the editor pane as well as unbounded disk.
 ///
 /// It is also very nearly the bound on the resume PICKER: every offerable record is a row on the

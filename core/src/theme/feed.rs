@@ -476,7 +476,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = None;
-        // Polled at POLL_INTERVAL, exactly as `shell::theme::feed::listen` polls on the GTK main loop.
+        // Polled at POLL_INTERVAL, exactly as `EditorFeeds` polls it from the host's timer.
         while Instant::now() < deadline && seen.is_none() {
             seen = reader.poll().filter(|p| p.options.colors_name == "retrobox");
             std::thread::sleep(POLL_INTERVAL);

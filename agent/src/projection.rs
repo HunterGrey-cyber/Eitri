@@ -211,7 +211,7 @@ pub enum AgentDomainEvent {
     ///
     /// `text` is the text the user typed, deliberately NOT the text that went on the wire. Wire 1
     /// composes editor context into the outgoing turn above both backends
-    /// (`shell/src/agent_panel.rs`); rendering that would show a file path and a selection nobody
+    /// (`panel/src/agent_panel.rs`); rendering that would show a file path and a selection nobody
     /// wrote.
     UserPromptSubmitted {
         text: String,

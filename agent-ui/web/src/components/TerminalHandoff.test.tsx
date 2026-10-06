@@ -32,7 +32,7 @@ function renderControl(overrides: Overrides = {}) {
   return { container, button, onHandoff, onClose };
 }
 
-/* The rule, mirrored from `shell/src/terminal_handoff.rs`'s `prepare_handoff`. Two implementations
+/* The rule, mirrored from `panel/src/terminal_handoff.rs`'s `prepare_handoff`. Two implementations
    of one rule is deliberate and is the same arrangement `reducer.ts` has with the Rust projection:
    Rust is the enforcement (it rejects the command outright), this is the affordance (it stops the
    control being offered). Each side is tested on its own; neither is tested only through the

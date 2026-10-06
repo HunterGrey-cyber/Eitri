@@ -23,7 +23,7 @@
 //! doubt an envelope is `Immediate`.
 //!
 //! This module is pure (no clock of its own: every method takes an `Instant`, no GTK), so the
-//! rules are testable without a display; `shell/src/panel_pacer.rs` is the thin half that owns the
+//! rules are testable without a display; `panel/src/panel_pacer.rs` is the thin half that owns the
 //! WebView.
 
 use std::collections::VecDeque;

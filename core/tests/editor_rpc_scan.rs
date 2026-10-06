@@ -11,24 +11,22 @@
 //! - `leak` called as a method or a path (`.leak()`, `Box::leak(..)`, `.map(String::leak)`) outside
 //!   a `#[cfg(test)]` module: leaking is the one way to make a built `String` a `&'static str`. A
 //!   test module kept in a file of its own is read as product code, which can only turn this red;
-//! - a `"nvim_exec_lua"` string literal outside `src/nvim_rpc.rs` and test modules: calling the
+//! - a `"nvim_exec_lua"` string literal outside `core/src/nvim_rpc.rs` and test modules: calling the
 //!   method by name on a link would go around the typed calls (a test may name it to check what
 //!   went over the wire).
 //!
 //! Comments and literals are blanked before anything is matched, and calls are found by their
 //! tokens, never by where a line ends, so formatting can neither hide a call nor invent one.
 
-use std::path::{Path, PathBuf};
-
 const ANNOTATION: &str = "// editor-rpc-scan: forwards a caller's constant";
 
-/// Every annotated forwarder, by file (relative to `core/`) and count. Reviewed: each passes on a
+/// Every annotated forwarder, by file (relative to the workspace root) and count. Reviewed: each passes on a
 /// `code` its own caller gave it, and that caller's call is checked here in turn.
 const EXPECTED_FORWARDERS: &[(&str, usize)] = &[
-    ("src/companion/driver.rs", 5),
-    ("src/editor_rpc.rs", 1),
-    ("../shell/src/companion/link.rs", 2),
-    ("../shell/src/editor_rpc.rs", 1),
+    ("core/src/companion/driver.rs", 5),
+    ("core/src/companion/link.rs", 2),
+    ("core/src/editor_rpc.rs", 1),
+    ("shell/src/editor_rpc.rs", 1),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -388,7 +386,7 @@ fn scan(rel: &str, text: &str) -> Report {
         }
     }
 
-    if rel != "src/nvim_rpc.rs" {
+    if rel != "core/src/nvim_rpc.rs" {
         let word: Vec<char> = "\"nvim_exec_lua\"".chars().collect();
         for at in 0..chars.len().saturating_sub(word.len() - 1) {
             if chars[at..at + word.len()] == word[..]
@@ -404,34 +402,26 @@ fn scan(rel: &str, text: &str) -> Report {
     report
 }
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 #[test]
 fn editor_rpc_callers_pass_only_constant_lua() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    rust_files(&root.join("src"), &mut files);
-    rust_files(&root.join("../shell/src"), &mut files);
-    files.sort();
-    assert!(files.len() >= 40, "the walk found only {} files", files.len());
+    let read = eitri_core::source_scan::rust_sources(&["core/src", "shell/src", "panel/src"]);
+    eitri_core::source_scan::require_anchors(
+        &read,
+        &[
+            "impl EditorRpc for EmbeddedEditorRpc",
+            "impl EditorRpc for CompanionLink",
+            "fn handle_inbound_message(",
+        ],
+    );
+    assert!(read.len() >= 40, "the walk found only {} files", read.len());
 
     let mut flagged = Vec::new();
     let mut forwarders: Vec<(String, usize)> = Vec::new();
     let mut install_seen = false;
-    for path in &files {
-        let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
-        let text = std::fs::read_to_string(path).unwrap();
-        let report = scan(&rel, &text);
-        if rel == "src/companion/driver.rs" && report.constants.iter().any(|c| c == "INSTALL_LUA") {
+    for source in &read {
+        let rel = source.path.clone();
+        let report = scan(&rel, &source.text);
+        if rel == "core/src/companion/driver.rs" && report.constants.iter().any(|c| c == "INSTALL_LUA") {
             install_seen = true;
         }
         flagged.extend(report.flagged);
@@ -441,7 +431,7 @@ fn editor_rpc_callers_pass_only_constant_lua() {
     }
     assert!(
         install_seen,
-        "the install's own call (`INSTALL_LUA` in src/companion/driver.rs) was not found: the scan reads nothing"
+        "the install's own call (`INSTALL_LUA` in core/src/companion/driver.rs) was not found: the scan reads nothing"
     );
     assert!(
         flagged.is_empty(),
