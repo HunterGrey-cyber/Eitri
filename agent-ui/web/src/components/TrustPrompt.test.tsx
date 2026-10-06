@@ -165,4 +165,17 @@ describe("TrustPrompt", () => {
     expect(text(container)).toContain("<script>alert(1)</script>");
     expect(text(container)).toContain("<img src=x onerror=alert(1)>");
   });
+
+  it("says that Claude Code honours a project allow rule only with its own folder trust", () => {
+    const allow = { what: "allow", file: ".claude/settings.json", label: "permissions.allow", value: "Bash(ls)", outside: false };
+    const withAllow = render(<TrustPrompt envelope={envelope({ items: [...envelope().items, allow] })} />);
+    const note = withAllow.container.querySelector(".trust-allow-note");
+    expect(note).not.toBeNull();
+    expect(note!.textContent).toContain("terminal claude");
+    expect(note!.textContent).toContain("permissions.allow");
+    withAllow.unmount();
+
+    const without = render(<TrustPrompt envelope={envelope()} />);
+    expect(without.container.querySelector(".trust-allow-note")).toBeNull();
+  });
 });

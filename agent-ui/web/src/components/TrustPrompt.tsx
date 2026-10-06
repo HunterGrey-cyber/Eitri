@@ -79,6 +79,14 @@ export const TrustPrompt = forwardRef<HTMLDivElement, Props>(function TrustPromp
           </ul>
         </section>
       ))}
+      {envelope.items.some((item) => item.what === "allow") && (
+        // Claude Code keeps its own per-folder trust and drops a project's allow rules without it. Eitri never
+        // sets that trust for the user, so the prompt says what a `y` here does not reach.
+        <p className="trust-note trust-allow-note">
+          Claude Code applies these permissions.allow rules only if you have also trusted this folder in terminal claude;
+          Eitri does not set that. Hooks, MCP servers and deny or ask rules load with y either way.
+        </p>
+      )}
       {envelope.remember !== "yes" && envelope.rememberNote !== null && (
         <p className="trust-note">
           <Shown text={envelope.rememberNote} />
