@@ -5,7 +5,7 @@
 //!
 //! After a split key (`split.right`/`split.below`, `%`/`"` by default) the prefix waits for a module
 //! key -- `e a t` and each Lua panel's `key` -- and a capital is taken for its lowercase when no Lua
-//! panel registered the capital itself. A Lua panel's key also
+//! panel registered the capital itself (`"` is Shift+' on a US layout). A Lua panel's key also
 //! runs its module directly, since no binding can have it (the reserved-set check,
 //! `ModuleKeys::build`).
 //!
@@ -54,7 +54,8 @@ pub enum Outcome {
     Run(PrefixCommand),
 }
 
-/// The key `send-prefix` / `send-keys` hands the pane with the keys.
+/// The key `send-prefix` / `send-keys` hands the pane with the keys: `send-prefix` sends the configured prefix chord
+/// itself, so a user who rebound the prefix still reaches a program inside the pane that wants it.
 pub fn literal_for(action: &Action, keymap: &Keymap) -> Option<KeySpec> {
     match action {
         Action::SendPrefix => Some(*keymap.prefix()),
@@ -412,7 +413,8 @@ mod tests {
         );
     }
 
-    /// A held prefix is sent once, using the configured chord.
+    /// A held prefix chord's auto-repeat is swallowed rather than sent on, and `send-prefix` sends the chord that is
+    /// configured, never a hard-coded `C-b`.
     #[test]
     fn held_prefix_is_not_sent_twice_and_send_prefix_names_the_configured_chord() {
         let t = Instant::now();

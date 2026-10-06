@@ -192,9 +192,12 @@ pub(crate) fn build_agent_panel(
                                 return true;
                             }
                             webkit6::NavigationType::FormSubmitted | webkit6::NavigationType::FormResubmitted => {
-                                // DOMPurify preserves `<form action="...">`, so clicking a sanitized form can navigate
-                                // this panel to a remote origin that would inherit its bridge. Block form submissions
-                                // because the embedded document has no legitimate form submission path.
+                                // DOMPurify's default config deliberately keeps <form action="...">
+                                // intact -- a sanitized-but-attacker-styled form submit button is a
+                                // real, click-required (not zero-click) way to navigate this panel to
+                                // a remote origin that would inherit the same bridge, and the link-click
+                                // guard above does not cover it. There is no legitimate reason this panel's own
+                                // embedded document would ever submit a form anywhere.
                                 nav_decision.ignore();
                                 return true;
                             }
@@ -231,8 +234,9 @@ pub(crate) fn build_agent_panel(
     // same state -- every later event would then be dispatched twice.
     start_pump_timer(handle.clone());
 
-    // Recover WebView crashes automatically with a guard, so the chat does not stay blank
-    // until a manual reload. A termination requested by the host is not a crash.
+    // Recover this WebView's own crash automatically (guarded) instead of leaving the chat
+    // blank until the user finds `\u{21bb}`/`prefix r` by hand. See `AgentPanelHandle::page_gone`'s
+    // own doc. An end the host asked for itself is no crash.
     {
         let handle = handle.clone();
         webview.connect_web_process_terminated(move |_webview, reason| {
@@ -268,7 +272,7 @@ fn start_pump_timer(handle: AgentPanelHandle) {
 /// script in this page can answer permission cards, so that matters. Styles keep `'unsafe-inline'`:
 /// the theme block `PanelDocument::themed` inserts and the bundle's own `<style>` need it, and a style
 /// cannot act on the host. The hash is computed from the embedded `AGENT_UI_HTML` at first use
-/// (`crate::panel_csp`), not carried in from the build script: `include_str!` follows the built
+/// (`PanelDocument::new`, `eitri_panel::panel_csp`), not carried in from the build script: `include_str!` follows the built
 /// file while the build script reruns only when its inputs change, so the two could describe
 /// different bundles, and the panel would silently never start. A document the extractor refuses
 /// gets `script-src 'none'` and a stderr line, never inline script by keyword.
@@ -289,10 +293,12 @@ fn panel_content_security_policy() -> &'static str {
     PANEL_DOCUMENT.csp()
 }
 
-/// The ephemeral `NetworkSession` keeps cookies, cache, and storage in memory for its lifetime
-/// without writing them to disk. Its proxy points to the closed discard port on loopback, so
-/// requests that get past the sanitizer and CSP fail to connect. The CSP remains the security
-/// boundary; the proxy adds a fallback.
+/// A backstop for the CSP: an ephemeral
+/// `NetworkSession` (per `WebKitWebsiteDataManager:is-ephemeral`, all data -- cookies, cache, storage
+/// -- is held in memory for the session's lifetime and never written to disk; it is non-persistent,
+/// not absent) whose proxy is the "discard" port on loopback, so any request that gets past the CSP
+/// above and the sanitizer dies at a closed port. **This is a backstop, not the boundary** --
+/// the CSP is.
 const PANEL_NETWORK_PROXY_URI: &str = "http://127.0.0.1:9";
 
 /// Installs `app.reload-agent-panel` for the top bar's reload button and `prefix r`.
@@ -304,7 +310,8 @@ const PANEL_NETWORK_PROXY_URI: &str = "http://127.0.0.1:9";
 ///
 /// The action is application-wide but the handle belongs to one window. A second window
 /// in the same process would replace the action and redirect the first window's reload
-/// button to the second panel.
+/// button to the second panel. `ApplicationFlags::NON_UNIQUE` gives each launch its own
+/// process, avoiding this case.
 pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle) {
     let action = gtk4::gio::SimpleAction::new("reload-agent-panel", None);
     // Cloned because the caller still needs its own handle afterwards -- `connect_close_request`
@@ -434,7 +441,7 @@ mod tests {
     /// It drives a plain `gio::Application` rather than a `gtk4::Application` deliberately -- the
     /// latter needs a display, which is what stops `shell` from testing any of this -- and
     /// `gtk4::Application` IS a `gio::Application`, which is where `hold` is defined and what
-    /// `AgentPanelHandle::shutdown` calls it through.
+    /// `hold_until_done` calls it through.
     ///
     /// The first half is a control: without the hold, `run` returns as soon as `activate` does. Its
     /// point is that the second half's 300ms is the hold's doing and not the loop's own latency.

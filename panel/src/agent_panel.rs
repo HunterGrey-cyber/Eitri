@@ -1,18 +1,24 @@
-//! Agent panel with an embedded `agent-ui/web` frontend on a host-provided `panel_page::PageSurface`.
-//! `AgentPanelHandle::page_message` handles JS-to-Rust messages; backend events flow back to the page.
+//! The real agent-ui panel: the page a host supplies (`panel_page::PageSurface`) running the embedded
+//! `agent-ui/web` frontend, its messages in (JS -> Rust, `AgentPanelHandle::page_message`), and a fast poll
+//! of every tab's backend pushed to the page (Rust -> JS).
 //!
-//! Each tab has one backend. `eitri_core::tab_set::TabSet` holds the tabs and worker receivers;
-//! this module spawns the workers and drains every tab on a shared 33 ms tick.
-//! Commands go to the tab they name. Backend construction is lazy: an empty tab starts its
-//! backend on its first `send_message` or `resume`, using `eitri_core::agent_backend`.
-//! Every session is gated. The tab's mode is read when answering requests and is never sent to the CLI.
+//! **One backend per tab**. The tabs themselves live in
+//! `eitri_core::tab_set::TabSet`; this module spawns the workers that set only holds receivers
+//! for, drains every tab on one 33 ms tick, and routes each inbound command to the tab it names --
+//! never to "the active one". Backend construction is lazy per tab: an empty
+//! tab starts its backend on its first `send_message` (or a `resume`). No mode goes into it (since
+//! 2026-09-27): every session is gated, and the tab's own mode is read where requests are answered,
+//! never sent to the CLI. Which backend gets built is `eitri_core::agent_backend`'s decision.
 //!
-//! Sidecar state comes from the server through `pump()`, including `active_turn_id`, tool calls
-//! and permissions. Successful commands return no events; the UI updates on the next poll.
-//! Synthesizing `TurnStarted` here would put the panel's running state ahead of the server.
+//! **State is server-originated.** For the sidecar backend this module folds nothing of its own:
+//! `active_turn_id`, tool calls and permissions all arrive as real events through `pump()`. A
+//! command that succeeds returns no events at all; the UI updates on the next poll. Nothing here
+//! synthesizes an optimistic `TurnStarted` to make the UI feel faster -- doing so would put the
+//! panel's idea of "a turn is running" ahead of the server's, which is the exact shadow state the
+//! runtime design forbids.
 //!
-//! The WebView draws only the active tab. Background events update attention and mark tabs stale
-//! through `TabSet::pump`; switching sends the newly active tab's full snapshot.
+//! **The WebView draws only the active tab.** A background tab's events feed its attention and mark
+//! it stale (`TabSet::pump`); a switch always sends the new active tab's full snapshot.
 
 use crate::panel_document::{PanelDocument, PANEL_BASE_URI};
 use crate::panel_page::{PanelHost, PanelPage};
@@ -325,8 +331,7 @@ fn collect_reports(rx: mpsc::Receiver<()>, expected: usize) -> usize {
 /// a worker, or a connect that has not finished (a closed tab, `r` reset, a fatal command, a
 /// session that never opened).
 ///
-/// **Held in panel state so the window-close backstop sees it** (the session-tabs whole-branch
-/// review). These used to run on bare threads nobody recorded, so a window closed a few seconds
+/// **Held in panel state so the window-close backstop sees it.** These used to run on bare threads nobody recorded, so a window closed a few seconds
 /// after `prefix &` y let `Application::run` return with the worker halfway through `shutdown()`:
 /// `SpawnedSidecar::drop` never ran and the sidecar outlived the process, and a connect finishing
 /// later was never shut down at all. `AgentPanelHandle::shutdown` now watches every entry here under
@@ -356,8 +361,7 @@ impl Retiring {
     /// A tab removed from the set: its backend is shut down, its connect is waited for, and a
     /// handoff's own worker (which already owns that backend) is waited for too. Returns the
     /// requests the tab still owed a `command_result`, for the caller to refuse -- a connect's
-    /// `send_message`/`resume`, and a handoff's `handoff_to_terminal`. The record is never deleted
-    ///.
+    /// `send_message`/`resume`, and a handoff's `handoff_to_terminal`. The record is never deleted.
     fn tab(&mut self, tab: Tab) -> Vec<String> {
         let mut owed = Vec::new();
         if let Some(handoff) = tab.pending_handoff {
@@ -521,7 +525,7 @@ struct AgentPanelState {
     /// Teardowns and connects of tabs that left while the window stays open, so the window-close
     /// backstop covers them too. See [`Retiring`].
     retiring: Retiring,
-    /// Application history and permission directories under `$XDG_STATE_HOME`; `None` without a state directory.
+    /// `$XDG_STATE_HOME/eitri/history` and `.../permissions`; `None` with no state directory.
     history_dir: Option<PathBuf>,
     rules_dir: Option<PathBuf>,
     /// The project's prompts, oldest first, as last read or written.
@@ -536,16 +540,19 @@ struct AgentPanelState {
     /// Where a `tab_verb` message's mapped `TabAction` goes. `None`
     /// until `main.rs`'s `AgentPanelHandle::on_tab_verb` installs one.
     tab_verb_hook: Option<Rc<dyn Fn(TabAction)>>,
-    /// C1's mirror: the page's last-reported `panel_keys` mode. Starts, and is reset to,
+    /// The page's last-reported `panel_keys` mode, mirrored here. Starts, and is reset to,
     /// `Other` on every `ready` (`PanelKeys::Other`'s own doc says why, `reset_nav_mode_for_ready`
     /// is where the reset happens) -- see `AgentPanelHandle::panel_keys`.
     nav_mode: Cell<PanelKeys>,
-    /// Receives directions from `nav_fallthrough` and `pane_nav` messages.
-    /// `None` until `main.rs` installs a hook with `AgentPanelHandle::on_nav_fallthrough`.
-    /// Both message types can be refused while the hook is absent.
+    /// Where a `nav_fallthrough` message's direction goes, and a `pane_nav`'s (`Ctrl+w h/j/k/l` --
+    /// the same move, from a key the page read itself): `None` until `main.rs`'s
+    /// `AgentPanelHandle::on_nav_fallthrough` installs one, which is why `InboundMessage::NavFallthrough`
+    /// and `InboundMessage::PaneNav` can be refused.
     nav_fallthrough_hook: Option<Rc<dyn Fn(Direction)>>,
-    /// Tracks recent WebView process crashes and whether automatic recovery has given up.
-    /// Only manual recovery re-arms the guard; automatic reloads must preserve the crash count.
+    /// How many times this WebView's own web process has crashed recently, and whether
+    /// automatic recovery has given up on it -- see `AgentPanelHandle::page_gone`.
+    /// Re-armed by a manual recovery, never by the automatic path itself --
+    /// `AgentPanelHandle::reload_document_by_hand`'s own doc says why.
     crash_guard: crate::webview_crash_guard::WebViewCrashGuard,
     /// Keeps `$XDG_STATE_HOME/eitri/tabs/<project>.json` in step with the tabs, once per tick.
     tab_memory: TabMemory,
@@ -624,12 +631,17 @@ type EditorRequestHook = Rc<dyn Fn(&eitri_core::scratch::ScratchRequest) -> Resu
 #[derive(Clone)]
 pub struct AgentPanelHandle {
     state: Rc<RefCell<AgentPanelState>>,
-    /// Holds the page and its pacer for document reinjection without traversing the widget tree.
-    /// They are shared with the pump and the page's message handler.
-    /// `None` when WebKit's sandbox cannot start (`webkit_sandbox::Decision::Unavailable`).
-    /// In that case a GTK notice replaces the WebView, and no page messages can start a session.
-    /// Focus, HINT, prefix and tab-verb paths still reach the inert state. Page operations do
-    /// nothing, and tab verbs refuse with `closing` so the host flashes instead of opening invisible tabs.
+    /// Held so the panel's document can be re-injected without going back through the widget tree.
+    /// The page and the pacer in front of it are one value, shared with the pump and the page's own
+    /// message handler.
+    ///
+    /// `None` when WebKit's sandbox cannot start in this process (`webkit_sandbox::Decision::
+    /// Unavailable`): no `WebView` is built, the
+    /// panel's place is a GTK notice, and nothing ever starts a session -- sessions start from the
+    /// page's own messages, and there is no page. Every method below still runs against the inert
+    /// state `main.rs`'s focus, HINT, prefix and tab-verb paths call into; what would reach a page
+    /// does nothing, and the tab verbs refuse (`closing`), so `main.rs` flashes rather than opening
+    /// tabs nobody can see.
     page: Option<Rc<PanelPage>>,
 }
 
@@ -884,7 +896,7 @@ impl AgentPanelHandle {
                 }
             }
         }
-        // A turn ended in these tabs, so their queued messages can be sent now.
+        // A turn ended in these tabs; their queued messages go out now.
         for tab in turn_ended {
             let flush = state.borrow_mut().tabs.flush_queue(tab);
             if let Some(flush) = flush {
@@ -936,28 +948,47 @@ impl AgentPanelHandle {
         true
     }
 
-    /// Shuts down every tab's backend, including one still being constructed on a worker thread.
-    /// A window closed during construction can otherwise leave a live sidecar and runtime thread
-    /// in a channel that nobody will read. Taking all tabs with `TabSet::take_all` makes completed
-    /// backends available for teardown and prevents a later tick from installing a session.
-    /// The pump also stops on `shutting_down`.
+    /// Shuts down every tab's backend, INCLUDING one still being constructed on a worker thread,
+    /// all of them in parallel under one backstop.
     ///
-    /// `tear_down_all` starts one worker per live backend with one collector and one backstop.
-    /// Serial sidecar closes can take 10 s each, so closing tabs in sequence could outlast the backstop.
-    /// This function returns immediately with a [`ShutdownWatch`]; it never waits on the GTK thread.
-    /// The host passes that watch to `hold_until_done` to keep the process alive until teardown
-    /// finishes or the backstops expire.
+    /// The in-flight case is not hypothetical: since construction moved off the GTK main loop, a
+    /// window closed during a connect leaves a fully-built backend -- a live sidecar process and a
+    /// Tokio runtime thread -- owned by nothing but a channel nobody will ever read.
     ///
-    /// This only covers panel shutdown. The window's close handler first calls `pane.shutdown()`
-    /// on the GTK thread, which waits for nvim to exit. A slow `:qa!` or plugin can still delay closing.
+    /// Taking every tab (`TabSet::take_all`) is load-bearing twice over: it lets a backend that
+    /// already finished be shut down properly, and it leaves nothing for a later tick to install a
+    /// session into -- the pump stops on `shutting_down` anyway.
     ///
-    /// A handoff's close already runs on a worker that owns the backend. Watch `dropped_rx`, since
-    /// `closed_rx` only reports that shutdown returned and the sidecar child dies during drop afterwards.
-    /// `HANDOFF_CLOSE_BACKSTOP` may expire before the sidecar's worst-case teardown finishes.
-    /// The host owns the process hold because this handle belongs to one window while the
-    /// application owns the event loop.
+    /// **Every live backend is torn down at once** (`tear_down_all`): one worker per tab, one
+    /// collector, one backstop. Serial sidecar closes are bounded at 10 s each, so N tabs torn down
+    /// in turn could outlive any backstop.
+    ///
+    /// **This function does not wait for anything, and that is its most important property.** It
+    /// runs from `window.connect_close_request` on the GTK main thread, where a wait keeps the
+    /// window mapped and frozen until it returns; two previous versions of this code waited there
+    /// (3s, then 15s) while describing themselves as not doing so. Every branch below instead puts
+    /// its receiver in the returned [`ShutdownWatch`], which the host hands to `hold_until_done`:
+    /// **this function** returns immediately and the process stays alive -- with no window on
+    /// screen -- until the teardowns report or their backstops expire.
+    ///
+    /// **Scoped to the panel, deliberately, because the previous two versions of this doc were not
+    /// and were false for it** (2026-09-21, the third time a review found it wrong). The
+    /// whole close handler does NOT return immediately: `main.rs`'s `connect_close_request` calls
+    /// `pane.shutdown()` first, on the GTK thread, and that spins until nvim exits
+    /// (`LiveHarness::shutdown` in the fork). So "the window disappears at once" is a claim about
+    /// this half only, and a slow `:qa!` -- a hung plugin, a slow `BufWritePre` -- still delays the
+    /// close with nothing here involved.
+    ///
+    /// **A handoff's close** is already running on its own worker, which owns that backend: there
+    /// is nothing to start, only a reason to keep the process alive. It is held on `dropped_rx`,
+    /// not `closed_rx` -- `closed_rx` reports when `shutdown()` returned, while on the sidecar path
+    /// the child dies in the backend's drop afterwards. `HANDOFF_CLOSE_BACKSTOP` is generous for
+    /// the legacy backend and knowingly short of the sidecar's worst case; see its own doc.
+    ///
+    /// The hold belongs to the host (`hold_until_done`): this handle is per-window, and the process
+    /// the watch keeps alive belongs to the application that owns the loop this panel's timers run on.
     pub fn shutdown(&self) -> ShutdownWatch {
-        // Queued text is saved as history before the window closes.
+        // Queued words outlive the window as history.
         let texts = self.state.borrow_mut().tabs.take_every_queued_text();
         if !texts.is_empty() {
             let (dir, root) = {
@@ -997,8 +1028,7 @@ impl AgentPanelHandle {
         }
         entries.extend(tear_down_all("every session tab's teardown", backends));
         // Tabs that left earlier, while the window stayed open: their teardowns and connects are
-        // still running on workers nothing else would keep alive (the session-tabs whole-branch
-        // review). Same holds and backstops as the tabs just taken.
+        // still running on workers nothing else would keep alive. Same holds and backstops as the tabs just taken.
         let retiring = std::mem::take(&mut self.state.borrow_mut().retiring);
         entries.extend(retiring.connects.into_iter().map(watch_connect));
         for rx in retiring.teardowns {
@@ -1040,23 +1070,33 @@ impl AgentPanelHandle {
         page.load_document(&document.themed(&vars), PANEL_BASE_URI);
     }
 
-    /// Handles manual panel recovery through `prefix r` or the top-bar reload button.
+    /// The user's OWN recovery action for a wedged or crashed panel -- `prefix r`
+    /// (`Action::PanelReload`) or the top-bar `\u{21bb}` button (`install_reload_action`) -- as
+    /// distinct from the AUTOMATIC reload `page_gone` performs while still within
+    /// `crash_guard`'s own budget.
     ///
-    /// Resets `crash_guard` before calling [`reload_document`](Self::reload_document).
-    /// The reset belongs here because `page_gone` also calls reload_document for automatic recovery.
-    /// Resetting in that shared path would erase the crash history on every automatic reload,
-    /// preventing `GiveUp` from ever being reached. Automatic recovery must keep counting crashes.
+    /// Re-arms `crash_guard` (`WebViewCrashGuard::reset`) before doing exactly what
+    /// [`reload_document`](Self::reload_document) does. **Why a separate method rather than putting
+    /// the reset inside `reload_document` itself:** `page_gone`'s own `Reload` branch calls
+    /// `reload_document` directly, on every crash still within budget -- if that shared path reset
+    /// the guard too, every automatic reload would erase its own crash history and `GiveUp` could
+    /// never be reached, defeating the loop guard entirely. Only a genuinely manual recovery may
+    /// re-arm it; the automatic path must keep counting toward the very loop it exists to detect.
     pub fn reload_document_by_hand(&self) {
         self.state.borrow_mut().crash_guard.reset();
         self.reload_document();
     }
 
-    /// Handles an unexpected end of the page's content process, such as a crash or memory exhaustion.
-    /// Recovery uses [`reload_document`](Self::reload_document). The session stays in Rust,
-    /// and the fresh page rehydrates through its ready/hello exchange.
-    /// `crash_guard` limits automatic reloads so a page that crashes while loading cannot loop forever.
-    /// The host excludes WebKit's TerminatedByApi reason because an intentional termination
-    /// must not consume the crash budget.
+    /// The page's content process ended: a real WebKit crash, or the host
+    /// genuinely out of memory. Until the signal was connected the chat stayed blank until the user
+    /// found `\u{21bb}`/`prefix r` by hand.
+    /// Recovery is exactly [`reload_document`](Self::reload_document): the session lives in Rust,
+    /// so a fresh document rehydrates from its own `ready`/`hello` round trip with nothing lost.
+    ///
+    /// Guarded by `crash_guard` (`webview_crash_guard::WebViewCrashGuard`) so a page that cannot
+    /// even finish loading does not turn into a reload/crash loop. The host leaves out an end it asked
+    /// for itself (WebKit's `TerminatedByApi`): that is no crash and must not count toward the guard's
+    /// budget. Nothing on this panel's view ends its process today, but the Lua-panel's call site does.
     pub fn page_gone(&self, reason: &str) {
         // The page that reported BROWSE or INPUT is dead, and the give-up document never sends
         // `ready`: left as it was, `main.rs` would keep claiming `Ctrl+j`/`Ctrl+k` for a page that
@@ -1129,10 +1169,13 @@ impl AgentPanelHandle {
         self.set_theme(&tokens);
     }
 
-    /// Updates the recorded theme's `editor_row_px` for `--nv-editor-row` and re-sends the theme.
-    /// Like `font_size_px`, the value is then used by both document reloads and fresh `ready`
-    /// handshakes without another envelope. `main.rs` calls this on cell-size and `gtk-xft-dpi`
-    /// changes, using `webkit_zoom::EditorRow` to convert GTK logical pixels to panel CSS pixels.
+    /// The twin of [`set_panel_font_size_px`](Self::set_panel_font_size_px), for
+    /// `--nv-editor-row`: updates only the recorded theme's `editor_row_px` and
+    /// re-sends it, so both a panel reload and a fresh `ready` handshake pick the editor's cell
+    /// height up the same way `font_size_px` already does, with no new envelope. `main.rs` calls
+    /// this from `NeovideEditorPane::connect_cell_size_changed` and on a `gtk-xft-dpi` change, in
+    /// the panel's CSS px -- already converted from the editor's GTK logical px by
+    /// `webkit_zoom::EditorRow`.
     pub fn set_editor_row_px(&self, editor_row_px: f32) {
         let tokens = {
             let mut tokens = self.state.borrow().theme.clone();
@@ -1223,9 +1266,10 @@ impl AgentPanelHandle {
     pub fn set_pane_focused(&self, focused: bool) {
         self.state.borrow_mut().pane_focused = focused;
         if !focused {
-            // A pending bypass prompt belongs to the tab the user was viewing. Drop it when focus
-            // moves to another pane, just as `TabSet::select` drops it on a tab switch, so a later
-            // `y` cannot confirm a prompt the user has left.
+            // A pending bypass prompt is about the tab the user was just looking
+            // at. Losing the keys entirely (focus moved to another module, e.g. the editor or the
+            // terminal) must drop it, the same way switching tabs already does (`TabSet::select`),
+            // so a `y` that slips through afterwards lands on nothing.
             self.state.borrow_mut().tabs.drop_bypass_prompt();
         }
         self.dispatch(eitri_core::agent_bridge::serialize_pane_focus_for_js(focused));
@@ -1240,33 +1284,35 @@ impl AgentPanelHandle {
         self.dispatch(eitri_core::agent_bridge::serialize_enter_input_for_js());
     }
 
-    /// Keyboard arrivals enter BROWSE on the last row with following resumed if it was active;
-    /// otherwise the previous view is restored. Sent after `Ctrl+l`, a tray chip or a
-    /// `prefix a` miss moves GTK focus into the panel. Uses the same guarded dispatch as
-    /// `enter_input`, so it is safe before the page loads.
+    /// Where every other keyboard arrival lands: BROWSE -- on the last row with following resumed if
+    /// the reader was following it, else on the row and scroll they left (2026-09-29; the page decides, from what it parked when the keys left). Sent after `Ctrl+l`/a
+    /// tray chip/`prefix a`'s miss have moved GTK focus into the panel (this reverses the 2026-09-19
+    /// behaviour of `Ctrl+l` going straight into the composer). Mirrors `enter_input` exactly
+    /// except for the envelope it dispatches; safe before the page loads for the same reason.
     pub fn arrive(&self) {
         self.drop_bypass_prompt();
         self.dispatch(eitri_core::agent_bridge::serialize_arrive_for_js());
     }
 
-    /// Drops Rust's bypass prompt when GTK routes keys away before the WebView sees them.
-    /// The panel cancels its copy on the matching envelope; the nonce then rejects a stray `y`.
-    /// This prevents a copy key after HINT or a name starting with `y` after `prefix ,` from
-    /// entering bypass and approving waiting cards. The same cancellation applies to `arrive`,
-    /// `enter_input`, `nav_key`, `literal_key`, `prefix ?`, `prefix i`, `prefix &`, `<leader>bo`,
-    /// card landings, focus loss and tab switches.
+    /// Every keyboard route GTK claims before the WebView sees a key is a route away
+    /// from a bypass prompt. The panel cancels its own copy on the matching envelope; this drops
+    /// Rust's, so a `y` that slipped through is refused by the nonce. HINT (`prefix f`) and `prefix ,` left the prompt open, and the
+    /// next ordinary key -- the `y` that copies a code block HINT landed on, a name starting with
+    /// `y` -- entered bypass and approved the waiting cards. The same now holds for `arrive`,
+    /// `enter_input`, `nav_key`, `literal_key`, `prefix ?`, `prefix i`, `prefix &`, `<leader>bo` and
+    /// a card landing, besides `pane_focus false` and the tab switches that already dropped it.
     fn drop_bypass_prompt(&self) {
         self.state.borrow_mut().tabs.drop_bypass_prompt();
     }
 
-    /// C1's mirror: the page's last-reported effective mode, for `main.rs`'s
+    /// The page's last-reported effective mode, for `main.rs`'s
     /// `Ctrl+j`/`Ctrl+k` intercept to decide against (`claims`). `Other` before the page has ever
     /// posted one, and again after every `ready` -- see `PanelKeys::Other`'s own doc.
     pub fn panel_keys(&self) -> PanelKeys {
         self.state.borrow().nav_mode.get()
     }
 
-    /// C1's decision, dispatched to the page: `Ctrl+j` claimed in BROWSE, or
+    /// Tells the page that `Ctrl+j` was claimed in BROWSE, or
     /// `Ctrl+k` claimed in INPUT. Safe before the page loads for the same reason `arrive` is --
     /// there is no live mirror yet, so `main.rs`'s intercept never calls this before one exists.
     pub fn nav_key(&self, direction: NavKeyDirection) {
@@ -1418,9 +1464,8 @@ impl AgentPanelHandle {
         self.state.borrow_mut().editor_done_hook = Some(Rc::new(hook));
     }
 
-    /// Called with the old and new values whenever [`AgentPanelHandle::attention`] changes.
-    /// Keeping both values here avoids a separate copy in `main.rs` that could drift.
-    /// `main.rs` installs this once.
+    /// Called with the value before and after whenever [`AgentPanelHandle::attention`] changes --
+    /// the one place that knows both, so `main.rs` keeps no copy of its own to drift. `main.rs` installs this once.
     pub fn on_attention(
         &self,
         hook: impl Fn(eitri_core::attention::Attention, eitri_core::attention::Attention) + 'static,
@@ -1429,24 +1474,25 @@ impl AgentPanelHandle {
     }
 
     /// Where a `tab_verb` message's mapped `TabAction` goes: the same code the prefix's own
-    /// `Action::Tab` arm runs. `None`
+    /// `Action::Tab` arm runs (`main.rs`'s `run_tab_action`). `None`
     /// until `main.rs` installs one, which is why `InboundMessage::TabVerb` can be refused.
     /// `main.rs` installs this once.
     pub fn on_tab_verb(&self, hook: impl Fn(TabAction) + 'static) {
         self.state.borrow_mut().tab_verb_hook = Some(Rc::new(hook));
     }
 
-    /// Routes `nav_fallthrough` directions to `move_focus(&ModuleId::agent(), dir)` in `main.rs`,
-    /// the same move the intercepted chord would have made. `pane_nav` uses this hook too for
-    /// `Ctrl+w h/j/k/l`. `main.rs` installs the hook once.
+    /// Where a `nav_fallthrough` message's direction goes: `main.rs` wires this to
+    /// `move_focus(&ModuleId::agent(), dir)`, i.e. exactly what the chord would have done had the
+    /// panel never intercepted it. A `pane_nav` (`Ctrl+w h/j/k/l`) goes through the
+    /// same hook, for it is the same move. `main.rs` installs this once.
     pub fn on_nav_fallthrough(&self, hook: impl Fn(Direction) + 'static) {
         self.state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(hook));
     }
 }
 
-/// Session-tab verbs bound by `main.rs`. Each borrows and changes the set, drops the borrow,
-/// then dispatches. They do nothing while `AgentPanelState::shutting_down` is set, when the
-/// tab set is empty.
+/// The session-tab verbs `main.rs` binds. Each borrows, changes
+/// the set, drops the borrow, then dispatches. Every one of them does nothing once the window is
+/// closing (`AgentPanelState::shutting_down`: the set is empty then).
 // The keymap and the window close will call these; until they do, some have no caller.
 #[allow(dead_code)]
 impl AgentPanelHandle {
@@ -1475,7 +1521,7 @@ impl AgentPanelHandle {
         send_tabs(&self.state, page);
     }
 
-    /// `prefix <digit>`. `false` when no tab has that number.
+    /// `prefix <digit>`. `false` when no tab has that number (the caller flashes).
     pub fn select_number(&self, n: u16) -> bool {
         self.switch_with(|tabs| tabs.select_number(n))
     }
@@ -1532,8 +1578,9 @@ impl AgentPanelHandle {
         self.dispatch(payload);
     }
 
-    /// Shows the footer's y/n prompt to close every tab except the active one (`<leader>bo`).
-    /// When only the active tab is open, there is nothing to close, dispatch or flash.
+    /// `<leader>bo` asks for confirmation in the footer before closing all other tabs.
+    /// With only the active tab open, it dispatches nothing and shows no flash, like `prefix n`/`p`
+    /// with one tab. A command naming a nonexistent tab still flashes.
     pub fn confirm_close_others(&self) {
         if self.closing() {
             return;
@@ -1551,8 +1598,9 @@ impl AgentPanelHandle {
         if self.closing() {
             return;
         }
-        // Opening the chooser cancels the bypass prompt for the tab the user is leaving.
-        // A fresh prompt raised by Shift+Tab inside the chooser builds its own plan afterwards.
+        // Opening the chooser is one of the routes that cancels an outstanding bypass
+        // prompt -- it was about the tab the user is leaving to see this list. A fresh one raised
+        // from inside the chooser (its own Shift+Tab) makes its own plan afterwards, unaffected.
         self.state.borrow_mut().tabs.drop_bypass_prompt();
         let payload = chooser_payload(&self.state.borrow());
         self.dispatch(payload);
@@ -1642,7 +1690,7 @@ impl AgentPanelHandle {
         Ok(ids.len())
     }
 
-    /// Counts tabs with a running turn or a session that is still connecting.
+    /// Tabs whose turn is running or whose session is still connecting.
     pub fn running_count(&self) -> usize {
         let state = self.state.borrow();
         if state.shutting_down {
@@ -1651,7 +1699,7 @@ impl AgentPanelHandle {
         state.tabs.running_count()
     }
 
-    /// Sums every tab's queued messages for the window-close prompt.
+    /// Every tab's queued messages, summed (the window-close prompt).
     pub fn queued_count(&self) -> usize {
         let state = self.state.borrow();
         if state.shutting_down {
@@ -2103,8 +2151,8 @@ fn poll_review_flow(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     dispatch_review_outs(state, page, outs);
 }
 
-/// C5's return half: every edit whose marker appeared goes back to the tab it came from (review
-/// focus 4), and the keys return to the chat.
+/// The return half of a scratch edit: every edit whose marker appeared goes back to the tab it came from,
+/// and the keys return to the chat.
 fn poll_scratch_edits(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     let finished: Vec<(eitri_core::scratch::PendingEdit, eitri_core::scratch::EditDone)> = {
         let mut state_ref = state.borrow_mut();
@@ -2255,12 +2303,12 @@ fn send_switch(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     report_attention(state, before);
 }
 
-/// Recomputes and sends the window's `hello` whenever the open provider sessions change:
-/// a session is adopted, a resume is installed, or a tab is closed or reset.
+/// `hello` is window-level and re-sent, recomputed, whenever the set of open provider
+/// sessions changes -- a session adopted, a resume installed, a tab closed or reset.
 fn send_hello_if_open_sessions_changed(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     let payload = {
         let mut state_ref = state.borrow_mut();
-        // `ready` sends `hello` itself and saves the open session IDs used to compute it.
+        // `ready` sends `hello` itself, and records what it was computed against.
         if !state_ref.document_ready {
             return;
         }
@@ -3165,11 +3213,12 @@ fn spawn_connect_holding(
 /// `never_opened_message` below guesses for every other reason.
 const SIDECAR_STOPPED_MARKER: &str = "the connection to the provider ended before this session did";
 
-/// Builds the text `report_sessions_that_never_opened` shows for a `reason`, without a live tab.
-/// A resumed sidecar reports itself open only on its first new turn because attaching
-/// does not replay `SessionReady`. If it stops before then, it reaches this path even
-/// though the conversation and transcript still exist. Give stopped-sidecar reasons
-/// their own wording without the generic guess that the session no longer exists.
+/// Builds the text shown by `report_sessions_that_never_opened` for a reason.
+/// Kept separate so it can be tested without a live tab.
+/// Most reasons indicate that the session never opened. A resumed sidecar session reports
+/// open only on its first new turn because AgentConversation does not replay SessionReady
+/// on attach. If the sidecar stops before that turn, the conversation and transcript may
+/// still exist. Give that reason its own message without guessing that the conversation is gone.
 fn never_opened_message(reason: &str) -> String {
     if reason.contains(SIDECAR_STOPPED_MARKER) {
         format!("the agent sidecar stopped ({reason})")
@@ -3186,8 +3235,7 @@ fn never_opened_message(reason: &str) -> String {
 ///
 /// `AgentConversation::resume` catches the common case synchronously, within its own short window.
 /// This is the backstop for everything slower than that window and for fresh sessions, which have
-/// no equivalent check: either way the tab becomes `Failed` with the provider's own reason (ruling
-/// 14), where `r` starts it over. It is never turned into a fresh session automatically. The
+/// no equivalent check: either way the tab becomes `Failed` with the provider's own reason, where `r` starts it over. It is never turned into a fresh session automatically. The
 /// `error{tab}` envelope goes out only if that tab is active; the tab keeps the reason for when it
 /// is shown, and no other tab is touched.
 ///
@@ -3288,7 +3336,7 @@ fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage
                     continue;
                 }
                 page.send(&serialize_command_result_for_js(&request_id, Err(&error.message)));
-                // Show the error only for the active tab; other tabs retain the reason for later.
+                // Only if that tab is on screen; it keeps the reason for later.
                 if state.borrow().tabs.active() == tab {
                     page.send(&serialize_error_for_js(tab, &error.message));
                 }
@@ -3374,11 +3422,13 @@ fn title_from_first_prompt(state: &Rc<RefCell<AgentPanelState>>, tab: TabId, typ
     }
 }
 
-/// Checks every tab's in-flight terminal handoff without blocking.
-/// The command is dispatched only after the session's `shutdown()` returns on its worker,
-/// so the frontend cannot show a command to run before shutdown completes.
-/// A handoff card is sent only for the active tab; others retain it in `last_handoff`.
-/// `command_result` is sent either way, and the tick's `tabs` envelope reports the change.
+/// Every tab's in-flight terminal handoff, checked without blocking.
+///
+/// The command is dispatched here and nowhere else, which is what makes the handoff ordering real: by
+/// the time the frontend can show a user the line to run, the session's own `shutdown()` has
+/// already returned on the worker thread. The handoff card goes out only if its tab is active
+/// (the tab keeps it in `last_handoff` for when it is shown); the `command_result` is
+/// owed either way, and the tick's `tabs` envelope reports the state change.
 fn collect_pending_handoffs(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     let handing_off: Vec<TabId> = state
         .borrow()
@@ -3504,9 +3554,8 @@ fn ready_payloads(
     keymap: Option<&str>,
     restore: Option<&RestoreOffer>,
 ) -> Vec<String> {
-    // Exclude sessions open in any tab or handed off from a tab from resume offers.
-    // An open session's lease refuses a second driver; a handed-off session may have a CLI
-    // writing to it.
+    // No session open in any tab, or handed off from one, is offered for resume -- the
+    // lease refuses a second driver, and a handed-off one has a CLI writing it.
     greeting.resumable.retain(|r| !open.contains(&r.provider_session_id));
     let mut payloads = vec![serialize_hello_with_restore_for_js(&greeting, restore)];
     payloads.extend(theme.map(str::to_string));
@@ -3554,7 +3603,7 @@ fn end_pending_edits(state: &mut AgentPanelState) -> Vec<(TabId, Option<String>)
     ended
 }
 
-/// C1's mirror: called from the `Ready` arm on
+/// Resets the nav-mode mirror (`AgentPanelState::nav_mode`'s own doc): called from the `Ready` arm on
 /// every `ready` -- the first one and every reload's alike -- so the mirror never survives a
 /// reload holding whatever mode the torn-down document last reported.
 ///
@@ -3619,11 +3668,11 @@ impl PermissionAnswer {
     }
 }
 
-/// Handles a `permission_response` without a WebView so the full route can be tested.
-/// For "Always allow", save the rule Rust offered for the card before answering; never
-/// accept a rule supplied by the panel. `TabSet::answer_card` records human approval so
-/// the CLI's prompt for the same call can proceed without a second card. `Err` is a
-/// refusal shown by the panel, leaving the card usable; `Ok` contains the answer's outcome.
+/// Everything a `permission_response` does, with no WebView, so its route is tested whole: the rule the card offered is saved first when the user chose "Always allow" (never taken
+/// from the panel), then the answer goes through `TabSet::answer_card` -- the one route
+/// that records a human approval, which is what lets the CLI's own prompt for the same call through
+/// without a second card. `Err` is a refusal the panel shows (the card stays and `a`
+/// still works); `Ok` is the answer's own outcome.
 fn answer_permission_response(
     tabs: &mut eitri_core::tab_set::TabSet,
     rules_dir: Option<&Path>,
@@ -3633,9 +3682,9 @@ fn answer_permission_response(
 ) -> Result<Result<Vec<agent::AgentDomainEvent>, BackendError>, String> {
     let remembered = {
         let t = tabs.get(tab).ok_or_else(|| format!("protocol: no tab {}", tab.0))?;
-        // Read immediately before saving so a request that is no longer waiting saves no rule.
-        // `Tab::card_is_waiting` also excludes requests already answered by this tab, even while
-        // the sidecar projection still lists them pending until `PermissionResolved` arrives.
+        // Read right before the save, so an id that is no longer
+        // pending -- or that this tab's user already answered, which the sidecar's projection still
+        // lists until its `PermissionResolved` arrives -- saves nothing (`Tab::card_is_waiting`).
         let still_pending = t.card_is_waiting(&answer.permission_id);
         rule_to_remember(
             t,
@@ -3667,13 +3716,17 @@ fn answer_permission_response(
     Ok(tabs.answer_card(tab, &answer.permission_id, decision))
 }
 
-/// Returns the rule offered for `permission_id` to remember, only with an allow while the card waits.
-/// The caller reads `still_pending` through `Tab::card_is_waiting` immediately before this call.
-/// Passing it in keeps this check testable without a live backend.
+/// The `remember` choice: the rule Rust offered for `permission_id`, only with an allow, and
+/// only while that id is still a card waiting for the user.
+/// `still_pending` is the caller's own read (`Tab::card_is_waiting`), taken right before this runs
+/// -- passed in rather than read here so this stays testable without a live backend, the same
+/// reason `changed_envelope` takes `document_ready` as a parameter.
 ///
-/// `TabSet::answer_card` removes the offer after the first successful answer, regardless of
-/// the decision. The tab's `user_answered` prevents `refresh_offers` from recreating it while
-/// the sidecar projection still lists the request pending before `PermissionResolved` arrives.
+/// The offer itself is gone once the first answer to that id succeeds, whatever the decision, and
+/// never comes back (`TabSet::answer_card`, the tab's `user_answered`): on the sidecar path the
+/// projection still lists the id as pending until the provider's real `PermissionResolved`
+/// arrives, and `refresh_offers` recomputes offers from that projection whenever another id
+/// arrives, so a one-time removal alone was undone by the next pump.
 fn rule_to_remember(
     tab: &Tab,
     permission_id: &str,
@@ -3726,12 +3779,13 @@ fn events_owed(
     }
 }
 
-/// Builds an `events` envelope for events returned by a backend and already folded into
-/// its projection: legacy's synthesized events, a refused send's folded prompt and
-/// `ConfirmOutcome::Entered::resolved` permissions from entering bypass on legacy.
-/// These events do not arrive through the pump. Returns `None` for an empty batch or a
-/// background tab, which catches up with a snapshot when selected. Revisions come from
-/// the projection after these events were folded one by one on this thread.
+/// The `events` envelope for a batch a backend RETURNED (folded into its own projection already)
+/// rather than delivered through the pump: legacy's synthesized events, a refused send's folded
+/// prompt, and the `PermissionResolved`s entering bypass produced on
+/// legacy (`ConfirmOutcome::Entered::resolved`), which no pump ever carries. `None` for an empty
+/// batch, or for a tab that is not the active one: the WebView draws only that tab, and a background
+/// tab catches up with a snapshot when it is switched to. The revisions are the projection's, as the
+/// events were folded into it one each, just now, on this thread.
 fn returned_events_payload(state: &AgentPanelState, tab: TabId, events: &[agent::AgentDomainEvent]) -> Option<String> {
     if events.is_empty() || state.tabs.active() != tab {
         return None;
@@ -3764,7 +3818,7 @@ fn apply_command_outcome(
     apply_outcome(state, page, tab, Some(request_id), outcome);
 }
 
-/// [`apply_command_outcome`] for an outcome no request is waiting on:
+/// [`apply_command_outcome`] for an outcome no request is waiting on (a queue flush):
 /// `request_id` is `None` and no `command_result` goes out.
 fn apply_outcome(
     state: &Rc<RefCell<AgentPanelState>>,
@@ -3886,9 +3940,9 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         return;
     }
     let request_id = message.request_id().to_string();
-    // A tab command must name its tab so a permission answer after a switch reaches the tab that
-    // asked. Bind the resolution before the `match` to release the state borrow: a scrutinee's
-    // temporaries otherwise live until the end of the whole match.
+    // A tab command names its tab, or it is refused. Never "the
+    // active one" -- a permission answered just after a switch must reach the tab that asked.
+    // Bound before the `match`: a scrutinee's temporaries live to the end of the whole match.
     let resolved = state.borrow().tabs.resolve(message.tab_ref());
     let target = match resolved {
         Ok(target) => target,
@@ -3911,14 +3965,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             // sent after that snapshot it would draw the same text twice.
             let discarded = page.pacer().borrow_mut().discard_pending();
             trace_discarded_first_texts(state, discarded);
-            // `ready_payloads` computes the fresh document's payloads without a WebView, making
-            // reload behavior testable. Neither the initial `ready` nor a reload opens the chooser;
-            // a fresh document for an empty tab shows its dashboard.
+            // Everything a fresh document is owed is decided by one pure function, so the reload
+            // path is testable without a WebView -- see `ready_payloads`. A `ready` never opens the
+            // chooser,  on the first one or on a reload -- the empty tab's dashboard is
+            // what a fresh document sees.
             let payloads = {
                 let mut state_ref = state.borrow_mut();
                 let state_ref = &mut *state_ref;
-                // C1's mirror: "it starts other and returns to other on every ready
-                // (a reload)". A fresh document starts BROWSE-or-dashboard, never whatever mode
+                // The nav-mode mirror starts as `Other` and returns to it on every ready
+                // (a reload). A fresh document starts BROWSE-or-dashboard, never whatever mode
                 // the torn-down document last reported, so the mirror must not carry the old
                 // value across -- see `reset_nav_mode_for_ready`'s own doc for the failure this
                 // closes.
@@ -3966,7 +4021,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 ));
                 state_ref.last_open_ids = open;
                 state_ref.last_restore_offered = restore_is_on_offer(state_ref);
-                // The tick may send payloads to this document once it is marked ready.
+                // From here on the tick may send into this document.
                 state_ref.document_ready = true;
                 payloads
             };
@@ -4261,14 +4316,17 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 }
             };
 
-            // Set the tab to `NotStarted` before shutdown so no further turn can be sent.
-            // `shutdown()` cancels every pending permission and closes the provider's session.
+            // The handoff's steps, in the only order that is safe: from here on this tab
+            // holds no session (`NotStarted` at once), so no further turn can be sent,
+            // and `shutdown()` itself cancels every pending permission (fail-closed) and closes the
+            // provider's session.
             let taken = {
                 let mut state_ref = state.borrow_mut();
-                // Drop the bypass prompt before the tab becomes `NotStarted`. Otherwise a confirmation
-                // intended for a live tab could also change the window default after the session is gone.
-                // Handoff clicks bypass the panel's y/n path, so cancellation is needed here as well as
-                // `confirm_bypass` rechecking which question was asked.
+                // The tab becomes `NotStarted` under whatever bypass
+                // prompt was open for it -- a live tab's `Switch to bypass?` whose `y` would then also
+                // have moved the window default. Reached by clicks that never pass
+                // through the panel's y/n, so it is dropped here; `confirm_bypass`'s own re-check of
+                // which question was asked is the other half.
                 state_ref.tabs.drop_bypass_prompt();
                 let t = state_ref.tabs.get_mut(tab).expect("resolved above");
                 match std::mem::replace(&mut t.backend, TabBackend::NotStarted) {
@@ -4375,11 +4433,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 Err(why) => refuse(page, &why),
             }
         }
-        // `TabSet::cycle_mode` returns `Result<ModeCycle, String>` for live and empty tabs,
-        // so `Ok(Changed(_))` does not imply the tab was empty. Read `was_empty` before the call
-        // to persist the next-launch default only when changing an empty tab.
-        // `Confirm(plan)` dispatches a y/n prompt; a later `confirm_bypass` message answers it
-        // through `apply_confirm_bypass`.
+        // `TabSet::cycle_mode` returns a `Result<ModeCycle, String>` -- a live,
+        // active tab can toggle too, not only an empty one, so `Ok(Changed(_))` here no longer
+        // means "was empty". `was_empty` is read BEFORE the call so the persisted "next launch"
+        // default is written only for the tab whose move that preference is actually
+        // about. `Confirm(plan)` dispatches the real y/n prompt rather than refusing --
+        // `apply_confirm_bypass`, below, is what a later `confirm_bypass` message answers it with.
         InboundMessage::CycleMode { .. } => {
             let tab = tab_of(target);
             let was_empty = matches!(
@@ -4419,7 +4478,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         }
         InboundMessage::OpenDetail { .. } => {
             let tab = tab_of(target);
-            // A route away from a bypass prompt.
+            // A route away from a bypass prompt (the panel cancels its own on `tab_detail`).
             state.borrow_mut().tabs.drop_bypass_prompt();
             let payload = detail_payload(&state.borrow(), tab);
             page.send(&payload);
@@ -4481,7 +4540,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             }
         }
         InboundMessage::Draft { text, .. } => {
-            // Mirror the draft in Rust without sending a reply.
+            // A mirror, answered with nothing.
             state.borrow_mut().tabs.set_draft(tab_of(target), &text);
         }
         InboundMessage::HistoryPush { text, .. } => {
@@ -4628,8 +4687,9 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             Err(why) => refuse(page, why),
         },
         InboundMessage::CycleDefaultMode { .. } => {
-            // `Shift+Tab` on the chooser's `New session` row or a saved session cycles the window default.
-            // Like a tab's `CycleMode`, `Confirm` sends a y/n prompt answered by `confirm_bypass`.
+            // `Shift+Tab` on the chooser's `New session` row or a record: the window's
+            // remembered default, exactly as `CycleMode` remembers a tab's own mode above. `Confirm`
+            // dispatches the same y/n prompt, answered by a later `confirm_bypass` message.
             match cycle_default_mode(state) {
                 eitri_core::tab_set::ModeCycle::Changed(_) => {
                     send_tabs(state, page);
@@ -4661,7 +4721,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 Some(why) => refuse(page, why),
             }
         }
-        // C1's mirror: recorded so `main.rs`'s intercept can read it back through
+        // The nav-mode mirror: recorded so `main.rs`'s intercept can read it back through
         // `AgentPanelHandle::panel_keys`. Never refused -- an unrecognised `mode` is a parse
         // failure in `parse_inbound_message`, not something that reaches here.
         InboundMessage::PanelKeys { mode, .. } => {
@@ -4672,15 +4732,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             Ok(()) => ok(page),
             Err(why) => refuse(page, why),
         },
-        // `Ctrl+w h/j/k/l` in BROWSE moves focus just as `Ctrl+h/j/k/l` does.
+        // `Ctrl+w h/j/k/l` in the panel's BROWSE -- the move `Ctrl+h/j/k/l` make.
         InboundMessage::PaneNav { direction, .. } => match run_pane_nav(state, direction) {
             Ok(()) => ok(page),
             Err(why) => refuse(page, why),
         },
-        // `gx` opens a web link in the system browser. Rust checks the URL again with `web_url`
-        // before passing it to the launcher, even though `nav.ts#webUrl` checked it in the page.
-        // A refusal is logged because it indicates a page/Rust mismatch or an unexpected message.
-        // The address uses `{:?}` to escape characters a terminal could interpret.
+        // `gx` -- a web link out to the system browser. The page's own check
+        // (`nav.ts#webUrl`) is not trusted with what reaches the launcher: `web_url` decides again, and a
+        // refusal means a page/Rust mismatch or a page that should not be sending this, so it is logged
+        // (the address through `{:?}`, which escapes anything a terminal would act on).
         InboundMessage::OpenUrl { url, .. } => match web_url(&url) {
             Some(url) => {
                 // Cloned out of the borrow first: the host runs arbitrary code.
@@ -4727,20 +4787,22 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             let active = state_ref.tabs.active();
             state_ref.trust.command(request_id.clone(), action, active);
         }
-        // Handles `y`/`Y` for the bypass prompt. The client enforces the 250 ms
-        // `TYPING_GUARD_MS` delay and cancels on routes away. `apply_confirm_bypass` and
-        // `TabSet::confirm_bypass` recheck the nonce, the active tab and whether exactly the
-        // delivered cards are still pending.
+        // `y`/`Y` to the band's bypass prompt. The typed-input guard (the 250ms
+        // `TYPING_GUARD_MS` rule, cancelling on every route away) is enforced client-side
+        // -- this only re-validates the facts (the nonce, the active tab, exactly
+        // the delivered cards still pending) via `apply_confirm_bypass`/`TabSet::confirm_bypass`,
+        // which is where all of that is actually checked.
         InboundMessage::ConfirmBypass { tab, scope, nonce, .. } => match scope.scope(tab) {
             Err(why) => refuse(page, &why),
             Ok(scope) => {
                 let before = state.borrow().tabs.attention();
                 match apply_confirm_bypass(state, scope, nonce) {
                     Ok(eitri_core::tab_set::ConfirmOutcome::Entered { resolved, .. }) => {
-                        // The legacy CLI reports no event for a hook reply, so deliver the returned resolutions
-                        // here to remove approved cards immediately. Otherwise they remain visible and counted
-                        // until the next snapshot. Tab scope is always the active tab; window-default scope
-                        // approves no cards and returns an empty `resolved` list.
+                        // On legacy the approved cards' resolutions exist
+                        // only here (its CLI reports nothing for a hook reply), so without this the
+                        // cards stayed drawn and counted as waiting until the next snapshot. A tab
+                        // scope is always the active tab (`confirm_bypass` refuses any other); the
+                        // window-default scope approves nothing, so `resolved` is empty there.
                         let payload = {
                             let state_ref = state.borrow();
                             let active = state_ref.tabs.active();
@@ -4760,8 +4822,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                         ok(page);
                     }
                     Ok(eitri_core::tab_set::ConfirmOutcome::Reprompt(plan)) => {
-                        // A card arrived while the prompt was open. Keep the mode unchanged and show the updated
-                        // count with a fresh nonce.
+                        // A card arrived while the prompt was up -- nothing changed, and the
+                        // panel is shown the fresh count under a fresh nonce instead.
                         page.send(&eitri_core::agent_bridge::serialize_confirm_bypass_for_js(&plan));
                         ok(page);
                     }
@@ -4772,10 +4834,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
     }
 }
 
-/// Cycles the window default through `TabSet::cycle_default_mode` and persists only `Changed(Auto)`.
-/// Bypass is never written to disk, and `Confirm` writes nothing here.
-/// A write failure is logged without refusing the mode change that already took effect.
-/// This body avoids the WebView for testing; the message handler sends tabs and the prompt.
+/// `cycle_default_mode`: `TabSet::cycle_default_mode` plus remembering the new default on
+/// `Changed(Auto)` only -- bypass is never written, and a `Confirm` is not persisted here
+/// either (only actually entering bypass, via `apply_confirm_bypass` below, ever could -- and that is
+/// forbidden too). A failure to write is logged, not refused, since the mode itself did change.
+/// Never touches the WebView, so it is tested directly; the arm above owns `send_tabs` and
+/// dispatching the prompt.
 fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>) -> eitri_core::tab_set::ModeCycle {
     let outcome = state.borrow_mut().tabs.cycle_default_mode();
     if let eitri_core::tab_set::ModeCycle::Changed(mode) = outcome {
@@ -4792,9 +4856,11 @@ fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>) -> eitri_core::tab_s
     outcome
 }
 
-/// Handles `confirm_bypass` without a WebView so the message handler's call can be tested directly.
-/// `TabSet::confirm_bypass` checks the delivered cards, nonce, active tab and ended/failed state.
-/// Bypass is never persisted, so this wrapper only forwards the call.
+/// `confirm_bypass`: the `ConfirmBypass` arm's WebView-free body, the same split `cycle_default_mode`
+/// gets above. `TabSet::confirm_bypass` does all of the checking (the re-check against exactly the
+/// delivered cards, the nonce, the active tab, ended/failed) and bypass is never written to
+/// disk, so there is nothing else for this wrapper to do -- it exists so a test can drive the exact
+/// call the arm makes without a WebView, the same way `cycle_default_mode` can.
 fn apply_confirm_bypass(
     state: &Rc<RefCell<AgentPanelState>>,
     scope: eitri_core::tab_set::BypassScope,
@@ -4803,9 +4869,9 @@ fn apply_confirm_bypass(
     state.borrow_mut().tabs.confirm_bypass(scope, nonce)
 }
 
-/// Maps `tab_verb` from the wire shape and calls the hook `main.rs` installs through
-/// `on_tab_verb` for `run_tab_action`. Refuses with a reason if the hook is not wired yet.
-/// It never touches the WebView, so it can be tested directly.
+/// `tab_verb`: the hook `main.rs` installs via `on_tab_verb` (`run_tab_action`), mapped from the wire shape and called -- or a refusal naming why there is none yet (a
+/// legacy backend at startup, before `main.rs` has wired it). Never touches the WebView, so it is
+/// tested directly.
 fn run_tab_verb(state: &Rc<RefCell<AgentPanelState>>, verb: TabVerbWire) -> Result<(), &'static str> {
     // Cloned out in its own statement: a `state.borrow()` in the `match` scrutinee would live to
     // the end of the `match` (edition 2021), and the hook -- `main.rs`'s `run_tab_action` -- goes
@@ -4838,8 +4904,8 @@ fn run_nav_fallthrough(state: &Rc<RefCell<AgentPanelState>>, direction: NavKeyDi
     }
 }
 
-/// Routes `pane_nav` through the hook shared with `nav_fallthrough`.
-/// `main.rs` wires it to `move_focus(&ModuleId::agent(), direction)`, like `Ctrl+h/j/k/l`.
+/// `pane_nav`: the same hook `nav_fallthrough` uses -- `main.rs` installs it as
+/// `move_focus(&ModuleId::agent(), direction)`, exactly what `Ctrl+h/j/k/l` do from the panel.
 fn run_pane_nav(state: &Rc<RefCell<AgentPanelState>>, direction: PaneNavDirection) -> Result<(), &'static str> {
     let hook = state.borrow().nav_fallthrough_hook.clone();
     let hook = hook.ok_or("pane nav is not wired")?;
@@ -4872,14 +4938,14 @@ fn open_path_target(project_dir: &std::path::Path, path: &str) -> Result<std::pa
     Ok(resolved)
 }
 
-/// Checks which `open_url` values may be passed to `UriLauncher`.
-/// The page supplies a WHATWG-normalized `URL.href`; Rust strictly re-checks it without
-/// browser-style parsing. Accepts only ASCII with no whitespace, controls or backslashes,
-/// an HTTP or HTTPS scheme, and a host containing only letters, digits, dots and hyphens.
-/// The host must have no trailing dot and must differ from `PANEL_BASE_URI`'s host.
-/// An optional port must contain only digits. Scheme and host comparisons ignore case.
-/// Returns the input unchanged if accepted. Rejects `%`, `@`, `[`, non-ASCII and userinfo
-/// rather than guessing how a browser would normalize them.
+/// `open_url`: what a panel key may hand `UriLauncher`. The page sends a WHATWG-normalized
+/// `URL.href` (`nav.ts#webUrl`); no crate here parses the way a browser does (`url` is not a
+/// dependency), so this is a strict re-check instead of a parse: ASCII only, no whitespace, control
+/// character or backslash anywhere, an `http://` or `https://` scheme, and an authority that is a plain
+/// host -- letters, digits, `.` and `-` only, no trailing dot, not the panel's own `eitri.invalid`
+/// (`PANEL_BASE_URI`, where every relative link resolves) -- with an optional all-digit port. The scheme
+/// and host are compared lower-cased, and the input comes back unchanged: this only ever says yes or no.
+/// Anything a browser would re-normalize (`%`, `@`, `[`, non-ASCII, userinfo) is refused, not guessed at.
 fn web_url(url: &str) -> Option<&str> {
     if url
         .chars()
@@ -4971,7 +5037,7 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId)
                     );
                 }
             }
-            // Queued text is saved as history before the tab closes.
+            // The queued words outlive the tab as history.
             eitri_core::tabs::CloseStep::QueueToHistory => {
                 let texts = state.borrow().tabs.queue_texts(tab);
                 remember_prompts(state, page, &texts);
@@ -5069,9 +5135,8 @@ mod tests {
         );
     }
 
-    /// Checks that a stopped-sidecar reason keeps its own wording without the guess that
-    /// the session no longer exists. A stopped connection does not imply the conversation
-    /// or its transcript is gone.
+    /// A stopped sidecar does not imply that the conversation or transcript no longer exists.
+    /// Keep its stop reason without adding the "most likely no longer exists" guess.
     #[test]
     fn a_stopped_sidecar_reason_gets_no_never_opened_guess() {
         let reason = format!(
@@ -5151,8 +5216,9 @@ mod tests {
             .collect()
     }
 
-    /// `SESSION_CLOSE_BACKSTOP` covers both the `close_session` unary RPC and the sidecar's
-    /// reaping of its CLI child, with margin so drop normally finishes before the backstop.
+    /// `SESSION_CLOSE_BACKSTOP` must cover both the `close_session` unary RPC and the
+    /// sidecar's own reap of the `claude` CLI it owns, with margin -- so the drop normally finishes
+    /// inside this backstop rather than racing it.
     #[test]
     fn the_close_backstop_covers_a_close_rpc_and_the_sidecars_reap() {
         assert!(
@@ -5181,9 +5247,9 @@ mod tests {
         let (other_provider, backend) = live_backend(&dir);
         set.get_mut(other).unwrap().backend = TabBackend::Live(backend);
         assert_eq!(set.active(), other, "the user has switched away");
-        // `perm-1` must be pending on the asking tab: a conversation refuses answers to permissions
-        // it never requested. Writing `.git/main.rs` needs confirmation and leaves a card for the test.
-        // An ordinary in-project `Write` would take the acceptEdits fast path without creating a card.
+        // `perm-1` must be pending on the asking tab because a conversation refuses unsolicited answers.
+        // Use a Write to `.git/main.rs` so the pump leaves a permission card. An ordinary in-project
+        // Write takes the acceptEdits fast path and would not produce the card this test needs.
         asking_provider.queue(agent::AgentDomainEvent::PermissionRequested {
             permission_id: "perm-1".into(),
             tool_use_id: None,
@@ -5220,9 +5286,8 @@ mod tests {
         }
     }
 
-    /// O3 review #4: the panel's own `permission_response` route records the human's approval, so the
-    /// CLI's own prompt for the same call that follows it is answered without a second card (ruling
-    /// 5). Were the route to answer the backend directly, this would be a second card.
+    /// The panel's own `permission_response` route records the human's approval, so the
+    /// CLI's own prompt for the same call that follows it is answered without a second card. Were the route to answer the backend directly, this would be a second card.
     #[test]
     fn the_panels_approve_route_lets_the_clis_own_prompt_for_that_call_through() {
         agent::state_dirs::redirect_state_to_a_test_root();
@@ -5289,9 +5354,9 @@ mod tests {
         }
     }
 
-    /// Keeps a closed tab in panel state until its teardown or connect finishes, so the
-    /// window-close backstop can still see it. Returns a connecting tab's pending command
-    /// so it can be answered.
+    /// A tab closed while the window stays open is kept in panel state
+    /// until its teardown or connect finishes, so the window-close backstop can see it; and the
+    /// command a connecting tab still owed is handed back to be answered.
     #[test]
     fn a_closed_tabs_teardown_and_connect_are_kept_until_they_finish() {
         agent::state_dirs::redirect_state_to_a_test_root();
@@ -5771,10 +5836,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// With no WebView because the sandbox cannot start, window calls still run without a display
-    /// or panic. Focus, HINT, prefix, tab, theme, zoom and close calls leave the handle inert.
-    /// Tab verbs refuse so the prefix flashes. `panel_keys` stays `Other`, leaving `Ctrl+j` and
-    /// `Ctrl+k` free to move focus, and the chat reports no attention.
+    /// With no page (WebKit's sandbox cannot
+    /// start, so no `WebView` exists), every call `main.rs`'s focus, HINT, prefix, tab-verb, theme,
+    /// zoom and close paths make still runs -- none panics, none needs a display -- and nothing that
+    /// only a page could act on happens: no tab is opened or switched to (the verbs refuse, so the
+    /// prefix flashes), `panel_keys` never leaves `Other` (so `Ctrl+j`/`Ctrl+k` are never claimed for
+    /// a composer that does not exist and always move focus), and the chat owes no attention.
     #[test]
     fn a_panel_with_no_page_answers_every_window_call_and_does_nothing_a_page_would() {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
@@ -5847,9 +5914,10 @@ mod tests {
         assert!(!handle.poll_activate());
     }
 
-    /// Checks that `tab_verb` refuses with a reason until `main.rs` installs a hook through
-    /// `AgentPanelHandle::on_tab_verb`. Once installed, the hook receives the mapped
-    /// `TabAction` for every wire value, covering the full mapping.
+    /// `tab_verb` refuses naming why until `main.rs` installs a hook
+    /// (`AgentPanelHandle::on_tab_verb`), and once one is installed it is called with the mapped
+    /// `TabAction` -- every wire value, not just one, since a mapping this exhaustive is easy to
+    /// get wrong silently for the one case nobody wrote a test for.
     #[test]
     fn tab_verb_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_action() {
         let state = state_for_hooks(TabSet::new(
@@ -5878,9 +5946,9 @@ mod tests {
         }
     }
 
-    /// The product hook (`main.rs`'s `run_tab_action`) re-enters this same state with `borrow_mut`
-    /// (`switch_with`, `new_tab`). `run_tab_verb` must release its borrow before calling the hook,
-    /// or panel tab keys panic on the GTK thread.
+    /// The product hook (`main.rs`'s `run_tab_action`) re-enters this
+    /// same state with `borrow_mut` (`switch_with`, `new_tab`). `run_tab_verb` must not still hold
+    /// its own borrow while the hook runs, or every panel tab key panics on the GTK thread.
     #[test]
     fn tab_verb_hook_may_borrow_the_panel_state_mutably() {
         let state = state_for_hooks(TabSet::new(
@@ -5901,7 +5969,7 @@ mod tests {
         assert_eq!(*ran.borrow(), 1);
     }
 
-    /// C1's mirror: `handle_inbound_message`'s `PanelKeys` arm is what
+    /// The nav-mode mirror: `handle_inbound_message`'s `PanelKeys` arm is what
     /// `AgentPanelHandle::panel_keys` reads back, and it starts `Other`.
     #[test]
     fn a_panel_keys_message_updates_the_mirror_handle_inbound_message_records() {
@@ -5916,12 +5984,10 @@ mod tests {
         }
     }
 
-    /// The navigation mirror starts at `Other` and returns there on every `ready`, including reloads.
-    /// The `Ready` arm of `handle_inbound_message` needs a real `WebView` for `dispatch_all` and `ok`,
-    /// so this tests its state mutation, `reset_nav_mode_for_ready`, directly.
-    /// A stale `Input` mirror after reload would disagree with the fresh document's BROWSE mode.
-    /// Then `claims(PanelKeys::Input, Direction::Down)` would be false, and `Ctrl+j` intended to
-    /// open the composer would fall through to `move_focus`.
+    /// The navigation-mode mirror starts at `Other` and resets to `Other` on every `ready`.
+    /// Test reset_nav_mode_for_ready directly because the Ready handler needs a real WebView.
+    /// A stale `Input` value after reload would make `claims(PanelKeys::Input, Direction::Down)`
+    /// return false, sending Ctrl+j to move_focus instead of opening the composer.
     #[test]
     fn ready_resets_the_nav_mode_mirror_to_other() {
         let state = state_for_hooks(TabSet::new(
@@ -5939,9 +6005,9 @@ mod tests {
         }
     }
 
-    /// Clear a crashed or replaced page's BROWSE/INPUT mode immediately.
-    /// The give-up document never sends `ready`, so waiting for it would leave stale navigation state.
-    /// Test the helper shared by page_gone and reload_document without constructing a WebView.
+    /// A crashed or replaced page's BROWSE/INPUT is
+    /// forgotten at once, not at a `ready` the give-up document never sends. `page_gone`
+    /// and `reload_document` are exercised against a recording page elsewhere; this pins the call they both make.
     #[test]
     fn a_dead_pages_nav_mode_is_forgotten_before_any_ready() {
         let state = state_for_hooks(TabSet::new(
@@ -5983,10 +6049,11 @@ mod tests {
         }
     }
 
-    /// `pane_nav` uses the same hook as `nav_fallthrough`, calling `move_focus` from the agent module,
-    /// so `Ctrl+w h/j/k/l` moves focus like `Ctrl+h/j/k/l` from the panel. It refuses until the hook
-    /// is installed, then calls it once per message with the mapped `Direction` for each wire value.
-    /// The hook handles directions with no neighboring module.
+    /// `pane_nav` runs the very hook `nav_fallthrough` does -- `main.rs`'s
+    /// `move_focus(&ModuleId::agent(), direction)` -- so `Ctrl+w h/j/k/l` moves the keys exactly as
+    /// `Ctrl+h/j/k/l` do from the panel. A refusal naming why until `main.rs` installs it, then called
+    /// with the mapped `Direction`, once per message, for all four wire values (the move is left to
+    /// the hook: a side with no module is its business, not this function's).
     #[test]
     fn pane_nav_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_direction() {
         let state = state_for_hooks(TabSet::new(
@@ -6041,9 +6108,10 @@ mod tests {
         assert!(state.borrow().pane_focused);
     }
 
-    /// The URLs `gx` may pass to `UriLauncher` include queries, fragments, ports, numeric hosts,
-    /// punycode hosts, and `@` after the host's slash. The page normally sends normalized `URL.href`.
-    /// Uppercase input is checked case-insensitively and returned unchanged.
+    /// The addresses `gx` may hand `UriLauncher`. The page sends a normalized
+    /// `URL.href`, so these are what a browser writes: a query, a fragment, a port, a numeric host, a
+    /// punycode one, an `@` after the host's slash. An upper-case spelling (which only a page that did not
+    /// normalize would send) is judged as its lower-case self and returned unchanged, never rewritten.
     #[test]
     fn web_url_accepts_plain_http_and_https_links() {
         for url in [
@@ -6144,8 +6212,9 @@ mod tests {
         }
     }
 
-    /// Entering bypass from Auto always asks for confirmation and never persists bypass.
-    /// Leaving bypass returns to Auto, which is persisted.
+    /// Bypass is never remembered on disk: `save_mode` refuses it outright. Auto -> bypass
+    /// always asks first and writes nothing either way; only leaving bypass (always to Auto,
+    /// which is allowed) is ever remembered.
     #[test]
     fn cycle_default_mode_moves_the_default_and_remembers_auto_only_on_disk() {
         let dir = agent::state_dirs::test_workspace_dir("panel-cycle-default-mode");
@@ -6173,8 +6242,8 @@ mod tests {
             "nothing on disk yet"
         );
 
-        // `apply_confirm_bypass` delegates to `TabSet::confirm_bypass` to confirm the change.
-        // It updates the in-memory default and writes nothing to disk.
+        // Confirming is `apply_confirm_bypass`'s job, which is `TabSet::confirm_bypass`
+        // and nothing else -- it moves the in-memory default and still writes nothing.
         assert_eq!(
             apply_confirm_bypass(&state, plan.scope, plan.nonce),
             Ok(eitri_core::tab_set::ConfirmOutcome::Entered {
@@ -6192,7 +6261,7 @@ mod tests {
             "still nothing on disk while bypass"
         );
 
-        // Leaving bypass changes the mode to Auto immediately and persists it.
+        // Leaving bypass moves at once and IS remembered -- it is Auto, which is allowed.
         assert_eq!(
             cycle_default_mode(&state),
             eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto)
@@ -6211,8 +6280,9 @@ mod tests {
         state.borrow().tabs.get(tab).unwrap().mode()
     }
 
-    /// `apply_confirm_bypass` changes a tab's own mode as well as handling the window default.
-    /// Entering bypass never writes the mode to the preferences directory.
+    /// `apply_confirm_bypass` -- the `ConfirmBypass` arm's WebView-free body -- moves a
+    /// TAB's own mode (not only the window default the test above covers) and, like every path into
+    /// bypass, never writes it to the prefs dir either way.
     #[test]
     fn apply_confirm_bypass_moves_a_live_tabs_mode_and_never_touches_prefs() {
         let dir = agent::state_dirs::test_workspace_dir("panel-apply-confirm-bypass-tab");
@@ -6245,12 +6315,13 @@ mod tests {
         );
     }
 
-    /// Entering bypass on a legacy tab approves waiting cards through `respond_permission`.
-    /// The legacy CLI reports no hook-reply event, so its returned `PermissionResolved` events
-    /// must travel in `ConfirmOutcome::Entered::resolved` and reach the panel through this path.
-    /// The panel removes cards on `permission_resolved`. The backend test
-    /// `approve_pending_keeps_the_resolutions_a_legacy_answer_returns` checks that the returned
-    /// resolutions are retained; this test checks their delivery to the panel.
+    /// Entering bypass on a legacy tab approves its waiting cards through
+    /// `respond_permission`, whose `PermissionResolved` exists nowhere but in what it returns (the CLI
+    /// reports nothing for a hook reply). `ConfirmOutcome::Entered::resolved` now carries it, and the
+    /// `ConfirmBypass` arm hands it to the panel through this function -- the only event that takes a
+    /// card off the panel's screen (`reducer.ts`'s `permission_resolved`). A real
+    /// `AgentBackend::Legacy` needs a real `claude` process, so the half that FILLS `resolved` is
+    /// `eitri-core`'s `approve_pending_keeps_the_resolutions_a_legacy_answer_returns`.
     #[test]
     fn a_resolution_entering_bypass_returned_reaches_the_panel_payload() {
         let mut set = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
@@ -6279,9 +6350,10 @@ mod tests {
         assert!(returned_events_payload(&state.borrow(), active, &[]).is_none());
     }
 
-    /// Losing pane focus drops any outstanding bypass prompt, just as switching tabs does.
-    /// This tests `TabSet::drop_bypass_prompt`, the WebView-free part of `set_pane_focused(false)`.
-    /// A later `y` is refused by its nonce instead of reaching a tab no longer on screen.
+    /// The pane losing the keys entirely -- the WebView-free half of
+    /// `set_pane_focused(false)`, `TabSet::drop_bypass_prompt` -- drops an outstanding bypass
+    /// prompt the same way switching tabs already does, so a `y` that slips through afterwards is
+    /// refused by the nonce rather than landing on a tab no longer on screen.
     #[test]
     fn a_bypass_prompt_dropped_by_a_focus_loss_refuses_a_later_confirm() {
         let set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
@@ -6331,7 +6403,7 @@ mod tests {
         assert_eq!(finished, 2);
     }
 
-    /// Defect 7 (phase 2's sandbox pass): the first tick dispatched `tabs` into a page that had not
+    /// The first tick dispatched `tabs` into a page that had not
     /// loaded. A window-level envelope goes out only once the document said `ready`, and one held
     /// back is not recorded as sent, so it still goes out once it is.
     #[test]
@@ -6586,8 +6658,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Checks that only an allow can remember a rule, and that the rule comes from what
-    /// Rust offered for the card rather than from the panel.
+    /// The rule comes from what Rust offered for that card, never from the panel, and only
+    /// with an allow.
     #[test]
     fn remember_saves_only_the_rule_rust_offered_and_only_with_an_allow() {
         use eitri_core::agent_bridge::DecisionChoice;
@@ -6620,8 +6692,9 @@ mod tests {
         );
     }
 
-    /// An already answered request saves no rule even if its offer remains in `rule_offers`.
-    /// Offers are only recomputed once per pump tick.
+    /// A request that is no longer pending -- because it was
+    /// already answered -- saves no rule, even though the offer Rust made for it may still be
+    /// sitting in `rule_offers` (the offer is only recomputed once per pump tick).
     #[test]
     fn a_no_longer_pending_request_saves_no_rule_even_if_still_offered() {
         use eitri_core::agent_bridge::DecisionChoice;
@@ -6638,11 +6711,13 @@ mod tests {
         );
     }
 
-    /// `answer_permission_response` must reject repeated answers even before the provider's event
-    /// updates the projection. A projection read alone cannot detect that interval.
-    /// The first successful answer removes the rule offer and marks the card answered through
-    /// `TabSet::answer_card`, regardless of the decision. A later pump that recomputes offers for
-    /// another permission must not restore the answered card's offer.
+    /// The sidecar's own longer window, through the production route
+    /// (`answer_permission_response`, the whole `permission_response` arm): `respond_permission`'s
+    /// own resolution is not folded into the projection until the provider's real event arrives
+    /// (`AgentConversation::respond_permission`'s own doc), so a projection read alone cannot catch
+    /// a second response landing before that. The first successful answer, whatever its decision,
+    /// drops the offer and marks the card answered (`TabSet::answer_card`), and the next pump, which recomputes offers because another id arrived, does
+    /// not bring it back.
     #[test]
     fn an_answered_cards_offer_never_comes_back_and_a_replayed_remember_saves_nothing() {
         agent::state_dirs::redirect_state_to_a_test_root();
@@ -6793,8 +6868,8 @@ mod tests {
         assert_eq!(kinds(&payloads), vec!["hello", "theme", "keymap", "tabs", "snapshot"]);
     }
 
-    /// Checks that `hello` excludes sessions open in any tab and sessions handed off from
-    /// a tab from its resume offers.
+    /// `hello` offers no session that is open in a tab, and still
+    /// drops a session a tab handed off (the older rule, now per tab).
     #[test]
     fn hello_offers_no_session_that_is_open_in_a_tab() {
         let mut greeting = legacy_greeting();
@@ -7096,8 +7171,8 @@ mod tests {
         );
     }
 
-    /// The first `ready` displays the empty tab's New session dashboard, without opening the chooser.
-    /// `ready_payloads` supplies all messages sent in response to `ready`.
+    /// The first
+    /// `ready` draws the empty tab's dashboard, never the chooser -- `ready_payloads` is all a `ready` sends now.
     #[test]
     fn a_ready_sends_no_chooser() {
         assert!(!kinds(&ready_payloads(

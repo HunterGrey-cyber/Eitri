@@ -227,7 +227,8 @@ mod tests {
         assert_eq!(classify(Key::space, ModifierType::empty()), key("Space"));
     }
 
-    /// Modified arrows and named keys must classify and run instead of becoming `Other`.
+    /// Named and modified keys (Ctrl+Up, Alt+Up, Alt+1, F11, ...) must classify: under the old one-character key
+    /// representation they were all `Other` and could never be bound.
     #[test]
     fn ctrl_up_alt_up_up_alt_1_and_f11_classify_and_run() {
         let t = Instant::now();
@@ -289,7 +290,8 @@ mod tests {
         );
     }
 
-    /// CapsLock still permits the prefix, and Shift is preserved on named keys.
+    /// Caps Lock does not change the chord (`C-b` with Lock still arms), and Shift stays on a named key, so `S-Up` is
+    /// its own unbound key and never `select.up`.
     #[test]
     fn capslock_still_arms_and_shift_is_kept_on_named_keys() {
         let t = Instant::now();

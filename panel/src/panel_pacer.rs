@@ -24,9 +24,10 @@ pub trait Sink {
     fn send(&self, payload: &str);
 }
 
-/// The tab and turn whose first text this stream envelope carries (`submitted_at` in the trace).
-/// Keep them with the envelope because a flush may release it after the active tab or turn changes.
-/// A `tabs` dispatch after `prefix n` must not assign tab A's stamp to tab B.
+/// Whose first text a stream envelope carries: the tab it was pumped for and that tab's turn
+/// (the trace's `submitted_at`). Kept with the envelope because by the time a flush releases it the
+/// active tab, or the tab's turn, may be another one (a `tabs` dispatch after
+/// `prefix n` used to hand tab A's stamp to tab B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirstText {
     pub tab: TabId,
@@ -473,9 +474,10 @@ mod tests {
         );
     }
 
-    /// Tab A's first text is held, then `prefix n` switches to tab B and its `tabs` dispatch flushes it.
-    /// The stamp still names A and A's turn, regardless of which tab is active when the pump reads it.
-    /// A `turn_rendered` handler can take the stamp before that tick without clearing the pump's `any`.
+    /// Tab A's first text is held, `prefix n` switches to tab B and its `tabs`
+    /// dispatch flushes A's text. The stamp names A (and A's turn), whatever tab is active when the
+    /// pump reads it; and a `turn_rendered` handler can take it before that tick does, leaving the
+    /// pump's `any` alone.
     #[test]
     fn a_first_text_released_by_another_tabs_dispatch_still_names_its_own_tab() {
         let (mut pacer, t0) = typing_pacer(Some(8));

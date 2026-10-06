@@ -1,19 +1,24 @@
-//! Guards against repeated `WebView` crashes causing a tight reload loop.
-//! `webkit6::WebView::connect_web_process_terminated` reports when a page's render
-//! process dies. Reloading can recover a crashed page, but unconditional retries
-//! can pin a CPU core when a page cannot finish loading, for example after a
-//! driver failure or memory exhaustion.
+//! A guard against a `WebView`-crash loop (2026-09-27):
+//! `webkit6::WebView::connect_web_process_terminated` fires whenever a hosted page's own render
+//! process dies (a real WebKit crash, or the host running out of memory), and the right response
+//! is to reload the page -- both the agent panel and a Lua panel already have a working "reload
+//! the document, keep everything else" recovery path (`eitri_panel::agent_panel::AgentPanelHandle::reload_document`,
+//! and `shell::lua::panel`'s revive-on-next-show `load_uri`), just never wired to this signal.
+//! Reloading unconditionally would turn a page that cannot even finish loading (a
+//! driver bug, a genuinely out-of-memory host) into a tight crash/reload loop that pins a CPU core
+//! forever and never leaves the user anything to read.
 //!
-//! The agent panel reloads through `shell::agent_panel::AgentPanelHandle::reload_document`.
-//! A Lua panel recovers through `shell::lua::panel`'s `load_uri` when next shown.
-//! This module separates crash timing and retry decisions from GTK/WebKit call sites,
-//! allowing those decisions to be unit-tested without a display.
+//! This module is the pure decision -- how many crashes in how long counts as "a loop", and what
+//! to do once that line is crossed -- kept apart from the GTK/WebKit call sites so it is
+//! unit-tested without a display, the same split `shell::webkit_zoom` uses for its own WebKit-
+//! adjacent arithmetic.
 //!
-//! `WebProcessTerminationReason::TerminatedByApi` is a deliberate termination.
-//! `shell::main`'s `kill_pane` calls `WebView::terminate_web_process()` when the user
-//! hides a Lua module with `prefix x`. That module reloads when shown again, so an
-//! automatic reload must not race the deliberate termination. Both call sites
-//! check the termination reason before consulting the guard.
+//! **`WebProcessTerminationReason::TerminatedByApi` is never a crash to guard against.** It is
+//! WebKit's own name for a *deliberate* `WebView::terminate_web_process()` call -- `shell::main`'s
+//! `kill_pane` calls it on a Lua panel's `WebView` when the user explicitly hides that module
+//! (`prefix x`), which already has its own recovery (`load_uri` runs again when the module is
+//! shown), and must not race a second, automatic reload against that deliberate kill. Both call
+//! sites check the reason before ever asking a guard.
 
 use std::time::{Duration, Instant};
 

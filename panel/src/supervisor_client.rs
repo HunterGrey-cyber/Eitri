@@ -10,7 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use supervisor::{AgentStatus, ShellMessage, SupervisorMessage};
 
-/// One status per window: the most urgent tab's status. The dashboard does not show per-tab rows.
+/// One status per window, now that a window holds several sessions: the most urgent tab's. Per-tab rows in the dashboard are a follow-on.
 pub fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) -> AgentStatus {
     fn rank(status: AgentStatus) -> u8 {
         match status {
@@ -27,9 +27,10 @@ pub fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) -> Agen
         .unwrap_or(AgentStatus::NoSession)
 }
 
-/// Maps an optional session projection to dashboard status. A tab has no backend until its first
-/// send or resume, or after backend failure; `None` maps to `NoSession`.
-/// Called once per tab; `aggregate_status` picks the window's status.
+/// The pure mapping from a session's projection to the dashboard's status, checked in the exact stated order. Takes
+/// `Option<&AgentSessionProjection>` rather than the state directly because a session tab has no
+/// backend until its first send or resume (and none once it failed); `None` here means exactly
+/// that (the `no_session` status). One call per tab; `aggregate_status` picks the window's.
 pub fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus {
     let Some(projection) = projection else {
         return AgentStatus::NoSession;
@@ -94,16 +95,27 @@ fn retry_schedule() -> Vec<u64> {
     vec![25, 50, 100, 200, 400, 800, 1600, 1600, 1600, 1600]
 }
 
-/// Whether this window may start the supervisor when none is listening. Defaults to false so
-/// launching `shell` does not open an unsolicited dashboard window. Connecting to an already open
-/// supervisor remains unconditional, so it still receives this window's status.
+/// Whether this window may *start* `eitri-supervisor` when none is listening.
 ///
-/// Takes the raw variable instead of reading the environment, like `BackendKind::choose`, so tests
-/// can cover the input matrix without mutating process-global state shared by other tests.
+/// **Default: no (changed 2026-09-19).**
+/// Until then, the first `shell` launch on a machine put a second, unasked-for GTK window on the
+/// screen -- a dashboard nobody had opened, belonging to a feature the user had not invoked.
 ///
-/// Unrecognised values return false and leave the dashboard closed. `BackendKind::from_env`
-/// warns about typos because it still selects a backend; here a typo simply leaves a window closed,
-/// which the user can see and correct.
+/// Connecting is unaffected and is still unconditional: a supervisor the user *has* opened still
+/// gets this window's status, so the dashboard works exactly as before for anyone who wants it.
+/// What changed is only who decides it should exist. That distinction is the whole point -- the
+/// old behaviour conflated "use the dashboard if it is there" with "there should be a dashboard",
+/// and only the second one is a decision.
+///
+/// Takes the raw variable rather than reading the environment, the same reason
+/// `BackendKind::choose` does: the matrix is then testable without mutating a process-global that
+/// every other test in the binary shares.
+///
+/// Anything unrecognised is `false`. This is the safe direction and the opposite of the one
+/// `BackendKind::from_env` picks for its own typos, deliberately: a typo there still selects a
+/// *backend* (the sidecar, with a warning -- it used to
+/// fall to legacy instead, before legacy became the gated backend), so it warns; a typo here
+/// silently declines to open a window, which the user can see and correct by looking at the screen.
 fn spawn_requested(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1" | "true" | "yes"))
 }
@@ -134,9 +146,10 @@ impl SupervisorClient {
         match supervisor::locate_supervisor_binary() {
             Ok(binary) => {
                 let mut command = std::process::Command::new(&binary);
-                // Detach the persistent supervisor: `shell` must not wait on it directly or give it this
-                // process's stdio or process group. Null stdio keeps GTK/a11y output out of the launching terminal;
-                // a separate process group keeps Ctrl+C in that terminal from killing the supervisor.
+                // A detached, persistent background process -- `shell` never waits on
+                // it directly and must not inherit its stdio (GTK/a11y noise landing in this
+                // process's own terminal) or its process group (a Ctrl+C in the launching
+                // terminal must not also kill the "persistent" supervisor).
                 command
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())

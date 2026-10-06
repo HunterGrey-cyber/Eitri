@@ -1,5 +1,5 @@
 //! One window's session tabs: one conversation, and so one `AgentBackend`,
-//! per tab, every one of them running. GTK-free: `shell::agent_panel` spawns the connect and
+//! per tab, every one of them running. GTK-free: `eitri_panel::agent_panel` spawns the connect and
 //! handoff workers and hands this set their receivers; the 33 ms tick calls [`TabSet::pump`], which
 //! drains EVERY tab -- `take_ui_delivery` is where the permission policy answers what needs no
 //! human, so a tab that was not pumped would stall on its first `Read`.
@@ -33,7 +33,7 @@ pub struct FirstTurn {
     pub typed: String,
 }
 
-/// A backend being constructed on a worker. See `shell::agent_panel`'s connect worker.
+/// A backend being constructed on a worker. See `eitri_panel::agent_panel`'s connect worker.
 pub struct PendingStart {
     /// The command (`send_message` or `resume`) whose `command_result` is owed when it finishes.
     pub request_id: String,
@@ -483,7 +483,7 @@ pub struct PumpOutput {
     pub offers_changed: Vec<TabId>,
     /// Tabs failed this tick because their CLI reported an ungated permission mode, with each
     /// backend removed for shutdown. The caller shuts them down off the GTK thread, as it does for
-    /// closed tabs (`shell::agent_panel`'s `Retiring::backend`).
+    /// closed tabs (`eitri_panel::agent_panel`'s `Retiring::backend`).
     pub tripped: Vec<Tripped>,
     /// Turns whose end snapshot landed this tick, for the status band (empty without a turn
     /// review installed).
@@ -2386,7 +2386,7 @@ impl TabSet {
     ///
     /// `take_all` leaves the set without tabs, so `active_tab()` would panic afterwards. Only the
     /// close path calls it, after setting `shutting_down`, and nothing reads the set after that
-    /// (`shell::agent_panel` checks `shutting_down` first on every path that reaches the set).
+    /// (`eitri_panel::agent_panel` checks `shutting_down` first on every path that reaches the set).
     pub fn take_all(&mut self) -> Vec<Tab> {
         self.closing = true;
         for tab in &mut self.tabs {
@@ -3634,7 +3634,7 @@ mod tests {
             "the old session's snapshot covers more revisions than the new one will reach below"
         );
 
-        // As `shell::agent_panel` retires a session whose command failed fatally.
+        // As `eitri_panel::agent_panel` retires a session whose command failed fatally.
         let old = std::mem::replace(
             &mut set.get_mut(tab).unwrap().backend,
             TabBackend::Failed {

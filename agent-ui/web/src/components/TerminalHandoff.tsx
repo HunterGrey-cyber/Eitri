@@ -3,7 +3,7 @@ import { Row } from "./Row";
 
 /** Why "continue in a terminal" cannot be used right now, or `null` when it can.
  *
- * Mirrors `shell/src/terminal_handoff.rs`'s `prepare_handoff`, and is deliberately a second
+ * Mirrors `panel/src/terminal_handoff.rs`'s `prepare_handoff`, and is deliberately a second
  * implementation of one rule rather than a value sent over the wire -- the same arrangement
  * `reducer.ts` has with the Rust projection. Rust is the enforcement: it refuses the command even
  * if this returns `null` wrongly. This is the affordance: it stops the control being offered at all,

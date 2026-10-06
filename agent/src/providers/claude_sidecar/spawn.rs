@@ -1,5 +1,5 @@
 //! Locates, builds if necessary, and spawns Verdandi's `apps/claude-sidecar` Node.js process --
-//! deliberately NOT reusing `shell/src/supervisor_client.rs`'s spawn pattern wholesale. Two real,
+//! deliberately NOT reusing `panel/src/supervisor_client.rs`'s spawn pattern wholesale. Two real,
 //! verified differences from that pattern (see this plan's "Verified facts", points 5 and 6):
 //!
 //! 1. `apps/claude-sidecar/dist/` is gitignored in Verdandi, not committed -- a git-dependency

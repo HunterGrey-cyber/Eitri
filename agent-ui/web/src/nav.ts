@@ -23,7 +23,7 @@ export const STOP_ATTR = "data-nav-stop";
  *  The `gf` path picker and `gx` link picker reuse it for their letter labels. */
 export const HINT_ALPHABET = "asdjklghweruio";
 
-/** a web link as `web_url` (`shell/src/agent_panel.rs`) will re-check it -- `http(s)`
+/** A web link as `web_url` (`panel/src/agent_panel.rs`) will re-check it -- `http(s)`
  *  by the WHATWG parser with no base (the parser the browser opens it with, so `https://%65itri.invalid/x`
  *  and `https:\\eitri.invalid\x` are what they really are), no userinfo, a plain `[a-z0-9.-]` host with
  *  no trailing dot that is not the panel's own `eitri.invalid` (where every relative link resolves), and

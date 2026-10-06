@@ -1,26 +1,25 @@
-//! Eligibility and command construction for continuing a conversation in a terminal.
-//! This module produces a raw/manual command and takes no lease. The displayed command carries
-//! a concurrency warning because the same session can still be resumed elsewhere.
+//! Produces a manual terminal resume command after the panel session has closed.
 //!
-//! `agent::handoff::prepare_eitri_to_cli_handoff` launches `eitri-claude-handoff` as a direct
-//! child with an already-locked lease descriptor and the caller's stdio. The GUI has no terminal
-//! to give it: desktop-launcher stdio is not a terminal, and stdio under `cargo run` is still
-//! used by the GUI's diagnostics. Sharing it with an interactive child would mix their output.
+//! This module starts no process and takes no lease. `shell` is a GUI process without a dedicated
+//! terminal to hand over: desktop-launcher stdio may not be a terminal, and a cargo run terminal
+//! also carries the shell's diagnostics.
 //!
-//! Passing a lease through an emulator requires assurance that its child inherits the same
-//! descriptor. `fcntl(fd, F_GETFD)` checks only whether a descriptor number is open; if that
-//! number is reused for another file, the check passes without proving the lease is held.
-//! This path does not launch an emulator or call the direct-child handoff helper.
+//! `agent::handoff::prepare_eitri_to_cli_handoff` instead spawns `eitri-claude-handoff` directly
+//! with the locked lease descriptor and the caller's stdio inherited. Passing that descriptor
+//! through an arbitrary terminal emulator has no verified descriptor-preservation guarantee.
+//! A reused descriptor number could pass `fcntl(fd, F_GETFD)` without referring to the lease.
 //!
-//! `agent_panel` closes the active session and waits for shutdown before showing the command,
-//! so the panel has stopped driving the session when the user receives it. No projection or
-//! provider session ID is persisted on this path: the worker calls `AgentBackend::shutdown()`
-//! and drops the backend. The default legacy backend cannot resume and reports `resumable: None`
-//! from `BackendGreeting::for_kind`.
+//! The command is shown explicitly as a raw/manual path with a concurrency warning.
+//! No lease prevents this workspace from resuming the same session, and even a lease cannot
+//! prevent an external `claude --resume` from doing so.
 //!
-//! `AgentPanelState::last_handoff` retains the resulting `ClaudeResumeCommand` in the Rust host
-//! and supplies it again after a document reload. This retains the command; the conversation
-//! transcript is no longer available in the panel.
+//! `agent_panel` closes the session and waits for shutdown before showing the command.
+//! The shutdown worker calls `AgentBackend::shutdown()` and drops the backend; this path writes
+//! no projection. The default legacy backend cannot resume and advertises `resumable: None`.
+//! `AgentPanelState::last_handoff` keeps the `ClaudeResumeCommand` in Rust so a reloaded page can
+//! show it again. This retains the command, not the conversation transcript.
+//!
+//! The direct handoff helper has no consumer here because it requires a caller-owned terminal.
 
 use agent::handoff::{ClaudeResumeCommand, ResumeCommandError};
 use std::path::Path;
@@ -191,8 +190,8 @@ mod tests {
         );
     }
 
-    /// An in-flight turn must finish or be interrupted before the session is closed.
-    /// Handing off mid-turn would close the session out from under a running turn.
+    /// Handoff step 2: an in-flight turn is finished or interrupted BEFORE the session is
+    /// closed. Handing off mid-turn would close the session out from under a running turn.
     #[test]
     fn a_turn_in_flight_blocks_the_handoff_rather_than_cutting_it_short() {
         let refusal = prepare_handoff(

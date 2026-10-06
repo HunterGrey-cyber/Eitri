@@ -115,9 +115,10 @@ use webkit6::{UserContentManager, WebView};
 #[path = "support/own_x_server.rs"]
 mod own_x_server;
 
-/// The product's `PANEL_BASE_URI`, duplicated because this crate has no `[lib]` target
-/// through which an integration test can import it. `panel_stream_scroll.rs` duplicates
-/// `themed_document` for the same reason. `panel_base_uri_matches_product` checks equality.
+/// `panel/src/panel_document.rs`'s own `const PANEL_BASE_URI`, duplicated:
+/// this crate has no `[lib]` target an integration test can reach a private item through, the same
+/// reason `panel_stream_scroll.rs` duplicates `themed_document` rather than importing it.
+/// `panel_base_uri_matches_product` (below) pins the two equal.
 const PANEL_BASE_URI: &str = "https://eitri.invalid/";
 
 /// `Harness::clear_clipboard`'s own marker: a string no real copy in this replay could ever produce.
@@ -522,8 +523,8 @@ impl Harness {
         pump(30);
     }
 
-    /// Reads text back from GDK's clipboard to verify the copy itself,
-    /// rather than the page's `writeText` wrapper or flash message.
+    /// Reads the GDK clipboard's own text back: never the page's own
+    /// `writeText` wrapper, never the flash.
     fn read_clipboard(&self, timeout_ms: u64) -> Option<String> {
         let display = gtk4::gdk::Display::default()?;
         let clipboard = display.clipboard();
@@ -1262,9 +1263,10 @@ fn w7_permission_card(h: &Harness) -> Result<(), String> {
     if typed != serde_json::Value::Bool(true) {
         return Err(format!("W7: could not put text in the reason box: {typed}"));
     }
-    // Select in V-LINE from the card's first line through five j motions into the following Bash row.
-    // The selection crosses the diff, reason box and buttons, so checking that controls are absent
-    // from the copy exercises their exclusion.
+    // The first version's `vjjy` never reached the card's controls
+    // -- the card was the last row, and three lines from its top end in its diff -- so "no Approve,
+    // Deny, Always allow" held of any copy at all. V-LINE from the card's first line, five `j` down:
+    // across the diff, the reason box and the buttons, into the Bash row the replay puts after it.
     to_card(h);
     h.clear_clipboard();
     h.xdotool_keys(&["shift+v", "j", "j", "j", "j", "j", "y"]);

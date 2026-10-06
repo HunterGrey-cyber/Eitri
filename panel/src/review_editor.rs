@@ -12,10 +12,10 @@ use eitri_core::turn_review::ReviewFlow;
 
 /// Who owns the module in the editor now: asked again before every request, because a companion
 /// panel's channel changes with each attach. `None`: there is no editor to show a review in.
-pub(crate) type OwnerSource = Rc<dyn Fn() -> Option<Owner>>;
+pub type OwnerSource = Rc<dyn Fn() -> Option<Owner>>;
 
 /// Brings the editor to the user once a file was opened in it.
-pub(crate) type OpenedHook = Rc<dyn Fn()>;
+pub type OpenedHook = Rc<dyn Fn()>;
 
 /// The window's side of the editor overlay.
 #[derive(Default)]
