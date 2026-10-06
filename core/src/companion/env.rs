@@ -65,6 +65,7 @@ pub fn inherited_editor_env(get: &dyn Fn(&str) -> Option<OsString>) -> Vec<&'sta
     }
     names
 }
+
 /// Calls `remove` once for every name in `names`. Separate from the `remove_var` it is given, so a
 /// test can see every name reach it.
 pub fn scrub(names: &[&str], remove: &dyn Fn(&str)) {
@@ -76,7 +77,7 @@ pub fn scrub(names: &[&str], remove: &dyn Fn(&str)) {
 /// What `eitri split` removes from its own environment, given how that environment reads (`get`):
 /// always the RPC address and the other window's sockets ([`inherited_editor_env`]), and
 /// `MYVIMRC`, `VIMRUNTIME` and `VIM` only when `$NVIM` is set, which is how a split started from an
-/// nvim's `:terminal` shows (the same test [`run`] reads first). Without it those three are the
+/// nvim's `:terminal` shows (the same test `eitri split`'s entry point in `shell` reads first). Without it those three are the
 /// user's own exports, which the Neovide nvim started next needs (a `VIMRUNTIME` for a source or
 /// Nix build), and they pass through.
 pub fn split_scrub_names(get: &dyn Fn(&str) -> Option<OsString>) -> Vec<&'static str> {

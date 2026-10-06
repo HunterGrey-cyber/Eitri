@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use eitri_core::keymap::{Action, HelpRow, Keymap, PanelKeymap, TabAction};
-use eitri_core::layout::ModuleKeys;
+use eitri_core::layout::{Direction, ModuleKeys};
 use eitri_core::nvim_keys::NvimReport;
 
 use eitri_core::keymap::companion::CompanionVerb;
@@ -25,8 +25,9 @@ pub enum HelpScope {
     /// prefix runs are listed (`eitri_core::keymap::companion::classify`), and the root chords are one row, since
     /// the window manager decides what leaving the panel does.
     Companion,
-    /// The panel and the editor in one window that hides the panel for the zoom: the companion's rows, plus
-    /// the zoom, and a root row that says where the keys go (the window, not a window manager, decides).
+    /// The panel and the editor in one window that hides the panel for the zoom: the companion's rows
+    /// without HINT (this window has none), plus the zoom and the moves between the editor and the panel,
+    /// and a root row that says where the keys go (the window, not a window manager, decides).
     PanelBesideEditor,
 }
 
@@ -52,15 +53,50 @@ fn help_tables(scope: HelpScope, keymap: &Keymap, module_keys: &ModuleKeys) -> (
                 keys: "Ctrl+h".into(),
                 what: "leave the panel for the editor".into(),
             }],
-            keymap.help_where(module_keys, |action| {
-                // The zoom is this window's own (it hides the panel), and `classify` refuses it for the
-                // companion window, which has no panel to hide.
-                *action == Action::Zoom
-                    || (!matches!(action, Action::Select(_))
-                        && !matches!(eitri_core::keymap::companion::classify(action), CompanionVerb::Refuse))
-            }),
+            panel_beside_editor_rows(keymap, module_keys),
         ),
     }
+}
+
+/// The prefix rows of the window that holds the editor and the panel side by side.
+fn panel_beside_editor_rows(keymap: &Keymap, module_keys: &ModuleKeys) -> Vec<HelpRow> {
+    let keep = |action: &Action| match action {
+        // The zoom is this window's own (it hides the panel), and `classify` refuses it for the companion
+        // window, which has no panel to hide.
+        Action::Zoom => true,
+        // Here the window itself moves the keys between its two panes, the editor on the left and the panel
+        // on the right; there is nothing above or below either of them.
+        Action::Select(direction) => matches!(direction, Direction::Left | Direction::Right),
+        action => !matches!(
+            eitri_core::keymap::companion::classify(action),
+            // This window has no global HINT: the prefix answers it with a notice, so it is not listed.
+            CompanionVerb::Refuse | CompanionVerb::Hint
+        ),
+    };
+    // The keymap's own wording speaks of modules, which this window does not have.
+    let prefix = keymap.prefix().human();
+    let module_move = Action::Select(Direction::Left).describe(&prefix, "");
+    let module_zoom = Action::Zoom.describe(&prefix, "");
+    keymap
+        .help_where(module_keys, keep)
+        .into_iter()
+        .map(|row| {
+            if let Some(rest) = row.what.strip_prefix(module_move.as_str()) {
+                HelpRow {
+                    what: format!("Move the keys between the editor (left) and the panel (right){rest}"),
+                    ..row
+                }
+            } else if let Some(rest) = row.what.strip_prefix(module_zoom.as_str()) {
+                // Here the zoom is the editor filling the window: it hides the panel, and shows it again.
+                HelpRow {
+                    what: format!("Hide the panel so the editor fills the window, or show it again{rest}"),
+                    ..row
+                }
+            } else {
+                row
+            }
+        })
+        .collect()
 }
 
 pub struct KeysHelp {
@@ -176,9 +212,35 @@ mod tests {
         let (root, beside) = help_tables(HelpScope::PanelBesideEditor, &keymap, &keys);
         assert_eq!(root.len(), 1);
         let extra: Vec<&HelpRow> = beside.iter().filter(|row| !companion.contains(row)).collect();
-        assert_eq!(extra.len(), 1, "only the zoom is added: {extra:?}");
-        assert!(extra[0].what.contains("Zoom"), "{extra:?}");
-        assert!(companion.iter().all(|row| beside.contains(row)));
+        assert_eq!(extra.len(), 2, "the zoom and the pane moves are added: {extra:?}");
+        let zoom: Vec<&&HelpRow> = extra.iter().filter(|row| row.keys.ends_with(" z")).collect();
+        assert_eq!(zoom.len(), 1, "{extra:?}");
+        assert_eq!(
+            zoom[0].what, "Hide the panel so the editor fills the window, or show it again",
+            "the zoom hides the panel here, it does not zoom a module"
+        );
+        assert!(!zoom[0].what.contains("module"), "{zoom:?}");
+        // The companion window and the full window keep the keymap's own wording.
+        assert!(
+            !companion.iter().any(|row| row.what.contains("Hide the panel")),
+            "{companion:?}"
+        );
+        let (_, full) = help_tables(HelpScope::Window, &keymap, &keys);
+        assert!(
+            full.iter().any(|row| row.what == "Zoom this module, or restore"),
+            "{full:?}"
+        );
+        let moves: Vec<&&HelpRow> = extra.iter().filter(|row| row.what.contains("(left)")).collect();
+        assert_eq!(moves.len(), 1, "{extra:?}");
+        assert_eq!(
+            moves[0].keys, "Ctrl+b Left / Right",
+            "nothing is above or below either pane"
+        );
+        assert!(!moves[0].what.contains("module"), "{moves:?}");
+        // HINT is the one companion row this window answers with a notice.
+        let missing: Vec<&HelpRow> = companion.iter().filter(|row| !beside.contains(row)).collect();
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(missing[0].what.contains("HINT"), "{missing:?}");
     }
 
     #[test]

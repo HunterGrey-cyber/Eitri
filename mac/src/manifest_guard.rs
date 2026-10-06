@@ -105,7 +105,7 @@ fn manifest_declares_no_gtk_or_webkit_dependency() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "eitri-mac must build without a toolkit -- the host's GTK half lives in `shell`:\n{}",
+        "eitri-mac must not depend on a GTK or WebKit crate on any target -- its macOS half uses AppKit and is compiled on macOS only:\n{}",
         offenders.join("\n")
     );
 }

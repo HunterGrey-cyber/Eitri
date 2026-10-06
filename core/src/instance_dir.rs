@@ -428,10 +428,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// The sweep still recognises what a pre-L2-T5 build wrote. Without this, every directory an
-    /// older `shell` leaked would be *permanently* unreclaimable -- and unlike the prefix rename,
-    /// which each caller answers by sweeping its own legacy prefix too, this half needs no second
-    /// call, only a parser that keeps accepting the old spelling.
+    /// `create_instance_dir` makes a private directory of its own per call, named for this process, and
+    /// reclaims a dead process's leftover on the way.
     #[test]
     fn create_instance_dir_makes_a_fresh_private_directory_named_for_this_process() {
         use std::os::unix::fs::MetadataExt;
@@ -458,6 +456,10 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The sweep still recognises what a pre-L2-T5 build wrote. Without this, every directory an
+    /// older `shell` leaked would be *permanently* unreclaimable -- and unlike the prefix rename,
+    /// which each caller answers by sweeping its own legacy prefix too, this half needs no second
+    /// call, only a parser that keeps accepting the old spelling.
     #[test]
     fn a_pre_l2_t5_hyphenated_uuid_is_still_recognised() {
         let uuid = uuid::Uuid::new_v4();

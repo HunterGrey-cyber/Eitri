@@ -8,10 +8,8 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
-use std::mem::ManuallyDrop;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use eitri_core::companion::env::SET_ON_THE_NVIM_CHILD;
@@ -75,14 +73,30 @@ pub enum ProjectStart {
 ///
 /// A launch from the Dock or Finder names no project and runs in `/`, which is never a project: that is
 /// `Choose`. `/` named on purpose, by an argument or the variable, is refused.
+///
+/// This host has no options at all. The Linux window's own (`--clean`, `--version`, `--legacy`), which the
+/// shared resolver steps over, are refused here: skipped, `eitri-mac --legacy` would open the working
+/// directory on the sidecar with nothing said.
 pub fn project_start(args: &[OsString], env_project_dir: Option<OsString>, cwd: &Path) -> Result<ProjectStart, String> {
     // LaunchServices may add a process serial number (`-psn_<n>_<n>`) to a GUI start's arguments; left in,
-    // it would be an unrecognised option and the app would not start.
+    // it would be an unrecognised option and the app would not start. Only before `--`: after it every
+    // argument is a path, and a directory may be named `-psn_dir`.
+    let mut options_ended = false;
     let args: Vec<OsString> = args
         .iter()
-        .filter(|arg| !arg.as_bytes().starts_with(b"-psn_"))
+        .filter(|arg| {
+            options_ended |= arg.as_bytes() == b"--";
+            options_ended || !arg.as_bytes().starts_with(b"-psn_")
+        })
         .cloned()
         .collect();
+    let mut options = args.iter().take_while(|arg| arg.as_bytes() != b"--");
+    if let Some(option) = options.find(|arg| arg.as_bytes().first() == Some(&b'-')) {
+        return Err(format!(
+            "eitri-mac takes no options, and {option:?} is one; if it is a project directory, pass it after \
+             `--` (eitri-mac -- {option:?})"
+        ));
+    }
     let source = select_root_source(args.iter().map(OsString::as_os_str), env_project_dir.as_deref())?;
     let root = resolve_in(&args, env_project_dir, Ok(cwd.to_path_buf()))?;
     if root == Path::new("/") {
@@ -172,15 +186,32 @@ pub fn detach_stdin_if_redirected() -> io::Result<()> {
     detach_if_redirected(0)
 }
 
+/// Whether `fd` is a character device, asked of the descriptor itself with `fstat`: no `File` is built
+/// from a number that may not be open. `Ok(None)` is a closed descriptor (`EBADF`).
+fn is_char_device(fd: RawFd) -> io::Result<Option<bool>> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `stat` is a valid, writable `struct stat`; `fstat` only reads `fd` as a number and reports
+    // `EBADF` for one that is not open, so any integer is safe to pass.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == -1 {
+        let e = io::Error::last_os_error();
+        return if e.raw_os_error() == Some(libc::EBADF) {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+    // SAFETY: `fstat` returned 0, so it filled in the whole structure.
+    let mode = unsafe { stat.assume_init() }.st_mode;
+    Ok(Some(mode & libc::S_IFMT == libc::S_IFCHR))
+}
+
 fn detach_if_redirected(fd: RawFd) -> io::Result<()> {
-    // The handle only asks `fstat`; it must not close the descriptor it borrows.
-    let borrowed = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
-    match borrowed.metadata() {
-        Ok(meta) if meta.file_type().is_char_device() => return Ok(()),
-        Ok(_) => {}
+    match is_char_device(fd)? {
+        Some(true) => return Ok(()),
+        // A pipe, a socket or a file: replaced below.
+        Some(false) => {}
         // A closed descriptor: the next `open` would take its number and become some child's input.
-        Err(e) if e.raw_os_error() == Some(libc::EBADF) => {}
-        Err(e) => return Err(e),
+        None => {}
     }
     let null = File::open("/dev/null")?;
     if null.as_raw_fd() == fd {
@@ -204,7 +235,9 @@ fn detach_if_redirected(fd: RawFd) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::os::unix::fs::MetadataExt;
+    use std::mem::ManuallyDrop;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Iterator<Item = (OsString, OsString)> + 'a {
         pairs.iter().map(|(k, v)| (OsString::from(k), OsString::from(v)))
@@ -333,8 +366,54 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_named_like_a_serial_number_opens_after_the_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("-psn_project");
+        std::fs::create_dir(&project).unwrap();
+        let args = [OsString::from("--"), project.as_os_str().to_owned()];
+        assert_eq!(
+            project_start(&args, None, Path::new("/")),
+            Ok(ProjectStart::Root(project.canonicalize().unwrap()))
+        );
+        // Before the separator it is still LaunchServices' serial number and is dropped.
+        let before = [
+            OsString::from("-psn_0_1"),
+            OsString::from("--"),
+            project.as_os_str().to_owned(),
+        ];
+        assert_eq!(
+            project_start(&before, None, Path::new("/")),
+            Ok(ProjectStart::Root(project.canonicalize().unwrap()))
+        );
+    }
+
+    #[test]
     fn an_unknown_option_is_still_refused() {
         assert!(project_start(&[OsString::from("--bogus")], None, Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn the_linux_windows_options_are_refused_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        for flag in ["--legacy", "--version", "--clean"] {
+            let refused = project_start(&[OsString::from(flag)], None, dir.path());
+            assert!(
+                refused.as_ref().is_err_and(|why| why.contains(flag)),
+                "{flag}: {refused:?}"
+            );
+            // Before a project directory too, and from `/`, where skipping it would have asked for one.
+            let before = [OsString::from(flag), dir.path().as_os_str().to_owned()];
+            assert!(project_start(&before, None, Path::new("/")).is_err(), "{flag}");
+        }
+        // After `--` it is a project directory, as on Linux.
+        assert_eq!(
+            project_start(
+                &[OsString::from("--"), dir.path().as_os_str().to_owned()],
+                None,
+                Path::new("/")
+            ),
+            Ok(ProjectStart::Root(dir.path().canonicalize().unwrap()))
+        );
     }
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
@@ -404,6 +483,8 @@ mod tests {
     }
 
     fn is_dev_null_like(fd: RawFd) -> bool {
+        // SAFETY: every caller passes a descriptor that is open (the tests make sure of it), and the
+        // `ManuallyDrop` keeps this handle from closing it: it only borrows the number to `fstat` and read.
         let borrowed = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
         let char_device = borrowed.metadata().unwrap().file_type().is_char_device();
         let mut buf = [0u8; 8];
@@ -414,10 +495,12 @@ mod tests {
     #[test]
     fn a_pipe_and_a_regular_file_on_the_fd_are_replaced_by_dev_null() {
         let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is two writable `c_int`s, which is all `pipe` writes.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let (read_end, write_end) = (fds[0], fds[1]);
         detach_if_redirected(read_end).unwrap();
         assert!(is_dev_null_like(read_end));
+        // SAFETY: both ends were opened above and nothing else owns or closes them.
         unsafe {
             libc::close(read_end);
             libc::close(write_end);
@@ -434,10 +517,13 @@ mod tests {
         // A high number no other thread of the test process is likely to take.
         let fd: RawFd = 777;
         let null = File::open("/dev/null").unwrap();
+        // SAFETY: `null` is open; `dup2` makes `fd` another descriptor for it.
         assert_ne!(unsafe { libc::dup2(null.as_raw_fd(), fd) }, -1);
+        // SAFETY: `fd` was opened by the `dup2` above and is closed exactly once here.
         assert_eq!(unsafe { libc::close(fd) }, 0);
         detach_if_redirected(fd).unwrap();
         assert!(is_dev_null_like(fd));
+        // SAFETY: `detach_if_redirected` opened `fd` again; this closes that descriptor once.
         unsafe { libc::close(fd) };
     }
 

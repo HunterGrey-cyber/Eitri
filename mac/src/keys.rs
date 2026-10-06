@@ -215,10 +215,14 @@ impl Keys {
     }
 
     /// The window was deactivated or a click arrived: whatever the prefix waits for ends.
+    ///
+    /// The key still down keeps its pane. A click into the other pane while a key is held would otherwise
+    /// let that key's repeats reach the pane clicked (a held Backspace begun in the composer deleting in
+    /// the editor). A key-up lost meanwhile costs nothing: only a repeat is checked against it, and the
+    /// next press of any key replaces it.
     pub fn cancel(&mut self) {
         let was = self.prefix.waiting();
         self.prefix.cancel();
-        self.down = None;
         if was != Waiting::No {
             println!("[prefix] armed=false waiting={:?}", Waiting::No);
         }
@@ -470,6 +474,44 @@ mod tests {
         f.keys.cancel();
         assert_eq!(f.keys.waiting(), Waiting::No);
         assert_eq!(down(&mut f, &plain("c", C), Pane::Panel, false), KeyAction::Pass);
+    }
+
+    #[test]
+    fn a_click_does_not_let_a_held_key_repeat_into_the_other_pane() {
+        const BACKSPACE: u16 = 51;
+        let mut f = fixture(&[]);
+        assert_eq!(
+            down(&mut f, &plain("\u{7f}", BACKSPACE), Pane::Panel, false),
+            KeyAction::Pass
+        );
+        // A click on the editor while Backspace is still held.
+        f.keys.cancel();
+        assert_eq!(
+            down(&mut f, &repeating(plain("\u{7f}", BACKSPACE)), Pane::Editor, false),
+            KeyAction::Swallow
+        );
+        f.keys.key_up(BACKSPACE);
+        assert_eq!(
+            down(&mut f, &plain("\u{7f}", BACKSPACE), Pane::Editor, false),
+            KeyAction::Pass
+        );
+        assert_eq!(
+            down(&mut f, &repeating(plain("\u{7f}", BACKSPACE)), Pane::Editor, false),
+            KeyAction::Pass
+        );
+    }
+
+    #[test]
+    fn a_fresh_press_after_a_cancel_belongs_to_its_pane() {
+        // The key-up was lost while the window was inactive; the next press is new, and so are its repeats.
+        let mut f = fixture(&[]);
+        assert_eq!(down(&mut f, &plain("c", C), Pane::Panel, false), KeyAction::Pass);
+        f.keys.cancel();
+        assert_eq!(down(&mut f, &plain("c", C), Pane::Editor, false), KeyAction::Pass);
+        assert_eq!(
+            down(&mut f, &repeating(plain("c", C)), Pane::Editor, false),
+            KeyAction::Pass
+        );
     }
 
     fn key(spec: &str) -> Press {

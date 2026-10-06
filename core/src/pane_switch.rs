@@ -579,6 +579,9 @@ fn parse_message(line: &str) -> Option<PaneMessage> {
 mod tests {
     use super::*;
     use crate::layout::Direction;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
 
     #[test]
     fn the_shims_four_letters_are_the_four_directions() {
@@ -589,9 +592,6 @@ mod tests {
         assert_eq!(letter_direction('r'), None);
         assert_eq!(letter_direction('X'), None);
     }
-    use std::io::Write;
-    use std::os::unix::net::UnixStream;
-    use std::time::Instant;
 
     /// For a test asserting that **one** poll handles several connections.
     /// [`MAX_POLL_DURATION`] is a wall-clock backstop, so under it such an assertion depends on the
