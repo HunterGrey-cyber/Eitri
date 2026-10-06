@@ -52,7 +52,7 @@ fn opts(lua: &Lua, value: &Value) -> Result<Vec<(String, OptValue)>, String> {
     Ok(out)
 }
 
-/// `pub`: `shell::lua::LuaEngine::new` calls this.
+/// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlua::Result<()> {
     let keymap = lua.create_table()?;
 

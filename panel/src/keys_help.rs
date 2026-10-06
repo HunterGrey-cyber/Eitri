@@ -12,18 +12,22 @@ use eitri_core::keymap::{Action, HelpRow, Keymap, PanelKeymap, TabAction};
 use eitri_core::layout::ModuleKeys;
 use eitri_core::nvim_keys::NvimReport;
 
+use eitri_core::keymap::companion::CompanionVerb;
+
 use crate::agent_panel::AgentPanelHandle;
-use crate::companion::prefix::CompanionVerb;
 
 /// Which window the `?` overlay is drawn for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HelpScope {
+pub enum HelpScope {
     /// The full window: modules, layout, the root chords.
     Window,
     /// A companion window: one agent panel and nothing to lay out. Only the tab and panel actions its
-    /// prefix runs are listed (`companion::prefix::classify`), and the root chords are one row, since
+    /// prefix runs are listed (`eitri_core::keymap::companion::classify`), and the root chords are one row, since
     /// the window manager decides what leaving the panel does.
     Companion,
+    /// The panel and the editor in one window that hides the panel for the zoom: the companion's rows, plus
+    /// the zoom, and a root row that says where the keys go (the window, not a window manager, decides).
+    PanelBesideEditor,
 }
 
 /// The two window-level tables of the overlay, "Anywhere in the window" then "After <prefix>", for
@@ -40,13 +44,26 @@ fn help_tables(scope: HelpScope, keymap: &Keymap, module_keys: &ModuleKeys) -> (
                 // A move toward the next window is the window manager's, not a module move, so its
                 // row ("move the keys to the module that way") would say what does not happen here.
                 !matches!(action, Action::Select(_))
-                    && !matches!(crate::companion::prefix::classify(action), CompanionVerb::Refuse)
+                    && !matches!(eitri_core::keymap::companion::classify(action), CompanionVerb::Refuse)
+            }),
+        ),
+        HelpScope::PanelBesideEditor => (
+            vec![HelpRow {
+                keys: "Ctrl+h".into(),
+                what: "leave the panel for the editor".into(),
+            }],
+            keymap.help_where(module_keys, |action| {
+                // The zoom is this window's own (it hides the panel), and `classify` refuses it for the
+                // companion window, which has no panel to hide.
+                *action == Action::Zoom
+                    || (!matches!(action, Action::Select(_))
+                        && !matches!(eitri_core::keymap::companion::classify(action), CompanionVerb::Refuse))
             }),
         ),
     }
 }
 
-pub(crate) struct KeysHelp {
+pub struct KeysHelp {
     /// `.0` is the last nvim report seen (`None` until the feed's first line, or forever if the feed
     /// could not start); `.1` is the last `PanelKeymap` actually sent, so a report that leaves the
     /// merged table unchanged costs no dispatch and no repeated log line.
@@ -62,7 +79,7 @@ pub(crate) struct KeysHelp {
 }
 
 impl KeysHelp {
-    pub(crate) fn new(
+    pub fn new(
         keymap: Rc<Keymap>,
         module_keys: Rc<ModuleKeys>,
         panel: AgentPanelHandle,
@@ -86,7 +103,7 @@ impl KeysHelp {
     }
 
     /// Recomputes the panel table from the last nvim report and sends the help when it changed.
-    pub(crate) fn send(&self) {
+    pub fn send(&self) {
         let mut latest = self.latest.borrow_mut();
         let report = latest.0.clone();
         let (panel_keymap, log) = eitri_core::keymap::panel::effective(self.keymap.panel_user(), report.as_ref());
@@ -109,7 +126,7 @@ impl KeysHelp {
     }
 
     /// nvim's own keys changed: remember the report and re-send if the merged table moved.
-    pub(crate) fn nvim_report(&self, report: NvimReport) {
+    pub fn nvim_report(&self, report: NvimReport) {
         self.latest.borrow_mut().0 = Some(report);
         self.send();
     }
@@ -149,6 +166,19 @@ mod tests {
             assert!(!whats.iter().any(|w| w.contains(gone)), "{gone:?} is listed: {whats:?}");
         }
         assert!(!prefix.is_empty());
+    }
+
+    #[test]
+    fn the_panel_beside_the_editor_lists_the_zoom_and_the_companion_rows() {
+        let keymap = Keymap::defaults();
+        let keys = ModuleKeys::built_in();
+        let (_, companion) = help_tables(HelpScope::Companion, &keymap, &keys);
+        let (root, beside) = help_tables(HelpScope::PanelBesideEditor, &keymap, &keys);
+        assert_eq!(root.len(), 1);
+        let extra: Vec<&HelpRow> = beside.iter().filter(|row| !companion.contains(row)).collect();
+        assert_eq!(extra.len(), 1, "only the zoom is added: {extra:?}");
+        assert!(extra[0].what.contains("Zoom"), "{extra:?}");
+        assert!(companion.iter().all(|row| beside.contains(row)));
     }
 
     #[test]

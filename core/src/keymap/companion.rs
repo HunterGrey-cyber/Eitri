@@ -4,18 +4,27 @@
 //! other action with a toast. The tab chords are not layout, and they are how a tmux user drives the
 //! tabs from the keyboard.
 
-use eitri_core::keymap::{Action, Keymap, TabAction, TextChange};
-use eitri_core::layout::Direction;
+use super::prefix::Waiting;
+use super::{Action, Keymap, TabAction, TextChange};
+use crate::layout::Direction;
 
-use crate::prefix::Waiting;
-use crate::prefix_strip::StripPiece;
+/// One piece of the strip the armed prefix shows in the top bar, left to right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripPiece {
+    /// Where the next module goes, after `\`/`"`: `right of editor:`.
+    Heading(String),
+    /// A key and what it does, `e editor`; `dimmed` for a module that is hidden or not placed.
+    Run { text: String, dimmed: bool },
+    /// The `·` between two runs; never before the first, after the last, or after the heading.
+    Dot,
+}
 
 /// The toast for an action a companion window does not have.
-pub(crate) const REFUSED_TEXT: &str = "not in a companion window";
+pub const REFUSED_TEXT: &str = "not in a companion window";
 
 /// What a companion window does with one prefix action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompanionVerb {
+pub enum CompanionVerb {
     Tab(TabAction),
     Reload,
     Keymap,
@@ -33,7 +42,7 @@ pub(crate) enum CompanionVerb {
 /// Sorts every `Action` into what a companion window does with it. Exhaustive on purpose, with no
 /// catch-all arm: a new action does not compile until someone decides what a window without a layout
 /// does with it.
-pub(crate) fn classify(action: &Action) -> CompanionVerb {
+pub fn classify(action: &Action) -> CompanionVerb {
     match action {
         Action::Tab(tab) => CompanionVerb::Tab(*tab),
         Action::PanelReload => CompanionVerb::Reload,
@@ -61,7 +70,7 @@ pub(crate) fn classify(action: &Action) -> CompanionVerb {
 /// What the armed prefix shows in a companion window: the keys that do something here, as the
 /// effective keymap binds them. After a split key (the only way the prefix waits for a module key)
 /// it says why nothing will happen.
-pub(crate) fn strip_pieces(waiting: Waiting, keymap: &Keymap) -> Vec<StripPiece> {
+pub fn strip_pieces(waiting: Waiting, keymap: &Keymap) -> Vec<StripPiece> {
     match waiting {
         Waiting::No => Vec::new(),
         Waiting::Module(_) => vec![StripPiece::Heading(REFUSED_TEXT.to_string())],
@@ -97,8 +106,8 @@ pub(crate) fn strip_pieces(waiting: Waiting, keymap: &Keymap) -> Vec<StripPiece>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eitri_core::keymap::{KeySpec, SwapTarget};
-    use eitri_core::layout::{Axis, ModuleId};
+    use crate::keymap::{KeySpec, SwapTarget};
+    use crate::layout::{Axis, ModuleId};
 
     /// One action of every family, so a new variant that is mapped wrongly shows up here as well as
     /// failing to compile in `classify`.
@@ -153,8 +162,8 @@ mod tests {
     /// the name split so the scan does not match itself.
     #[test]
     fn classify_has_no_catch_all_arm() {
-        let source = include_str!("prefix.rs");
-        let start = source.find("pub(crate) fn classify").expect("classify is in this file");
+        let source = include_str!("companion.rs");
+        let start = source.find("pub fn classify").expect("classify is in this file");
         let body = &source[start..];
         let end = body.find("\n}\n").expect("classify ends");
         let wildcard = ["_", " =>"].concat();

@@ -87,7 +87,7 @@ pub fn flag_given<'a>(args: impl IntoIterator<Item = &'a OsStr>, flag: &str) -> 
 /// choice from the `canonicalize` is what keeps the precedence rule unit-testable without a real
 /// directory tree to point at.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RootSource {
+pub enum RootSource {
     /// The first positional (non-`-`-prefixed) command-line argument, or whatever followed `--`.
     Argument(OsString),
     /// `EITRI_PROJECT_DIR`.
@@ -134,11 +134,13 @@ pub fn resolve() -> Result<PathBuf, String> {
 /// is not the process's own: `eitri panel` hands its leftover arguments here after taking its own
 /// options out. The environment and the cwd are the process's, exactly as in [`resolve`].
 pub fn resolve_args(args: &[OsString]) -> Result<PathBuf, String> {
-    resolve_from(
-        args.iter().map(OsString::as_os_str),
-        std::env::var_os(PROJECT_DIR_ENV),
-        std::env::current_dir(),
-    )
+    resolve_in(args, std::env::var_os(PROJECT_DIR_ENV), std::env::current_dir())
+}
+
+/// [`resolve_args`] with the environment variable and the working directory handed in, for a host that
+/// decides them itself (and for tests, which must not read the runner's own).
+pub fn resolve_in(args: &[OsString], env: Option<OsString>, cwd: io::Result<PathBuf>) -> Result<PathBuf, String> {
+    resolve_from(args.iter().map(OsString::as_os_str), env, cwd)
 }
 
 /// What `eitri panel` took from its own command line.
@@ -272,7 +274,7 @@ fn resolve_from<'a>(
 /// The one real limitation left: an option that takes a *separate* value (`--foo bar`) cannot be
 /// handled by a membership test -- `bar` would be read here as the project directory. Such an
 /// option has to be taught to this function, not just added to `KNOWN_FLAGS`.
-pub(crate) fn select_root_source<'a>(
+pub fn select_root_source<'a>(
     args: impl IntoIterator<Item = &'a OsStr>,
     env: Option<&OsStr>,
 ) -> Result<RootSource, String> {

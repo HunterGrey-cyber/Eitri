@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// `pub`: `shell/src/main.rs` reads `keybinding` off every entry `iter()` yields, and
-/// `LuaEngine::invoke_command` (`shell/src/lua/mod.rs`) reads `action`. `title` is read by
+/// `Kernel::invoke_command` reads `action`. `title` is read by
 /// neither yet (`#[allow(dead_code)]` below is original, not new) and stays `pub(crate)`.
 pub struct CommandEntry {
     #[allow(dead_code)] // read by a future command-palette UI; not consumed by this plan
@@ -19,13 +19,13 @@ pub struct CommandEntry {
     pub keybinding: Option<String>,
     // `Rc<RegistryKey>`, not a bare `RegistryKey`: `RegistryKey` doesn't implement `Clone`
     // (verified against the installed mlua 0.12.1's `src/types/registry_key.rs`), and
-    // `LuaEngine::invoke_command` needs to clone the handle *out* of a borrowed
+    // `Kernel::invoke_command` needs to clone the handle *out* of a borrowed
     // `CommandRegistry` before dropping that borrow, to avoid a reentrant `BorrowMutError` if
     // the action itself calls `eitri.command.register(...)`.
     pub action: Rc<RegistryKey>,
 }
 
-/// `pub`: `shell/src/lua/mod.rs` holds one behind an `Rc<RefCell<_>>` field and calls `install`.
+/// `pub`: `Kernel` holds one behind an `Rc<RefCell<_>>` field and calls `install`.
 #[derive(Default)]
 pub struct CommandRegistry {
     commands: HashMap<String, CommandEntry>,
@@ -53,13 +53,13 @@ impl CommandRegistry {
         self.commands.is_empty()
     }
 
-    /// `pub`: `LuaEngine::invoke_command` calls this.
+    /// `pub`: `Kernel::invoke_command` calls this.
     pub fn get(&self, id: &str) -> Option<&CommandEntry> {
         self.commands.get(id)
     }
 
     /// The message of the first command id `register` refused, or `None`. `pub`:
-    /// `LuaEngine::load_init_file` makes it a startup failure once init.lua has run.
+    /// `Kernel::load_init_file` makes it a startup failure once init.lua has run.
     pub fn refused(&self) -> Option<&str> {
         self.refused.as_deref()
     }
@@ -81,7 +81,7 @@ fn is_valid_command_id(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
-/// `pub`: `LuaEngine::new` calls this.
+/// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, registry: Rc<RefCell<CommandRegistry>>) -> mlua::Result<()> {
     let command_table = lua.create_table()?;
     let register_fn = lua.create_function(move |lua, spec: Table| {
@@ -175,7 +175,7 @@ mod tests {
     /// Regression test for the reentrancy panic the final review reproduced: a command action
     /// that itself calls `eitri.command.register(...)` -- registering another command from
     /// inside a command's own action -- must not panic with `BorrowMutError`. This mirrors
-    /// `LuaEngine::invoke_command`'s own borrow/call sequence rather than going through
+    /// `Kernel::invoke_command`'s own borrow/call sequence rather than going through
     /// `LuaEngine` directly, since this module (unlike `LuaEngine`) needs no display and is
     /// fully unit-testable on its own.
     #[test]
@@ -204,7 +204,7 @@ mod tests {
         .exec()
         .unwrap();
 
-        // Mirror `LuaEngine::invoke_command`'s clone-out-then-call pattern: resolve the action
+        // Mirror `Kernel::invoke_command`'s clone-out-then-call pattern: resolve the action
         // under a scoped borrow, drop the borrow, then call it. Before the fix (a bare
         // `RegistryKey` resolved and called while still holding `registry.borrow()`), the
         // action's own `eitri.command.register` call would panic with `BorrowMutError`.
@@ -295,7 +295,7 @@ mod tests {
 
     /// A Lua chunk run with `.exec()` stops at its first uncaught error. An invalid command id
     /// therefore prevents all later statements in that chunk from running. Exercise the
-    /// registration closure from `install` directly to check this without starting the shell.
+    /// registration closure from `install` directly, so the check needs no `LuaEngine`.
     #[test]
     fn an_invalid_id_stops_the_rest_of_the_chunk_not_just_that_call() {
         let lua = Lua::new();
@@ -325,7 +325,7 @@ mod tests {
         );
     }
     /// A refused command id is remembered even if `init.lua` catches the Lua error with `pcall`.
-    /// `LuaEngine::load_init_file` can then fail startup and name the id. A Lua error alone can skip
+    /// `Kernel::load_init_file` can then fail startup and name the id. A Lua error alone can skip
     /// the rest of `init.lua` while allowing startup, with only stderr output that an app-menu launch
     /// may not show.
     #[test]

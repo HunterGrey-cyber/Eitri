@@ -16,7 +16,6 @@ use eitri_core::panel_control::{ControlServer, Request};
 
 use super::close_watch::{CloseWatcher, ExitDecision};
 use super::link::{self, CompanionLink};
-use super::prefix::{self as companion_prefix, CompanionVerb};
 use super::wm_runner::WmRunner;
 use super::Start;
 use crate::agent_panel::{self, AgentPanelHandle};
@@ -28,6 +27,7 @@ use crate::text_size::TextSizeController;
 use crate::toast::Toast;
 use crate::web_host::WebHost;
 use crate::window_config::{self, WindowConfig};
+use eitri_core::keymap::companion::{self as companion_prefix, CompanionVerb};
 
 /// Moves the keys toward the window on one side of the panel; `false` when nothing was claimed.
 type MoveFocus = Rc<dyn Fn(&ModuleId, Direction) -> bool>;
@@ -60,7 +60,7 @@ fn run_tab(
     focus_module: &dyn Fn(&ModuleId) -> bool,
     toast: &Rc<Toast>,
 ) {
-    use crate::tab_verbs::{plan, TabVerb};
+    use eitri_core::tabs::{plan, TabVerb};
     let keys_in = crate::pane_focus::focused_module(window, &grid.hosts())
         .as_ref()
         .map(ModuleId::kind);
@@ -160,7 +160,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     // editor is the user's own, already running, and gets its sockets through the install.
     let feed_pump = crate::editor_feeds::FeedPump::start();
     let mut theme_feed = crate::theme::feed::ThemeFeed::new();
-    let mut context_feed = crate::editor_context::EditorContextFeed::new();
+    let mut context_feed = eitri_core::editor_context::feed::EditorContextFeed::new();
     let mut keys_feed = eitri_core::nvim_keys::feed::NvimKeysFeed::new();
     let scratch_dir = eitri_core::scratch::ScratchDir::new();
     let scratch_path = scratch_dir.as_ref().map(|dir| dir.path().to_path_buf());
@@ -192,7 +192,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     };
     let (agent_widget, agent) = crate::agent_panel::build_agent_panel(
         start.project_root.clone(),
-        crate::editor_context::gated(context_source, attached.clone()),
+        eitri_core::editor_context::gated(context_source, attached.clone()),
         scratch_dir,
         start.backend_kind,
         start.panel_notice.as_deref(),
@@ -331,12 +331,12 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
 
     // The `?` overlay's window and prefix sections, re-sent whenever the attached editor's own keys
     // report changes.
-    let keys_help = crate::keys_help::KeysHelp::new(
+    let keys_help = eitri_panel::keys_help::KeysHelp::new(
         config.keymap.clone(),
         module_keys.clone(),
         agent.clone(),
         config.tmux_skipped.clone(),
-        crate::keys_help::HelpScope::Companion,
+        eitri_panel::keys_help::HelpScope::Companion,
     );
     keys_help.send();
     if let Some(feed) = keys_feed.as_mut() {
@@ -446,7 +446,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         ModuleId::agent(),
         &agent_host,
         move_focus.clone(),
-        Some(crate::agent_nav_intercept(agent.clone())),
+        Some(agent.nav_intercept()),
     );
     // No key with Super or Hyper held reaches the panel's page (`panel_super.rs`).
     crate::panel_super::install(&agent_host);

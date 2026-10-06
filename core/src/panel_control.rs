@@ -233,7 +233,7 @@ struct Peer {
 }
 
 /// The uid of the process on the other end of `stream`, for a caller that needs no more of it.
-pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     peer(stream).map(|peer| peer.uid)
 }
 

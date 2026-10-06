@@ -348,6 +348,19 @@ pub enum PaneMessage {
     QuitCancelled(u32),
 }
 
+/// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
+/// else is not a direction (the shim only ever sends these four).
+pub fn letter_direction(letter: char) -> Option<crate::layout::Direction> {
+    use crate::layout::Direction;
+    match letter {
+        'L' => Some(Direction::Left),
+        'R' => Some(Direction::Right),
+        'U' => Some(Direction::Up),
+        'D' => Some(Direction::Down),
+        _ => None,
+    }
+}
+
 /// Reads [`PaneMessage`]s without blocking the caller on a slow or trickling sender.
 /// Construct once per channel and retain across polls: a fresh reader loses buffered bytes from
 /// partial connections.
@@ -565,6 +578,17 @@ fn parse_message(line: &str) -> Option<PaneMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Direction;
+
+    #[test]
+    fn the_shims_four_letters_are_the_four_directions() {
+        assert_eq!(letter_direction('L'), Some(Direction::Left));
+        assert_eq!(letter_direction('R'), Some(Direction::Right));
+        assert_eq!(letter_direction('U'), Some(Direction::Up));
+        assert_eq!(letter_direction('D'), Some(Direction::Down));
+        assert_eq!(letter_direction('r'), None);
+        assert_eq!(letter_direction('X'), None);
+    }
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::time::Instant;
