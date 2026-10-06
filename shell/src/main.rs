@@ -7,6 +7,7 @@ mod chrome;
 mod close_prompt;
 mod companion;
 mod editor_context;
+mod editor_feeds;
 mod editor_quit;
 mod editor_rpc;
 mod editor_start_failure;
@@ -17,7 +18,6 @@ mod layout;
 mod layout_state;
 mod lua;
 mod module_grid;
-mod nvim_keys;
 mod pane_focus;
 mod pane_switch;
 mod panel_super;
@@ -257,6 +257,8 @@ fn build_ui(
     let theme_css = theme::gtk_css::ThemeCss::install(&eitri_core::theme::ThemeTokens::fallback());
     // Built before the editor pane for the same reason `pane_switch` is: its env and `--cmd` reach
     // nvim only at spawn. `None` (logged) leaves the window on the fallback colours.
+    // One timer for the four feeds below; each is read once its consumer calls `listen_*`.
+    let feed_pump = editor_feeds::FeedPump::start();
     let mut theme_feed = theme::feed::ThemeFeed::new();
 
     // Built before the editor pane, because its `child_env()` has to be handed to the pane's
@@ -314,7 +316,7 @@ fn build_ui(
     // A feed that failed to start yields a source that always answers `None`, so the panel needs no
     // branch: turns simply go out as the user typed them, exactly as before wire 1 existed.
     let editor_context_source = match context_feed.as_mut() {
-        Some(feed) => editor_context::listen(feed, scratch_path.clone()),
+        Some(feed) => feed_pump.listen_context(feed, scratch_path.clone()).0,
         None => std::rc::Rc::new(|| None),
     };
     let (agent_widget, agent_panel_handle) = agent_panel::build_agent_panel(
@@ -409,7 +411,7 @@ fn build_ui(
     };
     // The `?` overlay's window and prefix sections, generated from the keymap;
     // see `keys_help`. It is re-sent, only when the merged panel table changed, every time nvim's
-    // own keys report changes (`nvim_keys::listen` below).
+    // own keys report changes (`FeedPump::listen_keys` below).
     let keys_help = keys_help::KeysHelp::new(
         keymap.clone(),
         module_keys.clone(),
@@ -420,7 +422,7 @@ fn build_ui(
     keys_help.send();
     if let Some(feed) = nvim_keys_feed.as_mut() {
         let keys_help = keys_help.clone();
-        nvim_keys::listen(feed, move |report| keys_help.nvim_report(report));
+        feed_pump.listen_keys(feed, move |report| keys_help.nvim_report(report));
     }
     // The layout this window opens with: this project's state file if
     // it can be used, else `init.lua`'s `eitri.layout.default`, else the first launch. A malformed
@@ -676,7 +678,7 @@ fn build_ui(
         let agent_panel_handle = agent_panel_handle.clone();
         let pane_for_theme = pane.clone();
         let terminal = terminal.clone();
-        theme::feed::listen(feed, move |payload| {
+        feed_pump.listen_theme(feed, move |payload| {
             let tokens = eitri_core::theme::ThemeTokens::derive(&payload);
             println!(
                 "[theme] following nvim colorscheme {:?} (background={})",
@@ -1735,7 +1737,7 @@ fn build_ui(
     if let Some(ps) = pane_switch.as_mut() {
         let move_focus = move_focus.clone();
         let editor_quitting = editor_quitting.clone();
-        pane_switch::listen(ps, move |message| match message {
+        feed_pump.listen_pane_switch(ps, move |message| match message {
             pane_switch::PaneMessage::Direction(letter) => match pane_switch::letter_direction(letter) {
                 Some(direction) => {
                     move_focus(&ModuleId::editor(), direction);

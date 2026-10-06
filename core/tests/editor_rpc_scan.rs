@@ -24,8 +24,8 @@ const ANNOTATION: &str = "// editor-rpc-scan: forwards a caller's constant";
 /// `code` its own caller gave it, and that caller's call is checked here in turn.
 const EXPECTED_FORWARDERS: &[(&str, usize)] = &[
     ("core/src/companion/driver.rs", 5),
+    ("core/src/companion/link.rs", 2),
     ("core/src/editor_rpc.rs", 1),
-    ("shell/src/companion/link.rs", 2),
     ("shell/src/editor_rpc.rs", 1),
 ];
 

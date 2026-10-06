@@ -13,6 +13,7 @@ pub mod attention;
 pub mod buffer_reload;
 pub mod companion;
 pub mod editor_context;
+pub mod editor_feeds;
 pub mod editor_lines;
 pub mod editor_rpc;
 pub mod hint;
