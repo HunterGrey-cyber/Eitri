@@ -730,11 +730,12 @@ impl AgentBackend {
     /// The CLI's own prompts (`provider_prompt: Some`) are handled before gate requests.
     /// They can ask for checks, such as sensitive files, that a hook allowance or session
     /// rule does not silence. These prompts bypass the classifier and saved prefix rules.
-    /// In `Auto`, a prompt is allowed only when `approvals` contains the same id, tool and
-    /// input approved on a card; that approval is consumed. Otherwise a card is shown.
-    /// `Bypass` allows these prompts except those marked `needs_a_human`. Those always need
-    /// a card: the user's `permissions.ask` rule forced them, their kind is unknown, or they
-    /// give no reason for asking. A content-scoped ask rule can also give no reason.
+    /// `Bypass` allows all such prompts, including forced asks, unknown kinds and prompts
+    /// with no reason. In `Auto`, a prompt requires an approval matching its id, tool and
+    /// input, which is consumed when used. Otherwise a card is shown. A prompt marked
+    /// `needs_its_own_card` requires a card in `Auto` even with a matching approval: it was
+    /// forced by the user's ask rule, has an unknown kind, or gives no reason for asking.
+    /// A content-scoped ask rule can also give no reason.
     /// Each prompt answered without a card is added to `answered_for_you` with its row note.
     ///
     /// After `respond_permission` succeeds, a `Write`, `Edit` or `NotebookEdit` allowed by
@@ -820,30 +821,25 @@ impl AgentBackend {
                 // O3: never the classifier's or a rule's. The CLI's sentence embeds the
                 // model's own path and a rule can come from a file in the repository, so both are
                 // printed escaped (`{:?}`, review #2): they cannot forge or garble a log line.
-                if prompt.needs_a_human() {
-                    eprintln!(
-                        "[permission] asking the user: {tool_name} (the CLI's own prompt, only you answer it: {:?})",
-                        prompt.label()
-                    );
-                    kept.push((revision, event));
-                    continue;
-                }
                 if host_answered.contains(permission_id) {
                     continue;
                 }
                 let allow_because = match mode {
-                    PermissionMode::Bypass => Some("in bypass"),
+                    // Every prompt, whatever it says about why it asked.
+                    PermissionMode::Bypass => Ok("in bypass"),
+                    PermissionMode::Auto if prompt.needs_its_own_card() => Err(prompt.label()),
                     PermissionMode::Auto => approvals
                         .matches(tool_use_id.as_deref(), tool_name, input)
-                        .then_some("with your approval"),
+                        .then_some("with your approval")
+                        .ok_or_else(|| prompt.reason.clone().unwrap_or_else(|| "no reason given".to_string())),
                 };
-                let Some(because) = allow_because else {
-                    eprintln!(
-                        "[permission] asking the user: {tool_name} (the CLI's own prompt: {:?})",
-                        prompt.reason.as_deref().unwrap_or("no reason given")
-                    );
-                    kept.push((revision, event));
-                    continue;
+                let because = match allow_because {
+                    Ok(because) => because,
+                    Err(why) => {
+                        eprintln!("[permission] asking the user: {tool_name} (the CLI's own prompt: {why:?})");
+                        kept.push((revision, event));
+                        continue;
+                    }
                 };
                 let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
                 let (tool_use_id, label) = (tool_use_id.clone(), prompt.label());
@@ -1077,10 +1073,12 @@ impl AgentBackend {
     /// before a resync, but `TabSet::confirm_bypass` calls directly between pumps. The
     /// projection can already contain the report before the tab is marked `Failed`.
     ///
-    /// Prompts forced by `permissions.ask`, unknown prompt kinds, and prompts with no reason
-    /// remain cards even in bypass. `TabSet::waiting_cards` excludes them from the bypass
-    /// count and list so the confirmation count matches what is approved. This check also
-    /// protects other callers.
+    /// Reads the projection again before each answer. Ingestion continues while earlier
+    /// answers are sent, so a trip folded during the batch stops subsequent answers.
+    ///
+    /// In bypass, CLI prompts are answered regardless of their reason, including
+    /// `permissions.ask`, unknown kinds, and missing reasons. Prompts naming a call are
+    /// returned in `Approved::prompts` with the bypass note for that call's row.
     pub fn approve_pending(&mut self, ids: &[String], why: &str) -> Approved {
         // Its own statement, guard dropped before any answer -- the same lock-order rule the
         // collection below follows.
@@ -1088,24 +1086,35 @@ impl AgentBackend {
             eprintln!("[permission] not answering {why}: the CLI reported an ungated mode");
             return Approved::default();
         }
-        let pending: std::collections::BTreeMap<String, String> = {
+        let pending: std::collections::BTreeMap<String, PendingAnswer> = {
             let projection = self.projection();
             ids.iter()
                 .filter_map(|id| {
                     let p = projection.pending_permissions.get(id)?;
-                    if let Some(prompt) = p.provider_prompt.as_ref().filter(|pp| pp.needs_a_human()) {
-                        eprintln!(
-                            "[permission] not allowing {} {why}: only you answer this prompt ({:?})",
-                            p.tool_name,
-                            prompt.label()
-                        );
-                        return None;
-                    }
-                    Some((id.clone(), p.tool_name.clone()))
+                    let prompt = p
+                        .provider_prompt
+                        .as_ref()
+                        .and_then(|prompt| named_call(&p.tool_use_id).map(|call| (call, prompt.label())));
+                    Some((
+                        id.clone(),
+                        PendingAnswer {
+                            tool_name: p.tool_name.clone(),
+                            prompt,
+                        },
+                    ))
                 })
                 .collect()
         };
         approve_each(ids, &pending, why, |id| {
+            // Its own statement, guard dropped before the answer locks the projection again.
+            let tripped = self.projection().ungated_cli_mode.is_some();
+            if tripped {
+                return Err(BackendError {
+                    message: "the CLI reported an ungated mode".into(),
+                    benign: true,
+                    folded_events: Vec::new(),
+                });
+            }
             self.respond_permission(id, PermissionDecision::Allow)
         })
     }
@@ -1120,26 +1129,35 @@ impl AgentBackend {
 
 /// What [`AgentBackend::approve_pending`] answered: the ids, and the events answering them produced
 /// on this side (legacy's locally folded `PermissionResolved`s; none on the sidecar). A caller that
-/// shows the panel a tab must hand it `events`, or the approved cards stay drawn.
+/// shows the panel a tab must hand it `events`, or the approved cards stay drawn. `prompts` holds the
+/// row note of each CLI prompt it answered that names its call ("<label> — allowed in bypass").
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Approved {
     pub ids: Vec<String>,
     pub events: Vec<AgentDomainEvent>,
+    pub prompts: Vec<PromptAnsweredForYou>,
+}
+
+/// One still-pending request `approve_pending` is about to answer: its tool (for the log) and, for a
+/// CLI prompt that names its call, that call's tool-use id and the prompt's label (for its row note).
+struct PendingAnswer {
+    tool_name: String,
+    prompt: Option<(String, String)>,
 }
 
 /// `approve_pending`'s loop, with the answer itself injected: the legacy arm of `respond_permission`
 /// needs a real `claude` process to exist at all (see `user_prompt_event_records_what_was_typed_not_
 /// what_went_on_the_wire`'s doc), so this is the part a test can drive with a legacy-shaped answer.
-/// `pending` maps each still-pending id to its tool name (for the log only).
+/// `pending` maps each still-pending id to what is answered (`PendingAnswer`).
 fn approve_each(
     ids: &[String],
-    pending: &std::collections::BTreeMap<String, String>,
+    pending: &std::collections::BTreeMap<String, PendingAnswer>,
     why: &str,
     mut respond: impl FnMut(&str) -> Result<Vec<AgentDomainEvent>, BackendError>,
 ) -> Approved {
     let mut approved = Approved::default();
     for id in ids {
-        let Some(tool_name) = pending.get(id) else {
+        let Some(PendingAnswer { tool_name, prompt }) = pending.get(id) else {
             continue;
         };
         match respond(id) {
@@ -1147,6 +1165,13 @@ fn approve_each(
                 eprintln!("[permission] allowed {why}: {tool_name}");
                 approved.ids.push(id.clone());
                 approved.events.extend(events);
+                if let Some((call, label)) = prompt {
+                    // Both callers are bypass, so the note is the one a bypass tab's own answer gives.
+                    approved.prompts.push(PromptAnsweredForYou {
+                        tool_use_id: call.clone(),
+                        note: format!("{label} — allowed in bypass"),
+                    });
+                }
             }
             Err(error) => {
                 eprintln!("[permission] could not allow {tool_name} {why}: {}", error.message);
@@ -2506,7 +2531,8 @@ mod tests {
     }
 
     /// An ungated-mode tripwire prevents approvals even when bypass is reported in the same
-    /// batch. The tripwire takes precedence over bypass.
+    /// batch. It blocks both gate requests and CLI prompts, which bypass would otherwise
+    /// answer regardless of their reason.
     #[test]
     fn a_tripwire_in_bypass_answers_nothing_either() {
         let dir = a_workspace_holding_one_file();
@@ -2526,11 +2552,20 @@ mod tests {
             detail: "SessionReady".into(),
         });
         provider.queue(read("behind-it"));
+        provider.queue(provider_prompt(
+            "prompt-behind-it",
+            Some("tu-1"),
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+            Some("cat:*"),
+        ));
         let mut delivered = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !delivered
+        while delivered
             .iter()
-            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+            .filter(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+            .count()
+            < 2
         {
             assert!(std::time::Instant::now() < deadline, "timed out: {delivered:?}");
             if let UiDelivery::Events(events) = backend.take_ui_delivery(&dir, PermissionMode::Bypass) {
@@ -2712,10 +2747,19 @@ mod tests {
     /// a legacy-shaped answer because a real legacy backend requires a `claude` process.
     #[test]
     fn approve_pending_keeps_the_resolutions_a_legacy_answer_returns() {
-        let pending: std::collections::BTreeMap<String, String> = [("p1", "Write"), ("p2", "Bash"), ("p3", "Edit")]
-            .into_iter()
-            .map(|(id, tool)| (id.to_string(), tool.to_string()))
-            .collect();
+        let pending: std::collections::BTreeMap<String, PendingAnswer> =
+            [("p1", "Write"), ("p2", "Bash"), ("p3", "Edit")]
+                .into_iter()
+                .map(|(id, tool)| {
+                    (
+                        id.to_string(),
+                        PendingAnswer {
+                            tool_name: tool.to_string(),
+                            prompt: None,
+                        },
+                    )
+                })
+                .collect();
         let ids: Vec<String> = ["p1", "gone", "p2", "p3"].iter().map(|s| s.to_string()).collect();
         let mut asked = Vec::new();
         let approved = approve_each(&ids, &pending, "test", |id| {
@@ -2997,49 +3041,147 @@ mod tests {
         backend.shutdown();
     }
 
-    /// A prompt forced by `permissions.ask`, or of an unknown kind, remains a card in both modes.
-    /// In `Auto` it remains a card even after the user approved the gate for the exact same call.
-    #[test]
-    fn a_prompt_only_a_human_answers_is_a_card_in_every_mode() {
-        let dir = a_workspace_holding_one_file();
+    /// Every kind of the CLI's own prompt that Auto keeps as a card of its own
+    /// (`ProviderPrompt::needs_its_own_card`), each under the id `tu-1` for a `Bash` of `cat notes.txt`:
+    /// one a bare and one a content-scoped ask rule forced, one of a kind this build does not know, one
+    /// that gives no reason, one that only describes its subject, one that only names a path, and one
+    /// with an empty and one with a blank reason. Paired with the label its row note carries.
+    fn prompts_that_need_their_own_card() -> Vec<(&'static str, AgentDomainEvent, &'static str)> {
         let cat = serde_json::json!({ "command": "cat notes.txt" });
-        let mut unknown = provider_prompt("perm-unknown", Some("tu-1"), "Bash", cat.clone(), None);
-        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut unknown {
-            provider_prompt.as_mut().unwrap().unrecognized_origin = Some(7);
-        }
-        let ruled = provider_prompt("perm-ask", Some("tu-1"), "Bash", cat.clone(), Some("cat:*"));
-        for (event, id) in [(ruled, "perm-ask"), (unknown, "perm-unknown")] {
-            for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
-                let (provider, mut backend) = sidecar_backend(&dir);
-                provider.queue(event.clone());
-                let mut approvals = HumanApprovals::default();
-                approvals.record("tu-1", "Bash", &cat);
-                let mut host_answered = BTreeSet::new();
-                let (delivered, answered) = deliver(
-                    &mut backend,
-                    &dir,
-                    &agent::PrefixRules::default(),
-                    mode,
-                    &mut host_answered,
-                    &mut approvals,
-                );
-                assert!(carded(&delivered, id), "{id} {mode:?}: {delivered:?}");
-                assert!(provider.resolutions().is_empty(), "{id} {mode:?}");
-                assert!(host_answered.is_empty() && answered.is_empty(), "{id} {mode:?}");
-                assert!(
-                    approvals.contains("tu-1"),
-                    "{id} {mode:?}: an approval a card kept is not used up"
-                );
-                backend.shutdown();
+        let with = |id: &'static str, change: &dyn Fn(&mut agent::ProviderPrompt)| {
+            let mut event = provider_prompt(id, Some("tu-1"), "Bash", cat.clone(), None);
+            if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
+                change(provider_prompt.as_mut().unwrap());
             }
+            event
+        };
+        let maybe_a_rule = "Claude Code asked (maybe your ask rule)";
+        vec![
+            (
+                "perm-scoped-rule",
+                provider_prompt("perm-scoped-rule", Some("tu-1"), "Bash", cat.clone(), Some("cat:*")),
+                "your ask rule: Bash(cat:*)",
+            ),
+            (
+                "perm-bare-rule",
+                with("perm-bare-rule", &|p| {
+                    p.reason = None;
+                    p.matched_ask_rule = Some(agent::MatchedAskRule {
+                        source: "userSettings".into(),
+                        tool_name: "Bash".into(),
+                        rule_content: None,
+                    });
+                }),
+                "your ask rule: Bash",
+            ),
+            (
+                "perm-unknown",
+                with("perm-unknown", &|p| p.unrecognized_origin = Some(7)),
+                "Claude Code asked",
+            ),
+            ("perm-silent", with("perm-silent", &|p| p.reason = None), maybe_a_rule),
+            (
+                "perm-described",
+                with("perm-described", &|p| {
+                    p.reason = None;
+                    p.description = Some("Print the notes".into());
+                }),
+                maybe_a_rule,
+            ),
+            (
+                "perm-path-only",
+                with("perm-path-only", &|p| {
+                    p.reason = None;
+                    p.blocked_path = Some("/p/notes.txt".into());
+                }),
+                maybe_a_rule,
+            ),
+            (
+                "perm-empty-reason",
+                with("perm-empty-reason", &|p| {
+                    p.reason = Some(String::new());
+                    p.blocked_path = Some("/p/notes.txt".into());
+                }),
+                maybe_a_rule,
+            ),
+            (
+                "perm-blank-reason",
+                with("perm-blank-reason", &|p| p.reason = Some("  \n".into())),
+                maybe_a_rule,
+            ),
+        ]
+    }
+
+    /// Bypass approves every request, the CLI's own prompts included, whatever they say about why they
+    /// asked: one the user's own ask rule forced (bare or content-scoped), one of a kind this build does
+    /// not know, and one that gives no reason are each answered `allow` with no card, recorded in
+    /// `host_answered`, and noted on the call's row under their own label.
+    #[test]
+    fn bypass_allows_every_kind_of_the_clis_own_prompt() {
+        let dir = a_workspace_holding_one_file();
+        for (id, event, label) in prompts_that_need_their_own_card() {
+            let (provider, mut backend) = sidecar_backend(&dir);
+            provider.queue(event);
+            let mut host_answered = BTreeSet::new();
+            let (delivered, answered) = deliver(
+                &mut backend,
+                &dir,
+                &agent::PrefixRules::default(),
+                PermissionMode::Bypass,
+                &mut host_answered,
+                &mut HumanApprovals::default(),
+            );
+            assert!(!carded(&delivered, id), "{id}: {delivered:?}");
+            assert_eq!(provider.resolutions(), vec![(id.to_string(), true)], "{id}");
+            assert_eq!(host_answered, BTreeSet::from([id.to_string()]), "{id}");
+            assert_eq!(
+                answered,
+                vec![PromptAnsweredForYou {
+                    tool_use_id: "tu-1".into(),
+                    note: format!("{label} — allowed in bypass"),
+                }],
+                "{id}"
+            );
+            backend.shutdown();
         }
     }
 
-    /// The acceptEdits fast path allows the gate for an in-project `Write`.
-    /// A later CLI prompt for that call remains a card in `Auto`, including one forced by
-    /// `permissions.ask` through `Edit(notes.txt)`. The fast-path allow is not a human approval,
-    /// so `HumanApprovals` stays empty even when no ask rule caused the prompt.
-    /// Prompts forced by `permissions.ask` remain cards in bypass too.
+    /// In Auto the same prompts are cards of their own: the user's approval of the gate's card for
+    /// exactly this call does not answer them, and is not used up by them.
+    #[test]
+    fn in_auto_a_prompt_that_needs_its_own_card_is_one_even_after_an_approval() {
+        let dir = a_workspace_holding_one_file();
+        let cat = serde_json::json!({ "command": "cat notes.txt" });
+        for (id, event, _) in prompts_that_need_their_own_card() {
+            let (provider, mut backend) = sidecar_backend(&dir);
+            provider.queue(event);
+            let mut approvals = HumanApprovals::default();
+            approvals.record("tu-1", "Bash", &cat);
+            let mut host_answered = BTreeSet::new();
+            let (delivered, answered) = deliver(
+                &mut backend,
+                &dir,
+                &agent::PrefixRules::default(),
+                PermissionMode::Auto,
+                &mut host_answered,
+                &mut approvals,
+            );
+            assert!(carded(&delivered, id), "{id}: {delivered:?}");
+            assert!(provider.resolutions().is_empty(), "{id}");
+            assert!(host_answered.is_empty() && answered.is_empty(), "{id}");
+            assert!(
+                approvals.contains("tu-1"),
+                "{id}: an approval a card kept is not used up"
+            );
+            backend.shutdown();
+        }
+    }
+
+    /// The acceptEdits fast path allows only the gate's request for an in-project `Write`.
+    /// A later CLI prompt for that same call is still a card in `Auto`, whether a user's
+    /// `permissions.ask` rule (`Edit(notes.txt)`) forced it or no rule is behind it: the fast-path
+    /// allow is not a human approval, so `HumanApprovals` stays empty. This keeps an ask rule for
+    /// an edit from being answered silently in `Auto`. Bypass allows the prompt.
     #[test]
     fn a_users_own_ask_rule_still_cards_an_edit_the_fast_path_allowed() {
         let dir = a_workspace_holding_one_file();
@@ -3162,95 +3304,22 @@ mod tests {
         backend.shutdown();
     }
 
-    /// A blocked path is not a reason: a path check can sit next to a user's own rule's decision, and the
-    /// prompt bypass may approve (the sensitive-file check) carries its reason and no path. So a prompt
-    /// with a path and no reason -- or an empty or blank reason, which a hook's ask can produce -- is a
-    /// card in bypass and in Auto, and a reason is what lets bypass answer it.
-    #[test]
-    fn a_prompt_without_a_real_reason_is_a_card_whatever_else_it_carries() {
-        let dir = a_workspace_holding_one_file();
-        let variants: [(&str, Option<&str>, Option<&str>); 3] = [
-            ("path only", None, Some("/p/.git/probe")),
-            ("empty reason", Some(""), Some("/p/.git/probe")),
-            ("blank reason", Some("  \n"), None),
-        ];
-        for (what, reason, blocked_path) in variants {
-            for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
-                let (provider, mut backend) = sidecar_backend(&dir);
-                let mut event = provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None);
-                if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
-                    let prompt = provider_prompt.as_mut().unwrap();
-                    prompt.reason = reason.map(str::to_string);
-                    prompt.blocked_path = blocked_path.map(str::to_string);
-                }
-                provider.queue(event);
-                let mut approvals = HumanApprovals::default();
-                approvals.record("tu-1", "Write", &probe_write());
-                let mut host_answered = BTreeSet::new();
-                let (delivered, answered) = deliver(
-                    &mut backend,
-                    &dir,
-                    &agent::PrefixRules::default(),
-                    mode,
-                    &mut host_answered,
-                    &mut approvals,
-                );
-                assert!(carded(&delivered, "perm-prov"), "{what} {mode:?}: {delivered:?}");
-                assert!(provider.resolutions().is_empty(), "{what} {mode:?}");
-                assert!(host_answered.is_empty() && answered.is_empty(), "{what} {mode:?}");
-                backend.shutdown();
-            }
-        }
-    }
-
-    /// A user's content-scoped ask rule reaches Eitri with no reason, no matched rule and no blocked
-    /// path (the CLI names only a bare tool-name rule), so a prompt that explains nothing is a card in
-    /// every mode: not answered in bypass, and not on the strength of the human's approval of the
-    /// gate's card for the same call in Auto.
-    #[test]
-    fn a_prompt_that_explains_nothing_is_a_card_in_every_mode() {
-        let dir = a_workspace_holding_one_file();
-        let echo = serde_json::json!({ "command": "echo zebra" });
-        let mut silent = provider_prompt("perm-silent", Some("tu-1"), "Bash", echo.clone(), None);
-        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut silent {
-            let prompt = provider_prompt.as_mut().unwrap();
-            prompt.reason = None;
-            prompt.description = Some("Print the word zebra".into());
-        }
-        for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
-            let (provider, mut backend) = sidecar_backend(&dir);
-            provider.queue(silent.clone());
-            let mut approvals = HumanApprovals::default();
-            approvals.record("tu-1", "Bash", &echo);
-            let mut host_answered = BTreeSet::new();
-            let (delivered, answered) = deliver(
-                &mut backend,
-                &dir,
-                &agent::PrefixRules::default(),
-                mode,
-                &mut host_answered,
-                &mut approvals,
-            );
-            assert!(carded(&delivered, "perm-silent"), "{mode:?}: {delivered:?}");
-            assert!(provider.resolutions().is_empty(), "{mode:?}");
-            assert!(host_answered.is_empty() && answered.is_empty(), "{mode:?}");
-            assert!(
-                approvals.contains("tu-1"),
-                "{mode:?}: an approval a card kept is not used up"
-            );
-            backend.shutdown();
-        }
-    }
-
     /// Fail toward a card, as every automatic answer here does: an allow of the CLI's own prompt that
-    /// the provider refuses stays in the delivery -- and an approval it would have used is kept.
+    /// the provider refuses stays in the delivery -- and an approval it would have used is kept. In
+    /// bypass that holds for a prompt the user's own ask rule forced as much as for a plain one.
     #[test]
     fn a_failed_allow_of_the_clis_own_prompt_draws_the_card() {
         let dir = a_workspace_holding_one_file();
-        for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
+        let plain = provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None);
+        let ruled = provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), Some(".git/probe"));
+        for (mode, event) in [
+            (PermissionMode::Bypass, plain.clone()),
+            (PermissionMode::Bypass, ruled),
+            (PermissionMode::Auto, plain),
+        ] {
             let (provider, mut backend) = sidecar_backend(&dir);
             provider.refuse_resolutions(true);
-            provider.queue(provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None));
+            provider.queue(event);
             let mut approvals = HumanApprovals::default();
             approvals.record("tu-1", "Write", &probe_write());
             let mut host_answered = BTreeSet::new();
@@ -3270,10 +3339,10 @@ mod tests {
     }
 
     /// `approve_pending` (entering bypass with cards waiting, and the bypass resync sweep) answers a
-    /// list in one go; a prompt only a human answers -- an ask rule's, or one of unknown kind -- is
-    /// never in what it answers.
+    /// list in one go, the CLI's own prompts included: an ask rule's, one of unknown kind and one that
+    /// gives no reason are answered like a plain one, in the order given.
     #[test]
-    fn approve_pending_never_answers_a_prompt_only_a_human_answers() {
+    fn approve_pending_answers_every_kind_of_the_clis_own_prompt() {
         let dir = a_workspace_holding_one_file();
         let (provider, mut backend) = sidecar_backend(&dir);
         provider.queue(provider_prompt(
@@ -3288,6 +3357,11 @@ mod tests {
             provider_prompt.as_mut().unwrap().unrecognized_origin = Some(7);
         }
         provider.queue(unknown);
+        let mut silent = provider_prompt("perm-silent", Some("tu-4"), "Write", probe_write(), None);
+        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut silent {
+            provider_prompt.as_mut().unwrap().reason = None;
+        }
+        provider.queue(silent);
         provider.queue(provider_prompt(
             "perm-plain",
             Some("tu-2"),
@@ -3296,17 +3370,93 @@ mod tests {
             None,
         ));
         let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
-        assert_eq!(delivered.len(), 3, "all card in Auto with no approval: {delivered:?}");
-        let answered = backend.approve_pending(
-            &[
-                "perm-ask".to_string(),
-                "perm-unknown".to_string(),
-                "perm-plain".to_string(),
-            ],
-            "test",
+        assert_eq!(delivered.len(), 4, "all card in Auto with no approval: {delivered:?}");
+        let ids: Vec<String> = ["perm-ask", "perm-unknown", "perm-silent", "perm-plain"]
+            .map(str::to_string)
+            .to_vec();
+        let answered = backend.approve_pending(&ids, "test");
+        assert_eq!(answered.ids, ids);
+        assert_eq!(
+            provider.resolutions(),
+            ids.iter().map(|id| (id.clone(), true)).collect::<Vec<_>>()
         );
-        assert_eq!(answered.ids, vec!["perm-plain".to_string()]);
-        assert_eq!(provider.resolutions(), vec![("perm-plain".to_string(), true)]);
+        backend.shutdown();
+    }
+
+    /// What `approve_pending` answers of the CLI's own prompts carries the row note a bypass tab's own
+    /// answer carries ("<label> — allowed in bypass"), by tool-use id, so a call approved on entering
+    /// bypass or by the resync sweep says so on its row too. The gate's own request, and a prompt that
+    /// names no call, give none.
+    #[test]
+    fn approve_pending_notes_each_cli_prompt_it_answers() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        provider.queue(provider_prompt(
+            "perm-ask",
+            Some("tu-1"),
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+            Some("cat:*"),
+        ));
+        let mut silent = provider_prompt("perm-silent", Some("tu-2"), "Write", probe_write(), None);
+        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut silent {
+            provider_prompt.as_mut().unwrap().reason = None;
+        }
+        provider.queue(silent);
+        provider.queue(provider_prompt("perm-noid", None, "Write", probe_write(), None));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-gate".into(),
+            tool_use_id: Some("tu-4".into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "rm -rf build" }),
+            provider_prompt: None,
+        });
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        assert_eq!(delivered.len(), 4, "{delivered:?}");
+        let ids: Vec<String> = ["perm-ask", "perm-silent", "perm-noid", "perm-gate"]
+            .map(str::to_string)
+            .to_vec();
+        let answered = backend.approve_pending(&ids, "on entering bypass");
+        assert_eq!(answered.ids, ids);
+        assert_eq!(
+            answered.prompts,
+            vec![
+                PromptAnsweredForYou {
+                    tool_use_id: "tu-1".into(),
+                    note: "your ask rule: Bash(cat:*) — allowed in bypass".into(),
+                },
+                PromptAnsweredForYou {
+                    tool_use_id: "tu-2".into(),
+                    note: "Claude Code asked (maybe your ask rule) — allowed in bypass".into(),
+                },
+            ]
+        );
+        backend.shutdown();
+    }
+
+    /// A trip folded by ingestion while the first answer is being sent stops later answers in
+    /// the same `approve_pending` batch, matching `answer_what_needs_no_human`.
+    #[test]
+    fn approve_pending_stops_at_a_trip_folded_mid_batch() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        provider.queue(provider_prompt(
+            "perm-1",
+            Some("tu-1"),
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+            Some("cat:*"),
+        ));
+        provider.queue(provider_prompt("perm-2", Some("tu-2"), "Write", probe_write(), None));
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        assert_eq!(delivered.len(), 2, "{delivered:?}");
+        provider.fold_after_next_resolution(vec![AgentDomainEvent::UngatedCliMode {
+            reported: "acceptEdits".into(),
+            detail: "SessionReady".into(),
+        }]);
+        let answered = backend.approve_pending(&["perm-1".to_string(), "perm-2".to_string()], "on entering bypass");
+        assert_eq!(answered.ids, vec!["perm-1".to_string()]);
+        assert_eq!(provider.resolutions(), vec![("perm-1".to_string(), true)]);
         backend.shutdown();
     }
 
@@ -3529,8 +3679,8 @@ mod tests {
 
     /// The CLI's own prompts keep their rules on an auto session: never deferred (Verdandi refuses
     /// that, and it is the CLI's own question already), a card in Auto without the human's approval
-    /// of the same call, allowed with it, allowed in bypass, and a card in every mode when only a
-    /// human may answer it.
+    /// of the same call, allowed with it, allowed in bypass, and one the user's ask rule forced a card
+    /// in Auto even with the approval and allowed in bypass.
     #[test]
     fn the_clis_own_prompts_are_answered_as_before_on_an_auto_session() {
         let dir = a_workspace_holding_one_file();
@@ -3574,7 +3724,8 @@ mod tests {
             vec![("perm-prov".to_string(), PermissionDecision::Allow)]
         );
         backend.shutdown();
-        // An ask rule's prompt: a card in both modes, even with the approval.
+        // An ask rule's prompt: a card in Auto even with the approval, allowed in bypass, never
+        // deferred in either.
         for mode in [PermissionMode::Auto, PermissionMode::Bypass] {
             let (provider, mut backend) = auto_backend(&dir);
             provider.queue_all(vec![
@@ -3591,8 +3742,17 @@ mod tests {
                 &mut BTreeSet::new(),
                 &mut approvals,
             );
-            assert!(carded(&delivered, "perm-ask"), "{mode:?}: {delivered:?}");
-            assert!(provider.decisions().is_empty(), "{mode:?}");
+            if mode == PermissionMode::Auto {
+                assert!(carded(&delivered, "perm-ask"), "{mode:?}: {delivered:?}");
+                assert!(provider.decisions().is_empty(), "{mode:?}");
+            } else {
+                assert!(!carded(&delivered, "perm-ask"), "{mode:?}: {delivered:?}");
+                assert_eq!(
+                    provider.decisions(),
+                    vec![("perm-ask".to_string(), PermissionDecision::Allow)],
+                    "{mode:?}"
+                );
+            }
             backend.shutdown();
         }
     }

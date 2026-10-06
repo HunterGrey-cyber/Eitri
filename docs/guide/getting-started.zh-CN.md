@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=d09c25371dfec1cec34748f5862c1fef032e500dce80c14e2de21d6aecd392d9 -->
+<!-- translated-from: getting-started.md sha256=cb990b0576b560085e3695f22fa2a5403c1c670f265755f9412ca42a9064b7cb -->
 
 # 快速上手
 
@@ -64,7 +64,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 **Auto 和 bypass。** 每个标签页处于两种模式之一，`Shift+Tab`（或 `<leader>m`）来切换。
 
 - **Auto** 是默认模式。Eitri 仍然看得到每一次调用。你保存的规则允许的调用会被立即批准。其余的交给 Claude Code 自己的 auto 模式来决定，它不用卡片；它拒绝一次调用时，该工具那一行会写 `blocked by auto: <原因>`，多次被拒绝之后，Claude Code 会自己用一张卡片来问你。如果你的 Claude Code 运行不了它的 auto 模式，就由 Eitri 自己的规则来决定哪些调用需要卡片。
-- **Bypass** 让 Eitri 自己批准工具调用，它自己的检查不再出卡片。Claude Code 自己提出的、只有人才能回答的问题仍然会作为卡片出现：一种是你的 `permissions.ask` 规则强制要问的，另一种是没有说明为什么要问的。因为 bypass 意味着很大的信任，`Shift+Tab` 进入它时会先问一句（一个 `y/n` 问题，措辞会说明还有什么会变，例如它会批准多少张等待中的卡片），而且只有单独按下、并且在问题出现片刻之后按的 `y` 才算数。离开 bypass 不需要确认。
+- **Bypass** 让 Eitri 自己批准每一次工具调用，不出卡片：它自己的检查和 Claude Code 自己提出的问题都一样，你的 `permissions.ask` 规则强制要问的也在内。因为 bypass 意味着很大的信任，`Shift+Tab` 进入它时会先问一句（一个 `y/n` 问题，措辞会说明还有什么会变，例如它会批准多少张等待中的卡片），而且只有单独按下、并且在问题出现片刻之后按的 `y` 才算数。离开 bypass 不需要确认。
 
 每种模式具体放行什么、保存的规则，以及项目自己的 Claude Code 配置如何被信任，都在[权限](permissions.zh-CN.md)里。
 

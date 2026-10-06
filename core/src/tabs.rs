@@ -217,21 +217,6 @@ pub fn bypass_prompt(scope: PromptScope, waiting: usize) -> String {
     }
 }
 
-/// The consequence line under a bypass prompt when cards stay waiting after `y`: a CLI prompt only a
-/// human answers (the user's own ask rule's, one that gives no reason for asking, or one of a kind
-/// this build does not know) is a card in bypass too, and `y` does not approve it -- so the prompt says
-/// so rather than leaving it to be found afterwards. It claims no more than Eitri knows: a prompt
-/// without a reason is only possibly the user's own rule. English like the prompt above it; the verb
-/// agrees with the count.
-pub fn bypass_staying_line(staying: usize) -> String {
-    let (cards, stay) = if staying == 1 {
-        ("card", "stays")
-    } else {
-        ("cards", "stay")
-    };
-    format!("{staying} {cards} only you can answer {stay} waiting after the switch")
-}
-
 /// tmux's `confirm-before`, plus a line for each consequence that applies.
 pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
     let mut lines = vec![format!("close {} \"{}\"? (y/n)", facts.number, facts.label_name)];
@@ -596,23 +581,6 @@ mod tests {
             bypass_prompt(PromptScope::LiveTab, 12),
             "Switch to bypass and approve the 12 waiting cards? (y/n)"
         );
-    }
-
-    /// The consequence line under the prompt in English and agreeing with its count:
-    /// one card "stays", several "stay".
-    #[test]
-    fn the_staying_line_agrees_with_its_count() {
-        assert_eq!(
-            bypass_staying_line(1),
-            "1 card only you can answer stays waiting after the switch"
-        );
-        assert_eq!(
-            bypass_staying_line(2),
-            "2 cards only you can answer stay waiting after the switch"
-        );
-        for staying in [1, 2, 7] {
-            assert!(bypass_staying_line(staying).is_ascii(), "{staying}");
-        }
     }
 
     #[test]

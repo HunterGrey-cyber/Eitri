@@ -269,8 +269,8 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
 
 /// Returns `None` for a hook request, or `Some` with the CLI's words for a prompt it raised.
 /// UNSPECIFIED is treated as HOOK for older sidecars, and provider fields on HOOK are ignored.
-/// An unknown origin becomes a provider prompt excluded from permission-policy evaluation
-/// and automatic answers. It requires a human response in every mode, including bypass.
+/// An unknown origin becomes a provider prompt excluded from permission-policy evaluation.
+/// In Auto it needs its own card and cannot reuse an earlier approval. Bypass answers it normally.
 fn provider_prompt_of(requested: &claude_runtime_protocol::v1::PermissionRequested) -> Option<crate::ProviderPrompt> {
     let unrecognized_origin = match ProtoPermissionOrigin::try_from(requested.origin) {
         Ok(ProtoPermissionOrigin::Unspecified) | Ok(ProtoPermissionOrigin::Hook) => return None,
@@ -278,7 +278,7 @@ fn provider_prompt_of(requested: &claude_runtime_protocol::v1::PermissionRequest
         Err(_) => {
             eprintln!(
                 "agent: ClaudeSidecarProvider: PermissionRequested with unrecognized origin {}, treated as \
-                 a CLI prompt only a human answers (a card in every mode)",
+                 a CLI prompt that is a card of its own outside bypass",
                 requested.origin
             );
             Some(requested.origin)
@@ -754,7 +754,7 @@ mod tests {
             Some(AgentDomainEvent::PermissionRequested { provider_prompt, .. }) => {
                 assert_eq!(provider_prompt, Some(crate::ProviderPrompt::default()));
                 // It names no reason, rule or path, so nothing tells it from the user's own rule.
-                assert!(provider_prompt.unwrap().needs_a_human());
+                assert!(provider_prompt.unwrap().needs_its_own_card());
             }
             other => panic!("expected a PermissionRequested, got {other:?}"),
         }
@@ -793,9 +793,9 @@ mod tests {
             Some(AgentDomainEvent::PermissionRequested { provider_prompt, .. }) => {
                 let prompt = provider_prompt.expect("an unknown origin is never the gate's own request");
                 assert_eq!(prompt.unrecognized_origin, Some(7));
-                // O3 review #3: it is a card in every mode, bypass included -- the same standing
-                // as the user's own ask rule, not the plain CLI prompt bypass allows.
-                assert!(prompt.needs_a_human());
+                // The same standing as the user's own ask rule: in Auto a card of its own, not
+                // answered on an approval of the same call's gate card.
+                assert!(prompt.needs_its_own_card());
             }
             other => panic!("expected a PermissionRequested, got {other:?}"),
         }

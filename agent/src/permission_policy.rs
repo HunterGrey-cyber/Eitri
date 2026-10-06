@@ -1,70 +1,79 @@
-//! Classifies tool calls that reach the permission gate.
+//! Classifies tool calls that reach the permission gate to decide whether to ask the user.
 //!
-//! Both backends install a `PreToolUse` gate with matcher `*`. The gate sees every call;
-//! this module decides which calls need a user prompt. Asking the host about a call must
-//! not automatically produce a GUI card for harmless reads and searches.
+//! Both backends install a `PreToolUse` gate with a `*` matcher. The legacy backend generates
+//! its hook in `crate::process`; the sidecar supplies its hook through `permissionBroker.ts`.
+//! Every call must reach the gate, but that does not mean every call needs a GUI card.
+//! Forwarding every call to a card would prompt even for reads and searches.
 //!
-//! The policy lives in `agent` because it depends on the CLI's tool names, input fields
-//! and permission behavior. Its CLI conformance tests live in the same crate.
+//! This policy lives in `agent` because it uses the CLI's tool vocabulary, including `Read`'s
+//! `file_path` and `Bash`'s `command`. The core crate depends on `agent`, so both crates can use it.
+//! The real-CLI conformance tests live alongside it in `agent/tests/permission_policy_conformance.rs`.
 //!
-//! The baseline is the CLI's interactive `default` mode without configured permission
-//! rules. Under `claude --print` without `--permission-mode`, calls that would prompt
-//! are denied instead. On CLI 2.1.272, `Read`, `ls`, `cat a.txt` and `git status --short`
-//! were allowed; `Write`, `echo hi > c.txt`, `rm b.txt` and `git commit` were denied.
-//! The CLI's `auto` mode is separate and uses a classifier for some actions.
+//! The baseline is interactive `default` mode with no configured permission rules.
+//! With `--print` and no `--permission-mode` flag, the CLI uses the same classification but denies
+//! calls that would need a prompt. This lets tests identify calls that need no human response.
+//! On CLI 2.1.272, `Read`, `ls`, `cat a.txt` and `git status --short` were allowed.
+//! `Write`, `echo hi > c.txt`, `rm b.txt` and `git commit` were denied.
+//! The CLI's `--permission-mode auto` is separate: it auto-approves and uses a background classifier.
 //!
-//! For `Write`, `Edit` and `NotebookEdit`, this module also reproduces the deterministic
-//! `acceptEdits` fast path from CLI 2.1.283. Both the requested and resolved paths must
-//! stay inside the project root and pass [`DANGEROUS_DIRECTORIES`],
-//! [`DANGEROUS_RELATIVE_PATH`] and [`PROTECTED_EDIT_FILE_BASENAMES`]. Hard-linked files,
-//! malformed input, unresolvable targets and paths that cannot be examined get a card.
-//! A qualifying target gets [`PermissionVerdict::AllowWithoutAsking`].
+//! This module also reproduces the edit fast path used by CLI 2.1.283's auto mode.
+//! That fast path allows in-project writes and edits without its classifier unless the target is
+//! protected. Here, `Write`, `Edit` and `NotebookEdit` can return [`PermissionVerdict::AllowWithoutAsking`]
+//! only when the target is inside the project root both as written and after resolution.
+//! It must not be a hard-linked file or match [`DANGEROUS_DIRECTORIES`], [`DANGEROUS_RELATIVE_PATH`]
+//! or [`PROTECTED_EDIT_FILE_BASENAMES`]. `classify_edit_target` implements these checks.
+//! Outside paths, failed resolution, unexaminable directories, hard links, malformed input and
+//! protected paths still require a card.
 //!
-//! The application resolves paths in a different process from the CLI that opens them.
-//! Links such as `/proc/self/cwd` or `/dev/fd` can mean different things in each process.
-//! The shared resolver therefore refuses lookups under `/proc`, `/sys` and `/dev`
-//! ([`KERNEL_TREES`]). [`resolve_in_root`] also refuses links outside the root or links
-//! that leave it at any step, even if they return inside. These restrictions apply to
-//! read tools and `Bash` arguments as well as edit targets.
+//! Path resolution happens in this process, while the CLI child writes with the project root as
+//! its working directory. Per-process links such as `/proc/self/cwd`, `/proc/self/root`,
+//! `/proc/self/fd/*`, `/dev/fd` and `/dev/stdin` can therefore resolve differently in the child.
+//! A link such as `d -> /proc/self/cwd/..` could otherwise make an outside write appear inside.
+//! The shared resolver refuses lookups under `/proc`, `/sys` and `/dev` through [`KERNEL_TREES`].
+//! [`resolve_in_root`] follows only links that stay inside the root at every step.
+//! A link that leaves the root and returns still requires a card. These protections also apply
+//! to `Read`, `Grep`, `Glob` and `Bash` arguments.
 //!
-//! `boundary` rejects a root that no longer resolves to itself. Otherwise, moving the
-//! project and replacing it with a link could silently change the permission boundary.
-//! `classify_search_path` rejects `Grep` and `Glob` paths whose spelling the CLI would
-//! change by trimming, expanding `~` or settling `..` lexically.
+//! A root that no longer resolves to itself is rejected by `boundary`. Renaming a root and leaving
+//! a link in its place must not move the permission boundary. `classify_search_path` also requires
+//! a card when the CLI would interpret a `Grep` or `Glob` path differently after trimming,
+//! expanding a leading `~` or resolving `..` by name.
+//! A directory or link can still change between classification and the CLI opening the path.
+//! Rejecting links alone cannot close this window because a directory can also be replaced by a link.
+//! Only the opening process could close it, for example with `openat2` and `RESOLVE_BENEATH`.
 //!
-//! A path can still change between this check and the CLI opening it. A process able
-//! to change a directory on the path can retarget a link or replace a directory with
-//! one. Closing that window requires the opening process to enforce containment,
-//! for example with `openat2` and `RESOLVE_BENEATH`.
-//!
-//! The entire `.claude` directory requires a card here. The CLI's exceptions for its
-//! skills, agents, commands, scheduled tasks and worktrees are not reproduced.
+//! The entire `.claude` directory requires a card here. The CLI's exceptions for `.claude/skills`,
+//! `.claude/agents`, `.claude/commands`, `.claude/scheduled_tasks.json` and `.claude/worktrees` are
+//! omitted, so this module asks in some cases where the CLI would allow the edit.
 //!
 //! Saved [`crate::permission_rules::PrefixRules`] are allow-only and match only `Bash`.
-//! They never match `Write`, `Edit` or `NotebookEdit`, so they cannot override the edit
-//! fast path or widen it past protected paths. This module does not read the CLI's own
-//! `permissions.deny` or `permissions.ask` settings.
-//!
-//! CLI 2.1.283's bundle indicates that its own deny rules override a hook `allow` and
-//! its edit ask rules can still reach `canUseTool`. On the sidecar, a provider prompt
-//! with `matched_ask_rule` gets a card in every mode through `ProviderPrompt::needs_a_human`.
+//! `PrefixRules::matching_rule` returns `None` for every other tool, so saved rules cannot change
+//! an edit verdict or bypass a protected path. `no_rule_can_touch_the_edit_tools_at_all` tests this.
+//! The CLI's own `permissions.deny` and `permissions.ask` settings are separate from these saved rules.
+//! In CLI 2.1.283's bundle, `EQn` runs `DR` after a hook allows a call. A deny rule stops the call.
+//! An edit ask rule makes `checkPermissions` return an ask, which reaches `canUseTool` rather than
+//! accepting the hook's allow. On the sidecar, `matched_ask_rule` produces a separate card in Auto
+//! through `ProviderPrompt::needs_its_own_card`; a bypass tab answers it like other requests.
 //! The legacy backend refuses under `--print` when no prompt tool is available.
-//! This chain has not been verified against the running CLI; the corresponding
-//! conformance test remains ignored.
+//! This chain matters because the edit fast path can allow an edit that a CLI ask rule must stop.
+//! The CLI behavior is inferred from its bundle; the real-CLI conformance test remains ignored.
 //!
-//! Bypass mode is handled before `classify_with_rules` and never reaches this module.
-//! The CLI is still launched with `--permission-mode default`, and the `PreToolUse`
-//! gate still sees every call.
+//! Bypass mode returns `allow` before `classify_with_rules`, so it never reaches this module.
+//! The CLI is spawned with `--permission-mode default`, and the `PreToolUse` hook still sees every call.
 //!
-//! Anything this module cannot classify confidently gets a card. A permissive mistake
-//! can grant unsafe access; a restrictive mistake costs a click. `Bash` commands with
-//! metacharacters that could redirect, chain, glob, substitute or quote require a card.
-//! Matching only the first word would incorrectly allow a command such as `echo hi > c.txt`.
-//! `WebFetch` requires a card because the CLI's documentation-domain exemptions are
-//! not known here. Unknown tools and malformed input also require a card.
+//! Anything this module cannot classify with confidence requires a card. A mistaken allow can
+//! grant unwanted access; an unnecessary card costs a click.
+//! There is no shell parser. A `Bash` command with metacharacters that redirect, chain, glob,
+//! substitute or quote requires a card. Matching only the first word would wrongly allow
+//! `echo hi > c.txt` just because `echo` is on the CLI's read-only list.
+//! `WebFetch` always requires a card because the CLI's preapproved documentation domain list
+//! is unavailable here. Unknown tool names also require a card.
+//! Malformed tool input requires a card, including a non-object input, a missing path or a
+//! `command` value that is not a string.
 //!
-//! `crate::CONSERVATIVE_DISALLOWED_TOOLS` serves a separate purpose: it forbids tools
-//! entirely in Bypass mode. This module classifies calls that reach an active gate.
+//! Keep this policy separate from `crate::CONSERVATIVE_DISALLOWED_TOOLS`.
+//! That array forbids tools in Bypass mode and is mirrored as `CONSERVATIVE_BYPASS_DENY`.
+//! This module classifies calls that reach a live permission gate.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
