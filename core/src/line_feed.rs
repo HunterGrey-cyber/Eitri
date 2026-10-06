@@ -390,6 +390,25 @@ mod tests {
         let mut reader = reader_for(&mut feed);
         let mut client = UnixStream::connect(feed.socket_path()).unwrap();
         let file = "x".repeat(MAX_READ_BYTES_PER_POLL);
+        // macOS's default AF_UNIX send buffer is a few KiB, so this one write would block before the
+        // reader ever polls; give the client room for the whole message so the write completes first
+        // and the first poll really sees more data than its budget.
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let room: libc::c_int = (4 * MAX_READ_BYTES_PER_POLL) as libc::c_int;
+            // SAFETY: the descriptor is open for the call and `room` outlives it.
+            let set = unsafe {
+                libc::setsockopt(
+                    client.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&room as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(set, 0, "raise the test client's send buffer");
+        }
         writeln!(client, "{{\"v\":1,\"file\":\"{file}\"}}").unwrap();
         assert!(
             reader.poll().is_none(),

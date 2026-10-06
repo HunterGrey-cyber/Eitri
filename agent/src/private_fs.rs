@@ -437,7 +437,12 @@ mod tests {
         if current_uid() == 0 {
             return;
         }
-        // `/etc/hostname` is not guaranteed; any root-owned, world-readable file will do.
+        // `/etc/hostname` is not guaranteed; any root-owned, world-readable file will do. macOS's
+        // `/etc/passwd` is stored compressed, and opening such a file for writing blocks in the kernel
+        // while it is decompressed, so there the target is a file that is not.
+        #[cfg(target_os = "macos")]
+        let theirs = Path::new("/etc/hosts");
+        #[cfg(not(target_os = "macos"))]
         let theirs = Path::new("/etc/passwd");
         assert!(open_private(theirs).is_err());
         assert!(std::fs::metadata(theirs).unwrap().len() > 0);

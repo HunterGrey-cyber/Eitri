@@ -28,7 +28,14 @@ impl ScratchDir {
     /// Creates `<std::env::temp_dir()>/<prefix>-<label>-<uuid>/state` and returns a guard that
     /// removes the whole `<prefix>-<label>-<uuid>` directory on drop.
     pub(crate) fn new(prefix: &str, label: &str) -> Self {
+        // macOS's `TMPDIR` is already ~49 bytes and a socket path may not pass 103, so there the
+        // directory is named by a short random id alone; the long form is kept where paths are roomy.
+        #[cfg(target_os = "macos")]
+        let outer = std::env::temp_dir().join(&uuid::Uuid::new_v4().simple().to_string()[..12]);
+        #[cfg(not(target_os = "macos"))]
         let outer = std::env::temp_dir().join(format!("{prefix}-{label}-{}", uuid::Uuid::new_v4()));
+        #[cfg(target_os = "macos")]
+        let _ = (prefix, label);
         let dir = outer.join("state");
         std::fs::create_dir_all(&dir).unwrap();
         ScratchDir { outer, dir }

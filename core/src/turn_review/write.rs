@@ -302,7 +302,9 @@ pub fn read_current(target: &Target) -> io::Result<Current> {
             file.read_to_end(&mut bytes)?;
             Ok(Current::Regular {
                 bytes,
-                mode: fst.st_mode & 0o7777,
+                // `st_mode` is `u16` on macOS, `u32` on Linux; widen so `Current::Regular::mode`
+                // has one type on every platform.
+                mode: fst.st_mode as u32 & 0o7777,
             })
         }
         _ => Ok(Current::Other),
@@ -650,7 +652,7 @@ fn in_place(
         let mut writer = &file;
         writer.seek(SeekFrom::Start(0))?;
         write_chunks(&mut writer, bytes, fault)?;
-        if mode != fst.st_mode & 0o7777 {
+        if mode != fst.st_mode as u32 & 0o7777 {
             // SAFETY: the descriptor is open for the call; `fchmod` takes no pointers.
             retry(|| unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) })?;
         }
@@ -699,7 +701,7 @@ fn put_back(parent: &OwnedFd, leaf: &CString, file: &File, pre: &[u8], pre_mode:
     writer.seek(SeekFrom::Start(0))?;
     writer.write_all(pre)?;
     let fd = file.as_raw_fd();
-    if fstat(fd)?.st_mode & 0o7777 != pre_mode {
+    if fstat(fd)?.st_mode as u32 & 0o7777 != pre_mode {
         // SAFETY: the descriptor is open for the call; `fchmod` takes no pointers.
         retry(|| unsafe { libc::fchmod(fd, pre_mode as libc::mode_t) })?;
     }
@@ -713,7 +715,7 @@ fn put_back(parent: &OwnedFd, leaf: &CString, file: &File, pre: &[u8], pre_mode:
     let (mut again, ast) = open_leaf(parent, leaf, libc::O_RDONLY, &st)?;
     let mut bytes = Vec::with_capacity(pre.len());
     again.read_to_end(&mut bytes)?;
-    if bytes != pre || ast.st_mode & 0o7777 != pre_mode {
+    if bytes != pre || ast.st_mode as u32 & 0o7777 != pre_mode {
         return Err(io::Error::other(
             "reading it back did not give its earlier bytes and mode",
         ));

@@ -316,7 +316,16 @@ mod tests {
         let b = test_workspace_dir("unit");
         assert_ne!(a, b);
         assert!(a.is_dir() && b.is_dir());
-        assert!(a.starts_with(redirect_state_to_a_test_root()));
+        // `a` is canonicalized (see `test_workspace_dir`'s own comment on why); on macOS
+        // `$TMPDIR` has a symlinked ancestor (`/var` -> `/private/var`), so the uncanonicalized
+        // root must be resolved the same way before comparing.
+        let root = redirect_state_to_a_test_root();
+        let root = if cfg!(target_os = "macos") {
+            root.canonicalize().expect("the test root should resolve")
+        } else {
+            root
+        };
+        assert!(a.starts_with(root));
     }
 
     /// A root belonging to a pid that no longer exists is removed; a live one is not. Pid 1 always

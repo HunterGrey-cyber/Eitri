@@ -6541,7 +6541,11 @@ mod tests {
     /// (resolving back to `dir`) up to about `pad` bytes, the last naming `last`. What the round-3
     /// review built: every hop resolves where it points, so nothing about it is refused except
     /// what it costs.
-    #[cfg(unix)]
+    ///
+    /// Linux-only: every caller here pads to ~4 KB, which fits Linux's 4096-byte `PATH_MAX` but
+    /// not macOS's 1024-byte one -- `symlink(2)` itself refuses a target that long on macOS, so
+    /// the fixture cannot even be built there.
+    #[cfg(target_os = "linux")]
     fn padded_chain(dir: &Path, prefix: &str, n: usize, pad: usize, last: &str) {
         std::fs::create_dir_all(dir.join("d")).unwrap();
         let padding = "d/../".repeat(pad / 5);
@@ -6565,7 +6569,10 @@ mod tests {
     /// Paths are now resolved by a bounded resolver that reads each link before following it: a
     /// long target, one with many components or `..`, too many hops or steps, or a git directory
     /// holding more links than the policy checks -- each cards.
-    #[cfg(unix)]
+    ///
+    /// Linux-only: see [`padded_chain`] -- every case here needs a ~4 KB symlink target, which
+    /// macOS's `symlink(2)` refuses outright (its `PATH_MAX` is 1024, not Linux's 4096).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_path_whose_links_would_take_long_to_resolve_cards_instead() {
         // The review's shape, scaled down: links in `.git` whose every hop resolves inside it.
@@ -6681,25 +6688,9 @@ mod tests {
                 carded(&ws, "one component too many")
             }
         }
-        // A target's bytes: one component, a long name.
-        for (bytes, ok) in [(MAX_LINK_TARGET_BYTES, true), (MAX_LINK_TARGET_BYTES + 1, false)] {
-            let ws = Workspace::new();
-            let name = "n".repeat(200);
-            let dirs = bytes / 201;
-            let rest = bytes - dirs * 201;
-            let mut target = format!("{name}/").repeat(dirs);
-            target.push_str(&"f".repeat(rest));
-            let file = ws.path().join(".git/l").join(&target);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(&file, "x\n").unwrap();
-            assert_eq!(target.len(), bytes);
-            ws.link(".git/l/x", &target);
-            if ok {
-                allowed(&ws, "bytes at the limit")
-            } else {
-                carded(&ws, "one byte too many")
-            }
-        }
+        // A target's bytes: one component, a long name. See
+        // `each_bound_at_the_target_byte_limit_cards_past_it` below -- this sub-case moved out
+        // because macOS's 1024-byte `PATH_MAX` cannot even hold a real path this long.
         // Hops, one link naming the next.
         for (hops, ok) in [(MAX_LINK_HOPS, true), (MAX_LINK_HOPS + 1, false)] {
             let ws = Workspace::new();
@@ -6760,6 +6751,43 @@ mod tests {
         }
     }
 
+    /// The "target bytes" bound from the test above, split out because it needs a real path at
+    /// `MAX_LINK_TARGET_BYTES` (1024) bytes under the project root -- past macOS's own
+    /// `PATH_MAX` (1024) before the root's own prefix is even counted, so the fixture can only be
+    /// built on Linux, where `PATH_MAX` is 4096.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn each_bound_at_the_target_byte_limit_cards_past_it() {
+        let allowed = |ws: &Workspace, label: &str| {
+            assert_eq!(
+                bash("git status", ws.path()),
+                PermissionVerdict::AllowWithoutAsking,
+                "{label}"
+            );
+        };
+        let carded = |ws: &Workspace, label: &str| {
+            assert_eq!(bash("git status", ws.path()), PermissionVerdict::AskTheUser, "{label}");
+        };
+        for (bytes, ok) in [(MAX_LINK_TARGET_BYTES, true), (MAX_LINK_TARGET_BYTES + 1, false)] {
+            let ws = Workspace::new();
+            let name = "n".repeat(200);
+            let dirs = bytes / 201;
+            let rest = bytes - dirs * 201;
+            let mut target = format!("{name}/").repeat(dirs);
+            target.push_str(&"f".repeat(rest));
+            let file = ws.path().join(".git/l").join(&target);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x\n").unwrap();
+            assert_eq!(target.len(), bytes);
+            ws.link(".git/l/x", &target);
+            if ok {
+                allowed(&ws, "bytes at the limit")
+            } else {
+                carded(&ws, "one byte too many")
+            }
+        }
+    }
+
     /// Two places a lexical reading of a path would differ from the kernel's. A gitfile may name
     /// its git directory through a padded chain (resolved within bounds, so it cards rather than
     /// costing seconds); and `<common>/modules` may itself be a link, so an entry in it naming
@@ -6770,13 +6798,8 @@ mod tests {
     fn git_paths_are_resolved_physically_and_within_bounds() {
         let ws = Workspace::without_git();
         fabricate_git_dir(&ws.path().join("real.git"));
-        padded_chain(&ws.path().join("chain"), "g", 39, 4000, "../real.git");
-        ws.write(".git", "gitdir: chain/g0\n");
-        assert_eq!(
-            bash("git status", ws.path()),
-            PermissionVerdict::AskTheUser,
-            "a padded gitdir"
-        );
+        // The "padded gitdir" case lives in `a_padded_gitdir_through_a_long_chain_cards` below
+        // (Linux-only: it needs `padded_chain`).
         ws.write(".git", "gitdir: real.git\n");
         assert_eq!(
             bash("git status", ws.path()),
@@ -6806,6 +6829,22 @@ mod tests {
             bash("git status", ws.path()),
             PermissionVerdict::AskTheUser,
             "modules/x -> ../evil through a linked modules/"
+        );
+    }
+
+    /// The "padded gitdir" case from the test above, split out: it needs a ~4 KB symlink target
+    /// (see [`padded_chain`]), which only Linux's 4096-byte `PATH_MAX` allows building.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_padded_gitdir_through_a_long_chain_cards() {
+        let ws = Workspace::without_git();
+        fabricate_git_dir(&ws.path().join("real.git"));
+        padded_chain(&ws.path().join("chain"), "g", 39, 4000, "../real.git");
+        ws.write(".git", "gitdir: chain/g0\n");
+        assert_eq!(
+            bash("git status", ws.path()),
+            PermissionVerdict::AskTheUser,
+            "a padded gitdir"
         );
     }
 
