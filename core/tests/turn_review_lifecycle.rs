@@ -1054,6 +1054,9 @@ fn a_long_patch_is_refused_with_its_counts() {
 /// Two files whose names read the same on the wire (one not valid UTF-8, one with the replacement
 /// character itself) must not be answered with each other's patch: neither is served while both
 /// are in the review, and a name that is unambiguous still is.
+// APFS refuses a file name that is not valid UTF-8 (`EILSEQ`), so the raw-bytes name this test is about
+// cannot exist on macOS.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_path_that_reads_like_another_files_name_gets_no_patch() {
     use std::os::unix::ffi::OsStrExt;

@@ -750,6 +750,15 @@ pub(crate) mod tests {
             other => panic!("expected a symlink refusal, got {other:?}"),
         }
         // Without search permission nothing inside can be looked at.
+        // Linux opens it by `O_PATH`, which needs no permission, and refuses the lookups; macOS's
+        // `O_SEARCH` needs search permission on the directory itself, so the open is the refusal.
+        if cfg!(target_os = "macos") {
+            let refused = DirHandle::open_absolute(&dir.join("none"))
+                .err()
+                .expect("the open is refused");
+            assert_eq!(refused.describe(), "permission denied");
+            return;
+        }
         let none = DirHandle::open_absolute(&dir.join("none")).unwrap();
         assert_eq!(none.lstat(OsStr::new("a")).unwrap_err().describe(), "permission denied");
         assert_eq!(none.entries(10).unwrap_err().describe(), "permission denied");

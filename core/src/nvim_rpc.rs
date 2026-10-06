@@ -1065,7 +1065,9 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let fake = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(T)).unwrap();
+            // The link may already have refused and hung up; macOS answers `EINVAL` to a socket option
+            // on a socket whose peer is gone, and the read below then ends at once anyway.
+            let _ = stream.set_read_timeout(Some(T));
             let mut got = Vec::new();
             let _ = stream.read_to_end(&mut got);
             got.len()
@@ -1089,6 +1091,9 @@ mod tests {
     /// Writes `head`, then zeros until the other end hangs up. Rust ignores SIGPIPE, so the end
     /// is an `Err` from `write`, not a signal.
     fn flood(mut stream: UnixStream, head: Vec<u8>) {
+        // The link shutting its end down does not wake a writer blocked here on every OS (macOS
+        // leaves it asleep), so a stalled write ends the flood: by then the link has long closed.
+        stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
         if stream.write_all(&head).is_err() {
             return;
         }

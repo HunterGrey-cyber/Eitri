@@ -207,7 +207,7 @@ mod tests {
     }
 
     fn scratch(case: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("split-{}-{case}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sp-{}-{case}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -349,6 +349,8 @@ mod tests {
         assert!(draws.len() > 1);
     }
 
+    // `proc_start_time` reads `/proc`, which only Linux has; elsewhere it answers `None` by design.
+    #[cfg(target_os = "linux")]
     #[test]
     fn this_process_has_a_start_time_that_is_stable() {
         let pid = std::process::id();

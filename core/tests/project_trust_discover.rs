@@ -23,7 +23,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Fixture {
+        // macOS's `TMPDIR` (canonicalized, `/private/var/...`) is ~57 bytes and a socket in the tree may
+        // not pass 103, so there the directory is named by a short id alone.
+        #[cfg(target_os = "macos")]
+        let outer = std::env::temp_dir().join(&uuid::Uuid::new_v4().simple().to_string()[..12]);
+        #[cfg(not(target_os = "macos"))]
         let outer = std::env::temp_dir().join(format!("eitri-trust-it-{label}-{}", uuid::Uuid::new_v4()));
+        #[cfg(target_os = "macos")]
+        let _ = label;
         std::fs::create_dir_all(&outer).unwrap();
         let base = outer.canonicalize().unwrap();
         let home = base.join("home");

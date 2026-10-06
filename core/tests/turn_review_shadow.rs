@@ -201,6 +201,14 @@ fn traced_commands(trace: &Path) -> Vec<String> {
                 .iter()
                 .find_map(|marker| line.split_once(marker).map(|(_, rest)| rest.trim().to_owned()))
         })
+        .map(|command| {
+            // macOS's `/usr/bin/git` re-executes the real one, which traces under its full path
+            // (`/Applications/Xcode.app/.../git`); compare by program name as Linux's trace shows it.
+            match command.split_once(' ') {
+                Some((program, rest)) if program.ends_with("/git") => format!("git {rest}"),
+                _ => command,
+            }
+        })
         .collect()
 }
 
@@ -840,22 +848,69 @@ fn a_timed_out_git_is_stopped_with_its_children() {
         format!("#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n", pid_file.display()).as_bytes(),
     );
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut cmd = git::user_read_only(&scratch.0);
-    cmd.arg(format!("--exec-path={}", exec.display()))
-        .arg("eitri-test-hang");
-    let started = std::time::Instant::now();
-    let result = git::run(cmd, Duration::from_millis(500));
-    assert!(matches!(result, Err(git::GitError::TimedOut)), "{result:?}");
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "the run outlived its timeout"
-    );
-    let pid = std::fs::read_to_string(&pid_file).unwrap().trim().to_owned();
-    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    // Linux starts the helper well inside the timeout. macOS's `git` is an `xcrun` shim whose start-up
+    // can outlast 500 ms, so the helper has not written its pid yet when the group is killed and
+    // there is nothing to check: that attempt proves nothing and is retried with a longer timeout.
+    // The helper only ever ends by being killed (`sleep 60` and `wait`), so a `TimedOut` is always
+    // the timeout's doing, never a normal exit.
+    #[cfg(target_os = "macos")]
+    let timeouts = [1u64, 2, 4, 8];
+    #[cfg(not(target_os = "macos"))]
+    let timeouts = [500u64];
+    let mut pid = None;
+    for ms in timeouts {
+        let _ = std::fs::remove_file(&pid_file);
+        let mut cmd = git::user_read_only(&scratch.0);
+        cmd.arg(format!("--exec-path={}", exec.display()))
+            .arg("eitri-test-hang");
+        let started = std::time::Instant::now();
+        let timeout = if cfg!(target_os = "macos") {
+            Duration::from_secs(ms)
+        } else {
+            Duration::from_millis(ms)
+        };
+        // Linux keeps its original 10 s bound; on macOS the bound is the timeout plus 5 s.
+        let bound = if cfg!(target_os = "macos") {
+            timeout + Duration::from_secs(5)
+        } else {
+            Duration::from_secs(10)
+        };
+        let result = git::run(cmd, timeout);
+        assert!(matches!(result, Err(git::GitError::TimedOut)), "{result:?}");
+        assert!(started.elapsed() < bound, "the run outlived its timeout");
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            pid = Some(text.trim().to_owned());
+            break;
+        }
+        assert!(
+            cfg!(target_os = "macos"),
+            "the helper never wrote its pid before the timeout"
+        );
+    }
+    let pid = pid.expect("git never got as far as the helper, even with an 8 s timeout");
+    #[cfg(not(target_os = "macos"))]
+    let gone = {
+        let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+        (0..200).any(|_| {
+            let alive = std::fs::read_to_string(proc_dir.join("stat"))
+                .map(|stat| !stat.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z'))
+                .unwrap_or(false);
+            if alive {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            !alive
+        })
+    };
+    // macOS has no /proc: `ps` prints nothing (and fails) for a pid that no longer exists, and a
+    // zombie, killed and not yet reaped, counts as gone like on Linux.
+    #[cfg(target_os = "macos")]
     let gone = (0..200).any(|_| {
-        let alive = std::fs::read_to_string(proc_dir.join("stat"))
-            .map(|stat| !stat.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z'))
-            .unwrap_or(false);
+        let out = std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .expect("ps runs");
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let alive = !stat.trim().is_empty() && !stat.trim().starts_with('Z');
         if alive {
             std::thread::sleep(Duration::from_millis(10));
         }
