@@ -23,7 +23,7 @@ groundwork for a macOS app and is not meant to change anything on Linux.
 
 - `VERDANDI_CLAUDE_EXTRA_MCP_SERVERS`, a variable that newer agent backends read to add MCP servers to every
   session, is removed from the backend's environment, so a value in your shell cannot reach an Eitri session.
-  Eitri names the MCP servers a session gets, and it names none.
+  Eitri adds no MCP servers of its own; those your settings and a trusted project's configuration name still load.
 - The agent panel loads its page only when it is sure where the page's script policy goes; otherwise it shows a
   short page saying the panel could not be built. A release build always passes this check.
 - The panel's text fields no longer auto-capitalise, autocorrect or spell-check what you type.
@@ -132,7 +132,7 @@ Eitri @VERSION@ -- 你的 Neovim，与 Claude Code 并肩。基于提交 @COMMIT
 
 **加固**
 
-- `VERDANDI_CLAUDE_EXTRA_MCP_SERVERS` 是较新的 agent 后端会读取、用来给每个会话额外加上 MCP server 的变量，现在它会从后端的环境里移除，所以你 shell 里设的值进不了 Eitri 的会话。会话用哪些 MCP server 由 Eitri 指定，而它一个也不指定。
+- `VERDANDI_CLAUDE_EXTRA_MCP_SERVERS` 是较新的 agent 后端会读取、用来给每个会话额外加上 MCP server 的变量，现在它会从后端的环境里移除，所以你 shell 里设的值进不了 Eitri 的会话。Eitri 自己不额外加任何 MCP server；你的设置和被信任项目的配置里写的 MCP server 照常加载。
 - agent 面板只在确定页面的脚本策略该放在哪里时才加载页面；否则显示一个简短的页面，说明面板无法构建。正式发布的构建总能通过这项检查。
 - 面板的文本框不再对你输入的内容自动大写、自动更正或做拼写检查。
 
