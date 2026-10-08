@@ -1339,8 +1339,9 @@ struct CodexHomeGuess {
 /// Codex's home from `CODEX_HOME` (`var`), as Codex picks it: unset or empty means `~/.codex`, and
 /// any other value is used as given, a relative one resolved against Codex's own working directory.
 /// That directory is the project root when Eitri starts it, but nothing here can be sure of it, so
-/// a relative value skips no `.codex/` (each is asked about) and only the alternate names are read
-/// from the root's join, which can add files to ask about but never remove one. Touches no disk.
+/// a relative value skips no `.codex/` (each is asked about) and only the alternate names are taken
+/// from the root's join, which can add files to ask about but never remove one (its MCP servers are
+/// not taken as the user's, [`codex_profile_env`]). Touches no disk.
 fn codex_home_guess(var: Option<&std::ffi::OsStr>, home: Option<&Path>, root: &Path) -> CodexHomeGuess {
     match var.filter(|v| !v.is_empty()).map(Path::new) {
         None => {
@@ -1358,6 +1359,21 @@ fn codex_home_guess(var: Option<&std::ffi::OsStr>, home: Option<&Path>, root: &P
             skip: None,
             config: Some(root.join(relative)),
         },
+    }
+}
+
+/// What a Codex discovery is given from the configuration read in `user`, with `codex_home` the
+/// `.codex/` known to be the user's own (`None` when it is not known). The servers `user` lists are
+/// passed on only when that home is known: a relative `CODEX_HOME` may name a directory inside the
+/// project, and taking the servers of a file the project wrote as the user's would let the project
+/// exempt its own server from the check an untrusted session makes. The alternate names are passed
+/// on either way, since they can only add files to ask about. Touches no disk.
+fn codex_profile_env(codex_home: Option<PathBuf>, user: UserCodexConfig) -> ProfileEnv {
+    let user_mcp_servers = if codex_home.is_some() { user.mcp_servers } else { None };
+    ProfileEnv {
+        fallback_names: user.fallback_names,
+        user_mcp_servers,
+        codex_home,
     }
 }
 
@@ -1403,11 +1419,7 @@ fn run_worker(
                 },
                 read_codex_user_config,
             );
-            ProfileEnv {
-                fallback_names: user.fallback_names,
-                user_mcp_servers: user.mcp_servers,
-                codex_home: codex_home.clone(),
-            }
+            codex_profile_env(codex_home.clone(), user)
         }
         Profile::Claude | Profile::Acp { .. } => ProfileEnv::default(),
     };
@@ -3077,6 +3089,37 @@ mod tests {
                 config: None
             }
         );
+    }
+
+    /// A relative `CODEX_HOME` names a directory the project may hold: its `config.toml` is not known
+    /// to be the user's own, so the servers it lists are not taken as the user's, and an untrusted
+    /// start still watches for every server the project gives. A home that is the user's own still
+    /// leaves out the servers it starts itself.
+    #[test]
+    fn a_relative_codex_home_does_not_whitelist_project_servers() {
+        let fx = Fx::new("codex-relative-home");
+        fx.write(".codex/config.toml", b"[mcp_servers.evil]\ncommand = \"evil\"\n");
+        let plan_for = |var: Option<&str>| {
+            let guess = codex_home_guess(var.map(std::ffi::OsStr::new), Some(&fx.home), &fx.root);
+            let user = read_codex_user_config(guess.config.as_deref().unwrap());
+            let env = codex_profile_env(guess.skip, user);
+            let found =
+                eitri_core::project_trust::discover(&fx.root, Some(&fx.home), &Default::default(), &CODEX, &env);
+            eitri_core::project_trust::trust_plan(&found, agent::DirTrust::Untrusted, &fx.root)
+                .unwrap()
+                .project_only
+        };
+        assert_eq!(plan_for(Some(".codex")), vec!["evil".to_string()]);
+        assert_eq!(plan_for(Some("./.codex")), vec!["evil".to_string()]);
+
+        let own = fx.home.join(".codex");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("config.toml"), b"[mcp_servers.evil]\ncommand = \"mine\"\n").unwrap();
+        fx.write(
+            ".codex/config.toml",
+            b"[mcp_servers.evil]\ncommand = \"evil\"\n[mcp_servers.other]\ncommand = \"o\"\n",
+        );
+        assert_eq!(plan_for(None), vec!["other".to_string()]);
     }
 
     /// A registered agent cannot leave the project's configuration out, so its `n` starts nothing and

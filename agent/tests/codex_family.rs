@@ -861,7 +861,215 @@ fn an_unreadable_start_of_a_childs_turn_is_still_followed() {
     assert_eq!(outcome, TurnOutcome::Interrupted);
 }
 
+/// A `turn/started` over the line cap, for `thread`'s turn `turn`.
+fn huge_turn_started(thread: &str, turn: &str) -> Value {
+    json!({"write_big": {
+        "prefix": format!(
+            r#"{{"method":"turn/started","params":{{"threadId":"{thread}","turn":{{"id":"{turn}","items":[{{"type":"agentMessage","id":"x","text":""#
+        ),
+        "bytes": 17 * 1024 * 1024,
+        "suffix": r#""}],"status":"inProgress"}}}"#,
+    }})
+}
+
+/// A `turn/started` whose turn cannot be read, for `thread`.
+fn unreadable_turn_started(thread: &str) -> Value {
+    write(json!({"method": "turn/started", "params": {"threadId": thread, "turn": {"id": 5}}}))
+}
+
+fn collab_spawn(id: &str, receiver: &str) -> Value {
+    json!({"type": "collabAgentToolCall", "id": id, "tool": "spawnAgent", "status": "completed",
+           "senderThreadId": "tab", "receiverThreadIds": [receiver], "prompt": "go"})
+}
+
+/// A child's start that cannot be read and arrives before the call that makes the child a member is still
+/// followed once it is: the tab's turn waits for the child, its calls are shown, and an interrupt reaches
+/// it.
+#[test]
+fn an_unreadable_start_before_the_announcement_is_followed_after_it() {
+    for unreadable in [huge_turn_started("child", "c1"), unreadable_turn_started("child")] {
+        let (provider, thread) = running(
+            "tab",
+            "t1",
+            vec![
+                unreadable,
+                item_event("item/completed", "tab", "t1", collab_spawn("sp1", "child")),
+                turn_completed("tab", "t1", "completed"),
+                json!({"sleep_ms": 100}),
+                item_event(
+                    "item/started",
+                    "child",
+                    "c1",
+                    command_item("late", "touch late", "inProgress"),
+                ),
+                expect_interrupt(5, "child", "c1"),
+                turn_completed("child", "c1", "interrupted"),
+            ],
+        );
+        let late = row_id("tab", "child", "late");
+        let early = pump_until(&provider, |events| events.iter().any(tool_started(late.clone())));
+        assert!(
+            !early.iter().any(is_completed),
+            "the tab's turn ended while its child ran: {early:#?}"
+        );
+        interrupt(&provider, &thread);
+        let events = until_turn_completed(&provider);
+        let (turn, outcome, _) = ended(&events);
+        assert_eq!(turn, "t1");
+        assert_eq!(outcome, TurnOutcome::Interrupted);
+    }
+}
+
+/// A child whose unreadable start and readable end both come before its announcement is not running when
+/// it joins: the tab's turn ends with the tab's own.
+#[test]
+fn an_early_turn_that_ended_before_the_announcement_is_not_followed() {
+    let (provider, _) = running(
+        "tab",
+        "t1",
+        vec![
+            unreadable_turn_started("child"),
+            turn_completed("child", "c1", "completed"),
+            item_event("item/completed", "tab", "t1", collab_spawn("sp1", "child")),
+            json!({"sleep_ms": 100}),
+            turn_completed("tab", "t1", "completed"),
+        ],
+    );
+    let events = until_turn_completed(&provider);
+    let (turn, outcome, _) = ended(&events);
+    assert_eq!(turn, "t1");
+    assert_eq!(outcome, TurnOutcome::Completed);
+}
+
+/// A child whose start (read or not) and unreadable end both come before its announcement is not running
+/// when it joins; one announced before its unreadable end is ended by it. Either way the tab's turn ends
+/// with the tab's own, and the tab takes its next turn.
+#[test]
+fn an_unreadable_end_ends_a_child_announced_before_or_after_it() {
+    let starts = || {
+        [
+            unreadable_turn_started("child"),
+            huge_turn_started("child", "c1"),
+            turn_started("child", "c1"),
+        ]
+    };
+    let ends = || [huge_turn_completed("child", "c1"), unreadable_turn_completed("child")];
+    for start in starts() {
+        for end in ends() {
+            for announced_first in [false, true] {
+                let spawn = item_event("item/completed", "tab", "t1", collab_spawn("sp1", "child"));
+                let mut rest = if announced_first {
+                    vec![spawn, start.clone(), end.clone()]
+                } else {
+                    vec![start.clone(), end.clone(), spawn]
+                };
+                rest.extend([
+                    json!({"sleep_ms": 100}),
+                    turn_completed("tab", "t1", "completed"),
+                    expect_request(5, "turn/start"),
+                    turn_response(5, "t2"),
+                ]);
+                let (provider, thread) = running("tab", "t1", rest);
+                let events = until_turn_completed(&provider);
+                let (turn, outcome, _) = ended(&events);
+                assert_eq!(turn, "t1", "{start} {end} announced first: {announced_first}");
+                assert_eq!(
+                    outcome,
+                    TurnOutcome::Completed,
+                    "a child's end is not the tab's failure"
+                );
+                assert_eq!(send(&provider, &thread, "next").expect("the tab is idle"), "t2");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- interrupt
+
+/// A member's turn whose start could not be read has no id an interrupt could name. When nothing else of
+/// the family runs, the key cannot reach it, so it is not waited on: the tab's turn ends interrupted and
+/// the tab takes its next turn, with no `turn/interrupt` sent.
+#[test]
+fn interrupting_a_family_running_only_unnamed_turns_ends_the_tabs_turn() {
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            item_event("item/completed", "tab", "t1", collab_spawn("sp1", "child")),
+            unreadable_turn_started("child"),
+            turn_completed("tab", "t1", "completed"),
+            // An interrupt would have taken id 5.
+            expect_request(5, "turn/start"),
+            turn_response(5, "t2"),
+        ],
+    );
+    let early = pump_for(&provider, Duration::from_millis(300));
+    assert!(
+        !early.iter().any(is_completed),
+        "the tab's turn ended while its child ran: {early:#?}"
+    );
+    interrupt(&provider, &thread);
+    let events = until_turn_completed(&provider);
+    let (turn, outcome, _) = ended(&events);
+    assert_eq!(turn, "t1");
+    assert_eq!(outcome, TurnOutcome::Interrupted);
+    assert_eq!(send(&provider, &thread, "next").expect("the tab is idle"), "t2");
+}
+
+/// The interrupt reaches the turns it can name; once they have ended, a member turn it could not name is
+/// not waited on.
+#[test]
+fn an_unnamed_turn_is_not_waited_on_once_the_named_ones_ended_after_an_interrupt() {
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            item_event("item/completed", "tab", "t1", collab_spawn("sp1", "child")),
+            unreadable_turn_started("child"),
+            expect_interrupt(5, "tab", "t1"),
+            turn_completed("tab", "t1", "interrupted"),
+            expect_request(6, "turn/start"),
+            turn_response(6, "t2"),
+        ],
+    );
+    pump_for(&provider, Duration::from_millis(300));
+    interrupt(&provider, &thread);
+    let events = until_turn_completed(&provider);
+    let (turn, outcome, _) = ended(&events);
+    assert_eq!(turn, "t1");
+    assert_eq!(outcome, TurnOutcome::Interrupted);
+    assert_eq!(send(&provider, &thread, "next").expect("the tab is idle"), "t2");
+}
+
+/// The tab's own turn whose start could not be read, opened while the tab was idle, ends interrupted on
+/// the key too.
+#[test]
+fn interrupting_the_tabs_own_unnamed_turn_ends_it() {
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            turn_completed("tab", "t1", "completed"),
+            json!({"sleep_ms": 100}),
+            unreadable_turn_started("tab"),
+            expect_request(5, "turn/start"),
+            turn_response(5, "t2"),
+        ],
+    );
+    let first = until_turn_completed(&provider);
+    assert_eq!(ended(&first).0, "t1");
+    let opened = pump_until(&provider, |events| events.iter().any(is_started));
+    let unnamed = match &opened[position(&opened, is_started)] {
+        AgentDomainEvent::TurnStarted { turn_id } => turn_id.clone(),
+        other => panic!("{other:?}"),
+    };
+    interrupt(&provider, &thread);
+    let events = until_turn_completed(&provider);
+    let (turn, outcome, _) = ended(&events);
+    assert_eq!(turn, unnamed);
+    assert_eq!(outcome, TurnOutcome::Interrupted);
+    assert_eq!(send(&provider, &thread, "next").expect("the tab is idle"), "t2");
+}
 
 #[test]
 fn interrupt_reaches_every_running_family_turn() {

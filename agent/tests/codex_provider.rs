@@ -335,6 +335,65 @@ fn missing_binary_is_a_tab_notice() {
     }
 }
 
+/// A scratch directory holding `codex`, a script that leaves `ran` beside itself when anything runs it.
+/// Returns the directory, the program and the marker.
+fn marker_program(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("eitri-{name}-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("ran");
+    let program = dir.join("codex");
+    std::fs::write(&program, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display())).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, program, marker)
+}
+
+/// A relative `CODEX_HOME` is resolved by Codex against its working directory, the project root, so the
+/// project's own directory of that name would be read as the user's configuration. The start is refused,
+/// naming the variable, before any child runs; an absolute or empty one is not refused.
+#[test]
+fn a_relative_codex_home_refuses_the_start_before_anything_runs() {
+    for value in [".codex", "./.codex", "codex-home", "../elsewhere"] {
+        let (dir, program, marker) = marker_program("relative-home");
+        let launch = CodexLaunch {
+            program,
+            cwd: dir.clone(),
+            state_home: dir.clone(),
+        };
+        let env = vec![(OsString::from("CODEX_HOME"), OsString::from(value))];
+        match CodexProvider::connect_with_env(launch, Vec::new(), env, Vec::new()) {
+            Err(ProviderError::Provider { code, message }) => {
+                assert_eq!(code, ProviderErrorCode::InvalidConfiguration, "{value}");
+                assert!(
+                    message.contains("CODEX_HOME") && message.contains(value) && message.contains("absolute"),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!("expected a refusal for {value}, got {other}"),
+            Ok(_) => panic!("a relative CODEX_HOME ({value}) connected"),
+        }
+        assert!(!marker.exists(), "a child ran under CODEX_HOME={value}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    // An absolute or an empty one is Codex's own business: the child runs (and here fails).
+    for value in ["/nonexistent/eitri-codex-home", ""] {
+        let (dir, program, marker) = marker_program("absolute-home");
+        let launch = CodexLaunch {
+            program,
+            cwd: dir.clone(),
+            state_home: dir.clone(),
+        };
+        let env = vec![(OsString::from("CODEX_HOME"), OsString::from(value))];
+        assert!(CodexProvider::connect_with_env(launch, Vec::new(), env, Vec::new()).is_err());
+        assert!(marker.exists(), "CODEX_HOME={value:?} was refused");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 #[test]
 fn the_plain_claude_shaped_calls_refuse() {
     let (provider, thread) = open("th-plain", vec![]);

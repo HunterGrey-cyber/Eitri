@@ -1166,7 +1166,8 @@ impl AgentSessionProjection {
                 });
                 // The latest turn's ending, if it did not complete and knew no reset time, takes this
                 // one: the report that explains the stop can come just after it. One it already had
-                // stays, and a turn started since ends that.
+                // stays, and a turn started since ends that. A resumed session's past ending is never
+                // filled: its seed carries no `last_turn_ending` (`resume_external`).
                 if self.last_turn_ending.is_some() {
                     if let Some(ending) = self.turn_endings.last_mut() {
                         if ending.resets_at.is_none() {

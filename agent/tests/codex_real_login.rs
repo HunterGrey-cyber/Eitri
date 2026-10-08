@@ -5,6 +5,8 @@
 //!   `cargo test -p agent --test codex_real_login -- --ignored --test-threads=1`. The suite spends at most
 //!   three turns (one per test) on the cheapest model the account lists, at the lowest reasoning effort the
 //!   models share, and prints the `codex --version` it ran against. It lists models once (no turn).
+//!   `EITRI_CODEX_LOGIN_MODEL` names the model instead, and `EITRI_CODEX_LOGIN_EFFORT` the reasoning effort
+//!   (default `low`; an empty value is the default), for a model that does not accept `low`.
 //! - The login is the machine's default one: this file never reads, copies or prints a credential, never
 //!   writes under the account's Codex home (its threads are `ephemeral`), and learns only the *names* of the
 //!   account's own tool servers, from the app-server's `config/read`, so that the session can turn each off.
@@ -32,7 +34,25 @@ use std::time::Duration;
 /// A real model takes longer than a scripted one.
 const REAL_TURN: Duration = Duration::from_secs(240);
 /// The lowest reasoning effort every current model accepts.
-const EFFORT: &str = "low";
+const DEFAULT_EFFORT: &str = "low";
+
+/// The reasoning effort the sessions ask for: `EITRI_CODEX_LOGIN_EFFORT`, else [`DEFAULT_EFFORT`].
+fn effort() -> String {
+    effort_from(std::env::var("EITRI_CODEX_LOGIN_EFFORT").ok())
+}
+
+fn effort_from(var: Option<String>) -> String {
+    var.filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_EFFORT.to_string())
+}
+
+#[test]
+fn the_effort_is_low_unless_named() {
+    assert_eq!(effort_from(None), "low");
+    assert_eq!(effort_from(Some(String::new())), "low");
+    assert_eq!(effort_from(Some("  ".to_string())), "low");
+    assert_eq!(effort_from(Some("minimal".to_string())), "minimal");
+}
 
 // ------------------------------------------------------------------------------------ the account
 
@@ -114,7 +134,7 @@ fn cheapest_model(peer: &mut Peer) -> String {
         .expect("no \"mini\" model is listed for this account; set EITRI_CODEX_LOGIN_MODEL to the cheapest one")
 }
 
-/// A started thread under the posture, with the cheapest model and the lowest effort.
+/// A started thread under the posture, with the cheapest model and the lowest effort (or the ones named).
 fn login_thread(peer: &mut Peer, project: &Path, trust: DirTrust, reviewer: Reviewer, model: &str) -> Thread {
     let names = account_tool_servers(peer);
     let off: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -122,7 +142,7 @@ fn login_thread(peer: &mut Peer, project: &Path, trust: DirTrust, reviewer: Revi
     let mut params =
         serde_json::to_value(ThreadStartParams::new(text_of(project).to_string(), reviewer, config)).expect("params");
     params["model"] = json!(model);
-    params["config"]["model_reasoning_effort"] = json!(EFFORT);
+    params["config"]["model_reasoning_effort"] = json!(effort());
     // The tests leave nothing behind in the account's Codex home.
     params["ephemeral"] = json!(true);
     start_thread(peer, params)
@@ -170,7 +190,7 @@ fn reviewer_rows_appear_in_auto() {
     // A request that reaches the client in Auto is not expected; if one does, it is declined.
     let mut peer = Peer::start_on_login(&codex, &project, decline_all());
     let model = cheapest_model(&mut peer);
-    eprintln!("model: {model}, effort {EFFORT}");
+    eprintln!("model: {model}, effort {}", effort());
     let thread = login_thread(&mut peer, &project, DirTrust::Untrusted, Reviewer::Agent, &model);
     let status = login_turn(&mut peer, &thread.id, Reviewer::Agent, &escalate_prompt(&target));
     peer.pump_for(Duration::from_secs(1));
@@ -216,7 +236,7 @@ fn decline_continues_on_a_real_model() {
 
     let mut peer = Peer::start_on_login(&codex, &project, decline_all());
     let model = cheapest_model(&mut peer);
-    eprintln!("model: {model}, effort {EFFORT}");
+    eprintln!("model: {model}, effort {}", effort());
     let thread = login_thread(&mut peer, &project, DirTrust::Untrusted, Reviewer::User, &model);
     let status = login_turn(&mut peer, &thread.id, Reviewer::User, &escalate_prompt(&target));
     peer.pump_for(Duration::from_secs(1));
@@ -269,7 +289,7 @@ fn mcp_approval_card_with_a_local_server() {
     });
     let mut peer = Peer::start_on_login(&codex, &project, answer);
     let model = cheapest_model(&mut peer);
-    eprintln!("model: {model}, effort {EFFORT}");
+    eprintln!("model: {model}, effort {}", effort());
     let thread = login_thread(&mut peer, &project, DirTrust::Trusted, Reviewer::User, &model);
     let status = login_turn(
         &mut peer,

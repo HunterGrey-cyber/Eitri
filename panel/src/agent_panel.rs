@@ -3726,8 +3726,13 @@ fn spawn_external(
     std::thread::spawn(move || {
         let program = match &agent {
             AgentId::Codex => {
-                let located =
-                    agent::providers::codex::locate_codex(codex_command.as_deref()).map_err(|e| BackendError {
+                // A relative home is refused before anything runs, the version probe of the binary included.
+                let located = agent::providers::codex::refuse_relative_codex_home()
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| {
+                        agent::providers::codex::locate_codex(codex_command.as_deref()).map_err(|e| e.to_string())
+                    })
+                    .map_err(|e| BackendError {
                         message: format!("Codex could not start: {e}"),
                         benign: false,
                         folded_events: Vec::new(),

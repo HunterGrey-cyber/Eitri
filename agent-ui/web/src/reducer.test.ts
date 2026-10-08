@@ -1049,6 +1049,22 @@ describe("turn endings", () => {
     expect(late.turnEndings.map((e) => e.resetsAt)).toEqual([3000, 4000]);
   });
 
+  it("a resumed session's past ending is not filled by a live report", () => {
+    // What Rust sends for a resume whose last past turn hit the limit: the row, and no band word.
+    const snapshot = {
+      ...(initialState() as AgentUiSnapshot),
+      turnEndings: [
+        { seq: 1, turnId: "old-1", kind: "limit_reached", reason: "usage_limit", apiErrorStatus: null, message: null, resetsAt: null },
+      ],
+      lastTurnEnding: null,
+    } as AgentUiSnapshot;
+    let state = applySnapshot(initialState(), snapshot, 2);
+    state = applyEvent(state, { type: "session_opened", session_id: "s", provider_session_id: "p", model: "m", cwd: "/p" } as AgentDomainEvent);
+    state = applyEvent(state, { type: "account_limits", used_percent: 3, window_minutes: 300, resets_at: 1000, plan: null } as AgentDomainEvent);
+    expect(state.accountLimits?.resetsAt).toBe(1000);
+    expect(state.turnEndings.map((e) => e.resetsAt)).toEqual([null]);
+  });
+
   it("a completed turn adds nothing and leaves lastTurnEnding as it was", () => {
     const state = applyEvent(running(), ended("completed"));
     expect(state.turnEndings).toEqual([]);

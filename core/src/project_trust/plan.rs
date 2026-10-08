@@ -39,8 +39,9 @@ impl std::error::Error for NonUtf8 {}
 /// so a session that did not load that configuration can tell when one starts anyway. A name the
 /// user's own Codex configuration also gives a running server is left out: that server starts in
 /// every session, and its startup proves nothing. When the user's servers are not known (their file
-/// could not be read), every name the project gives is kept, so the check errs toward stopping a
-/// session rather than toward missing a project server.
+/// could not be read, or `CODEX_HOME` is relative and so may name a directory of the project), every
+/// name the project gives is kept, so the check errs toward stopping a session rather than toward
+/// missing a project server.
 pub fn trust_plan(d: &Discovery, answer: DirTrust, root: &Path) -> Result<TrustPlan, NonUtf8> {
     // Every ancestor of a UTF-8 path is UTF-8.
     if root.to_str().is_none() {

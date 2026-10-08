@@ -43,7 +43,7 @@ use crate::{AgentDomainEvent, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -282,6 +282,44 @@ fn effective_codex_home(reported: Option<&str>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/nonexistent/.codex"))
 }
 
+/// The `CODEX_HOME` a child started with `env` and `env_remove` sees: what `env` sets wins, a removed one is
+/// gone, and otherwise it is Eitri's own.
+fn child_codex_home(env: &[(OsString, OsString)], env_remove: &[OsString]) -> Option<OsString> {
+    if let Some((_, value)) = env.iter().rev().find(|(name, _)| name == "CODEX_HOME") {
+        return Some(value.clone());
+    }
+    if env_remove.iter().any(|name| name == "CODEX_HOME") {
+        return None;
+    }
+    std::env::var_os("CODEX_HOME")
+}
+
+/// Refuses a relative `CODEX_HOME`. Codex resolves it against its working directory, which is the project
+/// root, so a directory the project itself holds would be read as the user's own configuration: its MCP
+/// servers, hooks, rules and skills would load whatever the user said about trusting the project. No
+/// child is started under it. An empty value is Codex's own "unset" and an absolute one is the user's.
+fn refuse_relative_home(value: Option<&OsStr>) -> Result<(), ProviderError> {
+    let Some(value) = value.filter(|v| !v.is_empty() && !Path::new(v).is_absolute()) else {
+        return Ok(());
+    };
+    let shown = value.to_string_lossy();
+    let shown = shown.escape_debug();
+    Err(provider_error(
+        ProviderErrorCode::InvalidConfiguration,
+        format!(
+            "CODEX_HOME is relative ({shown}): Codex would read the project's own {shown} as your configuration; \
+             set it to an absolute path"
+        ),
+    ))
+}
+
+/// Refuses a Codex start under a relative `CODEX_HOME` in Eitri's own environment, the one every Codex child
+/// inherits. A tab's connect worker asks before it looks for the binary, since probing its version runs a
+/// child too; [`CodexProvider::connect`] asks again.
+pub fn refuse_relative_codex_home() -> Result<(), ProviderError> {
+    refuse_relative_home(child_codex_home(&[], &[]).as_deref())
+}
+
 fn to_json<T: Serialize>(params: &T) -> Result<Value, ProviderError> {
     serde_json::to_value(params).map_err(|e| ProviderError::Transport(format!("a request could not be written: {e}")))
 }
@@ -302,6 +340,8 @@ impl CodexProvider {
     /// A binary Eitri has not checked yet first goes through the per-binary self-check, which takes a few
     /// seconds once; while it has not passed, no Codex start is allowed.
     pub fn connect(launch: CodexLaunch) -> Result<CodexProvider, ProviderError> {
+        // Before the self-check too: nothing is started under a home the project could supply.
+        refuse_relative_codex_home()?;
         match ensure_checked(&launch.program, &launch.state_home) {
             Ok(()) => {}
             Err(SelfCheckError::NotFound) => {
@@ -334,6 +374,7 @@ impl CodexProvider {
         env: Vec<(OsString, OsString)>,
         env_remove: Vec<OsString>,
     ) -> Result<CodexProvider, ProviderError> {
+        refuse_relative_home(child_codex_home(&env, &env_remove).as_deref())?;
         let link = JsonRpcLink::spawn(LinkSpec {
             program: launch.program.clone(),
             args,
@@ -510,6 +551,9 @@ impl CodexProvider {
             end_added_row(st, card, PermissionOutcome::CancelledByInterrupt);
         }
         self.send_interrupts(st);
+        if forget_unnamed_turns(st) {
+            self.close_family_turn(st);
+        }
     }
 
     fn respond(&self, id: Value, result: Value) {
@@ -1000,7 +1044,10 @@ impl CodexProvider {
             return;
         };
         if !in_family(st, thread_id) {
+            // A child may start its turn before the message that makes it a member is read; it is kept
+            // under the stand-in like a readable early start, so the thread is followed once it joins.
             note_foreign(st, thread_id);
+            remember_early_turn(st, thread_id, UNREAD_TURN.to_string());
             return;
         }
         let edge = match st.family.as_mut() {
@@ -1023,16 +1070,19 @@ impl CodexProvider {
     /// did not say whose it was, it is taken for the tab's own turn if that runs, else for the one family
     /// turn running; with several running and none of them the tab's, nothing is guessed.
     fn unreadable_turn_end(&self, st: &mut State, thread_id: Option<&str>, text: &str, reason: &str) {
+        if let Some(thread) = thread_id.filter(|thread| !in_family(st, thread)) {
+            // Not a member (yet): whatever turn was kept for it is over, so the message that makes it one
+            // must not bring that turn back, or the tab would wait for an end that already came.
+            st.early_turns.remove(thread);
+            note_foreign(st, thread);
+            return;
+        }
         if !st.turn.as_ref().is_some_and(|t| t.id.is_some()) {
             return;
         }
         let Some(family) = st.family.as_ref() else { return };
         let thread = match thread_id {
-            Some(thread) if family.contains(thread) => thread.to_string(),
-            Some(thread) => {
-                note_foreign(st, thread);
-                return;
-            }
+            Some(thread) => thread.to_string(),
             None if family.running_on(family.tab_thread()).is_some() => family.tab_thread().to_string(),
             None => match family.running_turns().as_slice() {
                 [(thread, _)] => thread.clone(),
@@ -1060,9 +1110,7 @@ impl CodexProvider {
     fn on_turn_started(&self, st: &mut State, n: TurnNotification) {
         if !in_family(st, &n.thread_id) {
             note_foreign(st, &n.thread_id);
-            if st.early_turns.len() < EARLY_TURNS_KEPT || st.early_turns.contains_key(&n.thread_id) {
-                st.early_turns.insert(n.thread_id, n.turn.id);
-            }
+            remember_early_turn(st, &n.thread_id, n.turn.id);
             return;
         }
         self.join_family_turn(st, &n.thread_id, n.turn.id);
@@ -1085,8 +1133,11 @@ impl CodexProvider {
 
     /// A thread that just joined the family may already be running a turn; it is followed from now on.
     fn joined(&self, st: &mut State, thread: &str) {
-        if let Some(turn) = st.early_turns.remove(thread) {
-            self.join_family_turn(st, thread, turn);
+        match st.early_turns.remove(thread) {
+            // Its start could not be read: followed under the stand-in until a message names the turn.
+            Some(turn) if turn == UNREAD_TURN => self.unreadable_turn_start(st, Some(thread)),
+            Some(turn) => self.join_family_turn(st, thread, turn),
+            None => {}
         }
     }
 
@@ -1265,7 +1316,12 @@ impl CodexProvider {
     /// A turn of the family ended. The tab's turn ends with the last of them, with the outcome of the tab's
     /// own turn: a child's end is not the tab's failure.
     fn on_turn_completed(&self, st: &mut State, n: TurnNotification) {
-        if st.early_turns.get(&n.thread_id) == Some(&n.turn.id) {
+        // An early turn whose start could not be read is the one the next end on its thread names.
+        if st
+            .early_turns
+            .get(&n.thread_id)
+            .is_some_and(|early| *early == n.turn.id || early == UNREAD_TURN)
+        {
             st.early_turns.remove(&n.thread_id);
         }
         if !self.running_turn(st, &n.thread_id, &n.turn.id) {
@@ -1287,9 +1343,18 @@ impl CodexProvider {
             Some(family) => family.turn_completed(thread, turn),
             None => return,
         };
-        if edge != FamilyEdge::Closed {
-            return;
+        let closed = match edge {
+            FamilyEdge::Closed => true,
+            FamilyEdge::Still => forget_unnamed_turns(st),
+            _ => false,
+        };
+        if closed {
+            self.close_family_turn(st);
         }
+    }
+
+    /// The family has no turn running: the tab's turn ends, with the outcome of the tab's own turn.
+    fn close_family_turn(&self, st: &mut State) {
         let (own, asked) = match st.turn.as_mut() {
             Some(turn) => (turn.own_end.take(), turn.interrupt_asked),
             None => return,
@@ -1376,11 +1441,48 @@ fn labelled(st: &State, thread_id: &str, mut input: Value) -> Value {
     input
 }
 
+/// A family turn whose start could not be read has no id, so an interrupt cannot be sent to it, and should
+/// its end never be readable either the tab would stay busy for good. Once the user has asked to interrupt
+/// and only such turns are left running, they are not waited on: they are forgotten, the tab's own among
+/// them ending interrupted. Should one of them go on, what it sends later names no running turn and is
+/// dropped like any other message about a turn the tab does not follow. Returns whether this left the
+/// family idle.
+fn forget_unnamed_turns(st: &mut State) -> bool {
+    if !st.turn.as_ref().is_some_and(|t| t.interrupting) {
+        return false;
+    }
+    let Some(family) = st.family.as_mut() else { return false };
+    let running = family.running_turns();
+    if running.is_empty() || running.iter().any(|(_, turn)| turn != UNREAD_TURN) {
+        return false;
+    }
+    let own = running.iter().any(|(thread, _)| thread == family.tab_thread());
+    let mut edge = FamilyEdge::Ignored;
+    for (thread, _) in &running {
+        edge = family.turn_completed(thread, UNREAD_TURN);
+    }
+    if own {
+        if let Some(turn) = st.turn.as_mut() {
+            turn.own_end = Some(translate::turn_ending(&TurnStatus::Interrupted, None));
+        }
+    }
+    eprintln!("agent: an interrupt cannot name a turn whose start Codex sent unreadably; it is no longer waited on");
+    edge == FamilyEdge::Closed
+}
+
 /// Logs a thread outside the tab's family, once per thread, and drops what it sent.
 fn note_foreign(st: &mut State, thread_id: &str) {
     let key = format!("thread {thread_id}");
     if st.seen_unknown.len() < UNKNOWN_METHODS_KEPT && st.seen_unknown.insert(key) {
         eprintln!("agent: Codex sent something about a thread outside this tab's family; dropped");
+    }
+}
+
+/// Remembers `turn` as the running turn of `thread`, not (yet) in the family, so a child announced after
+/// its turn began is followed from that turn. At most `EARLY_TURNS_KEPT` threads are kept.
+fn remember_early_turn(st: &mut State, thread: &str, turn: String) {
+    if st.early_turns.len() < EARLY_TURNS_KEPT || st.early_turns.contains_key(thread) {
+        st.early_turns.insert(thread.to_string(), turn);
     }
 }
 

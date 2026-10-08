@@ -309,7 +309,8 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // The latest report wins, whole: the agent states the window each time. A slot it did not say
       // is `null`, not carried over from the earlier report. The latest turn's ending, if it did not
       // complete and knew no reset time, takes this one (the report explaining a stop can follow it);
-      // one it had stays. MUST stay identical to `AgentSessionProjection::apply`.
+      // one it had stays. A resumed session's past ending is never filled: Rust's seed carries no
+      // `lastTurnEnding`. MUST stay identical to `AgentSessionProjection::apply`.
       const resetsAt = event.resets_at ?? null;
       const last = state.turnEndings[state.turnEndings.length - 1];
       const fill = state.lastTurnEnding !== null && last !== undefined && (last.resetsAt ?? null) === null;

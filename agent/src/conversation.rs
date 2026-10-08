@@ -632,6 +632,10 @@ impl AgentConversation {
         for event in provider.take_history() {
             seed.apply(&event);
         }
+        // How the last past turn ended stays a row, but it is not the latest news: the band does not
+        // say it (a Claude resume's seed has no ending either), and a live report of the account's
+        // limits, which may fill the latest ending's reset time, must not write today's into it.
+        seed.last_turn_ending = None;
         let ingest = ConversationIngest::start(
             Arc::clone(&as_agent),
             name,

@@ -415,6 +415,72 @@ fn resume_external_seeds_the_history_and_delivers_no_past_turn() {
     conversation.shutdown();
 }
 
+/// A past turn's ending is history: the band does not say it, and a live report of the account's limits
+/// never writes today's reset time into it.
+#[test]
+fn a_resumed_ending_is_not_filled_by_a_live_limits_report() {
+    let cwd = workspace("ext-resume-ending");
+    let canonical = cwd.canonicalize().unwrap();
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let provider = Scripted::new("codex");
+    {
+        let mut script = provider.script.lock().unwrap();
+        script.history = vec![
+            AgentDomainEvent::TurnStarted {
+                turn_id: "old-1".to_string(),
+            },
+            AgentDomainEvent::TurnCompleted {
+                turn_id: "old-1".to_string(),
+                outcome: agent::TurnOutcome::LimitReached,
+                result_text: "You've hit your usage limit.".to_string(),
+                stop_reason: None,
+                usage: None,
+                detail: agent::TurnEndDetail {
+                    reason: Some("usage_limit".to_string()),
+                    api_error_status: None,
+                    message: None,
+                },
+            },
+        ];
+        script.events.push_back(AgentDomainEvent::SessionOpened {
+            session_id: "ext-session".to_string(),
+            provider_session_id: "thread-old".to_string(),
+            model: "m".to_string(),
+            cwd: canonical_str.clone(),
+        });
+        script.events.push_back(AgentDomainEvent::AccountLimits {
+            used_percent: 3.0,
+            window_minutes: Some(300),
+            resets_at: Some(1_900_000_000),
+            plan: None,
+        });
+    }
+    let lease = SessionLease::try_acquire("codex", &canonical_str, "thread-old").unwrap();
+    let mut conversation = AgentConversation::resume_external(
+        provider.clone(),
+        start_for(&canonical, Some("thread-old")),
+        &canonical,
+        lease,
+    )
+    .expect("the resume is attached");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while conversation.projection().account_limits.is_none() && std::time::Instant::now() < deadline {
+        let _ = conversation.take_ui_delivery();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    {
+        let projection = conversation.projection();
+        assert!(projection.account_limits.is_some(), "the live report was folded");
+        assert_eq!(projection.turn_endings.len(), 1, "the past ending is still a row");
+        assert_eq!(
+            projection.turn_endings[0].resets_at, None,
+            "a live report filled a past turn's ending"
+        );
+        assert_eq!(projection.last_turn_ending, None, "the band says a past turn's ending");
+    }
+    conversation.shutdown();
+}
+
 #[test]
 fn resume_external_refuses_a_lease_for_another_session() {
     let cwd = workspace("ext-resume-lease");
