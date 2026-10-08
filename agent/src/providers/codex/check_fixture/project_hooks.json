@@ -1,0 +1,1 @@
+{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/bin/sh '@MARKER_SH@' '@MARKERS@/hook'","timeout":5}]}]}}

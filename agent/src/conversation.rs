@@ -27,6 +27,7 @@
 //! The session lease is advisory. It coordinates only processes that use this protocol. A manually
 //! started CLI takes no lease and is not stopped; two clients resuming one session share its transcript.
 
+use crate::external::{ExternalProvider, ExternalStart, TurnPolicy};
 use crate::ingestion::ConversationIngest;
 use crate::lease::{LeaseError, SessionLease};
 use crate::persistence::{save_conversation_record, ConversationRecord};
@@ -84,6 +85,10 @@ pub enum ConversationError {
     /// The session transcript is still being written, so another client is likely driving it.
     /// Refuse to resume while the transcript is changing.
     TranscriptUnstable { provider_session_id: String },
+    /// The call does not exist for this conversation's agent: a plain `send_turn` on a conversation
+    /// whose agent takes a policy with every turn, or `send_turn_with` on one that does not.
+    /// The conversation is fine; the caller used the wrong door.
+    Unsupported,
 }
 
 impl ConversationError {
@@ -91,7 +96,7 @@ impl ConversationError {
     /// carry on; tearing down the session over one would discard a working conversation.
     pub fn is_benign(&self) -> bool {
         match self {
-            ConversationError::TurnAlreadyActive => true,
+            ConversationError::TurnAlreadyActive | ConversationError::Unsupported => true,
             ConversationError::Provider(e) => e.is_benign(),
             ConversationError::NoSession | ConversationError::Cwd(_) => false,
             // A refused resume leaves nothing running and nothing to tear down, but it is not
@@ -133,6 +138,9 @@ impl std::fmt::Display for ConversationError {
                  That session has been closed rather than handed back: continuing it would look like \
                  your previous conversation while carrying none of it. Start a new session instead."
             ),
+            ConversationError::Unsupported => {
+                write!(f, "this conversation's agent does not take a turn sent that way")
+            }
             ConversationError::TranscriptUnstable { provider_session_id } => write!(
                 f,
                 "session {provider_session_id} is still being written to, so something else is \
@@ -227,6 +235,7 @@ fn ensure_transcript_is_not_being_written(cwd: &str, provider_session_id: &str) 
 /// when that prompt was sent before the session was adopted). A title the record already has always
 /// wins, the same way `created_at` does: a resume must not rename a session.
 pub(crate) fn persist_record(
+    provider_name: &str,
     conversation_id: &str,
     canonical_cwd: &str,
     provider_session_id: &str,
@@ -258,7 +267,7 @@ pub(crate) fn persist_record(
     let title = existing.and_then(|r| r.title).or_else(|| title.map(str::to_string));
     let record = ConversationRecord {
         conversation_id: conversation_id.to_string(),
-        provider: PROVIDER_NAME.to_string(),
+        provider: provider_name.to_string(),
         provider_session_id: provider_session_id.to_string(),
         canonical_cwd: canonical_cwd.to_string(),
         created_at,
@@ -302,6 +311,10 @@ pub struct AgentConversation {
     /// conversation is CONSTRUCTED on a worker thread, because creating one spawns a real sidecar
     /// process and, on a cold checkout, runs `npm ci` -- minutes that must never land on a GTK loop.)
     provider: Arc<dyn AgentProvider + Send + Sync>,
+    /// The same provider seen through the external extension, for a conversation that has one.
+    /// `Some` is what makes this an external conversation: its turns carry a policy, and it reads no
+    /// Claude transcript.
+    external: Option<Arc<dyn ExternalProvider + Send + Sync>>,
     capabilities: ProviderCapabilities,
     info: ProviderInfo,
     /// Verdandi's id for this session. `None` only between construction failure modes -- a
@@ -357,7 +370,52 @@ impl AgentConversation {
             streaming: crate::provider::StreamingPreference::Partial,
             project,
         })?;
-        Ok(Self::assembled(provider, canonical_cwd, capabilities, info, session_id))
+        Ok(Self::assembled(
+            provider,
+            None,
+            PROVIDER_NAME,
+            canonical_cwd,
+            capabilities,
+            info,
+            session_id,
+        ))
+    }
+
+    /// Creates a fresh session on an external provider. The provider's name keys the lease and the
+    /// persisted record, and the start carries the trust plan and the policy of the tab's mode.
+    ///
+    /// `start.resume` must be empty: a start that names a session to continue is a resume, and
+    /// quietly starting a fresh one instead is the substitution the resume path exists to prevent.
+    /// The working directory the provider sees is the canonical one, whatever `start.cwd` says.
+    pub fn create_external(
+        provider: Arc<dyn ExternalProvider + Send + Sync>,
+        start: ExternalStart,
+        cwd: &Path,
+    ) -> Result<Self, ConversationError> {
+        if start.resume.is_some() {
+            return Err(ConversationError::Provider(ProviderError::Provider {
+                code: crate::ProviderErrorCode::InvalidConfiguration,
+                message: "a start that names a session to continue must go through resume_external".to_string(),
+            }));
+        }
+        let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
+        let as_agent: Arc<dyn AgentProvider + Send + Sync> = provider.clone();
+        let capabilities = as_agent.capabilities();
+        let info = as_agent.info();
+        let name = provider.name();
+        let session_id = provider.start(ExternalStart {
+            cwd: canonical_cwd.to_string_lossy().to_string(),
+            ..start
+        })?;
+        Ok(Self::assembled(
+            as_agent,
+            Some(provider),
+            name,
+            canonical_cwd,
+            capabilities,
+            info,
+            session_id,
+        ))
     }
 
     /// Wires a freshly-created conversation to its ingestion thread.
@@ -367,17 +425,21 @@ impl AgentConversation {
     /// whichever thread eventually decides to look.
     fn assembled(
         provider: Arc<dyn AgentProvider + Send + Sync>,
+        external: Option<Arc<dyn ExternalProvider + Send + Sync>>,
+        provider_name: &'static str,
         canonical_cwd: PathBuf,
         capabilities: ProviderCapabilities,
         info: ProviderInfo,
         session_id: String,
     ) -> Self {
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);
+        let resumable = external.as_ref().map_or(capabilities.resume, |e| e.resumes());
         let ingest = ConversationIngest::start(
             Arc::clone(&provider),
+            provider_name,
             conversation_id.clone(),
             canonical_cwd.to_string_lossy().to_string(),
-            capabilities.resume,
+            resumable,
             None,
             None,
             // A fresh session has nothing to restore. `create` never reads either history record --
@@ -388,6 +450,7 @@ impl AgentConversation {
             conversation_id,
             canonical_cwd,
             provider,
+            external,
             capabilities,
             info,
             session_id: Some(session_id),
@@ -495,6 +558,7 @@ impl AgentConversation {
 
         let ingest = ConversationIngest::start(
             Arc::clone(&provider),
+            PROVIDER_NAME,
             conversation_id.clone(),
             cwd_string.clone(),
             capabilities.resume,
@@ -504,10 +568,11 @@ impl AgentConversation {
             Some(lease),
             seed,
         );
-        let mut conversation = Self {
+        let conversation = Self {
             conversation_id,
             canonical_cwd,
             provider,
+            external: None,
             capabilities,
             info,
             session_id: Some(session_id),
@@ -517,6 +582,88 @@ impl AgentConversation {
             ui_snapshot_revision: None,
         };
 
+        Self::confirm_resume(conversation, PROVIDER_NAME, &cwd_string, provider_session_id)
+    }
+
+    /// Resumes a session on an external provider, with the session's lease already taken by the
+    /// caller (as [`resume_holding`](Self::resume_holding) does). The session to continue is
+    /// `start.resume`, and a start without one is refused.
+    ///
+    /// Two steps of the Claude resume are skipped because they are about Claude's files: the probe of
+    /// Claude's own transcript, and the seed read from it. An external agent's history arrives as
+    /// events from the provider itself, folded before any live one.
+    pub fn resume_external(
+        provider: Arc<dyn ExternalProvider + Send + Sync>,
+        start: ExternalStart,
+        cwd: &Path,
+        holding: SessionLease,
+    ) -> Result<Self, ConversationError> {
+        let Some(provider_session_id) = start.resume.clone() else {
+            return Err(ConversationError::Provider(ProviderError::Provider {
+                code: crate::ProviderErrorCode::InvalidConfiguration,
+                message: "resume_external needs the id of the session to continue".to_string(),
+            }));
+        };
+        let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
+        let as_agent: Arc<dyn AgentProvider + Send + Sync> = provider.clone();
+        let capabilities = as_agent.capabilities();
+        if !provider.resumes() {
+            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
+                "resume",
+            )));
+        }
+        let info = as_agent.info();
+        let name = provider.name();
+        let cwd_string = canonical_cwd.to_string_lossy().to_string();
+        if !holding.is_for(name, &cwd_string, &provider_session_id) {
+            return Err(ConversationError::Lease(LeaseError::Io(std::io::Error::other(
+                "the lease handed to this resume is for another session",
+            ))));
+        }
+        let conversation_id = conversation_id_for_cwd(&canonical_cwd);
+        let session_id = provider.start(ExternalStart {
+            cwd: cwd_string.clone(),
+            ..start
+        })?;
+        let ingest = ConversationIngest::start(
+            Arc::clone(&as_agent),
+            name,
+            conversation_id.clone(),
+            cwd_string.clone(),
+            true,
+            Some(provider_session_id.clone()),
+            Some(holding),
+            // Nothing is read from disk: the provider's events carry the history.
+            crate::AgentSessionProjection::default(),
+        );
+        let conversation = Self {
+            conversation_id,
+            canonical_cwd,
+            provider: as_agent,
+            external: Some(provider),
+            capabilities,
+            info,
+            session_id: Some(session_id),
+            ingest,
+            title_noted: false,
+            close_failed: false,
+            ui_snapshot_revision: None,
+        };
+        Self::confirm_resume(conversation, name, &cwd_string, &provider_session_id)
+    }
+
+    /// The last step of every resume: waits briefly for the provider's verdict, tears the session down
+    /// on a rejection, and persists the record on success.
+    fn confirm_resume(
+        mut conversation: Self,
+        provider_name: &'static str,
+        cwd_string: &str,
+        provider_session_id: &str,
+    ) -> Result<Self, ConversationError> {
+        let resumable = match &conversation.external {
+            Some(external) => external.resumes(),
+            None => conversation.capabilities.resume,
+        };
         // A resume the provider ACCEPTS can still fail moments later. The sidecar's CreateSession
         // returns as soon as the session object exists; the SDK only discovers that the session id
         // does not exist when it tries to attach, and the session then terminates. Measured: a
@@ -544,10 +691,11 @@ impl AgentConversation {
         }
 
         persist_record(
+            provider_name,
             conversation.conversation_id(),
-            &cwd_string,
+            cwd_string,
             provider_session_id,
-            capabilities.resume,
+            resumable,
             None,
             &crate::persistence::NameUpdate::Keep,
         );
@@ -646,6 +794,15 @@ impl AgentConversation {
         &self.conversation_id
     }
 
+    /// `claude` for the sidecar, the external provider's own name otherwise: the component that keys
+    /// the lease and the persisted record.
+    pub fn provider_name(&self) -> &str {
+        match &self.external {
+            Some(external) => external.name(),
+            None => PROVIDER_NAME,
+        }
+    }
+
     pub fn canonical_cwd(&self) -> &Path {
         &self.canonical_cwd
     }
@@ -692,7 +849,13 @@ impl AgentConversation {
     /// it is set when the provider's event arrives. The local guard below therefore cannot be the
     /// only defense against a double send, and it is not: the provider rejects a concurrent turn
     /// too, with a typed `TurnAlreadyActive`. Both are real; neither is optimistic shadow state.
+    ///
+    /// An external conversation's turns carry a policy, so this door is closed on it
+    /// ([`send_turn_with`](Self::send_turn_with) is the one that opens).
     pub fn send_turn(&mut self, text: &str) -> Result<String, ConversationError> {
+        if self.external.is_some() {
+            return Err(ConversationError::Unsupported);
+        }
         if self.projection().active_turn_id.is_some() {
             return Err(ConversationError::TurnAlreadyActive);
         }
@@ -702,13 +865,40 @@ impl AgentConversation {
                 session_id,
                 text: text.to_string(),
             })
-            .map_err(|e| match e {
-                ProviderError::Provider {
-                    code: crate::ProviderErrorCode::TurnAlreadyActive,
-                    ..
-                } => ConversationError::TurnAlreadyActive,
-                other => ConversationError::Provider(other),
-            })
+            .map_err(Self::turn_error)
+    }
+
+    /// Submits one user turn on an external conversation, under the policy of the tab's mode. Same
+    /// local guard as [`send_turn`](Self::send_turn); the provider keeps its own, which also covers
+    /// the window before its `TurnStarted` is folded. A conversation with no external provider
+    /// refuses.
+    pub fn send_turn_with(&mut self, text: &str, policy: TurnPolicy) -> Result<String, ConversationError> {
+        let Some(external) = self.external.clone() else {
+            return Err(ConversationError::Unsupported);
+        };
+        if self.projection().active_turn_id.is_some() {
+            return Err(ConversationError::TurnAlreadyActive);
+        }
+        let session_id = self.require_session()?;
+        external
+            .send_turn_with(
+                SendTurnRequest {
+                    session_id,
+                    text: text.to_string(),
+                },
+                policy,
+            )
+            .map_err(Self::turn_error)
+    }
+
+    fn turn_error(e: ProviderError) -> ConversationError {
+        match e {
+            ProviderError::Provider {
+                code: crate::ProviderErrorCode::TurnAlreadyActive,
+                ..
+            } => ConversationError::TurnAlreadyActive,
+            other => ConversationError::Provider(other),
+        }
     }
 
     /// Store the first line of `as_typed` as the resume picker's session title. Pass the user's

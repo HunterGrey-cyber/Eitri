@@ -14,6 +14,7 @@ function envelope(over: Partial<TrustPromptEnvelope> = {}): TrustPromptEnvelope 
     kind: "trust_prompt",
     tab: 3,
     nonce: 17,
+    agent: "Claude",
     root: "/home/u/p/src",
     top: "/home/u/p",
     fingerprint: HEX_A,
@@ -49,6 +50,14 @@ describe("TrustPrompt", () => {
     ]);
     expect(container.querySelector(".trust-footer")!.textContent).toBe(
       "y trusts and loads it · n starts without it · Esc puts this off",
+    );
+  });
+
+  it("names the agent whose configuration a y trusts", () => {
+    const { container } = render(<TrustPrompt envelope={envelope({ agent: "Codex" })} />);
+    expect(container.querySelector("h2")!.textContent).toBe("Trust this project's Codex configuration?");
+    expect(container.querySelector(".trust-prompt")!.getAttribute("aria-label")).toBe(
+      "Trust this project's Codex configuration?",
     );
   });
 

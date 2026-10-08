@@ -22,6 +22,7 @@ export function initialState(): AgentUiState {
     capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
     provider: null,
     usage: null,
+    accountLimits: null,
     turnEndings: [],
     lastTurnEnding: null,
     history: null,
@@ -291,6 +292,22 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       const held = [...state.denialsBeforeTheirCall.filter((d) => d.toolUseId !== id), { toolUseId: id, denied }];
       return { ...state, denialsBeforeTheirCall: held.slice(-MAX_HELD_DENIALS) };
     }
+    case "policy_mismatch":
+      // Rust fails the tab (`TabSet::pump`) and the failure reaches the page as the tab's own state;
+      // there is nothing here to draw. `state`, so `nextSeq` keeps step with Rust's revision.
+      return state;
+    case "account_limits":
+      // The latest report wins, whole: the agent states the window each time. A slot it did not say
+      // is `null`, not carried over from the earlier report.
+      return {
+        ...state,
+        accountLimits: {
+          usedPercent: event.used_percent,
+          windowMinutes: event.window_minutes ?? null,
+          resetsAt: event.resets_at ?? null,
+          plan: event.plan ?? null,
+        },
+      };
     case "permission_mode_changed":
       // The mode lives on the tab (`tabs` envelope), not the projection: `TabInfo.mode` is what the
       // band and the box read, and Rust's own `tabs` envelope already reflects an acknowledged
@@ -410,12 +427,14 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
   // because earlier thinking does not imply current activity. Resync or reload may degrade
   // `thinking` to `sent` but must not invent activity. Take `usage` from this tab's snapshot so a
   // tab with no report cannot retain the previous tab's figure. Default an absent key to `null`,
-  // which `usageSegment` treats as unknown; `undefined` would throw. Restore `turnEndings` and
-  // `lastTurnEnding` from the snapshot, defaulting absent keys to `[]` and `null`, so reload
-  // preserves ending rows and the band's status.
+  // which `usageSegment` treats as unknown; `undefined` would throw. Restore `accountLimits` from
+  // the snapshot, defaulting an absent key to `null` for payloads that predate it. Restore
+  // `turnEndings` and `lastTurnEnding` from the snapshot, defaulting absent keys to `[]` and
+  // `null`, so reload preserves ending rows and the band's status.
   return {
     ...snapshot,
     usage: snapshot.usage ?? null,
+    accountLimits: snapshot.accountLimits ?? null,
     turnEndings: snapshot.turnEndings ?? [],
     lastTurnEnding: snapshot.lastTurnEnding ?? null,
     nextSeq: throughRevision,

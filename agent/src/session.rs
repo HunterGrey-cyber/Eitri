@@ -390,6 +390,7 @@ pub(crate) fn translate_wire_event(
             // and `model` are `None` -- unknown, not a zeroed `TokenUsage` -- where the sidecar
             // backend, which has no turn count, reports the reverse.
             let usage = Some(crate::UsageInfo {
+                cost_reported: true,
                 total_cost_usd,
                 num_turns: Some(num_turns),
                 tokens: None,
@@ -704,6 +705,7 @@ mod tests {
             [AgentDomainEvent::TurnCompleted { usage, .. }] => assert_eq!(
                 *usage,
                 Some(crate::UsageInfo {
+                    cost_reported: true,
                     total_cost_usd: 0.0123,
                     num_turns: Some(4),
                     tokens: None,

@@ -32,11 +32,12 @@ use eitri_core::agent_bridge::{
 };
 use eitri_core::keymap::TabAction;
 use eitri_core::layout::Direction;
+use eitri_core::project_trust::Profile;
 use eitri_core::saved_tabs::{SavedTabs, TabMemory};
 use eitri_core::tab_restore::{RestoreOffer, RestorePolicy, RestoreRun};
 use eitri_core::tab_set::{
-    AwaitingTrust, BypassPolicy, DeferredStart, FirstTurn, PendingHandoff, PendingStart, RestoreGo, RestorePrompt,
-    RestoreStep, ResumeRoute, StartCollected, Tab, TabBackend,
+    AgentId, AwaitingTrust, BypassPolicy, DeferredStart, FirstTurn, PendingHandoff, PendingStart, RestoreGo,
+    RestorePrompt, RestoreStep, ResumeRoute, StartCollected, Tab, TabBackend,
 };
 use eitri_core::tabs::TabId;
 use std::cell::{Cell, RefCell};
@@ -339,21 +340,24 @@ struct Retiring {
     /// Connects of tabs that are gone. Whatever one produces is shut down (`poll`).
     connects: Vec<mpsc::Receiver<Result<AgentBackend, BackendError>>>,
     /// One per teardown worker, sent after the backend was shut down AND dropped -- the drop is
-    /// where the sidecar child actually dies. A worker that panicked drops its sender instead.
-    teardowns: Vec<mpsc::Receiver<()>>,
+    /// where the sidecar child actually dies. A worker that panicked drops its sender instead. Each
+    /// names the tab whose presence the set keeps until it reports ([`TabSet::note_retiring`]), when
+    /// it is one the set counted.
+    teardowns: Vec<(Option<TabId>, mpsc::Receiver<()>)>,
 }
 
 impl Retiring {
     /// One backend, shut down and dropped on a worker thread, never on the GTK main loop (the same
-    /// reasons as `tear_down`).
-    fn backend(&mut self, mut backend: AgentBackend) {
+    /// reasons as `tear_down`). `tab` is the tab the set counted it as retiring for, which `poll`
+    /// names once the shutdown has returned; `None` for a backend the set never held.
+    fn backend(&mut self, mut backend: AgentBackend, tab: Option<TabId>) {
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
             backend.shutdown();
             drop(backend);
             let _ = done_tx.send(());
         });
-        self.teardowns.push(done_rx);
+        self.teardowns.push((tab, done_rx));
     }
 
     /// A tab removed from the set: its backend is shut down, its connect is waited for, and a
@@ -364,10 +368,11 @@ impl Retiring {
         let mut owed = Vec::new();
         if let Some(handoff) = tab.pending_handoff {
             owed.push(handoff.request_id);
-            self.teardowns.push(handoff.dropped_rx);
+            self.teardowns.push((None, handoff.dropped_rx));
         }
         match tab.backend {
-            TabBackend::Live(backend) => self.backend(backend),
+            // `TabSet::remove` counted it as retiring.
+            TabBackend::Live(backend) => self.backend(backend, Some(tab.id)),
             TabBackend::Starting(pending) => {
                 owed.push(pending.request_id);
                 self.connects.push(pending.result_rx);
@@ -380,8 +385,9 @@ impl Retiring {
     }
 
     /// Each tick: a connect that finished has its backend shut down; a teardown that reported, or
-    /// whose worker died, is forgotten. `try_recv` only -- this runs on the GTK main loop.
-    fn poll(&mut self) {
+    /// whose worker died, is forgotten, and the tab it was counted for is returned for
+    /// [`TabSet::retire_done`]. `try_recv` only -- this runs on the GTK main loop.
+    fn poll(&mut self) -> Vec<TabId> {
         let mut finished = Vec::new();
         self.connects.retain(|rx| match rx.try_recv() {
             Ok(Ok(backend)) => {
@@ -393,10 +399,18 @@ impl Retiring {
         });
         for backend in finished {
             eprintln!("[agent_panel] a closed tab's connect finished; shutting its backend down");
-            self.backend(backend);
+            self.backend(backend, None);
         }
-        self.teardowns
-            .retain(|rx| matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let mut done = Vec::new();
+        self.teardowns.retain(|(tab, rx)| {
+            // A worker that died has dropped its backend on the way out, which ends the child too.
+            let finished = !matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+            if finished {
+                done.extend(*tab);
+            }
+            !finished
+        });
+        done
     }
 
     #[cfg(test)]
@@ -568,11 +582,18 @@ struct AgentPanelState {
     bypass_by_config: bool,
     /// Whether this project remembers a mode Shift+Tab left, which the configured default yields to.
     mode_remembered: bool,
+    /// The agent a tab made without naming one runs (`agent.default`).
+    default_agent: AgentId,
+    /// `agent.codex.command` as `init.lua` left it; `EITRI_CODEX` still outranks it.
+    codex_command: Option<String>,
     /// A restore whose resumes have not all returned yet.
     restore_run: Option<RestoreRun>,
     /// Whether the hello last sent could carry the restore offer, so the tick sends a new one only
     /// when that changes.
     last_restore_offered: bool,
+    /// The agent of the active tab the hello last sent was computed for: its sessions are the ones
+    /// the greeting offers, so the tick sends a new one when the active tab runs another agent.
+    last_hello_agent: AgentId,
     /// Where a restore's one-line result goes: `main.rs`'s window toast.
     toast_hook: Option<ToastHook>,
     /// Whether a session about to start may load the project's own Claude configuration, and the
@@ -608,6 +629,13 @@ enum SpawnCall {
         id: String,
         lease: agent::lease::SessionLease,
         project: ProjectTrust,
+    },
+    /// A tab of another agent, fresh or resumed, with the trust plan it was given.
+    External {
+        agent: AgentId,
+        plan: agent::TrustPlan,
+        mode: SessionModeChoice,
+        resume: Option<String>,
     },
 }
 
@@ -780,7 +808,10 @@ impl AgentPanelHandle {
         collect_pending_starts(state, page);
         collect_pending_handoffs(state, page);
         report_sessions_that_never_opened(state, page);
-        state.borrow_mut().retiring.poll();
+        let retired = state.borrow_mut().retiring.poll();
+        for tab in retired {
+            state.borrow_mut().tabs.retire_done(tab);
+        }
 
         // The payload is built under the borrow and dispatched OUTSIDE it. Calling into WebKit while
         // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
@@ -856,7 +887,8 @@ impl AgentPanelHandle {
         // The active one also says why, as a session that never opened does.
         for tripped in tripped {
             let active = state.borrow().tabs.active() == tripped.tab;
-            state.borrow_mut().retiring.backend(tripped.backend);
+            // The pump counted it as retiring for its tab.
+            state.borrow_mut().retiring.backend(tripped.backend, Some(tripped.tab));
             if active {
                 page.send(&serialize_error_for_js(tripped.tab, &tripped.reason));
             }
@@ -1028,7 +1060,7 @@ impl AgentPanelHandle {
         // still running on workers nothing else would keep alive. Same holds and backstops as the tabs just taken.
         let retiring = std::mem::take(&mut self.state.borrow_mut().retiring);
         entries.extend(retiring.connects.into_iter().map(watch_connect));
-        for rx in retiring.teardowns {
+        for (_, rx) in retiring.teardowns {
             entries.push(watched("a closed tab's teardown", rx, SESSION_CLOSE_BACKSTOP, |()| {
                 Vec::new()
             }));
@@ -1252,6 +1284,19 @@ impl AgentPanelHandle {
                 state.tabs.apply_configured_default(mode);
             }
         }
+    }
+
+    /// `agent.default` as `init.lua` left it, applied once after it ran: every tab made without naming
+    /// an agent, and the empty tab the window already has, run it.
+    pub fn set_default_agent(&self, agent: AgentId) {
+        let mut state = self.state.borrow_mut();
+        state.tabs.apply_configured_agent(agent.clone());
+        state.default_agent = agent;
+    }
+
+    /// `agent.codex.command` as `init.lua` left it (`None`: unset), read by every Codex start.
+    pub fn set_codex_command(&self, command: Option<String>) {
+        self.state.borrow_mut().codex_command = command;
     }
 
     /// `review.enabled` and `review.hint` as `init.lua` left them, applied once after it ran. Enabled
@@ -1539,13 +1584,19 @@ impl AgentPanelHandle {
         self.page.as_deref()
     }
 
-    /// `prefix c`: opens a tab, selects it, and sends `tabs` -- nothing else: an empty tab has no
-    /// state yet.
+    /// `prefix c`: opens a tab running the window's default agent (`agent.default`), selects it, and
+    /// sends `tabs` -- nothing else: an empty tab has no state yet.
     pub fn new_tab(&self) {
+        let agent = self.state.borrow().default_agent.clone();
+        self.new_tab_for(agent);
+    }
+
+    /// [`new_tab`](Self::new_tab) for a named agent (`:tabnew <agent>`).
+    pub fn new_tab_for(&self, agent: AgentId) {
         let Some(page) = self.live_page() else {
             return;
         };
-        self.state.borrow_mut().tabs.open();
+        self.state.borrow_mut().tabs.open(agent);
         send_tabs(&self.state, page);
     }
 
@@ -1879,8 +1930,11 @@ fn panel_state(
         restore_policy: RestorePolicy::Offer,
         bypass_by_config: false,
         mode_remembered,
+        default_agent: AgentId::Claude,
+        codex_command: None,
         restore_run: None,
         last_restore_offered: false,
+        last_hello_agent: AgentId::Claude,
         toast_hook: None,
         editor_context,
         backend_kind,
@@ -2310,8 +2364,8 @@ fn switch_payloads(state: &mut AgentPanelState) -> Vec<String> {
     state.trust.drop_command_prompt();
     let mut payloads = vec![tabs_payload_recorded(state)];
     payloads.extend(state.tabs.active_state_payloads());
-    if state.trust.current_route() == Some(Route::Ask) {
-        let active = state.tabs.active();
+    let active = state.tabs.active();
+    if state.trust.current_route(&waiting_profile(state, active)) == Some(Route::Ask) {
         payloads.extend(reroute_or_ask(state, active).payloads);
     }
     payloads
@@ -2345,14 +2399,21 @@ fn send_hello_if_open_sessions_changed(state: &Rc<RefCell<AgentPanelState>>, pag
         // The saved tabs are on offer only while nothing here has started: when that stops being
         // true the dashboard's line has to go, though no session id changed with it.
         let offered = restore_is_on_offer(&state_ref);
-        if open == state_ref.last_open_ids && offered == state_ref.last_restore_offered {
+        // The greeting lists the active tab's agent's sessions, so a switch to a tab running another
+        // agent changes it too, though no session id changed with it.
+        let agent = state_ref.tabs.active_tab().agent().clone();
+        if open == state_ref.last_open_ids
+            && offered == state_ref.last_restore_offered
+            && agent == state_ref.last_hello_agent
+        {
             return;
         }
-        let mut greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
+        let mut greeting = BackendGreeting::for_agent(state_ref.backend_kind, &agent, state_ref.project_dir.clone());
         greeting.resumable.retain(|r| !open.contains(&r.provider_session_id));
-        let offer = restore_offer(&state_ref, &greeting);
+        let offer = restore_offer(&state_ref);
         state_ref.last_open_ids = open;
         state_ref.last_restore_offered = offered;
+        state_ref.last_hello_agent = agent;
         serialize_hello_with_restore_for_js(&greeting, offer.as_ref())
     };
     page.send(&payload);
@@ -2369,19 +2430,27 @@ fn restore_is_on_offer(state: &AgentPanelState) -> bool {
 
 /// What the dashboard says it can bring back: the saved tabs that still can be, `None` when that is
 /// none (a key that restores nothing is never offered).
-fn restore_offer(state: &AgentPanelState, greeting: &BackendGreeting) -> Option<RestoreOffer> {
+fn restore_offer(state: &AgentPanelState) -> Option<RestoreOffer> {
     if !restore_is_on_offer(state) {
         return None;
     }
-    restore_plan(state, greeting).offer()
+    restore_plan(state).offer()
 }
 
 /// Which of the saved tabs can come back, judged against the records and leases as they are now.
-fn restore_plan(state: &AgentPanelState, greeting: &BackendGreeting) -> eitri_core::tab_restore::RestorePlan {
+fn restore_plan(state: &AgentPanelState) -> eitri_core::tab_restore::RestorePlan {
     let canonical = state.canonical_project_dir.as_str();
     let saved = state.restore_source.clone().unwrap_or_default();
-    eitri_core::tab_restore::plan(&saved, &greeting.resumable, &state.tabs.open_session_ids(), |id| {
-        agent::lease::SessionLease::is_held("claude", canonical, id).unwrap_or(false)
+    // Read here rather than taken from a greeting: the greeting lists the active tab's agent's
+    // records, and the saved Claude tabs are matched with Claude's whichever agent that tab runs. The
+    // other agents' records are read beside them, each saved tab being matched only with a record its
+    // own agent wrote.
+    let mut records = BackendGreeting::claude_sessions(state.backend_kind, &state.project_dir);
+    if !saved.external_tabs.is_empty() {
+        records.extend(eitri_core::agent_backend::external_sessions(&state.project_dir));
+    }
+    eitri_core::tab_restore::plan(&saved, &records, &state.tabs.open_session_ids(), |agent, id| {
+        agent::lease::SessionLease::is_held(&agent.record_name(), canonical, id).unwrap_or(false)
     })
 }
 
@@ -2428,7 +2497,12 @@ fn resume_spawner(
 /// tabs. Nothing is started unless this window has started nothing yet; what is cleared waits for the
 /// trust question before anything is leased or started.
 fn ask_for_restore(state: &mut AgentPanelState, from: TabId, ask: RestoreAsk) -> RestoreResult {
-    if state.backend_kind != BackendKind::Sidecar {
+    // Another agent's saved tab does not need the sidecar; a window with only Claude tabs saved does.
+    let saved_external = state
+        .restore_source
+        .as_ref()
+        .is_some_and(|s| !s.external_tabs.is_empty());
+    if state.backend_kind != BackendKind::Sidecar && !saved_external {
         return RestoreResult::Refused("only the sidecar backend can resume sessions".to_string());
     }
     if state.restore_run.is_some() {
@@ -2445,8 +2519,7 @@ fn ask_for_restore(state: &mut AgentPanelState, from: TabId, ask: RestoreAsk) ->
     if state.restore_source.is_none() {
         return RestoreResult::Refused("there are no saved tabs to restore".to_string());
     }
-    let greeting = BackendGreeting::for_kind(state.backend_kind, state.project_dir.clone());
-    let plan = restore_plan(state, &greeting);
+    let plan = restore_plan(state);
     // A launch has one go at it, whatever comes of it: a reload of the page must not try again.
     if ask == RestoreAsk::Launch {
         state.restore_source = None;
@@ -2510,10 +2583,13 @@ fn start_restore(
     project: ProjectTrust,
 ) -> RestoreResult {
     let canonical = state.canonical_project_dir.clone();
+    // Only Claude tabs are started here; another agent's tab is refused in `connect` below, before a
+    // tab is made for it, so no lease is taken for one.
     let mut leases: std::collections::HashMap<String, Result<agent::lease::SessionLease, String>> = go
-        .session_ids()
+        .sessions()
         .into_iter()
-        .map(|id| {
+        .filter(|(agent, _)| *agent == AgentId::Claude)
+        .map(|(_, id)| {
             let lease = match agent::lease::SessionLease::try_acquire("claude", &canonical, &id) {
                 Ok(lease) => Ok(lease),
                 Err(agent::lease::LeaseError::AlreadyHeld) => Err(eitri_core::tab_restore::HELD_ELSEWHERE.to_string()),
@@ -2523,10 +2599,15 @@ fn start_restore(
         })
         .collect();
     let (downgraded, asked) = (go.downgraded, go.asked);
-    let run = state.tabs.start_restore(from, go, |id| match leases.remove(id) {
-        Some(Ok(lease)) => Ok(spawn(id, lease, project)),
-        Some(Err(reason)) => Err(reason),
-        None => Err("it was listed twice".to_string()),
+    let run = state.tabs.start_restore(from, go, |agent, id| {
+        if agent.is_external() {
+            return Err(format!("this build cannot bring a {} tab back yet", agent.label()));
+        }
+        match leases.remove(id) {
+            Some(Ok(lease)) => Ok(spawn(id, lease, project)),
+            Some(Err(reason)) => Err(reason),
+            None => Err("it was listed twice".to_string()),
+        }
     });
     // The tabs this restore just set connecting are the only starting ones without their tiers:
     // every other start names them as it begins.
@@ -2672,12 +2753,43 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Puts a session start off until the gate has checked the project: the tab holds what was asked
-/// for, and nothing is spawned or leased until the check (and, when it must, the user) says how.
+/// The discovery profile of an agent: whose project files its trust question is about.
+fn trust_profile(agent: &AgentId) -> Profile {
+    match agent {
+        AgentId::Claude => Profile::Claude,
+        AgentId::Codex => Profile::Codex,
+        // No registration names its files yet, so nothing is found: the agent still starts only
+        // after a `y`, and a file list given later changes the fingerprint and asks again.
+        AgentId::Acp(name) => Profile::Acp {
+            name: name.clone(),
+            files: Vec::new(),
+        },
+    }
+}
+
+/// The profile a tab's start waits on. A restore starts Claude's saved tabs only, whichever agent
+/// the tab it waits in runs, so it is Claude's configuration that is asked about.
+fn waiting_profile(state: &AgentPanelState, tab: TabId) -> Profile {
+    match state.tabs.get(tab) {
+        Some(t) => match &t.backend {
+            TabBackend::AwaitingTrust(AwaitingTrust {
+                start: DeferredStart::Restore { .. },
+                ..
+            }) => Profile::Claude,
+            _ => trust_profile(t.agent()),
+        },
+        None => Profile::Claude,
+    }
+}
+
+/// Puts a session start off until the gate has checked the project for the tab's agent: the tab holds
+/// what was asked for, and nothing is spawned or leased until the check (and, when it must, the user)
+/// says how.
 fn gate_start(state: &mut AgentPanelState, tab: TabId, start: DeferredStart) -> Result<(), String> {
     state.tabs.defer_start(tab, start)?;
-    state.trust.wait_for(tab);
-    state.trust.begin_check();
+    let profile = waiting_profile(state, tab);
+    state.trust.wait_for(tab, &profile);
+    state.trust.begin_check(&profile);
     Ok(())
 }
 
@@ -2691,6 +2803,10 @@ fn start_deferred(state: &mut AgentPanelState, tab: TabId, start: DeferredStart,
     }
     // A question the tab may still have had on screen is spent: the tab is starting.
     state.trust.hide(tab);
+    let agent = state.tabs.get(tab).expect("checked above").agent().clone();
+    if agent.is_external() && !matches!(start, DeferredStart::Restore { .. }) {
+        return start_external_tab(state, tab, agent, start, project);
+    }
     let (kind, project_dir) = (state.backend_kind, state.project_dir.clone());
     match start {
         DeferredStart::FirstSend { request_id, first_turn } => {
@@ -2771,6 +2887,112 @@ fn start_deferred(state: &mut AgentPanelState, tab: TabId, start: DeferredStart,
     out
 }
 
+/// [`start_deferred`] for a tab of another agent: its trust plan is built from the discovery the
+/// gate's answer is bound to, and the agent's own connect worker is begun with it. Without such a
+/// discovery (the trust check could not run) or with a root no agent configuration can name, the
+/// start is dropped and says why. So is an untrusted start of an agent that has no way to leave the
+/// project's configuration out, whatever routed it here: such an agent starts only after a `y`.
+fn start_external_tab(
+    state: &mut AgentPanelState,
+    tab: TabId,
+    agent: AgentId,
+    start: DeferredStart,
+    project: ProjectTrust,
+) -> TrustOut {
+    let profile = trust_profile(&agent);
+    if project == ProjectTrust::Untrusted && profile.requires_explicit_yes() {
+        return put_off_start(state, tab, start, &crate::trust_gate::refused_without_yes(&profile));
+    }
+    let answer = match project {
+        ProjectTrust::Trusted => agent::DirTrust::Trusted,
+        ProjectTrust::Untrusted => agent::DirTrust::Untrusted,
+    };
+    let plan = match state.trust.bound_discovery(&profile) {
+        Some(discovery) => {
+            eitri_core::project_trust::trust_plan(discovery, answer, &discovery.root).map_err(|e| e.to_string())
+        }
+        None => Err(format!(
+            "{} was not started: the trust check of this project has not run",
+            agent.label()
+        )),
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(why) => return put_off_start(state, tab, start, &why),
+    };
+    let (request_id, resume, resumed_title, resumed_name, first_turn) = match start {
+        DeferredStart::FirstSend { request_id, first_turn } => (request_id, None, None, None, Some(first_turn)),
+        DeferredStart::Resume {
+            request_id,
+            provider_session_id,
+            resumed_title,
+            resumed_name,
+        } => (request_id, Some(provider_session_id), resumed_title, resumed_name, None),
+        // A restore is started by `start_deferred` itself.
+        DeferredStart::Restore { .. } => return TrustOut::default(),
+    };
+    let mode = state.tabs.get(tab).map_or(SessionModeChoice::Auto, |t| t.mode());
+    let project_dir = state.project_dir.clone();
+    let codex_command = state.codex_command.clone();
+    let result_rx = match &state.spawner {
+        Spawner::Real => spawn_external(agent, project_dir, plan, mode, resume.clone(), codex_command),
+        #[cfg(test)]
+        Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::External {
+            agent,
+            plan,
+            mode,
+            resume: resume.clone(),
+        }),
+    };
+    let Some(t) = state.tabs.get_mut(tab) else {
+        return TrustOut::default();
+    };
+    t.project_tiers = Some(project);
+    let resuming = resume.is_some();
+    t.backend = TabBackend::Starting(PendingStart {
+        request_id,
+        result_rx,
+        first_turn,
+        resume,
+        resumed_title,
+        resumed_name,
+    });
+    let mut out = TrustOut::default();
+    if resuming && state.tabs.active() == tab {
+        out.payloads.extend(switch_payloads(state));
+    } else {
+        out.push(tabs_payload_recorded(state));
+    }
+    out
+}
+
+/// A start that will not happen, taken back as an `Escape` on its question would be: a first message
+/// returns to the composer, a resume or a restore is dropped with a toast. `why` is said in the panel
+/// and is the refused command's error.
+fn put_off_start(state: &mut AgentPanelState, tab: TabId, start: DeferredStart, why: &str) -> TrustOut {
+    let mut out = TrustOut::default();
+    out.push(tabs_payload_recorded(state));
+    out.push(eitri_core::agent_bridge::serialize_notice_for_js(why));
+    match start {
+        DeferredStart::FirstSend {
+            request_id: sent,
+            first_turn,
+        } => {
+            // The refused send first: the page puts a refused message back in its box itself, so the
+            // draft that follows only confirms it rather than adding it a second time.
+            state.tabs.set_draft(tab, &first_turn.typed);
+            out.push(serialize_command_result_for_js(&sent, Err(why)));
+            out.push(eitri_core::agent_bridge::serialize_draft_for_js(tab, &first_turn.typed));
+        }
+        DeferredStart::Resume { request_id: asked, .. } => {
+            out.push(serialize_command_result_for_js(&asked, Err(why)));
+            out.toast = Some(why.to_string());
+        }
+        DeferredStart::Restore { .. } => out.toast = Some(why.to_string()),
+    }
+    out
+}
+
 /// A tab waiting for the trust question, given what the gate knows now: started if the answer is
 /// already known, asked if it is on screen and its question is not, left waiting otherwise. Does
 /// nothing while its check or its record is still out.
@@ -2787,7 +3009,8 @@ fn reroute_or_ask(state: &mut AgentPanelState, tab: TabId) -> TrustOut {
     if state.trust.is_waiting(tab) {
         return out;
     }
-    match state.trust.current_route() {
+    let profile = waiting_profile(state, tab);
+    match state.trust.current_route(&profile) {
         None => {}
         Some(Route::Start(project)) => {
             if let Some(start) = state.tabs.take_deferred(tab) {
@@ -2806,7 +3029,7 @@ fn reroute_or_ask(state: &mut AgentPanelState, tab: TabId) -> TrustOut {
             let Ok(nonce) = state.tabs.ask_trust(tab) else {
                 return out;
             };
-            if let Some(view) = state.trust.show(tab, nonce) {
+            if let Some(view) = state.trust.show(tab, nonce, &profile) {
                 out.push(eitri_core::agent_bridge::serialize_trust_prompt_for_js(&view));
             }
         }
@@ -2877,6 +3100,34 @@ fn trust_events(state: &mut AgentPanelState) -> TrustOut {
     out
 }
 
+/// `:trust` / `:untrust` from the `:` line, about the active tab's agent. `agent` is the agent the page
+/// believed that tab runs; a command typed for another agent's tab (the page was behind a switch) is
+/// refused rather than applied to whichever agent is on screen now.
+fn trust_command(
+    state: &mut AgentPanelState,
+    request_id: &str,
+    action: eitri_core::agent_bridge::TrustAction,
+    agent: &str,
+) -> Result<(), String> {
+    let active = state.tabs.active_tab();
+    let (tab, running) = (active.id, active.agent().clone());
+    if running.record_name() != agent {
+        let command = match action {
+            eitri_core::agent_bridge::TrustAction::Trust => ":trust",
+            eitri_core::agent_bridge::TrustAction::Untrust => ":untrust",
+        };
+        let asked = AgentId::from_record_name(agent).map_or_else(|| format!("{agent:?}"), |a| a.label());
+        return Err(format!(
+            "that {command} was for a {asked} tab; this tab runs {}",
+            running.label()
+        ));
+    }
+    state
+        .trust
+        .command(request_id.to_string(), action, tab, &trust_profile(&running));
+    Ok(())
+}
+
 /// Drains the gate from the tick.
 fn poll_trust(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     let out = trust_events(&mut state.borrow_mut());
@@ -2928,6 +3179,18 @@ fn answer_trust(
                 out.push(serialize_command_result_for_js(request_id, Err(&why)));
                 // Asked again with what is on disk now, or started if there is nothing left to ask.
                 out.extend(reroute_or_ask(state, tab));
+            }
+            AnswerOutcome::NotStarted(why) => {
+                let Ok(start) = state.tabs.take_answered(tab, nonce) else {
+                    out.push(serialize_command_result_for_js(
+                        request_id,
+                        Err(crate::trust_gate::NOT_CURRENT),
+                    ));
+                    return out;
+                };
+                out.extend(put_off_start(state, tab, start, &why));
+                // The answer itself was taken; it is the start that is refused.
+                out.push(serialize_command_result_for_js(request_id, Ok(())));
             }
         }
         return out;
@@ -3032,8 +3295,10 @@ fn remember_tabs(state: &Rc<RefCell<AgentPanelState>>) {
 /// The chooser's envelope (`prefix w`): the open tabs in number order, then every record open
 /// in no tab, each marked if another window holds its lease.
 fn chooser_payload(state: &AgentPanelState) -> String {
-    let greeting = BackendGreeting::for_kind(state.backend_kind, state.project_dir.clone());
-    let resumable = state.backend_kind == BackendKind::Sidecar;
+    // The records offered are the active tab's agent's, as the resume that follows starts in it.
+    let agent = state.tabs.active_tab().agent().clone();
+    let greeting = BackendGreeting::for_agent(state.backend_kind, &agent, state.project_dir.clone());
+    let lease_name = agent.record_name();
     let open: Vec<ChooserTab> = state
         .tabs
         .tabs()
@@ -3045,13 +3310,13 @@ fn chooser_payload(state: &AgentPanelState) -> String {
                 label: eitri_core::tabs::label(t.number, &t.label_name()),
                 marker: eitri_core::tabs::marker(facts),
                 pending: facts.pending,
-                resumable,
+                resumable: t.resumable(state.backend_kind),
             }
         })
         .collect();
     let canonical = state.canonical_project_dir.as_str();
     let records = chooser_records(&greeting.resumable, &state.tabs.open_session_ids(), |id| {
-        agent::lease::SessionLease::is_held("claude", canonical, id).unwrap_or(false)
+        agent::lease::SessionLease::is_held(&lease_name, canonical, id).unwrap_or(false)
     });
     eitri_core::agent_bridge::serialize_chooser_for_js(&open, &records)
 }
@@ -3069,8 +3334,8 @@ fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
                 .as_ref()
                 .map(|d| eitri_core::permission_store::path(d, &state.project_dir))
                 .as_deref(),
-            &state.trust.row(),
-            state.trust.next_session_trust(),
+            &state.trust.row(&trust_profile(t.agent())),
+            state.trust.next_session_trust(&trust_profile(t.agent())),
         ),
         None => Vec::new(),
     };
@@ -3110,7 +3375,9 @@ fn chooser_records(
 }
 
 /// `prefix i`'s rows for one tab, in the order they are shown, `—` for anything unknown. `trust_row` is the
-/// window's latest trust check in words, and `next` the tiers a session started now would get.
+/// window's latest trust check in words, and `next` the tiers a session started now would get. A tab
+/// that runs another agent than Claude gets that agent's rows (`external_detail_rows`); the Claude rows
+/// below are the same for a Claude tab on either backend.
 ///
 /// `provider_session_id()` is read into a local BEFORE `projection()` is taken: on the sidecar path
 /// both lock the same ingestion mutex (the 2026-09-15 GTK freeze; `tab_set`'s module doc).
@@ -3123,6 +3390,9 @@ fn detail_rows(
     trust_row: &str,
     next: ProjectTrust,
 ) -> Vec<DetailRow> {
+    if tab.agent().is_external() {
+        return external_detail_rows(tab, kind, project_dir, trust_row, next);
+    }
     const UNKNOWN: &str = "—";
     let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
     let backend = tab.live();
@@ -3160,9 +3430,10 @@ fn detail_rows(
         (Some(conversation), Some(session)) => agent::persistence::load_conversation_record(conversation, session).ok(),
         _ => None,
     };
-    let resumable = match kind {
-        BackendKind::Sidecar => "yes",
-        BackendKind::Legacy => "no (legacy backend)",
+    let resumable = if tab.resumable(kind) {
+        "yes"
+    } else {
+        "no (legacy backend)"
     };
     let rows: [(&str, String); 20] = [
         ("name", known(tab.name.clone())),
@@ -3206,6 +3477,147 @@ fn detail_rows(
         .collect()
 }
 
+/// What Codex does without asking, for `prefix i`: the sandbox's reach and every route around it, as
+/// they were measured, not softened. `root` is the project the sandbox is rooted at; the second half
+/// of the sentence follows the tab's mode, since in bypass Eitri answers what Codex's reviewer would.
+fn codex_runs_without_asking(root: &Path, bypass: bool) -> String {
+    let who_decides = if bypass {
+        "Eitri allows anything else"
+    } else {
+        "its reviewer decides anything else"
+    };
+    format!(
+        "Codex runs commands and edits inside {} without asking, reads anywhere, no network or sockets; \
+         your exec-policy allow rules run unsandboxed; {who_decides}, which then runs with your full \
+         rights; MCP tools follow their servers' approval modes",
+        root.display()
+    )
+}
+
+/// What a mode change does to a Codex tab and when: Eitri's own answers follow it at once, Codex's
+/// reviewer only at the next turn.
+const CODEX_MODE_LAG: &str = "a mode change reaches Codex's reviewer at the next turn; a running turn keeps the \
+     reviewer it started with (bypass to auto: Codex keeps asking and Eitri now draws cards; auto to bypass: \
+     Codex's reviewer still decides for the rest of that turn and Eitri accepts what still arrives)";
+
+/// The account limit an agent last reported, in words.
+fn limits_row(limits: &agent::AccountLimitsRecord) -> String {
+    let mut line = format!("{:.0}% used", limits.used_percent);
+    if let Some(minutes) = limits.window_minutes {
+        line.push_str(&format!(" of the {minutes}-minute window"));
+    }
+    if let Some(resets) = limits.resets_at.and_then(|t| u64::try_from(t).ok()) {
+        line.push_str(&format!(
+            " · resets {} {:02}:{:02} UTC",
+            eitri_core::project_trust::civil_date(resets),
+            resets % 86_400 / 3_600,
+            resets % 3_600 / 60
+        ));
+    }
+    if let Some(plan) = limits.plan.as_deref().filter(|p| !p.is_empty()) {
+        line.push_str(&format!(" · plan {plan}"));
+    }
+    line
+}
+
+/// `prefix i`'s rows for a tab that runs another agent than Claude. The Claude-only rows (Verdandi
+/// session, Claude session, CLI, Verdandi revision, permission rules) are not shown: they describe
+/// things such a tab does not have.
+fn external_detail_rows(
+    tab: &Tab,
+    kind: BackendKind,
+    project_dir: &Path,
+    trust_row: &str,
+    next: ProjectTrust,
+) -> Vec<DetailRow> {
+    const UNKNOWN: &str = "—";
+    let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
+    let agent = tab.agent();
+    let is_codex = matches!(agent, AgentId::Codex);
+    let backend = tab.live();
+    // As on the Claude rows: the session id is read before the projection is taken.
+    let provider_session_id = backend.and_then(|b| b.provider_session_id());
+    let (cwd, limits) = match backend {
+        Some(b) => {
+            let projection = b.projection();
+            (projection.cwd.clone(), projection.account_limits.clone())
+        }
+        None => (None, None),
+    };
+    let conversation_id = backend.and_then(|b| b.conversation_id().map(str::to_string));
+    let version = backend.and_then(|b| b.provider_info()).map(|info| {
+        let mut line = info.build_description.clone().unwrap_or_else(|| UNKNOWN.to_string());
+        for diagnostic in &info.startup_diagnostics {
+            line.push_str(" · ");
+            line.push_str(diagnostic);
+        }
+        line
+    });
+    let record = match (&conversation_id, &provider_session_id) {
+        (Some(conversation), Some(session)) => agent::persistence::load_conversation_record(conversation, session).ok(),
+        _ => None,
+    };
+    let project_loaded = match tab.project_tiers.unwrap_or(next) {
+        ProjectTrust::Trusted => "loaded",
+        ProjectTrust::Untrusted => "not loaded",
+    };
+    let bypass = tab.mode() == SessionModeChoice::Bypass;
+    let (backend_name, session_label, settings, runs_without_asking, mode_lag, limits_label, limits_value) = if is_codex
+    {
+        (
+            "codex app-server".to_string(),
+            "thread",
+            format!(
+                "your ~/.codex configuration (always; skills off while this project is untrusted); this project's: \
+                 {project_loaded}"
+            ),
+            codex_runs_without_asking(project_dir, bypass),
+            CODEX_MODE_LAG.to_string(),
+            "limits",
+            limits.as_ref().map(limits_row),
+        )
+    } else {
+        (
+            "acp".to_string(),
+            "session",
+            format!("the agent's own configuration (always); this project's: {project_loaded}"),
+            "what the agent's own permission model allows; Eitri shows every request it receives".to_string(),
+            "a mode change takes effect at the next turn".to_string(),
+            "context",
+            None,
+        )
+    };
+    let rows: [(&str, String); 18] = [
+        ("name", known(tab.name.clone())),
+        ("title", known(tab.title.clone())),
+        ("state", tab.wire_state().as_str().to_string()),
+        ("mode", tab.mode().as_str().to_string()),
+        ("agent", known(version.or_else(|| Some(agent.label())))),
+        ("backend", backend_name),
+        (
+            "cwd",
+            known(cwd.or_else(|| Some(project_dir.to_string_lossy().into_owned()))),
+        ),
+        ("conversation", known(conversation_id)),
+        (session_label, known(provider_session_id)),
+        ("settings", settings),
+        ("trust", trust_row.to_string()),
+        ("runs without asking", runs_without_asking),
+        ("mode lag", mode_lag),
+        (limits_label, known(limits_value)),
+        ("resumable", if tab.resumable(kind) { "yes" } else { "no" }.to_string()),
+        ("created", known(record.as_ref().map(|r| r.created_at.clone()))),
+        ("updated", known(record.as_ref().map(|r| r.updated_at.clone()))),
+        ("queued", tab.queue.len().to_string()),
+    ];
+    rows.into_iter()
+        .map(|(label, value)| DetailRow {
+            label: label.to_string(),
+            value,
+        })
+        .collect()
+}
+
 /// The connect worker, shared by `send_message` on an empty tab and `resume`. Off the GTK main
 /// loop: constructing the sidecar backend spawns a real process, does a real gRPC handshake, and on
 /// a cold Verdandi checkout runs `npm ci` + `npm run build` -- minutes, in the cold case.
@@ -3216,6 +3628,38 @@ fn spawn_connect(
     project: ProjectTrust,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     spawn_connect_holding(kind, project_dir, resume, None, project)
+}
+
+/// The connect worker of another agent's tab: locates its binary and starts (or resumes) its session
+/// with `plan`, off the GTK main loop, since the agent's own check and handshake take seconds.
+fn spawn_external(
+    agent: AgentId,
+    project_dir: PathBuf,
+    plan: agent::TrustPlan,
+    mode: SessionModeChoice,
+    resume: Option<String>,
+    codex_command: Option<String>,
+) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
+    let (result_tx, result_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let program = match &agent {
+            AgentId::Codex => {
+                agent::providers::codex::locate_codex(codex_command.as_deref()).map_err(|e| BackendError {
+                    message: format!("Codex could not start: {e}"),
+                    benign: false,
+                    folded_events: Vec::new(),
+                })
+            }
+            // `start_external` refuses an agent it has no provider for, naming it.
+            AgentId::Claude | AgentId::Acp(_) => Ok(PathBuf::new()),
+        };
+        let result = program.and_then(|program| {
+            AgentBackend::start_external(agent, program, &project_dir, plan, mode, resume.as_deref())
+        });
+        // As in `spawn_connect_holding`: a receiver dropped mid-connect makes this drop the cleanup.
+        let _ = result_tx.send(result);
+    });
+    result_rx
 }
 
 /// [`spawn_connect`] for a resume whose session lease is already held: the worker hands it to the
@@ -3321,7 +3765,9 @@ fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, page:
             (dead, active)
         };
         if let TabBackend::Live(backend) = dead {
-            state.borrow_mut().retiring.backend(backend);
+            let mut state_ref = state.borrow_mut();
+            state_ref.tabs.note_retiring(tab);
+            state_ref.retiring.backend(backend, Some(tab));
         }
         if active {
             page.send(&serialize_error_for_js(tab, &message));
@@ -3441,10 +3887,12 @@ fn send_first_turn(
 ) {
     let outcome = {
         let mut state_ref = state.borrow_mut();
+        let mut mode = eitri_core::agent_bridge::SessionModeChoice::Auto;
         if let Some(t) = state_ref.tabs.get_mut(tab) {
             t.turn_trace = eitri_core::turn_trace::TurnTrace::start();
+            mode = t.mode();
         }
-        backend_for(&mut state_ref.tabs, tab).and_then(|backend| backend.send_turn(&turn.wire, &turn.typed))
+        backend_for(&mut state_ref.tabs, tab).and_then(|backend| backend.send_turn_in(&turn.wire, &turn.typed, mode))
     };
     if outcome.is_ok() {
         title_from_first_prompt(state, tab, &turn.typed);
@@ -3916,7 +4364,9 @@ fn apply_outcome(
                 })
             };
             if let Some(TabBackend::Live(backend)) = dead {
-                state.borrow_mut().retiring.backend(backend);
+                let mut state_ref = state.borrow_mut();
+                state_ref.tabs.note_retiring(tab);
+                state_ref.retiring.backend(backend, Some(tab));
             }
             if let Some(id) = request_id {
                 page.send(&serialize_command_result_for_js(id, Err(&error.message)));
@@ -4019,7 +4469,9 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 // value across -- see `reset_nav_mode_for_ready`'s own doc for the failure this
                 // closes.
                 reset_nav_mode_for_ready(state_ref);
-                let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
+                let agent = state_ref.tabs.active_tab().agent().clone();
+                let greeting =
+                    BackendGreeting::for_agent(state_ref.backend_kind, &agent, state_ref.project_dir.clone());
                 let open = state_ref.tabs.open_session_ids();
                 let theme = eitri_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
                 let context = eitri_core::agent_bridge::context_summary(
@@ -4041,7 +4493,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 offered_greeting
                     .resumable
                     .retain(|r| !open.contains(&r.provider_session_id));
-                let offer = restore_offer(state_ref, &offered_greeting);
+                let offer = restore_offer(state_ref);
                 let mut payloads = ready_payloads(
                     offered_greeting,
                     &open,
@@ -4062,6 +4514,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 ));
                 state_ref.last_open_ids = open;
                 state_ref.last_restore_offered = restore_is_on_offer(state_ref);
+                state_ref.last_hello_agent = agent;
                 // From here on the tick may send into this document.
                 state_ref.document_ready = true;
                 payloads
@@ -4083,7 +4536,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 state_ref.trust.drop_command_prompt();
                 let active = state_ref.tabs.active();
                 state_ref.trust.hide(active);
-                state_ref.trust.begin_check();
+                let profile = waiting_profile(state_ref, active);
+                state_ref.trust.begin_check(&profile);
                 reroute_or_ask(state_ref, active)
             };
             deliver_trust(state, page, asked);
@@ -4131,14 +4585,16 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                     // closed, in the same project.
                     Plan::Refused("the previous session is still being handed off to a terminal")
                 } else {
+                    let mode = t.mode();
                     match &mut t.backend {
                         TabBackend::Live(backend) => {
                             // Stamped before the call, so the trace's zero is the user's action
                             // rather than the moment the backend got around to accepting it.
                             let trace = eitri_core::turn_trace::TurnTrace::start();
                             // `&text` second, and it is the user's own: the panel shows what was
-                            // typed, never the composed wire text.
-                            let outcome = backend.send_turn(&composed, &text);
+                            // typed, never the composed wire text. The tab's mode goes with it: an
+                            // external agent's turn runs under it.
+                            let outcome = backend.send_turn_in(&composed, &text, mode);
                             t.turn_trace = trace;
                             Plan::Sent(outcome)
                         }
@@ -4194,7 +4650,14 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 return;
             }
             let canonical = state.borrow().canonical_project_dir.clone();
-            let held = agent::lease::SessionLease::is_held("claude", &canonical, &provider_session_id).unwrap_or(false);
+            // The session is the tab's agent's: its lease is under that agent's name.
+            let lease_name = state
+                .borrow()
+                .tabs
+                .get(tab)
+                .map_or_else(|| "claude".to_string(), |t| t.agent().record_name());
+            let held =
+                agent::lease::SessionLease::is_held(&lease_name, &canonical, &provider_session_id).unwrap_or(false);
             let route = state.borrow_mut().tabs.route_resume(tab, &provider_session_id, held);
             match route {
                 ResumeRoute::SwitchTo(_) => {
@@ -4206,7 +4669,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                     let deferred = {
                         let mut state_ref = state.borrow_mut();
                         let state_ref = &mut *state_ref;
-                        let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
+                        let agent = state_ref
+                            .tabs
+                            .get(target_tab)
+                            .map_or(AgentId::Claude, |t| t.agent().clone());
+                        let greeting =
+                            BackendGreeting::for_agent(state_ref.backend_kind, &agent, state_ref.project_dir.clone());
                         // The rename and the title separately: the
                         // label puts a rename first, and folding the two into the
                         // title lost the rename whenever the record had both.
@@ -4446,7 +4914,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             match reset {
                 Ok(old) => {
                     if let Some(old) = old {
-                        state.borrow_mut().retiring.backend(old);
+                        // `TabSet::reset` counted it as retiring.
+                        state.borrow_mut().retiring.backend(old, Some(tab));
                     }
                     state.borrow_mut().trust.forget_tab(tab);
                     // Before the draft the reset carries: the page puts a refused message back in
@@ -4723,6 +5192,20 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 Err(why) => refuse(page, why),
             }
         }
+        // `:tabnew <agent>`: the page names the agent, so the hook the prefix's `c` goes through (which
+        // carries none) is not used. Keys are in the panel already, since the word was typed there.
+        InboundMessage::TabVerb {
+            verb: TabVerbWire::New,
+            agent: Some(word),
+            ..
+        } => match open_tab_named(state, &word) {
+            Ok(()) => {
+                send_tabs(state, page);
+                page.send(&eitri_core::agent_bridge::serialize_enter_input_for_js());
+                ok(page);
+            }
+            Err(why) => refuse(page, &why),
+        },
         InboundMessage::TabVerb { verb, .. } => match run_tab_verb(state, verb) {
             Ok(()) => ok(page),
             Err(why) => refuse(page, why),
@@ -4823,10 +5306,11 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         }
         // `:trust` / `:untrust`: queued for the gate's worker; the notice and this command's
         // `command_result` come from the tick when it is done.
-        InboundMessage::TrustCommand { action, .. } => {
-            let mut state_ref = state.borrow_mut();
-            let active = state_ref.tabs.active();
-            state_ref.trust.command(request_id.clone(), action, active);
+        InboundMessage::TrustCommand { action, agent, .. } => {
+            let refused = trust_command(&mut state.borrow_mut(), &request_id, action, &agent);
+            if let Err(why) = refused {
+                refuse(page, &why);
+            }
         }
         // `y`/`Y` to the band's bypass prompt. The typed-input guard (the 250ms
         // `TYPING_GUARD_MS` rule, cancelling on every route away) is enforced client-side
@@ -4926,6 +5410,22 @@ fn run_tab_verb(state: &Rc<RefCell<AgentPanelState>>, verb: TabVerbWire) -> Resu
         None => Err("tab verbs are not wired"),
     }
 }
+
+/// `tab_verb new` with an agent word (`:tabnew <agent>`): opens and selects a tab that runs the agent
+/// the word names, or refuses naming the words that are accepted. Touches no page, so it is tested
+/// directly.
+fn open_tab_named(state: &Rc<RefCell<AgentPanelState>>, word: &str) -> Result<(), String> {
+    let Some(agent) = eitri_core::agent_prefs::agent_named(word) else {
+        return Err(format!("unknown agent {word:?}: {TABNEW_AGENTS}"));
+    };
+    let mut state = state.borrow_mut();
+    state.tabs.drop_bypass_prompt();
+    state.tabs.open(agent);
+    Ok(())
+}
+
+/// The words `:tabnew` accepts, as the refusal says them. The page keeps the same list.
+const TABNEW_AGENTS: &str = "claude, codex";
 
 /// `nav_fallthrough`: the hook `main.rs` installs via `on_nav_fallthrough`, called
 /// with the direction the page could not apply -- or a refusal naming why there is none yet. Never
@@ -5310,7 +5810,7 @@ mod tests {
         let asking = set.active();
         let (asking_provider, backend) = live_backend(&dir);
         set.get_mut(asking).unwrap().backend = TabBackend::Live(backend);
-        let other = set.open();
+        let other = set.open(eitri_core::tab_set::AgentId::Claude);
         let (other_provider, backend) = live_backend(&dir);
         set.get_mut(other).unwrap().backend = TabBackend::Live(backend);
         assert_eq!(set.active(), other, "the user has switched away");
@@ -5432,7 +5932,7 @@ mod tests {
         let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let live = set.active();
         set.get_mut(live).unwrap().backend = TabBackend::Live(live_backend(&dir).1);
-        let connecting = set.open();
+        let connecting = set.open(eitri_core::tab_set::AgentId::Claude);
         let (connect_tx, result_rx) = mpsc::channel();
         set.get_mut(connecting).unwrap().backend = TabBackend::Starting(PendingStart {
             request_id: "req-send".into(),
@@ -5668,6 +6168,75 @@ mod tests {
         );
     }
 
+    /// A closed tab's agent may still be writing while its backend shuts down (a subagent, during
+    /// the shutdown's grace), so the window's presence stays as if a turn ran until that shutdown has
+    /// returned: no revert in this window or another one can write meanwhile.
+    #[test]
+    fn closed_tab_keeps_presence_until_its_backend_has_shut_down() {
+        use eitri_core::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-retiring-presence");
+        let (handle, page, _host) = handle_with_recording_page();
+        let panel_page = handle.page.clone().unwrap();
+        let provider = std::sync::Arc::new(ExternalRecordingProvider::codex());
+        let release = provider.hold_close();
+        let (codex, survivor, guard) = {
+            let mut state_ref = handle.state.borrow_mut();
+            let tabs = &mut state_ref.tabs;
+            let codex = tabs.open(AgentId::Codex);
+            tabs.get_mut(codex).unwrap().backend = TabBackend::Live(
+                AgentBackend::start_external_with(
+                    AgentId::Codex,
+                    provider.clone(),
+                    &dir,
+                    empty_trust_plan(),
+                    SessionModeChoice::Auto,
+                    None,
+                )
+                .unwrap(),
+            );
+            let survivor = tabs.tabs().iter().find(|t| t.id != codex).unwrap().id;
+            tabs.hold_presence(eitri_core::turn_review::PresenceHolder::start(
+                dir.join(".review-state"),
+                std::process::id(),
+            ));
+            (codex, survivor, tabs.presence_guard().unwrap())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(guard.check(), Err(eitri_core::turn_review::Blocked::NotHeld(_))) {
+            assert!(std::time::Instant::now() < deadline, "the presence was never held");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(guard.check(), Ok(()), "nothing runs yet");
+
+        close_tab(&handle.state, &panel_page, codex).unwrap();
+        assert!(handle.state.borrow().tabs.get(codex).is_none());
+        assert!(handle.state.borrow().tabs.get(survivor).is_some());
+        page.visible.set(true);
+        for _ in 0..5 {
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            guard.check(),
+            Err(eitri_core::turn_review::Blocked::TurnRunningHere),
+            "the closed tab's backend is still shutting down"
+        );
+        assert_eq!(provider.inner.closes(), 0, "its close is held");
+
+        release.send(()).unwrap();
+        while guard.check() != Ok(()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the presence never let go: {:?}",
+                guard.check()
+            );
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(provider.inner.closes(), 1, "released only after the shutdown returned");
+    }
+
     #[test]
     fn a_panel_with_no_page_never_ticks() {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
@@ -5784,8 +6353,11 @@ mod tests {
             restore_policy: RestorePolicy::Offer,
             bypass_by_config: false,
             mode_remembered: false,
+            default_agent: AgentId::Claude,
+            codex_command: None,
             restore_run: None,
             last_restore_offered: false,
+            last_hello_agent: AgentId::Claude,
             toast_hook: None,
             // No worker and no disk: every start goes on untrusted, as for a root with nothing to
             // trust. A test about the question puts a real gate in its place.
@@ -6394,7 +6966,7 @@ mod tests {
     fn a_resolution_entering_bypass_returned_reaches_the_panel_payload() {
         let mut set = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
         let active = set.active();
-        let background = set.open();
+        let background = set.open(eitri_core::tab_set::AgentId::Claude);
         set.select(active);
         let state = state_for_hooks(set);
         let resolved = vec![agent::AgentDomainEvent::PermissionResolved {
@@ -6694,7 +7266,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let saved = set.active();
-        let unsaved = set.open();
+        let unsaved = set.open(eitri_core::tab_set::AgentId::Claude);
         set.set_draft(saved, "old");
         set.set_draft(unsaved, "kept\n");
         let edit = |id: u64, body: &str| {
@@ -7464,6 +8036,7 @@ mod tests {
                     })
                     .collect(),
                 active: 0,
+                ..SavedTabs::default()
             });
         }
         (state, dir)
@@ -7543,6 +8116,7 @@ mod tests {
                 spawn(&id, lease, project)
             }
             SpawnCall::Connect { .. } => panic!("a restore resumes; it never connects afresh"),
+            SpawnCall::External { .. } => panic!("a restore starts only Claude tabs"),
         })));
         let result = f();
         state.borrow_mut().spawner = spawn_nothing();
@@ -7608,29 +8182,90 @@ mod tests {
             &["s-a", "s-b"],
         );
         let s = state.borrow();
-        let greeting = BackendGreeting::for_kind(s.backend_kind, s.project_dir.clone());
         assert!(restore_is_on_offer(&s));
-        let offer = restore_offer(&s, &greeting).expect("two tabs can come back");
+        let offer = restore_offer(&s).expect("two tabs can come back");
         assert_eq!(offer.labels, vec!["title of s-a".to_string(), "api".to_string()]);
         assert_eq!(offer.bypass, 1);
+    }
+
+    /// The greeting lists the active tab's agent's sessions, and a switch to a tab running another
+    /// agent sends a new one though no session id changed; the restore offer still matches the saved
+    /// Claude tabs with Claude's records whichever agent the active tab runs.
+    #[test]
+    fn hello_follows_the_active_tabs_agent_and_the_offer_keeps_the_claude_tabs() {
+        let (state, dir) = restore_panel("hello-agent", &[("s-a", None, Auto)], &["s-a"]);
+        agent::persistence::save_conversation_record(&agent::persistence::ConversationRecord {
+            conversation_id: agent::conversation_id_for_cwd(&dir),
+            provider: AgentId::Codex.record_name(),
+            provider_session_id: "thread-1".to_string(),
+            canonical_cwd: dir.to_string_lossy().into_owned(),
+            created_at: "1".to_string(),
+            updated_at: "3".to_string(),
+            provider_advertised_resume: true,
+            title: None,
+            name: None,
+        })
+        .unwrap();
+        let page = Rc::new(RecordingPage::default());
+        let handle = AgentPanelHandle {
+            state: state.clone(),
+            page: Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        };
+        let last_hello = || {
+            let sent = page.sent.borrow();
+            let hello = sent.iter().rev().find(|e| kind_of(e) == "hello").expect("a hello");
+            let hello: serde_json::Value = serde_json::from_str(hello).unwrap();
+            let ids: Vec<String> = hello["resumableSessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["providerSessionId"].as_str().unwrap().to_string())
+                .collect();
+            (ids, hello["restore"]["labels"].clone())
+        };
+        let hellos = || page.sent.borrow().iter().filter(|e| kind_of(e) == "hello").count();
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        assert_eq!(
+            last_hello(),
+            (vec!["s-a".to_string()], serde_json::json!(["title of s-a"]))
+        );
+
+        let panel_page = handle.page.clone().unwrap();
+        let before = hellos();
+        send_hello_if_open_sessions_changed(&state, &panel_page);
+        assert_eq!(hellos(), before, "nothing changed, nothing is sent");
+
+        let claude_tab = state.borrow().tabs.active();
+        state.borrow_mut().tabs.open(AgentId::Codex);
+        send_hello_if_open_sessions_changed(&state, &panel_page);
+        assert_eq!(hellos(), before + 1);
+        assert_eq!(
+            last_hello(),
+            (vec!["thread-1".to_string()], serde_json::json!(["title of s-a"])),
+            "the Codex tab offers Codex's sessions, and the saved Claude tab can still come back"
+        );
+
+        state.borrow_mut().tabs.select(claude_tab);
+        send_hello_if_open_sessions_changed(&state, &panel_page);
+        assert_eq!(hellos(), before + 2);
+        assert_eq!(
+            last_hello(),
+            (vec!["s-a".to_string()], serde_json::json!(["title of s-a"]))
+        );
     }
 
     #[test]
     fn nothing_is_offered_after_a_session_started_under_another_policy_or_when_nothing_would_come_back() {
         let (state, _dir) = restore_panel("restore-not-offered", &[("s-a", None, Auto)], &["s-a"]);
-        let greeting = {
-            let s = state.borrow();
-            BackendGreeting::for_kind(s.backend_kind, s.project_dir.clone())
-        };
-        assert!(restore_offer(&state.borrow(), &greeting).is_some());
+        assert!(restore_offer(&state.borrow()).is_some());
 
         state.borrow_mut().restore_policy = RestorePolicy::Auto;
         assert!(
-            restore_offer(&state.borrow(), &greeting).is_none(),
+            restore_offer(&state.borrow()).is_none(),
             "auto restores at launch, it does not offer"
         );
         state.borrow_mut().restore_policy = RestorePolicy::Off;
-        assert!(restore_offer(&state.borrow(), &greeting).is_none());
+        assert!(restore_offer(&state.borrow()).is_none());
         state.borrow_mut().restore_policy = RestorePolicy::Offer;
 
         // A tab that has started a session: this is no longer a launch.
@@ -7644,17 +8279,13 @@ mod tests {
             resumed_title: None,
             resumed_name: None,
         });
-        assert!(restore_offer(&state.borrow(), &greeting).is_none());
+        assert!(restore_offer(&state.borrow()).is_none());
         state.borrow_mut().tabs.get_mut(started_tab).unwrap().backend = TabBackend::NotStarted;
-        assert!(restore_offer(&state.borrow(), &greeting).is_some());
+        assert!(restore_offer(&state.borrow()).is_some());
 
         // Every saved tab skipped: a key that restores nothing is not offered.
         let (nothing, _dir) = restore_panel("restore-nothing", &[("s-x", None, Auto)], &[]);
-        let greeting = {
-            let s = nothing.borrow();
-            BackendGreeting::for_kind(s.backend_kind, s.project_dir.clone())
-        };
-        assert!(restore_offer(&nothing.borrow(), &greeting).is_none());
+        assert!(restore_offer(&nothing.borrow()).is_none());
         // And no file, no offer.
         nothing.borrow_mut().restore_source = None;
         assert!(!restore_is_on_offer(&nothing.borrow()));
@@ -8171,6 +8802,18 @@ mod tests {
         /// Every start the panel's spawner was asked for: the session it resumes, if any, and the
         /// tiers it was given.
         spawned: Rc<RefCell<Vec<Spawned>>>,
+        /// Every start of another agent's tab: the agent, its trust plan, its mode and the session
+        /// it resumes.
+        external: Rc<RefCell<Vec<ExternalSpawned>>>,
+    }
+
+    /// One start of another agent's tab, as the counting spawner saw it.
+    #[derive(Debug, Clone)]
+    struct ExternalSpawned {
+        agent: AgentId,
+        plan: agent::TrustPlan,
+        mode: SessionModeChoice,
+        resume: Option<String>,
     }
 
     /// One start a counting spawner was asked for: the session it resumes, if any, and its tiers.
@@ -8213,6 +8856,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&state_home).unwrap();
         let spawned = Rc::new(RefCell::new(Vec::new()));
+        let external = Rc::new(RefCell::new(Vec::new()));
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
         {
             let mut s = state.borrow_mut();
@@ -8221,11 +8865,23 @@ mod tests {
             s.document_ready = true;
             s.trust = trust_gate_for(Some(state_home.as_os_str()), Some(home.as_os_str()), &root);
             let counted = spawned.clone();
+            let counted_external = external.clone();
             s.spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| {
-                counted.borrow_mut().push(match call {
-                    SpawnCall::Connect { resume, project } => (resume, project),
-                    SpawnCall::Resume { id, project, .. } => (Some(id), project),
-                });
+                match call {
+                    SpawnCall::Connect { resume, project } => counted.borrow_mut().push((resume, project)),
+                    SpawnCall::Resume { id, project, .. } => counted.borrow_mut().push((Some(id), project)),
+                    SpawnCall::External {
+                        agent,
+                        plan,
+                        mode,
+                        resume,
+                    } => counted_external.borrow_mut().push(ExternalSpawned {
+                        agent,
+                        plan,
+                        mode,
+                        resume,
+                    }),
+                }
                 mpsc::channel().1
             })));
         }
@@ -8234,6 +8890,7 @@ mod tests {
             state: state_home,
             root,
             spawned,
+            external,
         };
         (state, fx)
     }
@@ -8323,11 +8980,23 @@ mod tests {
 
     /// Outside `start_deferred` (and the connect workers it calls), nothing in the panel begins a
     /// session: no other code calls the spawners or `start_restore`, sets a tab connecting, or
-    /// starts a backend. Read as text, formatting-insensitive.
+    /// starts a backend. Another agent's tab is started by `start_external_tab`, which only
+    /// `start_deferred` calls, through `spawn_external`, the one worker that calls
+    /// `AgentBackend::start_external`. Read as text, formatting-insensitive.
     #[test]
     fn every_session_start_goes_through_the_trust_gate() {
         use eitri_core::source_scan as scan;
         const SCANNED: &[&str] = &["shell/src", "panel/src"];
+        const SPAWNERS: &[&str] = &[
+            "spawn_connect",
+            "spawn_connect_holding",
+            "resume_spawner",
+            "start_restore",
+            "spawn_external",
+            "start_external_tab",
+            "start_external",
+            "start_external_with",
+        ];
         let read = scan::rust_sources(SCANNED);
         let panel = scan::file_with(&read, "fn start_deferred(");
         let code = scan::code_only(&panel.text);
@@ -8335,27 +9004,56 @@ mod tests {
         assert_eq!(tests.len(), 1, "the tests module not found");
         let gate = scan::functions(&code, "start_deferred");
         assert_eq!(gate.len(), 1, "start_deferred not found");
-        for spawner in ["spawn_connect", "resume_spawner", "start_restore"] {
+        for spawner in ["spawn_connect", "resume_spawner", "start_restore", "start_external_tab"] {
             assert!(
                 scan::calls(gate[0], spawner) > 0,
                 "start_deferred no longer calls {spawner}; the scan would prove nothing"
             );
         }
         assert!(gate[0].contains("TabBackend::Starting(PendingStart"));
+        let external = scan::functions(&code, "start_external_tab");
+        assert_eq!(external.len(), 1, "start_external_tab not found");
+        assert!(
+            scan::calls(external[0], "spawn_external") > 0,
+            "start_external_tab no longer calls spawn_external; the scan would prove nothing"
+        );
+        assert!(
+            scan::calls(external[0], "trust_plan") > 0,
+            "an external start no longer builds its trust plan"
+        );
+        let worker = scan::functions(&code, "spawn_external");
+        assert_eq!(worker.len(), 1, "spawn_external not found");
+        let flat_worker: String = worker[0].split_whitespace().collect();
+        assert!(
+            flat_worker.contains("AgentBackend::start_external("),
+            "spawn_external no longer starts the backend; the scan would prove nothing"
+        );
+        // Of the two, only `start_deferred` may call `start_external_tab`, and only it may call
+        // `spawn_external`.
+        let without_gate = scan::without(&code, &[gate[0], tests[0]]);
+        assert_eq!(
+            scan::calls(&without_gate, "start_external_tab"),
+            0,
+            "start_external_tab is called outside start_deferred"
+        );
+        let without_external = scan::without(&code, &[external[0], tests[0]]);
+        assert_eq!(
+            scan::calls(&without_external, "spawn_external"),
+            0,
+            "spawn_external is called outside start_external_tab"
+        );
+
         let mut cut: Vec<&str> = tests;
         cut.extend(gate);
+        cut.extend(external);
+        cut.extend(worker);
         for worker in ["spawn_connect", "resume_spawner", "spawn_connect_holding"] {
             let found = scan::functions(&code, worker);
             assert_eq!(found.len(), 1, "{worker} not found");
             cut.extend(found);
         }
         let rest = scan::without(&code, &cut);
-        for name in [
-            "spawn_connect",
-            "spawn_connect_holding",
-            "resume_spawner",
-            "start_restore",
-        ] {
+        for name in SPAWNERS {
             assert_eq!(scan::calls(&rest, name), 0, "{name} is called outside start_deferred");
         }
         let flat: String = rest.split_whitespace().collect();
@@ -8372,12 +9070,7 @@ mod tests {
         for other in read.iter().filter(|source| source.path != panel.path) {
             let code = scan::code_only(&other.text);
             let rest = scan::without(&code, &scan::modules(&code, "tests"));
-            for name in [
-                "spawn_connect",
-                "spawn_connect_holding",
-                "resume_spawner",
-                "start_restore",
-            ] {
+            for name in SPAWNERS {
                 assert_eq!(scan::calls(&rest, name), 0, "{} calls {name}", other.path);
             }
             let flat: String = rest.split_whitespace().collect();
@@ -8388,6 +9081,260 @@ mod tests {
             );
             assert!(!flat.contains("AgentBackend::start"), "{} starts a backend", other.path);
         }
+    }
+
+    /// A Codex tab, opened and on screen.
+    fn codex_tab(state: &Rc<RefCell<AgentPanelState>>) -> TabId {
+        let mut s = state.borrow_mut();
+        let tab = s.tabs.open(AgentId::Codex);
+        s.tabs.select(tab);
+        tab
+    }
+
+    fn items_of_prompt(payloads: &[String]) -> Vec<String> {
+        payloads
+            .iter()
+            .map(|p| json_of(p))
+            .filter(|v| v["kind"] == "trust_prompt")
+            .flat_map(|v| {
+                v["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["file"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// `:trust` and `:untrust` act on the agent of the tab on screen: in a Codex tab they ask about,
+    /// record and forget Codex's configuration, never Claude's; one the page typed for another agent's
+    /// tab is refused.
+    #[test]
+    fn trust_command_acts_on_the_active_tab_agent() {
+        use eitri_core::agent_bridge::TrustAction;
+        let (state, fx) = trust_panel("trust-command-agent");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/claude"));
+        fx.write("AGENTS.md", b"codex instructions\n");
+        let tab = codex_tab(&state);
+        let codex_record = PathBuf::from(format!("{}.codex", fx.record_file().display()));
+
+        let refused = trust_command(&mut state.borrow_mut(), "c0", TrustAction::Trust, "claude");
+        assert_eq!(
+            refused,
+            Err("that :trust was for a Claude tab; this tab runs Codex".to_string())
+        );
+        let refused = trust_command(&mut state.borrow_mut(), "c0", TrustAction::Untrust, "claude");
+        assert_eq!(
+            refused,
+            Err("that :untrust was for a Claude tab; this tab runs Codex".to_string())
+        );
+
+        trust_command(&mut state.borrow_mut(), "c1", TrustAction::Trust, "codex").unwrap();
+        let seen = tick_until(&state, |seen| !prompts(&all_payloads(seen)).is_empty());
+        let payloads = all_payloads(&seen);
+        assert_eq!(
+            items_of_prompt(&payloads),
+            ["AGENTS.md"],
+            "the Codex files, not Claude's"
+        );
+        let prompt = prompts(&payloads).pop().unwrap();
+        assert_eq!(prompt.tab, tab);
+        let out = answer_prompt(&state, "a1", &prompt, true);
+        assert_eq!(result_for(&out.payloads, "a1"), Some(Ok(())));
+        let seen = tick_until(&state, |seen| result_for(&all_payloads(seen), "c1").is_some());
+        assert_eq!(result_for(&all_payloads(&seen), "c1"), Some(Ok(())));
+        assert!(codex_record.is_file());
+        assert!(!fx.record_file().exists(), "Claude's record is untouched");
+        assert!(state.borrow().trust.row(&Profile::Codex).starts_with("trusted since "));
+        assert_eq!(state.borrow().trust.row(&Profile::Claude), "not checked yet");
+
+        trust_command(&mut state.borrow_mut(), "c2", TrustAction::Untrust, "codex").unwrap();
+        let seen = tick_until(&state, |seen| result_for(&all_payloads(seen), "c2").is_some());
+        assert_eq!(result_for(&all_payloads(&seen), "c2"), Some(Ok(())));
+        assert!(!codex_record.exists());
+    }
+
+    /// The external start is handed the trust plan of the discovery its answer was bound to: a `y`
+    /// trusts the directories that discovery walked and nothing above them, names the project's own
+    /// tool servers, and keeps skills on; an `n` in another tab untrusts every directory up to `/`
+    /// and turns skills off. Nothing goes through the Claude spawner.
+    #[test]
+    fn external_start_gets_the_plan_of_the_bound_discovery() {
+        let (state, fx) = trust_panel("trust-external-plan");
+        fx.write("AGENTS.md", b"codex instructions\n");
+        fx.write(".codex/config.toml", b"[mcp_servers.srv]\ncommand = \"srv\"\n");
+        let tab = codex_tab(&state);
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello codex")).unwrap();
+        let prompt = next_prompt(&state);
+        assert_eq!(prompt.tab, tab);
+        assert!(fx.external.borrow().is_empty(), "nothing before the answer");
+        answer_prompt(&state, "a1", &prompt, true);
+        tick_until(&state, |_| !fx.external.borrow().is_empty());
+
+        let started = fx.external.borrow()[0].clone();
+        assert_eq!(started.agent, AgentId::Codex);
+        assert_eq!(started.mode, SessionModeChoice::Auto);
+        assert_eq!(started.resume, None);
+        let plan = &started.plan;
+        assert_eq!(
+            plan.fingerprint, prompt.fingerprint,
+            "the plan is the shown discovery's"
+        );
+        assert_eq!(plan.project_only, ["srv"]);
+        assert!(!plan.skills_off);
+        let root = fx.root.canonicalize().unwrap();
+        let expected: Vec<(PathBuf, agent::DirTrust)> = root
+            .ancestors()
+            .map(|dir| {
+                let level = if dir == root {
+                    agent::DirTrust::Trusted
+                } else {
+                    agent::DirTrust::Untrusted
+                };
+                (dir.to_path_buf(), level)
+            })
+            .collect();
+        assert_eq!(plan.dirs, expected);
+        assert_eq!(plan.dirs.last().unwrap().0, PathBuf::from("/"));
+        assert!(fx.spawned.borrow().is_empty(), "the Claude spawner is not used");
+        {
+            let s = state.borrow();
+            match &s.tabs.get(tab).unwrap().backend {
+                TabBackend::Starting(pending) => {
+                    assert_eq!(pending.request_id, "r1");
+                    assert_eq!(pending.first_turn.as_ref().unwrap().typed, "hello codex");
+                }
+                _ => panic!("the Codex tab connects once the record is written"),
+            }
+        }
+
+        // `:untrust`, then an `n` in a second Codex tab: every directory untrusted, skills off.
+        trust_command(
+            &mut state.borrow_mut(),
+            "u1",
+            eitri_core::agent_bridge::TrustAction::Untrust,
+            "codex",
+        )
+        .unwrap();
+        tick_until(&state, |seen| result_for(&all_payloads(seen), "u1").is_some());
+        let second = codex_tab(&state);
+        gate_start(&mut state.borrow_mut(), second, first_send("r2", "again")).unwrap();
+        let prompt = next_prompt(&state);
+        assert_eq!(prompt.tab, second);
+        answer_prompt(&state, "n1", &prompt, false);
+        assert_eq!(fx.external.borrow().len(), 2);
+        let plan = fx.external.borrow()[1].plan.clone();
+        assert_eq!(plan.fingerprint, prompt.fingerprint);
+        assert!(plan.skills_off);
+        assert!(plan.dirs.iter().all(|(_, level)| *level == agent::DirTrust::Untrusted));
+        assert_eq!(plan.dirs.len(), root.ancestors().count());
+    }
+
+    /// A resume of a Codex session runs the gate again and is given a plan built from what is on disk
+    /// now, not the one its first start had.
+    #[test]
+    fn resume_reasks_and_rebuilds_the_plan() {
+        let (state, fx) = trust_panel("trust-external-resume");
+        fx.write("AGENTS.md", b"first\n");
+        let first = codex_tab(&state);
+        gate_start(&mut state.borrow_mut(), first, first_send("r1", "hello")).unwrap();
+        let prompt = next_prompt(&state);
+        answer_prompt(&state, "a1", &prompt, true);
+        tick_until(&state, |_| !fx.external.borrow().is_empty());
+        let before = fx.external.borrow()[0].plan.clone();
+
+        fx.write("AGENTS.md", b"changed since\n");
+        let second = codex_tab(&state);
+        let resume = DeferredStart::Resume {
+            request_id: "r2".into(),
+            provider_session_id: "thread-1".into(),
+            resumed_title: None,
+            resumed_name: None,
+        };
+        gate_start(&mut state.borrow_mut(), second, resume).unwrap();
+        let again = next_prompt(&state);
+        assert_eq!(again.tab, second, "the changed configuration is asked about again");
+        assert_ne!(again.fingerprint, prompt.fingerprint);
+        assert_eq!(fx.external.borrow().len(), 1, "nothing resumes before the answer");
+        answer_prompt(&state, "a2", &again, true);
+        tick_until(&state, |_| fx.external.borrow().len() == 2);
+        let resumed = fx.external.borrow()[1].clone();
+        assert_eq!(resumed.resume.as_deref(), Some("thread-1"));
+        assert_eq!(resumed.plan.fingerprint, again.fingerprint);
+        assert_ne!(resumed.plan.fingerprint, before.fingerprint);
+        {
+            let s = state.borrow();
+            match &s.tabs.get(second).unwrap().backend {
+                TabBackend::Starting(pending) => assert_eq!(pending.resume.as_deref(), Some("thread-1")),
+                _ => panic!("the resume connects once the record is written"),
+            }
+        }
+
+        // Unchanged since, a later resume is let through by the record without a question, and is
+        // still given a plan of its own from a fresh check.
+        let third = codex_tab(&state);
+        let resume = DeferredStart::Resume {
+            request_id: "r3".into(),
+            provider_session_id: "thread-1".into(),
+            resumed_title: None,
+            resumed_name: None,
+        };
+        gate_start(&mut state.borrow_mut(), third, resume).unwrap();
+        let seen = tick_until(&state, |_| fx.external.borrow().len() == 3);
+        assert!(prompts(&all_payloads(&seen)).is_empty());
+        assert_eq!(fx.external.borrow()[2].plan.fingerprint, again.fingerprint);
+    }
+
+    /// No trust check result for the tab's agent (its worker never ran): the external start is
+    /// dropped with the reason and the typed text goes back to the composer; nothing is spawned.
+    #[test]
+    fn an_external_start_without_a_bound_discovery_is_refused() {
+        let (state, fx) = trust_panel("trust-external-unbound");
+        state.borrow_mut().trust = TrustGate::without_worker(fx.root.clone());
+        let tab = codex_tab(&state);
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let seen = tick_until(&state, |seen| result_for(&all_payloads(seen), "r1").is_some());
+        let payloads = all_payloads(&seen);
+        let why = "Codex was not started: the trust check of this project has not run";
+        assert_eq!(result_for(&payloads, "r1"), Some(Err(why.to_string())));
+        assert!(notices(&payloads).contains(&why.to_string()));
+        assert!(fx.external.borrow().is_empty());
+        assert!(matches!(
+            state.borrow().tabs.get(tab).unwrap().backend,
+            TabBackend::NotStarted
+        ));
+    }
+
+    /// The trust worker dies after a check of a registered agent's configuration came back: the next
+    /// start is routed untrusted with that check's discovery still held, and is refused because such
+    /// an agent starts only after a `y`. Nothing is spawned.
+    #[test]
+    fn an_untrusted_start_of_an_agent_that_needs_a_yes_is_refused() {
+        let (state, fx) = trust_panel("trust-external-explicit-yes");
+        let agent = AgentId::Acp("gem".into());
+        let profile = trust_profile(&agent);
+        state.borrow_mut().trust.begin_check(&profile);
+        tick_until(&state, |_| state.borrow().trust.bound_discovery(&profile).is_some());
+        state.borrow_mut().trust.drop_worker();
+        let tab = {
+            let mut s = state.borrow_mut();
+            let tab = s.tabs.open(agent);
+            s.tabs.select(tab);
+            tab
+        };
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let seen = tick_until(&state, |seen| result_for(&all_payloads(seen), "r1").is_some());
+        let payloads = all_payloads(&seen);
+        let why = crate::trust_gate::refused_without_yes(&profile);
+        assert_eq!(result_for(&payloads, "r1"), Some(Err(why.clone())));
+        assert!(notices(&payloads).contains(&why));
+        assert!(fx.external.borrow().is_empty());
+        assert!(fx.spawned.borrow().is_empty());
+        assert!(matches!(
+            state.borrow().tabs.get(tab).unwrap().backend,
+            TabBackend::NotStarted
+        ));
     }
 
     #[test]
@@ -8470,7 +9417,7 @@ mod tests {
         let (a, b) = {
             let mut s = state.borrow_mut();
             let a = s.tabs.active();
-            let b = s.tabs.open();
+            let b = s.tabs.open(eitri_core::tab_set::AgentId::Claude);
             s.tabs.select(a);
             (a, b)
         };
@@ -8647,7 +9594,7 @@ mod tests {
         let (a, b) = {
             let mut s = state.borrow_mut();
             let a = s.tabs.active();
-            let b = s.tabs.open();
+            let b = s.tabs.open(eitri_core::tab_set::AgentId::Claude);
             s.tabs.select(a);
             (a, b)
         };
@@ -8766,6 +9713,196 @@ mod tests {
             value(&rows, "settings"),
             agent::setting_sources::note_for_session(user, ProjectTrust::Untrusted),
             "a started tab keeps what its session was given"
+        );
+    }
+
+    fn codex_rows(mode: SessionModeChoice, next: ProjectTrust) -> Vec<DetailRow> {
+        // A window never starts in bypass; only the user's own `agent.default_mode` puts new tabs there.
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        set.apply_configured_default(mode);
+        let tab = set.open(AgentId::Codex);
+        detail_rows(
+            set.get(tab).unwrap(),
+            BackendKind::Sidecar,
+            Some("work"),
+            std::path::Path::new("/p/root"),
+            Some(std::path::Path::new("/s/eitri/permissions/x.json")),
+            "trusted since 2026-10-02",
+            next,
+        )
+    }
+
+    /// A Codex tab says, in `prefix i`, what its sandbox lets through without a question and how a mode
+    /// change reaches its reviewer; and shows none of the rows that describe Claude's machinery.
+    #[test]
+    fn detail_rows_for_a_codex_tab_state_what_runs_without_asking_and_the_mode_lag() {
+        let rows = codex_rows(SessionModeChoice::Auto, ProjectTrust::Untrusted);
+        let value = |label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "name",
+                "title",
+                "state",
+                "mode",
+                "agent",
+                "backend",
+                "cwd",
+                "conversation",
+                "thread",
+                "settings",
+                "trust",
+                "runs without asking",
+                "mode lag",
+                "limits",
+                "resumable",
+                "created",
+                "updated",
+                "queued"
+            ]
+        );
+        for claude_only in [
+            "verdandi session",
+            "claude session",
+            "CLI",
+            "Verdandi revision",
+            "permission rules",
+            "account",
+            "model",
+        ] {
+            assert!(
+                !labels.contains(&claude_only),
+                "{claude_only} is a Claude row: {labels:?}"
+            );
+        }
+        assert_eq!(value("backend"), "codex app-server");
+        assert_eq!(value("agent"), "Codex", "no version until a session reports one");
+        assert_eq!(value("trust"), "trusted since 2026-10-02");
+        assert_eq!(
+            value("settings"),
+            "your ~/.codex configuration (always; skills off while this project is untrusted); this project's: not loaded"
+        );
+        assert_eq!(
+            value("runs without asking"),
+            "Codex runs commands and edits inside /p/root without asking, reads anywhere, no network or sockets; \
+             your exec-policy allow rules run unsandboxed; its reviewer decides anything else, which then runs with \
+             your full rights; MCP tools follow their servers' approval modes"
+        );
+        assert!(value("mode lag").contains("next turn"), "{}", value("mode lag"));
+        assert!(value("mode lag").contains("keeps the reviewer it started with"));
+        assert_eq!(value("limits"), "—");
+        assert_eq!(value("resumable"), "yes");
+
+        // Bypass keeps the sandbox and answers for the reviewer; the project's tier follows the answer.
+        let rows = codex_rows(SessionModeChoice::Bypass, ProjectTrust::Trusted);
+        let value = |label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
+        assert!(value("runs without asking").contains("; Eitri allows anything else, which then runs"));
+        assert!(!value("runs without asking").contains("reviewer"));
+        assert!(value("settings").ends_with("this project's: loaded"));
+    }
+
+    /// The limit an agent reported is in the `limits` row of its tab, in words.
+    #[test]
+    fn the_limits_row_names_the_window_and_the_reset() {
+        let limits = agent::AccountLimitsRecord {
+            used_percent: 42.5,
+            window_minutes: Some(300),
+            resets_at: Some(1_790_000_000),
+            plan: Some("pro".into()),
+        };
+        assert_eq!(
+            limits_row(&limits),
+            "42% used of the 300-minute window · resets 2026-09-21 14:13 UTC · plan pro"
+        );
+        let bare = agent::AccountLimitsRecord {
+            used_percent: 3.0,
+            window_minutes: None,
+            resets_at: None,
+            plan: None,
+        };
+        assert_eq!(limits_row(&bare), "3% used");
+    }
+
+    /// A Claude tab's rows are the same twenty, in the same order, whatever else the window can run.
+    #[test]
+    fn claude_detail_rows_unchanged() {
+        let set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let rows = detail_rows(
+            set.active_tab(),
+            BackendKind::Sidecar,
+            Some("work"),
+            std::path::Path::new("/p"),
+            Some(std::path::Path::new("/s/rules.json")),
+            "not checked yet",
+            ProjectTrust::Untrusted,
+        );
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "name",
+                "title",
+                "state",
+                "mode",
+                "model",
+                "backend",
+                "account",
+                "cwd",
+                "conversation",
+                "verdandi session",
+                "claude session",
+                "CLI",
+                "settings",
+                "trust",
+                "Verdandi revision",
+                "resumable",
+                "created",
+                "updated",
+                "queued",
+                "permission rules"
+            ]
+        );
+        let value = |label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
+        assert_eq!(value("backend"), "sidecar");
+        assert_eq!(value("resumable"), "yes");
+        assert_eq!(value("permission rules"), "/s/rules.json");
+    }
+
+    /// `:tabnew <agent>` opens a tab of the agent the word names and refuses any other word, saying
+    /// which are accepted; the new-tab key's tab runs `agent.default`.
+    #[test]
+    fn tabnew_opens_the_named_agent_and_refuses_other_words() {
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        assert_eq!(open_tab_named(&state, "codex"), Ok(()));
+        let active = state.borrow().tabs.active();
+        assert_eq!(state.borrow().tabs.get(active).unwrap().agent(), &AgentId::Codex);
+        assert_eq!(open_tab_named(&state, "claude"), Ok(()));
+        let active = state.borrow().tabs.active();
+        assert_eq!(state.borrow().tabs.get(active).unwrap().agent(), &AgentId::Claude);
+        let before = state.borrow().tabs.tabs().len();
+        let refused = open_tab_named(&state, "gemini").unwrap_err();
+        assert!(
+            refused.contains("gemini") && refused.contains("claude, codex"),
+            "{refused}"
+        );
+        assert_eq!(state.borrow().tabs.tabs().len(), before, "a refused word opens nothing");
+    }
+
+    /// `agent.default` reaches the tab the window already has (empty, unstarted) and every later one;
+    /// a started tab keeps its agent.
+    #[test]
+    fn the_default_agent_applies_to_empty_tabs_only() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let first = set.active();
+        let named = set.open(AgentId::Claude);
+        set.get_mut(named).unwrap().name = Some("docs".into());
+        set.apply_configured_agent(AgentId::Codex);
+        assert_eq!(set.get(first).unwrap().agent(), &AgentId::Codex);
+        assert_eq!(
+            set.get(named).unwrap().agent(),
+            &AgentId::Claude,
+            "a tab the user named is theirs"
         );
     }
 

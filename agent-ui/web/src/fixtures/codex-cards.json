@@ -1,0 +1,970 @@
+{
+  "cases": [
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "gpt-5-codex",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "input": {
+              "command": "/bin/bash -lc 'git push origin main'",
+              "cwd": "/project",
+              "escalation": "runs outside the sandbox with your full rights",
+              "network": null,
+              "reason": "The push needs the network"
+            },
+            "permission_id": "perm-command",
+            "tool_name": "commandExecution",
+            "tool_use_id": "item-command",
+            "type": "permission_requested"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 4
+      },
+      "name": "command",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "gpt-5-codex",
+          "pendingPermissions": [
+            {
+              "input": {
+                "command": "/bin/bash -lc 'git push origin main'",
+                "cwd": "/project",
+                "escalation": "runs outside the sandbox with your full rights",
+                "network": null,
+                "reason": "The push needs the network"
+              },
+              "permissionId": "perm-command",
+              "seq": 3,
+              "toolName": "commandExecution",
+              "toolUseId": "item-command"
+            }
+          ],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "gpt-5-codex",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "input": {
+              "command": "/bin/bash -lc 'echo ‮dcba'",
+              "cwd": "/project",
+              "escalation": "runs outside the sandbox with your full rights",
+              "network": null,
+              "reason": null
+            },
+            "permission_id": "perm-hidden",
+            "tool_name": "commandExecution",
+            "tool_use_id": "item-hidden",
+            "type": "permission_requested"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 4
+      },
+      "name": "hidden",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "gpt-5-codex",
+          "pendingPermissions": [
+            {
+              "input": {
+                "command": "/bin/bash -lc 'echo ‮dcba'",
+                "cwd": "/project",
+                "escalation": "runs outside the sandbox with your full rights",
+                "network": null,
+                "reason": null
+              },
+              "permissionId": "perm-hidden",
+              "seq": 3,
+              "toolName": "commandExecution",
+              "toolUseId": "item-hidden"
+            }
+          ],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "gpt-5-codex",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "input": {
+              "command": null,
+              "cwd": null,
+              "escalation": "asks for network access to registry.example.com (https); may run outside the sandbox with your full rights",
+              "network": {
+                "host": "registry.example.com",
+                "protocol": "https"
+              },
+              "reason": null
+            },
+            "permission_id": "perm-network",
+            "tool_name": "commandExecution",
+            "tool_use_id": "item-network",
+            "type": "permission_requested"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 4
+      },
+      "name": "network",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "gpt-5-codex",
+          "pendingPermissions": [
+            {
+              "input": {
+                "command": null,
+                "cwd": null,
+                "escalation": "asks for network access to registry.example.com (https); may run outside the sandbox with your full rights",
+                "network": {
+                  "host": "registry.example.com",
+                  "protocol": "https"
+                },
+                "reason": null
+              },
+              "permissionId": "perm-network",
+              "seq": 3,
+              "toolName": "commandExecution",
+              "toolUseId": "item-network"
+            }
+          ],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "gpt-5-codex",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "input": {
+              "command": "/bin/bash -lc 'cargo test'",
+              "cwd": "/project",
+              "escalation": "runs outside the sandbox with your full rights",
+              "network": null,
+              "reason": null,
+              "subagent": "/root/tests"
+            },
+            "permission_id": "perm-subagent",
+            "tool_name": "commandExecution",
+            "tool_use_id": "item-subagent",
+            "type": "permission_requested"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 4
+      },
+      "name": "subagent",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "gpt-5-codex",
+          "pendingPermissions": [
+            {
+              "input": {
+                "command": "/bin/bash -lc 'cargo test'",
+                "cwd": "/project",
+                "escalation": "runs outside the sandbox with your full rights",
+                "network": null,
+                "reason": null,
+                "subagent": "/root/tests"
+              },
+              "permissionId": "perm-subagent",
+              "seq": 3,
+              "toolName": "commandExecution",
+              "toolUseId": "item-subagent"
+            }
+          ],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "gpt-5-codex",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "input": {
+              "changes": [
+                {
+                  "diff": "one\ntwo\n",
+                  "kind": "add",
+                  "path": "/project/new.txt"
+                },
+                {
+                  "diff": "@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n",
+                  "kind": "update",
+                  "movePath": "/project/src/main.rs",
+                  "path": "/project/src/lib.rs"
+                }
+              ],
+              "reason": "Rename b to c"
+            },
+            "permission_id": "perm-file_change",
+            "tool_name": "fileChange",
+            "tool_use_id": "item-file_change",
+            "type": "permission_requested"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 4
+      },
+      "name": "file_change",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "gpt-5-codex",
+          "pendingPermissions": [
+            {
+              "input": {
+                "changes": [
+                  {
+                    "diff": "one\ntwo\n",
+                    "kind": "add",
+                    "path": "/project/new.txt"
+                  },
+                  {
+                    "diff": "@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n",
+                    "kind": "update",
+                    "movePath": "/project/src/main.rs",
+                    "path": "/project/src/lib.rs"
+                  }
+                ],
+                "reason": "Rename b to c"
+              },
+              "permissionId": "perm-file_change",
+              "seq": 3,
+              "toolName": "fileChange",
+              "toolUseId": "item-file_change"
+            }
+          ],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "gpt-5-codex",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "input": {
+              "arguments": {
+                "limit": 3,
+                "query": "tokio"
+              },
+              "server": "docs",
+              "tool": "lookup"
+            },
+            "permission_id": "perm-mcp",
+            "tool_name": "mcpToolCall",
+            "tool_use_id": "item-mcp",
+            "type": "permission_requested"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 4
+      },
+      "name": "mcp",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "gpt-5-codex",
+          "pendingPermissions": [
+            {
+              "input": {
+                "arguments": {
+                  "limit": 3,
+                  "query": "tokio"
+                },
+                "server": "docs",
+                "tool": "lookup"
+              },
+              "permissionId": "perm-mcp",
+              "seq": 3,
+              "toolName": "mcpToolCall",
+              "toolUseId": "item-mcp"
+            }
+          ],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "gpt-5-codex",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "input": {
+              "command": "/bin/bash -lc 'ls'",
+              "cwd": "/project"
+            },
+            "name": "commandExecution",
+            "tool_use_id": "r1",
+            "turn_id": "t1",
+            "type": "tool_call_started"
+          },
+          {
+            "content": "Cargo.toml\n",
+            "is_error": false,
+            "tool_use_id": "r1",
+            "turn_id": "t1",
+            "type": "tool_call_completed"
+          },
+          {
+            "input": {
+              "command": "/bin/bash -lc 'cargo build'",
+              "cwd": "/project",
+              "subagent": "/root/builder"
+            },
+            "name": "commandExecution",
+            "tool_use_id": "r2",
+            "turn_id": "t1",
+            "type": "tool_call_started"
+          },
+          {
+            "content": "ok\n",
+            "is_error": false,
+            "tool_use_id": "r2",
+            "turn_id": "t1",
+            "type": "tool_call_completed"
+          },
+          {
+            "input": {
+              "changes": [
+                {
+                  "diff": "hello\n",
+                  "kind": "add",
+                  "path": "/project/a.txt"
+                }
+              ]
+            },
+            "name": "fileChange",
+            "tool_use_id": "r3",
+            "turn_id": "t1",
+            "type": "tool_call_started"
+          },
+          {
+            "content": "applied",
+            "is_error": false,
+            "tool_use_id": "r3",
+            "turn_id": "t1",
+            "type": "tool_call_completed"
+          },
+          {
+            "input": {
+              "arguments": {
+                "query": "tokio"
+              },
+              "server": "docs",
+              "tool": "lookup"
+            },
+            "name": "mcpToolCall",
+            "tool_use_id": "r4",
+            "turn_id": "t1",
+            "type": "tool_call_started"
+          },
+          {
+            "content": {
+              "content": []
+            },
+            "is_error": false,
+            "tool_use_id": "r4",
+            "turn_id": "t1",
+            "type": "tool_call_completed"
+          },
+          {
+            "input": {
+              "query": "tokio runtime"
+            },
+            "name": "webSearch",
+            "tool_use_id": "r5",
+            "turn_id": "t1",
+            "type": "tool_call_started"
+          },
+          {
+            "content": "",
+            "is_error": false,
+            "tool_use_id": "r5",
+            "turn_id": "t1",
+            "type": "tool_call_completed"
+          },
+          {
+            "input": {
+              "prompt": "Run the tests",
+              "receiverThreadIds": [
+                "th-2"
+              ],
+              "tool": "spawnAgent"
+            },
+            "name": "collabAgentToolCall",
+            "tool_use_id": "r6",
+            "turn_id": "t1",
+            "type": "tool_call_started"
+          },
+          {
+            "content": "spawnAgent: completed",
+            "is_error": false,
+            "tool_use_id": "r6",
+            "turn_id": "t1",
+            "type": "tool_call_completed"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 15
+      },
+      "name": "rows",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "gpt-5-codex",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [
+            {
+              "input": {
+                "command": "/bin/bash -lc 'ls'",
+                "cwd": "/project"
+              },
+              "name": "commandExecution",
+              "result": {
+                "content": "Cargo.toml\n",
+                "isError": false
+              },
+              "seq": 3,
+              "toolUseId": "r1",
+              "turnId": "t1"
+            },
+            {
+              "input": {
+                "command": "/bin/bash -lc 'cargo build'",
+                "cwd": "/project",
+                "subagent": "/root/builder"
+              },
+              "name": "commandExecution",
+              "result": {
+                "content": "ok\n",
+                "isError": false
+              },
+              "seq": 5,
+              "toolUseId": "r2",
+              "turnId": "t1"
+            },
+            {
+              "input": {
+                "changes": [
+                  {
+                    "diff": "hello\n",
+                    "kind": "add",
+                    "path": "/project/a.txt"
+                  }
+                ]
+              },
+              "name": "fileChange",
+              "result": {
+                "content": "applied",
+                "isError": false
+              },
+              "seq": 7,
+              "toolUseId": "r3",
+              "turnId": "t1"
+            },
+            {
+              "input": {
+                "arguments": {
+                  "query": "tokio"
+                },
+                "server": "docs",
+                "tool": "lookup"
+              },
+              "name": "mcpToolCall",
+              "result": {
+                "content": {
+                  "content": []
+                },
+                "isError": false
+              },
+              "seq": 9,
+              "toolUseId": "r4",
+              "turnId": "t1"
+            },
+            {
+              "input": {
+                "query": "tokio runtime"
+              },
+              "name": "webSearch",
+              "result": {
+                "content": "",
+                "isError": false
+              },
+              "seq": 11,
+              "toolUseId": "r5",
+              "turnId": "t1"
+            },
+            {
+              "input": {
+                "prompt": "Run the tests",
+                "receiverThreadIds": [
+                  "th-2"
+                ],
+                "tool": "spawnAgent"
+              },
+              "name": "collabAgentToolCall",
+              "result": {
+                "content": "spawnAgent: completed",
+                "isError": false
+              },
+              "seq": 13,
+              "toolUseId": "r6",
+              "turnId": "t1"
+            }
+          ],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 15,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "gpt-5-codex",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "plan": "pro",
+            "resets_at": 1790000000,
+            "type": "account_limits",
+            "used_percent": 100.0,
+            "window_minutes": 300
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": "You've hit your usage limit.",
+              "reason": "usage_limit"
+            },
+            "outcome": "limit_reached",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "usage_limit",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": {
+            "plan": "pro",
+            "resetsAt": 1790000000,
+            "usedPercent": 100.0,
+            "windowMinutes": 300
+          },
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "limit_reached",
+          "model": "gpt-5-codex",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "limit_reached",
+              "message": "You've hit your usage limit.",
+              "reason": "usage_limit",
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null
+      }
+    }
+  ],
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_codex_cards_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

@@ -6,27 +6,92 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use super::codex::{codex_findings, hooks_json_findings, rule_file_findings};
 use super::findings::{mcp_findings, settings_findings};
 use super::git_top::git_top_level;
 use super::nofollow::{normalize_lexically, DirHandle, FileKind, Refusal};
-use super::{Discovery, Entry, EntryKind, Finding, Fingerprint, Limits};
+use super::{Discovery, Entry, EntryKind, Finding, Fingerprint, Limits, Profile, ProfileEnv};
 
-/// What a file found on the walk is to the CLI, which decides how it is parsed and whether a link
-/// in its place leaves the CLI reading something the fingerprint cannot see.
+/// What a file found on the walk is to the agent, which decides how it is parsed and whether a link
+/// in its place leaves the agent reading something the fingerprint cannot see.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     Settings,
     Mcp,
     Memory,
-    /// Anything else under `.claude/`.
+    /// Codex's `config.toml` in a `.codex/`.
+    CodexConfig,
+    /// Codex's `hooks.json` in a `.codex/`.
+    HooksJson,
+    /// A Codex exec-policy rule file, `.codex/rules/*.rules`.
+    Rules,
+    /// A plugin-marketplace listing Codex reads at the top level.
+    Listing,
+    /// A directory in a `.codex/` that Codex lists and reads from itself (`rules/`, `skills/`): a
+    /// link in its place is followed, and what it leads to is never hashed.
+    CodexReadDir,
+    /// Anything else under a directory read whole.
     Plain,
 }
 
 impl Role {
-    /// The CLI reads this file itself, so a link here means it reads the link's target, whose
+    /// The agent reads this file itself, so a link here means it reads the link's target, whose
     /// content the fingerprint never sees.
     fn read_by_the_cli(self) -> bool {
         !matches!(self, Role::Plain)
+    }
+}
+
+/// Which directory a tree read whole is, which decides what each name in it means.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tree {
+    /// A project's `.claude/`.
+    Claude,
+    /// A project's `.codex/`.
+    Codex,
+    /// `.agents/skills/`: each directory directly in it is a skill.
+    AgentsSkills,
+    /// `.agents/plugins/`: its marketplace listings are named when it is at the top level.
+    AgentsPlugins { at_top: bool },
+    /// A directory an agent registered by name reads.
+    Plain,
+}
+
+/// The listings Codex reads from `.agents/plugins/` at the repository's top level.
+const AGENTS_PLUGIN_LISTINGS: [&str; 2] = ["marketplace.json", "api_marketplace.json"];
+
+/// The listings Codex reads from other tools' plugin directories at the repository's top level.
+const OTHER_PLUGIN_LISTINGS: [&str; 2] = [".claude-plugin", ".cursor-plugin"];
+
+impl Tree {
+    /// What a file `name` at `depth` below the tree's root, in the directory named `parent` (`None`
+    /// at the root), means to the agent.
+    fn role(self, depth: usize, parent: Option<&OsStr>, name: &OsStr) -> Role {
+        match self {
+            Tree::Claude => role_in(depth, name),
+            Tree::Codex => match (depth, name.as_bytes()) {
+                (0, b"config.toml") => Role::CodexConfig,
+                (0, b"hooks.json") => Role::HooksJson,
+                (0, b"rules") | (0, b"skills") => Role::CodexReadDir,
+                (1, file) if parent == Some(OsStr::new("rules")) && file.ends_with(b".rules") => Role::Rules,
+                _ => Role::Plain,
+            },
+            Tree::AgentsPlugins { at_top: true }
+                if depth == 0 && AGENTS_PLUGIN_LISTINGS.iter().any(|l| l.as_bytes() == name.as_bytes()) =>
+            {
+                Role::Listing
+            }
+            Tree::AgentsSkills | Tree::AgentsPlugins { .. } | Tree::Plain => Role::Plain,
+        }
+    }
+
+    /// Whether a directory `name` at `depth`, in the directory named `parent`, is a skill.
+    fn is_skill(self, depth: usize, parent: Option<&OsStr>) -> bool {
+        match self {
+            Tree::AgentsSkills => depth == 0,
+            Tree::Codex => depth == 1 && parent == Some(OsStr::new("skills")),
+            _ => false,
+        }
     }
 }
 
@@ -150,8 +215,12 @@ impl Scan<'_> {
                 match role {
                     Role::Settings => self.findings.extend(settings_findings(&path, &bytes)),
                     Role::Mcp => self.findings.extend(mcp_findings(&path, &bytes)),
-                    Role::Memory => self.findings.push(Finding::ClaudeMd { path: path.clone() }),
-                    Role::Plain => {}
+                    Role::Memory => self.findings.push(Finding::Memory { path: path.clone() }),
+                    Role::CodexConfig => self.findings.extend(codex_findings(&path, &bytes)),
+                    Role::HooksJson => self.findings.extend(hooks_json_findings(&path, &bytes)),
+                    Role::Rules => self.findings.extend(rule_file_findings(&path, &bytes)),
+                    Role::Listing => self.findings.push(Finding::PluginListing { path: path.clone() }),
+                    Role::CodexReadDir | Role::Plain => {}
                 }
                 self.push(
                     path,
@@ -220,12 +289,13 @@ impl Scan<'_> {
         }
     }
 
-    /// One directory on the walk: the files beside `.claude/`, then `.claude/` itself.
-    fn directory(&mut self, dir: &Path, at_home: bool) {
+    /// `dir` relative to the top level (empty for the top itself), and the directory opened. A
+    /// directory that cannot be opened is an entry that cannot be checked.
+    fn open_walked(&mut self, dir: &Path) -> Option<(PathBuf, DirHandle)> {
         let rel = relative(&self.top, dir);
         let base = if rel == Path::new(".") { PathBuf::new() } else { rel };
-        let handle = match DirHandle::open_absolute(dir) {
-            Ok(handle) => handle,
+        match DirHandle::open_absolute(dir) {
+            Ok(handle) => Some((base, handle)),
             Err(refusal) => {
                 if self.room() {
                     let path = if base.as_os_str().is_empty() {
@@ -235,8 +305,28 @@ impl Scan<'_> {
                     };
                     self.unreadable(path, format!("the directory cannot be opened: {}", refusal.describe()));
                 }
-                return;
+                None
             }
+        }
+    }
+
+    /// Names an agent reads that discovery cannot look up as one name: each is an entry that cannot be
+    /// checked, so no answer about this configuration outlives one start.
+    fn refused_names(&mut self, refused: &[String], what: &str) {
+        for name in refused {
+            if self.room() {
+                self.unreadable(
+                    PathBuf::from(name),
+                    format!("{what} that is not a plain file name, not read"),
+                );
+            }
+        }
+    }
+
+    /// One directory on the walk for Claude: the files beside `.claude/`, then `.claude/` itself.
+    fn claude_directory(&mut self, dir: &Path, at_home: bool) {
+        let Some((base, handle)) = self.open_walked(dir) else {
+            return;
         };
         for (name, role) in [
             (".mcp.json", Role::Mcp),
@@ -260,7 +350,7 @@ impl Scan<'_> {
                     let name = OsStr::new("settings.local.json");
                     self.expected_file(&claude, name, claude_path.join(name), Role::Settings);
                 }
-                Ok(claude) => self.dot_claude(claude, claude_path),
+                Ok(claude) => self.tree(claude, claude_path, Tree::Claude),
                 Err(Refusal::Symlink { .. }) => {
                     if self.room() {
                         self.symlink(&handle, dot_claude, claude_path, Role::Settings);
@@ -291,10 +381,12 @@ impl Scan<'_> {
         }
     }
 
-    /// Everything under a `.claude/` directory, depth first, bounded by depth and entries.
-    fn dot_claude(&mut self, claude: DirHandle, claude_path: PathBuf) {
-        let mut stack = vec![(claude, claude_path, 0usize)];
-        while let Some((dir, path, depth)) = stack.pop() {
+    /// Everything under a directory read whole (a `.claude/`, a `.codex/`, ...), depth first,
+    /// bounded by depth and entries.
+    fn tree(&mut self, top_dir: DirHandle, top_path: PathBuf, tree: Tree) {
+        // Each directory on the stack carries its own name, which gives the files in it their role.
+        let mut stack: Vec<(DirHandle, PathBuf, usize, Option<OsString>)> = vec![(top_dir, top_path.clone(), 0, None)];
+        while let Some((dir, path, depth, parent)) = stack.pop() {
             let room = self.limits.max_entries.saturating_sub(self.entries.len());
             let mut names = match dir.entries(room.saturating_add(1)) {
                 Ok(names) => names,
@@ -311,32 +403,43 @@ impl Scan<'_> {
                 self.note_over_budget(reason);
             }
             let mut other_files = 0usize;
-            let mut below: Vec<(DirHandle, PathBuf)> = Vec::new();
+            let mut below: Vec<(DirHandle, PathBuf, OsString)> = Vec::new();
             for name in names {
                 let child = path.join(&name);
-                let role = role_in(depth, &name);
+                let role = tree.role(depth, parent.as_deref(), &name);
                 match dir.lstat(&name) {
                     Ok(FileKind::Dir) => {
                         if !self.room() {
                             break;
                         }
                         self.push(child.clone(), EntryKind::Dir);
-                        if depth == 0 && name.as_bytes() == WORKTREES_DIR {
+                        if tree == Tree::Claude && depth == 0 && name.as_bytes() == WORKTREES_DIR {
                             self.findings.push(Finding::NotRead {
                                 path: child,
                                 reason: WORKTREES_REASON.to_string(),
                             });
                             continue;
                         }
+                        if tree.is_skill(depth, parent.as_deref()) {
+                            self.findings.push(Finding::Skill {
+                                path: child.clone(),
+                                name: name.to_string_lossy().into_owned(),
+                            });
+                        }
                         if depth + 1 > self.limits.max_depth {
+                            // Claude's wording is part of every existing record's fingerprint.
+                            let under = match tree {
+                                Tree::Claude => ".claude/".to_string(),
+                                _ => format!("{}/", top_path.display()),
+                            };
                             self.note_over_budget(format!(
-                                "deeper than {} directories under .claude/",
+                                "deeper than {} directories under {under}",
                                 self.limits.max_depth
                             ));
                             continue;
                         }
                         match dir.open_dir(&name) {
-                            Ok(sub) => below.push((sub, child)),
+                            Ok(sub) => below.push((sub, child, name)),
                             Err(refusal) => {
                                 // Not listed, so it cannot count as hashed.
                                 self.entries.pop();
@@ -345,7 +448,9 @@ impl Scan<'_> {
                         }
                     }
                     _ => {
-                        if self.expected_file(&dir, &name, child, role) && role == Role::Plain {
+                        if self.expected_file(&dir, &name, child, role)
+                            && matches!(role, Role::Plain | Role::CodexReadDir)
+                        {
                             other_files += 1;
                         }
                     }
@@ -358,15 +463,244 @@ impl Scan<'_> {
                 });
             }
             // Pushed in reverse so the first name is walked first.
-            for (sub, child) in below.into_iter().rev() {
-                stack.push((sub, child, depth + 1));
+            for (sub, child, name) in below.into_iter().rev() {
+                stack.push((sub, child, depth + 1, Some(name)));
+            }
+        }
+    }
+
+    /// A directory an agent reads whole, by name in `parent`: walked when it is one, a link to it
+    /// reported as one the agent would follow, anything else in its place named.
+    fn whole_dir(&mut self, parent: &DirHandle, name: &OsStr, path: PathBuf, tree: Tree) {
+        match parent.lstat(name) {
+            Err(Refusal::Missing) => {}
+            Err(refusal) => {
+                if self.room() {
+                    self.unreadable(path, refusal.describe());
+                }
+            }
+            // Like `.claude/` itself, the directory is not an entry of its own: an empty one is nothing
+            // to trust.
+            Ok(FileKind::Dir) => match parent.open_dir(name) {
+                Ok(handle) => self.tree(handle, path, tree),
+                Err(Refusal::Symlink { .. }) => {
+                    if self.room() {
+                        self.symlink(parent, name, path, Role::Settings);
+                    }
+                }
+                Err(refusal) => {
+                    if self.room() {
+                        self.unreadable(path, format!("cannot be opened: {}", refusal.describe()));
+                    }
+                }
+            },
+            Ok(FileKind::Symlink) => {
+                if self.room() {
+                    self.symlink(parent, name, path, Role::Settings);
+                }
+            }
+            Ok(FileKind::Regular { .. }) | Ok(FileKind::Unknown) => {
+                if self.room() {
+                    self.push(path, EntryKind::Other);
+                }
+            }
+            Ok(other) => {
+                if self.room() {
+                    self.unreadable(path, other.describe().to_string());
+                }
+            }
+        }
+    }
+
+    /// A directory that must be passed through to reach what an agent reads below it (`.agents/`,
+    /// `.claude-plugin/`): opened without a link, and a link or anything else in its place reported
+    /// as something the agent would follow. Nothing is recorded for it when it is a plain directory.
+    fn pass_through(&mut self, parent: &DirHandle, name: &OsStr, path: PathBuf) -> Option<DirHandle> {
+        match parent.lstat(name) {
+            Err(Refusal::Missing) => None,
+            Err(refusal) => {
+                if self.room() {
+                    self.unreadable(path, refusal.describe());
+                }
+                None
+            }
+            Ok(FileKind::Dir) => match parent.open_dir(name) {
+                Ok(handle) => Some(handle),
+                Err(Refusal::Symlink { .. }) => {
+                    if self.room() {
+                        self.symlink(parent, name, path, Role::Settings);
+                    }
+                    None
+                }
+                Err(refusal) => {
+                    if self.room() {
+                        self.unreadable(path, format!("cannot be opened: {}", refusal.describe()));
+                    }
+                    None
+                }
+            },
+            Ok(FileKind::Symlink) => {
+                if self.room() {
+                    self.symlink(parent, name, path, Role::Settings);
+                }
+                None
+            }
+            Ok(FileKind::Regular { .. }) | Ok(FileKind::Unknown) => None,
+            Ok(other) => {
+                if self.room() {
+                    self.unreadable(path, other.describe().to_string());
+                }
+                None
+            }
+        }
+    }
+
+    /// A `.codex/` at `dot_codex` (absolute), recorded under `path`: skipped when it is the user's own
+    /// `CODEX_HOME`, else read whole.
+    fn dot_codex(&mut self, parent: &DirHandle, path: PathBuf, dot_codex: &Path, env: &ProfileEnv) {
+        let name = OsStr::new(".codex");
+        let Some(codex_home) = env.codex_home.as_deref() else {
+            self.whole_dir(parent, name, path, Tree::Codex);
+            return;
+        };
+        if codex_home == dot_codex {
+            if matches!(parent.lstat(name), Ok(FileKind::Dir)) && self.room() {
+                self.push(path.clone(), EntryKind::Dir);
+                self.findings.push(Finding::NotRead {
+                    path,
+                    reason: CODEX_HOME_REASON.to_string(),
+                });
+            }
+            return;
+        }
+        // `CODEX_HOME` is canonical, so a `~/.codex` that is a link to it (a dotfile manager's) is
+        // spelt differently; Codex compares the resolved paths and skips it too. The link is resolved
+        // by its text alone: a target that only matches through further links stays a link the agent
+        // would follow, which is the safe side.
+        if matches!(parent.lstat(name), Ok(FileKind::Symlink)) {
+            let resolved = parent
+                .readlink(name)
+                .ok()
+                .and_then(|target| normalize_lexically(dot_codex.parent()?, &target));
+            if resolved.as_deref() == Some(codex_home) {
+                self.findings.push(Finding::NotRead {
+                    path,
+                    reason: CODEX_HOME_REASON.to_string(),
+                });
+                return;
+            }
+        }
+        self.whole_dir(parent, name, path, Tree::Codex);
+    }
+
+    /// One directory on the walk for Codex: its memory files, `.codex/`, `.agents/skills/` and
+    /// `.agents/plugins/` (not in `$HOME`, where they are the user's own), and at the top level the
+    /// plugin listings of other tools.
+    fn codex_directory(&mut self, dir: &Path, at_home: bool, at_top: bool, env: &ProfileEnv, names: &[OsString]) {
+        let Some((base, handle)) = self.open_walked(dir) else {
+            return;
+        };
+        for name in ["AGENTS.md", "AGENTS.override.md"] {
+            self.expected_file(&handle, OsStr::new(name), base.join(name), Role::Memory);
+        }
+        for name in names {
+            self.expected_file(&handle, name, base.join(name), Role::Memory);
+        }
+        self.dot_codex(&handle, base.join(".codex"), &dir.join(".codex"), env);
+        if !at_home {
+            let agents_path = base.join(".agents");
+            if let Some(agents) = self.pass_through(&handle, OsStr::new(".agents"), agents_path.clone()) {
+                self.whole_dir(
+                    &agents,
+                    OsStr::new("skills"),
+                    agents_path.join("skills"),
+                    Tree::AgentsSkills,
+                );
+                self.whole_dir(
+                    &agents,
+                    OsStr::new("plugins"),
+                    agents_path.join("plugins"),
+                    Tree::AgentsPlugins { at_top },
+                );
+            }
+        }
+        if at_top {
+            for tool in OTHER_PLUGIN_LISTINGS {
+                let tool_path = base.join(tool);
+                if let Some(tool_dir) = self.pass_through(&handle, OsStr::new(tool), tool_path.clone()) {
+                    let listing = OsStr::new("marketplace.json");
+                    self.expected_file(&tool_dir, listing, tool_path.join(listing), Role::Listing);
+                }
+            }
+        }
+    }
+
+    /// The `.codex/` a linked worktree's walked directory takes its hooks from: the same place in the
+    /// main checkout.
+    fn main_checkout_codex(&mut self, main_dir: &Path, env: &ProfileEnv) {
+        let path = relative(&self.top, &main_dir.join(".codex"));
+        let handle = match DirHandle::open_absolute(main_dir) {
+            Ok(handle) => handle,
+            // Nothing there to read: a directory the worktree has and the main checkout lacks.
+            Err(Refusal::Missing) | Err(Refusal::NotADirectory) => return,
+            Err(refusal) => {
+                if self.room() {
+                    self.unreadable(path, format!("the directory cannot be opened: {}", refusal.describe()));
+                }
+                return;
+            }
+        };
+        self.dot_codex(&handle, path, &main_dir.join(".codex"), env);
+    }
+
+    /// One directory on the walk for an agent registered by name: each of its files, and each
+    /// directory it named (a name ending in `/`) read whole.
+    fn named_directory(&mut self, dir: &Path, files: &[(OsString, bool)]) {
+        let Some((base, handle)) = self.open_walked(dir) else {
+            return;
+        };
+        for (name, is_dir) in files {
+            if *is_dir {
+                self.whole_dir(&handle, name, base.join(name), Tree::Plain);
+            } else {
+                self.expected_file(&handle, name, base.join(name), Role::Memory);
             }
         }
     }
 }
 
+/// Why a linked worktree whose common git directory is not named `.git` cannot be checked.
+const UNPLACED_COMMON_REASON: &str =
+    "the git directory of this linked worktree is not named .git, so the main checkout whose .codex/ hooks Codex reads cannot be found";
+
+/// Why a `.codex/` that is the user's `CODEX_HOME` is named and not read.
+const CODEX_HOME_REASON: &str = "the user's own Codex configuration (CODEX_HOME), not read";
+
+/// Splits names an agent reads in each directory into the plain names discovery can look up there
+/// (with whether each is a directory) and a finding for each it cannot: one with a `/` inside, an
+/// absolute one, `.` or `..`, which would reach outside the directory or through another one.
+fn plain_names(names: &[String], dirs_allowed: bool) -> (Vec<(OsString, bool)>, Vec<String>) {
+    let mut plain: Vec<(OsString, bool)> = Vec::new();
+    let mut refused = Vec::new();
+    for name in names {
+        let (bare, is_dir) = match name.strip_suffix('/') {
+            Some(bare) if dirs_allowed => (bare, true),
+            _ => (name.as_str(), false),
+        };
+        if bare.is_empty() || bare == "." || bare == ".." || bare.contains('/') || bare.contains('\0') {
+            refused.push(name.clone());
+            continue;
+        }
+        let entry = (OsString::from(bare), is_dir);
+        if !plain.contains(&entry) {
+            plain.push(entry);
+        }
+    }
+    (plain, refused)
+}
+
 /// What a name directly in `.claude/` (depth 0) or below it means to the CLI.
-fn role_in(depth: usize, name: &OsString) -> Role {
+fn role_in(depth: usize, name: &OsStr) -> Role {
     if depth != 0 {
         return Role::Plain;
     }
@@ -380,9 +714,15 @@ fn role_in(depth: usize, name: &OsString) -> Role {
 /// The fingerprint over the top level's place relative to the root, every entry and the budget
 /// note. Each field ends in a NUL, which no path, link target, hex digest or tag holds, so no two
 /// different configurations feed the hash the same bytes.
-fn fingerprint(root: &Path, top: &Path, entries: &[Entry], over_budget: Option<&str>) -> Fingerprint {
+fn fingerprint(
+    profile: &Profile,
+    root: &Path,
+    top: &Path,
+    entries: &[Entry],
+    over_budget: Option<&str>,
+) -> Fingerprint {
     let mut hash = Sha256::new();
-    hash.update(b"eitri-trust-v1\n");
+    hash.update(profile.fingerprint_header());
     let ups = root
         .strip_prefix(top)
         .map(|rest| rest.components().count())
@@ -411,15 +751,15 @@ fn fingerprint(root: &Path, top: &Path, entries: &[Entry], over_budget: Option<&
     Fingerprint(hash.finalize().into())
 }
 
-/// Discovers the configuration a session started at `root` (canonical) would load from the project
-/// and local tiers: every directory from `root` up to the git top level (or, when no repository was
+/// Discovers the configuration a session of `profile`'s agent started at `root` (canonical) would load
+/// from the project: every directory from `root` up to the git top level (or, when no repository was
 /// accepted, up to the highest directory whose `.git` could not be checked), never above `home`
 /// when `root` is below it. No link is followed and nothing blocks.
 ///
 /// `home` must be canonical too: it is compared with `root`'s ancestors by path, and a home spelt
 /// through a link would match none of them, so the walk would neither stop there nor keep the user
-/// tier's own files out of the fingerprint.
-pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits) -> Discovery {
+/// tier's own files out of the fingerprint. So must `env.codex_home`, for the same reason.
+pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Profile, env: &ProfileEnv) -> Discovery {
     let clamp = home.filter(|home| root.starts_with(home));
     let walk = git_top_level(root, clamp, limits.max_walk_up);
     // With no repository accepted, a `.git` the walk could not check may still be the one git takes,
@@ -458,8 +798,45 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits) -> Discovery 
     if let Some(reason) = walk.over_budget {
         scan.note_over_budget(reason);
     }
-    for dir in &walked {
-        scan.directory(dir, home == Some(dir.as_path()));
+    match profile {
+        Profile::Claude => {
+            for dir in &walked {
+                scan.claude_directory(dir, home == Some(dir.as_path()));
+            }
+        }
+        Profile::Codex => {
+            let (names, refused) = plain_names(&env.fallback_names, false);
+            let names: Vec<OsString> = names
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| name != "AGENTS.md" && name != "AGENTS.override.md")
+                .collect();
+            scan.refused_names(&refused, "an alternate name for AGENTS.md");
+            // A linked worktree whose main checkout this walk cannot place: Codex reads hooks from a
+            // `.codex/` there that nothing here can show or hash, so no answer outlives one start.
+            if let Some(common) = &walk.unplaced_common {
+                if scan.room() {
+                    scan.unreadable(relative(&top, common), UNPLACED_COMMON_REASON.to_string());
+                }
+            }
+            // A linked worktree's main checkout, when it is somewhere else than the worktree.
+            let main_checkout = walk.main_checkout.as_deref().filter(|main| *main != top.as_path());
+            for dir in &walked {
+                scan.codex_directory(dir, home == Some(dir.as_path()), *dir == top, env, &names);
+                if let Some(main) = main_checkout {
+                    if let Ok(rest) = dir.strip_prefix(&top) {
+                        scan.main_checkout_codex(&main.join(rest), env);
+                    }
+                }
+            }
+        }
+        Profile::Acp { files, .. } => {
+            let (names, refused) = plain_names(files, true);
+            scan.refused_names(&refused, "a project file name that is not one name");
+            for dir in &walked {
+                scan.named_directory(dir, &names);
+            }
+        }
     }
     let mut entries = scan.entries;
     entries.sort_by(|a, b| a.path.as_os_str().as_bytes().cmp(b.path.as_os_str().as_bytes()));
@@ -468,8 +845,9 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits) -> Discovery 
     for reason in &scan.over_budget {
         findings.push(Finding::OverBudget { reason: reason.clone() });
     }
-    let fingerprint = fingerprint(root, &top, &entries, over_budget.as_deref());
+    let fingerprint = fingerprint(profile, root, &top, &entries, over_budget.as_deref());
     Discovery {
+        profile: profile.clone(),
         root: root.to_path_buf(),
         top,
         walked,
@@ -514,16 +892,21 @@ mod tests {
             kind: EntryKind::Dir,
         };
         let root = Path::new("/r");
-        let a = fingerprint(root, root, &[link("p", "x\ny"), file("z")], None);
-        let b = fingerprint(root, root, &[link("p", "x"), file("y\nz")], None);
+        let claude = &Profile::Claude;
+        let a = fingerprint(claude, root, root, &[link("p", "x\ny"), file("z")], None);
+        let b = fingerprint(claude, root, root, &[link("p", "x"), file("y\nz")], None);
         assert_ne!(a, b);
         assert_ne!(
-            fingerprint(root, root, &[], None),
-            fingerprint(Path::new("/r/s"), root, &[], None)
+            fingerprint(claude, root, root, &[], None),
+            fingerprint(claude, Path::new("/r/s"), root, &[], None)
         );
         assert_ne!(
-            fingerprint(root, root, &[], None),
-            fingerprint(root, root, &[], Some("over"))
+            fingerprint(claude, root, root, &[], None),
+            fingerprint(claude, root, root, &[], Some("over"))
+        );
+        assert_ne!(
+            fingerprint(claude, root, root, &[], None),
+            fingerprint(&Profile::Codex, root, root, &[], None)
         );
     }
 }

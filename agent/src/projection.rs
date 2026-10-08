@@ -361,6 +361,26 @@ pub enum AgentDomainEvent {
         /// parsed, when it gave any.
         reason: Option<String>,
     },
+    /// An agent that is not the Claude sidecar reported a sandbox, approval policy or reviewer other
+    /// than the one Eitri asked for. The host fails the tab and stops answering requests on its own,
+    /// bypass included (`eitri_core::tab_set::TabSet::pump`).
+    PolicyMismatch {
+        /// What Eitri sent, in the agent's own words.
+        requested: String,
+        /// What the agent reported, in the agent's own words.
+        reported: String,
+    },
+    /// The account's usage limit changed, as the agent reported it. Account-wide, not per turn.
+    AccountLimits {
+        /// How much of the window is used, in percent.
+        used_percent: f64,
+        /// Length of the window, when the agent said.
+        window_minutes: Option<u32>,
+        /// When the window resets (Unix seconds), when the agent said.
+        resets_at: Option<i64>,
+        /// The plan the limit belongs to, when the agent said.
+        plan: Option<String>,
+    },
 }
 
 /// The CLI's own refusal of one tool call, as the projection keeps it on that call's record
@@ -377,6 +397,15 @@ pub struct ToolCallDenial {
 pub struct UngatedCliModeRecord {
     pub reported: String,
     pub detail: String,
+}
+
+/// The latest `AgentDomainEvent::AccountLimits` a session reported, as the projection keeps it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountLimitsRecord {
+    pub used_percent: f64,
+    pub window_minutes: Option<u32>,
+    pub resets_at: Option<i64>,
+    pub plan: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -621,15 +650,41 @@ pub struct TokenUsage {
 /// Each backend fills the half it really has and leaves the rest `None`, which is unknown, not zero:
 /// the sidecar carries tokens and a model but no turn count (`TurnUsage` has none); the legacy
 /// backend carries a turn count but no tokens or model (its `ResultLine` reads no token fields).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageInfo {
     pub total_cost_usd: f64,
+    /// False when the provider reports tokens but no cost (Codex): `total_cost_usd` is then a
+    /// placeholder, and a view must show no cost rather than `$0.00`. Left out of the serialized
+    /// form while true, so a Claude report is byte for byte what it was; absent in older JSON, which
+    /// reads as true.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub cost_reported: bool,
     /// Legacy's `result.num_turns`; `None` from the sidecar, whose `TurnUsage` has none.
     pub num_turns: Option<u32>,
     /// `None` from legacy, whose `ResultLine` reads no token fields.
     pub tokens: Option<TokenUsage>,
     /// `TurnUsage.model`: the model with the most tokens; `None` when empty.
     pub model: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+impl Default for UsageInfo {
+    fn default() -> Self {
+        Self {
+            total_cost_usd: 0.0,
+            cost_reported: true,
+            num_turns: None,
+            tokens: None,
+            model: None,
+        }
+    }
 }
 
 /// Eitri's sole product-state authority for one conversation. `pending_permissions`
@@ -727,6 +782,14 @@ pub struct AgentSessionProjection {
     /// changes nothing a view draws, only how the host answers (`cli_runs_auto`).
     #[serde(skip)]
     pub cli_mode_reported: Option<String>,
+    /// The first `AgentDomainEvent::PolicyMismatch` this session reported, as `(requested, reported)`.
+    /// Kept for the same reason as `ungated_cli_mode`: the event alone does not survive a resync, and
+    /// the host's pump and its answer path read this. Not serialized.
+    #[serde(skip)]
+    pub policy_mismatch: Option<(String, String)>,
+    /// The latest `AgentDomainEvent::AccountLimits`, or `None` before the first. Not serialized.
+    #[serde(skip)]
+    pub account_limits: Option<AccountLimitsRecord>,
     /// CLI refusals whose call has not been folded yet, oldest first, by tool-use id, attached when
     /// it is. In the one recorded run (CLI 2.1.284) the refusal followed the assistant message
     /// carrying its call; this keeps a refusal that ever arrives first from being lost. Emptied at
@@ -1072,6 +1135,27 @@ impl AgentSessionProjection {
             // The latest report wins: the CLI re-reports its mode at every turn's start.
             AgentDomainEvent::CliPermissionMode { reported } => {
                 self.cli_mode_reported = Some(reported.clone());
+            }
+            // First report wins, like the CLI-mode tripwire: the host fails the tab, and until it has
+            // the projection says what it was told.
+            AgentDomainEvent::PolicyMismatch { requested, reported } => {
+                if self.policy_mismatch.is_none() {
+                    self.policy_mismatch = Some((requested.clone(), reported.clone()));
+                }
+            }
+            // The latest report wins: the agent states the whole window each time.
+            AgentDomainEvent::AccountLimits {
+                used_percent,
+                window_minutes,
+                resets_at,
+                plan,
+            } => {
+                self.account_limits = Some(AccountLimitsRecord {
+                    used_percent: *used_percent,
+                    window_minutes: *window_minutes,
+                    resets_at: *resets_at,
+                    plan: plan.clone(),
+                });
             }
             // On the call it refused, or held until that call is folded. A refusal naming no call
             // has nothing to sit on and changes nothing; the call's own error result still says it.

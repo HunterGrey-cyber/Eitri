@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { latestTurnEnding, turnEndingBandText, turnEndingText } from "./turnEnding";
+import { latestTurnEnding, resetTimeText, turnEndingBandText, turnEndingText } from "./turnEnding";
 import type { TurnEnding } from "./types";
 
 const e = (kind: TurnEnding["kind"], over: Partial<TurnEnding> = {}) => ({ kind, reason: null, apiErrorStatus: null, message: null, ...over });
@@ -79,5 +79,45 @@ describe("latestTurnEnding", () => {
     expect(latestTurnEnding({ turnEndings, lastTurnEnding: "interrupted" })).toEqual(turnEndings[1]);
     expect(latestTurnEnding({ turnEndings, lastTurnEnding: null })).toBeNull();
     expect(latestTurnEnding({ turnEndings: [], lastTurnEnding: null })).toBeNull();
+  });
+});
+
+describe("a Codex turn ending", () => {
+  it("usage limit ending shows the reset time", () => {
+    // 2030-03-20 12:34:56 UTC; the wording is local time, so the test builds the same text.
+    const resetsAt = Date.UTC(2030, 2, 20, 12, 34, 56) / 1000;
+    const at = new Date(resetsAt * 1000);
+    const time = at.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+    const ending = e("limit_reached", { reason: "usage_limit", message: "You've hit your usage limit." });
+    const text = turnEndingText(ending, resetsAt);
+    expect(text).toMatch(/^stopped at the usage limit \(resets .*\d\d:\d\d\): You've hit your usage limit\.$/);
+    expect(text).toContain(time);
+    // A reset on another day names the day.
+    expect(text).toMatch(/resets \w{3} \d{1,2} \w{3} \d\d:\d\d/);
+    expect(turnEndingBandText(ending)).toBe("limit reached");
+  });
+
+  it("a usage limit with no known reset time says only that", () => {
+    const ending = e("limit_reached", { reason: "usage_limit" });
+    expect(turnEndingText(ending)).toBe("stopped at the usage limit");
+    expect(turnEndingText(ending, null)).toBe("stopped at the usage limit");
+  });
+
+  it("today's reset names the time alone", () => {
+    const now = new Date(2026, 9, 20, 9, 0, 0);
+    const soon = new Date(2026, 9, 20, 14, 5, 0).getTime() / 1000;
+    expect(resetTimeText(soon, now)).toBe("14:05");
+  });
+
+  it("a full context, a spending limit and a rate limit have their own words", () => {
+    const full = e("limit_reached", { reason: "context_window_exceeded", message: "Codex's context is full" });
+    expect(turnEndingText(full)).toBe("stopped: the context is full: Codex's context is full");
+    expect(turnEndingBandText(full)).toBe("context full");
+    const budget = e("limit_reached", { reason: "session_budget" });
+    expect(turnEndingText(budget)).toBe("stopped at the spending limit");
+    expect(turnEndingBandText(budget)).toBe("spending limit");
+    const rate = e("limit_reached", { reason: "rate_limited" });
+    expect(turnEndingText(rate)).toBe("rate limited");
+    expect(turnEndingBandText(rate)).toBe("rate limited");
   });
 });

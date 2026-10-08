@@ -4,9 +4,13 @@
 //! that cannot be used moved whole to `<name>.json.unusable` and read as nothing. Never inside the
 //! project.
 //!
-//! **What is listed:** only tabs that have a Claude session (an empty tab has nothing to bring
-//! back), in tab-bar order, each with the rename it carries and the permission mode it was in, and
-//! the index of the tab that was active. Two windows on one project each write their own set and the
+//! **What is listed:** only tabs that have a session (an empty tab has nothing to bring back), in
+//! tab-bar order, each with the rename it carries and the permission mode it was in, and the index of
+//! the tab that was active. Claude tabs are in `tabs`; a tab running another agent is in
+//! `external_tabs`, a separate array with the agent named, so that an older build -- which reads
+//! `tabs` only and ignores what it does not know -- never resumes another agent's session as a Claude
+//! one. Such a build drops the array on its next write, which loses only the offer to bring those
+//! tabs back. The format's version stays 1 for that reason. Two windows on one project each write their own set and the
 //! last writer wins; the session leases, not this file, are what stop two windows driving one
 //! session.
 //!
@@ -19,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent_backend::AgentId;
 use crate::agent_bridge::SessionModeChoice;
 use crate::layout::persist::{create_state_dir, file_name, state_subdir, temporary};
 
@@ -39,12 +44,36 @@ pub struct SavedTab {
     pub mode: SessionModeChoice,
 }
 
-/// The tabs of one window, in tab-bar order.
+/// One tab of an agent other than Claude worth bringing back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedExternalTab {
+    /// Which agent, as its records name it (`codex`, `acp:<name>`).
+    pub agent: AgentId,
+    pub conversation_id: String,
+    /// The agent's own id for the session (a Codex thread id): what its record and lease are keyed on.
+    pub provider_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub mode: SessionModeChoice,
+}
+
+/// The tabs of one window, in tab-bar order: the Claude tabs, then the other agents' tabs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SavedTabs {
     pub tabs: Vec<SavedTab>,
-    /// Index into `tabs` of the tab that was on screen.
+    /// Index into `tabs` of the tab that was on screen, or of the first Claude tab when the tab on
+    /// screen was another agent's (what an older build, which reads only `tabs`, falls back to).
     pub active: usize,
+    pub external_tabs: Vec<SavedExternalTab>,
+    /// Index into `external_tabs` when the tab on screen was another agent's.
+    pub active_external: Option<usize>,
+}
+
+impl SavedTabs {
+    /// No tab of either kind.
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty() && self.external_tabs.is_empty()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,6 +82,21 @@ struct TabsFile {
     project_root: String,
     tabs: Vec<SavedTab>,
     active: usize,
+    /// Absent from a file with no such tab, so the file of a window that ran only Claude is what it
+    /// always was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    external_tabs: Vec<ExternalEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_external: Option<usize>,
+}
+
+/// One entry of `external_tabs` as read: an agent this build does not know (a later build's) is kept
+/// out of the restore without making the whole file unusable, which would lose the Claude tabs too.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum ExternalEntry {
+    Known(SavedExternalTab),
+    Unknown(serde_json::Value),
 }
 
 /// `<state home>/eitri/tabs`, by the same rule as the layout directory.
@@ -67,6 +111,8 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
         project_root: project_root.to_string_lossy().into_owned(),
         tabs: saved.tabs.clone(),
         active: saved.active,
+        external_tabs: saved.external_tabs.iter().cloned().map(ExternalEntry::Known).collect(),
+        active_external: saved.active_external,
     };
     serde_json::to_string_pretty(&file).expect("saved tabs always serialize")
 }
@@ -96,7 +142,41 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
         .take()
         .and_then(|id| kept.iter().position(|t| t.provider_session_id == id))
         .unwrap_or(0);
-    Ok(SavedTabs { tabs: kept, active })
+    // The same rules for the other agents' tabs, a session being one agent's id of it.
+    let read: Vec<Option<SavedExternalTab>> = file
+        .external_tabs
+        .into_iter()
+        .map(|entry| match entry {
+            ExternalEntry::Known(tab) => Some(tab),
+            ExternalEntry::Unknown(_) => None,
+        })
+        .collect();
+    let active_external_id = file
+        .active_external
+        .and_then(|i| read.get(i))
+        .and_then(Option::as_ref)
+        .map(|t| (t.agent.clone(), t.provider_session_id.clone()));
+    let mut external: Vec<SavedExternalTab> = Vec::new();
+    for tab in read.into_iter().flatten() {
+        let usable = !tab.provider_session_id.trim().is_empty() && !tab.conversation_id.trim().is_empty();
+        let listed = external
+            .iter()
+            .any(|k| k.agent == tab.agent && k.provider_session_id == tab.provider_session_id);
+        if usable && !listed && tab.agent.is_external() {
+            external.push(tab);
+        }
+    }
+    let active_external = active_external_id.and_then(|(agent, id)| {
+        external
+            .iter()
+            .position(|t| t.agent == agent && t.provider_session_id == id)
+    });
+    Ok(SavedTabs {
+        tabs: kept,
+        active,
+        external_tabs: external,
+        active_external,
+    })
 }
 
 /// What [`load`] found.
@@ -151,7 +231,7 @@ pub fn set_aside(dir: &Path, project_root: &Path) -> std::io::Result<PathBuf> {
 pub fn startup(dir: Option<&Path>, project_root: &Path) -> (Option<SavedTabs>, Vec<String>) {
     let Some(dir) = dir else { return (None, Vec::new()) };
     match load(dir, project_root) {
-        Loaded::Saved(saved) if saved.tabs.is_empty() => (None, Vec::new()),
+        Loaded::Saved(saved) if saved.is_empty() => (None, Vec::new()),
         Loaded::Saved(saved) => (Some(saved), Vec::new()),
         Loaded::Missing => (None, Vec::new()),
         Loaded::Unusable(why) => {
@@ -258,6 +338,7 @@ mod tests {
                 tab("s-two", None, SessionModeChoice::Bypass),
             ],
             active: 1,
+            ..SavedTabs::default()
         }
     }
 
@@ -419,6 +500,7 @@ mod tests {
         let first = SavedTabs {
             tabs: vec![tab("s-one", None, SessionModeChoice::Auto)],
             active: 0,
+            ..SavedTabs::default()
         };
         assert!(matches!(memory.observe(Some(first.clone())), Some(Ok(_))));
         assert_eq!(load(&dir, &root()), Loaded::Saved(first.clone()));
@@ -516,5 +598,110 @@ mod tests {
         let aside = written.set_aside.expect("the bad file was set aside");
         assert_eq!(std::fs::read_to_string(aside).unwrap(), "typo");
         assert_eq!(load(&dir, &root()), Loaded::Saved(two()));
+    }
+
+    fn codex(session: &str, mode: SessionModeChoice) -> SavedExternalTab {
+        SavedExternalTab {
+            agent: AgentId::Codex,
+            conversation_id: "0123456789abcdef0123456789abcdef".to_string(),
+            provider_session_id: session.to_string(),
+            name: Some("refactor".to_string()),
+            mode,
+        }
+    }
+
+    #[test]
+    fn external_tabs_round_trip_and_old_files_load() {
+        let mut saved = two();
+        saved.external_tabs = vec![
+            codex("thread-a", SessionModeChoice::Bypass),
+            SavedExternalTab {
+                agent: AgentId::Acp("gemini".into()),
+                name: None,
+                ..codex("session-b", SessionModeChoice::Auto)
+            },
+        ];
+        saved.active_external = Some(1);
+        let text = encode(&saved, &root());
+        assert!(text.contains("\"external_tabs\""), "{text}");
+        assert!(
+            text.contains("\"agent\": \"codex\"") && text.contains("\"agent\": \"acp:gemini\""),
+            "{text}"
+        );
+        assert!(text.contains("\"version\": 1"), "the version stays 1: {text}");
+        assert_eq!(decode(&text, &root()), Ok(saved));
+
+        // A window that ran only Claude writes exactly what it always wrote.
+        let only_claude = encode(&two(), &root());
+        assert!(!only_claude.contains("external"), "{only_claude}");
+        // And a file written before external tabs existed loads with none.
+        let old = r#"{"version":1,"project_root":"/home/user/project","tabs":[
+            {"conversation_id":"c","provider_session_id":"s-one","mode":"auto"}],"active":0}"#;
+        let loaded = decode(old, &root()).unwrap();
+        assert_eq!(loaded.tabs.len(), 1);
+        assert!(loaded.external_tabs.is_empty() && loaded.active_external.is_none());
+
+        // An entry for Claude, an unknown agent or a session listed twice is never kept as another
+        // agent's tab; an agent this build does not know is left out and the rest of the file kept.
+        let mut twice = two();
+        twice.external_tabs = vec![
+            codex("thread-a", SessionModeChoice::Auto),
+            codex("thread-a", SessionModeChoice::Bypass),
+        ];
+        twice.active_external = Some(1);
+        let kept = decode(&encode(&twice, &root()), &root()).unwrap();
+        assert_eq!(kept.external_tabs, vec![codex("thread-a", SessionModeChoice::Auto)]);
+        assert_eq!(
+            kept.active_external,
+            Some(0),
+            "the active entry keeps pointing at its session"
+        );
+        let claude_as_external = encode(&twice, &root()).replace("\"agent\": \"codex\"", "\"agent\": \"claude\"");
+        assert!(decode(&claude_as_external, &root()).unwrap().external_tabs.is_empty());
+        let unknown = encode(&twice, &root()).replacen("\"agent\": \"codex\"", "\"agent\": \"openai\"", 1);
+        let read = decode(&unknown, &root()).expect("the rest of the file is still usable");
+        assert_eq!(read.tabs, two().tabs);
+        assert_eq!(read.external_tabs, vec![codex("thread-a", SessionModeChoice::Bypass)]);
+        assert_eq!(read.active_external, Some(0));
+
+        // A file that holds only another agent's tabs is still something to offer at launch.
+        let dir = ScratchDir::new("nv-saved-tabs", "external-only");
+        let only_external = SavedTabs {
+            external_tabs: vec![codex("thread-a", SessionModeChoice::Auto)],
+            active_external: Some(0),
+            ..SavedTabs::default()
+        };
+        save(&dir, &root(), &only_external).unwrap();
+        assert_eq!(startup(Some(&dir), &root()).0, Some(only_external));
+    }
+
+    /// What an Eitri from before external tabs reads: its own `TabsFile`, copied here as it was.
+    #[derive(Deserialize)]
+    struct OlderTabsFile {
+        version: u32,
+        project_root: String,
+        tabs: Vec<SavedTab>,
+        active: usize,
+    }
+
+    #[test]
+    fn an_older_reader_ignores_external_tabs() {
+        let mut saved = two();
+        saved.external_tabs = vec![codex("thread-a", SessionModeChoice::Bypass)];
+        saved.active_external = Some(0);
+        let text = encode(&saved, &root());
+        let older: OlderTabsFile = serde_json::from_str(&text).expect("an older build reads the file");
+        assert_eq!(older.version, VERSION);
+        assert_eq!(older.project_root, root().to_string_lossy());
+        assert_eq!(
+            older.tabs,
+            two().tabs,
+            "only the Claude tabs, so no Codex thread resumes as Claude"
+        );
+        assert_eq!(
+            older.active,
+            two().active,
+            "and a Claude tab to fall back to as the active one"
+        );
     }
 }

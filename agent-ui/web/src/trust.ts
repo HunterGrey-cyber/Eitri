@@ -3,7 +3,7 @@ import type { KeyLike } from "./keymap";
 import { bypassYesCounts } from "./modeKey";
 import type { TabId } from "./types";
 
-/** One thing the project's own Claude configuration would run or load, as Rust found it. Every string is
+/** One thing the project's own configuration for the tab's agent would run or load, as Rust found it. Every string is
  *  text to draw as a text node: a hook command or a file name is attacker-controlled. */
 export type TrustItem = {
   /** `hook`, `mcp_server`, `symlink`, `unreadable`, ... -- the kind Rust grouped it under. */
@@ -29,6 +29,9 @@ export type TrustPromptEnvelope = {
   kind: "trust_prompt";
   tab: TabId;
   nonce: number;
+  /** Whose configuration the question is about, as a person reads it: `Claude`, `Codex`, or a registered
+   *  agent's own name. */
+  agent: string;
   root: string;
   top: string;
   fingerprint: string;
@@ -144,8 +147,15 @@ export function scrollTarget(
   return Math.min(max, Math.max(0, wanted));
 }
 
-/** What the `:` line does with its text: the exact words only, so `:trust x` and `:trusted` stay a refusal. */
-export function parseTrustCommand(line: string): "trust" | "untrust" | null {
-  const word = line.trim();
-  return word === "trust" || word === "untrust" ? word : null;
+/** An ex command the `:` line runs. `tabnew` carries the agent word typed after it, `null` for none. */
+export type ExCommand = { command: "trust" | "untrust" } | { command: "tabnew"; agent: string | null };
+
+/** What the `:` line does with its text: the exact words only, so `:trust x` and `:trusted` stay a
+ *  refusal. `:tabnew` takes at most one word, which is not checked here (`TABNEW_AGENTS` says which are
+ *  accepted). */
+export function parseExCommand(line: string): ExCommand | null {
+  const [head, argument, ...rest] = line.trim().split(/\s+/);
+  if (head === "trust" || head === "untrust") return argument === undefined ? { command: head } : null;
+  if (head === "tabnew" && rest.length === 0) return { command: "tabnew", agent: argument ?? null };
+  return null;
 }

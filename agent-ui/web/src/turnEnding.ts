@@ -4,8 +4,12 @@ type Wording = Pick<TurnEnding, "kind" | "reason" | "apiErrorStatus" | "message"
 
 /** Terminal reasons Claude Code itself counts as the context being full (its own classifier calls all three
  *  `context_limit`): the conversation no longer fits, and waiting changes nothing. Verdandi reports the first
- *  and the last as a limit and `prompt_too_long` as a failure, so they are worded by reason, not by kind. */
-const CONTEXT_FULL = new Set(["blocking_limit", "prompt_too_long", "rapid_refill_breaker"]);
+ *  and the last as a limit and `prompt_too_long` as a failure, so they are worded by reason, not by kind.
+ *  `context_window_exceeded` is Codex's word for the same thing. */
+const CONTEXT_FULL = new Set(["blocking_limit", "prompt_too_long", "rapid_refill_breaker", "context_window_exceeded"]);
+
+/** Terminal reasons for a spending limit: Claude Code's budget, and a Codex session's. */
+const SPENDING_LIMIT = new Set(["budget_exhausted", "session_budget"]);
 
 /** Terminal reasons for a turn a hook stopped -- a pause, not an error, in Claude Code's own terms. */
 const HOOK_STOPPED = new Set(["hook_stopped", "stop_hook_prevented"]);
@@ -14,10 +18,21 @@ const HOOK_STOPPED = new Set(["hook_stopped", "stop_hook_prevented"]);
  *  as a failure, so a turn that ended for one of these is said to have stopped, not to have failed. */
 const NOT_AN_ERROR = new Set(["tool_deferred", "background_requested", "max_turns", "completed", "aborted_streaming", "aborted_tools"]);
 
+/** When a usage window resets, as a person reads it: the time alone for today, with the day otherwise. `resetsAt`
+ *  is Unix seconds, as the agent reported it. */
+export function resetTimeText(resetsAt: number, now: Date = new Date()): string {
+  const at = new Date(resetsAt * 1000);
+  const time = at.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  if (at.toDateString() === now.toDateString()) return time;
+  return `${at.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })} ${time}`;
+}
+
 /** The row's one line, in plain words, for a turn that did not complete. The provider's own message follows
  *  after a colon when it said anything; it is shown as it came (Rust already trimmed and capped it), and
- *  nothing here reads a reset time out of it -- if the CLI wrote one into its text, it is in the text. */
-export function turnEndingText(ending: Wording): string {
+ *  nothing here reads a reset time out of it -- if the CLI wrote one into its text, it is in the text.
+ *  `resetsAt` is the reset time of the account's latest limit report, when the agent gave one (Codex does,
+ *  Claude Code does not): a turn stopped by the usage limit says when it ends. */
+export function turnEndingText(ending: Wording, resetsAt: number | null = null): string {
   const message = ending.message !== null && ending.message !== "" ? `: ${ending.message}` : "";
   const reason = ending.reason ?? "";
   switch (ending.kind) {
@@ -33,7 +48,12 @@ export function turnEndingText(ending: Wording): string {
   if (HOOK_STOPPED.has(reason)) return `stopped by a hook${message}`;
   if (ending.kind === "limit_reached") {
     if (reason === "max_turns") return `stopped at the turn limit${message}`;
-    if (reason === "budget_exhausted") return `stopped at the spending limit${message}`;
+    if (SPENDING_LIMIT.has(reason)) return `stopped at the spending limit${message}`;
+    if (reason === "usage_limit") {
+      const when = resetsAt !== null && Number.isFinite(resetsAt) ? ` (resets ${resetTimeText(resetsAt)})` : "";
+      return `stopped at the usage limit${when}${message}`;
+    }
+    if (reason === "rate_limited") return `rate limited${message}`;
     return `stopped at a limit${reason !== "" ? ` (${reason})` : ""}${message}`;
   }
   // A 429 is where a usage or rate limit shows up: Verdandi reports it as an API error with that status.
@@ -62,7 +82,8 @@ export function turnEndingBandText(ending: Wording): string {
   if (HOOK_STOPPED.has(reason)) return "stopped by a hook";
   if (ending.kind === "limit_reached") {
     if (reason === "max_turns") return "turn limit";
-    if (reason === "budget_exhausted") return "spending limit";
+    if (SPENDING_LIMIT.has(reason)) return "spending limit";
+    if (reason === "rate_limited") return "rate limited";
     return "limit reached";
   }
   if (ending.apiErrorStatus === 429) return "rate limited";

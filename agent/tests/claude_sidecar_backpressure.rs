@@ -89,6 +89,8 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::UngatedCliMode { .. } => "UngatedCliMode",
             AgentDomainEvent::CliPermissionMode { .. } => "CliPermissionMode",
             AgentDomainEvent::PermissionDenied { .. } => "PermissionDenied",
+            AgentDomainEvent::PolicyMismatch { .. } => "PolicyMismatch",
+            AgentDomainEvent::AccountLimits { .. } => "AccountLimits",
         };
         *counts.entry(kind).or_default() += 1;
     }

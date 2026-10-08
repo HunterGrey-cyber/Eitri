@@ -620,7 +620,7 @@ fn a_running_turn_in_this_window_refuses_before_asking_the_editor() {
 #[test]
 fn a_revert_for_a_tab_closed_meanwhile_is_refused() {
     let (mut f, n) = changed_once("tab-closed");
-    let spare = f.tabs.open();
+    let spare = f.tabs.open(eitri_core::tab_set::AgentId::Claude);
     let editor = FakeEditor::holding();
     let outs = f.handle(editor.rpc(), revert_file("r1", f.tab, n, "a.txt"));
     assert!(outs.is_empty());
@@ -890,7 +890,7 @@ fn a_comment_is_quoted_from_the_end_snapshot_and_can_be_removed() {
 #[test]
 fn a_comment_whose_tab_closed_while_it_was_quoted_is_refused() {
     let (mut f, n) = changed_once("comment-closed");
-    let _spare = f.tabs.open();
+    let _spare = f.tabs.open(eitri_core::tab_set::AgentId::Claude);
     let mut outs = f.handle(None, comment("c1", f.tab, n, "a.txt", "hello"));
     let mut closed = f.tabs.remove(f.tab).unwrap();
     if let TabBackend::Live(backend) = &mut closed.backend {
@@ -1951,7 +1951,7 @@ fn an_editor_revert_records_the_files_own_bytes() {
 fn an_editor_revert_for_a_closed_tab_is_dropped() {
     let (mut f, n) = changed_once("editor-closed");
     embedded(&mut f);
-    let spare = f.tabs.open();
+    let spare = f.tabs.open(eitri_core::tab_set::AgentId::Claude);
     let editor = ScriptedEditor::new();
     f.run(editor.rpc(), "o1", open_in_editor("o1", f.tab, n, "a.txt"));
     editor.queue_event(revert_event(&f, n, "a.txt", 1, 2, "two", "TWO", "lf"));

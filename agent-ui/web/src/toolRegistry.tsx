@@ -1,8 +1,11 @@
 import { memo } from "react";
 import type { ReactNode } from "react";
 import type { ToolCallDenial, ToolCallRecord } from "./types";
-import { editPreview } from "./diff";
+import { codexChangePreview, editPreview, lineDiff } from "./diff";
 import { EditDiff } from "./components/EditDiff";
+import { Revealed } from "./components/Revealed";
+import { subagentOf } from "./externalTools";
+import { revealHidden } from "./revealHidden";
 import { useProjectRelative } from "./projectPath";
 
 export type ToolRenderConfig = {
@@ -209,6 +212,116 @@ function editConfig(label: string, toolName: string, pathField = "file_path"): T
   };
 }
 
+/** A string field of a tool input, or `""`. */
+function textField(input: unknown, key: string): string {
+  if (input && typeof input === "object") {
+    const value = (input as Record<string, unknown>)[key];
+    if (typeof value === "string") return value;
+  }
+  return "";
+}
+
+/** Text another agent wrote, as a person would read it: hidden and direction-changing characters are drawn as
+ *  escapes, the same as on the card that asked about it. */
+function Shown({ text }: { text: string }) {
+  return <Revealed pieces={revealHidden(text)} />;
+}
+
+/** Codex's `commandExecution`: the exact command, shell wrapper included, like a `Bash` row. */
+const codexCommand: ToolRenderConfig = {
+  label: "Run command",
+  renderInvocation: (input) => (
+    <pre className="tool-card tool-card-bash">
+      $ <Shown text={textField(input, "command") || (JSON.stringify(input) ?? "")} />
+    </pre>
+  ),
+};
+
+/** Codex's `fileChange`: each path with its diff, folded to a path and counts like `Edit` until the row is
+ *  expanded. */
+const codexFileChange: ToolRenderConfig = {
+  label: "Change files",
+  previewSuccess: false,
+  renderInvocation: (input, { expanded }) => {
+    const changes =
+      input && typeof input === "object" && Array.isArray((input as { changes?: unknown }).changes)
+        ? ((input as { changes: Array<{ path: string; kind: string; diff: string }> }).changes)
+        : [];
+    if (changes.length === 0) return <div className="tool-card">Change files: {summarizeInput(input)}</div>;
+    return (
+      <>
+        {changes.map((change, i) => (
+          <EditDiff key={i} preview={codexChangePreview(change)} maxLines={expanded ? undefined : 0} />
+        ))}
+      </>
+    );
+  },
+};
+
+const codexMcp: ToolRenderConfig = {
+  label: "Tool call",
+  renderInvocation: (input) => {
+    const args = input && typeof input === "object" ? (input as Record<string, unknown>).arguments : undefined;
+    return (
+      <div className="tool-card">
+        <Shown text={`${textField(input, "server")} · ${textField(input, "tool")}`} />{" "}
+        <Shown text={cut(JSON.stringify(args ?? null) ?? "")} />
+      </div>
+    );
+  },
+};
+
+const codexWebSearch: ToolRenderConfig = {
+  label: "Web search",
+  renderInvocation: (input) => (
+    <div className="tool-card">
+      Search: <Shown text={textField(input, "query") || summarizeInput(input)} />
+    </div>
+  ),
+};
+
+const codexSubagentCall: ToolRenderConfig = {
+  label: "Subagent",
+  renderInvocation: (input) => (
+    <div className="tool-card">
+      Subagent {textField(input, "tool")}: <Shown text={cut(textField(input, "prompt"))} />
+    </div>
+  ),
+};
+
+/** An ACP agent's call, named `acp:<kind>`: the title the agent gave it, and a diff for each file it changes. */
+function acpConfig(name: string): ToolRenderConfig {
+  const kind = name.slice("acp:".length);
+  return {
+    label: kind,
+    renderInvocation: (input, { expanded }) => {
+      const title = textField(input, "title");
+      const diffs =
+        input && typeof input === "object" && Array.isArray((input as { diffs?: unknown }).diffs)
+          ? ((input as { diffs: Array<{ path: string; oldText?: string | null; newText?: string }> }).diffs)
+          : [];
+      return (
+        <>
+          <div className="tool-card">
+            {kind}: <Shown text={title || summarizeInput(input)} />
+          </div>
+          {diffs.map((diff, i) => {
+            const shown = lineDiff(diff.oldText ?? "", diff.newText ?? "");
+            const count = (k: "added" | "removed") => shown?.filter((l) => l.kind === k).length ?? 0;
+            return (
+              <EditDiff
+                key={i}
+                maxLines={expanded ? undefined : 0}
+                preview={{ filePath: diff.path, diff: shown, added: count("added"), removed: count("removed"), replaceAll: false, wholeFile: false }}
+              />
+            );
+          })}
+        </>
+      );
+    },
+  };
+}
+
 /** The tools Claude Code 2.1.27x actually offers, matching `agent/src/permission_policy.rs`'s own
  *  `TOOLS_OFFERED_BY_CLI_2_1_272` (`toolRegistry.test.tsx` reads that file as text and checks every
  *  name here). `Grep`/`Glob`/`WebFetch`/`WebSearch` predate that list and are kept for a build that
@@ -282,6 +395,12 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
   SendMessage: oneLine("SendMessage"),
   TaskOutput: oneLine("TaskOutput"),
   TaskStop: oneLine("TaskStop"),
+  // Another agent's calls: Codex's item types, which its provider names its tool calls by.
+  commandExecution: codexCommand,
+  fileChange: codexFileChange,
+  mcpToolCall: codexMcp,
+  webSearch: codexWebSearch,
+  collabAgentToolCall: codexSubagentCall,
 };
 
 /** Looks a tool up without consulting `Object.prototype`.
@@ -292,6 +411,7 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
  * mid-render, and `App.tsx` has no error boundary, so the whole panel would unmount. Tool names
  * arrive off the provider wire and an MCP server may name its tools anything it likes. */
 export function lookupTool(name: string): ToolRenderConfig | undefined {
+  if (name.startsWith("acp:")) return acpConfig(name);
   return Object.prototype.hasOwnProperty.call(TOOL_REGISTRY, name) ? TOOL_REGISTRY[name] : undefined;
 }
 
@@ -508,8 +628,14 @@ export function renderToolCall(
   // the kind of refusal only when it was not the classifier's (a settings deny rule, the mode).
   const deniedNote = call.denied === undefined ? null : <div className="tool-rule-note tool-denied-note">{deniedNoteText(call.denied)}</div>;
   const shown = call.result === null || showResult || opts.detailed === true;
+  const subagent = subagentOf(call.name, call.input);
   return (
     <div className="tool-call" data-tool-name={call.name} data-folded={shown ? undefined : "true"}>
+      {subagent !== null && (
+        <div className="tool-rule-note tool-subagent-note">
+          subagent <Shown text={subagent} />
+        </div>
+      )}
       {invocation}
       {ruleNote}
       {autoNote}

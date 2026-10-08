@@ -1,0 +1,9 @@
+
+# What a user's own file could say to widen what a session may do. The check starts Codex with this
+# and expects the session's own configuration to win over every line of it.
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["@EXTRA@"]
+
+[features]
+exec_permission_approvals = true

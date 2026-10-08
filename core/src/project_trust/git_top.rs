@@ -36,6 +36,15 @@ pub struct GitWalk {
     /// as the git top level can be. Always `None` when `top` is found, since everything this walk
     /// could not accept lies below that.
     pub unverified_top: Option<PathBuf>,
+    /// When `top` is a linked worktree, the main checkout: the directory holding the `.git` that is the
+    /// worktree's common directory. Codex reads a linked worktree's hooks from there. `None` for a
+    /// plain checkout, and for a common directory not named `.git` (see `unplaced_common`).
+    pub main_checkout: Option<PathBuf>,
+    /// When `top` is a linked worktree whose common directory is not named `.git` (a repository made
+    /// with a separate git directory, or a bare one), that common directory. Codex still finds a main
+    /// checkout for such a worktree (the work tree a separate git directory belongs to) and reads its
+    /// hooks there, by rules this walk does not repeat, so where that checkout is stays unknown here.
+    pub unplaced_common: Option<PathBuf>,
     /// Only `Finding::GitUnverified`, with absolute paths.
     pub findings: Vec<Finding>,
     pub over_budget: Option<String>,
@@ -54,9 +63,17 @@ pub fn git_top_level(root: &Path, stop_at: Option<&Path>, max_walk_up: usize) ->
             break;
         }
         let reported = walk.findings.len();
-        if accepts(dir, &mut walk.findings) {
+        let mut linked_common = None;
+        if accepts(dir, &mut walk.findings, &mut linked_common) {
             walk.top = Some(dir.to_path_buf());
             walk.unverified_top = None;
+            if let Some(common) = linked_common {
+                if common.file_name() == Some(OsStr::new(".git")) {
+                    walk.main_checkout = common.parent().map(Path::to_path_buf);
+                } else {
+                    walk.unplaced_common = Some(common);
+                }
+            }
             return walk;
         }
         if walk.findings.len() > reported {
@@ -102,8 +119,9 @@ fn trim_line_ends(bytes: &[u8]) -> &[u8] {
 }
 
 /// Whether `dir/.git` is a repository git would accept. Everything it could not accept, or could not
-/// check without following a link, is a finding.
-fn accepts(dir: &Path, findings: &mut Vec<Finding>) -> bool {
+/// check without following a link, is a finding. On acceptance of a linked worktree, `linked_common`
+/// is set to the common directory its `commondir` names.
+fn accepts(dir: &Path, findings: &mut Vec<Finding>, linked_common_out: &mut Option<PathBuf>) -> bool {
     let dot_git_path = dir.join(".git");
     let handle = match DirHandle::open_absolute(dir) {
         Ok(handle) => handle,
@@ -183,10 +201,11 @@ fn accepts(dir: &Path, findings: &mut Vec<Finding>) -> bool {
     if !head_names_a_ref_or_an_object(&git_dir, &git_dir_path, findings) {
         return false;
     }
-    let Some(common) = common_dir(git_dir, &git_dir_path, findings) else {
+    let Some((common, linked_common)) = common_dir(git_dir, &git_dir_path, findings) else {
         return false;
     };
     if common.searchable(OsStr::new("objects")) && common.searchable(OsStr::new("refs")) {
+        *linked_common_out = linked_common;
         true
     } else {
         unverified(
@@ -263,12 +282,16 @@ fn head_names_a_ref_or_an_object(git_dir: &DirHandle, git_dir_path: &Path, findi
 }
 
 /// The common directory: the git directory itself without a `commondir`, else the directory that
-/// file names (relative to the git directory), opened component by component.
-fn common_dir(git_dir: DirHandle, git_dir_path: &Path, findings: &mut Vec<Finding>) -> Option<DirHandle> {
+/// file names (relative to the git directory), opened component by component, with its path.
+fn common_dir(
+    git_dir: DirHandle,
+    git_dir_path: &Path,
+    findings: &mut Vec<Finding>,
+) -> Option<(DirHandle, Option<PathBuf>)> {
     let commondir = OsStr::new("commondir");
     let commondir_path = git_dir_path.join("commondir");
     match git_dir.lstat(commondir) {
-        Err(Refusal::Missing) => return Some(git_dir),
+        Err(Refusal::Missing) => return Some((git_dir, None)),
         Err(refusal) => {
             let (reason, target) = refused(refusal);
             unverified(findings, commondir_path, reason, target);
@@ -309,7 +332,7 @@ fn common_dir(git_dir: DirHandle, git_dir_path: &Path, findings: &mut Vec<Findin
         return None;
     };
     match DirHandle::open_absolute(&common_path) {
-        Ok(common) => Some(common),
+        Ok(common) => Some((common, Some(common_path))),
         Err(refusal) => {
             let (reason, _) = refused(refusal);
             unverified(

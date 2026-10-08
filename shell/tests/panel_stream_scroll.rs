@@ -2659,6 +2659,7 @@ fn sole_tab_envelope(sole_tab: eitri_core::tabs::TabId) -> String {
         resumable: false,
         failure: None,
         title: None,
+        agent: "claude".into(),
     }];
     serialize_tabs_for_js(sole_tab, &tabs, SessionModeChoice::Auto)
 }

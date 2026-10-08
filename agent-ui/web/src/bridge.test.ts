@@ -254,7 +254,7 @@ describe("installDispatch", () => {
   describe("the trust question", () => {
     const HEX = "a1".repeat(32);
     const prompt = (over: Record<string, unknown> = {}) => ({
-      kind: "trust_prompt", tab: 3, nonce: 17, root: "/p/src", top: "/p", fingerprint: HEX, findingsDigest: HEX,
+      kind: "trust_prompt", tab: 3, nonce: 17, agent: "Claude", root: "/p/src", top: "/p", fingerprint: HEX, findingsDigest: HEX,
       state: "untrusted", remember: "yes", rememberNote: null, changed: null, items: [], ...over,
     });
     const dispatched = (envelope: Record<string, unknown>) => {
@@ -292,6 +292,12 @@ describe("installDispatch", () => {
       }
     });
 
+    it("rejects a trust_prompt that names no agent", () => {
+      for (const agent of [undefined, "", 1, null]) {
+        expect(dispatched(prompt({ agent })).handler, String(agent)).not.toHaveBeenCalled();
+      }
+    });
+
     it("rejects a trust_prompt whose remember is not yes, window or session", () => {
       for (const remember of [undefined, "no", "Yes", "forever", 1]) {
         expect(dispatched(prompt({ remember })).handler, String(remember)).not.toHaveBeenCalled();
@@ -307,7 +313,7 @@ describe("installDispatch", () => {
       const sent: OutboundMessage[] = [
         { type: "trust_answer", request_id: "r1", tab: 3, nonce: 17, fingerprint: HEX, findings_digest: HEX, trust: true },
         { type: "trust_cancel", request_id: "r2", tab: 3, nonce: 17 },
-        { type: "trust_command", request_id: "r3", action: "untrust" },
+        { type: "trust_command", request_id: "r3", action: "untrust", agent: "codex" },
       ];
       expect(sent.map((m) => m.type)).toEqual(["trust_answer", "trust_cancel", "trust_command"]);
     });

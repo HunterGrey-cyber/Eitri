@@ -132,6 +132,8 @@ pub struct ResumeOutcomeRecord {
 
 /// Immutable facts the ingestion thread needs in order to adopt a provider session when one appears.
 struct AdoptionContext {
+    /// The name the lease and the record are keyed by (`ExternalProvider::name()`, or `claude`).
+    provider_name: &'static str,
     conversation_id: String,
     canonical_cwd: String,
     provider_advertises_resume: bool,
@@ -269,6 +271,7 @@ impl ConversationIngest {
     /// of a gRPC round trip, quietly recreating the coupling this module exists to break.
     pub(crate) fn start(
         provider: Arc<dyn crate::provider::AgentProvider + Send + Sync>,
+        provider_name: &'static str,
         conversation_id: String,
         canonical_cwd: String,
         provider_advertises_resume: bool,
@@ -303,6 +306,7 @@ impl ConversationIngest {
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let context = AdoptionContext {
+            provider_name,
             conversation_id,
             canonical_cwd,
             provider_advertises_resume,
@@ -575,11 +579,7 @@ fn adopt_provider_session(
     title: Option<&str>,
     name: Option<Option<String>>,
 ) -> Option<SessionLease> {
-    let lease = match SessionLease::try_acquire(
-        crate::conversation::PROVIDER_NAME,
-        &context.canonical_cwd,
-        provider_session_id,
-    ) {
+    let lease = match SessionLease::try_acquire(context.provider_name, &context.canonical_cwd, provider_session_id) {
         Ok(lease) => Some(lease),
         Err(e @ crate::lease::LeaseError::AlreadyHeld) => {
             eprintln!(
@@ -599,6 +599,7 @@ fn adopt_provider_session(
         }
     };
     crate::conversation::persist_record(
+        context.provider_name,
         &context.conversation_id,
         &context.canonical_cwd,
         provider_session_id,
@@ -630,6 +631,7 @@ pub(crate) mod tests {
 
     fn adoption_context(conversation_id: &str) -> AdoptionContext {
         AdoptionContext {
+            provider_name: crate::conversation::PROVIDER_NAME,
             conversation_id: conversation_id.to_string(),
             canonical_cwd: "/tmp/ws".to_string(),
             provider_advertises_resume: true,

@@ -1,0 +1,5 @@
+model_reasoning_effort = "minimal"
+
+[mcp_servers.eitri_check_tool_server]
+command = "/bin/sh"
+args = ["@MARKER_SH@", "@MARKERS@/tool-server"]

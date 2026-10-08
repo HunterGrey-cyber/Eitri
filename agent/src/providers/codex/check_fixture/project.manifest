@@ -1,0 +1,6 @@
+# Where each file of the fixture project goes (relative to its root), and which template it is written from.
+.codex/config.toml	project_config.toml
+.codex/hooks.json	project_hooks.json
+.codex/rules/default.rules	project_rules.rules
+AGENTS.md	project_agents.md
+.agents/skills/eitri-check-skill/SKILL.md	project_skill.md

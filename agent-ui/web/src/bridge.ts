@@ -63,8 +63,9 @@ export type OutboundMessage =
    *  prefix's own tmux window keys run. Window-level, like the prefix's own `tab_verb` -- whichever
    *  tab is under the keys decides, so this carries no `tab` of its own (Rust's `InboundMessage::
    *  TabVerb` has none either); sent through `postToRust` directly rather than `post()`, which would
-   *  add one. `TabVerbWire`'s wire spelling, `core/src/agent_bridge.rs`. */
-  | { type: "tab_verb"; request_id: string; verb: "next" | "prev" | "last" | "new" | "close" | "close_others" | "choose" | "info" }
+   *  add one. `TabVerbWire`'s wire spelling, `core/src/agent_bridge.rs`. `agent` is read by `new`
+   *  alone: the word `:tabnew` was typed with (none: the window's default agent). */
+  | { type: "tab_verb"; request_id: string; verb: "next" | "prev" | "last" | "new" | "close" | "close_others" | "choose" | "info"; agent?: string }
   /** `y` to a `confirm_close_others` prompt is window-level, like `TabVerb`.
    *  Rust recomputes every tab except the active one when answering, so this carries no tab list.
    *  Maps to `InboundMessage::CloseOthers` in `core/src/agent_bridge.rs`. */
@@ -93,8 +94,10 @@ export type OutboundMessage =
    *  `InboundMessage::TrustCancel`, `core/src/agent_bridge.rs`. */
   | { type: "trust_cancel"; request_id: string; tab: TabId; nonce: number }
   /** `:trust` or `:untrust` on the command line. Window-level: the trust belongs to the window's project, not to
-   *  a tab. `InboundMessage::TrustCommand`, `core/src/agent_bridge.rs`. */
-  | { type: "trust_command"; request_id: string; action: "trust" | "untrust" }
+   *  a tab. `agent` is the agent of the tab on screen (`TabInfo.agent`): each agent's trust is its own, and Rust
+   *  refuses a command typed for another agent than the active tab runs. `InboundMessage::TrustCommand`,
+   *  `core/src/agent_bridge.rs`. */
+  | { type: "trust_command"; request_id: string; action: "trust" | "untrust"; agent: string }
   /** Mirror the window's effective mode whenever it changes and once after `ready`. Rust keeps one
    *  value per window because `install_module_nav`, which reads it, is installed once per window.
    *  The empty tab's menu and composer also count as browse and input. Use other for states that
@@ -287,8 +290,8 @@ type InboundHandler = (
      *  `n` brings the bypass tabs back in auto. `nonce` is echoed back on either answer, as
      *  `confirm_bypass`'s is. `serialize_confirm_restore_for_js`, `core/src/agent_bridge.rs`. */
     | { kind: "confirm_restore"; nonce: number; lines: string[] }
-    /** The question before a session loads this project's own Claude configuration, with what it would load.
-     *  Tab-scoped. A second one for the same tab replaces the first. `serialize_trust_prompt_for_js`,
+    /** The question before a session loads this project's own configuration for the tab's agent, with what it
+     *  would load. Tab-scoped. A second one for the same tab replaces the first. `serialize_trust_prompt_for_js`,
      *  `core/src/agent_bridge.rs`. */
     | TrustPromptEnvelope
     /** This tab's queue and the refusal reason if its last flush was refused. */
@@ -344,6 +347,8 @@ function isWellFormedTrustPrompt(value: unknown): boolean {
   return (
     typeof o.tab === "number" &&
     typeof o.nonce === "number" &&
+    typeof o.agent === "string" &&
+    o.agent !== "" &&
     isHex64(o.fingerprint) &&
     isHex64(o.findingsDigest) &&
     isTrustRemember(o.remember) &&

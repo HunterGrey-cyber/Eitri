@@ -176,3 +176,44 @@ export function editPreview(toolName: string, input: unknown): EditPreview | nul
 
   return null;
 }
+
+/** The most lines a Codex change is drawn with. Codex's own diffs are not limited the way a card's `Edit` is,
+ *  and a diff missing lines is one a person would approve anyway, so a larger one is counted and not shown. */
+const MAX_CODEX_DIFF_LINES = 2 * MAX_DIFF_LINES;
+
+/** A Codex `fileChange` entry as a reviewable preview. Codex sends a unified diff for an `update` (its hunk
+ *  headers are drawn as context lines) and the whole content for an `add` or a `delete`; a kind this build
+ *  does not know is drawn as the unified diff it most likely is. Nothing is matched against the disk. */
+export function codexChangePreview(change: { path: string; kind: string; diff: string }): EditPreview {
+  const raw = lines(change.diff);
+  let diff: DiffLine[];
+  if (change.kind === "add") diff = raw.map((text) => ({ kind: "added", text }));
+  else if (change.kind === "delete") diff = raw.map((text) => ({ kind: "removed", text }));
+  else {
+    diff = [];
+    // Without any hunk header the text is taken as the hunk's lines.
+    let inHunk = !raw.some((text) => text.startsWith("@@"));
+    for (const text of raw) {
+      if (text.startsWith("@@")) {
+        inHunk = true;
+        diff.push({ kind: "context", text });
+      } else if (!inHunk) {
+        // A file header before the first hunk says which file it is, which the card's path already does.
+        continue;
+      } else if (text.startsWith("+")) diff.push({ kind: "added", text: text.slice(1) });
+      else if (text.startsWith("-")) diff.push({ kind: "removed", text: text.slice(1) });
+      else if (text.startsWith("\\")) continue;
+      else diff.push({ kind: "context", text: text.startsWith(" ") ? text.slice(1) : text });
+    }
+  }
+  const added = diff.filter((l) => l.kind === "added").length;
+  const removed = diff.filter((l) => l.kind === "removed").length;
+  return {
+    filePath: change.path,
+    diff: diff.length > MAX_CODEX_DIFF_LINES ? null : diff,
+    added,
+    removed,
+    replaceAll: false,
+    wholeFile: false,
+  };
+}

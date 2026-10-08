@@ -527,6 +527,7 @@ fn turn_completed_clears_active_turn_id_and_updates_usage_for_every_outcome() {
     ] {
         // Every field set, so a projection that kept only the cost would fail here too.
         let reported = UsageInfo {
+            cost_reported: true,
             total_cost_usd: 0.01,
             num_turns: Some(1),
             tokens: Some(TokenUsage {
@@ -585,6 +586,7 @@ fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
     );
 
     let real = UsageInfo {
+        cost_reported: true,
         total_cost_usd: 0.25,
         num_turns: Some(2),
         ..Default::default()
@@ -621,6 +623,7 @@ fn a_later_report_replaces_usage_whole_even_when_it_is_lower() {
         result_text: String::new(),
         stop_reason: None,
         usage: Some(UsageInfo {
+            cost_reported: true,
             total_cost_usd: cost,
             ..Default::default()
         }),
@@ -646,6 +649,7 @@ fn usage_serializes_with_tokens_and_a_model_for_the_sidecar_and_a_turn_count_for
         detail: Default::default(),
     };
     let sidecar = serde_json::to_value(event(UsageInfo {
+        cost_reported: true,
         total_cost_usd: 0.42,
         num_turns: None,
         tokens: Some(TokenUsage {
@@ -667,6 +671,7 @@ fn usage_serializes_with_tokens_and_a_model_for_the_sidecar_and_a_turn_count_for
         })
     );
     let legacy = serde_json::to_value(event(UsageInfo {
+        cost_reported: true,
         total_cost_usd: 0.01,
         num_turns: Some(3),
         tokens: None,
@@ -1190,6 +1195,7 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             result_text: "Done.".into(),
             stop_reason: None,
             usage: Some(UsageInfo {
+                cost_reported: true,
                 total_cost_usd: 0.01,
                 num_turns: Some(1),
                 tokens: None,
@@ -1230,6 +1236,16 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             reason_type: Some("classifier".into()),
             reason: Some("[Git Destructive]".into()),
         },
+        AgentDomainEvent::PolicyMismatch {
+            requested: "on-request".into(),
+            reported: "never".into(),
+        },
+        AgentDomainEvent::AccountLimits {
+            used_percent: 42.5,
+            window_minutes: Some(300),
+            resets_at: Some(1_790_000_000),
+            plan: Some("pro".into()),
+        },
     ]
 }
 
@@ -1263,5 +1279,81 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::UngatedCliMode { .. } => "UngatedCliMode",
         AgentDomainEvent::CliPermissionMode { .. } => "CliPermissionMode",
         AgentDomainEvent::PermissionDenied { .. } => "PermissionDenied",
+        AgentDomainEvent::PolicyMismatch { .. } => "PolicyMismatch",
+        AgentDomainEvent::AccountLimits { .. } => "AccountLimits",
     }
+}
+
+#[test]
+fn policy_mismatch_folds_into_the_projection() {
+    let mut projection = AgentSessionProjection::default();
+    let before = projection.last_revision;
+    projection.apply(&AgentDomainEvent::PolicyMismatch {
+        requested: "on-request".into(),
+        reported: "never".into(),
+    });
+    projection.apply(&AgentDomainEvent::PolicyMismatch {
+        requested: "workspaceWrite".into(),
+        reported: "dangerFullAccess".into(),
+    });
+    // The first report wins, as the CLI-mode tripwire's does.
+    assert_eq!(
+        projection.policy_mismatch,
+        Some(("on-request".to_string(), "never".to_string()))
+    );
+    // Folding it moves nothing a view draws.
+    assert_eq!(projection.status, ProjectionStatus::default());
+    assert_eq!(projection.last_revision, before + 2);
+}
+
+#[test]
+fn account_limits_fold_and_the_latest_report_wins() {
+    let mut projection = AgentSessionProjection::default();
+    assert!(projection.account_limits.is_none());
+    projection.apply(&AgentDomainEvent::AccountLimits {
+        used_percent: 10.0,
+        window_minutes: Some(300),
+        resets_at: Some(1_790_000_000),
+        plan: Some("pro".into()),
+    });
+    projection.apply(&AgentDomainEvent::AccountLimits {
+        used_percent: 12.5,
+        window_minutes: None,
+        resets_at: None,
+        plan: None,
+    });
+    let limits = projection.account_limits.expect("a report was folded");
+    assert_eq!(limits.used_percent, 12.5);
+    assert_eq!(limits.window_minutes, None);
+    assert_eq!(limits.plan, None);
+}
+
+#[test]
+fn cost_unreported_round_trips_and_defaults_true_for_old_json() {
+    let unreported = UsageInfo {
+        total_cost_usd: 0.0,
+        cost_reported: false,
+        num_turns: None,
+        tokens: None,
+        model: Some("gpt-x".into()),
+    };
+    let json = serde_json::to_string(&unreported).unwrap();
+    assert!(json.contains("\"cost_reported\":false"), "{json}");
+    let back: UsageInfo = serde_json::from_str(&json).unwrap();
+    assert!(!back.cost_reported);
+    assert_eq!(back, unreported);
+
+    // A report of a cost reads exactly as it did before the flag existed: nothing extra on the wire.
+    let reported = UsageInfo {
+        total_cost_usd: 0.42,
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&reported).unwrap();
+    assert!(json.get("cost_reported").is_none(), "{json}");
+
+    // JSON written before the flag existed has no such key, and it means the cost was reported.
+    let old: UsageInfo =
+        serde_json::from_str(r#"{"total_cost_usd":1.5,"num_turns":3,"tokens":null,"model":null}"#).unwrap();
+    assert!(old.cost_reported);
+    assert_eq!(old.total_cost_usd, 1.5);
 }

@@ -1,0 +1,4 @@
+
+[hooks.state."@KEY@"]
+trusted_hash = "@HASH@"
+enabled = true

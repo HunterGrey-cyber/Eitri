@@ -1,8 +1,11 @@
 //! Who changed what: the files a turn's own edit calls named, set against the files that differ on
 //! disk.
 //!
-//! A file is "named" when one of the tab's `Write`, `Edit`, `MultiEdit` or `NotebookEdit` calls in
-//! the turn targets it and finished without an error. Naming is all the transcript can say: it
+//! A file is "named" when one of the tab's own file-changing calls in the turn targets it and
+//! finished without an error: Claude's `Write`, `Edit`, `MultiEdit` and `NotebookEdit`, Codex's
+//! applied `fileChange` items (the tab's own and its subagents'), and an ACP agent's finished
+//! `acp:edit`, `acp:delete` and `acp:move` calls. Commands name nothing, whichever agent ran them,
+//! so what a shell changes stays `workspace`. Naming is all the transcript can say: it
 //! cannot tell whether someone else also touched the file afterwards, so the review never claims
 //! the agent changed anything -- it shows what changed on disk, and these signs say which of those
 //! files the agent's own calls named.
@@ -66,33 +69,80 @@ impl Origin {
     }
 }
 
-/// The edit calls of the turns `turn_ids` among `tool_calls`: the paths of those that finished
-/// without an error (`input.file_path`, or `input.notebook_path` for a notebook), and how many
-/// have no result yet.
+/// The file-changing calls of the turns `turn_ids` among `tool_calls`: the paths of those that finished
+/// without an error, and how many have no result yet. What a call names depends on its tool: Claude's
+/// tools carry `input.file_path` (`input.notebook_path` for a notebook), Codex's `fileChange` carries
+/// `changes[].path` and `movePath`, an ACP edit carries `diffs[].path` and `locations[].path`.
 pub fn named_paths(tool_calls: &[agent::ToolCallRecord], turn_ids: &[&str]) -> NamedPaths {
     let mut named = NamedPaths::default();
     for call in tool_calls {
-        if !CHANGING_TOOLS.contains(&call.name.as_str()) || !turn_ids.contains(&call.turn_id.as_str()) {
+        if !turn_ids.contains(&call.turn_id.as_str()) {
             continue;
         }
+        let kind = match call_kind(&call.name) {
+            Some(kind) => kind,
+            None => continue,
+        };
         match &call.result {
             None => named.pending_no_result += 1,
             Some(result) if result.is_error => {}
-            Some(_) => {
-                let key = if call.name == "NotebookEdit" {
-                    "notebook_path"
-                } else {
-                    "file_path"
-                };
-                if let Some(path) = call.input.get(key).and_then(|v| v.as_str()) {
-                    if !path.is_empty() {
-                        named.paths.insert(PathBuf::from(path));
+            // Codex words a finished `fileChange` by its status; only an applied one changed anything.
+            Some(result) if kind == Kind::CodexFileChange && !is_applied(&result.content) => {}
+            Some(_) => kind.collect(&call.input, &mut named.paths),
+        }
+    }
+    named
+}
+
+/// How a changing call spells the files it targets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    ClaudeFile,
+    ClaudeNotebook,
+    CodexFileChange,
+    AcpEdit,
+}
+
+fn call_kind(name: &str) -> Option<Kind> {
+    match name {
+        "NotebookEdit" => Some(Kind::ClaudeNotebook),
+        n if CHANGING_TOOLS.contains(&n) => Some(Kind::ClaudeFile),
+        "fileChange" => Some(Kind::CodexFileChange),
+        "acp:edit" | "acp:delete" | "acp:move" => Some(Kind::AcpEdit),
+        _ => None,
+    }
+}
+
+fn is_applied(content: &serde_json::Value) -> bool {
+    content.as_str() == Some(agent::providers::codex::translate::FILE_CHANGE_APPLIED)
+}
+
+impl Kind {
+    fn collect(self, input: &serde_json::Value, paths: &mut BTreeSet<PathBuf>) {
+        let mut add = |value: Option<&serde_json::Value>| {
+            if let Some(path) = value.and_then(|v| v.as_str()).filter(|p| !p.is_empty()) {
+                paths.insert(PathBuf::from(path));
+            }
+        };
+        let entries = |key: &str| input.get(key).and_then(|v| v.as_array()).into_iter().flatten();
+        match self {
+            Kind::ClaudeFile => add(input.get("file_path")),
+            Kind::ClaudeNotebook => add(input.get("notebook_path")),
+            Kind::CodexFileChange => {
+                for change in entries("changes") {
+                    add(change.get("path"));
+                    add(change.get("movePath"));
+                }
+            }
+            Kind::AcpEdit => {
+                for key in ["diffs", "locations"] {
+                    for entry in entries(key) {
+                        add(entry.get("path"));
                     }
                 }
             }
         }
     }
-    named
 }
 
 /// The sign of `path` (relative to the project root): whether the turn's calls named it, against
@@ -248,5 +298,142 @@ mod tests {
         let relative = named.relative_to(Path::new("/p"));
         let expected: BTreeSet<PathBuf> = ["src/a.rs", "b.rs", "c.rs"].into_iter().map(PathBuf::from).collect();
         assert_eq!(relative.paths, expected);
+    }
+
+    fn call_with(
+        turn: &str,
+        name: &str,
+        input: serde_json::Value,
+        content: serde_json::Value,
+        is_error: bool,
+    ) -> ToolCallRecord {
+        let mut c = call(turn, name, input, Some(is_error));
+        c.result = Some(ToolCallResult { content, is_error });
+        c
+    }
+
+    fn set(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn codex_file_change_is_agent() {
+        let calls = vec![call_with(
+            "t1",
+            "fileChange",
+            json!({ "changes": [
+                { "path": "/p/a.rs", "kind": "update", "diff": "" },
+                { "path": "/p/old.rs", "kind": "update", "diff": "", "movePath": "/p/new.rs" },
+                { "path": "", "kind": "add", "diff": "" },
+            ]}),
+            json!("applied"),
+            false,
+        )];
+        let named = named_paths(&calls, &["t1"]);
+        assert_eq!(named.paths, set(&["/p/a.rs", "/p/old.rs", "/p/new.rs"]));
+        assert_eq!(
+            origin(Path::new("a.rs"), &named.relative_to(Path::new("/p")), true),
+            Some(Origin::Agent)
+        );
+    }
+
+    #[test]
+    fn declined_or_failed_file_change_names_nothing() {
+        let input = json!({ "changes": [{ "path": "/p/a.rs", "kind": "add", "diff": "" }] });
+        let calls = vec![
+            call_with("t1", "fileChange", input.clone(), json!("declined"), true),
+            call_with("t1", "fileChange", input.clone(), json!("failed"), true),
+            call_with("t1", "fileChange", input.clone(), json!("in progress"), false),
+        ];
+        assert!(named_paths(&calls, &["t1"]).paths.is_empty());
+        // One with no result yet may still write, and is counted like Claude's.
+        let pending = vec![call("t1", "fileChange", input, None)];
+        assert_eq!(named_paths(&pending, &["t1"]).pending_no_result, 1);
+    }
+
+    #[test]
+    fn child_file_change_is_agent() {
+        let calls = vec![call_with(
+            "t1",
+            "fileChange",
+            json!({ "subagent": "worker", "changes": [{ "path": "/p/child.rs", "kind": "add", "diff": "" }] }),
+            json!("applied"),
+            false,
+        )];
+        assert_eq!(named_paths(&calls, &["t1"]).paths, set(&["/p/child.rs"]));
+    }
+
+    #[test]
+    fn acp_edit_locations_are_agent() {
+        let calls = vec![
+            call_with(
+                "t1",
+                "acp:edit",
+                json!({ "title": "edit", "locations": [{ "path": "/p/loc.rs", "line": 3 }], "diffs": [{ "path": "/p/diff.rs" }] }),
+                json!("done"),
+                false,
+            ),
+            call_with(
+                "t1",
+                "acp:delete",
+                json!({ "locations": [{ "path": "/p/gone.rs" }] }),
+                json!("done"),
+                false,
+            ),
+            call_with(
+                "t1",
+                "acp:move",
+                json!({ "diffs": [{ "path": "/p/moved.rs" }] }),
+                json!("done"),
+                false,
+            ),
+            call_with(
+                "t1",
+                "acp:edit",
+                json!({ "locations": [{ "path": "/p/failed.rs" }] }),
+                json!("boom"),
+                true,
+            ),
+        ];
+        assert_eq!(
+            named_paths(&calls, &["t1"]).paths,
+            set(&["/p/loc.rs", "/p/diff.rs", "/p/gone.rs", "/p/moved.rs"])
+        );
+    }
+
+    #[test]
+    fn commands_stay_workspace() {
+        let calls = vec![
+            call_with(
+                "t1",
+                "commandExecution",
+                json!({ "command": "touch /p/x.rs", "cwd": "/p" }),
+                json!(""),
+                false,
+            ),
+            call_with(
+                "t1",
+                "acp:execute",
+                json!({ "locations": [{ "path": "/p/y.rs" }] }),
+                json!("ok"),
+                false,
+            ),
+        ];
+        let named = named_paths(&calls, &["t1"]);
+        assert!(named.paths.is_empty());
+        assert_eq!(named.pending_no_result, 0);
+        assert_eq!(origin(Path::new("x.rs"), &named, true), Some(Origin::Workspace));
+    }
+
+    #[test]
+    fn claude_attribution_unchanged() {
+        // A Claude call that happens to carry another agent's keys names only its own.
+        let calls = vec![call(
+            "t1",
+            "Write",
+            json!({ "file_path": "/p/a.rs", "changes": [{ "path": "/p/no.rs" }] }),
+            Some(false),
+        )];
+        assert_eq!(named_paths(&calls, &["t1"]).paths, set(&["/p/a.rs"]));
     }
 }

@@ -47,6 +47,7 @@
       "snapshot": {
         "kind": "snapshot",
         "state": {
+          "accountLimits": null,
           "activeTurnId": null,
           "assistantMessageOpen": false,
           "backend": "sidecar",
@@ -145,6 +146,7 @@
       "snapshot": {
         "kind": "snapshot",
         "state": {
+          "accountLimits": null,
           "activeTurnId": null,
           "assistantMessageOpen": false,
           "backend": "sidecar",
@@ -243,6 +245,7 @@
       "snapshot": {
         "kind": "snapshot",
         "state": {
+          "accountLimits": null,
           "activeTurnId": null,
           "assistantMessageOpen": false,
           "backend": "sidecar",
@@ -341,6 +344,7 @@
       "snapshot": {
         "kind": "snapshot",
         "state": {
+          "accountLimits": null,
           "activeTurnId": null,
           "assistantMessageOpen": false,
           "backend": "sidecar",
@@ -439,6 +443,7 @@
       "snapshot": {
         "kind": "snapshot",
         "state": {
+          "accountLimits": null,
           "activeTurnId": null,
           "assistantMessageOpen": false,
           "backend": "sidecar",
@@ -537,6 +542,7 @@
       "snapshot": {
         "kind": "snapshot",
         "state": {
+          "accountLimits": null,
           "activeTurnId": null,
           "assistantMessageOpen": false,
           "backend": "sidecar",
@@ -639,6 +645,7 @@
       "snapshot": {
         "kind": "snapshot",
         "state": {
+          "accountLimits": null,
           "activeTurnId": null,
           "assistantMessageOpen": false,
           "backend": "sidecar",
@@ -729,6 +736,7 @@
       "snapshot": {
         "kind": "snapshot",
         "state": {
+          "accountLimits": null,
           "activeTurnId": null,
           "assistantMessageOpen": false,
           "backend": "sidecar",

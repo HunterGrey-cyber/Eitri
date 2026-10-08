@@ -127,6 +127,8 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::CliPermissionMode { .. } => false,
         // The CLI refused a call: the row's note says why, and the user may want to act on it.
         AgentDomainEvent::PermissionDenied { .. } => false,
+        // A tripwire and a limit change state the user may act on, so neither waits for a slot.
+        AgentDomainEvent::PolicyMismatch { .. } | AgentDomainEvent::AccountLimits { .. } => false,
     }
 }
 
@@ -288,6 +290,24 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_tripwire_and_a_limit_change_are_never_plain_stream_content() {
+        let mismatch = AgentDomainEvent::PolicyMismatch {
+            requested: "on-request".to_string(),
+            reported: "never".to_string(),
+        };
+        let limits = AgentDomainEvent::AccountLimits {
+            used_percent: 50.0,
+            window_minutes: None,
+            resets_at: None,
+            plan: None,
+        };
+        assert!(!is_plain_stream_content(&mismatch));
+        assert!(!is_plain_stream_content(&limits));
+        assert_eq!(classify_events(&[mismatch], false), EnvelopeClass::Immediate);
+        assert_eq!(classify_events(&[limits], false), EnvelopeClass::Immediate);
     }
 
     // ---- the config key ------------------------------------------------------------------

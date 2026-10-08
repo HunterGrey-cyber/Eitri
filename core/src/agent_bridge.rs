@@ -357,6 +357,10 @@ pub enum InboundMessage {
     TabVerb {
         request_id: String,
         verb: TabVerbWire,
+        /// Only `new` reads it: the agent word `:tabnew <agent>` typed. Absent is the new-tab key's own
+        /// tab, which runs the window's default agent.
+        #[serde(default)]
+        agent: Option<String>,
     },
     /// `Shift+Tab` on the chooser's `New session` row or a record: the same auto/bypass
     /// TOGGLE as `CycleMode`, applied to `TabSet::default_mode` (the window's remembered default for
@@ -445,10 +449,13 @@ pub enum InboundMessage {
         tab: u64,
         nonce: u64,
     },
-    /// `:trust` / `:untrust`. Window-level: the root is the window's, not a tab's.
+    /// `:trust` / `:untrust`. Window-level: the root is the window's, not a tab's. `agent` is the
+    /// agent of the tab on screen when it was typed (`TabView::agent`): the trust it changes is that
+    /// agent's, and one typed for another agent than the active tab now runs is refused.
     TrustCommand {
         request_id: String,
         action: TrustAction,
+        agent: String,
     },
 }
 
@@ -1411,7 +1418,10 @@ impl<'a> SnapshotView<'a> {
     /// transcript entries remain visible.
     pub fn of(backend: &'a crate::agent_backend::AgentBackend, hidden: &'a BTreeSet<String>) -> Self {
         Self {
-            backend: backend.kind().as_str(),
+            // An external agent runs on neither Claude backend.
+            backend: backend
+                .kind()
+                .map_or("external", crate::agent_backend::BackendKind::as_str),
             conversation_id: backend.conversation_id(),
             session_id: backend.session_id(),
             provider_session_id: backend.provider_session_id(),
@@ -1663,6 +1673,14 @@ pub fn serialize_snapshot_with_notes_for_js(
         // event carries -- the one place in `state` that is not camelCase, so the panel folds a
         // live report and a snapshot's copy with one type (`types.ts`'s `UsageInfo`).
         "usage": projection.usage,
+        // The account's usage limit as the agent last reported it, `null` before any report. Account-wide,
+        // but the snapshot is the only way a reloaded panel learns it before the next report.
+        "accountLimits": projection.account_limits.as_ref().map(|limits| json!({
+            "usedPercent": limits.used_percent,
+            "windowMinutes": limits.window_minutes,
+            "resetsAt": limits.resets_at,
+            "plan": limits.plan,
+        })),
         "capabilities": {
             "resume": capabilities.resume,
             "fork": capabilities.fork,
@@ -1782,6 +1800,9 @@ pub struct TrustItemView {
 pub struct TrustPromptView {
     pub tab: crate::tabs::TabId,
     pub nonce: u64,
+    /// Whose configuration the question is about, as a person reads it: `Claude`, `Codex`, or a
+    /// registered agent's own name.
+    pub agent: String,
     pub root: String,
     pub top: String,
     /// The shown discovery's fingerprint, in hex.
@@ -1797,6 +1818,7 @@ pub struct TrustPromptView {
 /// serialization order, so it is part of what the digest means.
 #[derive(Serialize)]
 struct TrustShown<'a> {
+    agent: &'a str,
     root: &'a str,
     top: &'a str,
     fingerprint: &'a str,
@@ -1821,6 +1843,7 @@ fn trust_value_as_shown(value: &str) -> String {
 impl TrustPromptView {
     fn shown(&self) -> TrustShown<'_> {
         TrustShown {
+            agent: &self.agent,
             root: &self.root,
             top: &self.top,
             fingerprint: &self.fingerprint,
@@ -1844,7 +1867,7 @@ impl TrustPromptView {
         }
     }
 
-    /// The sha256 (64 hex) of the compact JSON of everything the page shows -- `root`, `top`,
+    /// The sha256 (64 hex) of the compact JSON of everything the page shows -- `agent`, `root`, `top`,
     /// `fingerprint`, `state`, `remember`, `rememberNote`, `changed`, `items`, in that order, with each
     /// value cut as it is shown -- and not `tab` or `nonce`. An answer echoing it is an answer about
     /// this text, not only about the bytes on disk.
@@ -1856,9 +1879,10 @@ impl TrustPromptView {
     }
 }
 
-/// `{"kind":"trust_prompt","tab":...,"nonce":...,"root":...,"top":...,"fingerprint":...,
+/// `{"kind":"trust_prompt","tab":...,"nonce":...,"agent":...,"root":...,"top":...,"fingerprint":...,
 /// "findingsDigest":...,"state":...,"remember":...,"rememberNote":...,"changed":...,"items":[...]}` --
-/// the question a tab waits on before its session may load the project's own Claude configuration.
+/// the question a tab waits on before its session may load the project's own configuration for
+/// `agent` (Claude's, Codex's, a registered agent's).
 /// Values are sent raw (serde escapes them); the page reveals hidden characters. `tab` names the tab
 /// it is about; the panel drops it unless that tab is active.
 pub fn serialize_trust_prompt_for_js(view: &TrustPromptView) -> String {
@@ -1867,6 +1891,7 @@ pub fn serialize_trust_prompt_for_js(view: &TrustPromptView) -> String {
         "kind": "trust_prompt",
         "tab": view.tab.0,
         "nonce": view.nonce,
+        "agent": shown.agent,
         "root": shown.root,
         "top": shown.top,
         "fingerprint": shown.fingerprint,
@@ -1923,6 +1948,8 @@ pub struct TabView {
     /// The first prompt's title or the resumed record's display title; `null` before one exists.
     /// Filled from `Tab.title` in `Tab::view`.
     pub title: Option<String>,
+    /// The agent the tab runs, as records name it: `claude`, `codex`, `acp:<name>`.
+    pub agent: String,
 }
 
 /// `{"kind":"tabs",...}` carries every tab and the active id. Sent on `ready` and when tabs
@@ -1946,6 +1973,7 @@ pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView], defau
                 "resumable": t.resumable,
                 "failure": t.failure,
                 "title": t.title,
+                "agent": t.agent,
             })
         })
         .collect();
@@ -2264,6 +2292,18 @@ mod tests {
         ));
         assert_eq!(m.tab_ref(), TabRef::WindowLevel);
         assert!(parse_inbound_message(r#"{"type":"tab_verb","request_id":"a","verb":"rename"}"#).is_none());
+        let named =
+            parse_inbound_message(r#"{"type":"tab_verb","request_id":"a","verb":"new","agent":"codex"}"#).unwrap();
+        assert!(matches!(
+            named,
+            InboundMessage::TabVerb {
+                verb: TabVerbWire::New,
+                agent: Some(ref agent),
+                ..
+            } if agent == "codex"
+        ));
+        let plain = parse_inbound_message(r#"{"type":"tab_verb","request_id":"a","verb":"new"}"#).unwrap();
+        assert!(matches!(plain, InboundMessage::TabVerb { agent: None, .. }));
         let c = parse_inbound_message(r#"{"type":"cycle_default_mode","request_id":"a"}"#).unwrap();
         assert_eq!(c.tab_ref(), TabRef::WindowLevel);
         let m = parse_inbound_message(r#"{"type":"tab_verb","request_id":"a","verb":"close_others"}"#).unwrap();
@@ -3615,6 +3655,261 @@ mod tests {
         }
     }
 
+    /// `agent-ui/web/src/fixtures/codex-cards.json`: what a Codex tab's permission cards, tool rows and
+    /// limit-stopped turn look like on the wire -- the events payload this side sends and the snapshot it
+    /// sends after folding the same events -- built from the provider's own card and tool-call
+    /// constructors, which the panel's tests render. Compared on every run; `EITRI_WRITE_FIXTURES=1`
+    /// rewrites it.
+    #[test]
+    fn the_codex_cards_fixture_is_what_the_serializer_sends() {
+        use agent::providers::codex::approvals::{CardKind, FileChangeEntry, Wording};
+        use agent::providers::codex::translate;
+        use agent::providers::codex::wire::{ThreadItem, TurnError, TurnStatus};
+        let card = |name: &str, kind: CardKind, subagent: Option<&str>| {
+            let mut input = kind.input();
+            if let (Some(label), Some(object)) = (subagent, input.as_object_mut()) {
+                object.insert("subagent".into(), json!(label));
+            }
+            (
+                name.to_string(),
+                vec![AgentDomainEvent::PermissionRequested {
+                    permission_id: format!("perm-{name}"),
+                    tool_use_id: Some(format!("item-{name}")),
+                    tool_name: kind.tool_name().to_string(),
+                    input,
+                    provider_prompt: None,
+                }],
+            )
+        };
+        let row = |item: serde_json::Value, subagent: Option<&str>| {
+            let item: ThreadItem = serde_json::from_value(item).expect("a thread item");
+            let (name, mut input) = translate::tool_start(&item).expect("a tool call");
+            if let (Some(label), Some(object)) = (subagent, input.as_object_mut()) {
+                object.insert("subagent".into(), json!(label));
+            }
+            let (content, is_error) = translate::tool_result(&item).expect("a result");
+            let id = item.id().expect("an id").to_string();
+            vec![
+                AgentDomainEvent::ToolCallStarted {
+                    turn_id: "t1".into(),
+                    tool_use_id: id.clone(),
+                    name: name.to_string(),
+                    input,
+                },
+                AgentDomainEvent::ToolCallCompleted {
+                    turn_id: "t1".into(),
+                    tool_use_id: id,
+                    content,
+                    is_error,
+                },
+            ]
+        };
+        let entry = |path: &str, kind: &str, diff: &str, move_path: Option<&str>| FileChangeEntry {
+            path: path.into(),
+            kind: kind.into(),
+            diff: diff.into(),
+            move_path: move_path.map(str::to_string),
+        };
+        let (limit_outcome, limit_detail) = translate::turn_ending(
+            &TurnStatus::Failed,
+            Some(
+                &serde_json::from_value::<TurnError>(json!({
+                    "message": "You've hit your usage limit.",
+                    "codexErrorInfo": "usageLimitExceeded",
+                }))
+                .unwrap(),
+            ),
+        );
+        let cases: Vec<(String, Vec<AgentDomainEvent>)> = vec![
+            card(
+                "command",
+                CardKind::Command {
+                    command: Some("/bin/bash -lc 'git push origin main'".into()),
+                    cwd: Some("/project".into()),
+                    escalation: Wording::OutsideSandbox,
+                    reason: Some("The push needs the network".into()),
+                },
+                None,
+            ),
+            card(
+                "hidden",
+                CardKind::Command {
+                    command: Some("/bin/bash -lc 'echo \u{202e}dcba'".into()),
+                    cwd: Some("/project".into()),
+                    escalation: Wording::OutsideSandbox,
+                    reason: None,
+                },
+                None,
+            ),
+            card(
+                "network",
+                CardKind::Command {
+                    command: None,
+                    cwd: None,
+                    escalation: Wording::Network {
+                        host: "registry.example.com".into(),
+                        protocol: "https".into(),
+                    },
+                    reason: None,
+                },
+                None,
+            ),
+            card(
+                "subagent",
+                CardKind::Command {
+                    command: Some("/bin/bash -lc 'cargo test'".into()),
+                    cwd: Some("/project".into()),
+                    escalation: Wording::OutsideSandbox,
+                    reason: None,
+                },
+                Some("/root/tests"),
+            ),
+            card(
+                "file_change",
+                CardKind::FileChange {
+                    changes: vec![
+                        entry("/project/new.txt", "add", "one\ntwo\n", None),
+                        entry(
+                            "/project/src/lib.rs",
+                            "update",
+                            "@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n",
+                            Some("/project/src/main.rs"),
+                        ),
+                    ],
+                    reason: Some("Rename b to c".into()),
+                },
+                None,
+            ),
+            card(
+                "mcp",
+                CardKind::Mcp {
+                    server: "docs".into(),
+                    tool: "lookup".into(),
+                    arguments: json!({"query": "tokio", "limit": 3}),
+                },
+                None,
+            ),
+            (
+                "rows".to_string(),
+                [
+                    row(
+                        json!({"type": "commandExecution", "id": "r1", "command": "/bin/bash -lc 'ls'", "cwd": "/project",
+                               "status": "completed", "aggregatedOutput": "Cargo.toml\n", "exitCode": 0}),
+                        None,
+                    ),
+                    row(
+                        json!({"type": "commandExecution", "id": "r2", "command": "/bin/bash -lc 'cargo build'",
+                               "cwd": "/project", "status": "completed", "aggregatedOutput": "ok\n", "exitCode": 0}),
+                        Some("/root/builder"),
+                    ),
+                    row(
+                        json!({"type": "fileChange", "id": "r3", "status": "completed", "changes": [
+                            {"path": "/project/a.txt", "kind": {"type": "add"}, "diff": "hello\n"}]}),
+                        None,
+                    ),
+                    row(
+                        json!({"type": "mcpToolCall", "id": "r4", "server": "docs", "tool": "lookup", "status": "completed",
+                               "arguments": {"query": "tokio"}, "result": {"content": []}}),
+                        None,
+                    ),
+                    row(json!({"type": "webSearch", "id": "r5", "query": "tokio runtime"}), None),
+                    row(
+                        json!({"type": "collabAgentToolCall", "id": "r6", "tool": "spawnAgent", "status": "completed",
+                               "receiverThreadIds": ["th-2"], "prompt": "Run the tests"}),
+                        None,
+                    ),
+                ]
+                .concat(),
+            ),
+            (
+                "usage_limit".to_string(),
+                vec![
+                    AgentDomainEvent::AccountLimits {
+                        used_percent: 100.0,
+                        window_minutes: Some(300),
+                        resets_at: Some(1_790_000_000),
+                        plan: Some("pro".into()),
+                    },
+                    AgentDomainEvent::TurnCompleted {
+                        turn_id: "t1".into(),
+                        outcome: limit_outcome,
+                        result_text: String::new(),
+                        stop_reason: None,
+                        usage: None,
+                        detail: limit_detail,
+                    },
+                ],
+            ),
+        ];
+
+        let mut written_cases = Vec::new();
+        for (name, tail) in cases {
+            let mut events = vec![
+                AgentDomainEvent::SessionOpened {
+                    session_id: "sess-1".into(),
+                    provider_session_id: "prov-1".into(),
+                    model: "gpt-5-codex".into(),
+                    cwd: "/project".into(),
+                },
+                AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+                AgentDomainEvent::UserPromptSubmitted {
+                    text: "fix the parser".into(),
+                },
+            ];
+            events.extend(tail);
+            let mut projection = AgentSessionProjection::default();
+            for event in &events {
+                projection.apply(event);
+            }
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: Some("sess-1"),
+                provider_session_id: Some("prov-1".into()),
+                capabilities: agent::ProviderCapabilities {
+                    resume: true,
+                    fork: false,
+                    interrupt: true,
+                    bypass_permission_mode: true,
+                    interactive_permission_mode: true,
+                    cli_auto_mode: false,
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
+            };
+            let events_payload = serialize_events_for_js(TabId(1), 0, projection.last_revision, &events);
+            let snapshot_payload = serialize_snapshot_for_js(TabId(1), &view, None);
+            written_cases.push(json!({
+                "name": name,
+                "events": serde_json::from_str::<Value>(&events_payload).unwrap(),
+                "snapshot": serde_json::from_str::<Value>(&snapshot_payload).unwrap(),
+            }));
+        }
+        let fixture = json!({
+            "writtenBy": "core/src/agent_bridge.rs, tests::the_codex_cards_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "cases": written_cases,
+        });
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/codex-cards.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the codex cards fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed codex cards fixture is not what this test produces; if the change is \
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
     /// a tab's last usage figure rides its snapshot, so a tab switch or a
     /// panel reload shows it at once instead of waiting for the next turn to report one. `null` --
     /// present as a key, never a zeroed object -- until a provider has reported something, and
@@ -3673,6 +3968,7 @@ mod tests {
 
         // The sidecar's shape: tokens and a model, no turn count.
         projection.apply(&completed(Some(agent::UsageInfo {
+            cost_reported: true,
             total_cost_usd: 0.42,
             num_turns: None,
             tokens: Some(agent::TokenUsage {
@@ -3700,6 +3996,7 @@ mod tests {
         // ...and one that does replaces it whole, a lower figure included (`/clear` resets the SDK's
         // running total). Legacy's shape: a turn count, no tokens and no model.
         projection.apply(&completed(Some(agent::UsageInfo {
+            cost_reported: true,
             total_cost_usd: 0.01,
             num_turns: Some(3),
             tokens: None,
@@ -3708,6 +4005,63 @@ mod tests {
         assert_eq!(
             usage_in_snapshot(&projection),
             json!({"total_cost_usd": 0.01, "num_turns": 3, "tokens": null, "model": null})
+        );
+    }
+
+    /// The account's usage limit rides the snapshot like the usage figure does, so a tab switch or a
+    /// panel reload shows it without waiting for the agent's next report. An explicit `null` until one
+    /// arrived; camelCase inside, unlike `usage`, because the panel folds it from a hand-shaped object.
+    #[test]
+    fn account_limits_reach_the_ui_snapshot() {
+        let limits_in_snapshot = |projection: &AgentSessionProjection| -> Value {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities {
+                    resume: false,
+                    fork: false,
+                    interrupt: true,
+                    bypass_permission_mode: true,
+                    interactive_permission_mode: true,
+                    cli_auto_mode: false,
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            assert!(
+                parsed["state"].as_object().unwrap().contains_key("accountLimits"),
+                "the key is always sent: `null` says no report yet"
+            );
+            parsed["state"]["accountLimits"].clone()
+        };
+        let mut projection = AgentSessionProjection::default();
+        assert_eq!(limits_in_snapshot(&projection), Value::Null);
+
+        projection.apply(&AgentDomainEvent::AccountLimits {
+            used_percent: 42.5,
+            window_minutes: Some(300),
+            resets_at: Some(1_790_000_000),
+            plan: Some("pro".into()),
+        });
+        assert_eq!(
+            limits_in_snapshot(&projection),
+            json!({"usedPercent": 42.5, "windowMinutes": 300, "resetsAt": 1_790_000_000i64, "plan": "pro"})
+        );
+
+        // The latest report replaces the whole figure; fields the agent left out are `null`, not kept.
+        projection.apply(&AgentDomainEvent::AccountLimits {
+            used_percent: 61.0,
+            window_minutes: None,
+            resets_at: None,
+            plan: None,
+        });
+        assert_eq!(
+            limits_in_snapshot(&projection),
+            json!({"usedPercent": 61.0, "windowMinutes": null, "resetsAt": null, "plan": null})
         );
     }
 
@@ -4791,6 +5145,7 @@ mod tests {
                 resumable: true,
                 failure: None,
                 title: Some("fix the parser".into()),
+                agent: "claude".into(),
             },
             TabView {
                 id: TabId(4),
@@ -4804,6 +5159,7 @@ mod tests {
                 resumable: false,
                 failure: Some("the gate refused".into()),
                 title: None,
+                agent: "codex".into(),
             },
         ];
         let value: serde_json::Value =
@@ -4816,9 +5172,10 @@ mod tests {
             serde_json::json!({
                 "id": 1, "number": 1, "label": "1 fix-parser", "name": "fix-parser", "state": "live",
                 "mode": "auto", "marker": "needs_input", "pending": 2, "resumable": true, "failure": null,
-                "title": "fix the parser"
+                "title": "fix the parser", "agent": "claude"
             })
         );
+        assert_eq!(value["tabs"][1]["agent"], "codex");
         assert_eq!(value["tabs"][1]["state"], "failed");
         assert_eq!(value["tabs"][1]["marker"], "ended");
         assert_eq!(value["tabs"][1]["name"], serde_json::Value::Null);
@@ -5195,17 +5552,24 @@ mod tests {
     #[test]
     fn trust_command_deserializes() {
         for (word, want) in [("trust", TrustAction::Trust), ("untrust", TrustAction::Untrust)] {
-            let line = format!(r#"{{"type":"trust_command","request_id":"r11","action":"{word}"}}"#);
+            let line = format!(r#"{{"type":"trust_command","request_id":"r11","action":"{word}","agent":"codex"}}"#);
             match parse_inbound_message(&line).unwrap() {
-                InboundMessage::TrustCommand { request_id, action } => {
+                InboundMessage::TrustCommand {
+                    request_id,
+                    action,
+                    agent,
+                } => {
                     assert_eq!(request_id, "r11");
                     assert_eq!(action, want);
+                    assert_eq!(agent, "codex");
                 }
                 other => panic!("expected TrustCommand, got {other:?}"),
             }
         }
         assert!(parse_inbound_message(r#"{"type":"trust_command","request_id":"r11","action":"always"}"#).is_none());
         assert!(parse_inbound_message(r#"{"type":"trust_command","request_id":"r11"}"#).is_none());
+        // Without the agent it was typed for, the command cannot be told from one for another tab.
+        assert!(parse_inbound_message(r#"{"type":"trust_command","request_id":"r11","action":"trust"}"#).is_none());
     }
 
     #[test]
@@ -5213,7 +5577,7 @@ mod tests {
         let lines = [
             TRUST_ANSWER,
             TRUST_CANCEL,
-            r#"{"type":"trust_command","request_id":"r11","action":"trust"}"#,
+            r#"{"type":"trust_command","request_id":"r11","action":"trust","agent":"claude"}"#,
         ];
         let ids: Vec<String> = lines
             .iter()
@@ -5249,7 +5613,7 @@ mod tests {
     #[test]
     fn trust_command_is_window_level() {
         for word in ["trust", "untrust"] {
-            let line = format!(r#"{{"type":"trust_command","request_id":"r11","action":"{word}"}}"#);
+            let line = format!(r#"{{"type":"trust_command","request_id":"r11","action":"{word}","agent":"claude"}}"#);
             assert!(matches!(
                 parse_inbound_message(&line).unwrap().tab_ref(),
                 TabRef::WindowLevel
@@ -5269,6 +5633,7 @@ mod tests {
         TrustPromptView {
             tab: TabId(3),
             nonce: 17,
+            agent: "Claude".into(),
             root: "/home/u/p/src".into(),
             top: "/home/u/p".into(),
             fingerprint: "f".repeat(64),
@@ -5314,6 +5679,7 @@ mod tests {
                 "kind": "trust_prompt",
                 "tab": 3,
                 "nonce": 17,
+                "agent": "Claude",
                 "root": "/home/u/p/src",
                 "top": "/home/u/p",
                 "fingerprint": "f".repeat(64),
@@ -5393,6 +5759,7 @@ mod tests {
 
         type Change = Box<dyn Fn(&mut TrustPromptView)>;
         let changes: Vec<(&str, Change)> = vec![
+            ("agent", Box::new(|v| v.agent = "Codex".into())),
             ("root", Box::new(|v| v.root.push('x'))),
             ("top", Box::new(|v| v.top.push('x'))),
             ("fingerprint", Box::new(|v| v.fingerprint = "e".repeat(64))),

@@ -269,15 +269,15 @@ fn the_permission_and_send_paths_never_read_review_state() {
         "answer_what_needs_no_human",
     );
     assert!(
-        !functions(&backend, "send_turn").is_empty(),
-        "AgentBackend::send_turn not found"
+        !functions(&backend, "send_turn").is_empty() && !functions(&backend, "send_turn_in").is_empty(),
+        "AgentBackend::send_turn or send_turn_in not found"
     );
 
     let tabs = read("src/tab_set.rs");
     for (name, anchor) in [
         ("answer_card", "respond_permission"),
         ("confirm_bypass", "approve_pending"),
-        ("flush_queue", "send_turn"),
+        ("flush_queue", "send_turn_in"),
         ("send_now", "interrupt"),
         ("queue_message", "queued_at_ms"),
     ] {
@@ -305,7 +305,7 @@ fn the_permission_and_send_paths_never_read_review_state() {
     check(
         "agent_panel's send_first_turn",
         &functions(&panel, "send_first_turn"),
-        "send_turn",
+        "send_turn_in",
     );
     for (variant, anchor) in [
         ("SendMessage", "note_sent"),
@@ -377,7 +377,7 @@ fn called(body: &str) -> std::collections::BTreeSet<String> {
 /// ordinary queue and flush: nothing else in the review code sends, queues or flushes a turn.
 #[test]
 fn only_the_confirmed_review_send_reaches_the_send_path() {
-    const SEND_PATH: [&str; 3] = ["send_turn", "queue_message", "flush_queue"];
+    const SEND_PATH: [&str; 4] = ["send_turn", "send_turn_in", "queue_message", "flush_queue"];
     // The confirmed send's function in `flow.rs`: where the review flow hands the confirmed text to
     // `TabSet::send_review`.
     const CONFIRMED_SEND: &str = "confirmed_send";

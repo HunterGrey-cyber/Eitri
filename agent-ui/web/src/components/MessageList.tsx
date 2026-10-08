@@ -289,6 +289,9 @@ export function MessageList({
      Memoising the timeline avoids rebuilding and sorting it on unrelated parent renders.
      This does not avoid `renderMarkdown` running over every transcript message on each render.
      Keep `timeline` above `onScroll` because its `updatePill` closure reads the same binding. */
+  // The account's reset time belongs to the latest limit report, so only the newest ending row may quote it;
+  // an older one would name a window that has since rolled over.
+  const lastEndingSeq = state.turnEndings[state.turnEndings.length - 1]?.seq ?? null;
   const timeline = useMemo(
     () => buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
     [state, expanded, detailed],
@@ -642,7 +645,7 @@ export function MessageList({
               const yanked = item.key === yankedKey ? "row-yanked" : undefined;
               return (
                 <Row key={item.key} kind="ending" sign="·" current={current} className={yanked} navStop="row">
-                  {turnEndingText(item.ending)}
+                  {turnEndingText(item.ending, item.ending.seq === lastEndingSeq ? (state.accountLimits?.resetsAt ?? null) : null)}
                 </Row>
               );
             }

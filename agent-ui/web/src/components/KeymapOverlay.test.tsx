@@ -160,6 +160,15 @@ describe("KeymapOverlay", () => {
       expect(items).toContain("/model");
     });
 
+    it("is left out in another agent's tab: its slash commands are Claude Code's", () => {
+      const { container } = render(
+        <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+b" panel={EMPTY_PANEL_TABLE} claudeSlashCommands={false} />,
+      );
+      const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);
+      expect(titles).not.toContain("Slash commands");
+      expect(titles).toContain("Typing");
+    });
+
     it("adds no <tr> of its own -- it is a plain list, not a key table", () => {
       const section = slashSection(overlay().container);
       expect(section.querySelectorAll("tr").length).toBe(0);

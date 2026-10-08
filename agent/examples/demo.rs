@@ -112,6 +112,10 @@ fn print_event(event: &AgentDomainEvent) {
             reason,
             ..
         } => println!("[blocked by the CLI] tool={tool_name} kind={reason_type:?} reason={reason:?}"),
+        AgentDomainEvent::PolicyMismatch { requested, reported } => {
+            println!("[policy mismatch] requested={requested} reported={reported}")
+        }
+        AgentDomainEvent::AccountLimits { used_percent, .. } => println!("[account limits] {used_percent}% used"),
         AgentDomainEvent::TurnCompleted {
             result_text,
             outcome,

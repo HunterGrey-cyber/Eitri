@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupItemsByFile, isHex64, parseTrustCommand, resolveTrustKey, scrollTarget, trustFooter } from "./trust";
+import { groupItemsByFile, isHex64, parseExCommand, resolveTrustKey, scrollTarget, trustFooter } from "./trust";
 import type { TrustItem, TrustKeyEvent } from "./trust";
 
 const GUARD_OPEN = { now: 1000, openedAt: 0, lastKeyAt: -Infinity, pendingG: false };
@@ -87,12 +87,21 @@ describe("groupItemsByFile", () => {
   });
 });
 
-describe("parseTrustCommand", () => {
-  it("takes the two words exactly, ignoring only surrounding space", () => {
-    expect(parseTrustCommand("trust")).toBe("trust");
-    expect(parseTrustCommand(" untrust ")).toBe("untrust");
-    for (const line of ["", "trust x", "trusted", "Trust", "trust untrust", "tru", "ls"]) {
-      expect(parseTrustCommand(line), line).toBeNull();
+describe("parseExCommand", () => {
+  it("takes the two trust words exactly, ignoring only surrounding space", () => {
+    expect(parseExCommand("trust")).toEqual({ command: "trust" });
+    expect(parseExCommand(" untrust ")).toEqual({ command: "untrust" });
+    for (const line of ["", "trust x", "trusted", "Trust", "trust untrust", "tru", "ls", "untrust codex"]) {
+      expect(parseExCommand(line), line).toBeNull();
+    }
+  });
+
+  it("takes :tabnew with at most one word, and leaves judging the word to the caller", () => {
+    expect(parseExCommand("tabnew")).toEqual({ command: "tabnew", agent: null });
+    expect(parseExCommand(" tabnew  codex ")).toEqual({ command: "tabnew", agent: "codex" });
+    expect(parseExCommand("tabnew gemini")).toEqual({ command: "tabnew", agent: "gemini" });
+    for (const line of ["tabnew codex claude", "tabnewcodex", "Tabnew", "tabn codex"]) {
+      expect(parseExCommand(line), line).toBeNull();
     }
   });
 });

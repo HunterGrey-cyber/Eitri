@@ -96,6 +96,9 @@ type Props = {
   editingInNvim?: boolean;
   /** `?` on an empty box opens the `?` keymap overlay. */
   onOpenKeymap?: () => void;
+  /** Whether a typed `/command` is judged as one of Claude Code's (a held-back one is refused with a
+   *  flash). False in another agent's tab, which sends every draft as typed. */
+  claudeSlashCommands?: boolean;
   /** Passes keys consumed by the `Ctrl+r` search to the containing component's typing guard
    *  through `HistorySearch`'s `onLineKey`, since these keys do not bubble. */
   onLineKey?: (event: React.KeyboardEvent<HTMLInputElement>) => void;
@@ -132,6 +135,7 @@ export function Composer({
   onEditInNvim = () => {},
   editingInNvim = false,
   onOpenKeymap = () => {},
+  claudeSlashCommands = true,
   onLineKey,
 }: Props) {
   const [text, setText] = useState("");
@@ -230,7 +234,7 @@ export function Composer({
     // includes `/login`, `/config` and `/resume`. Keep the draft unchanged and show a flash
     // naming the command. A bare `/model` or `/effort` is sent to open a picker parsed from the
     // CLI reply.
-    const held = heldBackSlashCommand(body);
+    const held = claudeSlashCommands ? heldBackSlashCommand(body) : null;
     if (held !== null) {
       showSlashFlash(slashCommandFlashText(held));
       return;

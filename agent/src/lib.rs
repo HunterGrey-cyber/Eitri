@@ -31,12 +31,14 @@ mod wire;
 mod wire_guard;
 
 pub mod account;
+pub mod external;
 pub mod external_writer;
 pub mod handoff;
 pub mod history;
 #[cfg(feature = "legacy-backend")]
 pub mod hook_protocol;
 pub mod ingestion;
+pub mod jsonrpc_link;
 pub mod lease;
 pub mod permission_policy;
 pub mod permission_rules;
@@ -57,6 +59,7 @@ pub use account::{AccountError, ClaudeAccount};
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
 #[cfg(feature = "legacy-backend")]
 pub use event::{AgentEvent, PermissionSource};
+pub use external::{DirTrust, ExternalProvider, ExternalStart, Reviewer, TrustPlan, TurnPolicy};
 pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
 pub use permission_policy::{
     classify_permission_request, classify_with_rules, rule_that_allows, Classification, PermissionVerdict,
@@ -87,10 +90,11 @@ pub const LEGACY_NOT_IN_BUILD: &str =
     "the legacy backend is not in this build (it is development-only: build with --features shell/legacy-backend)";
 
 pub use projection::{
-    describe_failed_resume, AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice, HistorySource,
-    MatchedAskRule, PermissionOutcome, PermissionRequestRecord, ProjectionStatus, ProviderPrompt, ResumeStatus,
-    TokenUsage, ToolCallDenial, ToolCallRecord, ToolCallResult, TranscriptMessage, TurnEndDetail, TurnEndingKind,
-    TurnEndingRecord, TurnOutcome, UngatedCliModeRecord, UsageInfo, UserPromptRecord, MAX_TURN_END_MESSAGE_CHARS,
+    describe_failed_resume, AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice,
+    HistorySource, MatchedAskRule, PermissionOutcome, PermissionRequestRecord, ProjectionStatus, ProviderPrompt,
+    ResumeStatus, TokenUsage, ToolCallDenial, ToolCallRecord, ToolCallResult, TranscriptMessage, TurnEndDetail,
+    TurnEndingKind, TurnEndingRecord, TurnOutcome, UngatedCliModeRecord, UsageInfo, UserPromptRecord,
+    MAX_TURN_END_MESSAGE_CHARS,
 };
 pub use provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,

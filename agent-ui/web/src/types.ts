@@ -78,6 +78,34 @@ export type PermissionRequestRecord = {
    *  own request. Answered like any card, with the same permission id. */
   providerPrompt?: ProviderPrompt;
 };
+/** The input of a Codex `commandExecution` card, as the Codex provider writes it (`approvals.rs`,
+ *  `CardKind::input`). `command` and `cwd` are `null` for a network request, which names a host and no
+ *  command. `escalation` is Rust's own wording of how far the command reaches; `network` is set for the
+ *  network form. `subagent` is the task name of a subagent's thread, absent for the tab's own. */
+export type CodexCommandInput = {
+  command: string | null;
+  cwd: string | null;
+  escalation: string;
+  network: { host: string; protocol: string } | null;
+  reason: string | null;
+  subagent?: string;
+};
+/** One path of a Codex `fileChange` card or row. `diff` is a unified diff for `update`, and the whole
+ *  content for `add` and `delete`; `kind` is Codex's own word for a kind this build does not know. */
+export type CodexFileChange = { path: string; kind: string; diff: string; movePath?: string };
+export type CodexFileChangeInput = { changes: CodexFileChange[]; reason?: string | null; subagent?: string };
+export type CodexMcpInput = { server: string; tool: string; arguments: unknown; subagent?: string };
+/** The input of an ACP agent's card (`acp:<kind>`): what the agent called the call, and its own permission
+ *  options with their `kind` (`allow_once`, `reject_once`, ...) as the agent claimed them. */
+export type AcpCardInput = {
+  title?: string | null;
+  rawInput?: unknown;
+  locations?: Array<{ path: string }>;
+  diffs?: Array<{ path: string; oldText?: string | null; newText?: string }>;
+  options?: Array<{ name: string; kind: string }>;
+  reason?: string | null;
+  subagent?: string;
+};
 /** The CLI's own words about why it asked, verbatim; any of them may be `null`. `reason` is English
  *  prose from the CLI ("... which is a sensitive file.") -- shown, never parsed. */
 export type ProviderPrompt = {
@@ -106,7 +134,9 @@ export type SessionStatus =
   | { kind: "unavailable"; reason: string }
   | { kind: "closed"; reason: string };
 
-export type BackendKind = "legacy" | "sidecar";
+/** Which Claude backend a session runs on; `external` for a tab running another agent (a snapshot only:
+ * the handshake names the window's Claude backend). */
+export type BackendKind = "legacy" | "sidecar" | "external";
 
 /** A previous conversation offered for continuation. The key is the CLAUDE session id -- the only
  * identity that survives a resume. Resuming mints a new Verdandi session id, so storing that one
@@ -266,6 +296,10 @@ export type AgentUiState = {
    * reload shows the figure without waiting for the next turn. A resumed tab shows none until its
    * first turn after the resume, because history seeding reports no usage. */
   usage: UsageInfo | null;
+  /** The account limit the agent last reported, or `null` before it has. Folded from `account_limits`
+   *  events, and carried by a snapshot (an explicit `null` before any report), so a reload or a tab
+   *  switch shows it without waiting for the next report. */
+  accountLimits: AccountLimits | null;
   /** The turns that ended without completing, oldest first: failed, hit a limit, interrupted, or cut off
    *  by the session ending. Each is a muted row where the turn stopped. A turn that completed adds none. */
   turnEndings: TurnEnding[];
@@ -433,7 +467,21 @@ export type TokenUsage = { input: number; output: number; cache_creation: number
  *  event once arrived with `total_cost_usd: 0, num_turns: 0` hardcoded on the sidecar, so a cost readout
  *  was right on `legacy` and confidently, permanently wrong there). `band.ts`'s `usageSegment` is the one
  *  reader, and draws nothing for `null`. */
-export type UsageInfo = { total_cost_usd: number; num_turns: number | null; tokens: TokenUsage | null; model: string | null };
+export type UsageInfo = {
+  total_cost_usd: number;
+  /** `false` when the provider reported tokens but no cost (Codex): `total_cost_usd` is then a
+   *  placeholder and a cost readout must show nothing rather than $0.00. Rust leaves the key out while
+   *  it is true, so absent means a cost was reported. */
+  cost_reported?: boolean;
+  num_turns: number | null;
+  tokens: TokenUsage | null;
+  model: string | null;
+};
+
+/** The account's usage limit as the agent last reported it (`AgentDomainEvent::AccountLimits`, folded
+ *  by the reducer into `AgentUiState.accountLimits`). Account-wide, not per turn. `resetsAt` is Unix
+ *  seconds. A `null` slot is something the agent did not say. */
+export type AccountLimits = { usedPercent: number; windowMinutes: number | null; resetsAt: number | null; plan: string | null };
 export type AgentDomainEvent =
   | { type: "session_opened"; session_id: string; provider_session_id: string; model: string; cwd: string }
   | { type: "turn_started"; turn_id: string }
@@ -500,7 +548,13 @@ export type AgentDomainEvent =
       tool_name: string;
       reason_type: string | null;
       reason: string | null;
-    };
+    }
+  /** An agent that is not the Claude sidecar reported a sandbox, approval policy or reviewer other than
+   *  the one Eitri asked for (`AgentDomainEvent::PolicyMismatch`). **The reducer ignores it on purpose**:
+   *  Rust fails the tab, and the failure reaches the page as the tab's own state. */
+  | { type: "policy_mismatch"; requested: string; reported: string }
+  /** The account's usage limit changed (`AgentDomainEvent::AccountLimits`). The latest wins. */
+  | { type: "account_limits"; used_percent: number; window_minutes: number | null; resets_at: number | null; plan: string | null };
 
 /** A session tab's identity for its whole life, and the bridge's (`eitri_core::tabs::TabId`). */
 export type TabId = number;
@@ -526,6 +580,9 @@ export type TabInfo = {
    *  resumed record's display title. `null` before one exists. Read by the chooser's open-tab rows
    *  once they join a `ChooserTab` to its `TabInfo` here. */
   title: string | null;
+  /** The agent the tab runs, as records name it: `claude`, `codex`, `acp:<name>` (`TabView::agent`). Rust
+   *  always sends it; a tab without it reads as Claude's. */
+  agent?: string;
 };
 export type TabsEnvelope = {
   active: TabId;

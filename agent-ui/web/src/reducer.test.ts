@@ -817,6 +817,45 @@ describe("the CLI's own auto mode", () => {
   });
 });
 
+describe("an agent's policy tripwire and account limits", () => {
+  const limits = (usedPercent: number, rest: Partial<Extract<AgentDomainEvent, { type: "account_limits" }>> = {}): AgentDomainEvent => ({
+    type: "account_limits",
+    used_percent: usedPercent,
+    window_minutes: 300,
+    resets_at: 1790000000,
+    plan: "pro",
+    ...rest,
+  });
+
+  it("account_limits event stores limits; policy_mismatch is ignored", () => {
+    let state = applyEvent(initialState(), limits(42.5));
+    expect(state.accountLimits).toEqual({ usedPercent: 42.5, windowMinutes: 300, resetsAt: 1790000000, plan: "pro" });
+    expect(state.nextSeq).toBe(1);
+
+    const before = state;
+    state = applyEvent(state, { type: "policy_mismatch", requested: "on-request", reported: "never" });
+    expect(state.accountLimits).toEqual(before.accountLimits);
+    expect(state.status).toEqual(before.status);
+    expect(state.nextSeq).toBe(before.nextSeq + 1);
+  });
+
+  it("the latest report replaces the earlier one whole, and a slot it leaves out is null", () => {
+    let state = applyEvent(initialState(), limits(10));
+    state = applyEvent(state, limits(12.5, { window_minutes: null, resets_at: null, plan: null }));
+    expect(state.accountLimits).toEqual({ usedPercent: 12.5, windowMinutes: null, resetsAt: null, plan: null });
+  });
+
+  it("a snapshot carries the limits, and one without the key (an older build) leaves none", () => {
+    const withLimits = applyEvent(initialState(), limits(42.5));
+    const { nextSeq: _n, turnThinking: _t, denialsBeforeTheirCall: _d, ...snapshot } = withLimits;
+    expect(applySnapshot(initialState(), snapshot, 7).accountLimits).toEqual(withLimits.accountLimits);
+    // A tab that has reported nothing must not keep the figure of the one shown before it.
+    expect(applySnapshot(withLimits, { ...snapshot, accountLimits: null }, 7).accountLimits).toBeNull();
+    const { accountLimits: _a, ...old } = snapshot;
+    expect(applySnapshot(withLimits, old as typeof snapshot, 7).accountLimits).toBeNull();
+  });
+});
+
 describe("a CLI refusal that arrives ahead of its call", () => {
   const started = (id: string): AgentDomainEvent => ({
     type: "tool_call_started",

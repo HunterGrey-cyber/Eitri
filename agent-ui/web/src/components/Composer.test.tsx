@@ -161,6 +161,17 @@ describe("Composer and slash commands (P10)", () => {
     }
   });
 
+  it("sends a leading / as typed in another agent's tab, held-back words included", () => {
+    for (const command of ["/login", "/config", "/resume"]) {
+      const { container, textarea, onSend } = renderComposer({ claudeSlashCommands: false });
+      fireEvent.change(textarea, { target: { value: command } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSend, command).toHaveBeenCalledWith(command);
+      expect(container.querySelector(".composer-slash-flash"), command).toBeNull();
+      cleanup();
+    }
+  });
+
   /* Bare `/model` can be sent because `App.tsx` parses its reply into a picker. This component
    *  only sends the command. */
   it("sends /model bare or with an argument alike", () => {

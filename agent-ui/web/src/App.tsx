@@ -70,7 +70,8 @@ import { pathsIn, viewText } from "./paths";
 import type { PathRef } from "./paths";
 import { PathPick } from "./components/PathPick";
 import { LinkPick } from "./components/LinkPick";
-import { acceptsEnvelope, activeTabInfo, countedTabTarget, forgetClosed, saveView, takeView, withoutHandoff } from "./tabs";
+import { isExternalTool, agentTitle } from "./externalTools";
+import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, forgetClosed, isExternalAgent, saveView, TABNEW_AGENTS, takeView, withoutHandoff } from "./tabs";
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
 import type { NavKeyRequest } from "./components/EmptyTab";
@@ -90,7 +91,7 @@ import type { ShownHint } from "./components/HintLayer";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { ReviewOverlay } from "./components/ReviewOverlay";
 import { TrustPrompt } from "./components/TrustPrompt";
-import { parseTrustCommand, resolveTrustKey, scrollTarget, TRUST_BAND_PROMPT, TRUST_WAIT_FLASH, trustFooter } from "./trust";
+import { parseExCommand, resolveTrustKey, scrollTarget, TRUST_BAND_PROMPT, TRUST_WAIT_FLASH, trustFooter } from "./trust";
 import type { TrustKeyEvent, TrustPromptEnvelope } from "./trust";
 import {
   applyReviewKey,
@@ -1056,7 +1057,14 @@ export default function App() {
       case "panel.keymap":
         setKeymapOpen(true);
         break;
-      case "panel.handoff":
+      case "panel.handoff": {
+        // Only a Claude session can be taken into a terminal `claude`; another agent's tab says so
+        // instead of opening a confirmation that could not be carried out.
+        const other = agentWord(activeTabInfo(tabsRef.current)?.agent);
+        if (other !== null) {
+          showFlash(`Continuing a ${other} session in a terminal is not available yet`);
+          break;
+        }
         // `<leader>t`: opens `ContinueInTerminal`'s confirmation directly, since the
         // band leaves no permanently visible button for a click to reach first any more. Opening
         // unconditionally is deliberate -- if the handoff is blocked (no session id yet, a turn
@@ -1064,6 +1072,7 @@ export default function App() {
         // doing nothing with no explanation.
         setHandoffOpen(true);
         break;
+      }
       case "mode.cycle":
         // Mode cycling is disabled for fixed tabs and flashes instead of posting. `modeKeyRoute`
         // also routes Shift+Tab. All routes except an ended or failed tab that is not already in
@@ -1240,7 +1249,7 @@ export default function App() {
     // A restore found a tab saved in bypass and asks before giving it back: `y` as saved, `n` in auto.
     // The same on-screen wait and lone-key guard as `bypass`, since a `y` here also enters bypass.
     | { kind: "restore"; nonce: number; lines: string[]; openedAt: number }
-    // The question before this tab's session loads the project's own Claude configuration. `view` is the
+    // The question before this tab's session loads the project's own configuration for its agent. `view` is the
     // envelope as shown, and an answer echoes its `fingerprint` and `findingsDigest` and nothing recomputed
     // here. The same on-screen wait and lone-key guard as `bypass`, since a `y` loads a repository's hooks.
     // `flashAfter` is the flash counter when it opened: only a flash made since then is about this question.
@@ -3344,7 +3353,8 @@ export default function App() {
     // The `command_result` handler clears it on refusal because a send that never ran cannot
     // start the awaited turn. A picker choice carries an argument, so `barePickerCommand`
     // returns `null` for it and both send paths can use this assignment.
-    pendingSlashPickerRef.current = barePickerCommand(text);
+    // External-agent tabs receive slash commands as typed and do not open this picker.
+    pendingSlashPickerRef.current = isExternalAgent(activeTabInfo(tabsRef.current)?.agent) ? null : barePickerCommand(text);
     postToRust({ type: "send_message", request_id: requestId, tab, text });
     // A send follows the reply, wherever the reader had scrolled (`./follow.ts`).
     resumeFollowing(containerRef.current?.querySelector(".message-list"));
@@ -3964,6 +3974,7 @@ export default function App() {
               panel={panelTable}
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
+              claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
             />
           </PanelErrorBoundary>
         )}
@@ -5092,6 +5103,13 @@ export default function App() {
         if (root === null) break;
         // Uses the same target card and wait as `a`/`d`.
         const target = edgeFocused ? null : permissionTarget(answerableItems, cursor);
+        // Another agent's card has no reason box: its deny carries no reason, so `D` says what happens
+        // instead of waiting for a box that is not there.
+        const targetItem = target === null ? undefined : timeline[target];
+        if (targetItem?.kind === "permission" && isExternalTool(targetItem.request.toolName)) {
+          showFlash(`${agentTitle(activeTabInfo(tabsRef.current)?.agent)} takes no reason with a deny; d denies`);
+          break;
+        }
         // The card's row by structure: `conversationRows(root)[target]` is timeline item
         // `target`, which a card row holds no model HTML inside.
         const box =
@@ -5549,6 +5567,7 @@ export default function App() {
               panel={panelTable}
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
+              claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
             />
           </PanelErrorBoundary>
         )}
@@ -5690,6 +5709,8 @@ export default function App() {
         closing={handingOff}
         restoredDraft={restoredDraft}
         mode={mode}
+        // The held-back slash commands are Claude Code's; another agent's tab sends a leading `/` as typed.
+        claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
         // `composerFocusRequest` is bumped by the `inputRequest` effect only when no overlay is open,
         // and by the `i`/`o`/`A` mode actions. Passing the raw request would let `Composer`
         // focus its textarea under an overlay.
@@ -5797,11 +5818,25 @@ export default function App() {
             onChange={setExLine}
             onAccept={(event) => {
               noteLineKey(event);
-              const command = parseTrustCommand(exLine);
-              if (command !== null) {
+              const command = parseExCommand(exLine);
+              if (command !== null && command.command === "tabnew") {
+                // vim's `:tabnew`: the word names the agent; none is the new-tab key's own tab.
+                if (command.agent !== null && !TABNEW_AGENTS.includes(command.agent)) {
+                  showFlash(`unknown agent ${command.agent} — :tabnew accepts ${TABNEW_AGENTS.join(", ")}`);
+                } else {
+                  postToRust({
+                    type: "tab_verb",
+                    request_id: nextRequestId(),
+                    verb: "new",
+                    ...(command.agent !== null ? { agent: command.agent } : {}),
+                  });
+                }
+              } else if (command !== null) {
                 const commandId = nextRequestId();
                 inFlight.current.set(commandId, { kind: "trust", tab: activeTabRef.current ?? 0 });
-                postToRust({ type: "trust_command", request_id: commandId, action: command });
+                // The trust it changes is the agent's of the tab on screen.
+                const agent = activeTabInfo(tabsRef.current)?.agent ?? "claude";
+                postToRust({ type: "trust_command", request_id: commandId, action: command.command, agent });
               } else {
                 showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
               }

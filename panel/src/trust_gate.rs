@@ -1,10 +1,15 @@
-//! The window's trust gate: whether a session about to start may load the project's own Claude
-//! configuration (the project and local setting tiers), and the question that decides it.
+//! The window's trust gate: whether a session about to start may load the project's own
+//! configuration for its agent (Claude's project and local setting tiers, Codex's project layers, a
+//! registered agent's own files), and the question that decides it.
 //!
-//! One gate per window, over the window's one project root. Every disk operation of the trust
-//! check -- discovering and fingerprinting the configuration, reading Eitri's record of it, writing
-//! that record and removing it -- runs on the gate's own worker thread, in the order it was asked
-//! for, so a slow or hostile state directory (a FIFO, a network home) can never freeze the window.
+//! One gate per window, over the window's one project root, with each agent's configuration kept
+//! apart: every check, answer, record and memory of an answer belongs to one discovery profile, so a
+//! `y` for one agent never lets another load anything, and two tabs of two agents get two questions.
+//!
+//! Every disk operation of the trust check -- discovering and fingerprinting the configuration,
+//! reading Eitri's record of it, writing that record and removing it -- runs on the gate's own worker
+//! thread, in the order it was asked for, so a slow or hostile state directory (a FIFO, a network
+//! home) can never freeze the window.
 //! The GTK thread only queues jobs and drains their results from the panel's tick ([`TrustGate::poll`]
 //! never blocks), and everything it reads ([`TrustGate::row`], [`TrustGate::route`]) is the latest
 //! result already in memory.
@@ -29,7 +34,9 @@ use agent::setting_sources::ProjectTrust;
 use eitri_core::agent_bridge::{
     TrustAction, TrustDiffView, TrustItemView, TrustPromptState, TrustPromptView, TrustRememberView,
 };
-use eitri_core::project_trust::{civil_date, Discovery, Finding, Fingerprint, Remember, TrustState, TrustStore};
+use eitri_core::project_trust::{
+    civil_date, Discovery, Finding, Fingerprint, Profile, ProfileEnv, Remember, TrustState, TrustStore,
+};
 use eitri_core::tabs::TabId;
 
 /// Said once per window, after the first `n`.
@@ -57,6 +64,49 @@ pub(crate) const NOTHING_HERE: &str = "nothing to trust here";
 pub(crate) const UNTRUSTED_FROM_NOW: &str = "not trusted: sessions started from now on leave this project's Claude \
                                              configuration out; running sessions are unchanged";
 pub(crate) const WAS_NOT_TRUSTED: &str = "was not trusted";
+
+/// [`NOT_LOADED`] for any agent.
+pub(crate) fn not_loaded(profile: &Profile) -> String {
+    match profile {
+        Profile::Claude => NOT_LOADED.to_string(),
+        other => format!("this project's own {} configuration is not loaded", other.label()),
+    }
+}
+
+/// [`TRUSTED_FROM_NOW`] for any agent.
+pub(crate) fn trusted_from_now(profile: &Profile) -> String {
+    match profile {
+        Profile::Claude => TRUSTED_FROM_NOW.to_string(),
+        other => format!(
+            "trusted: {} sessions started from now on load this project's {} configuration; running sessions \
+             are unchanged",
+            other.label(),
+            other.label()
+        ),
+    }
+}
+
+/// [`UNTRUSTED_FROM_NOW`] for any agent.
+pub(crate) fn untrusted_from_now(profile: &Profile) -> String {
+    match profile {
+        Profile::Claude => UNTRUSTED_FROM_NOW.to_string(),
+        other => format!(
+            "not trusted: {} sessions started from now on leave this project's {} configuration out; running \
+             sessions are unchanged",
+            other.label(),
+            other.label()
+        ),
+    }
+}
+
+/// An `n` for an agent that cannot be started without loading the project's own configuration.
+pub(crate) fn refused_without_yes(profile: &Profile) -> String {
+    format!(
+        "{} would load this project's own configuration, which you have not trusted; Eitri cannot start it \
+         without loading that",
+        profile.label()
+    )
+}
 
 pub(crate) fn window_only_notice(why: &str) -> String {
     format!("trusted for this window only: {why}")
@@ -140,6 +190,9 @@ pub(crate) enum AnswerOutcome {
     Recording,
     /// Not taken; the tab is asked again with what is on disk now.
     Refused(String),
+    /// An `n` for an agent that has no way to start without the project's own configuration: the
+    /// start is dropped, saying why.
+    NotStarted(String),
 }
 
 /// What [`TrustGate::answer_command`] decided about `:trust`'s own prompt.
@@ -190,6 +243,7 @@ enum Purpose {
 enum Job {
     Check {
         generation: u64,
+        profile: Profile,
     },
     Record {
         purpose: Purpose,
@@ -207,10 +261,12 @@ enum Job {
     CommandCheck {
         request_id: String,
         tab: TabId,
+        profile: Profile,
     },
     Forget {
         request_id: String,
         had_window_trust: bool,
+        profile: Profile,
     },
 }
 
@@ -236,6 +292,7 @@ enum Done {
     },
     RecordFailed {
         purpose: Purpose,
+        profile: ProfileKey,
         reason: String,
     },
     CommandChecked {
@@ -264,25 +321,36 @@ struct Kept {
 /// mistaken for each other.
 const COMMAND_NONCE_BASE: u64 = 1 << 48;
 
+/// A profile's name as the gate's maps key it ([`Profile::key`]).
+type ProfileKey = String;
+
 pub(crate) struct TrustGate {
     #[cfg_attr(not(test), allow(dead_code))]
     root: PathBuf,
     jobs: Option<mpsc::Sender<Job>>,
     done: mpsc::Receiver<Done>,
-    /// The last check queued.
+    /// The last check queued, of any profile.
     generation: u64,
-    /// Moved by `:untrust`: a record queued before it is not trust any more when it lands.
-    epoch: u64,
-    /// The newest result of any check, in the order they were queued.
-    latest: Option<TrustState>,
+    /// Moved by `:untrust` of a profile: a record of it queued before is not trust any more when it
+    /// lands.
+    epochs: HashMap<ProfileKey, u64>,
+    /// Per profile, the newest result of any check of it, in the order they were queued.
+    latest: HashMap<ProfileKey, TrustState>,
+    /// What each tab's question showed; the discovery it holds names the question's profile.
     shown: HashMap<TabId, Shown>,
-    answered: Option<Answered>,
-    /// Why the last record could not be written: later prompts say this window only.
-    record_failure: Option<String>,
-    said_not_loaded: bool,
-    /// Tabs waiting for a check, each with the generation of the check that answers it.
-    waiting: Vec<(TabId, u64)>,
-    command_pending: Option<(String, TabId)>,
+    /// This window's own answer per profile.
+    answered: HashMap<ProfileKey, Answered>,
+    /// Per profile, why its last record could not be written: its later prompts say this window
+    /// only. Each profile has a record file of its own, so one that cannot be written says nothing
+    /// about another's.
+    record_failure: HashMap<ProfileKey, String>,
+    /// The profiles whose "not loaded" notice has been said.
+    said_not_loaded: std::collections::HashSet<ProfileKey>,
+    /// Tabs waiting for a check, each with the profile and the generation of the check that answers
+    /// it.
+    waiting: Vec<(TabId, ProfileKey, u64)>,
+    /// `:trust` asked for a question: its request, the tab whose `:` line asked, and the profile.
+    command_pending: Option<(String, TabId, ProfileKey)>,
     command_shown: Option<CommandShown>,
     next_command_nonce: u64,
     /// Results made here rather than by the worker, delivered by the next `poll`.
@@ -302,6 +370,13 @@ impl TrustGate {
         TrustGate::with_wait(store, root, home, Box::new(move || hold.wait()))
     }
 
+    /// The worker is gone from here on, as when its thread has died: what it would answer is made by
+    /// [`TrustGate::queue`], with every earlier check's result still held.
+    #[cfg(test)]
+    pub(crate) fn drop_worker(&mut self) {
+        self.jobs = None;
+    }
+
     /// A gate with no worker: the test reads the jobs it queues and hands it the results itself.
     #[cfg(test)]
     fn detached(root: PathBuf) -> (TrustGate, mpsc::Receiver<Job>, mpsc::Sender<Done>) {
@@ -312,12 +387,12 @@ impl TrustGate {
             jobs: Some(jobs_tx),
             done: done_rx,
             generation: 0,
-            epoch: 0,
-            latest: None,
+            epochs: HashMap::new(),
+            latest: HashMap::new(),
             shown: HashMap::new(),
-            answered: None,
-            record_failure: None,
-            said_not_loaded: false,
+            answered: HashMap::new(),
+            record_failure: HashMap::new(),
+            said_not_loaded: Default::default(),
             waiting: Vec::new(),
             command_pending: None,
             command_shown: None,
@@ -345,9 +420,11 @@ impl TrustGate {
         let (jobs_tx, jobs_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let worker_root = root.clone();
+        // Read here, where no disk is touched: the worker resolves it.
+        let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
         let started = std::thread::Builder::new()
             .name("eitri-trust".into())
-            .spawn(move || run_worker(store, worker_root, home, jobs_rx, done_tx, before_each));
+            .spawn(move || run_worker(store, worker_root, home, codex_home, jobs_rx, done_tx, before_each));
         let jobs = match started {
             Ok(_) => Some(jobs_tx),
             Err(e) => {
@@ -360,12 +437,12 @@ impl TrustGate {
             jobs,
             done: done_rx,
             generation: 0,
-            epoch: 0,
-            latest: None,
+            epochs: HashMap::new(),
+            latest: HashMap::new(),
             shown: HashMap::new(),
-            answered: None,
-            record_failure: None,
-            said_not_loaded: false,
+            answered: HashMap::new(),
+            record_failure: HashMap::new(),
+            said_not_loaded: Default::default(),
             waiting: Vec::new(),
             command_pending: None,
             command_shown: None,
@@ -393,10 +470,16 @@ impl TrustGate {
         };
         const NO_WORKER: &str = "the trust check is not running";
         match job {
-            Job::Check { generation } => {
-                let (resolved, kept): (Vec<_>, Vec<_>) = self.waiting.drain(..).partition(|(_, g)| *g <= generation);
+            Job::Check { generation, profile } => {
+                let key = profile.key();
+                let (resolved, kept): (Vec<_>, Vec<_>) = self
+                    .waiting
+                    .drain(..)
+                    .partition(|(_, p, g)| *p == key && *g <= generation);
                 self.waiting = kept;
-                for (tab, _) in resolved {
+                // Started untrusted. An agent that needs a `y` is refused where external starts begin,
+                // which takes no untrusted start of one, whatever discovery an earlier check left.
+                for (tab, _, _) in resolved {
                     self.owed
                         .push(GateEvent::Route(tab, Route::Start(ProjectTrust::Untrusted)));
                 }
@@ -422,24 +505,27 @@ impl TrustGate {
         }
     }
 
-    /// Queues a fresh check of the root; returns its generation.
-    pub(crate) fn begin_check(&mut self) -> u64 {
+    /// Queues a fresh check of the root for `profile`; returns its generation.
+    pub(crate) fn begin_check(&mut self, profile: &Profile) -> u64 {
         self.generation += 1;
         let generation = self.generation;
-        self.queue(Job::Check { generation });
+        self.queue(Job::Check {
+            generation,
+            profile: profile.clone(),
+        });
         generation
     }
 
-    /// `tab` waits for the check [`TrustGate::begin_check`] queues next (callers always call it right
-    /// after); an older result does not resolve it.
-    pub(crate) fn wait_for(&mut self, tab: TabId) {
+    /// `tab` waits for the check of `profile` that [`TrustGate::begin_check`] queues next (callers
+    /// always call it right after); an older result, or one of another profile, does not resolve it.
+    pub(crate) fn wait_for(&mut self, tab: TabId, profile: &Profile) {
         let generation = self.generation + 1;
-        self.waiting.retain(|(t, _)| *t != tab);
-        self.waiting.push((tab, generation));
+        self.waiting.retain(|(t, _, _)| *t != tab);
+        self.waiting.push((tab, profile.key(), generation));
     }
 
     pub(crate) fn is_waiting(&self, tab: TabId) -> bool {
-        self.waiting.iter().any(|(t, _)| *t == tab)
+        self.waiting.iter().any(|(t, _, _)| *t == tab)
     }
 
     /// Whether `tab`'s prompt on screen is the one under `nonce`.
@@ -456,42 +542,50 @@ impl TrustGate {
     /// no longer has is refused and asked again.
     pub(crate) fn poll(&mut self) -> Vec<GateEvent> {
         let mut events = std::mem::take(&mut self.owed);
-        // Positions in `events` settled only once the batch is drained.
-        let mut routes: Vec<usize> = Vec::new();
-        let mut taken: Vec<(usize, Fingerprint)> = Vec::new();
+        // Positions in `events` settled only once the batch is drained, each with its profile.
+        let mut routes: Vec<(usize, ProfileKey)> = Vec::new();
+        let mut taken: Vec<(usize, ProfileKey, Fingerprint)> = Vec::new();
         while let Ok(done) = self.done.try_recv() {
             match done {
                 Done::Checked { generation, state } => {
+                    let key = state_profile(&state).key();
                     self.take_latest(state, &mut events);
-                    let (resolved, kept): (Vec<_>, Vec<_>) =
-                        self.waiting.drain(..).partition(|(_, g)| *g <= generation);
+                    let (resolved, kept): (Vec<_>, Vec<_>) = self
+                        .waiting
+                        .drain(..)
+                        .partition(|(_, p, g)| *p == key && *g <= generation);
                     self.waiting = kept;
-                    for (tab, _) in resolved {
-                        routes.push(events.len());
+                    for (tab, _, _) in resolved {
+                        routes.push((events.len(), key.clone()));
                         events.push(GateEvent::Route(tab, Route::Ask));
                     }
                 }
                 Done::Recorded { purpose, epoch, state } => {
-                    if epoch == self.epoch {
+                    let profile = state_profile(&state).clone();
+                    let key = profile.key();
+                    if epoch == self.epoch_of(&key) {
                         let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
                         if let Some(fingerprint) = fingerprint {
-                            self.answered = Some(Answered {
-                                fingerprint,
-                                trust: ProjectTrust::Trusted,
-                                window_only: None,
-                            });
+                            self.answered.insert(
+                                key.clone(),
+                                Answered {
+                                    fingerprint,
+                                    trust: ProjectTrust::Trusted,
+                                    window_only: None,
+                                },
+                            );
                         }
-                        self.record_failure = None;
+                        self.record_failure.remove(&key);
                         self.take_latest(state, &mut events);
                         if let (Purpose::ForTab(_), Some(fingerprint)) = (&purpose, fingerprint) {
-                            taken.push((events.len(), fingerprint));
+                            taken.push((events.len(), key, fingerprint));
                         }
                         events.push(match purpose {
                             Purpose::ForTab(tab) => GateEvent::Recorded { tab, notice: None },
                             Purpose::Command(request_id) => GateEvent::CommandDone {
                                 request_id,
                                 ok: true,
-                                notice: Some(TRUSTED_FROM_NOW.to_string()),
+                                notice: Some(trusted_from_now(&profile)),
                             },
                         });
                     } else {
@@ -506,21 +600,25 @@ impl TrustGate {
                     kept,
                     state,
                 } => {
-                    if epoch != self.epoch {
+                    let key = state_profile(&state).key();
+                    if epoch != self.epoch_of(&key) {
                         events.push(refused(purpose, WITHDRAWN.to_string()));
                         continue;
                     }
                     let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
                     if let (Some(why), Some(fingerprint)) = (kept.window_only.clone(), fingerprint) {
-                        self.answered = Some(Answered {
-                            fingerprint,
-                            trust: ProjectTrust::Trusted,
-                            window_only: Some(why),
-                        });
+                        self.answered.insert(
+                            key.clone(),
+                            Answered {
+                                fingerprint,
+                                trust: ProjectTrust::Trusted,
+                                window_only: Some(why),
+                            },
+                        );
                     }
                     self.take_latest(state, &mut events);
                     if let (Purpose::ForTab(_), Some(fingerprint)) = (&purpose, fingerprint) {
-                        taken.push((events.len(), fingerprint));
+                        taken.push((events.len(), key, fingerprint));
                     }
                     events.push(match purpose {
                         Purpose::ForTab(tab) => GateEvent::Recorded {
@@ -538,18 +636,23 @@ impl TrustGate {
                     self.take_latest(state, &mut events);
                     events.push(refused(purpose, CHANGED_WHILE_READING.to_string()));
                 }
-                Done::RecordFailed { purpose, reason } => {
+                Done::RecordFailed {
+                    purpose,
+                    profile,
+                    reason,
+                } => {
                     let notice = match &purpose {
                         Purpose::ForTab(_) => record_failed_notice(&reason),
                         Purpose::Command(_) => format!("trust could not be recorded ({reason})"),
                     };
-                    self.record_failure = Some(reason);
+                    self.record_failure.insert(profile, reason);
                     events.push(refused(purpose, notice));
                 }
                 Done::CommandChecked { request_id, tab, state } => {
+                    let key = state_profile(&state).key();
                     self.take_latest(state, &mut events);
                     self.drop_command_prompt_into(&mut events);
-                    events.push(self.command_check_result(request_id, tab));
+                    events.push(self.command_check_result(request_id, tab, key));
                 }
                 Done::Forgot {
                     request_id,
@@ -566,14 +669,14 @@ impl TrustGate {
                 }
             }
         }
-        let route = self.current_route().unwrap_or(Route::Ask);
-        for at in routes {
+        for (at, key) in routes {
+            let route = self.latest.get(&key).map_or(Route::Ask, |state| self.route(state));
             if let GateEvent::Route(_, r) = &mut events[at] {
                 *r = route;
             }
         }
-        let newest = self.latest.as_ref().and_then(discovery_of).map(|d| d.fingerprint);
-        for (at, fingerprint) in taken {
+        for (at, key, fingerprint) in taken {
+            let newest = self.latest.get(&key).and_then(discovery_of).map(|d| d.fingerprint);
             if newest != Some(fingerprint) {
                 if let GateEvent::Recorded { tab, .. } = events[at] {
                     events[at] = GateEvent::RecordRefused {
@@ -586,13 +689,20 @@ impl TrustGate {
         events
     }
 
-    /// A newer result: every prompt that no longer shows its fingerprint goes, and is asked again.
+    /// The `:untrust` count of a profile.
+    fn epoch_of(&self, key: &str) -> u64 {
+        self.epochs.get(key).copied().unwrap_or(0)
+    }
+
+    /// A newer result for its profile: every prompt of that profile that no longer shows its
+    /// fingerprint goes, and is asked again. Other profiles' prompts are about other files.
     fn take_latest(&mut self, state: TrustState, events: &mut Vec<GateEvent>) {
+        let key = state_profile(&state).key();
         let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
         let mut stale: Vec<TabId> = self
             .shown
             .iter()
-            .filter(|(_, shown)| Some(shown.fingerprint) != fingerprint)
+            .filter(|(_, shown)| shown.discovery.profile.key() == key && Some(shown.fingerprint) != fingerprint)
             .map(|(tab, _)| *tab)
             .collect();
         stale.sort_by_key(|tab| tab.0);
@@ -603,7 +713,7 @@ impl TrustGate {
         if self
             .command_shown
             .as_ref()
-            .is_some_and(|c| Some(c.shown.fingerprint) != fingerprint)
+            .is_some_and(|c| c.shown.discovery.profile.key() == key && Some(c.shown.fingerprint) != fingerprint)
         {
             let command = self.command_shown.take().expect("checked above");
             events.push(GateEvent::CommandDone {
@@ -612,16 +722,16 @@ impl TrustGate {
                 notice: Some(COMMAND_OUT_OF_DATE.to_string()),
             });
         }
-        self.latest = Some(state);
+        self.latest.insert(key, state);
     }
 
-    fn command_check_result(&mut self, request_id: String, tab: TabId) -> GateEvent {
+    fn command_check_result(&mut self, request_id: String, tab: TabId, key: ProfileKey) -> GateEvent {
         let done = |ok: bool, notice: String| GateEvent::CommandDone {
             request_id: request_id.clone(),
             ok,
             notice: Some(notice),
         };
-        match self.latest.as_ref() {
+        match self.latest.get(&key) {
             None | Some(TrustState::NothingToTrust(_)) => done(true, NOTHING_HERE.to_string()),
             Some(TrustState::Trusted { since_unix, .. }) => {
                 done(true, format!("already trusted since {}", civil_date(*since_unix)))
@@ -632,43 +742,61 @@ impl TrustGate {
                 done(false, cannot_remember_notice(discovery))
             }
             Some(_) => {
-                self.command_pending = Some((request_id.clone(), tab));
+                self.command_pending = Some((request_id.clone(), tab, key));
                 GateEvent::CommandAsk { request_id, tab }
             }
         }
     }
 
-    /// Where a start goes, given a check's result and this window's answers. Pure.
+    /// Where a start goes, given a check's result and this window's answers for its profile. Pure.
     pub(crate) fn route(&self, state: &TrustState) -> Route {
+        let profile = state_profile(state);
         match state {
             // Nothing exists to load, so the untrusted tiers lose nothing, and they keep out a
-            // `.claude/` that appears between this check and the CLI's own read.
-            TrustState::NothingToTrust(_) => Route::Start(ProjectTrust::Untrusted),
+            // `.claude/` that appears between this check and the CLI's own read. An agent that needs
+            // a `y` never gets here: the store asks about its empty discovery.
+            TrustState::NothingToTrust(_) if !profile.requires_explicit_yes() => Route::Start(ProjectTrust::Untrusted),
+            TrustState::NothingToTrust(_) => Route::Ask,
             TrustState::Trusted { .. } => Route::Start(ProjectTrust::Trusted),
-            TrustState::Untrusted { discovery, .. } | TrustState::Changed { discovery, .. } => match &self.answered {
-                Some(answered) if answered.fingerprint == discovery.fingerprint && discovery.fully_hashed() => {
-                    Route::Start(answered.trust)
+            TrustState::Untrusted { discovery, .. } | TrustState::Changed { discovery, .. } => {
+                match self.answered.get(&profile.key()) {
+                    Some(answered)
+                        if answered.fingerprint == discovery.fingerprint
+                            && discovery.fully_hashed()
+                            && (answered.trust == ProjectTrust::Trusted || !profile.requires_explicit_yes()) =>
+                    {
+                        Route::Start(answered.trust)
+                    }
+                    _ => Route::Ask,
                 }
-                _ => Route::Ask,
-            },
+            }
         }
     }
 
-    /// The route for a start right now, from the latest check; `None` before any check came back.
-    pub(crate) fn current_route(&self) -> Option<Route> {
-        self.latest.as_ref().map(|state| self.route(state))
+    /// The route for a start of `profile` right now, from its latest check; `None` before any check
+    /// of it came back.
+    pub(crate) fn current_route(&self, profile: &Profile) -> Option<Route> {
+        self.latest.get(&profile.key()).map(|state| self.route(state))
     }
 
-    /// The prompt for `tab` under `nonce`, from the latest check, kept as what this tab was shown.
-    /// `None` when the latest check is nothing to ask about.
-    pub(crate) fn show(&mut self, tab: TabId, nonce: u64) -> Option<TrustPromptView> {
-        let (view, shown) = self.build_prompt(tab, nonce)?;
+    /// The newest discovery of `profile`: what a start routed by [`TrustGate::current_route`], or let
+    /// through by an answer, is bound to. A `y` is taken only while the newest check still has the
+    /// fingerprint its prompt showed, and an `n` only while the page echoes it, so this is the
+    /// configuration the answer was about.
+    pub(crate) fn bound_discovery(&self, profile: &Profile) -> Option<&Discovery> {
+        self.latest.get(&profile.key()).and_then(discovery_of)
+    }
+
+    /// The prompt for `tab` under `nonce`, from the latest check of `profile` (the tab's agent's),
+    /// kept as what this tab was shown. `None` when that check is nothing to ask about.
+    pub(crate) fn show(&mut self, tab: TabId, nonce: u64, profile: &Profile) -> Option<TrustPromptView> {
+        let (view, shown) = self.build_prompt(tab, nonce, &profile.key())?;
         self.shown.insert(tab, shown);
         Some(view)
     }
 
-    fn build_prompt(&self, tab: TabId, nonce: u64) -> Option<(TrustPromptView, Shown)> {
-        let (discovery, state, diff, remember) = match self.latest.as_ref()? {
+    fn build_prompt(&self, tab: TabId, nonce: u64, key: &str) -> Option<(TrustPromptView, Shown)> {
+        let (discovery, state, diff, remember) = match self.latest.get(key)? {
             TrustState::Untrusted { discovery, remember } => (discovery, TrustPromptState::Untrusted, None, remember),
             TrustState::Changed {
                 discovery,
@@ -683,7 +811,7 @@ impl TrustGate {
                 Some(format!("{note}; y trusts this start only; the next one asks again")),
             ),
             Remember::WindowOnly(why) => (TrustRememberView::Window, Some(why.clone())),
-            Remember::Yes => match &self.record_failure {
+            Remember::Yes => match self.record_failure.get(key) {
                 Some(why) => (
                     TrustRememberView::Window,
                     Some(format!("trust could not be recorded ({why})")),
@@ -695,6 +823,7 @@ impl TrustGate {
         let view = TrustPromptView {
             tab,
             nonce,
+            agent: discovery.profile.label(),
             root: discovery.root.display().to_string(),
             top: discovery.top.display().to_string(),
             fingerprint: discovery.fingerprint.hex(),
@@ -706,7 +835,7 @@ impl TrustGate {
                 removed: lossy(&diff.removed),
                 changed: lossy(&diff.changed),
             }),
-            items: discovery.findings.iter().map(item_of).collect(),
+            items: discovery.findings.iter().flat_map(items_of).collect(),
         };
         let shown = Shown {
             nonce,
@@ -717,11 +846,11 @@ impl TrustGate {
         Some((view, shown))
     }
 
-    /// Whether an answer can outlive this start, for the latest check.
-    fn remember_now(&self) -> Remember {
-        match self.latest.as_ref() {
+    /// Whether an answer can outlive this start, for the latest check of a profile.
+    fn remember_now(&self, key: &str) -> Remember {
+        match self.latest.get(key) {
             Some(TrustState::Untrusted { remember, .. } | TrustState::Changed { remember, .. }) => match remember {
-                Remember::Yes => match &self.record_failure {
+                Remember::Yes => match self.record_failure.get(key) {
                     Some(why) => Remember::WindowOnly(format!("trust could not be recorded ({why})")),
                     None => Remember::Yes,
                 },
@@ -765,10 +894,11 @@ impl TrustGate {
         trust: bool,
         now_unix: u64,
     ) -> AnswerOutcome {
+        let shown_key = self.shown.get(&tab).map(|s| s.discovery.profile.key());
         if let Err(why) = Self::check_echo(
             self.shown.get(&tab),
             nonce,
-            self.latest.as_ref(),
+            shown_key.as_deref().and_then(|key| self.latest.get(key)),
             fingerprint,
             findings_digest,
         ) {
@@ -780,23 +910,32 @@ impl TrustGate {
             return AnswerOutcome::Refused(why.to_string());
         }
         let shown = self.shown.remove(&tab).expect("checked above");
-        let remember = self.remember_now();
+        let profile = shown.discovery.profile.clone();
+        let key = profile.key();
+        let remember = self.remember_now(&key);
         if !trust {
-            if shown.discovery.fully_hashed() {
-                self.answered = Some(Answered {
-                    fingerprint: shown.fingerprint,
-                    trust: ProjectTrust::Untrusted,
-                    window_only: None,
-                });
+            // An `n` for an agent that cannot leave the project's configuration out starts nothing,
+            // and is not remembered: the next start asks again.
+            if profile.requires_explicit_yes() {
+                return AnswerOutcome::NotStarted(refused_without_yes(&profile));
             }
-            let notice = (!self.said_not_loaded).then(|| NOT_LOADED.to_string());
-            self.said_not_loaded = true;
+            if shown.discovery.fully_hashed() {
+                self.answered.insert(
+                    key.clone(),
+                    Answered {
+                        fingerprint: shown.fingerprint,
+                        trust: ProjectTrust::Untrusted,
+                        window_only: None,
+                    },
+                );
+            }
+            let notice = self.said_not_loaded.insert(key).then(|| not_loaded(&profile));
             return AnswerOutcome::Start(ProjectTrust::Untrusted, notice);
         }
         // Every `y` waits for the worker to read the disk again: the prompt may have been on screen
         // for as long as it took to read it, and a configuration changed meanwhile must be asked
         // about rather than loaded unseen, whether or not a record is written.
-        let epoch = self.epoch;
+        let epoch = self.epoch_of(&key);
         match remember {
             Remember::SessionOnly(_) => {
                 let notice = session_only_notice(&shown.discovery);
@@ -835,25 +974,32 @@ impl TrustGate {
         }
     }
 
-    /// `:trust` (`tab` is the tab whose `:` line asked) or `:untrust`. Only queues: the worker runs a
-    /// fresh check and the record's removal, and the answer is a [`GateEvent::CommandDone`].
-    pub(crate) fn command(&mut self, request_id: String, action: TrustAction, tab: TabId) {
+    /// `:trust` (`tab` is the tab whose `:` line asked) or `:untrust`, about `profile` (that tab's
+    /// agent's). Only queues: the worker runs a fresh check and the record's removal, and the answer
+    /// is a [`GateEvent::CommandDone`].
+    pub(crate) fn command(&mut self, request_id: String, action: TrustAction, tab: TabId, profile: &Profile) {
         match action {
-            TrustAction::Trust => self.queue(Job::CommandCheck { request_id, tab }),
+            TrustAction::Trust => self.queue(Job::CommandCheck {
+                request_id,
+                tab,
+                profile: profile.clone(),
+            }),
             TrustAction::Untrust => {
                 // Before the forget is queued: from here on no start reuses this window's answer, and
                 // a record still queued for an earlier `y` is not trust when it lands.
+                let key = profile.key();
                 let had_window_trust = self
                     .answered
-                    .take()
+                    .remove(&key)
                     .is_some_and(|answered| answered.trust == ProjectTrust::Trusted);
-                self.epoch += 1;
+                *self.epochs.entry(key).or_insert(0) += 1;
                 let mut dropped = Vec::new();
                 self.drop_command_prompt_into(&mut dropped);
                 self.owed.extend(dropped);
                 self.queue(Job::Forget {
                     request_id,
                     had_window_trust,
+                    profile: profile.clone(),
                 });
             }
         }
@@ -861,16 +1007,16 @@ impl TrustGate {
 
     /// `:trust`'s prompt for `tab`, if `:trust` asked for one there and it can still be asked.
     pub(crate) fn show_command(&mut self, tab: TabId, request_id: &str) -> Option<TrustPromptView> {
-        match self.command_pending.take() {
-            Some((pending, pending_tab)) if pending == request_id && pending_tab == tab => {}
+        let key = match self.command_pending.take() {
+            Some((pending, pending_tab, key)) if pending == request_id && pending_tab == tab => key,
             other => {
                 self.command_pending = other;
                 return None;
             }
-        }
+        };
         let nonce = self.next_command_nonce;
         self.next_command_nonce += 1;
-        let (view, shown) = self.build_prompt(tab, nonce)?;
+        let (view, shown) = self.build_prompt(tab, nonce, &key)?;
         self.command_shown = Some(CommandShown {
             request_id: request_id.to_string(),
             tab,
@@ -899,6 +1045,8 @@ impl TrustGate {
     ) -> Option<CommandAnswer> {
         let command = self.command_shown.take_if(|c| c.tab == tab && c.shown.nonce == nonce)?;
         let request_id = command.request_id;
+        let profile = command.shown.discovery.profile.clone();
+        let key = profile.key();
         let done = |ok: bool, notice: Option<String>| CommandAnswer::Done {
             request_id: request_id.clone(),
             ok,
@@ -907,7 +1055,7 @@ impl TrustGate {
         if Self::check_echo(
             Some(&command.shown),
             nonce,
-            self.latest.as_ref(),
+            self.latest.get(&key),
             fingerprint,
             findings_digest,
         )
@@ -918,23 +1066,24 @@ impl TrustGate {
         if !trust {
             return Some(done(false, None));
         }
-        Some(match self.remember_now() {
+        Some(match self.remember_now(&key) {
             Remember::SessionOnly(_) => done(false, Some(cannot_remember_notice(&command.shown.discovery))),
             Remember::WindowOnly(why) => {
                 // Nothing is written, but the disk is read again first, as for a tab's `y`.
+                let epoch = self.epoch_of(&key);
                 self.queue(Job::Confirm {
                     purpose: Purpose::Command(request_id.clone()),
                     shown: Box::new(command.shown.discovery),
-                    epoch: self.epoch,
+                    epoch,
                     kept: Kept {
-                        notice: format!("{TRUSTED_FROM_NOW} (this window only: {why})"),
+                        notice: format!("{} (this window only: {why})", trusted_from_now(&profile)),
                         window_only: Some(why),
                     },
                 });
                 CommandAnswer::Recording
             }
             Remember::Yes => {
-                let epoch = self.epoch;
+                let epoch = self.epoch_of(&key);
                 self.queue(Job::Record {
                     purpose: Purpose::Command(request_id.clone()),
                     shown: Box::new(command.shown.discovery),
@@ -960,7 +1109,7 @@ impl TrustGate {
             .take()
             .map(|c| c.request_id)
             .into_iter()
-            .chain(self.command_pending.take().map(|(request_id, _)| request_id));
+            .chain(self.command_pending.take().map(|(request_id, _, _)| request_id));
         for request_id in request_ids {
             events.push(GateEvent::CommandDone {
                 request_id,
@@ -985,17 +1134,18 @@ impl TrustGate {
     /// A closed tab: its prompt and its wait go.
     pub(crate) fn forget_tab(&mut self, tab: TabId) {
         self.shown.remove(&tab);
-        self.waiting.retain(|(t, _)| *t != tab);
+        self.waiting.retain(|(t, _, _)| *t != tab);
         if self.command_shown.as_ref().is_some_and(|c| c.tab == tab)
-            || self.command_pending.as_ref().is_some_and(|(_, t)| *t == tab)
+            || self.command_pending.as_ref().is_some_and(|(_, t, _)| *t == tab)
         {
             self.drop_command_prompt();
         }
     }
 
-    /// The `trust` row of `prefix i`, for the window's latest check.
-    pub(crate) fn row(&self) -> String {
-        let Some(state) = self.latest.as_ref() else {
+    /// The `trust` row of `prefix i`, for the latest check of `profile` (the tab's agent's).
+    pub(crate) fn row(&self, profile: &Profile) -> String {
+        let key = profile.key();
+        let Some(state) = self.latest.get(&key) else {
             return "not checked yet".to_string();
         };
         match state {
@@ -1004,7 +1154,7 @@ impl TrustGate {
             TrustState::Untrusted { discovery, .. } | TrustState::Changed { discovery, .. } => {
                 let answered = self
                     .answered
-                    .as_ref()
+                    .get(&key)
                     .filter(|a| a.fingerprint == discovery.fingerprint && discovery.fully_hashed());
                 match (answered, state) {
                     (
@@ -1026,9 +1176,10 @@ impl TrustGate {
         }
     }
 
-    /// What a session started now would be given without asking; untrusted when it would ask.
-    pub(crate) fn next_session_trust(&self) -> ProjectTrust {
-        match self.current_route() {
+    /// What a session of `profile` started now would be given without asking; untrusted when it
+    /// would ask.
+    pub(crate) fn next_session_trust(&self, profile: &Profile) -> ProjectTrust {
+        match self.current_route(profile) {
             Some(Route::Start(trust)) => trust,
             Some(Route::Ask) | None => ProjectTrust::Untrusted,
         }
@@ -1046,6 +1197,16 @@ fn refused(purpose: Purpose, notice: String) -> GateEvent {
     }
 }
 
+/// The profile a check's result is about.
+fn state_profile(state: &TrustState) -> &Profile {
+    match state {
+        TrustState::NothingToTrust(discovery)
+        | TrustState::Trusted { discovery, .. }
+        | TrustState::Untrusted { discovery, .. }
+        | TrustState::Changed { discovery, .. } => &discovery.profile,
+    }
+}
+
 fn discovery_of(state: &TrustState) -> Option<&Discovery> {
     match state {
         TrustState::NothingToTrust(discovery)
@@ -1055,7 +1216,29 @@ fn discovery_of(state: &TrustState) -> Option<&Discovery> {
     }
 }
 
-/// One finding as the prompt shows it.
+/// One finding as the prompt shows it: one row, or for a rule file whose calls are all it holds one
+/// row per call (a file with none still gets its row).
+fn items_of(finding: &Finding) -> Vec<TrustItemView> {
+    match finding {
+        Finding::RuleFile {
+            path,
+            calls,
+            text: None,
+        } if !calls.is_empty() => calls
+            .iter()
+            .map(|call| TrustItemView {
+                what: "rule",
+                file: path.display().to_string(),
+                label: "exec-policy rule".to_string(),
+                value: call.clone(),
+                outside: false,
+            })
+            .collect(),
+        other => vec![item_of(other)],
+    }
+}
+
+/// One finding as one row of the prompt.
 fn item_of(finding: &Finding) -> TrustItemView {
     let lossy = |p: &Path| p.display().to_string();
     let item = |what: &'static str, file: &Path, label: String, value: String| TrustItemView {
@@ -1082,7 +1265,14 @@ fn item_of(finding: &Finding) -> TrustItemView {
             file,
             name,
             command_line,
-        } => item("mcp_server", file, name.clone(), command_line.clone()),
+            approval_mode,
+        } => {
+            let label = match approval_mode {
+                Some(mode) => format!("{name} (tools approved: {mode})"),
+                None => name.clone(),
+            };
+            item("mcp_server", file, label, command_line.clone())
+        }
         Finding::EnvKey { file, key } => item("env_key", file, "env".to_string(), key.clone()),
         Finding::ApiKeyHelper { file, command } => {
             item("api_key_helper", file, "apiKeyHelper".to_string(), command.clone())
@@ -1096,7 +1286,26 @@ fn item_of(finding: &Finding) -> TrustItemView {
         ),
         Finding::OtherSetting { file, key, value } => item("other_setting", file, key.clone(), value.clone()),
         Finding::Unparsed { file, reason } => item("unparsed", file, "not parsed".to_string(), reason.clone()),
-        Finding::ClaudeMd { path } => item("claude_md", path, "memory file".to_string(), "present".to_string()),
+        Finding::Memory { path } => item("memory", path, "memory file".to_string(), "present".to_string()),
+        // A file that is more than its rule calls is shown whole: what it allows may be spelt in no
+        // call a scan can pick out.
+        Finding::RuleFile {
+            path, text: Some(text), ..
+        } => item("rule", path, "exec-policy rules, whole file".to_string(), text.clone()),
+        Finding::RuleFile { path, .. } => item(
+            "rule",
+            path,
+            "exec-policy rules".to_string(),
+            "only comments".to_string(),
+        ),
+        Finding::Skill { path, name } => item("skill", path, "skill".to_string(), name.clone()),
+        Finding::PluginListing { path } => item(
+            "plugin_listing",
+            path,
+            "plugin listing".to_string(),
+            "present".to_string(),
+        ),
+        Finding::Overridden { file, key, value } => item("overridden", file, key.clone(), value.clone()),
         Finding::Symlink { path, target, outside } => TrustItemView {
             outside: *outside,
             ..item("symlink", path, lossy(path), lossy(target))
@@ -1117,12 +1326,48 @@ fn item_of(finding: &Finding) -> TrustItemView {
     }
 }
 
+/// Where Codex keeps the user's own configuration, as far as Eitri can tell without asking it.
+#[derive(Debug, PartialEq, Eq)]
+struct CodexHomeGuess {
+    /// A project's `.codex/` that is this directory is the user's own and is not read. `None` skips
+    /// nothing.
+    skip: Option<PathBuf>,
+    /// Where the alternate names of `AGENTS.md` are read from.
+    config: Option<PathBuf>,
+}
+
+/// Codex's home from `CODEX_HOME` (`var`), as Codex picks it: unset or empty means `~/.codex`, and
+/// any other value is used as given, a relative one resolved against Codex's own working directory.
+/// That directory is the project root when Eitri starts it, but nothing here can be sure of it, so
+/// a relative value skips no `.codex/` (each is asked about) and only the alternate names are read
+/// from the root's join, which can add files to ask about but never remove one. Touches no disk.
+fn codex_home_guess(var: Option<&std::ffi::OsStr>, home: Option<&Path>, root: &Path) -> CodexHomeGuess {
+    match var.filter(|v| !v.is_empty()).map(Path::new) {
+        None => {
+            let default = home.map(|h| h.join(".codex"));
+            CodexHomeGuess {
+                skip: default.clone(),
+                config: default,
+            }
+        }
+        Some(dir) if dir.is_absolute() => CodexHomeGuess {
+            skip: Some(dir.to_path_buf()),
+            config: Some(dir.to_path_buf()),
+        },
+        Some(relative) => CodexHomeGuess {
+            skip: None,
+            config: Some(root.join(relative)),
+        },
+    }
+}
+
 /// The worker: the only code here that touches the disk. It owns the store, runs each job in the
 /// order queued, and ends when the gate (and so the sender) is dropped.
 fn run_worker(
     store: TrustStore,
     root: PathBuf,
     home: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
     jobs: mpsc::Receiver<Job>,
     done: mpsc::Sender<Done>,
     before_each: Box<dyn Fn() + Send>,
@@ -1133,13 +1378,33 @@ fn run_worker(
         .filter(|h| h.is_absolute())
         .map(|h| std::fs::canonicalize(&h).unwrap_or(h));
     let home = home.as_deref();
-    let check = |store: &TrustStore| eitri_core::project_trust::for_root(store, &root, home);
+    let canonical = |h: PathBuf| std::fs::canonicalize(&h).unwrap_or(h);
+    let guess = codex_home_guess(codex_home.as_deref().map(Path::as_os_str), home, &root);
+    let codex_home = guess.skip.map(canonical);
+    let codex_config_dir = guess.config.map(canonical);
+    // Read again for every Codex job: the user may change the alternate names while Eitri runs.
+    let env_for = |profile: &Profile| match profile {
+        Profile::Codex => ProfileEnv {
+            fallback_names: codex_config_dir
+                .as_deref()
+                .map(eitri_core::project_trust::codex_fallback_names)
+                .unwrap_or_default(),
+            codex_home: codex_home.clone(),
+        },
+        Profile::Claude | Profile::Acp { .. } => ProfileEnv::default(),
+    };
+    let check = |store: &TrustStore, profile: &Profile| {
+        eitri_core::project_trust::for_root(store, &root, home, profile, &env_for(profile))
+    };
+    let rediscover = |profile: &Profile| {
+        eitri_core::project_trust::discover(&root, home, &Default::default(), profile, &env_for(profile))
+    };
     while let Ok(job) = jobs.recv() {
         before_each();
         let result = match job {
-            Job::Check { generation } => Done::Checked {
+            Job::Check { generation, profile } => Done::Checked {
                 generation,
-                state: check(&store),
+                state: check(&store, &profile),
             },
             Job::Record {
                 purpose,
@@ -1149,7 +1414,7 @@ fn run_worker(
             } => {
                 // What was shown is what is written, and only if the disk still says the same: a
                 // change since the prompt is asked about again rather than trusted unseen.
-                let fresh = eitri_core::project_trust::discover(&root, home, &Default::default());
+                let fresh = rediscover(&shown.profile);
                 if fresh.fingerprint != shown.fingerprint {
                     Done::Moved {
                         purpose,
@@ -1167,6 +1432,7 @@ fn run_worker(
                         },
                         Err(e) => Done::RecordFailed {
                             purpose,
+                            profile: shown.profile.key(),
                             reason: e.to_string(),
                         },
                     }
@@ -1178,7 +1444,7 @@ fn run_worker(
                 epoch,
                 kept,
             } => {
-                let fresh = eitri_core::project_trust::discover(&root, home, &Default::default());
+                let fresh = rediscover(&shown.profile);
                 if fresh.fingerprint != shown.fingerprint {
                     Done::Moved {
                         purpose,
@@ -1193,17 +1459,22 @@ fn run_worker(
                     }
                 }
             }
-            Job::CommandCheck { request_id, tab } => Done::CommandChecked {
+            Job::CommandCheck {
                 request_id,
                 tab,
-                state: check(&store),
+                profile,
+            } => Done::CommandChecked {
+                request_id,
+                tab,
+                state: check(&store, &profile),
             },
             Job::Forget {
                 request_id,
                 had_window_trust,
+                profile,
             } => {
-                let (ok, notice) = match store.forget(&root) {
-                    Ok(existed) if existed || had_window_trust => (true, UNTRUSTED_FROM_NOW.to_string()),
+                let (ok, notice) = match store.forget(&root, &profile) {
+                    Ok(existed) if existed || had_window_trust => (true, untrusted_from_now(&profile)),
                     Ok(_) => (true, WAS_NOT_TRUSTED.to_string()),
                     Err(e) => (false, e.to_string()),
                 };
@@ -1211,7 +1482,7 @@ fn run_worker(
                     request_id,
                     ok,
                     notice,
-                    state: check(&store),
+                    state: check(&store, &profile),
                 }
             }
         };
@@ -1314,7 +1585,13 @@ mod tests {
 
         /// Records the configuration as it is now, as another window's `y` would have.
         fn trust_now(&self, at: u64) {
-            let found = eitri_core::project_trust::discover(&self.root, Some(&self.home), &Default::default());
+            let found = eitri_core::project_trust::discover(
+                &self.root,
+                Some(&self.home),
+                &Default::default(),
+                &Profile::Claude,
+                &ProfileEnv::default(),
+            );
             self.store().record(&found, at).unwrap();
         }
     }
@@ -1340,6 +1617,7 @@ mod tests {
 
     const SETTINGS: &str = ".claude/settings.json";
     const A: TabId = TabId(1);
+    const CLAUDE: Profile = Profile::Claude;
     const B: TabId = TabId(2);
 
     /// Polls every 5 ms until `done` holds for everything seen so far, for at most two seconds.
@@ -1358,8 +1636,8 @@ mod tests {
 
     /// A start for `tab`, as the panel defers one: waits for a fresh check and returns its route.
     fn start(gate: &mut TrustGate, tab: TabId) -> Route {
-        gate.wait_for(tab);
-        gate.begin_check();
+        gate.wait_for(tab, &CLAUDE);
+        gate.begin_check(&CLAUDE);
         let seen = drain(gate, |seen| {
             seen.iter().any(|e| matches!(e, GateEvent::Route(t, _) if *t == tab))
         });
@@ -1390,7 +1668,7 @@ mod tests {
     }
 
     fn command(gate: &mut TrustGate, request: &str, action: TrustAction) -> Vec<GateEvent> {
-        gate.command(request.to_string(), action, A);
+        gate.command(request.to_string(), action, A, &CLAUDE);
         drain(gate, |seen| {
             command_done(seen, request).is_some()
                 || seen
@@ -1404,11 +1682,11 @@ mod tests {
         let fx = Fx::new("nothing");
         fx.write("src/main.rs", b"fn main() {}\n");
         let mut gate = fx.gate();
-        assert_eq!(gate.row(), "not checked yet");
+        assert_eq!(gate.row(&CLAUDE), "not checked yet");
         assert_eq!(start(&mut gate, A), Route::Start(ProjectTrust::Untrusted));
-        assert!(gate.show(A, 1).is_none(), "nothing to ask about");
-        assert_eq!(gate.row(), "nothing to trust");
-        assert_eq!(gate.next_session_trust(), ProjectTrust::Untrusted);
+        assert!(gate.show(A, 1, &CLAUDE).is_none(), "nothing to ask about");
+        assert_eq!(gate.row(&CLAUDE), "nothing to trust");
+        assert_eq!(gate.next_session_trust(&CLAUDE), ProjectTrust::Untrusted);
     }
 
     #[test]
@@ -1418,9 +1696,9 @@ mod tests {
         fx.trust_now(1_790_000_000);
         let mut gate = fx.gate();
         assert_eq!(start(&mut gate, A), Route::Start(ProjectTrust::Trusted));
-        assert!(gate.show(A, 1).is_none());
-        assert_eq!(gate.row(), "trusted since 2026-09-21");
-        assert_eq!(gate.next_session_trust(), ProjectTrust::Trusted);
+        assert!(gate.show(A, 1, &CLAUDE).is_none());
+        assert_eq!(gate.row(&CLAUDE), "trusted since 2026-09-21");
+        assert_eq!(gate.next_session_trust(&CLAUDE), ProjectTrust::Trusted);
     }
 
     #[test]
@@ -1429,19 +1707,19 @@ mod tests {
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         let mut gate = fx.gate();
         assert_eq!(start(&mut gate, A), Route::Ask);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(view.state, TrustPromptState::Untrusted);
         assert_eq!(view.remember, TrustRememberView::Yes);
         assert!(view.items.iter().any(|i| i.what == "hook" && i.value == "touch /tmp/a"));
-        assert_eq!(gate.next_session_trust(), ProjectTrust::Untrusted);
+        assert_eq!(gate.next_session_trust(&CLAUDE), ProjectTrust::Untrusted);
 
         fx.trust_now(5);
         fx.write(SETTINGS, &hook("touch /tmp/b"));
         assert_eq!(start(&mut gate, B), Route::Ask);
-        let view = gate.show(B, 2).unwrap();
+        let view = gate.show(B, 2, &CLAUDE).unwrap();
         assert_eq!(view.state, TrustPromptState::Changed);
         assert_eq!(view.changed.unwrap().changed, vec![SETTINGS.to_string()]);
-        assert_eq!(gate.row(), "changed since trusted");
+        assert_eq!(gate.row(&CLAUDE), "changed since trusted");
     }
 
     #[test]
@@ -1450,14 +1728,14 @@ mod tests {
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         let mut gate = fx.gate();
         assert_eq!(start(&mut gate, A), Route::Ask);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(
             answer(&mut gate, &view, false),
             AnswerOutcome::Start(ProjectTrust::Untrusted, Some(NOT_LOADED.to_string()))
         );
         // Another tab of this window starts without the question while nothing changed.
         assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Untrusted));
-        assert_eq!(gate.next_session_trust(), ProjectTrust::Untrusted);
+        assert_eq!(gate.next_session_trust(&CLAUDE), ProjectTrust::Untrusted);
         fx.write(SETTINGS, &hook("touch /tmp/b"));
         assert_eq!(start(&mut gate, B), Route::Ask, "a changed fingerprint asks again");
         assert!(!fx.record_file().exists(), "an n writes nothing");
@@ -1469,7 +1747,7 @@ mod tests {
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         let mut gate = TrustGate::new(TrustStore::at(None), fx.root.clone(), Some(fx.home.clone()));
         assert_eq!(start(&mut gate, A), Route::Ask);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(view.remember, TrustRememberView::Window);
         let why = "no usable state directory (XDG_STATE_HOME/HOME)";
         assert_eq!(view.remember_note.as_deref(), Some(why));
@@ -1485,8 +1763,8 @@ mod tests {
             "trusted for this window only: no usable state directory (XDG_STATE_HOME/HOME)"
         );
         assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Trusted));
-        assert_eq!(gate.row(), format!("trusted for this window only ({why})"));
-        assert_eq!(gate.next_session_trust(), ProjectTrust::Trusted);
+        assert_eq!(gate.row(&CLAUDE), format!("trusted for this window only ({why})"));
+        assert_eq!(gate.next_session_trust(&CLAUDE), ProjectTrust::Trusted);
     }
 
     #[test]
@@ -1495,14 +1773,14 @@ mod tests {
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         let mut gate = fx.gate();
         start(&mut gate, A);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(
             answer(&mut gate, &view, false),
             AnswerOutcome::Start(ProjectTrust::Untrusted, Some(NOT_LOADED.to_string()))
         );
         fx.write(SETTINGS, &hook("touch /tmp/b"));
         assert_eq!(start(&mut gate, B), Route::Ask);
-        let view = gate.show(B, 2).unwrap();
+        let view = gate.show(B, 2, &CLAUDE).unwrap();
         assert_eq!(
             answer(&mut gate, &view, false),
             AnswerOutcome::Start(ProjectTrust::Untrusted, None),
@@ -1668,7 +1946,7 @@ mod tests {
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         let mut gate = fx.gate();
         start(&mut gate, A);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
         drain(&mut gate, |seen| {
             seen.contains(&GateEvent::Recorded { tab: A, notice: None })
@@ -1681,7 +1959,7 @@ mod tests {
             Some((true, Some(UNTRUSTED_FROM_NOW.to_string())))
         );
         assert!(!fx.record_file().exists());
-        assert_eq!(gate.row(), "not trusted");
+        assert_eq!(gate.row(&CLAUDE), "not trusted");
         assert_eq!(start(&mut gate, B), Route::Ask);
     }
 
@@ -1692,10 +1970,10 @@ mod tests {
         let hold = WorkerHold::default();
         let mut gate = fx.held(&hold);
         start(&mut gate, A);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         hold.close();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
-        gate.command("u".into(), TrustAction::Untrust, A);
+        gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
         hold.open();
         let seen = drain(&mut gate, |seen| command_done(seen, "u").is_some());
         assert!(
@@ -1714,31 +1992,31 @@ mod tests {
     fn the_row_for_each_state() {
         let fx = Fx::new("row");
         let mut gate = fx.gate();
-        assert_eq!(gate.row(), "not checked yet");
+        assert_eq!(gate.row(&CLAUDE), "not checked yet");
         start(&mut gate, A);
-        assert_eq!(gate.row(), "nothing to trust");
+        assert_eq!(gate.row(&CLAUDE), "nothing to trust");
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         start(&mut gate, A);
-        assert_eq!(gate.row(), "not trusted");
-        let view = gate.show(A, 1).unwrap();
+        assert_eq!(gate.row(&CLAUDE), "not trusted");
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         answer(&mut gate, &view, false);
-        assert_eq!(gate.row(), "not trusted (answered n in this window)");
+        assert_eq!(gate.row(&CLAUDE), "not trusted (answered n in this window)");
         fx.trust_now(1_790_000_000);
         start(&mut gate, A);
-        assert_eq!(gate.row(), "trusted since 2026-09-21");
+        assert_eq!(gate.row(&CLAUDE), "trusted since 2026-09-21");
         fx.write(SETTINGS, &hook("touch /tmp/b"));
         start(&mut gate, A);
-        assert_eq!(gate.row(), "changed since trusted");
+        assert_eq!(gate.row(&CLAUDE), "changed since trusted");
 
         let mut window = TrustGate::new(TrustStore::at(None), fx.root.clone(), Some(fx.home.clone()));
         start(&mut window, A);
-        let view = window.show(A, 1).unwrap();
+        let view = window.show(A, 1, &CLAUDE).unwrap();
         answer(&mut window, &view, true);
         drain(&mut window, |seen| {
             seen.iter().any(|e| matches!(e, GateEvent::Recorded { tab: A, .. }))
         });
         assert_eq!(
-            window.row(),
+            window.row(&CLAUDE),
             "trusted for this window only (no usable state directory (XDG_STATE_HOME/HOME))"
         );
     }
@@ -1746,14 +2024,20 @@ mod tests {
     #[test]
     fn a_stale_check_result_does_not_resolve_a_newer_wait() {
         let fx = Fx::new("stale");
-        let state = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
+        let state = eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
         let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
-        let first = gate.begin_check();
-        gate.wait_for(A);
-        let second = gate.begin_check();
+        let first = gate.begin_check(&CLAUDE);
+        gate.wait_for(A, &CLAUDE);
+        let second = gate.begin_check(&CLAUDE);
         assert!(second > first);
-        assert!(matches!(jobs.try_recv(), Ok(Job::Check { generation }) if generation == first));
-        assert!(matches!(jobs.try_recv(), Ok(Job::Check { generation }) if generation == second));
+        assert!(matches!(jobs.try_recv(), Ok(Job::Check { generation, .. }) if generation == first));
+        assert!(matches!(jobs.try_recv(), Ok(Job::Check { generation, .. }) if generation == second));
         done.send(Done::Checked {
             generation: first,
             state: state.clone(),
@@ -1777,14 +2061,20 @@ mod tests {
     fn an_answer_echoing_another_fingerprint_or_digest_is_refused() {
         let fx = Fx::new("echo");
         fx.write(SETTINGS, &hook("touch /tmp/a"));
-        let state = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
+        let state = eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
         let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
-        gate.wait_for(A);
-        gate.begin_check();
+        gate.wait_for(A, &CLAUDE);
+        gate.begin_check(&CLAUDE);
         done.send(Done::Checked { generation: 1, state }).unwrap();
         assert_eq!(gate.poll(), vec![GateEvent::Route(A, Route::Ask)]);
         let _ = jobs.try_recv();
-        let view = gate.show(A, 7).unwrap();
+        let view = gate.show(A, 7, &CLAUDE).unwrap();
         let digest = view.findings_digest();
         let other = "0".repeat(64);
         for (nonce, fingerprint, digest, why) in [
@@ -1793,7 +2083,7 @@ mod tests {
             (8, view.fingerprint.as_str(), digest.as_str(), NOT_CURRENT),
         ] {
             // Shown again each time: an answer that echoes something else spends the prompt.
-            let view = gate.show(A, 7).unwrap();
+            let view = gate.show(A, 7, &CLAUDE).unwrap();
             assert_eq!(view.findings_digest(), digest_of(&gate, A));
             assert_eq!(
                 gate.answer(A, nonce, fingerprint, digest, true, 1),
@@ -1801,7 +2091,7 @@ mod tests {
             );
             assert!(jobs.try_recv().is_err(), "nothing was queued");
         }
-        let view = gate.show(A, 9).unwrap();
+        let view = gate.show(A, 9, &CLAUDE).unwrap();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
         assert!(matches!(jobs.try_recv(), Ok(Job::Record { .. })));
     }
@@ -1816,10 +2106,10 @@ mod tests {
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         let mut gate = fx.gate();
         assert_eq!(start(&mut gate, A), Route::Ask);
-        let first = gate.show(A, 1).unwrap();
+        let first = gate.show(A, 1, &CLAUDE).unwrap();
         fx.write(SETTINGS, &hook("touch /tmp/b"));
-        gate.wait_for(B);
-        gate.begin_check();
+        gate.wait_for(B, &CLAUDE);
+        gate.begin_check(&CLAUDE);
         let seen = drain(&mut gate, |seen| {
             seen.iter().any(|e| matches!(e, GateEvent::Route(t, _) if *t == B))
         });
@@ -1829,7 +2119,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(gate.poll().is_empty(), "no record was queued");
         assert!(!fx.record_file().exists());
-        let second = gate.show(A, 2).unwrap();
+        let second = gate.show(A, 2, &CLAUDE).unwrap();
         assert_ne!(second.fingerprint, first.fingerprint);
     }
 
@@ -1840,7 +2130,7 @@ mod tests {
         let hold = WorkerHold::default();
         let mut gate = fx.held(&hold);
         start(&mut gate, A);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         hold.close();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
         fx.write(SETTINGS, &hook("touch /tmp/b"));
@@ -1853,7 +2143,7 @@ mod tests {
             notice: CHANGED_WHILE_READING.to_string()
         }));
         assert!(!fx.record_file().exists());
-        let again = gate.show(A, 2).unwrap();
+        let again = gate.show(A, 2, &CLAUDE).unwrap();
         assert_ne!(again.fingerprint, view.fingerprint, "asked about what is there now");
     }
 
@@ -1864,7 +2154,7 @@ mod tests {
         fx.write(SETTINGS, &body);
         let mut gate = fx.gate();
         assert_eq!(start(&mut gate, A), Route::Ask);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(view.remember, TrustRememberView::Session);
         assert!(view
             .remember_note
@@ -1887,13 +2177,13 @@ mod tests {
         });
         assert!(!fx.record_file().exists());
         assert_eq!(start(&mut gate, B), Route::Ask, "the next start asks again");
-        assert_eq!(gate.next_session_trust(), ProjectTrust::Untrusted);
+        assert_eq!(gate.next_session_trust(&CLAUDE), ProjectTrust::Untrusted);
         // Changed in place at the same size: still asked, still never recorded.
         let changed = padded_hook("touch /tmp/b", 5 << 20);
         assert_eq!(changed.len(), body.len());
         fx.write(SETTINGS, &changed);
         assert_eq!(start(&mut gate, B), Route::Ask);
-        let view = gate.show(B, 2).unwrap();
+        let view = gate.show(B, 2, &CLAUDE).unwrap();
         assert!(matches!(
             answer(&mut gate, &view, false),
             AnswerOutcome::Start(ProjectTrust::Untrusted, _)
@@ -1914,7 +2204,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, fx.root.join(SETTINGS)).unwrap();
         let mut gate = fx.gate();
         assert_eq!(start(&mut gate, A), Route::Ask);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(view.remember, TrustRememberView::Session);
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
         drain(&mut gate, |seen| {
@@ -1924,7 +2214,7 @@ mod tests {
             })
         });
         assert_eq!(start(&mut gate, B), Route::Ask, "the next start asks again");
-        let view = gate.show(B, 2).unwrap();
+        let view = gate.show(B, 2, &CLAUDE).unwrap();
         assert!(matches!(
             answer(&mut gate, &view, false),
             AnswerOutcome::Start(ProjectTrust::Untrusted, _)
@@ -1940,7 +2230,7 @@ mod tests {
         let hold = WorkerHold::default();
         let mut gate = fx.held(&hold);
         start(&mut gate, A);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         hold.close();
         let began = Instant::now();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
@@ -1963,7 +2253,7 @@ mod tests {
         std::fs::write(fx.state.join("eitri/trust"), b"i am a file\n").unwrap();
         let mut gate = fx.gate();
         start(&mut gate, A);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(view.remember, TrustRememberView::Yes);
         let began = Instant::now();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
@@ -1981,7 +2271,7 @@ mod tests {
         assert!(notice.starts_with("trust could not be recorded ("), "{notice}");
         assert!(notice.ends_with("); asking again for this window only"), "{notice}");
         assert!(!seen.contains(&GateEvent::Recorded { tab: A, notice: None }));
-        let again = gate.show(A, 2).unwrap();
+        let again = gate.show(A, 2, &CLAUDE).unwrap();
         assert_eq!(again.remember, TrustRememberView::Window);
         assert!(again
             .remember_note
@@ -2021,7 +2311,7 @@ mod tests {
             hold.clone(),
         );
         assert_eq!(start(&mut gate, A), Route::Ask);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(view.remember, TrustRememberView::Window);
         hold.close();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
@@ -2039,7 +2329,7 @@ mod tests {
             "{seen:?}"
         );
         assert_eq!(start(&mut gate, B), Route::Ask, "the window remembers nothing");
-        let again = gate.show(B, 2).unwrap();
+        let again = gate.show(B, 2, &CLAUDE).unwrap();
         assert_ne!(again.fingerprint, view.fingerprint, "asked about what is there now");
         assert!(again.items.iter().any(|i| i.value == "touch /tmp/evil"));
     }
@@ -2054,7 +2344,7 @@ mod tests {
         let hold = WorkerHold::default();
         let mut gate = fx.held(&hold);
         assert_eq!(start(&mut gate, A), Route::Ask);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(view.remember, TrustRememberView::Session);
         hold.close();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
@@ -2101,17 +2391,29 @@ mod tests {
         let fx = Fx::new("batch-route");
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         fx.trust_now(1_790_000_000);
-        let trusted = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
+        let trusted = eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
         assert!(matches!(trusted, TrustState::Trusted { .. }));
         fx.write(SETTINGS, &hook("touch /tmp/evil"));
-        let changed = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
+        let changed = eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
         assert!(matches!(changed, TrustState::Changed { .. }));
 
         let (mut gate, _jobs, done) = TrustGate::detached(fx.root.clone());
-        gate.wait_for(A);
-        let first = gate.begin_check();
-        gate.wait_for(B);
-        let second = gate.begin_check();
+        gate.wait_for(A, &CLAUDE);
+        let first = gate.begin_check(&CLAUDE);
+        gate.wait_for(B, &CLAUDE);
+        let second = gate.begin_check(&CLAUDE);
         done.send(Done::Checked {
             generation: first,
             state: trusted.clone(),
@@ -2133,11 +2435,17 @@ mod tests {
         // The other way round the newest result is the trusted one, and both start with it.
         let (mut gate, _jobs, done) = TrustGate::detached(fx.root.clone());
         fx.write(SETTINGS, &hook("touch /tmp/a"));
-        let untrusted_first = eitri_core::project_trust::for_root(&TrustStore::at(None), &fx.root, Some(&fx.home));
-        gate.wait_for(A);
-        let first = gate.begin_check();
-        gate.wait_for(B);
-        let second = gate.begin_check();
+        let untrusted_first = eitri_core::project_trust::for_root(
+            &TrustStore::at(None),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
+        gate.wait_for(A, &CLAUDE);
+        let first = gate.begin_check(&CLAUDE);
+        gate.wait_for(B, &CLAUDE);
+        let second = gate.begin_check(&CLAUDE);
         done.send(Done::Checked {
             generation: first,
             state: untrusted_first,
@@ -2163,25 +2471,43 @@ mod tests {
     fn a_record_overtaken_by_a_newer_check_in_the_same_batch_is_refused() {
         let fx = Fx::new("batch-record");
         fx.write(SETTINGS, &hook("touch /tmp/a"));
-        let untrusted = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
+        let untrusted = eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
         let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
-        gate.wait_for(A);
-        let first = gate.begin_check();
+        gate.wait_for(A, &CLAUDE);
+        let first = gate.begin_check(&CLAUDE);
         done.send(Done::Checked {
             generation: first,
             state: untrusted,
         })
         .unwrap();
         assert_eq!(gate.poll(), vec![GateEvent::Route(A, Route::Ask)]);
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
         let _ = jobs.try_recv();
-        let shown = eitri_core::project_trust::discover(&fx.root, Some(&fx.home), &Default::default());
+        let shown = eitri_core::project_trust::discover(
+            &fx.root,
+            Some(&fx.home),
+            &Default::default(),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
         fx.store().record(&shown, 1).unwrap();
         fx.write(SETTINGS, &hook("touch /tmp/evil"));
-        let changed = eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home));
-        gate.wait_for(B);
-        let second = gate.begin_check();
+        let changed = eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
+        gate.wait_for(B, &CLAUDE);
+        let second = gate.begin_check(&CLAUDE);
         done.send(Done::Recorded {
             purpose: Purpose::ForTab(A),
             epoch: 0,
@@ -2217,8 +2543,8 @@ mod tests {
         let hold = WorkerHold::closed();
         let mut gate = fx.held(&hold);
         let began = Instant::now();
-        gate.command("t".into(), TrustAction::Trust, A);
-        gate.command("u".into(), TrustAction::Untrust, A);
+        gate.command("t".into(), TrustAction::Trust, A, &CLAUDE);
+        gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
         assert!(began.elapsed() < Duration::from_millis(50));
         std::thread::sleep(Duration::from_millis(50));
         assert!(gate.poll().is_empty());
@@ -2253,6 +2579,13 @@ mod tests {
                 file: p(".mcp.json"),
                 name: "m".into(),
                 command_line: "sh -c x".into(),
+                approval_mode: None,
+            },
+            Finding::McpServer {
+                file: p(".codex/config.toml"),
+                name: "c".into(),
+                command_line: "srv".into(),
+                approval_mode: Some("approve".into()),
             },
             Finding::EnvKey {
                 file: p(SETTINGS),
@@ -2279,7 +2612,37 @@ mod tests {
                 file: p(".mcp.json"),
                 reason: "bad".into(),
             },
-            Finding::ClaudeMd { path: p("CLAUDE.md") },
+            Finding::Memory { path: p("CLAUDE.md") },
+            Finding::RuleFile {
+                path: p(".codex/rules/a.rules"),
+                calls: vec![
+                    "prefix_rule(pattern=[\"ls\"])".into(),
+                    "prefix_rule(pattern=[\"pwd\"])".into(),
+                ],
+                text: None,
+            },
+            Finding::RuleFile {
+                path: p(".codex/rules/b.rules"),
+                calls: vec![],
+                text: None,
+            },
+            Finding::RuleFile {
+                path: p(".codex/rules/c.rules"),
+                calls: vec![],
+                text: Some("r = prefix_rule\nr(pattern=[\"rm\"], decision=\"allow\")\n".into()),
+            },
+            Finding::Skill {
+                path: p(".agents/skills/s"),
+                name: "s".into(),
+            },
+            Finding::PluginListing {
+                path: p(".claude-plugin/marketplace.json"),
+            },
+            Finding::Overridden {
+                file: p(".codex/config.toml"),
+                key: "sandbox_mode".into(),
+                value: "\"danger-full-access\"".into(),
+            },
             Finding::Symlink {
                 path: p(".claude/hooks/run"),
                 target: p("/opt/x/run"),
@@ -2307,6 +2670,7 @@ mod tests {
             },
         ];
         let discovery = Discovery {
+            profile: Profile::Claude,
             root: p("/home/u/p"),
             top: p("/home/u/p"),
             walked: vec![p("/home/u/p")],
@@ -2331,7 +2695,7 @@ mod tests {
         })
         .unwrap();
         gate.poll();
-        let view = gate.show(A, 1).unwrap();
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
         let rows: Vec<(&str, &str, &str, &str, bool)> = view
             .items
             .iter()
@@ -2343,13 +2707,63 @@ mod tests {
                 ("hook", SETTINGS, "PreToolUse (Bash)", "run", false),
                 ("hook", SETTINGS, "SessionStart", "go", false),
                 ("mcp_server", ".mcp.json", "m", "sh -c x", false),
+                (
+                    "mcp_server",
+                    ".codex/config.toml",
+                    "c (tools approved: approve)",
+                    "srv",
+                    false,
+                ),
                 ("env_key", SETTINGS, "env", "K", false),
                 ("api_key_helper", SETTINGS, "apiKeyHelper", "helper", false),
                 ("allow", SETTINGS, "permissions.allow", "Bash(ls)", false),
                 ("additional_directory", SETTINGS, "additionalDirectories", "/x", false),
                 ("other_setting", SETTINGS, "model", "\"m\"", false),
                 ("unparsed", ".mcp.json", "not parsed", "bad", false),
-                ("claude_md", "CLAUDE.md", "memory file", "present", false),
+                ("memory", "CLAUDE.md", "memory file", "present", false),
+                (
+                    "rule",
+                    ".codex/rules/a.rules",
+                    "exec-policy rule",
+                    "prefix_rule(pattern=[\"ls\"])",
+                    false,
+                ),
+                (
+                    "rule",
+                    ".codex/rules/a.rules",
+                    "exec-policy rule",
+                    "prefix_rule(pattern=[\"pwd\"])",
+                    false,
+                ),
+                (
+                    "rule",
+                    ".codex/rules/b.rules",
+                    "exec-policy rules",
+                    "only comments",
+                    false
+                ),
+                (
+                    "rule",
+                    ".codex/rules/c.rules",
+                    "exec-policy rules, whole file",
+                    "r = prefix_rule\nr(pattern=[\"rm\"], decision=\"allow\")\n",
+                    false,
+                ),
+                ("skill", ".agents/skills/s", "skill", "s", false),
+                (
+                    "plugin_listing",
+                    ".claude-plugin/marketplace.json",
+                    "plugin listing",
+                    "present",
+                    false,
+                ),
+                (
+                    "overridden",
+                    ".codex/config.toml",
+                    "sandbox_mode",
+                    "\"danger-full-access\"",
+                    false,
+                ),
                 ("symlink", ".claude/hooks/run", ".claude/hooks/run", "/opt/x/run", true),
                 ("other_files", ".claude/agents", "other files", "3", false),
                 ("not_read", ".claude/worktrees", "not read", "kept apart", false),
@@ -2416,5 +2830,224 @@ mod tests {
                 source.path
             );
         }
+    }
+
+    // ---- one gate, several agents ---------------------------------------------------------------
+
+    const CODEX: Profile = Profile::Codex;
+
+    fn gem() -> Profile {
+        Profile::Acp {
+            name: "gem".into(),
+            files: vec!["GEM.md".into()],
+        }
+    }
+
+    /// A start of `profile` for `tab`: waits for a fresh check of it and returns its route.
+    fn start_as(gate: &mut TrustGate, tab: TabId, profile: &Profile) -> Route {
+        gate.wait_for(tab, profile);
+        gate.begin_check(profile);
+        let seen = drain(gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Route(t, _) if *t == tab))
+        });
+        seen.into_iter()
+            .find_map(|e| match e {
+                GateEvent::Route(t, route) if t == tab => Some(route),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn item_files(view: &TrustPromptView) -> Vec<String> {
+        view.items.iter().map(|item| item.file.clone()).collect()
+    }
+
+    /// A Claude tab and a Codex tab wait at once: two checks, each with its own tab's profile, two
+    /// questions about two different sets of files under two nonces, and a check of one agent never
+    /// takes the other's question off.
+    #[test]
+    fn two_waiting_tabs_of_two_agents_get_two_questions() {
+        let fx = Fx::new("two-agents");
+        fx.write(SETTINGS, &hook("touch /tmp/claude"));
+        fx.write("AGENTS.md", b"codex instructions\n");
+        let mut gate = fx.gate();
+        gate.wait_for(A, &CLAUDE);
+        gate.begin_check(&CLAUDE);
+        gate.wait_for(B, &CODEX);
+        gate.begin_check(&CODEX);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().filter(|e| matches!(e, GateEvent::Route(..))).count() == 2
+        });
+        assert!(seen.contains(&GateEvent::Route(A, Route::Ask)), "{seen:?}");
+        assert!(seen.contains(&GateEvent::Route(B, Route::Ask)), "{seen:?}");
+
+        let claude = gate.show(A, 1, &CLAUDE).unwrap();
+        // A newer Codex check does not touch the Claude question.
+        gate.wait_for(B, &CODEX);
+        gate.begin_check(&CODEX);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Route(t, _) if *t == B))
+        });
+        assert!(!seen.contains(&GateEvent::Reask(A)), "{seen:?}");
+        let codex = gate.show(B, 2, &CODEX).unwrap();
+        assert_ne!(claude.fingerprint, codex.fingerprint);
+        assert_ne!(claude.nonce, codex.nonce);
+        assert_eq!(item_files(&claude), [SETTINGS]);
+        assert_eq!(item_files(&codex), ["AGENTS.md"]);
+
+        // Each answer is about its own agent, and each agent's first `n` says so once.
+        assert_eq!(
+            answer(&mut gate, &claude, false),
+            AnswerOutcome::Start(ProjectTrust::Untrusted, Some(NOT_LOADED.to_string()))
+        );
+        assert_eq!(
+            answer(&mut gate, &codex, false),
+            AnswerOutcome::Start(
+                ProjectTrust::Untrusted,
+                Some("this project's own Codex configuration is not loaded".to_string())
+            )
+        );
+        assert_eq!(gate.row(&CLAUDE), "not trusted (answered n in this window)");
+        assert_eq!(gate.row(&CODEX), "not trusted (answered n in this window)");
+    }
+
+    /// A `y` in a Codex tab writes Codex's record and remembers Codex's answer; a Claude start in the
+    /// same window is still asked, and Claude's record is never written.
+    #[test]
+    fn a_codex_yes_does_not_trust_claude() {
+        let fx = Fx::new("codex-yes");
+        fx.write(SETTINGS, &hook("touch /tmp/claude"));
+        fx.write(".codex/config.toml", b"[mcp_servers.srv]\ncommand = \"srv\"\n");
+        let mut gate = fx.gate();
+        assert_eq!(start_as(&mut gate, B, &CODEX), Route::Ask);
+        let view = gate.show(B, 1, &CODEX).unwrap();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Recorded { .. }))
+        });
+        assert!(seen.contains(&GateEvent::Recorded { tab: B, notice: None }), "{seen:?}");
+        let codex_record = PathBuf::from(format!("{}.codex", fx.record_file().display()));
+        assert!(codex_record.is_file());
+        assert!(
+            !fx.record_file().exists(),
+            "Claude's record is not written by a Codex y"
+        );
+
+        assert_eq!(start_as(&mut gate, A, &CLAUDE), Route::Ask);
+        assert_eq!(gate.row(&CLAUDE), "not trusted");
+        assert_eq!(gate.next_session_trust(&CLAUDE), ProjectTrust::Untrusted);
+        assert!(gate.row(&CODEX).starts_with("trusted since "), "{}", gate.row(&CODEX));
+        assert_eq!(gate.next_session_trust(&CODEX), ProjectTrust::Trusted);
+        // Another Codex start in this window is let through by the record.
+        assert_eq!(start_as(&mut gate, B, &CODEX), Route::Start(ProjectTrust::Trusted));
+
+        // `:untrust` in the Claude tab leaves Codex's record alone.
+        gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
+        drain(&mut gate, |seen| command_done(seen, "u").is_some());
+        assert!(codex_record.is_file());
+        assert_eq!(start_as(&mut gate, B, &CODEX), Route::Start(ProjectTrust::Trusted));
+    }
+
+    /// Claude's record cannot be written (its path is a directory) while Codex's can: the failure makes
+    /// Claude's later questions window-only, and leaves Codex's question, and its record, as they were.
+    #[test]
+    fn a_record_failure_of_one_agent_leaves_the_other_s_record_alone() {
+        let fx = Fx::new("record-failure-per-agent");
+        fx.write(SETTINGS, &hook("touch /tmp/claude"));
+        fx.write("AGENTS.md", b"codex instructions\n");
+        std::fs::create_dir_all(fx.record_file().join("in-the-way")).unwrap();
+        let mut gate = fx.gate();
+        assert_eq!(start_as(&mut gate, A, &CLAUDE), Route::Ask);
+        let claude = gate.show(A, 1, &CLAUDE).unwrap();
+        assert_eq!(claude.agent, "Claude");
+        assert_eq!(answer(&mut gate, &claude, true), AnswerOutcome::Recording);
+        drain(&mut gate, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::RecordRefused { tab, .. } if *tab == A))
+        });
+        assert_eq!(gate.show(A, 2, &CLAUDE).unwrap().remember, TrustRememberView::Window);
+
+        assert_eq!(start_as(&mut gate, B, &CODEX), Route::Ask);
+        let codex = gate.show(B, 3, &CODEX).unwrap();
+        assert_eq!(codex.agent, "Codex");
+        assert_eq!(codex.remember, TrustRememberView::Yes);
+        assert_eq!(codex.remember_note, None);
+        assert_eq!(answer(&mut gate, &codex, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Recorded { tab, .. } if *tab == B))
+        });
+        assert!(seen.contains(&GateEvent::Recorded { tab: B, notice: None }), "{seen:?}");
+        assert!(PathBuf::from(format!("{}.codex", fx.record_file().display())).is_file());
+        // Codex's record written does not clear Claude's failure.
+        assert_eq!(gate.show(A, 4, &CLAUDE).unwrap().remember, TrustRememberView::Window);
+    }
+
+    /// `CODEX_HOME` as Codex reads it: unset or empty is `~/.codex`, an absolute one is used as is,
+    /// and a relative one, which Codex resolves against its own working directory, skips no
+    /// project `.codex/` and reads the alternate names from below the root.
+    #[test]
+    fn a_relative_codex_home_skips_nothing() {
+        let home = Path::new("/h");
+        let root = Path::new("/h/p");
+        let both = |dir: &str| CodexHomeGuess {
+            skip: Some(PathBuf::from(dir)),
+            config: Some(PathBuf::from(dir)),
+        };
+        assert_eq!(codex_home_guess(None, Some(home), root), both("/h/.codex"));
+        assert_eq!(
+            codex_home_guess(Some(std::ffi::OsStr::new("")), Some(home), root),
+            both("/h/.codex")
+        );
+        assert_eq!(
+            codex_home_guess(Some(std::ffi::OsStr::new("/elsewhere/codex")), Some(home), root),
+            both("/elsewhere/codex")
+        );
+        assert_eq!(
+            codex_home_guess(Some(std::ffi::OsStr::new("../.codex")), Some(home), root),
+            CodexHomeGuess {
+                skip: None,
+                config: Some(PathBuf::from("/h/p/../.codex")),
+            }
+        );
+        assert_eq!(
+            codex_home_guess(None, None, root),
+            CodexHomeGuess {
+                skip: None,
+                config: None
+            }
+        );
+    }
+
+    /// A registered agent cannot leave the project's configuration out, so its `n` starts nothing and
+    /// is not remembered, and a project with none of its files is still asked about: a `y` records the
+    /// empty configuration, and a file that appears later asks again.
+    #[test]
+    fn acp_profile_n_refuses_and_empty_asks() {
+        let fx = Fx::new("acp-explicit");
+        let acp = gem();
+        let mut gate = fx.gate();
+        // Claude in the same empty root starts at once, without the project's tiers.
+        assert_eq!(start_as(&mut gate, A, &CLAUDE), Route::Start(ProjectTrust::Untrusted));
+        assert_eq!(start_as(&mut gate, B, &acp), Route::Ask);
+        let view = gate.show(B, 1, &acp).expect("an empty project is still asked about");
+        assert!(view.items.is_empty());
+        assert_eq!(
+            answer(&mut gate, &view, false),
+            AnswerOutcome::NotStarted(refused_without_yes(&acp))
+        );
+        assert!(refused_without_yes(&acp).starts_with("gem would load this project's own configuration"));
+        // Not remembered: the next start asks again.
+        assert_eq!(start_as(&mut gate, B, &acp), Route::Ask);
+        let view = gate.show(B, 2, &acp).unwrap();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Recorded { .. }))
+        });
+        assert!(seen.contains(&GateEvent::Recorded { tab: B, notice: None }), "{seen:?}");
+        assert!(PathBuf::from(format!("{}.acp-gem", fx.record_file().display())).is_file());
+        assert_eq!(start_as(&mut gate, B, &acp), Route::Start(ProjectTrust::Trusted));
+        fx.write("GEM.md", b"appeared later\n");
+        assert_eq!(start_as(&mut gate, B, &acp), Route::Ask);
     }
 }

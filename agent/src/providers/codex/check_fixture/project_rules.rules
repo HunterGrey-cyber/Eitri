@@ -1,0 +1,2 @@
+prefix_rule(pattern=["touch", "@OUTSIDE@/rule-parent"], decision="allow")
+prefix_rule(pattern=["touch", "@OUTSIDE@/rule-child"], decision="allow")

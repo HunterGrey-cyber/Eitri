@@ -205,6 +205,23 @@ describe("usage (R5)", () => {
       "$1.5000 — since this tab started or resumed; /clear starts it over; Claude Code's own estimate, not a bill",
     );
   });
+  it("usage_without_reported_cost_shows_no_cost", () => {
+    const tokens = { input: 10, output: 5000, cache_creation: 0, cache_read: 1_000_000 };
+    const unpriced = (t: TokenUsage | null) => ({ ...u(0, t), cost_reported: false });
+    // Tokens alone: no dollar sign anywhere, in the text or in the title.
+    const seg = usageSegment(unpriced(tokens))!;
+    expect(seg.text).toBe("1M tok");
+    expect(seg.text).not.toContain("$");
+    expect(seg.title).not.toContain("$");
+    expect(seg.title).toContain("no cost reported");
+    // A placeholder that is not finite is still no reason to hide the tokens.
+    expect(usageSegment({ ...unpriced(tokens), total_cost_usd: Number.NaN })!.text).toBe("1M tok");
+    // Neither tokens nor a cost: nothing to say.
+    expect(usageSegment(unpriced(null))).toBeNull();
+    // A report that says the cost was reported, or says nothing about it, keeps the dollars.
+    expect(usageSegment({ ...u(1.5, tokens), cost_reported: true })!.text).toBe("1M tok $1.50");
+    expect(usageSegment(u(1.5, tokens))!.text).toBe("1M tok $1.50");
+  });
   it("a cost that is not a finite number is no measurement: nothing is drawn, and nothing throws", () => {
     expect(usageSegment(u(Number.NaN, { input: 1, output: 1, cache_creation: 0, cache_read: 0 }))).toBeNull();
     expect(usageSegment(u(Number.POSITIVE_INFINITY, null))).toBeNull();

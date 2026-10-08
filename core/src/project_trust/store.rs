@@ -1,10 +1,11 @@
-//! Eitri's own record of which project configuration the user trusted, one file per root.
+//! Eitri's own record of which project configuration the user trusted, one file per root and agent.
 //!
-//! The record is `<state home>/eitri/trust/<16 hex of the root>.json`: the root it is about, when
-//! it was made, the fingerprint of the configuration that was shown and each file's own hash, so a
-//! later change can be named file by file. A root is only ever trusted by its own record -- a
-//! record for a parent or a child directory is a different file under a different key -- and no
-//! other program's notion of trust is read.
+//! Claude's record is `<state home>/eitri/trust/<16 hex of the root>.json`; every other agent's is
+//! that name followed by `.<profile key>` (`<16 hex>.json.codex`), and says which profile it is. Each
+//! holds the root it is about, when it was made, the fingerprint of the configuration that was shown
+//! and each file's own hash, so a later change can be named file by file. A root is only ever trusted
+//! by its own record for that agent -- a record for a parent or a child directory, or for another
+//! agent, is a different file -- and no other program's notion of trust is read.
 //!
 //! A record that cannot be used (missing, not JSON, another version, another root, owned by
 //! someone else, a link, a FIFO) reads as untrusted and is left where it is: another user may have
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::nofollow::{read_regular_nofollow, Owner};
-use super::{discover, Discovery, EntryKind, Limits};
+use super::{discover, Discovery, EntryKind, Limits, Profile, ProfileEnv};
 use crate::layout::persist;
 
 /// A record larger than this is not one of ours.
@@ -78,6 +79,17 @@ struct Record {
     trusted_at: u64,
     fingerprint: String,
     files: BTreeMap<String, String>,
+    /// The profile's key for every agent but Claude, whose records predate profiles and carry none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+}
+
+/// What a record for `profile` says it is about: nothing for Claude, else the profile's key.
+fn profile_field(profile: &Profile) -> Option<String> {
+    match profile {
+        Profile::Claude => None,
+        other => Some(other.key()),
+    }
 }
 
 pub struct TrustStore {
@@ -98,17 +110,26 @@ impl TrustStore {
         TrustStore { dir }
     }
 
-    fn record_path(&self, root: &Path) -> Option<PathBuf> {
-        self.dir.as_ref().map(|dir| dir.join(persist::file_name(root)))
+    /// Claude's record keeps the name it had before profiles existed, so a record made then still
+    /// answers; every other profile's adds its key to that name.
+    fn record_path(&self, root: &Path, profile: &Profile) -> Option<PathBuf> {
+        let name = match profile {
+            Profile::Claude => persist::file_name(root),
+            other => format!("{}.{}", persist::file_name(root), other.key()),
+        };
+        self.dir.as_ref().map(|dir| dir.join(name))
     }
 
     /// What the record says about `discovery`. Reads the one record file, never following a link.
+    ///
+    /// An empty discovery is "nothing to trust" except for a profile that needs an explicit `y`: that
+    /// one is asked about, and its record holds the empty fingerprint.
     pub fn state(&self, discovery: Discovery) -> TrustState {
-        if discovery.nothing_to_trust() {
+        if discovery.nothing_to_trust() && !discovery.profile.requires_explicit_yes() {
             return TrustState::NothingToTrust(discovery);
         }
         let remember = self.remember_for(&discovery);
-        let Some(record) = self.read_usable(&discovery.root) else {
+        let Some(record) = self.read_usable(&discovery.root, &discovery.profile) else {
             return TrustState::Untrusted { discovery, remember };
         };
         if record.fingerprint == discovery.fingerprint.hex() {
@@ -142,11 +163,12 @@ impl TrustStore {
         Remember::Yes
     }
 
-    fn read_usable(&self, root: &Path) -> Option<Record> {
-        let path = self.record_path(root)?;
+    fn read_usable(&self, root: &Path, profile: &Profile) -> Option<Record> {
+        let path = self.record_path(root, profile)?;
         let bytes = read_regular_nofollow(&path, MAX_RECORD_BYTES, Owner::Me).ok()?;
         let record: Record = serde_json::from_slice(&bytes).ok()?;
         let usable = record.version == 1
+            && record.profile == profile_field(profile)
             && root.to_str() == Some(record.root.as_str())
             && record.fingerprint.len() == 64
             && record.fingerprint.bytes().all(|b| b.is_ascii_hexdigit());
@@ -163,7 +185,10 @@ impl TrustStore {
                 format!("not recorded: {}", not_hashed_note(discovery)),
             ));
         }
-        let (Some(dir), Some(path)) = (self.dir.as_deref(), self.record_path(&discovery.root)) else {
+        let (Some(dir), Some(path)) = (
+            self.dir.as_deref(),
+            self.record_path(&discovery.root, &discovery.profile),
+        ) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no usable state directory (XDG_STATE_HOME/HOME)",
@@ -181,6 +206,7 @@ impl TrustStore {
             trusted_at: now_unix,
             fingerprint: discovery.fingerprint.hex(),
             files: files_of(discovery),
+            profile: profile_field(&discovery.profile),
         };
         let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
         persist::create_state_dir(dir)?;
@@ -194,10 +220,10 @@ impl TrustStore {
         Ok(())
     }
 
-    /// Removes this root's record when it is a regular file the user owns; `true` if one existed.
-    /// A foreign file or a link is left in place and named in the error.
-    pub fn forget(&self, root: &Path) -> io::Result<bool> {
-        let Some(path) = self.record_path(root) else {
+    /// Removes this root's record for `profile` when it is a regular file the user owns; `true` if
+    /// one existed. A foreign file or a link is left in place and named in the error.
+    pub fn forget(&self, root: &Path, profile: &Profile) -> io::Result<bool> {
+        let Some(path) = self.record_path(root, profile) else {
             return Ok(false);
         };
         let meta = match std::fs::symlink_metadata(&path) {
@@ -227,9 +253,15 @@ impl TrustStore {
     }
 }
 
-/// Discovers `root`'s configuration and asks the record about it.
-pub fn for_root(store: &TrustStore, root: &Path, home: Option<&Path>) -> TrustState {
-    store.state(discover(root, home, &Limits::default()))
+/// Discovers `root`'s configuration for `profile` and asks that profile's record about it.
+pub fn for_root(
+    store: &TrustStore,
+    root: &Path,
+    home: Option<&Path>,
+    profile: &Profile,
+    env: &ProfileEnv,
+) -> TrustState {
+    store.state(discover(root, home, &Limits::default(), profile, env))
 }
 
 /// Which parts of a discovery nobody could check, for the prompt and for a refused record.

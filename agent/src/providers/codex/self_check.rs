@@ -1,0 +1,1488 @@
+//! The per-binary self-check: before the first start with a `codex` Eitri has not checked, a real
+//! `codex app-server` runs a scripted conversation against a **scripted model**, to prove that the
+//! levers every Codex tab relies on still work in this binary.
+//!
+//! What a Codex tab relies on is written into each `thread/start` and `thread/resume`: the project
+//! trust entries, the skills switch, the extra-permission features, the narrow sandbox table. An
+//! untested Codex could change any of them, so while the check has not passed **every** Codex start is
+//! refused, trusted ones included.
+//!
+//! **The check is hostile on purpose.** Its `CODEX_HOME` is private and its `config.toml` does what a
+//! careless user file could do (a wider sandbox, extra permission requests on); the fixture project
+//! holds everything an untrusted folder must not be able to use (a tool server, a hook trusted by hash,
+//! an instruction file, a skill, an exec-policy rule that allows a command outside the sandbox). The
+//! session is started the way an untrusted tab is, and it passes only when none of that took effect --
+//! in the parent, in a child the parent spawns, and after a resume in a new process.
+//!
+//! **The fixture files are data, not wire.** They live in `check_fixture/` and are written into the
+//! check's own private directory, read by the Codex the check starts and by nothing else; what Eitri
+//! sends over the wire is only what [`super::config`] builds.
+//!
+//! The verdict is cached per [`BinaryKey`] (path, size, modification time, version); a failure is not
+//! cached, so a transient one is retried at the next start, with the reasons kept in a log.
+
+use super::config::{expected_echo, session_config};
+use super::scripted_model::{ScriptedModel, Step};
+use super::translate::{parse_user_agent_version, version_text};
+use super::tripwire;
+use super::wire::{
+    method, Decision, DecisionResponse, InitializeParams, InitializeResponse, ThreadResumeParams, ThreadStartParams,
+    ThreadStartResponse, TurnStartParams,
+};
+use crate::external::{DirTrust, Reviewer, TrustPlan};
+use crate::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkSpec};
+use crate::private_fs::{create_private_dir_all, open_private, read_private_to_string, write_private};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::fmt;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// The catalog model the scripted conversation names. Codex knows it, so its tool set is the one a real
+/// model gets; a name Codex does not know would be offered a different tool set.
+pub const SCRIPTED_MODEL_SLUG: &str = "gpt-6-luna";
+
+/// The notice every refused start carries; `{}` is the log's path.
+const NOTICE: &str = "Eitri could not confirm that this Codex keeps its levers; see";
+
+/// Everything the check does must be over in this time.
+const CHECK_BUDGET: Duration = Duration::from_secs(150);
+/// How long `codex --version` may take.
+const VERSION_BUDGET: Duration = Duration::from_secs(10);
+/// One request's answer.
+const CALL_BUDGET: Duration = Duration::from_secs(30);
+/// A turn, children included.
+const TURN_BUDGET: Duration = Duration::from_secs(60);
+/// How long a child that is shut down may take before it is killed.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+/// The directory under Eitri's state directory that holds one directory per checked binary.
+const CHECK_DIR: &str = "codex-check";
+/// The method that lists the hooks of a project; read only, used to learn the fixture hook's key and hash.
+const HOOKS_LIST: &str = "hooks/list";
+
+const PARENT_PROMPT: &str = "EITRI-CHECK-PARENT-PROMPT";
+const CHILD_TASK: &str = "EITRI-CHECK-CHILD-TASK";
+const RESUME_PROMPT: &str = "EITRI-CHECK-RESUME-PROMPT";
+const AGENTS_MARKER: &str = "EITRI-CHECK-AGENTS-MARKER";
+const SKILL_NAME: &str = "eitri-check-skill";
+const EXTRA_PERMISSIONS_FIELD: &str = "with_additional_permissions";
+/// The tool server's name in the fixture project's configuration.
+const PROJECT_TOOL_SERVER: &str = "eitri_check_tool_server";
+/// The namespace Codex's multi-agent tools live in.
+const AGENT_NAMESPACE: &str = "collaboration";
+
+const FIXTURE_HOME: &str = include_str!("check_fixture/home.toml");
+/// The fixture project: where each file goes, and the templates they are written from.
+const FIXTURE_MANIFEST: &str = include_str!("check_fixture/project.manifest");
+const FIXTURE_TEMPLATES: &[(&str, &str)] = &[
+    ("project_config.toml", include_str!("check_fixture/project_config.toml")),
+    ("project_hooks.json", include_str!("check_fixture/project_hooks.json")),
+    ("project_rules.rules", include_str!("check_fixture/project_rules.rules")),
+    ("project_agents.md", include_str!("check_fixture/project_agents.md")),
+    ("project_skill.md", include_str!("check_fixture/project_skill.md")),
+];
+const FIXTURE_HOOK_STATE: &str = include_str!("check_fixture/hook_state.toml");
+const FIXTURE_MARKER_SH: &str = include_str!("check_fixture/marker.sh");
+
+// ------------------------------------------------------------------------------------ the error
+
+/// Why a start was refused by the check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfCheckError {
+    /// The program is not there.
+    NotFound,
+    /// The program is older than the oldest Codex Eitri works with.
+    TooOld { found: (u32, u32, u32) },
+    /// The check failed or could not run. `reasons` say why; `log` is the file that keeps them.
+    Failed { reasons: Vec<String>, log: PathBuf },
+}
+
+impl fmt::Display for SelfCheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SelfCheckError::NotFound => write!(f, "{}", super::provider::NOT_FOUND),
+            SelfCheckError::TooOld { found } => write!(
+                f,
+                "Codex {} is older than the oldest Eitri works with ({}): update Codex",
+                version_text(*found),
+                version_text(super::provider::MIN_CODEX)
+            ),
+            SelfCheckError::Failed { log, .. } => write!(f, "{NOTICE} {}", log.display()),
+        }
+    }
+}
+
+impl std::error::Error for SelfCheckError {}
+
+// ------------------------------------------------------------------------------------ identity
+
+/// What makes one `codex` binary the one that was checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryKey {
+    path: PathBuf,
+    size: u64,
+    mtime_ns: i128,
+    version: String,
+}
+
+impl BinaryKey {
+    /// The key of a binary already known: the resolved path, its size, its modification time in
+    /// nanoseconds since the epoch, and the version it reports.
+    pub fn new(path: PathBuf, size: u64, mtime_ns: i128, version: String) -> BinaryKey {
+        BinaryKey {
+            path,
+            size,
+            mtime_ns,
+            version,
+        }
+    }
+
+    /// Reads the key off the file system and `<program> --version`.
+    pub fn of(program: &Path) -> Result<BinaryKey, SelfCheckError> {
+        let path = match std::fs::canonicalize(program) {
+            Ok(path) => path,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SelfCheckError::NotFound),
+            Err(e) => {
+                return Err(failed_without_log(format!(
+                    "{} cannot be resolved: {e}",
+                    program.display()
+                )))
+            }
+        };
+        let meta = std::fs::metadata(&path).map_err(|e| failed_without_log(format!("{}: {e}", path.display())))?;
+        if !meta.is_file() {
+            return Err(SelfCheckError::NotFound);
+        }
+        let modified = meta
+            .modified()
+            .map_err(|e| failed_without_log(format!("{}: no modification time: {e}", path.display())))?;
+        let mtime_ns = match modified.duration_since(UNIX_EPOCH) {
+            Ok(after) => after.as_nanos() as i128,
+            Err(before) => -(before.duration().as_nanos() as i128),
+        };
+        let version = probe_version(&path).map_err(failed_without_log)?;
+        Ok(BinaryKey {
+            path,
+            size: meta.len(),
+            mtime_ns,
+            version,
+        })
+    }
+
+    /// The version the binary reported, as its own text.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The version as numbers.
+    pub fn version_numbers(&self) -> Option<(u32, u32, u32)> {
+        parse_user_agent_version(&self.version)
+    }
+
+    /// Sixteen hex digits naming this key: the directory and file names are built from it.
+    pub fn id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.path.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        hasher.update(self.size.to_le_bytes());
+        hasher.update(self.mtime_ns.to_le_bytes());
+        hasher.update(self.version.as_bytes());
+        hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn describe(&self) -> Value {
+        json!({
+            "path": self.path.to_string_lossy(),
+            "size": self.size,
+            "mtime_ns": self.mtime_ns.to_string(),
+            "version": self.version,
+        })
+    }
+}
+
+fn failed_without_log(reason: String) -> SelfCheckError {
+    SelfCheckError::Failed {
+        reasons: vec![reason],
+        log: PathBuf::from(CHECK_DIR),
+    }
+}
+
+/// `<program> --version`: the last word of its first line, such as `0.161.0`.
+fn probe_version(program: &Path) -> Result<String, String> {
+    // A file written a moment ago can still be open in a child another thread is forking; the kernel then
+    // refuses to run it for a few milliseconds ("text file busy").
+    let mut attempts = 0;
+    let mut child = loop {
+        let spawned = Command::new(program)
+            .arg("--version")
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 50 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => break other.map_err(|e| format!("{} --version could not run: {e}", program.display()))?,
+        }
+    };
+    let end = Instant::now() + VERSION_BUDGET;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{} --version did not finish", program.display()));
+            }
+        }
+    };
+    let mut text = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.by_ref().take(4096).read_to_string(&mut text);
+    }
+    if !status.success() {
+        return Err(format!("{} --version failed", program.display()));
+    }
+    let word = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().last())
+        .unwrap_or_default();
+    if parse_user_agent_version(word).is_none() {
+        return Err(format!(
+            "{} --version did not print a version Eitri can read",
+            program.display()
+        ));
+    }
+    Ok(word.to_string())
+}
+
+// ------------------------------------------------------------------------------------ the cache
+
+/// Makes sure this binary has passed the check, running it when it has not.
+///
+/// `state_home` is Eitri's own state directory; the check keeps `codex-check/<key>/` in it (0700, its
+/// files 0600): the verdict, the log of the last run, and, while a run is going, its scratch directory.
+/// Concurrent callers take turns on a lock, so the second finds the first's verdict.
+pub fn ensure_checked(program: &Path, state_home: &Path) -> Result<(), SelfCheckError> {
+    ensure_checked_with(program, state_home, true, |key, run_dir, log| {
+        run_check(program, key, run_dir, log, &CheckTweaks::default())
+    })
+}
+
+/// Deliberate faults for the check's own tests: a check that cannot fail proves nothing. A run with
+/// any of them never records a verdict.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct CheckTweaks {
+    /// The scripted model calls `spawn_agent` without its namespace, as a Codex that refuses to spawn answers.
+    pub spawn_without_namespace: bool,
+    /// The session config loses the switch that keeps skills out of the thread.
+    pub drop_skills_lever: bool,
+    /// The fixture project is trusted, as a lever that no longer holds would leave it.
+    pub grant_trust: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl CheckTweaks {
+    fn any(&self) -> bool {
+        self.spawn_without_namespace || self.drop_skills_lever || self.grant_trust
+    }
+}
+
+/// [`ensure_checked`] with deliberate faults. Never records a verdict.
+#[doc(hidden)]
+#[cfg(feature = "test-support")]
+pub fn ensure_checked_tweaked(program: &Path, state_home: &Path, tweaks: &CheckTweaks) -> Result<(), SelfCheckError> {
+    ensure_checked_with(program, state_home, !tweaks.any(), |key, run_dir, log| {
+        run_check(program, key, run_dir, log, tweaks)
+    })
+}
+
+/// The cache around a check: `run` is the check itself, given the key, a scratch directory and the log.
+fn ensure_checked_with(
+    program: &Path,
+    state_home: &Path,
+    record: bool,
+    run: impl FnOnce(&BinaryKey, &Path, &mut Log) -> Result<(), Vec<String>>,
+) -> Result<(), SelfCheckError> {
+    let key = BinaryKey::of(program)?;
+    match key.version_numbers() {
+        Some(found) if found < super::provider::MIN_CODEX => return Err(SelfCheckError::TooOld { found }),
+        _ => {}
+    }
+    let dir = state_home.join(CHECK_DIR).join(key.id());
+    let log_path = dir.join("check.log");
+    let fail = |reason: String| SelfCheckError::Failed {
+        reasons: vec![reason],
+        log: log_path.clone(),
+    };
+    create_private_dir_all(&dir, state_home).map_err(|e| fail(format!("{} cannot be made: {e}", dir.display())))?;
+
+    let verdict_path = dir.join("verdict.json");
+    if verdict_is_pass(&verdict_path, &key) {
+        return Ok(());
+    }
+    // One check at a time per binary; whoever waits finds the verdict.
+    let _lock =
+        DirLock::take(&dir.join("lock")).map_err(|e| fail(format!("the check's lock could not be taken: {e}")))?;
+    if verdict_is_pass(&verdict_path, &key) {
+        return Ok(());
+    }
+
+    let run_dir = dir.join("run");
+    let _ = std::fs::remove_dir_all(&run_dir);
+    create_private_dir_all(&run_dir, state_home)
+        .map_err(|e| fail(format!("{} cannot be made: {e}", run_dir.display())))?;
+    let mut log = Log::new();
+    log.line(format!("codex {} at {}", key.version, key.path.display()));
+    let started = Instant::now();
+    let result = run(&key, &run_dir, &mut log);
+    let _ = std::fs::remove_dir_all(&run_dir);
+    log.line(match &result {
+        Ok(()) => format!("passed in {:.1}s", started.elapsed().as_secs_f32()),
+        Err(_) => format!("FAILED after {:.1}s", started.elapsed().as_secs_f32()),
+    });
+    if let Err(reasons) = &result {
+        for reason in reasons {
+            log.line(format!("reason: {reason}"));
+        }
+    }
+    if let Err(e) = write_private(&log_path, log.text().as_bytes()) {
+        eprintln!("agent: the Codex check's log could not be written: {e}");
+    }
+    match result {
+        Ok(()) => {
+            if record {
+                let verdict = json!({
+                    "version": 1,
+                    "result": "passed",
+                    "key": key.describe(),
+                    "checked_at": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+                });
+                let temp = dir.join(format!("verdict.json.{}", std::process::id()));
+                let written = write_private(&temp, verdict.to_string().as_bytes())
+                    .and_then(|()| std::fs::rename(&temp, &verdict_path));
+                if let Err(e) = written {
+                    let _ = std::fs::remove_file(&temp);
+                    eprintln!("agent: the Codex check's verdict could not be recorded: {e}");
+                }
+            }
+            Ok(())
+        }
+        Err(reasons) => Err(SelfCheckError::Failed { reasons, log: log_path }),
+    }
+}
+
+/// A recorded pass for exactly this key. Anything unreadable, foreign, malformed or about another key
+/// is not a pass.
+fn verdict_is_pass(path: &Path, key: &BinaryKey) -> bool {
+    let Ok(text) = read_private_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    value.get("version") == Some(&json!(1))
+        && value.get("result") == Some(&json!("passed"))
+        && value.get("key") == Some(&key.describe())
+}
+
+/// An exclusive `flock` on a private file, released when dropped.
+struct DirLock(File);
+
+impl DirLock {
+    fn take(path: &Path) -> std::io::Result<DirLock> {
+        let file = open_private(path)?;
+        loop {
+            // SAFETY: the descriptor is `file`'s own and stays open for the call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(DirLock(file));
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        // SAFETY: as above; closing the file would release it too.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+struct Log {
+    started: Instant,
+    lines: Vec<String>,
+}
+
+impl Log {
+    fn new() -> Log {
+        Log {
+            started: Instant::now(),
+            lines: Vec::new(),
+        }
+    }
+
+    fn line(&mut self, text: String) {
+        self.lines
+            .push(format!("[{:6.1}s] {text}", self.started.elapsed().as_secs_f32()));
+    }
+
+    fn text(&self) -> String {
+        let mut out = self.lines.join("\n");
+        out.push('\n');
+        out
+    }
+}
+
+// ------------------------------------------------------------------------------------ the fixture
+
+/// Where everything of one run lives, all under the run's scratch directory.
+struct Layout {
+    home: PathBuf,
+    probe_home: PathBuf,
+    project: PathBuf,
+    outside: PathBuf,
+    extra: PathBuf,
+    markers: PathBuf,
+    marker_sh: PathBuf,
+}
+
+impl Layout {
+    /// The files the sandbox must keep the model's commands from creating.
+    fn forbidden_writes(&self) -> Vec<(&'static str, PathBuf)> {
+        vec![
+            (
+                "the rule-matching touch in the parent",
+                self.outside.join("rule-parent"),
+            ),
+            ("the rule-matching touch in the child", self.outside.join("rule-child")),
+            ("a plain write into the extra writable root", self.extra.join("plain")),
+            ("the declined escalation", self.outside.join("escalated")),
+        ]
+    }
+
+    fn markers_present(&self) -> Vec<&'static str> {
+        ["tool-server", "hook"]
+            .into_iter()
+            .filter(|name| self.markers.join(name).exists())
+            .collect()
+    }
+}
+
+/// The `(destination, template)` pairs of the manifest.
+fn manifest_entries() -> impl Iterator<Item = (&'static str, &'static str)> {
+    FIXTURE_MANIFEST
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once('\t'))
+}
+
+/// A path that can be put inside a TOML string, a JSON string and a single-quoted shell word as it is.
+fn plain_path(path: &Path) -> Result<&str, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", path.display()))?;
+    if text.chars().any(|c| c.is_control() || matches!(c, '"' | '\'' | '\\')) {
+        return Err(format!(
+            "{text} holds a quote, a backslash or a control character, which the check's fixture files cannot hold"
+        ));
+    }
+    Ok(text)
+}
+
+fn fill(template: &str, values: &[(&str, &str)]) -> String {
+    let mut out = template.to_string();
+    for (name, value) in values {
+        out = out.replace(name, value);
+    }
+    out
+}
+
+fn write_file(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    write_private(path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn build_layout(run_dir: &Path, tweaks: &CheckTweaks) -> Result<Layout, String> {
+    let run = std::fs::canonicalize(run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
+    let layout = Layout {
+        home: run.join("home"),
+        probe_home: run.join("probe-home"),
+        project: run.join("project"),
+        outside: run.join("outside"),
+        extra: run.join("extra"),
+        markers: run.join("markers"),
+        marker_sh: run.join("marker.sh"),
+    };
+    for dir in [
+        &layout.home,
+        &layout.probe_home,
+        &layout.outside,
+        &layout.extra,
+        &layout.markers,
+    ] {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    write_file(&layout.marker_sh, FIXTURE_MARKER_SH)?;
+    let values = [
+        ("@MARKER_SH@", plain_path(&layout.marker_sh)?),
+        ("@MARKERS@", plain_path(&layout.markers)?),
+        ("@OUTSIDE@", plain_path(&layout.outside)?),
+        ("@EXTRA@", plain_path(&layout.extra)?),
+    ];
+    plain_path(&layout.project)?;
+    for (dest, template) in manifest_entries() {
+        let text = FIXTURE_TEMPLATES
+            .iter()
+            .find(|(name, _)| *name == template)
+            .map(|(_, text)| *text)
+            .ok_or_else(|| format!("the fixture manifest names a template that is not built in: {template}"))?;
+        write_file(&layout.project.join(dest), &fill(text, &values))?;
+    }
+    let _ = tweaks;
+    Ok(layout)
+}
+
+/// The home's `config.toml`: the scripted model, then the hostile file.
+fn home_config(model: &ScriptedModel, layout: &Layout, extra_tables: &str) -> Result<String, String> {
+    let values = [("@EXTRA@", plain_path(&layout.extra)?)];
+    Ok(format!(
+        "{}{}{}",
+        model.provider_toml(SCRIPTED_MODEL_SLUG),
+        fill(FIXTURE_HOME, &values),
+        extra_tables
+    ))
+}
+
+// ------------------------------------------------------------------------------------ the peer
+
+/// A request Codex made of the check, answered at once.
+struct Asked {
+    method: String,
+    thread_id: Option<String>,
+    /// How many notifications had arrived when it did.
+    after_notes: usize,
+}
+
+/// One `codex app-server` child under the check, with everything it said.
+struct Peer {
+    link: JsonRpcLink,
+    notes: Vec<(String, Value)>,
+    asked: Vec<Asked>,
+    closed: Option<String>,
+    deadline: Instant,
+}
+
+impl Peer {
+    fn spawn(program: &Path, home: &Path, cwd: &Path, deadline: Instant) -> Result<Peer, String> {
+        let no_proxy = OsString::from("127.0.0.1,localhost");
+        let link = JsonRpcLink::spawn(LinkSpec {
+            program: program.to_path_buf(),
+            args: ["app-server", "--listen", "stdio://"]
+                .iter()
+                .map(OsString::from)
+                .collect(),
+            cwd: cwd.to_path_buf(),
+            framing: Framing::Bare,
+            env: vec![
+                (OsString::from("CODEX_HOME"), home.as_os_str().to_os_string()),
+                (OsString::from("NO_PROXY"), no_proxy.clone()),
+                (OsString::from("no_proxy"), no_proxy),
+            ],
+            env_remove: [
+                "TMUX",
+                "TMUX_PANE",
+                "NVIM",
+                "NVIM_LISTEN_ADDRESS",
+                "OPENAI_API_KEY",
+                "CODEX_API_KEY",
+            ]
+            .iter()
+            .map(OsString::from)
+            .collect(),
+        })
+        .map_err(|e| format!("codex app-server could not be started: {e}"))?;
+        Ok(Peer {
+            link,
+            notes: Vec::new(),
+            asked: Vec::new(),
+            closed: None,
+            deadline,
+        })
+    }
+
+    /// Reads what has arrived. Approvals are declined, anything else Codex asks is answered "not found".
+    fn pump(&mut self) {
+        while let Some(message) = self.link.try_recv() {
+            match message {
+                Incoming::Notification { method, params } => self.notes.push((method, params)),
+                Incoming::Request { id, method, params } => {
+                    let thread_id = params.get("threadId").and_then(Value::as_str).map(str::to_string);
+                    if method.ends_with("requestApproval") {
+                        let answer = serde_json::to_value(DecisionResponse {
+                            decision: Decision::Decline,
+                        })
+                        .unwrap_or(Value::Null);
+                        self.link.respond(id, answer);
+                    } else {
+                        self.link.respond_error(id, -32601, "method not found");
+                    }
+                    self.asked.push(Asked {
+                        method,
+                        thread_id,
+                        after_notes: self.notes.len(),
+                    });
+                }
+                Incoming::Skipped(_) => {}
+                Incoming::Closed { reason } => self.closed = Some(reason),
+            }
+        }
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let mut pending = self.link.request(method, params);
+        let end = (Instant::now() + CALL_BUDGET).min(self.deadline);
+        loop {
+            self.pump();
+            if let Some(answer) = pending.try_take() {
+                return answer.map_err(|e| format!("{method}: {e}"));
+            }
+            if let Some(reason) = &self.closed {
+                return Err(format!("{method}: codex ended ({reason})"));
+            }
+            if Instant::now() >= end {
+                return Err(format!("{method} was not answered in time"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for(&mut self, within: Duration, mut done: impl FnMut(&Peer) -> bool) -> bool {
+        let end = (Instant::now() + within).min(self.deadline);
+        loop {
+            self.pump();
+            if done(self) {
+                return true;
+            }
+            if self.closed.is_some() || Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn turn_completed(&self, thread_id: &str) -> bool {
+        self.notes
+            .iter()
+            .any(|(m, p)| m == method::TURN_COMPLETED && p.get("threadId").and_then(Value::as_str) == Some(thread_id))
+    }
+
+    /// `initialize`, then `initialized`. Returns the version Codex reports and refuses to go on when
+    /// Codex is not using the home it was given: nothing else may be sent to a Codex that reads the user's own.
+    fn handshake(&mut self, home: &Path) -> Result<String, String> {
+        let params =
+            serde_json::to_value(InitializeParams::eitri(env!("CARGO_PKG_VERSION"))).map_err(|e| e.to_string())?;
+        let answer = self.call(method::INITIALIZE, params)?;
+        let init: InitializeResponse =
+            serde_json::from_value(answer).map_err(|e| format!("the handshake answer could not be read: {e}"))?;
+        self.link.notify(method::INITIALIZED, Value::Null);
+        let reported = init
+            .codex_home
+            .as_deref()
+            .map(Path::new)
+            .and_then(|p| std::fs::canonicalize(p).ok());
+        if reported.as_deref() != std::fs::canonicalize(home).ok().as_deref() {
+            return Err("codex does not use the private home the check gave it".to_string());
+        }
+        Ok(init.user_agent)
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.link.stderr_tail()
+    }
+
+    fn finish(self) {
+        self.link.shutdown(EXIT_GRACE);
+    }
+}
+
+// ------------------------------------------------------------------------------------ the run
+
+/// What one thread start or resume answered.
+struct ThreadFacts {
+    thread_id: String,
+    echo_problem: Option<String>,
+    instruction_sources: Vec<String>,
+    reasoning_effort: Option<String>,
+}
+
+fn thread_facts(answer: Value, reviewer: Reviewer) -> Result<ThreadFacts, String> {
+    let effort = answer
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let started: ThreadStartResponse =
+        serde_json::from_value(answer).map_err(|e| format!("the thread answer could not be read: {e}"))?;
+    let echo_problem = tripwire::check_echo(&expected_echo(reviewer), &started.echo())
+        .err()
+        .map(|mismatch| mismatch.to_string());
+    Ok(ThreadFacts {
+        thread_id: started.thread.id.clone(),
+        echo_problem,
+        instruction_sources: started.instruction_sources,
+        reasoning_effort: effort,
+    })
+}
+
+fn script(layout: &Layout, tweaks: &CheckTweaks) -> Vec<Step> {
+    let outside = layout.outside.display();
+    let touch = |name: &str| format!("touch {outside}/{name}");
+    let namespace = if tweaks.spawn_without_namespace {
+        None
+    } else {
+        Some(AGENT_NAMESPACE)
+    };
+    let for_child = |step: Step| step.when_body_has(CHILD_TASK).unless_body_has(PARENT_PROMPT);
+    vec![
+        // The parent: the rule-matching command alone, then a child, then waiting for it.
+        Step::exec("p0", &touch("rule-parent"), false)
+            .when_body_has(PARENT_PROMPT)
+            .unless_body_has("\"p0\""),
+        Step::call(
+            "sp1",
+            namespace,
+            "spawn_agent",
+            &json!({"task_name": "child", "message": format!("{CHILD_TASK} run the commands"), "fork_turns": "none"}),
+        )
+        .when_body_has(PARENT_PROMPT)
+        .when_body_has("\"p0\"")
+        .unless_body_has("\"sp1\""),
+        Step::call("wa1", namespace, "wait_agent", &json!({"timeout_ms": 30000}))
+            .when_body_has(PARENT_PROMPT)
+            .when_body_has("\"sp1\"")
+            .unless_body_has("\"wa1\""),
+        // The child, told apart by the absence of the parent's prompt: the same command, a plain write
+        // into the extra root, and one that asks to leave the sandbox.
+        for_child(Step::exec("cc1", &touch("rule-child"), false)).unless_body_has("\"cc1\""),
+        for_child(Step::exec(
+            "cc0",
+            &format!("touch {}/plain", layout.extra.display()),
+            false,
+        ))
+        .when_body_has("\"cc1\"")
+        .unless_body_has("\"cc0\""),
+        for_child(Step::exec("cc2", &touch("escalated"), true))
+            .when_body_has("\"cc0\"")
+            .unless_body_has("\"cc2\""),
+    ]
+}
+
+/// What the run saw, reduced to the facts the verdict is made of.
+#[derive(Default)]
+struct Evidence {
+    start: Option<ThreadFacts>,
+    resume: Option<ThreadFacts>,
+    announced_child: Option<String>,
+    child_asked_after_announcement: bool,
+    child_requests: usize,
+    outputs: BTreeSet<String>,
+    markers: Vec<&'static str>,
+    created: Vec<&'static str>,
+    leaked: Vec<&'static str>,
+    projects_written: bool,
+    steps_left_after_first_turn: usize,
+    first_turn_done: bool,
+    child_turn_done: bool,
+    resumed_turn_done: bool,
+    version_ok: bool,
+}
+
+/// The reasons the run does not pass; empty when it does.
+fn judge(e: &Evidence) -> Vec<String> {
+    let mut why = Vec::new();
+    if !e.version_ok {
+        why.push("the version Codex reported is not the one its binary printed".to_string());
+    }
+    for (label, facts) in [("start", &e.start), ("resume", &e.resume)] {
+        match facts {
+            None => why.push(format!("the thread {label} gave no answer")),
+            Some(facts) => {
+                if let Some(problem) = &facts.echo_problem {
+                    why.push(format!("the thread {label} did not echo the narrow policy: {problem}"));
+                }
+                if !facts.instruction_sources.is_empty() {
+                    why.push(format!(
+                        "the thread {label} loaded instruction files: {}",
+                        facts.instruction_sources.join(", ")
+                    ));
+                }
+                if facts.reasoning_effort.as_deref() == Some("minimal") {
+                    why.push(format!("the thread {label} echoed the project's reasoning effort"));
+                }
+            }
+        }
+    }
+    if !e.markers.is_empty() {
+        why.push(format!("the project's own commands ran: {}", e.markers.join(", ")));
+    }
+    for what in &e.created {
+        why.push(format!("the sandbox let a write through: {what}"));
+    }
+    if !e.first_turn_done {
+        why.push("the first turn did not finish".to_string());
+    }
+    if e.steps_left_after_first_turn > 0 {
+        why.push(format!(
+            "{} scripted steps were never asked for, so the conversation did not run as scripted",
+            e.steps_left_after_first_turn
+        ));
+    }
+    if e.announced_child.is_none() {
+        why.push(
+            "no child was announced: the parent could not spawn one, so the child's levers are unchecked".to_string(),
+        );
+    }
+    if e.child_requests == 0 {
+        why.push("no request of a child reached the model".to_string());
+    }
+    if e.announced_child.is_some() && !e.child_asked_after_announcement {
+        why.push("the child's escalation did not arrive on its own thread after the parent announced it".to_string());
+    }
+    for call in ["p0", "cc1", "cc0"] {
+        if !e.outputs.contains(call) {
+            why.push(format!(
+                "the command {call} never reported back, so what the sandbox did with it is unknown"
+            ));
+        }
+    }
+    if e.announced_child.is_some() && !e.child_turn_done {
+        why.push("the child's turn did not finish".to_string());
+    }
+    if !e.resumed_turn_done {
+        why.push("the turn after the resume did not finish".to_string());
+    }
+    for what in &e.leaked {
+        why.push(format!("a request to the model carried {what}"));
+    }
+    if e.projects_written {
+        why.push("Codex wrote a project entry into the check's own config file".to_string());
+    }
+    why
+}
+
+fn run_check(
+    program: &Path,
+    key: &BinaryKey,
+    run_dir: &Path,
+    log: &mut Log,
+    tweaks: &CheckTweaks,
+) -> Result<(), Vec<String>> {
+    let deadline = Instant::now() + CHECK_BUDGET;
+    let one = |reason: String| vec![reason];
+    let layout = build_layout(run_dir, tweaks).map_err(one)?;
+    let model = ScriptedModel::start(script(&layout, tweaks))
+        .map_err(|e| one(format!("the scripted model could not start: {e}")))?;
+    log.line(format!(
+        "scripted model on 127.0.0.1:{} with the catalog model {SCRIPTED_MODEL_SLUG}",
+        model.port
+    ));
+
+    // The fixture hook is trusted by hash in the home, as a hostile user file would have it. The hash is
+    // Codex's own, learnt from a throwaway home that trusts the project.
+    let project_text = plain_path(&layout.project).map_err(one)?.to_string();
+    let probe_tables = format!("\n[projects.\"{project_text}\"]\ntrust_level = \"trusted\"\n");
+    write_file(
+        &layout.probe_home.join("config.toml"),
+        &home_config(&model, &layout, &probe_tables).map_err(one)?,
+    )
+    .map_err(one)?;
+    let (hook_key, hook_hash) = learn_hook(program, &layout, deadline, log).map_err(one)?;
+    let state = fill(
+        FIXTURE_HOOK_STATE,
+        &[
+            ("@KEY@", plain_key(&hook_key).map_err(one)?),
+            ("@HASH@", plain_key(&hook_hash).map_err(one)?),
+        ],
+    );
+    let config_path = layout.home.join("config.toml");
+    write_file(&config_path, &home_config(&model, &layout, &state).map_err(one)?).map_err(one)?;
+
+    let trusted = tweaks.grant_trust;
+    let plan = TrustPlan {
+        dirs: vec![(
+            layout.project.clone(),
+            if trusted {
+                DirTrust::Trusted
+            } else {
+                DirTrust::Untrusted
+            },
+        )],
+        skills_off: !trusted,
+        fingerprint: "self-check".to_string(),
+        project_only: vec![PROJECT_TOOL_SERVER.to_string()],
+    };
+    let mut config = session_config(&plan).map_err(|e| one(e.to_string()))?;
+    if tweaks.drop_skills_lever {
+        config = drop_skills_lever(config);
+    }
+    let cwd = plain_path(&layout.project).map_err(one)?.to_string();
+
+    let mut evidence = Evidence::default();
+    let mut notes_for_log = Vec::new();
+
+    // ---- the first process: start, one turn with a child
+    let ctx = Ctx {
+        home: &layout.home,
+        config: &config,
+        cwd: &cwd,
+        binary_version: &key.version,
+    };
+    let mut peer = Peer::spawn(program, &layout.home, &layout.project, deadline).map_err(one)?;
+    let outcome = first_process(&mut peer, &mut evidence, &ctx, log);
+    notes_for_log.push(peer.stderr_tail());
+    peer.finish();
+    outcome.map_err(one)?;
+    evidence.steps_left_after_first_turn = model.steps_left();
+
+    // ---- a new process: resume, one more turn
+    let thread_id = evidence.start.as_ref().map(|f| f.thread_id.clone()).unwrap_or_default();
+    let mut peer = Peer::spawn(program, &layout.home, &layout.project, deadline).map_err(one)?;
+    let outcome = second_process(&mut peer, &mut evidence, &ctx, &thread_id, log);
+    notes_for_log.push(peer.stderr_tail());
+    peer.finish();
+    outcome.map_err(one)?;
+
+    // ---- what is on the disk and what the model was sent
+    evidence.markers = layout.markers_present();
+    evidence.created = layout
+        .forbidden_writes()
+        .into_iter()
+        .filter(|(_, path)| path.exists())
+        .map(|(what, _)| what)
+        .collect();
+    let configured = std::fs::read_to_string(&config_path).unwrap_or_default();
+    evidence.projects_written = configured.contains("[projects");
+    let requests = model.requests();
+    evidence.child_requests = requests
+        .iter()
+        .filter(|r| {
+            let text = r.to_string();
+            text.contains(CHILD_TASK) && !text.contains(PARENT_PROMPT)
+        })
+        .count();
+    for body in &requests {
+        for item in body.get("input").and_then(Value::as_array).into_iter().flatten() {
+            if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+                if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                    evidence.outputs.insert(id.to_string());
+                }
+            }
+        }
+    }
+    let all = requests.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+    for (needle, what) in [
+        (AGENTS_MARKER, "the project's instruction file"),
+        (SKILL_NAME, "the project's skill"),
+        (EXTRA_PERMISSIONS_FIELD, "the extra-permission field of the shell tool"),
+    ] {
+        if all.contains(needle) {
+            evidence.leaked.push(what);
+        }
+    }
+
+    for tail in notes_for_log.iter().filter(|t| !t.trim().is_empty()) {
+        log.line(format!(
+            "codex stderr (tail): {}",
+            without_colours(tail.trim()).replace('\n', " | ")
+        ));
+    }
+    let reasons = judge(&evidence);
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn drop_skills_lever(config: super::config::SessionConfig) -> super::config::SessionConfig {
+    config.without_skills_lever()
+}
+
+#[cfg(not(feature = "test-support"))]
+fn drop_skills_lever(config: super::config::SessionConfig) -> super::config::SessionConfig {
+    config
+}
+
+/// Codex colours its log lines; the check's log is read in an editor.
+fn without_colours(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A key or hash Codex printed, fit to go inside a TOML string.
+fn plain_key(text: &str) -> Result<&str, String> {
+    if text.is_empty() || text.chars().any(|c| c.is_control() || matches!(c, '"' | '\\')) {
+        return Err("Codex printed a hook key or hash the check cannot write down".to_string());
+    }
+    Ok(text)
+}
+
+/// Asks a throwaway Codex that trusts the fixture project for the key and hash of its hook.
+fn learn_hook(program: &Path, layout: &Layout, deadline: Instant, log: &mut Log) -> Result<(String, String), String> {
+    let mut peer = Peer::spawn(program, &layout.probe_home, &layout.project, deadline)?;
+    let result = (|| {
+        peer.handshake(&layout.probe_home)?;
+        let cwd = layout.project.to_string_lossy().to_string();
+        let answer = peer.call(HOOKS_LIST, json!({ "cwds": [cwd.clone()] }))?;
+        find_hook(&answer, &cwd).ok_or_else(|| "Codex did not list the fixture project's hook".to_string())
+    })();
+    peer.finish();
+    if let Ok((key, _)) = &result {
+        log.line(format!("learnt the fixture hook's key: {key}"));
+    }
+    result
+}
+
+/// The first `key` / `currentHash` pair in an answer whose key begins with the project's path.
+fn find_hook(value: &Value, project: &str) -> Option<(String, String)> {
+    match value {
+        Value::Object(map) => {
+            if let (Some(Value::String(key)), Some(Value::String(hash))) = (map.get("key"), map.get("currentHash")) {
+                if key.starts_with(project) {
+                    return Some((key.clone(), hash.clone()));
+                }
+            }
+            map.values().find_map(|v| find_hook(v, project))
+        }
+        Value::Array(items) => items.iter().find_map(|v| find_hook(v, project)),
+        _ => None,
+    }
+}
+
+/// What both processes of the run are given.
+struct Ctx<'a> {
+    home: &'a Path,
+    config: &'a super::config::SessionConfig,
+    cwd: &'a str,
+    binary_version: &'a str,
+}
+
+fn start_turn(peer: &mut Peer, thread_id: &str, text: String) -> Result<(), String> {
+    let turn = serde_json::to_value(TurnStartParams::new(thread_id.to_string(), text, Reviewer::User))
+        .map_err(|e| e.to_string())?;
+    peer.call(method::TURN_START, turn).map(|_| ())
+}
+
+fn first_process(peer: &mut Peer, evidence: &mut Evidence, ctx: &Ctx, log: &mut Log) -> Result<(), String> {
+    let user_agent = peer.handshake(ctx.home)?;
+    evidence.version_ok = parse_user_agent_version(&user_agent) == parse_user_agent_version(ctx.binary_version);
+    let params = serde_json::to_value(ThreadStartParams::new(
+        ctx.cwd.to_string(),
+        Reviewer::User,
+        ctx.config.clone(),
+    ))
+    .map_err(|e| e.to_string())?;
+    let facts = thread_facts(peer.call(method::THREAD_START, params)?, Reviewer::User)?;
+    log.line(format!(
+        "thread started; the policy echo was as asked = {}",
+        facts.echo_problem.is_none()
+    ));
+    let thread_id = facts.thread_id.clone();
+    evidence.start = Some(facts);
+
+    start_turn(peer, &thread_id, format!("{PARENT_PROMPT} run the commands"))?;
+    evidence.first_turn_done = peer.wait_for(TURN_BUDGET, |p| p.turn_completed(&thread_id));
+    log.line(format!("first turn finished = {}", evidence.first_turn_done));
+
+    // The child, announced by the parent's items first, and its own turn.
+    let announced_at = announcement_index(peer, &thread_id);
+    evidence.announced_child = announced_child(peer, &thread_id);
+    if let Some(child) = evidence.announced_child.clone() {
+        evidence.child_turn_done = peer.wait_for(TURN_BUDGET, |p| p.turn_completed(&child));
+        evidence.child_asked_after_announcement = peer.asked.iter().any(|a| {
+            a.method.ends_with("requestApproval")
+                && a.thread_id.as_deref() == Some(child.as_str())
+                && announced_at.is_some_and(|at| a.after_notes > at)
+        });
+        log.line(format!(
+            "a child was announced and its turn finished = {}",
+            evidence.child_turn_done
+        ));
+    }
+    Ok(())
+}
+
+fn announcement_index(peer: &Peer, parent: &str) -> Option<usize> {
+    peer.notes.iter().position(|(m, p)| {
+        (m == method::ITEM_STARTED || m == method::ITEM_COMPLETED)
+            && p.get("threadId").and_then(Value::as_str) == Some(parent)
+            && p.pointer("/item/type").and_then(Value::as_str) == Some("subAgentActivity")
+            && p.pointer("/item/kind").and_then(Value::as_str) == Some("started")
+    })
+}
+
+fn announced_child(peer: &Peer, parent: &str) -> Option<String> {
+    let at = announcement_index(peer, parent)?;
+    peer.notes[at]
+        .1
+        .pointer("/item/agentThreadId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn second_process(
+    peer: &mut Peer,
+    evidence: &mut Evidence,
+    ctx: &Ctx,
+    thread_id: &str,
+    log: &mut Log,
+) -> Result<(), String> {
+    peer.handshake(ctx.home)?;
+    let params = serde_json::to_value(ThreadResumeParams::new(
+        thread_id.to_string(),
+        ctx.cwd.to_string(),
+        Reviewer::User,
+        ctx.config.clone(),
+    ))
+    .map_err(|e| e.to_string())?;
+    let facts = thread_facts(peer.call(method::THREAD_RESUME, params)?, Reviewer::User)?;
+    log.line(format!(
+        "thread resumed; the policy echo was as asked = {}",
+        facts.echo_problem.is_none()
+    ));
+    evidence.resume = Some(facts);
+    start_turn(peer, thread_id, format!("{RESUME_PROMPT} once more"))?;
+    evidence.resumed_turn_done = peer.wait_for(TURN_BUDGET, |p| p.turn_completed(thread_id));
+    log.line(format!(
+        "the turn after the resume finished = {}",
+        evidence.resumed_turn_done
+    ));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A scratch directory that goes away with the test.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("eitri-self-check-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Scratch(dir)
+        }
+
+        /// An executable that prints a version line, as `codex --version` does.
+        fn program(&self, name: &str, version_line: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho '{version_line}'\n")).expect("writes");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            path
+        }
+
+        fn state(&self) -> PathBuf {
+            self.0.join("state")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).expect("exists").permissions().mode() & 0o777
+    }
+
+    fn check(
+        program: &Path,
+        state: &Path,
+        runs: &Cell<u32>,
+        outcome: Result<(), Vec<String>>,
+    ) -> Result<(), SelfCheckError> {
+        ensure_checked_with(program, state, true, |_, _, _| {
+            runs.set(runs.get() + 1);
+            outcome
+        })
+    }
+
+    #[test]
+    fn verdict_cache_is_private_and_keyed() {
+        let scratch = Scratch::new("cache");
+        let a = scratch.program("codex-a", "codex-cli 0.161.0");
+        let b = scratch.program("codex-b", "codex-cli 0.161.0");
+        let state = scratch.state();
+        let runs = Cell::new(0);
+
+        // A pass is recorded privately, once per binary.
+        check(&a, &state, &runs, Ok(())).expect("passes");
+        assert_eq!(runs.get(), 1);
+        let key_a = BinaryKey::of(&a).expect("key");
+        let dir_a = state.join(CHECK_DIR).join(key_a.id());
+        assert_eq!(mode(&dir_a), 0o700);
+        assert_eq!(mode(&dir_a.join("verdict.json")), 0o600);
+        assert_eq!(mode(&dir_a.join("check.log")), 0o600);
+        assert!(!dir_a.join("run").exists(), "the scratch directory is removed");
+        check(&a, &state, &runs, Err(vec!["not asked".into()])).expect("the cached pass answers");
+        assert_eq!(runs.get(), 1, "a recorded pass is not run again");
+
+        // Another binary has its own key and its own directory.
+        check(&b, &state, &runs, Ok(())).expect("passes");
+        assert_eq!(runs.get(), 2);
+        let key_b = BinaryKey::of(&b).expect("key");
+        assert_ne!(key_a.id(), key_b.id());
+        assert!(state.join(CHECK_DIR).join(key_b.id()).join("verdict.json").is_file());
+
+        // A verdict that names another key is not a pass for this one.
+        let verdict = dir_a.join("verdict.json");
+        let text = std::fs::read_to_string(&verdict).expect("reads");
+        std::fs::write(&verdict, text.replace("codex-a", "codex-z")).expect("tampers");
+        check(&a, &state, &runs, Ok(())).expect("passes again");
+        assert_eq!(runs.get(), 3, "a verdict about another file is rerun");
+        // So is one that is not JSON.
+        std::fs::write(&verdict, "passed").expect("tampers");
+        check(&a, &state, &runs, Ok(())).expect("passes again");
+        assert_eq!(runs.get(), 4);
+    }
+
+    #[test]
+    fn a_failure_is_not_recorded_and_names_its_log() {
+        let scratch = Scratch::new("fail");
+        let program = scratch.program("codex", "codex-cli 0.161.0");
+        let state = scratch.state();
+        let runs = Cell::new(0);
+        let err = check(
+            &program,
+            &state,
+            &runs,
+            Err(vec!["the sandbox let a write through".into()]),
+        )
+        .expect_err("fails");
+        let SelfCheckError::Failed { reasons, log } = &err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(reasons, &vec!["the sandbox let a write through".to_string()]);
+        let message = err.to_string();
+        assert!(message.starts_with("Eitri could not confirm that this Codex keeps its levers; see "));
+        assert!(message.ends_with(&log.display().to_string()));
+        let text = std::fs::read_to_string(log).expect("the log is kept");
+        assert!(
+            text.contains("FAILED") && text.contains("the sandbox let a write through"),
+            "{text}"
+        );
+        assert_eq!(mode(log), 0o600);
+        assert!(!log.parent().expect("dir").join("verdict.json").exists());
+        // The next start tries again.
+        check(&program, &state, &runs, Ok(())).expect("passes");
+        assert_eq!(runs.get(), 2);
+    }
+
+    #[test]
+    fn a_changed_binary_reruns_the_check() {
+        let scratch = Scratch::new("changed");
+        let program = scratch.program("codex", "codex-cli 0.161.0");
+        let state = scratch.state();
+        let runs = Cell::new(0);
+        check(&program, &state, &runs, Ok(())).expect("passes");
+        let before = BinaryKey::of(&program).expect("key");
+
+        // The same file with a later modification time is another binary.
+        let file = File::options().write(true).open(&program).expect("opens");
+        file.set_modified(SystemTime::now() + Duration::from_secs(60))
+            .expect("sets mtime");
+        drop(file);
+        let after = BinaryKey::of(&program).expect("key");
+        assert_eq!(before.size, after.size);
+        assert_ne!(before.mtime_ns, after.mtime_ns);
+        assert_ne!(before.id(), after.id());
+        check(&program, &state, &runs, Ok(())).expect("passes");
+        assert_eq!(runs.get(), 2);
+
+        // A new version at the same path is another binary too.
+        let upgraded = BinaryKey::new(after.path.clone(), after.size, after.mtime_ns, "0.162.0".into());
+        assert_ne!(after.id(), upgraded.id());
+    }
+
+    #[test]
+    fn a_missing_or_too_old_binary_is_refused_before_any_check() {
+        let scratch = Scratch::new("refused");
+        let state = scratch.state();
+        let runs = Cell::new(0);
+        let missing = scratch.0.join("no-such-codex");
+        assert_eq!(check(&missing, &state, &runs, Ok(())), Err(SelfCheckError::NotFound));
+        let old = scratch.program("old", "codex-cli 0.159.2");
+        let err = check(&old, &state, &runs, Ok(())).expect_err("too old");
+        assert_eq!(err, SelfCheckError::TooOld { found: (0, 159, 2) });
+        assert!(err.to_string().contains("0.159.2") && err.to_string().contains("0.160.0"));
+        let nonsense = scratch.program("nonsense", "not a version");
+        assert!(matches!(
+            check(&nonsense, &state, &runs, Ok(())),
+            Err(SelfCheckError::Failed { .. })
+        ));
+        assert_eq!(runs.get(), 0, "no check ran for any of them");
+    }
+
+    fn facts(thread: &str) -> ThreadFacts {
+        ThreadFacts {
+            thread_id: thread.to_string(),
+            echo_problem: None,
+            instruction_sources: Vec::new(),
+            reasoning_effort: Some("low".to_string()),
+        }
+    }
+
+    fn passing() -> Evidence {
+        Evidence {
+            start: Some(facts("parent")),
+            resume: Some(facts("parent")),
+            announced_child: Some("child".into()),
+            child_asked_after_announcement: true,
+            child_requests: 4,
+            outputs: ["p0", "cc1", "cc0"].iter().map(|s| s.to_string()).collect(),
+            first_turn_done: true,
+            child_turn_done: true,
+            resumed_turn_done: true,
+            version_ok: true,
+            ..Evidence::default()
+        }
+    }
+
+    #[test]
+    fn the_verdict_passes_only_when_every_lever_held() {
+        assert_eq!(judge(&passing()), Vec::<String>::new());
+
+        let says = |mutate: fn(&mut Evidence), word: &str| {
+            let mut e = passing();
+            mutate(&mut e);
+            let why = judge(&e);
+            assert!(why.iter().any(|r| r.contains(word)), "{word:?} not in {why:?}");
+        };
+        says(|e| e.markers = vec!["hook"], "project's own commands ran");
+        says(|e| e.created = vec!["the declined escalation"], "let a write through");
+        says(|e| e.leaked = vec!["the project's skill"], "skill");
+        says(|e| e.projects_written = true, "project entry");
+        says(|e| e.announced_child = None, "no child was announced");
+        says(|e| e.child_requests = 0, "no request of a child");
+        says(|e| e.child_asked_after_announcement = false, "escalation");
+        says(|e| e.outputs.clear(), "never reported back");
+        says(|e| e.steps_left_after_first_turn = 2, "never asked for");
+        says(|e| e.first_turn_done = false, "first turn");
+        says(|e| e.resumed_turn_done = false, "after the resume");
+        says(|e| e.version_ok = false, "version");
+        says(|e| e.resume = None, "resume gave no answer");
+        says(
+            |e| {
+                if let Some(f) = e.start.as_mut() {
+                    f.echo_problem = Some("sandbox differs".into());
+                }
+            },
+            "narrow policy",
+        );
+        says(
+            |e| {
+                if let Some(f) = e.resume.as_mut() {
+                    f.instruction_sources = vec!["/p/AGENTS.md".into()];
+                }
+            },
+            "instruction files",
+        );
+        says(
+            |e| {
+                if let Some(f) = e.start.as_mut() {
+                    f.reasoning_effort = Some("minimal".into());
+                }
+            },
+            "reasoning effort",
+        );
+    }
+
+    #[test]
+    fn colour_codes_are_taken_out_of_the_log() {
+        assert_eq!(
+            without_colours("\u{1b}[2m12:00\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m text"),
+            "12:00 ERROR text"
+        );
+    }
+
+    #[test]
+    fn the_fixture_files_fill_in_and_refuse_odd_paths() {
+        let values = [
+            ("@MARKER_SH@", "/r/marker.sh"),
+            ("@MARKERS@", "/r/markers"),
+            ("@OUTSIDE@", "/r/outside"),
+            ("@EXTRA@", "/r/extra"),
+        ];
+        for (_, template) in FIXTURE_TEMPLATES.iter().chain([&("home", FIXTURE_HOME)]) {
+            let filled = fill(template, &values);
+            assert!(!filled.contains('@'), "an unfilled placeholder in {filled}");
+        }
+        for (dest, template) in manifest_entries() {
+            let text = FIXTURE_TEMPLATES.iter().find(|(name, _)| *name == template);
+            assert!(
+                text.is_some(),
+                "{dest} names a template that is not built in: {template}"
+            );
+            if dest.ends_with(".json") {
+                let filled = fill(text.map_or("", |(_, t)| t), &values);
+                assert!(
+                    serde_json::from_str::<Value>(&filled).is_ok(),
+                    "{dest} is not JSON: {filled}"
+                );
+            }
+        }
+        assert_eq!(manifest_entries().count(), FIXTURE_TEMPLATES.len());
+        assert!(plain_path(Path::new("/a b/c.d")).is_ok());
+        for odd in ["/a\"b", "/a'b", "/a\\b", "/a\nb"] {
+            assert!(plain_path(Path::new(odd)).is_err(), "{odd}");
+        }
+        // The hook's key and hash are read out of whatever shape the listing has.
+        let listing = json!({"data": [{"cwd": "/p", "hooks": [{"key": "/p/.codex/hooks.json:pre_tool_use:0:0", "currentHash": "sha256:ab"},
+            {"key": "/other/hooks.json:pre_tool_use:0:0", "currentHash": "sha256:cd"}]}]});
+        assert_eq!(
+            find_hook(&listing, "/p"),
+            Some((
+                "/p/.codex/hooks.json:pre_tool_use:0:0".to_string(),
+                "sha256:ab".to_string()
+            ))
+        );
+        assert_eq!(find_hook(&listing, "/q"), None);
+    }
+}

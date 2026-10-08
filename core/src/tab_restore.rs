@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use agent::ResumableSession;
 
+use crate::agent_backend::AgentId;
 use crate::agent_bridge::SessionModeChoice;
 use crate::saved_tabs::SavedTabs;
 use crate::tabs::{label_name, TabId};
@@ -54,6 +55,8 @@ pub struct Skipped {
 /// A saved tab that can be resumed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedTab {
+    /// The agent the tab ran, and runs again.
+    pub agent: AgentId,
     pub provider_session_id: String,
     pub name: Option<String>,
     pub title: Option<String>,
@@ -77,34 +80,55 @@ pub const GONE: &str = "its saved record is gone";
 pub const HELD_ELSEWHERE: &str = "open in another window";
 
 /// Sorts `saved` into what can be resumed and what cannot. `records` are the sessions this project
-/// can resume (`agent::resumable_sessions`, with their display titles), `open` the sessions this
-/// window already has open (left out without comment: they are already where they should be), and
-/// `held` says whether a lease on a session is held right now.
+/// can resume (`agent::resumable_sessions`, with their display titles), of every agent: a saved tab
+/// is matched only with a record its own agent wrote. `open` the sessions this window already has
+/// open (left out without comment: they are already where they should be), and `held` says whether
+/// a lease on an agent's session is held right now. The Claude tabs come first, then the other
+/// agents' tabs, each in saved order.
 pub fn plan(
     saved: &SavedTabs,
     records: &[ResumableSession],
     open: &[String],
-    held: impl Fn(&str) -> bool,
+    held: impl Fn(&AgentId, &str) -> bool,
 ) -> RestorePlan {
     let mut items = Vec::new();
     let mut skipped = Vec::new();
-    for tab in &saved.tabs {
-        let id = tab.provider_session_id.as_str();
+    let claude = saved.tabs.iter().map(|t| {
+        (
+            AgentId::Claude,
+            t.provider_session_id.as_str(),
+            t.name.as_deref(),
+            t.mode,
+        )
+    });
+    let external = saved.external_tabs.iter().map(|t| {
+        (
+            t.agent.clone(),
+            t.provider_session_id.as_str(),
+            t.name.as_deref(),
+            t.mode,
+        )
+    });
+    for (agent, id, saved_name, saved_mode) in claude.chain(external) {
         if open.iter().any(|o| o == id) {
             continue;
         }
-        let Some(record) = records.iter().find(|r| r.provider_session_id == id) else {
+        let provider = agent.record_name();
+        let Some(record) = records
+            .iter()
+            .find(|r| r.provider_session_id == id && r.provider == provider)
+        else {
             skipped.push(Skipped {
-                label: label_name(tab.name.as_deref(), None, Some(id)),
+                label: label_name(saved_name, None, Some(id)),
                 reason: GONE.to_string(),
             });
             continue;
         };
         // The record carries the rename the tab had (a rename is written to it); the saved copy only
         // covers a rename that was made after the record was last read.
-        let name = record.name.clone().or_else(|| tab.name.clone());
+        let name = record.name.clone().or_else(|| saved_name.map(str::to_string));
         let label = label_name(name.as_deref(), record.title.as_deref(), Some(id));
-        if held(id) {
+        if held(&agent, id) {
             skipped.push(Skipped {
                 label,
                 reason: HELD_ELSEWHERE.to_string(),
@@ -112,17 +136,22 @@ pub fn plan(
             continue;
         }
         items.push(PlannedTab {
+            agent,
             provider_session_id: id.to_string(),
             name,
             title: record.title.clone(),
-            saved_mode: tab.mode,
+            saved_mode,
             label,
         });
     }
+    let active_session = match saved.active_external {
+        Some(i) => saved.external_tabs.get(i).map(|t| t.provider_session_id.clone()),
+        None => saved.tabs.get(saved.active).map(|t| t.provider_session_id.clone()),
+    };
     RestorePlan {
         items,
         skipped,
-        active_session: saved.tabs.get(saved.active).map(|t| t.provider_session_id.clone()),
+        active_session,
     }
 }
 
@@ -161,6 +190,8 @@ pub struct RestoreRun {
     /// The mode that tab had before the restore gave it a session's, so a failed resume leaves an
     /// empty tab as it found it rather than in a mode only the restored session was cleared for.
     pub(crate) first_mode: SessionModeChoice,
+    /// The agent that tab ran before, for the same reason.
+    pub(crate) first_agent: AgentId,
     pub(crate) pending: BTreeMap<TabId, String>,
     /// The tabs the restore started, in saved order, until one fails or is closed: where the screen
     /// goes when the tab it was on did not come back.
@@ -171,10 +202,17 @@ pub struct RestoreRun {
 }
 
 impl RestoreRun {
-    pub(crate) fn new(first: TabId, first_mode: SessionModeChoice, total: usize, skipped: Vec<Skipped>) -> Self {
+    pub(crate) fn new(
+        first: TabId,
+        first_mode: SessionModeChoice,
+        first_agent: AgentId,
+        total: usize,
+        skipped: Vec<Skipped>,
+    ) -> Self {
         RestoreRun {
             first,
             first_mode,
+            first_agent,
             pending: BTreeMap::new(),
             order: Vec::new(),
             restored: 0,
@@ -193,10 +231,11 @@ impl RestoreRun {
         self.first == tab
     }
 
-    /// What `tab` goes back to if its resume fails: `Some(mode)`, an empty tab again in the mode it
-    /// had, when it is the one the restore began in; `None`, closed, when the restore made it.
-    pub fn back_to(&self, tab: TabId) -> Option<SessionModeChoice> {
-        self.began_in(tab).then_some(self.first_mode)
+    /// What `tab` goes back to if its resume fails: `Some((mode, agent))`, an empty tab again in the
+    /// mode it had and running the agent it ran, when it is the one the restore began in; `None`,
+    /// closed, when the restore made it.
+    pub fn back_to(&self, tab: TabId) -> Option<(SessionModeChoice, AgentId)> {
+        self.began_in(tab).then(|| (self.first_mode, self.first_agent.clone()))
     }
 
     /// A tab still connecting that the user closed: nothing is owed for it, and the message neither
@@ -292,6 +331,7 @@ mod tests {
                 })
                 .collect(),
             active,
+            ..SavedTabs::default()
         }
     }
 
@@ -331,7 +371,7 @@ mod tests {
             record("a", None, Some("first")),
             record("b", Some("api"), None),
         ];
-        let plan = plan(&saved, &records, &[], |_| false);
+        let plan = plan(&saved, &records, &[], |_, _| false);
         let ids: Vec<&str> = plan.items.iter().map(|i| i.provider_session_id.as_str()).collect();
         assert_eq!(ids, ["a", "b", "c"], "tab-bar order, not the records' own ranking");
         assert!(plan.skipped.is_empty());
@@ -352,7 +392,7 @@ mod tests {
             0,
         );
         let records = [record("held", Some("busy"), None), record("fine", None, Some("ok"))];
-        let plan = plan(&saved, &records, &[], |id| id == "held");
+        let plan = plan(&saved, &records, &[], |_, id| id == "held");
         assert_eq!(plan.items.len(), 1);
         assert_eq!(
             plan.skipped,
@@ -379,7 +419,7 @@ mod tests {
     fn a_session_this_window_already_has_open_is_left_out_without_comment() {
         let saved = saved(&[("open", None, Auto), ("other", None, Auto)], 0);
         let records = [record("open", None, None), record("other", None, None)];
-        let plan = plan(&saved, &records, &["open".to_string()], |_| false);
+        let plan = plan(&saved, &records, &["open".to_string()], |_, _| false);
         assert_eq!(plan.items.len(), 1);
         assert!(plan.skipped.is_empty());
     }
@@ -387,9 +427,9 @@ mod tests {
     #[test]
     fn a_rename_saved_after_the_record_was_read_still_names_the_tab() {
         let saved = saved(&[("a", Some("newer"), Auto)], 0);
-        let plan = plan(&saved, &[record("a", None, Some("title"))], &[], |_| false);
+        let plan = plan(&saved, &[record("a", None, Some("title"))], &[], |_, _| false);
         assert_eq!(plan.items[0].label, "newer");
-        let plan = super::plan(&saved, &[record("a", Some("recorded"), None)], &[], |_| false);
+        let plan = super::plan(&saved, &[record("a", Some("recorded"), None)], &[], |_, _| false);
         assert_eq!(plan.items[0].label, "recorded", "the record's own rename is the tab's");
     }
 
@@ -400,7 +440,7 @@ mod tests {
             0,
         );
         let records = [record("a", Some("one"), None), record("b", Some("two"), None)];
-        let offer = plan(&saved, &records, &[], |_| false).offer().unwrap();
+        let offer = plan(&saved, &records, &[], |_, _| false).offer().unwrap();
         assert_eq!(
             offer,
             RestoreOffer {
@@ -409,14 +449,20 @@ mod tests {
             }
         );
 
-        let nothing = plan(&saved, &[], &[], |_| false);
+        let nothing = plan(&saved, &[], &[], |_, _| false);
         assert_eq!(nothing.offer(), None, "every tab would be skipped");
-        let held = plan(&saved, &records, &[], |_| true);
+        let held = plan(&saved, &records, &[], |_, _| true);
         assert_eq!(held.offer(), None, "every session is held elsewhere");
     }
 
     fn run_of(tabs: &[(u64, &str)], skipped: Vec<Skipped>) -> RestoreRun {
-        let mut run = RestoreRun::new(TabId(tabs[0].0), Auto, tabs.len() + skipped.len(), skipped);
+        let mut run = RestoreRun::new(
+            TabId(tabs[0].0),
+            Auto,
+            AgentId::Claude,
+            tabs.len() + skipped.len(),
+            skipped,
+        );
         for (id, label) in tabs {
             run.pending.insert(TabId(*id), label.to_string());
         }
@@ -500,12 +546,12 @@ mod tests {
 
     #[test]
     fn a_failed_first_tab_goes_back_to_the_mode_it_had_and_a_made_one_goes_away() {
-        let mut run = RestoreRun::new(TabId(1), Auto, 2, Vec::new());
+        let mut run = RestoreRun::new(TabId(1), Auto, AgentId::Claude, 2, Vec::new());
         run.pending.insert(TabId(1), "a".to_string());
-        assert_eq!(run.back_to(TabId(1)), Some(Auto));
+        assert_eq!(run.back_to(TabId(1)), Some((Auto, AgentId::Claude)));
         assert_eq!(run.back_to(TabId(2)), None);
-        let bypass = RestoreRun::new(TabId(4), Bypass, 1, Vec::new());
-        assert_eq!(bypass.back_to(TabId(4)), Some(Bypass));
+        let bypass = RestoreRun::new(TabId(4), Bypass, AgentId::Codex, 1, Vec::new());
+        assert_eq!(bypass.back_to(TabId(4)), Some((Bypass, AgentId::Codex)));
     }
 
     #[test]
@@ -514,7 +560,7 @@ mod tests {
             label: "docs".to_string(),
             reason: GONE.to_string(),
         }];
-        let run = RestoreRun::new(TabId(1), Auto, 1, skipped);
+        let run = RestoreRun::new(TabId(1), Auto, AgentId::Claude, 1, skipped);
         assert_eq!(
             run.outcome().unwrap().message(),
             "Restored 0 of 1 tab; 1 could not be: docs (its saved record is gone)"

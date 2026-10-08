@@ -1,7 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import type { MatchedAskRule, PermissionRequestRecord, ProviderPrompt } from "../types";
+import type {
+  AcpCardInput,
+  CodexCommandInput,
+  CodexFileChange,
+  CodexFileChangeInput,
+  CodexMcpInput,
+  MatchedAskRule,
+  PermissionRequestRecord,
+  ProviderPrompt,
+} from "../types";
 import type { PermissionDecision } from "../bridge";
-import { editPreview } from "../diff";
+import { codexChangePreview, editPreview, lineDiff } from "../diff";
+import type { EditPreview } from "../diff";
+import { isExternalTool, subagentOf } from "../externalTools";
 import { isUsableLink } from "../timeline";
 import { EditDiff } from "./EditDiff";
 import { countEscapes, revealHidden } from "../revealHidden";
@@ -51,6 +62,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
      (`alreadyAnswered`) when `a`/`d` answered it. Neither of these clears the card; only a provider
      event does that. */
   const inert = answered || sessionEnded;
+  const external = isExternalTool(request.toolName);
 
   function handleAnswer(decision: PermissionDecision, remember = false) {
     if (inert) return;
@@ -79,24 +91,28 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
       </div>
       {request.providerPrompt && <ProviderPromptLine prompt={request.providerPrompt} />}
       <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />
-      <input
-        type="text"
-        {...NO_TEXT_ASSIST}
-        data-nav-order={ruleOffer ? 4 : 3}
-        placeholder="Reason (shown to the agent if you deny) — Enter denies"
-        value={reason}
-        onChange={(e) => {
-          setReason(e.target.value);
-          onReasonChange?.(request.permissionId, e.target.value);
-        }}
-        onKeyDown={(e) => {
-          // Enter denies with the reason; leave IME Enter to the input method.
-          if (e.key !== "Enter" || e.nativeEvent.isComposing || e.keyCode === 229) return;
-          e.preventDefault();
-          handleAnswer("deny");
-        }}
-        disabled={inert}
-      />
+      {/* A deny from another agent carries no reason (Codex's decline has no field for one), so there is
+          no box to type into; `D` says so (`App.tsx`). */}
+      {!external && (
+        <input
+          type="text"
+          {...NO_TEXT_ASSIST}
+          data-nav-order={ruleOffer ? 4 : 3}
+          placeholder="Reason (shown to the agent if you deny) — Enter denies"
+          value={reason}
+          onChange={(e) => {
+            setReason(e.target.value);
+            onReasonChange?.(request.permissionId, e.target.value);
+          }}
+          onKeyDown={(e) => {
+            // Enter denies with the reason; leave IME Enter to the input method.
+            if (e.key !== "Enter" || e.nativeEvent.isComposing || e.keyCode === 229) return;
+            e.preventDefault();
+            handleAnswer("deny");
+          }}
+          disabled={inert}
+        />
+      )}
       <div className="permission-card-buttons">
         {/* `data-nav-order` puts Approve first for `l`, then Deny, then Always allow when offered,
             then the reason box. `a`/`d` answer through `answerPermission` by `permissionId`, using
@@ -156,6 +172,7 @@ function askRuleText(rule: MatchedAskRule): string {
  * Other inputs render as JSON, with `Bash` commands shown as shell text when available.
  * `PreToolUse` already carries the complete input object; these previews need no extra wire fields. */
 function ToolInput({ toolName, input, createsFile }: { toolName: string; input: unknown; createsFile?: boolean }) {
+  if (isExternalTool(toolName)) return <ExternalInput toolName={toolName} input={input} />;
   const preview = editPreview(toolName, input);
   if (preview !== null) {
     // No cap here: a card shows the whole change, unlike the folded preview a conversation row gets
@@ -187,6 +204,205 @@ function ToolInput({ toolName, input, createsFile }: { toolName: string; input: 
         <Revealed pieces={pieces} />
       </pre>
       <HiddenWarning count={countEscapes(pieces)} what="input" />
+    </>
+  );
+}
+
+/** Agent-written text, drawn through `revealHidden` with its own warning line when it holds anything hidden. */
+function Shown({ text, what }: { text: string; what: string }) {
+  const pieces = revealHidden(text);
+  return (
+    <>
+      <Revealed pieces={pieces} />
+      <HiddenWarning count={countEscapes(pieces)} what={what} />
+    </>
+  );
+}
+
+/** The agent's explanation of why it asks, labelled and muted: it is the agent's claim, not Eitri's. */
+function AgentSays({ who, reason }: { who: string; reason: unknown }) {
+  if (typeof reason !== "string" || reason.trim() === "") return null;
+  return (
+    <div className="permission-card-description permission-card-says">
+      {who} says: <Shown text={reason} what="reason" />
+    </div>
+  );
+}
+
+/** Whose subagent a call came from, when it did not come from the tab's own thread. */
+function SubagentLine({ name }: { name: string | null }) {
+  if (name === null) return null;
+  return (
+    <div className="permission-card-provider">
+      <span className="permission-card-provider-label">subagent</span>
+      <Shown text={name} what="subagent name" />
+    </div>
+  );
+}
+
+/** The cards of another agent: a Codex command, file change or tool call, or an ACP agent's call. What each
+ *  card shows is what the provider holds for the request, never more: a file change is the diff Codex
+ *  announced for that item, and a command is the exact string Codex will run. */
+function ExternalInput({ toolName, input }: { toolName: string; input: unknown }) {
+  const subagent = subagentOf(toolName, input);
+  return (
+    <>
+      <SubagentLine name={subagent} />
+      {toolName === "commandExecution" ? (
+        <CodexCommand input={input as Partial<CodexCommandInput>} />
+      ) : toolName === "fileChange" ? (
+        <CodexFileChanges input={input as Partial<CodexFileChangeInput>} />
+      ) : toolName === "mcpToolCall" ? (
+        <CodexMcp input={input as Partial<CodexMcpInput>} />
+      ) : (
+        <AcpCall input={(input ?? {}) as AcpCardInput} />
+      )}
+    </>
+  );
+}
+
+function CodexCommand({ input }: { input: Partial<CodexCommandInput> }) {
+  const network = input.network ?? null;
+  const command = typeof input.command === "string" ? revealHidden(input.command) : null;
+  const wording =
+    typeof input.escalation === "string" && input.escalation !== ""
+      ? input.escalation
+      : network !== null
+        ? `asks for network access to ${network.host} (${network.protocol})`
+        : "";
+  return (
+    <>
+      {wording !== "" && (
+        <div className="permission-card-wording">
+          <Shown text={wording} what="wording" />
+        </div>
+      )}
+      {command !== null && (
+        <>
+          <pre className="permission-card-command">
+            {"$ "}
+            <Revealed pieces={command} />
+          </pre>
+          <HiddenWarning count={countEscapes(command)} what="command" />
+        </>
+      )}
+      {typeof input.cwd === "string" && input.cwd !== "" && (
+        <div className="permission-card-description">
+          in <Shown text={input.cwd} what="directory" />
+        </div>
+      )}
+      <AgentSays who="Codex" reason={input.reason} />
+    </>
+  );
+}
+
+function CodexFileChanges({ input }: { input: Partial<CodexFileChangeInput> }) {
+  const changes: CodexFileChange[] = Array.isArray(input.changes) ? input.changes : [];
+  return (
+    <>
+      {changes.length === 0 && <div className="permission-card-description">(no files named)</div>}
+      {changes.map((change, i) => (
+        <div key={i} className="permission-card-change">
+          <ChangeNote change={change} />
+          <EditDiff preview={codexChangePreview(change)} />
+        </div>
+      ))}
+      <AgentSays who="Codex" reason={input.reason} />
+    </>
+  );
+}
+
+/** What the change does to the path beyond the lines: a new file, a removed one, a move. */
+function ChangeNote({ change }: { change: CodexFileChange }) {
+  const note =
+    change.kind === "add"
+      ? "Creates a new file."
+      : change.kind === "delete"
+        ? "Deletes the file."
+        : change.kind === "update"
+          ? null
+          : `Change of kind ${change.kind}.`;
+  const moved = typeof change.movePath === "string" && change.movePath !== "";
+  if (note === null && !moved) return null;
+  return (
+    <div className="permission-card-edit-note">
+      {note}
+      {note !== null && moved ? " " : ""}
+      {moved && (
+        <>
+          Moves it to <Shown text={change.movePath!} what="path" />.
+        </>
+      )}
+    </div>
+  );
+}
+
+function CodexMcp({ input }: { input: Partial<CodexMcpInput> }) {
+  const pieces = revealHidden(JSON.stringify(input.arguments ?? null, null, 2) ?? "");
+  return (
+    <>
+      <div className="permission-card-wording">
+        Tool <Shown text={String(input.tool ?? "")} what="tool name" /> on server{" "}
+        <Shown text={String(input.server ?? "")} what="server name" />
+      </div>
+      <pre className="permission-card-input">
+        <Revealed pieces={pieces} />
+      </pre>
+      <HiddenWarning count={countEscapes(pieces)} what="arguments" />
+    </>
+  );
+}
+
+/** The preview of one ACP diff: the old text against the new, as the agent sent them. */
+function acpPreview(diff: NonNullable<AcpCardInput["diffs"]>[number]): EditPreview {
+  const before = typeof diff.oldText === "string" ? diff.oldText : "";
+  const after = typeof diff.newText === "string" ? diff.newText : "";
+  const shown = lineDiff(before, after);
+  const count = (kind: "added" | "removed") => shown?.filter((l) => l.kind === kind).length ?? 0;
+  return { filePath: diff.path, diff: shown, added: count("added"), removed: count("removed"), replaceAll: false, wholeFile: false };
+}
+
+/** An ACP agent's call: the title it gave, what it names, and the agent's own option names, drawn as it wrote
+ *  them because a reject may end the turn. Approve takes the first `allow_once`, Deny the first `reject_once`;
+ *  `allow_always` and `reject_always` are never offered. */
+function AcpCall({ input }: { input: AcpCardInput }) {
+  const options = Array.isArray(input.options) ? input.options : [];
+  const approve = options.find((o) => o.kind === "allow_once");
+  const deny = options.find((o) => o.kind === "reject_once");
+  const approvePieces = revealHidden(approve?.name ?? "");
+  const denyPieces = revealHidden(deny?.name ?? "");
+  const locations = Array.isArray(input.locations) ? input.locations : [];
+  const diffs = Array.isArray(input.diffs) ? input.diffs : [];
+  const raw = input.rawInput === undefined || input.rawInput === null ? null : revealHidden(JSON.stringify(input.rawInput, null, 2) ?? "");
+  return (
+    <>
+      {typeof input.title === "string" && input.title !== "" && (
+        <div className="permission-card-wording">
+          <Shown text={input.title} what="title" />
+        </div>
+      )}
+      {locations.map((location, i) => (
+        <div key={i} className="permission-card-description">
+          <Shown text={String(location.path)} what="path" />
+        </div>
+      ))}
+      {diffs.map((diff, i) => (
+        <EditDiff key={i} preview={acpPreview(diff)} />
+      ))}
+      {raw !== null && (
+        <>
+          <pre className="permission-card-input">
+            <Revealed pieces={raw} />
+          </pre>
+          <HiddenWarning count={countEscapes(raw)} what="input" />
+        </>
+      )}
+      <AgentSays who="The agent" reason={input.reason} />
+      <div className="permission-card-description permission-card-options">
+        Approve answers {approve ? <>“<Revealed pieces={approvePieces} />”</> : "nothing: the agent offered no allow-once option"}.
+        Deny answers {deny ? <>“<Revealed pieces={denyPieces} />”</> : "nothing: the agent offered no reject-once option"}.
+      </div>
+      <HiddenWarning count={countEscapes(approvePieces) + countEscapes(denyPieces)} what="option name" />
     </>
   );
 }

@@ -945,6 +945,28 @@ describe("slash command pickers", () => {
     expect(posted.filter((m) => m.type === "send_message")).toHaveLength(sentBefore);
   });
 
+  it("slash picker absent in codex tab", () => {
+    const rendered = startedApp();
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, agent: "codex" }] });
+    const { container } = rendered;
+    sendBareCommand(container, "/model");
+    expect(lastOfType("send_message")!.text).toBe("/model");
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
+    );
+    expect(container.querySelector(".slash-picker")).toBeNull();
+  });
+
+  it("a held-back slash command is sent as typed in a codex tab", () => {
+    const rendered = startedApp();
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, agent: "codex" }] });
+    const { container } = rendered;
+    sendBareCommand(container, "/config");
+    expect(lastOfType("send_message")!.text).toBe("/config");
+    expect(container.querySelector(".composer-slash-flash")).toBeNull();
+  });
+
   it("opens a picker for a bare /effort too, with no current marked (the bare reply names none)", () => {
     const { container } = startedApp();
     sendBareCommand(container, "/effort");
@@ -2863,6 +2885,31 @@ describe("the leader", () => {
       expect(container.querySelector(".handoff")).not.toBeNull();
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("handoff flashes in codex tab", () => {
+    vi.useFakeTimers();
+    try {
+      const pause = () => act(() => vi.advanceTimersByTime(300));
+      const widen = stubBandWidth();
+      const { container } = started();
+      act(() => widen(container));
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, agent: "codex" }] });
+      sendTable({ ...TABLE, bindings: [...TABLE.bindings, binding(["<leader>", "t"], "panel.handoff", "terminal")] });
+      act(() => root(container).focus());
+      posted.length = 0;
+      pause();
+      press(" ");
+      press("t");
+      expect(posted.length).toBe(0);
+      expect(container.querySelector(".handoff")).toBeNull();
+      expect(container.querySelector(".band-message")!.textContent).toBe(
+        "Continuing a codex session in a terminal is not available yet",
+      );
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
     }
   });
 });

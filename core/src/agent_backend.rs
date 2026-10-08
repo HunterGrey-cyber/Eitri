@@ -21,10 +21,12 @@ use agent::setting_sources::ProjectTrust;
 use agent::{
     AgentConversation, AgentDomainEvent, AgentSession, AgentSessionProjection, ClaudeSidecarProvider,
     ConversationError, PermissionDecision, PermissionMode, ProjectionGuard, ProviderCapabilities, ProviderInfo,
-    ResumableSession, RevisedDelivery, UiDelivery,
+    ResumableSession, Reviewer, RevisedDelivery, TrustPlan, TurnPolicy, UiDelivery,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+use crate::agent_bridge::SessionModeChoice;
 
 /// The legacy backend's capabilities, stated once so a test can assert on the value
 /// `capabilities()` actually returns rather than on a copy of it.
@@ -94,6 +96,107 @@ impl std::ops::Deref for ProjectionRef<'_> {
             ProjectionRef::Borrowed(projection) => projection,
             ProjectionRef::Guarded(guard) => guard,
         }
+    }
+}
+
+/// Which agent a tab runs. Claude runs on the window's Claude backend ([`BackendKind`]); every other
+/// agent is a provider of its own, started per tab ([`AgentBackend::start_external`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AgentId {
+    Claude,
+    Codex,
+    /// An agent spoken to over ACP, by the name it was registered under.
+    Acp(String),
+}
+
+impl AgentId {
+    /// The name its conversation records and session leases carry: `claude`, `codex`, `acp:<name>`.
+    pub fn record_name(&self) -> String {
+        match self {
+            AgentId::Claude => "claude".to_string(),
+            AgentId::Codex => "codex".to_string(),
+            AgentId::Acp(name) => format!("acp:{name}"),
+        }
+    }
+
+    /// The reverse of [`record_name`](Self::record_name); `None` for anything else, an ACP name that is
+    /// empty or carries a control character included.
+    pub fn from_record_name(text: &str) -> Option<AgentId> {
+        match text {
+            "claude" => Some(AgentId::Claude),
+            "codex" => Some(AgentId::Codex),
+            other => {
+                let name = other.strip_prefix("acp:")?;
+                (!name.trim().is_empty() && !name.chars().any(char::is_control)).then(|| AgentId::Acp(name.to_string()))
+            }
+        }
+    }
+
+    /// Whether this agent runs as an external provider rather than on the window's Claude backend.
+    pub fn is_external(&self) -> bool {
+        !matches!(self, AgentId::Claude)
+    }
+
+    /// How a person reads it: `Claude`, `Codex`, or the ACP agent's own name.
+    pub fn label(&self) -> String {
+        match self {
+            AgentId::Claude => "Claude".to_string(),
+            AgentId::Codex => "Codex".to_string(),
+            AgentId::Acp(name) => name.clone(),
+        }
+    }
+}
+
+impl serde::Serialize for AgentId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.record_name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AgentId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        AgentId::from_record_name(&text).ok_or_else(|| serde::de::Error::custom(format!("not an agent: {text:?}")))
+    }
+}
+
+/// The policy a turn of an external agent runs under, from the tab's mode: in Auto the agent's own
+/// reviewer decides what still needs asking, in Bypass every request reaches Eitri, which answers it.
+pub fn turn_policy(mode: SessionModeChoice) -> TurnPolicy {
+    TurnPolicy {
+        reviewer: match mode {
+            SessionModeChoice::Auto => Reviewer::Agent,
+            SessionModeChoice::Bypass => Reviewer::User,
+        },
+    }
+}
+
+/// A conversation with an external agent, and which agent it is.
+pub struct ExternalConversation {
+    agent: AgentId,
+    conversation: AgentConversation,
+}
+
+impl ExternalConversation {
+    /// Refuses a conversation that is not an external provider's, or one whose provider names
+    /// another agent than `agent`: the tab's agent, its records and its leases must agree.
+    pub fn new(agent: AgentId, conversation: AgentConversation) -> Result<Self, BackendError> {
+        if !agent.is_external() || conversation.provider_name() != agent.record_name() {
+            return Err(BackendError::fatal(format!(
+                "a {} session cannot be held as a {} tab",
+                conversation.provider_name(),
+                agent.record_name()
+            )));
+        }
+        Ok(ExternalConversation { agent, conversation })
+    }
+
+    pub fn agent(&self) -> &AgentId {
+        &self.agent
+    }
+
+    pub fn conversation(&self) -> &AgentConversation {
+        &self.conversation
     }
 }
 
@@ -298,6 +401,8 @@ fn user_prompt_event(as_typed: &str) -> AgentDomainEvent {
 pub enum AgentBackend {
     Legacy(AgentSession),
     Sidecar(Box<AgentConversation>),
+    /// A tab running another agent than Claude: its own provider, its own records.
+    External(Box<ExternalConversation>),
 }
 
 impl AgentBackend {
@@ -369,10 +474,105 @@ impl AgentBackend {
         }
     }
 
-    pub fn kind(&self) -> BackendKind {
+    /// Starts, or resumes, a session of an external agent. **Blocking** like [`start`](Self::start):
+    /// it runs the agent's own child, and for Codex the per-binary check first, so callers run it off
+    /// the GTK main loop.
+    ///
+    /// `plan` is the trust plan the user's answer was bound to and `mode` the tab's, which picks the
+    /// reviewer of the session's first turn. `resume` names the agent's own session to continue; its
+    /// lease is taken here and held by the conversation. Every start of an external tab goes through
+    /// the same trust gate as a Claude start, so nothing here decides what the project may load.
+    pub fn start_external(
+        agent: AgentId,
+        program: PathBuf,
+        project_dir: &Path,
+        plan: TrustPlan,
+        mode: SessionModeChoice,
+        resume: Option<&str>,
+    ) -> Result<Self, BackendError> {
+        let state_home = crate::layout::persist::state_subdir(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+            "",
+        )
+        .ok_or_else(|| BackendError::fatal("Eitri has no state directory to keep Codex's check in".to_string()))?;
+        let canonical = project_dir
+            .canonicalize()
+            .map_err(|e| BackendError::fatal(format!("the project directory cannot be resolved: {e}")))?;
+        let provider: std::sync::Arc<dyn agent::ExternalProvider + Send + Sync> = match &agent {
+            AgentId::Codex => std::sync::Arc::new(
+                agent::providers::codex::CodexProvider::connect(agent::providers::codex::CodexLaunch {
+                    program,
+                    cwd: canonical.clone(),
+                    state_home,
+                })
+                .map_err(|e| BackendError::fatal(format!("Codex could not start: {e}")))?,
+            ),
+            AgentId::Claude | AgentId::Acp(_) => {
+                return Err(BackendError::fatal(format!(
+                    "this build cannot start a {} tab",
+                    agent.label()
+                )))
+            }
+        };
+        Self::start_external_with(agent, provider, &canonical, plan, mode, resume)
+    }
+
+    /// [`start_external`](Self::start_external) over a provider the caller already has: what it does
+    /// once its provider is connected, and the way a test drives an external tab without a child.
+    pub fn start_external_with(
+        agent: AgentId,
+        provider: std::sync::Arc<dyn agent::ExternalProvider + Send + Sync>,
+        project_dir: &Path,
+        plan: TrustPlan,
+        mode: SessionModeChoice,
+        resume: Option<&str>,
+    ) -> Result<Self, BackendError> {
+        let canonical = project_dir
+            .canonicalize()
+            .map_err(|e| BackendError::fatal(format!("the project directory cannot be resolved: {e}")))?;
+        let start = agent::ExternalStart {
+            cwd: canonical.to_string_lossy().into_owned(),
+            plan,
+            policy: turn_policy(mode),
+            resume: resume.map(str::to_string),
+        };
+        let conversation = match resume {
+            Some(id) => {
+                let cwd = canonical.to_string_lossy().into_owned();
+                let lease = agent::lease::SessionLease::try_acquire(&agent.record_name(), &cwd, id).map_err(|e| {
+                    BackendError::fatal(format!(
+                        "could not continue the previous {} session: {e}",
+                        agent.label()
+                    ))
+                })?;
+                AgentConversation::resume_external(provider, start, &canonical, lease).map_err(|e| {
+                    BackendError::fatal(format!(
+                        "could not continue the previous {} session: {e}",
+                        agent.label()
+                    ))
+                })?
+            }
+            None => AgentConversation::create_external(provider, start, &canonical)
+                .map_err(|e| BackendError::fatal(format!("failed to create a {} session: {e}", agent.label())))?,
+        };
+        ExternalConversation::new(agent, conversation).map(|c| AgentBackend::External(Box::new(c)))
+    }
+
+    /// Which Claude backend this is; `None` for an external agent, which runs on neither.
+    pub fn kind(&self) -> Option<BackendKind> {
         match self {
-            AgentBackend::Legacy(_) => BackendKind::Legacy,
-            AgentBackend::Sidecar(_) => BackendKind::Sidecar,
+            AgentBackend::Legacy(_) => Some(BackendKind::Legacy),
+            AgentBackend::Sidecar(_) => Some(BackendKind::Sidecar),
+            AgentBackend::External(_) => None,
+        }
+    }
+
+    /// The agent this backend runs.
+    pub fn agent(&self) -> AgentId {
+        match self {
+            AgentBackend::Legacy(_) | AgentBackend::Sidecar(_) => AgentId::Claude,
+            AgentBackend::External(external) => external.agent.clone(),
         }
     }
 
@@ -406,6 +606,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(session) => ProjectionRef::Borrowed(&session.projection),
             AgentBackend::Sidecar(conversation) => ProjectionRef::Guarded(conversation.projection()),
+            AgentBackend::External(external) => ProjectionRef::Guarded(external.conversation.projection()),
         }
     }
 
@@ -415,6 +616,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(_) => None,
             AgentBackend::Sidecar(conversation) => Some(conversation.conversation_id()),
+            AgentBackend::External(external) => Some(external.conversation.conversation_id()),
         }
     }
 
@@ -429,6 +631,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(session) => session.projection.session_id.as_deref(),
             AgentBackend::Sidecar(conversation) => conversation.session_id(),
+            AgentBackend::External(external) => external.conversation.session_id(),
         }
     }
 
@@ -439,6 +642,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(session) => session.projection.provider_session_id.clone(),
             AgentBackend::Sidecar(conversation) => conversation.provider_session_id(),
+            AgentBackend::External(external) => external.conversation.provider_session_id(),
         }
     }
 
@@ -446,6 +650,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(_) => None,
             AgentBackend::Sidecar(conversation) => Some(conversation.provider_info()),
+            AgentBackend::External(external) => Some(external.conversation.provider_info()),
         }
     }
 
@@ -458,6 +663,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(_) => LEGACY_CAPABILITIES,
             AgentBackend::Sidecar(conversation) => conversation.capabilities(),
+            AgentBackend::External(external) => external.conversation.capabilities(),
         }
     }
 
@@ -524,14 +730,44 @@ impl AgentBackend {
                 conversation.note_title(as_typed);
                 Ok(Vec::new())
             }
+            // An external turn runs under the policy of its tab's mode, which this door does not
+            // carry: refused, and nothing folded, rather than sent under a guessed reviewer.
+            AgentBackend::External(_) => Err(BackendError {
+                message: "this tab's turns carry its permission mode; send it through its tab".to_string(),
+                benign: true,
+                folded_events: Vec::new(),
+            }),
         }
+    }
+
+    /// [`send_turn`](Self::send_turn) in a tab whose mode is `mode`. A Claude turn ignores the mode:
+    /// its tab's mode is applied where requests are answered (`take_ui_delivery_with_rules`), never
+    /// sent to the CLI. An external agent's turn carries it as the turn's reviewer, so a mode change
+    /// reaches the agent at the next turn, while Eitri's own answering follows the mode at once.
+    pub fn send_turn_in(
+        &mut self,
+        wire_text: &str,
+        as_typed: &str,
+        mode: SessionModeChoice,
+    ) -> Result<Vec<AgentDomainEvent>, BackendError> {
+        let AgentBackend::External(external) = self else {
+            return self.send_turn(wire_text, as_typed);
+        };
+        // Folded before the send, as on the sidecar, so the prompt keeps its place before the
+        // agent's first event of the turn.
+        external.conversation.fold_locally(user_prompt_event(as_typed));
+        external.conversation.send_turn_with(wire_text, turn_policy(mode))?;
+        external.conversation.note_title(as_typed);
+        Ok(Vec::new())
     }
 
     /// A session tab's rename. Legacy writes no records, so its name lives only in the
     /// tab (`crate::tab_set`).
     pub fn note_name(&mut self, name: Option<String>) {
-        if let AgentBackend::Sidecar(conversation) = self {
-            conversation.note_name(name);
+        match self {
+            AgentBackend::Legacy(_) => {}
+            AgentBackend::Sidecar(conversation) => conversation.note_name(name),
+            AgentBackend::External(external) => external.conversation.note_name(name),
         }
     }
 
@@ -540,6 +776,10 @@ impl AgentBackend {
             AgentBackend::Legacy(session) => Ok(session.interrupt()?),
             AgentBackend::Sidecar(conversation) => {
                 conversation.interrupt()?;
+                Ok(Vec::new())
+            }
+            AgentBackend::External(external) => {
+                external.conversation.interrupt()?;
                 Ok(Vec::new())
             }
         }
@@ -560,6 +800,10 @@ impl AgentBackend {
             AgentBackend::Legacy(session) => Ok(session.respond_permission(permission_id, decision)?),
             AgentBackend::Sidecar(conversation) => {
                 conversation.respond_permission(permission_id, decision)?;
+                Ok(Vec::new())
+            }
+            AgentBackend::External(external) => {
+                external.conversation.respond_permission(permission_id, decision)?;
                 Ok(Vec::new())
             }
         }
@@ -641,6 +885,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(_) => {}
             AgentBackend::Sidecar(conversation) => conversation.note_ui_snapshot(revision),
+            AgentBackend::External(external) => external.conversation.note_ui_snapshot(revision),
         }
     }
 
@@ -649,6 +894,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(_) => None,
             AgentBackend::Sidecar(conversation) => conversation.take_ui_snapshot_revision(),
+            AgentBackend::External(external) => external.conversation.take_ui_snapshot_revision(),
         }
     }
 
@@ -676,6 +922,7 @@ impl AgentBackend {
                 }
             }
             AgentBackend::Sidecar(conversation) => conversation.take_revised_ui_delivery(),
+            AgentBackend::External(external) => external.conversation.take_revised_ui_delivery(),
         };
         match delivery {
             RevisedDelivery::Events(events) => {
@@ -790,7 +1037,10 @@ impl AgentBackend {
         let mut tripped = false;
         let mut kept = Vec::with_capacity(events.len());
         for (revision, event) in events {
-            tripped |= matches!(event, AgentDomainEvent::UngatedCliMode { .. });
+            tripped |= matches!(
+                event,
+                AgentDomainEvent::UngatedCliMode { .. } | AgentDomainEvent::PolicyMismatch { .. }
+            );
             let AgentDomainEvent::PermissionRequested {
                 permission_id,
                 tool_use_id,
@@ -808,13 +1058,59 @@ impl AgentBackend {
             // deferral: the session asked for the CLI's auto mode, and the CLI says it is running it.
             let (projection_tripped, cli_reports_auto) = {
                 let projection = self.projection();
-                (projection.ungated_cli_mode.is_some(), projection.cli_runs_auto())
+                (session_tripped(&projection), projection.cli_runs_auto())
             };
             tripped |= projection_tripped;
             let defers_to_the_cli = self.capabilities().cli_auto_mode && cli_reports_auto;
             if tripped {
-                eprintln!("[permission] not answering {tool_name}: the CLI reported an ungated mode");
+                eprintln!("[permission] not answering {tool_name}: the agent reported a policy it was not asked for");
                 kept.push((revision, event));
+                continue;
+            }
+            if matches!(self, AgentBackend::External(_)) {
+                // An external agent's requests are judged by nobody here. In Auto its own reviewer has
+                // already passed on what it let through, so what reaches Eitri is the user's to answer;
+                // in Bypass every one is allowed (the requests its provider declines itself never
+                // arrive). Eitri's classifier and the saved prefix rules are about Claude's tools and
+                // are never consulted.
+                if mode == PermissionMode::Auto {
+                    eprintln!("[permission] asking the user: {tool_name} (the agent's own reviewer passed it on)");
+                    kept.push((revision, event));
+                    continue;
+                }
+                if host_answered.contains(permission_id) {
+                    continue;
+                }
+                let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
+                let call = named_call(tool_use_id);
+                match self.respond_permission(&permission_id, PermissionDecision::Allow) {
+                    Ok(_resolution) => {
+                        answered_for_you.gate_answers.push(GateAnswer {
+                            origin: GateOrigin::GateRequest,
+                            permission_id: permission_id.clone(),
+                            tool_use_id: call.clone(),
+                            tool_name: tool_name.clone(),
+                            deferred: false,
+                        });
+                        host_answered.insert(permission_id);
+                        // The agent asked because its sandbox would not let the call through; the row
+                        // says this host let it through, or the escalation would pass unseen.
+                        if let Some(call) = call {
+                            answered_for_you.prompts.push(PromptAnsweredForYou {
+                                tool_use_id: call,
+                                note: EXTERNAL_BYPASS_NOTE.to_string(),
+                            });
+                        }
+                        eprintln!("[permission] allowed in bypass: {tool_name}");
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[permission] could not allow {tool_name} in bypass, showing a card instead: {}",
+                            error.message
+                        );
+                        kept.push((revision, event));
+                    }
+                }
                 continue;
             }
             if let Some(prompt) = provider_prompt {
@@ -1082,19 +1378,26 @@ impl AgentBackend {
     pub fn approve_pending(&mut self, ids: &[String], why: &str) -> Approved {
         // Its own statement, guard dropped before any answer -- the same lock-order rule the
         // collection below follows.
-        if self.projection().ungated_cli_mode.is_some() {
-            eprintln!("[permission] not answering {why}: the CLI reported an ungated mode");
+        if session_tripped(&self.projection()) {
+            eprintln!("[permission] not answering {why}: the agent reported a policy it was not asked for");
             return Approved::default();
         }
+        let external = matches!(self, AgentBackend::External(_));
         let pending: std::collections::BTreeMap<String, PendingAnswer> = {
             let projection = self.projection();
             ids.iter()
                 .filter_map(|id| {
                     let p = projection.pending_permissions.get(id)?;
-                    let prompt = p
-                        .provider_prompt
-                        .as_ref()
-                        .and_then(|prompt| named_call(&p.tool_use_id).map(|call| (call, prompt.label())));
+                    // Every external request is an escalation past the agent's own sandbox, so each
+                    // one approved here gets its row note; a Claude gate request does not.
+                    let prompt = if external {
+                        named_call(&p.tool_use_id).map(|call| (call, EXTERNAL_BYPASS_NOTE.to_string()))
+                    } else {
+                        p.provider_prompt.as_ref().and_then(|prompt| {
+                            named_call(&p.tool_use_id)
+                                .map(|call| (call, format!("{} — allowed in bypass", prompt.label())))
+                        })
+                    };
                     Some((
                         id.clone(),
                         PendingAnswer {
@@ -1107,10 +1410,10 @@ impl AgentBackend {
         };
         approve_each(ids, &pending, why, |id| {
             // Its own statement, guard dropped before the answer locks the projection again.
-            let tripped = self.projection().ungated_cli_mode.is_some();
+            let tripped = session_tripped(&self.projection());
             if tripped {
                 return Err(BackendError {
-                    message: "the CLI reported an ungated mode".into(),
+                    message: "the agent reported a policy it was not asked for".into(),
                     benign: true,
                     folded_events: Vec::new(),
                 });
@@ -1123,6 +1426,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(session) => session.shutdown(),
             AgentBackend::Sidecar(conversation) => conversation.shutdown(),
+            AgentBackend::External(external) => external.conversation.shutdown(),
         }
     }
 }
@@ -1139,7 +1443,8 @@ pub struct Approved {
 }
 
 /// One still-pending request `approve_pending` is about to answer: its tool (for the log) and, for a
-/// CLI prompt that names its call, that call's tool-use id and the prompt's label (for its row note).
+/// request whose row says it was allowed (a CLI prompt, or any external agent's request) that names
+/// its call, that call's tool-use id and the row note.
 struct PendingAnswer {
     tool_name: String,
     prompt: Option<(String, String)>,
@@ -1165,11 +1470,11 @@ fn approve_each(
                 eprintln!("[permission] allowed {why}: {tool_name}");
                 approved.ids.push(id.clone());
                 approved.events.extend(events);
-                if let Some((call, label)) = prompt {
+                if let Some((call, note)) = prompt {
                     // Both callers are bypass, so the note is the one a bypass tab's own answer gives.
                     approved.prompts.push(PromptAnsweredForYou {
                         tool_use_id: call.clone(),
-                        note: format!("{label} — allowed in bypass"),
+                        note: note.clone(),
                     });
                 }
             }
@@ -1241,6 +1546,9 @@ impl HumanApprovals {
         self.calls.is_empty()
     }
 }
+
+/// The row note of an external agent's request this host allowed because the tab is in bypass.
+pub const EXTERNAL_BYPASS_NOTE: &str = "allowed in bypass";
 
 /// A CLI prompt answered without a card, identified by tool-use id, and the note displayed on
 /// its call's row. `ProviderPrompt::label` identifies the prompt.
@@ -1326,6 +1634,13 @@ pub struct GateAnswer {
 /// `EDIT_TOOLS`, restated here only to recognise its answer, never to decide one.
 const ACCEPT_EDITS_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
 
+/// Whether the session has reported a policy other than the one Eitri asked for: the Claude CLI's
+/// ungated permission mode, or any other agent's sandbox, approval policy or trust difference. Either
+/// way the session is about to be closed and nothing is answered for it, bypass included.
+fn session_tripped(projection: &agent::AgentSessionProjection) -> bool {
+    projection.ungated_cli_mode.is_some() || projection.policy_mismatch.is_some()
+}
+
 /// A request's tool-use id, when it names a call a row can show: `None` for a missing or empty id.
 fn named_call(tool_use_id: &Option<String>) -> Option<String> {
     tool_use_id.clone().filter(|id| !id.is_empty())
@@ -1408,6 +1723,27 @@ fn title_for(canonical_cwd: &str, mut session: ResumableSession) -> ResumableSes
     session
 }
 
+/// Every resumable session of the project at `project_dir` that an agent other than Claude recorded,
+/// newest first: what a restore matches the other agents' saved tabs with.
+pub fn external_sessions(project_dir: &Path) -> Vec<ResumableSession> {
+    project_dir
+        .canonicalize()
+        .map(|cwd| {
+            agent::resumable_sessions(&agent::conversation_id_for_cwd(&cwd))
+                .into_iter()
+                .filter(|s| AgentId::from_record_name(&s.provider).is_some_and(|a| a.is_external()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The sessions of `sessions` that `agent` itself recorded, in their order: what a tab of that agent
+/// may offer to continue.
+pub fn sessions_of(agent: &AgentId, sessions: Vec<ResumableSession>) -> Vec<ResumableSession> {
+    let name = agent.record_name();
+    sessions.into_iter().filter(|s| s.provider == name).collect()
+}
+
 /// What the frontend is told at handshake time, before any session exists.
 pub struct BackendGreeting {
     pub kind: BackendKind,
@@ -1450,28 +1786,56 @@ impl BackendGreeting {
     /// Eitri's own records for one that grows with a file this project neither writes nor knows a
     /// bound for, and it would do it here, on the loop that draws the editor.
     pub fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
+        Self::for_agent(kind, &AgentId::Claude, project_dir)
+    }
+
+    /// [`for_kind`](Self::for_kind) for a tab running `agent`: what it offers to continue is that
+    /// agent's sessions only, so a Codex thread is never offered to a Claude tab or the other way
+    /// round. An external agent's sessions need no Claude backend to resume, and their titles are
+    /// Eitri's own (no Claude transcript to read one from).
+    pub fn for_agent(kind: BackendKind, agent: &AgentId, project_dir: PathBuf) -> Self {
+        if agent.is_external() {
+            // Only this agent's records: the Claude records and their transcript titles are not read
+            // at all, since nothing here would show them.
+            let resumable = project_dir
+                .canonicalize()
+                .ok()
+                .map(|cwd| sessions_of(agent, agent::resumable_sessions(&agent::conversation_id_for_cwd(&cwd))))
+                .unwrap_or_default();
+            return Self::with_resumable(kind, project_dir, resumable);
+        }
+        let resumable = Self::claude_sessions(kind, &project_dir);
+        Self::with_resumable(kind, project_dir, resumable)
+    }
+
+    /// The Claude sessions of the project at `project_dir` a `kind` backend can continue, titled,
+    /// newest first: what a Claude tab offers, and what a restore matches saved Claude tabs with,
+    /// whichever agent the active tab runs. The same bounded reads as [`for_kind`](Self::for_kind).
+    pub fn claude_sessions(kind: BackendKind, project_dir: &Path) -> Vec<ResumableSession> {
         // Keyed on the CANONICAL directory, matching what `AgentConversation` persists -- otherwise
         // `/x/proj` and `/x/../x/proj` would look up two different records for one workspace.
         //
         // Gated on the capability rather than on the backend's name: a backend this client cannot
         // drive a resume through offers nothing, however many records the directory holds. That is
         // the whole legacy case today, and it also means the lookup is skipped entirely there.
-        let resumable: Vec<ResumableSession> = if client_implements_resume(kind) {
-            project_dir
-                .canonicalize()
-                .ok()
-                .map(|cwd| {
-                    let id = agent::conversation_id_for_cwd(&cwd);
-                    let cwd = cwd.to_string_lossy().into_owned();
-                    agent::resumable_sessions(&id)
-                        .into_iter()
-                        .map(|session| title_for(&cwd, session))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        if !client_implements_resume(kind) {
+            return Vec::new();
+        }
+        project_dir
+            .canonicalize()
+            .ok()
+            .map(|cwd| {
+                let id = agent::conversation_id_for_cwd(&cwd);
+                let cwd = cwd.to_string_lossy().into_owned();
+                sessions_of(&AgentId::Claude, agent::resumable_sessions(&id))
+                    .into_iter()
+                    .map(|session| title_for(&cwd, session))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn with_resumable(kind: BackendKind, project_dir: PathBuf, resumable: Vec<ResumableSession>) -> Self {
         let account = agent::account::configured().map(|a| a.name().to_string());
         match kind {
             BackendKind::Legacy => Self {
@@ -2578,6 +2942,96 @@ mod tests {
             "bypass must not allow a request behind the tripwire either: {:?}",
             provider.resolutions()
         );
+        backend.shutdown();
+    }
+
+    /// A `PolicyMismatch` (another agent's sandbox, approval policy or trust differed from what Eitri
+    /// asked for) outranks bypass exactly as the Claude CLI's ungated mode does: not the request
+    /// queued behind it in the same batch, not the CLI's own prompt, not one in a later batch (which
+    /// only the projection's record can catch), and not the direct `approve_pending` call.
+    #[test]
+    fn policy_mismatch_stops_bypass_answers() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let read = |id: &str| AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "main.rs" }),
+            provider_prompt: None,
+        };
+
+        provider.queue(AgentDomainEvent::PolicyMismatch {
+            requested: "sandbox workspaceWrite".into(),
+            reported: "sandbox dangerFullAccess".into(),
+        });
+        provider.queue(read("behind-it"));
+        provider.queue(provider_prompt(
+            "prompt-behind-it",
+            Some("tu-1"),
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+            Some("cat:*"),
+        ));
+        let mut delivered = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while delivered
+            .iter()
+            .filter(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+            .count()
+            < 2
+        {
+            assert!(std::time::Instant::now() < deadline, "timed out: {delivered:?}");
+            if let UiDelivery::Events(events) = backend.take_ui_delivery(&dir, PermissionMode::Bypass) {
+                delivered.extend(events);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            provider.resolutions().is_empty(),
+            "bypass must not allow a request behind the mismatch: {:?}",
+            provider.resolutions()
+        );
+
+        provider.queue(read("later"));
+        let later = pump_until_delivery(&mut backend, &dir, PermissionMode::Bypass);
+        assert!(later.iter().any(
+            |e| matches!(e, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == "later")
+        ));
+        assert!(provider.resolutions().is_empty(), "nor one in a later batch");
+
+        let answered = backend.approve_pending(&["behind-it".to_string()], "on entering bypass");
+        assert_eq!(answered, Approved::default());
+        assert!(provider.resolutions().is_empty(), "nor a direct approval");
+        backend.shutdown();
+    }
+
+    /// The mismatch withholds the automatic answers of Auto too, the classifier's `allow` of an
+    /// in-project `Read` included.
+    #[test]
+    fn policy_mismatch_withholds_the_automatic_answers_in_auto() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        provider.queue(AgentDomainEvent::PolicyMismatch {
+            requested: "approvalPolicy on-request".into(),
+            reported: "approvalPolicy never".into(),
+        });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "behind-it".into(),
+            tool_use_id: None,
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "main.rs" }),
+            provider_prompt: None,
+        });
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        assert!(delivered
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })));
+        assert!(provider.resolutions().is_empty(), "{:?}", provider.resolutions());
         backend.shutdown();
     }
 
@@ -3933,5 +4387,301 @@ mod tests {
             assert!(carded(&delivered, "perm-2"), "{mode:?}: {delivered:?}");
             backend.shutdown();
         }
+    }
+}
+
+/// An external agent's tab: how its requests are answered, and what it offers to continue.
+#[cfg(test)]
+mod external_tests {
+    use super::*;
+    use crate::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+    use std::sync::Arc;
+
+    fn workspace(label: &str) -> PathBuf {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        dir
+    }
+
+    fn codex_backend(dir: &Path) -> (Arc<ExternalRecordingProvider>, AgentBackend) {
+        let provider = Arc::new(ExternalRecordingProvider::codex());
+        let backend = AgentBackend::start_external_with(
+            AgentId::Codex,
+            provider.clone(),
+            dir,
+            empty_trust_plan(),
+            SessionModeChoice::Auto,
+            None,
+        )
+        .expect("a scripted external start succeeds");
+        (provider, backend)
+    }
+
+    fn request(id: &str, tool: &str, input: serde_json::Value) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: Some(format!("call-{id}")),
+            tool_name: tool.into(),
+            input,
+            provider_prompt: None,
+        }
+    }
+
+    /// Every delivery until `want` requests have reached the projection and 100 ms pass quietly.
+    fn deliver(
+        backend: &mut AgentBackend,
+        dir: &Path,
+        rules: &agent::PrefixRules,
+        mode: PermissionMode,
+        host_answered: &mut BTreeSet<String>,
+    ) -> Vec<AgentDomainEvent> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut delivered = Vec::new();
+        let mut last_new: Option<std::time::Instant> = None;
+        loop {
+            let now = std::time::Instant::now();
+            match backend.take_ui_delivery_with_rules(dir, rules, mode, host_answered) {
+                UiDelivery::Events(events) if !events.is_empty() => {
+                    delivered.extend(events);
+                    last_new = Some(now);
+                }
+                _ if last_new.is_some_and(|at| now.duration_since(at) >= std::time::Duration::from_millis(100))
+                    || now > deadline =>
+                {
+                    return delivered
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+    }
+
+    fn carded(delivered: &[AgentDomainEvent], id: &str) -> bool {
+        delivered
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == id))
+    }
+
+    #[test]
+    fn external_tab_bypass_allows_and_auto_cards() {
+        let dir = workspace("external-bypass-auto");
+        let (provider, mut backend) = codex_backend(&dir);
+        assert_eq!(backend.agent(), AgentId::Codex);
+        assert_eq!(backend.kind(), None, "an external agent runs on neither Claude backend");
+        let rules = agent::PrefixRules::default();
+
+        // Auto: the agent's own reviewer already passed these on, so each is the user's to answer.
+        provider.inner.queue(request(
+            "a1",
+            "commandExecution",
+            serde_json::json!({ "command": "rm -rf build" }),
+        ));
+        provider.inner.queue(request(
+            "a2",
+            "fileChange",
+            serde_json::json!({ "changes": [{ "path": "main.rs" }] }),
+        ));
+        let mut answered = BTreeSet::new();
+        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Auto, &mut answered);
+        assert!(carded(&delivered, "a1") && carded(&delivered, "a2"), "{delivered:?}");
+        assert!(
+            provider.inner.decisions().is_empty(),
+            "Auto answers nothing for an external tab"
+        );
+        assert!(answered.is_empty());
+
+        // Bypass: every request is allowed here and none is drawn.
+        provider.inner.queue(request(
+            "b1",
+            "commandExecution",
+            serde_json::json!({ "command": "curl https://example.org" }),
+        ));
+        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Bypass, &mut answered);
+        assert!(!carded(&delivered, "b1"), "{delivered:?}");
+        assert_eq!(
+            provider.inner.decisions(),
+            vec![("b1".to_string(), PermissionDecision::Allow)]
+        );
+        assert!(answered.contains("b1"));
+        backend.shutdown();
+    }
+
+    /// A request a bypass tab allowed says so on its call's row, whether it arrived in bypass or was
+    /// waiting when the tab entered bypass: the escalation past the agent's sandbox is never silent.
+    #[test]
+    fn external_bypass_approvals_leave_a_row_note() {
+        let dir = workspace("external-bypass-note");
+        let (provider, mut backend) = codex_backend(&dir);
+        let rules = agent::PrefixRules::default();
+        provider.inner.queue(request(
+            "b1",
+            "commandExecution",
+            serde_json::json!({ "command": "curl https://example.org" }),
+        ));
+        let mut host_answered = BTreeSet::new();
+        let mut approvals = HumanApprovals::default();
+        let mut answered = AnsweredForYou::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while answered.gate_answers.is_empty() && std::time::Instant::now() < deadline {
+            backend.take_ui_delivery_with_approvals(
+                &dir,
+                &rules,
+                PermissionMode::Bypass,
+                &mut host_answered,
+                &mut approvals,
+                &mut answered,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            answered.prompts,
+            vec![PromptAnsweredForYou {
+                tool_use_id: "call-b1".into(),
+                note: EXTERNAL_BYPASS_NOTE.into(),
+            }]
+        );
+
+        // A card waiting in Auto, approved on entering bypass.
+        provider.inner.queue(request(
+            "a1",
+            "fileChange",
+            serde_json::json!({ "changes": [{ "path": "main.rs" }] }),
+        ));
+        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Auto, &mut host_answered);
+        assert!(carded(&delivered, "a1"), "{delivered:?}");
+        let approved = backend.approve_pending(&["a1".to_string()], "on entering bypass");
+        assert_eq!(approved.ids, vec!["a1".to_string()]);
+        assert_eq!(
+            approved.prompts,
+            vec![PromptAnsweredForYou {
+                tool_use_id: "call-a1".into(),
+                note: EXTERNAL_BYPASS_NOTE.into(),
+            }]
+        );
+        backend.shutdown();
+    }
+
+    #[test]
+    fn external_tab_never_consults_the_classifier_or_rules() {
+        let dir = workspace("external-no-classifier");
+        let (provider, mut backend) = codex_backend(&dir);
+        // A rule that allows the command, and a read inside the project that Claude's classifier
+        // would allow without asking: neither answers an external agent's request.
+        let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(ls *)").unwrap());
+        provider
+            .inner
+            .queue(request("r1", "Bash", serde_json::json!({ "command": "ls -la" })));
+        provider
+            .inner
+            .queue(request("r2", "Read", serde_json::json!({ "file_path": "main.rs" })));
+        provider.inner.queue(request(
+            "r3",
+            "commandExecution",
+            serde_json::json!({ "command": "ls -la" }),
+        ));
+        let mut answered = BTreeSet::new();
+        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Auto, &mut answered);
+        for id in ["r1", "r2", "r3"] {
+            assert!(carded(&delivered, id), "{id} must be a card: {delivered:?}");
+        }
+        assert!(
+            provider.inner.decisions().is_empty(),
+            "{:?}",
+            provider.inner.decisions()
+        );
+        backend.shutdown();
+    }
+
+    #[test]
+    fn an_external_turn_refuses_the_door_without_a_mode() {
+        let dir = workspace("external-plain-send");
+        let (provider, mut backend) = codex_backend(&dir);
+        let refused = backend.send_turn("hello", "hello").expect_err("no mode, no turn");
+        assert!(refused.benign, "{}", refused.message);
+        assert!(provider.policies().is_empty());
+        backend
+            .send_turn_in("hello", "hello", SessionModeChoice::Bypass)
+            .expect("the tab's door carries the mode");
+        assert_eq!(
+            provider.policies(),
+            vec![TurnPolicy {
+                reviewer: Reviewer::User
+            }]
+        );
+        assert_eq!(provider.starts()[0].policy.reviewer, Reviewer::Agent, "started in Auto");
+        backend.shutdown();
+    }
+
+    #[test]
+    fn an_external_conversation_must_be_its_agents() {
+        let dir = workspace("external-wrong-agent");
+        let provider = Arc::new(ExternalRecordingProvider::codex());
+        let start = agent::ExternalStart {
+            cwd: dir.to_string_lossy().into_owned(),
+            plan: empty_trust_plan(),
+            policy: turn_policy(SessionModeChoice::Auto),
+            resume: None,
+        };
+        let conversation = AgentConversation::create_external(provider, start, &dir).unwrap();
+        let refused = ExternalConversation::new(AgentId::Acp("gemini".into()), conversation);
+        assert!(refused.is_err(), "a codex session is not an ACP tab's");
+    }
+
+    #[test]
+    fn agent_ids_round_trip_their_record_names() {
+        for agent in [AgentId::Claude, AgentId::Codex, AgentId::Acp("gemini".into())] {
+            assert_eq!(AgentId::from_record_name(&agent.record_name()), Some(agent.clone()));
+            let json = serde_json::to_string(&agent).unwrap();
+            assert_eq!(serde_json::from_str::<AgentId>(&json).unwrap(), agent);
+        }
+        for bad in ["", "acp:", "acp: ", "acp:a\nb", "Codex", "openai"] {
+            assert_eq!(AgentId::from_record_name(bad), None, "{bad:?}");
+        }
+    }
+
+    fn plant(dir: &Path, provider: &str, session: &str) {
+        let canonical = dir.canonicalize().unwrap();
+        agent::persistence::save_conversation_record(&agent::persistence::ConversationRecord {
+            conversation_id: agent::conversation_id_for_cwd(&canonical),
+            provider: provider.into(),
+            provider_session_id: session.into(),
+            canonical_cwd: canonical.to_string_lossy().into_owned(),
+            created_at: "1000".into(),
+            updated_at: "2000".into(),
+            provider_advertised_resume: true,
+            title: Some(format!("{provider} work")),
+            name: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn resume_picker_lists_only_the_tab_agent() {
+        let dir = workspace("picker-per-agent");
+        plant(&dir, "claude", "claude-session");
+        plant(&dir, "codex", "codex-thread");
+        plant(&dir, "acp:gemini", "gemini-session");
+        let ids = |agent: &AgentId| -> Vec<String> {
+            BackendGreeting::for_agent(BackendKind::Sidecar, agent, dir.clone())
+                .resumable
+                .into_iter()
+                .map(|s| s.provider_session_id)
+                .collect()
+        };
+        assert_eq!(ids(&AgentId::Claude), vec!["claude-session".to_string()]);
+        assert_eq!(ids(&AgentId::Codex), vec!["codex-thread".to_string()]);
+        assert_eq!(ids(&AgentId::Acp("gemini".into())), vec!["gemini-session".to_string()]);
+        // A Codex tab's records need no Claude backend that resumes.
+        let legacy = BackendGreeting::for_agent(BackendKind::Legacy, &AgentId::Codex, dir.clone());
+        assert_eq!(legacy.resumable.len(), 1);
+        assert!(BackendGreeting::for_kind(BackendKind::Legacy, dir.clone())
+            .resumable
+            .is_empty());
+        let mut external: Vec<String> = external_sessions(&dir)
+            .into_iter()
+            .map(|s| s.provider_session_id)
+            .collect();
+        external.sort();
+        assert_eq!(external, vec!["codex-thread".to_string(), "gemini-session".to_string()]);
     }
 }

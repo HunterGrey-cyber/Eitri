@@ -1,5 +1,6 @@
 import type { TimelineItem } from "./timeline";
 import type { ToolCallRecord } from "./types";
+import { shortToolName, subagentOf } from "./externalTools";
 
 type Options = { expanded: Record<string, boolean>; detailed: boolean; turnRunning: boolean };
 
@@ -7,13 +8,20 @@ type Options = { expanded: Record<string, boolean>; detailed: boolean; turnRunni
 export function runSummary(calls: ToolCallRecord[]): string {
   const counts = new Map<string, number>();
   for (const c of calls) counts.set(c.name, (counts.get(c.name) ?? 0) + 1);
-  return Array.from(counts, ([name, n]) => `${name} ×${n}`).join(" · ");
+  return Array.from(counts, ([name, n]) => `${shortToolName(name)} ×${n}`).join(" · ");
 }
 
 /** `Write`, `Edit` and `NotebookEdit` can finish without a permission card under `acceptEdits`.
  *  Keep each change in its own row so it cannot disappear into a tool-count summary. These tools
  *  end a run on either side, just as failed or gated calls do; reads and searches still fold. */
-const NEVER_FOLDED_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
+const NEVER_FOLDED_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "fileChange"]);
+
+/** The same for an ACP agent's file-changing kinds: the change is its own row, not a count in a run. */
+const neverFolded = (call: ToolCallRecord): boolean =>
+  NEVER_FOLDED_TOOLS.has(call.name) ||
+  /^acp:(edit|delete|move)$/.test(call.name) ||
+  // A subagent's call keeps its own row, so whose it is stays on screen instead of inside a count.
+  subagentOf(call.name, call.input) !== null;
 
 /** Fold consecutive finished, ungated tool calls into one `run` row when there are at least
  *  two and another item follows or the turn has ended. Expanded runs and the detailed view keep
@@ -37,7 +45,7 @@ export function buildDisplay(timeline: TimelineItem[], opts: Options): TimelineI
         item.call.result === null ||
         item.call.result.isError ||
         gated.has(item.call.toolUseId) ||
-        NEVER_FOLDED_TOOLS.has(item.call.name)
+        neverFolded(item.call)
       )
         break;
       i++;

@@ -23,6 +23,7 @@
       }
     ],
     "snapshot": {
+      "accountLimits": null,
       "activeTurnId": "t1",
       "assistantMessageOpen": true,
       "backend": "sidecar",
@@ -80,6 +81,7 @@
       }
     ],
     "snapshot": {
+      "accountLimits": null,
       "activeTurnId": "t1",
       "assistantMessageOpen": true,
       "backend": "sidecar",

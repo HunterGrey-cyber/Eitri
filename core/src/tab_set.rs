@@ -15,13 +15,14 @@ use std::sync::{mpsc, Arc, Weak};
 
 use agent::{AgentDomainEvent, RevisedDelivery};
 
+pub use crate::agent_backend::AgentId;
 use crate::agent_backend::{AgentBackend, BackendError, BackendKind};
 use crate::agent_bridge::{
     serialize_events_with_notes_for_js, serialize_handoff_for_js, serialize_snapshot_with_notes_for_js,
     serialize_tabs_for_js, CallNotes, SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView,
 };
 use crate::attention::{Attention, AttentionTracker};
-use crate::saved_tabs::{SavedTab, SavedTabs};
+use crate::saved_tabs::{SavedExternalTab, SavedTab, SavedTabs};
 use crate::tab_restore::{PlannedTab, RestorePlan, RestoreRun, Skipped};
 use crate::tabs::{self, TabFacts, TabId};
 
@@ -189,6 +190,9 @@ pub struct Tab {
     /// only happen through `cycle_mode`/`confirm_bypass`, which require confirmation.
     /// `mode()` provides read-only access; this module's tests may write the field directly.
     mode: SessionModeChoice,
+    /// The agent this tab runs, chosen when it was opened (or by the session a restore brings back
+    /// into it) and kept by `r`. Private so that only the set decides it; [`Tab::agent`] reads it.
+    agent: AgentId,
     pub backend: TabBackend,
     /// Which of the project's own configuration tiers the session of this tab was given; set when
     /// the session is spawned, so a later change of the window's answer leaves running sessions as
@@ -308,13 +312,14 @@ impl Tab {
         &self.gate_log
     }
 
-    fn new(id: TabId, number: u16, mode: SessionModeChoice) -> Self {
+    fn new(id: TabId, number: u16, mode: SessionModeChoice, agent: AgentId) -> Self {
         Tab {
             id,
             number,
             name: None,
             title: None,
             mode,
+            agent,
             backend: TabBackend::NotStarted,
             project_tiers: None,
             attention: AttentionTracker::default(),
@@ -373,6 +378,21 @@ impl Tab {
     /// The tab's own permission mode. Read-only outside this module -- see the field's own doc.
     pub fn mode(&self) -> SessionModeChoice {
         self.mode
+    }
+
+    /// The agent this tab runs.
+    pub fn agent(&self) -> &AgentId {
+        &self.agent
+    }
+
+    /// Whether this tab's sessions can be continued later, judged by its agent first: a Claude tab
+    /// only on the sidecar backend (`kind`), Codex always (its own threads), an ACP agent not yet.
+    pub fn resumable(&self, kind: BackendKind) -> bool {
+        match &self.agent {
+            AgentId::Claude => kind == BackendKind::Sidecar,
+            AgentId::Codex => true,
+            AgentId::Acp(_) => false,
+        }
     }
 
     pub fn live(&self) -> Option<&AgentBackend> {
@@ -462,6 +482,7 @@ impl Tab {
                 _ => None,
             },
             title: self.title.clone(),
+            agent: self.agent.record_name(),
         }
     }
 }
@@ -507,6 +528,12 @@ pub fn ungated_cli_mode_reason(reported: &str, detail: &str) -> String {
         "the CLI reports permission mode '{reported}' ({detail}) — a project's permissions.defaultMode? \
          Eitri runs only sessions it gates itself; the session was closed"
     )
+}
+
+/// Why a tab whose agent echoed or showed a policy other than the one Eitri sent was closed. The two
+/// strings are the agent's own words for what was asked and what it reported.
+pub fn policy_mismatch_reason(requested: &str, reported: &str) -> String {
+    format!("the agent reported {reported}, Eitri asked for {requested}; the session was closed")
 }
 
 pub enum StartCollected {
@@ -639,6 +666,14 @@ impl RestoreGo {
             .map(|t| t.planned.provider_session_id.clone())
             .collect()
     }
+
+    /// [`session_ids`](Self::session_ids), each with its agent, under whose name its lease is taken.
+    pub fn sessions(&self) -> Vec<(AgentId, String)> {
+        self.tabs
+            .iter()
+            .map(|t| (t.planned.agent.clone(), t.planned.provider_session_id.clone()))
+            .collect()
+    }
 }
 
 pub enum RestoreStep {
@@ -683,6 +718,11 @@ pub struct TabSet {
     /// on or off, since a window that merely has the project open, or runs a turn, blocks another
     /// window's revert. `None` until [`TabSet::hold_presence`].
     presence: Option<crate::turn_review::PresenceHolder>,
+    /// Tabs whose backend left them still live and is being shut down elsewhere (a closed tab, `r`,
+    /// a tripped or failed session), each with how many such shutdowns are outstanding. Their
+    /// presence is kept as if a turn ran: an agent's subagent can still write during the shutdown's
+    /// grace. [`TabSet::retire_done`] ends one.
+    retiring: std::collections::BTreeMap<u64, usize>,
     /// One-shot test hook after `pump` drains a live tab's queue. Fold an event after the drain
     /// and before the next snapshot read in `active_state_payloads` or `Resync`, so the test
     /// reproduces the race without relying on timing.
@@ -739,6 +779,7 @@ impl TabSet {
             turn_review: None,
             turn_review_off: false,
             presence: None,
+            retiring: std::collections::BTreeMap::new(),
             #[cfg(test)]
             after_drain: None,
             #[cfg(test)]
@@ -746,7 +787,7 @@ impl TabSet {
             #[cfg(test)]
             before_resync_snapshot: None,
         };
-        set.open();
+        set.open(AgentId::Claude);
         set.last_active = None;
         set
     }
@@ -785,18 +826,42 @@ impl TabSet {
         self.presence.as_ref().map(crate::turn_review::PresenceHolder::guard)
     }
 
-    /// Hands the presence the ids of the tabs whose turns run. Reads only the tabs and touches no
-    /// disk: the presence thread does that.
+    /// Hands the presence the ids of the tabs whose turns run, and of those whose backend is still
+    /// being shut down ([`TabSet::note_retiring`]). Reads only the tabs and touches no disk: the
+    /// presence thread does that.
     fn sync_presence(&self) {
         if let Some(holder) = &self.presence {
-            let running = self
+            let mut running: BTreeSet<u64> = self
                 .tabs
                 .iter()
                 .filter(|tab| tab.turn_running())
                 .map(|tab| tab.id.0)
                 .collect();
+            running.extend(self.retiring.keys().copied());
             holder.sync(&running);
         }
+    }
+
+    /// A live backend of `tab` was taken away to be shut down elsewhere: until that shutdown has
+    /// returned ([`TabSet::retire_done`]), the window's presence stays as if a turn of `tab` ran, so
+    /// no window reverts a file the agent may still be writing. Every backend counts; Claude's
+    /// shutdown is simply quick. The set's own `remove`, `reset` and tripwire call it; a caller that
+    /// takes a live backend out of a tab itself calls it too.
+    pub fn note_retiring(&mut self, tab: TabId) {
+        *self.retiring.entry(tab.0).or_insert(0) += 1;
+        self.sync_presence();
+    }
+
+    /// One shutdown [`TabSet::note_retiring`] counted for `tab` has returned. A tab with none
+    /// outstanding is left alone.
+    pub fn retire_done(&mut self, tab: TabId) {
+        if let Some(count) = self.retiring.get_mut(&tab.0) {
+            *count -= 1;
+            if *count == 0 {
+                self.retiring.remove(&tab.0);
+            }
+        }
+        self.sync_presence();
     }
 
     /// The installed turn review, for building review jobs.
@@ -927,13 +992,13 @@ impl TabSet {
         &self.rules
     }
 
-    /// `prefix c`: a new empty tab at the lowest free number, selected.
-    pub fn open(&mut self) -> TabId {
+    /// `prefix c`: a new empty tab at the lowest free number, selected, running `agent`.
+    pub fn open(&mut self, agent: AgentId) -> TabId {
         let used: Vec<u16> = self.tabs.iter().map(|t| t.number).collect();
         let id = TabId(self.next_id);
         self.next_id += 1;
         self.tabs
-            .push(Tab::new(id, tabs::lowest_free_number(&used), self.default_mode));
+            .push(Tab::new(id, tabs::lowest_free_number(&used), self.default_mode, agent));
         self.tabs.sort_by_key(|t| t.number);
         self.select(id);
         id
@@ -979,7 +1044,9 @@ impl TabSet {
     }
 
     /// Takes a tab out and hands it back: its backend, pending start or handoff are the caller's to
-    /// shut down or watch. The last tab's removal opens a fresh tab 1.
+    /// shut down or watch. A live backend is counted as retiring ([`TabSet::note_retiring`]): the
+    /// caller reports [`TabSet::retire_done`] once its shutdown has returned. The last tab's removal
+    /// opens a fresh tab 1.
     pub fn remove(&mut self, id: TabId) -> Option<Tab> {
         let at = self.tabs.iter().position(|t| t.id == id)?;
         let before = self.active;
@@ -990,6 +1057,10 @@ impl TabSet {
         if let Some(review) = self.turn_review.as_mut() {
             review.close_tab(id.0, wall_clock_ms());
         }
+        if matches!(tab.backend, TabBackend::Live(_)) {
+            // Before the sync below, so the presence never drops between the turn and the shutdown.
+            *self.retiring.entry(id.0).or_insert(0) += 1;
+        }
         self.sync_presence();
         self.removed_arrived += tab.attention.attention().arrived;
         self.recency.retain(|t| *t != id);
@@ -997,7 +1068,7 @@ impl TabSet {
             self.last_active = None;
         }
         if self.tabs.is_empty() {
-            self.open();
+            self.open(AgentId::Claude);
             self.last_active = None;
         } else if self.active == id {
             let fallback = self.tabs[at.min(self.tabs.len() - 1)].id;
@@ -1439,7 +1510,10 @@ impl TabSet {
         tab.creates_file_unsent.clear();
         self.pending_bypass = None;
         Ok(match old {
-            TabBackend::Live(backend) => Some(backend),
+            TabBackend::Live(backend) => {
+                self.note_retiring(id);
+                Some(backend)
+            }
             _ => None,
         })
     }
@@ -1484,7 +1558,12 @@ impl TabSet {
         let empty = self
             .get(from)
             .is_some_and(|t| matches!(t.backend, TabBackend::NotStarted));
-        let target = if empty { from } else { self.open() };
+        let target = if empty {
+            from
+        } else {
+            let agent = self.get(from).map_or(AgentId::Claude, |t| t.agent.clone());
+            self.open(agent)
+        };
         ResumeRoute::StartIn(target)
     }
 
@@ -1609,25 +1688,36 @@ impl TabSet {
             // dropped, or one folded ahead of its delivery -- from the projection's record. The
             // whole batch is withheld, so no card in it is ever drawn to be approved; the session
             // is handed out to be shut down, which denies what is still pending in it.
-            let reported = match &delivery {
+            let tripped_reason = match &delivery {
                 RevisedDelivery::Events(events) => events.iter().find_map(|(_, event)| match event {
-                    AgentDomainEvent::UngatedCliMode { reported, detail } => Some((reported.clone(), detail.clone())),
+                    AgentDomainEvent::UngatedCliMode { reported, detail } => {
+                        Some(ungated_cli_mode_reason(reported, detail))
+                    }
+                    AgentDomainEvent::PolicyMismatch { requested, reported } => {
+                        Some(policy_mismatch_reason(requested, reported))
+                    }
                     _ => None,
                 }),
                 _ => None,
             };
-            let reported = reported.or_else(|| {
-                let record = backend.projection().ungated_cli_mode.clone();
-                record.map(|r| (r.reported, r.detail))
+            let tripped_reason = tripped_reason.or_else(|| {
+                let projection = backend.projection();
+                if let Some(r) = &projection.ungated_cli_mode {
+                    return Some(ungated_cli_mode_reason(&r.reported, &r.detail));
+                }
+                projection
+                    .policy_mismatch
+                    .as_ref()
+                    .map(|(requested, reported)| policy_mismatch_reason(requested, reported))
             });
-            if let Some((reported, detail)) = reported {
-                let reason = ungated_cli_mode_reason(&reported, &detail);
+            if let Some(reason) = tripped_reason {
                 eprintln!("[permission] tab {}: {reason}", tab.id.0);
                 tab.attention.session_ended(on_screen);
                 tab.was_running = false;
                 tab.turn_clock = None;
                 let dead = std::mem::replace(&mut tab.backend, TabBackend::Failed { reason: reason.clone() });
                 if let TabBackend::Live(backend) = dead {
+                    *self.retiring.entry(tab.id.0).or_insert(0) += 1;
                     out.tripped.push(Tripped {
                         tab: tab.id,
                         reason,
@@ -1988,6 +2078,8 @@ impl TabSet {
                     } else {
                         tab.name = pending.resumed_name;
                     }
+                    // What runs is what the tab says it runs, whichever way it got there.
+                    tab.agent = backend.agent();
                     tab.backend = TabBackend::Live(backend);
                     tab.was_running = false;
                     tab.attention.restart();
@@ -2089,8 +2181,7 @@ impl TabSet {
     }
 
     pub fn tabs_payload(&self) -> String {
-        let resumable = self.kind == BackendKind::Sidecar;
-        let views: Vec<TabView> = self.tabs.iter().map(|t| t.view(resumable)).collect();
+        let views: Vec<TabView> = self.tabs.iter().map(|t| t.view(t.resumable(self.kind))).collect();
         serialize_tabs_for_js(self.active, &views, self.default_mode)
     }
 
@@ -2153,7 +2244,7 @@ impl TabSet {
             label_name: tab.label_name(),
             turn_running: tab.turn_running(),
             queued: tab.queue.len(),
-            legacy: self.kind == BackendKind::Legacy,
+            legacy: self.kind == BackendKind::Legacy && tab.agent == AgentId::Claude,
             has_backend: tab.live().is_some(),
         })
     }
@@ -2219,7 +2310,8 @@ impl TabSet {
             .collect::<Vec<_>>()
             .join("\n\n");
         let trace = crate::turn_trace::TurnTrace::start();
-        let outcome = tab.live_mut().expect("checked above").send_turn(&wire, &typed);
+        let mode = tab.mode;
+        let outcome = tab.live_mut().expect("checked above").send_turn_in(&wire, &typed, mode);
         match &outcome {
             Ok(_) => {
                 tab.queue.clear();
@@ -2408,8 +2500,9 @@ impl TabSet {
 
     /// The tabs worth bringing back next launch (`saved_tabs`), or `None` while the window is closing
     /// and has handed its tabs over to be torn down -- closing every tab is not the user closing
-    /// them. A tab is listed when it has a Claude session, which includes one still being resumed.
-    /// Only the sidecar backend resumes, so a window on the legacy backend lists nothing.
+    /// them. A tab is listed when it has a session, which includes one still being resumed. Claude
+    /// tabs are listed only on the sidecar backend, the only one that resumes; another agent's tab
+    /// whose agent resumes is listed whatever the window's Claude backend, in `external_tabs`.
     ///
     /// `conversation_id` is the project's (`agent::conversation_id_for_cwd`): every session of one
     /// project shares it, and a tab whose backend has not been built yet has none of its own.
@@ -2417,13 +2510,38 @@ impl TabSet {
         if self.closing {
             return None;
         }
+        let external: Vec<(TabId, SavedExternalTab)> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.agent.is_external() && tab.resumable(self.kind))
+            .filter_map(|tab| {
+                let session = tab.provider_session_id().filter(|id| !id.is_empty())?;
+                Some((
+                    tab.id,
+                    SavedExternalTab {
+                        agent: tab.agent.clone(),
+                        conversation_id: conversation_id.to_string(),
+                        provider_session_id: session,
+                        name: tab.name.clone(),
+                        mode: tab.mode,
+                    },
+                ))
+            })
+            .collect();
+        let active_external = external.iter().position(|(id, _)| *id == self.active);
+        let external_tabs: Vec<SavedExternalTab> = external.into_iter().map(|(_, saved)| saved).collect();
         if self.kind != BackendKind::Sidecar {
-            return Some(SavedTabs::default());
+            return Some(SavedTabs {
+                external_tabs,
+                active_external,
+                ..SavedTabs::default()
+            });
         }
         // `provider_session_id` is read in its own statement per tab (the lock-order rule above).
         let listed: Vec<(TabId, SavedTab)> = self
             .tabs
             .iter()
+            .filter(|tab| tab.agent == AgentId::Claude)
             .filter_map(|tab| {
                 let session = tab.provider_session_id().filter(|id| !id.is_empty())?;
                 Some((
@@ -2451,6 +2569,8 @@ impl TabSet {
         Some(SavedTabs {
             tabs: listed.into_iter().map(|(_, saved)| saved).collect(),
             active,
+            external_tabs,
+            active_external,
         })
     }
 
@@ -2462,6 +2582,17 @@ impl TabSet {
         for tab in &mut self.tabs {
             if matches!(tab.backend, TabBackend::NotStarted) {
                 tab.mode = mode;
+            }
+        }
+    }
+
+    /// The user's own `init.lua` choice of the agent new tabs run (`agent.default`), applied once at
+    /// startup to the tabs that exist by then and have not started: a tab's agent is fixed from the
+    /// first message on, so a started or named tab keeps its own.
+    pub fn apply_configured_agent(&mut self, agent: AgentId) {
+        for tab in &mut self.tabs {
+            if matches!(tab.backend, TabBackend::NotStarted) && tab.name.is_none() && tab.title.is_none() {
+                tab.agent = agent.clone();
             }
         }
     }
@@ -2525,12 +2656,13 @@ impl TabSet {
     /// resume has returned.
     pub fn start_restore<F>(&mut self, from: TabId, go: RestoreGo, mut connect: F) -> RestoreRun
     where
-        F: FnMut(&str) -> Result<mpsc::Receiver<Result<AgentBackend, BackendError>>, String>,
+        F: FnMut(&AgentId, &str) -> Result<mpsc::Receiver<Result<AgentBackend, BackendError>>, String>,
     {
         let total = go.tabs.len() + go.skipped.len();
         let mut run = RestoreRun::new(
             from,
             self.get(from).map_or(self.default_mode, |t| t.mode),
+            self.get(from).map_or(AgentId::Claude, |t| t.agent.clone()),
             total,
             go.skipped,
         );
@@ -2543,7 +2675,7 @@ impl TabSet {
                 started.push((id, open));
                 continue;
             }
-            let result_rx = match connect(&id) {
+            let result_rx = match connect(&planned.agent, &id) {
                 Ok(rx) => rx,
                 Err(reason) => {
                     run.failed.push(Skipped {
@@ -2558,6 +2690,7 @@ impl TabSet {
             };
             let tab = self.get_mut(target).expect("route_resume names a tab it has");
             tab.mode = mode;
+            tab.agent = planned.agent;
             tab.backend = TabBackend::Starting(PendingStart {
                 request_id: format!("restore-{}", n + 1),
                 result_rx,
@@ -2585,16 +2718,17 @@ impl TabSet {
     /// A restored tab whose resume failed. `back_to` is [`RestoreRun::back_to`]: an empty tab again, in
     /// the mode it had before the restore, if it is the one the restore began in; gone if the restore
     /// made it. What went wrong is reported once for the whole restore, not left as a dead tab each.
-    pub fn discard_failed_restore(&mut self, tab: TabId, back_to: Option<SessionModeChoice>) {
+    pub fn discard_failed_restore(&mut self, tab: TabId, back_to: Option<(SessionModeChoice, AgentId)>) {
         if !matches!(self.get(tab).map(|t| &t.backend), Some(TabBackend::Failed { .. })) {
             return;
         }
         match back_to {
-            Some(mode) => {
+            Some((mode, agent)) => {
                 if let Some(t) = self.get_mut(tab) {
                     t.backend = TabBackend::NotStarted;
                     t.reported_start_failure = false;
                     t.mode = mode;
+                    t.agent = agent;
                 }
             }
             None => {
@@ -3004,12 +3138,12 @@ mod tests {
     fn tabs_open_at_the_lowest_free_number_and_the_last_close_opens_a_fresh_tab_one() {
         let mut set = set();
         let one = set.active();
-        let two = set.open();
-        let three = set.open();
+        let two = set.open(AgentId::Claude);
+        let three = set.open(AgentId::Claude);
         assert_eq!(set.active(), three, "tmux's new-window selects the new window");
         assert_eq!(set.get(three).unwrap().number, 3);
         set.remove(two).unwrap();
-        let again = set.open();
+        let again = set.open(AgentId::Claude);
         assert_eq!(set.get(again).unwrap().number, 2, "the lowest free number, reused");
         assert_ne!(again, two, "the id is never reused");
         for id in [one, again, three] {
@@ -3023,8 +3157,8 @@ mod tests {
     fn next_and_previous_wrap_last_goes_back_and_a_missing_number_selects_nothing() {
         let mut set = set();
         let one = set.active();
-        let two = set.open();
-        let three = set.open();
+        let two = set.open(AgentId::Claude);
+        let three = set.open(AgentId::Claude);
         assert_eq!(set.step(1), Some(one), "wraps from the last");
         assert_eq!(set.step(-1), Some(three));
         assert!(set.select(two));
@@ -3061,7 +3195,7 @@ mod tests {
         let background = set.active();
         let (background_provider, backend) = live(&dir);
         set.get_mut(background).unwrap().backend = TabBackend::Live(backend);
-        let foreground = set.open();
+        let foreground = set.open(AgentId::Claude);
         let (_foreground_provider, backend) = live(&dir);
         set.get_mut(foreground).unwrap().backend = TabBackend::Live(backend);
 
@@ -3720,7 +3854,7 @@ mod tests {
         let dir = workspace("tabs-late-start");
         let mut set = set();
         let keep = set.active();
-        let doomed = set.open();
+        let doomed = set.open(AgentId::Claude);
         let (tx, result_rx) = mpsc::channel();
         set.get_mut(doomed).unwrap().backend = TabBackend::Starting(PendingStart {
             request_id: "req-1".into(),
@@ -3775,7 +3909,7 @@ mod tests {
         assert_eq!(tab.title.as_deref(), Some("fix the parser"));
         assert_eq!(tab.label_name(), "parser work");
 
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         let tx = starting(&mut set, second, Some("fix the parser"), Some("parser work"));
         set.rename(second, "mine");
         tx.send(Ok(live(&dir).1)).unwrap();
@@ -3801,7 +3935,7 @@ mod tests {
         assert_eq!(set.attention().pending, 0, "a new session holds no card");
         assert_eq!(set.attention().arrived, 1, "installing a session kept the count");
 
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         set.get_mut(second).unwrap().attention.observe(&[write("p2")], false);
         set.get_mut(second).unwrap().backend = TabBackend::Failed { reason: "x".into() };
         set.reset(second).unwrap();
@@ -3816,7 +3950,7 @@ mod tests {
         let dir = workspace("tabs-install");
         let mut set = set();
         let first = set.active();
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         set.rename(first, "docs");
         let (tx, result_rx) = mpsc::channel();
         set.get_mut(first).unwrap().backend = TabBackend::Starting(PendingStart {
@@ -3877,7 +4011,7 @@ mod tests {
             set.get(holder).unwrap().provider_session_id().is_some()
         });
         assert_eq!(set.open_session_ids(), vec!["claude-open".to_string()]);
-        let other = set.open();
+        let other = set.open(AgentId::Claude);
 
         assert_eq!(
             set.route_resume(other, "claude-open", true),
@@ -3931,7 +4065,7 @@ mod tests {
             SessionModeChoice::Bypass,
             "new tabs take the remembered mode"
         );
-        let next = set.open();
+        let next = set.open(AgentId::Claude);
         assert_eq!(set.get(next).unwrap().mode, SessionModeChoice::Bypass);
 
         let (_provider, backend) = live(&dir);
@@ -4031,7 +4165,7 @@ mod tests {
         let first = set.active();
         let (first_provider, backend) = live(&dir);
         set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         let (second_provider, backend) = live(&dir);
         set.get_mut(second).unwrap().backend = TabBackend::Live(backend);
 
@@ -4223,7 +4357,7 @@ mod tests {
         );
         assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
 
-        let next = set.open();
+        let next = set.open(AgentId::Claude);
         assert_eq!(
             set.get(next).unwrap().mode,
             SessionModeChoice::Bypass,
@@ -4559,7 +4693,7 @@ mod tests {
             "a provider report never moves Tab::mode"
         );
 
-        let bypass_tab = set.open();
+        let bypass_tab = set.open(AgentId::Claude);
         let (bypass_provider, backend) = live(&dir);
         set.get_mut(bypass_tab).unwrap().backend = TabBackend::Live(backend);
         let plan = plan(set.cycle_mode(bypass_tab));
@@ -4594,7 +4728,7 @@ mod tests {
             let first = set.active();
             let (_p, backend) = live(dir);
             set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
-            let second = set.open();
+            let second = set.open(AgentId::Claude);
             let (_p, backend) = live(dir);
             set.get_mut(second).unwrap().backend = TabBackend::Live(backend);
             set.select(first);
@@ -4616,7 +4750,7 @@ mod tests {
                     set.select(second);
                 }
                 "open" => {
-                    set.open();
+                    set.open(AgentId::Claude);
                 }
                 "step" => {
                     set.step(1);
@@ -4672,7 +4806,7 @@ mod tests {
         let first = set.active();
         let (_p, backend) = live(&dir);
         set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         let (_p, backend) = live(&dir);
         set.get_mut(second).unwrap().backend = TabBackend::Live(backend);
         set.select(first);
@@ -4812,7 +4946,7 @@ mod tests {
             "leaving bypass on ANY tab drops an in-window default too"
         );
 
-        let next = set.open();
+        let next = set.open(AgentId::Claude);
         assert_eq!(set.get(next).unwrap().mode, SessionModeChoice::Auto);
         shut_down_all(&mut set);
     }
@@ -4860,7 +4994,7 @@ mod tests {
             set.confirm_bypass(live_plan.scope, live_plan.nonce),
             Err("that prompt is no longer current".to_string())
         );
-        let next = set.open();
+        let next = set.open(AgentId::Claude);
         assert_eq!(
             set.get(next).unwrap().mode,
             SessionModeChoice::Auto,
@@ -4926,7 +5060,7 @@ mod tests {
         let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Bypass);
         assert_eq!(set.default_mode(), SessionModeChoice::Auto);
         assert_eq!(set.active_tab().mode(), SessionModeChoice::Auto);
-        let next = set.open();
+        let next = set.open(AgentId::Claude);
         assert_eq!(set.get(next).unwrap().mode(), SessionModeChoice::Auto);
     }
 
@@ -4965,7 +5099,7 @@ mod tests {
     fn the_oldest_card_across_tabs_names_the_tab_that_holds_it() {
         let mut set = set();
         let first = set.active();
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         set.get_mut(second).unwrap().attention.observe(&[write("older")], false);
         set.get_mut(first).unwrap().attention.observe(&[write("newer")], false);
         assert_eq!(set.oldest_card_tab(), Some(second));
@@ -4994,8 +5128,8 @@ mod tests {
         let mut set = set();
         let active = set.active();
         assert_eq!(set.close_others_plan(), None, "the active tab is the only one open");
-        let second = set.open();
-        let third = set.open();
+        let second = set.open(AgentId::Claude);
+        let third = set.open(AgentId::Claude);
         set.select(active);
         let (ids, prompt) = set.close_others_plan().unwrap();
         assert_eq!(ids, vec![second, third]);
@@ -5156,7 +5290,7 @@ mod tests {
         assert!(!set.close_needs_confirm(empty), "an empty tab has nothing to lose");
         assert!(!set.close_needs_confirm(TabId(999)), "no such tab");
 
-        let connecting = set.open();
+        let connecting = set.open(AgentId::Claude);
         let (_tx, result_rx) = mpsc::channel();
         set.get_mut(connecting).unwrap().backend = TabBackend::Starting(PendingStart {
             request_id: "req-1".into(),
@@ -5211,7 +5345,7 @@ mod tests {
             "a later tick keeps it"
         );
 
-        let other = set.open();
+        let other = set.open(AgentId::Claude);
         set.pump(&dir, true);
         set.select(tab);
         let payloads = set.active_state_payloads();
@@ -5398,7 +5532,7 @@ mod tests {
     fn close_facts_and_the_window_count_the_queue_and_a_close_hands_the_texts_back() {
         let mut set = set();
         let one = set.active();
-        let two = set.open();
+        let two = set.open(AgentId::Claude);
         for (tab, text) in [(one, "a"), (two, "b"), (two, "c")] {
             set.get_mut(tab).unwrap().queue.push(Queued {
                 text: text.into(),
@@ -5424,7 +5558,7 @@ mod tests {
         let background = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(background).unwrap().backend = TabBackend::Live(backend);
-        set.open();
+        set.open(AgentId::Claude);
         let bash = |id: &str, command: &str| AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
             tool_use_id: None,
@@ -6837,7 +6971,7 @@ mod tests {
         let (provider, backend) = live(&dir);
         set.get_mut(background).unwrap().backend = TabBackend::Live(backend);
         set.get_mut(background).unwrap().turn_trace = Some(crate::turn_trace::TurnTrace::started_now());
-        set.open();
+        set.open(AgentId::Claude);
         provider.queue(started("t1"));
         provider.queue(AgentDomainEvent::ContentDelta {
             turn_id: "t1".into(),
@@ -6917,7 +7051,7 @@ mod tests {
         set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
         set.queue_message(first, "queued", "queued".into(), 5).unwrap();
         set.set_draft(first, "typing");
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         let kinds = |payloads: Vec<String>| -> Vec<(String, serde_json::Value)> {
             payloads
                 .into_iter()
@@ -6970,7 +7104,7 @@ mod tests {
         set.set_draft(first, "before");
         set.begin_scratch_edit(first, 7).unwrap();
         assert!(set.begin_scratch_edit(first, 8).is_err(), "one edit per tab at a time");
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         set.set_draft(second, "second's own");
         let (tab, draft) = set
             .finish_scratch_edit(7, &crate::scratch::EditDone::Written("after".into()))
@@ -6998,9 +7132,9 @@ mod tests {
         use crate::scratch::EditDone;
         let mut set = set();
         let changed = set.active();
-        let identical = set.open();
-        let discarded = set.open();
-        let silent = set.open();
+        let identical = set.open(AgentId::Claude);
+        let discarded = set.open(AgentId::Claude);
+        let silent = set.open(AgentId::Claude);
         set.set_draft(changed, "old");
         set.set_draft(identical, "same\n");
         set.set_draft(discarded, "kept");
@@ -7103,6 +7237,72 @@ mod tests {
         for payload in &payloads {
             assert!(
                 !payload.contains("behind-the-trip"),
+                "a card could have been drawn: {payload}"
+            );
+        }
+        assert!(
+            provider.resolutions().is_empty(),
+            "nothing was answered on the host's side"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// A `PolicyMismatch` from another agent closes the tab the way the ungated mode does: the
+    /// reason carries both sides, the backend is handed out for the shutdown, the batch it came in is
+    /// withheld (the `Write` behind it never becomes a card) and nothing is answered on the host's
+    /// side.
+    #[test]
+    fn policy_mismatch_withholds_the_batch_and_fails_the_tab() {
+        let dir = workspace("tabs-policy-mismatch");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        provider.queue(AgentDomainEvent::PolicyMismatch {
+            requested: "sandbox workspaceWrite".into(),
+            reported: "sandbox dangerFullAccess".into(),
+        });
+        provider.queue(write("behind-the-mismatch"));
+
+        let mut tripped = Vec::new();
+        let mut payloads = Vec::new();
+        until("the trip", || {
+            let out = set.pump(&dir, true);
+            payloads.extend(out.active_payload);
+            tripped.extend(out.tripped);
+            !tripped.is_empty()
+        });
+        let state = set.get(tab).unwrap();
+        let TabBackend::Failed { reason } = &state.backend else {
+            panic!("the tab must be failed");
+        };
+        assert!(reason.contains("sandbox dangerFullAccess"), "{reason}");
+        assert!(reason.contains("sandbox workspaceWrite"), "{reason}");
+        assert_eq!(state.wire_state(), TabStateWire::Failed);
+        assert_eq!(state.attention.attention().pending, 0, "no card is counted as waiting");
+
+        assert_eq!(tripped.len(), 1);
+        assert_eq!(tripped[0].tab, tab);
+        assert_eq!(&tripped[0].reason, reason);
+        assert_eq!(
+            provider.closes(),
+            0,
+            "the pump shuts nothing down on the GTK thread itself"
+        );
+        for mut t in tripped {
+            t.backend.shutdown();
+        }
+        assert_eq!(provider.closes(), 1);
+
+        for _ in 0..5 {
+            let out = set.pump(&dir, true);
+            assert!(out.tripped.is_empty());
+            payloads.extend(out.active_payload);
+        }
+        for payload in &payloads {
+            assert!(
+                !payload.contains("behind-the-mismatch"),
                 "a card could have been drawn: {payload}"
             );
         }
@@ -7785,8 +7985,8 @@ mod tests {
         let first = set.active();
         give_session(&mut set, first, &dir, "s-one");
         set.rename(first, "api");
-        let empty = set.open();
-        let third = set.open();
+        let empty = set.open(AgentId::Claude);
+        let third = set.open(AgentId::Claude);
         give_session(&mut set, third, &dir, "s-three");
         set.get_mut(third).unwrap().mode = SessionModeChoice::Bypass;
 
@@ -7813,11 +8013,11 @@ mod tests {
         let mut set = set();
         let a = set.active();
         give_session(&mut set, a, &dir, "s-a");
-        let b = set.open();
+        let b = set.open(AgentId::Claude);
         give_session(&mut set, b, &dir, "s-b");
-        let c = set.open(); // empty
-        let d = set.open(); // empty
-                            // a, b, c, d in that order; now b, then d: the empty d is on screen.
+        let c = set.open(AgentId::Claude); // empty
+        let d = set.open(AgentId::Claude); // empty
+                                           // a, b, c, d in that order; now b, then d: the empty d is on screen.
         set.select(b);
         set.select(d);
         assert_eq!(
@@ -7848,7 +8048,7 @@ mod tests {
             resumed_title: None,
             resumed_name: None,
         });
-        let failed = set.open();
+        let failed = set.open(AgentId::Claude);
         set.get_mut(failed).unwrap().backend = TabBackend::Failed { reason: "no".into() };
         assert_eq!(ids(&set.saved_snapshot(PROJECT).unwrap()), ["s-coming"]);
     }
@@ -7884,7 +8084,7 @@ mod tests {
     fn a_pristine_window_has_no_tab_with_a_session_in_any_state() {
         let mut set = set();
         assert!(set.is_pristine());
-        set.open();
+        set.open(AgentId::Claude);
         assert!(set.is_pristine(), "empty tabs do not count");
         let tab = set.active();
         set.get_mut(tab).unwrap().backend = TabBackend::Failed { reason: "x".into() };
@@ -7911,7 +8111,7 @@ mod tests {
             SessionModeChoice::Bypass,
             "the empty tab it already has"
         );
-        let next = set.open();
+        let next = set.open(AgentId::Claude);
         assert_eq!(
             set.get(next).unwrap().mode(),
             SessionModeChoice::Bypass,
@@ -7925,6 +8125,7 @@ mod tests {
 
     fn planned(id: &str, mode: SessionModeChoice) -> PlannedTab {
         PlannedTab {
+            agent: AgentId::Claude,
             provider_session_id: id.to_string(),
             name: None,
             title: Some(format!("title of {id}")),
@@ -7987,7 +8188,7 @@ mod tests {
         assert_eq!((go.downgraded, go.asked), (0, true));
         let from = set.active();
         let mut asked = Vec::new();
-        set.start_restore(from, go, |id| {
+        set.start_restore(from, go, |_, id| {
             asked.push(id.to_string());
             Ok(mpsc::channel().1)
         });
@@ -8014,7 +8215,7 @@ mod tests {
         let go = set.answer_restore(prompt.nonce, false).unwrap();
         assert_eq!(go.downgraded, 2);
         let from = set.active();
-        set.start_restore(from, go, |_| Ok(mpsc::channel().1));
+        set.start_restore(from, go, |_, _| Ok(mpsc::channel().1));
         assert_eq!(mode_of(&set, "a"), SessionModeChoice::Auto);
         assert_eq!(mode_of(&set, "b"), SessionModeChoice::Auto);
         assert_eq!(
@@ -8041,7 +8242,7 @@ mod tests {
         );
         assert!(set.answer_restore(0, true).is_err());
         // Moving to another tab ends the question, as it does a bypass prompt.
-        let other = set.open();
+        let other = set.open(AgentId::Claude);
         let _ = other;
         assert!(
             set.answer_restore(second.nonce, true).is_err(),
@@ -8076,7 +8277,7 @@ mod tests {
         };
         assert_eq!((kept.downgraded, kept.asked), (0, false));
         let from = set.active();
-        set.start_restore(from, kept, |_| Ok(mpsc::channel().1));
+        set.start_restore(from, kept, |_, _| Ok(mpsc::channel().1));
         assert_eq!(
             mode_of(&set, "a"),
             SessionModeChoice::Bypass,
@@ -8099,7 +8300,7 @@ mod tests {
         let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
             panic!("no question")
         };
-        let run = set.start_restore(from, go, |_| Ok(mpsc::channel().1));
+        let run = set.start_restore(from, go, |_, _| Ok(mpsc::channel().1));
         let numbers: Vec<(u16, Option<String>)> =
             set.tabs().iter().map(|t| (t.number, t.provider_session_id())).collect();
         assert_eq!(
@@ -8135,7 +8336,7 @@ mod tests {
         let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
             panic!("no question")
         };
-        set.start_restore(from, go, |_| Ok(mpsc::channel().1));
+        set.start_restore(from, go, |_, _| Ok(mpsc::channel().1));
         assert_eq!(set.active_tab().provider_session_id().as_deref(), Some("a"));
     }
 
@@ -8145,7 +8346,7 @@ mod tests {
         let mut set = set();
         let holder = set.active();
         give_session(&mut set, holder, &dir, "s-open");
-        let from = set.open();
+        let from = set.open(AgentId::Claude);
         let plan = plan_of(
             vec![
                 planned("s-open", SessionModeChoice::Auto),
@@ -8157,7 +8358,7 @@ mod tests {
             panic!("no question")
         };
         let mut connected = Vec::new();
-        let run = set.start_restore(from, go, |id| {
+        let run = set.start_restore(from, go, |_, id| {
             connected.push(id.to_string());
             Ok(mpsc::channel().1)
         });
@@ -8182,7 +8383,7 @@ mod tests {
         let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
             panic!("no question")
         };
-        let run = set.start_restore(from, go, |id| {
+        let run = set.start_restore(from, go, |_, id| {
             if id == "held" {
                 Err("open in another window".to_string())
             } else {
@@ -8222,7 +8423,7 @@ mod tests {
             panic!("no question")
         };
         let mut senders = Vec::new();
-        let mut run = set.start_restore(from, go, |_| {
+        let mut run = set.start_restore(from, go, |_, _| {
             let (tx, rx) = mpsc::channel();
             senders.push(tx);
             Ok(rx)
@@ -8272,7 +8473,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel();
         let mut rx = Some(rx);
-        let mut run = set.start_restore(from, go, |_| Ok(rx.take().unwrap()));
+        let mut run = set.start_restore(from, go, |_, _| Ok(rx.take().unwrap()));
         tx.send(Err(refused("refused"))).unwrap();
         for collected in set.collect_starts() {
             if let StartCollected::Failed { tab, error, .. } = collected {
@@ -8293,8 +8494,8 @@ mod tests {
     fn discarding_leaves_any_tab_that_is_not_failed_alone() {
         let mut set = set();
         let tab = set.active();
-        set.discard_failed_restore(tab, Some(SessionModeChoice::Auto));
-        let other = set.open();
+        set.discard_failed_restore(tab, Some((SessionModeChoice::Auto, AgentId::Claude)));
+        let other = set.open(AgentId::Claude);
         set.discard_failed_restore(other, None);
         assert_eq!(set.tabs().len(), 2);
     }
@@ -8330,12 +8531,12 @@ mod tests {
         assert!(show(&set, &mut memory), "renamed");
         assert_eq!(on_disk(&state).tabs[0].name.as_deref(), Some("api"));
 
-        let empty = set.open();
+        let empty = set.open(AgentId::Claude);
         assert!(
             !show(&set, &mut memory),
             "an empty tab is not listed, and neither is its being active"
         );
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         give_session(&mut set, second, &dir, "s-two");
         assert!(show(&set, &mut memory), "a second session");
         assert_eq!(on_disk(&state).active, 1);
@@ -8794,11 +8995,15 @@ mod tests {
         until("the turn is seen elsewhere", || {
             seen_from_elsewhere(&review) == Some(Busy::TurnRunning { pid: 4242 })
         });
-        set.open();
+        set.open(AgentId::Claude);
         let mut closed = set.remove(tab).unwrap();
+        // Its backend may still be writing until its shutdown returns: the file stays until then.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(seen_from_elsewhere(&review), Some(Busy::TurnRunning { pid: 4242 }));
         if let TabBackend::Live(backend) = &mut closed.backend {
             backend.shutdown();
         }
+        set.retire_done(tab);
         until("the turn's file is gone", || {
             seen_from_elsewhere(&review) == Some(Busy::OtherWindow { pid: 4242 })
         });
@@ -8847,7 +9052,7 @@ mod tests {
                 .first()
                 .is_some_and(|r| matches!(r.base, crate::turn_review::Snap::Taken { .. }))
         });
-        let other = set.open();
+        let other = set.open(AgentId::Claude);
         let mut closed = set.remove(tab).unwrap();
         if let TabBackend::Live(backend) = &mut closed.backend {
             backend.shutdown();
@@ -8939,7 +9144,7 @@ mod tests {
         set.review_draft_mut(first)
             .unwrap()
             .record_revert(review_draft_revert("a", None));
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         assert!(set.review_draft(second).unwrap().is_empty(), "a new tab starts empty");
         set.remove(first).unwrap();
         assert!(set.review_draft(first).is_err(), "the draft went with its tab");
@@ -9053,7 +9258,7 @@ mod tests {
         let mut set = set();
         let tab = set.active();
         give_session(&mut set, tab, &dir, "sess-remove");
-        let other = set.open();
+        let other = set.open(AgentId::Claude);
         let ticket = set.review_ticket(tab).unwrap();
         let kept = set.review_ticket(tab).unwrap();
         assert!(ticket.wanted.load(Ordering::SeqCst));
@@ -9078,7 +9283,7 @@ mod tests {
         let mut set = set();
         let first = set.active();
         give_session(&mut set, first, &dir, "sess-first");
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         give_session(&mut set, second, &dir, "sess-second");
         let kept = set.review_ticket(second).unwrap();
         let mut closed = set.remove(first).unwrap();
@@ -9095,7 +9300,7 @@ mod tests {
         let mut set = set();
         let first = set.active();
         give_session(&mut set, first, &dir, "sess-a");
-        let second = set.open();
+        let second = set.open(AgentId::Claude);
         give_session(&mut set, second, &dir, "sess-b");
         let a = set.review_ticket(first).unwrap();
         let b = set.review_ticket(second).unwrap();
@@ -9191,10 +9396,10 @@ mod tests {
         let starting = set.active();
         set.get_mut(starting).unwrap().backend = TabBackend::Starting(pending_connect());
         assert!(set.defer_start(starting, first_send("r1", "hi")).is_err(), "Starting");
-        let running = set.open();
+        let running = set.open(AgentId::Claude);
         give_session(&mut set, running, &dir, "sess-live");
         assert!(set.defer_start(running, first_send("r2", "hi")).is_err(), "Live");
-        let empty = set.open();
+        let empty = set.open(AgentId::Claude);
         set.defer_start(empty, first_send("r3", "hi")).unwrap();
         assert!(
             set.defer_start(empty, first_send("r4", "again")).is_err(),
@@ -9230,7 +9435,7 @@ mod tests {
         assert_ne!(first, 0, "0 is never a valid nonce");
         assert_eq!(awaiting(&set, tab).asking, Some(second));
         assert!(set.ask_trust(TabId(999)).is_err());
-        let empty = set.open();
+        let empty = set.open(AgentId::Claude);
         assert!(set.ask_trust(empty).is_err(), "a tab with nothing to ask about");
     }
 
@@ -9253,7 +9458,7 @@ mod tests {
     #[test]
     fn an_answer_for_a_tab_not_on_screen_is_refused() {
         let (mut set, first, _) = asked(first_send("r1", "hi"));
-        let other = set.open();
+        let other = set.open(AgentId::Claude);
         assert_eq!(set.active(), other);
         let nonce = set.ask_trust(first).unwrap();
         let why = set.check_trust_answer(first, nonce).unwrap_err();
@@ -9280,7 +9485,7 @@ mod tests {
             let (mut set, tab, nonce) = asked(first_send("r1", "hi"));
             match how {
                 "select" => {
-                    let other = set.open();
+                    let other = set.open(AgentId::Claude);
                     assert_ne!(other, tab);
                     set.select(tab);
                 }
@@ -9358,7 +9563,7 @@ mod tests {
         assert!(matches!(set.get(tab).unwrap().backend, TabBackend::AwaitingTrust(_)));
 
         // The user went to another tab meanwhile: the record's result still finds its start.
-        let other = set.open();
+        let other = set.open(AgentId::Claude);
         assert_eq!(set.active(), other);
         let start = set.take_recorded(tab).expect("the start is still held");
         assert_eq!(start.request_id(), Some("r1"));
@@ -9415,7 +9620,7 @@ mod tests {
     #[test]
     fn closing_an_awaiting_tab_drops_its_start() {
         let (mut set, tab, nonce) = asked(first_send("r1", "hi"));
-        let other = set.open();
+        let other = set.open(AgentId::Claude);
         let closed = set.remove(tab).expect("the tab closes");
         match closed.backend {
             TabBackend::AwaitingTrust(waiting) => assert_eq!(waiting.start.request_id(), Some("r1")),
@@ -9442,7 +9647,7 @@ mod tests {
             Some("sess-wait"),
             "the session it will resume is known"
         );
-        let other = set.open();
+        let other = set.open(AgentId::Claude);
         // Resuming the same session again switches to the tab that already holds it: no second start.
         assert!(matches!(set.route_resume(other, "sess-wait", false), ResumeRoute::SwitchTo(t) if t == tab));
         // A tab with a message waiting is not "empty": a resume from it opens another tab.
@@ -9489,5 +9694,315 @@ mod tests {
             ["a", "b"],
             "intact, ready to start when the answer allows it"
         );
+    }
+}
+
+/// Tabs running another agent than Claude: the reviewer each turn carries, how a mode change reaches
+/// the answers and the turns, what is saved and how it comes back, and the presence of a closed tab.
+#[cfg(test)]
+mod external_tab_tests {
+    use super::*;
+    use crate::tab_restore::PlannedTab;
+    use crate::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+    use agent::{Reviewer, TurnPolicy};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    fn workspace(label: &str) -> PathBuf {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        dir
+    }
+
+    fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A window with one Codex tab, live on a scripted provider, in `mode`.
+    fn codex_tab(dir: &Path, mode: SessionModeChoice) -> (TabSet, TabId, Arc<ExternalRecordingProvider>) {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.open(AgentId::Codex);
+        let provider = Arc::new(ExternalRecordingProvider::codex());
+        let backend =
+            AgentBackend::start_external_with(AgentId::Codex, provider.clone(), dir, empty_trust_plan(), mode, None)
+                .unwrap();
+        let t = set.get_mut(tab).unwrap();
+        t.mode = mode;
+        t.backend = TabBackend::Live(backend);
+        (set, tab, provider)
+    }
+
+    fn turn_completed(turn: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        }
+    }
+
+    fn command(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: Some(format!("item-{id}")),
+            tool_name: "commandExecution".into(),
+            input: serde_json::json!({ "command": "cargo publish" }),
+            provider_prompt: None,
+        }
+    }
+
+    fn send(set: &mut TabSet, tab: TabId, text: &str) {
+        match set.send_now(tab, text, text.to_string(), 0).unwrap() {
+            SendNow::Flushed(Some(Flush { outcome: Ok(_), .. })) => {}
+            SendNow::Flushed(Some(Flush { outcome: Err(e), .. })) => panic!("refused: {}", e.message),
+            _ => panic!("nothing was sent"),
+        }
+    }
+
+    fn reviewer(r: Reviewer) -> TurnPolicy {
+        TurnPolicy { reviewer: r }
+    }
+
+    #[test]
+    fn send_turn_carries_reviewer_from_mode() {
+        let dir = workspace("external-reviewer-from-mode");
+        let (mut set, tab, provider) = codex_tab(&dir, SessionModeChoice::Auto);
+        assert_eq!(set.get(tab).unwrap().agent(), &AgentId::Codex);
+        send(&mut set, tab, "first");
+        provider.inner.queue(AgentDomainEvent::TurnStarted {
+            turn_id: "turn-1".into(),
+        });
+        provider.inner.queue(turn_completed("turn-1"));
+        until("the first turn ends", || set.pump(&dir, true).turn_ended.contains(&tab));
+        // Bypass is entered as always: asked first, then confirmed.
+        let plan = match set.cycle_mode(tab) {
+            Ok(ModeCycle::Confirm(plan)) => plan,
+            other => panic!("expected a question, got {other:?}"),
+        };
+        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        send(&mut set, tab, "second");
+        assert_eq!(
+            provider.policies(),
+            vec![reviewer(Reviewer::Agent), reviewer(Reviewer::User)],
+            "Auto's turn is reviewed by the agent, Bypass's reaches Eitri"
+        );
+        for mut t in set.take_all() {
+            if let TabBackend::Live(b) = &mut t.backend {
+                b.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn mode_switch_mid_turn_changes_answers_now_and_reviewer_next_turn() {
+        let dir = workspace("external-mid-turn-switch");
+        let (mut set, tab, provider) = codex_tab(&dir, SessionModeChoice::Auto);
+        send(&mut set, tab, "first");
+        provider.inner.queue(AgentDomainEvent::TurnStarted {
+            turn_id: "turn-1".into(),
+        });
+        provider.inner.queue(command("p1"));
+        until("the Auto card is waiting", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        assert!(
+            provider.inner.decisions().is_empty(),
+            "Auto drew a card and answered nothing"
+        );
+
+        // Entering bypass mid-turn: the waiting card is approved, and what arrives next is allowed
+        // at once, while the running turn keeps the reviewer it started with.
+        let plan = match set.cycle_mode(tab) {
+            Ok(ModeCycle::Confirm(plan)) => plan,
+            other => panic!("expected a question, got {other:?}"),
+        };
+        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        provider.inner.queue(command("p2"));
+        until("both answered", || {
+            set.pump(&dir, true);
+            provider.inner.decisions().len() == 2
+        });
+        assert_eq!(
+            provider.inner.decisions(),
+            vec![
+                ("p1".to_string(), agent::PermissionDecision::Allow),
+                ("p2".to_string(), agent::PermissionDecision::Allow)
+            ]
+        );
+        assert_eq!(provider.policies(), vec![reviewer(Reviewer::Agent)], "no new turn yet");
+
+        // Back to Auto before the turn ends: the next request is a card again, at once.
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        provider.inner.queue(command("p3"));
+        until("the card after leaving bypass", || {
+            set.pump(&dir, true);
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .pending_permissions
+                .contains_key("p3")
+        });
+        set.pump(&dir, true);
+        assert_eq!(provider.inner.decisions().len(), 2, "p3 waits for the user");
+        // The provider reports each answer's resolution, and the user's interrupt ends p3.
+        for (id, outcome) in [
+            ("p1", agent::PermissionOutcome::Allowed),
+            ("p2", agent::PermissionOutcome::Allowed),
+            ("p3", agent::PermissionOutcome::CancelledByInterrupt),
+        ] {
+            provider.inner.queue(AgentDomainEvent::PermissionResolved {
+                permission_id: id.into(),
+                outcome,
+            });
+        }
+        provider.inner.queue(turn_completed("turn-1"));
+        until("the turn ends", || set.pump(&dir, true).turn_ended.contains(&tab));
+        // The next turn carries the mode the tab is in now.
+        send(&mut set, tab, "second");
+        assert_eq!(
+            provider.policies(),
+            vec![reviewer(Reviewer::Agent), reviewer(Reviewer::Agent)]
+        );
+        for mut t in set.take_all() {
+            if let TabBackend::Live(b) = &mut t.backend {
+                b.shutdown();
+            }
+        }
+    }
+
+    fn planned(agent: AgentId, id: &str, mode: SessionModeChoice) -> PlannedTab {
+        PlannedTab {
+            agent,
+            provider_session_id: id.to_string(),
+            name: None,
+            title: Some(format!("title of {id}")),
+            saved_mode: mode,
+            label: format!("title of {id}"),
+        }
+    }
+
+    #[test]
+    fn restore_asks_bypass_then_trust_then_starts_for_external_tabs() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let from = set.active();
+        let plan = RestorePlan {
+            items: vec![
+                planned(AgentId::Claude, "claude-a", SessionModeChoice::Auto),
+                planned(AgentId::Codex, "codex-b", SessionModeChoice::Bypass),
+            ],
+            skipped: Vec::new(),
+            active_session: Some("codex-b".into()),
+        };
+        // 1. The bypass question, since a Codex tab was saved in bypass.
+        let RestoreStep::Confirm(prompt) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("a saved bypass tab is asked about first")
+        };
+        let go = set.answer_restore(prompt.nonce, true).unwrap();
+        assert_eq!(
+            go.sessions(),
+            vec![
+                (AgentId::Claude, "claude-a".to_string()),
+                (AgentId::Codex, "codex-b".to_string())
+            ]
+        );
+        // 2. The trust question, before anything is started.
+        set.defer_start(from, DeferredStart::Restore { go }).unwrap();
+        let mut asked: Vec<(AgentId, String)> = Vec::new();
+        assert!(set.tabs().iter().all(|t| !matches!(t.backend, TabBackend::Starting(_))));
+        let nonce = set.ask_trust(from).unwrap();
+        set.mark_recording(from, nonce).unwrap();
+        let Some(DeferredStart::Restore { go }) = set.take_recorded(from) else {
+            panic!("the recorded answer hands the restore back")
+        };
+        // 3. Then the starts, each told its agent.
+        let run = set.start_restore(from, go, |agent, id| {
+            asked.push((agent.clone(), id.to_string()));
+            Ok(mpsc::channel().1)
+        });
+        assert_eq!(
+            asked,
+            vec![
+                (AgentId::Claude, "claude-a".to_string()),
+                (AgentId::Codex, "codex-b".to_string())
+            ]
+        );
+        let codex = set.tab_with_session("codex-b").expect("the Codex tab is starting");
+        let t = set.get(codex).unwrap();
+        assert_eq!(t.agent(), &AgentId::Codex);
+        assert_eq!(t.mode(), SessionModeChoice::Bypass, "answered y, so bypass comes back");
+        assert_eq!(set.active(), codex, "the saved active tab is shown");
+        assert_eq!(set.get(from).unwrap().agent(), &AgentId::Claude);
+        // A failed start puts the first tab back as it was, its agent included.
+        assert_eq!(run.back_to(from), Some((SessionModeChoice::Auto, AgentId::Claude)));
+    }
+
+    #[test]
+    fn an_external_tab_is_saved_beside_the_claude_tabs_and_is_the_active_one() {
+        let dir = workspace("external-saved");
+        let (mut set, tab, provider) = codex_tab(&dir, SessionModeChoice::Bypass);
+        until("the thread is named", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().provider_session_id().is_some()
+        });
+        set.select(tab);
+        let saved = set.saved_snapshot("conv").unwrap();
+        assert!(saved.tabs.is_empty(), "the empty Claude tab has nothing to save");
+        assert_eq!(
+            saved.external_tabs,
+            vec![crate::saved_tabs::SavedExternalTab {
+                agent: AgentId::Codex,
+                conversation_id: "conv".into(),
+                provider_session_id: "thread-1".into(),
+                name: None,
+                mode: SessionModeChoice::Bypass,
+            }]
+        );
+        assert_eq!(saved.active_external, Some(0));
+        // A window on the legacy Claude backend still keeps its Codex tabs.
+        set.kind = BackendKind::Legacy;
+        assert_eq!(set.saved_snapshot("conv").unwrap().external_tabs.len(), 1);
+        drop(provider);
+        for mut t in set.take_all() {
+            if let TabBackend::Live(b) = &mut t.backend {
+                b.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn a_removed_live_tab_keeps_presence_until_retire_done() {
+        let dir = workspace("external-retiring-count");
+        let (mut set, tab, _provider) = codex_tab(&dir, SessionModeChoice::Auto);
+        let review = dir.join(".review-state");
+        set.hold_presence(crate::turn_review::PresenceHolder::start(review, std::process::id()));
+        let guard = set.presence_guard().unwrap();
+        until("the presence is held", || {
+            !matches!(guard.check(), Err(crate::turn_review::Blocked::NotHeld(_)))
+        });
+        assert_eq!(guard.check(), Ok(()));
+        let mut removed = set.remove(tab).unwrap();
+        assert_eq!(
+            guard.check(),
+            Err(crate::turn_review::Blocked::TurnRunningHere),
+            "the backend is still being shut down"
+        );
+        if let TabBackend::Live(b) = &mut removed.backend {
+            b.shutdown();
+        }
+        set.retire_done(tab);
+        assert_eq!(guard.check(), Ok(()));
+        // A second report for the same tab changes nothing.
+        set.retire_done(tab);
+        assert_eq!(guard.check(), Ok(()));
     }
 }

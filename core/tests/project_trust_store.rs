@@ -10,7 +10,9 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use eitri_core::project_trust::{civil_date, discover, Diff, Discovery, Limits, Remember, TrustState, TrustStore};
+use eitri_core::project_trust::{
+    civil_date, discover, Diff, Discovery, Limits, Profile, ProfileEnv, Remember, TrustState, TrustStore,
+};
 
 struct Fixture {
     outer: PathBuf,
@@ -43,7 +45,13 @@ impl Fixture {
     }
 
     fn discover(&self, root: &Path) -> Discovery {
-        discover(root, Some(&self.home), &Limits::default())
+        discover(
+            root,
+            Some(&self.home),
+            &Limits::default(),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        )
     }
 
     fn root(&self, name: &str) -> PathBuf {
@@ -391,7 +399,7 @@ fn over_budget_is_session_only() {
         max_entries: 3,
         ..Limits::default()
     };
-    let found = discover(&root, Some(&fx.home), &limits);
+    let found = discover(&root, Some(&fx.home), &limits, &Profile::Claude, &ProfileEnv::default());
     assert!(found.over_budget.is_some());
     let store = fx.store();
     match store.state(found.clone()) {
@@ -537,17 +545,20 @@ fn forget_removes_only_the_own_record() {
     let root = trusted(&fx, "p");
     let store = fx.store();
     let other = trusted(&fx, "q");
-    assert!(store.forget(&root).unwrap());
+    assert!(store.forget(&root, &Profile::Claude).unwrap());
     assert!(!fx.record_file(&root).exists());
     assert!(fx.record_file(&other).exists());
-    assert!(!store.forget(&root).unwrap(), "nothing left to forget");
+    assert!(
+        !store.forget(&root, &Profile::Claude).unwrap(),
+        "nothing left to forget"
+    );
     assert!(matches!(store.state(fx.discover(&root)), TrustState::Untrusted { .. }));
 
     // A link in the record's place is left alone, and so is its target.
     let target = fx.outer.join("target.json");
     write(&target, b"{}");
     symlink(&target, fx.record_file(&root)).unwrap();
-    let err = store.forget(&root).unwrap_err();
+    let err = store.forget(&root, &Profile::Claude).unwrap_err();
     assert!(err.to_string().contains("a link"), "{err}");
     assert!(std::fs::symlink_metadata(fx.record_file(&root))
         .unwrap()
@@ -558,9 +569,9 @@ fn forget_removes_only_the_own_record() {
     // So is anything that is not a regular file.
     std::fs::remove_file(fx.record_file(&root)).unwrap();
     mkfifo(&fx.record_file(&root));
-    assert!(store.forget(&root).is_err());
+    assert!(store.forget(&root, &Profile::Claude).is_err());
     assert!(fx.record_file(&root).exists());
-    assert!(!TrustStore::at(None).forget(&root).unwrap());
+    assert!(!TrustStore::at(None).forget(&root, &Profile::Claude).unwrap());
 }
 
 #[test]
@@ -599,4 +610,192 @@ fn civil_date_examples() {
     assert_eq!(civil_date(1_709_164_800 + 86_400), "2024-03-01");
     // 2100 is not a leap year.
     assert_eq!(civil_date(4_107_542_400), "2100-03-01");
+}
+
+/// The fingerprint `project_trust_discover.rs` pins for the same tree, computed before discovery had
+/// profiles.
+const CLAUDE_FINGERPRINT_BEFORE_PROFILES: &str = "ba47e9a4d5cbf5ca032f353e8bb1737fd39b760374dbe8f83fcc8d8ee6411a9a";
+
+/// The tree `profile_fixture` in `project_trust_discover.rs` builds, opened in `src`.
+fn profile_fixture(fx: &Fixture) -> PathBuf {
+    let repo = fx.repo("repo");
+    write(
+        &repo.join(".claude/settings.json"),
+        br#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"touch /tmp/marker"}]}]}}"#,
+    );
+    write(
+        &repo.join(".claude/settings.local.json"),
+        br#"{"permissions":{"allow":["Bash(ls)"]}}"#,
+    );
+    write(&repo.join(".claude/agents/reviewer.md"), b"agent\n");
+    write(&repo.join(".claude/worktrees/wt/x"), b"x");
+    symlink("../README.md", repo.join(".claude/link")).unwrap();
+    write(
+        &repo.join(".mcp.json"),
+        br#"{"mcpServers":{"m":{"command":"sh","args":["-c","true"]}}}"#,
+    );
+    write(&repo.join("CLAUDE.md"), b"memory\n");
+    write(&repo.join("src/CLAUDE.local.md"), b"local\n");
+    write(&repo.join("AGENTS.md"), b"codex memory\n");
+    write(&repo.join(".codex/config.toml"), b"model = \"x\"\n");
+    write(&repo.join(".agents/skills/s/SKILL.md"), b"skill\n");
+    repo.join("src")
+}
+
+fn discover_as(fx: &Fixture, root: &Path, profile: &Profile) -> Discovery {
+    let env = ProfileEnv {
+        codex_home: Some(fx.outer.join("codex-home")),
+        fallback_names: Vec::new(),
+    };
+    discover(root, Some(&fx.home), &Limits::default(), profile, &env)
+}
+
+#[test]
+fn claude_record_from_before_still_trusted() {
+    let fx = Fixture::new("before-profiles");
+    let root = profile_fixture(&fx);
+    // A record exactly as the store wrote it before profiles existed: no profile field, the same name.
+    let record = serde_json::json!({
+        "version": 1,
+        "root": root.to_str().unwrap(),
+        "trusted_at": 1_790_000_000u64,
+        "fingerprint": CLAUDE_FINGERPRINT_BEFORE_PROFILES,
+        "files": {},
+    });
+    std::fs::create_dir_all(fx.dir()).unwrap();
+    std::fs::set_permissions(fx.state.join("eitri"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(fx.dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = fx.record_file(&root);
+    std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    match fx.store().state(fx.discover(&root)) {
+        TrustState::Trusted { since_unix, discovery } => {
+            assert_eq!(since_unix, 1_790_000_000);
+            assert_eq!(discovery.fingerprint.hex(), CLAUDE_FINGERPRINT_BEFORE_PROFILES);
+        }
+        other => panic!("{other:?}"),
+    }
+    // A Claude record written now has the same name and no profile field.
+    std::fs::remove_file(&path).unwrap();
+    fx.store().record(&fx.discover(&root), 7).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let keys: Vec<String> = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, ["files", "fingerprint", "root", "trusted_at", "version"]);
+}
+
+#[test]
+fn profiles_never_alias_records() {
+    let fx = Fixture::new("alias");
+    let root = profile_fixture(&fx);
+    let store = fx.store();
+    let gemini = Profile::Acp {
+        name: "codex".into(),
+        files: vec!["GEMINI.md".into(), ".gemini/".into()],
+    };
+    write(&root.join("GEMINI.md"), b"gemini\n");
+    let profiles = [Profile::Claude, Profile::Codex, gemini.clone()];
+    let found: Vec<Discovery> = profiles.iter().map(|p| discover_as(&fx, &root, p)).collect();
+    for (i, a) in found.iter().enumerate() {
+        for b in &found[i + 1..] {
+            assert_ne!(a.fingerprint, b.fingerprint, "{:?} and {:?}", a.profile, b.profile);
+        }
+    }
+    // Trusting for Claude trusts nothing else.
+    store.record(&found[0], 1).unwrap();
+    assert!(matches!(store.state(found[0].clone()), TrustState::Trusted { .. }));
+    for other in &found[1..] {
+        assert!(
+            matches!(store.state(other.clone()), TrustState::Untrusted { .. }),
+            "{:?}",
+            other.profile
+        );
+    }
+    // Each profile's record has its own name.
+    store.record(&found[1], 2).unwrap();
+    store.record(&found[2], 3).unwrap();
+    let claude_file = fx.record_file(&root);
+    let codex_file = PathBuf::from(format!("{}.codex", claude_file.display()));
+    let acp_file = PathBuf::from(format!("{}.acp-codex", claude_file.display()));
+    for file in [&claude_file, &codex_file, &acp_file] {
+        assert!(file.is_file(), "{} missing", file.display());
+    }
+    assert_eq!(std::fs::read_dir(fx.dir()).unwrap().count(), 3);
+    for found in &found {
+        assert!(matches!(store.state(found.clone()), TrustState::Trusted { .. }));
+    }
+    // A record under another profile's name does not answer for it, whichever way round.
+    std::fs::copy(&codex_file, &claude_file).unwrap();
+    assert!(!matches!(store.state(found[0].clone()), TrustState::Trusted { .. }));
+    store.record(&found[0], 1).unwrap();
+    std::fs::copy(&claude_file, &codex_file).unwrap();
+    assert!(!matches!(store.state(found[1].clone()), TrustState::Trusted { .. }));
+    // Forgetting one profile's record leaves the others.
+    assert!(store.forget(&root, &gemini).unwrap());
+    assert!(!acp_file.exists());
+    assert!(matches!(store.state(found[0].clone()), TrustState::Trusted { .. }));
+    assert!(matches!(store.state(found[2].clone()), TrustState::Untrusted { .. }));
+    // A registered name never spells a path or another key.
+    let odd = Profile::Acp {
+        name: "../x y".into(),
+        files: Vec::new(),
+    };
+    assert_eq!(odd.key(), "acp-..%2Fx%20y");
+    assert_ne!(Profile::Codex.key(), gemini.key());
+}
+
+/// A registered agent starts only where the user said yes for it, so finding nothing is still a
+/// question: an empty discovery is untrusted until its empty fingerprint is recorded, and a file
+/// that appears afterwards changes it. Claude and Codex keep "nothing to trust".
+#[test]
+fn an_explicit_yes_profile_asks_about_nothing_found_and_records_it() {
+    let fx = Fixture::new("explicit-yes");
+    let root = fx.root("empty");
+    let store = fx.store();
+    let acp = Profile::Acp {
+        name: "gem".into(),
+        files: vec!["GEM.md".into()],
+    };
+    assert!(acp.requires_explicit_yes());
+    assert!(!Profile::Claude.requires_explicit_yes());
+    assert!(!Profile::Codex.requires_explicit_yes());
+    for quiet in [Profile::Claude, Profile::Codex] {
+        assert!(matches!(
+            store.state(discover_as(&fx, &root, &quiet)),
+            TrustState::NothingToTrust(_)
+        ));
+    }
+    let empty = discover_as(&fx, &root, &acp);
+    assert!(empty.nothing_to_trust());
+    assert!(matches!(
+        store.state(empty.clone()),
+        TrustState::Untrusted {
+            remember: Remember::Yes,
+            ..
+        }
+    ));
+    store.record(&empty, 5).unwrap();
+    assert!(matches!(
+        store.state(discover_as(&fx, &root, &acp)),
+        TrustState::Trusted { since_unix: 5, .. }
+    ));
+    write(&root.join("GEM.md"), b"now there is one\n");
+    assert!(matches!(
+        store.state(discover_as(&fx, &root, &acp)),
+        TrustState::Changed { .. }
+    ));
+}
+
+#[test]
+fn profiles_are_named_for_people() {
+    assert_eq!(Profile::Claude.label(), "Claude");
+    assert_eq!(Profile::Codex.label(), "Codex");
+    let acp = Profile::Acp {
+        name: "gem".into(),
+        files: vec!["GEM.md".into()],
+    };
+    assert_eq!(acp.label(), "gem");
 }

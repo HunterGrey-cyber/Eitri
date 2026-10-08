@@ -786,7 +786,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
     what: "Copy the row (message, command, path), or the code block HINT landed on / its whole output",
   },
   { keys: "v / V", what: "A caret to move with h j k l, w b e, 0 $, gg G; V selects lines at once" },
-  { keys: "D", what: "Deny with a reason: into the card's reason box, Enter denies" },
+  { keys: "D", what: "Deny with a reason: into the card's reason box, Enter denies (a Codex or ACP card has none: d denies)" },
   { keys: "i / o", what: "Start typing, caret where you left it (C1a: o is an exact alias of i)" },
   { keys: "A", what: "Start typing at the end of the draft" },
   { keys: "f", what: "HINT: jump anywhere in the window (links too; Enter opens one)" },

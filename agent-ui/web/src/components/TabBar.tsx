@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import type { TabId, TabInfo } from "../types";
-import { markerGlyph } from "../tabs";
+import { agentWord, markerGlyph } from "../tabs";
 import { NO_TEXT_ASSIST } from "../textField";
 
 type Props = {
@@ -47,6 +47,8 @@ export function TabBar({ tabs, active, renaming, focusRequest, onSelect, onRenam
           );
         }
         const glyph = markerGlyph(tab.marker, tab.pending);
+        // A tab that runs another agent than Claude names it, as tmux's window list names a program.
+        const other = agentWord(tab.agent);
         return (
           <button
             key={tab.id}
@@ -58,6 +60,7 @@ export function TabBar({ tabs, active, renaming, focusRequest, onSelect, onRenam
             onClick={() => onSelect(tab.id)}
           >
             {tab.label}
+            {other !== null && ` ${other}`}
             {glyph !== "" && ` ${glyph}`}
             {tab.marker === "working" && <span className="tab-working" aria-label="working" />}
           </button>

@@ -1,11 +1,13 @@
-//! A project's own Claude configuration: what the CLI would load from the project and local
-//! setting tiers for a root, found and fingerprinted so a session can load those tiers only after
-//! the user has trusted exactly that configuration.
+//! A project's own agent configuration: what an agent would load from the project for a root, found
+//! and fingerprinted so a session can load it only after the user has trusted exactly that
+//! configuration.
 //!
-//! The CLI reads the project tier from the working directory and the local tier from the git top
-//! level, and memory files from the directories in between, so discovery walks from the root up to
-//! the git top level (never above `$HOME` when the root is below it) and, in each directory, looks
-//! at `.claude/` (all of it), `.mcp.json`, `CLAUDE.md` and `CLAUDE.local.md`.
+//! Each agent reads its own files, named by its [`Profile`]. Claude's CLI reads the project tier from
+//! the working directory and the local tier from the git top level, and memory files from the
+//! directories in between, so discovery walks from the root up to the git top level (never above
+//! `$HOME` when the root is below it) and, in each directory, looks at `.claude/` (all of it),
+//! `.mcp.json`, `CLAUDE.md` and `CLAUDE.local.md`. Codex reads `.codex/`, `.agents/skills/`,
+//! `.agents/plugins/`, `AGENTS.md` and its alternate names over the same walk (see [`codex`]).
 //!
 //! The fingerprint covers all of it by content: every file's bytes, every symlink's target as
 //! written (never followed) and every directory's name. Anything that could not be hashed -- a file
@@ -16,17 +18,21 @@
 //! Every byte read from the disk here goes through [`nofollow`], which opens nothing through a link
 //! and never blocks on a FIFO.
 
+mod codex;
 mod discover;
 mod findings;
 pub mod git_top;
 pub mod nofollow;
+mod plan;
 mod store;
 
 use std::path::{Path, PathBuf};
 
+pub use codex::{codex_fallback_names, codex_findings, hooks_json_findings, rule_calls, scan_rules, RuleScan};
 pub use discover::discover;
 pub use findings::{mcp_findings, settings_findings};
 pub use git_top::{git_top_level, GitWalk};
+pub use plan::{trust_plan, NonUtf8};
 pub use store::{civil_date, for_root, Diff, Remember, TrustState, TrustStore};
 
 /// How much discovery may look at before it stops and says so.
@@ -56,6 +62,82 @@ impl Default for Limits {
     }
 }
 
+/// Whose configuration discovery looks for: each agent reads its own files from a project, and each
+/// keeps its own record, so trusting a project for one agent never trusts it for another.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Profile {
+    /// `.claude/`, `.mcp.json`, `CLAUDE.md`, `CLAUDE.local.md`. Its fingerprint and record name are the
+    /// ones every record written before profiles existed was keyed by.
+    Claude,
+    /// `.codex/`, `.agents/skills/`, `.agents/plugins/`, `AGENTS.md`, `AGENTS.override.md`, the user's
+    /// alternate memory names, and the plugin-marketplace listings at the top level.
+    Codex,
+    /// An agent registered by name, with the project files it reads: a name ending in `/` is a
+    /// directory read whole, anything else one file.
+    Acp { name: String, files: Vec<String> },
+}
+
+impl Profile {
+    /// The profile's name in a record's file name and in its fingerprint: `claude`, `codex`, or
+    /// `acp-<name>` with every byte outside `[A-Za-z0-9._-]` written `%XX`, so no registered name can
+    /// spell another profile's key or a path.
+    pub fn key(&self) -> String {
+        match self {
+            Profile::Claude => "claude".to_string(),
+            Profile::Codex => "codex".to_string(),
+            Profile::Acp { name, .. } => {
+                let mut key = String::from("acp-");
+                for byte in name.bytes() {
+                    if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+                        key.push(byte as char);
+                    } else {
+                        key.push_str(&format!("%{byte:02X}"));
+                    }
+                }
+                key
+            }
+        }
+    }
+
+    /// How a person reads the agent: `Claude`, `Codex`, or the registered name.
+    pub fn label(&self) -> String {
+        match self {
+            Profile::Claude => "Claude".to_string(),
+            Profile::Codex => "Codex".to_string(),
+            Profile::Acp { name, .. } => name.clone(),
+        }
+    }
+
+    /// Whether a session of this agent starts only after a `y` for exactly what is on disk, even when
+    /// nothing is found. Claude and Codex can be started without the project's own configuration, so
+    /// an `n` (or nothing to ask about) starts them untrusted; a registered agent has no such switch,
+    /// so for it an `n` refuses the start and an empty project is still asked about.
+    pub fn requires_explicit_yes(&self) -> bool {
+        matches!(self, Profile::Acp { .. })
+    }
+
+    /// The first bytes of the fingerprint. Claude's is the header every existing record was hashed
+    /// with; every other profile names itself, so two profiles never hash to the same value.
+    pub(crate) fn fingerprint_header(&self) -> Vec<u8> {
+        match self {
+            Profile::Claude => b"eitri-trust-v1\n".to_vec(),
+            other => format!("eitri-trust-v1 {}\n", other.key()).into_bytes(),
+        }
+    }
+}
+
+/// What a profile's discovery needs from the user's own agent configuration, read beforehand by the
+/// trust worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileEnv {
+    /// The effective `CODEX_HOME`, canonical. A `.codex/` that is this directory is the user's own
+    /// configuration, not the project's, and is not read.
+    pub codex_home: Option<PathBuf>,
+    /// The alternate names of `AGENTS.md` from the user's Codex configuration
+    /// ([`codex_fallback_names`]).
+    pub fallback_names: Vec<String>,
+}
+
 /// The sha256 of a discovery's whole configuration.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct Fingerprint(pub [u8; 32]);
@@ -77,6 +159,8 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 /// What was found for one root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovery {
+    /// Whose configuration this is; the record it is checked against is that profile's.
+    pub profile: Profile,
     pub root: PathBuf,
     /// The git top level (never above `$HOME` when the root is below it); without one, the highest
     /// directory whose `.git` could not be checked, since git may take that one; else the root.
@@ -171,6 +255,9 @@ pub enum Finding {
         file: PathBuf,
         name: String,
         command_line: String,
+        /// How the server's tools are approved, as the file sets it (Codex's
+        /// `default_tools_approval_mode` and each tool's `approval_mode`); `None` when it sets none.
+        approval_mode: Option<String>,
     },
     EnvKey {
         file: PathBuf,
@@ -198,8 +285,34 @@ pub enum Finding {
         file: PathBuf,
         reason: String,
     },
-    ClaudeMd {
+    /// A memory or instructions file the agent puts into its prompt (`CLAUDE.md`, `AGENTS.md`, ...).
+    Memory {
         path: PathBuf,
+    },
+    /// A Codex exec-policy rule file, with each rule call in it as written (`prefix_rule(...)`,
+    /// `network_rule(...)`, `host_executable(...)`), and the file's whole text when it holds anything
+    /// besides those calls, comments and whitespace: a rule reached through another name or made by
+    /// a function shows in no call, so then only the text says what the file does.
+    RuleFile {
+        path: PathBuf,
+        calls: Vec<String>,
+        text: Option<String>,
+    },
+    /// A skill directory, by name.
+    Skill {
+        path: PathBuf,
+        name: String,
+    },
+    /// A plugin-marketplace listing.
+    PluginListing {
+        path: PathBuf,
+    },
+    /// A setting Eitri replaces on every session it starts (the sandbox and approval keys), so what the
+    /// file says is not what runs.
+    Overridden {
+        file: PathBuf,
+        key: String,
+        value: String,
     },
     Symlink {
         path: PathBuf,

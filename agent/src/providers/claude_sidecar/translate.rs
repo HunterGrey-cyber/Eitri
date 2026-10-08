@@ -304,6 +304,7 @@ fn provider_prompt_of(requested: &claude_runtime_protocol::v1::PermissionRequest
 /// (`runtime.proto:844-869`). A non-finite or negative cost is dropped whole -- never half a figure.
 fn usage_from_proto(u: claude_runtime_protocol::v1::TurnUsage) -> Option<UsageInfo> {
     (u.total_cost_usd.is_finite() && u.total_cost_usd >= 0.0).then(|| UsageInfo {
+        cost_reported: true,
         total_cost_usd: u.total_cost_usd,
         num_turns: None,
         tokens: Some(TokenUsage {
@@ -1027,6 +1028,7 @@ mod tests {
         assert_eq!(
             usage,
             Some(UsageInfo {
+                cost_reported: true,
                 total_cost_usd: 0.0421,
                 num_turns: None,
                 tokens: Some(TokenUsage {
@@ -1086,6 +1088,7 @@ mod tests {
                 ..Default::default()
             }),
             Some(UsageInfo {
+                cost_reported: true,
                 total_cost_usd: 0.0,
                 num_turns: None,
                 tokens: Some(TokenUsage {

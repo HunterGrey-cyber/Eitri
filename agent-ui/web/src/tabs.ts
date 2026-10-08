@@ -54,6 +54,22 @@ export function showTabBar(tabCount: number, renaming: boolean): boolean {
   return tabCount >= 2 || renaming;
 }
 
+/** The agents `:tabnew` accepts. Rust refuses any other word too; an agent registered from `init.lua`
+ *  joins both lists when such a registry exists. */
+export const TABNEW_AGENTS: readonly string[] = ["claude", "codex"];
+
+/** Whether a tab runs an agent other than Claude (`TabInfo.agent`: `codex`, `acp:<name>`; absent is Claude's). */
+export function isExternalAgent(agent: string | undefined): boolean {
+  return agent !== undefined && agent !== "claude";
+}
+
+/** The word a non-Claude tab shows in its label and in what is said about it: `codex`, or the name an
+ *  `acp:<name>` agent was registered under. `null` for a Claude tab. */
+export function agentWord(agent: string | undefined): string | null {
+  if (!isExternalAgent(agent)) return null;
+  return agent!.startsWith("acp:") ? agent!.slice(4) : agent!;
+}
+
 export function activeTabInfo(tabs: TabsEnvelope | null): TabInfo | null {
   if (tabs === null) return null;
   return tabs.tabs.find((t) => t.id === tabs.active) ?? null;

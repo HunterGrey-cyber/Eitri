@@ -187,3 +187,126 @@ impl RecordingProvider {
         });
     }
 }
+
+/// An external agent's provider (`agent::ExternalProvider`) over a [`RecordingProvider`]: it records
+/// every start and the policy of every turn, and its shutdown can be held on a gate, for a test that
+/// needs a backend whose shutdown has not returned yet. Its Claude-shaped session and turn doors are
+/// closed, as a real external provider's are.
+pub struct ExternalRecordingProvider {
+    pub inner: RecordingProvider,
+    name: &'static str,
+    starts: std::sync::Mutex<Vec<agent::ExternalStart>>,
+    policies: std::sync::Mutex<Vec<agent::TurnPolicy>>,
+    /// While set, `close_session` waits for one message (or the sender's drop) before it closes.
+    close_gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl ExternalRecordingProvider {
+    /// A provider that names itself `codex`, as Codex's does.
+    pub fn codex() -> Self {
+        ExternalRecordingProvider {
+            inner: RecordingProvider::interruptible(),
+            name: "codex",
+            starts: std::sync::Mutex::new(Vec::new()),
+            policies: std::sync::Mutex::new(Vec::new()),
+            close_gate: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Every start it was handed, in order.
+    pub fn starts(&self) -> Vec<agent::ExternalStart> {
+        self.starts.lock().unwrap().clone()
+    }
+
+    /// The policy of every turn it was sent, in order.
+    pub fn policies(&self) -> Vec<agent::TurnPolicy> {
+        self.policies.lock().unwrap().clone()
+    }
+
+    /// Holds the next `close_session` until the returned sender sends or is dropped.
+    pub fn hold_close(&self) -> std::sync::mpsc::Sender<()> {
+        let (release, gate) = std::sync::mpsc::channel();
+        *self.close_gate.lock().unwrap() = Some(gate);
+        release
+    }
+}
+
+impl agent::AgentProvider for ExternalRecordingProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        agent::AgentProvider::capabilities(&self.inner)
+    }
+    fn info(&self) -> ProviderInfo {
+        agent::AgentProvider::info(&self.inner)
+    }
+    fn create_session(&self, _request: agent::CreateSessionRequest) -> Result<String, agent::ProviderError> {
+        Err(agent::ProviderError::UnsupportedCapability("external"))
+    }
+    fn resume_session(&self, _request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
+        Err(agent::ProviderError::UnsupportedCapability("external"))
+    }
+    fn send_turn(&self, _request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+        Err(agent::ProviderError::UnsupportedCapability("external"))
+    }
+    fn interrupt_turn(&self, request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
+        agent::AgentProvider::interrupt_turn(&self.inner, request)
+    }
+    fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
+        agent::AgentProvider::resolve_permission(&self.inner, request)
+    }
+    fn close_session(&self, request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
+        let gate = self.close_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.recv();
+        }
+        agent::AgentProvider::close_session(&self.inner, request)
+    }
+    fn pump(&self) -> Vec<AgentDomainEvent> {
+        agent::AgentProvider::pump(&self.inner)
+    }
+}
+
+impl agent::ExternalProvider for ExternalRecordingProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn resumes(&self) -> bool {
+        true
+    }
+    fn start(&self, req: agent::ExternalStart) -> Result<String, agent::ProviderError> {
+        match &req.resume {
+            Some(id) => self.inner.queue(AgentDomainEvent::ResumeOutcome {
+                requested_provider_session_id: id.clone(),
+                status: agent::ResumeStatus::Attached,
+                attached_provider_session_id: Some(id.clone()),
+                forked: false,
+                detail: None,
+            }),
+            None => self.inner.queue(AgentDomainEvent::SessionOpened {
+                session_id: "ext-session".into(),
+                provider_session_id: "thread-1".into(),
+                model: "gpt-test".into(),
+                cwd: req.cwd.clone(),
+            }),
+        }
+        self.starts.lock().unwrap().push(req);
+        Ok("ext-session".into())
+    }
+    fn send_turn_with(
+        &self,
+        request: agent::SendTurnRequest,
+        policy: agent::TurnPolicy,
+    ) -> Result<String, agent::ProviderError> {
+        self.policies.lock().unwrap().push(policy);
+        agent::AgentProvider::send_turn(&self.inner, request)
+    }
+}
+
+/// A trust plan with nothing in it, for tests that start an external tab and do not look at trust.
+pub fn empty_trust_plan() -> agent::TrustPlan {
+    agent::TrustPlan {
+        dirs: Vec::new(),
+        skills_off: true,
+        fingerprint: String::new(),
+        project_only: Vec::new(),
+    }
+}

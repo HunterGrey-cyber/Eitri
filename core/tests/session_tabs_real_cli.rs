@@ -20,7 +20,7 @@
 
 use eitri_core::agent_backend::{AgentBackend, BackendKind};
 use eitri_core::agent_bridge::SessionModeChoice;
-use eitri_core::tab_set::{TabBackend, TabSet};
+use eitri_core::tab_set::{AgentId, TabBackend, TabSet};
 use std::time::{Duration, Instant};
 
 fn project() -> std::path::PathBuf {
@@ -60,7 +60,7 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
     let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
     let background = set.active();
     set.get_mut(background).unwrap().backend = TabBackend::Live(start(&dir));
-    let foreground = set.open();
+    let foreground = set.open(AgentId::Claude);
     set.get_mut(foreground).unwrap().backend = TabBackend::Live(start(&dir));
 
     // 1. The background tab reads a file inside the project (the policy answers it, no card) while

@@ -22,6 +22,8 @@ type Props = {
   /** A companion window (`App.tsx`: the editor link is set): its prefix section lists only the tab and
    *  panel keys, and says why the layout keys are missing. */
   companion?: boolean;
+  /** Whether the Slash commands section is drawn: they are Claude Code's, so another agent's tab has none. */
+  claudeSlashCommands?: boolean;
 };
 
 /** One of the four groups, rendered from the same tables `keymap.test.ts` binds to
@@ -203,7 +205,7 @@ function SlashCommands() {
  * fires it.
  */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false },
+  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true },
   ref,
 ) {
   return (
@@ -259,7 +261,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           { keys: "Ctrl+j", what: "The module below" },
         ]}
       />
-      <SlashCommands />
+      {claudeSlashCommands && <SlashCommands />}
       <Section title="Anywhere in the window" rows={windowKeys} />
       <Section
         title={`After ${prefixLabel}`}

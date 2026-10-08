@@ -43,14 +43,18 @@ function PathList({ title, paths }: { title: string; paths: string[] }) {
 
 type Props = { envelope: TrustPromptEnvelope };
 
-/** The question before a project's own Claude configuration is loaded (hooks, MCP servers, rules), with what
- *  it would run. Drawn only: `App.tsx` owns every key while it is open and scrolls this box. Nothing here is
- *  set as HTML. */
+/** The question before a project's own configuration for the tab's agent is loaded (hooks, MCP servers, rules),
+ *  with what it would run. It names the agent the answer is about: a `y` trusts that agent's configuration and
+ *  no other's. Drawn only: `App.tsx` owns every key while it is open and scrolls this box. Nothing here is set
+ *  as HTML. */
 export const TrustPrompt = forwardRef<HTMLDivElement, Props>(function TrustPrompt({ envelope }, ref) {
   const groups = groupItemsByFile(envelope.items);
+  const question = `Trust this project's ${envelope.agent} configuration?`;
   return (
-    <div className="trust-prompt" ref={ref} role="dialog" aria-label="Trust this project's Claude configuration?">
-      <h2>Trust this project's Claude configuration?</h2>
+    <div className="trust-prompt" ref={ref} role="dialog" aria-label={question}>
+      <h2>
+        <Shown text={question} />
+      </h2>
       <p className="trust-root">
         <span className="trust-key">root</span> <Shown text={envelope.root} />
       </p>

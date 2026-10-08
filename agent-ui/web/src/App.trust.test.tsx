@@ -129,7 +129,7 @@ const HEX_D = "d".repeat(64);
 
 function trustPrompt(over: Record<string, unknown> = {}) {
   return {
-    kind: "trust_prompt", tab: 1, nonce: 17, root: "/home/u/p/src", top: "/home/u/p",
+    kind: "trust_prompt", tab: 1, nonce: 17, agent: "Claude", root: "/home/u/p/src", top: "/home/u/p",
     fingerprint: HEX_A, findingsDigest: HEX_B, state: "untrusted", remember: "yes", rememberNote: null, changed: null,
     items: [{ what: "hook", file: ".claude/settings.json", label: "SessionStart", value: "touch /tmp/m", outside: false }],
     ...over,
@@ -608,5 +608,43 @@ describe("the : line's trust commands", () => {
     const { container } = started();
     typed(container, "trust");
     expect(requests("trust_command")[0]).not.toHaveProperty("tab");
+  });
+
+  it("trust_command_names_the_active_tab_agent", () => {
+    const { container } = started({ tabs: [{ ...TAB1, agent: "codex" }] });
+    typed(container, "trust");
+    expect(requests("trust_command")).toEqual([expect.objectContaining({ action: "trust", agent: "codex" })]);
+  });
+
+  it("tabnew codex posts tab_verb new with agent", () => {
+    const { container } = started();
+    typed(container, "tabnew codex");
+    expect(requests("tab_verb")).toEqual([
+      expect.objectContaining({ type: "tab_verb", verb: "new", agent: "codex", request_id: expect.any(String) }),
+    ]);
+    expect(requests("trust_command")).toEqual([]);
+  });
+
+  it("tabnew alone posts the new-tab verb with no agent", () => {
+    const { container } = started();
+    typed(container, "tabnew");
+    expect(requests("tab_verb")).toHaveLength(1);
+    expect(requests("tab_verb")[0]).toMatchObject({ verb: "new" });
+    expect(requests("tab_verb")[0]).not.toHaveProperty("agent");
+  });
+
+  it("unknown agent word flashes the accepted names", () => {
+    const { container } = started();
+    typed(container, "tabnew gemini");
+    expect(requests("tab_verb")).toEqual([]);
+    expect(container.querySelector(".band-message")!.textContent).toBe(
+      "unknown agent gemini — :tabnew accepts claude, codex",
+    );
+  });
+
+  it("a_tab_that_names_no_agent_is_claude_s", () => {
+    const { container } = started();
+    typed(container, "untrust");
+    expect(requests("trust_command")).toEqual([expect.objectContaining({ action: "untrust", agent: "claude" })]);
   });
 });

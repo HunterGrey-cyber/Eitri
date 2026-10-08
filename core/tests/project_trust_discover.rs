@@ -12,7 +12,11 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use eitri_core::project_trust::{discover, git_top_level, Discovery, EntryKind, Finding, Limits};
+use agent::DirTrust;
+use eitri_core::project_trust::{
+    codex_fallback_names, discover, git_top_level, trust_plan, Discovery, EntryKind, Finding, Limits, Profile,
+    ProfileEnv,
+};
 
 /// A scratch directory (canonical) holding a fake home; removed on drop.
 struct Fixture {
@@ -38,8 +42,26 @@ impl Fixture {
         Fixture { outer, base, home }
     }
 
+    fn discover_as(&self, root: &Path, profile: &Profile, env: &ProfileEnv) -> Discovery {
+        discover(root, Some(&self.home), &Limits::default(), profile, env)
+    }
+
+    /// Codex's environment with a `CODEX_HOME` outside the fake home and no alternate names.
+    fn codex_env(&self) -> ProfileEnv {
+        ProfileEnv {
+            codex_home: Some(self.base.join("codex-home")),
+            fallback_names: Vec::new(),
+        }
+    }
+
     fn discover(&self, root: &Path) -> Discovery {
-        discover(root, Some(&self.home), &Limits::default())
+        discover(
+            root,
+            Some(&self.home),
+            &Limits::default(),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        )
     }
 
     /// Discovery on another thread, which must finish within two seconds.
@@ -48,7 +70,13 @@ impl Fixture {
         let root = root.to_path_buf();
         let home = self.home.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(discover(&root, Some(&home), &Limits::default()));
+            let _ = tx.send(discover(
+                &root,
+                Some(&home),
+                &Limits::default(),
+                &Profile::Claude,
+                &ProfileEnv::default(),
+            ));
         });
         rx.recv_timeout(Duration::from_secs(2)).expect("discovery blocked")
     }
@@ -1004,4 +1032,664 @@ fn a_repository_with_only_worktree_checkouts_has_nothing_to_trust() {
     assert!(found.findings.contains(&not_read(".claude/worktrees")));
     write(&repo.join(".claude/settings.json"), b"{}");
     assert!(!fx.discover(&repo).nothing_to_trust());
+}
+
+/// A repository holding every kind of thing the Claude profile reads (settings with a hook, local
+/// settings, `.mcp.json`, memory files at two levels, a link, a nested file, Claude Code's worktree
+/// directory) and the files only Codex reads, opened in `src`. Its Claude fingerprint is pinned below
+/// as computed before discovery gained profiles, so an existing record keeps matching.
+fn profile_fixture(fx: &Fixture) -> PathBuf {
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    write(&repo.join(".claude/settings.json"), HOOK_SETTINGS);
+    write(
+        &repo.join(".claude/settings.local.json"),
+        br#"{"permissions":{"allow":["Bash(ls)"]}}"#,
+    );
+    write(&repo.join(".claude/agents/reviewer.md"), b"agent\n");
+    write(&repo.join(".claude/worktrees/wt/x"), b"x");
+    symlink("../README.md", repo.join(".claude/link")).unwrap();
+    write(
+        &repo.join(".mcp.json"),
+        br#"{"mcpServers":{"m":{"command":"sh","args":["-c","true"]}}}"#,
+    );
+    write(&repo.join("CLAUDE.md"), b"memory\n");
+    write(&repo.join("src/CLAUDE.local.md"), b"local\n");
+    write(&repo.join("AGENTS.md"), b"codex memory\n");
+    write(&repo.join(".codex/config.toml"), b"model = \"x\"\n");
+    write(&repo.join(".agents/skills/s/SKILL.md"), b"skill\n");
+    repo.join("src")
+}
+
+#[test]
+fn claude_fingerprint_unchanged_byte_for_byte() {
+    let fx = Fixture::new("claude-pin");
+    let root = profile_fixture(&fx);
+    let found = fx.discover(&root);
+    assert_eq!(
+        found.fingerprint.hex(),
+        "ba47e9a4d5cbf5ca032f353e8bb1737fd39b760374dbe8f83fcc8d8ee6411a9a"
+    );
+}
+
+fn has(discovery: &Discovery, path: &str) -> bool {
+    discovery.entries.iter().any(|e| e.path == Path::new(path))
+}
+
+#[test]
+fn codex_profile_reads_dot_codex_agents_skills_and_plugins() {
+    let fx = Fixture::new("codex-reads");
+    let root = profile_fixture(&fx);
+    let repo = fx.home.join("repo");
+    write(&repo.join(".codex/hooks.json"), br#"{"hooks":{}}"#);
+    write(&repo.join(".codex/prompts/p.md"), b"prompt\n");
+    write(&repo.join(".agents/plugins/p/plugin.json"), b"{}");
+    write(&repo.join(".agents/other/x.md"), b"not Codex's\n");
+    write(&root.join("AGENTS.override.md"), b"override\n");
+    let found = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    for wanted in [
+        "AGENTS.md",
+        "src/AGENTS.override.md",
+        ".codex/config.toml",
+        ".codex/hooks.json",
+        ".codex/prompts",
+        ".codex/prompts/p.md",
+        ".agents/skills/s",
+        ".agents/skills/s/SKILL.md",
+        ".agents/plugins/p",
+        ".agents/plugins/p/plugin.json",
+    ] {
+        assert!(has(&found, wanted), "{wanted} missing from {:?}", paths(&found));
+    }
+    for unwanted in [
+        ".claude/settings.json",
+        ".mcp.json",
+        "CLAUDE.md",
+        "src/CLAUDE.local.md",
+        ".agents/other/x.md",
+    ] {
+        assert!(!has(&found, unwanted), "{unwanted} read for Codex");
+    }
+    assert!(found.findings.contains(&Finding::Memory {
+        path: PathBuf::from("AGENTS.md")
+    }));
+    assert!(found.findings.contains(&Finding::Memory {
+        path: PathBuf::from("src/AGENTS.override.md")
+    }));
+    assert!(found.findings.contains(&Finding::Skill {
+        path: PathBuf::from(".agents/skills/s"),
+        name: "s".into()
+    }));
+    assert!(found.fully_hashed(), "{:?}", found.findings);
+    assert_eq!(found.profile, Profile::Codex);
+
+    // The Claude profile of the same tree reads none of it, and the two fingerprints differ.
+    let claude = fx.discover(&root);
+    assert!(!has(&claude, ".codex/config.toml") && !has(&claude, "AGENTS.md"));
+    assert_ne!(claude.fingerprint, found.fingerprint);
+
+    // A change to any Codex file changes the Codex fingerprint only.
+    write(&repo.join(".agents/plugins/p/plugin.json"), b"{\"x\":1}");
+    assert_ne!(
+        fx.discover_as(&root, &Profile::Codex, &fx.codex_env()).fingerprint,
+        found.fingerprint
+    );
+    assert_eq!(fx.discover(&root).fingerprint, claude.fingerprint);
+}
+
+#[test]
+fn codex_profile_skips_home_dot_codex_only_when_it_is_codex_home() {
+    let fx = Fixture::new("codex-home");
+    // A home that is itself a repository, so the walk from a project in it reaches it.
+    fx.repo(&fx.home, false);
+    write(
+        &fx.home.join(".codex/config.toml"),
+        b"[mcp_servers.mine]\ncommand = \"my-server\"\n",
+    );
+    write(&fx.home.join(".agents/skills/mine/SKILL.md"), b"the user's own\n");
+    write(&fx.home.join(".agents/plugins/marketplace.json"), b"{}");
+    let root = fx.home.join("proj");
+    write(&root.join(".agents/skills/theirs/SKILL.md"), b"the project's\n");
+
+    let as_codex_home = ProfileEnv {
+        codex_home: Some(fx.home.join(".codex")),
+        fallback_names: Vec::new(),
+    };
+    let found = fx.discover_as(&root, &Profile::Codex, &as_codex_home);
+    assert_eq!(found.top, fx.home);
+    assert!(!has(&found, ".codex/config.toml"), "{:?}", paths(&found));
+    assert!(found.findings.iter().any(
+        |f| matches!(f, Finding::NotRead { path, reason } if path == Path::new(".codex") && reason.contains("CODEX_HOME"))
+    ));
+    assert!(!found.findings.iter().any(|f| matches!(f, Finding::McpServer { .. })));
+    assert!(has(&found, "proj/.agents/skills/theirs/SKILL.md"));
+    assert!(!has(&found, ".agents/skills/mine/SKILL.md"));
+    assert!(!has(&found, ".agents/plugins/marketplace.json"));
+
+    // With CODEX_HOME elsewhere, `$HOME/.codex` is a project layer like any other.
+    let found = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    assert!(has(&found, ".codex/config.toml"), "{:?}", paths(&found));
+    assert!(found
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::McpServer { name, .. } if name == "mine")));
+    assert!(!has(&found, ".agents/skills/mine/SKILL.md"));
+
+    // A `.codex/` that is CODEX_HOME and holds nothing else is nothing to trust.
+    let only = fx.base.join("only");
+    std::fs::create_dir_all(&only).unwrap();
+    let env = ProfileEnv {
+        codex_home: Some(only.join(".codex")),
+        fallback_names: Vec::new(),
+    };
+    write(&only.join(".codex/config.toml"), b"model = \"x\"\n");
+    let lone = discover(&only, None, &Limits::default(), &Profile::Codex, &env);
+    assert!(lone.nothing_to_trust(), "{:?}", lone.entries);
+}
+
+#[test]
+fn codex_profile_reads_main_checkout_hooks_for_a_linked_worktree() {
+    let fx = Fixture::new("codex-wt");
+    let main = fx.home.join("main");
+    fx.repo(&main, true);
+    write(
+        &main.join(".codex/hooks.json"),
+        br#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"main-hook.sh"}]}]}}"#,
+    );
+    write(&main.join("sub/.codex/config.toml"), b"model = \"m\"\n");
+    let wt = fx.home.join("wt");
+    fx.git(&main, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]);
+    std::fs::create_dir_all(wt.join("sub")).unwrap();
+    write(&wt.join(".codex/config.toml"), b"model = \"w\"\n");
+
+    let found = fx.discover_as(&wt.join("sub"), &Profile::Codex, &fx.codex_env());
+    assert_eq!(found.top, wt);
+    for wanted in [
+        ".codex/config.toml",
+        "../main/.codex/hooks.json",
+        "../main/sub/.codex/config.toml",
+    ] {
+        assert!(has(&found, wanted), "{wanted} missing from {:?}", paths(&found));
+    }
+    assert!(found.findings.contains(&Finding::Hook {
+        file: PathBuf::from("../main/.codex/hooks.json"),
+        event: "PreToolUse".into(),
+        matcher: None,
+        command: "main-hook.sh".into(),
+    }));
+    let before = found.fingerprint;
+    write(
+        &main.join(".codex/hooks.json"),
+        br#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"other.sh"}]}]}}"#,
+    );
+    assert_ne!(
+        fx.discover_as(&wt.join("sub"), &Profile::Codex, &fx.codex_env())
+            .fingerprint,
+        before
+    );
+
+    // In the main checkout itself the files are read once, where they are.
+    let in_main = fx.discover_as(&main, &Profile::Codex, &fx.codex_env());
+    assert_eq!(paths(&in_main), vec![PathBuf::from(".codex/hooks.json")]);
+
+    // A repository made with a separate git directory: Codex still takes the worktree's hooks from
+    // the main checkout, which this walk cannot place, so the answer lasts one start.
+    let repo = fx.home.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    fx.git(
+        &repo,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            repo.join(".git-data").to_str().unwrap(),
+        ],
+    );
+    std::fs::write(repo.join("README.md"), b"readme\n").unwrap();
+    fx.git(&repo, &["add", "README.md"]);
+    fx.git(&repo, &["commit", "-q", "-m", "first"]);
+    write(
+        &repo.join(".codex/hooks.json"),
+        br#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"main-hook.sh"}]}]}}"#,
+    );
+    let separate = fx.home.join("separate-wt");
+    fx.git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "sep", separate.to_str().unwrap()],
+    );
+    write(&separate.join(".codex/config.toml"), b"model = \"w\"\n");
+    let found = fx.discover_as(&separate, &Profile::Codex, &fx.codex_env());
+    assert_eq!(found.top, separate);
+    assert!(!found.fully_hashed(), "{:?}", found.findings);
+    assert!(
+        found
+            .uncheckable()
+            .iter()
+            .any(|(path, reason)| *path == Path::new("../repo/.git-data") && reason.contains("main checkout")),
+        "{:?}",
+        found.uncheckable()
+    );
+    // Claude reads nothing from a main checkout, so the same worktree is fully hashed for it.
+    let as_claude = fx.discover_as(&separate, &Profile::Claude, &ProfileEnv::default());
+    assert!(as_claude.fully_hashed(), "{:?}", as_claude.findings);
+}
+
+#[test]
+fn a_linked_codex_read_directory_cannot_be_checked() {
+    let fx = Fixture::new("codex-linked-dirs");
+    let outside = fx.base.join("outside");
+    write(
+        &outside.join("rules/allow.rules"),
+        b"prefix_rule(pattern = [\"rm\"], decision = \"allow\")\n",
+    );
+    write(&outside.join("skills/s/SKILL.md"), b"skill\n");
+    for dir in ["rules", "skills"] {
+        let repo = fx.home.join(format!("repo-{dir}"));
+        fx.repo(&repo, false);
+        write(&repo.join(".codex/config.toml"), b"model = \"m\"\n");
+        symlink(outside.join(dir), repo.join(".codex").join(dir)).unwrap();
+        let found = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
+        assert!(!found.fully_hashed(), "{dir}: {:?}", found.findings);
+        let link = PathBuf::from(".codex").join(dir);
+        assert!(
+            found.uncheckable().iter().any(|(path, _)| *path == link),
+            "{dir}: {:?}",
+            found.uncheckable()
+        );
+    }
+    // A link elsewhere in `.codex/` is hashed by its target, as before.
+    let repo = fx.home.join("repo-other");
+    fx.repo(&repo, false);
+    write(&repo.join(".codex/config.toml"), b"model = \"m\"\n");
+    symlink(outside.join("rules"), repo.join(".codex/notes")).unwrap();
+    let found = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
+    assert!(found.fully_hashed(), "{:?}", found.findings);
+}
+
+#[test]
+fn a_dot_codex_linked_to_codex_home_is_not_read() {
+    let fx = Fixture::new("codex-home-link");
+    fx.repo(&fx.home, false);
+    let dotfiles = fx.base.join("dotfiles/codex");
+    write(
+        &dotfiles.join("config.toml"),
+        b"[mcp_servers.mine]\ncommand = \"my-server\"\n",
+    );
+    symlink(&dotfiles, fx.home.join(".codex")).unwrap();
+    let root = fx.home.join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    let env = ProfileEnv {
+        codex_home: Some(dotfiles.clone()),
+        fallback_names: Vec::new(),
+    };
+    let found = fx.discover_as(&root, &Profile::Codex, &env);
+    assert_eq!(found.top, fx.home);
+    assert!(found.fully_hashed(), "{:?}", found.findings);
+    assert!(found.nothing_to_trust(), "{:?}", found.entries);
+    assert!(found.findings.iter().any(
+        |f| matches!(f, Finding::NotRead { path, reason } if path == Path::new(".codex") && reason.contains("CODEX_HOME"))
+    ));
+    // A link to anywhere else is one the agent would follow.
+    let found = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    assert!(!found.fully_hashed(), "{:?}", found.findings);
+}
+
+#[test]
+fn marketplace_listings_are_fingerprinted_and_named() {
+    let fx = Fixture::new("codex-listings");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    let listings = [
+        ".agents/plugins/marketplace.json",
+        ".agents/plugins/api_marketplace.json",
+        ".claude-plugin/marketplace.json",
+        ".cursor-plugin/marketplace.json",
+    ];
+    for listing in listings {
+        write(&repo.join(listing), b"{\"plugins\":[]}");
+    }
+    write(&repo.join(".claude-plugin/plugin.json"), b"{}");
+    write(&repo.join("src/.claude-plugin/marketplace.json"), b"{}");
+    write(&repo.join("src/.agents/plugins/marketplace.json"), b"{}");
+    let root = repo.join("src");
+    let found = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    for listing in listings {
+        assert!(has(&found, listing), "{listing} missing from {:?}", paths(&found));
+        assert!(
+            found.findings.contains(&Finding::PluginListing {
+                path: PathBuf::from(listing)
+            }),
+            "{listing} not named"
+        );
+    }
+    // Below the top only `.agents/plugins/` is Codex's, read as a plugin directory and not a listing.
+    assert!(!has(&found, "src/.claude-plugin/marketplace.json"));
+    assert!(!has(&found, ".claude-plugin/plugin.json"));
+    assert!(has(&found, "src/.agents/plugins/marketplace.json"));
+    assert!(!found.findings.contains(&Finding::PluginListing {
+        path: PathBuf::from("src/.agents/plugins/marketplace.json")
+    }));
+    let before = found.fingerprint;
+    write(&repo.join(".cursor-plugin/marketplace.json"), b"{\"plugins\":[1]}");
+    assert_ne!(
+        fx.discover_as(&root, &Profile::Codex, &fx.codex_env()).fingerprint,
+        before
+    );
+    // A link in a listing's place is something Codex would follow: it cannot be checked.
+    std::fs::remove_file(repo.join(".claude-plugin/marketplace.json")).unwrap();
+    symlink("/etc/hostname", repo.join(".claude-plugin/marketplace.json")).unwrap();
+    assert!(!fx.discover_as(&root, &Profile::Codex, &fx.codex_env()).fully_hashed());
+}
+
+#[test]
+fn fallback_names_read_one_key_and_follow_no_link() {
+    let fx = Fixture::new("codex-fallback");
+    let codex_home = fx.base.join("codex-home");
+    write(
+        &codex_home.join("config.toml"),
+        br#"model = "secret-model"
+project_doc_fallback_filenames = ["TEAM.md", "TEAM.md", 7, "docs/AI.md"]
+
+[mcp_servers.x]
+command = "y"
+"#,
+    );
+    assert_eq!(
+        codex_fallback_names(&codex_home),
+        vec!["TEAM.md".to_string(), "docs/AI.md".to_string()]
+    );
+
+    // The file through a link, a home through a link, a FIFO, bad TOML, a missing key: no names.
+    let linked = fx.base.join("linked-home");
+    std::fs::create_dir_all(&linked).unwrap();
+    symlink(codex_home.join("config.toml"), linked.join("config.toml")).unwrap();
+    assert!(codex_fallback_names(&linked).is_empty());
+    let via_link = fx.base.join("home-link");
+    symlink(&codex_home, &via_link).unwrap();
+    assert!(codex_fallback_names(&via_link).is_empty());
+    let fifo_home = fx.base.join("fifo-home");
+    mkfifo(&fifo_home.join("config.toml"));
+    let (tx, rx) = mpsc::channel();
+    let probe = fifo_home.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(codex_fallback_names(&probe));
+    });
+    assert!(rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("blocked on a FIFO")
+        .is_empty());
+    let bad = fx.base.join("bad-home");
+    write(&bad.join("config.toml"), b"project_doc_fallback_filenames = [");
+    assert!(codex_fallback_names(&bad).is_empty());
+    let none = fx.base.join("none-home");
+    write(&none.join("config.toml"), b"model = \"x\"\n");
+    assert!(codex_fallback_names(&none).is_empty());
+    assert!(codex_fallback_names(&fx.base.join("missing")).is_empty());
+
+    // Discovery reads a plain alternate name in every walked directory, and cannot check one that is
+    // not a plain name, so trust in that configuration lasts one start.
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    write(&repo.join("TEAM.md"), b"team\n");
+    write(&repo.join("src/TEAM.md"), b"src team\n");
+    let env = ProfileEnv {
+        codex_home: Some(codex_home.clone()),
+        fallback_names: vec!["TEAM.md".into()],
+    };
+    let found = fx.discover_as(&repo.join("src"), &Profile::Codex, &env);
+    assert!(
+        has(&found, "TEAM.md") && has(&found, "src/TEAM.md"),
+        "{:?}",
+        paths(&found)
+    );
+    assert!(found.findings.contains(&Finding::Memory {
+        path: PathBuf::from("src/TEAM.md")
+    }));
+    assert!(found.fully_hashed());
+    let env = ProfileEnv {
+        codex_home: Some(codex_home),
+        fallback_names: codex_fallback_names(&fx.base.join("codex-home")),
+    };
+    let found = fx.discover_as(&repo.join("src"), &Profile::Codex, &env);
+    assert!(!found.fully_hashed());
+    assert!(found
+        .uncheckable()
+        .iter()
+        .any(|(path, _)| *path == Path::new("docs/AI.md")));
+}
+
+const CODEX_CONFIG: &[u8] = br#"model = "o3"
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+
+[features]
+exec_permission_approvals = true
+web_search = true
+
+[mcp_servers.marker]
+command = "sh"
+args = ["-c", "touch /tmp/n"]
+default_tools_approval_mode = "approve"
+
+[mcp_servers.marker.tools.write]
+approval_mode = "prompt"
+
+[mcp_servers.remote]
+url = "https://example.com/mcp"
+"#;
+
+#[test]
+fn toml_findings_name_mcp_servers_and_approval_modes() {
+    let fx = Fixture::new("codex-toml");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    write(&repo.join(".codex/config.toml"), CODEX_CONFIG);
+    let found = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
+    let file = PathBuf::from(".codex/config.toml");
+    let expected = [
+        Finding::McpServer {
+            file: file.clone(),
+            name: "marker".into(),
+            command_line: "sh -c 'touch /tmp/n'".into(),
+            approval_mode: Some("approve; write: prompt".into()),
+        },
+        Finding::McpServer {
+            file: file.clone(),
+            name: "remote".into(),
+            command_line: "http https://example.com/mcp".into(),
+            approval_mode: None,
+        },
+        Finding::Overridden {
+            file: file.clone(),
+            key: "sandbox_mode".into(),
+            value: "\"danger-full-access\"".into(),
+        },
+        Finding::Overridden {
+            file: file.clone(),
+            key: "approval_policy".into(),
+            value: "\"never\"".into(),
+        },
+        Finding::Overridden {
+            file: file.clone(),
+            key: "features.exec_permission_approvals".into(),
+            value: "true".into(),
+        },
+        Finding::OtherSetting {
+            file: file.clone(),
+            key: "features.web_search".into(),
+            value: "true".into(),
+        },
+        Finding::OtherSetting {
+            file: file.clone(),
+            key: "model".into(),
+            value: "\"o3\"".into(),
+        },
+    ];
+    for finding in &expected {
+        assert!(
+            found.findings.contains(finding),
+            "{finding:?} missing from {:?}",
+            found.findings
+        );
+    }
+    let plan = trust_plan(&found, DirTrust::Untrusted, &repo).unwrap();
+    assert_eq!(plan.project_only, vec!["marker".to_string(), "remote".to_string()]);
+
+    write(&repo.join(".codex/config.toml"), b"[mcp_servers\n");
+    let broken = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
+    assert!(broken
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::Unparsed { file: f, .. } if *f == file)));
+}
+
+#[test]
+fn hooks_json_and_config_toml_hooks_both_found() {
+    let fx = Fixture::new("codex-hooks");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    write(
+        &repo.join(".codex/config.toml"),
+        br#"[[hooks.PreToolUse]]
+matcher = "Bash"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "toml-hook.sh"
+
+[hooks.state.some-hook]
+trusted_hash = "abc"
+"#,
+    );
+    write(
+        &repo.join(".codex/hooks.json"),
+        br#"{"description":"d","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"json-hook.sh"}]}]}}"#,
+    );
+    let found = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
+    assert!(found.findings.contains(&Finding::Hook {
+        file: PathBuf::from(".codex/config.toml"),
+        event: "PreToolUse".into(),
+        matcher: Some("Bash".into()),
+        command: "toml-hook.sh".into(),
+    }));
+    assert!(found.findings.contains(&Finding::Hook {
+        file: PathBuf::from(".codex/hooks.json"),
+        event: "SessionStart".into(),
+        matcher: None,
+        command: "json-hook.sh".into(),
+    }));
+    assert!(found
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::OtherSetting { key, .. } if key == "hooks.state")));
+    assert!(!found
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::Hook { event, .. } if event == "state")));
+}
+
+#[test]
+fn rule_file_calls_shown_verbatim() {
+    let fx = Fixture::new("codex-rules");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    let rules = "# prefix_rule(pattern = [\"commented\"])\nprefix_rule(\n    pattern = [\"touch\", \"/outside\"],\n    decision = \"allow\",\n)\nprefix_rule(pattern=[\"git\", \"push\"], decision=\"prompt\")\n";
+    write(&repo.join(".codex/rules/default.rules"), rules.as_bytes());
+    write(&repo.join(".codex/rules/notes.txt"), b"prefix_rule(pattern=[\"x\"])\n");
+    write(
+        &repo.join(".codex/rules/deeper/more.rules"),
+        b"prefix_rule(pattern=[\"y\"])\n",
+    );
+    // Rules a scan for calls cannot see: one reached through another name, and one a function makes.
+    let aliased = "r = prefix_rule\nr(pattern = [\"rm\"], decision = \"allow\")\n";
+    write(&repo.join(".codex/rules/aliased.rules"), aliased.as_bytes());
+    let wrapped = "def allow(cmd):\n    prefix_rule(pattern = [cmd], decision = \"allow\")\n\nallow(\"rm\")\n";
+    write(&repo.join(".codex/rules/wrapped.rules"), wrapped.as_bytes());
+    write(&repo.join(".codex/rules/empty.rules"), b"# nothing yet\n\n");
+    let found = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
+    let rule_files: Vec<&Finding> = found
+        .findings
+        .iter()
+        .filter(|f| matches!(f, Finding::RuleFile { .. }))
+        .collect();
+    assert_eq!(
+        rule_files,
+        vec![
+            &Finding::RuleFile {
+                path: PathBuf::from(".codex/rules/aliased.rules"),
+                calls: vec![],
+                text: Some(aliased.to_string()),
+            },
+            &Finding::RuleFile {
+                path: PathBuf::from(".codex/rules/default.rules"),
+                calls: vec![
+                    "prefix_rule(\n    pattern = [\"touch\", \"/outside\"],\n    decision = \"allow\",\n)".into(),
+                    "prefix_rule(pattern=[\"git\", \"push\"], decision=\"prompt\")".into(),
+                ],
+                text: None,
+            },
+            &Finding::RuleFile {
+                path: PathBuf::from(".codex/rules/empty.rules"),
+                calls: vec![],
+                text: None,
+            },
+            &Finding::RuleFile {
+                path: PathBuf::from(".codex/rules/wrapped.rules"),
+                calls: vec!["prefix_rule(pattern = [cmd], decision = \"allow\")".into()],
+                text: Some(wrapped.to_string()),
+            },
+        ]
+    );
+    // The other files are still hashed.
+    assert!(has(&found, ".codex/rules/notes.txt") && has(&found, ".codex/rules/deeper/more.rules"));
+}
+
+#[test]
+fn trust_plan_untrusted_lists_every_ancestor() {
+    let fx = Fixture::new("plan-untrusted");
+    let root = profile_fixture(&fx);
+    let found = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    let plan = trust_plan(&found, DirTrust::Untrusted, &root).unwrap();
+    let want: Vec<(PathBuf, DirTrust)> = root
+        .ancestors()
+        .map(|dir| (dir.to_path_buf(), DirTrust::Untrusted))
+        .collect();
+    assert_eq!(plan.dirs, want);
+    assert_eq!(plan.dirs.first().map(|(d, _)| d.clone()), Some(root.clone()));
+    assert_eq!(plan.dirs.last().map(|(d, _)| d.clone()), Some(PathBuf::from("/")));
+    assert!(plan.skills_off);
+    assert_eq!(plan.fingerprint, found.fingerprint.hex());
+
+    // A root with nothing to trust gets the same plan.
+    let bare = fx.home.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let nothing = fx.discover_as(&bare, &Profile::Codex, &fx.codex_env());
+    assert!(nothing.nothing_to_trust());
+    let plan = trust_plan(&nothing, DirTrust::Untrusted, &bare).unwrap();
+    assert!(plan.dirs.iter().all(|(_, level)| *level == DirTrust::Untrusted));
+    assert_eq!(plan.dirs.len(), bare.ancestors().count());
+}
+
+#[test]
+fn trust_plan_trusted_trusts_walked_untrusts_above() {
+    let fx = Fixture::new("plan-trusted");
+    let root = profile_fixture(&fx);
+    let repo = fx.home.join("repo");
+    let found = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    assert_eq!(found.walked, vec![root.clone(), repo.clone()]);
+    let plan = trust_plan(&found, DirTrust::Trusted, &root).unwrap();
+    let mut want = vec![(root.clone(), DirTrust::Trusted), (repo.clone(), DirTrust::Trusted)];
+    want.extend(
+        repo.ancestors()
+            .skip(1)
+            .map(|dir| (dir.to_path_buf(), DirTrust::Untrusted)),
+    );
+    assert_eq!(plan.dirs, want);
+    assert!(!plan.skills_off);
+    assert_eq!(plan.project_only, Vec::<String>::new());
+
+    // A root that is not UTF-8 cannot be named exactly, so there is no plan for it.
+    let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/\xff"));
+    assert!(trust_plan(&found, DirTrust::Trusted, &odd).is_err());
+    assert!(trust_plan(&found, DirTrust::Untrusted, &odd).is_err());
 }

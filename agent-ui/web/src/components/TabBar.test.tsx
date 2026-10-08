@@ -32,6 +32,13 @@ describe("TabBar", () => {
     expect(buttons[2].classList.contains("tab-ended")).toBe(true);
     expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
   });
+  it("names the agent of a tab that is not Claude's, after its label", () => {
+    const { container } = renderBar({
+      tabs: [tab(1, { label: "1 new", agent: "claude" }), tab(2, { label: "2 fix", agent: "codex" }), tab(3, { agent: "acp:gemini" }), tab(4)],
+    });
+    const buttons = container.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    expect(Array.from(buttons).map((b) => b.textContent)).toEqual(["1 new", "2 fix codex", "3 new gemini", "4 new"]);
+  });
   it("selects a tab on click (Enter on a focused tab button is its click)", () => {
     const { container, props } = renderBar();
     fireEvent.click(container.querySelectorAll('[role="tab"]')[0]);

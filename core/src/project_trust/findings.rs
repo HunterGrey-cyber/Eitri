@@ -1,4 +1,5 @@
-//! What a settings file or `.mcp.json` asks the CLI to do, as findings for the prompt.
+//! What a settings file or `.mcp.json` asks the CLI to do, as findings for the prompt. Codex's own
+//! files are read in `codex.rs`, through the same helpers.
 //!
 //! Nothing is filtered by how dangerous it looks: a list of dangerous keys is always one key short,
 //! so every top-level key is reported, the ones read here in a form a person can judge (a hook's
@@ -12,19 +13,19 @@ use serde_json::{Map, Value};
 use super::Finding;
 
 /// The compact JSON of a value, as it would appear in the file.
-fn compact(value: &Value) -> String {
+pub(super) fn compact(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
 /// A string as itself, anything else as its compact JSON.
-fn text(value: &Value) -> String {
+pub(super) fn text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         other => compact(other),
     }
 }
 
-fn parse_object(file: &Path, bytes: &[u8], out: &mut Vec<Finding>) -> Option<Map<String, Value>> {
+pub(super) fn parse_object(file: &Path, bytes: &[u8], out: &mut Vec<Finding>) -> Option<Map<String, Value>> {
     match serde_json::from_slice::<Value>(bytes) {
         Ok(Value::Object(map)) => Some(map),
         Ok(other) => {
@@ -105,7 +106,7 @@ pub fn settings_findings(file: &Path, bytes: &[u8]) -> Vec<Finding> {
 
 /// `hooks.<Event>[].{matcher, hooks[].command}`. Anything not in that shape is still a hook, given
 /// as its compact JSON, so an unusual entry is never dropped from the prompt.
-fn hooks(file: &Path, events: &Map<String, Value>, out: &mut Vec<Finding>) {
+pub(super) fn hooks(file: &Path, events: &Map<String, Value>, out: &mut Vec<Finding>) {
     let hook = |out: &mut Vec<Finding>, event: &str, matcher: Option<String>, command: String| {
         out.push(Finding::Hook {
             file: file.to_path_buf(),
@@ -179,13 +180,14 @@ pub fn mcp_findings(file: &Path, bytes: &[u8]) -> Vec<Finding> {
                 file: file.to_path_buf(),
                 name: name.clone(),
                 command_line: server_line(server),
+                approval_mode: None,
             });
         }
     }
     out
 }
 
-fn server_line(server: &Value) -> String {
+pub(super) fn server_line(server: &Value) -> String {
     let Value::Object(fields) = server else {
         return compact(server);
     };

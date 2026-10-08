@@ -24,6 +24,10 @@ pub struct WindowConfig {
     pub typing_cadence: Option<u32>,
     pub restore_policy: eitri_core::tab_restore::RestorePolicy,
     pub default_mode: Option<eitri_core::agent_bridge::SessionModeChoice>,
+    /// `agent.default`: the agent a new tab runs. Claude when unset.
+    pub default_agent: eitri_core::agent_backend::AgentId,
+    /// `agent.codex.command`: the `codex` to run (an absolute path or a bare name), if `init.lua` named one.
+    pub codex_command: Option<String>,
     pub on_permission: eitri_core::attention::ChatOnPermission,
     pub keymap: Rc<eitri_core::keymap::Keymap>,
     pub tmux_import: Option<eitri_core::keymap::TmuxImport>,
@@ -147,6 +151,23 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         );
     }
 
+    // The agent a new tab runs (`agent.default`: "claude", the default, or "codex") and where the
+    // `codex` binary is (`agent.codex.command`). A bad value of either is a startup failure naming
+    // its key, like the keys above; a `codex` that is not installed fails a Codex tab's start, never
+    // the window.
+    let default_agent = eitri_core::agent_prefs::parse_agent_default(
+        kernel.config.borrow().get(eitri_core::agent_prefs::AGENT_DEFAULT_KEY),
+    )?;
+    if default_agent != eitri_core::agent_backend::AgentId::Claude {
+        eprintln!(
+            "[agent] new tabs run {} (init.lua's agent.default)",
+            default_agent.record_name()
+        );
+    }
+    let codex_command = eitri_core::agent_prefs::parse_codex_command(
+        kernel.config.borrow().get(eitri_core::agent_prefs::CODEX_COMMAND_KEY),
+    )?;
+
     // Whether sessions load the user's own Claude Code configuration (`agent.user_settings`: true,
     // the default, or false), pinned for the whole process before any session starts; the panel's
     // `prefix i` note and both backends read the one answer. Anything else is a startup failure
@@ -239,6 +260,8 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         typing_cadence,
         restore_policy,
         default_mode,
+        default_agent,
+        codex_command,
         on_permission,
         keymap,
         tmux_import,
@@ -250,11 +273,13 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
 
 impl WindowConfig {
     /// The settings that live on the panel itself: the typing cadence, the restore policy, the
-    /// default mode for new tabs and the turn review switches.
+    /// default mode and agent for new tabs, the `codex` command and the turn review switches.
     pub fn apply_to_panel(&self, panel: &AgentPanelHandle) {
         panel.set_typing_cadence(self.typing_cadence);
         panel.set_restore_policy(self.restore_policy);
         panel.set_default_mode(self.default_mode);
+        panel.set_default_agent(self.default_agent.clone());
+        panel.set_codex_command(self.codex_command.clone());
         panel.set_review(ReviewConfig {
             enabled: self.review.enabled,
             hint: self.review.hint,
@@ -301,6 +326,31 @@ mod tests {
         assert_eq!(run("eitri.config.set(\"review.enabled\", false)\n"), Ok((false, false)));
         assert!(run("eitri.config.set(\"review.hint\", {})\n").is_err());
         std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// The two agent keys run through the real Lua engine: a good value is read, a bad one is a
+    /// startup failure naming its key.
+    #[test]
+    fn window_config_reads_the_agent_keys() {
+        use eitri_core::agent_backend::AgentId;
+        let ok = load_from("", &[]).unwrap();
+        assert_eq!(ok.default_agent, AgentId::Claude);
+        assert_eq!(ok.codex_command, None);
+        let set = load_from(
+            "eitri.config.set(\"agent.default\", \"codex\")\neitri.config.set(\"agent.codex.command\", \"/opt/codex\")\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(set.default_agent, AgentId::Codex);
+        assert_eq!(set.codex_command.as_deref(), Some("/opt/codex"));
+        let err = load_from("eitri.config.set(\"agent.default\", \"gemini\")\n", &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("agent.default"), "{err}");
+        let err = load_from("eitri.config.set(\"agent.codex.command\", \"bin/codex\")\n", &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("agent.codex.command"), "{err}");
     }
 
     #[test]

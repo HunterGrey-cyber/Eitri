@@ -232,13 +232,18 @@ function dollars(c: number): string {
 const GROUPED = new Intl.NumberFormat("en-US");
 
 /** Format the latest reported token counts and cost, without accumulating reports. Return null for
- *  unknown usage or a non-finite cost so rendering cannot throw. A legacy cost-only report shows
- *  only its cost. */
+ *  unknown usage or a non-finite reported cost so rendering cannot throw. A legacy cost-only report
+ *  shows only its cost. With `cost_reported: false`, show tokens without a cost rather than a
+ *  fabricated `$0.00`. */
 export function usageSegment(u: UsageInfo | null): UsageFact | null {
-  if (u === null || !Number.isFinite(u.total_cost_usd)) return null;
+  if (u === null) return null;
+  // `cost_reported: false` (Codex): the provider counted tokens and priced nothing, so `total_cost_usd`
+  // is a placeholder. Show the tokens alone, and nothing at all when there are none either.
+  const priced = u.cost_reported !== false;
+  if (priced && !Number.isFinite(u.total_cost_usd)) return null;
   const t = u.tokens;
   const total = t === null ? null : t.input + t.output + t.cache_creation + t.cache_read;
-  const text = total === null ? dollars(u.total_cost_usd) : `${tokens(total)} tok ${dollars(u.total_cost_usd)}`;
+  if (!priced && total === null) return null;
   const parts =
     t === null
       ? []
@@ -248,6 +253,10 @@ export function usageSegment(u: UsageInfo | null): UsageFact | null {
           `cache write ${GROUPED.format(t.cache_creation)}`,
           `cache read ${GROUPED.format(t.cache_read)}`,
         ];
+  if (!priced) {
+    return { text: `${tokens(total!)} tok`, title: `${parts.join(" · ")} — since this tab started or resumed; no cost reported` };
+  }
+  const text = total === null ? dollars(u.total_cost_usd) : `${tokens(total)} tok ${dollars(u.total_cost_usd)}`;
   const what = "since this tab started or resumed; /clear starts it over; Claude Code's own estimate, not a bill";
   const title = `${[...parts, `$${u.total_cost_usd.toFixed(4)}`].join(" · ")} — ${what}`;
   return { text, title };

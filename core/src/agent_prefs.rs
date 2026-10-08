@@ -160,6 +160,57 @@ pub fn parse_review_hint(value: Option<&str>) -> Result<bool, String> {
     parse_switch(REVIEW_HINT_KEY, value, false)
 }
 
+/// The `init.lua` key: `eitri.config.set("agent.default", "claude" | "codex")`.
+pub const AGENT_DEFAULT_KEY: &str = "agent.default";
+
+/// The `init.lua` key: `eitri.config.set("agent.codex.command", "<path or command name>")`.
+pub const CODEX_COMMAND_KEY: &str = "agent.codex.command";
+
+/// The agent a new tab runs when the user names none (the new-tab key, an empty window's first tab).
+/// Unset is Claude, as ever. Anything but a name this build can start is an error naming the key,
+/// like every other configuration key here; the names of agents registered from `init.lua` join the
+/// accepted ones when such a registry exists.
+pub fn parse_agent_default(value: Option<&str>) -> Result<crate::agent_backend::AgentId, String> {
+    use crate::agent_backend::AgentId;
+    match value.map(str::trim) {
+        None | Some("claude") => Ok(AgentId::Claude),
+        Some("codex") => Ok(AgentId::Codex),
+        Some(_) => Err(format!(
+            "eitri.config.set(\"{AGENT_DEFAULT_KEY}\", {:?}): must be \"claude\" or \"codex\"",
+            value.unwrap_or_default()
+        )),
+    }
+}
+
+/// The agent a word typed at the panel's `:tabnew` names, or `None` for a word that names none.
+pub fn agent_named(word: &str) -> Option<crate::agent_backend::AgentId> {
+    parse_agent_default(Some(word)).ok()
+}
+
+/// [`CODEX_COMMAND_KEY`]: the `codex` to run, as an absolute path or a bare command name looked up on
+/// `PATH`. Unset or empty says nothing (the binary is found on `PATH`). A relative path with a
+/// directory part is refused: Codex runs from the project directory, where it would name a file
+/// the project supplied. That the file exists is not checked here; a missing binary fails the Codex
+/// tab's start, never the window.
+pub fn parse_codex_command(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let path = Path::new(raw);
+    let mut parts = path.components();
+    let bare = matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if path.is_absolute() || bare {
+        Ok(Some(raw.to_string()))
+    } else {
+        Err(format!(
+            "eitri.config.set(\"{CODEX_COMMAND_KEY}\", {raw:?}): must be an absolute path or a bare command name"
+        ))
+    }
+}
+
 /// Whether this project has a remembered choice of mode that the configured default must not
 /// override: a readable file that says `auto` (the only thing [`save_mode`] writes, once Shift+Tab
 /// has left bypass). A file from before v1 that says bypass is not a choice anyone is still making,
@@ -221,6 +272,39 @@ mod tests {
 
     fn root() -> PathBuf {
         PathBuf::from("/home/user/project")
+    }
+
+    #[test]
+    fn agent_default_accepts_claude_codex_and_refuses_others_naming_the_key() {
+        use crate::agent_backend::AgentId;
+        assert_eq!(parse_agent_default(None), Ok(AgentId::Claude));
+        assert_eq!(parse_agent_default(Some("claude")), Ok(AgentId::Claude));
+        assert_eq!(parse_agent_default(Some(" codex ")), Ok(AgentId::Codex));
+        for bad in ["", "Codex", "gemini", "acp:x", "claude codex"] {
+            let err = parse_agent_default(Some(bad)).unwrap_err();
+            assert!(err.contains("agent.default"), "{bad}: {err}");
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
+        assert_eq!(agent_named("codex"), Some(AgentId::Codex));
+        assert_eq!(agent_named("claude"), Some(AgentId::Claude));
+        assert_eq!(agent_named(""), None);
+        assert_eq!(agent_named("gemini"), None);
+    }
+
+    #[test]
+    fn codex_command_absolute_or_bare_name() {
+        assert_eq!(parse_codex_command(None), Ok(None));
+        assert_eq!(parse_codex_command(Some("  ")), Ok(None));
+        assert_eq!(parse_codex_command(Some("codex")), Ok(Some("codex".into())));
+        assert_eq!(
+            parse_codex_command(Some("/opt/codex/bin/codex")),
+            Ok(Some("/opt/codex/bin/codex".into()))
+        );
+        for bad in ["bin/codex", "./codex", "../codex", "..", "."] {
+            let err = parse_codex_command(Some(bad)).unwrap_err();
+            assert!(err.contains("agent.codex.command"), "{bad}: {err}");
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
     }
 
     #[test]

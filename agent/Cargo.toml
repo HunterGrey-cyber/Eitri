@@ -17,6 +17,9 @@ tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 sha2 = "0.10"
 libc = "0.2"
+# Only the scripted stand-in child (`eitri-agent-standin`) matches lines with it; already in the
+# lock file through other crates, and absent from a build without `test-support`.
+regex = { version = "1", optional = true }
 
 # The legacy backend (`AgentSession`: this crate spawning `claude` itself, parsing its stream-json
 # wire, relaying its `PreToolUse` hook through `agent-hook`) is development-only and is in no release
@@ -27,6 +30,12 @@ libc = "0.2"
 # Development asks for it with `--features shell/legacy-backend` (forwarded by both).
 [features]
 legacy-backend = []
+# The crate's own test doubles for its integration tests, which see it only as an outside crate:
+# today the scripted stand-in child that plays an agent's stdio (`eitri-agent-standin`).
+test-support = ["dep:regex"]
+
+[dev-dependencies]
+agent = { path = ".", features = ["test-support"] }
 
 # The legacy gate's relay, located only by `settings::locate_agent_hook_binary` on the legacy spawn
 # path: without the feature there is nothing for it to relay to, so it is not built. A release then
@@ -35,6 +44,13 @@ legacy-backend = []
 name = "agent-hook"
 path = "src/bin/agent-hook.rs"
 required-features = ["legacy-backend"]
+
+# A child that plays a JSON script on its stdio (lines to write, regexes to expect, sleeps, exit codes),
+# standing in for an agent such as `codex app-server` in the `JsonRpcLink` tests. Never shipped.
+[[bin]]
+name = "eitri-agent-standin"
+path = "src/bin/eitri-agent-standin.rs"
+required-features = ["test-support"]
 
 # A live demo of the legacy `AgentSession`; without the feature it would compile against the stub and
 # fail at `start`, so it asks for the feature instead.

@@ -1,0 +1,619 @@
+//! Resuming a Codex thread by pages, the policy echo and the trust tripwires, against the scripted
+//! stand-in for `codex app-server` (`eitri-agent-standin`). No real Codex runs and no model turn is spent.
+
+use agent::providers::codex::config::expected_echo;
+use agent::providers::codex::tripwire::{check_echo, check_instruction_sources, TrustWatch};
+use agent::providers::codex::wire::ThreadEcho;
+use agent::providers::codex::{CodexLaunch, CodexProvider};
+use agent::{
+    AgentDomainEvent, AgentProvider, ContentKind, DirTrust, ExternalProvider, ExternalStart, ProviderError,
+    ProviderErrorCode, Reviewer, SendTurnRequest, TrustPlan, TurnOutcome, TurnPolicy,
+};
+use serde_json::{json, Value};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const UA: &str = "eitri-probe/0.160.0 (Arch Linux Rolling Release; x86_64) tmux-256color (eitri-probe; 0)";
+const CODEX_HOME: &str = "/home/user/.codex";
+
+// ---------------------------------------------------------------- script building
+
+fn exact(text: &str) -> String {
+    let mut out = String::from("^");
+    for c in text.chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('$');
+    out
+}
+
+fn expect_exact(line: &str) -> Value {
+    json!({ "expect": exact(line) })
+}
+
+/// A line that starts with `{"id":<id>,"method":"<method>"`.
+fn expect_request(id: u64, method: &str) -> Value {
+    json!({ "expect": format!(r#"^\{{"id":{id},"method":"{method}""#) })
+}
+
+/// A request whose line also matches `pattern` (a regular expression over the whole line).
+fn expect_request_like(id: u64, method: &str, pattern: &str) -> Value {
+    json!({ "expect": format!(r#"^\{{"id":{id},"method":"{method}",{pattern}"#) })
+}
+
+fn write(message: Value) -> Value {
+    json!({ "write": message.to_string() })
+}
+
+fn handshake() -> Vec<Value> {
+    vec![
+        expect_exact(&format!(
+            r#"{{"id":1,"method":"initialize","params":{{"clientInfo":{{"name":"eitri","title":"Eitri","version":"{}"}}}}}}"#,
+            env!("CARGO_PKG_VERSION")
+        )),
+        write(json!({"id": 1, "result": {"userAgent": UA, "codexHome": CODEX_HOME}})),
+        expect_exact(r#"{"method":"initialized"}"#),
+        expect_exact(r#"{"id":2,"method":"account/read","params":{"refreshToken":false}}"#),
+        write(json!({"id": 2, "result": {
+            "account": {"type": "chatgpt", "email": "someone@example.com", "planType": "pro"},
+            "requiresOpenaiAuth": true,
+        }})),
+    ]
+}
+
+fn launch() -> CodexLaunch {
+    CodexLaunch {
+        program: PathBuf::from(env!("CARGO_BIN_EXE_eitri-agent-standin")),
+        cwd: std::env::temp_dir(),
+        state_home: std::env::temp_dir(),
+    }
+}
+
+fn connect(script: Vec<Value>) -> CodexProvider {
+    CodexProvider::connect_with_args(launch(), vec![OsString::from(Value::Array(script).to_string())])
+        .expect("the handshake passes")
+}
+
+fn plan(project_only: &[&str]) -> TrustPlan {
+    TrustPlan {
+        dirs: vec![
+            (PathBuf::from("/work/proj"), DirTrust::Untrusted),
+            (PathBuf::from("/work"), DirTrust::Untrusted),
+            (PathBuf::from("/"), DirTrust::Untrusted),
+        ],
+        skills_off: true,
+        fingerprint: "fp".into(),
+        project_only: project_only.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn request(resume: Option<&str>, project_only: &[&str]) -> ExternalStart {
+    ExternalStart {
+        cwd: "/work/proj".into(),
+        plan: plan(project_only),
+        policy: TurnPolicy {
+            reviewer: Reviewer::User,
+        },
+        resume: resume.map(str::to_string),
+    }
+}
+
+fn sandbox() -> Value {
+    json!({"type": "workspaceWrite", "writableRoots": [], "networkAccess": false,
+           "excludeTmpdirEnvVar": false, "excludeSlashTmp": false})
+}
+
+/// The answer to `thread/start` or `thread/resume`, echoing the policy that was asked for.
+fn thread_answer(id: u64, thread: &str, extra: Value) -> Value {
+    let mut result = json!({
+        "thread": {"id": thread, "cwd": "/work/proj"},
+        "model": "gpt-test",
+        "cwd": "/work/proj",
+        "instructionSources": [],
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandbox": sandbox(),
+    });
+    if let (Some(base), Some(more)) = (result.as_object_mut(), extra.as_object()) {
+        for (key, value) in more {
+            if value.is_null() {
+                base.remove(key);
+            } else {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    write(json!({"id": id, "result": result}))
+}
+
+fn pump_until(provider: &CodexProvider, mut done: impl FnMut(&[AgentDomainEvent]) -> bool) -> Vec<AgentDomainEvent> {
+    let mut seen = Vec::new();
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        seen.extend(provider.pump());
+        if done(&seen) {
+            return seen;
+        }
+        assert!(Instant::now() < end, "timed out; the events so far: {seen:#?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn mismatch_in(events: &[AgentDomainEvent]) -> Option<(&str, &str)> {
+    events.iter().find_map(|e| match e {
+        AgentDomainEvent::PolicyMismatch { requested, reported } => Some((requested.as_str(), reported.as_str())),
+        _ => None,
+    })
+}
+
+// ---------------------------------------------------------------- the policy echo
+
+fn good_echo() -> ThreadEcho {
+    ThreadEcho {
+        approval_policy: Some(json!("on-request")),
+        approvals_reviewer: Some(json!("user")),
+        sandbox: Some(sandbox()),
+    }
+}
+
+#[test]
+fn the_expected_echo_passes() {
+    assert!(check_echo(&expected_echo(Reviewer::User), &good_echo()).is_ok());
+    let mut auto = good_echo();
+    auto.approvals_reviewer = Some(json!("auto_review"));
+    assert!(check_echo(&expected_echo(Reviewer::Agent), &auto).is_ok());
+}
+
+#[test]
+fn echo_mismatch_trips() {
+    let sent = expected_echo(Reviewer::User);
+    let cases: Vec<(&str, Box<dyn Fn(&mut ThreadEcho)>)> = vec![
+        (
+            "a different reviewer",
+            Box::new(|e| e.approvals_reviewer = Some(json!("auto_review"))),
+        ),
+        (
+            "a different policy",
+            Box::new(|e| e.approval_policy = Some(json!("never"))),
+        ),
+        (
+            "network on",
+            Box::new(|e| e.sandbox.as_mut().unwrap()["networkAccess"] = json!(true)),
+        ),
+        (
+            "a writable root",
+            Box::new(|e| e.sandbox.as_mut().unwrap()["writableRoots"] = json!(["/home/user"])),
+        ),
+        (
+            "exclude tmpdir",
+            Box::new(|e| e.sandbox.as_mut().unwrap()["excludeTmpdirEnvVar"] = json!(true)),
+        ),
+        (
+            "exclude slash tmp",
+            Box::new(|e| e.sandbox.as_mut().unwrap()["excludeSlashTmp"] = json!(true)),
+        ),
+        (
+            "another sandbox",
+            Box::new(|e| e.sandbox = Some(json!({"type": "dangerFullAccess"}))),
+        ),
+        (
+            "a sandbox with a field Eitri did not ask for",
+            Box::new(|e| e.sandbox.as_mut().unwrap()["readOnlyAccess"] = json!({"type": "fullAccess"})),
+        ),
+    ];
+    for (name, change) in cases {
+        let mut got = good_echo();
+        change(&mut got);
+        let mismatch = check_echo(&sent, &got).expect_err(name);
+        assert!(
+            !mismatch.requested.is_empty() && !mismatch.reported.is_empty(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn echo_without_sandbox_field_trips() {
+    let mut got = good_echo();
+    got.sandbox = None;
+    let mismatch = check_echo(&expected_echo(Reviewer::User), &got).expect_err("an absent sandbox");
+    assert!(mismatch.reported.contains("sandbox absent"), "{mismatch}");
+
+    // The other two fields fail closed the same way.
+    for field in ["approvalPolicy", "approvalsReviewer"] {
+        let mut got = good_echo();
+        match field {
+            "approvalPolicy" => got.approval_policy = None,
+            _ => got.approvals_reviewer = None,
+        }
+        assert!(check_echo(&expected_echo(Reviewer::User), &got).is_err(), "{field}");
+    }
+}
+
+// ---------------------------------------------------------------- trust tripwires
+
+#[test]
+fn instruction_source_inside_walked_dir_trips_but_codex_home_does_not() {
+    let walked = vec![PathBuf::from("/work/proj"), PathBuf::from("/work")];
+    let home = Path::new(CODEX_HOME);
+    let sources = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    let at_root = check_instruction_sources(&sources(&["/work/proj/AGENTS.md"]), &walked, home);
+    assert!(at_root
+        .expect_err("a root file")
+        .reported
+        .contains("/work/proj/AGENTS.md"));
+    assert!(check_instruction_sources(&sources(&["/work/AGENTS.override.md"]), &walked, home).is_err());
+    // A spelling that goes round the directory is still that file.
+    assert!(check_instruction_sources(&sources(&["/work/proj/../proj/./AGENTS.md"]), &walked, home).is_err());
+
+    assert!(check_instruction_sources(&sources(&[&format!("{CODEX_HOME}/AGENTS.md")]), &walked, home).is_ok());
+    assert!(check_instruction_sources(&sources(&[]), &walked, home).is_ok());
+    // Somewhere else on the disk is not a walked directory.
+    assert!(check_instruction_sources(&sources(&["/etc/codex/AGENTS.md"]), &walked, home).is_ok());
+
+    // A root at the home directory: the user's own file under `.codex` passes, the home's own does not.
+    let at_home = vec![PathBuf::from("/home/user")];
+    assert!(check_instruction_sources(&sources(&[&format!("{CODEX_HOME}/AGENTS.md")]), &at_home, home).is_ok());
+    assert!(check_instruction_sources(&sources(&["/home/user/AGENTS.md"]), &at_home, home).is_err());
+}
+
+#[test]
+fn trust_watch_names_project_only_servers_and_project_hooks() {
+    let watch = TrustWatch::new(["proj-server".to_string()]);
+    assert!(watch.mcp_started("proj-server").is_err());
+    assert!(watch.mcp_started("user-server").is_ok());
+    assert!(watch.hook_started("project").is_err());
+    assert!(watch.hook_started("user").is_ok());
+    // A trusted plan has nothing to watch.
+    let mut trusted = plan(&["proj-server"]);
+    trusted.skills_off = false;
+    let watch = TrustWatch::for_plan(&trusted);
+    assert!(watch.mcp_started("proj-server").is_ok());
+    assert!(watch.hook_started("project").is_ok());
+}
+
+/// A session on `th-t`, then `rest`.
+fn started_session(project_only: &[&str], rest: Vec<Value>) -> CodexProvider {
+    let mut script = handshake();
+    script.push(expect_request(3, "thread/start"));
+    script.push(thread_answer(3, "th-t", json!({})));
+    script.extend(rest);
+    let provider = connect(script);
+    provider.start(request(None, project_only)).expect("the session starts");
+    provider
+}
+
+#[test]
+fn project_only_mcp_startup_trips_on_any_family_thread() {
+    // The tab's own thread, and one the family does not hold: both are Codex starting a server only the
+    // project names.
+    for thread in ["th-t", "th-child"] {
+        let provider = started_session(
+            &["proj-server"],
+            vec![
+                write(json!({"method": "mcpServer/startupStatus/updated", "params": {
+                    "threadId": "th-t", "name": "user-server", "status": "starting",
+                }})),
+                write(json!({"method": "mcpServer/startupStatus/updated", "params": {
+                    "threadId": thread, "name": "proj-server", "status": "starting",
+                }})),
+            ],
+        );
+        let events = pump_until(&provider, |events| mismatch_in(events).is_some());
+        let (_, reported) = mismatch_in(&events).expect("a mismatch");
+        assert!(
+            reported.contains("project configuration Eitri did not allow"),
+            "{reported}"
+        );
+        assert!(reported.contains("proj-server"), "{reported}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. }))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn project_hook_start_trips() {
+    let hook = |source: &str| {
+        write(json!({"method": "hook/started", "params": {
+            "threadId": "th-t", "turnId": "tu-1",
+            "run": {"id": "pre-tool-use:0:x:c1", "eventName": "preToolUse", "source": source},
+        }}))
+    };
+    let provider = started_session(&[], vec![hook("user"), hook("project")]);
+    let events = pump_until(&provider, |events| mismatch_in(events).is_some());
+    let (_, reported) = mismatch_in(&events).expect("a mismatch");
+    assert!(reported.contains("hook"), "{reported}");
+}
+
+#[test]
+fn a_tripped_session_takes_no_turn() {
+    let provider = started_session(
+        &[],
+        vec![write(json!({"method": "hook/started", "params": {
+            "threadId": "th-t", "turnId": "tu-1", "run": {"id": "h", "source": "project"},
+        }}))],
+    );
+    pump_until(&provider, |events| mismatch_in(events).is_some());
+    let refused = provider.send_turn_with(
+        SendTurnRequest {
+            session_id: "th-t".into(),
+            text: "go".into(),
+        },
+        TurnPolicy {
+            reviewer: Reviewer::User,
+        },
+    );
+    assert!(matches!(
+        refused,
+        Err(ProviderError::Provider {
+            code: ProviderErrorCode::ProviderUnavailable,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_start_whose_answer_lacks_the_sandbox_fails_the_tab() {
+    let mut script = handshake();
+    script.push(expect_request(3, "thread/start"));
+    script.push(thread_answer(3, "th-t", json!({"sandbox": null})));
+    let provider = connect(script);
+    provider.start(request(None, &[])).expect("the session starts");
+    let events = provider.pump();
+    let (requested, reported) = mismatch_in(&events).expect("a mismatch");
+    assert!(requested.contains("sandbox"), "{requested}");
+    assert!(reported.contains("sandbox absent"), "{reported}");
+}
+
+#[test]
+fn a_start_that_loaded_a_project_instruction_file_fails_the_tab() {
+    let mut script = handshake();
+    script.push(expect_request(3, "thread/start"));
+    script.push(thread_answer(
+        3,
+        "th-t",
+        json!({"instructionSources": [format!("{CODEX_HOME}/AGENTS.md"), "/work/proj/AGENTS.md"]}),
+    ));
+    let provider = connect(script);
+    provider.start(request(None, &[])).expect("the session starts");
+    let events = provider.pump();
+    let (_, reported) = mismatch_in(&events).expect("a mismatch");
+    assert!(reported.contains("/work/proj/AGENTS.md"), "{reported}");
+}
+
+// ---------------------------------------------------------------- resume
+
+fn turn_meta(id: &str, status: &str) -> Value {
+    json!({"id": id, "items": [], "itemsView": "notLoaded", "status": status, "error": null})
+}
+
+fn turns_page(id: u64, turns: Vec<Value>, next: Option<&str>) -> Value {
+    write(json!({"id": id, "result": {"data": turns, "nextCursor": next}}))
+}
+
+fn items_page(id: u64, turn: &str, items: Vec<Value>) -> Value {
+    let data: Vec<Value> = items
+        .into_iter()
+        .map(|item| json!({"turnId": turn, "item": item}))
+        .collect();
+    write(json!({"id": id, "result": {"data": data, "nextCursor": null}}))
+}
+
+fn user_message(id: &str, text: &str) -> Value {
+    json!({"type": "userMessage", "id": id, "content": [{"type": "text", "text": text, "text_elements": []}]})
+}
+
+fn agent_message(id: &str, text: &str) -> Value {
+    json!({"type": "agentMessage", "id": id, "text": text})
+}
+
+fn rate_limits() -> Value {
+    write(
+        json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "limitId": "codex",
+            "primary": {"usedPercent": 12.0, "windowDurationMins": 300, "resetsAt": 1_790_000_000},
+            "planType": "pro",
+        }}}),
+    )
+}
+
+fn kind(event: &AgentDomainEvent) -> &'static str {
+    match event {
+        AgentDomainEvent::SessionOpened { .. } => "opened",
+        AgentDomainEvent::ResumeOutcome { .. } => "resume",
+        AgentDomainEvent::UserPromptSubmitted { .. } => "prompt",
+        AgentDomainEvent::TurnStarted { .. } => "turn+",
+        AgentDomainEvent::TurnCompleted { .. } => "turn-",
+        AgentDomainEvent::ContentDelta { .. } => "text",
+        AgentDomainEvent::AssistantMessageBoundary { .. } => "boundary",
+        AgentDomainEvent::ToolCallStarted { .. } => "call+",
+        AgentDomainEvent::ToolCallCompleted { .. } => "call-",
+        AgentDomainEvent::AccountLimits { .. } => "limits",
+        _ => "other",
+    }
+}
+
+#[test]
+fn resume_pages_history_then_releases_live_events_in_order() {
+    let mut script = handshake();
+    script.push(expect_request_like(
+        3,
+        "thread/resume",
+        r#""params":\{.*"excludeTurns":true.*"threadId":"th-old".*\}\}$"#,
+    ));
+    script.push(thread_answer(3, "th-old", json!({})));
+    // A live notification right behind the answer, before any history was asked for.
+    script.push(rate_limits());
+    script.push(expect_request_like(
+        4,
+        "thread/turns/list",
+        r#""params":\{"itemsView":"notLoaded","limit":10,"sortDirection":"asc","threadId":"th-old"\}\}$"#,
+    ));
+    script.push(turns_page(
+        4,
+        vec![turn_meta("tu-1", "completed"), turn_meta("tu-2", "interrupted")],
+        Some("cursor-2"),
+    ));
+    script.push(expect_request_like(
+        5,
+        "thread/items/list",
+        r#""params":\{"limit":50,"threadId":"th-old","turnId":"tu-1"\}\}$"#,
+    ));
+    script.push(items_page(
+        5,
+        "tu-1",
+        vec![
+            user_message("u1", "first question"),
+            agent_message("a1", "first answer"),
+            json!({"type": "commandExecution", "id": "c1", "command": "ls", "cwd": "/work/proj",
+                   "status": "completed", "aggregatedOutput": "a\nb\n", "exitCode": 0}),
+        ],
+    ));
+    script.push(expect_request(6, "thread/items/list"));
+    script.push(items_page(6, "tu-2", vec![user_message("u2", "second question")]));
+    script.push(expect_request_like(
+        7,
+        "thread/turns/list",
+        r#""params":\{"cursor":"cursor-2","itemsView":"notLoaded","limit":10,"sortDirection":"asc","threadId":"th-old"\}\}$"#,
+    ));
+    script.push(turns_page(7, vec![turn_meta("tu-3", "completed")], None));
+    script.push(expect_request(8, "thread/items/list"));
+    script.push(items_page(8, "tu-3", vec![agent_message("a3", "third answer")]));
+
+    let provider = connect(script);
+    let id = provider
+        .start(request(Some("th-old"), &[]))
+        .expect("the resume completes");
+    assert_eq!(id, "th-old");
+    let events = pump_until(&provider, |events| events.iter().any(|e| kind(e) == "limits"));
+    let kinds: Vec<&str> = events.iter().map(kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "opened", "resume", // the session
+            "prompt", "turn+", "boundary", "text", "call+", "call-", "turn-", // tu-1
+            "prompt", "turn+", "turn-", // tu-2
+            "turn+", "boundary", "text", "turn-",  // tu-3
+            "limits", // the live message, after all of it
+        ]
+    );
+    assert!(matches!(
+        &events[1],
+        AgentDomainEvent::ResumeOutcome { status: agent::ResumeStatus::Attached, attached_provider_session_id: Some(a), .. }
+            if a == "th-old"
+    ));
+    assert!(matches!(&events[2], AgentDomainEvent::UserPromptSubmitted { text } if text == "first question"));
+    assert!(matches!(
+        &events[5],
+        AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } if text == "first answer"
+    ));
+    // The turn that was cut off reads interrupted; the others completed.
+    let outcomes: Vec<TurnOutcome> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::TurnCompleted { outcome, .. } => Some(*outcome),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![TurnOutcome::Completed, TurnOutcome::Interrupted, TurnOutcome::Completed]
+    );
+}
+
+#[test]
+fn over_cap_history_page_is_skipped_not_fatal() {
+    let mut script = handshake();
+    script.push(expect_request(3, "thread/resume"));
+    script.push(thread_answer(3, "th-old", json!({})));
+    script.push(expect_request(4, "thread/turns/list"));
+    script.push(turns_page(
+        4,
+        vec![turn_meta("tu-1", "completed"), turn_meta("tu-2", "completed")],
+        None,
+    ));
+    script.push(expect_request(5, "thread/items/list"));
+    // 17 MiB on one line: past the cap, so it is skipped and the request it answers fails.
+    script.push(json!({"write_big": {
+        "prefix": r#"{"id":5,"result":{"data":[{"turnId":"tu-1","item":{"type":"agentMessage","id":"a1","text":""#,
+        "bytes": 17 * 1024 * 1024,
+        "suffix": r#""}}],"nextCursor":null}}"#,
+    }}));
+    script.push(expect_request(6, "thread/items/list"));
+    script.push(items_page(6, "tu-2", vec![agent_message("a2", "still readable")]));
+
+    let provider = connect(script);
+    provider
+        .start(request(Some("th-old"), &[]))
+        .expect("the resume completes");
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+            .count()
+            == 2
+    });
+    let note = events
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::ToolCallStarted {
+                name, input, turn_id, ..
+            } if name == "history" => Some((turn_id.as_str(), input.to_string())),
+            _ => None,
+        })
+        .expect("a note on the turn that was too large");
+    assert_eq!(note.0, "tu-1");
+    assert!(note.1.contains("too large to show"), "{}", note.1);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::ContentDelta { text, .. } if text == "still readable")));
+    assert!(mismatch_in(&events).is_none());
+}
+
+#[test]
+fn resume_of_a_thread_held_elsewhere_is_rejected_with_codex_message() {
+    let mut script = handshake();
+    script.push(expect_request(3, "thread/resume"));
+    script.push(write(json!({"id": 3, "error": {
+        "code": -32600,
+        "message": "thread th-held is open in another Codex client",
+    }})));
+    let provider = connect(script);
+    let id = provider
+        .start(request(Some("th-held"), &[]))
+        .expect("a refusal is a verdict, not a failure to start");
+    assert_eq!(id, "th-held");
+    let events = provider.pump();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            AgentDomainEvent::SessionOpened { .. },
+            AgentDomainEvent::ResumeOutcome {
+                status: agent::ResumeStatus::Rejected,
+                requested_provider_session_id,
+                detail: Some(detail),
+                ..
+            },
+        ] if requested_provider_session_id == "th-held" && detail == "thread th-held is open in another Codex client"
+    ));
+    let refused = provider.send_turn_with(
+        SendTurnRequest {
+            session_id: "th-held".into(),
+            text: "go".into(),
+        },
+        TurnPolicy {
+            reviewer: Reviewer::User,
+        },
+    );
+    assert!(refused.is_err());
+}
