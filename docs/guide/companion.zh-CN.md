@@ -1,5 +1,5 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=3ef09d80a923d7ddf3503f7f97081d5bc1722e1f0f62c89d1305cd8e90eab841 -->
+<!-- translated-from: companion.md sha256=73312fce1cb9e8c7cac0d0b744726e040e2145c1fee45497f6aceea16678abed -->
 
 # 配合你自己的 Neovim 使用
 
@@ -43,7 +43,7 @@ eitri panel [--nvim <addr>] [DIR]
 
 ### 在两个窗口之间移动
 
-在 Neovim 里，处在 Neovim 自己窗口的边缘时，`Ctrl+h/j/k/l` 会把这次移动交给面板，面板再请求你的窗口管理器去聚焦相邻的窗口。只有在你的配置把这些键留空、或者留在 Neovim 自己的默认（或者像 LazyVim 那样的普通窗口移动）时，Eitri 才会绑定其中的某个键，所以你自己映射过的键仍然是你的。
+在 Neovim 的普通和可视模式里，处在 Neovim 自己窗口的边缘时，`Ctrl+h/j/k/l` 会把这次移动交给面板，面板再请求你的窗口管理器去聚焦相邻的窗口。只有在你的配置把这些键留空、或者留在 Neovim 自己的默认（或者像 LazyVim 那样的普通窗口移动）时，Eitri 才会绑定其中的某个键，所以你自己映射过的键仍然是你的。插入模式里只绑定了 `Ctrl+l`（它先退出插入模式）；`Ctrl+h`、`Ctrl+j`、`Ctrl+k` 在那里保持插入模式原有的含义。
 
 在面板里：
 
@@ -87,7 +87,7 @@ eitri split [DIR]
 
 关闭由 `eitri split` 启动的那个 Neovide，面板也会一起关闭（有回合还在运行时，和任何一次关闭一样会先问你）；只关面板则 Neovide 保持打开，因为那是你的编辑器，在里面运行 `:EitriPanel` 就能把面板找回来。两种情况下会话都会保留（除非 `agent.restore` 是 `"off"`），下一次对该项目运行 `eitri split` 时，会在空标签页上把它们作为 `Restore last session`（`s`）提供出来；设了 `agent.restore = "auto"` 的话，它们在启动时不用按任何键就回来。上面讲的一切，包括焦点键，都适用于它打开的面板。
 
-Neovide 在你启动 `eitri split` 的那个 shell 的前台运行，和 Neovide 默认的行为一样：在那里按 `Ctrl+C`，或者关掉那个终端，会结束 Neovide 和面板。想让它们比终端活得更久，就让它脱离终端启动（`setsid eitri split DIR`，或者从启动器里启动）。只有 `eitri split` 附着的那个面板会随它的 Neovide 一起关闭：你之后用 `:EitriPanel` 带回来的面板不会，而在另一个 Neovim 里运行 `:EitriPanel` 会把面板移到那里，并结束这层关联。
+Neovide 在你启动 `eitri split` 的那个 shell 的前台运行，和 Neovide 默认的行为一样：在那里按 `Ctrl+C`，或者关掉那个终端，会结束 Neovide 和面板。如果这个项目已经有面板在运行，这一条不成立：`eitri split` 会把那个面板附着过来，立即返回，Neovide 留在你的提示符后面继续运行，所以在提示符处按 `Ctrl+C` 什么也结束不了。想让它们比终端活得更久，就让它脱离终端启动（`setsid eitri split DIR`，或者从启动器里启动）。只有 `eitri split` 附着的那个面板会随它的 Neovide 一起关闭：你之后用 `:EitriPanel` 带回来的面板不会，而在另一个 Neovim 里运行 `:EitriPanel` 会把面板移到那里，并结束这层关联。
 
 如果这个项目已经有一个面板在运行，`eitri split` 会把它附着到新的 Neovide 上，而不是再开一个。
 

@@ -72,7 +72,8 @@ naming the call, so a typo does not leave you with a keymap you did not write. [
 defaults and the actions.
 
 The defaults are stock tmux's, with `Ctrl+b` as the prefix. Eitri then reads your tmux configuration (the same
-files tmux reads, and what they `source-file`), and finally applies your `eitri.keymap` calls, so your own
+files tmux reads, and what they `source-file` by an absolute path; a relative path is skipped, because Eitri
+does not know the directory tmux would resolve it against), and finally applies your `eitri.keymap` calls, so your own
 calls win. Eitri only reads tmux's files; it never starts or asks tmux. Set `keymap.from_tmux` to `"off"` to
 skip the tmux step.
 
@@ -92,7 +93,8 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "by
   tabs that have a Claude session (their order, names, modes and which one was on screen) as it goes, and never
   records "no tabs" because you closed the window. With `"offer"` the empty tab's dashboard shows a
   `Restore last session` line, `s`, while nothing in the window has started; `"auto"` brings the tabs back at
-  launch with no key pressed; `"off"` neither offers nor remembers. Each tab is resumed (nothing is sent until
+  launch with no key pressed (unless the project's Claude configuration is new or changed, in which case the
+  restore waits for your answer to the [trust question](permissions.md#trusting-a-project)); `"off"` neither offers nor remembers. Each tab is resumed (nothing is sent until
   you type), the one on screen last time is on screen again, and one message says how many came back. A tab
   is skipped, and named, when its saved record is gone or another window holds its session. A tab that was in
   bypass is never put back in bypass without a yes: `s` asks first, and `n` (or `"auto"`) brings it back in
@@ -134,7 +136,7 @@ not settings and are not listed.
 | `EITRI_NVIM` | The absolute path of the `nvim` to run. It wins over everything below. A value that is not an absolute path to an existing file stops the launch. |
 | `NEOVIM_BIN` | Read when `EITRI_NVIM` is not set: the same rule, an absolute path to an existing file. Without either, Eitri uses the `nvim` on `PATH`; if that is missing or older than 0.10 and you accepted a private copy from `eitri setup`, it uses the newest copy under `$XDG_DATA_HOME/eitri/nvim/`. |
 | `EITRI_NEOVIDE` | The Neovide that `eitri split` starts. It must name an existing file; unset, `neovide` on `PATH` is used. |
-| `EITRI_PROJECT_DIR` | The project to open when no directory is given on the command line. The command-line directory wins over it, and it wins over the current directory. |
+| `EITRI_PROJECT_DIR` | The project to open when no directory is given on the command line. The command-line directory wins over it, and it wins over the current directory. The installed `eitri` command does not read it: it opens the current directory when you name none. |
 | `EITRI_CONFIG_DIR` | The directory `init.lua` and its `lua/` modules are read from, instead of `~/.config/eitri`. |
 | `EITRI_AGENT_TRACE` | Set to `1` to print one `[turn-trace]` line per turn on stderr, with the turn's timings. |
 | `EITRI_SUPERVISOR` | Set to `1`, `true` or `yes` to let a window start `eitri-supervisor`, a dashboard of the agent status of every open window, when none is running. Unset, a window only connects to one you started yourself. |

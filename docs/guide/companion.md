@@ -70,10 +70,10 @@ output says how many were left out. It has no editor, no bottom terminal and no 
 
 ### Moving between the two windows
 
-In Neovim, `Ctrl+h/j/k/l` at the edge of Neovim's own windows hands the move to the panel, which asks your
+In Neovim's Normal and Visual modes, `Ctrl+h/j/k/l` at the edge of Neovim's own windows hands the move to the panel, which asks your
 window manager to focus the neighbouring window. Eitri binds one of these keys only where your configuration
 has left it empty, or at Neovim's own default (or a plain window move such as LazyVim's), so a key you mapped
-yourself stays yours.
+yourself stays yours. In Insert mode only `Ctrl+l` is bound (it leaves Insert mode first); `Ctrl+h`, `Ctrl+j` and `Ctrl+k` keep their Insert-mode meaning there.
 
 In the panel:
 
@@ -134,7 +134,7 @@ project offers them back on the empty tab as `Restore last session` (`s`); with 
 back at launch with no key pressed. Everything above applies to the panel it opens, including the focus keys.
 
 Neovide runs in the foreground of the shell you started `eitri split` from, as Neovide itself does by
-default: `Ctrl+C` there, or closing that terminal, ends Neovide and the panel. Start it detached
+default: `Ctrl+C` there, or closing that terminal, ends Neovide and the panel. This does not hold when a panel for the project is already running: `eitri split` then attaches it, returns at once and leaves Neovide running behind your prompt, so `Ctrl+C` at the prompt ends nothing. Start it detached
 (`setsid eitri split DIR`, or from a launcher) when you want them to outlive the terminal. Only the panel that
 `eitri split` attached closes with its Neovide: a panel you bring back later with `:EitriPanel` does not, and
 `:EitriPanel` in another Neovim moves the panel there and ends that tie.

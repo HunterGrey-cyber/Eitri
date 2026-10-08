@@ -107,7 +107,8 @@ Claude Code runs in its default mode, or from editing the rules file by hand.
 - **Where they are stored.** Outside the project, one file per project under `~/.local/state/eitri/permissions/`
   (`$XDG_STATE_HOME/eitri/permissions/` when that is set). Eitri writes nothing into the project, unlike Claude
   Code's own "don't ask again", which writes `.claude/settings.local.json`. To remove a rule, edit that file:
-  `<prefix> i` shows its path in the `permission rules` row. A file Eitri cannot use is set aside with
+  `<prefix> i` shows its path in the `permission rules` row. A window reads the file once, when it starts, so
+  a removed rule stays in force in every window that is already open until you restart it. A file Eitri cannot use is set aside with
   `.unusable` added to its name and read as no rules, which means more cards, never fewer.
 
 ## When Claude Code itself asks
@@ -154,7 +155,9 @@ of these starts at once, with no question.
 Claude configuration?" with what it found, file by file: each hook with its event and command, each MCP server
 with its command line (environment first), the names of the environment variables a settings file sets, an
 `apiKeyHelper`, each `permissions.allow` rule, each `additionalDirectories` entry, each `CLAUDE.md`, and any other
-setting as written. Hidden and direction-changing characters in those texts are drawn as visible escapes, so a
+setting as written. A single text longer than 4,096 characters, a long hook command for instance, is shown cut
+at that length with a count of the characters left out. `y` still trusts the whole file, including the part you
+did not see, so read such a command in the file itself first. Hidden and direction-changing characters in those texts are drawn as visible escapes, so a
 command cannot read as something else than it is.
 
 - `y` trusts the project and loads its configuration. `n` starts the session without it. `Esc` puts the
@@ -174,12 +177,13 @@ command cannot read as something else than it is.
 - Starting a session in any other way, restoring tabs or resuming a conversation, waits for the answer too.
 
 **Commands.** `:trust` on the panel's command line (`:` in browsing; see
-[the command line](keys.md#the-command-line)) shows the same question and records nothing you did not see.
-`:untrust` forgets the answer at once. Both apply to sessions started afterwards: a running session keeps what
+[the command line](keys.md#the-command-line)) shows the same question and records nothing until you answer it, with the same display limit.
+`:untrust` forgets the answer at once, in this window too. Both apply to sessions started afterwards: a running session keeps what
 it loaded.
 
-**Where it is kept.** One small record per project under `~/.local/state/eitri/trust/`. Deleting that directory
-forgets every answer. Eitri does not read the trust answer of terminal `claude` and terminal `claude` does not
+**Where it is kept.** One small record per project under `~/.local/state/eitri/trust/` (`$XDG_STATE_HOME/eitri/trust/` when that is
+set to an absolute path). Deleting that directory forgets every answer for windows started afterwards. A window
+that already has your answer keeps using it until you run `:untrust` or restart it. Eitri does not read the trust answer of terminal `claude` and terminal `claude` does not
 see Eitri's, so a project you trusted in a terminal asks once more here.
 
 ## What an agent session loads

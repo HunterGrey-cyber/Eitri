@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=4be860319c97a3e6d471d540efec303f24b1906bff5fad0d63cf8c13a530cf28 -->
+<!-- translated-from: keys.md sha256=40566d6737f1258b76642faf84159d9166548515ff15e9505104e1c8043b8bed -->
 
 # 按键
 
@@ -39,7 +39,7 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `<prefix> Ctrl+Up`、`Ctrl+Down`、`Ctrl+Left`、`Ctrl+Right` | 把最近的分隔线朝那个方向移一格（repeats） |
 | `<prefix> Alt+Up`、`Alt+Down`、`Alt+Left`、`Alt+Right` | 同上，五格（repeats） |
 | `<prefix> x` | 关闭这个模块并结束它里面运行的东西，会先问一个 `y/n`；关掉屏幕上的最后一个模块就关闭 Eitri |
-| `<prefix> [` 或 `<prefix> PageUp` | 把底部终端往回滚（复制模式） |
+| `<prefix> [` 或 `<prefix> PageUp` | 把底部终端往回滚（复制模式）；只在终端拿着按键时有效，在别处只会闪一下拒绝提示 |
 | `<prefix> F11` | 沉浸模式：不带顶栏的全屏 |
 
 **窗口和面板。**
@@ -88,14 +88,15 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `Enter` | 发送；回合运行期间，把消息排队，等它结束后再发 |
 | `Ctrl+Enter` | 立刻发送：中断正在运行的回合，然后发送队列和这条消息 |
 | `Shift+Enter`、`Alt+Enter`，或者反斜杠再加 `Enter` | 换行（反斜杠会被它替换掉） |
-| `Up` / `Down` | 在第一行 / 最后一行时：先把队列取回，然后逐条翻看之前的提示 |
+| `Up` | 在第一行时：先把队列取回，然后逐条翻看之前的提示 |
+| `Down` | 在最后一行时，并且已经在翻看之前的提示：再往前走一条 |
 | `Ctrl+r` | 搜索之前的提示；`Enter` 把其中一条放进输入框 |
 | `Ctrl+w` / `Ctrl+u` | 删除一个词 / 删到行首 |
 | `Ctrl+c` | 中断正在运行的回合；空闲时，把输入框清空并存入历史 |
 | `Ctrl+y` | 批准这个标签页里等得最久的卡片（见[回答一张卡片](#answering-a-card)） |
-| `Ctrl+g` | 在 Neovim 里编辑草稿；`:wq` 把它带回来，`:q!` 什么都不改 |
+| `Ctrl+g` | 在 Neovim 里编辑草稿；`:wq` 把它带回来；`:q!` 什么都不改，除非你已经用 `:w` 保存过草稿，这时保存的文字会回来 |
 | `Ctrl+o` | 详细视图（BROWSE 里也有） |
-| `Shift+Tab` | 在 Auto 和 Bypass 之间切换；进入 Bypass 会先问 |
+| `Shift+Tab` | 在 Auto 和 Bypass 之间切换；进入 Bypass 会先问，回答 `y` 还会批准这个标签页里已经在等的 Claude Code 提问（你的 ask 规则引起的也算），并替你回答之后的提问，见[Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks) |
 | `Esc` | 停止输入，回到 BROWSE |
 | `?` | 按键列表，在输入框为空时 |
 

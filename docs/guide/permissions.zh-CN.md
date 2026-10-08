@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=76b39d1ba21a37ae1a65a9d3534abc33a62447d6f929cab3ce8fe51fef88a764 -->
+<!-- translated-from: permissions.md sha256=7815227b3e0cef784aacbcf79d95672614c39e8ea07deb11a29aaa99213b6c77 -->
 
 # 权限与信任
 
@@ -59,7 +59,7 @@ Claude Code 可能回退到它普通的默认模式，而且某些已安装的�
 - **规则从不让 Eitri 读不清楚的命令运行起来。** 规则只替换“这个程序不在只读名单上”这一个判断。带重定向、管道、`;` 或 `&&`、通配符、引号或 `$(...)`、项目之外的路径，或者 `git -C` 之类选项的命令，即使规则的单词和它匹配，也不会被规则放行。在 Claude Code 运行它的 auto 模式的地方（通常情况），这样的调用交给那个模式的分类器，它可能不出任何卡片就运行它；否则它是一张卡片。
 - **规则覆盖的比按钮提供的更多。** 按钮的谨慎只决定它建议什么。一条保存的规则会允许每一个以它的单词开头、能被读清楚的命令，包括按钮根本不会为之提供规则的命令：保存了 `cargo *` 之后，`cargo -p helper run` 也会不出卡片就运行。保存或写下能满足需要的最窄的规则。
 - **规则在哪里适用。** 在 Auto 标签页里，上面两种情形都适用。在 bypass 下不需要规则。规则从不回答 Claude Code 自己的问题（下一节）。
-- **它们存在哪里。** 在项目之外，每个项目一个文件，位于 `~/.local/state/eitri/permissions/` 下（设置了 `$XDG_STATE_HOME/eitri/permissions/` 时用它）。Eitri 不往项目里写任何东西，这和 Claude Code 自己的 “don't ask again” 不一样，后者会写 `.claude/settings.local.json`。要去掉一条规则，就编辑那个文件：`<prefix> i` 在 `permission rules` 那一行里显示它的路径。Eitri 用不了的文件会在名字后加上 `.unusable` 放到一边，并被当作没有规则来读，这意味着更多的卡片，绝不会更少。
+- **它们存在哪里。** 在项目之外，每个项目一个文件，位于 `~/.local/state/eitri/permissions/` 下（设置了 `$XDG_STATE_HOME/eitri/permissions/` 时用它）。Eitri 不往项目里写任何东西，这和 Claude Code 自己的 “don't ask again” 不一样，后者会写 `.claude/settings.local.json`。要去掉一条规则，就编辑那个文件：`<prefix> i` 在 `permission rules` 那一行里显示它的路径。窗口只在启动时读一次这个文件，所以已经打开的窗口里，被删掉的规则仍然有效，直到你重启那个窗口。Eitri 用不了的文件会在名字后加上 `.unusable` 放到一边，并被当作没有规则来读，这意味着更多的卡片，绝不会更少。
 
 <a id="when-claude-code-itself-asks"></a>
 ## Claude Code 自己提问时
@@ -85,7 +85,7 @@ Eitri 放行一次调用之后，Claude Code 仍可能自己再就它提问。�
 
 **看哪些东西。** 在项目目录里和它之上的每个目录里，一直到它的 git 仓库顶层（而且从不高于你的主目录）：`.claude/`、`.mcp.json`、`CLAUDE.md` 和 `CLAUDE.local.md`。`.claude/worktrees/`（Claude Code 在那里保存它自己的检出）会被点名，但不读取。没有这些东西的项目立即启动，不提任何问题。
 
-**那个问题。** 在这样的项目里第一个会话启动之前，面板会显示 “Trust this project's Claude configuration?” 以及它找到的东西，逐个文件列出：每个 hook 和它的事件及命令，每个 MCP server 和它的命令行（环境变量在前），某个设置文件设置的环境变量的名字，一个 `apiKeyHelper`，每条 `permissions.allow` 规则，每个 `additionalDirectories` 条目，每个 `CLAUDE.md`，以及其他任何设置原样。这些文字里的隐藏字符和改变方向的字符会被画成可见的转义，所以一条命令不会看起来像是别的东西。
+**那个问题。** 在这样的项目里第一个会话启动之前，面板会显示 “Trust this project's Claude configuration?” 以及它找到的东西，逐个文件列出：每个 hook 和它的事件及命令，每个 MCP server 和它的命令行（环境变量在前），某个设置文件设置的环境变量的名字，一个 `apiKeyHelper`，每条 `permissions.allow` 规则，每个 `additionalDirectories` 条目，每个 `CLAUDE.md`，以及其他任何设置原样。单段文字超过 4,096 个字符（比如很长的 hook 命令）时，只显示到这个长度，并注明省略了多少个字符。`y` 仍然信任整个文件，包括你没看到的那一部分，所以遇到这种命令，请先在文件里读完它。这些文字里的隐藏字符和改变方向的字符会被画成可见的转义，所以一条命令不会看起来像是别的东西。
 
 - `y` 信任这个项目并加载它的配置。`n` 不带它启动会话。`Esc` 把这个问题推后：第一条消息回到输入框里，继续或恢复则被丢弃，并给出一条消息。`y` 和 `n` 只有单独按下、并且在问题出现片刻之后按才算数；太早敲的键会闪出 “wait a moment, then y or n”。
 - **`y` 按项目记住，并且和你看到的内容严格绑定。** 这些文件的任何变化都会再问一次，并列出加了什么、去掉了什么、改了什么。这包括 agent 在 `.claude/` 下做的一次编辑，以及 Claude Code 自己的 “don't ask again”（它会写 `.claude/settings.local.json`）。
@@ -93,9 +93,9 @@ Eitri 放行一次调用之后，Claude Code 仍可能自己再就它提问。�
 - **Eitri 检查不了的东西，会让信任只持续一次启动。** 超过 4 MiB 的文件、读不了的文件、管道或其他特殊文件、Claude Code 读取文件的地方出现了符号链接，或者文件太多的仓库，会在问题里被点名为 “cannot be checked”，这时 `y` 只覆盖这一次启动；什么都不保存，下一次启动再问。
 - 用任何其他方式启动会话，恢复标签页或继续一个对话，也要等这个回答。
 
-**命令。** 面板命令行上的 `:trust`（在浏览模式里按 `:`；见[命令行](keys.zh-CN.md#the-command-line)）显示同样的问题，不记录任何你没看过的东西。`:untrust` 立即忘掉这个回答。两者都对之后启动的会话生效：正在运行的会话保留它已经加载的东西。
+**命令。** 面板命令行上的 `:trust`（在浏览模式里按 `:`；见[命令行](keys.zh-CN.md#the-command-line)）显示同样的问题（显示上限相同），在你回答之前不记录任何东西。`:untrust` 立即忘掉这个回答，当前窗口里的也一样。两者都对之后启动的会话生效：正在运行的会话保留它已经加载的东西。
 
-**它存在哪里。** 每个项目一个小记录，位于 `~/.local/state/eitri/trust/` 下。删掉这个目录就忘掉每一个回答。Eitri 不读终端里 `claude` 的信任回答，终端里的 `claude` 也看不到 Eitri 的，所以你在终端里信任过的项目，在这里还要再问一次。
+**它存在哪里。** 每个项目一个小记录，位于 `~/.local/state/eitri/trust/` 下（`$XDG_STATE_HOME` 设为绝对路径时用 `$XDG_STATE_HOME/eitri/trust/`）。删掉这个目录，之后启动的窗口就忘掉每一个回答。已经拿到你回答的窗口会继续用它，直到你运行 `:untrust` 或重启它。Eitri 不读终端里 `claude` 的信任回答，终端里的 `claude` 也看不到 Eitri 的，所以你在终端里信任过的项目，在这里还要再问一次。
 
 <a id="what-an-agent-session-loads"></a>
 ## 一个 agent 会话会加载什么

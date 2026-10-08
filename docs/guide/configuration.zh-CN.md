@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=87ecaaf4fa1cc11e5652e9ec95f75ef0a4860de0c1c02658afdb32315d5a064f -->
+<!-- translated-from: configuration.md sha256=eb644697c9702d34c923cbb05789c9539f351f958f7e98c7139923c671e50474 -->
 
 # 配置
 
@@ -58,7 +58,7 @@ k.del("prefix", "%")                          -- remove a default binding
 
 `k.prefix(key)` 改前缀，`k.set(table, key, action, options)` 绑定一个键，`k.del(table, key)` 去掉一个。错误的键、不认识的动作或者两个互相冲突的绑定，会让 Eitri 在启动时停下，并给出一条点出这次调用的消息，所以笔误不会留给你一套你没有写过的按键映射。[按键](keys.zh-CN.md)列出了默认值和这些动作。
 
-默认值是原版 tmux 的，以 `Ctrl+b` 为前缀。然后 Eitri 读取你的 tmux 配置（tmux 读的那些文件，以及它们 `source-file` 进来的文件），最后应用你的 `eitri.keymap` 调用，所以你自己的调用优先。Eitri 只读 tmux 的文件；从不启动或询问 tmux。把 `keymap.from_tmux` 设为 `"off"` 可以跳过 tmux 这一步。
+默认值是原版 tmux 的，以 `Ctrl+b` 为前缀。然后 Eitri 读取你的 tmux 配置（tmux 读的那些文件，以及它们用绝对路径 `source-file` 进来的文件；相对路径会被跳过，因为 Eitri 不知道 tmux 会拿哪个目录去解析它），最后应用你的 `eitri.keymap` 调用，所以你自己的调用优先。Eitri 只读 tmux 的文件；从不启动或询问 tmux。把 `keymap.from_tmux` 设为 `"off"` 可以跳过 tmux 这一步。
 
 一个完整的例子是 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua)，它把前缀移到 `Ctrl+a`，并重新绑定了分割、调整大小和放大。把你想要的部分从里面粘贴到你的 `init.lua` 里。
 
@@ -72,7 +72,7 @@ eitri.config.set("agent.restore", "offer")        -- "offer" (the default), "aut
 eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "bypass"
 ```
 
-- **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有 Claude 会话的标签页（它们的顺序、名字、模式，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成“没有标签页”。设为 `"offer"` 时，只要窗口里还没有任何东西启动，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来；`"off"` 既不提议也不记录。每个标签页都会被继续（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。曾经处于 bypass 的标签页，没有你的一句“是”，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。
+- **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有 Claude 会话的标签页（它们的顺序、名字、模式，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成“没有标签页”。设为 `"offer"` 时，只要窗口里还没有任何东西启动，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来（除非项目的 Claude 配置是新的或已改动，这时恢复要等你回答[信任问题](permissions.zh-CN.md#trusting-a-project)）；`"off"` 既不提议也不记录。每个标签页都会被继续（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。曾经处于 bypass 的标签页，没有你的一句“是”，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。
 - **`agent.default_mode`** 是新标签页开始时所处的模式，针对你还没有用 `Shift+Tab` 离开过 bypass 的项目（那个选择按项目记住，并且始终优先）。设为 `"bypass"` 是唯一一种窗口不经询问就以 bypass 开始的方式，因为你已经在自己的文件里这么说了；它同时也让保存下来的 bypass 标签页不必回答那个问题就以 bypass 回来。这两种模式的含义见[权限](permissions.zh-CN.md)。
 
 <a id="accounts"></a>
@@ -98,7 +98,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "by
 | `EITRI_NVIM` | 要运行的 `nvim` 的绝对路径。它优先于下面的一切。不是指向现有文件的绝对路径的值会让启动停下。 |
 | `NEOVIM_BIN` | 在没有设置 `EITRI_NVIM` 时读取：规则相同，要求指向现有文件的绝对路径。两者都没有时，Eitri 用 `PATH` 上的 `nvim`；如果它不存在或者比 0.10 旧，并且你在 `eitri setup` 里接受过一个私有副本，就用 `$XDG_DATA_HOME/eitri/nvim/` 下最新的那个副本。 |
 | `EITRI_NEOVIDE` | `eitri split` 启动的那个 Neovide。它必须指向一个现有文件；没设置时用 `PATH` 上的 `neovide`。 |
-| `EITRI_PROJECT_DIR` | 命令行上没有给目录时要打开的项目。命令行上的目录优先于它，它优先于当前目录。 |
+| `EITRI_PROJECT_DIR` | 命令行上没有给目录时要打开的项目。命令行上的目录优先于它，它优先于当前目录。已安装的 `eitri` 命令不读它：没有给目录时，它打开当前目录。 |
 | `EITRI_CONFIG_DIR` | 从这个目录读取 `init.lua` 和它的 `lua/` 模块，而不是 `~/.config/eitri`。 |
 | `EITRI_AGENT_TRACE` | 设为 `1`，每个回合在 stderr 上打印一行 `[turn-trace]`，带着这个回合的耗时。 |
 | `EITRI_SUPERVISOR` | 设为 `1`、`true` 或 `yes`，允许窗口在没有运行时启动 `eitri-supervisor`，一个显示所有已打开窗口的 agent 状态的仪表盘。没设置时，窗口只会连接到你自己启动的那个。 |

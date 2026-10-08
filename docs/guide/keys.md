@@ -44,7 +44,7 @@ The keys marked "repeats" can be pressed again within half a second without the 
 | `<prefix> Ctrl+Up`, `Ctrl+Down`, `Ctrl+Left`, `Ctrl+Right` | move the nearest divider one cell that way (repeats) |
 | `<prefix> Alt+Up`, `Alt+Down`, `Alt+Left`, `Alt+Right` | the same, five cells (repeats) |
 | `<prefix> x` | close this module and end what runs in it, after a `y/n` question; closing the last one on screen closes Eitri |
-| `<prefix> [` or `<prefix> PageUp` | scroll the bottom terminal back (copy mode) |
+| `<prefix> [` or `<prefix> PageUp` | scroll the bottom terminal back (copy mode); only while the terminal has the keys, elsewhere it flashes a refusal |
 | `<prefix> F11` | immersive: fullscreen without the top bar |
 
 **The window and the panel.**
@@ -111,14 +111,15 @@ right after a reply arrives do not start HINT or open the box in the middle of a
 | `Enter` | send; while a turn runs, queue the message for when it ends |
 | `Ctrl+Enter` | send now: interrupts a running turn, then sends the queue and this message |
 | `Shift+Enter`, `Alt+Enter`, or a backslash then `Enter` | a new line (the backslash is replaced by it) |
-| `Up` / `Down` | from the first / the last line: take the queue back, then step through earlier prompts |
+| `Up` | from the first line: take the queue back, then step through earlier prompts |
+| `Down` | from the last line, once you are stepping through earlier prompts: one step forward again |
 | `Ctrl+r` | search earlier prompts; `Enter` puts one in the box |
 | `Ctrl+w` / `Ctrl+u` | delete a word / to the start of the line |
 | `Ctrl+c` | interrupt a running turn; when idle, clear the box into the history |
 | `Ctrl+y` | approve the oldest card waiting in this tab (see [Answering a card](#answering-a-card)) |
-| `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back, `:q!` changes nothing |
+| `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back; `:q!` changes nothing unless you already saved the draft with `:w`, in which case the saved text comes back |
 | `Ctrl+o` | the detailed view (also in BROWSE) |
-| `Shift+Tab` | switch between Auto and Bypass; entering Bypass asks first |
+| `Shift+Tab` | switch between Auto and Bypass; entering Bypass asks first, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks) |
 | `Esc` | stop typing and go back to BROWSE |
 | `?` | the list of keys, from an empty box |
 
