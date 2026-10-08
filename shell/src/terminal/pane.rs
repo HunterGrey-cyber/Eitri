@@ -604,7 +604,7 @@ fn build_metrics(allocation: Allocation) -> Result<TerminalMetrics, String> {
         |payload| {
             payload
                 .downcast_ref::<&str>()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "the font manager panicked".to_string())
         },
@@ -738,7 +738,7 @@ fn connect_visibility(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticon
 /// and are not tested without a display; the decisions are (`State::take_cursor`, `State::bell`,
 /// `BellFlash`, `bell::repaint_delay`, and the engine's OSC 52 tests).
 fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: bool) {
-    let Some(update) = state.borrow().session.as_ref().map(|s| s.take_update()) else {
+    let Some(update) = state.borrow().session.as_ref().map(TerminalSession::take_update) else {
         return;
     };
     let (repoint, flash_until, closed_by_exit) = {
@@ -869,7 +869,7 @@ fn connect_resize(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext
 /// only on the next `GLArea` snapshot. Without `queue_render`, the old framebuffer stays
 /// upscaled and blurry until output causes a redraw.
 fn connect_scale_change(area: &GLArea) {
-    area.connect_scale_factor_notify(|area| area.queue_render());
+    area.connect_scale_factor_notify(gtk4::prelude::GLAreaExt::queue_render);
 }
 
 fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {

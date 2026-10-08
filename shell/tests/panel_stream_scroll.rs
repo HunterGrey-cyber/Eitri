@@ -1010,7 +1010,7 @@ fn run_one(config: Config, scenario: Scenario, replay: &Replay) -> Result<Value,
                             if let Err(e) = result {
                                 eprintln!("[panel_stream_scroll] a step's script failed: {e}");
                             }
-                        })
+                        });
                     }
                 }
                 step_index.set(i + 1);

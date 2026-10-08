@@ -59,35 +59,35 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
                 provider_session_id,
                 ..
             } => {
-                eprintln!("  SessionOpened   session_id={session_id} provider_session_id={provider_session_id}")
+                eprintln!("  SessionOpened   session_id={session_id} provider_session_id={provider_session_id}");
             }
             AgentDomainEvent::TurnStarted { turn_id } => eprintln!("  TurnStarted     turn_id={turn_id}"),
             AgentDomainEvent::ContentDelta { kind, text, .. } => {
                 eprintln!(
                     "  ContentDelta    {kind:?} {:?}",
                     text.chars().take(40).collect::<String>()
-                )
+                );
             }
             AgentDomainEvent::ToolCallStarted { name, tool_use_id, .. } => {
-                eprintln!("  ToolCallStarted {name} tool_use_id={tool_use_id}")
+                eprintln!("  ToolCallStarted {name} tool_use_id={tool_use_id}");
             }
             AgentDomainEvent::ToolCallCompleted {
                 tool_use_id, is_error, ..
             } => {
-                eprintln!("  ToolCallDone    tool_use_id={tool_use_id} is_error={is_error}")
+                eprintln!("  ToolCallDone    tool_use_id={tool_use_id} is_error={is_error}");
             }
             AgentDomainEvent::PermissionRequested {
                 permission_id,
                 tool_name,
                 ..
             } => {
-                eprintln!("  PermissionReq   {tool_name} permission_id={permission_id}")
+                eprintln!("  PermissionReq   {tool_name} permission_id={permission_id}");
             }
             AgentDomainEvent::PermissionResolved { permission_id, outcome } => {
-                eprintln!("  PermissionDone  permission_id={permission_id} {outcome:?}")
+                eprintln!("  PermissionDone  permission_id={permission_id} {outcome:?}");
             }
             AgentDomainEvent::TurnCompleted { turn_id, outcome, .. } => {
-                eprintln!("  TurnCompleted   turn_id={turn_id} {outcome:?}")
+                eprintln!("  TurnCompleted   turn_id={turn_id} {outcome:?}");
             }
             other => eprintln!("  {other:?}"),
         }

@@ -314,7 +314,7 @@ fn the_tap_sees_the_raw_stream() {
         colors: TerminalColors::default(),
         focused: true,
         tap: Some(Box::new(move |bytes: &[u8]| {
-            sink.lock().unwrap().extend_from_slice(bytes)
+            sink.lock().unwrap().extend_from_slice(bytes);
         })),
     });
     h.wait_for(WAIT, |h| h.exited.is_some());

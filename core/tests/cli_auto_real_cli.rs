@@ -224,7 +224,7 @@ fn the_clis_auto_mode_runs_ls_unasked_and_refuses_a_force_push() {
         println!(
             "[cli-auto] ls: Bash {id} {:?} -> {}",
             command_of(call),
-            completion(&events, id).map_or("never completed".to_string(), |c| c.to_string())
+            completion(&events, id).map_or("never completed".to_string(), ToString::to_string)
         );
     }
     let ls = bash_calls(&events)
@@ -268,7 +268,7 @@ fn the_clis_auto_mode_runs_ls_unasked_and_refuses_a_force_push() {
         }
         println!(
             "[cli-auto] force-push: result {}",
-            completion(&events, id).map_or("never completed".to_string(), |c| c.to_string())
+            completion(&events, id).map_or("never completed".to_string(), ToString::to_string)
         );
     }
     assert!(

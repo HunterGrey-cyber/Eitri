@@ -1889,7 +1889,7 @@ fn find_libwlroots() -> Option<PathBuf> {
     ]
     .iter()
     .filter_map(|dir| std::fs::read_dir(dir).ok())
-    .flat_map(|entries| entries.flatten())
+    .flat_map(Iterator::flatten)
     .map(|entry| entry.path())
     .find(|path| {
         path.file_name()
@@ -2047,7 +2047,7 @@ fn refusal_chain_self_test() {
                     println!(
                         "cursor_animation: refusal chain: headless and mapping {}: accepted",
                         library.display()
-                    )
+                    );
                 }
                 other => failures.push(format!(
                     "a headless wlroots fake (pid {pid}): expected Ok({pid}), got {other:?}"
@@ -2055,7 +2055,7 @@ fn refusal_chain_self_test() {
             }
         }
         None => {
-            println!("cursor_animation: refusal chain: no libwlroots on this machine; the positive control is skipped")
+            println!("cursor_animation: refusal chain: no libwlroots on this machine; the positive control is skipped");
         }
     }
 

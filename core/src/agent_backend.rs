@@ -191,7 +191,7 @@ impl BackendKind {
             // code. `NO_SIDECAR_HINT` names the way out (`eitri setup`) because starting the
             // sidecar path anyway is about to fail with that identical sentence.
             agent::SidecarAvailability::Missing => {
-                eprintln!("[agent_backend] using the sidecar backend: {}", agent::NO_SIDECAR_HINT)
+                eprintln!("[agent_backend] using the sidecar backend: {}", agent::NO_SIDECAR_HINT);
             }
         }
         Ok(BackendKind::Sidecar)
@@ -2760,7 +2760,7 @@ mod tests {
                     )
                 })
                 .collect();
-        let ids: Vec<String> = ["p1", "gone", "p2", "p3"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = ["p1", "gone", "p2", "p3"].iter().map(ToString::to_string).collect();
         let mut asked = Vec::new();
         let approved = approve_each(&ids, &pending, "test", |id| {
             asked.push(id.to_string());

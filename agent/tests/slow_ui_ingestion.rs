@@ -196,7 +196,7 @@ fn twenty_thousand_events_against_a_stalled_ui_do_not_accumulate_as_raw_events()
     );
     match (rss_before, rss_after) {
         (Some(before), Some(after)) => {
-            eprintln!("  RSS {before}KiB -> {after}KiB (+{}KiB)", after.saturating_sub(before))
+            eprintln!("  RSS {before}KiB -> {after}KiB (+{}KiB)", after.saturating_sub(before));
         }
         // Linux and macOS always read it (`process_probe`'s own tests insist); only another
         // platform reaches this, and it says so rather than printing a number.

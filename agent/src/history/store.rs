@@ -612,7 +612,7 @@ mod tests {
             "a recorded session's history must survive"
         );
         assert!(
-            history_path(&conversation_id, "sess-doomed").unwrap().exists() == false,
+            !history_path(&conversation_id, "sess-doomed").unwrap().exists(),
             "an orphaned history must be swept"
         );
         assert!(load(&conversation_id, "sess-new").is_ok());

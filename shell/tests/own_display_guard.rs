@@ -188,7 +188,7 @@ fn main() {
     // Nothing real can be reached or touched here, or this test does nothing at all.
     let tmp: Vec<String> = std::fs::read_dir("/tmp")
         .unwrap_or_else(|e| refuse(&format!("/tmp: {e}")))
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     if tmp != [marker(&token).trim_start_matches("/tmp/").to_string()] {
@@ -264,7 +264,7 @@ fn main() {
     }
     let entries: Vec<String> = std::fs::read_dir("/tmp/.X11-unix")
         .map(|dir| {
-            dir.filter_map(|e| e.ok())
+            dir.filter_map(Result::ok)
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect()
         })
@@ -278,7 +278,7 @@ fn main() {
     }
     let locks: Vec<String> = std::fs::read_dir("/tmp")
         .map(|dir| {
-            dir.filter_map(|e| e.ok())
+            dir.filter_map(Result::ok)
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .filter(|name| name.ends_with("-lock"))
                 .collect()
@@ -291,7 +291,7 @@ fn main() {
     // 2. The cookie: none of the desktop's is ever offered.
     match std::env::var_os("XAUTHORITY") {
         Some(path) if Path::new(&path) == cookie => {
-            failures.push("XAUTHORITY still names the inherited (desktop's) cookie".into())
+            failures.push("XAUTHORITY still names the inherited (desktop's) cookie".into());
         }
         Some(path) if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) => failures.push(format!(
             "XAUTHORITY names {}, which is not empty",

@@ -205,7 +205,7 @@ pub(crate) fn read_history_from(
                 continue;
             }
         };
-        if raw.iter().all(|b| b.is_ascii_whitespace()) {
+        if raw.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         let parsed = match std::str::from_utf8(&raw) {

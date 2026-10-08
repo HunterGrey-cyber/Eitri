@@ -6,8 +6,8 @@
 //! `eitri_core::tab_set::TabSet`; this module spawns the workers that set only holds receivers
 //! for, drains every tab on one 33 ms tick, and routes each inbound command to the tab it names --
 //! never to "the active one". Backend construction is lazy per tab: an empty
-//! tab starts its backend on its first `send_message` (or a `resume`). No mode goes into it (since
-//! 2026-09-27): every session is gated, and the tab's own mode is read where requests are answered,
+//! tab starts its backend on its first `send_message` (or a `resume`). No mode goes into it:
+//! every session is gated, and the tab's own mode is read where requests are answered,
 //! never sent to the CLI. Which backend gets built is `eitri_core::agent_backend`'s decision.
 //!
 //! **State is server-originated.** For the sidecar backend this module folds nothing of its own:
@@ -75,9 +75,8 @@ const HANDOFF_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_se
 /// anything: `shutdown()` issues `close_session`, a unary RPC bounded at `agent::UNARY_RPC_TIMEOUT`
 /// (agent/src/providers/claude_sidecar/mod.rs), and it is `SpawnedSidecar::drop` (close stdin, poll
 /// up to `agent::SIDECAR_EXIT_GRACE`, then SIGKILL) plus `RuntimeThread::drop` that end the child.
-/// 18 seconds covers that ~16 s worst case with a little room; a round of this branch's review
-/// found an earlier version deriving 15 from those same two numbers while reporting BEFORE the
-/// drop, so the escalation it was sized for sat outside the window it bounded.
+/// 18 seconds covers that ~16 s worst case with a little room. The bound must include the drop,
+/// because it is the step that escalates to stop the child process.
 ///
 /// **What expiring costs**, since it is a bound and not a guarantee: one line on stderr naming what
 /// is still outstanding, then the hold is released anyway, `Application::run` returns, and the
@@ -168,7 +167,7 @@ fn watched<T: 'static>(
                     }
                 }
                 CloseWatch::WorkerDied => {
-                    eprintln!("[agent_panel] {what}: its worker died without reporting")
+                    eprintln!("[agent_panel] {what}: its worker died without reporting");
                 }
                 CloseWatch::Expired => eprintln!(
                     "[agent_panel] {what} had still not finished {}s after the window closed; the \
@@ -217,9 +216,8 @@ impl ShutdownWatch {
 ///
 /// **One mechanism for every backend this panel shuts down itself**, which is the point of it
 /// being a function: `AgentPanelHandle::shutdown` has two such backends (the installed session,
-/// and one that finished connecting while the window was closing) and a review found the second
-/// still being torn down inline on the GTK main loop, 60 lines under a comment claiming that never
-/// happens. A comment true of one branch and false of its sibling is worse than none.
+/// and one that finished connecting while the window was closing). Both must be torn down on a
+/// worker rather than the GTK main loop.
 ///
 /// Why it may not happen inline: `AgentBackend::shutdown` stops ingestion first, and
 /// `ConversationIngest::stop` JOINS the ingestion thread, which since the resume-history branch
@@ -971,8 +969,7 @@ impl AgentPanelHandle {
     /// **this function** returns immediately and the process stays alive -- with no window on
     /// screen -- until the teardowns report or their backstops expire.
     ///
-    /// **Scoped to the panel, deliberately, because the previous two versions of this doc were not
-    /// and were false for it** (2026-09-21, the third time a review found it wrong). The
+    /// **Scoped to the panel deliberately:** the
     /// whole close handler does NOT return immediately: `main.rs`'s `connect_close_request` calls
     /// `pane.shutdown()` first, on the GTK thread, and that spins until nvim exits
     /// (`LiveHarness::shutdown` in the fork). So "the window disappears at once" is a claim about
@@ -1039,17 +1036,27 @@ impl AgentPanelHandle {
         ShutdownWatch { entries }
     }
 
-    /// Reloads the panel frontend while keeping the Rust session alive.
+    /// Reloads the panel's frontend from scratch, deliberately WITHOUT touching the session.
     ///
-    /// The frontend displays `AgentSessionProjection`. A new document sends `ready`, and the handler
-    /// responds with `hello` and a full snapshot to restore the view after a frontend or bridge failure.
-    /// Use `PageSurface::load_document` rather than `WebViewExt::reload()`: this document is loaded
-    /// from substitute data, with no fetchable URI, so reload() can leave the WebView blank.
+    /// The frontend is a pure view layer over `AgentSessionProjection`, which lives here in Rust --
+    /// so a WebView that has wedged (a frontend panic leaving a blank pane, a bridge that stopped
+    /// dispatching) can be thrown away and rebuilt while the real conversation keeps running. The
+    /// fresh document sends `ready` on mount, and `Ready`'s handler answers with `hello` plus a
+    /// snapshot of the still-live session, which rehydrates the replacement document.
     ///
-    /// `take_ui_delivery()` consumes events. Recovery therefore depends on the new document's full
-    /// snapshot from canonical state, including tool-call results from `serialize_snapshot_for_js`,
-    /// instead of replaying events that may have been consumed while the document was unavailable.
-    /// Keep the pump as the sole consumer and the snapshot complete to avoid losing visible state.
+    /// `PageSurface::load_document` (WebKit's `load_html`), NOT `WebViewExt::reload()`. The latter
+    /// reproducibly leaves this WebView permanently blank with zero further page activity, because the panel's document
+    /// is a substitute-data load rather than a fetchable URI -- so the recovery action would itself
+    /// be the wedge it exists to undo.
+    ///
+    /// **The invariant this rests on, stated because it is not obvious and a later change could
+    /// break it silently:** `take_ui_delivery()` CONSUMES events. Every envelope the 33ms pump
+    /// dispatches between this document load and the new document's own `ready` is therefore gone --
+    /// the old document is being torn down and the new one has no listener yet. Nothing is lost
+    /// only because `Ready`'s handler answers from canonical state with a full snapshot rather than
+    /// a replay, and `serialize_snapshot_for_js` already carries tool-call results. A pump that
+    /// ever stopped being the sole consumer, or a snapshot that stopped being complete, would turn
+    /// this into a quiet data-loss path with no test failing.
     pub(crate) fn reload_document(&self) {
         let Some(page) = &self.page else {
             eprintln!("[agent_panel] no panel document to reload: WebKit's sandbox cannot start here");
@@ -1554,7 +1561,7 @@ impl AgentPanelHandle {
 
     /// `prefix l`: the previously active tab.
     pub fn select_last(&self) -> bool {
-        self.switch_with(|tabs| tabs.select_last())
+        self.switch_with(eitri_core::tab_set::TabSet::select_last)
     }
 
     fn switch_with(&self, select: impl FnOnce(&mut eitri_core::tab_set::TabSet) -> Option<TabId>) -> bool {
@@ -1599,9 +1606,10 @@ impl AgentPanelHandle {
         self.dispatch(payload);
     }
 
-    /// `<leader>bo` asks for confirmation in the footer before closing all other tabs.
-    /// With only the active tab open, it dispatches nothing and shows no flash, like `prefix n`/`p`
-    /// with one tab. A command naming a nonexistent tab still flashes.
+    /// `<leader>bo`: the footer's y/n prompt over every tab but the active one.
+    /// Nothing to dispatch, and no flash, when the active tab is the only one open -- `<leader>bo`
+    /// with one tab is simply nothing to do, the same as `prefix n`/`p` with one tab (unlike a verb naming a tab that
+    /// does not exist, which flashes).
     pub fn confirm_close_others(&self) {
         if self.closing() {
             return;
@@ -2547,7 +2555,10 @@ fn finish_restore(state: &Rc<RefCell<AgentPanelState>>) {
         if let Some(run) = restore_run.as_mut() {
             run.forget_closed(|tab| tabs.get(tab).is_some());
         }
-        let outcome = state_ref.restore_run.as_ref().and_then(|run| run.outcome());
+        let outcome = state_ref
+            .restore_run
+            .as_ref()
+            .and_then(eitri_core::tab_restore::RestoreRun::outcome);
         outcome.map(|outcome| {
             state_ref.restore_run = None;
             outcome.message()
@@ -3051,7 +3062,7 @@ fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
         Some(t) => detail_rows(
             t,
             state.backend_kind,
-            agent::account::configured().map(|a| a.name()),
+            agent::account::configured().map(agent::account::ClaudeAccount::name),
             &state.project_dir,
             state
                 .rules_dir
@@ -3115,7 +3126,7 @@ fn detail_rows(
     const UNKNOWN: &str = "—";
     let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
     let backend = tab.live();
-    let provider_session_id = backend.and_then(|b| b.provider_session_id());
+    let provider_session_id = backend.and_then(AgentBackend::provider_session_id);
     let (model, cwd) = match backend {
         Some(b) => {
             let projection = b.projection();
@@ -3234,12 +3245,17 @@ fn spawn_connect_holding(
 /// `never_opened_message` below guesses for every other reason.
 const SIDECAR_STOPPED_MARKER: &str = "the connection to the provider ended before this session did";
 
-/// Builds the text shown by `report_sessions_that_never_opened` for a reason.
-/// Kept separate so it can be tested without a live tab.
-/// Most reasons indicate that the session never opened. A resumed sidecar session reports
-/// open only on its first new turn because AgentConversation does not replay SessionReady
-/// on attach. If the sidecar stops before that turn, the conversation and transcript may
-/// still exist. Give that reason its own message without guessing that the conversation is gone.
+/// The text `report_sessions_that_never_opened` shows for a `reason`. Split out so it can be
+/// tested without a live tab.
+///
+/// **Most `reason`s here mean the session never opened at all**, so the generic guess ("it most
+/// likely no longer exists") is right for them. **A resumed sidecar session is the exception**: it
+/// reports itself open only at its first new turn (`AgentConversation` never re-plays
+/// `SessionReady` on attach), so a sidecar that stops before that first turn lands here too even
+/// though the conversation and its transcript are completely fine -- the guess is simply wrong for
+/// it. `agent-ui/web/src/problems.ts`'s `classifySidecarStopped`/`failureEvidence` read this
+/// reason correctly on the panel side, so this wrapper gives a `reason` naming a stopped sidecar
+/// its own wording with no guess appended instead of folding it into the generic case.
 fn never_opened_message(reason: &str) -> String {
     if reason.contains(SIDECAR_STOPPED_MARKER) {
         format!("the agent sidecar stopped ({reason})")
@@ -3278,7 +3294,11 @@ fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, page:
             .tabs()
             .iter()
             .filter(|t| !t.reported_start_failure)
-            .filter_map(|t| t.live().and_then(|b| b.terminated_before_opening()).map(|r| (t.id, r)))
+            .filter_map(|t| {
+                t.live()
+                    .and_then(AgentBackend::terminated_before_opening)
+                    .map(|r| (t.id, r))
+            })
             .collect()
     };
     for (tab, reason) in failed {
@@ -4220,7 +4240,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         }
         InboundMessage::Interrupt { .. } => {
             let tab = tab_of(target);
-            let outcome = backend_for(&mut state.borrow_mut().tabs, tab).and_then(|backend| backend.interrupt());
+            let outcome = backend_for(&mut state.borrow_mut().tabs, tab).and_then(AgentBackend::interrupt);
             apply_command_outcome(state, page, tab, &request_id, outcome);
         }
         message @ InboundMessage::PermissionResponse { .. } => {
@@ -4723,9 +4743,9 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             }
         }
         InboundMessage::CloseOthers { .. } => {
-            // Recompute the tabs to close when `confirm_close_others` receives `y`, rather than
-            // trusting the set shown in the prompt. Call `close_tab` once per tab, using the same
-            // close path as confirming `prefix &`.
+            // `y` to `confirm_close_others`: recomputed fresh rather than
+            // trusting the set the prompt was shown with, then `close_tab` -- the same close path
+            // `prefix &`'s own `y` runs -- once per tab.
             let ids = state
                 .borrow()
                 .tabs
@@ -5049,7 +5069,7 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId)
     for step in eitri_core::tabs::close_steps(&facts) {
         match step {
             eitri_core::tabs::CloseStep::Interrupt => {
-                let interrupted = backend_for(&mut state.borrow_mut().tabs, tab).and_then(|b| b.interrupt());
+                let interrupted = backend_for(&mut state.borrow_mut().tabs, tab).and_then(AgentBackend::interrupt);
                 if let Err(e) = interrupted {
                     // The close goes on: the shutdown below ends the turn anyway.
                     eprintln!(
@@ -5182,8 +5202,8 @@ mod tests {
         );
     }
 
-    /// A stopped sidecar does not imply that the conversation or transcript no longer exists.
-    /// Keep its stop reason without adding the "most likely no longer exists" guess.
+    /// A `reason` naming a stopped sidecar must not carry the "most likely no longer
+    /// exists" guess, which is wrong for it -- the conversation and its transcript are fine.
     #[test]
     fn a_stopped_sidecar_reason_gets_no_never_opened_guess() {
         let reason = format!(
@@ -5208,9 +5228,9 @@ mod tests {
         assert!(message.contains("start a new session instead"), "{message}");
     }
 
-    /// GUI pass, 2026-09-25: every `y` in the panel (a row, a code block, the handoff command, the
-    /// `prefix i` popover's line) calls `navigator.clipboard.writeText`, and none of them ever
-    /// reached the clipboard. `load_html(.., None)` gives the document an opaque origin, which is not
+    /// Every `y` in the panel (a row, a code block, the handoff command, the `prefix i` popover's
+    /// line) calls `navigator.clipboard.writeText`, and none of them can reach the clipboard.
+    /// `load_html(.., None)` gives the document an opaque origin, which is not
     /// a secure context, so WebKitGTK 2.52.6 has no `navigator.clipboard` and the optional chain
     /// did nothing. Measured in the sandbox with a bare WebKitGTK view: base `None`, nothing copied;
     /// base `https://eitri.invalid/`, `wl-paste` printed the text. Every `load_html` here must
@@ -5294,9 +5314,10 @@ mod tests {
         let (other_provider, backend) = live_backend(&dir);
         set.get_mut(other).unwrap().backend = TabBackend::Live(backend);
         assert_eq!(set.active(), other, "the user has switched away");
-        // `perm-1` must be pending on the asking tab because a conversation refuses unsolicited answers.
-        // Use a Write to `.git/main.rs` so the pump leaves a permission card. An ordinary in-project
-        // Write takes the acceptEdits fast path and would not produce the card this test needs.
+        // `perm-1` must really be pending on the asking tab: a conversation refuses an answer to a
+        // permission it never asked for. A `Write` needs a human, so the pump leaves it a card --
+        // `.git/main.rs` rather than plain `main.rs`:
+        // an ordinary in-project `Write` no longer cards at all under the acceptEdits fast path.
         asking_provider.queue(agent::AgentDomainEvent::PermissionRequested {
             permission_id: "perm-1".into(),
             tool_use_id: None,
@@ -5534,10 +5555,10 @@ mod tests {
             self.inner.is_visible()
         }
         fn load_document(&self, html: &str, base_uri: &str) {
-            self.inner.load_document(html, base_uri)
+            self.inner.load_document(html, base_uri);
         }
         fn set_background(&self, rgb: [u8; 3]) {
-            self.inner.set_background(rgb)
+            self.inner.set_background(rgb);
         }
     }
 
@@ -7052,9 +7073,12 @@ mod tests {
         }
     }
 
-    /// Checks each close-watch tick's result and ordering without opening a window.
-    /// This does not exercise `AgentPanelHandle::shutdown`, the application hold or GTK's
-    /// window destruction; those behaviors need GUI verification.
+    /// What each tick of the close watch decides, including the two orderings that are judgements
+    /// rather than mechanics.
+    ///
+    /// This is the whole of what `shell`'s own suite can say about the close path: it cannot open a
+    /// window, so it cannot exercise `AgentPanelHandle::shutdown`, the application hold, or GTK's
+    /// window destruction. What a test can pin is that no tick misreports what it saw.
     #[test]
     fn a_close_watch_tick_reports_what_it_saw() {
         // Still running, still inside the backstop: the application stays held.
@@ -7665,7 +7689,7 @@ mod tests {
             .tabs
             .tabs()
             .iter()
-            .map(|t| t.provider_session_id())
+            .map(eitri_core::tab_set::Tab::provider_session_id)
             .collect();
         assert_eq!(numbers, ["s-1", "s-2", "s-3"].map(|s| Some(s.to_string())));
         drop(resumes.leases);

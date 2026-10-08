@@ -582,7 +582,7 @@ impl Harness {
             if let Some(reply) = self.posted_type("hint_targets") {
                 let count = reply
                     .get("count")
-                    .and_then(|c| c.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .ok_or("hint_targets carried no count")?;
                 return Ok((session, count as usize));
             }
@@ -869,7 +869,7 @@ fn w0_keys_reach_the_page(h: &Harness) -> Result<(), String> {
             log.iter().any(|e| {
                 e.get("type").and_then(|t| t.as_str()) == Some("keydown")
                     && e.get("key").and_then(|k| k.as_str()) == Some("Shift")
-                    && e.get("trusted").and_then(|t| t.as_bool()) == Some(true)
+                    && e.get("trusted").and_then(serde_json::Value::as_bool) == Some(true)
             })
         })
         .unwrap_or(false);
@@ -1133,7 +1133,7 @@ fn w6_tall_tool_output(h: &Harness) -> Result<(), String> {
     let start = h.eval(start_probe, 1000)?;
     let start_line = start
         .get("line")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| format!("W6: V did not start on the tool row's invocation or an output line: {start}"))?;
     println!("[panel_visual_mode] W6: V started on {start}");
     let caret_probe = r#"(() => {
@@ -1162,7 +1162,7 @@ fn w6_tall_tool_output(h: &Harness) -> Result<(), String> {
     for step in 1..=40 {
         h.xdotool_key("j");
         let result = h.eval(caret_probe, 1000)?;
-        if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        if result.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(format!("W6: caret left the visible box/list after j #{step}: {result}"));
         }
     }
@@ -1353,8 +1353,8 @@ fn w7_permission_card(h: &Harness) -> Result<(), String> {
         1000,
     )?;
     let (Some(x), Some(y)) = (
-        rect.get("x").and_then(|v| v.as_f64()),
-        rect.get("y").and_then(|v| v.as_f64()),
+        rect.get("x").and_then(serde_json::Value::as_f64),
+        rect.get("y").and_then(serde_json::Value::as_f64),
     ) else {
         return Err(format!("W7: could not read the reason box's rect: {rect}"));
     };
@@ -1460,12 +1460,12 @@ fn w9_streaming(h: &Harness) -> Result<(), String> {
             "JSON.stringify({ sameAnchor: window.getSelection().anchorNode === window.__w9AnchorNode, sameNode: (() => { const rows = document.querySelectorAll('.row-assistant'); return (rows[rows.length - 1] ?? null) === window.__w9ReplyNode; })() })",
             500,
         )?;
-        if identity.get("sameAnchor").and_then(|v| v.as_bool()) != Some(true) {
+        if identity.get("sameAnchor").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(format!(
                 "W9: the selection's own anchor moved after delta #{i}: {identity}"
             ));
         }
-        if identity.get("sameNode").and_then(|v| v.as_bool()) != Some(true) {
+        if identity.get("sameNode").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(format!(
                 "W9: the reply's own DOM node was replaced (not merely extended) after delta #{i}: {identity}"
             ));
@@ -1786,7 +1786,7 @@ fn view_info(h: &Harness) -> Result<serde_json::Value, String> {
 }
 
 fn num(v: &serde_json::Value, k: &str) -> f64 {
-    v.get(k).and_then(|x| x.as_f64()).unwrap_or(f64::NAN)
+    v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(f64::NAN)
 }
 
 /// Each key scrolls only enough to show the caret and reports any scroll to `follow.ts`. On the
@@ -1845,7 +1845,7 @@ fn w11_caret_view(h: &Harness) -> Result<(), String> {
     if after_40
         .get("said")
         .and_then(|s| s.as_array())
-        .is_none_or(|a| a.is_empty())
+        .is_none_or(Vec::is_empty)
     {
         return Err(format!(
             "W11 view: 40j scrolled the list but announced nothing (follow.ts never learns): {after_40}"

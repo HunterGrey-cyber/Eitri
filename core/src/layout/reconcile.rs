@@ -320,11 +320,17 @@ mod tests {
             placement: Placement::RightOfRoot,
         };
         let kept = row(saved(), leaf(side.id.clone()));
-        let r = reconcile(kept.clone(), &BTreeSet::new(), Some(&editor()), &[side.clone()]).unwrap();
+        let r = reconcile(
+            kept.clone(),
+            &BTreeSet::new(),
+            Some(&editor()),
+            std::slice::from_ref(&side),
+        )
+        .unwrap();
         assert_eq!(r.layout.root(), &kept);
         assert!(r.notes.is_empty());
 
-        let r = reconcile(saved(), &BTreeSet::new(), Some(&editor()), &[side.clone()]).unwrap();
+        let r = reconcile(saved(), &BTreeSet::new(), Some(&editor()), std::slice::from_ref(&side)).unwrap();
         assert_eq!(
             r.layout.root(),
             &Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, saved(), leaf(side.id.clone()))
@@ -335,7 +341,7 @@ mod tests {
             id: ModuleId::lua("main"),
             placement: Placement::InPlaceOfEditor,
         };
-        let r = reconcile(saved(), &BTreeSet::new(), Some(&editor()), &[main.clone()]).unwrap();
+        let r = reconcile(saved(), &BTreeSet::new(), Some(&editor()), std::slice::from_ref(&main)).unwrap();
         assert!(r.layout.hidden().contains(&editor()));
         assert_eq!(
             r.layout.focus(),

@@ -1015,7 +1015,7 @@ mod tests {
             "the render node is open"
         );
         CREATED.with(|c| c.set(c.get() + 1));
-        if CREATE_RETURNS_NULL.with(|n| n.get()) {
+        if CREATE_RETURNS_NULL.with(std::cell::Cell::get) {
             std::ptr::null_mut()
         } else {
             std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
@@ -1051,7 +1051,11 @@ mod tests {
                 .expect_err("a missing function fails");
             assert!(err.contains(&*missing.to_string_lossy()), "{err}");
         }
-        assert_eq!(CREATED.with(|c| c.get()), 0, "no device was created, so none leaked");
+        assert_eq!(
+            CREATED.with(std::cell::Cell::get),
+            0,
+            "no device was created, so none leaked"
+        );
     }
 
     #[test]
@@ -1060,16 +1064,22 @@ mod tests {
         let gbm =
             unsafe { Gbm::open_from(fake_libgbm(c"gbm_bo_create_with_modifiers2"), c"/dev/null") }.expect("opens");
         assert!(gbm.fns.bo_create_with_modifiers2.is_none());
-        assert_eq!((CREATED.with(|c| c.get()), DESTROYED.with(|c| c.get())), (1, 0));
+        assert_eq!(
+            (CREATED.with(std::cell::Cell::get), DESTROYED.with(std::cell::Cell::get)),
+            (1, 0)
+        );
         drop(gbm);
-        assert_eq!(DESTROYED.with(|c| c.get()), 1);
+        assert_eq!(DESTROYED.with(std::cell::Cell::get), 1);
 
         CREATE_RETURNS_NULL.with(|n| n.set(true));
         let err = unsafe { Gbm::open_from(fake_libgbm(c"none"), c"/dev/null") }
             .map(|_| ())
             .expect_err("no device");
         assert_eq!(err, "gbm_create_device failed");
-        assert_eq!((CREATED.with(|c| c.get()), DESTROYED.with(|c| c.get())), (2, 1));
+        assert_eq!(
+            (CREATED.with(std::cell::Cell::get), DESTROYED.with(std::cell::Cell::get)),
+            (2, 1)
+        );
     }
 
     /// A pipe stands in for a dmabuf fd: its read end sees EOF exactly when every copy of the

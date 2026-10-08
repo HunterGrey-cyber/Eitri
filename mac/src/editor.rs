@@ -111,17 +111,17 @@ impl Editor {
         let mut feeds = EditorFeeds::new();
         let attached = Rc::new(Cell::new(false));
         let (source, reset_context): (ContextSource, Rc<dyn Fn()>) =
-            match context_feed.as_mut().and_then(|feed| feed.take_listener()) {
+            match context_feed.as_mut().and_then(EditorContextFeed::take_listener) {
                 Some(listener) => feeds.add_context(EditorContextReader::new(listener), scratch_path.clone(), now),
                 None => (Rc::new(|| None), Rc::new(|| {})),
             };
-        if let Some(listener) = theme_feed.as_mut().and_then(|feed| feed.take_listener()) {
+        if let Some(listener) = theme_feed.as_mut().and_then(ThemeFeed::take_listener) {
             feeds.add_theme(ThemePayloadReader::new(listener), now);
         }
-        if let Some(listener) = keys_feed.as_mut().and_then(|feed| feed.take_listener()) {
+        if let Some(listener) = keys_feed.as_mut().and_then(NvimKeysFeed::take_listener) {
             feeds.add_keys(NvimKeysReader::new(listener), now);
         }
-        if let Some(listener) = pane_switch.as_mut().and_then(|channel| channel.take_listener()) {
+        if let Some(listener) = pane_switch.as_mut().and_then(PaneSwitchChannel::take_listener) {
             feeds.add_pane_switch(PaneSwitchReader::new(listener), now);
         }
         Ok(Editor {
@@ -308,10 +308,10 @@ mod tests {
     fn shutdown_removes_its_directories() {
         let editor = editor();
         let sockets = [
-            editor.theme_feed.as_ref().map(|feed| feed.socket_path()),
-            editor.keys_feed.as_ref().map(|feed| feed.socket_path()),
-            editor.context_feed.as_ref().map(|feed| feed.socket_path()),
-            editor.pane_switch.as_ref().map(|channel| channel.socket_path()),
+            editor.theme_feed.as_ref().map(ThemeFeed::socket_path),
+            editor.keys_feed.as_ref().map(NvimKeysFeed::socket_path),
+            editor.context_feed.as_ref().map(EditorContextFeed::socket_path),
+            editor.pane_switch.as_ref().map(PaneSwitchChannel::socket_path),
         ];
         let mut gone = Vec::new();
         for socket in sockets {

@@ -142,7 +142,7 @@ mod tests {
         PathBuf::from("/home/user/project")
     }
     fn texts(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(ToString::to_string).collect()
     }
 
     #[test]

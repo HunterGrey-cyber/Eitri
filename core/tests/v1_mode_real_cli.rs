@@ -631,7 +631,7 @@ fn effects_turn(
     let mut events = Vec::new();
     drive_turn(set, dir, tab, prompt, label, |set, new| {
         trace.observe(set, tab, new);
-        events.extend(new.iter().cloned())
+        events.extend(new.iter().cloned());
     });
     events
 }
@@ -2181,7 +2181,7 @@ fn bypass_approves_the_ask_rule_card(label: &str, ask_rule: &str) {
     assert_eq!(plan.lines.len(), 1, "no card stays waiting: {:?}", plan.lines);
     match set.confirm_bypass(plan.scope, plan.nonce).unwrap() {
         ConfirmOutcome::Entered { approved, .. } => {
-            assert_eq!(approved, plan.approve.len(), "every listed card was approved")
+            assert_eq!(approved, plan.approve.len(), "every listed card was approved");
         }
         other => panic!("expected Entered, got {other:?}"),
     }

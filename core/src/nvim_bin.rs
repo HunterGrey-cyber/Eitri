@@ -343,13 +343,10 @@ fn version_of_binary(path: &Path) -> Option<(u64, u64, u64)> {
         let _ = tx.send(buf);
     });
 
-    let stdout_bytes = match rx.recv_timeout(VERSION_PROBE_TIMEOUT) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
+    let Ok(stdout_bytes) = rx.recv_timeout(VERSION_PROBE_TIMEOUT) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
     };
 
     let _ = child.kill();
@@ -376,7 +373,7 @@ pub fn resolve() -> Result<Choice, String> {
     decide(
         nvim_override.as_deref(),
         inherited.as_deref(),
-        |p| p.is_file(),
+        Path::is_file,
         path_nvim.as_deref(),
         &private_candidates,
         version_of_binary,

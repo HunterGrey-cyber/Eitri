@@ -1753,7 +1753,7 @@ fn build_ui(
                      nvim's exit retires the editor only"
                 ),
                 editor_quit::Cancel::Ignored => {
-                    println!("[modules] editor: a quit-cancelled letter for quit {g}, not the one in flight; ignored")
+                    println!("[modules] editor: a quit-cancelled letter for quit {g}, not the one in flight; ignored");
                 }
             },
         });
@@ -1885,13 +1885,13 @@ fn build_ui(
         let review_for_exit = agent_panel_handle.clone();
         pane.on_exited_unrequested(move || {
             review_for_exit.review_editor_lost();
-            editor_quitting_for_exit.nvim_exited()
+            editor_quitting_for_exit.nvim_exited();
         });
         let editor_quitting = editor_quitting.clone();
         let review_for_unreachable = agent_panel_handle.clone();
         pane.on_nvim_unreachable(move || {
             review_for_unreachable.review_editor_lost();
-            editor_quitting.nvim_unreachable()
+            editor_quitting.nvim_unreachable();
         });
     }
 

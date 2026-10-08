@@ -1128,9 +1128,8 @@ impl TabSet {
         let plan = self.pending_bypass.take().expect("checked above");
         match scope {
             BypassScope::Tab(id) => {
-                let at = match self.tabs.iter().position(|t| t.id == id) {
-                    Some(at) => at,
-                    None => return Err(format!("no tab {}", id.0)),
+                let Some(at) = self.tabs.iter().position(|t| t.id == id) else {
+                    return Err(format!("no tab {}", id.0));
                 };
                 if id != self.active {
                     return Err(format!("tab {} is not the one on screen", self.tabs[at].number));
@@ -1465,7 +1464,7 @@ impl TabSet {
     /// Every Claude session this window has open or just handed off: filtered out of `hello`
     /// and of the chooser's records.
     pub fn open_session_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.tabs.iter().filter_map(|t| t.provider_session_id()).collect();
+        let mut ids: Vec<String> = self.tabs.iter().filter_map(Tab::provider_session_id).collect();
         ids.extend(
             self.tabs
                 .iter()
@@ -1681,7 +1680,7 @@ impl TabSet {
                             }
                             // The session ended: its queue waits for `r`, not a flush.
                             AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
-                                tab.was_running = false
+                                tab.was_running = false;
                             }
                             // `Tab::mode` is authoritative; provider reports do not change it. A `PermissionModeChanged`
                             // that reaches here names `default`; other modes became `UngatedCliMode` above.
@@ -6854,7 +6853,7 @@ mod tests {
                     .unwrap()
                     .turn_trace
                     .as_ref()
-                    .is_some_and(|t| t.is_finished())
+                    .is_some_and(crate::turn_trace::TurnTrace::is_finished)
         });
         let trace = set.get(background).unwrap().turn_trace.as_ref().unwrap();
         assert!(trace.line().contains("first_paint_frame=bg"), "{}", trace.line());

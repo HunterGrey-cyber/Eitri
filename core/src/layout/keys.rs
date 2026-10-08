@@ -266,7 +266,7 @@ pub fn strip_direct(keys: &ModuleKeys, keymap: &Keymap, layout: &Layout) -> Vec<
             let mut direct: Vec<String> = keymap
                 .keys_for(&Action::Module(module.clone()))
                 .iter()
-                .map(|k| k.to_string())
+                .map(ToString::to_string)
                 .collect();
             if module.kind() == ModuleKind::LuaWebview && !direct.contains(&key.to_string()) {
                 direct.push(key.to_string());

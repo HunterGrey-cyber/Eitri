@@ -146,7 +146,7 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "executable_host_cli",
     ]
     .iter()
-    .map(|s| s.to_string())
+    .map(ToString::to_string)
     .collect();
     // Compare capability order and length as well as membership to catch changes to
     // the sidecar's literal list.

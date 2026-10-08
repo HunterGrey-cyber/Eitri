@@ -69,7 +69,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                     detail: "SessionReady".to_string(),
                 }),
                 CliModeReport::Auto | CliModeReport::AutoUnavailable => {
-                    out.push(AgentDomainEvent::CliPermissionMode { reported })
+                    out.push(AgentDomainEvent::CliPermissionMode { reported });
                 }
                 CliModeReport::Default | CliModeReport::Stricter | CliModeReport::Unreported => {}
             }

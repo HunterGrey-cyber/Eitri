@@ -106,7 +106,7 @@ pub fn resolve(choice: WmChoice, env: &dyn Fn(&str) -> Option<OsString>) -> Wm {
 }
 
 fn argv(parts: &[&str]) -> Option<Vec<String>> {
-    Some(parts.iter().map(|s| s.to_string()).collect())
+    Some(parts.iter().map(ToString::to_string).collect())
 }
 
 pub fn move_focus_argv(wm: Wm, dir: Direction) -> Option<Vec<String>> {
@@ -165,7 +165,7 @@ pub fn focus_window_argv(wm: Wm, target: &WindowRef) -> Option<Vec<String>> {
         Wm::Niri => target.id.map(|id| {
             ["niri", "msg", "action", "focus-window", "--id"]
                 .iter()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .chain(std::iter::once(id.to_string()))
                 .collect()
         }),
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn every_direction_builds_the_documented_argv_per_wm() {
-        let v = |parts: &[&str]| Some(parts.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let v = |parts: &[&str]| Some(parts.iter().map(ToString::to_string).collect::<Vec<_>>());
         let dirs = [Direction::Left, Direction::Right, Direction::Up, Direction::Down];
         let hypr = ["l", "r", "u", "d"];
         let sway = ["left", "right", "up", "down"];

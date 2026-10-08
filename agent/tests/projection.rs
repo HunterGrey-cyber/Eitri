@@ -707,7 +707,7 @@ fn session_unavailable_and_session_closed_set_distinct_statuses() {
 #[test]
 fn every_apply_call_bumps_last_revision_by_exactly_one() {
     let mut projection = AgentSessionProjection::default();
-    let events = vec![
+    let events = [
         AgentDomainEvent::SessionOpened {
             session_id: "s".into(),
             provider_session_id: "p".into(),

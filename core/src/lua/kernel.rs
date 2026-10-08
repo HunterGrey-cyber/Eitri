@@ -1,6 +1,6 @@
 //! The Lua extension kernel without a toolkit: the `mlua` state, the `require` sandbox that resolves
 //! only under `<config dir>/lua/`, and the command, event, config, layout and keymap stores behind
-//! `eitri.*`.
+//! `eitri.*`, a Lua runtime that remains separate from Neovim's own.
 //! A host decides what `eitri.panel.register` does by passing an installer to [`Kernel::new`]: `shell`
 //! builds a WebKitGTK view, a host with no Lua panels passes [`refuse_panels`].
 

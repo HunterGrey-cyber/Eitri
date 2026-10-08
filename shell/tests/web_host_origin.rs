@@ -121,7 +121,8 @@ fn run() -> Result<Vec<String>, String> {
         origin.y()
     ));
 
-    let children: Vec<gtk4::Widget> = std::iter::successors(host.first_child(), |c| c.next_sibling()).collect();
+    let children: Vec<gtk4::Widget> =
+        std::iter::successors(host.first_child(), gtk4::prelude::WidgetExt::next_sibling).collect();
     if children.len() != 1 || children[0] != content.clone().upcast::<gtk4::Widget>() {
         return Err(format!(
             "the host has {} children, not exactly its content",

@@ -107,18 +107,18 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
                 model,
                 ..
             } => {
-                eprintln!("  SessionOpened   provider_session_id={provider_session_id} model={model}")
+                eprintln!("  SessionOpened   provider_session_id={provider_session_id} model={model}");
             }
             AgentDomainEvent::ContentDelta { text, .. } => {
-                eprintln!("  ContentDelta    {:?}", text.chars().take(60).collect::<String>())
+                eprintln!("  ContentDelta    {:?}", text.chars().take(60).collect::<String>());
             }
             AgentDomainEvent::ToolCallStarted { name, tool_use_id, .. } => {
-                eprintln!("  ToolCallStarted {name} tool_use_id={tool_use_id}")
+                eprintln!("  ToolCallStarted {name} tool_use_id={tool_use_id}");
             }
             AgentDomainEvent::ToolCallCompleted {
                 tool_use_id, is_error, ..
             } => {
-                eprintln!("  ToolCallDone    tool_use_id={tool_use_id} is_error={is_error}")
+                eprintln!("  ToolCallDone    tool_use_id={tool_use_id} is_error={is_error}");
             }
             AgentDomainEvent::TurnCompleted { outcome, .. } => eprintln!("  TurnCompleted   {outcome:?}"),
             other => eprintln!("  {other:?}"),

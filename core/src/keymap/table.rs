@@ -208,7 +208,7 @@ fn default_bindings() -> Vec<Binding> {
             action,
             repeatable,
             source: Source::Default,
-        })
+        });
     };
     let arrows = [
         ("Up", Direction::Up),
@@ -365,7 +365,7 @@ impl Keymap {
                 import.skipped.push(Skipped {
                     origin: origin.clone(),
                     reason,
-                })
+                });
             };
             match step {
                 Step::Prefix(key) => {

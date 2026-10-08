@@ -1941,7 +1941,7 @@ pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView], defau
                 "name": t.name,
                 "state": t.state.as_str(),
                 "mode": t.mode.as_str(),
-                "marker": t.marker.map(|m| m.wire()),
+                "marker": t.marker.map(crate::tabs::Marker::wire),
                 "pending": t.pending,
                 "resumable": t.resumable,
                 "failure": t.failure,
@@ -1999,7 +1999,7 @@ pub fn serialize_chooser_for_js(open: &[ChooserTab], records: &[ChooserRecord]) 
         .iter()
         .map(|t| {
             json!({
-                "tab": t.tab.0, "label": t.label, "marker": t.marker.map(|m| m.wire()),
+                "tab": t.tab.0, "label": t.label, "marker": t.marker.map(crate::tabs::Marker::wire),
                 "pending": t.pending, "resumable": t.resumable,
             })
         })
@@ -3441,7 +3441,7 @@ mod tests {
                      reason: Option<&str>,
                      status: Option<u32>,
                      errors: &[&str]| {
-            let errors: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+            let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
             AgentDomainEvent::TurnCompleted {
                 turn_id: "t1".into(),
                 outcome,
@@ -5406,7 +5406,7 @@ mod tests {
                         added: vec!["a".into()],
                         removed: vec![],
                         changed: vec![],
-                    })
+                    });
                 }),
             ),
             ("value", Box::new(|v| v.items[0].value.push('!'))),

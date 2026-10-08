@@ -1362,7 +1362,7 @@ mod tests {
                 // actually has, not hidden by a fixture that always includes it.
             ]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect(),
             configuration_profiles: vec!["native".into(), "isolated".into()],
             permission_modes: vec!["interactive".into(), "verdandi_rules".into(), "bypass".into()],

@@ -429,7 +429,10 @@ mod tests {
         let fish = PathBuf::from("/usr/bin/fish");
         let zsh = PathBuf::from("/usr/bin/zsh");
         let sh = PathBuf::from("/bin/sh");
-        assert_eq!(fallback_shell(&[fish.clone()], Some(zsh.clone())), Some(zsh.clone()));
+        assert_eq!(
+            fallback_shell(std::slice::from_ref(&fish), Some(zsh.clone())),
+            Some(zsh.clone())
+        );
         assert_eq!(
             fallback_shell(&[fish.clone(), zsh.clone()], Some(zsh.clone())),
             Some(sh.clone())
@@ -439,7 +442,7 @@ mod tests {
             None
         );
         assert_eq!(
-            fallback_shell(&[zsh.clone()], Some(zsh.clone())),
+            fallback_shell(std::slice::from_ref(&zsh), Some(zsh.clone())),
             Some(sh.clone()),
             "$SHELL was the passwd shell"
         );

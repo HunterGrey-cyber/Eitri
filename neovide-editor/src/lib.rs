@@ -647,7 +647,7 @@ fn run_detached(job: Job, spawn: impl FnOnce(Job) -> std::io::Result<()>) -> boo
     let slot = Arc::new(std::sync::Mutex::new(Some(job)));
     let theirs = slot.clone();
     let spawned = spawn(Box::new(move || {
-        let job = theirs.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let job = theirs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(job) = job {
             job();
         }
@@ -656,7 +656,7 @@ fn run_detached(job: Job, spawn: impl FnOnce(Job) -> std::io::Result<()>) -> boo
         Ok(()) => true,
         Err(err) => {
             eprintln!("[live] could not start a thread ({err}); running its job here instead");
-            let job = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
             if let Some(job) = job {
                 job();
             }
@@ -691,7 +691,7 @@ fn ask_nvim_for_its_pid(harness: &LiveHarness, process: &Arc<nvim_child::NvimPro
                 Some(pid) if process.learn(pid) => println!("[live] nvim is pid {pid} (its own answer)"),
                 Some(pid) => println!("[live] nvim answered pid {pid}, which is not a live nvim --embed; not held"),
                 None => {
-                    println!("[live] nvim did not answer getpid(); a forced kill falls back to what the fork started")
+                    println!("[live] nvim did not answer getpid(); a forced kill falls back to what the fork started");
                 }
             }
         });
@@ -1160,7 +1160,7 @@ impl NeovideEditorPane {
                 // into it, with no intermediate and no copy. Otherwise `GtkGLArea`'s.
                 let own_buffer = widget
                     .downcast_ref::<editor_area::EditorGlArea>()
-                    .is_some_and(|area| area.draws_into_own_buffer());
+                    .is_some_and(editor_area::EditorGlArea::draws_into_own_buffer);
                 state.ensure_gtk_surface(own_buffer);
                 state.ensure_render_surface(own_buffer);
 
@@ -1769,7 +1769,7 @@ impl NeovideEditorPane {
     pub fn draws_into_own_buffers(&self) -> bool {
         self.widget
             .downcast_ref::<editor_area::EditorGlArea>()
-            .is_some_and(|area| area.draws_into_own_buffer())
+            .is_some_and(editor_area::EditorGlArea::draws_into_own_buffer)
     }
 
     /// How many frames went through each presentation path, and how often the own-buffer path
@@ -1778,7 +1778,7 @@ impl NeovideEditorPane {
     pub fn presentation_counts(&self) -> PresentationCounts {
         self.widget
             .downcast_ref::<editor_area::EditorGlArea>()
-            .map(|area| area.presentation_counts())
+            .map(editor_area::EditorGlArea::presentation_counts)
             .unwrap_or_default()
     }
 
@@ -1965,7 +1965,7 @@ impl NeovideEditorPane {
                 let field = |name: &str| pairs.iter().find(|(k, _)| k.as_str() == Some(name)).map(|(_, v)| v);
                 Some((
                     field("mode").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                    field("blocking").and_then(|v| v.as_bool()).unwrap_or(false),
+                    field("blocking").and_then(rmpv::Value::as_bool).unwrap_or(false),
                 ))
             }
         };
@@ -2240,7 +2240,7 @@ mod tests {
         );
         let _serial = crate::DEFAULT_CONTEXT_TEST_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()

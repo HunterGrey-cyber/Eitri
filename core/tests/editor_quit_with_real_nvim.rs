@@ -391,7 +391,7 @@ fn a_cancelled_window_close_keeps_the_unsaved_buffer_and_its_swap_file() {
         ],
     );
     client.request("nvim_command", vec![Value::from("preserve")]);
-    let swap_files = || std::fs::read_dir(&swap).map(|dir| dir.count()).unwrap_or(0);
+    let swap_files = || std::fs::read_dir(&swap).map(std::iter::Iterator::count).unwrap_or(0);
     assert_eq!(swap_files(), 1, "the control: the modified buffer has a swap file");
 
     client.send_quit(9);

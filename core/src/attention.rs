@@ -80,7 +80,7 @@ impl AttentionTracker {
                 }
                 AgentDomainEvent::TurnCompleted { .. } if !on_screen => self.unread = true,
                 AgentDomainEvent::SessionUnavailable { .. } | AgentDomainEvent::SessionClosed { .. } => {
-                    self.session_ended(on_screen)
+                    self.session_ended(on_screen);
                 }
                 _ => {}
             }

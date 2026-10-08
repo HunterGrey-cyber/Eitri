@@ -301,17 +301,35 @@ fn panel_content_security_policy() -> &'static str {
 /// the CSP is.
 const PANEL_NETWORK_PROXY_URI: &str = "http://127.0.0.1:9";
 
-/// Installs `app.reload-agent-panel` for the top bar's reload button and `prefix r`.
-/// The action lives outside the WebView so a wedged page can be recovered without
-/// closing the editor, nvim child and agent session. It binds no accelerator.
+/// Installs `app.reload-agent-panel`, which the top bar's `↻` and `prefix r`
+/// fire, for the panel `handle` owns.
 ///
-/// `main.rs` registers the action before building the top bar. Late registration and
-/// button sensitivity have not been tested here.
+/// The affordance deliberately lives OUTSIDE the WebView. A reload button drawn by the panel's own
+/// page would be drawn by the very thing that has stopped responding -- missing exactly when it is
+/// needed -- and until now a wedged panel could only be recovered by closing the window, which also
+/// takes the editor, the nvim child and the agent session with it.
 ///
-/// The action is application-wide but the handle belongs to one window. A second window
-/// in the same process would replace the action and redirect the first window's reload
-/// button to the second panel. `ApplicationFlags::NON_UNIQUE` gives each launch its own
-/// process, avoiding this case.
+/// It binds no accelerator: `Ctrl+Shift+R` was removed with every other `Ctrl+Shift` chord.
+///
+/// **Not verified, and stated here so nobody reads a constraint into the call site:** `main.rs`
+/// calls this before building the top bar, whose `⟳` button is a `GtkActionable` pointed at this
+/// action. An earlier version of this comment claimed the order was load-bearing -- that a button
+/// pointed at an action that does not exist yet renders permanently insensitive. That claim was
+/// never tested here, and upstream GTK4's own `gtk/gtkactionhelper.c` appears to contradict it:
+/// `GtkActionHelper` implements `GtkActionObserver` (`action_added`, `action_removed`,
+/// `action_enabled_changed`) and calls `gtk_widget_set_sensitive` when an action appears. That is
+/// read from the GNOME repository's `main`, not from the GTK actually installed here, and it is not
+/// the same thing as having watched a late-registered action light the button up. So the ordering
+/// is most likely free, on documentary evidence rather than observation. It is kept as it is because it is the conservative one, not
+/// because anything in this repository has demonstrated that the other order breaks. Whether the
+/// button is in fact sensitive on screen still needs an interactive check.
+///
+/// **Known limitation while `shell` can still run two windows in one process:** the action is
+/// process-global (`app.add_action`) and this handle is per-window, so a second `activate` running
+/// `build_ui` again silently REPLACES the first window's action -- after which window 1's `⟳` and
+/// Ctrl+Shift+R reload window 2's panel. `ApplicationFlags::NON_UNIQUE`
+/// makes that unreachable by giving each launch its own process, so this only matters if a second
+/// window is ever hosted in one process again.
 pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle) {
     let action = gtk4::gio::SimpleAction::new("reload-agent-panel", None);
     // Cloned because the caller still needs its own handle afterwards -- `connect_close_request`
@@ -491,11 +509,16 @@ mod tests {
         RELEASE_AT.with(|cell| cell.get().is_some_and(|at| std::time::Instant::now() >= at))
     }
 
-    /// Checks that the embedded document contains the frontend and its Rust dispatch entry point.
-    /// A stale or truncated `agent-ui/web/dist/index.html` could load without error yet receive
-    /// no envelopes, causing `reload_document` to reproduce the blank panel it should recover.
-    /// This test does not exercise a WebView reload. Recovery uses `load_html` because
-    /// `WebViewExt::reload()` does not work for this substitute-data document.
+    /// The document this panel loads -- at startup, and again on every `reload_document()` -- has to
+    /// actually carry the frontend and the global Rust dispatches into. A stale or truncated
+    /// `agent-ui/web/dist/index.html` (build.rs's mtime freshness check going wrong, a half-written
+    /// build output) would produce a WebView that loads without error and can never receive a single
+    /// envelope -- which presents exactly as the wedged panel `reload_document` exists to recover
+    /// from, so the recovery would silently reproduce the fault.
+    ///
+    /// What this does NOT prove: that the reload itself works. Re-injection is a real `load_html`
+    /// call on a real `WebView`. `WebViewExt::reload()` does NOT work for a substitute-data load
+    /// like this one.
     #[test]
     fn the_embedded_panel_document_carries_the_frontend_and_its_dispatch_entry_point() {
         assert!(
@@ -620,7 +643,7 @@ mod tests {
             .expect("the policy has a script-src directive");
         let sources: Vec<&str> = script_src.split_whitespace().collect();
         assert_eq!(sources.first().copied(), Some(expected.as_str()), "{policy}");
-        assert_eq!(Ok(sources.iter().map(|s| s.to_string()).collect::<Vec<_>>()), hashes);
+        assert_eq!(Ok(sources.iter().map(ToString::to_string).collect::<Vec<_>>()), hashes);
     }
 
     /// Scripts are allowed only by hash: no keyword or scheme in `script-src` that would let an
@@ -683,9 +706,9 @@ mod tests {
         );
     }
 
-    /// The panel's WebView uses an ephemeral `NetworkSession` with a closed loopback proxy,
-    /// so requests that pass the CSP and sanitizer still cannot leave.
-    /// Check the builder source because constructing a WebView requires a display.
+    /// The panel's `WebView` uses an ephemeral `NetworkSession` whose proxy is the closed loopback
+    /// "discard" port, so a request that gets past the CSP and the sanitizer still cannot leave.
+    /// Source-scan this constraint because it is a network containment backstop.
     #[test]
     fn the_webview_builder_applies_the_network_proxy_backstop() {
         assert_eq!(PANEL_NETWORK_PROXY_URI, "http://127.0.0.1:9");

@@ -64,9 +64,9 @@ pub fn parse_seq(text: &str) -> Result<PanelSeq, String> {
             rest = &rest[end + 1..];
         } else {
             if c == ' ' {
-                keys.push(PanelKey::Space)
+                keys.push(PanelKey::Space);
             } else {
-                keys.push(PanelKey::Char(c))
+                keys.push(PanelKey::Char(c));
             }
             rest = &rest[c.len_utf8()..];
         }

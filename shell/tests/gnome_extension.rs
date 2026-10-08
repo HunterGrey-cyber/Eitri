@@ -26,7 +26,7 @@ fn read(rel: &str) -> String {
 }
 
 fn shipped_set() -> BTreeSet<String> {
-    SHIPPED.iter().map(|s| s.to_string()).collect()
+    SHIPPED.iter().map(ToString::to_string).collect()
 }
 
 /// The words of a shell assignment `NAME='a b c'` in `text`.
@@ -40,7 +40,7 @@ fn quoted_list(text: &str, name: &str) -> BTreeSet<String> {
         .strip_suffix('\'')
         .unwrap_or_else(|| panic!("{name} is not closed"))
         .split_whitespace()
-        .map(str::to_string)
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -88,7 +88,7 @@ fn pkgbuild_files(rel: &str) -> BTreeSet<String> {
         .unwrap()
         .strip_suffix("; do")
         .unwrap_or_else(|| panic!("{rel}: odd loop line {line:?}"));
-    list.split_whitespace().map(str::to_string).collect()
+    list.split_whitespace().map(ToString::to_string).collect()
 }
 
 /// The file names on the right of `_GNOME_EXT_FILES = { ... }` in release_check.py.

@@ -563,7 +563,7 @@ fn parse_use_tree(c: &mut Cursor, prefix: &[String], at: usize, out: &mut Vec<Us
     let mut alias = None;
     let before_as = c.i;
     if c.ident() == Some("as") {
-        alias = c.ident().map(str::to_string);
+        alias = c.ident().map(ToString::to_string);
     } else {
         c.i = before_as;
     }
@@ -604,7 +604,7 @@ fn use_items(code: &str) -> Vec<UseItem> {
                 if let Some(name) = c.ident() {
                     let before_as = c.i;
                     let alias = if c.ident() == Some("as") {
-                        c.ident().map(str::to_string)
+                        c.ident().map(ToString::to_string)
                     } else {
                         c.i = before_as;
                         None
@@ -638,9 +638,9 @@ fn followed_paths() -> Vec<Vec<String>> {
         .flat_map(|root| TEST_MACROS.iter().map(move |name| format!("{root}::{name}")));
     INIT_FORMS
         .iter()
-        .map(|form| form.to_string())
+        .map(ToString::to_string)
         .chain(macros)
-        .map(|path| path.split("::").map(str::to_string).collect())
+        .map(|path| path.split("::").map(ToString::to_string).collect())
         .collect()
 }
 
@@ -1462,7 +1462,7 @@ fn use_items_flattens_groups_globs_and_renames() {
             .map(|item| (item.path.join("::"), item.alias))
             .collect()
     };
-    let named = |path: &str, alias: Option<&str>| (path.to_string(), alias.map(str::to_string));
+    let named = |path: &str, alias: Option<&str>| (path.to_string(), alias.map(ToString::to_string));
     assert_eq!(flat("use gtk4 as gtk;"), vec![named("gtk4", Some("gtk"))]);
     assert_eq!(
         flat("use gtk4::{self as g, init, prelude::*};"),

@@ -160,10 +160,10 @@ fn decide_for_this_process() -> Decision {
     });
     match (&decision, &probed) {
         (Decision::DisabledByUser, _) => {
-            eprintln!("[webkit-sandbox] off: {ESCAPE_HATCH} is set, so WebKit runs without its sandbox")
+            eprintln!("[webkit-sandbox] off: {ESCAPE_HATCH} is set, so WebKit runs without its sandbox");
         }
         (Decision::Available, None) => {
-            eprintln!("[webkit-sandbox] no user-namespace restriction here; WebKit starts its sandbox as usual")
+            eprintln!("[webkit-sandbox] no user-namespace restriction here; WebKit starts its sandbox as usual");
         }
         (Decision::Available, Some((Probe::Inconclusive(why), took))) => eprintln!(
             "[webkit-sandbox] the user-namespace restriction is on, and the probe could not tell ({why}, {} ms); \

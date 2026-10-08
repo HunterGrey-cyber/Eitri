@@ -177,7 +177,7 @@ fn edited(n: u32, changes: &[(u32, &[&str])]) -> Vec<u8> {
     let mut out = Vec::new();
     for i in 1..=n {
         match changes.iter().find(|(at, _)| *at == i) {
-            Some((_, with)) => out.extend(with.iter().map(|s| s.to_string())),
+            Some((_, with)) => out.extend(with.iter().map(ToString::to_string)),
             None => out.push(format!("a{i}")),
         }
     }

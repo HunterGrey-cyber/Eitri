@@ -65,7 +65,7 @@ fn main() {
             colors: TerminalColors::default(),
             focused: true,
             tap: Some(Box::new(move |bytes: &[u8]| {
-                sink.lock().unwrap().write_all(bytes).unwrap()
+                sink.lock().unwrap().write_all(bytes).unwrap();
             })),
         },
         move || {

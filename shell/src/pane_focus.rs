@@ -81,7 +81,10 @@ pub(crate) fn install(
         // Reading it once before this closure would miss them. Headless tests do not catch that change;
         // focus tracking, `Ctrl+a Ctrl+a`, and `Ctrl+h/j/k/l` need checking with a module added at runtime.
         let modules = hosts();
-        let chain = std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent());
+        let chain = std::iter::successors(
+            gtk4::prelude::GtkWindowExt::focus(window),
+            gtk4::prelude::WidgetExt::parent,
+        );
         let focused = owning_module(chain, &modules);
         if let Some(id) = &focused {
             on_owner(id);
@@ -124,7 +127,10 @@ pub(crate) fn focused_module(
     modules: &[(ModuleId, gtk4::Widget)],
 ) -> Option<ModuleId> {
     owning_module(
-        std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent()),
+        std::iter::successors(
+            gtk4::prelude::GtkWindowExt::focus(window),
+            gtk4::prelude::WidgetExt::parent,
+        ),
         modules,
     )
 }

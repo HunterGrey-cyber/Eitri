@@ -432,7 +432,7 @@ mod tests {
     fn a_higher_scale_gives_proportionally_larger_cells_and_a_smaller_grid() {
         let one = TerminalMetrics::new(1600.0, 1200.0, 1.0);
         let two = TerminalMetrics::new(1600.0, 1200.0, 2.0);
-        assert!(two.cell_width() > one.cell_width() * 1.8, "{:?} vs {:?}", one, two);
+        assert!(two.cell_width() > one.cell_width() * 1.8, "{one:?} vs {two:?}");
         assert!(
             two.cols() < one.cols(),
             "a 2x scale in the same pixel box must fit fewer columns"

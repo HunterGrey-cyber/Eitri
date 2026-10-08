@@ -96,7 +96,7 @@ impl TickDriver {
     }
 
     fn area(&self) -> Option<GLArea> {
-        self.area.borrow().as_ref().and_then(|w| w.upgrade())
+        self.area.borrow().as_ref().and_then(glib::WeakRef::upgrade)
     }
 
     #[cfg(test)]
@@ -414,7 +414,7 @@ mod tests {
     fn dropping_the_driver_removes_its_fd_watch() {
         let _serial = crate::DEFAULT_CONTEXT_TEST_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()

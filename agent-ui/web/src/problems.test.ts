@@ -64,10 +64,9 @@ describe("classify", () => {
     });
   });
 
-  /* The v1-ui GUI pass (2026-09-27) captured what a logged-out account really produces: the
-     sidecar's own account check refuses before binding its socket, so no turn is sent and the
-     "Please run /login" string above never appears. Unrecognised, the failed tab showed only the
-     raw text. */
+  /* A logged-out account makes the sidecar's own account check refuse before its socket binds, so
+     no turn is sent and the "Please run /login" string above never appears. Unrecognised, the
+     failed tab showed only the raw text. */
   it("recognises the captured logged-out sidecar and names the account and its directory", () => {
     expect(classify(notLoggedInFixture)).toEqual({
       headline: "Claude Code is not logged in.",
@@ -85,9 +84,13 @@ describe("classify", () => {
     expect(classify("claude-sidecar exited with signal: 11 (SIGSEGV); its stderr said:\nsegfault")).toBeNull();
   });
 
-  // An unsupported `/login` reply says the command is unavailable even in a logged-in session.
-  // That text must not be classified as a login failure. The login recognizer uses the interactive
-  // authentication diagnostic; a logged-out sidecar fixture has not been captured.
+  // the test-account wrapper hardcodes its own config directory and discards overrides, so a real-call
+  // test cannot point an already-logged-in host at an empty one. Sending `/login` through a normal
+  // logged-in session yields the same boilerplate as every unsupported slash command --
+  // `"/login isn't available in this environment."` -- which is not a login failure and must not be
+  // classified as one. This pins that the classifier keeps those cases distinct; the logged-out
+  // sidecar message follows Claude Code's documented interactive string instead.
+  // (the two tests just above this one).
   it("does NOT classify /login's own captured 'isn't available in this environment' text as not-logged-in", () => {
     expect(classify("/login isn't available in this environment.")).toBeNull();
   });
@@ -103,8 +106,8 @@ describe("classify", () => {
   });
 });
 
-/** A resumed session whose sidecar stops before any new turn. The inner reason comes from
- *  `stream_ended_early_reason`; the wrapper adds a "never opened" guess. */
+/** A resumed sidecar session whose sidecar stops before any new turn. The inner
+ *  reason is `stream_ended_early_reason`'s; the wrapper is `shell`'s "never opened" guess. */
 describe("a sidecar that stopped under a session", () => {
   const INNER =
     "the connection to the provider ended before this session did, so anything after this point never arrived and the reply above may be incomplete (the provider closed the event stream)";
@@ -135,8 +138,9 @@ describe("a sidecar that stopped under a session", () => {
     expect(watchRs.replace(/\s+\\?\n\s*/g, " ")).toContain("the connection to the provider ended before this session did");
   });
 
-  // Check the wrapper against the Rust code that writes it (`report_sessions_that_never_opened`).
-  // If the wording drifts, `failureEvidence` stops unwrapping it and shows the guess again.
+  // And the wrapper against the panel's Rust that writes it (`report_sessions_that_never_opened`,
+  // via its `never_opened_message` helper): if its wording drifts, `failureEvidence` silently stops
+  // unwrapping and the guess is shown again.
   it("unwraps exactly what agent_panel.rs's never-opened format! writes", () => {
     const source = agentPanelRs.replace(/\\\n\s*/g, "");
     const literal = /"(the session ended before it started \(\{reason\}\)[^"]*)"/.exec(source);
@@ -146,9 +150,10 @@ describe("a sidecar that stopped under a session", () => {
     expect(failureEvidence(written)).toBe(INNER);
   });
 
-  // `never_opened_message` gives a stopped sidecar its own literal without the missing-session guess.
-  // Read that literal from `agent_panel.rs`, substitute a real INNER, and check that classification
-  // reports the stopped sidecar while preserving the evidence without the wrapper guess.
+  // `never_opened_message` gives a stopped sidecar its own literal rather than wrapping it in the
+  // "most likely no longer exists" guess. Read that literal from `agent_panel.rs`, write it with a
+  // real INNER, and check this module still identifies it as "the sidecar stopped" with no wrapper
+  // guess left over.
   it("shell's own never-opened-message literal for a stopped sidecar carries no guess", () => {
     const source = agentPanelRs.replace(/\\\n\s*/g, "");
     const literal = /"(the agent sidecar stopped \(\{reason\}\)[^"]*)"/.exec(source);

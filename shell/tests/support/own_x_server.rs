@@ -105,7 +105,7 @@ impl OwnXServer {
                 // A file that appeared while the server started is someone else's: move on (the
                 // server drops, and stops, here).
                 Ok(_) if !display_is_unclaimed_by_file(n) => {
-                    last_error = format!(":{n} gained a socket or lock file while starting")
+                    last_error = format!(":{n} gained a socket or lock file while starting");
                 }
                 Ok(mut server) => {
                     remove_on_fatal_signal(&xauthority);
@@ -243,7 +243,7 @@ impl OwnXServer {
             return (0, vec!["/proc/self/fd cannot be read".into()]);
         };
         for fd in fds
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
         {
             let Some(address) = unix_peer_address(fd) else { continue };

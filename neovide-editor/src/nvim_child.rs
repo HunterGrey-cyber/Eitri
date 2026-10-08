@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn the_new_embed_child_is_found_and_nothing_else() {
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch("find");
         let before = direct_children();
         let mut other = Command::new("sleep").arg("30").spawn().expect("sleep");
@@ -609,7 +609,7 @@ mod tests {
     /// returns at once: the pidfd pins the process, not the number a new one may have taken.
     #[test]
     fn an_nvim_already_gone_is_signalled_nothing() {
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch("gone");
         let before = direct_children();
         let mut nvim = spawn_embed(&dir, &[]);
@@ -673,7 +673,7 @@ mod tests {
     /// can leave a hung nvim running.
     #[test]
     fn a_launcher_that_does_not_exec_nvim_is_not_what_an_end_reaches() {
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch("wrapper");
         let wrapper = write_wrapper(&dir);
         let before = direct_children();
@@ -720,7 +720,7 @@ mod tests {
     /// -- the pid is "not known", and the caller says so instead of guessing.
     #[test]
     fn a_direct_child_that_is_not_nvim_is_never_killed() {
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = direct_children();
         // Two commands, so the shell forks `sleep` instead of exec'ing it and stays itself.
         let mut other = Command::new("sh")
@@ -754,7 +754,7 @@ mod tests {
     fn nvims_own_pid_is_what_an_end_reaches() {
         use nvim_rs::rpc::handler::Dummy;
         use std::os::unix::fs::PermissionsExt;
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch("reported");
         let inner = write_wrapper(&dir);
         let wrapper = dir.join("outer-nvim");
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn nvim_outliving_its_launcher_is_seen_alive() {
         use nvim_rs::rpc::handler::Dummy;
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch("orphan");
         let wrapper = write_wrapper(&dir);
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -889,7 +889,7 @@ mod tests {
     /// the dialog here. [`fork_nvim`] checks the ending order with the harness's own UI.
     fn ending(case: &str, dialog: bool, stop: bool) -> (Ended, bool, bool, bool) {
         use std::io::Write;
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch(case);
         let swap = dir.join("swap");
         std::fs::create_dir_all(&swap).expect("swap dir");
@@ -933,7 +933,7 @@ mod tests {
             .unwrap();
         stdin.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::read_dir(&swap).map(|d| d.count()).unwrap_or(0) == 0 {
+        while std::fs::read_dir(&swap).map(Iterator::count).unwrap_or(0) == 0 {
             if Instant::now() >= deadline {
                 // Not left running behind a failed test.
                 let _ = nvim.kill();
@@ -1189,7 +1189,7 @@ mod tests {
             answered("the edit", tokio::time::timeout(Duration::from_secs(5), edit).await).expect("the edit");
         });
         let deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::read_dir(&swap).map(|d| d.count()).unwrap_or(0) == 0 {
+        while std::fs::read_dir(&swap).map(Iterator::count).unwrap_or(0) == 0 {
             assert!(Instant::now() < deadline, "{case}: nvim never made its swap file");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1247,7 +1247,7 @@ mod tests {
 
     /// Ends a [`fork_nvim`] on `schedule`; the hang-up is the fork's own `HangUp`.
     fn end_fork_nvim(case: &str, updatetime: u32, dialog: bool, schedule: Schedule) -> Outcome {
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut fork = fork_nvim(case, updatetime, dialog);
         let hang_up = fork.session.hang_up.clone();
         let started = Instant::now();
@@ -1370,7 +1370,7 @@ mod tests {
         let mut hung_up = 0;
         let started = Instant::now();
         let ended = end(&NvimProcess::new(None), started, SCHEDULE_IN_A_PROMPT, &mut || {
-            hung_up += 1
+            hung_up += 1;
         });
         assert_eq!(ended, Ended::Unknown);
         assert_eq!(hung_up, 1);
