@@ -15,7 +15,7 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 This is the recommended way, on every distribution; on Arch, the [AUR package](#aur-arch) fits better.
 It installs into `~/.local`, without `sudo`, and builds the agent sidecar on your machine
 ([why](#why-the-sidecar-is-built-on-your-machine)), which takes a few minutes, network access and about
-600 MiB of disk. Options go after `sh -s --`, for example `… | sh -s -- --version 0.2.1 --yes`;
+600 MiB of disk. Options go after `sh -s --`, for example `… | sh -s -- --version 0.2.2 --yes`;
 `sh install.sh --help` lists them all.
 
 To check the download's signature before running it, see [Verify before running](#verify-before-running).

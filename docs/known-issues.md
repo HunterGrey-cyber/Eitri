@@ -110,6 +110,9 @@ one-window mode.
   asks, its card shows the rewritten input and the tool's row the original. Hooks work this way in a terminal too.
 - **A trusted project's `permissions.allow` rules reach an Auto tab only if you have also trusted that directory
   in terminal `claude`.** That is Claude Code's own rule; your user settings' rules always apply.
+- **In a bypass tab your own ask rules stop nothing.** Since 0.2.2 bypass also approves the questions Claude Code
+  raises itself, those your `permissions.ask` rules (or a trusted project's) force included, with no card; the
+  tool's row says it was allowed in bypass. Use an Auto tab where an ask rule has to hold.
 - **The bottom terminal can write to your clipboard, by design.** A program running there can set the clipboard
   or the primary selection with an OSC 52 escape sequence (the same default as Alacritty); Eitri shows no notice
   when it happens, so what you paste next may not be what you copied. Reading the clipboard is refused.

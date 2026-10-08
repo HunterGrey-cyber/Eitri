@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=02b2565e4d77a00385acb9176df5bf1dd54d618ad4321004042efa038ba7b1b2 -->
+<!-- translated-from: known-issues.md sha256=fd404ebee188b04c9c1c30eb0a06fbc35738f5b632f1ba7d29402069022f221d -->
 
 # 已知问题与限制
 
@@ -49,6 +49,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **在 Auto 标签页里，Claude Code 自己的 auto 模式可能不经询问就让 agent 在 `.git/` 下写文件**，包括新建一个 git hook。回合审阅不显示 `.git/` 下的改动，信任提问盯的是 `.claude/`、`.mcp.json` 和 `CLAUDE.md`，不是 `.git/`。在你在意的仓库里跑完一个回合后，值得看一眼 `ls .git/hooks`。相反，`.claude/` 下的改动会让 Eitri 在下一个会话之前重新提出信任提问。
 - **你自己 Claude Code 设置里的 hook（或者一个已信任项目的 hook）可以在你批准之后改掉工具调用。** Claude Code 在 Eitri 看过原始输入之后才应用 hook 改写过的输入；如果 Claude Code 随后再询问，它的卡片显示改写后的输入，而工具那一行显示原始的。在终端里 hook 也是这样工作的。
 - **已信任项目的 `permissions.allow` 规则，只有在你也在终端 `claude` 里信任过那个目录时，才会作用到 Auto 标签页。** 这是 Claude Code 自己的规则；你用户设置里的规则始终有效。
+- **在 bypass 标签页里，你自己的 ask 规则什么也拦不住。** 从 0.2.2 起，bypass 也会批准 Claude Code 自己提出的问题，包括你的 `permissions.ask` 规则（或被信任项目的）强制它提出的问题，不出卡片；工具那一行会注明它是在 bypass 下放行的。需要 ask 规则起作用的地方，请用 Auto 标签页。
 - **底部终端可以写你的剪贴板，这是有意为之。** 在那里运行的程序可以用 OSC 52 转义序列设置剪贴板或主选区（和 Alacritty 的默认行为一样）；发生时 Eitri 不会提示，所以你接下来粘贴的内容可能不是你复制的。读取剪贴板则会被拒绝。
 - **agent 面板的脚本策略是新的，只在测试里检查过，还没有在每一种环境的屏幕上看过。** 面板现在只允许自己的那段脚本（按哈希），不再允许任意内联脚本。如果更新后 agent 面板一直是空白，请连同你的 WebKitGTK 版本一起报告。
 
