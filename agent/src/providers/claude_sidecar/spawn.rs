@@ -828,12 +828,19 @@ fn sidecar_command(
         // supervisor-robustness-followup plan). A Node.js sidecar crash during real CLI parity
         // testing (Task 9) is exactly the kind of thing worth seeing.
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // The sidecar merges this variable's MCP servers into every session it serves. Eitri states
+        // which servers a session gets and states none today, so a value left in the user's shell
+        // must not turn into servers (and tools) in an Eitri session.
+        .env_remove(EXTRA_MCP_SERVERS_VAR);
     if let Some(account) = account {
         command.env("VERDANDI_CLAUDE_ACCOUNT", account.name());
     }
     command
 }
+
+/// The sidecar's process-level list of extra MCP servers (JSON); never inherited from the shell.
+const EXTRA_MCP_SERVERS_VAR: &str = "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS";
 
 /// True when `path` is exactly discovery step 3's candidate -- `current_exe()`'s sibling -- rather
 /// than an explicitly named `EITRI_SIDECAR_BINARY` (step 1) or the per-user rev-keyed path (step
@@ -1582,17 +1589,49 @@ mod tests {
         }
     }
 
-    /// The shipped default: with nothing configured the child's environment is what it always was,
-    /// and the sidecar's own account support never engages.
+    /// `get_envs` reports a removal as `(key, None)`; an inherited value is gone only if that entry
+    /// exists, and it must survive an account being set too.
     #[test]
-    fn with_no_account_the_child_gets_exactly_the_socket_and_nothing_else() {
+    fn the_extra_mcp_servers_variable_is_removed_from_the_sidecar_child() {
+        let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "account-test").unwrap();
+        let account =
+            crate::account::ClaudeAccount::resolve_from("work", |k| (k == "HOME").then(|| "/home/user".to_string()))
+                .unwrap();
+        for account in [None, Some(&account)] {
+            let command = sidecar_command(
+                Path::new("/usr/lib/eitri/verdandi-claude-sidecar"),
+                &[],
+                &socket,
+                account,
+            );
+            let removed: Vec<_> = command
+                .get_envs()
+                .filter(|(k, _)| k.to_string_lossy() == "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS")
+                .collect();
+            assert_eq!(removed.len(), 1, "{removed:?}");
+            assert!(removed[0].1.is_none(), "it must be removed, not set: {removed:?}");
+        }
+    }
+
+    /// The shipped default: with nothing configured the child's environment is what it always was
+    /// (plus the one removal above), and the sidecar's own account support never engages.
+    #[test]
+    fn with_no_account_the_child_sets_the_socket_and_only_removes_the_extra_servers() {
         let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "account-test").unwrap();
         let command = sidecar_command(Path::new("/usr/lib/eitri/verdandi-claude-sidecar"), &[], &socket, None);
         let keys: Vec<String> = command
             .get_envs()
             .map(|(k, _)| k.to_string_lossy().to_string())
             .collect();
-        assert_eq!(keys, vec!["VERDANDI_CLAUDE_SIDECAR_SOCKET".to_string()]);
+        let mut keys = keys;
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS".to_string(),
+                "VERDANDI_CLAUDE_SIDECAR_SOCKET".to_string()
+            ]
+        );
     }
 
     // -- v1-dist Task 3: the per-user sidecar, keyed by the pinned revision (spec §5.2, D3) --

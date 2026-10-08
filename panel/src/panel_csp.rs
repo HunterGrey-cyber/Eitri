@@ -40,6 +40,12 @@ pub fn content_security_policy_for(html: &str) -> String {
     format!("default-src 'none'; script-src {script_sources}; {AFTER_SCRIPT_SRC}")
 }
 
+/// The policy for a document that must run no script at all: the same as [`content_security_policy_for`]
+/// gives a refused document, without the stderr line (the caller says why itself).
+pub fn script_less_policy() -> String {
+    format!("default-src 'none'; script-src 'none'; {AFTER_SCRIPT_SRC}")
+}
+
 /// One CSP source expression, `'sha256-<base64>'` with its quotes, per inline `<script>` element
 /// in `html`, in document order. The hash covers the element's text exactly as written: no trim,
 /// no newline change.
@@ -213,6 +219,11 @@ mod tests {
         );
         let before_style = &policy[..policy.find("style-src").unwrap()];
         assert!(!before_style.contains("unsafe"), "{policy}");
+    }
+
+    #[test]
+    fn the_script_less_policy_is_what_a_refused_document_gets() {
+        assert_eq!(script_less_policy(), content_security_policy_for("<head></head>"));
     }
 
     #[test]
