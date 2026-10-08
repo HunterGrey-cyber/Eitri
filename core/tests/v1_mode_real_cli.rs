@@ -43,6 +43,12 @@
 //! both, on entering it and in a bypass tab (test 6a). A waiting card the host's own policy raised,
 //! which only legacy does, is test 6b.
 //!
+//! Test 7 asks whether a `PreToolUse` hook that answers `ask` with a reason is answered by the host
+//! on the strength of the gate card the human approved for the same call. Measured on CLI 2.1.292: on
+//! the sidecar there is no gate card (an Auto tab defers) and the CLI's prompt for the hook is a card;
+//! on legacy the CLI refuses the call headlessly with the hook's reason and no prompt arrives. The
+//! hook goes in the trusted project tier so the test never edits the user's own settings file.
+//!
 //! **A run that did not exercise what a test is about fails as INCONCLUSIVE**: test 1b needs exactly
 //! five Reads each paired with its own resolution by id; test 3 needs an `Agent`/`Task` call and, for
 //! a `Write` card, proof from the CLI's own transcript that a subagent made it; test 5 counts a trip
@@ -2439,6 +2445,208 @@ fn entering_bypass_mid_turn_approves_the_waiting_card_legacy() {
         "Use the Bash tool to run exactly this command: echo ok > first.txt",
         "Use the Bash tool to run exactly this command: echo ok > second.txt",
     );
+}
+
+/// What the hook-ask probe saw of the one marker call, so the branch it took is printed whole.
+// Read through `Debug` in the probe's printed line.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct HookAskOutcome {
+    /// Gate cards drawn for the marker call (permission ids), each approved by the probe.
+    gate_cards: Vec<String>,
+    /// CLI-prompt cards for the marker call, with the prompt's reason, each approved by the probe.
+    prompt_cards: Vec<(String, Option<String>)>,
+    /// The host answered the CLI's own prompt for the marker call itself, with this row note.
+    auto_answered: Option<String>,
+    /// The host's answers to the gate request of the marker call: `deferred` of each.
+    deferred: Vec<bool>,
+    /// The marker call ran to a non-error completion.
+    ran: bool,
+    /// The marker call failed with the hook's reason as its result and no prompt reached the host: the
+    /// CLI refused the ask itself (a headless session has nobody to ask).
+    refused_with_the_reason: bool,
+}
+
+/// A project-tier `PreToolUse` hook that answers `ask`, with a reason, for one marker `Bash` command and
+/// says nothing for every other call. The test profile's user settings file is a link to a
+/// shared one, which a test must not edit; Eitri sees the same thing either way -- the CLI's own prompt,
+/// carrying the hook's reason -- and the project tier is loaded because `auto_tab` starts the session
+/// trusted.
+fn write_ask_hook(dir: &Path, marker: &str, reason: &str) {
+    let answer = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": reason,
+        }
+    });
+    let command = format!("if grep -q {marker}; then printf '%s' '{answer}'; fi; exit 0");
+    std::fs::create_dir_all(dir.join(".claude")).unwrap();
+    std::fs::write(
+        dir.join(".claude/settings.json"),
+        serde_json::json!({
+            "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": command } ] } ] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// Test 7: a hook that answers `ask` with a reason, in an Auto tab. The question is whether Eitri then
+/// answers the CLI's prompt for that hook without a card on the strength of the gate card the human
+/// approved for the same call. Every card the probe meets is approved (so the turn ends), and who
+/// answered what is read from the tab's own record. Asserted: an answer of the host to the CLI's own
+/// prompt for the marker call exists only if the probe approved a gate card for that very call before
+/// it (nothing else is an approval); everything else -- which branch this CLI and backend took -- is
+/// printed.
+fn user_hook_ask_in_an_auto_tab(kind: BackendKind, label: &str) {
+    const MARKER: &str = "eitri-ask-hook-marker";
+    const HOOK_REASON: &str = "eitri probe hook: a human must look at this";
+    let dir = project(label);
+    write_ask_hook(&dir, MARKER, HOOK_REASON);
+    let command = format!("touch {MARKER}.txt");
+    let (mut set, tab) = auto_tab(kind, &dir);
+    let mut trace = GateTrace::new(&dir);
+    let mut gate_cards: Vec<String> = Vec::new();
+    let mut prompt_cards: Vec<(String, Option<String>)> = Vec::new();
+    let mut approved_gate_calls: BTreeSet<String> = BTreeSet::new();
+    let mut answered_prompt_before_any_approval = false;
+    drive_turn(
+        &mut set,
+        &dir,
+        tab,
+        &format!("Use the Bash tool to run exactly this command and nothing else: {command}"),
+        label,
+        |set, new| {
+            trace.observe(set, tab, new);
+            for event in new {
+                if event["type"] != "permission_requested"
+                    || !event["input"]["command"].as_str().is_some_and(|c| c.contains(MARKER))
+                {
+                    continue;
+                }
+                let id = event["permission_id"].as_str().unwrap().to_string();
+                let call = event["tool_use_id"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
+                if event["provider_prompt"].is_object() {
+                    prompt_cards.push((
+                        id.clone(),
+                        event["provider_prompt"]["reason"].as_str().map(str::to_string),
+                    ));
+                } else {
+                    gate_cards.push(id.clone());
+                    approved_gate_calls.extend(call);
+                }
+                set.answer_card(tab, &id, PermissionDecision::Allow)
+                    .map_err(|e| e.message)
+                    .unwrap();
+            }
+            // Whether the host answered a CLI prompt before any gate card of its own was approved.
+            let marker_prompt_answered = trace
+                .calls_where("Bash", |input| {
+                    input["command"].as_str().is_some_and(|c| c.contains(MARKER))
+                })
+                .iter()
+                .any(|(id, _)| trace.prompt_answered.contains(id));
+            if marker_prompt_answered && approved_gate_calls.is_empty() {
+                answered_prompt_before_any_approval = true;
+            }
+        },
+    );
+    let marker_calls = trace.calls_where("Bash", |input| {
+        input["command"].as_str().is_some_and(|c| c.contains(MARKER))
+    });
+    assert!(
+        !marker_calls.is_empty(),
+        "INCONCLUSIVE: the model never ran the marker command (calls: {:?})",
+        trace.calls
+    );
+    let outcome = HookAskOutcome {
+        gate_cards,
+        prompt_cards,
+        auto_answered: marker_calls
+            .iter()
+            .find(|(id, _)| trace.prompt_answered.contains(id))
+            .map(|(id, _)| trace.prompt_notes.get(id).cloned().unwrap_or_default()),
+        deferred: set
+            .get(tab)
+            .unwrap()
+            .gate_answers()
+            .iter()
+            .filter(|a| a.origin == GateOrigin::GateRequest)
+            .filter(|a| {
+                a.tool_use_id
+                    .as_ref()
+                    .is_some_and(|id| marker_calls.iter().any(|(m, _)| m == id))
+            })
+            .map(|a| a.deferred)
+            .collect(),
+        ran: marker_calls.iter().any(|(_, is_error)| is_error == &Some(false)),
+        refused_with_the_reason: marker_calls.iter().any(|(id, is_error)| {
+            is_error == &Some(true)
+                && trace
+                    .completed
+                    .get(id)
+                    .is_some_and(|(_, content)| content.contains(HOOK_REASON))
+        }),
+    };
+    println!(
+        "[v1-mode] test7 {label}: {outcome:?} marker_calls={marker_calls:?} \
+         host_answered={:?} prompt_answered={:?} prompt_notes={:?} completed={:?} file={}",
+        trace.host_answered(),
+        trace.prompt_answered,
+        trace.prompt_notes,
+        trace.completed,
+        dir.join(format!("{MARKER}.txt")).exists()
+    );
+    // The hook must have fired: its ask reached Eitri as a prompt (a card, or answered by the host) or
+    // the CLI refused it with the hook's reason without asking anyone.
+    assert!(
+        !outcome.prompt_cards.is_empty() || outcome.auto_answered.is_some() || outcome.refused_with_the_reason,
+        "INCONCLUSIVE: the hook's ask was never seen (outcome {outcome:?})"
+    );
+    if outcome.refused_with_the_reason {
+        assert!(
+            !dir.join(format!("{MARKER}.txt")).exists(),
+            "the CLI refused the hook's ask, so the command must not have run: {outcome:?}"
+        );
+    }
+    if outcome.auto_answered.is_some() {
+        assert!(
+            !outcome.gate_cards.is_empty() && !answered_prompt_before_any_approval,
+            "the host answered the CLI's prompt for the hook's ask with no approved gate card behind it: {outcome:?}"
+        );
+        // Each call whose prompt the host answered is one whose own gate card the probe approved.
+        for (id, _) in marker_calls.iter().filter(|(id, _)| trace.prompt_answered.contains(id)) {
+            assert!(
+                approved_gate_calls.contains(id),
+                "the host answered the CLI's prompt for {id} but the probe approved no gate card for that call \
+                 (approved: {approved_gate_calls:?}): {outcome:?}"
+            );
+        }
+    }
+    for (_, reason) in &outcome.prompt_cards {
+        assert_eq!(
+            reason.as_deref(),
+            Some(HOOK_REASON),
+            "a prompt card for the hook's ask carries the hook's reason"
+        );
+    }
+}
+
+#[test]
+#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
+fn a_hook_that_asks_in_an_auto_tab_sidecar() {
+    user_hook_ask_in_an_auto_tab(BackendKind::Sidecar, "hook-ask-sidecar");
+}
+
+#[cfg(feature = "legacy-backend")]
+#[test]
+#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
+fn a_hook_that_asks_in_an_auto_tab_legacy() {
+    user_hook_ask_in_an_auto_tab(BackendKind::Legacy, "hook-ask-legacy");
 }
 
 /// The evidence rules, on synthetic events: these run in a plain `cargo test`, no Claude involved. Each

@@ -24,6 +24,11 @@
 //! A separate ignored test checks that a user's `Edit(...)` ask rule overrides the gate's allow.
 //! These edit checks have not yet been run against the real CLI.
 
+//! **2026-10-08, CLI 2.1.292 on the TEST profile: passed**, 19 probes made calls, nothing more permissive, seven stricter.
+//! The eight `Grep`/`Glob` arms added that day were skipped: 2.1.292 lists neither tool (`TOOLS_THE_CLI_MAY_LACK`), so a
+//! skip is printed and never counted as agreement. Two `Read` arms with the same path reasoning (`/proc`, a symlink out of
+//! the root) ran: the CLI refused both and the policy cards both.
+
 use agent::{classify_permission_request, PermissionVerdict};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -77,7 +82,17 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
     let mut more_permissive_than_the_cli: Vec<String> = Vec::new();
     let mut observed_anything = false;
 
+    let mut skipped_for_a_missing_tool: Vec<String> = Vec::new();
     for probe in probes() {
+        if TOOLS_THE_CLI_MAY_LACK.contains(&probe.expects_tool) && !tools_the_cli_lists().contains(probe.expects_tool) {
+            println!(
+                "\n--- probe: {} --- SKIPPED: this CLI build lists no {} tool, so the call this arm exists \
+                 for cannot be made",
+                probe.label, probe.expects_tool
+            );
+            skipped_for_a_missing_tool.push(format!("{} ({})", probe.label, probe.expects_tool));
+            continue;
+        }
         let fresh = a_fresh_workspace();
         let workspace = (probe.run_in)(&fresh);
         let calls = run_one_probe(&workspace, probe.prompt, probe.permission_mode);
@@ -91,6 +106,19 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
             probe.expects_tool,
             calls.iter().map(|c| c.tool_name.as_str()).collect::<Vec<_>>()
         );
+        for (label_part, fragment) in INPUT_MUST_MENTION {
+            if probe.label.contains(label_part) {
+                assert!(
+                    calls
+                        .iter()
+                        .any(|c| c.tool_name == probe.expects_tool && c.input.to_string().contains(fragment)),
+                    "probe {}: no {} call named {fragment}, so the path this arm exists for was never tried. \
+                     Calls observed: {calls:?}",
+                    probe.label,
+                    probe.expects_tool
+                );
+            }
+        }
         for call in &calls {
             observed_anything = true;
             let ours = classify_permission_request(&call.tool_name, &call.input, &workspace);
@@ -150,6 +178,13 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
         "no tool call was observed in any probe -- the CLI ran, but nothing was classified, so \
          this test proved nothing. Check the stream-json parsing before trusting a pass."
     );
+    if !skipped_for_a_missing_tool.is_empty() {
+        println!(
+            "\nNOT EXERCISED, the CLI has no such tool ({}): {}",
+            skipped_for_a_missing_tool.len(),
+            skipped_for_a_missing_tool.join("; ")
+        );
+    }
     if !stricter_than_the_cli.is_empty() {
         println!(
             "\nstricter than the CLI ({}), which is allowed and is the cost of rule (c):\n  {}",
@@ -357,8 +392,9 @@ fn with_an_option_shaped_symlink(workspace: &Path) -> PathBuf {
     workspace.to_path_buf()
 }
 
-/// Seventeen probes, one billed turn each, covering both directions of the assertion.
+/// Twenty-seven probes, one billed turn each, covering both directions of the assertion.
 /// The set is not exhaustive; each added probe costs another turn.
+/// Eight Grep and Glob probes run only where the CLI lists those tools.
 ///
 /// Three edit probes run under `--permission-mode acceptEdits`: an in-project `Write`,
 /// an in-project `Edit` of an existing file, and a `Write` under a protected directory.
@@ -459,10 +495,11 @@ fn probes() -> Vec<Probe> {
             run_in: in_the_workspace,
             permission_mode: None,
         },
-        // `..` out of the root. The workspace is /tmp/<dir>, so this names /etc/hostname. There is
-        // no Grep or Glob probe because CLI 2.1.272 has neither tool: its `system/init` lists no
-        // such name (measured 2026-09-19), and a Grep probe made the model reach for ToolSearch
-        // twice and then give up -- which the per-probe check above caught as vacuous.
+        // `..` out of the root. The workspace is /tmp/<dir>, so this names /etc/hostname. The
+        // Grep and Glob arms are at the end of the list, and run only on a build that lists those
+        // tools: CLI 2.1.272 had neither (its `system/init` listed no such name, measured 2026-09-19,
+        // and a Grep probe made the model reach for ToolSearch twice and then give up, which the
+        // per-probe check above caught as vacuous), and neither has 2.1.292.
         // The tools are deferred on this build, so the model reaches for `ToolSearch` before it can
         // use anything -- which made this the most frequent gated call in a real session and the
         // reason auto mode still felt like a wall of popups. The CLI runs it in default mode.
@@ -576,7 +613,170 @@ fn probes() -> Vec<Probe> {
             run_in: with_a_gitfile_naming_a_repository_outside,
             permission_mode: None,
         },
+        // Path arms the oracle lacked: the policy allows a path-judged call only when the path resolves
+        // inside the root, so each of these is a place the resolution could go wrong. Read has them
+        // because Grep and Glob (below) do not exist on every CLI build.
+        Probe {
+            label: "a read of /proc",
+            prompt: "Using the Read tool, read the file /proc/version and tell me what it says. \
+                     Do not use any other tool.",
+            expects_tool: "Read",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: in_the_workspace,
+            permission_mode: None,
+        },
+        Probe {
+            label: "a read through a symlink that leaves the working directory",
+            prompt: "Using the Read tool, read the file out/hostname (relative to the current \
+                     directory) and tell me what it says. Do not use any other tool.",
+            expects_tool: "Read",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: with_a_symlink_out_of_the_root,
+            permission_mode: None,
+        },
+        // Grep and Glob, four paths each: inside the root, outside it, /proc, and through a link out.
+        // Exercised only on a CLI build that lists the tool (`TOOLS_THE_CLI_MAY_LACK`).
+        Probe {
+            label: "a grep inside the working directory",
+            prompt: "Using the Grep tool, search for the word probe in the current directory and \
+                     tell me which file matched. Use only the Grep tool.",
+            expects_tool: "Grep",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: in_the_workspace,
+            permission_mode: None,
+        },
+        Probe {
+            label: "a grep outside the working directory",
+            prompt: "Using the Grep tool with the path /etc, search for the word localhost in \
+                     /etc/hosts and tell me what it found. Use only the Grep tool.",
+            expects_tool: "Grep",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: in_the_workspace,
+            permission_mode: None,
+        },
+        Probe {
+            label: "a grep of /proc",
+            prompt: "Using the Grep tool with the path /proc/version, search for the word Linux and \
+                     tell me what it found. Use only the Grep tool.",
+            expects_tool: "Grep",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: in_the_workspace,
+            permission_mode: None,
+        },
+        Probe {
+            label: "a grep through a symlink that leaves the working directory",
+            prompt: "Using the Grep tool with the path out (relative to the current directory), search \
+                     for the word localhost in out/hosts and tell me what it found. Use only the Grep tool.",
+            expects_tool: "Grep",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: with_a_symlink_out_of_the_root,
+            permission_mode: None,
+        },
+        Probe {
+            label: "a glob inside the working directory",
+            prompt: "Using the Glob tool, find the files matching *.rs in the current directory and \
+                     list them. Use only the Glob tool.",
+            expects_tool: "Glob",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: in_the_workspace,
+            permission_mode: None,
+        },
+        Probe {
+            label: "a glob outside the working directory",
+            prompt: "Using the Glob tool with the path /etc, find the files matching host* and list \
+                     them. Use only the Glob tool.",
+            expects_tool: "Glob",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: in_the_workspace,
+            permission_mode: None,
+        },
+        Probe {
+            label: "a glob of /proc",
+            prompt: "Using the Glob tool with the path /proc, find the files matching ver* and list \
+                     them. Use only the Glob tool.",
+            expects_tool: "Glob",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: in_the_workspace,
+            permission_mode: None,
+        },
+        Probe {
+            label: "a glob through a symlink that leaves the working directory",
+            prompt: "Using the Glob tool with the path out (relative to the current directory), find \
+                     the files matching host* and list them. Use only the Glob tool.",
+            expects_tool: "Glob",
+            file_that_must_not_exist: None,
+            file_must_contain: None,
+            run_in: with_a_symlink_out_of_the_root,
+            permission_mode: None,
+        },
     ]
+}
+
+/// `<workspace>/out` is a symlink to `/etc`, a directory outside the workspace: a path that starts
+/// inside the root and leaves it through a link, which only resolving the path reveals.
+fn with_a_symlink_out_of_the_root(workspace: &Path) -> PathBuf {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/etc", workspace.join("out")).unwrap();
+    workspace.to_path_buf()
+}
+
+/// `(part of a probe's label, text one of its calls' inputs must hold)`: an arm about a path the model
+/// could reach another way (reading `/etc/hostname` itself instead of `out/hostname`) fails as vacuous
+/// when its call never names the path.
+const INPUT_MUST_MENTION: &[(&str, &str)] = &[("through a symlink that leaves", "out"), ("of /proc", "/proc")];
+
+/// Tools a newer CLI build may not have. Claude Code 2.1.292 lists no `Grep` and no `Glob` (its
+/// `system/init` names neither, and `ToolSearch` finds neither: the model searches with `Bash`), so an
+/// arm that exists to exercise one of them cannot make its call there and is reported as not
+/// exercised, never counted as agreement. The first build the oracle was written against had both.
+const TOOLS_THE_CLI_MAY_LACK: &[&str] = &["Grep", "Glob"];
+
+/// The tool names the CLI lists in its `system/init` message, read once from one short session in a
+/// scratch workspace (no tool is called, so the turn is cheap).
+fn tools_the_cli_lists() -> &'static std::collections::BTreeSet<String> {
+    static LISTED: std::sync::OnceLock<std::collections::BTreeSet<String>> = std::sync::OnceLock::new();
+    LISTED.get_or_init(|| {
+        let workspace = a_fresh_workspace();
+        let output = std::process::Command::new("claude")
+            .current_dir(&workspace)
+            .args([
+                "--print",
+                "Reply with the word ok.",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--setting-sources",
+                "project,local",
+            ])
+            .output()
+            .expect("`claude` must be on PATH; run this through a test-account wrapper");
+        let _ = std::fs::remove_dir_all(&workspace);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let tools: std::collections::BTreeSet<String> = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|v| v["type"] == "system" && v["subtype"] == "init")
+            .and_then(|init| init["tools"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect();
+        assert!(
+            tools.contains("Read"),
+            "the CLI's init message listed no Read tool, so its tool list was not read: {tools:?}"
+        );
+        println!("the CLI lists these tools: {tools:?}");
+        tools
+    })
 }
 
 fn a_fresh_workspace() -> PathBuf {

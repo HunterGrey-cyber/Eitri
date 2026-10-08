@@ -33,6 +33,15 @@
 //!   for the arm below: a CLI that never read the project tier would pass that arm too.
 //! - `Untrusted` (`[USER]`): the rule is not loaded, so the command runs and prints the marker.
 //!
+//! **`additionalDirectories`.** The project's one settings file also names a directory beside the project in
+//! `permissions.additionalDirectories`. The CLI reads a settings file as a whole, so the deny-rule probe shows whether the
+//! entry was read at all: untrusted, the command runs (the file was not loaded); trusted, the rule refuses it. Nothing
+//! model-visible shows a trusted session using the entry itself on this CLI build (its environment block names only the
+//! primary directory, and auto mode's classifier lets a read, a write and an `ls` of the directory through with or without
+//! the entry), so the trusted arm's environment question is printed and asserts nothing, and the untrusted arm's assertion
+//! that the block does not name the directory is a tripwire (it would hold for a trusted session too), not evidence; the
+//! deny rule's fate is the evidence.
+//!
 //! A run in which the model never attempted the exact command, or in which the CLI did not run its
 //! own auto mode, measured nothing and fails as INCONCLUSIVE. A card the CLI raises itself is answered
 //! `deny` here and reported.
@@ -481,4 +490,119 @@ fn an_untrusted_projects_deny_rule_is_not_loaded() {
         probe.other_failures
     );
     observe_force_push(&mut live.0, &fx, tab, "untrusted-force-push");
+}
+
+/// A directory beside the project, named by the project's `additionalDirectories`, holding one file.
+fn add_extra_directory(fx: &Fixture) -> PathBuf {
+    let extra = fx.root.join("extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    let extra = extra.canonicalize().unwrap();
+    std::fs::write(extra.join("note.txt"), "extra-dir-note\n").unwrap();
+    let settings = serde_json::json!({
+        "permissions": { "deny": [format!("Bash({PROBE})")], "additionalDirectories": [extra] }
+    });
+    std::fs::write(
+        fx.project.join(".claude").join("settings.json"),
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    extra
+}
+
+/// One tool-free turn asking the model to quote the lines of its environment block that name a working
+/// directory, and the transcript text the turn produced. The path of the extra directory is a per-run
+/// one the prompt never names, so a reply that holds it was read from the session's own environment.
+fn quote_the_working_directories(set: &mut TabSet, fx: &Fixture, tab: TabId, label: &str) -> String {
+    drive_turn(
+        set,
+        &fx.project,
+        tab,
+        "Without using any tool, quote verbatim every line of your environment information that mentions a \
+         working directory.",
+        label,
+    );
+    assert_runs_auto(set, tab, label);
+    let reply = set
+        .get(tab)
+        .unwrap()
+        .live()
+        .unwrap()
+        .projection()
+        .transcript
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    println!("[trust-auto] {label}: working directories as the model quoted them: {reply:?}");
+    reply
+}
+
+/// The project's one settings file holds the deny rule and an `additionalDirectories` entry for a
+/// directory beside the project, and the CLI reads a settings file as a whole, so the probe command's
+/// fate shows whether the entry was ever read: refused by the rule means the file was loaded, ran means
+/// it was not. The CLI's environment block is asked as well, as a second view: on this build a trusted
+/// session's block names only the primary directory (an entry from a settings file is not listed there),
+/// so the block cannot show the entry taking effect and is asserted only for the untrusted side, where
+/// it must not name the directory.
+#[test]
+#[ignore = "real Claude; run under with EITRI_VERDANDI_CHECKOUT, see the module doc"]
+fn a_trusted_projects_additional_directory_file_is_loaded() {
+    let fx = fixture("extra-trusted");
+    let extra = add_extra_directory(&fx);
+    let (mut live, tab) = auto_tab(&fx.project, ProjectTrust::Trusted);
+    let probe = run_probe(&mut live.0, &fx, tab, "extra-trusted");
+    assert!(
+        probe.attempted,
+        "INCONCLUSIVE: the model never asked for `{PROBE}`, so the file holding the entry was not exercised"
+    );
+    assert!(
+        probe.refused_by_a_rule && !probe.ran,
+        "INCONCLUSIVE: the settings file holding the additionalDirectories entry was not loaded in a trusted \
+         session (ran: {}, refused by a rule: {}, other failures: {:?})",
+        probe.ran,
+        probe.refused_by_a_rule,
+        probe.other_failures
+    );
+    let reply = quote_the_working_directories(&mut live.0, &fx, tab, "extra-trusted-env");
+    println!(
+        "[trust-auto] extra-trusted-env: OBSERVATION ONLY: the environment block names the entry {}: {}",
+        extra.display(),
+        reply.contains(extra.to_str().unwrap())
+    );
+}
+
+#[test]
+#[ignore = "real Claude; run under with EITRI_VERDANDI_CHECKOUT, see the module doc"]
+fn an_untrusted_projects_additional_directory_is_not_loaded() {
+    assert!(
+        agent::setting_sources::loads_user_settings(),
+        "this binary measures the shipped default"
+    );
+    let fx = fixture("extra-untrusted");
+    let extra = add_extra_directory(&fx);
+    let (mut live, tab) = auto_tab(&fx.project, ProjectTrust::Untrusted);
+    let probe = run_probe(&mut live.0, &fx, tab, "extra-untrusted");
+    assert!(
+        probe.attempted,
+        "INCONCLUSIVE: the model never asked for `{PROBE}`, so the file holding the entry was not exercised"
+    );
+    assert!(
+        probe.ran && !probe.refused_by_a_rule,
+        "the settings file holding the additionalDirectories entry was loaded in an untrusted session (ran: {}, \
+         refused by a rule: {}, other failures: {:?})",
+        probe.ran,
+        probe.refused_by_a_rule,
+        probe.other_failures
+    );
+    let reply = quote_the_working_directories(&mut live.0, &fx, tab, "extra-untrusted-env");
+    assert!(
+        reply.contains(&fx.project.display().to_string()),
+        "INCONCLUSIVE: the reply does not show the model read the primary directory out of its environment: \
+         {reply:?}"
+    );
+    assert!(
+        !reply.contains(extra.to_str().unwrap()),
+        "an untrusted session's environment names the project's additionalDirectories entry {}: {reply:?}",
+        extra.display()
+    );
 }
