@@ -61,5 +61,9 @@ name = "hook_protocol"
 required-features = ["legacy-backend"]
 
 [[test]]
+name = "stream_capture_conformance"
+required-features = ["legacy-backend"]
+
+[[test]]
 name = "wire_translation"
 required-features = ["legacy-backend"]
