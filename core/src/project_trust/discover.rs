@@ -855,6 +855,7 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
         findings,
         fingerprint,
         over_budget,
+        user_mcp_servers: env.user_mcp_servers.clone(),
     }
 }
 

@@ -6,9 +6,13 @@ export function isExternalTool(name: string): boolean {
   return CODEX_TOOLS.has(name) || name.startsWith("acp:");
 }
 
+/** Rows (never cards) of Codex's requests that Eitri answered itself, which may name a subagent too. */
+const CODEX_ANSWERED_REQUESTS = new Set(["permissions", "mcpElicitation", "requestUserInput"]);
+
 /** The task name of the subagent whose thread made a call, when Rust labelled the input with one. */
 export function subagentOf(toolName: string, input: unknown): string | null {
-  if (!isExternalTool(toolName) || input === null || typeof input !== "object") return null;
+  if (!(isExternalTool(toolName) || CODEX_ANSWERED_REQUESTS.has(toolName)) || input === null || typeof input !== "object")
+    return null;
   const label = (input as Record<string, unknown>).subagent;
   return typeof label === "string" && label !== "" ? label : null;
 }
@@ -25,6 +29,9 @@ const SHORT_NAMES: Record<string, string> = {
   mcpToolCall: "tool call",
   webSearch: "web search",
   collabAgentToolCall: "subagent",
+  permissions: "extra permissions",
+  mcpElicitation: "tool server form",
+  requestUserInput: "question",
 };
 
 /** The word a collapsed run of calls uses for a tool: Codex's item types read as plain words, every other

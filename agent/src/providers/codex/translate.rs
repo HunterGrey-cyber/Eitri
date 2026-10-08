@@ -212,6 +212,23 @@ pub struct LimitFigure {
 
 // ---------------------------------------------------------------- tool calls
 
+/// The start of a row id built from a thread as well as an item id.
+const THREAD_ROW_PREFIX: &str = "codex-thread:";
+/// The start of every row id Eitri makes up itself (notes, history, rows for requests that had none).
+const EITRI_ROW_PREFIX: &str = "eitri-";
+
+/// The id a call's row goes under. Codex numbers items on each thread alone, so a parent and its subagent
+/// can both run a `call-1`, while the transcript links a row, its result, its card and its notes by this id
+/// alone. A call of the tab's own thread keeps Codex's id; one of another thread, and one of the tab's whose
+/// id could be mistaken for a built or an Eitri id, is `codex-thread:<thread length>:<thread>:<item>`. The
+/// length makes the split unambiguous whatever the two ids hold, so no two calls ever share a row.
+pub fn row_id(tab_thread: &str, thread: &str, item: &str) -> String {
+    if thread == tab_thread && !item.starts_with(THREAD_ROW_PREFIX) && !item.starts_with(EITRI_ROW_PREFIX) {
+        return item.to_string();
+    }
+    format!("{THREAD_ROW_PREFIX}{}:{thread}:{item}", thread.len())
+}
+
 /// A tool call as the transcript names it: the item type Codex gave it, and its input in the shape the
 /// panel draws. `None` for an item that is not a tool call (messages, reasoning, markers).
 pub fn tool_start(item: &ThreadItem) -> Option<(&'static str, Value)> {
@@ -342,6 +359,24 @@ fn bounded_value(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_ids_never_collide_across_threads() {
+        assert_eq!(row_id("tab", "tab", "call-1"), "call-1");
+        let child = row_id("tab", "child", "call-1");
+        assert_ne!(child, "call-1");
+        // A tab id that looks built or made up by Eitri is built too, so it cannot pose as another row.
+        assert_ne!(row_id("tab", "tab", &child), child);
+        assert_ne!(row_id("tab", "tab", "eitri-answered-t1-1"), "eitri-answered-t1-1");
+        // Ids holding the separator still split one way only.
+        assert_ne!(row_id("tab", "a:b", "c"), row_id("tab", "a", "b:c"));
+        let mut seen = std::collections::HashSet::new();
+        for thread in ["tab", "child", "a:b", "a"] {
+            for item in ["call-1", "c", "b:c", "codex-thread:3:tab:x", "eitri-x"] {
+                assert!(seen.insert(row_id("tab", thread, item)), "{thread} {item}");
+            }
+        }
+    }
 
     #[test]
     fn the_version_is_read_from_the_user_agent() {

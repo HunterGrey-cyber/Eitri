@@ -152,9 +152,9 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
     }
 
     // The agent a new tab runs (`agent.default`: "claude", the default, or "codex") and where the
-    // `codex` binary is (`agent.codex.command`). A bad value of either is a startup failure naming
-    // its key, like the keys above; a `codex` that is not installed fails a Codex tab's start, never
-    // the window.
+    // `codex` binary is (`agent.codex.command`, beaten by `EITRI_CODEX`). A bad value of any of them is
+    // a startup failure naming it, like the keys above; a `codex` that is not installed fails a Codex
+    // tab's start, never the window.
     let default_agent = eitri_core::agent_prefs::parse_agent_default(
         kernel.config.borrow().get(eitri_core::agent_prefs::AGENT_DEFAULT_KEY),
     )?;
@@ -166,6 +166,12 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
     }
     let codex_command = eitri_core::agent_prefs::parse_codex_command(
         kernel.config.borrow().get(eitri_core::agent_prefs::CODEX_COMMAND_KEY),
+    )?;
+    // `EITRI_CODEX` beats the key: a value the user exported that names no file fails the window
+    // now, naming the variable, rather than every Codex tab later.
+    eitri_core::agent_prefs::check_codex_env(
+        std::env::var_os(agent::providers::codex::locate::CODEX_ENV).as_deref(),
+        |p| p.is_file(),
     )?;
 
     // Whether sessions load the user's own Claude Code configuration (`agent.user_settings`: true,
@@ -351,6 +357,20 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("agent.codex.command"), "{err}");
+    }
+
+    /// Every window reads `EITRI_CODEX` where it reads its keys: the full window, the companion window
+    /// and the Mac host all go through `load`.
+    #[test]
+    fn load_checks_eitri_codex() {
+        use eitri_core::source_scan as scan;
+        let read = scan::rust_sources(&["panel/src"]);
+        let source = scan::file_with(&read, "pub fn load(kernel: &Kernel");
+        let code = scan::code_only(&source.text);
+        let load = scan::functions(&code, "load");
+        assert_eq!(load.len(), 1, "load not found");
+        assert_eq!(scan::calls(load[0], "check_codex_env"), 1);
+        assert!(load[0].contains("CODEX_ENV"));
     }
 
     #[test]

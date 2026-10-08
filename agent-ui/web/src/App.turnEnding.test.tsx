@@ -11,6 +11,7 @@ import App from "./App";
 import { initialState } from "./reducer";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import { TYPING_GUARD_MS } from "./typingGuard";
+import { resetTimeText } from "./turnEnding";
 import type { AgentUiState, Hello } from "./types";
 /** What Rust really sends for each way a turn can end: its events payload, and the snapshot payload after folding
  *  the same events (a panel reload, a tab switch back). */
@@ -123,6 +124,15 @@ const EXPECTED: Record<string, { row: string; band: string }> = {
   interrupt: { row: "interrupted", band: "interrupted" },
   cli_crash_closed: { row: "the turn ended with an error", band: "turn failed" },
   stream_lost: { row: "the turn did not finish: the session ended", band: "turn did not finish" },
+  // The reset time the ending had, not the later report's.
+  usage_limit: {
+    row: `stopped at the usage limit (resets ${resetTimeText(1_900_000_000)}): You've hit your usage limit.`,
+    band: "limit reached",
+  },
+  usage_limit_reported_after: {
+    row: `stopped at the usage limit (resets ${resetTimeText(1_900_000_000)}): You've hit your usage limit.`,
+    band: "limit reached",
+  },
 };
 
 describe("a turn that did not complete", () => {

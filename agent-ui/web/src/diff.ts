@@ -177,14 +177,22 @@ export function editPreview(toolName: string, input: unknown): EditPreview | nul
   return null;
 }
 
-/** The most lines a Codex change is drawn with. Codex's own diffs are not limited the way a card's `Edit` is,
- *  and a diff missing lines is one a person would approve anyway, so a larger one is counted and not shown. */
+/** The most lines a Codex change is drawn with in a conversation row. Codex's own diffs are not limited the way a
+ *  card's `Edit` is, and a diff missing lines is one a person would approve anyway, so a larger one is counted and
+ *  not shown there. */
 const MAX_CODEX_DIFF_LINES = 2 * MAX_DIFF_LINES;
 
 /** A Codex `fileChange` entry as a reviewable preview. Codex sends a unified diff for an `update` (its hunk
  *  headers are drawn as context lines) and the whole content for an `add` or a `delete`; a kind this build
- *  does not know is drawn as the unified diff it most likely is. Nothing is matched against the disk. */
-export function codexChangePreview(change: { path: string; kind: string; diff: string }): EditPreview {
+ *  does not know is drawn as the unified diff it most likely is. Nothing is matched against the disk.
+ *
+ *  `whole` draws every line however many there are: a card asking to approve the change must show all of what it
+ *  approves, since counts beside an Approve would have a person approve lines they never saw. Its size is bounded
+ *  before it reaches a card (Eitri declines a change it did not see in full, or one over 1 MiB, itself). */
+export function codexChangePreview(
+  change: { path: string; kind: string; diff: string },
+  { whole = false }: { whole?: boolean } = {},
+): EditPreview {
   const raw = lines(change.diff);
   let diff: DiffLine[];
   if (change.kind === "add") diff = raw.map((text) => ({ kind: "added", text }));
@@ -210,7 +218,7 @@ export function codexChangePreview(change: { path: string; kind: string; diff: s
   const removed = diff.filter((l) => l.kind === "removed").length;
   return {
     filePath: change.path,
-    diff: diff.length > MAX_CODEX_DIFF_LINES ? null : diff,
+    diff: !whole && diff.length > MAX_CODEX_DIFF_LINES ? null : diff,
     added,
     removed,
     replaceAll: false,

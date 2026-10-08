@@ -1637,6 +1637,7 @@ pub fn serialize_snapshot_with_notes_for_js(
                 "reason": ending.detail.reason,
                 "apiErrorStatus": ending.detail.api_error_status,
                 "message": ending.detail.message,
+                "resetsAt": ending.resets_at,
             })
         })
         .collect();
@@ -3498,6 +3499,12 @@ mod tests {
                 ),
             }
         };
+        let limits = |resets_at: i64| AgentDomainEvent::AccountLimits {
+            used_percent: 100.0,
+            window_minutes: Some(300),
+            resets_at: Some(resets_at),
+            plan: Some("pro".into()),
+        };
         let cases: Vec<(&str, Vec<AgentDomainEvent>)> = vec![
             (
                 "api_error",
@@ -3579,6 +3586,38 @@ mod tests {
                 vec![AgentDomainEvent::SessionUnavailable {
                     reason: "the sidecar's event stream ended without closing the session".into(),
                 }],
+            ),
+            // An agent that reports its account's limits (Codex): the row keeps the reset time it
+            // ended with, whatever a later report says.
+            (
+                "usage_limit",
+                vec![
+                    limits(1_900_000_000),
+                    ended(
+                        TurnOutcome::LimitReached,
+                        true,
+                        "You've hit your usage limit.",
+                        Some("usage_limit"),
+                        None,
+                        &[],
+                    ),
+                    limits(1_900_086_400),
+                ],
+            ),
+            // The report that explains the stop came just after it.
+            (
+                "usage_limit_reported_after",
+                vec![
+                    ended(
+                        TurnOutcome::LimitReached,
+                        true,
+                        "You've hit your usage limit.",
+                        Some("usage_limit"),
+                        None,
+                        &[],
+                    ),
+                    limits(1_900_000_000),
+                ],
             ),
         ];
 

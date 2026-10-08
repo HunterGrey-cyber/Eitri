@@ -196,6 +196,9 @@ pub struct RestoreRun {
     /// The tabs the restore started, in saved order, until one fails or is closed: where the screen
     /// goes when the tab it was on did not come back.
     pub(crate) order: Vec<TabId>,
+    /// The tabs brought back holding their resume for their own agent's trust answer: counted as
+    /// restored, and started (or not) by that answer, outside this tally.
+    pub(crate) awaiting: Vec<TabId>,
     pub(crate) restored: usize,
     pub(crate) failed: Vec<Skipped>,
     pub(crate) total: usize,
@@ -215,6 +218,7 @@ impl RestoreRun {
             first_agent,
             pending: BTreeMap::new(),
             order: Vec::new(),
+            awaiting: Vec::new(),
             restored: 0,
             failed: skipped,
             total,
@@ -224,6 +228,11 @@ impl RestoreRun {
     /// Whether `tab` is one of this restore's, still connecting.
     pub fn owns(&self, tab: TabId) -> bool {
         self.pending.contains_key(&tab)
+    }
+
+    /// The tabs that came back waiting for their own agent's trust answer, in saved order.
+    pub fn awaiting_trust(&self) -> &[TabId] {
+        &self.awaiting
     }
 
     /// Whether `tab` is the one the restore began in.
@@ -247,6 +256,9 @@ impl RestoreRun {
             self.order.retain(|t| *t != tab);
             self.total -= 1;
         }
+        // A tab that came back waiting for its trust answer and was closed is no place to go back to.
+        self.order.retain(|t| still_open(*t));
+        self.awaiting.retain(|t| still_open(*t));
     }
 
     /// The first tab the restore started that is still there (connecting or connected): where the

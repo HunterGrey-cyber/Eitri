@@ -35,7 +35,7 @@ use eitri_core::agent_bridge::{
     TrustAction, TrustDiffView, TrustItemView, TrustPromptState, TrustPromptView, TrustRememberView,
 };
 use eitri_core::project_trust::{
-    civil_date, Discovery, Finding, Fingerprint, Profile, ProfileEnv, Remember, TrustState, TrustStore,
+    civil_date, Discovery, Finding, Fingerprint, Profile, ProfileEnv, Remember, TrustState, TrustStore, UserCodexConfig,
 };
 use eitri_core::tabs::TabId;
 
@@ -1361,6 +1361,17 @@ fn codex_home_guess(var: Option<&std::ffi::OsStr>, home: Option<&Path>, root: &P
     }
 }
 
+/// The user's own Codex `config.toml` in `dir`, read the way Codex reads it: a link at the file is
+/// followed, since a user who keeps it in a dotfiles repository links it into place (read without
+/// following, such a file would hide every server the user has). The file it names is still read as
+/// a regular file of at most 4 MiB without blocking. Only the alternate names of `AGENTS.md` and the
+/// names of MCP servers are kept. Runs on the worker only.
+fn read_codex_user_config(dir: &Path) -> UserCodexConfig {
+    let file = dir.join("config.toml");
+    let resolved = std::fs::canonicalize(&file).unwrap_or(file);
+    eitri_core::project_trust::read_user_codex_config(&resolved)
+}
+
 /// The worker: the only code here that touches the disk. It owns the store, runs each job in the
 /// order queued, and ends when the gate (and so the sender) is dropped.
 fn run_worker(
@@ -1382,15 +1393,22 @@ fn run_worker(
     let guess = codex_home_guess(codex_home.as_deref().map(Path::as_os_str), home, &root);
     let codex_home = guess.skip.map(canonical);
     let codex_config_dir = guess.config.map(canonical);
-    // Read again for every Codex job: the user may change the alternate names while Eitri runs.
+    // Read again for every Codex job: the user may change their configuration while Eitri runs.
     let env_for = |profile: &Profile| match profile {
-        Profile::Codex => ProfileEnv {
-            fallback_names: codex_config_dir
-                .as_deref()
-                .map(eitri_core::project_trust::codex_fallback_names)
-                .unwrap_or_default(),
-            codex_home: codex_home.clone(),
-        },
+        Profile::Codex => {
+            let user = codex_config_dir.as_deref().map_or_else(
+                || UserCodexConfig {
+                    fallback_names: Vec::new(),
+                    mcp_servers: None,
+                },
+                read_codex_user_config,
+            );
+            ProfileEnv {
+                fallback_names: user.fallback_names,
+                user_mcp_servers: user.mcp_servers,
+                codex_home: codex_home.clone(),
+            }
+        }
         Profile::Claude | Profile::Acp { .. } => ProfileEnv::default(),
     };
     let check = |store: &TrustStore, profile: &Profile| {
@@ -2684,6 +2702,7 @@ mod tests {
             findings,
             fingerprint: Fingerprint([2; 32]),
             over_budget: None,
+            user_mcp_servers: None,
         };
         let (mut gate, _jobs, done) = TrustGate::detached(p("/home/u/p"));
         done.send(Done::Checked {
@@ -2782,8 +2801,9 @@ mod tests {
         )
     }
 
-    /// The disk is touched by the worker only: outside `run_worker` (and these tests) no discovery,
-    /// no record read, write or removal, and no file system call at all.
+    /// The disk is touched by the worker only: outside `run_worker`, the helper it reads the user's
+    /// Codex configuration with (and these tests) no discovery, no record read, write or removal, and
+    /// no file system call at all.
     #[test]
     fn only_the_worker_touches_the_disk() {
         let code = own_source();
@@ -2803,11 +2823,25 @@ mod tests {
                 "the scan would not see `{anchor}` in run_worker"
             );
         }
+        // The one helper the worker reads the user's Codex configuration with; called from nowhere
+        // else (checked below, since it is cut out with the worker).
+        let helper = scan::functions(&code, "read_codex_user_config");
+        assert_eq!(helper.len(), 1, "read_codex_user_config not found");
+        assert!(
+            worker[0].contains("read_codex_user_config"),
+            "the worker reads the user's config"
+        );
         let tests = scan::modules(&code, "tests");
         assert_eq!(tests.len(), 1, "the tests module not found");
         let mut cut: Vec<&str> = worker;
+        cut.extend(helper);
         cut.extend(tests);
         let rest = scan::without(&code, &cut);
+        assert_eq!(
+            scan::word_ends(&rest, "read_codex_user_config").len(),
+            1,
+            "read_codex_user_config is named outside the worker (beyond its own definition)"
+        );
         for word in ["for_root", "discover", "canonicalize"] {
             assert!(scan::word_ends(&rest, word).is_empty(), "`{word}` outside the worker");
         }
@@ -2981,6 +3015,32 @@ mod tests {
         assert!(PathBuf::from(format!("{}.codex", fx.record_file().display())).is_file());
         // Codex's record written does not clear Claude's failure.
         assert_eq!(gate.show(A, 4, &CLAUDE).unwrap().remember, TrustRememberView::Window);
+    }
+
+    /// The user's Codex `config.toml` is read through a link the user made, as Codex reads it, and a
+    /// link to something other than a regular file still leaves the servers unknown.
+    #[test]
+    fn the_user_codex_config_is_read_through_a_link() {
+        let fx = Fx::new("codex-user-link");
+        let dotfiles = fx.outer.join("dotfiles/codex.toml");
+        std::fs::create_dir_all(dotfiles.parent().unwrap()).unwrap();
+        std::fs::write(&dotfiles, b"[mcp_servers.context7]\ncommand = \"npx\"\n").unwrap();
+        let codex_home = fx.home.join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::os::unix::fs::symlink(&dotfiles, codex_home.join("config.toml")).unwrap();
+        assert_eq!(
+            read_codex_user_config(&codex_home).mcp_servers,
+            Some(vec!["context7".to_string()])
+        );
+
+        let to_dir = fx.outer.join("to-dir");
+        std::fs::create_dir_all(&to_dir).unwrap();
+        std::os::unix::fs::symlink(fx.outer.join("dotfiles"), to_dir.join("config.toml")).unwrap();
+        assert_eq!(read_codex_user_config(&to_dir).mcp_servers, None);
+        assert_eq!(
+            read_codex_user_config(&fx.outer.join("absent")).mcp_servers,
+            Some(Vec::new())
+        );
     }
 
     /// `CODEX_HOME` as Codex reads it: unset or empty is `~/.codex`, an absolute one is used as is,

@@ -674,6 +674,25 @@ impl RestoreGo {
             .map(|t| (t.planned.agent.clone(), t.planned.provider_session_id.clone()))
             .collect()
     }
+
+    /// The agent whose trust answer the restore itself waits for: Claude's when any Claude tab comes
+    /// back (those are started on that one answer), else the first tab's agent's. `None` for a restore
+    /// with no tab to start.
+    pub fn trust_agent(&self) -> Option<AgentId> {
+        if self.tabs.iter().any(|t| t.planned.agent == AgentId::Claude) {
+            return Some(AgentId::Claude);
+        }
+        self.tabs.first().map(|t| t.planned.agent.clone())
+    }
+}
+
+/// How [`TabSet::start_restore`]'s `connect` begins one saved tab.
+pub enum RestoreConnect {
+    /// The resume is begun; its result arrives here.
+    Started(mpsc::Receiver<Result<AgentBackend, BackendError>>),
+    /// Not begun: the tab comes back holding its resume, waiting for its own agent's trust answer
+    /// (a tab of another agent than the one the restore's own answer was about).
+    AwaitTrust,
 }
 
 pub enum RestoreStep {
@@ -2656,7 +2675,7 @@ impl TabSet {
     /// resume has returned.
     pub fn start_restore<F>(&mut self, from: TabId, go: RestoreGo, mut connect: F) -> RestoreRun
     where
-        F: FnMut(&AgentId, &str) -> Result<mpsc::Receiver<Result<AgentBackend, BackendError>>, String>,
+        F: FnMut(&AgentId, &str) -> Result<RestoreConnect, String>,
     {
         let total = go.tabs.len() + go.skipped.len();
         let mut run = RestoreRun::new(
@@ -2675,8 +2694,8 @@ impl TabSet {
                 started.push((id, open));
                 continue;
             }
-            let result_rx = match connect(&planned.agent, &id) {
-                Ok(rx) => rx,
+            let connected = match connect(&planned.agent, &id) {
+                Ok(connected) => connected,
                 Err(reason) => {
                     run.failed.push(Skipped {
                         label: planned.label,
@@ -2691,15 +2710,37 @@ impl TabSet {
             let tab = self.get_mut(target).expect("route_resume names a tab it has");
             tab.mode = mode;
             tab.agent = planned.agent;
-            tab.backend = TabBackend::Starting(PendingStart {
-                request_id: format!("restore-{}", n + 1),
-                result_rx,
-                first_turn: None,
-                resume: Some(id.clone()),
-                resumed_title: planned.title,
-                resumed_name: planned.name,
-            });
-            run.pending.insert(target, planned.label);
+            let request_id = format!("restore-{}", n + 1);
+            match connected {
+                RestoreConnect::Started(result_rx) => {
+                    tab.backend = TabBackend::Starting(PendingStart {
+                        request_id,
+                        result_rx,
+                        first_turn: None,
+                        resume: Some(id.clone()),
+                        resumed_title: planned.title,
+                        resumed_name: planned.name,
+                    });
+                    run.pending.insert(target, planned.label);
+                }
+                // Back as a tab holding its session, so it is listed among the saved tabs while it
+                // waits, and counted as brought back: its start is now that tab's own, as a resume by
+                // hand would be.
+                RestoreConnect::AwaitTrust => {
+                    tab.backend = TabBackend::AwaitingTrust(AwaitingTrust {
+                        start: DeferredStart::Resume {
+                            request_id,
+                            provider_session_id: id.clone(),
+                            resumed_title: planned.title,
+                            resumed_name: planned.name,
+                        },
+                        asking: None,
+                        recording: false,
+                    });
+                    run.restored += 1;
+                    run.awaiting.push(target);
+                }
+            }
             run.order.push(target);
             started.push((id, target));
         }
@@ -8190,7 +8231,7 @@ mod tests {
         let mut asked = Vec::new();
         set.start_restore(from, go, |_, id| {
             asked.push(id.to_string());
-            Ok(mpsc::channel().1)
+            Ok(RestoreConnect::Started(mpsc::channel().1))
         });
         assert_eq!(asked, ["a", "b", "c"]);
         assert_eq!(mode_of(&set, "a"), SessionModeChoice::Auto);
@@ -8215,7 +8256,7 @@ mod tests {
         let go = set.answer_restore(prompt.nonce, false).unwrap();
         assert_eq!(go.downgraded, 2);
         let from = set.active();
-        set.start_restore(from, go, |_, _| Ok(mpsc::channel().1));
+        set.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
         assert_eq!(mode_of(&set, "a"), SessionModeChoice::Auto);
         assert_eq!(mode_of(&set, "b"), SessionModeChoice::Auto);
         assert_eq!(
@@ -8277,7 +8318,7 @@ mod tests {
         };
         assert_eq!((kept.downgraded, kept.asked), (0, false));
         let from = set.active();
-        set.start_restore(from, kept, |_, _| Ok(mpsc::channel().1));
+        set.start_restore(from, kept, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
         assert_eq!(
             mode_of(&set, "a"),
             SessionModeChoice::Bypass,
@@ -8300,7 +8341,7 @@ mod tests {
         let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
             panic!("no question")
         };
-        let run = set.start_restore(from, go, |_, _| Ok(mpsc::channel().1));
+        let run = set.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
         let numbers: Vec<(u16, Option<String>)> =
             set.tabs().iter().map(|t| (t.number, t.provider_session_id())).collect();
         assert_eq!(
@@ -8336,7 +8377,7 @@ mod tests {
         let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
             panic!("no question")
         };
-        set.start_restore(from, go, |_, _| Ok(mpsc::channel().1));
+        set.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
         assert_eq!(set.active_tab().provider_session_id().as_deref(), Some("a"));
     }
 
@@ -8360,7 +8401,7 @@ mod tests {
         let mut connected = Vec::new();
         let run = set.start_restore(from, go, |_, id| {
             connected.push(id.to_string());
-            Ok(mpsc::channel().1)
+            Ok(RestoreConnect::Started(mpsc::channel().1))
         });
         assert_eq!(connected, ["s-new"], "the open one is not connected again");
         assert_eq!(set.tab_with_session("s-open"), Some(holder));
@@ -8387,7 +8428,7 @@ mod tests {
             if id == "held" {
                 Err("open in another window".to_string())
             } else {
-                Ok(mpsc::channel().1)
+                Ok(RestoreConnect::Started(mpsc::channel().1))
             }
         });
         assert_eq!(
@@ -8426,7 +8467,7 @@ mod tests {
         let mut run = set.start_restore(from, go, |_, _| {
             let (tx, rx) = mpsc::channel();
             senders.push(tx);
-            Ok(rx)
+            Ok(RestoreConnect::Started(rx))
         });
         assert_eq!(run.outcome(), None);
 
@@ -8473,7 +8514,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel();
         let mut rx = Some(rx);
-        let mut run = set.start_restore(from, go, |_, _| Ok(rx.take().unwrap()));
+        let mut run = set.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(rx.take().unwrap())));
         tx.send(Err(refused("refused"))).unwrap();
         for collected in set.collect_starts() {
             if let StartCollected::Failed { tab, error, .. } = collected {
@@ -9927,7 +9968,7 @@ mod external_tab_tests {
         // 3. Then the starts, each told its agent.
         let run = set.start_restore(from, go, |agent, id| {
             asked.push((agent.clone(), id.to_string()));
-            Ok(mpsc::channel().1)
+            Ok(RestoreConnect::Started(mpsc::channel().1))
         });
         assert_eq!(
             asked,
@@ -9944,6 +9985,73 @@ mod external_tab_tests {
         assert_eq!(set.get(from).unwrap().agent(), &AgentId::Claude);
         // A failed start puts the first tab back as it was, its agent included.
         assert_eq!(run.back_to(from), Some((SessionModeChoice::Auto, AgentId::Claude)));
+    }
+
+    /// A saved tab of another agent than the one the restore's own trust answer was about comes back
+    /// holding its resume for its own agent's question: listed among the saved tabs while it waits,
+    /// in the mode the bypass question gave it, and counted as brought back.
+    #[test]
+    fn a_restored_external_tab_waits_for_its_own_trust_answer() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let from = set.active();
+        let plan = RestorePlan {
+            items: vec![
+                planned(AgentId::Claude, "claude-a", SessionModeChoice::Auto),
+                planned(AgentId::Codex, "codex-b", SessionModeChoice::Bypass),
+            ],
+            skipped: Vec::new(),
+            active_session: Some("codex-b".into()),
+        };
+        let RestoreStep::Confirm(prompt) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("a saved bypass tab is asked about first")
+        };
+        let go = set.answer_restore(prompt.nonce, true).unwrap();
+        assert_eq!(
+            go.trust_agent(),
+            Some(AgentId::Claude),
+            "the Claude tabs start on its answer"
+        );
+        let mut started: Vec<String> = Vec::new();
+        let run = set.start_restore(from, go, |agent, id| {
+            if agent.is_external() {
+                return Ok(RestoreConnect::AwaitTrust);
+            }
+            started.push(id.to_string());
+            Ok(RestoreConnect::Started(mpsc::channel().1))
+        });
+        assert_eq!(started, ["claude-a"]);
+        let codex = set.tab_with_session("codex-b").expect("the Codex tab came back");
+        assert_eq!(run.awaiting_trust(), &[codex]);
+        let t = set.get(codex).unwrap();
+        assert_eq!(t.agent(), &AgentId::Codex);
+        assert_eq!(t.mode(), SessionModeChoice::Bypass);
+        assert!(matches!(
+            &t.backend,
+            TabBackend::AwaitingTrust(AwaitingTrust {
+                start: DeferredStart::Resume { provider_session_id, .. },
+                asking: None,
+                recording: false,
+            }) if provider_session_id == "codex-b"
+        ));
+        assert_eq!(set.active(), codex, "the saved active tab is shown");
+        let saved = set.saved_snapshot("conv").unwrap();
+        assert_eq!(saved.external_tabs.len(), 1, "kept in the saved file while it waits");
+        assert_eq!(saved.external_tabs[0].provider_session_id, "codex-b");
+        assert_eq!(saved.active_external, Some(0));
+        assert_eq!(run.outcome(), None, "claude-a is still connecting");
+        assert_eq!(run.restored, 1, "the waiting tab is back");
+
+        // A restore of another agent's tabs alone waits for that agent's answer.
+        let only = RestorePlan {
+            items: vec![planned(AgentId::Codex, "codex-c", SessionModeChoice::Auto)],
+            skipped: Vec::new(),
+            active_session: None,
+        };
+        let RestoreStep::Go(go) = set.begin_restore(only, BypassPolicy::Ask) else {
+            panic!("nothing in bypass, nothing to ask")
+        };
+        assert_eq!(go.trust_agent(), Some(AgentId::Codex));
+        drop(go);
     }
 
     #[test]

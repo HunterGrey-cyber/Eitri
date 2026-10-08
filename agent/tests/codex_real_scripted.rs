@@ -1459,3 +1459,163 @@ fn tool_approval_is_a_form_for_the_server() {
         peer.close();
     }
 }
+
+// ------------------------------------------------------------------------------------ the plain tool set
+
+/// Under a model with the plain tool set (no code mode: a slug Codex has no catalog entry for), Codex
+/// announces a spawned child only by the `collabAgentToolCall` whose end names it, never by a
+/// `subAgentActivity`. `CodexProvider` itself drives this run: the parent spawns a child and ends its turn
+/// without waiting, the child writes into the project two seconds later and then asks to leave the
+/// sandbox. The child is a member of the tab's family all the same: its card names it, its write lands
+/// inside the tab's turn, and the tab's turn ends only after the child's.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn plain_tool_spawn_is_followed_by_the_family() {
+    use agent::providers::codex::{CodexLaunch, CodexProvider};
+    use agent::{
+        AgentDomainEvent, AgentProvider, ExternalProvider, ExternalStart, PermissionDecision, ResolvePermissionRequest,
+        Reviewer, SendTurnRequest, TurnPolicy,
+    };
+    use std::ffi::OsString;
+
+    let codex = real_codex();
+    let s = Scratch::new("plain-spawn");
+    let outside = s.dir("outside");
+    let for_child = |step: Step| step.when_body_has(CHILD_TASK).unless_body_has(PARENT_PROMPT);
+    let model = ScriptedModel::start(vec![
+        Step::call(
+            "sp1",
+            Some("multi_agent_v1"),
+            "spawn_agent",
+            &json!({"task_name": "child", "message": CHILD_TASK, "fork_turns": "none"}),
+        )
+        .when_body_has(PARENT_PROMPT)
+        .unless_body_has("\"sp1\""),
+        for_child(Step::exec("pc1", "sleep 2; touch child-late-write", false)).unless_body_has("\"pc1\""),
+        for_child(Step::exec(
+            "pc2",
+            &format!("touch {}/child-escalated", text_of(&outside)),
+            true,
+        ))
+        .when_body_has("\"pc1\"")
+        .unless_body_has("\"pc2\""),
+    ])
+    .expect("model");
+    let home = s.dir("home");
+    write_home_for(&home, &model, "eitri-plain-tools", "");
+    let project = s.dir("proj");
+    write_project(&project, "");
+
+    let no_proxy = OsString::from("127.0.0.1,localhost");
+    let provider = CodexProvider::connect_with_env(
+        CodexLaunch {
+            program: codex.clone(),
+            cwd: project.clone(),
+            state_home: s.dir("state"),
+        },
+        ["app-server", "--listen", "stdio://"]
+            .iter()
+            .map(OsString::from)
+            .collect(),
+        vec![
+            (OsString::from("CODEX_HOME"), home.as_os_str().to_os_string()),
+            (OsString::from("NO_PROXY"), no_proxy.clone()),
+            (OsString::from("no_proxy"), no_proxy),
+        ],
+        [
+            "TMUX",
+            "TMUX_PANE",
+            "NVIM",
+            "NVIM_LISTEN_ADDRESS",
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect(),
+    )
+    .expect("the handshake passes");
+    let policy = TurnPolicy {
+        reviewer: Reviewer::User,
+    };
+    let thread = provider
+        .start(ExternalStart {
+            cwd: text_of(&project).to_string(),
+            plan: plan(&project, DirTrust::Untrusted),
+            policy,
+            resume: None,
+        })
+        .expect("the session starts");
+    provider
+        .send_turn_with(
+            SendTurnRequest {
+                session_id: thread.clone(),
+                text: PARENT_PROMPT.to_string(),
+            },
+            policy,
+        )
+        .expect("the turn starts");
+
+    let mut events: Vec<AgentDomainEvent> = Vec::new();
+    let end = Instant::now() + TURN_BUDGET;
+    let card = loop {
+        events.extend(provider.pump());
+        if let Some(card) = events.iter().find_map(|e| match e {
+            AgentDomainEvent::PermissionRequested {
+                permission_id, input, ..
+            } => Some((permission_id.clone(), input.clone())),
+            _ => None,
+        }) {
+            break card;
+        }
+        assert!(Instant::now() < end, "no card came; the events so far: {events:#?}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let is_completed = |e: &AgentDomainEvent| matches!(e, AgentDomainEvent::TurnCompleted { .. });
+    assert!(
+        !events.iter().any(is_completed),
+        "the tab's turn ended while the child ran: {events:#?}"
+    );
+    assert!(
+        project.join("child-late-write").exists(),
+        "the child's late write came before its card"
+    );
+    let label = card.1["subagent"].as_str().unwrap_or_default().to_string();
+    assert!(label.starts_with("/root/"), "the card names the subagent: {}", card.1);
+    // A `subAgentActivity` would have named it by its task; the collab call names only its thread.
+    assert_ne!(label, "/root/child", "this run did not take the plain-tool path");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::ToolCallStarted { name, input, .. }
+                if name == "commandExecution" && input["subagent"] == label.as_str()
+                    && input["command"].as_str().is_some_and(|c| c.contains("child-late-write"))
+        )),
+        "the child's write is a row of the tab's turn: {events:#?}"
+    );
+    provider
+        .resolve_permission(ResolvePermissionRequest {
+            session_id: thread.clone(),
+            permission_id: card.0,
+            decision: PermissionDecision::Deny { reason: None },
+        })
+        .expect("the answer is taken");
+    let end = Instant::now() + TURN_BUDGET;
+    while !events.iter().any(is_completed) {
+        events.extend(provider.pump());
+        assert!(Instant::now() < end, "the tab's turn never ended: {events:#?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!outside.join("child-escalated").exists(), "a declined escalation ran");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentDomainEvent::TurnStarted { .. }))
+            .count(),
+        1,
+        "one tab turn: {events:#?}"
+    );
+    provider
+        .close_session(agent::CloseSessionRequest { session_id: thread })
+        .expect("closes");
+}

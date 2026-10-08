@@ -30,8 +30,8 @@ export function resetTimeText(resetsAt: number, now: Date = new Date()): string 
 /** The row's one line, in plain words, for a turn that did not complete. The provider's own message follows
  *  after a colon when it said anything; it is shown as it came (Rust already trimmed and capped it), and
  *  nothing here reads a reset time out of it -- if the CLI wrote one into its text, it is in the text.
- *  `resetsAt` is the reset time of the account's latest limit report, when the agent gave one (Codex does,
- *  Claude Code does not): a turn stopped by the usage limit says when it ends. */
+ *  `resetsAt` is the reset time the ending kept from the account's limit reports, when the agent gave one (Codex
+ *  does, Claude Code does not): a turn stopped by the usage limit says when it ends. */
 export function turnEndingText(ending: Wording, resetsAt: number | null = null): string {
   const message = ending.message !== null && ending.message !== "" ? `: ${ending.message}` : "";
   const reason = ending.reason ?? "";

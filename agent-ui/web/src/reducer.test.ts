@@ -1017,7 +1017,7 @@ describe("turn endings", () => {
   it("a failed turn pushes one item with the detail's fields, at the event's own seq, and sets lastTurnEnding", () => {
     const before = running();
     const state = applyEvent(before, ended("failed", { reason: "api_error", api_error_status: 500, message: "boom" }));
-    expect(state.turnEndings).toEqual([{ seq: before.nextSeq, turnId: "t1", kind: "failed", reason: "api_error", apiErrorStatus: 500, message: "boom" }]);
+    expect(state.turnEndings).toEqual([{ seq: before.nextSeq, turnId: "t1", kind: "failed", reason: "api_error", apiErrorStatus: 500, message: "boom", resetsAt: null }]);
     expect(state.lastTurnEnding).toBe("failed");
     expect(state.activeTurnId).toBeNull();
   });
@@ -1026,6 +1026,27 @@ describe("turn endings", () => {
     const state = applyEvent(running(), ended(outcome, { reason: "max_turns", api_error_status: null, message: null }));
     expect(state.turnEndings.map((e) => [e.kind, e.reason])).toEqual([[outcome, "max_turns"]]);
     expect(state.lastTurnEnding).toBe(outcome);
+  });
+
+  it("an ending keeps the reset time it had; a later report fills one that had none, until the next turn", () => {
+    const limits = (resets_at: number) =>
+      ({ type: "account_limits", used_percent: 100, window_minutes: 300, resets_at, plan: null }) as AgentDomainEvent;
+    const usage = { reason: "usage_limit", api_error_status: null, message: null };
+    let state = applyEvent(running(), limits(1000));
+    state = applyEvent(state, ended("limit_reached", usage));
+    state = applyEvent(state, limits(2000));
+    expect(state.turnEndings[0].resetsAt).toBe(1000);
+    expect(state.accountLimits?.resetsAt).toBe(2000);
+
+    let late = applyEvent(running(), ended("limit_reached", usage));
+    expect(late.turnEndings[0].resetsAt).toBeNull();
+    late = applyEvent(late, limits(3000));
+    late = applyEvent(late, limits(4000));
+    expect(late.turnEndings[0].resetsAt).toBe(3000);
+    late = applyEvent(late, { type: "turn_started", turn_id: "t2" } as AgentDomainEvent);
+    late = applyEvent(late, ended("limit_reached", usage));
+    late = applyEvent(late, limits(5000));
+    expect(late.turnEndings.map((e) => e.resetsAt)).toEqual([3000, 4000]);
   });
 
   it("a completed turn adds nothing and leaves lastTurnEnding as it was", () => {
@@ -1065,7 +1086,7 @@ describe("turn endings", () => {
     it.each(events)("%s pushes a lost item for the active turn", (_name, event) => {
       const before = running();
       const state = applyEvent(before, event);
-      expect(state.turnEndings).toEqual([{ seq: before.nextSeq, turnId: "t1", kind: "lost", reason: null, apiErrorStatus: null, message: null }]);
+      expect(state.turnEndings).toEqual([{ seq: before.nextSeq, turnId: "t1", kind: "lost", reason: null, apiErrorStatus: null, message: null, resetsAt: null }]);
       expect(state.lastTurnEnding).toBe("lost");
     });
     it.each(events)("%s with no turn running pushes nothing", (_name, event) => {

@@ -5,6 +5,7 @@
 //! the recordings where one has the shape and built by hand where none does. No real Codex runs here and no
 //! model turn is spent.
 
+use agent::providers::codex::translate::row_id;
 use agent::providers::codex::{CodexLaunch, CodexProvider};
 use agent::{
     AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind, DirTrust, ExternalProvider, ExternalStart,
@@ -238,12 +239,30 @@ fn position(events: &[AgentDomainEvent], want: impl Fn(&AgentDomainEvent) -> boo
         .unwrap_or_else(|| panic!("no such event in {events:#?}"))
 }
 
-fn tool_started(id: &'static str) -> impl Fn(&AgentDomainEvent) -> bool {
-    move |e| matches!(e, AgentDomainEvent::ToolCallStarted { tool_use_id, .. } if tool_use_id == id)
+fn tool_started(id: impl Into<String>) -> impl Fn(&AgentDomainEvent) -> bool {
+    let id = id.into();
+    move |e| matches!(e, AgentDomainEvent::ToolCallStarted { tool_use_id, .. } if *tool_use_id == id)
 }
 
-fn tool_completed(id: &'static str) -> impl Fn(&AgentDomainEvent) -> bool {
-    move |e| matches!(e, AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } if tool_use_id == id)
+fn tool_completed(id: impl Into<String>) -> impl Fn(&AgentDomainEvent) -> bool {
+    let id = id.into();
+    move |e| matches!(e, AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } if *tool_use_id == id)
+}
+
+/// The row id of item `item` on whichever thread ran it, read off the row that started.
+fn row_named(events: &[AgentDomainEvent], item: &str) -> String {
+    let suffix = format!(":{item}");
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::ToolCallStarted { tool_use_id, .. }
+                if tool_use_id == item || tool_use_id.ends_with(&suffix) =>
+            {
+                Some(tool_use_id.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no row for {item} in {events:#?}"))
 }
 
 fn alive(pid: u32) -> bool {
@@ -298,7 +317,14 @@ fn input_of<'a>(events: &'a [AgentDomainEvent], tool: &str) -> &'a Value {
 /// sandbox. `pause_after_parent_ms` stands for the time the recording shows between the parent's end and
 /// the child's first command, so a test can look at the tab between the two.
 fn late_child_script(pause_after_parent_ms: u64) -> (Vec<Value>, String, String) {
-    let text = std::fs::read_to_string(format!("{FIXTURES}/m4-r2-a.jsonl")).expect("the recording exists");
+    replay_script("m4-r2-a.jsonl", pause_after_parent_ms)
+}
+
+/// A recording of the probe as stand-in steps after the handshake, with the ids of Eitri's own requests
+/// moved past `account/read` and a pause after the parent's turn ends. Returns the steps, the tab's thread
+/// and the tab's first turn.
+fn replay_script(fixture: &str, pause_after_parent_ms: u64) -> (Vec<Value>, String, String) {
+    let text = std::fs::read_to_string(format!("{FIXTURES}/{fixture}")).expect("the recording exists");
     let shift = |id: u64| if id >= 2 { id + 1 } else { id };
     let mut steps = handshake();
     let (mut thread, mut turn) = (String::new(), String::new());
@@ -439,8 +465,9 @@ fn child_late_write_lands_inside_the_tab_turn() {
     events.extend(until_turn_completed(&provider));
 
     let started = position(&events, is_started);
-    let write_started = position(&events, tool_started("cs1"));
-    let write_done = position(&events, tool_completed("cs1"));
+    let cs1 = row_named(&events, "cs1");
+    let write_started = position(&events, tool_started(cs1.clone()));
+    let write_done = position(&events, tool_completed(cs1.clone()));
     let completed = position(&events, is_completed);
     assert!(
         started < write_started && write_started < write_done && write_done < completed,
@@ -455,8 +482,11 @@ fn child_late_write_lands_inside_the_tab_turn() {
             _ => {}
         }
     }
-    assert_eq!(input_of(&events, "cs1")["subagent"], "/root/child");
-    assert_eq!(input_of(&events, "gc1")["subagent"], "/root/child/grand");
+    assert_eq!(input_of(&events, &cs1)["subagent"], "/root/child");
+    assert_eq!(
+        input_of(&events, &row_named(&events, "gc1"))["subagent"],
+        "/root/child/grand"
+    );
 }
 
 // ---------------------------------------------------------------- announcements
@@ -501,13 +531,13 @@ fn announcement_only_from_member_threads() {
     );
     let events = until_turn_completed(&provider);
     assert_eq!(
-        input_of(&events, "grand-cmd")["subagent"],
+        input_of(&events, &row_id("tab", "grand", "grand-cmd"))["subagent"],
         "/root/child/grand",
         "a grandchild announced on its parent's thread is a member"
     );
-    for foreign in ["ghost-cmd", "stranger-cmd"] {
+    for (thread, foreign) in [("ghost", "ghost-cmd"), ("stranger", "stranger-cmd")] {
         assert!(
-            !events.iter().any(tool_started(foreign)),
+            !events.iter().any(tool_started(row_id("tab", thread, foreign))),
             "{foreign} belongs to no thread of the family: {events:#?}"
         );
     }
@@ -537,7 +567,101 @@ fn a_completed_announcement_adds_no_member() {
         ],
     );
     let events = until_turn_completed(&provider);
-    assert!(!events.iter().any(tool_started("late-cmd")), "{events:#?}");
+    assert!(
+        !events.iter().any(tool_started(row_id("tab", "late", "late-cmd"))),
+        "{events:#?}"
+    );
+}
+
+/// A spawn as Codex 0.161.0 reports it under a model with the plain tool set: a `collabAgentToolCall` whose
+/// end names the child (`receiverThreadIds`), and no `subAgentActivity` at all. Replayed from the recording:
+/// the parent ends its turn while the child runs a command and asks to leave the sandbox. The child is a
+/// member: its row and card are shown and say whose they are, and the tab's turn waits for it.
+#[test]
+fn a_child_announced_by_a_collab_call_joins_the_family() {
+    let (script, thread, turn) = replay_script("t8-i11g-plain-spawn.jsonl", 300);
+    let provider = connect(script);
+    assert_eq!(provider.start(start_request()).unwrap(), thread);
+    assert_eq!(send(&provider, &thread, "PARENT-PROMPT").unwrap(), turn);
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+    });
+    assert!(
+        !events.iter().any(is_completed),
+        "the tab's turn ended with the parent's while the child ran: {events:#?}"
+    );
+    let (id, input) = card_of(&events);
+    let label = input["subagent"].as_str().unwrap_or_default().to_string();
+    assert!(label.starts_with("/root/"), "the card names the subagent: {input}");
+    answer(&provider, &thread, &id, PermissionDecision::Deny { reason: None });
+    let mut events = events;
+    events.extend(until_turn_completed(&provider));
+    let cc2 = row_named(&events, "cc2");
+    assert_ne!(cc2, "cc2", "the child's call has a row of its own");
+    assert_eq!(input_of(&events, &cc2)["subagent"], label.as_str());
+    let (_, outcome, _) = ended(&events);
+    assert_eq!(outcome, TurnOutcome::Completed);
+    assert_eq!(events.iter().filter(|e| is_started(e)).count(), 1, "one tab turn");
+}
+
+/// A collab call's receivers join only when the call is on a member thread, and a child whose turn started
+/// before the call that names it was read is still followed from that turn.
+#[test]
+fn collab_receivers_join_from_members_only_and_an_early_turn_is_kept() {
+    let collab = |id: &str, receivers: Vec<&str>| {
+        json!({"type": "collabAgentToolCall", "id": id, "tool": "spawnAgent", "status": "completed",
+               "senderThreadId": "tab", "receiverThreadIds": receivers, "prompt": "go"})
+    };
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            // The child's turn is under way before the call that spawned it is reported.
+            turn_started("child", "c1"),
+            item_event("item/completed", "tab", "t1", collab("sp1", vec!["child"])),
+            // A thread nobody follows names a receiver of its own.
+            item_event("item/completed", "stranger", "s1", collab("sp9", vec!["ghost"])),
+            turn_started("ghost", "g1"),
+            item_event(
+                "item/started",
+                "ghost",
+                "g1",
+                command_item("ghost-cmd", "echo ghost", "inProgress"),
+            ),
+            item_event(
+                "item/started",
+                "child",
+                "c1",
+                command_item("child-cmd", "touch late", "inProgress"),
+            ),
+            turn_completed("tab", "t1", "completed"),
+            // Only the child is left; an interrupt reaches it.
+            expect_interrupt(5, "child", "c1"),
+            turn_completed("child", "c1", "interrupted"),
+        ],
+    );
+    let child_cmd = row_id("tab", "child", "child-cmd");
+    let early = pump_until(&provider, |events| events.iter().any(tool_started(child_cmd.clone())));
+    let early = {
+        let mut all = early;
+        all.extend(pump_for(&provider, Duration::from_millis(150)));
+        all
+    };
+    assert!(
+        !early.iter().any(is_completed),
+        "the child's early turn keeps the tab's turn open: {early:#?}"
+    );
+    assert!(
+        !early.iter().any(tool_started(row_id("tab", "ghost", "ghost-cmd"))),
+        "a receiver named from outside the family is not a member: {early:#?}"
+    );
+    interrupt(&provider, &thread);
+    let events = until_turn_completed(&provider);
+    let (turn, outcome, _) = ended(&events);
+    assert_eq!(turn, "t1");
+    assert_eq!(outcome, TurnOutcome::Interrupted);
 }
 
 // ---------------------------------------------------------------- a family turn while the tab is idle
@@ -579,7 +703,8 @@ fn family_turn_while_tab_idle_opens_a_tab_turn() {
         matches!(&second[0], AgentDomainEvent::TurnStarted { turn_id } if turn_id == "c9"),
         "the child's turn opened a tab turn: {second:#?}"
     );
-    assert!(second.iter().any(tool_started("late")) && second.iter().any(tool_completed("late")));
+    let late = row_id("tab", "child", "late");
+    assert!(second.iter().any(tool_started(late.clone())) && second.iter().any(tool_completed(late)));
     match &second[position(&second, is_completed)] {
         AgentDomainEvent::TurnCompleted { turn_id, outcome, .. } => {
             assert_eq!(turn_id, "c9");
@@ -589,6 +714,151 @@ fn family_turn_while_tab_idle_opens_a_tab_turn() {
     }
     // The tab turn is over, so the tab takes a turn of its own.
     assert_eq!(send(&provider, &thread, "next").expect("the tab is idle"), "t2");
+}
+
+// ---------------------------------------------------------------- an end that cannot be read
+
+/// A `turn/completed` over the line cap, for `thread`'s turn `turn`.
+fn huge_turn_completed(thread: &str, turn: &str) -> Value {
+    json!({"write_big": {
+        "prefix": format!(
+            r#"{{"method":"turn/completed","params":{{"threadId":"{thread}","turn":{{"id":"{turn}","items":[{{"type":"agentMessage","id":"x","text":""#
+        ),
+        "bytes": 17 * 1024 * 1024,
+        "suffix": r#""}],"status":"completed"}}}"#,
+    }})
+}
+
+/// A `turn/completed` whose turn cannot be read, for `thread`.
+fn unreadable_turn_completed(thread: &str) -> Value {
+    write(json!({"method": "turn/completed", "params": {"threadId": thread, "turn": {"id": 5}}}))
+}
+
+fn ended(events: &[AgentDomainEvent]) -> (String, TurnOutcome, Option<String>) {
+    match &events[position(events, is_completed)] {
+        AgentDomainEvent::TurnCompleted {
+            turn_id,
+            outcome,
+            detail,
+            ..
+        } => (turn_id.clone(), *outcome, detail.reason.clone()),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The end of the tab's own turn arrives in a message Eitri cannot read while a child still runs. The tab's
+/// turn is the family's, so it stays open: the child's later calls are still shown, an interrupt still
+/// reaches it, and the tab's turn ends, failed, only when the child's does.
+#[test]
+fn an_unreadable_end_of_the_parents_turn_keeps_the_running_child() {
+    for unreadable in [huge_turn_completed("tab", "t1"), unreadable_turn_completed("tab")] {
+        let (provider, thread) = running(
+            "tab",
+            "t1",
+            vec![
+                announce("tab", "t1", "child", "/root/child"),
+                turn_started("child", "c1"),
+                unreadable,
+                json!({"sleep_ms": 100}),
+                item_event(
+                    "item/started",
+                    "child",
+                    "c1",
+                    command_item("late", "touch late", "inProgress"),
+                ),
+                // Only the child is still running, so only the child is sent an interrupt.
+                expect_interrupt(5, "child", "c1"),
+                turn_completed("child", "c1", "interrupted"),
+            ],
+        );
+        let late = row_id("tab", "child", "late");
+        let early = pump_until(&provider, |events| events.iter().any(tool_started(late.clone())));
+        assert!(
+            !early.iter().any(is_completed),
+            "the tab's turn ended while its child ran: {early:#?}"
+        );
+        interrupt(&provider, &thread);
+        let events = until_turn_completed(&provider);
+        let (turn, outcome, reason) = ended(&events);
+        assert_eq!(turn, "t1");
+        assert_eq!(outcome, TurnOutcome::Failed, "the tab's own turn failed");
+        assert!(
+            matches!(reason.as_deref(), Some("message_too_large" | "unreadable_turn_end")),
+            "{reason:?}"
+        );
+    }
+}
+
+/// A child's end that cannot be read ends the child's turn only: the tab's own turn goes on, and the tab's
+/// turn ends with the tab's own outcome.
+#[test]
+fn an_unreadable_end_of_a_childs_turn_ends_only_the_child() {
+    for unreadable in [huge_turn_completed("child", "c1"), unreadable_turn_completed("child")] {
+        let (provider, _) = running(
+            "tab",
+            "t1",
+            vec![
+                announce("tab", "t1", "child", "/root/child"),
+                turn_started("child", "c1"),
+                unreadable,
+                json!({"sleep_ms": 100}),
+                item_event(
+                    "item/started",
+                    "tab",
+                    "t1",
+                    command_item("own", "echo own", "inProgress"),
+                ),
+                json!({"sleep_ms": 200}),
+                turn_completed("tab", "t1", "completed"),
+            ],
+        );
+        let early = pump_until(&provider, |events| events.iter().any(tool_started("own")));
+        assert!(!early.iter().any(is_completed), "{early:#?}");
+        let events = until_turn_completed(&provider);
+        let (turn, outcome, _) = ended(&events);
+        assert_eq!(turn, "t1");
+        assert_eq!(
+            outcome,
+            TurnOutcome::Completed,
+            "a child's end is not the tab's failure"
+        );
+    }
+}
+
+/// A child's start that cannot be read still makes its turn one of the family's: the first message naming
+/// the turn says which it is, and the tab's turn waits for it.
+#[test]
+fn an_unreadable_start_of_a_childs_turn_is_still_followed() {
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            announce("tab", "t1", "child", "/root/child"),
+            json!({"write_big": {
+                "prefix": r#"{"method":"turn/started","params":{"threadId":"child","turn":{"id":"c1","items":[{"type":"agentMessage","id":"x","text":""#,
+                "bytes": 17 * 1024 * 1024,
+                "suffix": r#""}],"status":"inProgress"}}}"#,
+            }}),
+            turn_completed("tab", "t1", "completed"),
+            json!({"sleep_ms": 100}),
+            item_event(
+                "item/started",
+                "child",
+                "c1",
+                command_item("late", "touch late", "inProgress"),
+            ),
+            expect_interrupt(5, "child", "c1"),
+            turn_completed("child", "c1", "interrupted"),
+        ],
+    );
+    let late = row_id("tab", "child", "late");
+    let early = pump_until(&provider, |events| events.iter().any(tool_started(late.clone())));
+    assert!(!early.iter().any(is_completed), "{early:#?}");
+    interrupt(&provider, &thread);
+    let events = until_turn_completed(&provider);
+    let (turn, outcome, _) = ended(&events);
+    assert_eq!(turn, "t1");
+    assert_eq!(outcome, TurnOutcome::Interrupted);
 }
 
 // ---------------------------------------------------------------- interrupt
@@ -710,6 +980,113 @@ fn child_approval_is_a_card_naming_the_subagent() {
     )));
 }
 
+/// Codex numbers a thread's items on that thread alone, so a parent and its child can both run a
+/// `call-1`. Each is a row of its own, and what the child's call starts, ends, asks or is noted about lands
+/// on the child's row, never on the parent's.
+#[test]
+fn a_childs_item_id_never_lands_on_the_parents_row() {
+    let parent_cmd = "/usr/bin/zsh -lc 'echo parent'";
+    let child_cmd = "/usr/bin/zsh -lc 'touch /outside/child'";
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            announce("tab", "t1", "child", "/root/child"),
+            turn_started("child", "c1"),
+            item_event(
+                "item/started",
+                "tab",
+                "t1",
+                command_item("call-1", parent_cmd, "inProgress"),
+            ),
+            item_event(
+                "item/started",
+                "child",
+                "c1",
+                command_item("call-1", child_cmd, "inProgress"),
+            ),
+            command_request(0, "child", "c1", "call-1", child_cmd),
+            expect_answer(json!(0), r#"{"decision":"decline"}"#),
+            // Input typed into the child's command: answered by Eitri, with a note on the child's row.
+            write(
+                json!({"id": 1, "method": "item/commandExecution/requestApproval", "params": {
+                    "kind": "writeStdin", "threadId": "child", "turnId": "c1", "itemId": "call-1",
+                }}),
+            ),
+            expect_answer(json!(1), r#"{"decision":"decline"}"#),
+            item_event(
+                "item/completed",
+                "tab",
+                "t1",
+                command_item("call-1", parent_cmd, "completed"),
+            ),
+            item_event(
+                "item/completed",
+                "child",
+                "c1",
+                command_item("call-1", child_cmd, "declined"),
+            ),
+            turn_completed("child", "c1", "completed"),
+            turn_completed("tab", "t1", "completed"),
+        ],
+    );
+    let mut events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+    });
+    let card = events
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_use_id,
+                ..
+            } => Some((permission_id.clone(), tool_use_id.clone())),
+            _ => None,
+        })
+        .expect("a card");
+    answer(&provider, &thread, &card.0, PermissionDecision::Deny { reason: None });
+    events.extend(until_turn_completed(&provider));
+
+    let child_row = row_id("tab", "child", "call-1");
+    assert_ne!(child_row, "call-1");
+    assert_eq!(row_id("tab", "tab", "call-1"), "call-1", "the tab's own ids are kept");
+    let started: Vec<(&str, &Value)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::ToolCallStarted { tool_use_id, input, .. } => Some((tool_use_id.as_str(), input)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started.len(), 2, "two rows: {events:#?}");
+    assert_eq!(started[0].0, "call-1");
+    assert_eq!(started[0].1["command"], parent_cmd);
+    assert_eq!(started[1].0, child_row);
+    assert_eq!(started[1].1["command"], child_cmd);
+    assert_eq!(
+        card.1.as_deref(),
+        Some(child_row.as_str()),
+        "the card sits on the child's row"
+    );
+    let completed: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completed, vec!["call-1", child_row.as_str()], "{events:#?}");
+    let noted: Vec<Option<&str>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::PermissionDenied { tool_use_id, .. } => Some(tool_use_id.as_deref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(noted, vec![Some(child_row.as_str())], "{events:#?}");
+}
+
 #[test]
 fn the_tabs_own_approval_names_no_subagent() {
     let command = "/usr/bin/zsh -lc 'touch /outside/own'";
@@ -794,7 +1171,9 @@ fn closing_mid_child_interrupts_the_family() {
             write(json!({"id": 7, "result": {"status": "unsubscribed"}})),
         ],
     );
-    pump_until(&provider, |events| events.iter().any(tool_started("sleeper")));
+    pump_until(&provider, |events| {
+        events.iter().any(tool_started(row_id("tab", "child", "sleeper")))
+    });
     let pid = provider.pid();
     assert!(alive(pid));
     let began = Instant::now();

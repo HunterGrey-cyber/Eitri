@@ -125,6 +125,12 @@ pub struct TurnEndingRecord {
     pub turn_id: String,
     pub kind: TurnEndingKind,
     pub detail: TurnEndDetail,
+    /// When the account's usage window reset as of this ending: the latest limit report's reset time
+    /// when the turn ended, or, when none was known then, that of the first report before the next turn
+    /// starts (an agent may report the limit just after the turn it stopped). Kept with the ending, so
+    /// a later report never changes what an older row says.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -870,6 +876,7 @@ impl AgentSessionProjection {
                 turn_id: turn_id.clone(),
                 kind: TurnEndingKind::Lost,
                 detail: TurnEndDetail::default(),
+                resets_at: self.account_limits.as_ref().and_then(|limits| limits.resets_at),
             });
             self.last_turn_ending = Some(TurnEndingKind::Lost);
         }
@@ -1050,6 +1057,7 @@ impl AgentSessionProjection {
                         turn_id: turn_id.clone(),
                         kind,
                         detail: detail.clone(),
+                        resets_at: self.account_limits.as_ref().and_then(|limits| limits.resets_at),
                     });
                     self.last_turn_ending = Some(kind);
                 }
@@ -1156,6 +1164,16 @@ impl AgentSessionProjection {
                     resets_at: *resets_at,
                     plan: plan.clone(),
                 });
+                // The latest turn's ending, if it did not complete and knew no reset time, takes this
+                // one: the report that explains the stop can come just after it. One it already had
+                // stays, and a turn started since ends that.
+                if self.last_turn_ending.is_some() {
+                    if let Some(ending) = self.turn_endings.last_mut() {
+                        if ending.resets_at.is_none() {
+                            ending.resets_at = *resets_at;
+                        }
+                    }
+                }
             }
             // On the call it refused, or held until that call is folded. A refusal naming no call
             // has nothing to sit on and changes nothing; the call's own error result still says it.
@@ -1222,6 +1240,61 @@ pub fn describe_failed_resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn limits(resets_at: i64) -> AgentDomainEvent {
+        AgentDomainEvent::AccountLimits {
+            used_percent: 100.0,
+            window_minutes: Some(300),
+            resets_at: Some(resets_at),
+            plan: None,
+        }
+    }
+
+    fn limit_reached(turn_id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: turn_id.into(),
+            outcome: TurnOutcome::LimitReached,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: TurnEndDetail {
+                reason: Some("usage_limit".into()),
+                api_error_status: None,
+                message: None,
+            },
+        }
+    }
+
+    /// An ending keeps the reset time current when it happened; a later report changes the account's
+    /// figure, not what the row says. One reported just after the stop fills an ending that had none,
+    /// until the next turn starts.
+    #[test]
+    fn an_ending_keeps_the_reset_time_it_had() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        p.apply(&limits(1000));
+        p.apply(&limit_reached("t1"));
+        p.apply(&limits(2000));
+        assert_eq!(p.turn_endings[0].resets_at, Some(1000));
+        assert_eq!(p.account_limits.as_ref().unwrap().resets_at, Some(2000));
+
+        let mut late = AgentSessionProjection::default();
+        late.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        late.apply(&limit_reached("t1"));
+        assert_eq!(late.turn_endings[0].resets_at, None);
+        late.apply(&limits(3000));
+        late.apply(&limits(4000));
+        assert_eq!(
+            late.turn_endings[0].resets_at,
+            Some(3000),
+            "the first report after the stop"
+        );
+        late.apply(&AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        late.apply(&limit_reached("t2"));
+        late.apply(&limits(5000));
+        assert_eq!(late.turn_endings[0].resets_at, Some(3000));
+        assert_eq!(late.turn_endings[1].resets_at, Some(4000));
+    }
 
     /// The empty-string case is not hypothetical. On the sidecar path `tool_use_id` crosses
     /// proto3, which has no absent string: a field the provider never set arrives as `""`, not as

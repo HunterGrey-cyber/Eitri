@@ -82,6 +82,17 @@ describe("a Codex file change card", () => {
     expect(container.querySelector(".permission-card-says")!.textContent).toBe("Codex says: Rename b to c");
   });
 
+  it("a large change is shown whole, never as counts beside an Approve", () => {
+    const request = requestOf("file_change");
+    const input = request.input as { changes: Array<Record<string, unknown>> };
+    const big = Array.from({ length: 2500 }, (_, i) => `line ${i}`).join("\n");
+    const { container } = card({ ...request, input: { ...input, changes: [{ ...input.changes[0], kind: "add", diff: big }] } });
+    expect(container.textContent).not.toContain("Too large to show here");
+    const shown = Array.from(container.querySelectorAll(".permission-card-diff .diff-line"));
+    expect(shown).toHaveLength(2500);
+    expect(shown[2499].querySelector(".diff-text")!.textContent).toBe("line 2499");
+  });
+
   it("a path with a hidden character is revealed", () => {
     const request = requestOf("file_change");
     const input = request.input as { changes: Array<Record<string, unknown>> };

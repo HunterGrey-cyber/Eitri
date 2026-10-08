@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use agent::DirTrust;
 use eitri_core::project_trust::{
-    codex_fallback_names, discover, git_top_level, trust_plan, Discovery, EntryKind, Finding, Limits, Profile,
-    ProfileEnv,
+    codex_fallback_names, discover, git_top_level, read_user_codex_config, trust_plan, Discovery, EntryKind, Finding,
+    Limits, Profile, ProfileEnv,
 };
 
 /// A scratch directory (canonical) holding a fake home; removed on drop.
@@ -51,6 +51,7 @@ impl Fixture {
         ProfileEnv {
             codex_home: Some(self.base.join("codex-home")),
             fallback_names: Vec::new(),
+            user_mcp_servers: None,
         }
     }
 
@@ -1154,6 +1155,7 @@ fn codex_profile_skips_home_dot_codex_only_when_it_is_codex_home() {
     let as_codex_home = ProfileEnv {
         codex_home: Some(fx.home.join(".codex")),
         fallback_names: Vec::new(),
+        user_mcp_servers: None,
     };
     let found = fx.discover_as(&root, &Profile::Codex, &as_codex_home);
     assert_eq!(found.top, fx.home);
@@ -1181,6 +1183,7 @@ fn codex_profile_skips_home_dot_codex_only_when_it_is_codex_home() {
     let env = ProfileEnv {
         codex_home: Some(only.join(".codex")),
         fallback_names: Vec::new(),
+        user_mcp_servers: None,
     };
     write(&only.join(".codex/config.toml"), b"model = \"x\"\n");
     let lone = discover(&only, None, &Limits::default(), &Profile::Codex, &env);
@@ -1321,6 +1324,7 @@ fn a_dot_codex_linked_to_codex_home_is_not_read() {
     let env = ProfileEnv {
         codex_home: Some(dotfiles.clone()),
         fallback_names: Vec::new(),
+        user_mcp_servers: None,
     };
     let found = fx.discover_as(&root, &Profile::Codex, &env);
     assert_eq!(found.top, fx.home);
@@ -1435,6 +1439,7 @@ command = "y"
     let env = ProfileEnv {
         codex_home: Some(codex_home.clone()),
         fallback_names: vec!["TEAM.md".into()],
+        user_mcp_servers: None,
     };
     let found = fx.discover_as(&repo.join("src"), &Profile::Codex, &env);
     assert!(
@@ -1449,6 +1454,7 @@ command = "y"
     let env = ProfileEnv {
         codex_home: Some(codex_home),
         fallback_names: codex_fallback_names(&fx.base.join("codex-home")),
+        user_mcp_servers: None,
     };
     let found = fx.discover_as(&repo.join("src"), &Profile::Codex, &env);
     assert!(!found.fully_hashed());
@@ -1642,6 +1648,98 @@ fn rule_file_calls_shown_verbatim() {
     );
     // The other files are still hashed.
     assert!(has(&found, ".codex/rules/notes.txt") && has(&found, ".codex/rules/deeper/more.rules"));
+}
+
+/// The user's own MCP servers are read from their `config.toml` by name only, leaving out one
+/// switched off; a file that is not there defines none, and one that cannot be read leaves them
+/// unknown.
+#[test]
+fn the_user_config_names_its_mcp_servers() {
+    let fx = Fixture::new("codex-user-servers");
+    let file = fx.base.join("codex-home/config.toml");
+    write(
+        &file,
+        br#"model = "secret-model"
+project_doc_fallback_filenames = ["TEAM.md"]
+
+[mcp_servers.context7]
+command = "npx"
+args = ["secret-arg"]
+
+[mcp_servers.off]
+command = "x"
+enabled = false
+
+[mcp_servers.alpha]
+url = "https://example.com/mcp"
+"#,
+    );
+    let read = read_user_codex_config(&file);
+    assert_eq!(read.fallback_names, vec!["TEAM.md".to_string()]);
+    assert_eq!(
+        read.mcp_servers,
+        Some(vec!["alpha".to_string(), "context7".to_string()])
+    );
+
+    let none = fx.base.join("none/config.toml");
+    write(&none, b"model = \"x\"\n");
+    assert_eq!(read_user_codex_config(&none).mcp_servers, Some(Vec::new()));
+    assert_eq!(
+        read_user_codex_config(&fx.base.join("missing/config.toml")).mcp_servers,
+        Some(Vec::new())
+    );
+
+    // A link (not followed here), bad TOML, a FIFO, a key that is not a table: unknown.
+    let linked = fx.base.join("linked/config.toml");
+    std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    symlink(&file, &linked).unwrap();
+    assert_eq!(read_user_codex_config(&linked).mcp_servers, None);
+    let bad = fx.base.join("bad/config.toml");
+    write(&bad, b"[mcp_servers\n");
+    assert_eq!(read_user_codex_config(&bad).mcp_servers, None);
+    let odd = fx.base.join("odd/config.toml");
+    write(&odd, b"mcp_servers = 3\n");
+    assert_eq!(read_user_codex_config(&odd).mcp_servers, None);
+    let fifo = fx.base.join("fifo-home");
+    mkfifo(&fifo.join("config.toml"));
+    let (tx, rx) = mpsc::channel();
+    let probe = fifo.join("config.toml");
+    std::thread::spawn(move || {
+        let _ = tx.send(read_user_codex_config(&probe));
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("blocked on a FIFO")
+            .mcp_servers,
+        None
+    );
+}
+
+/// A server the project names that the user's own configuration also runs is no sign that the
+/// project's configuration loaded, so the plan does not watch for it; when the user's servers are
+/// not known, every project server is watched for.
+#[test]
+fn trust_plan_leaves_out_servers_the_user_also_runs() {
+    let fx = Fixture::new("plan-user-servers");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    write(&repo.join(".codex/config.toml"), CODEX_CONFIG);
+    let env = |user: Option<Vec<String>>| ProfileEnv {
+        user_mcp_servers: user,
+        ..fx.codex_env()
+    };
+
+    let found = fx.discover_as(&repo, &Profile::Codex, &env(Some(vec!["marker".into(), "mine".into()])));
+    let plan = trust_plan(&found, DirTrust::Untrusted, &repo).unwrap();
+    assert_eq!(plan.project_only, vec!["remote".to_string()]);
+
+    let unknown = fx.discover_as(&repo, &Profile::Codex, &env(None));
+    assert_eq!(
+        unknown.fingerprint, found.fingerprint,
+        "the user's servers are not the project's"
+    );
+    let plan = trust_plan(&unknown, DirTrust::Untrusted, &repo).unwrap();
+    assert_eq!(plan.project_only, vec!["marker".to_string(), "remote".to_string()]);
 }
 
 #[test]

@@ -15,6 +15,11 @@ use std::collections::HashMap;
 /// Threads remembered as members at most, so a flood of announcements cannot grow without bound.
 const MEMBERS_MAX: usize = 256;
 
+/// Stands for the turn of a member thread whose start could not be read. Codex never gives a turn an
+/// empty id, and the first readable message naming a turn on that thread says which turn it is
+/// ([`Family::adopt`]).
+pub const UNREAD_TURN: &str = "";
+
 /// What a start or an end of a family turn did to the tab's turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FamilyEdge {
@@ -80,6 +85,33 @@ impl Family {
         true
     }
 
+    /// Takes the receivers of a `collabAgentToolCall` seen on `on_thread` into account. Under a model with the
+    /// plain tool set Codex announces a spawned child only this way (the call's end names it), never with a
+    /// `subAgentActivity`; a call that sends a member input or resumes it names it too. Only a call on a
+    /// member thread adds threads, under the same cap as an announcement. A receiver gets a label of the
+    /// calling thread's path and the end of its own id, since the call carries no task name; a later
+    /// `subAgentActivity` for it replaces that with its path. Returns the threads that joined.
+    pub fn announce_receivers(&mut self, on_thread: &str, receivers: &[String]) -> Vec<String> {
+        if !self.contains(on_thread) {
+            return Vec::new();
+        }
+        let parent = self.label(on_thread).unwrap_or("/root").to_string();
+        let mut joined = Vec::new();
+        for receiver in receivers {
+            if receiver.is_empty() || self.contains(receiver) {
+                continue;
+            }
+            if self.announced.len() >= MEMBERS_MAX {
+                break;
+            }
+            let start = receiver.char_indices().rev().nth(7).map_or(0, |(at, _)| at);
+            self.announced
+                .insert(receiver.clone(), format!("{parent}/{}", &receiver[start..]));
+            joined.push(receiver.clone());
+        }
+        joined
+    }
+
     /// A turn started on a member thread.
     pub fn turn_started(&mut self, thread: &str, turn: &str) -> FamilyEdge {
         if !self.contains(thread) {
@@ -111,6 +143,21 @@ impl Family {
             FamilyEdge::Closed
         } else {
             FamilyEdge::Still
+        }
+    }
+
+    /// The turn running on `thread` is one whose start could not be read: `turn`, the first turn a
+    /// readable message names there, is that one. Returns whether it was taken.
+    pub fn adopt(&mut self, thread: &str, turn: &str) -> bool {
+        if turn == UNREAD_TURN {
+            return false;
+        }
+        match self.running.iter_mut().find(|(t, r)| t == thread && r == UNREAD_TURN) {
+            Some((_, running)) => {
+                *running = turn.to_string();
+                true
+            }
+            None => false,
         }
     }
 
@@ -171,6 +218,37 @@ mod tests {
     }
 
     #[test]
+    fn collab_receivers_join_from_member_threads_only() {
+        let mut family = Family::new("tab");
+        let child = "01a11b94-eb86-7d10-bd77-2ac835206b32".to_string();
+        assert_eq!(family.announce_receivers("tab", &[child.clone()]), vec![child.clone()]);
+        assert_eq!(family.label(&child), Some("/root/35206b32"));
+        assert!(
+            family.announce_receivers("tab", &[child.clone()]).is_empty(),
+            "already a member"
+        );
+        assert_eq!(
+            family.announce_receivers(&child, &["grand".to_string()]),
+            vec!["grand".to_string()]
+        );
+        assert_eq!(family.label("grand"), Some("/root/35206b32/grand"));
+        assert!(family.announce_receivers("stranger", &["ghost".to_string()]).is_empty());
+        assert!(!family.contains("ghost"));
+        // An announcement with a path names the thread properly from then on.
+        family.announce("tab", &started(&child, "/root/child"));
+        assert_eq!(family.label(&child), Some("/root/child"));
+    }
+
+    #[test]
+    fn collab_receivers_respect_the_member_cap() {
+        let mut family = Family::new("tab");
+        let many: Vec<String> = (0..MEMBERS_MAX + 10).map(|n| format!("t{n}")).collect();
+        assert_eq!(family.announce_receivers("tab", &many).len(), MEMBERS_MAX);
+        assert!(!family.contains(&format!("t{}", MEMBERS_MAX)));
+        assert!(!family.announce("tab", &started("late", "/root/late")));
+    }
+
+    #[test]
     fn only_a_started_item_adds_a_member() {
         let mut family = Family::new("tab");
         let mut item = started("child", "/root/child");
@@ -192,6 +270,20 @@ mod tests {
         assert_eq!(family.turn_completed("child", "c1"), FamilyEdge::Ignored);
         // A child that works on after the tab went idle opens a new tab turn.
         assert_eq!(family.turn_started("child", "c2"), FamilyEdge::Opened);
+    }
+
+    #[test]
+    fn an_unread_start_is_taken_by_the_first_turn_named() {
+        let mut family = Family::new("tab");
+        family.announce("tab", &started("child", "/root/child"));
+        assert_eq!(family.turn_started("tab", "t1"), FamilyEdge::Opened);
+        assert_eq!(family.turn_started("child", UNREAD_TURN), FamilyEdge::Joined);
+        assert!(!family.adopt("tab", "t9"), "the tab's turn was read");
+        assert!(family.adopt("child", "c1"));
+        assert!(!family.adopt("child", "c2"), "only the unread one is taken");
+        assert!(family.is_running("child", "c1"));
+        assert_eq!(family.turn_completed("tab", "t1"), FamilyEdge::Still);
+        assert_eq!(family.turn_completed("child", "c1"), FamilyEdge::Closed);
     }
 
     #[test]

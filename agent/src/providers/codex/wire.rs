@@ -991,6 +991,23 @@ pub struct AutoReviewNotification {
     #[serde(default)]
     pub target_item_id: Option<String>,
     pub review: AutoReview,
+    /// What was reviewed (`{"type": "networkAccess", "host": ..., "protocol": ...}` and others), kept as
+    /// Codex wrote it: only a network review's host is read from it.
+    #[serde(default)]
+    pub action: Option<Value>,
+}
+
+impl AutoReviewNotification {
+    /// The host and protocol a network review is about.
+    pub fn network(&self) -> Option<(String, String)> {
+        let action = self.action.as_ref()?;
+        if action.get("type").and_then(Value::as_str) != Some("networkAccess") {
+            return None;
+        }
+        let host = action.get("host").and_then(Value::as_str)?;
+        let protocol = action.get("protocol").and_then(Value::as_str).unwrap_or_default();
+        Some((host.to_string(), protocol.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1141,6 +1158,8 @@ pub enum ServerNotification {
     Malformed {
         method: String,
         error: String,
+        /// The thread the payload named, when its `threadId` could still be read.
+        thread_id: Option<String>,
     },
 }
 
@@ -1152,14 +1171,25 @@ fn typed<T: DeserializeOwned, R>(method: &str, params: Value, f: fn(T) -> R, mal
 }
 
 fn malformed_notification(method: String, error: String) -> ServerNotification {
-    ServerNotification::Malformed { method, error }
+    ServerNotification::Malformed {
+        method,
+        error,
+        thread_id: None,
+    }
 }
 
 /// Reads one notification. Never fails: an unknown method is `Unknown`, a bad payload `Malformed`.
 pub fn parse_notification(name: &str, params: Value) -> ServerNotification {
     use ServerNotification as N;
     let m = malformed_notification;
-    match name {
+    // Read before the payload is consumed: a turn's start or end that cannot be read whole still says
+    // whose it was, which is what decides what its loss stops.
+    let thread_id = if name == method::TURN_STARTED || name == method::TURN_COMPLETED {
+        params.get("threadId").and_then(Value::as_str).map(str::to_string)
+    } else {
+        None
+    };
+    let parsed = match name {
         method::THREAD_STARTED => typed(name, params, N::ThreadStarted, m),
         method::TURN_STARTED => typed(name, params, N::TurnStarted, m),
         method::TURN_COMPLETED => typed(name, params, N::TurnCompleted, m),
@@ -1182,6 +1212,14 @@ pub fn parse_notification(name: &str, params: Value) -> ServerNotification {
             method: name.to_string(),
             params,
         },
+    };
+    match parsed {
+        N::Malformed { method, error, .. } => N::Malformed {
+            method,
+            error,
+            thread_id,
+        },
+        other => other,
     }
 }
 

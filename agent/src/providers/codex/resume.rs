@@ -71,7 +71,7 @@ pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Ve
         };
         for turn in &page.data {
             let (items, complete) = load_items(thread_id, turn, ask);
-            events.extend(turn_events(turn, &items, complete));
+            events.extend(turn_events(thread_id, turn, &items, complete));
         }
         match page.next_cursor {
             // A cursor that does not move would ask for the same page for ever.
@@ -146,7 +146,7 @@ fn user_text(content: &[Value]) -> String {
 
 /// The events of one past turn: the prompt, the start, what it said and ran, a note for what could not be
 /// read, and the end.
-fn turn_events(turn: &Turn, items: &[ThreadItem], complete: Complete) -> Vec<AgentDomainEvent> {
+fn turn_events(thread_id: &str, turn: &Turn, items: &[ThreadItem], complete: Complete) -> Vec<AgentDomainEvent> {
     let mut events = Vec::new();
     for item in items {
         if let ThreadItem::UserMessage(m) = item {
@@ -189,15 +189,17 @@ fn turn_events(turn: &Turn, items: &[ThreadItem], complete: Complete) -> Vec<Age
                 if let (Some((name, input)), Some((content, is_error)), Some(id)) =
                     (translate::tool_start(other), translate::tool_result(other), other.id())
                 {
+                    // Under the id the live call had, so a row never shares an id with another.
+                    let row = translate::row_id(thread_id, thread_id, id);
                     events.push(AgentDomainEvent::ToolCallStarted {
                         turn_id: turn.id.clone(),
-                        tool_use_id: id.to_string(),
+                        tool_use_id: row.clone(),
                         name: name.to_string(),
                         input,
                     });
                     events.push(AgentDomainEvent::ToolCallCompleted {
                         turn_id: turn.id.clone(),
-                        tool_use_id: id.to_string(),
+                        tool_use_id: row,
                         content,
                         is_error,
                     });

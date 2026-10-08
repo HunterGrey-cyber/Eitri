@@ -86,6 +86,90 @@ describe("renderToolCall", () => {
     expect(plain.container.textContent).not.toContain("blocked by auto");
   });
 
+  /** Another agent's request that Eitri answered itself is Eitri's answer, not the CLI's auto mode: the note
+   *  says so, in Bypass as anywhere, and the row says it once. */
+  it("words a request Eitri answered itself as Eitri's, once on its row", () => {
+    const why = "Codex asked for extra permissions; Eitri grants none";
+    const added = call({
+      toolUseId: "eitri-answered-t1-1",
+      name: "permissions",
+      input: { subagent: "/root/child" },
+      result: { content: "", isError: false },
+      denied: { reasonType: "eitri", reason: why },
+    });
+    for (const shown of [false, true]) {
+      const { container } = render(<>{renderToolCall(added, shown)}</>);
+      expect(container.querySelector(".tool-denied-note")?.textContent).toBe(`answered by Eitri: ${why}`);
+      expect(container.textContent).not.toContain("blocked by auto");
+      expect(container.textContent).not.toContain("(eitri)");
+      expect(container.textContent?.split(why).length).toBe(2);
+      expect(container.querySelector(".tool-subagent-note")?.textContent).toBe("subagent /root/child");
+      expect(container.textContent).not.toContain("{");
+      cleanup();
+    }
+    // On a call's own row: input typed into a running command.
+    const own = render(
+      <>
+        {renderToolCall(
+          call({
+            name: "commandExecution",
+            input: { command: "cat", cwd: "/work" },
+            denied: { reasonType: "eitri", reason: "Codex asked to type into a running command" },
+          }),
+        )}
+      </>,
+    );
+    expect(own.container.querySelector(".tool-denied-note")?.textContent).toBe(
+      "answered by Eitri: Codex asked to type into a running command",
+    );
+    cleanup();
+    // The CLI's own refusals read as before.
+    const cli = render(<>{renderToolCall(call({ denied: { reasonType: "classifier", reason: "[Git Destructive]" } }))}</>);
+    expect(cli.container.querySelector(".tool-denied-note")?.textContent).toBe("blocked by auto: [Git Destructive]");
+  });
+
+  /** Codex's own reviewer decided a call in Auto: its verdict sits on the call's row in its words. */
+  it("words Codex's reviewer's verdicts as its own", () => {
+    const denied = render(
+      <>
+        {renderToolCall(
+          call({ name: "commandExecution", input: { command: "rm -rf /" }, denied: { reasonType: "auto_review", reason: "destructive" } }),
+        )}
+      </>,
+    );
+    expect(denied.container.querySelector(".tool-denied-note")?.textContent).toBe("blocked by auto review: destructive");
+    cleanup();
+    const allowed = render(
+      <>
+        {renderToolCall(
+          call({ name: "commandExecution", input: { command: "ls" }, denied: { reasonType: "auto_review_approved", reason: null } }),
+        )}
+      </>,
+    );
+    expect(allowed.container.querySelector(".tool-denied-note")?.textContent).toBe("allowed by auto review");
+  });
+
+  /** A network request's row names the host it asked for, not the raw input. */
+  it("draws a network request's row as the host it asked for", () => {
+    const { container } = render(
+      <>
+        {renderToolCall(
+          call({
+            toolUseId: "network#https#example.org#443#x",
+            name: "commandExecution",
+            input: { command: null, cwd: null, network: { host: "example.org", protocol: "https" }, escalation: "e", reason: null },
+            result: { content: "network access to example.org (https): allowed once", isError: false },
+            promptNote: "allowed in bypass",
+          }),
+          false,
+        )}
+      </>,
+    );
+    expect(container.querySelector(".tool-card")?.textContent).toBe("network access to example.org (https)");
+    expect(container.querySelector(".tool-prompt-note")?.textContent).toBe("allowed in bypass");
+    expect(container.textContent).not.toContain("{");
+  });
+
   /** The refusal's wording under the note is the CLI's reason, so it is drawn wrapped and whole; any other
    *  failure keeps the one cut line. */
   it("draws a refused call's failure wrapped and uncut, and another failure as before", () => {

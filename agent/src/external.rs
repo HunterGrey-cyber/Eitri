@@ -9,6 +9,7 @@
 //! Nothing here depends on `core`: the trust plan is built there from the very discovery the user's
 //! answer was bound to, and plain values cross.
 
+use crate::projection::AgentDomainEvent;
 use crate::provider::{AgentProvider, ProviderError, SendTurnRequest};
 use std::path::PathBuf;
 
@@ -74,4 +75,11 @@ pub trait ExternalProvider: AgentProvider {
     fn start(&self, req: ExternalStart) -> Result<String, ProviderError>;
     /// Sends one turn under `policy`. Returns the turn's id, taken from the agent's own answer.
     fn send_turn_with(&self, req: SendTurnRequest, policy: TurnPolicy) -> Result<String, ProviderError>;
+    /// The past of the session a `start` resumed, oldest first, handed over once; empty for a fresh start
+    /// or an agent that replays nothing. The host folds it into the projection before any live event, as a
+    /// Claude resume's transcript is, so a past turn is never taken for one happening now. `pump` never
+    /// returns these events.
+    fn take_history(&self) -> Vec<AgentDomainEvent> {
+        Vec::new()
+    }
 }

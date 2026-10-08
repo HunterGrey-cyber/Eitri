@@ -646,6 +646,7 @@ fn discover_as(fx: &Fixture, root: &Path, profile: &Profile) -> Discovery {
     let env = ProfileEnv {
         codex_home: Some(fx.outer.join("codex-home")),
         fallback_names: Vec::new(),
+        user_mcp_servers: None,
     };
     discover(root, Some(&fx.home), &Limits::default(), profile, &env)
 }

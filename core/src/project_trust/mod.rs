@@ -28,7 +28,10 @@ mod store;
 
 use std::path::{Path, PathBuf};
 
-pub use codex::{codex_fallback_names, codex_findings, hooks_json_findings, rule_calls, scan_rules, RuleScan};
+pub use codex::{
+    codex_fallback_names, codex_findings, hooks_json_findings, read_user_codex_config, rule_calls, scan_rules,
+    RuleScan, UserCodexConfig,
+};
 pub use discover::discover;
 pub use findings::{mcp_findings, settings_findings};
 pub use git_top::{git_top_level, GitWalk};
@@ -136,6 +139,9 @@ pub struct ProfileEnv {
     /// The alternate names of `AGENTS.md` from the user's Codex configuration
     /// ([`codex_fallback_names`]).
     pub fallback_names: Vec<String>,
+    /// The MCP servers the user's own Codex configuration starts ([`UserCodexConfig::mcp_servers`]);
+    /// `None` when that is not known.
+    pub user_mcp_servers: Option<Vec<String>>,
 }
 
 /// The sha256 of a discovery's whole configuration.
@@ -172,6 +178,9 @@ pub struct Discovery {
     pub findings: Vec<Finding>,
     pub fingerprint: Fingerprint,
     pub over_budget: Option<String>,
+    /// [`ProfileEnv::user_mcp_servers`] as it was read for this discovery. Not part of the
+    /// fingerprint: it is the user's own configuration, not the project's.
+    pub user_mcp_servers: Option<Vec<String>>,
 }
 
 impl Discovery {

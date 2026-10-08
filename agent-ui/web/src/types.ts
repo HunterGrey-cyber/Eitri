@@ -439,6 +439,10 @@ export type TurnEnding = {
   reason: string | null;
   apiErrorStatus: number | null;
   message: string | null;
+  /** When the account's usage window resets as of this ending (Unix seconds): the latest limit report's when the
+   *  turn ended, else the first report's before the next turn starts. Kept with the row, so a later report never
+   *  changes it. Absent from a build that predates it. */
+  resetsAt?: number | null;
 };
 
 /** The token counts of one usage report, as Verdandi's `TurnUsage` carries them (Rust's

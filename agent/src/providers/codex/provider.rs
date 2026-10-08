@@ -20,7 +20,7 @@
 
 use super::approvals::{self, AnswerForm, CardAnswer, Handling, HeldItems};
 use super::config::{expected_echo, session_config};
-use super::family::{Family, FamilyEdge};
+use super::family::{Family, FamilyEdge, UNREAD_TURN};
 use super::resume;
 use super::self_check::{ensure_checked, SelfCheckError};
 use super::translate::{self, parse_user_agent_version, version_text, SIGNED_OUT};
@@ -66,6 +66,8 @@ const UNSUBSCRIBE_WAIT: Duration = Duration::from_secs(3);
 const PUMP_BATCH: usize = 4096;
 /// Unknown method names remembered so each is logged once.
 const UNKNOWN_METHODS_KEPT: usize = 64;
+/// Turns of threads not (yet) in the family remembered at most, for a child announced after its turn began.
+const EARLY_TURNS_KEPT: usize = 64;
 /// The longest stderr tail put in a notice.
 const NOTICE_TAIL_CHARS: usize = 400;
 
@@ -76,6 +78,16 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const ANSWERED_BY_EITRI: &str = "eitri";
 /// The prefix of the id of a row Eitri adds for a request it answered that has no row of its own.
 const ANSWERED_ROW_PREFIX: &str = "eitri-answered-";
+/// What `PermissionDenied.reason_type` says when Codex's own reviewer refused a call, or ran out of time,
+/// which Codex treats the same.
+const REVIEW_DENIED: &str = "auto_review";
+/// What `PermissionDenied.reason_type` says when Codex's own reviewer let a call through. The event is the
+/// one note a call's row carries about who decided it, whichever way.
+const REVIEW_APPROVED: &str = "auto_review_approved";
+/// The prefix of the id of a row Eitri adds for a review that names no call (a network request).
+const REVIEW_ROW_PREFIX: &str = "eitri-review-";
+/// The longest reviewer's rationale a note carries.
+const REVIEW_RATIONALE_CHARS: usize = 2000;
 
 /// The notice for a Codex that is not installed.
 pub const NOT_FOUND: &str = "codex not found: install it and run `codex login`, or set EITRI_CODEX";
@@ -101,6 +113,8 @@ struct ActiveTurn {
     interrupted: HashSet<String>,
     /// The user pressed interrupt after the tab's own turn had ended, so only subagents were left to stop.
     interrupt_asked: bool,
+    /// The user pressed interrupt: a family turn learnt about later is sent its interrupt too.
+    interrupting: bool,
     /// How the tab's own thread's turn ended, once it has; the family may still be working then.
     own_end: Option<(TurnOutcome, TurnEndDetail)>,
     /// The last whole assistant message of the turn: the turn's result text.
@@ -116,6 +130,7 @@ impl ActiveTurn {
             interrupt_wanted: false,
             interrupted: HashSet::new(),
             interrupt_asked: false,
+            interrupting: false,
             own_end: None,
             last_message: String::new(),
             usage: None,
@@ -132,6 +147,18 @@ struct WaitingCard {
     item_id: String,
     /// The thread that asked: the tab's, or a subagent's.
     thread_id: String,
+    /// The row Eitri added for the card because its call had none, which ends with the card's answer.
+    added_row: Option<AddedRow>,
+}
+
+/// A row Eitri drew for a card whose call had no row of its own (a network request names Codex's own key,
+/// and no item is ever started for it).
+struct AddedRow {
+    row: String,
+    /// The tab turn the row was filed under.
+    turn_id: String,
+    /// What the card asked about, which the row's result repeats with the answer.
+    subject: String,
 }
 
 #[derive(Default)]
@@ -146,7 +173,8 @@ struct State {
     turn: Option<ActiveTurn>,
     /// Bytes already emitted for each streaming item of the running turn.
     items: HashMap<String, usize>,
-    /// Tool calls of the running turn that have started and not completed.
+    /// Rows of the running turn's tool calls that have started and not completed, by row id
+    /// (`translate::row_id`).
     open_tools: HashSet<String>,
     /// The calls of the running turn a request may name, as Codex announced them.
     calls: HeldItems,
@@ -156,7 +184,14 @@ struct State {
     next_card: u64,
     /// Numbers the rows Eitri adds for requests it answered that had no row of their own.
     next_answered_row: u64,
+    /// Rows Eitri added for a card and ended with its answer. Should Codex report that call after all, its
+    /// start draws no second row and its end gives the row Codex's own result.
+    answered_rows: HashSet<String>,
     seen_unknown: HashSet<String>,
+    /// The running turn of each thread outside the family that started one, by thread. A child can start
+    /// its turn before the message that makes it a member is read; it is followed from that turn once it
+    /// is.
+    early_turns: HashMap<String, String>,
     last_limits: Option<translate::LimitFigure>,
     /// What the session's start reported about the project configuration it loaded, and what to look for
     /// while it runs.
@@ -167,6 +202,9 @@ struct State {
     /// A resumed thread's history is being read. What arrives meanwhile is held, so the history reaches the
     /// projection first.
     history_loading: bool,
+    /// The resumed thread's history, until the host takes it (`take_history`). Never pumped: a past turn
+    /// delivered live would read to the host as one that just ran.
+    history: Vec<AgentDomainEvent>,
     /// Closed by the host.
     closed: bool,
     /// The child ended on its own.
@@ -284,13 +322,25 @@ impl CodexProvider {
     /// [`connect`](Self::connect) with the child's arguments given: the tests start a scripted stand-in.
     #[doc(hidden)]
     pub fn connect_with_args(launch: CodexLaunch, args: Vec<OsString>) -> Result<CodexProvider, ProviderError> {
+        Self::connect_with_env(launch, args, Vec::new(), Vec::new())
+    }
+
+    /// [`connect_with_args`](Self::connect_with_args) with variables set on and taken from the child: the
+    /// tests that run a real Codex give it a private home and no multiplexer.
+    #[doc(hidden)]
+    pub fn connect_with_env(
+        launch: CodexLaunch,
+        args: Vec<OsString>,
+        env: Vec<(OsString, OsString)>,
+        env_remove: Vec<OsString>,
+    ) -> Result<CodexProvider, ProviderError> {
         let link = JsonRpcLink::spawn(LinkSpec {
             program: launch.program.clone(),
             args,
             cwd: launch.cwd.clone(),
             framing: Framing::Bare,
-            env: Vec::new(),
-            env_remove: Vec::new(),
+            env,
+            env_remove,
         })
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => provider_error(ProviderErrorCode::ProviderUnavailable, NOT_FOUND),
@@ -413,7 +463,9 @@ impl CodexProvider {
             return;
         }
         for (thread_id, turn_id) in family.running_turns() {
-            if !turn.interrupted.insert(turn_id.clone()) {
+            // A turn whose start could not be read has no id to name yet; it is sent its interrupt once a
+            // message names it (`running_turn`).
+            if turn_id == UNREAD_TURN || !turn.interrupted.insert(turn_id.clone()) {
                 continue;
             }
             let Ok(params) = to_json(&TurnInterruptParams { thread_id, turn_id }) else {
@@ -436,6 +488,9 @@ impl CodexProvider {
         if let (Some(turn), false) = (st.turn.as_mut(), own_running) {
             turn.interrupt_asked = true;
         }
+        if let Some(turn) = st.turn.as_mut() {
+            turn.interrupting = true;
+        }
         for (permission_id, card) in std::mem::take(&mut st.cards) {
             if card.form.ends_the_turn(CardAnswer::Interrupt) {
                 let ended = st
@@ -447,11 +502,12 @@ impl CodexProvider {
                     turn.interrupted.insert(ended);
                 }
             }
-            self.respond(card.request_id, card.form.reply(CardAnswer::Interrupt));
+            self.respond(card.request_id.clone(), card.form.reply(CardAnswer::Interrupt));
             st.events.push_back(AgentDomainEvent::PermissionResolved {
                 permission_id,
                 outcome: PermissionOutcome::CancelledByInterrupt,
             });
+            end_added_row(st, card, PermissionOutcome::CancelledByInterrupt);
         }
         self.send_interrupts(st);
     }
@@ -472,6 +528,14 @@ impl CodexProvider {
                 |thread: &str, item: &str| cards.iter().any(|(_, c)| c.thread_id == thread && c.item_id == item);
             approvals::classify(request, &st.calls, &carded)
         };
+        if let Handling::Card {
+            thread_id,
+            turn_id: Some(turn_id),
+            ..
+        } = &handling
+        {
+            self.adopt_turn(st, thread_id, turn_id);
+        }
         // A request about a thread outside the tab's family is not shown; it is answered the way a deny
         // would be.
         let ours = handling.thread_id().is_none_or(|t| in_family(st, t));
@@ -503,7 +567,27 @@ impl CodexProvider {
                 ..
             } => {
                 st.calls.mark_asked(&thread_id, &item_id);
+                let row = row_of(st, &thread_id, &item_id);
                 let input = labelled(st, &thread_id, card.input());
+                // A card whose call has no row gets one, or the card, the host's note on it and the
+                // answer would sit on nothing the panel draws.
+                let added_row = match Self::tab_turn_id(st) {
+                    Some(turn_id) if !st.open_tools.contains(&row) && !st.answered_rows.contains(&row) => {
+                        st.open_tools.insert(row.clone());
+                        st.events.push_back(AgentDomainEvent::ToolCallStarted {
+                            turn_id: turn_id.clone(),
+                            tool_use_id: row.clone(),
+                            name: card.tool_name().to_string(),
+                            input: input.clone(),
+                        });
+                        Some(AddedRow {
+                            row: row.clone(),
+                            turn_id,
+                            subject: card.subject(),
+                        })
+                    }
+                    _ => None,
+                };
                 st.next_card += 1;
                 let permission_id = format!("codex-{}", st.next_card);
                 st.cards.push((
@@ -513,11 +597,12 @@ impl CodexProvider {
                         form,
                         item_id: item_id.clone(),
                         thread_id,
+                        added_row,
                     },
                 ));
                 st.events.push_back(AgentDomainEvent::PermissionRequested {
                     permission_id,
-                    tool_use_id: Some(item_id),
+                    tool_use_id: Some(row),
                     tool_name: card.tool_name().to_string(),
                     input,
                     provider_prompt: None,
@@ -559,8 +644,9 @@ impl CodexProvider {
 
     /// Says on a row why Eitri answered a request itself. The note goes on the call's own row when it has
     /// one; otherwise on a row Eitri adds for it, since a note with no row to sit on would never be seen
-    /// and the user would not learn that something was answered for them. With no turn running there is
-    /// nowhere to add a row, and the log line is all that is left.
+    /// and the user would not learn that something was answered for them. The note is the row's one
+    /// statement of it: an added row's input names only the subagent and its result is empty. With no turn
+    /// running there is nowhere to add a row, and the log line is all that is left.
     fn note_answered(
         st: &mut State,
         thread_id: Option<&str>,
@@ -574,7 +660,10 @@ impl CodexProvider {
             reason_type: Some(ANSWERED_BY_EITRI.to_string()),
             reason: Some(note),
         };
-        let on_its_row = item_id.filter(|id| st.open_tools.contains(id));
+        let on_its_row = match (thread_id, item_id) {
+            (Some(thread), Some(item)) => Some(row_of(st, thread, &item)).filter(|row| st.open_tools.contains(row)),
+            _ => None,
+        };
         if let Some(row) = on_its_row {
             st.events.push_back(denied(Some(row), note));
             return;
@@ -586,8 +675,8 @@ impl CodexProvider {
         // The turn's id keeps the row's id unique in a projection that outlives this connection.
         let row = format!("{ANSWERED_ROW_PREFIX}{turn_id}-{}", st.next_answered_row);
         let input = match thread_id {
-            Some(thread) => labelled(st, thread, json!({ "note": note })),
-            None => json!({ "note": note }),
+            Some(thread) => labelled(st, thread, json!({})),
+            None => json!({}),
         };
         st.events.push_back(AgentDomainEvent::ToolCallStarted {
             turn_id: turn_id.clone(),
@@ -595,12 +684,78 @@ impl CodexProvider {
             name: tool_name.to_string(),
             input,
         });
-        st.events.push_back(denied(Some(row.clone()), note.clone()));
+        st.events.push_back(denied(Some(row.clone()), note));
         st.events.push_back(AgentDomainEvent::ToolCallCompleted {
             turn_id,
             tool_use_id: row,
-            content: Value::String(note),
-            is_error: true,
+            content: Value::String(String::new()),
+            is_error: false,
+        });
+    }
+
+    /// Codex's own reviewer decided an escalation (Auto). The verdict is a note on the call it reviewed. A
+    /// network review names no call, since the command that wanted the network is not what was decided, so
+    /// it gets a row of its own naming the host. A review stopped by an interrupt decided nothing.
+    fn on_auto_review(&self, st: &mut State, review: wire::AutoReviewNotification) {
+        if !self.running_turn(st, &review.thread_id, &review.turn_id) {
+            return;
+        }
+        let Some(turn_id) = Self::tab_turn_id(st) else { return };
+        let rationale = review
+            .review
+            .rationale
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(|r| r.chars().take(REVIEW_RATIONALE_CHARS).collect::<String>());
+        let (reason_type, reason, allowed) = match review.review.status {
+            wire::ReviewStatus::Approved => (REVIEW_APPROVED, rationale, true),
+            wire::ReviewStatus::Denied => (REVIEW_DENIED, rationale, false),
+            wire::ReviewStatus::TimedOut => (
+                REVIEW_DENIED,
+                Some(rationale.unwrap_or_else(|| "the reviewer did not decide in time".to_string())),
+                false,
+            ),
+            wire::ReviewStatus::InProgress | wire::ReviewStatus::Aborted | wire::ReviewStatus::Unknown(_) => return,
+        };
+        let note = |row: String| AgentDomainEvent::PermissionDenied {
+            tool_use_id: Some(row),
+            tool_name: "autoApprovalReview".to_string(),
+            reason_type: Some(reason_type.to_string()),
+            reason: reason.clone(),
+        };
+        if let Some(item) = review.target_item_id.as_deref() {
+            let row = row_of(st, &review.thread_id, item);
+            st.events.push_back(note(row));
+            return;
+        }
+        let Some((host, protocol)) = review.network() else {
+            return;
+        };
+        st.next_answered_row += 1;
+        let row = format!("{REVIEW_ROW_PREFIX}{turn_id}-{}", st.next_answered_row);
+        let input = labelled(
+            st,
+            &review.thread_id,
+            json!({ "command": null, "cwd": null, "network": { "host": host, "protocol": protocol } }),
+        );
+        let said = if allowed {
+            "allowed by auto review"
+        } else {
+            "blocked by auto review"
+        };
+        st.events.push_back(AgentDomainEvent::ToolCallStarted {
+            turn_id: turn_id.clone(),
+            tool_use_id: row.clone(),
+            name: "commandExecution".to_string(),
+            input,
+        });
+        st.events.push_back(note(row.clone()));
+        st.events.push_back(AgentDomainEvent::ToolCallCompleted {
+            turn_id,
+            tool_use_id: row,
+            content: Value::String(format!("network access to {host} ({protocol}): {said}")),
+            is_error: !allowed,
         });
     }
 
@@ -613,18 +768,20 @@ impl CodexProvider {
         let Some(at) = st.cards.iter().position(|(_, c)| c.request_id == resolved.request_id) else {
             return;
         };
-        let (permission_id, _) = st.cards.remove(at);
+        let (permission_id, card) = st.cards.remove(at);
         st.events.push_back(AgentDomainEvent::PermissionResolved {
             permission_id,
             outcome: PermissionOutcome::CancelledByInterrupt,
         });
+        end_added_row(st, card, PermissionOutcome::CancelledByInterrupt);
     }
 
     /// Every card still waiting goes, with `outcome`: what it asked about can no longer happen.
     fn drop_cards(st: &mut State, outcome: PermissionOutcome) {
-        for (permission_id, _) in std::mem::take(&mut st.cards) {
+        for (permission_id, card) in std::mem::take(&mut st.cards) {
             st.events
                 .push_back(AgentDomainEvent::PermissionResolved { permission_id, outcome });
+            end_added_row(st, card, outcome);
         }
     }
 
@@ -701,19 +858,20 @@ impl CodexProvider {
 
     fn on_skipped(&self, st: &mut State, skipped: Skipped) {
         match skipped {
-            Skipped::TurnTooLarge { method, thread_id } => {
-                eprintln!("agent: a {method} message from Codex was larger than 16 MiB");
-                let ours = thread_id.as_deref().is_none_or(|t| in_family(st, t));
-                if ours && st.turn.as_ref().is_some_and(|t| t.id.is_some()) {
-                    let detail = TurnEndDetail::from_result(
-                        TurnOutcome::Failed,
-                        true,
+            Skipped::TurnTooLarge {
+                method: name,
+                thread_id,
+            } => {
+                eprintln!("agent: a {name} message from Codex was larger than 16 MiB");
+                if name == method::TURN_STARTED {
+                    self.unreadable_turn_start(st, thread_id.as_deref());
+                } else {
+                    self.unreadable_turn_end(
+                        st,
+                        thread_id.as_deref(),
                         "a message from Codex was too large",
-                        Some("message_too_large".to_string()),
-                        None,
-                        &[],
+                        "message_too_large",
                     );
-                    self.end_turn(st, TurnOutcome::Failed, detail);
                 }
             }
             Skipped::ItemTooLarge {
@@ -771,7 +929,9 @@ impl CodexProvider {
             N::ThreadStarted(_) => {}
             // Output is read from the finished item, which carries all of it.
             N::CommandOutputDelta(_) => {}
-            N::AutoReviewStarted(_) | N::AutoReviewCompleted(_) => {}
+            // A review under way has nothing to say yet; its verdict is what the row needs.
+            N::AutoReviewStarted(_) => {}
+            N::AutoReviewCompleted(review) => self.on_auto_review(st, review),
             N::McpStartupStatus(status) => {
                 if let Err(mismatch) = st.watch.mcp_started(&status.name) {
                     self.trip(st, mismatch);
@@ -786,19 +946,22 @@ impl CodexProvider {
             N::ServerRequestResolved(resolved) => self.on_request_resolved(st, resolved),
             N::Error(_) => {}
             N::Unknown { method, .. } => note_unknown(st, "a notification", &method),
-            N::Malformed { method: name, error } => {
+            N::Malformed {
+                method: name,
+                error,
+                thread_id,
+            } => {
                 eprintln!("agent: a {name} notification from Codex could not be read: {error}");
-                // A turn whose end cannot be read would otherwise run forever.
-                if name == method::TURN_COMPLETED && st.turn.as_ref().is_some_and(|t| t.id.is_some()) {
-                    let detail = TurnEndDetail::from_result(
-                        TurnOutcome::Failed,
-                        true,
+                if name == method::TURN_COMPLETED {
+                    // A turn whose end cannot be read would otherwise run forever.
+                    self.unreadable_turn_end(
+                        st,
+                        thread_id.as_deref(),
                         "Codex sent the end of the turn in a form Eitri could not read",
-                        Some("unreadable_turn_end".to_string()),
-                        None,
-                        &[],
+                        "unreadable_turn_end",
                     );
-                    self.end_turn(st, TurnOutcome::Failed, detail);
+                } else if name == method::TURN_STARTED {
+                    self.unreadable_turn_start(st, thread_id.as_deref());
                 }
             }
         }
@@ -806,13 +969,84 @@ impl CodexProvider {
 
     /// Whether a message names a turn of the family that is running. Anything else is about something this
     /// tab does not follow, and a thread outside the family is logged once.
-    fn running_turn(st: &mut State, thread_id: &str, turn_id: &str) -> bool {
+    fn running_turn(&self, st: &mut State, thread_id: &str, turn_id: &str) -> bool {
         if !in_family(st, thread_id) {
             note_foreign(st, thread_id);
             return false;
         }
-        st.turn.as_ref().is_some_and(|t| t.id.is_some())
-            && st.family.as_ref().is_some_and(|f| f.is_running(thread_id, turn_id))
+        if !st.turn.as_ref().is_some_and(|t| t.id.is_some()) {
+            return false;
+        }
+        self.adopt_turn(st, thread_id, turn_id);
+        st.family.as_ref().is_some_and(|f| f.is_running(thread_id, turn_id))
+    }
+
+    /// A message named `turn_id` on `thread_id`: when that thread's running turn is one whose start could
+    /// not be read, this is it. An interrupt the user asked for meanwhile goes out to it now.
+    fn adopt_turn(&self, st: &mut State, thread_id: &str, turn_id: &str) {
+        let adopted = st.family.as_mut().is_some_and(|f| f.adopt(thread_id, turn_id));
+        if adopted && st.turn.as_ref().is_some_and(|t| t.interrupting) {
+            self.send_interrupts(st);
+        }
+    }
+
+    /// A turn of the family started in a message Eitri could not read. A thread already running a turn
+    /// (the tab's, begun by the `turn/start` answer) loses nothing. Any other member's turn is followed
+    /// under a stand-in until a readable message names it, so the tab's turn still lasts as long as it
+    /// runs; when it opens the tab's turn, that turn gets an id of Eitri's own.
+    fn unreadable_turn_start(&self, st: &mut State, thread_id: Option<&str>) {
+        let Some(thread_id) = thread_id else {
+            eprintln!("agent: a turn started that Codex did not say the thread of; it is not followed");
+            return;
+        };
+        if !in_family(st, thread_id) {
+            note_foreign(st, thread_id);
+            return;
+        }
+        let edge = match st.family.as_mut() {
+            Some(family) if family.running_on(thread_id).is_none() => family.turn_started(thread_id, UNREAD_TURN),
+            _ => return,
+        };
+        if edge == FamilyEdge::Opened && st.turn.is_none() {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let turn_id = format!("eitri-unread-turn-{thread_id}-{stamp}");
+            st.turn = Some(ActiveTurn::new(Some(turn_id.clone())));
+            st.events.push_back(AgentDomainEvent::TurnStarted { turn_id });
+        }
+    }
+
+    /// A turn of the family ended in a message Eitri could not read, so its end is a failure. Only that
+    /// thread's turn ends: the tab's turn still waits for every other turn of the family. When the message
+    /// did not say whose it was, it is taken for the tab's own turn if that runs, else for the one family
+    /// turn running; with several running and none of them the tab's, nothing is guessed.
+    fn unreadable_turn_end(&self, st: &mut State, thread_id: Option<&str>, text: &str, reason: &str) {
+        if !st.turn.as_ref().is_some_and(|t| t.id.is_some()) {
+            return;
+        }
+        let Some(family) = st.family.as_ref() else { return };
+        let thread = match thread_id {
+            Some(thread) if family.contains(thread) => thread.to_string(),
+            Some(thread) => {
+                note_foreign(st, thread);
+                return;
+            }
+            None if family.running_on(family.tab_thread()).is_some() => family.tab_thread().to_string(),
+            None => match family.running_turns().as_slice() {
+                [(thread, _)] => thread.clone(),
+                _ => {
+                    eprintln!("agent: a turn ended that Codex did not say the thread of; the tab waits on");
+                    return;
+                }
+            },
+        };
+        let Some(turn) = family.running_on(&thread).map(str::to_string) else {
+            return;
+        };
+        let detail = TurnEndDetail::from_result(TurnOutcome::Failed, true, text, Some(reason.to_string()), None, &[]);
+        self.family_turn_ended(st, &thread, &turn, (TurnOutcome::Failed, detail));
     }
 
     /// The id of the tab's running turn, which every event of a family turn is filed under.
@@ -826,37 +1060,71 @@ impl CodexProvider {
     fn on_turn_started(&self, st: &mut State, n: TurnNotification) {
         if !in_family(st, &n.thread_id) {
             note_foreign(st, &n.thread_id);
+            if st.early_turns.len() < EARLY_TURNS_KEPT || st.early_turns.contains_key(&n.thread_id) {
+                st.early_turns.insert(n.thread_id, n.turn.id);
+            }
             return;
         }
+        self.join_family_turn(st, &n.thread_id, n.turn.id);
+    }
+
+    /// `turn` of member `thread` is running: it joins the tab's turn, or opens one when the tab is idle. An
+    /// interrupt the user asked for that this turn missed goes out to it now.
+    fn join_family_turn(&self, st: &mut State, thread: &str, turn: String) {
         let edge = match st.family.as_mut() {
-            Some(family) => family.turn_started(&n.thread_id, &n.turn.id),
+            Some(family) => family.turn_started(thread, &turn),
             None => return,
         };
         if edge == FamilyEdge::Opened && st.turn.is_none() {
-            st.turn = Some(ActiveTurn::new(Some(n.turn.id.clone())));
-            st.events
-                .push_back(AgentDomainEvent::TurnStarted { turn_id: n.turn.id });
+            st.turn = Some(ActiveTurn::new(Some(turn.clone())));
+            st.events.push_back(AgentDomainEvent::TurnStarted { turn_id: turn });
+        } else if st.turn.as_ref().is_some_and(|t| t.interrupting) {
+            self.send_interrupts(st);
         }
     }
 
-    /// A subagent announced on a thread of the family joins it. Returns whether the item was one.
-    fn announced(st: &mut State, thread_id: &str, item: &ThreadItem) -> bool {
-        let ThreadItem::SubAgentActivity(activity) = item else {
-            return false;
-        };
-        if let Some(family) = st.family.as_mut() {
-            if !family.announce(thread_id, activity) && activity.kind == SubAgentKind::Started {
-                note_foreign(st, thread_id);
-            }
+    /// A thread that just joined the family may already be running a turn; it is followed from now on.
+    fn joined(&self, st: &mut State, thread: &str) {
+        if let Some(turn) = st.early_turns.remove(thread) {
+            self.join_family_turn(st, thread, turn);
         }
-        true
+    }
+
+    /// Takes what an item says about the family into account. A `subAgentActivity` announces a subagent
+    /// and is nothing else, so the caller drops it (returns true). A `collabAgentToolCall` on a member
+    /// thread makes its receivers members, which is how a spawn is announced under a model with the plain
+    /// tool set; it is still the call's row (returns false).
+    fn announced(&self, st: &mut State, thread_id: &str, item: &ThreadItem) -> bool {
+        match item {
+            ThreadItem::SubAgentActivity(activity) => {
+                let member = st.family.as_mut().is_some_and(|f| f.announce(thread_id, activity));
+                if member {
+                    self.joined(st, &activity.agent_thread_id);
+                } else if activity.kind == SubAgentKind::Started {
+                    note_foreign(st, thread_id);
+                }
+                true
+            }
+            ThreadItem::CollabAgentToolCall(call) => {
+                let joined = st
+                    .family
+                    .as_mut()
+                    .map(|f| f.announce_receivers(thread_id, &call.receiver_thread_ids))
+                    .unwrap_or_default();
+                for thread in joined {
+                    self.joined(st, &thread);
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     fn on_item_started(&self, st: &mut State, n: ItemNotification) {
-        if Self::announced(st, &n.thread_id, &n.item) {
+        if self.announced(st, &n.thread_id, &n.item) {
             return;
         }
-        if !Self::running_turn(st, &n.thread_id, &n.turn_id) {
+        if !self.running_turn(st, &n.thread_id, &n.turn_id) {
             return;
         }
         let Some(turn_id) = Self::tab_turn_id(st) else { return };
@@ -886,10 +1154,11 @@ impl CodexProvider {
             other => {
                 if let (Some((name, input)), Some(id)) = (translate::tool_start(other), other.id()) {
                     let input = labelled(st, &n.thread_id, input);
-                    if st.open_tools.insert(id.to_string()) {
+                    let row = row_of(st, &n.thread_id, id);
+                    if !st.answered_rows.contains(&row) && st.open_tools.insert(row.clone()) {
                         st.events.push_back(AgentDomainEvent::ToolCallStarted {
                             turn_id,
-                            tool_use_id: id.to_string(),
+                            tool_use_id: row,
                             name: name.to_string(),
                             input,
                         });
@@ -900,10 +1169,10 @@ impl CodexProvider {
     }
 
     fn on_item_completed(&self, st: &mut State, n: ItemNotification) {
-        if Self::announced(st, &n.thread_id, &n.item) {
+        if self.announced(st, &n.thread_id, &n.item) {
             return;
         }
-        if !Self::running_turn(st, &n.thread_id, &n.turn_id) {
+        if !self.running_turn(st, &n.thread_id, &n.turn_id) {
             return;
         }
         let Some(turn_id) = Self::tab_turn_id(st) else { return };
@@ -955,20 +1224,21 @@ impl CodexProvider {
                 else {
                     return;
                 };
-                if st.open_tools.remove(id) {
+                let row = row_of(st, &n.thread_id, id);
+                if st.open_tools.remove(&row) || st.answered_rows.remove(&row) {
                     // Started earlier: only the result is new.
                 } else {
                     let input = labelled(st, &n.thread_id, input);
                     st.events.push_back(AgentDomainEvent::ToolCallStarted {
                         turn_id: turn_id.clone(),
-                        tool_use_id: id.to_string(),
+                        tool_use_id: row.clone(),
                         name: name.to_string(),
                         input,
                     });
                 }
                 st.events.push_back(AgentDomainEvent::ToolCallCompleted {
                     turn_id,
-                    tool_use_id: id.to_string(),
+                    tool_use_id: row,
                     content,
                     is_error,
                 });
@@ -977,7 +1247,7 @@ impl CodexProvider {
     }
 
     fn on_delta(&self, st: &mut State, delta: ItemDelta, kind: ContentKind) {
-        if delta.delta.is_empty() || !Self::running_turn(st, &delta.thread_id, &delta.turn_id) {
+        if delta.delta.is_empty() || !self.running_turn(st, &delta.thread_id, &delta.turn_id) {
             return;
         }
         let Some(turn_id) = Self::tab_turn_id(st) else { return };
@@ -995,17 +1265,26 @@ impl CodexProvider {
     /// A turn of the family ended. The tab's turn ends with the last of them, with the outcome of the tab's
     /// own turn: a child's end is not the tab's failure.
     fn on_turn_completed(&self, st: &mut State, n: TurnNotification) {
-        if !Self::running_turn(st, &n.thread_id, &n.turn.id) {
+        if st.early_turns.get(&n.thread_id) == Some(&n.turn.id) {
+            st.early_turns.remove(&n.thread_id);
+        }
+        if !self.running_turn(st, &n.thread_id, &n.turn.id) {
             return;
         }
-        if is_tab(st, &n.thread_id) {
-            let ending = translate::turn_ending(&n.turn.status, n.turn.error.as_ref());
-            if let Some(turn) = st.turn.as_mut() {
-                turn.own_end = Some(ending);
+        let ending = translate::turn_ending(&n.turn.status, n.turn.error.as_ref());
+        self.family_turn_ended(st, &n.thread_id, &n.turn.id, ending);
+    }
+
+    /// `turn` of `thread` ended with `ending`. The tab's turn ends with the last of the family's, with the
+    /// outcome of the tab's own turn.
+    fn family_turn_ended(&self, st: &mut State, thread: &str, turn: &str, ending: (TurnOutcome, TurnEndDetail)) {
+        if is_tab(st, thread) {
+            if let Some(active) = st.turn.as_mut() {
+                active.own_end = Some(ending);
             }
         }
         let edge = match st.family.as_mut() {
-            Some(family) => family.turn_completed(&n.thread_id, &n.turn.id),
+            Some(family) => family.turn_completed(thread, turn),
             None => return,
         };
         if edge != FamilyEdge::Closed {
@@ -1032,6 +1311,7 @@ impl CodexProvider {
         let usage = turn.usage.as_ref().map(|u| translate::usage_of(u, st.model.as_deref()));
         st.items.clear();
         st.open_tools.clear();
+        st.answered_rows.clear();
         st.calls.clear();
         if let Some(family) = st.family.as_mut() {
             family.reset_turns();
@@ -1046,6 +1326,32 @@ impl CodexProvider {
             detail,
         });
     }
+}
+
+/// Ends the row Eitri added for `card`, if it added one and Codex has not reported the call since, with the
+/// card's answer as its result.
+fn end_added_row(st: &mut State, card: WaitingCard, outcome: PermissionOutcome) {
+    let Some(added) = card.added_row else { return };
+    if !st.open_tools.remove(&added.row) {
+        return;
+    }
+    let (said, is_error) = match outcome {
+        PermissionOutcome::Allowed => ("allowed once", false),
+        PermissionOutcome::Denied => ("declined", true),
+        _ => ("not answered", true),
+    };
+    st.answered_rows.insert(added.row.clone());
+    st.events.push_back(AgentDomainEvent::ToolCallCompleted {
+        turn_id: added.turn_id,
+        tool_use_id: added.row,
+        content: Value::String(format!("{}: {said}", added.subject)),
+        is_error,
+    });
+}
+
+/// The row id of item `item` of `thread` (`translate::row_id`).
+fn row_of(st: &State, thread: &str, item: &str) -> String {
+    translate::row_id(st.thread_id.as_deref().unwrap_or_default(), thread, item)
 }
 
 /// Whether a thread is the tab's own.
@@ -1162,14 +1468,14 @@ impl AgentProvider for CodexProvider {
             ));
         };
         let (permission_id, card) = st.cards.remove(at);
-        self.respond(card.request_id, card.form.reply(answer));
-        st.events.push_back(AgentDomainEvent::PermissionResolved {
-            permission_id,
-            outcome: match answer {
-                CardAnswer::Approve => PermissionOutcome::Allowed,
-                _ => PermissionOutcome::Denied,
-            },
-        });
+        self.respond(card.request_id.clone(), card.form.reply(answer));
+        let outcome = match answer {
+            CardAnswer::Approve => PermissionOutcome::Allowed,
+            _ => PermissionOutcome::Denied,
+        };
+        st.events
+            .push_back(AgentDomainEvent::PermissionResolved { permission_id, outcome });
+        end_added_row(&mut st, card, outcome);
         Ok(())
     }
 
@@ -1337,7 +1643,8 @@ impl CodexProvider {
         requested.to_string()
     }
 
-    /// Reads the thread's history page by page and files it ahead of everything Codex said meanwhile.
+    /// Reads the thread's history page by page and keeps it for the host, which folds it ahead of
+    /// everything Codex said meanwhile.
     fn read_history(&self, thread_id: &str) {
         let skip = lock(&self.state).blocked.is_some();
         let mut events = Vec::new();
@@ -1355,7 +1662,7 @@ impl CodexProvider {
             events = resume::page_history(thread_id, Instant::now() + HISTORY_BUDGET, &mut ask);
         }
         let mut st = lock(&self.state);
-        st.events.extend(events);
+        st.history = events;
         st.history_loading = false;
     }
 }
@@ -1389,6 +1696,10 @@ impl ExternalProvider for CodexProvider {
             lock(&self.state).history_loading = false;
         }
         result
+    }
+
+    fn take_history(&self) -> Vec<AgentDomainEvent> {
+        std::mem::take(&mut lock(&self.state).history)
     }
 
     fn send_turn_with(&self, req: SendTurnRequest, policy: TurnPolicy) -> Result<String, ProviderError> {

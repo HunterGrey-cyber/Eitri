@@ -36,8 +36,8 @@ use eitri_core::project_trust::Profile;
 use eitri_core::saved_tabs::{SavedTabs, TabMemory};
 use eitri_core::tab_restore::{RestoreOffer, RestorePolicy, RestoreRun};
 use eitri_core::tab_set::{
-    AgentId, AwaitingTrust, BypassPolicy, DeferredStart, FirstTurn, PendingHandoff, PendingStart, RestoreGo,
-    RestorePrompt, RestoreStep, ResumeRoute, StartCollected, Tab, TabBackend,
+    AgentId, AwaitingTrust, BypassPolicy, DeferredStart, FirstTurn, PendingHandoff, PendingStart, RestoreConnect,
+    RestoreGo, RestorePrompt, RestoreStep, ResumeRoute, StartCollected, Tab, TabBackend,
 };
 use eitri_core::tabs::TabId;
 use std::cell::{Cell, RefCell};
@@ -586,6 +586,9 @@ struct AgentPanelState {
     default_agent: AgentId,
     /// `agent.codex.command` as `init.lua` left it; `EITRI_CODEX` still outranks it.
     codex_command: Option<String>,
+    /// What a connect worker has to say while it works (a first Codex start's self-check): sent to
+    /// the band by the tick.
+    start_notes: StartNotes,
     /// A restore whose resumes have not all returned yet.
     restore_run: Option<RestoreRun>,
     /// Whether the hello last sent could carry the restore offer, so the tick sends a new one only
@@ -805,6 +808,8 @@ impl AgentPanelHandle {
         let panel_mapped = page.is_visible();
         // Read before anything below changes it: a session installed this tick resets its count.
         let attention_before = state.borrow().tabs.attention();
+        let notes = state.borrow().start_notes.drain();
+        dispatch_all(page, notes);
         collect_pending_starts(state, page);
         collect_pending_handoffs(state, page);
         report_sessions_that_never_opened(state, page);
@@ -1932,6 +1937,7 @@ fn panel_state(
         mode_remembered,
         default_agent: AgentId::Claude,
         codex_command: None,
+        start_notes: StartNotes::default(),
         restore_run: None,
         last_restore_offered: false,
         last_hello_agent: AgentId::Claude,
@@ -2583,8 +2589,9 @@ fn start_restore(
     project: ProjectTrust,
 ) -> RestoreResult {
     let canonical = state.canonical_project_dir.clone();
-    // Only Claude tabs are started here; another agent's tab is refused in `connect` below, before a
-    // tab is made for it, so no lease is taken for one.
+    // Only Claude tabs are started here, on this answer. Another agent's tab comes back holding its
+    // resume and waits for its own agent's trust answer, which starts it as a resume by hand; its
+    // lease is taken when it starts, so none is taken here.
     let mut leases: std::collections::HashMap<String, Result<agent::lease::SessionLease, String>> = go
         .sessions()
         .into_iter()
@@ -2601,14 +2608,21 @@ fn start_restore(
     let (downgraded, asked) = (go.downgraded, go.asked);
     let run = state.tabs.start_restore(from, go, |agent, id| {
         if agent.is_external() {
-            return Err(format!("this build cannot bring a {} tab back yet", agent.label()));
+            return Ok(RestoreConnect::AwaitTrust);
         }
         match leases.remove(id) {
-            Some(Ok(lease)) => Ok(spawn(id, lease, project)),
+            Some(Ok(lease)) => Ok(RestoreConnect::Started(spawn(id, lease, project))),
             Some(Err(reason)) => Err(reason),
             None => Err("it was listed twice".to_string()),
         }
     });
+    // Each waiting tab is checked for its own agent now; the tick asks the question once the tab is
+    // on screen, or starts it at once when the window already has that agent's answer.
+    for &tab in run.awaiting_trust() {
+        let profile = waiting_profile(state, tab);
+        state.trust.wait_for(tab, &profile);
+        state.trust.begin_check(&profile);
+    }
     // The tabs this restore just set connecting are the only starting ones without their tiers:
     // every other start names them as it begins.
     for tab in state.tabs.tabs().iter().map(|t| t.id).collect::<Vec<_>>() {
@@ -2767,15 +2781,18 @@ fn trust_profile(agent: &AgentId) -> Profile {
     }
 }
 
-/// The profile a tab's start waits on. A restore starts Claude's saved tabs only, whichever agent
-/// the tab it waits in runs, so it is Claude's configuration that is asked about.
+/// The profile a tab's start waits on. A restore starts on its answer only the tabs of the agent it
+/// waits for (Claude's, whenever it brings a Claude tab back), whichever agent the tab it waits in
+/// runs; its other agents' tabs come back waiting for their own answers.
 fn waiting_profile(state: &AgentPanelState, tab: TabId) -> Profile {
     match state.tabs.get(tab) {
         Some(t) => match &t.backend {
+            // A restore waits for the answer its own tabs start on: Claude's when it brings any
+            // Claude tab back, else its first tab's agent's.
             TabBackend::AwaitingTrust(AwaitingTrust {
-                start: DeferredStart::Restore { .. },
+                start: DeferredStart::Restore { go },
                 ..
-            }) => Profile::Claude,
+            }) => trust_profile(&go.trust_agent().unwrap_or(AgentId::Claude)),
             _ => trust_profile(t.agent()),
         },
         None => Profile::Claude,
@@ -2935,7 +2952,15 @@ fn start_external_tab(
     let project_dir = state.project_dir.clone();
     let codex_command = state.codex_command.clone();
     let result_rx = match &state.spawner {
-        Spawner::Real => spawn_external(agent, project_dir, plan, mode, resume.clone(), codex_command),
+        Spawner::Real => spawn_external(
+            agent,
+            project_dir,
+            plan,
+            mode,
+            resume.clone(),
+            codex_command,
+            state.start_notes.sender(),
+        ),
         #[cfg(test)]
         Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::External {
             agent,
@@ -3630,6 +3655,62 @@ fn spawn_connect(
     spawn_connect_holding(kind, project_dir, resume, None, project)
 }
 
+/// What the band says while a Codex binary Eitri has not checked yet goes through its self-check.
+const CHECKING_CODEX: &str = "checking this Codex\u{2026} (once for this binary, a few seconds)";
+
+/// Where the self-check keeps a verdict, under Eitri's state directory: `codex-check/<key>/verdict.json`,
+/// written only for a pass.
+const CODEX_CHECK_DIR: &str = "codex-check";
+
+/// Whether starting `program` will run the self-check first: no passing verdict is kept for this binary
+/// under `state_home`. Asked only to say so in the band; the start decides for itself. A binary whose
+/// key cannot be read, or one too old to be checked, is refused by the start before any check runs, so
+/// it says nothing here. Runs a `--version` of the binary: worker threads only.
+fn codex_check_pending(program: &Path, state_home: Option<&Path>) -> bool {
+    let Some(state_home) = state_home else { return false };
+    let Ok(key) = agent::providers::codex::BinaryKey::of(program) else {
+        return false;
+    };
+    if key
+        .version_numbers()
+        .is_some_and(|found| found < agent::providers::codex::MIN_CODEX)
+    {
+        return false;
+    }
+    !state_home
+        .join(CODEX_CHECK_DIR)
+        .join(key.id())
+        .join("verdict.json")
+        .is_file()
+}
+
+/// The notes connect workers send while they work, drained by the tick.
+struct StartNotes {
+    tx: mpsc::Sender<String>,
+    rx: mpsc::Receiver<String>,
+}
+
+impl Default for StartNotes {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        StartNotes { tx, rx }
+    }
+}
+
+impl StartNotes {
+    fn sender(&self) -> mpsc::Sender<String> {
+        self.tx.clone()
+    }
+
+    /// Every note sent since the last call, as `notice` payloads for the band. Never blocks.
+    fn drain(&self) -> Vec<String> {
+        self.rx
+            .try_iter()
+            .map(|note| eitri_core::agent_bridge::serialize_notice_for_js(&note))
+            .collect()
+    }
+}
+
 /// The connect worker of another agent's tab: locates its binary and starts (or resumes) its session
 /// with `plan`, off the GTK main loop, since the agent's own check and handshake take seconds.
 fn spawn_external(
@@ -3639,16 +3720,31 @@ fn spawn_external(
     mode: SessionModeChoice,
     resume: Option<String>,
     codex_command: Option<String>,
+    notes: mpsc::Sender<String>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let program = match &agent {
             AgentId::Codex => {
-                agent::providers::codex::locate_codex(codex_command.as_deref()).map_err(|e| BackendError {
-                    message: format!("Codex could not start: {e}"),
-                    benign: false,
-                    folded_events: Vec::new(),
-                })
+                let located =
+                    agent::providers::codex::locate_codex(codex_command.as_deref()).map_err(|e| BackendError {
+                        message: format!("Codex could not start: {e}"),
+                        benign: false,
+                        folded_events: Vec::new(),
+                    });
+                // The start is about to run the self-check: the tab would otherwise sit in "starting"
+                // for seconds with nothing said.
+                if let Ok(program) = &located {
+                    let state_home = eitri_core::layout::persist::state_subdir(
+                        std::env::var_os("XDG_STATE_HOME").as_deref(),
+                        std::env::var_os("HOME").as_deref(),
+                        "",
+                    );
+                    if codex_check_pending(program, state_home.as_deref()) {
+                        let _ = notes.send(CHECKING_CODEX.to_string());
+                    }
+                }
+                located
             }
             // `start_external` refuses an agent it has no provider for, naming it.
             AgentId::Claude | AgentId::Acp(_) => Ok(PathBuf::new()),
@@ -6355,6 +6451,7 @@ mod tests {
             mode_remembered: false,
             default_agent: AgentId::Claude,
             codex_command: None,
+            start_notes: StartNotes::default(),
             restore_run: None,
             last_restore_offered: false,
             last_hello_agent: AgentId::Claude,
@@ -9558,6 +9655,215 @@ mod tests {
         for t in state.borrow().tabs.tabs() {
             assert_eq!(t.project_tiers, Some(ProjectTrust::Untrusted));
         }
+    }
+
+    /// A stand-in `codex` that prints `version` for `--version`, in a fresh scratch directory.
+    fn fake_codex(label: &str, version: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        let program = dir.join("codex");
+        std::fs::write(&program, format!("#!/bin/sh\necho 'codex-cli {version}'\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, program)
+    }
+
+    /// The band says the self-check is running exactly when the start is about to run it: a binary with no
+    /// passing verdict kept. A kept verdict, a binary too old to check, or no state directory say nothing.
+    #[test]
+    fn a_first_codex_start_says_it_is_checking_this_codex() {
+        let (dir, program) = fake_codex("codex-check-note", "0.161.0");
+        let state_home = dir.join("state");
+        assert!(codex_check_pending(&program, Some(&state_home)));
+        assert!(!codex_check_pending(&program, None));
+        let key = agent::providers::codex::BinaryKey::of(&program).unwrap();
+        let verdict = state_home.join(CODEX_CHECK_DIR).join(key.id()).join("verdict.json");
+        std::fs::create_dir_all(verdict.parent().unwrap()).unwrap();
+        std::fs::write(&verdict, b"{}").unwrap();
+        assert!(
+            !codex_check_pending(&program, Some(&state_home)),
+            "checked once is checked"
+        );
+
+        let (old_dir, old) = fake_codex("codex-check-note-old", "0.100.0");
+        assert!(!codex_check_pending(&old, Some(&old_dir.join("state"))));
+
+        let notes = StartNotes::default();
+        notes.sender().send(CHECKING_CODEX.to_string()).unwrap();
+        let sent = notes.drain();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(json_of(&sent[0])["kind"], "notice");
+        assert_eq!(
+            json_of(&sent[0])["text"],
+            "checking this Codex\u{2026} (once for this binary, a few seconds)"
+        );
+        assert!(notes.drain().is_empty());
+    }
+
+    /// The band's guess reads the self-check's own verdict file: the two names must stay the same.
+    #[test]
+    fn the_check_note_reads_where_the_self_check_writes() {
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent/src/providers/codex/self_check.rs"),
+        )
+        .unwrap();
+        assert!(source.contains(&format!("const CHECK_DIR: &str = \"{CODEX_CHECK_DIR}\";")));
+        assert!(source.contains("dir.join(\"verdict.json\")"));
+    }
+
+    /// A panel from [`restore_panel`] whose last window also left a Codex tab (`thread-9`, the one on
+    /// screen), with its record, and a spawner that records what it was asked to start.
+    #[allow(clippy::type_complexity)]
+    fn restore_panel_with_codex(
+        label: &str,
+    ) -> (
+        Rc<RefCell<AgentPanelState>>,
+        PathBuf,
+        Rc<RefCell<Vec<String>>>,
+        Rc<RefCell<Vec<ExternalSpawned>>>,
+    ) {
+        let (state, dir) = restore_panel(label, &[("s-1", None, Auto)], &["s-1"]);
+        let conversation_id = agent::conversation_id_for_cwd(&dir);
+        agent::persistence::save_conversation_record(&agent::persistence::ConversationRecord {
+            conversation_id: conversation_id.clone(),
+            provider: "codex".to_string(),
+            provider_session_id: "thread-9".to_string(),
+            canonical_cwd: dir.to_string_lossy().into_owned(),
+            created_at: "1".to_string(),
+            updated_at: "2".to_string(),
+            provider_advertised_resume: true,
+            title: Some("title of thread-9".to_string()),
+            name: None,
+        })
+        .unwrap();
+        let resumed = Rc::new(RefCell::new(Vec::new()));
+        let external = Rc::new(RefCell::new(Vec::new()));
+        {
+            let mut s = state.borrow_mut();
+            s.document_ready = true;
+            let saved = s.restore_source.as_mut().unwrap();
+            saved.external_tabs = vec![eitri_core::saved_tabs::SavedExternalTab {
+                agent: AgentId::Codex,
+                conversation_id,
+                provider_session_id: "thread-9".to_string(),
+                name: None,
+                mode: Auto,
+            }];
+            saved.active_external = Some(0);
+            let (resumed, external) = (resumed.clone(), external.clone());
+            s.spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| {
+                match call {
+                    SpawnCall::Resume { id, .. } => resumed.borrow_mut().push(id),
+                    SpawnCall::Connect { .. } => panic!("a restore resumes; it never connects afresh"),
+                    SpawnCall::External {
+                        agent,
+                        plan,
+                        mode,
+                        resume,
+                    } => external.borrow_mut().push(ExternalSpawned {
+                        agent,
+                        plan,
+                        mode,
+                        resume,
+                    }),
+                }
+                mpsc::channel().1
+            })));
+        }
+        (state, dir, resumed, external)
+    }
+
+    /// A saved Codex tab comes back after the Claude tabs' answer, holding its resume for Codex's own
+    /// answer (here nothing to trust, so given at once), and is resumed as a resume by hand would be.
+    #[test]
+    fn a_saved_codex_tab_is_restored_through_its_own_trust_answer() {
+        let (state, _dir, resumed, external) = restore_panel_with_codex("restore-codex");
+        let from = state.borrow().tabs.active();
+        let result = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard);
+        assert!(matches!(result, RestoreResult::Deferred));
+        tick_until(&state, |_| !external.borrow().is_empty());
+        assert_eq!(*resumed.borrow(), ["s-1"]);
+        let spawned = external.borrow();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].agent, AgentId::Codex);
+        assert_eq!(spawned[0].resume.as_deref(), Some("thread-9"));
+        assert_eq!(spawned[0].mode, Auto);
+        assert!(spawned[0].plan.skills_off, "nothing to trust starts untrusted");
+        let s = state.borrow();
+        let codex = s.tabs.tab_with_session("thread-9").expect("the Codex tab is back");
+        assert_eq!(s.tabs.get(codex).unwrap().agent(), &AgentId::Codex);
+        assert_eq!(s.tabs.active(), codex, "the saved active tab is on screen");
+        let saved = s.tabs.saved_snapshot("conv").unwrap();
+        assert_eq!(saved.tabs.len(), 1);
+        assert_eq!(saved.external_tabs.len(), 1, "the Codex tab is still saved");
+    }
+
+    /// When the project has something for Codex to load, the restored Codex tab waits for that
+    /// question without starting, and stays in the saved file meanwhile; the answer starts it.
+    #[test]
+    fn a_restored_codex_tab_waiting_for_its_question_stays_saved() {
+        let (state, dir, resumed, external) = restore_panel_with_codex("restore-codex-asks");
+        std::fs::write(dir.join("AGENTS.md"), b"be careful\n").unwrap();
+        let from = state.borrow().tabs.active();
+        let result = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard);
+        assert!(matches!(result, RestoreResult::Deferred));
+        let prompt = next_prompt(&state);
+        assert_eq!(*resumed.borrow(), ["s-1"], "Claude has nothing to trust and started");
+        assert!(
+            external.borrow().is_empty(),
+            "nothing of Codex starts while it is asked"
+        );
+        let codex = state
+            .borrow()
+            .tabs
+            .tab_with_session("thread-9")
+            .expect("the Codex tab is back");
+        assert_eq!(prompt.tab, codex);
+        assert!(matches!(
+            state.borrow().tabs.get(codex).unwrap().backend,
+            TabBackend::AwaitingTrust(_)
+        ));
+        let saved = state.borrow().tabs.saved_snapshot("conv").unwrap();
+        assert_eq!(saved.external_tabs.len(), 1, "kept in the saved file while it waits");
+        assert_eq!(saved.external_tabs[0].provider_session_id, "thread-9");
+
+        let out = answer_prompt(&state, "n1", &prompt, false);
+        assert_eq!(result_for(&out.payloads, "n1"), Some(Ok(())));
+        let spawned = external.borrow();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].resume.as_deref(), Some("thread-9"));
+        assert!(spawned[0].plan.skills_off, "an n starts it untrusted");
+    }
+
+    /// A restore of Codex tabs alone asks Codex's question, once, and never Claude's.
+    #[test]
+    fn a_restore_of_codex_tabs_alone_asks_only_codexs_question() {
+        let (state, dir, resumed, external) = restore_panel_with_codex("restore-codex-only");
+        state.borrow_mut().restore_source.as_mut().unwrap().tabs.clear();
+        // Claude would have something to ask about too; it is not asked.
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), b"be careful\n").unwrap();
+        let from = state.borrow().tabs.active();
+        let result = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard);
+        assert!(matches!(result, RestoreResult::Deferred));
+        let seen = tick_until(&state, |seen| !prompts(&all_payloads(seen)).is_empty());
+        let asked: Vec<serde_json::Value> = all_payloads(&seen)
+            .iter()
+            .map(|p| json_of(p))
+            .filter(|v| v["kind"] == "trust_prompt")
+            .collect();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0]["agent"], "Codex");
+        let prompt = prompts(&all_payloads(&seen)).pop().unwrap();
+        let out = answer_prompt(&state, "n1", &prompt, false);
+        assert_eq!(result_for(&out.payloads, "n1"), Some(Ok(())));
+        let seen = tick_until(&state, |_| !external.borrow().is_empty());
+        assert!(
+            prompts(&all_payloads(&seen)).is_empty(),
+            "the window's answer covers the tab"
+        );
+        assert!(resumed.borrow().is_empty());
+        assert_eq!(external.borrow()[0].resume.as_deref(), Some("thread-9"));
     }
 
     /// A saved bypass tab's question is answered first; only then is the trust question asked, and

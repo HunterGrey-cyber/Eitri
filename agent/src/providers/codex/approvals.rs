@@ -132,6 +132,19 @@ impl CardKind {
         }
     }
 
+    /// What the card asks about, in a few words, for the row Eitri adds when the request's call has none.
+    pub fn subject(&self) -> String {
+        match self {
+            CardKind::Command {
+                escalation: Wording::Network { host, protocol },
+                ..
+            } => format!("network access to {host} ({protocol})"),
+            CardKind::Command { .. } => "the command".to_string(),
+            CardKind::FileChange { .. } => "the file change".to_string(),
+            CardKind::Mcp { server, tool, .. } => format!("{server}'s tool {tool}"),
+        }
+    }
+
     /// The bytes of what the card shows that Codex wrote.
     fn shown_bytes(&self) -> usize {
         match self {

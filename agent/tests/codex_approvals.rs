@@ -237,11 +237,26 @@ fn note_on(events: &[AgentDomainEvent], item: Option<&str>) -> String {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                AgentDomainEvent::ToolCallCompleted { tool_use_id, content, is_error: true, .. }
-                    if *tool_use_id == row && content.as_str() == Some(note.as_str())
+                AgentDomainEvent::ToolCallCompleted { tool_use_id, content, .. }
+                    if *tool_use_id == row && content.as_str() == Some("")
             )),
-            "Eitri's row ends as a failure that says why: {events:#?}"
+            "Eitri's row ends, with nothing of its own to add: {events:#?}"
         );
+        // The note is said once on the row: not again in the row's input or its result.
+        let said = events
+            .iter()
+            .filter(|e| match e {
+                AgentDomainEvent::ToolCallStarted { tool_use_id, input, .. } => {
+                    *tool_use_id == row && input.to_string().contains(note.as_str())
+                }
+                AgentDomainEvent::ToolCallCompleted {
+                    tool_use_id, content, ..
+                } => *tool_use_id == row && content.to_string().contains(note.as_str()),
+                AgentDomainEvent::PermissionDenied { tool_use_id, .. } => tool_use_id.as_deref() == Some(row.as_str()),
+                _ => false,
+            })
+            .count();
+        assert_eq!(said, 1, "the note is said once: {events:#?}");
     }
     note
 }
@@ -354,6 +369,214 @@ fn network_context_is_worded_with_host() {
     assert_eq!(on.as_deref(), Some(net_id), "the card is answered under Codex's own id");
     answer(&provider, "th-c3", &id, PermissionDecision::Allow);
     until_turn_completed(&provider);
+}
+
+/// A network request names a call no row has (its id is Codex's own key, and no item is started for it).
+/// It gets a row of its own before its card, so a note the host puts on it ("allowed in bypass") and the
+/// grant itself stay on screen; the row ends with the answer, since Codex never reports that call.
+#[test]
+fn a_network_request_gets_a_row_that_ends_with_its_answer() {
+    for (decision, written, granted) in [
+        (PermissionDecision::Allow, r#"{"decision":"accept"}"#, true),
+        (
+            PermissionDecision::Deny { reason: None },
+            r#"{"decision":"decline"}"#,
+            false,
+        ),
+    ] {
+        let net_id = "network#https#example.org#443#7f1c9a52-0d6e-4c7a-9a43-2f8b1e0c5d11";
+        let provider = running(
+            "th-n1",
+            "tu-n1",
+            Reviewer::User,
+            vec![
+                item_started("th-n1", "tu-n1", command_item("exec-n", "curl https://example.org")),
+                request(
+                    json!(0),
+                    "item/commandExecution/requestApproval",
+                    json!({"threadId": "th-n1", "turnId": "tu-n1", "itemId": net_id, "startedAtMs": 1,
+                           "networkApprovalContext": {"host": "example.org", "protocol": "https"}}),
+                ),
+                expect_answer(json!(0), written),
+                turn_completed("th-n1", "tu-n1", "completed"),
+            ],
+        );
+        let (id, _, _, mut events) = until_card(&provider);
+        let row = events.iter().position(|e| {
+            matches!(e, AgentDomainEvent::ToolCallStarted { tool_use_id, name, input, .. }
+                if tool_use_id == net_id && name == "commandExecution" && input["network"]["host"] == "example.org")
+        });
+        let card = events.iter().position(
+            |e| matches!(e, AgentDomainEvent::PermissionRequested { tool_use_id: Some(t), .. } if t == net_id),
+        );
+        assert!(
+            row.is_some() && row < card,
+            "a row for the request, before its card: {events:#?}"
+        );
+        answer(&provider, "th-n1", &id, decision);
+        events.extend(until_turn_completed(&provider));
+        let ends: Vec<(String, bool)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentDomainEvent::ToolCallCompleted {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } if tool_use_id == net_id => Some((content.as_str().unwrap_or_default().to_string(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 1, "the row ends once: {events:#?}");
+        assert_eq!(ends[0].1, !granted, "{ends:?}");
+        assert!(ends[0].0.contains("example.org"), "{ends:?}");
+    }
+}
+
+/// `item/autoApprovalReview/*` as Codex 0.160.0 writes it: the reviewed call, the verdict and the action.
+fn review(
+    method: &str,
+    turn: &str,
+    review_id: &str,
+    target: Option<&str>,
+    status: &str,
+    rationale: Option<&str>,
+    action: Value,
+) -> Value {
+    write(json!({"method": method, "params": {
+        "threadId": "th-r", "turnId": turn, "startedAtMs": 1, "reviewId": review_id,
+        "targetItemId": target, "decisionSource": "agent",
+        "review": {"status": status, "riskLevel": "high", "userAuthorization": null, "rationale": rationale},
+        "action": action,
+    }}))
+}
+
+/// In Auto, Codex's own reviewer decides an escalation. Its verdict is a note on the call it reviewed: a
+/// denial (or a review that ran out of time, which Codex treats as one) says "blocked", an approval says so
+/// too, and a review still under way says nothing yet. A network review names no call, so it gets a row.
+#[test]
+fn the_reviewers_verdict_is_a_note_on_the_reviewed_call() {
+    let started = "item/autoApprovalReview/started";
+    let completed = "item/autoApprovalReview/completed";
+    let command = |c: &str| json!({"type": "command", "source": "shell", "command": c, "cwd": "/work/proj"});
+    let provider = running(
+        "th-r",
+        "tu-r",
+        Reviewer::Agent,
+        vec![
+            item_started("th-r", "tu-r", command_item("exec-bad", "rm -rf build")),
+            review(
+                started,
+                "tu-r",
+                "rv1",
+                Some("exec-bad"),
+                "inProgress",
+                None,
+                command("rm -rf build"),
+            ),
+            review(
+                completed,
+                "tu-r",
+                "rv1",
+                Some("exec-bad"),
+                "denied",
+                Some("deletes the build"),
+                command("rm -rf build"),
+            ),
+            item_started("th-r", "tu-r", command_item("exec-ok", "cargo build")),
+            review(
+                completed,
+                "tu-r",
+                "rv2",
+                Some("exec-ok"),
+                "approved",
+                Some("builds the project"),
+                command("cargo build"),
+            ),
+            item_started("th-r", "tu-r", command_item("exec-slow", "make")),
+            review(
+                completed,
+                "tu-r",
+                "rv3",
+                Some("exec-slow"),
+                "timedOut",
+                None,
+                command("make"),
+            ),
+            review(
+                completed,
+                "tu-r",
+                "rv4",
+                None,
+                "approved",
+                Some("a package mirror"),
+                json!({"type": "networkAccess", "target": "https://example.org", "host": "example.org",
+                       "protocol": "https", "port": 443}),
+            ),
+            turn_completed("th-r", "tu-r", "completed"),
+        ],
+    );
+    let events = until_turn_completed(&provider);
+    let notes: Vec<(String, Option<String>, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::PermissionDenied {
+                tool_use_id: Some(row),
+                reason_type,
+                reason,
+                ..
+            } => Some((row.clone(), reason_type.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect();
+    let on = |row: &str| notes.iter().filter(|(r, _, _)| r == row).cloned().collect::<Vec<_>>();
+    assert_eq!(
+        on("exec-bad"),
+        vec![(
+            "exec-bad".into(),
+            Some("auto_review".into()),
+            Some("deletes the build".into())
+        )],
+        "one note, the verdict; the review under way said nothing: {events:#?}"
+    );
+    assert_eq!(
+        on("exec-ok"),
+        vec![(
+            "exec-ok".into(),
+            Some("auto_review_approved".into()),
+            Some("builds the project".into())
+        )]
+    );
+    let slow = on("exec-slow");
+    assert_eq!(slow.len(), 1);
+    assert_eq!(
+        slow[0].1.as_deref(),
+        Some("auto_review"),
+        "a review out of time blocks the call"
+    );
+    // The network review: a row of its own, with the host, the verdict and an end.
+    let net = events
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::ToolCallStarted { tool_use_id, input, .. }
+                if input["network"]["host"] == "example.org" =>
+            {
+                Some(tool_use_id.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a row for the network review: {events:#?}"));
+    assert_eq!(
+        on(&net),
+        vec![(
+            net.clone(),
+            Some("auto_review_approved".into()),
+            Some("a package mirror".into())
+        )]
+    );
+    assert!(events.iter().any(
+        |e| matches!(e, AgentDomainEvent::ToolCallCompleted { tool_use_id, is_error: false, .. } if *tool_use_id == net)
+    ));
 }
 
 #[test]

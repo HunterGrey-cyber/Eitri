@@ -304,7 +304,8 @@ function CodexFileChanges({ input }: { input: Partial<CodexFileChangeInput> }) {
       {changes.map((change, i) => (
         <div key={i} className="permission-card-change">
           <ChangeNote change={change} />
-          <EditDiff preview={codexChangePreview(change)} />
+          {/* Every line, however many: the card approves exactly this change. */}
+          <EditDiff preview={codexChangePreview(change, { whole: true })} />
         </div>
       ))}
       <AgentSays who="Codex" reason={input.reason} />

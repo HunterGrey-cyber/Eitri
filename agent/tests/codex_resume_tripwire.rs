@@ -495,30 +495,38 @@ fn resume_pages_history_then_releases_live_events_in_order() {
         .start(request(Some("th-old"), &[]))
         .expect("the resume completes");
     assert_eq!(id, "th-old");
-    let events = pump_until(&provider, |events| events.iter().any(|e| kind(e) == "limits"));
-    let kinds: Vec<&str> = events.iter().map(kind).collect();
+    // The history is handed over whole by the time the start returns, apart from the live stream: the
+    // host folds it into the projection before ingestion starts, so no past turn passes for a live one.
+    let history = provider.take_history();
+    assert!(provider.take_history().is_empty(), "taken once");
+    let kinds: Vec<&str> = history.iter().map(kind).collect();
     assert_eq!(
         kinds,
         vec![
-            "opened", "resume", // the session
             "prompt", "turn+", "boundary", "text", "call+", "call-", "turn-", // tu-1
             "prompt", "turn+", "turn-", // tu-2
-            "turn+", "boundary", "text", "turn-",  // tu-3
-            "limits", // the live message, after all of it
+            "turn+", "boundary", "text", "turn-", // tu-3
         ]
+    );
+    let events = pump_until(&provider, |events| events.iter().any(|e| kind(e) == "limits"));
+    let live: Vec<&str> = events.iter().map(kind).collect();
+    assert_eq!(
+        live,
+        vec!["opened", "resume", "limits"],
+        "only the session and the live message are live"
     );
     assert!(matches!(
         &events[1],
         AgentDomainEvent::ResumeOutcome { status: agent::ResumeStatus::Attached, attached_provider_session_id: Some(a), .. }
             if a == "th-old"
     ));
-    assert!(matches!(&events[2], AgentDomainEvent::UserPromptSubmitted { text } if text == "first question"));
+    assert!(matches!(&history[0], AgentDomainEvent::UserPromptSubmitted { text } if text == "first question"));
     assert!(matches!(
-        &events[5],
+        &history[3],
         AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } if text == "first answer"
     ));
     // The turn that was cut off reads interrupted; the others completed.
-    let outcomes: Vec<TurnOutcome> = events
+    let outcomes: Vec<TurnOutcome> = history
         .iter()
         .filter_map(|e| match e {
             AgentDomainEvent::TurnCompleted { outcome, .. } => Some(*outcome),
@@ -556,13 +564,15 @@ fn over_cap_history_page_is_skipped_not_fatal() {
     provider
         .start(request(Some("th-old"), &[]))
         .expect("the resume completes");
-    let events = pump_until(&provider, |events| {
+    let events = provider.take_history();
+    assert_eq!(
         events
             .iter()
             .filter(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
-            .count()
-            == 2
-    });
+            .count(),
+        2,
+        "{events:#?}"
+    );
     let note = events
         .iter()
         .find_map(|e| match e {

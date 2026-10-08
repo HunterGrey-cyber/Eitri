@@ -45,7 +45,15 @@ export const MAX_HELD_DENIALS = 64;
  *  `AgentSessionProjection::apply`, which does the same on the same three events. */
 function withLostTurn(state: AgentUiState, seq: Seq): AgentUiState {
   if (state.activeTurnId === null) return state;
-  const ending: TurnEnding = { seq, turnId: state.activeTurnId, kind: "lost", reason: null, apiErrorStatus: null, message: null };
+  const ending: TurnEnding = {
+    seq,
+    turnId: state.activeTurnId,
+    kind: "lost",
+    reason: null,
+    apiErrorStatus: null,
+    message: null,
+    resetsAt: state.accountLimits?.resetsAt ?? null,
+  };
   return { ...state, turnEndings: [...state.turnEndings, ending], lastTurnEnding: "lost" };
 }
 
@@ -234,6 +242,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         reason: detail.reason ?? null,
         apiErrorStatus: detail.api_error_status ?? null,
         message: detail.message ?? null,
+        resetsAt: state.accountLimits?.resetsAt ?? null,
       };
       return { ...done, turnEndings: [...state.turnEndings, ending], lastTurnEnding: event.outcome };
     }
@@ -296,18 +305,25 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // Rust fails the tab (`TabSet::pump`) and the failure reaches the page as the tab's own state;
       // there is nothing here to draw. `state`, so `nextSeq` keeps step with Rust's revision.
       return state;
-    case "account_limits":
+    case "account_limits": {
       // The latest report wins, whole: the agent states the window each time. A slot it did not say
-      // is `null`, not carried over from the earlier report.
+      // is `null`, not carried over from the earlier report. The latest turn's ending, if it did not
+      // complete and knew no reset time, takes this one (the report explaining a stop can follow it);
+      // one it had stays. MUST stay identical to `AgentSessionProjection::apply`.
+      const resetsAt = event.resets_at ?? null;
+      const last = state.turnEndings[state.turnEndings.length - 1];
+      const fill = state.lastTurnEnding !== null && last !== undefined && (last.resetsAt ?? null) === null;
       return {
         ...state,
         accountLimits: {
           usedPercent: event.used_percent,
           windowMinutes: event.window_minutes ?? null,
-          resetsAt: event.resets_at ?? null,
+          resetsAt,
           plan: event.plan ?? null,
         },
+        turnEndings: fill ? [...state.turnEndings.slice(0, -1), { ...last, resetsAt }] : state.turnEndings,
       };
+    }
     case "permission_mode_changed":
       // The mode lives on the tab (`tabs` envelope), not the projection: `TabInfo.mode` is what the
       // band and the box read, and Rust's own `tabs` envelope already reflects an acknowledged

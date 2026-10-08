@@ -82,6 +82,7 @@
               "kind": "failed",
               "message": "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
               "reason": "api_error",
+              "resetsAt": null,
               "seq": 4,
               "turnId": "t1"
             }
@@ -181,6 +182,7 @@
               "kind": "failed",
               "message": "API Error: 429 rate_limit_error",
               "reason": "api_error",
+              "resetsAt": null,
               "seq": 4,
               "turnId": "t1"
             }
@@ -280,6 +282,7 @@
               "kind": "limit_reached",
               "message": "Prompt is too long",
               "reason": "blocking_limit",
+              "resetsAt": null,
               "seq": 4,
               "turnId": "t1"
             }
@@ -379,6 +382,7 @@
               "kind": "limit_reached",
               "message": "Reached maximum number of turns (3)",
               "reason": "max_turns",
+              "resetsAt": null,
               "seq": 4,
               "turnId": "t1"
             }
@@ -478,6 +482,7 @@
               "kind": "failed",
               "message": null,
               "reason": "hook_stopped",
+              "resetsAt": null,
               "seq": 4,
               "turnId": "t1"
             }
@@ -577,6 +582,7 @@
               "kind": "interrupted",
               "message": null,
               "reason": "aborted_streaming",
+              "resetsAt": null,
               "seq": 4,
               "turnId": "t1"
             }
@@ -681,6 +687,7 @@
               "kind": "failed",
               "message": null,
               "reason": null,
+              "resetsAt": null,
               "seq": 4,
               "turnId": "t1"
             }
@@ -772,6 +779,7 @@
               "kind": "lost",
               "message": null,
               "reason": null,
+              "resetsAt": null,
               "seq": 4,
               "turnId": "t1"
             }
@@ -786,6 +794,237 @@
         },
         "tab": 1,
         "throughRevision": 5,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "plan": "pro",
+            "resets_at": 1900000000,
+            "type": "account_limits",
+            "used_percent": 100.0,
+            "window_minutes": 300
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": "You've hit your usage limit.",
+              "reason": "usage_limit"
+            },
+            "outcome": "limit_reached",
+            "result_text": "You've hit your usage limit.",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "plan": "pro",
+            "resets_at": 1900086400,
+            "type": "account_limits",
+            "used_percent": 100.0,
+            "window_minutes": 300
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 7
+      },
+      "name": "usage_limit",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": {
+            "plan": "pro",
+            "resetsAt": 1900086400,
+            "usedPercent": 100.0,
+            "windowMinutes": 300
+          },
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "limit_reached",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "limit_reached",
+              "message": "You've hit your usage limit.",
+              "reason": "usage_limit",
+              "resetsAt": 1900000000,
+              "seq": 5,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at the parser",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": "You've hit your usage limit.",
+              "reason": "usage_limit"
+            },
+            "outcome": "limit_reached",
+            "result_text": "You've hit your usage limit.",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "plan": "pro",
+            "resets_at": 1900000000,
+            "type": "account_limits",
+            "used_percent": 100.0,
+            "window_minutes": 300
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 6
+      },
+      "name": "usage_limit_reported_after",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": {
+            "plan": "pro",
+            "resetsAt": 1900000000,
+            "usedPercent": 100.0,
+            "windowMinutes": 300
+          },
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "backend": "sidecar",
+          "capabilities": {
+            "bypassPermissionMode": true,
+            "fork": false,
+            "interrupt": true,
+            "resume": true
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "limit_reached",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at the parser"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "limit_reached",
+              "message": "You've hit your usage limit.",
+              "reason": "usage_limit",
+              "resetsAt": 1900000000,
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 2,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 6,
         "turnStartedAtMs": null
       }
     }

@@ -34,6 +34,8 @@ struct Script {
     started: Vec<ExternalStart>,
     turns: Vec<(String, TurnPolicy)>,
     plain_calls: Vec<&'static str>,
+    /// What a resume reads back as the session's past, handed over through `take_history`.
+    history: Vec<AgentDomainEvent>,
 }
 
 /// A provider that answers like an external one: the plain session and turn calls refuse, `start`
@@ -134,6 +136,9 @@ impl ExternalProvider for Scripted {
     fn send_turn_with(&self, req: SendTurnRequest, policy: TurnPolicy) -> Result<String, ProviderError> {
         self.script.lock().unwrap().turns.push((req.text, policy));
         Ok("turn-1".to_string())
+    }
+    fn take_history(&self) -> Vec<AgentDomainEvent> {
+        std::mem::take(&mut self.script.lock().unwrap().history)
     }
 }
 
@@ -331,6 +336,81 @@ fn resume_external_does_not_read_a_claude_transcript() {
     assert_eq!(
         provider.script.lock().unwrap().started[0].resume.as_deref(),
         Some("thread-resumed")
+    );
+    conversation.shutdown();
+}
+
+/// A resumed external session's past turns are its history, not turns happening now: they are folded into
+/// the projection before ingestion starts, as a Claude resume's transcript is, and never delivered as live
+/// events -- which would have the host take each past turn for one that just ran (turn review's snapshots
+/// and overlaps, the queue's flush, attention).
+#[test]
+fn resume_external_seeds_the_history_and_delivers_no_past_turn() {
+    let cwd = workspace("ext-resume-history");
+    let canonical = cwd.canonicalize().unwrap();
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let provider = Scripted::new("codex");
+    provider.script.lock().unwrap().history = vec![
+        AgentDomainEvent::UserPromptSubmitted {
+            text: "an old question".to_string(),
+        },
+        AgentDomainEvent::TurnStarted {
+            turn_id: "old-1".to_string(),
+        },
+        AgentDomainEvent::AssistantMessageBoundary {
+            turn_id: "old-1".to_string(),
+        },
+        AgentDomainEvent::ContentDelta {
+            turn_id: "old-1".to_string(),
+            kind: agent::ContentKind::Text,
+            text: "an old answer".to_string(),
+        },
+        AgentDomainEvent::TurnCompleted {
+            turn_id: "old-1".to_string(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: "an old answer".to_string(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        },
+    ];
+    let lease = SessionLease::try_acquire("codex", &canonical_str, "thread-old").unwrap();
+    let mut conversation = AgentConversation::resume_external(
+        provider.clone(),
+        start_for(&canonical, Some("thread-old")),
+        &canonical,
+        lease,
+    )
+    .expect("the resume is attached");
+    {
+        let projection = conversation.projection();
+        assert!(
+            projection.transcript.iter().any(|m| m.text.contains("an old answer")),
+            "the history is in the projection: {:?}",
+            projection.transcript
+        );
+        assert!(projection.active_turn_id.is_none(), "no past turn is running");
+    }
+    let mut delivered = Vec::new();
+    for _ in 0..20 {
+        if let agent::UiDelivery::Events(events) = conversation.take_ui_delivery() {
+            delivered.extend(events);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        !delivered.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::TurnStarted { .. }
+                | AgentDomainEvent::TurnCompleted { .. }
+                | AgentDomainEvent::UserPromptSubmitted { .. }
+                | AgentDomainEvent::ContentDelta { .. }
+        )),
+        "a past turn was delivered as a live one: {delivered:#?}"
+    );
+    assert!(
+        provider.script.lock().unwrap().history.is_empty(),
+        "the history was taken once"
     );
     conversation.shutdown();
 }

@@ -590,8 +590,8 @@ impl AgentConversation {
     /// `start.resume`, and a start without one is refused.
     ///
     /// Two steps of the Claude resume are skipped because they are about Claude's files: the probe of
-    /// Claude's own transcript, and the seed read from it. An external agent's history arrives as
-    /// events from the provider itself, folded before any live one.
+    /// Claude's own transcript, and the seed read from it. An external agent's history comes from the
+    /// provider itself (`ExternalProvider::take_history`) and is the seed instead.
     pub fn resume_external(
         provider: Arc<dyn ExternalProvider + Send + Sync>,
         start: ExternalStart,
@@ -625,6 +625,13 @@ impl AgentConversation {
             cwd: cwd_string.clone(),
             ..start
         })?;
+        // Nothing is read from disk: the provider read the history back while it started, and it is
+        // folded here, before ingestion exists, exactly where a Claude resume's seed goes. Delivered as
+        // live events instead, every past turn would reach the host as one that just ran.
+        let mut seed = crate::AgentSessionProjection::default();
+        for event in provider.take_history() {
+            seed.apply(&event);
+        }
         let ingest = ConversationIngest::start(
             Arc::clone(&as_agent),
             name,
@@ -633,8 +640,7 @@ impl AgentConversation {
             true,
             Some(provider_session_id.clone()),
             Some(holding),
-            // Nothing is read from disk: the provider's events carry the history.
-            crate::AgentSessionProjection::default(),
+            seed,
         );
         let conversation = Self {
             conversation_id,

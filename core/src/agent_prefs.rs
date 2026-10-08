@@ -211,6 +211,19 @@ pub fn parse_codex_command(value: Option<&str>) -> Result<Option<String>, String
     }
 }
 
+/// `EITRI_CODEX`, checked when the window starts: a value that is set must be an absolute path to a
+/// file, else the window fails naming the variable, as a bad `init.lua` key does. Unset or empty
+/// says nothing; a `codex` missing from `PATH` (or from `agent.codex.command`) fails only a Codex
+/// tab's start. The rule is the one the tab's start applies (`decide_codex`), asked of the variable
+/// alone.
+pub fn check_codex_env(value: Option<&OsStr>, is_file: impl Fn(&Path) -> bool) -> Result<(), String> {
+    use agent::providers::codex::{decide_codex, LocateError};
+    match decide_codex(value, None, None, is_file) {
+        Err(error @ (LocateError::EnvNotAbsolute(_) | LocateError::EnvNotAFile(_))) => Err(error.to_string()),
+        _ => Ok(()),
+    }
+}
+
 /// Whether this project has a remembered choice of mode that the configured default must not
 /// override: a readable file that says `auto` (the only thing [`save_mode`] writes, once Shift+Tab
 /// has left bypass). A file from before v1 that says bypass is not a choice anyone is still making,
@@ -304,6 +317,21 @@ mod tests {
             let err = parse_codex_command(Some(bad)).unwrap_err();
             assert!(err.contains("agent.codex.command"), "{bad}: {err}");
             assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
+    }
+
+    /// `EITRI_CODEX` set to anything but an absolute path to a file is a startup failure naming the
+    /// variable; unset or empty says nothing, and whether a `codex` is on `PATH` is not asked here.
+    #[test]
+    fn a_bad_eitri_codex_is_a_startup_failure_naming_it() {
+        let files = |p: &Path| p == Path::new("/opt/codex");
+        assert_eq!(check_codex_env(None, files), Ok(()));
+        assert_eq!(check_codex_env(Some(OsStr::new("")), files), Ok(()));
+        assert_eq!(check_codex_env(Some(OsStr::new("/opt/codex")), files), Ok(()));
+        for bad in ["codex", "bin/codex", "/opt/missing", "/opt"] {
+            let err = check_codex_env(Some(OsStr::new(bad)), files).unwrap_err();
+            assert!(err.contains("EITRI_CODEX"), "{bad}: {err}");
+            assert!(err.contains(bad), "{bad}: {err}");
         }
     }
 

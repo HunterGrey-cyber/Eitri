@@ -3,22 +3,26 @@
 //! replaces, and every other key), a `.codex/hooks.json`, and the exec-policy rule files under
 //! `.codex/rules/`. As for Claude's files, nothing is filtered by how dangerous it looks.
 //!
-//! Also the one key Eitri reads from the user's own Codex configuration: the alternate names of
-//! `AGENTS.md`, which discovery must fingerprint in every walked directory.
+//! Also the two keys Eitri reads from the user's own Codex configuration: the alternate names of
+//! `AGENTS.md`, which discovery must fingerprint in every walked directory, and the names of the
+//! user's MCP servers, which an untrusted session may start without loading the project's.
 
 use std::path::Path;
 
 use serde_json::{Map, Value};
 
 use super::findings::{compact, hooks, parse_object, server_line, text};
-use super::nofollow::{read_regular_nofollow, Owner};
+use super::nofollow::{read_regular_nofollow, Owner, Refusal};
 use super::Finding;
 
-/// The most of the user's `config.toml` that is read for the alternate names.
+/// The most of the user's `config.toml` that is read.
 const MAX_USER_CONFIG_BYTES: u64 = 4 << 20;
 
 /// The key of the user's Codex configuration that names alternates for `AGENTS.md`.
 const FALLBACK_NAMES_KEY: &str = "project_doc_fallback_filenames";
+
+/// The table of the user's Codex configuration that defines MCP servers.
+const MCP_SERVERS_KEY: &str = "mcp_servers";
 
 /// Top-level keys of a project's `config.toml` that every session Eitri starts sets itself, so the
 /// project's value never applies.
@@ -35,32 +39,78 @@ const OVERRIDDEN_FEATURES: [&str; 2] = ["exec_permission_approvals", "request_pe
 /// The calls of an exec-policy file that let something run: each is shown as written.
 const RULE_CALLS: [&str; 3] = ["prefix_rule", "network_rule", "host_executable"];
 
-/// The alternate names of `AGENTS.md` from `<codex_home>/config.toml`: read without following a
-/// link, at most 4 MiB, parsed as TOML, and only that one key kept (its string items, in order,
-/// once each). Anything that keeps the key from being read -- no file, a link, a FIFO, bad TOML, a
-/// value that is not a list -- gives no names. Nothing else from the file is kept or logged.
-pub fn codex_fallback_names(codex_home: &Path) -> Vec<String> {
-    let Ok(bytes) = read_regular_nofollow(&codex_home.join("config.toml"), MAX_USER_CONFIG_BYTES, Owner::Anyone) else {
-        return Vec::new();
+/// What Eitri reads from the user's own Codex `config.toml`, and nothing else from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserCodexConfig {
+    /// The alternate names of `AGENTS.md` (`project_doc_fallback_filenames`): its string items, in
+    /// order, once each.
+    pub fallback_names: Vec<String>,
+    /// The MCP servers the file defines and does not switch off (`[mcp_servers.<name>]` without
+    /// `enabled = false`), sorted. Codex starts these in every session, so a startup report of one of
+    /// these names says nothing about the project's configuration. `None` when the file is there but
+    /// could not be read as TOML (a link, a FIFO, over 4 MiB, not UTF-8, bad TOML, `mcp_servers` not
+    /// a table): which servers the user has is then unknown. A file that is not there defines none.
+    pub mcp_servers: Option<Vec<String>>,
+}
+
+/// Reads the user's Codex `config.toml` at `file`: without following a link, at most 4 MiB, parsed
+/// as TOML, and only the keys of [`UserCodexConfig`] kept. Nothing else from the file is kept or
+/// logged. A caller that wants a link the user made to be followed resolves `file` itself first.
+pub fn read_user_codex_config(file: &Path) -> UserCodexConfig {
+    let unknown = UserCodexConfig {
+        fallback_names: Vec::new(),
+        mcp_servers: None,
+    };
+    let bytes = match read_regular_nofollow(file, MAX_USER_CONFIG_BYTES, Owner::Anyone) {
+        Ok(bytes) => bytes,
+        Err(Refusal::Missing) => {
+            return UserCodexConfig {
+                fallback_names: Vec::new(),
+                mcp_servers: Some(Vec::new()),
+            }
+        }
+        Err(_) => return unknown,
     };
     let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Vec::new();
+        return unknown;
     };
     let Ok(mut table) = text.parse::<toml::Table>() else {
-        return Vec::new();
+        return unknown;
     };
-    let Some(toml::Value::Array(items)) = table.remove(FALLBACK_NAMES_KEY) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = Vec::new();
-    for item in items {
-        if let toml::Value::String(name) = item {
-            if !names.contains(&name) {
-                names.push(name);
+    let mut fallback_names: Vec<String> = Vec::new();
+    if let Some(toml::Value::Array(items)) = table.remove(FALLBACK_NAMES_KEY) {
+        for item in items {
+            if let toml::Value::String(name) = item {
+                if !fallback_names.contains(&name) {
+                    fallback_names.push(name);
+                }
             }
         }
     }
-    names
+    let mcp_servers = match table.remove(MCP_SERVERS_KEY) {
+        None => Some(Vec::new()),
+        Some(toml::Value::Table(servers)) => {
+            let mut names: Vec<String> = servers
+                .into_iter()
+                .filter(|(_, server)| server.get("enabled") != Some(&toml::Value::Boolean(false)))
+                .map(|(name, _)| name)
+                .collect();
+            names.sort();
+            Some(names)
+        }
+        Some(_) => None,
+    };
+    UserCodexConfig {
+        fallback_names,
+        mcp_servers,
+    }
+}
+
+/// The alternate names of `AGENTS.md` from `<codex_home>/config.toml`, read as
+/// [`read_user_codex_config`] does. Anything that keeps the key from being read -- no file, a link,
+/// a FIFO, bad TOML, a value that is not a list -- gives no names.
+pub fn codex_fallback_names(codex_home: &Path) -> Vec<String> {
+    read_user_codex_config(&codex_home.join("config.toml")).fallback_names
 }
 
 /// A TOML value as the JSON the prompt shows; a date-time becomes its text.

@@ -181,6 +181,12 @@ function cut(text: string): string {
   return line.length > 120 ? `${line.slice(0, 119)}…` : line;
 }
 
+/** A request Codex made that Eitri answered itself, drawn as what was asked for: the row's note says how it
+ *  was answered and why, and the input names nothing else. */
+function answeredRequest(label: string): ToolRenderConfig {
+  return { label, renderInvocation: () => <div className="tool-card">{label}</div> };
+}
+
 /** A tool this registry recognizes by name only: one muted line, its own summary, nothing more.
  *  Every name in `TOOLS_OFFERED_BY_CLI_2_1_272` this file has no richer view for gets one of these,
  *  so "not in the table" (the 2026-09-19 defect: 18 of 26 real tools carded as unknown) cannot
@@ -227,14 +233,40 @@ function Shown({ text }: { text: string }) {
   return <Revealed pieces={revealHidden(text)} />;
 }
 
-/** Codex's `commandExecution`: the exact command, shell wrapper included, like a `Bash` row. */
+/** Whether an input says nothing beyond the subagent that made the call. */
+function saysNothing(input: unknown): boolean {
+  if (input === null || typeof input !== "object") return input === undefined || input === null;
+  return Object.keys(input).every((key) => key === "subagent");
+}
+
+/** The host and protocol of a network request's row, when the input names them. */
+function networkOf(input: unknown): { host: string; protocol: string } | null {
+  const network = input && typeof input === "object" ? (input as Record<string, unknown>).network : undefined;
+  if (network === null || typeof network !== "object") return null;
+  const { host, protocol } = network as Record<string, unknown>;
+  return typeof host === "string" && typeof protocol === "string" ? { host, protocol } : null;
+}
+
+/** Codex's `commandExecution`: the exact command, shell wrapper included, like a `Bash` row. A network request
+ *  names a host and no command, and a request Eitri answered itself may name neither. */
 const codexCommand: ToolRenderConfig = {
   label: "Run command",
-  renderInvocation: (input) => (
-    <pre className="tool-card tool-card-bash">
-      $ <Shown text={textField(input, "command") || (JSON.stringify(input) ?? "")} />
-    </pre>
-  ),
+  renderInvocation: (input) => {
+    const command = textField(input, "command");
+    const network = networkOf(input);
+    if (command === "" && network !== null)
+      return (
+        <div className="tool-card">
+          network access to <Shown text={network.host} /> (<Shown text={network.protocol} />)
+        </div>
+      );
+    if (command === "" && saysNothing(input)) return <div className="tool-card">command</div>;
+    return (
+      <pre className="tool-card tool-card-bash">
+        $ <Shown text={command || (JSON.stringify(input) ?? "")} />
+      </pre>
+    );
+  },
 };
 
 /** Codex's `fileChange`: each path with its diff, folded to a path and counts like `Edit` until the row is
@@ -247,7 +279,12 @@ const codexFileChange: ToolRenderConfig = {
       input && typeof input === "object" && Array.isArray((input as { changes?: unknown }).changes)
         ? ((input as { changes: Array<{ path: string; kind: string; diff: string }> }).changes)
         : [];
-    if (changes.length === 0) return <div className="tool-card">Change files: {summarizeInput(input)}</div>;
+    if (changes.length === 0)
+      return saysNothing(input) ? (
+        <div className="tool-card">Change files</div>
+      ) : (
+        <div className="tool-card">Change files: {summarizeInput(input)}</div>
+      );
     return (
       <>
         {changes.map((change, i) => (
@@ -261,6 +298,7 @@ const codexFileChange: ToolRenderConfig = {
 const codexMcp: ToolRenderConfig = {
   label: "Tool call",
   renderInvocation: (input) => {
+    if (saysNothing(input)) return <div className="tool-card">tool call</div>;
     const args = input && typeof input === "object" ? (input as Record<string, unknown>).arguments : undefined;
     return (
       <div className="tool-card">
@@ -401,6 +439,10 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
   mcpToolCall: codexMcp,
   webSearch: codexWebSearch,
   collabAgentToolCall: codexSubagentCall,
+  // Requests Codex made that Eitri answered itself; their row's note says how.
+  permissions: answeredRequest("extra permissions"),
+  mcpElicitation: answeredRequest("tool server form"),
+  requestUserInput: answeredRequest("question"),
 };
 
 /** Looks a tool up without consulting `Object.prototype`.
@@ -551,10 +593,21 @@ const ToolResultPreview = memo(function ToolResultPreview({
   );
 });
 
-/** The row note for a call the CLI refused: "blocked by auto: [Git Destructive]", with the kind of
- *  refusal appended when it was not the classifier's ("… (rule)"). */
+/** What decided a call, in a `ToolCallDenial.reasonType` that is not the Claude CLI's: Eitri itself
+ *  answered another agent's request, or Codex's own reviewer passed on it. */
+export const ANSWERED_BY_EITRI = "eitri";
+export const AUTO_REVIEW_DENIED = "auto_review";
+export const AUTO_REVIEW_APPROVED = "auto_review_approved";
+
+/** The row note for a call someone decided without a card. The Claude CLI's refusal reads "blocked by auto:
+ *  [Git Destructive]", with the kind of refusal appended when it was not the classifier's ("… (rule)").
+ *  A request Eitri answered itself reads "answered by Eitri: <why>", and Codex's reviewer's verdict "blocked
+ *  by auto review: <why>" or "allowed by auto review: <why>". */
 export function deniedNoteText(denied: ToolCallDenial): string {
   const reason = denied.reason === null || denied.reason.trim() === "" ? "" : `: ${denied.reason}`;
+  if (denied.reasonType === ANSWERED_BY_EITRI) return `answered by Eitri${reason}`;
+  if (denied.reasonType === AUTO_REVIEW_DENIED) return `blocked by auto review${reason}`;
+  if (denied.reasonType === AUTO_REVIEW_APPROVED) return `allowed by auto review${reason}`;
   const kind = denied.reasonType === null || denied.reasonType === "" || denied.reasonType === "classifier" ? "" : ` (${denied.reasonType})`;
   return `blocked by auto${reason}${kind}`;
 }
