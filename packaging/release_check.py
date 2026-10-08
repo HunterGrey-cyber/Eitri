@@ -1206,6 +1206,9 @@ TWIN_REQUIRED_PAIRS: tuple[tuple[str, str], ...] = (
     ("README.md", "README.zh-CN.md"),
     ("INSTALL.md", "INSTALL.zh-CN.md"),
 )
+# Directories whose every English page is a user-facing guide and so must have its Chinese twin (the
+# documentation site shows both languages side by side); elsewhere a file without a twin is English-only.
+TWIN_REQUIRED_DIRS: tuple[str, ...] = ("docs/guide",)
 _TWIN_ZH_SUFFIX = ".zh-CN.md"
 _TWIN_MARKER_RE = re.compile(r"^<!-- translated-from: (?P<name>\S+) sha256=(?P<hash>[0-9a-f]{64}) -->$")
 
@@ -1221,8 +1224,9 @@ def check_twins(root: str) -> None:
     translated from. README.md/README.zh-CN.md and INSTALL.md/INSTALL.zh-CN.md
     (TWIN_REQUIRED_PAIRS) are required pairs at `root`'s own top level; every other
     `<name>.zh-CN.md` file found **at any depth under `root`** is paired with the `<name>.md` in
-    the SAME directory -- its adjacent English original -- the same way. A file with no twin at
-    all (e.g. CONTRIBUTING.md, English-only by design) is never checked.
+    the SAME directory -- its adjacent English original -- the same way. Every English page directly in a `TWIN_REQUIRED_DIRS` directory
+    (`docs/guide`) must also have its twin. A file with no twin at all elsewhere (e.g. CONTRIBUTING.md,
+    English-only by design) is never checked.
 
     Recurses because `publish/export.sh` mirrors
     `publish/files/` into the exported tree path for path ("Files that exist only in the public
@@ -1234,6 +1238,7 @@ def check_twins(root: str) -> None:
 
     Raises ReleaseCheckError, naming every offending file relative to `root` (and, for a stale
     hash, both hashes), collecting every problem found rather than stopping at the first one:
+      - an English page directly in a `TWIN_REQUIRED_DIRS` directory has no twin;
       - a required pair's English file is missing, or its twin is missing, or both are missing
         (each gets its own message: a lone twin naming a missing English file reads differently
         from neither existing at all);
@@ -1308,6 +1313,18 @@ def check_twins(root: str) -> None:
     for directory, zh in discovered:
         stem = zh[: -len(_TWIN_ZH_SUFFIX)]
         check_pair(directory, f"{stem}.md", zh, required=False)
+
+    # A page whose twin exists was checked above; only the missing ones are added here, so nothing
+    # is reported twice.
+    for rel_dir in TWIN_REQUIRED_DIRS:
+        directory = os.path.join(root, rel_dir)
+        if not os.path.isdir(directory):
+            continue
+        for name in sorted(os.listdir(directory)):
+            if name.endswith(".md") and not name.endswith(_TWIN_ZH_SUFFIX):
+                zh = name[: -len(".md")] + _TWIN_ZH_SUFFIX
+                if not os.path.exists(os.path.join(directory, zh)):
+                    check_pair(directory, name, zh, required=True)
 
     if problems:
         raise ReleaseCheckError("release_check twins: " + "; ".join(problems))

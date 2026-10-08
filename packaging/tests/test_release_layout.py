@@ -1500,6 +1500,32 @@ class TwinsCheckTests(unittest.TestCase):
         self.plant_text({**self.fresh_readme(), **self.fresh_install()})
         rc.check_twins(self.root)  # must not raise
 
+    def test_a_guide_page_without_a_twin_is_reported(self):
+        self.plant_text({**self.fresh_readme(), **self.fresh_install(),
+                         "docs/guide/keys.md": "English | [简体中文](keys.zh-CN.md)\n\n# Keys\n"})
+        with self.assertRaisesRegex(rc.ReleaseCheckError, r"docs/guide/keys\.md"):
+            rc.check_twins(self.root)
+
+    def test_a_guide_page_with_a_fresh_twin_passes(self):
+        english = "English | [简体中文](keys.zh-CN.md)\n\n# Keys\n"
+        zh_name, zh_text = _fresh_zh_twin("keys.md", english)
+        self.plant_text({**self.fresh_readme(), **self.fresh_install(),
+                         "docs/guide/keys.md": english, f"docs/guide/{zh_name}": zh_text})
+        rc.check_twins(self.root)  # must not raise
+
+    def test_a_stale_guide_twin_is_reported_exactly_once(self):
+        english = "English | [简体中文](keys.zh-CN.md)\n\n# Keys\n"
+        zh_name, zh_text = _fresh_zh_twin("keys.md", english)
+        self.plant_text({**self.fresh_readme(), **self.fresh_install(),
+                         "docs/guide/keys.md": english + "more\n", f"docs/guide/{zh_name}": zh_text})
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.check_twins(self.root)
+        self.assertEqual(str(caught.exception).count("docs/guide/keys.zh-CN.md"), 1)
+
+    def test_a_tree_without_a_guide_directory_passes(self):
+        self.plant_text({**self.fresh_readme(), **self.fresh_install()})
+        rc.check_twins(self.root)  # must not raise
+
     def test_a_stale_twin_is_reported_with_both_hashes(self):
         files = self.fresh_readme()
         files["README.md"] += "more\n"
