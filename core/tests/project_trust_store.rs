@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use eitri_core::project_trust::{
-    civil_date, discover, Diff, Discovery, Limits, Profile, ProfileEnv, Remember, TrustState, TrustStore,
+    civil_date, discover, Diff, Discovery, Limits, Profile, ProfileEnv, Remember, TrustState, TrustStore, DISCLOSURE,
 };
 
 struct Fixture {
@@ -296,6 +296,15 @@ fn an_unusable_record_reads_as_untrusted_and_is_left_alone() {
             }),
         ),
         (
+            "a record from before the full disclosure",
+            Box::new(|fx, root, at| {
+                let mut record: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_slice(&valid(fx, root)).unwrap();
+                assert!(record.remove("disclosure").is_some());
+                write(at, serde_json::to_string_pretty(&record).unwrap().as_bytes());
+            }),
+        ),
+        (
             "another root",
             Box::new(|fx, root, at| {
                 let text = String::from_utf8(valid(fx, root))
@@ -481,9 +490,10 @@ fn an_uncheckable_discovery_is_session_only_and_never_recorded() {
 
     // A record made by hand with this very fingerprint still is not trust.
     let text = format!(
-        r#"{{"version":1,"root":"{}","trusted_at":1,"fingerprint":"{}","files":{{}}}}"#,
+        r#"{{"version":1,"root":"{}","trusted_at":1,"fingerprint":"{}","files":{{}},"disclosure":{}}}"#,
         root.display(),
-        found.fingerprint.hex()
+        found.fingerprint.hex(),
+        DISCLOSURE
     );
     write(&fx.record_file(&root), text.as_bytes());
     assert!(matches!(
@@ -652,23 +662,49 @@ fn discover_as(fx: &Fixture, root: &Path, profile: &Profile) -> Discovery {
 }
 
 #[test]
-fn claude_record_from_before_still_trusted() {
+fn a_record_from_before_the_full_disclosure_is_asked_about_again() {
     let fx = Fixture::new("before-profiles");
     let root = profile_fixture(&fx);
-    // A record exactly as the store wrote it before profiles existed: no profile field, the same name.
-    let record = serde_json::json!({
+    std::fs::create_dir_all(fx.dir()).unwrap();
+    std::fs::set_permissions(fx.state.join("eitri"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(fx.dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = fx.record_file(&root);
+    let plant = |record: serde_json::Value| {
+        std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    // A record exactly as the store wrote it before profiles existed, and before the prompt showed
+    // every value whole: no profile field, no disclosure, the same name, the same fingerprint. The
+    // `y` it stands for was given to a prompt that showed less, so the project is asked about again,
+    // as an ordinary untrusted question whose answer can be recorded.
+    let before = serde_json::json!({
         "version": 1,
         "root": root.to_str().unwrap(),
         "trusted_at": 1_790_000_000u64,
         "fingerprint": CLAUDE_FINGERPRINT_BEFORE_PROFILES,
         "files": {},
     });
-    std::fs::create_dir_all(fx.dir()).unwrap();
-    std::fs::set_permissions(fx.state.join("eitri"), std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::set_permissions(fx.dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let path = fx.record_file(&root);
-    std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    plant(before.clone());
+    match fx.store().state(fx.discover(&root)) {
+        TrustState::Untrusted { remember, discovery } => {
+            assert_eq!(remember, Remember::Yes);
+            // The fingerprint itself is unchanged: only the record is too old to count.
+            assert_eq!(discovery.fingerprint.hex(), CLAUDE_FINGERPRINT_BEFORE_PROFILES);
+        }
+        other => panic!("{other:?}"),
+    }
+    // A lower disclosure is no better than none.
+    let mut lower = before.clone();
+    lower["disclosure"] = serde_json::json!(DISCLOSURE - 1);
+    plant(lower);
+    assert!(matches!(
+        fx.store().state(fx.discover(&root)),
+        TrustState::Untrusted { .. }
+    ));
+    // The same record at the current disclosure is trust.
+    let mut current = before;
+    current["disclosure"] = serde_json::json!(DISCLOSURE);
+    plant(current);
     match fx.store().state(fx.discover(&root)) {
         TrustState::Trusted { since_unix, discovery } => {
             assert_eq!(since_unix, 1_790_000_000);
@@ -676,16 +712,43 @@ fn claude_record_from_before_still_trusted() {
         }
         other => panic!("{other:?}"),
     }
-    // A Claude record written now has the same name and no profile field.
+    // A Claude record written now has the same name, no profile field, the current disclosure, and
+    // is trusted.
     std::fs::remove_file(&path).unwrap();
     fx.store().record(&fx.discover(&root), 7).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
-    let keys: Vec<String> = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
-    assert_eq!(keys, ["files", "fingerprint", "root", "trusted_at", "version"]);
+    let written = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text).unwrap();
+    let keys: Vec<String> = written.keys().cloned().collect();
+    assert_eq!(
+        keys,
+        ["disclosure", "files", "fingerprint", "root", "trusted_at", "version"]
+    );
+    assert_eq!(written["disclosure"], serde_json::json!(DISCLOSURE));
+    assert_eq!(written["version"], serde_json::json!(1));
+    assert!(matches!(
+        fx.store().state(fx.discover(&root)),
+        TrustState::Trusted { .. }
+    ));
+}
+
+#[test]
+fn another_profiles_record_from_before_the_full_disclosure_is_asked_about_again() {
+    let fx = Fixture::new("codex-before-disclosure");
+    let root = profile_fixture(&fx);
+    let store = fx.store();
+    let found = discover_as(&fx, &root, &Profile::Codex);
+    store.record(&found, 3).unwrap();
+    assert!(matches!(store.state(found.clone()), TrustState::Trusted { .. }));
+    // The same record with its disclosure taken away, as a build before the field wrote it.
+    let path = fx
+        .dir()
+        .join(format!("{}.json.codex", &agent::conversation_id_for_cwd(&root)[..16]));
+    let mut record: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record.remove("disclosure"), Some(serde_json::json!(DISCLOSURE)));
+    assert_eq!(record["profile"], serde_json::json!("codex"));
+    std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+    assert!(matches!(store.state(found), TrustState::Untrusted { .. }));
 }
 
 #[test]
@@ -799,6 +862,70 @@ fn profiles_are_named_for_people() {
         files: vec!["GEM.md".into()],
     };
     assert_eq!(acp.label(), "gem");
+}
+
+#[test]
+fn an_unparsed_settings_file_is_session_only_and_never_recorded() {
+    let fx = Fixture::new("unparsed");
+    let root = fx.root("p");
+    // A lone surrogate escape: serde_json refuses it, another JSON parser may not.
+    write(
+        &root.join(SETTINGS),
+        br#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"x\ud800"}]}]}}"#,
+    );
+    let store = fx.store();
+    let found = fx.discover(&root);
+    assert!(!found.fully_hashed());
+    match store.state(found.clone()) {
+        TrustState::Untrusted {
+            remember: Remember::SessionOnly(note),
+            ..
+        } => assert!(note.contains(SETTINGS), "{note}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(store.record(&found, 1).is_err());
+    assert!(!fx.record_file(&root).exists());
+}
+
+#[test]
+fn an_unparseable_codex_config_is_session_only_and_shows_its_text() {
+    let fx = Fixture::new("codex-bad-toml");
+    let root = profile_fixture(&fx);
+    let repo = root.parent().unwrap().to_path_buf();
+    write(
+        &repo.join(".codex/config.toml"),
+        b"[mcp_servers.marker]\ncommand = \"sh -c 'touch /tmp/n'\"\n[unclosed\n",
+    );
+    let store = fx.store();
+    let found = discover_as(&fx, &root, &Profile::Codex);
+    assert!(!found.fully_hashed());
+    // Named as unchecked, in words that fit a TOML file, and with the text Codex might still load.
+    assert!(found
+        .uncheckable()
+        .iter()
+        .any(|(path, why)| *path == Path::new(".codex/config.toml") && *why == "could not be parsed for this check"));
+    assert!(found.findings.iter().any(|f| matches!(f,
+        eitri_core::project_trust::Finding::Unparsed { file, reason }
+            if file == Path::new(".codex/config.toml") && reason.contains("command = \"sh -c 'touch /tmp/n'\""))));
+    match store.state(found.clone()) {
+        TrustState::Untrusted {
+            remember: Remember::SessionOnly(note),
+            ..
+        } => assert!(
+            note.contains(".codex/config.toml (could not be parsed for this check)"),
+            "{note}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    let refused = store.record(&found, 1).unwrap_err();
+    assert!(
+        refused.to_string().starts_with("not recorded: cannot be checked"),
+        "{refused}"
+    );
+    assert!(!fx
+        .dir()
+        .join(format!("{}.json.codex", &agent::conversation_id_for_cwd(&root)[..16]))
+        .exists());
 }
 
 /// A registered agent's profile: one file and one directory it reads whole.

@@ -387,6 +387,361 @@ pub enum AgentDomainEvent {
         /// The plan the limit belongs to, when the agent said.
         plan: Option<String>,
     },
+    /// The CLI's own prompt for a call carried another input than the gate was asked about for the
+    /// same `tool_use_id` (something after the gate, such as a loaded settings tier's `PreToolUse`
+    /// hook returning `updatedInput`, changed it). **Never read off the provider's wire:** the
+    /// projection derives it ([`AgentSessionProjection::derived_after`]) when ingestion folds the
+    /// prompt, and ingestion folds and delivers it right after that prompt, so the panel learns of
+    /// the change even when the host answered the gate request (and so never delivered it). It is
+    /// the one place the comparison is made; the panel only applies it.
+    ToolInputChanged {
+        tool_use_id: String,
+        change: InputChange,
+    },
+}
+
+/// The longest string in a [`InputChange`], in characters; longer ones are cut with `…`.
+pub const MAX_CHANGED_VALUE_CHARS: usize = 1000;
+/// The most a [`InputChange`]'s `fields` hold, serialized; a field that would pass it is left out.
+pub const MAX_CHANGED_FIELDS_BYTES: usize = 4000;
+/// The most keys (and key characters) an input is remembered or reported by.
+const MAX_INPUT_KEYS: usize = 64;
+const MAX_KEY_CHARS: usize = 200;
+/// The key a non-object input is compared and reported under.
+const WHOLE_INPUT_KEY: &str = "(input)";
+
+/// How a call's input, as the CLI's own prompt carried it, differs from the gate's: only the
+/// top-level fields that differ, with the CLI's values, bounded ([`MAX_CHANGED_VALUE_CHARS`],
+/// [`MAX_CHANGED_FIELDS_BYTES`]). A rewritten `Write` therefore never copies its body twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputChange {
+    /// The CLI's value of every field that is new or differs from the gate's.
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    /// Fields the gate saw that the CLI's input no longer has.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<String>,
+    /// Something above was cut or left out to stay inside the bounds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clipped: bool,
+}
+
+/// What the projection remembers of a gate request's input: a digest per top-level field, not the
+/// input, so held inputs stay small whatever a `Write` carried.
+#[derive(Debug, Clone, Default)]
+pub struct GateInput {
+    /// Whether the input was a JSON object; an input of any other kind is one field under `""`.
+    object: bool,
+    fields: std::collections::BTreeMap<FieldId, HeldField>,
+}
+
+/// How a field is keyed in the gate memory. A name too long to hold is keyed by the digest of its
+/// bytes in a variant of its own, so no literal name, whatever it spells, can be taken for it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum FieldId {
+    Literal(String),
+    Hashed([u8; 32]),
+}
+
+/// One remembered field: the digest of its value and, for a long name, the cut name to report it by.
+#[derive(Debug, Clone)]
+struct HeldField {
+    digest: [u8; 32],
+    /// `Some` only for a [`FieldId::Hashed`] key: the name cut to [`MAX_KEY_CHARS`] with `…`.
+    cut_name: Option<String>,
+}
+
+fn top_level(input: &serde_json::Value) -> Vec<(&str, &serde_json::Value)> {
+    match input {
+        serde_json::Value::Object(map) => map.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+        other => vec![("", other)],
+    }
+}
+
+/// A field name as the gate memory keys it: the name itself, or for one longer than
+/// [`MAX_KEY_CHARS`] a digest of it, so what is held stays small whatever a key looks like.
+fn key_id(key: &str) -> FieldId {
+    use sha2::{Digest, Sha256};
+    if key.chars().nth(MAX_KEY_CHARS).is_none() {
+        return FieldId::Literal(key.to_string());
+    }
+    FieldId::Hashed(Sha256::digest(key.as_bytes()).into())
+}
+
+/// A digest that ignores object key order and tells `1` from `1.0`, as `Value ==` does.
+fn digest(value: &serde_json::Value) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    fn feed(hasher: &mut Sha256, value: &serde_json::Value) {
+        use serde_json::Value;
+        match value {
+            Value::Null => hasher.update([0]),
+            Value::Bool(b) => hasher.update([1, u8::from(*b)]),
+            Value::Number(n) => {
+                let text = n.to_string();
+                hasher.update([2]);
+                hasher.update((text.len() as u64).to_le_bytes());
+                hasher.update(text.as_bytes());
+            }
+            Value::String(text) => {
+                hasher.update([3]);
+                hasher.update((text.len() as u64).to_le_bytes());
+                hasher.update(text.as_bytes());
+            }
+            Value::Array(items) => {
+                hasher.update([4]);
+                hasher.update((items.len() as u64).to_le_bytes());
+                for item in items {
+                    feed(hasher, item);
+                }
+            }
+            Value::Object(map) => {
+                hasher.update([5]);
+                hasher.update((map.len() as u64).to_le_bytes());
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                for (key, item) in entries {
+                    hasher.update((key.len() as u64).to_le_bytes());
+                    hasher.update(key.as_bytes());
+                    feed(hasher, item);
+                }
+            }
+        }
+    }
+    let mut hasher = Sha256::new();
+    feed(&mut hasher, value);
+    hasher.finalize().into()
+}
+
+impl GateInput {
+    /// `None` for an input with more fields than [`MAX_INPUT_KEYS`]: nothing is remembered, so
+    /// nothing is compared, and no comparison is never a mark.
+    fn of(input: &serde_json::Value) -> Option<Self> {
+        let fields = top_level(input);
+        (fields.len() <= MAX_INPUT_KEYS).then(|| GateInput {
+            object: input.is_object(),
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| {
+                    let id = key_id(k);
+                    let cut_name = matches!(id, FieldId::Hashed(_)).then(|| clip_chars(k, MAX_KEY_CHARS).0);
+                    (
+                        id,
+                        HeldField {
+                            digest: digest(v),
+                            cut_name,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+}
+
+fn clip_chars(text: &str, max: usize) -> (String, bool) {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => (format!("{}…", &text[..at]), true),
+        None => (text.to_string(), false),
+    }
+}
+
+/// `value` with its strings and keys cut. Copies the whole value, so it is only for one already
+/// known to fit the byte budget ([`clip_text`] says so without walking more than the budget).
+fn clip_value(value: &serde_json::Value, clipped: &mut bool) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => {
+            let (text, cut) = clip_chars(text, MAX_CHANGED_VALUE_CHARS);
+            *clipped |= cut;
+            Value::String(text)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(|v| clip_value(v, clipped)).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let (key, cut) = clip_chars(k, MAX_KEY_CHARS);
+                    *clipped |= cut;
+                    (key, clip_value(v, clipped))
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// A [`serde_json::Value`] serialized with its strings and keys cut as [`clip_value`] cuts them,
+/// without building the cut copy.
+struct Clipped<'a>(&'a serde_json::Value);
+
+impl Serialize for Clipped<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        use serde_json::Value;
+        match self.0 {
+            Value::String(text) => serializer.serialize_str(&clip_chars(text, MAX_CHANGED_VALUE_CHARS).0),
+            Value::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(&Clipped(item))?;
+                }
+                seq.end()
+            }
+            Value::Object(map) => {
+                let mut out = serializer.serialize_map(Some(map.len()))?;
+                for (key, item) in map {
+                    out.serialize_entry(&clip_chars(key, MAX_KEY_CHARS).0, &Clipped(item))?;
+                }
+                out.end()
+            }
+            other => other.serialize(serializer),
+        }
+    }
+}
+
+/// A writer that keeps the first `cap` bytes and fails the write that would pass them, so a
+/// serializer driving it stops at once instead of finishing a value nobody will read.
+struct Capped {
+    bytes: Vec<u8>,
+    cap: usize,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let room = self.cap - self.bytes.len();
+        if data.len() > room {
+            self.bytes.extend_from_slice(&data[..room]);
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "past the cap"));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The compact JSON text of `value` with its strings and keys cut, at most `cap` bytes of it, and
+/// whether there was more. The work is bounded by `cap`, whatever `value` holds: the serializer
+/// stops at the first write past it. The text of an overflow ends wherever the cap fell, which may
+/// be inside a multi-byte character; that part is dropped.
+fn clip_text(value: &serde_json::Value, cap: usize) -> (String, bool) {
+    let mut out = Capped { bytes: Vec::new(), cap };
+    let overflowed = serde_json::to_writer(&mut out, &Clipped(value)).is_err();
+    let text = match String::from_utf8(out.bytes) {
+        Ok(text) => text,
+        Err(e) => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    };
+    (text, overflowed)
+}
+
+/// The bytes a key costs in a serialized object: its escaped form, the colon and, after the first
+/// field, the comma before it.
+fn field_overhead(key: &str, first: bool) -> usize {
+    serde_json::to_string(key).map_or(MAX_KEY_CHARS * 6 + 2, |k| k.len()) + 1 + usize::from(!first)
+}
+
+impl InputChange {
+    /// How `cli` differs from what `gate` remembers; `None` when no top-level field differs.
+    fn between(gate: &GateInput, cli: &serde_json::Value) -> Option<Self> {
+        let mut clipped = false;
+        // The braces of the serialized `fields` are part of its bound.
+        let total = MAX_CHANGED_FIELDS_BYTES - 2;
+        if gate.object != cli.is_object() {
+            // Not the same kind of input: nothing to compare field by field, the CLI's is shown whole.
+            let mut fields = serde_json::Map::new();
+            let room = total.saturating_sub(field_overhead(WHOLE_INPUT_KEY, true));
+            fields.insert(WHOLE_INPUT_KEY.to_string(), Self::fit(cli, room, &mut clipped));
+            return Some(InputChange {
+                fields,
+                removed: vec![],
+                clipped,
+            });
+        }
+        let mut fields = serde_json::Map::new();
+        let mut removed = Vec::new();
+        let mut budget = total;
+        let theirs = top_level(cli);
+        let mut differs = false;
+        for (key, value) in &theirs {
+            if gate.fields.get(&key_id(key)).map(|held| &held.digest) == Some(&digest(value)) {
+                continue;
+            }
+            differs = true;
+            let (key, cut) = clip_chars(key, MAX_KEY_CHARS);
+            clipped |= cut;
+            let Some(room) = budget.checked_sub(field_overhead(&key, fields.is_empty())) else {
+                clipped = true;
+                continue;
+            };
+            // Squeezed into what is left only while nothing has been reported yet: a first field cut
+            // short says what differs, a later one squeezed to nothing says nothing.
+            let shown = if fields.is_empty() {
+                Self::fit(value, room, &mut clipped)
+            } else {
+                match Self::clip_within(value, room, &mut clipped) {
+                    Some(shown) => shown,
+                    None => {
+                        clipped = true;
+                        continue;
+                    }
+                }
+            };
+            let cost = field_overhead(&key, fields.is_empty()) + shown.to_string().len();
+            if cost > budget {
+                clipped = true;
+                continue;
+            }
+            budget -= cost;
+            fields.insert(key, shown);
+        }
+        let ours: std::collections::BTreeSet<FieldId> = theirs.iter().map(|(k, _)| key_id(k)).collect();
+        for (id, held) in gate.fields.iter().filter(|(id, _)| !ours.contains(*id)) {
+            differs = true;
+            if removed.len() < 16 {
+                match (id, &held.cut_name) {
+                    (_, Some(name)) => {
+                        clipped = true;
+                        removed.push(name.clone());
+                    }
+                    (FieldId::Literal(name), None) => removed.push(name.clone()),
+                    // Only a long name is keyed by digest, and it always keeps its cut name.
+                    (FieldId::Hashed(_), None) => clipped = true,
+                }
+            } else {
+                clipped = true;
+            }
+        }
+        differs.then_some(InputChange {
+            fields,
+            removed,
+            clipped,
+        })
+    }
+
+    /// `value` with its strings cut ([`MAX_CHANGED_VALUE_CHARS`]) when that serializes into `room`
+    /// bytes, else `None`. Walks no more than `room` bytes of `value`.
+    fn clip_within(value: &serde_json::Value, room: usize, clipped: &mut bool) -> Option<serde_json::Value> {
+        let (_, over) = clip_text(value, room);
+        (!over).then(|| clip_value(value, clipped))
+    }
+
+    /// `value` with its strings cut ([`MAX_CHANGED_VALUE_CHARS`]) and, when what is left still does
+    /// not serialize into `room` bytes, replaced by the start of its own JSON text as a string that
+    /// does, so a field that differs is never reported as nothing. The work is bounded by `room`.
+    fn fit(value: &serde_json::Value, room: usize, clipped: &mut bool) -> serde_json::Value {
+        let (text, over) = clip_text(value, room);
+        if !over {
+            return clip_value(value, clipped);
+        }
+        *clipped = true;
+        // A string's JSON form is at most 6 bytes a character (`\u00XX`), plus its quotes.
+        let chars = (room.saturating_sub(2) / 6).min(MAX_CHANGED_VALUE_CHARS);
+        serde_json::Value::String(clip_chars(&text, chars).0)
+    }
 }
 
 /// The CLI's own refusal of one tool call, as the projection keeps it on that call's record
@@ -472,6 +827,15 @@ pub struct ToolCallRecord {
     /// file stored before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied: Option<ToolCallDenial>,
+    /// Set by [`AgentDomainEvent::ToolInputChanged`]: the CLI's own prompt for this call carried a
+    /// different input from the one the gate was asked about for the same `tool_use_id`, so the
+    /// gate's answer and a human's approval of the original no longer describe what the CLI was
+    /// about to run. Holds only the fields that differ, bounded. Absent when the two agree and
+    /// whenever no comparison could be made (no gate request for the id, an input over the key
+    /// bound, the legacy backend, which has no CLI prompts); absence never says "same". Stored
+    /// with the call, and restored with it (`history::load`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_input: Option<InputChange>,
 }
 
 /// One unanswered permission request. Deliberately carries no `PermissionSource`
@@ -804,6 +1168,25 @@ pub struct AgentSessionProjection {
     /// that never comes would otherwise sit here for as long as the turn lasts.
     #[serde(skip)]
     pub denials_before_their_call: VecDeque<(String, ToolCallDenial)>,
+    /// What each gate request (no provider prompt) carried, by its tool-use id (a digest per field,
+    /// not the input), kept after the request is answered so a later CLI prompt for the same call
+    /// can be compared with what the gate judged. Newest last; at most [`MAX_HELD_DENIALS`], the
+    /// oldest dropped first; emptied where the denials are.
+    #[serde(skip)]
+    pub gate_inputs: VecDeque<(String, GateInput)>,
+    /// Changes whose call has not been folded yet, held and attached like a refusal.
+    #[serde(skip)]
+    pub changed_inputs_before_their_call: VecDeque<(String, InputChange)>,
+}
+
+/// Appends `(id, value)`, replacing an earlier entry for the id and dropping the oldest past
+/// [`MAX_HELD_DENIALS`].
+fn push_bounded<T>(queue: &mut VecDeque<(String, T)>, id: &str, value: T) {
+    queue.retain(|(held, _)| held != id);
+    queue.push_back((id.to_string(), value));
+    while queue.len() > MAX_HELD_DENIALS {
+        queue.pop_front();
+    }
 }
 
 /// How many refusals that arrived ahead of their call a projection holds at once.
@@ -880,6 +1263,71 @@ impl AgentSessionProjection {
             });
             self.last_turn_ending = Some(TurnEndingKind::Lost);
         }
+    }
+
+    /// Remembers what a gate request carried; a second request for the same id replaces it, and an
+    /// input too wide to remember ([`GateInput::of`]) leaves the id with nothing to compare.
+    fn remember_gate_input(&mut self, tool_use_id: &str, input: &serde_json::Value) {
+        match GateInput::of(input) {
+            Some(gate) => push_bounded(&mut self.gate_inputs, tool_use_id, gate),
+            None => self.gate_inputs.retain(|(id, _)| id != tool_use_id),
+        }
+    }
+
+    /// The event ingestion folds right after `event`, when `event` is a CLI prompt for a call whose
+    /// gate request carried another input: the one place the comparison is made. Nothing to compare
+    /// with (no id, no remembered gate input, the gate request itself, equal inputs) is `None`, and
+    /// `None` is never read as "the same". Reads only, so it may run before or after the fold of
+    /// `event` itself (which changes no gate input for a prompt).
+    pub fn derived_after(&self, event: &AgentDomainEvent) -> Option<AgentDomainEvent> {
+        let AgentDomainEvent::PermissionRequested {
+            tool_use_id: Some(id),
+            input,
+            provider_prompt: Some(_),
+            ..
+        } = event
+        else {
+            return None;
+        };
+        if id.is_empty() {
+            return None;
+        }
+        let (_, gate) = self.gate_inputs.iter().find(|(held, _)| held == id)?;
+        let change = InputChange::between(gate, input)?;
+        Some(AgentDomainEvent::ToolInputChanged {
+            tool_use_id: id.clone(),
+            change,
+        })
+    }
+
+    /// `apply`, then `apply` of what [`Self::derived_after`] derived from `event`, which is
+    /// returned. What ingestion does for every event it folds, for callers (tests, loaders) that
+    /// have no delivery queue.
+    pub fn apply_with_derived(&mut self, event: &AgentDomainEvent) -> Option<AgentDomainEvent> {
+        let derived = self.derived_after(event);
+        self.apply(event);
+        if let Some(derived) = &derived {
+            self.apply(derived);
+        }
+        derived
+    }
+
+    fn take_held_changed_input(&mut self, tool_use_id: &str) -> Option<InputChange> {
+        let at = self
+            .changed_inputs_before_their_call
+            .iter()
+            .position(|(id, _)| id == tool_use_id)?;
+        self.changed_inputs_before_their_call
+            .remove(at)
+            .map(|(_, change)| change)
+    }
+
+    /// Forgets everything held for calls that have not been folded, and the gate inputs: a prompt
+    /// and its gate request share a turn.
+    fn clear_held_for_calls(&mut self) {
+        self.denials_before_their_call.clear();
+        self.gate_inputs.clear();
+        self.changed_inputs_before_their_call.clear();
     }
 
     /// Takes the refusal held for this call, if one arrived ahead of it.
@@ -989,6 +1437,7 @@ impl AgentSessionProjection {
                 // streaming has ended; the text after it is a new message.
                 self.assistant_message_open = false;
                 let denied = self.take_held_denial(tool_use_id);
+                let changed_input = self.take_held_changed_input(tool_use_id);
                 self.tool_calls.push(ToolCallRecord {
                     seq,
                     turn_id: turn_id.clone(),
@@ -997,6 +1446,7 @@ impl AgentSessionProjection {
                     input: input.clone(),
                     result: None,
                     denied,
+                    changed_input,
                 });
             }
             AgentDomainEvent::ToolCallCompleted {
@@ -1020,6 +1470,11 @@ impl AgentSessionProjection {
                 provider_prompt,
             } => {
                 self.assistant_message_open = false;
+                if let Some(id) = tool_use_id.as_deref().filter(|id| !id.is_empty()) {
+                    if provider_prompt.is_none() {
+                        self.remember_gate_input(id, input);
+                    }
+                }
                 // Keyed by `permission_id`, never by `tool_use_id`: a provider prompt is a SECOND
                 // request for a call whose gate request was already answered, and it must land as a
                 // card of its own rather than be taken for a duplicate.
@@ -1063,7 +1518,7 @@ impl AgentSessionProjection {
                 }
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
-                self.denials_before_their_call.clear();
+                self.clear_held_for_calls();
                 // Conditional, where this arm used to assign unconditionally -- which is how the
                 // sidecar path's fabricated zero reached the projection in the first place. A turn
                 // that reported no usage leaves whatever was last reported standing: silence is not
@@ -1102,7 +1557,7 @@ impl AgentSessionProjection {
                     self.record_lost_turn(seq);
                     self.active_turn_id = None;
                     self.assistant_message_open = false;
-                    self.denials_before_their_call.clear();
+                    self.clear_held_for_calls();
                     self.status = ProjectionStatus::Unavailable {
                         reason: describe_failed_resume(
                             requested_provider_session_id,
@@ -1117,14 +1572,14 @@ impl AgentSessionProjection {
                 self.record_lost_turn(seq);
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
-                self.denials_before_their_call.clear();
+                self.clear_held_for_calls();
                 self.status = ProjectionStatus::Unavailable { reason: reason.clone() };
             }
             AgentDomainEvent::SessionClosed { reason } => {
                 self.record_lost_turn(seq);
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
-                self.denials_before_their_call.clear();
+                self.clear_held_for_calls();
                 self.status = ProjectionStatus::Closed { reason: reason.clone() };
             }
             // The host's answer mode is the tab's (`Tab::mode`), and nothing a provider reports moves
@@ -1174,6 +1629,14 @@ impl AgentSessionProjection {
                             ending.resets_at = *resets_at;
                         }
                     }
+                }
+            }
+            // On the first call with that id, or held until that call is folded. The comparison was
+            // made when the prompt was folded (`derived_after`); this only records its result.
+            AgentDomainEvent::ToolInputChanged { tool_use_id, change } => {
+                match self.tool_calls.iter_mut().find(|c| &c.tool_use_id == tool_use_id) {
+                    Some(call) => call.changed_input = Some(change.clone()),
+                    None => push_bounded(&mut self.changed_inputs_before_their_call, tool_use_id, change.clone()),
                 }
             }
             // On the call it refused, or held until that call is folded. A refusal naming no call
@@ -1482,5 +1945,514 @@ mod tests {
             reported: "default".into(),
         });
         assert!(!p.cli_runs_auto(), "a fallback to default is not auto");
+    }
+
+    fn asked(permission_id: &str, id: Option<&str>, input: serde_json::Value, from_cli: bool) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: permission_id.into(),
+            tool_use_id: id.map(Into::into),
+            tool_name: "Bash".into(),
+            input,
+            provider_prompt: from_cli.then(ProviderPrompt::default),
+        }
+    }
+
+    fn push(command: &str) -> serde_json::Value {
+        serde_json::json!({ "command": command })
+    }
+
+    fn change_of(fields: serde_json::Value) -> InputChange {
+        InputChange {
+            fields: fields.as_object().unwrap().clone(),
+            removed: vec![],
+            clipped: false,
+        }
+    }
+
+    /// The measured case: the gate judged `git push -f origin main`, a hook rewrote it, and the CLI's
+    /// own prompt carried the rewrite. The comparison is made once, in `derived_after`; the event it
+    /// derives is what marks the call, and what the panel is sent.
+    #[test]
+    fn a_cli_prompt_with_another_input_than_the_gate_saw_derives_the_event_that_marks_the_call() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&started("toolu_a"));
+        assert_eq!(
+            p.apply_with_derived(&asked(
+                "g",
+                Some("toolu_a"),
+                push("git push --force origin main"),
+                false
+            )),
+            None
+        );
+        p.apply(&AgentDomainEvent::PermissionResolved {
+            permission_id: "g".into(),
+            outcome: PermissionOutcome::Allowed,
+        });
+        let derived = p.apply_with_derived(&asked(
+            "c",
+            Some("toolu_a"),
+            push("rtk git push --force origin main"),
+            true,
+        ));
+        assert_eq!(
+            derived,
+            Some(AgentDomainEvent::ToolInputChanged {
+                tool_use_id: "toolu_a".into(),
+                change: change_of(push("rtk git push --force origin main")),
+            })
+        );
+        assert_eq!(
+            p.tool_calls[0].changed_input,
+            Some(change_of(push("rtk git push --force origin main")))
+        );
+        let json = serde_json::to_value(&p.tool_calls[0]).unwrap();
+        assert_eq!(
+            json["changed_input"]["fields"],
+            push("rtk git push --force origin main")
+        );
+        assert!(json["changed_input"].get("removed").is_none());
+        assert!(json["changed_input"].get("clipped").is_none());
+    }
+
+    /// Folding a CLI prompt alone (`apply`) compares nothing: only the derived event marks.
+    #[test]
+    fn apply_alone_never_marks() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&started("toolu_a"));
+        p.apply(&asked("g", Some("toolu_a"), push("x"), false));
+        p.apply(&asked("c", Some("toolu_a"), push("y"), true));
+        assert_eq!(p.tool_calls[0].changed_input, None);
+    }
+
+    #[test]
+    fn the_same_input_says_nothing_and_key_order_is_not_a_difference() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&started("toolu_a"));
+        p.apply_with_derived(&asked(
+            "g",
+            Some("toolu_a"),
+            serde_json::json!({ "a": 1, "n": { "x": 1, "y": [1, 2] }, "b": 2 }),
+            false,
+        ));
+        let derived = p.apply_with_derived(&asked(
+            "c",
+            Some("toolu_a"),
+            serde_json::json!({ "b": 2, "n": { "y": [1, 2], "x": 1 }, "a": 1 }),
+            true,
+        ));
+        assert_eq!(derived, None);
+        assert_eq!(p.tool_calls[0].changed_input, None);
+        assert!(serde_json::to_value(&p.tool_calls[0])
+            .unwrap()
+            .get("changed_input")
+            .is_none());
+    }
+
+    /// `1` and `1.0` are different JSON numbers to `Value ==`, and so to the digest.
+    #[test]
+    fn an_integer_and_a_float_are_different_inputs() {
+        let mut p = AgentSessionProjection::default();
+        p.apply_with_derived(&asked("g", Some("toolu_a"), serde_json::json!({ "n": 1 }), false));
+        let derived = p.derived_after(&asked(
+            "c",
+            Some("toolu_a"),
+            serde_json::from_str(r#"{"n":1.0}"#).unwrap(),
+            true,
+        ));
+        assert!(derived.is_some());
+    }
+
+    /// No gate request for the id (never seen, no id at all, another id) is no comparison, and
+    /// no comparison is never a mark.
+    #[test]
+    fn a_comparison_that_cannot_be_made_marks_nothing() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&started("toolu_a"));
+        for event in [
+            asked("c1", Some("toolu_a"), push("x"), true),
+            asked("g", None, push("y"), false),
+            asked("c2", None, push("z"), true),
+            asked("g2", Some("toolu_other"), push("y"), false),
+            asked("c3", Some("toolu_a"), push("z"), true),
+            asked("g3", Some(""), push("y"), false),
+            asked("c4", Some(""), push("z"), true),
+        ] {
+            assert_eq!(p.apply_with_derived(&event), None);
+        }
+        assert_eq!(p.tool_calls[0].changed_input, None);
+        assert!(p.changed_inputs_before_their_call.is_empty());
+    }
+
+    /// A gate request alone (the legacy backend has nothing else) never marks a call.
+    #[test]
+    fn a_gate_request_alone_marks_nothing() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&started("toolu_a"));
+        p.apply_with_derived(&asked("g", Some("toolu_a"), push("x"), false));
+        assert_eq!(
+            p.apply_with_derived(&asked("g", Some("toolu_a"), push("y"), false)),
+            None
+        );
+        assert_eq!(p.tool_calls[0].changed_input, None);
+    }
+
+    /// A change that arrives before its call is held and attached when the call starts, and a turn's
+    /// end drops both what was held and the gate inputs.
+    #[test]
+    fn a_change_that_arrives_ahead_of_its_call_is_attached_and_a_turn_end_forgets() {
+        let mut p = AgentSessionProjection::default();
+        p.apply_with_derived(&asked("g", Some("toolu_a"), push("x"), false));
+        p.apply_with_derived(&asked("c", Some("toolu_a"), push("y"), true));
+        assert_eq!(p.changed_inputs_before_their_call.len(), 1);
+        p.apply(&started("toolu_a"));
+        assert_eq!(p.tool_calls[0].changed_input, Some(change_of(push("y"))));
+        assert!(p.changed_inputs_before_their_call.is_empty());
+
+        p.apply_with_derived(&asked("g2", Some("toolu_b"), push("x"), false));
+        p.apply(&AgentDomainEvent::SessionClosed { reason: "done".into() });
+        assert!(p.gate_inputs.is_empty());
+        p.apply(&started("toolu_b"));
+        assert_eq!(
+            p.apply_with_derived(&asked("c2", Some("toolu_b"), push("y"), true)),
+            None
+        );
+        assert_eq!(
+            p.tool_calls[1].changed_input, None,
+            "the gate input did not outlive the turn"
+        );
+    }
+
+    #[test]
+    fn what_is_held_for_comparison_is_bounded() {
+        let mut p = AgentSessionProjection::default();
+        for n in 0..(MAX_HELD_DENIALS + 6) {
+            p.apply(&asked(&format!("g{n}"), Some(&format!("toolu_{n}")), push("x"), false));
+        }
+        assert_eq!(p.gate_inputs.len(), MAX_HELD_DENIALS);
+        for n in 0..(MAX_HELD_DENIALS + 6) {
+            p.apply(&AgentDomainEvent::ToolInputChanged {
+                tool_use_id: format!("toolu_{n}"),
+                change: change_of(push("y")),
+            });
+        }
+        assert_eq!(p.changed_inputs_before_their_call.len(), MAX_HELD_DENIALS);
+    }
+
+    #[test]
+    fn a_completed_turn_forgets_the_gate_inputs_and_an_empty_id_is_no_link() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&asked("g", Some("toolu_a"), push("x"), false));
+        p.apply(&AgentDomainEvent::TurnCompleted {
+            turn_id: "t".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: TurnEndDetail::default(),
+        });
+        assert!(p.gate_inputs.is_empty());
+        p.apply(&asked("g2", Some(""), push("x"), false));
+        assert!(p.gate_inputs.is_empty());
+    }
+
+    /// The note and what is stored are bounded: a rewritten `Write` reports only the field that
+    /// differs, its text cut, and the gate's own copy of the body is a digest, not the body.
+    #[test]
+    fn a_large_rewritten_input_is_reported_by_its_differing_field_and_bounded() {
+        let body = "a".repeat(100_000);
+        let mut p = AgentSessionProjection::default();
+        p.apply(&started("toolu_a"));
+        let gate = serde_json::json!({ "file_path": "/p/a.rs", "content": body });
+        p.apply_with_derived(&asked("g", Some("toolu_a"), gate, false));
+        let cli = serde_json::json!({ "file_path": "/p/a.rs", "content": "b".repeat(100_000) });
+        let derived = p.apply_with_derived(&asked("c", Some("toolu_a"), cli, true));
+        let Some(AgentDomainEvent::ToolInputChanged { change, .. }) = derived else {
+            panic!("a rewritten body is a change");
+        };
+        assert_eq!(
+            change.fields.keys().collect::<Vec<_>>(),
+            ["content"],
+            "the unchanged path is not repeated"
+        );
+        let shown = change.fields["content"].as_str().unwrap();
+        assert_eq!(shown.chars().count(), MAX_CHANGED_VALUE_CHARS + 1);
+        assert!(shown.ends_with('…'));
+        assert!(change.clipped);
+        assert!(serde_json::to_string(&change).unwrap().len() < MAX_CHANGED_FIELDS_BYTES + 200);
+    }
+
+    #[test]
+    fn many_changed_fields_stop_at_the_byte_bound_and_a_removed_field_is_named() {
+        let mut gate = serde_json::Map::new();
+        let mut cli = serde_json::Map::new();
+        for n in 0..40 {
+            gate.insert(format!("k{n:02}"), serde_json::json!("old"));
+            cli.insert(format!("k{n:02}"), serde_json::json!("n".repeat(900)));
+        }
+        gate.insert("dropped".into(), serde_json::json!(1));
+        let mut p = AgentSessionProjection::default();
+        p.apply(&asked("g", Some("toolu_a"), serde_json::Value::Object(gate), false));
+        let change = p
+            .derived_after(&asked("c", Some("toolu_a"), serde_json::Value::Object(cli), true))
+            .and_then(|e| match e {
+                AgentDomainEvent::ToolInputChanged { change, .. } => Some(change),
+                _ => None,
+            })
+            .unwrap();
+        assert!(change.clipped);
+        assert!(change.fields.len() < 40);
+        assert!(serde_json::to_string(&change.fields).unwrap().len() <= MAX_CHANGED_FIELDS_BYTES);
+        assert_eq!(change.removed, ["dropped"]);
+    }
+
+    /// A removed field alone is a change, with nothing in `fields`; a non-object input is compared
+    /// whole, and an input too wide to remember is never compared.
+    #[test]
+    fn removed_fields_whole_inputs_and_inputs_too_wide_to_remember() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&asked(
+            "g",
+            Some("toolu_a"),
+            serde_json::json!({ "a": 1, "b": 2 }),
+            false,
+        ));
+        let Some(AgentDomainEvent::ToolInputChanged { change, .. }) =
+            p.derived_after(&asked("c", Some("toolu_a"), serde_json::json!({ "a": 1 }), true))
+        else {
+            panic!("a dropped field is a change");
+        };
+        assert!(change.fields.is_empty());
+        assert_eq!(change.removed, ["b"]);
+
+        p.apply(&asked("g2", Some("toolu_b"), serde_json::json!("plain"), false));
+        assert!(p
+            .derived_after(&asked("c2", Some("toolu_b"), serde_json::json!("plain"), true))
+            .is_none());
+        assert!(p
+            .derived_after(&asked("c3", Some("toolu_b"), serde_json::json!("other"), true))
+            .is_some());
+
+        let wide: serde_json::Map<_, _> = (0..=MAX_INPUT_KEYS)
+            .map(|n| (format!("k{n}"), serde_json::json!(n)))
+            .collect();
+        p.apply(&asked("g3", Some("toolu_c"), serde_json::Value::Object(wide), false));
+        assert!(p.gate_inputs.iter().all(|(id, _)| id != "toolu_c"));
+        assert!(p
+            .derived_after(&asked("c4", Some("toolu_c"), push("z"), true))
+            .is_none());
+    }
+
+    /// A key is held by name only while it is short; a long one by its digest, so a hostile key
+    /// cannot make the memory of a gate input large, and two long keys sharing a prefix stay apart.
+    #[test]
+    fn a_long_field_name_is_held_by_digest_and_still_compared_exactly() {
+        let long_a = format!("{}a", "k".repeat(MAX_KEY_CHARS + 50));
+        let long_b = format!("{}b", "k".repeat(MAX_KEY_CHARS + 50));
+        let mut p = AgentSessionProjection::default();
+        p.apply(&asked(
+            "g",
+            Some("toolu_a"),
+            serde_json::json!({ long_a.clone(): 1 }),
+            false,
+        ));
+        assert!(p.gate_inputs[0].1.fields.iter().all(|(k, held)| match k {
+            FieldId::Literal(name) => name.chars().count() <= MAX_KEY_CHARS,
+            FieldId::Hashed(_) => held
+                .cut_name
+                .as_ref()
+                .is_some_and(|n| n.chars().count() <= MAX_KEY_CHARS + 1),
+        }));
+        assert!(p
+            .derived_after(&asked(
+                "c1",
+                Some("toolu_a"),
+                serde_json::json!({ long_a.clone(): 1 }),
+                true
+            ))
+            .is_none());
+        let Some(AgentDomainEvent::ToolInputChanged { change, .. }) =
+            p.derived_after(&asked("c2", Some("toolu_a"), serde_json::json!({ long_b: 1 }), true))
+        else {
+            panic!("another long name is a change");
+        };
+        assert_eq!(change.fields.len(), 1);
+        assert_eq!(change.removed.len(), 1, "the dropped long name is reported, clipped");
+        assert!(change.clipped);
+    }
+
+    fn change_between(gate: serde_json::Value, cli: serde_json::Value) -> Option<InputChange> {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&asked("g", Some("toolu_a"), gate, false));
+        p.derived_after(&asked("c", Some("toolu_a"), cli, true))
+            .map(|e| match e {
+                AgentDomainEvent::ToolInputChanged { change, .. } => change,
+                other => panic!("not a change: {other:?}"),
+            })
+    }
+
+    fn digest_name(key: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let hex: String = Sha256::digest(key.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("sha256:{hex}")
+    }
+
+    /// A literal field named like a long name's digest is a different field from that long name.
+    #[test]
+    fn a_field_named_like_a_long_names_digest_is_another_field() {
+        let long = "L".repeat(MAX_KEY_CHARS + 10);
+        let lookalike = digest_name(&long);
+        let same = serde_json::json!({ long.clone(): 1, lookalike.clone(): 2 });
+        assert!(
+            change_between(same.clone(), same).is_none(),
+            "identical inputs are no change"
+        );
+        let change = change_between(
+            serde_json::json!({ long.clone(): 1 }),
+            serde_json::json!({ lookalike.clone(): 1 }),
+        )
+        .expect("the long field was replaced by another one");
+        assert_eq!(change.fields.keys().collect::<Vec<_>>(), [lookalike.as_str()]);
+        assert_eq!(change.removed.len(), 1);
+        let change = change_between(
+            serde_json::json!({ lookalike.clone(): 1 }),
+            serde_json::json!({ long: 1 }),
+        )
+        .expect("and the other way round");
+        assert_eq!(change.removed, [lookalike]);
+    }
+
+    /// A dropped long name is reported by its own cut text, not by the digest the memory keys it by.
+    #[test]
+    fn a_dropped_long_name_is_reported_by_its_cut_name() {
+        let long = format!("{}tail", "n".repeat(MAX_KEY_CHARS + 20));
+        let change = change_between(
+            serde_json::json!({ long.clone(): 1, "a": 1 }),
+            serde_json::json!({ "a": 1 }),
+        )
+        .expect("a dropped field is a change");
+        assert_eq!(change.removed.len(), 1);
+        let shown = &change.removed[0];
+        assert!(!shown.starts_with("sha256:"), "{shown}");
+        assert_eq!(shown.chars().count(), MAX_KEY_CHARS + 1);
+        assert!(shown.starts_with(&"n".repeat(MAX_KEY_CHARS)) && shown.ends_with('…'));
+        assert!(change.clipped);
+    }
+
+    /// Keys that escape to six bytes a character are charged at their serialized size, so the note
+    /// never serializes past the bound.
+    #[test]
+    fn keys_that_escape_are_charged_at_their_serialized_size() {
+        let mut gate = serde_json::Map::new();
+        let mut cli = serde_json::Map::new();
+        for n in 0..19 {
+            let key = format!("{}{}", "\u{1}".repeat(MAX_KEY_CHARS - 2), char::from(b'a' + n));
+            gate.insert(key.clone(), serde_json::json!(0));
+            cli.insert(key, serde_json::json!(1));
+        }
+        let change = change_between(serde_json::Value::Object(gate), serde_json::Value::Object(cli)).unwrap();
+        assert!(!change.fields.is_empty());
+        assert!(change.clipped, "not every field fits");
+        let size = serde_json::to_string(&change.fields).unwrap().len();
+        assert!(size <= MAX_CHANGED_FIELDS_BYTES, "{size} bytes");
+    }
+
+    /// The whole of the bound counts, braces and commas included, for many small fields.
+    #[test]
+    fn many_small_fields_never_serialize_past_the_bound() {
+        let mut gate = serde_json::Map::new();
+        let mut cli = serde_json::Map::new();
+        for n in 0..64 {
+            gate.insert(format!("{n:0>60}"), serde_json::json!("old"));
+            cli.insert(format!("{n:0>60}"), serde_json::json!("n".repeat(40)));
+        }
+        let change = change_between(serde_json::Value::Object(gate), serde_json::Value::Object(cli)).unwrap();
+        let size = serde_json::to_string(&change.fields).unwrap().len();
+        assert!(size <= MAX_CHANGED_FIELDS_BYTES, "{size} bytes");
+    }
+
+    /// A value of hundreds of thousands of small objects is reported cut from a walk that stops at
+    /// the budget, not from a copy of the whole input.
+    #[test]
+    fn a_huge_nested_value_is_cut_by_a_walk_bounded_by_the_budget() {
+        let items: Vec<serde_json::Value> = (0..400_000).map(|n| serde_json::json!({ "i": n, "t": "x" })).collect();
+        let started = std::time::Instant::now();
+        let change = change_between(
+            serde_json::json!({ "a": 1, "list": [] }),
+            serde_json::json!({ "a": 1, "list": items.clone(), "more": items }),
+        )
+        .unwrap();
+        let took = started.elapsed();
+        assert!(change.clipped);
+        assert!(!change.fields.is_empty());
+        assert!(
+            change.fields.contains_key("list"),
+            "the first differing field is cut short, never dropped"
+        );
+        let size = serde_json::to_string(&change.fields).unwrap().len();
+        assert!(size <= MAX_CHANGED_FIELDS_BYTES, "{size} bytes");
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    }
+
+    /// The clipping walk stops after about a budget's worth of nodes: it visits a bounded number of
+    /// elements of an input it cannot finish.
+    #[test]
+    fn the_clipping_walk_visits_a_bounded_number_of_nodes() {
+        // An iterator-backed count cannot see inside serde_json::Value, so count what is serialized.
+        let items: Vec<serde_json::Value> = (0..1_000_000).map(|_| serde_json::json!([])).collect();
+        let value = serde_json::Value::Array(items);
+        let (text, overflowed) = clip_text(&value, MAX_CHANGED_FIELDS_BYTES);
+        assert!(overflowed);
+        assert_eq!(text.len(), MAX_CHANGED_FIELDS_BYTES);
+    }
+
+    /// One field whose JSON is larger than the budget (control characters are six bytes each) is
+    /// reported cut, never as an empty note.
+    #[test]
+    fn one_field_larger_than_the_budget_is_cut_not_dropped() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&asked(
+            "g",
+            Some("toolu_a"),
+            serde_json::json!({ "content": "x" }),
+            false,
+        ));
+        let hostile = "\u{1}".repeat(MAX_CHANGED_VALUE_CHARS);
+        let Some(AgentDomainEvent::ToolInputChanged { change, .. }) = p.derived_after(&asked(
+            "c",
+            Some("toolu_a"),
+            serde_json::json!({ "content": hostile }),
+            true,
+        )) else {
+            panic!("a change");
+        };
+        let shown = change.fields["content"].as_str().expect("a string, cut");
+        assert!(!shown.is_empty());
+        assert!(change.clipped);
+        assert!(serde_json::to_string(&change.fields).unwrap().len() <= MAX_CHANGED_FIELDS_BYTES);
+    }
+
+    /// A plain-text input and an object whose only field is named like the whole-input key are not
+    /// the same input.
+    #[test]
+    fn a_whole_input_and_an_object_are_never_taken_for_each_other() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&asked("g", Some("toolu_a"), serde_json::json!("plain"), false));
+        for cli in [
+            serde_json::json!({ "(input)": "plain" }),
+            serde_json::json!({ "": "plain" }),
+        ] {
+            assert!(p.derived_after(&asked("c", Some("toolu_a"), cli, true)).is_some());
+        }
+        assert!(p
+            .derived_after(&asked("c", Some("toolu_a"), serde_json::json!("plain"), true))
+            .is_none());
+        p.apply(&asked("g2", Some("toolu_b"), serde_json::json!({ "": "plain" }), false));
+        assert!(p
+            .derived_after(&asked("c2", Some("toolu_b"), serde_json::json!("plain"), true))
+            .is_some());
     }
 }

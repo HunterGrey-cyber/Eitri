@@ -1,11 +1,11 @@
 //! The revert journal: what an in-place rewrite of a project file was doing, kept on disk for as
 //! long as the rewrite runs, so a crash halfway through leaves the file's earlier bytes findable.
 //!
-//! A file that cannot be replaced by a rename (it has another hard link, another owner, extended
-//! attributes or an ACL) is rewritten in place, and a rewrite in place is not atomic. Before the
-//! file is truncated, an entry `journal/<id>.json` (0600, in a 0700 directory under the review
-//! directory, never in the project) names the file and the stored blobs of its bytes before and
-//! after; the two blobs get refs of their own in the shadow (`refs/eitri-journal/<id>/`), which
+//! A file that cannot be replaced by a rename (another owner, extended attributes or an ACL) is
+//! rewritten in place, and a rewrite in place is not atomic. (A file with another hard link is not
+//! written at all.) Before the file is truncated, an entry `journal/<id>.json` (0600, in a 0700
+//! directory under the review directory, never in the project) names the file, the stored blobs of
+//! its bytes before and after, and the permission bits it is to end with; the two blobs get refs of their own in the shadow (`refs/eitri-journal/<id>/`), which
 //! retention never ages out. The entry is removed once the write, or the putting back of the
 //! earlier bytes, is verified; an entry that outlives its writer is a write that never finished.
 //!
@@ -57,6 +57,9 @@ pub struct JournalEntry {
     pub pre: Option<String>,
     /// The stored blob of the bytes that were being written.
     pub intended: Option<String>,
+    /// The permission bits the write was to leave; `None` in an entry written by an older build,
+    /// which did not record them.
+    pub intended_mode: Option<u32>,
     /// The file's permission bits before the write.
     pub mode: u32,
     /// When the write started, in milliseconds since the Unix epoch.
@@ -100,6 +103,9 @@ struct EntryFile {
     path_hex: String,
     pre: Option<String>,
     intended: Option<String>,
+    /// Absent from an entry an older build wrote; such an entry still parses, without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intended_mode: Option<u32>,
     mode: u32,
     session: String,
     at_ms: u64,
@@ -133,12 +139,17 @@ impl Journal {
         &self.dir
     }
 
-    /// Writes an entry for `note` and holds it. Under the store's shared lock, held across both
+    /// Writes an entry for `note`, whose write is to leave the file with `intended_mode`, and holds it. Under the store's shared lock, held across both
     /// steps, the blobs are pinned and the entry is written, synced and moved into place; a
     /// collection, which holds that lock exclusively, therefore sees the entry and its pins or
     /// neither. The entry is locked before its first byte is written and renamed into place whole,
     /// so a reader never meets a half-written entry or an unlocked one that is still being made.
-    pub(crate) fn begin(&self, note: &JournalNote, shadow: &Shadow) -> Result<JournalHold, ShadowError> {
+    pub(crate) fn begin(
+        &self,
+        note: &JournalNote,
+        intended_mode: u32,
+        shadow: &Shadow,
+    ) -> Result<JournalHold, ShadowError> {
         shadow::validate_session(&note.session)?;
         if !is_project_relative(&note.path) {
             return Err(ShadowError::InvalidPath(note.path.clone()));
@@ -150,6 +161,7 @@ impl Journal {
             path_hex: shadow::hex_encode(note.path.as_os_str().as_bytes()),
             pre: note.pre.clone(),
             intended: note.intended.clone(),
+            intended_mode: Some(intended_mode),
             mode: note.pre_mode,
             session: note.session.clone(),
             at_ms: wall_clock_ms(),
@@ -351,6 +363,7 @@ fn parse_entry(stem: &[u8], bytes: &[u8]) -> Option<JournalEntry> {
         path,
         pre: entry.pre,
         intended: entry.intended,
+        intended_mode: entry.intended_mode,
         mode: entry.mode,
         at_ms: entry.at_ms,
         pid: entry.pid,
@@ -408,6 +421,7 @@ mod tests {
                 path_hex: shadow::hex_encode(path),
                 pre: None,
                 intended: None,
+                intended_mode: Some(0o644),
                 mode: 0o644,
                 session: "s".into(),
                 at_ms: 1,
@@ -425,6 +439,22 @@ mod tests {
         let other = "fedcba9876543210fedcba9876543210";
         assert!(parse_entry(other.as_bytes(), &entry(b"x", id)).is_none());
         assert!(parse_entry(b"x", b"{not json").is_none());
+    }
+
+    #[test]
+    fn an_entry_without_the_intended_mode_still_parses_without_it() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let older = format!(
+            r#"{{"v":1,"id":"{id}","path_hex":"{}","pre":null,"intended":null,"mode":420,"session":"s","at_ms":1,"pid":1}}"#,
+            shadow::hex_encode(b"a.txt")
+        );
+        let parsed = parse_entry(id.as_bytes(), older.as_bytes()).expect("an older entry parses");
+        assert_eq!(parsed.intended_mode, None);
+        assert_eq!(parsed.mode, 0o644);
+
+        let newer = older.replace(r#""mode":420"#, r#""intended_mode":493,"mode":420"#);
+        let parsed = parse_entry(id.as_bytes(), newer.as_bytes()).expect("a newer entry parses");
+        assert_eq!(parsed.intended_mode, Some(0o755));
     }
 
     #[test]

@@ -49,14 +49,19 @@ pub(crate) fn hook_socket(dir: &Path, conversation_id: uuid::Uuid) -> io::Result
 #[cfg(feature = "legacy-backend")]
 pub(crate) const HOOK_SOCKET_PREFIX: &str = "eitri-hook-";
 
+/// How many hex digits of an instance id the socket's file name keeps.
+const SOCKET_ID_HEX: usize = 16;
+
 /// One sidecar instance's gRPC socket: `sc-<id>.sock` inside the private directory
 /// [`private_socket_dir`] returns. A hyphenated UUID -- which is what every caller in this
-/// workspace passes -- is written in its 32-hex simple form, 39 bytes of file name; any other id is
-/// used verbatim and is subject to the check. The name is short because the directory in front of it
-/// costs `eitri-<uid>/` bytes of the macOS cap.
+/// workspace passes -- is written as the first [`SOCKET_ID_HEX`] digits of its 32-hex simple form
+/// (60 random bits of a v4 UUID, enough that two live sidecars of one user never meet), a 24-byte
+/// file name; any other id is used verbatim and is subject to the check. The name is short because
+/// the directory in front of it costs `eitri-<uid>/` bytes of the macOS cap, and a directory-service
+/// uid there can have ten digits: `<49-byte TMPDIR>eitri-<10 digits>/sc-<16 hex>.sock` is 90 bytes.
 pub(crate) fn sidecar_socket(dir: &Path, instance_id: &str) -> io::Result<PathBuf> {
     let id = match uuid::Uuid::parse_str(instance_id) {
-        Ok(uuid) => uuid.simple().to_string(),
+        Ok(uuid) => uuid.simple().to_string()[..SOCKET_ID_HEX].to_owned(),
         Err(_) => instance_id.to_owned(),
     };
     in_dir(dir, &format!("sc-{id}.sock"))
@@ -67,6 +72,13 @@ pub(crate) fn sidecar_socket(dir: &Path, instance_id: &str) -> io::Result<PathBu
 /// `<tmp>/eitri-<uid>`. The directory is created 0700 when absent, and an existing one is accepted
 /// only if it is a real directory (no symlink), owned by this user, with no group or other bit.
 ///
+/// In the `<tmp>/eitri-<uid>` case the directory's parent matters as much as the directory: whoever
+/// can rename entries in `<tmp>` can move a validated 0700 directory away and put their own, also
+/// 0700 but theirs, in its place before the sidecar binds. So `<tmp>` itself must belong to this
+/// user or to root and must not be writable by its group or by anyone, unless it has the sticky bit
+/// (which stops everyone but an entry's owner and the directory's owner, both trusted by the first
+/// rule); the same rule `packaging/install.sh` applies to the cache directories.
+///
 /// A socket directly in a shared `TMPDIR` is connectable by whoever the process umask lets in, and
 /// the sidecar's protocol carries no credential, so the directory is what keeps other users away
 /// from `ResolvePermission`. Anything short of that is an error, never a fallback to a shared place.
@@ -74,7 +86,10 @@ pub(crate) fn private_socket_dir(runtime_dir: Option<&Path>, tmp: &Path, uid: u3
     use std::os::unix::fs::DirBuilderExt;
     let dir = match runtime_dir.filter(|d| d.is_absolute() && is_private_dir(d)) {
         Some(runtime) => runtime.join("eitri"),
-        None => tmp.join(format!("eitri-{uid}")),
+        None => {
+            require_safe_parent(tmp)?;
+            tmp.join(format!("eitri-{uid}"))
+        }
     };
     match std::fs::DirBuilder::new()
         .mode(crate::private_fs::PRIVATE_DIR_MODE)
@@ -95,6 +110,34 @@ pub(crate) fn private_socket_dir(runtime_dir: Option<&Path>, tmp: &Path, uid: u3
         ));
     }
     Ok(dir)
+}
+
+/// Whether the owner and mode of the directory a private directory is created in keep anyone else
+/// from replacing that private directory: owned by `euid` or root, and not group- or other-writable
+/// unless sticky.
+fn parent_is_safe(owner: u32, mode: u32, euid: u32) -> bool {
+    (owner == euid || owner == 0) && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+}
+
+/// [`parent_is_safe`] for `tmp`. A symlink named by `TMPDIR` is followed (macOS's `/var` is one); it
+/// is the directory it leads to whose entries can be renamed.
+fn require_safe_parent(tmp: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let meta = std::fs::metadata(tmp)?;
+    if meta.is_dir() && parent_is_safe(meta.uid(), meta.mode(), euid) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is not a directory of this user or root, or is writable by its group or by anyone without \
+             the sticky bit, so another user could swap the sidecar's socket directory in it; refusing to \
+             bind the sidecar's socket there (point TMPDIR at a directory of your own)",
+            tmp.display()
+        ),
+    ))
 }
 
 /// A real directory (a symlink is not followed) owned by this process's effective user, with no
@@ -130,8 +173,12 @@ mod tests {
     const MACOS_TEMP_DIR: &str = "/var/folders/33/0tqfpnyn4z3c049gljzppdv00000gn/T/";
 
     fn scratch(label: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("nv-sock-dir-{label}-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("create_dir {dir:?}: {e}"));
+        // 0755 whatever the umask: a directory a private one is made in must not be group-writable.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("chmod {dir:?}: {e}"));
         dir
     }
 
@@ -184,14 +231,69 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
     }
 
+    /// The umask is process-wide, so the body runs in a child copy of the test binary.
     #[test]
     fn a_restrictive_umask_does_not_leave_the_directory_unusable() {
-        let tmp = scratch("umask");
-        // SAFETY: umask is process-wide; restored straight after the one call that needs it.
-        let old = unsafe { libc::umask(0o277) };
-        let dir = private_socket_dir(None, &tmp, 9);
-        unsafe { libc::umask(old) };
-        assert_eq!(mode(&dir.unwrap()), 0o700);
+        crate::test_umask::with_umask(
+            concat!(
+                module_path!(),
+                "::a_restrictive_umask_does_not_leave_the_directory_unusable"
+            ),
+            0o277,
+            || {
+                let tmp = scratch("umask");
+                let dir = private_socket_dir(None, &tmp, 9).unwrap();
+                assert_eq!(mode(&dir), 0o700);
+            },
+        );
+    }
+
+    /// The directory the private one is made in decides whether another user can swap it.
+    #[test]
+    fn the_rule_for_the_directory_above_the_private_one() {
+        let me = 1000;
+        // (owner, mode, safe)
+        for (owner, mode, safe) in [
+            (me, 0o755, true),
+            (me, 0o700, true),
+            (0, 0o755, true),
+            (0, 0o1777, true),
+            (me, 0o1777, true),
+            (me, 0o775, false),
+            (me, 0o757, false),
+            (me, 0o777, false),
+            (0, 0o777, false),
+            (0, 0o775, false),
+            (me + 1, 0o755, false),
+            (me + 1, 0o1777, false),
+        ] {
+            assert_eq!(parent_is_safe(owner, mode, me), safe, "owner {owner} mode {mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_shared_non_sticky_temp_dir_is_refused_and_a_sticky_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = scratch("shared");
+        for open_mode in [0o777, 0o775, 0o757] {
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(open_mode)).unwrap();
+            let err = private_socket_dir(None, &tmp, 3).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{open_mode:o}: {err}");
+            assert!(
+                !tmp.join("eitri-3").exists(),
+                "nothing is created under an unsafe parent"
+            );
+        }
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert_eq!(private_socket_dir(None, &tmp, 3).unwrap(), tmp.join("eitri-3"));
+    }
+
+    #[test]
+    fn a_temp_dir_that_is_a_symlink_to_a_safe_directory_is_accepted() {
+        let real = scratch("real");
+        let link = scratch("link").join("tmp");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(private_socket_dir(None, &link, 5).unwrap(), link.join("eitri-5"));
     }
 
     #[test]
@@ -249,33 +351,77 @@ mod tests {
         }
     }
 
-    /// Both production socket paths fit under the macOS temp dir, and under this machine's own.
-    /// The hook socket only where it is built: a build with the legacy backend.
+    /// The sidecar's socket fits under the macOS temp dir and under this machine's own, with the
+    /// longest uid a directory service hands out (ten digits).
     #[test]
-    fn every_production_socket_path_fits_under_the_macos_temp_dir() {
+    fn the_sidecar_socket_fits_under_the_macos_temp_dir_with_a_ten_digit_uid() {
         for dir in [Path::new(MACOS_TEMP_DIR).to_path_buf(), std::env::temp_dir()] {
-            // The private directory adds `eitri-<uid>/`; a five-digit uid is macOS's worst real case.
-            let dir = dir.join("eitri-99999");
-            let sidecar = sidecar_socket(&dir, &uuid::Uuid::new_v4().to_string()).unwrap();
-            #[cfg(feature = "legacy-backend")]
-            let paths = [hook_socket(&dir, uuid::Uuid::new_v4()).unwrap(), sidecar];
-            #[cfg(not(feature = "legacy-backend"))]
-            let paths = [sidecar];
-            for path in paths {
-                assert!(path.as_os_str().len() <= MAX_SOCKET_PATH_BYTES, "{path:?}");
-            }
+            let dir = dir.join(format!("eitri-{}", u32::MAX));
+            assert_eq!(u32::MAX.to_string().len(), 10);
+            let path = sidecar_socket(&dir, &uuid::Uuid::new_v4().to_string()).unwrap();
+            assert!(path.as_os_str().len() <= MAX_SOCKET_PATH_BYTES, "{path:?}");
+        }
+        // 49 (temp dir) + "eitri-" + 10 digits + "/" + 24 (file name): the figure the notes quote.
+        let macos = Path::new(MACOS_TEMP_DIR).join(format!("eitri-{}", u32::MAX));
+        let path = sidecar_socket(&macos, &uuid::Uuid::new_v4().to_string()).unwrap();
+        assert_eq!(path.as_os_str().len(), 49 + 6 + 10 + 1 + 24);
+    }
+
+    /// The legacy hook socket sits directly in the temp dir (never in the private directory), so it
+    /// is checked there.
+    #[cfg(feature = "legacy-backend")]
+    #[test]
+    fn the_hook_socket_fits_under_the_macos_temp_dir() {
+        for dir in [Path::new(MACOS_TEMP_DIR).to_path_buf(), std::env::temp_dir()] {
+            let path = hook_socket(&dir, uuid::Uuid::new_v4()).unwrap();
+            assert!(path.as_os_str().len() <= MAX_SOCKET_PATH_BYTES, "{path:?}");
         }
     }
 
     #[test]
-    fn a_hyphenated_uuid_instance_id_is_written_in_its_simple_form() {
+    fn a_hyphenated_uuid_instance_id_is_written_as_sixteen_hex_digits() {
         let id = uuid::Uuid::new_v4();
         let path = sidecar_socket(Path::new("/t"), &id.to_string()).unwrap();
-        assert_eq!(path, Path::new(&format!("/t/sc-{}.sock", id.simple())));
+        assert_eq!(
+            path,
+            Path::new(&format!("/t/sc-{}.sock", &id.simple().to_string()[..16]))
+        );
+        assert_eq!(path.file_name().unwrap().len(), 24);
         assert_eq!(
             sidecar_socket(Path::new("/t"), "abc").unwrap(),
             Path::new("/t/sc-abc.sock")
         );
+    }
+
+    /// The connector of `ClaudeSidecarProvider::connect` checks who serves the socket before any byte
+    /// goes over it. The check cannot be exercised against another uid without root, so this reads the
+    /// production source: `require_own_peer` must be called in `connect`, after the `UnixStream::connect`
+    /// and before the stream is handed to the channel.
+    #[test]
+    fn the_sidecar_connector_checks_the_peer_before_using_the_stream() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join("src/providers/claude_sidecar/mod.rs")).unwrap();
+        let start = text
+            .find("pub fn connect(instance_id: &str)")
+            .expect("anchor: ClaudeSidecarProvider::connect");
+        let body = &text[start..];
+        let end = body.find("\n    }\n").expect("the end of connect");
+        let body = &body[..end];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let connected = code
+            .find("UnixStream::connect(")
+            .expect("the connector opens the stream");
+        let checked = code
+            .find("require_own_peer(")
+            .expect("connect must call require_own_peer");
+        let handed = code
+            .find("TokioIo::new(stream)")
+            .expect("the stream is handed to the channel");
+        assert!(connected < checked && checked < handed, "check order in connect");
     }
 
     /// The assertion over every construction site. Any line in `agent/src` or `agent/tests` that

@@ -304,6 +304,20 @@ pub struct Tab {
     gate_log: Vec<crate::agent_backend::GateAnswer>,
 }
 
+/// Keeps the row note of each CLI prompt the host answered that names its call, for the call's row
+/// once it completes. Takes the map, not the tab, so a caller holding the tab's backend borrowed can
+/// still use it.
+fn note_answered_prompts(
+    candidates: &mut std::collections::BTreeMap<String, String>,
+    prompts: Vec<crate::agent_backend::PromptAnsweredForYou>,
+) {
+    candidates.extend(
+        prompts
+            .into_iter()
+            .map(|answered| (answered.tool_use_id, answered.note)),
+    );
+}
+
 impl Tab {
     /// Every request this tab's host answered itself (a deferral or an `allow`), recorded where the
     /// answer was sent, so it holds one a resolution had already removed from the projection.
@@ -1278,12 +1292,7 @@ impl TabSet {
                 };
                 tab.host_answered.extend(answered.ids.iter().cloned());
                 // The CLI's own prompts it answered say so on their calls' rows once those complete.
-                tab.prompt_note_candidates.extend(
-                    answered
-                        .prompts
-                        .into_iter()
-                        .map(|answered| (answered.tool_use_id, answered.note)),
-                );
+                note_answered_prompts(&mut tab.prompt_note_candidates, answered.prompts);
                 let answered_set: BTreeSet<String> = answered.ids.iter().cloned().collect();
                 tab.attention.retain_pending(|id| !answered_set.contains(id));
                 let approved = answered.ids.len();
@@ -1674,12 +1683,7 @@ impl TabSet {
             let covered = covered.filter(|_| !self.redeliver_covered);
             #[cfg(any(test, feature = "test-support"))]
             tab.gate_log.extend(answered_for_you.gate_answers);
-            tab.prompt_note_candidates.extend(
-                answered_for_you
-                    .prompts
-                    .into_iter()
-                    .map(|answered| (answered.tool_use_id, answered.note)),
-            );
+            note_answered_prompts(&mut tab.prompt_note_candidates, answered_for_you.prompts);
             // Keep fast-path answers, saved-rule answers, and `Write` answers for nonexistent files as
             // captured when answered. The first two wait for call completion (`note_auto_edit_answers`,
             // `note_rule_answers`); file creation markers need only a payload to carry them
@@ -1992,12 +1996,7 @@ impl TabSet {
                         // is read after they were folded, so it already shows those cards answered.
                         let answered = backend.approve_pending(&sweep, "in bypass after a resync");
                         tab.host_answered.extend(answered.ids);
-                        tab.prompt_note_candidates.extend(
-                            answered
-                                .prompts
-                                .into_iter()
-                                .map(|answered| (answered.tool_use_id, answered.note)),
-                        );
+                        note_answered_prompts(&mut tab.prompt_note_candidates, answered.prompts);
                     }
                     tab.attention
                         .resync(pending.iter().filter(|id| !tab.host_answered.contains(*id)).cloned());

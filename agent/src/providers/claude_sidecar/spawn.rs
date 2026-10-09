@@ -720,7 +720,12 @@ fn sidecar_command_for(
         // The sidecar merges this variable's MCP servers into every session it serves. Eitri states
         // which servers a session gets and states none today, so a value left in the user's shell
         // must not turn into servers (and tools) in an Eitri session.
-        .env_remove(EXTRA_MCP_SERVERS_VAR);
+        .env_remove(EXTRA_MCP_SERVERS_VAR)
+        // `none` makes the sidecar ignore end-of-file on its stdin, which is how it learns that the
+        // window holding the other end is gone, so a window killed with SIGKILL would leave it
+        // running; any other value than `stdin` or `none` fails every start. The window states
+        // nothing here, so the sidecar's own default (`stdin`) is what applies.
+        .env_remove(PARENT_WATCH_VAR);
     // Verdandi's fault-injection and sizing knobs change how a session behaves (dropped watches, a
     // one-event ring); a value left in a shell must not reach a window's sidecar. The real-sidecar
     // tests that set them on purpose also set `TEST_SEAMS_VAR`.
@@ -744,6 +749,9 @@ const TEST_SEAM_VARS: [&str; 3] = [
 
 /// Set by the real-sidecar tests that pass a seam on purpose; never set by a window.
 const TEST_SEAMS_VAR: &str = "EITRI_SIDECAR_TEST_SEAMS";
+
+/// How the sidecar notices that its parent is gone; never inherited from the shell.
+const PARENT_WATCH_VAR: &str = "VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH";
 
 /// The sidecar's process-level list of extra MCP servers (JSON); never inherited from the shell.
 const EXTRA_MCP_SERVERS_VAR: &str = "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS";
@@ -1470,6 +1478,24 @@ mod tests {
         }
     }
 
+    /// An inherited `none` would make the sidecar ignore its stdin closing, so it would outlive a
+    /// window that was killed; the removal holds with the test switch on too.
+    #[test]
+    fn the_parent_watch_variable_is_removed_from_the_sidecar_child_in_every_case() {
+        let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "watch-test").unwrap();
+        let program = Path::new("/usr/lib/eitri/verdandi-claude-sidecar");
+        for keep in [false, true] {
+            let command = sidecar_command_for(program, &[], &socket, None, keep);
+            let removed: Vec<_> = command
+                .get_envs()
+                .filter(|(k, _)| k.to_string_lossy() == PARENT_WATCH_VAR)
+                .collect();
+            assert_eq!(removed.len(), 1, "keep_test_seams={keep}: {removed:?}");
+            assert!(removed[0].1.is_none(), "it must be removed, not set: {removed:?}");
+        }
+        assert_eq!(PARENT_WATCH_VAR, "VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH");
+    }
+
     /// The seams are removed from the child unless the test switch is on, in which case they are
     /// left to be inherited.
     #[test]
@@ -1506,7 +1532,7 @@ mod tests {
     /// The shipped default: with nothing configured the child's environment is what it always was
     /// (plus the one removal above), and the sidecar's own account support never engages.
     #[test]
-    fn with_no_account_the_child_sets_the_socket_and_only_removes_the_extra_servers() {
+    fn with_no_account_the_child_sets_the_socket_and_only_removes_the_inherited_knobs() {
         let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "account-test").unwrap();
         let command = sidecar_command(Path::new("/usr/lib/eitri/verdandi-claude-sidecar"), &[], &socket, None);
         let keys: Vec<String> = command
@@ -1520,6 +1546,7 @@ mod tests {
             vec![
                 "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS".to_string(),
                 "VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER".to_string(),
+                "VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH".to_string(),
                 "VERDANDI_CLAUDE_SIDECAR_RING_CAPACITY".to_string(),
                 "VERDANDI_CLAUDE_SIDECAR_SOCKET".to_string(),
                 "VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS".to_string(),

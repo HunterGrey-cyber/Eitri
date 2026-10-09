@@ -141,6 +141,57 @@ fn a_newline_in_an_opened_path_is_part_of_the_name_and_runs_nothing() {
     dir.cleanup();
 }
 
+/// A name that starts with `+` is an Ex command to `:edit` even as a structured argument. Every producer
+/// hands over an absolute path; a relative one must be refused by the snippet, not opened.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_relative_path_is_refused_and_runs_nothing() {
+    let dir = ScratchDir::new().expect("a scratch directory");
+    let pwned = dir.path().join("pwned");
+    let lua = format!(
+        "lua if vim.g.eitri_pwned then io.open({},{}):close() end",
+        lua_bytes(&pwned.to_string_lossy()),
+        lua_bytes("w")
+    );
+    for op in ["open", "view"] {
+        let request = serde_json::json!({ "op": op, "path": "+let\\ g:eitri_pwned=1 x", "line": null }).to_string();
+        let hex: String = request.bytes().map(|b| format!("{b:02x}")).collect();
+        nvim(&dir, &[call(&hex), lua.clone()]);
+        assert!(!pwned.exists(), "{op}: the +command in a relative path ran");
+    }
+    dir.cleanup();
+}
+
+/// The `edit` op opens its draft with `:split`, which reads a leading `+` as a command just as `:edit` does, so it
+/// goes through the same absolute-path check. Unlike `open` and `view` it carries a `done` marker, so the refusal
+/// also has to come back through it as a failure the panel can show.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_relative_path_for_an_edit_is_refused_and_reported_through_done() {
+    let mut dir = ScratchDir::new().expect("a scratch directory");
+    let pwned = dir.path().join("pwned");
+    let lua = format!(
+        "lua if vim.g.eitri_pwned then io.open({},{}):close() end",
+        lua_bytes(&pwned.to_string_lossy()),
+        lua_bytes("w")
+    );
+    let (_, edit) = dir.prepare_edit("draft").unwrap();
+    let request = serde_json::json!({
+        "op": "edit",
+        "path": "+let\\ g:eitri_pwned=1 x",
+        "done": edit.done.to_string_lossy(),
+    })
+    .to_string();
+    let hex: String = request.bytes().map(|b| format!("{b:02x}")).collect();
+    nvim(&dir, &[call(&hex), lua]);
+    assert!(!pwned.exists(), "the +command in a relative edit path ran");
+    assert!(
+        matches!(edit.poll(), Some(EditDone::Failed(why)) if why.contains("not absolute")),
+        "the refusal did not reach the done marker"
+    );
+    dir.cleanup();
+}
+
 /// `%`, `#`, a space and a backslash in a name name themselves, not the current file, the
 /// alternate file or two arguments.
 #[test]

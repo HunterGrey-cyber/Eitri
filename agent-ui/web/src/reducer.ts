@@ -29,8 +29,18 @@ export function initialState(): AgentUiState {
     assistantMessageOpen: false,
     nextSeq: 0,
     turnThinking: false,
-    denialsBeforeTheirCall: [],
+    ...NOTHING_HELD,
   };
+}
+
+/** What the state holds for calls that have not been folded: none of it on the wire, all of it
+ * dropped where Rust's projection drops its own. */
+const NOTHING_HELD = { denialsBeforeTheirCall: [], changedInputsBeforeTheirCall: [] } as const;
+
+/** Appends `(toolUseId, change)`, replacing an earlier entry for the id, capped at `MAX_HELD_DENIALS`
+ * with the oldest dropped first (Rust's `push_bounded`). */
+function pushBounded<T extends { toolUseId: string }>(held: ReadonlyArray<T>, entry: T): T[] {
+  return [...held.filter((h) => h.toolUseId !== entry.toolUseId), entry].slice(-MAX_HELD_DENIALS);
 }
 
 /** How many refusals that arrived ahead of their call a state holds at once; the same cap as
@@ -176,6 +186,8 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // A refusal that arrived before this call is attached now, as Rust's projection does.
       const held = state.denialsBeforeTheirCall.find((d) => d.toolUseId === event.tool_use_id);
       if (held !== undefined) record.denied = held.denied;
+      const heldChange = state.changedInputsBeforeTheirCall.find((c) => c.toolUseId === event.tool_use_id);
+      if (heldChange !== undefined) record.changedInput = heldChange.change;
       // A tool call only happens between assistant messages, so the streaming text ended here.
       return {
         ...state,
@@ -184,6 +196,9 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         ...(held === undefined
           ? {}
           : { denialsBeforeTheirCall: state.denialsBeforeTheirCall.filter((d) => d.toolUseId !== event.tool_use_id) }),
+        ...(heldChange === undefined
+          ? {}
+          : { changedInputsBeforeTheirCall: state.changedInputsBeforeTheirCall.filter((c) => c.toolUseId !== event.tool_use_id) }),
       };
     }
     case "tool_call_completed":
@@ -232,7 +247,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // updates the band until the next turn starts. A completed turn adds no ending row. Keep this
       // behavior identical to `AgentSessionProjection::apply`. Use a fallback for absent `detail`
       // so an event without it still produces a row.
-      const done = { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage, denialsBeforeTheirCall: [] };
+      const done = { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage, ...NOTHING_HELD };
       if (event.outcome === "completed") return done;
       const detail = event.detail ?? { reason: null, api_error_status: null, message: null };
       const ending: TurnEnding = {
@@ -263,7 +278,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "unavailable", reason: describeFailedResume(event) },
         assistantMessageOpen: false,
-        denialsBeforeTheirCall: [],
+        ...NOTHING_HELD,
       };
     }
     case "session_unavailable":
@@ -272,7 +287,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "unavailable", reason: event.reason },
         assistantMessageOpen: false,
-        denialsBeforeTheirCall: [],
+        ...NOTHING_HELD,
       };
     case "session_closed":
       return {
@@ -280,7 +295,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "closed", reason: event.reason },
         assistantMessageOpen: false,
-        denialsBeforeTheirCall: [],
+        ...NOTHING_HELD,
       };
     case "cli_permission_mode":
       // Rust's answer path reads it; the view draws nothing from it. `state`, so `nextSeq` keeps
@@ -323,6 +338,20 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
           plan: event.plan ?? null,
         },
         turnEndings: fill ? [...state.turnEndings.slice(0, -1), { ...last, resetsAt }] : state.turnEndings,
+      };
+    }
+    case "tool_input_changed": {
+      // Rust compared the CLI's prompt with the gate request (one it may have answered itself, so
+      // the page never saw it) and says so here: applied, never recomputed. Like
+      // `AgentSessionProjection::apply`: the first call with that id, or held until it starts.
+      const id = event.tool_use_id;
+      const at = state.toolCalls.findIndex((call) => call.toolUseId === id);
+      if (at >= 0) {
+        return { ...state, toolCalls: state.toolCalls.map((call, i) => (i === at ? { ...call, changedInput: event.change } : call)) };
+      }
+      return {
+        ...state,
+        changedInputsBeforeTheirCall: pushBounded(state.changedInputsBeforeTheirCall, { toolUseId: id, change: event.change }),
       };
     }
     case "permission_mode_changed":
@@ -422,7 +451,7 @@ export function keepAfterSidecarStop(state: AgentUiState, reason: string): Agent
     pendingPermissions: [],
     assistantMessageOpen: false,
     turnThinking: false,
-    denialsBeforeTheirCall: [],
+    ...NOTHING_HELD,
   };
 }
 
@@ -456,7 +485,9 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
     lastTurnEnding: snapshot.lastTurnEnding ?? null,
     nextSeq: throughRevision,
     turnThinking: false,
-    denialsBeforeTheirCall: [],
+    ...NOTHING_HELD,
+    // The one held list Rust serializes: a change whose call has not started yet.
+    changedInputsBeforeTheirCall: snapshot.changedInputsBeforeTheirCall ?? [],
   };
 }
 

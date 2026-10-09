@@ -47,7 +47,7 @@ use super::message::{compose, Preview};
 use super::presence::{Blocked, PresenceGuard};
 use super::revert::{
     buffer_state_args, parse_buffer_state, AppliedRevert, EditorCheck, EditorClear, ExactHunk, ExactHunks,
-    RecoverAnswer, Refusal, RevertKind, RevertTarget, Saved, BUFFER_STATE_LUA,
+    RecoverAnswer, Recovered, Refusal, RevertKind, RevertTarget, Saved, BUFFER_STATE_LUA,
 };
 
 /// How long the editor has to say what a buffer holds for a message's check. Past it the revert is
@@ -179,7 +179,7 @@ enum Stage {
 enum Done {
     Revert(Result<AppliedRevert, Refusal>),
     Undo(Result<(), Refusal>),
-    Recover(Result<(), Refusal>),
+    Recover(Result<Recovered, Refusal>),
 }
 
 struct AnchorWork {
@@ -763,11 +763,21 @@ impl ReviewFlow {
                     }
                 }
             }
-            (Op::Restore { entry } | Op::Dismiss { entry }, Done::Recover(Ok(()))) => {
+            (Op::Restore { entry } | Op::Dismiss { entry }, Done::Recover(Ok(recovered))) => {
                 self.recoveries.retain(|e| e.id != entry.id);
                 // Sent even when nothing is left: an empty list takes the notice away.
                 out.push(Out::Envelope(serialize_review_recovery_for_js(&self.recoveries)));
-                out.push(ok(id));
+                match recovered {
+                    // Not a restore: the user is told that nothing was put back, and why.
+                    Recovered::AlreadyWritten => out.push(ok_with(
+                        id,
+                        &format!(
+                            "{} already held what the interrupted revert was writing; nothing was changed, the entry is forgotten",
+                            entry.path.display()
+                        ),
+                    )),
+                    Recovered::Restored | Recovered::Dismissed => out.push(ok(id)),
+                }
             }
             (_, Done::Revert(Err(refusal))) | (_, Done::Undo(Err(refusal))) | (_, Done::Recover(Err(refusal))) => {
                 let why = match refusal {

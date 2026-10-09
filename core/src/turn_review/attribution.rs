@@ -224,6 +224,7 @@ mod tests {
                 is_error,
             }),
             denied: None,
+            changed_input: None,
         }
     }
 

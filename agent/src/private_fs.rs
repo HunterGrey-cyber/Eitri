@@ -301,24 +301,31 @@ mod tests {
     }
 
     /// Umask 002 is the case the review measured (`0775`/`0664`); the modes here are set
-    /// explicitly, so the process umask cannot widen them. The umask is process-wide, so this test
-    /// only ever narrows what it widened -- `0o002` for its own creations, restored before asserting.
+    /// explicitly, so the process umask cannot widen them. The umask is process-wide, so the body
+    /// runs in a child copy of the test binary (`test_umask`).
     #[test]
     fn new_directories_are_0700_and_files_0600_whatever_the_umask() {
-        let base = scratch("umask");
-        let root = base.join("eitri");
-        let dir = root.join("conversations").join("abc");
-        let file = dir.join("record.json");
-        // SAFETY: `umask` has no preconditions; the old value is restored right after.
-        let old = unsafe { libc::umask(0o002) };
-        let created = create_private_dir_all(&dir, &root).and_then(|()| write_private(&file, b"{}"));
-        unsafe { libc::umask(old) };
-        created.unwrap();
-        assert_eq!(mode(&root), 0o700);
-        assert_eq!(mode(&root.join("conversations")), 0o700);
-        assert_eq!(mode(&dir), 0o700);
-        assert_eq!(mode(&file), 0o600);
-        std::fs::remove_dir_all(&base).unwrap();
+        crate::test_umask::with_umask(
+            concat!(
+                module_path!(),
+                "::new_directories_are_0700_and_files_0600_whatever_the_umask"
+            ),
+            0o002,
+            || {
+                let base = scratch("umask");
+                let root = base.join("eitri");
+                let dir = root.join("conversations").join("abc");
+                let file = dir.join("record.json");
+                create_private_dir_all(&dir, &root)
+                    .and_then(|()| write_private(&file, b"{}"))
+                    .unwrap();
+                assert_eq!(mode(&root), 0o700);
+                assert_eq!(mode(&root.join("conversations")), 0o700);
+                assert_eq!(mode(&dir), 0o700);
+                assert_eq!(mode(&file), 0o600);
+                std::fs::remove_dir_all(&base).unwrap();
+            },
+        );
     }
 
     /// An older build's `0755` tree is tightened on the next write, from the root down; nothing

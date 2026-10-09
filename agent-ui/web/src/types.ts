@@ -50,7 +50,16 @@ export type ToolCallRecord = {
    *  its auto-mode classifier most often, whose `reasonType` is `"classifier"`. Both strings are the
    *  CLI's own, shown and never parsed; either may be `null`. Absent on every call nobody refused. */
   denied?: ToolCallDenial;
+  /** How the input the CLI's own prompt for this call carried differs from the one the gate judged
+   *  for the same `toolUseId` (Rust's `ToolCallRecord.changed_input`, set by a `tool_input_changed`
+   *  event that Rust derives; the page compares nothing): something after the gate, such as a loaded
+   *  settings tier's hook, changed it. Absent when the two agree and whenever no comparison could be
+   *  made -- absence never says "same". */
+  changedInput?: InputChange;
 };
+/** Rust's `agent::InputChange`: only the top-level fields that differ, with the CLI's values, already
+ *  bounded by Rust (`removed` and `clipped` are absent when empty / false). */
+export type InputChange = { fields: Record<string, unknown>; removed?: string[]; clipped?: boolean };
 export type ToolCallDenial = { reasonType: string | null; reason: string | null };
 /** `toolUseId` is the link back to the `ToolCallRecord` this request gates -- the same id that
  * call is keyed on.
@@ -355,6 +364,9 @@ export type AgentUiState = {
    * arrives. Emptied when the turn or the session ends, and capped at `MAX_HELD_DENIALS`. A snapshot
    * resets it: Rust does not serialize its own held refusals, so there is nothing to seed it from. */
   denialsBeforeTheirCall: ReadonlyArray<{ toolUseId: string; denied: ToolCallDenial }>;
+  /** Reducer-internal (Rust's `changed_inputs_before_their_call`): a changed input whose call has not
+   * started yet, attached when `tool_call_started` arrives. */
+  changedInputsBeforeTheirCall: ReadonlyArray<{ toolUseId: string; change: InputChange }>;
 };
 
 /** A snapshot as it ACTUALLY arrives from Rust, which is not an `AgentUiState`.
@@ -371,7 +383,11 @@ export type AgentUiState = {
  * it used to be, on the theory that it was reducer-internal like the other two, but Rust's own
  * projection carries the same bit and disagreeing about it split a mid-stream reply across a
  * snapshot -- see that field's own doc comment on `AgentUiState`. */
-export type AgentUiSnapshot = Omit<AgentUiState, "nextSeq" | "turnThinking" | "denialsBeforeTheirCall">;
+export type AgentUiSnapshot = Omit<AgentUiState, "nextSeq" | "turnThinking" | "denialsBeforeTheirCall" | "changedInputsBeforeTheirCall"> & {
+  /** Present only while Rust holds a change whose call has not started: it is the one held list
+   *  Rust sends, so a rebuilt page attaches it when the call starts, as Rust does. */
+  changedInputsBeforeTheirCall?: AgentUiState["changedInputsBeforeTheirCall"];
+};
 
 /** How long a turn has been running, tracked in `App.tsx` alongside `AgentUiState` rather than
  * inside it: it is a UI-local clock, not part of the projection Rust serializes, and it does not
@@ -560,7 +576,12 @@ export type AgentDomainEvent =
    *  Rust fails the tab, and the failure reaches the page as the tab's own state. */
   | { type: "policy_mismatch"; requested: string; reported: string }
   /** The account's usage limit changed (`AgentDomainEvent::AccountLimits`). The latest wins. */
-  | { type: "account_limits"; used_percent: number; window_minutes: number | null; resets_at: number | null; plan: string | null };
+  | { type: "account_limits"; used_percent: number; window_minutes: number | null; resets_at: number | null; plan: string | null }
+  /** The CLI's own prompt for a call carried another input than the gate was asked about. Rust
+   *  derives it when it folds the prompt and sends it right after, even when the host answered the
+   *  gate request itself and so never delivered it: the page applies it and compares nothing.
+   *  Lands on the call's row as `ToolCallRecord.changedInput`, or is held until the call starts. */
+  | { type: "tool_input_changed"; tool_use_id: string; change: InputChange };
 
 /** A session tab's identity for its whole life, and the bridge's (`eitri_core::tabs::TabId`). */
 export type TabId = number;

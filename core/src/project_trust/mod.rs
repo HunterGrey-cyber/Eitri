@@ -36,7 +36,7 @@ pub use discover::discover;
 pub use findings::{mcp_findings, settings_findings};
 pub use git_top::{git_top_level, GitWalk};
 pub use plan::{trust_plan, NonUtf8};
-pub use store::{civil_date, for_root, Diff, Remember, TrustState, TrustStore};
+pub use store::{civil_date, for_root, Diff, Remember, TrustState, TrustStore, DISCLOSURE};
 
 /// How much discovery may look at before it stops and says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,7 +196,7 @@ impl Discovery {
             && !self
                 .findings
                 .iter()
-                .any(|finding| matches!(finding, Finding::Unreadable { .. }))
+                .any(|finding| matches!(finding, Finding::Unreadable { .. } | Finding::Unparsed { .. }))
     }
 
     /// The entries that could not be checked, each with its reason.
@@ -205,6 +205,7 @@ impl Discovery {
             .iter()
             .filter_map(|finding| match finding {
                 Finding::Unreadable { path, reason } => Some((path.as_path(), reason.as_str())),
+                Finding::Unparsed { file, .. } => Some((file.as_path(), "could not be parsed for this check")),
                 _ => None,
             })
             .collect()
@@ -268,9 +269,12 @@ pub enum Finding {
         /// `default_tools_approval_mode` and each tool's `approval_mode`); `None` when it sets none.
         approval_mode: Option<String>,
     },
-    EnvKey {
+    /// One `env` entry of a settings file: the CLI applies these to its own process and to every
+    /// tool it runs, so the value (a proxy address, `NODE_OPTIONS`) matters as much as the name.
+    Env {
         file: PathBuf,
         key: String,
+        value: String,
     },
     ApiKeyHelper {
         file: PathBuf,
@@ -290,6 +294,10 @@ pub enum Finding {
         key: String,
         value: String,
     },
+    /// A configuration file this module could not parse (JSON, TOML, or a rule file that is not
+    /// UTF-8). The agent's parser is not ours, so a file one rejects may be accepted by the other: the
+    /// file counts as unchecked, and `reason` carries why and the file's text (lossily, when it is not
+    /// UTF-8).
     Unparsed {
         file: PathBuf,
         reason: String,

@@ -1064,6 +1064,15 @@ textarea,
   font-size: var(--fs-code);
 }
 
+/* The input the CLI's own prompt showed, after the gate had judged another: laid out ltr and
+   overridden like a card's command so a bidi control cannot reorder it, and wrapped, not cut. */
+.tool-changed-input-note code {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Text on a card is `--nv-surface-fg`/`--nv-surface-muted`, guarded against the card's own fill;
    the body's `--nv-fg`/`--nv-muted` are guarded against `bg` (sw-theme-2). */
 .tool-card {

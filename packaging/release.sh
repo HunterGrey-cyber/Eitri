@@ -379,7 +379,14 @@ preflight() {
 		|| die "$RS_SOURCE/neovide is not clean (git status --porcelain --ignored lists something)"
 
 	[ ! -e "$RS_SOURCE/.cargo" ] || die "$RS_SOURCE has a .cargo/: cargo configuration could change the build behind this script's back (M15)"
-	if grep -nE 'ssh://|git@' "$RS_SOURCE/Cargo.lock" >&2; then die "$RS_SOURCE/Cargo.lock names an ssh source"; fi
+	[ -f "$RS_SOURCE/Cargo.lock" ] || die "$RS_SOURCE has no Cargo.lock: a --locked build has nothing to check its sources against"
+	lock_rc=0
+	grep -nE 'ssh://|git@' "$RS_SOURCE/Cargo.lock" >&2 || lock_rc=$?
+	case "$lock_rc" in
+		0) die "$RS_SOURCE/Cargo.lock names an ssh source" ;;
+		1) ;;
+		*) die "cannot read $RS_SOURCE/Cargo.lock (grep exited $lock_rc)" ;;
+	esac
 	if git -C "$RS_SOURCE" grep -nE 'ssh://|git@' -- 'Cargo.toml' '*/Cargo.toml' >&2; then
 		die "a Cargo.toml in $RS_SOURCE names an ssh source"
 	fi
@@ -728,10 +735,33 @@ NV_VERIFY_ZH
 	RS_NOTES="$notes"
 }
 
+# Keep LEAK-SCANNED beside the assets, outside RELEASE's fixed, signed fields.
+# publish/tag.sh requires LEAK_SCANNED=1 and matching RELEASE and SHA256SUMS hashes.
+# A missing negative marker proves nothing: a --no-leak-scan run can fail before
+# writing one, leaving an unscanned directory behind.
+
+# mark_not_leak_scanned DIR: a --no-leak-scan run's marker, at its start.
+mark_not_leak_scanned() {
+	printf '%s\n' "publish/scan.sh never read these assets (--no-leak-scan); they must not be tagged or published." > "$1/NOT-LEAK-SCANNED" \
+		|| die "cannot write $1/NOT-LEAK-SCANNED"
+}
+
+# record_leak_scan DIR: LEAK-SCANNED, once every scan of the run passed, bound to DIR's RELEASE and SHA256SUMS.
+record_leak_scan() {
+	local release sums
+	[ ! -e "$1/NOT-LEAK-SCANNED" ] || die "$1 holds NOT-LEAK-SCANNED; not recording a leak scan there"
+	release="$(sha256sum < "$1/RELEASE")" || die "cannot hash $1/RELEASE"
+	sums="$(sha256sum < "$1/SHA256SUMS")" || die "cannot hash $1/SHA256SUMS"
+	printf 'LEAK_SCANNED=1\nRELEASE_SHA256=%s\nSHA256SUMS_SHA256=%s\n' "${release%% *}" "${sums%% *}" > "$1/LEAK-SCANNED.tmp" \
+		&& mv -- "$1/LEAK-SCANNED.tmp" "$1/LEAK-SCANNED" || die "cannot write $1/LEAK-SCANNED"
+}
+
 host_main() {
 	parse_args "$@"
 	preflight
 	prepare_dirs
+	# Written before anything is built, so a run that stops partway still leaves its directory marked.
+	if [ "$RS_NO_LEAK_SCAN" = 1 ]; then mark_not_leak_scanned "$RS_REL"; fi
 	trap cleanup_containers EXIT
 	trap 'cleanup_containers; exit 130' INT TERM
 	local started=$SECONDS names=() name
@@ -756,6 +786,8 @@ host_main() {
 		warn "no SHA256SUMS.sig (--unsigned)"
 	fi
 	fill_notes
+	# Every leak check of this run has read and passed by now: preflight's, host_scans and the notes'.
+	if [ "$RS_NO_LEAK_SCAN" = 0 ]; then record_leak_scan "$RS_REL"; fi
 	chmod a-w -- "$RS_REL"/* "$RS_REL"
 
 	local gh_line paths=()
@@ -766,6 +798,9 @@ host_main() {
 	echo
 	if [ "$RS_NO_LEAK_SCAN" = 1 ]; then
 		echo "NOT LEAK-SCANNED (--no-leak-scan) -- publish/scan.sh never read these assets; never publish them."
+		echo "Eitri $RS_VERSION is in $RS_REL ($(( (SECONDS - started) / 60 )) min); logs in $RS_LOGS."
+		echo "No tag or push commands are printed for a run the leak scan did not read; publish/tag.sh refuses $RS_REL."
+		return 0
 	fi
 	if [ "$RS_REHEARSAL" = 1 ]; then
 		echo "REHEARSAL -- the commands below are what a real release would print; never run them for this output."

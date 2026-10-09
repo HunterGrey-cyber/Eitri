@@ -1367,6 +1367,12 @@ impl AgentBackend {
         kept
     }
 
+    /// Whether the session has reported a policy it was not asked for. The projection guard is a
+    /// temporary of this call, so it is gone before the caller sends any answer.
+    fn tripped(&self) -> bool {
+        session_tripped(&self.projection())
+    }
+
     /// Answers `allow` to ids still pending on this session, in the supplied order (sorted by
     /// `seq` by the caller). Skips ids already resolved or unknown. Returns only successfully
     /// answered ids so the caller can extend `host_answered`. `why` labels the log message.
@@ -1397,7 +1403,7 @@ impl AgentBackend {
     pub fn approve_pending(&mut self, ids: &[String], why: &str) -> Approved {
         // Its own statement, guard dropped before any answer -- the same lock-order rule the
         // collection below follows.
-        if session_tripped(&self.projection()) {
+        if self.tripped() {
             eprintln!("[permission] not answering {why}: the agent reported a policy it was not asked for");
             return Approved::default();
         }
@@ -1429,8 +1435,7 @@ impl AgentBackend {
         };
         approve_each(ids, &pending, why, |id| {
             // Its own statement, guard dropped before the answer locks the projection again.
-            let tripped = session_tripped(&self.projection());
-            if tripped {
+            if self.tripped() {
                 return Err(BackendError {
                     message: "the agent reported a policy it was not asked for".into(),
                     benign: true,
@@ -4095,6 +4100,104 @@ mod tests {
             ["perm-read", "perm-build", "perm-push"].map(|id| (id.to_string(), PermissionDecision::Allow))
         );
         backend.shutdown();
+    }
+
+    /// Which events reach the page when a gate request is answered by the host and the CLI's own
+    /// prompt for the same call carries a rewritten input: the answered gate request never arrives,
+    /// but the derived `ToolInputChanged` does, between the call and the prompt's card.
+    fn changed_input_delivery(
+        mode: PermissionMode,
+        auto_session: bool,
+        gate_tool: &str,
+        gate_input: serde_json::Value,
+    ) {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = if auto_session {
+            auto_backend(&dir)
+        } else {
+            sidecar_backend(&dir)
+        };
+        let rewritten = serde_json::json!({ "command": "rtk git push --force origin main" });
+        let mut batch = vec![];
+        if auto_session {
+            batch.push(cli_reports("auto"));
+        }
+        batch.extend([
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: "t".into(),
+                tool_use_id: "tu-1".into(),
+                name: gate_tool.into(),
+                input: gate_input.clone(),
+            },
+            gate("perm-gate", "tu-1", gate_tool, gate_input),
+            // The CLI's own prompt: no reason, so an Auto tab cards it (bypass would answer it).
+            AgentDomainEvent::PermissionRequested {
+                permission_id: "perm-cli".into(),
+                tool_use_id: Some("tu-1".into()),
+                tool_name: gate_tool.into(),
+                input: rewritten.clone(),
+                provider_prompt: Some(agent::ProviderPrompt::default()),
+            },
+        ]);
+        provider.queue_all(batch);
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            mode,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert!(
+            !carded(&delivered, "perm-gate"),
+            "the gate request was answered by the host: {delivered:?}"
+        );
+        let changed: Vec<_> = delivered
+            .iter()
+            .filter_map(|e| match e {
+                AgentDomainEvent::ToolInputChanged { tool_use_id, change } => Some((tool_use_id.as_str(), change)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changed.len(), 1, "{delivered:?}");
+        assert_eq!(changed[0].0, "tu-1");
+        assert_eq!(changed[0].1.fields["command"], rewritten["command"]);
+        let at = |pred: &dyn Fn(&AgentDomainEvent) -> bool| delivered.iter().position(|e| pred(e)).unwrap();
+        let started = at(&|e| matches!(e, AgentDomainEvent::ToolCallStarted { .. }));
+        let mark = at(&|e| matches!(e, AgentDomainEvent::ToolInputChanged { .. }));
+        assert!(started < mark, "the mark follows its call");
+        backend.shutdown();
+    }
+
+    #[test]
+    fn a_deferred_gate_request_still_lets_the_page_learn_of_the_changed_input() {
+        changed_input_delivery(
+            PermissionMode::Auto,
+            true,
+            "Bash",
+            serde_json::json!({ "command": "git push --force origin main" }),
+        );
+    }
+
+    #[test]
+    fn a_classifier_allowed_gate_request_still_lets_the_page_learn_of_the_changed_input() {
+        // A read-only command the classifier allows without a card, on a session whose CLI runs `default`.
+        changed_input_delivery(
+            PermissionMode::Auto,
+            false,
+            "Bash",
+            serde_json::json!({ "command": "ls" }),
+        );
+    }
+
+    #[test]
+    fn a_bypass_allowed_gate_request_still_lets_the_page_learn_of_the_changed_input() {
+        changed_input_delivery(
+            PermissionMode::Bypass,
+            true,
+            "Bash",
+            serde_json::json!({ "command": "git push --force origin main" }),
+        );
     }
 
     /// A saved prefix rule answers on an auto session exactly what it answers today, `allow`, with

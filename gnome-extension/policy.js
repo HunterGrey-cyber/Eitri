@@ -3,8 +3,13 @@
 //
 // The rule in one sentence: no method moves focus unless the user has just pressed a key or a button in the focused
 // window, and that window belongs to the caller (for the calls that move focus away from it) or to the partner the
-// caller named (for the calls that bring focus to the caller). A background application can therefore never take
-// focus at will: at most it can follow the user's own key within half a second.
+// caller named (for the calls that bring focus to the caller, which also need a Wayland window of the caller to have
+// held focus within the last half hour, `callerHeldFocus`). So an application whose window the user has not been in
+// for that long can never take focus: at most it can follow the user's own key within half a second. An application
+// the user was in recently can, because the user's key in the partner's window is all that is asked of the user;
+// and the memory is not a promise about the user's own visits: a focus the extension itself gave (an `ActivateOwn`
+// or `FocusSelfIfNeighbour` it granted) is a focus gain like any other and renews it, so a caller that wins focus
+// once in every half hour keeps the credit for good.
 
 import {isDirection, pickNeighbour} from './direction.js';
 
@@ -23,6 +28,19 @@ export const SETTLE_MS = 300;
 
 // The editor's process chain is short; the cap only bounds what one caller can make the shell store.
 export const MAX_PARTNER_PIDS = 64;
+
+// How long after a Wayland window of the caller last held focus the caller may still bring itself forward on the
+// partner's keystroke. The two calls that do that (ActivateOwn, FocusSelfIfNeighbour) name a partner the caller chose,
+// so without this a process that never had focus could name the window the user is typing in and take their next
+// keys; with it the caller must be an application the user has recently been in. The panel's own flows start from the
+// panel holding focus, and every call from its focused window refreshes the record. Cost: a panel the user has not
+// touched for this long must be clicked once before Ctrl+h/j/k/l from the editor reaches it.
+// What it does not do: the record is written for every focus gain, the extension's own activations included, so a
+// caller that is granted focus again before the memory runs out keeps its credit indefinitely; it limits an
+// application the user was never in, not one that has been in focus once in a while. The record is also lost whenever
+// the extension is disabled, which GNOME does at every screen lock: after an unlock Ctrl+h at the editor's edge and
+// the `:EitriPanel` raise are refused, silently, until the panel itself has been focused again (a click).
+export const CALLER_FOCUS_MEMORY_MS = 30 * 60 * 1000;
 
 export const METHODS = Object.freeze(['FocusDirection', 'FocusSelfIfNeighbour', 'ActivateOwn', 'ActivatePartner']);
 
@@ -135,6 +153,63 @@ export function partnerPid(chain, ownsWindow) {
     return null;
 }
 
+// Whether the caller held focus in a Wayland window of its own within CALLER_FOCUS_MEMORY_MS, on the extension's
+// monotonic clock (`callerFocusedAt64`: the last moment such a window had focus, or now while it has it). Anything
+// missing, in the future or older than the memory is no.
+export function callerHeldFocus({callerFocusedAt64, now64}) {
+    if (!isMonotonicMs(callerFocusedAt64) || !isMonotonicMs(now64) || callerFocusedAt64 > now64)
+        return false;
+    return now64 - callerFocusedAt64 <= CALLER_FOCUS_MEMORY_MS;
+}
+
+// The bookkeeping behind `callerFocusedAt64`, kept here as plain data so it can be tested outside GNOME Shell.
+// `held` is {records: Map<window id, {pid, at}>, last: window id | null}: per window, never per pid, so a process that
+// gets a closed application's pid number inherits nothing; `last` is the window that has focus right now, if it is one
+// that counts.
+
+// How many records may build up before the ones older than the memory are dropped. Windows that ever had focus are
+// few; this only bounds what a long-running session accumulates.
+export const FOCUS_RECORDS_TRIM_AT = 64;
+
+export function newHeldFocus() {
+    return {records: new Map(), last: null};
+}
+
+// Records a focus change at `now` (the extension's monotonic clock): the window that had focus held it up to now, and
+// `focus` (null when no window has it, else {id, pid, wayland}) holds it from now. A window that cannot count (an X11
+// window, whose pid is client-written, or one with no pid) is not recorded. Past FOCUS_RECORDS_TRIM_AT records, those
+// older than the memory go; the window that has focus now is stamped `now` and so is never among them.
+export function noteHeldFocus(held, focus, now) {
+    if (held.last !== null)
+        held.records.set(held.last, {...held.records.get(held.last), at: now});
+    held.last = null;
+    if (!focus || focus.wayland !== true || !isPid(focus.pid))
+        return;
+    held.records.set(focus.id, {pid: focus.pid, at: now});
+    held.last = focus.id;
+    if (held.records.size > FOCUS_RECORDS_TRIM_AT) {
+        for (const [id, record] of [...held.records]) {
+            if (now - record.at > CALLER_FOCUS_MEMORY_MS)
+                held.records.delete(id);
+        }
+    }
+}
+
+// The latest moment a window that exists now (`windows`, the snapshot's records), belongs to the caller's pid both in
+// the record and now, and is a Wayland window had focus; `now64` while it still has it. Undefined when there is none.
+export function callerFocusedAt(held, callerPid, windows, now64) {
+    let latest;
+    for (const w of windows) {
+        const record = held.records.get(w.id);
+        if (!record || record.pid !== callerPid || w.pid !== callerPid || w.wayland !== true)
+            continue;
+        const at = w.id === held.last ? now64 : record.at;
+        if (latest === undefined || at > latest)
+            latest = at;
+    }
+    return latest;
+}
+
 // Moving focus away from the caller's own window: the caller must be focused and the user must just have pressed a
 // key or button in it.
 export function mayFocusDirection({focusedPid, callerPid, freshInput}) {
@@ -219,8 +294,8 @@ const refuse = reason => ({act: false, reason});
 // and `modal` whether the shell holds a modal grab (the overview, a system dialog, the lock screen).
 // Returns {act: true, target: <window id>} or {act: false, reason}.
 export function decide({
-    method, direction, callerPid, partnerChain, focusedId, focusGained64, focusGainedByUs, focusGainedFrom, now64,
-    idleMs, modal, windows,
+    method, direction, callerPid, callerFocusedAt64, partnerChain, focusedId, focusGained64, focusGainedByUs,
+    focusGainedFrom, now64, idleMs, modal, windows,
 }) {
     if (!METHODS.includes(method))
         return refuse('unknown-method');
@@ -262,6 +337,9 @@ export function decide({
         return {act: true, target: mostRecentWindowOf(all, partner).id};
     }
 
+    // The caller chose its partner, so it must also be an application the user has been in lately.
+    if (!callerHeldFocus({callerFocusedAt64, now64}))
+        return refuse('caller-not-focused-lately');
     const partner = partnerPid(chainWithout(partnerChain, callerPid), pid => mostRecentWindowOf(all, pid) !== null);
     if (partner === null)
         return refuse('no-partner');

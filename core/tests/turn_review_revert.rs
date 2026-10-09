@@ -19,8 +19,9 @@ use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::nvim_rpc::{Answer, Pending};
 use eitri_core::turn_review::{
     replace, review_dir_for, AppliedRevert, Blocked, Busy, Content, EditorCheck, EditorClear, ExactHunks, FsHooks,
-    Journal, JournalEntry, JournalNote, Limits, Presence, PresenceGuard, ProjectDir, RecoverAnswer, Refusal,
-    RevertKind, RevertTarget, ReviewOptions, Saved, Scope, Shadow, Snap, Stage, TurnReview, BUFFER_STATE_LUA,
+    Journal, JournalEntry, JournalNote, Limits, Presence, PresenceGuard, ProjectDir, RecoverAnswer, Recovered, Refusal,
+    RevertKind, RevertTarget, ReviewOptions, Saved, Scope, Shadow, Snap, Stage, TurnReview, WriteError,
+    BUFFER_STATE_LUA,
 };
 use rmpv::Value;
 
@@ -255,7 +256,7 @@ impl World {
             .run()
     }
 
-    fn recover(&self, entry: &JournalEntry) -> Result<(), Refusal> {
+    fn recover(&self, entry: &JournalEntry) -> Result<Recovered, Refusal> {
         let rel = entry.path.to_str().unwrap();
         self.review
             .recover_job(self.guard(), &entry.id, RecoverAnswer::Restore(self.clear(rel)))
@@ -1312,7 +1313,7 @@ fn editor_check_refuses_with_no_link_modified_or_silence() {
 /// that is genuinely half written.
 const CRASH_NEW_LEN: usize = 200 * 1024;
 
-/// The child of the recovery tests: an in-place rewrite of a hard-linked file that dies after its
+/// The child of the recovery tests: an in-place rewrite of a file with an extended attribute that dies after its
 /// first chunk, as a crash of a window in the middle of a revert would.
 #[test]
 #[ignore = "run by the recovery tests"]
@@ -1359,14 +1360,28 @@ fn revert_crash_child() {
     unreachable!("the write was to abort");
 }
 
-/// Kills an in-place write of `rel` halfway (the file gets a second link outside the project, so
-/// it is rewritten in place) and returns the journal entry it left.
+/// Gives `path` a user extended attribute, which makes a write rewrite it in place.
+fn mark_for_in_place(path: &Path) {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let name = std::ffi::CString::new("user.eitri_test").unwrap();
+    #[cfg(target_vendor = "apple")]
+    // SAFETY: both strings are NUL-terminated; the value is 3 valid bytes.
+    let set = unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"yes".as_ptr().cast(), 3, 0, 0) };
+    #[cfg(not(target_vendor = "apple"))]
+    // SAFETY: both strings are NUL-terminated; the value is 3 valid bytes.
+    let set = unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"yes".as_ptr().cast(), 3, 0) };
+    assert_eq!(
+        set,
+        0,
+        "these tests need user extended attributes: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Kills an in-place write of `rel` halfway (the file gets an extended attribute, so it is
+/// rewritten in place) and returns the journal entry it left.
 fn crash_mid_write(w: &World, rel: &str) -> JournalEntry {
-    static LINKS: AtomicUsize = AtomicUsize::new(0);
-    let link = w
-        .dir()
-        .join(format!("second-link-{}", LINKS.fetch_add(1, Ordering::Relaxed)));
-    std::fs::hard_link(w.file(rel), link).unwrap();
+    mark_for_in_place(&w.file(rel));
     let original = w.read(rel);
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -1420,8 +1435,13 @@ fn recover_restores_and_keeps_the_current_bytes() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(offered, vec![entry.clone()]);
+    assert_eq!(
+        entry.intended_mode,
+        Some(0o644),
+        "the entry says which mode the write was to leave"
+    );
 
-    w.recover(&entry).unwrap();
+    assert_eq!(w.recover(&entry), Ok(Recovered::Restored));
     assert_eq!(w.read("a.txt"), original);
     assert_eq!(mode_of(&w.file("a.txt")), 0o640);
     assert!(w.pending().is_empty());
@@ -1540,4 +1560,115 @@ fn the_projects_git_is_never_written_by_revert_undo_or_recover() {
     assert_eq!(w.read("linked.txt"), b"linked\n");
 
     assert_eq!(git_state(&p), before);
+}
+
+// ---- hard links, and a restore of a write that finished ----------------------------------------------
+
+#[test]
+fn a_hard_linked_file_is_not_reverted_undone_or_recovered() {
+    let mut w = World::new("hardlinked");
+    let end = b"end\n".to_vec();
+    w.write("a.txt", b"base\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", &end, 0o644));
+    // A second name for the same bytes, as the other user of a file outside the project would hold.
+    let outside = w.dir().join("outside-link");
+    std::fs::hard_link(w.file("a.txt"), &outside).unwrap();
+
+    let refused = w.revert_file(n, "a.txt").unwrap_err();
+    assert_eq!(refused, Refusal::Write(WriteError::HardLinked { links: 2 }));
+    assert!(refused.to_string().contains("2 hard links"), "{refused}");
+    assert_eq!(w.read("a.txt"), end);
+    assert_eq!(std::fs::read(&outside).unwrap(), end, "the other link is untouched");
+    assert!(w.pending().is_empty(), "nothing was journalled");
+
+    // The same file after the link is gone reverts, and a link made afterwards refuses the undo.
+    std::fs::remove_file(&outside).unwrap();
+    let applied = w.revert_file(n, "a.txt").unwrap();
+    assert_eq!(w.read("a.txt"), b"base\n");
+    std::fs::hard_link(w.file("a.txt"), &outside).unwrap();
+    assert_eq!(
+        w.undo(&applied).unwrap_err(),
+        Refusal::Write(WriteError::HardLinked { links: 2 })
+    );
+    assert_eq!(w.read("a.txt"), b"base\n");
+    assert_eq!(std::fs::read(&outside).unwrap(), b"base\n");
+}
+
+#[test]
+fn a_recovery_of_a_hard_linked_file_writes_nothing() {
+    let w = World::new("recover-hardlink");
+    w.write("a.txt", b"the original\n", 0o644);
+    let entry = crash_mid_write(&w, "a.txt");
+    let outside = w.dir().join("outside-link");
+    std::fs::hard_link(w.file("a.txt"), &outside).unwrap();
+    let half = w.read("a.txt");
+    assert_eq!(
+        w.recover(&entry).unwrap_err(),
+        Refusal::Write(WriteError::HardLinked { links: 2 })
+    );
+    assert_eq!(w.read("a.txt"), half);
+    assert_eq!(std::fs::read(&outside).unwrap(), half);
+    // Asked until it shows: a lock another test's child shares for a moment hides it from one read.
+    assert_eq!(w.pending_of(1).len(), 1, "the entry stays for a decision");
+}
+
+#[test]
+fn an_entry_whose_write_finished_is_dropped_not_restored() {
+    let w = World::new("recover-finished");
+    w.write("a.txt", b"the original\n", 0o644);
+    let entry = crash_mid_write(&w, "a.txt");
+    // The write had in fact been completed (only its journal entry was left behind).
+    let intended = noise(CRASH_NEW_LEN, 3);
+    w.write("a.txt", &intended, 0o644);
+    assert_eq!(
+        w.recover(&entry),
+        Ok(Recovered::AlreadyWritten),
+        "told apart from a restore"
+    );
+    assert_eq!(w.read("a.txt"), intended, "the good write is not undone");
+    assert!(w.pending().is_empty());
+    assert!(w.refs("refs/eitri-journal/").is_empty(), "no pin is left");
+    assert!(
+        w.refs("refs/eitri-revert/").is_empty(),
+        "nothing was restored, so nothing was anchored"
+    );
+}
+
+#[test]
+fn intended_bytes_with_the_wrong_mode_are_restored_not_dropped() {
+    let w = World::new("recover-wrong-mode");
+    w.write("a.txt", b"the original\n", 0o644);
+    let entry = crash_mid_write(&w, "a.txt");
+    // The last byte landed but the mode was never set: a write killed just before its `fchmod`.
+    let intended = noise(CRASH_NEW_LEN, 3);
+    w.write("a.txt", &intended, 0o600);
+    assert_eq!(entry.intended_mode, Some(0o644));
+    assert_eq!(w.recover(&entry), Ok(Recovered::Restored));
+    assert_eq!(w.read("a.txt"), b"the original\n");
+    assert_eq!(mode_of(&w.file("a.txt")), 0o644);
+    assert!(w.pending().is_empty());
+}
+
+#[test]
+fn an_older_entry_without_its_intended_mode_is_never_taken_for_finished() {
+    let w = World::new("recover-old-entry");
+    w.write("a.txt", b"the original\n", 0o644);
+    let entry = crash_mid_write(&w, "a.txt");
+    // The entry as a build that did not record the intended mode wrote it.
+    let file = w.review_dir.join("journal").join(format!("{}.json", entry.id));
+    let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert!(json.as_object_mut().unwrap().remove("intended_mode").is_some());
+    std::fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+    let entry = w
+        .pending_of(1)
+        .into_iter()
+        .find(|e| e.id == entry.id)
+        .expect("an older entry is still offered");
+    assert_eq!(entry.intended_mode, None);
+    // Even holding exactly the intended bytes, the file is restored: whether its mode is right is
+    // not known.
+    w.write("a.txt", &noise(CRASH_NEW_LEN, 3), 0o644);
+    assert_eq!(w.recover(&entry), Ok(Recovered::Restored));
+    assert_eq!(w.read("a.txt"), b"the original\n");
+    assert!(w.pending().is_empty());
 }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
     FRESH_INPUT_MS, MAX_PARTNER_PIDS, METHODS, cleanPartnerList, decide, isFreshInput, mayActOnPartnerInput,
-    mayFocusDirection, partnerPid, MAX_FOCUS_AGE_MS, SETTLE_MS} from '../policy.js';
+    mayFocusDirection, partnerPid, MAX_FOCUS_AGE_MS, SETTLE_MS, CALLER_FOCUS_MEMORY_MS} from '../policy.js';
 
 // Times are milliseconds. `now64` and `focusGained64` are on the extension's own 64-bit monotonic clock;
 // `userTime` is mutter's 32-bit timestamp, the same clock cut to its low 32 bits.
@@ -176,7 +176,7 @@ function scene(overrides = {}) {
         Object.assign(windows.find(w => w.id === Number(id)), patch);
     return {
         method: 'FocusDirection', direction: 'left', callerPid: 100, partnerChain: [200], focusedId: 1,
-        focusGained64: NOW - 10_000, focusGainedByUs: false, now64: NOW, idleMs: 0, modal: false,
+        callerFocusedAt64: NOW - 1_000, focusGained64: NOW - 10_000, focusGainedByUs: false, now64: NOW, idleMs: 0, modal: false,
         windows: [...windows, ...(overrides.extra ?? [])],
         ...overrides.call,
     };
@@ -314,6 +314,22 @@ test('decide ActivateOwn: refused without a partner, a focused partner, fresh in
     assert.equal(decide(scene({patch: pressed(2), call: {...call, callerPid: 101}})).reason, 'no-own-window');
 });
 
+test('decide ActivateOwn / FocusSelfIfNeighbour: a caller that never held focus lately is refused', () => {
+    // A caller that names the window the user is typing in as its partner must not follow that user's key unless
+    // the user has been in the caller's own window lately.
+    for (const call of [{method: 'ActivateOwn', focusedId: 2}, {method: 'FocusSelfIfNeighbour', direction: 'right', focusedId: 2}]) {
+        assert.deepEqual(decide(scene({patch: pressed(2), call})).act, true, `${call.method} with a recent focus`);
+        for (const callerFocusedAt64 of [undefined, null, 0, -5, NOW + 1, NOW - CALLER_FOCUS_MEMORY_MS - 1, 1.5, '5']) {
+            assert.equal(decide(scene({patch: pressed(2), call: {...call, callerFocusedAt64}})).reason,
+                'caller-not-focused-lately', `${call.method}, ${String(callerFocusedAt64)}`);
+        }
+        assert.equal(decide(scene({patch: pressed(2), call: {...call, callerFocusedAt64: NOW - CALLER_FOCUS_MEMORY_MS}})).act,
+            true, 'exactly at the memory');
+    }
+    // The calls that start from the caller's own focused window do not need the record.
+    assert.equal(decide(scene({patch: pressed(1), call: {callerFocusedAt64: undefined}})).act, true);
+});
+
 // The shell's own activation sets the activated window's user time to the activation's timestamp; the extension
 // records that same timestamp as the window's focus gain.
 function afterActivation(windows, id, t) {
@@ -431,11 +447,11 @@ test('decide: a focus gain recorded after now refuses, one from weeks ago does n
     assert.equal(decide(scene({patch: pressed(2), call: {...call, focusGained64: NOW + 60_001}})).reason,
         'no-fresh-input');
     const now64 = 50 * DAY + 777;
-    const longFocus = {...call, now64, focusGained64: now64 - 49 * DAY};
+    const longFocus = {...call, now64, callerFocusedAt64: now64 - 1_000, focusGained64: now64 - 49 * DAY};
     assert.deepEqual(decide(scene({patch: {2: {userTime: (now64 - 100) % TOP}}, call: longFocus})),
         {act: true, target: 1});
     // Past one period of the 32-bit clock nothing counts until the window is focused again.
-    const tooLong = {...call, now64, focusGained64: now64 - 50 * DAY + 1};
+    const tooLong = {...call, now64, callerFocusedAt64: now64 - 1_000, focusGained64: now64 - 50 * DAY + 1};
     assert.equal(decide(scene({patch: {2: {userTime: (now64 - 100) % TOP}}, call: tooLong})).reason, 'no-fresh-input');
 });
 

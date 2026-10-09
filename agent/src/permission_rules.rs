@@ -13,7 +13,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::permission_policy::{classify_permission_request, REPLACEABLE_BY_A_RULE};
+use crate::permission_policy::{bash_input_is_only_a_command, classify_permission_request, REPLACEABLE_BY_A_RULE};
 
 /// One `Bash(<words> *)` rule. `words` is never empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,17 +29,30 @@ impl PrefixRule {
     /// `timeout 5 *`, or an assignment such as `LC_ALL=C *`) is `None` too, even though the syntax is fine: it would allow whatever program
     /// follows, so the card never offers one, and a hand-edited rules file must not add one either.
     pub fn parse(text: &str) -> Option<Self> {
-        let inner = text.trim().strip_prefix("Bash(")?.strip_suffix(')')?;
-        let inner = inner.trim_end();
-        let body = inner.strip_suffix(" *")?;
+        Self::parse_or_refusal(text).ok()
+    }
+
+    /// [`Self::parse`], saying why a text is not a rule, so the rules file's reader can log the
+    /// reason that applies rather than one that fits only some of them.
+    pub fn parse_or_refusal(text: &str) -> Result<Self, RuleRefusal> {
+        let body = text
+            .trim()
+            .strip_prefix("Bash(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .map(str::trim_end)
+            .and_then(|inner| inner.strip_suffix(" *"))
+            .ok_or(RuleRefusal::NotAPrefixRule)?;
         let words: Vec<String> = ascii_words(body).map(str::to_string).collect();
-        if words.is_empty() || words.iter().any(|w| w.contains('*') || !is_ascii_graphic_word(w)) {
-            return None;
+        if words.is_empty() || words.iter().any(|w| w.contains('*')) {
+            return Err(RuleRefusal::NotAPrefixRule);
+        }
+        if words.iter().any(|w| !is_ascii_graphic_word(w)) {
+            return Err(RuleRefusal::NotPrintableAscii);
         }
         if runs_another_program(&words[0]) {
-            return None;
+            return Err(RuleRefusal::RunsAnotherProgram);
         }
-        Some(PrefixRule { words })
+        Ok(PrefixRule { words })
     }
 
     pub fn to_rule_string(&self) -> String {
@@ -56,9 +69,44 @@ impl PrefixRule {
     }
 
     /// Whole leading words, never a character prefix: `cargo test *` is not `cargo testx`.
+    ///
+    /// A command holding a newline or a carriage return matches nothing: to the shell a newline
+    /// ends one command and starts the next, so `git status<LF>rm -rf ~` would otherwise match
+    /// `git status *` and run a second program the rule never named.
     pub fn matches_command(&self, command: &str) -> bool {
+        if command.contains(['\n', '\r']) {
+            return false;
+        }
         let mut words = ascii_words(command);
         self.words.iter().all(|w| words.next() == Some(w.as_str()))
+    }
+}
+
+/// Why a text is not a rule ([`PrefixRule::parse_or_refusal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleRefusal {
+    /// Not `Bash(<words> *)`: another tool, the exact form, no words, or a `*` anywhere but last.
+    NotAPrefixRule,
+    /// A word holding anything but printable ASCII (a non-ASCII letter or space, a control
+    /// character), so the words shown are not certainly the words the shell runs.
+    NotPrintableAscii,
+    /// The first word runs another program (`env`, `sh`, `timeout`, an assignment such as
+    /// `LC_ALL=C`), so the rule would allow whatever program follows.
+    RunsAnotherProgram,
+}
+
+impl RuleRefusal {
+    /// One line for a log, naming why the text was refused.
+    pub fn describe(self) -> &'static str {
+        match self {
+            RuleRefusal::NotAPrefixRule => "not a Bash(<words> *) prefix rule",
+            RuleRefusal::NotPrintableAscii => {
+                "a word holds a character other than printable ASCII, so the rule may not name the command that runs"
+            }
+            RuleRefusal::RunsAnotherProgram => {
+                "its first word runs another program (env, sh, timeout, an assignment...), so it would allow any program"
+            }
+        }
     }
 }
 
@@ -92,8 +140,12 @@ impl PrefixRules {
 
     /// The first rule [`Self::matches`] would match on, so a transcript row can name the rule that
     /// answered it rather than only stderr saying "a prefix rule".
+    ///
+    /// A call carrying more than its command (`dangerouslyDisableSandbox: true`, an unknown key)
+    /// matches no rule: the rule was approved for the command's words, not for whatever else the
+    /// call asks for.
     pub fn matching_rule(&self, tool_name: &str, input: &Value) -> Option<&PrefixRule> {
-        if tool_name != "Bash" {
+        if tool_name != "Bash" || !bash_input_is_only_a_command(input) {
             return None;
         }
         let Some(Value::String(command)) = input.get("command") else {
@@ -123,12 +175,15 @@ fn runs_another_program(first: &str) -> bool {
     first.contains('=') || WRAPPERS.contains(&first.rsplit('/').next().unwrap_or(first))
 }
 
-/// The words of a command as the shell splits them: at space, tab and newline only (its default
-/// `IFS`). A no-break or other Unicode space, a carriage return or a form feed belongs to the word
-/// it sits in (the shell runs `git<NBSP>status` as one program that does not exist), so a rule
-/// built or matched over a wider split would name a different command than the one that runs.
+/// The words of one simple command as the shell splits them: at space and tab only. A newline is
+/// not a word break to the shell but the end of the command, so it is never split at here: a rule
+/// holding one is refused as not printable ASCII, a suggestion is never made from a command holding
+/// one, and [`PrefixRule::matches_command`] refuses such a command outright. A no-break or other
+/// Unicode space, a carriage return or a form feed belongs to the word it sits in (the shell runs
+/// `git<NBSP>status` as one program that does not exist), so a rule built or matched over a wider
+/// split would name a different command than the one that runs.
 fn ascii_words(text: &str) -> impl Iterator<Item = &str> {
-    text.split([' ', '\t', '\n']).filter(|w| !w.is_empty())
+    text.split([' ', '\t']).filter(|w| !w.is_empty())
 }
 
 /// A word a rule may name: printable ASCII only, so what the card shows is what the rule means.
@@ -151,6 +206,10 @@ fn is_bare_word(word: &str) -> bool {
 /// `git -C sub log` must not suggest `git *`, which would also allow `git push --force`.
 /// With no bare words after the options, the first word alone is still offered.
 pub fn suggest(command: &str) -> Option<PrefixRule> {
+    // A newline starts another command, which a rule built from the first would then not name.
+    if command.contains(['\n', '\r']) {
+        return None;
+    }
     let words: Vec<&str> = ascii_words(command).collect();
     let first = *words.first()?;
     if runs_another_program(first) || !is_ascii_graphic_word(first) {
@@ -204,6 +263,51 @@ mod tests {
         assert!(!rule.matches_command("git\u{c}status foo"));
         assert!(rule.matches_command("git \t status foo"));
         assert_eq!(suggest("git status foo").unwrap().display(), "git status *");
+    }
+
+    /// To the shell a newline ends one command and starts another, so a command holding one is
+    /// never matched by a rule over its first line, nor makes a suggestion, and a rule holding one
+    /// is not a rule. Before, words were split at a newline as if it were a blank, and
+    /// `git status<LF>rm -rf ~` matched `git status *`.
+    #[test]
+    fn a_newline_ends_the_command_and_no_rule_matches_across_it() {
+        let rule = PrefixRule::parse("Bash(git status *)").unwrap();
+        assert!(!rule.matches_command("git status\nrm -rf ~"));
+        assert!(!rule.matches_command("git status\n"));
+        assert!(!rule.matches_command("git\nstatus"));
+        assert!(!rule.matches_command("git status\r\nrm -rf ~"));
+        assert!(!rule.matches_command("git status --short\r"));
+        assert!(rule.matches_command("git status --short"));
+        let rules = PrefixRules::new(vec![rule]);
+        assert_eq!(
+            rules.matching_rule("Bash", &json!({ "command": "git status\nrm -rf ~" })),
+            None
+        );
+        assert_eq!(suggest("git status\nrm -rf ~"), None);
+        assert_eq!(suggest("make\n"), None);
+        assert_eq!(
+            PrefixRule::parse_or_refusal("Bash(git\nstatus *)"),
+            Err(RuleRefusal::NotPrintableAscii)
+        );
+    }
+
+    /// Each refusal says which rule of the format it broke, so the rules file's log names the
+    /// right reason.
+    #[test]
+    fn a_refused_rule_says_why() {
+        for (text, why) in [
+            ("Read(src/*)", RuleRefusal::NotAPrefixRule),
+            ("Bash(git log)", RuleRefusal::NotAPrefixRule),
+            ("Bash(git * log *)", RuleRefusal::NotAPrefixRule),
+            ("Bash(git st\u{e4}tus *)", RuleRefusal::NotPrintableAscii),
+            ("Bash(git\u{a0}status *)", RuleRefusal::NotPrintableAscii),
+            ("Bash(env *)", RuleRefusal::RunsAnotherProgram),
+            ("Bash(LC_ALL=C rm *)", RuleRefusal::RunsAnotherProgram),
+        ] {
+            assert_eq!(PrefixRule::parse_or_refusal(text), Err(why), "{text:?}");
+            assert_eq!(PrefixRule::parse(text), None, "{text:?}");
+        }
+        assert!(PrefixRule::parse_or_refusal("Bash(git log *)").is_ok());
     }
 
     #[test]

@@ -25,7 +25,12 @@ export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPrev
   const diff = preview.diff !== null && maxLines !== undefined && preview.diff.length > maxLines ? preview.diff.slice(0, maxLines) : preview.diff;
   const pathPieces = revealHidden(shownPath);
   const linePieces = diff?.map((line) => revealHidden(line.text)) ?? [];
-  const hidden = countEscapes(pathPieces) + linePieces.reduce((sum, pieces) => sum + countEscapes(pieces), 0);
+  // The note can carry the call's own text (a `NotebookEdit` delete names its `cell_id`).
+  const notePieces = preview.wholeFileNote === undefined ? null : revealHidden(preview.wholeFileNote);
+  const hidden =
+    countEscapes(pathPieces) +
+    linePieces.reduce((sum, pieces) => sum + countEscapes(pieces), 0) +
+    (notePieces === null ? 0 : countEscapes(notePieces));
   return (
     <div className="permission-card-edit">
       <div className="permission-card-edit-head">
@@ -54,7 +59,7 @@ export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPrev
              when file-existence information is absent too. `preview.wholeFileNote` overrides it for
              content such as a NotebookEdit cell; undefined keeps the Write wording. */
           <div className="permission-card-edit-note">
-            {preview.wholeFileNote ?? "Writes the whole file. The request does not say what is there now."}
+            {notePieces !== null ? <Revealed pieces={notePieces} /> : "Writes the whole file. The request does not say what is there now."}
           </div>
         ))}
       {preview.replaceAll && (

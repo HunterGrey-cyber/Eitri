@@ -34,19 +34,49 @@ pub fn path(dir: &Path, project_root: &Path) -> PathBuf {
     dir.join(file_name(project_root))
 }
 
+/// One line of a rules file as read: a rule, or a text the loader refused, kept verbatim so that
+/// rewriting the file never deletes what the user wrote.
+enum Line {
+    Rule(PrefixRule),
+    Refused(String),
+}
+
+/// What [`read`] found: the lines of a usable file, or why it is not one.
+enum Read {
+    Lines(Vec<Line>),
+    Missing,
+    Unusable(String),
+}
+
 pub fn load(dir: &Path, project_root: &Path) -> LoadedRules {
+    match read(dir, project_root) {
+        Read::Lines(lines) => LoadedRules::Rules(PrefixRules::new(
+            lines
+                .into_iter()
+                .filter_map(|line| match line {
+                    Line::Rule(rule) => Some(rule),
+                    Line::Refused(_) => None,
+                })
+                .collect(),
+        )),
+        Read::Missing => LoadedRules::Missing,
+        Read::Unusable(why) => LoadedRules::Unusable(why),
+    }
+}
+
+fn read(dir: &Path, project_root: &Path) -> Read {
     let file = path(dir, project_root);
     let text = match agent::private_fs::read_private_to_string(&file) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadedRules::Missing,
-        Err(e) => return LoadedRules::Unusable(format!("{}: {e}", file.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Read::Missing,
+        Err(e) => return Read::Unusable(format!("{}: {e}", file.display())),
     };
     let parsed: RulesFile = match serde_json::from_str(&text) {
         Ok(parsed) => parsed,
-        Err(e) => return LoadedRules::Unusable(format!("{}: not a rules file ({e})", file.display())),
+        Err(e) => return Read::Unusable(format!("{}: not a rules file ({e})", file.display())),
     };
     if parsed.version != VERSION {
-        return LoadedRules::Unusable(format!(
+        return Read::Unusable(format!(
             "{}: version {} (this build reads {VERSION})",
             file.display(),
             parsed.version
@@ -54,44 +84,67 @@ pub fn load(dir: &Path, project_root: &Path) -> LoadedRules {
     }
     let root = project_root.to_string_lossy();
     if parsed.project_root != root {
-        return LoadedRules::Unusable(format!(
+        return Read::Unusable(format!(
             "{}: written for {}, not {root}",
             file.display(),
             parsed.project_root
         ));
     }
-    let mut rules = Vec::new();
-    for text in parsed.rules {
-        match PrefixRule::parse(&text) {
-            Some(rule) => rules.push(rule),
-            None => eprintln!(
-                "[permissions] {}: not a Bash(<words> *) rule a card could offer (a rule over env, sh, timeout... allows any program), skipped: {text:?}",
-                file.display()
-            ),
-        }
-    }
-    LoadedRules::Rules(PrefixRules::new(rules))
+    let lines = parsed
+        .rules
+        .into_iter()
+        .map(|text| match PrefixRule::parse_or_refusal(&text) {
+            Ok(rule) => Line::Rule(rule),
+            Err(why) => {
+                eprintln!(
+                    "[permissions] {}: {}; not applied, and kept in the file as written: {text:?}",
+                    file.display(),
+                    why.describe()
+                );
+                Line::Refused(text)
+            }
+        })
+        .collect();
+    Read::Lines(lines)
 }
 
 /// Adds `rule` (read-modify-write, atomic) and returns the project's rules after it. An unusable
-/// file is set aside first, so the new rule is not lost behind it.
+/// file is set aside first, so the new rule is not lost behind it. A line the loader refused is
+/// written back exactly as it was, in its place: it applies to nothing, but it is the user's text,
+/// and a later build, or the user fixing it by hand, may still want it.
 pub fn add(dir: &Path, project_root: &Path, rule: &PrefixRule) -> std::io::Result<PrefixRules> {
     crate::layout::persist::create_state_dir(dir)?;
-    let current = match load(dir, project_root) {
-        LoadedRules::Rules(rules) => rules,
-        LoadedRules::Missing => PrefixRules::default(),
-        LoadedRules::Unusable(why) => {
+    let lines = match read(dir, project_root) {
+        Read::Lines(lines) => lines,
+        Read::Missing => Vec::new(),
+        Read::Unusable(why) => {
             eprintln!("[permissions] {why}; setting it aside");
             set_aside(dir, project_root)?;
-            PrefixRules::default()
+            Vec::new()
         }
     };
-    let rules = current.with(rule.clone());
+    let mut rules = PrefixRules::default();
+    let mut texts = Vec::new();
+    for line in lines {
+        match line {
+            Line::Rule(kept) => {
+                if !rules.rules().contains(&kept) {
+                    texts.push(kept.to_rule_string());
+                    rules = rules.with(kept);
+                }
+            }
+            Line::Refused(text) => texts.push(text),
+        }
+    }
+    if !rules.rules().contains(rule) {
+        texts.push(rule.to_rule_string());
+        rules = rules.with(rule.clone());
+    }
     let file = path(dir, project_root);
     let body = RulesFile {
         version: VERSION,
         project_root: project_root.to_string_lossy().into_owned(),
-        rules: rules.rules().iter().map(PrefixRule::to_rule_string).collect(),
+        rules: texts,
     };
     let tmp = temporary(&file);
     let text = serde_json::to_string_pretty(&body).expect("a rules file always serializes");
@@ -244,6 +297,46 @@ mod tests {
             rules.rules().iter().map(|r| r.to_rule_string()).collect::<Vec<_>>(),
             vec!["Bash(git log *)"]
         );
+    }
+
+    /// A line the loader refused is not applied, but saving another rule keeps it, verbatim and in
+    /// its place: the file is the user's, and a rule they wrote must never vanish because a build
+    /// would not read it. Before, the next save rewrote the file from the parsed rules alone.
+    #[test]
+    fn saving_a_rule_keeps_the_lines_the_loader_refused() {
+        let dir = scratch("keep-refused");
+        let root = root();
+        std::fs::write(
+            path(&dir, &root),
+            format!(
+                "{{\"version\":1,\"project_root\":{:?},\"rules\":[\"Bash(git st\\u00e4tus *)\",\"Bash(npm ci *)\",\"Bash(env *)\",\"Read(*)\",\"Bash(npm ci *)\"]}}",
+                root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let rules = add(&dir, &root, &rule("Bash(cargo test *)")).unwrap();
+        assert_eq!(
+            rules.rules().iter().map(|r| r.to_rule_string()).collect::<Vec<_>>(),
+            vec!["Bash(npm ci *)", "Bash(cargo test *)"]
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path(&dir, &root)).unwrap()).unwrap();
+        assert_eq!(
+            written["rules"],
+            serde_json::json!([
+                "Bash(git st\u{e4}tus *)",
+                "Bash(npm ci *)",
+                "Bash(env *)",
+                "Read(*)",
+                "Bash(cargo test *)"
+            ])
+        );
+        // Saving one already there adds nothing and still keeps every refused line.
+        add(&dir, &root, &rule("Bash(npm ci *)")).unwrap();
+        let again: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path(&dir, &root)).unwrap()).unwrap();
+        assert_eq!(again["rules"], written["rules"]);
+        assert_eq!(load(&dir, &root), LoadedRules::Rules(rules));
     }
 
     #[test]

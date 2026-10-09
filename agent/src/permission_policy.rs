@@ -70,6 +70,9 @@
 //! is unavailable here. Unknown tool names also require a card.
 //! Malformed tool input requires a card, including a non-object input, a missing path or a
 //! `command` value that is not a string.
+//! A `Bash` call with `dangerouslyDisableSandbox` other than `false`, `allowed_domains` or any
+//! key outside [`BASH_KEYS_THAT_CHANGE_NOTHING`] requires a card, and no saved rule answers it
+//! ([`REASON_BASH_INPUT_BEYOND_THE_COMMAND`]). A command prefix rule cannot authorize extra input.
 //!
 //! Keep this policy separate from `crate::CONSERVATIVE_DISALLOWED_TOOLS`.
 //! That array forbids tools in Bypass mode and is mirrored as `CONSERVATIVE_BYPASS_DENY`.
@@ -240,6 +243,35 @@ pub const REASON_GIT_GLOBAL_OPTION: &str =
 pub const REASON_TOO_MUCH_WORK: &str =
     "checking this call would need more of the disk read than this policy reads (too many files, links or includes)";
 
+/// A `Bash` call with a top-level key beyond [`BASH_KEYS_THAT_CHANGE_NOTHING`], or a
+/// `dangerouslyDisableSandbox` that is anything but `false`. Not in [`REPLACEABLE_BY_A_RULE`]: a
+/// saved rule names the leading words of the command and nothing else, so a call that also asks to
+/// leave the sandbox, reach a host or do something this policy has never seen is not one the rule
+/// was approved for.
+pub const REASON_BASH_INPUT_BEYOND_THE_COMMAND: &str =
+    "this Bash call asks for more than its command (leaving the sandbox, or a key this policy does not know)";
+
+/// The top-level keys of a `Bash` call that change nothing about what the command may reach: the
+/// command itself, its label, how long it may run, and whether it runs in the background. Kept to
+/// what the CLI's own Bash schema names and this policy knows to be harmless; a new key the CLI
+/// adds is unknown here, and an unknown key cards.
+pub const BASH_KEYS_THAT_CHANGE_NOTHING: &[&str] = &["command", "description", "timeout", "run_in_background"];
+
+/// Whether a `Bash` call's input carries nothing beyond [`BASH_KEYS_THAT_CHANGE_NOTHING`], with a
+/// `dangerouslyDisableSandbox` of exactly `false` the one other key allowed (it asks for nothing).
+/// Any other value of it -- `true`, `"true"`, `1`, `null` -- counts as asking, since the CLI may
+/// read a string or a number as a boolean and this policy will not guess which. Input that is not
+/// an object is not "only a command" either.
+pub fn bash_input_is_only_a_command(input: &Value) -> bool {
+    let Some(fields) = input.as_object() else {
+        return false;
+    };
+    fields.iter().all(|(key, value)| {
+        BASH_KEYS_THAT_CHANGE_NOTHING.contains(&key.as_str())
+            || (key == "dangerouslyDisableSandbox" && *value == Value::Bool(false))
+    })
+}
+
 /// Characters that stop command analysis and send the call to a permission card.
 ///
 /// A command containing shell syntax cannot be judged from its first word alone. Redirects, pipes,
@@ -348,7 +380,10 @@ pub fn classify_with_rules(
 /// The rule [`classify_with_rules`] would answer this call with, in Claude Code's own syntax
 /// (`Bash(git log *)`), or `None` when the call is not one a rule answers -- the same condition,
 /// so the two can never disagree. What a transcript row names when a saved rule, not the user,
-/// allowed a call.
+/// allowed a call. A call carrying more than its command is never one a rule
+/// answers ([`bash_input_is_only_a_command`], checked by `matching_rule` and by the classifier's
+/// reason both), so where this is the only way to an allow -- an Auto tab whose CLI runs its own
+/// auto mode -- such a call is deferred to the CLI's classifier, not allowed.
 pub fn rule_that_allows(
     tool_name: &str,
     input: &Value,
@@ -970,6 +1005,12 @@ fn fold_confusables(segment: &str) -> String {
 /// Words split only at [`SHELL_BLANKS`]. Other whitespace and control characters require cards
 /// so the policy and shell cannot disagree about which path a word names.
 fn classify_bash(input: &Value, root: &Path, surroundings: &Surroundings) -> Classification {
+    // First, before the command is read at all: whatever the command is, a call that also asks to
+    // leave the sandbox (or for something unknown) is decided by a person, and the reason is one a
+    // saved rule cannot replace.
+    if !bash_input_is_only_a_command(input) {
+        return ask(REASON_BASH_INPUT_BEYOND_THE_COMMAND);
+    }
     let Some(Value::String(command)) = input.get("command") else {
         return ask("this Bash call has no string `command`");
     };
@@ -4393,7 +4434,7 @@ mod tests {
     #[test]
     fn the_commands_the_real_cli_allowed_need_no_human_here_either() {
         let ws = Workspace::new();
-        for command in ["ls", "cat a.txt", "git status --short"] {
+        for command in ["ls", "cat src/main.rs", "git status --short"] {
             assert_eq!(
                 bash(command, ws.path()),
                 PermissionVerdict::AllowWithoutAsking,
@@ -4891,6 +4932,95 @@ mod tests {
         assert!(
             classify_with_rules("WebFetch", &json!({ "url": "https://example.com" }), ws.path(), &all).needs_a_human()
         );
+    }
+
+    /// A Bash call that asks for more than its command cards whatever the command, and neither a
+    /// saved rule over that command nor the read-only list answers it: the rule was approved for the
+    /// command's words, not for leaving the sandbox. Before this check, `npm test` with
+    /// `dangerouslyDisableSandbox: true` was allowed by a saved `npm test *` and `ls` with it by the
+    /// read-only list, both with no card.
+    #[test]
+    fn a_bash_call_asking_for_more_than_its_command_cards_and_no_rule_answers_it() {
+        let ws = Workspace::new();
+        let extras = [
+            json!({ "dangerouslyDisableSandbox": true }),
+            json!({ "dangerouslyDisableSandbox": "true" }),
+            json!({ "dangerouslyDisableSandbox": 1 }),
+            json!({ "dangerouslyDisableSandbox": null }),
+            json!({ "allowed_domains": ["example.com"] }),
+            json!({ "_simulatedSedEdit": { "filePath": "a.txt", "newContent": "x" } }),
+            json!({ "someKeyNoOneKnows": false }),
+            json!({ "description": "list", "timeout": 5000, "dangerouslyDisableSandbox": true }),
+        ];
+        // Read-only commands the classifier allows on their own, and commands a saved rule allows.
+        for command in [
+            "ls",
+            "cat src/main.rs",
+            "git status --short",
+            "npm test",
+            "rm b.txt",
+            "git push",
+        ] {
+            for extra in &extras {
+                let mut input = extra.clone();
+                input["command"] = json!(command);
+                let plain = classify_permission_request("Bash", &input, ws.path());
+                assert_eq!(plain.verdict, PermissionVerdict::AskTheUser, "`{command}` with {extra}");
+                assert_eq!(
+                    plain.reason, REASON_BASH_INPUT_BEYOND_THE_COMMAND,
+                    "`{command}` with {extra}"
+                );
+                assert!(!REPLACEABLE_BY_A_RULE.contains(&plain.reason));
+                assert_eq!(
+                    classify_with_rules("Bash", &input, ws.path(), &rules_for(command)),
+                    plain,
+                    "a rule answered `{command}` with {extra}"
+                );
+                assert_eq!(
+                    rule_that_allows("Bash", &input, ws.path(), &rules_for(command)),
+                    None,
+                    "a row would name a rule for `{command}` with {extra}"
+                );
+                assert_eq!(rules_for(command).matching_rule("Bash", &input), None);
+                assert_eq!(crate::permission_rules::offer("Bash", &input, ws.path()), None);
+            }
+        }
+    }
+
+    /// The positive control: the keys that change nothing about what a command reaches, and a
+    /// `dangerouslyDisableSandbox` of exactly `false`, leave every verdict as the command alone gets.
+    #[test]
+    fn the_keys_that_change_nothing_leave_the_verdict_alone() {
+        let ws = Workspace::new();
+        let harmless = json!({
+            "description": "a label",
+            "timeout": 120000,
+            "run_in_background": true,
+            "dangerouslyDisableSandbox": false,
+        });
+        for command in ["ls", "cat src/main.rs", "git status --short"] {
+            let mut input = harmless.clone();
+            input["command"] = json!(command);
+            assert_eq!(
+                classify_permission_request("Bash", &input, ws.path()).verdict,
+                PermissionVerdict::AllowWithoutAsking,
+                "`{command}`"
+            );
+        }
+        for command in ["npm test", "rm b.txt", "git push"] {
+            let mut input = harmless.clone();
+            input["command"] = json!(command);
+            let first = command.split_whitespace().next().unwrap();
+            assert_eq!(
+                rule_that_allows("Bash", &input, ws.path(), &rules_for(command)),
+                Some(format!("Bash({first} *)")),
+                "`{command}`"
+            );
+            assert!(
+                crate::permission_rules::offer("Bash", &input, ws.path()).is_some(),
+                "`{command}`"
+            );
+        }
     }
 
     /// Only the offer the card may show: a rule for a command it would allow, none for one it would

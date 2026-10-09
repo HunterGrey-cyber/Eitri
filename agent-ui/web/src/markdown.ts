@@ -259,8 +259,11 @@ const SANITIZE_CONFIG = {
   ],
   /* DOMPurify's own default pattern with the schemes narrowed to what a reply may link to: `tel:`,
      `sms:`, `ftp:`, `callto:`, `cid:`, `xmpp:` and `matrix:` open other applications. Relative links and
-     fragments still pass, as they do by default (the panel's click handler decides what is opened). */
-  ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
+     fragments still pass, as they do by default (the panel's click handler decides what is opened).
+     A scheme is a letter followed by letters, digits, `+`, `.` and `-`, so the relative-link branch
+     takes a run of all of those and then needs a character that cannot continue a scheme and is not
+     its `:`; with digits left out, `h323:x` and `web+foo1:x` read as relative and kept their href. */
+  ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z][a-z0-9+.\-]*(?:[^a-z0-9+.\-:]|$))/i,
 };
 
 /** A fenced block is copied byte for byte (`y`), so what it holds must be seen: every character

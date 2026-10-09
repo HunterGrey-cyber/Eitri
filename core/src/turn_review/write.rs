@@ -8,16 +8,22 @@
 //! link to somewhere else, before or during the write, is refused or simply not reached: no path
 //! string is ever resolved again.
 //!
-//! **How a file is replaced** depends on what a rename would lose. A file with one link, owned by
-//! this user, with no extended attributes (an ACL is one) gets its new bytes in a temporary file in
-//! the same directory, synced and renamed over it: a crash leaves the old file or the new one. Any
-//! other regular file is rewritten in place, which keeps its inode, its other links, its owner and
-//! its attributes; since that is not atomic, a journal entry naming its stored earlier bytes is
-//! written and synced first ([`super::journal`]), and a failed write puts the earlier bytes back and
-//! checks that they are there.
+//! **How a file is replaced** depends on what a rename would lose. A file with more than one hard
+//! link is never written: any write reaches every name of it, and another name may be outside the
+//! project. A file with one link, owned by this user, with no extended attributes (an ACL is one)
+//! gets its new bytes in a temporary file in the same directory, synced and renamed over it: a
+//! crash leaves the old file or the new one. Any other regular file (another owner, extended
+//! attributes) is rewritten in place, which keeps its inode, its owner and its attributes; since
+//! that is not atomic, a journal entry naming its stored earlier bytes is written and synced first
+//! ([`super::journal`]), and a failed write puts the earlier bytes back and checks that they are
+//! there.
 //!
-//! Nothing here compares the disk with what the caller expected; the caller checks that right
-//! before calling, and every check made here is about the file system, not the content.
+//! **The last look.** The caller compares the disk with what it expects right before calling; the
+//! gap between that look and the write is still long enough for an editor's save or a checkout to
+//! land in it. So every change to an existing path looks once more, as late as it can: right
+//! before the rename, the unlink, or (in place) the truncate. A regular file is overwritten or
+//! removed only when the caller named the bytes it expects there (`JournalNote::pre`) and the file
+//! still holds exactly them; one the caller did not expect is left alone ([`WriteError::Changed`]).
 
 use std::ffi::CString;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -95,13 +101,14 @@ pub enum WriteMode {
     Atomic,
     /// Rewritten in place, journalled, for the reason given.
     InPlace(InPlaceWhy),
+    /// Not written at all: the file has this many hard links, and a write through any of them
+    /// would change the bytes of the others, which may live outside the project.
+    HardLinked(u64),
 }
 
 /// What a rename would lose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InPlaceWhy {
-    /// The file has another hard link, which a rename would leave with the old bytes.
-    HardLinks,
     /// It belongs to another user, and a renamed-in file would belong to this one.
     OtherOwner,
     /// It has extended attributes (an ACL among them), which a new file would not have.
@@ -158,6 +165,12 @@ pub enum WriteError {
     Appeared,
     /// The path leaves the project, or reaches it through a link.
     Outside(String),
+    /// The file has other hard links, so no write to it is made: it would reach whatever else is
+    /// linked to the same bytes, inside the project or not.
+    HardLinked { links: u64 },
+    /// The file no longer held the bytes this write expected when it came to change it; nothing was
+    /// written.
+    Changed,
     /// The write failed before anything was changed.
     Io(String),
     /// The write failed after the file was changed, and its earlier bytes were put back.
@@ -176,6 +189,11 @@ impl std::fmt::Display for WriteError {
             ),
             WriteError::Appeared => write!(f, "the file appeared since it was checked; nothing was written"),
             WriteError::Outside(why) => write!(f, "{why}"),
+            WriteError::HardLinked { links } => write!(
+                f,
+                "the file has {links} hard links; writing it would change the other links too, so nothing was written"
+            ),
+            WriteError::Changed => write!(f, "the file changed while it was being written; nothing was written"),
             WriteError::Io(e) => write!(f, "the write failed: {e}"),
             WriteError::RolledBack(e) => write!(f, "the write failed and the file was put back as it was: {e}"),
             WriteError::Broken(e) => write!(
@@ -312,11 +330,11 @@ pub fn read_current(target: &Target) -> io::Result<Current> {
 }
 
 /// How a regular file with `nlink` links, owned by `uid`, with `xattr_names` extended attributes is
-/// replaced by a process running as `own_uid`. The first reason found wins: links, then owner, then
-/// attributes.
+/// replaced by a process running as `own_uid`. The first reason found wins: links (which refuse the
+/// write), then owner, then attributes.
 pub fn decide_mode(nlink: u64, uid: u32, own_uid: u32, xattr_names: usize) -> WriteMode {
     if nlink > 1 {
-        WriteMode::InPlace(InPlaceWhy::HardLinks)
+        WriteMode::HardLinked(nlink)
     } else if uid != own_uid {
         WriteMode::InPlace(InPlaceWhy::OtherOwner)
     } else if xattr_names > 0 {
@@ -349,10 +367,19 @@ pub fn write_mode(target: &Target) -> io::Result<WriteMode> {
 ///   replaces: something that appeared at the path meanwhile is [`WriteError::Appeared`] and is left
 ///   alone. A file system without hard links cannot restore this way, and says so as an error;
 /// - a link, or a file going where a link is, is a temporary renamed over it;
-/// - a regular file is replaced atomically or in place by [`decide_mode`]. An in-place write reads
-///   `note.pre`'s stored bytes and opens the file before anything is journalled, so a file it cannot
-///   open or a missing blob fails with nothing changed; then it journals, truncates, writes and
-///   syncs, and on any failure writes the earlier bytes back and reads them again to be sure.
+/// - a regular file with another hard link is refused ([`WriteError::HardLinked`]): any write to it
+///   reaches the other names too, which may be outside the project;
+/// - any other regular file is replaced atomically or in place by [`decide_mode`]. An in-place write
+///   reads `note.pre`'s stored bytes and opens the file before anything is journalled, so a file it
+///   cannot open or a missing blob fails with nothing changed; then it journals, looks again,
+///   truncates, writes and syncs, and on any failure writes the earlier bytes back and reads them
+///   again to be sure.
+///
+/// Whatever is at the path is looked at once more right before it is replaced or removed (the last
+/// look of the module's header): the same inode, kind, size and times as when this call first
+/// looked, and for a regular file exactly `note.pre`'s bytes. A regular file when `note.pre` names
+/// none, a link when it names some, or any difference, is [`WriteError::Changed`] and nothing is
+/// written.
 ///
 /// The mode written is always the one in `new`.
 pub fn replace(
@@ -388,10 +415,20 @@ pub fn replace(
     };
     let kind = st.as_ref().map(|st| st.st_mode & libc::S_IFMT);
     let not_regular = || WriteError::Io(format!("{shown} is not a regular file or a link"));
+    // Only what is replaced or removed needs its expected bytes; a path that is empty now needs none.
+    let expected = match kind {
+        Some(_) => expected_bytes(note, shadow).map_err(io_err)?,
+        None => None,
+    };
     match (new, kind) {
         (_, Some(k)) if k != libc::S_IFREG && k != libc::S_IFLNK => Err(not_regular()),
         (Content::Absent, None) => Err(WriteError::Io(format!("{shown} disappeared since it was checked"))),
         (Content::Absent, Some(_)) => {
+            let st = st.expect("a kind comes from a stat");
+            // An unlink cannot be taken back: the file must still be what the caller judged.
+            if !still_as_judged(parent, &target.leaf, &st, expected.as_deref()).map_err(io_err)? {
+                return Err(WriteError::Changed);
+            }
             unlink_at(parent, &target.leaf, 0).map_err(io_err)?;
             sync_fd(parent.as_raw_fd()).map_err(io_err)
         }
@@ -411,27 +448,134 @@ pub fn replace(
             link_into_place(parent, &name, &target.leaf, &fault, &shown)
         }
         (Content::Symlink { target: link }, Some(_)) => {
+            let st = st.expect("a kind comes from a stat");
             let name = make_temp_link(parent, &target.leaf, link).map_err(io_err)?;
+            match still_as_judged(parent, &target.leaf, &st, expected.as_deref()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = unlink_at(parent, &name, 0);
+                    return Err(WriteError::Changed);
+                }
+                Err(e) => {
+                    let _ = unlink_at(parent, &name, 0);
+                    return Err(io_err(e));
+                }
+            }
             rename_into_place(parent, &name, &target.leaf).map_err(io_err)
         }
         (Content::Bytes { bytes, mode }, Some(libc::S_IFLNK)) => {
-            atomic(parent, &target.leaf, bytes, *mode, None, &fault).map_err(io_err)?;
+            let st = st.expect("a kind comes from a stat");
+            let unchanged = || still_as_judged(parent, &target.leaf, &st, expected.as_deref());
+            atomic(parent, &target.leaf, bytes, *mode, None, &fault, Some(&unchanged))?;
             Ok(())
         }
         (Content::Bytes { bytes, mode }, Some(_)) => {
             let st = st.expect("a kind comes from a stat");
+            // A regular file the caller did not expect (it saw a link or nothing here) appeared since
+            // it looked: neither a rename nor an in-place write may lose bytes nobody has seen.
+            if expected.is_none() {
+                return Err(WriteError::Changed);
+            }
             let (how, _) = regular_mode(parent, &target.leaf, &st).map_err(io_err)?;
-            if how == WriteMode::Atomic {
-                match atomic(parent, &target.leaf, bytes, *mode, Some(&st), &fault).map_err(io_err)? {
-                    Renamed::Done => return Ok(()),
-                    // The new file could not be given the old one's group: a rename would change
-                    // who may read it, so it is rewritten in place like any file a rename would hurt.
-                    Renamed::GroupWouldChange => {}
+            match how {
+                WriteMode::HardLinked(links) => return Err(WriteError::HardLinked { links }),
+                WriteMode::Atomic => {
+                    let unchanged = || still_as_judged(parent, &target.leaf, &st, expected.as_deref());
+                    match atomic(parent, &target.leaf, bytes, *mode, Some(&st), &fault, Some(&unchanged))? {
+                        Renamed::Done => return Ok(()),
+                        // The new file could not be given the old one's group: a rename would change
+                        // who may read it, so it is rewritten in place like any file a rename would hurt.
+                        Renamed::GroupWouldChange => {}
+                    }
                 }
+                WriteMode::InPlace(_) => {}
             }
             in_place(parent, target, &st, bytes, *mode, note, journal, shadow, &fault)
         }
     }
+}
+
+/// The stored bytes `note` says the file holds now, when it names them.
+fn expected_bytes(note: &JournalNote, shadow: &Shadow) -> io::Result<Option<Vec<u8>>> {
+    let Some(id) = note.pre.as_deref() else {
+        return Ok(None);
+    };
+    match shadow.read_stored(id) {
+        Ok(Some(bytes)) => Ok(Some(bytes)),
+        Ok(None) => Err(io::Error::other("the stored copy of its current bytes is missing")),
+        Err(e) => Err(io::Error::other(e.to_string())),
+    }
+}
+
+/// Whether `leaf` is still the very entry `st` described (same inode, kind, size and times) and
+/// what the caller expected there: a regular file holding exactly `expected`, or a link when
+/// `expected` is `None`. A writer that is not Eitri (a formatter on save, `git checkout`) can change
+/// a path between the last look and the rename or unlink that would lose what it put there.
+///
+/// `expected` is `None` only when the caller saw a link or nothing at the path, so a regular file
+/// found with nothing expected is one nobody looked at, and a link found with bytes expected is not
+/// the file the caller judged.
+fn still_as_judged(parent: &OwnedFd, leaf: &CString, st: &libc::stat, expected: Option<&[u8]>) -> io::Result<bool> {
+    let now = match stat_at(parent, leaf) {
+        Ok(now) => now,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino)
+        || now.st_mode & libc::S_IFMT != st.st_mode & libc::S_IFMT
+        || now.st_size != st.st_size
+        || (now.st_mtime, now.st_mtime_nsec) != (st.st_mtime, st.st_mtime_nsec)
+        || (now.st_ctime, now.st_ctime_nsec) != (st.st_ctime, st.st_ctime_nsec)
+    {
+        return Ok(false);
+    }
+    match (now.st_mode & libc::S_IFMT, expected) {
+        (libc::S_IFREG, Some(expected)) => {
+            let mut file = match open_leaf(parent, leaf, libc::O_RDONLY, st) {
+                Ok((file, _)) => file,
+                // Gone, replaced or not a regular file any more: not what was judged.
+                Err(_) => return Ok(false),
+            };
+            holds_exactly(&mut file, expected)
+        }
+        (libc::S_IFLNK, None) => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+/// Whether `target` is a regular file holding exactly `bytes` with permission bits `mode`. When it
+/// is, its bytes and its directory entry are synced before this answers, through the descriptor the
+/// comparison read: a caller that forgets the earlier bytes because the file already holds the new
+/// ones must not do so while those new ones still sit only in the page cache.
+pub(crate) fn holds_durably(target: &Target, bytes: &[u8], mode: u32) -> io::Result<bool> {
+    let parent = parent_of(target)?;
+    let st = match stat_at(parent, &target.leaf) {
+        Ok(st) => st,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Ok(false);
+    }
+    let (mut file, fst) = match open_leaf(parent, &target.leaf, libc::O_RDONLY, &st) {
+        Ok(opened) => opened,
+        Err(_) => return Ok(false),
+    };
+    if fst.st_mode as u32 & 0o7777 != mode || !holds_exactly(&mut file, bytes)? {
+        return Ok(false);
+    }
+    file.sync_all()?;
+    sync_fd(parent.as_raw_fd())?;
+    Ok(true)
+}
+
+/// Whether the rest of `file`, from its start, is exactly `expected`; never reads more than one byte
+/// past it.
+fn holds_exactly(file: &mut File, expected: &[u8]) -> io::Result<bool> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut got = Vec::with_capacity(expected.len().min(1 << 20) + 1);
+    file.take(expected.len() as u64 + 1).read_to_end(&mut got)?;
+    Ok(got == expected)
 }
 
 /// [`FsHooks::free_bytes`] in production: what `fstatvfs` on the parent says this user may use.
@@ -543,8 +687,10 @@ fn atomic(
     mode: u32,
     orig: Option<&libc::stat>,
     fault: &dyn Fn(Stage) -> io::Result<()>,
-) -> io::Result<Renamed> {
-    let temp = make_temp(parent, leaf)?;
+    unchanged: Option<&dyn Fn() -> io::Result<bool>>,
+) -> Result<Renamed, WriteError> {
+    let io_err = |e: io::Error| WriteError::Io(format!("{}: {e}", leaf.to_string_lossy()));
+    let temp = make_temp(parent, leaf).map_err(io_err)?;
     let result = fill_temp(&temp, bytes, mode, orig, fault);
     match result {
         Ok(true) => {}
@@ -554,10 +700,25 @@ fn atomic(
         }
         Err(e) => {
             let _ = unlink_at(parent, &temp.name, 0);
-            return Err(e);
+            return Err(io_err(e));
         }
     }
-    rename_into_place(parent, &temp.name, leaf)?;
+    // Filling and syncing the temporary is the slow part; look at the original once more right
+    // before the rename that would replace it.
+    if let Some(unchanged) = unchanged {
+        match unchanged() {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = unlink_at(parent, &temp.name, 0);
+                return Err(WriteError::Changed);
+            }
+            Err(e) => {
+                let _ = unlink_at(parent, &temp.name, 0);
+                return Err(io_err(e));
+            }
+        }
+    }
+    rename_into_place(parent, &temp.name, leaf).map_err(io_err)?;
     Ok(Renamed::Done)
 }
 
@@ -640,12 +801,51 @@ fn in_place(
         .ok_or_else(|| io_err("the stored copy of its current bytes is missing".into()))?;
     // Opened before anything is journalled: a file that cannot be opened for writing is a plain
     // failure with nothing changed, not a broken write with a recovery to offer.
-    let (file, fst) = open_leaf(parent, &target.leaf, libc::O_WRONLY, st).map_err(|e| io_err(e.to_string()))?;
-    let hold = journal.begin(note, shadow).map_err(|e| io_err(e.to_string()))?;
+    // Read and write through this one descriptor, so what is compared is what is truncated.
+    let (mut file, fst) = open_leaf(parent, &target.leaf, libc::O_RDWR, st).map_err(|e| io_err(e.to_string()))?;
+    // Judged again on the descriptor itself: a link made since the path was looked at is as much a
+    // reason to write nothing as one that was there.
+    #[allow(clippy::unnecessary_cast)] // `nlink_t` is 32 bits on some targets
+    let links = fst.st_nlink as u64;
+    if links > 1 {
+        return Err(WriteError::HardLinked { links });
+    }
+    let hold = journal.begin(note, mode, shadow).map_err(|e| io_err(e.to_string()))?;
 
     let mut touched = false;
+    let mut refused: Option<WriteError> = None;
     let written = (|| -> io::Result<()> {
         fault(Stage::JournalWritten)?;
+        // The journal holds `pre` as the way back, so the file must still be `pre` when it is
+        // truncated; whatever a formatter or a checkout put there meanwhile is not Eitri's to lose.
+        if !holds_exactly(&mut file, &pre)? {
+            refused = Some(WriteError::Changed);
+            return Err(io::Error::other("the file changed since it was checked"));
+        }
+        // Writing the journal entry takes a while, and a hard link made to the file meanwhile changes
+        // none of its bytes: the links are counted again on this descriptor as the last thing before
+        // the truncate, since a write now would change every name the file has.
+        let now = fstat(file.as_raw_fd())?;
+        #[allow(clippy::unnecessary_cast)] // `nlink_t` is 32 bits on some targets
+        let links = now.st_nlink as u64;
+        if links > 1 {
+            refused = Some(WriteError::HardLinked { links });
+            return Err(io::Error::other("the file was hard linked since it was checked"));
+        }
+        // And the path must still name this descriptor's file, or the write would land in a file
+        // the project no longer shows while the one it does show stays as it was.
+        match stat_at(parent, &target.leaf) {
+            Ok(named) if (named.st_dev, named.st_ino) == (now.st_dev, now.st_ino) => {}
+            Ok(_) => {
+                refused = Some(WriteError::Changed);
+                return Err(io::Error::other("the path names another file now"));
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                refused = Some(WriteError::Changed);
+                return Err(io::Error::other("the file was removed since it was checked"));
+            }
+            Err(e) => return Err(e),
+        }
         touched = true;
         file.set_len(0)?;
         fault(Stage::Truncated)?;
@@ -672,6 +872,9 @@ fn in_place(
     if !touched {
         if let Err(e) = journal.remove(hold.id(), shadow) {
             eprintln!("[review] the journal entry of a write that never started could not be removed: {e}");
+        }
+        if let Some(refusal) = refused {
+            return Err(refusal);
         }
         return Err(io_err(error.to_string()));
     }

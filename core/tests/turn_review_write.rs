@@ -228,6 +228,33 @@ mod xattr_sys {
     }
 }
 
+/// Set to `1` to let the in-place tests pass without running where the file system refuses user
+/// extended attributes. Unset, such a file system fails them: a green run must mean the in-place
+/// path was exercised.
+const NO_XATTR: &str = "EITRI_TEST_NO_XATTR";
+
+/// Gives `path` an extended attribute, which makes a write replace it in place. When the file system
+/// refuses user attributes this panics, unless [`NO_XATTR`] is `1`, which makes it `false` (the caller
+/// then has nothing to test and returns).
+fn force_in_place(path: &Path) -> bool {
+    let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let name = CString::new("user.eitri_test").unwrap();
+    // SAFETY: both strings are NUL-terminated; the value is 3 valid bytes.
+    let set = unsafe { xattr_sys::set(&c, &name, b"yes") };
+    if set == 0 {
+        return true;
+    }
+    let why = std::io::Error::last_os_error();
+    if std::env::var_os(NO_XATTR).is_some_and(|v| v == "1") {
+        println!("this file system refuses user extended attributes ({why}); skipped as {NO_XATTR}=1 asks");
+        return false;
+    }
+    panic!(
+        "this file system refuses user extended attributes ({why}), so the in-place write cannot be tested; \
+         set {NO_XATTR}=1 to skip the in-place tests knowingly"
+    );
+}
+
 /// How many extended attribute names `path` has, or why that cannot be asked.
 fn xattr_count(path: &Path) -> Result<usize, std::io::Error> {
     let c = CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -344,7 +371,7 @@ fn an_ordinary_file_is_replaced_atomically() {
 }
 
 #[test]
-fn a_hard_linked_file_keeps_its_inode_and_the_other_link_sees_it() {
+fn a_hard_linked_file_is_never_written() {
     let scratch = Scratch::new("hardlink");
     let fx = Fixture::at(&scratch.0);
     let pre = b"before\n".to_vec();
@@ -354,7 +381,7 @@ fn a_hard_linked_file_keeps_its_inode_and_the_other_link_sees_it() {
     std::fs::hard_link(fx.file("a.txt"), &other).unwrap();
     let inode = meta(&fx.file("a.txt")).ino();
     let target = fx.root.target(Path::new("a.txt"), false).unwrap();
-    assert_eq!(write_mode(&target).unwrap(), WriteMode::InPlace(InPlaceWhy::HardLinks));
+    assert_eq!(write_mode(&target).unwrap(), WriteMode::HardLinked(2));
 
     let new = b"after\r\n\xc3\x28".to_vec();
     let note = fx.note("a.txt", &pre, 0o640, &new);
@@ -362,11 +389,19 @@ fn a_hard_linked_file_keeps_its_inode_and_the_other_link_sees_it() {
         bytes: new.clone(),
         mode: 0o640,
     };
-    replace(&target, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()).unwrap();
+    assert_eq!(
+        replace(&target, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()),
+        Err(WriteError::HardLinked { links: 2 })
+    );
+    let message = WriteError::HardLinked { links: 2 }.to_string();
+    assert!(
+        message.contains("2 hard links") && message.contains("nothing was written"),
+        "{message}"
+    );
 
+    assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), pre);
+    assert_eq!(std::fs::read(&other).unwrap(), pre, "the other link is untouched");
     assert_eq!(meta(&fx.file("a.txt")).ino(), inode);
-    assert_eq!(std::fs::read(&other).unwrap(), new, "the other link sees the new bytes");
-    assert_eq!(mode_of(&fx.file("a.txt")), 0o640);
     assert!(fx.journal.pending().is_empty());
     assert!(names(fx.journal.dir()).is_empty(), "{:?}", names(fx.journal.dir()));
     assert!(fx.refs("refs/eitri-journal/").is_empty());
@@ -379,17 +414,11 @@ fn a_file_with_an_xattr_is_written_in_place() {
     let fx = Fixture::at(&scratch.0);
     let pre = b"attrs\n".to_vec();
     write_file(&fx.file("x.txt"), &pre, 0o644);
-    let path = CString::new(fx.file("x.txt").as_os_str().as_bytes()).unwrap();
-    let name = CString::new("user.eitri_test").unwrap();
-    // SAFETY: both strings are NUL-terminated; the value is 3 valid bytes.
-    let set = unsafe { xattr_sys::set(&path, &name, b"yes") };
-    if set != 0 {
-        println!(
-            "this file system refuses user extended attributes ({}); nothing to test",
-            std::io::Error::last_os_error()
-        );
+    if !force_in_place(&fx.file("x.txt")) {
         return;
     }
+    let path = CString::new(fx.file("x.txt").as_os_str().as_bytes()).unwrap();
+    let name = CString::new("user.eitri_test").unwrap();
     let inode = meta(&fx.file("x.txt")).ino();
     let target = fx.root.target(Path::new("x.txt"), false).unwrap();
     assert_eq!(write_mode(&target).unwrap(), WriteMode::InPlace(InPlaceWhy::Xattrs));
@@ -412,11 +441,11 @@ fn a_file_with_an_xattr_is_written_in_place() {
 #[test]
 fn decide_mode_covers_owner_links_and_xattrs() {
     assert_eq!(decide_mode(1, 1000, 1000, 0), WriteMode::Atomic);
-    assert_eq!(decide_mode(2, 1000, 1000, 0), WriteMode::InPlace(InPlaceWhy::HardLinks));
+    assert_eq!(decide_mode(2, 1000, 1000, 0), WriteMode::HardLinked(2));
     assert_eq!(decide_mode(1, 0, 1000, 0), WriteMode::InPlace(InPlaceWhy::OtherOwner));
     assert_eq!(decide_mode(1, 1000, 1000, 1), WriteMode::InPlace(InPlaceWhy::Xattrs));
     // The first reason found wins.
-    assert_eq!(decide_mode(2, 0, 1000, 1), WriteMode::InPlace(InPlaceWhy::HardLinks));
+    assert_eq!(decide_mode(2, 0, 1000, 1), WriteMode::HardLinked(2));
     assert_eq!(decide_mode(1, 0, 1000, 3), WriteMode::InPlace(InPlaceWhy::OtherOwner));
 }
 
@@ -539,7 +568,9 @@ fn a_failed_in_place_write_puts_the_old_bytes_back() {
     let fx = Fixture::at(&scratch.0);
     let pre = b"the earlier bytes\r\n".to_vec();
     write_file(&fx.file("a.txt"), &pre, 0o644);
-    std::fs::hard_link(fx.file("a.txt"), fx.file("b.txt")).unwrap();
+    if !force_in_place(&fx.file("a.txt")) {
+        return;
+    }
     let inode = meta(&fx.file("a.txt")).ino();
     let new = b"never all written\n".to_vec();
     let note = fx.note("a.txt", &pre, 0o644, &new);
@@ -565,8 +596,13 @@ fn an_unwritable_in_place_file_journals_nothing() {
     let scratch = Scratch::new("unwritable");
     let fx = Fixture::at(&scratch.0);
     let pre = b"read only\n".to_vec();
-    write_file(&fx.file("ro.txt"), &pre, 0o444);
-    std::fs::hard_link(fx.file("ro.txt"), fx.file("ro2.txt")).unwrap();
+    // The attribute goes on while the file is still writable: a user attribute on a read-only file is
+    // refused like any other write to it.
+    write_file(&fx.file("ro.txt"), &pre, 0o644);
+    if !force_in_place(&fx.file("ro.txt")) {
+        return;
+    }
+    std::fs::set_permissions(fx.file("ro.txt"), std::fs::Permissions::from_mode(0o444)).unwrap();
     // SAFETY: `geteuid` has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
         println!("root writes a 0444 file anyway; nothing to test");
@@ -652,7 +688,7 @@ fn a_deletion_unlinks_the_file() {
     assert!(fx.file("d/sub").is_dir());
 }
 
-/// The child of `a_real_short_write_rolls_back`: a hard-linked 4 KiB file rewritten in place with
+/// The child of `a_real_short_write_rolls_back`: a 4 KiB file with an extended attribute rewritten in place with
 /// 64 KiB under a 16 KiB file size limit, so the kernel refuses the write partway.
 #[test]
 #[ignore = "run by a_real_short_write_rolls_back"]
@@ -690,12 +726,13 @@ fn a_real_short_write_rolls_back() {
     let fx = Fixture::at(&scratch.0);
     let pre = noise(4096, 1);
     write_file(&fx.file("a.bin"), &pre, 0o644);
-    std::fs::hard_link(fx.file("a.bin"), scratch.path("other-link")).unwrap();
+    if !force_in_place(&fx.file("a.bin")) {
+        return;
+    }
     let inode = meta(&fx.file("a.bin")).ino();
     let status = run_child("short_write_child", &scratch.0);
     assert!(status.success(), "the child failed: {status:?}");
     assert_eq!(std::fs::read(fx.file("a.bin")).unwrap(), pre);
-    assert_eq!(std::fs::read(scratch.path("other-link")).unwrap(), pre);
     assert_eq!(meta(&fx.file("a.bin")).ino(), inode);
     assert!(fx.journal.pending().is_empty());
     assert!(fx.refs("refs/eitri-journal/").is_empty());
@@ -705,7 +742,7 @@ fn a_real_short_write_rolls_back() {
 /// that is genuinely half written.
 const CRASH_NEW_LEN: usize = 200 * 1024;
 
-/// The child of the crash tests: an in-place rewrite of a hard-linked file that dies after its
+/// The child of the crash tests: an in-place rewrite of a file with an extended attribute that dies after its
 /// first chunk.
 #[test]
 #[ignore = "run by a_crash_mid_write_leaves_a_journal_entry"]
@@ -745,7 +782,10 @@ fn crashed(scratch: &Scratch) -> (Fixture, Vec<u8>) {
     let fx = Fixture::at(&scratch.0);
     let original = b"the original\r\nbytes \xff\n".to_vec();
     write_file(&fx.file("src/a.txt"), &original, 0o644);
-    std::fs::hard_link(fx.file("src/a.txt"), scratch.path("second-link")).unwrap();
+    assert!(
+        force_in_place(&fx.file("src/a.txt")),
+        "the crash tests need user extended attributes"
+    );
     let status = run_child("write_crash_child", &scratch.0);
     assert!(!status.success(), "the child was to die");
     assert_ne!(
@@ -1111,11 +1151,15 @@ fn the_projects_git_is_never_written_by_a_write() {
     write_file(&fx.file("tracked.txt"), b"v1\n", 0o644);
     write_file(&fx.file("linked.txt"), b"linked\n", 0o644);
     write_file(&fx.file("gone.txt"), b"gone\n", 0o644);
+    write_file(&fx.file("attrs.txt"), b"attrs\n", 0o644);
     tgit(p, &["add", "-A"]);
     tgit(p, &["commit", "-q", "-m", "one"]);
     write_file(&fx.file("tracked.txt"), b"v2\n", 0o644);
     tgit(p, &["stash", "-q"]);
     std::fs::hard_link(fx.file("linked.txt"), scratch.path("outside-link")).unwrap();
+    // An extended attribute makes its write in place, journalled: the one kind of write that keeps
+    // state of its own besides the file.
+    let in_place = force_in_place(&fx.file("attrs.txt"));
     let before = git_state(p);
 
     let note = |rel: &str, pre: &[u8], new: &[u8]| fx.note(rel, pre, 0o644, new);
@@ -1131,13 +1175,15 @@ fn the_projects_git_is_never_written_by_a_write() {
         &hooks,
     )
     .unwrap();
-    fx.replace(
-        "linked.txt",
-        &bytes(b"in place\n"),
-        &note("linked.txt", b"linked\n", b"in place\n"),
-        &hooks,
-    )
-    .unwrap();
+    assert_eq!(
+        fx.replace(
+            "linked.txt",
+            &bytes(b"in place\n"),
+            &note("linked.txt", b"linked\n", b"in place\n"),
+            &hooks,
+        ),
+        Err(WriteError::HardLinked { links: 2 })
+    );
     fx.replace("gone.txt", &Content::Absent, &note("gone.txt", b"gone\n", b""), &hooks)
         .unwrap();
     fx.replace(
@@ -1151,9 +1197,35 @@ fn the_projects_git_is_never_written_by_a_write() {
         target: b"tracked.txt".to_vec(),
     };
     fx.replace("link", &link, &note("link", b"", b""), &hooks).unwrap();
+    if in_place {
+        let journalled = Arc::new(AtomicUsize::new(0));
+        let seen = journalled.clone();
+        let hooks = FsHooks {
+            fault: Some(Arc::new(move |stage| {
+                if stage == Stage::JournalWritten {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            })),
+            ..FsHooks::default()
+        };
+        fx.replace(
+            "attrs.txt",
+            &bytes(b"rewritten in place\n"),
+            &note("attrs.txt", b"attrs\n", b"rewritten in place\n"),
+            &hooks,
+        )
+        .unwrap();
+        assert_eq!(
+            journalled.load(Ordering::SeqCst),
+            1,
+            "the write went in place, through the journal"
+        );
+        assert_eq!(std::fs::read(fx.file("attrs.txt")).unwrap(), b"rewritten in place\n");
+    }
 
     assert_eq!(git_state(p), before);
-    assert_eq!(std::fs::read(scratch.path("outside-link")).unwrap(), b"in place\n");
+    assert_eq!(std::fs::read(scratch.path("outside-link")).unwrap(), b"linked\n");
 }
 
 #[test]
@@ -1162,7 +1234,9 @@ fn a_write_in_progress_is_not_pending_and_a_bad_entry_is_kept() {
     let fx = Fixture::at(&scratch.0);
     let pre = b"pre\n".to_vec();
     write_file(&fx.file("a.txt"), &pre, 0o644);
-    std::fs::hard_link(fx.file("a.txt"), scratch.path("other")).unwrap();
+    if !force_in_place(&fx.file("a.txt")) {
+        return;
+    }
     let journal = fx.journal.clone();
     let seen = Arc::new(std::sync::Mutex::new(None));
     let seen_in_hook = seen.clone();
@@ -1190,4 +1264,224 @@ fn a_write_in_progress_is_not_pending_and_a_bad_entry_is_kept() {
     std::fs::write(&bad, b"{ not an entry").unwrap();
     assert!(fx.journal.pending().is_empty());
     assert!(bad.exists());
+}
+
+/// A hook that, at `stage`, does what a formatter on save or `git checkout` does: puts other bytes
+/// in `path` through the same inode.
+fn foreign_write_at(stage: Stage, path: PathBuf, bytes: &'static [u8]) -> FsHooks {
+    FsHooks {
+        fault: Some(Arc::new(move |s| {
+            if s == stage {
+                std::fs::write(&path, bytes)?;
+            }
+            Ok(())
+        })),
+        ..FsHooks::default()
+    }
+}
+
+#[test]
+fn an_in_place_write_leaves_bytes_that_appeared_before_the_truncate() {
+    let scratch = Scratch::new("foreign-in-place");
+    let fx = Fixture::at(&scratch.0);
+    let pre = b"what the turn left\n".to_vec();
+    write_file(&fx.file("a.txt"), &pre, 0o644);
+    if !force_in_place(&fx.file("a.txt")) {
+        return;
+    }
+    let new = b"the revert\n".to_vec();
+    let note = fx.note("a.txt", &pre, 0o644, &new);
+    let content = Content::Bytes {
+        bytes: new,
+        mode: 0o644,
+    };
+    let hooks = foreign_write_at(Stage::JournalWritten, fx.file("a.txt"), b"saved by a formatter\n");
+    assert_eq!(fx.replace("a.txt", &content, &note, &hooks), Err(WriteError::Changed));
+    assert_eq!(
+        std::fs::read(fx.file("a.txt")).unwrap(),
+        b"saved by a formatter\n",
+        "the other writer's bytes are not lost"
+    );
+    assert!(fx.journal.pending().is_empty());
+    assert!(names(fx.journal.dir()).is_empty());
+    assert!(fx.refs("refs/eitri-journal/").is_empty());
+}
+
+#[test]
+fn an_atomic_write_leaves_bytes_that_appeared_before_the_rename() {
+    let scratch = Scratch::new("foreign-atomic");
+    let fx = Fixture::at(&scratch.0);
+    let pre = b"what the turn left\n".to_vec();
+    write_file(&fx.file("a.txt"), &pre, 0o644);
+    let inode = meta(&fx.file("a.txt")).ino();
+    let new = b"the revert\n".to_vec();
+    let note = fx.note("a.txt", &pre, 0o644, &new);
+    let content = Content::Bytes {
+        bytes: new,
+        mode: 0o644,
+    };
+    // `Synced` is reached with the temporary complete and the rename still to come.
+    let hooks = foreign_write_at(Stage::Synced, fx.file("a.txt"), b"saved by a formatter\n");
+    assert_eq!(fx.replace("a.txt", &content, &note, &hooks), Err(WriteError::Changed));
+    assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), b"saved by a formatter\n");
+    assert_eq!(meta(&fx.file("a.txt")).ino(), inode, "the file was not replaced");
+    no_temp_left(&fx.project);
+}
+
+#[test]
+fn an_unchanged_file_is_still_replaced_after_the_second_look() {
+    let scratch = Scratch::new("second-look");
+    let fx = Fixture::at(&scratch.0);
+    write_file(&fx.file("a.txt"), b"old\n", 0o644);
+    let note = fx.note("a.txt", b"old\n", 0o644, b"new\n");
+    let content = Content::Bytes {
+        bytes: b"new\n".to_vec(),
+        mode: 0o644,
+    };
+    fx.replace("a.txt", &content, &note, &FsHooks::default()).unwrap();
+    assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), b"new\n");
+}
+
+#[test]
+fn a_hard_link_made_while_the_journal_is_written_refuses_the_in_place_write() {
+    let scratch = Scratch::new("late-link");
+    let fx = Fixture::at(&scratch.0);
+    let pre = b"before\n".to_vec();
+    write_file(&fx.file("a.txt"), &pre, 0o644);
+    if !force_in_place(&fx.file("a.txt")) {
+        return;
+    }
+    let outside = scratch.path("elsewhere/a-link");
+    std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+    let (from, to) = (fx.file("a.txt"), outside.clone());
+    // Linking changes no byte of the file, so only counting its links again can see it.
+    let hooks = FsHooks {
+        fault: Some(Arc::new(move |stage| {
+            if stage == Stage::JournalWritten {
+                std::fs::hard_link(&from, &to)?;
+            }
+            Ok(())
+        })),
+        ..FsHooks::default()
+    };
+    let new = b"after\n".to_vec();
+    let note = fx.note("a.txt", &pre, 0o644, &new);
+    let content = Content::Bytes {
+        bytes: new,
+        mode: 0o644,
+    };
+    assert_eq!(
+        fx.replace("a.txt", &content, &note, &hooks),
+        Err(WriteError::HardLinked { links: 2 })
+    );
+    assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), pre);
+    assert_eq!(std::fs::read(&outside).unwrap(), pre, "the name outside is untouched");
+    assert!(names(fx.journal.dir()).is_empty(), "the entry is removed");
+    assert!(fx.refs("refs/eitri-journal/").is_empty(), "and its pins");
+}
+
+#[test]
+fn a_regular_file_nobody_expected_is_never_replaced_or_removed() {
+    let scratch = Scratch::new("unexpected");
+    let fx = Fixture::at(&scratch.0);
+    // What a restore of a deleted file or a link records: nothing regular was expected at the path.
+    let note = JournalNote {
+        session: "s1".into(),
+        path: "a.txt".into(),
+        pre: None,
+        pre_mode: 0,
+        intended: Some(fx.shadow.store_blob(b"restored\n").unwrap()),
+    };
+    let planted = b"saved by someone else after the last check\n";
+    write_file(&fx.file("a.txt"), planted, 0o644);
+    let inode = meta(&fx.file("a.txt")).ino();
+    let link = Content::Symlink {
+        target: b"elsewhere".to_vec(),
+    };
+    for content in [
+        Content::Bytes {
+            bytes: b"restored\n".to_vec(),
+            mode: 0o644,
+        },
+        link,
+        Content::Absent,
+    ] {
+        assert_eq!(
+            fx.replace("a.txt", &content, &note, &FsHooks::default()),
+            Err(WriteError::Changed),
+            "{content:?}"
+        );
+        assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), planted);
+        assert_eq!(meta(&fx.file("a.txt")).ino(), inode);
+    }
+    no_temp_left(&fx.project);
+
+    // In place too (an extended attribute), with nothing journalled.
+    if force_in_place(&fx.file("a.txt")) {
+        let content = Content::Bytes {
+            bytes: b"restored\n".to_vec(),
+            mode: 0o644,
+        };
+        assert_eq!(
+            fx.replace("a.txt", &content, &note, &FsHooks::default()),
+            Err(WriteError::Changed)
+        );
+        assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), planted);
+        assert!(names(fx.journal.dir()).is_empty());
+    }
+}
+
+#[test]
+fn a_deletion_looks_at_the_bytes_last() {
+    let scratch = Scratch::new("delete-late");
+    let fx = Fixture::at(&scratch.0);
+    // Same length as what the caller expected, so only the bytes differ.
+    write_file(&fx.file("a.txt"), b"theirs\n", 0o644);
+    let note = fx.note("a.txt", b"mine!!\n", 0o644, b"");
+    assert_eq!(
+        fx.replace("a.txt", &Content::Absent, &note, &FsHooks::default()),
+        Err(WriteError::Changed)
+    );
+    assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), b"theirs\n");
+
+    // A link where a file was expected is not removed either.
+    std::fs::remove_file(fx.file("a.txt")).unwrap();
+    std::os::unix::fs::symlink("elsewhere", fx.file("a.txt")).unwrap();
+    assert_eq!(
+        fx.replace("a.txt", &Content::Absent, &note, &FsHooks::default()),
+        Err(WriteError::Changed)
+    );
+    assert!(meta(&fx.file("a.txt")).file_type().is_symlink());
+
+    // The file the caller expected is removed.
+    std::fs::remove_file(fx.file("a.txt")).unwrap();
+    write_file(&fx.file("a.txt"), b"mine!!\n", 0o644);
+    fx.replace("a.txt", &Content::Absent, &note, &FsHooks::default())
+        .unwrap();
+    assert!(std::fs::symlink_metadata(fx.file("a.txt")).is_err());
+}
+
+#[test]
+fn an_atomic_write_compares_the_bytes_not_only_the_size_and_times() {
+    let scratch = Scratch::new("same-size");
+    let fx = Fixture::at(&scratch.0);
+    // The file holds other bytes of the same length than the caller expected, and this call's own
+    // look at it is the first: its size and times are the ones it is judged by, so only the byte
+    // comparison can tell.
+    write_file(&fx.file("a.txt"), b"theirs\n", 0o644);
+    let inode = meta(&fx.file("a.txt")).ino();
+    let note = fx.note("a.txt", b"mine!!\n", 0o644, b"the revert\n");
+    let content = Content::Bytes {
+        bytes: b"the revert\n".to_vec(),
+        mode: 0o644,
+    };
+    let target = fx.root.target(Path::new("a.txt"), false).unwrap();
+    assert_eq!(write_mode(&target).unwrap(), WriteMode::Atomic);
+    assert_eq!(
+        fx.replace("a.txt", &content, &note, &FsHooks::default()),
+        Err(WriteError::Changed)
+    );
+    assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), b"theirs\n");
+    assert_eq!(meta(&fx.file("a.txt")).ino(), inode);
+    no_temp_left(&fx.project);
 }

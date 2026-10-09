@@ -339,6 +339,14 @@ fn stored_events(stored: &StoredHistory) -> Vec<AgentDomainEvent> {
                     name: call.name.clone(),
                     input: call.input.clone(),
                 });
+                // Before the completion-skip below: the mark belongs to the call, not to its result,
+                // and an empty id is no link (a held change for it could never be attached).
+                if let Some(change) = call.changed_input.as_ref().filter(|_| !call.tool_use_id.is_empty()) {
+                    events.push(AgentDomainEvent::ToolInputChanged {
+                        tool_use_id: call.tool_use_id.clone(),
+                        change: change.clone(),
+                    });
+                }
                 if let Some(result) = &call.result {
                     // An empty id is not a link (`projection::tool_use_link`'s whole subject): a
                     // completion carrying one would be matched by `apply` against the FIRST call
@@ -477,6 +485,7 @@ mod tests {
                 is_error: false,
             }),
             denied: None,
+            changed_input: None,
         }
     }
 
@@ -584,6 +593,42 @@ mod tests {
         assert_eq!(projection.user_prompts[0].seq, 0);
         assert_eq!(projection.transcript[0].seq, 1);
         assert_eq!(projection.user_prompts[1].seq, 2);
+    }
+
+    /// A call's changed-input mark was stored with it, and a restore from Eitri's own copy (the
+    /// transcript unavailable) brings it back; a call stored without one stays unmarked.
+    #[test]
+    fn a_changed_input_mark_survives_a_restore_from_the_stored_copy() {
+        let conversation_id = setup();
+        let change = crate::InputChange {
+            fields: serde_json::json!({ "command": "rtk ls" }).as_object().unwrap().clone(),
+            removed: vec!["timeout".into()],
+            clipped: true,
+        };
+        let mut marked = tool_call(1, "toolu_marked", Some("ok"));
+        marked.changed_input = Some(change.clone());
+        store_copy(
+            &conversation_id,
+            "sess-mark",
+            vec![prompt(0, "go")],
+            vec![],
+            vec![marked, tool_call(2, "toolu_plain", Some("ok")), {
+                // An empty id is no link: it neither gets a result nor a held mark.
+                let mut anonymous = tool_call(3, "", None);
+                anonymous.changed_input = Some(change.clone());
+                anonymous
+            }],
+        );
+
+        let projection = seed_from(Ok(missing_transcript()), &conversation_id, "sess-mark");
+        assert_eq!(projection.tool_calls.len(), 3);
+        assert_eq!(projection.tool_calls[0].changed_input, Some(change));
+        assert_eq!(projection.tool_calls[1].changed_input, None);
+        assert_eq!(projection.tool_calls[2].changed_input, None);
+        assert!(projection.changed_inputs_before_their_call.is_empty());
+        // And it went to disk in the shape the loader reads (a round trip through the real store).
+        let again = store::load(&conversation_id, "sess-mark").expect("stored history");
+        assert!(again.tool_calls[0].changed_input.is_some());
     }
 
     // Closing `assistant_message_open` keeps restored and live replies separate.

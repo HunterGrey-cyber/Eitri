@@ -1246,6 +1246,17 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             resets_at: Some(1_790_000_000),
             plan: Some("pro".into()),
         },
+        AgentDomainEvent::ToolInputChanged {
+            tool_use_id: "tu-1".into(),
+            change: agent::InputChange {
+                fields: serde_json::json!({ "command": "rtk git push" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                removed: vec![],
+                clipped: false,
+            },
+        },
     ]
 }
 
@@ -1281,6 +1292,7 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::PermissionDenied { .. } => "PermissionDenied",
         AgentDomainEvent::PolicyMismatch { .. } => "PolicyMismatch",
         AgentDomainEvent::AccountLimits { .. } => "AccountLimits",
+        AgentDomainEvent::ToolInputChanged { .. } => "ToolInputChanged",
     }
 }
 

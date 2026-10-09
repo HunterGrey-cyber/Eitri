@@ -1496,7 +1496,11 @@ fn toml_findings_name_mcp_servers_and_approval_modes() {
         Finding::McpServer {
             file: file.clone(),
             name: "marker".into(),
-            command_line: "sh -c 'touch /tmp/n'".into(),
+            // The approval keys are shown beside the command as well: a tool's table can hold more
+            // than its `approval_mode`, and every field of a server is part of what it is.
+            command_line:
+                r#"sh -c 'touch /tmp/n' {"default_tools_approval_mode":"approve","tools":{"write":{"approval_mode":"prompt"}}}"#
+                    .into(),
             approval_mode: Some("approve; write: prompt".into()),
         },
         Finding::McpServer {

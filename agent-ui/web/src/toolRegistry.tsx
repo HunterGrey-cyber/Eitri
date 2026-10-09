@@ -1,11 +1,11 @@
 import { memo } from "react";
 import type { ReactNode } from "react";
-import type { ToolCallDenial, ToolCallRecord } from "./types";
+import type { InputChange, ToolCallDenial, ToolCallRecord } from "./types";
 import { codexChangePreview, editPreview, lineDiff } from "./diff";
 import { EditDiff } from "./components/EditDiff";
-import { Revealed } from "./components/Revealed";
+import { HiddenWarning, Revealed } from "./components/Revealed";
 import { subagentOf } from "./externalTools";
-import { revealHidden } from "./revealHidden";
+import { countEscapes, revealHidden } from "./revealHidden";
 import { useProjectRelative } from "./projectPath";
 
 export type ToolRenderConfig = {
@@ -612,6 +612,44 @@ export function deniedNoteText(denied: ToolCallDenial): string {
   return `blocked by auto${reason}${kind}`;
 }
 
+/** The most characters the row shows of a change; Rust already bounds what it sends, this is the
+ *  page's own limit for a payload that is not Rust's (a stored record from another build). */
+const MAX_CHANGED_NOTE_CHARS = 4000;
+
+/** What the row shows of an input the CLI's own prompt carried instead of the gate's: a `Bash`
+ *  command as the shell reads it when that is the whole difference, otherwise only the fields that
+ *  differ as compact JSON, then the fields that went away. Cut at `MAX_CHANGED_NOTE_CHARS`. */
+export function changedInputText(name: string, change: InputChange): string {
+  const fields = change.fields ?? {};
+  const removed = change.removed ?? [];
+  const keys = Object.keys(fields);
+  let text: string;
+  // Only a lone changed `command` reads as the command: any other field (a flag a hook added, a
+  // dropped one) is part of what changed, so the fields are shown as they are.
+  if (name === "Bash" && removed.length === 0 && keys.length === 1 && typeof fields.command === "string") text = fields.command;
+  else {
+    text = keys.length === 0 ? "" : (JSON.stringify(fields) ?? "");
+    if (removed.length > 0) text += `${text === "" ? "" : " "}(no longer present: ${removed.join(", ")})`;
+  }
+  const chars = Array.from(text);
+  if (chars.length > MAX_CHANGED_NOTE_CHARS) text = `${chars.slice(0, MAX_CHANGED_NOTE_CHARS).join("")}… (${chars.length - MAX_CHANGED_NOTE_CHARS} more)`;
+  return change.clipped === true ? `${text} (cut)` : text;
+}
+
+/** The muted row note for a call whose input differs from what the gate was asked about. It says what
+ *  the CLI's own prompt showed, with hidden characters drawn as escapes like every card, and claims
+ *  nothing about whether it was then allowed to run. "Differs", not "was changed": only the two
+ *  inputs are compared, and why they differ is not on any wire. */
+function ChangedInputNote({ name, change }: { name: string; change: InputChange }) {
+  const pieces = revealHidden(changedInputText(name, change));
+  return (
+    <div className="tool-rule-note tool-changed-input-note">
+      input differs from what the gate was asked; Claude Code asked about <code><Revealed pieces={pieces} /></code>
+      <HiddenWarning count={countEscapes(pieces)} what="input" />
+    </div>
+  );
+}
+
 /** `ToolResult` owns head/tail truncation so renderers do not duplicate it.
  * `opts.gated` hides invocation details already shown by the pending permission card.
  * Repeating a command or diff above a card asking to run it can make it look approved.
@@ -680,6 +718,7 @@ export function renderToolCall(
   // told so in the call's error result. Muted like the notes above; the CLI's reason verbatim, and
   // the kind of refusal only when it was not the classifier's (a settings deny rule, the mode).
   const deniedNote = call.denied === undefined ? null : <div className="tool-rule-note tool-denied-note">{deniedNoteText(call.denied)}</div>;
+  const changedNote = call.changedInput === undefined ? null : <ChangedInputNote name={call.name} change={call.changedInput} />;
   const shown = call.result === null || showResult || opts.detailed === true;
   const subagent = subagentOf(call.name, call.input);
   return (
@@ -694,6 +733,7 @@ export function renderToolCall(
       {autoNote}
       {promptNote}
       {deniedNote}
+      {changedNote}
       {shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
       {!shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
         <ToolResultPreview result={call.result} wrapped={call.denied !== undefined && call.result.isError} />

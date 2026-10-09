@@ -23,7 +23,18 @@ end
 -- Every file name reaches nvim as a structured argument, never spliced into an Ex command line: in
 -- a command string a newline in the name ends the command and the rest runs as Ex, and escaping
 -- does not prevent that. `magic.file = false` also keeps `%`, `#` and wildcards in a name literal.
+-- A name that starts with `+` or `++` is read by `:edit` as a command or an option even with the structured
+-- argument, so only an absolute path is accepted: whoever builds a request has to qualify the name, and a
+-- relative one fails here instead of reaching nvim.
+local function absolute(path)
+  if type(path) ~= 'string' or path:sub(1, 1) ~= '/' then
+    error('scratch path is not absolute: ' .. tostring(path))
+  end
+  return path
+end
+
 local function run(cmd, path, mods)
+  path = absolute(path)
   vim.api.nvim_cmd({ cmd = cmd, args = { path }, mods = mods or {}, magic = { file = false } }, {})
 end
 
@@ -43,6 +54,7 @@ end
 -- read here and put into a buffer whose 'modeline' is already off. The buffer still carries the
 -- file's name, so `:ls` says what it is and the editor-context feed knows it as a scratch buffer.
 local function view(path)
+  path = absolute(path)
   local f = assert(io.open(path, 'rb'))
   local text = f:read('a')
   f:close()

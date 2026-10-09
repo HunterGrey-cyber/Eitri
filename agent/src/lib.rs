@@ -23,6 +23,10 @@ mod runtime_thread;
 mod session;
 #[cfg(not(feature = "legacy-backend"))]
 mod session_stub;
+/// Runs a test body under a chosen umask in a child copy of the test binary, so the process-wide
+/// umask is never changed while other tests create files.
+#[cfg(test)]
+mod test_umask;
 #[cfg(feature = "legacy-backend")]
 mod wire;
 /// Scans source for routes to an ungated `claude` process. This module is test-only so its own
@@ -64,7 +68,7 @@ pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, U
 pub use permission_policy::{
     classify_permission_request, classify_with_rules, rule_that_allows, Classification, PermissionVerdict,
 };
-pub use permission_rules::{PrefixRule, PrefixRules};
+pub use permission_rules::{PrefixRule, PrefixRules, RuleRefusal};
 pub use persistence::{resumable_sessions, NameUpdate, ResumableSession};
 #[cfg(feature = "legacy-backend")]
 pub use process::AgentProcess;
@@ -91,9 +95,9 @@ pub const LEGACY_NOT_IN_BUILD: &str =
 
 pub use projection::{
     describe_failed_resume, AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice,
-    HistorySource, MatchedAskRule, PermissionOutcome, PermissionRequestRecord, ProjectionStatus, ProviderPrompt,
-    ResumeStatus, TokenUsage, ToolCallDenial, ToolCallRecord, ToolCallResult, TranscriptMessage, TurnEndDetail,
-    TurnEndingKind, TurnEndingRecord, TurnOutcome, UngatedCliModeRecord, UsageInfo, UserPromptRecord,
+    HistorySource, InputChange, MatchedAskRule, PermissionOutcome, PermissionRequestRecord, ProjectionStatus,
+    ProviderPrompt, ResumeStatus, TokenUsage, ToolCallDenial, ToolCallRecord, ToolCallResult, TranscriptMessage,
+    TurnEndDetail, TurnEndingKind, TurnEndingRecord, TurnOutcome, UngatedCliModeRecord, UsageInfo, UserPromptRecord,
     MAX_TURN_END_MESSAGE_CHARS,
 };
 pub use provider::{

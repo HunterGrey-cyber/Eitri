@@ -98,6 +98,12 @@ const ALLOWED_ARM: (&str, &str) = (
 /// `allowDangerouslySkipPermissions` that enable it.
 const FORBIDDEN_ANY_CASE: &[&str] = &["bypasspermissions", "dangerously", "allow_dangerously"];
 
+/// The one production read of a word [`FORBIDDEN_ANY_CASE`] holds that is not a CLI flag or mode:
+/// the Bash tool's own input key, which the permission policy reads off a call the model made so that
+/// a call asking to leave the sandbox is carded. It is a key of the model's input, never something
+/// Eitri passes to the CLI; allowed only as this exact literal, only in this file, and only once.
+const ALLOWED_INPUT_KEY: (&str, &str) = ("permission_policy.rs", "\"dangerouslyDisableSandbox\"");
+
 /// Exact substrings forbidden in production sources: prost setters that could build an
 /// ungated policy without a struct literal, and the mid-session permission-mode switch.
 const FORBIDDEN_EXACT: &[&str] = &[
@@ -121,6 +127,8 @@ struct Report {
     scanned: BTreeSet<String>,
     skipped: BTreeSet<String>,
     allowlisted: usize,
+    /// How many times [`ALLOWED_INPUT_KEY`] was read in its own file.
+    input_key_reads: usize,
     /// How many times each [`AUTO_SITES`] entry was found, by its index.
     auto_sites_found: BTreeMap<usize, usize>,
 }
@@ -830,6 +838,15 @@ fn check_request_literals(rel: &str, code: &str, offenders: &mut Vec<String>) {
                     snippet(code, at)
                 ));
             }
+            // `Some(Default::default())` or `Some(<ClaudeHostPolicy as Default>::default())` is
+            // `Some(..)` and states none of the policy's fields.
+            if policy.as_deref().is_some_and(|v| v.contains("::default(")) {
+                offenders.push(format!(
+                    "{rel}: a CreateSessionRequest literal's `policy` is built from `default()`, which \
+                     states none of the gate's fields: {}",
+                    snippet(code, at)
+                ));
+            }
         }
     }
 }
@@ -966,6 +983,7 @@ fn check_file(
     code: &str,
     crate_aliases: &BTreeSet<String>,
     allowlisted: &mut usize,
+    input_key_reads: &mut usize,
     auto_sites_found: &mut BTreeMap<usize, usize>,
     offenders: &mut Vec<String>,
 ) {
@@ -974,8 +992,18 @@ fn check_file(
     }
     let lower = code.to_lowercase();
     for word in FORBIDDEN_ANY_CASE {
-        if let Some(at) = lower.find(word) {
+        for (at, _) in lower.match_indices(word) {
+            let is_the_input_key = rel == ALLOWED_INPUT_KEY.0
+                && at > 0
+                && code
+                    .get(at - 1..)
+                    .is_some_and(|rest| rest.starts_with(ALLOWED_INPUT_KEY.1));
+            if is_the_input_key && *input_key_reads == 0 {
+                *input_key_reads += 1;
+                continue;
+            }
             offenders.push(format!("{rel}: `{word}` (any case): {}", snippet(code, at)));
+            break;
         }
     }
     for text in FORBIDDEN_EXACT {
@@ -1000,6 +1028,13 @@ fn check_file(
         ".permissions",
         ".cli_permission_mode",
         ".cli_auto_mode",
+        // The trust and identity fields of a policy, and the request's policy itself: assigned
+        // after the literal was checked, they would replace what it stated.
+        ".setting_sources",
+        ".tool_policy",
+        ".executable",
+        ".configuration",
+        ".policy",
     ] {
         for (at, _) in tight.match_indices(field) {
             let after = &tight[at + field.len()..];
@@ -1113,6 +1148,7 @@ fn scan_tree(files: &BTreeMap<String, String>) -> Report {
             code,
             &crate_aliases,
             &mut report.allowlisted,
+            &mut report.input_key_reads,
             &mut report.auto_sites_found,
             &mut report.offenders,
         );
@@ -1172,6 +1208,11 @@ fn no_production_source_can_reach_an_ungated_cli() {
         report.allowlisted, 1,
         "the allowlisted `PermissionModeChanged` decode arm in {} was not found",
         ALLOWED_ARM.0
+    );
+    assert_eq!(
+        report.input_key_reads, 1,
+        "the allowlisted read of {} in {} was not found exactly once",
+        ALLOWED_INPUT_KEY.1, ALLOWED_INPUT_KEY.0
     );
     // And so is a stale auto site: each must be there, once.
     for (i, (file, text)) in AUTO_SITES.iter().enumerate() {
@@ -1256,6 +1297,16 @@ fn a_session_request_states_a_policy() {
     for body in ["cwd: c, policy: None", "cwd: c", "cwd: c, policy", "cwd: c, ..base"] {
         let bad = format!("{head}fn r() -> R {{ R {{ {body} }} }}\n");
         assert!(!one("x.rs", &bad).offenders.is_empty(), "`{body}` must be refused");
+    }
+    // A policy built from `default` is `Some(..)` and states nothing.
+    for value in [
+        "Some(Default::default())",
+        "Some(<ClaudeHostPolicy as Default>::default())",
+        "Some(ClaudeHostPolicy::default())",
+        "Some( Default :: default() )",
+    ] {
+        let bad = format!("{head}fn r() -> R {{ R {{ cwd: c, policy: {value} }} }}\n");
+        assert!(!one("x.rs", &bad).offenders.is_empty(), "`{value}` must be refused");
     }
     // The crate's own request type of the same name is not the wire's.
     let own =
@@ -1374,6 +1425,11 @@ fn compound_assignments_and_spaced_fields_are_assignments() {
         "p.permissions",
         "p.permission_mode_switchable",
         "c.cli_auto_mode",
+        "p.setting_sources",
+        "p.tool_policy",
+        "p.executable",
+        "p.configuration",
+        "req.policy",
     ] {
         for op in ["=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>="] {
             let src = format!("fn f() {{ {field} {op} 1; }}");
@@ -1386,6 +1442,11 @@ fn compound_assignments_and_spaced_fields_are_assignments() {
         "fn f(p: &mut ClaudeHostPolicy) { policy. permissions  += 3; }",
         "fn f(p: &mut ClaudeHostPolicy) { policy .permission_mode_switchable ^= true; }",
         "fn f(c: &mut ProviderCapabilities) { c . cli_auto_mode &= x; }",
+        "fn f(p: &mut ClaudeHostPolicy) { p . setting_sources = None; }",
+        "fn f(p: &mut ClaudeHostPolicy) { p.tool_policy\n    = None; }",
+        "fn f(p: &mut ClaudeHostPolicy) { p.executable = 1; }",
+        "fn f(p: &mut ClaudeHostPolicy) { p . configuration |= 1; }",
+        "fn f(r: &mut CreateSessionRequest) { r .policy = None; }",
     ] {
         assert_eq!(one("x.rs", src).offenders.len(), 1, "{src}");
     }
@@ -1394,6 +1455,9 @@ fn compound_assignments_and_spaced_fields_are_assignments() {
         "fn f(p: &ClaudeHostPolicy) -> bool { p.permissions == 3 }",
         "fn f(p: &ClaudeHostPolicy) -> bool { p . cli_permission_mode != 0 && p.permissions >= 1 }",
         "fn f(p: &ClaudeHostPolicy) -> bool { p.permissions <= 2 || p.cli_permission_mode >> 1 > 0 }",
+        "fn f(p: &ClaudeHostPolicy) -> bool { p.setting_sources == q && p.executable != 1 && p.configuration == 0 }",
+        "fn f(r: &CreateSessionRequest) -> bool { r.policy == None || r.tool_policy.is_none() }",
+        "fn f(r: &R) -> usize { r.policy_count + r.configuration_len }",
     ] {
         assert!(
             one("x.rs", src).offenders.is_empty(),
@@ -1576,6 +1640,36 @@ fn test_code_is_not_scanned() {
     assert_eq!(report.offenders.len(), 1, "{:?}", report.offenders);
     assert!(report.offenders[0].starts_with("probe.rs"), "{:?}", report.offenders);
     assert_eq!(report.skipped, BTreeSet::from(["a/deep.rs".to_string()]));
+}
+
+/// The Bash input key the permission policy reads passes only as that exact literal, in that file,
+/// once; the flags and the mode the guard exists for are still caught there and everywhere else.
+#[test]
+fn the_allowlisted_input_key_passes_only_as_itself_in_its_own_file() {
+    let read = "fn f(key: &str) -> bool { key == \"dangerouslyDisableSandbox\" }\n";
+    let report = one(ALLOWED_INPUT_KEY.0, read);
+    assert!(report.offenders.is_empty(), "{:?}", report.offenders);
+    assert_eq!(report.input_key_reads, 1);
+    // The same literal in any other file fails.
+    assert_eq!(one("process.rs", read).offenders.len(), 1);
+    // A second copy in the right file fails.
+    let twice = format!("{read}fn g(k: &str) -> bool {{ k == \"dangerouslyDisableSandbox\" }}\n");
+    assert_eq!(one(ALLOWED_INPUT_KEY.0, &twice).offenders.len(), 1);
+    // Another spelling of the word in the right file fails: the flag, the SDK option, the key unquoted.
+    for text in [
+        "const A: &str = \"--dangerously-skip-permissions\";",
+        "const A: &str = \"--allow-dangerously-skip-permissions\";",
+        "const A: &str = \"allowDangerouslySkipPermissions\";",
+        "fn f(i: &I) -> bool { i.dangerouslyDisableSandbox }",
+        "const A: &str = \"DangerouslyDisableSandbox\";",
+    ] {
+        let report = one(ALLOWED_INPUT_KEY.0, &format!("{read}{text}\n"));
+        assert_eq!(report.offenders.len(), 1, "{text}: {:?}", report.offenders);
+    }
+    // And the allowed read does not hide a flag or the ungated mode beside it.
+    let beside =
+        format!("{read}const B: &str = \"--dangerously-skip-permissions\"; const C: &str = \"bypassPermissions\";\n");
+    assert_eq!(one(ALLOWED_INPUT_KEY.0, &beside).offenders.len(), 2);
 }
 
 #[test]

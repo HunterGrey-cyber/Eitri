@@ -101,6 +101,18 @@ describe("a Codex file change card", () => {
   });
 });
 
+describe("a Codex file change of a kind this build does not know", () => {
+  it("names Codex's kind word with hidden characters revealed", () => {
+    const request = requestOf("file_change");
+    const input = request.input as { changes: Array<Record<string, unknown>> };
+    const { container } = card({ ...request, input: { ...input, changes: [{ ...input.changes[0], kind: "re\u202ename", movePath: undefined }] } });
+    const note = container.querySelector(".permission-card-edit-note")!;
+    expect(note.textContent).toBe("Change of kind re⟨U+202E⟩name.");
+    expect(note.textContent).not.toContain("\u202e");
+    expect(container.textContent).toContain("kind holds 1 invisible");
+  });
+});
+
 describe("a Codex tool call card", () => {
   it("shows the server, the tool and the arguments as JSON", () => {
     const { container } = card(requestOf("mcp"));

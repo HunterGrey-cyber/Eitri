@@ -376,6 +376,7 @@ mod tests {
             input: serde_json::json!({"file_path": "/p/a.rs"}),
             result: None,
             denied: None,
+            changed_input: None,
         }
     }
 

@@ -486,4 +486,14 @@ describe("what a reply cannot draw or link to", () => {
     expect(el.textContent).toContain("c");
     expect(el.querySelector("th")!.getAttribute("align")).toBe("center");
   });
+
+  it("drops a scheme holding digits, plus, dot or dash, and keeps relative links", () => {
+    const el = host(
+      "[a](h323:hello) [b](web+foo1:hello) [c](a.b-c+1:x) [d](z39.50s:x) [e](H323:hello) " +
+        "[f](docs/a1.md) [g](page2.html) [h](#frag) [i](./v1:x) [j](docs/v1:x)\n",
+    );
+    const hrefs = Object.fromEntries(Array.from(el.querySelectorAll("a")).map((a) => [a.textContent, a.getAttribute("href")]));
+    for (const dropped of ["a", "b", "c", "d", "e"]) expect(hrefs[dropped] ?? null, dropped).toBeNull();
+    expect(hrefs).toMatchObject({ f: "docs/a1.md", g: "page2.html", h: "#frag", i: "./v1:x", j: "docs/v1:x" });
+  });
 });

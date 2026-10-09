@@ -91,6 +91,8 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::PermissionDenied { .. } => "PermissionDenied",
             AgentDomainEvent::PolicyMismatch { .. } => "PolicyMismatch",
             AgentDomainEvent::AccountLimits { .. } => "AccountLimits",
+            // Derived by ingestion, never read off the wire: matched for exhaustiveness.
+            AgentDomainEvent::ToolInputChanged { .. } => "ToolInputChanged",
         };
         *counts.entry(kind).or_default() += 1;
     }

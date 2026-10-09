@@ -1,0 +1,123 @@
+{
+  "events": {
+    "events": [
+      {
+        "cwd": "/project",
+        "model": "claude-sonnet-5",
+        "provider_session_id": "prov-1",
+        "session_id": "sess-1",
+        "type": "session_opened"
+      },
+      {
+        "turn_id": "t1",
+        "type": "turn_started"
+      },
+      {
+        "input": {
+          "command": "git push --force origin main"
+        },
+        "name": "Bash",
+        "tool_use_id": "toolu_1",
+        "turn_id": "t1",
+        "type": "tool_call_started"
+      },
+      {
+        "input": {
+          "command": "rtk git push --force origin main‮"
+        },
+        "permission_id": "c1",
+        "provider_prompt": {
+          "blocked_path": null,
+          "description": null,
+          "matched_ask_rule": null,
+          "reason": null
+        },
+        "tool_name": "Bash",
+        "tool_use_id": "toolu_1",
+        "type": "permission_requested"
+      },
+      {
+        "change": {
+          "fields": {
+            "command": "rtk git push --force origin main‮"
+          }
+        },
+        "tool_use_id": "toolu_1",
+        "type": "tool_input_changed"
+      }
+    ],
+    "fromRevision": 0,
+    "kind": "events",
+    "tab": 1,
+    "throughRevision": 7
+  },
+  "snapshot": {
+    "kind": "snapshot",
+    "state": {
+      "accountLimits": null,
+      "activeTurnId": "t1",
+      "assistantMessageOpen": false,
+      "backend": "sidecar",
+      "capabilities": {
+        "bypassPermissionMode": true,
+        "fork": false,
+        "interrupt": true,
+        "resume": true
+      },
+      "conversationId": null,
+      "cwd": "/project",
+      "history": null,
+      "lastTurnEnding": null,
+      "model": "claude-sonnet-5",
+      "pendingPermissions": [
+        {
+          "input": {
+            "command": "rtk git push --force origin main‮"
+          },
+          "permissionId": "c1",
+          "providerPrompt": {
+            "blockedPath": null,
+            "description": null,
+            "matchedAskRule": null,
+            "reason": null,
+            "unrecognizedOrigin": null
+          },
+          "seq": 5,
+          "toolName": "Bash",
+          "toolUseId": "toolu_1"
+        }
+      ],
+      "provider": null,
+      "providerSessionId": "prov-1",
+      "sessionId": "sess-1",
+      "status": {
+        "kind": "running"
+      },
+      "toolCalls": [
+        {
+          "changedInput": {
+            "fields": {
+              "command": "rtk git push --force origin main‮"
+            }
+          },
+          "input": {
+            "command": "git push --force origin main"
+          },
+          "name": "Bash",
+          "result": null,
+          "seq": 2,
+          "toolUseId": "toolu_1",
+          "turnId": "t1"
+        }
+      ],
+      "transcript": [],
+      "turnEndings": [],
+      "usage": null,
+      "userPrompts": []
+    },
+    "tab": 1,
+    "throughRevision": 7,
+    "turnStartedAtMs": null
+  },
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_changed_input_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

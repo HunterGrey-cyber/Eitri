@@ -65,7 +65,7 @@ test('a raise from nvim: the partner is the sender\'s chain, then nvim\'s own; C
     // has focus with the user's Enter in it, and ActivateOwn pulls focus to the panel.
     const raise = {
         method: 'ActivateOwn', callerPid: 100, partnerChain: [4321, 210, 205, 200], focusedId: 2,
-        focusGained64: NOW - 60_000, focusGainedByUs: false, now64: NOW, idleMs: 30, modal: false,
+        callerFocusedAt64: NOW - 1_000, focusGained64: NOW - 60_000, focusGainedByUs: false, now64: NOW, idleMs: 30, modal: false,
         windows: windows().map(w => (w.id === 2 ? {...w, userTime: NOW - 30} : w)),
     };
     assert.deepEqual(decide(raise), {act: true, target: 1});
@@ -111,7 +111,8 @@ test('the origin of a pull binds ActivatePartner only: the other methods are jud
         direction: 'left'})), {act: true, target: 2});
     // B pulled from somewhere else: A's ActivateOwn on a fresh key in B is not about the origin.
     const own = {
-        method: 'ActivateOwn', callerPid: 100, partnerChain: [200], focusedId: 2, focusGained64: NOW - 1_000,
+        method: 'ActivateOwn', callerPid: 100, callerFocusedAt64: NOW - 1_000, partnerChain: [200], focusedId: 2,
+        focusGained64: NOW - 1_000,
         focusGainedByUs: true, focusGainedFrom: 999, now64: NOW, idleMs: 30, modal: false,
         windows: windows().map(w => (w.id === 2 ? {...w, userTime: NOW - 30} : w)),
     };

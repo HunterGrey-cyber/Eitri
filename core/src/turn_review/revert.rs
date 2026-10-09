@@ -41,7 +41,7 @@ use super::lifecycle::{
 };
 use super::presence::{Blocked, PresenceGuard};
 use super::shadow::{validate_session, Entry, EntryKind, Shadow, ShadowError, READ_TIMEOUT};
-use super::write::{read_current, replace, Content, Current, FsHooks, ProjectDir, Target, WriteError};
+use super::write::{holds_durably, read_current, replace, Content, Current, FsHooks, ProjectDir, Target, WriteError};
 
 /// The Lua that asks the editor about one file's buffers. Its arguments are
 /// [`buffer_state_args`]; its answer is read by [`parse_buffer_state`].
@@ -421,6 +421,18 @@ pub enum RecoverAnswer {
     Dismiss,
 }
 
+/// How an interrupted revert was handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovered {
+    /// The file's earlier bytes were put back.
+    Restored,
+    /// The entry was forgotten on request; the file was not touched.
+    Dismissed,
+    /// The file already held exactly the bytes and mode the interrupted write was making, so it was
+    /// left as it is (synced first) and the entry was forgotten.
+    AlreadyWritten,
+}
+
 /// Called right before the last checks of a write; tests use it to change the world there.
 type FinalHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -791,12 +803,13 @@ impl RecoveriesJob {
 }
 
 impl RecoverJob {
-    pub fn run(self) -> Result<(), Refusal> {
+    pub fn run(self) -> Result<Recovered, Refusal> {
         match self.answer {
             RecoverAnswer::Dismiss => {
                 let (shadow, journal) = open_store(&self.spec)?;
                 let (entry, _claim) = claim(&journal, &self.entry)?;
-                journal.remove(&entry.id, &shadow).map_err(store_failed)
+                journal.remove(&entry.id, &shadow).map_err(store_failed)?;
+                Ok(Recovered::Dismissed)
             }
             RecoverAnswer::Restore(ref clear) => {
                 self.guard.check().map_err(Refusal::Blocked)?;
@@ -818,7 +831,10 @@ impl RecoverJob {
 }
 
 /// Puts back what `entry` names. There is no comparison with an expected state: the bytes a crash
-/// left are unknown, so they are kept (stored and anchored) instead.
+/// left are unknown, so they are kept (stored and anchored) instead. The one state that is known is
+/// the file already holding the entry's intended bytes with its intended mode: the write finished,
+/// and the entry is only forgotten. An entry that does not say which mode was intended (an older
+/// build's) is never taken for finished.
 fn restore_entry(
     spec: &ShadowSpec,
     guard: &PresenceGuard,
@@ -827,12 +843,38 @@ fn restore_entry(
     journal: &Journal,
     entry: &JournalEntry,
     hook: Option<&FinalHook>,
-) -> Result<(), Refusal> {
+) -> Result<Recovered, Refusal> {
     let rel = entry.path.clone();
     let (root, target) = locate(clear, &spec.root, &rel, &entry.session)?;
     let current = read_current(&target).map_err(|e| read_failed(&rel, e))?;
     if current == Current::Other {
         return Err(Refusal::NotRegular);
+    }
+    // A write that was verified but whose entry could not be removed leaves the file holding
+    // exactly what it was to hold; putting the earlier bytes over that would undo good work. The
+    // mode counts too: a write killed after its last byte but before its mode was set left the
+    // right bytes with the wrong mode, which only a restore puts right.
+    if let (Current::Regular { bytes, mode }, Some(intended), Some(intended_mode)) =
+        (&current, entry.intended.as_deref(), entry.intended_mode)
+    {
+        if *mode == intended_mode
+            && shadow.read_stored(intended).map_err(store_failed)?.as_deref() == Some(bytes.as_slice())
+        {
+            // The entry is the only way back to the earlier bytes, so it goes only once the bytes
+            // that make it unneeded are on disk. Should the file have changed since it was read,
+            // the restore below judges it like any other.
+            let durable = holds_durably(&target, bytes, intended_mode)
+                .map_err(|e| Refusal::Unavailable(format!("{} could not be synced: {e}", rel.display())))?;
+            if durable {
+                journal.remove(&entry.id, shadow).map_err(|e| {
+                    Refusal::Unavailable(format!(
+                        "{} already holds what the interrupted revert was writing; its entry could not be forgotten: {e}",
+                        rel.display()
+                    ))
+                })?;
+                return Ok(Recovered::AlreadyWritten);
+            }
+        }
     }
     let pre_blob = entry.pre.as_deref().ok_or_else(|| {
         Refusal::Unavailable("this interrupted revert kept no copy of the file's earlier bytes".into())
@@ -865,7 +907,8 @@ fn restore_entry(
         Refusal::Unavailable(format!(
             "{shown} was restored, but its interrupted revert could not be forgotten: {e}"
         ))
-    })
+    })?;
+    Ok(Recovered::Restored)
 }
 
 // ---- the steps every write shares ----------------------------------------------------------------

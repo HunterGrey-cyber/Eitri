@@ -710,9 +710,9 @@ def lock_package_sources(lock_text: str, name: str) -> list[str | None]:
 
 # --- 12. The scan view on disk -----------------------------------------------------------------
 
-# publish/scan.sh skips directories with these names in a checkout because they
-# contain build output. Release assets ship their contents, including the built
-# agent-ui/web/dist/index.html, so rename these directories to include them in the scan.
+# publish/scan.sh now reads directories with these names and skips only top-level .git.
+# Keep renaming them in scan views as an extra precaution: extracted assets ship their
+# contents, including agent-ui/web/dist/index.html, so they must be scanned.
 SCAN_VIEW_RENAMED_DIRS = ("dist", "target", "node_modules")
 # publish/scan.sh skips the top-level fork submodule checkout in a public tree.
 # The source asset ships that pinned fork's source, so rename it for scanning too.

@@ -158,5 +158,7 @@ fn print_event(event: &AgentDomainEvent) {
         AgentDomainEvent::UngatedCliMode { reported, detail } => {
             println!("[ungated CLI mode] {reported} (from {detail}) -- the host closes such a session (R07)");
         }
+        // Derived by ingestion, which this demo does not run: nothing to print.
+        AgentDomainEvent::ToolInputChanged { .. } => {}
     }
 }

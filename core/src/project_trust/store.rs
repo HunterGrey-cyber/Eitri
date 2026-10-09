@@ -8,7 +8,8 @@
 //! agent, is a different file -- and no other program's notion of trust is read.
 //!
 //! A record that cannot be used (missing, not JSON, another version, another root, owned by
-//! someone else, a link, a FIFO) reads as untrusted and is left where it is: another user may have
+//! someone else, a link, a FIFO, or written after a prompt that showed less than this one does)
+//! reads as untrusted and is left where it is: another user may have
 //! planted it, and renaming it aside would only move their file around. Answering `y` replaces it
 //! atomically instead; the rename puts a new file in the name's place and never follows a planted
 //! link.
@@ -30,6 +31,14 @@ use crate::layout::persist;
 
 /// A record larger than this is not one of ours.
 const MAX_RECORD_BYTES: u64 = 1 << 20;
+
+/// How much the prompt a record answered showed. A `y` is about what the person saw, not only about
+/// the bytes the fingerprint covers: an earlier prompt cut long values short, gave `env` names
+/// without their values and left out some fields of MCP servers and hooks, so a `y` given to it
+/// covered less than the same configuration shows now. A record of a lower disclosure (or none,
+/// which every record written before this field existed has) is not trust, and the project is
+/// asked about once more. Raise this whenever the prompt starts showing something it hid before.
+pub const DISCLOSURE: u32 = 2;
 
 /// What changed between the trusted configuration and the one found now, by path relative to the
 /// top level.
@@ -82,6 +91,9 @@ struct Record {
     /// The profile's key for every agent but Claude, whose records predate profiles and carry none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
+    /// [`DISCLOSURE`] when the record was written; 0 for a record from before the field existed.
+    #[serde(default)]
+    disclosure: u32,
 }
 
 /// What a record for `profile` says it is about: nothing for Claude, else the profile's key.
@@ -168,6 +180,7 @@ impl TrustStore {
         let bytes = read_regular_nofollow(&path, MAX_RECORD_BYTES, Owner::Me).ok()?;
         let record: Record = serde_json::from_slice(&bytes).ok()?;
         let usable = record.version == 1
+            && record.disclosure >= DISCLOSURE
             && record.profile == profile_field(profile)
             && root.to_str() == Some(record.root.as_str())
             && record.fingerprint.len() == 64
@@ -207,6 +220,7 @@ impl TrustStore {
             fingerprint: discovery.fingerprint.hex(),
             files: files_of(discovery),
             profile: profile_field(&discovery.profile),
+            disclosure: DISCLOSURE,
         };
         let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
         persist::create_state_dir(dir)?;

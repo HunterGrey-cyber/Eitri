@@ -1277,7 +1277,7 @@ fn item_of(finding: &Finding) -> TrustItemView {
             };
             item("mcp_server", file, label, command_line.clone())
         }
-        Finding::EnvKey { file, key } => item("env_key", file, "env".to_string(), key.clone()),
+        Finding::Env { file, key, value } => item("env", file, "env".to_string(), format!("{key}={value}")),
         Finding::ApiKeyHelper { file, command } => {
             item("api_key_helper", file, "apiKeyHelper".to_string(), command.clone())
         }
@@ -2621,9 +2621,10 @@ mod tests {
                 command_line: "srv".into(),
                 approval_mode: Some("approve".into()),
             },
-            Finding::EnvKey {
+            Finding::Env {
                 file: p(SETTINGS),
                 key: "K".into(),
+                value: "v".into(),
             },
             Finding::ApiKeyHelper {
                 file: p(SETTINGS),
@@ -2749,7 +2750,7 @@ mod tests {
                     "srv",
                     false,
                 ),
-                ("env_key", SETTINGS, "env", "K", false),
+                ("env", SETTINGS, "env", "K=v", false),
                 ("api_key_helper", SETTINGS, "apiKeyHelper", "helper", false),
                 ("allow", SETTINGS, "permissions.allow", "Bash(ls)", false),
                 ("additional_directory", SETTINGS, "additionalDirectories", "/x", false),

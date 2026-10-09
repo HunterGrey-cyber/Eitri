@@ -103,7 +103,18 @@ pub struct ScratchDir {
 impl ScratchDir {
     /// `None`, logged, when the directory cannot be made: `Ctrl+g` then answers with a notice.
     pub fn new() -> Option<Self> {
-        let tmp = std::env::temp_dir();
+        // The snippet accepts only absolute paths, and a relative `TMPDIR` would hand it relative ones.
+        let tmp = match std::path::absolute(std::env::temp_dir()) {
+            Ok(tmp) => tmp,
+            Err(e) => {
+                // An empty `TMPDIR` has no absolute form; say so rather than leaving `Ctrl+g` unexplained.
+                eprintln!(
+                    "[scratch] could not make the temporary directory {} absolute: {e} -- Ctrl+g is unavailable",
+                    std::env::temp_dir().display()
+                );
+                return None;
+            }
+        };
         crate::instance_dir::sweep_stale_instance_dirs(&tmp, DIR_PREFIX, NO_SOCKET, "scratch");
         Self::in_dir(&tmp)
     }

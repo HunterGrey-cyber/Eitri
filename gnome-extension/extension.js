@@ -8,7 +8,9 @@ import Meta from 'gi://Meta';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-import {TESTING_ENV, cleanPartnerList, decide, testingMethodsWanted} from './policy.js';
+import {
+    TESTING_ENV, callerFocusedAt, cleanPartnerList, decide, newHeldFocus, noteHeldFocus, testingMethodsWanted,
+} from './policy.js';
 
 const BUS_NAME = 'cn.huntergrey.Eitri.Shell1';
 const OBJECT_PATH = '/cn/huntergrey/Eitri/Shell1';
@@ -26,8 +28,8 @@ function interfaceXml(extraMethods) {
     return `<node><interface name="${BUS_NAME}">${METHODS_XML}${extraMethods}</interface></node>`;
 }
 
-// Never more entries than windows that ever had focus; the map is trimmed to live windows when it grows past this.
-const FOCUS_RECORDS_TRIM_AT = 64;
+// The focus-gain map is trimmed to live windows when it grows past this.
+const FOCUS_GAINED_TRIM_AT = 64;
 
 function debug(message) {
     console.debug(`Eitri: ${message}`);
@@ -97,6 +99,9 @@ class EitriShell {
         // focus notify is still to come; and, for the extension's own activation, the pid whose window had focus when
         // it was made (0 when none, or for a gain the user made).
         this._focusGained = new Map();
+        // Which Wayland windows held focus, and when (policy.js, `noteHeldFocus`/`callerFocusedAt`): the input to
+        // `callerHeldFocus`. Lost with the extension, as a screen lock disables it.
+        this._held = newHeldFocus();
         this._signals = [];
         this._exported = null;
         this._ownId = 0;
@@ -143,6 +148,7 @@ class EitriShell {
             Gio.bus_unwatch_name(entry.watchId);
         this._partners.clear();
         this._focusGained.clear();
+        this._held = newHeldFocus();
         if (this._testingTeardown) {
             this._testingTeardown();
             this._testingTeardown = null;
@@ -157,6 +163,7 @@ class EitriShell {
     // The source of focus is kept from the activation's record, so the gain stays bound to the window focus left.
     _noteFocus() {
         const window = global.display.focus_window;
+        this._noteHeldFocus(window);
         if (!window)
             return;
         const previous = this._focusGained.get(window.get_id());
@@ -165,9 +172,21 @@ class EitriShell {
         this._recordFocusGained(window, {at: monotonicMs(), byUs: ours, pending: false, from});
     }
 
+    // Records the focus change for `callerHeldFocus`: kept per window id, which the shell never reuses, and not per
+    // pid, so a process that gets a closed application's pid number must not inherit the time that application's
+    // window held focus.
+    _noteHeldFocus(window) {
+        const focus = window ? {
+            id: window.get_id(),
+            pid: pidOf(window),
+            wayland: window.get_client_type() === Meta.WindowClientType.WAYLAND,
+        } : null;
+        noteHeldFocus(this._held, focus, monotonicMs());
+    }
+
     _recordFocusGained(window, record) {
         this._focusGained.set(window.get_id(), record);
-        if (this._focusGained.size > FOCUS_RECORDS_TRIM_AT) {
+        if (this._focusGained.size > FOCUS_GAINED_TRIM_AT) {
             const live = new Set(allWindows().map(w => w.get_id()));
             for (const id of [...this._focusGained.keys()]) {
                 if (!live.has(id))
@@ -298,6 +317,8 @@ class EitriShell {
             method,
             direction,
             callerPid,
+            // Still holding focus counts as now, however long ago it began.
+            callerFocusedAt64: callerFocusedAt(this._held, callerPid, snapshot.windows, snapshot.now64),
             partnerChain: this._partners.get(sender)?.pids ?? [],
             focusedId: snapshot.focusedId,
             focusGained64: snapshot.focusGained64,

@@ -1142,7 +1142,7 @@ fn an_editor_revert_the_editor_cannot_vouch_for_is_never_called_only_in_the_edit
 /// that is genuinely half written.
 const CRASH_NEW_LEN: usize = 200 * 1024;
 
-/// The child of the recovery tests: an in-place rewrite of a hard-linked file that dies after its
+/// The child of the recovery tests: an in-place rewrite of a file with an extended attribute that dies after its
 /// first chunk, as a crash of a window in the middle of a revert would.
 #[test]
 #[ignore = "run by the recovery tests"]
@@ -1198,11 +1198,18 @@ fn one_crash_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     CRASH.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Kills an in-place write of `rel` halfway (the file gets a second link outside the project, so
-/// it is rewritten in place) and returns the id of the journal entry it left.
+/// Kills an in-place write of `rel` halfway (the file gets an extended attribute, so it is
+/// rewritten in place) and returns the id of the journal entry it left.
 fn crash_mid_write(f: &Fixture, rel: &str) -> String {
-    let link = f.scratch.0.join("second-link");
-    std::fs::hard_link(f.file(rel), link).unwrap();
+    let c = std::ffi::CString::new(f.file(rel).as_os_str().as_encoded_bytes()).unwrap();
+    let name = std::ffi::CString::new("user.eitri_test").unwrap();
+    #[cfg(target_vendor = "apple")]
+    // SAFETY: both strings are NUL-terminated; the value is 3 valid bytes.
+    let set = unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"yes".as_ptr().cast(), 3, 0, 0) };
+    #[cfg(not(target_vendor = "apple"))]
+    // SAFETY: both strings are NUL-terminated; the value is 3 valid bytes.
+    let set = unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"yes".as_ptr().cast(), 3, 0) };
+    assert_eq!(set, 0, "these tests need user extended attributes");
     let original = f.read(rel);
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -1375,6 +1382,31 @@ fn a_restore_puts_the_file_back_and_clears_the_offer() {
     let outs = f.run(editor.rpc(), "v1", recover("v1", &id, "restore"));
     assert_eq!(result_of(&outs, "v1"), Ok(None));
     assert_eq!(f.read("a.txt"), b"the original\n");
+    assert_eq!(offered(&outs), Some(Vec::new()));
+    assert!(pending_ids(&f).is_empty());
+    f.shut_down();
+}
+
+#[test]
+fn a_restore_of_a_finished_write_says_nothing_was_changed() {
+    let _one = one_crash_at_a_time();
+    let mut f = Fixture::new("recover-finished");
+    f.write("a.txt", b"the original\n", 0o644);
+    let id = crash_mid_write(&f, "a.txt");
+    first_offer(&mut f);
+    // The write had in fact finished; only its journal entry was left.
+    let intended: Vec<u8> = (0..CRASH_NEW_LEN).map(|i| (i % 251) as u8).collect();
+    f.write("a.txt", &intended, 0o644);
+    let editor = FakeEditor::answering(clear_buffer());
+    let outs = f.run(editor.rpc(), "v1", recover("v1", &id, "restore"));
+    assert_eq!(
+        result_of(&outs, "v1"),
+        Ok(Some(
+            "a.txt already held what the interrupted revert was writing; nothing was changed, the entry is forgotten"
+                .to_string()
+        ))
+    );
+    assert_eq!(f.read("a.txt"), intended);
     assert_eq!(offered(&outs), Some(Vec::new()));
     assert!(pending_ids(&f).is_empty());
     f.shut_down();

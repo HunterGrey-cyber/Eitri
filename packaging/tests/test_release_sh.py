@@ -360,6 +360,11 @@ class Refusals(ReleaseShTestCase):
         self.commit()
         self.assertRefused(self.run_release("--unsigned"), "Cargo.lock names an ssh source")
 
+    def test_a_missing_lockfile(self):
+        os.remove(os.path.join(self.clone, "Cargo.lock"))
+        self.commit()
+        self.assertRefused(self.run_release("--unsigned"), "has no Cargo.lock")
+
     def test_a_version_that_disagrees_with_the_workspace(self):
         self.assertRefused(self.run_release("--unsigned", version="1.0.0-rc.2"), "disagrees with")
 
@@ -591,6 +596,19 @@ class LeakScanRule(ReleaseShTestCase):
         self.assertReachedDocker(proc)
         self.assertIn("never publish them", proc.stderr)
 
+    def test_no_leak_scan_marks_the_directory_before_anything_is_built(self):
+        # The image build is where this fixture's run stops: a run that dies that early is marked already.
+        self.assertReachedDocker(self.run_release("--unsigned", "--no-leak-scan", script=self.clone_copy()))
+        rel = os.path.join(self.out, "v1.0.0-rc.1")
+        self.assertTrue(os.path.isfile(os.path.join(rel, "NOT-LEAK-SCANNED")))
+        self.assertFalse(os.path.exists(os.path.join(rel, "LEAK-SCANNED")))
+
+    def test_a_run_that_stops_before_the_scans_records_no_leak_scan(self):
+        self.assertReachedDocker(self.run_release("--unsigned"))
+        rel = os.path.join(self.out, "v1.0.0-rc.1")
+        self.assertFalse(os.path.exists(os.path.join(rel, "LEAK-SCANNED")))
+        self.assertFalse(os.path.exists(os.path.join(rel, "NOT-LEAK-SCANNED")))
+
     def test_no_leak_scan_where_the_scanner_exists(self):
         self.assertTrue(os.path.isfile(os.path.join(_PACKAGING, "..", "publish", "scan.sh")))
         self.assertRefused(self.run_release("--unsigned", "--no-leak-scan"), "where the scanner exists it always runs")
@@ -599,6 +617,49 @@ class LeakScanRule(ReleaseShTestCase):
         key, _ = self.env.keypair("k")
         self.assertRefused(self.run_release("--sign", key, "--no-leak-scan", version="1.0.0", script=self.clone_copy()),
                            "--no-leak-scan is for release candidates only")
+
+
+class LeakScanRecord(unittest.TestCase):
+    """publish/tag.sh tags only a release directory whose LEAK-SCANNED says LEAK_SCANNED=1 and names its
+    RELEASE and SHA256SUMS: the absence of NOT-LEAK-SCANNED proved nothing, because a --no-leak-scan run that
+    died before writing it left a directory tag.sh accepted."""
+
+    def setUp(self):
+        self.scratch = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+        self.rel = os.path.join(self.scratch, "rel")
+        _write(os.path.join(self.rel, "RELEASE"), "EITRI_VERSION=1.0.0-rc.1\n")
+        _write(os.path.join(self.rel, "SHA256SUMS"), "0" * 64 + "  RELEASE\n")
+
+    def sha(self, name):
+        with open(os.path.join(self.rel, name), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def test_the_record_names_what_it_was_written_for(self):
+        proc = _bash(f'record_leak_scan "{self.rel}"', dict(os.environ), self.scratch)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(os.path.join(self.rel, "LEAK-SCANNED"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), f"LEAK_SCANNED=1\nRELEASE_SHA256={self.sha('RELEASE')}\n"
+                                       f"SHA256SUMS_SHA256={self.sha('SHA256SUMS')}\n")
+
+    def test_no_record_beside_a_not_leak_scanned_marker(self):
+        _bash(f'mark_not_leak_scanned "{self.rel}"', dict(os.environ), self.scratch)
+        proc = _bash(f'record_leak_scan "{self.rel}"', dict(os.environ), self.scratch)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.rel, "LEAK-SCANNED")))
+
+    def test_host_main_records_only_after_every_scan_and_never_for_no_leak_scan(self):
+        with open(_RELEASE_SH, encoding="utf-8") as f:
+            text = f.read()
+        body = text[text.index("host_main() {"):text.index("\n}\n", text.index("host_main() {"))]
+        record = body.index('if [ "$RS_NO_LEAK_SCAN" = 0 ]; then record_leak_scan "$RS_REL"; fi')
+        for earlier in ("\tpreflight\n", "\thost_scans\n", "\tfill_notes\n", "sign_sums", "write_sums"):
+            self.assertLess(body.index(earlier), record, earlier)
+        self.assertLess(record, body.index("chmod a-w"))
+        self.assertEqual(body.count("record_leak_scan"), 1)
+        mark = body.index('if [ "$RS_NO_LEAK_SCAN" = 1 ]; then mark_not_leak_scanned "$RS_REL"; fi')
+        self.assertLess(body.index("\tprepare_dirs\n"), mark)
+        self.assertLess(mark, body.index("\tbuild_image\n"))
 
 
 class PublicCommitsRule(ReleaseShTestCase):

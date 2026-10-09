@@ -170,7 +170,18 @@ struct IngestState {
 }
 
 impl IngestState {
+    /// Folds `event`, then the event the projection derives from it (a changed tool input: the
+    /// comparison is made once, here, and the derived event is folded and delivered like any other,
+    /// so the panel learns of it even when the host answered the request it came with).
     fn fold(&mut self, event: AgentDomainEvent) {
+        let derived = self.projection.derived_after(&event);
+        self.fold_one(event);
+        if let Some(derived) = derived {
+            self.fold_one(derived);
+        }
+    }
+
+    fn fold_one(&mut self, event: AgentDomainEvent) {
         // The reducer sees every event, in order, always. Coalescing happens strictly AFTER this --
         // collapsing "assistant partial / tool start / tool result / assistant partial" into one blob
         // before the reducer would destroy boundaries the projection is defined in terms of.
@@ -636,6 +647,54 @@ pub(crate) mod tests {
             canonical_cwd: "/tmp/ws".to_string(),
             provider_advertises_resume: true,
         }
+    }
+
+    /// The changed input is derived once, at the fold, and delivered as its own event right after
+    /// the prompt it came from -- whether or not the host later answers (and so hides) the gate
+    /// request. Both revisions strictly increase, the second being the derived event's.
+    #[test]
+    fn a_cli_prompt_that_differs_from_the_gate_is_followed_by_the_event_that_says_so() {
+        let ask = |id: &str, input: serde_json::Value, from_cli: bool| AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: Some("toolu_1".into()),
+            tool_name: "Bash".into(),
+            input,
+            provider_prompt: from_cli.then(crate::ProviderPrompt::default),
+        };
+        let mut st = state();
+        st.fold(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t".into(),
+            tool_use_id: "toolu_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "a" }),
+        });
+        st.fold(ask("g", serde_json::json!({ "command": "a" }), false));
+        st.fold(ask("c", serde_json::json!({ "command": "b" }), true));
+        st.fold(ask("c2", serde_json::json!({ "command": "a" }), true));
+        let RevisedDelivery::Events(events) = st.take_revised_delivery() else {
+            panic!("events were queued");
+        };
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|(_, e)| match e {
+                AgentDomainEvent::ToolCallStarted { .. } => "started",
+                AgentDomainEvent::PermissionRequested { .. } => "asked",
+                AgentDomainEvent::ToolInputChanged { .. } => "changed",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["started", "asked", "asked", "changed", "asked"]);
+        assert!(
+            events.windows(2).all(|w| w[0].0 < w[1].0),
+            "revisions strictly increase"
+        );
+        assert_eq!(
+            st.projection.tool_calls[0]
+                .changed_input
+                .as_ref()
+                .map(|c| c.fields["command"].clone()),
+            Some(serde_json::json!("b"))
+        );
     }
 
     /// Checks the `record_written` gate while the session id is known but no record is on disk.

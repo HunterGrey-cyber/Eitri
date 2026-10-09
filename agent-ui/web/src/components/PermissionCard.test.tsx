@@ -376,8 +376,8 @@ describe("PermissionCard shows everything it asks to approve", () => {
       />,
     );
     const extra = container.querySelector(".permission-card-extra")!;
-    expect(extra.textContent).toContain("dangerouslyDisableSandbox: true");
-    expect(extra.textContent).toContain("timeout: 5000");
+    expect(extra.textContent).toContain('"dangerouslyDisableSandbox": true');
+    expect(extra.textContent).toContain('"timeout": 5000');
     expect(container.querySelector(".permission-card-command")!.textContent).toBe("$ make");
   });
 
@@ -385,7 +385,33 @@ describe("PermissionCard shows everything it asks to approve", () => {
     const { container } = render(
       <PermissionCard request={{ ...REQUEST, input: { command: "make", description: { x: 1 } } }} sessionEnded={false} onAnswer={() => {}} />,
     );
-    expect(container.querySelector(".permission-card-extra")!.textContent).toContain('description: {"x":1}');
+    expect(container.querySelector(".permission-card-extra")!.textContent).toContain('"description": {"x":1}');
+  });
+
+  it("quotes a key's name, so a newline in it cannot lay out as another key", () => {
+    const { container } = render(
+      <PermissionCard
+        request={{ ...REQUEST, input: { command: "make", "x\ntimeout": 5, "y\u2028z": 1 } }}
+        sessionEnded={false}
+        onAnswer={() => {}}
+      />,
+    );
+    const extra = container.querySelector(".permission-card-extra")!;
+    // Two keys, two lines: the newline inside the first key is drawn as JSON's escape.
+    expect(extra.textContent!.split("\n")).toEqual(['"x\\ntimeout": 5', '"y⟨U+2028⟩z": 1']);
+  });
+
+  it("draws a NotebookEdit delete's cell id through the hidden-character escapes", () => {
+    const { container } = render(
+      <PermissionCard
+        request={{ ...REQUEST, toolName: "NotebookEdit", input: { notebook_path: "/p/a.ipynb", cell_id: "c\u202e1", edit_mode: "delete" } }}
+        sessionEnded={false}
+        onAnswer={() => {}}
+      />,
+    );
+    const note = container.querySelector(".permission-card-edit-note")!;
+    expect(note.textContent).toBe("Deletes cell c⟨U+202E⟩1. The request carries no record of what it held.");
+    expect(container.querySelector(".permission-card-warning")!.textContent).toContain("change holds 1 invisible");
   });
 
   it("lists nothing extra for a plain command and description", () => {

@@ -135,14 +135,16 @@ fn parse_toml(file: &Path, bytes: &[u8], out: &mut Vec<Finding>) -> Option<toml:
             reason,
         })
     };
+    // Codex's parser is not ours, so a file this one refuses may still be loaded: its text is shown
+    // as well as why it was refused, as for a JSON file.
     let Ok(text) = std::str::from_utf8(bytes) else {
-        unparsed(out, "not UTF-8".to_string());
+        unparsed(out, format!("not UTF-8: {}", String::from_utf8_lossy(bytes)));
         return None;
     };
     match text.parse::<toml::Table>() {
         Ok(table) => Some(table),
         Err(error) => {
-            unparsed(out, error.message().to_string());
+            unparsed(out, format!("{}: {text}", error.message()));
             None
         }
     }
@@ -258,9 +260,10 @@ pub(super) fn rule_file_findings(file: &Path, bytes: &[u8]) -> Vec<Finding> {
                 text: (!scan.only_calls).then(|| text.to_string()),
             }]
         }
+        // Not text this check can scan, but still what Codex may read: shown as near as it can be.
         Err(_) => vec![Finding::Unparsed {
             file: file.to_path_buf(),
-            reason: "not UTF-8".to_string(),
+            reason: format!("not UTF-8: {}", String::from_utf8_lossy(bytes)),
         }],
     }
 }
@@ -478,6 +481,32 @@ mod tests {
                 key: "when".into(),
                 value: "\"1979-05-27T07:32:00Z\"".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn an_unparsed_toml_or_rule_file_shows_its_text() {
+        let reason = |found: Vec<Finding>| match &found[..] {
+            [Finding::Unparsed { reason, .. }] => reason.clone(),
+            other => panic!("{other:?}"),
+        };
+        let bad = reason(codex_findings(
+            Path::new("c.toml"),
+            b"[mcp_servers.x]\ncommand = \"sh -c evil\"\n[unclosed",
+        ));
+        assert!(bad.contains("command = \"sh -c evil\""), "{bad}");
+        let not_utf8 = reason(codex_findings(Path::new("c.toml"), b"command = \"run\" \xff"));
+        assert!(
+            not_utf8.starts_with("not UTF-8: ") && not_utf8.contains("command = \"run\""),
+            "{not_utf8}"
+        );
+        let rules = reason(rule_file_findings(
+            Path::new(".codex/rules/r.rules"),
+            b"prefix_rule(pattern = [\"rm\"]) \xff",
+        ));
+        assert!(
+            rules.starts_with("not UTF-8: ") && rules.contains("prefix_rule"),
+            "{rules}"
         );
     }
 

@@ -337,28 +337,37 @@ function CodexFileChanges({ input }: { input: Partial<CodexFileChangeInput> }) {
   );
 }
 
-/** What the change does to the path beyond the lines: a new file, a removed one, a move. */
+/** What the change does to the path beyond the lines: a new file, a removed one, a move. A kind this
+ *  build does not know is Codex's own word, so it is drawn through the hidden-character escapes like
+ *  every other text the agent wrote. */
 function ChangeNote({ change }: { change: CodexFileChange }) {
+  const known = change.kind === "add" || change.kind === "delete" || change.kind === "update";
+  const kindPieces = known ? null : revealHidden(String(change.kind));
   const note =
-    change.kind === "add"
-      ? "Creates a new file."
-      : change.kind === "delete"
-        ? "Deletes the file."
-        : change.kind === "update"
-          ? null
-          : `Change of kind ${change.kind}.`;
+    change.kind === "add" ? (
+      "Creates a new file."
+    ) : change.kind === "delete" ? (
+      "Deletes the file."
+    ) : kindPieces === null ? null : (
+      <>
+        Change of kind <Revealed pieces={kindPieces} />.
+      </>
+    );
   const moved = typeof change.movePath === "string" && change.movePath !== "";
   if (note === null && !moved) return null;
   return (
-    <div className="permission-card-edit-note">
-      {note}
-      {note !== null && moved ? " " : ""}
-      {moved && (
-        <>
-          Moves it to <Shown text={change.movePath!} what="path" />.
-        </>
-      )}
-    </div>
+    <>
+      <div className="permission-card-edit-note">
+        {note}
+        {note !== null && moved ? " " : ""}
+        {moved && (
+          <>
+            Moves it to <Shown text={change.movePath!} what="path" />.
+          </>
+        )}
+      </div>
+      {kindPieces !== null && <HiddenWarning count={countEscapes(kindPieces)} what="kind" />}
+    </>
   );
 }
 
@@ -468,7 +477,9 @@ function AcpCall({ input }: { input: AcpCardInput }) {
 
 /** Top-level keys of a `Bash` call other than the ones drawn above. A key such as
  *  `dangerouslyDisableSandbox` changes what the command may do, so it is part of what is approved:
- *  each is listed after the command, name and value, through the same hidden-character escapes. */
+ *  each is listed after the command, name and value, through the same hidden-character escapes. The
+ *  name is quoted as JSON, like the value: a key holding a newline would otherwise lay out as lines
+ *  of its own that read like other keys. */
 function drawnAbove(key: string, value: unknown): boolean {
   return (key === "command" || key === "description") && typeof value === "string";
 }
@@ -476,7 +487,7 @@ function drawnAbove(key: string, value: unknown): boolean {
 function ExtraBashFields({ fields }: { fields: Record<string, unknown> }) {
   const extra = Object.keys(fields).filter((key) => !drawnAbove(key, fields[key]));
   if (extra.length === 0) return null;
-  const pieces = revealHidden(extra.map((key) => `${key}: ${JSON.stringify(fields[key]) ?? "undefined"}`).join("\n"));
+  const pieces = revealHidden(extra.map((key) => `${JSON.stringify(key)}: ${JSON.stringify(fields[key]) ?? "undefined"}`).join("\n"));
   return (
     <>
       <pre className="permission-card-input permission-card-extra">
