@@ -370,12 +370,14 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
 #[test]
 #[ignore]
 fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
+    std::env::set_var("EITRI_SIDECAR_TEST_SEAMS", "1");
     for (k, v) in [("VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS", "1000")] {
         std::env::set_var(k, v);
     }
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
         .expect("connecting to a real sidecar should succeed");
     std::env::remove_var("VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS");
+    std::env::remove_var("EITRI_SIDECAR_TEST_SEAMS");
 
     let pid = provider.sidecar_pid();
     let session_id = open(&provider);

@@ -695,6 +695,17 @@ fn sidecar_command(
     socket_path: &Path,
     account: Option<&crate::account::ClaudeAccount>,
 ) -> Command {
+    let keep_test_seams = std::env::var_os(TEST_SEAMS_VAR).is_some_and(|v| v == "1");
+    sidecar_command_for(program_path, program_args, socket_path, account, keep_test_seams)
+}
+
+fn sidecar_command_for(
+    program_path: &Path,
+    program_args: &[PathBuf],
+    socket_path: &Path,
+    account: Option<&crate::account::ClaudeAccount>,
+    keep_test_seams: bool,
+) -> Command {
     let mut command = Command::new(program_path);
     command
         .args(program_args)
@@ -710,11 +721,29 @@ fn sidecar_command(
         // which servers a session gets and states none today, so a value left in the user's shell
         // must not turn into servers (and tools) in an Eitri session.
         .env_remove(EXTRA_MCP_SERVERS_VAR);
+    // Verdandi's fault-injection and sizing knobs change how a session behaves (dropped watches, a
+    // one-event ring); a value left in a shell must not reach a window's sidecar. The real-sidecar
+    // tests that set them on purpose also set `TEST_SEAMS_VAR`.
+    if !keep_test_seams {
+        for var in TEST_SEAM_VARS {
+            command.env_remove(var);
+        }
+    }
     if let Some(account) = account {
         command.env("VERDANDI_CLAUDE_ACCOUNT", account.name());
     }
     command
 }
+
+/// Verdandi's test seams: they are inherited by the sidecar only when [`TEST_SEAMS_VAR`] is `1`.
+const TEST_SEAM_VARS: [&str; 3] = [
+    "VERDANDI_CLAUDE_SIDECAR_RING_CAPACITY",
+    "VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER",
+    "VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS",
+];
+
+/// Set by the real-sidecar tests that pass a seam on purpose; never set by a window.
+const TEST_SEAMS_VAR: &str = "EITRI_SIDECAR_TEST_SEAMS";
 
 /// The sidecar's process-level list of extra MCP servers (JSON); never inherited from the shell.
 const EXTRA_MCP_SERVERS_VAR: &str = "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS";
@@ -821,7 +850,14 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     for line in &build_warnings {
         eprintln!("agent: {line}");
     }
-    let socket_path = crate::socket_path::sidecar_socket(&std::env::temp_dir(), instance_id)?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let socket_dir = crate::socket_path::private_socket_dir(
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).as_deref(),
+        &std::env::temp_dir(),
+        euid,
+    )?;
+    let socket_path = crate::socket_path::sidecar_socket(&socket_dir, instance_id)?;
     let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 
     let account = crate::account::configured();
@@ -945,6 +981,8 @@ impl Drop for SpawnedSidecar {
     fn drop(&mut self) {
         drop(self.stdin_keepalive.take()); // closes the write end -> sidecar sees stdin EOF
         let _ = stop_child(&mut self.child, SIDECAR_EXIT_GRACE);
+        // The directory outlives windows, so a killed sidecar's file would otherwise pile up in it.
+        let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 
@@ -1432,6 +1470,39 @@ mod tests {
         }
     }
 
+    /// The seams are removed from the child unless the test switch is on, in which case they are
+    /// left to be inherited.
+    #[test]
+    fn verdandis_test_seams_are_removed_from_the_sidecar_child_unless_a_test_asks() {
+        let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "seam-test").unwrap();
+        let program = Path::new("/usr/lib/eitri/verdandi-claude-sidecar");
+        let removed = |keep: bool| -> Vec<String> {
+            sidecar_command_for(program, &[], &socket, None, keep)
+                .get_envs()
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| k.to_string_lossy().into_owned())
+                .collect()
+        };
+        let by_default = removed(false);
+        for var in TEST_SEAM_VARS {
+            assert!(
+                by_default.iter().any(|k| k == var),
+                "{var} must be removed: {by_default:?}"
+            );
+        }
+        let kept = removed(true);
+        for var in TEST_SEAM_VARS {
+            assert!(
+                !kept.iter().any(|k| k == var),
+                "{var} must be inherited on request: {kept:?}"
+            );
+        }
+        assert!(
+            kept.iter().any(|k| k == EXTRA_MCP_SERVERS_VAR),
+            "the switch never frees the MCP list"
+        );
+    }
+
     /// The shipped default: with nothing configured the child's environment is what it always was
     /// (plus the one removal above), and the sidecar's own account support never engages.
     #[test]
@@ -1448,7 +1519,10 @@ mod tests {
             keys,
             vec![
                 "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS".to_string(),
-                "VERDANDI_CLAUDE_SIDECAR_SOCKET".to_string()
+                "VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER".to_string(),
+                "VERDANDI_CLAUDE_SIDECAR_RING_CAPACITY".to_string(),
+                "VERDANDI_CLAUDE_SIDECAR_SOCKET".to_string(),
+                "VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS".to_string(),
             ]
         );
     }

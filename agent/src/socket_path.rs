@@ -49,15 +49,75 @@ pub(crate) fn hook_socket(dir: &Path, conversation_id: uuid::Uuid) -> io::Result
 #[cfg(feature = "legacy-backend")]
 pub(crate) const HOOK_SOCKET_PREFIX: &str = "eitri-hook-";
 
-/// One sidecar instance's gRPC socket: `eitri-sc-<id>.sock`. A hyphenated UUID -- which is what
-/// every caller in this workspace passes -- is written in its 32-hex simple form, 46 bytes of file
-/// name (95 under macOS's `temp_dir()`); any other id is used verbatim and is subject to the check.
+/// One sidecar instance's gRPC socket: `sc-<id>.sock` inside the private directory
+/// [`private_socket_dir`] returns. A hyphenated UUID -- which is what every caller in this
+/// workspace passes -- is written in its 32-hex simple form, 39 bytes of file name; any other id is
+/// used verbatim and is subject to the check. The name is short because the directory in front of it
+/// costs `eitri-<uid>/` bytes of the macOS cap.
 pub(crate) fn sidecar_socket(dir: &Path, instance_id: &str) -> io::Result<PathBuf> {
     let id = match uuid::Uuid::parse_str(instance_id) {
         Ok(uuid) => uuid.simple().to_string(),
         Err(_) => instance_id.to_owned(),
     };
-    in_dir(dir, &format!("eitri-sc-{id}.sock"))
+    in_dir(dir, &format!("sc-{id}.sock"))
+}
+
+/// The directory sockets that another process serves are bound in: `$XDG_RUNTIME_DIR/eitri` when
+/// that is an absolute path to a real directory of this user that nobody else can write, else
+/// `<tmp>/eitri-<uid>`. The directory is created 0700 when absent, and an existing one is accepted
+/// only if it is a real directory (no symlink), owned by this user, with no group or other bit.
+///
+/// A socket directly in a shared `TMPDIR` is connectable by whoever the process umask lets in, and
+/// the sidecar's protocol carries no credential, so the directory is what keeps other users away
+/// from `ResolvePermission`. Anything short of that is an error, never a fallback to a shared place.
+pub(crate) fn private_socket_dir(runtime_dir: Option<&Path>, tmp: &Path, uid: u32) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = match runtime_dir.filter(|d| d.is_absolute() && is_private_dir(d)) {
+        Some(runtime) => runtime.join("eitri"),
+        None => tmp.join(format!("eitri-{uid}")),
+    };
+    match std::fs::DirBuilder::new()
+        .mode(crate::private_fs::PRIVATE_DIR_MODE)
+        .create(&dir)
+    {
+        // Created here: the umask may have taken bits off the mode (0277 leaves 0500, which cannot be bound in).
+        Ok(()) => crate::private_fs::make_dir_private(&dir)?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    if !is_private_dir(&dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a real directory owned by this user with mode 0700; refusing to bind the sidecar's socket there",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(dir)
+}
+
+/// A real directory (a symlink is not followed) owned by this process's effective user, with no
+/// group or other permission bit.
+fn is_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    matches!(path.symlink_metadata(), Ok(m) if m.is_dir() && m.uid() == euid && m.mode() & 0o077 == 0)
+}
+
+/// Whether the process on the other end of a freshly connected socket may be talked to: only this
+/// user's own. Checked after `connect` and before a byte is sent.
+pub(crate) fn require_own_peer(peer_uid: u32) -> io::Result<()> {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if peer_uid == euid {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("the sidecar socket is served by uid {peer_uid}, not this user ({euid}); refusing to use it"),
+    ))
 }
 
 #[cfg(test)]
@@ -68,6 +128,79 @@ mod tests {
     /// user's `/var/folders/<2>/<28>/T/` has this shape, so this is the real worst case there
     /// rather than a guess.
     const MACOS_TEMP_DIR: &str = "/var/folders/33/0tqfpnyn4z3c049gljzppdv00000gn/T/";
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nv-sock-dir-{label}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The sidecar's socket used to sit directly in the shared temp directory.
+    #[test]
+    fn the_socket_directory_is_created_private_and_is_not_the_temp_dir_itself() {
+        let tmp = scratch("create");
+        let dir = private_socket_dir(None, &tmp, 4242).unwrap();
+        assert_eq!(dir, tmp.join("eitri-4242"));
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(private_socket_dir(None, &tmp, 4242).unwrap(), dir);
+    }
+
+    #[test]
+    fn a_runtime_dir_of_this_user_is_preferred_and_a_loose_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = scratch("tmp");
+        let runtime = scratch("runtime");
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            private_socket_dir(Some(&runtime), &tmp, 1).unwrap(),
+            runtime.join("eitri")
+        );
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            private_socket_dir(Some(&runtime), &tmp, 1).unwrap(),
+            tmp.join("eitri-1")
+        );
+    }
+
+    #[test]
+    fn an_existing_directory_that_others_can_enter_or_a_symlink_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = scratch("loose");
+        let loose = tmp.join("eitri-7");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = private_socket_dir(None, &tmp, 7).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+
+        let target = scratch("target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, tmp.join("eitri-8")).unwrap();
+        let err = private_socket_dir(None, &tmp, 8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    #[test]
+    fn a_restrictive_umask_does_not_leave_the_directory_unusable() {
+        let tmp = scratch("umask");
+        // SAFETY: umask is process-wide; restored straight after the one call that needs it.
+        let old = unsafe { libc::umask(0o277) };
+        let dir = private_socket_dir(None, &tmp, 9);
+        unsafe { libc::umask(old) };
+        assert_eq!(mode(&dir.unwrap()), 0o700);
+    }
+
+    #[test]
+    fn only_the_own_uid_may_serve_the_socket() {
+        let own = unsafe { libc::geteuid() };
+        require_own_peer(own).unwrap();
+        let err = require_own_peer(own.wrapping_add(1)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
 
     #[test]
     fn the_macos_temp_dir_fixture_is_the_real_length() {
@@ -121,6 +254,8 @@ mod tests {
     #[test]
     fn every_production_socket_path_fits_under_the_macos_temp_dir() {
         for dir in [Path::new(MACOS_TEMP_DIR).to_path_buf(), std::env::temp_dir()] {
+            // The private directory adds `eitri-<uid>/`; a five-digit uid is macOS's worst real case.
+            let dir = dir.join("eitri-99999");
             let sidecar = sidecar_socket(&dir, &uuid::Uuid::new_v4().to_string()).unwrap();
             #[cfg(feature = "legacy-backend")]
             let paths = [hook_socket(&dir, uuid::Uuid::new_v4()).unwrap(), sidecar];
@@ -136,10 +271,10 @@ mod tests {
     fn a_hyphenated_uuid_instance_id_is_written_in_its_simple_form() {
         let id = uuid::Uuid::new_v4();
         let path = sidecar_socket(Path::new("/t"), &id.to_string()).unwrap();
-        assert_eq!(path, Path::new(&format!("/t/eitri-sc-{}.sock", id.simple())));
+        assert_eq!(path, Path::new(&format!("/t/sc-{}.sock", id.simple())));
         assert_eq!(
             sidecar_socket(Path::new("/t"), "abc").unwrap(),
-            Path::new("/t/eitri-sc-abc.sock")
+            Path::new("/t/sc-abc.sock")
         );
     }
 

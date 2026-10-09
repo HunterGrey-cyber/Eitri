@@ -241,6 +241,7 @@ impl ClaudeSidecarProvider {
                             let socket_path = socket_path.clone();
                             async move {
                                 let stream = UnixStream::connect(socket_path).await?;
+                                crate::socket_path::require_own_peer(stream.peer_cred()?.uid())?;
                                 Ok::<_, std::io::Error>(TokioIo::new(stream))
                             }
                         }))

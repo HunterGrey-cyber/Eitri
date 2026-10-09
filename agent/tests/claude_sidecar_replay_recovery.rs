@@ -35,6 +35,7 @@ const STREAMING_PROMPT: &str =
 /// single-threaded (see the module doc) or they will overwrite each other's configuration and pass
 /// for the wrong reason.
 fn connect_with(vars: &[(&str, &str)]) -> ClaudeSidecarProvider {
+    std::env::set_var("EITRI_SIDECAR_TEST_SEAMS", "1");
     for (key, value) in vars {
         std::env::set_var(key, value);
     }
@@ -43,6 +44,7 @@ fn connect_with(vars: &[(&str, &str)]) -> ClaudeSidecarProvider {
     for (key, _) in vars {
         std::env::remove_var(key);
     }
+    std::env::remove_var("EITRI_SIDECAR_TEST_SEAMS");
     provider
 }
 

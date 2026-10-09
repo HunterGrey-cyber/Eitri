@@ -207,6 +207,14 @@ fn tighten_handle(handle: &std::fs::File) {
     let _ = fchmod(handle, PRIVATE_DIR_MODE);
 }
 
+/// Sets a directory this process just created to exactly 0700 (the umask may have taken more off),
+/// through a handle opened without following a symlink.
+pub(crate) fn make_dir_private(dir: &Path) -> std::io::Result<()> {
+    let handle = open_dir_handle(dir)
+        .ok_or_else(|| std::io::Error::other(format!("cannot open {} as a directory", dir.display())))?;
+    fchmod(&handle, PRIVATE_DIR_MODE)
+}
+
 fn fchmod(handle: &std::fs::File, mode: u32) -> std::io::Result<()> {
     // SAFETY: the descriptor is `handle`'s own and stays open for the call; `fchmod` reads nothing
     // else of ours.

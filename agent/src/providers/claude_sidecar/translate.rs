@@ -114,8 +114,15 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 None
             }
         },
-        ProtoEvent::PermissionRequested(requested) => match serde_json::from_str(&requested.input_json) {
-            Ok(input) => one(AgentDomainEvent::PermissionRequested {
+        ProtoEvent::PermissionRequested(requested) => {
+            // A request the sidecar's hook is waiting on is never dropped for a malformed input: it
+            // arrives as the raw text, a non-object value the permission policy never allows (a card,
+            // or the CLI's own classifier under auto), so the turn cannot hang on a call nobody was asked about.
+            let input = serde_json::from_str(&requested.input_json).unwrap_or_else(|e| {
+                eprintln!("agent: ClaudeSidecarProvider: unparseable PermissionRequested.input_json, passing it on as text: {e}");
+                serde_json::Value::String(requested.input_json.clone())
+            });
+            one(AgentDomainEvent::PermissionRequested {
                 // Read before the fields below are moved out of `requested`.
                 provider_prompt: provider_prompt_of(&requested),
                 permission_id: requested.permission_id,
@@ -133,12 +140,8 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 tool_use_id: crate::projection::tool_use_link(requested.tool_use_id),
                 tool_name: requested.tool_name,
                 input,
-            }),
-            Err(e) => {
-                eprintln!("agent: ClaudeSidecarProvider: unparseable PermissionRequested.input_json, dropping this event: {e}");
-                None
-            }
-        },
+            })
+        }
         ProtoEvent::PermissionResolved(resolved) => {
             let outcome = translate_permission_outcome(resolved.outcome());
             one(AgentDomainEvent::PermissionResolved {
@@ -658,6 +661,27 @@ mod tests {
                 provider_prompt: None,
             })
         );
+    }
+
+    /// A gate request whose input is not JSON still reaches the policy, as the raw text.
+    #[test]
+    fn permission_requested_with_unparseable_input_json_is_delivered_as_text() {
+        let event = wrap(ProtoEvent::PermissionRequested(PermissionRequested {
+            permission_id: "perm-1".into(),
+            tool_use_id: "tu-1".into(),
+            tool_name: "Bash".into(),
+            input_json: "{\"command\": \"rm -rf".into(),
+            ..Default::default()
+        }));
+        match translate(event) {
+            Some(AgentDomainEvent::PermissionRequested {
+                input, permission_id, ..
+            }) => {
+                assert_eq!(permission_id, "perm-1");
+                assert_eq!(input, serde_json::Value::String("{\"command\": \"rm -rf".into()));
+            }
+            other => panic!("expected the request to be delivered, got {other:?}"),
+        }
     }
 
     /// proto3 has no absent string, so a `tool_use_id` the provider never set arrives here as

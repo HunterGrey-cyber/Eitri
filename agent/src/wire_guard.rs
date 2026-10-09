@@ -34,6 +34,8 @@ const PROTO_PERMISSION_MODE: &str = "claude_runtime_protocol::v1::PermissionMode
 
 /// The proto enum whose `Auto` value asks the CLI for its own auto mode under the gate.
 const PROTO_CLI_PERMISSION_MODE: &str = "claude_runtime_protocol::v1::CliPermissionMode";
+const PROTO_HOST_POLICY: &str = "claude_runtime_protocol::v1::ClaudeHostPolicy";
+const PROTO_CREATE_SESSION_REQUEST: &str = "claude_runtime_protocol::v1::CreateSessionRequest";
 
 /// Allowed sites for requesting the CLI's auto mode, identified by file and surrounding
 /// text with whitespace collapsed. Every [`AUTO_NEEDLES`] occurrence must be inside one
@@ -499,6 +501,22 @@ fn proto_aliases(code: &str, path: &str) -> Vec<String> {
             aliases.push(format!("{name}::{tail}"));
         }
     }
+    // `type P = <path>;`: matched on the last segment, so a rename-by-alias is read too.
+    let mut rest = code;
+    while let Some(at) = rest.find("type ") {
+        let before = rest[..at].chars().next_back();
+        let tail = &rest[at + 5..];
+        if !before.is_some_and(is_ident) {
+            if let Some((name, value)) = tail.split_once('=') {
+                let value = value.split(';').next().unwrap_or("").trim();
+                let name = name.trim();
+                if !name.is_empty() && name.chars().all(is_ident) && last_segment(value) == last_segment(path) {
+                    aliases.push(name.to_string());
+                }
+            }
+        }
+        rest = tail;
+    }
     aliases.sort();
     aliases.dedup();
     aliases
@@ -612,8 +630,33 @@ fn snippet(code: &str, at: usize) -> String {
 fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offenders: &mut Vec<String>) {
     let c: Vec<char> = code.chars().collect();
     let interactive: Vec<String> = aliases.iter().map(|a| format!("{a}::Interactive as i32")).collect();
-    for at in whole_word_positions(code, "ClaudeHostPolicy") {
-        let i = code[..at].chars().count() + "ClaudeHostPolicy".len();
+    // The policy is written under every name the crate gives it (`use ... as P`, `type P = ...`),
+    // and a default one is refused outright: it states none of the fields below.
+    let mut names = proto_aliases(code, PROTO_HOST_POLICY);
+    names.push("ClaudeHostPolicy".to_string());
+    names.sort();
+    names.dedup();
+    for name in &names {
+        for (at, _) in code.match_indices(&format!("{name}::default")) {
+            let before = code[..at].chars().next_back();
+            if !before.is_some_and(is_ident) {
+                offenders.push(format!(
+                    "{rel}: `{name}::default`, a policy that states none of the gate's fields: {}",
+                    snippet(code, at)
+                ));
+            }
+        }
+    }
+    let positions: Vec<(usize, &str)> = names
+        .iter()
+        .flat_map(|name| {
+            whole_word_positions(code, name)
+                .into_iter()
+                .map(move |at| (at, name.as_str()))
+        })
+        .collect();
+    for (at, name) in positions {
+        let i = code[..at].chars().count() + name.chars().count();
         let open = skip_spaces(&c, i);
         if c.get(open) != Some(&'{') {
             continue;
@@ -635,6 +678,10 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
         let mut permissions = None;
         let mut switchable = None;
         let mut cli_mode = None;
+        let mut setting_sources = None;
+        let mut tool_policy = None;
+        let mut executable = None;
+        let mut configuration = None;
         for entry in split_top_level(&body, ',') {
             let entry = entry.trim();
             if entry.starts_with("..") {
@@ -653,6 +700,10 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
                 "permissions" => permissions = Some(value),
                 "permission_mode_switchable" => switchable = Some(value),
                 "cli_permission_mode" => cli_mode = Some(value),
+                "setting_sources" => setting_sources = Some(value),
+                "tool_policy" => tool_policy = Some(value),
+                "executable" => executable = Some(value),
+                "configuration" => configuration = Some(value),
                 _ => {}
             }
         }
@@ -669,6 +720,45 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
             other => offenders.push(format!(
                 "{rel}: a ClaudeHostPolicy literal's `permission_mode_switchable` is {other:?}, not `false` \
                  (R07; `true` sets --allow-dangerously-skip-permissions on the CLI): {}",
+                snippet(code, at)
+            )),
+        }
+        // Workspace trust and the CLI's identity: an absent `setting_sources` falls back to the
+        // configuration, which loads every tier of an untrusted root, and an absent `tool_policy`
+        // leaves the tool set to the sidecar. Both are stated, the selection through the one
+        // function that knows the trust, and the CLI is the user's own on the native profile.
+        match setting_sources.as_deref() {
+            Some(v)
+                if v.starts_with("Some(")
+                    && v.contains("sources: proto_sources(crate::setting_sources::for_session(")
+                    && !v.contains(".chain(") => {}
+            other => offenders.push(format!(
+                "{rel}: a ClaudeHostPolicy literal's `setting_sources` is {other:?}, not `Some(..)` built \
+                 from `setting_sources::for_session(` (an absent selection loads every settings tier, \
+                 an untrusted project's included): {}",
+                snippet(code, at)
+            )),
+        }
+        match tool_policy.as_deref() {
+            Some(v) if v.starts_with("Some(") => {}
+            other => offenders.push(format!(
+                "{rel}: a ClaudeHostPolicy literal's `tool_policy` is {other:?}, not `Some(..)`: {}",
+                snippet(code, at)
+            )),
+        }
+        match executable.as_deref() {
+            Some(v) if v.ends_with("ExecutableSource::HostCli as i32") => {}
+            other => offenders.push(format!(
+                "{rel}: a ClaudeHostPolicy literal's `executable` is {other:?}, not \
+                 `ExecutableSource::HostCli as i32` (the user's own claude): {}",
+                snippet(code, at)
+            )),
+        }
+        match configuration.as_deref() {
+            Some(v) if v.ends_with("ConfigurationProfile::Native as i32") => {}
+            other => offenders.push(format!(
+                "{rel}: a ClaudeHostPolicy literal's `configuration` is {other:?}, not \
+                 `ConfigurationProfile::Native as i32`: {}",
                 snippet(code, at)
             )),
         }
@@ -692,6 +782,54 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
                  CLI's auto mode only from the handshake): {}",
                 snippet(code, at)
             ));
+        }
+    }
+}
+
+/// Every proto `CreateSessionRequest { .. }` literal states `policy: Some(..)`: a request with no
+/// policy leaves the gate, the settings tiers and the CLI to whatever the sidecar assumes, and a
+/// `..` base could carry any of it.
+fn check_request_literals(rel: &str, code: &str, offenders: &mut Vec<String>) {
+    let c: Vec<char> = code.chars().collect();
+    let names = proto_aliases(code, PROTO_CREATE_SESSION_REQUEST);
+    for name in names {
+        for at in whole_word_positions(code, &name) {
+            let open = skip_spaces(&c, code[..at].chars().count() + name.chars().count());
+            if c.get(open) != Some(&'{') {
+                continue;
+            }
+            let before = code[..at].trim_end();
+            if ["->", "impl", "for", "struct", "enum", "trait", "type", "let", "use"]
+                .iter()
+                .any(|kw| before.ends_with(kw))
+            {
+                continue;
+            }
+            let Some(close) = matching_close(&c, open) else {
+                offenders.push(format!("{rel}: an unterminated CreateSessionRequest literal"));
+                continue;
+            };
+            let body: String = c[open + 1..close].iter().collect();
+            let mut policy = None;
+            for entry in split_top_level(&body, ',') {
+                let entry = entry.trim();
+                if entry.starts_with("..") {
+                    offenders.push(format!(
+                        "{rel}: a CreateSessionRequest literal takes fields from `{entry}`: {}",
+                        snippet(code, at)
+                    ));
+                } else if let Some((field, value)) = field_split(entry) {
+                    if field == "policy" {
+                        policy = Some(value);
+                    }
+                }
+            }
+            if !policy.as_deref().is_some_and(|v| v.starts_with("Some(")) {
+                offenders.push(format!(
+                    "{rel}: a CreateSessionRequest literal's `policy` is {policy:?}, not `Some(..)`: {}",
+                    snippet(code, at)
+                ));
+            }
         }
     }
 }
@@ -901,6 +1039,7 @@ fn check_file(
         }
     }
     check_host_policy_literals(rel, code, &aliases, offenders);
+    check_request_literals(rel, code, offenders);
 }
 
 /// Every source of a tree as the scans read it -- comment-free, collapsed, test modules removed --
@@ -1048,6 +1187,12 @@ fn one(rel: &str, src: &str) -> Report {
     scan_tree(&BTreeMap::from([(rel.to_string(), src.to_string())]))
 }
 
+/// The fields the trust and identity checks read, stated correctly, for the fixtures that test
+/// other rules.
+const COMPLETE: &str = "configuration: ConfigurationProfile::Native as i32, executable: ExecutableSource::HostCli as i32, \
+     setting_sources: Some(SettingSourceSelection { sources: proto_sources(crate::setting_sources::for_session(u, p)) }), \
+     tool_policy: Some(ToolPolicy { deny: vec![], unrestricted: true, allow: None }),";
+
 fn policy(permissions: &str, switchable: &str) -> String {
     policy_with_cli_mode(permissions, switchable, "CliPermissionMode::Unspecified as i32")
 }
@@ -1055,10 +1200,67 @@ fn policy(permissions: &str, switchable: &str) -> String {
 fn policy_with_cli_mode(permissions: &str, switchable: &str, cli_mode: &str) -> String {
     format!(
         "use claude_runtime_protocol::v1::{{ClaudeHostPolicy, CliPermissionMode, PermissionMode as ProtoPermissionMode}};\n\
-         fn p() -> Option<ClaudeHostPolicy> {{\n    Some(ClaudeHostPolicy {{\n        configuration: 1,\n        \
+         fn p() -> Option<ClaudeHostPolicy> {{\n    Some(ClaudeHostPolicy {{\n        \
          permissions: {permissions},\n        permission_mode_switchable: {switchable},\n        \
-         cli_permission_mode: {cli_mode},\n    }})\n}}\n"
+         cli_permission_mode: {cli_mode},\n        {COMPLETE}\n    }})\n}}\n"
     )
+}
+
+/// A policy that leaves the settings selection, the tool policy, the executable or the profile
+/// unstated, or builds the policy from `default`, is refused; the complete fixture passes.
+#[test]
+fn the_trust_and_identity_fields_of_a_policy_are_stated() {
+    let interactive = "ProtoPermissionMode::Interactive as i32";
+    let good = policy(interactive, "false");
+    assert!(one("x.rs", &good).offenders.is_empty());
+    for (what, from, to) in [
+        ("no selection", "setting_sources: Some(SettingSourceSelection { sources: proto_sources(crate::setting_sources::for_session(u, p)) }),", ""),
+        ("a None selection", "setting_sources: Some(SettingSourceSelection { sources: proto_sources(crate::setting_sources::for_session(u, p)) }),", "setting_sources: None,"),
+        ("a hand-written selection", "setting_sources: Some(SettingSourceSelection { sources: proto_sources(crate::setting_sources::for_session(u, p)) }),", "setting_sources: Some(SettingSourceSelection { sources: vec![] }),"),
+        ("no tool policy", "tool_policy: Some(ToolPolicy { deny: vec![], unrestricted: true, allow: None }),", ""),
+        ("a None tool policy", "tool_policy: Some(ToolPolicy { deny: vec![], unrestricted: true, allow: None }),", "tool_policy: None,"),
+        ("the bundled CLI", "executable: ExecutableSource::HostCli as i32,", "executable: ExecutableSource::SdkBundled as i32,"),
+        ("no executable", "executable: ExecutableSource::HostCli as i32,", ""),
+        ("an isolated profile", "configuration: ConfigurationProfile::Native as i32,", "configuration: ConfigurationProfile::Isolated as i32,"),
+    ] {
+        let bad = good.replace(from, to);
+        assert_ne!(bad, good, "{what}: the fixture changed");
+        assert!(!one("x.rs", &bad).offenders.is_empty(), "{what} must be refused");
+    }
+}
+
+#[test]
+fn a_default_policy_or_one_written_under_an_alias_is_refused() {
+    let default = "use claude_runtime_protocol::v1::ClaudeHostPolicy;\nfn p() -> ClaudeHostPolicy { ClaudeHostPolicy::default() }\n";
+    assert!(!one("x.rs", default).offenders.is_empty());
+    let aliased = "use claude_runtime_protocol::v1::ClaudeHostPolicy as P;\nfn p() -> P { P { permissions: 1 } }\n";
+    let report = one("x.rs", aliased);
+    assert!(
+        report.offenders.iter().any(|o| o.contains("permissions")),
+        "a literal under an alias is read: {:?}",
+        report.offenders
+    );
+    let alias_default = "type P = claude_runtime_protocol::v1::ClaudeHostPolicy;\nfn p() -> P { P::default() }\n";
+    assert!(!one("x.rs", alias_default).offenders.is_empty());
+}
+
+#[test]
+fn a_session_request_states_a_policy() {
+    let head = "use claude_runtime_protocol::v1::CreateSessionRequest as R;\n";
+    let ok = format!("{head}fn r() -> R {{ R {{ cwd: c, policy: Some(x()), resume: None }} }}\n");
+    assert!(
+        one("x.rs", &ok).offenders.is_empty(),
+        "{:?}",
+        one("x.rs", &ok).offenders
+    );
+    for body in ["cwd: c, policy: None", "cwd: c", "cwd: c, policy", "cwd: c, ..base"] {
+        let bad = format!("{head}fn r() -> R {{ R {{ {body} }} }}\n");
+        assert!(!one("x.rs", &bad).offenders.is_empty(), "`{body}` must be refused");
+    }
+    // The crate's own request type of the same name is not the wire's.
+    let own =
+        "struct CreateSessionRequest { cwd: u8 }\nfn r() -> CreateSessionRequest { CreateSessionRequest { cwd: 1 } }\n";
+    assert!(one("x.rs", own).offenders.is_empty());
 }
 
 /// Rule 6, the literal half: UNSPECIFIED passes, and so does the request's one `match` on the
@@ -1103,8 +1305,9 @@ fn the_cli_mode_is_unspecified_or_the_one_gated_match() {
     // Not stated at all.
     let unstated = "fn p() -> ClaudeHostPolicy { ClaudeHostPolicy { permissions: \
                     claude_runtime_protocol::v1::PermissionMode::Interactive as i32, \
-                    permission_mode_switchable: false } }";
-    let report = one("x.rs", unstated);
+                    permission_mode_switchable: false, COMPLETE_FIELDS } }";
+    let unstated = unstated.replace("COMPLETE_FIELDS", COMPLETE);
+    let report = one("x.rs", &unstated);
     assert_eq!(report.offenders.len(), 1, "{:?}", report.offenders);
     assert!(report.offenders[0].contains("cli_permission_mode"));
 }
@@ -1295,7 +1498,8 @@ fn a_numeric_permissions_value_fails() {
     let spread = "fn p(b: ClaudeHostPolicy) -> ClaudeHostPolicy { ClaudeHostPolicy { permissions: \
                   claude_runtime_protocol::v1::PermissionMode::Interactive as i32, \
                   permission_mode_switchable: false, ..b } }";
-    let report = one("x.rs", spread);
+    let spread = spread.replace("..b", &format!("{COMPLETE} ..b"));
+    let report = one("x.rs", &spread);
     assert_eq!(report.offenders.len(), 2, "{:?}", report.offenders);
     assert!(report.offenders[0].contains("..b"), "{:?}", report.offenders);
 }
