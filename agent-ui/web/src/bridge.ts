@@ -277,6 +277,9 @@ type InboundHandler = (
     | ({ kind: "tabs" } & TabsEnvelope)
     | { kind: "tab_detail"; tab: TabId; rows: DetailRow[] }
     | ({ kind: "chooser" } & ChooserEnvelope)
+    /** Newer titles for records the last chooser listed, read after it was sent: laid over an open chooser's
+     *  rows in place; with no chooser open, nothing happens (it never opens one). */
+    | { kind: "chooser_titles"; titles: { providerSessionId: string; title: string }[] }
     | { kind: "confirm_close"; tab: TabId; lines: string[] }
     /** `<leader>bo` / `tab.close-others` is window-level. `tabs` lists the tabs a `y` would close;
      *  Rust recomputes the set when answering rather than trusting the displayed list.
@@ -418,6 +421,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "tabs" ||
         obj.kind === "tab_detail" ||
         obj.kind === "chooser" ||
+        obj.kind === "chooser_titles" ||
         obj.kind === "confirm_close" ||
         obj.kind === "confirm_close_others" ||
         obj.kind === "confirm_bypass" ||

@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
 import type { ChooserEnvelope, PermissionModeChoice, TabId, TabInfo } from "../types";
-import { choosable, chooserRows, pickerStep, relativeWhen, resumeMode, tabStateWord } from "../chooser";
+import { choosable, chooserRows, pickerStep, relativeWhen, resumeMode, rowKey, tabStateWord } from "../chooser";
 import type { ChooserRow } from "../chooser";
 import { shortId } from "./SessionRow";
 import { isShiftTab, modeFixedMessage, modeKeyRoute } from "../modeKey";
@@ -211,6 +211,21 @@ export function Chooser({
   const needle = filter.trim().toLowerCase();
   const rows = chooserRows(envelope, tabs, filter);
   const current: ChooserRow | undefined = rows[Math.min(cursor, rows.length - 1)];
+  // The cursor is an index into the filtered rows, and a new envelope (titles read after the chooser opened)
+  // can change which rows a filter matches: then the cursor goes back to the row it was on, by what the row
+  // is, so Enter never chooses a row the user did not move to. A row that left the list leaves the index.
+  const anchor = useRef<{ envelope: ChooserEnvelope; key: string | null }>({ envelope, key: null });
+  useLayoutEffect(() => {
+    let key = current === undefined ? null : rowKey(current);
+    if (anchor.current.envelope !== envelope && anchor.current.key !== null) {
+      const at = rows.findIndex((r) => rowKey(r) === anchor.current.key);
+      if (at >= 0) {
+        if (at !== Math.min(cursor, rows.length - 1)) setCursor(at);
+        key = anchor.current.key;
+      }
+    }
+    anchor.current = { envelope, key };
+  });
   const activeInfo = tabs.find((t) => t.id === active) ?? null;
 
   /** Restores focus on mount and each `focusRequest` change to the active rename input,

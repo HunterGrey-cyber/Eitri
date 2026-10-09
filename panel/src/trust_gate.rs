@@ -709,7 +709,20 @@ impl TrustGate {
         // Positions in `events` settled only once the batch is drained, each with its profile.
         let mut routes: Vec<(usize, ProfileKey)> = Vec::new();
         let mut taken: Vec<(usize, ProfileKey, Fingerprint)> = Vec::new();
-        while let Ok(Msg { seq, done, prompts }) = self.done.try_recv() {
+        loop {
+            let Msg { seq, done, prompts } = match self.done.try_recv() {
+                Ok(msg) => msg,
+                Err(mpsc::TryRecvError::Empty) => break,
+                // The worker is gone (it panicked): what it owed never comes, so nothing is counted as
+                // coming, and every later job is answered here as with no worker.
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.jobs.take().is_some() {
+                        eprintln!("[trust] the trust check stopped; this window starts sessions without the project's settings");
+                    }
+                    self.in_flight = 0;
+                    break;
+                }
+            };
             // The worker answers each job with exactly one message.
             self.in_flight = self.in_flight.saturating_sub(1);
             // Each result's prompts go in with its state; nothing else of this message uses them.
@@ -2188,6 +2201,31 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    /// A worker that died owes answers it will never give: once its channel says so, the gate is not busy (the
+    /// window would otherwise poll on its steady cadence for good), and a later check is answered as with no
+    /// worker.
+    #[test]
+    fn a_gate_whose_worker_died_is_not_busy_for_good() {
+        let fx = Fx::new("worker-died");
+        let (mut gate, _jobs, done) = TrustGate::detached(fx.root.clone());
+        gate.wait_for(A, &CLAUDE);
+        gate.begin_check(&CLAUDE);
+        assert!(gate.is_busy(), "the check is with the worker");
+        drop(done);
+        let _ = gate.poll();
+        assert!(!gate.is_busy(), "nothing will answer: the window stops polling");
+        gate.wait_for(B, &CLAUDE);
+        gate.begin_check(&CLAUDE);
+        let events = gate.poll();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GateEvent::Route(t, Route::Start(ProjectTrust::Untrusted)) if *t == B)),
+            "a later check is answered as with no worker: {events:?}"
+        );
+        assert!(!gate.is_busy());
     }
 
     /// The window keeps polling the gate while the worker owes an answer and may stop once it has none:

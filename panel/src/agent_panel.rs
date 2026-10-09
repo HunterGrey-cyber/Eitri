@@ -638,6 +638,11 @@ struct AgentPanelState {
     titles: eitri_core::transcript_titles::TitleCache,
     /// A title read since the last `hello`: it is sent again.
     hello_titles_stale: bool,
+    /// The records the last chooser listed, each with the title it showed, so a title read after it was
+    /// sent reaches the rows of a chooser still open.
+    chooser_listed: Vec<(String, Option<String>)>,
+    /// A title read since the chooser's titles were last compared with the cache.
+    chooser_titles_stale: bool,
     /// This project's conversation id (`agent::conversation_id_for_cwd` of its canonical root), which
     /// every saved tab carries.
     conversation_id: String,
@@ -1132,6 +1137,7 @@ impl AgentPanelHandle {
         // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
         poll_trust(state, page);
         apply_title_reads(state);
+        send_chooser_titles_if_changed(state, page);
         send_tabs_if_changed(state, page);
         remember_tabs(state);
         send_hello_if_open_sessions_changed(state, page);
@@ -1937,7 +1943,8 @@ impl AgentPanelHandle {
         // prompt -- it was about the tab the user is leaving to see this list. A fresh one raised
         // from inside the chooser (its own Shift+Tab) makes its own plan afterwards, unaffected.
         self.state.borrow_mut().tabs.drop_bypass_prompt();
-        let payload = chooser_payload(&self.state.borrow());
+        let (payload, listed) = chooser_payload(&self.state.borrow());
+        self.state.borrow_mut().chooser_listed = listed;
         self.dispatch(payload);
     }
 
@@ -2187,6 +2194,8 @@ fn panel_state(
         tab_memory: TabWriter::new(tabs_dir, project_dir.clone()),
         titles,
         hello_titles_stale: false,
+        chooser_listed: Vec::new(),
+        chooser_titles_stale: false,
         conversation_id: agent::conversation_id_for_cwd(&canonical_root),
         restore_source,
         restore_policy: RestorePolicy::Offer,
@@ -2308,6 +2317,8 @@ fn bare_state(
         tab_memory: TabWriter::new(None, PathBuf::new()),
         titles,
         hello_titles_stale: false,
+        chooser_listed: Vec::new(),
+        chooser_titles_stale: false,
         conversation_id: String::new(),
         restore_source: None,
         restore_policy: RestorePolicy::Offer,
@@ -2669,12 +2680,41 @@ fn apply_title_reads(state: &Rc<RefCell<AgentPanelState>>) {
     let state_ref = &mut *state_ref;
     if state_ref.titles.take_changed() {
         state_ref.hello_titles_stale = true;
+        state_ref.chooser_titles_stale = true;
     }
     // Every tick, not only after a read: a read can land before the tab it titles is installed or knows
     // its session, and a tab with no record's title left is skipped at no cost.
     let cwd = state_ref.canonical_project_dir.clone();
     let titles = &state_ref.titles;
     state_ref.tabs.retitle_from(|session| titles.known_title(&cwd, session));
+}
+
+/// The titles of the records the last chooser listed that the cache knows better since it was sent. The page
+/// applies them only to a chooser still open, so sending them after it closed reopens nothing.
+fn send_chooser_titles_if_changed(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+    let payload = {
+        let mut state_ref = state.borrow_mut();
+        let state_ref = &mut *state_ref;
+        if !std::mem::take(&mut state_ref.chooser_titles_stale) {
+            return;
+        }
+        let cwd = state_ref.canonical_project_dir.as_str();
+        let titles = &state_ref.titles;
+        let mut changed = Vec::new();
+        for (id, shown) in &mut state_ref.chooser_listed {
+            if let Some(title) = titles.known_title(cwd, id) {
+                if shown.as_deref() != Some(title.as_str()) {
+                    *shown = Some(title.clone());
+                    changed.push((id.clone(), title));
+                }
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        eitri_core::agent_bridge::serialize_chooser_titles_for_js(&changed)
+    };
+    page.send(&payload);
 }
 
 /// The tick's `tabs` envelope: sent only when it differs from the last one sent (a marker, a
@@ -3802,8 +3842,8 @@ fn remember_tabs(state: &Rc<RefCell<AgentPanelState>>) {
 }
 
 /// The chooser's envelope (`prefix w`): the open tabs in number order, then every record open
-/// in no tab, each marked if another window holds its lease.
-fn chooser_payload(state: &AgentPanelState) -> String {
+/// in no tab, each marked if another window holds its lease. Also each record listed with the title shown.
+fn chooser_payload(state: &AgentPanelState) -> (String, Vec<(String, Option<String>)>) {
     // The records offered are the active tab's agent's, as the resume that follows starts in it.
     let agent = state.tabs.active_tab().agent().clone();
     let greeting = BackendGreeting::for_agent_titled(
@@ -3832,7 +3872,14 @@ fn chooser_payload(state: &AgentPanelState) -> String {
     let records = chooser_records(&greeting.resumable, &state.tabs.open_session_ids(), |id| {
         agent::lease::SessionLease::is_held(&lease_name, canonical, id).unwrap_or(false)
     });
-    eitri_core::agent_bridge::serialize_chooser_for_js(&open, &records)
+    let listed = records
+        .iter()
+        .map(|r| (r.provider_session_id.clone(), r.title.clone()))
+        .collect();
+    (
+        eitri_core::agent_bridge::serialize_chooser_for_js(&open, &records),
+        listed,
+    )
 }
 
 /// The detail popover's envelope for `tab` (`prefix i`, `open_detail{tab}`).
@@ -10049,6 +10096,55 @@ mod tests {
         assert_eq!(loaded.tabs[0].provider_session_id, "s-closing");
     }
 
+    /// The close holds the process while the writer is inside the last write and lets go only once it is on
+    /// disk: with the write held, every look keeps holding; released, the close ends with the tab saved.
+    #[test]
+    fn the_close_holds_while_the_last_saved_tabs_write_is_under_way() {
+        let (state, dir) = restore_panel("restore-close-held", &[], &[]);
+        let files = agent::state_dirs::test_workspace_dir("restore-close-held-files");
+        let mut writer = TabWriter::new(Some(files.clone()), dir.clone());
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        writer.set_before_write(std::sync::Arc::new(move || {
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10));
+        }));
+        state.borrow_mut().tab_memory = writer;
+        {
+            // A tab that keeps its session's id with no backend to tear down: the write is all the close owes.
+            let mut s = state.borrow_mut();
+            let tab = s.tabs.active();
+            let t = s.tabs.get_mut(tab).unwrap();
+            t.failed_resume = Some("s-held".to_string());
+            t.backend = TabBackend::Failed {
+                reason: "stopped".to_string(),
+            };
+        }
+        let mut watch = handle_for(&state).shutdown();
+        let held_until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < held_until {
+            assert!(
+                watch.step(std::time::Instant::now()),
+                "let go while the write was under way"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while watch.step(std::time::Instant::now()) {
+            assert!(std::time::Instant::now() < deadline, "the close never let go");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let loaded = match eitri_core::saved_tabs::load(&files, &dir) {
+            eitri_core::saved_tabs::Loaded::Saved(saved) => saved,
+            other => panic!("{other:?}"),
+        };
+        let ids: Vec<_> = loaded.tabs.iter().map(|t| t.provider_session_id.as_str()).collect();
+        assert_eq!(ids, ["s-held"]);
+    }
+
     /// Points `CLAUDE_CONFIG_DIR` at one disposable root for this whole test binary, and returns it.
     ///
     /// A process-wide variable set from a multi-threaded test binary, which this project normally
@@ -10115,6 +10211,76 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(titles(&page)[1], "the CLI's title");
+        let _ = std::fs::remove_file(transcript);
+    }
+
+    /// A chooser sent before the CLI's title of one of its records was read gets that title once the worker
+    /// has read it: a `chooser_titles` envelope naming the record, and nothing more for it afterwards.
+    #[test]
+    fn a_title_read_after_the_chooser_opened_is_sent_to_it() {
+        a_claude_config_root();
+        let (state, dir) = restore_panel("titles-chooser", &[], &["s-listed"]);
+        let transcript = agent::transcript::transcript_path(&dir.to_string_lossy(), "s-listed").unwrap();
+        let _ = std::fs::remove_file(&transcript);
+        let page = Rc::new(RecordingPage::default());
+        page.visible.set(true);
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        // The greeting's read finds no transcript yet; the title is written after.
+        assert!(state.borrow().titles.wait_read(std::time::Duration::from_secs(5)));
+        let tick_pending = |handle: &AgentPanelHandle| {
+            if let Some(due) = handle.take_wake(std::time::Instant::now()) {
+                handle.run_tick(due);
+            }
+        };
+        tick_pending(&handle);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"the CLI's late title\"}\n",
+        )
+        .unwrap();
+        handle.open_chooser();
+        let chooser = page
+            .sent
+            .borrow()
+            .iter()
+            .rfind(|p| kind_of(p) == "chooser")
+            .cloned()
+            .expect("the chooser was sent");
+        assert!(
+            chooser.contains("title of s-listed"),
+            "the record's own title: {chooser}"
+        );
+        let retitled = |page: &RecordingPage| {
+            page.sent
+                .borrow()
+                .iter()
+                .filter(|p| kind_of(p) == "chooser_titles")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while retitled(&page).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the chooser was never told the title"
+            );
+            tick_pending(&handle);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let sent: serde_json::Value = serde_json::from_str(&retitled(&page)[0]).unwrap();
+        assert_eq!(
+            sent["titles"],
+            serde_json::json!([{ "providerSessionId": "s-listed", "title": "the CLI's late title" }])
+        );
+        // Told once: a later title read that changes nothing for it sends nothing more.
+        handle.state.borrow_mut().chooser_titles_stale = true;
+        handle.run_tick(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        assert_eq!(retitled(&page).len(), 1);
         let _ = std::fs::remove_file(transcript);
     }
 
@@ -11327,6 +11493,128 @@ mod tests {
             .borrow()
             .tab_memory
             .wait_written(std::time::Duration::from_secs(5)));
+    }
+
+    /// Runs the tick on its own cadence until it says it waits for the wake (at most ten seconds of real
+    /// time: workers answer meanwhile); the moment of the last tick.
+    fn tick_until_quiet(handle: &AgentPanelHandle, mut at: std::time::Instant) -> std::time::Instant {
+        use crate::panel_wake::NextTick;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match handle.run_tick(at) {
+                NextTick::OnWake => return at,
+                NextTick::At(next) => at = next,
+                NextTick::Stop => panic!("the tick stopped"),
+            }
+            assert!(std::time::Instant::now() < deadline, "the tick never went quiet");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// The trust worker builds the prompt beside its check and tells nobody when it is done: the prompt
+    /// reaches the page only through the tick that polls the gate. Held on the worker, the tick keeps its
+    /// steady cadence; let go, the prompt is sent and the tick waits for the answer.
+    #[test]
+    fn a_prompt_built_on_the_trust_worker_is_polled_for_until_it_reaches_the_page() {
+        use crate::panel_wake::NextTick;
+        let (handle, page) = settled_panel();
+        let outer = agent::state_dirs::test_workspace_dir("panel-trust-polled");
+        let home = outer.join("home");
+        let state_home = outer.join("state");
+        let root = home.join("p");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::create_dir_all(&state_home).unwrap();
+        std::fs::write(root.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        let hold = crate::trust_gate::WorkerHold::closed();
+        {
+            let mut s = handle.state.borrow_mut();
+            s.project_dir = root.clone();
+            s.canonical_project_dir = root.to_string_lossy().into_owned();
+            let store =
+                eitri_core::project_trust::TrustStore::new(Some(state_home.as_os_str()), Some(home.as_os_str()));
+            s.trust = TrustGate::new_held(store, root.clone(), Some(home.clone()), hold.clone());
+            let tab = s.tabs.active();
+            gate_start(&mut s, tab, first_send("r1", "hello")).unwrap();
+        }
+        let sent = page.sent.borrow().len();
+        let prompt_sent = || page.sent.borrow()[sent..].iter().any(|p| kind_of(p) == "trust_prompt");
+        let mut at = std::time::Instant::now();
+        for _ in 0..5 {
+            assert_eq!(
+                handle.run_tick(at),
+                NextTick::At(at + AgentPanelHandle::TICK),
+                "the worker owes an answer: polled"
+            );
+            at += AgentPanelHandle::TICK;
+        }
+        assert!(!prompt_sent());
+        hold.open();
+        tick_until_quiet(&handle, at);
+        assert!(
+            prompt_sent(),
+            "the prompt reached the page: {:?}",
+            &page.sent.borrow()[sent..]
+        );
+    }
+
+    /// A dashboard restore waits for the trust question while another tab's session opens. That session's
+    /// id arrives on the backend's own thread, whose fold wakes the tick; the tick it brings settles the
+    /// waiting restore and hands the writer a set with the waiting sessions in it.
+    #[test]
+    fn a_waiting_restore_is_settled_and_written_by_the_tick_a_fold_wakes() {
+        let (state, dir) = restore_panel(
+            "trust-restore-settle-wake",
+            &[("s-1", Some("api"), Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        let files = agent::state_dirs::test_workspace_dir("trust-restore-settle-wake-files");
+        let page = Rc::new(RecordingPage::default());
+        page.visible.set(true);
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
+        let from = state.borrow().tabs.active();
+        assert!(matches!(
+            ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard),
+            RestoreResult::Deferred
+        ));
+        let at = tick_until_quiet(&handle, std::time::Instant::now());
+        assert!(
+            page.sent.borrow().iter().any(|p| kind_of(p) == "trust_prompt"),
+            "the restore waits for the question"
+        );
+        assert!(state.borrow().restore_source.is_some(), "still on offer");
+
+        // Another tab's backend; the tick that finds it hands it the wake.
+        let other = state.borrow_mut().tabs.open(AgentId::Claude);
+        state.borrow_mut().tabs.select(from);
+        let (provider, backend) = live_backend(&dir);
+        state.borrow_mut().tabs.get_mut(other).unwrap().backend = TabBackend::Live(backend);
+        let at = tick_until_quiet(&handle, at + AgentPanelHandle::TICK);
+        handle.take_wake(at);
+
+        provider.open_session("s-new", &dir);
+        let due = wait_for_wake(&handle);
+        tick_until_quiet(&handle, due);
+        assert!(state.borrow().restore_source.is_none(), "the offer is spent");
+        assert!(state
+            .borrow()
+            .tab_memory
+            .wait_written(std::time::Duration::from_secs(5)));
+        let ids: Vec<String> = saved_file_sessions(&files, &dir)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, ["s-new", "s-1", "s-2"], "written with the waiting sessions");
+        let mut closed = state.borrow_mut().tabs.remove(other).unwrap();
+        if let TabBackend::Live(backend) = &mut closed.backend {
+            backend.shutdown();
+        }
     }
 
     /// The saved file as the window last wrote it: each Claude session with its name.

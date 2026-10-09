@@ -30,6 +30,13 @@ function rowSearchText(row: ChooserRow): string {
   return recordLead(row.record);
 }
 
+/** What a row is, whatever its place: the same tab or session keeps its key when rows come or go. */
+export function rowKey(row: ChooserRow): string {
+  if (row.kind === "new") return "new";
+  if (row.kind === "tab") return `tab:${row.tab.tab}`;
+  return `record:${row.record.providerSessionId}`;
+}
+
 /** A record another window's lease holds is shown and never chosen. Every
  *  other row -- `New session`, an open tab -- is always choosable. */
 export function choosable(row: ChooserRow): boolean {
@@ -106,4 +113,20 @@ export function resumeMode(
 ): { mode: PermissionModeChoice; into: "this tab" | "a new tab" } {
   if (active !== null && active.state === "not_started") return { mode: active.mode, into: "this tab" };
   return { mode: defaultMode, into: "a new tab" };
+}
+
+/** `envelope` with each listed record's title replaced by a newer one from `titles` (by session id). The
+ *  rows, their order and every other field stay, so the cursor's row is the same row afterwards. */
+export function withChooserTitles(
+  envelope: ChooserEnvelope,
+  titles: { providerSessionId: string; title: string }[],
+): ChooserEnvelope {
+  const newer = new Map(titles.map((t) => [t.providerSessionId, t.title]));
+  return {
+    ...envelope,
+    records: envelope.records.map((r) => {
+      const title = newer.get(r.providerSessionId);
+      return title === undefined ? r : { ...r, title };
+    }),
+  };
 }

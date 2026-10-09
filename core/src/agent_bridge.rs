@@ -2082,6 +2082,16 @@ pub fn serialize_chooser_for_js(open: &[ChooserTab], records: &[ChooserRecord]) 
     json!({ "kind": "chooser", "open": open, "records": records }).to_string()
 }
 
+/// Newer titles for records the chooser listed, read after it was sent: the page lays them over an open
+/// chooser's rows in place and opens none.
+pub fn serialize_chooser_titles_for_js(titles: &[(String, String)]) -> String {
+    let titles: Vec<Value> = titles
+        .iter()
+        .map(|(id, title)| json!({ "providerSessionId": id, "title": title }))
+        .collect();
+    json!({ "kind": "chooser_titles", "titles": titles }).to_string()
+}
+
 /// `prefix &`: the footer's y/n prompt, first line the question (`tabs::close_prompt`).
 pub fn serialize_confirm_close_for_js(tab: crate::tabs::TabId, lines: &[String]) -> String {
     json!({ "kind": "confirm_close", "tab": tab.0, "lines": lines }).to_string()

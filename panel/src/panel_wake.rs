@@ -33,10 +33,22 @@ struct Raise {
 
 impl Raise {
     fn raise(&self) {
-        if !self.raised.swap(true, Ordering::SeqCst) {
-            // A full buffer already holds a byte the host has not read; nothing else can fail here that a
-            // retry would mend.
-            let _ = (&self.write).write(&[1]);
+        if self.raised.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        loop {
+            match (&self.write).write(&[1]) {
+                Ok(1..) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A full buffer already holds a byte the host has not read: the host is woken by it.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                // Nothing was written and nothing waits, so the host is not woken by this raise. Left up,
+                // the flag would make every later raise a no-op for good; lowered, the next one tries again.
+                Ok(0) | Err(_) => {
+                    self.raised.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
         }
     }
 }
@@ -160,6 +172,20 @@ impl TickSchedule {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A write that fails with nothing queued leaves the flag down, so a later raise writes again instead of
+    /// finding it up for good.
+    #[test]
+    fn a_raise_whose_write_failed_leaves_the_flag_down() {
+        let wake = PanelWake::new().unwrap();
+        wake.raise.write.shutdown(std::net::Shutdown::Write).unwrap();
+        wake.raise();
+        assert!(
+            !wake.raise.raised.load(Ordering::SeqCst),
+            "the flag is down after a failed write"
+        );
+        assert!(!wake.take(), "nothing was raised for the host");
+    }
 
     #[test]
     fn a_raise_is_one_byte_until_it_is_taken() {

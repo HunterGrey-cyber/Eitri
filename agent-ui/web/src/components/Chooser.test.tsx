@@ -702,3 +702,28 @@ describe("Chooser: a waiting g ends on the window's cancel routes (K01)", () => 
     expect(currentRow(container)).toContain("1 fix-parser");
   });
 });
+
+/** Titles read after the chooser opened can change which rows a filter matches. The cursor stays on the
+ *  row it was on, not on the index it had, so Enter resumes the session the user was looking at. */
+describe("the cursor follows its row when the rows change under a filter", () => {
+  const rec = (id: string, title: string) => ({
+    providerSessionId: id, name: null, title, createdAt: "1", updatedAt: "2", heldElsewhere: false,
+  });
+  const before: ChooserEnvelope = { open: [], records: [rec("a-0000", "foo a"), rec("b-0000", "bar b"), rec("c-0000", "foo c")] };
+  const after: ChooserEnvelope = { open: [], records: [rec("a-0000", "foo a"), rec("b-0000", "foo b"), rec("c-0000", "foo c")] };
+
+  it("a row the filter newly matches above the cursor does not take the cursor", () => {
+    const { root, container, props, rerender } = renderChooser({ envelope: before, tabs: [] });
+    fireEvent.keyDown(root, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    fireEvent.change(filter, { target: { value: "foo" } });
+    fireEvent.keyDown(filter, { key: "Enter" });
+    fireEvent.keyDown(root, { key: "j" });
+    expect(container.querySelector(".chooser-row.current")!.textContent).toContain("foo c");
+    rerender(<Chooser {...props} envelope={after} />);
+    expect(container.querySelectorAll(".chooser-row").length).toBe(3);
+    expect(container.querySelector(".chooser-row.current")!.textContent).toContain("foo c");
+    fireEvent.keyDown(root, { key: "Enter" });
+    expect(props.onResume).toHaveBeenCalledWith("c-0000");
+  });
+});

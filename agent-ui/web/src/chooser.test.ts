@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { choosable, chooserRows, pickerStep, relativeWhen, resumeMode, tabStateWord } from "./chooser";
+import { choosable, chooserRows, pickerStep, relativeWhen, resumeMode, tabStateWord, withChooserTitles } from "./chooser";
 import type { ChooserEnvelope, TabInfo } from "./types";
 
 const TAB: TabInfo = {
@@ -128,5 +128,24 @@ describe("pickerStep", () => {
     ]) {
       expect(pickerStep(init), JSON.stringify(init)).toBeNull();
     }
+  });
+});
+
+describe("withChooserTitles", () => {
+  const record = (id: string, title: string | null) => ({
+    providerSessionId: id, name: null, title, createdAt: "1", updatedAt: "2", heldElsewhere: false,
+  });
+  const envelope: ChooserEnvelope = { open: [], records: [record("s-1", "old"), record("s-2", null), record("s-3", "kept")] };
+
+  it("replaces only the titles it names, keeping the rows and their order", () => {
+    const next = withChooserTitles(envelope, [{ providerSessionId: "s-2", title: "the CLI's" }, { providerSessionId: "s-1", title: "new" }]);
+    expect(next.records.map((r) => [r.providerSessionId, r.title])).toEqual([["s-1", "new"], ["s-2", "the CLI's"], ["s-3", "kept"]]);
+    expect(next.open).toBe(envelope.open);
+    expect(next.records[2]).toBe(envelope.records[2]);
+  });
+
+  it("adds no row for a session it does not list", () => {
+    const next = withChooserTitles(envelope, [{ providerSessionId: "s-9", title: "elsewhere" }]);
+    expect(next.records).toEqual(envelope.records);
   });
 });

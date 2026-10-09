@@ -286,11 +286,18 @@ impl TabMemory {
     /// A file found unusable just before the write -- hand-edited, or from another build, since the
     /// window opened -- is set aside first rather than overwritten, as the layout file's is.
     pub fn observe(&mut self, now: Option<SavedTabs>) -> Option<Result<Written, std::io::Error>> {
-        let dir = self.dir.as_ref()?;
         let now = now?;
         if now == self.last {
             return None;
         }
+        self.write(now)
+    }
+
+    /// Writes `now` whatever was written last; `None` when nothing is ever written. For a caller that has
+    /// already decided `now` is a change: [`TabWriter`]'s thread, whose sets are compared on the window's
+    /// thread, and which may never have been handed the set this one replaced.
+    fn write(&mut self, now: SavedTabs) -> Option<Result<Written, std::io::Error>> {
+        let dir = self.dir.as_ref()?;
         self.last = now.clone();
         // A file that cannot be moved aside is left where it is: writing over it would destroy the one
         // copy of what a person may want to read, so the write is given up and said.
@@ -330,7 +337,7 @@ pub struct TabWriter {
     last: SavedTabs,
     /// Started at the first write.
     worker: Option<WriterHandle>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     before_write: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -363,7 +370,7 @@ impl TabWriter {
             project_root,
             last: SavedTabs::default(),
             worker: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             before_write: None,
         }
     }
@@ -410,6 +417,13 @@ impl TabWriter {
         worker.done.take()
     }
 
+    /// Runs `hook` on the writer thread before each write, for a test that holds a write under way. Set before
+    /// the first hand-over: the thread takes it when it starts.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_before_write(&mut self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.before_write = Some(hook);
+    }
+
     /// Waits until the writer has written everything handed to it, for a test to read the file.
     #[cfg(any(test, feature = "test-support"))]
     pub fn wait_written(&self, within: std::time::Duration) -> bool {
@@ -437,18 +451,18 @@ impl TabWriter {
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let memory = TabMemory::new(Some(dir), self.project_root.clone());
             let thread_shared = shared.clone();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let before_write = self.before_write.clone();
             let spawned = std::thread::Builder::new()
                 .name("eitri-saved-tabs".into())
                 .spawn(move || {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     let hook = move || {
                         if let Some(hook) = &before_write {
                             hook();
                         }
                     };
-                    #[cfg(not(test))]
+                    #[cfg(not(any(test, feature = "test-support")))]
                     let hook = || {};
                     write_loop(&thread_shared, memory, hook);
                     let _ = done_tx.send(());
@@ -501,7 +515,10 @@ fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl F
             }
         };
         before_write();
-        match memory.observe(Some(next)) {
+        // Not `observe`: the window's thread compared this set with the last one it handed over, and the set
+        // in between may never have been taken here (replaced while queued), so this thread's own last set
+        // can be stale. An emptied window, the set before it never taken, must still empty the file.
+        match memory.write(next) {
             Some(Err(e)) => eprintln!("[tabs] could not save the open tabs: {e}"),
             Some(Ok(Written {
                 set_aside: Some(aside), ..
@@ -762,6 +779,46 @@ mod tests {
             Loaded::Saved(numbered(19)),
             "a closing window writes nothing"
         );
+    }
+
+    /// A window that adopted a session and closed it again before the writer took the first set hands over
+    /// tabs, then no tabs, and only the second is ever taken. The thread writes it although it never wrote
+    /// anything else: the file the launch found is emptied, not left to be offered again.
+    #[test]
+    fn an_emptied_set_whose_predecessor_was_never_taken_is_still_written() {
+        let dir = ScratchDir::new("nv-saved-tabs", "writer-emptied");
+        save(&dir, &root(), &two()).unwrap();
+        let shared = WriterShared::default();
+        {
+            let mut queue = shared.queue.lock().unwrap();
+            queue.next = Some(SavedTabs::default());
+            queue.finished = true;
+        }
+        write_loop(&shared, memory(&dir), || {});
+        assert_eq!(load(&dir, &root()), Loaded::Saved(SavedTabs::default()));
+
+        // The same through the whole writer. Whether the thread takes the first set before it is replaced or not
+        // is up to the scheduler, so this half only checks the file ends empty either way; the half above pins
+        // the case that went wrong.
+        let dir = ScratchDir::new("nv-saved-tabs", "writer-emptied-whole");
+        save(&dir, &root(), &two()).unwrap();
+        let mut writer = TabWriter::new(Some(dir.to_path_buf()), root());
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        writer.before_write = Some({
+            let gate = gate.clone();
+            std::sync::Arc::new(move || {
+                let (open, ready) = &*gate;
+                let open = open.lock().unwrap();
+                let _ = ready.wait_timeout_while(open, std::time::Duration::from_secs(10), |open| !*open);
+            })
+        });
+        writer.observe(Some(numbered(3)));
+        writer.observe(Some(SavedTabs::default()));
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let done = writer.finish().unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(load(&dir, &root()), Loaded::Saved(SavedTabs::default()));
     }
 
     /// A writer dropped without `finish` ends its thread, after the last set it was handed, and the drop

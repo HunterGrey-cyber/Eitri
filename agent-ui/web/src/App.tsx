@@ -123,6 +123,7 @@ import {
 import type { ReviewEffect, ReviewState } from "./review";
 import type { ReviewRecoveryEntry } from "./types";
 import { Chooser } from "./components/Chooser";
+import { withChooserTitles } from "./chooser";
 import { SlashPicker } from "./components/SlashPicker";
 import type { SlashPickerKind } from "./components/SlashPicker";
 import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
@@ -3183,6 +3184,10 @@ export default function App() {
         setSearch(null);
         setExLine(null);
         setChooser({ open: payload.open, records: payload.records });
+      } else if (payload.kind === "chooser_titles") {
+        // Only the titles of the rows already drawn change: same rows, same order, so the cursor stays on its
+        // row, and a chooser the user closed is not opened again.
+        setChooser((open) => (open === null ? null : withChooserTitles(open, payload.titles)));
       } else if (payload.kind === "queue") {
         setQueue(payload.items);
         setQueueError(payload.error);

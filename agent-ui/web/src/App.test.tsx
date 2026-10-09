@@ -14471,3 +14471,44 @@ describe("restoring the last session's tabs", () => {
     }
   });
 });
+
+/** A title the window read after the chooser was sent reaches a chooser still open, in place, the cursor on
+ *  the same row; one that arrives with no chooser open opens none. */
+describe("chooser_titles", () => {
+  const record = (id: string, title: string | null) => ({
+    providerSessionId: id, name: null, title, createdAt: "1", updatedAt: "2", heldElsewhere: false,
+  });
+  const CHOOSER = {
+    kind: "chooser",
+    open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }],
+    records: [record("s-1", "the record's own"), record("s-2", "second")],
+  };
+
+  it("retitles an open chooser's row and keeps the cursor where it was", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch(CHOOSER);
+    const chooser = container.querySelector<HTMLElement>(".chooser")!;
+    // From the active tab's row (after `New session`) to the first record's.
+    fireEvent.keyDown(chooser, { key: "j" });
+    const before = container.querySelector(".chooser-row.current")!.textContent;
+    dispatch({ kind: "chooser_titles", titles: [{ providerSessionId: "s-1", title: "the CLI's title" }] });
+    expect(container.querySelector(".chooser")!.textContent).toContain("the CLI's title");
+    expect(container.querySelector(".chooser")!.textContent).not.toContain("the record's own");
+    const after = container.querySelector(".chooser-row.current")!.textContent;
+    expect(before).toContain("the record's own");
+    expect(after).toContain("the CLI's title");
+  });
+
+  it("opens no chooser", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch(CHOOSER);
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
+    expect(container.querySelector(".chooser")).toBeNull();
+    dispatch({ kind: "chooser_titles", titles: [{ providerSessionId: "s-1", title: "the CLI's title" }] });
+    expect(container.querySelector(".chooser")).toBeNull();
+  });
+});
