@@ -170,3 +170,20 @@ describe("the start screen", () => {
     expect(container.querySelector(".search-bar input")).toBeNull();
   });
 });
+
+describe("a tab that fails right after a switch to it", () => {
+  it("never keeps the tab switched away from's conversation as its own", () => {
+    const { container } = conversation(true);
+    const second = { ...LIVE_TAB, id: 2, number: 2, label: "2 new" };
+    // The switch and the second tab's failure in one task, before React renders in between.
+    act(() => {
+      window.__eitriDispatch!(JSON.stringify({ kind: "tabs", active: 2, tabs: [LIVE_TAB, second] }));
+      window.__eitriDispatch!(
+        JSON.stringify({ ...fixture.error, tab: 2, message: "Codex ended unexpectedly (closed)" }),
+      );
+    });
+    const text = container.textContent ?? "";
+    expect(text).not.toContain("restored reply from the agent");
+    expect(text).not.toContain("please fix the parser");
+  });
+});

@@ -2626,7 +2626,11 @@ export default function App() {
           restoreSeq.current += 1;
           draftRef.current = "";
           setRestoredDraft({ text: "", seq: restoreSeq.current });
-          setState(initialState());
+          // The ref too, at once: an `error` envelope for the tab switched to can arrive before the next
+          // render, and must not keep the previous tab's conversation as its own.
+          const fresh = initialState();
+          stateRef.current = fresh;
+          setState(fresh);
           setCursor(0);
           setExpanded({});
           setDetailed(false);

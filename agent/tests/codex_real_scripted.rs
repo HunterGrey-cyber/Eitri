@@ -1992,3 +1992,84 @@ fn an_interrupt_stops_a_subagents_command() {
     );
     assert_eq!(session_lost(&run.events).as_deref(), Some(STOPPED));
 }
+
+/// An interrupt while a command's card waits answers the card `cancel`: the command never ran, so the turn
+/// ends at once and the session goes on.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn an_interrupt_with_a_command_card_waiting_does_not_stop_the_session() {
+    use agent::{AgentDomainEvent, AgentProvider, ExternalProvider, ExternalStart, InterruptTurnRequest, Reviewer};
+    use agent::{SendTurnRequest, TurnPolicy};
+    let codex = real_codex();
+    let s = Scratch::new("int-card");
+    let outside = s.dir("outside");
+    let model = ScriptedModel::start(vec![Step::exec(
+        "esc1",
+        &format!("touch {}/escalated", text_of(&outside)),
+        true,
+    )
+    .when_body_has("PROMPT-CARD")
+    .unless_body_has("\"esc1\"")])
+    .expect("model");
+    let project = s.dir("proj");
+    write_project(&project, "");
+    let home = s.dir("home");
+    write_home(&home, &model, "");
+    let provider = real_provider(&codex, &s, &home, &project);
+    let policy = || TurnPolicy {
+        reviewer: Reviewer::User,
+    };
+    let thread = provider
+        .start(ExternalStart {
+            cwd: text_of(&project).to_string(),
+            plan: plan(&project, DirTrust::Untrusted),
+            policy: policy(),
+            resume: None,
+        })
+        .expect("the session starts");
+    provider
+        .send_turn_with(
+            SendTurnRequest {
+                session_id: thread.clone(),
+                text: "PROMPT-CARD".to_string(),
+            },
+            policy(),
+        )
+        .expect("the turn starts");
+    let mut events = Vec::new();
+    let until = Instant::now() + TURN_BUDGET;
+    while !events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+    {
+        assert!(Instant::now() < until, "no card: {events:#?}");
+        events.extend(provider.pump());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pressed = Instant::now();
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: thread.clone(),
+        })
+        .expect("the interrupt is accepted");
+    while !events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    {
+        assert!(
+            pressed.elapsed() < Duration::from_secs(20),
+            "the turn did not end: {events:#?}"
+        );
+        events.extend(provider.pump());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let ended = pressed.elapsed();
+    events.extend(provider.pump());
+    assert!(session_lost(&events).is_none(), "the session was stopped: {events:#?}");
+    assert!(
+        ended < Duration::from_secs(2),
+        "the turn waited {ended:?} for a command that never ran"
+    );
+    assert!(!outside.join("escalated").exists(), "the cancelled command ran");
+    let _ = provider.close_session(agent::CloseSessionRequest { session_id: thread });
+}

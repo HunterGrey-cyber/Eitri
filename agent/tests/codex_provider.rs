@@ -1522,3 +1522,77 @@ fn an_interrupt_with_nothing_running_ends_the_turn_at_once() {
         pressed.elapsed()
     );
 }
+
+#[test]
+fn a_search_left_running_is_not_waited_on() {
+    let (t, u) = ("th-37", "turn-37");
+    let (provider, _) = interrupted_with(t, u, json!({"type": "webSearch", "id": "w1", "query": "x"}), vec![]);
+    let pressed = Instant::now();
+    let events = until_turn_completed(&provider);
+    assert!(
+        pressed.elapsed() < Duration::from_secs(1),
+        "took {:?}",
+        pressed.elapsed()
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
+}
+
+#[test]
+fn a_family_turn_named_while_the_turn_settles_is_waited_for() {
+    let (t, u) = ("th-38", "turn-38");
+    let (provider, _) = interrupted_with(
+        t,
+        u,
+        command("c1", "inProgress"),
+        vec![
+            // A turn of the tab's thread whose start cannot be read, then a message that names it, which
+            // Eitri sends its interrupt.
+            write(json!({"method": "turn/started", "params": {"threadId": t, "turn": {"bogus": true}}})),
+            item_note(
+                "item/started",
+                t,
+                "turn-38b",
+                json!({"type": "agentMessage", "id": "m9", "text": ""}),
+            ),
+            expect_exact(&format!(
+                r#"{{"id":6,"method":"turn/interrupt","params":{{"threadId":"{t}","turnId":"turn-38b"}}}}"#
+            )),
+            item_note("item/completed", t, u, command("c1", "completed")),
+            json!({"sleep_ms": 700}),
+            turn_completed(t, "turn-38b", "interrupted", Value::Null),
+        ],
+    );
+    let pressed = Instant::now();
+    let events = until_turn_completed(&provider);
+    assert!(
+        pressed.elapsed() >= Duration::from_millis(600),
+        "the tab's turn ended {:?} after the key, while a family turn still ran: {events:#?}",
+        pressed.elapsed()
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
+}
+
+#[test]
+fn closing_during_a_stop_waits_until_the_child_is_gone() {
+    let (t, u) = ("th-39", "turn-39");
+    // The stand-in sleeps through its stdin's end, so only the process-group kill after the grace ends it.
+    let (provider, thread) = interrupted_with(t, u, command("c1", "inProgress"), vec![json!({"sleep_ms": 30000})]);
+    let pid = provider.pid();
+    let pressed = Instant::now();
+    while pressed.elapsed() < agent::providers::codex::provider::INTERRUPT_SETTLE + Duration::from_millis(300) {
+        provider.pump();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(alive(pid), "the stand-in should still be inside its grace period");
+    provider
+        .close_session(CloseSessionRequest { session_id: thread })
+        .expect("closes");
+    assert!(
+        !alive(pid),
+        "the close returned while the stop had not killed the child"
+    );
+}

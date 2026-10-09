@@ -2632,7 +2632,13 @@ impl TabSet {
                 .tabs
                 .iter()
                 .any(|other| other.id != tab.id && other.provider_session_id().as_deref() == Some(id.as_str()));
-            return (!open_elsewhere).then_some(id);
+            // Two failed tabs of the same session (a refused restore, then a refused resume of it by hand)
+            // are one entry, the first; else the next restore would bring it back twice.
+            let failed_before = self.tabs.iter().take_while(|other| other.id != tab.id).any(|other| {
+                matches!(other.backend, TabBackend::Failed { .. })
+                    && other.failed_resume.as_deref() == Some(id.as_str())
+            });
+            return (!open_elsewhere && !failed_before).then_some(id);
         }
         tab.provider_session_id().filter(|id| !id.is_empty())
     }
@@ -10287,6 +10293,12 @@ mod external_tab_tests {
         set.get_mut(codex).unwrap().backend = TabBackend::Failed { reason: "x".into() };
         set.get_mut(codex).unwrap().failed_resume = Some("codex-b".into());
         assert_eq!(set.saved_snapshot("conv").unwrap().external_tabs.len(), 1);
+        // A second failed tab of the same session (its resume by hand refused too) is not a second entry.
+        let twin = set.open(AgentId::Codex);
+        set.get_mut(twin).unwrap().backend = TabBackend::Failed { reason: "y".into() };
+        set.get_mut(twin).unwrap().failed_resume = Some("codex-b".into());
+        assert_eq!(set.saved_snapshot("conv").unwrap().external_tabs.len(), 1);
+        set.remove(twin).unwrap();
         set.remove(codex).unwrap();
         assert!(set.saved_snapshot("conv").unwrap().external_tabs.is_empty());
     }

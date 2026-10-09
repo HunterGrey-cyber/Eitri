@@ -156,6 +156,20 @@ impl ActiveTurn {
     }
 }
 
+/// Item types that run nothing and write nothing (a search, a plan, a look at an image, a pause, review
+/// markers, a compaction, a hook's prompt, an output record), so an interrupt does not wait for them.
+const QUIET_ITEM_TYPES: &[&str] = &[
+    "webSearch",
+    "plan",
+    "imageView",
+    "sleep",
+    "enteredReviewMode",
+    "exitedReviewMode",
+    "contextCompaction",
+    "hookPrompt",
+    "functionCallOutput",
+];
+
 /// What a call Codex started and has not reported ended is, for deciding what an interrupt left running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Running {
@@ -163,7 +177,9 @@ enum Running {
     FileChange,
     /// An item whose kind or start Eitri could not read, which may be either.
     Unread,
-    /// A call that changes nothing by itself (a tool server's call, a subagent call).
+    /// A call Eitri does not stop the session for: a subagent call, which ends with its child, or a tool
+    /// server's call, which may be a long read as well as anything else. It is waited on only up to the
+    /// settle time, so what a tool server writes after that is not in the turn's end snapshot.
     Other,
 }
 
@@ -172,6 +188,10 @@ impl Running {
         match item {
             ThreadItem::CommandExecution(_) => Some(Running::Command),
             ThreadItem::FileChange(_) => Some(Running::FileChange),
+            // What Codex 0.161 names in its schema that runs nothing and writes nothing: not waited on.
+            ThreadItem::Unknown { item_type, .. } if QUIET_ITEM_TYPES.contains(&item_type.as_str()) => None,
+            // Anything else it may add, an image it saves, a tool Eitri never offered, a known type that
+            // did not read: may be writing.
             ThreadItem::Unknown { .. } | ThreadItem::Malformed { .. } => Some(Running::Unread),
             ThreadItem::McpToolCall(_) | ThreadItem::CollabAgentToolCall(_) => Some(Running::Other),
             ThreadItem::UserMessage(_)
@@ -204,7 +224,19 @@ pub fn stopped_after_interrupt(kept_doing: &str) -> String {
 struct Stopping {
     /// Set once the child and everything it started are gone.
     done: Arc<AtomicBool>,
+    /// The thread doing it, which a close waits for: a window that went before the group was killed would
+    /// leave the command running.
+    worker: Option<std::thread::JoinHandle<()>>,
     kept_doing: &'static str,
+}
+
+/// Sets its flag when dropped, so a stop that panics, or a thread that could not start, still ends the turn.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// A card waiting for its answer.
@@ -1532,8 +1564,8 @@ impl CodexProvider {
     /// After an interrupt, once every turn of the family has ended: the tab's turn ends when nothing Codex
     /// started is running any more. A command or file change still running past [`INTERRUPT_SETTLE`] (or
     /// a call Eitri could not read) stops the session, and the turn ends only once the child is gone, so
-    /// nothing reported as over is still writing. A call that changes nothing by itself is not waited on
-    /// past the settle time.
+    /// no command Codex ran is still writing when the turn is reported over. A subagent's or tool server's
+    /// call is not waited on past the settle time.
     fn settle(&self, st: &mut State) {
         if let Some(stopping) = st.stopping.as_ref() {
             if stopping.done.load(Ordering::Acquire) {
@@ -1546,14 +1578,25 @@ impl CodexProvider {
         if st.dead || st.closed {
             return;
         }
-        let Some(turn) = st.turn.as_ref().filter(|t| t.settling) else {
+        if !st.turn.as_ref().is_some_and(|t| t.settling) {
             return;
-        };
+        }
+        // A family turn began meanwhile (one whose start could not be read included): the tab's turn waits
+        // for it to end again, which settles anew. One that no message has named is not waited on, as
+        // everywhere after an interrupt.
+        forget_unnamed_turns(st);
+        if st.family.as_ref().is_some_and(|f| !f.running_turns().is_empty()) {
+            if let Some(turn) = st.turn.as_mut() {
+                turn.settling = false;
+            }
+            return;
+        }
         if !st.running_unread && st.running.is_empty() {
             self.end_family_turn(st);
             return;
         }
-        if turn.settle_until.is_some_and(|until| Instant::now() < until) {
+        let until = st.turn.as_ref().and_then(|t| t.settle_until);
+        if until.is_some_and(|until| Instant::now() < until) {
             return;
         }
         let unread = st.running_unread.then_some(Running::Unread);
@@ -1575,22 +1618,26 @@ impl CodexProvider {
         st.dead = true;
         Self::drop_cards(st, PermissionOutcome::CancelledByInterrupt);
         let done = Arc::new(AtomicBool::new(false));
+        let mut worker = None;
         if let Some(link) = lock(&self.link).take() {
-            let flag = Arc::clone(&done);
-            let spawned = std::thread::Builder::new()
+            let set = SetOnDrop(Arc::clone(&done));
+            // Without a thread the closure, and the link in it, is dropped inside `spawn`, which kills the
+            // group at once; the flag is set as it goes. The pump cannot read it before: it holds `st`.
+            worker = std::thread::Builder::new()
                 .name("eitri-codex-stop".to_string())
                 .spawn(move || {
+                    let _set = set;
                     link.shutdown(SIDECAR_EXIT_GRACE);
-                    flag.store(true, Ordering::Release);
-                });
-            // Without a thread the closure, and the link in it, was dropped, which kills the group at once.
-            if spawned.is_err() {
-                done.store(true, Ordering::Release);
-            }
+                })
+                .ok();
         } else {
             done.store(true, Ordering::Release);
         }
-        st.stopping = Some(Stopping { done, kept_doing });
+        st.stopping = Some(Stopping {
+            done,
+            worker,
+            kept_doing,
+        });
     }
 
     /// The child is gone: the rows still open end, the turn ends interrupted, and the session is over.
@@ -1854,6 +1901,7 @@ impl AgentProvider for CodexProvider {
     }
 
     fn close_session(&self, request: CloseSessionRequest) -> Result<(), ProviderError> {
+        let stop_worker;
         let thread_id = {
             let mut st = lock(&self.state);
             if st.closed {
@@ -1874,8 +1922,14 @@ impl AgentProvider for CodexProvider {
             st.events.push_back(AgentDomainEvent::SessionClosed {
                 reason: "closed_by_host".to_string(),
             });
+            // A stop under way is the close's own shutdown now: waited for below, and the session's end
+            // is this close rather than the stop's.
+            stop_worker = st.stopping.take().and_then(|stopping| stopping.worker);
             st.thread_id.clone()
         };
+        if let Some(worker) = stop_worker {
+            let _ = worker.join();
+        }
         let dead = lock(&self.state).dead;
         if let (Some(thread_id), false) = (thread_id, dead) {
             if let Ok(params) = to_json(&ThreadUnsubscribeParams { thread_id }) {
