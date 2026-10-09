@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=eb644697c9702d34c923cbb05789c9539f351f958f7e98c7139923c671e50474 -->
+<!-- translated-from: configuration.md sha256=2decd686f67df517a9543443c183701e8748246b71761d4b496596c75beb1829 -->
 
 # 配置
 
@@ -33,6 +33,8 @@ eitri.config.set("review.hint", true)
 | `agent.account` | 一个账号名 | 未设置 | 这个窗口使用的 Claude 账号。见[账号](#accounts)。 |
 | `agent.font_size` | 9 到 32 之间的数字 | `14` | agent 面板的文字大小，单位是像素。 |
 | `agent.typing_cadence_hz` | 1 到 60 之间的整数，或 `"off"` | `5` | 你在编辑器里输入时，agent 面板每秒最多允许更新多少次。稳定的较慢频率可以避免面板在你输入时重绘；`"off"` 让它全速更新。 |
+| `agent.default` | `"claude"`、`"codex"`，或用 `eitri.agent.register` 注册的 agent 的名字 | `"claude"` | 新标签页，以及新窗口的第一个标签页，运行哪个 agent。见 [Codex 与其他 agent](agents.zh-CN.md)。 |
+| `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`。带目录部分的相对路径会让 Eitri 在启动时停下。 |
 | `agent.default_mode` | `"auto"` 或 `"bypass"` | `"auto"` | 新标签页开始时所处的模式。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.restore` | `"offer"`、`"auto"` 或 `"off"` | `"offer"` | 对这个项目上一个窗口里开着的标签页怎么办。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.user_settings` | `true` 或 `false` | `true` | agent 会话是否加载你自己的 Claude Code 配置（你的 hook、插件、skill、`CLAUDE.md` 和权限规则），和终端里的 `claude` 一样。`false` 把你自己的配置排除在外；项目自己的配置由[信任](permissions.zh-CN.md)管，不由这个键管。 |
@@ -43,6 +45,11 @@ eitri.config.set("review.hint", true)
 | `companion.wm` | `"auto"`、`"hyprland"`、`"sway"`、`"niri"`、`"gnome"` 或 `"none"` | `"auto"` | 由哪个窗口管理器适配器在 [companion 窗口](companion.zh-CN.md)和你的编辑器之间移动焦点。`"auto"` 从会话里检测；`"none"` 从不向窗口管理器请求任何东西。 |
 
 设置只在窗口启动时读取一次。改了 `init.lua` 之后，开一个新窗口才会生效。
+
+<a id="registering-another-agent"></a>
+## 注册另一个 agent
+
+`eitri.agent.register` 不是一个设置：它接受一个表，加入一个通过标准输入输出说 ACP 的 agent，这样 `:tabnew NAME` 和 `agent.default` 就能用它。它的各个键、信任问题对它做什么，以及 Eitri 能为这样的 agent 做什么、不能做什么，都在 [Codex 与其他 agent](agents.zh-CN.md#other-agents-over-acp) 里。注册有问题，Eitri 会在启动时停下并点出那个键。
 
 <a id="keys"></a>
 ## 按键
@@ -72,7 +79,7 @@ eitri.config.set("agent.restore", "offer")        -- "offer" (the default), "aut
 eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "bypass"
 ```
 
-- **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有 Claude 会话的标签页（它们的顺序、名字、模式，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成“没有标签页”。设为 `"offer"` 时，只要窗口里还没有任何东西启动，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来（除非项目的 Claude 配置是新的或已改动，这时恢复要等你回答[信任问题](permissions.zh-CN.md#trusting-a-project)）；`"off"` 既不提议也不记录。每个标签页都会被继续（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。曾经处于 bypass 的标签页，没有你的一句“是”，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。
+- **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有可以继续的会话的标签页（它们的顺序、名字、模式、agent，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成“没有标签页”。设为 `"offer"` 时，只要窗口里还没有任何东西启动，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来（除非项目的 Claude 配置是新的或已改动，这时恢复要等你回答[信任问题](permissions.zh-CN.md#trusting-a-project)）；`"off"` 既不提议也不记录。每个标签页都会被继续（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。曾经处于 bypass 的标签页，没有你的一句“是”，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。
 - **`agent.default_mode`** 是新标签页开始时所处的模式，针对你还没有用 `Shift+Tab` 离开过 bypass 的项目（那个选择按项目记住，并且始终优先）。设为 `"bypass"` 是唯一一种窗口不经询问就以 bypass 开始的方式，因为你已经在自己的文件里这么说了；它同时也让保存下来的 bypass 标签页不必回答那个问题就以 bypass 回来。这两种模式的含义见[权限](permissions.zh-CN.md)。
 
 <a id="accounts"></a>
@@ -97,6 +104,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "by
 |---|---|
 | `EITRI_NVIM` | 要运行的 `nvim` 的绝对路径。它优先于下面的一切。不是指向现有文件的绝对路径的值会让启动停下。 |
 | `NEOVIM_BIN` | 在没有设置 `EITRI_NVIM` 时读取：规则相同，要求指向现有文件的绝对路径。两者都没有时，Eitri 用 `PATH` 上的 `nvim`；如果它不存在或者比 0.10 旧，并且你在 `eitri setup` 里接受过一个私有副本，就用 `$XDG_DATA_HOME/eitri/nvim/` 下最新的那个副本。 |
+| `EITRI_CODEX` | Codex 标签页运行的 `codex`：一个现有文件的绝对路径，否则 Eitri 会在启动时停下并点出这个变量。它优先于 `agent.codex.command` 和 `PATH`。空值算作未设置。Eitri 不为 Codex 标签页设置 `CODEX_HOME`；Codex 读的是你的，而相对的 `CODEX_HOME` 会让每一次 Codex 启动都被拒绝。 |
 | `EITRI_NEOVIDE` | `eitri split` 启动的那个 Neovide。它必须指向一个现有文件；没设置时用 `PATH` 上的 `neovide`。 |
 | `EITRI_PROJECT_DIR` | 命令行上没有给目录时要打开的项目。命令行上的目录优先于它，它优先于当前目录。已安装的 `eitri` 命令不读它：没有给目录时，它打开当前目录。 |
 | `EITRI_CONFIG_DIR` | 从这个目录读取 `init.lua` 和它的 `lua/` 模块，而不是 `~/.config/eitri`。 |

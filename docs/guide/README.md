@@ -10,7 +10,7 @@ the keyboard.
 ## The window
 
 - **The editor.** A real Neovim running your own `init.lua`, plugins, LSP and keymaps.
-- **The agent panel.** Claude Code's conversation, one tab per session: rendered replies, each edit as its own
+- **The agent panel.** Claude Code's conversation (or Codex's, or another agent's), one tab per session: rendered replies, each edit as its own
   diff row, and a card to approve or deny what the agent may not run on its own.
 - **The bottom terminal.** A shell below the editor. It is hidden when a window first opens and
   only starts once you show it.
@@ -29,4 +29,5 @@ orchestrator of many agents; you supervise one Claude Code session per tab, in a
 - [Companion mode](companion.md): the agent panel as its own window beside the Neovim you already use.
 - [Turn review](turn-review.md): see what changed on disk during a turn, revert a hunk, send comments back.
 - [Permissions](permissions.md): what runs without asking, what waits on a card, and the bypass mode.
+- [Codex and other agents](agents.md): tabs that run Codex, or an agent you register that speaks ACP.
 - [Known issues](../known-issues.md): what is unsupported or rough today.

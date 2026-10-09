@@ -127,7 +127,8 @@ A message that starts with `/` is a Claude Code slash command. Some work (`/clea
 `/context`, `/usage`, `/model`, `/mcp`, `/agents`, `/doctor` and `/output-style` are the ones that show an
 effect), a bare `/model` or `/effort` opens a picker, and a few that need a full terminal (`/login`,
 `/config` and `/resume`) are refused with a message. The rest are sent as ordinary text, which Claude answers
-as words rather than as a command. `?` lists the ones that work.
+as words rather than as a command. `?` lists the ones that work. In a Codex tab, or a tab of an agent you
+registered, the message is sent as typed: there is no list of held-back commands and no picker.
 
 ### In BROWSE
 
@@ -182,7 +183,7 @@ After it, a short list of what can follow appears. These keys work in BROWSE.
 | `<leader>,` | switch tab |
 | `<leader>/` | search the conversation |
 | `<leader>i` | this tab's details |
-| `<leader>t` | continue this conversation in a terminal |
+| `<leader>t` | continue this conversation in a terminal (Claude tabs; a Codex or registered agent's tab says it is not available yet) |
 | `<leader>m` | switch between Auto and Bypass (as `Shift+Tab`) |
 | `<leader>?` | the list of keys |
 
@@ -238,15 +239,17 @@ nothing, since `f` is never a label.
 ## The command line
 
 `:` in BROWSE (or `<prefix> :` from anywhere) opens a command line at the bottom of the panel. It is not
-vim's: it takes two commands, so that `:ls` or `:d` typed from habit land here and never on a card. `Enter`
+vim's: it takes three commands, so that `:ls` or `:d` typed from habit land here and never on a card. `Enter`
 runs it and `Esc` closes it; anything else shows a note saying there are no other commands.
 
 | command | what it does |
 |---|---|
-| `:trust` | check this project's own Claude Code configuration (its `.claude/`, `.mcp.json` and `CLAUDE.md`) and ask whether to trust it; sessions started afterwards load it. It says so when there is nothing to trust or it is already trusted |
+| `:tabnew` | open a new tab of the default agent, as `<prefix> c` does. `:tabnew codex`, or `:tabnew` and the name of an agent registered in `init.lua`, opens a tab that runs that agent. Any other word is refused with the list of accepted ones |
+| `:trust` | check this project's own configuration for the agent of the tab on screen (for Claude its `.claude/`, `.mcp.json` and `CLAUDE.md`) and ask whether to trust it; sessions started afterwards load it. It says so when there is nothing to trust or it is already trusted |
 | `:untrust` | forget that trust; sessions started afterwards leave the project's configuration out. Running sessions are unchanged |
 
-What trusting means is in [Permissions](permissions.md).
+What trusting means is in [Permissions](permissions.md), and the other agents are in
+[Codex and other agents](agents.md).
 
 ## Your tmux keys
 

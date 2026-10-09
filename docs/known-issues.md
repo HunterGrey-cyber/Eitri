@@ -18,6 +18,9 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 - **Neovim 0.10 or newer**: your own on `PATH`, or a private copy the installer offers to fetch.
 - **Claude Code**, installed and logged in, 2.1.252 or newer and below 3.0. Without it Eitri still opens and
   the editor works; the agent panel cannot run turns.
+- **Codex and other agents are optional.** A Codex tab needs `codex` 0.160.0 or newer, installed and signed in
+  (tried with 0.160.0 to 0.161.0); a tab for any other agent needs an agent that speaks ACP version 1 over standard
+  input and output. See [Codex and other agents](guide/agents.md).
 
 ## Installing
 
@@ -116,6 +119,40 @@ one-window mode.
 - **The agent panel's script policy is new and was checked in tests, not yet on a screen on every setup.** The
   panel now allows only its own script by hash instead of any inline script. If the agent panel stays blank
   after an update, please report it with your WebKitGTK version.
+
+## Codex and ACP tabs
+
+Tabs for Codex and for agents registered with `eitri.agent.register` are new ([the guide](guide/agents.md)). They
+have been tried against stand-in models and stand-in agents, and, in a few runs, a real Codex and the `codex-acp`
+adapter; they have not been tried on every setup.
+
+- **The first start with a `codex` Eitri has not checked runs a short self-check, and every Codex start is refused
+  until it passes.** It takes a few seconds, is remembered per binary (path, size, modification time and version)
+  and runs again after an update. It fails, naming `XDG_STATE_HOME`, when the state directory is under `/tmp` or `$TMPDIR`
+  and neither `XDG_RUNTIME_DIR` nor the cache directory is elsewhere. A newer Codex than the tested range runs and
+  is marked as untested.
+- **A Codex tab's sandbox limits writes, network and sockets, not reads.** Codex can read any file you can read.
+  Commands your own exec-policy `allow` rules cover run outside the sandbox, MCP tools follow the approval mode
+  of their server, and a command approved to leave the sandbox runs with your full rights. Your own Codex
+  configuration (`CODEX_HOME`, or `~/.codex`) always loads, and Eitri cannot turn it off.
+- **Subagents cannot be turned off.** A Codex subagent inherits the tab's sandbox and trust answer; its own text is
+  not shown.
+- **A command the model leaves running in the background past its call outlives a turn that ends normally.** An
+  interrupt after that stops the whole Codex session, and closing the tab stops it too.
+- **A hook of yours can answer first.** A `PermissionRequest` hook in your own Codex configuration may answer a
+  request before Eitri sees it. Not measured: a hook rewriting a command after approval, how each MCP approval
+  mode behaves, a plugin from a marketplace listing loading in a trusted project, resuming a thread that a live
+  Codex client holds, a subagent's file-change approval, and whether the sandbox can reach your session bus, tmux
+  or nvim.
+- **There is no Eitri-side classifier or saved rule for these agents.** Every request that reaches Eitri is a card
+  (in Auto), or is approved by Eitri (in Bypass).
+- **An ACP agent starts only after a `y`**, because Eitri cannot keep it from loading the project's own
+  configuration; an `n` starts nothing and is not remembered. `project_files` is your list: Eitri hashes only
+  what you name there. Eitri does not scrub the agent's environment, so an agent that reads a relative-path
+  variable as its configuration directory would read the project's directory.
+- **What an ACP agent runs without asking is the agent's own.** Eitri shows the requests it receives and sets
+  only the mode the registration names. Eitri has no rate limits, context bar, slash-command list or model picker
+  for these tabs, and `<leader>t` (continue in a terminal) is not available for them yet.
 
 ## Turn review
 

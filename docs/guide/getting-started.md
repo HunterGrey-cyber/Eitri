@@ -8,7 +8,8 @@ end well. It assumes Eitri is [installed](../../INSTALL.md) and the `claude` com
 account.
 
 Keys are written for the default setup: the prefix is `Ctrl+b`, and "the leader" is `Space` unless your
-Neovim configuration sets another `mapleader`. The full list is in [Keys](keys.md); `?` in the panel shows it
+Neovim configuration sets another `mapleader` of a single key the panel can use (a longer or reserved one falls
+back to `Space`). The full list is in [Keys](keys.md); `?` in the panel shows it
 too.
 
 ## Open a project
@@ -48,7 +49,12 @@ to tell whether a problem comes from your own setup.
 
 Press `i` (or `Ctrl+j`) in the panel and type your prompt. `Enter` sends it; `Shift+Enter` starts a new
 line, and so do `Alt+Enter` and a backslash followed by `Enter`. The session starts when you send the first
-message, not before. Each message also carries the name of the file open in the editor, or the lines you had
+message, not before, and in a project that ships its own Claude Code configuration (`.claude/`, `.mcp.json` or
+`CLAUDE.md`) not before you have answered a question: Eitri holds the start and asks whether to trust that
+configuration. `y` loads it, `n` starts the session without it, and `Esc` puts the start off and gives your
+text back. Until you answer, the panel says "Waiting for your answer to the trust question — nothing has
+started". What the question shows and what each answer means is in
+[Trusting a project](permissions.md#trusting-a-project). Each message also carries the name of the file open in the editor, or the lines you had
 selected there in Visual mode. A selection is what points the agent at a particular piece of code, so select
 the function in the editor first when you say "fix this function"; a cursor position alone is not sent.
 
@@ -70,7 +76,9 @@ After a turn that edited files, `c` in browsing shows what changed on disk durin
 
 Some tool calls wait for you. Eitri draws a permission card in the conversation, next to the call it gates,
 with an **Approve** and a **Deny** button, and for many commands a third button, "Always allow ... in this
-project", which saves a rule so that call no longer asks.
+project", which saves a rule that approves such commands without a card from then on. A rule does not answer
+the questions Claude Code raises itself, so a command it still asks about gets a card even then; see
+[When Claude Code itself asks](permissions.md#when-claude-code-itself-asks).
 
 In browsing:
 
@@ -115,7 +123,8 @@ Each conversation is a tab. The tab bar appears once there are two or more.
 | `<prefix> w` | a list of the open tabs and the saved sessions, to switch or resume |
 | `<prefix> i` | details of this tab: name, mode, model, session ids, the settings it loaded and whether its project is trusted |
 
-In the panel, `H` and `L` (or `gT` and `gt`) also go to the previous and the next tab. Tabs run side by side: a
+In the panel, `H` and `L` (or `gT` and `gt`) also go to the previous and the next tab. Each tab runs one agent, Claude by default; `:tabnew codex` opens a tab for Codex, and an agent you register
+can have tabs too. See [Codex and other agents](agents.md). Tabs run side by side: a
 background tab keeps streaming, and its label in the tab bar shows what it needs (`⚑` for a waiting card, `•`
 for a turn that finished while you were elsewhere, `✕` for a session that ended badly).
 

@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=be131bc89c00be6035e374cb965d1be6b1016d509d4218fa062652cb7d0434a7 -->
+<!-- translated-from: README.md sha256=4e5345074cb9c9abc9ddc4929dd619c4caec154827182b8f6db39699d6fd4d7e -->
 
 # Eitri 文档
 
@@ -8,7 +8,7 @@ Eitri 是一个面向 Linux 的 Neovim 图形前端，旁边带着 Claude Code�
 ## 窗口
 
 - **编辑器。** 一个真正的 Neovim，运行你自己的 `init.lua`、插件、LSP 和按键映射。
-- **agent 面板。** Claude Code 的对话，每个会话一个标签页：渲染好的回复、每一次编辑各自一个 diff 行，以及一张用来批准或拒绝 agent 不能自己运行的东西的卡片。
+- **agent 面板。** Claude Code 的对话（或 Codex 的、其他 agent 的），每个会话一个标签页：渲染好的回复、每一次编辑各自一个 diff 行，以及一张用来批准或拒绝 agent 不能自己运行的东西的卡片。
 - **底部终端。** 编辑器下面的一个 shell。窗口刚打开时它是隐藏的，只有在你把它显示出来之后才会启动。
 
 ## 它不是什么
@@ -24,4 +24,5 @@ Eitri 不取代 Neovim：缓冲区、动作、LSP 和补全仍然是 Neovim 自�
 - [Companion 模式](companion.zh-CN.md)：agent 面板作为独立窗口，放在你已经在用的 Neovim 旁边。
 - [回合审阅](turn-review.zh-CN.md)：查看一个回合期间磁盘上改了什么，还原一个 hunk，把评论发回去。
 - [权限](permissions.zh-CN.md)：什么不经询问就运行，什么要等一张卡片，以及 bypass 模式。
+- [Codex 与其他 agent](agents.zh-CN.md)：运行 Codex，或你注册的、说 ACP 的 agent 的标签页。
 - [已知问题](../known-issues.zh-CN.md)：今天不支持的和还比较粗糙的地方。

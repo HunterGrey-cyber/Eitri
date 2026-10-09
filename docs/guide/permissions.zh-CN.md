@@ -1,11 +1,13 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=7815227b3e0cef784aacbcf79d95672614c39e8ea07deb11a29aaa99213b6c77 -->
+<!-- translated-from: permissions.md sha256=d7c5df2b901653439f08b4374f447b519da12380aeb5dcd63f798ba45a8bb73e -->
 
 # 权限与信任
 
 这一页说明一次工具调用在运行之前会怎样、由谁来回答、一条保存的规则能做什么和不能做什么、Claude Code 自己还可能问什么，以及 Eitri 怎样决定是否加载项目自己的 Claude Code 配置。它描述的是 Eitri 今天实际做的事，包括它比你想象的要弱的地方；这些都汇集在[已知限制](#known-limits)里。
 
 怎样用键盘回答一张卡片，见[快速上手](getting-started.zh-CN.md)和[按键](keys.zh-CN.md#answering-a-card)。
+
+这一页讲的是 Claude 标签页。运行 Codex 或你注册的 agent 的标签页有它自己的沙箱、审查者和信任问题，它们在 [Codex 与其他 agent](agents.zh-CN.md) 里描述。
 
 ## 谁来决定一次工具调用
 

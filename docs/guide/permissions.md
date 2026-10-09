@@ -10,6 +10,9 @@ assume; those are collected under [Known limits](#known-limits).
 How to answer a card with the keyboard is in [Getting started](getting-started.md) and
 [Keys](keys.md#answering-a-card).
 
+This page is about Claude tabs. A tab that runs Codex, or an agent you registered, has its own sandbox,
+reviewer and trust question; they are described in [Codex and other agents](agents.md).
+
 ## Who decides a tool call
 
 Every tool call Claude Code wants to run is sent to Eitri first, in both modes, before it runs. What happens

@@ -44,6 +44,8 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `agent.account` | an account name | unset | The Claude account the window uses. See [Accounts](#accounts). |
 | `agent.font_size` | a number from 9 to 32 | `14` | The agent panel's text size, in pixels. |
 | `agent.typing_cadence_hz` | a whole number from 1 to 60, or `"off"` | `5` | While you type in the editor, how many times a second the agent panel is allowed to update. A steady slower rate keeps the panel from redrawing under your typing; `"off"` lets it update at full speed. |
+| `agent.default` | `"claude"`, `"codex"` or the name of an agent registered with `eitri.agent.register` | `"claude"` | The agent a new tab runs, and the first tab of a fresh window. See [Codex and other agents](agents.md). |
+| `agent.codex.command` | an absolute path, or a bare command name | unset | The `codex` a Codex tab runs. `EITRI_CODEX` outranks it; without either, `codex` on `PATH`. A relative path with a directory part stops Eitri at startup. |
 | `agent.default_mode` | `"auto"` or `"bypass"` | `"auto"` | The mode a new tab starts in. See [How a launch starts](#how-a-launch-starts). |
 | `agent.restore` | `"offer"`, `"auto"` or `"off"` | `"offer"` | What happens to the tabs the last window on this project had open. See [How a launch starts](#how-a-launch-starts). |
 | `agent.user_settings` | `true` or `false` | `true` | Whether agent sessions load your own Claude Code configuration (your hooks, plugins, skills, `CLAUDE.md` and permission rules), as `claude` does in a terminal. `false` leaves your own configuration out; a project's own configuration is governed by [trust](permissions.md), not by this key. |
@@ -54,6 +56,13 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `companion.wm` | `"auto"`, `"hyprland"`, `"sway"`, `"niri"`, `"gnome"` or `"none"` | `"auto"` | Which window-manager adapter moves focus between the [companion window](companion.md) and your editor. `"auto"` detects it from the session; `"none"` never asks the window manager for anything. |
 
 The settings are read once, when the window starts. Change `init.lua` and open a new window to apply a change.
+
+## Registering another agent
+
+`eitri.agent.register` is not a setting: it takes a table and adds an agent that speaks ACP over standard input
+and output, so that `:tabnew NAME` and `agent.default` can use it. Its keys, what the trust question does for it
+and what Eitri can and cannot do for such an agent are on [Codex and other agents](agents.md#other-agents-over-acp).
+A bad registration stops Eitri at startup and names the key.
 
 ## Keys
 
@@ -90,7 +99,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "by
 ```
 
 - **`agent.restore`** is what happens to the tabs the last window on this project had open. Eitri keeps the
-  tabs that have a Claude session (their order, names, modes and which one was on screen) as it goes, and never
+  tabs that have a session to resume (their order, names, modes, agents and which one was on screen) as it goes, and never
   records "no tabs" because you closed the window. With `"offer"` the empty tab's dashboard shows a
   `Restore last session` line, `s`, while nothing in the window has started; `"auto"` brings the tabs back at
   launch with no key pressed (unless the project's Claude configuration is new or changed, in which case the
@@ -135,6 +144,7 @@ not settings and are not listed.
 |---|---|
 | `EITRI_NVIM` | The absolute path of the `nvim` to run. It wins over everything below. A value that is not an absolute path to an existing file stops the launch. |
 | `NEOVIM_BIN` | Read when `EITRI_NVIM` is not set: the same rule, an absolute path to an existing file. Without either, Eitri uses the `nvim` on `PATH`; if that is missing or older than 0.10 and you accepted a private copy from `eitri setup`, it uses the newest copy under `$XDG_DATA_HOME/eitri/nvim/`. |
+| `EITRI_CODEX` | The `codex` a Codex tab runs: an absolute path to an existing file, else Eitri stops at startup and names the variable. It wins over `agent.codex.command` and `PATH`. Empty counts as unset. Eitri sets no `CODEX_HOME` for a Codex tab; Codex reads yours, and a relative `CODEX_HOME` makes every Codex start refuse. |
 | `EITRI_NEOVIDE` | The Neovide that `eitri split` starts. It must name an existing file; unset, `neovide` on `PATH` is used. |
 | `EITRI_PROJECT_DIR` | The project to open when no directory is given on the command line. The command-line directory wins over it, and it wins over the current directory. The installed `eitri` command does not read it: it opens the current directory when you name none. |
 | `EITRI_CONFIG_DIR` | The directory `init.lua` and its `lua/` modules are read from, instead of `~/.config/eitri`. |

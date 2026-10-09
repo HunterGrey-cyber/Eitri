@@ -23,8 +23,11 @@ Each changed file is a row with its added and removed line counts and a sign in 
 | sign | what it means |
 |---|---|
 | `✓` | one of the agent's own successful `Write`, `Edit`, `MultiEdit` or `NotebookEdit` calls in this tab named the file, and it changed |
-| `·` | one of those calls named the file, but the file did not change on disk |
+| `·` | one of those calls named the file, but the comparison shows no change in it: the file did not change, or your ignore rules keep it out of the snapshots, so a change to it cannot be seen |
 | `?` | the file changed, and none of those calls named it |
+
+In a Codex tab a file change Codex applied counts as such a call (a subagent's included), and in a tab of an
+agent registered over ACP an edit, delete or move call that finished without an error does; see [Codex and other agents](agents.md).
 
 The wording is deliberately about the disk, not about who acted. A change made by a shell command the agent
 ran, or by you in your editor while the turn was running, has no edit call to name it, so it shows as `?`;
@@ -62,7 +65,7 @@ A turn that changed nothing says `no files changed on disk`.
 | `Enter` | open or close a file's hunks; on a hunk, close its file; on the folded group, open it |
 | `[` / `]` | the previous / next turn |
 | `S` | switch between this turn and the whole session (everything changed since the session's first snapshot) |
-| `y` | copy `path:line` of the row under the cursor |
+| `y` | copy `path:line` of the row under the cursor; a file row whose patch is not open yet, and a binary or oversized file, copies the path alone |
 | `o` | open the file in your editor at the hunk's first line (see [In your editor](#in-your-editor)) |
 | `q`, `Esc` or `c` | close |
 
@@ -77,22 +80,25 @@ status band can say `2 files changed · c to review`; see [Turning it off](#turn
 `x` on a hunk puts that hunk's lines back the way they were before the turn (in the session view, before the
 session's first turn). `x` on a file row reverts the whole file and asks first:
 `revert the whole file <path> to before turn N? y/n`. A file the turn created is deleted, a file the turn
-deleted comes back with the mode it had, and a link comes back as a link. A binary file can only be reverted
-whole.
+deleted comes back with the mode it had, and a link comes back as a link. A binary file, a file the turn created
+or deleted, and a symbolic link can only be reverted whole: `x` on one of their hunks is refused and says so.
 
 A reverted hunk or file is marked `reverted`. `u` undoes the last revert made here and puts the file back
 byte for byte, mode included; the mark then reads `reverted, undone`. Neither key writes anything unless
 every one of these holds, and when one does not, the footer says which:
 
-- **No agent turn is running, in any Eitri window.** Otherwise: `an agent turn is running`.
+- **No agent turn is running in any Eitri window on this project.** Otherwise: `an agent turn is running`. A
+  turn in a window on another project does not count.
 - **No other Eitri window has this project open.** Otherwise: `another Eitri window has this project open;
   revert from one window at a time`.
 - **Your editor holds no unsaved changes to that file.** Otherwise: `<path> has unsaved changes in the editor;
   write or discard them first`. With no editor attached (for instance a [companion](companion.md) panel that
   is detached), Eitri cannot tell and refuses: `no editor is connected, so Eitri cannot tell whether <path> has
   unsaved changes`.
-- **The file is still what the turn left.** If you edited it since, the revert is refused with `changed since
-  the turn ended; open it in the editor (o)`, so your own work is never overwritten by a stale revert.
+- **The lines being reverted are still what the turn left.** For a whole file that means every byte of it; for a
+  hunk, only that hunk's lines and the context around them, so your own edits elsewhere in the file stay. If they
+  differ, the revert is refused with `changed since the turn ended; open it in the editor (o)`, so your own work
+  is never overwritten by a stale revert.
 - **The path is inside the project.** A parent directory that is a symbolic link is refused, even when it
   leads somewhere harmless.
 - **The turn was finished and its snapshots are still there.** A turn without a closing snapshot has nothing
@@ -137,8 +143,8 @@ Nothing is sent without this preview.
 
 `o` on a file or a hunk opens the file in your editor at the hunk's first line and draws the turn's hunks over
 the buffer: added lines highlighted and the removed lines shown above or below them as text that is not in the buffer. In the full
-window the editor gets the keys; in a companion window the editor's window is raised. A file that has changed
-since the turn is not drawn over, and reloading the buffer (`:e!` or a change from outside) clears the overlay
+window the editor gets the keys; in a companion window the editor's window is raised. A hunk whose lines no
+longer match the buffer is skipped and the notice says how many; the hunks that still match are drawn. Reloading the buffer (`:e!` or a change from outside) clears the overlay
 with a notice.
 
 In that buffer:

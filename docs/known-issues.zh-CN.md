@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=02b2565e4d77a00385acb9176df5bf1dd54d618ad4321004042efa038ba7b1b2 -->
+<!-- translated-from: known-issues.md sha256=3a313319021c818148d5d5cde455e4c0de520e08d56719a5841b8636e294814c -->
 
 # 已知问题与限制
 
@@ -12,6 +12,7 @@
 - **需要 WebKitGTK 2.40 或更新**（`webkitgtk-6.0` API）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的版本没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 满足要求；Ubuntu 22.04 和 Debian 12 不满足。
 - **Neovim 0.10 或更新**：用你自己 `PATH` 里的，或者让安装脚本为 Eitri 单独下载的一份私有副本。
 - **Claude Code**，已安装并已登录，2.1.252 或更新，低于 3.0。没有它时 Eitri 照样能打开，编辑器可以用；agent 面板没法运行对话。
+- **Codex 和其他 agent 是可选的。** Codex 标签页需要 0.160.0 或更新的 `codex`，已安装并已登录（试过 0.160.0 到 0.161.0）；其他 agent 的标签页需要一个通过标准输入输出说 ACP 第 1 版的 agent。见 [Codex 与其他 agent](guide/agents.zh-CN.md)。
 
 ## 安装
 
@@ -51,6 +52,20 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **已信任项目的 `permissions.allow` 规则，只有在你也在终端 `claude` 里信任过那个目录时，才会作用到 Auto 标签页。** 这是 Claude Code 自己的规则；你用户设置里的规则始终有效。
 - **底部终端可以写你的剪贴板，这是有意为之。** 在那里运行的程序可以用 OSC 52 转义序列设置剪贴板或主选区（和 Alacritty 的默认行为一样）；发生时 Eitri 不会提示，所以你接下来粘贴的内容可能不是你复制的。读取剪贴板则会被拒绝。
 - **agent 面板的脚本策略是新的，只在测试里检查过，还没有在每一种环境的屏幕上看过。** 面板现在只允许自己的那段脚本（按哈希），不再允许任意内联脚本。如果更新后 agent 面板一直是空白，请连同你的 WebKitGTK 版本一起报告。
+
+<a id="codex-and-acp-tabs"></a>
+## Codex 与 ACP 标签页
+
+Codex 的标签页，以及用 `eitri.agent.register` 注册的 agent 的标签页都是新的（[指南](guide/agents.zh-CN.md)）。它们拿替身模型和替身 agent 试过，也在少数几次运行里用过真实的 Codex 和 `codex-acp` 适配器；没有在每一种环境上试过。
+
+- **第一次用一个 Eitri 没检查过的 `codex` 启动时，会运行一次简短的自检，通过之前每一次 Codex 启动都会被拒绝。** 它要几秒钟，按程序（路径、大小、修改时间和版本）记住，更新之后会再运行。如果状态目录在 `/tmp` 或 `$TMPDIR` 之下，而 `XDG_RUNTIME_DIR` 和缓存目录又都不在别处，它会失败，并点出 `XDG_STATE_HOME`。比试过的范围更新的 Codex 能运行，并被标为未测试。
+- **Codex 标签页的沙箱限制写入、网络和套接字，不限制读取。** Codex 能读取你能读取的任何文件。你自己的 exec-policy `allow` 规则覆盖的命令在沙箱之外运行，MCP 工具遵循它们所在服务器的批准模式，被批准离开沙箱的命令以你的全部权限运行。你自己的 Codex 配置（`CODEX_HOME`，或 `~/.codex`）总会加载，Eitri 没办法关掉它。
+- **子 agent 关不掉。** Codex 的子 agent 继承标签页的沙箱和信任回答；它们自己的文字不会显示。
+- **模型在自己那次调用之后留在后台继续运行的命令，会比正常结束的回合活得更久。** 在那之后的中断会停掉整个 Codex 会话，关闭标签页也会停掉它。
+- **你的钩子可能抢先回答。** 你自己的 Codex 配置里的 `PermissionRequest` 钩子，可能在 Eitri 看到请求之前就回答了它。没有测过的有：钩子在批准之后改写命令、每种 MCP 批准模式的行为、来自市场清单的插件在已信任的项目里加载、恢复一个有真实 Codex 客户端占着的线程、子 agent 的文件改动批准，以及沙箱能不能够到你的会话总线、tmux 或 nvim。
+- **这些 agent 没有 Eitri 一侧的分类器或保存的规则。** 到达 Eitri 的每个请求，在 Auto 下是一张卡片，在 Bypass 下由 Eitri 批准。
+- **ACP agent 只在 `y` 之后才启动**，因为 Eitri 没法不让它加载项目自己的配置；`n` 什么也不启动，也不会被记住。`project_files` 是你的清单：Eitri 只对你在那里点名的东西做哈希。Eitri 不清理 agent 的环境，所以把环境变量里的相对路径当作配置目录的 agent，会去读项目的目录。
+- **ACP agent 不经询问运行什么，是 agent 自己的事。** Eitri 显示它收到的请求，只设置注册里点名的那个模式。这类标签页没有速率限制、上下文条、斜杠命令列表或模型选择器，`<leader>t`（在终端里继续）对它们也还不可用。
 
 <a id="turn-review"></a>
 ## 回合审阅

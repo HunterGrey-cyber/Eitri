@@ -1,11 +1,11 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=cb990b0576b560085e3695f22fa2a5403c1c670f265755f9412ca42a9064b7cb -->
+<!-- translated-from: getting-started.md sha256=519372e9744599324832bdab56f7b9fafd6204d4000bdf950d9d5bd8cbf66ab8 -->
 
 # 快速上手
 
 这一页带你从命令走到第一个完成的回合：打开一个项目、发送提示、回应 Eitri 弹出的卡片、同时使用多个会话，以及某个回合没有顺利结束时面板会说什么。它假定 Eitri 已经[安装好](../../INSTALL.zh-CN.md)，并且 `claude` 命令已经登录到你的账号。
 
-文中的按键按默认设置来写：前缀是 `Ctrl+b`，“leader”是 `Space`，除非你的 Neovim 配置设了别的 `mapleader`。完整的按键列表在[按键](keys.zh-CN.md)里，在面板里按 `?` 也能看到。
+文中的按键按默认设置来写：前缀是 `Ctrl+b`，“leader”是 `Space`，除非你的 Neovim 配置设了别的、面板能用的单个键的 `mapleader`（更长的或被保留的会退回到 `Space`）。完整的按键列表在[按键](keys.zh-CN.md)里，在面板里按 `?` 也能看到。
 
 <a id="open-a-project"></a>
 ## 打开一个项目
@@ -36,7 +36,7 @@ eitri [DIR]
 <a id="your-first-turn"></a>
 ## 你的第一个回合
 
-在面板里按 `i`（或 `Ctrl+j`），输入你的提示。`Enter` 发送；`Shift+Enter` 换行，`Alt+Enter` 以及反斜杠加 `Enter` 也一样。会话在你发出第一条消息时才启动，不会更早。每条消息还会带上编辑器里打开的文件名，或者你在那里用 Visual 模式选中的行。选区才是让 agent 指向某一段代码的方式，所以说“修好这个函数”之前，先在编辑器里把那个函数选上；光标位置本身不会被发送。
+在面板里按 `i`（或 `Ctrl+j`），输入你的提示。`Enter` 发送；`Shift+Enter` 换行，`Alt+Enter` 以及反斜杠加 `Enter` 也一样。会话在你发出第一条消息时才启动，不会更早；而且在一个自带 Claude Code 配置（`.claude/`、`.mcp.json` 或 `CLAUDE.md`）的项目里，要等你回答一个问题才会启动：Eitri 会先扣住这次启动，问是否信任那份配置。`y` 加载它，`n` 不加载它而启动会话，`Esc` 把这次启动推迟并把你的文字还给你。在你回答之前，面板会写 “Waiting for your answer to the trust question — nothing has started”。问题显示什么、每个回答意味着什么，见[信任一个项目](permissions.zh-CN.md#trusting-a-project)。每条消息还会带上编辑器里打开的文件名，或者你在那里用 Visual 模式选中的行。选区才是让 agent 指向某一段代码的方式，所以说“修好这个函数”之前，先在编辑器里把那个函数选上；光标位置本身不会被发送。
 
 Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示。每一次文件编辑是它自己的一个 diff 行。agent 运行的每个工具也是一行：一条命令、一个读过的文件、一次搜索。
 
@@ -50,7 +50,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 <a id="when-eitri-asks"></a>
 ## Eitri 什么时候会问你
 
-有些工具调用要等你。Eitri 会在对话里、紧挨着它所拦住的那次调用画出一张权限卡片，上面有 **Approve**（批准）和 **Deny**（拒绝）两个按钮，对许多命令还有第三个按钮 “Always allow ... in this project”，它会保存一条规则，之后这类调用就不再询问。
+有些工具调用要等你。Eitri 会在对话里、紧挨着它所拦住的那次调用画出一张权限卡片，上面有 **Approve**（批准）和 **Deny**（拒绝）两个按钮，对许多命令还有第三个按钮 “Always allow ... in this project”，它会保存一条规则，之后这类命令不出卡片就被批准。规则不回答 Claude Code 自己提出的问题，所以 Claude Code 仍然要问的命令，即使有规则也还是会出卡片；见 [Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks)。
 
 在浏览模式里：
 
@@ -84,7 +84,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 | `<prefix> w` | 已打开的标签页和保存过的会话的列表，用来切换或继续 |
 | `<prefix> i` | 这个标签页的详情：名字、模式、模型、会话 id、它加载了哪些设置，以及它的项目是否被信任 |
 
-在面板里，`H` 和 `L`（或 `gT` 和 `gt`）同样切到上一个和下一个标签页。标签页并排运行：后台标签页会继续流式输出，它在标签栏里的标记会显示它需要什么（`⚑` 表示有等待中的卡片，`•` 表示在你看别处时一个回合结束了，`✕` 表示一个会话糟糕地结束了）。
+在面板里，`H` 和 `L`（或 `gT` 和 `gt`）同样切到上一个和下一个标签页。每个标签页运行一个 agent，默认是 Claude；`:tabnew codex` 会打开一个 Codex 的标签页，你注册的 agent 也可以有标签页。见 [Codex 与其他 agent](agents.zh-CN.md)。标签页并排运行：后台标签页会继续流式输出，它在标签栏里的标记会显示它需要什么（`⚑` 表示有等待中的卡片，`•` 表示在你看别处时一个回合结束了，`✕` 表示一个会话糟糕地结束了）。
 
 **继续一个对话。** 关闭标签页不会删除它的对话。在空标签页上按 `r` 继续最近一次保存的会话，`<prefix> w`（或空标签页上的 `w`）列出全部，每个都带着名字或标题；另一个窗口当前占用的会话会显示出来，但不能选。
 

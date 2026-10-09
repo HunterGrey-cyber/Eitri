@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=40566d6737f1258b76642faf84159d9166548515ff15e9505104e1c8043b8bed -->
+<!-- translated-from: keys.md sha256=d1bde63c3a8305977ceafb4de4930eafb546d57c8890c39baaf58b4bfe480214 -->
 
 # 按键
 
@@ -100,7 +100,7 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `Esc` | 停止输入，回到 BROWSE |
 | `?` | 按键列表，在输入框为空时 |
 
-以 `/` 开头的消息是 Claude Code 的斜杠命令。有些能用（`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 是能看到效果的那些），单独的 `/model` 或 `/effort` 会打开一个选择器，少数需要完整终端的（`/login`、`/config` 和 `/resume`）会被拒绝并给出一条消息。其余的会作为普通文字发出去，Claude 会把它当作话来回答，而不是当作命令。`?` 列出能用的那些。
+以 `/` 开头的消息是 Claude Code 的斜杠命令。有些能用（`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 是能看到效果的那些），单独的 `/model` 或 `/effort` 会打开一个选择器，少数需要完整终端的（`/login`、`/config` 和 `/resume`）会被拒绝并给出一条消息。其余的会作为普通文字发出去，Claude 会把它当作话来回答，而不是当作命令。`?` 列出能用的那些。在 Codex 标签页，或你注册的 agent 的标签页里，消息按输入的原样发出：没有被拦下的命令列表，也没有选择器。
 
 ### 在 BROWSE 里
 
@@ -152,7 +152,7 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `<leader>,` | 切换标签页 |
 | `<leader>/` | 在对话里搜索 |
 | `<leader>i` | 这个标签页的详情 |
-| `<leader>t` | 在终端里继续这个对话 |
+| `<leader>t` | 在终端里继续这个对话（Claude 标签页；Codex 或已注册 agent 的标签页会提示这还不可用） |
 | `<leader>m` | 在 Auto 和 Bypass 之间切换（和 `Shift+Tab` 一样） |
 | `<leader>?` | 按键列表 |
 
@@ -192,11 +192,12 @@ BROWSE 里的 `f`，或者任何地方的 `<prefix> f`，会给所有你能跳�
 <a id="the-command-line"></a>
 ## 命令行
 
-BROWSE 里的 `:`（或任何地方的 `<prefix> :`）在面板底部打开一个命令行。它不是 vim 的：只接受两个命令，所以出于习惯敲出来的 `:ls` 或 `:d` 落在这里，绝不会落到一张卡片上。`Enter` 运行它，`Esc` 关闭它；其他任何东西都会显示一条说没有别的命令的提示。
+BROWSE 里的 `:`（或任何地方的 `<prefix> :`）在面板底部打开一个命令行。它不是 vim 的：只接受三个命令，所以出于习惯敲出来的 `:ls` 或 `:d` 落在这里，绝不会落到一张卡片上。`Enter` 运行它，`Esc` 关闭它；其他任何东西都会显示一条说没有别的命令的提示。
 
 | 命令 | 作用 |
 |---|---|
-| `:trust` | 检查这个项目自己的 Claude Code 配置（它的 `.claude/`、`.mcp.json` 和 `CLAUDE.md`），并问是否信任它；之后启动的会话会加载它。没有什么可信任的，或者已经信任过时，它会说明 |
+| `:tabnew` | 打开默认 agent 的新标签页，和 `<prefix> c` 一样。`:tabnew codex`，或 `:tabnew` 加上在 `init.lua` 里注册的 agent 的名字，会打开一个运行该 agent 的标签页。任何其他词都会被拒绝，并给出可接受的词的列表 |
+| `:trust` | 检查这个项目自己为屏幕上那个标签页的 agent 准备的配置（对 Claude 是它的 `.claude/`、`.mcp.json` 和 `CLAUDE.md`），并问是否信任它；之后启动的会话会加载它。没有什么可信任的，或者已经信任过时，它会说明 |
 | `:untrust` | 忘掉这个信任；之后启动的会话把项目的配置排除在外。正在运行的会话不变 |
 
 信任意味着什么，见[权限](permissions.zh-CN.md)。
