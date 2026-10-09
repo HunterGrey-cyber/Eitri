@@ -2379,12 +2379,11 @@ mod tests {
     #[test]
     fn a_huge_nested_value_is_cut_by_a_walk_bounded_by_the_budget() {
         let items: Vec<serde_json::Value> = (0..400_000).map(|n| serde_json::json!({ "i": n, "t": "x" })).collect();
+        // Both values are built before the clock starts: the bound is on the walk, not on building its input.
+        let before = serde_json::json!({ "a": 1, "list": [] });
+        let after = serde_json::json!({ "a": 1, "list": items.clone(), "more": items });
         let started = std::time::Instant::now();
-        let change = change_between(
-            serde_json::json!({ "a": 1, "list": [] }),
-            serde_json::json!({ "a": 1, "list": items.clone(), "more": items }),
-        )
-        .unwrap();
+        let change = change_between(before, after).unwrap();
         let took = started.elapsed();
         assert!(change.clipped);
         assert!(!change.fields.is_empty());
