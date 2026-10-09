@@ -1256,6 +1256,62 @@ fn a_request_whose_input_would_be_cut_cannot_be_approved() {
 }
 
 #[test]
+fn a_request_whose_diff_would_not_be_shown_whole_cannot_be_approved() {
+    // No raw input at all: only the edit's own diff, too large for a card to draw whole.
+    let mut script = boot("agent");
+    let old_text = "line\n".repeat(60 * 1024);
+    script.extend([
+        expect_prompt(3, "edit"),
+        agent_request(
+            7,
+            "session/request_permission",
+            json!({
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "c1", "title": "Edit a.txt", "kind": "edit", "status": "pending",
+                             "content": [{"type": "diff", "path": "/work/a.txt", "oldText": old_text, "newText": ""}]},
+                "options": [
+                    {"optionId": "a-1", "name": "Yes", "kind": "allow_once"},
+                    {"optionId": "r-1", "name": "No", "kind": "reject_once"}
+                ]
+            }),
+        ),
+        expect_answer(7, json!({"outcome": {"outcome": "selected", "optionId": "r-1"}})),
+        reply(3, json!({"stopReason": "end_turn"})),
+    ]);
+    let file = std::env::temp_dir().join(format!("eitri-acp-long-diff-{}.json", std::process::id()));
+    std::fs::write(&file, Value::Array(script).to_string()).expect("writes the script");
+    let provider = AcpProvider::connect(
+        AcpAgentSpec {
+            name: "stand-in".to_string(),
+            argv: vec![
+                OsString::from(standin()),
+                OsString::from(format!("@{}", file.display())),
+            ],
+            auto_mode: None,
+        },
+        std::env::temp_dir(),
+    )
+    .expect("connects");
+    provider.start(start_request(None)).expect("starts");
+    send(&provider, "edit").expect("sends");
+    let (id, events) = until_permission(&provider);
+    let input = events
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::PermissionRequested { input, .. } => Some(input.clone()),
+            _ => None,
+        })
+        .expect("a card");
+    assert_eq!(input["inputCut"], json!(true));
+    assert_eq!(input["options"], json!([{"kind": "reject_once", "name": "No"}]));
+    let err = allow(&provider, &id).expect_err("cannot approve what is not shown");
+    assert!(err.is_benign(), "{err}");
+    deny(&provider, &id).expect("can refuse");
+    until_completed(&provider);
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn a_pump_during_the_start_cannot_take_the_modes_report() {
     // The agent reports another mode just ahead of its answer to `session/set_mode`. A host that pumps
     // while the start is running must not read that report away from the start's own check.

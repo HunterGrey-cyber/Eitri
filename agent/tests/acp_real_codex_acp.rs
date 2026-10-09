@@ -4,8 +4,14 @@
 //! - The test is `#[ignore]`d and is run by hand, once, by whoever owns the Codex login:
 //!   `cargo test -p agent --test acp_real_codex_acp -- --ignored --test-threads=1`. It needs `npx` and a `codex` on
 //!   `PATH` (the adapter runs that `codex`, through `CODEX_PATH`, not the copy it bundles), and the adapter package
-//!   `@agentclientprotocol/codex-acp`, which `npx` fetches on first use. It spends at most two turns, on the
-//!   cheapest model the account lists (`EITRI_CODEX_LOGIN_MODEL` names another) at the lowest reasoning effort.
+//!   `@agentclientprotocol/codex-acp`, which `npx` fetches on first use. It spends two turns of its own, on the
+//!   cheapest model the account lists (`EITRI_CODEX_LOGIN_MODEL` names another) at the lowest reasoning effort
+//!   (`EITRI_CODEX_LOGIN_EFFORT` names another).
+//! - **The adapter spends a third turn the test cannot hold to its posture.** After the first turn it starts a thread
+//!   of its own to write the session's title, on a model it picks, with nothing but the directory: `CODEX_CONFIG`
+//!   does not reach that thread, so the account's own tool servers can start for it. No client setting turns the
+//!   title off, and overrides on the `codex` command line that only disable a server are refused as incomplete
+//!   server entries. Settle how to hold that thread before running this again.
 //! - The login is the machine's default one: this file never reads, copies or prints a credential and never writes
 //!   under the account's Codex home. The adapter is told, through `CODEX_CONFIG`, to start none of the account's
 //!   own tool servers (their names come from the app-server's `config/read`; `EITRI_CODEX_LOGIN_MCP` names more).
@@ -100,7 +106,10 @@ fn adapter_config(codex: &Path, cwd: &Path) -> String {
         .into_iter()
         .map(|name| (name, json!({"enabled": false})))
         .collect();
-    json!({"model": model, "model_reasoning_effort": "low", "mcp_servers": servers}).to_string()
+    // `EITRI_CODEX_LOGIN_EFFORT` names another reasoning effort, as the login checks of Codex tabs allow.
+    let effort = std::env::var("EITRI_CODEX_LOGIN_EFFORT").unwrap_or_else(|_| "low".to_string());
+    eprintln!("reasoning effort: {effort}");
+    json!({"model": model, "model_reasoning_effort": effort, "mcp_servers": servers}).to_string()
 }
 
 fn pump_until(provider: &AcpProvider, what: &str, done: impl Fn(&AgentDomainEvent) -> bool) -> Vec<AgentDomainEvent> {

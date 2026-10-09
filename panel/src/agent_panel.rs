@@ -3414,6 +3414,7 @@ fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
             state
                 .trust
                 .next_session_trust(&trust_profile(&state.acp_agents, t.agent())),
+            &state.acp_agents,
         ),
         None => Vec::new(),
     };
@@ -3467,9 +3468,10 @@ fn detail_rows(
     rules_file: Option<&Path>,
     trust_row: &str,
     next: ProjectTrust,
+    registered: &[AgentRegistration],
 ) -> Vec<DetailRow> {
     if tab.agent().is_external() {
-        return external_detail_rows(tab, kind, project_dir, trust_row, next);
+        return external_detail_rows(tab, kind, project_dir, trust_row, next, registered);
     }
     const UNKNOWN: &str = "—";
     let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
@@ -3578,6 +3580,34 @@ const CODEX_MODE_LAG: &str = "a mode change reaches Codex's reviewer at the next
      reviewer it started with (bypass to auto: Codex keeps asking and Eitri now draws cards; auto to bypass: \
      Codex's reviewer still decides for the rest of that turn and Eitri accepts what still arrives)";
 
+/// What an ACP agent runs without a question. Eitri sets only the mode the registration names, once at the
+/// start, and does not know what any mode of the agent lets through; without one the agent's own default
+/// stays and Eitri cannot say even which mode that is.
+fn acp_runs_without_asking(auto_mode: Option<&str>) -> String {
+    match auto_mode {
+        Some(mode) => format!(
+            "whatever the agent's mode {mode} lets through, set at the start; Eitri shows every request it receives"
+        ),
+        None => "Eitri does not know what this agent runs without asking (no auto_mode registered, so its own \
+                 default mode); Eitri shows every request it receives"
+            .to_string(),
+    }
+}
+
+/// What a mode change does to an ACP tab: Eitri answers by the tab's mode at once, and the agent's own mode,
+/// set once at the start, never changes with it.
+const ACP_MODE_LAG: &str = "none: Eitri answers by the tab's mode at once (entering bypass approves the cards \
+     waiting); the agent's own mode is not changed";
+
+/// How full an agent last said its context window is, in words.
+fn context_row(gauge: agent::external::ContextGauge) -> String {
+    if gauge.size == 0 {
+        return format!("{} used", gauge.used);
+    }
+    let percent = gauge.used.saturating_mul(100) / gauge.size;
+    format!("{percent}% full ({} of {})", gauge.used, gauge.size)
+}
+
 /// The account limit an agent last reported, in words.
 fn limits_row(limits: &agent::AccountLimitsRecord) -> String {
     let mut line = format!("{:.0}% used", limits.used_percent);
@@ -3607,6 +3637,7 @@ fn external_detail_rows(
     project_dir: &Path,
     trust_row: &str,
     next: ProjectTrust,
+    registered: &[AgentRegistration],
 ) -> Vec<DetailRow> {
     const UNKNOWN: &str = "—";
     let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
@@ -3655,14 +3686,25 @@ fn external_detail_rows(
             limits.as_ref().map(limits_row),
         )
     } else {
+        let auto_mode = match agent {
+            AgentId::Acp(name) => registered
+                .iter()
+                .find(|a| a.name == *name)
+                .and_then(|a| a.auto_mode.clone()),
+            _ => None,
+        };
+        let context = match backend {
+            Some(AgentBackend::External(external)) => external.conversation().context_gauge(),
+            _ => None,
+        };
         (
             "acp".to_string(),
             "session",
             format!("the agent's own configuration (always); this project's: {project_loaded}"),
-            "what the agent's own permission model allows; Eitri shows every request it receives".to_string(),
-            "a mode change takes effect at the next turn".to_string(),
+            acp_runs_without_asking(auto_mode.as_deref()),
+            ACP_MODE_LAG.to_string(),
             "context",
-            None,
+            context.map(context_row),
         )
     };
     let rows: [(&str, String); 18] = [
@@ -7640,6 +7682,7 @@ mod tests {
             Some(rules),
             "not checked yet",
             ProjectTrust::Untrusted,
+            &[],
         );
         let value = |label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
         assert_eq!(value("queued"), "1");
@@ -7652,6 +7695,7 @@ mod tests {
             None,
             "not checked yet",
             ProjectTrust::Untrusted,
+            &[],
         );
         assert_eq!(rows.iter().find(|r| r.label == "permission rules").unwrap().value, "—");
     }
@@ -7749,6 +7793,7 @@ mod tests {
             None,
             "not checked yet",
             ProjectTrust::Untrusted,
+            &[],
         );
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         for want in [
@@ -7804,6 +7849,7 @@ mod tests {
                 None,
                 "not checked yet",
                 ProjectTrust::Untrusted,
+                &[],
             );
             let settings = rows
                 .iter()
@@ -10322,6 +10368,7 @@ mod tests {
                 None,
                 "trusted since 2026-10-02",
                 next,
+                &[],
             )
         };
         let value = |rows: &[DetailRow], label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
@@ -10361,6 +10408,7 @@ mod tests {
             Some(std::path::Path::new("/s/eitri/permissions/x.json")),
             "trusted since 2026-10-02",
             next,
+            &[],
         )
     }
 
@@ -10434,6 +10482,65 @@ mod tests {
         assert!(value("settings").ends_with("this project's: loaded"));
     }
 
+    /// An ACP tab says what Eitri knows of what the agent runs unasked (only the mode it registered, or
+    /// nothing at all without one), that a mode change applies at once, and how full its context is.
+    #[test]
+    fn detail_rows_for_an_acp_tab_follow_its_registration() {
+        let registration = |auto_mode: Option<&str>| AgentRegistration {
+            name: "gem".into(),
+            command: vec!["gem-acp".into()],
+            project_files: vec![".gem/".into()],
+            auto_mode: auto_mode.map(str::to_string),
+        };
+        let rows_for = |registered: &[AgentRegistration]| {
+            let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+            let tab = set.open(AgentId::Acp("gem".into()));
+            detail_rows(
+                set.get(tab).unwrap(),
+                BackendKind::Sidecar,
+                None,
+                std::path::Path::new("/p/root"),
+                None,
+                "not checked yet",
+                ProjectTrust::Untrusted,
+                registered,
+            )
+        };
+        let value = |rows: &[DetailRow], label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
+
+        let rows = rows_for(&[registration(None)]);
+        assert_eq!(rows.len(), 18);
+        assert_eq!(value(&rows, "backend"), "acp");
+        assert!(
+            value(&rows, "runs without asking").starts_with("Eitri does not know what this agent runs without asking"),
+            "{}",
+            value(&rows, "runs without asking")
+        );
+        let lag = value(&rows, "mode lag");
+        assert!(
+            lag.starts_with("none: Eitri answers by the tab's mode at once"),
+            "{lag}"
+        );
+        assert!(!lag.contains("next turn"), "{lag}");
+        assert_eq!(value(&rows, "context"), "—", "nothing reported before a session");
+
+        let rows = rows_for(&[registration(Some("auto_edit"))]);
+        let runs = value(&rows, "runs without asking");
+        assert!(runs.contains("auto_edit"), "{runs}");
+        assert!(!runs.contains("does not know what this agent"), "{runs}");
+
+        // An agent init.lua no longer registers is one Eitri knows nothing about.
+        let rows = rows_for(&[]);
+        assert!(value(&rows, "runs without asking").starts_with("Eitri does not know"));
+    }
+
+    #[test]
+    fn the_context_row_is_a_gauge_in_words() {
+        let gauge = |used, size| agent::external::ContextGauge { used, size };
+        assert_eq!(context_row(gauge(50_000, 200_000)), "25% full (50000 of 200000)");
+        assert_eq!(context_row(gauge(7, 0)), "7 used");
+    }
+
     /// The limit an agent reported is in the `limits` row of its tab, in words.
     #[test]
     fn the_limits_row_names_the_window_and_the_reset() {
@@ -10468,6 +10575,7 @@ mod tests {
             Some(std::path::Path::new("/s/rules.json")),
             "not checked yet",
             ProjectTrust::Untrusted,
+            &[],
         );
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(

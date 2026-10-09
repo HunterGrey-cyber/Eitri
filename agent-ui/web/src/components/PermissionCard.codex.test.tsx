@@ -141,6 +141,49 @@ describe("an ACP agent's card", () => {
     const options = container.querySelector(".permission-card-options")!.textContent!;
     expect(options).toContain("Approve answers nothing: the agent offered no allow-once option");
     expect(options).toContain("Deny answers nothing: the agent offered no reject-once option");
+    const approve = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Approve")!;
+    expect(approve.disabled).toBe(true);
+  });
+
+  it("draws every line of a diff too long to compare line by line", () => {
+    const oldText = Array.from({ length: 401 }, (_, i) => `old ${i}`).join("\n") + "\n";
+    const { container } = card({
+      ...request,
+      toolName: "acp:edit",
+      input: {
+        title: "Edit a.txt",
+        diffs: [{ path: "/project/a.txt", oldText, newText: "new\n" }],
+        options: [{ name: "Yes", kind: "allow_once" }],
+      },
+    });
+    const diff = container.querySelector(".permission-card-diff")!;
+    expect(diff.textContent).toContain("old 0");
+    expect(diff.textContent).toContain("old 400");
+    expect(diff.textContent).toContain("new");
+    expect(container.textContent).not.toContain("Too large to show here");
+    const approve = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Approve")!;
+    expect(approve.disabled).toBe(false);
+  });
+
+  it("says why a call too large to show cannot be approved, and names its files without drawing them", () => {
+    const { container } = card({
+      ...request,
+      toolName: "acp:edit",
+      input: {
+        title: "Edit a.txt",
+        diffs: [{ path: "/project/a.txt", oldText: "a", newText: "b" }],
+        options: [{ name: "No", kind: "reject_once" }],
+        inputCut: true,
+      },
+    });
+    expect(container.querySelector(".permission-card-cut")!.textContent).toContain("too large to show here whole");
+    expect(container.querySelector(".permission-card-diff")).toBeNull();
+    expect(container.textContent).toContain("Changes /project/a.txt");
+    const options = container.querySelector(".permission-card-options")!.textContent!;
+    expect(options).toContain("Approve answers nothing: Eitri held back the agent's allow-once option");
+    expect(options).not.toContain("the agent offered no allow-once option");
+    const approve = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Approve")!;
+    expect(approve.disabled).toBe(true);
   });
 });
 

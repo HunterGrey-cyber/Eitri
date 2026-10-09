@@ -15,4 +15,5 @@ pub mod provider;
 pub mod translate;
 pub mod wire;
 
-pub use provider::{AcpAgentSpec, AcpProvider, ContextGauge};
+pub use crate::external::ContextGauge;
+pub use provider::{AcpAgentSpec, AcpProvider};

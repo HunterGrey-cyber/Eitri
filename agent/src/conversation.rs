@@ -849,6 +849,11 @@ impl AgentConversation {
         self.external.as_ref().map_or(self.capabilities.resume, |e| e.resumes())
     }
 
+    /// How full the agent last said its context window is: only an external provider that reports it.
+    pub fn context_gauge(&self) -> Option<crate::external::ContextGauge> {
+        self.external.as_ref().and_then(|e| e.context_gauge())
+    }
+
     pub fn provider_info(&self) -> &ProviderInfo {
         &self.info
     }

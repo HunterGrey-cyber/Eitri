@@ -103,6 +103,8 @@ export type AcpCardInput = {
   locations?: Array<{ path: string }>;
   diffs?: Array<{ path: string; oldText?: string | null; newText?: string }>;
   options?: Array<{ name: string; kind: string }>;
+  /** Set by Rust when the card cannot show the whole call; it then leaves `allow_once` out of `options`. */
+  inputCut?: boolean;
   reason?: string | null;
   subagent?: string;
 };

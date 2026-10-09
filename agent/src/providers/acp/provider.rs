@@ -23,7 +23,7 @@
 use super::history::History;
 use super::translate::{self, Fold};
 use super::wire::{self, method, ChunkKind, InitializeResponse, OptionKind, PermissionRequest, Update};
-use crate::external::{ExternalProvider, ExternalStart, TurnPolicy};
+use crate::external::{ContextGauge, ExternalProvider, ExternalStart, TurnPolicy};
 use crate::jsonrpc_link::{resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, Pending, Skipped};
 use crate::projection::{AgentDomainEvent, PermissionOutcome, ResumeStatus, TurnEndDetail, TurnOutcome};
 use crate::provider::{
@@ -70,13 +70,6 @@ pub struct AcpAgentSpec {
     /// The mode id set at the start of every session, in both Eitri modes. Eitri never sets another. With
     /// none, the agent's own default mode stays and Eitri does not know what it runs without asking.
     pub auto_mode: Option<String>,
-}
-
-/// How full the agent says its context window is. A gauge, not a count of tokens spent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContextGauge {
-    pub used: u64,
-    pub size: u64,
 }
 
 /// The provider name for an agent: leaked once per distinct name, since [`ExternalProvider::name`] hands
@@ -691,8 +684,8 @@ impl AcpProvider {
             }
             None => request.tool_call.clone(),
         };
-        // An input too long to be shown whole cannot be approved: the card would not show all of what an
-        // approval lets through. It can still be refused, and the interrupt ends it.
+        // An input or a diff the card cannot show whole cannot be approved: the card would not show all of
+        // what an approval lets through. It can still be refused, and the interrupt ends it.
         let unshowable = translate::input_is_cut(&tool);
         let first = |kind: OptionKind| request.options.iter().find(|o| o.kind == kind).map(|o| o.id.clone());
         let allow = first(OptionKind::AllowOnce).filter(|_| !unshowable);
@@ -957,6 +950,10 @@ impl ExternalProvider for AcpProvider {
     /// A saved session is continued with `session/load`, where the agent advertises it.
     fn resumes(&self) -> bool {
         self.load_session
+    }
+
+    fn context_gauge(&self) -> Option<ContextGauge> {
+        AcpProvider::context_gauge(self)
     }
 
     /// An ACP agent loads its own configuration, so the trust plan and the policy of the tab's mode are not

@@ -28,6 +28,10 @@ export interface DiffLine {
 export const MAX_DIFF_LINES = 400;
 
 /** Splits the way a file does, so a trailing newline does not become a phantom empty last line. */
+export function splitLines(text: string): string[] {
+  return lines(text);
+}
+
 function lines(text: string): string[] {
   if (text === "") return [];
   const split = text.split("\n");

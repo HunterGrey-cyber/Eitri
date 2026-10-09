@@ -31,13 +31,39 @@ fn bounded_value(value: Value) -> Value {
     }
 }
 
-/// Whether [`tool_input`] has to cut the call's raw input to show it. A card for such a call must not be
-/// approvable: what would be approved is more than the card shows.
+/// Whether a card cannot show the whole call: [`tool_input`] has to cut its raw input, its diffs together
+/// are larger than a card draws in full, or a diff carries a path or a text that is not a string, which the
+/// card would draw as empty. A card for such a call must not be approvable: what would be approved is more
+/// than the card shows.
 pub fn input_is_cut(fields: &ToolCallFields) -> bool {
-    fields
+    let raw_cut = fields
         .raw_input
         .as_ref()
-        .is_some_and(|input| input.to_string().len() > MAX_RESULT_BYTES)
+        .is_some_and(|input| input.to_string().len() > MAX_RESULT_BYTES);
+    raw_cut || diffs_are_unshowable(&fields.diffs())
+}
+
+/// Whether diffs, as [`ToolCallFields::diffs`] gives them, cannot all be drawn whole on a card.
+fn diffs_are_unshowable(diffs: &[Value]) -> bool {
+    let mut total = 0usize;
+    for diff in diffs {
+        if !diff["path"].is_string() || !diff["newText"].is_string() {
+            return true;
+        }
+        // No old text is a new file; anything else must be text to be drawn.
+        let old = match &diff["oldText"] {
+            Value::Null => 0,
+            Value::String(text) => text.len(),
+            _ => return true,
+        };
+        total = total
+            .saturating_add(old)
+            .saturating_add(diff["newText"].as_str().map_or(0, str::len));
+        if total > MAX_RESULT_BYTES {
+            return true;
+        }
+    }
+    false
 }
 
 /// What a call's row and its permission card show of it.
@@ -305,6 +331,61 @@ mod tests {
         assert_eq!(outcome, TurnOutcome::Failed);
         assert_eq!(detail.reason.as_deref(), Some("tool_budget"));
         assert_eq!(stop_ending(None).0, TurnOutcome::Failed);
+    }
+
+    fn with_diffs(diffs: Vec<Value>) -> ToolCallFields {
+        let content = diffs
+            .into_iter()
+            .map(|mut d| {
+                d["type"] = json!("diff");
+                d
+            })
+            .collect();
+        ToolCallFields {
+            id: "c1".to_string(),
+            title: None,
+            kind: Some("edit".to_string()),
+            status: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            content,
+        }
+    }
+
+    #[test]
+    fn a_diff_a_card_cannot_draw_whole_makes_the_input_cut() {
+        let small = json!({"path": "/w/a", "oldText": "a\n", "newText": "b\n"});
+        assert!(!input_is_cut(&with_diffs(vec![small.clone()])));
+        // A new file has no old text.
+        assert!(!input_is_cut(&with_diffs(vec![
+            json!({"path": "/w/a", "oldText": null, "newText": "b"})
+        ])));
+        // Many lines are still drawn whole while the texts stay within the bound.
+        let lines = "line\n".repeat(401);
+        assert!(!input_is_cut(&with_diffs(vec![
+            json!({"path": "/w/a", "oldText": lines, "newText": ""})
+        ])));
+        // Over the bound, one diff or several together.
+        let half = "x".repeat(MAX_RESULT_BYTES / 2 + 1);
+        assert!(input_is_cut(&with_diffs(vec![
+            json!({"path": "/w/a", "oldText": half, "newText": half})
+        ])));
+        assert!(input_is_cut(&with_diffs(vec![
+            json!({"path": "/w/a", "oldText": null, "newText": half}),
+            json!({"path": "/w/b", "oldText": null, "newText": half}),
+        ])));
+        // A path or a text the card would draw as empty.
+        assert!(input_is_cut(&with_diffs(vec![
+            json!({"path": 1, "oldText": "a", "newText": "b"})
+        ])));
+        assert!(input_is_cut(&with_diffs(vec![
+            json!({"path": "/w/a", "oldText": {"a": 1}, "newText": "b"})
+        ])));
+        assert!(input_is_cut(&with_diffs(vec![json!({"path": "/w/a", "oldText": "a"})])));
+        assert!(input_is_cut(&with_diffs(vec![
+            json!({"path": "/w/a", "oldText": "a", "newText": ["b"]})
+        ])));
     }
 
     #[test]

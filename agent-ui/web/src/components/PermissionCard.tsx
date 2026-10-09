@@ -10,7 +10,7 @@ import type {
   ProviderPrompt,
 } from "../types";
 import type { PermissionDecision } from "../bridge";
-import { codexChangePreview, editPreview, lineDiff } from "../diff";
+import { codexChangePreview, editPreview, lineDiff, splitLines } from "../diff";
 import type { EditPreview } from "../diff";
 import { isExternalTool, subagentOf } from "../externalTools";
 import { isUsableLink } from "../timeline";
@@ -63,6 +63,9 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
      event does that. */
   const inert = answered || sessionEnded;
   const external = isExternalTool(request.toolName);
+  // An ACP card whose agent offered no allow-once option, or whose option Rust held back, has nothing for
+  // Approve to answer with.
+  const approvable = !request.toolName.startsWith("acp:") || acpApprovable(request.input);
 
   function handleAnswer(decision: PermissionDecision, remember = false) {
     if (inert) return;
@@ -118,7 +121,14 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
             then the reason box. `a`/`d` answer through `answerPermission` by `permissionId`, using
             its shared guard against a second answer. `alreadyAnswered` then makes the card inert.
             `data-nav-action` lets `App.tsx` identify card buttons for its Enter/Space guard. */}
-        <button data-nav-order={1} data-nav-action="allow" onClick={() => handleAnswer("allow")} disabled={inert}>Approve</button>
+        <button
+          data-nav-order={1}
+          data-nav-action="allow"
+          onClick={() => handleAnswer("allow")}
+          disabled={inert || !approvable}
+        >
+          Approve
+        </button>
         <button data-nav-order={2} data-nav-action="deny" onClick={() => handleAnswer("deny")} disabled={inert}>Deny</button>
         {ruleOffer && (
           <button data-nav-order={3} data-nav-action="always" onClick={() => handleAnswer("allow", true)} disabled={inert}>
@@ -354,13 +364,27 @@ function CodexMcp({ input }: { input: Partial<CodexMcpInput> }) {
   );
 }
 
-/** The preview of one ACP diff: the old text against the new, as the agent sent them. */
-function acpPreview(diff: NonNullable<AcpCardInput["diffs"]>[number]): EditPreview {
+/** The preview of one ACP diff on a card: the old text against the new, as the agent sent them, every line of
+ *  it. Too many lines for a line-by-line comparison are drawn whole instead, the old text removed and the new
+ *  added, since counts beside an Approve would have a person approve lines they never saw. Rust bounds what
+ *  reaches an approvable card, and marks anything larger `inputCut`. */
+export function acpPreview(diff: NonNullable<AcpCardInput["diffs"]>[number]): EditPreview {
   const before = typeof diff.oldText === "string" ? diff.oldText : "";
   const after = typeof diff.newText === "string" ? diff.newText : "";
-  const shown = lineDiff(before, after);
-  const count = (kind: "added" | "removed") => shown?.filter((l) => l.kind === kind).length ?? 0;
-  return { filePath: diff.path, diff: shown, added: count("added"), removed: count("removed"), replaceAll: false, wholeFile: false };
+  const shown =
+    lineDiff(before, after) ?? [
+      ...splitLines(before).map((text) => ({ kind: "removed" as const, text })),
+      ...splitLines(after).map((text) => ({ kind: "added" as const, text })),
+    ];
+  const count = (kind: "added" | "removed") => shown.filter((l) => l.kind === kind).length;
+  return { filePath: String(diff.path), diff: shown, added: count("added"), removed: count("removed"), replaceAll: false, wholeFile: false };
+}
+
+/** Whether an ACP card can be approved: Rust left the agent's `allow_once` in its options. It leaves it out
+ *  when the card could not show the whole call (`inputCut`), and an agent may offer none. */
+function acpApprovable(input: unknown): boolean {
+  const options = input && typeof input === "object" ? (input as AcpCardInput).options : undefined;
+  return Array.isArray(options) && options.some((o) => o.kind === "allow_once");
 }
 
 /** An ACP agent's call: the title it gave, what it names, and the agent's own option names, drawn as it wrote
@@ -374,6 +398,7 @@ function AcpCall({ input }: { input: AcpCardInput }) {
   const denyPieces = revealHidden(deny?.name ?? "");
   const locations = Array.isArray(input.locations) ? input.locations : [];
   const diffs = Array.isArray(input.diffs) ? input.diffs : [];
+  const cut = input.inputCut === true;
   const raw = input.rawInput === undefined || input.rawInput === null ? null : revealHidden(JSON.stringify(input.rawInput, null, 2) ?? "");
   return (
     <>
@@ -387,9 +412,20 @@ function AcpCall({ input }: { input: AcpCardInput }) {
           <Shown text={String(location.path)} what="path" />
         </div>
       ))}
-      {diffs.map((diff, i) => (
-        <EditDiff key={i} preview={acpPreview(diff)} />
-      ))}
+      {cut && (
+        <div className="permission-card-description permission-card-cut">
+          This call is too large to show here whole, so Eitri does not offer to approve it: Deny, or interrupt the
+          turn.
+        </div>
+      )}
+      {/* A cut call's changes are named, not drawn: they may be far larger than a card can hold. */}
+      {cut
+        ? diffs.map((diff, i) => (
+            <div key={i} className="permission-card-description">
+              Changes <Shown text={String(diff.path)} what="path" />
+            </div>
+          ))
+        : diffs.map((diff, i) => <EditDiff key={i} preview={acpPreview(diff)} />)}
       {raw !== null && (
         <>
           <pre className="permission-card-input">
@@ -400,7 +436,15 @@ function AcpCall({ input }: { input: AcpCardInput }) {
       )}
       <AgentSays who="The agent" reason={input.reason} />
       <div className="permission-card-description permission-card-options">
-        Approve answers {approve ? <>“<Revealed pieces={approvePieces} />”</> : "nothing: the agent offered no allow-once option"}.
+        Approve answers{" "}
+        {approve ? (
+          <>“<Revealed pieces={approvePieces} />”</>
+        ) : cut ? (
+          "nothing: Eitri held back the agent's allow-once option, because this card cannot show the whole call"
+        ) : (
+          "nothing: the agent offered no allow-once option"
+        )}
+        .
         Deny answers {deny ? <>“<Revealed pieces={denyPieces} />”</> : "nothing: the agent offered no reject-once option"}.
       </div>
       <HiddenWarning count={countEscapes(approvePieces) + countEscapes(denyPieces)} what="option name" />

@@ -61,6 +61,13 @@ pub struct ExternalStart {
     pub resume: Option<String>,
 }
 
+/// How full an agent says its context window is. A gauge, not a count of tokens spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextGauge {
+    pub used: u64,
+    pub size: u64,
+}
+
 /// A provider that is not the Claude sidecar. Its plain `AgentProvider` session and turn methods
 /// answer `UnsupportedCapability("external")`.
 pub trait ExternalProvider: AgentProvider {
@@ -81,5 +88,9 @@ pub trait ExternalProvider: AgentProvider {
     /// returns these events.
     fn take_history(&self) -> Vec<AgentDomainEvent> {
         Vec::new()
+    }
+    /// How full the agent last said its context window is, for an agent that reports it that way.
+    fn context_gauge(&self) -> Option<ContextGauge> {
+        None
     }
 }
