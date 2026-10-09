@@ -37,7 +37,7 @@
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path};
 
 /// Directories: owner only.
@@ -103,27 +103,96 @@ pub fn create_private_dir_all(dir: &Path, root: &Path) -> std::io::Result<()> {
 /// before the next is made inside it. A recursive create leaves that to the umask, and one that takes
 /// the owner's bits away (0277 gives 0500) makes the first new directory one nothing can be created
 /// in. Directories that already exist are left as they are here.
+///
+/// Everything from the deepest directory that exists is done through open handles: each new directory
+/// is made with `mkdirat` from its parent's handle, opened from that handle without following a link,
+/// checked to be this user's and set with `fchmod`. A path is never looked up a second time, so another
+/// user who can write a directory above `root` cannot swap an ancestor for a link between the steps and
+/// have the mode of something else changed (or a directory made in someone else's tree). The deepest
+/// existing directory itself is opened following links, as the state home may be a link of the user's.
 fn create_dirs_owner_usable(dir: &Path) -> std::io::Result<()> {
     let mut missing = Vec::new();
+    let mut base = Path::new(".");
     for ancestor in dir.ancestors() {
         if ancestor.as_os_str().is_empty() {
             break;
         }
         match std::fs::symlink_metadata(ancestor) {
-            Ok(_) => break,
+            Ok(_) => {
+                base = ancestor;
+                break;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(ancestor),
             Err(e) => return Err(e),
         }
     }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(base)?;
     for path in missing.into_iter().rev() {
-        match std::fs::DirBuilder::new().mode(PRIVATE_DIR_MODE).create(path) {
-            Ok(()) => make_dir_private(path)?,
-            // Made meanwhile by someone else, as a recursive create would also accept.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && std::fs::metadata(path)?.is_dir() => {}
-            Err(e) => return Err(e),
-        }
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} does not end in a directory name", path.display()),
+            )
+        })?;
+        handle = make_dir_at(&handle, name, path)?;
     }
     Ok(())
+}
+
+/// Makes `name` inside the directory `parent` holds open, and returns a handle to it, set to exactly
+/// 0700 when this call made it. One that appeared meanwhile is kept as it is (the walk from the root
+/// tightens it afterwards), but only a real directory of this user's is accepted: a link in its place
+/// is refused, never followed. `path` is only for the messages and the test hook.
+fn make_dir_at(parent: &std::fs::File, name: &std::ffi::OsStr, path: &Path) -> std::io::Result<std::fs::File> {
+    let cname = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a directory name holds a NUL"))?;
+    // SAFETY: `parent` is an open descriptor for the call and `cname` a NUL-terminated buffer that
+    // outlives it; `mkdirat` reads nothing else of ours.
+    let made = unsafe { libc::mkdirat(parent.as_raw_fd(), cname.as_ptr(), PRIVATE_DIR_MODE as libc::mode_t) } == 0;
+    if !made {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+    }
+    #[cfg(test)]
+    run_after_mkdir_hook(path);
+    let handle = openat_dir(parent, &cname).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "cannot open {} as a directory of its own (a link, or removed meanwhile): {e}",
+                path.display()
+            ),
+        )
+    })?;
+    refuse_foreign(path, &handle.metadata()?)?;
+    if made {
+        fchmod(&handle, PRIVATE_DIR_MODE)?;
+    }
+    Ok(handle)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Called with the path of each directory just made, before anything else is done to it: a test
+    /// swaps an ancestor for a link here, as another user could.
+    static AFTER_MKDIR: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_mkdir_hook(made: &Path) {
+    AFTER_MKDIR.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(made);
+        }
+    });
 }
 
 /// [`refuse_foreign_dirs`] for the part of the path that already exists: a directory not there yet
@@ -223,6 +292,11 @@ fn open_dir_handle(path: &Path) -> Option<std::fs::File> {
 /// caller here only ever passes one straight from `Path::components()`.
 fn openat_dir_handle(parent: &std::fs::File, name: &std::ffi::OsStr) -> Option<std::fs::File> {
     let name = std::ffi::CString::new(name.as_bytes()).ok()?;
+    openat_dir(parent, &name).ok()
+}
+
+/// [`openat_dir_handle`] with the reason it failed, for a caller that reports one.
+fn openat_dir(parent: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<std::fs::File> {
     // SAFETY: `parent` is a valid, open descriptor for the duration of this call and stays ours;
     // `name` is a valid NUL-terminated buffer for its own lifetime. `openat` reads neither beyond
     // what those two describe.
@@ -234,11 +308,11 @@ fn openat_dir_handle(parent: &std::fs::File, name: &std::ffi::OsStr) -> Option<s
         )
     };
     if fd < 0 {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `fd` was just returned by the `openat` call above, is a valid open descriptor, and is
     // owned by nothing else -- wrapping it in a `File` is what gives it a `Drop` that closes it.
-    Some(unsafe { std::fs::File::from_raw_fd(fd) })
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// `fchmod`s `handle` to 0700 when it `fstat`s as a directory owned by this user whose mode is
@@ -407,6 +481,38 @@ mod tests {
                 std::fs::remove_dir_all(&base).unwrap();
             },
         );
+    }
+
+    /// A directory just made is set to 0700 through the handle it was made by, not by looking its path
+    /// up again: another user who can write the directory above `eitri` could swap `eitri` for a link
+    /// between the two steps, and the second step would then change the mode of whatever the link
+    /// leads to (here the victim's own `conversations`, 0755).
+    #[test]
+    fn a_directory_swapped_for_a_link_right_after_it_was_made_is_not_followed() {
+        let base = scratch("swap");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(victim.join("conversations")).unwrap();
+        std::fs::set_permissions(victim.join("conversations"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = base.join("eitri");
+        let dir = root.join("conversations");
+        let swap = {
+            let (base, victim, root, dir) = (base.clone(), victim.clone(), root.clone(), dir.clone());
+            move |made: &Path| {
+                if made == dir {
+                    std::fs::rename(&root, base.join("eitri.moved")).unwrap();
+                    std::os::unix::fs::symlink(&victim, &root).unwrap();
+                }
+            }
+        };
+        AFTER_MKDIR.with(|hook| *hook.borrow_mut() = Some(Box::new(swap)));
+        let _ = create_private_dir_all(&dir, &root);
+        AFTER_MKDIR.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            mode(&victim.join("conversations")),
+            0o755,
+            "a directory the link led to was changed"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// An older build's `0755` tree is tightened on the next write, from the root down; nothing

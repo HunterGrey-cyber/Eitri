@@ -576,8 +576,9 @@ mod tests {
 
 /// What reading sixteen sessions' titles costs the thread that builds the picker (the GTK thread):
 /// `EITRI_MEASURE_DIR` names where the transcripts are written, so the storage is the one measured.
-/// Cold reads drop each file's pages from the cache first (`POSIX_FADV_DONTNEED`).
-#[cfg(test)]
+/// Cold reads drop each file's pages from the cache first (`POSIX_FADV_DONTNEED`), which macOS's libc has
+/// no binding for: the module is Linux-only so `cargo test -p agent` still compiles there.
+#[cfg(all(test, target_os = "linux"))]
 mod measure {
     use super::*;
     use std::io::Write;

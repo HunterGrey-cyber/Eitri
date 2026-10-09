@@ -523,6 +523,19 @@ mod tests {
         );
     }
 
+    /// The cached blob is shaped in the face `font_for_text` picks, not the first character's: with
+    /// a primary face that lacks the combining mark the blob must carry the accent's glyph, so its
+    /// bounds are those of a blob built from that face. (Where the primary face has the mark, or no
+    /// face has both letters, both faces are the same and this cannot fail.)
+    #[test]
+    fn the_cached_blob_of_a_grapheme_is_shaped_in_the_face_that_has_all_of_it() {
+        let metrics = TerminalMetrics::new(800.0, 600.0, 1.0);
+        let text = "e\u{301}";
+        let whole = TextBlob::new(text, &metrics.font_for_text(text, false, false)).expect("a blob");
+        let cached = metrics.text_blob(text, false, false).expect("a blob");
+        assert_eq!(cached.bounds(), whole.bounds());
+    }
+
     /// The other half of `fallback_family`: a codepoint outside the private-use areas is looked up
     /// exactly as before, so CJK keeps the face it had.
     #[test]
