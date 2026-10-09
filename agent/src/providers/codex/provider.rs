@@ -45,14 +45,16 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// The oldest Codex Eitri drives. Below it a start is refused, naming both versions.
 pub const MIN_CODEX: (u32, u32, u32) = (0, 160, 0);
 
-/// The newest Codex whose traffic was recorded against this code. A newer one runs, with a note.
-pub const HIGHEST_TESTED_CODEX: (u32, u32, u32) = (0, 160, 0);
+/// The newest Codex whose traffic was recorded against this code and whose scripted suite and self-check
+/// passed. A newer one runs, with a note.
+pub const HIGHEST_TESTED_CODEX: (u32, u32, u32) = (0, 161, 0);
 
 /// How long the handshake and the session start may take.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -72,6 +74,12 @@ const UNKNOWN_METHODS_KEPT: usize = 64;
 const EARLY_TURNS_KEPT: usize = 64;
 /// The longest stderr tail put in a notice.
 const NOTICE_TAIL_CHARS: usize = 400;
+/// How long after an interrupt the tab's turn waits for the calls Codex was running to end. Codex ends an
+/// interrupted turn at once but lets a running command go on to its own end, so a command or file change
+/// still running when this has passed is stopped with the whole session.
+pub const INTERRUPT_SETTLE: Duration = Duration::from_secs(3);
+/// Running calls remembered at most; past it something always counts as still running.
+const RUNNING_CALLS_KEPT: usize = 4096;
 
 /// JSON-RPC's "method not found".
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -119,6 +127,12 @@ struct ActiveTurn {
     interrupting: bool,
     /// How the tab's own thread's turn ended, once it has; the family may still be working then.
     own_end: Option<(TurnOutcome, TurnEndDetail)>,
+    /// When the first interrupt was pressed, plus [`INTERRUPT_SETTLE`]: whatever still changes things after
+    /// it stops the session.
+    settle_until: Option<Instant>,
+    /// Every turn of the family has ended after an interrupt, and the tab's turn waits for the calls still
+    /// running before it ends.
+    settling: bool,
     /// The last whole assistant message of the turn: the turn's result text.
     last_message: String,
     /// The thread's running token total as of the last report.
@@ -134,10 +148,63 @@ impl ActiveTurn {
             interrupt_asked: false,
             interrupting: false,
             own_end: None,
+            settle_until: None,
+            settling: false,
             last_message: String::new(),
             usage: None,
         }
     }
+}
+
+/// What a call Codex started and has not reported ended is, for deciding what an interrupt left running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Running {
+    Command,
+    FileChange,
+    /// An item whose kind or start Eitri could not read, which may be either.
+    Unread,
+    /// A call that changes nothing by itself (a tool server's call, a subagent call).
+    Other,
+}
+
+impl Running {
+    fn of(item: &ThreadItem) -> Option<Running> {
+        match item {
+            ThreadItem::CommandExecution(_) => Some(Running::Command),
+            ThreadItem::FileChange(_) => Some(Running::FileChange),
+            ThreadItem::Unknown { .. } | ThreadItem::Malformed { .. } => Some(Running::Unread),
+            ThreadItem::McpToolCall(_) | ThreadItem::CollabAgentToolCall(_) => Some(Running::Other),
+            ThreadItem::UserMessage(_)
+            | ThreadItem::AgentMessage(_)
+            | ThreadItem::Reasoning(_)
+            | ThreadItem::SubAgentActivity(_) => None,
+        }
+    }
+
+    /// What the tab says Codex kept doing, or `None` for a call that changes nothing by itself.
+    fn kept_doing(self) -> Option<&'static str> {
+        match self {
+            Running::Command => Some("kept running a command"),
+            Running::FileChange => Some("kept applying a file change"),
+            Running::Unread => Some("kept running something Eitri could not read"),
+            Running::Other => None,
+        }
+    }
+}
+
+/// What the tab says when an interrupt left `kept_doing` running and the session was stopped for it.
+pub fn stopped_after_interrupt(kept_doing: &str) -> String {
+    format!(
+        "Codex {kept_doing} after the interrupt; its session was stopped so nothing more runs. \
+         The conversation can be resumed."
+    )
+}
+
+/// The session being stopped because something kept running after an interrupt.
+struct Stopping {
+    /// Set once the child and everything it started are gone.
+    done: Arc<AtomicBool>,
+    kept_doing: &'static str,
 }
 
 /// A card waiting for its answer.
@@ -207,9 +274,17 @@ struct State {
     /// The resumed thread's history, until the host takes it (`take_history`). Never pumped: a past turn
     /// delivered live would read to the host as one that just ran.
     history: Vec<AgentDomainEvent>,
+    /// The calls Codex has started and not reported ended, on any thread of this connection, by thread and
+    /// item. Kept across turns: a command can outlive the turn that started it.
+    running: HashMap<(String, String), Running>,
+    /// A call started that could not be told apart, or more were running than are remembered: something
+    /// counts as running for as long as this connection lasts.
+    running_unread: bool,
+    /// Something kept running after an interrupt and the child is being stopped for it.
+    stopping: Option<Stopping>,
     /// Closed by the host.
     closed: bool,
-    /// The child ended on its own.
+    /// The child ended on its own, or was stopped.
     dead: bool,
 }
 
@@ -533,6 +608,8 @@ impl CodexProvider {
         }
         if let Some(turn) = st.turn.as_mut() {
             turn.interrupting = true;
+            turn.settle_until
+                .get_or_insert_with(|| Instant::now() + INTERRUPT_SETTLE);
         }
         for (permission_id, card) in std::mem::take(&mut st.cards) {
             if card.form.ends_the_turn(CardAnswer::Interrupt) {
@@ -921,11 +998,21 @@ impl CodexProvider {
                 }
             }
             Skipped::ItemTooLarge {
-                method,
+                method: name,
                 item_id,
                 thread_id,
             } => {
-                eprintln!("agent: a {method} message from Codex was larger than 16 MiB; the item is not shown");
+                eprintln!("agent: a {name} message from Codex was larger than 16 MiB; the item is not shown");
+                if name == method::ITEM_STARTED {
+                    match (&thread_id, &item_id) {
+                        (Some(thread), Some(id)) => note_running(st, thread, id, Running::Unread),
+                        _ => st.running_unread = true,
+                    }
+                } else if name == method::ITEM_COMPLETED {
+                    if let (Some(thread), Some(id)) = (&thread_id, &item_id) {
+                        st.running.remove(&(thread.clone(), id.clone()));
+                    }
+                }
                 // What is held may no longer be what Codex will do; a request naming it is declined.
                 match (item_id, thread_id) {
                     (Some(id), Some(thread)) => st.calls.forget(&thread, &id),
@@ -1019,6 +1106,9 @@ impl CodexProvider {
                     );
                 } else if name == method::TURN_STARTED {
                     self.unreadable_turn_start(st, thread_id.as_deref());
+                } else if name == method::ITEM_STARTED {
+                    // A call whose start cannot be read may be a command that is running now.
+                    st.running_unread = true;
                 }
             }
         }
@@ -1140,6 +1230,10 @@ impl CodexProvider {
             st.turn = Some(ActiveTurn::new(Some(turn.clone())));
             st.events.push_back(AgentDomainEvent::TurnStarted { turn_id: turn });
         } else if st.turn.as_ref().is_some_and(|t| t.interrupting) {
+            // A turn begun while the tab's turn waited for its calls: the family is running again.
+            if let Some(active) = st.turn.as_mut() {
+                active.settling = false;
+            }
             self.send_interrupts(st);
         }
     }
@@ -1185,6 +1279,14 @@ impl CodexProvider {
     }
 
     fn on_item_started(&self, st: &mut State, n: ItemNotification) {
+        // Before anything decides whether the item is shown: what runs is counted whoever runs it.
+        if let Some(kind) = Running::of(&n.item) {
+            match n.item.id() {
+                Some(id) => note_running(st, &n.thread_id, id, kind),
+                None if kind == Running::Other => {}
+                None => st.running_unread = true,
+            }
+        }
         if self.announced(st, &n.thread_id, &n.item) {
             return;
         }
@@ -1233,7 +1335,15 @@ impl CodexProvider {
     }
 
     fn on_item_completed(&self, st: &mut State, n: ItemNotification) {
+        if let Some(id) = n.item.id() {
+            st.running.remove(&(n.thread_id.clone(), id.to_string()));
+        }
         if self.announced(st, &n.thread_id, &n.item) {
+            return;
+        }
+        if st.turn.as_ref().is_some_and(|t| t.settling) {
+            // A call the interrupted turn left running has ended; its row gets its result.
+            self.end_settled_row(st, &n);
             return;
         }
         if !self.running_turn(st, &n.thread_id, &n.turn_id) {
@@ -1366,8 +1476,20 @@ impl CodexProvider {
         }
     }
 
-    /// The family has no turn running: the tab's turn ends, with the outcome of the tab's own turn.
+    /// The family has no turn running: the tab's turn ends, with the outcome of the tab's own turn. After an
+    /// interrupt it first waits for the calls still running (`settle`).
     fn close_family_turn(&self, st: &mut State) {
+        let something_runs = st.running_unread || !st.running.is_empty();
+        let Some(turn) = st.turn.as_mut() else { return };
+        if turn.interrupting && something_runs {
+            turn.settling = true;
+            return;
+        }
+        self.end_family_turn(st);
+    }
+
+    /// Ends the tab's turn, the family being idle, with the outcome of the tab's own turn.
+    fn end_family_turn(&self, st: &mut State) {
         let (own, asked) = match st.turn.as_mut() {
             Some(turn) => (turn.own_end.take(), turn.interrupt_asked),
             None => return,
@@ -1404,6 +1526,127 @@ impl CodexProvider {
             detail,
         });
     }
+}
+
+impl CodexProvider {
+    /// After an interrupt, once every turn of the family has ended: the tab's turn ends when nothing Codex
+    /// started is running any more. A command or file change still running past [`INTERRUPT_SETTLE`] (or
+    /// a call Eitri could not read) stops the session, and the turn ends only once the child is gone, so
+    /// nothing reported as over is still writing. A call that changes nothing by itself is not waited on
+    /// past the settle time.
+    fn settle(&self, st: &mut State) {
+        if let Some(stopping) = st.stopping.as_ref() {
+            if stopping.done.load(Ordering::Acquire) {
+                let kept_doing = stopping.kept_doing;
+                st.stopping = None;
+                self.finish_stop(st, kept_doing);
+            }
+            return;
+        }
+        if st.dead || st.closed {
+            return;
+        }
+        let Some(turn) = st.turn.as_ref().filter(|t| t.settling) else {
+            return;
+        };
+        if !st.running_unread && st.running.is_empty() {
+            self.end_family_turn(st);
+            return;
+        }
+        if turn.settle_until.is_some_and(|until| Instant::now() < until) {
+            return;
+        }
+        let unread = st.running_unread.then_some(Running::Unread);
+        let worst = unread
+            .into_iter()
+            .chain(st.running.values().copied())
+            .find_map(|kind| kind.kept_doing());
+        match worst {
+            Some(kept_doing) => self.stop_session(st, kept_doing),
+            None => self.end_family_turn(st),
+        }
+    }
+
+    /// Stops the child, and with it everything it runs: stdin is closed, then its process group is killed.
+    /// That waits, so it happens on a thread of its own; the pump learns from `Stopping::done` that it is
+    /// over. Nothing is sent to Codex from here on.
+    fn stop_session(&self, st: &mut State, kept_doing: &'static str) {
+        eprintln!("agent: Codex {kept_doing} after the interrupt; its session is stopped");
+        st.dead = true;
+        Self::drop_cards(st, PermissionOutcome::CancelledByInterrupt);
+        let done = Arc::new(AtomicBool::new(false));
+        if let Some(link) = lock(&self.link).take() {
+            let flag = Arc::clone(&done);
+            let spawned = std::thread::Builder::new()
+                .name("eitri-codex-stop".to_string())
+                .spawn(move || {
+                    link.shutdown(SIDECAR_EXIT_GRACE);
+                    flag.store(true, Ordering::Release);
+                });
+            // Without a thread the closure, and the link in it, was dropped, which kills the group at once.
+            if spawned.is_err() {
+                done.store(true, Ordering::Release);
+            }
+        } else {
+            done.store(true, Ordering::Release);
+        }
+        st.stopping = Some(Stopping { done, kept_doing });
+    }
+
+    /// The child is gone: the rows still open end, the turn ends interrupted, and the session is over.
+    fn finish_stop(&self, st: &mut State, kept_doing: &'static str) {
+        if let Some(turn_id) = Self::tab_turn_id(st) {
+            let mut rows: Vec<String> = st.open_tools.drain().collect();
+            rows.sort();
+            for row in rows {
+                st.events.push_back(AgentDomainEvent::ToolCallCompleted {
+                    turn_id: turn_id.clone(),
+                    tool_use_id: row,
+                    content: Value::String("stopped with the session after the interrupt".to_string()),
+                    is_error: true,
+                });
+            }
+        }
+        st.running.clear();
+        st.running_unread = false;
+        self.end_family_turn(st);
+        st.events.push_back(AgentDomainEvent::SessionUnavailable {
+            reason: stopped_after_interrupt(kept_doing),
+        });
+    }
+
+    /// A call that the interrupted turn left running ended while the tab's turn waited for it: its row, if
+    /// the tab drew one, gets the result.
+    fn end_settled_row(&self, st: &mut State, n: &ItemNotification) {
+        let Some(turn_id) = Self::tab_turn_id(st) else { return };
+        let (Some((_, _)), Some((content, is_error)), Some(id)) = (
+            translate::tool_start(&n.item),
+            translate::tool_result(&n.item),
+            n.item.id(),
+        ) else {
+            return;
+        };
+        st.calls.forget(&n.thread_id, id);
+        let row = row_of(st, &n.thread_id, id);
+        if st.open_tools.remove(&row) {
+            st.events.push_back(AgentDomainEvent::ToolCallCompleted {
+                turn_id,
+                tool_use_id: row,
+                content,
+                is_error,
+            });
+        }
+    }
+}
+
+/// Counts a call Codex started as running until it is reported ended.
+fn note_running(st: &mut State, thread: &str, item: &str, kind: Running) {
+    let key = (thread.to_string(), item.to_string());
+    if st.running.len() >= RUNNING_CALLS_KEPT && !st.running.contains_key(&key) {
+        st.running_unread = true;
+        return;
+    }
+    st.running.insert(key, kind);
 }
 
 /// Ends the row Eitri added for `card`, if it added one and Codex has not reported the call since, with the
@@ -1516,13 +1759,29 @@ impl AgentProvider for CodexProvider {
 
     fn info(&self) -> ProviderInfo {
         let untested = self.version > HIGHEST_TESTED_CODEX;
+        let version = version_text(self.version);
+        let tested = format!(
+            "tested {} to {}",
+            version_text(MIN_CODEX),
+            version_text(HIGHEST_TESTED_CODEX)
+        );
         ProviderInfo {
-            build_description: Some(format!("Codex {}", version_text(self.version))),
+            // A version inside the tested range says so; one above it is named as untested beside the
+            // newest one that was tested.
+            build_description: Some(if untested {
+                format!("Codex {version}")
+            } else {
+                format!("Codex {version} ({tested})")
+            }),
             startup_diagnostics: if untested {
-                vec![format!("untested Codex {}", version_text(self.version))]
+                vec![format!(
+                    "untested Codex {version} (tested up to {})",
+                    version_text(HIGHEST_TESTED_CODEX)
+                )]
             } else {
                 Vec::new()
             },
+            configuration_home: Some(self.codex_home.display().to_string()),
             ..Default::default()
         }
     }
@@ -1638,6 +1897,7 @@ impl AgentProvider for CodexProvider {
         if !st.closed {
             self.drain(&mut st);
         }
+        self.settle(&mut st);
         st.events.drain(..).collect()
     }
 }
@@ -1903,7 +2163,7 @@ impl ExternalProvider for CodexProvider {
             turn_id: turn_id.clone(),
         });
         if wanted {
-            self.send_interrupts(&mut st);
+            self.interrupt_running(&mut st);
         }
         Ok(turn_id)
     }

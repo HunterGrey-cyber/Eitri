@@ -68,10 +68,12 @@ function narrowCwd(path: string): string {
 
 /** Working directory with the home path abbreviated to `~`, followed by the optional account.
  *  Narrow mode shortens the directory and omits the account. */
-function whereLine(hello: Hello, narrow: boolean): string {
+function whereLine(hello: Hello, narrow: boolean, agent: string | null): string {
   const cwd = narrow ? narrowCwd(hello.projectDir) : abbreviateHome(hello.projectDir);
   const parts = [cwd];
-  if (!narrow && hello.account !== null) parts.push(hello.account);
+  // The account is the Claude account; another agent's tab names the agent instead.
+  if (agent !== null) parts.push(agent);
+  else if (!narrow && hello.account !== null) parts.push(hello.account);
   return parts.join(" · ");
 }
 
@@ -91,10 +93,10 @@ function restoreSummary(offer: NonNullable<Hello["restore"]>): string {
   return `${count} ${count === 1 ? "tab" : "tabs"}${bypass}: ${names.join(", ")}`;
 }
 
-function ItemLabel({ item, hello, mode }: { item: DashItem; hello: Hello; mode: PermissionModeChoice }) {
+function ItemLabel({ item, hello, mode, agent }: { item: DashItem; hello: Hello; mode: PermissionModeChoice; agent: string | null }) {
   switch (item) {
     case "new":
-      return <>New session</>;
+      return <>{agent === null ? "New session" : `New ${agent} session`}</>;
     case "restore":
       return (
         <>
@@ -140,6 +142,9 @@ type Props = {
    *  speaks for a window that holds only this panel. Optional so a caller with no editor beside it
    *  needs no stand-in. */
   editorLink?: EditorLink | null;
+  /** The word for the agent this tab runs when it is not Claude (`agentTitle`), named on the start
+   *  screen so an empty Codex tab is not mistaken for a Claude one. `null`/absent for Claude. */
+  agent?: string | null;
 };
 
 /** The empty tab's dashboard: a centred `Eitri`, the
@@ -153,13 +158,13 @@ type Props = {
  * here is ever really DOM-focused. A real, focused `<button>` would eat a `Space` keydown as
  * native activation before it ever reached the leader system (`App.tsx`'s root `onKeyDown`), which
  * is exactly the key this screen's own `j`/`k`/letters/`Enter` must never intercept from. */
-export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix, editorLink = null }: Props) {
+export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix, editorLink = null, agent = null }: Props) {
   const items = dashItems(hello);
   const consequence = MODE_CONSEQUENCE[mode];
   return (
     <div className="dashboard">
       <div className="dash-title">Eitri</div>
-      <div className="dash-where">{whereLine(hello, narrow)}</div>
+      <div className="dash-where">{whereLine(hello, narrow, agent)}</div>
       <div className="dash-items">
         {items.map((item, index) => (
           <div
@@ -181,7 +186,7 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix, editorL
               )}
             </span>
             <span className="dash-label">
-              <ItemLabel item={item} hello={hello} mode={mode} />
+              <ItemLabel item={item} hello={hello} mode={mode} agent={agent} />
             </span>
             <span className="dash-key">{DASH_ITEM_KEY[item]}</span>
           </div>

@@ -307,14 +307,31 @@ fn account_present_or_auth_not_required_passes() {
 }
 
 #[test]
-fn a_newer_codex_runs_with_a_note_and_the_tested_one_with_none() {
+fn a_newer_codex_runs_with_a_note_and_a_tested_one_states_the_tested_range() {
     let tested = connect(handshake(UA, signed_in())).expect("connects");
     assert!(tested.info().startup_diagnostics.is_empty());
-    let newer = connect(handshake("codex/0.161.0 (Arch)", signed_in())).expect("connects");
+    assert_eq!(
+        tested.info().build_description.as_deref(),
+        Some("Codex 0.160.0 (tested 0.160.0 to 0.161.0)")
+    );
+    let highest = connect(handshake("codex/0.161.0 (Arch)", signed_in())).expect("connects");
+    assert!(highest.info().startup_diagnostics.is_empty(), "0.161.0 is tested");
+    assert_eq!(
+        highest.info().build_description.as_deref(),
+        Some("Codex 0.161.0 (tested 0.160.0 to 0.161.0)")
+    );
+    let newer = connect(handshake("codex/0.162.0 (Arch)", signed_in())).expect("connects");
+    assert_eq!(newer.info().build_description.as_deref(), Some("Codex 0.162.0"));
     assert_eq!(
         newer.info().startup_diagnostics,
-        vec!["untested Codex 0.161.0".to_string()]
+        vec!["untested Codex 0.162.0 (tested up to 0.161.0)".to_string()]
     );
+}
+
+#[test]
+fn the_info_names_the_configuration_directory_codex_reported() {
+    let provider = connect(handshake(UA, signed_in())).expect("connects");
+    assert_eq!(provider.info().configuration_home.as_deref(), Some("/x"));
 }
 
 #[test]
@@ -1294,4 +1311,214 @@ fn closing_a_running_turn_interrupts_it_first() {
         .close_session(CloseSessionRequest { session_id: thread })
         .expect("closes");
     assert!(!alive(provider.pid()));
+}
+
+// ---------------------------------------------------------------- what an interrupt leaves running
+
+fn command(id: &str, status: &str) -> Value {
+    json!({"type": "commandExecution", "id": id, "command": "for i in 1 2 3; do sleep 1; done", "cwd": "/work/proj",
+           "status": status, "aggregatedOutput": if status == "inProgress" { Value::Null } else { json!("all three") },
+           "exitCode": if status == "inProgress" { Value::Null } else { json!(0) }})
+}
+
+/// A session whose turn starts `item` and is interrupted: Codex ends the turn at once, then (after `then`)
+/// whatever the script says.
+fn interrupted_with(thread: &str, turn: &str, item: Value, then: Vec<Value>) -> (Arc<CodexProvider>, String) {
+    let mut rest = vec![
+        expect_request(4, "turn/start"),
+        turn_response(4, turn),
+        item_note("item/started", thread, turn, item),
+        expect_exact(&format!(
+            r#"{{"id":5,"method":"turn/interrupt","params":{{"threadId":"{thread}","turnId":"{turn}"}}}}"#
+        )),
+        turn_completed(thread, turn, "interrupted", Value::Null),
+    ];
+    rest.extend(then);
+    let (provider, id) = open(thread, rest);
+    send(&provider, &id, "go").expect("starts");
+    // The item is read before the key is pressed.
+    std::thread::sleep(Duration::from_millis(300));
+    provider.pump();
+    provider
+        .interrupt_turn(InterruptTurnRequest { session_id: id.clone() })
+        .expect("the interrupt is accepted");
+    (provider, id)
+}
+
+fn position(events: &[AgentDomainEvent], what: impl Fn(&AgentDomainEvent) -> bool) -> Option<usize> {
+    events.iter().position(what)
+}
+
+#[test]
+fn an_interrupted_turn_waits_for_the_command_codex_kept_running() {
+    let (t, u) = ("th-30", "turn-30");
+    let (provider, thread) = interrupted_with(
+        t,
+        u,
+        command("c1", "inProgress"),
+        vec![
+            json!({"sleep_ms": 800}),
+            item_note("item/completed", t, u, command("c1", "completed")),
+            expect_request(6, "turn/start"),
+            turn_response(6, "turn-31"),
+        ],
+    );
+    let pressed = Instant::now();
+    let events = until_turn_completed(&provider);
+    assert!(
+        pressed.elapsed() >= Duration::from_millis(600),
+        "the turn ended {:?} after the interrupt, while Codex still ran the command",
+        pressed.elapsed()
+    );
+    let result = position(
+        &events,
+        |e| matches!(e, AgentDomainEvent::ToolCallCompleted { content, .. } if content == &json!("all three")),
+    )
+    .expect("the command's row got its result");
+    let end = position(&events, |e| matches!(e, AgentDomainEvent::TurnCompleted { .. })).expect("the end");
+    assert!(result < end, "the row's result came after the turn's end: {events:#?}");
+    assert!(matches!(
+        &events[end],
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Interrupted,
+            ..
+        }
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })),
+        "a command that ended in time stopped the session"
+    );
+    assert_eq!(
+        send(&provider, &thread, "next").expect("the session goes on"),
+        "turn-31"
+    );
+}
+
+#[test]
+fn a_command_still_running_after_the_settle_time_stops_the_session() {
+    let (t, u) = ("th-32", "turn-32");
+    // Codex never reports the command ended; the stand-in then waits for EOF on its stdin.
+    let (provider, thread) = interrupted_with(t, u, command("c1", "inProgress"), vec![]);
+    let pid = provider.pid();
+    let pressed = Instant::now();
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
+    });
+    let waited = pressed.elapsed();
+    assert!(
+        waited + Duration::from_millis(200) >= agent::providers::codex::provider::INTERRUPT_SETTLE,
+        "the session was stopped after only {waited:?}"
+    );
+    assert!(!alive(pid), "the turn ended before the child was gone");
+    let row = position(&events, |e| {
+        matches!(e, AgentDomainEvent::ToolCallCompleted { is_error: true, content, .. }
+            if content.as_str().is_some_and(|c| c.contains("stopped")))
+    })
+    .expect("the command's row says it was stopped");
+    let end = position(&events, |e| {
+        matches!(
+            e,
+            AgentDomainEvent::TurnCompleted {
+                outcome: TurnOutcome::Interrupted,
+                ..
+            }
+        )
+    })
+    .expect("the turn ends interrupted");
+    assert!(row < end);
+    let gone = position(&events, |e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }));
+    assert!(gone > Some(end), "the session ended before its turn did: {events:#?}");
+    let reason = events
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::SessionUnavailable { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("the session is over");
+    assert_eq!(
+        reason,
+        "Codex kept running a command after the interrupt; its session was stopped so nothing more runs. \
+         The conversation can be resumed."
+    );
+    assert!(
+        send(&provider, &thread, "next").is_err(),
+        "a stopped session took a turn"
+    );
+}
+
+#[test]
+fn a_call_eitri_cannot_read_counts_as_still_running() {
+    let (t, u) = ("th-33", "turn-33");
+    let (provider, _) = interrupted_with(t, u, json!({"type": "someFutureCall", "id": "z1"}), vec![]);
+    let pid = provider.pid();
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
+    });
+    assert!(!alive(pid));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentDomainEvent::SessionUnavailable { reason } if reason.starts_with("Codex kept running something Eitri could not read")
+    )));
+}
+
+#[test]
+fn a_tool_server_call_left_running_is_not_a_reason_to_stop() {
+    let (t, u) = ("th-34", "turn-34");
+    let (provider, thread) = interrupted_with(
+        t,
+        u,
+        json!({"type": "mcpToolCall", "id": "k1", "server": "s", "tool": "t", "status": "inProgress", "arguments": {}}),
+        vec![expect_request(6, "turn/start"), turn_response(6, "turn-35")],
+    );
+    let pid = provider.pid();
+    let events = until_turn_completed(&provider);
+    assert!(alive(pid));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
+    assert_eq!(
+        send(&provider, &thread, "next").expect("the session goes on"),
+        "turn-35"
+    );
+}
+
+#[test]
+fn an_interrupt_with_nothing_running_ends_the_turn_at_once() {
+    // A command that ended before the key: nothing is waited on.
+    let (t, u) = ("th-36", "turn-36");
+    let (provider, thread) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            item_note("item/started", t, u, command("c1", "inProgress")),
+            item_note("item/completed", t, u, command("c1", "completed")),
+            expect_request(5, "turn/interrupt"),
+            turn_completed(t, u, "interrupted", Value::Null),
+        ],
+    );
+    send(&provider, &thread, "go").expect("starts");
+    pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::ToolCallCompleted { .. }))
+    });
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: thread.clone(),
+        })
+        .expect("accepted");
+    let pressed = Instant::now();
+    until_turn_completed(&provider);
+    assert!(
+        pressed.elapsed() < Duration::from_secs(1),
+        "took {:?}",
+        pressed.elapsed()
+    );
 }

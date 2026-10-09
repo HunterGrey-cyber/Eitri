@@ -192,11 +192,17 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     // goes, and goes last, with only the mode left.
     (s) => s.map((x) => (x.id === "recovery" && f.recovery ? { ...x, text: recoverySegment(f.recovery.path.split("/").pop() ?? f.recovery.path, f.recovery.more) } : x)),
     (s) => s.filter((x) => x.id !== "recovery"),
-    (s) => s.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x)),
   ];
   for (const apply of steps) {
     if (width(segs) <= budget) break;
     segs = apply(segs);
+  }
+  // The mode shrinks to its letter last. Not for a flash that wraps anyway: five characters of mode
+  // word would not make it fit, and the row it wraps onto would then lead with a bare letter ("B");
+  // the mode keeps its word unless the letter is what lets everything fit.
+  if (width(segs) > budget) {
+    const shortened = segs.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x));
+    if (!segs.some((x) => x.id === "message") || width(shortened) <= budget) segs = shortened;
   }
   // If the full message still exceeds the row after every droppable segment is gone, mark it
   // `wraps`. `StatusBand` grows to keep the flash's explanation visible.

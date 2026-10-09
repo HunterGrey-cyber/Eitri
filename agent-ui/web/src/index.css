@@ -472,6 +472,8 @@ body,
    (`data-focused`, `paneFocused`'s own claim) -- moved unchanged from the old `Footer`'s mode
    block, itself explained by the big comment above this rule. */
 .band-mode {
+  /* Never squeezed by a long flash beside it: the flash wraps, the mode keeps its width. */
+  flex-shrink: 0;
   font-weight: 600;
   padding: 0 6px;
   background: var(--nv-cursorline);

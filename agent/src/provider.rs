@@ -200,6 +200,9 @@ pub struct ProviderInfo {
     /// untested, a Verdandi checkout that has drifted from the verified baseline. **Empty is the
     /// normal case**, which is what lets a UI treat non-empty as a real signal.
     pub startup_diagnostics: Vec<String>,
+    /// The directory of the user's own configuration for this agent, as the agent itself reported it
+    /// (Codex's `CODEX_HOME`), when it has one that a status row should name. Descriptive only.
+    pub configuration_home: Option<String>,
 }
 
 /// A provider-neutral mirror of the sidecar proto's own `ErrorCode`. Exists because the code was

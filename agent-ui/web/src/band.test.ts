@@ -136,6 +136,22 @@ describe("defect 1: a y/n prompt or a flash is never truncated", () => {
     expect(message.wraps).toBe(true);
   });
 
+  it("a flash that wraps leaves the mode its word: the letter would not make it fit", () => {
+    const segs = bandLayout({ ...idle, message: D11_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
+    expect(segs.find((s) => s.id === "mode")!.text).toBe("BROWSE");
+    expect(segs.find((s) => s.id === "message")!.wraps).toBe(true);
+    // ...while a band with no message still shortens the mode when nothing else is left to drop.
+    expect(bandLayout({ ...idle, warn: "skew" }, 120, 7.2).find((s) => s.id === "mode")!.text).toBe("B");
+  });
+
+  it("the letter still replaces the word when that is what lets a message fit", () => {
+    // mode 6 + pill 7 + message 28 + 3 * 2 padding = 47 > 44; with the letter, 42 fits.
+    const message = "x".repeat(28);
+    const segs = bandLayout({ ...idle, message }, 44 * 7.2, 7.2);
+    expect(segs.find((s) => s.id === "mode")!.text).toBe("B");
+    expect(segs.find((s) => s.id === "message")!.wraps).toBeFalsy();
+  });
+
   it("a short prompt still fits the row whole -- no wraps flag, same as before this fix", () => {
     const shortPrompt = 'close 1 "docs"? (y/n)';
     const segs = bandLayout({ ...idle, prompt: shortPrompt }, NARROW_BUDGET_WIDTH, 7.2);

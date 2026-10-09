@@ -3544,8 +3544,14 @@ fn detail_rows(
         ("trust", trust_row.to_string()),
         ("Verdandi revision", known(revision)),
         ("resumable", resumable.to_string()),
-        ("created", known(record.as_ref().map(|r| r.created_at.clone()))),
-        ("updated", known(record.as_ref().map(|r| r.updated_at.clone()))),
+        (
+            "created",
+            record_stamp_row(record.as_ref().map(|r| r.created_at.as_str())),
+        ),
+        (
+            "updated",
+            record_stamp_row(record.as_ref().map(|r| r.updated_at.as_str())),
+        ),
         ("queued", tab.queue.len().to_string()),
         ("permission rules", known(rules_file.map(|p| p.display().to_string()))),
     ];
@@ -3628,6 +3634,23 @@ fn limits_row(limits: &agent::AccountLimitsRecord) -> String {
     line
 }
 
+/// A `created`/`updated` row of `prefix i`: the record's stamp as local date and time, or a dash for a tab
+/// with no record.
+fn record_stamp_row(raw: Option<&str>) -> String {
+    raw.map_or_else(|| "\u{2014}".to_string(), eitri_core::tabs::record_stamp)
+}
+
+/// The `settings` row of a Codex tab: Codex's own configuration directory, the one it reported (a
+/// `CODEX_HOME` the user set, not always `~/.codex`), and what of the project is loaded. Before a session
+/// has reported one it says where Codex looks.
+fn codex_settings_row(configuration_home: Option<&str>, project_loaded: &str) -> String {
+    let whose = match configuration_home {
+        Some(home) => format!("your Codex configuration in {home} (always;"),
+        None => "your Codex configuration (CODEX_HOME, else ~/.codex; always;".to_string(),
+    };
+    format!("{whose} skills off while this project is untrusted); this project's: {project_loaded}")
+}
+
 /// `prefix i`'s rows for a tab that runs another agent than Claude. The Claude-only rows (Verdandi
 /// session, Claude session, CLI, Verdandi revision, permission rules) are not shown: they describe
 /// things such a tab does not have.
@@ -3662,6 +3685,9 @@ fn external_detail_rows(
         }
         line
     });
+    let configuration_home = backend
+        .and_then(|b| b.provider_info())
+        .and_then(|info| info.configuration_home.clone());
     let record = match (&conversation_id, &provider_session_id) {
         (Some(conversation), Some(session)) => agent::persistence::load_conversation_record(conversation, session).ok(),
         _ => None,
@@ -3676,10 +3702,7 @@ fn external_detail_rows(
         (
             "codex app-server".to_string(),
             "thread",
-            format!(
-                "your ~/.codex configuration (always; skills off while this project is untrusted); this project's: \
-                 {project_loaded}"
-            ),
+            codex_settings_row(configuration_home.as_deref(), project_loaded),
             codex_runs_without_asking(project_dir, bypass),
             CODEX_MODE_LAG.to_string(),
             "limits",
@@ -3726,8 +3749,14 @@ fn external_detail_rows(
         ("mode lag", mode_lag),
         (limits_label, known(limits_value)),
         ("resumable", if tab.resumable(kind) { "yes" } else { "no" }.to_string()),
-        ("created", known(record.as_ref().map(|r| r.created_at.clone()))),
-        ("updated", known(record.as_ref().map(|r| r.updated_at.clone()))),
+        (
+            "created",
+            record_stamp_row(record.as_ref().map(|r| r.created_at.as_str())),
+        ),
+        (
+            "updated",
+            record_stamp_row(record.as_ref().map(|r| r.updated_at.as_str())),
+        ),
         ("queued", tab.queue.len().to_string()),
     ];
     rows.into_iter()
@@ -3964,6 +3993,9 @@ fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, page:
             let on_screen = active && page.is_visible();
             let Some(t) = state_ref.tabs.get_mut(tab) else { continue };
             t.reported_start_failure = true;
+            t.failed_after_start = false;
+            // The session that never opened is still the one the file should keep for this tab.
+            t.failed_resume = t.live().and_then(AgentBackend::provider_session_id);
             // Its cards go with it (the tick reports the change).
             t.attention.session_ended(on_screen);
             let dead = std::mem::replace(
@@ -4565,6 +4597,8 @@ fn apply_outcome(
                 state_ref.tabs.get_mut(tab).map(|t| {
                     // The cards of a session that is gone can no longer be answered.
                     t.attention.session_ended(on_screen);
+                    t.failed_after_start = true;
+                    t.failed_resume = None;
                     std::mem::replace(
                         &mut t.backend,
                         TabBackend::Failed {
@@ -10461,7 +10495,8 @@ mod tests {
         assert_eq!(value("trust"), "trusted since 2026-10-02");
         assert_eq!(
             value("settings"),
-            "your ~/.codex configuration (always; skills off while this project is untrusted); this project's: not loaded"
+            "your Codex configuration (CODEX_HOME, else ~/.codex; always; skills off while this project is untrusted); \
+             this project's: not loaded"
         );
         assert_eq!(
             value("runs without asking"),
@@ -10484,6 +10519,22 @@ mod tests {
 
     /// An ACP tab says what Eitri knows of what the agent runs unasked (only the mode it registered, or
     /// nothing at all without one), that a mode change applies at once, and how full its context is.
+    #[test]
+    fn the_settings_row_names_the_directory_codex_reported_and_the_stamps_read_as_dates() {
+        assert_eq!(
+            codex_settings_row(Some("/home/user/.config/codex"), "loaded"),
+            "your Codex configuration in /home/user/.config/codex (always; skills off while this project is \
+             untrusted); this project's: loaded"
+        );
+        assert!(
+            codex_settings_row(None, "not loaded").starts_with("your Codex configuration (CODEX_HOME, else ~/.codex;")
+        );
+        assert_eq!(record_stamp_row(None), "\u{2014}");
+        let shown = record_stamp_row(Some("1791522750000"));
+        assert!(shown.starts_with("2026-10-0") && shown.len() == 16, "{shown}");
+        assert!(!shown.contains("1791522750000"));
+    }
+
     #[test]
     fn detail_rows_for_an_acp_tab_follow_its_registration() {
         let registration = |auto_mode: Option<&str>| AgentRegistration {

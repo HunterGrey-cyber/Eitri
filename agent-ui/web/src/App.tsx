@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { ProjectDirContext } from "./projectPath";
-import { applyCallNotes, applyEvent, applySnapshot, initialState, keepAfterSidecarStop, resumeAttached } from "./reducer";
+import { applyCallNotes, applyEvent, applySnapshot, initialState, keepAfterFailure, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { NavKeyDirection, OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
@@ -81,7 +81,7 @@ import { TabBar } from "./components/TabBar";
 import { MessageList } from "./components/MessageList";
 import { cardApprovable } from "./components/PermissionCard";
 import { Row } from "./components/Row";
-import { classify, failureEvidence, remedyNamesR, sidecarStopped } from "./problems";
+import { classify, failureEvidence, remedyNamesR } from "./problems";
 import { ActivityLine } from "./components/ActivityLine";
 import { StatusBand } from "./components/StatusBand";
 import { QueueLines } from "./components/QueueLines";
@@ -1308,7 +1308,7 @@ export default function App() {
     slashPicker !== null ||
     renaming !== null ||
     (search !== null && sessionStarted) ||
-    (exLine !== null && sessionStarted) ||
+    exLine !== null ||
     review !== null;
   /** Current overlay state for the document key replay listener, installed once. */
   const overlayOpenRef = useRef(overlayOpen);
@@ -1619,8 +1619,8 @@ export default function App() {
       return;
     }
     // Focus the `:` command line like the search prompt; both use `SearchBar`.
-    if (exLine !== null && sessionStarted) {
-      containerRef.current?.querySelector<HTMLInputElement>(".search-bar input")?.focus();
+    if (exLine !== null) {
+      (containerRef.current ?? startScreenRef.current)?.querySelector<HTMLInputElement>(".search-bar input")?.focus();
       return;
     }
     // An open review comment input (a `SearchBar` too) keeps the keys through a window focus round trip, which
@@ -2515,20 +2515,14 @@ export default function App() {
         setKeymapOpen(true);
         setReview(null); // the review overlay is over the same area, and ends where `?` does
       } else if (payload.kind === "open_command_line") {
-        // `prefix :` opens the same command line as BROWSE's `:`. GTK captures the chord, so handle
-        // its envelope here rather than letting subsequent letters run as panel keys. The line
-        // consumes keys but runs no command: Enter explains this and Esc closes it. An empty tab
-        // has no command line and shows a flash instead.
-        if (!sessionStartedRef.current) {
-          showFlash("no command line on this screen — ? lists this panel's keys");
-          return;
-        }
-        // A route away from a bypass prompt, from VISUAL, and from every overlay over the conversation,
-        // as `hint_collect` and `tab_detail` are: GTK's chord reaches no key handler here. The `/` prompt
-        // and this line are one command line, so opening one closes the other.
-        // End every pending y/n prompt and any `gf` picker, not only a bypass prompt: see `endKeyPrompts`.
-        // A key typed into this line is the line's; the prompt it covers is over, as it is for BROWSE's own `:`
-        // (whose key ends it).
+        // `prefix :` opens the same command line as BROWSE's `:`. GTK handles the chord,
+        // so it reaches this panel as an envelope rather than a key event. Without this route,
+        // the armed prefix swallowed `:` and the following command text ran as panel keys.
+        // The line takes the keys; Enter reports unsupported commands and Esc closes it.
+        // It also appears on the start screen. Opening it ends VISUAL and closes conversation overlays.
+        // `endKeyPrompts` ends every pending y/n prompt and the `gf` picker.
+        // The `/` prompt and this line share one command line, so opening either closes the other.
+        // Keys typed into this line cannot answer a prompt it has replaced.
         endKeyPrompts();
         exitRegion();
         setKeymapOpen(false);
@@ -2686,7 +2680,12 @@ export default function App() {
         // Keep the saved conversation only while its tab is failed. Restore it after the reset when
         // switching back, since a failed tab sends no snapshot.
         for (const id of [...keptStates.current.keys()]) {
-          if (payload.tabs.find((t) => t.id === id)?.state !== "failed") keptStates.current.delete(id);
+          const tab = payload.tabs.find((t) => t.id === id);
+          if (tab?.state === "failed") continue;
+          keptStates.current.delete(id);
+          // The tab on screen was restarted (`r`, a first send): the lost conversation and its reason must not
+          // linger under the new session until its first snapshot lands.
+          if (tab !== undefined && id === payload.active && id === activeTabRef.current) setState(initialState());
         }
         if (payload.active !== activeTabRef.current) {
           const kept = keptStates.current.get(payload.active);
@@ -2965,11 +2964,13 @@ export default function App() {
         // and this tab's own `tabs.failure` carries the reason for when it is shown again. This
         // window's other tabs are untouched.
         setHandoffRequests((current) => withoutHandoff(current, payload.tab));
-        // If a sidecar stops with a conversation to show, keep it visible as a lost session with
-        // the provider's reason. A resumed session can reach this before any new turn as "ended before it started". For other failures or an empty conversation, use the ordinary reset.
+        // A tab that had shown anything (restored history, prompts, a transcript, tool calls) keeps it
+        // on screen as a lost session with the failure's own reason, whatever the failure: a sidecar
+        // that stopped under a resumed conversation, a policy mismatch, a child that ended. Only a tab
+        // that never showed anything falls back to the empty tab's failure row.
         const kept =
-          payload.tab === activeTabRef.current && sidecarStopped(payload.message)
-            ? keepAfterSidecarStop(stateRef.current, failureEvidence(payload.message))
+          payload.tab === activeTabRef.current
+            ? keepAfterFailure(stateRef.current, failureEvidence(payload.message))
             : null;
         if (kept !== null) keptStates.current.set(payload.tab, kept);
         // End the region before replacing state, as in `handoff`. A reset to `initialState()` does not
@@ -3466,6 +3467,13 @@ export default function App() {
     containerRef.current?.focus();
   }
 
+  /** Opens the `:` line empty and hands it the keys; one already open is wiped, as vim's `:` gives a fresh line. */
+  function openExLine() {
+    setSearch(null);
+    setExLine("");
+    setLineFocusRequest((n) => n + 1);
+  }
+
   /** Hands the keys back to whichever layout is on screen -- the conversation's own root, or the
    *  start screen's while no session has started yet. The same fallback `hint_collect` and the
    *  document-`<body>` replay above already use. */
@@ -3787,6 +3795,64 @@ export default function App() {
       </PanelErrorBoundary>
     ) : null;
 
+  /** The `:` command line runs only `:tabnew` and trust commands. Enter explains other
+   *  commands; Esc and `Ctrl+[` close it silently. It overlays both layouts so a fresh window
+   *  can create a tab from the start screen. */
+  const commandLineOverlay =
+    exLine === null ? null : (
+      <PanelErrorBoundary
+        name="command line"
+        onError={() =>
+          overlayFailed("command line", () => {
+            setExLine(null);
+            returnKeysToRoot();
+          })
+        }
+      >
+        <SearchBar
+          lead=":"
+          label="Command line"
+          query={exLine}
+          focusRequest={lineFocusRequest}
+          onChange={setExLine}
+          onAccept={(event) => {
+            noteLineKey(event);
+            const command = parseExCommand(exLine);
+            if (command !== null && command.command === "tabnew") {
+              // vim's `:tabnew`: the word names the agent; none is the new-tab key's own tab. Which words
+              // name an agent is Rust's to say (`init.lua` may register more), and its refusal, naming
+              // every accepted word, is flashed.
+              const tabnewId = nextRequestId();
+              if (command.agent !== null) {
+                inFlight.current.set(tabnewId, { kind: "tabnew", tab: activeTabRef.current ?? 0 });
+              }
+              postToRust({
+                type: "tab_verb",
+                request_id: tabnewId,
+                verb: "new",
+                ...(command.agent !== null ? { agent: command.agent } : {}),
+              });
+            } else if (command !== null) {
+              const commandId = nextRequestId();
+              inFlight.current.set(commandId, { kind: "trust", tab: activeTabRef.current ?? 0 });
+              // The trust it changes is the agent's of the tab on screen.
+              const agent = activeTabInfo(tabsRef.current)?.agent ?? "claude";
+              postToRust({ type: "trust_command", request_id: commandId, action: command.command, agent });
+            } else {
+              showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
+            }
+            setExLine(null);
+            returnKeysToRoot();
+          }}
+          onCancel={(event) => {
+            noteLineKey(event);
+            setExLine(null);
+            returnKeysToRoot();
+          }}
+        />
+      </PanelErrorBoundary>
+    );
+
   if (!sessionStarted) {
     // `errorBanner` deliberately stays out of this branch: a failed tab shows its own reason inside
     // `EmptyTab` (`activeTab.failure`), and a fatal error that arrived before any `tabs` envelope
@@ -3867,6 +3933,7 @@ export default function App() {
               panelTable={panelTable}
               onPanelAction={runPanelAction}
               typingGuard={typingGuard}
+              onExLine={openExLine}
               onFlash={showFlash}
               // Whoever sends from here is typing, and the conversation this starts must open where
               // they are: in INPUT. It mounted in BROWSE, so a second message typed straight away ran
@@ -3910,6 +3977,7 @@ export default function App() {
             window-close prompt sit directly under the empty tab; the composer lives inside
             `EmptyTab`. The band replaces the footer and shows editor context in its `context`
             fact. */}
+        {commandLineOverlay}
         <StatusBand
           facts={{
             mode: emptyMode,
@@ -5375,9 +5443,7 @@ export default function App() {
         // The command box takes focus through `SearchBar` and runs nothing on opening.
         // If it is already open with focus elsewhere, clear it and request focus again so `:`
         // always presents a fresh command line.
-        setSearch(null);
-        setExLine("");
-        setLineFocusRequest((n) => n + 1);
+        openExLine();
         break;
       case "search-next": {
         const found = findMatch(timeline, lastSearchRef.current, cursor, action.delta, false);
@@ -5814,62 +5880,7 @@ export default function App() {
           />
         </PanelErrorBoundary>
       )}
-      {/* The `:` command line takes command text so `:ls`, `:l` or `:d` followed by Enter
-          cannot activate a card. It runs nothing; Enter explains that, while Esc and `Ctrl+[`
-          close it silently. */}
-      {exLine !== null && (
-        <PanelErrorBoundary
-          name="command line"
-          onError={() =>
-            overlayFailed("command line", () => {
-              setExLine(null);
-              returnKeysToRoot();
-            })
-          }
-        >
-          <SearchBar
-            lead=":"
-            label="Command line"
-            query={exLine}
-            focusRequest={lineFocusRequest}
-            onChange={setExLine}
-            onAccept={(event) => {
-              noteLineKey(event);
-              const command = parseExCommand(exLine);
-              if (command !== null && command.command === "tabnew") {
-                // vim's `:tabnew`: the word names the agent; none is the new-tab key's own tab. Which words
-                // name an agent is Rust's to say (`init.lua` may register more), and its refusal, naming
-                // every accepted word, is flashed.
-                const tabnewId = nextRequestId();
-                if (command.agent !== null) {
-                  inFlight.current.set(tabnewId, { kind: "tabnew", tab: activeTabRef.current ?? 0 });
-                }
-                postToRust({
-                  type: "tab_verb",
-                  request_id: tabnewId,
-                  verb: "new",
-                  ...(command.agent !== null ? { agent: command.agent } : {}),
-                });
-              } else if (command !== null) {
-                const commandId = nextRequestId();
-                inFlight.current.set(commandId, { kind: "trust", tab: activeTabRef.current ?? 0 });
-                // The trust it changes is the agent's of the tab on screen.
-                const agent = activeTabInfo(tabsRef.current)?.agent ?? "claude";
-                postToRust({ type: "trust_command", request_id: commandId, action: command.command, agent });
-              } else {
-                showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
-              }
-              setExLine(null);
-              returnKeysToRoot();
-            }}
-            onCancel={(event) => {
-              noteLineKey(event);
-              setExLine(null);
-              returnKeysToRoot();
-            }}
-          />
-        </PanelErrorBoundary>
-      )}
+      {commandLineOverlay}
       {/* The bottom band combines status, unread counts and context in one status row.
           `showcmd` reads the same `box` as the which-key popup but appears immediately, without
           `WHICH_KEY_DELAY_MS`, so `box` is computed unconditionally. The window-close y/n `prompt`

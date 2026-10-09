@@ -1731,3 +1731,264 @@ fn plain_tool_spawn_is_followed_by_the_family() {
         .close_session(agent::CloseSessionRequest { session_id: thread })
         .expect("closes");
 }
+
+// ------------------------------------------------------------------------------------ what an interrupt leaves running
+
+/// A `CodexProvider` (what a tab runs) on the real codex in the private home, with the scripted model.
+fn real_provider(codex: &Path, s: &Scratch, home: &Path, project: &Path) -> agent::providers::codex::CodexProvider {
+    use std::ffi::OsString;
+    let no_proxy = OsString::from("127.0.0.1,localhost");
+    agent::providers::codex::CodexProvider::connect_with_env(
+        agent::providers::codex::CodexLaunch {
+            program: codex.to_path_buf(),
+            cwd: project.to_path_buf(),
+            state_home: s.dir("state"),
+        },
+        ["app-server", "--listen", "stdio://"]
+            .iter()
+            .map(OsString::from)
+            .collect(),
+        vec![
+            (OsString::from("CODEX_HOME"), home.as_os_str().to_os_string()),
+            (OsString::from("NO_PROXY"), no_proxy.clone()),
+            (OsString::from("no_proxy"), no_proxy),
+        ],
+        [
+            "TMUX",
+            "TMUX_PANE",
+            "NVIM",
+            "NVIM_LISTEN_ADDRESS",
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect(),
+    )
+    .expect("the provider connects to the real codex")
+}
+
+fn count_lines(path: &Path) -> usize {
+    std::fs::read_to_string(path).map(|t| t.lines().count()).unwrap_or(0)
+}
+
+/// What an interrupted run left: the events, when the key was pressed and the turn and session ended, and
+/// how many lines the loop had written when the turn ended and a while later.
+struct InterruptRun {
+    events: Vec<agent::AgentDomainEvent>,
+    turn_ended_after: Duration,
+    lines_at_end: usize,
+    lines_later: usize,
+}
+
+/// Starts a session on `project`, sends `prompt`, waits until `loop_file` has two lines, presses interrupt,
+/// and pumps until the tab's turn has ended and `settle_more` has passed. Each command first sleeps half a
+/// second: an interrupt that comes before Codex has announced the command stops it with the turn (and no
+/// item is ever announced), which is not the case under test.
+fn interrupt_a_loop(
+    codex: &Path,
+    s: &Scratch,
+    model: &ScriptedModel,
+    project: &Path,
+    prompt: &str,
+    loop_file: &Path,
+    settle_more: Duration,
+) -> InterruptRun {
+    use agent::{AgentDomainEvent, AgentProvider, ExternalProvider, ExternalStart, InterruptTurnRequest, Reviewer};
+    use agent::{SendTurnRequest, TurnPolicy};
+    let home = s.dir("home");
+    write_home(&home, model, "");
+    let provider = real_provider(codex, s, &home, project);
+    let thread = provider
+        .start(ExternalStart {
+            cwd: text_of(project).to_string(),
+            plan: plan(project, DirTrust::Untrusted),
+            policy: TurnPolicy {
+                reviewer: Reviewer::User,
+            },
+            resume: None,
+        })
+        .expect("the session starts");
+    provider
+        .send_turn_with(
+            SendTurnRequest {
+                session_id: thread.clone(),
+                text: prompt.to_string(),
+            },
+            TurnPolicy {
+                reviewer: Reviewer::User,
+            },
+        )
+        .expect("the turn starts");
+    let mut events = Vec::new();
+    let until = Instant::now() + TURN_BUDGET;
+    while count_lines(loop_file) < 2 {
+        assert!(Instant::now() < until, "the loop never ran: {events:#?}");
+        events.extend(provider.pump());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pressed = Instant::now();
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: thread.clone(),
+        })
+        .expect("the interrupt is accepted");
+    let mut ended = None;
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        events.extend(provider.pump());
+        if ended.is_none()
+            && events
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+        {
+            ended = Some((pressed.elapsed(), count_lines(loop_file)));
+        }
+        if let Some((after, _)) = ended {
+            if pressed.elapsed() >= after + settle_more {
+                break;
+            }
+        }
+        assert!(Instant::now() < until, "the turn did not end: {events:#?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (turn_ended_after, lines_at_end) = ended.expect("ended");
+    let _ = provider.close_session(agent::CloseSessionRequest { session_id: thread });
+    InterruptRun {
+        events,
+        turn_ended_after,
+        lines_at_end,
+        lines_later: count_lines(loop_file),
+    }
+}
+
+fn session_lost(events: &[agent::AgentDomainEvent]) -> Option<String> {
+    events.iter().find_map(|e| match e {
+        agent::AgentDomainEvent::SessionUnavailable { reason } => Some(reason.clone()),
+        _ => None,
+    })
+}
+
+const STOPPED: &str =
+    "Codex kept running a command after the interrupt; its session was stopped so nothing more runs. \
+                       The conversation can be resumed.";
+
+/// Codex ends an interrupted turn at once but lets the command go on. A tab's turn waits for it; one still
+/// running after the settle time stops the session, and the turn ends only once nothing more writes. A
+/// command that ends within the settle time is waited for and the session goes on.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn an_interrupt_stops_a_command_codex_keeps_running() {
+    let codex = real_codex();
+    // A loop of 40 writes, 10 s in all, interrupted after two: stopped.
+    let s = Scratch::new("int-loop");
+    let model = ScriptedModel::start(vec![Step::exec(
+        "loop1",
+        "sleep 0.5; for i in $(seq 1 40); do echo $i >> loop.txt; sleep 0.25; done",
+        false,
+    )
+    .when_body_has("PROMPT-LOOP")
+    .unless_body_has("\"loop1\"")])
+    .expect("model");
+    let project = s.dir("proj");
+    write_project(&project, "");
+    let run = interrupt_a_loop(
+        &codex,
+        &s,
+        &model,
+        &project,
+        "PROMPT-LOOP",
+        &project.join("loop.txt"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        run.turn_ended_after >= agent::providers::codex::provider::INTERRUPT_SETTLE,
+        "the turn ended {:?} after the key, before the settle time",
+        run.turn_ended_after
+    );
+    assert!(
+        run.lines_at_end < 40,
+        "the loop ran to its end ({} lines)",
+        run.lines_at_end
+    );
+    assert_eq!(
+        run.lines_later, run.lines_at_end,
+        "the command kept writing after the tab's turn ended"
+    );
+    assert_eq!(session_lost(&run.events).as_deref(), Some(STOPPED));
+
+    // A command that ends 1.5 s after the key: waited for, and the session is not stopped.
+    let s = Scratch::new("int-short");
+    let model = ScriptedModel::start(vec![Step::exec(
+        "short1",
+        "sleep 0.5; echo 1 >> loop.txt; echo 2 >> loop.txt; sleep 1.5; echo done >> loop.txt",
+        false,
+    )
+    .when_body_has("PROMPT-SHORT")
+    .unless_body_has("\"short1\"")])
+    .expect("model");
+    let project = s.dir("proj");
+    write_project(&project, "");
+    let run = interrupt_a_loop(
+        &codex,
+        &s,
+        &model,
+        &project,
+        "PROMPT-SHORT",
+        &project.join("loop.txt"),
+        Duration::from_secs(1),
+    );
+    assert_eq!(
+        run.lines_at_end, 3,
+        "the turn ended before the command did ({:?} after the key, {} lines later): {:#?}",
+        run.turn_ended_after, run.lines_later, run.events
+    );
+    assert_eq!(
+        session_lost(&run.events),
+        None,
+        "a command that ended in time stopped the session"
+    );
+}
+
+/// The same for a subagent's command: the parent waits on a child running a loop; the interrupt ends both
+/// turns at once, the child's command goes on, and the session is stopped.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn an_interrupt_stops_a_subagents_command() {
+    let codex = real_codex();
+    let s = Scratch::new("int-child-loop");
+    let for_child = |step: Step| step.when_body_has(CHILD_TASK).unless_body_has(PARENT_PROMPT);
+    let model = ScriptedModel::start(vec![
+        spawn_step("sp1", "child", CHILD_TASK)
+            .when_body_has(PARENT_PROMPT)
+            .unless_body_has("\"sp1\""),
+        Step::call("wa1", Some(COLLAB), "wait_agent", &json!({"timeout_ms": 60000}))
+            .when_body_has("\"sp1\"")
+            .unless_body_has("\"wa1\""),
+        for_child(Step::exec(
+            "cl1",
+            "sleep 0.5; for i in $(seq 1 40); do echo $i >> child-loop.txt; sleep 0.25; done",
+            false,
+        ))
+        .unless_body_has("\"cl1\""),
+    ])
+    .expect("model");
+    let project = s.dir("proj");
+    write_project(&project, "");
+    let run = interrupt_a_loop(
+        &codex,
+        &s,
+        &model,
+        &project,
+        PARENT_PROMPT,
+        &project.join("child-loop.txt"),
+        Duration::from_secs(3),
+    );
+    assert!(run.turn_ended_after >= agent::providers::codex::provider::INTERRUPT_SETTLE);
+    assert!(run.lines_at_end < 40, "the child's loop ran to its end");
+    assert_eq!(
+        run.lines_later, run.lines_at_end,
+        "the child's command kept writing after the tab's turn ended"
+    );
+    assert_eq!(session_lost(&run.events).as_deref(), Some(STOPPED));
+}

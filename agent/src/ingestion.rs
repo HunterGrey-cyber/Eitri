@@ -581,6 +581,16 @@ fn flush_history(state: &Mutex<IngestState>, context: &AdoptionContext) {
     tests::note_history_writer_thread();
     if let Err(e) = crate::history::store::save(&history) {
         eprintln!("agent: could not store the history of session {provider_session_id}: {e}");
+        return;
+    }
+    // The turn changed the conversation, so the record's "last used" moves with it: the session picker
+    // and the launch offer lead with the session used last, not the one opened last.
+    if let Err(e) = crate::persistence::touch_updated_at(
+        &context.conversation_id,
+        &provider_session_id,
+        &crate::conversation::epoch_millis(),
+    ) {
+        eprintln!("agent: could not update the record of session {provider_session_id}: {e}");
     }
 }
 
@@ -729,6 +739,52 @@ pub(crate) mod tests {
         state.lock().unwrap().record_written = true;
         flush_history(&state, &adoption_context(&conversation_id));
         assert!(crate::history::store::load(&conversation_id, "sess-in-the-gap").is_ok());
+    }
+
+    /// A turn that changed the conversation moves the record's `updated_at` and leaves the rest of it
+    /// (the start time, the title, the name) alone; a flush with nothing new does not touch it.
+    #[test]
+    fn a_stored_turn_moves_the_records_updated_at_and_nothing_else() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let conversation_id = uuid::Uuid::new_v4().simple().to_string();
+        crate::persistence::save_conversation_record(&crate::persistence::ConversationRecord {
+            conversation_id: conversation_id.clone(),
+            provider: crate::conversation::PROVIDER_NAME.to_string(),
+            provider_session_id: "sess-used".to_string(),
+            canonical_cwd: "/tmp/ws".to_string(),
+            created_at: "1000".to_string(),
+            updated_at: "1000".to_string(),
+            provider_advertised_resume: true,
+            title: Some("a title".to_string()),
+            name: Some("a name".to_string()),
+        })
+        .unwrap();
+        let mut initial = state();
+        initial.provider_session_id = Some("sess-used".to_string());
+        initial.record_written = true;
+        initial.history_dirty = true;
+        initial
+            .projection
+            .apply(&AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
+        let state = Mutex::new(initial);
+
+        flush_history(&state, &adoption_context(&conversation_id));
+
+        let record = crate::persistence::load_conversation_record(&conversation_id, "sess-used").unwrap();
+        assert_ne!(record.updated_at, "1000", "the turn moved it");
+        assert!(
+            record.updated_at.parse::<u128>().unwrap() > 1_000_000_000_000,
+            "{}",
+            record.updated_at
+        );
+        assert_eq!(record.created_at, "1000");
+        assert_eq!(record.title.as_deref(), Some("a title"));
+        assert_eq!(record.name.as_deref(), Some("a name"));
+
+        let moved = record.updated_at.clone();
+        flush_history(&state, &adoption_context(&conversation_id));
+        let again = crate::persistence::load_conversation_record(&conversation_id, "sess-used").unwrap();
+        assert_eq!(again.updated_at, moved, "nothing new was stored, so nothing moved");
     }
 
     /// A turn boundary marks the history dirty; nothing inside a turn does. The negative half is

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyCallNotes, applyEvent, applySnapshot, keepAfterSidecarStop, initialState, MAX_HELD_DENIALS, resetToStartScreen } from "./reducer";
+import { applyCallNotes, applyEvent, applySnapshot, keepAfterFailure, initialState, MAX_HELD_DENIALS, resetToStartScreen } from "./reducer";
 import type { AgentDomainEvent, AgentUiSnapshot, TurnEndDetail, TurnOutcome, UsageInfo } from "./types";
 /** What Rust really sends for the turn-ending cases; written from its serializer. */
 import fixture from "./fixtures/turn-endings.json";
@@ -162,7 +162,7 @@ describe("applyEvent", () => {
       expect(state.usage).toEqual(usage);
       // The lost-session view also keeps usage after the sidecar stops.
       const said = applyEvent(applyEvent(initialState(), done(usage)), { type: "content_delta", turn_id: "t2", kind: "text", text: "hi" });
-      expect(keepAfterSidecarStop(said, "the sidecar stopped")?.usage).toEqual(usage);
+      expect(keepAfterFailure(said, "the sidecar stopped")?.usage).toEqual(usage);
     });
   });
 
@@ -1016,12 +1016,12 @@ describe("applyCallNotes", () => {
   });
 });
 
-describe("keepAfterSidecarStop", () => {
+describe("keepAfterFailure", () => {
   it("keeps a conversation as lost, without its cards; keeps nothing when nothing was said", () => {
-    expect(keepAfterSidecarStop(initialState(), "gone")).toBeNull();
+    expect(keepAfterFailure(initialState(), "gone")).toBeNull();
     let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
     state = applyEvent(state, { type: "permission_requested", permission_id: "p", tool_use_id: null, tool_name: "Bash", input: {} });
-    const kept = keepAfterSidecarStop(state, "gone")!;
+    const kept = keepAfterFailure(state, "gone")!;
     expect(kept.status).toEqual({ kind: "unavailable", reason: "gone" });
     expect(kept.userPrompts).toEqual(state.userPrompts);
     expect(kept.pendingPermissions).toEqual([]);

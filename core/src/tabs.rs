@@ -352,6 +352,50 @@ pub fn plan(action: TabAction, keys_in: Option<ModuleKind>, terminals: usize) ->
     TabVerbPlan { verb, takes_the_keys }
 }
 
+/// A conversation record's `created_at`/`updated_at` as a person reads it: local time, `2026-10-09 05:12`.
+/// The records keep milliseconds since the epoch as a string; a stamp that is not one (an older record, a
+/// value this build does not know) is shown as it is, never guessed at.
+pub fn record_stamp(raw: &str) -> String {
+    match raw.trim().parse::<u64>() {
+        Ok(ms) => stamp_at(ms, local_offset_secs(ms / 1000)),
+        Err(_) => raw.to_string(),
+    }
+}
+
+/// `ms` since the epoch at `offset_secs` east of UTC, as `YYYY-MM-DD HH:MM`.
+fn stamp_at(ms: u64, offset_secs: i64) -> String {
+    let local = ms as i64 / 1000 + offset_secs;
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    // Civil date from a day count (Howard Hinnant's days-to-civil), valid for every date a record holds.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}", secs / 3600, secs / 60 % 60)
+}
+
+/// The local zone's offset from UTC at `secs` since the epoch, in seconds east; 0 when it cannot be asked.
+fn local_offset_secs(secs: u64) -> i64 {
+    let Ok(secs) = libc::time_t::try_from(secs) else {
+        return 0;
+    };
+    // SAFETY: `localtime_r` writes only into `tm`, which lives for the call; both pointers are valid and
+    // unaliased.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let converted = unsafe { !libc::localtime_r(&secs, &mut tm).is_null() };
+    if converted {
+        i64::from(tm.tm_gmtoff)
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +815,29 @@ mod tests {
             TabVerb::Nothing,
             "swallowed"
         );
+    }
+
+    #[test]
+    fn a_record_stamp_reads_as_local_date_and_time() {
+        // 2026-10-09 05:12:30 UTC.
+        let ms = 1_791_522_750_000;
+        assert_eq!(stamp_at(ms, 0), "2026-10-09 05:12");
+        assert_eq!(stamp_at(ms, 8 * 3600), "2026-10-09 13:12");
+        assert_eq!(
+            stamp_at(ms, -6 * 3600),
+            "2026-10-08 23:12",
+            "a zone west of UTC crosses midnight"
+        );
+        assert_eq!(stamp_at(0, 0), "1970-01-01 00:00");
+        assert_eq!(stamp_at(951_782_400_000, 0), "2000-02-29 00:00", "a leap day");
+    }
+
+    #[test]
+    fn a_record_stamp_that_is_not_milliseconds_is_shown_as_it_is() {
+        assert_eq!(record_stamp("2026-09-10T00:00:00Z"), "2026-09-10T00:00:00Z");
+        assert_eq!(record_stamp(""), "");
+        let shown = record_stamp("1791522750000");
+        assert!(shown.starts_with("2026-10-0"), "{shown}");
+        assert_eq!(shown.len(), "2026-10-09 05:12".len());
     }
 }

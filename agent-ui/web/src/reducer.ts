@@ -442,11 +442,12 @@ function providerPromptFromWire(wire: WireProviderPrompt): ProviderPrompt {
   };
 }
 
-/** Keep the visible conversation after its sidecar stops, with `reason` in the lost-session row.
- *  Return `null` when there is no restored history or conversation content, allowing an empty
- *  session to fail normally. Remove permission cards because the stopped sidecar can no longer
- *  answer them. */
-export function keepAfterSidecarStop(state: AgentUiState, reason: string): AgentUiState | null {
+/** The conversation a tab showed when its session failed under it, kept on screen as a lost
+ *  session (`reason` in the lost-session row) rather than replaced by an empty failed tab. `null`
+ *  when there is nothing to keep -- no restored history and nothing said yet -- so a session that
+ *  never showed anything still fails the ordinary way. The cards go: nothing can answer them any
+ *  more. */
+export function keepAfterFailure(state: AgentUiState, reason: string): AgentUiState | null {
   const said = state.history !== null || state.userPrompts.length > 0 || state.transcript.length > 0 || state.toolCalls.length > 0;
   if (!said) return null;
   return {

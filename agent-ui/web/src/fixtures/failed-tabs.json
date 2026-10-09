@@ -1,0 +1,47 @@
+{
+  "error": {
+    "kind": "error",
+    "message": "the agent reported sandbox dangerFullAccess, Eitri asked for sandbox workspaceWrite; the session was closed",
+    "tab": 1
+  },
+  "neverStartedTab": 2,
+  "tabs": {
+    "active": 1,
+    "defaultMode": "auto",
+    "kind": "tabs",
+    "tabs": [
+      {
+        "agent": "claude",
+        "failedAfterStart": true,
+        "failure": "the agent reported sandbox dangerFullAccess, Eitri asked for sandbox workspaceWrite; the session was closed",
+        "id": 1,
+        "label": "1 new",
+        "marker": "ended",
+        "mode": "auto",
+        "name": null,
+        "number": 1,
+        "pending": 0,
+        "resumable": true,
+        "state": "failed",
+        "title": null
+      },
+      {
+        "agent": "claude",
+        "failedAfterStart": false,
+        "failure": "failed to start session: codex not found",
+        "id": 2,
+        "label": "2 new",
+        "marker": "ended",
+        "mode": "auto",
+        "name": null,
+        "number": 2,
+        "pending": 0,
+        "resumable": true,
+        "state": "failed",
+        "title": null
+      }
+    ]
+  },
+  "trippedTab": 1,
+  "writtenBy": "core/src/tab_set.rs, tests::a_failed_tab_says_whether_its_session_had_been_open_and_the_fixture_records_it -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

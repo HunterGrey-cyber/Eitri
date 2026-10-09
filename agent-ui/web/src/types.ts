@@ -603,6 +603,10 @@ export type TabInfo = {
   /** False on legacy: "not resumable". */
   resumable: boolean;
   failure: string | null;
+  /** True for a `failed` tab whose session had been open (a tripwire, a fatal command): its failure row
+   *  says the session stopped rather than that it did not start (`TabView::failed_after_start`). Rust
+   *  always sends it; absent reads as false. */
+  failedAfterStart?: boolean;
   /** The record's title: the first prompt's title, or a
    *  resumed record's display title. `null` before one exists. Read by the chooser's open-tab rows
    *  once they join a `ChooserTab` to its `TabInfo` here. */

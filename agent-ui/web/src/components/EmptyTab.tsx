@@ -17,6 +17,8 @@ import { Dashboard, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
 import { classify, failureEvidence, remedyNamesR } from "../problems";
+import { agentTitle } from "../externalTools";
+import { isExternalAgent } from "../tabs";
 import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TypingGuard } from "../typingGuard";
 
 /** Below this width the dashboard's where-line cuts the cwd and drops the
@@ -38,6 +40,8 @@ export type EmptyTabProps = {
   handoff: HandoffCommand | null;
   failure: string | null;
   paneFocused: boolean;
+  /** `:` in BROWSE: opens the window's command line (`:tabnew codex` from a fresh window). */
+  onExLine?: () => void;
   focusRequest: number;
   /** Bumped by App's `arrive` handling: lands BROWSE with the
    *  cursor on the dashboard's `New session` item, the same reversal a live tab's arrival gets. */
@@ -567,6 +571,12 @@ export function EmptyTab(props: EmptyTabProps) {
       props.onReset();
       return;
     }
+    if (event.key === ":" && !event.ctrlKey && !event.altKey && !event.metaKey && props.onExLine !== undefined) {
+      // The live conversation opens its command line on a bare `:` in BROWSE, with no typing-guard wait.
+      event.preventDefault();
+      props.onExLine();
+      return;
+    }
     if (event.key === "f") {
       event.preventDefault();
       // Defer `f` for `TYPING_GUARD_MS` so prose starting with that letter cannot open HINT. Fire
@@ -711,7 +721,7 @@ export function EmptyTab(props: EmptyTabProps) {
       {handoff !== null && <HandoffCommandCard handoff={handoff} />}
       {failed && (
         <Row kind="error" sign="✗" role="alert" problem={failureProblem}>
-          <strong>This tab's session did not start.</strong>
+          <strong>{tab.failedAfterStart ? "This tab's session stopped." : "This tab's session did not start."}</strong>
           <pre>{failure === null ? "no reason was given" : failureEvidence(failure)}</pre>
           {/* Omit the retry hint when the remedy already names the same key. */}
           {!remedyNamesR(failureProblem) && <div className="row-hint">Press r to start a new session here.</div>}
@@ -735,7 +745,16 @@ export function EmptyTab(props: EmptyTabProps) {
           `hello !== null` (not just `showDashboard`, which TS cannot narrow through) is what lets
           `Dashboard`'s `hello: Hello` prop take it without a non-null assertion. */}
       {hello !== null && showDashboard && (
-        <Dashboard hello={hello} mode={tab.mode} cursor={dashCursor} narrow={narrow} onItem={runItem} prefix={prefix} editorLink={editorLink} />
+        <Dashboard
+          hello={hello}
+          mode={tab.mode}
+          cursor={dashCursor}
+          narrow={narrow}
+          onItem={runItem}
+          prefix={prefix}
+          editorLink={editorLink}
+          agent={isExternalAgent(tab.agent) ? agentTitle(tab.agent) : null}
+        />
       )}
       <QueueLines items={props.queue ?? []} error={props.queueError ?? null} />
       <Composer

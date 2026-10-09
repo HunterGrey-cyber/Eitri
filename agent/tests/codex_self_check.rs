@@ -187,3 +187,43 @@ fn self_check_fails_when_the_project_is_trusted() {
     );
     assert!(reasons.iter().any(|r| r.contains("instruction file")), "{reasons:?}");
 }
+
+/// A state directory under `/tmp`, where Codex's sandbox always lets commands write: the check puts the files
+/// it must keep commands from writing elsewhere and passes on a Codex that keeps its levers.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn self_check_passes_with_its_state_under_tmp() {
+    let state = PathBuf::from("/tmp").join(format!("eitri-self-check-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    let result = ensure_checked(&real_codex(), &state);
+    let log = std::fs::read_dir(state.join("codex-check"))
+        .ok()
+        .and_then(|mut dirs| dirs.next())
+        .and_then(|d| std::fs::read_to_string(d.ok()?.path().join("check.log")).ok())
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&state);
+    result.unwrap_or_else(|e| panic!("the check failed under /tmp: {e}\n{log}"));
+    assert!(log.contains("always lets commands write"), "{log}");
+}
+
+/// And an escape is still caught there: a trusted fixture project lets its exec-policy rule write outside
+/// the sandbox, and the check fails.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn self_check_under_tmp_still_catches_a_write_outside() {
+    let state = PathBuf::from("/tmp").join(format!("eitri-self-check-tmp-escape-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    let tweaks = CheckTweaks {
+        grant_trust: true,
+        ..CheckTweaks::default()
+    };
+    let err = ensure_checked_tweaked(&real_codex(), &state, &tweaks);
+    let _ = std::fs::remove_dir_all(&state);
+    let SelfCheckError::Failed { reasons, .. } = err.expect_err("a trusted fixture project fails") else {
+        panic!("not a failed check")
+    };
+    assert!(
+        reasons.iter().any(|r| r.contains("the sandbox let a write through")),
+        "{reasons:?}"
+    );
+}

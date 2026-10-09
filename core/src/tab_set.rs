@@ -203,6 +203,15 @@ pub struct Tab {
     pub stale: bool,
     pub turn_trace: Option<crate::turn_trace::TurnTrace>,
     pub reported_start_failure: bool,
+    /// Whether the session had been open when the tab went `Failed`, so the panel words the
+    /// failure as a session that stopped rather than one that never started. Every place that
+    /// swaps in `Failed` sets it; it means nothing while the backend is anything else.
+    pub failed_after_start: bool,
+    /// The saved session this tab was starting or resuming when it went `Failed` (a restored tab whose
+    /// start was refused, a resume by hand that failed), so the saved-tabs file keeps the conversation
+    /// until the tab is closed or started over. Read only while the backend is `Failed`; every place
+    /// that swaps `Failed` in sets it.
+    pub failed_resume: Option<String>,
     pub pending_handoff: Option<PendingHandoff>,
     /// Held per tab here so a panel reload cannot lose the last terminal handoff.
     pub last_handoff: Option<agent::handoff::ClaudeResumeCommand>,
@@ -340,6 +349,8 @@ impl Tab {
             stale: false,
             turn_trace: None,
             reported_start_failure: false,
+            failed_after_start: false,
+            failed_resume: None,
             pending_handoff: None,
             last_handoff: None,
             queue: Vec::new(),
@@ -505,6 +516,7 @@ impl Tab {
                 TabBackend::Failed { reason } => Some(reason.clone()),
                 _ => None,
             },
+            failed_after_start: matches!(self.backend, TabBackend::Failed { .. }) && self.failed_after_start,
             title: self.title.clone(),
             agent: self.agent.record_name(),
         }
@@ -1748,6 +1760,8 @@ impl TabSet {
                 tab.attention.session_ended(on_screen);
                 tab.was_running = false;
                 tab.turn_clock = None;
+                tab.failed_after_start = true;
+                tab.failed_resume = None;
                 let dead = std::mem::replace(&mut tab.backend, TabBackend::Failed { reason: reason.clone() });
                 if let TabBackend::Live(backend) = dead {
                     *self.retiring.entry(tab.id.0).or_insert(0) += 1;
@@ -2129,6 +2143,12 @@ impl TabSet {
                     });
                 }
                 Err(error) => {
+                    tab.failed_after_start = false;
+                    // A refused resume leaves the session in the saved-tabs file, under the name it had.
+                    tab.failed_resume = pending.resume.clone();
+                    if tab.name.is_none() {
+                        tab.name = pending.resumed_name;
+                    }
                     tab.backend = TabBackend::Failed {
                         reason: error.message.clone(),
                     };
@@ -2541,9 +2561,9 @@ impl TabSet {
         let external: Vec<(TabId, SavedExternalTab)> = self
             .tabs
             .iter()
-            .filter(|tab| tab.agent.is_external() && tab.resumable(self.kind))
+            .filter(|tab| tab.agent.is_external() && (tab.resumable(self.kind) || tab.failed_resume.is_some()))
             .filter_map(|tab| {
-                let session = tab.provider_session_id().filter(|id| !id.is_empty())?;
+                let session = self.saved_session_id(tab)?;
                 Some((
                     tab.id,
                     SavedExternalTab {
@@ -2571,7 +2591,7 @@ impl TabSet {
             .iter()
             .filter(|tab| tab.agent == AgentId::Claude)
             .filter_map(|tab| {
-                let session = tab.provider_session_id().filter(|id| !id.is_empty())?;
+                let session = self.saved_session_id(tab)?;
                 Some((
                     tab.id,
                     SavedTab {
@@ -2600,6 +2620,21 @@ impl TabSet {
             external_tabs,
             active_external,
         })
+    }
+
+    /// The session `tab` is saved under: the one it holds, or, for a tab that failed starting a saved
+    /// session, that session, so a refused start does not lose the conversation from the file. Not
+    /// when the same session is open and running in another tab (then that tab is the entry).
+    fn saved_session_id(&self, tab: &Tab) -> Option<String> {
+        if let TabBackend::Failed { .. } = tab.backend {
+            let id = tab.failed_resume.clone().filter(|id| !id.is_empty())?;
+            let open_elsewhere = self
+                .tabs
+                .iter()
+                .any(|other| other.id != tab.id && other.provider_session_id().as_deref() == Some(id.as_str()));
+            return (!open_elsewhere).then_some(id);
+        }
+        tab.provider_session_id().filter(|id| !id.is_empty())
     }
 
     /// The user's own `init.lua` choice of the mode new tabs start in (`agent.default_mode`): the
@@ -7363,6 +7398,88 @@ mod tests {
         shut_down_all(&mut set);
     }
 
+    /// What the page is sent for a tab a tripwire failed, and for one whose start never happened:
+    /// the `error` envelope with the reason, and a `tabs` envelope that says whether the session
+    /// had been open (`failedAfterStart`), so the page can word the two differently and keep the
+    /// conversation of the first. `agent-ui/web/src/fixtures/failed-tabs.json` records both for the
+    /// page's tests. Compared on every run; `EITRI_WRITE_FIXTURES=1` rewrites it.
+    #[test]
+    fn a_failed_tab_says_whether_its_session_had_been_open_and_the_fixture_records_it() {
+        let dir = workspace("tabs-failed-after-start");
+        let mut set = set();
+        let tripped_tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tripped_tab).unwrap().backend = TabBackend::Live(backend);
+        let never_started_tab = set.open(AgentId::Claude);
+        provider.queue(AgentDomainEvent::PolicyMismatch {
+            requested: "sandbox workspaceWrite".into(),
+            reported: "sandbox dangerFullAccess".into(),
+        });
+        let mut tripped = Vec::new();
+        until("the trip", || {
+            tripped.extend(set.pump(&dir, true).tripped);
+            !tripped.is_empty()
+        });
+        let reason = tripped[0].reason.clone();
+        for mut t in tripped {
+            t.backend.shutdown();
+        }
+        {
+            let tab = set.get_mut(never_started_tab).unwrap();
+            tab.failed_after_start = false;
+            tab.backend = TabBackend::Failed {
+                reason: "failed to start session: codex not found".into(),
+            };
+        }
+
+        let tabs_of = |active: TabId, set: &TabSet| -> serde_json::Value {
+            let mut value: serde_json::Value = serde_json::from_str(&set.tabs_payload()).unwrap();
+            value["active"] = serde_json::json!(active.0);
+            value
+        };
+        let tripped_tabs = tabs_of(tripped_tab, &set);
+        let by_id = |id: TabId| {
+            tripped_tabs["tabs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == id.0)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(tripped_tab)["state"], "failed");
+        assert_eq!(by_id(tripped_tab)["failure"], reason.as_str());
+        assert_eq!(by_id(tripped_tab)["failedAfterStart"], true);
+        assert_eq!(by_id(never_started_tab)["state"], "failed");
+        assert_eq!(by_id(never_started_tab)["failedAfterStart"], false);
+
+        let fixture = serde_json::json!({
+            "writtenBy": "core/src/tab_set.rs, tests::a_failed_tab_says_whether_its_session_had_been_open_and_the_fixture_records_it \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "trippedTab": tripped_tab.0,
+            "neverStartedTab": never_started_tab.0,
+            "error": serde_json::from_str::<serde_json::Value>(&crate::agent_bridge::serialize_error_for_js(tripped_tab, &reason)).unwrap(),
+            "tabs": tripped_tabs,
+        });
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/failed-tabs.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() != Some(written.as_str()) {
+            if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+                std::fs::write(&path, &written).expect("write the failed tabs fixture");
+            } else {
+                assert_eq!(
+                    committed.as_deref(),
+                    Some(written.as_str()),
+                    "the committed failed tabs fixture is not what this test produces; if the change is \
+                     intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+                );
+            }
+        }
+        shut_down_all(&mut set);
+    }
+
     /// The report survives a `Resync`: a UI queue that overflowed drops its events, the tripwire
     /// among them, and the projection's record is what still closes the session.
     #[test]
@@ -10094,6 +10211,84 @@ mod external_tab_tests {
                 b.shutdown();
             }
         }
+    }
+
+    /// A restored tab whose start is refused (a relative `CODEX_HOME`, a missing binary) stays on screen
+    /// as a failed tab, and the saved-tabs file keeps its conversation, under its name and mode, until
+    /// the tab is closed; starting it over drops it, as the user chose a fresh session.
+    #[test]
+    fn a_restored_tab_whose_start_fails_stays_in_the_saved_tabs_until_it_is_closed() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let from = set.active();
+        let mut planned_codex = planned(AgentId::Codex, "codex-b", SessionModeChoice::Bypass);
+        planned_codex.name = Some("parser work".into());
+        let plan = RestorePlan {
+            items: vec![planned_codex],
+            skipped: Vec::new(),
+            active_session: Some("codex-b".into()),
+        };
+        let RestoreStep::Confirm(prompt) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("a saved bypass tab is asked about first")
+        };
+        let go = set.answer_restore(prompt.nonce, true).unwrap();
+        set.start_restore(from, go, |_, _| Ok(RestoreConnect::AwaitTrust));
+        let codex = set.tab_with_session("codex-b").expect("the Codex tab came back");
+
+        // Its own agent's trust answer starts it as a resume by hand, and the start is refused.
+        let (tx, result_rx) = mpsc::channel();
+        set.get_mut(codex).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "restore-1".into(),
+            result_rx,
+            first_turn: None,
+            resume: Some("codex-b".into()),
+            resumed_title: None,
+            resumed_name: Some("parser work".into()),
+        });
+        tx.send(Err(BackendError {
+            message: "Codex could not start: CODEX_HOME is relative".into(),
+            benign: false,
+            folded_events: Vec::new(),
+        }))
+        .unwrap();
+        let collected = set.collect_starts();
+        assert!(matches!(collected.as_slice(), [StartCollected::Failed { tab, .. }] if *tab == codex));
+        assert_eq!(set.get(codex).unwrap().wire_state(), TabStateWire::Failed);
+
+        let saved = set.saved_snapshot("conv").unwrap();
+        assert_eq!(saved.external_tabs.len(), 1, "the conversation is still in the file");
+        assert_eq!(saved.external_tabs[0].agent, AgentId::Codex);
+        assert_eq!(saved.external_tabs[0].provider_session_id, "codex-b");
+        assert_eq!(saved.external_tabs[0].name.as_deref(), Some("parser work"));
+        assert_eq!(saved.external_tabs[0].mode, SessionModeChoice::Bypass);
+        assert_eq!(saved.active_external, Some(0));
+
+        // The same session opened in another tab is that tab's entry, not listed twice.
+        let other = set.open(AgentId::Codex);
+        set.get_mut(other).unwrap().backend = TabBackend::AwaitingTrust(AwaitingTrust {
+            start: DeferredStart::Resume {
+                request_id: "r".into(),
+                provider_session_id: "codex-b".into(),
+                resumed_title: None,
+                resumed_name: None,
+            },
+            asking: None,
+            recording: false,
+        });
+        assert_eq!(set.saved_snapshot("conv").unwrap().external_tabs.len(), 1);
+        set.remove(other).unwrap();
+
+        // Starting it over is the user's choice of a fresh session; closing it is the user's choice to let go.
+        let mut again = set.saved_snapshot("conv").unwrap();
+        assert_eq!(again.external_tabs.len(), 1);
+        set.reset(codex).unwrap();
+        again = set.saved_snapshot("conv").unwrap();
+        assert!(again.external_tabs.is_empty(), "a tab started over holds no session");
+
+        set.get_mut(codex).unwrap().backend = TabBackend::Failed { reason: "x".into() };
+        set.get_mut(codex).unwrap().failed_resume = Some("codex-b".into());
+        assert_eq!(set.saved_snapshot("conv").unwrap().external_tabs.len(), 1);
+        set.remove(codex).unwrap();
+        assert!(set.saved_snapshot("conv").unwrap().external_tabs.is_empty());
     }
 
     /// An ACP tab is saved, and comes back, exactly when its agent said it can load a saved session.

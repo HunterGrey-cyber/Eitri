@@ -39,6 +39,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -451,7 +452,8 @@ impl Log {
 
 // ------------------------------------------------------------------------------------ the fixture
 
-/// Where everything of one run lives, all under the run's scratch directory.
+/// Where everything of one run lives: under the run's scratch directory, except the directories the sandbox
+/// must keep commands out of when that directory is one the sandbox always lets them write to.
 struct Layout {
     home: PathBuf,
     probe_home: PathBuf,
@@ -460,6 +462,78 @@ struct Layout {
     extra: PathBuf,
     markers: PathBuf,
     marker_sh: PathBuf,
+    /// Holds `outside` and `extra` when they could not be under the run directory; removed with the layout.
+    _elsewhere: Elsewhere,
+}
+
+/// A directory made for one run outside the state directory, removed when dropped.
+struct Elsewhere(Option<PathBuf>);
+
+impl Drop for Elsewhere {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// The directories a command in Codex's `workspace-write` sandbox may write to whatever the session says:
+/// `/tmp` and the one `TMPDIR` names, which the session leaves writable as Codex's own default does. A
+/// "forbidden" file under one of them proves nothing either way.
+fn always_writable() -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("/tmp")];
+    if let Some(dir) = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+    {
+        roots.push(dir);
+    }
+    roots
+        .into_iter()
+        .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+        .collect()
+}
+
+/// The first of `candidates` (canonical directories) that no always-writable root holds.
+fn outside_base(candidates: &[PathBuf], writable: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|dir| !writable.iter().any(|root| dir.starts_with(root)))
+        .cloned()
+}
+
+/// Where the run's forbidden files go: the run directory itself when the sandbox does not always let
+/// commands write there; else a fresh private directory in the user's runtime or cache directory. With
+/// none of them outside `/tmp` and `TMPDIR` the check cannot tell a held sandbox from a broken one, and it
+/// fails.
+fn forbidden_base(run: &Path) -> Result<(PathBuf, Elsewhere), String> {
+    let writable = always_writable();
+    if outside_base(&[run.to_path_buf()], &writable).is_some() {
+        return Ok((run.to_path_buf(), Elsewhere(None)));
+    }
+    let absolute = |name: &str| std::env::var_os(name).map(PathBuf::from).filter(|d| d.is_absolute());
+    let cache = absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|home| home.join(".cache")));
+    let candidates: Vec<PathBuf> = [absolute("XDG_RUNTIME_DIR"), cache]
+        .into_iter()
+        .flatten()
+        .filter_map(|dir| std::fs::canonicalize(dir).ok())
+        .filter(|dir| dir.is_dir())
+        .collect();
+    let Some(base) = outside_base(&candidates, &writable) else {
+        return Err(format!(
+            "{} is under /tmp or TMPDIR, where Codex's sandbox always lets commands write, and neither \
+             XDG_RUNTIME_DIR nor the cache directory is elsewhere, so the check could not tell whether the \
+             sandbox holds; set XDG_STATE_HOME outside /tmp",
+            run.display()
+        ));
+    };
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = base.join(format!("eitri-codex-check-{}-{stamp}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok((dir.clone(), Elsewhere(Some(dir))))
 }
 
 impl Layout {
@@ -522,14 +596,16 @@ fn write_file(path: &Path, text: &str) -> Result<(), String> {
 
 fn build_layout(run_dir: &Path, tweaks: &CheckTweaks) -> Result<Layout, String> {
     let run = std::fs::canonicalize(run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
+    let (forbidden, elsewhere) = forbidden_base(&run)?;
     let layout = Layout {
         home: run.join("home"),
         probe_home: run.join("probe-home"),
         project: run.join("project"),
-        outside: run.join("outside"),
-        extra: run.join("extra"),
+        outside: forbidden.join("outside"),
+        extra: forbidden.join("extra"),
         markers: run.join("markers"),
         marker_sh: run.join("marker.sh"),
+        _elsewhere: elsewhere,
     };
     for dir in [
         &layout.home,
@@ -897,6 +973,13 @@ fn run_check(
     let deadline = Instant::now() + CHECK_BUDGET;
     let one = |reason: String| vec![reason];
     let layout = build_layout(run_dir, tweaks).map_err(one)?;
+    if let Some(parent) = layout.outside.parent().filter(|p| !p.starts_with(run_dir)) {
+        log.line(format!(
+            "the files the sandbox must keep commands from writing are in {}: the run directory is where Codex's \
+             sandbox always lets commands write",
+            parent.display()
+        ));
+    }
     let model = ScriptedModel::start(script(&layout, tweaks))
         .map_err(|e| one(format!("the scripted model could not start: {e}")))?;
     log.line(format!(
@@ -1198,6 +1281,55 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn forbidden_files_never_go_where_the_sandbox_always_lets_commands_write() {
+        let writable = [PathBuf::from("/tmp"), PathBuf::from("/var/tmp/me")];
+        let pick = |dirs: &[&str]| outside_base(&dirs.iter().map(PathBuf::from).collect::<Vec<_>>(), &writable);
+        assert_eq!(
+            pick(&["/home/u/.local/state/eitri/run"]),
+            Some(PathBuf::from("/home/u/.local/state/eitri/run"))
+        );
+        assert_eq!(
+            pick(&["/tmp/state/run", "/run/user/1000"]),
+            Some(PathBuf::from("/run/user/1000"))
+        );
+        assert_eq!(
+            pick(&["/var/tmp/me/x", "/tmp", "/home/u/.cache"]),
+            Some(PathBuf::from("/home/u/.cache"))
+        );
+        assert_eq!(pick(&["/tmp/a", "/var/tmp/me"]), None);
+        // A sibling whose name only starts the same is not inside the root.
+        assert_eq!(pick(&["/tmpfoo/run"]), Some(PathBuf::from("/tmpfoo/run")));
+    }
+
+    #[test]
+    fn a_run_directory_under_tmp_puts_the_forbidden_files_elsewhere_and_removes_them() {
+        let run = std::env::temp_dir().join(format!("eitri-forbidden-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&run).expect("run dir");
+        let run = std::fs::canonicalize(&run).expect("canonical");
+        let writable = always_writable();
+        assert!(
+            writable.iter().any(|root| run.starts_with(root)),
+            "the temporary directory should be one the sandbox always allows"
+        );
+        match forbidden_base(&run) {
+            Ok((base, elsewhere)) => {
+                assert!(!base.starts_with(&run), "{base:?} is under the run directory");
+                assert!(!writable.iter().any(|root| base.starts_with(root)), "{base:?}");
+                assert!(base.is_dir());
+                assert_eq!(
+                    std::fs::metadata(&base).expect("meta").permissions().mode() & 0o777,
+                    0o700
+                );
+                drop(elsewhere);
+                assert!(!base.exists(), "the directory made for the run is removed with it");
+            }
+            // Only when the runtime and cache directories are under /tmp too; the check then fails.
+            Err(why) => assert!(why.contains("XDG_STATE_HOME"), "{why}"),
+        }
+        let _ = std::fs::remove_dir_all(&run);
+    }
 
     /// A scratch directory that goes away with the test.
     struct Scratch(PathBuf);

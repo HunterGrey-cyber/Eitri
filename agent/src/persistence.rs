@@ -142,10 +142,9 @@ pub struct ResumableSession {
     /// record that still held the true value, making the loss permanent. The doc here claimed
     /// preservation unconditionally the whole time.
     pub created_at: String,
-    /// When this session was last STARTED OR RESUMED -- not when it last had activity. Nothing
-    /// rewrites a record during a conversation, so a session used for an hour and a session opened
-    /// and abandoned carry the same stamp. Anything rendering this must not call it "last active".
-    /// (Setting the title rewrites the record once, and leaves this stamp as it was.)
+    /// When this session was last STARTED, RESUMED or finished a turn (`touch_updated_at`, once per
+    /// stored turn). Not a live activity clock: nothing rewrites the record while a turn streams, and
+    /// setting the title or the name rewrites the record and leaves this stamp as it was.
     pub updated_at: String,
     /// `ConversationRecord::title`. `None` for a session recorded before titles were kept.
     pub title: Option<String>,
@@ -491,7 +490,8 @@ pub(crate) fn existing_record(conversation_id: &str, provider_session_id: &str) 
 /// no directory record exists or a title is already set; the first title wins.
 /// The ingestion thread calls this through `ingestion::flush_title` only after the
 /// record is on disk, since calling earlier can lose the title to `Ok(false)`.
-/// `updated_at` is unchanged: it means "last started or resumed", and titling is neither.
+/// `updated_at` is unchanged: it means "last started, resumed or finished a turn";
+/// titling is none of those.
 pub(crate) fn set_title_if_missing(
     conversation_id: &str,
     provider_session_id: &str,
@@ -504,6 +504,19 @@ pub(crate) fn set_title_if_missing(
         return Ok(false);
     }
     record.title = Some(title.to_string());
+    save_conversation_record(&record)?;
+    Ok(true)
+}
+
+/// Moves this session's directory record's `updated_at` to `stamp`: the conversation just changed (a turn
+/// ended), so the record's "last used" follows it. Everything else in the record stays as it was.
+/// `Ok(false)` when there is no directory record. Called only from the ingestion thread, right after the
+/// turn's history was stored (`ingestion::flush_history`), which already knows the record is on disk.
+pub(crate) fn touch_updated_at(conversation_id: &str, provider_session_id: &str, stamp: &str) -> std::io::Result<bool> {
+    let Ok(mut record) = load_conversation_record(conversation_id, provider_session_id) else {
+        return Ok(false);
+    };
+    record.updated_at = stamp.to_string();
     save_conversation_record(&record)?;
     Ok(true)
 }
@@ -730,9 +743,9 @@ mod tests {
     /// the second save clobbered the first and the offer became whichever save happened last, which
     /// is the opposite answer.
     ///
-    /// `updated_at` means "when this session was last started or resumed", not "when it last had
-    /// activity": `conversation::persist_record` runs on first adoption and on resume, and nothing
-    /// refreshes it during a conversation.
+    /// `updated_at` means "when this session was last started, resumed or finished a turn", not "when it
+    /// last had activity": `conversation::persist_record` runs on first adoption and on resume, and
+    /// `touch_updated_at` once per stored turn.
     #[test]
     fn a_workspace_with_two_sessions_offers_the_one_with_the_greatest_updated_at() {
         let conv = unique_conversation_id("multi");

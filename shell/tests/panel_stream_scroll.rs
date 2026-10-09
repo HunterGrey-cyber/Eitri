@@ -2658,6 +2658,7 @@ fn sole_tab_envelope(sole_tab: eitri_core::tabs::TabId) -> String {
         pending: 0,
         resumable: false,
         failure: None,
+        failed_after_start: false,
         title: None,
         agent: "claude".into(),
     }];

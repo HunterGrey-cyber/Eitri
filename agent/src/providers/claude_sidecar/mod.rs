@@ -161,6 +161,7 @@ fn info_from_handshake(
         event_buffer_policy: response.event_buffer_policy.clone(),
         build_description,
         startup_diagnostics,
+        configuration_home: None,
     }
 }
 

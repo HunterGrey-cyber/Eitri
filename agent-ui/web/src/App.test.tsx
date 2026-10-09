@@ -7429,25 +7429,37 @@ describe("App: a live session's ending classified", () => {
 });
 
 describe("App fatal errors", () => {
-  it("shows the whole error text on the empty tab, with the dead session's transcript gone", () => {
-    // `errorBanner` (`.fatal-error`) is deliberately kept out of the empty-tab render (Step 12): a
-    // failed tab shows its own reason inline instead, which is what this now asserts on.
+  it("keeps what the dead session showed, with the whole error text in the lost-session row", () => {
+    // `errorBanner` (`.fatal-error`) is deliberately kept out of the empty-tab render (Step 12), and a kept
+    // conversation says the reason in its own row, so the banner would say it twice.
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState({ transcript: [{ seq: 0, text: "gone" }] }), 0);
     dispatch({ kind: "error", tab: 1, message: "sidecar handshake failed\nclaude CLI 2.1.272 is untested" });
-    // A fatal command marks the tab Failed. The `tabs` envelope carrying that state returns the render
-    // to the empty tab; the `error` alone does not.
     dispatch({
       kind: "tabs",
       active: 1,
       tabs: [{ ...LIVE_TAB, state: "failed", failure: "sidecar handshake failed\nclaude CLI 2.1.272 is untested" }],
     });
     expect(container.querySelector(".fatal-error")).toBeNull();
-    const failedRow = container.querySelector(".empty-tab .row-error")!;
-    expect(failedRow.textContent).toContain("claude CLI 2.1.272 is untested");
-    // The dead session's transcript is gone with it, rather than left on screen looking live.
-    expect(container.textContent).not.toContain("gone");
+    expect(container.querySelector(".empty-tab")).toBeNull();
+    expect(container.textContent).toContain("gone");
+    expect(container.textContent).toContain("This session was lost.");
+    expect(container.textContent).toContain("claude CLI 2.1.272 is untested");
+  });
+
+  it("shows the whole error text on the empty tab when nothing had been shown", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    dispatch({ kind: "error", tab: 1, message: "sidecar handshake failed\nclaude CLI 2.1.272 is untested" });
+    dispatch({
+      kind: "tabs",
+      active: 1,
+      tabs: [{ ...LIVE_TAB, state: "failed", failure: "sidecar handshake failed\nclaude CLI 2.1.272 is untested" }],
+    });
+    expect(container.querySelector(".fatal-error")).toBeNull();
+    expect(container.querySelector(".empty-tab .row-error")!.textContent).toContain("claude CLI 2.1.272 is untested");
   });
 
   // "asks for a fresh hello when a fatal error drops it back to the start screen" and "re-asks once
@@ -12028,8 +12040,8 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
   it("a restarted tab does not keep the old session's \"agent session ended\" notice over the new conversation", () => {
     const { container } = startedOnPromptRow();
     dispatch({ kind: "error", tab: 1, message: "failed to connect to the Verdandi sidecar: did not bind" });
-    expect(container.querySelector(".fatal-error")).not.toBeNull();
     dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: "did not bind" }] });
+    expect(container.textContent).toContain("This session was lost.");
     dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
     dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ userPrompts: [{ seq: 1, text: "a brand new conversation" }] }) });
     expect(container.textContent).toContain("a brand new conversation");
@@ -13914,15 +13926,15 @@ describe("#28: prefix : opens the panel's command line", () => {
     expect(document.activeElement).toBe(line(container));
   });
 
-  it("on the empty tab there is no line to open: it says so and the keys stay where they were", () => {
+  it("on the empty tab it opens the line too, with the keys in it", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
     dispatch({ kind: "pane_focus", focused: true });
     act(() => widen(container));
     dispatch({ kind: "open_command_line" });
-    expect(line(container)).toBeNull();
-    expect(band(container)).toBe("no command line on this screen — ? lists this panel's keys");
+    expect(line(container)).not.toBeNull();
+    expect(document.activeElement).toBe(line(container));
     expect(sent()).toEqual([]);
   });
 
