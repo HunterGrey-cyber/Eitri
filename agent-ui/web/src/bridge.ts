@@ -300,8 +300,10 @@ type InboundHandler = (
     /** This tab's queue and the refusal reason if its last flush was refused. */
     | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null }
     /** Rust's mirror of the composer's own text, sent only on a switch, `ready`,
-     *  a reset or a scratch-editor return -- never while the user is typing. */
-    | { kind: "draft"; tab: TabId; text: string }
+     *  a reset or a scratch-editor return -- never while the user is typing. `refused` names the send
+     *  whose refusal this follows (a first message the trust question put off), which the page has put
+     *  back into the box itself. */
+    | { kind: "draft"; tab: TabId; text: string; refused?: string }
     /** Reply to `take_back_queue`: the queue's texts, for the panel to merge into
      *  the box itself. */
     | { kind: "queue_taken"; tab: TabId; texts: string[] }

@@ -2118,6 +2118,13 @@ pub fn serialize_draft_for_js(tab: crate::tabs::TabId, text: &str) -> String {
     json!({ "kind": "draft", "tab": tab.0, "text": text }).to_string()
 }
 
+/// Rust's copy of the box right after it refused the send `refused` (a request id) and the page put the
+/// message back itself: the page already holds the message and what was typed after it, and this copy may
+/// trail that, so the page skips it. Every other `draft` is applied.
+pub fn serialize_refused_draft_for_js(tab: crate::tabs::TabId, text: &str, refused: &str) -> String {
+    json!({ "kind": "draft", "tab": tab.0, "text": text, "refused": refused }).to_string()
+}
+
 /// The reply to `take_back_queue`: the whole queue, oldest first.
 pub fn serialize_queue_taken_for_js(tab: crate::tabs::TabId, texts: &[String]) -> String {
     json!({ "kind": "queue_taken", "tab": tab.0, "texts": texts }).to_string()

@@ -894,11 +894,11 @@ export default function App() {
   /** The composer's text reaches Rust 300ms after its last change and immediately when the tab
    *  stops being active. `pendingDraftRef` holds the unsent text and its tab. */
   const pendingDraftRef = useRef<{ tab: TabId; text: string } | null>(null);
-  /** A refused send this page has put back into the box itself (`tab`, the message `text`, and when). The refusal
-   *  of a first message put off by the trust question is followed by Rust's `draft`, its copy of the box with the
-   *  message in front; that echo must not replace a box that already holds the message and what was typed after
-   *  it. Forgotten once the mirror it goes with is delivered. */
-  const refusedEchoRef = useRef<{ tab: TabId; text: string; at: number } | null>(null);
+  /** A refused send this page has put back into the box itself (`tab`, its `requestId`, and when). The refusal
+   *  of a first message put off by the trust question is followed by Rust's `draft` naming that send
+   *  (`refused`), its copy of the box with the message in front; that echo must not replace a box that already
+   *  holds the message and what was typed after it. Forgotten once the mirror it goes with is delivered. */
+  const refusedEchoRef = useRef<{ tab: TabId; requestId: string; at: number } | null>(null);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   function flushDraft() {
     refusedEchoRef.current = null;
@@ -908,14 +908,18 @@ export default function App() {
     pendingDraftRef.current = null;
     if (pending !== null) postToRust({ type: "draft", request_id: nextRequestId(), tab: pending.tab, text: pending.text });
   }
-  /** Whether `text` is the echo of the refusal just recorded for `tab`: it starts with the refused message and
-   *  comes straight after it. Taken once; an echo that never comes expires (`REFUSED_ECHO_MS`, or when the
-   *  mirror it follows goes out). */
-  function takeRefusedEcho(tab: TabId, text: string): boolean {
+  /** Whether a `draft` for `tab` is the echo of the refusal just recorded: Rust names the refused send in it
+   *  (`refused`), which only the trust question's put-off does. Taken once; an echo that never comes expires
+   *  (`REFUSED_ECHO_MS`, or when the mirror it follows goes out). */
+  function takeRefusedEcho(tab: TabId, refused: string | undefined): boolean {
     const echo = refusedEchoRef.current;
     refusedEchoRef.current = null;
     return (
-      echo !== null && echo.tab === tab && performance.now() - echo.at < REFUSED_ECHO_MS && text.startsWith(echo.text)
+      echo !== null &&
+      refused !== undefined &&
+      echo.tab === tab &&
+      echo.requestId === refused &&
+      performance.now() - echo.at < REFUSED_ECHO_MS
     );
   }
   function mirrorDraft(text: string) {
@@ -2960,8 +2964,7 @@ export default function App() {
               restoreSeq.current += 1;
               setRestoredDraft({ text: recovered, seq: restoreSeq.current });
               mirrorDraft(recovered);
-              refusedEchoRef.current =
-                (record.text ?? "") === "" ? null : { tab: record.tab, text: record.text ?? "", at: performance.now() };
+              refusedEchoRef.current = { tab: record.tab, requestId: payload.requestId, at: performance.now() };
               setCommandNotice(`That message was not sent (${payload.error}). It is back in the box.`);
             } else {
               // The tab this was sent from is no longer the active one (the user switched away
@@ -3169,7 +3172,7 @@ export default function App() {
       } else if (payload.kind === "queue") {
         setQueue(payload.items);
         setQueueError(payload.error);
-      } else if (payload.kind === "draft" && takeRefusedEcho(payload.tab, payload.text)) {
+      } else if (payload.kind === "draft" && takeRefusedEcho(payload.tab, payload.refused)) {
         // The echo of a refused send this page put back itself: Rust's copy of the box can trail what was typed
         // since, and the box already holds the message and everything typed after it. Nothing to apply.
       } else if (payload.kind === "draft") {

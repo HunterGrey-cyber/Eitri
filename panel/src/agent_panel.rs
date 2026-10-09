@@ -2590,7 +2590,7 @@ fn answer_restore_question(state: &mut AgentPanelState, nonce: u64, keep_bypass:
 /// no lease while it waits: those are taken when it starts, so a question left unanswered blocks no
 /// other window.
 fn gate_restore(state: &mut AgentPanelState, from: TabId, mut go: RestoreGo) -> RestoreResult {
-    // Still held by the window (a dashboard restore): a put-off leaves it on offer, the file untouched.
+    // Still held by the window (a dashboard restore): put off while the window saves nothing else, it stays on offer.
     go.reoffer = state.restore_source.is_some();
     match gate_start(state, from, DeferredStart::Restore { go }) {
         Ok(()) => RestoreResult::Deferred,
@@ -3058,7 +3058,9 @@ fn put_off_start(state: &mut AgentPanelState, tab: TabId, start: DeferredStart, 
             out.toast = Some(why.to_string());
         }
         DeferredStart::Restore { go } => {
-            state.tabs.keep_put_off_restore(tab, go, why);
+            if !state.tabs.keep_put_off_restore(tab, go, why) {
+                state.restore_source = None;
+            }
             out.payloads.extend(switch_payloads(state));
             out.toast = Some(why.to_string());
         }
@@ -3086,7 +3088,9 @@ fn return_first_message(
     };
     state.tabs.set_draft(tab, &draft);
     out.push(serialize_command_result_for_js(sent, Err(why)));
-    out.push(eitri_core::agent_bridge::serialize_draft_for_js(tab, &draft));
+    out.push(eitri_core::agent_bridge::serialize_refused_draft_for_js(
+        tab, &draft, sent,
+    ));
 }
 
 /// A tab waiting for the trust question, given what the gate knows now: started if the answer is
@@ -3380,7 +3384,9 @@ fn cancel_trust_question(state: &mut AgentPanelState, request_id: &str, tab: Tab
             out.toast = Some(PUT_OFF.to_string());
         }
         DeferredStart::Restore { go } => {
-            state.tabs.keep_put_off_restore(tab, go, PUT_OFF);
+            if !state.tabs.keep_put_off_restore(tab, go, PUT_OFF) {
+                state.restore_source = None;
+            }
             out.payloads.extend(switch_payloads(state));
             out.toast = Some(PUT_OFF.to_string());
         }
@@ -3393,6 +3399,10 @@ fn cancel_trust_question(state: &mut AgentPanelState, request_id: &str, tab: Tab
 fn remember_tabs(state: &Rc<RefCell<AgentPanelState>>) {
     let mut state_ref = state.borrow_mut();
     let state_ref = &mut *state_ref;
+    // A dashboard restore still waiting is listed from the first write that would otherwise leave it out.
+    if state_ref.tabs.settle_waiting_restore() {
+        state_ref.restore_source = None;
+    }
     let snapshot = state_ref.tabs.saved_snapshot(&state_ref.conversation_id);
     match state_ref.tab_memory.observe(snapshot) {
         Some(Err(e)) => eprintln!("[tabs] could not save the open tabs: {e}"),
@@ -10390,22 +10400,26 @@ mod tests {
             Some(RestoreResult::Deferred)
         ));
         let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
-        let sessions = |state: &Rc<RefCell<AgentPanelState>>| -> Vec<(String, Option<String>)> {
-            let saved = state.borrow().tabs.saved_snapshot("conv").unwrap();
-            saved
-                .tabs
-                .into_iter()
-                .map(|t| (t.provider_session_id, t.name))
-                .collect()
-        };
+        let files = agent::state_dirs::test_workspace_dir("trust-restore-escape-files");
+        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
         let both = vec![("s-1".to_string(), Some("api".to_string())), ("s-2".to_string(), None)];
-        assert_eq!(sessions(&state), both, "kept while the question waits");
+        remember_tabs(&state);
+        assert_eq!(saved_file_sessions(&files, &dir), both, "kept while the question waits");
 
         let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         assert_eq!(out.toast.as_deref(), Some(crate::trust_gate::PUT_OFF));
         assert!(resumes.asked.is_empty(), "nothing was resumed");
-        assert_eq!(sessions(&state), both, "kept after it is put off");
+        // A session started afterwards is written beside them, not over them.
+        let (other, _provider) = start_session_in_new_tab(&state, &dir, "s-new");
+        remember_tabs(&state);
+        let mut with_new = both.clone();
+        with_new.push(("s-new".to_string(), None));
+        assert_eq!(saved_file_sessions(&files, &dir), with_new, "kept after it is put off");
+        let mut closed = state.borrow_mut().tabs.remove(other).unwrap();
+        if let TabBackend::Live(backend) = &mut closed.backend {
+            backend.shutdown();
+        }
         let s = state.borrow();
         let failed: Vec<_> = s
             .tabs
@@ -10429,6 +10443,8 @@ mod tests {
         );
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-escape-files");
+        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
         state.borrow_mut().document_ready = true;
         let from = state.borrow().tabs.active();
         let mut resumes = FakeResumes::default();
@@ -10438,16 +10454,205 @@ mod tests {
             "no bypass tab, so no question"
         );
         let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        remember_tabs(&state);
         assert!(
-            state.borrow().tabs.saved_snapshot("conv").unwrap().tabs.is_empty(),
-            "the file is not rewritten while it waits"
+            std::fs::read_dir(&files).unwrap().next().is_none(),
+            "the file is not written while it waits with nothing else to save"
         );
         let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
+        remember_tabs(&state);
+        assert!(std::fs::read_dir(&files).unwrap().next().is_none(), "nor after");
         let s = state.borrow();
         assert!(s.tabs.is_pristine(), "the tab is empty again");
         assert!(restore_is_on_offer(&s), "the same key can ask again");
-        assert!(s.tabs.saved_snapshot("conv").unwrap().tabs.is_empty());
+    }
+
+    /// The saved file as the window last wrote it: each Claude session with its name.
+    fn saved_file_sessions(files: &std::path::Path, dir: &std::path::Path) -> Vec<(String, Option<String>)> {
+        match eitri_core::saved_tabs::load(files, dir) {
+            eitri_core::saved_tabs::Loaded::Saved(saved) => saved
+                .tabs
+                .into_iter()
+                .map(|t| (t.provider_session_id, t.name))
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Starts a session in a new tab of the window, as a typed first message would, and waits for its id.
+    /// The tab on screen stays on screen.
+    fn start_session_in_new_tab(
+        state: &Rc<RefCell<AgentPanelState>>,
+        dir: &std::path::Path,
+        session: &str,
+    ) -> (TabId, std::sync::Arc<RecordingProvider>) {
+        let back = state.borrow().tabs.active();
+        let tab = state.borrow_mut().tabs.open(AgentId::Claude);
+        state.borrow_mut().tabs.select(back);
+        let (provider, backend) = live_backend(dir);
+        state.borrow_mut().tabs.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.open_session(session, dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.borrow().tabs.get(tab).unwrap().provider_session_id().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the session id never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (tab, provider)
+    }
+
+    /// A dashboard restore waits for the trust question while another tab starts a session: the file
+    /// the window then writes keeps the waiting sessions, also once that other tab is closed again, and
+    /// put off with `Escape` they come back as failed tabs instead of being left out of every tab.
+    #[test]
+    fn a_waiting_dashboard_restore_stays_in_the_file_when_another_tab_starts_a_session() {
+        let (state, dir) = restore_panel(
+            "trust-restore-dashboard-other",
+            &[("s-1", Some("api"), Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-other-files");
+        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().document_ready = true;
+        let from = state.borrow().tabs.active();
+        let mut resumes = FakeResumes::default();
+        assert!(matches!(
+            ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard),
+            RestoreResult::Deferred
+        ));
+        let _ = with_resumes(&state, &mut resumes, || next_prompt(&state));
+
+        let (other, _provider) = start_session_in_new_tab(&state, &dir, "s-new");
+        remember_tabs(&state);
+        let waiting = vec![("s-1".to_string(), Some("api".to_string())), ("s-2".to_string(), None)];
+        let mut all = vec![("s-new".to_string(), None)];
+        all.extend(waiting.clone());
+        assert_eq!(
+            saved_file_sessions(&files, &dir),
+            all,
+            "written with the waiting sessions"
+        );
+        assert!(state.borrow().restore_source.is_none(), "the offer is spent");
+
+        // Closing the other tab again does not take the waiting sessions back out of the file.
+        let mut closed = state.borrow_mut().tabs.remove(other).unwrap();
+        if let TabBackend::Live(backend) = &mut closed.backend {
+            backend.shutdown();
+        }
+        remember_tabs(&state);
+        assert_eq!(
+            saved_file_sessions(&files, &dir),
+            waiting,
+            "still listed while they wait"
+        );
+
+        let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
+        assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
+        assert!(resumes.asked.is_empty(), "nothing was resumed");
+        remember_tabs(&state);
+        assert_eq!(saved_file_sessions(&files, &dir), waiting, "kept after it is put off");
+        let s = state.borrow();
+        let failed: Vec<_> = s
+            .tabs
+            .tabs()
+            .iter()
+            .filter(|t| matches!(&t.backend, TabBackend::Failed { reason } if reason == crate::trust_gate::PUT_OFF))
+            .map(|t| t.failed_resume.clone())
+            .collect();
+        assert_eq!(failed, [Some("s-1".to_string()), Some("s-2".to_string())]);
+    }
+
+    /// A put-off while another tab's session is still starting (no id yet, so nothing of it is saved)
+    /// keeps the sessions as failed tabs: that tab writes the file once its id arrives, and the offer
+    /// could not be shown again beside it.
+    #[test]
+    fn a_dashboard_restore_put_off_beside_a_starting_session_keeps_its_sessions() {
+        let (state, dir) = restore_panel(
+            "trust-restore-dashboard-starting",
+            &[("s-1", None, Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-starting-files");
+        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().document_ready = true;
+        let from = state.borrow().tabs.active();
+        let mut resumes = FakeResumes::default();
+        assert!(matches!(
+            ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard),
+            RestoreResult::Deferred
+        ));
+        let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        // Another tab starts a session whose id has not arrived.
+        let other = state.borrow_mut().tabs.open(AgentId::Claude);
+        state.borrow_mut().tabs.select(from);
+        let (provider, backend) = live_backend(&dir);
+        state.borrow_mut().tabs.get_mut(other).unwrap().backend = TabBackend::Live(backend);
+        let nonce = state.borrow_mut().tabs.ask_trust(from).unwrap();
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, nonce);
+        assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
+        assert!(state.borrow().restore_source.is_none(), "no longer on offer");
+        remember_tabs(&state);
+
+        provider.open_session("s-new", &dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.borrow().tabs.get(other).unwrap().provider_session_id().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the session id never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        remember_tabs(&state);
+        let ids: Vec<String> = saved_file_sessions(&files, &dir)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, ["s-1", "s-new", "s-2"]);
+        let mut closed = state.borrow_mut().tabs.remove(other).unwrap();
+        if let TabBackend::Live(backend) = &mut closed.backend {
+            backend.shutdown();
+        }
+    }
+
+    /// A put-off that comes before the tick has written anything (the other session started in the same
+    /// tick) still keeps the sessions, since the file is about to be written without them.
+    #[test]
+    fn a_dashboard_restore_put_off_beside_another_session_keeps_its_sessions() {
+        let (state, dir) = restore_panel(
+            "trust-restore-dashboard-same-tick",
+            &[("s-1", None, Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-same-tick-files");
+        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().document_ready = true;
+        let from = state.borrow().tabs.active();
+        let mut resumes = FakeResumes::default();
+        assert!(matches!(
+            ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard),
+            RestoreResult::Deferred
+        ));
+        let _ = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        let (other, _provider) = start_session_in_new_tab(&state, &dir, "s-new");
+        // Asked again with no tick between (a tick would write the file first).
+        let nonce = state.borrow_mut().tabs.ask_trust(from).unwrap();
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", from, nonce);
+        assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
+        assert!(state.borrow().restore_source.is_none(), "no longer on offer");
+        remember_tabs(&state);
+        let ids: Vec<String> = saved_file_sessions(&files, &dir)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, ["s-1", "s-new", "s-2"], "the first in the tab it waited in");
+        let mut closed = state.borrow_mut().tabs.remove(other).unwrap();
+        if let TabBackend::Live(backend) = &mut closed.backend {
+            backend.shutdown();
+        }
     }
 
     /// A session of a waiting restore that a failed tab already holds (a resume by hand that failed) is
@@ -10911,6 +11116,10 @@ mod tests {
             .collect();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0]["text"], "hello\nand more");
+        assert_eq!(
+            drafts[0]["refused"], "r1",
+            "it names the refusal it follows, so the page can skip it"
+        );
         assert_eq!(state.borrow().tabs.get(tab).unwrap().draft, "hello\nand more");
     }
 
@@ -10944,6 +11153,7 @@ mod tests {
             .collect();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0]["text"], "hello");
+        assert_eq!(drafts[0]["refused"], "r1");
         let s = state.borrow();
         let t = s.tabs.get(tab).unwrap();
         assert!(matches!(t.backend, TabBackend::NotStarted));

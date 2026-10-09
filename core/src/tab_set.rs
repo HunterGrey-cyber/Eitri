@@ -704,9 +704,10 @@ pub struct RestoreGo {
     pub downgraded: usize,
     /// Whether the user was asked (a quiet downgrade says so afterwards; an answered `n` need not).
     pub asked: bool,
-    /// The saved tabs are still on offer (a restore asked for from the dashboard leaves them so): a restore
-    /// put off then leaves its tab empty and the offer standing, and the saved file untouched, instead of
-    /// keeping its sessions as failed tabs.
+    /// The saved tabs are still on offer (a restore asked for from the dashboard leaves them so): while the
+    /// window has nothing else to save, a restore put off leaves its tab empty and the offer standing, and
+    /// the saved file untouched, instead of keeping its sessions as failed tabs. It ends for good once
+    /// another tab has something to save ([`TabSet::settle_waiting_restore`]).
     pub reoffer: bool,
 }
 
@@ -2648,7 +2649,9 @@ impl TabSet {
         let waiting_active = self.waiting_restore_active();
         let mut external_tabs: Vec<SavedExternalTab> = external.into_iter().map(|(_, saved)| saved).collect();
         // A restore waiting for the trust question has no tab for its sessions yet; they stay in the
-        // file meanwhile, so a session started in another tab does not write over them.
+        // file meanwhile, so a session started in another tab does not write over them. A dashboard
+        // restore's are left out only while the window has nothing else to save: then nothing is written
+        // and the file still holds them (`settle_waiting_restore`).
         let waiting = self.waiting_restore_tabs();
         for granted in waiting.iter().filter(|g| g.planned.agent.is_external()) {
             if active_external.is_none() && waiting_active == Some(granted.planned.provider_session_id.as_str()) {
@@ -2769,6 +2772,40 @@ impl TabSet {
                     })
             })
             .collect()
+    }
+
+    /// Whether the window has anything to save besides a dashboard restore that is waiting for the trust
+    /// question: a write of the file would then leave that restore's sessions out.
+    fn saves_more_than_the_offer(&self) -> bool {
+        self.saved_snapshot("")
+            .is_some_and(|saved| !saved.tabs.is_empty() || !saved.external_tabs.is_empty())
+    }
+
+    /// A dashboard restore waiting for the trust question stops being on offer once another tab has
+    /// something to save: from then on its sessions are listed in the file like a launch restore's, and a
+    /// put-off keeps them as failed tabs. Call it before each write of the file, so no write leaves
+    /// them out; it is for good, as a later close of that other tab must not drop them again. Returns
+    /// whether the offer ended now (its source is spent).
+    pub fn settle_waiting_restore(&mut self) -> bool {
+        let waiting_offer = self.tabs.iter().any(|tab| {
+            matches!(&tab.backend, TabBackend::AwaitingTrust(AwaitingTrust {
+                start: DeferredStart::Restore { go },
+                ..
+            }) if go.reoffer)
+        });
+        if !waiting_offer || !self.saves_more_than_the_offer() {
+            return false;
+        }
+        for tab in &mut self.tabs {
+            if let TabBackend::AwaitingTrust(AwaitingTrust {
+                start: DeferredStart::Restore { go },
+                ..
+            }) = &mut tab.backend
+            {
+                go.reoffer = false;
+            }
+        }
+        true
     }
 
     /// The session the waiting restore would put on screen, if it names one.
@@ -2950,10 +2987,15 @@ impl TabSet {
     /// and the rest in new tabs, so the saved-tabs file keeps them until the user closes a tab or
     /// starts it over with `r`. Without this the restore's sessions would be in no tab and the next
     /// write of the file would leave them out. A session already open in a tab is not listed twice.
-    pub fn keep_put_off_restore(&mut self, from: TabId, go: RestoreGo, reason: &str) {
-        if go.reoffer {
-            // The saved tabs are still on offer and the file was never touched: the tab is empty again.
-            return;
+    ///
+    /// A dashboard restore (`RestoreGo::reoffer`) is the exception when the window is otherwise empty
+    /// (its tab already is): the file was never written, so the tab is only emptied and the offer stands,
+    /// shown again by the dashboard. A tab whose session is still starting has nothing saved yet but will
+    /// write the file once its id arrives, so it counts. Returns whether the offer stands; when not, the
+    /// saved tabs are no longer on offer.
+    pub fn keep_put_off_restore(&mut self, from: TabId, go: RestoreGo, reason: &str) -> bool {
+        if go.reoffer && self.is_pristine() {
+            return true;
         }
         let mut kept: Vec<(String, TabId)> = Vec::new();
         for granted in go.tabs {
@@ -2987,6 +3029,7 @@ impl TabSet {
         if let Some(tab) = on_screen {
             self.select(tab);
         }
+        false
     }
 
     /// A restored tab whose resume failed. `back_to` is [`RestoreRun::back_to`]: an empty tab again, in

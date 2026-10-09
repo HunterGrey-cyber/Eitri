@@ -6,6 +6,7 @@ import { applyEvent, initialState } from "./reducer";
 import { RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT } from "./follow";
 import type { AgentDomainEvent, AgentUiState, Hello, ProviderInfo, UsageInfo } from "./types";
 import { WHICH_KEY_DELAY_MS } from "./leader";
+import { REFUSED_ECHO_MS } from "./tabs";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
 // A namespace import lets the test spy on the real `isPlainAnswerKey` export and check that the
@@ -7259,9 +7260,11 @@ describe("App refused commands", () => {
   });
 
   /* A first message put off by the trust question is refused and followed by a `draft` that holds Rust's copy
-     of the box: the message with whatever Rust had mirrored after it. That copy trails typing by the mirror's
-     delay, so the page, which has already put the message back in front of what is in the box, keeps its box
-     and does not apply the echo of its own refusal. A draft Rust sends on its own still replaces the box. */
+     of the box: the message with whatever Rust had mirrored after it, naming the refused send (`refused`). That
+     copy trails typing by the mirror's delay, so the page, which has already put the message back in front of
+     what is in the box, keeps its box and does not apply the echo of its own refusal. A draft Rust sends on its
+     own still replaces the box. Here Rust's copy is longer than the box (text deleted after it was mirrored),
+     so no rule about prefixes of the box could tell it apart: only the refusal it names does. */
   it("keeps text typed since a refused send when Rust's draft echo of it trails the box", () => {
     vi.useFakeTimers();
     try {
@@ -7271,13 +7274,66 @@ describe("App refused commands", () => {
       fireEvent.keyDown(box, { key: "Enter" });
       const requestId = lastOfType("send_message")!.request_id;
       fireEvent.change(box, { target: { value: "second unsent draft" } });
-      dispatch({ kind: "command_result", requestId, ok: false, error: "not started" });
-      // Rust's copy trails the box: the stale start of what was typed, and then an edit in place.
-      dispatch({ kind: "draft", tab: 1, text: "first prompt\nsecond" });
-      expect(box.value).toBe("first prompt\nsecond unsent draft");
       act(() => vi.advanceTimersByTime(300));
-      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "first prompt\nsecond unsent draft" });
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "second unsent draft" });
+      fireEvent.change(box, { target: { value: "second unsent" } });
+      dispatch({ kind: "command_result", requestId, ok: false, error: "not started" });
+      dispatch({ kind: "draft", tab: 1, text: "first prompt\nsecond unsent draft", refused: requestId });
+      expect(box.value).toBe("first prompt\nsecond unsent");
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "first prompt\nsecond unsent" });
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* Only the trust question's put-off is followed by an echo. Any other refused send is not, so a draft Rust
+     sends on its own right after it (a scratch-editor return) is applied, even one that starts with the
+     refused message. */
+  it("applies a draft Rust sends on its own right after a refused send that names no refusal", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "first prompt" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      dispatch({ kind: "command_result", requestId, ok: false, error: "no active session" });
+      expect(box.value).toBe("first prompt");
+      dispatch({ kind: "draft", tab: 1, text: "first prompt\nedited in the scratch buffer" });
+      expect(box.value).toBe("first prompt\nedited in the scratch buffer");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* The echo is skipped only within `REFUSED_ECHO_MS` of its refusal, measured on the page's clock even when no
+     timer has run (the mirror's timer, which also forgets it, can be held up). */
+  it("applies an echo of a refused send that comes later than REFUSED_ECHO_MS", () => {
+    vi.useFakeTimers();
+    const now = vi.spyOn(performance, "now");
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      const refuse = (text: string): string => {
+        fireEvent.change(box, { target: { value: text } });
+        fireEvent.keyDown(box, { key: "Enter" });
+        const requestId = lastOfType("send_message")!.request_id as string;
+        now.mockReturnValue(10_000);
+        dispatch({ kind: "command_result", requestId, ok: false, error: "not started" });
+        return requestId;
+      };
+      const early = refuse("early");
+      now.mockReturnValue(10_000 + REFUSED_ECHO_MS - 1);
+      dispatch({ kind: "draft", tab: 1, text: "early\nstale", refused: early });
+      expect(box.value).toBe("early");
+      fireEvent.change(box, { target: { value: "" } });
+      const late = refuse("late");
+      now.mockReturnValue(10_000 + REFUSED_ECHO_MS);
+      dispatch({ kind: "draft", tab: 1, text: "late\nfrom rust", refused: late });
+      expect(box.value).toBe("late\nfrom rust");
+    } finally {
+      now.mockRestore();
       vi.useRealTimers();
     }
   });
@@ -7292,7 +7348,7 @@ describe("App refused commands", () => {
       const requestId = lastOfType("send_message")!.request_id;
       fireEvent.change(box, { target: { value: "axc" } });
       dispatch({ kind: "command_result", requestId, ok: false, error: "not started" });
-      dispatch({ kind: "draft", tab: 1, text: "hello\nabc" });
+      dispatch({ kind: "draft", tab: 1, text: "hello\nabc", refused: requestId });
       expect(box.value).toBe("hello\naxc");
       act(() => vi.advanceTimersByTime(300));
       expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "hello\naxc" });
@@ -7310,13 +7366,13 @@ describe("App refused commands", () => {
       fireEvent.change(box, { target: { value: "abc" } });
       dispatch({ kind: "draft", tab: 1, text: "ab" });
       expect(box.value).toBe("ab");
-      // An echo that comes long after its refusal is just a draft too.
+      // An echo that comes after the mirror of its refusal went out is just a draft too.
       fireEvent.change(box, { target: { value: "first" } });
       fireEvent.keyDown(box, { key: "Enter" });
       const requestId = lastOfType("send_message")!.request_id;
       dispatch({ kind: "command_result", requestId, ok: false, error: "not started" });
-      act(() => vi.advanceTimersByTime(5000));
-      dispatch({ kind: "draft", tab: 1, text: "first\nfrom rust" });
+      act(() => vi.advanceTimersByTime(300));
+      dispatch({ kind: "draft", tab: 1, text: "first\nfrom rust", refused: requestId });
       expect(box.value).toBe("first\nfrom rust");
     } finally {
       vi.useRealTimers();
