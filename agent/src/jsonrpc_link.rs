@@ -15,6 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +37,18 @@ const WRITE_QUEUE: usize = 1024;
 const INCOMING_QUEUE: usize = 4096;
 /// The stderr tail kept for notices and logs.
 const STDERR_TAIL: usize = 8 * 1024;
+
+/// Writes one log line and ignores a failure to write it. `eprintln!` panics when stderr is a pipe
+/// whose reader has gone, and these lines are written from the link's own threads.
+fn write_log(out: &mut impl Write, args: fmt::Arguments<'_>) {
+    let _ = writeln!(out, "{args}");
+}
+
+macro_rules! link_log {
+    ($($arg:tt)*) => {
+        write_log(&mut io::stderr(), format_args!($($arg)*))
+    };
+}
 
 /// How a message is framed: ACP carries the `"jsonrpc":"2.0"` member, the Codex app-server omits it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,8 +301,8 @@ pub struct JsonRpcLink {
 }
 
 impl JsonRpcLink {
-    /// Starts the child with piped stdio in `spec.cwd`. The child is not put in a process group of
-    /// its own, and its environment is the caller's except for what `spec.env` and `spec.env_remove` say.
+    /// Starts the child with piped stdio in `spec.cwd`, leading a process group of its own so that
+    /// shutting down can end what it started too. Its environment is the caller's except for what `spec.env` and `spec.env_remove` say.
     pub fn spawn(spec: LinkSpec) -> io::Result<JsonRpcLink> {
         if !spec.program.is_absolute() {
             return Err(io::Error::new(
@@ -303,7 +316,8 @@ impl JsonRpcLink {
             .current_dir(&spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .process_group(0);
         for name in &spec.env_remove {
             command.env_remove(name);
         }
@@ -388,20 +402,20 @@ impl JsonRpcLink {
             members.push(("params", json_text(&params)));
         }
         if let Err(e) = self.shared.send_line(self.shared.line(&members)) {
-            eprintln!("a notification to the agent was not sent: {e}");
+            link_log!("a notification to the agent was not sent: {e}");
         }
     }
 
     /// Answers a request the agent made, by its own id.
     pub fn respond(&self, id: Value, result: Value) {
         if let Err(e) = self.shared.respond(&id, &result) {
-            eprintln!("an answer to the agent was not sent: {e}");
+            link_log!("an answer to the agent was not sent: {e}");
         }
     }
 
     pub fn respond_error(&self, id: Value, code: i64, message: &str) {
         if let Err(e) = self.shared.respond_error(&id, code, message) {
-            eprintln!("an error answer to the agent was not sent: {e}");
+            link_log!("an error answer to the agent was not sent: {e}");
         }
     }
 
@@ -416,7 +430,7 @@ impl JsonRpcLink {
         redact_emails(&String::from_utf8_lossy(&bytes))
     }
 
-    /// Closes the child's stdin and waits up to `grace` for it to exit; then SIGKILL to the captured pid.
+    /// Closes the child's stdin and waits up to `grace` for it to exit; then SIGKILL to the captured pid's process group.
     pub fn shutdown(mut self, grace: Duration) {
         self.finish(grace);
     }
@@ -433,8 +447,20 @@ impl JsonRpcLink {
                 _ => break,
             }
         }
+        // The child has not been reaped here, so its pid still names its process group and neither
+        // can belong to anything else; a grandchild that kept our pipes open would otherwise keep
+        // the reader and stderr threads blocked for good.
+        kill_group(self.pid);
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+fn kill_group(pid: u32) {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return };
+    // SAFETY: `kill` takes no pointers; the group is the one `spawn` made the child the leader of.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
     }
 }
 
@@ -469,7 +495,35 @@ fn drain_stderr(mut stderr: impl Read, shared: Arc<Shared>) {
     }
 }
 
+/// Ends the reader however it ends: pending calls fail and the owner is told, also when the loop
+/// unwinds, which would otherwise leave every caller waiting out its deadline.
+struct ReaderEnd {
+    shared: Arc<Shared>,
+    tx: SyncSender<Incoming>,
+    reason: String,
+}
+
+impl ReaderEnd {
+    fn new(shared: Arc<Shared>, tx: SyncSender<Incoming>) -> ReaderEnd {
+        ReaderEnd {
+            shared,
+            tx,
+            reason: "the reader stopped unexpectedly".to_string(),
+        }
+    }
+}
+
+impl Drop for ReaderEnd {
+    fn drop(&mut self) {
+        self.shared.fail_all();
+        let _ = self.tx.send(Incoming::Closed {
+            reason: std::mem::take(&mut self.reason),
+        });
+    }
+}
+
 fn read_loop(stdout: ChildStdout, shared: Arc<Shared>, tx: SyncSender<Incoming>) {
+    let mut end = ReaderEnd::new(shared, tx);
     let mut out = BufReader::with_capacity(64 * 1024, stdout);
     let mut line: Vec<u8> = Vec::new();
     // Set once the line in progress passed the cap: only its first bytes are kept.
@@ -503,10 +557,10 @@ fn read_loop(stdout: ChildStdout, shared: Arc<Shared>, tx: SyncSender<Incoming>)
             continue;
         }
         let verdict = match over_cap.take() {
-            Some(prefix) => handle_over_cap(&prefix, &shared, &tx),
+            Some(prefix) => handle_over_cap(&prefix, &end.shared, &end.tx),
             None => {
                 let whole = std::mem::take(&mut line);
-                handle_line(&whole, &shared, &tx)
+                handle_line(&whole, &end.shared, &end.tx)
             }
         };
         line.clear();
@@ -514,18 +568,26 @@ fn read_loop(stdout: ChildStdout, shared: Arc<Shared>, tx: SyncSender<Incoming>)
             break reason;
         }
     };
-    shared.fail_all();
-    let _ = tx.send(Incoming::Closed { reason });
+    end.reason = reason;
 }
 
 fn push(tx: &SyncSender<Incoming>, item: Incoming) -> Result<(), String> {
     tx.send(item).map_err(|_| "the link was dropped".to_string())
 }
 
-/// A bounded, escaped excerpt for a log line.
-fn excerpt(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(160)]);
-    format!("{:?}", text.as_ref())
+/// What a log line may say about a line it dropped: its size and what kind of byte it starts with,
+/// never its content, which can carry account data.
+fn describe_dropped(bytes: &[u8]) -> String {
+    let class = match bytes.first() {
+        None => "empty",
+        Some(b'[') => "starts like an array",
+        Some(b'"') => "starts like a string",
+        Some(b) if b.is_ascii_digit() || *b == b'-' => "starts like a number",
+        Some(b) if b.is_ascii_alphabetic() => "starts with a letter",
+        Some(b) if b.is_ascii() => "starts with punctuation",
+        Some(_) => "starts with a non-ASCII byte",
+    };
+    format!("{} bytes, {class}", bytes.len())
 }
 
 fn handle_line(bytes: &[u8], shared: &Shared, tx: &SyncSender<Incoming>) -> Result<(), String> {
@@ -534,9 +596,9 @@ fn handle_line(bytes: &[u8], shared: &Shared, tx: &SyncSender<Incoming>) -> Resu
         return Ok(());
     }
     let Ok(Value::Object(mut map)) = serde_json::from_slice::<Value>(bytes) else {
-        eprintln!(
-            "a line from the agent was not a JSON object and was dropped: {}",
-            excerpt(bytes)
+        link_log!(
+            "a line from the agent was not a JSON object and was dropped ({})",
+            describe_dropped(bytes)
         );
         return Ok(());
     };
@@ -544,7 +606,7 @@ fn handle_line(bytes: &[u8], shared: &Shared, tx: &SyncSender<Incoming>) -> Resu
         None => None,
         Some(Value::String(m)) => Some(m.clone()),
         Some(_) => {
-            eprintln!("a message from the agent had a method that is not a string and was dropped");
+            link_log!("a message from the agent had a method that is not a string and was dropped");
             return Ok(());
         }
     };
@@ -563,7 +625,7 @@ fn handle_line(bytes: &[u8], shared: &Shared, tx: &SyncSender<Incoming>) -> Resu
             Ok(())
         }
         (None, None) => {
-            eprintln!("a message from the agent had neither a method nor an id and was dropped");
+            link_log!("a message from the agent had neither a method nor an id and was dropped");
             Ok(())
         }
     }
@@ -585,7 +647,7 @@ fn deliver_response(shared: &Shared, id: &Value, map: &mut serde_json::Map<Strin
 
 fn handle_over_cap(prefix: &[u8], shared: &Shared, tx: &SyncSender<Incoming>) -> Result<(), String> {
     let found = scan_prefix(prefix);
-    eprintln!("a message from the agent was larger than 16 MiB");
+    link_log!("a message from the agent was larger than 16 MiB");
     match (found.has_method, found.has_id) {
         (true, true) => {
             let (Some(id), method) = (found.id, found.method.unwrap_or_default()) else {
@@ -601,7 +663,7 @@ fn handle_over_cap(prefix: &[u8], shared: &Shared, tx: &SyncSender<Incoming>) ->
                 shared.respond_error(&id, -32600, "too large")
             };
             if let Err(e) = answered {
-                eprintln!("the answer to an over-sized request was not sent: {e}");
+                link_log!("the answer to an over-sized request was not sent: {e}");
             }
             push(tx, Incoming::Skipped(Skipped::RequestAnswered { method }))
         }
@@ -613,7 +675,7 @@ fn handle_over_cap(prefix: &[u8], shared: &Shared, tx: &SyncSender<Incoming>) ->
                 push(tx, Incoming::Skipped(Skipped::ResponseFailed { id }))
             }
             None => {
-                eprintln!("an over-sized response with an unreadable id was dropped");
+                link_log!("an over-sized response with an unreadable id was dropped");
                 Ok(())
             }
         },
@@ -632,7 +694,7 @@ fn handle_over_cap(prefix: &[u8], shared: &Shared, tx: &SyncSender<Incoming>) ->
                     }),
                 )
             } else {
-                eprintln!("an over-sized notification was dropped");
+                link_log!("an over-sized notification was dropped");
                 Ok(())
             }
         }
@@ -658,6 +720,7 @@ fn scan_prefix(bytes: &[u8]) -> Prefix {
         b: bytes,
         i: 0,
         found: Prefix::default(),
+        steps: 0,
     };
     scan.ws();
     if scan.b.get(scan.i) == Some(&b'{') {
@@ -670,12 +733,26 @@ struct Scan<'a> {
     b: &'a [u8],
     i: usize,
     found: Prefix,
+    /// Loop turns and values taken so far, against [`Scan::STEP_BUDGET`].
+    steps: usize,
 }
 
 /// The bytes ended or stopped being JSON.
 struct Cut;
 
 impl Scan<'_> {
+    /// Far more than any prefix of [`PREFIX_LEN`] bytes can need: every turn but a malformed one
+    /// consumes a byte, so this only ever ends a scan that has stopped advancing.
+    const STEP_BUDGET: usize = 4 * PREFIX_LEN;
+
+    fn spend(&mut self) -> Result<(), Cut> {
+        self.steps += 1;
+        if self.steps > Self::STEP_BUDGET {
+            return Err(Cut);
+        }
+        Ok(())
+    }
+
     fn ws(&mut self) {
         while self.b.get(self.i).is_some_and(u8::is_ascii_whitespace) {
             self.i += 1;
@@ -715,6 +792,7 @@ impl Scan<'_> {
     fn object(&mut self, path: &mut Vec<String>) -> Result<(), Cut> {
         self.i += 1;
         loop {
+            self.spend()?;
             self.ws();
             match *self.b.get(self.i).ok_or(Cut)? {
                 b'}' => {
@@ -748,6 +826,7 @@ impl Scan<'_> {
     fn array(&mut self, path: &mut Vec<String>) -> Result<(), Cut> {
         self.i += 1;
         loop {
+            self.spend()?;
             self.ws();
             match *self.b.get(self.i).ok_or(Cut)? {
                 b']' => {
@@ -766,6 +845,7 @@ impl Scan<'_> {
     }
 
     fn value(&mut self, path: &mut Vec<String>) -> Result<(), Cut> {
+        self.spend()?;
         self.ws();
         match *self.b.get(self.i).ok_or(Cut)? {
             b'{' => self.object(path),
@@ -783,6 +863,11 @@ impl Scan<'_> {
                     .is_some_and(|c| !matches!(c, b',' | b'}' | b']') && !c.is_ascii_whitespace())
                 {
                     self.i += 1;
+                }
+                // No token at all is a closer of the wrong kind or a stray comma: the bytes stopped
+                // being JSON here, and an array would otherwise ask for the same byte forever.
+                if self.i == start {
+                    return Err(Cut);
                 }
                 // A token that runs to the end of the bytes may have been cut in the middle.
                 if self.i >= self.b.len() {
@@ -843,4 +928,157 @@ pub fn redact_emails(text: &str) -> String {
         out.extend(&chars[start..i]);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Runs the scan on a thread so a scan that never returns fails the test instead of hanging it.
+    fn scan_within(bytes: &'static [u8]) -> Prefix {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(scan_prefix(bytes));
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("scan_prefix did not return")
+    }
+
+    #[test]
+    fn a_closing_brace_where_an_array_element_should_be_ends_the_scan() {
+        let cut_inside_list = scan_within(br#"{"method":"item/started","params":{"threadId":"t1","list":[1}"#);
+        assert!(cut_inside_list.has_method);
+        assert_eq!(cut_inside_list.method.as_deref(), Some("item/started"));
+        assert_eq!(cut_inside_list.thread_id.as_deref(), Some("t1"));
+        for bytes in [
+            &br#"{"method":"x","params":[}"#[..],
+            br#"{"method":"x","params":[ }"#,
+            br#"{"a":[1,2}"#,
+            br#"{"a":[,}"#,
+            br#"{"a":[{"b":1}}"#,
+            br#"{"a":[[}]]"#,
+            br#"{"a":[1}"#,
+        ] {
+            // Each leaks into a `'static` slice only because the helper moves it to a thread.
+            let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+            let found = scan_within(leaked);
+            assert!(!found.has_id, "{:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[test]
+    fn well_formed_prefixes_are_classified_as_before() {
+        let request = scan_within(br#"{"method":"x","id":3,"params":[1,[2],{"k":[]}]"#);
+        assert!(request.has_method && request.has_id);
+        assert_eq!(request.id, Some(Value::from(3)));
+        assert_eq!(request.method.as_deref(), Some("x"));
+
+        let item =
+            scan_within(br#"{"method":"item/completed","params":{"item":{"id":"i9","list":[1,2,3]},"threadId":"t2"#);
+        assert_eq!(item.item_id.as_deref(), Some("i9"));
+        assert!(
+            item.thread_id.is_none(),
+            "a string cut before its quote is not recorded"
+        );
+
+        let response = scan_within(br#"{"id":"abc","result":{"a":[true,null,"s"]}"#);
+        assert!(response.has_id && !response.has_method);
+        assert_eq!(response.id, Some(Value::String("abc".into())));
+    }
+
+    #[test]
+    fn the_step_budget_bounds_a_scan_whatever_the_bytes_are() {
+        let mut scan = Scan {
+            b: b"",
+            i: 0,
+            found: Prefix::default(),
+            steps: 0,
+        };
+        for _ in 0..=Scan::STEP_BUDGET {
+            let _ = scan.spend();
+        }
+        assert!(scan.spend().is_err());
+    }
+
+    fn shared_for_test() -> Arc<Shared> {
+        Arc::new(Shared {
+            framing: Framing::Bare,
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(PendingMap::default()),
+            writer: Mutex::new(None),
+            stderr: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    fn pending_in(shared: &Arc<Shared>, id: u64) -> Pending {
+        let slot = Slot::new();
+        lock(&shared.pending).slots.insert(id, Arc::clone(&slot));
+        Pending {
+            id,
+            slot,
+            shared: Arc::clone(shared),
+        }
+    }
+
+    #[test]
+    fn a_reader_that_unwinds_still_fails_pending_calls_and_reports_closed() {
+        let shared = shared_for_test();
+        let pending = pending_in(&shared, 7);
+        let (tx, rx) = sync_channel::<Incoming>(4);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _end = ReaderEnd::new(Arc::clone(&shared), tx);
+            panic!("the reader body failed");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(
+            pending.wait(Instant::now() + Duration::from_secs(1)),
+            Err(LinkError::Closed)
+        );
+        assert!(lock(&shared.pending).closed);
+        match rx.try_recv() {
+            Ok(Incoming::Closed { reason }) => assert_eq!(reason, "the reader stopped unexpectedly"),
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reader_that_ends_normally_reports_its_own_reason() {
+        let shared = shared_for_test();
+        let (tx, rx) = sync_channel::<Incoming>(4);
+        {
+            let mut end = ReaderEnd::new(Arc::clone(&shared), tx);
+            end.reason = "the agent closed its output".to_string();
+        }
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(Incoming::Closed {
+                reason: "the agent closed its output".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_log_line_to_a_broken_stream_is_dropped_without_a_panic() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+        }
+        write_log(&mut Broken, format_args!("a line {}", 1));
+    }
+
+    #[test]
+    fn a_dropped_line_is_described_without_its_content() {
+        let note = describe_dropped(b"user@example.com {\"token\":\"secret\"} not json");
+        assert!(!note.contains("example"), "{note}");
+        assert!(!note.contains("secret"), "{note}");
+        assert!(note.starts_with("44 bytes"), "{note}");
+        assert_eq!(describe_dropped(b""), "0 bytes, empty");
+        assert_eq!(describe_dropped(b"[1,2]"), "5 bytes, starts like an array");
+    }
 }

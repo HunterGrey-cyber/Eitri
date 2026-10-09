@@ -260,21 +260,102 @@ fn instruction_source_inside_walked_dir_trips_but_codex_home_does_not() {
     let at_home = vec![PathBuf::from("/home/user")];
     assert!(check_instruction_sources(&sources(&[&format!("{CODEX_HOME}/AGENTS.md")]), &at_home, home).is_ok());
     assert!(check_instruction_sources(&sources(&["/home/user/AGENTS.md"]), &at_home, home).is_err());
+
+    // A file Eitri cannot place is not taken for one outside the project.
+    let relative = check_instruction_sources(&sources(&["AGENTS.md"]), &walked, home);
+    assert!(relative.expect_err("a relative file").reported.contains("AGENTS.md"));
+    assert!(check_instruction_sources(&sources(&["proj/AGENTS.md"]), &walked, home).is_err());
+
+    // A root inside the user's Codex directory: only a file directly in it is the user's own.
+    let in_home: Vec<PathBuf> = [
+        "/home/user/.codex/proj",
+        "/home/user/.codex",
+        "/home/user",
+        "/home",
+        "/",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    assert!(check_instruction_sources(&sources(&["/home/user/.codex/proj/AGENTS.md"]), &in_home, home).is_err());
+    assert!(check_instruction_sources(&sources(&[&format!("{CODEX_HOME}/AGENTS.md")]), &in_home, home).is_ok());
 }
 
 #[test]
 fn trust_watch_names_project_only_servers_and_project_hooks() {
-    let watch = TrustWatch::new(["proj-server".to_string()]);
+    let home = Path::new(CODEX_HOME);
+    let watch = TrustWatch::for_plan(&plan(&["proj-server"]), home);
     assert!(watch.mcp_started("proj-server").is_err());
     assert!(watch.mcp_started("user-server").is_ok());
-    assert!(watch.hook_started("project").is_err());
-    assert!(watch.hook_started("user").is_ok());
+    let user_file = format!("{CODEX_HOME}/hooks.json");
+    let user_config = format!("{CODEX_HOME}/config.toml");
+    assert!(watch
+        .hook_started(Some("project"), Some("/work/proj/.codex/hooks.json"))
+        .is_err());
+    assert!(watch.hook_started(Some("user"), Some(&user_file)).is_ok());
+    assert!(watch.hook_started(Some("user"), Some(&user_config)).is_ok());
+    // Only the layer word measured for the user's own hooks passes; Codex's own default, a word it may
+    // add later, a missing word and a near spelling all stop the session.
+    for source in [
+        None,
+        Some("unknown"),
+        Some("repo"),
+        Some("projects"),
+        Some(" user"),
+        Some("User"),
+    ] {
+        assert!(watch.hook_started(source, Some(&user_file)).is_err(), "{source:?}");
+    }
+    for source in ["system", "mdm", "plugin", "sessionFlags", "cloudRequirements"] {
+        assert!(watch.hook_started(Some(source), Some(&user_file)).is_err(), "{source}");
+    }
+    // The user's word on a file Eitri cannot place in the user's own directory is not believed.
+    for path in [
+        None,
+        Some("/work/proj/.codex/hooks.json"),
+        Some("/work/proj/hooks.json"),
+        Some("/work/hooks.json"),
+        Some("hooks.json"),
+        Some("/home/user/.codex/../hooks.json"),
+        Some("/home/user/.codex/sub/hooks.json"),
+    ] {
+        assert!(watch.hook_started(Some("user"), path).is_err(), "{path:?}");
+    }
+    // An unreadable hook announcement or startup status may be the project's.
+    assert!(watch.unreadable_hook().is_err());
+    assert!(watch.unreadable_mcp_status().is_err());
+    // An untrusted plan with no project-only server has no server to miss.
+    assert!(TrustWatch::for_plan(&plan(&[]), home).unreadable_mcp_status().is_ok());
+
+    // A root inside the user's Codex directory: only a file directly in it is the user's own.
+    let mut nested = plan(&[]);
+    nested.dirs = [
+        "/home/user/.codex/proj",
+        "/home/user/.codex",
+        "/home/user",
+        "/home",
+        "/",
+    ]
+    .iter()
+    .map(|d| (PathBuf::from(d), DirTrust::Untrusted))
+    .collect();
+    let watch = TrustWatch::for_plan(&nested, home);
+    assert!(watch.hook_started(Some("user"), Some(&user_file)).is_ok());
+    assert!(watch
+        .hook_started(Some("user"), Some("/home/user/.codex/proj/.codex/hooks.json"))
+        .is_err());
+
     // A trusted plan has nothing to watch.
     let mut trusted = plan(&["proj-server"]);
     trusted.skills_off = false;
-    let watch = TrustWatch::for_plan(&trusted);
+    let watch = TrustWatch::for_plan(&trusted, home);
     assert!(watch.mcp_started("proj-server").is_ok());
-    assert!(watch.hook_started("project").is_ok());
+    assert!(watch
+        .hook_started(Some("project"), Some("/work/proj/.codex/hooks.json"))
+        .is_ok());
+    assert!(watch.hook_started(None, None).is_ok());
+    assert!(watch.unreadable_hook().is_ok());
+    assert!(watch.unreadable_mcp_status().is_ok());
 }
 
 /// A session on `th-t`, then `rest`.
@@ -323,16 +404,58 @@ fn project_only_mcp_startup_trips_on_any_family_thread() {
 
 #[test]
 fn project_hook_start_trips() {
-    let hook = |source: &str| {
+    let hook = |source: &str, path: &str| {
         write(json!({"method": "hook/started", "params": {
             "threadId": "th-t", "turnId": "tu-1",
-            "run": {"id": "pre-tool-use:0:x:c1", "eventName": "preToolUse", "source": source},
+            "run": {"id": "pre-tool-use:0:x:c1", "eventName": "preToolUse", "source": source, "sourcePath": path},
         }}))
     };
-    let provider = started_session(&[], vec![hook("user"), hook("project")]);
+    let provider = started_session(
+        &[],
+        vec![
+            hook("user", &format!("{CODEX_HOME}/hooks.json")),
+            hook("project", "/work/proj/.codex/hooks.json"),
+        ],
+    );
     let events = pump_until(&provider, |events| mismatch_in(events).is_some());
     let (_, reported) = mismatch_in(&events).expect("a mismatch");
     assert!(reported.contains("hook"), "{reported}");
+}
+
+/// A hook start that does not say its layer, or cannot be read at all, may be the project's: an untrusted
+/// session ends on it.
+#[test]
+fn a_hook_start_without_a_layer_or_unreadable_trips() {
+    let user_hook = write(json!({"method": "hook/started", "params": {
+        "threadId": "th-t", "turnId": "tu-1",
+        "run": {"id": "u", "source": "user", "sourcePath": format!("{CODEX_HOME}/hooks.json")},
+    }}));
+    let no_source = write(json!({"method": "hook/started", "params": {
+        "threadId": "th-t", "turnId": "tu-1", "run": {"id": "h"},
+    }}));
+    let no_id = write(json!({"method": "hook/started", "params": {
+        "threadId": "th-t", "turnId": "tu-1", "run": {"source": "user"},
+    }}));
+    for (what, hook) in [("no source", no_source), ("no run id", no_id)] {
+        let provider = started_session(&[], vec![user_hook.clone(), hook]);
+        let events = pump_until(&provider, |events| mismatch_in(events).is_some());
+        let (_, reported) = mismatch_in(&events).expect("a mismatch");
+        assert!(reported.contains("hook"), "{what}: {reported}");
+    }
+}
+
+/// An unreadable startup status may name a server only the project gives.
+#[test]
+fn an_unreadable_mcp_status_trips_when_a_project_server_is_watched() {
+    let provider = started_session(
+        &["proj-server"],
+        vec![write(json!({"method": "mcpServer/startupStatus/updated", "params": {
+            "threadId": "th-t", "status": "starting",
+        }}))],
+    );
+    let events = pump_until(&provider, |events| mismatch_in(events).is_some());
+    let (_, reported) = mismatch_in(&events).expect("a mismatch");
+    assert!(reported.contains("tool server"), "{reported}");
 }
 
 #[test]

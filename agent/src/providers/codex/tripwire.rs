@@ -116,9 +116,11 @@ fn lexical(path: &Path) -> PathBuf {
 /// trust.
 ///
 /// `walked` are those directories, each one the folder an instruction file would be read from, not its
-/// ancestors' subtrees: a root at `/home/user` must not make everything below `/home` suspect. A file in
-/// the effective `codex_home` is the user's own and always allowed, even where `walked` holds its parent
-/// (a root at `$HOME` legitimately lists `~/.codex/AGENTS.md`).
+/// ancestors' subtrees: a root at `/home/user` must not make everything below `/home` suspect. A file
+/// directly in the effective `codex_home` is the user's own and always allowed, even where `walked` holds
+/// its parent (a root at `$HOME` legitimately lists `~/.codex/AGENTS.md`); one deeper in it is not, since a
+/// project may sit inside that directory. A file named by a relative path cannot be placed at all, so it
+/// counts as one from the project.
 pub fn check_instruction_sources(
     sources: &[String],
     walked: &[PathBuf],
@@ -127,8 +129,13 @@ pub fn check_instruction_sources(
     let home = lexical(codex_home);
     let walked: HashSet<PathBuf> = walked.iter().map(|d| lexical(d)).collect();
     for source in sources {
+        if !Path::new(source).is_absolute() {
+            return Err(PolicyMismatch::project_loaded(format!(
+                "it read an instruction file Eitri cannot place: {source}"
+            )));
+        }
         let file = lexical(Path::new(source));
-        if file.starts_with(&home) {
+        if file.parent() == Some(home.as_path()) {
             continue;
         }
         if file.parent().is_some_and(|dir| walked.contains(dir)) {
@@ -149,32 +156,38 @@ pub fn dirs_not_trusted(plan: &TrustPlan) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The configuration layer Codex names for a hook from the user's own Codex directory. Every other word
+/// stops an untrusted session: the project's own (`project`), Codex's default when it cannot say
+/// (`unknown`), and any layer whose hooks have not been seen to come from the user's directory.
+pub const USER_HOOK_LAYER: &str = "user";
+
 /// What an untrusted session watches for after it started: tool servers and hooks that only the project's
 /// own configuration provides.
 #[derive(Debug, Clone, Default)]
 pub struct TrustWatch {
     /// Names of tool servers found only in project configuration.
     project_only: HashSet<String>,
-    /// Whether a hook from the project layer is a violation. A trusted session lets those run.
+    /// Whether hooks are checked at all. A trusted session lets the project's run.
     hooks_gated: bool,
+    /// The directories the session was told not to trust, spelled without `.` and `..`.
+    not_trusted: Vec<PathBuf>,
+    /// The user's own Codex directory, as Codex reported it, spelled without `.` and `..`.
+    codex_home: PathBuf,
 }
 
 impl TrustWatch {
-    /// A watch for an untrusted session, over these tool servers.
-    pub fn new(project_only: impl IntoIterator<Item = String>) -> TrustWatch {
-        TrustWatch {
-            project_only: project_only.into_iter().collect(),
-            hooks_gated: true,
-        }
-    }
-
     /// The watch a plan calls for: a plan that turns project skills off is an untrusted one; a trusted one
-    /// has nothing to watch because the user allowed what the project configures.
-    pub fn for_plan(plan: &TrustPlan) -> TrustWatch {
-        if plan.skills_off {
-            TrustWatch::new(plan.project_only.iter().cloned())
-        } else {
-            TrustWatch::default()
+    /// has nothing to watch because the user allowed what the project configures. `codex_home` is the
+    /// directory Codex keeps the user's own configuration in.
+    pub fn for_plan(plan: &TrustPlan, codex_home: &Path) -> TrustWatch {
+        if !plan.skills_off {
+            return TrustWatch::default();
+        }
+        TrustWatch {
+            project_only: plan.project_only.iter().cloned().collect(),
+            hooks_gated: true,
+            not_trusted: dirs_not_trusted(plan).iter().map(|d| lexical(d)).collect(),
+            codex_home: lexical(codex_home),
         }
     }
 
@@ -188,13 +201,72 @@ impl TrustWatch {
         Ok(())
     }
 
-    /// A hook started; `source` is the configuration layer Codex says it came from.
-    pub fn hook_started(&self, source: &str) -> Result<(), PolicyMismatch> {
-        if self.hooks_gated && source.trim().to_ascii_lowercase().starts_with("project") {
-            return Err(PolicyMismatch::project_loaded(
-                "a hook from the project's configuration ran".to_string(),
-            ));
+    /// A startup status that could not be read: it may name a server only the project gives, so it counts
+    /// as one when there is such a server to watch for.
+    pub fn unreadable_mcp_status(&self) -> Result<(), PolicyMismatch> {
+        if self.project_only.is_empty() {
+            return Ok(());
+        }
+        Err(PolicyMismatch::project_loaded(
+            "a tool server reported a startup Eitri could not read, and the project names servers of its own"
+                .to_string(),
+        ))
+    }
+
+    /// A hook started. `source` is the configuration layer Codex says it came from, `source_path` the file.
+    ///
+    /// In an untrusted session only a hook that Codex places in the user's layer, from a file directly in
+    /// the user's Codex directory (or somewhere no untrusted directory holds), may run. Anything Eitri
+    /// cannot place that way may be the project's, so it stops the session: a missing or unknown layer, a
+    /// missing or relative file, and the user's word on a file in a project directory.
+    pub fn hook_started(&self, source: Option<&str>, source_path: Option<&str>) -> Result<(), PolicyMismatch> {
+        if !self.hooks_gated {
+            return Ok(());
+        }
+        match source {
+            Some(USER_HOOK_LAYER) => {}
+            Some("project") => {
+                return Err(PolicyMismatch::project_loaded(
+                    "a hook from the project's configuration ran".to_string(),
+                ))
+            }
+            Some(other) => {
+                return Err(PolicyMismatch::project_loaded(format!(
+                    "a hook Codex placed in the layer {other:?} ran, which Eitri cannot tell from the project's"
+                )))
+            }
+            None => {
+                return Err(PolicyMismatch::project_loaded(
+                    "a hook ran and Codex did not say which configuration it came from".to_string(),
+                ))
+            }
+        }
+        let Some(path) = source_path.map(Path::new).filter(|p| p.is_absolute()) else {
+            return Err(PolicyMismatch::project_loaded(format!(
+                "a hook ran from a file Eitri cannot place: {}",
+                source_path.unwrap_or("none named")
+            )));
+        };
+        let file = lexical(path);
+        if file.parent() == Some(self.codex_home.as_path()) {
+            return Ok(());
+        }
+        if self.not_trusted.iter().any(|dir| file.starts_with(dir)) {
+            return Err(PolicyMismatch::project_loaded(format!(
+                "a hook ran from {}, which is not in the user's own Codex directory",
+                path.display()
+            )));
         }
         Ok(())
+    }
+
+    /// A hook start that could not be read: it may be the project's.
+    pub fn unreadable_hook(&self) -> Result<(), PolicyMismatch> {
+        if !self.hooks_gated {
+            return Ok(());
+        }
+        Err(PolicyMismatch::project_loaded(
+            "a hook started and Eitri could not read where it came from".to_string(),
+        ))
     }
 }

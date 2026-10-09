@@ -23,9 +23,11 @@
 mod codex_peer;
 
 use agent::external::DirTrust;
+use agent::external::TrustPlan;
 use agent::jsonrpc_link::Skipped;
 use agent::providers::codex::family::{Family, FamilyEdge};
 use agent::providers::codex::scripted_model::{ScriptedModel, Step};
+use agent::providers::codex::tripwire::TrustWatch;
 use agent::providers::codex::wire::{method, ElicitationResponse};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -444,13 +446,48 @@ fn find_hook(value: &Value, project: &str) -> Option<(String, String)> {
     }
 }
 
-/// What a project's hook and exec-policy rule do, by trust and by whether the user trusted the hook.
+/// What a project's hook and exec-policy rule do, by trust and by whether the user trusted the hook. The
+/// user's own hook (in the home's `hooks.json`) runs beside the project's in every arm.
 struct HookRun {
     hook_ran: bool,
-    hook_notes: usize,
+    user_hook_ran: bool,
+    /// `run.source` and `run.sourcePath` of every `hook/started`, as Codex sent them.
+    started: Vec<(Option<String>, Option<String>)>,
+    project: PathBuf,
+    home: PathBuf,
     rule_file_created: bool,
     approval_requests: usize,
     status: String,
+}
+
+impl HookRun {
+    fn started_from(&self, source: &str) -> Vec<Option<String>> {
+        self.started
+            .iter()
+            .filter(|(s, _)| s.as_deref() == Some(source))
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+
+    /// What Eitri's untrusted-session watch says about each hook start: every ancestor of the project
+    /// untrusted, as an untrusted start's plan has it, and the scratch home as the user's Codex directory.
+    fn untrusted_watch_verdicts(&self) -> Vec<bool> {
+        let plan = TrustPlan {
+            dirs: self
+                .project
+                .ancestors()
+                .map(|d| (d.to_path_buf(), DirTrust::Untrusted))
+                .collect(),
+            skills_off: true,
+            fingerprint: "real-suite".to_string(),
+            project_only: Vec::new(),
+        };
+        let watch = TrustWatch::for_plan(&plan, &self.home);
+        self.started
+            .iter()
+            .map(|(source, path)| watch.hook_started(source.as_deref(), path.as_deref()).is_ok())
+            .collect()
+    }
 }
 
 fn hook_run(codex: &Path, tag: &str, trust: DirTrust, hook_trusted_by_user: bool) -> HookRun {
@@ -482,10 +519,30 @@ fn hook_run(codex: &Path, tag: &str, trust: DirTrust, hook_trusted_by_user: bool
         ),
     );
     let home = s.dir("home");
-    let mut tables = String::new();
+    let user_ran = s.path("user-hook-ran");
+    write_file(
+        &home.join("hooks.json"),
+        &json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{
+            "type": "command",
+            "command": format!("/bin/sh '{}' '{}'", text_of(&marker), text_of(&user_ran)),
+            "timeout": 5,
+        }]}]}})
+        .to_string(),
+    );
+    // The user's own hook runs only once the user trusted it by hash too, as a real user's would be.
+    write_home(&home, &model, "");
+    let mut peer = Peer::start(codex, &home, &project, decline_all());
+    let listed = peer
+        .call("hooks/list", json!({ "cwds": [text_of(&project)] }))
+        .expect("hooks/list");
+    peer.close();
+    let (user_key, user_hash) = find_hook(&listed, text_of(&home)).expect("Codex listed the user's hook");
+    let mut tables = format!("\n[hooks.state.\"{user_key}\"]\ntrusted_hash = \"{user_hash}\"\nenabled = true\n");
     if hook_trusted_by_user {
         let (key, hash) = learn_hook(codex, &s, &model, &project, tag);
-        tables = format!("\n[hooks.state.\"{key}\"]\ntrusted_hash = \"{hash}\"\nenabled = true\n");
+        tables.push_str(&format!(
+            "\n[hooks.state.\"{key}\"]\ntrusted_hash = \"{hash}\"\nenabled = true\n"
+        ));
     }
     write_home(&home, &model, &tables);
 
@@ -493,9 +550,24 @@ fn hook_run(codex: &Path, tag: &str, trust: DirTrust, hook_trusted_by_user: bool
     let thread = start_thread(&mut peer, start_params(&project, trust));
     let status = run_turn(&mut peer, &thread.id, "probe");
     peer.pump_for(Duration::from_secs(1));
+    let started = peer
+        .notes
+        .iter()
+        .filter(|n| n.method == "hook/started")
+        .map(|n| {
+            (
+                json_str(&n.params, "/run/source").map(str::to_string),
+                json_str(&n.params, "/run/sourcePath").map(str::to_string),
+            )
+        })
+        .collect();
+    eprintln!("hook/started (source, sourcePath) in arm {tag}: {started:?}");
     let result = HookRun {
         hook_ran: ran.exists(),
-        hook_notes: peer.notes.iter().filter(|n| n.method.starts_with("hook/")).count(),
+        user_hook_ran: user_ran.exists(),
+        started,
+        project: project.clone(),
+        home: home.clone(),
         rule_file_created: target.exists(),
         approval_requests: peer.requests.iter().filter(|r| is_decision_request(&r.method)).count(),
         status,
@@ -515,7 +587,36 @@ fn hooks_and_rules_trusted_and_untrusted() {
     let trusted = hook_run(&codex, "t", DirTrust::Trusted, true);
     assert_eq!(trusted.status, "completed");
     assert!(trusted.hook_ran, "the trusted project's hook did not run");
-    assert!(trusted.hook_notes > 0, "no hook notification arrived");
+    assert!(trusted.user_hook_ran, "the user's own hook did not run");
+    // The words and files Eitri's untrusted-session watch relies on, measured on this Codex: the project's
+    // hook is `project` from the project's `.codex/hooks.json`, the user's is `user` from the home's.
+    let project_file = trusted.project.join(".codex/hooks.json");
+    let user_file = trusted.home.join("hooks.json");
+    let from_project = trusted.started_from("project");
+    assert!(!from_project.is_empty(), "no project hook start: {:?}", trusted.started);
+    assert!(
+        from_project
+            .iter()
+            .all(|p| p.as_deref() == Some(text_of(&project_file))),
+        "{from_project:?}"
+    );
+    let from_user = trusted.started_from("user");
+    assert!(!from_user.is_empty(), "no user hook start: {:?}", trusted.started);
+    assert!(
+        from_user.iter().all(|p| p.as_deref() == Some(text_of(&user_file))),
+        "{from_user:?}"
+    );
+    assert_eq!(
+        from_project.len() + from_user.len(),
+        trusted.started.len(),
+        "a hook start under another layer: {:?}",
+        trusted.started
+    );
+    // So the watch lets the user's run and stops on the project's.
+    let verdicts = trusted.untrusted_watch_verdicts();
+    for ((source, _), allowed) in trusted.started.iter().zip(&verdicts) {
+        assert_eq!(*allowed, source.as_deref() == Some("user"), "{source:?}");
+    }
     assert!(
         trusted.rule_file_created,
         "the trusted project's allow rule did not apply"
@@ -528,7 +629,18 @@ fn hooks_and_rules_trusted_and_untrusted() {
     let untrusted = hook_run(&codex, "u", DirTrust::Untrusted, true);
     assert_eq!(untrusted.status, "completed");
     assert!(!untrusted.hook_ran, "an untrusted project's hook ran");
-    assert_eq!(untrusted.hook_notes, 0, "an untrusted project's hook was announced");
+    assert!(untrusted.user_hook_ran, "the user's own hook did not run");
+    assert!(
+        untrusted.started_from("project").is_empty(),
+        "an untrusted project's hook was announced: {:?}",
+        untrusted.started
+    );
+    assert!(!untrusted.started.is_empty(), "the user's hook was not announced");
+    assert!(
+        untrusted.untrusted_watch_verdicts().iter().all(|ok| *ok),
+        "the watch would stop an untrusted session on the user's own hook: {:?}",
+        untrusted.started
+    );
     assert!(!untrusted.rule_file_created, "an untrusted project's rule applied");
     assert_eq!(untrusted.approval_requests, 0);
 

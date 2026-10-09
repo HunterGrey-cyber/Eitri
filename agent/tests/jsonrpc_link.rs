@@ -235,6 +235,35 @@ fn over_cap_turn_completed_reports_turn_too_large() {
 }
 
 #[test]
+fn over_cap_line_with_a_stray_brace_in_a_list_does_not_wedge_the_reader() {
+    let link = link(
+        Framing::Bare,
+        json!([
+            {"write_big": {
+                "prefix": r#"{"method":"item/started","params":{"threadId":"t1","list":[1}"#,
+                "bytes": MAX_LINE + 1,
+            }},
+            {"write": r#"{"method":"alive","params":{}}"#},
+        ]),
+    );
+    assert_eq!(
+        next(&link),
+        Incoming::Skipped(Skipped::ItemTooLarge {
+            method: "item/started".into(),
+            item_id: None,
+            thread_id: Some("t1".into())
+        })
+    );
+    assert_eq!(
+        next(&link),
+        Incoming::Notification {
+            method: "alive".into(),
+            params: json!({})
+        }
+    );
+}
+
+#[test]
 fn prefix_without_method_or_id_closes() {
     let link = link(
         Framing::Bare,
@@ -369,4 +398,45 @@ fn resolve_program_skips_relative_path_entries() {
         resolve_program(OsStr::new("codex"), None, files(&["/usr/bin/codex"])),
         None
     );
+}
+
+#[test]
+fn shutdown_kills_the_children_the_agent_started_too() {
+    let link = JsonRpcLink::spawn(LinkSpec {
+        program: PathBuf::from("/bin/sh"),
+        args: vec![OsString::from("-c"), OsString::from("sleep 300 & echo $! >&2; wait")],
+        cwd: std::env::temp_dir(),
+        framing: Framing::Bare,
+        env: Vec::new(),
+        env_remove: Vec::new(),
+    })
+    .expect("sh starts");
+    let end = soon();
+    let grandchild: i32 = loop {
+        if let Ok(pid) = link.stderr_tail().trim().parse() {
+            break pid;
+        }
+        assert!(Instant::now() < end, "the shell never named its child");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(alive(grandchild as u32));
+    link.shutdown(Duration::ZERO);
+    let end = Instant::now() + Duration::from_secs(2);
+    let mut gone = false;
+    while Instant::now() < end {
+        // A killed child that nobody waits for stays a zombie until init reaps it, and signal 0
+        // still reaches a zombie, so read its state.
+        gone = std::fs::read_to_string(format!("/proc/{grandchild}/stat")).map_or(true, |stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+        });
+        if gone {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: cleanup of a process this test started, by its captured pid.
+    unsafe { libc::kill(grandchild, libc::SIGKILL) };
+    assert!(gone, "the agent's own child outlived the link");
 }

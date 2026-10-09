@@ -982,7 +982,10 @@ impl CodexProvider {
                 }
             }
             N::HookStarted(hook) => {
-                if let Err(mismatch) = st.watch.hook_started(hook.run.source.as_deref().unwrap_or_default()) {
+                if let Err(mismatch) = st
+                    .watch
+                    .hook_started(hook.run.source.as_deref(), hook.run.source_path.as_deref())
+                {
                     self.trip(st, mismatch);
                 }
             }
@@ -996,7 +999,15 @@ impl CodexProvider {
                 thread_id,
             } => {
                 eprintln!("agent: a {name} notification from Codex could not be read: {error}");
-                if name == method::TURN_COMPLETED {
+                // What cannot be read cannot be shown to be the user's own.
+                let unplaced = match name.as_str() {
+                    method::HOOK_STARTED => st.watch.unreadable_hook().err(),
+                    method::MCP_STARTUP_STATUS => st.watch.unreadable_mcp_status().err(),
+                    _ => None,
+                };
+                if let Some(mismatch) = unplaced {
+                    self.trip(st, mismatch);
+                } else if name == method::TURN_COMPLETED {
                     // A turn whose end cannot be read would otherwise run forever.
                     self.unreadable_turn_end(
                         st,
@@ -1695,7 +1706,7 @@ impl CodexProvider {
             st.thread_id = Some(thread_id.clone());
             st.family = Some(Family::new(thread_id.clone()));
             st.model = started.model;
-            st.watch = TrustWatch::for_plan(&req.plan);
+            st.watch = TrustWatch::for_plan(&req.plan, &self.codex_home);
             st.events.push_back(AgentDomainEvent::SessionOpened {
                 session_id: thread_id.clone(),
                 provider_session_id: thread_id.clone(),
