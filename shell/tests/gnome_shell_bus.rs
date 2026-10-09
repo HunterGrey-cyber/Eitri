@@ -30,10 +30,10 @@ mod own_x_server;
 mod gnome_shell;
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -90,7 +90,15 @@ impl PrivateBus {
             eprintln!("skipping {name}: no dbus-daemon on this machine");
             return None;
         }
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("gsb-{}-{name}", std::process::id()));
+        // A short path in the system's temporary directory: the socket's path must fit the 108
+        // bytes of a Unix socket address, which a checkout's target dir and a test's name together
+        // can pass. The test's name stays in the panics instead.
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "eitri-gsb-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("bus");
@@ -104,16 +112,21 @@ impl PrivateBus {
             .stdout(Stdio::null())
             .spawn()
             .expect("dbus-daemon starts");
-        let bus = PrivateBus {
+        let mut bus = PrivateBus {
             child,
             dir,
             address: format!("unix:path={}", socket.display()),
         };
         let started = Instant::now();
         while !socket.exists() {
+            // A daemon that refused its configuration (a socket path too long, say) exits at
+            // once; waiting out the deadline would only hide why.
+            if let Some(status) = bus.child.try_wait().expect("dbus-daemon can be waited for") {
+                panic!("{name}: the private bus exited before it listened ({status}); its errors are above");
+            }
             assert!(
                 started.elapsed() < Duration::from_secs(10),
-                "the private bus never listened"
+                "{name}: the private bus never listened"
             );
             std::thread::sleep(Duration::from_millis(10));
         }

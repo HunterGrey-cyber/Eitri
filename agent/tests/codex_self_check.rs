@@ -8,6 +8,9 @@
 //! The scratch directories live under the test target's own directory and not under `/tmp`: Codex's sandbox
 //! always lets a command write `/tmp`, which would defeat the check's "outside the sandbox" files.
 
+#[path = "support/codex_peer.rs"]
+mod codex_peer;
+
 use agent::providers::codex::self_check::{ensure_checked, ensure_checked_tweaked, CheckTweaks, SelfCheckError};
 use agent::providers::codex::{locate_codex, CodexLaunch, CodexProvider};
 use agent::{ProviderError, ProviderErrorCode};
@@ -41,7 +44,11 @@ impl Drop for Scratch {
 }
 
 fn real_codex() -> PathBuf {
-    locate_codex(None).expect("a codex on PATH (or EITRI_CODEX)")
+    let program = locate_codex(None).expect("a codex on PATH (or EITRI_CODEX)");
+    // An older binary is refused before the check runs (`TooOld`), so the tests below would fail on
+    // that and say nothing about the check: the shared helper names the cause instead.
+    codex_peer::require_supported_codex(&program);
+    program
 }
 
 fn verdicts(state: &Path) -> usize {

@@ -32,7 +32,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -1300,6 +1300,10 @@ pub(crate) fn flock_file(
         .mode(agent::private_fs::PRIVATE_FILE_MODE)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
+    // Exactly 0600 whatever the umask: one that takes the owner's write bit away would leave a 0400
+    // file, which another window's probe (it opens the file for writing) could not open, and every
+    // revert would be refused.
+    file.set_permissions(std::fs::Permissions::from_mode(agent::private_fs::PRIVATE_FILE_MODE))?;
     let flags = if deadline.is_some() {
         operation | libc::LOCK_NB
     } else {
@@ -1327,18 +1331,26 @@ pub(crate) fn flock_file(
 
 /// Tries to take `path`'s `flock` exclusively without creating it: `Some` when it was free (the
 /// caller now holds it), `None` when someone else holds it. A path that is missing, a symlink or
-/// not a regular file is [`std::io::ErrorKind::NotFound`]: there is nothing there to lock, and a
-/// FIFO or a device someone planted is never opened for reading.
+/// not a regular file (a directory, a socket, a FIFO) is [`std::io::ErrorKind::NotFound`]: there
+/// is nothing there to lock, and a FIFO someone planted cannot hold the open up.
+///
+/// The file is opened for writing as well, though nothing is written: on NFS Linux takes an
+/// `flock` as a byte-range lock, and an exclusive one on a descriptor open only for reading fails
+/// with `EBADF`, which would make every presence check fail on a home directory served over NFS.
 pub(crate) fn try_flock_existing(path: &Path) -> Result<Option<ShadowLock>, ShadowError> {
     let not_a_lock_file = || ShadowError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "not a lock file"));
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
     {
         Ok(file) => file,
-        // `O_NOFOLLOW` on a symlink.
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(not_a_lock_file()),
+        // `O_NOFOLLOW` on a symlink; a directory, which cannot be opened for writing; a socket,
+        // which cannot be opened at all.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::EISDIR | libc::ENXIO)) => {
+            return Err(not_a_lock_file())
+        }
         Err(e) => return Err(e.into()),
     };
     if !file.metadata()?.is_file() {
@@ -1523,6 +1535,25 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The access mode `file` was opened with.
+    fn access_mode(file: &File) -> libc::c_int {
+        // SAFETY: the descriptor is `file`'s own and open for the call; `F_GETFL` takes no pointer.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "{}", std::io::Error::last_os_error());
+        flags & libc::O_ACCMODE
+    }
+
+    /// An exclusive `flock` on NFS needs a descriptor open for writing; this pins it on every file
+    /// system, since a local one takes the lock either way and would not notice the difference.
+    #[test]
+    fn a_probe_lock_is_taken_on_a_descriptor_open_for_writing() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-shadow", "probe-mode");
+        let path = dir.join("windows-1");
+        std::fs::write(&path, b"").unwrap();
+        let probe = try_flock_existing(&path).unwrap().expect("nobody holds it");
+        assert_eq!(access_mode(&probe.file), libc::O_RDWR);
+    }
 
     #[test]
     fn a_label_round_trips_through_its_message() {

@@ -199,6 +199,28 @@ impl TerminalMetrics {
         self.fallback.borrow_mut().insert(key, found.clone());
         found.unwrap_or_else(|| styled(self.font.clone()))
     }
+    /// The face to draw the grapheme `text` with: [`TerminalMetrics::font_for`] its first character,
+    /// unless that face lacks a later one.
+    ///
+    /// A primary face can have a base letter and not the combining mark on it (Andale Mono has `e`
+    /// and no U+0301), and drawing `é` in it loses the accent without a trace. Then the face found
+    /// for the first character it lacks is used, but only when that face has every character of
+    /// the grapheme: one that lacked the base would lose the letter instead of the mark.
+    pub fn font_for_text(&self, text: &str, bold: bool, italic: bool) -> Font {
+        let first = text.chars().next().unwrap_or(' ');
+        let font = self.font_for(first, bold, italic);
+        let has = |font: &Font, ch: char| font.unichar_to_glyph(ch as i32) != 0;
+        let Some(missing) = text.chars().skip(1).find(|&ch| !has(&font, ch)) else {
+            return font;
+        };
+        let other = self.font_for(missing, bold, italic);
+        if text.chars().all(|ch| has(&other, ch)) {
+            other
+        } else {
+            font
+        }
+    }
+
     pub fn font_mgr(&self) -> &FontMgr {
         &self.font_mgr
     }
@@ -408,6 +430,46 @@ mod tests {
                  falls back differently by family on this machine; the check above could not fail"
             );
         }
+    }
+
+    /// A combining mark the primary face lacks is not lost with its base: the grapheme is drawn in
+    /// a face that has both whenever the fallback finds one.
+    ///
+    /// This depends on the fonts installed, and says so: where the primary face has U+0301 the old
+    /// first-character rule draws it too, and the test prints that it could not fail. Where it does
+    /// not (Andale Mono as `monospace`), this was checked red against the first-character rule.
+    #[test]
+    fn a_combining_mark_the_primary_face_lacks_is_drawn_with_its_base() {
+        let metrics = TerminalMetrics::new(800.0, 600.0, 1.0);
+        let has = |font: &Font, ch: char| font.unichar_to_glyph(ch as i32) != 0;
+        let mark = '\u{301}';
+        if has(metrics.font(), mark) {
+            eprintln!(
+                "a_combining_mark_the_primary_face_lacks_is_drawn_with_its_base: the primary face has \
+                 U+0301 on this machine; the check below could not fail"
+            );
+        }
+        let fallback = metrics.font_for(mark, false, false);
+        if has(&fallback, 'e') && has(&fallback, mark) {
+            let drawn = metrics.font_for_text("e\u{301}", false, false);
+            assert!(
+                has(&drawn, 'e') && has(&drawn, mark),
+                "{}",
+                drawn.typeface().family_name()
+            );
+        } else {
+            eprintln!(
+                "a_combining_mark_the_primary_face_lacks_is_drawn_with_its_base: the face found for U+0301 \
+                 ({}) does not have both `e` and U+0301 on this machine, so no face can draw the grapheme \
+                 whole and the check above was not made",
+                fallback.typeface().family_name()
+            );
+        }
+        // A grapheme the primary face covers keeps it, whatever the fallback would say.
+        assert_eq!(
+            metrics.font_for_text("e", false, false).typeface().family_name(),
+            metrics.font().typeface().family_name()
+        );
     }
 
     /// The other half of `fallback_family`: a codepoint outside the private-use areas is looked up

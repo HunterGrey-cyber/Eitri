@@ -6,9 +6,10 @@
 //! umask 022. Where the path down to the state home is traversable by other accounts (Eitri is
 //! the first to create `~/.local/state`, or `XDG_STATE_HOME` points somewhere shared), any local
 //! user could read every prompt typed into neovibe. The rule now:
-//! directories 0700, files 0600, and a directory of Eitri's own that an older build left open is
-//! tightened when Eitri next writes into it -- `chmod`, never `chown`, and only on a real
-//! directory owned by this user.
+//! directories 0700, files 0600, set exactly whatever the umask, and a directory of Eitri's own
+//! with any other mode (an older build's `0755`, a `0500` a restrictive umask left) is set to
+//! 0700 when Eitri next writes into it -- `chmod`, never `chown`, and only on a real directory
+//! owned by this user.
 //!
 //! Also the one place `eitri-core` asks "is this ours?" ([`current_uid`]): its stale-instance
 //! sweep must skip another user's entries in a shared `TMPDIR` before connecting to anything.
@@ -61,9 +62,11 @@ pub fn is_own_real_dir(path: &Path) -> bool {
     matches!(path.symlink_metadata(), Ok(meta) if meta.is_dir() && meta.uid() == current_uid())
 }
 
-/// Creates `dir` and every missing directory above it with mode 0700, then tightens `root` and
-/// each existing directory from `root` down to `dir` to 0700 where one of them is still open to
-/// the group or others -- an older build's `0755`. The walk is by open handle
+/// Sets `root` and each directory that already exists from `root` down towards `dir` to exactly
+/// 0700 where its mode is anything else -- an older build's `0755`, or a `0500` a restrictive
+/// umask left, in which nothing could be created -- then creates `dir` and every missing directory
+/// above it, one at a time, each set to exactly 0700 before the next is made inside it, and walks
+/// from `root` to `dir` once more. The walk is by open handle
 /// (`openat` from the previous component), never by path, so a symlink anywhere from `root`
 /// itself down to `dir`'s parent stops the walk there rather than being resolved through -- see
 /// the module doc's C3 section for why that matters and what a symlinked `root` means.
@@ -79,22 +82,64 @@ pub fn is_own_real_dir(path: &Path) -> bool {
 /// sit next to -- the owner of `root` can rename any directory inside it away and put one of their
 /// own in its place, whatever the modes below it say.
 pub fn create_private_dir_all(dir: &Path, root: &Path) -> std::io::Result<()> {
-    // A `root` of someone else's is refused before anything is created inside it, not only after.
-    if dir.starts_with(root) {
-        match std::fs::metadata(root) {
-            Ok(meta) => refuse_foreign(root, &meta)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+    // What already exists from `root` down is judged before anything is created or changed: a
+    // directory of someone else's is refused here, not only after.
+    refuse_foreign_existing(dir, root)?;
+    // Then what exists is set to 0700 before anything is made inside it: an older build under a
+    // restrictive umask left 0500 directories, and creating the next level in one fails.
+    if let Ok(below) = dir.strip_prefix(root) {
+        tighten_from_root(root, below);
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(PRIVATE_DIR_MODE)
-        .create(dir)?;
+    create_dirs_owner_usable(dir)?;
     refuse_foreign_dirs(dir, root)?;
     match dir.strip_prefix(root) {
         Ok(below) => tighten_from_root(root, below),
         Err(_) => tighten_own_dir(dir),
+    }
+    Ok(())
+}
+
+/// Creates `dir` and whatever is missing above it, one directory at a time, each set to exactly 0700
+/// before the next is made inside it. A recursive create leaves that to the umask, and one that takes
+/// the owner's bits away (0277 gives 0500) makes the first new directory one nothing can be created
+/// in. Directories that already exist are left as they are here.
+fn create_dirs_owner_usable(dir: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    for ancestor in dir.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(ancestor),
+            Err(e) => return Err(e),
+        }
+    }
+    for path in missing.into_iter().rev() {
+        match std::fs::DirBuilder::new().mode(PRIVATE_DIR_MODE).create(path) {
+            Ok(()) => make_dir_private(path)?,
+            // Made meanwhile by someone else, as a recursive create would also accept.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && std::fs::metadata(path)?.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// [`refuse_foreign_dirs`] for the part of the path that already exists: a directory not there yet
+/// is skipped, as this runs before anything is created. Only `dir` is judged when it is not inside
+/// `root`.
+fn refuse_foreign_existing(dir: &Path, root: &Path) -> std::io::Result<()> {
+    let inside = dir.starts_with(root);
+    for candidate in dir.ancestors() {
+        match std::fs::metadata(candidate) {
+            Ok(meta) => refuse_foreign(candidate, &meta)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        if !inside || candidate == root {
+            break;
+        }
     }
     Ok(())
 }
@@ -144,8 +189,9 @@ fn tighten_from_root(root: &Path, below: &Path) {
     }
 }
 
-/// Sets `dir` to 0700 when it is a real directory owned by this user and still has any group or
-/// other bit. Best-effort and silent: a failure leaves the files below it 0600 all the same.
+/// Sets `dir` to exactly 0700 when it is a real directory owned by this user whose mode is anything
+/// else (a group or other bit set, or an owner bit missing). Best-effort and silent: a failure
+/// leaves the files below it 0600 all the same.
 ///
 /// This opens `dir` by *path*, so -- exactly as before C3 -- only `dir`'s own last path component
 /// is protected from being a symlink (`O_NOFOLLOW`); an ancestor of `dir` that is itself a symlink
@@ -195,13 +241,15 @@ fn openat_dir_handle(parent: &std::fs::File, name: &std::ffi::OsStr) -> Option<s
     Some(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-/// `fchmod`s `handle` to 0700 when it `fstat`s as a directory owned by this user with any group or
-/// other bit still set. Shared by [`tighten_own_dir`] and [`tighten_from_root`]'s walk: what is
-/// checked here is always exactly the handle that would be changed, never a path re-resolved after
-/// the check.
+/// `fchmod`s `handle` to 0700 when it `fstat`s as a directory owned by this user whose mode is
+/// anything else: a group or other bit still set, or an owner bit missing. The second is what a
+/// restrictive umask leaves (0277 makes a new directory 0500, which nothing can be created in), so
+/// the mode is set exactly rather than only narrowed. Shared by [`tighten_own_dir`] and
+/// [`tighten_from_root`]'s walk: what is checked here is always exactly the handle that would be
+/// changed, never a path re-resolved after the check.
 fn tighten_handle(handle: &std::fs::File) {
     let Ok(meta) = handle.metadata() else { return };
-    if !meta.is_dir() || meta.uid() != current_uid() || meta.mode() & 0o077 == 0 {
+    if !meta.is_dir() || meta.uid() != current_uid() || meta.mode() & 0o777 == PRIVATE_DIR_MODE {
         return;
     }
     let _ = fchmod(handle, PRIVATE_DIR_MODE);
@@ -328,6 +376,39 @@ mod tests {
         );
     }
 
+    /// A umask that takes the owner's own bits away (0277 leaves `0500` directories and `0400`
+    /// files) must not leave a directory nothing can be created in or a file nothing can rewrite:
+    /// the modes are set exactly, not only tightened.
+    #[test]
+    fn a_umask_that_takes_the_owners_bits_still_gives_0700_and_0600() {
+        crate::test_umask::with_umask(
+            concat!(
+                module_path!(),
+                "::a_umask_that_takes_the_owners_bits_still_gives_0700_and_0600"
+            ),
+            0o277,
+            || {
+                let base = scratch("umask-owner");
+                // Above the root nothing is ever changed, so the test opens up its own scratch,
+                // which the umask made 0500 too, as a user's state home would already be.
+                std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let root = base.join("eitri");
+                let dir = root.join("conversations").join("abc");
+                let file = dir.join("record.json");
+                create_private_dir_all(&dir, &root)
+                    .and_then(|()| write_private(&file, b"{}"))
+                    .unwrap();
+                assert_eq!(mode(&root), 0o700);
+                assert_eq!(mode(&root.join("conversations")), 0o700);
+                assert_eq!(mode(&dir), 0o700);
+                assert_eq!(mode(&file), 0o600);
+                write_private(&file, b"{\"again\":1}").unwrap();
+                assert_eq!(std::fs::read(&file).unwrap(), b"{\"again\":1}");
+                std::fs::remove_dir_all(&base).unwrap();
+            },
+        );
+    }
+
     /// An older build's `0755` tree is tightened on the next write, from the root down; nothing
     /// above the root is touched.
     #[test]
@@ -350,6 +431,46 @@ mod tests {
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&old_file), 0o600, "an existing file is narrowed on its next write");
         assert_eq!(mode(&base), 0o755, "above the root is never changed");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A root a restrictive umask left at 0500 by an older build, with nothing inside it yet, is set
+    /// to 0700 before anything is made in it: otherwise the first directory below it cannot be
+    /// created and the root is never repaired.
+    #[test]
+    fn a_0500_root_is_repaired_before_a_directory_is_made_in_it() {
+        let base = scratch("root-0500");
+        let root = base.join("eitri");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let dir = root.join("conversations").join("abc");
+        let made = create_private_dir_all(&dir, &root);
+        // Open it up again before asserting, so a failure still leaves a removable scratch.
+        let root_mode = mode(&root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        made.unwrap();
+        assert_eq!(root_mode, 0o700);
+        assert_eq!(mode(&root.join("conversations")), 0o700);
+        assert_eq!(mode(&dir), 0o700);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The same for a directory between the root and the one asked for.
+    #[test]
+    fn a_0500_directory_below_the_root_is_repaired_before_a_directory_is_made_in_it() {
+        let base = scratch("middle-0500");
+        let root = base.join("eitri");
+        let middle = root.join("conversations");
+        std::fs::create_dir_all(&middle).unwrap();
+        std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let dir = middle.join("abc");
+        let made = create_private_dir_all(&dir, &root);
+        let middle_mode = mode(&middle);
+        std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o700)).unwrap();
+        made.unwrap();
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(middle_mode, 0o700);
+        assert_eq!(mode(&dir), 0o700);
         std::fs::remove_dir_all(&base).unwrap();
     }
 

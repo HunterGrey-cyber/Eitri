@@ -1,4 +1,4 @@
-//! Diffs between snapshots against real git, in temporary directories under the target dir.
+//! Diffs between snapshots against real git, in directories under the system's temporary directory.
 //!
 //! The test-side git is isolated like the shadow's own (cleared environment, no global or system
 //! config), so the machine's configuration cannot change a result.
@@ -6,7 +6,6 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use eitri_core::turn_review::{
     changed_files, file_hunks, review_dir_for, ChangeKind, Limits, LineKind, Shadow, ShadowError, Side, SnapshotKind,
@@ -17,16 +16,17 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("turn_review_diff")
-            .join(format!(
-                "{name}-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // The system's temporary directory, not the target dir: real snapshots must finish inside
+        // the waits below, and a checkout on a network mount can take longer than that. A fresh
+        // directory of this user's own holds it: a random name made here at 0700, never one already
+        // in place in a shared directory, set exactly so whatever the umask, and removed on drop.
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!(
+            "eitri-turn_review_diff-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         Scratch(dir.canonicalize().unwrap())
     }
 
@@ -44,7 +44,22 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // A snapshot or journal worker a test started can still write here for a moment after the
+        // test's last line (they are not joined), and a removal racing it leaves part of the tree,
+        // or the worker makes it again. So the directory must stay gone for a while, up to 5 s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut absent_since = None;
+        while std::time::Instant::now() < deadline {
+            if self.0.exists() {
+                let _ = std::fs::remove_dir_all(&self.0);
+                absent_since = None;
+            } else if absent_since.get_or_insert_with(std::time::Instant::now).elapsed()
+                > std::time::Duration::from_millis(100)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 

@@ -141,14 +141,86 @@ fn files_are_private_and_a_leftover_is_swept_not_reported() {
     assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
 }
 
-/// What the child half of `a_killed_window_releases_and_is_swept` runs: it holds a window and a
-/// running turn until killed. A bare run with nothing to hold does nothing.
+/// A directory or a socket at a presence path is no lock file and is skipped like a symlink: the
+/// probe opens for writing, which a directory refuses with `EISDIR` and a socket with `ENXIO`, and
+/// neither may block every revert.
 #[test]
-#[ignore = "run by a_killed_window_releases_and_is_swept as a child process"]
+fn a_directory_or_a_socket_at_a_presence_path_is_skipped() {
+    let scratch = Scratch::new("not-a-file");
+    let dir = scratch.review_dir();
+    drop(Presence::open(&dir, 4242).unwrap());
+    std::fs::create_dir(dir.join("windows/9")).unwrap();
+    std::fs::create_dir(dir.join("running/9.1")).unwrap();
+    // `mknod` makes the socket node without binding it, so the path's length does not matter.
+    let socket = std::ffi::CString::new(dir.join("windows/10").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: `socket` is a valid NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mknod(socket.as_ptr(), libc::S_IFSOCK | 0o600, 0) }, 0);
+    assert_eq!(busy_elsewhere(&dir, 100).unwrap(), None);
+    assert!(dir.join("windows/9").is_dir(), "a directory is left alone");
+    assert!(dir.join("running/9.1").is_dir());
+    assert!(dir.join("windows/10").exists(), "a socket is left alone");
+}
+
+/// A window started under a umask that takes the owner's write bit away is still seen by another
+/// window, and its files are still this user's 0600 ones. The probe opens another window's file for
+/// writing (an exclusive lock on NFS needs that), so a file created 0400 would refuse every revert.
+/// The umask is process-wide, so it is set in a child of its own rather than in this test runner.
+#[test]
+fn a_window_under_a_restrictive_umask_is_still_seen() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("umask");
+    let dir = scratch.review_dir();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "presence_child", "--ignored", "--test-threads=1"])
+        .env("EITRI_PRESENCE_CHILD_DIR", &dir)
+        .env("EITRI_PRESENCE_CHILD_UMASK", "277")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let seen = loop {
+        match busy_elsewhere(&dir, 100) {
+            Ok(Some(Busy::TurnRunning { pid: held })) if held == pid => break Ok(()),
+            Ok(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(other) => break Err(format!("the child's turn was never seen: {other:?}")),
+            Err(e) => break Err(format!("the other windows could not be listed: {e}")),
+        }
+    };
+    let modes = ["windows", "running"].map(|sub| {
+        let file = if sub == "windows" {
+            dir.join(format!("windows/{pid}"))
+        } else {
+            dir.join(format!("running/{pid}.5"))
+        };
+        std::fs::metadata(&file).map(|m| m.permissions().mode() & 0o777)
+    });
+    // Killed by the pid captured at the spawn, before anything can fail.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    seen.unwrap();
+    for mode in modes {
+        assert_eq!(mode.unwrap(), 0o600);
+    }
+}
+
+/// What the child half of `a_killed_window_releases_and_is_swept` and
+/// `a_window_under_a_restrictive_umask_is_still_seen` runs: it holds a window and a running turn
+/// until killed, under the umask `EITRI_PRESENCE_CHILD_UMASK` names (octal) when it names one. A
+/// bare run with nothing to hold does nothing.
+#[test]
+#[ignore = "run as a child process by a_killed_window_releases_and_is_swept and a_window_under_a_restrictive_umask_is_still_seen"]
 fn presence_child() {
     let Some(dir) = std::env::var_os("EITRI_PRESENCE_CHILD_DIR") else {
         return;
     };
+    if let Some(mask) = std::env::var_os("EITRI_PRESENCE_CHILD_UMASK") {
+        let mask = libc::mode_t::from_str_radix(mask.to_str().unwrap(), 8).unwrap();
+        // SAFETY: `umask` has no preconditions; this process is a child of its own, so no other
+        // test's files are created under it.
+        unsafe { libc::umask(mask) };
+    }
     let mut presence = Presence::open(Path::new(&dir), std::process::id()).unwrap();
     presence.turn_started(5).unwrap();
     // Gives up on its own if its parent never kills it.

@@ -578,7 +578,7 @@ fn flush_history(state: &Mutex<IngestState>, context: &AdoptionContext) {
         tool_calls,
     );
     #[cfg(test)]
-    tests::note_history_writer_thread();
+    tests::note_history_writer_thread(&context.conversation_id);
     if let Err(e) = crate::history::store::save(&history) {
         eprintln!("agent: could not store the history of session {provider_session_id}: {e}");
         return;
@@ -637,17 +637,31 @@ fn adopt_provider_session(
 pub(crate) mod tests {
     use super::*;
     use crate::{ContentKind, ProjectionStatus};
+    use std::collections::BTreeMap;
 
-    /// The name of the thread that last wrote a stored history.
+    /// The name of the thread that last wrote each conversation's stored history, by conversation
+    /// id.
     ///
     /// Test-only, written by `flush_history`, which is the only place a history write happens.
     /// It exists because "the write is on the ingestion thread" (invariant 12) is otherwise only
     /// argued from where the code sits, and the title feature's own history is what that argument
-    /// is worth: its first version made the same argument from a lock and was wrong.
-    pub(crate) static HISTORY_WRITER_THREAD: Mutex<Option<String>> = Mutex::new(None);
+    /// is worth: its first version made the same argument from a lock and was wrong. It is kept per
+    /// conversation because tests run in parallel and some call `flush_history` on their own
+    /// thread: one slot for the whole process let such a test's write land between another test's
+    /// write and its read.
+    static HISTORY_WRITER_THREAD: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
-    pub(super) fn note_history_writer_thread() {
-        *HISTORY_WRITER_THREAD.lock().unwrap() = Some(std::thread::current().name().unwrap_or("<unnamed>").to_string());
+    pub(super) fn note_history_writer_thread(conversation_id: &str) {
+        let name = std::thread::current().name().unwrap_or("<unnamed>").to_string();
+        HISTORY_WRITER_THREAD
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_string(), name);
+    }
+
+    /// The thread that last wrote `conversation_id`'s stored history, if any did.
+    pub(crate) fn history_writer_thread(conversation_id: &str) -> Option<String> {
+        HISTORY_WRITER_THREAD.lock().unwrap().get(conversation_id).cloned()
     }
 
     fn adoption_context(conversation_id: &str) -> AdoptionContext {

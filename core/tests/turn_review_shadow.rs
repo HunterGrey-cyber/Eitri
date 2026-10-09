@@ -1,4 +1,4 @@
-//! The shadow repository against real git, in temporary directories under the target dir.
+//! The shadow repository against real git, in directories under the system's temporary directory.
 //!
 //! The git this file runs itself (to build test projects and to inspect the shadow) is isolated
 //! the same way the shadow's is -- a cleared environment, no global or system config -- so neither
@@ -9,7 +9,6 @@ use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, RwLock};
 use std::time::Duration;
 
@@ -25,21 +24,23 @@ fn environment() -> std::sync::RwLockReadGuard<'static, ()> {
     ENVIRONMENT.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A directory of the test's own under the target dir, removed when dropped.
+/// A directory of the test's own under the system's temporary directory, removed when dropped.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("turn_review_shadow")
-            .join(format!(
-                "{name}-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // The system's temporary directory, not the target dir: these tests need user extended
+        // attributes (the in-place write), git's fsmonitor and a disk fast enough for the snapshot
+        // budget, and a checkout on a network mount has none of the three. A fresh directory of
+        // this user's own holds it: a random name made here at 0700, never one already in place in
+        // a shared directory, set exactly so whatever the umask, and removed on drop.
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!(
+            "eitri-turn_review_shadow-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         Scratch(dir.canonicalize().unwrap())
     }
 
@@ -65,14 +66,32 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // A snapshot or journal worker a test started can still write here for a moment after the
+        // test's last line (they are not joined), and a removal racing it leaves part of the tree,
+        // or the worker makes it again. So the directory must stay gone for a while, up to 5 s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut absent_since = None;
+        while std::time::Instant::now() < deadline {
+            if self.0.exists() {
+                let _ = std::fs::remove_dir_all(&self.0);
+                absent_since = None;
+            } else if absent_since.get_or_insert_with(std::time::Instant::now).elapsed()
+                > std::time::Duration::from_millis(100)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
 /// Test-side git in `dir`, isolated from the machine's config and from the process environment.
+/// Automatic maintenance is off: after a `commit` git may start it in the background, and its
+/// `objects/maintenance.lock` would then appear in a repository a test watches for changes.
 fn tgit_cmd(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.env_clear()
+    cmd.args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+        .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", dir)
         .env("LC_ALL", "C")
@@ -697,6 +716,77 @@ fn a_non_git_project_and_a_linked_worktree() {
         "the common dir's info/exclude was not honoured"
     );
     assert!(!entries.contains_key(".git"));
+}
+
+/// A project that is a directory below a repository's top level, as a project inside a monorepo
+/// is: the snapshot is taken of the project alone, the repository above it is never written, and
+/// that repository's `info/exclude` is not taken (it is copied only for a project that is the top
+/// of its work tree). The scratch directories are not inside any repository, so without this the
+/// case would go untested.
+#[test]
+fn a_project_below_a_repositorys_top_level() {
+    let _env = environment();
+    let scratch = Scratch::new("below-top");
+    let repo = scratch.path("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    tgit(&repo, &["init", "-q"]);
+    write(&repo.join("top.txt"), b"top\n");
+    write(&repo.join("sub/a.txt"), b"one\n");
+    write(&repo.join("sub/.gitignore"), b"*.tmp\n");
+    tgit(&repo, &["add", "top.txt", "sub/a.txt", "sub/.gitignore"]);
+    tgit(&repo, &["commit", "-qm", "first"]);
+    write(&repo.join(".git/info/exclude"), b"secret\n");
+    let project = repo.join("sub");
+    write(&project.join("a.txt"), b"dirty\n");
+    write(&project.join("y.tmp"), b"ignored here\n");
+    write(&project.join("new.txt"), b"new\n");
+
+    let observe = || {
+        (
+            tree_bytes(&repo.join(".git")),
+            text(&tgit(&repo, &["for-each-ref"])),
+            text(&tgit(&repo, &["count-objects", "-v"])),
+        )
+    };
+    let before = observe();
+    let shadow = scratch.shadow(&project);
+    let base = snap(&shadow, SESSION, 1, SnapshotKind::Base);
+    let end = snap(&shadow, SESSION, 1, SnapshotKind::End);
+    let entries = tree_entries(&shadow, &end.commit);
+    assert!(
+        entries.contains_key("a.txt") && entries.contains_key("new.txt") && entries.contains_key(".gitignore"),
+        "{entries:?}"
+    );
+    assert!(
+        !entries.contains_key("top.txt"),
+        "only the project is snapshotted: {entries:?}"
+    );
+    assert!(
+        !entries.contains_key("sub/a.txt"),
+        "paths are the project's own: {entries:?}"
+    );
+    assert!(
+        !entries.contains_key("y.tmp"),
+        "the project's own .gitignore is honoured: {entries:?}"
+    );
+    assert_eq!(
+        shadow.read_blob(&base.commit, Path::new("a.txt")).unwrap().as_deref(),
+        Some(&b"dirty\n"[..])
+    );
+    assert!(
+        !shadow.git_dir().join("info/exclude").exists(),
+        "a project below the top does not take the repository's info/exclude"
+    );
+    let after = observe();
+    let changed: Vec<_> = before
+        .0
+        .keys()
+        .chain(after.0.keys())
+        .filter(|path| before.0.get(*path) != after.0.get(*path))
+        .collect();
+    assert!(changed.is_empty(), "the repository's .git changed: {changed:?}");
+    assert_eq!(before.1, after.1, "refs");
+    assert_eq!(before.2, after.2, "object count");
 }
 
 #[test]

@@ -1285,6 +1285,24 @@ mod tests {
         AgentConversation::create(Arc::new(Shared(fake)), dir, project)
     }
 
+    /// Whether the session's lease can be taken, asked again for up to a second while it looks held.
+    /// A lock just let go can look held for a moment while another test thread starts a child
+    /// process (the child shares every descriptor until it execs); one that was never let go is
+    /// still held after the second. So what this checks is "released within a second", a little
+    /// weaker than "released when its holder was dropped".
+    fn lease_comes_free(cwd: &str, session: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match SessionLease::try_acquire(PROVIDER_NAME, cwd, session) {
+                Ok(_) => return true,
+                Err(LeaseError::AlreadyHeld) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
     /// Waits for the ingestion thread to reach a state, or fails.
     ///
     /// These tests used to drive folding by calling `pump()` themselves, which no longer exists:
@@ -1589,7 +1607,7 @@ mod tests {
         fake.queue(turn_completed("t1"));
         stored_history(&conversation);
 
-        let writer = crate::ingestion::tests::HISTORY_WRITER_THREAD.lock().unwrap().clone();
+        let writer = crate::ingestion::tests::history_writer_thread(conversation.conversation_id());
         let writer = writer.expect("a history write must have been recorded");
         assert_eq!(
             writer, "eitri-agent-ingest",
@@ -2240,7 +2258,7 @@ mod tests {
         // provider before the lease -- is actually dropped, the lease goes too.
         drop(conversation);
         assert!(
-            SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-abc").is_ok(),
+            lease_comes_free(&cwd, "claude-uuid-abc"),
             "the lease must still be released once the conversation itself is dropped"
         );
     }
@@ -2289,7 +2307,7 @@ mod tests {
 
         drop(conversation);
         assert!(
-            SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-abc").is_ok(),
+            lease_comes_free(&cwd, "claude-uuid-abc"),
             "the lease must still be released once the conversation itself is dropped"
         );
     }
@@ -2398,10 +2416,7 @@ mod tests {
             "the handed lease is still the one held while the conversation lives"
         );
         drop(conversation);
-        assert!(
-            SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).is_ok(),
-            "and it goes with the conversation"
-        );
+        assert!(lease_comes_free(&cwd, session), "and it goes with the conversation");
     }
 
     /// A lease for some other session must never stand in for this one: nothing is asked of the
@@ -2452,7 +2467,7 @@ mod tests {
         let result = AgentConversation::resume_holding(provider, &dir, session, Some(lease), ProjectTrust::Untrusted);
         assert!(matches!(result, Err(ConversationError::ResumeRejected { .. })));
         assert!(
-            SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).is_ok(),
+            lease_comes_free(&cwd, session),
             "the session is free again once its resume failed"
         );
     }

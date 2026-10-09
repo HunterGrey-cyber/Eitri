@@ -10,7 +10,6 @@ use std::cell::{Cell, RefCell};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,28 +38,45 @@ const OTHER_PID: u32 = 999_999;
 
 // ---- scratch and files -----------------------------------------------------------------------------
 
-/// A directory of the test's own under the target dir, removed when dropped.
+/// A directory of the test's own under the system's temporary directory, removed when dropped.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("turn_review_flow")
-            .join(format!(
-                "{name}-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // The system's temporary directory, not the target dir: these tests need user extended
+        // attributes (the in-place write), git's fsmonitor and a disk fast enough for the snapshot
+        // budget, and a checkout on a network mount has none of the three. A fresh directory of
+        // this user's own holds it: a random name made here at 0700, never one already in place in
+        // a shared directory, set exactly so whatever the umask, and removed on drop.
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!(
+            "eitri-turn_review_flow-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         Scratch(dir.canonicalize().unwrap())
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // A snapshot or journal worker a test started can still write here for a moment after the
+        // test's last line (they are not joined), and a removal racing it leaves part of the tree,
+        // or the worker makes it again. So the directory must stay gone for a while, up to 5 s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut absent_since = None;
+        while std::time::Instant::now() < deadline {
+            if self.0.exists() {
+                let _ = std::fs::remove_dir_all(&self.0);
+                absent_since = None;
+            } else if absent_since.get_or_insert_with(std::time::Instant::now).elapsed()
+                > std::time::Duration::from_millis(100)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
@@ -1436,6 +1452,12 @@ fn the_journal_is_read_at_the_first_ready_after_a_review_exists() {
     assert_eq!(flow.jobs_started(), 1, "asked once the review exists");
     assert!(flow.document_ready(&tabs).is_empty());
     assert_eq!(flow.jobs_started(), 1, "and only once");
+    // The journal is read on a worker; one still running after the test would create its
+    // directory again inside the scratch that is being removed.
+    until("the journal read to finish", || {
+        flow.tick(&mut tabs, None, Instant::now());
+        flow.is_idle()
+    });
 }
 
 // ---- review off ------------------------------------------------------------------------------------

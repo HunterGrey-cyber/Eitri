@@ -206,7 +206,7 @@ fn draw_text(
     // Face selection (including fallback for graphemes the primary face lacks) lives in the
     // metrics, with the rest of the font decisions and with the memoisation that keeps it off the
     // per-frame fontconfig path.
-    let font = metrics.font_for(text.chars().next().unwrap_or(' '), style.bold, style.italic);
+    let font = metrics.font_for_text(text, style.bold, style.italic);
 
     // One blob per op. A wide glyph is one draw spanning two columns: there is no second op for the
     // second column and nothing here to suppress, because the spacer concept never reaches a backend.
@@ -237,8 +237,61 @@ fn draw_text(
     }
 }
 
+/// Where an underline's bars go: the first bar's top, every bar's thickness, and the second bar's top
+/// for a double one. In whole pixels, because rules are filled without antialiasing and so cover
+/// whole pixel rows anyway.
+///
+/// In order of what gives way last: a rule never reaches the row below (only that row's next repaint
+/// would take it away), never starts above the baseline (it would be drawn over the bottoms of the
+/// letters), and sits a fixed share of the cell below the baseline when there is room. A double
+/// rule's first bar keeps a pixel clear below the baseline where it can; to fit, the gap between its
+/// bars shrinks to one pixel first, then the pair moves up towards the baseline, and only in a cell
+/// with less room than that do the bars get thinner. A face with a shallow descent needs all of it
+/// (Andale Mono leaves 3.4 px of a 17 px cell below the baseline).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct UnderlineRows {
+    y: f32,
+    thickness: f32,
+    second: Option<f32>,
+}
+
+fn underline_rows(cell: Rect, baseline_y: f32, thickness: f32, double: bool) -> UnderlineRows {
+    let bottom = cell.bottom.floor();
+    let first_clear = baseline_y.ceil().min(bottom - 1.0);
+    let room = bottom - first_clear;
+    let preferred = (baseline_y + cell.height() * UNDERLINE_DROP).round();
+    let mut t = thickness.round().max(1.0);
+    if !double {
+        t = t.min(room.max(1.0));
+        let y = preferred.min(bottom - t).max(first_clear.min(bottom - t));
+        return UnderlineRows {
+            y,
+            thickness: t,
+            second: None,
+        };
+    }
+    let wanted_top = (baseline_y + 1.0).ceil();
+    let mut gap = t;
+    if wanted_top + 2.0 * t + gap > bottom {
+        gap = (bottom - wanted_top - 2.0 * t).max(1.0);
+    }
+    if 2.0 * t + gap > room {
+        t = ((room - gap) / 2.0).floor().max(1.0);
+    }
+    let lowest = bottom - (2.0 * t + gap);
+    // Above the baseline only in a cell too shallow for the pair at one pixel each: the next row
+    // gives way last.
+    let y = preferred.max(wanted_top).min(lowest).max(first_clear.min(lowest));
+    UnderlineRows {
+        y,
+        thickness: t,
+        second: Some(y + t + gap),
+    }
+}
+
 fn draw_underline(canvas: &Canvas, cell: Rect, baseline_y: f32, thickness: f32, kind: UnderlineKind, color: RgbColor) {
-    let y = baseline_y + cell.height() * UNDERLINE_DROP;
+    let UnderlineRows { y, thickness, second } =
+        underline_rows(cell, baseline_y, thickness, kind == UnderlineKind::Double);
     let paint = fill_paint(color);
     let bar = |canvas: &Canvas, y: f32| {
         canvas.draw_rect(Rect::from_xywh(cell.left, y, cell.width(), thickness), &paint);
@@ -250,7 +303,9 @@ fn draw_underline(canvas: &Canvas, cell: Rect, baseline_y: f32, thickness: f32, 
         // is indistinguishable from Single, which is the whole distinction the terminal drew.
         UnderlineKind::Double => {
             bar(canvas, y);
-            bar(canvas, y + thickness * 2.0);
+            if let Some(second) = second {
+                bar(canvas, second);
+            }
         }
         UnderlineKind::Curl | UnderlineKind::Dotted | UnderlineKind::Dashed => {
             // Dashes approximate all three patterned underline kinds and keep them distinct from Single.
@@ -337,6 +392,102 @@ mod tests {
                 assert_eq!(*background, palette.get(CURSOR), "fill in the cursor colour");
             }
             other => panic!("expected one DrawNotice, got {other:?}"),
+        }
+    }
+
+    /// An underline stays between its baseline and its cell's bottom, of every kind: it never reaches
+    /// the row below, and never rises above the baseline into the letters. The geometries are
+    /// Andale Mono's at 15 pt (a 17 px cell with the baseline at 13.6, where the rule once landed on
+    /// the next row and a clamped double one then rose above the baseline), a DejaVu-like one, and
+    /// a roomy one.
+    #[test]
+    fn an_underline_stays_between_its_baseline_and_its_cells_bottom() {
+        for (height, baseline) in [(17.0_f32, 13.6_f32), (18.0, 14.1), (24.0, 17.0)] {
+            let cell = Rect::from_xywh(0.0, 0.0, 9.0, height);
+            let thickness = (cell.height() * RULE_THICKNESS).max(1.0);
+            let rows = (height as usize) * 2;
+            for kind in [
+                UnderlineKind::Single,
+                UnderlineKind::Double,
+                UnderlineKind::Curl,
+                UnderlineKind::Dotted,
+                UnderlineKind::Dashed,
+            ] {
+                let mut surface = skia_safe::surfaces::raster_n32_premul(skia_safe::ISize::new(9, rows as i32))
+                    .expect("raster surface");
+                surface.canvas().clear(Color::BLACK);
+                draw_underline(
+                    surface.canvas(),
+                    cell,
+                    baseline,
+                    thickness,
+                    kind,
+                    RgbColor::new(0xff, 0xff, 0xff),
+                );
+                let info = surface.image_info();
+                let row_bytes = info.min_row_bytes();
+                let mut pixels = vec![0u8; row_bytes * rows];
+                assert!(surface.read_pixels(&info, &mut pixels, row_bytes, (0, 0)));
+                let lit = |rows: std::ops::Range<usize>| {
+                    rows.flat_map(|y| pixels[y * row_bytes..y * row_bytes + 9 * 4].chunks(4))
+                        .filter(|px| px[..3] != [0, 0, 0])
+                        .count()
+                };
+                let what = format!("{kind:?} in a {height} px cell, baseline {baseline}");
+                assert!(lit(0..height as usize) > 0, "{what}: no rule drawn in its own cell");
+                assert_eq!(lit(height as usize..rows), 0, "{what}: the rule reached the row below");
+                // Every pixel row that starts above the baseline: rules are filled without
+                // antialiasing, so a lit row the baseline crosses is a whole row of rule drawn over
+                // the bottoms of the letters.
+                assert_eq!(
+                    lit(0..baseline.ceil() as usize),
+                    0,
+                    "{what}: the rule rose above the baseline"
+                );
+            }
+        }
+    }
+
+    /// Where a double rule's bars go: the first a pixel clear below the baseline where the cell has
+    /// room for it, the gap given up before that, and always a visible gap between the bars.
+    #[test]
+    fn a_double_underline_gives_up_its_gap_before_its_clearance() {
+        let rows = |height: f32, baseline: f32| {
+            let cell = Rect::from_xywh(0.0, 0.0, 9.0, height);
+            underline_rows(cell, baseline, (height * RULE_THICKNESS).max(1.0), true)
+        };
+        // Andale Mono: 3.4 px below the baseline, so the pair starts on the first row under it.
+        assert_eq!(
+            rows(17.0, 13.6),
+            UnderlineRows {
+                y: 14.0,
+                thickness: 1.0,
+                second: Some(16.0)
+            }
+        );
+        // DejaVu-like: the gap shrinks to a pixel and the pair still starts under the baseline.
+        assert_eq!(
+            rows(18.0, 14.1),
+            UnderlineRows {
+                y: 15.0,
+                thickness: 1.0,
+                second: Some(17.0)
+            }
+        );
+        // Room for everything: a full gap, and the first bar a pixel clear of the baseline.
+        assert_eq!(
+            rows(24.0, 17.0),
+            UnderlineRows {
+                y: 18.0,
+                thickness: 2.0,
+                second: Some(22.0)
+            }
+        );
+        for (height, baseline) in [(17.0, 13.6), (18.0, 14.1), (24.0, 17.0), (12.0, 11.5), (40.0, 30.2)] {
+            let r = rows(height, baseline);
+            let second = r.second.expect("a double rule has two bars");
+            assert!(second >= r.y + r.thickness + 1.0, "{height}/{baseline}: {r:?}");
+            assert!(second + r.thickness <= height, "{height}/{baseline}: {r:?}");
         }
     }
 

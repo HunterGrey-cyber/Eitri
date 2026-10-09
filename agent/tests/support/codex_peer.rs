@@ -7,13 +7,14 @@ use agent::external::{DirTrust, Reviewer, TrustPlan};
 use agent::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkSpec, Skipped};
 use agent::providers::codex::config::{expected_echo, session_config};
 use agent::providers::codex::family::{Family, FamilyEdge};
-use agent::providers::codex::locate_codex;
 use agent::providers::codex::scripted_model::{ScriptedModel, Step};
 use agent::providers::codex::self_check::SCRIPTED_MODEL_SLUG;
+use agent::providers::codex::translate::version_text;
 use agent::providers::codex::tripwire;
 use agent::providers::codex::wire::{
     method, InitializeParams, ThreadResumeParams, ThreadStartParams, ThreadStartResponse, TurnStartParams,
 };
+use agent::providers::codex::{locate_codex, BinaryKey, MIN_CODEX};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -179,7 +180,25 @@ pub fn real_codex() -> PathBuf {
         "codex: {version} at {}; scripted model slug {SCRIPTED_MODEL_SLUG}",
         program.display()
     );
+    require_supported_codex(&program);
     program
+}
+
+/// Fails at once, saying why, when `program` is older than the oldest Codex Eitri starts. Eitri refuses
+/// such a binary before any session, so what one does with these tests says nothing about Eitri, and
+/// letting them run would only bury that under failures that look like protocol defects.
+pub fn require_supported_codex(program: &Path) {
+    let key = BinaryKey::of(program).unwrap_or_else(|e| panic!("{}: {e}", program.display()));
+    match key.version_numbers() {
+        Some(found) if found >= MIN_CODEX => {}
+        found => panic!(
+            "{} reports {:?} ({found:?}); these tests need Codex {} or newer, the oldest Eitri starts: \
+             put a newer codex first on PATH or name it in EITRI_CODEX",
+            program.display(),
+            key.version(),
+            version_text(MIN_CODEX),
+        ),
+    }
 }
 
 pub fn json_str<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {

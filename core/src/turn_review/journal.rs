@@ -303,11 +303,14 @@ impl Journal {
 
 /// `path`'s bytes when nobody holds its lock, and the descriptor that now holds it; `None` while
 /// another does. The lock is taken and the bytes read on one descriptor, opened without following
-/// a link or blocking, of a regular file this user owns.
+/// a link or blocking, of a regular file this user owns. It is opened for writing too, though
+/// nothing is written through it: on NFS Linux takes an `flock` as a byte-range lock, and an
+/// exclusive one fails with `EBADF` on a descriptor open only for reading.
 fn read_unheld(path: &Path) -> std::io::Result<Option<(File, Vec<u8>)>> {
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
         .open(path)?;
     lock_and_read(file, path)
 }
@@ -411,6 +414,21 @@ fn wall_clock_ms() -> u64 {
 mod tests {
     use super::*;
 
+    /// An exclusive `flock` on NFS needs a descriptor open for writing; this pins it on every file
+    /// system, since a local one takes the lock either way and would not notice the difference.
+    #[test]
+    fn an_entry_is_locked_on_a_descriptor_open_for_writing() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-journal", "lock-mode");
+        let path = dir.join("entry.json");
+        std::fs::write(&path, b"one").unwrap();
+        let (file, bytes) = read_unheld(&path).unwrap().expect("unheld");
+        assert_eq!(bytes, b"one");
+        // SAFETY: the descriptor is `file`'s own and open for the call; `F_GETFL` takes no pointer.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDWR);
+    }
+
     #[test]
     fn an_entry_outside_the_project_or_misnamed_does_not_parse() {
         let id = "0123456789abcdef0123456789abcdef";
@@ -464,6 +482,7 @@ mod tests {
         let open = || {
             std::fs::OpenOptions::new()
                 .read(true)
+                .write(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(&path)
                 .unwrap()
