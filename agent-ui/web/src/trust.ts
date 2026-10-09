@@ -36,7 +36,12 @@ export type TrustPromptEnvelope = {
   top: string;
   fingerprint: string;
   findingsDigest: string;
-  state: "untrusted" | "changed";
+  /** `nothing`: none of the agent's files are in the project, and the agent is asked about anyway (it loads
+   *  whatever project files appear, so it starts only after a `y`). */
+  state: "untrusted" | "changed" | "nothing";
+  /** Whether `n` refuses the start instead of starting without the project's configuration: a registered ACP
+   *  agent has no way to leave it out. Absent reads as `false`. */
+  needsYes?: boolean;
   remember: TrustRemember;
   rememberNote: string | null;
   changed: TrustChanged | null;
@@ -73,8 +78,10 @@ export const TRUST_BAND_PROMPT = "trust? y/n";
 
 /** The overlay's last line, and the flash for a key the prompt does not take. A `session` prompt says what
  *  its `y` is worth: the start in front of it and nothing after. */
-export function trustFooter(remember: TrustRemember): string {
-  const base = "y trusts and loads it · n starts without it · Esc puts this off";
+export function trustFooter(remember: TrustRemember, needsYes = false): string {
+  const base = needsYes
+    ? "y trusts and starts it · n does not start it · Esc puts this off"
+    : "y trusts and loads it · n starts without it · Esc puts this off";
   return remember === "session" ? `${base} · y trusts this start only` : base;
 }
 
@@ -151,8 +158,8 @@ export function scrollTarget(
 export type ExCommand = { command: "trust" | "untrust" } | { command: "tabnew"; agent: string | null };
 
 /** What the `:` line does with its text: the exact words only, so `:trust x` and `:trusted` stay a
- *  refusal. `:tabnew` takes at most one word, which is not checked here (`TABNEW_AGENTS` says which are
- *  accepted). */
+ *  refusal. `:tabnew` takes at most one word, which is not checked here: Rust knows which agents `init.lua`
+ *  registered, and its refusal names every accepted word. */
 export function parseExCommand(line: string): ExCommand | null {
   const [head, argument, ...rest] = line.trim().split(/\s+/);
   if (head === "trust" || head === "untrust") return argument === undefined ? { command: head } : null;

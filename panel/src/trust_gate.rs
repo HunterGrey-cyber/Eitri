@@ -797,6 +797,9 @@ impl TrustGate {
 
     fn build_prompt(&self, tab: TabId, nonce: u64, key: &str) -> Option<(TrustPromptView, Shown)> {
         let (discovery, state, diff, remember) = match self.latest.get(key)? {
+            TrustState::Untrusted { discovery, remember } if discovery.nothing_to_trust() => {
+                (discovery, TrustPromptState::Nothing, None, remember)
+            }
             TrustState::Untrusted { discovery, remember } => (discovery, TrustPromptState::Untrusted, None, remember),
             TrustState::Changed {
                 discovery,
@@ -828,6 +831,7 @@ impl TrustGate {
             top: discovery.top.display().to_string(),
             fingerprint: discovery.fingerprint.hex(),
             state,
+            needs_yes: discovery.profile.requires_explicit_yes(),
             remember,
             remember_note,
             changed: diff.map(|diff| TrustDiffView {

@@ -1766,6 +1766,9 @@ impl TrustRememberView {
 pub enum TrustPromptState {
     Untrusted,
     Changed,
+    /// Nothing of the agent's was found, and the agent still starts only after a `y` (a registered
+    /// agent, which loads whatever project files appear).
+    Nothing,
 }
 
 impl TrustPromptState {
@@ -1773,6 +1776,7 @@ impl TrustPromptState {
         match self {
             TrustPromptState::Untrusted => "untrusted",
             TrustPromptState::Changed => "changed",
+            TrustPromptState::Nothing => "nothing",
         }
     }
 }
@@ -1809,6 +1813,9 @@ pub struct TrustPromptView {
     /// The shown discovery's fingerprint, in hex.
     pub fingerprint: String,
     pub state: TrustPromptState,
+    /// Whether an `n` refuses the start rather than starting without the project's configuration: true
+    /// for an agent that cannot be started without loading it.
+    pub needs_yes: bool,
     pub remember: TrustRememberView,
     pub remember_note: Option<String>,
     pub changed: Option<TrustDiffView>,
@@ -1824,6 +1831,8 @@ struct TrustShown<'a> {
     top: &'a str,
     fingerprint: &'a str,
     state: &'static str,
+    #[serde(rename = "needsYes")]
+    needs_yes: bool,
     remember: &'static str,
     #[serde(rename = "rememberNote")]
     remember_note: Option<&'a str>,
@@ -1849,6 +1858,7 @@ impl TrustPromptView {
             top: &self.top,
             fingerprint: &self.fingerprint,
             state: self.state.as_str(),
+            needs_yes: self.needs_yes,
             remember: self.remember.as_str(),
             remember_note: self.remember_note.as_deref(),
             changed: self.changed.as_ref(),
@@ -1869,7 +1879,7 @@ impl TrustPromptView {
     }
 
     /// The sha256 (64 hex) of the compact JSON of everything the page shows -- `agent`, `root`, `top`,
-    /// `fingerprint`, `state`, `remember`, `rememberNote`, `changed`, `items`, in that order, with each
+    /// `fingerprint`, `state`, `needsYes`, `remember`, `rememberNote`, `changed`, `items`, in that order, with each
     /// value cut as it is shown -- and not `tab` or `nonce`. An answer echoing it is an answer about
     /// this text, not only about the bytes on disk.
     pub fn findings_digest(&self) -> String {
@@ -1881,7 +1891,8 @@ impl TrustPromptView {
 }
 
 /// `{"kind":"trust_prompt","tab":...,"nonce":...,"agent":...,"root":...,"top":...,"fingerprint":...,
-/// "findingsDigest":...,"state":...,"remember":...,"rememberNote":...,"changed":...,"items":[...]}` --
+/// "findingsDigest":...,"state":...,"needsYes":...,"remember":...,"rememberNote":...,"changed":...,
+/// "items":[...]}` --
 /// the question a tab waits on before its session may load the project's own configuration for
 /// `agent` (Claude's, Codex's, a registered agent's).
 /// Values are sent raw (serde escapes them); the page reveals hidden characters. `tab` names the tab
@@ -1898,6 +1909,7 @@ pub fn serialize_trust_prompt_for_js(view: &TrustPromptView) -> String {
         "fingerprint": shown.fingerprint,
         "findingsDigest": view.findings_digest(),
         "state": shown.state,
+        "needsYes": shown.needs_yes,
         "remember": shown.remember,
         "rememberNote": shown.remember_note,
         "changed": shown.changed,
@@ -5677,6 +5689,7 @@ mod tests {
             top: "/home/u/p".into(),
             fingerprint: "f".repeat(64),
             state: TrustPromptState::Untrusted,
+            needs_yes: false,
             remember: TrustRememberView::Yes,
             remember_note: None,
             changed: None,
@@ -5724,6 +5737,7 @@ mod tests {
                 "fingerprint": "f".repeat(64),
                 "findingsDigest": digest,
                 "state": "untrusted",
+                "needsYes": false,
                 "remember": "yes",
                 "rememberNote": null,
                 "changed": null,
@@ -5803,6 +5817,8 @@ mod tests {
             ("top", Box::new(|v| v.top.push('x'))),
             ("fingerprint", Box::new(|v| v.fingerprint = "e".repeat(64))),
             ("state", Box::new(|v| v.state = TrustPromptState::Changed)),
+            ("state nothing", Box::new(|v| v.state = TrustPromptState::Nothing)),
+            ("needsYes", Box::new(|v| v.needs_yes = true)),
             ("remember", Box::new(|v| v.remember = TrustRememberView::Window)),
             ("note", Box::new(|v| v.remember_note = Some("why".into()))),
             (

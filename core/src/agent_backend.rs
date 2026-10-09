@@ -160,6 +160,14 @@ impl<'de> serde::Deserialize<'de> for AgentId {
     }
 }
 
+/// What starts an external agent's child: the `codex` binary, already located, or a registered ACP
+/// agent with its command.
+#[derive(Debug, Clone)]
+pub enum ExternalLaunch {
+    Codex(PathBuf),
+    Acp(agent::providers::acp::AcpAgentSpec),
+}
+
 /// The policy a turn of an external agent runs under, from the tab's mode: in Auto the agent's own
 /// reviewer decides what still needs asking, in Bypass every request reaches Eitri, which answers it.
 pub fn turn_policy(mode: SessionModeChoice) -> TurnPolicy {
@@ -482,33 +490,44 @@ impl AgentBackend {
     /// reviewer of the session's first turn. `resume` names the agent's own session to continue; its
     /// lease is taken here and held by the conversation. Every start of an external tab goes through
     /// the same trust gate as a Claude start, so nothing here decides what the project may load.
+    ///
+    /// `launch` is what starts the agent's child: the located `codex`, or a registered ACP agent's
+    /// command. One that does not belong to `agent` is refused.
     pub fn start_external(
         agent: AgentId,
-        program: PathBuf,
+        launch: ExternalLaunch,
         project_dir: &Path,
         plan: TrustPlan,
         mode: SessionModeChoice,
         resume: Option<&str>,
     ) -> Result<Self, BackendError> {
-        let state_home = crate::layout::persist::state_subdir(
-            std::env::var_os("XDG_STATE_HOME").as_deref(),
-            std::env::var_os("HOME").as_deref(),
-            "",
-        )
-        .ok_or_else(|| BackendError::fatal("Eitri has no state directory to keep Codex's check in".to_string()))?;
         let canonical = project_dir
             .canonicalize()
             .map_err(|e| BackendError::fatal(format!("the project directory cannot be resolved: {e}")))?;
-        let provider: std::sync::Arc<dyn agent::ExternalProvider + Send + Sync> = match &agent {
-            AgentId::Codex => std::sync::Arc::new(
-                agent::providers::codex::CodexProvider::connect(agent::providers::codex::CodexLaunch {
-                    program,
-                    cwd: canonical.clone(),
-                    state_home,
-                })
-                .map_err(|e| BackendError::fatal(format!("Codex could not start: {e}")))?,
+        let provider: std::sync::Arc<dyn agent::ExternalProvider + Send + Sync> = match (&agent, launch) {
+            (AgentId::Codex, ExternalLaunch::Codex(program)) => {
+                let state_home = crate::layout::persist::state_subdir(
+                    std::env::var_os("XDG_STATE_HOME").as_deref(),
+                    std::env::var_os("HOME").as_deref(),
+                    "",
+                )
+                .ok_or_else(|| {
+                    BackendError::fatal("Eitri has no state directory to keep Codex's check in".to_string())
+                })?;
+                std::sync::Arc::new(
+                    agent::providers::codex::CodexProvider::connect(agent::providers::codex::CodexLaunch {
+                        program,
+                        cwd: canonical.clone(),
+                        state_home,
+                    })
+                    .map_err(|e| BackendError::fatal(format!("Codex could not start: {e}")))?,
+                )
+            }
+            (AgentId::Acp(name), ExternalLaunch::Acp(spec)) if spec.name == *name => std::sync::Arc::new(
+                agent::providers::acp::AcpProvider::connect(spec, canonical.clone())
+                    .map_err(|e| BackendError::fatal(format!("{name} could not start: {e}")))?,
             ),
-            AgentId::Claude | AgentId::Acp(_) => {
+            _ => {
                 return Err(BackendError::fatal(format!(
                     "this build cannot start a {} tab",
                     agent.label()
@@ -4610,6 +4629,37 @@ mod external_tests {
         );
         assert_eq!(provider.starts()[0].policy.reviewer, Reviewer::Agent, "started in Auto");
         backend.shutdown();
+    }
+
+    /// A launch that is not the tab's own agent's never starts a child: an ACP registration of another
+    /// name, a `codex` for an ACP tab, or anything for a Claude tab.
+    #[test]
+    fn a_launch_for_another_agent_is_refused() {
+        let dir = workspace("external-wrong-launch");
+        let spec = |name: &str| {
+            ExternalLaunch::Acp(agent::providers::acp::AcpAgentSpec {
+                name: name.into(),
+                argv: vec!["/nonexistent/eitri-never-run".into()],
+                auto_mode: None,
+            })
+        };
+        for (agent, launch) in [
+            (AgentId::Acp("gem".into()), spec("other")),
+            (
+                AgentId::Acp("gem".into()),
+                ExternalLaunch::Codex("/nonexistent/codex".into()),
+            ),
+            (AgentId::Codex, spec("gem")),
+            (AgentId::Claude, spec("gem")),
+        ] {
+            let label = agent.label();
+            let refused =
+                AgentBackend::start_external(agent, launch, &dir, empty_trust_plan(), SessionModeChoice::Auto, None);
+            match refused {
+                Err(e) => assert_eq!(e.message, format!("this build cannot start a {label} tab")),
+                Ok(_) => panic!("{label} started on another agent's launch"),
+            }
+        }
     }
 
     #[test]

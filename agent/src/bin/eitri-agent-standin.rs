@@ -1,5 +1,6 @@
 //! A scripted stand-in for an agent child (`codex app-server`, an ACP agent) in the `JsonRpcLink`
-//! tests. The one argument is a JSON array of steps, run in order:
+//! tests. The one argument is a JSON array of steps, run in order (or `@<path>`, a file holding that
+//! array, for a script too long for an argument):
 //!
 //! - `{"write": "<line>"}`: the text and a newline on stdout.
 //! - `{"write_raw": "<text>"}`: the text alone, to split a line across reads.
@@ -35,6 +36,13 @@ fn main() {
         mcp_server();
         return;
     }
+    let script = match script.strip_prefix('@') {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => fail(2, &format!("cannot read the script file {path}: {e}")),
+        },
+        None => script,
+    };
     let steps: Vec<Value> = match serde_json::from_str(&script) {
         Ok(steps) => steps,
         Err(e) => fail(2, &format!("script is not a JSON array: {e}")),

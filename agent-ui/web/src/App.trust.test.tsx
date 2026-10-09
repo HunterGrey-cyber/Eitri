@@ -633,13 +633,27 @@ describe("the : line's trust commands", () => {
     expect(requests("tab_verb")[0]).not.toHaveProperty("agent");
   });
 
-  it("unknown agent word flashes the accepted names", () => {
+  it("an agent word goes to Rust, whose refusal naming the accepted words is flashed", () => {
     const { container } = started();
     typed(container, "tabnew gemini");
-    expect(requests("tab_verb")).toEqual([]);
+    const [sent] = requests("tab_verb");
+    expect(sent).toMatchObject({ verb: "new", agent: "gemini" });
+    dispatch({
+      kind: "command_result",
+      requestId: sent.request_id,
+      ok: false,
+      error: "unknown agent gemini — :tabnew accepts claude, codex",
+    });
     expect(container.querySelector(".band-message")!.textContent).toBe(
       "unknown agent gemini — :tabnew accepts claude, codex",
     );
+    expect(container.querySelector(".command-notice")).toBeNull();
+  });
+
+  it("registered_agent_offered_by_tabnew: a registered name is posted as typed", () => {
+    const { container } = started();
+    typed(container, "tabnew gem");
+    expect(requests("tab_verb")).toEqual([expect.objectContaining({ verb: "new", agent: "gem" })]);
   });
 
   it("a_tab_that_names_no_agent_is_claude_s", () => {

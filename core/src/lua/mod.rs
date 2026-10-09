@@ -6,6 +6,7 @@
 //! `PanelEntry`, `PanelRegistry` and the real widget-constructing `install` stay in
 //! `shell::lua::panel`, because `PanelEntry` holds a `gtk4::Widget`.
 
+pub mod agent;
 pub mod command;
 pub mod config;
 pub mod event;

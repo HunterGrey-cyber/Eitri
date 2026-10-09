@@ -28,6 +28,8 @@ pub struct WindowConfig {
     pub default_agent: eitri_core::agent_backend::AgentId,
     /// `agent.codex.command`: the `codex` to run (an absolute path or a bare name), if `init.lua` named one.
     pub codex_command: Option<String>,
+    /// The ACP agents `eitri.agent.register` accepted, in the order `init.lua` registered them.
+    pub acp_agents: Vec<eitri_core::lua::agent::AgentRegistration>,
     pub on_permission: eitri_core::attention::ChatOnPermission,
     pub keymap: Rc<eitri_core::keymap::Keymap>,
     pub tmux_import: Option<eitri_core::keymap::TmuxImport>,
@@ -151,13 +153,25 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         );
     }
 
-    // The agent a new tab runs (`agent.default`: "claude", the default, or "codex") and where the
-    // `codex` binary is (`agent.codex.command`, beaten by `EITRI_CODEX`). A bad value of any of them is
-    // a startup failure naming it, like the keys above; a `codex` that is not installed fails a Codex
-    // tab's start, never the window.
+    // The agent a new tab runs (`agent.default`: "claude", the default, "codex" or a name
+    // `eitri.agent.register` accepted) and where the `codex` binary is (`agent.codex.command`, beaten by
+    // `EITRI_CODEX`). A bad value of any of them is a startup failure naming it, like the keys above; a
+    // `codex` that is not installed fails a Codex tab's start, never the window. The registrations are
+    // read here, after the whole of `init.lua` ran, so the order of the two lines in it does not matter.
+    let acp_agents = kernel.agents.borrow().agents().to_vec();
+    let registered: Vec<&str> = acp_agents.iter().map(|a| a.name.as_str()).collect();
     let default_agent = eitri_core::agent_prefs::parse_agent_default(
         kernel.config.borrow().get(eitri_core::agent_prefs::AGENT_DEFAULT_KEY),
+        &registered,
     )?;
+    for registration in &acp_agents {
+        eprintln!(
+            "[agent] {} registered ({}; reads {})",
+            registration.name,
+            registration.command.join(" "),
+            registration.project_files.join(", ")
+        );
+    }
     if default_agent != eitri_core::agent_backend::AgentId::Claude {
         eprintln!(
             "[agent] new tabs run {} (init.lua's agent.default)",
@@ -268,6 +282,7 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         default_mode,
         default_agent,
         codex_command,
+        acp_agents,
         on_permission,
         keymap,
         tmux_import,
@@ -279,11 +294,13 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
 
 impl WindowConfig {
     /// The settings that live on the panel itself: the typing cadence, the restore policy, the
-    /// default mode and agent for new tabs, the `codex` command and the turn review switches.
+    /// default mode and agent for new tabs, the registered agents, the `codex` command and the turn review
+    /// switches.
     pub fn apply_to_panel(&self, panel: &AgentPanelHandle) {
         panel.set_typing_cadence(self.typing_cadence);
         panel.set_restore_policy(self.restore_policy);
         panel.set_default_mode(self.default_mode);
+        panel.set_acp_agents(self.acp_agents.clone());
         panel.set_default_agent(self.default_agent.clone());
         panel.set_codex_command(self.codex_command.clone());
         panel.set_review(ReviewConfig {
@@ -357,6 +374,38 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("agent.codex.command"), "{err}");
+    }
+
+    /// `agent.default` names a registered agent: accepted whether the registration comes before or after
+    /// the `set` in `init.lua`, refused naming the key when nothing registered that name, and the
+    /// registrations reach the window's configuration.
+    #[test]
+    fn window_config_reads_a_registered_default_and_the_registrations() {
+        use eitri_core::agent_backend::AgentId;
+        let register = "eitri.agent.register({ name = \"gem\", command = { \"gem\", \"--acp\" }, \
+                        project_files = { \".gem/\", \"GEM.md\" } })\n";
+        let set = "eitri.config.set(\"agent.default\", \"gem\")\n";
+        for source in [format!("{set}{register}"), format!("{register}{set}")] {
+            let config = load_from(&source, &[]).unwrap();
+            assert_eq!(config.default_agent, AgentId::Acp("gem".into()));
+            assert_eq!(config.acp_agents.len(), 1);
+            assert_eq!(
+                config.acp_agents[0].project_files,
+                vec![".gem/".to_string(), "GEM.md".to_string()]
+            );
+        }
+        let err = load_from(
+            &format!("{register}eitri.config.set(\"agent.default\", \"other\")\n"),
+            &[],
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("agent.default"), "{err}");
+        assert!(err.contains("gem"), "{err}");
+        let err = load_from("eitri.agent.register({ name = \"gem\", command = { \"gem\" } })\n", &[])
+            .err()
+            .unwrap();
+        assert!(err.contains("project_files"), "{err}");
     }
 
     /// Every window reads `EITRI_CODEX` where it reads its keys: the full window, the companion window

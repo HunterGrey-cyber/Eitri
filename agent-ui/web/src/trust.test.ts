@@ -119,5 +119,7 @@ describe("the wire checks", () => {
     expect(trustFooter("yes")).toBe("y trusts and loads it · n starts without it · Esc puts this off");
     expect(trustFooter("window")).toBe(trustFooter("yes"));
     expect(trustFooter("session")).toContain("y trusts this start only");
+    expect(trustFooter("yes", true)).toBe("y trusts and starts it · n does not start it · Esc puts this off");
+    expect(trustFooter("session", true)).toContain("n does not start it");
   });
 });

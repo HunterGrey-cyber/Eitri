@@ -160,31 +160,47 @@ pub fn parse_review_hint(value: Option<&str>) -> Result<bool, String> {
     parse_switch(REVIEW_HINT_KEY, value, false)
 }
 
-/// The `init.lua` key: `eitri.config.set("agent.default", "claude" | "codex")`.
+/// The `init.lua` key: `eitri.config.set("agent.default", "claude" | "codex" | "<registered name>")`.
 pub const AGENT_DEFAULT_KEY: &str = "agent.default";
 
 /// The `init.lua` key: `eitri.config.set("agent.codex.command", "<path or command name>")`.
 pub const CODEX_COMMAND_KEY: &str = "agent.codex.command";
 
 /// The agent a new tab runs when the user names none (the new-tab key, an empty window's first tab).
-/// Unset is Claude, as ever. Anything but a name this build can start is an error naming the key,
-/// like every other configuration key here; the names of agents registered from `init.lua` join the
-/// accepted ones when such a registry exists.
-pub fn parse_agent_default(value: Option<&str>) -> Result<crate::agent_backend::AgentId, String> {
+/// Unset is Claude, as ever. `registered` are the names `eitri.agent.register` accepted; the host reads
+/// this key after `init.lua` has run, so a registration below the `set` in the file counts. Anything but
+/// `claude`, `codex` or a registered name is an error naming the key, like every other configuration key
+/// here.
+pub fn parse_agent_default(value: Option<&str>, registered: &[&str]) -> Result<crate::agent_backend::AgentId, String> {
     use crate::agent_backend::AgentId;
     match value.map(str::trim) {
         None | Some("claude") => Ok(AgentId::Claude),
         Some("codex") => Ok(AgentId::Codex),
+        Some(name) if registered.contains(&name) => Ok(AgentId::Acp(name.to_string())),
         Some(_) => Err(format!(
-            "eitri.config.set(\"{AGENT_DEFAULT_KEY}\", {:?}): must be \"claude\" or \"codex\"",
-            value.unwrap_or_default()
+            "eitri.config.set(\"{AGENT_DEFAULT_KEY}\", {:?}): must be {}",
+            value.unwrap_or_default(),
+            accepted_agents(registered)
         )),
     }
 }
 
 /// The agent a word typed at the panel's `:tabnew` names, or `None` for a word that names none.
-pub fn agent_named(word: &str) -> Option<crate::agent_backend::AgentId> {
-    parse_agent_default(Some(word)).ok()
+pub fn agent_named(word: &str, registered: &[&str]) -> Option<crate::agent_backend::AgentId> {
+    parse_agent_default(Some(word), registered).ok()
+}
+
+/// The words that name an agent, as a refusal says them: `"claude" or "codex"`, or with the registered
+/// names, `"claude", "codex" or a name registered with eitri.agent.register (...)`.
+fn accepted_agents(registered: &[&str]) -> String {
+    if registered.is_empty() {
+        "\"claude\" or \"codex\"".to_string()
+    } else {
+        format!(
+            "\"claude\", \"codex\" or a name registered with eitri.agent.register ({})",
+            registered.join(", ")
+        )
+    }
 }
 
 /// [`CODEX_COMMAND_KEY`]: the `codex` to run, as an absolute path or a bare command name looked up on
@@ -290,18 +306,40 @@ mod tests {
     #[test]
     fn agent_default_accepts_claude_codex_and_refuses_others_naming_the_key() {
         use crate::agent_backend::AgentId;
-        assert_eq!(parse_agent_default(None), Ok(AgentId::Claude));
-        assert_eq!(parse_agent_default(Some("claude")), Ok(AgentId::Claude));
-        assert_eq!(parse_agent_default(Some(" codex ")), Ok(AgentId::Codex));
+        assert_eq!(parse_agent_default(None, &[]), Ok(AgentId::Claude));
+        assert_eq!(parse_agent_default(Some("claude"), &[]), Ok(AgentId::Claude));
+        assert_eq!(parse_agent_default(Some(" codex "), &[]), Ok(AgentId::Codex));
         for bad in ["", "Codex", "gemini", "acp:x", "claude codex"] {
-            let err = parse_agent_default(Some(bad)).unwrap_err();
+            let err = parse_agent_default(Some(bad), &[]).unwrap_err();
             assert!(err.contains("agent.default"), "{bad}: {err}");
             assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
         }
-        assert_eq!(agent_named("codex"), Some(AgentId::Codex));
-        assert_eq!(agent_named("claude"), Some(AgentId::Claude));
-        assert_eq!(agent_named(""), None);
-        assert_eq!(agent_named("gemini"), None);
+        assert_eq!(agent_named("codex", &[]), Some(AgentId::Codex));
+        assert_eq!(agent_named("claude", &[]), Some(AgentId::Claude));
+        assert_eq!(agent_named("", &[]), None);
+        assert_eq!(agent_named("gemini", &[]), None);
+    }
+
+    #[test]
+    fn agent_default_accepts_a_registered_acp_name_and_refuses_an_unregistered_one() {
+        use crate::agent_backend::AgentId;
+        let registered = ["gemini", "goose"];
+        assert_eq!(
+            parse_agent_default(Some("gemini"), &registered),
+            Ok(AgentId::Acp("gemini".into()))
+        );
+        assert_eq!(
+            parse_agent_default(Some(" goose "), &registered),
+            Ok(AgentId::Acp("goose".into()))
+        );
+        assert_eq!(parse_agent_default(Some("codex"), &registered), Ok(AgentId::Codex));
+        for bad in ["Gemini", "acp:gemini", "other"] {
+            let err = parse_agent_default(Some(bad), &registered).unwrap_err();
+            assert!(err.contains("agent.default"), "{bad}: {err}");
+            assert!(err.contains("gemini, goose"), "{bad}: {err}");
+        }
+        assert_eq!(agent_named("gemini", &registered), Some(AgentId::Acp("gemini".into())));
+        assert_eq!(agent_named("gemini", &[]), None);
     }
 
     #[test]

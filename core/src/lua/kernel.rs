@@ -22,6 +22,8 @@ pub struct Kernel {
     /// `eitri.keymap.*`: the calls `init.lua` made, applied by the host once it has run
     /// (`crate::keymap::Keymap::apply_user`).
     pub keymap: Rc<RefCell<super::keymap::KeymapStore>>,
+    /// `eitri.agent.register`: the ACP agents `init.lua` registered, read by the host once it has run.
+    pub agents: Rc<RefCell<super::agent::AgentRegistry>>,
 }
 
 /// The panel installer for a host that has no Lua panels (the companion window, `eitri-mac`):
@@ -117,6 +119,8 @@ impl Kernel {
         super::layout::install(&lua, &eitri, layout.clone())?;
         let keymap = Rc::new(RefCell::new(super::keymap::KeymapStore::default()));
         super::keymap::install(&lua, &eitri, keymap.clone())?;
+        let agents = Rc::new(RefCell::new(super::agent::AgentRegistry::default()));
+        super::agent::install(&lua, &eitri, agents.clone())?;
 
         lua.globals().set("eitri", eitri)?;
 
@@ -127,6 +131,7 @@ impl Kernel {
             config,
             layout,
             keymap,
+            agents,
         })
     }
 
@@ -159,10 +164,11 @@ impl Kernel {
     /// logs and the shell continues with whatever it registered before the error (the editor and
     /// the agent are not registered here at all: every window has them).
     ///
-    /// **Two exceptions, startup failures: a command id `eitri.command.register` refused**
-    /// (`CommandRegistry::refused`), **and a value `eitri.config.set` could not store**
+    /// **Three exceptions, startup failures: a command id `eitri.command.register` refused**
+    /// (`CommandRegistry::refused`), **a value `eitri.config.set` could not store**
     /// (`ConfigStore::refused`: a table, a function, a string that is not UTF-8, a key
-    /// that is not a string). Both are config values Eitri validates, and like `agent.font_size` or
+    /// that is not a string), **and an agent `eitri.agent.register` refused** (`AgentRegistry::refused`).
+    /// All are config values Eitri validates, and like `agent.font_size` or
     /// a keybinding collision (in the host's `main()`) they exit 1 naming themselves -- rather than a window
     /// that silently lacks everything init.lua registered after them, or runs on a key's default:
     /// an `agent.account` that never reached the store spends whichever account launched the
@@ -179,7 +185,8 @@ impl Kernel {
         self.run_init_file(path);
         let commands = self.commands.borrow();
         let config = self.config.borrow();
-        match commands.refused().or(config.refused()) {
+        let agents = self.agents.borrow();
+        match commands.refused().or(config.refused()).or(agents.refused()) {
             Some(refused) => Err(format!("{} ({})", refused, path.display())),
             None => Ok(()),
         }

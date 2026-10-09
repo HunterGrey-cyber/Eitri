@@ -71,7 +71,7 @@ import type { PathRef } from "./paths";
 import { PathPick } from "./components/PathPick";
 import { LinkPick } from "./components/LinkPick";
 import { isExternalTool, agentTitle } from "./externalTools";
-import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, forgetClosed, isExternalAgent, saveView, TABNEW_AGENTS, takeView, withoutHandoff } from "./tabs";
+import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, forgetClosed, isExternalAgent, saveView, takeView, withoutHandoff } from "./tabs";
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
 import type { NavKeyRequest } from "./components/EmptyTab";
@@ -565,12 +565,13 @@ export default function App() {
    *  `"review"` tracks `review_request`/`review_diff_request`; refusals appear in the overlay header
    *  because no response envelope follows them.
    *  `"trust"` tracks answers, Escape, `:trust` and `:untrust`. Rust notices supply feedback.
-   *  Refusals without a notice follow a cancellation or move away; neither is echoed in the banner. */
+   *  Refusals without a notice follow a cancellation or move away; neither is echoed in the banner.
+   *  `"tabnew"` flashes a refusal naming accepted agents when `:tabnew <agent>` uses an unknown agent. */
   const inFlight = useRef<
     Map<
       string,
       {
-        kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust";
+        kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew";
         tab: TabId;
         text?: string;
         permissionId?: string;
@@ -2890,7 +2891,7 @@ export default function App() {
             // The overlay's own request was refused (no session, no such turn, git unavailable): it says
             // so in its header. Never the conversation's banner, which is for what breaks the conversation.
             setReview((current) => (current === null ? current : failRequest(current, payload.requestId, payload.error)));
-          } else if (record?.kind === "editor" || record?.kind === "link") {
+          } else if (record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew") {
             // A scratch-editor round trip's own refusal, or `gx`'s address Rust would not
             // open, is a footer nicety, not something that should fill the banner
             // reserved for conversation-breaking errors.
@@ -3644,7 +3645,7 @@ export default function App() {
         // Escape alone works from inside a text field: it starts nothing. Every other key typed there is the
         // field's text, so it is taken and never answers.
         if (event.key !== "Escape" && isEditableElement(event.target)) {
-          showFlash(trustFooter(confirm.view.remember));
+          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true));
           return true;
         }
         const pendingG = trustPendingGRef.current;
@@ -3683,7 +3684,7 @@ export default function App() {
         } else if (action.kind === "wait") {
           showFlash(TRUST_WAIT_FLASH);
         } else {
-          showFlash(trustFooter(confirm.view.remember));
+          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true));
         }
         return true;
       }
@@ -5820,17 +5821,19 @@ export default function App() {
               noteLineKey(event);
               const command = parseExCommand(exLine);
               if (command !== null && command.command === "tabnew") {
-                // vim's `:tabnew`: the word names the agent; none is the new-tab key's own tab.
-                if (command.agent !== null && !TABNEW_AGENTS.includes(command.agent)) {
-                  showFlash(`unknown agent ${command.agent} — :tabnew accepts ${TABNEW_AGENTS.join(", ")}`);
-                } else {
-                  postToRust({
-                    type: "tab_verb",
-                    request_id: nextRequestId(),
-                    verb: "new",
-                    ...(command.agent !== null ? { agent: command.agent } : {}),
-                  });
+                // vim's `:tabnew`: the word names the agent; none is the new-tab key's own tab. Which words
+                // name an agent is Rust's to say (`init.lua` may register more), and its refusal, naming
+                // every accepted word, is flashed.
+                const tabnewId = nextRequestId();
+                if (command.agent !== null) {
+                  inFlight.current.set(tabnewId, { kind: "tabnew", tab: activeTabRef.current ?? 0 });
                 }
+                postToRust({
+                  type: "tab_verb",
+                  request_id: tabnewId,
+                  verb: "new",
+                  ...(command.agent !== null ? { agent: command.agent } : {}),
+                });
               } else if (command !== null) {
                 const commandId = nextRequestId();
                 inFlight.current.set(commandId, { kind: "trust", tab: activeTabRef.current ?? 0 });

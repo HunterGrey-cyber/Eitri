@@ -53,6 +53,26 @@ describe("TrustPrompt", () => {
     );
   });
 
+  it("asks whether to start an agent that needs a y when none of its files are there", () => {
+    const { container } = render(
+      <TrustPrompt envelope={envelope({ agent: "gem", state: "nothing", needsYes: true, items: [] })} />,
+    );
+    expect(container.querySelector("h2")!.textContent).toBe(
+      "gem loads whatever project files it finds; there are none now. Start it here?",
+    );
+    expect(container.querySelector(".trust-footer")!.textContent).toBe(
+      "y trusts and starts it · n does not start it · Esc puts this off",
+    );
+  });
+
+  it("says n does not start an agent that needs a y, even with files to show", () => {
+    const { container } = render(<TrustPrompt envelope={envelope({ agent: "gem", needsYes: true })} />);
+    expect(container.querySelector("h2")!.textContent).toBe("Trust this project's gem configuration?");
+    expect(container.querySelector(".trust-footer")!.textContent).toBe(
+      "y trusts and starts it · n does not start it · Esc puts this off",
+    );
+  });
+
   it("names the agent whose configuration a y trusts", () => {
     const { container } = render(<TrustPrompt envelope={envelope({ agent: "Codex" })} />);
     expect(container.querySelector("h2")!.textContent).toBe("Trust this project's Codex configuration?");

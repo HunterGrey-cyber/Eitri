@@ -32,6 +32,7 @@ use eitri_core::agent_bridge::{
 };
 use eitri_core::keymap::TabAction;
 use eitri_core::layout::Direction;
+use eitri_core::lua::agent::AgentRegistration;
 use eitri_core::project_trust::Profile;
 use eitri_core::saved_tabs::{SavedTabs, TabMemory};
 use eitri_core::tab_restore::{RestoreOffer, RestorePolicy, RestoreRun};
@@ -586,6 +587,9 @@ struct AgentPanelState {
     default_agent: AgentId,
     /// `agent.codex.command` as `init.lua` left it; `EITRI_CODEX` still outranks it.
     codex_command: Option<String>,
+    /// The ACP agents `init.lua` registered: what `:tabnew <name>` accepts, the files each one's trust
+    /// question is about, and the command its start runs.
+    acp_agents: Vec<AgentRegistration>,
     /// What a connect worker has to say while it works (a first Codex start's self-check): sent to
     /// the band by the tick.
     start_notes: StartNotes,
@@ -633,12 +637,14 @@ enum SpawnCall {
         lease: agent::lease::SessionLease,
         project: ProjectTrust,
     },
-    /// A tab of another agent, fresh or resumed, with the trust plan it was given.
+    /// A tab of another agent, fresh or resumed, with the trust plan it was given and, for an ACP
+    /// agent, its registration.
     External {
         agent: AgentId,
         plan: agent::TrustPlan,
         mode: SessionModeChoice,
         resume: Option<String>,
+        acp: Option<agent::providers::acp::AcpAgentSpec>,
     },
 }
 
@@ -1304,6 +1310,11 @@ impl AgentPanelHandle {
         self.state.borrow_mut().codex_command = command;
     }
 
+    /// The ACP agents `eitri.agent.register` accepted, applied once after `init.lua` ran.
+    pub fn set_acp_agents(&self, agents: Vec<AgentRegistration>) {
+        self.state.borrow_mut().acp_agents = agents;
+    }
+
     /// `review.enabled` and `review.hint` as `init.lua` left them, applied once after it ran. Enabled
     /// installs the turn review (the legacy backend has no turn boundaries to follow and says so);
     /// disabled leaves none, and a request for one says why. The hint only decides whether a
@@ -1937,6 +1948,7 @@ fn panel_state(
         mode_remembered,
         default_agent: AgentId::Claude,
         codex_command: None,
+        acp_agents: Vec::new(),
         start_notes: StartNotes::default(),
         restore_run: None,
         last_restore_offered: false,
@@ -2767,18 +2779,33 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// The discovery profile of an agent: whose project files its trust question is about.
-fn trust_profile(agent: &AgentId) -> Profile {
+/// The discovery profile of an agent: whose project files its trust question is about. A registered
+/// agent's are the files its registration names. One no registration names (a tab saved while it was
+/// registered) finds nothing; it still starts only after a `y`, which its start then refuses for want
+/// of a command.
+fn trust_profile(registered: &[AgentRegistration], agent: &AgentId) -> Profile {
     match agent {
         AgentId::Claude => Profile::Claude,
         AgentId::Codex => Profile::Codex,
-        // No registration names its files yet, so nothing is found: the agent still starts only
-        // after a `y`, and a file list given later changes the fingerprint and asks again.
         AgentId::Acp(name) => Profile::Acp {
             name: name.clone(),
-            files: Vec::new(),
+            files: registered
+                .iter()
+                .find(|a| a.name == *name)
+                .map(|a| a.project_files.clone())
+                .unwrap_or_default(),
         },
     }
+}
+
+/// The ACP command a registered agent's tab starts with, or `None` when nothing registered that name.
+fn acp_spec(registered: &[AgentRegistration], name: &str) -> Option<agent::providers::acp::AcpAgentSpec> {
+    let registration = registered.iter().find(|a| a.name == name)?;
+    Some(agent::providers::acp::AcpAgentSpec {
+        name: registration.name.clone(),
+        argv: registration.command.iter().map(std::ffi::OsString::from).collect(),
+        auto_mode: registration.auto_mode.clone(),
+    })
 }
 
 /// The profile a tab's start waits on. A restore starts on its answer only the tabs of the agent it
@@ -2792,8 +2819,8 @@ fn waiting_profile(state: &AgentPanelState, tab: TabId) -> Profile {
             TabBackend::AwaitingTrust(AwaitingTrust {
                 start: DeferredStart::Restore { go },
                 ..
-            }) => trust_profile(&go.trust_agent().unwrap_or(AgentId::Claude)),
-            _ => trust_profile(t.agent()),
+            }) => trust_profile(&state.acp_agents, &go.trust_agent().unwrap_or(AgentId::Claude)),
+            _ => trust_profile(&state.acp_agents, t.agent()),
         },
         None => Profile::Claude,
     }
@@ -2916,10 +2943,22 @@ fn start_external_tab(
     start: DeferredStart,
     project: ProjectTrust,
 ) -> TrustOut {
-    let profile = trust_profile(&agent);
+    let profile = trust_profile(&state.acp_agents, &agent);
     if project == ProjectTrust::Untrusted && profile.requires_explicit_yes() {
         return put_off_start(state, tab, start, &crate::trust_gate::refused_without_yes(&profile));
     }
+    // A registered agent starts with the command its registration names; a tab of a name nothing
+    // registers (saved while it was) has none to run.
+    let acp = match &agent {
+        AgentId::Acp(name) => match acp_spec(&state.acp_agents, name) {
+            Some(spec) => Some(spec),
+            None => {
+                let why = format!("{name} was not started: no agent of that name is registered in init.lua");
+                return put_off_start(state, tab, start, &why);
+            }
+        },
+        AgentId::Claude | AgentId::Codex => None,
+    };
     let answer = match project {
         ProjectTrust::Trusted => agent::DirTrust::Trusted,
         ProjectTrust::Untrusted => agent::DirTrust::Untrusted,
@@ -2959,6 +2998,7 @@ fn start_external_tab(
             mode,
             resume.clone(),
             codex_command,
+            acp,
             state.start_notes.sender(),
         ),
         #[cfg(test)]
@@ -2967,6 +3007,7 @@ fn start_external_tab(
             plan,
             mode,
             resume: resume.clone(),
+            acp,
         }),
     };
     let Some(t) = state.tabs.get_mut(tab) else {
@@ -3147,9 +3188,12 @@ fn trust_command(
             running.label()
         ));
     }
-    state
-        .trust
-        .command(request_id.to_string(), action, tab, &trust_profile(&running));
+    state.trust.command(
+        request_id.to_string(),
+        action,
+        tab,
+        &trust_profile(&state.acp_agents, &running),
+    );
     Ok(())
 }
 
@@ -3359,8 +3403,10 @@ fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
                 .as_ref()
                 .map(|d| eitri_core::permission_store::path(d, &state.project_dir))
                 .as_deref(),
-            &state.trust.row(&trust_profile(t.agent())),
-            state.trust.next_session_trust(&trust_profile(t.agent())),
+            &state.trust.row(&trust_profile(&state.acp_agents, t.agent())),
+            state
+                .trust
+                .next_session_trust(&trust_profile(&state.acp_agents, t.agent())),
         ),
         None => Vec::new(),
     };
@@ -3711,8 +3757,10 @@ impl StartNotes {
     }
 }
 
-/// The connect worker of another agent's tab: locates its binary and starts (or resumes) its session
-/// with `plan`, off the GTK main loop, since the agent's own check and handshake take seconds.
+/// The connect worker of another agent's tab: locates its binary (Codex) or takes its registered
+/// command (`acp`, an ACP agent) and starts (or resumes) its session with `plan`, off the GTK main loop,
+/// since the agent's own check and handshake take seconds.
+#[allow(clippy::too_many_arguments)]
 fn spawn_external(
     agent: AgentId,
     project_dir: PathBuf,
@@ -3720,11 +3768,13 @@ fn spawn_external(
     mode: SessionModeChoice,
     resume: Option<String>,
     codex_command: Option<String>,
+    acp: Option<agent::providers::acp::AcpAgentSpec>,
     notes: mpsc::Sender<String>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
+    use eitri_core::agent_backend::ExternalLaunch;
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let program = match &agent {
+        let launch = match &agent {
             AgentId::Codex => {
                 // A relative home is refused before anything runs, the version probe of the binary included.
                 let located = agent::providers::codex::refuse_relative_codex_home()
@@ -3749,13 +3799,23 @@ fn spawn_external(
                         let _ = notes.send(CHECKING_CODEX.to_string());
                     }
                 }
-                located
+                located.map(ExternalLaunch::Codex)
             }
-            // `start_external` refuses an agent it has no provider for, naming it.
-            AgentId::Claude | AgentId::Acp(_) => Ok(PathBuf::new()),
+            AgentId::Acp(name) => acp
+                .ok_or_else(|| BackendError {
+                    message: format!("{name} was not started: no agent of that name is registered in init.lua"),
+                    benign: false,
+                    folded_events: Vec::new(),
+                })
+                .map(ExternalLaunch::Acp),
+            AgentId::Claude => Err(BackendError {
+                message: "a Claude tab is not started as another agent's".to_string(),
+                benign: false,
+                folded_events: Vec::new(),
+            }),
         };
-        let result = program.and_then(|program| {
-            AgentBackend::start_external(agent, program, &project_dir, plan, mode, resume.as_deref())
+        let result = launch.and_then(|launch| {
+            AgentBackend::start_external(agent, launch, &project_dir, plan, mode, resume.as_deref())
         });
         // As in `spawn_connect_holding`: a receiver dropped mid-connect makes this drop the cleanup.
         let _ = result_tx.send(result);
@@ -5516,17 +5576,20 @@ fn run_tab_verb(state: &Rc<RefCell<AgentPanelState>>, verb: TabVerbWire) -> Resu
 /// the word names, or refuses naming the words that are accepted. Touches no page, so it is tested
 /// directly.
 fn open_tab_named(state: &Rc<RefCell<AgentPanelState>>, word: &str) -> Result<(), String> {
-    let Some(agent) = eitri_core::agent_prefs::agent_named(word) else {
-        return Err(format!("unknown agent {word:?}: {TABNEW_AGENTS}"));
-    };
     let mut state = state.borrow_mut();
+    let registered: Vec<&str> = state.acp_agents.iter().map(|a| a.name.as_str()).collect();
+    let Some(agent) = eitri_core::agent_prefs::agent_named(word, &registered) else {
+        let mut accepted = vec!["claude", "codex"];
+        accepted.extend(registered);
+        return Err(format!(
+            "unknown agent {word} — :tabnew accepts {}",
+            accepted.join(", ")
+        ));
+    };
     state.tabs.drop_bypass_prompt();
     state.tabs.open(agent);
     Ok(())
 }
-
-/// The words `:tabnew` accepts, as the refusal says them. The page keeps the same list.
-const TABNEW_AGENTS: &str = "claude, codex";
 
 /// `nav_fallthrough`: the hook `main.rs` installs via `on_nav_fallthrough`, called
 /// with the direction the page could not apply -- or a refusal naming why there is none yet. Never
@@ -6456,6 +6519,7 @@ mod tests {
             mode_remembered: false,
             default_agent: AgentId::Claude,
             codex_command: None,
+            acp_agents: Vec::new(),
             start_notes: StartNotes::default(),
             restore_run: None,
             last_restore_offered: false,
@@ -8916,6 +8980,8 @@ mod tests {
         plan: agent::TrustPlan,
         mode: SessionModeChoice,
         resume: Option<String>,
+        /// The command and mode a registered agent's start was given.
+        acp: Option<(Vec<std::ffi::OsString>, Option<String>)>,
     }
 
     /// One start a counting spawner was asked for: the session it resumes, if any, and its tiers.
@@ -8977,11 +9043,13 @@ mod tests {
                         plan,
                         mode,
                         resume,
+                        acp,
                     } => counted_external.borrow_mut().push(ExternalSpawned {
                         agent,
                         plan,
                         mode,
                         resume,
+                        acp: acp.map(|spec| (spec.argv, spec.auto_mode)),
                     }),
                 }
                 mpsc::channel().1
@@ -9414,8 +9482,9 @@ mod tests {
     #[test]
     fn an_untrusted_start_of_an_agent_that_needs_a_yes_is_refused() {
         let (state, fx) = trust_panel("trust-external-explicit-yes");
+        state.borrow_mut().acp_agents = vec![gem_registration()];
         let agent = AgentId::Acp("gem".into());
-        let profile = trust_profile(&agent);
+        let profile = trust_profile(&state.borrow().acp_agents, &agent);
         state.borrow_mut().trust.begin_check(&profile);
         tick_until(&state, |_| state.borrow().trust.bound_discovery(&profile).is_some());
         state.borrow_mut().trust.drop_worker();
@@ -9437,6 +9506,162 @@ mod tests {
             state.borrow().tabs.get(tab).unwrap().backend,
             TabBackend::NotStarted
         ));
+    }
+
+    /// A registered agent as `init.lua` would give it: a command, two project files and a mode.
+    fn gem_registration() -> AgentRegistration {
+        AgentRegistration {
+            name: "gem".into(),
+            command: vec!["gem-acp".into(), "--stdio".into()],
+            project_files: vec![".gem/".into(), "GEM.md".into()],
+            auto_mode: Some("auto_edit".into()),
+        }
+    }
+
+    /// A tab of the registered `gem`, opened and on screen.
+    fn gem_tab(state: &Rc<RefCell<AgentPanelState>>) -> TabId {
+        let mut s = state.borrow_mut();
+        s.acp_agents = vec![gem_registration()];
+        let tab = s.tabs.open(AgentId::Acp("gem".into()));
+        s.tabs.select(tab);
+        tab
+    }
+
+    fn prompt_json(payloads: &[String]) -> serde_json::Value {
+        payloads
+            .iter()
+            .map(|p| json_of(p))
+            .rfind(|v| v["kind"] == "trust_prompt")
+            .expect("a trust prompt")
+    }
+
+    /// `:tabnew <name>` opens a tab of a registered agent; a name nothing registered is refused with
+    /// the accepted words, the registered ones among them.
+    #[test]
+    fn registered_agent_offered_by_tabnew() {
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let refused = open_tab_named(&state, "gem").unwrap_err();
+        assert_eq!(refused, "unknown agent gem — :tabnew accepts claude, codex");
+        state.borrow_mut().acp_agents = vec![gem_registration()];
+        open_tab_named(&state, "gem").unwrap();
+        assert_eq!(state.borrow().tabs.active_tab().agent(), &AgentId::Acp("gem".into()));
+        let refused = open_tab_named(&state, "other").unwrap_err();
+        assert_eq!(refused, "unknown agent other — :tabnew accepts claude, codex, gem");
+        assert!(open_tab_named(&state, "acp:gem").is_err());
+    }
+
+    /// A registered agent in a root with none of its files is still asked about, with the question
+    /// saying there are none and that `n` does not start it; a `y` records the empty configuration and
+    /// starts the agent with its registered command and mode.
+    #[test]
+    fn acp_root_with_nothing_found_asks_and_records_the_empty_fingerprint() {
+        let (state, fx) = trust_panel("acp-nothing-found");
+        fx.write("CLAUDE.md", b"another agent's file, not gem's\n");
+        let tab = gem_tab(&state);
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let seen = tick_until(&state, |seen| !prompts(&all_payloads(seen)).is_empty());
+        let payloads = all_payloads(&seen);
+        let shown = prompt_json(&payloads);
+        assert_eq!(shown["agent"], "gem");
+        assert_eq!(shown["state"], "nothing");
+        assert_eq!(shown["needsYes"], true);
+        assert_eq!(shown["items"], serde_json::json!([]));
+        let prompt = prompts(&payloads).pop().unwrap();
+        assert_eq!(prompt.tab, tab);
+        assert!(fx.external.borrow().is_empty(), "nothing before the answer");
+
+        let out = answer_prompt(&state, "a1", &prompt, true);
+        assert_eq!(result_for(&out.payloads, "a1"), Some(Ok(())));
+        tick_until(&state, |_| !fx.external.borrow().is_empty());
+        let record = PathBuf::from(format!("{}.acp-gem", fx.record_file().display()));
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert_eq!(written["fingerprint"], prompt.fingerprint.as_str());
+        assert!(!fx.record_file().exists(), "Claude's record is untouched");
+        let started = fx.external.borrow()[0].clone();
+        assert_eq!(started.agent, AgentId::Acp("gem".into()));
+        assert_eq!(
+            started.acp,
+            Some((
+                vec![std::ffi::OsString::from("gem-acp"), std::ffi::OsString::from("--stdio")],
+                Some("auto_edit".to_string())
+            ))
+        );
+        assert!(
+            fx.spawned.borrow().is_empty(),
+            "nothing went through the Claude spawner"
+        );
+    }
+
+    /// An `n` to a registered agent's question starts nothing and says why; it is not remembered, so the
+    /// next start asks again.
+    #[test]
+    fn acp_n_refuses_with_the_notice() {
+        let (state, fx) = trust_panel("acp-n-refuses");
+        fx.write("GEM.md", b"gem instructions\n");
+        let tab = gem_tab(&state);
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let seen = tick_until(&state, |seen| !prompts(&all_payloads(seen)).is_empty());
+        let payloads = all_payloads(&seen);
+        assert_eq!(prompt_json(&payloads)["state"], "untrusted");
+        assert_eq!(prompt_json(&payloads)["needsYes"], true);
+        assert_eq!(items_of_prompt(&payloads), ["GEM.md"]);
+        let prompt = prompts(&payloads).pop().unwrap();
+
+        let out = answer_prompt(&state, "a1", &prompt, false);
+        assert_eq!(
+            result_for(&out.payloads, "a1"),
+            Some(Ok(())),
+            "the answer is taken; the start is refused"
+        );
+        let payloads = out.payloads;
+        let why = "gem would load this project's own configuration, which you have not trusted; Eitri cannot \
+                   start it without loading that";
+        let profile = trust_profile(&state.borrow().acp_agents, &AgentId::Acp("gem".into()));
+        assert_eq!(crate::trust_gate::refused_without_yes(&profile), why);
+        assert_eq!(result_for(&payloads, "r1"), Some(Err(why.to_string())));
+        assert!(notices(&payloads).contains(&why.to_string()), "{payloads:?}");
+        assert!(fx.external.borrow().is_empty());
+        assert!(fx.spawned.borrow().is_empty());
+
+        gate_start(&mut state.borrow_mut(), tab, first_send("r2", "again")).unwrap();
+        let again = next_prompt(&state);
+        assert_eq!(again.tab, tab);
+        assert!(fx.external.borrow().is_empty());
+    }
+
+    /// Trusted with nothing found, a registered agent starts without asking; once one of its project
+    /// files appears, the fingerprint no longer matches and the next start asks again, naming it.
+    #[test]
+    fn a_file_appearing_later_reasks() {
+        let (state, fx) = trust_panel("acp-file-later");
+        let tab = gem_tab(&state);
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let prompt = next_prompt(&state);
+        answer_prompt(&state, "a1", &prompt, true);
+        tick_until(&state, |_| fx.external.borrow().len() == 1);
+
+        let second = {
+            let mut s = state.borrow_mut();
+            let second = s.tabs.open(AgentId::Acp("gem".into()));
+            s.tabs.select(second);
+            second
+        };
+        gate_start(&mut state.borrow_mut(), second, first_send("r2", "hello")).unwrap();
+        tick_until(&state, |_| fx.external.borrow().len() == 2);
+
+        fx.write(".gem/settings.json", b"{\"tools\": \"all\"}\n");
+        let third = {
+            let mut s = state.borrow_mut();
+            let third = s.tabs.open(AgentId::Acp("gem".into()));
+            s.tabs.select(third);
+            third
+        };
+        gate_start(&mut state.borrow_mut(), third, first_send("r3", "hello")).unwrap();
+        let seen = tick_until(&state, |seen| !prompts(&all_payloads(seen)).is_empty());
+        let payloads = all_payloads(&seen);
+        assert_eq!(prompts(&payloads).pop().unwrap().tab, third);
+        assert_eq!(prompt_json(&payloads)["state"], "changed");
+        assert_eq!(fx.external.borrow().len(), 2, "the third start waits for the answer");
     }
 
     #[test]
@@ -9764,11 +9989,13 @@ mod tests {
                         plan,
                         mode,
                         resume,
+                        acp,
                     } => external.borrow_mut().push(ExternalSpawned {
                         agent,
                         plan,
                         mode,
                         resume,
+                        acp: acp.map(|spec| (spec.argv, spec.auto_mode)),
                     }),
                 }
                 mpsc::channel().1
