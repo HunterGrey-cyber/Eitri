@@ -714,6 +714,11 @@ fn no_allow_once_cannot_be_approved() {
     let (first, _) = until_permission(&provider);
     let err = allow(&provider, &first).expect_err("cannot approve");
     assert!(err.is_benign(), "{err}");
+    assert!(
+        err.to_string()
+            .contains("offers no way for this request to be approved"),
+        "{err}"
+    );
     // The card stays; the option that exists still works.
     deny(&provider, &first).expect("refuses");
 
@@ -1250,6 +1255,11 @@ fn a_request_whose_input_would_be_cut_cannot_be_approved() {
     assert_eq!(input["options"], json!([{"kind": "reject_once", "name": "No"}]));
     let err = allow(&provider, &id).expect_err("cannot approve what is not shown");
     assert!(err.is_benign(), "{err}");
+    // The refusal names Eitri's own reason: the agent did offer an allow-once option.
+    assert!(
+        err.to_string().contains("Eitri held back stand-in's allow-once option"),
+        "{err}"
+    );
     deny(&provider, &id).expect("can refuse");
     until_completed(&provider);
     let _ = std::fs::remove_file(&file);
@@ -1306,6 +1316,11 @@ fn a_request_whose_diff_would_not_be_shown_whole_cannot_be_approved() {
     assert_eq!(input["options"], json!([{"kind": "reject_once", "name": "No"}]));
     let err = allow(&provider, &id).expect_err("cannot approve what is not shown");
     assert!(err.is_benign(), "{err}");
+    // The refusal names Eitri's own reason: the agent did offer an allow-once option.
+    assert!(
+        err.to_string().contains("Eitri held back stand-in's allow-once option"),
+        "{err}"
+    );
     deny(&provider, &id).expect("can refuse");
     until_completed(&provider);
     let _ = std::fs::remove_file(&file);

@@ -63,9 +63,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
      event does that. */
   const inert = answered || sessionEnded;
   const external = isExternalTool(request.toolName);
-  // An ACP card whose agent offered no allow-once option, or whose option Rust held back, has nothing for
-  // Approve to answer with.
-  const approvable = !request.toolName.startsWith("acp:") || acpApprovable(request.input);
+  const approvable = cardApprovable(request);
 
   function handleAnswer(decision: PermissionDecision, remember = false) {
     if (inert) return;
@@ -404,6 +402,13 @@ export function acpPreview(diff: NonNullable<AcpCardInput["diffs"]>[number]): Ed
     ];
   const count = (kind: "added" | "removed") => shown.filter((l) => l.kind === kind).length;
   return { filePath: String(diff.path), diff: shown, added: count("added"), removed: count("removed"), replaceAll: false, wholeFile: false };
+}
+
+/** Whether Approve has anything to answer with. An ACP card whose agent offered no allow-once option, or whose
+ *  option Rust held back, has not; every other card has. INPUT's `Ctrl+y` asks the same question, so it never
+ *  offers or sends an approval the card's own button would refuse. */
+export function cardApprovable(request: Pick<PermissionRequestRecord, "toolName" | "input">): boolean {
+  return !request.toolName.startsWith("acp:") || acpApprovable(request.input);
 }
 
 /** Whether an ACP card can be approved: Rust left the agent's `allow_once` in its options. It leaves it out

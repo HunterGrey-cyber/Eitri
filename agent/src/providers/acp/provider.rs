@@ -94,6 +94,9 @@ struct WaitingCard {
     allow: Option<String>,
     /// The agent's first `reject_once` option, if it offered one. Never shown.
     reject: Option<String>,
+    /// The agent offered an `allow_once` option, but the card could not show the whole call, so it is not
+    /// used: a refused approval then says so instead of blaming the agent.
+    allow_held_back: bool,
 }
 
 /// What belongs to one running turn.
@@ -688,7 +691,9 @@ impl AcpProvider {
         // what an approval lets through. It can still be refused, and the interrupt ends it.
         let unshowable = translate::input_is_cut(&tool);
         let first = |kind: OptionKind| request.options.iter().find(|o| o.kind == kind).map(|o| o.id.clone());
-        let allow = first(OptionKind::AllowOnce).filter(|_| !unshowable);
+        let offered_allow = first(OptionKind::AllowOnce);
+        let allow_held_back = unshowable && offered_allow.is_some();
+        let allow = offered_allow.filter(|_| !unshowable);
         let reject = first(OptionKind::RejectOnce);
         // Only what can be answered is shown, by the agent's own names, without the ids.
         let shown: Vec<Value> = request
@@ -716,6 +721,7 @@ impl AcpProvider {
                 request_id: id,
                 allow,
                 reject,
+                allow_held_back,
             },
         ));
         st.events.push_back(AgentDomainEvent::PermissionRequested {
@@ -865,6 +871,15 @@ impl AgentProvider for AcpProvider {
         // A request that offers no option of the kind cannot be answered that way, and nothing else is
         // selected in its place: the card stays, and an interrupt can still end it.
         let Some(option) = wanted else {
+            if approve && st.cards[at].1.allow_held_back {
+                return Err(provider_error(
+                    ProviderErrorCode::PermissionNotFound,
+                    format!(
+                        "Eitri held back {}'s allow-once option: this card cannot show the whole call, so it cannot be approved",
+                        self.agent
+                    ),
+                ));
+            }
             let what = if approve { "approved" } else { "refused" };
             return Err(provider_error(
                 ProviderErrorCode::PermissionNotFound,

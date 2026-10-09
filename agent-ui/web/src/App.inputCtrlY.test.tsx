@@ -119,12 +119,16 @@ const bandMessage = (c: HTMLElement) => c.querySelector(".band-message")?.textCo
 
 /** Tab 1 live with `cards` cards, the pane focused, the keys arrived on a waiting card if present,
  *  the band widened. Stays in BROWSE. */
-function started(cards: 0 | 1 | 2, tabs: readonly Record<string, unknown>[] = [TAB1]) {
+function started(
+  cards: 0 | 1 | 2,
+  tabs: readonly Record<string, unknown>[] = [TAB1],
+  events: AgentDomainEvent[] = cardEvents(cards),
+) {
   const rendered = render(<App />);
   dispatch({ kind: "hello", ...HELLO });
   dispatch({ kind: "tabs", active: 1, tabs });
   dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
-  const list = cardEvents(cards);
+  const list = events;
   dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   dispatch({
     kind: "keymap",
@@ -555,5 +559,60 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
       wait(1000);
       expect(answered()).toEqual([]);
     });
+  });
+});
+
+/** An ACP card Approve cannot answer: the agent offered an allow-once option, but the call was too large for the
+ *  card to show whole, so Rust held it back (`inputCut`) and left only the reject. */
+function unapprovableAcpCard(): AgentDomainEvent[] {
+  const input = {
+    title: "Edit notes.txt",
+    inputCut: true,
+    options: [{ kind: "reject_once", name: "Reject" }],
+    diffs: [],
+    locations: [{ path: "/work/notes.txt" }],
+  };
+  return [
+    { type: "user_prompt_submitted", text: "edit it" },
+    { type: "turn_started", turn_id: "t1" },
+    { type: "tool_call_started", turn_id: "t1", tool_use_id: "c1", name: "acp:edit", input },
+    { type: "permission_requested", permission_id: "acp-1", tool_use_id: "c1", tool_name: "acp:edit", input },
+  ];
+}
+
+describe("a card Approve cannot answer: neither Ctrl+y nor a sends an approval", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    widen = stubBandWidth();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("the band does not offer Ctrl+y for it, and Ctrl+y flashes why and sends nothing", () => {
+    const { container } = started(1, [TAB1], unapprovableAcpCard());
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "i" });
+    wait(TYPING_GUARD_MS + 50);
+    const box = textarea(container)!;
+    expect(bandText(container)).not.toContain("Ctrl+y approves");
+    expect(ctrlY(box)).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(bandMessage(container)).toContain("cannot be approved");
+  });
+
+  it("a on it flashes why and sends nothing; d still denies", () => {
+    const { container } = started(1, [TAB1], unapprovableAcpCard());
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "a" });
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(bandMessage(container)).toContain("cannot be approved");
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "d" });
+    wait(1000);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "acp-1", decision: "deny" })]);
   });
 });

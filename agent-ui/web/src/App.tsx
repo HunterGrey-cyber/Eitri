@@ -79,6 +79,7 @@ import { Composer } from "./components/Composer";
 import type { RestoredDraft } from "./components/Composer";
 import { TabBar } from "./components/TabBar";
 import { MessageList } from "./components/MessageList";
+import { cardApprovable } from "./components/PermissionCard";
 import { Row } from "./components/Row";
 import { classify, failureEvidence, remedyNamesR, sidecarStopped } from "./problems";
 import { ActivityLine } from "./components/ActivityLine";
@@ -237,6 +238,10 @@ const CTRL_Y_TARGET_FLASH = "Ctrl+y: the waiting card just changed — read it, 
 /** Message shown when INPUT's `Ctrl+y` follows a composer kill key.
  *  After `Ctrl+u`, `Ctrl+w` or `Ctrl+k`, it is a yank regardless of the pause. */
 const CTRL_Y_YANK_FLASH = "Ctrl+y right after Ctrl+u, Ctrl+w or Ctrl+k is a yank, not an answer — press it again";
+/** What the band says when `a` or INPUT's `Ctrl+y` would approve a card whose Approve is disabled: an ACP card
+ *  whose agent offered no allow-once option, or one Eitri held back because the card cannot show the whole
+ *  call. Nothing is sent; sending would only bring back the agent's refusal under a misleading reason. */
+const NOT_APPROVABLE_FLASH = "this card cannot be approved — deny it, or Ctrl+c interrupts the turn";
 
 /** Whether the target is the composer's textarea, where INPUT's `Ctrl+y` can answer.
  *  Search fields and card reason boxes do not qualify. */
@@ -1944,7 +1949,10 @@ export default function App() {
     if (mode !== "input" || !paneFocused || sessionEnded || !composerBoxFocused) return null;
     const index = oldestWaitingPermission(timeline, answeredPermissions);
     const item = index === null ? undefined : timeline[index];
-    return item?.kind === "permission" ? { tool: item.request.toolName, summary: cardSummary(item.request.input) } : null;
+    // A card Approve cannot answer is not named: `Ctrl+y` would only flash that it cannot.
+    return item?.kind === "permission" && cardApprovable(item.request)
+      ? { tool: item.request.toolName, summary: cardSummary(item.request.input) }
+      : null;
   })();
   /** Identifies INPUT's `Ctrl+y` target by tab and permission id. Each target must stay unchanged
    *  for `TYPING_GUARD_MS` before approval, so a quick second `Ctrl+y` cannot approve a new card.
@@ -4035,6 +4043,10 @@ export default function App() {
     decision: "allow" | "deny",
   ) {
     const item = target === null ? undefined : timeline[target];
+    if (decision === "allow" && item?.kind === "permission" && !cardApprovable(item.request)) {
+      showFlash(NOT_APPROVABLE_FLASH);
+      return;
+    }
     const permissionId = item?.kind === "permission" ? item.request.permissionId : null;
     const tab = activeTabRef.current;
     const stillThere =
@@ -4074,6 +4086,10 @@ export default function App() {
     const item = index === null ? undefined : timeline[index];
     if (item?.kind !== "permission") return;
     event.preventDefault();
+    if (!cardApprovable(item.request)) {
+      showFlash(NOT_APPROVABLE_FLASH);
+      return;
+    }
     const permissionId = item.request.permissionId;
     const tab = activeTabRef.current;
     const targetKey = `${tab}:${permissionId}`;
