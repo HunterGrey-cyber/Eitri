@@ -704,6 +704,10 @@ pub struct RestoreGo {
     pub downgraded: usize,
     /// Whether the user was asked (a quiet downgrade says so afterwards; an answered `n` need not).
     pub asked: bool,
+    /// The saved tabs are still on offer (a restore asked for from the dashboard leaves them so): a restore
+    /// put off then leaves its tab empty and the offer standing, and the saved file untouched, instead of
+    /// keeping its sessions as failed tabs.
+    pub reoffer: bool,
 }
 
 impl RestoreGo {
@@ -2640,8 +2644,24 @@ impl TabSet {
                 ))
             })
             .collect();
-        let active_external = external.iter().position(|(id, _)| *id == self.active);
-        let external_tabs: Vec<SavedExternalTab> = external.into_iter().map(|(_, saved)| saved).collect();
+        let mut active_external = external.iter().position(|(id, _)| *id == self.active);
+        let waiting_active = self.waiting_restore_active();
+        let mut external_tabs: Vec<SavedExternalTab> = external.into_iter().map(|(_, saved)| saved).collect();
+        // A restore waiting for the trust question has no tab for its sessions yet; they stay in the
+        // file meanwhile, so a session started in another tab does not write over them.
+        let waiting = self.waiting_restore_tabs();
+        for granted in waiting.iter().filter(|g| g.planned.agent.is_external()) {
+            if active_external.is_none() && waiting_active == Some(granted.planned.provider_session_id.as_str()) {
+                active_external = Some(external_tabs.len());
+            }
+            external_tabs.push(SavedExternalTab {
+                agent: granted.planned.agent.clone(),
+                conversation_id: conversation_id.to_string(),
+                provider_session_id: granted.planned.provider_session_id.clone(),
+                name: granted.planned.name.clone(),
+                mode: granted.mode,
+            });
+        }
         if self.kind != BackendKind::Sidecar {
             return Some(SavedTabs {
                 external_tabs,
@@ -2650,7 +2670,7 @@ impl TabSet {
             });
         }
         // `provider_session_id` is read in its own statement per tab (the lock-order rule above).
-        let listed: Vec<(TabId, SavedTab)> = self
+        let mut listed: Vec<(TabId, SavedTab)> = self
             .tabs
             .iter()
             .filter(|tab| tab.agent == AgentId::Claude)
@@ -2668,7 +2688,7 @@ impl TabSet {
             })
             .collect();
         // The tab on screen if it is listed, else the listed tab that was on screen most recently.
-        let active = listed
+        let mut active = listed
             .iter()
             .position(|(id, _)| *id == self.active)
             .or_else(|| {
@@ -2678,6 +2698,22 @@ impl TabSet {
                     .find_map(|recent| listed.iter().position(|(id, _)| id == recent))
             })
             .unwrap_or(0);
+        let had_tabs = !listed.is_empty();
+        for granted in waiting.iter().filter(|g| g.planned.agent == AgentId::Claude) {
+            // Behind the tabs that exist; when none does, the restore's own active tab is the one.
+            if !had_tabs && self.waiting_restore_active() == Some(granted.planned.provider_session_id.as_str()) {
+                active = listed.len();
+            }
+            listed.push((
+                TabId(u64::MAX),
+                SavedTab {
+                    conversation_id: conversation_id.to_string(),
+                    provider_session_id: granted.planned.provider_session_id.clone(),
+                    name: granted.planned.name.clone(),
+                    mode: granted.mode,
+                },
+            ));
+        }
         Some(SavedTabs {
             tabs: listed.into_iter().map(|(_, saved)| saved).collect(),
             active,
@@ -2707,6 +2743,43 @@ impl TabSet {
             return (!open_elsewhere && !failed_before).then_some(id);
         }
         tab.provider_session_id().filter(|id| !id.is_empty())
+    }
+
+    /// The sessions of a restore that is waiting for the trust question and so has no tab of its own
+    /// yet, except the ones already open in a tab.
+    fn waiting_restore_tabs(&self) -> Vec<&GrantedTab> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| match &tab.backend {
+                TabBackend::AwaitingTrust(AwaitingTrust {
+                    start: DeferredStart::Restore { go },
+                    ..
+                }) => Some(go),
+                _ => None,
+            })
+            .filter(|go| !go.reoffer)
+            .flat_map(|go| go.tabs.iter())
+            .filter(|granted| {
+                let (agent, id) = (&granted.planned.agent, granted.planned.provider_session_id.as_str());
+                self.tab_with_session(agent, id).is_none()
+                    && !self.tabs.iter().any(|t| {
+                        matches!(t.backend, TabBackend::Failed { .. })
+                            && t.agent == *agent
+                            && t.failed_resume.as_deref() == Some(id)
+                    })
+            })
+            .collect()
+    }
+
+    /// The session the waiting restore would put on screen, if it names one.
+    fn waiting_restore_active(&self) -> Option<&str> {
+        self.tabs.iter().find_map(|tab| match &tab.backend {
+            TabBackend::AwaitingTrust(AwaitingTrust {
+                start: DeferredStart::Restore { go },
+                ..
+            }) if !go.reoffer => go.active_session.as_deref(),
+            _ => None,
+        })
     }
 
     /// The user's own `init.lua` choice of the mode new tabs start in (`agent.default_mode`): the
@@ -2872,6 +2945,50 @@ impl TabSet {
         run
     }
 
+    /// A restore whose start was put off (a trust question answered `Escape`, too large to show, or
+    /// refused): its sessions come back as failed tabs holding their resume ids, the first in `from`
+    /// and the rest in new tabs, so the saved-tabs file keeps them until the user closes a tab or
+    /// starts it over with `r`. Without this the restore's sessions would be in no tab and the next
+    /// write of the file would leave them out. A session already open in a tab is not listed twice.
+    pub fn keep_put_off_restore(&mut self, from: TabId, go: RestoreGo, reason: &str) {
+        if go.reoffer {
+            // The saved tabs are still on offer and the file was never touched: the tab is empty again.
+            return;
+        }
+        let mut kept: Vec<(String, TabId)> = Vec::new();
+        for granted in go.tabs {
+            let GrantedTab { planned, mode } = granted;
+            let id = planned.provider_session_id.clone();
+            if self.tab_with_session(&planned.agent, &id).is_some() {
+                continue;
+            }
+            let ResumeRoute::StartIn(target) = self.route_resume(from, &planned.agent, &id, false) else {
+                continue;
+            };
+            let tab = self.get_mut(target).expect("route_resume names a tab it has");
+            tab.mode = mode;
+            tab.agent = planned.agent;
+            tab.failed_after_start = false;
+            tab.failed_resume = Some(id.clone());
+            if tab.name.is_none() {
+                tab.name = planned.name;
+            }
+            tab.backend = TabBackend::Failed {
+                reason: reason.to_string(),
+            };
+            kept.push((id, target));
+        }
+        let on_screen = go
+            .active_session
+            .as_ref()
+            .and_then(|wanted| kept.iter().find(|(id, _)| id == wanted))
+            .or_else(|| kept.first())
+            .map(|(_, tab)| *tab);
+        if let Some(tab) = on_screen {
+            self.select(tab);
+        }
+    }
+
     /// A restored tab whose resume failed. `back_to` is [`RestoreRun::back_to`]: an empty tab again, in
     /// the mode it had before the restore, if it is the one the restore began in; gone if the restore
     /// made it. What went wrong is reported once for the whole restore, not left as a dead tab each.
@@ -2920,6 +3037,7 @@ fn grant(plan: RestorePlan, policy: BypassPolicy, asked: bool) -> RestoreGo {
         active_session: plan.active_session,
         downgraded,
         asked,
+        reoffer: false,
     }
 }
 

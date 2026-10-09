@@ -101,6 +101,10 @@ export type TabViewState = {
 /** How long after the last keystroke the composer mirrors its text to Rust. */
 export const DRAFT_MIRROR_DELAY_MS = 300;
 
+/** How long after a refused send the page puts back itself Rust's `draft` echo of that refusal is still told apart
+ *  from a draft Rust sends on its own (a switch, a reset, a scratch return). */
+export const REFUSED_ECHO_MS = 1500;
+
 export function saveView(store: Map<TabId, TabViewState>, tab: TabId, view: TabViewState): void {
   store.set(tab, view);
 }

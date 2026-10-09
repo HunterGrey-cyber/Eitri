@@ -37,8 +37,9 @@ export type TrustPromptEnvelope = {
   fingerprint: string;
   findingsDigest: string;
   /** `nothing`: none of the agent's files are in the project, and the agent is asked about anyway (it loads
-   *  whatever project files appear, so it starts only after a `y`). */
-  state: "untrusted" | "changed" | "nothing";
+   *  whatever project files appear, so it starts only after a `y`). `too_large`: the configuration is too large
+   *  to show whole, so nothing is asked to be trusted: the question takes `n` and `Esc` and never a `y`. */
+  state: "untrusted" | "changed" | "nothing" | "too_large";
   /** Whether `n` refuses the start instead of starting without the project's configuration: a registered ACP
    *  agent has no way to leave it out. Absent reads as `false`. */
   needsYes?: boolean;
@@ -75,10 +76,13 @@ export function groupItemsByFile(items: readonly TrustItem[]): { file: string; i
 
 /** The band's prompt while the question is up. */
 export const TRUST_BAND_PROMPT = "trust? y/n";
+/** The band while the question for a configuration too large to show is up: it takes no `y`. */
+export const TRUST_BAND_PROMPT_N_ONLY = "trust? n/Esc";
 
 /** The overlay's last line, and the flash for a key the prompt does not take. A `session` prompt says what
  *  its `y` is worth: the start in front of it and nothing after. */
-export function trustFooter(remember: TrustRemember, needsYes = false): string {
+export function trustFooter(remember: TrustRemember, needsYes = false, state?: TrustPromptEnvelope["state"]): string {
+  if (state === "too_large") return "n starts without it · Esc puts this off · y is not taken here";
   const base = needsYes
     ? "y trusts and starts it · n does not start it · Esc puts this off"
     : "y trusts and loads it · n starts without it · Esc puts this off";
@@ -110,12 +114,15 @@ export type TrustKeyEvent = KeyLike & { repeat: boolean };
  *  a repository's hooks. `Escape` starts nothing, so it has no guard. */
 export function resolveTrustKey(
   event: TrustKeyEvent,
-  ctx: { now: number; openedAt: number; lastKeyAt: number; pendingG: boolean },
+  ctx: { now: number; openedAt: number; lastKeyAt: number; pendingG: boolean; onlyN?: boolean },
 ): TrustKeyAction {
   const plain = isPlainAnswerKey(event) && event.altKey !== true && event.metaKey !== true;
   if (event.key === "Escape") return { kind: "cancel" };
   const lower = event.key.length === 1 ? event.key.toLowerCase() : event.key;
   if ((lower === "y" || lower === "n") && !event.ctrlKey) {
+    // The question for a configuration too large to show has no `y`: it is taken and answered with the
+    // footer, never sent.
+    if (lower === "y" && ctx.onlyN === true) return { kind: "swallow" };
     const counts =
       plain &&
       !event.repeat &&

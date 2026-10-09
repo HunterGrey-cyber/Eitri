@@ -65,6 +65,20 @@ describe("TrustPrompt", () => {
     );
   });
 
+  it("asks no trust question when the configuration is too large to show: n or Esc, no y", () => {
+    const note =
+      "this project's Claude configuration is too large to show whole in the trust question (over 3.0 MiB; at most 2.0 MiB can be shown), and nothing is trusted unseen; nothing of it will be loaded";
+    const { container } = render(
+      <TrustPrompt envelope={envelope({ state: "too_large", remember: "window", rememberNote: note, items: [] })} />,
+    );
+    expect(container.querySelector("h2")!.textContent).toBe("This project's Claude configuration is too large to show.");
+    expect(container.querySelector(".trust-note")!.textContent).toBe(note);
+    expect(container.querySelectorAll(".trust-file")).toHaveLength(0);
+    expect(container.querySelector(".trust-footer")!.textContent).toBe(
+      "n starts without it · Esc puts this off · y is not taken here",
+    );
+  });
+
   it("says n does not start an agent that needs a y, even with files to show", () => {
     const { container } = render(<TrustPrompt envelope={envelope({ agent: "gem", needsYes: true })} />);
     expect(container.querySelector("h2")!.textContent).toBe("Trust this project's gem configuration?");

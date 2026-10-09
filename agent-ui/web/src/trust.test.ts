@@ -17,6 +17,20 @@ describe("resolveTrustKey", () => {
     expect(resolveTrustKey(key("n"), GUARD_OPEN)).toEqual({ kind: "answer", trust: false });
   });
 
+  it("takes no y at the question for a configuration too large to show, only n and Escape", () => {
+    const only = { ...GUARD_OPEN, onlyN: true };
+    expect(resolveTrustKey(key("y"), only)).toEqual({ kind: "swallow" });
+    expect(resolveTrustKey(key("Y", { shiftKey: true }), only)).toEqual({ kind: "swallow" });
+    expect(resolveTrustKey(key("n"), only)).toEqual({ kind: "answer", trust: false });
+    expect(resolveTrustKey(key("Escape"), only)).toEqual({ kind: "cancel" });
+    // Not a wait either: a y inside the wait is still no answer.
+    expect(resolveTrustKey(key("y"), { ...only, now: 100 })).toEqual({ kind: "swallow" });
+  });
+
+  it("words the footer of that question without a y", () => {
+    expect(trustFooter("window", false, "too_large")).toBe("n starts without it · Esc puts this off · y is not taken here");
+  });
+
   it("refuses a y or n typed with Ctrl, Alt, Meta, Super or an input method composing", () => {
     for (const k of ["y", "n"]) {
       expect(resolveTrustKey(key(k, { ctrlKey: true }), GUARD_OPEN).kind).not.toBe("answer");

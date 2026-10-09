@@ -22,7 +22,7 @@
 
 use crate::panel_document::{PanelDocument, PANEL_BASE_URI};
 use crate::panel_page::{PanelHost, PanelPage};
-use crate::trust_gate::{AnswerOutcome, CommandAnswer, GateEvent, Route, TrustGate};
+use crate::trust_gate::{AnswerOutcome, Asked, CommandAnswer, GateEvent, Route, TrustGate};
 use agent::setting_sources::ProjectTrust;
 use eitri_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
 use eitri_core::agent_bridge::{
@@ -2589,7 +2589,9 @@ fn answer_restore_question(state: &mut AgentPanelState, nonce: u64, keep_bypass:
 /// A restore the bypass question (if any) has cleared waits in `from` for the trust question. It holds
 /// no lease while it waits: those are taken when it starts, so a question left unanswered blocks no
 /// other window.
-fn gate_restore(state: &mut AgentPanelState, from: TabId, go: RestoreGo) -> RestoreResult {
+fn gate_restore(state: &mut AgentPanelState, from: TabId, mut go: RestoreGo) -> RestoreResult {
+    // Still held by the window (a dashboard restore): a put-off leaves it on offer, the file untouched.
+    go.reoffer = state.restore_source.is_some();
     match gate_start(state, from, DeferredStart::Restore { go }) {
         Ok(()) => RestoreResult::Deferred,
         Err(why) => RestoreResult::Refused(why),
@@ -3050,20 +3052,41 @@ fn put_off_start(state: &mut AgentPanelState, tab: TabId, start: DeferredStart, 
         DeferredStart::FirstSend {
             request_id: sent,
             first_turn,
-        } => {
-            // The refused send first: the page puts a refused message back in its box itself, so the
-            // draft that follows only confirms it rather than adding it a second time.
-            state.tabs.set_draft(tab, &first_turn.typed);
-            out.push(serialize_command_result_for_js(&sent, Err(why)));
-            out.push(eitri_core::agent_bridge::serialize_draft_for_js(tab, &first_turn.typed));
-        }
+        } => return_first_message(state, tab, &sent, &first_turn, why, &mut out),
         DeferredStart::Resume { request_id: asked, .. } => {
             out.push(serialize_command_result_for_js(&asked, Err(why)));
             out.toast = Some(why.to_string());
         }
-        DeferredStart::Restore { .. } => out.toast = Some(why.to_string()),
+        DeferredStart::Restore { go } => {
+            state.tabs.keep_put_off_restore(tab, go, why);
+            out.payloads.extend(switch_payloads(state));
+            out.toast = Some(why.to_string());
+        }
     }
     out
+}
+
+/// A first message whose start will not happen goes back to the composer, `why` being the refusal.
+/// The refused send comes first: the page puts the message back in its box itself, keeping what was
+/// typed there since and putting the message before it. Rust's copy of the draft is that same merge, so
+/// the `draft` that follows (which replaces the box) holds both and loses neither.
+fn return_first_message(
+    state: &mut AgentPanelState,
+    tab: TabId,
+    sent: &str,
+    first_turn: &FirstTurn,
+    why: &str,
+    out: &mut TrustOut,
+) {
+    let typed_since = state.tabs.get(tab).map(|t| t.draft.clone()).unwrap_or_default();
+    let draft = if typed_since.is_empty() {
+        first_turn.typed.clone()
+    } else {
+        format!("{}\n{typed_since}", first_turn.typed)
+    };
+    state.tabs.set_draft(tab, &draft);
+    out.push(serialize_command_result_for_js(sent, Err(why)));
+    out.push(eitri_core::agent_bridge::serialize_draft_for_js(tab, &draft));
 }
 
 /// A tab waiting for the trust question, given what the gate knows now: started if the answer is
@@ -3102,8 +3125,19 @@ fn reroute_or_ask(state: &mut AgentPanelState, tab: TabId) -> TrustOut {
             let Ok(nonce) = state.tabs.ask_trust(tab) else {
                 return out;
             };
-            if let Some(view) = state.trust.show(tab, nonce, &profile) {
-                out.push(eitri_core::agent_bridge::serialize_trust_prompt_for_js(&view));
+            match state.trust.ask(tab, nonce, &profile) {
+                Some(Asked::Prompt(message)) => out.push(message),
+                // Nothing in a prompt may be cut, so one too large to show refuses its start.
+                Some(asked @ (Asked::TooLarge { .. } | Asked::Unavailable)) => {
+                    if let Some(start) = state.tabs.take_deferred(tab) {
+                        let why = match asked {
+                            Asked::TooLarge { agent, bytes } => crate::trust_gate::too_large_to_start(&agent, bytes),
+                            _ => crate::trust_gate::UNAVAILABLE_START.to_string(),
+                        };
+                        out.extend(put_off_start(state, tab, start, &why));
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -3121,7 +3155,7 @@ fn sweep_awaiting(state: &mut AgentPanelState) -> TrustOut {
 
 /// The tick's half of the gate: what its worker finished, acted on. Never blocks.
 fn trust_events(state: &mut AgentPanelState) -> TrustOut {
-    use eitri_core::agent_bridge::{serialize_notice_for_js, serialize_trust_prompt_for_js};
+    use eitri_core::agent_bridge::serialize_notice_for_js;
     let mut out = TrustOut::default();
     for event in state.trust.poll() {
         match event {
@@ -3149,10 +3183,18 @@ fn trust_events(state: &mut AgentPanelState) -> TrustOut {
             }
             GateEvent::CommandAsk { request_id, tab } => {
                 let shown = (state.tabs.active() == tab && state.document_ready)
-                    .then(|| state.trust.show_command(tab, &request_id))
+                    .then(|| state.trust.ask_command(tab, &request_id))
                     .flatten();
                 match shown {
-                    Some(view) => out.push(serialize_trust_prompt_for_js(&view)),
+                    Some(Asked::Prompt(message)) => out.push(message),
+                    Some(asked @ (Asked::TooLarge { .. } | Asked::Unavailable)) => {
+                        let why = match asked {
+                            Asked::TooLarge { agent, bytes } => crate::trust_gate::too_large(&agent, bytes),
+                            _ => crate::trust_gate::UNAVAILABLE_COMMAND.to_string(),
+                        };
+                        out.push(serialize_notice_for_js(&why));
+                        out.push(serialize_command_result_for_js(&request_id, Err(&why)));
+                    }
                     // The tab is not on screen any more: `:trust` is answered on the next poll.
                     None => state.trust.drop_command_prompt(),
                 }
@@ -3332,18 +3374,16 @@ fn cancel_trust_question(state: &mut AgentPanelState, request_id: &str, tab: Tab
         DeferredStart::FirstSend {
             request_id: sent,
             first_turn,
-        } => {
-            // The refused send first: the page puts a refused message back in its box itself, so
-            // the draft that follows only confirms it rather than adding it a second time.
-            state.tabs.set_draft(tab, &first_turn.typed);
-            out.push(serialize_command_result_for_js(&sent, Err(NOT_STARTED)));
-            out.push(eitri_core::agent_bridge::serialize_draft_for_js(tab, &first_turn.typed));
-        }
+        } => return_first_message(state, tab, &sent, &first_turn, NOT_STARTED, &mut out),
         DeferredStart::Resume { request_id: asked, .. } => {
             out.push(serialize_command_result_for_js(&asked, Err(PUT_OFF)));
             out.toast = Some(PUT_OFF.to_string());
         }
-        DeferredStart::Restore { .. } => out.toast = Some(PUT_OFF.to_string()),
+        DeferredStart::Restore { go } => {
+            state.tabs.keep_put_off_restore(tab, go, PUT_OFF);
+            out.payloads.extend(switch_payloads(state));
+            out.toast = Some(PUT_OFF.to_string());
+        }
     }
     out.push(serialize_command_result_for_js(request_id, Ok(())));
     out
@@ -9451,6 +9491,7 @@ mod tests {
         fingerprint: String,
         digest: String,
         remember: String,
+        state: String,
     }
 
     fn json_of(payload: &str) -> serde_json::Value {
@@ -9468,6 +9509,7 @@ mod tests {
                 fingerprint: v["fingerprint"].as_str().unwrap().to_string(),
                 digest: v["findingsDigest"].as_str().unwrap().to_string(),
                 remember: v["remember"].as_str().unwrap().to_string(),
+                state: v["state"].as_str().unwrap().to_string(),
             })
             .collect()
     }
@@ -9852,6 +9894,66 @@ mod tests {
             state.borrow().tabs.get(tab).unwrap().backend,
             TabBackend::NotStarted
         ));
+    }
+
+    /// A project whose trust question would be larger than the page is ever sent (here one hook of
+    /// 3 MiB) is not shown in part. Claude starts without the project's configuration on an `n`, so it is
+    /// asked a short question that has no `y`: a `y` is refused and the question asked again, nothing is
+    /// started or recorded, and an `n` starts the session untrusted. `:trust` is told the configuration
+    /// is too large and shown nothing.
+    #[test]
+    fn a_trust_prompt_too_large_to_show_is_a_short_question_with_no_y() {
+        let (state, fx) = trust_panel("trust-too-large");
+        fx.write(PROJECT_SETTINGS, &session_start_hook(&"x".repeat(3 << 20)));
+        let tab = state.borrow().tabs.active();
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let seen = tick_until(&state, |seen| !prompts(&all_payloads(seen)).is_empty());
+        let raw = all_payloads(&seen)
+            .into_iter()
+            .find(|p| json_of(p)["kind"] == "trust_prompt")
+            .unwrap();
+        assert!(
+            raw.len() < 4096,
+            "no part of the configuration is sent: {} bytes",
+            raw.len()
+        );
+        let prompt = prompts(&all_payloads(&seen)).pop().unwrap();
+        assert_eq!(
+            (prompt.state.as_str(), prompt.remember.as_str()),
+            ("too_large", "window")
+        );
+
+        // A `y` is refused and the question asked again; nothing started or recorded.
+        let out = answer_prompt(&state, "y1", &prompt, true);
+        assert_eq!(
+            result_for(&out.payloads, "y1"),
+            Some(Err(crate::trust_gate::Y_NOT_TAKEN.to_string()))
+        );
+        let again = prompts(&out.payloads);
+        assert_eq!(again.len(), 1, "asked again: {:?}", out.payloads);
+        assert_ne!(again[0].nonce, prompt.nonce);
+        assert!(fx.spawned.borrow().is_empty() && !fx.record_file().exists());
+        assert!(matches!(
+            state.borrow().tabs.get(tab).unwrap().backend,
+            TabBackend::AwaitingTrust(_)
+        ));
+
+        // An `n` starts the session without the project's configuration.
+        let out = answer_prompt(&state, "n1", &again[0], false);
+        assert_eq!(result_for(&out.payloads, "n1"), Some(Ok(())));
+        assert!(notices(&out.payloads).contains(&crate::trust_gate::NOT_LOADED.to_string()));
+        assert_eq!(*fx.spawned.borrow(), [(None, ProjectTrust::Untrusted)]);
+        assert!(!fx.record_file().exists());
+
+        // `:trust` has nothing to trust: told, with nothing shown.
+        use eitri_core::agent_bridge::TrustAction;
+        trust_command(&mut state.borrow_mut(), "c1", TrustAction::Trust, "claude").unwrap();
+        let seen = tick_until(&state, |seen| result_for(&all_payloads(seen), "c1").is_some());
+        let payloads = all_payloads(&seen);
+        assert!(prompts(&payloads).is_empty());
+        let refused = result_for(&payloads, "c1").unwrap().unwrap_err();
+        assert!(refused.contains("too large to show whole"), "{refused}");
+        assert!(!fx.record_file().exists());
     }
 
     /// The trust worker dies after a check of a registered agent's configuration came back: the next
@@ -10265,6 +10367,169 @@ mod tests {
         }
     }
 
+    /// A restore waiting for the trust question keeps its sessions in the saved-tabs file, and so does
+    /// one put off with `Escape`: they come back as failed tabs holding their resume ids, names and
+    /// modes, so a session started afterwards does not write over them.
+    #[test]
+    fn a_restore_put_off_by_escape_keeps_its_sessions_in_the_saved_file() {
+        let (state, dir) = restore_panel(
+            "trust-restore-escape",
+            &[("s-1", Some("api"), Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        {
+            let mut s = state.borrow_mut();
+            s.restore_policy = RestorePolicy::Auto;
+            s.document_ready = true;
+        }
+        let mut resumes = FakeResumes::default();
+        assert!(matches!(
+            launch_restore(&mut state.borrow_mut()),
+            Some(RestoreResult::Deferred)
+        ));
+        let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        let sessions = |state: &Rc<RefCell<AgentPanelState>>| -> Vec<(String, Option<String>)> {
+            let saved = state.borrow().tabs.saved_snapshot("conv").unwrap();
+            saved
+                .tabs
+                .into_iter()
+                .map(|t| (t.provider_session_id, t.name))
+                .collect()
+        };
+        let both = vec![("s-1".to_string(), Some("api".to_string())), ("s-2".to_string(), None)];
+        assert_eq!(sessions(&state), both, "kept while the question waits");
+
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
+        assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
+        assert_eq!(out.toast.as_deref(), Some(crate::trust_gate::PUT_OFF));
+        assert!(resumes.asked.is_empty(), "nothing was resumed");
+        assert_eq!(sessions(&state), both, "kept after it is put off");
+        let s = state.borrow();
+        let failed: Vec<_> = s
+            .tabs
+            .tabs()
+            .iter()
+            .filter(|t| matches!(&t.backend, TabBackend::Failed { reason } if reason == crate::trust_gate::PUT_OFF))
+            .map(|t| t.failed_resume.clone())
+            .collect();
+        assert_eq!(failed, [Some("s-1".to_string()), Some("s-2".to_string())]);
+    }
+
+    /// A restore asked for from the launch dashboard leaves the saved tabs on offer: put off with
+    /// `Escape`, its tab is empty again, the offer stands (the same key asks again) and the file is not
+    /// touched, as before restores kept their sessions as failed tabs.
+    #[test]
+    fn a_dashboard_restore_put_off_by_escape_stays_on_offer() {
+        let (state, dir) = restore_panel(
+            "trust-restore-dashboard-escape",
+            &[("s-1", None, Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        state.borrow_mut().document_ready = true;
+        let from = state.borrow().tabs.active();
+        let mut resumes = FakeResumes::default();
+        let result = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard);
+        assert!(
+            matches!(result, RestoreResult::Deferred),
+            "no bypass tab, so no question"
+        );
+        let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        assert!(
+            state.borrow().tabs.saved_snapshot("conv").unwrap().tabs.is_empty(),
+            "the file is not rewritten while it waits"
+        );
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
+        assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
+        let s = state.borrow();
+        assert!(s.tabs.is_pristine(), "the tab is empty again");
+        assert!(restore_is_on_offer(&s), "the same key can ask again");
+        assert!(s.tabs.saved_snapshot("conv").unwrap().tabs.is_empty());
+    }
+
+    /// A session of a waiting restore that a failed tab already holds (a resume by hand that failed) is
+    /// listed once.
+    #[test]
+    fn a_waiting_restore_does_not_list_a_session_a_failed_tab_holds() {
+        let (state, dir) = restore_panel(
+            "trust-restore-no-twice",
+            &[("s-1", None, Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        {
+            let mut s = state.borrow_mut();
+            s.restore_policy = RestorePolicy::Auto;
+            s.document_ready = true;
+        }
+        let mut resumes = FakeResumes::default();
+        assert!(matches!(
+            launch_restore(&mut state.borrow_mut()),
+            Some(RestoreResult::Deferred)
+        ));
+        let _ = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        {
+            let mut s = state.borrow_mut();
+            let other = s.tabs.open(AgentId::Claude);
+            let t = s.tabs.get_mut(other).unwrap();
+            t.backend = TabBackend::Failed { reason: "x".into() };
+            t.failed_resume = Some("s-1".into());
+        }
+        let saved = state.borrow().tabs.saved_snapshot("conv").unwrap();
+        let ids: Vec<_> = saved.tabs.iter().map(|t| t.provider_session_id.as_str()).collect();
+        assert_eq!(ids.iter().filter(|id| **id == "s-1").count(), 1, "{ids:?}");
+        assert!(ids.contains(&"s-2"), "{ids:?}");
+    }
+
+    /// A restore whose start is refused outright (here by the panel's own put-off, as an agent that
+    /// needs a `y` gets after an `n`) keeps its sessions the same way, saying why on the failed tabs.
+    #[test]
+    fn a_restore_whose_start_is_refused_keeps_its_sessions_in_the_saved_file() {
+        let (state, dir) = restore_panel(
+            "trust-restore-refused",
+            &[("s-1", None, Auto), ("s-2", Some("two"), Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        {
+            let mut s = state.borrow_mut();
+            s.restore_policy = RestorePolicy::Auto;
+            s.document_ready = true;
+        }
+        let mut resumes = FakeResumes::default();
+        assert!(matches!(
+            launch_restore(&mut state.borrow_mut()),
+            Some(RestoreResult::Deferred)
+        ));
+        let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        let why = "not started: for the test";
+        {
+            let mut s = state.borrow_mut();
+            let start = s.tabs.take_deferred(prompt.tab).expect("the restore waits in its tab");
+            assert!(matches!(start, DeferredStart::Restore { .. }));
+            let out = put_off_start(&mut s, prompt.tab, start, why);
+            assert_eq!(out.toast.as_deref(), Some(why));
+        }
+        let s = state.borrow();
+        let saved = s.tabs.saved_snapshot("conv").unwrap();
+        let ids: Vec<_> = saved.tabs.iter().map(|t| t.provider_session_id.as_str()).collect();
+        assert_eq!(ids, ["s-1", "s-2"]);
+        assert_eq!(saved.tabs[1].name.as_deref(), Some("two"));
+        for t in s.tabs.tabs() {
+            assert!(
+                matches!(&t.backend, TabBackend::Failed { reason } if reason == why),
+                "{:?}",
+                t.id
+            );
+        }
+        assert!(resumes.asked.is_empty());
+    }
+
     /// A stand-in `codex` that prints `version` for `--version`, in a fresh scratch directory.
     fn fake_codex(label: &str, version: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -10624,6 +10889,29 @@ mod tests {
         trust_events(&mut state.borrow_mut());
         assert!(fx.spawned.borrow().is_empty());
         assert!(!fx.record_file().exists());
+    }
+
+    /// A first message put off while the user typed on: the composer's text since the send (Rust's
+    /// mirrored copy of the box) is kept after the message, as the page merges it, so the `draft` that
+    /// follows the refusal replaces the box with both and loses neither.
+    #[test]
+    fn a_put_off_first_message_comes_back_with_what_was_typed_since() {
+        let (state, fx) = trust_panel("trust-escape-typed-since");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/never"));
+        let tab = state.borrow().tabs.active();
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let prompt = next_prompt(&state);
+        state.borrow_mut().tabs.set_draft(tab, "and more");
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", tab, prompt.nonce);
+        let drafts: Vec<_> = out
+            .payloads
+            .iter()
+            .map(|p| json_of(p))
+            .filter(|v| v["kind"] == "draft")
+            .collect();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0]["text"], "hello\nand more");
+        assert_eq!(state.borrow().tabs.get(tab).unwrap().draft, "hello\nand more");
     }
 
     /// `Escape` on the question for a first message: the tab is empty again and the message is back in

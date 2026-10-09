@@ -7258,6 +7258,71 @@ describe("App refused commands", () => {
     }
   });
 
+  /* A first message put off by the trust question is refused and followed by a `draft` that holds Rust's copy
+     of the box: the message with whatever Rust had mirrored after it. That copy trails typing by the mirror's
+     delay, so the page, which has already put the message back in front of what is in the box, keeps its box
+     and does not apply the echo of its own refusal. A draft Rust sends on its own still replaces the box. */
+  it("keeps text typed since a refused send when Rust's draft echo of it trails the box", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "first prompt" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      fireEvent.change(box, { target: { value: "second unsent draft" } });
+      dispatch({ kind: "command_result", requestId, ok: false, error: "not started" });
+      // Rust's copy trails the box: the stale start of what was typed, and then an edit in place.
+      dispatch({ kind: "draft", tab: 1, text: "first prompt\nsecond" });
+      expect(box.value).toBe("first prompt\nsecond unsent draft");
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "first prompt\nsecond unsent draft" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an edit made in place since a refused send, which Rust's stale copy would overwrite", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "hello" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      fireEvent.change(box, { target: { value: "axc" } });
+      dispatch({ kind: "command_result", requestId, ok: false, error: "not started" });
+      dispatch({ kind: "draft", tab: 1, text: "hello\nabc" });
+      expect(box.value).toBe("hello\naxc");
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "hello\naxc" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("applies a draft Rust sends on its own, even one that is the start of unmirrored text", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      // No refusal came before: a scratch return, a switch or a reset. Rust's copy replaces the box.
+      fireEvent.change(box, { target: { value: "abc" } });
+      dispatch({ kind: "draft", tab: 1, text: "ab" });
+      expect(box.value).toBe("ab");
+      // An echo that comes long after its refusal is just a draft too.
+      fireEvent.change(box, { target: { value: "first" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      dispatch({ kind: "command_result", requestId, ok: false, error: "not started" });
+      act(() => vi.advanceTimersByTime(5000));
+      dispatch({ kind: "draft", tab: 1, text: "first\nfrom rust" });
+      expect(box.value).toBe("first\nfrom rust");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   /* The queue_message path (a refusal while a turn is showing as running) goes through the exact
      same restore code as send_message -- this is the probe's own second case, unchanged-since-send
      on that path. */

@@ -54,7 +54,9 @@ export const TrustPrompt = forwardRef<HTMLDivElement, Props>(function TrustPromp
   const question =
     envelope.state === "nothing"
       ? `${envelope.agent} loads whatever project files it finds; there are none now. Start it here?`
-      : `Trust this project's ${envelope.agent} configuration?`;
+      : envelope.state === "too_large"
+        ? `This project's ${envelope.agent} configuration is too large to show.`
+        : `Trust this project's ${envelope.agent} configuration?`;
   return (
     <div className="trust-prompt" ref={ref} role="dialog" aria-label={question}>
       <h2>
@@ -101,7 +103,7 @@ export const TrustPrompt = forwardRef<HTMLDivElement, Props>(function TrustPromp
           <Shown text={envelope.rememberNote} />
         </p>
       )}
-      <p className="trust-footer">{trustFooter(envelope.remember, envelope.needsYes === true)}</p>
+      <p className="trust-footer">{trustFooter(envelope.remember, envelope.needsYes === true, envelope.state)}</p>
     </div>
   );
 });

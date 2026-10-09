@@ -21,6 +21,13 @@
 //! shown: neither a check started for another tab nor an edit made while the prompt was being read
 //! can put a configuration nobody saw under the user's `y`.
 //!
+//! The prompt itself -- its rows, its digest and the message the page is sent -- is built on the
+//! worker too, next to the check it describes: a project near discovery's budget (16 MiB of
+//! configuration, every value shown whole) would otherwise cost the GTK thread a long stall to lay
+//! out, hash and serialise. The GTK thread only picks the finished message and puts the tab and nonce
+//! on it. A prompt over [`MAX_PROMPT_BYTES`] is never sent at all: since nothing in it may be cut,
+//! such a start is refused instead.
+//!
 //! A configuration that could not be hashed entirely (a file too large or unreadable, a FIFO, a link
 //! where the CLI reads a file, a walk over its budget) can change while its fingerprint stays the
 //! same, so an answer about it covers one start: it is never recorded and the window does not
@@ -28,7 +35,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 use agent::setting_sources::ProjectTrust;
 use eitri_core::agent_bridge::{
@@ -64,6 +71,38 @@ pub(crate) const NOTHING_HERE: &str = "nothing to trust here";
 pub(crate) const UNTRUSTED_FROM_NOW: &str = "not trusted: sessions started from now on leave this project's Claude \
                                              configuration out; running sessions are unchanged";
 pub(crate) const WAS_NOT_TRUSTED: &str = "was not trusted";
+
+/// The largest trust prompt the page is sent, as the message's JSON. Nothing in a prompt is cut,
+/// since a `y` approves exactly what the box shows, so a larger one cannot be shown and its start is
+/// refused instead. 2 MiB is far more than anyone can read before answering (a project's own settings
+/// run to kilobytes; 2,000 files named with their sizes take a few hundred), while staying well below
+/// what discovery lets a project put in front of the page (16 MiB of configuration, any 4 MiB file
+/// shown whole, more after JSON escaping): the message is escaped once more into the script that
+/// carries it to the web process, parsed there, and every row is laid out with its hidden characters
+/// marked, and a page that runs out of memory doing that reloads into the same prompt.
+pub(crate) const MAX_PROMPT_BYTES: usize = 2 << 20;
+
+/// Why a prompt too large to show was not shown.
+pub(crate) fn too_large(profile_label: &str, bytes: usize) -> String {
+    format!(
+        "this project's {profile_label} configuration is too large to show whole in the trust question (over {}; \
+         at most {} can be shown), and nothing is trusted unseen",
+        human_size(bytes as u64),
+        human_size(MAX_PROMPT_BYTES as u64)
+    )
+}
+
+/// A `y` to the question a too-large configuration gets, which takes only `n` and `Escape`.
+pub(crate) const Y_NOT_TAKEN: &str =
+    "that question takes only n (start without the project's configuration) or Escape; asking again";
+
+/// A start refused because its prompt is too large to show.
+pub(crate) fn too_large_to_start(profile_label: &str, bytes: usize) -> String {
+    format!(
+        "not started: {}; nothing was loaded or recorded",
+        too_large(profile_label, bytes)
+    )
+}
 
 /// [`NOT_LOADED`] for any agent.
 pub(crate) fn not_loaded(profile: &Profile) -> String {
@@ -209,12 +248,120 @@ pub(crate) enum CommandAnswer {
     Recording,
 }
 
+/// What [`TrustGate::ask`] has for a tab or for `:trust`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Asked {
+    /// The `trust_prompt` message for the page, whole.
+    Prompt(String),
+    /// The prompt is larger than [`MAX_PROMPT_BYTES`]: it is not shown, and what it would have asked
+    /// about cannot be trusted. Says how large it is, in a person's words.
+    TooLarge {
+        /// The agent the configuration is for, as the prompt names it.
+        agent: String,
+        bytes: usize,
+    },
+    /// The check came back without a prompt the gate can show (only if the worker failed to build
+    /// one): nothing is shown and nothing can be answered, so the start is refused rather than left
+    /// waiting on a question that will not come.
+    Unavailable,
+}
+
+/// Why a start was refused because its question could not be built.
+pub(crate) const UNAVAILABLE_START: &str =
+    "not started: the trust question for this project could not be prepared; start again to check once more";
+/// `:trust` in the same case.
+pub(crate) const UNAVAILABLE_COMMAND: &str =
+    "the trust question could not be prepared; type :trust again to check once more";
+
 /// What a tab's prompt showed: an answer must name exactly this.
 struct Shown {
     nonce: u64,
     fingerprint: Fingerprint,
     findings_digest: String,
-    discovery: Discovery,
+    /// The check the prompt was built from, shared with the gate's own copy of it.
+    state: Arc<TrustState>,
+    /// The remember line it showed, which decides whether a `y` writes a record.
+    basis: Basis,
+    /// The worker's number of the result the prompt was built for: a record that fails rebuilds the
+    /// prompt of exactly that result, never of a newer one a same-fingerprint check made since.
+    seq: u64,
+    /// The prompt is the short question a too-large configuration gets: it takes `n` and `Escape`,
+    /// never a `y`.
+    only_n: bool,
+}
+
+impl Shown {
+    fn discovery(&self) -> &Discovery {
+        discovery_of(&self.state).expect("every state carries its discovery")
+    }
+
+    /// Whether a `y` to this prompt can outlive the start: what the prompt said.
+    fn remember(&self) -> Remember {
+        let remember = match &*self.state {
+            TrustState::Untrusted { remember, .. } | TrustState::Changed { remember, .. } => remember.clone(),
+            _ => Remember::Yes,
+        };
+        match (remember, &self.basis) {
+            (Remember::Yes, Basis::RecordFailed(why)) => {
+                Remember::WindowOnly(format!("trust could not be recorded ({why})"))
+            }
+            (other, _) => other,
+        }
+    }
+}
+
+/// Which remember line a prepared prompt carries: the check's own, or the one a failed record turns a
+/// "remembered" answer into, with that failure's words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Basis {
+    Own,
+    RecordFailed(String),
+}
+
+/// One prompt as the worker built it, everything but the tab and the nonce.
+struct Prepared {
+    basis: Basis,
+    findings_digest: String,
+    shape: Shape,
+}
+
+enum Shape {
+    /// The `trust_prompt` message without `tab` and `nonce`, starting with `{`; the view it was made
+    /// from is kept for the tests, which read its fields.
+    Fits {
+        body: String,
+        #[cfg(test)]
+        view: Box<TrustPromptView>,
+    },
+    /// Over [`MAX_PROMPT_BYTES`], for an agent that starts without the project's configuration on an
+    /// `n`: the message is the short question that says so and takes no `y`. `bytes` is at least how
+    /// large the whole prompt would have been.
+    OnlyN {
+        body: String,
+        bytes: usize,
+        #[cfg(test)]
+        view: Box<TrustPromptView>,
+    },
+    /// Over [`MAX_PROMPT_BYTES`], for an agent that starts only after a `y`: nothing is asked, the
+    /// start is refused. At least this many bytes.
+    TooLarge { bytes: usize },
+}
+
+/// The prompt for one check's result, made on the worker. The worker alone knows whether the
+/// profile's last record failed, so the one prompt it builds already carries the right remember line.
+struct Prompts {
+    key: ProfileKey,
+    /// The worker's number of the message whose state this describes.
+    for_seq: u64,
+    prepared: Prepared,
+}
+
+/// What the worker sends: a result, numbered, with the prompt for the state it carries (or, after a
+/// failed record, for the state that record was asked for, rebuilt with the failure's words).
+struct Msg {
+    seq: u64,
+    done: Done,
+    prompts: Option<Prompts>,
 }
 
 /// This window's own answer, kept against the fingerprint it was given for.
@@ -247,14 +394,16 @@ enum Job {
     },
     Record {
         purpose: Purpose,
-        shown: Box<Discovery>,
+        shown: Arc<TrustState>,
+        /// The gate's number of the result `shown` is; a failed record's rebuilt prompt is for it.
+        seq: u64,
         epoch: u64,
         now: u64,
     },
     /// A `y` that writes nothing: the disk is read again and must still be what was shown.
     Confirm {
         purpose: Purpose,
-        shown: Box<Discovery>,
+        shown: Arc<TrustState>,
         epoch: u64,
         kept: Kept,
     },
@@ -328,22 +477,22 @@ pub(crate) struct TrustGate {
     #[cfg_attr(not(test), allow(dead_code))]
     root: PathBuf,
     jobs: Option<mpsc::Sender<Job>>,
-    done: mpsc::Receiver<Done>,
+    done: mpsc::Receiver<Msg>,
     /// The last check queued, of any profile.
     generation: u64,
     /// Moved by `:untrust` of a profile: a record of it queued before is not trust any more when it
     /// lands.
     epochs: HashMap<ProfileKey, u64>,
     /// Per profile, the newest result of any check of it, in the order they were queued.
-    latest: HashMap<ProfileKey, TrustState>,
+    latest: HashMap<ProfileKey, Arc<TrustState>>,
+    /// The worker's number of the message each `latest` came in.
+    latest_seq: HashMap<ProfileKey, u64>,
+    /// The prompt the worker built for each `latest` that asks something.
+    prompts: HashMap<ProfileKey, Prompts>,
     /// What each tab's question showed; the discovery it holds names the question's profile.
     shown: HashMap<TabId, Shown>,
     /// This window's own answer per profile.
     answered: HashMap<ProfileKey, Answered>,
-    /// Per profile, why its last record could not be written: its later prompts say this window
-    /// only. Each profile has a record file of its own, so one that cannot be written says nothing
-    /// about another's.
-    record_failure: HashMap<ProfileKey, String>,
     /// The profiles whose "not loaded" notice has been said.
     said_not_loaded: std::collections::HashSet<ProfileKey>,
     /// Tabs waiting for a check, each with the profile and the generation of the check that answers
@@ -379,7 +528,7 @@ impl TrustGate {
 
     /// A gate with no worker: the test reads the jobs it queues and hands it the results itself.
     #[cfg(test)]
-    fn detached(root: PathBuf) -> (TrustGate, mpsc::Receiver<Job>, mpsc::Sender<Done>) {
+    fn detached(root: PathBuf) -> (TrustGate, mpsc::Receiver<Job>, DoneSender) {
         let (jobs_tx, jobs_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let gate = TrustGate {
@@ -389,9 +538,10 @@ impl TrustGate {
             generation: 0,
             epochs: HashMap::new(),
             latest: HashMap::new(),
+            latest_seq: HashMap::new(),
+            prompts: HashMap::new(),
             shown: HashMap::new(),
             answered: HashMap::new(),
-            record_failure: HashMap::new(),
             said_not_loaded: Default::default(),
             waiting: Vec::new(),
             command_pending: None,
@@ -399,7 +549,7 @@ impl TrustGate {
             next_command_nonce: COMMAND_NONCE_BASE,
             owed: Vec::new(),
         };
-        (gate, jobs_rx, done_tx)
+        (gate, jobs_rx, DoneSender::new(done_tx))
     }
 
     /// A gate whose worker never started, as when the thread cannot be spawned: every check sends
@@ -439,9 +589,10 @@ impl TrustGate {
             generation: 0,
             epochs: HashMap::new(),
             latest: HashMap::new(),
+            latest_seq: HashMap::new(),
+            prompts: HashMap::new(),
             shown: HashMap::new(),
             answered: HashMap::new(),
-            record_failure: HashMap::new(),
             said_not_loaded: Default::default(),
             waiting: Vec::new(),
             command_pending: None,
@@ -545,11 +696,13 @@ impl TrustGate {
         // Positions in `events` settled only once the batch is drained, each with its profile.
         let mut routes: Vec<(usize, ProfileKey)> = Vec::new();
         let mut taken: Vec<(usize, ProfileKey, Fingerprint)> = Vec::new();
-        while let Ok(done) = self.done.try_recv() {
+        while let Ok(Msg { seq, done, prompts }) = self.done.try_recv() {
+            // Each result's prompts go in with its state; nothing else of this message uses them.
+            let mut prompts = prompts;
             match done {
                 Done::Checked { generation, state } => {
                     let key = state_profile(&state).key();
-                    self.take_latest(state, &mut events);
+                    self.take_latest(state, seq, prompts.take(), &mut events);
                     let (resolved, kept): (Vec<_>, Vec<_>) = self
                         .waiting
                         .drain(..)
@@ -575,8 +728,7 @@ impl TrustGate {
                                 },
                             );
                         }
-                        self.record_failure.remove(&key);
-                        self.take_latest(state, &mut events);
+                        self.take_latest(state, seq, prompts.take(), &mut events);
                         if let (Purpose::ForTab(_), Some(fingerprint)) = (&purpose, fingerprint) {
                             taken.push((events.len(), key, fingerprint));
                         }
@@ -616,7 +768,7 @@ impl TrustGate {
                             },
                         );
                     }
-                    self.take_latest(state, &mut events);
+                    self.take_latest(state, seq, prompts.take(), &mut events);
                     if let (Purpose::ForTab(_), Some(fingerprint)) = (&purpose, fingerprint) {
                         taken.push((events.len(), key, fingerprint));
                     }
@@ -633,7 +785,7 @@ impl TrustGate {
                     });
                 }
                 Done::Moved { purpose, state } => {
-                    self.take_latest(state, &mut events);
+                    self.take_latest(state, seq, prompts.take(), &mut events);
                     events.push(refused(purpose, CHANGED_WHILE_READING.to_string()));
                 }
                 Done::RecordFailed {
@@ -645,12 +797,18 @@ impl TrustGate {
                         Purpose::ForTab(_) => record_failed_notice(&reason),
                         Purpose::Command(_) => format!("trust could not be recorded ({reason})"),
                     };
-                    self.record_failure.insert(profile, reason);
+                    // The worker built the refused prompt's state again with the failure's words;
+                    // it replaces that state's prompt only while that is still the newest result.
+                    if let Some(prompts) = prompts.take() {
+                        if prompts.key == profile && self.latest_seq.get(&prompts.key) == Some(&prompts.for_seq) {
+                            self.prompts.insert(prompts.key.clone(), prompts);
+                        }
+                    }
                     events.push(refused(purpose, notice));
                 }
                 Done::CommandChecked { request_id, tab, state } => {
                     let key = state_profile(&state).key();
-                    self.take_latest(state, &mut events);
+                    self.take_latest(state, seq, prompts.take(), &mut events);
                     self.drop_command_prompt_into(&mut events);
                     events.push(self.command_check_result(request_id, tab, key));
                 }
@@ -660,7 +818,7 @@ impl TrustGate {
                     notice,
                     state,
                 } => {
-                    self.take_latest(state, &mut events);
+                    self.take_latest(state, seq, prompts.take(), &mut events);
                     events.push(GateEvent::CommandDone {
                         request_id,
                         ok,
@@ -670,13 +828,13 @@ impl TrustGate {
             }
         }
         for (at, key) in routes {
-            let route = self.latest.get(&key).map_or(Route::Ask, |state| self.route(state));
+            let route = self.latest_state(&key).map_or(Route::Ask, |state| self.route(state));
             if let GateEvent::Route(_, r) = &mut events[at] {
                 *r = route;
             }
         }
         for (at, key, fingerprint) in taken {
-            let newest = self.latest.get(&key).and_then(discovery_of).map(|d| d.fingerprint);
+            let newest = self.latest_state(&key).and_then(discovery_of).map(|d| d.fingerprint);
             if newest != Some(fingerprint) {
                 if let GateEvent::Recorded { tab, .. } = events[at] {
                     events[at] = GateEvent::RecordRefused {
@@ -689,6 +847,11 @@ impl TrustGate {
         events
     }
 
+    /// The newest result of a profile's checks.
+    fn latest_state(&self, key: &str) -> Option<&TrustState> {
+        self.latest.get(key).map(|state| &**state)
+    }
+
     /// The `:untrust` count of a profile.
     fn epoch_of(&self, key: &str) -> u64 {
         self.epochs.get(key).copied().unwrap_or(0)
@@ -696,13 +859,13 @@ impl TrustGate {
 
     /// A newer result for its profile: every prompt of that profile that no longer shows its
     /// fingerprint goes, and is asked again. Other profiles' prompts are about other files.
-    fn take_latest(&mut self, state: TrustState, events: &mut Vec<GateEvent>) {
+    fn take_latest(&mut self, state: TrustState, seq: u64, prompts: Option<Prompts>, events: &mut Vec<GateEvent>) {
         let key = state_profile(&state).key();
         let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
         let mut stale: Vec<TabId> = self
             .shown
             .iter()
-            .filter(|(_, shown)| shown.discovery.profile.key() == key && Some(shown.fingerprint) != fingerprint)
+            .filter(|(_, shown)| shown.discovery().profile.key() == key && Some(shown.fingerprint) != fingerprint)
             .map(|(tab, _)| *tab)
             .collect();
         stale.sort_by_key(|tab| tab.0);
@@ -713,7 +876,7 @@ impl TrustGate {
         if self
             .command_shown
             .as_ref()
-            .is_some_and(|c| c.shown.discovery.profile.key() == key && Some(c.shown.fingerprint) != fingerprint)
+            .is_some_and(|c| c.shown.discovery().profile.key() == key && Some(c.shown.fingerprint) != fingerprint)
         {
             let command = self.command_shown.take().expect("checked above");
             events.push(GateEvent::CommandDone {
@@ -722,7 +885,12 @@ impl TrustGate {
                 notice: Some(COMMAND_OUT_OF_DATE.to_string()),
             });
         }
-        self.latest.insert(key, state);
+        match prompts {
+            Some(prompts) => self.prompts.insert(key.clone(), prompts),
+            None => self.prompts.remove(&key),
+        };
+        self.latest_seq.insert(key.clone(), seq);
+        self.latest.insert(key, Arc::new(state));
     }
 
     fn command_check_result(&mut self, request_id: String, tab: TabId, key: ProfileKey) -> GateEvent {
@@ -731,7 +899,7 @@ impl TrustGate {
             ok,
             notice: Some(notice),
         };
-        match self.latest.get(&key) {
+        match self.latest_state(&key) {
             None | Some(TrustState::NothingToTrust(_)) => done(true, NOTHING_HERE.to_string()),
             Some(TrustState::Trusted { since_unix, .. }) => {
                 done(true, format!("already trusted since {}", civil_date(*since_unix)))
@@ -776,7 +944,7 @@ impl TrustGate {
     /// The route for a start of `profile` right now, from its latest check; `None` before any check
     /// of it came back.
     pub(crate) fn current_route(&self, profile: &Profile) -> Option<Route> {
-        self.latest.get(&profile.key()).map(|state| self.route(state))
+        self.latest_state(&profile.key()).map(|state| self.route(state))
     }
 
     /// The newest discovery of `profile`: what a start routed by [`TrustGate::current_route`], or let
@@ -784,84 +952,91 @@ impl TrustGate {
     /// fingerprint its prompt showed, and an `n` only while the page echoes it, so this is the
     /// configuration the answer was about.
     pub(crate) fn bound_discovery(&self, profile: &Profile) -> Option<&Discovery> {
-        self.latest.get(&profile.key()).and_then(discovery_of)
+        self.latest_state(&profile.key()).and_then(discovery_of)
     }
 
     /// The prompt for `tab` under `nonce`, from the latest check of `profile` (the tab's agent's),
     /// kept as what this tab was shown. `None` when that check is nothing to ask about.
-    pub(crate) fn show(&mut self, tab: TabId, nonce: u64, profile: &Profile) -> Option<TrustPromptView> {
-        let (view, shown) = self.build_prompt(tab, nonce, &profile.key())?;
-        self.shown.insert(tab, shown);
-        Some(view)
+    ///
+    /// Builds nothing: the worker made the message with the check, and this only puts the tab and
+    /// nonce on it.
+    pub(crate) fn ask(&mut self, tab: TabId, nonce: u64, profile: &Profile) -> Option<Asked> {
+        let key = profile.key();
+        let (asked, shown) = self.pick(tab, nonce, &key, false)?;
+        match shown {
+            Some(shown) => {
+                self.shown.insert(tab, shown);
+            }
+            None => {
+                self.shown.remove(&tab);
+            }
+        }
+        Some(asked)
     }
 
-    fn build_prompt(&self, tab: TabId, nonce: u64, key: &str) -> Option<(TrustPromptView, Shown)> {
-        let (discovery, state, diff, remember) = match self.latest.get(key)? {
-            TrustState::Untrusted { discovery, remember } if discovery.nothing_to_trust() => {
-                (discovery, TrustPromptState::Nothing, None, remember)
-            }
-            TrustState::Untrusted { discovery, remember } => (discovery, TrustPromptState::Untrusted, None, remember),
-            TrustState::Changed {
-                discovery,
-                diff,
-                remember,
-            } => (discovery, TrustPromptState::Changed, Some(diff), remember),
-            _ => return None,
-        };
-        let (remember, remember_note) = match remember {
-            Remember::SessionOnly(note) => (
-                TrustRememberView::Session,
-                Some(format!("{note}; y trusts this start only; the next one asks again")),
-            ),
-            Remember::WindowOnly(why) => (TrustRememberView::Window, Some(why.clone())),
-            Remember::Yes => match self.record_failure.get(key) {
-                Some(why) => (
-                    TrustRememberView::Window,
-                    Some(format!("trust could not be recorded ({why})")),
-                ),
-                None => (TrustRememberView::Yes, None),
-            },
-        };
-        let lossy = |paths: &[PathBuf]| -> Vec<String> { paths.iter().map(|p| p.display().to_string()).collect() };
-        let view = TrustPromptView {
-            tab,
-            nonce,
-            agent: discovery.profile.label(),
-            root: discovery.root.display().to_string(),
-            top: discovery.top.display().to_string(),
-            fingerprint: discovery.fingerprint.hex(),
-            state,
-            needs_yes: discovery.profile.requires_explicit_yes(),
-            remember,
-            remember_note,
-            changed: diff.map(|diff| TrustDiffView {
-                added: lossy(&diff.added),
-                removed: lossy(&diff.removed),
-                changed: lossy(&diff.changed),
+    /// [`TrustGate::ask`] as the view the page would draw, for the tests, which read its fields.
+    /// `None` also for a prompt that cannot be shown.
+    #[cfg(test)]
+    pub(crate) fn show(&mut self, tab: TabId, nonce: u64, profile: &Profile) -> Option<TrustPromptView> {
+        match self.ask(tab, nonce, profile)? {
+            Asked::Prompt(_) => self.shown_view(tab, nonce, &profile.key()),
+            Asked::TooLarge { .. } | Asked::Unavailable => None,
+        }
+    }
+
+    /// The view behind the latest check's prompt for `key`, with this tab and nonce on it.
+    #[cfg(test)]
+    fn shown_view(&self, tab: TabId, nonce: u64, key: &str) -> Option<TrustPromptView> {
+        match &self.prompts.get(key)?.prepared.shape {
+            Shape::Fits { view, .. } | Shape::OnlyN { view, .. } => Some(TrustPromptView {
+                tab,
+                nonce,
+                ..(**view).clone()
             }),
-            items: discovery.findings.iter().flat_map(items_of).collect(),
+            Shape::TooLarge { .. } => None,
+        }
+    }
+
+    /// The finished message for `tab` under `nonce` from the latest check of `key`, and what it showed
+    /// (`None` when nothing is shown). `None` overall when that check asks nothing. A check that asks
+    /// something but came without its prompt is [`Asked::Unavailable`]: nothing is shown and nothing
+    /// is asked of the worker again, so a fault there can neither be answered nor loop. The short
+    /// question a too-large configuration gets is for a start; `:trust`, which can only trust, is told
+    /// the configuration is too large instead (`for_command`).
+    fn pick(&self, tab: TabId, nonce: u64, key: &str, for_command: bool) -> Option<(Asked, Option<Shown>)> {
+        let state = self.latest.get(key)?;
+        if !matches!(**state, TrustState::Untrusted { .. } | TrustState::Changed { .. }) {
+            return None;
+        }
+        let seq = self.latest_seq.get(key).copied();
+        let Some(prompts) = self.prompts.get(key).filter(|p| Some(p.for_seq) == seq) else {
+            return Some((Asked::Unavailable, None));
         };
+        let prepared = &prompts.prepared;
+        let (body, only_n) = match &prepared.shape {
+            Shape::Fits { body, .. } => (body, false),
+            Shape::OnlyN { body, .. } if !for_command => (body, true),
+            Shape::OnlyN { bytes, .. } | Shape::TooLarge { bytes } => {
+                return Some((
+                    Asked::TooLarge {
+                        agent: state_profile(state).label(),
+                        bytes: *bytes,
+                    },
+                    None,
+                ));
+            }
+        };
+        let message = format!("{{\"tab\":{},\"nonce\":{nonce},{}", tab.0, &body[1..]);
         let shown = Shown {
             nonce,
-            fingerprint: discovery.fingerprint,
-            findings_digest: view.findings_digest(),
-            discovery: discovery.clone(),
+            fingerprint: discovery_of(state)?.fingerprint,
+            findings_digest: prepared.findings_digest.clone(),
+            state: Arc::clone(state),
+            basis: prepared.basis.clone(),
+            seq: prompts.for_seq,
+            only_n,
         };
-        Some((view, shown))
-    }
-
-    /// Whether an answer can outlive this start, for the latest check of a profile.
-    fn remember_now(&self, key: &str) -> Remember {
-        match self.latest.get(key) {
-            Some(TrustState::Untrusted { remember, .. } | TrustState::Changed { remember, .. }) => match remember {
-                Remember::Yes => match self.record_failure.get(key) {
-                    Some(why) => Remember::WindowOnly(format!("trust could not be recorded ({why})")),
-                    None => Remember::Yes,
-                },
-                other => other.clone(),
-            },
-            _ => Remember::Yes,
-        }
+        Some((Asked::Prompt(message), Some(shown)))
     }
 
     /// The checks every answer makes before anything is taken: the prompt is the one this tab was
@@ -898,11 +1073,11 @@ impl TrustGate {
         trust: bool,
         now_unix: u64,
     ) -> AnswerOutcome {
-        let shown_key = self.shown.get(&tab).map(|s| s.discovery.profile.key());
+        let shown_key = self.shown.get(&tab).map(|s| s.discovery().profile.key());
         if let Err(why) = Self::check_echo(
             self.shown.get(&tab),
             nonce,
-            shown_key.as_deref().and_then(|key| self.latest.get(key)),
+            shown_key.as_deref().and_then(|key| self.latest_state(key)),
             fingerprint,
             findings_digest,
         ) {
@@ -913,17 +1088,23 @@ impl TrustGate {
             }
             return AnswerOutcome::Refused(why.to_string());
         }
+        if trust && self.shown.get(&tab).is_some_and(|s| s.only_n) {
+            // The short question for a configuration too large to show offers no `y`, so one that
+            // arrives is not an answer to what was drawn: it is spent and the question asked again.
+            self.shown.remove(&tab);
+            return AnswerOutcome::Refused(Y_NOT_TAKEN.to_string());
+        }
         let shown = self.shown.remove(&tab).expect("checked above");
-        let profile = shown.discovery.profile.clone();
+        let profile = shown.discovery().profile.clone();
         let key = profile.key();
-        let remember = self.remember_now(&key);
+        let remember = shown.remember();
         if !trust {
             // An `n` for an agent that cannot leave the project's configuration out starts nothing,
             // and is not remembered: the next start asks again.
             if profile.requires_explicit_yes() {
                 return AnswerOutcome::NotStarted(refused_without_yes(&profile));
             }
-            if shown.discovery.fully_hashed() {
+            if shown.discovery().fully_hashed() {
                 self.answered.insert(
                     key.clone(),
                     Answered {
@@ -942,10 +1123,10 @@ impl TrustGate {
         let epoch = self.epoch_of(&key);
         match remember {
             Remember::SessionOnly(_) => {
-                let notice = session_only_notice(&shown.discovery);
+                let notice = session_only_notice(shown.discovery());
                 self.queue(Job::Confirm {
                     purpose: Purpose::ForTab(tab),
-                    shown: Box::new(shown.discovery),
+                    shown: shown.state,
                     epoch,
                     kept: Kept {
                         window_only: None,
@@ -957,7 +1138,7 @@ impl TrustGate {
             Remember::WindowOnly(why) => {
                 self.queue(Job::Confirm {
                     purpose: Purpose::ForTab(tab),
-                    shown: Box::new(shown.discovery),
+                    shown: shown.state,
                     epoch,
                     kept: Kept {
                         notice: window_only_notice(&why),
@@ -969,7 +1150,8 @@ impl TrustGate {
             Remember::Yes => {
                 self.queue(Job::Record {
                     purpose: Purpose::ForTab(tab),
-                    shown: Box::new(shown.discovery),
+                    seq: shown.seq,
+                    shown: shown.state,
                     epoch,
                     now: now_unix,
                 });
@@ -1009,8 +1191,9 @@ impl TrustGate {
         }
     }
 
-    /// `:trust`'s prompt for `tab`, if `:trust` asked for one there and it can still be asked.
-    pub(crate) fn show_command(&mut self, tab: TabId, request_id: &str) -> Option<TrustPromptView> {
+    /// `:trust`'s prompt for `tab`, if `:trust` asked for one there and it can still be asked. A prompt
+    /// too large to show ends the command: it is not left waiting.
+    pub(crate) fn ask_command(&mut self, tab: TabId, request_id: &str) -> Option<Asked> {
         let key = match self.command_pending.take() {
             Some((pending, pending_tab, key)) if pending == request_id && pending_tab == tab => key,
             other => {
@@ -1020,13 +1203,28 @@ impl TrustGate {
         };
         let nonce = self.next_command_nonce;
         self.next_command_nonce += 1;
-        let (view, shown) = self.build_prompt(tab, nonce, &key)?;
-        self.command_shown = Some(CommandShown {
-            request_id: request_id.to_string(),
-            tab,
-            shown,
-        });
-        Some(view)
+        let (asked, shown) = self.pick(tab, nonce, &key, true)?;
+        if let Some(shown) = shown {
+            self.command_shown = Some(CommandShown {
+                request_id: request_id.to_string(),
+                tab,
+                shown,
+            });
+        }
+        Some(asked)
+    }
+
+    /// [`TrustGate::ask_command`] as the view the page would draw, for the tests.
+    #[cfg(test)]
+    pub(crate) fn show_command(&mut self, tab: TabId, request_id: &str) -> Option<TrustPromptView> {
+        let key = self.command_pending.as_ref().map(|(_, _, key)| key.clone())?;
+        match self.ask_command(tab, request_id)? {
+            Asked::Prompt(_) => {
+                let nonce = self.command_shown.as_ref()?.shown.nonce;
+                self.shown_view(tab, nonce, &key)
+            }
+            Asked::TooLarge { .. } | Asked::Unavailable => None,
+        }
     }
 
     /// Whether `nonce` names `:trust`'s prompt on screen in `tab`.
@@ -1049,7 +1247,7 @@ impl TrustGate {
     ) -> Option<CommandAnswer> {
         let command = self.command_shown.take_if(|c| c.tab == tab && c.shown.nonce == nonce)?;
         let request_id = command.request_id;
-        let profile = command.shown.discovery.profile.clone();
+        let profile = command.shown.discovery().profile.clone();
         let key = profile.key();
         let done = |ok: bool, notice: Option<String>| CommandAnswer::Done {
             request_id: request_id.clone(),
@@ -1059,7 +1257,7 @@ impl TrustGate {
         if Self::check_echo(
             Some(&command.shown),
             nonce,
-            self.latest.get(&key),
+            self.latest_state(&key),
             fingerprint,
             findings_digest,
         )
@@ -1070,14 +1268,14 @@ impl TrustGate {
         if !trust {
             return Some(done(false, None));
         }
-        Some(match self.remember_now(&key) {
-            Remember::SessionOnly(_) => done(false, Some(cannot_remember_notice(&command.shown.discovery))),
+        Some(match command.shown.remember() {
+            Remember::SessionOnly(_) => done(false, Some(cannot_remember_notice(command.shown.discovery()))),
             Remember::WindowOnly(why) => {
                 // Nothing is written, but the disk is read again first, as for a tab's `y`.
                 let epoch = self.epoch_of(&key);
                 self.queue(Job::Confirm {
                     purpose: Purpose::Command(request_id.clone()),
-                    shown: Box::new(command.shown.discovery),
+                    shown: command.shown.state,
                     epoch,
                     kept: Kept {
                         notice: format!("{} (this window only: {why})", trusted_from_now(&profile)),
@@ -1090,7 +1288,8 @@ impl TrustGate {
                 let epoch = self.epoch_of(&key);
                 self.queue(Job::Record {
                     purpose: Purpose::Command(request_id.clone()),
-                    shown: Box::new(command.shown.discovery),
+                    seq: command.shown.seq,
+                    shown: command.shown.state,
                     epoch,
                     now: now_unix,
                 });
@@ -1149,7 +1348,7 @@ impl TrustGate {
     /// The `trust` row of `prefix i`, for the latest check of `profile` (the tab's agent's).
     pub(crate) fn row(&self, profile: &Profile) -> String {
         let key = profile.key();
-        let Some(state) = self.latest.get(&key) else {
+        let Some(state) = self.latest_state(&key) else {
             return "not checked yet".to_string();
         };
         match state {
@@ -1187,6 +1386,260 @@ impl TrustGate {
             Some(Route::Start(trust)) => trust,
             Some(Route::Ask) | None => ProjectTrust::Untrusted,
         }
+    }
+}
+
+/// The remember line a prompt shows, for a check's own `remember` and the basis it is built on.
+fn remember_line(remember: &Remember, basis: &Basis) -> (TrustRememberView, Option<String>) {
+    match remember {
+        Remember::SessionOnly(note) => (
+            TrustRememberView::Session,
+            Some(format!("{note}; y trusts this start only; the next one asks again")),
+        ),
+        Remember::WindowOnly(why) => (TrustRememberView::Window, Some(why.clone())),
+        Remember::Yes => match basis {
+            Basis::RecordFailed(why) => (
+                TrustRememberView::Window,
+                Some(format!("trust could not be recorded ({why})")),
+            ),
+            Basis::Own => (TrustRememberView::Yes, None),
+        },
+    }
+}
+
+/// The prompt for a check's result as the page draws it, with tab and nonce left at zero; `None`
+/// when the result asks nothing. Worker only: a prompt can be as large as discovery's budget.
+fn view_of(state: &TrustState, basis: &Basis) -> Option<TrustPromptView> {
+    let (discovery, state, diff, remember) = match state {
+        TrustState::Untrusted { discovery, remember } if discovery.nothing_to_trust() => {
+            (discovery, TrustPromptState::Nothing, None, remember)
+        }
+        TrustState::Untrusted { discovery, remember } => (discovery, TrustPromptState::Untrusted, None, remember),
+        TrustState::Changed {
+            discovery,
+            diff,
+            remember,
+        } => (discovery, TrustPromptState::Changed, Some(diff), remember),
+        _ => return None,
+    };
+    let (remember, remember_note) = remember_line(remember, basis);
+    let lossy = |paths: &[PathBuf]| -> Vec<String> { paths.iter().map(|p| p.display().to_string()).collect() };
+    Some(TrustPromptView {
+        tab: TabId(0),
+        nonce: 0,
+        agent: discovery.profile.label(),
+        root: discovery.root.display().to_string(),
+        top: discovery.top.display().to_string(),
+        fingerprint: discovery.fingerprint.hex(),
+        state,
+        needs_yes: discovery.profile.requires_explicit_yes(),
+        remember,
+        remember_note,
+        changed: diff.map(|diff| TrustDiffView {
+            added: lossy(&diff.added),
+            removed: lossy(&diff.removed),
+            changed: lossy(&diff.changed),
+        }),
+        items: discovery.findings.iter().flat_map(items_of).collect(),
+    })
+}
+
+/// The bytes of text a view holds, before any JSON escaping, which only adds to them: a view whose
+/// text alone is over the bound cannot fit, and is not serialised to find that out.
+fn text_bytes(view: &TrustPromptView) -> usize {
+    let diff = view.changed.as_ref().map_or(0, |d| {
+        d.added
+            .iter()
+            .chain(&d.removed)
+            .chain(&d.changed)
+            .map(String::len)
+            .sum::<usize>()
+    });
+    let items: usize = view
+        .items
+        .iter()
+        .map(|i| i.what.len() + i.file.len() + i.label.len() + i.value.len())
+        .sum();
+    view.agent.len()
+        + view.root.len()
+        + view.top.len()
+        + view.fingerprint.len()
+        + view.remember_note.as_ref().map_or(0, String::len)
+        + diff
+        + items
+}
+
+/// Room left in the bound for the tab and nonce the GTK thread puts on a prepared message.
+const TAB_AND_NONCE_BYTES: usize = 64;
+
+/// A prompt's finished message without `tab` and `nonce`, and the digest an answer to it echoes.
+fn finish(view: &TrustPromptView) -> (String, String) {
+    let findings_digest = view.findings_digest();
+    let mut message: serde_json::Value =
+        serde_json::from_str(&eitri_core::agent_bridge::serialize_trust_prompt_for_js(view))
+            .expect("a prompt's message is JSON");
+    if let Some(fields) = message.as_object_mut() {
+        fields.remove("tab");
+        fields.remove("nonce");
+    }
+    (findings_digest, message.to_string())
+}
+
+/// What a prompt too large to show becomes. An agent that starts only after a `y` has no question to
+/// ask (the start is refused). Any other starts without the project's configuration on an `n`, so it
+/// is asked the short question that says why nothing can be trusted: it names the configuration, the
+/// size and what happens, shows none of it, and has no `y`. `view` is the whole prompt, of which only
+/// the header is used.
+fn too_large_prepared(view: &TrustPromptView, basis: Basis, bytes: usize) -> Prepared {
+    if view.needs_yes {
+        return Prepared {
+            basis,
+            findings_digest: String::new(),
+            shape: Shape::TooLarge { bytes },
+        };
+    }
+    let short = TrustPromptView {
+        tab: TabId(0),
+        nonce: 0,
+        agent: view.agent.clone(),
+        root: view.root.clone(),
+        top: view.top.clone(),
+        fingerprint: view.fingerprint.clone(),
+        state: TrustPromptState::TooLarge,
+        needs_yes: false,
+        remember: TrustRememberView::Window,
+        remember_note: Some(format!(
+            "{}; nothing of it will be loaded",
+            too_large(&view.agent, bytes)
+        )),
+        changed: None,
+        items: Vec::new(),
+    };
+    let (findings_digest, body) = finish(&short);
+    Prepared {
+        basis,
+        findings_digest,
+        shape: Shape::OnlyN {
+            body,
+            bytes,
+            #[cfg(test)]
+            view: Box::new(short),
+        },
+    }
+}
+
+/// One prompt for a check's result, built whole: its rows, its digest and its message, or only how
+/// large it is when it cannot be shown (see [`too_large_prepared`]). Worker only.
+fn prepare_one(state: &TrustState, basis: Basis) -> Option<Prepared> {
+    let view = view_of(state, &basis)?;
+    let text = text_bytes(&view);
+    if text + TAB_AND_NONCE_BYTES > MAX_PROMPT_BYTES {
+        return Some(too_large_prepared(&view, basis, text));
+    }
+    let (findings_digest, body) = finish(&view);
+    if body.len() + TAB_AND_NONCE_BYTES > MAX_PROMPT_BYTES {
+        let bytes = body.len();
+        return Some(too_large_prepared(&view, basis, bytes));
+    }
+    Some(Prepared {
+        basis,
+        findings_digest,
+        shape: Shape::Fits {
+            body,
+            #[cfg(test)]
+            view: Box::new(view),
+        },
+    })
+}
+
+/// The prompt for a check's result, sent with it in message `seq`, with the remember line `failure`
+/// (the profile's last failed record, if any) gives it. `None` when the result asks nothing. Worker
+/// only.
+fn prepare(state: &TrustState, failure: Option<&str>, seq: u64) -> Option<Prompts> {
+    let (discovery, remember) = match state {
+        TrustState::Untrusted { discovery, remember }
+        | TrustState::Changed {
+            discovery, remember, ..
+        } => (discovery, remember),
+        _ => return None,
+    };
+    let basis = match (remember, failure) {
+        (Remember::Yes, Some(why)) => Basis::RecordFailed(why.to_string()),
+        _ => Basis::Own,
+    };
+    Some(Prompts {
+        key: discovery.profile.key(),
+        for_seq: seq,
+        prepared: prepare_one(state, basis)?,
+    })
+}
+
+/// The state a result carries, if any.
+fn state_of(done: &Done) -> Option<&TrustState> {
+    match done {
+        Done::Checked { state, .. }
+        | Done::Recorded { state, .. }
+        | Done::Confirmed { state, .. }
+        | Done::Moved { state, .. }
+        | Done::CommandChecked { state, .. }
+        | Done::Forgot { state, .. } => Some(state),
+        Done::RecordFailed { .. } => None,
+    }
+}
+
+/// Numbers the worker's results and builds their prompts. It is the one place that knows why each
+/// profile's last record failed: the gate keeps no copy, and takes the remember line from the prompt
+/// it showed, so the two can never disagree about it.
+#[derive(Default)]
+struct Preparer {
+    seq: u64,
+    failures: HashMap<ProfileKey, String>,
+}
+
+impl Preparer {
+    /// `asked`, for a failed record, is the state that record was asked for and the gate's number of
+    /// it: its prompt is built again with the failure's words, keeping no copy of any state here.
+    fn wrap(&mut self, done: Done, asked: Option<(u64, &TrustState)>) -> Msg {
+        self.seq += 1;
+        let seq = self.seq;
+        let prompts = match &done {
+            Done::RecordFailed { profile, reason, .. } => {
+                self.failures.insert(profile.clone(), reason.clone());
+                asked.and_then(|(at, state)| prepare(state, Some(reason), at))
+            }
+            other => {
+                let state = state_of(other).expect("every other result carries a state");
+                let key = state_profile(state).key();
+                if matches!(other, Done::Recorded { .. }) {
+                    self.failures.remove(&key);
+                }
+                prepare(state, self.failures.get(&key).map(String::as_str), seq)
+            }
+        };
+        Msg { seq, done, prompts }
+    }
+}
+
+/// The worker's end of the channel, for a test that plays the worker: what it sends is numbered and
+/// given its prompts as the worker would.
+#[cfg(test)]
+pub(crate) struct DoneSender {
+    tx: mpsc::Sender<Msg>,
+    preparer: std::cell::RefCell<Preparer>,
+}
+
+#[cfg(test)]
+impl DoneSender {
+    fn new(tx: mpsc::Sender<Msg>) -> DoneSender {
+        DoneSender {
+            tx,
+            preparer: Default::default(),
+        }
+    }
+
+    fn send(&self, done: Done) -> Result<(), mpsc::SendError<Msg>> {
+        let msg = self.preparer.borrow_mut().wrap(done, None);
+        self.tx.send(msg)
     }
 }
 
@@ -1416,17 +1869,20 @@ fn read_codex_user_config(dir: &Path) -> UserCodexConfig {
     eitri_core::project_trust::read_user_codex_config(&resolved)
 }
 
-/// The worker: the only code here that touches the disk. It owns the store, runs each job in the
-/// order queued, and ends when the gate (and so the sender) is dropped.
+/// The worker: the only code here that touches the disk, and the only one that builds a prompt. It
+/// owns the store, runs each job in the order queued, and ends when the gate (and so the sender) is
+/// dropped.
 fn run_worker(
     store: TrustStore,
     root: PathBuf,
     home: Option<PathBuf>,
     codex_home: Option<PathBuf>,
     jobs: mpsc::Receiver<Job>,
-    done: mpsc::Sender<Done>,
+    done: mpsc::Sender<Msg>,
     before_each: Box<dyn Fn() + Send>,
 ) {
+    // Every result goes out with its prompt already built, here rather than on the GTK thread.
+    let mut preparer = Preparer::default();
     // Discovery compares the root's ancestors with the home by path, so a home spelt through a link
     // must be resolved once, here, where touching the disk is allowed.
     let home = home
@@ -1460,6 +1916,9 @@ fn run_worker(
     };
     while let Ok(job) = jobs.recv() {
         before_each();
+        // The state a record was asked for, kept until its result is sent: a failed record's prompt
+        // is rebuilt from it.
+        let mut asked: Option<(u64, Arc<TrustState>)> = None;
         let result = match job {
             Job::Check { generation, profile } => Done::Checked {
                 generation,
@@ -1467,10 +1926,12 @@ fn run_worker(
             },
             Job::Record {
                 purpose,
-                shown,
+                shown: shown_state,
+                seq,
                 epoch,
                 now,
             } => {
+                let shown = discovery_of(&shown_state).expect("every state carries its discovery");
                 // What was shown is what is written, and only if the disk still says the same: a
                 // change since the prompt is asked about again rather than trusted unseen.
                 let fresh = rediscover(&shown.profile);
@@ -1480,7 +1941,9 @@ fn run_worker(
                         state: store.state(fresh),
                     }
                 } else {
-                    match store.record(&shown, now) {
+                    let recorded = store.record(shown, now);
+                    asked = Some((seq, Arc::clone(&shown_state)));
+                    match recorded {
                         Ok(()) => Done::Recorded {
                             purpose,
                             epoch,
@@ -1503,6 +1966,7 @@ fn run_worker(
                 epoch,
                 kept,
             } => {
+                let shown = discovery_of(&shown).expect("every state carries its discovery");
                 let fresh = rediscover(&shown.profile);
                 if fresh.fingerprint != shown.fingerprint {
                     Done::Moved {
@@ -1545,7 +2009,8 @@ fn run_worker(
                 }
             }
         };
-        if done.send(result).is_err() {
+        let asked = asked.as_ref().map(|(seq, state)| (*seq, &**state));
+        if done.send(preparer.wrap(result, asked)).is_err() {
             return;
         }
     }
@@ -3292,5 +3757,609 @@ mod tests {
         assert_eq!(start_as(&mut gate, B, &acp), Route::Start(ProjectTrust::Trusted));
         fx.write("GEM.md", b"appeared later\n");
         assert_eq!(start_as(&mut gate, B, &acp), Route::Ask);
+    }
+
+    /// The message the GTK thread hands the page is the one the worker built, whole: as JSON it is what
+    /// serialising the view would give, with this tab and nonce, and its digest is the view's.
+    #[test]
+    fn the_prepared_message_is_the_prompt_whole() {
+        let fx = Fx::new("prepared-whole");
+        fx.write(SETTINGS, &hook("touch /tmp/\u{202e}a"));
+        fx.write(
+            ".mcp.json",
+            br#"{"mcpServers":{"m":{"command":"sh","args":["-c","x"],"env":{"K":"v"}}}}"#,
+        );
+        let mut gate = fx.gate();
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let message = match gate.ask(A, 41, &CLAUDE) {
+            Some(Asked::Prompt(message)) => message,
+            other => panic!("{other:?}"),
+        };
+        let view = gate.show(A, 41, &CLAUDE).unwrap();
+        assert_eq!((view.tab, view.nonce), (A, 41));
+        let sent: serde_json::Value = serde_json::from_str(&message).unwrap();
+        let whole: serde_json::Value =
+            serde_json::from_str(&eitri_core::agent_bridge::serialize_trust_prompt_for_js(&view)).unwrap();
+        assert_eq!(sent, whole);
+        assert_eq!(sent["findingsDigest"], view.findings_digest());
+        assert_eq!(digest_of(&gate, A), view.findings_digest());
+        assert!(gate.is_shown(A, 41));
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+    }
+
+    /// A prompt larger than the page is ever sent is not shown in any part. For an agent whose `n` loads
+    /// nothing it becomes a short question that names the problem and takes `n` and `Escape` only: no
+    /// part of the configuration goes to the page, a `y` is never taken (and spends the question), an
+    /// `n` starts the session without the project's configuration, and `:trust`, which can only trust,
+    /// is told the configuration is too large.
+    #[test]
+    fn a_prompt_too_large_to_show_is_asked_as_a_short_question_that_takes_no_y() {
+        let fx = Fx::new("too-large");
+        let secret = "x".repeat(MAX_PROMPT_BYTES);
+        fx.write(SETTINGS, &hook(&secret));
+        let mut gate = fx.gate();
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let message = match gate.ask(A, 1, &CLAUDE) {
+            Some(Asked::Prompt(message)) => message,
+            other => panic!("{other:?}"),
+        };
+        assert!(message.len() < 4096, "a short question, not {} bytes", message.len());
+        assert!(!message.contains("xxxxxxxx"), "no part of the configuration is sent");
+        let sent: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(sent["state"], "too_large");
+        assert_eq!(sent["needsYes"], false);
+        assert_eq!(sent["remember"], "window");
+        assert_eq!(sent["items"], serde_json::json!([]));
+        assert_eq!(sent["changed"], serde_json::Value::Null);
+        let note = sent["rememberNote"].as_str().unwrap();
+        assert!(note.contains("too large to show whole"), "{note}");
+        assert!(note.ends_with("nothing of it will be loaded"), "{note}");
+        assert_eq!(sent["findingsDigest"], digest_of(&gate, A));
+        assert!(gate.is_shown(A, 1));
+
+        // A `y` is not an answer to what was drawn: refused, and the question is spent and asked again.
+        let view = gate.show(A, 2, &CLAUDE).unwrap();
+        assert_eq!(view.state, TrustPromptState::TooLarge);
+        assert_eq!(
+            answer(&mut gate, &view, true),
+            AnswerOutcome::Refused(Y_NOT_TAKEN.to_string())
+        );
+        assert!(!gate.is_shown(A, 2));
+        assert!(gate.poll().is_empty(), "no record or confirmation was queued");
+        assert!(!fx.record_file().exists());
+
+        // The digest binds this question too.
+        let view = gate.show(A, 3, &CLAUDE).unwrap();
+        assert_eq!(
+            gate.answer(A, 3, &view.fingerprint, &"0".repeat(64), false, 1),
+            AnswerOutcome::Refused(OUT_OF_DATE.to_string())
+        );
+        let view = gate.show(A, 4, &CLAUDE).unwrap();
+        match answer(&mut gate, &view, false) {
+            AnswerOutcome::Start(ProjectTrust::Untrusted, Some(notice)) => assert_eq!(notice, not_loaded(&CLAUDE)),
+            other => panic!("{other:?}"),
+        }
+        // Remembered for the window against this fingerprint, like any `n`.
+        assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Untrusted));
+
+        // `:trust` has nothing to trust: told, with nothing shown.
+        let seen = command(&mut gate, "c", TrustAction::Trust);
+        assert!(
+            seen.iter().any(|e| matches!(e, GateEvent::CommandAsk { .. })),
+            "{seen:?}"
+        );
+        let (agent, bytes) = match gate.ask_command(A, "c") {
+            Some(Asked::TooLarge { agent, bytes }) => (agent, bytes),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(agent, "Claude");
+        assert!(bytes > MAX_PROMPT_BYTES, "{bytes}");
+        assert!(too_large(&agent, bytes).contains("too large to show whole"));
+        assert!(!gate.is_command_prompt(A, COMMAND_NONCE_BASE));
+        assert!(!fx.record_file().exists());
+    }
+
+    /// The same bound for an agent that starts only after a `y` (a registered one): its `n` would load
+    /// the configuration anyway, so there is no question to ask. The gate says how large the prompt is,
+    /// keeps nothing as shown, and no answer can be taken: the start is refused.
+    #[test]
+    fn a_prompt_too_large_to_show_for_an_agent_that_needs_a_yes_is_not_asked_at_all() {
+        let fx = Fx::new("too-large-needs-yes");
+        fx.write("GEM.md", b"be careful\n");
+        let state =
+            eitri_core::project_trust::for_root(&fx.store(), &fx.root, Some(&fx.home), &gem(), &ProfileEnv::default());
+        let view = view_of(&state, &Basis::Own).unwrap();
+        assert!(view.needs_yes);
+        let prepared = too_large_prepared(&view, Basis::Own, MAX_PROMPT_BYTES + 1);
+        assert!(matches!(prepared.shape, Shape::TooLarge { bytes } if bytes == MAX_PROMPT_BYTES + 1));
+        let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
+        gate.wait_for(A, &gem());
+        gate.begin_check(&gem());
+        assert!(matches!(jobs.try_recv(), Ok(Job::Check { .. })));
+        done.tx
+            .send(Msg {
+                seq: 1,
+                done: Done::Checked { generation: 1, state },
+                prompts: Some(Prompts {
+                    key: gem().key(),
+                    for_seq: 1,
+                    prepared,
+                }),
+            })
+            .unwrap();
+        assert_eq!(gate.poll(), vec![GateEvent::Route(A, Route::Ask)]);
+        assert_eq!(
+            gate.ask(A, 1, &gem()),
+            Some(Asked::TooLarge {
+                agent: "gem".to_string(),
+                bytes: MAX_PROMPT_BYTES + 1
+            })
+        );
+        assert!(!gate.is_shown(A, 1));
+        assert!(gate.show(A, 2, &gem()).is_none());
+        assert_eq!(
+            gate.answer(A, 1, &"0".repeat(64), &"0".repeat(64), true, 1),
+            AnswerOutcome::Refused(NOT_CURRENT.to_string())
+        );
+        assert!(jobs.try_recv().is_err(), "nothing was queued");
+    }
+
+    /// What a prompt too large to show is replaced with: the header of the real one, none of its
+    /// rows, and a digest of exactly that.
+    #[test]
+    fn the_short_question_keeps_only_the_prompts_header() {
+        let fx = Fx::new("short-question");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let state = eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
+        let whole = view_of(&state, &Basis::Own).unwrap();
+        let prepared = too_large_prepared(&whole, Basis::Own, 5 << 20);
+        let Shape::OnlyN { body, bytes, view } = prepared.shape else {
+            panic!("an agent whose n loads nothing is asked")
+        };
+        assert_eq!(bytes, 5 << 20);
+        assert_eq!(
+            (view.agent.as_str(), view.root.as_str()),
+            (whole.agent.as_str(), whole.root.as_str())
+        );
+        assert_eq!(view.fingerprint, whole.fingerprint);
+        assert_eq!(view.state, TrustPromptState::TooLarge);
+        assert!(!view.needs_yes && view.items.is_empty() && view.changed.is_none());
+        assert_eq!(prepared.findings_digest, view.findings_digest());
+        assert_ne!(prepared.findings_digest, whole.findings_digest());
+        let note = view.remember_note.as_deref().unwrap();
+        assert!(note.contains("over 5.0 MiB; at most 2.0 MiB can be shown"), "{note}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed.get("tab").is_none() && parsed.get("nonce").is_none());
+    }
+
+    /// Just under the bound a prompt is shown, whole.
+    #[test]
+    fn a_prompt_just_under_the_bound_is_shown_whole() {
+        let fx = Fx::new("just-under");
+        let value = "y".repeat(MAX_PROMPT_BYTES - 4096);
+        fx.write(SETTINGS, &hook(&value));
+        let mut gate = fx.gate();
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let message = match gate.ask(A, 1, &CLAUDE) {
+            Some(Asked::Prompt(message)) => message,
+            other => panic!("{other:?}"),
+        };
+        assert!(message.len() <= MAX_PROMPT_BYTES, "{}", message.len());
+        let sent: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert!(sent["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["value"] == value.as_str()));
+    }
+
+    /// A configuration whose record would be larger than a record may be is asked about as a
+    /// window-only trust from the start, saying why, rather than offering a record that cannot be kept.
+    #[test]
+    fn a_configuration_too_large_to_record_is_window_only_in_the_prompt() {
+        let fx = Fx::new("record-too-large");
+        let dir = fx.root.join(".claude/commands").join("d".repeat(250));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..1900 {
+            std::fs::write(dir.join(format!("{i:04}{}", "n".repeat(240))), b"x").unwrap();
+        }
+        let mut gate = fx.gate();
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
+        assert_eq!(view.remember, TrustRememberView::Window);
+        let note = view.remember_note.clone().unwrap_or_default();
+        assert!(note.starts_with("a trust record of it would be "), "{note}");
+        assert!(note.contains("more than the 1.0 MiB a record may be"), "{note}");
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Recorded { tab, .. } if *tab == A))
+        });
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Recorded { notice: Some(n), .. }
+                if n.starts_with("trusted for this window only: a trust record of it would be"))),
+            "{seen:?}"
+        );
+        assert!(!fx.record_file().exists());
+        assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Trusted));
+    }
+
+    /// The prompt is built by the worker only: outside the worker and the functions it builds prompts
+    /// with, nothing lays out a prompt's rows, hashes it or serialises it.
+    #[test]
+    fn only_the_worker_builds_prompts() {
+        let code = own_source();
+        let one = |name: &str| {
+            let found = scan::functions(&code, name);
+            assert_eq!(found.len(), 1, "{name} not found");
+            found[0]
+        };
+        let worker = one("run_worker");
+        assert!(
+            worker.contains("preparer.wrap("),
+            "the worker no longer builds the prompts"
+        );
+        let wrap = one("wrap");
+        assert!(scan::calls(wrap, "prepare") > 0);
+        let prepare = one("prepare");
+        assert!(scan::calls(prepare, "prepare_one") > 0);
+        let prepare_one = one("prepare_one");
+        assert!(
+            prepare_one.contains("view_of("),
+            "the scan would not see `view_of(` in prepare_one"
+        );
+        let finish = one("finish");
+        for anchor in ["findings_digest()", "serialize_trust_prompt_for_js"] {
+            assert!(finish.contains(anchor), "the scan would not see `{anchor}` in finish");
+        }
+        let too_large_prepared = one("too_large_prepared");
+        assert!(
+            scan::calls(too_large_prepared, "finish") > 0 && scan::calls(prepare_one, "finish") > 0,
+            "the prompts are no longer finished by the one function"
+        );
+        let view_of = one("view_of");
+        assert!(view_of.contains("items_of"));
+        let send = one("send");
+        assert!(send.contains(".wrap("), "the test sender no longer plays the worker");
+        let mut cut = vec![
+            worker,
+            wrap,
+            prepare,
+            prepare_one,
+            finish,
+            too_large_prepared,
+            view_of,
+            send,
+            one("items_of"),
+            one("item_of"),
+        ];
+        cut.extend(scan::modules(&code, "tests"));
+        let rest = scan::without(&code, &cut);
+        for needle in ["findings_digest()", "serialize_trust_prompt_for_js"] {
+            assert!(!rest.contains(needle), "`{needle}` outside the worker");
+        }
+        for name in [
+            "view_of",
+            "prepare_one",
+            "prepare",
+            "items_of",
+            "item_of",
+            "finish",
+            "too_large_prepared",
+        ] {
+            assert_eq!(scan::word_ends(&rest, name).len(), 1, "{name} named outside the worker");
+        }
+        for name in ["view_of", "prepare_one", "prepare", "finish", "too_large_prepared"] {
+            assert_eq!(scan::calls(&rest, name), 0, "{name} called outside the worker");
+        }
+        assert_eq!(
+            scan::word_ends(&rest, "wrap").len(),
+            1,
+            "wrap is called outside the worker"
+        );
+    }
+
+    /// A project near discovery's caps: three settings files just under 4 MiB, each one value shown
+    /// whole, and 1,900 more files. Prints how long the calls the GTK thread makes (`poll`, `ask`)
+    /// took against how long the worker took, for a check and the question that follows it. Timing,
+    /// so run by hand: `cargo test -p eitri-panel near_the_caps -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing; run by hand"]
+    fn near_the_caps_the_gtk_thread_only_hands_over() {
+        let fx = Fx::new("near-caps");
+        let big = (4 << 20) - 4096;
+        fx.write(SETTINGS, &padded_hook(&"a".repeat(big - 200), big));
+        fx.write(".claude/settings.local.json", &padded_hook(&"b".repeat(big - 200), big));
+        let mcp = format!(r#"{{"mcpServers":{{"m":{{"command":"{}"}}}}}}"#, "c".repeat(big - 200));
+        fx.write(".mcp.json", mcp.as_bytes());
+        for i in 0..1900 {
+            fx.write(&format!(".claude/commands/c{i:04}.md"), b"say hello\n");
+        }
+        let mut gate = fx.gate();
+        let mut gtk = Duration::ZERO;
+        let began = Instant::now();
+        gate.wait_for(A, &CLAUDE);
+        gate.begin_check(&CLAUDE);
+        let route = loop {
+            let at = Instant::now();
+            let seen = gate.poll();
+            gtk += at.elapsed();
+            if let Some(route) = seen.into_iter().find_map(|e| match e {
+                GateEvent::Route(t, route) if t == A => Some(route),
+                _ => None,
+            }) {
+                break route;
+            }
+            assert!(began.elapsed() < Duration::from_secs(120), "no route");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let worker = began.elapsed() - gtk;
+        assert_eq!(route, Route::Ask);
+        let at = Instant::now();
+        let asked = gate.ask(A, 1, &CLAUDE);
+        let ask = at.elapsed();
+        gtk += ask;
+        eprintln!(
+            "near the caps: GTK thread {:.2} ms (ask {:.2} ms), worker {:.1} ms, asked {:?}",
+            gtk.as_secs_f64() * 1e3,
+            ask.as_secs_f64() * 1e3,
+            worker.as_secs_f64() * 1e3,
+            asked.as_ref().map(|a| match a {
+                Asked::Prompt(m) => format!("prompt of {} bytes", m.len()),
+                Asked::TooLarge { bytes, .. } => format!("too large ({bytes} bytes)"),
+                Asked::Unavailable => "unavailable".to_string(),
+            })
+        );
+        assert!(matches!(asked, Some(Asked::Prompt(_))), "the short question");
+    }
+
+    /// The largest prompt that is still shown: the GTK thread copies the prepared message once.
+    /// Timing, so run by hand, as above.
+    #[test]
+    #[ignore = "timing; run by hand"]
+    fn near_the_bound_the_gtk_thread_copies_the_message_once() {
+        let fx = Fx::new("near-bound");
+        fx.write(SETTINGS, &hook(&"y".repeat(MAX_PROMPT_BYTES - 4096)));
+        let mut gate = fx.gate();
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let at = Instant::now();
+        let asked = gate.ask(A, 1, &CLAUDE);
+        let ask = at.elapsed();
+        let Some(Asked::Prompt(message)) = asked else {
+            panic!("{asked:?}")
+        };
+        eprintln!(
+            "near the bound: ask {:.3} ms for a message of {} bytes",
+            ask.as_secs_f64() * 1e3,
+            message.len()
+        );
+    }
+
+    /// A check that came back without its prompt (a worker fault) is refused at once, for a tab and for
+    /// `:trust` alike: nothing is shown, nothing can be answered, and the worker is not asked again, so
+    /// such a fault can neither leave a tab waiting in silence nor turn into a loop of checks.
+    #[test]
+    fn a_result_without_its_prompt_is_refused_and_never_asked_again() {
+        let fx = Fx::new("no-prompt");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let state = eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
+        let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
+        gate.wait_for(A, &CLAUDE);
+        gate.begin_check(&CLAUDE);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Check { .. })));
+        done.tx
+            .send(Msg {
+                seq: 1,
+                done: Done::Checked { generation: 1, state },
+                prompts: None,
+            })
+            .unwrap();
+        assert_eq!(gate.poll(), vec![GateEvent::Route(A, Route::Ask)]);
+        for nonce in [1, 2] {
+            assert_eq!(gate.ask(A, nonce, &CLAUDE), Some(Asked::Unavailable));
+            assert!(!gate.is_shown(A, nonce));
+        }
+        assert!(gate.show(A, 3, &CLAUDE).is_none());
+        gate.command("c".into(), TrustAction::Trust, A, &CLAUDE);
+        assert!(matches!(jobs.try_recv(), Ok(Job::CommandCheck { .. })));
+        let state = eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
+        done.tx
+            .send(Msg {
+                seq: 2,
+                done: Done::CommandChecked {
+                    request_id: "c".into(),
+                    tab: A,
+                    state,
+                },
+                prompts: None,
+            })
+            .unwrap();
+        assert!(gate
+            .poll()
+            .iter()
+            .any(|e| matches!(e, GateEvent::CommandAsk { request_id, .. } if request_id == "c")));
+        assert_eq!(gate.ask_command(A, "c"), Some(Asked::Unavailable));
+        assert!(!gate.is_command_prompt(A, COMMAND_NONCE_BASE));
+        assert!(jobs.try_recv().is_err(), "the worker was asked for nothing more");
+    }
+
+    /// A record that cannot be written: the worker, the one place that knows why, rebuilds the refused
+    /// prompt with the failure's words, the window-only `y` to it writes nothing, and a later check of
+    /// the same profile still says so. A shown prompt shares the gate's copy of its check.
+    #[test]
+    fn a_failed_record_s_prompt_comes_from_the_worker_and_its_y_writes_nothing() {
+        let fx = Fx::new("record-failed-one-source");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        std::fs::create_dir_all(fx.record_file().join("in-the-way")).unwrap();
+        let mut gate = fx.gate();
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
+        assert!(Arc::ptr_eq(&gate.shown[&A].state, &gate.latest[&CLAUDE.key()]));
+        assert_eq!(view.remember, TrustRememberView::Yes);
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        drain(&mut gate, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::RecordRefused { tab, .. } if *tab == A))
+        });
+        let again = gate.show(A, 2, &CLAUDE).unwrap();
+        assert_eq!(again.remember, TrustRememberView::Window);
+        let note = again.remember_note.clone().unwrap();
+        assert!(note.starts_with("trust could not be recorded ("), "{note}");
+        assert_eq!(answer(&mut gate, &again, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Recorded { tab, .. } if *tab == A))
+        });
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Recorded { notice: Some(n), .. }
+                if n.starts_with("trusted for this window only: trust could not be recorded"))),
+            "{seen:?}"
+        );
+        assert!(fx.record_file().is_dir(), "nothing was written over it");
+        // A fresh check is asked with the failure still said, by the same worker.
+        assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Trusted));
+        gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
+        drain(&mut gate, |seen| command_done(seen, "u").is_some());
+        assert_eq!(start(&mut gate, B), Route::Ask);
+        assert_eq!(gate.show(B, 3, &CLAUDE).unwrap().remember, TrustRememberView::Window);
+    }
+
+    /// The check of the root a test hands the gate as the worker's result.
+    fn claude_state(fx: &Fx) -> TrustState {
+        eitri_core::project_trust::for_root(
+            &fx.store(),
+            &fx.root,
+            Some(&fx.home),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        )
+    }
+
+    /// A gate whose worker is the test, with a first check of `fx` delivered as result 1 and tab `A`
+    /// shown its question.
+    fn gate_shown_result_one(fx: &Fx) -> (TrustGate, mpsc::Receiver<Job>, DoneSender, TrustPromptView) {
+        let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
+        gate.wait_for(A, &CLAUDE);
+        gate.begin_check(&CLAUDE);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Check { .. })));
+        done.send(Done::Checked {
+            generation: 1,
+            state: claude_state(fx),
+        })
+        .unwrap();
+        assert_eq!(gate.poll(), vec![GateEvent::Route(A, Route::Ask)]);
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
+        (gate, jobs, done, view)
+    }
+
+    /// A same-configuration check that lands after a tab was shown its question (another tab's start)
+    /// leaves that question on screen; the record its `y` asks for names the result the question was
+    /// built from, not the newer one.
+    #[test]
+    fn a_record_job_names_the_result_its_prompt_was_built_for() {
+        let fx = Fx::new("record-seq");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let (mut gate, jobs, done, view) = gate_shown_result_one(&fx);
+        gate.begin_check(&CLAUDE);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Check { .. })));
+        done.send(Done::Checked {
+            generation: 2,
+            state: claude_state(&fx),
+        })
+        .unwrap();
+        gate.poll();
+        assert!(gate.is_shown(A, 1), "the same configuration keeps the question");
+        assert_eq!(gate.latest_seq[&CLAUDE.key()], 2);
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        match jobs.try_recv() {
+            Ok(Job::Record { seq, .. }) => assert_eq!(seq, 1, "the result the question was built from"),
+            other => panic!("{:?}", other.map(|_| "another job")),
+        }
+    }
+
+    /// A record that fails after a newer same-configuration check landed: the rebuilt prompt belongs to
+    /// the older result and is not put on the newer one (whose text was built before the failure was
+    /// known and still says the answer is remembered). That prompt's `y` tries the record again, fails
+    /// again and is refused with nothing trusted; the second failure rebuilds the newest result's own
+    /// prompt, and the question after it is window-only. This is the one extra refused `y` that
+    /// CLAUDE.md names.
+    #[test]
+    fn a_failed_record_cannot_rewrite_a_newer_results_prompt_and_the_next_y_fails_closed() {
+        let fx = Fx::new("record-failed-newer");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let (mut gate, jobs, done, view) = gate_shown_result_one(&fx);
+        gate.begin_check(&CLAUDE);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Check { .. })));
+        let second = claude_state(&fx);
+        done.send(Done::Checked {
+            generation: 2,
+            state: claude_state(&fx),
+        })
+        .unwrap();
+        gate.poll();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Record { seq: 1, .. })));
+        // The record fails; the worker rebuilds result 1's prompt with the failure's words.
+        let fail = |reason: &str, asked: (u64, &TrustState)| {
+            let msg = done.preparer.borrow_mut().wrap(
+                Done::RecordFailed {
+                    purpose: Purpose::ForTab(A),
+                    profile: CLAUDE.key(),
+                    reason: reason.to_string(),
+                },
+                Some(asked),
+            );
+            done.tx.send(msg).unwrap();
+        };
+        fail("disk full", (1, &claude_state(&fx)));
+        let seen = gate.poll();
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::RecordRefused { tab, .. } if *tab == A)),
+            "{seen:?}"
+        );
+        // Result 2's prompt, built before the failure was known, still says "remembered".
+        let again = gate.show(A, 2, &CLAUDE).unwrap();
+        assert_eq!(again.remember, TrustRememberView::Yes);
+        // Its `y` is a record attempt, not a trust: it fails the same way and is refused.
+        assert_eq!(answer(&mut gate, &again, true), AnswerOutcome::Recording);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Record { seq: 2, .. })));
+        fail("disk full", (2, &second));
+        let seen = gate.poll();
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::RecordRefused { tab, .. } if *tab == A)),
+            "{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, GateEvent::Recorded { .. })),
+            "{seen:?}"
+        );
+        // Now the newest result's own prompt carries the failure: window-only, and the `y` writes nothing.
+        let last = gate.show(A, 3, &CLAUDE).unwrap();
+        assert_eq!(last.remember, TrustRememberView::Window);
+        assert!(last.remember_note.as_ref().unwrap().contains("disk full"));
+        assert_eq!(answer(&mut gate, &last, true), AnswerOutcome::Recording);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Confirm { .. })));
     }
 }

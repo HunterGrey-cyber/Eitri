@@ -94,7 +94,15 @@ import type { ShownHint } from "./components/HintLayer";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { ReviewOverlay } from "./components/ReviewOverlay";
 import { TrustPrompt } from "./components/TrustPrompt";
-import { parseExCommand, resolveTrustKey, scrollTarget, TRUST_BAND_PROMPT, TRUST_WAIT_FLASH, trustFooter } from "./trust";
+import {
+  parseExCommand,
+  resolveTrustKey,
+  scrollTarget,
+  TRUST_BAND_PROMPT,
+  TRUST_BAND_PROMPT_N_ONLY,
+  TRUST_WAIT_FLASH,
+  trustFooter,
+} from "./trust";
 import type { TrustKeyEvent, TrustPromptEnvelope } from "./trust";
 import {
   applyReviewKey,
@@ -119,7 +127,7 @@ import type { SlashPickerKind } from "./components/SlashPicker";
 import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
 import { barePickerCommand } from "./slashCommands";
 import { parseEffortReply, parseModelReply } from "./slashPicker";
-import { DRAFT_MIRROR_DELAY_MS, modePill, showTabBar } from "./tabs";
+import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
 import { cardSummary, shortModel, usageSegment } from "./band";
 import { latestTurnEnding } from "./turnEnding";
 import type { ApproveFact, BandFacts } from "./band";
@@ -886,13 +894,29 @@ export default function App() {
   /** The composer's text reaches Rust 300ms after its last change and immediately when the tab
    *  stops being active. `pendingDraftRef` holds the unsent text and its tab. */
   const pendingDraftRef = useRef<{ tab: TabId; text: string } | null>(null);
+  /** A refused send this page has put back into the box itself (`tab`, the message `text`, and when). The refusal
+   *  of a first message put off by the trust question is followed by Rust's `draft`, its copy of the box with the
+   *  message in front; that echo must not replace a box that already holds the message and what was typed after
+   *  it. Forgotten once the mirror it goes with is delivered. */
+  const refusedEchoRef = useRef<{ tab: TabId; text: string; at: number } | null>(null);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   function flushDraft() {
+    refusedEchoRef.current = null;
     if (draftTimerRef.current !== null) clearTimeout(draftTimerRef.current);
     draftTimerRef.current = null;
     const pending = pendingDraftRef.current;
     pendingDraftRef.current = null;
     if (pending !== null) postToRust({ type: "draft", request_id: nextRequestId(), tab: pending.tab, text: pending.text });
+  }
+  /** Whether `text` is the echo of the refusal just recorded for `tab`: it starts with the refused message and
+   *  comes straight after it. Taken once; an echo that never comes expires (`REFUSED_ECHO_MS`, or when the
+   *  mirror it follows goes out). */
+  function takeRefusedEcho(tab: TabId, text: string): boolean {
+    const echo = refusedEchoRef.current;
+    refusedEchoRef.current = null;
+    return (
+      echo !== null && echo.tab === tab && performance.now() - echo.at < REFUSED_ECHO_MS && text.startsWith(echo.text)
+    );
   }
   function mirrorDraft(text: string) {
     draftRef.current = text;
@@ -1476,7 +1500,7 @@ export default function App() {
       tab: payload.tab,
       nonce: payload.nonce,
       view: payload,
-      lines: [TRUST_BAND_PROMPT],
+      lines: [payload.state === "too_large" ? TRUST_BAND_PROMPT_N_ONLY : TRUST_BAND_PROMPT],
       openedAt: performance.now(),
       flashAfter: flashSeq.current,
     });
@@ -2936,6 +2960,8 @@ export default function App() {
               restoreSeq.current += 1;
               setRestoredDraft({ text: recovered, seq: restoreSeq.current });
               mirrorDraft(recovered);
+              refusedEchoRef.current =
+                (record.text ?? "") === "" ? null : { tab: record.tab, text: record.text ?? "", at: performance.now() };
               setCommandNotice(`That message was not sent (${payload.error}). It is back in the box.`);
             } else {
               // The tab this was sent from is no longer the active one (the user switched away
@@ -3143,6 +3169,9 @@ export default function App() {
       } else if (payload.kind === "queue") {
         setQueue(payload.items);
         setQueueError(payload.error);
+      } else if (payload.kind === "draft" && takeRefusedEcho(payload.tab, payload.text)) {
+        // The echo of a refused send this page put back itself: Rust's copy of the box can trail what was typed
+        // since, and the box already holds the message and everything typed after it. Nothing to apply.
       } else if (payload.kind === "draft") {
         // Rust's copy wins only when it is sent: a switch, `ready`, a reset, a scratch return.
         restoreSeq.current += 1;
@@ -3724,7 +3753,7 @@ export default function App() {
         // Escape alone works from inside a text field: it starts nothing. Every other key typed there is the
         // field's text, so it is taken and never answers.
         if (event.key !== "Escape" && isEditableElement(event.target)) {
-          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true));
+          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true, confirm.view.state));
           return true;
         }
         const pendingG = trustPendingGRef.current;
@@ -3734,6 +3763,7 @@ export default function App() {
           openedAt: confirm.openedAt,
           lastKeyAt: lastKeyAtRef.current,
           pendingG,
+          onlyN: confirm.view.state === "too_large",
         });
         if (action.kind === "answer") {
           // Echoes what was drawn: the page never computes either value, so an answer to anything other than
@@ -3763,7 +3793,7 @@ export default function App() {
         } else if (action.kind === "wait") {
           showFlash(TRUST_WAIT_FLASH);
         } else {
-          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true));
+          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true, confirm.view.state));
         }
         return true;
       }

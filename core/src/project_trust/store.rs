@@ -35,7 +35,11 @@ use super::nofollow::{read_regular_nofollow, Owner};
 use super::{discover, Discovery, EntryKind, Limits, Profile, ProfileEnv};
 use crate::layout::persist;
 
-/// A record larger than this is not one of ours.
+/// A record larger than this is not one of ours. The record is read on every check, from a state
+/// directory another program of the user's could fill, so the reader stays small; a configuration
+/// whose record would be larger (about 1,900 files with long names) is not recorded at all, and its
+/// prompt says from the start that a `y` lasts for this window only ([`Remember::WindowOnly`]): its
+/// fingerprint covers everything, so the window may keep the answer, but no record can.
 const MAX_RECORD_BYTES: u64 = 1 << 20;
 
 /// How much the prompt a record answered showed. A `y` is about what the person saw, not only about
@@ -208,6 +212,11 @@ impl TrustStore {
         if discovery.root.to_str().is_none() {
             return Remember::WindowOnly("the project path is not valid UTF-8".to_string());
         }
+        // Sized for the latest time a record can carry, so a record written later is never larger.
+        let size = record_text(discovery, u64::MAX).map_or(u64::MAX, |text| text.len() as u64);
+        if size > MAX_RECORD_BYTES {
+            return Remember::WindowOnly(too_large_to_record(discovery, size));
+        }
         Remember::Yes
     }
 
@@ -232,22 +241,17 @@ impl TrustStore {
             ));
         };
         let path = dir.join(record_name(&discovery.root, &discovery.profile));
-        let Some(root) = discovery.root.to_str() else {
+        let text = record_text(discovery, now_unix)?;
+        // A record the reader would refuse is never written: it could only ever read as untrusted.
+        if text.len() as u64 > MAX_RECORD_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the project path is not valid UTF-8",
+                format!(
+                    "not written: a record this large could not be read back, since {}",
+                    too_large_to_record(discovery, text.len() as u64)
+                ),
             ));
-        };
-        let record = Record {
-            version: 1,
-            root: root.to_string(),
-            trusted_at: now_unix,
-            fingerprint: discovery.fingerprint.hex(),
-            files: files_of(discovery),
-            profile: profile_field(&discovery.profile),
-            disclosure: DISCLOSURE,
-        };
-        let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
+        }
         persist::create_state_dir(&dir)?;
         let tmp = persist::temporary(&path);
         let written =
@@ -258,8 +262,9 @@ impl TrustStore {
         }
         // What `state` will read must be what was just written; anything else would tell the user
         // the project is trusted while the next start asks again.
+        let fingerprint = discovery.fingerprint.hex();
         let reads_back = read_usable_at(&path, &discovery.root, &discovery.profile)
-            .is_some_and(|read| read.fingerprint == record.fingerprint);
+            .is_some_and(|read| read.fingerprint == fingerprint);
         if !reads_back {
             return Err(io::Error::other(format!(
                 "the trust record {} could not be read back",
@@ -300,6 +305,37 @@ impl TrustStore {
         std::fs::remove_file(&path)?;
         Ok(true)
     }
+}
+
+/// The record of `discovery` as written, trusted at `now_unix`.
+fn record_text(discovery: &Discovery, now_unix: u64) -> io::Result<String> {
+    let Some(root) = discovery.root.to_str() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the project path is not valid UTF-8",
+        ));
+    };
+    let record = Record {
+        version: 1,
+        root: root.to_string(),
+        trusted_at: now_unix,
+        fingerprint: discovery.fingerprint.hex(),
+        files: files_of(discovery),
+        profile: profile_field(&discovery.profile),
+        disclosure: DISCLOSURE,
+    };
+    serde_json::to_string_pretty(&record).map_err(io::Error::other)
+}
+
+/// Why a configuration whose record would be `size` bytes is not recorded.
+fn too_large_to_record(discovery: &Discovery, size: u64) -> String {
+    let mib = |bytes: u64| format!("{:.1} MiB", bytes as f64 / (1u64 << 20) as f64);
+    format!(
+        "a trust record of it would be {} for {} files and directories, more than the {} a record may be",
+        mib(size),
+        discovery.entries.len(),
+        mib(MAX_RECORD_BYTES)
+    )
 }
 
 /// `dir` with every link in it resolved: its deepest existing ancestor made canonical, and the names

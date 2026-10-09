@@ -1112,3 +1112,83 @@ fn a_record_that_does_not_read_back_is_an_error() {
     assert!(refused.to_string().contains("could not be read back"), "{refused}");
     assert!(!matches!(store.state(found), TrustState::Trusted { .. }));
 }
+
+/// The refusal of an oversized record says what happened: nothing was written, so it must not talk
+/// of a record that "could not be read back" as if one had been put on disk.
+#[test]
+fn an_oversized_record_is_refused_in_words_that_say_nothing_was_written() {
+    let fx = Fixture::new("oversized-wording");
+    let root = fx.root("p");
+    let dir = root.join(".claude/commands").join("d".repeat(250));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..1900 {
+        std::fs::write(dir.join(format!("{i:04}{}", "n".repeat(240))), b"x").unwrap();
+    }
+    let found = fx.discover(&root);
+    let store = fx.store();
+    let refused = store.record(&found, 1).unwrap_err().to_string();
+    assert!(
+        refused.starts_with("not written: a record this large could not be read back"),
+        "{refused}"
+    );
+    assert!(!refused.contains("the trust record"), "{refused}");
+}
+
+/// The same configuration as above, asked about: since its record could never be kept, the check says
+/// so from the start (a `y` lasts for the window, with the reason), rather than offering a record
+/// that fails once the user has answered. A small configuration still offers one.
+#[test]
+fn a_configuration_whose_record_cannot_be_kept_is_window_only_from_the_start() {
+    let fx = Fixture::new("record-too-large");
+    let root = fx.root("p");
+    let dir = root.join(".claude/commands").join("d".repeat(250));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..1900 {
+        std::fs::write(dir.join(format!("{i:04}{}", "n".repeat(240))), b"x").unwrap();
+    }
+    let store = fx.store();
+    match store.state(fx.discover(&root)) {
+        TrustState::Untrusted {
+            remember: Remember::WindowOnly(why),
+            ..
+        } => {
+            assert!(why.starts_with("a trust record of it would be "), "{why}");
+            assert!(
+                why.contains(" files and directories, more than the 1.0 MiB a record may be"),
+                "{why}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let small = fx.root("small");
+    write(&small.join(".claude/settings.json"), &hook("touch /tmp/a"));
+    assert!(matches!(
+        store.state(fx.discover(&small)),
+        TrustState::Untrusted {
+            remember: Remember::Yes,
+            ..
+        }
+    ));
+}
+
+/// A record the reader would refuse is not written at all: no file is left that could only ever read
+/// as untrusted.
+#[test]
+fn a_record_over_the_cap_is_refused_before_anything_is_written() {
+    let fx = Fixture::new("record-not-written");
+    let root = fx.root("p");
+    let dir = root.join(".claude/commands").join("d".repeat(250));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..1900 {
+        std::fs::write(dir.join(format!("{i:04}{}", "n".repeat(240))), b"x").unwrap();
+    }
+    let found = fx.discover(&root);
+    assert!(found.fully_hashed(), "{:?}", found.uncheckable());
+    let refused = fx.store().record(&found, 1).unwrap_err();
+    assert!(refused.to_string().starts_with("not written: "), "{refused}");
+    assert!(!fx.record_file(&root).exists(), "a record was left behind");
+    let leftovers: Vec<_> = std::fs::read_dir(fx.dir())
+        .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}

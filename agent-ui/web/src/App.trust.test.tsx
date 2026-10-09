@@ -249,6 +249,26 @@ describe("the trust question", () => {
     expect(container.textContent).not.toContain("copied");
   });
 
+  it("the_question_for_a_configuration_too_large_to_show_takes_n_and_never_y", () => {
+    const { container } = asked({
+      state: "too_large",
+      remember: "window",
+      rememberNote: "too large to show whole; nothing of it will be loaded",
+      items: [],
+    });
+    wait(TYPING_GUARD_MS + 50);
+    press(container, "y");
+    press(container, "Y");
+    expect(requests("trust_answer")).toEqual([]);
+    expect(prompt(container)).not.toBeNull();
+    expect(promptLine(container)).toBe("trust? n/Esc · n starts without it · Esc puts this off · y is not taken here");
+    wait(TYPING_GUARD_MS + 50);
+    press(container, "n");
+    expect(requests("trust_answer")).toEqual([
+      expect.objectContaining({ tab: 1, nonce: 17, fingerprint: HEX_A, findings_digest: HEX_B, trust: false }),
+    ]);
+  });
+
   it("escape_posts_trust_cancel", () => {
     const { container } = asked();
     // No wait: Escape starts nothing.

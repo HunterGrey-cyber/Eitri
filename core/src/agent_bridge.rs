@@ -1795,6 +1795,9 @@ pub enum TrustPromptState {
     /// Nothing of the agent's was found, and the agent still starts only after a `y` (a registered
     /// agent, which loads whatever project files appear).
     Nothing,
+    /// The configuration is too large to show whole, so there is nothing to trust: the question takes
+    /// only `n` (start without it) or `Escape` (put the start off), and `y` is never taken.
+    TooLarge,
 }
 
 impl TrustPromptState {
@@ -1803,6 +1806,7 @@ impl TrustPromptState {
             TrustPromptState::Untrusted => "untrusted",
             TrustPromptState::Changed => "changed",
             TrustPromptState::Nothing => "nothing",
+            TrustPromptState::TooLarge => "too_large",
         }
     }
 }
@@ -6019,6 +6023,7 @@ mod tests {
             ("fingerprint", Box::new(|v| v.fingerprint = "e".repeat(64))),
             ("state", Box::new(|v| v.state = TrustPromptState::Changed)),
             ("state nothing", Box::new(|v| v.state = TrustPromptState::Nothing)),
+            ("state too large", Box::new(|v| v.state = TrustPromptState::TooLarge)),
             ("needsYes", Box::new(|v| v.needs_yes = true)),
             ("remember", Box::new(|v| v.remember = TrustRememberView::Window)),
             ("note", Box::new(|v| v.remember_note = Some("why".into()))),
