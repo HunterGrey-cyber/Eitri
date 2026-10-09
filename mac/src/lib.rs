@@ -7,6 +7,7 @@ pub mod assembly;
 pub mod editor;
 pub mod keys;
 pub mod layout;
+pub mod panel_pump;
 pub mod startup;
 
 /// Every socket path built here goes through `agent::socket_path::in_dir`; the core and agent guards read

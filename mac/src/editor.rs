@@ -47,6 +47,8 @@ pub enum EditorEvent {
     LinkChanged(BandLink),
     /// Draft edits waiting on the editor must end (it went away or was swapped).
     CancelDrafts,
+    /// The context source answers something new; the panel reads it when its tick runs, so it is woken.
+    ContextChanged,
 }
 
 pub struct Editor {
@@ -172,6 +174,9 @@ impl Editor {
         }
         if let Some(report) = found.keys {
             events.push(EditorEvent::Keys(report));
+        }
+        if found.context {
+            events.push(EditorEvent::ContextChanged);
         }
         for message in found.pane {
             if let PaneMessage::Direction(letter) = message {
@@ -301,6 +306,42 @@ mod tests {
         }
         assert!((editor.context())().is_none());
         assert!(editor.poll(Instant::now()).is_empty(), "nothing changed since");
+        editor.shutdown();
+    }
+
+    /// A context line read from the feed is said, so the window wakes the panel that reads it; the context
+    /// itself stays gated on an attached editor.
+    #[test]
+    fn a_new_context_is_said() {
+        use std::io::Write;
+        let editor = editor();
+        let start = Instant::now();
+        editor.poll(start);
+        let path = editor
+            .context_feed
+            .as_ref()
+            .expect("the context feed")
+            .socket_path()
+            .to_path_buf();
+        let mut stream = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+        stream
+            .write_all(b"{\"v\":1,\"file\":\"/p/a.rs\",\"selection\":null}\n")
+            .expect("write");
+        drop(stream);
+        let mut said = 0;
+        for step in 1..=40u32 {
+            let events = editor.poll(start + Duration::from_millis(100) * step);
+            said += events
+                .iter()
+                .filter(|e| matches!(e, EditorEvent::ContextChanged))
+                .count();
+            if said > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(said, 1, "the new context was said once");
+        assert!((editor.context())().is_none(), "no editor is attached");
         editor.shutdown();
     }
 

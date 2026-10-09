@@ -4,7 +4,7 @@
 //!
 //! **One backend per tab**. The tabs themselves live in
 //! `eitri_core::tab_set::TabSet`; this module spawns the workers that set only holds receivers
-//! for, drains every tab on one 33 ms tick, and routes each inbound command to the tab it names --
+//! for, drains every tab on one tick (run when due, `crate::panel_wake`), and routes each inbound command to the tab it names --
 //! never to "the active one". Backend construction is lazy per tab: an empty
 //! tab starts its backend on its first `send_message` (or a `resume`). No mode goes into it:
 //! every session is gated, and the tab's own mode is read where requests are answered,
@@ -34,7 +34,7 @@ use eitri_core::keymap::TabAction;
 use eitri_core::layout::Direction;
 use eitri_core::lua::agent::AgentRegistration;
 use eitri_core::project_trust::Profile;
-use eitri_core::saved_tabs::{SavedTabs, TabMemory};
+use eitri_core::saved_tabs::{SavedTabs, TabWriter};
 use eitri_core::tab_restore::{RestoreOffer, RestorePolicy, RestoreRun};
 use eitri_core::tab_set::{
     AgentId, AwaitingTrust, BypassPolicy, DeferredStart, FirstTurn, PendingHandoff, PendingStart, RestoreConnect,
@@ -102,6 +102,11 @@ const SESSION_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_se
 /// session nobody is looking at.
 const CONNECT_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long a close waits for the saved tabs' last write. A write is a small file renamed over the old one,
+/// milliseconds even on a network file system; a disk that hangs longer is left, and since the rename comes
+/// last the previous file stays whole.
+const SAVED_TABS_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How often the main loop looks at a close that is running on a worker. A `try_recv` and an
 /// `Instant::elapsed`, so the interval only sets how long the process lingers past a teardown that
 /// has already finished -- not how much work the main loop does.
@@ -155,6 +160,23 @@ fn watched<T: 'static>(
     what: &'static str,
     rx: mpsc::Receiver<T>,
     backstop: std::time::Duration,
+    on_value: impl FnMut(T) -> Vec<Watched> + 'static,
+) -> Watched {
+    watched_abandoning(
+        what,
+        rx,
+        backstop,
+        "whatever is left of it -- possibly a live `claude`, sidecar or `node` -- is being abandoned",
+        on_value,
+    )
+}
+
+/// [`watched`], saying `abandoned` (what is left behind when the backstop passes) in its log line.
+fn watched_abandoning<T: 'static>(
+    what: &'static str,
+    rx: mpsc::Receiver<T>,
+    backstop: std::time::Duration,
+    abandoned: &'static str,
     mut on_value: impl FnMut(T) -> Vec<Watched> + 'static,
 ) -> Watched {
     let started = std::time::Instant::now();
@@ -173,8 +195,7 @@ fn watched<T: 'static>(
                 }
                 CloseWatch::Expired => eprintln!(
                     "[agent_panel] {what} had still not finished {}s after the window closed; the \
-                     process is exiting anyway and whatever is left of it -- possibly a live `claude`, \
-                     sidecar or `node` -- is being abandoned",
+                     process is exiting anyway and {abandoned}",
                     backstop.as_secs()
                 ),
             }
@@ -414,9 +435,44 @@ impl Retiring {
         done
     }
 
-    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.connects.is_empty() && self.teardowns.is_empty()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static HOST_TEST_DOCUMENT: std::sync::LazyLock<PanelDocument> = std::sync::LazyLock::new(|| {
+    PanelDocument::new("<!doctype html><html><head></head><body><script type=\"module\">1</script></body></html>")
+});
+
+/// A host that opens nothing, for [`AgentPanelHandle::for_host_test`].
+#[cfg(any(test, feature = "test-support"))]
+struct NoHost;
+
+#[cfg(any(test, feature = "test-support"))]
+impl PanelHost for NoHost {
+    fn open_external(&self, _url: &str) {}
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl AgentPanelHandle {
+    /// A panel over `page` with one empty tab and no supervisor, disk, trust worker or review: what a
+    /// host's own tests drive, to see how its loop runs the tick.
+    pub fn for_host_test(page: Rc<dyn crate::panel_page::PageSurface>) -> Self {
+        let tabs =
+            eitri_core::tab_set::TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
+        let state = bare_state(&HOST_TEST_DOCUMENT, Rc::new(NoHost), tabs);
+        AgentPanelHandle::over(Rc::new(RefCell::new(state)), Some(Rc::new(PanelPage::new(page))))
+    }
+
+    /// Hands the panel a supervisor connection over `stream`, as a host's test plays the supervisor.
+    pub fn connect_test_supervisor(&self, stream: std::os::unix::net::UnixStream) {
+        self.state.borrow_mut().supervisor = crate::supervisor_client::SupervisorClient::over_stream(stream);
+    }
+
+    /// How many ticks have run.
+    pub fn ticks_run(&self) -> u64 {
+        self.state.borrow().ticks_run
     }
 }
 
@@ -477,6 +533,14 @@ struct AgentPanelState {
     /// **Also the guard on the tab set:** `shutdown` empties it with `TabSet::take_all`, after which
     /// `active_tab()` would panic, so every path that reaches the set checks this first.
     shutting_down: bool,
+    /// What tells the host to run the tick: raised by backends' folds and by every call into the panel.
+    /// `None` when the socket pair could not be made, and then the tick runs on its old steady cadence.
+    wake: Option<crate::panel_wake::PanelWake>,
+    /// When the last tick started: a wake runs the next one no sooner than [`AgentPanelHandle::TICK`] after.
+    last_tick: Option<std::time::Instant>,
+    /// Ticks that ran (past the close check), for a test counting how often an idle panel wakes.
+    #[cfg(any(test, feature = "test-support"))]
+    ticks_run: u64,
     /// The panel's current theme. Starts on `ThemeTokens::fallback()` and is replaced by
     /// `AgentPanelHandle::set_theme`. Held as tokens rather than an envelope because it feeds three
     /// things: the `ready` batch, the `<style>` inlined into every `load_html`, and the WebView's
@@ -568,7 +632,12 @@ struct AgentPanelState {
     /// `AgentPanelHandle::reload_document_by_hand`'s own doc says why.
     crash_guard: crate::webview_crash_guard::WebViewCrashGuard,
     /// Keeps `$XDG_STATE_HOME/eitri/tabs/<project>.json` in step with the tabs, once per tick.
-    tab_memory: TabMemory,
+    tab_memory: TabWriter,
+    /// The CLI's own session titles, read on a worker; a title that changed raises the wake and `hello`
+    /// is sent again.
+    titles: eitri_core::transcript_titles::TitleCache,
+    /// A title read since the last `hello`: it is sent again.
+    hello_titles_stale: bool,
     /// This project's conversation id (`agent::conversation_id_for_cwd` of its canonical root), which
     /// every saved tab carries.
     conversation_id: String,
@@ -678,6 +747,19 @@ pub struct AgentPanelHandle {
     /// does nothing, and the tab verbs refuse (`closing`), so `main.rs` flashes rather than opening
     /// tabs nobody can see.
     page: Option<Rc<PanelPage>>,
+    /// The wake's raise, held outside the state so raising it never needs the state's cell.
+    raise: Option<agent::UiWake>,
+}
+
+/// Where the window's link to `eitri-supervisor` stands ([`AgentPanelHandle::supervisor_link`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorLink {
+    /// The supervisor is being started and connected to, off the window's thread: ask again later.
+    Connecting,
+    /// Connected: an activation arrives on this descriptor, which stays open while it is reported.
+    Socket(std::os::fd::RawFd),
+    /// None now and none to come (none running, its connection gone, or the window closing).
+    Absent,
 }
 
 /// What `AgentPanelHandle::new` builds the panel's state from.
@@ -690,6 +772,12 @@ pub struct PanelInit {
 }
 
 impl AgentPanelHandle {
+    /// A handle over `state` and `page`, holding the state's wake.
+    fn over(state: Rc<RefCell<AgentPanelState>>, page: Option<Rc<PanelPage>>) -> Self {
+        let raise = state.borrow().wake.as_ref().map(crate::panel_wake::PanelWake::waker);
+        AgentPanelHandle { state, page, raise }
+    }
+
     /// With a page: connects to (or starts) the supervisor and builds the state, touching nothing on the
     /// page. Without one (WebKit's sandbox cannot start): the state alone, no pump and no supervisor
     /// client, and every page verb does nothing.
@@ -720,12 +808,13 @@ impl AgentPanelHandle {
             (None, None)
         };
         let state = Rc::new(RefCell::new(panel_state(init, supervisor, supervisor_pending, host)));
-        AgentPanelHandle { state, page }
+        AgentPanelHandle::over(state, page)
     }
 
     /// Paints the page's background and loads the themed document; called once the host listens for the
     /// page's messages.
     pub fn load_first_document(&self) {
+        self.wake();
         let Some(page) = &self.page else { return };
         let (tokens, document) = {
             let state = self.state.borrow();
@@ -737,6 +826,7 @@ impl AgentPanelHandle {
 
     /// A message the page posted (the `eitriAgent` handler).
     pub fn page_message(&self, raw: &str) {
+        self.wake();
         if let Some(page) = &self.page {
             handle_inbound_message(raw, &self.state, page);
         }
@@ -745,6 +835,7 @@ impl AgentPanelHandle {
     /// The page came on screen: whatever finished in the active tab while the chat was away has been
     /// seen (the tray's `agent •`).
     pub fn page_shown(&self) {
+        self.wake();
         if self.page.is_none() {
             return;
         }
@@ -765,6 +856,7 @@ impl AgentPanelHandle {
     /// address through `{:?}`, which escapes anything a terminal would act on) and flashed, so the
     /// click is not silently lost.
     pub fn link_clicked(&self, uri: Option<&str>) {
+        self.wake();
         let Some(page) = self.page.as_deref() else { return };
         match uri.and_then(clicked_link_url) {
             Some(url) => {
@@ -783,11 +875,66 @@ impl AgentPanelHandle {
 }
 
 impl AgentPanelHandle {
-    /// How often the host calls [`AgentPanelHandle::tick`]: fast enough that streaming text feels live
-    /// (a ~30-60fps cadence), not the coarse multi-second poll the first proof of concept used for a
-    /// much less latency-sensitive readout. The agent's own reader-thread channel is private, which is
-    /// why the panel polls at all.
+    /// The tick's steady cadence: fast enough that streaming text feels live (a ~30-60fps cadence). The
+    /// host runs the tick when [`run_tick`](Self::run_tick) and the wake say so, never sooner than this after
+    /// the last one, and on this cadence only while something it acts on cannot say when it is ready
+    /// (`crate::panel_wake`).
     pub const TICK: std::time::Duration = std::time::Duration::from_millis(33);
+
+    /// The descriptor the host watches for reading; when it is readable the host calls
+    /// [`take_wake`](Self::take_wake). `None`: there is no wake, and the host runs the tick every
+    /// [`TICK`](Self::TICK) as [`run_tick`](Self::run_tick) says.
+    pub fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.page.as_ref()?;
+        self.state.borrow().wake.as_ref().map(crate::panel_wake::PanelWake::fd)
+    }
+
+    /// Asks the host to run the tick soon: whatever a call into the panel changed is sent by that tick.
+    /// Cheap and idempotent until the host takes it.
+    pub fn wake(&self) {
+        if let Some(raise) = &self.raise {
+            raise();
+        }
+    }
+
+    /// The wake's descriptor was readable: takes what was raised and says when the tick is due -- now, or
+    /// one [`TICK`](Self::TICK) after the last tick if that is later, so a stream of folds is taken in the
+    /// batches a steady tick made. `None` when nothing was raised.
+    pub fn take_wake(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let state = self.state.borrow();
+        if !state.wake.as_ref().is_some_and(crate::panel_wake::PanelWake::take) {
+            return None;
+        }
+        Some(state.last_tick.map_or(now, |last| (last + Self::TICK).max(now)))
+    }
+
+    /// Runs the tick at `now` and says when the host runs it next: on the steady cadence while anything
+    /// it acts on is pending (and once more after that, for what a finished worker sent just before it
+    /// was seen to finish), at the typing cadence's next release, or only on the wake.
+    pub fn run_tick(&self, now: std::time::Instant) -> crate::panel_wake::NextTick {
+        use crate::panel_wake::NextTick;
+        let polled_before = needs_polling(&self.state.borrow());
+        self.state.borrow_mut().last_tick = Some(now);
+        if !self.tick() {
+            return NextTick::Stop;
+        }
+        let Some(page) = self.page.as_deref() else {
+            return NextTick::Stop;
+        };
+        let state = self.state.borrow();
+        let mut next = (polled_before || needs_polling(&state)).then_some(now + Self::TICK);
+        let paced = page
+            .pacer()
+            .borrow()
+            .next_deadline(std::time::Instant::now(), state.document_ready)
+            // Never at the moment this tick started: a deadline that would not move cannot spin the loop.
+            .map(|at| at.max(now + std::time::Duration::from_millis(1)));
+        next = match (next, paced) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        next.map_or(NextTick::OnWake, NextTick::At)
+    }
 
     /// The panel's single main-loop tick, over EVERY tab. Three jobs, in order:
     ///
@@ -809,6 +956,10 @@ impl AgentPanelHandle {
         // instead of ticking 30 times a second at nothing. See `AgentPanelState::shutting_down`.
         if state.borrow().shutting_down {
             return false;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            state.borrow_mut().ticks_run += 1;
         }
         // The chat's own host: unmapped while it is hidden or zoomed away.
         let panel_mapped = page.is_visible();
@@ -980,6 +1131,7 @@ impl AgentPanelHandle {
         poll_review_flow(state, page);
         // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
         poll_trust(state, page);
+        apply_title_reads(state);
         send_tabs_if_changed(state, page);
         remember_tabs(state);
         send_hello_if_open_sessions_changed(state, page);
@@ -1028,6 +1180,7 @@ impl AgentPanelHandle {
     /// The hold belongs to the host (`hold_until_done`): this handle is per-window, and the process
     /// the watch keeps alive belongs to the application that owns the loop this panel's timers run on.
     pub fn shutdown(&self) -> ShutdownWatch {
+        self.wake();
         // Queued words outlive the window as history.
         let texts = self.state.borrow_mut().tabs.take_every_queued_text();
         if !texts.is_empty() {
@@ -1041,9 +1194,13 @@ impl AgentPanelHandle {
                 }
             }
         }
+        // The tabs as they are now, whatever the last tick saw: the writer's last set, written before the
+        // close lets the process go.
+        remember_tabs(&self.state);
+        let last_write = self.state.borrow_mut().tab_memory.finish();
         let tabs = {
             let mut state = self.state.borrow_mut();
-            // Read by the 33ms pump, by `poll_activate` and by every path into the tab set, all of
+            // Read by the tick, by `poll_activate` and by every path into the tab set, all of
             // which keep running now that the loop outlives the window. See the field's own doc.
             state.shutting_down = true;
             state.tabs.take_all()
@@ -1067,6 +1224,16 @@ impl AgentPanelHandle {
             }
         }
         entries.extend(tear_down_all("every session tab's teardown", backends));
+        if let Some(rx) = last_write {
+            entries.push(watched_abandoning(
+                "the saved tabs' last write",
+                rx,
+                SAVED_TABS_BACKSTOP,
+                "the write is left unfinished: the saved-tabs file stays the one before it, whole, without this \
+                 window's last change to its tabs",
+                |()| Vec::new(),
+            ));
+        }
         // Tabs that left earlier, while the window stayed open: their teardowns and connects are
         // still running on workers nothing else would keep alive. Same holds and backstops as the tabs just taken.
         let retiring = std::mem::take(&mut self.state.borrow_mut().retiring);
@@ -1093,7 +1260,7 @@ impl AgentPanelHandle {
     /// be the wedge it exists to undo.
     ///
     /// **The invariant this rests on, stated because it is not obvious and a later change could
-    /// break it silently:** `take_ui_delivery()` CONSUMES events. Every envelope the 33ms pump
+    /// break it silently:** `take_ui_delivery()` CONSUMES events. Every envelope the tick
     /// dispatches between this document load and the new document's own `ready` is therefore gone --
     /// the old document is being torn down and the new one has no listener yet. Nothing is lost
     /// only because `Ready`'s handler answers from canonical state with a full snapshot rather than
@@ -1133,6 +1300,7 @@ impl AgentPanelHandle {
     /// never be reached, defeating the loop guard entirely. Only a genuinely manual recovery may
     /// re-arm it; the automatic path must keep counting toward the very loop it exists to detect.
     pub fn reload_document_by_hand(&self) {
+        self.wake();
         self.state.borrow_mut().crash_guard.reset();
         self.reload_document();
     }
@@ -1148,6 +1316,7 @@ impl AgentPanelHandle {
     /// for itself (WebKit's `TerminatedByApi`): that is no crash and must not count toward the guard's
     /// budget. Nothing on this panel's view ends its process today, but the Lua-panel's call site does.
     pub fn page_gone(&self, reason: &str) {
+        self.wake();
         // The page that reported BROWSE or INPUT is dead, and the give-up document never sends
         // `ready`: left as it was, `main.rs` would keep claiming `Ctrl+j`/`Ctrl+k` for a page that
         // cannot answer.
@@ -1191,12 +1360,29 @@ impl AgentPanelHandle {
         }
     }
 
+    /// Where the window's link to `eitri-supervisor` stands, for a host that waits on its socket instead
+    /// of polling [`poll_activate`](Self::poll_activate).
+    pub fn supervisor_link(&self) -> SupervisorLink {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return SupervisorLink::Absent;
+        }
+        match (&state.supervisor, &state.supervisor_pending) {
+            (Some(client), _) => client
+                .activate_fd()
+                .map_or(SupervisorLink::Absent, SupervisorLink::Socket),
+            (None, Some(_)) => SupervisorLink::Connecting,
+            (None, None) => SupervisorLink::Absent,
+        }
+    }
+
     /// Records `tokens` as the panel's current theme, repaints the WebView's own background, and
     /// pushes the variables to the live document.
     ///
     /// Safe to call before the page has loaded: the dispatch is guarded, and the `ready` handshake
     /// sends the recorded envelope anyway, so neither ordering loses it.
     pub fn set_theme(&self, tokens: &eitri_core::theme::ThemeTokens) {
+        self.wake();
         let payload = eitri_core::agent_bridge::serialize_theme_for_js(tokens);
         self.state.borrow_mut().theme = tokens.clone();
         let Some(page) = &self.page else { return };
@@ -1211,6 +1397,7 @@ impl AgentPanelHandle {
     /// handshake (whose `hello` theme payload comes from the same recorded field) pick the new
     /// size up automatically -- neither has a separate path that could fall out of sync with it.
     pub fn set_panel_font_size_px(&self, font_size_px: f32) {
+        self.wake();
         let tokens = {
             let mut tokens = self.state.borrow().theme.clone();
             tokens.font_size_px = font_size_px;
@@ -1227,6 +1414,7 @@ impl AgentPanelHandle {
     /// the panel's CSS px -- already converted from the editor's GTK logical px by
     /// `webkit_zoom::EditorRow`.
     pub fn set_editor_row_px(&self, editor_row_px: f32) {
+        self.wake();
         let tokens = {
             let mut tokens = self.state.borrow().theme.clone();
             tokens.editor_row_px = Some(editor_row_px);
@@ -1251,15 +1439,23 @@ impl AgentPanelHandle {
     /// The user pressed a key in the editor and it reached nvim (`NeovideEditorPane::
     /// connect_key_activity`). Starts, or extends, the typing window that paces the stream
     /// (`crate::panel_pacer`). O(1): it runs in the press's path.
+    ///
+    /// Wakes the tick only when the key began a typing window: a key inside one moves only the window's
+    /// end, which the tick already waits for, and a wake per keystroke would cost a tick per keystroke.
     pub fn note_editor_key(&self) {
-        if let Some(page) = &self.page {
-            page.pacer().borrow_mut().note_editor_key(std::time::Instant::now());
+        let began = self
+            .page
+            .as_ref()
+            .is_some_and(|page| page.pacer().borrow_mut().note_editor_key(std::time::Instant::now()));
+        if began {
+            self.wake();
         }
     }
 
     /// Whether the editor holds the window's keys (`pane_focus`). Losing them ends the typing window
     /// at once: the next tick releases what is held.
     pub fn set_editor_has_keys(&self, has_keys: bool) {
+        self.wake();
         if let Some(page) = &self.page {
             page.pacer().borrow_mut().set_editor_has_keys(has_keys);
         }
@@ -1267,6 +1463,7 @@ impl AgentPanelHandle {
 
     /// `agent.typing_cadence_hz` as `init.lua` left it (`None`: `"off"`), applied once after it ran.
     pub fn set_typing_cadence(&self, cadence_hz: Option<u32>) {
+        self.wake();
         if let Some(page) = &self.page {
             page.pacer().borrow_mut().set_cadence(cadence_hz);
         }
@@ -1275,6 +1472,7 @@ impl AgentPanelHandle {
     /// `agent.restore` as `init.lua` left it, applied once after it ran. `Off` also stops the tabs
     /// being remembered at all and forgets what the last window left.
     pub fn set_restore_policy(&self, policy: RestorePolicy) {
+        self.wake();
         let mut state = self.state.borrow_mut();
         state.restore_policy = policy;
         if policy == RestorePolicy::Off {
@@ -1288,6 +1486,7 @@ impl AgentPanelHandle {
     /// and every new one, start in it. Naming bypass here is the user's own answer to the question
     /// that is otherwise asked every time, so saved bypass tabs also come back in bypass unasked.
     pub fn set_default_mode(&self, mode: Option<SessionModeChoice>) {
+        self.wake();
         let mut state = self.state.borrow_mut();
         state.bypass_by_config = mode == Some(SessionModeChoice::Bypass);
         if let Some(mode) = mode {
@@ -1300,6 +1499,7 @@ impl AgentPanelHandle {
     /// `agent.default` as `init.lua` left it, applied once after it ran: every tab made without naming
     /// an agent, and the empty tab the window already has, run it.
     pub fn set_default_agent(&self, agent: AgentId) {
+        self.wake();
         let mut state = self.state.borrow_mut();
         state.tabs.apply_configured_agent(agent.clone());
         state.default_agent = agent;
@@ -1307,11 +1507,13 @@ impl AgentPanelHandle {
 
     /// `agent.codex.command` as `init.lua` left it (`None`: unset), read by every Codex start.
     pub fn set_codex_command(&self, command: Option<String>) {
+        self.wake();
         self.state.borrow_mut().codex_command = command;
     }
 
     /// The ACP agents `eitri.agent.register` accepted, applied once after `init.lua` ran.
     pub fn set_acp_agents(&self, agents: Vec<AgentRegistration>) {
+        self.wake();
         self.state.borrow_mut().acp_agents = agents;
     }
 
@@ -1320,11 +1522,13 @@ impl AgentPanelHandle {
     /// disabled leaves none, and a request for one says why. The hint only decides whether a
     /// finished turn writes to the status band.
     pub fn set_review(&self, review: ReviewConfig) {
+        self.wake();
         self.state.borrow_mut().apply_review(review);
     }
 
     /// Where a restore's one-line result goes. `main.rs` installs this once.
     pub fn on_toast(&self, hook: impl Fn(&str) + 'static) {
+        self.wake();
         self.state.borrow_mut().toast_hook = Some(Rc::new(hook));
     }
 
@@ -1332,6 +1536,7 @@ impl AgentPanelHandle {
     /// dims its mode block when it does not. Safe before the page has loaded for the same reason
     /// `set_theme` is: the dispatch is guarded, and `ready` re-sends the recorded value.
     pub fn set_pane_focused(&self, focused: bool) {
+        self.wake();
         self.state.borrow_mut().pane_focused = focused;
         if !focused {
             // A pending bypass prompt is about the tab the user was just looking
@@ -1348,6 +1553,7 @@ impl AgentPanelHandle {
     /// the page loads (the dispatch is guarded), in which case there is no composer yet and nothing
     /// happens.
     pub fn enter_input(&self) {
+        self.wake();
         self.drop_bypass_prompt();
         self.dispatch(eitri_core::agent_bridge::serialize_enter_input_for_js());
     }
@@ -1358,6 +1564,7 @@ impl AgentPanelHandle {
     /// behaviour of `Ctrl+l` going straight into the composer). Mirrors `enter_input` exactly
     /// except for the envelope it dispatches; safe before the page loads for the same reason.
     pub fn arrive(&self) {
+        self.wake();
         self.drop_bypass_prompt();
         self.dispatch(eitri_core::agent_bridge::serialize_arrive_for_js());
     }
@@ -1384,6 +1591,7 @@ impl AgentPanelHandle {
     /// `Ctrl+k` claimed in INPUT. Safe before the page loads for the same reason `arrive` is --
     /// there is no live mirror yet, so `main.rs`'s intercept never calls this before one exists.
     pub fn nav_key(&self, direction: NavKeyDirection) {
+        self.wake();
         self.drop_bypass_prompt();
         self.dispatch(serialize_nav_key_for_js(direction));
     }
@@ -1412,24 +1620,28 @@ impl AgentPanelHandle {
     /// The `?` overlay's rows (`serialize_keymap_for_js`): recorded for every later `ready`, and
     /// sent now to a document that is already up.
     pub fn set_keymap_help(&self, payload: String) {
+        self.wake();
         self.state.borrow_mut().keymap_help = Some(payload.clone());
         self.dispatch(payload);
     }
 
     /// `send-prefix`/`send-keys` with the panel holding the keys.
     pub fn literal_key(&self, key: &eitri_core::keymap::KeySpec) {
+        self.wake();
         self.drop_bypass_prompt();
         self.dispatch(eitri_core::agent_bridge::serialize_literal_key_for_js(&key.to_string()));
     }
 
     /// `prefix ?`: open the `?` overlay.
     pub fn open_keymap(&self) {
+        self.wake();
         self.drop_bypass_prompt();
         self.dispatch(eitri_core::agent_bridge::serialize_open_keymap_for_js());
     }
 
     /// `prefix :`: open the panel's `:` command line, which runs nothing.
     pub fn open_command_line(&self) {
+        self.wake();
         self.drop_bypass_prompt();
         self.dispatch(eitri_core::agent_bridge::serialize_open_command_line_for_js());
     }
@@ -1438,26 +1650,32 @@ impl AgentPanelHandle {
     /// is a one-line dispatch of the matching `serialize_hint_*_for_js` envelope; `shell::hint`
     /// drives the session, this handle only relays it to the WebView.
     pub fn hint_collect(&self, session_id: u64) {
+        self.wake();
         self.drop_bypass_prompt();
         self.dispatch(eitri_core::agent_bridge::serialize_hint_collect_for_js(session_id));
     }
     pub fn hint_show(&self, session_id: u64, labels: &[String]) {
+        self.wake();
         self.dispatch(eitri_core::agent_bridge::serialize_hint_show_for_js(session_id, labels));
     }
     pub fn hint_prefix(&self, session_id: u64, typed: &str) {
+        self.wake();
         self.dispatch(eitri_core::agent_bridge::serialize_hint_prefix_for_js(
             session_id, typed,
         ));
     }
     pub fn hint_land(&self, session_id: u64, index: usize) {
+        self.wake();
         self.dispatch(eitri_core::agent_bridge::serialize_hint_land_for_js(session_id, index));
     }
     pub fn hint_end(&self, session_id: u64) {
+        self.wake();
         self.dispatch(eitri_core::agent_bridge::serialize_hint_end_for_js(session_id));
     }
 
     /// Where the panel's two HINT messages go. `shell::hint::HintCoordinator` installs this once.
     pub fn on_hint(&self, hook: impl Fn(HintInbound) + 'static) {
+        self.wake();
         self.state.borrow_mut().hint_hook = Some(Rc::new(hook));
     }
 
@@ -1467,18 +1685,21 @@ impl AgentPanelHandle {
         &self,
         hook: impl Fn(&eitri_core::scratch::ScratchRequest) -> Result<(), String> + 'static,
     ) {
+        self.wake();
         self.state.borrow_mut().editor_request_hook = Some(Rc::new(hook));
     }
 
     /// The window's way to ask its editor something (the embedded pane, or the companion's link).
     /// `main.rs` and the companion window install this once.
     pub fn set_editor_rpc(&self, rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc>) {
+        self.wake();
         self.state.borrow_mut().editor_rpc = Some(rpc);
     }
 
     /// Who owns the review module in this window's editor, asked before every review request: the
     /// integrated window's own nvim, or the companion panel's channel. `None` from it: no editor.
     pub fn set_review_owner(&self, owner: impl Fn() -> Option<eitri_core::review_editor::Owner> + 'static) {
+        self.wake();
         self.state.borrow_mut().review_editor.set_owner(Rc::new(owner));
     }
 
@@ -1486,12 +1707,14 @@ impl AgentPanelHandle {
     /// user (shows and focuses it, or raises the user's own window). `main.rs` and the companion
     /// window install this once.
     pub fn on_review_open(&self, hook: impl Fn() + 'static) {
+        self.wake();
         self.state.borrow_mut().review_editor.set_opened(Rc::new(hook));
     }
 
     /// The editor went away, or its drafts were dropped: what the review overlay installed and
     /// drew there is forgotten, and an open still waiting on it is told it will not be answered.
     pub fn review_editor_lost(&self) {
+        self.wake();
         let outs = self.state.borrow_mut().review_flow.editor_lost();
         for out in outs {
             if let eitri_core::turn_review::Out::Envelope(payload) = out {
@@ -1503,6 +1726,7 @@ impl AgentPanelHandle {
     /// Where the panel stands with the editor beside it (companion mode), kept so a document that
     /// loads or reloads is told, and sent when it changes. Never called by the one-window mode.
     pub fn set_editor_link(&self, link: eitri_core::companion::attach::BandLink) {
+        self.wake();
         let payload = eitri_core::agent_bridge::serialize_editor_link_for_js(link.state, &link.text);
         {
             let mut state = self.state.borrow_mut();
@@ -1519,6 +1743,7 @@ impl AgentPanelHandle {
     /// Says so once if any edit was cut, and returns how many. It does not return the keys to the
     /// chat: the editor left, so nothing should take the focus.
     pub fn editor_detached(&self) -> usize {
+        self.wake();
         let (ended, active) = {
             let mut state = self.state.borrow_mut();
             let ended = end_pending_edits(&mut state);
@@ -1544,12 +1769,14 @@ impl AgentPanelHandle {
     /// One line in the panel's band, in the notice's own style. Used by the companion window for what
     /// it cannot say any other way (a desktop it cannot move focus on).
     pub fn show_notice(&self, text: &str) {
+        self.wake();
         self.dispatch(eitri_core::agent_bridge::serialize_notice_for_js(text));
     }
 
     /// Called when a draft edited in nvim came back (or was discarded): the keys return to the
     /// chat. `main.rs` installs this once.
     pub fn on_editor_done(&self, hook: impl Fn() + 'static) {
+        self.wake();
         self.state.borrow_mut().editor_done_hook = Some(Rc::new(hook));
     }
 
@@ -1559,6 +1786,7 @@ impl AgentPanelHandle {
         &self,
         hook: impl Fn(eitri_core::attention::Attention, eitri_core::attention::Attention) + 'static,
     ) {
+        self.wake();
         self.state.borrow_mut().attention_hook = Some(Rc::new(hook));
     }
 
@@ -1567,6 +1795,7 @@ impl AgentPanelHandle {
     /// until `main.rs` installs one, which is why `InboundMessage::TabVerb` can be refused.
     /// `main.rs` installs this once.
     pub fn on_tab_verb(&self, hook: impl Fn(TabAction) + 'static) {
+        self.wake();
         self.state.borrow_mut().tab_verb_hook = Some(Rc::new(hook));
     }
 
@@ -1575,6 +1804,7 @@ impl AgentPanelHandle {
     /// panel never intercepted it. A `pane_nav` (`Ctrl+w h/j/k/l`) goes through the
     /// same hook, for it is the same move. `main.rs` installs this once.
     pub fn on_nav_fallthrough(&self, hook: impl Fn(Direction) + 'static) {
+        self.wake();
         self.state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(hook));
     }
 }
@@ -1603,12 +1833,14 @@ impl AgentPanelHandle {
     /// `prefix c`: opens a tab running the window's default agent (`agent.default`), selects it, and
     /// sends `tabs` -- nothing else: an empty tab has no state yet.
     pub fn new_tab(&self) {
+        self.wake();
         let agent = self.state.borrow().default_agent.clone();
         self.new_tab_for(agent);
     }
 
     /// [`new_tab`](Self::new_tab) for a named agent (`:tabnew <agent>`).
     pub fn new_tab_for(&self, agent: AgentId) {
+        self.wake();
         let Some(page) = self.live_page() else {
             return;
         };
@@ -1618,16 +1850,19 @@ impl AgentPanelHandle {
 
     /// `prefix <digit>`. `false` when no tab has that number (the caller flashes).
     pub fn select_number(&self, n: u16) -> bool {
+        self.wake();
         self.switch_with(|tabs| tabs.select_number(n))
     }
 
     /// `prefix n` (+1) / `p` (-1), wrapping.
     pub fn step(&self, delta: i32) -> bool {
+        self.wake();
         self.switch_with(|tabs| tabs.step(delta))
     }
 
     /// `prefix l`: the previously active tab.
     pub fn select_last(&self) -> bool {
+        self.wake();
         self.switch_with(eitri_core::tab_set::TabSet::select_last)
     }
 
@@ -1645,6 +1880,7 @@ impl AgentPanelHandle {
 
     /// `prefix ,`: the inline rename field on the active tab's label.
     pub fn begin_rename(&self) {
+        self.wake();
         if self.closing() {
             return;
         }
@@ -1659,6 +1895,7 @@ impl AgentPanelHandle {
 
     /// `prefix &`: the footer's y/n prompt for the active tab.
     pub fn confirm_close(&self) {
+        self.wake();
         if self.closing() {
             return;
         }
@@ -1678,6 +1915,7 @@ impl AgentPanelHandle {
     /// with one tab is simply nothing to do, the same as `prefix n`/`p` with one tab (unlike a verb naming a tab that
     /// does not exist, which flashes).
     pub fn confirm_close_others(&self) {
+        self.wake();
         if self.closing() {
             return;
         }
@@ -1691,6 +1929,7 @@ impl AgentPanelHandle {
 
     /// `prefix w`.
     pub fn open_chooser(&self) {
+        self.wake();
         if self.closing() {
             return;
         }
@@ -1704,6 +1943,7 @@ impl AgentPanelHandle {
 
     /// `prefix i`: the active tab's detail popover.
     pub fn open_detail(&self) {
+        self.wake();
         if self.closing() {
             return;
         }
@@ -1718,6 +1958,7 @@ impl AgentPanelHandle {
     /// The tray chip, `prefix a`: switches to the tab holding the oldest pending card and puts the
     /// panel's cursor on it. `false` when no tab holds a card.
     pub fn focus_oldest_card(&self) -> bool {
+        self.wake();
         let Some(page) = self.live_page() else {
             return false;
         };
@@ -1766,6 +2007,7 @@ impl AgentPanelHandle {
     /// Refused, closing nothing, while a tab is being handed off to a terminal: `close_tab` refuses
     /// that tab, and a kill that closed the others and left it would not be a kill.
     pub fn close_every_tab(&self) -> Result<usize, &'static str> {
+        self.wake();
         let Some(page) = self.live_page() else {
             return Ok(0);
         };
@@ -1912,6 +2154,8 @@ fn panel_state(
     let canonical_root = project_dir.canonicalize().unwrap_or_else(|_| project_dir.clone());
     let mut tabs = eitri_core::tab_set::TabSet::new(backend_kind, mode);
     tabs.set_rules(rules);
+    let wake = panel_wake(&mut tabs);
+    let titles = eitri_core::transcript_titles::TitleCache::new(wake.as_ref().map(crate::panel_wake::PanelWake::waker));
     // Before anything review-related, and whatever the backend or `review.enabled` say: another
     // window's revert has to see this window, and this window's running turns.
     hold_window_presence(
@@ -1940,7 +2184,9 @@ fn panel_state(
         trust,
         spawner: Spawner::Real,
         tabs,
-        tab_memory: TabMemory::new(tabs_dir, project_dir.clone()),
+        tab_memory: TabWriter::new(tabs_dir, project_dir.clone()),
+        titles,
+        hello_titles_stale: false,
         conversation_id: agent::conversation_id_for_cwd(&canonical_root),
         restore_source,
         restore_policy: RestorePolicy::Offer,
@@ -1962,6 +2208,10 @@ fn panel_state(
         supervisor,
         supervisor_pending,
         shutting_down: false,
+        wake,
+        last_tick: None,
+        #[cfg(any(test, feature = "test-support"))]
+        ticks_run: 0,
         theme: eitri_core::theme::ThemeTokens::fallback(),
         keymap_help: None,
         pane_focused: false,
@@ -1993,6 +2243,122 @@ fn panel_state(
         nav_fallthrough_hook: None,
         crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
     }
+}
+
+/// A panel state with no supervisor, no disk, no trust worker and nothing installed: what the tests here,
+/// and a host's own tests through [`AgentPanelHandle::for_host_test`], build on.
+#[cfg(any(test, feature = "test-support"))]
+fn bare_state(
+    document: &'static PanelDocument,
+    host: Rc<dyn PanelHost>,
+    mut tabs: eitri_core::tab_set::TabSet,
+) -> AgentPanelState {
+    let wake = panel_wake(&mut tabs);
+    let titles = eitri_core::transcript_titles::TitleCache::new(wake.as_ref().map(crate::panel_wake::PanelWake::waker));
+    AgentPanelState {
+        document,
+        host,
+        tabs,
+        editor_context: Rc::new(|| None),
+        backend_kind: BackendKind::Sidecar,
+        project_dir: PathBuf::new(),
+        canonical_project_dir: String::new(),
+        prefs_dir: None,
+        supervisor: None,
+        supervisor_pending: None,
+        shutting_down: false,
+        wake,
+        last_tick: None,
+        #[cfg(any(test, feature = "test-support"))]
+        ticks_run: 0,
+        theme: eitri_core::theme::ThemeTokens::fallback(),
+        keymap_help: None,
+        pane_focused: false,
+        hint_hook: None,
+        attention_hook: None,
+        last_tabs_payload: None,
+        last_open_ids: Vec::new(),
+        scratch: None,
+        pending_edits: Vec::new(),
+        review_jobs: Vec::new(),
+        review_hints: Vec::new(),
+        shown_hints: Vec::new(),
+        review_hint: false,
+        review_roots: ReviewRoots {
+            state_home: None,
+            home: None,
+            canonical_root: PathBuf::new(),
+        },
+        editor_request_hook: None,
+        editor_rpc: None,
+        review_flow: eitri_core::turn_review::ReviewFlow::new(),
+        review_editor: crate::review_editor::ReviewEditor::default(),
+        editor_done_hook: None,
+        retiring: Retiring::default(),
+        history_dir: None,
+        rules_dir: None,
+        history: Vec::new(),
+        document_ready: false,
+        last_context_payload: None,
+        editor_link: None,
+        tab_verb_hook: None,
+        nav_mode: Cell::new(PanelKeys::Other),
+        nav_fallthrough_hook: None,
+        crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+        tab_memory: TabWriter::new(None, PathBuf::new()),
+        titles,
+        hello_titles_stale: false,
+        conversation_id: String::new(),
+        restore_source: None,
+        restore_policy: RestorePolicy::Offer,
+        bypass_by_config: false,
+        mode_remembered: false,
+        default_agent: AgentId::Claude,
+        codex_command: None,
+        acp_agents: Vec::new(),
+        start_notes: StartNotes::default(),
+        restore_run: None,
+        last_restore_offered: false,
+        last_hello_agent: AgentId::Claude,
+        toast_hook: None,
+        // No worker and no disk: every start goes on untrusted, as for a root with nothing to
+        // trust. A test about the question puts a real gate in its place.
+        trust: TrustGate::without_worker(PathBuf::new()),
+        spawner: Spawner::Real,
+    }
+}
+
+/// The window's wake, handed to every backend the tabs hold. A pair that cannot be made is logged, and the
+/// tick then runs on its steady cadence as it always did.
+fn panel_wake(tabs: &mut eitri_core::tab_set::TabSet) -> Option<crate::panel_wake::PanelWake> {
+    match crate::panel_wake::PanelWake::new() {
+        Ok(wake) => {
+            tabs.set_ui_wake(wake.waker());
+            Some(wake)
+        }
+        Err(e) => {
+            eprintln!(
+                "[agent_panel] the panel's wake could not be made ({e}); it ticks every {:?}",
+                AgentPanelHandle::TICK
+            );
+            None
+        }
+    }
+}
+
+/// Whether something the tick acts on can become ready without raising the wake, so the tick has to run on
+/// its steady cadence: a worker reporting through a channel (a connect, a teardown, the supervisor's
+/// connect, the trust check, a review or scratch job), a backend that does not announce its folds, or the
+/// review flow waiting on the editor.
+fn needs_polling(state: &AgentPanelState) -> bool {
+    state.wake.is_none()
+        || state.tabs.needs_polling()
+        || !state.retiring.is_empty()
+        || state.supervisor_pending.is_some()
+        || !state.pending_edits.is_empty()
+        || !state.review_jobs.is_empty()
+        || !state.review_flow.is_idle()
+        || state.trust.is_busy()
 }
 
 /// The window's trust gate over `root` (canonical), its record kept under the state home by the rule
@@ -2296,6 +2662,21 @@ fn poll_scratch_edits(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     }
 }
 
+/// Titles the worker read: `hello` is owed again after a change, and a tab resumed with its record's title
+/// takes the CLI's once it is known (the `tabs` envelope that follows carries it).
+fn apply_title_reads(state: &Rc<RefCell<AgentPanelState>>) {
+    let mut state_ref = state.borrow_mut();
+    let state_ref = &mut *state_ref;
+    if state_ref.titles.take_changed() {
+        state_ref.hello_titles_stale = true;
+    }
+    // Every tick, not only after a read: a read can land before the tab it titles is installed or knows
+    // its session, and a tab with no record's title left is skipped at no cost.
+    let cwd = state_ref.canonical_project_dir.clone();
+    let titles = &state_ref.titles;
+    state_ref.tabs.retitle_from(|session| titles.known_title(&cwd, session));
+}
+
 /// The tick's `tabs` envelope: sent only when it differs from the last one sent (a marker, a
 /// label, a state -- whatever `TabSet::tabs_payload` says).
 ///
@@ -2420,13 +2801,21 @@ fn send_hello_if_open_sessions_changed(state: &Rc<RefCell<AgentPanelState>>, pag
         // The greeting lists the active tab's agent's sessions, so a switch to a tab running another
         // agent changes it too, though no session id changed with it.
         let agent = state_ref.tabs.active_tab().agent().clone();
+        // A title the worker found since: the rows it names are out of date.
+        let titles_changed = std::mem::take(&mut state_ref.hello_titles_stale);
         if open == state_ref.last_open_ids
             && offered == state_ref.last_restore_offered
             && agent == state_ref.last_hello_agent
+            && !titles_changed
         {
             return;
         }
-        let mut greeting = BackendGreeting::for_agent(state_ref.backend_kind, &agent, state_ref.project_dir.clone());
+        let mut greeting = BackendGreeting::for_agent_titled(
+            state_ref.backend_kind,
+            &agent,
+            state_ref.project_dir.clone(),
+            eitri_core::agent_backend::Titles::Cached(&state_ref.titles),
+        );
         greeting.resumable.retain(|r| !open.contains(&r.provider_session_id));
         let offer = restore_offer(&state_ref);
         state_ref.last_open_ids = open;
@@ -2463,7 +2852,11 @@ fn restore_plan(state: &AgentPanelState) -> eitri_core::tab_restore::RestorePlan
     // records, and the saved Claude tabs are matched with Claude's whichever agent that tab runs. The
     // other agents' records are read beside them, each saved tab being matched only with a record its
     // own agent wrote.
-    let mut records = BackendGreeting::claude_sessions(state.backend_kind, &state.project_dir);
+    let mut records = BackendGreeting::claude_sessions_titled(
+        state.backend_kind,
+        &state.project_dir,
+        eitri_core::agent_backend::Titles::Cached(&state.titles),
+    );
     if !saved.external_tabs.is_empty() {
         records.extend(eitri_core::agent_backend::external_sessions(&state.project_dir));
     }
@@ -3395,7 +3788,8 @@ fn cancel_trust_question(state: &mut AgentPanelState, request_id: &str, tab: Tab
     out
 }
 
-/// Keeps the saved-tabs file in step with the tabs: once per tick, cheap when nothing changed.
+/// Keeps the saved-tabs file in step with the tabs: once per tick, cheap when nothing changed. A change is
+/// handed to the writer thread (`TabWriter`); nothing here touches the disk.
 fn remember_tabs(state: &Rc<RefCell<AgentPanelState>>) {
     let mut state_ref = state.borrow_mut();
     let state_ref = &mut *state_ref;
@@ -3404,18 +3798,7 @@ fn remember_tabs(state: &Rc<RefCell<AgentPanelState>>) {
         state_ref.restore_source = None;
     }
     let snapshot = state_ref.tabs.saved_snapshot(&state_ref.conversation_id);
-    match state_ref.tab_memory.observe(snapshot) {
-        Some(Err(e)) => eprintln!("[tabs] could not save the open tabs: {e}"),
-        Some(Ok(written)) => {
-            if let Some(aside) = written.set_aside {
-                eprintln!(
-                    "[tabs] an unusable saved-tabs file was set aside as {}",
-                    aside.display()
-                );
-            }
-        }
-        None => {}
-    }
+    state_ref.tab_memory.observe(snapshot);
 }
 
 /// The chooser's envelope (`prefix w`): the open tabs in number order, then every record open
@@ -3423,7 +3806,12 @@ fn remember_tabs(state: &Rc<RefCell<AgentPanelState>>) {
 fn chooser_payload(state: &AgentPanelState) -> String {
     // The records offered are the active tab's agent's, as the resume that follows starts in it.
     let agent = state.tabs.active_tab().agent().clone();
-    let greeting = BackendGreeting::for_agent(state.backend_kind, &agent, state.project_dir.clone());
+    let greeting = BackendGreeting::for_agent_titled(
+        state.backend_kind,
+        &agent,
+        state.project_dir.clone(),
+        eitri_core::agent_backend::Titles::Cached(&state.titles),
+    );
     let lease_name = agent.record_name();
     let open: Vec<ChooserTab> = state
         .tabs
@@ -4822,8 +5210,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 // closes.
                 reset_nav_mode_for_ready(state_ref);
                 let agent = state_ref.tabs.active_tab().agent().clone();
-                let greeting =
-                    BackendGreeting::for_agent(state_ref.backend_kind, &agent, state_ref.project_dir.clone());
+                let greeting = BackendGreeting::for_agent_titled(
+                    state_ref.backend_kind,
+                    &agent,
+                    state_ref.project_dir.clone(),
+                    eitri_core::agent_backend::Titles::Cached(&state_ref.titles),
+                );
                 let open = state_ref.tabs.open_session_ids();
                 let theme = eitri_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
                 let context = eitri_core::agent_bridge::context_summary(
@@ -5029,8 +5421,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                             .tabs
                             .get(target_tab)
                             .map_or(AgentId::Claude, |t| t.agent().clone());
-                        let greeting =
-                            BackendGreeting::for_agent(state_ref.backend_kind, &agent, state_ref.project_dir.clone());
+                        let greeting = BackendGreeting::for_agent_titled(
+                            state_ref.backend_kind,
+                            &agent,
+                            state_ref.project_dir.clone(),
+                            eitri_core::agent_backend::Titles::Cached(&state_ref.titles),
+                        );
                         // The rename and the title separately: the
                         // label puts a rename first, and folding the two into the
                         // title lost the rename whenever the record had both.
@@ -6435,10 +6831,10 @@ mod tests {
         let page = Rc::new(RecordingPage::default());
         let host = Rc::new(RecordingHost::default());
         state.borrow_mut().host = host.clone() as Rc<dyn PanelHost>;
-        let handle = AgentPanelHandle {
+        let handle = AgentPanelHandle::over(
             state,
-            page: Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
-        };
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
         (handle, page, host)
     }
 
@@ -6470,10 +6866,10 @@ mod tests {
     fn handle_with_strict_page() -> (AgentPanelHandle, Rc<StrictPage>) {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
         let page = Rc::new(StrictPage::default());
-        let handle = AgentPanelHandle {
+        let handle = AgentPanelHandle::over(
             state,
-            page: Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
-        };
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
         (handle, page)
     }
 
@@ -6778,6 +7174,361 @@ mod tests {
         );
     }
 
+    /// A ready panel with one empty tab and the page on screen, its first ticks run.
+    fn settled_panel() -> (AgentPanelHandle, Rc<RecordingPage>) {
+        let (handle, page, _host) = handle_with_recording_page();
+        page.visible.set(true);
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        let now = std::time::Instant::now();
+        handle.take_wake(now);
+        assert_eq!(
+            handle.run_tick(now),
+            crate::panel_wake::NextTick::OnWake,
+            "a settled panel waits"
+        );
+        (handle, page)
+    }
+
+    /// Waits up to 5 s for the wake's descriptor to have been raised, and takes it.
+    fn wait_for_wake(handle: &AgentPanelHandle) -> std::time::Instant {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(due) = handle.take_wake(std::time::Instant::now()) {
+                return due;
+            }
+            assert!(std::time::Instant::now() < deadline, "the wake never came");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Idle, the tick waits for the wake; every call into the panel and every page message raises it, and
+    /// the tick it brings sends what the call changed.
+    #[test]
+    fn a_settled_panel_waits_and_a_call_into_it_wakes_the_tick() {
+        let (handle, page) = settled_panel();
+        let now = std::time::Instant::now();
+        assert_eq!(handle.take_wake(now), None, "nothing raised");
+        let sent = page.sent.borrow().len();
+        handle.new_tab();
+        let due = handle.take_wake(now).expect("a call into the panel wakes it");
+        assert_eq!(handle.run_tick(due), crate::panel_wake::NextTick::OnWake);
+        assert!(
+            page.sent.borrow()[sent..].iter().any(|p| kind_of(p) == "tabs"),
+            "the new tab reached the page"
+        );
+        handle.page_message(r#"{"type":"ready","request_id":"r2"}"#);
+        assert!(handle.take_wake(now).is_some(), "a page message wakes it");
+    }
+
+    /// A wake runs the tick no sooner than one `TICK` after the last one, so a stream of folds is taken in
+    /// the batches a steady tick made; after a quiet stretch it runs at once.
+    #[test]
+    fn a_wake_runs_the_tick_no_sooner_than_one_tick_after_the_last() {
+        let (handle, _page) = settled_panel();
+        let at = std::time::Instant::now();
+        handle.run_tick(at);
+        handle.wake();
+        assert_eq!(
+            handle.take_wake(at + std::time::Duration::from_millis(5)),
+            Some(at + AgentPanelHandle::TICK)
+        );
+        handle.wake();
+        let later = at + std::time::Duration::from_secs(2);
+        assert_eq!(handle.take_wake(later), Some(later));
+    }
+
+    /// An agent's events wake the tick: the backend's fold raises the wake, and the tick it brings sends
+    /// them to the page. Then it waits again.
+    #[test]
+    fn a_backends_fold_wakes_the_tick_and_reaches_the_page() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-fold-wakes");
+        let (handle, page) = settled_panel();
+        let (provider, backend) = live_backend(&dir);
+        {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.active();
+            state.tabs.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        }
+        // A backend put in place without the wake is polled; the tick that finds it tells it about the
+        // wake (which raises it once), and runs once more.
+        let at = std::time::Instant::now();
+        assert_eq!(
+            handle.run_tick(at),
+            crate::panel_wake::NextTick::At(at + AgentPanelHandle::TICK)
+        );
+        let due = wait_for_wake(&handle);
+        assert_eq!(handle.run_tick(due), crate::panel_wake::NextTick::OnWake);
+        let sent = page.sent.borrow().len();
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        let due = wait_for_wake(&handle);
+        assert_eq!(
+            handle.run_tick(due),
+            crate::panel_wake::NextTick::OnWake,
+            "nothing left to poll"
+        );
+        assert!(
+            page.sent.borrow()[sent..].iter().any(|p| kind_of(p) == "events"),
+            "the fold reached the page: {:?}",
+            &page.sent.borrow()[sent..]
+        );
+        let tabs = handle.state.borrow_mut().tabs.take_all();
+        for mut tab in tabs {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    /// A connect reports through a channel nobody is told about: the tick runs on its steady cadence while
+    /// it is pending, collects it, runs once more, and then waits.
+    #[test]
+    fn a_pending_connect_is_polled_until_collected_and_once_more() {
+        use crate::panel_wake::NextTick;
+        let (handle, _page) = settled_panel();
+        let (connect_tx, result_rx) = mpsc::channel::<Result<AgentBackend, BackendError>>();
+        {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.active();
+            state.tabs.get_mut(tab).unwrap().backend = TabBackend::Starting(PendingStart {
+                request_id: "req-send".into(),
+                result_rx,
+                first_turn: None,
+                resume: None,
+                resumed_title: None,
+                resumed_name: None,
+            });
+        }
+        let at = std::time::Instant::now();
+        assert_eq!(
+            handle.run_tick(at),
+            NextTick::At(at + AgentPanelHandle::TICK),
+            "pending: polled"
+        );
+        drop(connect_tx);
+        let at = at + AgentPanelHandle::TICK;
+        assert_eq!(
+            handle.run_tick(at),
+            NextTick::At(at + AgentPanelHandle::TICK),
+            "collected: once more"
+        );
+        let at = at + AgentPanelHandle::TICK;
+        assert_eq!(handle.run_tick(at), NextTick::OnWake, "then it waits");
+    }
+
+    /// Each pending thing the tick polls keeps it on its steady cadence: a closed tab's teardown, the
+    /// supervisor's connect, the trust check, a review job, a scratch edit. None of them, nothing to poll.
+    #[test]
+    fn every_unannounced_pending_job_keeps_the_tick_polling() {
+        let (handle, _page) = settled_panel();
+        let polls = |handle: &AgentPanelHandle| needs_polling(&handle.state.borrow());
+        assert!(!polls(&handle));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        handle.state.borrow_mut().retiring.teardowns.push((None, done_rx));
+        assert!(polls(&handle), "a teardown");
+        done_tx.send(()).unwrap();
+        handle.state.borrow_mut().retiring.poll();
+        assert!(!polls(&handle));
+
+        let (supervisor_tx, supervisor_rx) = mpsc::channel();
+        handle.state.borrow_mut().supervisor_pending = Some(supervisor_rx);
+        assert!(polls(&handle), "the supervisor's connect");
+        drop(supervisor_tx);
+        handle.state.borrow_mut().supervisor_pending = None;
+
+        {
+            let mut state = handle.state.borrow_mut();
+            state.trust.wait_for(TabId(1), &Profile::Claude);
+            state.trust.begin_check(&Profile::Claude);
+        }
+        assert!(polls(&handle), "the trust check's answer");
+        let _ = handle.state.borrow_mut().trust.poll();
+        assert!(!polls(&handle));
+
+        let (_review_tx, review_rx) = mpsc::channel();
+        handle.state.borrow_mut().review_jobs.push(PendingReview {
+            request_id: "r".into(),
+            rx: review_rx,
+            clears_hint: None,
+        });
+        assert!(polls(&handle), "a review job");
+        handle.state.borrow_mut().review_jobs.clear();
+
+        let mut scratch = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        let (_request, edit) = scratch.prepare_edit("draft").unwrap();
+        handle.state.borrow_mut().pending_edits.push(edit);
+        assert!(polls(&handle), "a scratch edit");
+        for edit in std::mem::take(&mut handle.state.borrow_mut().pending_edits) {
+            edit.cleanup();
+        }
+        assert!(!polls(&handle));
+    }
+
+    /// The review flow's work (here: the recovery journal read it starts once a document is ready and a
+    /// review exists) reports through a worker nobody is told about: the tick runs on its steady cadence
+    /// until the flow is idle, and then waits.
+    #[test]
+    fn a_busy_review_flow_keeps_the_tick_polling_until_it_is_idle() {
+        use crate::panel_wake::NextTick;
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let project = agent::state_dirs::test_workspace_dir("panel-review-flow-polls");
+        let review_dir = agent::state_dirs::test_workspace_dir("panel-review-flow-polls-store");
+        let (handle, _page) = settled_panel();
+        {
+            let mut state = handle.state.borrow_mut();
+            let state = &mut *state;
+            let options = eitri_core::turn_review::ReviewOptions {
+                excludes: Some(None),
+                trim_every: std::time::Duration::MAX,
+                ..eitri_core::turn_review::ReviewOptions::default()
+            };
+            state
+                .tabs
+                .install_turn_review(eitri_core::turn_review::TurnReview::with_options(
+                    Some(review_dir),
+                    &project,
+                    options,
+                ))
+                .unwrap();
+            let _ = state.review_flow.document_ready(&state.tabs);
+            assert!(!state.review_flow.is_idle(), "the journal read is out");
+        }
+        assert!(needs_polling(&handle.state.borrow()), "a busy review flow is polled");
+        let mut at = std::time::Instant::now();
+        let deadline = at + std::time::Duration::from_secs(10);
+        loop {
+            let next = handle.run_tick(at);
+            if handle.state.borrow().review_flow.is_idle() && !needs_polling(&handle.state.borrow()) {
+                break;
+            }
+            assert_eq!(next, NextTick::At(at + AgentPanelHandle::TICK), "polled while busy");
+            assert!(std::time::Instant::now() < deadline, "the review flow never went idle");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            at += AgentPanelHandle::TICK;
+        }
+        // The tick that saw it go idle asked for one more; the one after waits.
+        let next = handle.run_tick(at + AgentPanelHandle::TICK);
+        assert_eq!(next, NextTick::OnWake);
+    }
+
+    /// The typing cadence's deadlines: the first key of a typing window wakes the tick, which tells the
+    /// page and is due again at the window's end; later keys wake nothing.
+    #[test]
+    fn the_typing_cadence_names_when_the_tick_is_due() {
+        use crate::panel_wake::NextTick;
+        let (handle, page) = settled_panel();
+        handle.set_typing_cadence(Some(2));
+        handle.set_editor_has_keys(true);
+        let at = std::time::Instant::now();
+        handle.take_wake(at);
+        handle.run_tick(at);
+        handle.note_editor_key();
+        let due = handle
+            .take_wake(std::time::Instant::now())
+            .expect("the first key wakes the tick");
+        handle.note_editor_key();
+        assert_eq!(
+            handle.take_wake(std::time::Instant::now()),
+            None,
+            "a later key does not"
+        );
+        let sent = page.sent.borrow().len();
+        let NextTick::At(end) = handle.run_tick(due) else {
+            panic!("the window's end is due")
+        };
+        assert!(
+            page.sent.borrow()[sent..].iter().any(|p| p.contains("\"typing\":true")),
+            "the page was told"
+        );
+        assert!(end > due && end <= std::time::Instant::now() + eitri_core::panel_cadence::TYPING_WINDOW);
+        std::thread::sleep(end.saturating_duration_since(std::time::Instant::now()));
+        let next = handle.run_tick(end);
+        assert!(
+            page.sent.borrow().iter().any(|p| p.contains("\"typing\":false")),
+            "the end was told"
+        );
+        assert_eq!(next, NextTick::OnWake);
+    }
+
+    /// The close stops the tick for good.
+    #[test]
+    fn the_close_stops_the_tick() {
+        let (handle, _page) = settled_panel();
+        let _ = handle.shutdown();
+        assert!(
+            handle.take_wake(std::time::Instant::now()).is_some(),
+            "the close wakes it"
+        );
+        assert_eq!(
+            handle.run_tick(std::time::Instant::now()),
+            crate::panel_wake::NextTick::Stop
+        );
+    }
+
+    /// Every call a host makes into the panel raises the wake, so what it changed is sent; only reads and
+    /// the scheduling calls themselves do not. A new `pub fn` on the handle must choose.
+    #[test]
+    fn every_call_into_the_panel_wakes_the_tick() {
+        use eitri_core::source_scan as scan;
+        const QUIET: &[&str] = &[
+            "new",
+            "tick",
+            "run_tick",
+            "wake",
+            "wake_fd",
+            "take_wake",
+            "poll_activate",
+            "supervisor_link",
+            "panel_keys",
+            "nav_intercept",
+            "attention",
+            "newest_card_label",
+            "running_count",
+            "queued_count",
+        ];
+        // Calls that wake only when what they changed needs the tick: a key that starts a typing window.
+        const WAKES_WHEN: &[&str] = &["note_editor_key"];
+        let sources = scan::rust_sources(&["panel/src"]);
+        let code = scan::code_only(&scan::file_with(&sources, "fn handle_inbound_message(").text);
+        let code = scan::without(&code, &scan::modules(&code, "tests"));
+        let mut checked = 0;
+        for (at, _) in code.match_indices("impl AgentPanelHandle {") {
+            // The test-support block builds handles for tests; it is not a call a host makes.
+            let line_before = code[..at].trim_end().rsplit('\n').next().unwrap_or("");
+            if line_before.trim_start().starts_with("#[cfg(any(test, feature") {
+                continue;
+            }
+            let body = &code[at..];
+            let end = body.find("\n}").expect("the impl block ends");
+            let body = &body[..end];
+            for (fn_at, _) in body.match_indices("\n    pub fn ") {
+                let rest = &body[fn_at + "\n    pub fn ".len()..];
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                let next = rest.find("\n    pub fn ").unwrap_or(rest.len());
+                let fn_body = &rest[..next];
+                checked += 1;
+                if QUIET.contains(&name.as_str()) {
+                    continue;
+                }
+                if WAKES_WHEN.contains(&name.as_str()) {
+                    assert!(
+                        fn_body.contains("self.wake()"),
+                        "`AgentPanelHandle::{name}` never wakes the tick"
+                    );
+                    continue;
+                }
+                // The first statement, so no early return can skip it.
+                let opened = fn_body.split_once('{').map_or("", |(_, body)| body);
+                assert!(
+                    opened.trim_start().starts_with("self.wake();"),
+                    "`AgentPanelHandle::{name}` does not wake the tick before anything else"
+                );
+            }
+        }
+        assert!(checked > 50, "only {checked} methods found");
+    }
+
     #[test]
     fn a_panel_with_no_page_never_ticks() {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
@@ -6842,71 +7593,9 @@ mod tests {
     /// and never touch the WebView, which lives on `AgentPanelHandle` and not on this struct --
     /// so no display is required to run them.
     fn state_for_hooks(tabs: TabSet) -> Rc<RefCell<AgentPanelState>> {
-        Rc::new(RefCell::new(AgentPanelState {
-            document: &TEST_DOCUMENT,
-            host: Rc::new(RecordingHost::default()),
-            tabs,
-            editor_context: Rc::new(|| None),
-            backend_kind: BackendKind::Sidecar,
-            project_dir: PathBuf::new(),
-            canonical_project_dir: String::new(),
-            prefs_dir: None,
-            supervisor: None,
-            supervisor_pending: None,
-            shutting_down: false,
-            theme: eitri_core::theme::ThemeTokens::fallback(),
-            keymap_help: None,
-            pane_focused: false,
-            hint_hook: None,
-            attention_hook: None,
-            last_tabs_payload: None,
-            last_open_ids: Vec::new(),
-            scratch: None,
-            pending_edits: Vec::new(),
-            review_jobs: Vec::new(),
-            review_hints: Vec::new(),
-            shown_hints: Vec::new(),
-            review_hint: false,
-            review_roots: ReviewRoots {
-                state_home: None,
-                home: None,
-                canonical_root: PathBuf::new(),
-            },
-            editor_request_hook: None,
-            editor_rpc: None,
-            review_flow: eitri_core::turn_review::ReviewFlow::new(),
-            review_editor: crate::review_editor::ReviewEditor::default(),
-            editor_done_hook: None,
-            retiring: Retiring::default(),
-            history_dir: None,
-            rules_dir: None,
-            history: Vec::new(),
-            document_ready: false,
-            last_context_payload: None,
-            editor_link: None,
-            tab_verb_hook: None,
-            nav_mode: Cell::new(PanelKeys::Other),
-            nav_fallthrough_hook: None,
-            crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
-            tab_memory: TabMemory::new(None, PathBuf::new()),
-            conversation_id: String::new(),
-            restore_source: None,
-            restore_policy: RestorePolicy::Offer,
-            bypass_by_config: false,
-            mode_remembered: false,
-            default_agent: AgentId::Claude,
-            codex_command: None,
-            acp_agents: Vec::new(),
-            start_notes: StartNotes::default(),
-            restore_run: None,
-            last_restore_offered: false,
-            last_hello_agent: AgentId::Claude,
-            toast_hook: None,
-            // No worker and no disk: every start goes on untrusted, as for a root with nothing to
-            // trust. A test about the question puts a real gate in its place.
-            trust: TrustGate::without_worker(PathBuf::new()),
-            spawner: spawn_nothing(),
-        }))
+        let mut state = bare_state(&TEST_DOCUMENT, Rc::new(RecordingHost::default()), tabs);
+        state.spawner = spawn_nothing();
+        Rc::new(RefCell::new(state))
     }
 
     /// A spawner whose every start fails at once (its sender is gone), so no test starts a process.
@@ -7030,10 +7719,7 @@ mod tests {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
         let host = Rc::new(RecordingHost::default());
         state.borrow_mut().host = host.clone() as Rc<dyn PanelHost>;
-        let handle = AgentPanelHandle {
-            state: state.clone(),
-            page: None,
-        };
+        let handle = AgentPanelHandle::over(state.clone(), None);
         let tabs_before: Vec<TabId> = state.borrow().tabs.tabs().iter().map(|t| t.id).collect();
 
         // Focus and arrival (`pane_focus`, `move_focus`, `arrive`), the prefix's panel keys.
@@ -8801,10 +9487,10 @@ mod tests {
         })
         .unwrap();
         let page = Rc::new(RecordingPage::default());
-        let handle = AgentPanelHandle {
-            state: state.clone(),
-            page: Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
-        };
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
         let last_hello = || {
             let sent = page.sent.borrow();
             let hello = sent.iter().rev().find(|e| kind_of(e) == "hello").expect("a hello");
@@ -9282,8 +9968,12 @@ mod tests {
     fn the_tick_keeps_the_saved_file_in_step_and_a_closing_window_leaves_it_alone() {
         let (state, dir) = restore_panel("restore-remember", &[], &[]);
         let files = agent::state_dirs::test_workspace_dir("restore-remember-files");
-        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
         remember_tabs(&state);
+        assert!(state
+            .borrow()
+            .tab_memory
+            .wait_written(std::time::Duration::from_secs(5)));
         assert!(
             std::fs::read_dir(&files).unwrap().next().is_none(),
             "an untouched launch writes nothing"
@@ -9299,6 +9989,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         remember_tabs(&state);
+        assert!(state
+            .borrow()
+            .tab_memory
+            .wait_written(std::time::Duration::from_secs(5)));
         let loaded = match eitri_core::saved_tabs::load(&files, &dir) {
             eitri_core::saved_tabs::Loaded::Saved(saved) => saved,
             other => panic!("{other:?}"),
@@ -9309,6 +10003,10 @@ mod tests {
 
         let taken = state.borrow_mut().tabs.take_all();
         remember_tabs(&state);
+        assert!(state
+            .borrow()
+            .tab_memory
+            .wait_written(std::time::Duration::from_secs(5)));
         assert_eq!(
             eitri_core::saved_tabs::load(&files, &dir),
             eitri_core::saved_tabs::Loaded::Saved(loaded)
@@ -9320,11 +10018,160 @@ mod tests {
         }
     }
 
-    fn handle_for(state: &Rc<RefCell<AgentPanelState>>) -> AgentPanelHandle {
-        AgentPanelHandle {
-            state: state.clone(),
-            page: None,
+    /// The close hands the writer the tabs as they are and holds the process until that write is on disk:
+    /// a session adopted after the last tick is still kept.
+    #[test]
+    fn the_close_waits_for_the_last_saved_tabs_write() {
+        let (state, dir) = restore_panel("restore-close", &[], &[]);
+        let files = agent::state_dirs::test_workspace_dir("restore-close-files");
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
+        let tab = state.borrow().tabs.active();
+        let (provider, backend) = live_backend(&dir);
+        state.borrow_mut().tabs.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.open_session("s-closing", &dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.borrow().tabs.get(tab).unwrap().provider_session_id().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the session id never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // No tick ran since: the close itself hands the set over.
+        let mut watch = handle_for(&state).shutdown();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while watch.step(std::time::Instant::now()) {
+            assert!(std::time::Instant::now() < deadline, "the close never let go");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let loaded = match eitri_core::saved_tabs::load(&files, &dir) {
+            eitri_core::saved_tabs::Loaded::Saved(saved) => saved,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].provider_session_id, "s-closing");
+    }
+
+    /// Points `CLAUDE_CONFIG_DIR` at one disposable root for this whole test binary, and returns it.
+    ///
+    /// A process-wide variable set from a multi-threaded test binary, which this project normally
+    /// refuses (`agent::state_dirs`'s own module doc says so). It is set exactly ONCE, to a value that
+    /// never changes, from inside a `OnceLock` initializer, so no thread can observe it being two different
+    /// things; `eitri-core`'s test binary does the same for the same reason. Nothing else in this binary
+    /// reads a transcript, so any other test that reaches a transcript path finds an empty directory,
+    /// which is what it would have found anyway. The root lives under the agent crate's test state root,
+    /// which the next run prunes once this process is gone, so nothing is left behind for good.
+    fn a_claude_config_root() -> PathBuf {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root = agent::state_dirs::redirect_state_to_a_test_root().join("claude-config");
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            std::env::set_var("CLAUDE_CONFIG_DIR", &root);
+            root
+        })
+        .clone()
+    }
+
+    /// `hello` names a row by its record's own title at once, and the CLI's own title, read on the
+    /// title worker, arrives with a wake and a second `hello`; the window never read the transcript.
+    #[test]
+    fn the_clis_title_reaches_hello_after_the_worker_read_it() {
+        a_claude_config_root();
+        let (state, dir) = restore_panel("titles-later", &[], &["s-titled"]);
+        let transcript = agent::transcript::transcript_path(&dir.to_string_lossy(), "s-titled").unwrap();
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{\"type\":\"ai-title\",\"aiTitle\":\"the CLI's title\"}\n").unwrap();
+        let page = Rc::new(RecordingPage::default());
+        page.visible.set(true);
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
+        let titles = |page: &RecordingPage| -> Vec<String> {
+            page.sent
+                .borrow()
+                .iter()
+                .filter(|p| kind_of(p) == "hello")
+                .map(|p| {
+                    let hello: serde_json::Value = serde_json::from_str(p).unwrap();
+                    hello["resumableSessions"][0]["title"].as_str().unwrap_or("").to_owned()
+                })
+                .collect()
+        };
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        assert_eq!(
+            titles(&page),
+            vec!["title of s-titled".to_string()],
+            "the record's own, at once"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while titles(&page).len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no second hello: {:?}",
+                titles(&page)
+            );
+            if let Some(due) = handle.take_wake(std::time::Instant::now()) {
+                handle.run_tick(due);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(titles(&page)[1], "the CLI's title");
+        let _ = std::fs::remove_file(transcript);
+    }
+
+    /// A tab restored with its record's title (the CLI's not read yet at launch) takes the CLI's title once
+    /// the worker has read it, and the `tabs` envelope carries it.
+    #[test]
+    fn a_restored_tab_takes_the_clis_title_when_it_is_read() {
+        a_claude_config_root();
+        let (state, dir) = restore_panel("titles-tab", &[], &["s-tabbed"]);
+        let transcript = agent::transcript::transcript_path(&dir.to_string_lossy(), "s-tabbed").unwrap();
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{\"type\":\"ai-title\",\"aiTitle\":\"the CLI's own\"}\n").unwrap();
+        let tab = state.borrow().tabs.active();
+        let (provider, backend) = live_backend(&dir);
+        {
+            let mut s = state.borrow_mut();
+            let t = s.tabs.get_mut(tab).unwrap();
+            t.backend = TabBackend::Live(backend);
+            t.title = Some("title of s-tabbed".into());
+            t.title_from_record = true;
+        }
+        let page = Rc::new(RecordingPage::default());
+        page.visible.set(true);
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
+        // The greeting asks the worker to read the session's transcript, which may land before the session
+        // has opened, as at a restore.
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        assert!(state.borrow().titles.wait_read(std::time::Duration::from_secs(5)));
+        provider.open_session("s-tabbed", &dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.borrow().tabs.get(tab).unwrap().title.as_deref() != Some("the CLI's own") {
+            assert!(std::time::Instant::now() < deadline, "the tab kept the record's title");
+            if let Some(due) = handle.take_wake(std::time::Instant::now()) {
+                handle.run_tick(due);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            page.sent
+                .borrow()
+                .iter()
+                .any(|p| kind_of(p) == "tabs" && p.contains("the CLI's own")),
+            "the tabs envelope carries it"
+        );
+        let _ = std::fs::remove_file(transcript);
+        for mut t in state.borrow_mut().tabs.take_all() {
+            if let TabBackend::Live(backend) = &mut t.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    fn handle_for(state: &Rc<RefCell<AgentPanelState>>) -> AgentPanelHandle {
+        AgentPanelHandle::over(state.clone(), None)
     }
 
     /// `agent.restore = "off"` is the whole feature off: nothing is offered, nothing is remembered.
@@ -9332,7 +10179,7 @@ mod tests {
     fn restore_off_offers_nothing_and_remembers_nothing() {
         let (state, dir) = restore_panel("restore-off", &[("s-1", None, Auto)], &["s-1"]);
         let files = agent::state_dirs::test_workspace_dir("restore-off-files");
-        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
         handle_for(&state).set_restore_policy(RestorePolicy::Off);
         assert!(state.borrow().restore_source.is_none());
         assert!(!state.borrow().tab_memory.is_enabled());
@@ -9348,6 +10195,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         remember_tabs(&state);
+        assert!(state
+            .borrow()
+            .tab_memory
+            .wait_written(std::time::Duration::from_secs(5)));
         assert!(std::fs::read_dir(&files).unwrap().next().is_none(), "nothing written");
         for mut tab in state.borrow_mut().tabs.take_all() {
             if let TabBackend::Live(backend) = &mut tab.backend {
@@ -10401,9 +11252,9 @@ mod tests {
         ));
         let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
         let files = agent::state_dirs::test_workspace_dir("trust-restore-escape-files");
-        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
         let both = vec![("s-1".to_string(), Some("api".to_string())), ("s-2".to_string(), None)];
-        remember_tabs(&state);
+        remember_tabs_written(&state);
         assert_eq!(saved_file_sessions(&files, &dir), both, "kept while the question waits");
 
         let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
@@ -10412,7 +11263,7 @@ mod tests {
         assert!(resumes.asked.is_empty(), "nothing was resumed");
         // A session started afterwards is written beside them, not over them.
         let (other, _provider) = start_session_in_new_tab(&state, &dir, "s-new");
-        remember_tabs(&state);
+        remember_tabs_written(&state);
         let mut with_new = both.clone();
         with_new.push(("s-new".to_string(), None));
         assert_eq!(saved_file_sessions(&files, &dir), with_new, "kept after it is put off");
@@ -10444,7 +11295,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
         let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-escape-files");
-        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
         state.borrow_mut().document_ready = true;
         let from = state.borrow().tabs.active();
         let mut resumes = FakeResumes::default();
@@ -10454,18 +11305,28 @@ mod tests {
             "no bypass tab, so no question"
         );
         let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
-        remember_tabs(&state);
+        remember_tabs_written(&state);
         assert!(
             std::fs::read_dir(&files).unwrap().next().is_none(),
             "the file is not written while it waits with nothing else to save"
         );
         let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
-        remember_tabs(&state);
+        remember_tabs_written(&state);
         assert!(std::fs::read_dir(&files).unwrap().next().is_none(), "nor after");
         let s = state.borrow();
         assert!(s.tabs.is_pristine(), "the tab is empty again");
         assert!(restore_is_on_offer(&s), "the same key can ask again");
+    }
+
+    /// `remember_tabs`, then waits until the writer thread has written what it was handed, so the test
+    /// can read the file.
+    fn remember_tabs_written(state: &Rc<RefCell<AgentPanelState>>) {
+        remember_tabs(state);
+        assert!(state
+            .borrow()
+            .tab_memory
+            .wait_written(std::time::Duration::from_secs(5)));
     }
 
     /// The saved file as the window last wrote it: each Claude session with its name.
@@ -10514,7 +11375,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
         let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-other-files");
-        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
         state.borrow_mut().document_ready = true;
         let from = state.borrow().tabs.active();
         let mut resumes = FakeResumes::default();
@@ -10525,7 +11386,7 @@ mod tests {
         let _ = with_resumes(&state, &mut resumes, || next_prompt(&state));
 
         let (other, _provider) = start_session_in_new_tab(&state, &dir, "s-new");
-        remember_tabs(&state);
+        remember_tabs_written(&state);
         let waiting = vec![("s-1".to_string(), Some("api".to_string())), ("s-2".to_string(), None)];
         let mut all = vec![("s-new".to_string(), None)];
         all.extend(waiting.clone());
@@ -10541,7 +11402,7 @@ mod tests {
         if let TabBackend::Live(backend) = &mut closed.backend {
             backend.shutdown();
         }
-        remember_tabs(&state);
+        remember_tabs_written(&state);
         assert_eq!(
             saved_file_sessions(&files, &dir),
             waiting,
@@ -10552,7 +11413,7 @@ mod tests {
         let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         assert!(resumes.asked.is_empty(), "nothing was resumed");
-        remember_tabs(&state);
+        remember_tabs_written(&state);
         assert_eq!(saved_file_sessions(&files, &dir), waiting, "kept after it is put off");
         let s = state.borrow();
         let failed: Vec<_> = s
@@ -10578,7 +11439,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
         let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-starting-files");
-        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
         state.borrow_mut().document_ready = true;
         let from = state.borrow().tabs.active();
         let mut resumes = FakeResumes::default();
@@ -10596,7 +11457,7 @@ mod tests {
         let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, nonce);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         assert!(state.borrow().restore_source.is_none(), "no longer on offer");
-        remember_tabs(&state);
+        remember_tabs_written(&state);
 
         provider.open_session("s-new", &dir);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -10604,7 +11465,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the session id never arrived");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        remember_tabs(&state);
+        remember_tabs_written(&state);
         let ids: Vec<String> = saved_file_sessions(&files, &dir)
             .into_iter()
             .map(|(id, _)| id)
@@ -10628,7 +11489,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
         let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-same-tick-files");
-        state.borrow_mut().tab_memory = TabMemory::new(Some(files.clone()), dir.clone());
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
         state.borrow_mut().document_ready = true;
         let from = state.borrow().tabs.active();
         let mut resumes = FakeResumes::default();
@@ -10643,7 +11504,7 @@ mod tests {
         let out = cancel_trust_question(&mut state.borrow_mut(), "c1", from, nonce);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         assert!(state.borrow().restore_source.is_none(), "no longer on offer");
-        remember_tabs(&state);
+        remember_tabs_written(&state);
         let ids: Vec<String> = saved_file_sessions(&files, &dir)
             .into_iter()
             .map(|(id, _)| id)

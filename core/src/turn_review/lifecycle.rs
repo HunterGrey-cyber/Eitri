@@ -523,7 +523,15 @@ pub struct TurnReview {
     /// tab after another, so their order within one pump, or across two neighbouring ones, is not
     /// known.
     pump: u64,
+    /// When the last poll ran: a window pumps only when something happened, so a quiet stretch counts as
+    /// the pumps a steady tick would have made in it (see [`poll_at`](Self::poll_at)).
+    last_poll: Option<std::time::Instant>,
 }
+
+/// The interval the window's pump ran on when "this pump or the one before" was chosen as the reach of an
+/// overlap. A quiet stretch longer than this counts as more pumps, so an end long before a start is not taken
+/// for one that may have come after it.
+pub const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
 impl TurnReview {
     /// The review of the project at `project_root` (canonical), its store under
@@ -553,6 +561,7 @@ impl TurnReview {
             sessions: BTreeMap::new(),
             tabs: BTreeMap::new(),
             pump: 0,
+            last_poll: None,
         }
     }
 
@@ -661,10 +670,29 @@ impl TurnReview {
         self.flush_marks();
     }
 
+    /// Whether a worker still owes an answer for a snapshot or a mark it was handed. A session's
+    /// numbering is read by its worker before its first task and sent ahead of that task's answer, so it
+    /// is covered too. Until this is false, [`poll`](Self::poll) has to be called again.
+    pub fn has_work_in_flight(&self) -> bool {
+        self.sessions.values().any(|s| s.outstanding > 0)
+    }
+
     /// Takes in what the workers finished, without waiting, and returns a hint for every turn whose
     /// end landed with both snapshots.
     pub fn poll(&mut self) -> Vec<ReviewHint> {
-        self.pump += 1;
+        self.poll_at(std::time::Instant::now())
+    }
+
+    /// [`poll`](Self::poll) at `now`. The pump count moves by one, and by one more for every whole
+    /// [`PUMP_INTERVAL`] past the first since the last poll: two pumps a quiet minute apart are not
+    /// neighbours, as two on a steady tick were not.
+    pub fn poll_at(&mut self, now: std::time::Instant) -> Vec<ReviewHint> {
+        let quiet = self.last_poll.map_or(0, |last| {
+            let intervals = now.saturating_duration_since(last).as_nanos() / PUMP_INTERVAL.as_nanos();
+            u64::try_from(intervals.saturating_sub(1)).unwrap_or(u64::MAX)
+        });
+        self.last_poll = Some(now);
+        self.pump = self.pump.saturating_add(1).saturating_add(quiet);
         let mut hints = Vec::new();
         while let Ok((session, done)) = self.done_rx.try_recv() {
             let Some(track) = self.sessions.get_mut(&session) else {

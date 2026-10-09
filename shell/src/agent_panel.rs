@@ -7,10 +7,13 @@ use eitri_core::agent_backend::BackendKind;
 use eitri_panel::agent_panel::{PanelInit, ShutdownWatch, CLOSE_WATCH_POLL};
 use eitri_panel::panel_document::PanelDocument;
 use eitri_panel::panel_page::{PageSurface, PanelHost, PanelPage};
+use eitri_panel::panel_wake::{NextTick, TickSchedule};
 use gtk4::prelude::*;
 use gtk4::Application;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Instant;
 use webkit6::prelude::*;
 use webkit6::{NetworkProxyMode, NetworkProxySettings, NetworkSession, UserContentManager, WebView};
 
@@ -250,14 +253,168 @@ pub(crate) fn build_agent_panel(
     (webview.upcast(), handle)
 }
 
-fn start_pump_timer(handle: AgentPanelHandle) {
-    gtk4::glib::timeout_add_local(AgentPanelHandle::TICK, move || {
-        if handle.tick() {
-            gtk4::glib::ControlFlow::Continue
-        } else {
-            gtk4::glib::ControlFlow::Break
+/// Runs the panel's tick when it says: a watch on its wake's descriptor, and one one-shot timer armed for
+/// the earliest moment anything asked for (`eitri_panel::panel_wake`). An idle panel is not woken at all.
+struct PumpTimer {
+    handle: AgentPanelHandle,
+    schedule: RefCell<TickSchedule>,
+    timer: RefCell<Option<gtk4::glib::SourceId>>,
+    watch: RefCell<Option<gtk4::glib::SourceId>>,
+    /// Each timer and the watch hold the pump through this, so it lives as long as something can run it.
+    me: std::rc::Weak<PumpTimer>,
+}
+
+impl PumpTimer {
+    /// The wake's descriptor is readable: take it and arm the timer if the tick is due sooner.
+    fn on_wake(&self) -> gtk4::glib::ControlFlow {
+        if let Some(due) = self.handle.take_wake(Instant::now()) {
+            let armed = self.schedule.borrow_mut().on_wake(due);
+            if let Some(at) = armed {
+                self.arm(at);
+            }
         }
+        gtk4::glib::ControlFlow::Continue
+    }
+
+    /// The timer fired: run the tick and arm what it asks for next.
+    fn on_timer(&self) {
+        *self.timer.borrow_mut() = None;
+        self.schedule.borrow_mut().fired();
+        let next = self.handle.run_tick(Instant::now());
+        if next == NextTick::Stop {
+            if let Some(watch) = self.watch.borrow_mut().take() {
+                watch.remove();
+            }
+            return;
+        }
+        let armed = self.schedule.borrow_mut().after_tick(next);
+        if let Some(at) = armed {
+            self.arm(at);
+        }
+    }
+
+    /// Replaces the armed timer with one for `at`.
+    fn arm(&self, at: Instant) {
+        if let Some(old) = self.timer.borrow_mut().take() {
+            old.remove();
+        }
+        let Some(pump) = self.me.upgrade() else { return };
+        let id = gtk4::glib::timeout_add_local_once(timer_wait(at, Instant::now()), move || pump.on_timer());
+        *self.timer.borrow_mut() = Some(id);
+    }
+}
+
+/// How long a GLib timer waits to fire at `at`: rounded UP to a whole millisecond, since GLib counts in
+/// milliseconds and drops the rest, and a timer that fires before a deadline costs a tick that finds nothing
+/// due and has to be armed again.
+fn timer_wait(at: Instant, now: Instant) -> std::time::Duration {
+    let nanos = at.saturating_duration_since(now).as_nanos();
+    std::time::Duration::from_millis(u64::try_from(nanos.div_ceil(1_000_000)).unwrap_or(u64::MAX))
+}
+
+fn start_pump_timer(handle: AgentPanelHandle) {
+    let Some(fd) = handle.wake_fd() else {
+        // No wake (no page, or the socket pair could not be made): the tick runs on its steady cadence.
+        gtk4::glib::timeout_add_local(AgentPanelHandle::TICK, move || {
+            if handle.tick() {
+                gtk4::glib::ControlFlow::Continue
+            } else {
+                gtk4::glib::ControlFlow::Break
+            }
+        });
+        return;
+    };
+    let pump = std::rc::Rc::new_cyclic(|me| PumpTimer {
+        handle,
+        schedule: RefCell::new(TickSchedule::new()),
+        timer: RefCell::new(None),
+        watch: RefCell::new(None),
+        me: me.clone(),
     });
+    let watched = {
+        let pump = pump.clone();
+        neovide_editor::fd_watch::add_local(
+            fd,
+            gtk4::glib::IOCondition::IN | gtk4::glib::IOCondition::ERR | gtk4::glib::IOCondition::HUP,
+            gtk4::glib::ffi::G_PRIORITY_DEFAULT,
+            move |_| pump.on_wake(),
+        )
+    };
+    match watched {
+        Ok(watch) => *pump.watch.borrow_mut() = Some(watch),
+        Err(neovide_editor::fd_watch::NotOwner) => {
+            // Not on the main context's own thread, where nothing could watch the descriptor: the tick
+            // runs on its steady cadence, as it always did.
+            let handle = pump.handle.clone();
+            gtk4::glib::timeout_add_local(AgentPanelHandle::TICK, move || {
+                if handle.tick() {
+                    gtk4::glib::ControlFlow::Continue
+                } else {
+                    gtk4::glib::ControlFlow::Break
+                }
+            });
+            return;
+        }
+    }
+    // The first tick at once: whatever the window set up before the loop runs is sent by it.
+    pump.schedule.borrow_mut().on_wake(Instant::now());
+    pump.arm(Instant::now());
+}
+
+/// Raises the window when `eitri-supervisor` asks: `on_activate` runs for each request. A watch on the
+/// supervisor's socket once the panel has one, a look every 200 ms only while one is still being started and
+/// connected, and nothing at all when there is none -- a window with no supervisor used to look five times a
+/// second for its whole life.
+pub(crate) fn watch_supervisor(handle: AgentPanelHandle, on_activate: Rc<dyn Fn()>) {
+    use eitri_panel::agent_panel::SupervisorLink;
+    match handle.supervisor_link() {
+        SupervisorLink::Absent => {}
+        SupervisorLink::Connecting => {
+            gtk4::glib::timeout_add_local_once(SUPERVISOR_CONNECT_LOOK, move || watch_supervisor(handle, on_activate));
+        }
+        SupervisorLink::Socket(fd) => {
+            let watched = {
+                let handle = handle.clone();
+                let on_activate = on_activate.clone();
+                neovide_editor::fd_watch::add_local(
+                    fd,
+                    gtk4::glib::IOCondition::IN | gtk4::glib::IOCondition::ERR | gtk4::glib::IOCondition::HUP,
+                    gtk4::glib::ffi::G_PRIORITY_DEFAULT,
+                    move |_| {
+                        #[cfg(test)]
+                        SUPERVISOR_LOOKS.with(|looks| looks.set(looks.get() + 1));
+                        if handle.poll_activate() {
+                            on_activate();
+                        }
+                        // A connection that ended reads as readable for good: let go of it.
+                        match handle.supervisor_link() {
+                            SupervisorLink::Socket(_) => gtk4::glib::ControlFlow::Continue,
+                            SupervisorLink::Connecting | SupervisorLink::Absent => gtk4::glib::ControlFlow::Break,
+                        }
+                    },
+                )
+            };
+            if watched.is_err() {
+                // Not on the main context's own thread, where nothing could watch the socket: look on the
+                // timer, as the window always did.
+                gtk4::glib::timeout_add_local(SUPERVISOR_CONNECT_LOOK, move || {
+                    if handle.poll_activate() {
+                        on_activate();
+                    }
+                    gtk4::glib::ControlFlow::Continue
+                });
+            }
+        }
+    }
+}
+
+/// How often a window looks at a supervisor connection still being made, and at one it cannot watch.
+const SUPERVISOR_CONNECT_LOOK: std::time::Duration = std::time::Duration::from_millis(200);
+
+#[cfg(test)]
+thread_local! {
+    /// How often the supervisor watch ran, for the test that it is not woken while nothing arrives.
+    static SUPERVISOR_LOOKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// The panel's Content-Security-Policy: a floor the page cannot loosen, applied two ways -- as the
@@ -767,5 +924,132 @@ mod tests {
             let glib = gtk4::glib::base64_encode(&checksum.digest()).to_string();
             assert_eq!(eitri_panel::panel_csp::sha256_base64(data), glib);
         }
+    }
+
+    /// A page for the pump tests: visible, and it keeps what it is sent.
+    #[derive(Default)]
+    struct CountingPage {
+        sent: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl eitri_panel::panel_page::PageSurface for CountingPage {
+        fn send(&self, envelope_json: &str) {
+            self.sent.borrow_mut().push(envelope_json.to_owned());
+        }
+        fn is_visible(&self) -> bool {
+            true
+        }
+        fn load_document(&self, _html: &str, _base_uri: &str) {}
+        fn set_background(&self, _rgb: [u8; 3]) {}
+    }
+
+    /// Runs glib's default main context for `ms`.
+    fn iterate_for(ms: u64) {
+        let context = gtk4::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < deadline {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// An idle panel (a ready page, one empty tab, nothing happening) on the real pump and glib's loop:
+    /// how many ticks run in one second.
+    #[test]
+    fn an_idle_panel_is_not_ticked() {
+        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let context = gtk4::glib::MainContext::default();
+        let _owner = context.acquire().expect("glib's default main context");
+        let page = std::rc::Rc::new(CountingPage::default());
+        let handle = AgentPanelHandle::for_host_test(page.clone());
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        start_pump_timer(handle.clone());
+        iterate_for(300);
+        let before = handle.ticks_run();
+        iterate_for(1000);
+        let ticks = handle.ticks_run() - before;
+        eprintln!("idle panel: {ticks} ticks in 1 s");
+        assert!(ticks <= 1, "an idle panel ticked {ticks} times in a second");
+
+        // A call into the panel is still answered by a tick, at once, and then it is quiet again.
+        let sent = page.sent.borrow().len();
+        let before = handle.ticks_run();
+        handle.new_tab();
+        iterate_for(100);
+        assert!(handle.ticks_run() > before, "the call woke the tick");
+        assert!(page.sent.borrow().len() > sent, "and what it changed reached the page");
+        let before = handle.ticks_run();
+        iterate_for(500);
+        assert!(handle.ticks_run() - before <= 1, "quiet again");
+
+        // The close stops it for good.
+        let _watch = handle.shutdown();
+        iterate_for(100);
+        let before = handle.ticks_run();
+        handle.wake();
+        iterate_for(200);
+        assert_eq!(handle.ticks_run(), before, "nothing runs after the close");
+    }
+
+    /// The supervisor raise waits on its socket: a connected window is not woken while nothing arrives
+    /// (it looked five times a second), a request still raises it at once, and a supervisor that goes away
+    /// lets go of the watch. A window with no supervisor arms nothing.
+    #[test]
+    fn the_supervisor_raise_waits_on_its_socket() {
+        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let context = gtk4::glib::MainContext::default();
+        let _owner = context.acquire().expect("glib's default main context");
+        let handle = AgentPanelHandle::for_host_test(std::rc::Rc::new(CountingPage::default()));
+        assert_eq!(
+            handle.supervisor_link(),
+            eitri_panel::agent_panel::SupervisorLink::Absent
+        );
+        watch_supervisor(handle.clone(), std::rc::Rc::new(|| panic!("no supervisor, no raise")));
+
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        handle.connect_test_supervisor(ours);
+        let raised = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let raised = raised.clone();
+            watch_supervisor(handle.clone(), std::rc::Rc::new(move || raised.set(raised.get() + 1)));
+        }
+        SUPERVISOR_LOOKS.with(|looks| looks.set(0));
+        iterate_for(1000);
+        let looks = SUPERVISOR_LOOKS.with(|looks| looks.get());
+        eprintln!("supervisor raise: {looks} looks in 1 s with nothing sent");
+        assert_eq!(looks, 0);
+
+        use std::io::Write;
+        (&theirs).write_all(b"{\"type\":\"activate\"}\n").unwrap();
+        iterate_for(100);
+        assert_eq!(raised.get(), 1, "the request raised the window");
+
+        drop(theirs);
+        iterate_for(100);
+        let after_close = SUPERVISOR_LOOKS.with(|looks| looks.get());
+        iterate_for(300);
+        assert_eq!(
+            SUPERVISOR_LOOKS.with(|looks| looks.get()),
+            after_close,
+            "a closed connection is let go, not looked at forever"
+        );
+        assert_eq!(
+            handle.supervisor_link(),
+            eitri_panel::agent_panel::SupervisorLink::Absent
+        );
+    }
+
+    #[test]
+    fn a_timer_never_fires_before_its_deadline() {
+        let now = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(timer_wait(now + std::time::Duration::from_micros(33_400), now), ms(34));
+        assert_eq!(timer_wait(now + ms(33), now), ms(33), "a whole millisecond stays");
+        assert_eq!(timer_wait(now + std::time::Duration::from_nanos(1), now), ms(1));
+        assert_eq!(timer_wait(now, now + ms(5)), ms(0), "a deadline passed fires at once");
     }
 }

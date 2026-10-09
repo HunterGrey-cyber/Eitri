@@ -504,6 +504,8 @@ pub(crate) struct TrustGate {
     next_command_nonce: u64,
     /// Results made here rather than by the worker, delivered by the next `poll`.
     owed: Vec<GateEvent>,
+    /// Jobs handed to the worker whose answer `poll` has not taken yet: the worker answers each job once.
+    in_flight: usize,
 }
 
 impl TrustGate {
@@ -527,7 +529,7 @@ impl TrustGate {
     }
 
     /// A gate with no worker: the test reads the jobs it queues and hands it the results itself.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn detached(root: PathBuf) -> (TrustGate, mpsc::Receiver<Job>, DoneSender) {
         let (jobs_tx, jobs_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -548,13 +550,14 @@ impl TrustGate {
             command_shown: None,
             next_command_nonce: COMMAND_NONCE_BASE,
             owed: Vec::new(),
+            in_flight: 0,
         };
         (gate, jobs_rx, DoneSender::new(done_tx))
     }
 
     /// A gate whose worker never started, as when the thread cannot be spawned: every check sends
     /// its tabs on without the project's tiers, and every record or command fails. Touches no disk.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn without_worker(root: PathBuf) -> TrustGate {
         let (mut gate, _jobs, _done) = TrustGate::detached(root);
         gate.jobs = None;
@@ -599,6 +602,7 @@ impl TrustGate {
             command_shown: None,
             next_command_nonce: COMMAND_NONCE_BASE,
             owed: Vec::new(),
+            in_flight: 0,
         }
     }
 
@@ -614,7 +618,10 @@ impl TrustGate {
     fn queue(&mut self, job: Job) {
         let job = match self.jobs.as_ref() {
             Some(jobs) => match jobs.send(job) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.in_flight += 1;
+                    return;
+                }
                 Err(mpsc::SendError(job)) => job,
             },
             None => job,
@@ -654,6 +661,12 @@ impl TrustGate {
                 })
             }
         }
+    }
+
+    /// Whether `poll` has something coming: a job the worker has not answered yet, or a result made
+    /// here. The worker tells nobody when it answers, so the window keeps polling until this is false.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.in_flight > 0 || !self.owed.is_empty()
     }
 
     /// Queues a fresh check of the root for `profile`; returns its generation.
@@ -697,6 +710,8 @@ impl TrustGate {
         let mut routes: Vec<(usize, ProfileKey)> = Vec::new();
         let mut taken: Vec<(usize, ProfileKey, Fingerprint)> = Vec::new();
         while let Ok(Msg { seq, done, prompts }) = self.done.try_recv() {
+            // The worker answers each job with exactly one message.
+            self.in_flight = self.in_flight.saturating_sub(1);
             // Each result's prompts go in with its state; nothing else of this message uses them.
             let mut prompts = prompts;
             match done {
@@ -1622,13 +1637,14 @@ impl Preparer {
 
 /// The worker's end of the channel, for a test that plays the worker: what it sends is numbered and
 /// given its prompts as the worker would.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DoneSender {
     tx: mpsc::Sender<Msg>,
     preparer: std::cell::RefCell<Preparer>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl DoneSender {
     fn new(tx: mpsc::Sender<Msg>) -> DoneSender {
         DoneSender {
@@ -1637,6 +1653,7 @@ impl DoneSender {
         }
     }
 
+    #[cfg(test)]
     fn send(&self, done: Done) -> Result<(), mpsc::SendError<Msg>> {
         let msg = self.preparer.borrow_mut().wrap(done, None);
         self.tx.send(msg)
@@ -2171,6 +2188,34 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    /// The window keeps polling the gate while the worker owes an answer and may stop once it has none:
+    /// busy from the check's queueing until its result was polled, and a gate with no worker is busy only
+    /// until the results it made itself were polled.
+    #[test]
+    fn the_gate_is_busy_while_an_answer_is_owed() {
+        let fx = Fx::new("busy");
+        let hold = WorkerHold::closed();
+        let mut gate = fx.held(&hold);
+        assert!(!gate.is_busy(), "nothing queued");
+        gate.wait_for(A, &CLAUDE);
+        gate.begin_check(&CLAUDE);
+        assert!(gate.is_busy(), "the check is with the worker");
+        assert!(gate.poll().is_empty());
+        assert!(gate.is_busy(), "still with the worker");
+        hold.open();
+        drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Route(t, _) if *t == A))
+        });
+        assert!(!gate.is_busy(), "answered and taken");
+
+        let mut gate = TrustGate::without_worker(fx.root.clone());
+        gate.wait_for(A, &CLAUDE);
+        gate.begin_check(&CLAUDE);
+        assert!(gate.is_busy(), "a result made here waits for the poll");
+        assert!(!gate.poll().is_empty());
+        assert!(!gate.is_busy());
     }
 
     fn answer(gate: &mut TrustGate, view: &TrustPromptView, trust: bool) -> AnswerOutcome {

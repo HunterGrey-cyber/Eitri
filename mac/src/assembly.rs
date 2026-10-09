@@ -211,6 +211,7 @@ impl Shared {
                 println!("[mac] link: {} {}", band.state, band.text);
                 self.panel.set_editor_link(band);
             }
+            EditorEvent::ContextChanged => self.panel.wake(),
             EditorEvent::CancelDrafts => {
                 let cut = self.panel.editor_detached();
                 if cut > 0 {

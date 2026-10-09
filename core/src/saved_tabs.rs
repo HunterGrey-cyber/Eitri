@@ -14,7 +14,7 @@
 //! last writer wins; the session leases, not this file, are what stop two windows driving one
 //! session.
 //!
-//! **When it is written** is [`TabMemory`]'s job: whenever the set it is shown differs from the set
+//! **When it is written** is [`TabMemory`]'s job, run on its own thread by [`TabWriter`]: whenever the set it is shown differs from the set
 //! it last saw, and never because the window is closing -- closing closes every tab, and recording
 //! "no tabs" then would erase exactly what the next launch wants.
 
@@ -313,6 +313,210 @@ pub struct Written {
     pub set_aside: Option<PathBuf>,
 }
 
+/// [`TabMemory`] on a thread of its own, so the window's thread never touches the disk for it.
+///
+/// [`observe`](Self::observe) only compares the tabs with the last set handed over and, when they differ,
+/// leaves the new set for the thread, replacing one it has not taken yet: the last set wins, and since one
+/// thread writes them in the order it takes them, the file always ends at the newest. What a write did is
+/// logged by the thread. [`finish`](Self::finish) at the window's close hands over the last set and
+/// returns a receiver that reports once the thread has written it and ended, which the close watches
+/// under a backstop: a write is a temporary file renamed over the old one, so a process that leaves
+/// before it ends keeps the previous file whole.
+pub struct TabWriter {
+    /// `None`: nothing is ever written (no state directory, or remembering is off).
+    dir: Option<PathBuf>,
+    project_root: PathBuf,
+    /// The last set handed over, to hand over only a change.
+    last: SavedTabs,
+    /// Started at the first write.
+    worker: Option<WriterHandle>,
+    #[cfg(test)]
+    before_write: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+struct WriterHandle {
+    shared: std::sync::Arc<WriterShared>,
+    done: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+#[derive(Default)]
+struct WriterShared {
+    queue: std::sync::Mutex<WriterQueue>,
+    ready: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct WriterQueue {
+    next: Option<SavedTabs>,
+    /// Taken by the thread and being written now.
+    writing: bool,
+    /// No more sets come: the thread ends once `next` is written.
+    finished: bool,
+    /// Remembering was turned off: what is queued is dropped and nothing more is written.
+    off: bool,
+}
+
+impl TabWriter {
+    pub fn new(dir: Option<PathBuf>, project_root: PathBuf) -> Self {
+        TabWriter {
+            dir,
+            project_root,
+            last: SavedTabs::default(),
+            worker: None,
+            #[cfg(test)]
+            before_write: None,
+        }
+    }
+
+    /// Stops all writing, for good, a set still queued included.
+    pub fn disable(&mut self) {
+        self.dir = None;
+        if let Some(worker) = &self.worker {
+            let mut queue = worker.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.off = true;
+            queue.next = None;
+            worker.shared.ready.notify_all();
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.dir.is_some()
+    }
+
+    /// `now` is the window's tabs, or `None` while the window is closing and has none to show. Hands a
+    /// changed set to the writer and returns at once; touches no disk.
+    pub fn observe(&mut self, now: Option<SavedTabs>) {
+        let Some(dir) = self.dir.clone() else { return };
+        let Some(now) = now else { return };
+        if now == self.last {
+            return;
+        }
+        self.last = now.clone();
+        let Some(worker) = self.worker_for(dir) else { return };
+        let mut queue = worker.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.next = Some(now);
+        worker.shared.ready.notify_all();
+    }
+
+    /// No more sets come: the writer writes what it was last handed and ends. The receiver reports once it
+    /// has (or is gone when the thread died); `None` when no writer ever started, so nothing is owed.
+    pub fn finish(&mut self) -> Option<std::sync::mpsc::Receiver<()>> {
+        let worker = self.worker.as_mut()?;
+        {
+            let mut queue = worker.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.finished = true;
+            worker.shared.ready.notify_all();
+        }
+        worker.done.take()
+    }
+
+    /// Waits until the writer has written everything handed to it, for a test to read the file.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wait_written(&self, within: std::time::Duration) -> bool {
+        let Some(worker) = &self.worker else { return true };
+        let deadline = std::time::Instant::now() + within;
+        let mut queue = worker.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while queue.next.is_some() || queue.writing {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            queue = worker
+                .shared
+                .ready
+                .wait_timeout(queue, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
+    }
+
+    fn worker_for(&mut self, dir: PathBuf) -> Option<&WriterHandle> {
+        if self.worker.is_none() {
+            let shared = std::sync::Arc::new(WriterShared::default());
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let memory = TabMemory::new(Some(dir), self.project_root.clone());
+            let thread_shared = shared.clone();
+            #[cfg(test)]
+            let before_write = self.before_write.clone();
+            let spawned = std::thread::Builder::new()
+                .name("eitri-saved-tabs".into())
+                .spawn(move || {
+                    #[cfg(test)]
+                    let hook = move || {
+                        if let Some(hook) = &before_write {
+                            hook();
+                        }
+                    };
+                    #[cfg(not(test))]
+                    let hook = || {};
+                    write_loop(&thread_shared, memory, hook);
+                    let _ = done_tx.send(());
+                });
+            if let Err(e) = spawned {
+                eprintln!("[tabs] the saved-tabs writer could not start ({e}); the open tabs are not kept");
+                self.dir = None;
+                return None;
+            }
+            self.worker = Some(WriterHandle {
+                shared,
+                done: Some(done_rx),
+            });
+        }
+        self.worker.as_ref()
+    }
+}
+
+/// A writer dropped without [`TabWriter::finish`] (a window's state that went away some other way) still lets
+/// its thread end: it writes what it was last handed and returns. Nothing here waits for it.
+impl Drop for TabWriter {
+    fn drop(&mut self) {
+        if let Some(worker) = &self.worker {
+            let mut queue = worker.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.finished = true;
+            worker.shared.ready.notify_all();
+        }
+    }
+}
+
+/// The writer thread: takes the newest set, writes it outside the lock, and ends once finished and empty.
+fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl Fn()) {
+    loop {
+        let next = {
+            let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if queue.off {
+                    queue.writing = false;
+                    shared.ready.notify_all();
+                    return;
+                }
+                if let Some(next) = queue.next.take() {
+                    queue.writing = true;
+                    break next;
+                }
+                if queue.finished {
+                    return;
+                }
+                queue = shared.ready.wait(queue).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        before_write();
+        match memory.observe(Some(next)) {
+            Some(Err(e)) => eprintln!("[tabs] could not save the open tabs: {e}"),
+            Some(Ok(Written {
+                set_aside: Some(aside), ..
+            })) => eprintln!(
+                "[tabs] an unusable saved-tabs file was set aside as {}",
+                aside.display()
+            ),
+            Some(Ok(_)) | None => {}
+        }
+        let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.writing = false;
+        shared.ready.notify_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +685,131 @@ mod tests {
 
     fn memory(dir: &Path) -> TabMemory {
         TabMemory::new(Some(dir.to_path_buf()), root())
+    }
+
+    fn numbered(n: usize) -> SavedTabs {
+        SavedTabs {
+            tabs: (0..=n % 7)
+                .map(|i| tab(&format!("s-{n}-{i}"), None, SessionModeChoice::Auto))
+                .collect(),
+            active: 0,
+            ..SavedTabs::default()
+        }
+    }
+
+    /// The window's thread never waits for the disk: with the writer held inside a write, a hundred changes
+    /// are handed over at once, and when it is let go the file ends at the last of them, with the modes the
+    /// synchronous write had.
+    #[test]
+    fn the_writer_never_blocks_the_caller_and_the_last_set_wins() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ScratchDir::new("nv-saved-tabs", "writer");
+        let state = dir.join("state");
+        let mut writer = TabWriter::new(Some(state.clone()), root());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        {
+            let held = held.clone();
+            writer.before_write = Some(std::sync::Arc::new(move || {
+                if held.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(10));
+                }
+            }));
+        }
+        let started = std::time::Instant::now();
+        for n in 0..100 {
+            writer.observe(Some(numbered(n)));
+        }
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(200),
+            "100 hand-overs took {took:?}"
+        );
+        held.store(false, std::sync::atomic::Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        let done = writer.finish().expect("a writer ran");
+        done.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the last write and the end");
+        assert_eq!(load(&state, &root()), Loaded::Saved(numbered(99)));
+        let path = state.join(file_name(&root()));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    /// Each change reaches the disk in order: waiting between hand-overs, every set is what the file holds.
+    #[test]
+    fn the_writer_writes_each_change_in_order() {
+        let dir = ScratchDir::new("nv-saved-tabs", "writer-order");
+        let mut writer = TabWriter::new(Some(dir.to_path_buf()), root());
+        assert!(writer.finish().is_none(), "nothing written, nothing owed");
+        let mut writer = TabWriter::new(Some(dir.to_path_buf()), root());
+        writer.observe(Some(SavedTabs::default()));
+        assert!(writer.worker.is_none(), "no change, no writer");
+        for n in 0..20 {
+            writer.observe(Some(numbered(n)));
+            assert!(writer.wait_written(std::time::Duration::from_secs(5)));
+            assert_eq!(load(&dir, &root()), Loaded::Saved(numbered(n)));
+        }
+        writer.observe(None);
+        let done = writer.finish().unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            load(&dir, &root()),
+            Loaded::Saved(numbered(19)),
+            "a closing window writes nothing"
+        );
+    }
+
+    /// A writer dropped without `finish` ends its thread, after the last set it was handed, and the drop
+    /// itself does not wait.
+    #[test]
+    fn a_dropped_writer_ends_its_thread() {
+        let dir = ScratchDir::new("nv-saved-tabs", "writer-drop");
+        let mut writer = TabWriter::new(Some(dir.to_path_buf()), root());
+        writer.observe(Some(numbered(4)));
+        let done = writer.worker.as_mut().unwrap().done.take().unwrap();
+        let started = std::time::Instant::now();
+        drop(writer);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "the drop waited"
+        );
+        done.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the thread ended");
+        assert_eq!(load(&dir, &root()), Loaded::Saved(numbered(4)));
+    }
+
+    /// Turning remembering off drops a set still queued and writes nothing more.
+    #[test]
+    fn a_disabled_writer_drops_what_is_queued() {
+        let dir = ScratchDir::new("nv-saved-tabs", "writer-off");
+        let mut writer = TabWriter::new(Some(dir.to_path_buf()), root());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        writer.before_write = Some(std::sync::Arc::new(move || {
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10));
+        }));
+        writer.observe(Some(numbered(1)));
+        writer.observe(Some(numbered(2)));
+        writer.disable();
+        assert!(!writer.is_enabled());
+        writer.observe(Some(numbered(3)));
+        release_tx.send(()).unwrap();
+        let done = writer.finish().unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        // The write already under way may finish; the queued one and anything later never do.
+        match load(&dir, &root()) {
+            Loaded::Missing => {}
+            Loaded::Saved(saved) => assert_eq!(saved, numbered(1)),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -741,6 +1070,30 @@ mod measure {
         times.sort();
         eprintln!(
             "saved-tabs write in {}: median {:?}, p99 {:?}, max {:?}",
+            dir.display(),
+            times[100],
+            times[198],
+            times[199]
+        );
+        // The same changes through the writer: what the window's thread spends on each.
+        let mut writer = TabWriter::new(Some(dir.clone()), root.to_path_buf());
+        let mut times = Vec::new();
+        for i in 0..200 {
+            let now = SavedTabs {
+                tabs: (0..4).map(|t| tab(t + i % 2)).collect(),
+                active: 0,
+                external_tabs: Vec::new(),
+                active_external: None,
+            };
+            let started = std::time::Instant::now();
+            writer.observe(Some(now));
+            times.push(started.elapsed());
+            // Each change lands before the next, as the window's do.
+            assert!(writer.wait_written(std::time::Duration::from_secs(5)));
+        }
+        times.sort();
+        eprintln!(
+            "saved-tabs hand-over to the writer in {}: median {:?}, p99 {:?}, max {:?}",
             dir.display(),
             times[100],
             times[198],

@@ -67,7 +67,7 @@ pub struct SupervisorClient {
     last_sent_status: Option<AgentStatus>,
     /// Set once a write or read has failed, or the peer has cleanly closed. Short-circuits
     /// `send_status`/`poll_activate` so a dead supervisor doesn't cost a failed write attempt on
-    /// every 33ms pump tick for the rest of this session.
+    /// panel tick for the rest of this session.
     dead: bool,
 }
 
@@ -124,7 +124,7 @@ impl SupervisorClient {
     /// Connects to the well-known socket, spawning `eitri-supervisor` first if nothing is
     /// listening. Never blocks the caller for longer than one connect attempt: when a spawn is
     /// needed, the retry loop runs on a worker thread and the result arrives over the returned
-    /// channel, which `agent_panel`'s existing 33ms pump drains -- the same shape it already uses
+    /// channel, which `agent_panel`'s tick drains (it keeps polling while one is pending) -- the same shape it already uses
     /// for off-thread backend construction.
     ///
     /// Every failure degrades to "this window just doesn't appear in the dashboard", logged and
@@ -240,7 +240,7 @@ impl SupervisorClient {
     }
 
     /// Sends a `Status` message only if `status` differs from the last one actually sent --
-    /// called from `agent_panel.rs`'s existing 33ms pump timer, so without this dedup every tick
+    /// called from every run of `agent_panel.rs`'s tick, so without this dedup every tick
     /// would write to the socket regardless of whether anything changed.
     pub fn send_status(&mut self, status: AgentStatus) {
         if self.dead || self.last_sent_status == Some(status) {
@@ -258,6 +258,20 @@ impl SupervisorClient {
         } else {
             self.dead = true;
         }
+    }
+
+    /// The descriptor `poll_activate` reads, for a host that waits for it to be readable instead of
+    /// polling; `None` once the connection is dead. Its readability is the stream's own: `poll_activate`
+    /// drains every buffered line, so nothing is left behind in the reader's buffer unseen.
+    pub fn activate_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        (!self.dead).then(|| self.reader.get_ref().as_raw_fd())
+    }
+
+    /// A client over `stream`, registered as a window would be, for a host's own tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn over_stream(stream: UnixStream) -> Option<Self> {
+        Self::finish_connecting(stream, "test".into(), "test".into(), Path::new("/test"))
     }
 
     /// Non-blocking: returns `true` if a `SupervisorMessage::Activate` arrived since the last

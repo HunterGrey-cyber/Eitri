@@ -196,6 +196,11 @@ fn completed(turn: &str) -> AgentDomainEvent {
     }
 }
 
+/// The pump interval the overlap rule counts quiet gaps in.
+fn turn_review_pump_interval() -> Duration {
+    eitri_core::turn_review::lifecycle::PUMP_INTERVAL
+}
+
 /// Polls until `done` holds for the session's turns, or fails at 5 s.
 fn poll_until(review: &mut TurnReview, session: &str, what: &str, done: impl Fn(&[TurnRecord]) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -800,6 +805,10 @@ fn turns_never_runs_git() {
 
 #[test]
 fn two_tabs_overlapping_are_marked() {
+    // Pumps on a steady 33 ms tick, by the clock this test names: the wall clock between two calls
+    // would decide which pumps count as neighbours.
+    let at = Instant::now();
+    let pump = |n: u32| at + turn_review_pump_interval() * n;
     let scratch = Scratch::new("two-tabs");
     let jobs = Jobs::default();
     let mut review = scratch.review(&jobs);
@@ -808,8 +817,8 @@ fn two_tabs_overlapping_are_marked() {
     review.observe(1, "s1", &completed("a1"), now());
     review.observe(2, "s2", &completed("b1"), now());
     // Two pumps later: an end observed in the pump before may still have come after a start.
-    review.poll();
-    review.poll();
+    review.poll_at(pump(0));
+    review.poll_at(pump(1));
     review.observe(1, "s1", &started("a2"), now());
     review.observe(1, "s1", &completed("a2"), now());
     poll_until(&mut review, "s1", "tab 1's turns", |t| is_ok(t, "a1") && is_ok(t, "a2"));
@@ -825,13 +834,17 @@ fn two_tabs_overlapping_are_marked() {
 /// or neighbouring pumps, are in no known order: either may have come first.
 #[test]
 fn an_overlap_the_drain_order_hides_is_still_marked() {
+    // Pumps on a steady 33 ms tick, by the clock this test names: the wall clock between two calls
+    // would decide which pumps count as neighbours.
+    let at = Instant::now();
+    let pump = |n: u32| at + turn_review_pump_interval() * n;
     // Tab 1 drained first: its end is observed before tab 2's start in the same pump.
     let scratch = Scratch::new("drain-order");
     let jobs = Jobs::default();
     let mut review = scratch.review(&jobs);
-    review.poll();
+    review.poll_at(pump(0));
     review.observe(1, "s1", &started("a1"), now());
-    review.poll();
+    review.poll_at(pump(1));
     review.observe(1, "s1", &completed("a1"), now());
     review.observe(2, "s2", &started("b1"), now());
     review.observe(2, "s2", &completed("b1"), now());
@@ -845,17 +858,77 @@ fn an_overlap_the_drain_order_hides_is_still_marked() {
     let scratch = Scratch::new("drain-order-next");
     let jobs = Jobs::default();
     let mut review = scratch.review(&jobs);
-    review.poll();
+    review.poll_at(pump(2));
     review.observe(2, "s2", &started("b1"), now());
-    review.poll();
+    review.poll_at(pump(3));
     review.observe(2, "s2", &completed("b1"), now());
-    review.poll();
+    review.poll_at(pump(4));
     review.observe(1, "s1", &started("a1"), now());
     review.observe(1, "s1", &completed("a1"), now());
     poll_until(&mut review, "s1", "tab 1's turn", |t| is_ok(t, "a1"));
     poll_until(&mut review, "s2", "tab 2's turn", |t| is_ok(t, "b1"));
     assert!(turn(&review.turns("s1"), "a1").overlapped_tab);
     assert!(turn(&review.turns("s2"), "b1").overlapped_tab);
+}
+
+/// A window pumps only when something happened, so a quiet stretch counts as the pumps a steady tick
+/// would have made in it: an end observed a quiet second before another tab's start is not taken for one
+/// that may have come after it, while an end in the pump just before still is.
+#[test]
+fn a_quiet_stretch_between_pumps_counts_as_the_pumps_it_would_have_held() {
+    let at = std::time::Instant::now();
+    let scratch = Scratch::new("quiet-gap");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    review.poll_at(at);
+    review.observe(2, "s2", &started("b1"), now());
+    review.poll_at(at + std::time::Duration::from_millis(33));
+    review.observe(2, "s2", &completed("b1"), now());
+    // The next pump comes a second later, when tab 1's start woke the window.
+    review.poll_at(at + std::time::Duration::from_millis(1033));
+    review.observe(1, "s1", &started("a1"), now());
+    review.observe(1, "s1", &completed("a1"), now());
+    poll_until(&mut review, "s1", "tab 1's turn", |t| is_ok(t, "a1"));
+    poll_until(&mut review, "s2", "tab 2's turn", |t| is_ok(t, "b1"));
+    assert!(!turn(&review.turns("s1"), "a1").overlapped_tab, "a quiet second apart");
+    assert!(!turn(&review.turns("s2"), "b1").overlapped_tab);
+
+    // The same with the next pump one tick later: the end may still have come after the start.
+    let scratch = Scratch::new("quiet-gap-none");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    review.poll_at(at);
+    review.observe(2, "s2", &started("b1"), now());
+    review.poll_at(at + std::time::Duration::from_millis(33));
+    review.observe(2, "s2", &completed("b1"), now());
+    review.poll_at(at + std::time::Duration::from_millis(66));
+    review.observe(1, "s1", &started("a1"), now());
+    review.observe(1, "s1", &completed("a1"), now());
+    poll_until(&mut review, "s1", "tab 1's turn", |t| is_ok(t, "a1"));
+    poll_until(&mut review, "s2", "tab 2's turn", |t| is_ok(t, "b1"));
+    assert!(turn(&review.turns("s1"), "a1").overlapped_tab, "neighbouring pumps");
+    assert!(turn(&review.turns("s2"), "b1").overlapped_tab);
+}
+
+/// The window keeps pumping while a worker owes an answer, and may stop once none does: a turn's snapshots
+/// are work in flight until their answers were polled.
+#[test]
+fn work_is_in_flight_until_every_snapshot_was_answered() {
+    let scratch = Scratch::new("in-flight");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    assert!(!review.has_work_in_flight(), "nothing was handed out");
+    review.observe(1, "s1", &opened("s1"), now());
+    review.observe(1, "s1", &started("a1"), now());
+    review.observe(1, "s1", &completed("a1"), now());
+    assert!(review.has_work_in_flight(), "the turn's snapshots are queued");
+    poll_until(&mut review, "s1", "the turn's snapshots", |t| is_ok(t, "a1"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while review.has_work_in_flight() {
+        assert!(Instant::now() < deadline, "work still in flight after 5 s");
+        review.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// A tab whose session ended starts another (`r`, then a prompt). The new session reports its id

@@ -63,6 +63,8 @@ alacritty_terminal = "0.26.0"
 # `eitri_core::test_providers::RecordingProvider`, for the agent panel's per-tab routing tests
 # (the session tabs). Tests only: the normal dependency above stays feature-free.
 eitri-core = { path = "../core", features = ["test-support"] }
+# `AgentPanelHandle::for_host_test`, for counting how often the panel's own loop wakes. Tests only.
+eitri-panel = { path = "../panel", features = ["test-support"] }
 # Only for `tests/nvim_bin_override.rs`: that test drives a real,
 # headless `LiveHarness` directly, which needs the fork crate itself, not just `neovide-editor`'s
 # wrapper around it. Same rev as `neovide-editor/Cargo.toml`'s own (non-dev) dependency -- Cargo

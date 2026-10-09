@@ -324,6 +324,8 @@ fn build_ui(
         backend_kind,
         panel_notice,
     );
+    // The panel reads the context when its tick runs, and its tick runs only when woken.
+    crate::editor_feeds::wake_panel_on_context(&feed_pump, &agent_panel_handle);
 
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
@@ -2000,21 +2002,15 @@ fn build_ui(
     lua_engine.emit("shell:ready");
     apply_layout_requests();
 
-    // Polls for a cross-window "come to the front" request from `eitri-supervisor` -- e.g. the
+    // Waits for a cross-window "come to the front" request from `eitri-supervisor` -- e.g. the
     // dashboard's own UI, or another shell instance, asking this window to raise itself. Cloning
     // `agent_panel_handle` here (rather than after) is load-bearing: the `connect_close_request`
     // closure below takes ownership of the original `agent_panel_handle` by move, so anything
-    // that still needs it afterward -- this timer included -- must clone it first, the same
+    // that still needs it afterward -- this watch included -- must clone it first, the same
     // pattern `lua_engine`'s own comment two blocks up documents for itself.
     {
         let window = window.clone();
-        let agent_panel_handle_for_poll = agent_panel_handle.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-            if agent_panel_handle_for_poll.poll_activate() {
-                window.present();
-            }
-            glib::ControlFlow::Continue
-        });
+        agent_panel::watch_supervisor(agent_panel_handle.clone(), Rc::new(move || window.present()));
     }
 
     // Registered last: this is `pane`'s final use in this function, so its `Rc` can be moved in

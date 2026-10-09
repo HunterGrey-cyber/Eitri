@@ -81,8 +81,14 @@ impl Pacer {
 
     /// A key was pressed in the editor and sent to nvim. O(1) and touches nothing else: it runs in
     /// the press's path.
-    pub fn note_editor_key(&mut self, now: Instant) {
+    ///
+    /// Whether this key began a typing window: the tick then has the page to tell and a window end to
+    /// wait for, so the caller wakes it; a key inside a window moves only its end, which the tick already
+    /// waits for.
+    pub fn note_editor_key(&mut self, now: Instant) -> bool {
+        let was = self.cadence.typing(now);
         self.cadence.note_editor_key(now);
+        !was && self.cadence.typing(now)
     }
 
     /// Whether the editor holds the window's keys (`pane_focus`).
@@ -157,6 +163,25 @@ impl Pacer {
                 ));
             }
         }
+    }
+
+    /// When [`poll`](Self::poll) next has something to do, from `now`: a release the cadence holds, or the
+    /// page to be told that typing started or stopped. `None`: nothing until something new arrives.
+    pub fn next_deadline(&self, now: Instant, page_ready: bool) -> Option<Instant> {
+        let mut next = self.cadence.next_due(now);
+        if page_ready && self.cadence.page_needs_typing_state().is_some() {
+            let typing = self.cadence.typing(now);
+            let tell = if typing != self.typing_told {
+                Some(now)
+            } else {
+                self.cadence.typing_ends_at(now)
+            };
+            next = match (next, tell) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        next
     }
 
     /// Throws away what is held: the document is being replaced, and its `ready` batch carries a
@@ -289,6 +314,50 @@ mod tests {
         assert_eq!(sink.take(), vec!["a"]);
         pacer.flush(&sink);
         assert!(sink.take().is_empty());
+    }
+
+    /// A tick run only at the moments `next_deadline` names releases and tells what a steady tick did: the
+    /// page hears of typing at once, a held envelope goes at its slot, the window's end is told, and then
+    /// nothing is due.
+    #[test]
+    fn polling_only_at_the_named_deadlines_releases_and_tells_as_a_steady_tick_did() {
+        let (mut pacer, t0) = typing_pacer(Some(2));
+        let sink = Recording::default();
+        assert_eq!(pacer.next_deadline(t0, true), None, "nothing to do before a key");
+        assert!(pacer.note_editor_key(t0), "the first key begins a window");
+        assert!(!pacer.note_editor_key(t0 + MS(10)), "a later one only moves its end");
+        assert_eq!(
+            pacer.next_deadline(t0 + MS(10), true),
+            Some(t0 + MS(10)),
+            "the page is told now"
+        );
+        pacer.poll(&sink, t0 + MS(10), true);
+        assert_eq!(typing_envelopes(&sink.take()).len(), 1);
+        stream(&mut pacer, &sink, "a", t0 + MS(100));
+        assert!(sink.take().is_empty());
+        let due = pacer.next_deadline(t0 + MS(100), true).expect("a release is due");
+        assert_eq!(due, t0 + MS(500), "the first slot");
+        pacer.poll(&sink, due - MS(1), true);
+        assert!(sink.take().is_empty(), "not before it");
+        let due = pacer.next_deadline(due - MS(1), true).unwrap();
+        pacer.poll(&sink, due, true);
+        assert_eq!(sink.take(), vec!["a"], "released at its slot");
+        let end = pacer.next_deadline(due, true).expect("the window's end is told");
+        assert_eq!(end, t0 + MS(510), "500 ms after the last key");
+        pacer.poll(&sink, end, true);
+        let out = sink.take();
+        assert!(out.len() == 1 && out[0].contains("\"typing\":false"), "{out:?}");
+        assert_eq!(pacer.next_deadline(end, true), None, "nothing left to do");
+
+        // At the default cadence the page is never told, and a held envelope goes at its slot.
+        let (mut pacer, t0) = typing_pacer(Some(8));
+        assert!(pacer.note_editor_key(t0));
+        assert_eq!(pacer.next_deadline(t0, true), None, "nothing held, nothing to tell");
+        stream(&mut pacer, &sink, "b", t0 + MS(10));
+        assert_eq!(pacer.next_deadline(t0 + MS(10), true), Some(t0 + MS(125)));
+        pacer.poll(&sink, t0 + MS(125), true);
+        assert_eq!(sink.take(), vec!["b"]);
+        assert_eq!(pacer.next_deadline(t0 + MS(125), true), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! One window's session tabs: one conversation, and so one `AgentBackend`,
 //! per tab, every one of them running. GTK-free: `eitri_panel::agent_panel` spawns the connect and
-//! handoff workers and hands this set their receivers; the 33 ms tick calls [`TabSet::pump`], which
+//! handoff workers and hands this set their receivers; the panel's tick calls [`TabSet::pump`], which
 //! drains EVERY tab -- `take_ui_delivery` is where the permission policy answers what needs no
 //! human, so a tab that was not pumped would stall on its first `Read`.
 //!
@@ -186,6 +186,9 @@ pub struct Tab {
     pub name: Option<String>,
     /// The first prompt's title, or the resumed record's display title.
     pub title: Option<String>,
+    /// `title` came from the record a resume or restore was started from, before the CLI's own title
+    /// for the session may have been read: a later read replaces it ([`TabSet::retitle_from`]).
+    pub title_from_record: bool,
     /// The tab's permission mode survives panel reloads. Keep it private so entering bypass can
     /// only happen through `cycle_mode`/`confirm_bypass`, which require confirmation.
     /// `mode()` provides read-only access; this module's tests may write the field directly.
@@ -341,6 +344,7 @@ impl Tab {
             number,
             name: None,
             title: None,
+            title_from_record: false,
             mode,
             agent,
             backend: TabBackend::NotStarted,
@@ -795,6 +799,9 @@ pub struct TabSet {
     /// presence is kept as if a turn ran: an agent's subagent can still write during the shutdown's
     /// grace. [`TabSet::retire_done`] ends one.
     retiring: std::collections::BTreeMap<u64, usize>,
+    /// What every live backend calls when it folded something, so the window need not poll for it
+    /// ([`set_ui_wake`](Self::set_ui_wake)).
+    ui_wake: Option<agent::UiWake>,
     /// One-shot test hook after `pump` drains a live tab's queue. Fold an event after the drain
     /// and before the next snapshot read in `active_state_payloads` or `Resync`, so the test
     /// reproduces the race without relying on timing.
@@ -852,6 +859,7 @@ impl TabSet {
             turn_review_off: false,
             presence: None,
             retiring: std::collections::BTreeMap::new(),
+            ui_wake: None,
             #[cfg(test)]
             after_drain: None,
             #[cfg(test)]
@@ -866,6 +874,62 @@ impl TabSet {
 
     pub fn kind(&self) -> BackendKind {
         self.kind
+    }
+
+    /// Has every live backend, and every one installed later, call `wake` when it folded something for
+    /// [`pump`](Self::pump) to take.
+    pub fn set_ui_wake(&mut self, wake: agent::UiWake) {
+        for tab in &self.tabs {
+            if let TabBackend::Live(backend) = &tab.backend {
+                backend.ensure_ui_wake(&wake);
+            }
+        }
+        self.ui_wake = Some(wake);
+    }
+
+    /// A title read since a tab was started from a record replaces the record's, once: `title_of` answers a
+    /// session's newest known title (from memory), and a tab that has one stops looking. Only tabs whose
+    /// title still is the record's are touched; one titled by its first prompt is not, and a rename is the tab's `name`, which the label
+    /// puts first anyway. Whether any title changed.
+    pub fn retitle_from(&mut self, title_of: impl Fn(&str) -> Option<String>) -> bool {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            if !tab.title_from_record {
+                continue;
+            }
+            let Some(session) = tab.live().and_then(AgentBackend::provider_session_id) else {
+                continue;
+            };
+            // Once: the tab takes the CLI's title as it is when first known (the old synchronous read at the
+            // resume did no more), or keeps its own when that already is it, and follows no later retitle.
+            if let Some(title) = title_of(&session) {
+                tab.title_from_record = false;
+                if tab.title.as_ref() != Some(&title) {
+                    tab.title = Some(title);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Whether something here can become ready without telling anyone, so the window has to keep
+    /// pumping on its tick: a connect or a terminal handoff running on a worker, a live backend that does
+    /// not announce its events (the legacy one, or any before [`set_ui_wake`](Self::set_ui_wake)), or turn
+    /// review waiting for its workers. When this is false, nothing changes here until a backend's wake, or
+    /// a command from the window, says so.
+    pub fn needs_polling(&self) -> bool {
+        self.tabs.iter().any(|tab| {
+            tab.pending_handoff.is_some()
+                || match &tab.backend {
+                    TabBackend::Starting(_) => true,
+                    TabBackend::Live(backend) => !backend.announces_to_ui(),
+                    TabBackend::NotStarted | TabBackend::AwaitingTrust(_) | TabBackend::Failed { .. } => false,
+                }
+        }) || self
+            .turn_review
+            .as_ref()
+            .is_some_and(crate::turn_review::TurnReview::has_work_in_flight)
     }
 
     /// Starts reviewing turns. Refused on the legacy backend: its turn starts are returned by the
@@ -1597,6 +1661,7 @@ impl TabSet {
         // An empty tab shows what its next session would get, not what the last one had.
         tab.project_tiers = None;
         tab.title = None;
+        tab.title_from_record = false;
         tab.attention.restart();
         tab.stale = false;
         tab.turn_trace = None;
@@ -1678,7 +1743,7 @@ impl TabSet {
         ResumeRoute::StartIn(target)
     }
 
-    /// One 33 ms tick over EVERY tab. The active tab's delivery is serialized for the
+    /// One tick over EVERY tab, run when something is due (at most one per 33 ms). The active tab's delivery is serialized for the
     /// panel; a background tab's feeds its attention and marks it stale, and nothing of it is sent.
     pub fn pump(&mut self, project_root: &Path, panel_mapped: bool) -> PumpOutput {
         let active = self.active;
@@ -1698,6 +1763,7 @@ impl TabSet {
             out.review_hints = review.poll();
         }
         let rules = &self.rules;
+        let ui_wake = self.ui_wake.as_ref();
         let mut review = self.turn_review.as_mut();
         for tab in &mut self.tabs {
             let is_active = tab.id == active;
@@ -1719,6 +1785,10 @@ impl TabSet {
                 tab.user_answered.clear();
                 continue;
             };
+            // A backend put in place some other way than `collect_starts` is told about the wake here.
+            if let Some(wake) = ui_wake {
+                backend.ensure_ui_wake(wake);
+            }
             let mut turn_ended = false;
             // Whether this tab's payload goes to the panel this tick (then `shell` prints a complete
             // trace after dispatching it; otherwise this function does, below).
@@ -2191,6 +2261,9 @@ impl TabSet {
                     }
                     // What runs is what the tab says it runs, whichever way it got there.
                     tab.agent = backend.agent();
+                    if let Some(wake) = &self.ui_wake {
+                        backend.ensure_ui_wake(wake);
+                    }
                     tab.backend = TabBackend::Live(backend);
                     tab.was_running = false;
                     tab.attention.restart();
@@ -2202,6 +2275,8 @@ impl TabSet {
                     tab.last_handoff = None;
                     tab.reported_start_failure = false;
                     tab.title = pending.resumed_title;
+                    // Only Claude's sessions have a transcript the CLI titles.
+                    tab.title_from_record = tab.title.is_some() && tab.agent == AgentId::Claude;
                     // A freshly installed backend has answered nothing yet on this tab's behalf.
                     tab.host_answered.clear();
                     tab.user_answered.clear();
@@ -3446,6 +3521,137 @@ mod tests {
                 backend.shutdown();
             }
         }
+    }
+
+    /// An idle set needs no pumping; a live backend needs it only until it announces its folds, and then
+    /// each fold calls the wake, after which the pump finds it. A connect running on a worker needs pumping.
+    #[test]
+    fn a_set_needs_pumping_only_for_what_cannot_announce_itself() {
+        let dir = workspace("tabs-needs-polling");
+        let mut set = set();
+        assert!(!set.needs_polling(), "an empty tab");
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        assert!(set.needs_polling(), "a live backend nobody is told about");
+
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let wakes = wakes.clone();
+            set.set_ui_wake(Arc::new(move || {
+                wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        assert!(!set.needs_polling(), "the backend announces its folds now");
+        let installed = wakes.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(installed >= 1, "installing the wake takes in what was folded before");
+
+        provider.queue(started("t1"));
+        until("the wake after the fold", || {
+            wakes.load(std::sync::atomic::Ordering::SeqCst) > installed
+        });
+        let out = set.pump(&dir, true);
+        assert!(out.active_payload.is_some(), "the woken pump finds the fold");
+        assert!(!set.needs_polling());
+
+        let other = set.open(AgentId::Claude);
+        let (_tx, result_rx) = mpsc::channel();
+        set.get_mut(other).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "req-1".into(),
+            result_rx,
+            first_turn: None,
+            resume: None,
+            resumed_title: None,
+            resumed_name: None,
+        });
+        assert!(set.needs_polling(), "a connect on a worker reports through a channel");
+        shut_down_all(&mut set);
+    }
+
+    /// A terminal handoff's close runs on a worker that reports through channels nobody is told about: the
+    /// set needs pumping until the handoff is collected, and not after.
+    #[test]
+    fn a_handoff_in_flight_needs_pumping() {
+        let mut set = set();
+        assert!(!set.needs_polling());
+        let tab = set.active();
+        let (_closed_tx, closed_rx) = mpsc::channel();
+        let (_dropped_tx, dropped_rx) = mpsc::channel();
+        set.get_mut(tab).unwrap().pending_handoff = Some(PendingHandoff {
+            request_id: "req-handoff".into(),
+            command: agent::handoff::ClaudeResumeCommand::for_session("/home/user/project", "1857dcd5-973b-46a2")
+                .unwrap(),
+            closed_rx,
+            dropped_rx,
+        });
+        assert!(set.needs_polling(), "a handoff's close is still running");
+        set.get_mut(tab).unwrap().pending_handoff = None;
+        assert!(!set.needs_polling(), "collected");
+    }
+
+    /// A tab resumed with its record's title takes the CLI's title once it is known; a tab titled by its
+    /// own first prompt keeps it.
+    #[test]
+    fn a_title_read_later_replaces_a_resumed_tabs_record_title() {
+        let dir = workspace("tabs-retitle");
+        let mut set = set();
+        let resumed = set.active();
+        let (provider, backend) = live(&dir);
+        let (tx, result_rx) = mpsc::channel();
+        set.get_mut(resumed).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "req-resume".into(),
+            result_rx,
+            first_turn: None,
+            resume: Some("s-resumed".into()),
+            resumed_title: Some("first prompt".into()),
+            resumed_name: None,
+        });
+        tx.send(Ok(backend)).unwrap();
+        assert_eq!(set.collect_starts().len(), 1);
+        provider.open_session("s-resumed", &dir);
+        until("the session id", || {
+            set.get(resumed)
+                .unwrap()
+                .live()
+                .and_then(AgentBackend::provider_session_id)
+                .is_some()
+        });
+        let fresh = set.open(AgentId::Claude);
+        let (other_provider, other) = live(&dir);
+        set.get_mut(fresh).unwrap().backend = TabBackend::Live(other);
+        set.get_mut(fresh).unwrap().title = Some("its own prompt".into());
+        other_provider.open_session("s-fresh", &dir);
+        until("the other session id", || {
+            set.get(fresh)
+                .unwrap()
+                .live()
+                .and_then(AgentBackend::provider_session_id)
+                .is_some()
+        });
+
+        let titles = |id: &str| Some(format!("CLI title of {id}"));
+        assert!(!set.retitle_from(|_| None), "nothing known yet");
+        assert!(set.retitle_from(titles));
+        assert_eq!(
+            set.get(resumed).unwrap().title.as_deref(),
+            Some("CLI title of s-resumed")
+        );
+        assert_eq!(set.get(fresh).unwrap().title.as_deref(), Some("its own prompt"));
+        assert!(!set.retitle_from(titles), "the same title again changes nothing");
+        assert!(
+            !set.retitle_from(|_| Some("retitled again".into())),
+            "a later retitle is not followed, as the read at the resume was not"
+        );
+        assert_eq!(
+            set.get(resumed).unwrap().title.as_deref(),
+            Some("CLI title of s-resumed")
+        );
+        assert!(!set.get(resumed).unwrap().title_from_record);
+        // A record whose title already was the CLI's (the cache was warm at the resume): kept, and done.
+        set.get_mut(resumed).unwrap().title_from_record = true;
+        assert!(!set.retitle_from(|_| Some("CLI title of s-resumed".into())));
+        assert!(!set.get(resumed).unwrap().title_from_record);
+        shut_down_all(&mut set);
     }
 
     #[test]
@@ -9310,6 +9516,79 @@ mod tests {
             .run()
             .unwrap();
         assert!(diff.hunks.is_some_and(|h| !h.is_empty()));
+        shut_down_all(&mut set);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// With a turn review installed, the set needs pumping while the review's worker owes a snapshot: from
+    /// the turn's end until the pump has collected its end snapshot (held here on the worker), and not
+    /// after both snapshots are in.
+    #[test]
+    fn a_turn_reviews_snapshots_in_flight_need_pumping() {
+        let scratch = target_scratch("review-in-flight");
+        let dir = scratch.join("project");
+        let gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)> = Arc::default();
+        let hook: crate::turn_review::JobHook = {
+            let gate = gate.clone();
+            Arc::new(move |event: &crate::turn_review::JobEvent| {
+                if let crate::turn_review::JobEvent::Starting {
+                    kind: crate::turn_review::SnapshotKind::End,
+                    ..
+                } = event
+                {
+                    let (held, cvar) = &*gate;
+                    let mut held = held.lock().unwrap();
+                    while *held {
+                        held = cvar.wait(held).unwrap();
+                    }
+                }
+            })
+        };
+        *gate.0.lock().unwrap() = true;
+        let mut set = set();
+        set.install_turn_review(crate::turn_review::TurnReview::with_options(
+            Some(scratch.join("state/review")),
+            &dir,
+            crate::turn_review::ReviewOptions {
+                excludes: Some(None),
+                trim_every: Duration::MAX,
+                on_job: Some(hook),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        set.set_ui_wake(Arc::new(|| {}));
+        provider.open_session("sess-in-flight", &dir);
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        let record = |set: &TabSet| set.turn_review().unwrap().turns("sess-in-flight").first().cloned();
+        until("the base, and nothing left in flight", || {
+            set.pump(&dir, true);
+            record(&set).is_some_and(|r| matches!(r.base, crate::turn_review::Snap::Taken { .. }))
+                && !set.needs_polling()
+        });
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        until("the turn's end observed", || {
+            set.pump(&dir, true);
+            record(&set).is_some_and(|r| r.ended_ms.is_some())
+        });
+        for _ in 0..5 {
+            assert!(set.needs_polling(), "the end snapshot is still with the worker");
+            set.pump(&dir, true);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        {
+            let (held, cvar) = &*gate;
+            *held.lock().unwrap() = false;
+            cvar.notify_all();
+        }
+        until("both snapshots collected and nothing left in flight", || {
+            set.pump(&dir, true);
+            !set.needs_polling()
+        });
+        assert!(record(&set).is_some_and(|r| matches!(r.end, crate::turn_review::Snap::Taken { .. })));
         shut_down_all(&mut set);
         let _ = std::fs::remove_dir_all(&scratch);
     }

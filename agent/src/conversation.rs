@@ -1028,6 +1028,16 @@ impl AgentConversation {
         self.ingest.take_delivery()
     }
 
+    /// Has `wake` called whenever something was folded for the UI to take (`ConversationIngest::set_ui_wake`).
+    pub fn set_ui_wake(&self, wake: crate::ingestion::UiWake) {
+        self.ingest.set_ui_wake(wake);
+    }
+
+    /// Whether the UI is told when there is something to take; without it the UI polls.
+    pub fn has_ui_wake(&self) -> bool {
+        self.ingest.has_ui_wake()
+    }
+
     /// [`Self::take_ui_delivery`], with each event's fold revision, for a caller that also reads
     /// snapshots and must not deliver an event one already carried (`crate::ingestion::RevisedDelivery`).
     pub fn take_revised_ui_delivery(&self) -> crate::ingestion::RevisedDelivery {

@@ -595,6 +595,29 @@ impl AgentBackend {
         }
     }
 
+    /// Has `wake` called whenever this backend folded something for the UI to take, unless one is
+    /// installed already. The legacy backend cannot: its reader thread tells nobody, so a window holding
+    /// one keeps polling ([`announces_to_ui`](Self::announces_to_ui)).
+    pub fn ensure_ui_wake(&self, wake: &agent::UiWake) {
+        let conversation = match self {
+            AgentBackend::Legacy(_) => return,
+            AgentBackend::Sidecar(conversation) => conversation,
+            AgentBackend::External(external) => &external.conversation,
+        };
+        if !conversation.has_ui_wake() {
+            conversation.set_ui_wake(wake.clone());
+        }
+    }
+
+    /// Whether the UI is told when this backend has something to take; if not, the UI polls it.
+    pub fn announces_to_ui(&self) -> bool {
+        match self {
+            AgentBackend::Legacy(_) => false,
+            AgentBackend::Sidecar(conversation) => conversation.has_ui_wake(),
+            AgentBackend::External(external) => external.conversation.has_ui_wake(),
+        }
+    }
+
     /// The reason a session terminated WITHOUT ever having opened, if that is what happened.
     ///
     /// "Opened" means the provider reported a real `SessionOpened` -- which is also where `model`
@@ -617,7 +640,7 @@ impl AgentBackend {
 
     /// Canonical conversation state, for whichever backend this is.
     ///
-    /// Returns a borrow rather than a clone: the panel reads this on every 33ms tick, and the
+    /// Returns a borrow rather than a clone: the panel reads this on every tick (up to 30 a second), and the
     /// sidecar path's projection can hold a whole conversation. The sidecar's arrives through the
     /// ingestion thread's lock, the legacy backend's is a plain field -- `ProjectionRef` is what lets
     /// one call site cover both without either paying for the other's shape.
@@ -1772,6 +1795,15 @@ fn title_for(canonical_cwd: &str, mut session: ResumableSession) -> ResumableSes
     session
 }
 
+/// Where a greeting's Claude rows take the CLI's own titles from.
+pub enum Titles<'a> {
+    /// Each transcript read now, on the caller's thread (`title_for`).
+    ReadNow,
+    /// The window's cache, which answers from memory and reads on its own worker
+    /// (`crate::transcript_titles`).
+    Cached(&'a crate::transcript_titles::TitleCache),
+}
+
 /// Every resumable session of the project at `project_dir` that an agent other than Claude recorded,
 /// newest first: what a restore matches the other agents' saved tabs with.
 pub fn external_sessions(project_dir: &Path) -> Vec<ResumableSession> {
@@ -1833,7 +1865,9 @@ impl BackendGreeting {
     /// this machine's 16 largest sessions.
     /// **It must stay a fixed-size read**: parsing those files whole would swap a bounded read of
     /// Eitri's own records for one that grows with a file this project neither writes nor knows a
-    /// bound for, and it would do it here, on the loop that draws the editor.
+    /// bound for, and it would do it here, on the loop that draws the editor. The window itself titles
+    /// its rows through [`Titles::Cached`] ([`for_agent_titled`](Self::for_agent_titled)), which reads no
+    /// transcript on its thread.
     pub fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
         Self::for_agent(kind, &AgentId::Claude, project_dir)
     }
@@ -1843,6 +1877,11 @@ impl BackendGreeting {
     /// round. An external agent's sessions need no Claude backend to resume, and their titles are
     /// Eitri's own (no Claude transcript to read one from).
     pub fn for_agent(kind: BackendKind, agent: &AgentId, project_dir: PathBuf) -> Self {
+        Self::for_agent_titled(kind, agent, project_dir, Titles::ReadNow)
+    }
+
+    /// [`for_agent`](Self::for_agent), the Claude rows titled from `titles`.
+    pub fn for_agent_titled(kind: BackendKind, agent: &AgentId, project_dir: PathBuf, titles: Titles<'_>) -> Self {
         if agent.is_external() {
             // Only this agent's records: the Claude records and their transcript titles are not read
             // at all, since nothing here would show them.
@@ -1853,7 +1892,7 @@ impl BackendGreeting {
                 .unwrap_or_default();
             return Self::with_resumable(kind, project_dir, resumable);
         }
-        let resumable = Self::claude_sessions(kind, &project_dir);
+        let resumable = Self::claude_sessions_titled(kind, &project_dir, titles);
         Self::with_resumable(kind, project_dir, resumable)
     }
 
@@ -1861,6 +1900,11 @@ impl BackendGreeting {
     /// newest first: what a Claude tab offers, and what a restore matches saved Claude tabs with,
     /// whichever agent the active tab runs. The same bounded reads as [`for_kind`](Self::for_kind).
     pub fn claude_sessions(kind: BackendKind, project_dir: &Path) -> Vec<ResumableSession> {
+        Self::claude_sessions_titled(kind, project_dir, Titles::ReadNow)
+    }
+
+    /// [`claude_sessions`](Self::claude_sessions), titled from `titles`.
+    pub fn claude_sessions_titled(kind: BackendKind, project_dir: &Path, titles: Titles<'_>) -> Vec<ResumableSession> {
         // Keyed on the CANONICAL directory, matching what `AgentConversation` persists -- otherwise
         // `/x/proj` and `/x/../x/proj` would look up two different records for one workspace.
         //
@@ -1876,10 +1920,15 @@ impl BackendGreeting {
             .map(|cwd| {
                 let id = agent::conversation_id_for_cwd(&cwd);
                 let cwd = cwd.to_string_lossy().into_owned();
-                sessions_of(&AgentId::Claude, agent::resumable_sessions(&id))
-                    .into_iter()
-                    .map(|session| title_for(&cwd, session))
-                    .collect()
+                let sessions = sessions_of(&AgentId::Claude, agent::resumable_sessions(&id));
+                match titles {
+                    Titles::ReadNow => sessions.into_iter().map(|session| title_for(&cwd, session)).collect(),
+                    Titles::Cached(cache) => {
+                        let mut sessions = sessions;
+                        cache.apply(&cwd, &mut sessions);
+                        sessions
+                    }
+                }
             })
             .unwrap_or_default()
     }
@@ -1905,6 +1954,30 @@ impl BackendGreeting {
             },
         }
     }
+}
+
+/// Points `CLAUDE_CONFIG_DIR` at one disposable root for this whole test binary, and returns
+/// the `projects/` directory under it.
+///
+/// A process-wide variable set from a multi-threaded test binary, which this project normally
+/// refuses (`agent::state_dirs`'s own module doc says so). It is set exactly ONCE, to a value
+/// that never changes, from inside a `OnceLock` initializer, so no thread can observe it being
+/// two different things -- and the alternative would have been a second global redirect in
+/// `agent` competing with the `CLAUDE_CONFIG_DIR` the external-writer tests already set. Any
+/// other test in this crate that reaches a transcript path finds an empty directory here, which
+/// is what it would have found anyway.
+#[cfg(test)]
+pub(crate) fn test_claude_projects_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        // Under the agent crate's test state root, which the next run prunes once this process is gone.
+        let root = agent::state_dirs::redirect_state_to_a_test_root().join("claude-config");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("projects")).expect("creating the fake config root should succeed");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &root);
+        root
+    })
+    .join("projects")
 }
 
 #[cfg(test)]
@@ -2205,27 +2278,8 @@ mod tests {
 
     // ---- The picker's title ladder ---------------------------------------------------------
 
-    /// Points `CLAUDE_CONFIG_DIR` at one disposable root for this whole test binary, and returns
-    /// the `projects/` directory under it.
-    ///
-    /// A process-wide variable set from a multi-threaded test binary, which this project normally
-    /// refuses (`agent::state_dirs`'s own module doc says so). It is set exactly ONCE, to a value
-    /// that never changes, from inside a `OnceLock` initializer, so no thread can observe it being
-    /// two different things -- and the alternative would have been a second global redirect in
-    /// `agent` competing with the `CLAUDE_CONFIG_DIR` the external-writer tests already set. Any
-    /// other test in this crate that reaches a transcript path finds an empty directory here, which
-    /// is what it would have found anyway.
-    fn a_claude_projects_root() -> &'static std::path::Path {
-        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        ROOT.get_or_init(|| {
-            let root = std::env::temp_dir().join(format!("eitri-core-claude-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join("projects")).expect("creating the fake config root should succeed");
-            std::env::set_var("CLAUDE_CONFIG_DIR", &root);
-            root
-        })
-        .join("projects")
-        .leak()
+    fn a_claude_projects_root() -> PathBuf {
+        super::test_claude_projects_root()
     }
 
     /// A workspace holding one offerable record, and optionally a transcript beside it.

@@ -9,6 +9,7 @@ pub mod panel_csp;
 pub mod panel_document;
 pub mod panel_pacer;
 pub mod panel_page;
+pub mod panel_wake;
 pub mod review_editor;
 pub mod supervisor_client;
 pub mod terminal_handoff;

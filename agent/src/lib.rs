@@ -64,7 +64,7 @@ pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationE
 #[cfg(feature = "legacy-backend")]
 pub use event::{AgentEvent, PermissionSource};
 pub use external::{DirTrust, ExternalProvider, ExternalStart, Reviewer, TrustPlan, TurnPolicy};
-pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
+pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, UiWake, UI_EVENT_QUEUE_CAPACITY};
 pub use permission_policy::{
     classify_permission_request, classify_with_rules, rule_that_allows, Classification, PermissionVerdict,
 };

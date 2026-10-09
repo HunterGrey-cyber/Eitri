@@ -43,6 +43,7 @@ pub(crate) struct FeedPump {
     theme: RefCell<Option<Handler<NvimThemePayload>>>,
     keys: RefCell<Option<Handler<NvimReport>>>,
     pane: RefCell<Option<Handler<PaneMessage>>>,
+    context: RefCell<Option<Handler<()>>>,
     wake: RefCell<Wake>,
     /// Each timer and watch holds the pump through this, so it lives as long as something can wake it.
     me: Weak<FeedPump>,
@@ -59,6 +60,7 @@ impl FeedPump {
             theme: RefCell::new(None),
             keys: RefCell::new(None),
             pane: RefCell::new(None),
+            context: RefCell::new(None),
             wake: RefCell::new(Wake::Watches(Vec::new())),
             me: me.clone(),
             #[cfg(test)]
@@ -177,6 +179,18 @@ impl FeedPump {
                 handler(message);
             }
         }
+        if events.context {
+            let handler = self.context.borrow().clone();
+            if let Some(handler) = handler {
+                handler(());
+            }
+        }
+    }
+
+    /// Calls `on_change` each time the context source [`listen_context`](Self::listen_context) returned
+    /// answers something new: the panel reads it only when its tick runs, and is woken for it here.
+    pub(crate) fn on_context(&self, on_change: impl Fn() + 'static) {
+        *self.context.borrow_mut() = Some(Rc::new(move |()| on_change()));
     }
 
     /// Calls `on_payload` with the newest valid payload each time one is read. `VimEnter` and
@@ -250,6 +264,13 @@ impl FeedPump {
     }
 }
 
+/// Wakes `panel` each time the context source `pump` handed it answers something new: the panel reads the
+/// context only when its tick runs, and its tick runs only when woken. Both windows call this.
+pub(crate) fn wake_panel_on_context(pump: &FeedPump, panel: &eitri_panel::agent_panel::AgentPanelHandle) {
+    let panel = panel.clone();
+    pump.on_context(move || panel.wake());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,7 +323,12 @@ mod tests {
             });
         }
         pump.listen_keys(&mut keys, |_| {});
-        let _ = pump.listen_context(&mut context_feed, None);
+        let (context_source, _) = pump.listen_context(&mut context_feed, None);
+        let contexts = Rc::new(std::cell::Cell::new(0));
+        {
+            let contexts = contexts.clone();
+            pump.on_context(move || contexts.set(contexts.get() + 1));
+        }
         {
             let panes = panes.clone();
             pump.listen_pane_switch(&mut pane, move |message| panes.borrow_mut().push(message));
@@ -327,10 +353,20 @@ mod tests {
         assert!(iterate_until(2000, || !themes.borrow().is_empty()), "the theme");
         assert_eq!(*themes.borrow(), vec!["x".to_string()]);
 
+        // A new context is said, so the panel that reads it can be woken.
+        assert_eq!(contexts.get(), 0);
+        send(
+            context_feed.socket_path(),
+            r#"{"v":1,"file":"/p/a.rs","selection":null}"#,
+        );
+        assert!(iterate_until(2000, || contexts.get() == 1), "the context change");
+        assert_eq!(context_source().map(|c| c.file), Some("/p/a.rs".to_string()));
+
         iterate_until(300, || false);
         let before = pump.ticks.get();
         iterate_until(500, || false);
         assert_eq!(pump.ticks.get() - before, 0, "quiet again after the messages");
+        assert_eq!(contexts.get(), 1, "said once");
 
         theme.cleanup();
         keys.cleanup();
@@ -388,5 +424,55 @@ mod tests {
         assert_eq!(pump.ticks.get() - before, 0, "quiet again");
         theme.borrow_mut().cleanup();
         pane.cleanup();
+    }
+
+    /// A context the editor sends wakes the panel, through the hookup both windows make; a window that
+    /// dropped the call would leave its panel showing an old context until something else woke it.
+    #[test]
+    fn a_new_context_wakes_the_panel_in_both_windows() {
+        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let context = glib::MainContext::default();
+        let _owner = context.acquire().expect("glib's default main context");
+        let pump = FeedPump::start();
+        let mut feed = EditorContextFeed::new().unwrap();
+        let (source, _) = pump.listen_context(&mut feed, None);
+        let panel = eitri_panel::agent_panel::AgentPanelHandle::for_host_test(Rc::new(NoPage));
+        wake_panel_on_context(&pump, &panel);
+        iterate_until(200, || false);
+        let now = Instant::now();
+        let _ = panel.take_wake(now);
+        assert_eq!(panel.take_wake(now), None, "nothing raised before the context");
+        send(feed.socket_path(), r#"{"v":1,"file":"/p/a.rs","selection":null}"#);
+        assert!(
+            iterate_until(2000, || panel.take_wake(Instant::now()).is_some()),
+            "the context woke the panel"
+        );
+        assert_eq!(source().map(|c| c.file), Some("/p/a.rs".to_string()));
+        feed.cleanup();
+
+        // Both windows make the hookup.
+        use eitri_core::source_scan as scan;
+        let sources = scan::rust_sources(&["shell/src"]);
+        for anchor in ["fn build_ui(", "fn build(app: &Application, start: &Start)"] {
+            let file = scan::file_with(&sources, anchor);
+            assert!(
+                scan::code_only(&file.text).contains("wake_panel_on_context(&feed_pump"),
+                "{} does not wake its panel on a context change",
+                file.path
+            );
+        }
+    }
+
+    struct NoPage;
+
+    impl eitri_panel::panel_page::PageSurface for NoPage {
+        fn send(&self, _envelope_json: &str) {}
+        fn is_visible(&self) -> bool {
+            true
+        }
+        fn load_document(&self, _html: &str, _base_uri: &str) {}
+        fn set_background(&self, _rgb: [u8; 3]) {}
     }
 }

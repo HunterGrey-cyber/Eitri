@@ -25,6 +25,8 @@ libc = "0.2"
 
 [dev-dependencies]
 eitri-core = { path = "../core", features = ["test-support"] }
+# `AgentPanelHandle::for_host_test`, for driving the panel's tick the way this window will. Tests only.
+eitri-panel = { path = "../panel", features = ["test-support"] }
 tempfile = "3"
 # The real-nvim tests' own probe connection builds its calls from msgpack values.
 rmpv = "1"

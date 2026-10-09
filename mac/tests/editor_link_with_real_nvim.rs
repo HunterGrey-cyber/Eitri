@@ -206,6 +206,7 @@ fn describe(event: &EditorEvent) -> String {
         EditorEvent::Keys(_) => "keys".to_string(),
         EditorEvent::LinkChanged(band) => format!("link {} {}", band.state, band.text),
         EditorEvent::CancelDrafts => "cancel drafts".to_string(),
+        EditorEvent::ContextChanged => "context".to_string(),
     }
 }
 

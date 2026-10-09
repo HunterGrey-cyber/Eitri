@@ -198,6 +198,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         start.panel_notice.as_deref(),
     );
     config.apply_to_panel(&agent);
+    // The panel reads the context when its tick runs, and its tick runs only when woken.
+    crate::editor_feeds::wake_panel_on_context(&feed_pump, &agent);
     // The panel's own `Ctrl+h/j/k/l`, the prefix's Select and an edge letter from nvim all end here.
     // `false` (no adapter) leaves the key to the page, and the band says why once.
     let move_focus: MoveFocus = {
@@ -456,16 +458,15 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let window = window.downgrade();
         let agent = agent.clone();
         let runner = runner.clone();
-        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-            let Some(window) = window.upgrade() else {
-                return gtk4::glib::ControlFlow::Break;
-            };
-            if agent.poll_activate() {
-                window.present();
-                runner.raise_pid(std::process::id());
-            }
-            gtk4::glib::ControlFlow::Continue
-        });
+        crate::agent_panel::watch_supervisor(
+            agent.clone(),
+            Rc::new(move || {
+                if let Some(window) = window.upgrade() {
+                    window.present();
+                    runner.raise_pid(std::process::id());
+                }
+            }),
+        );
     }
 
     // Where the panel stands with the user's nvim. The first call of `on_change` is at once, so the

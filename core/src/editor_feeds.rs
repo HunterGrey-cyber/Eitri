@@ -28,6 +28,8 @@ pub struct FeedEvents {
     pub theme: Option<NvimThemePayload>,
     pub keys: Option<NvimReport>,
     pub pane: Vec<PaneMessage>,
+    /// The context source answers something new: a host whose panel reads it only when woken must wake it.
+    pub context: bool,
 }
 
 /// Whether any of `fds` is readable now, without waiting. An error counts as readable: the caller
@@ -98,9 +100,10 @@ impl ContextFeed {
     /// moments after they made it, which is exactly when they move to the panel to ask about it. A report
     /// naming one of Eitri's own scratch buffers (a draft or a view) is dropped too, so the context stays
     /// on the file the user was in before it.
-    fn poll(&self) {
+    /// Whether the cache took a new context.
+    fn poll(&self) -> bool {
         let Some(context) = self.reader.borrow_mut().poll() else {
-            return;
+            return false;
         };
         let scratch = self
             .scratch_dir
@@ -109,6 +112,7 @@ impl ContextFeed {
         if !scratch {
             *self.cache.borrow_mut() = Some(context);
         }
+        !scratch
     }
 }
 
@@ -224,7 +228,7 @@ impl EditorFeeds {
             events.keys = reader.poll();
         }
         if let Some(feed) = self.context.as_mut().and_then(|feed| feed.due(now)) {
-            feed.poll();
+            events.context = feed.poll();
         }
         if let Some(reader) = self.pane.as_mut().and_then(|feed| feed.due(now)) {
             events.pane = reader.poll();
@@ -348,9 +352,9 @@ mod tests {
         let every = crate::editor_context::feed::POLL_INTERVAL;
 
         send(feed.socket_path(), &context_line("/p/a.rs"));
-        feeds.poll(now + every);
+        assert!(feeds.poll(now + every).context, "a new context is said to be new");
         send(feed.socket_path(), &context_line("/tmp/s/1-draft.md"));
-        feeds.poll(now + every * 2);
+        assert!(!feeds.poll(now + every * 2).context, "a dropped one changes nothing");
         assert_eq!(file(&source), Some("/p/a.rs".to_owned()));
         feed.cleanup();
     }
@@ -361,8 +365,8 @@ mod tests {
         let every = crate::editor_context::feed::POLL_INTERVAL;
 
         send(feed.socket_path(), &context_line("/p/a.rs"));
-        feeds.poll(now + every);
-        feeds.poll(now + every * 2);
+        assert!(feeds.poll(now + every).context);
+        assert!(!feeds.poll(now + every * 2).context, "no line, no news");
         assert_eq!(file(&source), Some("/p/a.rs".to_owned()));
         feed.cleanup();
     }

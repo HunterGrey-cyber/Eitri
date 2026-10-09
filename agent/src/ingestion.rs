@@ -253,6 +253,22 @@ impl IngestState {
     }
 }
 
+/// What the UI hands a conversation so it is told when there is something to take: called after events
+/// were folded (on the ingestion thread, or on the caller's for a local fold). It must be cheap and must
+/// never block or call back into the conversation.
+pub type UiWake = Arc<dyn Fn() + Send + Sync>;
+
+/// The UI's wake, shared between the conversation and its thread; empty until the UI installs one.
+type UiWakeSlot = Arc<Mutex<Option<UiWake>>>;
+
+/// Calls the installed wake, if any, outside the slot's lock.
+fn wake_ui(slot: &Mutex<Option<UiWake>>) {
+    let wake = slot.lock().unwrap().clone();
+    if let Some(wake) = wake {
+        wake();
+    }
+}
+
 /// A conversation's ingestion thread and the state it owns.
 pub struct ConversationIngest {
     state: Arc<Mutex<IngestState>>,
@@ -260,12 +276,14 @@ pub struct ConversationIngest {
     /// Raised by the provider when it queued events, and here when something the thread acts on
     /// was noted (a title, a name, a local fold, the stop).
     wake: Arc<EventSignal>,
+    /// Told after every fold, so the UI need not poll for deliveries.
+    ui_wake: UiWakeSlot,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Borrowed access to the canonical projection.
 ///
-/// A guard rather than a clone: the UI reads this on every 33ms tick, and cloning a conversation's
+/// A guard rather than a clone: the UI reads this on every tick (up to 30 a second), and cloning a conversation's
 /// whole transcript that often would reintroduce, as CPU, the cost this module just removed as
 /// memory.
 pub struct ProjectionGuard<'a>(MutexGuard<'a, IngestState>);
@@ -330,12 +348,14 @@ impl ConversationIngest {
             provider_advertises_resume,
         };
 
+        let ui_wake: UiWakeSlot = Arc::new(Mutex::new(None));
         let thread = {
             let state = Arc::clone(&state);
             let stop = Arc::clone(&stop);
+            let ui_wake = Arc::clone(&ui_wake);
             std::thread::Builder::new()
                 .name("eitri-agent-ingest".to_string())
-                .spawn(move || ingest_loop(provider, state, stop, announced, context))
+                .spawn(move || ingest_loop(provider, state, stop, announced, context, ui_wake))
                 .expect("spawning the agent ingestion thread")
         };
 
@@ -343,6 +363,7 @@ impl ConversationIngest {
             state,
             stop,
             wake,
+            ui_wake,
             thread: Some(thread),
         }
     }
@@ -386,6 +407,18 @@ impl ConversationIngest {
         self.wake.raise();
     }
 
+    /// Installs the UI's wake: from here on every fold calls it. Called once more at once, so what was
+    /// folded before the UI installed it is taken too.
+    pub fn set_ui_wake(&self, wake: UiWake) {
+        *self.ui_wake.lock().unwrap() = Some(wake);
+        wake_ui(&self.ui_wake);
+    }
+
+    /// Whether a UI wake is installed: without one the UI has to poll for deliveries.
+    pub fn has_ui_wake(&self) -> bool {
+        self.ui_wake.lock().unwrap().is_some()
+    }
+
     /// The provider's resume verdict, once it has stated one.
     pub fn resume_outcome(&self) -> Option<ResumeOutcomeRecord> {
         self.state.lock().unwrap().resume_outcome.clone()
@@ -417,6 +450,7 @@ impl ConversationIngest {
         self.state.lock().unwrap().fold(event);
         // The fold may have marked the history for writing, which the thread does.
         self.wake.raise();
+        wake_ui(&self.ui_wake);
     }
 
     /// Stops the ingestion thread and waits for it. Idempotent.
@@ -445,6 +479,8 @@ fn ingest_loop(
     // announces nothing and so has to be asked on a timer.
     announced: Option<Arc<EventSignal>>,
     context: AdoptionContext,
+    // Told once a batch is folded (and once more after an adoption, which the UI reads too).
+    ui_wake: UiWakeSlot,
 ) {
     while !stop.load(Ordering::SeqCst) {
         #[cfg(test)]
@@ -500,11 +536,16 @@ fn ingest_loop(
                 guard.fold(event);
             }
         }
+        // After the lock is released: the UI takes the same lock when it is woken.
+        wake_ui(&ui_wake);
         if let Some(provider_session_id) = adopt {
             let lease = adopt_provider_session(&context, &provider_session_id, title.as_deref(), name);
-            let mut guard = state.lock().unwrap();
-            guard.lease = lease;
-            guard.record_written = true;
+            {
+                let mut guard = state.lock().unwrap();
+                guard.lease = lease;
+                guard.record_written = true;
+            }
+            wake_ui(&ui_wake);
         }
     }
 }
@@ -1215,6 +1256,45 @@ mod idle_wakeups {
             started.elapsed() < std::time::Duration::from_secs(1),
             "a sleeping thread is woken to stop"
         );
+    }
+
+    /// The UI is told after a fold, so it need not poll for deliveries: once when it installs its wake (for
+    /// what was folded before), once per folded batch, and once for a local fold -- and only then.
+    #[test]
+    fn the_ui_is_woken_by_a_fold_and_only_by_one() {
+        let provider = Arc::new(Announcing::default());
+        let ingest = start(provider.clone());
+        wait_for("the first pump", || provider.quiet.pumps.load(Ordering::Relaxed) >= 1);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        assert!(!ingest.has_ui_wake());
+        {
+            let wakes = wakes.clone();
+            ingest.set_ui_wake(Arc::new(move || {
+                wakes.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        assert!(ingest.has_ui_wake());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "installing it wakes once");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "a quiet provider wakes nothing");
+
+        provider
+            .quiet
+            .queued
+            .lock()
+            .unwrap()
+            .push(AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
+        provider.signal.raise();
+        wait_for("the wake after the fold", || wakes.load(Ordering::SeqCst) == 2);
+        assert!(
+            matches!(ingest.take_delivery(), UiDelivery::Events(ref events) if events.len() == 1),
+            "the fold is there to take when the wake comes"
+        );
+
+        ingest.fold_locally(AgentDomainEvent::UserPromptSubmitted { text: "again".into() });
+        assert_eq!(wakes.load(Ordering::SeqCst), 3, "a local fold wakes at once");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(wakes.load(Ordering::SeqCst), 3);
     }
 
     type Hook = Arc<dyn Fn() + Send + Sync>;

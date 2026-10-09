@@ -216,6 +216,26 @@ impl<T> PanelCadence<T> {
                 .is_some_and(|key| now.saturating_duration_since(key) < TYPING_WINDOW)
     }
 
+    /// When the typing window open at `now` ends, if one is open.
+    pub fn typing_ends_at(&self, now: Instant) -> Option<Instant> {
+        self.typing(now)
+            .then(|| self.last_editor_key.map(|key| key + TYPING_WINDOW))
+            .flatten()
+    }
+
+    /// The first moment from `now` at which [`due`](Self::due) releases something: `now` itself when what
+    /// waits is no longer held, else the next slot or the end of the typing window, whichever is first.
+    /// `None` while nothing waits.
+    pub fn next_due(&self, now: Instant) -> Option<Instant> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let (Some(_), Some(ends)) = (self.period, self.typing_ends_at(now)) else {
+            return Some(now);
+        };
+        Some(self.slot.map_or(ends, |slot| slot.min(ends)))
+    }
+
     /// What to do with an envelope of `class` at `now`.
     pub fn route(&self, class: EnvelopeClass, now: Instant) -> Route {
         match class {
@@ -631,6 +651,25 @@ mod tests {
         c.push("a".to_string());
         c.note_editor_key(t0 + MS(505));
         assert_eq!(c.due(t0 + MS(506)), strs(&["a"]));
+    }
+
+    #[test]
+    fn the_next_release_is_the_next_slot_or_the_end_of_the_window() {
+        let (mut c, t) = typing_cadence();
+        c.note_editor_key(t);
+        assert_eq!(c.next_due(t), None, "nothing waits");
+        c.push("a".to_string());
+        let slot = c.next_due(t).expect("something waits");
+        assert!(slot > t, "held for a slot");
+        assert!(c.due(slot - MS(1)).is_empty(), "not before it");
+        assert_eq!(c.due(slot), strs(&["a"]), "released at it");
+        // The window ends 500 ms after the last key; what waits then goes at the end.
+        c.push("b".to_string());
+        let ends = c.typing_ends_at(t).expect("typing");
+        assert_eq!(ends, t + TYPING_WINDOW);
+        assert!(c.next_due(ends - MS(1)).is_some_and(|due| due <= ends));
+        assert_eq!(c.next_due(ends), Some(ends), "no longer typing: at once");
+        assert_eq!(c.typing_ends_at(ends), None);
     }
 
     #[test]
