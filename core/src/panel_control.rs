@@ -34,9 +34,13 @@
 //!   does not answer is reported ([`Claim::Unresponsive`]) and nothing is removed; so is a socket
 //!   that still has a listener but no readable pid. Reclaiming runs under an exclusive `flock` on
 //!   `p-<key>.lock`, so two claimants cannot both reclaim and delete each other's new socket, and
-//!   the removal is of the very socket (device and inode) that was probed. A recorded pid that
-//!   was reused by an unrelated process keeps the claim unresponsive until that process exits, which
-//!   is the price of never deleting a live panel's socket.
+//!   the removal is of the very socket (device and inode) that was probed. The pid file names the
+//!   panel by its pid and its start time (field 22 of `/proc/<pid>/stat`), so a pid that was reused
+//!   by an unrelated process does not count as the panel. Where no start time can be read (off
+//!   Linux), or in the file of a panel that wrote only its pid, a reused pid keeps the claim
+//!   unresponsive until that process exits, which is the price of never deleting a live panel's
+//!   socket. A panel that reads only a pid finds none in the two-field form and falls back to its
+//!   connect probe, which removes nothing that still has a listener.
 
 use crate::instance_dir::ConnectOutcome;
 use std::cell::Cell;
@@ -166,7 +170,8 @@ pub fn split_socket_path(dir: &Path, project_root: &Path, pid: u32, nonce: u32) 
     agent::socket_path::in_dir(dir, &format!("split-{project}-{pid}-{nonce:08x}.sock"))
 }
 
-/// `dir/p-<16 hex>.pid`, the pid of the panel that owns the socket.
+/// `dir/p-<16 hex>.pid`, the pid (and, where it can be read, the start time) of the panel that owns
+/// the socket.
 pub fn pid_path(dir: &Path, project_root: &Path) -> PathBuf {
     dir.join(format!("p-{}.pid", key(project_root)))
 }
@@ -560,9 +565,68 @@ fn send(sock: &Path, request: &Request, timeout: Duration) -> Result<Reply, Stri
     }
 }
 
-/// The pid in `pid_file`, if it is a regular file of this user holding one. Never follows a link
-/// and never blocks on a special file.
+/// What a pid file says about the panel that wrote it: its pid and, when it was known, its start
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PidRecord {
+    pid: u32,
+    start: Option<u64>,
+}
+
+impl PidRecord {
+    /// This process, as its own pid file names it.
+    fn own() -> PidRecord {
+        let pid = std::process::id();
+        PidRecord {
+            pid,
+            start: crate::split::proc_start_time(pid),
+        }
+    }
+
+    fn line(self) -> String {
+        match self.start {
+            Some(start) => format!("{} {start}\n", self.pid),
+            None => format!("{}\n", self.pid),
+        }
+    }
+
+    /// `<pid>` (what a panel that knew no start time, or an older one, wrote) or `<pid> <start>`.
+    fn parse(text: &str) -> Option<PidRecord> {
+        let mut words = text.split_ascii_whitespace();
+        let pid = words.next()?.parse::<u32>().ok().filter(|&pid| pid != 0)?;
+        let start = match words.next() {
+            Some(word) => Some(word.parse::<u64>().ok()?),
+            None => None,
+        };
+        if words.next().is_some() {
+            return None;
+        }
+        Some(PidRecord { pid, start })
+    }
+
+    /// Whether the process this record names is still running. A recorded start time that the
+    /// current process of that pid does not have means the pid was reused. When the current start
+    /// time cannot be read, the pid alone decides, as it does for a record without a start time:
+    /// a live panel's socket is never taken for a leftover.
+    fn is_alive(self, start_of: &dyn Fn(u32) -> Option<u64>) -> bool {
+        if !agent::process_probe::pid_is_alive(self.pid) {
+            return false;
+        }
+        match (self.start, start_of(self.pid)) {
+            (Some(recorded), Some(now)) => recorded == now,
+            _ => true,
+        }
+    }
+}
+
+/// The pid in `pid_file`, if it is a regular file of this user holding one.
 fn read_pid(pid_file: &Path) -> Option<u32> {
+    read_pid_record(pid_file).map(|record| record.pid)
+}
+
+/// The record in `pid_file`, if it is a regular file of this user holding one. Never follows a link
+/// and never blocks on a special file.
+fn read_pid_record(pid_file: &Path) -> Option<PidRecord> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -573,8 +637,8 @@ fn read_pid(pid_file: &Path) -> Option<u32> {
         return None;
     }
     let mut text = String::new();
-    file.take(32).read_to_string(&mut text).ok()?;
-    text.trim().parse::<u32>().ok().filter(|&pid| pid != 0)
+    file.take(64).read_to_string(&mut text).ok()?;
+    PidRecord::parse(&text)
 }
 
 /// `(device, inode)` of `path` itself, not of what a link there points at.
@@ -661,11 +725,12 @@ fn probe(sock: &Path, pid_file: &Path, request: Option<&Request>) -> Result<Prob
         if let Ok(reply) = send(sock, request, FORWARD_DEADLINE) {
             return Ok(Probe::Answered(reply));
         }
-        let pid = read_pid(pid_file);
+        let record = read_pid_record(pid_file);
+        let pid = record.map(|record| record.pid);
         let connect = crate::instance_dir::nonblocking_connect_outcome(sock);
-        if let Some(pid) = pid.filter(|&pid| agent::process_probe::pid_is_alive(pid)) {
+        if let Some(record) = record.filter(|record| record.is_alive(&crate::split::proc_start_time)) {
             // Alive but silent, whether or not a connect would be refused right now.
-            return Ok(Probe::Unresponsive(pid));
+            return Ok(Probe::Unresponsive(record.pid));
         }
         match connect {
             ConnectOutcome::NoListener => {}
@@ -724,8 +789,13 @@ pub fn claim(dir: &Path, project_root: &Path, request: Option<&Request>) -> Resu
                     // The socket was replaced while it was being probed: judge the new one.
                     continue;
                 }
-                remove_own_socket(&sock);
+                // The pid file goes first. Only a claimant that has bound the socket writes one,
+                // and nobody can bind until the socket is gone; the other order would delete the
+                // pid file of a claimant that won the path between the two removals.
                 remove_own_pid_file(&pid_file);
+                #[cfg(test)]
+                between_removals::run();
+                remove_own_socket(&sock);
                 reclaimed = true;
             }
         }
@@ -734,6 +804,27 @@ pub fn claim(dir: &Path, project_root: &Path, request: Option<&Request>) -> Resu
         "the control socket {} kept changing; giving up",
         sock.display()
     ))
+}
+
+/// A test's look at the moment between a reclaim's two removals, when another claimant could act.
+#[cfg(test)]
+mod between_removals {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn set(hook: Box<dyn FnMut()>) {
+        HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+    }
+
+    pub(super) fn run() {
+        let hook = HOOK.with(|cell| cell.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// The bound socket's side of a won claim: finishes setting it up and starts the thread.
@@ -747,7 +838,7 @@ fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf) -> Result<Con
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("could not set the mode of {}: {e}", sock.display()))?;
         let tmp = pid_file.with_extension("pid.tmp");
-        agent::private_fs::write_private(&tmp, format!("{}\n", std::process::id()).as_bytes())
+        agent::private_fs::write_private(&tmp, PidRecord::own().line().as_bytes())
             .and_then(|()| std::fs::rename(&tmp, &pid_file))
             .map_err(|e| {
                 let _ = std::fs::remove_file(&tmp);
@@ -1039,10 +1130,7 @@ mod tests {
         let pid_file = pid_path(&dir, &root());
         assert!(sock.symlink_metadata().unwrap().file_type().is_socket());
         assert_eq!(mode(&sock), 0o600);
-        assert_eq!(
-            std::fs::read_to_string(&pid_file).unwrap(),
-            format!("{}\n", std::process::id())
-        );
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), PidRecord::own().line());
         assert_eq!(mode(&pid_file), 0o600);
         assert!(!pid_file.with_extension("pid.tmp").exists());
         server.cleanup();
@@ -1141,14 +1229,140 @@ mod tests {
         // A pid far above any real pid_max: `kill` answers ESRCH, and the probe does not pre-reject it.
         std::fs::write(pid_path(&dir, &root()), format!("{}\n", i32::MAX)).unwrap();
         let server = ours(claim(&dir, &root(), None));
-        assert_eq!(
-            std::fs::read_to_string(pid_path(&dir, &root())).unwrap(),
-            format!("{}\n", std::process::id())
-        );
+        assert_eq!(read_pid(&pid_path(&dir, &root())), Some(std::process::id()));
         server.cleanup();
 
         // The same with no pid file at all: stale only after the recheck.
         drop(UnixListener::bind(&sock).unwrap());
+        let server = ours(claim(&dir, &root(), None));
+        server.cleanup();
+    }
+
+    /// A claimant that binds the path while a reclaim is between its two removals, and writes its pid
+    /// as the winner does, must keep that pid file: removing it would leave a live panel that every
+    /// later claim finds silent and pidless.
+    #[test]
+    fn a_claimant_that_binds_during_a_reclaim_keeps_its_pid_file() {
+        let scratch = ScratchDir::new("eitri-pc", "between");
+        let dir = scratch.join("c");
+        ensure_dir(&dir).unwrap();
+        let sock = socket_path(&dir, &root()).unwrap();
+        let pid_file = pid_path(&dir, &root());
+        drop(UnixListener::bind(&sock).unwrap());
+        std::fs::write(&pid_file, format!("{}\n", i32::MAX)).unwrap();
+        let intruder: std::rc::Rc<std::cell::RefCell<Option<UnixListener>>> = Default::default();
+        let held = std::rc::Rc::clone(&intruder);
+        let (hook_sock, hook_pid_file) = (sock.clone(), pid_file.clone());
+        between_removals::set(Box::new(move || {
+            if let Ok(listener) = UnixListener::bind(&hook_sock) {
+                std::fs::write(&hook_pid_file, "4242\n").unwrap();
+                *held.borrow_mut() = Some(listener);
+            }
+        }));
+        let claimed = claim(&dir, &root(), None);
+        let recorded = read_pid(&pid_file);
+        if intruder.borrow().is_some() {
+            assert_eq!(
+                recorded,
+                Some(4242),
+                "the intruder won the path but lost its pid file: {claimed:?}"
+            );
+        } else {
+            let server = ours(claimed);
+            assert_eq!(recorded, Some(std::process::id()));
+            server.cleanup();
+        }
+    }
+
+    /// The winner records its start time beside its pid, so a later claim can tell it from an
+    /// unrelated process that was given the same pid after it died.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_pid_file_names_the_winner_by_pid_and_start_time() {
+        let scratch = ScratchDir::new("eitri-pc", "pidstart");
+        let dir = scratch.join("c");
+        let server = ours(claim(&dir, &root(), None));
+        let own = std::process::id();
+        let start = crate::split::proc_start_time(own).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pid_path(&dir, &root())).unwrap(),
+            format!("{own} {start}\n")
+        );
+        server.cleanup();
+        assert!(
+            !pid_path(&dir, &root()).exists(),
+            "cleanup must still know its own pid file"
+        );
+    }
+
+    #[test]
+    fn a_pid_record_reads_both_forms_and_nothing_else() {
+        assert_eq!(PidRecord::parse("42\n"), Some(PidRecord { pid: 42, start: None }));
+        assert_eq!(
+            PidRecord::parse("42 777\n"),
+            Some(PidRecord {
+                pid: 42,
+                start: Some(777)
+            })
+        );
+        for junk in ["", "0", "0 5", "x", "42 x", "42 7 8", "-1", "42 -7"] {
+            assert_eq!(PidRecord::parse(junk), None, "{junk:?}");
+        }
+        let record = PidRecord {
+            pid: 42,
+            start: Some(777),
+        };
+        assert_eq!(PidRecord::parse(&record.line()), Some(record));
+        let bare = PidRecord { pid: 42, start: None };
+        assert_eq!(bare.line(), "42\n");
+    }
+
+    /// Where the current start time cannot be read, the pid alone decides, as it always did.
+    #[test]
+    fn a_pid_whose_start_time_cannot_be_read_counts_as_alive_when_it_runs() {
+        let own = std::process::id();
+        let unknown = |_: u32| None;
+        assert!(PidRecord {
+            pid: own,
+            start: Some(1)
+        }
+        .is_alive(&unknown));
+        assert!(PidRecord { pid: own, start: None }.is_alive(&|_| Some(5)));
+        assert!(!PidRecord {
+            pid: own,
+            start: Some(1)
+        }
+        .is_alive(&|_| Some(2)));
+        assert!(!PidRecord {
+            pid: i32::MAX as u32,
+            start: None
+        }
+        .is_alive(&unknown));
+    }
+
+    /// A recorded pid that is alive but started at another time than recorded is a reused pid: the
+    /// socket it was recorded for is a leftover. The right start time keeps it alive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recorded_pid_with_another_start_time_is_not_alive() {
+        let scratch = ScratchDir::new("eitri-pc", "reused");
+        let dir = scratch.join("c");
+        ensure_dir(&dir).unwrap();
+        let sock = socket_path(&dir, &root()).unwrap();
+        let pid_file = pid_path(&dir, &root());
+        let own = std::process::id();
+        let start = crate::split::proc_start_time(own).unwrap();
+
+        drop(UnixListener::bind(&sock).unwrap());
+        std::fs::write(&pid_file, format!("{own} {start}\n")).unwrap();
+        let claimed = claim(&dir, &root(), None);
+        assert!(
+            matches!(claimed, Ok(Claim::Unresponsive { pid }) if pid == own),
+            "{claimed:?}"
+        );
+        assert!(sock.exists() && pid_file.exists());
+
+        std::fs::write(&pid_file, format!("{own} {}\n", start + 1)).unwrap();
         let server = ours(claim(&dir, &root(), None));
         server.cleanup();
     }

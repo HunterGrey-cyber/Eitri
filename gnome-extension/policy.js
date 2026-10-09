@@ -142,13 +142,18 @@ export function cleanPartnerList(pids, {shellPid, callerPid}) {
 
 // The partner is the first pid in the chain that owns a window right now: the caller cannot list windows, so it names
 // the editor's whole ancestry and the shell picks the one that actually has the window (a terminal hosting nvim, or
-// Neovide itself).
-export function partnerPid(chain, ownsWindow) {
+// Neovide itself). With `ownsPreferred` the chain is read twice: first for a pid that passes it, and only when none
+// does, for one that passes `ownsWindow`. The chain starts at the editor itself and its shell, which own no window; a
+// window of another application that claims one of those pids would otherwise be reached before the terminal's own.
+export function partnerPid(chain, ownsWindow, ownsPreferred = null) {
     if (!Array.isArray(chain))
         return null;
-    for (const pid of chain) {
-        if (isPid(pid) && ownsWindow(pid) === true)
-            return pid;
+    const passes = typeof ownsPreferred === 'function' ? [ownsPreferred, ownsWindow] : [ownsWindow];
+    for (const owns of passes) {
+        for (const pid of chain) {
+            if (isPid(pid) && owns(pid) === true)
+                return pid;
+        }
     }
     return null;
 }
@@ -254,12 +259,25 @@ function stackPlace(w) {
     return Number.isFinite(w.stack) ? w.stack : -Infinity;
 }
 
-// The pid's user window to activate: the most recently used one, and among windows the shell's most-recently-used
-// list does not hold, the highest in the stacking order. The list only orders; it decides nothing about ownership.
+// Whether `w` is one of the windows that stand for `pid`. A Wayland window's pid is the connection's, which the
+// compositor knows; an X11 window's is a property the client writes itself, so an Xwayland client could claim another
+// process's pid. A pid's X11 windows stand for it only when it has no Wayland user window at all, which keeps an editor
+// that really runs under X11 reachable without letting an X11 window impersonate a Wayland application.
+function standsFor(windows, w, pid) {
+    if (w.pid !== pid || !isUserWindow(w))
+        return false;
+    if (w.wayland === true)
+        return true;
+    return !windows.some(o => o.pid === pid && o.wayland === true && isUserWindow(o));
+}
+
+// The pid's user window to activate: the most recently used of those that stand for it (`standsFor`), and among
+// windows the shell's most-recently-used list does not hold, the highest in the stacking order. The list only orders;
+// it decides nothing about ownership.
 function mostRecentWindowOf(windows, pid) {
     let best = null;
     for (const w of windows) {
-        if (w.pid !== pid || !isUserWindow(w))
+        if (!standsFor(windows, w, pid))
             continue;
         if (best === null || mruPlace(w) < mruPlace(best) ||
             (mruPlace(w) === mruPlace(best) && stackPlace(w) > stackPlace(best)))
@@ -286,7 +304,8 @@ const refuse = reason => ({act: false, reason});
 //   {id, pid, wayland, userTime, rect: {x, y, w, h}, minimized, type, skipTaskbar, onWorkspace, monitor, stack, mru}
 // where `type` is 'normal', 'dialog' or 'other', `skipTaskbar` the window's own flag, and `mru` the window's place in
 // the shell's most-recently-used list (smaller is more recent), or null when it is not in that list. A pid "owns a
-// window" when one of its windows passes `isUserWindow`; `mru` only chooses between a pid's windows.
+// window" when one of its windows passes `isUserWindow`; `mru` only chooses between a pid's windows, and a pid's
+// Wayland windows come before any of its X11 ones (`standsFor`).
 // `partnerChain` is what the caller last set (already cleaned), `focusGained64` the time the focused window last
 // gained focus and `now64` the current time, both on the extension's monotonic millisecond clock, `focusGainedByUs`
 // whether that gain was the extension's own activation, `focusGainedFrom` the pid whose window had focus when that
@@ -329,7 +348,7 @@ export function decide({
                 direction);
             return id === null ? refuse('nothing-there') : {act: true, target: id};
         }
-        const partner = partnerPid(chainWithout(partnerChain, callerPid), pid => mostRecentWindowOf(all, pid) !== null);
+        const partner = resolvePartner(all, partnerChain, callerPid);
         if (partner === null)
             return refuse('no-partner');
         if (!mayLeavePulledFocusFor({focusGainedByUs, focusGainedFrom, partnerPid: partner}))
@@ -340,7 +359,7 @@ export function decide({
     // The caller chose its partner, so it must also be an application the user has been in lately.
     if (!callerHeldFocus({callerFocusedAt64, now64}))
         return refuse('caller-not-focused-lately');
-    const partner = partnerPid(chainWithout(partnerChain, callerPid), pid => mostRecentWindowOf(all, pid) !== null);
+    const partner = resolvePartner(all, partnerChain, callerPid);
     if (partner === null)
         return refuse('no-partner');
     if (focused.pid !== partner)
@@ -355,13 +374,24 @@ export function decide({
             return refuse('nothing-there');
         // Only the caller's own window may be the one focus moves to; otherwise the caller would learn, or steer,
         // where some other window sits.
-        if (all.find(w => w.id === id).pid !== callerPid)
+        if (!standsFor(all, all.find(w => w.id === id), callerPid))
             return refuse('neighbour-not-caller');
         return {act: true, target: id};
     }
 
     const own = mostRecentWindowOf(all, callerPid);
     return own === null ? refuse('no-own-window') : {act: true, target: own.id};
+}
+
+// The partner pid for a call: the first pid of the chain with a Wayland user window, else the first with any user
+// window (an editor that really runs under X11). Wayland windows are judged by the compositor's pid; an X11 window's
+// pid is client-written, so it may name a pid only when nothing in the whole chain has a Wayland window.
+function resolvePartner(all, partnerChain, callerPid) {
+    return partnerPid(
+        chainWithout(partnerChain, callerPid),
+        pid => mostRecentWindowOf(all, pid) !== null,
+        pid => all.some(w => w.pid === pid && w.wayland === true && isUserWindow(w)),
+    );
 }
 
 function chainWithout(chain, pid) {

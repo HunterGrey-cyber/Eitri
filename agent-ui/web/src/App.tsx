@@ -55,6 +55,7 @@ import {
   currentStop,
   hintTargets,
   isActivatableControl,
+  linkClickNeedsLook,
   linkOpensAtOnce,
   nextControl,
   permissionTarget,
@@ -64,6 +65,7 @@ import {
   webLinks,
   HINT_ALPHABET,
 } from "./nav";
+import type { ShownLink } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
 import type { TimelineItem } from "./timeline";
 import { pathsIn, viewText } from "./paths";
@@ -807,6 +809,8 @@ export default function App() {
   /** The footer's transient line. `seq` so the same text twice is two flashes. */
   const [flash, setFlash] = useState<{ text: string; seq: number } | null>(null);
   const flashSeq = useRef(0);
+  /** The reply link whose address the last click showed instead of opening (`linkClickNeedsLook`). */
+  const shownLinkRef = useRef<ShownLink | null>(null);
   function showFlash(text: string) {
     flashSeq.current += 1;
     setFlash({ text, seq: flashSeq.current });
@@ -5574,6 +5578,24 @@ export default function App() {
       onPointerDownCapture={() => {
         exitRegion();
         arrivalParkRef.current = null; // #22: a press in the panel is a place chosen by hand
+      }}
+      // Every link in the panel is a reply's (the page writes none of its own), and a click on one is the
+      // browser's own navigation, which Rust launches with no look at where it goes. A link whose text is
+      // not its own address shows that address first; a second click on it opens it. Capture phase, so
+      // the default is gone before anything below sees the click; the click itself still propagates.
+      onClickCapture={(event) => {
+        const anchor = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>("a[href]") : null;
+        const root = containerRef.current;
+        if (anchor === null || root === null) return;
+        const now = Date.now();
+        const url = linkClickNeedsLook(anchor, root, shownLinkRef.current, now);
+        if (url === null) {
+          shownLinkRef.current = null;
+          return;
+        }
+        event.preventDefault();
+        shownLinkRef.current = { el: anchor, row: rowOf(root, anchor), url, at: now };
+        showFlash(`${url} — click again to open`);
       }}
       onFocus={(event) => {
         // Record a plain Tab's landing only at that key count and only if its default survived every

@@ -12,6 +12,11 @@
 //! A plain `main` (`harness = false`): the helper that gives a test its own display, and cuts the
 //! session bus off, has to run first thing on the main thread before anything else starts, and this
 //! test links GTK's crates even though it never opens a window.
+//!
+//! The fake extension also owns `org.gnome.Shell`, as gnome-shell, where the real one runs, does:
+//! the caller only calls an owner that is the same process as that name's owner. A test that needs
+//! that name held by another process starts this binary again in a helper mode
+//! ([`SQUATTER_ENV`]), checked in `main` before anything else, killed by its captured pid.
 
 // Never reaches a display or the session bus: it starts its own Xvfb, and sets the session bus
 // address to a dead one before anything connects (2026-09-29).
@@ -140,10 +145,16 @@ thread_local! {
 fn bus_name_call(method: &str, flags_arg: bool) -> Option<u32> {
     FAKE_CONNECTION.with(|slot| {
         let connection = slot.borrow().clone().expect("the fake's connection");
+        name_call(&connection, method, gnome_shell::BUS_NAME, flags_arg)
+    })
+}
+
+fn name_call(connection: &DBusConnection, method: &str, name: &str, flags_arg: bool) -> Option<u32> {
+    {
         let args = if flags_arg {
-            (gnome_shell::BUS_NAME, 0u32).to_variant()
+            (name, 0u32).to_variant()
         } else {
-            (gnome_shell::BUS_NAME,).to_variant()
+            (name,).to_variant()
         };
         let reply = connection
             .call_sync(
@@ -159,7 +170,7 @@ fn bus_name_call(method: &str, flags_arg: bool) -> Option<u32> {
             )
             .expect("the bus answers");
         reply.get::<(u32,)>().map(|(code,)| code)
-    })
+    }
 }
 
 /// The extension's interface on its own connection, on its own thread and main context.
@@ -173,6 +184,12 @@ struct FakeExtension {
 
 impl FakeExtension {
     fn start(address: &str) -> FakeExtension {
+        Self::start_with(address, true)
+    }
+
+    /// As [`start`](Self::start); `as_the_shell` says whether its connection also owns
+    /// `org.gnome.Shell`, as the real extension's (gnome-shell's own) does.
+    fn start_with(address: &str, as_the_shell: bool) -> FakeExtension {
         let calls: Arc<Mutex<Vec<Call>>> = Arc::default();
         let stalled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -218,6 +235,13 @@ impl FakeExtension {
                         .unwrap();
                     FAKE_CONNECTION.with(|slot| *slot.borrow_mut() = Some(connection.clone()));
                     assert_eq!(bus_name_call("RequestName", true), Some(1), "primary owner of the name");
+                    if as_the_shell {
+                        assert_eq!(
+                            name_call(&connection, "RequestName", gnome_shell::SHELL_NAME, true),
+                            Some(1),
+                            "primary owner of the shell's name"
+                        );
+                    }
                     let main_loop = MainLoop::new(Some(&context), false);
                     tx.send((main_loop.clone(), context.clone())).unwrap();
                     main_loop.run();
@@ -478,9 +502,122 @@ fn an_extension_that_appears_after_a_first_absent_verdict_is_found() {
     });
 }
 
+/// Set on a child of this binary that only owns `org.gnome.Shell` on the private bus it names, and
+/// holds it until it is killed.
+const SQUATTER_ENV: &str = "EITRI_GSB_SHELL_NAME_SQUATTER";
+
+/// The helper mode: connect, own the shell's name, say so on stdout, and wait for stdin to close.
+fn squat_on_the_shell_name(address: &str) {
+    let connection = DBusConnection::for_address_sync(
+        address,
+        DBusConnectionFlags::AUTHENTICATION_CLIENT | DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+        None,
+        gio::Cancellable::NONE,
+    )
+    .expect("the squatter connects to the private bus");
+    assert_eq!(
+        name_call(&connection, "RequestName", gnome_shell::SHELL_NAME, true),
+        Some(1)
+    );
+    println!("ready");
+    let mut sink = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut sink);
+}
+
+/// Another process holding `org.gnome.Shell`, killed by its captured pid when dropped.
+struct Squatter(Child);
+
+impl Squatter {
+    fn start(address: &str) -> Squatter {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .env(SQUATTER_ENV, address)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("the squatter starts");
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+        assert_eq!(line.trim(), "ready", "the squatter owns the shell's name");
+        Squatter(child)
+    }
+}
+
+impl Drop for Squatter {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Calls the caller makes, and what the owner of the extension's name got of them, when that owner
+/// is not the process that owns `org.gnome.Shell`.
+fn calls_to_an_owner_that_is_not_the_shell(bus: &PrivateBus, service: &FakeExtension) {
+    on_own_context(async {
+        let shell = caller(&bus.address);
+        let appeared = Rc::new(std::cell::Cell::new(0u32));
+        {
+            let appeared = appeared.clone();
+            shell.on_appeared(Box::new(move || appeared.set(appeared.get() + 1)));
+        }
+        shell.probe();
+        let (partner, done) = answer();
+        shell.set_partner(vec![300, 250], done);
+        let (activate, done) = answer();
+        shell.activate_partner(done);
+        until("the refused calls", 5000, || {
+            partner.borrow().is_some() && activate.borrow().is_some()
+        })
+        .await;
+        // Long enough for a watch's appearance and its check to have run.
+        glib::timeout_future(Duration::from_millis(300)).await;
+        assert_eq!(*partner.borrow(), Some(None));
+        assert_eq!(*activate.borrow(), Some(None));
+        assert_eq!(
+            appeared.get(),
+            0,
+            "an owner that is not the shell is not told the partner again"
+        );
+        assert_ne!(
+            shell.present(),
+            Some(false),
+            "something owns the name: not 'not installed'"
+        );
+        assert_ne!(shell.present(), Some(true));
+    });
+    assert_eq!(
+        service.calls(),
+        vec![],
+        "nothing reached an owner that is not the shell"
+    );
+}
+
+/// A process of this user that took the extension's name first, while gnome-shell is another
+/// process: it is never called, so it learns no process chain and answers nothing.
+fn an_owner_that_is_not_the_shells_process_is_never_called() {
+    let Some(bus) = PrivateBus::start("squatter") else {
+        return;
+    };
+    let _shell = Squatter::start(&bus.address);
+    let service = FakeExtension::start_with(&bus.address, false);
+    calls_to_an_owner_that_is_not_the_shell(&bus, &service);
+}
+
+/// With nobody owning `org.gnome.Shell`, nothing proves the extension's owner is gnome-shell.
+fn an_owner_with_no_shell_beside_it_is_never_called() {
+    let Some(bus) = PrivateBus::start("noshell") else {
+        return;
+    };
+    let service = FakeExtension::start_with(&bus.address, false);
+    calls_to_an_owner_that_is_not_the_shell(&bus, &service);
+}
+
 fn main() {
+    if let Some(address) = std::env::var_os(SQUATTER_ENV) {
+        squat_on_the_shell_name(&address.to_string_lossy());
+        return;
+    }
     let server = own_x_server::isolate("gnome_shell_bus", "640x480x24");
-    let tests: [(&str, fn()); 5] = [
+    let tests: [(&str, fn()); 7] = [
         (
             "each_method_reaches_the_service_by_name_with_the_documented_argument_types",
             each_method_reaches_the_service_by_name_with_the_documented_argument_types,
@@ -500,6 +637,14 @@ fn main() {
         (
             "an_extension_that_appears_after_a_first_absent_verdict_is_found",
             an_extension_that_appears_after_a_first_absent_verdict_is_found,
+        ),
+        (
+            "an_owner_that_is_not_the_shells_process_is_never_called",
+            an_owner_that_is_not_the_shells_process_is_never_called,
+        ),
+        (
+            "an_owner_with_no_shell_beside_it_is_never_called",
+            an_owner_with_no_shell_beside_it_is_never_called,
         ),
     ];
     let mut failed = 0;

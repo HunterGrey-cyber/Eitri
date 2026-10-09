@@ -24,6 +24,39 @@ t_root_allowed() {
 	expect_eq "$(installed_version)" 1.0.0 "installed with --allow-root"
 }
 
+TESTS="$TESTS t_root_cache_of_another_user_refused"
+t_root_cache_of_another_user_refused() {
+	# Root (`sudo -E` keeps the user's HOME) downloading into a cache another user owns: that user can
+	# replace a download after it was checked and before root unpacks it, so the ownership checks hold
+	# for root too, against root's own uid. find-as-root stands in for a real chown.
+	serve 1.0.0
+	mkdir -p "$TH/.cache"
+	printf '%s\n' "$TH/.cache" >"$S/logs/fake-owner-path"
+	inst_net --stubs "$S/stubs-root" -- --allow-root
+	expect_fail "root with a cache directory another user owns"
+	expect_out "$TH/.cache is owned by another user"
+	expect_absent "$TH/.local/lib/eitri"
+	rm -f "$S/logs/fake-owner-path"
+	mkdir -p "$TH/.cache/eitri"
+	printf '%s\n' "$TH/.cache/eitri" >"$S/logs/fake-owner-path"
+	inst_net --stubs "$S/stubs-root" -- --allow-root
+	expect_fail "root with a <cache>/eitri another user owns"
+	expect_out "$TH/.cache/eitri is owned by another user"
+	expect_absent "$TH/.local/lib/eitri"
+	rm -f "$S/logs/fake-owner-path"
+	rm -rf "$T/private-cache" "$TH/.cache/eitri"
+	mkdir -p "$T/private-cache"
+	chmod 0700 "$T/private-cache"
+	rm -rf "$TH/.cache"
+	ln -s "$T/private-cache" "$TH/.cache"
+	printf '%s\n' "$TH/.cache" >"$S/logs/fake-owner-path"
+	inst_net --stubs "$S/stubs-root" -- --allow-root
+	expect_fail "root with a cache root that is another user's symlink"
+	expect_out "$TH/.cache is a symlink owned by another user"
+	expect_absent "$TH/.local/lib/eitri"
+	rm -f "$S/logs/fake-owner-path"
+}
+
 TESTS="$TESTS t_home_root_refused"
 t_home_root_refused() {
 	# A HOME that is / however it is spelled -- `//` passed a check made before trimming slashes --

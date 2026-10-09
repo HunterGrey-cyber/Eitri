@@ -8,6 +8,16 @@
 //! the bytes on disk. So [`command`] clears the environment and rebuilds it from a short allowlist,
 //! names the git directory and the work tree explicitly, and never goes through a shell.
 //!
+//! One piece of a project's own configuration does reach it. git reads the repository-level config
+//! of whatever git directory it opens, and to tell whether a nested repository in the project has a
+//! commit checked out, turn review names that repository's own `.git`
+//! (`rev-parse --verify -q HEAD^{commit}`), so its `.git/config` is read; recording such a
+//! repository as a gitlink also has git look inside it. That is harmless: these runs start no hook,
+//! filter, pager or helper and write nothing into the nested repository, the `-c` overrides below
+//! still beat the file, and the most a hostile config can do is flip the answer, which leaves the
+//! nested repository out of the snapshot or makes the snapshot fail (git refuses to add a
+//! repository with no commit), never runs anything.
+//!
 //! Two read-only questions are asked of git in the user's own environment, because their answers
 //! live there: where the user's global excludes file is ([`user_excludes_file`]), and where a
 //! project's common git directory is ([`user_read_only`]). Neither writes anything.

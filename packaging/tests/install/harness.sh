@@ -78,6 +78,7 @@ setup_stubs() {
 	cp "$FIXTURES/gtk-update-icon-cache-fails" "$S/stubs-iccache-fail/gtk-update-icon-cache"
 	cp "$FIXTURES/gtk-update-icon-cache-writes" "$S/stubs-iccache-writes/gtk-update-icon-cache"
 	cp "$FIXTURES/id-root" "$S/stubs-root/id"
+	cp "$FIXTURES/find-as-root" "$S/stubs-root/find"
 	cp "$FIXTURES/tar-fail" "$S/stubs-tarfail/tar"
 	cp "$FIXTURES/curl-mirror" "$S/stubs-net/curl"
 	cp "$FIXTURES/wget-mirror" "$S/stubs-wget/wget"

@@ -1084,3 +1084,91 @@ t_cache_parent_owned_by_another_user_refused() {
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.0.0 "the version once the parent is ours"
 }
+
+# add_member TARBALL KIND NAME [TARGET]: TARBALL (gzip) gets one more member, a file (KIND file) or a
+# symlink (KIND link, to TARGET), under exactly NAME -- names `tar` itself would not write.
+add_member() {
+	python3 -I - "$@" <<'PY'
+import io, os, sys, tarfile
+path, kind, name = sys.argv[1:4]
+target = sys.argv[4] if len(sys.argv) > 4 else ""
+tmp = path + ".new"
+with tarfile.open(path, "r:gz") as src, tarfile.open(tmp, "w:gz", format=tarfile.GNU_FORMAT) as dst:
+    for m in src.getmembers():
+        dst.addfile(m, src.extractfile(m) if m.isreg() else None)
+    info = tarfile.TarInfo(name)
+    if kind == "link":
+        info.type, info.linkname = tarfile.SYMTYPE, target
+        dst.addfile(info)
+    else:
+        data = b"planted\n"
+        info.size = len(data)
+        dst.addfile(info, io.BytesIO(data))
+os.replace(tmp, path)
+PY
+}
+
+TESTS="$TESTS t_release_member_outside_refused"
+t_release_member_outside_refused() {
+	# A verified tarball is still listed before it is unpacked: a member with an absolute name or a `..`
+	# component, or a symlink leading out of the directory it is unpacked into, is refused, whatever the
+	# tar in use would have made of it.
+	top=eitri-1.0.0-x86_64-linux
+	for spec in "file /planted-abs" "file $top/../../planted-dots" "file $top/share/../../../planted-deep" \
+		"link $top/share/out /etc" "link $top/share/up ../../../../../.." "link $top/lib/eitri/far ../../../../x"; do
+		serve 1.0.0
+		d=$(served 1.0.0)
+		# shellcheck disable=SC2086 # split the member description into arguments
+		add_member "$d/$top.tar.gz" $spec
+		resign "$d"
+		relatest 1.0.0
+		inst_net --
+		expect_fail "a release tarball holding $spec"
+		expect_out "eitri-1.0.0-x86_64-linux.tar.gz holds "
+		expect_out ": refusing to "
+		expect_absent "$TH/.local/lib/eitri"
+		expect_absent "$TH/.cache/planted-dots"
+		expect_absent "$TH/.cache/planted-deep"
+	done
+	# A link that stays inside is fine: one level up from share/ is still the release's own top.
+	serve 1.0.0
+	d=$(served 1.0.0)
+	add_member "$d/$top.tar.gz" link "$top/share/doc-link" ../lib/eitri/RELEASE
+	resign "$d"
+	relatest 1.0.0
+	inst_net --
+	expect_rc 0
+	expect_eq "$(installed_version)" 1.0.0 "installed with a link that stays inside the release"
+}
+
+TESTS="$TESTS t_release_link_chain_outside_refused"
+t_release_link_chain_outside_refused() {
+	# Each link's text alone stays inside, but read through the other link the second climbs out: a `..`
+	# after a component that is itself a link goes up from wherever that link leads.
+	top=eitri-1.0.0-x86_64-linux
+	for pair in "s . l s/.." "$top/a . $top/share/far ../a/../../outside"; do
+		# shellcheck disable=SC2086 # the pair's words are the arguments
+		set -- $pair
+		serve 1.0.0
+		d=$(served 1.0.0)
+		add_member "$d/$top.tar.gz" link "$1" "$2"
+		add_member "$d/$top.tar.gz" link "$3" "$4"
+		resign "$d"
+		relatest 1.0.0
+		inst_net --
+		expect_fail "a release tarball holding $1 -> $2 and $3 -> $4"
+		expect_out "eitri-1.0.0-x86_64-linux.tar.gz holds a symlink leading outside"
+		expect_out "$3 -> $4"
+		expect_absent "$TH/.local/lib/eitri"
+	done
+	# A chain that only goes down through the other link stays inside.
+	serve 1.0.0
+	d=$(served 1.0.0)
+	add_member "$d/$top.tar.gz" link "$top/a" lib
+	add_member "$d/$top.tar.gz" link "$top/share/via" ../a/eitri/RELEASE
+	resign "$d"
+	relatest 1.0.0
+	inst_net --
+	expect_rc 0
+	expect_eq "$(installed_version)" 1.0.0 "installed with a link that goes down through another link"
+}

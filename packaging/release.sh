@@ -491,12 +491,68 @@ preflight() {
 		if [ "$has_key" = 1 ] && [ -n "$RS_SIGNERS_OVERRIDE" ] && ! signers_list_blob "$signers_file" "$blob"; then
 			die "packaging/release-signers already holds a release key, but --sign's key is not listed there (only in $RS_SIGNERS_OVERRIDE): an installer built from this tree embeds packaging/release-signers and could not verify a signature made with this key"
 		fi
-		for idpub in "$HOME"/.ssh/id_*.pub; do
+		# A key ssh offers to hosts by itself is a login key, even when nothing else in ~/.ssh holds its
+		# public half: ssh's default identities, and every file an IdentityFile line of ~/.ssh/config
+		# names. That parse is plain on purpose: the keyword in any case, `=` or blanks before the value,
+		# double quotes stripped, a leading `~` or `%d` read as HOME. It does not follow Include, expand
+		# other tokens or environment variables, or read /etc/ssh/ssh_config.
+		local idpub own_pub signingkey sk_blob sk_file idname idfile
+		for idname in id_rsa id_dsa id_ecdsa id_ecdsa_sk id_ed25519 id_ed25519_sk; do
+			idfile="$(realpath -- "$HOME/.ssh/$idname" 2>/dev/null)" || continue
+			[ "$idfile" != "$RS_SIGN_KEY" ] \
+				|| die "$RS_SIGN_KEY is ~/.ssh/$idname, one of ssh's default identities: an everyday login key must never become the release key"
+		done
+		if [ -f "$HOME/.ssh/config" ]; then
+			while IFS= read -r idfile; do
+				case "$idfile" in
+					"~") idfile="$HOME" ;;
+					"~/"*) idfile="$HOME/${idfile#"~/"}" ;;
+					"%d") idfile="$HOME" ;;
+					"%d/"*) idfile="$HOME/${idfile#"%d/"}" ;;
+				esac
+				idfile="$(realpath -- "${idfile%.pub}" 2>/dev/null)" || continue
+				[ "$idfile" != "$RS_SIGN_KEY" ] \
+					|| die "$RS_SIGN_KEY is named by an IdentityFile line of ~/.ssh/config: an everyday login key must never become the release key"
+			done < <(awk '{
+				line = $0
+				sub(/^[ \t]+/, "", line)
+				if (tolower(substr(line, 1, 12)) != "identityfile") next
+				rest = substr(line, 13)
+				if (rest !~ /^[ \t=]/) next
+				sub(/^[ \t]*=?[ \t]*/, "", rest)
+				if (substr(rest, 1, 1) == "\"") { rest = substr(rest, 2); sub(/".*/, "", rest) }
+				else sub(/[ \t].*/, "", rest)
+				if (rest != "") print rest
+			}' "$HOME/.ssh/config")
+		fi
+		# Every public key kept in ~/.ssh is an everyday key, whatever its name (a deploy or push key is
+		# rarely id_*), except the release key's own public half lying beside it.
+		own_pub="$(realpath -- "$RS_SIGN_KEY.pub" 2>/dev/null)" || own_pub="$RS_SIGN_KEY.pub"
+		for idpub in "$HOME"/.ssh/*.pub; do
 			[ -f "$idpub" ] || continue
+			[ "$(realpath -- "$idpub")" != "$own_pub" ] || continue
 			if [ "$(key_blob "$(cat -- "$idpub")")" = "$blob" ]; then
 				die "$RS_SIGN_KEY is $idpub's key: an everyday login key must never become the release key"
 			fi
 		done
+		# The key git signs commits with is used every day too. It is `key::<public key>`, or a path to
+		# a public or a private key file (whose public half is then the .pub beside it).
+		signingkey="$(git -C "$RS_SOURCE" config --type=path --get user.signingkey 2>/dev/null)" || signingkey=""
+		sk_blob=""
+		case "$signingkey" in
+			"") ;;
+			key::*) sk_blob="$(key_blob "${signingkey#key::}")" ;;
+			*)
+				for sk_file in "$signingkey" "$signingkey.pub"; do
+					if [ -z "$sk_blob" ] && [ -f "$sk_file" ]; then
+						sk_blob="$(awk 'NF >= 2 && $2 ~ /^AAAA/ { print $2; exit }' "$sk_file" 2>/dev/null)" || sk_blob=""
+					fi
+				done
+				;;
+		esac
+		if [ -n "$sk_blob" ] && [ "$sk_blob" = "$blob" ]; then
+			die "$RS_SIGN_KEY is git's user.signingkey ($signingkey): a key that signs everyday commits must never become the release key"
+		fi
 		RS_SIGNERS="$(realpath "$signers")"
 	fi
 	if [ -n "$RS_SIGNERS_OVERRIDE" ]; then

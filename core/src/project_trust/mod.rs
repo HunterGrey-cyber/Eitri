@@ -11,8 +11,9 @@
 //!
 //! The fingerprint covers all of it by content: every file's bytes, every symlink's target as
 //! written (never followed) and every directory's name. Anything that could not be hashed -- a file
-//! over the size limit, unreadable, a FIFO, a socket, a device, a configuration file that is a link,
-//! or a walk over its budget -- leaves a gap in the fingerprint, so such a discovery is never
+//! over the size limit, unreadable, a FIFO, a socket, a device, a configuration file that is a link
+//! (and every link below a `.claude/`, whose whole content the CLI reads), or a walk over its budget
+//! -- leaves a gap in the fingerprint, so such a discovery is never
 //! `fully_hashed` and no answer about it may outlive the start it was asked for.
 //!
 //! Every byte read from the disk here goes through [`nofollow`], which opens nothing through a link
@@ -336,10 +337,18 @@ pub enum Finding {
         target: PathBuf,
         outside: bool,
     },
-    /// Files under a `.claude/` directory that are not its settings or memory files.
-    OtherFiles {
+    /// A file under a directory read whole that is not one the prompt says more about (a settings,
+    /// memory, rule or listing file): a command, an agent, a skill's file, a hook script. Named under
+    /// the directory it is in, with its size and, for a Markdown file, which of the frontmatter keys
+    /// that change what runs it sets.
+    OtherFile {
+        /// The directory the file is directly in.
         dir: PathBuf,
-        count: usize,
+        /// The file's name in `dir`.
+        name: PathBuf,
+        len: u64,
+        /// The frontmatter keys among `hooks`, `allowed-tools`, `permissionMode` and `mcpServers` it sets, in that order.
+        frontmatter: Vec<String>,
     },
     /// A directory that is named and deliberately not read, and why. It is not configuration the CLI
     /// loads for this root, so it is not unchecked either: its name is in the fingerprint, its

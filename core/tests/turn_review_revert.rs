@@ -21,7 +21,7 @@ use eitri_core::turn_review::{
     replace, review_dir_for, AppliedRevert, Blocked, Busy, Content, EditorCheck, EditorClear, ExactHunks, FsHooks,
     Journal, JournalEntry, JournalNote, Limits, Presence, PresenceGuard, ProjectDir, RecoverAnswer, Recovered, Refusal,
     RevertKind, RevertTarget, ReviewOptions, Saved, Scope, Shadow, Snap, Stage, TurnReview, WriteError,
-    BUFFER_STATE_LUA,
+    BUFFER_STATE_LUA, MAX_CLEAR_AGE,
 };
 use rmpv::Value;
 
@@ -852,6 +852,67 @@ fn a_clear_for_another_path_is_refused() {
     assert_eq!(w.pending_of(1).len(), 1, "the entry is kept");
 }
 
+/// The editor's word about unsaved changes holds only for a while: the buffer may be edited after
+/// it answered, so a write whose clear is older than `MAX_CLEAR_AGE` refuses, for a revert, an
+/// undo and a recovery alike, and writes nothing.
+#[test]
+fn an_old_clear_is_refused() {
+    let mut w = World::new("oldclear");
+    w.write("a.txt", b"base\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", b"end\n", 0o644));
+    let old = || {
+        let answered = Instant::now()
+            .checked_sub(MAX_CLEAR_AGE + Duration::from_secs(1))
+            .expect("the clock is past the bound");
+        EditorClear::answered_at_for_tests(&w.file("a.txt"), answered)
+    };
+    let stale = |result: Result<String, Refusal>| match result {
+        Err(Refusal::Editor(why)) => assert!(why.contains("press the key again"), "{why}"),
+        other => panic!("expected an editor refusal, got {other:?}"),
+    };
+    let refused = w
+        .review
+        .revert_job(
+            w.guard(),
+            wanted(),
+            SESSION,
+            n,
+            Scope::Turn,
+            "a.txt",
+            RevertTarget::File,
+            old(),
+        )
+        .run();
+    stale(refused.map(|a| format!("{a:?}")));
+    assert_eq!(w.read("a.txt"), b"end\n");
+
+    let applied = w.revert_file(n, "a.txt").unwrap();
+    let undo = w.review.undo_job(
+        w.guard(),
+        wanted(),
+        SESSION,
+        "a.txt",
+        applied.pre.clone(),
+        applied.post.clone(),
+        old(),
+    );
+    stale(undo.run().map(|()| String::new()));
+    assert_eq!(w.read("a.txt"), b"base\n");
+
+    let entry = crash_mid_write(&w, "a.txt");
+    let half = w.read("a.txt");
+    let refused = w
+        .review
+        .recover_job(w.guard(), &entry.id, RecoverAnswer::Restore(old()))
+        .run();
+    stale(refused.map(|r| format!("{r:?}")));
+    assert_eq!(w.read("a.txt"), half);
+    assert_eq!(w.pending_of(1).len(), 1, "the entry is kept");
+
+    // A clear given just now, as every other test's, still writes.
+    assert!(matches!(w.recover(&entry), Ok(Recovered::Restored)));
+}
+
 #[test]
 fn a_change_between_check_and_write_is_refused() {
     let mut w = World::new("latechange");
@@ -1305,6 +1366,42 @@ fn editor_check_refuses_with_no_link_modified_or_silence() {
             .unwrap();
         assert_eq!(clear.path(), path);
     }
+}
+
+/// An answer the editor gave in time but the panel took late (a stalled main loop) is as old as
+/// the question: the clear it makes must not read as fresh, or a buffer edited since passes.
+#[test]
+fn a_late_poll_does_not_make_a_stale_clear_fresh() {
+    let mut w = World::new("latepoll");
+    w.write("a.txt", b"base\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", b"end\n", 0o644));
+    let file = w.file("a.txt");
+    let asked_at = Instant::now()
+        .checked_sub(MAX_CLEAR_AGE + Duration::from_secs(1))
+        .expect("the clock is past the bound");
+    let editor = FakeEditor::new(Some(buffer(true, false)));
+    let clear = EditorCheck::start(Some(&editor), &file, asked_at)
+        .poll(Instant::now())
+        .expect("the answer is there")
+        .expect("a clean buffer");
+    let refused = w
+        .review
+        .revert_job(
+            w.guard(),
+            wanted(),
+            SESSION,
+            n,
+            Scope::Turn,
+            "a.txt",
+            RevertTarget::File,
+            clear,
+        )
+        .run();
+    match refused {
+        Err(Refusal::Editor(why)) => assert!(why.contains("press the key again"), "{why}"),
+        other => panic!("expected a stale refusal, got {other:?}"),
+    }
+    assert_eq!(w.read("a.txt"), b"end\n");
 }
 
 // ---- recovery --------------------------------------------------------------------------------------

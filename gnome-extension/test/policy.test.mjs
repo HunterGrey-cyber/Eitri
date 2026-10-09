@@ -270,6 +270,39 @@ test('decide: the partner is the first pid in the chain that owns a window in th
         {act: true, target: 3});
 });
 
+test('decide: an X11 window claiming the editor\'s pid does not beat the terminal\'s Wayland window', () => {
+    // The chain is nvim (210), its shell (211), the terminal (200). An X11 window writes 210 as its pid; the terminal
+    // has a Wayland window. The Wayland window is the partner.
+    const claimant = {id: 9, pid: 210, wayland: false, userTime: NOW - 100, rect: {x: 0, y: 0, w: 50, h: 50},
+        minimized: false, type: 'normal', skipTaskbar: false, onWorkspace: true, monitor: 0, stack: 9, mru: 0};
+    const chain = [210, 211, 200];
+    assert.deepEqual(decide(scene({patch: pressed(1), extra: [claimant],
+        call: {method: 'ActivatePartner', partnerChain: chain}})), {act: true, target: 2});
+    const near = {method: 'FocusSelfIfNeighbour', direction: 'right', focusedId: 2, partnerChain: chain};
+    assert.deepEqual(decide(scene({patch: pressed(2), extra: [claimant], call: near})), {act: true, target: 1});
+    assert.deepEqual(decide(scene({patch: pressed(2), extra: [claimant], call: {...near, method: 'ActivateOwn'}})),
+        {act: true, target: 1});
+});
+
+test('decide: an editor that runs under X11 is still the partner when no pid in the chain has a Wayland window', () => {
+    const chain = [210, 211, 200];
+    assert.deepEqual(decide(scene({patch: {...pressed(1), 2: {wayland: false}},
+        call: {method: 'ActivatePartner', partnerChain: chain}})), {act: true, target: 2});
+    // With an X11 claimant on an earlier pid, that one is the first X11 owner and keeps today's behaviour.
+    const claimant = {id: 9, pid: 210, wayland: false, userTime: NOW - 100, rect: {x: 0, y: 0, w: 50, h: 50},
+        minimized: false, type: 'normal', skipTaskbar: false, onWorkspace: true, monitor: 0, stack: 9, mru: 0};
+    assert.deepEqual(decide(scene({patch: {...pressed(1), 2: {wayland: false}}, extra: [claimant],
+        call: {method: 'ActivatePartner', partnerChain: chain}})), {act: true, target: 9});
+});
+
+test('partnerPid: the preferred test is read over the whole chain before the general one', () => {
+    const any = pid => pid === 10 || pid === 12;
+    const preferred = pid => pid === 12;
+    assert.equal(partnerPid([10, 11, 12], any, preferred), 12);
+    assert.equal(partnerPid([10, 11, 12], any, pid => false), 10);
+    assert.equal(partnerPid([10, 11, 12], any), 10);
+});
+
 test('decide FocusSelfIfNeighbour: partner focused, fresh key, the caller beside it in that direction', () => {
     const call = {method: 'FocusSelfIfNeighbour', direction: 'right', focusedId: 2};
     assert.deepEqual(decide(scene({patch: pressed(2), call})), {act: true, target: 1});
@@ -540,4 +573,34 @@ test('decide: every method waits for the extension\'s own activation to settle',
         assert.deepEqual(decide(scene({patch: pressed(key, 10), call: {...byUs, focusGainedByUs: false,
             idleMs: NOW - (gained + 80)}})), {act: true, target}, `${call.method}, a gain the user caused`);
     }
+});
+
+// An X11 window's pid is the client's own claim, so an Xwayland client could name another process's pid. A pid's
+// Wayland windows therefore come first; one of its X11 windows stands for it only when it has no Wayland user window,
+// so an editor that really runs under X11 still works.
+function x11Window(id, pid, mru, rect = {x: 0, y: 0, w: 10, h: 10}) {
+    return {id, pid, wayland: false, userTime: NOW - 9_000, rect, minimized: false, type: 'normal', skipTaskbar: false,
+        onWorkspace: true, monitor: 0, stack: 9, mru};
+}
+
+test('decide ActivatePartner: a Wayland window of the partner beats an X11 window claiming its pid', () => {
+    const claimant = x11Window(6, 200, 0);
+    assert.deepEqual(decide(scene({patch: {1: {userTime: NOW - 100, mru: 1}, 2: {mru: 2}}, extra: [claimant],
+        call: {method: 'ActivatePartner'}})), {act: true, target: 2});
+    // A partner whose only window is an X11 one is still reached.
+    assert.deepEqual(decide(scene({patch: {...pressed(1), 2: {wayland: false}}, call: {method: 'ActivatePartner'}})),
+        {act: true, target: 2});
+});
+
+test('decide ActivateOwn: a Wayland window of the caller beats an X11 window claiming its pid', () => {
+    const claimant = x11Window(7, 100, 0);
+    const call = {method: 'ActivateOwn', focusedId: 2};
+    assert.deepEqual(decide(scene({patch: pressed(2), extra: [claimant], call})), {act: true, target: 1});
+});
+
+test('decide FocusSelfIfNeighbour: an X11 window claiming the caller\'s pid is not the caller\'s neighbour', () => {
+    const claimant = x11Window(7, 100, 3, {x: 960, y: 0, w: 400, h: 1080});
+    const call = {method: 'FocusSelfIfNeighbour', direction: 'right', focusedId: 2};
+    assert.equal(decide(scene({patch: {...pressed(2), 1: {rect: {x: 1400, y: 0, w: 520, h: 1080}}},
+        extra: [claimant], call})).reason, 'neighbour-not-caller');
 });

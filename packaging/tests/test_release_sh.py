@@ -409,6 +409,35 @@ class Refusals(ReleaseShTestCase):
         _write(signers, f'release@eitri namespaces="eitri-release" {kind} {blob}\n')
         self.assertRefused(self.run_release("--sign", key, "--release-signers", signers), "everyday login key")
 
+    def test_a_sign_key_that_is_any_other_public_key_under_ssh_is_refused(self):
+        # An everyday key is not always named id_*: a deploy or push key has a name of its own.
+        key, pub = self.env.keypair("k")
+        kind, blob = pub.split()[:2]
+        _write(os.path.join(self.env.home, ".ssh", "push_deploy.pub"), f"{kind} {blob} push@laptop\n")
+        signers = os.path.join(self.scratch, "signers")
+        _write(signers, f'release@eitri namespaces="eitri-release" {kind} {blob}\n')
+        proc = self.run_release("--sign", key, "--release-signers", signers)
+        self.assertRefused(proc, "everyday login key")
+        self.assertIn("push_deploy.pub", proc.stderr)
+
+    def test_a_sign_key_that_is_gits_signing_key_is_refused(self):
+        key, pub = self.env.keypair("k")
+        kind, blob = pub.split()[:2]
+        subprocess.run(["git", "config", "--file", self.env.vars["GIT_CONFIG_GLOBAL"], "user.signingkey",
+                        f"key::{kind} {blob}"], check=True, capture_output=True, env=self.env.vars)
+        signers = os.path.join(self.scratch, "signers")
+        _write(signers, f'release@eitri namespaces="eitri-release" {kind} {blob}\n')
+        self.assertRefused(self.run_release("--sign", key, "--release-signers", signers), "user.signingkey")
+
+    def test_a_sign_key_that_is_gits_signing_key_file_is_refused(self):
+        key, pub = self.env.keypair("k")
+        subprocess.run(["git", "config", "--file", self.env.vars["GIT_CONFIG_GLOBAL"], "user.signingkey",
+                        key + ".pub"], check=True, capture_output=True, env=self.env.vars)
+        kind, blob = pub.split()[:2]
+        signers = os.path.join(self.scratch, "signers")
+        _write(signers, f'release@eitri namespaces="eitri-release" {kind} {blob}\n')
+        self.assertRefused(self.run_release("--sign", key, "--release-signers", signers), "user.signingkey")
+
     def test_a_sign_key_whose_pub_file_is_missing_is_read_with_ssh_keygen(self):
         key, _ = self.env.keypair("k")
         os.remove(key + ".pub")
@@ -527,6 +556,41 @@ class EmbeddedKeyBindsRcSigning(ReleaseShTestCase):
         shutil.copy2(os.path.join(self.clone, "packaging", "release-signers"), same_key_signers)
         proc = self.run_release("--sign", key, "--release-signers", same_key_signers)
         self.assertReachedDocker(proc)
+
+    def test_a_sign_key_kept_under_ssh_beside_its_own_pub_is_not_refused(self):
+        # The release key's own public half next to it in ~/.ssh is not another, everyday key.
+        key = self.commit_a_real_key()
+        kept = os.path.join(self.env.home, ".ssh", "eitri-release")
+        shutil.copy2(key, kept)
+        shutil.copy2(key + ".pub", kept + ".pub")
+        self.assertReachedDocker(self.run_release("--sign", kept))
+
+    def test_a_sign_key_that_is_a_default_ssh_identity_is_refused(self):
+        # ssh offers ~/.ssh/id_ed25519 to every host by default: it is a login key whatever else it is,
+        # even when its own .pub beside it is the only copy of its public half.
+        key = self.commit_a_real_key()
+        login = os.path.join(self.env.home, ".ssh", "id_ed25519")
+        shutil.copy2(key, login)
+        shutil.copy2(key + ".pub", login + ".pub")
+        self.assertRefused(self.run_release("--sign", login), "ssh's default identities")
+        # A link to it is the same file.
+        link = os.path.join(self.scratch, "release-link")
+        os.symlink(login, link)
+        self.assertRefused(self.run_release("--sign", link), "ssh's default identities")
+
+    def test_a_sign_key_named_by_an_identityfile_line_is_refused(self):
+        key = self.commit_a_real_key()
+        kept = os.path.join(self.env.home, ".ssh", "work")
+        shutil.copy2(key, kept)
+        shutil.copy2(key + ".pub", kept + ".pub")
+        config = os.path.join(self.env.home, ".ssh", "config")
+        _write(config, "Host *.example.com\n  User git\n\tidentityfile=~/.ssh/work\n")
+        self.assertRefused(self.run_release("--sign", kept), "IdentityFile")
+        _write(config, 'Host *\n  IdentityFile "%d/.ssh/work"\n')
+        self.assertRefused(self.run_release("--sign", kept), "IdentityFile")
+        # An IdentityFile naming another key is no reason to refuse.
+        _write(config, 'Host *\n  IdentityFile "~/.ssh/other"\n')
+        self.assertReachedDocker(self.run_release("--sign", kept))
 
     def test_signing_directly_against_the_embedded_key_is_not_refused(self):
         # The ordinary, no-override case: still allowed once a key exists (the positive control for

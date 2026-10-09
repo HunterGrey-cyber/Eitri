@@ -65,6 +65,26 @@ t_https_curl_flags() {
 	done <"$T/curl-release-only.log"
 }
 
+TESTS="$TESTS t_downloads_bounded"
+t_downloads_bounded() {
+	# A server that never ends a download, or stalls in the middle of one, must not hold the installer
+	# for good: every curl call, the release's and the plain-http Node one alike, carries a size cap and
+	# stall detection. The limits are generous (a slow link still finishes); only their presence is
+	# checked here.
+	serve 1.0.0
+	inst --stubs "$S/stubs-net" -- --base-url https://mirror.example --release-signers "$SIGNERS"
+	expect_rc 0
+	if ! grep -F '127.0.0.1:1/' "$S/logs/curl.log" >/dev/null; then fail "no plain-http curl call was made"; fi
+	while IFS= read -r line; do
+		for want in " --connect-timeout 60 " " --speed-limit 1024 --speed-time 300 " " --max-filesize 1073741824 "; do
+			case $line in
+			*"$want"*) ;;
+			*) fail "a curl call without$want: $line" ;;
+			esac
+		done
+	done <"$S/logs/curl.log"
+}
+
 TESTS="$TESTS t_wget_never_used"
 t_wget_never_used() {
 	# wget's --https-only applies to recursive downloads. GNU Wget 1.25.0 can still follow an
@@ -88,4 +108,24 @@ t_wget_never_used() {
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.0.0 "installed from files with no curl"
 	if [ -s "$S/logs/wget.log" ]; then fail "wget was run: $(cat "$S/logs/wget.log")"; fi
+}
+
+TESTS="$TESTS t_test_mode_overrides_reach_only_loopback"
+t_test_mode_overrides_reach_only_loopback() {
+	# Test mode's download overrides lead only to a loopback server and its repository overrides only to
+	# a local path, so an EITRI_INSTALL_TEST=1 left in an environment cannot send a download, a clone or a
+	# build anywhere else. Each refusal comes before any download.
+	EVIL=evil.example
+	for v in "EITRI_INSTALL_TEST_NODE_BASE_URL=http://$EVIL/dist" \
+		"EITRI_INSTALL_TEST_NVIM_BASE_URL=https://$EVIL/nvim" \
+		"EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1.$EVIL/skia" \
+		"EITRI_INSTALL_TEST_NODE_BASE_URL=http://localhost@$EVIL/dist" \
+		"EITRI_INSTALL_TEST_REPO_URL=https://$EVIL/eitri.git" \
+		"EITRI_INSTALL_TEST_VERDANDI_REPO_URL=relative/verdandi"; do
+		inst --stubs "$S/stubs-net" --set "$v" -- --base-url "http://127.0.0.1:$PORT/" --release-signers "$SIGNERS"
+		expect_fail "$v"
+		expect_out "eitri: error: ${v%%=*}"
+	done
+	if [ -s "$S/logs/curl.log" ]; then fail "a refused override was fetched: $(cat "$S/logs/curl.log")"; fi
+	expect_absent "$TH/.local/lib/eitri"
 }

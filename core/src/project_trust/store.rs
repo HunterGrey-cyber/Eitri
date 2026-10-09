@@ -17,6 +17,12 @@
 //! Everything here that touches the disk (`state`, `record`, `forget`, `for_root`) is for the trust
 //! gate's worker thread only: a slow or hostile state directory must never stall the window.
 //! [`TrustStore::new`] and [`TrustStore::at`] touch nothing, so the window may build one anywhere.
+//!
+//! The record is read without following any link from `/` down, but the state home may well be
+//! reached through one (`/home` a link to `/var/home`, a linked `~/.local/state`). So each of those
+//! calls first resolves the links of the store's directory, once, and writes and reads the record at
+//! that real path; a record is also read back right after it is written, and one that does not read
+//! back as written is an error rather than a "trusted" that the next start would not see.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -38,7 +44,12 @@ const MAX_RECORD_BYTES: u64 = 1 << 20;
 /// covered less than the same configuration shows now. A record of a lower disclosure (or none,
 /// which every record written before this field existed has) is not trust, and the project is
 /// asked about once more. Raise this whenever the prompt starts showing something it hid before.
-pub const DISCLOSURE: u32 = 2;
+///
+/// 2: every value whole. 3: each file beyond the settings, memory and rule files (a command, an
+/// agent, a skill's file, a hook script) named with its size and the frontmatter keys that change
+/// what runs, where 2 gave only how many there were in each directory. 4: that note also names an
+/// agent file's own `permissionMode` and `mcpServers`, which 3 left unsaid.
+pub const DISCLOSURE: u32 = 4;
 
 /// What changed between the trusted configuration and the one found now, by path relative to the
 /// top level.
@@ -96,6 +107,30 @@ struct Record {
     disclosure: u32,
 }
 
+/// The record's file name for `root` and `profile`. Claude's record keeps the name it had before
+/// profiles existed, so a record made then still answers; every other profile's adds its key to
+/// that name.
+fn record_name(root: &Path, profile: &Profile) -> String {
+    match profile {
+        Profile::Claude => persist::file_name(root),
+        other => format!("{}.{}", persist::file_name(root), other.key()),
+    }
+}
+
+/// The record at `path` when it is a usable one for `root` and `profile`, read without following
+/// a link.
+fn read_usable_at(path: &Path, root: &Path, profile: &Profile) -> Option<Record> {
+    let bytes = read_regular_nofollow(path, MAX_RECORD_BYTES, Owner::Me).ok()?;
+    let record: Record = serde_json::from_slice(&bytes).ok()?;
+    let usable = record.version == 1
+        && record.disclosure >= DISCLOSURE
+        && record.profile == profile_field(profile)
+        && root.to_str() == Some(record.root.as_str())
+        && record.fingerprint.len() == 64
+        && record.fingerprint.bytes().all(|b| b.is_ascii_hexdigit());
+    usable.then_some(record)
+}
+
 /// What a record for `profile` says it is about: nothing for Claude, else the profile's key.
 fn profile_field(profile: &Profile) -> Option<String> {
     match profile {
@@ -122,14 +157,15 @@ impl TrustStore {
         TrustStore { dir }
     }
 
-    /// Claude's record keeps the name it had before profiles existed, so a record made then still
-    /// answers; every other profile's adds its key to that name.
+    /// The record's path: the store's directory with its links resolved ([`without_links`]), and
+    /// [`record_name`] in it, which is never resolved.
     fn record_path(&self, root: &Path, profile: &Profile) -> Option<PathBuf> {
-        let name = match profile {
-            Profile::Claude => persist::file_name(root),
-            other => format!("{}.{}", persist::file_name(root), other.key()),
-        };
-        self.dir.as_ref().map(|dir| dir.join(name))
+        self.real_dir().map(|dir| dir.join(record_name(root, profile)))
+    }
+
+    /// The store's directory with its links resolved. Touches the disk: worker only.
+    fn real_dir(&self) -> Option<PathBuf> {
+        self.dir.as_deref().map(without_links)
     }
 
     /// What the record says about `discovery`. Reads the one record file, never following a link.
@@ -176,16 +212,7 @@ impl TrustStore {
     }
 
     fn read_usable(&self, root: &Path, profile: &Profile) -> Option<Record> {
-        let path = self.record_path(root, profile)?;
-        let bytes = read_regular_nofollow(&path, MAX_RECORD_BYTES, Owner::Me).ok()?;
-        let record: Record = serde_json::from_slice(&bytes).ok()?;
-        let usable = record.version == 1
-            && record.disclosure >= DISCLOSURE
-            && record.profile == profile_field(profile)
-            && root.to_str() == Some(record.root.as_str())
-            && record.fingerprint.len() == 64
-            && record.fingerprint.bytes().all(|b| b.is_ascii_hexdigit());
-        usable.then_some(record)
+        read_usable_at(&self.record_path(root, profile)?, root, profile)
     }
 
     /// Writes the record for `discovery`: a temporary file beside it, 0600, renamed over the
@@ -198,15 +225,13 @@ impl TrustStore {
                 format!("not recorded: {}", not_hashed_note(discovery)),
             ));
         }
-        let (Some(dir), Some(path)) = (
-            self.dir.as_deref(),
-            self.record_path(&discovery.root, &discovery.profile),
-        ) else {
+        let Some(dir) = self.real_dir() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no usable state directory (XDG_STATE_HOME/HOME)",
             ));
         };
+        let path = dir.join(record_name(&discovery.root, &discovery.profile));
         let Some(root) = discovery.root.to_str() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -223,13 +248,23 @@ impl TrustStore {
             disclosure: DISCLOSURE,
         };
         let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
-        persist::create_state_dir(dir)?;
+        persist::create_state_dir(&dir)?;
         let tmp = persist::temporary(&path);
         let written =
             agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path));
         if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(err);
+        }
+        // What `state` will read must be what was just written; anything else would tell the user
+        // the project is trusted while the next start asks again.
+        let reads_back = read_usable_at(&path, &discovery.root, &discovery.profile)
+            .is_some_and(|read| read.fingerprint == record.fingerprint);
+        if !reads_back {
+            return Err(io::Error::other(format!(
+                "the trust record {} could not be read back",
+                path.display()
+            )));
         }
         Ok(())
     }
@@ -264,6 +299,29 @@ impl TrustStore {
         }
         std::fs::remove_file(&path)?;
         Ok(true)
+    }
+}
+
+/// `dir` with every link in it resolved: its deepest existing ancestor made canonical, and the names
+/// below that, which do not exist yet, put back as they were. A path that cannot be resolved at all
+/// is left as given; writing there may still work, and the read-back after a write says whether it
+/// did.
+fn without_links(dir: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut at = dir;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            let mut out = real;
+            out.extend(missing.iter().rev());
+            return out;
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                at = parent;
+            }
+            _ => return dir.to_path_buf(),
+        }
     }
 }
 

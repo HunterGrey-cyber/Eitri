@@ -1314,7 +1314,18 @@ fn item_of(finding: &Finding) -> TrustItemView {
             outside: *outside,
             ..item("symlink", path, lossy(path), lossy(target))
         },
-        Finding::OtherFiles { dir, count } => item("other_files", dir, "other files".to_string(), count.to_string()),
+        Finding::OtherFile {
+            dir,
+            name,
+            len,
+            frontmatter,
+        } => {
+            let mut value = human_size(*len);
+            if !frontmatter.is_empty() {
+                value.push_str(&format!("; its frontmatter sets {}", frontmatter.join(", ")));
+            }
+            item("other_file", dir, lossy(name), value)
+        }
         Finding::NotRead { path, reason } => item("not_read", path, "not read".to_string(), reason.clone()),
         Finding::Unreadable { path, reason } => {
             item("unreadable", path, "cannot be checked".to_string(), reason.clone())
@@ -1327,6 +1338,18 @@ fn item_of(finding: &Finding) -> TrustItemView {
             };
             item("git_unverified", path, "git".to_string(), value)
         }
+    }
+}
+
+/// A file's size as a person reads it: `512 bytes`, `1.2 KiB`, `3.5 MiB`.
+fn human_size(len: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    match len {
+        1 => "1 byte".to_string(),
+        len if len < KIB => format!("{len} bytes"),
+        len if len < MIB => format!("{:.1} KiB", len as f64 / KIB as f64),
+        len => format!("{:.1} MiB", len as f64 / MIB as f64),
     }
 }
 
@@ -1754,6 +1777,47 @@ mod tests {
         assert_eq!(view.state, TrustPromptState::Changed);
         assert_eq!(view.changed.unwrap().changed, vec![SETTINGS.to_string()]);
         assert_eq!(gate.row(&CLAUDE), "changed since trusted");
+    }
+
+    /// Files beyond the settings and memory files (commands, agents, skills, hook scripts) are named
+    /// one by one under their directory, with their size, and a Markdown file whose frontmatter sets
+    /// hooks or tools says so: a `y` covers each by name, never as a count.
+    #[test]
+    fn other_files_are_named_with_their_size_and_frontmatter() {
+        let fx = Fx::new("other-files");
+        fx.write(SETTINGS, b"{}");
+        fx.write(
+            ".claude/commands/deploy.md",
+            b"---\ndescription: ship it\nallowed-tools: Bash(git push:*)\nhooks:\n  PreToolUse: []\n---\n!`git push`\n",
+        );
+        fx.write(
+            ".claude/agents/reviewer.md",
+            b"---\ndescription: reads\n---\nhooks: not frontmatter\n",
+        );
+        fx.write(".claude/agents/deep/helper.md", &[b'x'; 1300]);
+        fx.write(".claude/hooks/run.sh", b"#!/bin/sh\n");
+        let mut gate = fx.gate();
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
+        let rows: Vec<(&str, &str, &str)> = view
+            .items
+            .iter()
+            .filter(|i| i.what.starts_with("other_file"))
+            .map(|i| (i.file.as_str(), i.label.as_str(), i.value.as_str()))
+            .collect();
+        let deploy_len = 97;
+        let deploy = format!("{deploy_len} bytes; its frontmatter sets hooks, allowed-tools");
+        let mut want = vec![
+            (".claude/agents", "reviewer.md", "50 bytes"),
+            (".claude/agents/deep", "helper.md", "1.3 KiB"),
+            (".claude/commands", "deploy.md", deploy.as_str()),
+            (".claude/hooks", "run.sh", "10 bytes"),
+        ];
+        let mut rows = rows;
+        rows.sort();
+        want.sort();
+        assert_eq!(rows, want);
+        assert!(view.items.iter().all(|i| i.what != "other_files"), "{:?}", view.items);
     }
 
     #[test]
@@ -2683,9 +2747,17 @@ mod tests {
                 target: p("/opt/x/run"),
                 outside: true,
             },
-            Finding::OtherFiles {
+            Finding::OtherFile {
                 dir: p(".claude/agents"),
-                count: 3,
+                name: p("a.md"),
+                len: 3,
+                frontmatter: vec![],
+            },
+            Finding::OtherFile {
+                dir: p(".claude/commands/deep"),
+                name: p("d\u{202e}.md"),
+                len: 1229,
+                frontmatter: vec!["hooks".into(), "allowed-tools".into()],
             },
             Finding::NotRead {
                 path: p(".claude/worktrees"),
@@ -2801,7 +2873,14 @@ mod tests {
                     false,
                 ),
                 ("symlink", ".claude/hooks/run", ".claude/hooks/run", "/opt/x/run", true),
-                ("other_files", ".claude/agents", "other files", "3", false),
+                ("other_file", ".claude/agents", "a.md", "3 bytes", false),
+                (
+                    "other_file",
+                    ".claude/commands/deep",
+                    "d\u{202e}.md",
+                    "1.2 KiB; its frontmatter sets hooks, allowed-tools",
+                    false,
+                ),
                 ("not_read", ".claude/worktrees", "not read", "kept apart", false),
                 ("unreadable", ".claude/big", "cannot be checked", "too large", false),
                 ("over_budget", "", "over budget", "too many", false),

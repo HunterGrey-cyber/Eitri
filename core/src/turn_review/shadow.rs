@@ -891,7 +891,8 @@ impl Shadow {
     }
 
     /// Whether the nested repository at `dir` (relative to the work tree) has a commit checked out.
-    /// Read-only, and isolated like every other shadow git run.
+    /// Read-only, and isolated like every other shadow git run, except that git reads that
+    /// repository's own config (the `git` module doc says why that is harmless).
     fn nested_has_commit(&self, dir: &[u8], deadline: Instant) -> Result<bool, ShadowError> {
         let nested = self.work_tree.join(OsStr::from_bytes(dir));
         let mut cmd = git::command(&nested.join(".git"), &nested, None, None);

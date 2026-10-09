@@ -687,20 +687,44 @@ fn a_record_from_before_the_full_disclosure_is_asked_about_again() {
     plant(before.clone());
     match fx.store().state(fx.discover(&root)) {
         TrustState::Untrusted { remember, discovery } => {
-            assert_eq!(remember, Remember::Yes);
+            // The tree holds a link below `.claude/`, which the CLI follows to bytes no fingerprint
+            // covers, so the answer lasts one start whatever the record says.
+            assert!(
+                matches!(&remember, Remember::SessionOnly(note) if note.contains(".claude/link")),
+                "{remember:?}"
+            );
             // The fingerprint itself is unchanged: only the record is too old to count.
             assert_eq!(discovery.fingerprint.hex(), CLAUDE_FINGERPRINT_BEFORE_PROFILES);
         }
         other => panic!("{other:?}"),
     }
-    // A lower disclosure is no better than none.
-    let mut lower = before.clone();
-    lower["disclosure"] = serde_json::json!(DISCLOSURE - 1);
-    plant(lower);
-    assert!(matches!(
-        fx.store().state(fx.discover(&root)),
-        TrustState::Untrusted { .. }
-    ));
+    // Without the link everything is hashed; a record of that fingerprint from before the full
+    // disclosure is asked about again as an ordinary question whose answer can be recorded.
+    std::fs::remove_file(root.parent().unwrap().join(".claude/link")).unwrap();
+    let unlinked = fx.discover(&root);
+    assert!(unlinked.fully_hashed(), "{:?}", unlinked.uncheckable());
+    let mut before = before;
+    before["fingerprint"] = serde_json::json!(unlinked.fingerprint.hex());
+    plant(before.clone());
+    match fx.store().state(fx.discover(&root)) {
+        TrustState::Untrusted { remember, .. } => assert_eq!(remember, Remember::Yes),
+        other => panic!("{other:?}"),
+    }
+    // A lower disclosure is no better than none: neither the one that showed every value whole but
+    // only counted the other files under `.claude/`, nor any before it.
+    assert_eq!(DISCLOSURE, 4);
+    for lower_disclosure in [1, 2, 3] {
+        let mut lower = before.clone();
+        lower["disclosure"] = serde_json::json!(lower_disclosure);
+        plant(lower);
+        assert!(matches!(
+            fx.store().state(fx.discover(&root)),
+            TrustState::Untrusted {
+                remember: Remember::Yes,
+                ..
+            }
+        ));
+    }
     // The same record at the current disclosure is trust.
     let mut current = before;
     current["disclosure"] = serde_json::json!(DISCLOSURE);
@@ -708,7 +732,7 @@ fn a_record_from_before_the_full_disclosure_is_asked_about_again() {
     match fx.store().state(fx.discover(&root)) {
         TrustState::Trusted { since_unix, discovery } => {
             assert_eq!(since_unix, 1_790_000_000);
-            assert_eq!(discovery.fingerprint.hex(), CLAUDE_FINGERPRINT_BEFORE_PROFILES);
+            assert_eq!(discovery.fingerprint, unlinked.fingerprint);
         }
         other => panic!("{other:?}"),
     }
@@ -755,6 +779,8 @@ fn another_profiles_record_from_before_the_full_disclosure_is_asked_about_again(
 fn profiles_never_alias_records() {
     let fx = Fixture::new("alias");
     let root = profile_fixture(&fx);
+    // A link below `.claude/` would make Claude's answer last one start, and this test records it.
+    std::fs::remove_file(root.parent().unwrap().join(".claude/link")).unwrap();
     let store = fx.store();
     let gemini = Profile::Acp {
         name: "codex".into(),
@@ -1029,4 +1055,59 @@ fn a_registered_plain_tree_is_recorded() {
         TrustState::Changed { diff, .. } => assert_eq!(diff.changed, vec![PathBuf::from(".gem/deep/x.json")]),
         other => panic!("{other:?}"),
     }
+}
+
+/// A state home reached through a link (`/home -> /var/home`, a linked `~/.local/state`): the
+/// record is written and read back at the same real place, so a `y` that said "trusted" is trust
+/// at the next start too. The record file itself is still never followed.
+#[test]
+fn a_store_under_a_linked_directory_reads_back_what_it_records() {
+    let fx = Fixture::new("linked-state");
+    let root = fx.root("p");
+    write(&root.join(SETTINGS), &hook("touch /tmp/a"));
+    let real = fx.outer.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = fx.outer.join("link");
+    symlink(&real, &link).unwrap();
+    for state in [link.join("state"), link.clone()] {
+        let store = TrustStore::new(Some(state.as_os_str()), Some(fx.home.as_os_str()));
+        let found = fx.discover(&root);
+        assert!(found.fully_hashed());
+        store.record(&found, 5).unwrap();
+        assert!(
+            matches!(
+                store.state(fx.discover(&root)),
+                TrustState::Trusted { since_unix: 5, .. }
+            ),
+            "{}",
+            state.display()
+        );
+        let in_real = real
+            .join(state.strip_prefix(&link).unwrap())
+            .join("eitri/trust")
+            .join(format!("{}.json", &agent::conversation_id_for_cwd(&root)[..16]));
+        assert!(in_real.is_file(), "{} missing", in_real.display());
+        assert!(store.forget(&root, &Profile::Claude).unwrap());
+        assert!(!in_real.exists());
+        assert!(matches!(store.state(fx.discover(&root)), TrustState::Untrusted { .. }));
+    }
+}
+
+/// A record that would not read back as trust is an error, never a silent "trusted": here one too
+/// large for the reader, from a configuration of many long-named files.
+#[test]
+fn a_record_that_does_not_read_back_is_an_error() {
+    let fx = Fixture::new("no-read-back");
+    let root = fx.root("p");
+    let dir = root.join(".claude/commands").join("d".repeat(250));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..1900 {
+        std::fs::write(dir.join(format!("{i:04}{}", "n".repeat(240))), b"x").unwrap();
+    }
+    let found = fx.discover(&root);
+    assert!(found.fully_hashed(), "{:?}", found.uncheckable());
+    let store = fx.store();
+    let refused = store.record(&found, 1).unwrap_err();
+    assert!(refused.to_string().contains("could not be read back"), "{refused}");
+    assert!(!matches!(store.state(found), TrustState::Trusted { .. }));
 }

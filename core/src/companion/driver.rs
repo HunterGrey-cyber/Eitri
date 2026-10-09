@@ -43,8 +43,9 @@ const OWN_CHANNELS: usize = 8;
 struct OwnChannel {
     addr: PathBuf,
     channel: u64,
-    /// The nvim process, known once the install answered. An nvim restarted on the same address
-    /// numbers its channels afresh, and has another pid.
+    /// The nvim process, known once the install answered: the process the kernel says holds the
+    /// socket, or the pid the editor reported where the platform names no peer. An nvim restarted
+    /// on the same address numbers its channels afresh, and has another pid.
     pid: Option<u32>,
 }
 
@@ -299,6 +300,12 @@ impl LinkDriver {
         attached_peer(self.attacher.state(), live_peer)
     }
 
+    /// The editor process while attached, as [`OwnChannel::pid`] records it: the socket's holder,
+    /// or the editor's own report where the platform gives no peer pid.
+    fn editor_pid(&self) -> Option<u32> {
+        self.peer_pid().or_else(|| self.nvim_pid())
+    }
+
     /// Whether the last install loaded the part called `name`.
     pub fn has_part(&self, name: &str) -> bool {
         self.installed.iter().any(|part| part == name)
@@ -484,7 +491,7 @@ impl LinkDriver {
         let Some(addr) = self.current_addr() else {
             return false;
         };
-        let pid = self.nvim_pid();
+        let pid = self.editor_pid();
         self.own_channels.iter().any(|own| {
             own.channel == by && own.addr == addr && !matches!((own.pid, pid), (Some(then), Some(now)) if then != now)
         })
@@ -545,7 +552,7 @@ impl LinkDriver {
                     if let (Some(live), Some(addr)) = (&self.live, self.current_addr()) {
                         for own in self.own_channels.iter_mut() {
                             if own.channel == live.channel && own.addr == addr {
-                                own.pid = Some(report.nvim_pid);
+                                own.pid = Some(peer.unwrap_or(report.nvim_pid));
                             }
                         }
                     }
@@ -982,6 +989,26 @@ mod tests {
             Value::Array(vec![Value::from(1), Value::from(id), Value::Nil, Value::from(7)]),
         );
         assert_eq!(pending.wait(Duration::from_secs(2)), Some(Ok(Value::from(7))));
+    }
+
+    /// The editor is told apart by the process the kernel says holds its socket, not by the pid it
+    /// reports about itself: a recorded channel of the process holding the socket is this panel's
+    /// even when the editor's own report names another pid, and one recorded under that reported pid
+    /// is not.
+    #[test]
+    fn an_earlier_channel_is_matched_by_the_sockets_holder_not_the_reported_pid() {
+        let (link, _fake, _reader) = fake_link();
+        let holder = link.peer_pid().expect("a socket pair names its peer");
+        let mut driver = attached_over(link);
+        assert_ne!(
+            driver.nvim_pid(),
+            Some(holder),
+            "the editor's report must differ for this test"
+        );
+        driver.own_channels.push_back(own("/r/a", 5, Some(holder)));
+        driver.own_channels.push_back(own("/r/a", 6, Some(9)));
+        assert!(driver.is_own_earlier_channel(5));
+        assert!(!driver.is_own_earlier_channel(6));
     }
 
     #[test]

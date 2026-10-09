@@ -5763,7 +5763,9 @@ fn clicked_link_url(uri: &str) -> Option<&str> {
 
 /// A `mailto:` address with something after the scheme: ASCII only, no whitespace, control character or
 /// backslash anywhere. `%`, `?`, `&` and `=` stay allowed, since a real mail link carries
-/// `?subject=a%20b`; the mail client parses the rest, and all it can do is open a draft.
+/// `?subject=a%20b`; the mail client parses the rest. Its query may name only the headers a draft
+/// needs ([`MAIL_HEADERS`]): some mail clients read `attach=<path>` as a local file to attach, which
+/// would put a file of the user's into a draft addressed by a reply.
 fn mail_url(uri: &str) -> Option<&str> {
     if uri
         .chars()
@@ -5772,7 +5774,43 @@ fn mail_url(uri: &str) -> Option<&str> {
         return None;
     }
     let scheme = uri.get(..7)?;
-    (scheme.eq_ignore_ascii_case("mailto:") && uri.len() > 7).then_some(uri)
+    if !(scheme.eq_ignore_ascii_case("mailto:") && uri.len() > 7) {
+        return None;
+    }
+    let query = uri[7..].split_once('?').map_or("", |(_, query)| query);
+    // `;` is split on too: a client that reads it as a separator must not find a key hidden in a value.
+    let headers_known = query.split(['&', ';']).filter(|piece| !piece.is_empty()).all(|piece| {
+        let key = piece.split_once('=').map_or(piece, |(key, _)| key);
+        percent_decoded(key).is_some_and(|key| {
+            MAIL_HEADERS
+                .iter()
+                .any(|known| key.eq_ignore_ascii_case(known.as_bytes()))
+        })
+    });
+    headers_known.then_some(uri)
+}
+
+/// The `mailto:` query keys a clicked mail link may carry.
+const MAIL_HEADERS: [&str; 6] = ["to", "cc", "bcc", "subject", "body", "in-reply-to"];
+
+/// `text` with every `%XX` replaced by its byte; `None` for a `%` not followed by two hex digits.
+fn percent_decoded(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = text
+                .get(i + 1..i + 3)
+                .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// `tab_verb`'s wire shape to the `TabAction` the prefix's own `Action::Tab` arm runs.
@@ -7098,6 +7136,42 @@ mod tests {
             "",
         ] {
             assert_eq!(clicked_link_url(uri), None, "{uri:?}");
+        }
+    }
+
+    /// A mail link may carry only the headers a draft needs. Any other key -- `attach` above all,
+    /// which some mail clients honour by attaching a local file to the draft -- refuses the whole
+    /// link, however its name is spelled or encoded.
+    #[test]
+    fn a_mail_link_carries_only_the_headers_a_draft_needs() {
+        for uri in [
+            "mailto:a@b?subject=hi",
+            "mailto:a@b?to=c@d&cc=e@f&bcc=g@h",
+            "mailto:a@b?SUBJECT=x&Body=y%0Az",
+            "mailto:a@b?in-reply-to=%3Cid@x%3E",
+            "mailto:a@b?%73ubject=x",
+            "mailto:?to=a@b",
+            "mailto:a@b?",
+            "mailto:a@b?subject",
+            "mailto:a@b?subject=x&",
+        ] {
+            assert_eq!(mail_url(uri), Some(uri), "{uri}");
+        }
+        for uri in [
+            "mailto:a@b?attach=/etc/passwd",
+            "mailto:a@b?subject=x&attach=/etc/passwd",
+            "mailto:a@b?Attachment=/etc/passwd",
+            "mailto:a@b?Attach%6Dent=/etc/passwd",
+            "mailto:a@b?%61ttach=/etc/passwd",
+            "mailto:a@b?subject=x;attach=/etc/passwd",
+            "mailto:a@b?x-attach=y",
+            "mailto:a@b?from=x",
+            "mailto:a@b?=x",
+            "mailto:a@b?%zz=x",
+            "mailto:a@b?%+5ubject=x",
+            "mailto:a@b?sub%00ject=x",
+        ] {
+            assert_eq!(mail_url(uri), None, "{uri:?}");
         }
     }
 

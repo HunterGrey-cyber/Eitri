@@ -6,6 +6,8 @@
 //! command, an MCP server's command line) and the rest as their compact JSON. Text is kept byte for
 //! byte; making control or bidi characters visible is the page's job.
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use serde_json::{Map, Value};
@@ -321,10 +323,119 @@ pub(super) fn server_line(server: &Value) -> String {
     compact(server)
 }
 
+/// The frontmatter keys the prompt names when a Markdown file sets them at its top level: a command,
+/// an agent or a skill can carry hooks of its own, widen which tools run without asking, set its own
+/// permission mode and start MCP servers of its own.
+pub(super) const FRONTMATTER_KEYS: [&str; 4] = ["hooks", "allowed-tools", "permissionMode", "mcpServers"];
+
+/// Which of [`FRONTMATTER_KEYS`] a Markdown file `name` sets in its YAML frontmatter: the block
+/// between a first line `---` and the next line `---`. Only top-level keys count (a line that
+/// starts the key in its first column), plain or quoted. Every doubt counts toward naming a key: a
+/// byte-order mark is skipped, a line may end in `\r` or blanks, letter case of the extension is
+/// ignored, and a block that never closes is read to the end of the file. Nothing but `bytes` is
+/// read.
+pub(super) fn frontmatter_keys(name: &OsStr, bytes: &[u8]) -> Vec<String> {
+    let is_markdown = name
+        .as_bytes()
+        .rsplit(|b| *b == b'.')
+        .next()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(b"md"))
+        && name.as_bytes().contains(&b'.');
+    if !is_markdown {
+        return Vec::new();
+    }
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let trim = |line: &[u8]| -> usize {
+        line.iter()
+            .rposition(|b| !matches!(b, b' ' | b'\t' | b'\r'))
+            .map_or(0, |at| at + 1)
+    };
+    let mut lines = bytes.split(|b| *b == b'\n');
+    match lines.next() {
+        Some(first) if &first[..trim(first)] == b"---" => {}
+        _ => return Vec::new(),
+    }
+    let mut set = [false; FRONTMATTER_KEYS.len()];
+    for line in lines {
+        let line = &line[..trim(line)];
+        if line == b"---" {
+            break;
+        }
+        let key = match line.first() {
+            Some(quote @ (b'"' | b'\'')) => {
+                let rest = &line[1..];
+                let Some(end) = rest.iter().position(|b| b == quote) else {
+                    continue;
+                };
+                let after = &rest[end + 1..];
+                if !after
+                    .iter()
+                    .find(|b| !matches!(b, b' ' | b'\t'))
+                    .is_some_and(|b| *b == b':')
+                {
+                    continue;
+                }
+                &rest[..end]
+            }
+            Some(b' ' | b'\t' | b'#' | b'-') | None => continue,
+            Some(_) => {
+                let Some(colon) = line.iter().position(|b| *b == b':') else {
+                    continue;
+                };
+                let key = &line[..colon];
+                &key[..trim(key)]
+            }
+        };
+        for (at, wanted) in FRONTMATTER_KEYS.iter().enumerate() {
+            if key == wanted.as_bytes() {
+                set[at] = true;
+            }
+        }
+    }
+    FRONTMATTER_KEYS
+        .iter()
+        .zip(set)
+        .filter(|(_, set)| *set)
+        .map(|(key, _)| key.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn keys(name: &str, text: &[u8]) -> Vec<String> {
+        frontmatter_keys(OsStr::new(name), text)
+    }
+
+    #[test]
+    fn frontmatter_keys_are_read_from_the_top_level_of_the_block() {
+        let both = b"---\ndescription: x\nallowed-tools: Bash\nhooks:\n  Stop: []\n---\nbody\n";
+        assert_eq!(keys("a.md", both), vec!["hooks", "allowed-tools"]);
+        // An agent file's own permission mode and MCP servers change what runs too.
+        let agent = b"---\nname: a\nmcpServers:\n  s: {}\npermissionMode: bypassPermissions\n---\nbody\n";
+        assert_eq!(keys("a.md", agent), vec!["permissionMode", "mcpServers"]);
+        assert!(keys("a.md", b"---\npermissionmode: x\nmcpserver: y\n---\n").is_empty());
+        // Quoted keys, CRLF, trailing blanks, a byte-order mark and an upper-case extension.
+        let odd = b"\xef\xbb\xbf--- \r\n\"hooks\" : {}\r\n'allowed-tools':  x\r\n---\r\n";
+        assert_eq!(keys("A.MD", odd), vec!["hooks", "allowed-tools"]);
+        // A block that never closes is read to the end.
+        assert_eq!(keys("a.md", b"---\nx: 1\nhooks: []\n"), vec!["hooks"]);
+    }
+
+    #[test]
+    fn frontmatter_keys_ignore_what_is_not_a_top_level_key_of_the_block() {
+        // After the block, nested, in a comment, in a list, or not a Markdown file at all.
+        assert!(keys("a.md", b"---\ndescription: x\n---\nhooks: []\n").is_empty());
+        assert!(keys("a.md", b"---\nmeta:\n  hooks: []\n  allowed-tools: x\n---\n").is_empty());
+        assert!(keys("a.md", b"---\n# hooks: []\n- allowed-tools\n---\n").is_empty());
+        assert!(keys("a.md", b"text\n---\nhooks: []\n---\n").is_empty());
+        assert!(keys("a.txt", b"---\nhooks: []\n---\n").is_empty());
+        assert!(keys("md", b"---\nhooks: []\n---\n").is_empty());
+        assert!(keys("a.md", b"---\nhooksy: []\nallowed-tools-x: y\n---\n").is_empty());
+        assert!(keys("a.md", b"---\nmeta:\n  permissionMode: x\n  mcpServers: y\n---\n").is_empty());
+    }
 
     fn file() -> PathBuf {
         PathBuf::from(".claude/settings.json")

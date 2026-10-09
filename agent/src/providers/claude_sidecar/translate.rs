@@ -204,10 +204,12 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
             None
         }
         // The `set_permission_mode` capability reports each accepted switch to every watcher.
-        // This client never requests a switch. A report naming `default` is a no-op; a less restrictive
+        // This client never requests a switch. CLI auto sessions reject every switch report.
+        // Otherwise a report naming `default` is a no-op; a less restrictive
         // mode name or a BYPASS enum closes the session. The `Bypass` match only decodes a report.
         // The interactive and rule-based modes both map to `Auto`. An UNSPECIFIED enum is logged and dropped
-        // after checking the provider mode name, which is checked independently of the enum.
+        // after checking the provider mode name. A missing CLI mode name closes the session
+        // regardless of the enum.
         ProtoEvent::PermissionModeChanged(changed) => {
             // A session created with the CLI's auto mode refuses every switch (the proto's
             // `SetPermissionModeRequest`), so a report of one is a peer breaking that rule, and what
@@ -239,6 +241,15 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                     } else {
                         "BYPASS".to_string()
                     },
+                    detail: "PermissionModeChanged".to_string(),
+                });
+            }
+            if changed.permission_mode.is_empty() {
+                // The sidecar reports a switch only after one was asked for, and always names the
+                // CLI's mode then; nothing here asks. A report that names none says nothing about
+                // what the CLI runs in now, so the session cannot go on being answered as gated.
+                return one(AgentDomainEvent::UngatedCliMode {
+                    reported: "a mode switch".to_string(),
                     detail: "PermissionModeChanged".to_string(),
                 });
             }
@@ -1261,9 +1272,6 @@ mod tests {
                 floor_applied: false,
             }]
         );
-        // UNSPECIFIED with nothing ungated about it is still dropped, loudly.
-        let none = wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged::default()));
-        assert_eq!(super::translate(none, RequestedCliMode::Default), vec![]);
         // And UNSPECIFIED never hides an ungated name.
         assert_eq!(
             super::translate(
@@ -1272,6 +1280,42 @@ mod tests {
             ),
             vec![AgentDomainEvent::UngatedCliMode {
                 reported: "bypassPermissions".into(),
+                detail: "PermissionModeChanged".into(),
+            }]
+        );
+    }
+
+    /// The sidecar reports a switch only after one was asked for, always naming the CLI's mode, and
+    /// this client never asks: a change that names no mode is a peer breaking that rule, so what the
+    /// CLI runs in afterwards is unknown. Closed whatever the enum says; BYPASS keeps its own word.
+    #[test]
+    fn a_mode_change_that_names_no_mode_trips_a_default_session() {
+        for mode in [
+            ProtoPermissionMode::Interactive,
+            ProtoPermissionMode::VerdandiRules,
+            ProtoPermissionMode::Unspecified,
+        ] {
+            assert_eq!(
+                super::translate(mode_changed(mode, ""), RequestedCliMode::Default),
+                vec![AgentDomainEvent::UngatedCliMode {
+                    reported: "a mode switch".into(),
+                    detail: "PermissionModeChanged".into(),
+                }],
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            super::translate(mode_changed(ProtoPermissionMode::Bypass, ""), RequestedCliMode::Default),
+            vec![AgentDomainEvent::UngatedCliMode {
+                reported: "BYPASS".into(),
+                detail: "PermissionModeChanged".into(),
+            }]
+        );
+        let none = wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged::default()));
+        assert_eq!(
+            super::translate(none, RequestedCliMode::Default),
+            vec![AgentDomainEvent::UngatedCliMode {
+                reported: "a mode switch".into(),
                 detail: "PermissionModeChanged".into(),
             }]
         );

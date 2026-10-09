@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::codex::{codex_findings, hooks_json_findings, rule_file_findings};
-use super::findings::{mcp_findings, settings_findings};
+use super::findings::{frontmatter_keys, mcp_findings, settings_findings};
 use super::git_top::git_top_level;
 use super::nofollow::{normalize_lexically, DirHandle, FileKind, Refusal};
 use super::{Discovery, Entry, EntryKind, Finding, Fingerprint, Limits, Profile, ProfileEnv};
@@ -38,6 +38,10 @@ enum Role {
     /// link anywhere in it and reads what it leads to, so a link here is one the fingerprint cannot
     /// see through.
     SkillTree,
+    /// Anything in a `.claude/` that is not its settings or memory file: commands, agents, skills,
+    /// the scripts its hooks run. The CLI reads all of it and follows a link anywhere in it, so a
+    /// link here leaves it reading something the fingerprint cannot see.
+    ClaudeOther,
     /// Anything else under a directory read whole.
     Plain,
 }
@@ -47,6 +51,14 @@ impl Role {
     /// content the fingerprint never sees.
     fn read_by_the_cli(self) -> bool {
         !matches!(self, Role::Plain)
+    }
+
+    /// A file the prompt names by itself, with its size, rather than by what it configures.
+    fn named_by_itself(self) -> bool {
+        matches!(
+            self,
+            Role::Plain | Role::CodexReadDir | Role::Registered | Role::SkillTree | Role::ClaudeOther
+        )
     }
 }
 
@@ -231,7 +243,17 @@ impl Scan<'_> {
                     Role::HooksJson => self.findings.extend(hooks_json_findings(&path, &bytes)),
                     Role::Rules => self.findings.extend(rule_file_findings(&path, &bytes)),
                     Role::Listing => self.findings.push(Finding::PluginListing { path: path.clone() }),
-                    Role::CodexReadDir | Role::Registered | Role::SkillTree | Role::Plain => {}
+                    Role::CodexReadDir | Role::Registered | Role::SkillTree | Role::ClaudeOther | Role::Plain => {}
+                }
+                if role.named_by_itself() {
+                    // The frontmatter is read from the bytes just hashed, so it is the same content.
+                    let name = path.file_name().unwrap_or(path.as_os_str());
+                    self.findings.push(Finding::OtherFile {
+                        dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+                        name: PathBuf::from(name),
+                        len: bytes.len() as u64,
+                        frontmatter: frontmatter_keys(name, &bytes),
+                    });
                 }
                 self.push(
                     path,
@@ -413,7 +435,6 @@ impl Scan<'_> {
                 let reason = format!("more than {} entries of configuration", self.limits.max_entries);
                 self.note_over_budget(reason);
             }
-            let mut other_files = 0usize;
             let mut below: Vec<(DirHandle, PathBuf, OsString)> = Vec::new();
             let in_skills = depth > 0
                 && path
@@ -465,22 +486,9 @@ impl Scan<'_> {
                         }
                     }
                     _ => {
-                        if self.expected_file(&dir, &name, child, role)
-                            && matches!(
-                                role,
-                                Role::Plain | Role::CodexReadDir | Role::Registered | Role::SkillTree
-                            )
-                        {
-                            other_files += 1;
-                        }
+                        self.expected_file(&dir, &name, child, role);
                     }
                 }
-            }
-            if other_files > 0 {
-                self.findings.push(Finding::OtherFiles {
-                    dir: path.clone(),
-                    count: other_files,
-                });
             }
             // Pushed in reverse so the first name is walked first.
             for (sub, child, name) in below.into_iter().rev() {
@@ -722,12 +730,12 @@ fn plain_names(names: &[String], dirs_allowed: bool) -> (Vec<(OsString, bool)>, 
 /// What a name directly in `.claude/` (depth 0) or below it means to the CLI.
 fn role_in(depth: usize, name: &OsStr) -> Role {
     if depth != 0 {
-        return Role::Plain;
+        return Role::ClaudeOther;
     }
     match name.as_bytes() {
         b"settings.json" | b"settings.local.json" => Role::Settings,
         b"CLAUDE.md" => Role::Memory,
-        _ => Role::Plain,
+        _ => Role::ClaudeOther,
     }
 }
 

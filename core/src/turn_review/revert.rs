@@ -6,9 +6,9 @@
 //! ([`PresenceGuard::check`]); the editor said no buffer of this very file has unsaved changes
 //! (an [`EditorClear`] naming it, which only [`EditorCheck`] makes); the file is reached from the
 //! project root without following a link ([`ProjectDir`]); and the disk is what the job expects.
-//! Right before the write the guard is asked again, the request is checked to be still wanted and
-//! the file is read and compared once more, so the gap between the last look and the write is as
-//! short as it can be. A job cannot be built without a guard and a clear.
+//! Right before the write the guard is asked again, the request is checked to be still wanted, the
+//! editor's answer is checked to be recent ([`MAX_CLEAR_AGE`]) and the file is read and compared
+//! once more, so the gap between the last look and the write is as short as it can be. A job cannot be built without a guard and a clear.
 //!
 //! **Bytes, never text.** A file's lines come from the snapshots' blobs, split after each `\n`, so
 //! line terminators and bytes that are not UTF-8 are written back exactly; the lossy text a review
@@ -50,6 +50,14 @@ pub const BUFFER_STATE_LUA: &str = include_str!("buffer_state.lua");
 /// How long the editor has to say whether a file has unsaved changes. nvim queues a request while
 /// it waits for a key, so silence is likely a pending key, not a crash.
 const EDITOR_ANSWER_WAIT: Duration = Duration::from_secs(5);
+
+/// How old the editor's word that a file has no unsaved changes may be when the write happens. A
+/// write runs on a thread of its own as soon as the editor answers, and its own work before the
+/// last look takes well under a second; the longest it can legitimately wait is the shadow's lock
+/// while retention holds it, and a write still waiting for that after [`READ_TIMEOUT`] (10 s) is
+/// refused anyway. An answer older than that is no longer a statement about the buffer as it is
+/// now, so the write is refused and the key is pressed again, which asks the editor afresh.
+pub const MAX_CLEAR_AGE: Duration = Duration::from_secs(10);
 
 /// The most lines a comment's anchor quotes.
 const MAX_ANCHOR_LINES: u32 = 200;
@@ -200,10 +208,13 @@ impl std::error::Error for Refusal {}
 
 /// The editor's word that no buffer of one file has unsaved changes. Only [`EditorCheck::poll`]
 /// makes one, and it names the absolute path that was asked about: a job given a clear for another
-/// path refuses. Not `Clone`: one answer clears one job.
+/// path refuses. It also says when the editor answered: the buffer may be edited at any moment
+/// after, so a write refuses a clear older than [`MAX_CLEAR_AGE`]. Not `Clone`: one answer clears
+/// one job.
 #[derive(Debug)]
 pub struct EditorClear {
     path: PathBuf,
+    answered: Instant,
 }
 
 impl EditorClear {
@@ -212,10 +223,18 @@ impl EditorClear {
         &self.path
     }
 
+    /// A clear answered just now.
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests(path: &Path) -> EditorClear {
+        EditorClear::answered_at_for_tests(path, Instant::now())
+    }
+
+    /// A clear the editor gave at `answered`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn answered_at_for_tests(path: &Path, answered: Instant) -> EditorClear {
         EditorClear {
             path: path.to_path_buf(),
+            answered,
         }
     }
 }
@@ -387,8 +406,13 @@ impl EditorCheck {
                 self.path.display()
             )));
         }
+        // Dated by the question, not by the poll that took the answer: a panel that polls late would
+        // otherwise renew an answer nvim gave long ago, and the buffer may have been edited since. The
+        // question was sent no later than the moment nvim looked at its buffers, so the age is never
+        // under-counted, and an answer is refused when it did not come within `EDITOR_ANSWER_WAIT`.
         Ok(EditorClear {
             path: self.path.clone(),
+            answered: self.started,
         })
     }
 
@@ -653,6 +677,7 @@ impl RevertJob {
         let target = final_checks(
             &self.guard,
             wanted,
+            &self.clear,
             &root,
             &rel,
             &current,
@@ -719,6 +744,7 @@ impl UndoJob {
         let target = final_checks(
             &self.guard,
             wanted,
+            &self.clear,
             &root,
             &rel,
             &current,
@@ -892,7 +918,7 @@ fn restore_entry(
         mode: entry.mode,
     };
     let shown = rel.display().to_string();
-    let target = final_checks(guard, None, &root, &rel, &current, true, hook, || {
+    let target = final_checks(guard, None, clear, &root, &rel, &current, true, hook, || {
         Refusal::Unavailable(format!(
             "{shown} changed while it was being restored; nothing was written"
         ))
@@ -934,8 +960,9 @@ fn locate(clear: &EditorClear, root: &Path, rel: &Path, session: &str) -> Result
     Ok((dir, target))
 }
 
-/// The last look before a write: the guard again, the request still wanted, and the file exactly
-/// as it was read (`expected`); otherwise `changed`.
+/// The last look before a write: the guard again, the request still wanted, the editor's clear
+/// still recent ([`MAX_CLEAR_AGE`]), and the file exactly as it was read (`expected`); otherwise
+/// `changed`.
 ///
 /// The file is reached from the project root once more, component by component, and the write goes
 /// through that fresh descriptor, never the one opened when the job started: a directory moved out
@@ -946,6 +973,7 @@ fn locate(clear: &EditorClear, root: &Path, rel: &Path, session: &str) -> Result
 fn final_checks(
     guard: &PresenceGuard,
     wanted: Option<&AtomicBool>,
+    clear: &EditorClear,
     root: &ProjectDir,
     rel: &Path,
     expected: &Current,
@@ -958,6 +986,7 @@ fn final_checks(
     }
     guard.check().map_err(Refusal::Blocked)?;
     still_wanted(wanted)?;
+    still_clear(clear, Instant::now())?;
     let create_missing = *expected == Current::Absent && writes_something;
     let target = root.target(rel, create_missing).map_err(write_refusal)?;
     if read_current(&target).map_err(|e| read_failed(rel, e))? != *expected {
@@ -965,6 +994,18 @@ fn final_checks(
     }
     still_wanted(wanted)?;
     Ok(target)
+}
+
+/// The editor's clear is too old once [`MAX_CLEAR_AGE`] has passed since it answered.
+fn still_clear(clear: &EditorClear, now: Instant) -> Result<(), Refusal> {
+    if now.saturating_duration_since(clear.answered) > MAX_CLEAR_AGE {
+        return Err(Refusal::Editor(format!(
+            "the editor said {} had no unsaved changes more than {} s ago; nothing was written, press the key again",
+            clear.path.display(),
+            MAX_CLEAR_AGE.as_secs()
+        )));
+    }
+    Ok(())
 }
 
 fn write_refusal(e: WriteError) -> Refusal {

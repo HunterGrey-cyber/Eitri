@@ -9477,6 +9477,50 @@ describe("gx: web links on a row", () => {
     expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
     expect(rendered.container.querySelector(".row-permission")).not.toBeNull();
   });
+
+  /* A click (or Enter, which clicks) is WebKit's own navigation, which Rust opens with no look at the address:
+     a reply link whose text is not where it goes shows that address first, and only a second click on it opens. */
+  describe("a click on a reply link", () => {
+    function clickAt(anchor: Element, at: number): boolean {
+      const now = vi.spyOn(Date, "now").mockReturnValue(at);
+      try {
+        return fireEvent.click(anchor);
+      } finally {
+        now.mockRestore();
+      }
+    }
+
+    it("shows the real address of a link whose text says another, and opens on the second click", () => {
+      const widen = stubBandWidth();
+      try {
+        const { container } = withReply("see [https://good.example/](https://evil.example/)");
+        act(() => widen(container));
+        boxLinks(container);
+        const anchor = container.querySelector(".row a[href]")!;
+        expect(clickAt(anchor, 10_000)).toBe(false);
+        expect(container.querySelector(".band-message")!.textContent).toBe(
+          "https://evil.example/ — click again to open",
+        );
+        expect(clickAt(anchor, 10_100)).toBe(false); // a double-click's second half is not a look
+        expect(clickAt(anchor, 11_000)).toBe(true);
+        expect(opened()).toEqual([]); // the panel posts nothing: the browser's own click goes on to Rust
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("lets a link whose text is its own address open on the first click", () => {
+      const { container } = withReply("see https://example.com/a");
+      boxLinks(container);
+      expect(clickAt(container.querySelector(".row a[href]")!, 10_000)).toBe(true);
+    });
+
+    it("leaves a mail link to Rust's own check", () => {
+      const { container } = withReply("write [to us](mailto:a@example.com)");
+      boxLinks(container);
+      expect(clickAt(container.querySelector(".row a[href]")!, 10_000)).toBe(true);
+    });
+  });
 });
 
 /** Moved in from the deleted `statusRow.test.ts`: `statusWarning` and

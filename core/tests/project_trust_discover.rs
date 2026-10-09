@@ -417,9 +417,11 @@ fn a_file_under_dot_claude_counts() {
     let first = fx.discover(&repo);
     assert!(paths(&first).contains(&PathBuf::from(".claude/hooks")));
     assert!(paths(&first).contains(&PathBuf::from(".claude/hooks/run.sh")));
-    assert!(first.findings.contains(&Finding::OtherFiles {
+    assert!(first.findings.contains(&Finding::OtherFile {
         dir: PathBuf::from(".claude/hooks"),
-        count: 1
+        name: PathBuf::from("run.sh"),
+        len: 18,
+        frontmatter: Vec::new(),
     }));
 
     std::fs::write(repo.join(".claude/hooks/run.sh"), b"#!/bin/sh\necho bye\n").unwrap();
@@ -432,6 +434,79 @@ fn a_file_under_dot_claude_counts() {
 
     write(&repo.join(".claude/agents/a.md"), b"agent\n");
     assert_ne!(fx.discover(&repo).fingerprint, renamed);
+}
+
+/// The files of `found` the prompt names by themselves: (directory, name, size, frontmatter keys).
+fn other_files(found: &Discovery) -> Vec<(String, String, u64, Vec<String>)> {
+    let mut out: Vec<_> = found
+        .findings
+        .iter()
+        .filter_map(|f| match f {
+            Finding::OtherFile {
+                dir,
+                name,
+                len,
+                frontmatter,
+            } => Some((
+                dir.display().to_string(),
+                name.display().to_string(),
+                *len,
+                frontmatter.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every tree read whole names each of its other files with its size, and a Markdown file whose
+/// frontmatter sets hooks, tools, a permission mode or MCP servers says so.
+#[test]
+fn other_files_are_named_in_every_tree() {
+    let fx = Fixture::new("other-named");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    let tools = b"---\nallowed-tools: Read\n---\nbody\n";
+    write(&repo.join(".claude/settings.json"), b"{}");
+    write(&repo.join(".claude/skills/s/SKILL.md"), tools);
+    write(&repo.join(".claude/commands/c.md"), b"plain\n");
+    write(
+        &repo.join(".claude/agents/a.md"),
+        b"---\npermissionMode: plan\nmcpServers: {}\n---\n",
+    );
+    write(&repo.join(".codex/prompts/p.md"), tools);
+    write(&repo.join(".agents/skills/k/SKILL.md"), b"---\nhooks: {}\n---\n");
+    write(&repo.join(".gem/x.md"), tools);
+    let s = |v: &[&str]| v.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        other_files(&fx.discover(&repo)),
+        vec![
+            (
+                ".claude/agents".into(),
+                "a.md".into(),
+                44,
+                s(&["permissionMode", "mcpServers"])
+            ),
+            (".claude/commands".into(), "c.md".into(), 6, vec![]),
+            (".claude/skills/s".into(), "SKILL.md".into(), 33, s(&["allowed-tools"])),
+        ]
+    );
+    assert_eq!(
+        other_files(&fx.discover_as(&repo, &Profile::Codex, &fx.codex_env())),
+        vec![
+            (".agents/skills/k".into(), "SKILL.md".into(), 18, s(&["hooks"])),
+            (".codex/prompts".into(), "p.md".into(), 33, s(&["allowed-tools"])),
+        ]
+    );
+    let gem = Profile::Acp {
+        name: "gem".into(),
+        files: vec![".gem/".into()],
+    };
+    assert_eq!(
+        other_files(&fx.discover_as(&repo, &gem, &ProfileEnv::default())),
+        vec![(".gem".into(), "x.md".into(), 33, s(&["allowed-tools"]))]
+    );
 }
 
 #[test]
@@ -460,8 +535,9 @@ fn a_symlink_is_reported_by_target_and_never_followed() {
         target: elsewhere.join("run"),
         outside: true,
     }));
-    // A hook script that is a link is fingerprinted by its target, not unhashed.
-    assert!(found.fully_hashed());
+    // A hook script that is a link is fingerprinted by its target as written, and the CLI reads what
+    // it leads to, which no fingerprint sees: the answer lasts one start.
+    assert!(!found.fully_hashed());
 
     // The target's bytes are never read.
     std::fs::write(elsewhere.join("run"), b"changed\n").unwrap();
@@ -499,6 +575,43 @@ fn a_symlink_is_reported_by_target_and_never_followed() {
         }
     );
     assert!(!found.findings.iter().any(|f| matches!(f, Finding::Hook { .. })));
+}
+
+/// The CLI reads everything in `.claude/` (commands, agents, skills, the scripts its hooks run), and
+/// follows a link anywhere there: what the link leads to can change under an unchanged fingerprint,
+/// so a link at any depth below `.claude/` makes the answer last one start, never a record.
+#[test]
+fn a_link_anywhere_below_dot_claude_is_not_fully_hashed() {
+    let fx = Fixture::new("below-claude-link");
+    for (at, target) in [
+        (".claude/hooks", "../scripts/hooks"),
+        (".claude/commands/x.md", "../../x.md"),
+        (".claude/agents/deep/er/a.md", "../../../../a.md"),
+        (".claude/skills/s", "../../skill"),
+    ] {
+        let repo = fx.home.join(format!("repo-{}", at.replace(['/', '.'], "_")));
+        fx.repo(&repo, false);
+        write(&repo.join(".claude/settings.json"), b"{}");
+        write(&repo.join("scripts/hooks/run.sh"), b"#!/bin/sh\n");
+        write(&repo.join("x.md"), b"x\n");
+        write(&repo.join("a.md"), b"a\n");
+        write(&repo.join("skill/SKILL.md"), b"s\n");
+        std::fs::create_dir_all(repo.join(at).parent().unwrap()).unwrap();
+        symlink(target, repo.join(at)).unwrap();
+        let found = fx.discover(&repo);
+        assert!(!found.fully_hashed(), "{at}");
+        let reason = format!("a link to {target}");
+        assert!(
+            found.uncheckable().contains(&(Path::new(at), reason.as_str())),
+            "{at}: {:?}",
+            found.uncheckable()
+        );
+        // Still named as a link, by its target as written.
+        assert!(found
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::Symlink { path, .. } if path == Path::new(at))));
+    }
 }
 
 #[test]
@@ -970,6 +1083,8 @@ fn a_worktrees_link_is_reported_and_not_followed() {
         .any(|f| matches!(f, Finding::Symlink { path, .. } if path == Path::new(".claude/worktrees"))));
     assert!(!found.findings.contains(&not_read(".claude/worktrees")));
     assert!(!paths(&found).iter().any(|p| below_worktrees(p)));
+    // Like any link below `.claude/`, it leads somewhere the fingerprint cannot see: one start only.
+    assert!(!found.fully_hashed());
     // The content behind the link is not read, so changing it changes nothing.
     write(&elsewhere.join("a/settings.json"), b"{}");
     assert_eq!(fx.discover(&repo).fingerprint, found.fingerprint);

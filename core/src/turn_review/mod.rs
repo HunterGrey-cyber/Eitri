@@ -57,7 +57,7 @@ pub use presence::{busy_elsewhere, Blocked, Busy, Presence, PresenceGuard, Prese
 pub use revert::{
     buffer_state_args, parse_buffer_state, AnchorJob, AppliedRevert, BufferState, EditorCheck, EditorClear, ExactHunk,
     ExactHunks, ExactHunksJob, RecoverAnswer, RecoverJob, Recovered, RecoveriesJob, Refusal, RevertJob, RevertKind,
-    RevertTarget, Saved, UndoJob, BUFFER_STATE_LUA,
+    RevertTarget, Saved, UndoJob, BUFFER_STATE_LUA, MAX_CLEAR_AGE,
 };
 pub use shadow::{
     review_dir_for, Entry, EntryKind, FilePrint, LeftOut, Limits, Shadow, ShadowError, ShadowLock, Snapshot,

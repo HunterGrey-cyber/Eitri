@@ -9,6 +9,9 @@ import {
   firstShownLine,
   hintTargets,
   hintVisible,
+  LINK_LOOK_MAX_MS,
+  LINK_LOOK_MIN_MS,
+  linkClickNeedsLook,
   linkOpensAtOnce,
   nextControl,
   nextStop,
@@ -447,6 +450,90 @@ describe("webUrl and webLinks", () => {
     const elsewhere = rowWithLinks(["https://example.com/out"]);
     expect(webLinks(row).map((l) => l.url)).toEqual(["https://example.com/in"]);
     expect(webLinks(elsewhere).map((l) => l.url)).toEqual(["https://example.com/out"]);
+  });
+});
+
+describe("linkClickNeedsLook: a click on a reply link whose text is not its address shows the address first", () => {
+  /** One row in a root whose box is y 0..200, holding one anchor with `text` and `href`, on screen. */
+  function anchorWith(href: string, text: string) {
+    document.body.innerHTML = `<div id="root"><div data-nav-stop="row" id="row"><a id="link"></a></div></div>`;
+    const a = byId("link") as HTMLAnchorElement;
+    a.setAttribute("href", href);
+    a.textContent = text;
+    rect(byId("root"), 0, 200);
+    rect(a, 10, 20);
+    return { a, root: byId("root") };
+  }
+
+  it("lets through a link whose visible text is its own address", () => {
+    const { a, root } = anchorWith("https://good.example/x", "https://good.example/x");
+    expect(linkClickNeedsLook(a, root, null, 0)).toBeNull();
+  });
+
+  it("shows the normalized address of a link that says something else", () => {
+    for (const [href, text, url] of [
+      ["https://evil.example/", "https://good.example/", "https://evil.example/"],
+      ["https://EVIL.example/a", "docs", "https://evil.example/a"],
+    ]) {
+      const { a, root } = anchorWith(href, text);
+      expect(linkClickNeedsLook(a, root, null, 0), href).toBe(url);
+    }
+    // A scheme-relative link is resolved against the document, as the click that follows it is.
+    const { a, root } = anchorWith("//evil.example/x", "x");
+    const resolved = new URL("//evil.example/x", document.baseURI).href;
+    expect(resolved.endsWith("//evil.example/x")).toBe(true);
+    expect(linkClickNeedsLook(a, root, null, 0)).toBe(resolved);
+  });
+
+  it("lets a second click on the same link through, but not a double-click or a late one", () => {
+    const { a, root } = anchorWith("https://evil.example/", "https://good.example/");
+    const shown = { el: a, row: rowOf(root, a), url: "https://evil.example/", at: 1000 };
+    expect(linkClickNeedsLook(a, root, shown, 1000 + LINK_LOOK_MIN_MS)).toBeNull();
+    expect(linkClickNeedsLook(a, root, shown, 1000 + LINK_LOOK_MAX_MS)).toBeNull();
+    expect(linkClickNeedsLook(a, root, shown, 1000 + LINK_LOOK_MIN_MS - 1)).toBe("https://evil.example/");
+    expect(linkClickNeedsLook(a, root, shown, 1000 + LINK_LOOK_MAX_MS + 1)).toBe("https://evil.example/");
+    // With no row to go by, another anchor is shown afresh, and so is the same one now pointing elsewhere.
+    const other = document.createElement("a");
+    expect(linkClickNeedsLook(a, root, { ...shown, row: null, el: other }, 1500)).toBe("https://evil.example/");
+    a.setAttribute("href", "https://worse.example/");
+    expect(linkClickNeedsLook(a, root, shown, 1500)).toBe("https://worse.example/");
+  });
+
+  it("lets a second click through on a re-rendered anchor of the same row and address, not on another row's", () => {
+    // A streaming reply's HTML is replaced on every chunk: the row stays, the anchor is a new element.
+    document.body.innerHTML =
+      `<div id="root"><div data-nav-stop="row" id="r1"><div id="body"><a id="l1" href="https://evil.example/">docs</a></div></div>` +
+      `<div data-nav-stop="row" id="r2"><a id="l2" href="https://evil.example/">docs</a></div></div>`;
+    const root = byId("root");
+    rect(root, 0, 200);
+    const first = byId("l1") as HTMLAnchorElement;
+    rect(first, 10, 20);
+    const shown = { el: first, row: rowOf(root, first), url: "https://evil.example/", at: 1000 };
+    byId("body").innerHTML = `<a id="l1b" href="https://evil.example/">docs</a>`;
+    const rebuilt = byId("l1b") as HTMLAnchorElement;
+    rect(rebuilt, 10, 20);
+    expect(rebuilt).not.toBe(first);
+    expect(linkClickNeedsLook(rebuilt, root, shown, 2000)).toBeNull();
+    // Same address in another row is a different link: shown again.
+    const other = byId("l2") as HTMLAnchorElement;
+    rect(other, 30, 40);
+    expect(linkClickNeedsLook(other, root, shown, 2000)).toBe("https://evil.example/");
+    // The same row with another address is shown afresh.
+    rebuilt.setAttribute("href", "https://worse.example/");
+    expect(linkClickNeedsLook(rebuilt, root, shown, 2000)).toBe("https://worse.example/");
+  });
+
+  it("leaves a link that is not a web link to Rust's own check", () => {
+    for (const href of ["mailto:a@b?subject=x", "javascript:alert(1)", "ftp://x.example/"]) {
+      const { a, root } = anchorWith(href, "click me");
+      expect(linkClickNeedsLook(a, root, null, 0), href).toBeNull();
+    }
+  });
+
+  it("shows the address of a link nobody can see, even when its text is its address", () => {
+    const { a, root } = anchorWith("https://evil.example/", "https://evil.example/");
+    rect(a, 500, 20); // below the root's own box
+    expect(linkClickNeedsLook(a, root, null, 0)).toBe("https://evil.example/");
   });
 });
 

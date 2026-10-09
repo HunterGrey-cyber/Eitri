@@ -75,6 +75,51 @@ export function linkOpensAtOnce(link: { el: HTMLAnchorElement; url: string }, ro
   return (text === link.url || `${text}/` === link.url) && hintVisible(link.el, root);
 }
 
+/** How soon after a click showed a link's address a second click on it may open it. Under the lower bound
+ *  the second click is the other half of a double-click, made before the address could be read. */
+export const LINK_LOOK_MIN_MS = 400;
+export const LINK_LOOK_MAX_MS = 5000;
+
+/** The link whose address the last click showed instead of opening, and when. `row` is the conversation row
+ *  the link was in: a streaming reply's HTML is replaced on every chunk, so the anchor element a second click
+ *  lands on is never the one the first click did, but its row (keyed by the item) and its address are. */
+export interface ShownLink {
+  el: HTMLAnchorElement;
+  row: HTMLElement | null;
+  url: string;
+  at: number;
+}
+
+/** Whether `anchor` is the link `shown` showed: the same conversation row when it has one (the anchor itself
+ *  may have been rebuilt by a re-render of the reply), else the same element. */
+function sameLink(shown: ShownLink, anchor: HTMLAnchorElement, root: HTMLElement): boolean {
+  const row = rowOf(root, anchor);
+  return row !== null && shown.row !== null ? shown.row === row : shown.el === anchor;
+}
+
+/** What a click (or Enter, which clicks) on `anchor` must do before the browser follows it. `null` lets it
+ *  through: a link `linkOpensAtOnce` accepts, a second click on the link whose address the previous click
+ *  showed (between `LINK_LOOK_MIN_MS` and `LINK_LOOK_MAX_MS` after it), or a link that is not a web link at
+ *  all (Rust's own scheme check refuses everything but web and mail). Otherwise the address the browser would
+ *  open, normalized, to be shown instead of opening: a reply's `<a href="https://evil">https://good</a>` must not
+ *  launch the browser on one click. Judged on the anchor's RESOLVED `href`, which is what the click navigates
+ *  to: a scheme-relative `//host/x` is a web link although `webUrl` of its attribute is not. */
+export function linkClickNeedsLook(
+  anchor: HTMLAnchorElement,
+  root: HTMLElement,
+  shown: ShownLink | null,
+  now: number,
+): string | null {
+  const url = webUrl(anchor.href);
+  if (url === null) return null;
+  if (linkOpensAtOnce({ el: anchor, url }, root)) return null;
+  if (shown !== null && shown.url === url && sameLink(shown, anchor, root)) {
+    const since = now - shown.at;
+    if (since >= LINK_LOOK_MIN_MS && since <= LINK_LOOK_MAX_MS) return null;
+  }
+  return url;
+}
+
 /** Whether `el` is inside a control a key activates by default: a button, summary, link or
  *  element with `role="button"`.
  *

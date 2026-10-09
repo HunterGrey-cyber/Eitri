@@ -1,0 +1,43 @@
+#!/bin/sh
+# Test double for `find`, beside id-root: the files of a run that pretends to be root are really this
+# user's, so an ownership test against uid 0 (`-uid 0`) also accepts this user's own uid -- the
+# directories this user owns stand for root's. A path named in <scratch>/logs/fake-owner-path is
+# reported as another user's for any -uid test, as find-fake-owner does. Every other predicate runs on
+# the real find, untouched.
+S=$(cd "$(dirname "$0")/.." && pwd)
+real=
+for m in /usr/bin/find /bin/find; do
+	if [ -x "$m" ]; then real=$m; break; fi
+done
+[ -n "$real" ] || exit 127
+_marker=$S/logs/fake-owner-path
+_path=$1
+if [ "$1" = -H ]; then _path=$2; fi
+if [ -f "$_marker" ] && [ "$_path" = "$(cat "$_marker")" ]; then
+	case " $* " in
+	*' -uid '*)
+		printf '%s\n' "$_path"
+		exit 0
+		;;
+	esac
+fi
+_me=
+for m in /usr/bin/id /bin/id; do
+	if [ -x "$m" ]; then _me=$("$m" -u); break; fi
+done
+[ -n "$_me" ] || exit 127
+_n=$#
+_i=0
+while [ "$_i" -lt "$_n" ]; do
+	_a=$1
+	shift
+	_i=$((_i + 1))
+	if [ "$_a" = -uid ] && [ "$_i" -lt "$_n" ] && [ "$1" = 0 ]; then
+		shift
+		_i=$((_i + 1))
+		set -- "$@" '(' -uid 0 -o -uid "$_me" ')'
+	else
+		set -- "$@" "$_a"
+	fi
+done
+exec "$real" "$@"

@@ -101,7 +101,8 @@ NV_APPARMOR_D=/etc/apparmor.d
 # them never reads this host's own restriction or profiles.
 # None of them touches the trust anchor: the release key is never taken from the environment (only
 # --release-signers replaces it, with a warning). At worst they make a system check pass or keep
-# one more sidecar.
+# one more sidecar. The URL overrides further down (EITRI_INSTALL_TEST_*_BASE_URL, *_REPO_URL) are
+# refused unless they name a loopback http server or an absolute local path (set_paths).
 NV_TEST_MODE=0
 
 OPT_MODE=install
@@ -132,6 +133,11 @@ NV_LOCK=
 NV_NEW_CREATED=0
 NV_CACHE_CREATED=0
 NV_LOOPBACK=0
+# Every download's bounds: refused past 1 GiB (the release tarball and the Node, nvim and Skia
+# archives are tens of MB) and given up when it moves under 1 KiB/s for five minutes or cannot
+# connect within a minute, so a server that never ends or stalls a transfer cannot hold a run for good
+# while a slow link still finishes.
+NV_MAX_DOWNLOAD_BYTES=1073741824
 NV_SYS_REV7=
 NV_SIDECAR_WORKDIR=
 NV_SIDECAR_TMP=
@@ -365,7 +371,42 @@ set_paths() {
 		NV_TEST_LIBDIRS=${EITRI_INSTALL_TEST_LIBDIRS-}
 		NV_PROC=${EITRI_INSTALL_TEST_PROC-/nonexistent/eitri-test-proc}
 		NV_APPARMOR_D=${EITRI_INSTALL_TEST_APPARMOR_D-/nonexistent/eitri-test-apparmor.d}
+		# The download overrides lead only to a loopback server and the repository overrides only to a
+		# local path: a test mode left switched on in an environment can then send no download, clone
+		# or build anywhere else.
+		for _sp_v in NODE NVIM SKIA; do
+			eval "_sp_u=\${EITRI_INSTALL_TEST_${_sp_v}_BASE_URL-}"
+			if [ -n "$_sp_u" ]; then
+				loopback_http "$_sp_u"
+				if [ "$LH" != 1 ]; then die "EITRI_INSTALL_TEST_${_sp_v}_BASE_URL=$_sp_u: test mode downloads only from http://127.0.0.1[:port] or http://localhost[:port]"; fi
+			fi
+		done
+		for _sp_v in REPO VERDANDI_REPO; do
+			eval "_sp_u=\${EITRI_INSTALL_TEST_${_sp_v}_URL-}"
+			case $_sp_u in
+			'' | /*) ;;
+			*) die "EITRI_INSTALL_TEST_${_sp_v}_URL=$_sp_u: test mode clones only from an absolute local path" ;;
+			esac
+		done
 	fi
+}
+
+# loopback_http URL: sets LH=1 when URL is plain http to exactly 127.0.0.1 or localhost, with an
+# optional numeric port and no user part, else LH=0 (check_base_url's rule for --base-url).
+loopback_http() {
+	LH=0
+	case $1 in http://*) ;; *) return 0 ;; esac
+	_lh_auth=${1#http://}
+	_lh_auth=${_lh_auth%%/*}
+	case $_lh_auth in
+	127.0.0.1 | localhost) LH=1 ;;
+	127.0.0.1:?* | localhost:?*)
+		case ${_lh_auth#*:} in
+		*[!0-9]*) ;;
+		*) LH=1 ;;
+		esac
+		;;
+	esac
 }
 
 # check_data_home: reject data paths outside $HOME before writing under NV_DATA.
@@ -830,6 +871,67 @@ nvim_private_state() {
 	if [ -n "$1" ] && [ -x "$NV_NVIM_PRIVATE_BIN" ]; then NV_NVIM_PRIVATE_PRESENT=1; fi
 }
 
+# archive_names_inside TAR-LIST-OPTION ARCHIVE WHAT: refuses ARCHIVE when a member's name is absolute
+# or has a `..` component, before anything is unpacked. Every archive here is checked against a hash
+# first; this holds whatever the tar in use would make of such a name (GNU tar and bsdtar strip or
+# skip them, others need not). `tar -t` prints one name per line, a newline inside a name escaped by
+# GNU tar or split by others -- either way a part that is absolute or climbs is still seen. A plain
+# statement (rule 2 above).
+archive_names_inside() {
+	_ani_list=$(tar "$1" "$2") || die "could not unpack $3: tar cannot even list it, so it is not a valid archive. Nothing was changed; report it at $NV_ISSUES"
+	_ani_bad=$(printf '%s\n' "$_ani_list" | awk '
+		/^\// { print; exit }
+		{ n = split($0, part, "/"); for (i = 1; i <= n; i++) if (part[i] == "..") { print; exit } }') || _ani_bad=
+	if [ -n "$_ani_bad" ]; then
+		die "$3 holds a member named $_ani_bad, outside the directory it is unpacked into: refusing to unpack it. Report it at $NV_ISSUES"
+	fi
+}
+
+# links_stay_inside DIR WHAT: refuses what was unpacked into DIR (from WHAT) when a symlink in it is
+# absolute, climbs out of DIR, or has a `..` after any other component. Its leading `..` components
+# are counted from where the link sits, and that count is exact: find does not descend through links,
+# so every directory above a link it reports is a real one. A `..` after another component is refused
+# outright, because that component may be a link leading anywhere inside DIR (`s -> .` turns
+# `l -> s/..` into DIR's parent). Without one, a target only goes up through real directories and then
+# down, and every link it goes down through is held to the same rule, so it ends inside DIR. `tar -t`
+# shows no link targets, so this reads the links themselves once unpacked; tar itself writes nothing
+# through a link it unpacked that could lead out (GNU tar unpacks a link with an absolute or `..`
+# target only at the end, bsdtar refuses to write through one), so nothing has reached outside DIR
+# yet. Names are passed to the checking shell as arguments, so any character in one is fine. A plain
+# statement (rule 2 above).
+links_stay_inside() {
+	# shellcheck disable=SC2016 # the script is for the inner shell
+	_lsi_bad=$(find "$1" -type l -exec sh -c '
+		root=$1
+		shift
+		for l do
+			t=$(readlink -- "$l") || { printf "%s\n" "$l"; exit 1; }
+			case $t in /*) printf "%s -> %s\n" "${l#"$root"/}" "$t"; exit 1 ;; esac
+			r=${l#"$root"/}
+			d=0
+			while :; do
+				case $r in */*) d=$((d + 1)); r=${r#*/} ;; *) break ;; esac
+			done
+			rest=$t
+			down=0
+			while [ -n "$rest" ]; do
+				c=${rest%%/*}
+				case $rest in */*) rest=${rest#*/} ;; *) rest= ;; esac
+				case $c in
+				"" | .) ;;
+				..)
+					d=$((d - 1))
+					if [ "$down" = 1 ] || [ "$d" -lt 0 ]; then printf "%s -> %s\n" "${l#"$root"/}" "$t"; exit 1; fi
+					;;
+				*) down=1 ;;
+				esac
+			done
+		done' sh "$1" {} + 2>/dev/null) || _lsi_bad=${_lsi_bad:-"a link that could not be read"}
+	if [ -n "$_lsi_bad" ]; then
+		die "$2 holds a symlink leading outside the directory it was unpacked into ($_lsi_bad): refusing to use it. Report it at $NV_ISSUES"
+	fi
+}
+
 # install_nvim_version VERSION SHA256 TOLERANT: download nvim-linux-x86_64.tar.gz for
 # VERSION and verify it against SHA256 from the parsed RELEASE. Strip the top directory
 # with --strip-components=1 and install into the per-user version directory.
@@ -860,7 +962,9 @@ install_nvim_version() {
 	mv -- "$_inv_tar.part" "$_inv_tar" || die "cannot rename $_inv_tar.part"
 	_inv_extract=$_inv_workdir/extract
 	mkdir -p -- "$_inv_extract" || die "cannot create $_inv_extract"
-	tar -xzf "$_inv_tar" --strip-components=1 -C "$_inv_extract" || die "could not unpack nvim-linux-x86_64.tar.gz: report it at $NV_ISSUES"
+	archive_names_inside -tzf "$_inv_tar" nvim-linux-x86_64.tar.gz
+	tar -xzf "$_inv_tar" --no-same-owner --strip-components=1 -C "$_inv_extract" || die "could not unpack nvim-linux-x86_64.tar.gz: report it at $NV_ISSUES"
+	links_stay_inside "$_inv_extract" nvim-linux-x86_64.tar.gz
 	if [ ! -x "$_inv_extract/bin/nvim" ]; then
 		die "nvim-linux-x86_64.tar.gz did not extract to bin/nvim: report it at $NV_ISSUES"
 	fi
@@ -1032,9 +1136,9 @@ require_curl() {
 # on every redirect too (--proto/--proto-redir); a loopback base follows no redirect at all.
 fetch() {
 	if [ "$NV_LOOPBACK" = 1 ]; then
-		curl --proto '=http' -fsS -o "$2" -- "$1" || die "could not download $3 from $1: is the server at $NV_BASE running?"
+		curl --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsS -o "$2" -- "$1" || die "could not download $3 from $1: is the server at $NV_BASE running?"
 	else
-		curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o "$2" -- "$1" || die "could not download $3 from $1: check your network connection and re-run"
+		curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsSL -o "$2" -- "$1" || die "could not download $3 from $1: check your network connection and re-run"
 	fi
 }
 
@@ -1093,14 +1197,16 @@ curl_get() {
 	CG_ERR=
 	case $1 in
 	https://*)
-		if _cg_out=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o "$2" -- "$1" 2>&1); then
+		if _cg_out=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsSL -o "$2" -- "$1" 2>&1); then
 			CG_OK=1
 		else
 			CG_ERR=$_cg_out
 		fi
 		;;
 	http://*)
-		if _cg_out=$(curl --proto '=http' -fsS -o "$2" -- "$1" 2>&1); then
+		loopback_http "$1"
+		if [ "$LH" != 1 ]; then die "curl_get: $1: plain http is only for a loopback test server"; fi
+		if _cg_out=$(curl --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsS -o "$2" -- "$1" 2>&1); then
 			CG_OK=1
 		else
 			CG_ERR=$_cg_out
@@ -1473,12 +1579,11 @@ own_private_group() {
 }
 
 # foreign_cache_link NAME UID: sets FCL=1 when NAME is itself a symlink owned by neither UID nor
-# root, else FCL=0. find without -H or -L looks at the link, not at what it leads to. Never 1 for
-# uid 0, as the ownership checks in acquire_lock are skipped for it. Called as a plain statement
-# (rule 2 above).
+# root, else FCL=0. find without -H or -L looks at the link, not at what it leads to. Called as a
+# plain statement (rule 2 above).
 foreign_cache_link() {
 	FCL=0
-	if [ ! -L "$1" ] || [ "$2" = 0 ]; then return 0; fi
+	if [ ! -L "$1" ]; then return 0; fi
 	_fcl_hit=$(find "$1" -maxdepth 0 -type l ! -uid "$2" ! -uid 0 -print 2>/dev/null) || _fcl_hit=
 	if [ -n "$_fcl_hit" ]; then FCL=1; fi
 }
@@ -1547,14 +1652,12 @@ acquire_lock() {
 	# already exists, so a $NV_CACHE_NV planted in advance by another user (in a shared
 	# XDG_CACHE_HOME) was never checked for who owns it -- only for its own write bits, which say
 	# nothing about whether its owner can already read or replace what a download writes inside it.
-	# Skipped for uid 0: --allow-root already documents a broader trust reduction (every
-	# state-changing step, npm's own install scripts included, runs as root), and ownership alone
-	# is not the boundary root's own unrestricted read/write access is checked against.
-	if [ "$_al_uid" != 0 ]; then
-		_al_nv_owner_bad=$(find "$NV_CACHE_NV" -maxdepth 0 ! -uid "$_al_uid" -print 2>/dev/null) || _al_nv_owner_bad=
-		if [ -n "$_al_nv_owner_bad" ]; then
-			die "$NV_CACHE_NV is owned by another user, so a download checked there could already be under their control: remove it (or set XDG_CACHE_HOME to a directory of your own) and re-run"
-		fi
+	# Root too (--allow-root): a cache another user owns (a HOME that `sudo -E` kept) lets that user
+	# replace a download after it was checked and before root unpacks it, so for uid 0 the owner must
+	# be root.
+	_al_nv_owner_bad=$(find "$NV_CACHE_NV" -maxdepth 0 ! -uid "$_al_uid" -print 2>/dev/null) || _al_nv_owner_bad=
+	if [ -n "$_al_nv_owner_bad" ]; then
+		die "$NV_CACHE_NV is owned by another user, so a download checked there could already be under their control: remove it (or set XDG_CACHE_HOME to a directory of your own) and re-run"
 	fi
 	# Downloads are checked and then used in here: in a directory other users can write to (one made
 	# in advance under a shared XDG_CACHE_HOME such as /tmp), they could swap the download directory
@@ -1592,12 +1695,10 @@ acquire_lock() {
 	# can replace from then on, since every directory above it passes the same checks.
 	_al_d=$NV_CACHE
 	while :; do
-		# Skipped for uid 0, the same reason as $NV_CACHE_NV's own ownership check above.
-		if [ "$_al_uid" != 0 ]; then
-			_al_parent_owner_bad=$(find "$_al_d" -maxdepth 0 ! -uid "$_al_uid" ! -uid 0 -print 2>/dev/null) || _al_parent_owner_bad=
-			if [ -n "$_al_parent_owner_bad" ]; then
-				die "$_al_d is owned by another user (not you, and not root), so its owner could replace $NV_CACHE_NV between checks no matter its permissions: set XDG_CACHE_HOME to a directory of your own and re-run"
-			fi
+		# For uid 0 the two tests are one: owned by root.
+		_al_parent_owner_bad=$(find "$_al_d" -maxdepth 0 ! -uid "$_al_uid" ! -uid 0 -print 2>/dev/null) || _al_parent_owner_bad=
+		if [ -n "$_al_parent_owner_bad" ]; then
+			die "$_al_d is owned by another user (not you, and not root), so its owner could replace $NV_CACHE_NV between checks no matter its permissions: set XDG_CACHE_HOME to a directory of your own and re-run"
 		fi
 		_al_parent_dir=$(find "$_al_d" -maxdepth 0 -type d -print 2>/dev/null) || _al_parent_dir=
 		if [ -z "$_al_parent_dir" ]; then
@@ -1949,13 +2050,17 @@ sidecar_build_core() {
 	_sbc_node_dir=$_sbc_workdir/node
 	_sbc_repo=$_sbc_workdir/repo
 	mkdir -p -- "$_sbc_node_dir" "$_sbc_repo" || die "cannot create $_sbc_workdir's build layout"
-	tar -xf "$_sbc_node_tar" -C "$_sbc_node_dir" || die "could not unpack $_sbc_node_tar: report it at $NV_ISSUES"
+	archive_names_inside -tf "$_sbc_node_tar" "$_sbc_node_tar"
+	tar -xf "$_sbc_node_tar" --no-same-owner -C "$_sbc_node_dir" || die "could not unpack $_sbc_node_tar: report it at $NV_ISSUES"
+	links_stay_inside "$_sbc_node_dir" "$_sbc_node_tar"
 	_sbc_node_top=$_sbc_node_dir/node-$REL_NODE_VERSION-linux-$NV_NODE_ARCH
 	_sbc_node_bin=$_sbc_node_top/bin
 	if [ ! -x "$_sbc_node_bin/node" ] || [ ! -x "$_sbc_node_bin/npm" ]; then
 		die "$_sbc_node_tar does not contain bin/node and bin/npm at $_sbc_node_top: not a Node distribution tarball. Report it at $NV_ISSUES"
 	fi
-	tar -xzf "$_sbc_src_tar" -C "$_sbc_repo" || die "could not unpack $_sbc_src_tar: report it at $NV_ISSUES"
+	archive_names_inside -tzf "$_sbc_src_tar" "$_sbc_src_tar"
+	tar -xzf "$_sbc_src_tar" --no-same-owner -C "$_sbc_repo" || die "could not unpack $_sbc_src_tar: report it at $NV_ISSUES"
+	links_stay_inside "$_sbc_repo" "$_sbc_src_tar"
 	if [ ! -f "$_sbc_repo/package.json" ] || [ ! -f "$_sbc_repo/apps/claude-sidecar/package.json" ]; then
 		die "$_sbc_src_tar does not look like the Verdandi source (no package.json / apps/claude-sidecar/package.json): report it at $NV_ISSUES"
 	fi
@@ -2902,7 +3007,9 @@ do_from_source() {
 	mkdir -p -- "$_dfs_node_workdir" || die "cannot create $_dfs_node_workdir"
 	sidecar_download_node "$_dfs_node_workdir" 0
 	_dfs_node_top=$_dfs_node_workdir/node-$REL_NODE_VERSION-linux-$NV_NODE_ARCH
-	tar -xf "$SDN_TARBALL" -C "$_dfs_node_workdir" || die "could not unpack $SDN_TARBALL: report it at $NV_ISSUES"
+	archive_names_inside -tf "$SDN_TARBALL" "$SDN_TARBALL"
+	tar -xf "$SDN_TARBALL" --no-same-owner -C "$_dfs_node_workdir" || die "could not unpack $SDN_TARBALL: report it at $NV_ISSUES"
+	links_stay_inside "$_dfs_node_workdir" "$SDN_TARBALL"
 	if [ ! -x "$_dfs_node_top/bin/node" ] || [ ! -x "$_dfs_node_top/bin/npm" ]; then
 		die "$SDN_TARBALL does not contain bin/node and bin/npm at $_dfs_node_top: report it at $NV_ISSUES"
 	fi
@@ -2987,7 +3094,9 @@ unpack_new() {
 		return 0
 	fi
 	mkdir -p -- "$NV_STAGE" || die "cannot create $NV_STAGE"
-	tar -xzf "$NV_TARBALL" -C "$NV_STAGE" || die "could not unpack $NV_TARBALL_NAME: it is not a valid Eitri release. Nothing was changed and your current install is untouched; report it at $NV_ISSUES"
+	archive_names_inside -tzf "$NV_TARBALL" "$NV_TARBALL_NAME"
+	tar -xzf "$NV_TARBALL" --no-same-owner -C "$NV_STAGE" || die "could not unpack $NV_TARBALL_NAME: it is not a valid Eitri release. Nothing was changed and your current install is untouched; report it at $NV_ISSUES"
+	links_stay_inside "$NV_STAGE" "$NV_TARBALL_NAME"
 	if [ ! -f "$_un_top/share/applications/$NV_MAIN_DESKTOP" ] && [ -f "$_un_top/share/applications/$NV_OLD_DESKTOP" ]; then
 		die "$NV_TARBALL_NAME is from a release before Eitri's app icon (its desktop entry is share/applications/$NV_OLD_DESKTOP, not $NV_MAIN_DESKTOP), which this installer does not lay out. $(before_icon_advice 'that release with its own install.sh, a release asset')"
 	fi
