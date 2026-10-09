@@ -32,8 +32,8 @@ impl PrefixRule {
         let inner = text.trim().strip_prefix("Bash(")?.strip_suffix(')')?;
         let inner = inner.trim_end();
         let body = inner.strip_suffix(" *")?;
-        let words: Vec<String> = body.split_whitespace().map(str::to_string).collect();
-        if words.is_empty() || words.iter().any(|w| w.contains('*')) {
+        let words: Vec<String> = ascii_words(body).map(str::to_string).collect();
+        if words.is_empty() || words.iter().any(|w| w.contains('*') || !is_ascii_graphic_word(w)) {
             return None;
         }
         if runs_another_program(&words[0]) {
@@ -57,7 +57,7 @@ impl PrefixRule {
 
     /// Whole leading words, never a character prefix: `cargo test *` is not `cargo testx`.
     pub fn matches_command(&self, command: &str) -> bool {
-        let mut words = command.split_whitespace();
+        let mut words = ascii_words(command);
         self.words.iter().all(|w| words.next() == Some(w.as_str()))
     }
 }
@@ -123,6 +123,19 @@ fn runs_another_program(first: &str) -> bool {
     first.contains('=') || WRAPPERS.contains(&first.rsplit('/').next().unwrap_or(first))
 }
 
+/// The words of a command as the shell splits them: at space, tab and newline only (its default
+/// `IFS`). A no-break or other Unicode space, a carriage return or a form feed belongs to the word
+/// it sits in (the shell runs `git<NBSP>status` as one program that does not exist), so a rule
+/// built or matched over a wider split would name a different command than the one that runs.
+fn ascii_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split([' ', '\t', '\n']).filter(|w| !w.is_empty())
+}
+
+/// A word a rule may name: printable ASCII only, so what the card shows is what the rule means.
+fn is_ascii_graphic_word(word: &str) -> bool {
+    word.chars().all(|c| c.is_ascii_graphic())
+}
+
 fn is_bare_word(word: &str) -> bool {
     word.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
         && word
@@ -138,9 +151,9 @@ fn is_bare_word(word: &str) -> bool {
 /// `git -C sub log` must not suggest `git *`, which would also allow `git push --force`.
 /// With no bare words after the options, the first word alone is still offered.
 pub fn suggest(command: &str) -> Option<PrefixRule> {
-    let words: Vec<&str> = command.split_whitespace().collect();
+    let words: Vec<&str> = ascii_words(command).collect();
     let first = *words.first()?;
-    if runs_another_program(first) {
+    if runs_another_program(first) || !is_ascii_graphic_word(first) {
         return None;
     }
     let mut rule = vec![first.to_string()];
@@ -175,6 +188,23 @@ pub fn offer(tool_name: &str, input: &Value, project_root: &Path) -> Option<Pref
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_ascii_whitespace_splits_words() {
+        // The shell reads `git<NBSP>status` as one word, so no rule may be built from it or match it.
+        assert_eq!(suggest("git\u{a0}status foo"), None);
+        assert_eq!(suggest("ls\u{2003}-la"), None);
+        assert_eq!(suggest("git\rstatus x"), None);
+        assert_eq!(suggest("git\u{c}status x"), None);
+        assert_eq!(PrefixRule::parse("Bash(git\u{a0}status *)"), None);
+        let rule = PrefixRule::parse("Bash(git status *)").unwrap();
+        assert!(!rule.matches_command("git\u{a0}status foo"));
+        assert!(!rule.matches_command("git\u{3000}status"));
+        assert!(!rule.matches_command("git\rstatus foo"));
+        assert!(!rule.matches_command("git\u{c}status foo"));
+        assert!(rule.matches_command("git \t status foo"));
+        assert_eq!(suggest("git status foo").unwrap().display(), "git status *");
+    }
 
     #[test]
     fn a_rule_round_trips_claude_codes_own_syntax() {

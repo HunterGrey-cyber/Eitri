@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+/// <reference types="vite/client" />
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, cleanup, fireEvent } from "@testing-library/react";
 
@@ -6,6 +7,7 @@ import { render, cleanup, fireEvent } from "@testing-library/react";
 afterEach(cleanup);
 import { PermissionCard } from "./PermissionCard";
 import type { PermissionRequestRecord } from "../types";
+import css from "../index.css?raw";
 
 const REQUEST: PermissionRequestRecord = {
   // `seq` places the card in the conversation; this component renders one card in isolation, so
@@ -361,5 +363,68 @@ describe("PermissionCard for the CLI's own prompt", () => {
   it("draws nothing extra on the gate's own card", () => {
     const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={vi.fn()} />);
     expect(container.querySelector(".permission-card-provider")).toBeNull();
+  });
+});
+
+describe("PermissionCard shows everything it asks to approve", () => {
+  it("lists a Bash call's other keys after the command", () => {
+    const { container } = render(
+      <PermissionCard
+        request={{ ...REQUEST, input: { command: "make", dangerouslyDisableSandbox: true, timeout: 5000 } }}
+        sessionEnded={false}
+        onAnswer={() => {}}
+      />,
+    );
+    const extra = container.querySelector(".permission-card-extra")!;
+    expect(extra.textContent).toContain("dangerouslyDisableSandbox: true");
+    expect(extra.textContent).toContain("timeout: 5000");
+    expect(container.querySelector(".permission-card-command")!.textContent).toBe("$ make");
+  });
+
+  it("lists a description that is not a string, since it is not drawn as one", () => {
+    const { container } = render(
+      <PermissionCard request={{ ...REQUEST, input: { command: "make", description: { x: 1 } } }} sessionEnded={false} onAnswer={() => {}} />,
+    );
+    expect(container.querySelector(".permission-card-extra")!.textContent).toContain('description: {"x":1}');
+  });
+
+  it("lists nothing extra for a plain command and description", () => {
+    const { container } = render(
+      <PermissionCard
+        request={{ ...REQUEST, input: { command: "make", description: "Build" } }}
+        sessionEnded={false}
+        onAnswer={() => {}}
+      />,
+    );
+    expect(container.querySelector(".permission-card-extra")).toBeNull();
+  });
+
+  it("escapes hidden characters in the extra keys, the description, the tool name and the rule offer", () => {
+    const { container } = render(
+      <PermissionCard
+        request={{
+          ...REQUEST,
+          input: { command: "make", description: "ok\u202E", "k\u200B": "v\u00A0" },
+        }}
+        ruleOffer={"git\u00A0status *"}
+        sessionEnded={false}
+        onAnswer={() => {}}
+      />,
+    );
+    const other = render(
+      <PermissionCard request={{ ...REQUEST, toolName: "mcp__a\u200Bb", input: {} }} sessionEnded={false} onAnswer={() => {}} />,
+    );
+    expect(other.container.querySelector(".permission-card-tool")!.textContent).toContain("⟨U+200B⟩");
+    for (const sel of [".permission-card-extra", ".permission-card-description", "[data-nav-action=always]"]) {
+      const el = container.querySelector(sel)!;
+      expect(el.textContent, sel).toMatch(/⟨U\+[0-9A-F]{4}⟩/);
+      expect(el.textContent, sel).not.toMatch(/[\u200B\u202E\u00A0]/);
+    }
+  });
+
+  it("wraps what a person approves instead of scrolling it out of sight", () => {
+    expect(css).toMatch(/\.permission-card-input\s*\{[^}]*white-space:\s*pre-wrap[^}]*overflow-wrap:\s*anywhere/);
+    expect(css).toMatch(/\.permission-card \.diff-line\s*\{[^}]*white-space:\s*pre-wrap/);
+    expect(css).toMatch(/\.permission-card \.diff-text\s*\{[^}]*min-width:\s*0/);
   });
 });

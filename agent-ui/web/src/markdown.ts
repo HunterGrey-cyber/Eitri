@@ -12,6 +12,7 @@ import rust from "highlight.js/lib/languages/rust";
 import toml from "highlight.js/lib/languages/ini";
 import typescript from "highlight.js/lib/languages/typescript";
 import yaml from "highlight.js/lib/languages/yaml";
+import { escapeText, isHiddenChar } from "./revealHidden";
 
 /* Register only the selected languages from `lib/core` to keep the single-file bundle small.
    `tsx` aliases typescript, and TOML uses highlight.js's `ini` grammar. */
@@ -101,7 +102,7 @@ marked.use({
           ? hljs.highlight(text, { language, ignoreIllegals: true }).value
           : escapeHtml(text);
       fencedTexts.push(text);
-      return `<pre class="cb-${CODE_NONCE}-${fencedTexts.length - 1}"><code>${body}</code></pre>`;
+      return `<pre class="cb-${CODE_NONCE}-${fencedTexts.length - 1}"><code>${markHiddenInCode(body)}</code></pre>`;
     },
     link(token: Tokens.Link) {
       linkDepth += 1;
@@ -154,6 +155,9 @@ marked.use({
    or other panel classes, since DOMPurify otherwise preserves arbitrary class values. */
 const ALLOWED_CLASS_PREFIXES = ["hljs-", "language-"];
 const ALLOWED_CLASSES = new Set(["table-scroll"]);
+/* `code-escape` is kept only on a `<span>` whose whole text is an escape (`⟨U+XXXX⟩`), as the code
+   renderer writes it, so a reply cannot dress its own text as one. */
+const ESCAPE_TEXT = /^⟨U\+[0-9A-F]{4,6}⟩$/;
 /* highlight.js's own tiered-scope convention (`core.js`'s `scopeToCSSClass`): a scope name like
    `title.class` becomes TWO space-separated classes on one element, `hljs-title` and a bare
    `class_` (one trailing underscore per nesting depth, so `title.function.invoke` -> `hljs-title`,
@@ -197,6 +201,10 @@ function installSanitizeHooks(): void {
           kept.push("code-block");
           node.setAttribute(CODE_TEXT_ATTR, text);
         }
+      } else if (token === "code-escape") {
+        if (node instanceof Element && node.tagName === "SPAN" && ESCAPE_TEXT.test(node.textContent ?? "")) {
+          kept.push(token);
+        }
       } else if (allowed(token)) {
         kept.push(token);
       }
@@ -234,13 +242,38 @@ const SANITIZE_CONFIG = {
   FORBID_TAGS: [
     "style", "picture", "source", "video", "audio", "input",
     "iframe", "object", "embed", "svg", "image", "img", "math", "dialog", "details", "summary", "font",
+    /* Nothing a reply needs, and each can draw something that looks like the panel's own control
+       (a button, a field, a meter) or changes the order or the size of what is read: form
+       controls, `bdo`/`bdi` (direction override), `marquee`, `canvas`. */
+    "button", "form", "textarea", "select", "option", "optgroup", "label", "fieldset", "legend", "output",
+    "meter", "progress", "canvas", "marquee", "bdo", "bdi", "datalist", "keygen", "frame", "frameset",
   ],
   FORBID_ATTR: [
     "style", "id", "name", "role", "form", "formaction", "background",
     "popover", "popovertarget", "popovertargetaction", "commandfor", "command", "tabindex", "hidden",
     "color", "bgcolor",
+    /* `dir`/`lang` reorder or restyle text, `title` is a tooltip that can say something else than the
+       link it sits on, `rowspan`/`colspan`/`width`/`height` can hide a cell, `download` turns a click
+       into a file save. `align` stays: marked writes it for a table column's alignment. */
+    "dir", "lang", "title", "rowspan", "colspan", "width", "height", "download", "ping", "referrerpolicy",
   ],
+  /* DOMPurify's own default pattern with the schemes narrowed to what a reply may link to: `tel:`,
+     `sms:`, `ftp:`, `callto:`, `cid:`, `xmpp:` and `matrix:` open other applications. Relative links and
+     fragments still pass, as they do by default (the panel's click handler decides what is opened). */
+  ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
 };
+
+/** A fenced block is copied byte for byte (`y`), so what it holds must be seen: every character
+ *  `revealHidden` knows (bidi controls, zero-width characters, no-break and other spaces, ...) is
+ *  drawn as an outlined `⟨U+XXXX⟩` in the block, as it is on a permission card. `html` is
+ *  highlight.js's output or escaped text; markup is ASCII there, so only text nodes can match. */
+function markHiddenInCode(html: string): string {
+  let out = "";
+  for (const ch of html) {
+    out += isHiddenChar(ch) ? `<span class="code-escape">${escapeText(ch)}</span>` : ch;
+  }
+  return out;
+}
 
 function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (c) =>

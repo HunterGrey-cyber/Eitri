@@ -1222,6 +1222,10 @@ textarea,
   padding: 6px;
   border-radius: 4px;
   overflow-x: auto;
+  /* Wrapped, never scrolled: a line wider than the card must not hide its tail from the person
+     approving it. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   width: max(100%, calc(var(--row-inline-size) - var(--row-gutter)));
   margin-left: -11px;
 }
@@ -1240,6 +1244,7 @@ textarea,
    around them, as a terminal without bidi shows the same line. */
 .permission-card-command,
 .permission-card-input,
+.code-block,
 .permission-card-edit-path,
 .permission-card-diff {
   direction: ltr;
@@ -1247,7 +1252,8 @@ textarea,
 }
 /* One escaped character (`⟨U+202E⟩`), and the line saying why there are any. The signal colour is a
    border, never text (see the note above `.tool-result-error`). */
-.permission-card-escape {
+.permission-card-escape,
+.code-escape {
   outline: 1px solid var(--nv-warn);
 }
 .permission-card-warning {
@@ -2390,7 +2396,10 @@ textarea,
 .diff-removed { border-left: 3px solid var(--nv-error); }
 .diff-context { border-left: 3px solid transparent; }
 /* The same diff inside a permission card sits on the card's `--nv-surface`, not on `bg`. */
-.permission-card .diff-line { color: var(--nv-surface-fg); }
+.permission-card .diff-line { color: var(--nv-surface-fg); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A flex item's minimum width is its content's, so without this a long line would still widen the
+   row past the card instead of wrapping. */
+.permission-card .diff-text { min-width: 0; }
 .permission-card .diff-gutter,
 .permission-card .permission-card-edit-note { color: var(--nv-surface-muted); }
 

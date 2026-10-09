@@ -90,7 +90,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
         title={isUsableLink(request.toolUseId) ? `tool call ${request.toolUseId}` : undefined}
         data-tool-use-id={isUsableLink(request.toolUseId) ? request.toolUseId : undefined}
       >
-        Permission requested: {request.toolName}
+        Permission requested: <ShownInline text={request.toolName} />
       </div>
       {request.providerPrompt && <ProviderPromptLine prompt={request.providerPrompt} />}
       <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />
@@ -132,7 +132,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
         <button data-nav-order={2} data-nav-action="deny" onClick={() => handleAnswer("deny")} disabled={inert}>Deny</button>
         {ruleOffer && (
           <button data-nav-order={3} data-nav-action="always" onClick={() => handleAnswer("allow", true)} disabled={inert}>
-            Always allow {ruleOffer} in this project
+            Always allow <ShownInline text={ruleOffer} /> in this project
           </button>
         )}
       </div>
@@ -145,6 +145,11 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
   );
 }
 
+/** Model- or hook-supplied text on the card, with the characters `revealHidden` knows drawn as escapes. */
+function ShownInline({ text }: { text: string }) {
+  return <Revealed pieces={revealHidden(text)} />;
+}
+
 /** Whose question this card is when the CLI itself asked (after the gate had already answered the
  *  call): a small label -- Claude Code asking, or the user's own ask rule when one forced the prompt -- and the CLI's own sentence, verbatim (it is prose, never parsed;
  *  its path is the CLI's, absolute). Answered like any card: same buttons, keys and permission id. */
@@ -153,9 +158,13 @@ function ProviderPromptLine({ prompt }: { prompt: ProviderPrompt }) {
   return (
     <div className="permission-card-provider">
       <span className="permission-card-provider-label" title={rule ? `from ${rule.source}` : undefined}>
-        {providerPromptLabel(prompt)}
+        <ShownInline text={providerPromptLabel(prompt)} />
       </span>
-      {prompt.reason && <span className="permission-card-provider-reason">{prompt.reason}</span>}
+      {prompt.reason && (
+        <span className="permission-card-provider-reason">
+          <ShownInline text={prompt.reason} />
+        </span>
+      )}
     </div>
   );
 }
@@ -201,7 +210,12 @@ function ToolInput({ toolName, input, createsFile }: { toolName: string; input: 
           <Revealed pieces={pieces} />
         </pre>
         <HiddenWarning count={countEscapes(pieces)} what="command" />
-        {typeof fields.description === "string" && <div className="permission-card-description">{fields.description}</div>}
+        {typeof fields.description === "string" && (
+          <div className="permission-card-description">
+            <ShownInline text={fields.description} />
+          </div>
+        )}
+        <ExtraBashFields fields={fields} />
       </>
     );
   }
@@ -448,6 +462,27 @@ function AcpCall({ input }: { input: AcpCardInput }) {
         Deny answers {deny ? <>“<Revealed pieces={denyPieces} />”</> : "nothing: the agent offered no reject-once option"}.
       </div>
       <HiddenWarning count={countEscapes(approvePieces) + countEscapes(denyPieces)} what="option name" />
+    </>
+  );
+}
+
+/** Top-level keys of a `Bash` call other than the ones drawn above. A key such as
+ *  `dangerouslyDisableSandbox` changes what the command may do, so it is part of what is approved:
+ *  each is listed after the command, name and value, through the same hidden-character escapes. */
+function drawnAbove(key: string, value: unknown): boolean {
+  return (key === "command" || key === "description") && typeof value === "string";
+}
+
+function ExtraBashFields({ fields }: { fields: Record<string, unknown> }) {
+  const extra = Object.keys(fields).filter((key) => !drawnAbove(key, fields[key]));
+  if (extra.length === 0) return null;
+  const pieces = revealHidden(extra.map((key) => `${key}: ${JSON.stringify(fields[key]) ?? "undefined"}`).join("\n"));
+  return (
+    <>
+      <pre className="permission-card-input permission-card-extra">
+        <Revealed pieces={pieces} />
+      </pre>
+      <HiddenWarning count={countEscapes(pieces)} what="options" />
     </>
   );
 }

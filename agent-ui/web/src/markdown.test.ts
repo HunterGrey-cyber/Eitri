@@ -407,3 +407,83 @@ describe("what a copy takes is what the reader sees", () => {
     expect([codeBlockText(a), codeBlockText(b)]).toEqual(["first", "second"]);
   });
 });
+
+describe("a fenced block shows the characters a copy would take", () => {
+  const host = (md: string) => {
+    const el = document.createElement("div");
+    el.innerHTML = renderMarkdown(md);
+    return el;
+  };
+
+  it("draws bidi, zero-width and no-break characters as escapes while the copy stays byte-exact", () => {
+    const fence = "echo \u202Eevil\u200B\u00A0x";
+    const el = host("```sh\n" + fence + "\n```");
+    const block = el.querySelector<HTMLElement>("pre.code-block")!;
+    expect(block.textContent).toContain("⟨U+202E⟩");
+    expect(block.textContent).toContain("⟨U+200B⟩");
+    expect(block.textContent).toContain("⟨U+00A0⟩");
+    expect(block.textContent).not.toMatch(/[\u202E\u200B\u00A0]/);
+    expect(block.querySelectorAll(".code-escape").length).toBe(3);
+    expect(codeBlockText(block)).toBe(fence);
+  });
+
+  it("marks them in an unhighlighted block too, and leaves plain text and tabs alone", () => {
+    const el = host("```\na\tb \u2067c\n```");
+    const block = el.querySelector<HTMLElement>("pre.code-block")!;
+    expect(block.textContent).toContain("a\tb ⟨U+2067⟩c");
+  });
+
+  it("keeps the escape class only on a span that is an escape", () => {
+    const el = host('<span class="code-escape">hello</span> <p class="code-escape">⟨U+200B⟩</p> <span class="code-escape">⟨U+200B⟩</span>');
+    expect(el.querySelectorAll(".code-escape").length).toBe(1);
+    expect(el.querySelector(".code-escape")!.textContent).toBe("⟨U+200B⟩");
+  });
+
+  it("lays the block out in character order", () => {
+    expect(css).toMatch(/\.code-block,[^{]*\{[^}]*unicode-bidi:\s*bidi-override/);
+  });
+});
+
+describe("what a reply cannot draw or link to", () => {
+  const host = (md: string) => {
+    const el = document.createElement("div");
+    el.innerHTML = renderMarkdown(md);
+    return el;
+  };
+
+  it("drops form controls, direction overrides and marquee, keeping their text", () => {
+    const el = host(
+      '<button>Approve</button><form action="x"><select><option>a</option></select><textarea>t</textarea>' +
+        "<label>l</label><fieldset><legend>g</legend></fieldset><output>o</output><meter></meter><progress></progress>" +
+        "<canvas></canvas><marquee>m</marquee><bdo dir=\"rtl\">abc</bdo><bdi>d</bdi>\n",
+    );
+    for (const tag of [
+      "button", "form", "select", "option", "textarea", "label", "fieldset", "legend", "output",
+      "meter", "progress", "canvas", "marquee", "bdo", "bdi",
+    ]) {
+      expect(el.querySelector(tag), tag).toBeNull();
+    }
+    expect(el.textContent).toContain("Approve");
+    expect(el.textContent).toContain("abc");
+  });
+
+  it("drops dir, title, lang, spans, sizes and download", () => {
+    const el = host(
+      '<p dir="rtl" lang="ar" title="t">x</p><table><tr><td rowspan="9" colspan="9" width="900" height="900">c</td></tr></table>' +
+        '<a href="https://example.com/f" download="f" title="other" ping="https://t.example/">l</a>\n',
+    );
+    expect(el.querySelector("[dir], [lang], [title], [rowspan], [colspan], [width], [height], [download], [ping]")).toBeNull();
+    expect(el.querySelector("a")!.getAttribute("href")).toBe("https://example.com/f");
+  });
+
+  it("keeps web and mail links and a table's column alignment, drops tel, sms and other schemes", () => {
+    const el = host(
+      "[a](https://example.com) [b](mailto:x@example.com) [c](tel:+100) [d](sms:+100) [e](ftp://h/f) [f](xmpp:a@b)\n\n" +
+        "| h |\n|:-:|\n| v |\n",
+    );
+    const hrefs = Array.from(el.querySelectorAll("a")).map((a) => a.getAttribute("href")).filter((h) => h !== null);
+    expect(hrefs).toEqual(["https://example.com", "mailto:x@example.com"]);
+    expect(el.textContent).toContain("c");
+    expect(el.querySelector("th")!.getAttribute("align")).toBe("center");
+  });
+});

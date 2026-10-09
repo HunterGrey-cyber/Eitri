@@ -26,6 +26,16 @@ function escapeOf(ch: string): string {
   return `⟨U+${hex}⟩`;
 }
 
+/** Whether `ch` (one code point) is one `revealHidden` draws as an escape. */
+export function isHiddenChar(ch: string): boolean {
+  return !KEPT.has(ch) && HIDDEN.test(ch);
+}
+
+/** `revealHidden`'s escape for `ch`, as text. */
+export function escapeText(ch: string): string {
+  return escapeOf(ch);
+}
+
 /** `text` as plain runs and escapes, in order; adjacent plain characters share one piece. */
 export function revealHidden(text: string): RevealedPiece[] {
   const pieces: RevealedPiece[] = [];
@@ -33,7 +43,7 @@ export function revealHidden(text: string): RevealedPiece[] {
   // `for...of` walks code points, so a tag character or an astral variation selector is one
   // character, and a lone surrogate comes through on its own.
   for (const ch of text) {
-    if (!KEPT.has(ch) && HIDDEN.test(ch)) {
+    if (isHiddenChar(ch)) {
       if (run !== "") {
         pieces.push({ text: run });
         run = "";
