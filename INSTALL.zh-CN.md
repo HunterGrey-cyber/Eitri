@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=a0db1a05e007a42237bfe2a6dcbbea19a1c46f804e520e545920e37726803e3b -->
+<!-- translated-from: INSTALL.md sha256=2d8b576b12346701ef0e9618548e716a2a5f48c09f6d6405202721e2b6a3377e -->
 
 # 安装 Eitri
 
@@ -12,7 +12,7 @@
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
 ```
 
-这是推荐的安装方式，适用于所有发行版；Arch 上用 [AUR 包](#aur-arch)更合适。装到 `~/.local`，不需要 `sudo`。安装时还会在你的机器上构建 agent sidecar（[原因](#why-the-sidecar-is-built-on-your-machine)），要几分钟，需要联网和大约 600 MiB 磁盘空间。选项写在 `sh -s --` 后面，例如 `… | sh -s -- --version 0.2.1 --yes`；全部选项见 `sh install.sh --help`。
+这是推荐的安装方式，适用于所有发行版；Arch 上用 [AUR 包](#aur-arch)更合适。装到 `~/.local`，不需要 `sudo`。安装时还会在你的机器上构建 agent sidecar（[原因](#why-the-sidecar-is-built-on-your-machine)），要几分钟，需要联网和大约 600 MiB 磁盘空间。选项写在 `sh -s --` 后面，例如 `… | sh -s -- --version 0.2.2 --yes`；全部选项见 `sh install.sh --help`。
 
 想在运行前先校验下载的签名，见[运行前先验证](#verify-before-running)。
 
