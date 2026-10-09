@@ -58,6 +58,8 @@ pub const HIGHEST_TESTED_CODEX: (u32, u32, u32) = (0, 160, 0);
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long reading the history of a resumed thread may take in all; one page waits as long as a turn start.
 const HISTORY_BUDGET: Duration = Duration::from_secs(30);
+/// How often a history page's answer is looked for, moving aside what Codex says meanwhile.
+const HISTORY_POLL: Duration = Duration::from_millis(2);
 /// The `turn/start` answer is immediate when Codex is healthy.
 const TURN_START_TIMEOUT: Duration = UNARY_RPC_TIMEOUT;
 /// How long a close waits for Codex to confirm the unsubscribe before it closes the pipe anyway.
@@ -840,11 +842,11 @@ impl CodexProvider {
             if awaiting_turn_id || st.history_loading {
                 let mut link = lock(&self.link);
                 if let Some(link) = link.as_mut() {
-                    while let Some(message) = link.try_recv() {
+                    // Never past the cap: what does not fit stays in the link's queue. A history read stops
+                    // once the cap is reached (`read_history`), and a turn start's wait ends on its timeout.
+                    while st.held.len() < PUMP_BATCH {
+                        let Some(message) = link.try_recv() else { break };
                         st.held.push_back(message);
-                        if st.held.len() >= PUMP_BATCH {
-                            break;
-                        }
                     }
                 }
                 return;
@@ -1762,15 +1764,32 @@ impl CodexProvider {
         let skip = lock(&self.state).blocked.is_some();
         let mut events = Vec::new();
         if !skip {
-            let mut ask = |name: &str, params: Value| -> Result<Value, LinkError> {
-                let pending = match lock(&self.link).as_ref() {
+            let mut ask = |name: &str, params: Value| -> Result<Value, resume::AskError> {
+                let mut pending = match lock(&self.link).as_ref() {
                     Some(link) => link.request(name, params),
-                    None => return Err(LinkError::Closed),
+                    None => return Err(LinkError::Closed.into()),
                 };
-                let answer = pending.wait(Instant::now() + TURN_START_TIMEOUT);
-                // The reader must never be left blocked behind a full queue while pages are awaited.
-                self.drain(&mut lock(&self.state));
-                answer
+                let until = Instant::now() + TURN_START_TIMEOUT;
+                loop {
+                    if let Some(answer) = pending.try_take() {
+                        return answer.map_err(Into::into);
+                    }
+                    // What Codex says meanwhile is moved aside while the answer is awaited, so the link's
+                    // reader is never left blocked with the answer behind it. Once as much is held as can
+                    // be, the history stops: the rest would only wait behind it.
+                    {
+                        let mut st = lock(&self.state);
+                        self.drain(&mut st);
+                        if st.held.len() >= PUMP_BATCH {
+                            return Err(resume::AskError::Flooded);
+                        }
+                    }
+                    let now = Instant::now();
+                    if now >= until {
+                        return Err(LinkError::Timeout.into());
+                    }
+                    std::thread::sleep(HISTORY_POLL.min(until - now));
+                }
             };
             events = resume::page_history(thread_id, Instant::now() + HISTORY_BUDGET, &mut ask);
         }

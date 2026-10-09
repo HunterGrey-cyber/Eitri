@@ -321,7 +321,10 @@ function CodexCommand({ input }: { input: Partial<CodexCommandInput> }) {
 }
 
 function CodexFileChanges({ input }: { input: Partial<CodexFileChangeInput> }) {
-  const changes: CodexFileChange[] = Array.isArray(input.changes) ? input.changes : [];
+  // An entry that is not an object names nothing a card could show, so it is left out rather than breaking the card.
+  const changes: CodexFileChange[] = Array.isArray(input.changes)
+    ? input.changes.filter((c) => typeof c === "object" && c !== null)
+    : [];
   return (
     <>
       {changes.length === 0 && <div className="permission-card-description">(no files named)</div>}

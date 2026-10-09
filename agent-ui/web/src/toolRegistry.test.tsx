@@ -128,6 +128,18 @@ describe("renderToolCall", () => {
     expect(cli.container.querySelector(".tool-denied-note")?.textContent).toBe("blocked by auto: [Git Destructive]");
   });
 
+  it("draws a Codex file change whose entries are incomplete without throwing", () => {
+    const { container } = render(
+      <>
+        {renderToolCall(
+          call({ name: "fileChange", input: { changes: [{ path: "/p/a.txt", kind: "update" }, null, 3, { path: "/p/b.txt", kind: "add", diff: "x\n" }] } }),
+        )}
+      </>,
+    );
+    const heads = Array.from(container.querySelectorAll(".permission-card-edit-path")).map((el) => el.textContent);
+    expect(heads).toEqual(["/p/a.txt", "/p/b.txt"]);
+  });
+
   /** Codex's own reviewer decided a call in Auto: its verdict sits on the call's row in its words. */
   it("words Codex's reviewer's verdicts as its own", () => {
     const denied = render(

@@ -671,6 +671,51 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_server_shows_every_field_beside_its_url() {
+        let line = server_line(&serde_json::json!({
+            "url": "https://a/mcp",
+            "bearer_token_env_var": "OPENAI_API_KEY",
+            "http_headers_helper": "./h.sh",
+            "headers": {"X-Token": "${TOKEN}"}
+        }));
+        assert!(line.starts_with("http https://a/mcp"), "{line}");
+        for part in [
+            "bearer_token_env_var",
+            "OPENAI_API_KEY",
+            "http_headers_helper",
+            "./h.sh",
+            "X-Token",
+            "${TOKEN}",
+        ] {
+            assert!(line.contains(part), "{part} missing from {line}");
+        }
+    }
+
+    #[test]
+    fn a_local_server_shows_every_field_beside_its_command_line() {
+        let line = server_line(&serde_json::json!({
+            "command": "srv",
+            "args": ["--x"],
+            "cwd": "/x",
+            "env_vars": ["TOKEN"],
+            "url": "https://also/mcp"
+        }));
+        assert!(line.starts_with("srv --x"), "{line}");
+        for part in ["cwd", "/x", "env_vars", "TOKEN", "https://also/mcp"] {
+            assert!(line.contains(part), "{part} missing from {line}");
+        }
+    }
+
+    #[test]
+    fn a_server_with_nothing_else_is_just_its_line() {
+        assert_eq!(server_line(&serde_json::json!({"command": "srv"})), "srv");
+        assert_eq!(
+            server_line(&serde_json::json!({"type": "sse", "url": "https://a/sse"})),
+            "sse https://a/sse"
+        );
+    }
+
+    #[test]
     fn other_keys_of_mcp_json_are_reported() {
         let found = mcp_findings(Path::new(".mcp.json"), br#"{"extra":1}"#);
         assert!(matches!(&found[..], [Finding::OtherSetting { key, .. }] if key == "extra"));

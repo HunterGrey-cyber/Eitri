@@ -17,6 +17,7 @@ use super::wire::{
 use crate::jsonrpc_link::LinkError;
 use crate::projection::{AgentDomainEvent, ContentKind, TurnEndDetail, TurnOutcome};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::time::Instant;
 
 /// The turn id the notes about the history as a whole sit in.
@@ -25,20 +26,78 @@ const NOTE_TURN: &str = "eitri-history";
 /// What a note about missing history says when a page was larger than the link reads.
 const TOO_LARGE: &str = "too large to show";
 
+/// Pages of one turn's items read at most. A turn longer than that is shown in part, so a Codex that hands
+/// out a new cursor for ever cannot hold the start.
+const ITEM_PAGES_MAX: usize = 200;
+
+/// Items of one turn kept at most, for the same reason.
+const ITEMS_MAX: usize = 10_000;
+
+/// Why one call of the pager got no answer.
+#[derive(Debug)]
+pub enum AskError {
+    /// The link's own failure.
+    Link(LinkError),
+    /// Codex sent more live messages while the history was read than can be kept for after it. Reading on
+    /// would leave the link's reader blocked behind them, with every later answer stuck there too.
+    Flooded,
+}
+
+impl From<LinkError> for AskError {
+    fn from(e: LinkError) -> AskError {
+        AskError::Link(e)
+    }
+}
+
 /// One call on the link: the method, its params, and the answer.
-pub type Ask<'a> = dyn FnMut(&str, Value) -> Result<Value, LinkError> + 'a;
+pub type Ask<'a> = dyn FnMut(&str, Value) -> Result<Value, AskError> + 'a;
+
+/// Why the whole history stopped being read: the rest is not asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The deadline passed, or Codex did not answer a page in time. One page that hangs would hang the next
+    /// one too, so nothing more is asked.
+    Slow,
+    Flooded,
+    /// The link is gone; the pump reports why.
+    Closed,
+}
+
+impl Stop {
+    fn of(e: &AskError) -> Option<Stop> {
+        match e {
+            AskError::Link(LinkError::Timeout) => Some(Stop::Slow),
+            AskError::Link(LinkError::Closed) => Some(Stop::Closed),
+            AskError::Flooded => Some(Stop::Flooded),
+            AskError::Link(_) => None,
+        }
+    }
+
+    /// The note in a turn of its own that says the rest of the history is missing, if one is said.
+    fn note(self) -> Vec<AgentDomainEvent> {
+        match self {
+            Stop::Slow => note_turn("the rest of this conversation was not loaded: reading it took too long"),
+            Stop::Flooded => {
+                note_turn("the rest of this conversation was not loaded: Codex sent too much while it was being read")
+            }
+            Stop::Closed => Vec::new(),
+        }
+    }
+}
 
 /// The events of a thread's history, oldest turn first. Anything that cannot be read becomes a note row in
 /// the turn it belongs to, or in a turn of its own when the list of turns is what failed. Stops at
-/// `deadline` with a note, since a very long thread must not hold the start for ever.
+/// `deadline` with a note, since a very long thread must not hold the start for ever; a page that is not
+/// answered in time stops it the same way. A cursor that comes back, and a turn listed twice, are not
+/// followed again.
 pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Vec<AgentDomainEvent> {
     let mut events = Vec::new();
     let mut cursor: Option<String> = None;
-    loop {
+    let mut cursors_seen: HashSet<String> = HashSet::new();
+    let mut turns_seen: HashSet<String> = HashSet::new();
+    'pages: loop {
         if Instant::now() >= deadline {
-            events.extend(note_turn(
-                "the rest of this conversation was not loaded: reading it took too long",
-            ));
+            events.extend(Stop::Slow.note());
             break;
         }
         let params = match serde_json::to_value(ThreadTurnsListParams::new(thread_id.to_string(), cursor.clone())) {
@@ -54,28 +113,37 @@ pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Ve
                     break;
                 }
             },
-            Err(LinkError::TooLarge) => {
+            Err(AskError::Link(LinkError::TooLarge)) => {
                 eprintln!("agent: Codex's list of turns was larger than 16 MiB; skipped");
                 events.extend(note_turn(&format!(
                     "a page of this conversation's history was {TOO_LARGE}"
                 )));
                 break;
             }
-            // The link is gone; the pump reports why.
-            Err(LinkError::Closed) => break,
-            Err(other) => {
-                eprintln!("agent: Codex's list of turns failed: {other}");
-                events.extend(note_turn("the history of this conversation could not be loaded"));
+            Err(e) => {
+                eprintln!("agent: Codex's list of turns failed: {e:?}");
+                match Stop::of(&e) {
+                    Some(stop) => events.extend(stop.note()),
+                    None => events.extend(note_turn("the history of this conversation could not be loaded")),
+                }
                 break;
             }
         };
         for turn in &page.data {
-            let (items, complete) = load_items(thread_id, turn, ask);
+            if !turns_seen.insert(turn.id.clone()) {
+                eprintln!("agent: Codex listed a turn of the history twice; shown once");
+                continue;
+            }
+            let (items, complete) = load_items(thread_id, turn, deadline, ask);
             events.extend(turn_events(thread_id, turn, &items, complete));
+            if let Complete::Stopped(stop) = complete {
+                events.extend(stop.note());
+                break 'pages;
+            }
         }
         match page.next_cursor {
-            // A cursor that does not move would ask for the same page for ever.
-            Some(next) if cursor.as_deref() != Some(next.as_str()) && !page.data.is_empty() => cursor = Some(next),
+            // A cursor already followed would ask for pages already read, perhaps for ever.
+            Some(next) if !page.data.is_empty() && cursors_seen.insert(next.clone()) => cursor = Some(next),
             _ => break,
         }
     }
@@ -83,10 +151,21 @@ pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Ve
 }
 
 /// How a turn's items were read: what arrived, and whether every page did.
-fn load_items(thread_id: &str, turn: &Turn, ask: &mut Ask<'_>) -> (Vec<ThreadItem>, Complete) {
+fn load_items(thread_id: &str, turn: &Turn, deadline: Instant, ask: &mut Ask<'_>) -> (Vec<ThreadItem>, Complete) {
     let mut items = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut cursors_seen: HashSet<String> = HashSet::new();
+    let mut pages = 0;
     loop {
+        if Instant::now() >= deadline {
+            return (items, Complete::Stopped(Stop::Slow));
+        }
+        if pages >= ITEM_PAGES_MAX || items.len() >= ITEMS_MAX {
+            eprintln!("agent: a turn of the history from Codex has more items than are read; shown in part");
+            items.truncate(ITEMS_MAX);
+            return (items, Complete::No);
+        }
+        pages += 1;
         let params = match serde_json::to_value(ThreadItemsListParams::new(
             thread_id.to_string(),
             turn.id.clone(),
@@ -103,19 +182,22 @@ fn load_items(thread_id: &str, turn: &Turn, ask: &mut Ask<'_>) -> (Vec<ThreadIte
                     return (items, Complete::No);
                 }
             },
-            Err(LinkError::TooLarge) => {
+            Err(AskError::Link(LinkError::TooLarge)) => {
                 eprintln!("agent: a page of a turn's items from Codex was larger than 16 MiB; skipped");
                 return (items, Complete::TooLarge);
             }
-            Err(other) => {
-                eprintln!("agent: Codex's items of a turn failed: {other}");
-                return (items, Complete::No);
+            Err(e) => {
+                eprintln!("agent: Codex's items of a turn failed: {e:?}");
+                return match Stop::of(&e) {
+                    Some(stop) => (items, Complete::Stopped(stop)),
+                    None => (items, Complete::No),
+                };
             }
         };
         let empty = page.data.is_empty();
         items.extend(page.data.into_iter().filter(|e| e.turn_id == turn.id).map(|e| e.item));
         match page.next_cursor {
-            Some(next) if cursor.as_deref() != Some(next.as_str()) && !empty => cursor = Some(next),
+            Some(next) if !empty && cursors_seen.insert(next.clone()) => cursor = Some(next),
             _ => break,
         }
     }
@@ -131,8 +213,10 @@ enum Complete {
     Yes,
     /// A page was skipped for its size.
     TooLarge,
-    /// A page could not be had for another reason.
+    /// A page could not be had for another reason, or the turn had more than is read.
     No,
+    /// Reading stopped in this turn, and the rest of the history is not asked for.
+    Stopped(Stop),
 }
 
 /// The text of a user message's parts.
@@ -210,7 +294,9 @@ fn turn_events(thread_id: &str, turn: &Turn, items: &[ThreadItem], complete: Com
     match complete {
         Complete::Yes => {}
         Complete::TooLarge => events.extend(note_row(&turn.id, &format!("part of this turn was {TOO_LARGE}"))),
-        Complete::No => events.extend(note_row(&turn.id, "part of this turn could not be loaded")),
+        Complete::No | Complete::Stopped(_) => {
+            events.extend(note_row(&turn.id, "part of this turn could not be loaded"))
+        }
     }
     // A past turn is over whatever Codex last wrote on it: one still marked running was cut off.
     let (outcome, detail) = match turn.status {
@@ -262,4 +348,177 @@ fn note_turn(note: &str) -> Vec<AgentDomainEvent> {
         detail: TurnEndDetail::default(),
     });
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn turn(id: &str) -> Value {
+        json!({"id": id, "items": [], "itemsView": "notLoaded", "status": "completed", "error": null})
+    }
+
+    fn turns_page(ids: &[&str], next: Option<&str>) -> Value {
+        json!({"data": ids.iter().map(|id| turn(id)).collect::<Vec<_>>(), "nextCursor": next})
+    }
+
+    fn items_page(turn: &str, item: &str, next: Option<&str>) -> Value {
+        json!({"data": [{"turnId": turn, "item": {"type": "agentMessage", "id": item, "text": item}}],
+               "nextCursor": next})
+    }
+
+    fn cursor_of(params: &Value) -> Option<String> {
+        params.get("cursor").and_then(Value::as_str).map(str::to_string)
+    }
+
+    fn notes(events: &[AgentDomainEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentDomainEvent::ToolCallCompleted { content, .. } => content.as_str().map(str::to_string),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn started(events: &[AgentDomainEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentDomainEvent::TurnStarted { turn_id } => Some(turn_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Item cursors that go round in a circle end the turn's read instead of asking for ever.
+    #[test]
+    fn an_item_cursor_that_comes_back_ends_the_turn() {
+        let mut item_asks = 0;
+        let mut ask = |name: &str, params: Value| -> Result<Value, AskError> {
+            if name == method::THREAD_TURNS_LIST {
+                return Ok(turns_page(&["t1"], None));
+            }
+            item_asks += 1;
+            if item_asks > 50 {
+                return Err(LinkError::Closed.into());
+            }
+            let next = match cursor_of(&params).as_deref() {
+                None | Some("B") => "A",
+                _ => "B",
+            };
+            Ok(items_page("t1", &format!("i{item_asks}"), Some(next)))
+        };
+        let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+        assert!(item_asks < 5, "{item_asks} item pages were asked for");
+        assert_eq!(started(&events), vec!["t1"]);
+    }
+
+    /// A page that times out ends the whole history: the next turns are not asked about one by one.
+    #[test]
+    fn a_timed_out_page_ends_the_history() {
+        let ids: Vec<String> = (0..10).map(|n| format!("t{n}")).collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut item_asks = 0;
+        let mut ask = |name: &str, _: Value| -> Result<Value, AskError> {
+            if name == method::THREAD_TURNS_LIST {
+                return Ok(turns_page(&ids, None));
+            }
+            item_asks += 1;
+            Err(LinkError::Timeout.into())
+        };
+        let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+        assert_eq!(item_asks, 1);
+        assert!(
+            notes(&events).iter().any(|n| n.contains("took too long")),
+            "{:#?}",
+            notes(&events)
+        );
+    }
+
+    /// A list of turns whose pages go round in a circle, or repeat a turn, shows each turn once.
+    #[test]
+    fn a_turn_listed_twice_is_shown_once() {
+        let mut turn_asks = 0;
+        let mut ask = |name: &str, params: Value| -> Result<Value, AskError> {
+            if name == method::THREAD_ITEMS_LIST {
+                return Ok(json!({"data": [], "nextCursor": null}));
+            }
+            turn_asks += 1;
+            if turn_asks > 50 {
+                return Err(LinkError::Closed.into());
+            }
+            Ok(match cursor_of(&params).as_deref() {
+                None => turns_page(&["t1", "t2"], Some("P")),
+                Some("P") => turns_page(&["t2", "t3"], Some("Q")),
+                _ => turns_page(&["t3"], Some("P")),
+            })
+        };
+        let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+        assert_eq!(started(&events), vec!["t1", "t2", "t3"]);
+        assert!(turn_asks <= 3, "{turn_asks} pages of turns were asked for");
+    }
+
+    /// The overall deadline is kept while a turn's items are read, not only between pages of turns.
+    #[test]
+    fn the_deadline_holds_inside_a_turns_items() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(200);
+        let mut item_asks = 0;
+        let mut ask = |name: &str, _: Value| -> Result<Value, AskError> {
+            if name == method::THREAD_TURNS_LIST {
+                return Ok(turns_page(&["t1"], None));
+            }
+            item_asks += 1;
+            if item_asks > 100 {
+                return Err(LinkError::Closed.into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(items_page(
+                "t1",
+                &format!("i{item_asks}"),
+                Some(&format!("c{item_asks}")),
+            ))
+        };
+        let events = page_history("th", deadline, &mut ask);
+        assert!(
+            start.elapsed() < Duration::from_millis(200 + 50 + 40),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            notes(&events).iter().any(|n| n.contains("took too long")),
+            "{:#?}",
+            notes(&events)
+        );
+    }
+
+    /// A turn with more pages of items than are read at most is shown in part, with a note.
+    #[test]
+    fn a_turn_with_too_many_pages_is_shown_in_part() {
+        let mut item_asks = 0;
+        let mut ask = |name: &str, _: Value| -> Result<Value, AskError> {
+            if name == method::THREAD_TURNS_LIST {
+                return Ok(turns_page(&["t1", "t2"], None));
+            }
+            item_asks += 1;
+            if item_asks > 5000 {
+                return Err(LinkError::Closed.into());
+            }
+            Ok(items_page(
+                "t1",
+                &format!("i{item_asks}"),
+                Some(&format!("c{item_asks}")),
+            ))
+        };
+        let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+        assert!(item_asks <= 2 * 200 + 1, "{item_asks} item pages were asked for");
+        assert_eq!(started(&events), vec!["t1", "t2"]);
+        assert!(
+            notes(&events).iter().any(|n| n.contains("could not be loaded")),
+            "{:#?}",
+            notes(&events)
+        );
+    }
 }

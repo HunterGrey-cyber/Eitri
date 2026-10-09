@@ -186,6 +186,9 @@ export function editPreview(toolName: string, input: unknown): EditPreview | nul
  *  not shown there. */
 const MAX_CODEX_DIFF_LINES = 2 * MAX_DIFF_LINES;
 
+/** The preamble lines of a unified diff that only name the file. */
+const FILE_HEADER = /^(--- |\+\+\+ |diff --git |index )/;
+
 /** A Codex `fileChange` entry as a reviewable preview. Codex sends a unified diff for an `update` (its hunk
  *  headers are drawn as context lines) and the whole content for an `add` or a `delete`; a kind this build
  *  does not know is drawn as the unified diff it most likely is. Nothing is matched against the disk.
@@ -197,7 +200,7 @@ export function codexChangePreview(
   change: { path: string; kind: string; diff: string },
   { whole = false }: { whole?: boolean } = {},
 ): EditPreview {
-  const raw = lines(change.diff);
+  const raw = lines(typeof change.diff === "string" ? change.diff : "");
   let diff: DiffLine[];
   if (change.kind === "add") diff = raw.map((text) => ({ kind: "added", text }));
   else if (change.kind === "delete") diff = raw.map((text) => ({ kind: "removed", text }));
@@ -210,8 +213,9 @@ export function codexChangePreview(
         inHunk = true;
         diff.push({ kind: "context", text });
       } else if (!inHunk) {
-        // A file header before the first hunk says which file it is, which the card's path already does.
-        continue;
+        // A file header before the first hunk says which file it is, which the card's path already does. Any other
+        // line there (a mode change, a rename, a similarity index) is part of what the change does, so it is drawn.
+        if (!FILE_HEADER.test(text)) diff.push({ kind: "context", text });
       } else if (text.startsWith("+")) diff.push({ kind: "added", text: text.slice(1) });
       else if (text.startsWith("-")) diff.push({ kind: "removed", text: text.slice(1) });
       else if (text.startsWith("\\")) continue;

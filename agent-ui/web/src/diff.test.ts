@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { editPreview, lineDiff, MAX_DIFF_LINES } from "./diff";
+import { codexChangePreview, editPreview, lineDiff, MAX_DIFF_LINES } from "./diff";
 
 describe("lineDiff", () => {
   it("marks only the lines that actually changed", () => {
@@ -131,5 +131,40 @@ describe("editPreview", () => {
     const preview = editPreview("Write", { file_path: "/f", content: huge })!;
     expect(preview.diff).toBeNull();
     expect(preview.added).toBe(MAX_DIFF_LINES + 5);
+  });
+});
+
+describe("codexChangePreview", () => {
+  const drawn = (diff: string) =>
+    codexChangePreview({ path: "f", kind: "update", diff }).diff!.map((l) => `${l.kind}:${l.text}`);
+
+  it("draws a mode change or a rename that comes before the first hunk", () => {
+    expect(drawn("old mode 100644\nnew mode 100755\n@@ -1 +1 @@\n-a\n+b\n")).toEqual([
+      "context:old mode 100644",
+      "context:new mode 100755",
+      "context:@@ -1 +1 @@",
+      "removed:a",
+      "added:b",
+    ]);
+    expect(drawn("rename from a.rs\nrename to b.rs\n@@ -1 +1 @@\n-a\n+b\n").slice(0, 2)).toEqual([
+      "context:rename from a.rs",
+      "context:rename to b.rs",
+    ]);
+  });
+
+  it("still leaves out the file header lines before the first hunk", () => {
+    expect(drawn("diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n")).toEqual([
+      "context:@@ -1 +1 @@",
+      "removed:a",
+      "added:b",
+    ]);
+  });
+
+  it("takes an entry whose diff is not a string as an empty diff", () => {
+    for (const diff of [undefined, null, 7, {}]) {
+      const preview = codexChangePreview({ path: "a", kind: "update", diff } as never);
+      expect(preview.diff).toEqual([]);
+      expect(preview.filePath).toBe("a");
+    }
   });
 });

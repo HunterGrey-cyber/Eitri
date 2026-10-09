@@ -82,6 +82,36 @@ describe("a Codex file change card", () => {
     expect(container.querySelector(".permission-card-says")!.textContent).toBe("Codex says: Rename b to c");
   });
 
+  it("a mode change before the first hunk is on the card", () => {
+    const request = requestOf("file_change");
+    const input = request.input as { changes: Array<Record<string, unknown>> };
+    const diff = "old mode 100644\nnew mode 100755\n@@ -1 +1 @@\n-a\n+b\n";
+    const { container } = card({ ...request, input: { ...input, changes: [{ ...input.changes[1], diff }] } });
+    const texts = Array.from(container.querySelectorAll(".permission-card-diff .diff-line")).map(
+      (l) => `${l.className.replace("diff-line diff-", "")}:${l.querySelector(".diff-text")!.textContent}`,
+    );
+    expect(texts).toContain("context:new mode 100755");
+  });
+
+  it("a kind this build does not know is drawn revealed", () => {
+    const request = requestOf("file_change");
+    const input = request.input as { changes: Array<Record<string, unknown>> };
+    const { container } = card({ ...request, input: { ...input, changes: [{ ...input.changes[1], kind: "x\u202ey", movePath: null }] } });
+    const note = container.querySelector(".permission-card-edit-note")!;
+    expect(note.textContent).toContain("⟨U+202E⟩");
+    expect(note.textContent).not.toContain("\u202e");
+    expect(container.querySelector(".permission-card-warning")!.textContent).toContain("kind");
+  });
+
+  it("an entry with no diff, or no object at all, does not break the card", () => {
+    const request = requestOf("file_change");
+    const input = request.input as { changes: Array<Record<string, unknown>> };
+    const changes = [{ path: "/project/a.txt", kind: "update" }, null, "x", { ...input.changes[0] }];
+    const { container } = card({ ...request, input: { ...input, changes } });
+    const heads = Array.from(container.querySelectorAll(".permission-card-edit-path")).map((el) => el.textContent);
+    expect(heads).toEqual(["/project/a.txt", "/project/new.txt"]);
+  });
+
   it("a large change is shown whole, never as counts beside an Approve", () => {
     const request = requestOf("file_change");
     const input = request.input as { changes: Array<Record<string, unknown>> };

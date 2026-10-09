@@ -1310,6 +1310,35 @@ fn a_linked_codex_read_directory_cannot_be_checked() {
 }
 
 #[test]
+fn a_link_inside_a_codex_skill_tree_cannot_be_checked() {
+    let fx = Fixture::new("codex-linked-skills");
+    // Codex follows links in a project's skill directories and reads what they lead to, which the
+    // fingerprint never sees: each such link makes the answer last one start.
+    let cases: [(&str, &str, &str); 4] = [
+        (".agents/skills/review", "../../shared/review", "shared/review/SKILL.md"),
+        (".agents/skills/y/SKILL.md", "../../../docs/skill.md", "docs/skill.md"),
+        (".codex/skills/x/SKILL.md", "../../../docs/skill.md", "docs/skill.md"),
+        (".codex/skills/x/refs", "../../../shared/refs", "shared/refs/a.md"),
+    ];
+    for (i, (link, target, held)) in cases.iter().enumerate() {
+        let repo = fx.home.join(format!("repo-{i}"));
+        fx.repo(&repo, false);
+        write(&repo.join(held), b"text\n");
+        write(&repo.join(".codex/config.toml"), b"model = \"m\"\n");
+        write(&repo.join(".codex/skills/x/other.md"), b"x\n");
+        write(&repo.join(".agents/skills/y/other.md"), b"y\n");
+        symlink(target, repo.join(link)).unwrap();
+        let found = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
+        assert!(!found.fully_hashed(), "{link}: {:?}", found.findings);
+        assert!(
+            found.uncheckable().iter().any(|(path, _)| *path == Path::new(link)),
+            "{link}: {:?}",
+            found.uncheckable()
+        );
+    }
+}
+
+#[test]
 fn a_dot_codex_linked_to_codex_home_is_not_read() {
     let fx = Fixture::new("codex-home-link");
     fx.repo(&fx.home, false);

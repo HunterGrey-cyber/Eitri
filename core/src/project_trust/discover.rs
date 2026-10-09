@@ -34,6 +34,10 @@ enum Role {
     /// of these files the agent reads or how, so every one counts as read by the agent itself: a link
     /// anywhere here leaves it reading something the fingerprint cannot see.
     Registered,
+    /// Anything in a skill tree Codex reads (`.agents/skills/`, `.codex/skills/`): Codex follows a
+    /// link anywhere in it and reads what it leads to, so a link here is one the fingerprint cannot
+    /// see through.
+    SkillTree,
     /// Anything else under a directory read whole.
     Plain,
 }
@@ -69,9 +73,10 @@ const OTHER_PLUGIN_LISTINGS: [&str; 2] = [".claude-plugin", ".cursor-plugin"];
 
 impl Tree {
     /// What a file `name` at `depth` below the tree's root, in the directory named `parent` (`None`
-    /// at the root), means to the agent.
-    fn role(self, depth: usize, parent: Option<&OsStr>, name: &OsStr) -> Role {
+    /// at the root), means to the agent. `in_skills` says the directory is in `.codex/skills/`.
+    fn role(self, depth: usize, parent: Option<&OsStr>, name: &OsStr, in_skills: bool) -> Role {
         match self {
+            Tree::Codex if in_skills => Role::SkillTree,
             Tree::Claude => role_in(depth, name),
             Tree::Codex => match (depth, name.as_bytes()) {
                 (0, b"config.toml") => Role::CodexConfig,
@@ -85,7 +90,8 @@ impl Tree {
             {
                 Role::Listing
             }
-            Tree::AgentsSkills | Tree::AgentsPlugins { .. } => Role::Plain,
+            Tree::AgentsSkills => Role::SkillTree,
+            Tree::AgentsPlugins { .. } => Role::Plain,
             Tree::Registered => Role::Registered,
         }
     }
@@ -225,7 +231,7 @@ impl Scan<'_> {
                     Role::HooksJson => self.findings.extend(hooks_json_findings(&path, &bytes)),
                     Role::Rules => self.findings.extend(rule_file_findings(&path, &bytes)),
                     Role::Listing => self.findings.push(Finding::PluginListing { path: path.clone() }),
-                    Role::CodexReadDir | Role::Registered | Role::Plain => {}
+                    Role::CodexReadDir | Role::Registered | Role::SkillTree | Role::Plain => {}
                 }
                 self.push(
                     path,
@@ -409,9 +415,15 @@ impl Scan<'_> {
             }
             let mut other_files = 0usize;
             let mut below: Vec<(DirHandle, PathBuf, OsString)> = Vec::new();
+            let in_skills = depth > 0
+                && path
+                    .strip_prefix(&top_path)
+                    .ok()
+                    .and_then(|rest| rest.components().next())
+                    .is_some_and(|first| first.as_os_str() == "skills");
             for name in names {
                 let child = path.join(&name);
-                let role = tree.role(depth, parent.as_deref(), &name);
+                let role = tree.role(depth, parent.as_deref(), &name, in_skills);
                 match dir.lstat(&name) {
                     Ok(FileKind::Dir) => {
                         if !self.room() {
@@ -454,7 +466,10 @@ impl Scan<'_> {
                     }
                     _ => {
                         if self.expected_file(&dir, &name, child, role)
-                            && matches!(role, Role::Plain | Role::CodexReadDir | Role::Registered)
+                            && matches!(
+                                role,
+                                Role::Plain | Role::CodexReadDir | Role::Registered | Role::SkillTree
+                            )
                         {
                             other_files += 1;
                         }

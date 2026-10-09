@@ -44,6 +44,13 @@ describe("applyEvent", () => {
     expect(state.toolCalls[0].result).toEqual({ content: "hi", isError: false });
   });
 
+  it("tool_call_completed completes only the first call with that id, as the Rust fold does", () => {
+    let state = applyEvent(initialState(), { type: "tool_call_started", turn_id: "t1", tool_use_id: "", name: "Bash", input: { command: "a" } });
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "", name: "Bash", input: { command: "b" } });
+    state = applyEvent(state, { type: "tool_call_completed", turn_id: "t1", tool_use_id: "", content: "done", is_error: false });
+    expect(state.toolCalls.map((c) => c.result)).toEqual([{ content: "done", isError: false }, null]);
+  });
+
   it("turn_started sets activeTurnId, and a subsequent turn_completed clears it regardless of outcome", () => {
     // Covers all four TurnOutcome values: `turn_completed` always clears the active turn,
     // regardless of how it ended.
@@ -220,6 +227,17 @@ describe("applyEvent", () => {
      wants to run", never WHICH Bash call -- and with several tool calls in one turn those are not
      the same question. `null` is what a request whose source supplied no such id looks like
      (today: the legacy backend's secondary `can_use_tool` path), never a fabricated id. */
+  it("a repeated permission_requested replaces the card with that id, as the Rust map does", () => {
+    let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_use_id: null, tool_name: "Bash", input: { a: 1 } });
+    state = applyEvent(state, { type: "permission_requested", permission_id: "r2", tool_use_id: null, tool_name: "Read", input: {} });
+    state = applyEvent(state, { type: "permission_requested", permission_id: "r1", tool_use_id: null, tool_name: "Bash", input: { a: 2 } });
+    expect(state.pendingPermissions.map((p) => p.permissionId)).toEqual(["r2", "r1"]);
+    expect(state.pendingPermissions[1].input).toEqual({ a: 2 });
+    expect(state.pendingPermissions[1].seq).toBeGreaterThan(state.pendingPermissions[0].seq);
+    state = applyEvent(state, { type: "permission_resolved", permission_id: "r1", outcome: "allowed" });
+    expect(state.pendingPermissions.map((p) => p.permissionId)).toEqual(["r2"]);
+  });
+
   it("permission_requested carries the tool_use_id of the call it gates", () => {
     const state = applyEvent(initialState(), {
       type: "permission_requested",
@@ -453,6 +471,15 @@ describe("identity handling", () => {
     expect(state.transcript.map((m) => m.text)).toEqual(["hello"]);
     expect(state.sessionId).toBe("sess-1");
     expect(state.providerSessionId).toBe("claude-1");
+  });
+
+  it("a session_opened in the middle of a reply does not end the message, as the Rust fold does not", () => {
+    const opened: AgentDomainEvent = { type: "session_opened", session_id: "s", provider_session_id: "p", model: "m", cwd: "/tmp" };
+    let state = applyEvent(initialState(), { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "hi" });
+    state = applyEvent(state, opened);
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: " there" });
+    expect(state.transcript.map((m) => m.text)).toEqual(["hi there"]);
   });
 
   it("starts with every capability false, so a gated control cannot appear before the server says so", () => {

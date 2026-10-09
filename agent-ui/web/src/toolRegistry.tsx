@@ -277,7 +277,9 @@ const codexFileChange: ToolRenderConfig = {
   renderInvocation: (input, { expanded }) => {
     const changes =
       input && typeof input === "object" && Array.isArray((input as { changes?: unknown }).changes)
-        ? ((input as { changes: Array<{ path: string; kind: string; diff: string }> }).changes)
+        ? (input as { changes: unknown[] }).changes.filter(
+            (c): c is { path: string; kind: string; diff: string } => typeof c === "object" && c !== null,
+          )
         : [];
     if (changes.length === 0)
       return saysNothing(input) ? (

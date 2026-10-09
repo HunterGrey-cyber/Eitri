@@ -128,7 +128,6 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         model: event.model,
         cwd: event.cwd,
         status: { kind: "running" },
-        assistantMessageOpen: false,
       };
     case "turn_started":
       // A new turn is newer news than however the last one ended: the band stops saying it. The row
@@ -201,19 +200,25 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
           : { changedInputsBeforeTheirCall: state.changedInputsBeforeTheirCall.filter((c) => c.toolUseId !== event.tool_use_id) }),
       };
     }
-    case "tool_call_completed":
+    case "tool_call_completed": {
+      // Only the first call with the id, as the Rust fold does: two calls can share an id (the sidecar's
+      // empty one), and a result belongs to one of them. Found once, so a long session's completion
+      // stays linear in its calls.
+      const first = state.toolCalls.findIndex((c) => c.toolUseId === event.tool_use_id);
       return {
         ...state,
-        toolCalls: state.toolCalls.map((call) =>
-          call.toolUseId === event.tool_use_id ? { ...call, result: { content: event.content, isError: event.is_error } } : call,
+        toolCalls: state.toolCalls.map((call, i) =>
+          i === first ? { ...call, result: { content: event.content, isError: event.is_error } } : call,
         ),
       };
+    }
     case "permission_requested":
       return {
         ...state,
         assistantMessageOpen: false,
         pendingPermissions: [
-          ...state.pendingPermissions,
+          // Keyed by `permission_id` like the Rust map: a repeat replaces the card and takes the newer `seq`.
+          ...state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id),
           // `tool_use_id` is carried through as-is, null included: it is what ties this card to the
           // exact tool call it gates, and a turn can have several of the same tool in flight. The
           // reducer takes no view on when a request arrives without one -- that is settled

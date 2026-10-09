@@ -436,7 +436,59 @@ fn shutdown_kills_the_children_the_agent_started_too() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // SAFETY: cleanup of a process this test started, by its captured pid.
-    unsafe { libc::kill(grandchild, libc::SIGKILL) };
+    if !gone {
+        // SAFETY: cleanup of a process this test started, by its captured pid, which is still
+        // alive and so still names it.
+        unsafe { libc::kill(grandchild, libc::SIGKILL) };
+    }
     assert!(gone, "the agent's own child outlived the link");
+}
+
+/// Waits up to two seconds for `pid` to be gone or a zombie, then kills it if it is not.
+fn ends_soon(pid: i32) -> bool {
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        let gone = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+        });
+        if gone {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: cleanup of a process this test started, by its captured pid, which is still alive.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    false
+}
+
+#[test]
+fn shutdown_kills_the_children_of_an_agent_that_already_exited() {
+    // The agent leaves a child behind and exits on its own, as an agent that ends cleanly on EOF
+    // would; the child is still in its group and still holds the link's pipes.
+    let link = JsonRpcLink::spawn(LinkSpec {
+        program: PathBuf::from("/bin/sh"),
+        args: vec![OsString::from("-c"), OsString::from("sleep 300 & echo $! >&2")],
+        cwd: std::env::temp_dir(),
+        framing: Framing::Bare,
+        env: Vec::new(),
+        env_remove: Vec::new(),
+    })
+    .expect("sh starts");
+    let end = soon();
+    let grandchild: i32 = loop {
+        if let Ok(pid) = link.stderr_tail().trim().parse() {
+            break pid;
+        }
+        assert!(Instant::now() < end, "the shell never named its child");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(alive(grandchild as u32));
+    // Long enough for the shell to have exited before the link looks.
+    link.shutdown(Duration::from_secs(2));
+    assert!(
+        ends_soon(grandchild),
+        "the child of an agent that exited outlived the link"
+    );
 }

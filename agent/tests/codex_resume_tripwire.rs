@@ -750,3 +750,62 @@ fn resume_of_a_thread_held_elsewhere_is_rejected_with_codex_message() {
     );
     assert!(refused.is_err());
 }
+
+/// Codex says more while the history is read than can be held for after it: the history stops with a note
+/// instead of leaving the link's reader blocked behind the messages, and every held message is still
+/// delivered, in order, once the start returns.
+#[test]
+fn a_flood_while_the_history_is_read_stops_it_and_keeps_the_live_messages() {
+    const FLOOD: usize = 5000;
+    let mut script = handshake();
+    script.push(expect_request(3, "thread/resume"));
+    script.push(thread_answer(3, "th-old", json!({})));
+    script.push(expect_request(4, "thread/turns/list"));
+    for n in 0..FLOOD {
+        script.push(write(
+            json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": n as f64 / 100.0, "windowDurationMins": 300, "resetsAt": 1_790_000_000},
+                "planType": "pro",
+            }}}),
+        ));
+    }
+    script.push(turns_page(4, vec![turn_meta("tu-1", "completed")], None));
+    let file = std::env::temp_dir().join(format!("codex-flood-script-{}.json", std::process::id()));
+    std::fs::write(&file, Value::Array(script).to_string()).expect("the script file");
+    let provider = CodexProvider::connect_with_args(launch(), vec![OsString::from(format!("@{}", file.display()))])
+        .expect("the handshake passes");
+    let started = Instant::now();
+    provider
+        .start(request(Some("th-old"), &[]))
+        .expect("the resume completes");
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the start waited out a page: {:?}",
+        started.elapsed()
+    );
+    let history = provider.take_history();
+    let note = history
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::ToolCallStarted { name, input, .. } if name == "history" => Some(input.to_string()),
+            _ => None,
+        })
+        .expect("a note on the history");
+    assert!(note.contains("sent too much"), "{note}");
+    let events = pump_until(&provider, |events| {
+        events.iter().filter(|e| kind(e) == "limits").count() == FLOOD
+    });
+    let figures: Vec<f64> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::AccountLimits { used_percent, .. } => Some(*used_percent),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        figures.windows(2).all(|w| w[0] < w[1]),
+        "the live messages kept their order"
+    );
+}

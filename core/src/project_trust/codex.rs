@@ -485,6 +485,63 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_server_line_names_every_field_of_the_server() {
+        let toml = br#"
+[mcp_servers.remote]
+url = "https://a/mcp"
+bearer_token_env_var = "OPENAI_API_KEY"
+http_headers_helper = "./h.sh"
+default_tools_approval_mode = "approve"
+
+[mcp_servers.remote.tools.write]
+approval_mode = "prompt"
+note = "kept"
+
+[mcp_servers.local]
+command = "srv"
+cwd = "/x"
+env_vars = ["TOKEN"]
+default_tools_approval_mode = "approve"
+
+[mcp_servers.local.tools.read]
+approval_mode = "approve"
+"#;
+        let found = codex_findings(Path::new(".codex/config.toml"), toml);
+        let line = |name: &str| {
+            found
+                .iter()
+                .find_map(|f| match f {
+                    Finding::McpServer {
+                        name: n,
+                        command_line,
+                        approval_mode,
+                        ..
+                    } if n == name => Some((command_line.clone(), approval_mode.clone())),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let (remote, remote_mode) = line("remote");
+        assert!(remote.starts_with("http https://a/mcp"), "{remote}");
+        for part in [
+            "bearer_token_env_var",
+            "OPENAI_API_KEY",
+            "http_headers_helper",
+            "./h.sh",
+            "note",
+            "kept",
+        ] {
+            assert!(remote.contains(part), "{part} missing from {remote}");
+        }
+        assert_eq!(remote_mode.as_deref(), Some("approve; write: prompt"));
+        let (local, _) = line("local");
+        assert!(local.starts_with("srv"), "{local}");
+        for part in ["cwd", "/x", "env_vars", "TOKEN"] {
+            assert!(local.contains(part), "{part} missing from {local}");
+        }
+    }
+
+    #[test]
     fn an_unparsed_toml_or_rule_file_shows_its_text() {
         let reason = |found: Vec<Finding>| match &found[..] {
             [Finding::Unparsed { reason, .. }] => reason.clone(),

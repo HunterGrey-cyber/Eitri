@@ -440,19 +440,68 @@ impl JsonRpcLink {
         lock(&self.shared.writer).take();
         let Some(mut child) = self.child.take() else { return };
         let end = Instant::now() + grace;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(10)),
-                _ => break,
+        let exited = loop {
+            match child_state(self.pid) {
+                ChildState::Running if Instant::now() < end => thread::sleep(Duration::from_millis(10)),
+                ChildState::Running => break false,
+                ChildState::Exited => break true,
+                // Reaped by someone else (SIGCHLD ignored): the pid may already name another
+                // process, so nothing is signalled.
+                ChildState::Gone => {
+                    let _ = child.wait();
+                    return;
+                }
             }
-        }
-        // The child has not been reaped here, so its pid still names its process group and neither
-        // can belong to anything else; a grandchild that kept our pipes open would otherwise keep
-        // the reader and stderr threads blocked for good.
+        };
+        // The child is not reaped yet, alive or a zombie, so its pid still names its process group
+        // and neither can belong to anything else. The group is killed even when the child exited
+        // on its own: a grandchild left in it would keep our pipes open, and with them the reader
+        // and stderr threads, for good.
         kill_group(self.pid);
-        let _ = child.kill();
+        if !exited {
+            let _ = child.kill();
+        }
         let _ = child.wait();
+    }
+}
+
+enum ChildState {
+    Running,
+    /// Exited and not reaped: its pid stays reserved until `wait`.
+    Exited,
+    /// Not our unreaped child any more.
+    Gone,
+}
+
+/// Whether the child has exited, asked without reaping it, so its pid keeps naming its group.
+fn child_state(pid: u32) -> ChildState {
+    let Ok(pid) = libc::id_t::try_from(pid) else {
+        return ChildState::Gone;
+    };
+    // SAFETY: an all-zero `siginfo_t` is a valid value, and `waitid` writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` lives for the call; WNOWAIT leaves the child waitable.
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if r != 0 {
+        return if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            ChildState::Running
+        } else {
+            ChildState::Gone
+        };
+    }
+    // With WNOHANG and nothing to report the pid field stays as zeroed above.
+    // SAFETY: `waitid` succeeded, so `info` holds a child state or the zeroes it started with.
+    if unsafe { info.si_pid() } == 0 {
+        ChildState::Running
+    } else {
+        ChildState::Exited
     }
 }
 
