@@ -843,6 +843,12 @@ impl AgentConversation {
         self.capabilities
     }
 
+    /// Whether this session can be continued later, as its provider said when it connected: an external
+    /// provider's own answer (an ACP agent's `loadSession`), else the provider's `resume` capability.
+    pub fn resumes(&self) -> bool {
+        self.external.as_ref().map_or(self.capabilities.resume, |e| e.resumes())
+    }
+
     pub fn provider_info(&self) -> &ProviderInfo {
         &self.info
     }

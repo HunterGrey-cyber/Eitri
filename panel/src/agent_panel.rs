@@ -2467,9 +2467,16 @@ fn restore_plan(state: &AgentPanelState) -> eitri_core::tab_restore::RestorePlan
     if !saved.external_tabs.is_empty() {
         records.extend(eitri_core::agent_backend::external_sessions(&state.project_dir));
     }
-    eitri_core::tab_restore::plan(&saved, &records, &state.tabs.open_session_ids(), |agent, id| {
+    let mut plan = eitri_core::tab_restore::plan(&saved, &records, &state.tabs.open_session_ids(), |agent, id| {
         agent::lease::SessionLease::is_held(&agent.record_name(), canonical, id).unwrap_or(false)
-    })
+    });
+    // A saved tab of an ACP agent `init.lua` no longer registers has no command to run: it is skipped
+    // and said to be, and the next save of the open tabs leaves it out of the file.
+    plan.skip_unregistered(|agent| match agent {
+        AgentId::Acp(name) => state.acp_agents.iter().any(|a| a.name == *name),
+        AgentId::Claude | AgentId::Codex => true,
+    });
+    plan
 }
 
 /// Where a restore was asked for.
@@ -9951,17 +9958,32 @@ mod tests {
         Rc<RefCell<Vec<String>>>,
         Rc<RefCell<Vec<ExternalSpawned>>>,
     ) {
+        restore_panel_with_external(label, AgentId::Codex, "thread-9")
+    }
+
+    /// [`restore_panel_with_codex`] for a tab of `agent` holding `session`.
+    #[allow(clippy::type_complexity)]
+    fn restore_panel_with_external(
+        label: &str,
+        agent: AgentId,
+        session: &str,
+    ) -> (
+        Rc<RefCell<AgentPanelState>>,
+        PathBuf,
+        Rc<RefCell<Vec<String>>>,
+        Rc<RefCell<Vec<ExternalSpawned>>>,
+    ) {
         let (state, dir) = restore_panel(label, &[("s-1", None, Auto)], &["s-1"]);
         let conversation_id = agent::conversation_id_for_cwd(&dir);
         agent::persistence::save_conversation_record(&agent::persistence::ConversationRecord {
             conversation_id: conversation_id.clone(),
-            provider: "codex".to_string(),
-            provider_session_id: "thread-9".to_string(),
+            provider: agent.record_name(),
+            provider_session_id: session.to_string(),
             canonical_cwd: dir.to_string_lossy().into_owned(),
             created_at: "1".to_string(),
             updated_at: "2".to_string(),
             provider_advertised_resume: true,
-            title: Some("title of thread-9".to_string()),
+            title: Some(format!("title of {session}")),
             name: None,
         })
         .unwrap();
@@ -9972,9 +9994,9 @@ mod tests {
             s.document_ready = true;
             let saved = s.restore_source.as_mut().unwrap();
             saved.external_tabs = vec![eitri_core::saved_tabs::SavedExternalTab {
-                agent: AgentId::Codex,
+                agent,
                 conversation_id,
-                provider_session_id: "thread-9".to_string(),
+                provider_session_id: session.to_string(),
                 name: None,
                 mode: Auto,
             }];
@@ -10027,6 +10049,78 @@ mod tests {
         let saved = s.tabs.saved_snapshot("conv").unwrap();
         assert_eq!(saved.tabs.len(), 1);
         assert_eq!(saved.external_tabs.len(), 1, "the Codex tab is still saved");
+    }
+
+    /// A saved tab of a registered ACP agent comes back holding its resume and waits for that agent's own
+    /// question, which it is asked even with nothing found; a `y` resumes it with the registered command,
+    /// and an `n` starts nothing.
+    #[test]
+    fn a_saved_acp_tab_is_restored_only_after_its_own_yes() {
+        for yes in [true, false] {
+            let label = if yes { "restore-acp-yes" } else { "restore-acp-no" };
+            let gem = AgentId::Acp("gem".into());
+            let (state, _dir, resumed, external) = restore_panel_with_external(label, gem.clone(), "gem-s");
+            state.borrow_mut().acp_agents = vec![gem_registration()];
+            let from = state.borrow().tabs.active();
+            let result = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard);
+            assert!(matches!(result, RestoreResult::Deferred));
+            let prompt = next_prompt(&state);
+            assert_eq!(*resumed.borrow(), ["s-1"], "Claude has nothing to trust and started");
+            assert!(external.borrow().is_empty(), "nothing of gem starts while it is asked");
+            let waiting = state
+                .borrow()
+                .tabs
+                .tab_with_session("gem-s")
+                .expect("the gem tab is back");
+            assert_eq!(prompt.tab, waiting);
+            let saved = state.borrow().tabs.saved_snapshot("conv").unwrap();
+            assert_eq!(saved.external_tabs.len(), 1, "kept in the saved file while it waits");
+            assert_eq!(saved.external_tabs[0].agent, gem);
+
+            answer_prompt(&state, "a1", &prompt, yes);
+            if yes {
+                tick_until(&state, |_| !external.borrow().is_empty());
+                let spawned = external.borrow();
+                assert_eq!(spawned.len(), 1);
+                assert_eq!(spawned[0].agent, gem);
+                assert_eq!(spawned[0].resume.as_deref(), Some("gem-s"));
+                assert_eq!(
+                    spawned[0].acp,
+                    Some((
+                        vec![std::ffi::OsString::from("gem-acp"), std::ffi::OsString::from("--stdio")],
+                        Some("auto_edit".to_string())
+                    ))
+                );
+            } else {
+                for _ in 0..20 {
+                    trust_events(&mut state.borrow_mut());
+                }
+                assert!(external.borrow().is_empty(), "an n starts nothing");
+            }
+        }
+    }
+
+    /// A saved tab of an ACP agent `init.lua` no longer registers is skipped, said to be, and never
+    /// asked about; the Claude tabs come back as usual, and the next save leaves it out.
+    #[test]
+    fn a_saved_tab_of_an_unregistered_acp_agent_is_skipped() {
+        let gem = AgentId::Acp("gem".into());
+        let (state, _dir, resumed, external) = restore_panel_with_external("restore-acp-gone", gem, "gem-s");
+        assert!(state.borrow().acp_agents.is_empty());
+        let plan = restore_plan(&state.borrow());
+        assert_eq!(plan.items.len(), 1, "only the Claude tab");
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].reason, eitri_core::tab_restore::NOT_REGISTERED);
+        let from = state.borrow().tabs.active();
+        let result = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard);
+        assert!(matches!(result, RestoreResult::Deferred));
+        tick_until(&state, |_| !resumed.borrow().is_empty());
+        assert_eq!(*resumed.borrow(), ["s-1"]);
+        assert!(external.borrow().is_empty());
+        let s = state.borrow();
+        assert!(s.tabs.tab_with_session("gem-s").is_none(), "no tab is made for it");
+        let saved = s.tabs.saved_snapshot("conv").unwrap();
+        assert!(saved.external_tabs.is_empty(), "the next save leaves it out");
     }
 
     /// When the project has something for Codex to load, the restored Codex tab waits for that

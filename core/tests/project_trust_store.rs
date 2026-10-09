@@ -800,3 +800,106 @@ fn profiles_are_named_for_people() {
     };
     assert_eq!(acp.label(), "gem");
 }
+
+/// A registered agent's profile: one file and one directory it reads whole.
+fn gem_profile() -> Profile {
+    Profile::Acp {
+        name: "gem".into(),
+        files: vec!["GEM.md".into(), ".gem/".into()],
+    }
+}
+
+/// Asserts that `root`'s configuration for `profile` can be answered for one start only, names
+/// `path` as what cannot be checked, and is never recorded.
+fn assert_session_only(fx: &Fixture, root: &Path, profile: &Profile, path: &str) {
+    let found = discover_as(fx, root, profile);
+    assert!(!found.fully_hashed(), "{:?}", found.findings);
+    assert!(
+        found.uncheckable().iter().any(|(p, _)| *p == Path::new(path)),
+        "{path} not named: {:?}",
+        found.uncheckable()
+    );
+    match fx.store().state(found.clone()) {
+        TrustState::Untrusted {
+            remember: Remember::SessionOnly(note),
+            ..
+        } => assert!(note.contains(path), "{note}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(fx.store().record(&found, 1).is_err());
+    let acp_file = PathBuf::from(format!("{}.{}", fx.record_file(root).display(), profile.key()));
+    assert!(!acp_file.exists());
+}
+
+/// Eitri cannot know which files in a registered directory the agent reads, so a link anywhere in
+/// it leaves the agent reading what no fingerprint covers: the answer lasts one start.
+#[test]
+fn a_link_inside_a_registered_directory_is_session_only() {
+    let fx = Fixture::new("acp-inner-link");
+    let root = fx.root("p");
+    write(&root.join("payload.json"), b"{\"a\":1}\n");
+    write(&root.join(".gem/plain.txt"), b"plain\n");
+    symlink("../payload.json", root.join(".gem/settings.json")).unwrap();
+    let profile = gem_profile();
+    assert_session_only(&fx, &root, &profile, ".gem/settings.json");
+
+    // Deeper down, and a link in place of a directory, are the same.
+    std::fs::remove_file(root.join(".gem/settings.json")).unwrap();
+    write(&root.join(".gem/deep/er/x.json"), b"{}\n");
+    symlink("../../../payload.json", root.join(".gem/deep/er/y.json")).unwrap();
+    assert_session_only(&fx, &root, &profile, ".gem/deep/er/y.json");
+    std::fs::remove_file(root.join(".gem/deep/er/y.json")).unwrap();
+    std::fs::create_dir(root.join("elsewhere")).unwrap();
+    symlink("../../elsewhere", root.join(".gem/deep/linked")).unwrap();
+    assert_session_only(&fx, &root, &profile, ".gem/deep/linked");
+}
+
+#[test]
+fn a_registered_file_that_is_a_link_is_session_only() {
+    let fx = Fixture::new("acp-file-link");
+    let root = fx.root("p");
+    write(&root.join("payload.md"), b"memory\n");
+    symlink("payload.md", root.join("GEM.md")).unwrap();
+    assert_session_only(&fx, &root, &gem_profile(), "GEM.md");
+}
+
+#[test]
+fn a_registered_directory_that_is_a_link_is_session_only() {
+    let fx = Fixture::new("acp-dir-link");
+    let root = fx.root("p");
+    write(&root.join("real/settings.json"), b"{}\n");
+    symlink("real", root.join(".gem")).unwrap();
+    assert_session_only(&fx, &root, &gem_profile(), ".gem");
+}
+
+/// Without a link, a registered agent's configuration is recorded, and a change to any file in its
+/// directory asks again.
+#[test]
+fn a_registered_plain_tree_is_recorded() {
+    let fx = Fixture::new("acp-plain");
+    let root = fx.root("p");
+    write(&root.join("GEM.md"), b"memory\n");
+    write(&root.join(".gem/settings.json"), b"{\"a\":1}\n");
+    write(&root.join(".gem/deep/x.json"), b"{}\n");
+    let profile = gem_profile();
+    let store = fx.store();
+    let found = discover_as(&fx, &root, &profile);
+    assert!(found.fully_hashed(), "{:?}", found.findings);
+    assert!(matches!(
+        store.state(found.clone()),
+        TrustState::Untrusted {
+            remember: Remember::Yes,
+            ..
+        }
+    ));
+    store.record(&found, 9).unwrap();
+    assert!(matches!(
+        store.state(discover_as(&fx, &root, &profile)),
+        TrustState::Trusted { since_unix: 9, .. }
+    ));
+    write(&root.join(".gem/deep/x.json"), b"{\"b\":2}\n");
+    match store.state(discover_as(&fx, &root, &profile)) {
+        TrustState::Changed { diff, .. } => assert_eq!(diff.changed, vec![PathBuf::from(".gem/deep/x.json")]),
+        other => panic!("{other:?}"),
+    }
+}

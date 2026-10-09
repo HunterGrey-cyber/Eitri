@@ -195,6 +195,8 @@ impl RecordingProvider {
 pub struct ExternalRecordingProvider {
     pub inner: RecordingProvider,
     name: &'static str,
+    /// What `resumes` answers: an ACP agent's `loadSession`.
+    resumes: bool,
     starts: std::sync::Mutex<Vec<agent::ExternalStart>>,
     policies: std::sync::Mutex<Vec<agent::TurnPolicy>>,
     /// While set, `close_session` waits for one message (or the sender's drop) before it closes.
@@ -204,9 +206,16 @@ pub struct ExternalRecordingProvider {
 impl ExternalRecordingProvider {
     /// A provider that names itself `codex`, as Codex's does.
     pub fn codex() -> Self {
+        Self::named("codex", true)
+    }
+
+    /// A provider that names itself `name` (`acp:<registered name>` for an ACP agent's) and answers
+    /// `resumes` with `resumes`.
+    pub fn named(name: &'static str, resumes: bool) -> Self {
         ExternalRecordingProvider {
             inner: RecordingProvider::interruptible(),
-            name: "codex",
+            name,
+            resumes,
             starts: std::sync::Mutex::new(Vec::new()),
             policies: std::sync::Mutex::new(Vec::new()),
             close_gate: std::sync::Mutex::new(None),
@@ -270,7 +279,7 @@ impl agent::ExternalProvider for ExternalRecordingProvider {
         self.name
     }
     fn resumes(&self) -> bool {
-        true
+        self.resumes
     }
     fn start(&self, req: agent::ExternalStart) -> Result<String, agent::ProviderError> {
         match &req.resume {

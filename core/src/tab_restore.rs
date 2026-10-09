@@ -78,6 +78,7 @@ pub struct RestorePlan {
 
 pub const GONE: &str = "its saved record is gone";
 pub const HELD_ELSEWHERE: &str = "open in another window";
+pub const NOT_REGISTERED: &str = "its agent is not registered in init.lua";
 
 /// Sorts `saved` into what can be resumed and what cannot. `records` are the sessions this project
 /// can resume (`agent::resumable_sessions`, with their display titles), of every agent: a saved tab
@@ -165,6 +166,20 @@ pub struct RestoreOffer {
 }
 
 impl RestorePlan {
+    /// Moves every planned tab whose agent this window cannot start to the skipped tabs, saying so:
+    /// a tab of an ACP agent saved while `init.lua` registered it, and no longer registered there. It
+    /// is then never brought back to wait for a question whose answer could not start it.
+    pub fn skip_unregistered(&mut self, registered: impl Fn(&AgentId) -> bool) {
+        let (kept, unregistered): (Vec<PlannedTab>, Vec<PlannedTab>) = std::mem::take(&mut self.items)
+            .into_iter()
+            .partition(|item| registered(&item.agent));
+        self.items = kept;
+        self.skipped.extend(unregistered.into_iter().map(|item| Skipped {
+            label: item.label,
+            reason: NOT_REGISTERED.to_string(),
+        }));
+    }
+
     /// `None` when every saved tab would be skipped: a key that restores nothing is not offered.
     pub fn offer(&self) -> Option<RestoreOffer> {
         if self.items.is_empty() {
@@ -391,6 +406,39 @@ mod tests {
         assert_eq!(plan.items[1].saved_mode, Bypass);
         assert_eq!(plan.items[1].name.as_deref(), Some("api"));
         assert_eq!(plan.items[0].label, "first");
+    }
+
+    #[test]
+    fn a_tab_of_an_agent_no_longer_registered_is_skipped_with_its_reason() {
+        let mut saved = saved(&[("a", None, Auto)], 0);
+        let acp = |name: &str, id: &str| crate::saved_tabs::SavedExternalTab {
+            agent: AgentId::Acp(name.to_string()),
+            conversation_id: "c".to_string(),
+            provider_session_id: id.to_string(),
+            name: None,
+            mode: Auto,
+        };
+        saved.external_tabs = vec![acp("gem", "g-1"), acp("gone", "x-1")];
+        let acp_record = |name: &str, id: &str| ResumableSession {
+            provider: format!("acp:{name}"),
+            ..record(id, None, Some(id))
+        };
+        let records = [
+            record("a", None, Some("first")),
+            acp_record("gem", "g-1"),
+            acp_record("gone", "x-1"),
+        ];
+        let mut plan = plan(&saved, &records, &[], |_, _| false);
+        plan.skip_unregistered(|agent| agent != &AgentId::Acp("gone".to_string()));
+        let ids: Vec<&str> = plan.items.iter().map(|i| i.provider_session_id.as_str()).collect();
+        assert_eq!(ids, ["a", "g-1"]);
+        assert_eq!(
+            plan.skipped,
+            vec![Skipped {
+                label: "x-1".to_string(),
+                reason: NOT_REGISTERED.to_string()
+            }]
+        );
     }
 
     #[test]

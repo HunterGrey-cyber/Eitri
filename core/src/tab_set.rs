@@ -386,12 +386,22 @@ impl Tab {
     }
 
     /// Whether this tab's sessions can be continued later, judged by its agent first: a Claude tab
-    /// only on the sidecar backend (`kind`), Codex always (its own threads), an ACP agent not yet.
+    /// only on the sidecar backend (`kind`), Codex always (its own threads), an ACP agent only where it
+    /// said it can load a saved session. Before its session is live, an ACP tab that is resuming one
+    /// holds a session its agent recorded as loadable; the agent is asked again when that resume starts.
     pub fn resumable(&self, kind: BackendKind) -> bool {
         match &self.agent {
             AgentId::Claude => kind == BackendKind::Sidecar,
             AgentId::Codex => true,
-            AgentId::Acp(_) => false,
+            AgentId::Acp(_) => match &self.backend {
+                TabBackend::Live(AgentBackend::External(external)) => external.conversation().resumes(),
+                TabBackend::Starting(pending) => pending.resume.is_some(),
+                TabBackend::AwaitingTrust(AwaitingTrust {
+                    start: DeferredStart::Resume { .. },
+                    ..
+                }) => true,
+                _ => false,
+            },
         }
     }
 
@@ -10085,6 +10095,71 @@ mod external_tab_tests {
                 b.shutdown();
             }
         }
+    }
+
+    /// An ACP tab is saved, and comes back, exactly when its agent said it can load a saved session.
+    #[test]
+    fn an_acp_tab_is_saved_only_when_its_agent_loads_sessions() {
+        let dir = workspace("acp-saved");
+        for (resumes, saved_count) in [(true, 1), (false, 0)] {
+            let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+            let agent = AgentId::Acp("gem".into());
+            let tab = set.open(agent.clone());
+            assert!(
+                !set.get(tab).unwrap().resumable(BackendKind::Sidecar),
+                "nothing said yet"
+            );
+            let provider = Arc::new(ExternalRecordingProvider::named("acp:gem", resumes));
+            let backend = AgentBackend::start_external_with(
+                agent.clone(),
+                provider.clone(),
+                &dir,
+                empty_trust_plan(),
+                SessionModeChoice::Auto,
+                None,
+            )
+            .unwrap();
+            set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+            until("the session is named", || {
+                set.pump(&dir, true);
+                set.get(tab).unwrap().provider_session_id().is_some()
+            });
+            assert_eq!(set.get(tab).unwrap().resumable(BackendKind::Sidecar), resumes);
+            set.select(tab);
+            let saved = set.saved_snapshot("conv").unwrap();
+            assert_eq!(saved.external_tabs.len(), saved_count, "loadSession {resumes}");
+            if resumes {
+                assert_eq!(saved.external_tabs[0].agent, agent);
+                assert_eq!(saved.external_tabs[0].provider_session_id, "thread-1");
+                assert_eq!(saved.active_external, Some(0));
+            } else {
+                assert_eq!(saved.active_external, None);
+            }
+            drop(provider);
+            for mut t in set.take_all() {
+                if let TabBackend::Live(b) = &mut t.backend {
+                    b.shutdown();
+                }
+            }
+        }
+        // A tab brought back holding a saved session waits as resumable, so it stays in the file.
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let from = set.active();
+        let plan = RestorePlan {
+            items: vec![planned(AgentId::Acp("gem".into()), "gem-s", SessionModeChoice::Auto)],
+            skipped: Vec::new(),
+            active_session: None,
+        };
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing in bypass, nothing to ask")
+        };
+        assert_eq!(go.trust_agent(), Some(AgentId::Acp("gem".into())));
+        set.start_restore(from, go, |_, _| Ok(RestoreConnect::AwaitTrust));
+        let waiting = set.tab_with_session("gem-s").expect("the ACP tab came back");
+        assert!(set.get(waiting).unwrap().resumable(BackendKind::Sidecar));
+        let saved = set.saved_snapshot("conv").unwrap();
+        assert_eq!(saved.external_tabs.len(), 1, "kept in the saved file while it waits");
+        assert_eq!(saved.external_tabs[0].provider_session_id, "gem-s");
     }
 
     #[test]

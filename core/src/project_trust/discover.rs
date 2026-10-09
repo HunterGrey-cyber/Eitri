@@ -30,6 +30,10 @@ enum Role {
     /// A directory in a `.codex/` that Codex lists and reads from itself (`rules/`, `skills/`): a
     /// link in its place is followed, and what it leads to is never hashed.
     CodexReadDir,
+    /// Anything under a directory an agent registered by name reads whole. Eitri cannot know which
+    /// of these files the agent reads or how, so every one counts as read by the agent itself: a link
+    /// anywhere here leaves it reading something the fingerprint cannot see.
+    Registered,
     /// Anything else under a directory read whole.
     Plain,
 }
@@ -54,7 +58,7 @@ enum Tree {
     /// `.agents/plugins/`: its marketplace listings are named when it is at the top level.
     AgentsPlugins { at_top: bool },
     /// A directory an agent registered by name reads.
-    Plain,
+    Registered,
 }
 
 /// The listings Codex reads from `.agents/plugins/` at the repository's top level.
@@ -81,7 +85,8 @@ impl Tree {
             {
                 Role::Listing
             }
-            Tree::AgentsSkills | Tree::AgentsPlugins { .. } | Tree::Plain => Role::Plain,
+            Tree::AgentsSkills | Tree::AgentsPlugins { .. } => Role::Plain,
+            Tree::Registered => Role::Registered,
         }
     }
 
@@ -220,7 +225,7 @@ impl Scan<'_> {
                     Role::HooksJson => self.findings.extend(hooks_json_findings(&path, &bytes)),
                     Role::Rules => self.findings.extend(rule_file_findings(&path, &bytes)),
                     Role::Listing => self.findings.push(Finding::PluginListing { path: path.clone() }),
-                    Role::CodexReadDir | Role::Plain => {}
+                    Role::CodexReadDir | Role::Registered | Role::Plain => {}
                 }
                 self.push(
                     path,
@@ -449,7 +454,7 @@ impl Scan<'_> {
                     }
                     _ => {
                         if self.expected_file(&dir, &name, child, role)
-                            && matches!(role, Role::Plain | Role::CodexReadDir)
+                            && matches!(role, Role::Plain | Role::CodexReadDir | Role::Registered)
                         {
                             other_files += 1;
                         }
@@ -661,7 +666,7 @@ impl Scan<'_> {
         };
         for (name, is_dir) in files {
             if *is_dir {
-                self.whole_dir(&handle, name, base.join(name), Tree::Plain);
+                self.whole_dir(&handle, name, base.join(name), Tree::Registered);
             } else {
                 self.expected_file(&handle, name, base.join(name), Role::Memory);
             }
