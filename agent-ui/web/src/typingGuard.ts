@@ -162,6 +162,14 @@ export class TypingGuard {
     return this.drop();
   }
 
+  /** A held key let go at `t` (a `j`/`k` whose repeats were moving the view, `./jkHold`): while it was
+   *  held it stood for a key pressed again and again, so the window a following key is judged by starts
+   *  at the release, not at its last repeat -- an `a` right after letting go of `j` waits like one right
+   *  after a press. Only when nothing else was pressed since that key; it records no key of its own. */
+  onRelease(key: string, t: number): void {
+    if (this.latest !== null && this.latest.key === key && t > this.latest.t) this.latest = { key, t };
+  }
+
   /** The number of keys recorded by `onKey`, including the key currently being handled.
    *  A landing recorded with `keyCount()` belongs to the preceding key exactly when the next key
    *  reads that landing's count as `keyCount() - 1`. */

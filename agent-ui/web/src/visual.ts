@@ -873,7 +873,8 @@ export function copySelectionText(sel: SelectionLike, root: HTMLElement, model: 
   const cursorRow = rowOf(root, elementOf(model.cursor.node) ?? root);
   const ai = anchorRow === null ? -1 : rows.indexOf(anchorRow);
   const ci = cursorRow === null ? -1 : rows.indexOf(cursorRow);
-  const touched: Element[] = ai === -1 || ci === -1 ? rows : rows.slice(Math.min(ai, ci), Math.max(ai, ci) + 1);
+  // A copy either way: `rows` is the lookup's shared list (`./nav`), and blocks are added below.
+  const touched: Element[] = ai === -1 || ci === -1 ? rows.slice() : rows.slice(Math.min(ai, ci), Math.max(ai, ci) + 1);
   const list = root.classList.contains("message-list") ? root : root.querySelector(".message-list");
   const range = list === null ? null : selectedRange(sel, model);
   if (list !== null && range !== null) {

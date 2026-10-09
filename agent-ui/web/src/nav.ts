@@ -183,16 +183,76 @@ function isOwnStop(root: HTMLElement, el: HTMLElement): boolean {
   return true;
 }
 
-/** Every stop under `root`, in document order, whether or not it is worth landing on. */
+/** What `ownStops` found under one root, kept until the tree changes in a way that could change it. */
+type StopCache = { observer: MutationObserver; stops: HTMLElement[] | null; rows: HTMLElement[] | null };
+const stopCaches = new WeakMap<HTMLElement, StopCache>();
+
+/** Whether a mutation could change which elements are stops: a `data-nav-stop` written or removed, or an
+ *  element carrying one (or holding one) put into the tree or taken out of it. Text changes, and a reply's
+ *  HTML re-rendered with no stop in it, cannot. */
+function touchesStops(record: MutationRecord): boolean {
+  if (record.type === "attributes") return true;
+  const carries = (node: Node) =>
+    node instanceof Element && (node.hasAttribute(STOP_ATTR) || node.querySelector(`[${STOP_ATTR}]`) !== null);
+  for (const node of record.addedNodes) if (carries(node)) return true;
+  for (const node of record.removedNodes) if (carries(node)) return true;
+  return false;
+}
+
+/** The cache for `root`, emptied first if the tree changed since it was filled. The pending records are
+ *  taken here, synchronously, rather than left to the observer's callback: a lookup in the same task as a
+ *  commit (a layout effect, a key handler right after a render) must never see the list from before it. */
+function stopCache(root: HTMLElement): StopCache {
+  let cache = stopCaches.get(root);
+  if (cache === undefined) {
+    const fresh: StopCache = {
+      observer: new MutationObserver((records) => {
+        if (records.some(touchesStops)) {
+          fresh.stops = null;
+          fresh.rows = null;
+        }
+      }),
+      stops: null,
+      rows: null,
+    };
+    fresh.observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: [STOP_ATTR] });
+    stopCaches.set(root, fresh);
+    cache = fresh;
+  }
+  if (cache.observer.takeRecords().some(touchesStops)) {
+    cache.stops = null;
+    cache.rows = null;
+  }
+  return cache;
+}
+
+/** Every stop under `root`, in document order, whether or not it is worth landing on.
+ *
+ *  Read from the tree once and kept until the tree changes in a way that could change it (`stopCache`):
+ *  a `j`/`k` press used to query the whole panel three times, about 6,000 elements on a long conversation.
+ *  The answer is the same structural one either way (`isOwnStop`), which is what keeps `a` on the card the
+ *  cursor shows. The array is shared and frozen: callers read it, never change it. */
 function ownStops(root: HTMLElement): HTMLElement[] {
-  return Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}]`)).filter((stop) => isOwnStop(root, stop));
+  const cache = stopCache(root);
+  if (cache.stops === null) {
+    cache.stops = Object.freeze(
+      Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}]`)).filter((stop) => isOwnStop(root, stop)),
+    ) as HTMLElement[];
+  }
+  return cache.stops;
 }
 
 /** The conversation rows under `root`, in document order: index `i` here is timeline index `i`.
  *  Only real rows -- a `data-nav-stop="row"` inside another stop (a reply's own HTML) is never
- *  one. Every site that turns the cursor into an element goes through this. */
+ *  one. Every site that turns the cursor into an element goes through this. The same
+ *  array is returned until the stops change (`ownStops`), so a caller can tell a changed list by
+ *  identity. */
 export function conversationRows(root: HTMLElement): HTMLElement[] {
-  return ownStops(root).filter((stop) => stop.getAttribute(STOP_ATTR) === "row");
+  const cache = stopCache(root);
+  if (cache.rows === null) {
+    cache.rows = Object.freeze(ownStops(root).filter((stop) => stop.getAttribute(STOP_ATTR) === "row")) as HTMLElement[];
+  }
+  return cache.rows;
 }
 
 /** The stop `el` sits in (or is), or `null`: the OUTERMOST `data-nav-stop` between `el` and

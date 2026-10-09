@@ -442,3 +442,37 @@ describe("TypingGuard.mayStartInput: i/o/A need a pause, never a motion run", ()
     expect(lastMayStart("i", 0, true)).toBe(false);
   });
 });
+
+describe("TypingGuard.onRelease: a held key counts until it is let go", () => {
+  it("an a right after letting go of a held j waits, however long ago its last repeat was", () => {
+    const guard = new TypingGuard();
+    guard.onKey("j", 0);
+    guard.onKey("j", 30);
+    guard.onRelease("j", 200);
+    guard.onKey("a", 400);
+    expect(guard.mayAnswerNow("a", 400, false)).toBe(false);
+    guard.onKey("a", 700);
+    expect(guard.mayAnswerNow("a", 700, false)).toBe(true);
+  });
+
+  it("changes nothing when another key came after the held one, or for an earlier time", () => {
+    const guard = new TypingGuard();
+    guard.onKey("j", 0);
+    guard.onKey("x", 10);
+    guard.onRelease("j", 500);
+    guard.onKey("a", 300);
+    expect(guard.mayAnswerNow("a", 300, false)).toBe(true);
+    const other = new TypingGuard();
+    other.onKey("j", 100);
+    other.onRelease("j", 50);
+    other.onKey("a", 360);
+    expect(other.mayAnswerNow("a", 360, false)).toBe(true);
+  });
+
+  it("records no key of its own", () => {
+    const guard = new TypingGuard();
+    guard.onKey("j", 0);
+    guard.onRelease("j", 100);
+    expect(guard.keyCount()).toBe(1);
+  });
+});

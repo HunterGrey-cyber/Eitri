@@ -7,6 +7,7 @@ import { initialState } from "./reducer";
 import { MARKDOWN_CACHE_LIMIT, isMarkdownCached, markdownParseCount } from "./markdown";
 import { lineDiffCount } from "./diff";
 import { timelineBuildCount } from "./timeline";
+import { timelineRowRenderCount } from "./components/MessageList";
 
 /* The panel's cost over a long conversation, counted rather than timed: jsdom's timing is not
    WebKitGTK's, and a count cannot be flaky. A conversation of more replies than the markdown cache
@@ -69,6 +70,14 @@ function mountLong() {
 }
 
 const textDeltas = (n: number) => Array.from({ length: n }, () => ({ type: "content_delta", kind: "text", text: "word " }));
+
+it("a k press renders the two rows the cursor left and reached, not the whole conversation", () => {
+  const { root } = mountLong();
+  const before = timelineRowRenderCount();
+  for (let i = 0; i < 10; i++) fireEvent.keyDown(root, { key: "k" });
+  console.log(`[long] rows rendered per k press over ${REPLIES + EDITS} rows: ${(timelineRowRenderCount() - before) / 10}`);
+  expect(timelineRowRenderCount() - before).toBe(20);
+});
 
 it("a k press diffs no finished Edit row again", () => {
   const { root } = mountLong();

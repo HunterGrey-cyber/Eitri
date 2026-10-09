@@ -13,6 +13,8 @@ import { noteUserScroll, RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT, type UserScroll
 import { pillLabel, pillShown } from "../pill";
 import { parsePath } from "../paths";
 import type { PathRef } from "../paths";
+import { CursorBand } from "../cursorBand";
+import { conversationRows } from "../nav";
 
 type Props = {
   state: AgentUiState;
@@ -210,6 +212,12 @@ export function MessageList({
    *  card landed below a reader rewrote `↓ ⚑ approval` as `↓ Jump to bottom` (the phase-3 GUI pass,
    *  2026-09-25). Assigned right after `onScroll` is defined, on every render. */
   const onScrollRef = useRef<() => void>(() => {});
+  /** The cursor's fill (`../cursorBand`): the element, its animator, and the row it was last put on, by
+   *  timeline key. `placeBandRef` is the current render's placement, for the observer below. */
+  const bandElRef = useRef<HTMLDivElement>(null);
+  const bandRef = useRef<CursorBand | null>(null);
+  const bandRowKeyRef = useRef<string | null>(null);
+  const placeBandRef = useRef<(glide: boolean) => void>(() => {});
 
   /* Measure the list width here because CSS size query containers caused stale `scrollTop` resets
      in WebKitGTK 2.52.6 when the status clock ticked during streaming. Containers on `.row`,
@@ -235,6 +243,9 @@ export function MessageList({
       }
       // As the follow effect does, read the position first: a scroll whose event has not arrived yet
       // still decides whether this is a view that is following. Through the ref: see `onScrollRef`.
+      // A row changed size, or the list did: the cursor's band follows its row at once, before the end is
+      // read below, which the band's old extent could otherwise still reach past.
+      placeBandRef.current(false);
       onScrollRef.current();
       if (followingRef.current) follow(list);
     });
@@ -261,6 +272,8 @@ export function MessageList({
       }
     }
     for (const el of Array.from(list.children)) {
+      // The band changes size as it glides; it is not content, and is placed from the rows.
+      if (el === bandElRef.current) continue;
       if (!observed.has(el)) {
         observer.observe(el);
         observed.add(el);
@@ -556,6 +569,34 @@ export function MessageList({
      tool can be in flight. Use the shared `isUsableLink` predicate from `../timeline` to exclude
      `null` and "", matching `PermissionCard` without duplicating the guard. Legacy permissions
      carry null, so this marker does not render on that backend. */
+  /* The cursor's band goes on the cursor's row, found by structure (`conversationRows`), as every other
+     cursor-to-row lookup is. It glides when the cursor moved from a row that is still in the list; a row
+     that is gone (a tab switch, a cleared conversation) or a first placement puts it there at once. */
+  placeBandRef.current = (glide: boolean) => {
+    const list = listRef.current;
+    const el = bandElRef.current;
+    if (list === null || el === null) return;
+    const band = (bandRef.current ??= new CursorBand(el));
+    const row = conversationRows(list)[cursor];
+    band.place(
+      row === undefined ? null : { left: row.offsetLeft, top: row.offsetTop, width: row.offsetWidth, height: row.offsetHeight },
+      glide,
+    );
+  };
+  useLayoutEffect(() => {
+    const key = timeline[cursor]?.key ?? null;
+    const before = bandRowKeyRef.current;
+    bandRowKeyRef.current = key;
+    const glide = before !== null && key !== null && before !== key && timeline.some((item) => item.key === before);
+    placeBandRef.current(glide);
+  });
+  useEffect(() => () => bandRef.current?.stop(), []);
+
+  /** The card callbacks a row calls, through one ref that never changes, so a new callback from the
+   *  parent (they are made on every render) does not make every row render again. */
+  const rowHandlersRef = useRef<RowHandlers>({ onAnswerPermission, onPermissionReason });
+  rowHandlersRef.current = { onAnswerPermission, onPermissionReason };
+
   const awaitingPermission = new Set(state.pendingPermissions.map((p) => p.toolUseId).filter(isUsableLink));
 
   return (
@@ -584,105 +625,173 @@ export function MessageList({
             is most of them. */}
         {state.history !== null && <HistoryNotice notice={state.history} />}
         {timeline.map((item, index) => {
-          const current = index === cursor;
-          switch (item.kind) {
-            case "prompt": {
-              // Plain text, never markdown: this is what the user typed, and parsing it would render
-              // their literal backticks and asterisks as formatting they did not ask for.
-              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
-              return (
-                <Row key={item.key} kind="prompt" sign="›" current={current} className={yanked} navStop="row">
-                  {item.text}
-                </Row>
-              );
-            }
-            case "message": {
-              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
-              return (
-                <Row key={item.key} kind="assistant" sign="" current={current} className={yanked} navStop="row">
-                  {/* `renderMarkdown` (`../markdown.ts`) is marked.parse, now with a `code` renderer
-                      that runs highlight.js against nvim's own syntax colours, then DOMPurify.sanitize
-                      -- one function so no caller can run half of it. */}
-                  <MarkdownBody text={item.text} />
-                </Row>
-              );
-            }
-            case "tool": {
-              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
-              const abandoned = isAbandonedCall(item.call, state, sessionEnded);
-              return (
-                <Row key={item.key} kind="tool" sign={toolSign(item.call, abandoned)} current={current} className={yanked} navStop="row">
-                  <div data-awaiting-permission={awaitingPermission.has(item.call.toolUseId) ? "true" : undefined}>
-                    {/* A gated call shows "waiting for approval" because its permission card already shows
-                        the invocation. Repeating it here would make a pending call look as if it had run. */}
-                    {renderToolCall(item.call, expanded[item.key] === true, {
-                      gated: awaitingPermission.has(item.call.toolUseId),
-                      detailed,
-                      expanded: expanded[item.key] === true,
-                      abandoned,
-                    })}
-                  </div>
-                </Row>
-              );
-            }
-            case "permission": {
-              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
-              return (
-                <Row key={item.key} kind="permission" sign="!" current={current} className={yanked} navStop="row">
-                  <PermissionCard
-                    request={item.request}
-                    sessionEnded={sessionEnded}
-                    ruleOffer={ruleOffers?.[item.request.permissionId] ?? null}
-                    alreadyAnswered={answeredPermissions?.has(item.request.permissionId) ?? false}
-                    onAnswer={onAnswerPermission}
-                    onReasonChange={onPermissionReason}
-                  />
-                </Row>
-              );
-            }
-            case "ending": {
-              // Where a turn that did not complete stopped, in plain words (`turnEnding.ts`), muted and
-              // signed `·` like the other "this is over" rows. A `j`/`k` stop like every conversation
-              // row, so `y` copies what it says. Plain text, never markdown: the message is the
-              // provider's, and its line breaks are kept by the row's own CSS.
-              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
-              return (
-                <Row key={item.key} kind="ending" sign="·" current={current} className={yanked} navStop="row">
-                  {/* The reset time the ending itself kept: a later limit report never changes an older row. */}
-                  {turnEndingText(item.ending, item.ending.resetsAt ?? null)}
-                </Row>
-              );
-            }
-            case "run": {
-              // A run replaces its calls with a summary such as `Read ×3 · Bash ×2`.
-              // Enter uses `toggle-expand` on the run row key to reveal the calls.
-              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
-              return (
-                <Row key={item.key} kind="tool-run" sign="✓" current={current} className={yanked} navStop="row">
-                  <div className="tool-card tool-card-run">
-                    {runSummary(item.calls)} <span className="fold-marker" aria-label="collapsed">▸</span>
-                  </div>
-                </Row>
-              );
-            }
-            default: {
-              // Exhaustiveness guard. Without it, a fifth `TimelineItem` kind gaining no case here
-              // renders as nothing: this `.map()` callback has no pinned return type, a missing case
-              // falls through to `undefined`, `undefined` is a valid `ReactNode`, and `tsc -b` stays
-              // clean -- exactly how the "prompt" case's own placeholder was allowed to hide for a
-              // whole task (see the git history of this switch). Assigning `item` to `never` turns
-              // that same mistake into a compile error instead of an invisible blank row.
-              const _exhaustive: never = item;
-              return _exhaustive;
-            }
-          }
+          // Everything a row draws is in these props, each a value or the timeline's own item, so a
+          // cursor move renders the two rows it changes and no other (`TimelineRow`).
+          const call = item.kind === "tool" ? item.call : null;
+          const permissionId = item.kind === "permission" ? item.request.permissionId : null;
+          return (
+            <TimelineRow
+              key={item.key}
+              item={item}
+              current={index === cursor}
+              yanked={item.key === yankedKey}
+              expanded={expanded[item.key] === true}
+              detailed={detailed}
+              sessionEnded={sessionEnded}
+              abandoned={call !== null && isAbandonedCall(call, state, sessionEnded)}
+              gated={call !== null && awaitingPermission.has(call.toolUseId)}
+              ruleOffer={permissionId === null ? null : (ruleOffers?.[permissionId] ?? null)}
+              alreadyAnswered={permissionId !== null && (answeredPermissions?.has(permissionId) ?? false)}
+              handlers={rowHandlersRef}
+            />
+          );
         })}
         {/* No end-of-list sentinel any more: it existed for the smooth `scrollIntoView` a new row used
             to get, and following is a snap to `scrollHeight` now (the GUI pass, 2026-09-24). */}
+        {/* The cursor's fill, behind the rows (`../cursorBand`). Hidden from assistive technology and from
+            VISUAL's selection (`[aria-hidden="true"]` is chrome there). */}
+        <div className="cursor-band" aria-hidden="true" ref={bandElRef} />
       </div>
     </>
   );
 }
+
+type RowHandlers = {
+  onAnswerPermission: Props["onAnswerPermission"];
+  onPermissionReason: Props["onPermissionReason"];
+};
+
+type TimelineRowProps = {
+  item: TimelineItem;
+  current: boolean;
+  yanked: boolean;
+  expanded: boolean;
+  detailed: boolean;
+  sessionEnded: boolean;
+  /** A tool call whose result can never arrive (`isAbandonedCall`). */
+  abandoned: boolean;
+  /** A tool call a card is waiting on. */
+  gated: boolean;
+  /** A card's offered rule, exactly as Rust offered it. */
+  ruleOffer: string | null;
+  alreadyAnswered: boolean;
+  handlers: { current: RowHandlers };
+};
+
+let rowRenders = 0;
+/** How many times a conversation row has rendered in this page (the measurement of `TimelineRow`). */
+export function timelineRowRenderCount(): number {
+  return rowRenders;
+}
+
+/** One conversation row. Memoized on its props, which are values or the timeline's own item: a held
+ *  `j`/`k` moves the cursor several rows a second, and rendering every row of a long conversation for
+ *  each move cost a frame or more. */
+const TimelineRow = memo(function TimelineRow({
+  item,
+  current,
+  yanked,
+  expanded,
+  detailed,
+  sessionEnded,
+  abandoned,
+  gated,
+  ruleOffer,
+  alreadyAnswered,
+  handlers,
+}: TimelineRowProps) {
+  rowRenders += 1;
+  switch (item.kind) {
+    case "prompt": {
+      // Plain text, never markdown: this is what the user typed, and parsing it would render
+      // their literal backticks and asterisks as formatting they did not ask for.
+      const yankedClass = yanked ? "row-yanked" : undefined;
+      return (
+        <Row kind="prompt" sign="›" current={current} className={yankedClass} navStop="row">
+          {item.text}
+        </Row>
+      );
+    }
+    case "message": {
+      const yankedClass = yanked ? "row-yanked" : undefined;
+      return (
+        <Row kind="assistant" sign="" current={current} className={yankedClass} navStop="row">
+          {/* `renderMarkdown` (`../markdown.ts`) is marked.parse, now with a `code` renderer
+              that runs highlight.js against nvim's own syntax colours, then DOMPurify.sanitize
+              -- one function so no caller can run half of it. */}
+          <MarkdownBody text={item.text} />
+        </Row>
+      );
+    }
+    case "tool": {
+      const yankedClass = yanked ? "row-yanked" : undefined;
+      return (
+        <Row kind="tool" sign={toolSign(item.call, abandoned)} current={current} className={yankedClass} navStop="row">
+          <div data-awaiting-permission={gated ? "true" : undefined}>
+            {/* A gated call shows "waiting for approval" because its permission card already shows
+                the invocation. Repeating it here would make a pending call look as if it had run. */}
+            {renderToolCall(item.call, expanded, {
+              gated,
+              detailed,
+              expanded,
+              abandoned,
+            })}
+          </div>
+        </Row>
+      );
+    }
+    case "permission": {
+      const yankedClass = yanked ? "row-yanked" : undefined;
+      return (
+        <Row kind="permission" sign="!" current={current} className={yankedClass} navStop="row">
+          <PermissionCard
+            request={item.request}
+            sessionEnded={sessionEnded}
+            ruleOffer={ruleOffer}
+            alreadyAnswered={alreadyAnswered}
+            onAnswer={(...args) => handlers.current.onAnswerPermission(...args)}
+            onReasonChange={(id, reason) => handlers.current.onPermissionReason?.(id, reason)}
+          />
+        </Row>
+      );
+    }
+    case "ending": {
+      // Where a turn that did not complete stopped, in plain words (`turnEnding.ts`), muted and
+      // signed `·` like the other "this is over" rows. A `j`/`k` stop like every conversation
+      // row, so `y` copies what it says. Plain text, never markdown: the message is the
+      // provider's, and its line breaks are kept by the row's own CSS.
+      const yankedClass = yanked ? "row-yanked" : undefined;
+      return (
+        <Row kind="ending" sign="·" current={current} className={yankedClass} navStop="row">
+          {/* The reset time the ending itself kept: a later limit report never changes an older row. */}
+          {turnEndingText(item.ending, item.ending.resetsAt ?? null)}
+        </Row>
+      );
+    }
+    case "run": {
+      // A run replaces its calls with a summary such as `Read ×3 · Bash ×2`.
+      // Enter uses `toggle-expand` on the run row key to reveal the calls.
+      const yankedClass = yanked ? "row-yanked" : undefined;
+      return (
+        <Row kind="tool-run" sign="✓" current={current} className={yankedClass} navStop="row">
+          <div className="tool-card tool-card-run">
+            {runSummary(item.calls)} <span className="fold-marker" aria-label="collapsed">▸</span>
+          </div>
+        </Row>
+      );
+    }
+    default: {
+      // Exhaustiveness guard. Without it, a fifth `TimelineItem` kind gaining no case here
+      // renders as nothing: this component has no pinned return type, a missing case
+      // falls through to `undefined`, `undefined` is a valid `ReactNode`, and `tsc -b` stays
+      // clean -- exactly how the "prompt" case's own placeholder was allowed to hide for a
+      // whole task (see the git history of this switch). Assigning `item` to `never` turns
+      // that same mistake into a compile error instead of an invisible blank row.
+      const _exhaustive: never = item;
+      return _exhaustive;
+    }
+  }
+});
 
 /** One reply's rendered HTML, made when the reply first shows and again only when its text changes.
  *  The list renders every row on every update (a cursor move, a streamed batch), and leaving that to

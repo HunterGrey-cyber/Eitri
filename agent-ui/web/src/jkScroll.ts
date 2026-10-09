@@ -247,10 +247,21 @@ export function readBoxState(list: HTMLElement, box: HTMLElement): BoxState {
 type Running = { frame: number; target: number; lastWritten: number };
 const running = new WeakMap<HTMLElement, Running>();
 
+/** A held `j`/`k`'s glide (`./jkHold`), by list: what `isListScrollAnimating` and `cancelListScroll` must
+ *  know about it. Registered here rather than imported from there, since that module builds on this one. */
+export type HoldHandle = { lastWritten: () => number; cancel: () => void };
+const holds = new WeakMap<HTMLElement, HoldHandle>();
+
+/** `./jkHold` registers a glide on `list` (`null`: it ended). */
+export function registerHold(list: HTMLElement, hold: HoldHandle | null): void {
+  if (hold === null) holds.delete(list);
+  else holds.set(list, hold);
+}
+
 /** Whether to skip the ease-out: the system asks for reduced motion (WebKitGTK follows GTK's
  *  `gtk-enable-animations` here), or there is no way to ask -- an environment without `matchMedia` gets
  *  the plain, immediate scroll rather than a guess. */
-function reducedMotion(): boolean {
+export function reducedMotion(): boolean {
   return typeof window === "undefined" || typeof window.matchMedia !== "function"
     ? true
     : window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -262,6 +273,8 @@ function reducedMotion(): boolean {
  *  outside the view for a moment -- and a scroll event that finds the list anywhere else (a wheel, say)
  *  is somebody else's, and is judged as any other. */
 export function isListScrollAnimating(list: HTMLElement): boolean {
+  const hold = holds.get(list);
+  if (hold !== undefined && Math.abs(list.scrollTop - hold.lastWritten()) <= SLACK_PX) return true;
   const state = running.get(list);
   return state !== undefined && Math.abs(list.scrollTop - state.lastWritten) <= SLACK_PX;
 }
@@ -281,6 +294,7 @@ export function settleListScroll(list: HTMLElement): void {
  *  replaces whatever was easing: the "has somebody else written the list?" check inside the ease cannot see
  *  a restore that writes the very position the ease began at. */
 export function cancelListScroll(list: HTMLElement): void {
+  holds.get(list)?.cancel();
   const state = running.get(list);
   if (state === undefined) return;
   cancelAnimationFrame(state.frame);
@@ -298,32 +312,60 @@ const FIRST_FRAME_MS = 16;
 
 const easeOut = (t: number) => 1 - (1 - t) ** 3;
 
+/** The shortest and longest a move that starts at speed takes (`scrollListTo`'s `v0`). Short enough that
+ *  the stop reads as the end of the glide, not as a second movement; the upper bound keeps a far target
+ *  from dragging on. */
+const MIN_SETTLE_MS = 60;
+const MAX_SETTLE_MS = 250;
+
+/** Where a move from `from` to `to` that starts at `v0` px/ms is, `u` of the way through its `duration`
+ *  (0..1): the cubic that leaves at that speed and arrives at rest, so a glide's stop has no jolt in it. */
+function settleAt(from: number, to: number, v0: number, duration: number, u: number): number {
+  const h01 = u * u * (3 - 2 * u);
+  const h10 = u * (1 - u) * (1 - u);
+  return from + (to - from) * h01 + v0 * duration * h10;
+}
+
 /** Moves `list` to `target` (a whole pixel inside its range). With `animate` the move eases out over
- *  `SCROLL_ANIMATION_MS`; without it -- a held key's repeats, a count, a system with animations off, a
+ *  `SCROLL_ANIMATION_MS`, or, given a starting speed `v0` (px/ms), leaves at that speed and comes to rest;
+ *  without it -- a count, a system with animations off, a
  *  move too small to see -- it is immediate. An animation yields the moment anything else writes the list's
  *  `scrollTop` (the follow-the-newest snap, a wheel, a restored view), and never fights it.
  *
  *  The first frame's share of an eased move is written in the same task as the call, not left to the first
  *  animation frame: a scroll event queued by an earlier write is delivered before that frame, and one that
  *  finds the view still at the bottom re-arms following -- undoing the `k` that began this very move. */
-export function scrollListTo(list: HTMLElement, target: number, animate: boolean): void {
+export function scrollListTo(list: HTMLElement, target: number, animate: boolean, v0 = 0): void {
   cancelListScroll(list);
   const from = list.scrollTop;
   if (Math.abs(target - from) < SLACK_PX / 2) return;
-  if (!animate || reducedMotion() || Math.abs(target - from) < MIN_EASED_PX) {
+  if (!animate || reducedMotion() || (v0 === 0 && Math.abs(target - from) < MIN_EASED_PX)) {
     list.scrollTop = target;
     return;
   }
+  // A move that starts at speed (a released glide, `./jkHold`) keeps that speed for its first instant and
+  // comes to rest at the target. Its length is what the speed asks for -- the time an ease-out from that
+  // speed takes to cover the distance -- within bounds. A speed away from the target is not kept.
+  const toward = Math.sign(v0) === Math.sign(target - from) ? v0 : 0;
+  const duration =
+    toward === 0
+      ? SCROLL_ANIMATION_MS
+      : Math.min(MAX_SETTLE_MS, Math.max(MIN_SETTLE_MS, (3 * Math.abs(target - from)) / Math.abs(toward)));
+  // No faster than a curve that never passes the target can start: at the shortest duration a short stop
+  // would otherwise run past it and come back.
+  const speed = Math.sign(toward) * Math.min(Math.abs(toward), (3 * Math.abs(target - from)) / duration);
+  const at = (t: number) =>
+    speed === 0 ? from + (target - from) * easeOut(t) : settleAt(from, target, speed, duration, t);
   const startedAt = performance.now() - FIRST_FRAME_MS;
-  list.scrollTop = Math.round(from + (target - from) * easeOut(FIRST_FRAME_MS / SCROLL_ANIMATION_MS));
+  list.scrollTop = Math.round(at(FIRST_FRAME_MS / duration));
   const state: Running = { frame: 0, target, lastWritten: list.scrollTop };
   const step = (now: number) => {
     if (Math.abs(list.scrollTop - state.lastWritten) > SLACK_PX) {
       running.delete(list);
       return;
     }
-    const t = Math.min(1, Math.max(0, now - startedAt) / SCROLL_ANIMATION_MS);
-    list.scrollTop = t >= 1 ? target : Math.round(from + (target - from) * easeOut(t));
+    const t = Math.min(1, Math.max(0, now - startedAt) / duration);
+    list.scrollTop = t >= 1 ? target : Math.round(at(t));
     state.lastWritten = list.scrollTop;
     if (t >= 1) running.delete(list);
     else state.frame = requestAnimationFrame(step);

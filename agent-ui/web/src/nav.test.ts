@@ -804,3 +804,47 @@ describe("clipBox and visibleBox", () => {
     expect(hintVisible(byId("stop"), root)).toBe(false);
   });
 });
+
+describe("the stop lookup is read once and kept until the stops change", () => {
+  function list(): HTMLElement {
+    document.body.innerHTML = `
+      <div id="root">
+        <div data-nav-stop="row" id="a"><p id="text">hello</p></div>
+        <div data-nav-stop="row" id="b"></div>
+      </div>`;
+    return document.getElementById("root")!;
+  }
+
+  it("hands back the same rows while nothing that makes a stop changed: text, or a reply re-rendered with no stop in it", () => {
+    const root = list();
+    const first = conversationRows(root);
+    byId("text").textContent = "hello again";
+    byId("a").insertAdjacentHTML("beforeend", "<p>more <b>reply</b></p>");
+    expect(conversationRows(root)).toBe(first);
+    expect(first.map((r) => r.id)).toEqual(["a", "b"]);
+  });
+
+  it("sees a row added, removed or renamed at once, in the same task as the change", () => {
+    const root = list();
+    conversationRows(root);
+    root.insertAdjacentHTML("beforeend", '<div data-nav-stop="row" id="c"></div>');
+    expect(conversationRows(root).map((r) => r.id)).toEqual(["a", "b", "c"]);
+    byId("a").remove();
+    expect(conversationRows(root).map((r) => r.id)).toEqual(["b", "c"]);
+    byId("b").setAttribute("data-nav-stop", "ended");
+    expect(conversationRows(root).map((r) => r.id)).toEqual(["c"]);
+  });
+
+  it("still never counts a stop a reply's own HTML put inside a row, however it arrived", () => {
+    const root = list();
+    conversationRows(root);
+    byId("a").insertAdjacentHTML("beforeend", '<div data-nav-stop="row" id="fake"></div>');
+    expect(conversationRows(root).map((r) => r.id)).toEqual(["a", "b"]);
+    expect(rowIndexOf(root, byId("b"))).toBe(1);
+  });
+
+  it("is frozen: a caller cannot change what the next one reads", () => {
+    const root = list();
+    expect(Object.isFrozen(conversationRows(root))).toBe(true);
+  });
+});

@@ -2159,11 +2159,17 @@ describe("index.css cascade (which rule actually wins)", () => {
 
   it("draws the panel's cursor solid with focus and hollow without", () => {
     const row = (focused: string) =>
-      `<div class="message-list" data-focused="${focused}"><div class="row row-tool row-current"><span class="row-sign">⚙</span><div class="row-body">x</div></div></div>`;
+      `<div class="message-list" data-focused="${focused}"><div class="row row-tool row-current"><span class="row-sign">⚙</span><div class="row-body">x</div></div>` +
+      `<div class="cursor-band" aria-hidden="true"></div></div>`;
     const solid = computed(row("true"), ".row-sign");
     expect(solid.background).toBe("var(--nv-fg)");
     expect(solid.color).toBe("var(--nv-bg)");
-    expect(computed(row("true"), ".row").background).toBe("var(--nv-cursorline)");
+    // The fill is the band behind the rows (`cursorBand.ts`), not the conversation row's own.
+    expect(computed(row("true"), ".row").background).not.toBe("var(--nv-cursorline)");
+    expect(computed(row("true"), ".cursor-band").background).toBe("var(--nv-cursorline)");
+    expect(computed(row("true"), ".cursor-band").display).not.toBe("none");
+    expect(computed(row("true"), ".cursor-band").pointerEvents).toBe("none");
+    expect(computed(row("false"), ".cursor-band").display).toBe("none");
     const hollow = computed(row("false"), ".row-sign");
     // jsdom resolves `background: none` to a transparent colour rather than echoing it, so this
     // asserts what matters: neither fill survives.

@@ -16,7 +16,8 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App from "./App";
 import { initialState } from "./reducer";
 import type { AgentUiState, Hello } from "./types";
-import { SCROLL_ANIMATION_MS } from "./jkScroll";
+import { decideLanding, READING_LINE, SCROLL_ANIMATION_MS } from "./jkScroll";
+import { TYPING_GUARD_MS } from "./typingGuard";
 
 afterEach(cleanup);
 
@@ -450,19 +451,18 @@ describe("the ease-out", () => {
     expect(list.scrollTop).toBe(227);
   });
 
-  it("a key's repeat, and a count, scroll at once", () => {
+  it("a count scrolls at once", () => {
     const { container } = started();
     prompts("a", "b", "c");
     const list = fakeLayout(container, [100, 990, 100]);
     press("g");
     press("g");
     press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
     queue.clear();
-    press("j", { repeat: true });
-    expect(list.scrollTop).toBe(STEP);
     press("3");
     press("j");
-    expect(list.scrollTop).toBe(4 * STEP);
+    expect(list.scrollTop).toBe(3 * STEP);
     expect(queue.size).toBe(0);
   });
 
@@ -528,6 +528,20 @@ describe("the ease-out", () => {
     expect(list.scrollTop).toBe(atSwitch);
   });
 
+  it("without an animation (reduced motion, or no way to ask) a held key's repeats step at once", () => {
+    (window as unknown as { matchMedia: unknown }).matchMedia = () => ({ matches: true });
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [100, 990, 100]);
+    press("g");
+    press("g");
+    press("j");
+    queue.clear();
+    press("j", { repeat: true });
+    expect(list.scrollTop).toBe(STEP);
+    expect(queue.size).toBe(0);
+  });
+
   it("without an animation (reduced motion, or no way to ask) the same press lands at once", () => {
     (window as unknown as { matchMedia: unknown }).matchMedia = () => ({ matches: true });
     const { container } = started();
@@ -537,5 +551,377 @@ describe("the ease-out", () => {
     press("g");
     press("j");
     expect(list.scrollTop).toBe(227);
+  });
+});
+
+describe("a held j or k glides", () => {
+  /** The key-repeat interval these tests hold keys at: 31 a second, two whole frames. */
+  const REPEAT_MS = 32;
+  let now = 0;
+  let nextId = 1;
+  let queue = new Map<number, FrameRequestCallback>();
+  let posted: Record<string, unknown>[] = [];
+
+  /** Runs animation frames every 16ms for `ms`. */
+  function advance(ms: number) {
+    const end = now + ms;
+    while (now < end) {
+      now = Math.min(end, now + 16);
+      const due = [...queue.entries()];
+      queue = new Map();
+      for (const [, callback] of due) act(() => callback(now));
+    }
+  }
+
+  /** Holds `key` for `ms` after its first press: a repeat every `every` ms, frames in between. Returns
+   *  the list's `scrollTop` and the cursor's row text after each frame. */
+  function holdFor(container: HTMLElement, list: HTMLElement, key: string, ms: number, every = REPEAT_MS) {
+    const seen: { scrollTop: number; cursor: string | null }[] = [];
+    let held = 0;
+    while (held < ms) {
+      press(key, { repeat: true });
+      for (let t = 0; t < every; t += 16) {
+        advance(16);
+        seen.push({ scrollTop: list.scrollTop, cursor: current(container) });
+      }
+      held += every;
+    }
+    return seen;
+  }
+
+  const letGo = (key: string) => fireEvent.keyUp(document.activeElement ?? document.body, { key });
+
+  beforeEach(() => {
+    now = 5000;
+    nextId = 1;
+    queue = new Map();
+    posted = [];
+    (window as unknown as { webkit: unknown }).webkit = {
+      messageHandlers: { eitriAgent: { postMessage: (m: string) => posted.push(JSON.parse(m)) } },
+    };
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      const id = nextId++;
+      queue.set(id, cb);
+      return id;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => {
+      queue.delete(id);
+    });
+    // One clock for the frames, `performance.now()` and the keydowns' own timestamps (jsdom takes those
+    // from `Date.now()`), as a browser has.
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    vi.spyOn(Date, "now").mockImplementation(() => 1_000_000 + now);
+    (window as unknown as { matchMedia: unknown }).matchMedia = () => ({ matches: false });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    delete (window as unknown as { matchMedia?: unknown }).matchMedia;
+  });
+
+  /** Short rows and long ones, one after another. */
+  const HEIGHTS = [100, 990, 40, 40, 600, 30, 1500, 60, 800, 40, 1200, 50];
+  const TEXTS = HEIGHTS.map((_, i) => `r${i}`);
+  /** 3 lines per repeat interval (the measured one, from the second repeat on), 16ms a frame. */
+  const PER_FRAME = ((3 * LINE) / REPEAT_MS) * 16;
+
+  function heldConversation() {
+    const rendered = started();
+    prompts(...TEXTS);
+    const list = fakeLayout(rendered.container, HEIGHTS);
+    press("g");
+    press("g");
+    advance(200);
+    return { ...rendered, list };
+  }
+
+  it("moves the view a little every frame at one steady speed, over short rows and long ones alike", () => {
+    const { container, list } = heldConversation();
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    const seen = holdFor(container, list, "j", 2500);
+    const steps = seen.slice(1).map((f, i) => f.scrollTop - seen[i].scrollTop);
+    // Never a jump: no frame moves more than a frame's worth at speed (plus the drift to the reading
+    // line and rounding), and once the line is on its reading line every frame moves the same.
+    for (const step of steps) {
+      expect(step).toBeGreaterThanOrEqual(0);
+      expect(step).toBeLessThanOrEqual(PER_FRAME * 1.6 + 1);
+    }
+    const settled = steps.slice(-40);
+    for (const step of settled) expect(Math.abs(step - PER_FRAME)).toBeLessThanOrEqual(1.5);
+    // It passed rows of 30px and of 1,500px on the way.
+    expect(new Set(seen.map((f) => f.cursor)).size).toBeGreaterThan(5);
+  });
+
+  it("keeps the cursor on the row under the reading line, which is always on screen", () => {
+    const { container, list } = heldConversation();
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    const seen = holdFor(container, list, "j", 2500);
+    let y = 0;
+    const spans = HEIGHTS.map((h) => {
+      const span = { top: y, bottom: y + h };
+      y += h;
+      return span;
+    });
+    for (const frame of seen.slice(-40)) {
+      const row = spans[TEXTS.indexOf(frame.cursor!)];
+      const reading = frame.scrollTop + 400 * READING_LINE;
+      // On the reading line, give or take a frame's travel and the line's drift.
+      expect(row.top).toBeLessThanOrEqual(reading + PER_FRAME + 2);
+      expect(row.bottom).toBeGreaterThanOrEqual(reading - PER_FRAME - 2);
+      expect(row.bottom).toBeGreaterThan(frame.scrollTop);
+      expect(row.top).toBeLessThan(frame.scrollTop + 400);
+    }
+  });
+
+  it("letting go stops it within a short distance, the cursor where it was, the row where a press would leave it", () => {
+    const { container, list } = heldConversation();
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    holdFor(container, list, "j", 1200);
+    const cursorAtRelease = current(container);
+    const atRelease = list.scrollTop;
+    letGo("j");
+    advance(400);
+    expect(queue.size).toBe(0);
+    expect(current(container)).toBe(cursorAtRelease);
+    // A short coast at most, plus what the cursor's row needs to land.
+    expect(list.scrollTop).toBeGreaterThanOrEqual(atRelease);
+    let y = 0;
+    const spans = HEIGHTS.map((h) => {
+      const span = { top: y, bottom: y + h };
+      y += h;
+      return span;
+    });
+    const row = spans[TEXTS.indexOf(cursorAtRelease!)];
+    const landing = decideLanding({
+      direction: 1,
+      view: { scrollTop: list.scrollTop, height: 400, maxScrollTop: y - 400 },
+      row,
+      line: LINE,
+    });
+    expect(landing.scrollTop).toBeLessThanOrEqual(list.scrollTop);
+    // A press from there is an ordinary press again.
+    const before = current(container);
+    press("j");
+    expect(current(container) !== before || list.scrollTop !== landing.scrollTop).toBe(true);
+  });
+
+  it("k is the mirror: up at the same speed, the cursor on the row under the line", () => {
+    const { container, list } = heldConversation();
+    press("G", { shiftKey: true });
+    advance(SCROLL_ANIMATION_MS + 40);
+    const bottom = list.scrollTop;
+    press("k");
+    advance(SCROLL_ANIMATION_MS + 40);
+    const seen = holdFor(container, list, "k", 2500);
+    const steps = seen.slice(1).map((f, i) => seen[i].scrollTop - f.scrollTop);
+    for (const step of steps) expect(step).toBeGreaterThanOrEqual(0);
+    for (const step of steps.slice(-40)) expect(Math.abs(step - PER_FRAME)).toBeLessThanOrEqual(1.5);
+    expect(list.scrollTop).toBeLessThan(bottom - 1500);
+    letGo("k");
+  });
+
+  it("stops at the last row with the view at the end, and the next repeat is an ordinary press there", () => {
+    const { container, list } = heldConversation();
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    holdFor(container, list, "j", 6000);
+    expect(current(container)).toBe(TEXTS[TEXTS.length - 1]);
+    const total = HEIGHTS.reduce((a, b) => a + b, 0);
+    expect(list.scrollTop).toBe(total - 400);
+    advance(300);
+    expect(queue.size).toBe(0);
+    // Held on: nothing more to glide to, and nothing moves.
+    press("j", { repeat: true });
+    advance(100);
+    expect(queue.size).toBe(0);
+    expect(current(container)).toBe(TEXTS[TEXTS.length - 1]);
+    letGo("j");
+  });
+
+  it("a missing repeat ends it as letting go would", () => {
+    const { container, list } = heldConversation();
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    holdFor(container, list, "j", 600);
+    advance(600); // no repeat, no keyup: the release was lost
+    expect(queue.size).toBe(0);
+    const at = list.scrollTop;
+    advance(200);
+    expect(list.scrollTop).toBe(at);
+  });
+
+  it("a frame the page was too busy to draw neither ends the hold nor leaps to make up the time", () => {
+    const { container, list } = heldConversation();
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    holdFor(container, list, "j", 1200);
+    // 150ms with no frame and no repeat delivered: the page was busy; the repeats queued meanwhile come
+    // after the late frame.
+    now += 150;
+    const before = list.scrollTop;
+    const due = [...queue.values()];
+    queue = new Map();
+    for (const callback of due) act(() => callback(now));
+    expect(queue.size).toBe(1);
+    expect(list.scrollTop - before).toBeLessThanOrEqual(PER_FRAME * (34 / 16) + 2);
+    // The queued repeats arrive, and the glide goes on at its speed rather than gathering again from rest.
+    press("j", { repeat: true });
+    const seen = holdFor(container, list, "j", 192);
+    const steps = seen.slice(1).map((f, i) => f.scrollTop - seen[i].scrollTop);
+    for (const step of steps) expect(Math.abs(step - PER_FRAME)).toBeLessThanOrEqual(3);
+    letGo("j");
+  });
+
+  it("a key that ends a hold is judged from the release, even when the repeats stopped arriving well before it", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { container } = started();
+    prompts("a", "b");
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "ls" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: { command: "ls" } },
+    );
+    prompts("c", "d", "e");
+    const rows = Array.from(container.querySelectorAll('.message-list [data-nav-stop="row"]'));
+    const list = fakeLayout(container, rows.map((row) => (row.classList.contains("row-permission") ? 300 : 120)));
+    press("g");
+    press("g");
+    advance(300);
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    let guard = 0;
+    while (!container.querySelector(".row-current.row-permission") && guard++ < 100) holdFor(container, list, "j", REPEAT_MS);
+    expect(container.querySelector(".row-current.row-permission")).not.toBeNull();
+    // The page stalls: no frame and no repeat for 300ms, and the next key is `a`. Measured from the last
+    // repeat it stands alone; but the key was held until `a` came.
+    now += 300;
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+    act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50));
+    expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+  });
+
+  it("an overlay that opens while a key is held stops the glide, and the repeats go to the overlay", () => {
+    const { container, list } = heldConversation();
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    holdFor(container, list, "j", 300);
+    dispatch({ kind: "open_keymap" });
+    const at = list.scrollTop;
+    const cursorAt = current(container);
+    holdFor(container, list, "j", 200);
+    expect(list.scrollTop).toBe(at);
+    expect(current(container)).toBe(cursorAt);
+  });
+
+  it("an arrival stops it where it is", () => {
+    const { container, list } = heldConversation();
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    holdFor(container, list, "j", 600);
+    dispatch({ kind: "pane_focus", focused: false });
+    const at = list.scrollTop;
+    advance(300);
+    expect(list.scrollTop).toBe(at);
+    expect(queue.size).toBe(0);
+  });
+
+  it("the cursor's band glides from the row it left to the row it reached, on a single press too", () => {
+    const { container } = heldConversation();
+    const rows = Array.from(container.querySelectorAll<HTMLElement>('.message-list [data-nav-stop="row"]'));
+    let y = 0;
+    rows.forEach((row, i) => {
+      const at = y;
+      y += HEIGHTS[i];
+      Object.defineProperty(row, "offsetTop", { value: at, configurable: true });
+      Object.defineProperty(row, "offsetHeight", { value: HEIGHTS[i], configurable: true });
+      Object.defineProperty(row, "offsetWidth", { value: 380, configurable: true });
+    });
+    const band = container.querySelector<HTMLElement>(".message-list > .cursor-band")!;
+    expect(band.getAttribute("aria-hidden")).toBe("true");
+    const bandTop = () => Number(/translate\([^,]+, ([-\d.]+)px\)/.exec(band.style.transform)![1]);
+    press("j");
+    advance(16);
+    expect(bandTop()).toBeGreaterThan(0);
+    expect(bandTop()).toBeLessThan(HEIGHTS[0]);
+    advance(200);
+    expect(bandTop()).toBe(HEIGHTS[0]);
+    expect(band.style.height).toBe(`${HEIGHTS[1]}px`);
+    // The row itself no longer carries the fill's class alone: the band is the fill.
+    expect(container.querySelector(".row-current .row-body")!.textContent).toBe("r1");
+  });
+
+  it("a count keeps its immediate steps, even on a repeat", () => {
+    const { container, list } = heldConversation();
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    queue.clear();
+    press("2");
+    press("j", { repeat: true });
+    expect(queue.size).toBe(0);
+    expect(list.scrollTop).toBeGreaterThan(0);
+    expect(current(container)).toBe("r1");
+  });
+
+  it("a/d wait the typing guard through a hold and after letting go, then answer the card the cursor is on", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const rendered = started();
+    const { container } = rendered;
+    events(
+      { type: "user_prompt_submitted", text: "go" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "assistant_message", turn_id: "t1", text: "x".repeat(10) },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "ls" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: { command: "ls" } },
+    );
+    const rows = container.querySelectorAll('.message-list [data-nav-stop="row"]');
+    const heights = Array.from(rows, (row) => (row.classList.contains("row-permission") ? 300 : 700));
+    const list = fakeLayout(container, heights);
+    press("g");
+    press("g");
+    advance(300);
+    act(() => vi.advanceTimersByTime(300));
+    press("j");
+    advance(SCROLL_ANIMATION_MS + 40);
+    // Hold until the card is the cursor's row.
+    let guard = 0;
+    while (!container.querySelector(".row-current.row-permission") && guard++ < 200) holdFor(container, list, "j", 33);
+    expect(container.querySelector(".row-current.row-permission")).not.toBeNull();
+    // An `a` while held answers nothing, and ends the hold.
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+    act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50));
+    expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+
+    // Hold again; let go 30ms after the last repeat; an `a` 240ms after letting go -- 270ms after the last
+    // repeat -- is still inside the window, which runs from the release.
+    advance(400);
+    act(() => vi.advanceTimersByTime(400));
+    press("k");
+    advance(SCROLL_ANIMATION_MS + 40);
+    holdFor(container, list, "k", 96);
+    advance(30);
+    letGo("k");
+    advance(240);
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+    act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50));
+    expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+
+    // Back on the card by single presses; a lone `a` past the window answers the card the cursor shows.
+    advance(400);
+    act(() => vi.advanceTimersByTime(400));
+    while (!container.querySelector(".row-current.row-permission") && guard++ < 400) {
+      press("j");
+      advance(SCROLL_ANIMATION_MS + 40);
+    }
+    advance(400);
+    act(() => vi.advanceTimersByTime(400));
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+    act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50));
+    const answers = posted.filter((m) => m.type === "permission_response");
+    expect(answers).toHaveLength(1);
+    expect(answers[0]).toMatchObject({ permission_id: "perm-1", decision: "allow" });
   });
 });

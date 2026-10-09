@@ -535,6 +535,10 @@ body,
      `overflow-x: auto` -- is untouched by it: those scroll inside their own box. `indexCss.test.ts`
      holds every `<pre>` the panel renders to one of those two. */
   overflow-wrap: anywhere;
+  /* The cursor's band (`.cursor-band`) is placed in the list's own content space and painted under the
+     rows: the list is its containing block and the stacking context it sits at the bottom of. */
+  position: relative;
+  isolation: isolate;
 }
 /* `.row-assistant pre` used to style every fenced code block here, back when `renderMarkdown` (then
    inlined in `MessageList.tsx`) used marked's plain default renderer and emitted a bare `<pre>`.
@@ -709,6 +713,28 @@ body,
    two cues must not fight each other for the same 2px border. */
 .row-current {
   background: var(--nv-cursorline);
+}
+/* In the conversation the fill is not the row's own: it is one band behind the rows that glides from the
+   row the cursor left to the row it reached, as Neovide's cursor glides (`cursorBand.ts`). Same token, same
+   full strength, so the same guaranteed contrast under `--nv-fg` text (the band's comment above). The
+   row's sign cell stays the row's. The band takes no pointer events and sits under every row's content
+   (`z-index: -1` in the list's stacking context), so it covers no text, selection or button. It is hidden
+   wherever the row fill was turned off: the panel without the keys, and VISUAL. */
+.message-list > .row-current {
+  background: none;
+}
+.cursor-band {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--nv-cursorline);
+}
+.cursor-band[data-row="none"],
+.message-list[data-focused="false"] > .cursor-band,
+.message-list[data-visual] > .cursor-band {
+  display: none;
 }
 /* The row `y`/`Y` just copied, flashed for 400ms (`App.tsx`'s `copied`, codecompanion's yank
    flash) so a keypress with no visible result of its own still tells the reader something happened.

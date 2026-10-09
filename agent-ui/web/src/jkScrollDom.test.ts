@@ -313,4 +313,26 @@ describe("scrollListTo -- the ease-out", () => {
     expect(mid).toBeGreaterThan(100);
     expect(list.scrollTop).toBe(100);
   });
+
+  it("a stop that starts at speed never runs past its target, however short it is", () => {
+    // A released glide at 2.2 px/ms with only 6px left to go: the shortest stop must not overshoot and come back.
+    for (const [from, to, v0] of [
+      [182, 188, 2.2],
+      [500, 400, -3],
+      [0, 40, 2.2],
+      [100, 400, 2.2],
+    ] as const) {
+      const list = fakeList({ scrollTop: from });
+      scrollListTo(list, to, true, v0);
+      const seen = [list.scrollTop];
+      for (let i = 0; i < 20; i++) {
+        advance(16);
+        seen.push(list.scrollTop);
+      }
+      const dir = Math.sign(to - from);
+      for (let i = 1; i < seen.length; i++) expect(dir * (seen[i] - seen[i - 1])).toBeGreaterThanOrEqual(0);
+      for (const top of seen) expect(dir * (top - to)).toBeLessThanOrEqual(0);
+      expect(list.scrollTop).toBe(to);
+    }
+  });
 });

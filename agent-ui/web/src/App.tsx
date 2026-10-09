@@ -18,6 +18,7 @@ import {
   settleListScroll,
   STEP_LINES,
 } from "./jkScroll";
+import { cancelHold, isHolding, keepHoldAlive, releaseHold, startHold } from "./jkHold";
 import { EMPTY_PANEL_TABLE, isPlainAnswerKey, resolveKey } from "./keymap";
 import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from "./keymap";
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
@@ -645,6 +646,10 @@ export default function App() {
    *. See
    *  `./keymap`'s own doc comment on `PanelMode`. */
   const [mode, setMode] = useState<PanelMode>("browse");
+  /** A held `j`/`k`'s glide (`./jkHold`): the last repeat's time on the keydowns' clock and on
+   *  `performance.now()`'s, to date its release for the typing guard, and which way it goes. */
+  const holdClockRef = useRef({ typed: 0, perf: 0 });
+  const holdDirectionRef = useRef<1 | -1>(1);
   /** Whether this pane has keyboard focus, reported by `shell` in `pane_focus`.
    *  Starts false because startup focuses the editor; `ready` resends the value to a new document.
    *  The mode block is bright only while the pane is focused, so it identifies which pane receives keys. */
@@ -1587,6 +1592,10 @@ export default function App() {
   useEffect(() => {
     if (keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null || confirm !== null || overlayOpen) {
       typingGuard.cancel();
+      // A held `j`/`k`'s glide stops where it is: the keys are the overlay's now, and its repeats must
+      // reach the overlay instead of moving the conversation behind it.
+      const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+      if (list !== null) cancelHold(list);
     }
   }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, linkPick, confirm, overlayOpen]);
   useEffect(() => () => void typingGuard.cancel(), [typingGuard]);
@@ -2434,7 +2443,12 @@ export default function App() {
       // the active tab's state, so one for any other tab -- a batch still in flight when the user
       // switched away -- is dropped here, before any of the arms below can touch `state`.
       if (!acceptsEnvelope(payload as { kind: string; tab?: number }, activeTabRef.current)) return;
-      if (CANCELS_WAITING_ANSWER.has(payload.kind)) typingGuard.cancel();
+      if (CANCELS_WAITING_ANSWER.has(payload.kind)) {
+        typingGuard.cancel();
+        // A held `j`/`k`'s glide stops where it is: the keys, or the view, are someone else's now.
+        const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+        if (list !== null) cancelHold(list);
+      }
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
       } else if (payload.kind === "editor_typing") {
@@ -4774,10 +4788,30 @@ export default function App() {
     // still cancel a waiting `a`/`d`/`D` and show a band notice. The key then continues normally.
     // Normalize WebKitGTK's Shift+Tab through `isShiftTab` to the walk key `Tab`.
     const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+    // A held `j`/`k` glides (`./jkHold`, started with the other motions below). A repeat of its key only
+    // keeps it going -- still a key to the guard below, and still the user's own scroll to the list. Any
+    // other key ends it first, as letting go would, and then acts on the panel as that leaves it. The
+    // release is recorded before this key is: the guard then judges the key against the moment the held
+    // one was let go, not against its last repeat.
+    const glidingList = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+    const keepsGliding =
+      glidingList !== null &&
+      isHolding(glidingList) &&
+      event.repeat &&
+      keepHoldAlive(glidingList, event.code || event.key, performance.now());
+    if (glidingList !== null && !keepsGliding) releaseHold(glidingList, performance.now());
     // The flash is the cancelled wait's own (`TypingGuard.defer`'s `cancelledFlash`): a cancelled
     // `f` or `L` says what did not happen, never the `a`/`d` text.
     const cancelled = typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, typedAt);
     if (cancelled !== null) showFlash(cancelled);
+    if (keepsGliding) {
+      holdClockRef.current = { typed: typedAt, perf: performance.now() };
+      noteUserScroll(glidingList, holdDirectionRef.current > 0 ? "down" : "up");
+      lastKeyWasKillRef.current = false;
+      tabAtKeyRef.current = null;
+      event.preventDefault();
+      return;
+    }
     // Remember whether the preceding key killed text in the composer, then record whether this key
     // does. Bare modifiers leave that state alone.
     const afterKill = lastKeyWasKillRef.current;
@@ -5122,6 +5156,50 @@ export default function App() {
       noteUserScroll(messageList, up ? "up" : "down");
     } else if (action.kind === "control") {
       noteUserScroll(messageList, "unknown");
+    }
+    // A held `j`/`k` (`./jkHold`): from its first repeat the view glides at a steady speed and the
+    // cursor follows the row under its line, instead of a jump per repeat. Only for the row cursor in
+    // BROWSE with no count (a count keeps its immediate steps), and only where the glide has somewhere to
+    // go and motion is allowed; otherwise the repeat is a press like any other, below.
+    if (
+      action.kind === "move" &&
+      event.repeat &&
+      count === null &&
+      !edgeFocused &&
+      mode === "browse" &&
+      frozenSnapshotRef.current === null &&
+      messageList !== null &&
+      root !== null &&
+      currentStop(root, cursor) === (conversationRows(root)[cursor] ?? null)
+    ) {
+      const heldKey = event.key;
+      const direction = action.delta;
+      const started = startHold({
+        list: messageList,
+        rows: () => conversationRows(root),
+        cursor,
+        direction,
+        code: event.code || event.key,
+        now: performance.now(),
+        onCursor: (index) => {
+          // The glide placed the view itself; the landing effect must not move it again. Only for a cursor
+          // that really moves: a "keep" no `[cursor]` effect consumes would swallow the next reveal.
+          if (index !== cursorRef.current) landingRef.current = "keep";
+          setCursor(index);
+        },
+        onRelease: (at) => {
+          // The guard's clock is the keydowns' own; the release is dated on it from the last repeat.
+          const clock = holdClockRef.current;
+          typingGuard.onRelease(heldKey, clock.typed + Math.max(0, at - clock.perf));
+        },
+      });
+      if (started) {
+        holdClockRef.current = { typed: typedAt, perf: performance.now() };
+        holdDirectionRef.current = direction;
+        markLandedCode(null);
+        event.preventDefault();
+        return;
+      }
     }
     // A press that arrives while the last one is still easing starts from where that one was going,
     // never from a frame in between: every decision below reads the list's geometry.
