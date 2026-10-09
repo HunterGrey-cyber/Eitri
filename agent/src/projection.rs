@@ -1192,6 +1192,21 @@ pub struct AgentSessionProjection {
     /// Changes whose call has not been folded yet, held and attached like a refusal.
     #[serde(skip)]
     pub changed_inputs_before_their_call: VecDeque<(String, InputChange)>,
+    /// Where each tool-use id's first call sits in `tool_calls`, so a completion, refusal or changed
+    /// input finds its call without searching every call of the session. Checked on every use and
+    /// rebuilt when `tool_calls` was changed other than by `apply` (it is a public field).
+    /// Public only so a literal with `..Default::default()` can still be written outside this crate;
+    /// nothing outside it can read or change what it holds.
+    #[serde(skip)]
+    pub call_index: CallIndex,
+}
+
+/// [`AgentSessionProjection::call_index`]: the position of each tool-use id's first call, valid for
+/// the first `covers` calls. Opaque outside this crate.
+#[derive(Debug, Clone, Default)]
+pub struct CallIndex {
+    first: HashMap<String, usize>,
+    covers: usize,
 }
 
 /// Appends `(id, value)`, replacing an earlier entry for the id and dropping the oldest past
@@ -1254,6 +1269,30 @@ pub struct HistoryNotice {
 }
 
 impl AgentSessionProjection {
+    /// The first call with `tool_use_id`, as a search from the front would find it.
+    fn call_mut(&mut self, tool_use_id: &str) -> Option<&mut ToolCallRecord> {
+        let index = &mut self.call_index;
+        if index.covers != self.tool_calls.len() {
+            index.first.clear();
+            for (at, call) in self.tool_calls.iter().enumerate() {
+                index.first.entry(call.tool_use_id.clone()).or_insert(at);
+            }
+            index.covers = self.tool_calls.len();
+        }
+        match index.first.get(tool_use_id) {
+            Some(&at) if self.tool_calls[at].tool_use_id == tool_use_id => self.tool_calls.get_mut(at),
+            // Not indexed (a refusal ahead of its call, usually), or out of step with a list changed in
+            // place: the search the index stands in for, so the answer is always the one it gives. A
+            // wrong entry is rebuilt on the next use.
+            stale => {
+                if stale.is_some() {
+                    index.covers = usize::MAX;
+                }
+                self.tool_calls.iter_mut().find(|c| c.tool_use_id == tool_use_id)
+            }
+        }
+    }
+
     /// Keeps a refusal whose call has not been folded yet: a second one for the same id replaces
     /// the first, and past [`MAX_HELD_DENIALS`] the oldest is dropped.
     fn hold_denial(&mut self, tool_use_id: String, denial: ToolCallDenial) {
@@ -1453,6 +1492,13 @@ impl AgentSessionProjection {
                 self.assistant_message_open = false;
                 let denied = self.take_held_denial(tool_use_id);
                 let changed_input = self.take_held_changed_input(tool_use_id);
+                if self.call_index.covers == self.tool_calls.len() {
+                    self.call_index
+                        .first
+                        .entry(tool_use_id.clone())
+                        .or_insert(self.tool_calls.len());
+                    self.call_index.covers += 1;
+                }
                 self.tool_calls.push(ToolCallRecord {
                     seq,
                     turn_id: turn_id.clone(),
@@ -1470,7 +1516,7 @@ impl AgentSessionProjection {
                 is_error,
                 ..
             } => {
-                if let Some(call) = self.tool_calls.iter_mut().find(|c| &c.tool_use_id == tool_use_id) {
+                if let Some(call) = self.call_mut(tool_use_id) {
                     call.result = Some(ToolCallResult {
                         content: content.clone(),
                         is_error: *is_error,
@@ -1650,12 +1696,10 @@ impl AgentSessionProjection {
             }
             // On the first call with that id, or held until that call is folded. The comparison was
             // made when the prompt was folded (`derived_after`); this only records its result.
-            AgentDomainEvent::ToolInputChanged { tool_use_id, change } => {
-                match self.tool_calls.iter_mut().find(|c| &c.tool_use_id == tool_use_id) {
-                    Some(call) => call.changed_input = Some(change.clone()),
-                    None => push_bounded(&mut self.changed_inputs_before_their_call, tool_use_id, change.clone()),
-                }
-            }
+            AgentDomainEvent::ToolInputChanged { tool_use_id, change } => match self.call_mut(tool_use_id) {
+                Some(call) => call.changed_input = Some(change.clone()),
+                None => push_bounded(&mut self.changed_inputs_before_their_call, tool_use_id, change.clone()),
+            },
             // On the call it refused, or held until that call is folded. A refusal naming no call
             // has nothing to sit on and changes nothing; the call's own error result still says it.
             AgentDomainEvent::PermissionDenied {
@@ -1669,7 +1713,7 @@ impl AgentSessionProjection {
                         reason_type: reason_type.clone(),
                         reason: reason.clone(),
                     };
-                    match self.tool_calls.iter_mut().find(|c| &c.tool_use_id == id) {
+                    match self.call_mut(id) {
                         Some(call) => call.denied = Some(denial),
                         None => self.hold_denial(id.clone(), denial),
                     }
@@ -1715,6 +1759,110 @@ pub fn describe_failed_resume(
              instead.",
             attached.unwrap_or("an unnamed session"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tool_call_lookup {
+    use super::*;
+
+    fn fold_calls(count: usize) -> std::time::Duration {
+        let mut p = AgentSessionProjection::default();
+        let started = std::time::Instant::now();
+        for i in 0..count {
+            let id = format!("toolu_{i:08}");
+            p.apply(&AgentDomainEvent::ToolCallStarted {
+                turn_id: "t".into(),
+                tool_use_id: id.clone(),
+                name: "Read".into(),
+                input: serde_json::Value::Null,
+            });
+            p.apply(&AgentDomainEvent::ToolCallCompleted {
+                turn_id: "t".into(),
+                tool_use_id: id,
+                content: serde_json::Value::Null,
+                is_error: false,
+            });
+        }
+        let elapsed = started.elapsed();
+        assert!(p.tool_calls.iter().all(|c| c.result.is_some()));
+        elapsed
+    }
+
+    fn started(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: "t".into(),
+            tool_use_id: id.into(),
+            name: "Read".into(),
+            input: serde_json::Value::Null,
+        }
+    }
+
+    fn completed(id: &str, content: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t".into(),
+            tool_use_id: id.into(),
+            content: content.into(),
+            is_error: false,
+        }
+    }
+
+    /// Two calls with one id: the result goes to the first, as a search from the front found it.
+    #[test]
+    fn a_repeated_id_completes_its_first_call() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&started("a"));
+        p.apply(&started("b"));
+        p.apply(&started("a"));
+        p.apply(&completed("a", "first"));
+        assert_eq!(p.tool_calls[0].result.as_ref().unwrap().content, "first");
+        assert!(p.tool_calls[2].result.is_none());
+        assert!(p.tool_calls[1].result.is_none());
+    }
+
+    /// The list is public: a call put in or taken out by hand is still found.
+    #[test]
+    fn calls_changed_by_hand_are_still_found() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&started("a"));
+        p.apply(&started("b"));
+        let mut by_hand = p.tool_calls[0].clone();
+        by_hand.tool_use_id = "c".into();
+        p.tool_calls.push(by_hand);
+        p.apply(&completed("c", "c"));
+        assert_eq!(p.tool_calls[2].result.as_ref().unwrap().content, "c");
+
+        p.tool_calls.remove(0);
+        p.apply(&completed("b", "b"));
+        assert_eq!(p.tool_calls[0].result.as_ref().unwrap().content, "b");
+
+        // Same length, ids changed in place: one the index never saw, one it placed elsewhere.
+        p.tool_calls[0].tool_use_id = "d".into();
+        p.apply(&completed("d", "d"));
+        assert_eq!(p.tool_calls[0].result.as_ref().unwrap().content, "d");
+        p.tool_calls[1].tool_use_id = "b".into();
+        p.apply(&completed("b", "b again"));
+        assert_eq!(p.tool_calls[1].result.as_ref().unwrap().content, "b again");
+
+        // A clone carries an index that still answers for it.
+        let mut copy = p.clone();
+        copy.apply(&started("e"));
+        copy.apply(&completed("e", "e"));
+        assert_eq!(copy.tool_calls[2].result.as_ref().unwrap().content, "e");
+    }
+
+    /// Completing a call does not search every call before it: folding eight times as many calls
+    /// takes about eight times as long, not sixty-four.
+    #[test]
+    fn folding_completions_scales_linearly() {
+        let best = |count| (0..3).map(|_| fold_calls(count)).min().unwrap();
+        let small = best(2_000);
+        let large = best(16_000);
+        eprintln!("2000 calls: {small:?}, 16000 calls: {large:?}");
+        assert!(
+            large < small * 24,
+            "16000 calls took {large:?}, 2000 took {small:?}: worse than linear"
+        );
     }
 }
 

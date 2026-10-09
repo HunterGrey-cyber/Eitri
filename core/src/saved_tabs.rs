@@ -705,3 +705,47 @@ mod tests {
         );
     }
 }
+
+/// How long a change of the saved tabs holds the thread that observes it (the GTK thread, once per
+/// change): `EITRI_MEASURE_DIR` names the directory to write in, so the storage is the one measured.
+#[cfg(test)]
+mod measure {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn measure_a_saved_tabs_write() {
+        let dir = PathBuf::from(std::env::var("EITRI_MEASURE_DIR").expect("EITRI_MEASURE_DIR"))
+            .join(format!("saved-tabs-{}", std::process::id()));
+        let root = Path::new("/p");
+        let tab = |i: usize| SavedTab {
+            conversation_id: format!("c{i}"),
+            provider_session_id: format!("s{i}"),
+            name: None,
+            mode: SessionModeChoice::Auto,
+        };
+        let mut memory = TabMemory::new(Some(dir.clone()), root.to_path_buf());
+        let mut times = Vec::new();
+        for i in 0..200 {
+            let now = SavedTabs {
+                tabs: (0..4).map(|t| tab(t + i % 2)).collect(),
+                active: 0,
+                external_tabs: Vec::new(),
+                active_external: None,
+            };
+            let started = std::time::Instant::now();
+            let written = memory.observe(Some(now));
+            times.push(started.elapsed());
+            assert!(matches!(written, Some(Ok(_))));
+        }
+        times.sort();
+        eprintln!(
+            "saved-tabs write in {}: median {:?}, p99 {:?}, max {:?}",
+            dir.display(),
+            times[100],
+            times[198],
+            times[199]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

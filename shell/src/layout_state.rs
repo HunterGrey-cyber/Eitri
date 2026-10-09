@@ -298,6 +298,11 @@ impl LayoutSaver {
     }
 }
 
+/// Taken by every test in this crate that runs glib's default main context, so they take turns:
+/// a source added there panics while another thread owns it.
+#[cfg(test)]
+pub(crate) static DEFAULT_CONTEXT_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,12 +817,13 @@ mod tests {
     /// loss, which the close cannot (before this test, no test called `changed()`, so
     /// `changed()` never arming the timer, or arming it on every change, left every test green).
     ///
-    /// This is the one test in the crate on glib's default main context. It owns the context for its
-    /// whole run (`acquire`), and [`Disarm`] takes a pending timer off it if an assertion fails. A
-    /// second test on that context would have to take turns with this one: `timeout_add_local_once`
-    /// panics while another thread owns it.
+    /// It runs on glib's default main context and owns it for its whole run (`acquire`), taking turns
+    /// with the crate's other test there through [`DEFAULT_CONTEXT_TURN`]: `timeout_add_local_once`
+    /// panics while another thread owns it. [`Disarm`] takes a pending timer off it if an assertion
+    /// fails.
     #[test]
     fn the_debounce_writes_an_arrangement_change_and_a_click_arms_nothing() {
+        let _turn = DEFAULT_CONTEXT_TURN.lock().unwrap_or_else(|e| e.into_inner());
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()

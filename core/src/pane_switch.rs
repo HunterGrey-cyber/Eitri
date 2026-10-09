@@ -448,6 +448,17 @@ impl PaneSwitchReader {
         }
     }
 
+    /// Whether a connection was accepted and its message is not finished: a host must poll again
+    /// (on a timer) rather than wait for the listener, which will not say so.
+    pub fn holds_connections(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The listening socket, for a host that waits for it to become readable.
+    pub fn listener_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.listener)
+    }
+
     /// Every message that became complete since the last call, in accept order. Never blocks: a
     /// connection with no complete line yet is retained for the next call rather than waited on --
     /// see this type's own doc for why that is the fix, and why a stuck connection blocks the

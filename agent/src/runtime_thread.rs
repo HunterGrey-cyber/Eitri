@@ -16,17 +16,24 @@ impl RuntimeThread {
     /// Spawns the dedicated OS thread and blocks the calling thread only until the new runtime is
     /// actually constructed and its `Handle` captured -- callers never race a not-yet-ready
     /// runtime. This function contains the two allowed `.expect()` calls in this whole module
-    ///: `Runtime::new().expect(..)` is a foundational setup failure with no
+    ///: building the runtime is a foundational setup failure with no
     /// meaningful degraded path (matching `eitri_supervisor.rs`'s own precedent for a bind
     /// failure), and the `handle_rx.recv().expect(..)` immediately following is not a second,
     /// independent risk — it only fires as the direct, causal consequence of that same failure
-    /// (if `Runtime::new()` panics, the handle is never sent, so the `recv()` fails too),
+    /// (if the build panics, the handle is never sent, so the `recv()` fails too),
     /// propagating the same underlying panic to the calling thread rather than introducing a new one.
     pub fn spawn() -> Self {
         let (handle_tx, handle_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().expect("failed to build Tokio runtime for a Claude provider");
+            // One thread: the runtime carries one provider's few calls and one event stream, and
+            // `Runtime::new` would start a worker per CPU for every provider (32 on a 32-core
+            // machine, idle for the session's whole life). Spawned tasks run on this thread while
+            // it waits in `block_on` below; nothing here may call `block_in_place`.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build Tokio runtime for a Claude provider");
             let _ = handle_tx.send(runtime.handle().clone());
             // Wait until `Drop` sends shutdown or drops the sender. Either unblocks the runtime
             // thread so it can exit. Parking on `std::future::pending()` would leave this thread
@@ -123,6 +130,53 @@ mod tests {
             let _ = tx.send(42);
         });
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 42);
+    }
+
+    fn threads_of_this_process() -> usize {
+        std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// One runtime is one thread: the provider's few connections do not need a worker per CPU.
+    #[test]
+    fn a_runtime_thread_is_one_thread() {
+        let runtime_thread = RuntimeThread::spawn();
+        assert_eq!(
+            runtime_thread.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        );
+    }
+
+    /// What four providers' runtimes cost in threads, for a measurement run on its own
+    /// (`--ignored --test-threads=1`, other tests start threads of their own).
+    #[test]
+    #[ignore]
+    fn measure_threads_of_four_runtimes() {
+        let before = threads_of_this_process();
+        let runtimes: Vec<_> = (0..4).map(|_| RuntimeThread::spawn()).collect();
+        for runtime in &runtimes {
+            runtime.block_on(async {}, Duration::from_secs(1)).unwrap();
+        }
+        eprintln!(
+            "threads: {before} before, {} with four runtimes",
+            threads_of_this_process()
+        );
+    }
+
+    /// The floor of a synchronous call through the runtime (what every unary RPC, a permission answer
+    /// included, pays before the wire), for a measurement run by hand.
+    #[test]
+    #[ignore]
+    fn measure_a_round_trip() {
+        let runtime_thread = RuntimeThread::spawn();
+        let mut times: Vec<_> = (0..1000)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                runtime_thread.block_on(async {}, Duration::from_secs(1)).unwrap();
+                started.elapsed()
+            })
+            .collect();
+        times.sort();
+        eprintln!("block_on round trip: median {:?}, p99 {:?}", times[500], times[990]);
     }
 
     /// The regression this whole fix closes: dropping many `RuntimeThread`s in a row must not

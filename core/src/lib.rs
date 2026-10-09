@@ -49,6 +49,14 @@ pub mod wm;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_providers;
 
+/// A counting allocator, for the tests that pin that a path does not copy.
+#[cfg(any(test, feature = "test-support"))]
+pub mod alloc_count;
+
+#[cfg(test)]
+#[global_allocator]
+static COUNTING: alloc_count::Counting = alloc_count::Counting;
+
 /// Reading the workspace's own sources as text, for the tests that hold an invariant by scanning code,
 /// here and in `shell`'s and `eitri-panel`'s tests.
 #[cfg(any(test, feature = "test-support"))]

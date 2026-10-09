@@ -80,6 +80,54 @@ export function resetToStartScreen(state: AgentUiState): AgentUiState {
 }
 
 /**
+ * Folds one delivered batch, in order: the same state `events.reduce(applyEvent, state)` gives.
+ *
+ * A run of consecutive text deltas of one turn is folded as one delta carrying their joined text,
+ * and `nextSeq` is then moved on by the rest of the run, which is exactly what folding them one by
+ * one does: the first either opens a message (at its own `seq`) or appends to the open one, and
+ * every later one appends to that same message, which keeps the first's `seq`. Folding them one by
+ * one copied the whole transcript once per delta; a batch of D deltas over M messages copied M x D
+ * entries for one render.
+ */
+export function applyEvents(state: AgentUiState, events: readonly AgentDomainEvent[]): AgentUiState {
+  let folded = state;
+  let i = 0;
+  while (i < events.length) {
+    const first = events[i];
+    let end = i + 1;
+    if (isTextDelta(first)) {
+      while (end < events.length) {
+        const next = events[end];
+        if (!isTextDelta(next) || next.turn_id !== first.turn_id) break;
+        end += 1;
+      }
+    }
+    if (end - i === 1) {
+      folded = applyEvent(folded, first);
+    } else {
+      const run = events.slice(i, end) as TextDelta[];
+      const merged = applyEvent(folded, { ...(first as TextDelta), text: run.map((e) => e.text).join("") });
+      folded = { ...merged, nextSeq: merged.nextSeq + (end - i - 1) };
+    }
+    i = end;
+  }
+  return folded;
+}
+
+type TextDelta = Extract<AgentDomainEvent, { type: "content_delta" }> & { kind: "text" };
+
+function isTextDelta(event: AgentDomainEvent): event is TextDelta {
+  return event.type === "content_delta" && event.kind === "text" && typeof event.text === "string";
+}
+
+let transcriptEntriesCopied = 0;
+/** How many transcript entries text deltas have copied into new arrays in this page (the
+ *  performance tests count it). */
+export function transcriptEntriesCopiedCount(): number {
+  return transcriptEntriesCopied;
+}
+
+/**
  * Folds one event, assigning any item it creates the `seq` that orders it against everything else
  * in the conversation.
  *
@@ -164,6 +212,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // MUST stay identical to `AgentSessionProjection::apply` in agent/src/projection.rs: the two
       // fold the same events and a snapshot from Rust has to be indistinguishable from this
       // reducer's own accumulation.
+      transcriptEntriesCopied += state.transcript.length;
       if (state.assistantMessageOpen && state.transcript.length > 0) {
         const transcript = state.transcript.slice();
         const open = transcript[transcript.length - 1];

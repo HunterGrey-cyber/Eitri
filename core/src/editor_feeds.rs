@@ -9,6 +9,7 @@
 //! so its connections wait in the kernel's queue instead of being consumed and dropped.
 
 use std::cell::RefCell;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -27,6 +28,26 @@ pub struct FeedEvents {
     pub theme: Option<NvimThemePayload>,
     pub keys: Option<NvimReport>,
     pub pane: Vec<PaneMessage>,
+}
+
+/// Whether any of `fds` is readable now, without waiting. An error counts as readable: the caller
+/// then keeps polling, which is what it did before it could ask.
+fn any_readable(fds: &[RawFd]) -> bool {
+    if fds.is_empty() {
+        return false;
+    }
+    let mut polled: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    // SAFETY: `polled` is a live array of `polled.len()` entries for the call; a zero timeout
+    // never waits.
+    let ready = unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, 0) };
+    ready != 0
 }
 
 /// One reader and the schedule it is read on.
@@ -152,6 +173,44 @@ impl EditorFeeds {
         });
         self.context = Some(Cadenced::new(feed, crate::editor_context::feed::POLL_INTERVAL, now));
         (source, reset)
+    }
+
+    /// The listening sockets of the readers added so far: what a host waits on while the feeds are
+    /// [quiet](Self::is_quiet).
+    pub fn listener_fds(&self) -> Vec<RawFd> {
+        let mut fds = Vec::new();
+        if let Some(feed) = &self.theme {
+            fds.push(feed.reader.lines().listener_fd());
+        }
+        if let Some(feed) = &self.keys {
+            fds.push(feed.reader.lines().listener_fd());
+        }
+        if let Some(feed) = &self.context {
+            fds.push(feed.reader.reader.borrow().lines().listener_fd());
+        }
+        if let Some(feed) = &self.pane {
+            fds.push(feed.reader.listener_fd());
+        }
+        fds
+    }
+
+    /// Whether there is nothing to read: no reader holds a connection it accepted and has not
+    /// finished, and no listener has a connection waiting. A host that finds the feeds quiet may stop
+    /// polling until one of [`Self::listener_fds`] becomes readable; while they are not, it polls
+    /// on its tick, since a connection that is accepted but not yet written to, or one a feed is not
+    /// due to read yet, wakes no listener.
+    pub fn is_quiet(&self) -> bool {
+        let holding = self
+            .theme
+            .as_ref()
+            .is_some_and(|f| f.reader.lines().holds_connections())
+            || self.keys.as_ref().is_some_and(|f| f.reader.lines().holds_connections())
+            || self
+                .context
+                .as_ref()
+                .is_some_and(|f| f.reader.reader.borrow().lines().holds_connections())
+            || self.pane.as_ref().is_some_and(|f| f.reader.holds_connections());
+        !holding && !any_readable(&self.listener_fds())
     }
 
     /// Reads every feed whose interval has passed since its last read (theme, keys and context every
@@ -332,6 +391,51 @@ mod tests {
             "the next editor starts empty"
         );
         feed.cleanup();
+    }
+
+    /// Quiet means nothing to read: a connection waiting for a feed that is not due yet, or one
+    /// accepted with its line unfinished, keeps the feeds from being quiet until it is read.
+    #[test]
+    fn the_feeds_are_quiet_only_with_nothing_left_to_read() {
+        let (mut feeds, feed, source, _reset, now) = context_feeds(None);
+        let every = crate::editor_context::feed::POLL_INTERVAL;
+        assert_eq!(feeds.listener_fds().len(), 1);
+        assert!(feeds.is_quiet(), "nothing sent");
+
+        send(feed.socket_path(), &context_line("/p/a.rs"));
+        assert!(!feeds.is_quiet(), "a connection waits");
+        feeds.poll(now + every / 2);
+        assert!(!feeds.is_quiet(), "still waits: the feed was not due");
+        feeds.poll(now + every);
+        assert_eq!(file(&source), Some("/p/a.rs".to_owned()));
+        assert!(feeds.is_quiet(), "read");
+
+        // Connected and half written: accepted by the read, but not finished.
+        let mut half = UnixStream::connect(feed.socket_path()).expect("connect");
+        half.write_all(br#"{"v":1,"file":"/p/b.rs""#).expect("write");
+        feeds.poll(now + every * 2);
+        assert!(!feeds.is_quiet(), "a line is half read");
+        half.write_all(b",\"selection\":null}\n").expect("write");
+        drop(half);
+        feeds.poll(now + every * 3);
+        assert_eq!(file(&source), Some("/p/b.rs".to_owned()));
+        assert!(feeds.is_quiet());
+        feed.cleanup();
+    }
+
+    #[test]
+    fn the_pane_switch_is_quiet_once_its_messages_are_read() {
+        let mut channel = PaneSwitchChannel::bind_without_shim().expect("bind");
+        let mut feeds = EditorFeeds::new();
+        let now = Instant::now();
+        assert!(feeds.listener_fds().is_empty() && feeds.is_quiet(), "nothing added");
+        feeds.add_pane_switch(PaneSwitchReader::new(channel.take_listener().unwrap()), now);
+        assert!(feeds.is_quiet());
+        send(channel.socket_path(), "L");
+        assert!(!feeds.is_quiet());
+        assert_eq!(feeds.poll(now).pane, vec![PaneMessage::Direction('L')]);
+        assert!(feeds.is_quiet());
+        channel.cleanup();
     }
 
     #[test]

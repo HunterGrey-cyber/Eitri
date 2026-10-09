@@ -152,6 +152,11 @@ impl Drop for EditorContextFeed {
 pub struct EditorContextReader(NewestLineReader);
 
 impl EditorContextReader {
+    /// The bounded reader underneath, for a host deciding whether there is anything to read.
+    pub(crate) fn lines(&self) -> &NewestLineReader {
+        &self.0
+    }
+
     pub fn new(listener: UnixListener) -> Self {
         Self(NewestLineReader::new(listener, "editor-context"))
     }
@@ -163,15 +168,13 @@ impl EditorContextReader {
 
     /// Returns the newest valid update available without waiting, or `None` for no news.
     pub fn poll(&mut self) -> Option<EditorContext> {
-        self.0
-            .poll_with(|line| match parse_bytes(line) {
-                Ok(_) => true,
-                Err(e) => {
-                    eprintln!("[editor-context] ignoring an update: {e}");
-                    false
-                }
-            })
-            .and_then(|line| parse_bytes(&line).ok())
+        self.0.poll_parsed(|line| match parse_bytes(line) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                eprintln!("[editor-context] ignoring an update: {e}");
+                None
+            }
+        })
     }
 }
 

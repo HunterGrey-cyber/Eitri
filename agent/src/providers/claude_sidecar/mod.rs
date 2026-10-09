@@ -209,7 +209,7 @@ pub struct ClaudeSidecarProvider {
     sidecar: SpawnedSidecar,
     runtime: RuntimeThread,
     client: RuntimeServiceClient<Channel>,
-    events: Arc<Mutex<Vec<AgentDomainEvent>>>,
+    events: Arc<EventQueue>,
     backpressure: Arc<BackpressureCounters>,
     /// Captured once at `connect()` from the real `HandshakeResponse`, which this provider used to
     /// discard entirely -- it checked only that the RPC succeeded. Without it there was no truthful
@@ -311,7 +311,7 @@ impl ClaudeSidecarProvider {
             sidecar,
             runtime,
             client,
-            events: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(EventQueue::default()),
             backpressure: Arc::new(BackpressureCounters::default()),
             capabilities,
             info,
@@ -324,7 +324,7 @@ impl ClaudeSidecarProvider {
     /// delivery has fallen. See `BackpressureStats` for why losslessness alone is not the question.
     pub fn backpressure_stats(&self) -> BackpressureStats {
         BackpressureStats {
-            pending_events: self.events.lock().unwrap().len(),
+            pending_events: self.events.len(),
             events_received: self.backpressure.events_received.load(Ordering::Relaxed),
             max_delivery_lag_ms: self.backpressure.max_delivery_lag_ms.load(Ordering::Relaxed),
             last_delivery_lag_ms: self.backpressure.last_delivery_lag_ms.load(Ordering::Relaxed),
@@ -414,10 +414,7 @@ impl ClaudeSidecarProvider {
             // one genuinely normal ending: a session that closed on its own terms.
             let report = |reason: String| {
                 eprintln!("agent: ClaudeSidecarProvider: event stream lost: {reason}");
-                events
-                    .lock()
-                    .unwrap()
-                    .push(AgentDomainEvent::SessionUnavailable { reason });
+                events.push(AgentDomainEvent::SessionUnavailable { reason });
             };
 
             loop {
@@ -470,7 +467,7 @@ impl ClaudeSidecarProvider {
                                 watch::SequenceVerdict::Deliver => {
                                     delivered_since_open = true;
                                     if let Some(boundary) = split.before(&event) {
-                                        events.lock().unwrap().push(boundary);
+                                        events.push(boundary);
                                     }
                                     if let Some(line) = cli_mode_note.observe(&event) {
                                         eprintln!("{line}");
@@ -481,7 +478,7 @@ impl ClaudeSidecarProvider {
                                         // terminal event, never inferred from the stream stopping.
                                         closed_by_session |=
                                             matches!(domain_event, AgentDomainEvent::SessionClosed { .. });
-                                        events.lock().unwrap().push(domain_event);
+                                        events.push(domain_event);
                                     }
                                 }
                                 // Replay after a reconnect legitimately re-sends what was already
@@ -895,7 +892,34 @@ impl AgentProvider for ClaudeSidecarProvider {
     }
 
     fn pump(&self) -> Vec<AgentDomainEvent> {
+        self.events.take()
+    }
+
+    fn event_signal(&self) -> Option<Arc<crate::provider::EventSignal>> {
+        Some(Arc::clone(&self.events.signal))
+    }
+}
+
+/// The events received off the wire and not yet taken by `pump`, with the signal that says so.
+/// Pushing raises it, so nothing can be queued without whoever drains `pump` being woken.
+#[derive(Default)]
+struct EventQueue {
+    events: Mutex<Vec<AgentDomainEvent>>,
+    signal: Arc<crate::provider::EventSignal>,
+}
+
+impl EventQueue {
+    fn push(&self, event: AgentDomainEvent) {
+        self.events.lock().unwrap().push(event);
+        self.signal.raise();
+    }
+
+    fn take(&self) -> Vec<AgentDomainEvent> {
         std::mem::take(&mut *self.events.lock().unwrap())
+    }
+
+    fn len(&self) -> usize {
+        self.events.lock().unwrap().len()
     }
 }
 

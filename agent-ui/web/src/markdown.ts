@@ -326,6 +326,18 @@ export function renderMarkdown(text: string): string {
   return html;
 }
 
+/** Drops `text`'s rendered HTML from the cache: a reply that kept streaming has no further use for
+ *  the HTML of what it said before. Only a cost if another row shows the very same text (it is
+ *  rendered again the next time that row mounts). */
+export function forgetMarkdown(text: string): void {
+  cache.delete(text);
+}
+
+/** Whether `text`'s rendered HTML is in the cache (the performance tests read it). */
+export function isMarkdownCached(text: string): boolean {
+  return cache.has(text);
+}
+
 /** The text a reader sees in `el`: `innerText` skips whatever the page does not render (`hidden`,
  *  `display: none`, a collapsed `<details>`), `textContent` does not. `innerText` is absent only
  *  where nothing is laid out (jsdom), where the two coincide for the markup the sanitizer allows. */

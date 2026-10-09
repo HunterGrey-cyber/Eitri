@@ -45,7 +45,14 @@ function lines(text: string): string[] {
  * than showing a truncated diff, because a diff that silently omits lines is worse than one that
  * refuses -- the reader would approve what they could see.
  */
+let lineDiffs = 0;
+/** How many times `lineDiff` has run in this page: the performance tests count it. */
+export function lineDiffCount(): number {
+  return lineDiffs;
+}
+
 export function lineDiff(before: string, after: string): DiffLine[] | null {
+  lineDiffs += 1;
   const a = lines(before);
   const b = lines(after);
   if (a.length > MAX_DIFF_LINES || b.length > MAX_DIFF_LINES) return null;
@@ -106,6 +113,49 @@ export interface EditPreview {
  */
 export function editPreview(toolName: string, input: unknown): EditPreview | null {
   if (input === null || typeof input !== "object") return null;
+  // A finished Edit row is drawn again on every render of the conversation (a cursor move, a streamed
+  // batch, a scroll), and a 400-by-400-line diff is 160,000 comparisons. A tool call's input never
+  // changes once it arrived, so the preview is kept with the input object itself -- and kept only
+  // while every top-level field is still the very value it was computed from, so even an input
+  // changed in place afterwards can never be shown with a preview of what it used to say.
+  const keys = Object.keys(input);
+  const values = keys.map((key) => (input as Record<string, unknown>)[key]);
+  const held = previews.get(input);
+  if (held !== undefined && held.toolName === toolName && sameFields(held, keys, values)) return held.preview;
+  const preview = freezePreview(computeEditPreview(toolName, input));
+  previews.set(input, { toolName, keys, values, preview });
+  return preview;
+}
+
+interface HeldPreview {
+  toolName: string;
+  keys: string[];
+  values: unknown[];
+  preview: EditPreview | null;
+}
+
+const previews = new WeakMap<object, HeldPreview>();
+
+function sameFields(held: HeldPreview, keys: string[], values: unknown[]): boolean {
+  if (held.keys.length !== keys.length) return false;
+  for (let i = 0; i < keys.length; i++) {
+    if (held.keys[i] !== keys[i] || !Object.is(held.values[i], values[i])) return false;
+  }
+  return true;
+}
+
+/** A held preview is shared by every row and card that draws the same input, so none of them may
+ *  change it. */
+function freezePreview(preview: EditPreview | null): EditPreview | null {
+  if (preview === null) return null;
+  if (preview.diff !== null) {
+    for (const line of preview.diff) Object.freeze(line);
+    Object.freeze(preview.diff);
+  }
+  return Object.freeze(preview);
+}
+
+function computeEditPreview(toolName: string, input: object): EditPreview | null {
   const fields = input as Record<string, unknown>;
   const str = (key: string): string => (typeof fields[key] === "string" ? (fields[key] as string) : "");
   const filePath = str("file_path");

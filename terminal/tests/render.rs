@@ -199,3 +199,22 @@ fn a_composition_shifted_in_from_the_last_column_still_covers_the_block_cursor()
         assert!(after.ink(&m, 0, col, 1, bg) > 0, "no preedit ink in cell {col}");
     }
 }
+
+/// The painter reuses what it built for an earlier frame (each glyph's shaped blob): a frame
+/// painted with metrics that have already painted it -- and others, in other styles -- is the
+/// same, pixel for pixel, as one painted with fresh metrics.
+#[test]
+fn a_frame_painted_again_with_warm_metrics_is_the_same_pixels() {
+    let mut screen = Screen::new(size(40, 6), themed());
+    screen.feed("plain \x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munder\x1b[0m\r\n".as_bytes());
+    screen.feed("\u{4f60}\u{597d} e\u{301} \x1b[7minverse\x1b[0m \x1b[38;5;196mred\x1b[0m".as_bytes());
+    let list = screen.render(true);
+    let warm = metrics();
+    let mut other = Screen::new(size(40, 6), TerminalColors::default());
+    other.feed("\x1b[1;3mplain bold italic \u{4f60}\x1b[0m e\u{301}".as_bytes());
+    Raster::of(&other.render(true), &warm);
+    Raster::of(&list, &warm);
+    let again = Raster::of(&list, &warm);
+    let fresh = Raster::of(&list, &metrics());
+    assert!(again.pixels == fresh.pixels, "warm metrics painted something else");
+}

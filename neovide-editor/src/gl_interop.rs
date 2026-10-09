@@ -166,21 +166,75 @@ impl SkiaState {
     }
 }
 
-/// Carried over verbatim from `neovide_embed::current_bound_framebuffer` (itself carried over from
-/// `gl_skia_test`) -- see that crate's doc comment for the full nm -D-verified explanation of the
-/// local libepoxy quirk this works around.
+/// The framebuffer GTK has bound, asked on every render. Carried over from
+/// `neovide_embed::current_bound_framebuffer` (itself carried over from `gl_skia_test`) -- see that
+/// crate's doc comment for the full nm -D-verified explanation of the local libepoxy quirk this
+/// works around -- except that the symbol is looked up once ([`get_integerv`]), not on every call.
 pub(crate) fn current_bound_framebuffer() -> i32 {
     const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
+    let proc_addr = get_integerv();
+    if proc_addr.is_null() {
+        return 0;
+    }
     unsafe {
-        let lib = libloading::os::unix::Library::this();
-        let proc_addr = resolve_gl_proc(&lib, "glGetIntegerv");
-        if proc_addr.is_null() {
-            return 0;
-        }
         let get_integerv: unsafe extern "C" fn(u32, *mut i32) = std::mem::transmute(proc_addr);
         let mut fbo: i32 = 0;
         get_integerv(GL_FRAMEBUFFER_BINDING, &mut fbo as *mut i32);
         fbo
+    }
+}
+
+/// Where `glGetIntegerv` is found, found once. Looking it up opened a handle on the process,
+/// formatted and allocated a symbol name and ran `dlsym` on every rendered frame, on GTK's thread.
+///
+/// libepoxy exports `epoxy_glGetIntegerv` as a slot whose value it rewrites (a resolver at first,
+/// the real entry point once resolved), so what is kept is the slot's ADDRESS and the slot is still
+/// read on every call -- the same pointer [`resolve_gl_proc`] would hand back each time. Only a
+/// plain `glGetIntegerv` export, which nothing rewrites, is kept as the function itself. A failed
+/// lookup is not kept: it is tried again next time, as before.
+#[derive(Clone, Copy)]
+enum GetIntegerv {
+    EpoxySlot(usize),
+    Plain(usize),
+}
+
+static GET_INTEGERV: std::sync::OnceLock<GetIntegerv> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static GET_INTEGERV_LOOKUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn get_integerv() -> *const std::ffi::c_void {
+    let found = match GET_INTEGERV.get() {
+        Some(found) => *found,
+        None => match lookup_get_integerv() {
+            Some(found) => *GET_INTEGERV.get_or_init(|| found),
+            None => return std::ptr::null(),
+        },
+    };
+    match found {
+        // SAFETY: the address of libepoxy's exported slot, which lives as long as the process.
+        GetIntegerv::EpoxySlot(slot) => unsafe { *(slot as *const *const std::ffi::c_void) },
+        GetIntegerv::Plain(proc_addr) => proc_addr as *const std::ffi::c_void,
+    }
+}
+
+fn lookup_get_integerv() -> Option<GetIntegerv> {
+    #[cfg(test)]
+    GET_INTEGERV_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        let lib = libloading::os::unix::Library::this();
+        if let Ok(sym) = lib.get::<*const std::ffi::c_void>(b"epoxy_glGetIntegerv\0") {
+            let slot = *sym as *const *const std::ffi::c_void;
+            if !slot.is_null() && !(*slot).is_null() {
+                return Some(GetIntegerv::EpoxySlot(slot as usize));
+            }
+        }
+        if let Ok(sym) = lib.get::<*const std::ffi::c_void>(b"glGetIntegerv\0") {
+            if !(*sym).is_null() {
+                return Some(GetIntegerv::Plain(*sym as usize));
+            }
+        }
+        None
     }
 }
 
@@ -386,6 +440,44 @@ pub(crate) fn fill_content_region(canvas: &Canvas, content_region: &PixelRect<f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `glGetIntegerv` is looked up once, not on every frame, and the answer is the one the
+    /// per-call lookup gives: the slot's current value under libepoxy, else the plain export. No GL
+    /// context is needed to look a symbol up.
+    #[test]
+    fn get_integerv_is_looked_up_once() {
+        use std::sync::atomic::Ordering;
+        let first = get_integerv();
+        let lookups = GET_INTEGERV_LOOKUPS.load(Ordering::SeqCst);
+        for _ in 0..100 {
+            assert_eq!(get_integerv(), first);
+        }
+        if !first.is_null() {
+            assert_eq!(GET_INTEGERV_LOOKUPS.load(Ordering::SeqCst), lookups, "looked up again");
+        }
+        let lib = libloading::os::unix::Library::this();
+        assert_eq!(first, unsafe { resolve_gl_proc(&lib, "glGetIntegerv") });
+    }
+
+    /// What the per-frame lookup cost, against the cached one. Release-only measurement:
+    /// `cargo test --release -p neovide-editor --lib -- --ignored --nocapture get_integerv`.
+    #[test]
+    #[ignore = "release-only measurement"]
+    fn get_integerv_lookup_timed() {
+        let n = 10_000;
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            let lib = libloading::os::unix::Library::this();
+            std::hint::black_box(unsafe { resolve_gl_proc(&lib, "glGetIntegerv") });
+        }
+        let per_frame = started.elapsed() / n;
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(get_integerv());
+        }
+        let cached = started.elapsed() / n;
+        eprintln!("glGetIntegerv lookup: every frame {per_frame:?}, cached {cached:?}");
+    }
 
     /// Pins the 2026-09-16 geometry: `CONTENT_MARGIN` is 0.0, so the editor fills its pane and the
     /// near-black frame that used to surround it cannot come back unnoticed. Deliberately separate

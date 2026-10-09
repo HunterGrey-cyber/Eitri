@@ -39,6 +39,7 @@
 
 use crate::lease::SessionLease;
 use crate::projection::{AgentDomainEvent, AgentSessionProjection};
+use crate::provider::EventSignal;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -52,9 +53,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// make anything more correct, it would only delay the switch and hold more raw events.
 pub const UI_EVENT_QUEUE_CAPACITY: usize = 256;
 
-/// How often the ingestion thread drains the provider. Short enough that the provider's own internal
-/// queue stays near-empty between drains, which is what keeps the raw-event backlog bounded at BOTH
-/// layers rather than moving it one step upstream.
+/// How often the ingestion thread drains a provider that raises no [`EventSignal`]. Short enough that
+/// the provider's own internal queue stays near-empty between drains, which is what keeps the
+/// raw-event backlog bounded at BOTH layers rather than moving it one step upstream. A provider that
+/// raises one is drained as soon as it does, and the thread sleeps while it is quiet.
 const INGEST_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// What the UI should do when it next wakes up.
@@ -255,6 +257,9 @@ impl IngestState {
 pub struct ConversationIngest {
     state: Arc<Mutex<IngestState>>,
     stop: Arc<AtomicBool>,
+    /// Raised by the provider when it queued events, and here when something the thread acts on
+    /// was noted (a title, a name, a local fold, the stop).
+    wake: Arc<EventSignal>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -316,6 +321,8 @@ impl ConversationIngest {
             history_dirty: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let announced = provider.event_signal();
+        let wake = announced.clone().unwrap_or_default();
         let context = AdoptionContext {
             provider_name,
             conversation_id,
@@ -328,13 +335,14 @@ impl ConversationIngest {
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("eitri-agent-ingest".to_string())
-                .spawn(move || ingest_loop(provider, state, stop, context))
+                .spawn(move || ingest_loop(provider, state, stop, announced, context))
                 .expect("spawning the agent ingestion thread")
         };
 
         Self {
             state,
             stop,
+            wake,
             thread: Some(thread),
         }
     }
@@ -368,12 +376,14 @@ impl ConversationIngest {
     /// over and then find nowhere to go. Only the first title is kept.
     pub(crate) fn note_title(&self, title: String) {
         self.state.lock().unwrap().pending_title.get_or_insert(title);
+        self.wake.raise();
     }
 
     /// Keeps a rename (`prefix ,`) for the ingestion thread to write. The last one noted wins,
     /// unlike `note_title`'s first-wins: `None` clears it. Nothing here touches the disk.
     pub(crate) fn note_name(&self, name: Option<String>) {
         self.state.lock().unwrap().pending_name = Some(name);
+        self.wake.raise();
     }
 
     /// The provider's resume verdict, once it has stated one.
@@ -405,11 +415,16 @@ impl ConversationIngest {
     /// to state.
     pub(crate) fn fold_locally(&self, event: AgentDomainEvent) {
         self.state.lock().unwrap().fold(event);
+        // The fold may have marked the history for writing, which the thread does.
+        self.wake.raise();
     }
 
     /// Stops the ingestion thread and waits for it. Idempotent.
     pub(crate) fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Stored before the raise, which takes the signal's lock: the thread's wait reads the flag under
+        // that lock, so it cannot miss it.
+        self.stop.store(true, Ordering::SeqCst);
+        self.wake.raise();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -426,9 +441,17 @@ fn ingest_loop(
     provider: Arc<dyn crate::provider::AgentProvider + Send + Sync>,
     state: Arc<Mutex<IngestState>>,
     stop: Arc<AtomicBool>,
+    // The provider's own signal, which `ConversationIngest` also raises; `None` when the provider
+    // announces nothing and so has to be asked on a timer.
+    announced: Option<Arc<EventSignal>>,
     context: AdoptionContext,
 ) {
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::SeqCst) {
+        #[cfg(test)]
+        idle_wakeups::between_the_check_and_the_look(&context.conversation_id);
+        // Read before the pump: an event queued after the pump looked raises the count past this,
+        // so the wait below ends at once instead of missing it.
+        let seen = announced.as_ref().map(|signal| signal.seen());
         let events = provider.pump();
         // Before the idle check, so a title noted while the provider is quiet still gets written.
         flush_title(&state, &context);
@@ -437,7 +460,13 @@ fn ingest_loop(
         // a quiet stretch, so waiting for the next non-empty pump would delay every write.
         flush_history(&state, &context);
         if events.is_empty() {
-            std::thread::sleep(INGEST_POLL_INTERVAL);
+            match (&announced, seen) {
+                // The stop is looked at again under the signal's lock: one that landed after the
+                // check above already raised the signal before `seen` was read, so the count alone
+                // would not end this wait.
+                (Some(signal), Some(seen)) => signal.wait_past_unless(seen, || stop.load(Ordering::SeqCst)),
+                _ => std::thread::sleep(INGEST_POLL_INTERVAL),
+            }
             continue;
         }
         // Adoption touches the filesystem, so it happens OUTSIDE the state lock -- holding it across
@@ -533,10 +562,9 @@ fn flush_name(state: &Mutex<IngestState>, context: &AdoptionContext) {
 /// is strictly worse on that thread than a title write was: it is two fsyncs and a serialization of
 /// the whole conversation, landing on a 33ms GTK tick.
 ///
-/// The lock is held only long enough to read the dirty flag and CLONE the three collections.
-/// Serializing and writing happen after it is released. That does not contradict `ProjectionGuard`'s
-/// "do not clone the transcript on every tick" rule -- that rule is about the 33ms tick, and this
-/// runs once per turn.
+/// The lock is held only long enough to read the dirty flag and copy what the history keeps of the
+/// three collections (`history_snapshot`: the newest items within the caps, not the whole session).
+/// Serializing and writing happen after it is released.
 ///
 /// Two gates, the same two `flush_title` has: the record must be on disk (a history file for a
 /// session with no record would be an orphan from birth), and there must be a
@@ -563,12 +591,8 @@ fn flush_history(state: &Mutex<IngestState>, context: &AdoptionContext) {
         // Cleared before the write, not after: a turn that completes while this one is writing must
         // mark the history dirty again rather than be swallowed by a later clear.
         guard.history_dirty = false;
-        (
-            id,
-            guard.projection.user_prompts.clone(),
-            guard.projection.transcript.clone(),
-            guard.projection.tool_calls.clone(),
-        )
+        let (user_prompts, transcript, tool_calls) = history_snapshot(&guard.projection);
+        (id, user_prompts, transcript, tool_calls)
     };
     let history = crate::history::StoredHistory::from_collections(
         context.conversation_id.clone(),
@@ -592,6 +616,18 @@ fn flush_history(state: &Mutex<IngestState>, context: &AdoptionContext) {
     ) {
         eprintln!("agent: could not update the record of session {provider_session_id}: {e}");
     }
+}
+
+/// What the stored history keeps of the conversation, copied: only what the history's caps keep,
+/// since this runs under the lock every UI read of the conversation takes.
+fn history_snapshot(
+    projection: &AgentSessionProjection,
+) -> (
+    Vec<crate::UserPromptRecord>,
+    Vec<crate::TranscriptMessage>,
+    Vec<crate::ToolCallRecord>,
+) {
+    crate::history::store::newest_that_fit(&projection.user_prompts, &projection.transcript, &projection.tool_calls)
 }
 
 fn adopt_provider_session(
@@ -965,5 +1001,308 @@ pub(crate) mod tests {
         let stats = state.stats;
         assert_eq!(stats.ui_backlog, 0);
         assert_eq!(stats.max_ui_backlog, 10);
+    }
+}
+
+#[cfg(test)]
+mod history_snapshot_cost {
+    use super::*;
+
+    /// A session of `calls` tool calls, each with a 10,000-character result, and a message after each.
+    fn session(calls: usize) -> AgentSessionProjection {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&AgentDomainEvent::UserPromptSubmitted { text: "go".into() });
+        for i in 0..calls {
+            let id = format!("toolu_{i}");
+            p.apply(&AgentDomainEvent::ToolCallStarted {
+                turn_id: "t".into(),
+                tool_use_id: id.clone(),
+                name: "Read".into(),
+                input: serde_json::json!({ "file_path": format!("/p/{i}.rs") }),
+            });
+            p.apply(&AgentDomainEvent::ToolCallCompleted {
+                turn_id: "t".into(),
+                tool_use_id: id,
+                content: serde_json::Value::String("r".repeat(10_000)),
+                is_error: false,
+            });
+            p.apply(&AgentDomainEvent::ContentDelta {
+                turn_id: "t".into(),
+                kind: crate::ContentKind::Text,
+                text: format!("message {i}"),
+            });
+        }
+        p
+    }
+
+    fn best(f: impl Fn() -> std::time::Duration) -> std::time::Duration {
+        (0..3).map(|_| f()).min().unwrap()
+    }
+
+    fn snapshot_time(p: &AgentSessionProjection) -> std::time::Duration {
+        best(|| {
+            let started = std::time::Instant::now();
+            let kept = history_snapshot(p);
+            let elapsed = started.elapsed();
+            assert!(kept.2.len() <= crate::history::HISTORY_MAX_ITEMS);
+            elapsed
+        })
+    }
+
+    /// What the history write holds the conversation's lock for no longer grows with the session:
+    /// eight times the session takes about as long, where copying it all took eight times as long.
+    #[test]
+    fn the_lock_held_part_of_a_history_write_does_not_grow_with_the_session() {
+        let small = snapshot_time(&session(500));
+        let large = snapshot_time(&session(4_000));
+        eprintln!("snapshot of 500 calls: {small:?}, of 4000: {large:?}");
+        assert!(large < small * 3, "4000 calls took {large:?}, 500 took {small:?}");
+    }
+
+    /// The copy the history write used to make under the lock, beside the one it makes now, for a
+    /// measurement run by hand (`--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn measure_the_history_snapshot() {
+        for calls in [500, 4_000, 16_000] {
+            let p = session(calls);
+            let whole = best(|| {
+                let started = std::time::Instant::now();
+                let copied = (p.user_prompts.clone(), p.transcript.clone(), p.tool_calls.clone());
+                let elapsed = started.elapsed();
+                drop(copied);
+                elapsed
+            });
+            eprintln!(
+                "{calls} calls: copying it all {whole:?}, the snapshot {:?}",
+                snapshot_time(&p)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_wakeups {
+    use super::*;
+    use crate::provider::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A provider that never has anything to say, and counts how often it is asked.
+    #[derive(Default)]
+    pub(super) struct Quiet {
+        pub(super) pumps: AtomicUsize,
+        pub(super) queued: Mutex<Vec<AgentDomainEvent>>,
+    }
+
+    impl AgentProvider for Quiet {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo::default()
+        }
+        fn create_session(&self, _: CreateSessionRequest) -> Result<String, ProviderError> {
+            Ok("s".into())
+        }
+        fn resume_session(&self, _: ResumeSessionRequest) -> Result<String, ProviderError> {
+            Ok("s".into())
+        }
+        fn send_turn(&self, _: SendTurnRequest) -> Result<String, ProviderError> {
+            Ok("t".into())
+        }
+        fn interrupt_turn(&self, _: InterruptTurnRequest) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn resolve_permission(&self, _: ResolvePermissionRequest) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn close_session(&self, _: CloseSessionRequest) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn pump(&self) -> Vec<AgentDomainEvent> {
+            self.pumps.fetch_add(1, Ordering::Relaxed);
+            std::mem::take(&mut *self.queued.lock().unwrap())
+        }
+    }
+
+    /// The same, announcing what it queues.
+    #[derive(Default)]
+    struct Announcing {
+        quiet: Quiet,
+        signal: Arc<EventSignal>,
+    }
+
+    impl AgentProvider for Announcing {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.quiet.capabilities()
+        }
+        fn info(&self) -> ProviderInfo {
+            self.quiet.info()
+        }
+        fn create_session(&self, r: CreateSessionRequest) -> Result<String, ProviderError> {
+            self.quiet.create_session(r)
+        }
+        fn resume_session(&self, r: ResumeSessionRequest) -> Result<String, ProviderError> {
+            self.quiet.resume_session(r)
+        }
+        fn send_turn(&self, r: SendTurnRequest) -> Result<String, ProviderError> {
+            self.quiet.send_turn(r)
+        }
+        fn interrupt_turn(&self, r: InterruptTurnRequest) -> Result<(), ProviderError> {
+            self.quiet.interrupt_turn(r)
+        }
+        fn resolve_permission(&self, r: ResolvePermissionRequest) -> Result<(), ProviderError> {
+            self.quiet.resolve_permission(r)
+        }
+        fn close_session(&self, r: CloseSessionRequest) -> Result<(), ProviderError> {
+            self.quiet.close_session(r)
+        }
+        fn pump(&self) -> Vec<AgentDomainEvent> {
+            self.quiet.pump()
+        }
+        fn event_signal(&self) -> Option<Arc<EventSignal>> {
+            Some(Arc::clone(&self.signal))
+        }
+    }
+
+    fn start(provider: Arc<dyn AgentProvider + Send + Sync>) -> ConversationIngest {
+        ConversationIngest::start(
+            provider,
+            "claude",
+            "c".into(),
+            "/tmp/ws".into(),
+            false,
+            None,
+            None,
+            AgentSessionProjection::default(),
+        )
+    }
+
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what} did not happen within 5 s");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A provider that announces its events is not asked while it has none: the idle thread sleeps
+    /// (it was woken about 200 times a second, measured), and an announced event is still folded at
+    /// once.
+    #[test]
+    fn an_announcing_provider_is_not_polled_while_it_is_quiet() {
+        let provider = Arc::new(Announcing::default());
+        let mut ingest = start(provider.clone());
+        wait_for("the first pump", || provider.quiet.pumps.load(Ordering::Relaxed) >= 1);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let idle = provider.quiet.pumps.load(Ordering::Relaxed);
+        assert!(idle <= 2, "asked {idle} times in half a second of silence");
+
+        provider
+            .quiet
+            .queued
+            .lock()
+            .unwrap()
+            .push(AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
+        provider.signal.raise();
+        wait_for("the announced event's fold", || {
+            ingest.projection().user_prompts.len() == 1
+        });
+
+        let started = std::time::Instant::now();
+        ingest.stop();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a sleeping thread is woken to stop"
+        );
+    }
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    /// Test-only: run by the ingestion thread of the conversation with this id, each time round, after
+    /// it found no stop and before it reads the signal. Keyed by conversation id so tests running in
+    /// parallel do not reach each other's threads.
+    static HOOKS: Mutex<Vec<(String, Hook)>> = Mutex::new(Vec::new());
+
+    pub(super) fn between_the_check_and_the_look(conversation_id: &str) {
+        let hook = HOOKS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| id == conversation_id)
+            .map(|(_, hook)| hook.clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// A stop that lands after the thread found no stop and before it read the signal still ends the
+    /// thread. The stop's raise is then part of what the thread saw, so only a look at the stop after
+    /// that read (here: under the signal's lock, as the wait's own condition) can notice it; waiting on
+    /// the count alone slept until the provider's next event, which a closed session never sends, and
+    /// `stop()` never returned.
+    #[test]
+    fn a_stop_between_the_check_and_the_look_still_ends_the_thread() {
+        let provider = Arc::new(Announcing::default());
+        let conversation_id = uuid::Uuid::new_v4().simple().to_string();
+        // The second time round the thread parks here until the test has stopped it.
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked = Mutex::new(Some((parked_tx, go_rx)));
+        HOOKS.lock().unwrap().push((
+            conversation_id.clone(),
+            Arc::new(move || {
+                if rounds.fetch_add(1, Ordering::SeqCst) == 1 {
+                    if let Some((parked_tx, go_rx)) = parked.lock().unwrap().take() {
+                        parked_tx.send(()).unwrap();
+                        let _ = go_rx.recv();
+                    }
+                }
+            }),
+        ));
+        let ingest = ConversationIngest::start(
+            provider.clone(),
+            "claude",
+            conversation_id.clone(),
+            "/tmp/ws".into(),
+            false,
+            None,
+            None,
+            AgentSessionProjection::default(),
+        );
+        // A first round that finds nothing and sleeps; raised once to send it round again.
+        wait_for("the first pump", || provider.quiet.pumps.load(Ordering::Relaxed) >= 1);
+        provider.signal.raise();
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the second round");
+
+        // The stop lands while the thread is parked between its check and its look.
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel::<()>();
+        let stopper = std::thread::spawn(move || {
+            let mut ingest = ingest;
+            ingest.stop();
+            let _ = stopped_tx.send(());
+        });
+        wait_for("the stop's raise", || provider.signal.seen() >= 2);
+        go_tx.send(()).unwrap();
+        HOOKS.lock().unwrap().retain(|(id, _)| id != &conversation_id);
+        assert!(
+            stopped_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "stop() did not return: the thread slept through the stop"
+        );
+        stopper.join().unwrap();
+    }
+
+    /// A provider that announces nothing (its `pump` may act on the clock) is still asked on a timer.
+    #[test]
+    fn a_provider_that_announces_nothing_is_still_polled() {
+        let provider = Arc::new(Quiet::default());
+        let mut ingest = start(provider.clone());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let pumps = provider.pumps.load(Ordering::Relaxed);
+        ingest.stop();
+        assert!(pumps >= 10, "asked only {pumps} times in 200 ms");
     }
 }

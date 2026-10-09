@@ -1,9 +1,9 @@
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AgentUiState, ToolCallRecord } from "../types";
 import { renderToolCall } from "../toolRegistry";
-import { buildTimeline, isUsableLink } from "../timeline";
+import { buildTimeline, isUsableLink, type TimelineItem } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
-import { renderMarkdown } from "../markdown";
+import { forgetMarkdown, renderMarkdown } from "../markdown";
 import { turnEndingText } from "../turnEnding";
 import { HistoryNotice } from "./HistoryNotice";
 import { PermissionCard } from "./PermissionCard";
@@ -24,9 +24,14 @@ type Props = {
   /** The index into THIS component's own `timeline` (below) that `Enter`/`y` act on in `App.tsx`.
    *  Safe to compare by position rather than by identity: both here and there, `timeline` is
    *  `buildDisplay(buildTimeline(state), …)` over the same `state`, `expanded` and `detailed`, a pure
-   *  function, so the two computations always agree on what sits at a given index for a given input
-   *  even though each holds its own copy. */
+   *  function, so the two agree on what sits at a given index for a given input (`App.tsx` hands
+   *  its own in as `timeline`, so in the panel they are the same array). */
   cursor: number;
+  /** The display timeline for exactly this `state`, `expanded` and `detailed`, when the caller has
+   *  already built it (`App.tsx` builds the same one to drive its cursor). Rebuilding it here doubled
+   *  the work of every streamed batch: a merge and sort of the whole conversation. Left out, it is
+   *  built here from the same three props. */
+  timeline?: TimelineItem[];
   /** `Ctrl+o` shows every result in full, at wider cuts, with no collapsed runs. Stored per tab
    *  in `TabViewState.detailed`; fresh tabs default to `false`. */
   detailed?: boolean;
@@ -180,6 +185,7 @@ export function MessageList({
   sessionEnded,
   expanded,
   cursor,
+  timeline: given,
   detailed = false,
   focused = true,
   codeLanded = false,
@@ -287,11 +293,11 @@ export function MessageList({
   /* `buildTimeline` merges conversation items using the `seq` assigned by Rust's projection
      and shipped in snapshots, so reloads and `UiDelivery::Resync` preserve live ordering.
      Memoising the timeline avoids rebuilding and sorting it on unrelated parent renders.
-     This does not avoid `renderMarkdown` running over every transcript message on each render.
-     Keep `timeline` above `onScroll` because its `updatePill` closure reads the same binding. */
+     `MarkdownBody` renders each reply once per text instead of repeating markdown processing
+     for every list render. Keep `timeline` above `onScroll` because `updatePill` reads it too. */
   const timeline = useMemo(
-    () => buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
-    [state, expanded, detailed],
+    () => given ?? buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
+    [given, state, expanded, detailed],
   );
 
   const followingRef = useRef(true);
@@ -597,7 +603,7 @@ export function MessageList({
                   {/* `renderMarkdown` (`../markdown.ts`) is marked.parse, now with a `code` renderer
                       that runs highlight.js against nvim's own syntax colours, then DOMPurify.sanitize
                       -- one function so no caller can run half of it. */}
-                  <div dangerouslySetInnerHTML={{ __html: renderMarkdown(item.text) }} />
+                  <MarkdownBody text={item.text} />
                 </Row>
               );
             }
@@ -677,3 +683,26 @@ export function MessageList({
     </>
   );
 }
+
+/** One reply's rendered HTML, made when the reply first shows and again only when its text changes.
+ *  The list renders every row on every update (a cursor move, a streamed batch), and leaving that to
+ *  `renderMarkdown`'s bounded cache alone re-parsed every reply on every render once a conversation
+ *  held more replies than the cache holds: each pass in order evicted the next entry it needed.
+ *
+ *  A reply that is still streaming changes text on every batch; its earlier text is dropped from the
+ *  shared cache as it is replaced, so a long streamed reply does not leave one cached copy of the
+ *  whole reply per batch behind it. */
+const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
+  const html = useMemo(() => renderMarkdown(text), [text]);
+  // The text this row last put on screen, and the dropping of the one before it, happen in an effect:
+  // effects run only for a render React committed, so a render it threw away cannot drop a text that
+  // is still shown. Not dropped when the row unmounts: a tab switch unmounts every row, and coming
+  // back would then render every reply again.
+  const shownRef = useRef<string | null>(null);
+  useEffect(() => {
+    const before = shownRef.current;
+    shownRef.current = text;
+    if (before !== null && before !== text) forgetMarkdown(before);
+  }, [text]);
+  return <div dangerouslySetInnerHTML={{ __html: html }} />;
+});

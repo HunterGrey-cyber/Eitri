@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { ProjectDirContext } from "./projectPath";
-import { applyCallNotes, applyEvent, applySnapshot, initialState, keepAfterFailure, resumeAttached } from "./reducer";
+import { applyCallNotes, applyEvents, applySnapshot, initialState, keepAfterFailure, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { NavKeyDirection, OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
@@ -799,10 +799,22 @@ export default function App() {
   // Companion mode: where the panel stands with the editor beside it. `null` is the one-window mode,
   // where Rust never sends one.
   const [editorLink, setEditorLink] = useState<EditorLink | null>(null);
-  /** The unread indicator reported by `MessageList` through `onUnreadChange`. `jump` starts as
-   *  a no-op so the band can accept clicks before the first `updatePill`, including before any
-   *  scroll on mount. */
-  const [unread, setUnread] = useState<{ label: string | null; jump: () => void }>({ label: null, jump: () => {} });
+  /** The unread pill is reported by `MessageList` through `onUnreadChange` and drawn in the
+   *  band. `jump` starts as a no-op so a click before the first `updatePill` is safe. Only the
+   *  label is state: reports arrive on every scroll and update, and storing each fresh `jump`
+   *  closure in state would render the whole panel on every scroll frame. Keep the latest
+   *  closure in a ref. */
+  const [unreadLabel, setUnreadLabelState] = useState<string | null>(null);
+  /** The label last set, compared before setting: a state setter handed its current value still
+   *  renders the panel once more when it is called from a layout effect, as `MessageList`'s is on
+   *  every update. */
+  const unreadLabelRef = useRef<string | null>(null);
+  const setUnreadLabel = (label: string | null) => {
+    if (label === unreadLabelRef.current) return;
+    unreadLabelRef.current = label;
+    setUnreadLabelState(label);
+  };
+  const unreadJumpRef = useRef<() => void>(() => {});
   /** The unread pill's current `seq` threshold, mirrored from `MessageList`'s `onUnreadChange` third
    *  argument -- read (not `state`) when a switch saves the departing tab's view, so
    *  a row that arrives while a tab is away is still counted once the reader comes back to it. A ref,
@@ -2709,7 +2721,8 @@ export default function App() {
           // starts with no threshold to remember -- the `snapshot` arm's restore block below sets a
           // real one back in (via `unseenSeed`) only for a tab whose saved view was actually parked
           //.
-          setUnread({ label: null, jump: () => {} });
+          setUnreadLabel(null);
+          unreadJumpRef.current = () => {};
           unseenAfterSeqRef.current = null;
           setScratchEditing(false);
           setQueueTaken(null);
@@ -2868,7 +2881,7 @@ export default function App() {
         ) {
           firstTextReceivedAt.current = performance.now();
         }
-        setState((s) => applyCallNotes(payload.events.reduce((acc, event) => applyEvent(acc, event), s), payload));
+        setState((s) => applyCallNotes(applyEvents(s, payload.events), payload));
       } else if (payload.kind === "command_result") {
         setPendingCommands((prev) => {
           const next = new Set(prev);
@@ -5714,6 +5727,7 @@ export default function App() {
           sessionEnded={frozenSnapshot?.sessionEnded ?? sessionEnded}
           expanded={frozenSnapshot?.expanded ?? expanded}
           cursor={frozenTimeline === null ? cursor : (indexOfKey(frozenTimeline, timeline[cursor]?.key ?? "") ?? -1)}
+          timeline={frozenTimeline ?? timeline}
           detailed={frozenSnapshot?.detailed ?? detailed}
           focused={paneFocused && !edgeFocused}
           codeLanded={codeLanded}
@@ -5727,7 +5741,8 @@ export default function App() {
           }}
           onOpenPath={openPath}
           onUnreadChange={(label, jump, afterSeq) => {
-            setUnread({ label, jump });
+            setUnreadLabel(label);
+            unreadJumpRef.current = jump;
             unseenAfterSeqRef.current = afterSeq;
           }}
           unseenSeed={unseenSeed}
@@ -5990,7 +6005,7 @@ export default function App() {
           message: flash?.text ?? null,
           prompt: confirmBandPrompt,
           warn: statusWarning(state.provider, activeTab?.failure ?? null),
-          unread: unread.label,
+          unread: unreadLabel,
           cards: state.pendingPermissions.length,
           queued: queue.length,
           context: sessionEnded ? null : contextFact(editorContext),
@@ -6013,7 +6028,7 @@ export default function App() {
         }}
         paneFocused={paneFocused}
         onOpenDetail={() => post({ type: "open_detail" })}
-        onJump={unread.jump}
+        onJump={() => unreadJumpRef.current()}
       />
       <HintLayer root={containerRef.current} hints={hints} typed={hintTyped} />
     </div>

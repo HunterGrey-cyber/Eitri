@@ -187,6 +187,18 @@ pub struct Screen {
     /// [`Self::render`] uses it for the live-bottom view while an update is open. Outside an
     /// update it projects the quiescent live `term`.
     frame: TerminalFrame,
+    /// [`Self::content_revision`] when `frame` was projected: a snapshot is taken again only once
+    /// the `Term` has changed since. An empty synchronized update (`ESC[?2026h ESC[?2026l`, what
+    /// nvim sends when a redraw changes nothing) otherwise paid a whole-screen projection at every
+    /// opening, hidden or not, and every render re-projected an unchanged screen.
+    frame_revision: u64,
+    /// How many times the grid was resized: the one change to the `Term` that is not a parser
+    /// dispatch, counted into [`Self::content_revision`].
+    resizes: u64,
+    /// [`Self::content_revision`] and the listener's count of titles and bells at the last
+    /// publication: what [`Self::publication_is_visible`] measures the next one from.
+    published_revision: u64,
+    published_inert: u64,
     /// Count updates forced closed by `abort_sync`. Add this to `SyncBarrier`'s `esu_count` in
     /// [`Self::open_update`] so the ordinal changes whenever an update ends, whether by ESU or
     /// abort.
@@ -229,6 +241,10 @@ impl Screen {
             size,
             dirty: true,
             frame,
+            frame_revision: 0,
+            resizes: 0,
+            published_revision: 0,
+            published_inert: 0,
             abort_count: 0,
             scroll: ScrollView::new(),
             pinned_frame: None,
@@ -246,20 +262,66 @@ impl Screen {
     /// open. A chunk can contain several `BSU ... ESU BSU ...` transitions; each opening
     /// replaces the snapshot, leaving the state just before the last still-open update.
     pub fn feed(&mut self, bytes: &[u8]) {
-        let mut published = false;
         for &byte in bytes {
             let was_in_sync = self.sync.barrier().in_sync();
+            let mut published = false;
             self.sync
                 .feed(&mut self.term, &[byte], |_term, _reason| published = true);
+            // Judged at the byte that published, so what it measures is exactly what was published.
+            if published && self.publication_is_visible() {
+                self.dirty = true;
+            }
             if !was_in_sync && self.sync.barrier().in_sync() {
-                self.frame = self.projector.full(&self.term);
+                self.refresh_frame();
             }
         }
-        self.dirty |= published;
         // Output can evict or reflow what a pinned view holds; re-align once per call, the same
         // cadence `RawViewport::observe`'s own doc asks for ("once per wakeup while pinned"). A
         // no-op while following the bottom.
         self.scroll.observe(&self.term);
+    }
+
+    /// A number that changes whenever the `Term` may have changed what [`Projector::full`] reads:
+    /// every parser dispatch except the two synchronized-update markers themselves (which change no
+    /// cell, mode or colour; `terminal-sync` counts all three kinds separately), plus every resize.
+    /// Conservative: a dispatch that changes nothing (a title) still moves it.
+    fn content_revision(&self) -> u64 {
+        let barrier = self.sync.barrier();
+        barrier.dispatch_count() - barrier.bsu_count() - barrier.esu_count() + self.resizes
+    }
+
+    /// Whether what was published since the last publication could change a frame: anything but a
+    /// run of titles and bells, which the host shows elsewhere (or not at all) and which used to
+    /// rebuild and repaint the whole screen as often as a program sent them.
+    ///
+    /// Exact, not a guess: `Term` reports a title (or its reset) only from `set_title` and
+    /// `pop_title`, and a bell only from `bell`, at most one per dispatch, and none of those three
+    /// changes a cell, the cursor, a mode or a colour. So when every content dispatch since the last
+    /// publication produced one of those events, the two counts moved together and nothing visible
+    /// changed; any other dispatch moves the first without the second. A resize moves the first too,
+    /// and is drawn anyway.
+    fn publication_is_visible(&mut self) -> bool {
+        let revision = self.content_revision();
+        let inert = self.listener.inert_events();
+        let visible = revision - self.published_revision != inert - self.published_inert;
+        self.published_revision = revision;
+        self.published_inert = inert;
+        visible
+    }
+
+    /// `frame` projected from the live `term`, unless nothing has changed since it last was.
+    fn refresh_frame(&mut self) {
+        let revision = self.content_revision();
+        if revision != self.frame_revision {
+            self.frame = self.projector.full(&self.term);
+            self.frame_revision = revision;
+        }
+    }
+
+    /// How many whole-screen snapshots this screen has projected: what [`Self::refresh_frame`] saves
+    /// is visible here.
+    pub fn snapshots(&self) -> u64 {
+        self.projector.stats().full_frames
     }
 
     /// Whether anything visible changed since the last call.
@@ -282,6 +344,7 @@ impl Screen {
         let size = size.clamped();
         self.size = size;
         self.term.resize(grid_size(size));
+        self.resizes += 1;
         self.dirty = true;
         self.scroll.observe(&self.term);
     }
@@ -311,7 +374,9 @@ impl Screen {
         if was_open {
             self.abort_count += 1;
         }
-        self.dirty |= published;
+        if published && self.publication_is_visible() {
+            self.dirty = true;
+        }
     }
 
     pub fn set_colors(&mut self, colors: TerminalColors) {
@@ -402,7 +467,7 @@ impl Screen {
         let (top_line, mode) = self.scroll.window(&self.term);
         let update_open = self.open_update().is_some();
         if !update_open {
-            self.frame = self.projector.full(&self.term);
+            self.refresh_frame();
         }
         let frame: &TerminalFrame = match mode {
             ViewMode::FollowBottom => &self.frame,
@@ -549,7 +614,12 @@ impl Screen {
         let bare_modifier =
             matches!(input, NormalizedInput::Key { event, .. } if terminal_input::is_modifier_key(event));
         if !bare_modifier {
-            self.scroll(ScrollRequest::Bottom);
+            // Only a view that is scrolled back has anything to snap. Marking an unchanged screen
+            // dirty here spent the render clock's leading edge on a frame identical to the last
+            // one, so the echo that followed a millisecond later waited out the rest of the frame.
+            if self.scroll.scrolled() {
+                self.scroll(ScrollRequest::Bottom);
+            }
             if self.term.selection.take().is_some() {
                 self.dirty = true;
             }
@@ -735,6 +805,99 @@ mod tests {
         screen.render(true);
         let cell = screen.cursor_cell();
         assert_eq!((cell.row, cell.col), (2, 9), "the update ended: now its cursor");
+    }
+
+    /// Typing at the live bottom with nothing selected changes nothing a frame shows; typing while
+    /// scrolled back snaps to the bottom, and that is a change.
+    #[test]
+    fn a_key_at_the_live_bottom_does_not_mark_the_screen_dirty() {
+        use terminal_input::keys::{Key, KeyEvent, ModifiersState};
+        let key = NormalizedInput::Key {
+            event: KeyEvent::press(Key::Character("x".to_string())),
+            mods: ModifiersState::empty(),
+        };
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        for i in 0..40 {
+            screen.feed(format!("line {i}\r\n").as_bytes());
+        }
+        screen.take_dirty();
+        screen.note_input(&key);
+        assert!(!screen.take_dirty(), "nothing to snap and nothing selected");
+        screen.scroll(ScrollRequest::Lines(3));
+        assert!(screen.scrolled());
+        screen.take_dirty();
+        screen.note_input(&key);
+        assert!(!screen.scrolled(), "typing snaps to the bottom");
+        assert!(screen.take_dirty(), "and the snap is drawn");
+    }
+
+    /// An empty synchronized update changes nothing, so its opening takes no snapshot, and a render
+    /// of a screen nothing has touched projects nothing either. A real change still does both.
+    #[test]
+    fn an_unchanged_screen_is_not_projected_again() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"hello");
+        screen.render(true);
+        let taken = screen.snapshots();
+        for _ in 0..100 {
+            screen.feed(b"\x1b[?2026h\x1b[?2026l");
+        }
+        screen.render(true);
+        screen.render(false);
+        screen.mark_dirty();
+        screen.render(true);
+        assert_eq!(screen.snapshots(), taken, "nothing changed: no projection");
+        screen.feed(b"\x1b[?2026h");
+        assert_eq!(screen.snapshots(), taken, "the update opened on the frame already held");
+        screen.feed(b"!\x1b[?2026l");
+        screen.render(true);
+        assert_eq!(
+            screen.snapshots(),
+            taken + 1,
+            "a change inside the update is projected once"
+        );
+        let drawn = screen
+            .render(true)
+            .ops
+            .iter()
+            .any(|op| matches!(op, terminal_render::PaintOp::DrawText { row: 0, col: 5, text, .. } if text == "!"));
+        assert!(drawn, "and drawn");
+        screen.resize(PtySize { cols: 30, ..SIZE });
+        assert_eq!(screen.render(true).cols, 30, "a resize is a change too");
+        assert_eq!(screen.snapshots(), taken + 2);
+    }
+
+    /// Titles and bells change nothing a frame shows, so publishing them leaves the screen clean;
+    /// anything else published beside them -- before, after, or inside the same synchronized update
+    /// -- still marks it dirty.
+    #[test]
+    fn titles_and_bells_alone_do_not_mark_the_screen_dirty() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.take_dirty();
+        screen.feed(b"\x1b]2;one\x07\x07\x1b]0;two\x07\x1b]2;\x07");
+        assert!(!screen.take_dirty(), "titles, an empty one, and a bell");
+        // Pushing the title reports nothing, so it cannot be told from a dispatch that drew: it
+        // counts as visible. Conservative, and rare.
+        screen.feed(b"\x1b[22;0t");
+        assert!(screen.take_dirty(), "a title push is not known to be inert");
+        assert!(screen.take_events().bell, "the events themselves still go out");
+        screen.feed(b"\x1b]2;three\x07x");
+        assert!(screen.take_dirty(), "a character after a title");
+        screen.feed(b"y\x1b]2;four\x07");
+        assert!(screen.take_dirty(), "a character before a title");
+        screen.feed(b"\x1b[?2026h\x1b]2;five\x07");
+        screen.feed(b"z\x07\x1b[?2026l");
+        assert!(
+            screen.take_dirty(),
+            "a character inside an update with a title and a bell"
+        );
+        screen.feed(b"\x1b[?2026h\x1b]2;six\x07\x1b[?2026l");
+        assert!(!screen.take_dirty(), "an update holding only a title");
+        screen.feed(b"\x1b[?2026h\x1b[Hq");
+        screen.abort_sync();
+        assert!(screen.take_dirty(), "an aborted update that drew something");
+        screen.feed(b"\x1b[?25l");
+        assert!(screen.take_dirty(), "hiding the cursor is visible");
     }
 
     #[test]

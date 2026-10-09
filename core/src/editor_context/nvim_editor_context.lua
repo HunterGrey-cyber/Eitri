@@ -23,8 +23,9 @@ end
 
 -- Send at most this often. CursorMoved fires on every cursor motion, so a write per event means a
 -- connect/write/close per keypress while a key repeats -- the theme feed has no equivalent problem
--- because ColorScheme is rare. A dirty flag plus one repeating timer bounds the rate no matter how
--- fast the user types, and 150ms is far below the time it takes to move a hand to the panel.
+-- because ColorScheme is rare. The first change after a send arms a one-shot timer and later ones
+-- ride along without moving it, which bounds the rate no matter how fast the user types; 150ms is
+-- far below the time it takes to move a hand to the panel. Nothing runs while nothing changes.
 local INTERVAL_MS = 150
 
 -- Never fetch more than this many lines of a selection: fetching a 100,000-line selection would
@@ -37,8 +38,13 @@ local MAX_SELECTION_LINES = 400
 -- even one valid selected line can be larger than the host's bounded socket reader permits.
 local CONTENT_LIMIT = 2000
 local TRUNCATION_MARKER = "\n... (truncated)"
+-- A character is at most 4 bytes, so this many bytes of selected text hold more than CONTENT_LIMIT
+-- characters (with 8 to spare for a cut inside a character, or an exclusive 'selection' leaving out
+-- the last one): fetching further would copy text only to cut it off.
+local CONTENT_BYTES = 4 * (CONTENT_LIMIT + 1) + 8
 
-local dirty = true
+-- Whether something changed since the last send; the timer is armed exactly while it is set.
+local dirty = false
 -- Set first thing by the teardown: a send the timer queued just before it must write nothing.
 local torn = false
 
@@ -109,6 +115,27 @@ local function capped_block_end(first, last)
   return nil
 end
 
+-- Where a charwise or linewise fetch from `first` to `last` can end instead: the position at which
+-- the text fetched so far is CONTENT_BYTES long, or nil when it never is before `last`'s own line
+-- (that line is never cut: 'selection' and the cursor decide where it ends). Only line lengths are
+-- read, so nothing is copied to find it. The text up to it holds more than CONTENT_LIMIT characters,
+-- so the result is cut at the same character as the whole selection's would be.
+local function content_end(mode, first, last)
+  local fetched = 0
+  for lnum = first[2], last[2] - 1 do
+    local length = vim.fn.col({ lnum, "$" }) - 1
+    local from = (mode == "v" and lnum == first[2]) and first[3] or 1
+    local remaining = CONTENT_BYTES - fetched
+    local here = math.max(length - from + 1, 0)
+    if here >= remaining then
+      return { 0, lnum, from + remaining - 1, 0 }
+    end
+    -- The newline that joins it to the next line counts as one character.
+    fetched = fetched + here + 1
+  end
+  return nil
+end
+
 local function selection()
   local mode = vim.fn.mode()
   -- Visual (v), visual-line (V) and visual-block (\22) only. `'<` and `'>` are deliberately not
@@ -141,9 +168,21 @@ local function selection()
       fetch_last[3] = 2147483647
     end
   end
+  local fetch_first, fetch_type = first, mode
+  if fetch_last and mode ~= "\22" then
+    local cut = content_end(mode, first, fetch_last)
+    if cut then
+      -- Fetched charwise up to the cut, from the first line's start for a linewise selection: the
+      -- same text as the selection's, ending sooner.
+      if mode == "V" then
+        fetch_first = { first[1], first[2], 1, 0 }
+      end
+      fetch_last, fetch_type = cut, "v"
+    end
+  end
   local lines = {}
   if fetch_last then
-    local ok, got = pcall(vim.fn.getregion, first, fetch_last, { type = mode })
+    local ok, got = pcall(vim.fn.getregion, fetch_first, fetch_last, { type = fetch_type })
     if not ok or type(got) ~= "table" then
       return nil
     end
@@ -195,27 +234,34 @@ local function send()
   end)
 end
 
+local timer = vim.uv.new_timer()
+
+local function fire()
+  dirty = false
+  -- `vim.fn.*` and `nvim_api` are not allowed in a libuv callback (a "fast event"); hop to the
+  -- main loop first. Getting this wrong fails with E5560 at runtime, never at load.
+  vim.schedule(send)
+end
+
+-- The first change after a send arms the timer; later ones wait for the same send.
+local function changed()
+  if dirty or torn then
+    return
+  end
+  dirty = true
+  timer:start(INTERVAL_MS, 0, fire)
+end
+
 local group = vim.api.nvim_create_augroup("EitriEditorContext", { clear = true })
 vim.api.nvim_create_autocmd(
   { "CursorMoved", "CursorMovedI", "ModeChanged", "BufEnter", "BufFilePost", "VimEnter" },
   {
     group = group,
-    callback = function()
-      dirty = true
-    end,
+    callback = changed,
   }
 )
-
-local timer = vim.uv.new_timer()
-timer:start(INTERVAL_MS, INTERVAL_MS, function()
-  if not dirty then
-    return
-  end
-  dirty = false
-  -- `vim.fn.*` and `nvim_api` are not allowed in a libuv callback (a "fast event"); hop to the
-  -- main loop first. Getting this wrong fails with E5560 at runtime, never at load.
-  vim.schedule(send)
-end)
+-- What the editor shows when this is loaded is news too.
+changed()
 
 -- Undoes this chunk: the autocommands and the timer.
 return function()

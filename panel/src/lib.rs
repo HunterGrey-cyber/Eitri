@@ -18,3 +18,7 @@ pub mod window_config;
 
 #[cfg(test)]
 mod manifest_guard;
+
+#[cfg(test)]
+#[global_allocator]
+static COUNTING: eitri_core::alloc_count::Counting = eitri_core::alloc_count::Counting;

@@ -111,12 +111,35 @@ impl NewestLineReader {
         }
     }
 
-    /// The newest complete line whose `accept` returned true, or None for no news.
-    pub fn poll_with(&mut self, accept: impl FnMut(&[u8]) -> bool) -> Option<Vec<u8>> {
-        self.poll_with_at(Instant::now(), accept)
+    /// Whether a connection was accepted and its line is not finished: a host must poll again
+    /// (on a timer) rather than wait for the listener, which will not say so.
+    pub fn holds_connections(&self) -> bool {
+        !self.pending.is_empty()
     }
 
+    /// The listening socket, for a host that waits for it to become readable.
+    pub fn listener_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.listener)
+    }
+
+    /// The newest complete line whose `accept` returned true, or None for no news.
+    pub fn poll_with(&mut self, mut accept: impl FnMut(&[u8]) -> bool) -> Option<Vec<u8>> {
+        self.poll_parsed(|line| accept(line).then(|| line.to_vec()))
+    }
+
+    /// What `parse` made of the newest complete line it did not refuse (`None`), or None for no
+    /// news. `parse` is the acceptance test and the parser at once, so a delivered line is parsed
+    /// once.
+    pub fn poll_parsed<T>(&mut self, parse: impl FnMut(&[u8]) -> Option<T>) -> Option<T> {
+        self.poll_parsed_at(Instant::now(), parse)
+    }
+
+    #[cfg(test)]
     pub(crate) fn poll_with_at(&mut self, now: Instant, mut accept: impl FnMut(&[u8]) -> bool) -> Option<Vec<u8>> {
+        self.poll_parsed_at(now, |line| accept(line).then(|| line.to_vec()))
+    }
+
+    pub(crate) fn poll_parsed_at<T>(&mut self, now: Instant, mut parse: impl FnMut(&[u8]) -> Option<T>) -> Option<T> {
         self.pending
             .retain(|pending| now.duration_since(pending.accepted_at) < MAX_CONNECTION_AGE);
         for _ in 0..MAX_ACCEPTS_PER_POLL {
@@ -167,9 +190,9 @@ impl NewestLineReader {
                 ReadStatus::Complete(bytes) => {
                     let sequence = pending.sequence;
                     self.pending.remove(index);
-                    if accept(&bytes) {
+                    if let Some(parsed) = parse(&bytes) {
                         self.published_sequence = sequence;
-                        latest = Some(bytes);
+                        latest = Some(parsed);
                     }
                 }
             }

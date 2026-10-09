@@ -311,4 +311,57 @@ pub trait AgentProvider {
     /// Drains every `AgentDomainEvent` that has arrived since the last call. Never blocks --
     /// mirrors `AgentSession::pump()`'s existing contract exactly.
     fn pump(&self) -> Vec<AgentDomainEvent>;
+    /// The signal this provider raises whenever it queues something for `pump`, if it raises one
+    /// for every such event. With it the reader of `pump` sleeps until there is news; without it
+    /// (the default) the reader has to keep asking, because a provider whose `pump` also acts on
+    /// the clock (a settle deadline, say) can have news nobody announced.
+    fn event_signal(&self) -> Option<std::sync::Arc<EventSignal>> {
+        None
+    }
+}
+
+/// A counter one side raises and another waits on: "something may have changed since you last
+/// looked". Raising never blocks and is never lost, because the waiter names the count it last saw
+/// rather than waiting for an edge it might have missed.
+#[derive(Debug, Default)]
+pub struct EventSignal {
+    raised: std::sync::Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+
+impl EventSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wakes every waiter.
+    pub fn raise(&self) {
+        let mut raised = self.raised.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *raised = raised.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    /// The count to hand to [`Self::wait_past`]: read it BEFORE looking for news, so news that
+    /// lands between the look and the wait still ends the wait.
+    pub fn seen(&self) -> u64 {
+        *self.raised.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sleeps until the signal has been raised since `seen` was read.
+    pub fn wait_past(&self, seen: u64) {
+        self.wait_past_unless(seen, || false);
+    }
+
+    /// [`Self::wait_past`], ending at once, and on every wake, when `done` says so. `done` is asked
+    /// under the signal's lock: whatever a raiser set before its `raise` is visible to it, so a flag
+    /// set and raised after `seen` was read (and so not counted as news) is still seen here.
+    pub fn wait_past_unless(&self, seen: u64, done: impl Fn() -> bool) {
+        let mut raised = self.raised.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *raised == seen && !done() {
+            raised = self
+                .changed
+                .wait(raised)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
 }

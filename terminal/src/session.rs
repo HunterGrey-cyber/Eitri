@@ -270,6 +270,7 @@ impl TerminalSession {
                     outbox: Outbox::new(),
                     sync_deadline: None,
                     events_pending: false,
+                    frame_owed: false,
                     last_mouse: None,
                 };
                 match panic::catch_unwind(AssertUnwindSafe(move || worker.run())) {
@@ -397,6 +398,12 @@ struct Worker<'w> {
     /// for these), so without this flag a stream with events but no other screen change would never
     /// be judged "changed" and its title/bell would wait forever rather than for one frame.
     events_pending: bool,
+    /// The screen changed since the last frame was published and a frame is owed: taken from
+    /// `Screen::take_dirty` at every turn, and kept until the clock lets the frame go. A turn with
+    /// only `events_pending` publishes the events and builds no frame -- a title or a bell changes
+    /// nothing the frame shows (`Screen::feed` no longer marks the screen dirty for them), and the
+    /// host shows a bell itself.
+    frame_owed: bool,
     /// The mouse-mode summary last published (bottom-terminal phase 3c): `None` until
     /// [`Worker::publish_mouse_modes`] first runs, then always `Some`. Compared against the live
     /// mode every loop turn so a change is published at once rather than waiting for the next frame
@@ -703,26 +710,32 @@ impl Worker<'_> {
         }
         // A title/bell rides this same clock (`events_pending`, set by `publish_events`): pixels
         // dirty OR an event pending both count as "something changed", and both are cleared by the
-        // one publish below -- one ring, whatever the reason.
-        let dirty = self.screen.take_dirty();
-        let changed = (dirty || self.events_pending) && self.clock.changed(now);
-        if changed || self.clock.is_due(now) {
-            let frame = self.screen.render(self.focused);
-            let cursor = self.screen.cursor_cell();
-            // Beside `cursor`, not instead of `publish_mouse_modes`'s own change-detected publish:
-            // every frame carries the mode it was rendered under, so a host that only ever reads
-            // `update.mouse` off a frame it took (never off a bare mode-change ring) still sees it.
-            let modes = MouseModes::from_mode(self.screen.mode());
-            self.last_mouse = Some(modes);
-            self.clock.rendered(now);
-            self.events_pending = false;
-            self.shared.renders.fetch_add(1, Ordering::SeqCst);
-            self.publish(|update| {
-                update.frame = Some(frame);
-                update.cursor = Some(cursor);
-                update.mouse = Some(modes);
-            });
+        // one publish below -- one ring, whatever the reason. Only owed pixels build a frame.
+        self.frame_owed |= self.screen.take_dirty();
+        let changed = (self.frame_owed || self.events_pending) && self.clock.changed(now);
+        if !(changed || self.clock.is_due(now)) {
+            return;
         }
+        self.clock.rendered(now);
+        self.events_pending = false;
+        if !std::mem::take(&mut self.frame_owed) {
+            // The events are in the pending update already (`publish_events`).
+            self.ring();
+            return;
+        }
+        let frame = self.screen.render(self.focused);
+        let cursor = self.screen.cursor_cell();
+        // Beside `cursor`, not instead of `publish_mouse_modes`'s own change-detected publish:
+        // every frame carries the mode it was rendered under, so a host that only ever reads
+        // `update.mouse` off a frame it took (never off a bare mode-change ring) still sees it.
+        let modes = MouseModes::from_mode(self.screen.mode());
+        self.last_mouse = Some(modes);
+        self.shared.renders.fetch_add(1, Ordering::SeqCst);
+        self.publish(|update| {
+            update.frame = Some(frame);
+            update.cursor = Some(cursor);
+            update.mouse = Some(modes);
+        });
     }
 
     /// The live mouse-mode summary, published (and the host rung) the moment it changes, called

@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use skia_safe::{Font, FontMgr, FontStyle};
+use skia_safe::{Font, FontMgr, FontStyle, TextBlob};
 
 /// Where pixels come from, and how many cells fit.
 ///
@@ -50,7 +50,15 @@ pub struct TerminalMetrics {
     /// A `None` value is a real answer ("no face on this system has it") and is cached too, so a
     /// missing glyph does not re-query on every frame forever.
     fallback: RefCell<HashMap<(i32, bool, bool), Option<Font>>>,
+    /// The shaped blob for a grapheme, per `[bold][italic]`, memoised the same way as `fallback`
+    /// (see [`TerminalMetrics::text_blob`]).
+    blobs: RefCell<[[HashMap<String, Option<TextBlob>>; 2]; 2]>,
 }
+
+/// How many distinct graphemes [`TerminalMetrics::text_blob`] keeps per style before it starts
+/// over. A screen of text uses a few hundred; this only bounds a stream of ever-new ones (`cat` of
+/// random CJK), whose blobs would otherwise accumulate for the life of the pane.
+const BLOB_CACHE_CAP: usize = 4096;
 
 /// What a terminal defaults to when nothing else is configured. A monospace family is not optional:
 /// the whole cell model assumes every ASCII advance is identical, and a proportional face silently
@@ -106,6 +114,7 @@ impl TerminalMetrics {
         let (cols, rows) = Self::grid_for(width_px, height_px, cell_width, cell_height);
         Self {
             fallback: RefCell::new(HashMap::new()),
+            blobs: RefCell::default(),
             font,
             font_mgr,
             family: family.to_string(),
@@ -199,6 +208,7 @@ impl TerminalMetrics {
         self.fallback.borrow_mut().insert(key, found.clone());
         found.unwrap_or_else(|| styled(self.font.clone()))
     }
+
     /// The face to draw the grapheme `text` with: [`TerminalMetrics::font_for`] its first character,
     /// unless that face lacks a later one.
     ///
@@ -219,6 +229,30 @@ impl TerminalMetrics {
         } else {
             font
         }
+    }
+
+    /// The blob that draws `text` (one grapheme) in this weight and slant, positioned at the origin,
+    /// as `TextBlob::new(text, &self.font_for_text(..))` makes it -- built once and then reused.
+    ///
+    /// Every repaint draws every visible glyph. Building each one's blob again cost 1.1 ms of CPU a
+    /// frame on a dense 160x50 screen, on the thread that paints, and a new blob is also a new
+    /// identity to Skia's GPU text cache, which keys on the blob and so could reuse nothing from the
+    /// frame before. The font a grapheme is drawn with depends only on these metrics and the three
+    /// keys, so the blob does too; [`TerminalMetrics::rescale`] builds new metrics, and with them an
+    /// empty cache. A `None` (nothing to shape) is remembered like a blob.
+    pub fn text_blob(&self, text: &str, bold: bool, italic: bool) -> Option<TextBlob> {
+        let mut blobs = self.blobs.borrow_mut();
+        let cache = &mut blobs[usize::from(bold)][usize::from(italic)];
+        if let Some(blob) = cache.get(text) {
+            return blob.clone();
+        }
+        if cache.len() >= BLOB_CACHE_CAP {
+            cache.clear();
+        }
+        let font = self.font_for_text(text, bold, italic);
+        let blob = TextBlob::new(text, &font);
+        cache.insert(text.to_owned(), blob.clone());
+        blob
     }
 
     pub fn font_mgr(&self) -> &FontMgr {
@@ -302,6 +336,23 @@ impl std::fmt::Debug for TerminalMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grapheme's blob is built once per style and reused: the same blob, not a new one with the
+    /// same glyphs, so Skia sees one identity across frames. Another style is another blob, and the
+    /// cache stays bounded however many distinct graphemes go by.
+    #[test]
+    fn a_glyphs_blob_is_built_once_and_reused() {
+        let metrics = TerminalMetrics::new(800.0, 600.0, 1.0);
+        let first = metrics.text_blob("a", false, false).expect("a blob");
+        let again = metrics.text_blob("a", false, false).expect("a blob");
+        assert_eq!(first.unique_id(), again.unique_id(), "the same blob, reused");
+        let bold = metrics.text_blob("a", true, false).expect("a blob");
+        assert_ne!(bold.unique_id(), first.unique_id(), "bold is drawn with another font");
+        for c in (0x4e00..0x4e00 + BLOB_CACHE_CAP as u32 + 10).filter_map(char::from_u32) {
+            metrics.text_blob(&c.to_string(), false, false);
+        }
+        assert!(metrics.blobs.borrow()[0][0].len() <= BLOB_CACHE_CAP);
+    }
 
     #[test]
     fn a_monospace_face_gives_every_ascii_glyph_the_same_advance() {

@@ -101,7 +101,7 @@ pub use projection::{
     MAX_TURN_END_MESSAGE_CHARS,
 };
 pub use provider::{
-    AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
+    AgentProvider, CloseSessionRequest, CreateSessionRequest, EventSignal, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
     ResumeSessionRequest, SendTurnRequest, StreamingPreference,
 };

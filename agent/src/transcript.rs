@@ -174,7 +174,15 @@ pub fn newest_ai_title(path: &Path) -> Option<String> {
         if seeked && index == 0 {
             continue;
         }
+        // Most lines are messages and tool results, and parsing each one only to read its type was
+        // most of this function's time. A line whose type is `ai-title` holds those bytes, unless
+        // the string is written with a `\u` escape, so only a line with neither is skipped unparsed.
         let Ok(text) = std::str::from_utf8(line) else { continue };
+        if !text.contains("ai-title") && !text.contains("\\u") {
+            continue;
+        }
+        #[cfg(test)]
+        tests::PARSES.with(|parses| parses.set(parses.get() + 1));
         let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
             continue;
         };
@@ -218,6 +226,33 @@ mod tests {
     /// other: each test asks only whether its OWN path is in here.
     pub(crate) static OPEN_ATTEMPTS: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
         std::sync::Mutex::new(None);
+
+    thread_local! {
+        /// How many lines [`newest_ai_title`] parsed as JSON on this thread.
+        pub(super) static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Only the lines that can be the title are parsed: a transcript's messages are skipped by their
+    /// bytes. A title written with a `\u` escape is still found.
+    #[test]
+    fn only_lines_that_can_be_a_title_are_parsed() {
+        let dir = std::env::temp_dir().join(format!("eitri-title-parse-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let message = "{\"type\":\"assistant\",\"message\":{\"content\":\"hello\"}}\n";
+        let mut body = message.repeat(200);
+        body.push_str("{\"type\":\"ai-title\",\"aiTitle\":\"first\"}\n");
+        body.push_str(&message.repeat(200));
+        std::fs::write(&path, &body).unwrap();
+        let before = PARSES.with(std::cell::Cell::get);
+        assert_eq!(newest_ai_title(&path).as_deref(), Some("first"));
+        assert_eq!(PARSES.with(std::cell::Cell::get) - before, 1, "lines parsed");
+
+        body.push_str("{\"type\":\"ai\\u002dtitle\",\"aiTitle\":\"escaped\"}\n");
+        std::fs::write(&path, &body).unwrap();
+        assert_eq!(newest_ai_title(&path).as_deref(), Some("escaped"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     pub(super) fn note_open_attempt(path: &Path) {
         OPEN_ATTEMPTS
@@ -536,5 +571,72 @@ mod tests {
             Duration::from_millis(10),
         );
         assert!(result.is_err());
+    }
+}
+
+/// What reading sixteen sessions' titles costs the thread that builds the picker (the GTK thread):
+/// `EITRI_MEASURE_DIR` names where the transcripts are written, so the storage is the one measured.
+/// Cold reads drop each file's pages from the cache first (`POSIX_FADV_DONTNEED`).
+#[cfg(test)]
+mod measure {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    #[ignore]
+    fn measure_sixteen_title_reads() {
+        let dir = std::path::PathBuf::from(std::env::var("EITRI_MEASURE_DIR").expect("EITRI_MEASURE_DIR"))
+            .join(format!("titles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "word ".repeat(400)
+        );
+        let paths: Vec<_> = (0..16)
+            .map(|i| {
+                let path = dir.join(format!("{i}.jsonl"));
+                let mut file = std::fs::File::create(&path).unwrap();
+                for _ in 0..500 {
+                    file.write_all(line.as_bytes()).unwrap();
+                }
+                file.write_all(b"{\"type\":\"ai-title\",\"aiTitle\":\"a title\"}\n")
+                    .unwrap();
+                file.sync_all().unwrap();
+                path
+            })
+            .collect();
+        let evict = || {
+            for path in &paths {
+                let file = std::fs::File::open(path).unwrap();
+                // SAFETY: a valid descriptor for the call; advice only, nothing is read or written.
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            }
+        };
+        let read_all = || {
+            let started = std::time::Instant::now();
+            for path in &paths {
+                assert_eq!(newest_ai_title(path).as_deref(), Some("a title"));
+            }
+            started.elapsed()
+        };
+        let mut cold = Vec::new();
+        let mut warm = Vec::new();
+        for _ in 0..5 {
+            evict();
+            cold.push(read_all());
+            warm.push(read_all());
+        }
+        cold.sort();
+        warm.sort();
+        eprintln!(
+            "16 titles in {}: cold median {:?} max {:?}; warm median {:?} max {:?}",
+            dir.display(),
+            cold[2],
+            cold[4],
+            warm[2],
+            warm[4]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -10,7 +10,7 @@
 //! preedit over a finished frame.
 
 use crate::metrics::TerminalMetrics;
-use skia_safe::{Canvas, Color, Paint, Rect, TextBlob};
+use skia_safe::{Canvas, Color, Paint, Rect};
 use terminal_render::color::{BACKGROUND, CURSOR};
 use terminal_render::{CursorShape, GlyphStyle, PaintList, PaintOp, Palette, RgbColor, UnderlineKind};
 
@@ -53,7 +53,78 @@ pub fn paint(canvas: &Canvas, list: &PaintList, metrics: &TerminalMetrics) {
     // has to come from somewhere -- this is that colour, and skipping it leaves the previous frame
     // showing through in the margin.
     canvas.clear(to_skia(list.surface_background));
-    paint_ops(canvas, &list.ops, metrics);
+    // The backgrounds come first (`ops` is layer-ordered, fills are the lowest layer): drawn here
+    // as row runs rather than cell by cell, the rest as given.
+    let backgrounds = list
+        .ops
+        .iter()
+        .take_while(|op| matches!(op, PaintOp::FillCells { .. }))
+        .count();
+    fill_backgrounds(canvas, &list.ops[..backgrounds], list, metrics);
+    paint_ops(canvas, &list.ops[backgrounds..], metrics);
+}
+
+/// The leading `FillCells` of a frame, with the same pixels as drawing each in turn, in fewer
+/// draws. A frame fills every cell it supplies, one cell per op, almost all of them in the colour
+/// the canvas was just cleared to: thousands of `draw_rect` calls a frame that change nothing.
+///
+/// - A fill in the clear colour over cells nothing has drawn on yet is skipped: they already hold
+///   that colour. Which cells have been drawn on is tracked exactly, so a fill that repaints a cell
+///   an earlier fill coloured is still drawn.
+/// - Consecutive fills on one row, in one colour, each starting where the last ended, are one
+///   rectangle. Only neighbours in the op stream are merged and a run is drawn before the next fill
+///   that is not part of it, so the order fills reach the canvas in is kept.
+fn fill_backgrounds(canvas: &Canvas, fills: &[PaintOp], list: &PaintList, metrics: &TerminalMetrics) {
+    let (cols, rows) = (usize::from(list.cols), usize::from(list.rows));
+    let mut drawn = vec![false; cols * rows];
+    // (row, first col, cols, colour)
+    let mut run: Option<(u16, u16, u16, RgbColor)> = None;
+    let flush = |run: &mut Option<(u16, u16, u16, RgbColor)>| {
+        if let Some((row, col, n, color)) = run.take() {
+            canvas.draw_rect(metrics.cell_rect(row, col, n), &fill_paint(color));
+        }
+    };
+    for op in fills {
+        let PaintOp::FillCells {
+            row,
+            col,
+            cols: n,
+            color,
+        } = *op
+        else {
+            unreachable!("only the leading fills are passed here");
+        };
+        let inside = usize::from(row) < rows && usize::from(col) + usize::from(n) <= cols;
+        let cells = || {
+            let start = usize::from(row) * cols + usize::from(col);
+            start..start + usize::from(n)
+        };
+        if !inside {
+            // Past the lattice the frame says it has: drawn as given, on its own, and whatever part
+            // of it is on the lattice counts as drawn on.
+            if usize::from(row) < rows && usize::from(col) < cols {
+                let start = usize::from(row) * cols + usize::from(col);
+                drawn[start..usize::from(row) * cols + cols].fill(true);
+            }
+            flush(&mut run);
+            canvas.draw_rect(metrics.cell_rect(row, col, n), &fill_paint(color));
+            continue;
+        }
+        if color == list.surface_background && !drawn[cells()].contains(&true) {
+            continue;
+        }
+        drawn[cells()].fill(true);
+        match &mut run {
+            Some((r, c, len, run_color)) if *r == row && *run_color == color && *c + *len == col => {
+                *len += n;
+            }
+            _ => {
+                flush(&mut run);
+                run = Some((row, col, n, color));
+            }
+        }
+    }
+    flush(&mut run);
 }
 
 /// Executes `ops` on top of whatever the canvas already holds, without clearing it: [`paint`]'s own
@@ -203,14 +274,13 @@ fn draw_text(
         return;
     }
     let origin = metrics.text_origin(row, col);
-    // Face selection (including fallback for graphemes the primary face lacks) lives in the
-    // metrics, with the rest of the font decisions and with the memoisation that keeps it off the
-    // per-frame fontconfig path.
-    let font = metrics.font_for_text(text, style.bold, style.italic);
-
+    // Face selection (including fallback for graphemes the primary face lacks) and the blob it
+    // shapes live in the metrics, with the rest of the font decisions and with the memoisation that
+    // keeps both off the per-frame path.
+    //
     // One blob per op. A wide glyph is one draw spanning two columns: there is no second op for the
     // second column and nothing here to suppress, because the spacer concept never reaches a backend.
-    if let Some(blob) = TextBlob::new(text, &font) {
+    if let Some(blob) = metrics.text_blob(text, style.bold, style.italic) {
         canvas.draw_text_blob(blob, origin, &text_paint(color));
     }
 
@@ -489,6 +559,126 @@ mod tests {
             assert!(second >= r.y + r.thickness + 1.0, "{height}/{baseline}: {r:?}");
             assert!(second + r.thickness <= height, "{height}/{baseline}: {r:?}");
         }
+    }
+
+    fn raster(list: &PaintList, metrics: &TerminalMetrics, draw: impl Fn(&Canvas)) -> Vec<u8> {
+        let width = (f32::from(list.cols) * metrics.cell_width()).ceil() as i32 + 3;
+        let height = (f32::from(list.rows) * metrics.cell_height()).ceil() as i32 + 3;
+        let mut surface = skia_safe::surfaces::raster_n32_premul((width, height)).expect("raster");
+        draw(surface.canvas());
+        let info = surface.image_info();
+        let row_bytes = info.min_row_bytes();
+        let mut pixels = vec![0u8; row_bytes * height as usize];
+        assert!(surface.read_pixels(&info, &mut pixels, row_bytes, (0, 0)));
+        pixels
+    }
+
+    /// `paint` draws the leading fills as row runs and skips the ones that repeat the clear colour;
+    /// the pixels are those of executing every op in turn, including fills that overlap, fills in
+    /// the clear colour over a cell an earlier fill coloured, multi-cell fills and fills past the
+    /// grid.
+    #[test]
+    fn background_runs_paint_the_same_pixels_as_every_fill_in_turn() {
+        let metrics = TerminalMetrics::with_font("monospace", 13.0, 400.0, 200.0, 1.25);
+        let clear = RgbColor::new(10, 20, 30);
+        let colors = [clear, RgbColor::new(200, 0, 0), RgbColor::new(0, 200, 0)];
+        let mut x: u32 = 0x1234_5678;
+        let mut rand = move |n: u32| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x % n
+        };
+        for _ in 0..300 {
+            let (cols, rows) = (1 + rand(12) as u16, 1 + rand(5) as u16);
+            let mut ops: Vec<PaintOp> = Vec::new();
+            for _ in 0..rand(60) {
+                ops.push(PaintOp::FillCells {
+                    row: rand(u32::from(rows) + 1) as u16,
+                    col: rand(u32::from(cols) + 1) as u16,
+                    cols: 1 + rand(3) as u16,
+                    color: colors[rand(3) as usize],
+                });
+            }
+            // Mostly a frame's own shape: every cell once, left to right.
+            if rand(2) == 0 {
+                ops.clear();
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let color = colors[if rand(4) == 0 { 1 + rand(2) as usize } else { 0 }];
+                        ops.push(PaintOp::FillCells {
+                            row,
+                            col,
+                            cols: 1,
+                            color,
+                        });
+                    }
+                }
+            }
+            ops.push(PaintOp::DrawCursor {
+                row: 0,
+                col: 0,
+                cols: 1,
+                shape: CursorShape::Block,
+                color: colors[1],
+                text_under: None,
+                blinking: false,
+            });
+            let list = PaintList {
+                ops,
+                cols,
+                rows,
+                surface_background: clear,
+                top_line: 0,
+            };
+            let runs = raster(&list, &metrics, |canvas| paint(canvas, &list, &metrics));
+            let each = raster(&list, &metrics, |canvas| {
+                canvas.clear(to_skia(clear));
+                paint_ops(canvas, &list.ops, &metrics);
+            });
+            assert!(runs == each, "{:?}", list.ops);
+        }
+    }
+
+    /// A frame on one background is drawn in a handful of rectangles, not one per cell.
+    #[test]
+    fn a_frame_on_one_background_is_not_drawn_cell_by_cell() {
+        let metrics = TerminalMetrics::new(800.0, 600.0, 1.0);
+        let clear = RgbColor::new(10, 20, 30);
+        let band = RgbColor::new(90, 90, 90);
+        let mut ops = Vec::new();
+        for row in 0..50 {
+            for col in 0..160 {
+                let color = if row == 3 && (10..70).contains(&col) {
+                    band
+                } else {
+                    clear
+                };
+                ops.push(PaintOp::FillCells {
+                    row,
+                    col,
+                    cols: 1,
+                    color,
+                });
+            }
+        }
+        let list = PaintList {
+            ops,
+            cols: 160,
+            rows: 50,
+            surface_background: clear,
+            top_line: 0,
+        };
+        let mut recorder = skia_safe::PictureRecorder::new();
+        let canvas = recorder.begin_recording(skia_safe::Rect::from_wh(2000.0, 2000.0), false);
+        paint(canvas, &list, &metrics);
+        let picture = recorder.finish_recording_as_picture(None).expect("a picture");
+        // The clear and the one band: 8,000 fills before.
+        assert!(
+            picture.approximate_op_count() <= 4,
+            "{} draws",
+            picture.approximate_op_count()
+        );
     }
 
     /// A 0-column row (never reached with a real terminal, whose grid clamps below one cell) draws

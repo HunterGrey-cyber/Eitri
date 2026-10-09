@@ -71,7 +71,14 @@ export function isUsableLink(toolUseId: string | null): toolUseId is string {
  * transcript and tool entries on legacy. `timeline.test.ts` and `MessageList.test.tsx` cover the
  * linked-card behavior that legacy cannot exercise.
  */
+let timelineBuilds = 0;
+/** How many times `buildTimeline` has run in this page: the performance tests count it. */
+export function timelineBuildCount(): number {
+  return timelineBuilds;
+}
+
 export function buildTimeline(state: AgentUiState): TimelineItem[] {
+  timelineBuilds += 1;
   // Which linked cards hang off which call. A call may gate more than one.
   const anchored = new Map<string, PermissionRequestRecord[]>();
   const unanchored: PermissionRequestRecord[] = [];

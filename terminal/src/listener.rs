@@ -4,6 +4,7 @@
 //! back to the PTY once the parser returns -- the listener runs inside `Term`'s own parse and cannot
 //! reach the PTY, or read the `Term`, itself.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -47,11 +48,26 @@ pub(crate) struct Pending {
     pub(crate) events: HostEvents,
 }
 
+/// `.0` is what the host and the program are owed. `.1` counts every title, title reset and bell
+/// `Term` has reported: the only events whose dispatches change nothing a frame shows, which is how
+/// [`crate::screen::Screen`] tells a stream of them from one that drew something. A counter of its
+/// own, beside the mutex, because the screen reads it at every publication -- for plain output that
+/// is every character.
 #[derive(Clone, Default)]
-pub(crate) struct Listener(pub(crate) Arc<Mutex<Pending>>);
+pub(crate) struct Listener(pub(crate) Arc<Mutex<Pending>>, pub(crate) Arc<AtomicU64>);
+
+impl Listener {
+    /// Titles, title resets and bells reported so far.
+    pub(crate) fn inert_events(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
+    }
+}
 
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
+        if matches!(event, Event::Title(_) | Event::ResetTitle | Event::Bell) {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
         let mut pending = self
             .0
             .lock()

@@ -3143,20 +3143,27 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
         // The CLI's own prompts are never offered a rule: no saved rule answers one,
         // and the CLI itself does not let a rule silence its check.
         // A card the user already answered is never offered a rule again (`user_answered`'s doc).
-        let mut ids: Vec<_> = projection
+        let mut cards: Vec<&agent::PermissionRequestRecord> = projection
             .pending_permissions
             .values()
             .filter(|p| p.provider_prompt.is_none() && !tab.user_answered.contains(&p.permission_id))
-            .map(|p| (p.permission_id.clone(), p.tool_name.clone(), p.input.clone()))
             .collect();
-        ids.sort_by(|a, b| a.0.cmp(&b.0));
-        ids
+        cards.sort_by(|a, b| a.permission_id.cmp(&b.permission_id));
+        // Compared by id before anything is copied: this runs on every tick, and a card's input
+        // can be a whole file's content.
+        let same = cards.len() == tab.rule_offers_seen.len()
+            && cards
+                .iter()
+                .zip(&tab.rule_offers_seen)
+                .all(|(p, seen)| &p.permission_id == seen);
+        if same {
+            return false;
+        }
+        cards
+            .into_iter()
+            .map(|p| (p.permission_id.clone(), p.tool_name.clone(), p.input.clone()))
+            .collect()
     };
-    let same = pending.len() == tab.rule_offers_seen.len()
-        && pending.iter().zip(&tab.rule_offers_seen).all(|(p, seen)| &p.0 == seen);
-    if same {
-        return false;
-    }
     tab.rule_offers_seen = pending.iter().map(|p| p.0.clone()).collect();
     let offers: std::collections::BTreeMap<String, agent::PrefixRule> = pending
         .into_iter()
@@ -7823,6 +7830,34 @@ mod tests {
         });
         assert_eq!(provider.resolutions(), vec![("perm-cli".to_string(), true)]);
         assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+        shut_down_all(&mut set);
+    }
+
+    /// A waiting card is not copied by a tick that finds it unchanged: the offers are worked out again
+    /// only when the set of cards changed. A 1 MiB card used to be copied on every tick (30 a second).
+    #[test]
+    fn an_unchanged_card_is_not_copied_by_a_tick() {
+        let dir = workspace("offers-no-copy");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        // A pipe makes it a card whatever the command, and the card is the size of a large edit.
+        let command = format!("echo {} | wc -c", "x".repeat(1 << 20));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-big".into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": command }),
+            provider_prompt: None,
+        });
+        until("the card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        set.pump(&dir, true);
+        let (_, bytes) = crate::alloc_count::bytes_allocated_by(|| set.pump(&dir, true));
+        assert!(bytes < 64 * 1024, "one quiet tick allocated {bytes} bytes");
         shut_down_all(&mut set);
     }
 

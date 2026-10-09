@@ -6690,6 +6690,44 @@ mod tests {
         assert!(handle.state.borrow().tabs.get(on_screen).is_some());
     }
 
+    /// What one tick of a settled panel costs: a ready page, one empty tab, a selection in the
+    /// editor, nothing happening. For a measurement run by hand (`--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn measure_an_idle_tick() {
+        let (handle, page) = handle_with_strict_page();
+        page.inner.visible.set(true);
+        let context = eitri_core::editor_context::EditorContext {
+            file: "/p/src/main.rs".into(),
+            selection: Some(eitri_core::editor_context::Selection {
+                start_line: 10,
+                end_line: 60,
+                text: "x".repeat(2000),
+            }),
+        };
+        handle.state.borrow_mut().editor_context = Rc::new(move || Some(context.clone()));
+        handle.state.borrow_mut().project_dir = PathBuf::from("/p");
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        for _ in 0..10 {
+            handle.tick();
+        }
+        let sent = page.inner.sent.borrow().len();
+        let ticks = 1000;
+        let started = std::time::Instant::now();
+        let (_, bytes) = eitri_core::alloc_count::bytes_allocated_by(|| {
+            for _ in 0..ticks {
+                handle.tick();
+            }
+        });
+        let elapsed = started.elapsed();
+        assert_eq!(page.inner.sent.borrow().len(), sent, "an idle tick sends nothing");
+        eprintln!(
+            "idle tick: {:?} and {} bytes allocated each",
+            elapsed / ticks,
+            bytes / ticks as usize
+        );
+    }
+
     #[test]
     fn a_panel_with_no_page_never_ticks() {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));

@@ -173,6 +173,11 @@ impl Drop for ThemeFeed {
 pub struct ThemePayloadReader(NewestLineReader);
 
 impl ThemePayloadReader {
+    /// The bounded reader underneath, for a host deciding whether there is anything to read.
+    pub(crate) fn lines(&self) -> &NewestLineReader {
+        &self.0
+    }
+
     pub fn new(listener: UnixListener) -> Self {
         Self(NewestLineReader::new(listener, "theme"))
     }
@@ -181,15 +186,13 @@ impl ThemePayloadReader {
     /// caller must read `None` as "no news", never as "no theme": the host keeps whatever
     /// `ThemeTokens` it last derived.
     pub fn poll(&mut self) -> Option<NvimThemePayload> {
-        self.0
-            .poll_with(|line| match parse_bytes(line) {
-                Ok(_) => true,
-                Err(e) => {
-                    eprintln!("[theme] ignoring a payload: {e}");
-                    false
-                }
-            })
-            .and_then(|line| parse_bytes(&line).ok())
+        self.0.poll_parsed(|line| match parse_bytes(line) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                eprintln!("[theme] ignoring a payload: {e}");
+                None
+            }
+        })
     }
 }
 

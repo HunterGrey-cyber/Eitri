@@ -436,3 +436,73 @@ fn injected_editor_context_reports_and_tears_down() {
     feed.cleanup();
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// Once it has sent what the editor shows, a snippet with nothing new to say leaves no timer
+/// running: an idle nvim is not woken by it (a repeating 150 ms timer woke it about 7 times a
+/// second, measured with nvim's own context switches).
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn an_idle_snippet_leaves_no_timer_running() {
+    let dir = std::env::temp_dir().join(format!("nv-w1-idle-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let count = dir.join("timers");
+    let mut feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+    let report = format!(
+        "lua local n = 0; vim.uv.walk(function(h) if h:get_type() == 'timer' and h:is_active() then n = n + 1 end end); \
+         vim.fn.writefile({{tostring(n)}}, '{}')",
+        count.display()
+    );
+    let context = drive_nvim_with(&feed, &mut reader, &file, &["--clean"], &["sleep 500m", &report]);
+    assert_eq!(
+        context.expect("what the editor showed was sent").file,
+        file.display().to_string()
+    );
+    assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "0", "active timers");
+    feed.cleanup();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A selection of 400 lines of 100,000 characters sends its first 2000 characters, marked, and its
+/// true range, and fetches about that much: it used to fetch all 40 MB to keep 2000 characters
+/// (17 ms of nvim's loop and 160 MB of peak memory, measured).
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_selection_of_long_lines_fetches_no_more_than_it_sends() {
+    let dir = std::env::temp_dir().join(format!("nv-w1-long-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("long.txt");
+    let line = |i: usize| format!("{i:03}{}", "x".repeat(100_000));
+    let body: String = (0..400).map(|i| line(i) + "\n").collect();
+    std::fs::write(&file, &body).unwrap();
+    let fetched = dir.join("fetched");
+    // Counts what every getregion call returns; installed before the snippet loads.
+    let count = "lua local g = vim.fn.getregion; _G.fetched = 0; vim.fn.getregion = function(...) \
+                 local r = g(...); for _, l in ipairs(r) do _G.fetched = _G.fetched + #l end; return r end";
+    let report = format!(
+        "lua vim.fn.writefile({{tostring(_G.fetched)}}, '{}')",
+        fetched.display()
+    );
+    for (motion, from) in [("normal! ggVG", 0), ("normal! gg0lvG$", 1)] {
+        let mut feed = EditorContextFeed::new().expect("the feed must bind");
+        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+        let context = drive_nvim_with(
+            &feed,
+            &mut reader,
+            &file,
+            &["--clean", "--cmd", count],
+            &[motion, "sleep 400m", &report],
+        )
+        .expect("an update must arrive");
+        let selection = context.selection.expect("a selection");
+        assert_eq!((selection.start_line, selection.end_line), (1, 400), "{motion}");
+        let whole: String = body[from..].chars().take(2000).collect();
+        assert_eq!(selection.text, format!("{whole}{TRUNCATION_MARKER}"), "{motion}");
+        let bytes: usize = std::fs::read_to_string(&fetched).unwrap().trim().parse().unwrap();
+        assert!(bytes < 64 * 1024, "{motion}: fetched {bytes} bytes");
+        feed.cleanup();
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

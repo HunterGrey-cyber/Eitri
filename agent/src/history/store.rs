@@ -207,6 +207,96 @@ fn truncate_to(
     (user_prompts, transcript, tool_calls)
 }
 
+/// What [`truncate`] keeps of copies of the three collections, copying only the survivors: this runs
+/// under the lock the UI's reads of the conversation take, and a long session's collections hold
+/// far more than the caps keep. Collections in `seq` order (as the projection keeps them) are walked
+/// newest first from their ends and stop at the caps, so the work is what survives; anything else
+/// is copied whole and truncated as before.
+pub(crate) fn newest_that_fit(
+    user_prompts: &[UserPromptRecord],
+    transcript: &[TranscriptMessage],
+    tool_calls: &[ToolCallRecord],
+) -> (Vec<UserPromptRecord>, Vec<TranscriptMessage>, Vec<ToolCallRecord>) {
+    newest_that_fit_to(
+        user_prompts,
+        transcript,
+        tool_calls,
+        super::HISTORY_MAX_ITEMS,
+        super::HISTORY_MAX_CHARS,
+    )
+}
+
+fn newest_that_fit_to(
+    user_prompts: &[UserPromptRecord],
+    transcript: &[TranscriptMessage],
+    tool_calls: &[ToolCallRecord],
+    max_items: usize,
+    max_chars: usize,
+) -> (Vec<UserPromptRecord>, Vec<TranscriptMessage>, Vec<ToolCallRecord>) {
+    fn in_order(seqs: impl Iterator<Item = u64>) -> bool {
+        let mut last = None;
+        seqs.into_iter().all(|seq| {
+            let ok = last.is_none_or(|last| last <= seq);
+            last = Some(seq);
+            ok
+        })
+    }
+    if !in_order(user_prompts.iter().map(|p| p.seq))
+        || !in_order(transcript.iter().map(|m| m.seq))
+        || !in_order(tool_calls.iter().map(|c| c.seq))
+    {
+        return truncate_to(
+            user_prompts.to_vec(),
+            transcript.to_vec(),
+            tool_calls.to_vec(),
+            max_items,
+            max_chars,
+        );
+    }
+    // Each collection's survivors are a run at its end (the walk stops, never skips), so a cursor per
+    // collection says where its run starts. The next item is the newest of the three ends, by the
+    // same key `truncate_to` sorts on.
+    let (mut prompts, mut messages, mut calls) = (user_prompts.len(), transcript.len(), tool_calls.len());
+    let mut kept = 0usize;
+    let mut chars = 0usize;
+    while kept < max_items {
+        let ends = [
+            prompts
+                .checked_sub(1)
+                .map(|i| ((user_prompts[i].seq, Which::Prompt as u8, i), Which::Prompt)),
+            messages
+                .checked_sub(1)
+                .map(|i| ((transcript[i].seq, Which::Message as u8, i), Which::Message)),
+            calls
+                .checked_sub(1)
+                .map(|i| ((tool_calls[i].seq, Which::ToolCall as u8, i), Which::ToolCall)),
+        ];
+        let Some((_, which)) = ends.into_iter().flatten().max_by_key(|(key, _)| *key) else {
+            break;
+        };
+        let cost = match which {
+            Which::Prompt => user_prompts[prompts - 1].text.chars().count(),
+            Which::Message => transcript[messages - 1].text.chars().count(),
+            Which::ToolCall => tool_call_chars(&tool_calls[calls - 1]),
+        };
+        if kept > 0 && chars + cost > max_chars {
+            break;
+        }
+        match which {
+            Which::Prompt => prompts -= 1,
+            Which::Message => messages -= 1,
+            Which::ToolCall => calls -= 1,
+        }
+        kept += 1;
+        chars += cost;
+    }
+    (
+        user_prompts[prompts..].to_vec(),
+        transcript[messages..].to_vec(),
+        tool_calls[calls..].to_vec(),
+    )
+}
+
 fn retain_by<T>(items: &mut Vec<T>, keep: &[bool]) {
     let mut index = 0;
     items.retain(|_| {
@@ -677,5 +767,55 @@ mod tests {
         )
         .unwrap();
         assert!(path.extension().unwrap() == "json");
+    }
+
+    /// The survivors copied from borrowed collections are exactly what truncating copies of them
+    /// keeps, for collections in `seq` order (with ties), out of order, and every cap from none to
+    /// all: a small generator, many seeds.
+    #[test]
+    fn copying_only_the_survivors_keeps_what_truncating_keeps() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        for round in 0..400 {
+            let sorted = round % 5 != 0;
+            let mut seq = 0u64;
+            let mut seqs = |next: &mut dyn FnMut(u64) -> u64, n: u64| -> Vec<u64> {
+                let mut out: Vec<u64> = (0..n)
+                    .map(|_| {
+                        seq += next(3);
+                        seq
+                    })
+                    .collect();
+                if !sorted {
+                    out.reverse();
+                }
+                out
+            };
+            let n = next(6);
+            let prompts: Vec<_> = seqs(&mut next, n)
+                .into_iter()
+                .map(|q| prompt(q, &"p".repeat(next(30) as usize)))
+                .collect();
+            let n = next(8);
+            let messages: Vec<_> = seqs(&mut next, n)
+                .into_iter()
+                .map(|q| message(q, &"m".repeat(next(60) as usize)))
+                .collect();
+            let n = next(8);
+            let calls: Vec<_> = seqs(&mut next, n)
+                .into_iter()
+                .map(|q| tool_call(q, &format!("t{q}")))
+                .collect();
+            let max_items = next(25) as usize;
+            let max_chars = next(400) as usize;
+            let expected = truncate_to(prompts.clone(), messages.clone(), calls.clone(), max_items, max_chars);
+            let got = newest_that_fit_to(&prompts, &messages, &calls, max_items, max_chars);
+            assert_eq!(got, expected, "round {round}");
+        }
     }
 }

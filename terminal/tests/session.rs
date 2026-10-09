@@ -566,6 +566,46 @@ fn a_hidden_terminal_renders_nothing_until_it_is_shown() {
     h.wait_for(WAIT, |h| h.has_line("2000"));
 }
 
+/// A key the program does not echo changes nothing on screen, so it renders nothing. A render for
+/// an unchanged screen is not only wasted work: it takes the render clock's leading edge, and the
+/// echo of the next key that does change something then waits out the rest of the frame (16 ms
+/// after idle, measured, before keys at the live bottom stopped marking the screen dirty).
+#[test]
+fn a_key_that_changes_nothing_on_screen_renders_nothing() {
+    let mut h = Harness::start(
+        spec("/bin/sh", &["-c", "stty -echo; printf ready; exec cat"]),
+        size(40, 5),
+    );
+    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "ready"));
+    std::thread::sleep(Duration::from_millis(50));
+    let before = h.session.renders();
+    h.type_str("abc");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(h.session.renders(), before, "keys with no echo rendered a frame");
+}
+
+/// A program that changes only its title, or rings the bell, changes nothing a frame shows: the
+/// events reach the host, riding the render clock as before, and no frame is built for them (34
+/// frames for 100 titles 5 ms apart before, measured).
+#[test]
+fn titles_and_bells_reach_the_host_without_a_frame() {
+    let script = "printf ready; read _; i=0; while [ $i -lt 20 ]; do printf '\\033]2;t%d\\007\\a' $i; i=$((i+1)); sleep 0.005; done; exec sleep 5";
+    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(40, 5));
+    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "ready"));
+    std::thread::sleep(Duration::from_millis(50));
+    h.wait_for(WAIT, |_| true);
+    let before = h.session.renders();
+    // The tty echoes the Enter that starts the loop: one frame for that.
+    h.type_str("\n");
+    h.wait_for(WAIT, |h| h.events.title == Some(Some("t19".to_string())));
+    assert!(h.events.bell, "the bells reached the host");
+    assert!(
+        h.session.renders() <= before + 1,
+        "{} frames for titles and bells",
+        h.session.renders() - before
+    );
+}
+
 /// A mouse report reaches the program only while its own mode asks for it, and a dropped report
 /// (the mode having just gone off) never gets read as something else's byte (bottom-terminal phase
 /// 3c). `ready` proves the enabling escape sequence was parsed before anything is sent; `off` proves

@@ -146,21 +146,24 @@ impl Drop for NvimKeysFeed {
 pub struct NvimKeysReader(NewestLineReader);
 
 impl NvimKeysReader {
+    /// The bounded reader underneath, for a host deciding whether there is anything to read.
+    pub(crate) fn lines(&self) -> &NewestLineReader {
+        &self.0
+    }
+
     pub fn new(listener: UnixListener) -> Self {
         Self(NewestLineReader::new(listener, "nvim-keys"))
     }
 
     /// Returns the newest valid report available without waiting, or `None` for no news.
     pub fn poll(&mut self) -> Option<NvimReport> {
-        self.0
-            .poll_with(|line| {
-                let ok = parse_report(line).is_some();
-                if !ok {
-                    eprintln!("[nvim-keys] ignoring a report that is not v1 JSON");
-                }
-                ok
-            })
-            .and_then(|line| parse_report(&line))
+        self.0.poll_parsed(|line| {
+            let report = parse_report(line);
+            if report.is_none() {
+                eprintln!("[nvim-keys] ignoring a report that is not v1 JSON");
+            }
+            report
+        })
     }
 }
 
@@ -245,6 +248,64 @@ mod tests {
                 "the size cap must drop the oversized line whole"
             );
         }
+    }
+
+    /// One realistic report: 2000 maps, about 200 KB.
+    fn big_report() -> String {
+        let maps: Vec<String> = (0..2000)
+            .map(|i| {
+                format!(r#"{{"lhs":"<Space>m{i}","rhs":":call Do{i}()<CR>","desc":"does thing {i}","callback":false}}"#)
+            })
+            .collect();
+        format!(
+            r#"{{"v":1,"mapleader":"<Space>","timeoutlen":300,"timeout":true,"maps":[{}]}}"#,
+            maps.join(",")
+        )
+    }
+
+    /// Sends `line` and polls until `poll` delivers it: the time and the bytes allocated on this thread.
+    fn cost_of_reading<T>(
+        line: &str,
+        mut poll: impl FnMut() -> Option<T>,
+        feed: &NvimKeysFeed,
+    ) -> (T, std::time::Duration, usize) {
+        let writer = send_line(feed, line.as_bytes());
+        let started = std::time::Instant::now();
+        let mut bytes = 0;
+        let found = loop {
+            let (found, spent) = crate::alloc_count::bytes_allocated_by(&mut poll);
+            bytes += spent;
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "never delivered");
+        };
+        let elapsed = started.elapsed();
+        writer.join().unwrap();
+        (found, elapsed, bytes)
+    }
+
+    /// A delivered report is parsed once: the reader's acceptance test hands back what it parsed.
+    #[test]
+    fn a_delivered_report_is_parsed_once() {
+        let line = big_report();
+        let (_, one_parse) = crate::alloc_count::bytes_allocated_by(|| parse_report(line.as_bytes()).unwrap());
+
+        let (feed, mut raw) = {
+            let mut feed = NvimKeysFeed::new().expect("bind the test feed");
+            let raw = crate::line_feed::NewestLineReader::new(feed.take_listener().unwrap(), "test");
+            (feed, raw)
+        };
+        let (_, _, reading) = cost_of_reading(&line, || raw.poll_parsed(|_| Some(())), &feed);
+
+        let (feed, mut reader) = bound_pair();
+        let (report, elapsed, bytes) = cost_of_reading(&line, || reader.poll(), &feed);
+        assert_eq!(report.maps.len(), 2000);
+        eprintln!("keys report: {elapsed:?}, {bytes} bytes; reading alone {reading}, one parse {one_parse}");
+        assert!(
+            bytes < reading + one_parse + one_parse / 2,
+            "{bytes} bytes: reading the line is {reading}, one parse {one_parse}"
+        );
     }
 
     #[test]
