@@ -4,7 +4,7 @@ import { turnEndingBandText } from "./turnEnding";
 
 /** A segment's identity, used for lookups.
  *  `bandLayout`'s construction order determines degrade order and render order. */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage" | "review" | "recovery" | "ending";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage" | "review" | "recovery" | "ending" | "background";
 
 /** One band segment's text and side of the gap. The left holds mode, pill, `⚑N`, `⧗N`, and
  *  message; the right holds showcmd, `⚠`, context, model, usage, position, and `↓N`.
@@ -63,7 +63,15 @@ export type BandFacts = {
    *  empty tab, which has no turns. On the left beside the state it describes, in the band's own colour like
    *  its neighbours; the muted row in the conversation carries the detail. */
   ending?: Pick<TurnEnding, "kind" | "reason" | "apiErrorStatus" | "message"> | null;
+  /** How many commands this tab's agent left running after its turns ended. `0`, `null` or absent says
+   *  nothing: optional things show nothing until there is something to show. */
+  background?: number | null;
 };
+
+/** The band's count of the commands an agent left running after its turns ended. */
+export function backgroundSegment(running: number): string {
+  return `${running} running in background`;
+}
 
 /** The band's turn-review segment: how many files changed on disk during the last turn, and the key that
  *  shows them. Says "changed", not who changed them -- the overlay carries the attribution. */
@@ -155,6 +163,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.cards > 0 ? [{ id: "cards", text: `⚑${f.cards}`, side: "left" } as Seg] : []),
     ...(f.approve ? [{ id: "approve", text: `Ctrl+y approves ${f.approve.tool}: ${f.approve.summary}`, side: "left" } as Seg] : []),
     ...(f.queued > 0 ? [{ id: "queue", text: `⧗${f.queued}`, side: "left" } as Seg] : []),
+    ...(f.background && f.background > 0 ? [{ id: "background", text: backgroundSegment(f.background), side: "left" } as Seg] : []),
     ...(f.ending ? [{ id: "ending", text: turnEndingBandText(f.ending), side: "left" } as Seg] : []),
     ...(f.recovery ? [{ id: "recovery", text: recoverySegment(f.recovery.path, f.recovery.more), side: "left" } as Seg] : []),
     ...(f.message ? [{ id: "message", text: f.message, side: "left" } as Seg] : []),
@@ -184,6 +193,8 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     (s) => s.map((x) => (x.id === "approve" && f.approve ? { ...x, text: `Ctrl+y approves ${f.approve.tool}` } : x)),
     (s) => s.filter((x) => x.id !== "approve"),
     (s) => s.filter((x) => x.id !== "cards"),
+    // Something still runs and may change files: it outlasts the figures and pointers, and the card count.
+    (s) => s.filter((x) => x.id !== "background"),
     // A turn that ended badly is short and it explains why the panel went quiet, so it outlasts every
     // figure and pointer above and the card count too, and goes only just before the mode shrinks to
     // its letter: the row in the conversation says the same thing in full.

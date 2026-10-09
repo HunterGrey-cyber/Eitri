@@ -15,7 +15,7 @@ use std::time::Duration;
 use agent::DirTrust;
 use eitri_core::project_trust::{
     codex_fallback_names, discover, git_top_level, read_user_codex_config, trust_plan, Discovery, EntryKind, Finding,
-    Limits, Profile, ProfileEnv,
+    Limits, Profile, ProfileEnv, ServerDefinition,
 };
 
 /// A scratch directory (canonical) holding a fake home; removed on drop.
@@ -52,6 +52,7 @@ impl Fixture {
             codex_home: Some(self.base.join("codex-home")),
             fallback_names: Vec::new(),
             user_mcp_servers: None,
+            user_config_unreadable: None,
         }
     }
 
@@ -1271,6 +1272,7 @@ fn codex_profile_skips_home_dot_codex_only_when_it_is_codex_home() {
         codex_home: Some(fx.home.join(".codex")),
         fallback_names: Vec::new(),
         user_mcp_servers: None,
+        user_config_unreadable: None,
     };
     let found = fx.discover_as(&root, &Profile::Codex, &as_codex_home);
     assert_eq!(found.top, fx.home);
@@ -1299,6 +1301,7 @@ fn codex_profile_skips_home_dot_codex_only_when_it_is_codex_home() {
         codex_home: Some(only.join(".codex")),
         fallback_names: Vec::new(),
         user_mcp_servers: None,
+        user_config_unreadable: None,
     };
     write(&only.join(".codex/config.toml"), b"model = \"x\"\n");
     let lone = discover(&only, None, &Limits::default(), &Profile::Codex, &env);
@@ -1469,6 +1472,7 @@ fn a_dot_codex_linked_to_codex_home_is_not_read() {
         codex_home: Some(dotfiles.clone()),
         fallback_names: Vec::new(),
         user_mcp_servers: None,
+        user_config_unreadable: None,
     };
     let found = fx.discover_as(&root, &Profile::Codex, &env);
     assert_eq!(found.top, fx.home);
@@ -1584,6 +1588,7 @@ command = "y"
         codex_home: Some(codex_home.clone()),
         fallback_names: vec!["TEAM.md".into()],
         user_mcp_servers: None,
+        user_config_unreadable: None,
     };
     let found = fx.discover_as(&repo.join("src"), &Profile::Codex, &env);
     assert!(
@@ -1599,6 +1604,7 @@ command = "y"
         codex_home: Some(codex_home),
         fallback_names: codex_fallback_names(&fx.base.join("codex-home")),
         user_mcp_servers: None,
+        user_config_unreadable: None,
     };
     let found = fx.discover_as(&repo.join("src"), &Profile::Codex, &env);
     assert!(!found.fully_hashed());
@@ -1606,6 +1612,67 @@ command = "y"
         .uncheckable()
         .iter()
         .any(|(path, _)| *path == Path::new("docs/AI.md")));
+}
+
+/// A project's own `.codex/config.toml` can name alternates for `AGENTS.md` too, and a trusted session
+/// then loads them as instructions: discovery fingerprints each name it gives in every walked directory,
+/// as it does the user's, and a name that is not one plain name makes the answer last one start.
+#[test]
+fn a_project_config_s_alternate_names_are_fingerprinted() {
+    let fx = Fixture::new("project-fallback");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    let root = repo.join("src");
+    write(&repo.join("TEAM.md"), b"team\n");
+    write(&root.join("RULES.md"), b"rules\n");
+    write(&repo.join("NOTES.md"), b"not named\n");
+    // Named by the root's configuration and by the top's: both apply in every walked directory.
+    write(
+        &root.join(".codex/config.toml"),
+        b"project_doc_fallback_filenames = [\"RULES.md\"]\n",
+    );
+    write(
+        &repo.join(".codex/config.toml"),
+        b"project_doc_fallback_filenames = [\"TEAM.md\", \"AGENTS.md\"]\n",
+    );
+    let found = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    assert!(
+        has(&found, "TEAM.md") && has(&found, "src/RULES.md"),
+        "{:?}",
+        paths(&found)
+    );
+    assert!(!has(&found, "NOTES.md"), "{:?}", paths(&found));
+    for path in ["TEAM.md", "src/RULES.md"] {
+        assert!(
+            found.findings.contains(&Finding::Memory {
+                path: PathBuf::from(path)
+            }),
+            "{path}: {:?}",
+            found.findings
+        );
+    }
+    assert!(found.fully_hashed());
+
+    // The named file is part of the fingerprint: changing it asks again.
+    write(&repo.join("TEAM.md"), b"team, changed\n");
+    let changed = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    assert_ne!(changed.fingerprint, found.fingerprint);
+
+    // A name that reaches outside the directory cannot be checked.
+    write(
+        &repo.join(".codex/config.toml"),
+        b"project_doc_fallback_filenames = [\"../outside.md\"]\n",
+    );
+    let refused = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    assert!(!refused.fully_hashed());
+
+    // The Claude profile reads none of it.
+    let claude = fx.discover(&root);
+    assert!(
+        !has(&claude, "TEAM.md") && !has(&claude, "src/RULES.md"),
+        "{:?}",
+        paths(&claude)
+    );
 }
 
 const CODEX_CONFIG: &[u8] = br#"model = "o3"
@@ -1825,15 +1892,15 @@ url = "https://example.com/mcp"
     let read = read_user_codex_config(&file);
     assert_eq!(read.fallback_names, vec!["TEAM.md".to_string()]);
     assert_eq!(
-        read.mcp_servers,
+        read.mcp_server_names(),
         Some(vec!["alpha".to_string(), "context7".to_string()])
     );
 
     let none = fx.base.join("none/config.toml");
     write(&none, b"model = \"x\"\n");
-    assert_eq!(read_user_codex_config(&none).mcp_servers, Some(Vec::new()));
+    assert_eq!(read_user_codex_config(&none).mcp_server_names(), Some(Vec::new()));
     assert_eq!(
-        read_user_codex_config(&fx.base.join("missing/config.toml")).mcp_servers,
+        read_user_codex_config(&fx.base.join("missing/config.toml")).mcp_server_names(),
         Some(Vec::new())
     );
 
@@ -1845,6 +1912,16 @@ url = "https://example.com/mcp"
     let bad = fx.base.join("bad/config.toml");
     write(&bad, b"[mcp_servers\n");
     assert_eq!(read_user_codex_config(&bad).mcp_servers, None);
+    // A file there that cannot be read says so, naming itself and not its text; one not there does not.
+    let (file, why) = read_user_codex_config(&bad).unreadable.expect("a gap");
+    assert_eq!(file, bad);
+    assert!(!why.contains("mcp_servers"), "{why}");
+    assert!(read_user_codex_config(&linked).unreadable.is_some());
+    assert_eq!(read_user_codex_config(&none).unreadable, None);
+    assert_eq!(
+        read_user_codex_config(&fx.base.join("missing/config.toml")).unreadable,
+        None
+    );
     let odd = fx.base.join("odd/config.toml");
     write(&odd, b"mcp_servers = 3\n");
     assert_eq!(read_user_codex_config(&odd).mcp_servers, None);
@@ -1863,7 +1940,14 @@ url = "https://example.com/mcp"
     );
 }
 
-/// A server the project names that the user's own configuration also runs is no sign that the
+/// The MCP servers of a user `config.toml` holding `text`, as the trust worker reads them.
+fn user_servers(fx: &Fixture, name: &str, text: &[u8]) -> Option<std::collections::BTreeMap<String, ServerDefinition>> {
+    let file = fx.base.join(format!("user-{name}/config.toml"));
+    write(&file, text);
+    read_user_codex_config(&file).mcp_servers
+}
+
+/// A server the project defines exactly as the user's own configuration does is no sign that the
 /// project's configuration loaded, so the plan does not watch for it; when the user's servers are
 /// not known, every project server is watched for.
 #[test]
@@ -1872,12 +1956,26 @@ fn trust_plan_leaves_out_servers_the_user_also_runs() {
     let repo = fx.home.join("repo");
     fx.repo(&repo, false);
     write(&repo.join(".codex/config.toml"), CODEX_CONFIG);
-    let env = |user: Option<Vec<String>>| ProfileEnv {
+    let env = |user| ProfileEnv {
         user_mcp_servers: user,
         ..fx.codex_env()
     };
 
-    let found = fx.discover_as(&repo, &Profile::Codex, &env(Some(vec!["marker".into(), "mine".into()])));
+    // The same table, written in another order and layout, is the same definition.
+    let same = user_servers(
+        &fx,
+        "same",
+        br#"[mcp_servers.mine]
+command = "mine"
+
+[mcp_servers.marker]
+default_tools_approval_mode = "approve"
+args = [ "-c", "touch /tmp/n" ]
+command = "sh"
+tools = { write = { approval_mode = "prompt" } }
+"#,
+    );
+    let found = fx.discover_as(&repo, &Profile::Codex, &env(same));
     let plan = trust_plan(&found, DirTrust::Untrusted, &repo).unwrap();
     assert_eq!(plan.project_only, vec!["remote".to_string()]);
 
@@ -1887,6 +1985,68 @@ fn trust_plan_leaves_out_servers_the_user_also_runs() {
         "the user's servers are not the project's"
     );
     let plan = trust_plan(&unknown, DirTrust::Untrusted, &repo).unwrap();
+    assert_eq!(plan.project_only, vec!["marker".to_string(), "remote".to_string()]);
+}
+
+/// A project that defines a server under the name of one of the user's own, but otherwise, starts its
+/// own server under that name: the plan watches for it, so an untrusted session that starts it stops.
+#[test]
+fn trust_plan_watches_a_project_server_that_redefines_one_of_the_users() {
+    let fx = Fixture::new("plan-shadowed-server");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    write(&repo.join(".codex/config.toml"), CODEX_CONFIG);
+    let env = |user| ProfileEnv {
+        user_mcp_servers: user,
+        ..fx.codex_env()
+    };
+    for (what, text) in [
+        (
+            "another command",
+            &br#"[mcp_servers.marker]
+command = "my-marker"
+"#[..],
+        ),
+        (
+            "one more field",
+            br#"[mcp_servers.marker]
+command = "sh"
+args = ["-c", "touch /tmp/n"]
+default_tools_approval_mode = "approve"
+tools = { write = { approval_mode = "prompt" } }
+cwd = "/x"
+"#,
+        ),
+        (
+            "an approval mode of its own",
+            br#"[mcp_servers.marker]
+command = "sh"
+args = ["-c", "touch /tmp/n"]
+default_tools_approval_mode = "prompt"
+tools = { write = { approval_mode = "prompt" } }
+"#,
+        ),
+    ] {
+        let found = fx.discover_as(&repo, &Profile::Codex, &env(user_servers(&fx, "other", text)));
+        let plan = trust_plan(&found, DirTrust::Untrusted, &repo).unwrap();
+        assert_eq!(
+            plan.project_only,
+            vec!["marker".to_string(), "remote".to_string()],
+            "{what}"
+        );
+    }
+
+    // A walked directory above the root that defines the name otherwise counts too, even when the
+    // root's own definition is the user's.
+    let root = repo.join("sub");
+    std::fs::create_dir_all(&root).unwrap();
+    write(
+        &root.join(".codex/config.toml"),
+        b"[mcp_servers.marker]\ncommand = \"my-marker\"\n",
+    );
+    let user = user_servers(&fx, "mine", b"[mcp_servers.marker]\ncommand = \"my-marker\"\n");
+    let found = fx.discover_as(&root, &Profile::Codex, &env(user));
+    let plan = trust_plan(&found, DirTrust::Untrusted, &root).unwrap();
     assert_eq!(plan.project_only, vec!["marker".to_string(), "remote".to_string()]);
 }
 

@@ -27,6 +27,7 @@
       "activeTurnId": "t1",
       "assistantMessageOpen": true,
       "backend": "sidecar",
+      "backgroundCalls": 0,
       "capabilities": {
         "bypassPermissionMode": false,
         "fork": false,
@@ -85,6 +86,7 @@
       "activeTurnId": "t1",
       "assistantMessageOpen": true,
       "backend": "sidecar",
+      "backgroundCalls": 0,
       "capabilities": {
         "bypassPermissionMode": false,
         "fork": false,

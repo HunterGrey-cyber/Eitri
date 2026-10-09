@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::codex::{codex_findings, hooks_json_findings, rule_file_findings};
+use super::codex::{
+    codex_findings, hooks_json_findings, project_fallback_names, project_server_definitions, rule_file_findings,
+    ServerDefinition,
+};
 use super::findings::{frontmatter_keys, mcp_findings, settings_findings};
 use super::git_top::git_top_level;
 use super::nofollow::{normalize_lexically, DirHandle, FileKind, Refusal};
@@ -132,6 +135,10 @@ struct Scan<'a> {
     findings: Vec<Finding>,
     over_budget: Vec<String>,
     total_bytes: u64,
+    /// The MCP servers each project `.codex/config.toml` read defines, with their definitions.
+    project_servers: Vec<(String, ServerDefinition)>,
+    /// The alternate names of `AGENTS.md` each project `.codex/config.toml` read gives.
+    project_fallback_names: Vec<String>,
 }
 
 /// A size as a person reads it: `4 MiB`, `16 KiB`, `100 bytes`.
@@ -239,7 +246,15 @@ impl Scan<'_> {
                     Role::Settings => self.findings.extend(settings_findings(&path, &bytes)),
                     Role::Mcp => self.findings.extend(mcp_findings(&path, &bytes)),
                     Role::Memory => self.findings.push(Finding::Memory { path: path.clone() }),
-                    Role::CodexConfig => self.findings.extend(codex_findings(&path, &bytes)),
+                    Role::CodexConfig => {
+                        self.findings.extend(codex_findings(&path, &bytes));
+                        self.project_servers.extend(project_server_definitions(&bytes));
+                        for name in project_fallback_names(&bytes) {
+                            if !self.project_fallback_names.contains(&name) {
+                                self.project_fallback_names.push(name);
+                            }
+                        }
+                    }
                     Role::HooksJson => self.findings.extend(hooks_json_findings(&path, &bytes)),
                     Role::Rules => self.findings.extend(rule_file_findings(&path, &bytes)),
                     Role::Listing => self.findings.push(Finding::PluginListing { path: path.clone() }),
@@ -663,6 +678,19 @@ impl Scan<'_> {
         }
     }
 
+    /// The memory files `names` in a walked directory that was opened before: one that cannot be opened
+    /// now was named when it was first tried, or has gone since, and is not named twice.
+    fn memory_files(&mut self, dir: &Path, names: &[OsString]) {
+        let rel = relative(&self.top, dir);
+        let base = if rel == Path::new(".") { PathBuf::new() } else { rel };
+        let Ok(handle) = DirHandle::open_absolute(dir) else {
+            return;
+        };
+        for name in names {
+            self.expected_file(&handle, name, base.join(name), Role::Memory);
+        }
+    }
+
     /// The `.codex/` a linked worktree's walked directory takes its hooks from: the same place in the
     /// main checkout.
     fn main_checkout_codex(&mut self, main_dir: &Path, env: &ProfileEnv) {
@@ -813,6 +841,8 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
         findings: Vec::new(),
         over_budget: Vec::new(),
         total_bytes: 0,
+        project_servers: Vec::new(),
+        project_fallback_names: Vec::new(),
     };
     for finding in walk.findings {
         if let Finding::GitUnverified { path, reason, target } = finding {
@@ -840,6 +870,16 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
                 .filter(|name| name != "AGENTS.md" && name != "AGENTS.override.md")
                 .collect();
             scan.refused_names(&refused, "an alternate name for AGENTS.md");
+            // The user's own file may name alternates this discovery then never looked for. Not an
+            // entry: the file is the user's, not the project's, and the fingerprint is the project's.
+            if let Some((file, why)) = &env.user_config_unreadable {
+                scan.findings.push(Finding::Unreadable {
+                    path: file.clone(),
+                    reason: format!(
+                        "your Codex configuration, which may name other files Codex reads as AGENTS.md, cannot be read ({why})"
+                    ),
+                });
+            }
             // A linked worktree whose main checkout this walk cannot place: Codex reads hooks from a
             // `.codex/` there that nothing here can show or hash, so no answer outlives one start.
             if let Some(common) = &walk.unplaced_common {
@@ -855,6 +895,25 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
                     if let Ok(rest) = dir.strip_prefix(&top) {
                         scan.main_checkout_codex(&main.join(rest), env);
                     }
+                }
+            }
+            // A project's own configuration can name alternates too, and a trusted session reads them
+            // in every directory it reads `AGENTS.md` in. They are known only once each `.codex/` on
+            // the walk has been read, so they are looked up in a second pass.
+            let (project_names, project_refused) = plain_names(&scan.project_fallback_names, false);
+            let project_names: Vec<OsString> = project_names
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| name != "AGENTS.md" && name != "AGENTS.override.md" && !names.contains(name))
+                .collect();
+            let project_refused: Vec<String> = project_refused
+                .into_iter()
+                .filter(|name| !refused.contains(name))
+                .collect();
+            scan.refused_names(&project_refused, "an alternate name for AGENTS.md");
+            if !project_names.is_empty() {
+                for dir in &walked {
+                    scan.memory_files(dir, &project_names);
                 }
             }
         }
@@ -884,6 +943,7 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
         fingerprint,
         over_budget,
         user_mcp_servers: env.user_mcp_servers.clone(),
+        project_mcp_servers: scan.project_servers,
     }
 }
 

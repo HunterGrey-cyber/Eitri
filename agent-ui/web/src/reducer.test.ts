@@ -883,6 +883,24 @@ describe("an agent's policy tripwire and account limits", () => {
   });
 });
 
+describe("the commands an agent left running", () => {
+  it("background_calls replaces the count, as Rust's fold does, and a snapshot carries it", () => {
+    let state = applyEvent(initialState(), { type: "background_calls", running: 2 });
+    expect(state.backgroundCalls).toBe(2);
+    expect(state.nextSeq).toBe(1);
+    state = applyEvent(state, { type: "background_calls", running: 0 });
+    expect(state.backgroundCalls).toBe(0);
+    expect(initialState().backgroundCalls).toBe(0);
+
+    const counted = applyEvent(initialState(), { type: "background_calls", running: 3 });
+    const { nextSeq: _n, turnThinking: _t, denialsBeforeTheirCall: _d, ...snapshot } = counted;
+    expect(applySnapshot(initialState(), snapshot, 4).backgroundCalls).toBe(3);
+    // Another tab's snapshot without one is a tab with none.
+    const { backgroundCalls: _b, ...old } = snapshot;
+    expect(applySnapshot(counted, old as typeof snapshot, 4).backgroundCalls).toBe(0);
+  });
+});
+
 describe("a CLI refusal that arrives ahead of its call", () => {
   const started = (id: string): AgentDomainEvent => ({
     type: "tool_call_started",

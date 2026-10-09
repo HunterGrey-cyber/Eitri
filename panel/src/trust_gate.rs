@@ -1400,6 +1400,7 @@ fn codex_profile_env(codex_home: Option<PathBuf>, user: UserCodexConfig) -> Prof
     ProfileEnv {
         fallback_names: user.fallback_names,
         user_mcp_servers,
+        user_config_unreadable: user.unreadable,
         codex_home,
     }
 }
@@ -1443,6 +1444,7 @@ fn run_worker(
                 || UserCodexConfig {
                     fallback_names: Vec::new(),
                     mcp_servers: None,
+                    unreadable: None,
                 },
                 read_codex_user_config,
             );
@@ -2792,6 +2794,7 @@ mod tests {
             fingerprint: Fingerprint([2; 32]),
             over_budget: None,
             user_mcp_servers: None,
+            project_mcp_servers: Vec::new(),
         };
         let (mut gate, _jobs, done) = TrustGate::detached(p("/home/u/p"));
         done.send(Done::Checked {
@@ -3125,7 +3128,7 @@ mod tests {
         std::fs::create_dir_all(&codex_home).unwrap();
         std::os::unix::fs::symlink(&dotfiles, codex_home.join("config.toml")).unwrap();
         assert_eq!(
-            read_codex_user_config(&codex_home).mcp_servers,
+            read_codex_user_config(&codex_home).mcp_server_names(),
             Some(vec!["context7".to_string()])
         );
 
@@ -3134,7 +3137,7 @@ mod tests {
         std::os::unix::fs::symlink(fx.outer.join("dotfiles"), to_dir.join("config.toml")).unwrap();
         assert_eq!(read_codex_user_config(&to_dir).mcp_servers, None);
         assert_eq!(
-            read_codex_user_config(&fx.outer.join("absent")).mcp_servers,
+            read_codex_user_config(&fx.outer.join("absent")).mcp_server_names(),
             Some(Vec::new())
         );
     }
@@ -3178,7 +3181,7 @@ mod tests {
     /// A relative `CODEX_HOME` names a directory the project may hold: its `config.toml` is not known
     /// to be the user's own, so the servers it lists are not taken as the user's, and an untrusted
     /// start still watches for every server the project gives. A home that is the user's own still
-    /// leaves out the servers it starts itself.
+    /// leaves out the servers it starts itself, unless the project defines that name otherwise.
     #[test]
     fn a_relative_codex_home_does_not_whitelist_project_servers() {
         let fx = Fx::new("codex-relative-home");
@@ -3198,12 +3201,65 @@ mod tests {
 
         let own = fx.home.join(".codex");
         std::fs::create_dir_all(&own).unwrap();
-        std::fs::write(own.join("config.toml"), b"[mcp_servers.evil]\ncommand = \"mine\"\n").unwrap();
+        std::fs::write(own.join("config.toml"), b"[mcp_servers.evil]\ncommand = \"evil\"\n").unwrap();
         fx.write(
             ".codex/config.toml",
             b"[mcp_servers.evil]\ncommand = \"evil\"\n[mcp_servers.other]\ncommand = \"o\"\n",
         );
         assert_eq!(plan_for(None), vec!["other".to_string()]);
+        // The user's own server under that name runs something else: the project's is its own.
+        std::fs::write(own.join("config.toml"), b"[mcp_servers.evil]\ncommand = \"mine\"\n").unwrap();
+        assert_eq!(plan_for(None), vec!["evil".to_string(), "other".to_string()]);
+    }
+
+    /// The user's own Codex `config.toml` that is there but cannot be read may name alternates for
+    /// `AGENTS.md` that a session loads, which this discovery then cannot have hashed: the answer lasts
+    /// one start, and every project server is watched for. A file that is not there is no gap.
+    #[test]
+    fn an_unreadable_user_codex_config_makes_the_answer_last_one_start() {
+        let fx = Fx::new("codex-user-unreadable");
+        fx.write("AGENTS.md", b"be careful\n");
+        fx.write("TEAM.md", b"team\n");
+        let own = fx.home.join(".codex");
+        std::fs::create_dir_all(&own).unwrap();
+        let file = own.join("config.toml");
+        let found_with = |text: Option<&[u8]>| {
+            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_dir(&file);
+            if let Some(text) = text {
+                std::fs::write(&file, text).unwrap();
+            }
+            let guess = codex_home_guess(None, Some(&fx.home), &fx.root);
+            let user = read_codex_user_config(guess.config.as_deref().unwrap());
+            let env = codex_profile_env(guess.skip, user);
+            eitri_core::project_trust::discover(&fx.root, Some(&fx.home), &Default::default(), &CODEX, &env)
+        };
+        assert!(found_with(None).fully_hashed(), "a missing file is no gap");
+        let fine = found_with(Some(b"model = \"x\"\n"));
+        assert!(fine.fully_hashed());
+        assert_eq!(fine.user_mcp_servers, Some(Default::default()));
+
+        let bad: [&[u8]; 2] = [
+            b"project_doc_fallback_filenames = [\"TEAM.md\"\n",
+            b"model = \"\xff\"\n",
+        ];
+        for text in bad {
+            let found = found_with(Some(text));
+            assert!(!found.fully_hashed(), "{}", String::from_utf8_lossy(text));
+            assert!(
+                found.uncheckable().iter().any(|(path, _)| *path == file.as_path()),
+                "{:?}",
+                found.uncheckable()
+            );
+            assert_eq!(found.user_mcp_servers, None, "the user's servers are unknown");
+        }
+        // Something other than a file where the file goes cannot be read either.
+        let _ = std::fs::remove_file(&file);
+        std::fs::create_dir_all(&file).unwrap();
+        let guess = codex_home_guess(None, Some(&fx.home), &fx.root);
+        let env = codex_profile_env(guess.skip, read_codex_user_config(guess.config.as_deref().unwrap()));
+        let found = eitri_core::project_trust::discover(&fx.root, Some(&fx.home), &Default::default(), &CODEX, &env);
+        assert!(!found.fully_hashed());
     }
 
     /// A registered agent cannot leave the project's configuration out, so its `n` starts nothing and

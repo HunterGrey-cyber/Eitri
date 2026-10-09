@@ -128,7 +128,9 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         // The CLI refused a call: the row's note says why, and the user may want to act on it.
         AgentDomainEvent::PermissionDenied { .. } => false,
         // A tripwire and a limit change state the user may act on, so neither waits for a slot.
-        AgentDomainEvent::PolicyMismatch { .. } | AgentDomainEvent::AccountLimits { .. } => false,
+        AgentDomainEvent::PolicyMismatch { .. }
+        | AgentDomainEvent::AccountLimits { .. }
+        | AgentDomainEvent::BackgroundCalls { .. } => false,
         // It travels with the CLI's own prompt (a card), and says the card is for another input.
         AgentDomainEvent::ToolInputChanged { .. } => false,
     }

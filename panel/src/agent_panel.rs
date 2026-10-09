@@ -3415,6 +3415,7 @@ fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
                 .trust
                 .next_session_trust(&trust_profile(&state.acp_agents, t.agent())),
             &state.acp_agents,
+            stop_background_keys(state.keymap_help.as_deref()).as_deref(),
         ),
         None => Vec::new(),
     };
@@ -3469,9 +3470,10 @@ fn detail_rows(
     trust_row: &str,
     next: ProjectTrust,
     registered: &[AgentRegistration],
+    stop_keys: Option<&str>,
 ) -> Vec<DetailRow> {
     if tab.agent().is_external() {
-        return external_detail_rows(tab, kind, project_dir, trust_row, next, registered);
+        return external_detail_rows(tab, kind, project_dir, trust_row, next, registered, stop_keys);
     }
     const UNKNOWN: &str = "—";
     let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
@@ -3661,6 +3663,7 @@ fn external_detail_rows(
     trust_row: &str,
     next: ProjectTrust,
     registered: &[AgentRegistration],
+    stop_keys: Option<&str>,
 ) -> Vec<DetailRow> {
     const UNKNOWN: &str = "—";
     let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
@@ -3669,12 +3672,16 @@ fn external_detail_rows(
     let backend = tab.live();
     // As on the Claude rows: the session id is read before the projection is taken.
     let provider_session_id = backend.and_then(|b| b.provider_session_id());
-    let (cwd, limits) = match backend {
+    let (cwd, limits, background) = match backend {
         Some(b) => {
             let projection = b.projection();
-            (projection.cwd.clone(), projection.account_limits.clone())
+            (
+                projection.cwd.clone(),
+                projection.account_limits.clone(),
+                projection.background_calls,
+            )
         }
-        None => (None, None),
+        None => (None, None, 0),
     };
     let conversation_id = backend.and_then(|b| b.conversation_id().map(str::to_string));
     let version = backend.and_then(|b| b.provider_info()).map(|info| {
@@ -3759,12 +3766,62 @@ fn external_detail_rows(
         ),
         ("queued", tab.queue.len().to_string()),
     ];
-    rows.into_iter()
+    let mut rows: Vec<DetailRow> = rows
+        .into_iter()
         .map(|(label, value)| DetailRow {
             label: label.to_string(),
             value,
         })
-        .collect()
+        .collect();
+    // Only Codex counts what it leaves running after a turn, and only its tab can stop it.
+    if is_codex {
+        rows.push(DetailRow {
+            label: "background".to_string(),
+            value: background_row(background, stop_keys),
+        });
+    }
+    rows
+}
+
+/// The `background` row of `prefix i`: how many commands the agent left running after its turns ended,
+/// and the key that stops them (`stop_keys`, as the user presses it; `None` when no key is bound).
+fn background_row(running: u32, stop_keys: Option<&str>) -> String {
+    if running == 0 {
+        return "none".to_string();
+    }
+    let them = if running == 1 { "it" } else { "them" };
+    match stop_keys {
+        Some(keys) => format!("{running} running ({keys} stops {them} with the session)"),
+        None => {
+            format!("{running} running (no key is bound to tab.stop-background, which stops {them} with the session)")
+        }
+    }
+}
+
+/// How the user presses `tab.stop-background`, read from the panel table the window last sent (the
+/// leader by its own name): the default `Space k` before any was sent, `None` when no key is bound.
+fn stop_background_keys(keymap_help: Option<&str>) -> Option<String> {
+    let Some(help) = keymap_help else {
+        return Some("Space k".to_string());
+    };
+    let help: serde_json::Value = serde_json::from_str(help).ok()?;
+    let panel = &help["panel"];
+    let leader = panel["leaderLabel"].as_str().unwrap_or("Space");
+    let binding = panel["bindings"]
+        .as_array()?
+        .iter()
+        .find(|b| b["action"] == "tab.stop-background")?;
+    let keys: Vec<String> = binding["keys"]
+        .as_array()?
+        .iter()
+        .filter_map(|k| k.as_str())
+        .map(|k| match k {
+            "<leader>" => leader.to_string(),
+            " " => "Space".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    (!keys.is_empty()).then(|| keys.join(" "))
 }
 
 /// The connect worker, shared by `send_message` on an empty tab and `resume`. Off the GTK main
@@ -3854,8 +3911,9 @@ fn spawn_external(
     std::thread::spawn(move || {
         let launch = match &agent {
             AgentId::Codex => {
-                // A relative home is refused before anything runs, the version probe of the binary included.
-                let located = agent::providers::codex::refuse_relative_codex_home()
+                // A relative home, or one inside the project, is refused before anything runs, the version
+                // probe of the binary included.
+                let located = agent::providers::codex::refuse_codex_home(&project_dir)
                     .map_err(|e| e.to_string())
                     .and_then(|()| {
                         agent::providers::codex::locate_codex(codex_command.as_deref()).map_err(|e| e.to_string())
@@ -4895,14 +4953,18 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             }
             let canonical = state.borrow().canonical_project_dir.clone();
             // The session is the tab's agent's: its lease is under that agent's name.
-            let lease_name = state
+            let agent = state
                 .borrow()
                 .tabs
                 .get(tab)
-                .map_or_else(|| "claude".to_string(), |t| t.agent().record_name());
+                .map_or(AgentId::Claude, |t| t.agent().clone());
+            let lease_name = agent.record_name();
             let held =
                 agent::lease::SessionLease::is_held(&lease_name, &canonical, &provider_session_id).unwrap_or(false);
-            let route = state.borrow_mut().tabs.route_resume(tab, &provider_session_id, held);
+            let route = state
+                .borrow_mut()
+                .tabs
+                .route_resume(tab, &agent, &provider_session_id, held);
             match route {
                 ResumeRoute::SwitchTo(_) => {
                     send_switch(state, page);
@@ -4953,6 +5015,13 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         InboundMessage::Interrupt { .. } => {
             let tab = tab_of(target);
             let outcome = backend_for(&mut state.borrow_mut().tabs, tab).and_then(AgentBackend::interrupt);
+            apply_command_outcome(state, page, tab, &request_id, outcome);
+        }
+        InboundMessage::StopBackground { running, .. } => {
+            // The tab the question was asked in, never the one on screen now. A refusal is benign and
+            // leaves the session alone; a taken stop ends the session through the pump, as a lost one.
+            let tab = tab_of(target);
+            let outcome = state.borrow_mut().tabs.stop_background(tab, running);
             apply_command_outcome(state, page, tab, &request_id, outcome);
         }
         message @ InboundMessage::PermissionResponse { .. } => {
@@ -6522,6 +6591,105 @@ mod tests {
         assert_eq!(provider.inner.closes(), 1, "released only after the shutdown returned");
     }
 
+    /// The confirmed `<leader>k` reaches the conversation of the tab it names, never the one on screen.
+    /// One that names a closed tab, or none, is refused; a refusal because of when it was asked is said
+    /// and leaves the tab live; a taken stop ends the session through the pump, as a lost one that can
+    /// be resumed.
+    #[test]
+    fn a_stop_of_the_background_reaches_the_tab_it_names_and_ends_its_session() {
+        use eitri_core::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-stop-background");
+        let (handle, page, _host) = handle_with_recording_page();
+        page.visible.set(true);
+        let provider = std::sync::Arc::new(ExternalRecordingProvider::codex());
+        let (codex, on_screen) = {
+            let mut state_ref = handle.state.borrow_mut();
+            let tabs = &mut state_ref.tabs;
+            let codex = tabs.open(AgentId::Codex);
+            tabs.get_mut(codex).unwrap().backend = TabBackend::Live(
+                AgentBackend::start_external_with(
+                    AgentId::Codex,
+                    provider.clone(),
+                    &dir,
+                    empty_trust_plan(),
+                    SessionModeChoice::Auto,
+                    None,
+                )
+                .unwrap(),
+            );
+            let on_screen = tabs.tabs().iter().find(|t| t.id != codex).unwrap().id;
+            tabs.select(on_screen);
+            (codex, on_screen)
+        };
+        provider
+            .inner
+            .queue(agent::AgentDomainEvent::BackgroundCalls { running: 1 });
+        let count = || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(codex)
+                .and_then(|t| t.live())
+                .map(|b| b.projection().background_calls)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while count() != Some(1) {
+            assert!(std::time::Instant::now() < deadline, "the count never arrived");
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let result = |request: &str| -> Option<Result<(), String>> {
+            page.sent.borrow().iter().find_map(|envelope| {
+                let v: serde_json::Value = serde_json::from_str(envelope).unwrap();
+                (v["kind"] == "command_result" && v["requestId"] == request).then(|| {
+                    if v["ok"] == true {
+                        Ok(())
+                    } else {
+                        Err(v["error"].as_str().unwrap_or("").to_string())
+                    }
+                })
+            })
+        };
+        let stop = |request: &str, tab: Option<TabId>| {
+            let tab = tab.map_or(String::new(), |t| format!(r#","tab":{}"#, t.0));
+            handle.page_message(&format!(
+                r#"{{"type":"stop_background","request_id":"{request}"{tab},"running":1}}"#
+            ));
+        };
+
+        stop("s0", Some(TabId(9_999)));
+        assert_eq!(result("s0"), Some(Err("protocol: no tab 9999".to_string())));
+        stop("s1", None);
+        assert_eq!(
+            result("s1"),
+            Some(Err("protocol: this command names no tab".to_string()))
+        );
+        stop("s2", Some(on_screen));
+        assert_eq!(result("s2"), Some(Err("no active session".to_string())));
+        provider.refuse_next_stop(agent::ProviderErrorCode::NoActiveTurn);
+        stop("s3", Some(codex));
+        assert!(matches!(result("s3"), Some(Err(_))), "{:?}", result("s3"));
+        assert!(
+            handle.state.borrow().tabs.get(codex).unwrap().live().is_some(),
+            "a refusal leaves the session alone"
+        );
+        assert_eq!(provider.stops(), 0);
+
+        stop("s4", Some(codex));
+        assert_eq!(result("s4"), Some(Ok(())));
+        assert_eq!(provider.stops(), 1, "the tab it named, not the one on screen");
+        let ended = || handle.state.borrow().tabs.get(codex).unwrap().wire_state().as_str() == "ended";
+        while !ended() {
+            assert!(std::time::Instant::now() < deadline, "the session never ended");
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(count(), Some(0));
+        assert!(handle.state.borrow().tabs.get(on_screen).is_some());
+    }
+
     #[test]
     fn a_panel_with_no_page_never_ticks() {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
@@ -7791,6 +7959,7 @@ mod tests {
             "not checked yet",
             ProjectTrust::Untrusted,
             &[],
+            Some("Space k"),
         );
         let value = |label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
         assert_eq!(value("queued"), "1");
@@ -7804,6 +7973,7 @@ mod tests {
             "not checked yet",
             ProjectTrust::Untrusted,
             &[],
+            Some("Space k"),
         );
         assert_eq!(rows.iter().find(|r| r.label == "permission rules").unwrap().value, "—");
     }
@@ -7902,6 +8072,7 @@ mod tests {
             "not checked yet",
             ProjectTrust::Untrusted,
             &[],
+            Some("Space k"),
         );
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         for want in [
@@ -7958,6 +8129,7 @@ mod tests {
                 "not checked yet",
                 ProjectTrust::Untrusted,
                 &[],
+                Some("Space k"),
             );
             let settings = rows
                 .iter()
@@ -8492,7 +8664,14 @@ mod tests {
 
     fn mode(state: &Rc<RefCell<AgentPanelState>>, session: &str) -> SessionModeChoice {
         let s = state.borrow();
-        s.tabs.get(s.tabs.tab_with_session(session).unwrap()).unwrap().mode()
+        let tab = s
+            .tabs
+            .tabs()
+            .iter()
+            .find(|t| t.provider_session_id().as_deref() == Some(session))
+            .map(|t| t.id)
+            .unwrap();
+        s.tabs.get(tab).unwrap().mode()
     }
 
     use SessionModeChoice::{Auto, Bypass};
@@ -8905,7 +9084,7 @@ mod tests {
         });
         let mut resumes = FakeResumes::default();
         started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
-        let second = state.borrow().tabs.tab_with_session("s-2").unwrap();
+        let second = state.borrow().tabs.tab_with_session(&AgentId::Claude, "s-2").unwrap();
         let (_provider, backend) = live_backend(&dir);
         resumes.senders[0].send(Ok(backend)).unwrap();
         let collected = state.borrow_mut().tabs.collect_starts();
@@ -8939,8 +9118,8 @@ mod tests {
         );
         let mut resumes = FakeResumes::default();
         started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
-        let first = state.borrow().tabs.tab_with_session("s-1").unwrap();
-        let second = state.borrow().tabs.tab_with_session("s-2").unwrap();
+        let first = state.borrow().tabs.tab_with_session(&AgentId::Claude, "s-1").unwrap();
+        let second = state.borrow().tabs.tab_with_session(&AgentId::Claude, "s-2").unwrap();
         assert_eq!(state.borrow().tabs.active(), first, "the saved active tab is the first");
         resumes.senders[0]
             .send(Err(BackendError {
@@ -10197,7 +10376,10 @@ mod tests {
         assert_eq!(spawned[0].mode, Auto);
         assert!(spawned[0].plan.skills_off, "nothing to trust starts untrusted");
         let s = state.borrow();
-        let codex = s.tabs.tab_with_session("thread-9").expect("the Codex tab is back");
+        let codex = s
+            .tabs
+            .tab_with_session(&AgentId::Codex, "thread-9")
+            .expect("the Codex tab is back");
         assert_eq!(s.tabs.get(codex).unwrap().agent(), &AgentId::Codex);
         assert_eq!(s.tabs.active(), codex, "the saved active tab is on screen");
         let saved = s.tabs.saved_snapshot("conv").unwrap();
@@ -10224,7 +10406,7 @@ mod tests {
             let waiting = state
                 .borrow()
                 .tabs
-                .tab_with_session("gem-s")
+                .tab_with_session(&AgentId::Acp("gem".into()), "gem-s")
                 .expect("the gem tab is back");
             assert_eq!(prompt.tab, waiting);
             let saved = state.borrow().tabs.saved_snapshot("conv").unwrap();
@@ -10272,7 +10454,10 @@ mod tests {
         assert_eq!(*resumed.borrow(), ["s-1"]);
         assert!(external.borrow().is_empty());
         let s = state.borrow();
-        assert!(s.tabs.tab_with_session("gem-s").is_none(), "no tab is made for it");
+        assert!(
+            s.tabs.tab_with_session(&AgentId::Acp("gem".into()), "gem-s").is_none(),
+            "no tab is made for it"
+        );
         let saved = s.tabs.saved_snapshot("conv").unwrap();
         assert!(saved.external_tabs.is_empty(), "the next save leaves it out");
     }
@@ -10295,7 +10480,7 @@ mod tests {
         let codex = state
             .borrow()
             .tabs
-            .tab_with_session("thread-9")
+            .tab_with_session(&AgentId::Codex, "thread-9")
             .expect("the Codex tab is back");
         assert_eq!(prompt.tab, codex);
         assert!(matches!(
@@ -10477,6 +10662,7 @@ mod tests {
                 "trusted since 2026-10-02",
                 next,
                 &[],
+                Some("Space k"),
             )
         };
         let value = |rows: &[DetailRow], label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
@@ -10517,6 +10703,7 @@ mod tests {
             "trusted since 2026-10-02",
             next,
             &[],
+            Some("Space k"),
         )
     }
 
@@ -10547,7 +10734,8 @@ mod tests {
                 "resumable",
                 "created",
                 "updated",
-                "queued"
+                "queued",
+                "background"
             ]
         );
         for claude_only in [
@@ -10582,6 +10770,7 @@ mod tests {
         assert!(value("mode lag").contains("keeps the reviewer it started with"));
         assert_eq!(value("limits"), "—");
         assert_eq!(value("resumable"), "yes");
+        assert_eq!(value("background"), "none");
 
         // Bypass keeps the sandbox and answers for the reviewer; the project's tier follows the answer.
         let rows = codex_rows(SessionModeChoice::Bypass, ProjectTrust::Trusted);
@@ -10629,6 +10818,7 @@ mod tests {
                 "not checked yet",
                 ProjectTrust::Untrusted,
                 registered,
+                Some("Space k"),
             )
         };
         let value = |rows: &[DetailRow], label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
@@ -10657,6 +10847,82 @@ mod tests {
         // An agent init.lua no longer registers is one Eitri knows nothing about.
         let rows = rows_for(&[]);
         assert!(value(&rows, "runs without asking").starts_with("Eitri does not know"));
+    }
+
+    /// The `background` row says how many commands a Codex tab's agent left running and the key that
+    /// stops them, as the user presses it: the leader by its own name, a rebinding followed, a deleted
+    /// binding said.
+    #[test]
+    fn the_background_row_counts_and_names_the_key_that_stops_them() {
+        assert_eq!(background_row(0, Some("Space k")), "none");
+        assert_eq!(
+            background_row(1, Some("Space k")),
+            "1 running (Space k stops it with the session)"
+        );
+        assert_eq!(
+            background_row(2, Some(", k")),
+            "2 running (, k stops them with the session)"
+        );
+        assert!(background_row(3, None).contains("no key is bound to tab.stop-background"));
+
+        assert_eq!(stop_background_keys(None).as_deref(), Some("Space k"));
+        let help = |leader: &str, bindings: serde_json::Value| {
+            serde_json::json!({"kind": "keymap", "panel": {"leaderLabel": leader, "bindings": bindings}}).to_string()
+        };
+        let bound = help(
+            ",",
+            serde_json::json!([{"keys": ["<leader>", "m"], "action": "mode.cycle"},
+                               {"keys": ["<leader>", "x", "k"], "action": "tab.stop-background"}]),
+        );
+        assert_eq!(stop_background_keys(Some(&bound)).as_deref(), Some(", x k"));
+        let unbound = help(
+            "Space",
+            serde_json::json!([{"keys": ["<leader>", "m"], "action": "mode.cycle"}]),
+        );
+        assert_eq!(stop_background_keys(Some(&unbound)), None);
+    }
+
+    /// A Codex tab's `background` row reads the count its agent last reported.
+    #[test]
+    fn a_codex_tab_background_row_reads_its_count() {
+        use eitri_core::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-background-row");
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.open(AgentId::Codex);
+        let provider = std::sync::Arc::new(ExternalRecordingProvider::codex());
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(
+            AgentBackend::start_external_with(
+                AgentId::Codex,
+                provider.clone(),
+                &dir,
+                empty_trust_plan(),
+                SessionModeChoice::Auto,
+                None,
+            )
+            .unwrap(),
+        );
+        provider
+            .inner
+            .queue(agent::AgentDomainEvent::BackgroundCalls { running: 2 });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while set.get(tab).unwrap().live().unwrap().projection().background_calls != 2 {
+            assert!(std::time::Instant::now() < deadline, "the count never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let rows = detail_rows(
+            set.get(tab).unwrap(),
+            BackendKind::Sidecar,
+            None,
+            &dir,
+            None,
+            "not checked yet",
+            ProjectTrust::Untrusted,
+            &[],
+            Some("Space k"),
+        );
+        let row = rows.iter().find(|r| r.label == "background").unwrap();
+        assert_eq!(row.value, "2 running (Space k stops them with the session)");
     }
 
     #[test]
@@ -10701,6 +10967,7 @@ mod tests {
             "not checked yet",
             ProjectTrust::Untrusted,
             &[],
+            Some("Space k"),
         );
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(

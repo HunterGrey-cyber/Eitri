@@ -1243,7 +1243,9 @@ fn feed_family(family: &mut Family, notes: &[Note]) -> Vec<(Instant, String, Fam
                         "agentPath": json_str(&note.params, "/item/agentPath").unwrap_or_default(),
                     });
                     if let Ok(item) = serde_json::from_value(item) {
-                        family.announce(&thread, &item);
+                        family
+                            .announce(&thread, &item)
+                            .expect("a real run stays under the member cap");
                     }
                 }
             }

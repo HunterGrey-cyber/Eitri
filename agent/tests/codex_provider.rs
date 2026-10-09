@@ -4,7 +4,7 @@
 //! failed turn). No real Codex runs here and no model turn is spent.
 
 use agent::providers::codex::provider::NOT_FOUND;
-use agent::providers::codex::{parse_user_agent_version, CodexLaunch, CodexProvider, MIN_CODEX};
+use agent::providers::codex::{parse_user_agent_version, BinaryKey, CodexLaunch, CodexProvider, MIN_CODEX};
 use agent::{
     AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind, DirTrust, ExternalProvider, ExternalStart,
     InterruptTurnRequest, ProviderError, ProviderErrorCode, Reviewer, SendTurnRequest, TrustPlan, TurnOutcome,
@@ -409,6 +409,135 @@ fn a_relative_codex_home_refuses_the_start_before_anything_runs() {
         assert!(marker.exists(), "CODEX_HOME={value:?} was refused");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+/// An absolute `CODEX_HOME` that names the project root or a directory in it would make a directory the
+/// project ships load as the user's own configuration layer, which no trust answer covers. The start is
+/// refused, naming the variable and the root, before any child runs; a home outside the project, or one
+/// under a root that holds the user's own home, is not refused.
+#[test]
+fn a_codex_home_inside_the_project_refuses_the_start_before_anything_runs() {
+    use std::os::unix::fs::symlink;
+    let outside = std::env::temp_dir().join(format!("eitri-outside-home-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+    type Case = (
+        &'static str,
+        fn(&std::path::Path, &std::path::Path) -> Vec<(OsString, OsString)>,
+        Vec<&'static str>,
+    );
+    let refused: Vec<Case> = vec![
+        (
+            "the root's .codex",
+            |root, _| vec![("CODEX_HOME".into(), root.join(".codex").into())],
+            vec![],
+        ),
+        (
+            "the root itself",
+            |root, _| vec![("CODEX_HOME".into(), root.into())],
+            vec![],
+        ),
+        (
+            "a directory not made yet",
+            |root, _| vec![("CODEX_HOME".into(), root.join("a/b/c").into())],
+            vec![],
+        ),
+        (
+            "a link in the project to a directory outside",
+            |root, outside| {
+                symlink(outside, root.join("away")).unwrap();
+                vec![("CODEX_HOME".into(), root.join("away").into())]
+            },
+            vec![],
+        ),
+        (
+            "a link outside to the project",
+            |root, outside| {
+                let link = outside.join(format!("into-{}", root.file_name().unwrap().to_string_lossy()));
+                symlink(root, &link).unwrap();
+                vec![("CODEX_HOME".into(), link.join(".codex").into())]
+            },
+            vec![],
+        ),
+        (
+            "an unset one whose ~/.codex is the root",
+            |root, _| vec![("HOME".into(), root.parent().unwrap().into())],
+            vec!["CODEX_HOME"],
+        ),
+    ];
+    for (what, env, remove) in refused {
+        let (dir, program, marker) = marker_program("home-in-project");
+        // The project is a directory of its own whose name is `.codex` only in the last case.
+        let root = if remove.is_empty() {
+            dir.join("project")
+        } else {
+            dir.join(".codex")
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let launch = CodexLaunch {
+            program,
+            cwd: root.clone(),
+            state_home: dir.clone(),
+        };
+        let env = env(&root, &outside);
+        let remove = remove.into_iter().map(OsString::from).collect();
+        match CodexProvider::connect_with_env(launch, Vec::new(), env, remove) {
+            Err(ProviderError::Provider { code, message }) => {
+                assert_eq!(code, ProviderErrorCode::InvalidConfiguration, "{what}");
+                assert!(
+                    message.contains("CODEX_HOME") && message.contains(&root.display().to_string()),
+                    "{what}: {message}"
+                );
+            }
+            Err(other) => panic!("expected a refusal for {what}, got {other}"),
+            Ok(_) => panic!("a CODEX_HOME inside the project ({what}) connected"),
+        }
+        assert!(!marker.exists(), "a child ran with {what}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    let allowed: Vec<Case> = vec![
+        (
+            "a home outside the project",
+            |_, outside| vec![("CODEX_HOME".into(), outside.join(".codex").into())],
+            vec![],
+        ),
+        (
+            "a root that holds the user's home",
+            |root, _| {
+                vec![
+                    ("HOME".into(), root.join("user").into()),
+                    ("CODEX_HOME".into(), root.join("user/.codex").into()),
+                ]
+            },
+            vec![],
+        ),
+        (
+            "an unset one under a root that holds the user's home",
+            |root, _| vec![("HOME".into(), root.join("user").into())],
+            vec!["CODEX_HOME"],
+        ),
+        (
+            "the root is the user's home",
+            |root, _| vec![("HOME".into(), root.into())],
+            vec!["CODEX_HOME"],
+        ),
+    ];
+    for (what, env, remove) in allowed {
+        let (dir, program, marker) = marker_program("home-outside-project");
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let launch = CodexLaunch {
+            program,
+            cwd: root.clone(),
+            state_home: dir.clone(),
+        };
+        let env = env(&root, &outside);
+        let remove = remove.into_iter().map(OsString::from).collect();
+        assert!(CodexProvider::connect_with_env(launch, Vec::new(), env, remove).is_err());
+        assert!(marker.exists(), "{what} was refused");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    std::fs::remove_dir_all(&outside).unwrap();
 }
 
 #[test]
@@ -1595,4 +1724,291 @@ fn closing_during_a_stop_waits_until_the_child_is_gone() {
         !alive(pid),
         "the close returned while the stop had not killed the child"
     );
+}
+
+/// The binary the self-check passed, as a key naming `version`.
+fn checked_as(version: &str) -> BinaryKey {
+    BinaryKey::new(launch().program, 0, 0, version.to_string())
+}
+
+fn connect_checked(script: Vec<Value>, key: &BinaryKey) -> Result<CodexProvider, ProviderError> {
+    CodexProvider::connect_checked_with_args(launch(), vec![OsString::from(Value::Array(script).to_string())], key)
+}
+
+#[test]
+fn a_codex_that_reports_another_version_than_the_checked_one_is_refused() {
+    // The path is resolved when the check runs and again when the tab's child starts; an upgrade in
+    // between leaves a binary running that was never checked.
+    let script = vec![
+        expect_request(1, "initialize"),
+        write(json!({"id": 1, "result": {"userAgent": UA, "codexHome": "/x"}})),
+    ];
+    match connect_checked(script, &checked_as("0.161.0")) {
+        Err(ProviderError::Provider { code, message }) => {
+            assert_eq!(code, ProviderErrorCode::ProviderUnavailable);
+            assert!(
+                message.contains("Codex changed while Eitri was checking it"),
+                "{message}"
+            );
+        }
+        Err(other) => panic!("expected a refusal, got {other}"),
+        Ok(_) => panic!("a Codex other than the checked one connected"),
+    }
+}
+
+#[test]
+fn a_codex_that_reports_the_checked_version_connects() {
+    let provider = connect_checked(handshake(UA, signed_in()), &checked_as("0.160.0")).expect("connects");
+    assert_eq!(provider.version(), (0, 160, 0));
+}
+
+// ---------------------------------------------------------------- what a completed turn leaves running
+
+fn background_counts(events: &[AgentDomainEvent]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::BackgroundCalls { running } => Some(*running),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A turn that completes while the command it started still runs (the model put it in the background).
+fn left_running(thread: &str, turn: &str, then: Vec<Value>) -> (Arc<CodexProvider>, String, Vec<AgentDomainEvent>) {
+    let mut rest = vec![
+        expect_request(4, "turn/start"),
+        turn_response(4, turn),
+        item_note("item/started", thread, turn, command("bg1", "inProgress")),
+        turn_completed(thread, turn, "completed", Value::Null),
+    ];
+    rest.extend(then);
+    let (provider, id) = open(thread, rest);
+    send(&provider, &id, "go").expect("starts");
+    let events = until_turn_completed(&provider);
+    (provider, id, events)
+}
+
+#[test]
+fn a_command_left_running_by_a_completed_turn_is_counted_before_the_turn_ends() {
+    let (t, u) = ("th-60", "turn-60");
+    let (provider, _, events) = left_running(
+        t,
+        u,
+        vec![
+            json!({"sleep_ms": 300}),
+            item_note("item/completed", t, u, command("bg1", "completed")),
+        ],
+    );
+    let count = position(&events, |e| {
+        matches!(e, AgentDomainEvent::BackgroundCalls { running: 1 })
+    })
+    .expect("the command left running is counted");
+    let end = position(&events, |e| matches!(e, AgentDomainEvent::TurnCompleted { .. })).expect("the end");
+    assert!(count < end, "the count came after the turn's end: {events:#?}");
+    assert!(matches!(
+        &events[end],
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    ));
+    // Its end, after the turn's, takes the count back to nothing.
+    let later = pump_until(&provider, |events| background_counts(events).contains(&0));
+    assert_eq!(background_counts(&later), vec![0]);
+}
+
+#[test]
+fn a_command_that_ends_inside_its_turn_is_never_counted() {
+    let (t, u) = ("th-61", "turn-61");
+    let (provider, id) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            item_note("item/started", t, u, command("c1", "inProgress")),
+            item_note("item/completed", t, u, command("c1", "completed")),
+            turn_completed(t, u, "completed", Value::Null),
+        ],
+    );
+    send(&provider, &id, "go").expect("starts");
+    let mut events = until_turn_completed(&provider);
+    std::thread::sleep(Duration::from_millis(100));
+    events.extend(provider.pump());
+    assert!(background_counts(&events).is_empty(), "{events:#?}");
+}
+
+#[test]
+fn stopping_the_background_stops_the_session() {
+    let (t, u) = ("th-62", "turn-62");
+    // The stand-in never reports the command ended and waits for its stdin to close.
+    let (provider, id, _) = left_running(t, u, vec![]);
+    let pid = provider.pid();
+    provider.stop_background(&id, 1).expect("the stop is taken");
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
+    });
+    assert!(!alive(pid), "the session ended before its child was gone");
+    assert_eq!(background_counts(&events), vec![0]);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentDomainEvent::SessionUnavailable { reason }
+            if reason == agent::providers::codex::provider::STOPPED_BACKGROUND
+    )));
+    assert!(send(&provider, &id, "next").is_err(), "a stopped session took a turn");
+}
+
+#[test]
+fn the_background_is_not_stopped_while_a_turn_runs_or_when_nothing_is_left() {
+    let (t, u) = ("th-63", "turn-63");
+    let (provider, id) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            item_note("item/started", t, u, command("c1", "inProgress")),
+        ],
+    );
+    let refused = |provider: &CodexProvider| match provider.stop_background(&id, 1) {
+        Err(ProviderError::Provider { code, .. }) => code,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(refused(&provider), ProviderErrorCode::NoActiveTurn, "nothing left yet");
+    send(&provider, &id, "go").expect("starts");
+    pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::ToolCallStarted { .. }))
+    });
+    assert_eq!(refused(&provider), ProviderErrorCode::TurnAlreadyActive);
+    assert!(alive(provider.pid()));
+}
+
+/// A turn start Codex did not answer in time is reported as not started; should Codex start that turn
+/// after all, it is interrupted rather than left running unseen by the user.
+#[test]
+fn a_turn_codex_starts_after_its_start_timed_out_is_interrupted() {
+    let (t, u) = ("th-64", "turn-64");
+    let (provider, id) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            json!({"sleep_ms": agent::UNARY_RPC_TIMEOUT.as_millis() as u64 + 500}),
+            write(json!({"method": "turn/started", "params": {"threadId": t, "turn": {
+                "id": u, "items": [], "itemsView": "notLoaded", "status": "inProgress", "error": null}}})),
+            expect_exact(&format!(
+                r#"{{"id":5,"method":"turn/interrupt","params":{{"threadId":"{t}","turnId":"{u}"}}}}"#
+            )),
+            turn_completed(t, u, "interrupted", Value::Null),
+        ],
+    );
+    assert!(matches!(send(&provider, &id, "go"), Err(ProviderError::Timeout)));
+    let events = until_turn_completed(&provider);
+    assert!(matches!(
+        the_completion(&events),
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Interrupted,
+            ..
+        }
+    ));
+}
+
+/// A call whose end is larger than the link reads is over all the same: its row ends with a note instead of
+/// reading as running until the turn ends.
+#[test]
+fn a_row_whose_end_is_too_large_to_read_ends_with_a_note() {
+    let (t, u) = ("th-65", "turn-65");
+    let prefix = format!(
+        r#"{{"method":"item/completed","params":{{"threadId":"{t}","turnId":"{u}","item":{{"type":"commandExecution","id":"big1","command":"yes","cwd":"/work/proj","status":"completed","aggregatedOutput":""#
+    );
+    let (provider, id) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            item_note("item/started", t, u, command("big1", "inProgress")),
+            json!({"write_big": {"prefix": prefix, "bytes": 17 * 1024 * 1024, "suffix": "\"}}}"}}),
+            json!({"sleep_ms": 300}),
+            turn_completed(t, u, "completed", Value::Null),
+        ],
+    );
+    send(&provider, &id, "go").expect("starts");
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::ToolCallCompleted { .. }))
+    });
+    let ended = events.iter().find_map(|e| match e {
+        AgentDomainEvent::ToolCallCompleted { content, .. } => content.as_str().map(str::to_string),
+        _ => None,
+    });
+    assert!(
+        ended.as_deref().is_some_and(|c| c.contains("larger than 16 MiB")),
+        "{ended:?}"
+    );
+    let rest = until_turn_completed(&provider);
+    assert!(
+        !background_counts(&rest).iter().any(|n| *n > 0),
+        "the call that ended counts as left running"
+    );
+}
+
+/// A final message that is not the streamed text with more after it is shown whole as a message of its own,
+/// never as its tail spliced onto what streamed.
+#[test]
+fn a_final_message_that_does_not_extend_what_streamed_is_not_spliced() {
+    let (t, u) = ("th-66", "turn-66");
+    let (provider, id) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            item_note(
+                "item/started",
+                t,
+                u,
+                json!({"type": "agentMessage", "id": "m1", "text": ""}),
+            ),
+            delta_note("item/agentMessage/delta", t, u, "m1", "Hello wor"),
+            item_note(
+                "item/completed",
+                t,
+                u,
+                json!({"type": "agentMessage", "id": "m1", "text": "Hi there, it is a new text"}),
+            ),
+            turn_completed(t, u, "completed", Value::Null),
+        ],
+    );
+    send(&provider, &id, "go").expect("starts");
+    let events = until_turn_completed(&provider);
+    let texts: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::ContentDelta {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["Hello wor", "Hi there, it is a new text"], "{events:#?}");
+}
+
+/// The user said yes to a number; when Codex's own count is another by now (its report not yet folded),
+/// nothing is stopped and the panel asks again.
+#[test]
+fn a_stop_for_a_count_that_moved_is_refused() {
+    let (t, u) = ("th-67", "turn-67");
+    let (provider, id, _) = left_running(t, u, vec![]);
+    match provider.stop_background(&id, 2) {
+        Err(ProviderError::Provider { code, message }) => {
+            assert_eq!(code, ProviderErrorCode::NoActiveTurn);
+            assert!(message.contains("ask again"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(alive(provider.pid()), "nothing was stopped");
 }

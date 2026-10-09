@@ -624,6 +624,18 @@ pub struct BypassPlan {
     pub prompt: tabs::PromptScope,
 }
 
+/// What a stop of the background says when the agent left nothing running.
+pub const NOTHING_IN_THE_BACKGROUND: &str = "nothing is running in the background";
+
+/// `1 command` or `N commands`: how the panel counts what an agent left running.
+pub fn running_in_background(n: u32) -> String {
+    if n == 1 {
+        "1 command".to_string()
+    } else {
+        format!("{n} commands")
+    }
+}
+
 /// Result of `cycle_mode`/`cycle_default_mode`: bypass -> auto changes at once; auto -> bypass
 /// returns a confirmation prompt without changing the mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1151,6 +1163,42 @@ impl TabSet {
         true
     }
 
+    /// The confirmed `<leader>k` of tab `id`: stops the commands its agent left running after its turns
+    /// ended by stopping the session. `shown` is the count the question named; when the tab's count is
+    /// another now, nothing is stopped and the user is asked to look again, since the answer was to a
+    /// different question. Every refusal is benign and leaves the session as it was: no such tab, no
+    /// live session, a turn running (an interrupt stops what it left), nothing left running.
+    pub fn stop_background(&mut self, id: TabId, shown: u32) -> Result<Vec<AgentDomainEvent>, BackendError> {
+        let benign = |message: String| BackendError {
+            message,
+            benign: true,
+            folded_events: Vec::new(),
+        };
+        let Some(tab) = self.get_mut(id) else {
+            return Err(benign(format!("no tab {}", id.0)));
+        };
+        let Some(backend) = tab.live_mut() else {
+            return Err(benign("no active session".to_string()));
+        };
+        let turn_running = backend.projection().active_turn_id.is_some();
+        let running = backend.projection().background_calls;
+        if turn_running {
+            return Err(benign(
+                "a turn is running: interrupting it also stops what it left running".to_string(),
+            ));
+        }
+        if running == 0 {
+            return Err(benign(NOTHING_IN_THE_BACKGROUND.to_string()));
+        }
+        if running != shown {
+            return Err(benign(format!(
+                "{} now running in the background, not {shown}: nothing was stopped; ask again",
+                running_in_background(running)
+            )));
+        }
+        backend.stop_background(shown)
+    }
+
     /// `Shift+Tab` / `<leader>m` toggles auto/bypass with an explicit `match`, rather than the N-way
     /// `SessionModeChoice::cycled`. Leaving bypass is immediate in every tab state, including
     /// `ended` and `failed`. Entering bypass requires `confirm_bypass`, so return a plan to show
@@ -1578,10 +1626,12 @@ impl TabSet {
         }
     }
 
-    pub fn tab_with_session(&self, provider_session_id: &str) -> Option<TabId> {
+    /// The tab holding `agent`'s session `provider_session_id`. Session ids are each agent's own, and two
+    /// agents may well use the same one, so the agent is part of what is looked for.
+    pub fn tab_with_session(&self, agent: &AgentId, provider_session_id: &str) -> Option<TabId> {
         self.tabs
             .iter()
-            .find(|t| t.provider_session_id().as_deref() == Some(provider_session_id))
+            .find(|t| t.agent == *agent && t.provider_session_id().as_deref() == Some(provider_session_id))
             .map(|t| t.id)
     }
 
@@ -1597,8 +1647,14 @@ impl TabSet {
         ids
     }
 
-    pub fn route_resume(&mut self, from: TabId, provider_session_id: &str, held_elsewhere: bool) -> ResumeRoute {
-        if let Some(open) = self.tab_with_session(provider_session_id) {
+    pub fn route_resume(
+        &mut self,
+        from: TabId,
+        agent: &AgentId,
+        provider_session_id: &str,
+        held_elsewhere: bool,
+    ) -> ResumeRoute {
+        if let Some(open) = self.tab_with_session(agent, provider_session_id) {
             self.select(open);
             return ResumeRoute::SwitchTo(open);
         }
@@ -2058,7 +2114,15 @@ impl TabSet {
                 if let Some(review) = review.as_deref_mut() {
                     let session = backend.provider_session_id().unwrap_or_default();
                     let running = backend.projection().active_turn_id.clone();
-                    review.observe_resync(tab.id.0, &session, running.as_deref(), wall_clock_ms());
+                    let background = backend.projection().background_calls;
+                    let at_end = backend.projection().background_at_last_turn_end;
+                    let now = wall_clock_ms();
+                    // A turn the resync ends ended with the count it had then, not with the one now:
+                    // the command may have finished among the dropped events.
+                    let count = |running| AgentDomainEvent::BackgroundCalls { running };
+                    review.observe(tab.id.0, &session, &count(at_end), now);
+                    review.observe_resync(tab.id.0, &session, running.as_deref(), now);
+                    review.observe(tab.id.0, &session, &count(background), now);
                 }
             }
             // Print a completed trace here if there is no dispatch to wait for: a background tab, or an
@@ -2628,14 +2692,16 @@ impl TabSet {
     fn saved_session_id(&self, tab: &Tab) -> Option<String> {
         if let TabBackend::Failed { .. } = tab.backend {
             let id = tab.failed_resume.clone().filter(|id| !id.is_empty())?;
-            let open_elsewhere = self
-                .tabs
-                .iter()
-                .any(|other| other.id != tab.id && other.provider_session_id().as_deref() == Some(id.as_str()));
+            let open_elsewhere = self.tabs.iter().any(|other| {
+                other.id != tab.id
+                    && other.agent == tab.agent
+                    && other.provider_session_id().as_deref() == Some(id.as_str())
+            });
             // Two failed tabs of the same session (a refused restore, then a refused resume of it by hand)
             // are one entry, the first; else the next restore would bring it back twice.
             let failed_before = self.tabs.iter().take_while(|other| other.id != tab.id).any(|other| {
                 matches!(other.backend, TabBackend::Failed { .. })
+                    && other.agent == tab.agent
                     && other.failed_resume.as_deref() == Some(id.as_str())
             });
             return (!open_elsewhere && !failed_before).then_some(id);
@@ -2739,7 +2805,7 @@ impl TabSet {
         for (n, granted) in go.tabs.into_iter().enumerate() {
             let GrantedTab { planned, mode } = granted;
             let id = planned.provider_session_id.clone();
-            if let Some(open) = self.tab_with_session(&id) {
+            if let Some(open) = self.tab_with_session(&planned.agent, &id) {
                 run.restored += 1;
                 started.push((id, open));
                 continue;
@@ -2754,7 +2820,7 @@ impl TabSet {
                     continue;
                 }
             };
-            let ResumeRoute::StartIn(target) = self.route_resume(from, &id, false) else {
+            let ResumeRoute::StartIn(target) = self.route_resume(from, &planned.agent, &id, false) else {
                 continue;
             };
             let tab = self.get_mut(target).expect("route_resume names a tab it has");
@@ -4105,21 +4171,28 @@ mod tests {
         let other = set.open(AgentId::Claude);
 
         assert_eq!(
-            set.route_resume(other, "claude-open", true),
+            set.route_resume(other, &AgentId::Claude, "claude-open", true),
             ResumeRoute::SwitchTo(holder)
         );
         assert_eq!(set.active(), holder, "switched, nothing started");
+        // Session ids are each agent's own: another agent's session of the same id is not this one.
         assert_eq!(
-            set.route_resume(holder, "claude-elsewhere", true),
+            set.route_resume(other, &AgentId::Codex, "claude-open", false),
+            ResumeRoute::StartIn(other),
+            "another agent's session of the same id is resumed, not switched to"
+        );
+        set.select(holder);
+        assert_eq!(
+            set.route_resume(holder, &AgentId::Claude, "claude-elsewhere", true),
             ResumeRoute::Refuse("open in another window".to_string())
         );
         assert_eq!(
-            set.route_resume(other, "claude-free", false),
+            set.route_resume(other, &AgentId::Claude, "claude-free", false),
             ResumeRoute::StartIn(other),
             "an empty tab takes it"
         );
         let before = set.tabs().len();
-        let ResumeRoute::StartIn(new_tab) = set.route_resume(holder, "claude-free", false) else {
+        let ResumeRoute::StartIn(new_tab) = set.route_resume(holder, &AgentId::Claude, "claude-free", false) else {
             panic!("a busy tab resumes into a new one")
         };
         assert_ne!(new_tab, holder);
@@ -8316,9 +8389,13 @@ mod tests {
     }
 
     fn mode_of(set: &TabSet, session: &str) -> SessionModeChoice {
-        set.get(set.tab_with_session(session).expect("the session has a tab"))
-            .unwrap()
-            .mode()
+        let tab = set
+            .tabs()
+            .iter()
+            .find(|t| t.provider_session_id().as_deref() == Some(session))
+            .map(|t| t.id)
+            .expect("the session has a tab");
+        set.get(tab).unwrap().mode()
     }
 
     #[test]
@@ -8536,7 +8613,7 @@ mod tests {
             Ok(RestoreConnect::Started(mpsc::channel().1))
         });
         assert_eq!(connected, ["s-new"], "the open one is not connected again");
-        assert_eq!(set.tab_with_session("s-open"), Some(holder));
+        assert_eq!(set.tab_with_session(&AgentId::Claude, "s-open"), Some(holder));
         assert_eq!(set.tabs().len(), 2, "and no tab was made for it");
         assert_eq!(run.outcome(), None, "s-new is still connecting");
         shut_down_all(&mut set);
@@ -8620,7 +8697,7 @@ mod tests {
         }
         assert_eq!(run.outcome(), None, "c is still connecting");
         assert_eq!(set.tabs().len(), 2, "the refused tab is gone, not left behind dead");
-        assert!(set.tab_with_session("b").is_none());
+        assert!(set.tab_with_session(&AgentId::Claude, "b").is_none());
 
         let (_provider, backend) = live(&dir);
         senders[2].send(Ok(backend)).unwrap();
@@ -9822,10 +9899,12 @@ mod tests {
         );
         let other = set.open(AgentId::Claude);
         // Resuming the same session again switches to the tab that already holds it: no second start.
-        assert!(matches!(set.route_resume(other, "sess-wait", false), ResumeRoute::SwitchTo(t) if t == tab));
+        assert!(
+            matches!(set.route_resume(other, &AgentId::Claude, "sess-wait", false), ResumeRoute::SwitchTo(t) if t == tab)
+        );
         // A tab with a message waiting is not "empty": a resume from it opens another tab.
         let (mut set, waiting, _) = asked(first_send("r3", "hi"));
-        match set.route_resume(waiting, "sess-new", false) {
+        match set.route_resume(waiting, &AgentId::Claude, "sess-new", false) {
             ResumeRoute::StartIn(target) => assert_ne!(target, waiting),
             _ => panic!("expected a new tab"),
         }
@@ -9941,6 +10020,76 @@ mod external_tab_tests {
 
     fn reviewer(r: Reviewer) -> TurnPolicy {
         TurnPolicy { reviewer: r }
+    }
+
+    fn background_count(set: &TabSet, tab: TabId) -> u32 {
+        set.get(tab).unwrap().live().unwrap().projection().background_calls
+    }
+
+    /// The confirmed stop reaches the conversation of the tab it names, and only when the count it was
+    /// asked about is the tab's count and no turn runs. Every refusal is benign and leaves the session
+    /// live; a tab with no session, and one that is gone, stop nothing.
+    #[test]
+    fn stopping_the_background_reaches_the_named_tab_and_a_refusal_leaves_it_alive() {
+        let dir = workspace("external-stop-background");
+        let (mut set, tab, provider) = codex_tab(&dir, SessionModeChoice::Auto);
+        let idle = set.open(AgentId::Codex);
+        let refused = set.stop_background(tab, 1).unwrap_err();
+        assert!(refused.benign);
+        assert_eq!(refused.message, NOTHING_IN_THE_BACKGROUND);
+
+        provider.inner.queue(AgentDomainEvent::BackgroundCalls { running: 2 });
+        until("the count is folded", || background_count(&set, tab) == 2);
+        let refused = set.stop_background(tab, 1).unwrap_err();
+        assert!(refused.benign);
+        assert!(
+            refused
+                .message
+                .starts_with("2 commands now running in the background, not 1"),
+            "{}",
+            refused.message
+        );
+        let refused = set.stop_background(idle, 2).unwrap_err();
+        assert!(refused.benign);
+        assert_eq!(refused.message, "no active session");
+        assert!(set.stop_background(TabId(9_999), 2).unwrap_err().benign);
+
+        provider.inner.queue(AgentDomainEvent::TurnStarted {
+            turn_id: "turn-1".into(),
+        });
+        until("the turn is folded", || {
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .active_turn_id
+                .is_some()
+        });
+        let refused = set.stop_background(tab, 2).unwrap_err();
+        assert!(refused.benign);
+        assert!(refused.message.starts_with("a turn is running"), "{}", refused.message);
+        provider.inner.queue(turn_completed("turn-1"));
+        until("the turn ends", || {
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .active_turn_id
+                .is_none()
+        });
+
+        // The agent refused it after all (the commands ended a moment ago): said, and nothing else.
+        provider.refuse_next_stop(agent::ProviderErrorCode::NoActiveTurn);
+        let refused = set.stop_background(tab, 2).unwrap_err();
+        assert!(refused.benign, "{}", refused.message);
+        assert!(set.get(tab).unwrap().live().is_some());
+        assert_eq!(provider.stops(), 0, "nothing reached the agent's stop yet");
+
+        set.stop_background(tab, 2).unwrap();
+        assert_eq!(provider.stops(), 1);
+        until("the count drops", || background_count(&set, tab) == 0);
     }
 
     #[test]
@@ -10109,7 +10258,9 @@ mod external_tab_tests {
                 (AgentId::Codex, "codex-b".to_string())
             ]
         );
-        let codex = set.tab_with_session("codex-b").expect("the Codex tab is starting");
+        let codex = set
+            .tab_with_session(&AgentId::Codex, "codex-b")
+            .expect("the Codex tab is starting");
         let t = set.get(codex).unwrap();
         assert_eq!(t.agent(), &AgentId::Codex);
         assert_eq!(t.mode(), SessionModeChoice::Bypass, "answered y, so bypass comes back");
@@ -10152,7 +10303,9 @@ mod external_tab_tests {
             Ok(RestoreConnect::Started(mpsc::channel().1))
         });
         assert_eq!(started, ["claude-a"]);
-        let codex = set.tab_with_session("codex-b").expect("the Codex tab came back");
+        let codex = set
+            .tab_with_session(&AgentId::Codex, "codex-b")
+            .expect("the Codex tab came back");
         assert_eq!(run.awaiting_trust(), &[codex]);
         let t = set.get(codex).unwrap();
         assert_eq!(t.agent(), &AgentId::Codex);
@@ -10238,7 +10391,9 @@ mod external_tab_tests {
         };
         let go = set.answer_restore(prompt.nonce, true).unwrap();
         set.start_restore(from, go, |_, _| Ok(RestoreConnect::AwaitTrust));
-        let codex = set.tab_with_session("codex-b").expect("the Codex tab came back");
+        let codex = set
+            .tab_with_session(&AgentId::Codex, "codex-b")
+            .expect("the Codex tab came back");
 
         // Its own agent's trust answer starts it as a resume by hand, and the start is refused.
         let (tx, result_rx) = mpsc::channel();
@@ -10361,7 +10516,9 @@ mod external_tab_tests {
         };
         assert_eq!(go.trust_agent(), Some(AgentId::Acp("gem".into())));
         set.start_restore(from, go, |_, _| Ok(RestoreConnect::AwaitTrust));
-        let waiting = set.tab_with_session("gem-s").expect("the ACP tab came back");
+        let waiting = set
+            .tab_with_session(&AgentId::Acp("gem".into()), "gem-s")
+            .expect("the ACP tab came back");
         assert!(set.get(waiting).unwrap().resumable(BackendKind::Sidecar));
         let saved = set.saved_snapshot("conv").unwrap();
         assert_eq!(saved.external_tabs.len(), 1, "kept in the saved file while it waits");

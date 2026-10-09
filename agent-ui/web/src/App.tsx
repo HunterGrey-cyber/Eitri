@@ -458,6 +458,15 @@ function applyViewScroll(list: HTMLElement, view: TabViewState, follow: boolean,
   list.scrollTop = view.scrollTop;
 }
 
+/** What `<leader>k` says when the agent left nothing running (Rust's `NOTHING_IN_THE_BACKGROUND`). */
+const NOTHING_IN_THE_BACKGROUND = "nothing is running in the background";
+
+/** `<leader>k`'s question: what is stopped, by whom it was left running, and what stopping it costs. */
+function stopBackgroundQuestion(who: string, running: number): string {
+  const what = running === 1 ? "the command" : `the ${running} commands`;
+  return `Stop ${what} ${who} left running? This ends the session; the conversation can be resumed. y/n`;
+}
+
 export default function App() {
   const [state, setState] = useState(initialState());
   const [hello, setHello] = useState<Hello | null>(null);
@@ -573,12 +582,13 @@ export default function App() {
    *  because no response envelope follows them.
    *  `"trust"` tracks answers, Escape, `:trust` and `:untrust`. Rust notices supply feedback.
    *  Refusals without a notice follow a cancellation or move away; neither is echoed in the banner.
-   *  `"tabnew"` flashes a refusal naming accepted agents when `:tabnew <agent>` uses an unknown agent. */
+   *  `"tabnew"` flashes a refusal naming accepted agents when `:tabnew <agent>` uses an unknown agent.
+   *  `"stop-background"` flashes a refusal if a turn started, commands ended or their count changed. */
   const inFlight = useRef<
     Map<
       string,
       {
-        kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew";
+        kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew" | "stop-background";
         tab: TabId;
         text?: string;
         permissionId?: string;
@@ -1083,6 +1093,21 @@ export default function App() {
         setHandoffOpen(true);
         break;
       }
+      case "tab.stop-background": {
+        // Only a live tab whose agent counts what it left running has anything to stop; a turn that runs
+        // is stopped by an interrupt, which takes what it left with it.
+        const tab = activeTab?.id ?? null;
+        if (tab === null || activeTab?.state !== "live" || state.backgroundCalls === 0) {
+          showFlash(NOTHING_IN_THE_BACKGROUND);
+          break;
+        }
+        if (state.activeTurnId !== null) {
+          showFlash("a turn is running: interrupting the turn stops them too");
+          break;
+        }
+        askStopBackground(tab, state.backgroundCalls);
+        break;
+      }
       case "mode.cycle":
         // Mode cycling is disabled for fixed tabs and flashes instead of posting. `modeKeyRoute`
         // also routes Shift+Tab. All routes except an ended or failed tab that is not already in
@@ -1264,6 +1289,10 @@ export default function App() {
     // here. The same on-screen wait and lone-key guard as `bypass`, since a `y` loads a repository's hooks.
     // `flashAfter` is the flash counter when it opened: only a flash made since then is about this question.
     | { kind: "trust"; tab: TabId; nonce: number; view: TrustPromptEnvelope; lines: string[]; openedAt: number; flashAfter: number }
+    // `<leader>k`: stop the commands this tab's agent left running, which ends its session. Bound to the tab and
+    // the count it names: a `y` given after either moved is not an answer to it. The same on-screen wait and
+    // lone-key guard as `bypass`, since a `y` here ends a session.
+    | { kind: "stop_background"; tab: TabId; running: number; lines: string[]; openedAt: number }
     | null
   >(null);
   /** The `prefix w` overlay lists open tabs followed by saved sessions, or is `null` when
@@ -1367,12 +1396,12 @@ export default function App() {
      rename field) end the question: what is typed there is text, and the `y` of "you should" must not give a tab
      bypass just because the question was still up. Only a move counts -- a field that already had the keys when
      the question opened (Shift+Tab pressed in the composer) is where an INPUT user answers, so its `y` still does. */
-  const confirmEntersBypass = confirm?.kind === "bypass" || confirm?.kind === "restore";
+  const confirmEntersBypass = confirm?.kind === "bypass" || confirm?.kind === "restore" || confirm?.kind === "stop_background";
   useEffect(() => {
     if (!confirmEntersBypass) return;
     function onFocusIn(event: FocusEvent) {
       if (!isEditableElement(event.target)) return;
-      setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" ? null : c));
+      setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "stop_background" ? null : c));
     }
     document.addEventListener("focusin", onFocusIn, true);
     return () => document.removeEventListener("focusin", onFocusIn, true);
@@ -2906,7 +2935,7 @@ export default function App() {
             // The overlay's own request was refused (no session, no such turn, git unavailable): it says
             // so in its header. Never the conversation's banner, which is for what breaks the conversation.
             setReview((current) => (current === null ? current : failRequest(current, payload.requestId, payload.error)));
-          } else if (record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew") {
+          } else if (record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew" || record?.kind === "stop-background") {
             // A scratch-editor round trip's own refusal, or `gx`'s address Rust would not
             // open, is a footer nicety, not something that should fill the banner
             // reserved for conversation-breaking errors.
@@ -3577,8 +3606,21 @@ export default function App() {
    *  Leaves close confirmations alone. Routes to another control inside the panel call
    *  `endKeyPrompts` instead, so text entered there cannot answer an earlier close prompt. */
   function cancelBypassConfirm() {
-    setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "trust" ? null : c));
+    setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "trust" || c?.kind === "stop_background" ? null : c));
     setHeldTrust(null);
+  }
+
+  /** Opens `<leader>k`'s question for `tab`, naming `running` commands and the tab's agent. Like the other y/n
+   *  prompts it takes the keys from whatever was open over the conversation. */
+  function askStopBackground(tab: TabId, running: number) {
+    dropPendingKeys();
+    exitRegion();
+    setDetail(null);
+    setHandoffOpen(false);
+    setKeymapOpen(false);
+    const word = agentWord(tabsRef.current?.tabs.find((t) => t.id === tab)?.agent);
+    const who = word === null ? "the agent" : word === "codex" ? "Codex" : word;
+    setConfirm({ kind: "stop_background", tab, running, lines: [stopBackgroundQuestion(who, running)], openedAt: performance.now() });
   }
 
   /** What a route that hands the keys to something else ends -- every
@@ -3734,6 +3776,32 @@ export default function App() {
             });
           } else {
             showFlash("y must be pressed on its own to restore in bypass — n restores in auto");
+          }
+        }
+        setConfirm(null);
+        return true;
+      }
+      if (confirm.kind === "stop_background") {
+        // Any key but a counted `y` puts the question away and stops nothing (`n`, Escape included).
+        if (event.key === "y" || event.key === "Y") {
+          const plain = isPlainAnswerKey(event.nativeEvent as unknown as KeyLike);
+          if (
+            !plain ||
+            event.repeat ||
+            !bypassYesCounts({ now: performance.now(), openedAt: confirm.openedAt, lastKeyAt: lastKeyAtRef.current })
+          ) {
+            showFlash("y must be pressed on its own to stop them; nothing was stopped");
+          } else if (activeTab?.id !== confirm.tab || activeTab?.state !== "live" || state.backgroundCalls === 0) {
+            // Not the tab, or not the commands, the question was about any more.
+            showFlash(state.backgroundCalls === 0 ? NOTHING_IN_THE_BACKGROUND : "the tab changed; nothing was stopped");
+          } else if (state.backgroundCalls !== confirm.running) {
+            // The count moved while the question was up: asked again with the count as it is now.
+            askStopBackground(confirm.tab, state.backgroundCalls);
+            return true;
+          } else {
+            const stopId = nextRequestId();
+            inFlight.current.set(stopId, { kind: "stop-background", tab: confirm.tab });
+            postToRust({ type: "stop_background", request_id: stopId, tab: confirm.tab, running: confirm.running });
           }
         }
         setConfirm(null);
@@ -5940,6 +6008,8 @@ export default function App() {
           review: activeTab !== null && reviewHints[activeTab.id] !== undefined ? { files: reviewHints[activeTab.id].files } : null,
           // An interrupted revert is named whatever `review.hint` says: a half-written file is not a diff notice.
           recovery: reviewRecovery.length > 0 ? { path: reviewRecovery[0].path, more: reviewRecovery.length - 1 } : null,
+          // Commands this tab's agent left running after its turns ended; nothing while there are none.
+          background: sessionEnded ? null : state.backgroundCalls,
         }}
         paneFocused={paneFocused}
         onOpenDetail={() => post({ type: "open_detail" })}

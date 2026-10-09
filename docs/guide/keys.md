@@ -185,6 +185,7 @@ After it, a short list of what can follow appears. These keys work in BROWSE.
 | `<leader>i` | this tab's details |
 | `<leader>t` | continue this conversation in a terminal (Claude tabs; a Codex or registered agent's tab says it is not available yet) |
 | `<leader>m` | switch between Auto and Bypass (as `Shift+Tab`) |
+| `<leader>k` | stop the commands a Codex tab left running in the background, which ends its session (it can be resumed), after a `y/n` question |
 | `<leader>?` | the list of keys |
 
 You can change them in [your configuration](configuration.md).

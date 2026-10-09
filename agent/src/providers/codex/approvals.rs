@@ -334,6 +334,12 @@ pub struct HeldItems {
     /// Tool calls a card was already drawn for. Codex asks once per call, so a later tool approval
     /// belongs to another call even while this one still runs.
     asked: HashSet<HeldKey>,
+    /// Threads on which a call may have started without being held: past the cap, in a form that could
+    /// not be read, or before the thread was followed. A tool approval there that names no tool may be
+    /// for that call, so it is not matched to one that is held.
+    missed: HashSet<String>,
+    /// As `missed`, for a call whose thread could not be read either.
+    missed_anywhere: bool,
 }
 
 impl HeldItems {
@@ -343,6 +349,9 @@ impl HeldItems {
             item,
             ThreadItem::CommandExecution(_) | ThreadItem::FileChange(_) | ThreadItem::McpToolCall(_)
         );
+        if matches!(item, ThreadItem::Malformed { .. }) {
+            self.mark_missed(thread);
+        }
         let Some(id) = item.id() else { return };
         if !keep {
             return;
@@ -350,6 +359,7 @@ impl HeldItems {
         let k = key(thread, id);
         if !self.items.contains_key(&k) {
             if self.items.len() >= HELD_ITEMS_MAX {
+                self.mark_missed(thread);
                 return;
             }
             self.order.push(k.clone());
@@ -378,6 +388,18 @@ impl HeldItems {
         self.items.clear();
         self.order.clear();
         self.asked.clear();
+        self.missed.clear();
+        self.missed_anywhere = false;
+    }
+
+    /// Notes that a call on `thread` may have started without being held.
+    pub fn mark_missed(&mut self, thread: &str) {
+        self.missed.insert(thread.to_string());
+    }
+
+    /// Notes that a call may have started without being held, on a thread that is not known.
+    pub fn mark_missed_anywhere(&mut self) {
+        self.missed_anywhere = true;
     }
 
     pub fn get(&self, thread: &str, id: &str) -> Option<&ThreadItem> {
@@ -404,6 +426,9 @@ impl HeldItems {
         tool: Option<&str>,
         carded: &dyn Fn(&str, &str) -> bool,
     ) -> Option<&ThreadItem> {
+        if tool.is_none() && (self.missed_anywhere || self.missed.contains(thread)) {
+            return None;
+        }
         let mut candidates = self
             .order
             .iter()

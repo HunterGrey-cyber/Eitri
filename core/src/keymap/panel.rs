@@ -22,6 +22,9 @@ pub enum PanelAction {
     Keymap,
     Handoff,
     ModeCycle,
+    /// Stop the commands the tab's agent left running after its turns ended (by stopping its session),
+    /// after a y/n question.
+    StopBackground,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +94,7 @@ pub fn parse_action(name: &str) -> Result<PanelAction, String> {
         "panel.keymap" => PanelAction::Keymap,
         "panel.handoff" => PanelAction::Handoff,
         "mode.cycle" => PanelAction::ModeCycle,
+        "tab.stop-background" => PanelAction::StopBackground,
         other => {
             return Err(format!(
                 "{other:?} is not a panel action (init.lua's panel table names)"
@@ -119,6 +123,7 @@ impl PanelAction {
             PanelAction::Keymap => "panel.keymap",
             PanelAction::Handoff => "panel.handoff",
             PanelAction::ModeCycle => "mode.cycle",
+            PanelAction::StopBackground => "tab.stop-background",
         }
     }
 
@@ -141,6 +146,7 @@ impl PanelAction {
             PanelAction::Keymap => "all keys",
             PanelAction::Handoff => "continue in a terminal",
             PanelAction::ModeCycle => "mode",
+            PanelAction::StopBackground => "stop background commands",
         }
     }
 }
@@ -210,7 +216,7 @@ pub fn reserved(seq: &PanelSeq) -> Option<String> {
 /// new tab).
 pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f", "+new")];
 
-/// The 16 default rows, in table order: direct
+/// The 17 default rows, in table order: direct
 /// tab-as-buffer keys first, then the `<leader>` rows. Every row's source is the
 /// LazyVim/nvim/which-key line it copies, or `eitri-only` with why (spec, "Rule for every line").
 pub fn default_bindings() -> Vec<PanelBinding> {
@@ -307,6 +313,13 @@ pub fn default_bindings() -> Vec<PanelBinding> {
         PanelBinding {
             seq: parse_seq("<leader>m").unwrap(),
             action: PanelAction::ModeCycle,
+            source: PanelSource::Default,
+        },
+        // eitri-only: LazyVim binds no `<leader>k`; `k` as in tmux's kill-* verbs. It asks y/n first, since
+        // what it stops is the whole session.
+        PanelBinding {
+            seq: parse_seq("<leader>k").unwrap(),
+            action: PanelAction::StopBackground,
             source: PanelSource::Default,
         },
         // lazyvim: plugins/editor.lua:105-110 ("Buffer Keymaps (which-key)")
@@ -574,6 +587,7 @@ mod tests {
             ("Space i", "tab.info"),
             ("Space t", "panel.handoff"),
             ("Space m", "mode.cycle"),
+            ("Space k", "tab.stop-background"),
             ("Space ?", "panel.keymap"),
         ];
         assert_eq!(
@@ -598,6 +612,7 @@ mod tests {
             "panel.keymap",
             "panel.handoff",
             "mode.cycle",
+            "tab.stop-background",
         ] {
             assert_eq!(parse_action(name).unwrap().name(), name);
         }

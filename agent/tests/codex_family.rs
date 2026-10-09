@@ -1404,3 +1404,225 @@ fn closing_mid_child_interrupts_the_family() {
         })
     );
 }
+
+// ---------------------------------------------------------------- the caps
+
+fn mismatch_of(events: &[AgentDomainEvent]) -> Option<(String, String)> {
+    events.iter().find_map(|e| match e {
+        AgentDomainEvent::PolicyMismatch { requested, reported } => Some((requested.clone(), reported.clone())),
+        _ => None,
+    })
+}
+
+/// A family larger than Eitri follows is not followed in part: a child left out could write files while
+/// the tab reads as idle, so the session ends instead.
+#[test]
+fn more_subagents_than_are_followed_end_the_session() {
+    let receivers: Vec<String> = (0..257).map(|n| format!("child-{n}")).collect();
+    let collab = json!({"type": "collabAgentToolCall", "id": "sp1", "tool": "spawnAgent", "status": "completed",
+                        "senderThreadId": "tab", "receiverThreadIds": receivers, "prompt": "go"});
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            item_event("item/completed", "tab", "t1", collab),
+            turn_started("child-256", "c256"),
+        ],
+    );
+    let events = pump_until(&provider, |events| mismatch_of(events).is_some());
+    let (requested, reported) = mismatch_of(&events).expect("a mismatch");
+    assert!(requested.contains("256"), "{requested}");
+    assert!(reported.contains("more"), "{reported}");
+    assert!(
+        send(&provider, &thread, "next").is_err(),
+        "a tripped session takes no turn"
+    );
+}
+
+/// The same for announcements one at a time.
+#[test]
+fn one_announcement_past_the_cap_ends_the_session() {
+    let mut rest: Vec<Value> = (0..257)
+        .map(|n| announce("tab", "t1", &format!("child-{n}"), &format!("/root/c{n}")))
+        .collect();
+    rest.push(turn_started("child-256", "c256"));
+    let (provider, _) = running("tab", "t1", rest);
+    let events = pump_until(&provider, |events| mismatch_of(events).is_some());
+    assert!(mismatch_of(&events).is_some());
+}
+
+/// Turns of threads not yet announced are kept up to a cap; one more ends the session rather than leaving
+/// a child that later joins unfollowed.
+#[test]
+fn more_early_turns_than_are_kept_end_the_session() {
+    let rest: Vec<Value> = (0..65)
+        .map(|n| turn_started(&format!("early-{n}"), &format!("e{n}")))
+        .collect();
+    let (provider, _) = running("tab", "t1", rest);
+    let events = pump_until(&provider, |events| mismatch_of(events).is_some());
+    let (requested, _) = mismatch_of(&events).expect("a mismatch");
+    assert!(requested.contains("64"), "{requested}");
+}
+
+/// An interrupt pressed while the `turn/start` answer is awaited reaches the subagent turns that started
+/// meanwhile too, not only the tab's own turn.
+#[test]
+fn an_interrupt_before_the_turn_id_reaches_the_family() {
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            announce("tab", "t1", "child", "/root/child"),
+            turn_completed("tab", "t1", "completed"),
+            expect_request(5, "turn/start"),
+            // Read while the answer is awaited, so held until it comes.
+            turn_started("child", "c2"),
+            json!({"sleep_ms": 400}),
+            turn_response(5, "t2"),
+            expect_interrupt(6, "tab", "t2"),
+            expect_interrupt(7, "child", "c2"),
+            turn_completed("tab", "t2", "interrupted"),
+            turn_completed("child", "c2", "interrupted"),
+        ],
+    );
+    pump_until(&provider, |events| events.iter().any(is_completed));
+    std::thread::scope(|scope| {
+        let sending = scope.spawn(|| send(&provider, &thread, "again"));
+        std::thread::sleep(Duration::from_millis(200));
+        provider
+            .interrupt_turn(InterruptTurnRequest {
+                session_id: thread.clone(),
+            })
+            .expect("taken while the start is awaited");
+        assert_eq!(sending.join().expect("the send").expect("the turn starts"), "t2");
+    });
+    let events = pump_until(&provider, |events| events.iter().any(is_completed));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Interrupted,
+            ..
+        }
+    )));
+}
+
+/// An announcement that does not read may name a child Eitri would never follow; the session ends.
+#[test]
+fn an_unreadable_announcement_ends_the_session() {
+    for item in [
+        json!({"type": "subAgentActivity", "id": "sp-x", "agentThreadId": "child"}),
+        json!({"type": "collabAgentToolCall", "id": "co-x", "receiverThreadIds": "child"}),
+    ] {
+        let (provider, thread) = running("tab", "t1", vec![item_event("item/started", "tab", "t1", item.clone())]);
+        let events = pump_until(&provider, |events| mismatch_of(events).is_some());
+        let (_, reported) = mismatch_of(&events).expect("a mismatch");
+        assert!(reported.contains("could not read"), "{item}: {reported}");
+        assert!(
+            send(&provider, &thread, "next").is_err(),
+            "a tripped session takes no turn"
+        );
+    }
+}
+
+/// A child's turn whose start does not read is not given the id of the child's previous turn by a late
+/// message about that turn, so the tab's turn waits for the new one to end.
+#[test]
+fn a_late_end_of_an_earlier_turn_does_not_end_an_unread_one() {
+    let (provider, _) = running(
+        "tab",
+        "t1",
+        vec![
+            announce("tab", "t1", "child", "/root/child"),
+            turn_started("child", "c1"),
+            turn_completed("child", "c1", "completed"),
+            // The child's next turn starts in a form that does not read.
+            write(json!({"method": "turn/started", "params": {"threadId": "child", "turn": {"bogus": true}}})),
+            // A late, repeated end of the turn that is over.
+            turn_completed("child", "c1", "completed"),
+            turn_completed("tab", "t1", "completed"),
+            json!({"sleep_ms": 800}),
+            item_event("item/started", "child", "c2", command_item("x2", "true", "inProgress")),
+            item_event("item/completed", "child", "c2", command_item("x2", "true", "completed")),
+            turn_completed("child", "c2", "completed"),
+        ],
+    );
+    let early = pump_for(&provider, Duration::from_millis(500));
+    assert!(
+        !early.iter().any(is_completed),
+        "the tab's turn ended while the child's new turn ran: {early:#?}"
+    );
+    pump_until(&provider, |events| events.iter().any(is_completed));
+}
+
+/// Only Eitri says whose a call is: a `subagent` key an item of the tab's own thread carries itself does not
+/// make its row read as a subagent's.
+#[test]
+fn a_subagent_key_in_the_tab_s_own_item_is_not_shown() {
+    let search = json!({"type": "webSearch", "id": "ws1", "query": "x", "subagent": "/root/impostor"});
+    let (provider, _) = running(
+        "tab",
+        "t1",
+        vec![
+            item_event("item/started", "tab", "t1", search.clone()),
+            item_event("item/completed", "tab", "t1", search),
+            turn_completed("tab", "t1", "completed"),
+        ],
+    );
+    let events = pump_until(&provider, |events| events.iter().any(is_completed));
+    let input = events
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::ToolCallStarted { input, .. } => Some(input.clone()),
+            _ => None,
+        })
+        .expect("the search's row");
+    assert!(input.get("subagent").is_none(), "{input}");
+}
+
+/// The tab's turn whose `turn/start` timed out is interrupted when Codex starts it after all, also when a
+/// subagent's turn opened the tab's turn first; the subagent's own turn is left alone.
+#[test]
+fn a_timed_out_turn_that_joins_a_subagent_turn_is_interrupted() {
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            announce("tab", "t1", "child", "/root/child"),
+            turn_completed("tab", "t1", "completed"),
+            expect_request(5, "turn/start"),
+            json!({"sleep_ms": agent::UNARY_RPC_TIMEOUT.as_millis() as u64 + 500}),
+            turn_started("child", "c3"),
+            turn_started("tab", "t2"),
+            expect_interrupt(6, "tab", "t2"),
+            turn_completed("tab", "t2", "interrupted"),
+            json!({"sleep_ms": 300}),
+            turn_completed("child", "c3", "completed"),
+        ],
+    );
+    pump_until(&provider, |events| events.iter().any(is_completed));
+    assert!(matches!(send(&provider, &thread, "again"), Err(ProviderError::Timeout)));
+    let events = pump_until(&provider, |events| events.iter().any(is_completed));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::TurnCompleted {
+                outcome: TurnOutcome::Interrupted,
+                ..
+            }
+        )),
+        "{events:#?}"
+    );
+}
+
+/// A child announced without a thread id could never be followed; the session ends as for one that does not
+/// read.
+#[test]
+fn an_announcement_with_no_thread_id_ends_the_session() {
+    let item = json!({"type": "subAgentActivity", "id": "sp-e", "kind": "started", "agentThreadId": "",
+                      "agentPath": "/root/nameless"});
+    let (provider, thread) = running("tab", "t1", vec![item_event("item/started", "tab", "t1", item)]);
+    let events = pump_until(&provider, |events| mismatch_of(events).is_some());
+    let (_, reported) = mismatch_of(&events).expect("a mismatch");
+    assert!(reported.contains("no thread id"), "{reported}");
+    assert!(send(&provider, &thread, "next").is_err());
+}

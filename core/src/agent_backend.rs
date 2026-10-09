@@ -804,6 +804,31 @@ impl AgentBackend {
         }
     }
 
+    /// Stops the commands the agent left running after its turns ended, by stopping its session
+    /// (`AgentConversation::stop_background`); the session then ends through the pump, and its
+    /// conversation can be resumed. A refusal because of when it was asked is benign (a turn started,
+    /// the commands ended), and so is an agent that keeps no such count: the session goes on.
+    pub fn stop_background(&mut self, shown: u32) -> Result<Vec<AgentDomainEvent>, BackendError> {
+        let benign = |message: String| BackendError {
+            message,
+            benign: true,
+            folded_events: Vec::new(),
+        };
+        let AgentBackend::External(external) = self else {
+            return Err(benign(
+                "this agent leaves nothing running in the background".to_string(),
+            ));
+        };
+        match external.conversation.stop_background(shown) {
+            Ok(()) => Ok(Vec::new()),
+            Err(ConversationError::Provider(agent::ProviderError::UnsupportedCapability(_))) => Err(benign(format!(
+                "{} cannot stop what it left running",
+                external.agent.label()
+            ))),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Answers one pending permission request.
     ///
     /// The two arms return different things for a real reason, not an oversight: the legacy backend

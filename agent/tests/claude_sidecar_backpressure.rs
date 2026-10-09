@@ -91,6 +91,7 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::PermissionDenied { .. } => "PermissionDenied",
             AgentDomainEvent::PolicyMismatch { .. } => "PolicyMismatch",
             AgentDomainEvent::AccountLimits { .. } => "AccountLimits",
+            AgentDomainEvent::BackgroundCalls { .. } => "BackgroundCalls",
             // Derived by ingestion, never read off the wire: matched for exhaustiveness.
             AgentDomainEvent::ToolInputChanged { .. } => "ToolInputChanged",
         };

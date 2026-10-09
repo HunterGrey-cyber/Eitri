@@ -311,6 +311,10 @@ export type AgentUiState = {
    *  events, and carried by a snapshot (an explicit `null` before any report), so a reload or a tab
    *  switch shows it without waiting for the next report. */
   accountLimits: AccountLimits | null;
+  /** How many commands the agent left running after its turns ended (`background_calls`): the band counts
+   *  them while there are any, and `<leader>k` stops them with the session. `0` for every agent that keeps
+   *  no such count. A snapshot carries it. */
+  backgroundCalls: number;
   /** The turns that ended without completing, oldest first: failed, hit a limit, interrupted, or cut off
    *  by the session ending. Each is a muted row where the turn stopped. A turn that completed adds none. */
   turnEndings: TurnEnding[];
@@ -577,6 +581,9 @@ export type AgentDomainEvent =
   | { type: "policy_mismatch"; requested: string; reported: string }
   /** The account's usage limit changed (`AgentDomainEvent::AccountLimits`). The latest wins. */
   | { type: "account_limits"; used_percent: number; window_minutes: number | null; resets_at: number | null; plan: string | null }
+  /** How many commands the agent left running after its turns ended (`AgentDomainEvent::BackgroundCalls`),
+   *  whenever that changes. The latest wins. */
+  | { type: "background_calls"; running: number }
   /** The CLI's own prompt for a call carried another input than the gate was asked about. Rust
    *  derives it when it folds the prompt and sends it right after, even when the host answered the
    *  gate request itself and so never delivered it: the page applies it and compares nothing.

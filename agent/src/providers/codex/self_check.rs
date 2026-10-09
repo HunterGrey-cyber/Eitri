@@ -18,8 +18,9 @@
 //! check's own private directory, read by the Codex the check starts and by nothing else; what Eitri
 //! sends over the wire is only what [`super::config`] builds.
 //!
-//! The verdict is cached per [`BinaryKey`] (path, size, modification time, version); a failure is not
-//! cached, so a transient one is retried at the next start, with the reasons kept in a log.
+//! The verdict is cached per [`BinaryKey`] (path, size, modification time, version) and names the revision
+//! of the check that earned it, so a pass from an older check does not answer for a newer one; a failure is
+//! not cached, so a transient one is retried at the next start, with the reasons kept in a log.
 
 use super::config::{expected_echo, session_config};
 use super::scripted_model::{ScriptedModel, Step};
@@ -54,6 +55,9 @@ const NOTICE: &str = "Eitri could not confirm that this Codex keeps its levers; 
 
 /// Everything the check does must be over in this time.
 const CHECK_BUDGET: Duration = Duration::from_secs(150);
+/// How long a start waits for another start's check of the same binary: that check's own budget, and some
+/// time for what it does around it.
+const LOCK_WAIT: Duration = Duration::from_secs(CHECK_BUDGET.as_secs() + 30);
 /// How long `codex --version` may take.
 const VERSION_BUDGET: Duration = Duration::from_secs(10);
 /// One request's answer.
@@ -62,8 +66,16 @@ const CALL_BUDGET: Duration = Duration::from_secs(30);
 const TURN_BUDGET: Duration = Duration::from_secs(60);
 /// How long a child that is shut down may take before it is killed.
 const EXIT_GRACE: Duration = Duration::from_secs(5);
+/// The revision of the check itself. **Bump it whenever the check's script, its fixture or the rules a run
+/// is judged by change**: a recorded pass names the revision it was earned under, and a pass of any other
+/// revision is not a pass, so a binary an older, weaker check let through is checked again. A verdict
+/// written before revisions were recorded has none and is not a pass either.
+const CHECK_REVISION: u32 = 2;
 /// The directory under Eitri's state directory that holds one directory per checked binary.
 const CHECK_DIR: &str = "codex-check";
+/// The file in a binary's check directory that records how its last run ended, so the starts that waited
+/// for that run get its answer.
+const LAST_RUN: &str = "last-run.json";
 /// The method that lists the hooks of a project; read only, used to learn the fixture hook's key and hash.
 const HOOKS_LIST: &str = "hooks/list";
 
@@ -102,6 +114,8 @@ pub enum SelfCheckError {
     TooOld { found: (u32, u32, u32) },
     /// The check failed or could not run. `reasons` say why; `log` is the file that keeps them.
     Failed { reasons: Vec<String>, log: PathBuf },
+    /// Another start's check of the same binary still held it when this start stopped waiting.
+    Unfinished { waited: Duration },
 }
 
 impl fmt::Display for SelfCheckError {
@@ -115,6 +129,11 @@ impl fmt::Display for SelfCheckError {
                 version_text(super::provider::MIN_CODEX)
             ),
             SelfCheckError::Failed { log, .. } => write!(f, "{NOTICE} {}", log.display()),
+            SelfCheckError::Unfinished { waited } => write!(
+                f,
+                "another check of this Codex did not finish in {} s; start the tab again",
+                waited.as_secs()
+            ),
         }
     }
 }
@@ -184,6 +203,12 @@ impl BinaryKey {
     /// The version as numbers.
     pub fn version_numbers(&self) -> Option<(u32, u32, u32)> {
         parse_user_agent_version(&self.version)
+    }
+
+    /// Whether `reported` is the version this binary reported when it was keyed. A version that could
+    /// not be read matches nothing.
+    pub fn is_version(&self, reported: (u32, u32, u32)) -> bool {
+        self.version_numbers() == Some(reported)
     }
 
     /// Sixteen hex digits naming this key: the directory and file names are built from it.
@@ -274,8 +299,9 @@ fn probe_version(program: &Path) -> Result<String, String> {
 ///
 /// `state_home` is Eitri's own state directory; the check keeps `codex-check/<key>/` in it (0700, its
 /// files 0600): the verdict, the log of the last run, and, while a run is going, its scratch directory.
-/// Concurrent callers take turns on a lock, so the second finds the first's verdict.
-pub fn ensure_checked(program: &Path, state_home: &Path) -> Result<(), SelfCheckError> {
+/// Concurrent callers take turns on a lock, so the second finds the first's verdict. Returns the key of
+/// the binary that passed, so the caller can tell whether what it starts afterwards is still that binary.
+pub fn ensure_checked(program: &Path, state_home: &Path) -> Result<BinaryKey, SelfCheckError> {
     ensure_checked_with(program, state_home, true, |key, run_dir, log| {
         run_check(program, key, run_dir, log, &CheckTweaks::default())
     })
@@ -304,7 +330,11 @@ impl CheckTweaks {
 /// [`ensure_checked`] with deliberate faults. Never records a verdict.
 #[doc(hidden)]
 #[cfg(feature = "test-support")]
-pub fn ensure_checked_tweaked(program: &Path, state_home: &Path, tweaks: &CheckTweaks) -> Result<(), SelfCheckError> {
+pub fn ensure_checked_tweaked(
+    program: &Path,
+    state_home: &Path,
+    tweaks: &CheckTweaks,
+) -> Result<BinaryKey, SelfCheckError> {
     ensure_checked_with(program, state_home, !tweaks.any(), |key, run_dir, log| {
         run_check(program, key, run_dir, log, tweaks)
     })
@@ -316,77 +346,174 @@ fn ensure_checked_with(
     state_home: &Path,
     record: bool,
     run: impl FnOnce(&BinaryKey, &Path, &mut Log) -> Result<(), Vec<String>>,
-) -> Result<(), SelfCheckError> {
-    let key = BinaryKey::of(program)?;
-    match key.version_numbers() {
-        Some(found) if found < super::provider::MIN_CODEX => return Err(SelfCheckError::TooOld { found }),
-        _ => {}
-    }
-    let dir = state_home.join(CHECK_DIR).join(key.id());
-    let log_path = dir.join("check.log");
-    let fail = |reason: String| SelfCheckError::Failed {
-        reasons: vec![reason],
-        log: log_path.clone(),
-    };
-    create_private_dir_all(&dir, state_home).map_err(|e| fail(format!("{} cannot be made: {e}", dir.display())))?;
+) -> Result<BinaryKey, SelfCheckError> {
+    Pending::new(program, state_home)?.finish(LOCK_WAIT, record, run)
+}
 
-    let verdict_path = dir.join("verdict.json");
-    if verdict_is_pass(&verdict_path, &key) {
-        return Ok(());
-    }
-    // One check at a time per binary; whoever waits finds the verdict.
-    let _lock =
-        DirLock::take(&dir.join("lock")).map_err(|e| fail(format!("the check's lock could not be taken: {e}")))?;
-    if verdict_is_pass(&verdict_path, &key) {
-        return Ok(());
-    }
+/// A start that knows which binary it is about to check and has not yet taken the lock.
+struct Pending {
+    key: BinaryKey,
+    state_home: PathBuf,
+    dir: PathBuf,
+    log_path: PathBuf,
+    /// The record of the last finished run as it stood before this start waited for the lock: a run that
+    /// finishes while it waits leaves a different one.
+    seen: Option<String>,
+}
 
-    let run_dir = dir.join("run");
-    let _ = std::fs::remove_dir_all(&run_dir);
-    create_private_dir_all(&run_dir, state_home)
-        .map_err(|e| fail(format!("{} cannot be made: {e}", run_dir.display())))?;
-    let mut log = Log::new();
-    log.line(format!("codex {} at {}", key.version, key.path.display()));
-    let started = Instant::now();
-    let result = run(&key, &run_dir, &mut log);
-    let _ = std::fs::remove_dir_all(&run_dir);
-    log.line(match &result {
-        Ok(()) => format!("passed in {:.1}s", started.elapsed().as_secs_f32()),
-        Err(_) => format!("FAILED after {:.1}s", started.elapsed().as_secs_f32()),
-    });
-    if let Err(reasons) = &result {
-        for reason in reasons {
-            log.line(format!("reason: {reason}"));
+impl Pending {
+    fn new(program: &Path, state_home: &Path) -> Result<Pending, SelfCheckError> {
+        let key = BinaryKey::of(program)?;
+        match key.version_numbers() {
+            Some(found) if found < super::provider::MIN_CODEX => return Err(SelfCheckError::TooOld { found }),
+            _ => {}
         }
+        let dir = state_home.join(CHECK_DIR).join(key.id());
+        let log_path = dir.join("check.log");
+        create_private_dir_all(&dir, state_home).map_err(|e| SelfCheckError::Failed {
+            reasons: vec![format!("{} cannot be made: {e}", dir.display())],
+            log: log_path.clone(),
+        })?;
+        let seen = read_private_to_string(&dir.join(LAST_RUN)).ok();
+        Ok(Pending {
+            key,
+            state_home: state_home.to_path_buf(),
+            dir,
+            log_path,
+            seen,
+        })
     }
-    if let Err(e) = write_private(&log_path, log.text().as_bytes()) {
-        eprintln!("agent: the Codex check's log could not be written: {e}");
-    }
-    match result {
-        Ok(()) => {
-            if record {
-                let verdict = json!({
-                    "version": 1,
-                    "result": "passed",
-                    "key": key.describe(),
-                    "checked_at": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
-                });
-                let temp = dir.join(format!("verdict.json.{}", std::process::id()));
-                let written = write_private(&temp, verdict.to_string().as_bytes())
-                    .and_then(|()| std::fs::rename(&temp, &verdict_path));
-                if let Err(e) = written {
-                    let _ = std::fs::remove_file(&temp);
-                    eprintln!("agent: the Codex check's verdict could not be recorded: {e}");
-                }
+
+    fn finish(
+        self,
+        lock_wait: Duration,
+        record: bool,
+        run: impl FnOnce(&BinaryKey, &Path, &mut Log) -> Result<(), Vec<String>>,
+    ) -> Result<BinaryKey, SelfCheckError> {
+        let Pending {
+            key,
+            state_home,
+            dir,
+            log_path,
+            seen,
+        } = self;
+        let state_home = state_home.as_path();
+        let fail = |reason: String| SelfCheckError::Failed {
+            reasons: vec![reason],
+            log: log_path.clone(),
+        };
+        let verdict_path = dir.join("verdict.json");
+        if verdict_is_pass(&verdict_path, &key) {
+            return Ok(key);
+        }
+        // One check at a time per binary; whoever waits finds the verdict, or the failure of the run it
+        // waited for. Waiting has an end, so a check that hangs past its own budget does not hold every
+        // later start of this binary for good.
+        let _lock = DirLock::take(&dir.join("lock"), Instant::now() + lock_wait).map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => SelfCheckError::Unfinished { waited: lock_wait },
+            _ => fail(format!("the check's lock could not be taken: {e}")),
+        })?;
+        if verdict_is_pass(&verdict_path, &key) {
+            return Ok(key);
+        }
+        // A run that failed while this start waited answers it too: running the same check again at once
+        // would only make every waiting start pay a few seconds for the same answer. A start that comes
+        // after that run finished saw its record before the lock and runs the check itself, so a failure
+        // is still not kept for later starts.
+        if let Some(reasons) = failed_since(&dir.join(LAST_RUN), seen.as_deref(), &key) {
+            return Err(SelfCheckError::Failed { reasons, log: log_path });
+        }
+
+        let run_dir = dir.join("run");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        create_private_dir_all(&run_dir, state_home)
+            .map_err(|e| fail(format!("{} cannot be made: {e}", run_dir.display())))?;
+        let mut log = Log::new();
+        log.line(format!("codex {} at {}", key.version, key.path.display()));
+        let started = Instant::now();
+        let result = run(&key, &run_dir, &mut log);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        log.line(match &result {
+            Ok(()) => format!("passed in {:.1}s", started.elapsed().as_secs_f32()),
+            Err(_) => format!("FAILED after {:.1}s", started.elapsed().as_secs_f32()),
+        });
+        if let Err(reasons) = &result {
+            for reason in reasons {
+                log.line(format!("reason: {reason}"));
             }
-            Ok(())
         }
-        Err(reasons) => Err(SelfCheckError::Failed { reasons, log: log_path }),
+        if let Err(e) = write_private(&log_path, log.text().as_bytes()) {
+            eprintln!("agent: the Codex check's log could not be written: {e}");
+        }
+        if record {
+            let last = json!({
+                "run": uuid::Uuid::new_v4().to_string(),
+                "result": if result.is_ok() { "passed" } else { "failed" },
+                "reasons": result.as_ref().err().cloned().unwrap_or_default(),
+                "check_revision": CHECK_REVISION,
+                "key": key.describe(),
+            });
+            if let Err(e) = write_replacing(&dir, LAST_RUN, &last) {
+                eprintln!("agent: the Codex check's last run could not be recorded: {e}");
+            }
+        }
+        match result {
+            Ok(()) => {
+                if record {
+                    let verdict = json!({
+                        "version": 1,
+                        "result": "passed",
+                        "check_revision": CHECK_REVISION,
+                        "key": key.describe(),
+                        "checked_at": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+                    });
+                    if let Err(e) = write_replacing(&dir, "verdict.json", &verdict) {
+                        eprintln!("agent: the Codex check's verdict could not be recorded: {e}");
+                    }
+                }
+                Ok(key)
+            }
+            Err(reasons) => Err(SelfCheckError::Failed { reasons, log: log_path }),
+        }
     }
 }
 
-/// A recorded pass for exactly this key. Anything unreadable, foreign, malformed or about another key
-/// is not a pass.
+/// Writes `name` in `dir` whole or not at all: a reader never sees half of it.
+fn write_replacing(dir: &Path, name: &str, value: &Value) -> std::io::Result<()> {
+    let temp = dir.join(format!("{name}.{}", std::process::id()));
+    let written =
+        write_private(&temp, value.to_string().as_bytes()).and_then(|()| std::fs::rename(&temp, dir.join(name)));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
+/// The reasons of a failed run of this check on this key that finished after `seen` was read, if the last
+/// run is one. Anything unreadable, unchanged, passed or about another key or revision is not.
+fn failed_since(path: &Path, seen: Option<&str>, key: &BinaryKey) -> Option<Vec<String>> {
+    let text = read_private_to_string(path).ok()?;
+    if seen == Some(text.as_str()) {
+        return None;
+    }
+    let value: Value = serde_json::from_str(&text).ok()?;
+    if value.get("result") != Some(&json!("failed"))
+        || value.get("check_revision") != Some(&json!(CHECK_REVISION))
+        || value.get("key") != Some(&key.describe())
+    {
+        return None;
+    }
+    let reasons: Vec<String> = value
+        .get("reasons")?
+        .as_array()?
+        .iter()
+        .map(|r| r.as_str().map(str::to_string))
+        .collect::<Option<_>>()?;
+    (!reasons.is_empty()).then_some(reasons)
+}
+
+/// A recorded pass for exactly this key, earned under this revision of the check. Anything unreadable,
+/// foreign, malformed, about another key or from another revision of the check is not a pass.
 fn verdict_is_pass(path: &Path, key: &BinaryKey) -> bool {
     let Ok(text) = read_private_to_string(path) else {
         return false;
@@ -396,6 +523,7 @@ fn verdict_is_pass(path: &Path, key: &BinaryKey) -> bool {
     };
     value.get("version") == Some(&json!(1))
         && value.get("result") == Some(&json!("passed"))
+        && value.get("check_revision") == Some(&json!(CHECK_REVISION))
         && value.get("key") == Some(&key.describe())
 }
 
@@ -403,16 +531,27 @@ fn verdict_is_pass(path: &Path, key: &BinaryKey) -> bool {
 struct DirLock(File);
 
 impl DirLock {
-    fn take(path: &Path) -> std::io::Result<DirLock> {
+    /// Takes the lock, waiting for whoever holds it until `deadline`; past it the error is `TimedOut`.
+    fn take(path: &Path, deadline: Instant) -> std::io::Result<DirLock> {
         let file = open_private(path)?;
         loop {
             // SAFETY: the descriptor is `file`'s own and stays open for the call.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(DirLock(file));
             }
             let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e);
+            match e.kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                std::io::ErrorKind::WouldBlock => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "another check holds the lock",
+                    ))
+                }
+                _ => return Err(e),
             }
         }
     }
@@ -1374,6 +1513,7 @@ mod tests {
             runs.set(runs.get() + 1);
             outcome
         })
+        .map(|_| ())
     }
 
     #[test]
@@ -1413,6 +1553,122 @@ mod tests {
         std::fs::write(&verdict, "passed").expect("tampers");
         check(&a, &state, &runs, Ok(())).expect("passes again");
         assert_eq!(runs.get(), 4);
+    }
+
+    #[test]
+    fn a_pass_of_another_check_revision_is_run_again() {
+        let scratch = Scratch::new("revision");
+        let program = scratch.program("codex", "codex-cli 0.161.0");
+        let state = scratch.state();
+        let runs = Cell::new(0);
+        check(&program, &state, &runs, Ok(())).expect("passes");
+        assert_eq!(runs.get(), 1);
+        let key = BinaryKey::of(&program).expect("key");
+        let verdict = state.join(CHECK_DIR).join(key.id()).join("verdict.json");
+
+        // A pass an older Eitri recorded, before the check's revision was written down: the same binary,
+        // but a check that may have been weaker than this one.
+        let old = json!({"version": 1, "result": "passed", "key": key.describe(), "checked_at": 1});
+        std::fs::write(&verdict, old.to_string()).expect("writes");
+        check(&program, &state, &runs, Ok(())).expect("passes again");
+        assert_eq!(runs.get(), 2, "a pass of an unrecorded check revision is not a pass");
+
+        // The fresh verdict names this revision and answers the next start.
+        let text = std::fs::read_to_string(&verdict).expect("reads");
+        let value: Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value.get("check_revision"), Some(&json!(CHECK_REVISION)));
+        check(&program, &state, &runs, Err(vec!["not asked".into()])).expect("the cached pass");
+        assert_eq!(runs.get(), 2);
+
+        // A pass of any other revision, older or newer, is run again.
+        for other in [CHECK_REVISION - 1, CHECK_REVISION + 1] {
+            let mut value = value.clone();
+            value["check_revision"] = json!(other);
+            std::fs::write(&verdict, value.to_string()).expect("writes");
+            let before = runs.get();
+            check(&program, &state, &runs, Ok(())).expect("passes again");
+            assert_eq!(runs.get(), before + 1, "revision {other} is not this check's");
+        }
+    }
+
+    #[test]
+    fn a_start_that_waited_for_a_failed_run_gets_its_outcome_and_a_later_one_runs_again() {
+        let scratch = Scratch::new("waited");
+        let program = scratch.program("codex", "codex-cli 0.161.0");
+        let state = scratch.state();
+        let runs = Cell::new(0);
+
+        // A start is under way (it has found its binary) when another start's run fails.
+        let waiting = Pending::new(&program, &state).expect("pending");
+        let first = check(
+            &program,
+            &state,
+            &runs,
+            Err(vec!["the sandbox let a write through".into()]),
+        )
+        .expect_err("fails");
+        assert_eq!(runs.get(), 1);
+
+        // The start that was waiting gets that run's failure instead of running the check again.
+        let shared = waiting
+            .finish(LOCK_WAIT, true, |_, _, _| {
+                runs.set(runs.get() + 1);
+                Ok(())
+            })
+            .expect_err("the waiting start shares the failure");
+        assert_eq!(runs.get(), 1, "a start that waited for a failed run does not run again");
+        assert_eq!(shared, first);
+
+        // A failure is still not cached: a start that comes afterwards runs the check.
+        check(&program, &state, &runs, Ok(())).expect("passes");
+        assert_eq!(runs.get(), 2);
+    }
+
+    #[test]
+    fn a_start_that_waited_for_a_passed_run_finds_its_verdict() {
+        let scratch = Scratch::new("waited-pass");
+        let program = scratch.program("codex", "codex-cli 0.161.0");
+        let state = scratch.state();
+        let runs = Cell::new(0);
+        let waiting = Pending::new(&program, &state).expect("pending");
+        check(&program, &state, &runs, Ok(())).expect("passes");
+        waiting
+            .finish(LOCK_WAIT, true, |_, _, _| Err(vec!["not asked".into()]))
+            .expect("the recorded pass answers");
+        assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn waiting_for_another_check_has_a_deadline() {
+        let scratch = Scratch::new("deadline");
+        let program = scratch.program("codex", "codex-cli 0.161.0");
+        let state = scratch.state();
+        let key = BinaryKey::of(&program).expect("key");
+        let dir = state.join(CHECK_DIR).join(key.id());
+        create_private_dir_all(&dir, &state).expect("dir");
+        // Another check holds the lock and never finishes.
+        let held = DirLock::take(&dir.join("lock"), Instant::now() + Duration::from_secs(5)).expect("lock");
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let (program_in, state_in) = (program.clone(), state.clone());
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = Pending::new(&program_in, &state_in).and_then(|pending| {
+                pending.finish(Duration::from_millis(300), true, |_, _, _| Err(vec!["ran".into()]))
+            });
+            let _ = done.send((result, started.elapsed()));
+        });
+        let (result, waited) = finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the waiting start gives up instead of waiting for ever");
+        drop(held);
+        let err = result.expect_err("refused");
+        assert!(matches!(err, SelfCheckError::Unfinished { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("another check of this Codex did not finish"),
+            "{err}"
+        );
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
     }
 
     #[test]
@@ -1471,6 +1727,32 @@ mod tests {
         // A new version at the same path is another binary too.
         let upgraded = BinaryKey::new(after.path.clone(), after.size, after.mtime_ns, "0.162.0".into());
         assert_ne!(after.id(), upgraded.id());
+    }
+
+    #[test]
+    fn only_the_checked_version_is_the_checked_binary() {
+        let key = BinaryKey::new(PathBuf::from("/c"), 1, 1, "0.161.0".into());
+        assert!(key.is_version((0, 161, 0)));
+        assert!(!key.is_version((0, 162, 0)));
+        assert!(!key.is_version((0, 160, 0)));
+        let unreadable = BinaryKey::new(PathBuf::from("/c"), 1, 1, "unknown".into());
+        assert!(
+            !unreadable.is_version((0, 161, 0)),
+            "a version that cannot be read matches nothing"
+        );
+    }
+
+    #[test]
+    fn ensure_checked_names_the_binary_it_checked() {
+        let scratch = Scratch::new("returns-key");
+        let program = scratch.program("codex", "codex-cli 0.161.0");
+        let key = ensure_checked_with(&program, &scratch.state(), true, |_, _, _| Ok(())).expect("passes");
+        assert_eq!(key, BinaryKey::of(&program).expect("key"));
+        let cached = ensure_checked_with(&program, &scratch.state(), true, |_, _, _| {
+            Err(vec!["not asked".into()])
+        })
+        .expect("the cached pass");
+        assert_eq!(cached, key);
     }
 
     #[test]

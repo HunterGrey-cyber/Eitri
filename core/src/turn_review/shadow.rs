@@ -295,11 +295,14 @@ pub struct TurnMarks {
     pub overlapped_next: bool,
     /// Another tab's turn on the same project ran at the same time.
     pub overlapped_tab: bool,
+    /// The agent still had a command running when the turn ended: what it wrote afterwards is in
+    /// no snapshot of this turn.
+    pub left_running: bool,
 }
 
 impl TurnMarks {
     pub fn any(&self) -> bool {
-        self.late || self.overlapped_next || self.overlapped_tab
+        self.late || self.overlapped_next || self.overlapped_tab || self.left_running
     }
 
     fn to_message(self, turn: u32, turn_id: &str) -> String {
@@ -308,12 +311,13 @@ impl TurnMarks {
             .map(|c| if c == '\n' || c == '\r' || c == '\0' { ' ' } else { c })
             .collect();
         format!(
-            "kind: marks\nturn: {turn}\nturn-id: {turn_id}\nlate: {}\noverlapped-next: {}\noverlapped-tab: {}\n",
-            self.late, self.overlapped_next, self.overlapped_tab
+            "kind: marks\nturn: {turn}\nturn-id: {turn_id}\nlate: {}\noverlapped-next: {}\noverlapped-tab: {}\nleft-running: {}\n",
+            self.late, self.overlapped_next, self.overlapped_tab, self.left_running
         )
     }
 
-    /// Reads a message written by `to_message` back; `None` for any other message.
+    /// Reads a message written by `to_message` back; `None` for any other message. A mark a message
+    /// does not name (one written before that mark existed) reads as not set.
     fn parse(message: &str) -> Option<TurnMarks> {
         let mut fields = BTreeMap::new();
         for line in message.lines() {
@@ -329,6 +333,7 @@ impl TurnMarks {
             late: flag("late"),
             overlapped_next: flag("overlapped-next"),
             overlapped_tab: flag("overlapped-tab"),
+            left_running: flag("left-running"),
         })
     }
 }
@@ -1603,9 +1608,24 @@ mod tests {
             late: true,
             overlapped_next: false,
             overlapped_tab: true,
+            left_running: true,
         };
         let message = marks.to_message(4, "t\n4");
         assert_eq!(TurnMarks::parse(&message), Some(marks));
+        assert!(TurnMarks {
+            left_running: true,
+            ..TurnMarks::default()
+        }
+        .any());
+        // A message written before the last mark existed reads it as not set.
+        let older = "kind: marks\nturn: 4\nturn-id: t\nlate: true\noverlapped-next: false\noverlapped-tab: true\n";
+        assert_eq!(
+            TurnMarks::parse(older),
+            Some(TurnMarks {
+                left_running: false,
+                ..marks
+            })
+        );
         assert_eq!(SnapshotLabel::parse(&message), None);
         let reference = |name: &str| SnapshotRef {
             name: name.into(),

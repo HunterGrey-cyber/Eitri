@@ -657,6 +657,7 @@ fn discover_as(fx: &Fixture, root: &Path, profile: &Profile) -> Discovery {
         codex_home: Some(fx.outer.join("codex-home")),
         fallback_names: Vec::new(),
         user_mcp_servers: None,
+        user_config_unreadable: None,
     };
     discover(root, Some(&fx.home), &Limits::default(), profile, &env)
 }

@@ -49,6 +49,9 @@ pub const NOTE_SESSION: &str = "changed on disk during this session";
 pub const NOTE_OVERLAPPED_NEXT: &str = "may include the next turn's first changes";
 /// A turn that ran while another tab's turn on the same project was running.
 pub const NOTE_OVERLAPPED_TAB: &str = "this turn overlapped another tab's turn";
+/// A turn that ended while the agent still had a command running in the background.
+pub const NOTE_LEFT_RUNNING: &str =
+    "a command was still running when this turn ended; later changes are not in this review";
 /// A turn that has a base and no end, from an earlier run of Eitri.
 pub const NOTE_UNFINISHED: &str = "this turn did not finish while Eitri was running";
 /// A turn still running: its base is compared with the files as they are now.
@@ -137,6 +140,9 @@ pub struct TurnRecord {
     pub overlapped_next: bool,
     /// Another tab's turn on the same project ran at the same time.
     pub overlapped_tab: bool,
+    /// The agent still had a command running in the background when the turn ended: whatever it
+    /// changed afterwards is not in this turn's review.
+    pub left_running: bool,
     /// Files left out of a snapshot for their size, relative to the project root.
     pub skipped_large: Vec<PathBuf>,
     /// The same files by the snapshot that left them out, each with its print: what tells a file
@@ -172,6 +178,7 @@ impl TurnRecord {
             late: self.late,
             overlapped_next: self.overlapped_next,
             overlapped_tab: self.overlapped_tab,
+            left_running: self.left_running,
         }
     }
 }
@@ -476,11 +483,19 @@ struct TabTrack {
     latest: Option<Active>,
     /// Turns started before the tab's session had an id.
     unbound: Vec<Rec>,
+    /// How many commands the tab's agent left running after its turns ended, as it last said. A turn
+    /// that ends while this is above zero is marked: that command may change files after the end.
+    background: u32,
 }
 
 impl TabTrack {
     fn live_session(&self) -> Option<&str> {
         self.session.as_deref().filter(|_| self.live)
+    }
+
+    /// The session the count belonged to is over: nothing it started runs any more.
+    fn forget_background(&mut self) {
+        self.background = 0;
     }
 
     fn drop_unbound(&mut self) {
@@ -564,7 +579,15 @@ impl TurnReview {
                 self.start_turn(tab, turn_id, now_ms, false);
             }
             AgentDomainEvent::ToolCallStarted { turn_id, .. } => self.tool_started(tab, turn_id),
-            AgentDomainEvent::TurnCompleted { .. } => self.end_active(tab, now_ms, false),
+            AgentDomainEvent::TurnCompleted { .. } => {
+                self.mark_left_running(tab);
+                self.end_active(tab, now_ms, false)
+            }
+            // The agent sends the count before the end of the turn that left something running.
+            AgentDomainEvent::BackgroundCalls { running } => {
+                self.tabs.entry(tab).or_default().background = *running;
+                return;
+            }
             AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
                 self.session_ended(tab, now_ms)
             }
@@ -612,6 +635,9 @@ impl TurnReview {
                 }
             }
             (Some(_), theirs) => {
+                // The count the dropped events carried was observed before this, from the
+                // rebuilt projection.
+                self.mark_left_running(tab);
                 self.end_active(tab, now_ms, theirs.is_some());
                 if let Some(theirs) = theirs {
                     self.start_turn(tab, theirs, now_ms, true);
@@ -975,6 +1001,7 @@ impl TurnReview {
                 late,
                 overlapped_next: false,
                 overlapped_tab,
+                left_running: false,
                 skipped_large: Vec::new(),
                 left_out: LeftOutSides::default(),
                 earlier_run: false,
@@ -1043,6 +1070,15 @@ impl TurnReview {
                         rec.record.late = true;
                     }
                 }
+            }
+        }
+    }
+
+    /// Marks the tab's running turn as ending with a command still running, when one is.
+    fn mark_left_running(&mut self, tab: u64) {
+        if self.tabs.get(&tab).is_some_and(|t| t.background > 0) {
+            if let Some(rec) = self.active_rec_mut(tab) {
+                rec.record.left_running = true;
             }
         }
     }
@@ -1157,6 +1193,7 @@ impl TurnReview {
         if let Some(track) = self.tabs.get_mut(&tab) {
             track.live = false;
             track.drop_unbound();
+            track.forget_background();
         }
     }
 
@@ -1169,6 +1206,7 @@ impl TurnReview {
             return;
         };
         track.drop_unbound();
+        track.forget_background();
         track.live = false;
         if let Some(session) = track.session.take() {
             if let Some(s) = self.sessions.get_mut(&session) {
@@ -1873,6 +1911,7 @@ fn merged_turns(shadow: &Shadow, session: &str, records: Vec<TurnRecord>) -> Res
                 late: marks.late,
                 overlapped_next: marks.overlapped_next,
                 overlapped_tab: marks.overlapped_tab,
+                left_running: marks.left_running,
                 skipped_large,
                 left_out,
                 earlier_run: true,
@@ -1981,6 +2020,9 @@ fn marks(turn: &TurnRecord) -> Vec<String> {
     if turn.overlapped_tab {
         notes.push(NOTE_OVERLAPPED_TAB.into());
     }
+    if turn.left_running {
+        notes.push(NOTE_LEFT_RUNNING.into());
+    }
     match turn.state() {
         TurnState::Unfinished(_) if turn.earlier_run => notes.push(NOTE_UNFINISHED.into()),
         TurnState::Unfinished(reason) => notes.push(format!(
@@ -2039,6 +2081,7 @@ mod tests {
             late: false,
             overlapped_next: false,
             overlapped_tab: false,
+            left_running: false,
             skipped_large: Vec::new(),
             left_out: LeftOutSides::default(),
             earlier_run: false,

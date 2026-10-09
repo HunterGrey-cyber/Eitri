@@ -376,6 +376,13 @@ pub enum AgentDomainEvent {
         /// What the agent reported, in the agent's own words.
         reported: String,
     },
+    /// How many calls the agent left running after a turn ended (a command it put in the background),
+    /// whenever that number changes. Sent before the `TurnCompleted` of the turn that left them, so the
+    /// turn's review knows that later changes are not in it. Calls a running turn starts are not counted
+    /// until it ends.
+    BackgroundCalls {
+        running: u32,
+    },
     /// The account's usage limit changed, as the agent reported it. Account-wide, not per turn.
     AccountLimits {
         /// How much of the window is used, in percent.
@@ -1160,6 +1167,14 @@ pub struct AgentSessionProjection {
     /// The latest `AgentDomainEvent::AccountLimits`, or `None` before the first. Not serialized.
     #[serde(skip)]
     pub account_limits: Option<AccountLimitsRecord>,
+    /// The latest `AgentDomainEvent::BackgroundCalls`: how many calls the agent left running after its
+    /// turns ended. Zero once the session is over. Not serialized.
+    #[serde(skip)]
+    pub background_calls: u32,
+    /// `background_calls` as it was when the latest turn ended, which a resync that ends that turn reads.
+    /// Not serialized.
+    #[serde(skip)]
+    pub background_at_last_turn_end: u32,
     /// CLI refusals whose call has not been folded yet, oldest first, by tool-use id, attached when
     /// it is. In the one recorded run (CLI 2.1.284) the refusal followed the assistant message
     /// carrying its call; this keeps a refusal that ever arrives first from being lost. Emptied at
@@ -1500,6 +1515,7 @@ impl AgentSessionProjection {
                 detail,
                 ..
             } => {
+                self.background_at_last_turn_end = self.background_calls;
                 let kind = match outcome {
                     TurnOutcome::Completed => None,
                     TurnOutcome::Interrupted => Some(TurnEndingKind::Interrupted),
@@ -1606,6 +1622,7 @@ impl AgentSessionProjection {
                     self.policy_mismatch = Some((requested.clone(), reported.clone()));
                 }
             }
+            AgentDomainEvent::BackgroundCalls { running } => self.background_calls = *running,
             // The latest report wins: the agent states the whole window each time.
             AgentDomainEvent::AccountLimits {
                 used_percent,
@@ -1704,6 +1721,24 @@ pub fn describe_failed_resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resync that ends a turn reads the count the turn ended with, which a later report must not move.
+    #[test]
+    fn the_background_count_at_a_turn_end_is_kept() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        p.apply(&AgentDomainEvent::BackgroundCalls { running: 2 });
+        p.apply(&AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: TurnEndDetail::default(),
+        });
+        p.apply(&AgentDomainEvent::BackgroundCalls { running: 0 });
+        assert_eq!((p.background_calls, p.background_at_last_turn_end), (0, 2));
+    }
 
     fn limits(resets_at: i64) -> AgentDomainEvent {
         AgentDomainEvent::AccountLimits {

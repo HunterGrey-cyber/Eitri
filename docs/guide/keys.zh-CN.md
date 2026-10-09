@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=d1bde63c3a8305977ceafb4de4930eafb546d57c8890c39baaf58b4bfe480214 -->
+<!-- translated-from: keys.md sha256=b8779f27d80595422c60449984b8aa4a97dfa40949fe792d6a6b729220b5e97d -->
 
 # 按键
 
@@ -154,6 +154,7 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `<leader>i` | 这个标签页的详情 |
 | `<leader>t` | 在终端里继续这个对话（Claude 标签页；Codex 或已注册 agent 的标签页会提示这还不可用） |
 | `<leader>m` | 在 Auto 和 Bypass 之间切换（和 `Shift+Tab` 一样） |
+| `<leader>k` | 停止 Codex 标签页留在后台运行的命令，这会结束它的会话（之后可以恢复），会先问一个 `y/n` |
 | `<leader>?` | 按键列表 |
 
 你可以在[自己的配置](configuration.zh-CN.md)里修改它们。

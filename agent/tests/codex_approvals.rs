@@ -7,7 +7,7 @@ use agent::providers::codex::{CodexLaunch, CodexProvider};
 use agent::{
     AgentDomainEvent, AgentProvider, DirTrust, ExternalProvider, ExternalStart, InterruptTurnRequest,
     PermissionDecision, PermissionOutcome, ProviderError, ResolvePermissionRequest, Reviewer, SendTurnRequest,
-    TrustPlan, TurnPolicy,
+    TrustPlan, TurnOutcome, TurnPolicy,
 };
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -733,6 +733,93 @@ fn interrupt_sends_cancel() {
         .expect("closes");
 }
 
+/// Should `cancel` not end the turn after all, pressing interrupt again sends the turn its `turn/interrupt`:
+/// the first press took the cancel for the turn's end and sent none.
+#[test]
+fn a_second_interrupt_reaches_a_turn_a_cancel_did_not_end() {
+    let provider = running(
+        "th-c5",
+        "tu-c5",
+        Reviewer::User,
+        vec![
+            item_started("th-c5", "tu-c5", command_item("exec-5", "touch /x")),
+            request(
+                json!("r-5"),
+                "item/commandExecution/requestApproval",
+                json!({"threadId": "th-c5", "turnId": "tu-c5", "itemId": "exec-5", "command": "touch /x"}),
+            ),
+            expect_answer(json!("r-5"), r#"{"decision":"cancel"}"#),
+            expect_exact(r#"{"id":5,"method":"turn/interrupt","params":{"threadId":"th-c5","turnId":"tu-c5"}}"#),
+            write(
+                json!({"method": "item/completed", "params": {"threadId": "th-c5", "turnId": "tu-c5",
+                "item": {"type": "commandExecution", "id": "exec-5", "command": "touch /x", "cwd": "/work/proj",
+                         "status": "declined"}}}),
+            ),
+            turn_completed("th-c5", "tu-c5", "interrupted"),
+        ],
+    );
+    until_card(&provider);
+    let interrupt = || {
+        provider
+            .interrupt_turn(InterruptTurnRequest {
+                session_id: "th-c5".into(),
+            })
+            .expect("the interrupt is taken")
+    };
+    interrupt();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    provider.pump();
+    interrupt();
+    let events = until_turn_completed(&provider);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Interrupted,
+            ..
+        }
+    )));
+}
+
+/// A session that trips with a card waiting cancels the card to Codex, so the turn that asked ends instead
+/// of waiting for an answer that never comes.
+#[test]
+fn a_tripped_session_cancels_the_card_that_waits() {
+    let provider = running(
+        "th-c6",
+        "tu-c6",
+        Reviewer::User,
+        vec![
+            item_started("th-c6", "tu-c6", command_item("exec-6", "touch /x")),
+            request(
+                json!("r-6"),
+                "item/commandExecution/requestApproval",
+                json!({"threadId": "th-c6", "turnId": "tu-c6", "itemId": "exec-6", "command": "touch /x"}),
+            ),
+            json!({"sleep_ms": 300}),
+            // A project hook in an untrusted session.
+            write(
+                json!({"method": "hook/started", "params": {"threadId": "th-c6", "turnId": "tu-c6",
+                "run": {"id": "h", "source": "project", "sourcePath": "/work/proj/.codex/hooks.json"}}}),
+            ),
+            expect_answer(json!("r-6"), r#"{"decision":"cancel"}"#),
+            turn_completed("th-c6", "tu-c6", "completed"),
+        ],
+    );
+    let (id, _, _, _) = until_card(&provider);
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. }))
+    });
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentDomainEvent::PermissionResolved { permission_id, outcome: PermissionOutcome::ProviderFailed }
+            if *permission_id == id
+    )));
+    // The stand-in reads the answer before it ends the turn; without it the turn never ends.
+    until_turn_completed(&provider);
+}
+
 fn write_stdin_declined(reviewer: Reviewer, thread: &str) {
     let provider = running(
         thread,
@@ -1101,6 +1188,36 @@ fn tool_approval(id: u64, thread: &str, turn: &str, arguments: &Value, message: 
 
 const TOOL_ACCEPT: &str = r#"{"_meta":null,"action":"accept","content":{}}"#;
 const TOOL_DECLINE: &str = r#"{"_meta":null,"action":"decline","content":null}"#;
+
+/// A tool call that could not be read is not held. An approval that names no tool may be for it, so it is
+/// not matched to the held call that happens to share its server and arguments.
+#[test]
+fn an_unnamed_tool_approval_is_declined_on_a_thread_with_a_call_not_held() {
+    let arguments = json!({"name": "prod"});
+    let provider = running(
+        "th-m5",
+        "tu-m5",
+        Reviewer::User,
+        vec![
+            item_started("th-m5", "tu-m5", mcp_call("call-read", "read", &arguments)),
+            // A tool call whose start does not read (no server): its tool is unknown.
+            item_started(
+                "th-m5",
+                "tu-m5",
+                json!({"type": "mcpToolCall", "id": "call-x", "tool": "delete", "status": "inProgress"}),
+            ),
+            tool_approval(9, "th-m5", "tu-m5", &arguments, "Approve app tool call?"),
+            expect_answer(json!(9), TOOL_DECLINE),
+            turn_completed("th-m5", "tu-m5", "completed"),
+        ],
+    );
+    let events = until_turn_completed(&provider);
+    assert_eq!(
+        cards(&events),
+        0,
+        "the approval was matched to a call it may not be for: {events:#?}"
+    );
+}
 
 #[test]
 fn a_tool_approval_that_could_be_either_of_two_tools_is_declined() {

@@ -23,6 +23,7 @@ export function initialState(): AgentUiState {
     provider: null,
     usage: null,
     accountLimits: null,
+    backgroundCalls: 0,
     turnEndings: [],
     lastTurnEnding: null,
     history: null,
@@ -345,6 +346,9 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         turnEndings: fill ? [...state.turnEndings.slice(0, -1), { ...last, resetsAt }] : state.turnEndings,
       };
     }
+    case "background_calls":
+      // The latest count wins, as in `AgentSessionProjection::apply`.
+      return { ...state, backgroundCalls: event.running };
     case "tool_input_changed": {
       // Rust compared the CLI's prompt with the gate request (one it may have answered itself, so
       // the page never saw it) and says so here: applied, never recomputed. Like
@@ -487,6 +491,8 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
     ...snapshot,
     usage: snapshot.usage ?? null,
     accountLimits: snapshot.accountLimits ?? null,
+    // A payload from a build that predates the count is a tab with none.
+    backgroundCalls: snapshot.backgroundCalls ?? 0,
     turnEndings: snapshot.turnEndings ?? [],
     lastTurnEnding: snapshot.lastTurnEnding ?? null,
     nextSeq: throughRevision,

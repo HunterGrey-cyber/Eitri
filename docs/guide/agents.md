@@ -153,8 +153,10 @@ tab's mode.
   Eitri waits up to three seconds after the key. If a command, a file change or something it could not read is
   still running by then, Eitri stops the Codex session, and everything it started with it, and says so: "Codex
   kept running a command after the interrupt; its session was stopped so nothing more runs. The conversation can
-  be resumed." A command the model left running in the background past its own call is not caught by this; it is
-  stopped by a later interrupt or by closing the tab.
+  be resumed." A command the model left running in the background past its own call is not caught by this: the
+  turn ends, the band says how many are still running, the turn's review says later changes are not in it, and
+  `<leader>k` stops them by stopping the session after a `y/n` (the conversation can be resumed); a later
+  interrupt or closing the tab stops them too.
 - **Subagents.** Codex may start subagents and Eitri cannot turn that off. Their rows and cards say `subagent`,
   they inherit the sandbox and the trust answer of the tab, interrupting or closing the tab reaches all of
   them, and the tab counts as busy until every one of them is idle. A subagent's own text is not shown.

@@ -7,6 +7,9 @@ export type OutboundMessage =
   | { type: "ready"; request_id: string }
   | { type: "send_message"; request_id: string; tab: TabId; text: string }
   | { type: "interrupt"; request_id: string; tab: TabId }
+  /** The confirmed `<leader>k`: stop what the tab's agent left running, which ends its session. `running` is
+   *  the count the question named; Rust stops nothing when the tab's count is another by then. */
+  | { type: "stop_background"; request_id: string; tab: TabId; running: number }
   /** `decision` is a closed set, not a boolean: Rust rejects an unrecognized value at parse time
    *  rather than defaulting it, and the tempting default would be the one that runs the tool.
    *  `reason` is only ever sent with a denial -- there is no field downstream that would show the

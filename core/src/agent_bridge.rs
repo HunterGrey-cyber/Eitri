@@ -117,6 +117,15 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
     },
+    /// The confirmed `<leader>k`: stop the commands the tab's agent left running after its turns
+    /// ended, by stopping its session. `running` is the count the question showed: an answer to a
+    /// question about another count stops nothing (`TabSet::stop_background`).
+    StopBackground {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        running: u32,
+    },
     /// The WebView reporting how long it took to draw the first assistant text of a turn, measured
     /// from its own receipt of the payload to the animation frame that rendered it.
     ///
@@ -546,6 +555,7 @@ impl InboundMessage {
             InboundMessage::TrustAnswer { tab, .. } | InboundMessage::TrustCancel { tab, .. } => Some(*tab),
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
+            | InboundMessage::StopBackground { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
             | InboundMessage::HandoffToTerminal { tab, .. }
             | InboundMessage::PermissionResponse { tab, .. }
@@ -610,6 +620,7 @@ impl InboundMessage {
             InboundMessage::Ready { request_id }
             | InboundMessage::SendMessage { request_id, .. }
             | InboundMessage::Interrupt { request_id, .. }
+            | InboundMessage::StopBackground { request_id, .. }
             | InboundMessage::TurnRendered { request_id, .. }
             | InboundMessage::HandoffToTerminal { request_id, .. }
             | InboundMessage::PermissionResponse { request_id, .. }
@@ -1682,6 +1693,9 @@ pub fn serialize_snapshot_with_notes_for_js(
         "usage": projection.usage,
         // The account's usage limit as the agent last reported it, `null` before any report. Account-wide,
         // but the snapshot is the only way a reloaded panel learns it before the next report.
+        // How many commands the agent left running after its turns ended (0 when none, and for every
+        // agent that keeps no such count): the band's count and what `<leader>k` would stop.
+        "backgroundCalls": projection.background_calls,
         "accountLimits": projection.account_limits.as_ref().map(|limits| json!({
             "usedPercent": limits.used_percent,
             "windowMinutes": limits.window_minutes,
@@ -3002,6 +3016,7 @@ mod tests {
             late: false,
             overlapped_next: false,
             overlapped_tab: false,
+            left_running: false,
             skipped_large: Vec::new(),
             left_out: Default::default(),
             earlier_run: false,
@@ -4202,6 +4217,39 @@ mod tests {
     /// The account's usage limit rides the snapshot like the usage figure does, so a tab switch or a
     /// panel reload shows it without waiting for the agent's next report. An explicit `null` until one
     /// arrived; camelCase inside, unlike `usage`, because the panel folds it from a hand-shaped object.
+    /// How many commands the agent left running rides the snapshot, so a tab switch or a reload shows
+    /// the band's count; `0` when there are none.
+    #[test]
+    fn the_background_count_reaches_the_ui_snapshot() {
+        let count_in_snapshot = |projection: &AgentSessionProjection| -> Value {
+            let view = SnapshotView {
+                backend: "external",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities {
+                    resume: false,
+                    fork: false,
+                    interrupt: true,
+                    bypass_permission_mode: true,
+                    interactive_permission_mode: true,
+                    cli_auto_mode: false,
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            parsed["state"]["backgroundCalls"].clone()
+        };
+        let mut projection = AgentSessionProjection::default();
+        assert_eq!(count_in_snapshot(&projection), json!(0));
+        projection.apply(&AgentDomainEvent::BackgroundCalls { running: 2 });
+        assert_eq!(count_in_snapshot(&projection), json!(2));
+        projection.apply(&AgentDomainEvent::BackgroundCalls { running: 0 });
+        assert_eq!(count_in_snapshot(&projection), json!(0));
+    }
+
     #[test]
     fn account_limits_reach_the_ui_snapshot() {
         let limits_in_snapshot = |projection: &AgentSessionProjection| -> Value {
@@ -5262,6 +5310,21 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(permission.tab_ref(), TabRef::Named(TabId(1))));
+    }
+
+    /// The confirmed stop of a tab's background names its tab and the count its question showed; one
+    /// that names no tab is refused like every other tab command, and one without the count does not
+    /// parse, so no answer is taken for a question whose count is unknown.
+    #[test]
+    fn a_stop_of_the_background_names_its_tab_and_the_count_it_was_asked_about() {
+        let named =
+            parse_inbound_message(r#"{"type":"stop_background","request_id":"s1","tab":4,"running":2}"#).unwrap();
+        assert!(matches!(named.tab_ref(), TabRef::Named(TabId(4))));
+        assert_eq!(named.request_id(), "s1");
+        assert!(matches!(named, InboundMessage::StopBackground { running: 2, .. }));
+        let missing = parse_inbound_message(r#"{"type":"stop_background","request_id":"s2","running":1}"#).unwrap();
+        assert!(matches!(missing.tab_ref(), TabRef::Missing));
+        assert!(parse_inbound_message(r#"{"type":"stop_background","request_id":"s3","tab":4}"#).is_none());
     }
 
     #[test]

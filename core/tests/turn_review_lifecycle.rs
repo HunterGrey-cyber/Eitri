@@ -645,6 +645,125 @@ fn an_earlier_runs_turn_keeps_its_marks_and_its_left_out_files() {
     );
 }
 
+fn background(running: u32) -> AgentDomainEvent {
+    AgentDomainEvent::BackgroundCalls { running }
+}
+
+const NOTE_LEFT_RUNNING: &str =
+    "a command was still running when this turn ended; later changes are not in this review";
+
+/// A turn that ends while the agent still has a command running in the background says so, since
+/// what that command writes later is in no review; the mark survives a restart. The count is the
+/// tab's own, and a turn that ends with nothing left running is not marked.
+#[test]
+fn a_turn_that_left_a_command_running_says_so_and_keeps_saying_it() {
+    let scratch = Scratch::new("left-running");
+    let jobs = Jobs::default();
+    {
+        let mut run1 = scratch.review(&jobs);
+        run1.observe(1, "s1", &started("t1"), now());
+        // The provider counts what the turn left before it reports the turn's end.
+        run1.observe(1, "s1", &background(1), now());
+        run1.observe(1, "s1", &completed("t1"), now());
+        run1.observe(1, "s1", &background(0), now());
+        run1.observe(1, "s1", &started("t2"), now());
+        run1.observe(1, "s1", &completed("t2"), now());
+        // Another tab's background command says nothing about this tab's turns.
+        run1.observe(2, "s2", &started("b1"), now());
+        run1.observe(2, "s2", &background(2), now());
+        run1.observe(2, "s2", &completed("b1"), now());
+        poll_until(&mut run1, "s1", "both turns", |t| is_ok(t, "t1") && is_ok(t, "t2"));
+        poll_until(&mut run1, "s2", "the other tab's turn", |t| is_ok(t, "b1"));
+        let seen = run1.turns("s1");
+        assert!(turn(&seen, "t1").left_running, "{seen:#?}");
+        assert!(!turn(&seen, "t2").left_running, "{seen:#?}");
+        assert!(turn(&run1.turns("s2"), "b1").left_running);
+
+        let notes = |review: &TurnReview, n: u32| {
+            review
+                .overview_job("s1", TurnRef::N(n), Scope::Turn, NamedPaths::default())
+                .run()
+                .unwrap()
+                .notes
+        };
+        assert!(
+            notes(&run1, 1).contains(&NOTE_LEFT_RUNNING.to_string()),
+            "{:?}",
+            notes(&run1, 1)
+        );
+        assert!(
+            !notes(&run1, 2).contains(&NOTE_LEFT_RUNNING.to_string()),
+            "{:?}",
+            notes(&run1, 2)
+        );
+
+        run1.close_tab(1, now());
+        run1.close_tab(2, now());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !run1.turns("s1").is_empty() || !run1.turns("s2").is_empty() {
+            assert!(Instant::now() < deadline, "the worker never finished");
+            run1.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let run2 = scratch.review(&jobs);
+    let job = run2.overview_job("s1", TurnRef::N(1), Scope::Turn, NamedPaths::default());
+    let overview = std::thread::spawn(move || job.run()).join().unwrap().unwrap();
+    let flags: Vec<(u32, bool, bool)> = overview
+        .turns
+        .iter()
+        .map(|t| (t.n, t.earlier_run, t.left_running))
+        .collect();
+    assert_eq!(flags, vec![(1, true, true), (2, true, false)]);
+    assert!(
+        overview.notes.contains(&NOTE_LEFT_RUNNING.to_string()),
+        "{:?}",
+        overview.notes
+    );
+    let job = run2.overview_job("s1", TurnRef::Latest, Scope::Session, NamedPaths::default());
+    let session = std::thread::spawn(move || job.run()).join().unwrap().unwrap();
+    assert!(
+        session.notes.contains(&format!("turn 1: {NOTE_LEFT_RUNNING}")),
+        "{:?}",
+        session.notes
+    );
+}
+
+/// The count is kept while it stays above zero: every turn that ends meanwhile is marked. A session
+/// that ends takes its count with it, so a turn of the next session is not marked, and a resync
+/// that swallowed a turn's end marks it from the count it was given.
+#[test]
+fn a_count_above_zero_marks_every_turn_until_it_drops() {
+    let scratch = Scratch::new("left-running-more");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    review.observe(1, "s1", &started("t1"), now());
+    review.observe(1, "s1", &background(1), now());
+    review.observe(1, "s1", &completed("t1"), now());
+    review.observe(1, "s1", &started("t2"), now());
+    review.observe(1, "s1", &completed("t2"), now());
+    review.observe(1, "s1", &started("t3"), now());
+    review.observe_resync(1, "s1", None, now());
+    poll_until(&mut review, "s1", "three turns", |t| {
+        is_ok(t, "t1") && is_ok(t, "t2") && is_ok(t, "t3")
+    });
+    let turns = review.turns("s1");
+    assert!(turns.iter().all(|t| t.left_running), "{turns:#?}");
+
+    review.observe(
+        1,
+        "s1",
+        &AgentDomainEvent::SessionUnavailable { reason: "gone".into() },
+        now(),
+    );
+    review.observe(1, "", &opened("s9"), now());
+    review.observe(1, "s9", &started("n1"), now());
+    review.observe(1, "s9", &completed("n1"), now());
+    poll_until(&mut review, "s9", "the new session's turn", |t| is_ok(t, "n1"));
+    assert!(!turn(&review.turns("s9"), "n1").left_running);
+}
+
 #[test]
 fn turns_never_runs_git() {
     let scratch = Scratch::new("no-git");
@@ -1319,4 +1438,21 @@ fn a_named_too_large_file_that_did_not_change_keeps_its_size_flag() {
         .map(|f| (f.path.display().to_string(), f.too_large, f.origin))
         .collect();
     assert_eq!(listed, vec![("huge.txt".to_string(), true, Origin::AgentOnly)]);
+}
+
+/// A resync that ends a turn whose end was among the dropped events hands review the count the turn ended
+/// with before the count of now: the command may have finished in between, and the turn still left it
+/// running.
+#[test]
+fn a_resync_marks_a_turn_by_the_count_it_ended_with() {
+    let scratch = Scratch::new("left-running-resync");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    review.observe(1, "s1", &started("t1"), now());
+    // What the tab hands review on a resync: the count at the latest turn's end, the resync, the count now.
+    review.observe(1, "s1", &background(1), now());
+    review.observe_resync(1, "s1", None, now());
+    review.observe(1, "s1", &background(0), now());
+    poll_until(&mut review, "s1", "the turn", |t| is_ok(t, "t1"));
+    assert!(turn(&review.turns("s1"), "t1").left_running);
 }

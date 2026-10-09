@@ -369,6 +369,37 @@ fn started_session(project_only: &[&str], rest: Vec<Value>) -> CodexProvider {
     provider
 }
 
+/// A tripwire Codex sent before the user's turn is read before the turn is sent: the turn is refused, not
+/// sent under a policy that already failed.
+#[test]
+fn a_turn_after_an_unread_tripwire_is_refused() {
+    let provider = started_session(
+        &[],
+        vec![write(json!({"method": "hook/started", "params": {
+            "threadId": "th-t", "turnId": "tu-0",
+            "run": {"id": "h", "source": "project", "sourcePath": "/work/proj/.codex/hooks.json"},
+        }}))],
+    );
+    // The notification is in, not yet pumped.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let sent = provider.send_turn_with(
+        SendTurnRequest {
+            session_id: "th-t".into(),
+            text: "go".into(),
+        },
+        TurnPolicy {
+            reviewer: Reviewer::User,
+        },
+    );
+    match sent {
+        Err(ProviderError::Provider { code, .. }) => assert_eq!(code, ProviderErrorCode::ProviderUnavailable),
+        other => panic!("the turn was not refused: {other:?} after {:?}", started.elapsed()),
+    }
+    let events = pump_until(&provider, |events| mismatch_in(events).is_some());
+    assert!(mismatch_in(&events).is_some());
+}
+
 #[test]
 fn project_only_mcp_startup_trips_on_any_family_thread() {
     // The tab's own thread, and one the family does not hold: both are Codex starting a server only the
@@ -749,6 +780,111 @@ fn resume_of_a_thread_held_elsewhere_is_rejected_with_codex_message() {
         },
     );
     assert!(refused.is_err());
+}
+
+/// A resume whose answer names another thread did not continue the conversation asked for: nothing of the
+/// other thread is read or shown, the verdict says so, and no turn goes to it.
+#[test]
+fn a_resume_that_continues_another_thread_is_not_taken() {
+    let mut script = handshake();
+    script.push(expect_request(3, "thread/resume"));
+    script.push(thread_answer(3, "th-other", json!({})));
+    let provider = connect(script);
+    let started = std::time::Instant::now();
+    let id = provider
+        .start(request(Some("th-old"), &[]))
+        .expect("a verdict, not a failure to start");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the other thread's history was asked for"
+    );
+    assert_eq!(id, "th-old");
+    let events = provider.pump();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::ResumeOutcome {
+                status: agent::ResumeStatus::Attached,
+                requested_provider_session_id,
+                attached_provider_session_id: Some(attached),
+                ..
+            } if requested_provider_session_id == "th-old" && attached == "th-other"
+        )),
+        "{events:#?}"
+    );
+    assert!(provider.take_history().is_empty());
+    let refused = provider.send_turn_with(
+        SendTurnRequest {
+            session_id: "th-old".into(),
+            text: "go".into(),
+        },
+        TurnPolicy {
+            reviewer: Reviewer::User,
+        },
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(ProviderError::Provider {
+                code: ProviderErrorCode::ProviderUnavailable,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+}
+
+/// A tripwire behind more messages than one batch reads still stops the next turn: the send reads on until
+/// nothing Codex already said is left.
+#[test]
+fn a_tripwire_behind_a_flood_still_stops_the_next_turn() {
+    const FLOOD: usize = 5000;
+    let mut script = handshake();
+    script.push(expect_request(3, "thread/resume"));
+    script.push(thread_answer(3, "th-old", json!({})));
+    script.push(expect_request(4, "thread/turns/list"));
+    for n in 0..FLOOD {
+        script.push(write(
+            json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": n as f64 / 100.0, "windowDurationMins": 300, "resetsAt": 1_790_000_000},
+                "planType": "pro",
+            }}}),
+        ));
+    }
+    script.push(write(json!({"method": "hook/started", "params": {
+        "threadId": "th-old", "turnId": "tu-0",
+        "run": {"id": "h", "source": "project", "sourcePath": "/work/proj/.codex/hooks.json"},
+    }})));
+    script.push(turns_page(4, vec![turn_meta("tu-1", "completed")], None));
+    let file = std::env::temp_dir().join(format!("codex-flood-trip-script-{}.json", std::process::id()));
+    std::fs::write(&file, Value::Array(script).to_string()).expect("the script file");
+    let provider = CodexProvider::connect_with_args(launch(), vec![OsString::from(format!("@{}", file.display()))])
+        .expect("the handshake passes");
+    provider
+        .start(request(Some("th-old"), &[]))
+        .expect("the resume completes");
+    let _ = std::fs::remove_file(&file);
+    std::thread::sleep(Duration::from_millis(300));
+    let sent = provider.send_turn_with(
+        SendTurnRequest {
+            session_id: "th-old".into(),
+            text: "go".into(),
+        },
+        TurnPolicy {
+            reviewer: Reviewer::User,
+        },
+    );
+    assert!(
+        matches!(
+            sent,
+            Err(ProviderError::Provider {
+                code: ProviderErrorCode::ProviderUnavailable,
+                ..
+            })
+        ),
+        "{sent:?}"
+    );
 }
 
 /// Codex says more while the history is read than can be held for after it: the history stops with a note

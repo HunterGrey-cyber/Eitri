@@ -27,11 +27,12 @@ pub mod nofollow;
 mod plan;
 mod store;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub use codex::{
     codex_fallback_names, codex_findings, hooks_json_findings, read_user_codex_config, rule_calls, scan_rules,
-    RuleScan, UserCodexConfig,
+    RuleScan, ServerDefinition, UserCodexConfig,
 };
 pub use discover::discover;
 pub use findings::{mcp_findings, settings_findings};
@@ -140,9 +141,14 @@ pub struct ProfileEnv {
     /// The alternate names of `AGENTS.md` from the user's Codex configuration
     /// ([`codex_fallback_names`]).
     pub fallback_names: Vec<String>,
-    /// The MCP servers the user's own Codex configuration starts ([`UserCodexConfig::mcp_servers`]);
-    /// `None` when that is not known.
-    pub user_mcp_servers: Option<Vec<String>>,
+    /// The MCP servers the user's own Codex configuration starts, with their definitions
+    /// ([`UserCodexConfig::mcp_servers`]); `None` when that is not known.
+    pub user_mcp_servers: Option<BTreeMap<String, ServerDefinition>>,
+    /// The user's Codex `config.toml` and why it could not be read, when it is there and could not be
+    /// ([`UserCodexConfig::unreadable`]): the alternate names of `AGENTS.md` it may give are unknown,
+    /// so a discovery cannot have hashed every file a session would load, and no answer about it
+    /// outlives one start.
+    pub user_config_unreadable: Option<(PathBuf, String)>,
 }
 
 /// The sha256 of a discovery's whole configuration.
@@ -181,7 +187,11 @@ pub struct Discovery {
     pub over_budget: Option<String>,
     /// [`ProfileEnv::user_mcp_servers`] as it was read for this discovery. Not part of the
     /// fingerprint: it is the user's own configuration, not the project's.
-    pub user_mcp_servers: Option<Vec<String>>,
+    pub user_mcp_servers: Option<BTreeMap<String, ServerDefinition>>,
+    /// Each MCP server a project `.codex/config.toml` on the walk defines, by name with its
+    /// definition (a name defined in two walked directories is here twice). Not part of the
+    /// fingerprint, which already holds the files it is read from. Empty for every other profile.
+    pub project_mcp_servers: Vec<(String, ServerDefinition)>,
 }
 
 impl Discovery {

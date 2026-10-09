@@ -854,6 +854,19 @@ impl AgentConversation {
         self.external.as_ref().and_then(|e| e.context_gauge())
     }
 
+    /// Stops what the agent left running in the background by stopping its session
+    /// (`ExternalProvider::stop_background`). Only an external provider can.
+    pub fn stop_background(&self, shown: u32) -> Result<(), ConversationError> {
+        let Some(external) = self.external.as_ref() else {
+            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
+                "stop_background",
+            )));
+        };
+        let session_id = self.require_session()?;
+        external.stop_background(&session_id, shown)?;
+        Ok(())
+    }
+
     pub fn provider_info(&self) -> &ProviderInfo {
         &self.info
     }

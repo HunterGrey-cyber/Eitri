@@ -1292,6 +1292,7 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::PermissionDenied { .. } => "PermissionDenied",
         AgentDomainEvent::PolicyMismatch { .. } => "PolicyMismatch",
         AgentDomainEvent::AccountLimits { .. } => "AccountLimits",
+        AgentDomainEvent::BackgroundCalls { .. } => "BackgroundCalls",
         AgentDomainEvent::ToolInputChanged { .. } => "ToolInputChanged",
     }
 }

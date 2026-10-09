@@ -8,9 +8,9 @@
 //!   sandbox field is marked legacy in Codex's own schema, so a Codex that drops it must not pass for
 //!   one that merely agrees.
 //! - **Project configuration in an untrusted session.** An instruction file from a project directory, a
-//!   tool server only the project's configuration names, and a hook from the project layer all mean Codex
-//!   read something the user was never asked about. None of them has a signal before it happens, so these
-//!   are looked for in what Codex says it loaded and started.
+//!   tool server the project's configuration defines (alone, or otherwise than the user's own), and a hook
+//!   from the project layer all mean Codex read something the user was never asked about. None of them
+//!   has a signal before it happens, so these are looked for in what Codex says it loaded and started.
 //!
 //! Everything here is a pure function of what Codex said, so each rule has a test that needs no process.
 
@@ -165,7 +165,7 @@ pub const USER_HOOK_LAYER: &str = "user";
 /// own configuration provides.
 #[derive(Debug, Clone, Default)]
 pub struct TrustWatch {
-    /// Names of tool servers found only in project configuration.
+    /// Names of tool servers the project's configuration defines, alone or otherwise than the user's.
     project_only: HashSet<String>,
     /// Whether hooks are checked at all. A trusted session lets the project's run.
     hooks_gated: bool,
@@ -195,7 +195,7 @@ impl TrustWatch {
     pub fn mcp_started(&self, name: &str) -> Result<(), PolicyMismatch> {
         if self.project_only.contains(name) {
             return Err(PolicyMismatch::project_loaded(format!(
-                "its tool server {name:?} started, and only the project's configuration names it"
+                "its tool server {name:?} started, and the project's configuration defines it (alone, or otherwise than your own configuration does)"
             )));
         }
         Ok(())

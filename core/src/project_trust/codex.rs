@@ -4,10 +4,12 @@
 //! `.codex/rules/`. As for Claude's files, nothing is filtered by how dangerous it looks.
 //!
 //! Also the two keys Eitri reads from the user's own Codex configuration: the alternate names of
-//! `AGENTS.md`, which discovery must fingerprint in every walked directory, and the names of the
-//! user's MCP servers, which an untrusted session may start without loading the project's.
+//! `AGENTS.md`, which discovery must fingerprint in every walked directory (as it must those a
+//! project's own configuration names), and the user's MCP servers, which an untrusted session may
+//! start without loading the project's.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
@@ -39,6 +41,62 @@ const OVERRIDDEN_FEATURES: [&str; 2] = ["exec_permission_approvals", "request_pe
 /// The calls of an exec-policy file that let something run: each is shown as written.
 const RULE_CALLS: [&str; 3] = ["prefix_rule", "network_rule", "host_executable"];
 
+/// One MCP server's definition (its `[mcp_servers.<name>]` table) as parsed values, in a canonical
+/// text: keys sorted, every value tagged with its type, so two definitions are equal exactly when
+/// their parsed tables are. A float is compared by its bits, so `0.0` and `-0.0` differ and a NaN
+/// equals the same NaN.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServerDefinition(String);
+
+impl ServerDefinition {
+    pub fn of(value: &toml::Value) -> ServerDefinition {
+        let mut out = String::new();
+        canonical(value, &mut out);
+        ServerDefinition(out)
+    }
+}
+
+fn canonical(value: &toml::Value, out: &mut String) {
+    let quoted = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    match value {
+        toml::Value::String(s) => {
+            out.push('s');
+            out.push_str(&quoted(s));
+        }
+        toml::Value::Integer(i) => out.push_str(&format!("i{i}")),
+        toml::Value::Float(f) => out.push_str(&format!("f{:016x}", f.to_bits())),
+        toml::Value::Boolean(b) => out.push_str(if *b { "b1" } else { "b0" }),
+        toml::Value::Datetime(d) => {
+            out.push('d');
+            out.push_str(&quoted(&d.to_string()));
+        }
+        toml::Value::Array(items) => {
+            out.push('[');
+            for (n, item) in items.iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                canonical(item, out);
+            }
+            out.push(']');
+        }
+        toml::Value::Table(table) => {
+            let mut keys: Vec<&String> = table.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (n, key) in keys.into_iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                out.push_str(&quoted(key));
+                out.push(':');
+                canonical(&table[key], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
 /// What Eitri reads from the user's own Codex `config.toml`, and nothing else from it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserCodexConfig {
@@ -46,63 +104,118 @@ pub struct UserCodexConfig {
     /// order, once each.
     pub fallback_names: Vec<String>,
     /// The MCP servers the file defines and does not switch off (`[mcp_servers.<name>]` without
-    /// `enabled = false`), sorted. Codex starts these in every session, so a startup report of one of
-    /// these names says nothing about the project's configuration. `None` when the file is there but
-    /// could not be read as TOML (a link, a FIFO, over 4 MiB, not UTF-8, bad TOML, `mcp_servers` not
-    /// a table): which servers the user has is then unknown. A file that is not there defines none.
-    pub mcp_servers: Option<Vec<String>>,
+    /// `enabled = false`), by name, with each one's definition. Codex starts these in every session,
+    /// so a startup report of one of them says nothing about the project's configuration, unless the
+    /// project defines that name otherwise. `None` when the file is there but could not be read as
+    /// TOML (a link, a FIFO, over 4 MiB, not UTF-8, bad TOML, `mcp_servers` not a table): which
+    /// servers the user has is then unknown. A file that is not there defines none.
+    pub mcp_servers: Option<BTreeMap<String, ServerDefinition>>,
+    /// The file, and why it could not be read as TOML, when it is there and could not be: the
+    /// alternate names it may give are then unknown, and so are the files a session would load
+    /// under them. `None` when it was read, or is not there.
+    pub unreadable: Option<(PathBuf, String)>,
+}
+
+impl UserCodexConfig {
+    /// The names of [`mcp_servers`](Self::mcp_servers), sorted; `None` when they are not known.
+    pub fn mcp_server_names(&self) -> Option<Vec<String>> {
+        self.mcp_servers
+            .as_ref()
+            .map(|servers| servers.keys().cloned().collect())
+    }
+}
+
+/// The alternate names of `AGENTS.md` a configuration table gives: the string items of its
+/// `project_doc_fallback_filenames`, in order, once each.
+fn fallback_names_in(table: &toml::Table) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(toml::Value::Array(items)) = table.get(FALLBACK_NAMES_KEY) {
+        for item in items {
+            if let toml::Value::String(name) = item {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The alternate names of `AGENTS.md` a project's `.codex/config.toml` gives. A trusted session loads
+/// that file, and Codex then reads instructions under these names as it does under the user's. A file
+/// that is not UTF-8 TOML gives none here (it is reported as unparsed).
+pub(super) fn project_fallback_names(bytes: &[u8]) -> Vec<String> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .map(|table| fallback_names_in(&table))
+        .unwrap_or_default()
+}
+
+/// The MCP servers a project's `.codex/config.toml` defines, by name with each one's definition, in
+/// the file's order. A file that is not UTF-8 TOML defines none here (it is reported as unparsed).
+pub(super) fn project_server_definitions(bytes: &[u8]) -> Vec<(String, ServerDefinition)> {
+    let Some(table) = std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+    else {
+        return Vec::new();
+    };
+    match table.get(MCP_SERVERS_KEY) {
+        Some(toml::Value::Table(servers)) => servers
+            .iter()
+            .map(|(name, server)| (name.clone(), ServerDefinition::of(server)))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Reads the user's Codex `config.toml` at `file`: without following a link, at most 4 MiB, parsed
 /// as TOML, and only the keys of [`UserCodexConfig`] kept. Nothing else from the file is kept or
 /// logged. A caller that wants a link the user made to be followed resolves `file` itself first.
 pub fn read_user_codex_config(file: &Path) -> UserCodexConfig {
-    let unknown = UserCodexConfig {
+    // Only why, never what the file holds: none of it is shown or logged.
+    let unknown = |why: String| UserCodexConfig {
         fallback_names: Vec::new(),
         mcp_servers: None,
+        unreadable: Some((file.to_path_buf(), why)),
     };
     let bytes = match read_regular_nofollow(file, MAX_USER_CONFIG_BYTES, Owner::Anyone) {
         Ok(bytes) => bytes,
         Err(Refusal::Missing) => {
             return UserCodexConfig {
                 fallback_names: Vec::new(),
-                mcp_servers: Some(Vec::new()),
+                mcp_servers: Some(BTreeMap::new()),
+                unreadable: None,
             }
         }
-        Err(_) => return unknown,
+        Err(refusal) => return unknown(refusal.describe()),
     };
     let Ok(text) = std::str::from_utf8(&bytes) else {
-        return unknown;
+        return unknown("not UTF-8".to_string());
     };
     let Ok(mut table) = text.parse::<toml::Table>() else {
-        return unknown;
+        return unknown("not TOML this check can read".to_string());
     };
-    let mut fallback_names: Vec<String> = Vec::new();
-    if let Some(toml::Value::Array(items)) = table.remove(FALLBACK_NAMES_KEY) {
-        for item in items {
-            if let toml::Value::String(name) = item {
-                if !fallback_names.contains(&name) {
-                    fallback_names.push(name);
-                }
-            }
-        }
-    }
+    let fallback_names = fallback_names_in(&table);
     let mcp_servers = match table.remove(MCP_SERVERS_KEY) {
-        None => Some(Vec::new()),
-        Some(toml::Value::Table(servers)) => {
-            let mut names: Vec<String> = servers
+        None => Some(BTreeMap::new()),
+        Some(toml::Value::Table(servers)) => Some(
+            servers
                 .into_iter()
                 .filter(|(_, server)| server.get("enabled") != Some(&toml::Value::Boolean(false)))
-                .map(|(name, _)| name)
-                .collect();
-            names.sort();
-            Some(names)
-        }
+                .map(|(name, server)| {
+                    let definition = ServerDefinition::of(&server);
+                    (name, definition)
+                })
+                .collect(),
+        ),
         Some(_) => None,
     };
     UserCodexConfig {
         fallback_names,
         mcp_servers,
+        unreadable: None,
     }
 }
 

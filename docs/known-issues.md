@@ -137,8 +137,10 @@ adapter; they have not been tried on every setup.
   configuration (`CODEX_HOME`, or `~/.codex`) always loads, and Eitri cannot turn it off.
 - **Subagents cannot be turned off.** A Codex subagent inherits the tab's sandbox and trust answer; its own text is
   not shown.
-- **A command the model leaves running in the background past its call outlives a turn that ends normally.** An
-  interrupt after that stops the whole Codex session, and closing the tab stops it too.
+- **A command the model leaves running in the background past its call outlives a turn that ends normally.** The
+  turn is not held for it: the band says how many are running, that turn's review says later changes are not in
+  it, and `<leader>k` stops them by stopping the Codex session (after a `y/n`; the conversation can be resumed).
+  An interrupt after that, or closing the tab, stops them too.
 - **A hook of yours can answer first.** A `PermissionRequest` hook in your own Codex configuration may answer a
   request before Eitri sees it. Not measured: a hook rewriting a command after approval, how each MCP approval
   mode behaves, a plugin from a marketplace listing loading in a trusted project, resuming a thread that a live

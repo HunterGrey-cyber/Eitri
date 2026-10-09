@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bandLayout, cardSummary, textWidth, usageSegment, type BandFacts } from "./band";
+import { backgroundSegment, bandLayout, cardSummary, textWidth, usageSegment, type BandFacts } from "./band";
 import type { TokenUsage } from "./types";
 
 const running: BandFacts = { mode: "input", pill: "⏵⏵ auto", showcmd: null, message: null, prompt: null, warn: null,
@@ -336,5 +336,23 @@ describe("turn ending", () => {
     expect(narrow).not.toContain("model");
     expect(narrow).not.toContain("cards");
     expect(ids(900, { ...facts, prompt: "close? (y/n)" })).toEqual(["mode", "prompt"]);
+  });
+});
+
+describe("the commands an agent left running", () => {
+  it("are counted on the band only while there are any, in the singular for one", () => {
+    expect(backgroundSegment(1)).toBe("1 running in background");
+    expect(backgroundSegment(3)).toBe("3 running in background");
+    const seg = (background: number | null | undefined) => bandLayout({ ...idle, background }, 900, 7.2).find((s) => s.id === "background");
+    expect(seg(2)).toEqual({ id: "background", text: "2 running in background", side: "left" });
+    expect(seg(1)!.text).toBe("1 running in background");
+    expect(seg(0)).toBeUndefined();
+    expect(seg(null)).toBeUndefined();
+    expect(seg(undefined)).toBeUndefined();
+  });
+  it("is never drawn over a prompt, and outlasts the figures when the band narrows", () => {
+    expect(bandLayout({ ...idle, background: 2, prompt: "close 1? (y/n)" }, 900, 7.2).map((s) => s.id)).not.toContain("background");
+    expect(ids(400, { ...running, background: 2 })).toContain("background");
+    expect(ids(400, { ...running, background: 2 })).not.toContain("model");
   });
 });

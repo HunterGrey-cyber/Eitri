@@ -201,6 +201,10 @@ pub struct ExternalRecordingProvider {
     policies: std::sync::Mutex<Vec<agent::TurnPolicy>>,
     /// While set, `close_session` waits for one message (or the sender's drop) before it closes.
     close_gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// How many `stop_background` calls it took.
+    stops: std::sync::Mutex<u32>,
+    /// While set, the next `stop_background` is refused with this code.
+    stop_refusal: std::sync::Mutex<Option<agent::ProviderErrorCode>>,
 }
 
 impl ExternalRecordingProvider {
@@ -219,7 +223,20 @@ impl ExternalRecordingProvider {
             starts: std::sync::Mutex::new(Vec::new()),
             policies: std::sync::Mutex::new(Vec::new()),
             close_gate: std::sync::Mutex::new(None),
+            stops: std::sync::Mutex::new(0),
+            stop_refusal: std::sync::Mutex::new(None),
         }
+    }
+
+    /// How many stops of the background it took.
+    pub fn stops(&self) -> u32 {
+        *self.stops.lock().unwrap()
+    }
+
+    /// Refuses the next `stop_background` with `code`, as Codex does when a turn started or the
+    /// commands ended meanwhile.
+    pub fn refuse_next_stop(&self, code: agent::ProviderErrorCode) {
+        *self.stop_refusal.lock().unwrap() = Some(code);
     }
 
     /// Every start it was handed, in order.
@@ -307,6 +324,22 @@ impl agent::ExternalProvider for ExternalRecordingProvider {
     ) -> Result<String, agent::ProviderError> {
         self.policies.lock().unwrap().push(policy);
         agent::AgentProvider::send_turn(&self.inner, request)
+    }
+    /// What Codex does once the stop is taken: the count drops, and the session ends once its child is
+    /// gone.
+    fn stop_background(&self, _session_id: &str, _shown: u32) -> Result<(), agent::ProviderError> {
+        if let Some(code) = self.stop_refusal.lock().unwrap().take() {
+            return Err(agent::ProviderError::Provider {
+                code,
+                message: "refused by the scripted provider".into(),
+            });
+        }
+        *self.stops.lock().unwrap() += 1;
+        self.inner.queue(AgentDomainEvent::BackgroundCalls { running: 0 });
+        self.inner.queue(AgentDomainEvent::SessionUnavailable {
+            reason: agent::providers::codex::provider::STOPPED_BACKGROUND.to_string(),
+        });
+        Ok(())
     }
 }
 

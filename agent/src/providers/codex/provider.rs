@@ -20,9 +20,9 @@
 
 use super::approvals::{self, AnswerForm, CardAnswer, Handling, HeldItems};
 use super::config::{expected_echo, session_config};
-use super::family::{Family, FamilyEdge, UNREAD_TURN};
+use super::family::{Family, FamilyEdge, Full, MEMBERS_MAX, UNREAD_TURN};
 use super::resume;
-use super::self_check::{ensure_checked, SelfCheckError};
+use super::self_check::{ensure_checked, BinaryKey, SelfCheckError};
 use super::translate::{self, parse_user_agent_version, version_text, SIGNED_OUT};
 use super::tripwire::{self, PolicyMismatch, TrustWatch};
 use super::wire::{
@@ -68,6 +68,8 @@ const TURN_START_TIMEOUT: Duration = UNARY_RPC_TIMEOUT;
 const UNSUBSCRIBE_WAIT: Duration = Duration::from_secs(3);
 /// Notifications and requests read per pump, so one call cannot run away with a flood.
 const PUMP_BATCH: usize = 4096;
+/// Batches a send reads before its turn goes out; past them the send is refused for now.
+const SEND_DRAIN_BATCHES: usize = 8;
 /// Unknown method names remembered so each is logged once.
 const UNKNOWN_METHODS_KEPT: usize = 64;
 /// Turns of threads not (yet) in the family remembered at most, for a child announced after its turn began.
@@ -119,8 +121,12 @@ struct ActiveTurn {
     id: Option<String>,
     /// The user asked to interrupt before the turn had an id.
     interrupt_wanted: bool,
-    /// The turns of the family that have been sent their one `turn/interrupt`.
+    /// The turns of the family that have been sent their one `turn/interrupt`, or whose waiting card was
+    /// answered `cancel`, which ends a turn by itself.
     interrupted: HashSet<String>,
+    /// The turns in `interrupted` only because a card of theirs was cancelled. Should one still run when the
+    /// user presses interrupt again, `cancel` did not end it, and it is sent a `turn/interrupt` after all.
+    cancelled: HashSet<String>,
     /// The user pressed interrupt after the tab's own turn had ended, so only subagents were left to stop.
     interrupt_asked: bool,
     /// The user pressed interrupt: a family turn learnt about later is sent its interrupt too.
@@ -145,6 +151,7 @@ impl ActiveTurn {
             id,
             interrupt_wanted: false,
             interrupted: HashSet::new(),
+            cancelled: HashSet::new(),
             interrupt_asked: false,
             interrupting: false,
             own_end: None,
@@ -220,14 +227,20 @@ pub fn stopped_after_interrupt(kept_doing: &str) -> String {
     )
 }
 
-/// The session being stopped because something kept running after an interrupt.
+/// What the tab says when the user stopped the calls Codex left running in the background.
+pub const STOPPED_BACKGROUND: &str =
+    "What Codex left running in the background was stopped with its session. The conversation can be resumed.";
+
+/// The session being stopped: something kept running after an interrupt, or the user stopped what was left
+/// running in the background.
 struct Stopping {
     /// Set once the child and everything it started are gone.
     done: Arc<AtomicBool>,
     /// The thread doing it, which a close waits for: a window that went before the group was killed would
     /// leave the command running.
     worker: Option<std::thread::JoinHandle<()>>,
-    kept_doing: &'static str,
+    /// What the session's end says.
+    reason: String,
 }
 
 /// Sets its flag when dropped, so a stop that panics, or a thread that could not start, still ends the turn.
@@ -274,6 +287,9 @@ struct State {
     turn: Option<ActiveTurn>,
     /// Bytes already emitted for each streaming item of the running turn.
     items: HashMap<String, usize>,
+    /// The text already emitted for each assistant message of the running turn, so its final text can be
+    /// told to extend it or not.
+    message_text: HashMap<String, String>,
     /// Rows of the running turn's tool calls that have started and not completed, by row id
     /// (`translate::row_id`).
     open_tools: HashSet<String>,
@@ -314,6 +330,16 @@ struct State {
     running_unread: bool,
     /// Something kept running after an interrupt and the child is being stopped for it.
     stopping: Option<Stopping>,
+    /// The calls of `running` that were still running when the tab's turn last ended: put in the background
+    /// by the agent. A running turn's own calls join them only when it ends.
+    background: HashSet<(String, String)>,
+    /// `running_unread` was set when a turn ended: something unreadable may be running in the background.
+    background_unread: bool,
+    /// The count last sent as `BackgroundCalls`.
+    background_reported: u32,
+    /// A `turn/start` got no answer in time and the user was told the turn did not start. Should Codex
+    /// start it after all, it is interrupted at once.
+    start_abandoned: bool,
     /// Closed by the host.
     closed: bool,
     /// The child ended on its own, or was stopped.
@@ -394,19 +420,25 @@ fn effective_codex_home(reported: Option<&str>) -> PathBuf {
 /// The `CODEX_HOME` a child started with `env` and `env_remove` sees: what `env` sets wins, a removed one is
 /// gone, and otherwise it is Eitri's own.
 fn child_codex_home(env: &[(OsString, OsString)], env_remove: &[OsString]) -> Option<OsString> {
-    if let Some((_, value)) = env.iter().rev().find(|(name, _)| name == "CODEX_HOME") {
+    child_var("CODEX_HOME", env, env_remove)
+}
+
+/// The value of `name` a child started with `env` and `env_remove` sees.
+fn child_var(name: &str, env: &[(OsString, OsString)], env_remove: &[OsString]) -> Option<OsString> {
+    if let Some((_, value)) = env.iter().rev().find(|(n, _)| n == name) {
         return Some(value.clone());
     }
-    if env_remove.iter().any(|name| name == "CODEX_HOME") {
+    if env_remove.iter().any(|n| n == name) {
         return None;
     }
-    std::env::var_os("CODEX_HOME")
+    std::env::var_os(name)
 }
 
 /// Refuses a relative `CODEX_HOME`. Codex resolves it against its working directory, which is the project
 /// root, so a directory the project itself holds would be read as the user's own configuration: its MCP
 /// servers, hooks, rules and skills would load whatever the user said about trusting the project. No
-/// child is started under it. An empty value is Codex's own "unset" and an absolute one is the user's.
+/// child is started under it. An empty value is Codex's own "unset"; an absolute one is judged by
+/// [`refuse_home_in_project`].
 fn refuse_relative_home(value: Option<&OsStr>) -> Result<(), ProviderError> {
     let Some(value) = value.filter(|v| !v.is_empty() && !Path::new(v).is_absolute()) else {
         return Ok(());
@@ -423,10 +455,120 @@ fn refuse_relative_home(value: Option<&OsStr>) -> Result<(), ProviderError> {
 }
 
 /// Refuses a Codex start under a relative `CODEX_HOME` in Eitri's own environment, the one every Codex child
-/// inherits. A tab's connect worker asks before it looks for the binary, since probing its version runs a
-/// child too; [`CodexProvider::connect`] asks again.
+/// inherits. Part of [`refuse_codex_home`], which the connect worker asks before it looks for the binary,
+/// since probing its version runs a child too.
 pub fn refuse_relative_codex_home() -> Result<(), ProviderError> {
     refuse_relative_home(child_codex_home(&[], &[]).as_deref())
+}
+
+/// Refuses a Codex start whose `CODEX_HOME`, as Eitri's own environment gives it to every Codex child, is
+/// relative ([`refuse_relative_codex_home`]) or lies in the project `root` (see [`refuse_home_in_project`]).
+/// A tab's connect worker asks before it looks for the binary; [`CodexProvider::connect`] asks again.
+pub fn refuse_codex_home(root: &Path) -> Result<(), ProviderError> {
+    refuse_relative_codex_home()?;
+    refuse_home_in_project(
+        child_codex_home(&[], &[]).as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        root,
+    )
+}
+
+/// Refuses an absolute `CODEX_HOME` (or, when it is unset or empty, `~/.codex`) that is the project root or
+/// lies in it. Codex reads that directory as the user's own configuration layer whatever the user said about
+/// trusting the project, and trust discovery leaves the effective `CODEX_HOME` out, so a `.codex/` the
+/// project ships there would load unasked.
+///
+/// A root that is the user's home or holds it is not a boundary: what lies in the user's own home is not
+/// something a project ships. "In the project" is judged on the path as written and on the path with its
+/// links resolved, and either is enough: a link in the project that leads elsewhere is the project's to
+/// change, so it never makes a home count as outside.
+fn refuse_home_in_project(value: Option<&OsStr>, user_home: Option<&OsStr>, root: &Path) -> Result<(), ProviderError> {
+    let user_home = user_home.map(Path::new).filter(|h| h.is_absolute());
+    let (home, named) = match value.filter(|v| !v.is_empty()) {
+        // A relative one is refused on its own; it is not judged here.
+        Some(v) if !Path::new(v).is_absolute() => return Ok(()),
+        Some(v) => (PathBuf::from(v), None),
+        None => match user_home {
+            Some(h) => (h.join(".codex"), Some("~/.codex")),
+            None => return Ok(()),
+        },
+    };
+    let roots = path_forms(root);
+    if let Some(user_home) = user_home {
+        let homes = path_forms(user_home);
+        if homes.iter().any(|h| roots.iter().any(|r| h.starts_with(r))) {
+            return Ok(());
+        }
+    }
+    let homes = path_forms(&home);
+    let inside = |h: &PathBuf| roots.iter().any(|r| h.starts_with(r));
+    if !homes.iter().any(inside) {
+        return Ok(());
+    }
+    // Only its links lead it into the project: a CODEX_HOME naming the same place would be refused too.
+    let by_link = !homes.first().is_some_and(inside);
+    let shown_home = home.to_string_lossy();
+    let shown_home = shown_home.escape_debug();
+    let shown_root = root.to_string_lossy();
+    let shown_root = shown_root.escape_debug();
+    let what = match named {
+        Some(default) => format!("CODEX_HOME is unset, so Codex reads {default} ({shown_home}), which"),
+        None => format!("CODEX_HOME ({shown_home})"),
+    };
+    let (place, advice) = if by_link {
+        (
+            "links into the project",
+            "set CODEX_HOME to a directory whose real path is outside the project",
+        )
+    } else {
+        (
+            "is inside the project",
+            "set CODEX_HOME to a directory outside the project",
+        )
+    };
+    Err(provider_error(
+        ProviderErrorCode::InvalidConfiguration,
+        format!(
+            "{what} {place} {shown_root}: Codex would read files the project holds as your configuration; \
+             {advice}"
+        ),
+    ))
+}
+
+/// A path as written with `.` and `..` taken out by name, and the same path with every link of its longest
+/// existing ancestor resolved and the rest put back.
+fn path_forms(path: &Path) -> Vec<PathBuf> {
+    let mut lexical = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            other => lexical.push(other),
+        }
+    }
+    let mut forms = vec![lexical];
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(existing) {
+            let mut resolved = resolved;
+            for part in rest.iter().rev() {
+                resolved.push(part);
+            }
+            forms.push(resolved);
+            break;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => break,
+        }
+    }
+    forms
 }
 
 fn to_json<T: Serialize>(params: &T) -> Result<Value, ProviderError> {
@@ -450,9 +592,9 @@ impl CodexProvider {
     /// seconds once; while it has not passed, no Codex start is allowed.
     pub fn connect(launch: CodexLaunch) -> Result<CodexProvider, ProviderError> {
         // Before the self-check too: nothing is started under a home the project could supply.
-        refuse_relative_codex_home()?;
-        match ensure_checked(&launch.program, &launch.state_home) {
-            Ok(()) => {}
+        refuse_codex_home(&launch.cwd)?;
+        let checked = match ensure_checked(&launch.program, &launch.state_home) {
+            Ok(key) => key,
             Err(SelfCheckError::NotFound) => {
                 return Err(provider_error(ProviderErrorCode::ProviderUnavailable, NOT_FOUND));
             }
@@ -460,12 +602,23 @@ impl CodexProvider {
                 return Err(provider_error(ProviderErrorCode::UnsupportedCliVersion, e.to_string()));
             }
             Err(e) => return Err(provider_error(ProviderErrorCode::ProviderUnavailable, e.to_string())),
-        }
+        };
         let args = ["app-server", "--listen", "stdio://"]
             .iter()
             .map(OsString::from)
             .collect();
-        Self::connect_with_args(launch, args)
+        Self::connect_child(launch, args, Vec::new(), Vec::new(), Some(&checked))
+    }
+
+    /// [`connect`](Self::connect) with the self-check's answer given and the child's arguments given: the
+    /// tests start a scripted stand-in and say which version the check passed.
+    #[doc(hidden)]
+    pub fn connect_checked_with_args(
+        launch: CodexLaunch,
+        args: Vec<OsString>,
+        checked: &BinaryKey,
+    ) -> Result<CodexProvider, ProviderError> {
+        Self::connect_child(launch, args, Vec::new(), Vec::new(), Some(checked))
     }
 
     /// [`connect`](Self::connect) with the child's arguments given: the tests start a scripted stand-in.
@@ -483,7 +636,25 @@ impl CodexProvider {
         env: Vec<(OsString, OsString)>,
         env_remove: Vec<OsString>,
     ) -> Result<CodexProvider, ProviderError> {
-        refuse_relative_home(child_codex_home(&env, &env_remove).as_deref())?;
+        Self::connect_child(launch, args, env, env_remove, None)
+    }
+
+    /// Starts the child and runs the handshake. `checked` is the binary the self-check passed, whose version
+    /// the child must report; only the tests' own doors start a child with none.
+    fn connect_child(
+        launch: CodexLaunch,
+        args: Vec<OsString>,
+        env: Vec<(OsString, OsString)>,
+        env_remove: Vec<OsString>,
+        checked: Option<&BinaryKey>,
+    ) -> Result<CodexProvider, ProviderError> {
+        let child_home = child_codex_home(&env, &env_remove);
+        refuse_relative_home(child_home.as_deref())?;
+        refuse_home_in_project(
+            child_home.as_deref(),
+            child_var("HOME", &env, &env_remove).as_deref(),
+            &launch.cwd,
+        )?;
         let link = JsonRpcLink::spawn(LinkSpec {
             program: launch.program.clone(),
             args,
@@ -496,7 +667,7 @@ impl CodexProvider {
             std::io::ErrorKind::NotFound => provider_error(ProviderErrorCode::ProviderUnavailable, NOT_FOUND),
             _ => ProviderError::Transport(format!("Codex could not be started: {e}")),
         })?;
-        let (version, codex_home) = Self::handshake(&link)?;
+        let (version, codex_home) = Self::handshake(&link, checked)?;
         let pid = link.pid();
         Ok(CodexProvider {
             link: Mutex::new(Some(link)),
@@ -508,7 +679,7 @@ impl CodexProvider {
         })
     }
 
-    fn handshake(link: &JsonRpcLink) -> Result<((u32, u32, u32), PathBuf), ProviderError> {
+    fn handshake(link: &JsonRpcLink, checked: Option<&BinaryKey>) -> Result<((u32, u32, u32), PathBuf), ProviderError> {
         let params = to_json(&InitializeParams::eitri(env!("CARGO_PKG_VERSION")))?;
         let answer = link
             .request(method::INITIALIZE, params)
@@ -521,6 +692,14 @@ impl CodexProvider {
                 "Codex did not report a version Eitri can read, so it cannot be checked",
             ));
         };
+        // The binary is found again for the tab's own child; one replaced after the check passed (an
+        // upgrade under way) would run unchecked.
+        if checked.is_some_and(|key| !key.is_version(version)) {
+            return Err(provider_error(
+                ProviderErrorCode::ProviderUnavailable,
+                "Codex changed while Eitri was checking it; start the tab again",
+            ));
+        }
         if version < MIN_CODEX {
             return Err(provider_error(
                 ProviderErrorCode::UnsupportedCliVersion,
@@ -627,6 +806,23 @@ impl CodexProvider {
         }
     }
 
+    /// Sends one family turn its `turn/interrupt`, unless it had one. The tab's turn goes on for the rest of
+    /// the family and ends with the outcome Codex reports for its own.
+    fn interrupt_one(&self, st: &mut State, thread_id: &str, turn_id: &str) {
+        if let Some(turn) = st.turn.as_mut() {
+            if !turn.interrupted.insert(turn_id.to_string()) {
+                return;
+            }
+        }
+        let params = TurnInterruptParams {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+        };
+        if let (Ok(params), Some(link)) = (to_json(&params), lock(&self.link).as_ref()) {
+            drop(link.request(method::TURN_INTERRUPT, params));
+        }
+    }
+
     /// Interrupts every running turn of the family. A card that waits is answered first: a command or
     /// file-change card with `cancel`, which ends that thread's turn by itself, so that turn is not sent an
     /// interrupt; a tool card with a decline, after which its turn still needs one.
@@ -639,6 +835,13 @@ impl CodexProvider {
             turn.interrupt_asked = true;
         }
         if let Some(turn) = st.turn.as_mut() {
+            if turn.interrupting {
+                // Pressed again: a turn that a cancelled card was to end and that still runs gets its
+                // interrupt now.
+                for ended in std::mem::take(&mut turn.cancelled) {
+                    turn.interrupted.remove(&ended);
+                }
+            }
             turn.interrupting = true;
             turn.settle_until
                 .get_or_insert_with(|| Instant::now() + INTERRUPT_SETTLE);
@@ -651,7 +854,9 @@ impl CodexProvider {
                     .and_then(|f| f.running_on(&card.thread_id))
                     .map(str::to_string);
                 if let (Some(turn), Some(ended)) = (st.turn.as_mut(), ended) {
-                    turn.interrupted.insert(ended);
+                    if turn.interrupted.insert(ended.clone()) {
+                        turn.cancelled.insert(ended);
+                    }
                 }
             }
             self.respond(card.request_id.clone(), card.form.reply(CardAnswer::Interrupt));
@@ -931,9 +1136,19 @@ impl CodexProvider {
         end_added_row(st, card, PermissionOutcome::CancelledByInterrupt);
     }
 
-    /// Every card still waiting goes, with `outcome`: what it asked about can no longer happen.
-    fn drop_cards(st: &mut State, outcome: PermissionOutcome) {
+    /// Every card still waiting goes, with `outcome`: what it asked about can no longer happen. Codex is
+    /// told no for each while it still runs: a request left unanswered would hold its thread's turn open
+    /// for good.
+    fn drop_cards(&self, st: &mut State, outcome: PermissionOutcome) {
+        self.drop_cards_with(st, outcome, CardAnswer::Deny);
+    }
+
+    /// [`drop_cards`](Self::drop_cards), telling Codex `answer` for each card.
+    fn drop_cards_with(&self, st: &mut State, outcome: PermissionOutcome, answer: CardAnswer) {
         for (permission_id, card) in std::mem::take(&mut st.cards) {
+            if !st.dead {
+                self.respond(card.request_id.clone(), card.form.reply(answer));
+            }
             st.events
                 .push_back(AgentDomainEvent::PermissionResolved { permission_id, outcome });
             end_added_row(st, card, outcome);
@@ -944,7 +1159,7 @@ impl CodexProvider {
 
     /// Reads what the link has, folding it into events. Holds the incoming messages back while a
     /// `turn/start` answer is awaited.
-    fn drain(&self, st: &mut State) {
+    fn drain(&self, st: &mut State) -> bool {
         let mut handled = 0;
         while handled < PUMP_BATCH {
             let awaiting_turn_id = st.turn.as_ref().is_some_and(|t| t.id.is_none());
@@ -958,16 +1173,17 @@ impl CodexProvider {
                         st.held.push_back(message);
                     }
                 }
-                return;
+                return true;
             }
             let next = match st.held.pop_front() {
                 Some(message) => Some(message),
                 None => lock(&self.link).as_ref().and_then(JsonRpcLink::try_recv),
             };
-            let Some(message) = next else { return };
+            let Some(message) = next else { return true };
             handled += 1;
             self.fold(st, message);
         }
+        false
     }
 
     fn fold(&self, st: &mut State, message: Incoming) {
@@ -987,7 +1203,7 @@ impl CodexProvider {
         }
         st.dead = true;
         // Nothing can answer what waited any more.
-        Self::drop_cards(st, PermissionOutcome::ProviderFailed);
+        self.drop_cards(st, PermissionOutcome::ProviderFailed);
         // The end of the output stream can be read a moment before the last of stderr; give it a short
         // chance so the notice says why the child went.
         let mut tail = String::new();
@@ -1040,9 +1256,26 @@ impl CodexProvider {
                         (Some(thread), Some(id)) => note_running(st, thread, id, Running::Unread),
                         _ => st.running_unread = true,
                     }
+                    match &thread_id {
+                        Some(thread) => st.calls.mark_missed(thread),
+                        None => st.calls.mark_missed_anywhere(),
+                    }
                 } else if name == method::ITEM_COMPLETED {
                     if let (Some(thread), Some(id)) = (&thread_id, &item_id) {
                         st.running.remove(&(thread.clone(), id.clone()));
+                        // The call is over even though its end could not be read; its row says so rather
+                        // than reading as running until the turn ends.
+                        let row = row_of(st, thread, id);
+                        if let (Some(turn_id), true) = (Self::tab_turn_id(st), st.open_tools.remove(&row)) {
+                            st.events.push_back(AgentDomainEvent::ToolCallCompleted {
+                                turn_id,
+                                tool_use_id: row,
+                                content: Value::String(
+                                    "ended; its result was larger than 16 MiB and is not shown".to_string(),
+                                ),
+                                is_error: false,
+                            });
+                        }
                     }
                 }
                 // What is held may no longer be what Codex will do; a request naming it is declined.
@@ -1139,8 +1372,13 @@ impl CodexProvider {
                 } else if name == method::TURN_STARTED {
                     self.unreadable_turn_start(st, thread_id.as_deref());
                 } else if name == method::ITEM_STARTED {
-                    // A call whose start cannot be read may be a command that is running now.
+                    // A call whose start cannot be read may be a command that is running now, or the tool
+                    // call a later approval is for.
                     st.running_unread = true;
+                    match thread_id.as_deref() {
+                        Some(thread) => st.calls.mark_missed(thread),
+                        None => st.calls.mark_missed_anywhere(),
+                    }
                 }
             }
         }
@@ -1182,7 +1420,7 @@ impl CodexProvider {
             // A child may start its turn before the message that makes it a member is read; it is kept
             // under the stand-in like a readable early start, so the thread is followed once it joins.
             note_foreign(st, thread_id);
-            remember_early_turn(st, thread_id, UNREAD_TURN.to_string());
+            self.remember_early_turn(st, thread_id, UNREAD_TURN.to_string());
             return;
         }
         let edge = match st.family.as_mut() {
@@ -1245,7 +1483,7 @@ impl CodexProvider {
     fn on_turn_started(&self, st: &mut State, n: TurnNotification) {
         if !in_family(st, &n.thread_id) {
             note_foreign(st, &n.thread_id);
-            remember_early_turn(st, &n.thread_id, n.turn.id);
+            self.remember_early_turn(st, &n.thread_id, n.turn.id);
             return;
         }
         self.join_family_turn(st, &n.thread_id, n.turn.id);
@@ -1258,6 +1496,10 @@ impl CodexProvider {
             Some(family) => family.turn_started(thread, &turn),
             None => return,
         };
+        // The tab's own turn after a `turn/start` that timed out is the one the user was told did not start,
+        // whether it opens the tab's turn or joins one a subagent opened first.
+        let abandoned = is_tab(st, thread) && std::mem::take(&mut st.start_abandoned);
+        let started = turn.clone();
         if edge == FamilyEdge::Opened && st.turn.is_none() {
             st.turn = Some(ActiveTurn::new(Some(turn.clone())));
             st.events.push_back(AgentDomainEvent::TurnStarted { turn_id: turn });
@@ -1268,10 +1510,19 @@ impl CodexProvider {
             }
             self.send_interrupts(st);
         }
+        // Only that turn is stopped: a subagent's turn that runs beside it was not part of the send.
+        if abandoned {
+            eprintln!("agent: Codex started a turn whose start had timed out; it is interrupted");
+            self.interrupt_one(st, thread, &started);
+        }
     }
 
-    /// A thread that just joined the family may already be running a turn; it is followed from now on.
+    /// A thread that just joined the family may already be running a turn; it is followed from now on. What
+    /// it started before is not held, so a tool approval on it must name its tool to be matched.
     fn joined(&self, st: &mut State, thread: &str) {
+        if st.early_turns.contains_key(thread) {
+            st.calls.mark_missed(thread);
+        }
         match st.early_turns.remove(thread) {
             // Its start could not be read: followed under the stand-in until a message names the turn.
             Some(turn) if turn == UNREAD_TURN => self.unreadable_turn_start(st, Some(thread)),
@@ -1286,25 +1537,58 @@ impl CodexProvider {
     /// tool set; it is still the call's row (returns false).
     fn announced(&self, st: &mut State, thread_id: &str, item: &ThreadItem) -> bool {
         match item {
+            // A child announced without a thread id could never be followed, like one that does not read.
+            ThreadItem::SubAgentActivity(activity)
+                if activity.kind == SubAgentKind::Started
+                    && activity.agent_thread_id.is_empty()
+                    && in_family(st, thread_id) =>
+            {
+                let mismatch = PolicyMismatch {
+                    requested: "every subagent announced with its thread".to_string(),
+                    reported: "Codex announced a subagent with no thread id".to_string(),
+                };
+                self.trip(st, mismatch);
+                true
+            }
             ThreadItem::SubAgentActivity(activity) => {
-                let member = st.family.as_mut().is_some_and(|f| f.announce(thread_id, activity));
-                if member {
-                    self.joined(st, &activity.agent_thread_id);
-                } else if activity.kind == SubAgentKind::Started {
-                    note_foreign(st, thread_id);
+                match st.family.as_mut().map(|f| f.announce(thread_id, activity)) {
+                    Some(Ok(true)) => self.joined(st, &activity.agent_thread_id),
+                    Some(Err(Full)) => self.trip(st, family_full()),
+                    _ if activity.kind == SubAgentKind::Started => note_foreign(st, thread_id),
+                    _ => {}
                 }
                 true
             }
             ThreadItem::CollabAgentToolCall(call) => {
-                let joined = st
+                let joined = match st
                     .family
                     .as_mut()
                     .map(|f| f.announce_receivers(thread_id, &call.receiver_thread_ids))
-                    .unwrap_or_default();
+                {
+                    Some(Ok(joined)) => joined,
+                    Some(Err(Full)) => {
+                        self.trip(st, family_full());
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                };
                 for thread in joined {
                     self.joined(st, &thread);
                 }
                 false
+            }
+            // An announcement that does not read may name a child, which would then never be followed:
+            // its turn could write files while the tab reads as idle. The session is failed instead.
+            ThreadItem::Malformed { item_type, .. }
+                if (item_type == "subAgentActivity" || item_type == "collabAgentToolCall")
+                    && in_family(st, thread_id) =>
+            {
+                let mismatch = PolicyMismatch {
+                    requested: "every subagent announced in a form Eitri can read".to_string(),
+                    reported: format!("Codex sent a {item_type} item Eitri could not read"),
+                };
+                self.trip(st, mismatch);
+                item_type == "subAgentActivity"
             }
             _ => false,
         }
@@ -1345,6 +1629,7 @@ impl CodexProvider {
                     });
                 }
                 st.items.insert(m.id.clone(), emitted);
+                st.message_text.insert(m.id.clone(), m.text.clone());
             }
             ThreadItem::Reasoning(r) => {
                 st.items.insert(r.id.clone(), 0);
@@ -1390,18 +1675,32 @@ impl CodexProvider {
             ThreadItem::AgentMessage(_) | ThreadItem::Reasoning(_) if !from_tab => {}
             ThreadItem::AgentMessage(m) => {
                 let emitted = st.items.remove(&m.id);
+                let shown = st.message_text.remove(&m.id).unwrap_or_default();
                 if emitted.is_none() {
                     st.events.push_back(AgentDomainEvent::AssistantMessageBoundary {
                         turn_id: turn_id.clone(),
                     });
                 }
-                let already = emitted.unwrap_or(0);
-                // What streamed is a prefix of the final text; only the rest is new.
-                if m.text.len() > already && m.text.is_char_boundary(already) {
+                if m.text.starts_with(shown.as_str()) {
+                    // What streamed is a prefix of the final text; only the rest is new.
+                    if m.text.len() > shown.len() {
+                        st.events.push_back(AgentDomainEvent::ContentDelta {
+                            turn_id,
+                            kind: ContentKind::Text,
+                            text: m.text[shown.len()..].to_string(),
+                        });
+                    }
+                } else if !m.text.is_empty() {
+                    // The final text is not what streamed with more after it. What was shown stays as Codex
+                    // sent it, and the final text follows whole as a message of its own, rather than the end
+                    // of one version spliced onto the start of the other.
+                    st.events.push_back(AgentDomainEvent::AssistantMessageBoundary {
+                        turn_id: turn_id.clone(),
+                    });
                     st.events.push_back(AgentDomainEvent::ContentDelta {
                         turn_id,
                         kind: ContentKind::Text,
-                        text: m.text[already..].to_string(),
+                        text: m.text.clone(),
                     });
                 }
                 if !m.text.is_empty() {
@@ -1460,7 +1759,10 @@ impl CodexProvider {
         if !is_tab(st, &delta.thread_id) {
             return;
         }
-        *st.items.entry(delta.item_id).or_insert(0) += delta.delta.len();
+        *st.items.entry(delta.item_id.clone()).or_insert(0) += delta.delta.len();
+        if kind == ContentKind::Text {
+            st.message_text.entry(delta.item_id).or_default().push_str(&delta.delta);
+        }
         st.events.push_back(AgentDomainEvent::ContentDelta {
             turn_id,
             kind,
@@ -1542,13 +1844,24 @@ impl CodexProvider {
         let Some(turn_id) = turn.id else { return };
         let usage = turn.usage.as_ref().map(|u| translate::usage_of(u, st.model.as_deref()));
         st.items.clear();
+        st.message_text.clear();
         st.open_tools.clear();
         st.answered_rows.clear();
         st.calls.clear();
         if let Some(family) = st.family.as_mut() {
             family.reset_turns();
         }
-        Self::drop_cards(st, PermissionOutcome::CancelledByInterrupt);
+        self.drop_cards(st, PermissionOutcome::CancelledByInterrupt);
+        // What is still running now outlives the turn: a command the model put in the background.
+        let left: Vec<(String, String)> = st
+            .running
+            .iter()
+            .filter(|(_, kind)| kind.kept_doing().is_some())
+            .map(|(key, _)| key.clone())
+            .collect();
+        st.background.extend(left);
+        st.background_unread |= st.running_unread;
+        report_background(st);
         st.events.push_back(AgentDomainEvent::TurnCompleted {
             turn_id,
             outcome,
@@ -1569,9 +1882,9 @@ impl CodexProvider {
     fn settle(&self, st: &mut State) {
         if let Some(stopping) = st.stopping.as_ref() {
             if stopping.done.load(Ordering::Acquire) {
-                let kept_doing = stopping.kept_doing;
+                let reason = std::mem::take(&mut st.stopping.as_mut().expect("checked above").reason);
                 st.stopping = None;
-                self.finish_stop(st, kept_doing);
+                self.finish_stop(st, reason);
             }
             return;
         }
@@ -1605,7 +1918,10 @@ impl CodexProvider {
             .chain(st.running.values().copied())
             .find_map(|kind| kind.kept_doing());
         match worst {
-            Some(kept_doing) => self.stop_session(st, kept_doing),
+            Some(kept_doing) => {
+                eprintln!("agent: Codex {kept_doing} after the interrupt; its session is stopped");
+                self.stop_session(st, stopped_after_interrupt(kept_doing));
+            }
             None => self.end_family_turn(st),
         }
     }
@@ -1613,10 +1929,9 @@ impl CodexProvider {
     /// Stops the child, and with it everything it runs: stdin is closed, then its process group is killed.
     /// That waits, so it happens on a thread of its own; the pump learns from `Stopping::done` that it is
     /// over. Nothing is sent to Codex from here on.
-    fn stop_session(&self, st: &mut State, kept_doing: &'static str) {
-        eprintln!("agent: Codex {kept_doing} after the interrupt; its session is stopped");
+    fn stop_session(&self, st: &mut State, reason: String) {
         st.dead = true;
-        Self::drop_cards(st, PermissionOutcome::CancelledByInterrupt);
+        self.drop_cards(st, PermissionOutcome::CancelledByInterrupt);
         let done = Arc::new(AtomicBool::new(false));
         let mut worker = None;
         if let Some(link) = lock(&self.link).take() {
@@ -1633,15 +1948,11 @@ impl CodexProvider {
         } else {
             done.store(true, Ordering::Release);
         }
-        st.stopping = Some(Stopping {
-            done,
-            worker,
-            kept_doing,
-        });
+        st.stopping = Some(Stopping { done, worker, reason });
     }
 
     /// The child is gone: the rows still open end, the turn ends interrupted, and the session is over.
-    fn finish_stop(&self, st: &mut State, kept_doing: &'static str) {
+    fn finish_stop(&self, st: &mut State, reason: String) {
         if let Some(turn_id) = Self::tab_turn_id(st) {
             let mut rows: Vec<String> = st.open_tools.drain().collect();
             rows.sort();
@@ -1657,9 +1968,8 @@ impl CodexProvider {
         st.running.clear();
         st.running_unread = false;
         self.end_family_turn(st);
-        st.events.push_back(AgentDomainEvent::SessionUnavailable {
-            reason: stopped_after_interrupt(kept_doing),
-        });
+        report_background(st);
+        st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
     }
 
     /// A call that the interrupted turn left running ended while the tab's turn waited for it: its row, if
@@ -1683,6 +1993,25 @@ impl CodexProvider {
                 is_error,
             });
         }
+    }
+}
+
+/// Sends `BackgroundCalls` when the number of calls left running after a turn changed. A session that is
+/// over has none: its child and everything it started are gone.
+fn report_background(st: &mut State) {
+    let running = &st.running;
+    st.background.retain(|key| running.contains_key(key));
+    if st.dead || st.closed {
+        st.background.clear();
+        st.background_unread = false;
+    }
+    let count = u32::try_from(st.background.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(u32::from(st.background_unread));
+    if count != st.background_reported {
+        st.background_reported = count;
+        st.events
+            .push_back(AgentDomainEvent::BackgroundCalls { running: count });
     }
 }
 
@@ -1733,12 +2062,14 @@ fn in_family(st: &State, thread_id: &str) -> bool {
 }
 
 /// `input` of a call made on a subagent's thread, naming the subagent so its rows and cards say whose they
-/// are. The tab's own calls are left as they are.
+/// are. The key is Eitri's alone: one the item carried itself is dropped, so the tab's own call never
+/// reads as a subagent's.
 fn labelled(st: &State, thread_id: &str, mut input: Value) -> Value {
-    if let (Some(label), Some(object)) = (
-        st.family.as_ref().and_then(|f| f.label(thread_id)),
-        input.as_object_mut(),
-    ) {
+    let Some(object) = input.as_object_mut() else {
+        return input;
+    };
+    object.remove("subagent");
+    if let Some(label) = st.family.as_ref().and_then(|f| f.label(thread_id)) {
         object.insert("subagent".to_string(), Value::String(label.to_string()));
     }
     input
@@ -1781,11 +2112,12 @@ fn note_foreign(st: &mut State, thread_id: &str) {
     }
 }
 
-/// Remembers `turn` as the running turn of `thread`, not (yet) in the family, so a child announced after
-/// its turn began is followed from that turn. At most `EARLY_TURNS_KEPT` threads are kept.
-fn remember_early_turn(st: &mut State, thread: &str, turn: String) {
-    if st.early_turns.len() < EARLY_TURNS_KEPT || st.early_turns.contains_key(thread) {
-        st.early_turns.insert(thread.to_string(), turn);
+/// The session follows only so many subagents. One it would have to leave out could write files while the
+/// tab reads as idle and the turn's review is taken, so the session is failed instead.
+fn family_full() -> PolicyMismatch {
+    PolicyMismatch {
+        requested: format!("at most {MEMBERS_MAX} subagents followed in one tab"),
+        reported: "Codex started more subagents than Eitri can follow".to_string(),
     }
 }
 
@@ -1917,7 +2249,7 @@ impl AgentProvider for CodexProvider {
                 // A running turn is interrupted first, so Codex has not left a command running.
                 self.interrupt_running(&mut st);
             }
-            Self::drop_cards(&mut st, PermissionOutcome::CancelledBySessionClose);
+            self.drop_cards(&mut st, PermissionOutcome::CancelledBySessionClose);
             st.closed = true;
             st.events.push_back(AgentDomainEvent::SessionClosed {
                 reason: "closed_by_host".to_string(),
@@ -1952,11 +2284,29 @@ impl AgentProvider for CodexProvider {
             self.drain(&mut st);
         }
         self.settle(&mut st);
+        report_background(&mut st);
         st.events.drain(..).collect()
     }
 }
 
 impl CodexProvider {
+    /// Remembers `turn` as the running turn of `thread`, not (yet) in the family, so a child announced after
+    /// its turn began is followed from that turn. Past `EARLY_TURNS_KEPT` threads the session is failed: a
+    /// turn not kept would leave its child unfollowed once it is announced.
+    fn remember_early_turn(&self, st: &mut State, thread: &str, turn: String) {
+        if st.early_turns.len() < EARLY_TURNS_KEPT || st.early_turns.contains_key(thread) {
+            st.early_turns.insert(thread.to_string(), turn);
+            return;
+        }
+        self.trip(
+            st,
+            PolicyMismatch {
+                requested: format!("at most {EARLY_TURNS_KEPT} subagent turns kept before their announcement"),
+                reported: "Codex started more turns on threads it had not announced".to_string(),
+            },
+        );
+    }
+
     /// Fails the session: Codex did something other than what Eitri asked for. The host fails the tab on the
     /// event and answers nothing on its own afterwards; here every card is declined and no turn starts.
     fn trip(&self, st: &mut State, mismatch: PolicyMismatch) {
@@ -1965,7 +2315,9 @@ impl CodexProvider {
         }
         eprintln!("agent: {mismatch}");
         st.blocked = Some("Codex is not running under the policy Eitri asked for");
-        Self::drop_cards(st, PermissionOutcome::ProviderFailed);
+        // Cancelled, not declined: a cancel ends the asking thread's turn at once, where a decline would let
+        // it go on with what needs no request until the host shuts the session down.
+        self.drop_cards_with(st, PermissionOutcome::ProviderFailed, CardAnswer::Interrupt);
         st.events.push_back(mismatch.into_event());
     }
 
@@ -2000,11 +2352,29 @@ impl CodexProvider {
             // Codex refuses a thread another client holds open, among other things. Its own words are
             // what the user needs, shown as the verdict on the resume.
             Err(LinkError::Rpc { message, .. }) if resume.is_some() => {
-                return Ok(self.resume_refused(&req, resume.unwrap_or_default(), message));
+                eprintln!("agent: Codex refused to resume a session: {message}");
+                return Ok(self.resume_not_continued(
+                    &req,
+                    resume.unwrap_or_default(),
+                    ResumeStatus::Rejected,
+                    None,
+                    Some(message),
+                ));
             }
             Err(e) => return Err(self.failure(e, verb)),
         };
         let started: ThreadStartResponse = from_json(answer, verb)?;
+        if let Some(requested) = resume.filter(|requested| *requested != started.thread.id) {
+            // Another conversation than the one asked for: none of it is shown, and no turn goes to it.
+            eprintln!("agent: Codex resumed another conversation than the one asked for");
+            return Ok(self.resume_not_continued(
+                &req,
+                requested,
+                ResumeStatus::Attached,
+                Some(started.thread.id),
+                None,
+            ));
+        }
 
         let thread_id = started.thread.id.clone();
         let model = started.model.clone().unwrap_or_default();
@@ -2048,9 +2418,17 @@ impl CodexProvider {
         Ok(thread_id)
     }
 
-    /// The resume Codex refused, as events: the session opens so there is something to say the verdict on.
-    fn resume_refused(&self, req: &ExternalStart, requested: &str, message: String) -> String {
-        eprintln!("agent: Codex refused to resume a session: {message}");
+    /// A resume that did not continue the conversation asked for (Codex refused it, or continued another),
+    /// as events: the session opens under the requested id so there is something to say the verdict on, and
+    /// what Codex says about any other thread is not the tab's.
+    fn resume_not_continued(
+        &self,
+        req: &ExternalStart,
+        requested: &str,
+        status: ResumeStatus,
+        attached: Option<String>,
+        detail: Option<String>,
+    ) -> String {
         let mut st = lock(&self.state);
         st.history_loading = false;
         st.blocked = Some("Codex would not resume this conversation");
@@ -2064,10 +2442,10 @@ impl CodexProvider {
         });
         st.events.push_back(AgentDomainEvent::ResumeOutcome {
             requested_provider_session_id: requested.to_string(),
-            status: ResumeStatus::Rejected,
-            attached_provider_session_id: None,
+            status,
+            attached_provider_session_id: attached,
             forked: false,
-            detail: Some(message),
+            detail,
         });
         requested.to_string()
     }
@@ -2148,9 +2526,66 @@ impl ExternalProvider for CodexProvider {
         std::mem::take(&mut lock(&self.state).history)
     }
 
+    /// Stops the session for what its turns left running, as an interrupt does for what a turn keeps
+    /// running: stdin's end, then the process group. Only between turns.
+    fn stop_background(&self, session_id: &str, shown: u32) -> Result<(), ProviderError> {
+        let mut st = lock(&self.state);
+        if st.thread_id.as_deref() != Some(session_id) {
+            return Err(provider_error(
+                ProviderErrorCode::SessionNotFound,
+                "no such Codex session",
+            ));
+        }
+        Self::require_open(&st)?;
+        if st.turn.is_some() {
+            return Err(provider_error(
+                ProviderErrorCode::TurnAlreadyActive,
+                "a turn is running: interrupt it, which also stops what is left running",
+            ));
+        }
+        report_background(&mut st);
+        if st.background_reported == 0 {
+            return Err(provider_error(
+                ProviderErrorCode::NoActiveTurn,
+                "nothing is running in the background",
+            ));
+        }
+        // The user said yes to a number the panel had; one that moved since is asked about again.
+        if st.background_reported != shown {
+            return Err(provider_error(
+                ProviderErrorCode::NoActiveTurn,
+                format!(
+                    "{} running in the background now, not {shown}: nothing was stopped; ask again",
+                    st.background_reported
+                ),
+            ));
+        }
+        eprintln!("agent: the user stopped what Codex left running in the background; its session is stopped");
+        self.stop_session(&mut st, STOPPED_BACKGROUND.to_string());
+        Ok(())
+    }
+
     fn send_turn_with(&self, req: SendTurnRequest, policy: TurnPolicy) -> Result<String, ProviderError> {
-        let thread_id = {
+        let (thread_id, pending) = {
             let mut st = lock(&self.state);
+            let busy = || provider_error(ProviderErrorCode::TurnAlreadyActive, "a turn is already running");
+            Self::require_open(&st)?;
+            if st.turn.is_some() {
+                return Err(busy());
+            }
+            // What Codex already said is read first: a tripwire it holds must stop this turn, not the next.
+            // Should it say more than a few batches hold, the turn waits rather than go out past an unread
+            // message.
+            let mut read_all = false;
+            for _ in 0..SEND_DRAIN_BATCHES {
+                if self.drain(&mut st) {
+                    read_all = true;
+                    break;
+                }
+            }
+            if !read_all {
+                return Err(busy());
+            }
             Self::require_open(&st)?;
             if let Some(why) = st.blocked {
                 return Err(provider_error(ProviderErrorCode::ProviderUnavailable, why));
@@ -2161,33 +2596,29 @@ impl ExternalProvider for CodexProvider {
                     "no such Codex session",
                 ));
             }
+            // A subagent's turn read just now may have opened one.
             if st.turn.is_some() {
-                return Err(provider_error(
-                    ProviderErrorCode::TurnAlreadyActive,
-                    "a turn is already running",
-                ));
+                return Err(busy());
             }
+            // Sent under the same lock as the check above: the pump cannot fold a tripwire in between.
+            let params = to_json(&TurnStartParams::new(req.session_id.clone(), req.text, policy.reviewer))?;
+            let pending = self.request(method::TURN_START, params)?;
             st.turn = Some(ActiveTurn::new(None));
-            req.session_id.clone()
+            (req.session_id.clone(), pending)
+        };
+        // The user is told the turn did not start, so one Codex starts after all is not left running.
+        let abandon_unanswered = |this: &Self| {
+            let mut st = lock(&this.state);
+            st.turn = None;
+            st.start_abandoned = true;
         };
         let abandon = |this: &Self| lock(&this.state).turn = None;
-
-        let params = match to_json(&TurnStartParams::new(thread_id.clone(), req.text, policy.reviewer)) {
-            Ok(params) => params,
-            Err(e) => {
-                abandon(self);
-                return Err(e);
-            }
-        };
-        let pending = match self.request(method::TURN_START, params) {
-            Ok(pending) => pending,
-            Err(e) => {
-                abandon(self);
-                return Err(e);
-            }
-        };
         let answer = match self.wait(pending, TURN_START_TIMEOUT, "the turn start") {
             Ok(answer) => answer,
+            Err(e @ ProviderError::Timeout) => {
+                abandon_unanswered(self);
+                return Err(e);
+            }
             Err(e) => {
                 abandon(self);
                 return Err(e);
@@ -2203,6 +2634,7 @@ impl ExternalProvider for CodexProvider {
 
         let turn_id = started.turn.id;
         let mut st = lock(&self.state);
+        st.start_abandoned = false;
         let wanted = match st.turn.as_mut() {
             Some(turn) => {
                 turn.id = Some(turn_id.clone());

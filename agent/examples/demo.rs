@@ -116,6 +116,7 @@ fn print_event(event: &AgentDomainEvent) {
             println!("[policy mismatch] requested={requested} reported={reported}")
         }
         AgentDomainEvent::AccountLimits { used_percent, .. } => println!("[account limits] {used_percent}% used"),
+        AgentDomainEvent::BackgroundCalls { running } => println!("[background] {running} running"),
         AgentDomainEvent::TurnCompleted {
             result_text,
             outcome,

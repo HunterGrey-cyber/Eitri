@@ -281,11 +281,13 @@ fn collab_input(c: &CollabAgentToolCallItem) -> Value {
     json!({ "tool": c.tool, "prompt": c.prompt, "receiverThreadIds": c.receiver_thread_ids })
 }
 
-/// A raw item's own fields, without the identity the transcript already carries.
+/// A raw item's own fields, without the identity the transcript already carries, and without a `subagent`
+/// key: whose a call is, only Eitri says.
 fn without_identity(raw: &Value) -> Value {
     let mut map = raw.as_object().cloned().unwrap_or_default();
     map.remove("id");
     map.remove("type");
+    map.remove("subagent");
     Value::Object(map)
 }
 
@@ -359,6 +361,18 @@ fn bounded_value(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A history row is built from the item alone; a `subagent` key it carries must not make the tab's own
+    /// call read as a subagent's there either.
+    #[test]
+    fn a_raw_item_s_own_subagent_key_is_dropped() {
+        let item: ThreadItem = serde_json::from_value(serde_json::json!(
+            {"type": "webSearch", "id": "ws1", "query": "x", "subagent": "/root/impostor"}
+        ))
+        .expect("an item");
+        let (_, input) = tool_start(&item).expect("a row");
+        assert_eq!(input, serde_json::json!({"query": "x"}));
+    }
 
     #[test]
     fn row_ids_never_collide_across_threads() {
