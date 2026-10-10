@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=d7c5df2b901653439f08b4374f447b519da12380aeb5dcd63f798ba45a8bb73e -->
+<!-- translated-from: permissions.md sha256=43d5d9812f32750fdd3502ab33c4cae71a6d0cc0ef95636c02e32ec013b4e81f -->
 
 # 权限与信任
 
@@ -85,7 +85,7 @@ Eitri 放行一次调用之后，Claude Code 仍可能自己再就它提问。�
 
 一个项目可以带着它自己的 Claude Code 配置：hook、MCP server、权限规则。加载它就意味着运行仓库里写的任何东西，所以在你看过它并说“是”之前，Eitri 不会加载它。
 
-**看哪些东西。** 在项目目录里和它之上的每个目录里，一直到它的 git 仓库顶层（而且从不高于你的主目录）：`.claude/`、`.mcp.json`、`CLAUDE.md` 和 `CLAUDE.local.md`。`.claude/worktrees/`（Claude Code 在那里保存它自己的检出）会被点名，但不读取。没有这些东西的项目立即启动，不提任何问题。
+**看哪些东西。** 在项目目录里和它之上的每个目录里，一直到它的 git 仓库顶层（而且从不高于你的主目录）：`.claude/`、`.mcp.json`、`CLAUDE.md` 和 `CLAUDE.local.md`。`.claude/worktrees/`（Claude Code 在那里保存它自己的检出）会被点名，但不读取。Claude Code 还会从仓库之上的各级目录（一直到根目录）加载记忆文件和 MCP server，所以这些也会被查看：`CLAUDE.md`、`CLAUDE.local.md`、`.mcp.json`、`.claude/CLAUDE.md` 和 `.claude/rules/`（主目录下的 `.claude/` 除外，那是你自己的配置）。它们以 `../` 开头的路径列出。项目子目录里的 `CLAUDE.md` 不会被查看，问题里也会这么说：信任之后，Claude Code 在处理那个子目录里的文件时会读取它。没有这些东西的项目立即启动，不提任何问题。
 
 **那个问题。** 在这样的项目里第一个会话启动之前，面板会显示 “Trust this project's Claude configuration?” 以及它找到的东西，逐个文件列出：每个 hook 和它的事件及命令，每个 MCP server 和它的命令行（环境变量在前），某个设置文件设置的环境变量的名字，一个 `apiKeyHelper`，每条 `permissions.allow` 规则，每个 `additionalDirectories` 条目，每个 `CLAUDE.md`，以及其他任何设置原样。单段文字超过 4,096 个字符（比如很长的 hook 命令）时，只显示到这个长度，并注明省略了多少个字符。`y` 仍然信任整个文件，包括你没看到的那一部分，所以遇到这种命令，请先在文件里读完它。这些文字里的隐藏字符和改变方向的字符会被画成可见的转义，所以一条命令不会看起来像是别的东西。
 

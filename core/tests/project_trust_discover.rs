@@ -3,6 +3,11 @@
 //! Every file a test inspects is made here, under a scratch directory with a fake home inside it;
 //! no test points discovery at an existing project or at the real home. `git` runs only to make
 //! fixtures, with no user or system configuration.
+//!
+//! Claude's discovery also looks at every directory above the top level up to `/`, so a stray
+//! `CLAUDE.md`, `CLAUDE.local.md`, `.mcp.json`, `.claude/CLAUDE.md` or `.claude/rules/` in a directory
+//! above the temp dir (`/tmp`, `/`) shows up in every fixture here and turns tests that expect an exact
+//! list red: remove it, it is loaded by every trusted Claude session below it too.
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -951,7 +956,10 @@ fn the_budget_is_kept() {
     let found = fx.discover(&deep);
     assert_eq!(
         found.over_budget.as_deref(),
-        Some("more than 64 directories above the root without a repository")
+        Some(
+            "more than 64 directories above the root without a repository; more than 64 directories above the \
+             top level"
+        )
     );
     assert!(!found.fully_hashed());
 }
@@ -2098,4 +2106,180 @@ fn trust_plan_trusted_trusts_walked_untrusts_above() {
     let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/\xff"));
     assert!(trust_plan(&found, DirTrust::Trusted, &odd).is_err());
     assert!(trust_plan(&found, DirTrust::Untrusted, &odd).is_err());
+}
+
+/// Memory and servers above the git top level: what a trusted CLI loads from there (measured by
+/// `workspace_trust_memory_real_cli`) and nothing else.
+fn above_the_top(outer: &Path) {
+    write(&outer.join("CLAUDE.md"), b"above\n");
+    write(&outer.join("CLAUDE.local.md"), b"above, local\n");
+    write(
+        &outer.join(".mcp.json"),
+        br#"{"mcpServers":{"above":{"command":"srv"}}}"#,
+    );
+    write(&outer.join(".claude/CLAUDE.md"), b"above, in .claude\n");
+    write(&outer.join(".claude/rules/a.md"), b"rule a\n");
+    write(&outer.join(".claude/rules/deeper/b.md"), b"rule b\n");
+    // Loaded only from the working directory or the top level, never from above it.
+    write(&outer.join(".claude/settings.json"), HOOK_SETTINGS);
+    write(&outer.join(".claude/settings.local.json"), HOOK_SETTINGS);
+    write(&outer.join(".claude/skills/s/SKILL.md"), b"---\nname: s\n---\n");
+    write(&outer.join(".claude/agents/a.md"), b"---\nname: a\n---\n");
+    write(&outer.join(".claude/commands/c.md"), b"do it\n");
+}
+
+const ABOVE: [&str; 7] = [
+    "../.claude/CLAUDE.md",
+    "../.claude/rules/a.md",
+    "../.claude/rules/deeper",
+    "../.claude/rules/deeper/b.md",
+    "../.mcp.json",
+    "../CLAUDE.local.md",
+    "../CLAUDE.md",
+];
+
+#[test]
+fn memory_and_servers_above_the_top_level_are_read() {
+    let fx = Fixture::new("above");
+    let outer = fx.home.join("outer");
+    above_the_top(&outer);
+    let repo = outer.join("repo");
+    fx.repo(&repo, false);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    for root in [repo.clone(), repo.join("src")] {
+        let found = fx.discover(&root);
+        assert_eq!(found.top, repo);
+        assert_eq!(paths(&found), ABOVE.map(PathBuf::from).to_vec());
+        assert!(found.fully_hashed());
+        assert!(!found.nothing_to_trust());
+        assert!(found
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::McpServer { name, command_line, .. }
+            if name == "above" && command_line == "srv")));
+        // The walk for the git top level is unchanged.
+        assert_eq!(found.walked.last(), Some(&repo));
+    }
+
+    // Each of them is in the fingerprint.
+    let before = fx.discover(&repo).fingerprint;
+    write(&outer.join(".claude/rules/deeper/b.md"), b"rule b, changed\n");
+    let after = fx.discover(&repo).fingerprint;
+    assert_ne!(before, after);
+    write(&outer.join("CLAUDE.md"), b"above, changed\n");
+    assert_ne!(after, fx.discover(&repo).fingerprint);
+}
+
+#[test]
+fn memory_above_a_root_without_a_repository_is_read() {
+    let fx = Fixture::new("above-norepo");
+    let outer = fx.home.join("outer");
+    above_the_top(&outer);
+    let root = outer.join("q");
+    std::fs::create_dir_all(&root).unwrap();
+    let found = fx.discover(&root);
+    assert_eq!(found.top, root);
+    assert_eq!(paths(&found), ABOVE.map(PathBuf::from).to_vec());
+}
+
+#[test]
+fn memory_further_up_is_read_and_home_dot_claude_is_left_out() {
+    let fx = Fixture::new("above-home");
+    // At the home: its memory files and server are read, its `.claude/` is the user tier's own.
+    write(&fx.home.join("CLAUDE.md"), b"home memory\n");
+    write(
+        &fx.home.join(".mcp.json"),
+        br#"{"mcpServers":{"home":{"command":"h"}}}"#,
+    );
+    write(&fx.home.join(".claude/CLAUDE.md"), b"user memory\n");
+    write(&fx.home.join(".claude/rules/r.md"), b"user rule\n");
+    // Above the home, and two levels above the top.
+    write(&fx.base.join("CLAUDE.local.md"), b"higher\n");
+    write(&fx.base.join(".claude/rules/r.md"), b"higher rule\n");
+    let repo = fx.home.join("a/repo");
+    fx.repo(&repo, false);
+    let found = fx.discover(&repo);
+    assert_eq!(found.top, repo);
+    assert_eq!(
+        paths(&found),
+        [
+            "../../../.claude/rules/r.md",
+            "../../../CLAUDE.local.md",
+            "../../.mcp.json",
+            "../../CLAUDE.md",
+        ]
+        .map(PathBuf::from)
+        .to_vec()
+    );
+}
+
+#[test]
+fn a_link_above_the_top_level_is_reported_and_not_followed() {
+    let fx = Fixture::new("above-link");
+    let elsewhere = fx.base.join("elsewhere");
+    write(&elsewhere.join("CLAUDE.md"), b"followed?\n");
+    write(&elsewhere.join("rules/r.md"), b"followed?\n");
+    let outer = fx.home.join("outer");
+    std::fs::create_dir_all(&outer).unwrap();
+    symlink(elsewhere.join("CLAUDE.md"), outer.join("CLAUDE.md")).unwrap();
+    symlink(&elsewhere, outer.join(".claude")).unwrap();
+    let repo = outer.join("repo");
+    fx.repo(&repo, false);
+    let watch = OpenWatch::new(&elsewhere.join("CLAUDE.md"));
+    let found = fx.discover(&repo);
+    assert!(
+        !watch.saw_anything() || !OpenWatch::WORKS,
+        "a link above the top was followed"
+    );
+    assert_eq!(
+        paths(&found),
+        ["../.claude", "../CLAUDE.md"].map(PathBuf::from).to_vec()
+    );
+    assert!(
+        found
+            .entries
+            .iter()
+            .all(|e| matches!(e.kind, EntryKind::Symlink { .. })),
+        "{:?}",
+        found.entries
+    );
+    // The CLI would follow either link to content the fingerprint cannot see.
+    assert!(!found.fully_hashed());
+}
+
+#[test]
+fn too_many_directories_above_the_top_level_are_over_budget() {
+    let fx = Fixture::new("above-budget");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    let limits = Limits {
+        max_walk_up: 1,
+        ..Limits::default()
+    };
+    let found = discover(&repo, Some(&fx.home), &limits, &Profile::Claude, &ProfileEnv::default());
+    assert!(!found.fully_hashed());
+    assert!(
+        found
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::OverBudget { reason } if reason.contains("above the top level"))),
+        "{:?}",
+        found.findings
+    );
+}
+
+#[test]
+fn codex_reads_nothing_above_the_top_level() {
+    let fx = Fixture::new("above-codex");
+    let outer = fx.home.join("outer");
+    above_the_top(&outer);
+    write(&outer.join("AGENTS.md"), b"above\n");
+    let repo = outer.join("repo");
+    fx.repo(&repo, false);
+    let found = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
+    assert!(
+        paths(&found).iter().all(|p| !p.starts_with("..")),
+        "{:?}",
+        paths(&found)
+    );
 }

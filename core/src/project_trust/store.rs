@@ -52,8 +52,9 @@ const MAX_RECORD_BYTES: u64 = 1 << 20;
 /// 2: every value whole. 3: each file beyond the settings, memory and rule files (a command, an
 /// agent, a skill's file, a hook script) named with its size and the frontmatter keys that change
 /// what runs, where 2 gave only how many there were in each directory. 4: that note also names an
-/// agent file's own `permissionMode` and `mcpServers`, which 3 left unsaid.
-pub const DISCLOSURE: u32 = 4;
+/// agent file's own `permissionMode` and `mcpServers`, which 3 left unsaid. 5: Claude's prompt says
+/// that a subdirectory's `CLAUDE.md`, which the walk does not read, loads once Claude reads a file there.
+pub const DISCLOSURE: u32 = 5;
 
 /// What changed between the trusted configuration and the one found now, by path relative to the
 /// top level.

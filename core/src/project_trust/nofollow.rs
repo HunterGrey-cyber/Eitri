@@ -114,6 +114,8 @@ pub struct DirHandle {
 pub enum Owner {
     /// Only a file owned by the effective uid.
     Me,
+    /// A file owned by the effective uid or by root: no other user can rewrite it after it was read.
+    MeOrRoot,
     /// Any owner.
     Anyone,
 }
@@ -291,10 +293,15 @@ impl DirHandle {
 
     /// Reads a regular file of at most `max_bytes`.
     pub fn read_file(&self, name: &OsStr, max_bytes: u64) -> Result<Vec<u8>, Refusal> {
-        self.read_file_owned_by(name, max_bytes, None)
+        self.read_file_owned_by(name, max_bytes, Owner::Anyone)
     }
 
-    fn read_file_owned_by(&self, name: &OsStr, max_bytes: u64, owner: Option<libc::uid_t>) -> Result<Vec<u8>, Refusal> {
+    /// [`DirHandle::read_file`], refusing a file `owner` does not allow (judged on the open handle).
+    pub fn read_file_as(&self, name: &OsStr, max_bytes: u64, owner: Owner) -> Result<Vec<u8>, Refusal> {
+        self.read_file_owned_by(name, max_bytes, owner)
+    }
+
+    fn read_file_owned_by(&self, name: &OsStr, max_bytes: u64, owner: Owner) -> Result<Vec<u8>, Refusal> {
         let c_name = component(name)?;
         // Look before opening: a FIFO, socket or device is refused without ever being opened.
         match self.lstat(name)? {
@@ -332,13 +339,18 @@ impl DirHandle {
             FileKind::Regular { .. } => {}
             other => return Err(Refusal::NotRegular(other.describe())),
         }
-        if let Some(uid) = owner {
-            if st.st_uid != uid {
-                return Err(Refusal::Io(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "owned by another user",
-                )));
-            }
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let allowed = match owner {
+            Owner::Me => st.st_uid == me,
+            Owner::MeOrRoot => st.st_uid == me || st.st_uid == 0,
+            Owner::Anyone => true,
+        };
+        if !allowed {
+            return Err(Refusal::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "owned by another user",
+            )));
         }
         // Read one byte past the limit, so a file growing under the read is still refused.
         let cap = max_bytes.saturating_add(1);
@@ -461,12 +473,7 @@ pub fn read_regular_nofollow(path: &Path, max_bytes: u64, owner: Owner) -> Resul
         return Err(Refusal::invalid("no file name"));
     };
     let dir = DirHandle::open_absolute(parent)?;
-    let uid = match owner {
-        // SAFETY: `geteuid` has no preconditions and cannot fail.
-        Owner::Me => Some(unsafe { libc::geteuid() }),
-        Owner::Anyone => None,
-    };
-    dir.read_file_owned_by(name, max_bytes, uid)
+    dir.read_file_owned_by(name, max_bytes, owner)
 }
 
 /// `named` joined to `base` without touching the disk: `.` is dropped, and a `..` is folded only at
@@ -591,6 +598,27 @@ pub(crate) mod tests {
                 "{name:?}"
             );
         }
+    }
+
+    #[test]
+    fn me_or_root_takes_a_root_file_and_me_does_not() {
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let etc = DirHandle::open_absolute(Path::new("/etc")).unwrap();
+        let passwd = OsStr::new("passwd");
+        assert!(etc.read_file_as(passwd, 1 << 20, Owner::MeOrRoot).is_ok());
+        assert!(etc.read_file_as(passwd, 1 << 20, Owner::Anyone).is_ok());
+        match etc.read_file_as(passwd, 1 << 20, Owner::Me) {
+            Err(Refusal::Io(e)) => assert_eq!(e.to_string(), "owned by another user"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let (_s, dir) = canonical_scratch("owner-mine");
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        let mine = DirHandle::open_absolute(&dir).unwrap();
+        assert!(mine.read_file_as(OsStr::new("f"), 16, Owner::MeOrRoot).is_ok());
+        assert!(mine.read_file_as(OsStr::new("f"), 16, Owner::Me).is_ok());
     }
 
     #[test]

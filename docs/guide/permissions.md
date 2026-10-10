@@ -151,8 +151,13 @@ running whatever the repository says, so Eitri does not load it until you have s
 
 **What is looked at.** In the project directory and in each directory above it, up to the top of its git
 repository (and never above your home directory): `.claude/`, `.mcp.json`, `CLAUDE.md` and `CLAUDE.local.md`.
-`.claude/worktrees/`, where Claude Code keeps checkouts of its own, is named but not read. A project with none
-of these starts at once, with no question.
+`.claude/worktrees/`, where Claude Code keeps checkouts of its own, is named but not read. Claude Code also
+loads memory files and MCP servers from the directories above the repository, all the way up, so those are
+looked at too: `CLAUDE.md`, `CLAUDE.local.md`, `.mcp.json`, `.claude/CLAUDE.md` and `.claude/rules/` (not the
+`.claude/` in your home directory, which is your own configuration). They are listed as `../` paths. A
+`CLAUDE.md` in a subdirectory of the project is not looked at, and the question says so: once trusted,
+Claude Code reads one when it works on a file in that subdirectory. A project with none of these starts at
+once, with no question.
 
 **The question.** Before the first session starts in such a project, the panel shows "Trust this project's
 Claude configuration?" with what it found, file by file: each hook with its event and command, each MCP server

@@ -98,8 +98,16 @@ export const TrustPrompt = forwardRef<HTMLDivElement, Props>(function TrustPromp
           Eitri does not set that. Hooks, MCP servers and deny or ask rules load with y either way.
         </p>
       )}
+      {envelope.agent === "Claude" && (envelope.state === "untrusted" || envelope.state === "changed") && (
+        // Claude Code loads a subdirectory's CLAUDE.md the first time it reads a file there, in a trusted session
+        // only. Discovery does not walk the whole tree, so the prompt says what a `y` reaches beyond this list.
+        <p className="trust-note trust-subdir-note">
+          With y, Claude Code also reads the CLAUDE.md of a subdirectory once it reads a file there; those are not listed
+          here.
+        </p>
+      )}
       {envelope.remember !== "yes" && envelope.rememberNote !== null && (
-        <p className="trust-note">
+        <p className="trust-note trust-remember-note">
           <Shown text={envelope.rememberNote} />
         </p>
       )}

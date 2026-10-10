@@ -17,6 +17,14 @@
 //! ```
 //!
 //! The sidecar runs the CLI named by `VERDANDI_CLAUDE_CLI_PATH`; `PATH` alone does not select it.
+//!
+//! **Where the card comes from.** An in-project `Write` in an Auto tab raises no card: Eitri's
+//! own policy allows it, and a CLI that runs its own auto mode lets its classifier decide a deferred
+//! call. The project therefore ships `.claude/settings.json` with `permissions.ask: ["Write"]` (the
+//! sessions start `Trusted`, so the project tier loads, and the CLI applies an ask rule whatever its
+//! own workspace trust says). The CLI then asks about the `Write` itself, under either of its modes,
+//! and a prompt forced by an ask rule is always a card in an Auto tab. That card is what part 2
+//! answers from the other tab.
 
 use eitri_core::agent_backend::{AgentBackend, BackendKind};
 use eitri_core::agent_bridge::SessionModeChoice;
@@ -27,6 +35,13 @@ fn project() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("nv-tabs-real-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("main.rs"), "fn marmalade() {}\n").unwrap();
+    // The one call in this test that must reach a human: see the module doc.
+    std::fs::create_dir_all(dir.join(".claude")).unwrap();
+    std::fs::write(
+        dir.join(".claude").join("settings.json"),
+        r#"{"permissions": {"ask": ["Write"]}}"#,
+    )
+    .unwrap();
     dir.canonicalize().unwrap()
 }
 
@@ -103,7 +118,8 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
     );
     assert!(transcript(&set, foreground).contains("30"));
 
-    // 2. A card in the background tab, answered after a switch, reaches that tab's session.
+    // 2. A card in the background tab (the project's ask rule on `Write`), answered after a switch,
+    //    reaches that tab's session.
     set.get_mut(background)
         .unwrap()
         .live_mut()
@@ -117,20 +133,26 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
     let deadline = Instant::now() + Duration::from_secs(180);
     while set.get(background).unwrap().attention.attention().pending == 0 {
         set.pump(&dir, true);
-        assert!(Instant::now() < deadline, "the Write never became a card");
+        assert!(
+            Instant::now() < deadline,
+            "the Write never became a card (the project's ask rule on Write should have made the CLI ask)"
+        );
         std::thread::sleep(Duration::from_millis(33));
     }
+    assert!(
+        !dir.join("tabs-proof.txt").exists(),
+        "the Write ran before its card was answered"
+    );
     assert!(set.select(background));
     let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
-    let permission_id = snapshot["state"]["pendingPermissions"][0]["permissionId"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    set.get_mut(background)
-        .unwrap()
-        .live_mut()
-        .unwrap()
-        .respond_permission(&permission_id, agent::PermissionDecision::Allow)
+    let card = &snapshot["state"]["pendingPermissions"][0];
+    assert_eq!(
+        card["toolName"], "Write",
+        "the background tab's card is the Write: {card}"
+    );
+    let permission_id = card["permissionId"].as_str().unwrap().to_string();
+    // The panel's own route for a card's answer, by tab and permission id.
+    set.answer_card(background, &permission_id, agent::PermissionDecision::Allow)
         .map_err(|e| e.message)
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -142,6 +164,11 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
     assert!(
         !set.get(foreground).unwrap().turn_running(),
         "the other session was never asked"
+    );
+    assert_eq!(
+        set.get(foreground).unwrap().attention.attention().pending,
+        0,
+        "the card never reached the other tab"
     );
 
     for mut tab in set.take_all() {

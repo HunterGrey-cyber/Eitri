@@ -72,7 +72,7 @@ describe("TrustPrompt", () => {
       <TrustPrompt envelope={envelope({ state: "too_large", remember: "window", rememberNote: note, items: [] })} />,
     );
     expect(container.querySelector("h2")!.textContent).toBe("This project's Claude configuration is too large to show.");
-    expect(container.querySelector(".trust-note")!.textContent).toBe(note);
+    expect(container.querySelector(".trust-remember-note")!.textContent).toBe(note);
     expect(container.querySelectorAll(".trust-file")).toHaveLength(0);
     expect(container.querySelector(".trust-footer")!.textContent).toBe(
       "n starts without it · Esc puts this off · y is not taken here",
@@ -138,7 +138,7 @@ describe("TrustPrompt", () => {
     const window = render(
       <TrustPrompt envelope={envelope({ remember: "window", rememberNote: "trust could not be recorded: no state directory" })} />,
     );
-    expect(window.container.querySelector(".trust-note")!.textContent).toBe("trust could not be recorded: no state directory");
+    expect(window.container.querySelector(".trust-remember-note")!.textContent).toBe("trust could not be recorded: no state directory");
     expect(window.container.querySelector(".trust-footer")!.textContent).not.toContain("this start only");
     cleanup();
 
@@ -154,7 +154,7 @@ describe("TrustPrompt", () => {
         })}
       />,
     );
-    expect(session.container.querySelector(".trust-note")!.textContent).toContain("y trusts this start only");
+    expect(session.container.querySelector(".trust-remember-note")!.textContent).toContain("y trusts this start only");
     const unchecked = session.container.querySelector("[data-what='unreadable']")!;
     expect(unchecked.textContent).toBe("cannot be checked: larger than 4 MiB");
     expect(session.container.querySelector(".trust-footer")!.textContent).toContain("y trusts this start only");
@@ -162,7 +162,7 @@ describe("TrustPrompt", () => {
 
   it("shows no note for a lasting trust", () => {
     const { container } = render(<TrustPrompt envelope={envelope({ rememberNote: "stale text" })} />);
-    expect(container.querySelector(".trust-note")).toBeNull();
+    expect(container.querySelector(".trust-remember-note")).toBeNull();
   });
 
   it("hidden_and_bidi_characters_in_a_hook_command_are_revealed", () => {
@@ -220,5 +220,20 @@ describe("TrustPrompt", () => {
 
     const without = render(<TrustPrompt envelope={envelope()} />);
     expect(without.container.querySelector(".trust-allow-note")).toBeNull();
+  });
+
+  it("says that a subdirectory's CLAUDE.md is not listed, for Claude only", () => {
+    const claude = render(<TrustPrompt envelope={envelope({ agent: "Claude" })} />);
+    const note = claude.container.querySelector(".trust-subdir-note");
+    expect(note).not.toBeNull();
+    expect(note!.textContent).toContain("CLAUDE.md of a subdirectory");
+    claude.unmount();
+
+    const codex = render(<TrustPrompt envelope={envelope({ agent: "Codex" })} />);
+    expect(codex.container.querySelector(".trust-subdir-note")).toBeNull();
+    codex.unmount();
+
+    const large = render(<TrustPrompt envelope={envelope({ agent: "Claude", state: "too_large", items: [] })} />);
+    expect(large.container.querySelector(".trust-subdir-note")).toBeNull();
   });
 });

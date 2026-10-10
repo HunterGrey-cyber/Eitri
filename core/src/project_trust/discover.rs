@@ -12,7 +12,7 @@ use super::codex::{
 };
 use super::findings::{frontmatter_keys, mcp_findings, settings_findings};
 use super::git_top::git_top_level;
-use super::nofollow::{normalize_lexically, DirHandle, FileKind, Refusal};
+use super::nofollow::{normalize_lexically, DirHandle, FileKind, Owner, Refusal};
 use super::{Discovery, Entry, EntryKind, Finding, Fingerprint, Limits, Profile, ProfileEnv};
 
 /// What a file found on the walk is to the agent, which decides how it is parsed and whether a link
@@ -78,6 +78,8 @@ enum Tree {
     AgentsPlugins { at_top: bool },
     /// A directory an agent registered by name reads.
     Registered,
+    /// A `.claude/rules/` above the git top level: every file in it is memory the CLI loads.
+    ClaudeRules,
 }
 
 /// The listings Codex reads from `.agents/plugins/` at the repository's top level.
@@ -108,6 +110,7 @@ impl Tree {
             Tree::AgentsSkills => Role::SkillTree,
             Tree::AgentsPlugins { .. } => Role::Plain,
             Tree::Registered => Role::Registered,
+            Tree::ClaudeRules => Role::ClaudeOther,
         }
     }
 
@@ -122,7 +125,8 @@ impl Tree {
 }
 
 /// Where Claude Code keeps whole git checkouts of its own worktrees, directly under `.claude/`. The
-/// CLI loads no configuration from them for a root outside them, and a root inside one has its own
+/// CLI loads nothing from them for a root outside them (no memory, skill, agent, command, hook or
+/// server, not even after reading a file there), and a root inside one has its own
 /// git top level and is discovered there; walking them would put thousands of unrelated files over
 /// the budget of every repository that has some, so each start would ask again.
 const WORKTREES_DIR: &[u8] = b"worktrees";
@@ -130,6 +134,9 @@ const WORKTREES_REASON: &str = "Claude Code's own worktree checkouts, not read";
 
 struct Scan<'a> {
     top: PathBuf,
+    /// Set while the walk is above the top level, where a directory such as `/tmp` may hold another
+    /// user's file: such a file is a gap (that user can rewrite it after it was shown), not trust.
+    above_top: bool,
     limits: &'a Limits,
     entries: Vec<Entry>,
     findings: Vec<Finding>,
@@ -238,7 +245,8 @@ impl Scan<'_> {
     fn file(&mut self, dir: &DirHandle, name: &OsStr, path: PathBuf, role: Role) -> bool {
         let remaining = self.limits.max_total_bytes.saturating_sub(self.total_bytes);
         let allowed = self.limits.max_file_bytes.min(remaining);
-        match dir.read_file(name, allowed) {
+        let owner = if self.above_top { Owner::MeOrRoot } else { Owner::Anyone };
+        match dir.read_file_as(name, allowed, owner) {
             Ok(bytes) => {
                 self.total_bytes += bytes.len() as u64;
                 let sha256: [u8; 32] = Sha256::digest(&bytes).into();
@@ -426,6 +434,38 @@ impl Scan<'_> {
                     self.unreadable(claude_path, other.describe().to_string());
                 }
             }
+        }
+    }
+
+    /// One directory above the git top level for Claude. The CLI walks from its working directory up
+    /// to `/` for memory files and `.mcp.json`, so a trusted session loads these from every directory
+    /// above the repository too (measured: `CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md`,
+    /// `.claude/rules/` and an `.mcp.json` server; not the settings files, skills, agents or commands
+    /// of a `.claude/` there). At `$HOME` the `.claude/` is left out as the user tier's own; under an
+    /// Eitri account the session's configuration directory is `~/.claude-<name>` instead, and whether
+    /// the CLI then loads `~/.claude/CLAUDE.md` as a parent's memory is not measured (the user's own
+    /// files either way). A file here owned by neither this user nor root is a gap (see `above_top`).
+    fn claude_above_top(&mut self, dir: &Path, at_home: bool) {
+        let Some((base, handle)) = self.open_walked(dir) else {
+            return;
+        };
+        for (name, role) in [
+            (".mcp.json", Role::Mcp),
+            ("CLAUDE.md", Role::Memory),
+            ("CLAUDE.local.md", Role::Memory),
+        ] {
+            self.expected_file(&handle, OsStr::new(name), base.join(name), role);
+        }
+        if at_home {
+            return;
+        }
+        let dot_claude = OsStr::new(".claude");
+        let claude_path = base.join(".claude");
+        if let Some(claude) = self.pass_through(&handle, dot_claude, claude_path.clone()) {
+            let memory = OsStr::new("CLAUDE.md");
+            self.expected_file(&claude, memory, claude_path.join(memory), Role::Memory);
+            let rules = OsStr::new("rules");
+            self.whole_dir(&claude, rules, claude_path.join(rules), Tree::ClaudeRules);
         }
     }
 
@@ -810,7 +850,9 @@ fn fingerprint(
 /// Discovers the configuration a session of `profile`'s agent started at `root` (canonical) would load
 /// from the project: every directory from `root` up to the git top level (or, when no repository was
 /// accepted, up to the highest directory whose `.git` could not be checked), never above `home`
-/// when `root` is below it. No link is followed and nothing blocks.
+/// when `root` is below it. For Claude, every directory above that top level up to `/` is looked at
+/// too, for the memory files and `.mcp.json` the CLI loads from there. No link is followed and
+/// nothing blocks.
 ///
 /// `home` must be canonical too: it is compared with `root`'s ancestors by path, and a home spelt
 /// through a link would match none of them, so the walk would neither stop there nor keep the user
@@ -836,6 +878,7 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
     }
     let mut scan = Scan {
         top: top.clone(),
+        above_top: false,
         limits,
         entries: Vec::new(),
         findings: Vec::new(),
@@ -860,6 +903,17 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
         Profile::Claude => {
             for dir in &walked {
                 scan.claude_directory(dir, home == Some(dir.as_path()));
+            }
+            let above: Vec<&Path> = top.ancestors().skip(1).collect();
+            if above.len() > limits.max_walk_up {
+                scan.note_over_budget(format!(
+                    "more than {} directories above the top level",
+                    limits.max_walk_up
+                ));
+            }
+            scan.above_top = true;
+            for dir in above.into_iter().take(limits.max_walk_up) {
+                scan.claude_above_top(dir, home == Some(dir));
             }
         }
         Profile::Codex => {

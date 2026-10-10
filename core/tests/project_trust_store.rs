@@ -713,8 +713,8 @@ fn a_record_from_before_the_full_disclosure_is_asked_about_again() {
     }
     // A lower disclosure is no better than none: neither the one that showed every value whole but
     // only counted the other files under `.claude/`, nor any before it.
-    assert_eq!(DISCLOSURE, 4);
-    for lower_disclosure in [1, 2, 3] {
+    assert_eq!(DISCLOSURE, 5);
+    for lower_disclosure in [1, 2, 3, 4] {
         let mut lower = before.clone();
         lower["disclosure"] = serde_json::json!(lower_disclosure);
         plant(lower);
