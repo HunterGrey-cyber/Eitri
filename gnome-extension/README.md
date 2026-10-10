@@ -45,6 +45,16 @@ panel process over its own gio connection, and a `gdbus`/`busctl` child it spawn
 | `FocusSelfIfNeighbour(dir)` | the caller's partner | yes | the caller's window, if it is the neighbour in `dir` |
 | `ActivateOwn()` | the caller's partner | yes | the caller's most recently used window |
 
+- **`ActivateOwn` and `FocusSelfIfNeighbour`** also need a Wayland window of the caller to have held, within the last
+  30 minutes, a focus the user gave it (else `caller-not-focused-lately`): the caller names its own partner, so without
+  this a process the user was never in could name the window they are typing in. Only a focus gain made while the
+  shell handles a key, button or touch event counts (a click, Alt+Tab, a shell shortcut); no client request produces
+  such an event, so a window an application maps, raises or activates itself earns nothing, and neither does any
+  activation of the extension's own, nor the focus it finds when it is enabled (also not any gain within 1 s of one of
+  its activations). A focus that earned nothing renews nothing when it ends, so one grant never pays for the next. A
+  panel reached only through the focus keys must be clicked at least once every 30 minutes, once after it opens, and
+  after every screen lock (GNOME disables the extension then, and the record goes with it). Each focus change is
+  logged at debug level as `credited` or `not credited`.
 - **Fresh input** to a window needs two things, both within the last 500 ms and both strictly after the window last
   gained focus, and a third after the extension's own activations:
   - its `user_time`, which mutter sets to the timestamp of every key and button press into the window, is at most

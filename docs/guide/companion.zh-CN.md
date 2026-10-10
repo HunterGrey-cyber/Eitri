@@ -1,5 +1,5 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=73312fce1cb9e8c7cac0d0b744726e040e2145c1fee45497f6aceea16678abed -->
+<!-- translated-from: companion.md sha256=1366aa2ce4a333fbe8676abf1c127f5805b1749a1e1c710f5ec6affd3e6b8810 -->
 
 # 配合你自己的 Neovim 使用
 
@@ -132,4 +132,5 @@ gnome-extensions enable eitri@huntergrey.cn
 - X11 会话里的窗口或 XWayland 程序的窗口永远不算数，因为 X11 程序自己写自己的按键时间：请把编辑器当作 Wayland 窗口运行；
 - 所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）算作一个伙伴，所以把焦点交回编辑器时，会落到它最近使用的那个窗口；
 - 在上一次移动之后大约三分之一秒内再移回去，会按设计被拒绝；
+- 它会把你最近一次亲手把焦点放进面板（点击、Alt+Tab）的时间记住 30 分钟；用焦点键或 `:EitriPanel` 移进面板，或者面板打开时自己拿到焦点，都不算。所以在面板刚打开时、超过这 30 分钟后，以及每次锁屏之后，从编辑器移进面板的焦点键和 `:EitriPanel` 都不起作用，直到你点一下面板（如果焦点跟随鼠标，就改用 Alt+Tab 或概览切换到它：只移动指针不算）；
 - 被转发的 `eitri split` 会让正在运行的面板附着上，但不会把面板带到前面（它新开的 Neovide 还没收到过按键）。

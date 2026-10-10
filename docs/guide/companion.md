@@ -202,5 +202,10 @@ Limits worth knowing:
 - a terminal that runs all its windows in one process (GNOME Terminal, Ptyxis) counts as one partner, so
   handing focus back to the editor goes to its most recent window;
 - moving back within about a third of a second of the previous move is refused by design;
+- for 30 minutes it remembers the last time you yourself put focus in the panel (a click, Alt+Tab); moving into
+  it with the focus keys or `:EitriPanel`, or the panel taking focus when it opens, does not count. So when the
+  panel has just opened, past those 30 minutes, and after every screen lock, the focus key from the editor into
+  the panel and `:EitriPanel` do nothing until you click the panel once (with focus following the mouse, switch to
+  it with Alt+Tab or the overview instead: a pointer that only moves earns nothing);
 - a forwarded `eitri split` attaches the running panel but does not bring it forward (its new Neovide has had
   no key yet).

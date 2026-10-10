@@ -5,3 +5,4 @@ import './heldfocus.test.mjs';
 import './policy.test.mjs';
 import './pull.test.mjs';
 import './testing-gate.test.mjs';
+import './userfocus.test.mjs';

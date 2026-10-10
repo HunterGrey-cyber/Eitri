@@ -2,6 +2,7 @@
 // focus another application's window by itself. It exports cn.huntergrey.Eitri.Shell1 on the session bus; every
 // method answers a boolean and nothing else, so a caller learns nothing about other windows. Who may move focus, and
 // when, is decided in policy.js.
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
@@ -9,7 +10,8 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {
-    TESTING_ENV, callerFocusedAt, cleanPartnerList, decide, newHeldFocus, noteHeldFocus, testingMethodsWanted,
+    TESTING_ENV, callerFocusedAt, cleanPartnerList, decide, focusGainCredited, newHeldFocus, noteHeldFocus,
+    testingMethodsWanted,
 } from './policy.js';
 
 const BUS_NAME = 'cn.huntergrey.Eitri.Shell1';
@@ -77,6 +79,27 @@ function idleMs() {
     }
 }
 
+// The events through which a user moves focus: a click or a touch on a window, a key (Alt+Tab switches on the
+// release). No Wayland or X11 client request produces them; an input device does, and so does a remote-desktop
+// virtual device, which also resets the idle monitor that the fresh-input rule trusts.
+const USER_INPUT_EVENTS = [
+    Clutter.EventType.BUTTON_PRESS, Clutter.EventType.BUTTON_RELEASE, Clutter.EventType.KEY_PRESS,
+    Clutter.EventType.KEY_RELEASE, Clutter.EventType.TOUCH_BEGIN, Clutter.EventType.TOUCH_END,
+];
+
+// Whether the shell is handling such an event right now. A focus change made while it does is the user's: the click
+// that focuses a window, the key that ends Alt+Tab. The credit goes to whichever window mutter focuses then, which is
+// usually the one the user chose; a shortcut that minimizes the focused window credits the window focus falls back to. One made from a client's request (a new window, an activation
+// token), from a D-Bus call (this extension's own activations) or from a timeout is not.
+function handlingUserInput() {
+    try {
+        const event = Clutter.get_current_event();
+        return event !== null && USER_INPUT_EVENTS.includes(event.type());
+    } catch (e) {
+        return false;
+    }
+}
+
 // The window's type as policy.js reads it.
 function kindOf(window) {
     switch (window.get_window_type()) {
@@ -99,17 +122,20 @@ class EitriShell {
         // focus notify is still to come; and, for the extension's own activation, the pid whose window had focus when
         // it was made (0 when none, or for a gain the user made).
         this._focusGained = new Map();
-        // Which Wayland windows held focus, and when (policy.js, `noteHeldFocus`/`callerFocusedAt`): the input to
-        // `callerHeldFocus`. Lost with the extension, as a screen lock disables it.
+        // Which Wayland windows held a focus the user gave them, and when (policy.js, `noteHeldFocus`/
+        // `callerFocusedAt`): the input to `callerHeldFocus`. Lost with the extension, as a screen lock disables it.
         this._held = newHeldFocus();
+        // When this extension last activated any window (monotonicMs()), or null: a focus gain soon after it is not
+        // credited, wherever it lands (policy.js, `focusGainCredited`).
+        this._lastOwnActivation = null;
         this._signals = [];
         this._exported = null;
         this._ownId = 0;
         this._testingTeardown = null;
 
         // Whatever has focus now gained it, as far as this extension can tell, now: input from before enable() does
-        // not count.
-        this._noteFocus();
+        // not count. Who gave it that focus cannot be told, so it earns no credit.
+        this._noteFocus({atEnable: true});
         this._signals.push([global.display,
             global.display.connect('notify::focus-window', () => this._noteFocus())]);
     }
@@ -161,27 +187,34 @@ class EitriShell {
     // left waiting because an activation never gave the window focus can only make a later gain count as the
     // extension's own, which is the stricter reading.
     // The source of focus is kept from the activation's record, so the gain stays bound to the window focus left.
-    _noteFocus() {
+    _noteFocus({atEnable = false} = {}) {
         const window = global.display.focus_window;
-        this._noteHeldFocus(window);
+        const at = monotonicMs();
+        const previous = window ? this._focusGained.get(window.get_id()) : undefined;
+        const ours = previous?.pending === true;
+        const credited = focusGainCredited({
+            userInput: handlingUserInput(), atEnable, gainedByUs: ours, now64: at,
+            lastOwnActivation64: this._lastOwnActivation,
+        });
+        this._noteHeldFocus(window, at, credited);
+        if (window)
+            debug(`focus to window ${window.get_id()} of pid ${pidOf(window)}: ${credited ? 'credited' : 'not credited'}`);
         if (!window)
             return;
-        const previous = this._focusGained.get(window.get_id());
-        const ours = previous?.pending === true;
         const from = ours ? previous.from : 0;
-        this._recordFocusGained(window, {at: monotonicMs(), byUs: ours, pending: false, from});
+        this._recordFocusGained(window, {at, byUs: ours, pending: false, from});
     }
 
     // Records the focus change for `callerHeldFocus`: kept per window id, which the shell never reuses, and not per
     // pid, so a process that gets a closed application's pid number must not inherit the time that application's
-    // window held focus.
-    _noteHeldFocus(window) {
+    // window held focus. Only a gain the user made (`credited`) starts a record.
+    _noteHeldFocus(window, at, credited) {
         const focus = window ? {
             id: window.get_id(),
             pid: pidOf(window),
             wayland: window.get_client_type() === Meta.WindowClientType.WAYLAND,
         } : null;
-        noteHeldFocus(this._held, focus, monotonicMs());
+        noteHeldFocus(this._held, focus, at, credited);
     }
 
     _recordFocusGained(window, record) {
@@ -204,13 +237,16 @@ class EitriShell {
     // It also names the pid whose window has focus now: from the activated window, ActivatePartner may only hand focus
     // back there (policy.js). Activating the window that already has focus names its own pid, which is never a
     // caller's partner, so ActivatePartner from it waits until the user focuses it again; only the test harness does
-    // that.
+    // that. The activation's time is noted before it is made, since its focus notify can fire inside
+    // Main.activateWindow(), so that no gain it causes, on this window or another, is credited to the user.
     activate(window) {
         const time = global.display.get_current_time_roundtrip();
         const focus = global.display.focus_window;
         const pending = focus !== window;
         const from = focus ? pidOf(focus) : 0;
-        this._recordFocusGained(window, {at: monotonicMs(), byUs: true, pending, from});
+        const at = monotonicMs();
+        this._lastOwnActivation = at;
+        this._recordFocusGained(window, {at, byUs: true, pending, from});
         Main.activateWindow(window, time);
     }
 
