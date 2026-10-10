@@ -1,0 +1,291 @@
+//! The host's start and end without a window: the panel assembled on the real page, the band saying the
+//! window waits for the editor, the link aimed at nvim's socket as soon as it exists, a quit with nothing at
+//! work going straight on, and the shutdown running once whichever way out calls it.
+//!
+//! AppKit and WebKit want the main thread, so this file is its own `main`. It owns the process: the panel
+//! writes its state under the state home it is given.
+
+#[cfg(not(target_os = "macos"))]
+fn main() {}
+
+#[cfg(target_os = "macos")]
+fn main() {
+    macos::run();
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::os::unix::net::UnixListener;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use eitri_mac::appkit::page::PANEL_DOCUMENT;
+    use eitri_mac::appkit::window::Host;
+    use eitri_mac::assembly::{assemble, HostActions};
+    use eitri_mac::editor::{AttachWait, Editor};
+    use eitri_mac::quit::QuitSource;
+    use eitri_panel::panel_page::PanelHost;
+    use std::cell::{Cell, RefCell};
+
+    use eitri_mac::appkit::app::{click_held_button, quit_alert, quit_chosen};
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, NSObject};
+    use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::NSEventTrackingRunLoopMode;
+    use objc2_app_kit::{NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSButton};
+    use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSRunLoop, NSString};
+
+    struct NoLinks;
+    impl PanelHost for NoLinks {
+        fn open_external(&self, _url: &str) {}
+    }
+
+    fn spin_until(limit: Duration, done: impl Fn() -> bool) -> bool {
+        // SAFETY: an extern static AppKit's Foundation defines.
+        spin_in(unsafe { NSDefaultRunLoopMode }, limit, done)
+    }
+
+    /// [`spin_until`] with the run loop in `mode`: the event-tracking mode is the one AppKit runs while a menu is
+    /// open or the window is being resized.
+    fn spin_in(mode: &NSString, limit: Duration, done: impl Fn() -> bool) -> bool {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if done() {
+                return true;
+            }
+            // Turns this thread's own run loop once, for at most 20 ms.
+            let until = NSDate::dateWithTimeIntervalSinceNow(0.02);
+            NSRunLoop::currentRunLoop().runMode_beforeDate(mode, &until);
+        }
+        done()
+    }
+
+    pub fn run() {
+        let mtm = MainThreadMarker::new().expect("a test without the harness runs on the main thread");
+        let mut failed = 0;
+        let mut check = |name: &str, ok: bool, detail: String| {
+            println!("{} {name}: {detail}", if ok { "ok  " } else { "FAIL" });
+            if !ok {
+                failed += 1;
+            }
+        };
+
+        // A short base: nvim's socket path must fit macOS's limit.
+        let tmp = tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("a scratch directory");
+        let (state_home, config_dir, project) = (tmp.path().join("s"), tmp.path().join("c"), tmp.path().join("p"));
+        for dir in [&state_home, &config_dir, &project] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::env::set_var("XDG_STATE_HOME", &state_home);
+        std::env::remove_var("VERDANDI_CLAUDE_ACCOUNT");
+        std::env::remove_var("EITRI_AGENT_BACKEND");
+        std::fs::write(
+            config_dir.join("init.lua"),
+            "eitri.config.set(\"keymap.from_tmux\", \"off\")\n",
+        )
+        .unwrap();
+        // The socket in a directory of its own, as the app makes it, so its removal can be seen.
+        std::fs::create_dir(tmp.path().join("nl")).unwrap();
+        let nvim_listen = tmp.path().join("nl/n.sock");
+
+        let editor = Rc::new(Editor::new(nvim_listen.clone()).expect("an editor"));
+        let host = Host::new(mtm);
+        let assembly = Rc::new(
+            assemble(
+                &project,
+                &config_dir,
+                Some(host.page()),
+                Rc::new(NoLinks),
+                &PANEL_DOCUMENT,
+                editor,
+                host.clone() as Rc<dyn HostActions>,
+            )
+            .unwrap_or_else(|why| panic!("assemble: {why}")),
+        );
+        host.attach(assembly.clone());
+
+        let waiting = spin_until(Duration::from_millis(500), || {
+            assembly.editor_link() == Some((AttachWait::WAITING.0.into(), AttachWait::WAITING.1.into()))
+        });
+        check(
+            "the band says the window waits for the editor",
+            waiting && host.life.attach_phase() == "waiting for nvim's socket",
+            format!("{:?}, {}", assembly.editor_link(), host.life.attach_phase()),
+        );
+
+        // The panel's tick: started at the attach, run once at once, then only when something is due. Looked at
+        // before nvim listens, while the editor's link has nothing to report.
+        check(
+            "the panel's tick is driven from the attach",
+            host.panel_ticking(),
+            String::new(),
+        );
+        let panel = assembly.panel.clone();
+        let ticked = spin_until(Duration::from_millis(500), || panel.ticks_run() > 0);
+        check(
+            "its first tick runs on the loop's first turns",
+            ticked,
+            format!("{} ticks", panel.ticks_run()),
+        );
+        // The page loads and says ready, the start's trust check answers: then it settles.
+        spin_until(Duration::from_secs(3), || false);
+        let before = panel.ticks_run();
+        spin_until(Duration::from_secs(1), || false);
+        let idle = panel.ticks_run() - before;
+        check(
+            "an idle panel is not ticked",
+            idle <= 1,
+            format!("{idle} ticks in a second"),
+        );
+        let before = panel.ticks_run();
+        panel.new_tab();
+        let woke = spin_until(Duration::from_millis(500), || panel.ticks_run() > before);
+        check(
+            "a call into the panel wakes its tick (the wake's dispatch source)",
+            woke,
+            String::new(),
+        );
+        let before = panel.ticks_run();
+        panel.new_tab();
+        // SAFETY: an extern static AppKit defines.
+        let tracking = unsafe { NSEventTrackingRunLoopMode };
+        let woke = spin_in(tracking, Duration::from_millis(500), || panel.ticks_run() > before);
+        check(
+            "and also while a menu is open or the window resizes",
+            woke,
+            String::new(),
+        );
+
+        // nvim starts listening.
+        let _listener = UnixListener::bind(&nvim_listen).expect("a socket where nvim would listen");
+        let attached = spin_until(Duration::from_secs(2), || {
+            host.life.attach_phase().starts_with("attach requested")
+        });
+        check(
+            "the link is aimed at nvim within a poll of its socket appearing",
+            attached,
+            host.life.attach_phase(),
+        );
+
+        check(
+            "a quit with nothing at work goes straight on",
+            host.quit_chord(false)
+                && host.quit_chord(true)
+                && host.quit_requested(QuitSource::Menu)
+                && !host.life.quit_asking(),
+            format!("{:?}", host.life.quit_log()),
+        );
+        check("no window yet", host.ns_window().is_none(), String::new());
+
+        let started = Instant::now();
+        host.finish("the test's first way out", true);
+        let took = started.elapsed();
+        host.finish("the test's second way out", false);
+        check(
+            "the shutdown runs once, for whichever way out came first",
+            host.life.finished_via() == Some("the test's first way out"),
+            format!("{:?} in {} ms", host.life.finished_via(), took.as_millis()),
+        );
+        let after = panel.ticks_run();
+        spin_until(Duration::from_millis(300), || false);
+        check(
+            "the shutdown stops the panel's tick",
+            !host.panel_ticking() && panel.ticks_run() == after,
+            format!("{} ticks after it", panel.ticks_run() - after),
+        );
+        check(
+            "with nvim gone, its socket directory is removed",
+            !tmp.path().join("nl").exists(),
+            String::new(),
+        );
+        check(
+            "after the shutdown a quit is never held",
+            host.quit_requested(QuitSource::CloseButton),
+            String::new(),
+        );
+
+        // The quit question as it is built: Cancel first and answering Return, Quit second with no key of its own.
+        let (alert, cancel) = quit_alert(mtm, "1 turn is running");
+        let buttons: Vec<(String, String)> = alert
+            .buttons()
+            .iter()
+            .map(|b| (b.title().to_string(), b.keyEquivalent().to_string()))
+            .collect();
+        check(
+            "the quit question: Cancel answers Return, Quit has no key",
+            buttons.len() == 2
+                && buttons[0] == ("Cancel".to_owned(), "\r".to_owned())
+                && buttons[1].0 == "Quit"
+                && !["\r", "\u{1b}"].contains(&buttons[1].1.as_str())
+                && std::ptr::eq(
+                    Retained::as_ptr(&cancel),
+                    Retained::as_ptr(&alert.buttons().objectAtIndex(0)),
+                ),
+            format!("{buttons:?}"),
+        );
+        check(
+            "its first button is Cancel, any other Quit",
+            !quit_chosen(NSAlertFirstButtonReturn) && quit_chosen(NSAlertSecondButtonReturn),
+            String::new(),
+        );
+
+        // Escape's click: the held button is clicked once, its action finds no borrow held (it takes the button
+        // out, as the answer does), and with none held nothing is clicked.
+        let slot: Rc<RefCell<Option<Retained<NSButton>>>> = Rc::new(RefCell::new(None));
+        let target = Answer::new(mtm, slot.clone());
+        let button = NSButton::new(mtm);
+        // SAFETY: plain setters on the main thread; the target outlives the button's use below.
+        unsafe {
+            button.setTarget(Some(&target));
+            button.setAction(Some(sel!(answered:)));
+        }
+        *slot.borrow_mut() = Some(button);
+        let clicked = click_held_button(&slot);
+        let again = click_held_button(&slot);
+        check(
+            "Escape clicks the held Cancel once, and nothing once it is answered",
+            clicked && !again && target.ivars().clicks.get() == 1 && slot.borrow().is_none(),
+            format!(
+                "clicked {clicked}, again {again}, answers {}",
+                target.ivars().clicks.get()
+            ),
+        );
+
+        println!("{failed} failed");
+        std::process::exit(if failed == 0 { 0 } else { 1 });
+    }
+
+    pub struct AnswerIvars {
+        slot: Rc<RefCell<Option<Retained<NSButton>>>>,
+        clicks: Cell<u32>,
+    }
+
+    define_class!(
+        /// What the question's completion does with the slot: takes the button out.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = AnswerIvars]
+        struct Answer;
+
+        impl Answer {
+            #[unsafe(method(answered:))]
+            fn answered(&self, _sender: Option<&AnyObject>) {
+                self.ivars().clicks.set(self.ivars().clicks.get() + 1);
+                self.ivars().slot.borrow_mut().take();
+            }
+        }
+    );
+
+    impl Answer {
+        fn new(mtm: MainThreadMarker, slot: Rc<RefCell<Option<Retained<NSButton>>>>) -> Retained<Answer> {
+            let this = Answer::alloc(mtm).set_ivars(AnswerIvars {
+                slot,
+                clicks: Cell::new(0),
+            });
+            // SAFETY: NSObject's `init` on a freshly allocated object.
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+}

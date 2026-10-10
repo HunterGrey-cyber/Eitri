@@ -1329,6 +1329,13 @@ pub(crate) fn flock_file(
     }
 }
 
+/// What opening a socket fails with: `ENXIO` on Linux, `EOPNOTSUPP` on macOS. Each OS's own only, so
+/// nothing else is ever taken for a socket.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SOCKET_OPEN: i32 = libc::ENXIO;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const SOCKET_OPEN: i32 = libc::EOPNOTSUPP;
+
 /// Tries to take `path`'s `flock` exclusively without creating it: `Some` when it was free (the
 /// caller now holds it), `None` when someone else holds it. A path that is missing, a symlink or
 /// not a regular file (a directory, a socket, a FIFO) is [`std::io::ErrorKind::NotFound`]: there
@@ -1347,8 +1354,11 @@ pub(crate) fn try_flock_existing(path: &Path) -> Result<Option<ShadowLock>, Shad
     {
         Ok(file) => file,
         // `O_NOFOLLOW` on a symlink; a directory, which cannot be opened for writing; a socket,
-        // which cannot be opened at all.
-        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::EISDIR | libc::ENXIO)) => {
+        // which cannot be opened at all (`SOCKET_OPEN`).
+        Err(e)
+            if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::EISDIR))
+                || e.raw_os_error() == Some(SOCKET_OPEN) =>
+        {
             return Err(not_a_lock_file())
         }
         Err(e) => return Err(e.into()),

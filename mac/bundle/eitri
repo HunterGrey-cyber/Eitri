@@ -1,0 +1,44 @@
+#!/bin/sh
+# Opens a project in a window of its own: `eitri [DIR]`, the current directory by default. Each project is its
+# own Eitri process (`open -n`), started by LaunchServices from the app bundle this script lives in
+# (Eitri.app/Contents/Resources/bin/eitri), which may be reached through a symlink on PATH.
+set -eu
+
+if [ $# -gt 1 ]; then
+	echo "usage: eitri [DIR]" >&2
+	exit 2
+fi
+dir=${1:-.}
+# `cd -` is the previous directory, not one named `-`.
+[ "$dir" != - ] || dir=./-
+if ! abs=$(CDPATH= cd -- "$dir" 2>/dev/null && pwd -P); then
+	echo "eitri: $dir is not a directory" >&2
+	exit 1
+fi
+
+# Follow a symlink to this script back to the bundle.
+self=$0
+hops=0
+while [ -L "$self" ]; do
+	hops=$((hops + 1))
+	if [ "$hops" -gt 40 ]; then
+		echo "eitri: too many symlinks from $0 to the app bundle" >&2
+		exit 1
+	fi
+	target=$(readlink -- "$self")
+	case $target in
+	/*) self=$target ;;
+	*) self=$(dirname -- "$self")/$target ;;
+	esac
+done
+app=$(CDPATH= cd -- "$(dirname -- "$self")/../../.." && pwd -P)
+case $app in
+*.app) ;;
+*)
+	echo "eitri: this script is not inside an app bundle ($app)" >&2
+	exit 1
+	;;
+esac
+
+# `--` before the path: a directory whose name starts with `-` is still a directory.
+exec open -n -a "$app" --args -- "$abs"

@@ -141,9 +141,35 @@ fn files_are_private_and_a_leftover_is_swept_not_reported() {
     assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
 }
 
+/// Puts a socket node at `path`, whatever its length. Linux: `mknod` makes it without binding. Elsewhere
+/// (macOS) `mknod` of a socket needs root, so one is bound under a short path in `/tmp` and renamed into
+/// place: a rename keeps the node, and the socket path cap applies only to the bind.
+fn socket_node_at(path: &std::path::Path) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let socket = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `socket` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mknod(socket.as_ptr(), libc::S_IFSOCK | 0o600, 0) }, 0);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let short = std::path::PathBuf::from(format!("/tmp/eitri-sock-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&short).unwrap();
+        let bound = short.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&bound).unwrap();
+        std::fs::rename(&bound, path).unwrap();
+        drop(listener);
+        std::fs::remove_dir(&short).unwrap();
+    }
+}
+
 /// A directory or a socket at a presence path is no lock file and is skipped like a symlink: the
-/// probe opens for writing, which a directory refuses with `EISDIR` and a socket with `ENXIO`, and
-/// neither may block every revert.
+/// probe opens for writing, which a directory refuses with `EISDIR` and a socket with each OS's own
+/// errno (`ENXIO` on Linux, `EOPNOTSUPP` on macOS), and neither may block every revert.
 #[test]
 fn a_directory_or_a_socket_at_a_presence_path_is_skipped() {
     let scratch = Scratch::new("not-a-file");
@@ -151,10 +177,7 @@ fn a_directory_or_a_socket_at_a_presence_path_is_skipped() {
     drop(Presence::open(&dir, 4242).unwrap());
     std::fs::create_dir(dir.join("windows/9")).unwrap();
     std::fs::create_dir(dir.join("running/9.1")).unwrap();
-    // `mknod` makes the socket node without binding it, so the path's length does not matter.
-    let socket = std::ffi::CString::new(dir.join("windows/10").into_os_string().into_encoded_bytes()).unwrap();
-    // SAFETY: `socket` is a valid NUL-terminated path that outlives the call.
-    assert_eq!(unsafe { libc::mknod(socket.as_ptr(), libc::S_IFSOCK | 0o600, 0) }, 0);
+    socket_node_at(&dir.join("windows/10"));
     assert_eq!(busy_elsewhere(&dir, 100).unwrap(), None);
     assert!(dir.join("windows/9").is_dir(), "a directory is left alone");
     assert!(dir.join("running/9.1").is_dir());

@@ -474,6 +474,37 @@ impl AgentPanelHandle {
         AgentPanelHandle::over(Rc::new(RefCell::new(state)), Some(Rc::new(PanelPage::new(page))))
     }
 
+    /// [`for_host_test`](Self::for_host_test) with its tabs kept in `files` for `project`: one tab that keeps
+    /// the session `session` (a resume that failed, so the close has nothing to tear down and owes only the
+    /// write), and `before_write` run on the writer thread before each write. A host's test of its close holds
+    /// the last write with it and sees the close wait for it.
+    pub fn for_host_test_with_saved_tabs(
+        page: Rc<dyn crate::panel_page::PageSurface>,
+        files: PathBuf,
+        project: PathBuf,
+        session: &str,
+        before_write: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let handle = Self::for_host_test(page);
+        {
+            let mut state = handle.state.borrow_mut();
+            let state = &mut *state;
+            state.canonical_project_dir = project.to_string_lossy().into_owned();
+            state.conversation_id = agent::conversation_id_for_cwd(&project);
+            let mut writer = TabWriter::new(Some(files), project.clone());
+            writer.set_before_write(before_write);
+            state.tab_memory = writer;
+            state.project_dir = project;
+            let tab = state.tabs.active();
+            let tab = state.tabs.get_mut(tab).expect("the active tab");
+            tab.failed_resume = Some(session.to_owned());
+            tab.backend = TabBackend::Failed {
+                reason: "stopped".to_owned(),
+            };
+        }
+        handle
+    }
+
     /// Hands the panel a supervisor connection over `stream`, as a host's test plays the supervisor.
     pub fn connect_test_supervisor(&self, stream: std::os::unix::net::UnixStream) {
         self.state.borrow_mut().supervisor = crate::supervisor_client::SupervisorClient::over_stream(stream);

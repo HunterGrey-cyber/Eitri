@@ -35,6 +35,55 @@ pub const TICK: Duration = EditorFeeds::TICK;
 /// never retries a refused connect on its own.
 pub const ATTACH_RETRY_FOR: Duration = Duration::from_secs(2);
 
+/// Waiting for Neovide's nvim to listen before the link is aimed at it: the socket is looked for every
+/// [`AttachWait::POLL`]. After [`AttachWait::BUDGET`] (the wait `eitri split` allows its Neovide) the band says
+/// so, and the host keeps looking.
+#[derive(Debug, Clone, Copy)]
+pub struct AttachWait {
+    deadline: Instant,
+}
+
+/// What [`AttachWait::step`] says to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachStep {
+    Wait,
+    /// The socket is there: attach now.
+    Attach,
+    /// It has not appeared within the budget.
+    GiveUp,
+}
+
+impl AttachWait {
+    pub const POLL: Duration = Duration::from_millis(50);
+    pub const BUDGET: Duration = Duration::from_secs(15);
+
+    /// The panel's band while waiting.
+    pub const WAITING: (&'static str, &'static str) = ("attaching", "waiting for the editor to start\u{2026}");
+    /// The panel's band once the budget has passed; the socket is still looked for.
+    pub const GAVE_UP: (&'static str, &'static str) = (
+        // Still attaching, as the text says: the panel styles `failed` as an error.
+        "attaching",
+        "the editor has not started listening yet; its link attaches when it does",
+    );
+
+    pub fn new(now: Instant) -> AttachWait {
+        AttachWait {
+            deadline: now + Self::BUDGET,
+        }
+    }
+
+    /// `listening`: whether nvim's socket exists now.
+    pub fn step(&self, now: Instant, listening: bool) -> AttachStep {
+        if listening {
+            AttachStep::Attach
+        } else if now >= self.deadline {
+            AttachStep::GiveUp
+        } else {
+            AttachStep::Wait
+        }
+    }
+}
+
 /// What one [`Editor::poll`] found, for the host to act on once the poll has returned.
 pub enum EditorEvent {
     /// nvim's own navigator ran out of windows toward `Direction`: the keys continue beyond the editor.
@@ -98,7 +147,7 @@ impl Editor {
             ("pane switch", pane_switch.is_some()),
         ] {
             if !bound {
-                eprintln!("[editor] the {name} socket could not be bound; that part is not installed");
+                crate::log_error!("[editor] the {name} socket could not be bound; that part is not installed");
             }
         }
         let sockets = Sockets {
@@ -182,7 +231,7 @@ impl Editor {
             if let PaneMessage::Direction(letter) = message {
                 match pane_switch::letter_direction(letter) {
                     Some(direction) => events.push(EditorEvent::PaneSwitch(direction)),
-                    None => println!("[pane_switch] unknown direction {letter:?}, ignoring"),
+                    None => crate::log_line!("[pane_switch] unknown direction {letter:?}, ignoring"),
                 }
             }
         }
@@ -192,7 +241,7 @@ impl Editor {
     fn poll_link(&self, now: Instant, events: &mut Vec<EditorEvent>) {
         let poll = self.link.poll(now);
         for line in &poll.logs {
-            println!("{line}");
+            crate::log_line!("{line}");
         }
         if let Some((state, band, _peer)) = poll.changed {
             let was = self.attached.get();
@@ -207,10 +256,10 @@ impl Editor {
             if is {
                 self.retry_until.set(None);
             }
-            println!("[editor] link: {} {}", band.state, band.text);
+            crate::log_line!("[editor] link: {} {}", band.state, band.text);
             match &state {
                 LinkState::Failed { addr, why } if self.retry_until.get().is_some_and(|until| now < until) => {
-                    println!("[editor] attach failed ({why}); trying again");
+                    crate::log_line!("[editor] attach failed ({why}); trying again");
                     self.link.attach(addr.clone());
                 }
                 _ => events.push(EditorEvent::LinkChanged(band)),
@@ -277,9 +326,39 @@ impl Editor {
         }
     }
 
+    /// The editor-context feed's socket, where nvim's glue writes the file and selection; `None` when the feed
+    /// could not be made.
+    pub fn context_socket(&self) -> Option<&Path> {
+        self.context_feed.as_ref().map(EditorContextFeed::socket_path)
+    }
+
     /// The socket nvim listens on.
     pub fn nvim_listen(&self) -> &Path {
         &self.nvim_listen
+    }
+}
+
+#[cfg(test)]
+mod attach_wait_tests {
+    use super::*;
+
+    #[test]
+    fn the_socket_is_awaited_for_fifteen_seconds_then_given_up() {
+        let start = Instant::now();
+        let wait = AttachWait::new(start);
+        assert_eq!(wait.step(start, false), AttachStep::Wait);
+        assert_eq!(
+            wait.step(start + Duration::from_millis(14_950), false),
+            AttachStep::Wait
+        );
+        assert_eq!(wait.step(start + Duration::from_secs(15), false), AttachStep::GiveUp);
+        assert_eq!(
+            wait.step(start + Duration::from_secs(20), true),
+            AttachStep::Attach,
+            "late is still found"
+        );
+        assert_eq!(wait.step(start, true), AttachStep::Attach);
+        assert_eq!(AttachWait::POLL, Duration::from_millis(50));
     }
 }
 

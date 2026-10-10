@@ -994,8 +994,11 @@ mod tests {
     /// The editor is told apart by the process the kernel says holds its socket, not by the pid it
     /// reports about itself: a recorded channel of the process holding the socket is this panel's
     /// even when the editor's own report names another pid, and one recorded under that reported pid
-    /// is not.
+    /// is not. Linux only: elsewhere `panel_control` asks only `getpeereid`, which gives the uid alone, so there is
+    /// no holder to match and the reported pid is used, as the module says. (macOS could name the peer's pid with
+    /// `LOCAL_PEERPID`; `panel_control` does not ask it yet.)
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn an_earlier_channel_is_matched_by_the_sockets_holder_not_the_reported_pid() {
         let (link, _fake, _reader) = fake_link();
         let holder = link.peer_pid().expect("a socket pair names its peer");

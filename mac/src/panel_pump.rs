@@ -125,7 +125,7 @@ mod tests {
             };
             // SAFETY: one live `pollfd` for the call.
             let ready = unsafe { libc::poll(&mut polled, 1, wait_ms) };
-            let mut act = |timer: Timer, armed: &mut Option<Instant>| match timer {
+            let act = |timer: Timer, armed: &mut Option<Instant>| match timer {
                 Timer::Arm(at) => *armed = Some(at),
                 Timer::Keep => {}
                 Timer::Stop => *armed = None,

@@ -11,8 +11,9 @@ publish.workspace = true
 
 [features]
 legacy-backend = ["eitri-core/legacy-backend"]
-# `AgentPanelHandle::for_host_test`: a panel with no supervisor, disk or worker, for a host's own tests.
-test-support = []
+# `AgentPanelHandle::for_host_test`: a panel with no supervisor, disk or worker, for a host's own tests
+# (`for_host_test_with_saved_tabs` holds the saved tabs' writer through core's test hook).
+test-support = ["eitri-core/test-support"]
 
 [dependencies]
 agent = { path = "../agent" }

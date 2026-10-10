@@ -1,5 +1,6 @@
 //! What the window does with a key-down before AppKit dispatches it: the prefix first, then the
-//! pane's own rules (`Ctrl+h/j/k/l` between the editor and the panel, `Cmd` chords for the menu).
+//! pane's own rules (`Ctrl+h/j/k/l` between the editor and the panel). A `Cmd` chord is AppKit's in
+//! either pane: in the panel the page sees it first and the main menu gets what the page leaves.
 //!
 //! The AppKit half only describes the event ([`KeyDown`]) and acts on the answer ([`KeyAction`]); every
 //! decision is here, so the Linux workstation tests the whole table. The translation into the prefix's
@@ -50,8 +51,6 @@ pub enum KeyAction {
     /// A composition is open in the editor and `Ctrl+l` was pressed: end it, then hand this key to nvim
     /// through the link.
     EndCompositionThenNvim(&'static str),
-    /// `Cmd` held while the page has the keys: the main menu sees it first.
-    MenuFirst,
 }
 
 /// The window's two panes: the editor on the left, the panel on the right. The one place that says who
@@ -62,6 +61,14 @@ pub fn neighbour(from: Pane, direction: Direction) -> Option<Pane> {
         (Pane::Editor, Direction::Right) => Some(Pane::Panel),
         _ => None,
     }
+}
+
+/// Where the keys must go before a key-down is decided, if anywhere: a panel whose view is hidden never gets a
+/// key. When the window narrows, the panel's view is hidden at once but the keys are moved to the editor only on
+/// the next turn (Neovide is laying the window out); a key arriving in between would otherwise reach the page,
+/// where a plain `a` or `y` answers a permission card nobody can see.
+pub fn move_before_key(pane: Pane, panel_view_hidden: bool) -> Option<Pane> {
+    (pane == Pane::Panel && panel_view_hidden).then_some(Pane::Editor)
 }
 
 /// `kVK_*` codes of the bare modifier keys (right and left Command, Shift, Caps Lock, Option, Control,
@@ -126,6 +133,16 @@ pub fn press_for(key: &KeyDown) -> Press {
     Press::Key(KeySpec::char(ch, key.ctrl, key.option))
 }
 
+/// Command+Q alone: the chord the menu's Quit carries (Neovide's default `system_quit_hotkey`).
+pub fn is_quit_chord(key: &KeyDown) -> bool {
+    key.cmd && !key.ctrl && !key.option && !key.shift && key.chars.eq_ignore_ascii_case("q")
+}
+
+/// Escape with no modifier: what cancels an open question.
+pub fn is_plain_escape(key: &KeyDown) -> bool {
+    key.keycode == KVK_ESCAPE && !key.cmd && !key.ctrl && !key.option && !key.shift
+}
+
 /// The direction `Ctrl+h/j/k/l` names; any other modifier alongside makes it a different key.
 fn nav_direction(key: &KeyDown) -> Option<Direction> {
     if !key.ctrl || key.shift || key.option || key.cmd {
@@ -143,8 +160,9 @@ fn nav_direction(key: &KeyDown) -> Option<Direction> {
 pub struct Keys {
     prefix: Prefix,
     nav_intercept: Rc<dyn Fn(Direction) -> bool>,
-    /// The last key routed to a pane and still down: a repeat of it never follows it into the other pane.
-    down: Option<(u16, Pane)>,
+    /// The last key pressed and still down, with the pane it was routed to (`None`: it went to neither, such as
+    /// the quit question's sheet): a repeat of it never follows it into another pane.
+    down: Option<(u16, Option<Pane>)>,
 }
 
 impl Keys {
@@ -173,24 +191,27 @@ impl Keys {
         let outcome = self.prefix.press(press_for(key), u32::from(code), now);
         let waiting = self.prefix.waiting();
         if was != waiting {
-            println!("[prefix] armed={} waiting={waiting:?}", waiting != Waiting::No);
+            crate::log_line!("[prefix] armed={} waiting={waiting:?}", waiting != Waiting::No);
         }
         match outcome {
             Outcome::Swallow => return KeyAction::Swallow,
             Outcome::Run(command) => {
-                println!("[prefix] {command:?}");
+                crate::log_line!("[prefix] {command:?}");
                 return KeyAction::RunPrefix(command);
             }
             Outcome::Pass => {}
         }
         // Holding Ctrl+h in the page moves the keys to the editor, and its repeats would then reach nvim
         // (in Insert mode `<C-h>` deletes); Ctrl+l at nvim's edge does the same the other way.
-        if key.repeat && self.down.is_some_and(|(held, first)| held == code && first != pane) {
+        if key.repeat
+            && self
+                .down
+                .is_some_and(|(held, first)| held == code && first != Some(pane))
+        {
             return KeyAction::Swallow;
         }
         let direction = nav_direction(key);
         let action = match pane {
-            Pane::Panel if key.cmd => KeyAction::MenuFirst,
             Pane::Panel => match direction {
                 Some(direction) if (self.nav_intercept)(direction) => KeyAction::Swallow,
                 Some(direction) if neighbour(Pane::Panel, direction) == Some(Pane::Editor) => KeyAction::FocusEditor,
@@ -202,9 +223,22 @@ impl Keys {
             Pane::Editor => KeyAction::Pass,
         };
         if !key.repeat {
-            self.down = Some((code, pane));
+            self.down = Some((code, Some(pane)));
         }
         action
+    }
+
+    /// A key-down that went to neither pane (the quit question's sheet, which a Return or an Escape answers): its
+    /// repeats reach no pane until it is released, or the sheet's answer would be followed by the held key's
+    /// repeats in the pane that has the keys (a Return sending the composer's draft).
+    pub fn hold(&mut self, keycode: u16) {
+        self.down = Some((keycode, None));
+    }
+
+    /// Whether a key-down is held off both panes: a fresh press (a repeat keeps what its press was given) while a
+    /// sheet of the window's own, the quit question, takes the keys.
+    pub fn held_off_by_question(key: &KeyDown, question_open: bool) -> bool {
+        question_open && !key.repeat
     }
 
     pub fn key_up(&mut self, keycode: u16) {
@@ -224,7 +258,7 @@ impl Keys {
         let was = self.prefix.waiting();
         self.prefix.cancel();
         if was != Waiting::No {
-            println!("[prefix] armed=false waiting={:?}", Waiting::No);
+            crate::log_line!("[prefix] armed=false waiting={:?}", Waiting::No);
         }
     }
 
@@ -271,6 +305,14 @@ mod tests {
             ..plain(chars, keycode)
         }
     }
+    #[test]
+    fn a_key_never_reaches_a_hidden_panel() {
+        assert_eq!(move_before_key(Pane::Panel, true), Some(Pane::Editor));
+        assert_eq!(move_before_key(Pane::Panel, false), None);
+        assert_eq!(move_before_key(Pane::Editor, true), None);
+        assert_eq!(move_before_key(Pane::Editor, false), None);
+    }
+
     fn repeating(key: KeyDown) -> KeyDown {
         KeyDown { repeat: true, ..key }
     }
@@ -349,9 +391,47 @@ mod tests {
     }
 
     #[test]
-    fn panel_cmd_c_goes_to_the_menu_first() {
+    fn panel_cmd_c_goes_to_the_page_first() {
+        // The page may claim the chord; what it leaves reaches the main menu through AppKit's own order.
         let mut f = fixture(&[]);
-        assert_eq!(down(&mut f, &cmd("c", C), Pane::Panel, false), KeyAction::MenuFirst);
+        assert_eq!(down(&mut f, &cmd("c", C), Pane::Panel, false), KeyAction::Pass);
+    }
+
+    #[test]
+    fn panel_ctrl_cmd_h_is_not_a_move_to_the_editor() {
+        // With Command held the chord is AppKit's (the page's, then the menu's), never the pane move.
+        let mut f = fixture(&[]);
+        let key = KeyDown {
+            ctrl: true,
+            ..cmd("h", 4)
+        };
+        assert_eq!(down(&mut f, &key, Pane::Panel, false), KeyAction::Pass);
+    }
+
+    #[test]
+    fn only_command_q_alone_is_the_quit_chord() {
+        assert!(is_quit_chord(&cmd("q", 12)));
+        assert!(!is_quit_chord(&plain("q", 12)));
+        assert!(!is_quit_chord(&KeyDown {
+            shift: true,
+            ..cmd("Q", 12)
+        }));
+        assert!(!is_quit_chord(&KeyDown {
+            option: true,
+            ..cmd("q", 12)
+        }));
+        assert!(!is_quit_chord(&cmd("w", 13)));
+    }
+
+    #[test]
+    fn only_escape_alone_is_plain_escape() {
+        assert!(is_plain_escape(&plain("\u{1b}", 53)));
+        assert!(!is_plain_escape(&KeyDown {
+            shift: true,
+            ..plain("\u{1b}", 53)
+        }));
+        assert!(!is_plain_escape(&cmd(".", 47)));
+        assert!(!is_plain_escape(&plain("q", 12)));
     }
 
     #[test]
@@ -460,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn armed_then_cmd_c_is_swallowed_not_sent_to_the_menu() {
+    fn armed_then_cmd_c_is_swallowed() {
         let mut f = fixture(&[]);
         arm(&mut f, Pane::Panel);
         assert_eq!(down(&mut f, &cmd("c", C), Pane::Panel, false), KeyAction::Swallow);
@@ -497,6 +577,42 @@ mod tests {
         );
         assert_eq!(
             down(&mut f, &repeating(plain("\u{7f}", BACKSPACE)), Pane::Editor, false),
+            KeyAction::Pass
+        );
+    }
+
+    #[test]
+    fn a_key_that_answered_the_quit_question_does_not_repeat_into_a_pane() {
+        const RETURN: u16 = 36;
+        const ESCAPE: u16 = 53;
+        let enter = plain("\r", RETURN);
+        let escape = plain("\u{1b}", ESCAPE);
+        // A fresh press while the question is open is held; a repeat keeps what its press was given.
+        assert!(Keys::held_off_by_question(&enter, true));
+        assert!(!Keys::held_off_by_question(&repeating(enter.clone()), true));
+        assert!(!Keys::held_off_by_question(&enter, false));
+        for (key, code) in [(&enter, RETURN), (&escape, ESCAPE)] {
+            for pane in [Pane::Panel, Pane::Editor] {
+                let mut f = fixture(&[]);
+                // The draft's last letter went to the composer; then the press answered the sheet.
+                assert_eq!(down(&mut f, &plain("x", 7), pane, false), KeyAction::Pass);
+                f.keys.hold(code);
+                // The sheet is gone and the key is still down: its repeats reach neither pane.
+                for _ in 0..3 {
+                    assert_eq!(down(&mut f, &repeating(key.clone()), pane, false), KeyAction::Swallow);
+                }
+                f.keys.key_up(code);
+                // Pressed again, it is the pane's.
+                assert_eq!(down(&mut f, key, pane, false), KeyAction::Pass);
+                assert_eq!(down(&mut f, &repeating(key.clone()), pane, false), KeyAction::Pass);
+            }
+        }
+        // A lost key-up costs nothing: the next press of the key is new.
+        let mut f = fixture(&[]);
+        f.keys.hold(RETURN);
+        assert_eq!(down(&mut f, &enter, Pane::Panel, false), KeyAction::Pass);
+        assert_eq!(
+            down(&mut f, &repeating(enter.clone()), Pane::Panel, false),
             KeyAction::Pass
         );
     }

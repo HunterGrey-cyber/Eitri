@@ -12,6 +12,8 @@ const NEVER_BOUND: &[(&str, &str)] = &[
     ("mac/src/startup.rs", "const NVIM_SOCKET: &str = \"n.sock\""),
     // The test fixture for `neovide_args`: a path handed to a function that only formats it.
     ("mac/src/startup.rs", "let sock = Path::new(\"/r/n.sock\");"),
+    // The file-name half of the acceptance socket's naming; it reaches `bind` only through `in_dir`.
+    ("mac/src/appkit/acceptance.rs", "const SOCKET: &str = \"a.sock\""),
 ];
 
 #[test]

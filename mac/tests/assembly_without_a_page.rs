@@ -4,7 +4,7 @@
 //! One test, because it owns the process: the panel writes its preferences and a presence lock under the
 //! state home, and the account and settings-tier configuration are process-wide.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::LazyLock;
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use eitri_core::keymap::prefix::PrefixCommand;
 use eitri_core::keymap::{Action, TabAction};
 use eitri_core::layout::Direction;
-use eitri_mac::assembly::{assemble, HostActions, NOT_IN_THIS_WINDOW};
+use eitri_mac::assembly::{assemble, HostActions, NOT_IN_THIS_WINDOW, PANEL_NOT_SHOWN, PANEL_TOOK_NO_KEYS};
 use eitri_mac::editor::{Editor, EditorEvent};
 use eitri_mac::keys::Pane;
 use eitri_panel::panel_document::PanelDocument;
@@ -36,16 +36,25 @@ enum Done {
     Hidden(bool),
 }
 
+/// What the host was asked to do. The first flag stands for a window too narrow to show the panel, the second
+/// for AppKit refusing a view the keys.
 #[derive(Default)]
-struct Recorder(RefCell<Vec<Done>>);
+struct Recorder(RefCell<Vec<Done>>, Cell<bool>, Cell<bool>);
 impl Recorder {
     fn take(&self) -> Vec<Done> {
         std::mem::take(&mut *self.0.borrow_mut())
     }
+    fn set_narrow(&self, narrow: bool) {
+        self.1.set(narrow);
+    }
+    fn set_refusing(&self, refusing: bool) {
+        self.2.set(refusing);
+    }
 }
 impl HostActions for Recorder {
-    fn focus(&self, pane: Pane) {
+    fn focus(&self, pane: Pane) -> bool {
         self.0.borrow_mut().push(Done::Focus(pane));
+        !self.2.get()
     }
     fn toast(&self, text: &str) {
         self.0.borrow_mut().push(Done::Toast(text.to_string()));
@@ -55,6 +64,10 @@ impl HostActions for Recorder {
     }
     fn set_panel_hidden(&self, hidden: bool) {
         self.0.borrow_mut().push(Done::Hidden(hidden));
+    }
+    fn panel_visible(&self) -> bool {
+        // Shown unless the window is narrow; the zoom's own state is the assembly's, and is what is tested.
+        !self.1.get()
     }
 }
 
@@ -115,6 +128,73 @@ fn the_configuration_and_the_events_reach_the_panel_and_the_host() {
     actions.take();
     assembly.run_prefix(run(Action::Tab(TabAction::New)), Pane::Editor);
     assert_eq!(actions.take(), vec![Done::Hidden(false), Done::Focus(Pane::Panel)]);
+
+    // A window too narrow for the panel: nvim's navigator at its right edge, `prefix l`, a tab verb, the keymap
+    // and the command line all leave the keys where they are and say why; the verbs that read the keys are not
+    // run in a panel nobody can see.
+    actions.set_narrow(true);
+    assembly.handle(EditorEvent::PaneSwitch(Direction::Right));
+    assert_eq!(actions.take(), vec![Done::Toast(PANEL_NOT_SHOWN.to_string())]);
+    assembly.run_prefix(run(Action::Select(Direction::Right)), Pane::Editor);
+    assert_eq!(actions.take(), vec![Done::Toast(PANEL_NOT_SHOWN.to_string())]);
+    for action in [
+        Action::Tab(TabAction::Close),
+        Action::PanelKeymap,
+        Action::PanelCommandLine,
+    ] {
+        assembly.run_prefix(run(action.clone()), Pane::Editor);
+        assert_eq!(
+            actions.take(),
+            vec![Done::Toast(PANEL_NOT_SHOWN.to_string())],
+            "{action:?}"
+        );
+    }
+    // Hidden by the zoom as well: the zoom is undone as asked, and the keys still stay.
+    assembly.run_prefix(run(Action::Zoom), Pane::Editor);
+    assert_eq!(actions.take(), vec![Done::Hidden(true)]);
+    assembly.handle(EditorEvent::PaneSwitch(Direction::Right));
+    assert_eq!(
+        actions.take(),
+        vec![Done::Hidden(false), Done::Toast(PANEL_NOT_SHOWN.to_string())]
+    );
+    // The zoom asked to show a panel the width does not allow says so.
+    assembly.run_prefix(run(Action::Zoom), Pane::Editor);
+    assembly.run_prefix(run(Action::Zoom), Pane::Editor);
+    assert_eq!(
+        actions.take(),
+        vec![
+            Done::Hidden(true),
+            Done::Hidden(false),
+            Done::Toast(PANEL_NOT_SHOWN.to_string())
+        ]
+    );
+    // Wide again: the keys go.
+    actions.set_narrow(false);
+    assembly.handle(EditorEvent::PaneSwitch(Direction::Right));
+    assert_eq!(actions.take(), vec![Done::Focus(Pane::Panel)]);
+
+    // On screen, but the move did not happen (AppKit refused the web view the keys): what was asked of the
+    // keys is not done, and the window says so, as for a panel it cannot show.
+    actions.set_refusing(true);
+    for action in [
+        Action::Select(Direction::Right),
+        Action::Tab(TabAction::Close),
+        Action::PanelKeymap,
+        Action::PanelCommandLine,
+    ] {
+        assembly.run_prefix(run(action.clone()), Pane::Editor);
+        assert_eq!(
+            actions.take(),
+            vec![Done::Focus(Pane::Panel), Done::Toast(PANEL_TOOK_NO_KEYS.to_string())],
+            "{action:?}"
+        );
+    }
+    assembly.handle(EditorEvent::PaneSwitch(Direction::Right));
+    assert_eq!(
+        actions.take(),
+        vec![Done::Focus(Pane::Panel), Done::Toast(PANEL_TOOK_NO_KEYS.to_string())]
+    );
+    actions.set_refusing(false);
 
     // What this window has no place for is said so.
     assembly.run_prefix(run(Action::Hint), Pane::Panel);

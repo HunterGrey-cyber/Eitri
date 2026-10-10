@@ -1,4 +1,4 @@
-//! Asserts this crate's own `Cargo.toml` never grows a GTK/WebKit dependency.
+//! Asserts this crate's own `Cargo.toml` never grows a GTK/WebKitGTK dependency.
 //!
 //! The Mac host draws with AppKit, which arrives under a macOS target table (an `objc2` crate is not
 //! on the forbidden list); a GTK or WebKitGTK crate, used or not, would tie the Mac host to the
@@ -105,7 +105,7 @@ fn manifest_declares_no_gtk_or_webkit_dependency() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "eitri-mac must not depend on a GTK or WebKit crate on any target -- its macOS half uses AppKit and is compiled on macOS only:\n{}",
+        "eitri-mac must not depend on a GTK or WebKitGTK crate on any target -- its macOS half uses AppKit and Apple's WebKit and is compiled on macOS only:\n{}",
         offenders.join("\n")
     );
 }

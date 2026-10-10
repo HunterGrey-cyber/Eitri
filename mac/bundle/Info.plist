@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The template bundle.sh fills in: @BUNDLE_ID@ (cn.huntergrey.eitri unless overridden), @NUMERIC_VERSION@ (the
+  workspace version's MAJOR.MINOR.PATCH, all the version keys take) and @VERSION@ (the full workspace version).
+  Sudden and automatic termination stay off: AppKit would otherwise be free to end the app without the
+  will-terminate notification, on which the agent sessions and the sidecar are shut down.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>@BUNDLE_ID@</string>
+	<key>CFBundleName</key>
+	<string>Eitri</string>
+	<key>CFBundleDisplayName</key>
+	<string>Eitri</string>
+	<key>CFBundleExecutable</key>
+	<string>Eitri</string>
+	<key>CFBundleIconFile</key>
+	<string>Eitri</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@NUMERIC_VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@NUMERIC_VERSION@</string>
+	<key>EitriVersion</key>
+	<string>@VERSION@</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.6</string>
+	<key>LSArchitecturePriority</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+</dict>
+</plist>

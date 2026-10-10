@@ -6,8 +6,11 @@ publish.workspace = true
 
 # The macOS host: Neovide's window with the agent panel beside the editor. This manifest carries the
 # host-neutral half (startup, paths, the layout policy), which builds and tests on any OS; the AppKit
-# half goes under a macOS target table. No GTK, GLib or WebKit crate may appear here, directly or
-# transitively (`src/manifest_guard.rs`, `core/tests/f1_no_toolkit_below_shell.rs`).
+# half is under the macOS target table below (AppKit and Apple's WebKit, through objc2). No GTK, GLib or
+# WebKitGTK crate may appear here, directly or transitively (`src/manifest_guard.rs`,
+# `core/tests/f1_no_toolkit_below_shell.rs`).
+
+build = "build.rs"
 
 [lib]
 path = "src/lib.rs"
@@ -23,6 +26,30 @@ eitri-panel = { path = "../panel" }
 # `dup2` and `fcntl` for the standard-input detach.
 libc = "0.2"
 
+# The AppKit half: Neovide's window through the fork's embedder, and the panel's page in a WKWebView.
+# The objc2 family at the versions the fork itself resolves, so one copy of each is compiled.
+[target.'cfg(target_os = "macos")'.dependencies]
+neovide = { path = "../neovide" }
+objc2 = "0.6.1"
+objc2-foundation = "0.3.1"
+objc2-app-kit = "0.3.1"
+objc2-web-kit = "0.3.1"
+block2 = "0.6.1"
+dispatch2 = "0.3.0"
+# Only to name the window Neovide hands the embedder, and read its AppKit view: the version the fork pins.
+winit = "=0.30.13"
+# The envelope as a JavaScript string literal in the page's dispatch call.
+serde_json = "1"
+
+[features]
+# A diagnostic socket for the acceptance driver (state, scripts in the page, recorded links). Never in a
+# default build; the bundle script refuses to sign a build with it unless asked for an acceptance build.
+acceptance = []
+
+[build-dependencies]
+# The web bundle's input fingerprint (`shell/build_web.rs`); the version `shell` already resolves.
+sha2 = "0.10"
+
 [dev-dependencies]
 eitri-core = { path = "../core", features = ["test-support"] }
 # `AgentPanelHandle::for_host_test`, for driving the panel's tick the way this window will. Tests only.
@@ -31,3 +58,18 @@ tempfile = "3"
 # The real-nvim tests' own probe connection builds its calls from msgpack values.
 rmpv = "1"
 serde_json = "1"
+
+# The page in a real WKWebView runs on the main thread, which only a test without the harness gets.
+[[test]]
+name = "appkit_page"
+harness = false
+
+# The Edit menu against a replaced main menu, on the main thread like the page's test.
+[[test]]
+name = "appkit_menu"
+harness = false
+
+# The host's start and end on the real page, without a window, on the main thread.
+[[test]]
+name = "appkit_host"
+harness = false

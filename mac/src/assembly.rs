@@ -32,10 +32,19 @@ use crate::keys::{neighbour, Keys, Pane};
 /// companion window's own text names the wrong window.
 pub const NOT_IN_THIS_WINDOW: &str = "not in this window";
 
+/// What the window says when the keys cannot go to the panel because it is not on screen: the window is too
+/// narrow to show it beside the editor.
+pub const PANEL_NOT_SHOWN: &str = "the window is too narrow for the panel; widen it to use the panel";
+
+/// What the window says when the panel is on screen but the keys did not move to it (AppKit refused its view
+/// the keys, or the window had none yet).
+pub const PANEL_TOOK_NO_KEYS: &str = "the panel could not take the keys; they stay where they are";
+
 /// What only the AppKit half can do.
 pub trait HostActions {
-    /// Move the keys within the window.
-    fn focus(&self, pane: Pane);
+    /// Move the keys within the window. `true` when `pane` has them afterwards: AppKit may refuse its view the
+    /// keys, and a panel whose view is hidden never takes them.
+    fn focus(&self, pane: Pane) -> bool;
     fn toast(&self, text: &str);
     /// Bring the window forward and give the editor the keys: something happened there the user must see
     /// (a draft to edit, a file the review opened).
@@ -43,6 +52,10 @@ pub trait HostActions {
     /// The prefix's zoom: the panel is hidden (`true`) or shown again. The host relayouts and, when it
     /// hides the panel, moves the keys to the editor.
     fn set_panel_hidden(&self, hidden: bool);
+    /// Whether the panel is on screen now: not hidden by the zoom, and the window wide enough to show it beside
+    /// the editor. A panel that is not on screen must never get the keys: a plain `a` or `y` would answer a
+    /// permission card nobody can see.
+    fn panel_visible(&self) -> bool;
 }
 
 /// Text size steps, as the one-pane companion case of the full window's rule: the panel alone is scaled
@@ -56,6 +69,39 @@ fn stepped(scale: f32, change: TextChange) -> f32 {
     ((next.clamp(0.5, 3.0)) * 100.0).round() / 100.0
 }
 
+/// What the panel has been told about the keys, so it is told only of a change: whether it has keyboard focus
+/// (it drops a pending bypass question when it loses it), and whether the editor has the keys (the typing
+/// cadence holds the panel's stream back only while keys go to the editor, and losing them ends the typing
+/// window at once). Either needs the window to be the key window: no key reaches a pane of a window that is not.
+#[derive(Debug, Default)]
+pub struct KeysReport {
+    told: Option<(bool, bool)>,
+}
+
+/// One change [`KeysReport::update`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysChange {
+    PanelFocused(bool),
+    EditorHasKeys(bool),
+}
+
+impl KeysReport {
+    /// The changes to tell the panel now that `pane` has the keys and the window is key or not; all of them
+    /// the first time.
+    pub fn update(&mut self, pane: Pane, window_key: bool) -> Vec<KeysChange> {
+        let now = (pane == Pane::Panel && window_key, pane == Pane::Editor && window_key);
+        let before = self.told.replace(now);
+        let mut changes = Vec::new();
+        if before.map(|b| b.0) != Some(now.0) {
+            changes.push(KeysChange::PanelFocused(now.0));
+        }
+        if before.map(|b| b.1) != Some(now.1) {
+            changes.push(KeysChange::EditorHasKeys(now.1));
+        }
+        changes
+    }
+}
+
 /// The state the panel's hooks and the prefix's commands share. Hooks keep it alive through the panel
 /// handle (the handle holds them), as the companion window's closures do: it lives for the process.
 struct Shared {
@@ -67,6 +113,9 @@ struct Shared {
     base_font_px: f32,
     panel_hidden: Cell<bool>,
     panel_scale: Cell<f32>,
+    /// The band the editor link last reported: `(state, text)`.
+    editor_link: RefCell<Option<(String, String)>>,
+    keys_report: RefCell<KeysReport>,
 }
 
 impl Shared {
@@ -74,13 +123,27 @@ impl Shared {
         self.base_font_px * self.panel_scale.get()
     }
 
-    /// The keys go to the panel. A hidden panel is shown first: tmux's `select-pane` unzooms a zoomed
-    /// window, and a tab verb that takes the keys means "show the chat".
-    fn give_panel_keys(&self) {
+    /// The keys go to the panel. A panel hidden by the zoom is shown first: tmux's `select-pane` unzooms a
+    /// zoomed window, and a tab verb that takes the keys means "show the chat". A panel the window is too narrow
+    /// to show is refused with a notice, and the keys stay where they are: `false`, and the caller does nothing
+    /// that needs them. The zoom is undone even then, as the request asked; the panel appears once the window is
+    /// wide enough. A move the host could not make is refused the same way: what is decided is where the keys
+    /// went, not where they were sent.
+    fn give_panel_keys(&self) -> bool {
         if self.panel_hidden.replace(false) {
             self.actions.set_panel_hidden(false);
         }
-        self.actions.focus(Pane::Panel);
+        if !self.actions.panel_visible() {
+            crate::log_line!("[mac] the panel is not on screen; the keys stay where they are");
+            self.actions.toast(PANEL_NOT_SHOWN);
+            return false;
+        }
+        if !self.actions.focus(Pane::Panel) {
+            crate::log_line!("[mac] the panel did not take the keys; they stay where they are");
+            self.actions.toast(PANEL_TOOK_NO_KEYS);
+            return false;
+        }
+        true
     }
 
     /// The prefix's tab verbs, as the companion window runs them: the chat takes the keys first for the
@@ -92,8 +155,10 @@ impl Shared {
         };
         // No terminal exists here, so the count is zero: `n`/`p` step the chat's tabs.
         let plan = plan(action, Some(keys_in), 0);
-        if plan.takes_the_keys {
-            self.give_panel_keys();
+        // A verb that reads the keys is not run in a panel that cannot have them: a close question would wait,
+        // unseen, for the `y` meant for the editor.
+        if plan.takes_the_keys && !self.give_panel_keys() {
+            return;
         }
         let panel = &self.panel;
         let switched = match plan.verb {
@@ -139,27 +204,34 @@ impl Shared {
             PrefixCommand::Run(action) => action,
             // A module key after a split key: there is nothing to place.
             PrefixCommand::Place { module, axis } => {
-                println!("[mac] prefix: place {module} {axis:?} refused");
+                crate::log_line!("[mac] prefix: place {module} {axis:?} refused");
                 self.actions.toast(NOT_IN_THIS_WINDOW);
                 return;
             }
         };
         if action == Action::Zoom {
+            // The zoom is the user's choice and is kept whatever the width; asked to show a panel the window is too
+            // narrow for, it says why nothing appears.
             let hidden = !self.panel_hidden.get();
             self.panel_hidden.set(hidden);
             self.actions.set_panel_hidden(hidden);
+            if !hidden && !self.actions.panel_visible() {
+                self.actions.toast(PANEL_NOT_SHOWN);
+            }
             return;
         }
         match companion_prefix::classify(&action) {
             CompanionVerb::Tab(tab) => self.run_tab(tab, pane),
             CompanionVerb::Reload => self.panel.reload_document_by_hand(),
             CompanionVerb::Keymap => {
-                self.give_panel_keys();
-                self.panel.open_keymap();
+                if self.give_panel_keys() {
+                    self.panel.open_keymap();
+                }
             }
             CompanionVerb::CommandLine => {
-                self.give_panel_keys();
-                self.panel.open_command_line();
+                if self.give_panel_keys() {
+                    self.panel.open_command_line();
+                }
             }
             CompanionVerb::Text(change) => {
                 self.panel_scale.set(stepped(self.panel_scale.get(), change));
@@ -172,7 +244,7 @@ impl Shared {
                         Pane::Panel => self.panel.literal_key(&key),
                         Pane::Editor => {
                             if let Err(why) = self.editor.send_keys(&key.to_vim()) {
-                                println!("[mac] prefix: the key did not reach the editor: {why}");
+                                crate::log_line!("[mac] prefix: the key did not reach the editor: {why}");
                                 self.actions.toast(&why);
                             }
                         }
@@ -180,12 +252,16 @@ impl Shared {
                 }
             }
             CompanionVerb::Select(direction) => match neighbour(pane, direction) {
-                Some(Pane::Panel) => self.give_panel_keys(),
-                Some(Pane::Editor) => self.actions.focus(Pane::Editor),
-                None => println!("[mac] prefix: nothing {direction:?} of the {pane:?}"),
+                Some(Pane::Panel) => {
+                    self.give_panel_keys();
+                }
+                Some(Pane::Editor) => {
+                    self.actions.focus(Pane::Editor);
+                }
+                None => crate::log_line!("[mac] prefix: nothing {direction:?} of the {pane:?}"),
             },
             CompanionVerb::Refuse => {
-                println!("[mac] prefix: {action:?} refused");
+                crate::log_line!("[mac] prefix: {action:?} refused");
                 self.actions.toast(NOT_IN_THIS_WINDOW);
             }
         }
@@ -194,13 +270,16 @@ impl Shared {
     fn handle(&self, event: EditorEvent) {
         match event {
             EditorEvent::PaneSwitch(direction) => match neighbour(Pane::Editor, direction) {
-                Some(_) => self.give_panel_keys(),
-                None => println!("[mac] pane switch {direction:?} from the editor leads nowhere"),
+                Some(_) => {
+                    self.give_panel_keys();
+                }
+                None => crate::log_line!("[mac] pane switch {direction:?} from the editor leads nowhere"),
             },
             EditorEvent::Theme(payload) => {
-                println!(
+                crate::log_line!(
                     "[theme] following nvim colorscheme {:?} (background={})",
-                    payload.options.colors_name, payload.options.background
+                    payload.options.colors_name,
+                    payload.options.background
                 );
                 let mut tokens = ThemeTokens::derive(&payload);
                 tokens.font_size_px = self.panel_font_size_px();
@@ -208,14 +287,15 @@ impl Shared {
             }
             EditorEvent::Keys(report) => self.keys_help.nvim_report(report),
             EditorEvent::LinkChanged(band) => {
-                println!("[mac] link: {} {}", band.state, band.text);
+                crate::log_line!("[mac] link: {} {}", band.state, band.text);
+                *self.editor_link.borrow_mut() = Some((band.state.to_owned(), band.text.clone()));
                 self.panel.set_editor_link(band);
             }
             EditorEvent::ContextChanged => self.panel.wake(),
             EditorEvent::CancelDrafts => {
                 let cut = self.panel.editor_detached();
                 if cut > 0 {
-                    println!("[mac] ended {cut} draft edit(s) out in the editor");
+                    crate::log_line!("[mac] ended {cut} draft edit(s) out in the editor");
                 }
                 self.panel.review_editor_lost();
             }
@@ -251,7 +331,7 @@ pub fn assemble(
     // This window has no place for a Lua command, and nothing runs `shell:ready`.
     let commands = kernel.commands.borrow().len();
     if commands > 0 {
-        println!("[mac] init.lua registers {commands} command(s); this window runs none");
+        crate::log_line!("[mac] init.lua registers {commands} command(s); this window runs none");
     }
     let config = window_config::load(&kernel, &[])?;
     let module_keys = Rc::new(ModuleKeys::build(&[], &config.keymap).map_err(|e| e.to_string())?);
@@ -287,6 +367,8 @@ pub fn assemble(
         base_font_px: config.panel_font_size,
         panel_hidden: Cell::new(false),
         panel_scale: Cell::new(1.0),
+        editor_link: RefCell::new(None),
+        keys_report: RefCell::new(KeysReport::default()),
     });
     install_hooks(&shared);
     let keys = Keys::new(config.keymap.clone(), module_keys, panel.nav_intercept());
@@ -348,8 +430,8 @@ fn install_hooks(shared: &Rc<Shared>) {
         // An edit that came back: the keys return to the panel, on the oldest card if one waits.
         let shared = shared.clone();
         panel.on_editor_done(move || {
-            shared.give_panel_keys();
-            if !shared.panel.focus_oldest_card() {
+            // The arrival is where the keys land in the panel; without them it has nowhere to land.
+            if shared.give_panel_keys() && !shared.panel.focus_oldest_card() {
                 shared.panel.arrive();
             }
         });
@@ -368,9 +450,38 @@ impl Assembly {
         self.shared.run_prefix(command, pane);
     }
 
+    /// Tells the panel where the keys are: `pane` has them, and the window is the key window or not. Call it
+    /// whenever either may have changed (a move between the panes, the window gaining or losing the keys, the
+    /// panel hidden); only a change reaches the panel.
+    pub fn report_keys(&self, pane: Pane, window_key: bool) {
+        // Bound first: the panel's calls below must find no borrow held.
+        let changes = self.shared.keys_report.borrow_mut().update(pane, window_key);
+        for change in changes {
+            match change {
+                KeysChange::PanelFocused(focused) => self.panel.set_pane_focused(focused),
+                KeysChange::EditorHasKeys(has) => self.panel.set_editor_has_keys(has),
+            }
+        }
+    }
+
     /// The panel's text size now: `agent.font_size` times the window's own scale.
     pub fn panel_font_size_px(&self) -> f32 {
         self.shared.panel_font_size_px()
+    }
+
+    /// The band the editor link last reported, `(state, text)`; `None` before the first report.
+    pub fn editor_link(&self) -> Option<(String, String)> {
+        self.shared.editor_link.borrow().clone()
+    }
+
+    /// Shows a band about the editor link the host itself knows (while it waits for nvim), as the link's
+    /// own reports are shown.
+    pub fn report_editor_link(&self, state: &'static str, text: &str) {
+        self.shared
+            .handle(EditorEvent::LinkChanged(eitri_core::companion::attach::BandLink {
+                state,
+                text: text.to_owned(),
+            }));
     }
 
     /// One call of the window's tick: the editor's feeds and link, each event handled.
@@ -384,6 +495,35 @@ impl Assembly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_editor_has_the_keys_only_while_its_pane_has_them_in_the_key_window() {
+        use KeysChange::{EditorHasKeys, PanelFocused};
+        let mut report = KeysReport::default();
+        // The first report says both.
+        assert_eq!(
+            report.update(Pane::Editor, true),
+            [PanelFocused(false), EditorHasKeys(true)]
+        );
+        assert_eq!(report.update(Pane::Editor, true), [], "no change, nothing told");
+        // A move to the panel: the typing window ends.
+        assert_eq!(
+            report.update(Pane::Panel, true),
+            [PanelFocused(true), EditorHasKeys(false)]
+        );
+        // Back to the editor (`Ctrl+h`, or the panel hidden by the zoom or a narrow window).
+        assert_eq!(
+            report.update(Pane::Editor, true),
+            [PanelFocused(false), EditorHasKeys(true)]
+        );
+        // The window lost the keys (another app, the quit question's sheet) and got them back.
+        assert_eq!(report.update(Pane::Editor, false), [EditorHasKeys(false)]);
+        assert_eq!(report.update(Pane::Editor, true), [EditorHasKeys(true)]);
+        // The panel's focus follows the window too, and the editor's stays off meanwhile.
+        report.update(Pane::Panel, true);
+        assert_eq!(report.update(Pane::Panel, false), [PanelFocused(false)]);
+        assert_eq!(report.update(Pane::Editor, false), []);
+    }
 
     #[test]
     fn panel_text_steps_like_the_companion() {

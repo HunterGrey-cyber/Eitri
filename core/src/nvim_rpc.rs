@@ -1095,8 +1095,12 @@ mod tests {
         bytes
     }
 
-    /// Writes `head`, then zeros until the other end hangs up. Rust ignores SIGPIPE, so the end
-    /// is an `Err` from `write`, not a signal.
+    /// Writes `head`, then one more chunk of zeros than the cap allows, so the frame it starts is
+    /// over the cap; it stops sooner if a write fails. Rust ignores SIGPIPE, so a hang-up is an
+    /// `Err` from `write`, not a signal. Bounded by the byte count, never by waiting for an error:
+    /// on macOS a write to a socket whose other end has shut down can succeed with the bytes
+    /// thrown away (when the writer was not inside `write` at the shutdown), so a flood that ran
+    /// until an error spun at full CPU forever.
     fn flood(mut stream: UnixStream, head: Vec<u8>) {
         // The link shutting its end down does not wake a writer blocked here on every OS (macOS
         // leaves it asleep), so a stalled write ends the flood: by then the link has long closed.
@@ -1105,7 +1109,12 @@ mod tests {
             return;
         }
         let zeros = vec![0u8; 64 * 1024];
-        while stream.write_all(&zeros).is_ok() {}
+        let chunks = MAX_FRAME as usize / zeros.len() + 1;
+        for _ in 0..chunks {
+            if stream.write_all(&zeros).is_err() {
+                return;
+            }
+        }
     }
 
     #[test]
