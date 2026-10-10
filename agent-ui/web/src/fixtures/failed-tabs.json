@@ -22,6 +22,7 @@
         "number": 1,
         "pending": 0,
         "resumable": true,
+        "resumesOnR": false,
         "state": "failed",
         "title": null
       },
@@ -37,6 +38,7 @@
         "number": 2,
         "pending": 0,
         "resumable": true,
+        "resumesOnR": false,
         "state": "failed",
         "title": null
       }

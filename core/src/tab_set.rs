@@ -468,6 +468,19 @@ impl Tab {
             .is_some_and(|backend| backend.projection().active_turn_id.is_some())
     }
 
+    /// The session `r` continues on this ended tab: one its agent stopped itself with the conversation whole,
+    /// on a tab whose sessions can be continued, by its own id. `None` for every other tab, where `r` empties
+    /// the tab to a start screen.
+    fn resumes_on_r(&self, resumable: bool) -> Option<String> {
+        if !resumable || self.pending_handoff.is_some() || self.wire_state() != TabStateWire::Ended {
+            return None;
+        }
+        self.live()
+            .filter(|backend| backend.stopped_resumable())
+            .and_then(AgentBackend::provider_session_id)
+            .filter(|id| !id.is_empty())
+    }
+
     pub fn wire_state(&self) -> TabStateWire {
         match &self.backend {
             TabBackend::NotStarted => TabStateWire::NotStarted,
@@ -521,6 +534,7 @@ impl Tab {
                 _ => None,
             },
             failed_after_start: matches!(self.backend, TabBackend::Failed { .. }) && self.failed_after_start,
+            resumes_on_r: self.resumes_on_r(resumable).is_some(),
             title: self.title.clone(),
             agent: self.agent.record_name(),
         }
@@ -1625,6 +1639,11 @@ impl TabSet {
                 None
             }
         }
+    }
+
+    /// [`Tab::resumes_on_r`] of tab `id`: the session a reset of it continues in place, if any.
+    pub fn resumes_on_r(&self, id: TabId) -> Option<String> {
+        self.get(id).and_then(|t| t.resumes_on_r(t.resumable(self.kind)))
     }
 
     /// `r`: an ended or failed tab back to empty, keeping its number, name and mode.

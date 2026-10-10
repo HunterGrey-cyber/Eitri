@@ -7547,6 +7547,21 @@ describe("App: a live session's ending classified", () => {
     expect(container.querySelector(".row-problem")).toBeNull();
     expect(container.querySelector(".row-error pre")!.textContent).toBe("provider exited");
   });
+
+  it("a session its agent stopped whole says r resumes it, and r asks Rust as before", () => {
+    const reason = "What Codex left running in the background was stopped with its session. The conversation can be resumed.";
+    const { container } = ended("session_unavailable", reason);
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "ended", resumesOnR: true }] });
+    expect(container.querySelector(".row-error .row-hint")!.textContent).toBe("Press r to resume this conversation.");
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "r" });
+    expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
+  });
+
+  it("any other ended session still offers a new one", () => {
+    const { container } = ended("session_unavailable", "provider exited");
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "ended" }] });
+    expect(container.querySelector(".row-error .row-hint")!.textContent).toBe("Press r to start a new session here.");
+  });
 });
 
 describe("App fatal errors", () => {

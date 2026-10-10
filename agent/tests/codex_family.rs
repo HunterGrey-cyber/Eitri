@@ -196,12 +196,44 @@ fn send(provider: &CodexProvider, thread: &str, text: &str) -> Result<String, Pr
 // ---------------------------------------------------------------- reading events
 
 /// Pumps until `done` is true of everything read, or fails after 20 s.
-fn pump_until(provider: &CodexProvider, mut done: impl FnMut(&[AgentDomainEvent]) -> bool) -> Vec<AgentDomainEvent> {
-    let mut seen = Vec::new();
+fn pump_until(provider: &CodexProvider, done: impl FnMut(&[AgentDomainEvent]) -> bool) -> Vec<AgentDomainEvent> {
+    pump_on(provider, Vec::new(), done)
+}
+
+/// Pumps until `done` holds over everything read, `seen` included. A wait that follows another goes on from
+/// what the first read: one pump can return the events of both (a test thread held up past a stand-in's
+/// pause reads them together), and a wait that started empty would never see the second.
+fn pump_on(
+    provider: &CodexProvider,
+    mut seen: Vec<AgentDomainEvent>,
+    mut done: impl FnMut(&[AgentDomainEvent]) -> bool,
+) -> Vec<AgentDomainEvent> {
     let end = Instant::now() + Duration::from_secs(20);
     loop {
         seen.extend(provider.pump());
         if done(&seen) {
+            return seen;
+        }
+        assert!(Instant::now() < end, "timed out; the events so far: {seen:#?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Pumps until a turn completes; the pump that reads it must return no earlier than `not_before`, the first
+/// instant the stand-in can have written it. An earlier completion is the provider ending the turn on its
+/// own; a later one is only a test thread that was held up, which cannot tell the two apart by what it read.
+fn until_completed_not_before(provider: &CodexProvider, not_before: Instant, why: &str) -> Vec<AgentDomainEvent> {
+    let mut seen = Vec::new();
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        let read = provider.pump();
+        let at = Instant::now();
+        seen.extend(read);
+        if seen.iter().any(is_completed) {
+            assert!(
+                at >= not_before,
+                "the turn ended before it could have: {why}: {seen:#?}"
+            );
             return seen;
         }
         assert!(Instant::now() < end, "timed out; the events so far: {seen:#?}");
@@ -387,37 +419,28 @@ fn replay_late_child(pause_ms: u64) -> (CodexProvider, String, String) {
 #[test]
 fn tab_turn_waits_for_the_child() {
     let (provider, thread, turn) = replay_late_child(500);
-    // The parent's own turn ends within milliseconds; its child is still to write. The tab is not done.
-    let early = pump_for(&provider, Duration::from_millis(250));
-    assert!(
-        early.iter().any(
-            |e| matches!(e, AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } if text == "done")
-        ),
-        "the parent's reply was read: {early:#?}"
-    );
-    assert!(
-        !early.iter().any(is_completed),
-        "the tab's turn ended with its parent's: {early:#?}"
-    );
-
-    // The grandchild's approval is the last thing that holds the family; the tab still waits for it.
-    let rest = pump_until(&provider, |events| {
+    // The parent's own turn ends within milliseconds; its child is still to write. The grandchild's approval
+    // is the last thing that holds the family: nothing read up to that card, however late it is read, may
+    // end the tab's turn.
+    let before_card = pump_until(&provider, |events| {
         events
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
     });
     assert!(
-        !rest.iter().any(is_completed),
-        "the tab ended before the family: {rest:#?}"
+        before_card.iter().any(
+            |e| matches!(e, AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } if text == "done")
+        ),
+        "the parent's reply was read: {before_card:#?}"
     );
-    let (id, input) = card_of(&rest);
+    assert!(
+        !before_card.iter().any(is_completed),
+        "the tab's turn ended before the family: {before_card:#?}"
+    );
+    let (id, input) = card_of(&before_card);
     assert_eq!(input["subagent"], "/root/child/grand");
     answer(&provider, &thread, &id, PermissionDecision::Deny { reason: None });
-    let end = until_turn_completed(&provider);
-
-    let mut events = early;
-    events.extend(rest);
-    events.extend(end);
+    let events = pump_on(&provider, before_card, |events| events.iter().any(is_completed));
     assert_eq!(events.iter().filter(|e| is_started(e)).count(), 1, "one tab turn");
     assert_eq!(events.iter().filter(|e| is_completed(e)).count(), 1, "one tab turn");
     match &events[position(&events, is_completed)] {
@@ -695,17 +718,20 @@ fn family_turn_while_tab_idle_opens_a_tab_turn() {
             turn_response(5, "t2"),
         ],
     );
-    let first = until_turn_completed(&provider);
-    assert_eq!(first.iter().filter(|e| is_started(e)).count(), 1);
-
-    let second = pump_until(&provider, |events| events.iter().any(is_completed));
+    // Read as one list: a test thread held up past the stand-in's pause reads both turns in one pump.
+    let all = pump_until(&provider, |events| {
+        events.iter().filter(|e| is_completed(e)).count() >= 2
+    });
+    let first_end = position(&all, is_completed);
+    assert_eq!(all[..first_end].iter().filter(|e| is_started(e)).count(), 1);
+    let second = &all[first_end + 1..];
     assert!(
-        matches!(&second[0], AgentDomainEvent::TurnStarted { turn_id } if turn_id == "c9"),
+        matches!(second.iter().find(|e| is_started(e)), Some(AgentDomainEvent::TurnStarted { turn_id }) if turn_id == "c9"),
         "the child's turn opened a tab turn: {second:#?}"
     );
     let late = row_id("tab", "child", "late");
     assert!(second.iter().any(tool_started(late.clone())) && second.iter().any(tool_completed(late)));
-    match &second[position(&second, is_completed)] {
+    match &second[position(second, is_completed)] {
         AgentDomainEvent::TurnCompleted { turn_id, outcome, .. } => {
             assert_eq!(turn_id, "c9");
             assert_eq!(*outcome, TurnOutcome::Completed);
@@ -812,9 +838,13 @@ fn an_unreadable_end_of_a_childs_turn_ends_only_the_child() {
                 turn_completed("tab", "t1", "completed"),
             ],
         );
-        let early = pump_until(&provider, |events| events.iter().any(tool_started("own")));
-        assert!(!early.iter().any(is_completed), "{early:#?}");
+        // The tab's turn ends after its own command started, however late both are read.
         let events = until_turn_completed(&provider);
+        let own = events.iter().position(tool_started("own"));
+        assert!(
+            own.is_some_and(|own| own < position(&events, is_completed)),
+            "the child's end ended the tab's turn: {events:#?}"
+        );
         let (turn, outcome, _) = ended(&events);
         assert_eq!(turn, "t1");
         assert_eq!(
@@ -1058,8 +1088,15 @@ fn interrupting_the_tabs_own_unnamed_turn_ends_it() {
     );
     let first = until_turn_completed(&provider);
     assert_eq!(ended(&first).0, "t1");
-    let opened = pump_until(&provider, |events| events.iter().any(is_started));
-    let unnamed = match &opened[position(&opened, is_started)] {
+    // The unnamed turn opens after the first one ended; both can be read in one pump.
+    let opened = pump_on(&provider, first, |events| {
+        events
+            .iter()
+            .position(is_completed)
+            .is_some_and(|ended| events[ended..].iter().any(is_started))
+    });
+    let opened = &opened[position(&opened, is_completed)..];
+    let unnamed = match &opened[position(opened, is_started)] {
         AgentDomainEvent::TurnStarted { turn_id } => turn_id.clone(),
         other => panic!("{other:?}"),
     };
@@ -1095,15 +1132,15 @@ fn interrupt_reaches_every_running_family_turn() {
     });
     // Let the announcement and the child's start be read.
     pump_for(&provider, Duration::from_millis(100));
+    let interrupted_at = Instant::now();
     for _ in 0..3 {
         interrupt(&provider, &thread);
     }
-    let early = pump_for(&provider, Duration::from_millis(250));
-    assert!(
-        !early.iter().any(is_completed),
-        "the child ended, the tab's own turn has not: {early:#?}"
+    let events = until_completed_not_before(
+        &provider,
+        interrupted_at + Duration::from_millis(400),
+        "the child ended",
     );
-    let events = until_turn_completed(&provider);
     match &events[position(&events, is_completed)] {
         AgentDomainEvent::TurnCompleted { turn_id, outcome, .. } => {
             assert_eq!(turn_id, "t1");
@@ -1546,12 +1583,13 @@ fn a_late_end_of_an_earlier_turn_does_not_end_an_unread_one() {
             turn_completed("child", "c2", "completed"),
         ],
     );
-    let early = pump_for(&provider, Duration::from_millis(500));
+    // The tab's turn ends after the child's new turn ran, however late both are read.
+    let events = pump_until(&provider, |events| events.iter().any(is_completed));
+    let ran = events.iter().position(tool_completed(row_id("tab", "child", "x2")));
     assert!(
-        !early.iter().any(is_completed),
-        "the tab's turn ended while the child's new turn ran: {early:#?}"
+        ran.is_some_and(|ran| ran < position(&events, is_completed)),
+        "the tab's turn ended while the child's new turn ran: {events:#?}"
     );
-    pump_until(&provider, |events| events.iter().any(is_completed));
 }
 
 /// Only Eitri says whose a call is: a `subagent` key an item of the tab's own thread carries itself does not

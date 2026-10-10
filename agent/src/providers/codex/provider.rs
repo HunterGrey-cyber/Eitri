@@ -330,6 +330,8 @@ struct State {
     running_unread: bool,
     /// Something kept running after an interrupt and the child is being stopped for it.
     stopping: Option<Stopping>,
+    /// The child was stopped by Eitri and is gone, the conversation whole: it can be continued.
+    stopped_whole: bool,
     /// The calls of `running` that were still running when the tab's turn last ended: put in the background
     /// by the agent. A running turn's own calls join them only when it ends.
     background: HashSet<(String, String)>,
@@ -1969,6 +1971,7 @@ impl CodexProvider {
         st.running_unread = false;
         self.end_family_turn(st);
         report_background(st);
+        st.stopped_whole = true;
         st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
     }
 
@@ -2524,6 +2527,11 @@ impl ExternalProvider for CodexProvider {
 
     fn take_history(&self) -> Vec<AgentDomainEvent> {
         std::mem::take(&mut lock(&self.state).history)
+    }
+
+    fn stopped_resumable(&self) -> bool {
+        let st = lock(&self.state);
+        st.stopped_whole && st.blocked.is_none()
     }
 
     /// Stops the session for what its turns left running, as an interrupt does for what a turn keeps

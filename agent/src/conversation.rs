@@ -854,6 +854,12 @@ impl AgentConversation {
         self.external.as_ref().and_then(|e| e.context_gauge())
     }
 
+    /// Whether the provider stopped this session itself with the conversation whole
+    /// (`ExternalProvider::stopped_resumable`); false for a Claude session.
+    pub fn stopped_resumable(&self) -> bool {
+        self.external.as_ref().is_some_and(|e| e.stopped_resumable())
+    }
+
     /// Stops what the agent left running in the background by stopping its session
     /// (`ExternalProvider::stop_background`). Only an external provider can.
     pub fn stop_background(&self, shown: u32) -> Result<(), ConversationError> {

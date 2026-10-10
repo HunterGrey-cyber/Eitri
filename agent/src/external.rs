@@ -102,4 +102,10 @@ pub trait ExternalProvider: AgentProvider {
         let _ = (session_id, shown);
         Err(ProviderError::UnsupportedCapability("stop_background"))
     }
+    /// Whether the session ended because the provider stopped it itself with its conversation whole (what
+    /// the agent left running, or kept running after an interrupt, was stopped with it), so continuing it is
+    /// what the user is offered next. False while it runs and after any other end.
+    fn stopped_resumable(&self) -> bool {
+        false
+    }
 }

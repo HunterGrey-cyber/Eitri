@@ -220,8 +220,18 @@ fn recorded_ids(name: &str) -> (String, String) {
 // ---------------------------------------------------------------- reading events
 
 /// Pumps until `done` is true of everything read, or fails after 20 s.
-fn pump_until(provider: &CodexProvider, mut done: impl FnMut(&[AgentDomainEvent]) -> bool) -> Vec<AgentDomainEvent> {
-    let mut seen = Vec::new();
+fn pump_until(provider: &CodexProvider, done: impl FnMut(&[AgentDomainEvent]) -> bool) -> Vec<AgentDomainEvent> {
+    pump_on(provider, Vec::new(), done)
+}
+
+/// Pumps until `done` holds over everything read, `seen` included. A wait that follows another goes on from
+/// what the first read: one pump can return the events of both (a test thread held up past a stand-in's
+/// pause reads them together), and a wait that started empty would never see the second.
+fn pump_on(
+    provider: &CodexProvider,
+    mut seen: Vec<AgentDomainEvent>,
+    mut done: impl FnMut(&[AgentDomainEvent]) -> bool,
+) -> Vec<AgentDomainEvent> {
     let end = Instant::now() + Duration::from_secs(20);
     loop {
         seen.extend(provider.pump());
@@ -1561,6 +1571,10 @@ fn a_command_still_running_after_the_settle_time_stops_the_session() {
     assert!(row < end);
     let gone = position(&events, |e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }));
     assert!(gone > Some(end), "the session ended before its turn did: {events:#?}");
+    assert!(
+        provider.stopped_resumable(),
+        "`r` continues a session Eitri stopped whole"
+    );
     let reason = events
         .iter()
         .find_map(|e| match e {
@@ -1814,8 +1828,8 @@ fn a_command_left_running_by_a_completed_turn_is_counted_before_the_turn_ends() 
         }
     ));
     // Its end, after the turn's, takes the count back to nothing.
-    let later = pump_until(&provider, |events| background_counts(events).contains(&0));
-    assert_eq!(background_counts(&later), vec![0]);
+    let all = pump_on(&provider, events, |events| background_counts(events).contains(&0));
+    assert_eq!(background_counts(&all[end + 1..]), vec![0]);
 }
 
 #[test]
@@ -1844,6 +1858,7 @@ fn stopping_the_background_stops_the_session() {
     // The stand-in never reports the command ended and waits for its stdin to close.
     let (provider, id, _) = left_running(t, u, vec![]);
     let pid = provider.pid();
+    assert!(!provider.stopped_resumable(), "a live session is no stopped one");
     provider.stop_background(&id, 1).expect("the stop is taken");
     let events = pump_until(&provider, |events| {
         events
@@ -1858,6 +1873,10 @@ fn stopping_the_background_stops_the_session() {
             if reason == agent::providers::codex::provider::STOPPED_BACKGROUND
     )));
     assert!(send(&provider, &id, "next").is_err(), "a stopped session took a turn");
+    assert!(
+        provider.stopped_resumable(),
+        "`r` continues a session Eitri stopped whole"
+    );
 }
 
 #[test]
@@ -1948,7 +1967,11 @@ fn a_row_whose_end_is_too_large_to_read_ends_with_a_note() {
         ended.as_deref().is_some_and(|c| c.contains("larger than 16 MiB")),
         "{ended:?}"
     );
-    let rest = until_turn_completed(&provider);
+    let rest = pump_on(&provider, events, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    });
     assert!(
         !background_counts(&rest).iter().any(|n| *n > 0),
         "the call that ended counts as left running"

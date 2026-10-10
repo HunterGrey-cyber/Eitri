@@ -144,8 +144,18 @@ fn file_change_item(id: &str) -> Value {
 
 // ---------------------------------------------------------------- reading events
 
-fn pump_until(provider: &CodexProvider, mut done: impl FnMut(&[AgentDomainEvent]) -> bool) -> Vec<AgentDomainEvent> {
-    let mut seen = Vec::new();
+fn pump_until(provider: &CodexProvider, done: impl FnMut(&[AgentDomainEvent]) -> bool) -> Vec<AgentDomainEvent> {
+    pump_on(provider, Vec::new(), done)
+}
+
+/// Pumps until `done` holds over everything read, `seen` included. A wait that follows another goes on from
+/// what the first read: one pump can return the events of both (a test thread held up past a stand-in's
+/// pause reads them together), and a wait that started empty would never see the second.
+fn pump_on(
+    provider: &CodexProvider,
+    mut seen: Vec<AgentDomainEvent>,
+    mut done: impl FnMut(&[AgentDomainEvent]) -> bool,
+) -> Vec<AgentDomainEvent> {
     let end = Instant::now() + Duration::from_secs(20);
     loop {
         seen.extend(provider.pump());
@@ -805,8 +815,8 @@ fn a_tripped_session_cancels_the_card_that_waits() {
             turn_completed("th-c6", "tu-c6", "completed"),
         ],
     );
-    let (id, _, _, _) = until_card(&provider);
-    let events = pump_until(&provider, |events| {
+    let (id, _, _, read) = until_card(&provider);
+    let events = pump_on(&provider, read, |events| {
         events
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. }))
@@ -817,7 +827,11 @@ fn a_tripped_session_cancels_the_card_that_waits() {
             if *permission_id == id
     )));
     // The stand-in reads the answer before it ends the turn; without it the turn never ends.
-    until_turn_completed(&provider);
+    pump_on(&provider, events, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    });
 }
 
 fn write_stdin_declined(reviewer: Reviewer, thread: &str) {
@@ -1456,8 +1470,8 @@ fn a_card_left_waiting_when_codex_dies_is_resolved_as_failed() {
             json!({"exit": 1}),
         ],
     );
-    let (id, _, _, _) = until_card(&provider);
-    let events = pump_until(&provider, |events| {
+    let (id, _, _, read) = until_card(&provider);
+    let events = pump_on(&provider, read, |events| {
         events
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))

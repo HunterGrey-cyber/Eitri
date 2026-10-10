@@ -15,7 +15,6 @@
 //! per-syscall timeout lets trickled bytes or successive silent connections stall the GTK
 //! thread indefinitely. A per-syscall timeout alone also leaves the line size unbounded.
 
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -78,7 +77,7 @@ impl ThemeFeed {
 
         let dir = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
         // 0700: the socket accepts colours from anyone who can connect to it.
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        if let Err(e) = crate::instance_dir::create_private_dir(&dir) {
             eprintln!(
                 "[theme] could not create {}: {e} -- colours stay on the built-in fallback",
                 dir.display()
@@ -112,6 +111,13 @@ impl ThemeFeed {
                 return None;
             }
         };
+        if let Err(e) = crate::instance_dir::make_socket_private(&socket_path) {
+            fail(format!(
+                "could not make {} reachable by nvim: {e}",
+                socket_path.display()
+            ));
+            return None;
+        }
         if let Err(e) = listener.set_nonblocking(true) {
             fail(format!("could not make the theme socket non-blocking: {e}"));
             return None;

@@ -703,6 +703,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
         resumable: false,
         failure: None,
         failed_after_start: false,
+        resumes_on_r: false,
         title: None,
         agent: "claude".into(),
     }];

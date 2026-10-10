@@ -614,6 +614,10 @@ export type TabInfo = {
    *  says the session stopped rather than that it did not start (`TabView::failed_after_start`). Rust
    *  always sends it; absent reads as false. */
   failedAfterStart?: boolean;
+  /** True for an `ended` tab whose agent stopped its session with the conversation whole: `r` continues that
+   *  session in the same tab instead of emptying it to a start screen (`TabView::resumes_on_r`). Rust always
+   *  sends it; absent reads as false. */
+  resumesOnR?: boolean;
   /** The record's title: the first prompt's title, or a
    *  resumed record's display title. `null` before one exists. Read by the chooser's open-tab rows
    *  once they join a `ChooserTab` to its `TabInfo` here. */

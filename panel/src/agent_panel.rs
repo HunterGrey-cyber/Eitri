@@ -372,14 +372,23 @@ impl Retiring {
     /// One backend, shut down and dropped on a worker thread, never on the GTK main loop (the same
     /// reasons as `tear_down`). `tab` is the tab the set counted it as retiring for, which `poll`
     /// names once the shutdown has returned; `None` for a backend the set never held.
-    fn backend(&mut self, mut backend: AgentBackend, tab: Option<TabId>) {
+    fn backend(&mut self, backend: AgentBackend, tab: Option<TabId>) {
+        let _ = self.backend_watched(backend, tab);
+    }
+
+    /// [`backend`](Self::backend), and a receiver told when it is shut down and dropped (or its worker died):
+    /// for a start that must not begin before the old session lets go of its lease.
+    fn backend_watched(&mut self, mut backend: AgentBackend, tab: Option<TabId>) -> mpsc::Receiver<()> {
         let (done_tx, done_rx) = mpsc::channel();
+        let (gone_tx, gone_rx) = mpsc::channel();
         std::thread::spawn(move || {
             backend.shutdown();
             drop(backend);
             let _ = done_tx.send(());
+            let _ = gone_tx.send(());
         });
         self.teardowns.push((tab, done_rx));
+        gone_rx
     }
 
     /// A tab removed from the set: its backend is shut down, its connect is waited for, and a
@@ -602,6 +611,10 @@ struct AgentPanelState {
     /// Teardowns and connects of tabs that left while the window stays open, so the window-close
     /// backstop covers them too. See [`Retiring`].
     retiring: Retiring,
+    /// Per tab, the session `r` is continuing in it and its old backend's teardown: that session's lease is
+    /// let go only when the old backend is gone, so a start resuming that session waits for it. Taken by the
+    /// tab's next external start whatever it is, and dropped when the start is put off or the tab closes.
+    resume_after: std::collections::HashMap<TabId, (String, mpsc::Receiver<()>)>,
     /// `$XDG_STATE_HOME/eitri/history` and `.../permissions`; `None` with no state directory.
     history_dir: Option<PathBuf>,
     rules_dir: Option<PathBuf>,
@@ -719,6 +732,8 @@ enum SpawnCall {
         mode: SessionModeChoice,
         resume: Option<String>,
         acp: Option<agent::providers::acp::AcpAgentSpec>,
+        /// The teardown of the tab's previous backend, which the start waits for (`r` continuing a session).
+        after_old: Option<mpsc::Receiver<()>>,
     },
 }
 
@@ -2241,6 +2256,7 @@ fn panel_state(
         review_editor: crate::review_editor::ReviewEditor::default(),
         editor_done_hook: None,
         retiring: Retiring::default(),
+        resume_after: std::collections::HashMap::new(),
         history_dir,
         rules_dir,
         history,
@@ -2304,6 +2320,7 @@ fn bare_state(
         review_editor: crate::review_editor::ReviewEditor::default(),
         editor_done_hook: None,
         retiring: Retiring::default(),
+        resume_after: std::collections::HashMap::new(),
         history_dir: None,
         rules_dir: None,
         history: Vec::new(),
@@ -3268,6 +3285,45 @@ fn waiting_profile(state: &AgentPanelState, tab: TabId) -> Profile {
     }
 }
 
+/// Puts the resume of `provider_session_id` into the empty tab `tab`, and selects the tab when `select`. It
+/// waits for the trust check like a first message (a resumed session loads the project's configuration only
+/// as a new one would); `request_id` is answered once the connect finishes or the question is put off.
+fn resume_in(
+    state: &mut AgentPanelState,
+    tab: TabId,
+    request_id: &str,
+    provider_session_id: String,
+    select: bool,
+) -> Result<(), String> {
+    let agent = state.tabs.get(tab).map_or(AgentId::Claude, |t| t.agent().clone());
+    let greeting = BackendGreeting::for_agent_titled(
+        state.backend_kind,
+        &agent,
+        state.project_dir.clone(),
+        eitri_core::agent_backend::Titles::Cached(&state.titles),
+    );
+    // The rename and the title separately: the label puts a rename first, and folding the two into the
+    // title lost the rename whenever the record had both.
+    let (resumed_title, resumed_name) = greeting
+        .resumable
+        .iter()
+        .find(|r| r.provider_session_id == provider_session_id)
+        .map(|r| (r.title.clone(), r.name.clone()))
+        .unwrap_or_default();
+    let start = DeferredStart::Resume {
+        request_id: request_id.to_string(),
+        provider_session_id,
+        resumed_title,
+        resumed_name,
+    };
+    let deferred = gate_start(state, tab, start);
+    if select {
+        // A new tab is already selected by `route_resume`; this is for the record.
+        state.tabs.select(tab);
+    }
+    deferred
+}
+
 /// Puts a session start off until the gate has checked the project for the tab's agent: the tab holds
 /// what was asked for, and nothing is spawned or leased until the check (and, when it must, the user)
 /// says how.
@@ -3385,6 +3441,8 @@ fn start_external_tab(
     start: DeferredStart,
     project: ProjectTrust,
 ) -> TrustOut {
+    // Taken whatever happens to this start, so a wait left for it never holds a later one.
+    let wait = state.resume_after.remove(&tab);
     let profile = trust_profile(&state.acp_agents, &agent);
     if project == ProjectTrust::Untrusted && profile.requires_explicit_yes() {
         return put_off_start(state, tab, start, &crate::trust_gate::refused_without_yes(&profile));
@@ -3432,6 +3490,10 @@ fn start_external_tab(
     let mode = state.tabs.get(tab).map_or(SessionModeChoice::Auto, |t| t.mode());
     let project_dir = state.project_dir.clone();
     let codex_command = state.codex_command.clone();
+    // Only the resume of the session whose old backend it waits for.
+    let after_old = wait
+        .filter(|(id, _)| resume.as_deref() == Some(id.as_str()))
+        .map(|(_, gone)| gone);
     let result_rx = match &state.spawner {
         Spawner::Real => spawn_external(
             agent,
@@ -3442,6 +3504,7 @@ fn start_external_tab(
             codex_command,
             acp,
             state.start_notes.sender(),
+            after_old,
         ),
         #[cfg(test)]
         Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::External {
@@ -3450,6 +3513,7 @@ fn start_external_tab(
             mode,
             resume: resume.clone(),
             acp,
+            after_old,
         }),
     };
     let Some(t) = state.tabs.get_mut(tab) else {
@@ -3478,6 +3542,7 @@ fn start_external_tab(
 /// returns to the composer, a resume or a restore is dropped with a toast. `why` is said in the panel
 /// and is the refused command's error.
 fn put_off_start(state: &mut AgentPanelState, tab: TabId, start: DeferredStart, why: &str) -> TrustOut {
+    state.resume_after.remove(&tab);
     let mut out = TrustOut::default();
     out.push(tabs_payload_recorded(state));
     out.push(eitri_core::agent_bridge::serialize_notice_for_js(why));
@@ -4377,9 +4442,13 @@ impl StartNotes {
     }
 }
 
+/// How long a session continued in its own tab (`r`) waits for the tab's old backend to let go of the lease.
+const OLD_SESSION_LET_GO: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The connect worker of another agent's tab: locates its binary (Codex) or takes its registered
 /// command (`acp`, an ACP agent) and starts (or resumes) its session with `plan`, off the GTK main loop,
-/// since the agent's own check and handshake take seconds.
+/// since the agent's own check and handshake take seconds. With `after_old`, it first waits (at most
+/// [`OLD_SESSION_LET_GO`]) for the tab's old backend to be dropped.
 #[allow(clippy::too_many_arguments)]
 fn spawn_external(
     agent: AgentId,
@@ -4390,10 +4459,16 @@ fn spawn_external(
     codex_command: Option<String>,
     acp: Option<agent::providers::acp::AcpAgentSpec>,
     notes: mpsc::Sender<String>,
+    after_old: Option<mpsc::Receiver<()>>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     use eitri_core::agent_backend::ExternalLaunch;
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
+        // The session's previous backend holds its lease until it is dropped; the resume would find it held.
+        // Bounded: a teardown that hangs leaves the resume to fail on the lease and say so.
+        if let Some(after_old) = after_old {
+            let _ = after_old.recv_timeout(OLD_SESSION_LET_GO);
+        }
         let launch = match &agent {
             AgentId::Codex => {
                 // A relative home, or one inside the project, is refused before anything runs, the version
@@ -5461,41 +5536,13 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 }
                 ResumeRoute::Refuse(why) => refuse(page, &why),
                 ResumeRoute::StartIn(target_tab) => {
-                    let deferred = {
-                        let mut state_ref = state.borrow_mut();
-                        let state_ref = &mut *state_ref;
-                        let agent = state_ref
-                            .tabs
-                            .get(target_tab)
-                            .map_or(AgentId::Claude, |t| t.agent().clone());
-                        let greeting = BackendGreeting::for_agent_titled(
-                            state_ref.backend_kind,
-                            &agent,
-                            state_ref.project_dir.clone(),
-                            eitri_core::agent_backend::Titles::Cached(&state_ref.titles),
-                        );
-                        // The rename and the title separately: the
-                        // label puts a rename first, and folding the two into the
-                        // title lost the rename whenever the record had both.
-                        let (resumed_title, resumed_name) = greeting
-                            .resumable
-                            .iter()
-                            .find(|r| r.provider_session_id == provider_session_id)
-                            .map(|r| (r.title.clone(), r.name.clone()))
-                            .unwrap_or_default();
-                        // The resume waits for the trust check like a first message: a resumed
-                        // session loads the project's configuration only as a new one would.
-                        let start = DeferredStart::Resume {
-                            request_id: request_id.clone(),
-                            provider_session_id,
-                            resumed_title,
-                            resumed_name,
-                        };
-                        let deferred = gate_start(state_ref, target_tab, start);
-                        // A new tab is already selected by `route_resume`; this is for the record.
-                        state_ref.tabs.select(target_tab);
-                        deferred
-                    };
+                    let deferred = resume_in(
+                        &mut state.borrow_mut(),
+                        target_tab,
+                        &request_id,
+                        provider_session_id,
+                        true,
+                    );
                     match deferred {
                         // The command_result is owed once the connect finishes, or when the question
                         // is put off.
@@ -5716,14 +5763,44 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 TabBackend::AwaitingTrust(waiting) => waiting.start.request_id().map(str::to_owned),
                 _ => None,
             });
+            // A session its agent stopped with the conversation whole is continued in the same tab, not
+            // left for a second `r` on the start screen.
+            let continued = state.borrow().tabs.resumes_on_r(tab);
             let reset = state.borrow_mut().tabs.reset(tab);
             match reset {
                 Ok(old) => {
-                    if let Some(old) = old {
-                        // `TabSet::reset` counted it as retiring.
-                        state.borrow_mut().retiring.backend(old, Some(tab));
+                    {
+                        let mut state_ref = state.borrow_mut();
+                        // A wait an earlier `r` left for this tab is over: its start did not happen.
+                        state_ref.resume_after.remove(&tab);
+                        if let Some(old) = old {
+                            // `TabSet::reset` counted it as retiring.
+                            if continued.is_some() {
+                                let gone = state_ref.retiring.backend_watched(old, Some(tab));
+                                let id = continued.clone().unwrap_or_default();
+                                state_ref.resume_after.insert(tab, (id, gone));
+                            } else {
+                                state_ref.retiring.backend(old, Some(tab));
+                            }
+                        }
+                        state_ref.trust.forget_tab(tab);
                     }
-                    state.borrow_mut().trust.forget_tab(tab);
+                    // No lease check first: the tab's own old backend holds it until its teardown, which the
+                    // start waits for. The command is answered when the connect finishes. The tab is selected
+                    // only if it was on screen: a reset never moves the window to another tab.
+                    let resumed = continued.map(|provider_session_id| {
+                        let on_screen = state.borrow().tabs.active() == tab;
+                        resume_in(
+                            &mut state.borrow_mut(),
+                            tab,
+                            &request_id,
+                            provider_session_id,
+                            on_screen,
+                        )
+                    });
+                    if let Some(Err(_)) = &resumed {
+                        state.borrow_mut().resume_after.remove(&tab);
+                    }
                     // Before the draft the reset carries: the page puts a refused message back in
                     // its box itself, and the draft that follows then only confirms it.
                     if let Some(owed) = owed {
@@ -5744,7 +5821,11 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                     dispatch_all(page, payloads);
                     send_hello_if_open_sessions_changed(state, page);
                     report_attention(state, before);
-                    ok(page);
+                    match resumed {
+                        None => ok(page),
+                        Some(Ok(())) => {}
+                        Some(Err(why)) => refuse(page, &why),
+                    }
                 }
                 Err(why) => refuse(page, &why),
             }
@@ -6412,6 +6493,8 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId)
     {
         return Err("this tab is still being handed off to a terminal; close it once that finishes");
     }
+    // A wait for the tab's old backend goes with the tab; nothing will start in it.
+    state.borrow_mut().resume_after.remove(&tab);
     let mut owed = Vec::new();
     for step in eitri_core::tabs::close_steps(&facts) {
         match step {
@@ -7087,7 +7170,8 @@ mod tests {
     /// The confirmed `<leader>k` reaches the conversation of the tab it names, never the one on screen.
     /// One that names a closed tab, or none, is refused; a refusal because of when it was asked is said
     /// and leaves the tab live; a taken stop ends the session through the pump, as a lost one that can
-    /// be resumed.
+    /// be resumed. One `r` on it resumes it in the same tab, and the start waits until the old backend has
+    /// let go of the session.
     #[test]
     fn a_stop_of_the_background_reaches_the_tab_it_names_and_ends_its_session() {
         use eitri_core::test_providers::{empty_trust_plan, ExternalRecordingProvider};
@@ -7181,6 +7265,115 @@ mod tests {
         }
         assert_eq!(count(), Some(0));
         assert!(handle.state.borrow().tabs.get(on_screen).is_some());
+
+        // The row says `r` resumes, and one `r` does.
+        let wire = |tab: TabId| {
+            let tabs: serde_json::Value = serde_json::from_str(&handle.state.borrow().tabs.tabs_payload()).unwrap();
+            tabs["tabs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == tab.0)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(wire(codex)["resumesOnR"], true);
+        assert_eq!(wire(on_screen)["resumesOnR"], false);
+        let release = provider.hold_close();
+        handle.page_message(&format!(
+            r#"{{"type":"reset_tab","request_id":"r1","tab":{}}}"#,
+            codex.0
+        ));
+        {
+            let state_ref = handle.state.borrow();
+            let tab = state_ref.tabs.get(codex).unwrap();
+            assert!(
+                matches!(
+                    &tab.backend,
+                    TabBackend::AwaitingTrust(AwaitingTrust {
+                        start: DeferredStart::Resume { provider_session_id, .. },
+                        ..
+                    }) if provider_session_id == "thread-1"
+                ),
+                "the session is resumed in place, not left for a start screen"
+            );
+            assert_eq!(
+                state_ref.tabs.active(),
+                on_screen,
+                "a reset never moves the window to its tab"
+            );
+        }
+        assert_eq!(result("r1"), None, "answered once the resume connects");
+        assert_eq!(wire(codex)["resumesOnR"], false);
+        // Its old backend keeps the lease until it is dropped; the start must not begin before. (This panel's
+        // gate has no worker, so the start itself is put off on the next tick: the wait is read here.)
+        let (session, gone) = handle
+            .state
+            .borrow_mut()
+            .resume_after
+            .remove(&codex)
+            .expect("the start waits for the old backend");
+        assert_eq!(session, "thread-1");
+        for _ in 0..5 {
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            gone.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "the old backend is still closing"
+        );
+        release.send(()).unwrap();
+        assert_eq!(gone.recv_timeout(std::time::Duration::from_secs(10)), Ok(()));
+        assert_eq!(provider.inner.closes(), 1);
+    }
+
+    /// `r` on an ended tab whose agent did not stop it itself still empties it to a start screen.
+    #[test]
+    fn r_on_a_session_that_simply_ended_starts_over() {
+        use eitri_core::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-r-starts-over");
+        let (handle, page, _host) = handle_with_recording_page();
+        page.visible.set(true);
+        let provider = std::sync::Arc::new(ExternalRecordingProvider::codex());
+        let codex = {
+            let mut state_ref = handle.state.borrow_mut();
+            let tabs = &mut state_ref.tabs;
+            let codex = tabs.open(AgentId::Codex);
+            tabs.get_mut(codex).unwrap().backend = TabBackend::Live(
+                AgentBackend::start_external_with(
+                    AgentId::Codex,
+                    provider.clone(),
+                    &dir,
+                    empty_trust_plan(),
+                    SessionModeChoice::Auto,
+                    None,
+                )
+                .unwrap(),
+            );
+            tabs.select(codex);
+            codex
+        };
+        provider.inner.queue(agent::AgentDomainEvent::SessionUnavailable {
+            reason: "the stream ended".into(),
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handle.state.borrow().tabs.get(codex).unwrap().wire_state().as_str() != "ended" {
+            assert!(std::time::Instant::now() < deadline, "the session never ended");
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(handle.state.borrow().tabs.resumes_on_r(codex), None);
+        handle.page_message(&format!(
+            r#"{{"type":"reset_tab","request_id":"r1","tab":{}}}"#,
+            codex.0
+        ));
+        assert!(matches!(
+            handle.state.borrow().tabs.get(codex).unwrap().backend,
+            TabBackend::NotStarted
+        ));
+        assert!(handle.state.borrow().resume_after.is_empty());
     }
 
     /// What one tick of a settled panel costs: a ready page, one empty tab, a selection in the
@@ -10427,6 +10620,8 @@ mod tests {
         resume: Option<String>,
         /// The command and mode a registered agent's start was given.
         acp: Option<(Vec<std::ffi::OsString>, Option<String>)>,
+        /// Whether the start waits for the tab's old backend to be gone (`r` continuing its session).
+        waits_for_old: bool,
     }
 
     /// One start a counting spawner was asked for: the session it resumes, if any, and its tiers.
@@ -10489,12 +10684,14 @@ mod tests {
                         mode,
                         resume,
                         acp,
+                        after_old,
                     } => counted_external.borrow_mut().push(ExternalSpawned {
                         agent,
                         plan,
                         mode,
                         resume,
                         acp: acp.map(|spec| (spec.argv, spec.auto_mode)),
+                        waits_for_old: after_old.is_some(),
                     }),
                 }
                 mpsc::channel().1
@@ -10901,6 +11098,50 @@ mod tests {
         let seen = tick_until(&state, |_| fx.external.borrow().len() == 3);
         assert!(prompts(&all_payloads(&seen)).is_empty());
         assert_eq!(fx.external.borrow()[2].plan.fingerprint, again.fingerprint);
+    }
+
+    /// A resume `r` continues in the tab its session stopped in is started holding the wait for that tab's old
+    /// backend, which keeps the session's lease until it is gone; a fresh start in a tab is never held by a
+    /// wait left there.
+    #[test]
+    fn a_resume_continued_by_r_waits_for_the_old_backend() {
+        let (state, fx) = trust_panel("trust-resume-waits");
+        let started = |n: usize| {
+            let seen = tick_until(&state, |seen| {
+                fx.external.borrow().len() == n || !prompts(&all_payloads(seen)).is_empty()
+            });
+            if let Some(p) = prompts(&all_payloads(&seen)).pop() {
+                answer_prompt(&state, "a", &p, true);
+                tick_until(&state, |_| fx.external.borrow().len() == n);
+            }
+        };
+        let tab = codex_tab(&state);
+        let (_old_gone, gone) = mpsc::channel::<()>();
+        state.borrow_mut().resume_after.insert(tab, ("thread-1".into(), gone));
+        resume_in(&mut state.borrow_mut(), tab, "r1", "thread-1".into(), true).unwrap();
+        started(1);
+        let spawned = fx.external.borrow()[0].clone();
+        assert_eq!(spawned.resume.as_deref(), Some("thread-1"));
+        assert!(spawned.waits_for_old);
+        assert!(state.borrow().resume_after.is_empty());
+
+        let other = codex_tab(&state);
+        let (_never, left) = mpsc::channel::<()>();
+        state.borrow_mut().resume_after.insert(other, ("thread-1".into(), left));
+        gate_start(&mut state.borrow_mut(), other, first_send("r2", "hello")).unwrap();
+        started(2);
+        assert!(!fx.external.borrow()[1].waits_for_old);
+        assert!(state.borrow().resume_after.is_empty());
+
+        // A resume of another session than the one the wait is for does not wait either.
+        let third = codex_tab(&state);
+        let (_never, left) = mpsc::channel::<()>();
+        state.borrow_mut().resume_after.insert(third, ("thread-1".into(), left));
+        resume_in(&mut state.borrow_mut(), third, "r3", "thread-9".into(), true).unwrap();
+        started(3);
+        assert_eq!(fx.external.borrow()[2].resume.as_deref(), Some("thread-9"));
+        assert!(!fx.external.borrow()[2].waits_for_old);
+        assert!(state.borrow().resume_after.is_empty());
     }
 
     /// No trust check result for the tab's agent (its worker never ran): the external start is
@@ -12002,12 +12243,14 @@ mod tests {
                         mode,
                         resume,
                         acp,
+                        after_old,
                     } => external.borrow_mut().push(ExternalSpawned {
                         agent,
                         plan,
                         mode,
                         resume,
                         acp: acp.map(|spec| (spec.argv, spec.auto_mode)),
+                        waits_for_old: after_old.is_some(),
                     }),
                 }
                 mpsc::channel().1

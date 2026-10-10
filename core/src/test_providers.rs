@@ -325,6 +325,10 @@ impl agent::ExternalProvider for ExternalRecordingProvider {
         self.policies.lock().unwrap().push(policy);
         agent::AgentProvider::send_turn(&self.inner, request)
     }
+    /// As Codex: a session it stopped itself can be continued.
+    fn stopped_resumable(&self) -> bool {
+        self.stops() > 0
+    }
     /// What Codex does once the stop is taken: the count drops, and the session ends once its child is
     /// gone.
     fn stop_background(&self, _session_id: &str, _shown: u32) -> Result<(), agent::ProviderError> {

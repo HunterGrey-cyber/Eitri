@@ -1982,6 +1982,9 @@ pub struct TabView {
     /// Whether a `failed` tab's session had been open (a tripwire, a fatal command), so the page
     /// words it "stopped" and not "did not start". `false` for every other state.
     pub failed_after_start: bool,
+    /// Whether `r` on this ended tab continues its session in place (its agent stopped it with the
+    /// conversation whole) rather than emptying the tab to a start screen.
+    pub resumes_on_r: bool,
     /// The first prompt's title or the resumed record's display title; `null` before one exists.
     /// Filled from `Tab.title` in `Tab::view`.
     pub title: Option<String>,
@@ -2010,6 +2013,7 @@ pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView], defau
                 "resumable": t.resumable,
                 "failure": t.failure,
                 "failedAfterStart": t.failed_after_start,
+                "resumesOnR": t.resumes_on_r,
                 "title": t.title,
                 "agent": t.agent,
             })
@@ -5420,6 +5424,7 @@ mod tests {
                 resumable: true,
                 failure: None,
                 failed_after_start: false,
+                resumes_on_r: false,
                 title: Some("fix the parser".into()),
                 agent: "claude".into(),
             },
@@ -5435,6 +5440,7 @@ mod tests {
                 resumable: false,
                 failure: Some("the gate refused".into()),
                 failed_after_start: true,
+                resumes_on_r: true,
                 title: None,
                 agent: "codex".into(),
             },
@@ -5449,11 +5455,12 @@ mod tests {
             serde_json::json!({
                 "id": 1, "number": 1, "label": "1 fix-parser", "name": "fix-parser", "state": "live",
                 "mode": "auto", "marker": "needs_input", "pending": 2, "resumable": true, "failure": null,
-                "failedAfterStart": false, "title": "fix the parser", "agent": "claude"
+                "failedAfterStart": false, "resumesOnR": false, "title": "fix the parser", "agent": "claude"
             })
         );
         assert_eq!(value["tabs"][1]["agent"], "codex");
         assert_eq!(value["tabs"][1]["failedAfterStart"], true);
+        assert_eq!(value["tabs"][1]["resumesOnR"], true);
         assert_eq!(value["tabs"][1]["state"], "failed");
         assert_eq!(value["tabs"][1]["marker"], "ended");
         assert_eq!(value["tabs"][1]["name"], serde_json::Value::Null);

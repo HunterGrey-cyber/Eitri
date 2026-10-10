@@ -17,7 +17,6 @@
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -175,7 +174,7 @@ impl PaneSwitchChannel {
         // first on nvim's `PATH` and the nav snippet is `dofile`d by nvim, so under umask 002 with a
         // shared primary group the old `0775` let another member of that group plant an executable
         // or rewrite the Lua -- code run as this user.
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        if let Err(e) = crate::instance_dir::create_private_dir(&dir) {
             eprintln!(
                 "[pane_switch] could not create {}: {e} -- Ctrl+h/j/k/l out of nvim disabled",
                 dir.display()
@@ -188,7 +187,7 @@ impl PaneSwitchChannel {
         };
         let fake_tmux = bin_dir.join("tmux");
         if let Some(shim) = shim {
-            if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&bin_dir) {
+            if let Err(e) = crate::instance_dir::create_private_dir(&bin_dir) {
                 fail(format!("could not create {}: {e}", bin_dir.display()));
                 return None;
             }
@@ -219,6 +218,13 @@ impl PaneSwitchChannel {
                 return None;
             }
         };
+        if let Err(e) = crate::instance_dir::make_socket_private(&socket_path) {
+            fail(format!(
+                "could not make {} reachable by nvim: {e}",
+                socket_path.display()
+            ));
+            return None;
+        }
         if let Err(e) = listener.set_nonblocking(true) {
             fail(format!("could not set the switch socket non-blocking: {e}"));
             return None;

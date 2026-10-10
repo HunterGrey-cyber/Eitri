@@ -2659,6 +2659,7 @@ fn sole_tab_envelope(sole_tab: eitri_core::tabs::TabId) -> String {
         resumable: false,
         failure: None,
         failed_after_start: false,
+        resumes_on_r: false,
         title: None,
         agent: "claude".into(),
     }];

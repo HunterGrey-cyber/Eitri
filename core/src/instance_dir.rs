@@ -48,12 +48,76 @@ pub(crate) fn instance_dir_path(tmp: &Path, prefix: &str) -> PathBuf {
 /// not recursive and not idempotent: a path that already exists, a symlink included, is an error and is
 /// never reused, so nothing planted in `tmp` can become this instance's directory.
 pub fn create_instance_dir(tmp: &Path, prefix: &str, socket_name: &str, log_tag: &str) -> io::Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
     sweep_stale_instance_dirs(tmp, prefix, socket_name, log_tag);
     let dir = instance_dir_path(tmp, prefix);
-    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    create_private_dir(&dir)?;
     Ok(dir)
 }
+
+/// Creates `dir`, which must not exist yet, as a directory of this user's of mode exactly 0700.
+///
+/// The mode given to `mkdir` is narrowed by the umask, and one that takes the owner's own bits away
+/// (0277) leaves 0500, in which nothing can be created: the feature that needed the directory would be
+/// off. So the mode is then set exactly, with `fchmod` on a handle opened without following a link,
+/// after `fstat` on that same handle says it is a directory owned by this user. Not recursive and not
+/// idempotent: a path that already exists, a link included, is an error. A directory this call made and
+/// could not finish is removed again.
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new().mode(PRIVATE_DIR_MODE).create(dir)?;
+    let narrowed = (|| {
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)?;
+        let meta = handle.metadata()?;
+        // The effective uid, the owner `mkdir` gave it (the sweep's `current_uid` is the real one).
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::other(format!(
+                "{} is not this user's directory",
+                dir.display()
+            )));
+        }
+        if meta.mode() & 0o7777 == PRIVATE_DIR_MODE {
+            return Ok(());
+        }
+        // SAFETY: the descriptor is `handle`'s own and stays open for the call.
+        if unsafe { libc::fchmod(handle.as_raw_fd(), PRIVATE_DIR_MODE as libc::mode_t) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })();
+    if narrowed.is_err() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    narrowed
+}
+
+/// Sets the socket a listener was just bound to at `path`, inside a directory [`create_private_dir`]
+/// made, to exactly 0600: a client must be able to write to the socket file to connect, and a umask that
+/// takes the owner's write bit away (0277) would leave nvim unable to reach it. The directory is this
+/// user's alone, so nothing else can have put a link in the socket's place; the entry is still checked
+/// to be a socket of this user's before its mode changes.
+pub(crate) fn make_socket_private(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(path)?;
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    if !meta.file_type().is_socket() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::other(format!(
+            "{} is not this user's socket",
+            path.display()
+        )));
+    }
+    if meta.mode() & 0o7777 == PRIVATE_SOCKET_MODE {
+        return Ok(());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_SOCKET_MODE))
+}
+
+const PRIVATE_DIR_MODE: u32 = 0o700;
+const PRIVATE_SOCKET_MODE: u32 = 0o600;
 
 /// Deletes directories under `tmp` named `<prefix><pid>-<uuid>` (or the legacy `<prefix><pid>`)
 /// whose process is gone.

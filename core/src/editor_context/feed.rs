@@ -5,7 +5,6 @@
 //! protocol is in production and its failure modes are already paid for. Read that module's
 //! comments before changing anything here; several of them are about bugs, not style.
 
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -63,7 +62,7 @@ impl EditorContextFeed {
 
         let dir = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
         // 0700: whatever can connect to this socket can tell the agent what the user is looking at.
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        if let Err(e) = crate::instance_dir::create_private_dir(&dir) {
             eprintln!(
                 "[editor-context] could not create {}: {e} -- turns will carry no editor context",
                 dir.display()
@@ -94,6 +93,13 @@ impl EditorContextFeed {
                 return None;
             }
         };
+        if let Err(e) = crate::instance_dir::make_socket_private(&socket_path) {
+            fail(format!(
+                "could not make {} reachable by nvim: {e}",
+                socket_path.display()
+            ));
+            return None;
+        }
         if let Err(e) = listener.set_nonblocking(true) {
             fail(format!("could not make the editor-context socket non-blocking: {e}"));
             return None;

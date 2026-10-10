@@ -449,6 +449,7 @@ fn replay_fixture() -> Vec<String> {
         resumable: false,
         failure: None,
         failed_after_start: false,
+        resumes_on_r: false,
         title: None,
         agent: "claude".into(),
     }];

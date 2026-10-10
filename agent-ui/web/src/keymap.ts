@@ -791,7 +791,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "i / o", what: "Start typing, caret where you left it (C1a: o is an exact alias of i)" },
   { keys: "A", what: "Start typing at the end of the draft" },
   { keys: "f", what: "HINT: jump anywhere in the window (links too; Enter opens one)" },
-  { keys: "r", what: "New session, once this one has ended" },
+  { keys: "r", what: "Once this session has ended: resume it, or start a new one (its last row says which)" },
   { keys: "c", what: "Review: the files that changed on disk during this tab's latest turn (read-only)" },
   { keys: "/", what: "Search the conversation (Enter keeps the match, Esc goes back)" },
   { keys: ":", what: "A command line, as in vim: :trust and :untrust" },

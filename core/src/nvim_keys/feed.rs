@@ -6,7 +6,6 @@
 //! Treat nvim-supplied bytes as untrusted. Drop a whole line if [`super::parse_report`] rejects
 //! it as a v1 report or it exceeds the line cap. The host keeps its last good report.
 
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -61,7 +60,7 @@ impl NvimKeysFeed {
 
         let dir = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
         // 0700: whatever can connect to this socket can tell the panel which keys do what.
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        if let Err(e) = crate::instance_dir::create_private_dir(&dir) {
             eprintln!(
                 "[nvim-keys] could not create {}: {e} -- the panel keeps its default keys",
                 dir.display()
@@ -92,6 +91,13 @@ impl NvimKeysFeed {
                 return None;
             }
         };
+        if let Err(e) = crate::instance_dir::make_socket_private(&socket_path) {
+            fail(format!(
+                "could not make {} reachable by nvim: {e}",
+                socket_path.display()
+            ));
+            return None;
+        }
         if let Err(e) = listener.set_nonblocking(true) {
             fail(format!("could not make the nvim-keys socket non-blocking: {e}"));
             return None;

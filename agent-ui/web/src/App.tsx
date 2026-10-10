@@ -5710,6 +5710,11 @@ export default function App() {
     state.status.kind === "unavailable" || state.status.kind === "closed"
       ? classify(state.status.reason, hello?.account ?? null)
       : null;
+  // What `r` does on this row: Rust continues a session its agent stopped with the conversation whole, and
+  // empties the tab to a start screen otherwise (`TabView::resumes_on_r`).
+  const restartHint = activeTab?.resumesOnR
+    ? "Press r to resume this conversation."
+    : "Press r to start a new session here.";
   const sessionEndedBanner =
     state.status.kind === "unavailable" ? (
       <Row kind="error" sign="✗" role="alert" problem={sessionEndedProblem}>
@@ -5721,7 +5726,7 @@ export default function App() {
             always BROWSE: `resolveKey` refuses `i` once the session has ended and the effect near
             the top of this component forces BROWSE if it died while INPUT was active, so this
             sentence cannot be on screen in a mode that drops `r`. */}
-        {!remedyNamesR(sessionEndedProblem) && <div className="row-hint">Press r to start a new session here.</div>}
+        {!remedyNamesR(sessionEndedProblem) && <div className="row-hint">{restartHint}</div>}
       </Row>
     ) : state.status.kind === "closed" ? (
       // Deliberately NOT `row-error`/`✗`: an ordinary close (the host closed it, the provider
@@ -5730,7 +5735,7 @@ export default function App() {
       // fuller record of why these two were briefly unified and then split back apart.
       <Row kind="ended" sign="·" problem={sessionEndedProblem}>
         This session has ended ({state.status.reason}).
-        {!remedyNamesR(sessionEndedProblem) && <div className="row-hint">Press r to start a new session here.</div>}
+        {!remedyNamesR(sessionEndedProblem) && <div className="row-hint">{restartHint}</div>}
       </Row>
     ) : null;
 

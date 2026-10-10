@@ -827,6 +827,15 @@ impl AgentBackend {
         }
     }
 
+    /// Whether the agent stopped this session itself with the conversation whole, so `r` on the ended tab
+    /// continues it (`AgentConversation::stopped_resumable`). Only an external agent's can be.
+    pub fn stopped_resumable(&self) -> bool {
+        match self {
+            AgentBackend::External(external) => external.conversation.stopped_resumable(),
+            _ => false,
+        }
+    }
+
     /// Stops the commands the agent left running after its turns ended, by stopping its session
     /// (`AgentConversation::stop_background`); the session then ends through the pump, and its
     /// conversation can be resumed. A refusal because of when it was asked is benign (a turn started,
