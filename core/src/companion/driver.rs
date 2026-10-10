@@ -66,6 +66,25 @@ enum WorkerMsg {
     },
 }
 
+/// Called after a worker thread has sent the driver something, and after [`LinkDriver::attach`], on
+/// whichever thread sent it: a host that stops polling while nothing is due polls again when told.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// A worker's end of the driver's channel: each message is followed by the host's wake.
+#[derive(Clone)]
+struct ToDriver {
+    tx: Sender<WorkerMsg>,
+    wake: Wake,
+}
+
+impl ToDriver {
+    fn send(&self, message: WorkerMsg) -> Result<(), ()> {
+        self.tx.send(message).map_err(drop)?;
+        (self.wake)();
+        Ok(())
+    }
+}
+
 /// What a carried-out effect and the driver's callers ask of a connection.
 pub(crate) trait Wire {
     fn exec_lua(&self, code: &str, args: Vec<Value>);
@@ -244,6 +263,7 @@ pub struct LinkDriver {
     shut: bool,
     /// Starts a connect's worker thread. A field so a test can make it fail.
     spawn_thread: fn(Job) -> io::Result<()>,
+    wake: Wake,
 }
 
 impl LinkDriver {
@@ -267,13 +287,22 @@ impl LinkDriver {
             last_state,
             shut: false,
             spawn_thread: spawn_attach_thread,
+            wake: Arc::new(|| {}),
         }
+    }
+
+    /// What to call when something reaches the driver from another thread (see [`Wake`]). Set it before
+    /// the first [`LinkDriver::poll`]: a worker already started keeps the wake it was started with.
+    pub fn set_wake(&mut self, wake: Wake) {
+        self.wake = wake;
     }
 
     /// Aim the panel at this nvim; the one it already follows is left as it is (asking from it is how
     /// the panel is brought forward). Takes effect at the next `poll`.
     pub fn attach(&self, addr: PathBuf) {
-        let _ = self.tx.send(WorkerMsg::Event(AttachEvent::Requested(addr)));
+        if self.tx.send(WorkerMsg::Event(AttachEvent::Requested(addr))).is_ok() {
+            (self.wake)();
+        }
     }
 
     pub fn state(&self) -> &LinkState {
@@ -515,7 +544,10 @@ impl LinkDriver {
     }
 
     fn carry_out(&mut self, effects: Vec<Effect>, tick: &mut Tick) {
-        let tx = self.tx.clone();
+        let tx = ToDriver {
+            tx: self.tx.clone(),
+            wake: Arc::clone(&self.wake),
+        };
         let current = Arc::clone(&self.current_gen);
         let sockets = self.sockets.clone();
         let spawn_thread = self.spawn_thread;
@@ -601,7 +633,7 @@ fn spawn_attach_thread(job: Job) -> io::Result<()> {
 }
 
 /// One connect, for one generation. Ends when the connection does or when the driver is gone.
-fn worker(gen: u64, addr: PathBuf, tx: Sender<WorkerMsg>, current: Arc<AtomicU64>, sockets: Sockets) {
+fn worker(gen: u64, addr: PathBuf, tx: ToDriver, current: Arc<AtomicU64>, sockets: Sockets) {
     let (link, events) = match NvimLink::connect(&addr, CONNECT_TIMEOUT) {
         Ok(connected) => connected,
         Err(why) => {
@@ -874,6 +906,94 @@ mod tests {
             },
         });
         assert!(!driver.is_own_earlier_channel(5), "pid 100 is not pid 200");
+    }
+
+    /// Polls `driver` until `done` holds, at most 2 s.
+    fn poll_until(driver: &mut LinkDriver, done: impl Fn(&LinkDriver) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            driver.poll(Instant::now());
+            if done(driver) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Waits for `count` to reach `n`, at most 2 s, without polling: what a host that stopped polling sees.
+    fn woken(count: &AtomicU64, n: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while count.load(Ordering::SeqCst) < n {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    #[test]
+    fn each_thing_a_worker_sends_and_each_attach_calls_the_wake() {
+        let count = Arc::new(AtomicU64::new(0));
+        let mut driver = LinkDriver::new(None, Sockets::default());
+        let counted = Arc::clone(&count);
+        driver.set_wake(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // An editor that is not there: the attach wakes, then the worker's failed connect does.
+        let dir = std::env::temp_dir().join(format!("drv-{}-wake", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        driver.attach(agent::socket_path::in_dir(&dir, "absent.sock").unwrap());
+        assert_eq!(count.load(Ordering::SeqCst), 1, "the attach");
+        driver.poll(Instant::now());
+        assert!(woken(&count, 2), "the failed connect, {}", count.load(Ordering::SeqCst));
+        assert!(poll_until(&mut driver, |d| matches!(
+            d.state(),
+            LinkState::Failed { .. }
+        )));
+
+        // An editor that answers the handshake, then goes: `Linked` wakes, and so does its close.
+        let sock = agent::socket_path::in_dir(&dir, "n.sock").unwrap();
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let fake = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let (id, method, _) = read_request(&mut reader);
+            assert_eq!(method, "nvim_get_api_info");
+            write_value(
+                &mut stream,
+                Value::Array(vec![
+                    Value::from(1),
+                    Value::from(id),
+                    Value::Nil,
+                    Value::Array(vec![Value::from(7), Value::Map(vec![])]),
+                ]),
+            );
+            // Held open until the test says the editor goes.
+            let _ = go_rx.recv_timeout(Duration::from_secs(5));
+        });
+        let before = count.load(Ordering::SeqCst);
+        driver.attach(sock.clone());
+        driver.poll(Instant::now());
+        assert!(woken(&count, before + 2), "the attach and `Linked`");
+        assert!(poll_until(&mut driver, |d| matches!(
+            d.state(),
+            LinkState::Attaching { .. }
+        )));
+        let before = count.load(Ordering::SeqCst);
+        go_tx.send(()).unwrap();
+        fake.join().unwrap();
+        assert!(woken(&count, before + 1), "the editor's close");
+        assert!(poll_until(&mut driver, |d| !matches!(
+            d.state(),
+            LinkState::Attaching { .. }
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

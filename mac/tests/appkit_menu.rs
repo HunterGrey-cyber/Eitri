@@ -17,7 +17,9 @@ fn main() {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use eitri_mac::appkit::menu::{edit_menu_present, keep_main_menu, EditTarget, QuitTarget, EDIT_MENU_TAG};
+    use eitri_mac::appkit::menu::{
+        edit_menu_present, keep_main_menu, menu_settled, EditTarget, QuitTarget, EDIT_MENU_TAG,
+    };
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool, NSObject};
     use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
@@ -121,10 +123,18 @@ fn main() {
         "with no main menu there is nothing to do",
         !pass.inserted_edit_menu && pass.removed_new_window == 0,
     );
+    check(
+        "and the host's tick keeps waiting for Neovide's menu",
+        !menu_settled(0, &pass),
+    );
 
     app.setMainMenu(Some(&neovides_menu()));
     let pass = keep_main_menu(mtm, &target, &quit_target);
     check("the Edit menu goes into the first main menu", pass.inserted_edit_menu);
+    check(
+        "Neovide's menu seen (its Quit retargeted) and the Edit menu in: the host's tick may stop",
+        pass.retargeted_quit == 1 && menu_settled(pass.retargeted_quit, &pass),
+    );
     check(
         "after the application menu",
         titles() == ["neovide", "Edit", "Window", "Help"],
@@ -206,6 +216,10 @@ fn main() {
     check(
         "a pass over a retargeted Quit changes nothing",
         pass.retargeted_quit == 0,
+    );
+    check(
+        "and stays settled on the count so far",
+        pass.edit_menu_present && menu_settled(1, &pass) && !menu_settled(0, &pass),
     );
 
     // The items' target: disabled while the panel does not have the keys.

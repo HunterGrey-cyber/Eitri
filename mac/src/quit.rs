@@ -188,6 +188,22 @@ mod tests {
         assert_eq!(ids, ["s-held"]);
     }
 
+    /// How many times `flat` (code with its whitespace removed) calls the panel's tick and takes its wake.
+    fn tick_and_wake_calls(flat: &str) -> (usize, usize) {
+        // The name and its parenthesis, whatever comes before: a method call and a path call both count.
+        (flat.matches("run_tick(").count(), flat.matches("take_wake(").count())
+    }
+
+    /// A call spelled as a path (`Handle::run_tick(&h, now)`) is a call too.
+    #[test]
+    fn the_scan_counts_a_call_spelled_as_a_path() {
+        assert_eq!(tick_and_wake_calls("h.run_tick(now);h.take_wake(now);"), (1, 1));
+        assert_eq!(
+            tick_and_wake_calls("AgentPanelHandle::run_tick(&h,now);AgentPanelHandle::take_wake(&h,now);"),
+            (1, 1)
+        );
+    }
+
     /// The app's every way out waits for the panel's close, and the panel's tick is the pump's: started at the
     /// attach, stopped by the teardown, and no fixed timer ticks the panel. Read from the AppKit half's source,
     /// which builds only on macOS.
@@ -224,7 +240,7 @@ mod tests {
                 "{:?} ticks the panel outside its pump",
                 source.path
             );
-            let (runs, takes) = (code.matches(".run_tick(").count(), code.matches(".take_wake(").count());
+            let (runs, takes) = tick_and_wake_calls(&code);
             if code.contains("pubstructPanelPump") {
                 pump_calls = (runs, takes);
             } else {

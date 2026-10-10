@@ -32,6 +32,7 @@ use objc2_foundation::{
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+use super::editor_tick::EditorTicker;
 use super::menu;
 use super::page::{repeat, PanelView};
 use super::tick::PanelTicker;
@@ -42,7 +43,8 @@ use crate::layout::{
     MIN_CONTENT_HEIGHT_PT, PANEL_WIDTH_PT,
 };
 
-/// How often the host looks after what nothing announces: whether Neovide replaced the main menu.
+/// How often the host looks after what nothing announces, until it has been seen: Neovide replacing the main
+/// menu (once, on the window's first focus; `menu::menu_settled`).
 const HOST_TICK: Duration = Duration::from_millis(250);
 
 /// How long a notice the panel cannot show stays in the window's subtitle.
@@ -105,7 +107,12 @@ pub fn subtitle_text(pieces: &[StripPiece]) -> String {
 
 /// Runs `f` on a later turn of the main run loop, when whatever AppKit or Neovide is in the middle of has
 /// returned. Only on the main thread, which the marker proves: `f` runs there.
-pub fn on_next_turn(_mtm: MainThreadMarker, f: impl FnOnce() + 'static) {
+pub fn on_next_turn(mtm: MainThreadMarker, f: impl FnOnce() + 'static) {
+    after(mtm, Duration::ZERO, f);
+}
+
+/// Runs `f` once on the main run loop, `delay` from now (in its common modes). Only on the main thread.
+pub fn after(_mtm: MainThreadMarker, delay: Duration, f: impl FnOnce() + 'static) {
     let f = Cell::new(Some(f));
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         if let Some(f) = f.take() {
@@ -114,7 +121,7 @@ pub fn on_next_turn(_mtm: MainThreadMarker, f: impl FnOnce() + 'static) {
     });
     // SAFETY: a one-shot timer added to the main run loop, which retains it (and the block) until it fires.
     unsafe {
-        let timer = NSTimer::timerWithTimeInterval_repeats_block(0.0, false, &block);
+        let timer = NSTimer::timerWithTimeInterval_repeats_block(delay.as_secs_f64(), false, &block);
         NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
     }
 }
@@ -140,6 +147,8 @@ pub struct Host {
     pub(super) timers: RefCell<Vec<Retained<NSTimer>>>,
     /// The panel's tick, from the attach until the shutdown.
     panel_tick: RefCell<Option<Rc<PanelTicker>>>,
+    /// The editor's poll, from the moment nvim listens until the shutdown.
+    pub(super) editor_tick: RefCell<Option<Rc<EditorTicker>>>,
     /// Starting, quitting and shutting down (`app.rs`).
     pub life: super::app::Lifecycle,
     /// The Edit menu's and the Quit item's targets, made with the window.
@@ -175,6 +184,7 @@ impl Host {
             observers: RefCell::new(Vec::new()),
             timers: RefCell::new(Vec::new()),
             panel_tick: RefCell::new(None),
+            editor_tick: RefCell::new(None),
             life: super::app::Lifecycle::default(),
             edit_target: RefCell::new(None),
             quit_target: RefCell::new(None),
@@ -313,24 +323,22 @@ impl Host {
         // The window may already be key: no notification will say so.
         self.report_pane_focus();
         let weak = Rc::downgrade(self);
-        let tick = repeat(self.mtm, HOST_TICK, move || match weak.upgrade() {
-            Some(host) => {
-                host.keep_edit_menu();
-                // The prefix's repeat window ends without a key; the subtitle follows it here.
-                host.update_subtitle();
-                true
-            }
-            None => false,
-        });
-        self.timers.borrow_mut().push(tick);
-        self.keep_edit_menu();
+        if !self.keep_edit_menu() {
+            let tick = repeat(self.mtm, HOST_TICK, move || match weak.upgrade() {
+                // Stops itself once the menu is settled: a frame still runs a pass.
+                Some(host) => !host.keep_edit_menu(),
+                None => false,
+            });
+            self.timers.borrow_mut().push(tick);
+        }
         #[cfg(feature = "acceptance")]
         super::acceptance::start(Rc::downgrade(self));
     }
 
-    fn keep_edit_menu(&self) {
+    /// One pass over the main menu; whether it is settled (`menu::menu_settled`).
+    fn keep_edit_menu(&self) -> bool {
         let (Some(target), Some(quit)) = (self.edit_target.borrow().clone(), self.quit_target.borrow().clone()) else {
-            return;
+            return false;
         };
         let pass = menu::keep_main_menu(self.mtm, &target, &quit);
         if pass.retargeted_quit > 0 {
@@ -348,6 +356,7 @@ impl Host {
                 pass.removed_new_window
             );
         }
+        menu::menu_settled(self.life.quit_items_retargeted(), &pass)
     }
 
     /// Removes what the window installed into AppKit (the key monitor, the observers) and stops its timers, so
@@ -371,6 +380,32 @@ impl Host {
         if let Some(tick) = tick {
             tick.stop();
         }
+        let editor_tick = self.editor_tick.borrow_mut().take();
+        if let Some(editor_tick) = editor_tick {
+            editor_tick.stop();
+        }
+    }
+
+    /// The editor's poll: `None` before nvim listens and after the shutdown, else whether it runs on its timer
+    /// (`true`) or waits on its sockets (`false`).
+    pub fn editor_ticking(&self) -> Option<bool> {
+        let tick = self.editor_tick.borrow();
+        let tick = tick.as_ref()?;
+        (tick.is_ticking() || tick.is_watching()).then(|| tick.is_ticking())
+    }
+
+    /// The sources the editor's poll waits on now (none while it ticks on its timer or once it is stopped).
+    pub fn editor_watch_sources(&self) -> Vec<dispatch2::DispatchRetained<dispatch2::DispatchSource>> {
+        self.editor_tick
+            .borrow()
+            .as_ref()
+            .map(|tick| tick.watch_sources())
+            .unwrap_or_default()
+    }
+
+    /// Lets go of the editor's poll without stopping it: what a ticker dropped by any other path would do.
+    pub fn drop_editor_tick_without_stopping(&self) {
+        self.editor_tick.borrow_mut().take();
     }
 
     /// Whether the panel's tick is driven (from the attach until the shutdown).
@@ -721,6 +756,13 @@ impl HostActions for Host {
                 crate::log_line!("[mac] notice: {text}");
                 *self.notice.borrow_mut() = Some((text.to_owned(), Instant::now() + SUBTITLE_NOTICE));
                 self.update_subtitle();
+                // The notice goes from the subtitle when it is due; nothing else would redraw it then.
+                let weak = HOST_FOR_LATER.with(|h| h.borrow().clone());
+                after(self.mtm, SUBTITLE_NOTICE, move || {
+                    if let Some(host) = weak.upgrade() {
+                        host.update_subtitle();
+                    }
+                });
             }
             None => crate::log_line!("[mac] {text}"),
         }

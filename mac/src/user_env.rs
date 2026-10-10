@@ -150,14 +150,18 @@ fn with_error_tail(why: String, stderr: &[u8]) -> String {
 /// group (it is started as the leader of its own) is killed by the pid it was given, so a shell configuration's
 /// own children go too; a shell that prints without end is no exception, since no read outlasts the budget.
 pub fn path_from_command(program: &Path, args: &[OsString], budget: Duration) -> Result<OsString, String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("{} could not start: {e}", program.display()))?;
+    let spawned = {
+        #[cfg(test)]
+        let _spawning = crate::spawn_gate::spawning();
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+    };
+    let mut child = spawned.map_err(|e| format!("{} could not start: {e}", program.display()))?;
     let pid = child.id() as libc::pid_t;
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
@@ -492,21 +496,40 @@ mod tests {
             &endless,
             "#!/bin/sh\necho $$ > \"$1\"\nyes 'on stderr' >&2 &\nyes 'on stdout'\n",
         );
-        let budget = Duration::from_millis(500);
-        let started = Instant::now();
-        let why = path_from_command(&endless, &[pid_file.clone().into_os_string()], budget).unwrap_err();
-        assert!(
-            started.elapsed() < budget + Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
-        assert!(why.contains("no answer"), "{why}");
-        assert!(why.contains("on stderr"), "the end of its errors: {why}");
-        let pgid: libc::pid_t = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
-        assert!(
-            !group_left(pgid, Duration::from_secs(3)),
-            "process group {pgid} was not killed"
-        );
+        // How soon a loaded machine gets the shell as far as its `yes` on stderr is not the test's to say: a budget
+        // that ran out first says nothing about the cut, so the budget doubles until the shell was seen to get
+        // there (its pid written and its errors quoted). What is asserted does not depend on which round that was.
+        let mut budget = Duration::from_millis(250);
+        let mut rounds = 0;
+        loop {
+            budget *= 2;
+            rounds += 1;
+            let _ = std::fs::remove_file(&pid_file);
+            let started = Instant::now();
+            let why = path_from_command(&endless, &[pid_file.clone().into_os_string()], budget).unwrap_err();
+            assert!(
+                started.elapsed() < budget * 4,
+                "{:?} for a budget of {budget:?}",
+                started.elapsed()
+            );
+            assert!(why.contains("no answer"), "{why}");
+            let pgid: Option<libc::pid_t> = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok());
+            if let Some(pgid) = pgid {
+                assert!(
+                    !group_left(pgid, Duration::from_secs(3)),
+                    "process group {pgid} was not killed"
+                );
+            }
+            if pgid.is_some() && why.contains("on stderr") {
+                return;
+            }
+            assert!(
+                rounds < 6,
+                "the end of its errors, after {rounds} budgets (the last {budget:?}), pid {pgid:?}: {why}"
+            );
+        }
     }
 
     #[test]

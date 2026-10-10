@@ -606,7 +606,8 @@ pub(crate) mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        let etc = DirHandle::open_absolute(Path::new("/etc")).unwrap();
+        // `/etc` is a link to `/private/etc` on macOS, and `open_absolute` refuses a linked component.
+        let etc = DirHandle::open_absolute(&std::fs::canonicalize("/etc").unwrap()).unwrap();
         let passwd = OsStr::new("passwd");
         assert!(etc.read_file_as(passwd, 1 << 20, Owner::MeOrRoot).is_ok());
         assert!(etc.read_file_as(passwd, 1 << 20, Owner::Anyone).is_ok());

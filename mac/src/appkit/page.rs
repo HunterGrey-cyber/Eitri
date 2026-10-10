@@ -1,10 +1,10 @@
 //! The agent panel's page in a WKWebView: the document, the view and its delegate, the `PageSurface` and
-//! `PanelHost` the panel's logic drives, and the run-loop timer that polls the editor.
+//! `PanelHost` the panel's logic drives, and the run-loop timer [`repeat`].
 //!
 //! The order a window follows: [`PanelView::new`] builds the view (no document yet), the window adds
 //! [`PanelView::view`] beside the editor, `assembly::assemble` builds the panel with [`PanelView::page`] and
 //! [`MacPanelHost`], then [`PanelView::connect`] routes the view's reports to that panel and loads the first
-//! document, and `super::tick::PanelTicker` and [`start_editor_tick`] drive it.
+//! document, and `super::tick::PanelTicker` and `super::editor_tick::EditorTicker` drive it.
 //!
 //! **The page is never allowed to navigate.** It holds the `eitriAgent` bridge, which answers permission
 //! cards, so any other document in this view would inherit it. The delegate allows only the loads
@@ -17,7 +17,7 @@ use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use block2::RcBlock;
 use eitri_panel::agent_panel::AgentPanelHandle;
@@ -35,8 +35,6 @@ use objc2_web_kit::{
     WKScriptMessage, WKScriptMessageHandler, WKUserContentController, WKWebView, WKWebViewConfiguration,
     WKWebsiteDataStore,
 };
-
-use crate::assembly::Assembly;
 
 /// The embedded, single-file `agent-ui/web` production build; `build.rs` builds it before this crate
 /// compiles on macOS. Nothing is read from the app bundle at run time.
@@ -728,15 +726,6 @@ pub fn repeat(_mtm: MainThreadMarker, interval: Duration, f: impl Fn() -> bool +
         NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
         timer
     }
-}
-
-/// The editor's feeds and link, every `EditorFeeds::TICK`, each event handled by the assembly. It runs until
-/// invalidated: the window does that when it shuts the editor link down.
-pub fn start_editor_tick(mtm: MainThreadMarker, assembly: Rc<Assembly>) -> Retained<NSTimer> {
-    repeat(mtm, crate::editor::TICK, move || {
-        assembly.poll_editor(Instant::now());
-        true
-    })
 }
 
 #[cfg(test)]

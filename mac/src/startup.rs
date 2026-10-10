@@ -380,6 +380,12 @@ pub fn open_project_log(dir: &Path, project_root: &Path) -> Option<ProjectLog> {
     if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
         return None;
     }
+    // The mode is put right before the lock's read-only open, which a log left at 0200 (or made under a umask
+    // such as 0477) would otherwise fail, and every start would write to `/dev/null` instead.
+    // SAFETY: `fchmod` on the descriptor `file` owns, open for the length of the call.
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == -1 {
+        return None;
+    }
     let lock = File::options()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -389,11 +395,8 @@ pub fn open_project_log(dir: &Path, project_root: &Path) -> Option<ProjectLog> {
     if (same.dev(), same.ino()) != (meta.dev(), meta.ino()) {
         return None;
     }
-    // SAFETY: `fchmod` and `flock` on descriptors `file` and `lock` own, open for the length of the calls.
+    // SAFETY: `flock` on the descriptor `lock` owns, open for the length of the call.
     unsafe {
-        if libc::fchmod(file.as_raw_fd(), 0o600) == -1 {
-            return None;
-        }
         if libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 {
             // Alone: last time's lines go.
             file.set_len(0).ok()?;
@@ -899,11 +902,64 @@ mod tests {
         assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
+    /// A child forked and not yet exec'd, as another test's `Command::spawn` leaves one for a moment: between the
+    /// fork and the exec it holds a copy of every descriptor of the process, close-on-exec or not.
+    struct ForkInFlight {
+        go: std::io::PipeWriter,
+        spawned: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ForkInFlight {
+        /// Returns once the child is between its fork and its exec.
+        fn start() -> ForkInFlight {
+            use std::io::Read;
+            use std::os::unix::process::CommandExt;
+            let (mut ready_read, ready_write) = std::io::pipe().unwrap();
+            let (go_read, go_write) = std::io::pipe().unwrap();
+            let (ready_fd, go_fd) = (ready_write.as_raw_fd(), go_read.as_raw_fd());
+            let spawned = std::thread::spawn(move || {
+                let mut command = std::process::Command::new("/usr/bin/true");
+                // SAFETY: only `write` and `read` on descriptors the closure's thread keeps open, which are
+                // async-signal-safe.
+                unsafe {
+                    command.pre_exec(move || {
+                        let mut byte = 0u8;
+                        libc::write(ready_fd, std::ptr::addr_of!(byte).cast(), 1);
+                        libc::read(go_fd, std::ptr::addr_of_mut!(byte).cast(), 1);
+                        Ok(())
+                    });
+                }
+                command.status().unwrap();
+                drop((ready_write, go_read));
+            });
+            let mut byte = [0u8; 1];
+            ready_read.read_exact(&mut byte).unwrap();
+            ForkInFlight {
+                go: go_write,
+                spawned: Some(spawned),
+            }
+        }
+
+        /// Lets the child exec, which closes its copies of the close-on-exec descriptors.
+        fn exec(self) {}
+    }
+
+    impl Drop for ForkInFlight {
+        fn drop(&mut self) {
+            use std::io::Write;
+            let _ = self.go.write_all(&[0]);
+            if let Some(spawned) = self.spawned.take() {
+                let _ = spawned.join();
+            }
+        }
+    }
+
     /// Two windows of one project write to one log: neither empties it while the other holds it, and each
     /// line lands after the last, whoever wrote it. A start with nobody else holding the log empties it.
     #[test]
     fn two_windows_of_one_project_append_to_its_log_and_only_a_lone_start_empties_it() {
         use std::io::Write;
+        let _quiet = crate::spawn_gate::quiet();
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("state/eitri/mac");
         let root = Path::new("/a/project");
@@ -936,11 +992,43 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
+    /// Until a forked child execs it holds a copy of the lock's descriptor, and a start that asks for the exclusive
+    /// lock meanwhile is not alone; the exec closes the copy (the lock's open is close-on-exec), so no child that
+    /// is running a program keeps a later start from being alone.
+    #[test]
+    fn a_forked_child_holds_the_lock_only_until_it_execs() {
+        use std::io::Write;
+        let _spawning = crate::spawn_gate::spawning();
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let root = Path::new("/a/project");
+        let mut app = open_project_log(&logs, root).unwrap();
+        app.file.write_all(b"a line\n").unwrap();
+        let path = app.path.clone();
+        let in_flight = ForkInFlight::start();
+        drop(app);
+        let during = open_project_log(&logs, root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a line\n",
+            "a start while a fork is in flight is not alone"
+        );
+        drop(during);
+        in_flight.exec();
+        let _after = open_project_log(&logs, root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "",
+            "after the exec nothing holds the lock"
+        );
+    }
+
     /// A child that inherited the log as its output (an orphaned `claude`, a sidecar that outlived the app) does
     /// not hold the lock, so the next lone start still empties the log, and the child goes on appending.
     #[test]
     fn a_child_left_writing_to_the_log_does_not_keep_the_next_start_from_emptying_it() {
         use std::io::Write;
+        let _spawning = crate::spawn_gate::spawning();
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("state/eitri/mac");
         let root = Path::new("/a/project");
@@ -1005,6 +1093,24 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(!hold_shared(ours.as_raw_fd(), 3, std::time::Duration::from_millis(1)));
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A log left at a mode nobody can read (a umask of 0477 makes one) is repaired at the start, not given up
+    /// on: the lock's open comes after the mode is put right.
+    #[test]
+    fn a_log_without_read_permission_is_repaired_and_opened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let root = Path::new("/a/project");
+        std::fs::create_dir_all(&logs).unwrap();
+        let path = logs.join(eitri_core::companion::stdio::log_file_name(root));
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let log = open_project_log(&logs, root).expect("a real log, not /dev/null");
+        assert!(log.locked);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "", "a lone start empties it");
     }
 
     #[test]

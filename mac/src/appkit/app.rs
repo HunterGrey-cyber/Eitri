@@ -27,7 +27,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSString};
 
-use super::page::{repeat, start_editor_tick, PANEL_DOCUMENT};
+use super::editor_tick::EditorTicker;
+use super::page::{repeat, PANEL_DOCUMENT};
 use super::window::{host_for_later, on_next_turn, Host, MacEmbedder};
 use crate::assembly::{assemble, Assembly};
 use crate::editor::{AttachStep, AttachWait, Editor};
@@ -320,8 +321,7 @@ impl Host {
                     crate::log_line!("[mac] nvim listens after {after} ms; attaching");
                     *host.life.attach.borrow_mut() = format!("attach requested after {after} ms");
                     assembly.editor.attach();
-                    let tick = start_editor_tick(mtm, assembly.clone());
-                    host.timers.borrow_mut().push(tick);
+                    *host.editor_tick.borrow_mut() = Some(EditorTicker::start(mtm, assembly.clone()));
                     false
                 }
                 AttachStep::GiveUp => {

@@ -3,12 +3,18 @@
 //! small state the two share. It is the companion window's editor half without the control socket, the
 //! window-manager runner or a second attach source: Neovide's nvim is the only editor.
 //!
-//! Nothing here blocks or owns a timer. The host calls [`Editor::poll`] every [`TICK`] and acts on the events
-//! it returns, so a test drives it with the times it makes up.
+//! Nothing here blocks or owns a timer. The host calls [`Editor::poll`] every [`TICK`] while [`Editor::wait`]
+//! says [`EditorWait::Tick`], and acts on the events it returns, so a test drives it with the times it makes up.
+//! Once nothing is left to read and the link has settled, the host instead waits for one of
+//! [`Editor::wake_fds`] to become readable: an idle window is not woken by the editor's half at all.
 
 use std::cell::{Cell, RefCell};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eitri_core::companion::attach::{BandLink, LinkState};
@@ -84,6 +90,18 @@ impl AttachWait {
     }
 }
 
+/// How the host waits for the next [`Editor::poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorWait {
+    /// Poll again in [`TICK`]: a feed has a connection it is reading, or the link is on its way somewhere (a
+    /// connect, an install, a retry).
+    Tick,
+    /// Poll when one of [`Editor::wake_fds`] is readable, and not before.
+    Sockets,
+    /// Shut down: nothing to poll any more.
+    Stop,
+}
+
 /// What one [`Editor::poll`] found, for the host to act on once the poll has returned.
 pub enum EditorEvent {
     /// nvim's own navigator ran out of windows toward `Direction`: the keys continue beyond the editor.
@@ -120,6 +138,18 @@ pub struct Editor {
     shut: Cell<bool>,
     /// While set and in the future, a failed attach is tried again instead of reported.
     retry_until: Cell<Option<Instant>>,
+    /// Read end of the link's wake: a byte arrives each time a link thread has news for `poll`. `None` when the
+    /// pair could not be made; then the host keeps ticking.
+    link_wake: Option<UnixStream>,
+    polls: Cell<u64>,
+}
+
+/// The pair the link's threads wake the host through. Both ends never block: a full buffer already says "poll".
+fn link_wake_pair() -> Option<(UnixStream, UnixStream)> {
+    let (read, write) = UnixStream::pair().ok()?;
+    read.set_nonblocking(true).ok()?;
+    write.set_nonblocking(true).ok()?;
+    Some((read, write))
 }
 
 impl Editor {
@@ -175,10 +205,23 @@ impl Editor {
         if let Some(listener) = pane_switch.as_mut().and_then(PaneSwitchChannel::take_listener) {
             feeds.add_pane_switch(PaneSwitchReader::new(listener), now);
         }
+        let link = Rc::new(CompanionLink::new(None, sockets));
+        let link_wake = match link_wake_pair() {
+            Some((read, write)) => {
+                link.set_wake(Arc::new(move || {
+                    let _ = (&write).write(&[1]);
+                }));
+                Some(read)
+            }
+            None => {
+                crate::log_error!("[editor] the link's wake could not be made; the editor is polled on its tick");
+                None
+            }
+        };
         Ok(Editor {
             nvim_listen,
             feeds: RefCell::new(feeds),
-            link: Rc::new(CompanionLink::new(None, sockets)),
+            link,
             theme_feed,
             keys_feed,
             context_feed,
@@ -192,6 +235,8 @@ impl Editor {
             next_link_poll: Cell::new(None),
             shut: Cell::new(false),
             retry_until: Cell::new(None),
+            link_wake,
+            polls: Cell::new(0),
         })
     }
 
@@ -207,12 +252,15 @@ impl Editor {
         if self.shut.get() {
             return Vec::new();
         }
+        self.polls.set(self.polls.get() + 1);
         let mut events = Vec::new();
         if self.first_poll.replace(false) {
             // The state a window is born in is told at once, so the band says what is true from the start.
             events.push(EditorEvent::LinkChanged(self.link.snapshot().1));
         }
-        if self.next_link_poll.get().is_none_or(|due| now >= due) {
+        // A link thread's news is read now whatever the link's cadence says: the host may have been asleep.
+        let woken = self.drain_link_wake();
+        if woken || self.next_link_poll.get().is_none_or(|due| now >= due) {
             self.next_link_poll.set(Some(now + CompanionLink::POLL_INTERVAL));
             self.poll_link(now, &mut events);
         }
@@ -236,6 +284,52 @@ impl Editor {
             }
         }
         events
+    }
+
+    /// Whether a link thread said something since the last call; empties the wake.
+    fn drain_link_wake(&self) -> bool {
+        let Some(read) = &self.link_wake else { return false };
+        let mut buf = [0u8; 64];
+        let mut any = false;
+        while let Ok(n @ 1..) = (&*read).read(&mut buf) {
+            any = true;
+            if n < buf.len() {
+                break;
+            }
+        }
+        any
+    }
+
+    /// How the host waits after the poll it just made. Ticking goes on while a feed holds a connection or one is
+    /// waiting, while the link is connecting or installing, and while a failed attach may still be retried; else
+    /// nothing is due until a socket says so (nvim connects to a feed, or a link thread has news).
+    pub fn wait(&self, now: Instant) -> EditorWait {
+        if self.shut.get() {
+            return EditorWait::Stop;
+        }
+        let settled = match self.link.snapshot().0 {
+            LinkState::NoEditor | LinkState::Attached { .. } | LinkState::Detached { .. } => true,
+            LinkState::Failed { .. } => self.retry_until.get().is_none_or(|until| now >= until),
+            LinkState::Connecting { .. } | LinkState::Attaching { .. } => false,
+        };
+        if self.first_poll.get() || self.link_wake.is_none() || !settled || !self.feeds.borrow().is_quiet() {
+            EditorWait::Tick
+        } else {
+            EditorWait::Sockets
+        }
+    }
+
+    /// What to watch for reading while [`Editor::wait`] says [`EditorWait::Sockets`]: the feeds' listening
+    /// sockets and the link's wake.
+    pub fn wake_fds(&self) -> Vec<RawFd> {
+        let mut fds = self.feeds.borrow().listener_fds();
+        fds.extend(self.link_wake.as_ref().map(AsRawFd::as_raw_fd));
+        fds
+    }
+
+    /// How many polls have run: what a test reads to see an idle editor left alone.
+    pub fn polls_run(&self) -> u64 {
+        self.polls.get()
     }
 
     fn poll_link(&self, now: Instant, events: &mut Vec<EditorEvent>) {
@@ -447,6 +541,41 @@ mod tests {
             assert!(!dir.exists(), "{} is still there", dir.display());
         }
         assert!(editor.poll(Instant::now()).is_empty(), "a shut editor polls nothing");
+    }
+
+    #[test]
+    fn the_host_ticks_only_while_something_is_left_to_read() {
+        let editor = editor();
+        let start = Instant::now();
+        assert_eq!(editor.wait(start), EditorWait::Tick, "the first poll says the band");
+        editor.poll(start);
+        assert_eq!(editor.wait(start), EditorWait::Sockets, "no editor, nothing to read");
+        assert_eq!(editor.wake_fds().len(), 5, "four feeds and the link's wake");
+
+        // nvim connects to a feed: ticking until it is read and closed.
+        let path = editor.context_socket().expect("the context feed").to_path_buf();
+        let stream = UnixStream::connect(&path).expect("connect");
+        assert_eq!(editor.wait(start), EditorWait::Tick, "a connection is waiting");
+        drop(stream);
+        let mut now = start;
+        for _ in 0..40 {
+            now += TICK;
+            editor.poll(now);
+            if editor.wait(now) == EditorWait::Sockets {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(editor.wait(now), EditorWait::Sockets, "read, and quiet again");
+
+        // An attach: the link is on its way, and its thread's news is read at once when it comes.
+        editor.attach();
+        let polls = editor.polls_run();
+        editor.poll(now);
+        assert_eq!(editor.wait(now), EditorWait::Tick, "connecting");
+        assert_eq!(editor.polls_run(), polls + 1);
+        editor.shutdown();
+        assert_eq!(editor.wait(now), EditorWait::Stop);
     }
 
     #[test]

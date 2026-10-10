@@ -70,6 +70,8 @@ struct Loop<'a> {
     pump: &'a PanelPump,
     armed: Option<Instant>,
     stopped: bool,
+    /// How many ticks [`run_on_the_timer_alone`](Self::run_on_the_timer_alone) ran for a due timer.
+    timer_ticks: u64,
 }
 
 impl Loop<'_> {
@@ -130,6 +132,7 @@ impl Loop<'_> {
             };
             std::thread::sleep(at.saturating_duration_since(now));
             self.armed = None;
+            self.timer_ticks += 1;
             let timer = self.pump.on_timer(Instant::now());
             self.act(timer);
         }
@@ -178,6 +181,7 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
         pump: &pump,
         armed: None,
         stopped: false,
+        timer_ticks: 0,
     };
     // The first tick runs at once: what the window set up before its loop (the hello the ready asked for) is sent.
     let first = pump.start(Instant::now());
@@ -271,16 +275,21 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
     assert!(surface.any_since(sent, "\"typing\":true"), "the typing window was told");
     assert!(looped.armed.is_some(), "and its end is armed");
     // From here the wake is not listened to: only the armed timer can tick the panel, so the end can be told only
-    // if its deadline was armed, and nothing may have raised the wake meanwhile.
+    // if its deadline was armed. A background thread may raise the wake meanwhile, which is not read here, so
+    // what is checked is that the end came on at least one timer tick and that no tick ran that the loop did not
+    // count as the timer's (a tick the panel ran on its own, or one this loop ran for another reason).
+    let ticks = panel.ticks_run();
+    let timer_ticks = looped.timer_ticks;
     looped.run_on_the_timer_alone(Duration::from_secs(2));
     assert!(
         surface.any_since(sent, "\"typing\":false"),
         "its end was told on the timer"
     );
+    assert!(looped.timer_ticks > timer_ticks, "the end was reached by a timer tick");
     assert_eq!(
-        panel.take_wake(Instant::now()),
-        None,
-        "nothing raised the wake for the typing window's end"
+        panel.ticks_run() - ticks,
+        looped.timer_ticks - timer_ticks,
+        "a tick in the interval was not the timer's"
     );
 
     // The close stops the pump for good.

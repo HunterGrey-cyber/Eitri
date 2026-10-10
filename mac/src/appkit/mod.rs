@@ -1,8 +1,8 @@
 //! The AppKit half of the Mac host: what only macOS can do, built on the host-neutral modules beside it.
 //!
 //! - [`app`]: `main`'s order, waiting for the editor, the question before a quit, and the shutdown.
-//! - [`page`]: the agent panel's page in a WKWebView, the `PageSurface` and `PanelHost` the panel drives,
-//!   and the run-loop timer that polls the editor.
+//! - [`page`]: the agent panel's page in a WKWebView, and the `PageSurface` and `PanelHost` the panel drives.
+//! - [`editor_tick`]: the editor's poll, on a timer while it has something to read, on its sockets otherwise.
 //! - [`tick`]: the panel's tick, run when its wake is raised or its next deadline comes.
 //! - [`window`]: the window's host state, pane focus, and the embedder Neovide calls.
 //! - [`keys`]: the key monitor.
@@ -12,6 +12,7 @@
 #[cfg(feature = "acceptance")]
 pub mod acceptance;
 pub mod app;
+pub mod editor_tick;
 pub mod keys;
 pub mod menu;
 pub mod page;

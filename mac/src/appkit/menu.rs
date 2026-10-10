@@ -4,9 +4,11 @@
 //! Neovide's own main menu has no Edit menu, and without one Cmd+A/C/V/Z do nothing in the composer: the page
 //! leaves those chords to AppKit, and AppKit runs them only through a menu item. Neovide builds its main menu
 //! itself, after the window exists (on the window's first focus), by replacing the whole menu, so an item
-//! inserted once would be dropped. [`keep_main_menu`] is therefore called repeatedly (every host tick and every
-//! frame) and inserts the menu whenever the current main menu lacks it; it costs a lookup by tag and a walk of
-//! the top-level items when nothing is to do.
+//! inserted once would be dropped. [`keep_main_menu`] is therefore called repeatedly (every frame, and on the
+//! host's tick until [`menu_settled`] says Neovide's own menu has been seen and kept) and inserts the menu
+//! whenever the current main menu lacks it; it costs a lookup by tag and a walk of the top-level items when
+//! nothing is to do. Neovide builds its menu once per process, so once its Quit item has been retargeted and the
+//! Edit menu is in place the tick has nothing left to wait for; a frame still runs a pass.
 //!
 //! **The Edit items act only while the panel has the keys.** Their target is an [`EditTarget`], which enables
 //! an item only then (and only when the responder that would act enables it too), and then sends the action
@@ -253,6 +255,14 @@ pub struct MenuPass {
     pub other_edit_menu: bool,
     /// Quit items pointed at the window's question.
     pub retargeted_quit: usize,
+    /// After the pass an Edit menu is in the main menu: ours, found or inserted, or another one.
+    pub edit_menu_present: bool,
+}
+
+/// Whether the host's tick may stop running passes: Neovide's menu has been seen (some pass retargeted its Quit
+/// item; `retargeted_so_far` counts them over the process) and this pass left an Edit menu in it.
+pub fn menu_settled(retargeted_so_far: usize, pass: &MenuPass) -> bool {
+    retargeted_so_far > 0 && pass.edit_menu_present
 }
 
 /// One pass over the app's current main menu: Neovide's New Window items go, its Quit item asks first, and the
@@ -298,6 +308,7 @@ pub fn keep_main_menu(mtm: MainThreadMarker, target: &EditTarget, quit: &QuitTar
         main.insertItem_atIndex(&edit_menu_item(mtm, target), edit_menu_index(main.numberOfItems()));
         pass.inserted_edit_menu = true;
     }
+    pass.edit_menu_present = true;
     pass
 }
 

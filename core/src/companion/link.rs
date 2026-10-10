@@ -43,6 +43,12 @@ impl CompanionLink {
         }
     }
 
+    /// What to call when the link has news for [`CompanionLink::poll`] from another thread: a host that
+    /// stops polling while the link is settled polls again when it is called. Set before the first poll.
+    pub fn set_wake(&self, wake: super::driver::Wake) {
+        self.driver.borrow_mut().set_wake(wake);
+    }
+
     /// The state, the band's view of it and the pid of the process holding the editor's socket.
     pub fn snapshot(&self) -> (LinkState, BandLink, Option<u32>) {
         let driver = self.driver.borrow();

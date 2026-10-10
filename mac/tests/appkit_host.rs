@@ -15,8 +15,10 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::os::unix::net::UnixListener;
+    use std::io::Write;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::rc::Rc;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use eitri_mac::appkit::page::PANEL_DOCUMENT;
@@ -58,6 +60,53 @@ mod macos {
             NSRunLoop::currentRunLoop().runMode_beforeDate(mode, &until);
         }
         done()
+    }
+
+    /// Stands in for Neovide's nvim on `listener`: answers the handshake, the install (with a report of no parts),
+    /// and every other request with nil, until `go` says the editor goes; then it closes the connection.
+    fn fake_nvim(listener: UnixListener, go: mpsc::Receiver<()>) -> std::thread::JoinHandle<()> {
+        use rmpv::Value;
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let report = Value::Map(vec![
+                (Value::from("version"), Value::from(1)),
+                (Value::from("installed"), Value::Array(vec![])),
+                (Value::from("failed"), Value::Array(vec![])),
+                (Value::from("pid"), Value::from(std::process::id())),
+                (Value::from("tmux"), Value::from(false)),
+            ]);
+            loop {
+                if go.try_recv().is_ok() {
+                    return;
+                }
+                let value = match rmpv::decode::read_value(&mut reader) {
+                    Ok(value) => value,
+                    Err(rmpv::decode::Error::InvalidMarkerRead(e)) | Err(rmpv::decode::Error::InvalidDataRead(e))
+                        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                    {
+                        continue
+                    }
+                    Err(_) => return,
+                };
+                let items = value.as_array().cloned().unwrap_or_default();
+                if items.first().and_then(Value::as_u64) != Some(0) {
+                    continue;
+                }
+                let answer = match items.get(2).and_then(Value::as_str) {
+                    Some("nvim_get_api_info") => Value::Array(vec![Value::from(7), Value::Map(vec![])]),
+                    Some("nvim_exec_lua") => report.clone(),
+                    _ => Value::Nil,
+                };
+                let mut bytes = Vec::new();
+                let response = Value::Array(vec![Value::from(1), items[1].clone(), Value::Nil, answer]);
+                rmpv::encode::write_value(&mut bytes, &response).unwrap();
+                if stream.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        })
     }
 
     pub fn run() {
@@ -159,7 +208,9 @@ mod macos {
         );
 
         // nvim starts listening.
-        let _listener = UnixListener::bind(&nvim_listen).expect("a socket where nvim would listen");
+        let listener = UnixListener::bind(&nvim_listen).expect("a socket where nvim would listen");
+        let (go, gone) = mpsc::channel();
+        let nvim = fake_nvim(listener, gone);
         let attached = spin_until(Duration::from_secs(2), || {
             host.life.attach_phase().starts_with("attach requested")
         });
@@ -167,6 +218,65 @@ mod macos {
             "the link is aimed at nvim within a poll of its socket appearing",
             attached,
             host.life.attach_phase(),
+        );
+
+        // The editor's poll: on its timer while the link attaches, then on its sockets alone.
+        let editor = assembly.editor.clone();
+        let band = || assembly.editor_link().map(|(state, _)| state).unwrap_or_default();
+        let linked = spin_until(Duration::from_secs(3), || band() == "attached");
+        check(
+            "the link attaches to an nvim that answers",
+            linked,
+            format!("{:?}", assembly.editor_link()),
+        );
+        let settled = spin_until(Duration::from_secs(1), || host.editor_ticking() == Some(false));
+        let before = editor.polls_run();
+        spin_until(Duration::from_secs(1), || false);
+        let idle = editor.polls_run() - before;
+        check(
+            "an attached, idle editor is not polled",
+            settled && idle == 0 && host.editor_ticking() == Some(false),
+            format!("{idle} polls in a second, ticking {:?}", host.editor_ticking()),
+        );
+        let before = editor.polls_run();
+        let mut feed = UnixStream::connect(editor.context_socket().expect("the context feed")).expect("connect");
+        feed.write_all(b"{\"v\":1,\"file\":\"/p/a.rs\",\"selection\":null}\n")
+            .expect("write");
+        drop(feed);
+        let read = spin_until(Duration::from_millis(500), || {
+            (assembly.editor.context())().is_some_and(|context| context.file == "/p/a.rs")
+        });
+        check(
+            "a feed's connection wakes it, and what it carried is read",
+            read && editor.polls_run() > before,
+            format!("{} polls", editor.polls_run() - before),
+        );
+        let back = spin_until(Duration::from_secs(1), || host.editor_ticking() == Some(false));
+        check(
+            "then it waits on its sockets again",
+            back,
+            format!("ticking {:?}", host.editor_ticking()),
+        );
+        go.send(()).unwrap();
+        nvim.join().unwrap();
+        let detached = spin_until(Duration::from_millis(500), || band() == "detached");
+        check(
+            "the link's own news wakes it: the editor going is told",
+            detached,
+            format!("{:?}", assembly.editor_link()),
+        );
+
+        // A ticker let go of without `stop` cancels what it armed: libdispatch keeps an uncancelled source alive
+        // after its last owner, with a handler that reaches nothing.
+        spin_until(Duration::from_secs(1), || host.editor_ticking() == Some(false));
+        let sources = host.editor_watch_sources();
+        let armed = !sources.is_empty() && sources.iter().all(|s| s.testcancel() == 0);
+        host.drop_editor_tick_without_stopping();
+        let cancelled = sources.iter().all(|s| s.testcancel() != 0);
+        check(
+            "a poll dropped without stop cancels its sources",
+            armed && cancelled,
+            format!("{} sources, armed {armed}, cancelled {cancelled}", sources.len()),
         );
 
         check(
@@ -190,6 +300,11 @@ mod macos {
         );
         let after = panel.ticks_run();
         spin_until(Duration::from_millis(300), || false);
+        check(
+            "the shutdown stops the editor's poll",
+            host.editor_ticking().is_none(),
+            format!("{:?}", host.editor_ticking()),
+        );
         check(
             "the shutdown stops the panel's tick",
             !host.panel_ticking() && panel.ticks_run() == after,
