@@ -317,12 +317,17 @@ fn run_window(
         backend_kind,
         panel_notice,
     };
+    // Before GTK and the panel's `WebView`, as in the editor window's `main`.
+    if !crate::process_memory::ui_process_jsc_without_jit() {
+        eprintln!("[memory] JavaScriptCore refused useJIT=false; the UI process keeps its JIT");
+    }
     let app = Application::builder()
         .application_id(PANEL_APP_ID)
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_activate(move |app| {
         window::build(app, &start);
+        crate::process_memory::trim_heap_after_startup();
     });
     app.run_with_args::<&str>(&[])
 }

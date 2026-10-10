@@ -21,6 +21,7 @@ mod pane_switch;
 mod panel_super;
 mod prefix;
 mod prefix_strip;
+mod process_memory;
 mod terminal;
 mod text_size;
 mod theme;
@@ -206,6 +207,12 @@ fn main() -> glib::ExitCode {
         }
         webkit_sandbox::Decision::Available | webkit_sandbox::Decision::DisabledByUser => None,
     };
+
+    // Before GTK and before any `WebView`: JavaScriptCore reads its options once, when WebKit first
+    // starts it (`process_memory`'s doc says why the UI process runs it without the JIT).
+    if !process_memory::ui_process_jsc_without_jit() {
+        eprintln!("[memory] JavaScriptCore refused useJIT=false; the UI process keeps its JIT");
+    }
 
     let app = build_application();
     app.connect_activate(move |app| build_ui(app, want_clean, &project_root, backend_kind, panel_notice.as_deref()));
@@ -2002,6 +2009,10 @@ fn build_ui(
     lua_engine.emit("shell:ready");
     apply_layout_requests();
 
+    // Startup leaves free but resident heap pages behind (the GPU driver's shader compiles, above all);
+    // one trim once it has settled gives them back.
+    process_memory::trim_heap_after_startup();
+
     // Waits for a cross-window "come to the front" request from `eitri-supervisor` -- e.g. the
     // dashboard's own UI, or another shell instance, asking this window to raise itself. Cloning
     // `agent_panel_handle` here (rather than after) is load-bearing: the `connect_close_request`
@@ -2465,6 +2476,51 @@ mod tests {
             at(concat!("build_", "application()")),
         ];
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    }
+
+    /// JavaScriptCore reads its options once, when WebKit first starts it, so the UI process's JIT
+    /// switch must come before GTK and every `WebView`: inside `main`, ahead of `build_application`
+    /// (whose `activate` builds the panel). The heap trim is scheduled from `build_ui`, once.
+    #[test]
+    fn main_turns_the_ui_jit_off_before_gtk_and_build_ui_schedules_the_trim() {
+        // Split literals, so this test's own text is not counted.
+        let src = include_str!("main.rs");
+        let start = src.find(concat!("fn main() -> glib", "::ExitCode {")).expect("main");
+        let end = start
+            + src[start..]
+                .find(concat!("fn build_", "application"))
+                .expect("build_application");
+        let body = &src[start..end];
+        let jit = concat!("process_memory::ui_process_jsc", "_without_jit()");
+        assert_eq!(body.matches(jit).count(), 1, "called exactly once in main");
+        assert!(body.find(jit) < body.find(concat!("build_", "application()")));
+        let ui = &src[src.find(concat!("fn build_", "ui(")).expect("build_ui")..];
+        let ui = &ui[..ui
+            .find(concat!("\nfn ", "flash("))
+            .expect("the function after build_ui")];
+        assert_eq!(
+            ui.matches(concat!("process_memory::trim_heap", "_after_startup()"))
+                .count(),
+            1
+        );
+        // The companion window (`eitri panel`, `eitri split`) builds the same panel in a process of its
+        // own and does both too.
+        let companion = include_str!("companion/mod.rs");
+        let jit_at = companion
+            .find(concat!("process_memory::ui_process_jsc", "_without_jit()"))
+            .expect("the companion turns its JIT off");
+        assert!(
+            jit_at
+                < companion
+                    .find(concat!("Application::", "builder()"))
+                    .expect("its application")
+        );
+        assert_eq!(
+            companion
+                .matches(concat!("process_memory::trim_heap", "_after_startup()"))
+                .count(),
+            1
+        );
     }
 
     /// The overlay's "Anywhere in the window" rows come from `eitri_core::keymap::root`, and its
