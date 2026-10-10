@@ -1,5 +1,5 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=1366aa2ce4a333fbe8676abf1c127f5805b1749a1e1c710f5ec6affd3e6b8810 -->
+<!-- translated-from: companion.md sha256=b4c669ee8c43f2e2200dab3bfef48948619c08e32023aeec72275304cd9b0dac -->
 
 # 配合你自己的 Neovim 使用
 
@@ -133,4 +133,5 @@ gnome-extensions enable eitri@huntergrey.cn
 - 所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）算作一个伙伴，所以把焦点交回编辑器时，会落到它最近使用的那个窗口；
 - 在上一次移动之后大约三分之一秒内再移回去，会按设计被拒绝；
 - 它会把你最近一次亲手把焦点放进面板（点击、Alt+Tab）的时间记住 30 分钟；用焦点键或 `:EitriPanel` 移进面板，或者面板打开时自己拿到焦点，都不算。所以在面板刚打开时、超过这 30 分钟后，以及每次锁屏之后，从编辑器移进面板的焦点键和 `:EitriPanel` 都不起作用，直到你点一下面板（如果焦点跟随鼠标，就改用 Alt+Tab 或概览切换到它：只移动指针不算）；
+- 只有当面板的焦点来自你或来自编辑器（焦点键、`:EitriPanel`）时，草稿、`gf` 或打开的审阅文件才会把编辑器带到前面；面板自己拿到焦点时（刚打开、它自己的某个窗口关闭之后、锁屏之后），这一步不起作用，直到你亲手把焦点放进面板：先点别的窗口再点面板，或者用 Alt+Tab 切走再切回来（面板已经有焦点时再点它，什么也不会改变）；
 - 被转发的 `eitri split` 会让正在运行的面板附着上，但不会把面板带到前面（它新开的 Neovide 还没收到过按键）。

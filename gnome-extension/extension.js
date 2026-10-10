@@ -10,7 +10,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {
-    TESTING_ENV, callerFocusedAt, cleanPartnerList, decide, focusGainCredited, newHeldFocus, noteHeldFocus,
+    TESTING_ENV, callerFocusedAt, cleanPartnerList, decide, focusGainOrigin, newHeldFocus, noteHeldFocus,
     testingMethodsWanted,
 } from './policy.js';
 
@@ -118,15 +118,17 @@ class EitriShell {
         // caller unique name -> {pids, watchId}
         this._partners = new Map();
         // window id -> {at, byUs, pending, from}: when the window last gained focus, or this extension last activated
-        // it (monotonicMs()); whether this extension's own activation caused that gain; whether that activation's
-        // focus notify is still to come; and, for the extension's own activation, the pid whose window had focus when
-        // it was made (0 when none, or for a gain the user made).
+        // it (monotonicMs()); whether that gain counts as this extension's own (any gain the user did not make,
+        // policy.js `focusGainOrigin`); whether that activation's focus notify is still to come; and, for the
+        // extension's own, the pid whose window had focus when its activation was made (0 when none, when the gain
+        // cannot be tied to an activation, or for a gain the user made).
         this._focusGained = new Map();
         // Which Wayland windows held a focus the user gave them, and when (policy.js, `noteHeldFocus`/
         // `callerFocusedAt`): the input to `callerHeldFocus`. Lost with the extension, as a screen lock disables it.
         this._held = newHeldFocus();
-        // When this extension last activated any window (monotonicMs()), or null: a focus gain soon after it is not
-        // credited, wherever it lands (policy.js, `focusGainCredited`).
+        // When this extension last activated any window (monotonicMs()) and the pid whose window had focus then, or
+        // null: a focus gain soon after it is not credited and counts as that activation's, wherever it lands
+        // (policy.js, `focusGainOrigin`).
         this._lastOwnActivation = null;
         this._signals = [];
         this._exported = null;
@@ -183,26 +185,32 @@ class EitriShell {
 
     // An activation by this extension fires this notify itself, during Main.activateWindow() or a little later, so
     // it must not undo what activate() recorded: a record still waiting for its notify makes this gain the
-    // extension's own. Any other gain (a click, Alt+Tab, focus falling back after a window closed) is not. A record
-    // left waiting because an activation never gave the window focus can only make a later gain count as the
-    // extension's own, which is the stricter reading.
-    // The source of focus is kept from the activation's record, so the gain stays bound to the window focus left.
+    // extension's own. So does every gain the user did not make (policy.js, `focusGainOrigin`): one within a second
+    // of any activation of the extension's, wherever it lands (the named window's modal dialog, a dialog its client
+    // opens on being activated), and one with no key, button or touch event behind it. Only a click, Alt+Tab or a
+    // shell shortcut is the user's. A record left waiting because an activation never gave the window focus names
+    // only a gain within that second; a later one is judged on its own.
+    // The source of focus is kept from the activation's record, or taken from the activation whose second this gain
+    // falls in, so the gain stays bound to the window focus left; a gain tied to no activation has none.
     _noteFocus({atEnable = false} = {}) {
         const window = global.display.focus_window;
         const at = monotonicMs();
         const previous = window ? this._focusGained.get(window.get_id()) : undefined;
-        const ours = previous?.pending === true;
-        const credited = focusGainCredited({
-            userInput: handlingUserInput(), atEnable, gainedByUs: ours, now64: at,
-            lastOwnActivation64: this._lastOwnActivation,
+        const origin = focusGainOrigin({
+            userInput: handlingUserInput(), atEnable, gainedByUs: previous?.pending === true, gainedAt64: previous?.at,
+            gainedFrom: previous?.from, now64: at,
+            // Only "never activated" is null: a record without a time must reach policy.js as one and be refused.
+            lastOwnActivation64: this._lastOwnActivation === null ? null : this._lastOwnActivation.at,
+            lastOwnActivationFrom: this._lastOwnActivation?.from,
         });
+        const credited = origin.byUs === false;
         this._noteHeldFocus(window, at, credited);
-        if (window)
-            debug(`focus to window ${window.get_id()} of pid ${pidOf(window)}: ${credited ? 'credited' : 'not credited'}`);
         if (!window)
             return;
-        const from = ours ? previous.from : 0;
-        this._recordFocusGained(window, {at, byUs: ours, pending: false, from});
+        debug(`focus to window ${window.get_id()} of pid ${pidOf(window)}: ${credited ? 'credited' : 'not credited'}`);
+        if (origin.byUs)
+            debug(`focus gain of window ${window.get_id()} counts as the extension's own, from pid ${origin.from}`);
+        this._recordFocusGained(window, {at, byUs: origin.byUs, pending: false, from: origin.from});
     }
 
     // Records the focus change for `callerHeldFocus`: kept per window id, which the shell never reuses, and not per
@@ -245,7 +253,7 @@ class EitriShell {
         const pending = focus !== window;
         const from = focus ? pidOf(focus) : 0;
         const at = monotonicMs();
-        this._lastOwnActivation = at;
+        this._lastOwnActivation = {at, from};
         this._recordFocusGained(window, {at, byUs: true, pending, from});
         Main.activateWindow(window, time);
     }

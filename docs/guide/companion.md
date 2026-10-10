@@ -207,5 +207,10 @@ Limits worth knowing:
   panel has just opened, past those 30 minutes, and after every screen lock, the focus key from the editor into
   the panel and `:EitriPanel` do nothing until you click the panel once (with focus following the mouse, switch to
   it with Alt+Tab or the overview instead: a pointer that only moves earns nothing);
+- a draft, a `gf` or an opened review file brings the editor forward only when the panel's focus came from you or
+  from the editor (the focus keys, `:EitriPanel`); when the panel took focus on its own (it has just opened, one of
+  its own windows closed, after a screen lock), it does nothing until you put focus in the panel yourself: click
+  another window and then the panel, or Alt+Tab away and back (a click on the panel while it already has focus
+  changes nothing);
 - a forwarded `eitri split` attaches the running panel but does not bring it forward (its new Neovide has had
   no key yet).

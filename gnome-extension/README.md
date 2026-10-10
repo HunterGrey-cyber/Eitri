@@ -69,12 +69,17 @@ panel process over its own gio connection, and a `gdbus`/`busctl` child it spawn
   - when the extension itself gave the window focus (its own activation for any method, or `testing.js`'s
     `Activate`), that device event must also be more than 300 ms after the activation. A key pressed in another
     window just before the extension moved focus is usually released 50-150 ms later, the release lands in the newly
-    focused window, and the idle monitor cannot tell a release from a press. A focus gain the user caused (a click,
-    Alt+Tab, focus falling back) has no such wait.
+    focused window, and the idle monitor cannot tell a release from a press. Only a focus gain the user made (a click,
+    Alt+Tab: one the shell makes while it handles a key, button or touch event) has no such wait. Every other gain
+    counts as the extension's own (`focusGainOrigin`): one within a second of any activation of the extension's,
+    wherever it lands (mutter focuses the named window's modal dialog instead, or the client opens one as it is
+    activated), and one with no input event behind it (focus falling back after a window closed, a client raising its
+    own window, the focus found at enable).
 
   The extension records the focus gain on `notify::focus-window`, and also whenever it activates a window itself (read
-  after the activation's timestamp, because an activation sets `user_time` too), with whether the gain was its own:
-  the activation's own focus notify keeps it marked as the extension's, any other notify marks it as not. It keeps
+  after the activation's timestamp, because an activation sets `user_time` too), with whether the gain counts as its
+  own: the activation's own focus notify (within a second of it) keeps it marked as the extension's, and any other
+  notify is marked by the rule above. It keeps
   focus gains on the monotonic clock at full width, of which mutter's timestamps are the low 32 bits, and places the
   press on that clock by its age; a focus held for a whole period of the 32-bit clock (about 49.7 days) counts nothing
   until the window is focused again. What remains open: any device event while the window has focus counts as
@@ -88,7 +93,13 @@ panel process over its own gio connection, and a `gdbus`/`busctl` child it spawn
   client moves its own user time to the same moment; without this, the caller could name a new partner after being
   focused and hand focus to any window. When the caller brought itself forward (`ActivateOwn`,
   `FocusSelfIfNeighbour`), that pid is exactly its partner then, so naming the same editor again after a raise (the
-  sender's chain, then nvim's own) still works. A focus gain the user made leaves the partner free.
+  sender's chain, then nvim's own) still works. A focus gain the user made leaves the partner free. A gain that counts
+  as the extension's without a pending activation of its own takes the source of the activation whose second it falls
+  in, so a modal dialog that took the focus meant for its parent is bound the same way; a gain tied to no activation
+  (no input event, more than a second after any) lets `ActivatePartner` go nowhere until the user focuses the window.
+  So the panel's way back to its editor (a draft, `gf`, an opened review file) does nothing from a panel that has just
+  opened, after one of its own windows closed, or after a screen lock, until the user focuses it: from another window
+  (a click on the panel while it already has focus changes no focus, so it frees nothing).
   `FocusDirection` is not bound this way: it only reaches a spatial neighbour, and a late release can still pass it.
 - **The partner** is per caller connection, set by `SetPartner`, and forgotten when the connection leaves the bus. The
   list is cleaned of 0, 1, the shell's pid and the caller's pid, de-duplicated and capped at 64; at check time the

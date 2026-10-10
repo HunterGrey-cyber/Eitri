@@ -47,8 +47,11 @@ export const CALLER_FOCUS_MEMORY_MS = 30 * 60 * 1000;
 
 // How long after any activation by the extension a focus gain is still taken as one it may have caused, whichever
 // window it lands on. An activation can put focus somewhere other than the window it named (mutter focuses a window's
-// modal dialog instead of the window), and that gain carries no mark of the extension; a user's click in this time
-// is lost too, which only means the user clicks again.
+// modal dialog instead of the window, or the client opens one as it is activated), and that gain carries no mark of
+// the extension: it earns no credit and counts as the extension's own (`focusGainOrigin`). A user's click in this time
+// is taken the same way. A second click in the same window changes no focus, so that window counts as the extension's
+// until focus leaves it and the user brings it back; when the activation started from that very window, its
+// ActivatePartner then goes nowhere until they do.
 export const OWN_ACTIVATION_SHADOW_MS = 1000;
 
 export const METHODS = Object.freeze(['FocusDirection', 'FocusSelfIfNeighbour', 'ActivateOwn', 'ActivatePartner']);
@@ -94,7 +97,8 @@ function isPid(n) {
 //   time, is input the user gave this window;
 // - when the extension itself gave the window focus (`focusGainedByUs`, anything but a plain false counting as yes),
 //   the device event must also be more than SETTLE_MS after that gain, so the release of the key that led to the
-//   activation does not count. A gain the user caused (a click, Alt+Tab, focus falling back) has no such wait.
+//   activation does not count. Only a gain the user made (a click, Alt+Tab: `focusGainOrigin`) has no such wait; one
+//   with no input event behind it, such as focus falling back after a window closed, waits too.
 // What remains: any real device event while the window has focus counts as activity, so pointer motion over it, or a
 // deliberate key in it after SETTLE_MS, can stand in for a press if the client moves its user time at the same moment;
 // the user is then interacting with that window. A late release after the extension's own activation can too, which
@@ -182,6 +186,41 @@ export function focusGainCredited({userInput, atEnable, gainedByUs, now64, lastO
     if (!isMonotonicMs(lastOwnActivation64) || lastOwnActivation64 > now64)
         return false;
     return now64 - lastOwnActivation64 >= OWN_ACTIVATION_SHADOW_MS;
+}
+
+// Whose a focus gain at `now64` is, for the rules that treat the extension's own gains apart (SETTLE_MS in
+// `isFreshInput`, `mayLeavePulledFocusFor`): {byUs, from}. The gain is the user's ({byUs: false, from: 0}) exactly when
+// it is credited (`focusGainCredited`); every other gain is the extension's own, since its cause cannot be told apart
+// from one: an activation can put focus on a window other than the one it named (mutter focuses the named window's
+// modal dialog instead, or the client opens one as it is activated), and that gain carries no mark of the extension.
+// `from` is the pid whose window had focus when the activation was made, the only place ActivatePartner may then send
+// focus: the pending activation's own (`gainedFrom`) when one named this window, else that of the extension's last
+// activation (`lastOwnActivationFrom`) when the gain is within OWN_ACTIVATION_SHADOW_MS of it, else 0, which lets
+// ActivatePartner go nowhere until the user focuses the window. A clock reading that cannot be trusted ties the gain to
+// no activation either.
+// A pending activation (`gainedByUs`, made at `gainedAt64`) names the gain only within OWN_ACTIVATION_SHADOW_MS of it:
+// its notify comes during the activation or just after. One left waiting longer (focus went to the window's modal
+// dialog instead) says nothing about a later gain, which is then judged like any other: a click is the user's, focus
+// falling back to the window when the dialog closes is the extension's with no source. Kept for good, it would bind
+// that fallback to the old activation's source, and swallow the credit of the user's next click into the window.
+export function focusGainOrigin({
+    userInput, atEnable, gainedByUs, gainedAt64, gainedFrom, now64, lastOwnActivation64, lastOwnActivationFrom,
+}) {
+    let pending = gainedByUs;
+    if (gainedByUs === true) {
+        if (!isMonotonicMs(gainedAt64) || !isMonotonicMs(now64) || gainedAt64 > now64)
+            return {byUs: true, from: 0};
+        pending = now64 - gainedAt64 < OWN_ACTIVATION_SHADOW_MS;
+    }
+    if (focusGainCredited({userInput, atEnable, gainedByUs: pending, now64, lastOwnActivation64}))
+        return {byUs: false, from: 0};
+    let from = 0;
+    if (pending === true)
+        from = gainedFrom;
+    else if (isMonotonicMs(now64) && isMonotonicMs(lastOwnActivation64) && lastOwnActivation64 <= now64 &&
+        now64 - lastOwnActivation64 < OWN_ACTIVATION_SHADOW_MS)
+        from = lastOwnActivationFrom;
+    return {byUs: true, from: isPid(from) ? from : 0};
 }
 
 // Whether the caller held focus in a Wayland window of its own within CALLER_FOCUS_MEMORY_MS, on the extension's
@@ -337,8 +376,9 @@ const refuse = reason => ({act: false, reason});
 // Wayland windows come before any of its X11 ones (`standsFor`).
 // `partnerChain` is what the caller last set (already cleaned), `focusGained64` the time the focused window last
 // gained focus and `now64` the current time, both on the extension's monotonic millisecond clock, `focusGainedByUs`
-// whether that gain was the extension's own activation, `focusGainedFrom` the pid whose window had focus when that
-// activation was made, `idleMs` the milliseconds since the last real input device event, read together with `now64`,
+// whether that gain counts as the extension's own (any gain the user did not make, `focusGainOrigin`),
+// `focusGainedFrom` the pid whose window had focus when the activation it is tied to was made (0 when it is tied to
+// none, which lets ActivatePartner go nowhere), `idleMs` the milliseconds since the last real input device event, read together with `now64`,
 // and `modal` whether the shell holds a modal grab (the overview, a system dialog, the lock screen).
 // Returns {act: true, target: <window id>} or {act: false, reason}.
 export function decide({
