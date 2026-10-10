@@ -150,42 +150,65 @@ A project can ship its own Claude Code configuration: hooks, MCP servers, permis
 running whatever the repository says, so Eitri does not load it until you have seen it and said yes.
 
 **What is looked at.** In the project directory and in each directory above it, up to the top of its git
-repository (and never above your home directory): `.claude/`, `.mcp.json`, `CLAUDE.md` and `CLAUDE.local.md`.
-`.claude/worktrees/`, where Claude Code keeps checkouts of its own, is named but not read. Claude Code also
+repository (and never above your home directory): `.claude/` (all of it, not only the settings files),
+`.mcp.json`, `CLAUDE.md` and `CLAUDE.local.md`. `.claude/worktrees/`, where Claude Code keeps checkouts of its
+own, is named but not read. Claude Code also
 loads memory files and MCP servers from the directories above the repository, all the way up, so those are
 looked at too: `CLAUDE.md`, `CLAUDE.local.md`, `.mcp.json`, `.claude/CLAUDE.md` and `.claude/rules/` (not the
-`.claude/` in your home directory, which is your own configuration). They are listed as `../` paths. A
+`.claude/` in your home directory, which is your own configuration). They are listed as `../` paths, and a
+file there that belongs to neither you nor root cannot be checked (see below). A
 `CLAUDE.md` in a subdirectory of the project is not looked at, and the question says so: once trusted,
 Claude Code reads one when it works on a file in that subdirectory. A project with none of these starts at
 once, with no question.
 
 **The question.** Before the first session starts in such a project, the panel shows "Trust this project's
-Claude configuration?" with what it found, file by file: each hook with its event and command, each MCP server
-with its command line (environment first), the names of the environment variables a settings file sets, an
-`apiKeyHelper`, each `permissions.allow` rule, each `additionalDirectories` entry, each `CLAUDE.md`, and any other
-setting as written. A single text longer than 4,096 characters, a long hook command for instance, is shown cut
-at that length with a count of the characters left out. `y` still trusts the whole file, including the part you
-did not see, so read such a command in the file itself first. Hidden and direction-changing characters in those texts are drawn as visible escapes, so a
-command cannot read as something else than it is.
+Claude configuration?" with what it found, file by file:
+
+- each hook, with its event, matcher and command (and the handler's other fields);
+- each MCP server, with its command line (environment first) and its other fields;
+- each environment variable a settings file sets, as `NAME=value`;
+- an `apiKeyHelper`, each `permissions.allow` rule (with a note that Claude Code applies such a rule only when it
+  also trusts the folder), each `additionalDirectories` entry and each `CLAUDE.md`;
+- any other setting as written;
+- every other file under `.claude/` by name, directory and size, with a note when a Markdown file sets `hooks`,
+  `allowed-tools`, `permissionMode` or `mcpServers` in its frontmatter.
+
+**Nothing in the question is cut.** What `y` approves is what the box shows, whole, however long a hook command
+is. Hidden and direction-changing characters in those texts are drawn as visible escapes, so a command cannot
+read as something else than it is.
+
+A configuration whose question would pass 2 MiB cannot be shown whole, and Eitri trusts nothing unseen. For a
+Claude tab the panel then asks a short question that takes only `n` (start without the project's configuration)
+or `Esc`; a `y` is refused. `:trust` says the configuration is too large to show and trusts nothing. Such a
+project cannot be trusted in Eitri at all.
 
 - `y` trusts the project and loads its configuration. `n` starts the session without it. `Esc` puts the
-  question off: a first message goes back to the box, and a resume or a restore is dropped with a message.
-  `y` and `n` count only when pressed on their own and a moment after the question appears; a key typed too
-  soon flashes "wait a moment, then y or n".
+  question off: a first message goes back to the box, and a resume is dropped with the message "not started:
+  the trust question was put off". A restore put off this way keeps its sessions: the tabs come back as failed
+  tabs that still hold their conversations (`r` in a tab starts it again), and a restore you asked for from the
+  empty tab's `Restore last session` line stays on offer there as long as the tab is still empty (otherwise its
+  tabs come back as failed tabs too). `y` and `n` count only when pressed on their
+  own and a moment after the question appears; a key typed too soon flashes "wait a moment, then y or n".
 - **`y` is remembered for the project and tied to exactly what you saw.** Any change to those files asks again
   and lists what was added, removed or changed. That includes an edit the agent makes under `.claude/` and
-  Claude Code's own "don't ask again", which writes `.claude/settings.local.json`.
+  Claude Code's own "don't ask again", which writes `.claude/settings.local.json`. It is also tied to how much
+  the question showed: when a release makes the question show more than before, every project you had trusted
+  is asked once more, even if nothing in it changed.
 - **`n` is remembered only for this window**, for that same content, and only when Eitri could check everything
   (see the next point); otherwise the question comes back at the next start in the window. Another window asks
   for itself.
 - **Something Eitri cannot check makes trust last one start only.** A file over 4 MiB, an unreadable one, a pipe
-  or other special file, a symbolic link where Claude Code reads a file, or a repository with too many files
-  is named in the question as "cannot be checked", and `y` then covers that one start; nothing is saved and the
-  next start asks again.
+  or other special file, a settings file or `.mcp.json` that is not valid JSON ("could not be parsed for this
+  check"), a symbolic link in place of a configuration file or anywhere below `.claude/`, a file above the
+  repository that belongs to neither you nor root, or a project with too many files, is named in the question
+  as "cannot be checked", and `y` then covers that one start; nothing is saved and the next start asks again.
+- **A very large configuration is remembered by this window only.** If the record of an answer would pass
+  1 MiB (roughly 1,900 files with long names), the question says so and `y` holds for this window; no record is
+  written, so a new window asks again.
 - Starting a session in any other way, restoring tabs or resuming a conversation, waits for the answer too.
 
 **Commands.** `:trust` on the panel's command line (`:` in browsing; see
-[the command line](keys.md#the-command-line)) shows the same question and records nothing until you answer it, with the same display limit.
+[the command line](keys.md#the-command-line)) shows the same question and records nothing until you answer it.
 `:untrust` forgets the answer at once, in this window too. Both apply to sessions started afterwards: a running session keeps what
 it loaded.
 

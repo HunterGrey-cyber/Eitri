@@ -3851,7 +3851,8 @@ fn answer_trust(
 }
 
 /// `Escape` on a trust question: the start is put off. A first message goes back to the composer; a
-/// resume or a restore is dropped and the toast says so. Nothing was leased, so nothing is released.
+/// resume is dropped and the toast says so; a restore keeps its sessions (as failed tabs holding their
+/// resume ids, or still on offer in an otherwise empty window). Nothing was leased, so nothing is released.
 fn cancel_trust_question(state: &mut AgentPanelState, request_id: &str, tab: TabId, nonce: u64) -> TrustOut {
     use crate::trust_gate::{NOT_CURRENT, NOT_STARTED, NOT_TRUSTED, PUT_OFF};
     let mut out = TrustOut::default();

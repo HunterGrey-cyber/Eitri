@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=43d5d9812f32750fdd3502ab33c4cae71a6d0cc0ef95636c02e32ec013b4e81f -->
+<!-- translated-from: permissions.md sha256=38f14c2cc78e662286c197207039f7a1d00ac580a2f02e8522378bc30d1a59d2 -->
 
 # 权限与信任
 
@@ -85,17 +85,29 @@ Eitri 放行一次调用之后，Claude Code 仍可能自己再就它提问。�
 
 一个项目可以带着它自己的 Claude Code 配置：hook、MCP server、权限规则。加载它就意味着运行仓库里写的任何东西，所以在你看过它并说“是”之前，Eitri 不会加载它。
 
-**看哪些东西。** 在项目目录里和它之上的每个目录里，一直到它的 git 仓库顶层（而且从不高于你的主目录）：`.claude/`、`.mcp.json`、`CLAUDE.md` 和 `CLAUDE.local.md`。`.claude/worktrees/`（Claude Code 在那里保存它自己的检出）会被点名，但不读取。Claude Code 还会从仓库之上的各级目录（一直到根目录）加载记忆文件和 MCP server，所以这些也会被查看：`CLAUDE.md`、`CLAUDE.local.md`、`.mcp.json`、`.claude/CLAUDE.md` 和 `.claude/rules/`（主目录下的 `.claude/` 除外，那是你自己的配置）。它们以 `../` 开头的路径列出。项目子目录里的 `CLAUDE.md` 不会被查看，问题里也会这么说：信任之后，Claude Code 在处理那个子目录里的文件时会读取它。没有这些东西的项目立即启动，不提任何问题。
+**看哪些东西。** 在项目目录里和它之上的每个目录里，一直到它的 git 仓库顶层（而且从不高于你的主目录）：`.claude/`（整个目录，不只是设置文件）、`.mcp.json`、`CLAUDE.md` 和 `CLAUDE.local.md`。`.claude/worktrees/`（Claude Code 在那里保存它自己的检出）会被点名，但不读取。Claude Code 还会从仓库之上的各级目录（一直到根目录）加载记忆文件和 MCP server，所以这些也会被查看：`CLAUDE.md`、`CLAUDE.local.md`、`.mcp.json`、`.claude/CLAUDE.md` 和 `.claude/rules/`（主目录下的 `.claude/` 除外，那是你自己的配置）。它们以 `../` 开头的路径列出；那里属于既不是你也不是 root 的文件无法被检查（见下文）。项目子目录里的 `CLAUDE.md` 不会被查看，问题里也会这么说：信任之后，Claude Code 在处理那个子目录里的文件时会读取它。没有这些东西的项目立即启动，不提任何问题。
 
-**那个问题。** 在这样的项目里第一个会话启动之前，面板会显示 “Trust this project's Claude configuration?” 以及它找到的东西，逐个文件列出：每个 hook 和它的事件及命令，每个 MCP server 和它的命令行（环境变量在前），某个设置文件设置的环境变量的名字，一个 `apiKeyHelper`，每条 `permissions.allow` 规则，每个 `additionalDirectories` 条目，每个 `CLAUDE.md`，以及其他任何设置原样。单段文字超过 4,096 个字符（比如很长的 hook 命令）时，只显示到这个长度，并注明省略了多少个字符。`y` 仍然信任整个文件，包括你没看到的那一部分，所以遇到这种命令，请先在文件里读完它。这些文字里的隐藏字符和改变方向的字符会被画成可见的转义，所以一条命令不会看起来像是别的东西。
+**那个问题。** 在这样的项目里第一个会话启动之前，面板会显示 “Trust this project's Claude configuration?” 以及它找到的东西，逐个文件列出：
 
-- `y` 信任这个项目并加载它的配置。`n` 不带它启动会话。`Esc` 把这个问题推后：第一条消息回到输入框里，继续或恢复则被丢弃，并给出一条消息。`y` 和 `n` 只有单独按下、并且在问题出现片刻之后按才算数；太早敲的键会闪出 “wait a moment, then y or n”。
-- **`y` 按项目记住，并且和你看到的内容严格绑定。** 这些文件的任何变化都会再问一次，并列出加了什么、去掉了什么、改了什么。这包括 agent 在 `.claude/` 下做的一次编辑，以及 Claude Code 自己的 “don't ask again”（它会写 `.claude/settings.local.json`）。
+- 每个 hook，带它的事件、matcher 和命令（以及该 handler 的其他字段）；
+- 每个 MCP server，带它的命令行（环境变量在前）和其他字段；
+- 设置文件设置的每个环境变量，写成 `NAME=value`；
+- `apiKeyHelper`、每条 `permissions.allow` 规则（并注明 Claude Code 只有在它自己也信任这个文件夹时才会应用这样的规则）、每个 `additionalDirectories` 条目和每个 `CLAUDE.md`；
+- 其他任何设置，原样显示；
+- `.claude/` 下其余每个文件，按名字、所在目录和大小列出；如果某个 Markdown 文件在 frontmatter 里设置了 `hooks`、`allowed-tools`、`permissionMode` 或 `mcpServers`，会加一条注明。
+
+**问题里的任何内容都不会被截断。** `y` 批准的就是方框里完整显示的东西，不管某条 hook 命令有多长。这些文字里的隐藏字符和改变方向的字符会被画成可见的转义，所以一条命令不会看起来像是别的东西。
+
+如果一个配置的提问会超过 2 MiB，就没法完整显示，Eitri 也不会信任任何没看过的东西。对 Claude 标签页，面板这时只问一个简短的问题，只接受 `n`（不带项目配置启动）或 `Esc`，`y` 会被拒绝。`:trust` 会说明配置太大、没法显示，并且什么也不信任。这样的项目在 Eitri 里根本没法被信任。
+
+- `y` 信任这个项目并加载它的配置。`n` 不带它启动会话。`Esc` 把这个问题推后：第一条消息回到输入框里，继续一个会话则被丢弃，并给出一条 “not started: the trust question was put off” 的消息。以这种方式推后的恢复会保留它的会话：这些标签页会作为失败的标签页回来，仍然保存着各自的对话（在标签页里按 `r` 再次启动它），而你从空标签页的 `Restore last session` 那一行发起的恢复，只要那个标签页仍是空的，就仍然留在那里供你再选（否则它的标签页同样作为失败的标签页回来）。`y` 和 `n` 只有单独按下、并且在问题出现片刻之后按才算数；太早敲的键会闪出 “wait a moment, then y or n”。
+- **`y` 按项目记住，并且和你看到的内容严格绑定。** 这些文件的任何变化都会再问一次，并列出加了什么、去掉了什么、改了什么。这包括 agent 在 `.claude/` 下做的一次编辑，以及 Claude Code 自己的 “don't ask again”（它会写 `.claude/settings.local.json`）。它还和问题当时显示了多少内容绑定：某个版本让问题显示得比以前更多时，你信任过的每个项目都会再被问一次，即使项目里什么都没变。
 - **`n` 只对这个窗口记住**，只针对同样的内容，并且只在 Eitri 能检查所有东西时才记住（见下一条）；否则这个问题会在这个窗口的下一次启动时回来。另一个窗口自己再问。
-- **Eitri 检查不了的东西，会让信任只持续一次启动。** 超过 4 MiB 的文件、读不了的文件、管道或其他特殊文件、Claude Code 读取文件的地方出现了符号链接，或者文件太多的仓库，会在问题里被点名为 “cannot be checked”，这时 `y` 只覆盖这一次启动；什么都不保存，下一次启动再问。
+- **Eitri 检查不了的东西，会让信任只持续一次启动。** 超过 4 MiB 的文件、读不了的文件、管道或其他特殊文件、不是合法 JSON 的设置文件或 `.mcp.json`（“could not be parsed for this check”）、顶替了某个配置文件的符号链接或 `.claude/` 下任何位置的符号链接、仓库之上那些既不属于你也不属于 root 的文件，或者文件太多的项目，会在问题里被点名为 “cannot be checked”，这时 `y` 只覆盖这一次启动；什么都不保存，下一次启动再问。
+- **非常大的配置只对这个窗口记住。** 如果一次回答的记录会超过 1 MiB（大约 1,900 个长文件名的文件），问题里会这么说，`y` 只在这个窗口里有效；不写任何记录，所以新窗口会再问。
 - 用任何其他方式启动会话，恢复标签页或继续一个对话，也要等这个回答。
 
-**命令。** 面板命令行上的 `:trust`（在浏览模式里按 `:`；见[命令行](keys.zh-CN.md#the-command-line)）显示同样的问题（显示上限相同），在你回答之前不记录任何东西。`:untrust` 立即忘掉这个回答，当前窗口里的也一样。两者都对之后启动的会话生效：正在运行的会话保留它已经加载的东西。
+**命令。** 面板命令行上的 `:trust`（在浏览模式里按 `:`；见[命令行](keys.zh-CN.md#the-command-line)）显示同样的问题，在你回答之前不记录任何东西。`:untrust` 立即忘掉这个回答，当前窗口里的也一样。两者都对之后启动的会话生效：正在运行的会话保留它已经加载的东西。
 
 **它存在哪里。** 每个项目一个小记录，位于 `~/.local/state/eitri/trust/` 下（`$XDG_STATE_HOME` 设为绝对路径时用 `$XDG_STATE_HOME/eitri/trust/`）。删掉这个目录，之后启动的窗口就忘掉每一个回答。已经拿到你回答的窗口会继续用它，直到你运行 `:untrust` 或重启它。Eitri 不读终端里 `claude` 的信任回答，终端里的 `claude` 也看不到 Eitri 的，所以你在终端里信任过的项目，在这里还要再问一次。
 

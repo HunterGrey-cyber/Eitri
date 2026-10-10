@@ -99,8 +99,12 @@ one-window mode.
   exact commands. Trust is remembered per project and is tied to what you saw: Eitri asks again after any change to
   `.claude/`, `.mcp.json` or `CLAUDE.md`, including one that terminal `claude` makes (its "don't ask again" rewrites
   `settings.local.json`). It never imports terminal `claude`'s own trust answer, so a project you already trusted in
-  the terminal asks once more here. A file Eitri cannot check (larger than 4 MiB, unreadable, a pipe, or a symlink)
-  is named in the question, and your answer then covers that one start only. A script a hook calls from outside
+  the terminal asks once more here. A file Eitri cannot check (larger than 4 MiB, unreadable, a pipe, a symlink in
+  place of a configuration file or anywhere below `.claude/`, or a settings file that is not valid JSON) is named
+  in the question, and your answer then covers that one start only. Nothing in the question is cut, so a
+  configuration whose question would pass 2 MiB cannot be shown and cannot be trusted at all: the project starts
+  only without its configuration. A `CLAUDE.md` in a subdirectory of the project is not read by the check; Claude
+  Code loads it once the agent reads a file there, and the question says so. A script a hook calls from outside
   `.claude/` is trusted only through the hook's command text, so trusting a project means trusting its code to run, as
   building it does. Continuing a conversation in a real terminal runs plain `claude`, whose own trust question applies.
   To forget every answer, delete `~/.local/state/eitri/trust/`.

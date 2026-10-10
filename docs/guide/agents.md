@@ -69,7 +69,8 @@ A linked git worktree also shows the main checkout's `.codex/`. Your own Codex d
 
 The answer works as it does for Claude (see [Trusting a project](permissions.md#trusting-a-project)): `y` is
 remembered for the project and tied to what you saw, so a change asks again; a file Eitri cannot check makes
-the answer last one start; `:trust` and `:untrust` act on the agent of the tab on screen. Each agent has its
+the answer last one start; nothing in the question is cut, so a project whose question would pass 2 MiB gets
+a short question that takes only `n` (or `Esc`) and `y` is refused; `:trust` and `:untrust` act on the agent of the tab on screen. Each agent has its
 own question, its own remembered answer and its own `:untrust`: trusting a project for Claude says nothing
 about Codex, and two waiting tabs of two agents are asked twice.
 
@@ -216,6 +217,8 @@ registered agent the question works differently:
 - **`y` starts the agent; `n` does not.** An `n` is not remembered, and the tab says that the agent would load this
   project's own configuration, which you have not trusted, and that Eitri cannot start it without loading that. The
   footer reads "y trusts and starts it · n does not start it · Esc puts this off".
+- Nothing in the question is cut. If it would pass 2 MiB, Eitri cannot show it whole and the agent's start is
+  refused with a message saying so.
 - Eitri cannot tell which of the listed files the agent actually follows, so a listed file or directory that is
   a symbolic link, or a link anywhere inside a listed directory, makes the answer last one start only.
 - The question and the remembered answer belong to that agent alone. A tab of a name that is no longer

@@ -103,7 +103,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "by
   records "no tabs" because you closed the window. With `"offer"` the empty tab's dashboard shows a
   `Restore last session` line, `s`, while nothing in the window has started; `"auto"` brings the tabs back at
   launch with no key pressed (unless the project's Claude configuration is new or changed, in which case the
-  restore waits for your answer to the [trust question](permissions.md#trusting-a-project)); `"off"` neither offers nor remembers. Each tab is resumed (nothing is sent until
+  restore waits for your answer to the [trust question](permissions.md#trusting-a-project), and `Esc` on it keeps the saved tabs: they come back as failed tabs you can start again with `r`, or, from the empty tab's `Restore last session` line while the tab is still empty, stay on offer); `"off"` neither offers nor remembers. Each tab is resumed (nothing is sent until
   you type), the one on screen last time is on screen again, and one message says how many came back. A tab
   is skipped, and named, when its saved record is gone or another window holds its session. A tab that was in
   bypass is never put back in bypass without a yes: `s` asks first, and `n` (or `"auto"`) brings it back in

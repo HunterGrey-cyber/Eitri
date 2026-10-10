@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=e0ccd7d10db64dcbb19a99448ede21abc15babef39840ad49fa82af44920a62b -->
+<!-- translated-from: agents.md sha256=0122d09873151b44ca70b184b642c5b09a37f135c4958a6512e1ba62de953abc -->
 
 # Codex 与其他 agent
 
@@ -43,7 +43,7 @@ Eitri 按这个顺序挑选程序：环境变量 `EITRI_CODEX`（一个文件的
 
 被链接的 git 工作树还会显示主检出里的 `.codex/`。你自己的 Codex 目录（`CODEX_HOME`，或 `~/.codex`）不属于项目，会被标为未读取。
 
-这个回答的运作方式和 Claude 一样（见[信任一个项目](permissions.zh-CN.md#trusting-a-project)）：`y` 会为这个项目记住，并绑定到你看到的内容，所以内容一变就再问；Eitri 检查不了的文件会让这个回答只管一次启动；`:trust` 和 `:untrust` 作用于屏幕上那个标签页的 agent。每个 agent 都有自己的问题、自己被记住的回答和自己的 `:untrust`：为 Claude 信任了一个项目，对 Codex 什么也说明不了，两个 agent 的两个等待中的标签页会被问两次。
+这个回答的运作方式和 Claude 一样（见[信任一个项目](permissions.zh-CN.md#trusting-a-project)）：`y` 会为这个项目记住，并绑定到你看到的内容，所以内容一变就再问；Eitri 检查不了的文件会让这个回答只管一次启动；问题里的任何内容都不会被截断，所以提问会超过 2 MiB 的项目只会得到一个简短的、只接受 `n`（或 `Esc`）的问题，`y` 会被拒绝；`:trust` 和 `:untrust` 作用于屏幕上那个标签页的 agent。每个 agent 都有自己的问题、自己被记住的回答和自己的 `:untrust`：为 Claude 信任了一个项目，对 Codex 什么也说明不了，两个 agent 的两个等待中的标签页会被问两次。
 
 需要知道的是 `n` 做什么。Codex 标签页可以在不加载项目配置的情况下启动，所以 `n` 就这样启动它：Eitri 告诉 Codex 不要信任项目目录（以及它之上的任何目录），并且在项目未被信任期间，技能（你自己的也包括在内）都被关掉。你自己的 Codex 配置总会加载，Eitri 没办法关掉它。如果在这样的会话里 Codex 仍然报告它加载了项目里的东西（项目里的指令文件、只有项目才提到的工具服务器，或项目那一层的钩子），Eitri 会结束这个标签页，并给出一条写着 “Codex loaded project configuration Eitri did not allow” 的消息。
 
@@ -131,6 +131,7 @@ ACP agent 会自己从项目里读它的配置，而 Eitri 没有办法让它不
 - 这个问题涵盖你在 `project_files` 里列出的文件，在项目目录以及它之上直到所在 git 仓库顶层的每一层目录里查找。列出的目录会被整个读取。
 - **即使这些文件一个也不存在，也要问**：“myagent loads whatever project files it finds; there are none now. Start it here?”（用你的 agent 的名字）。`y` 会针对这个空的状态被记住，所以之后出现一个列出的文件，就会再问。
 - **`y` 启动 agent；`n` 不启动。** `n` 不会被记住，标签页会说这个 agent 会加载这个项目自己的配置、而你没有信任它，所以 Eitri 没法在不加载它的情况下启动。页脚写的是 “y trusts and starts it · n does not start it · Esc puts this off”。
+- 问题里的任何内容都不会被截断。如果它会超过 2 MiB，Eitri 没法完整显示它，这个 agent 的启动就会被拒绝，并给出一条说明这一点的消息。
 - Eitri 分辨不出 agent 实际会跟随列出的哪些文件，所以列出的文件或目录如果是符号链接，或者列出的目录里任何地方有链接，这个回答就只管一次启动。
 - 这个问题和被记住的回答只属于那个 agent。一个名字已经不再注册的标签页，会在没有任何文件的情况下被问一次，然后被拒绝：“was not started: no agent of that name is registered in init.lua”。
 
