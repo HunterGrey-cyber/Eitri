@@ -1351,10 +1351,15 @@ impl NeovideEditorPane {
                                 (time, clock.refresh_info(time).0)
                             })
                             .unwrap_or_else(|| (glib::monotonic_time(), 16_667));
-                        let dt =
+                        // Up to and including the first frame that shows nvim, everything is placed,
+                        // not animated: nothing was on screen to move from (`AnimationClock::place`).
+                        let dt = if session.logged_ready {
                             session
                                 .animation_clock
-                                .advance(frame_time, refresh_interval, session.last_animating.get());
+                                .advance(frame_time, refresh_interval, session.last_animating.get())
+                        } else {
+                            session.animation_clock.place(frame_time)
+                        };
                         // Sync here too for re-realized widgets or snapshots that do not emit `resize`.
                         // Together with `connect_resize`, this keeps cell size and framebuffer scale consistent.
                         // Set `wants_frame` when a scale change is applied here because this path has no resize handler

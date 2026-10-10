@@ -6,6 +6,16 @@
 //! During an animation keep elapsed display time, including missed frames, so a 60 Hz display
 //! does not run animations at half speed. This is not the native scheduler's simulation substeps:
 //! `LiveHarness` exposes only a combined animate-and-draw call; repeating it would redraw too.
+//!
+//! A session's first frames are the exception ([`AnimationClock::place`]): until one of them shows
+//! nvim there is no cursor or window on screen to move from, and an animation started there only
+//! sends the cursor in from the canvas origin. Its spring then keeps the pane drawing for about
+//! 0.4 s, the last 0.25 s of it sub-pixel steps that change nothing on screen.
+
+/// The step [`AnimationClock::place`] hands out: longer than any of Neovide's default animations
+/// (0.15 s cursor and window moves, 0.3 s scrolling), so a spring given it ends at its destination
+/// in that frame. It is also the longest gap the native scheduler simulates.
+pub(crate) const PLACE_STEP: f32 = 1.0;
 
 #[derive(Default)]
 pub(crate) struct AnimationClock {
@@ -35,6 +45,13 @@ impl AnimationClock {
         } else {
             elapsed as f32 / 1_000_000.0
         }
+    }
+
+    /// For a frame that places what it draws instead of animating to it: records the frame like
+    /// [`AnimationClock::advance`] and returns [`PLACE_STEP`].
+    pub(crate) fn place(&mut self, frame_time_us: i64) -> f32 {
+        self.last_frame_us = Some(frame_time_us);
+        PLACE_STEP
     }
 
     pub(crate) fn reset(&mut self) {
@@ -116,6 +133,16 @@ mod tests {
         let mut clock = AnimationClock::default();
         clock.advance(1_000_000, 16_667, false);
         seconds(clock.advance(9_000_000, 16_667, true), 0.016667);
+    }
+
+    #[test]
+    fn a_placed_frame_ends_every_default_animation_and_the_next_one_starts_a_period() {
+        let mut clock = AnimationClock::default();
+        let step = clock.place(1_000_000);
+        assert!(step >= 0.3, "{step}s would leave a default scroll animation running");
+        // The frame after it is timed from it, as after any frame that was not animating.
+        seconds(clock.advance(1_050_000, 6_061, false), 0.006061);
+        seconds(clock.advance(1_056_061, 6_061, true), 0.006061);
     }
 
     #[test]

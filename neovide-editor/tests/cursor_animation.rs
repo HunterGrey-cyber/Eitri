@@ -1309,8 +1309,28 @@ fn run(
         spin(Duration::from_millis(20));
     }
     spin(Duration::from_millis(500));
-    wait_cursor(socket, 10, 11);
     let mut failures = Vec::new();
+    // Startup: the first frame that shows the cursor draws it as one cell, placed, not as the
+    // stretched quad of a cursor animated in from the canvas origin. That animation's spring kept
+    // the pane drawing for about 0.4 s, mostly sub-pixel steps that changed nothing on screen.
+    {
+        let samples = capture.samples.borrow();
+        let shown: Vec<(Point, usize)> = samples.iter().filter_map(|s| s.center.map(|c| (c, s.pixels))).collect();
+        let ((first, first_area), (settled, settled_area)) = (shown[0], shown[shown.len() - 1]);
+        println!(
+            "startup: frames showing the cursor={} first={first:?} ({first_area} px) settled={settled:?} \
+             ({settled_area} px)",
+            shown.len()
+        );
+        if first_area.abs_diff(settled_area) * 10 > settled_area {
+            failures.push(format!(
+                "startup: the first frame drew the cursor over {first_area} px at {first:?}, the settled cursor \
+                 is {settled_area} px at {settled:?}: it was animated in, not placed ({} frames)",
+                shown.len()
+            ));
+        }
+    }
+    wait_cursor(socket, 10, 11);
     println!("presentation: {}", presentation(pane));
     for (name, keys, target, delta) in [
         ("horizontal after idle", "l", (10, 12), (1, 0)),
