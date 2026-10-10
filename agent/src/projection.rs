@@ -2557,26 +2557,68 @@ mod tests {
         assert!(size <= MAX_CHANGED_FIELDS_BYTES, "{size} bytes");
     }
 
-    /// A value of hundreds of thousands of small objects is reported cut from a walk that stops at
-    /// the budget, not from a copy of the whole input.
+    /// Change detection compares whole fields, so one digest pass is unavoidable. The cut must stop
+    /// at the budget, as checked separately below. Both bounds are relative to work measured in the
+    /// same process rather than an absolute time limit.
     #[test]
     fn a_huge_nested_value_is_cut_by_a_walk_bounded_by_the_budget() {
-        let items: Vec<serde_json::Value> = (0..400_000).map(|n| serde_json::json!({ "i": n, "t": "x" })).collect();
-        // Both values are built before the clock starts: the bound is on the walk, not on building its input.
         let before = serde_json::json!({ "a": 1, "list": [] });
-        let after = serde_json::json!({ "a": 1, "list": items.clone(), "more": items });
+        let after = {
+            let items: Vec<serde_json::Value> = (0..200_000).map(|n| serde_json::json!({ "i": n, "t": "x" })).collect();
+            serde_json::json!({ "a": 1, "list": items.clone(), "more": items })
+        };
+        let pass = {
+            let input = after.clone();
+            let started = std::time::Instant::now();
+            for value in input.as_object().unwrap().values() {
+                std::hint::black_box(digest(value));
+            }
+            started.elapsed()
+        };
+        let took = (0..3)
+            .map(|_| {
+                // Cloning is outside the measurement; the moved input is dropped inside the call.
+                let gate = before.clone();
+                let cli = after.clone();
+                let started = std::time::Instant::now();
+                let change = std::hint::black_box(change_between(gate, cli)).unwrap();
+                let took = started.elapsed();
+                assert!(change.clipped);
+                assert!(!change.fields.is_empty());
+                assert!(
+                    change.fields.contains_key("list"),
+                    "the first differing field is cut short, never dropped"
+                );
+                let size = serde_json::to_string(&change.fields).unwrap().len();
+                assert!(size <= MAX_CHANGED_FIELDS_BYTES, "{size} bytes");
+                took
+            })
+            .min()
+            .unwrap();
+        assert!(took < pass * 4, "took {took:?}, digest pass {pass:?}");
+    }
+
+    /// Cutting stops at the budget and must be far cheaper than serializing the whole value,
+    /// with both times measured in the same process.
+    #[test]
+    fn the_cut_of_a_huge_value_is_far_cheaper_than_walking_it() {
+        let items: Vec<serde_json::Value> = (0..200_000).map(|n| serde_json::json!({ "i": n, "t": "x" })).collect();
+        let value = serde_json::Value::Array(items);
         let started = std::time::Instant::now();
-        let change = change_between(before, after).unwrap();
-        let took = started.elapsed();
-        assert!(change.clipped);
-        assert!(!change.fields.is_empty());
-        assert!(
-            change.fields.contains_key("list"),
-            "the first differing field is cut short, never dropped"
-        );
-        let size = serde_json::to_string(&change.fields).unwrap().len();
-        assert!(size <= MAX_CHANGED_FIELDS_BYTES, "{size} bytes");
-        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+        let text = std::hint::black_box(serde_json::to_string(&value).unwrap());
+        let full = started.elapsed();
+        drop(text);
+        let cut = (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let (_text, overflowed) = std::hint::black_box(clip_text(&value, MAX_CHANGED_FIELDS_BYTES));
+                let cut = started.elapsed();
+                assert!(overflowed);
+                cut
+            })
+            .min()
+            .unwrap();
+        assert!(cut * 20 < full, "cut {cut:?}, full serialization {full:?}");
     }
 
     /// The clipping walk stops after about a budget's worth of nodes: it visits a bounded number of

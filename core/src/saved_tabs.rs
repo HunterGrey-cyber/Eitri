@@ -715,46 +715,73 @@ mod tests {
     }
 
     /// The window's thread never waits for the disk: with the writer held inside a write, a hundred changes
-    /// are handed over at once, and when it is let go the file ends at the last of them, with the modes the
-    /// synchronous write had.
+    /// are handed over before the writer is released or its hang guard expires. When it is let go the file
+    /// ends at the last of them, with the modes the synchronous write had.
     #[test]
     fn the_writer_never_blocks_the_caller_and_the_last_set_wins() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = ScratchDir::new("nv-saved-tabs", "writer");
-        let state = dir.join("state");
-        let mut writer = TabWriter::new(Some(state.clone()), root());
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let release_rx = std::sync::Mutex::new(release_rx);
-        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        {
-            let held = held.clone();
-            writer.before_write = Some(std::sync::Arc::new(move || {
-                if held.load(std::sync::atomic::Ordering::SeqCst) {
-                    let _ = release_rx
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(std::time::Duration::from_secs(10));
+        let calibration = (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                for n in 0..100 {
+                    std::hint::black_box(numbered(n).clone() == numbered((n + 1) % 100));
                 }
-            }));
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        let mut min_took = std::time::Duration::MAX;
+        for attempt in 0..3 {
+            let dir = ScratchDir::new("nv-saved-tabs", &format!("writer{attempt}"));
+            let state = dir.join("state");
+            let mut writer = TabWriter::new(Some(state.clone()), root());
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = std::sync::Mutex::new(release_rx);
+            let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let gave_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let held = held.clone();
+                let gave_up = gave_up.clone();
+                writer.before_write = Some(std::sync::Arc::new(move || {
+                    if held.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(60))
+                        {
+                            gave_up.store(true, std::sync::atomic::Ordering::SeqCst);
+                            held.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }));
+            }
+            let started = std::time::Instant::now();
+            for n in 0..100 {
+                writer.observe(Some(numbered(n)));
+            }
+            let took = started.elapsed();
+            min_took = min_took.min(took);
+            assert!(
+                !gave_up.load(std::sync::atomic::Ordering::SeqCst),
+                "the hand-overs had to finish while the writer was still held"
+            );
+            held.store(false, std::sync::atomic::Ordering::SeqCst);
+            release_tx.send(()).unwrap();
+            let done = writer.finish().expect("a writer ran");
+            done.recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the last write and the end");
+            assert_eq!(load(&state, &root()), Loaded::Saved(numbered(99)));
+            let path = state.join(file_name(&root()));
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o700);
         }
-        let started = std::time::Instant::now();
-        for n in 0..100 {
-            writer.observe(Some(numbered(n)));
-        }
-        let took = started.elapsed();
+        // The writer is held: waiting for it or writing to disk on the caller costs milliseconds per
+        // hand-over against a calibration of microseconds; a healthy hand-over is a lock and a notify.
+        // The generous factor absorbs scheduler noise, and the minimum drops a preempted attempt.
         assert!(
-            took < std::time::Duration::from_millis(200),
-            "100 hand-overs took {took:?}"
+            min_took < calibration * 500,
+            "hand-overs took {min_took:?}, against a caller-work calibration of {calibration:?}"
         );
-        held.store(false, std::sync::atomic::Ordering::SeqCst);
-        release_tx.send(()).unwrap();
-        let done = writer.finish().expect("a writer ran");
-        done.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the last write and the end");
-        assert_eq!(load(&state, &root()), Loaded::Saved(numbered(99)));
-        let path = state.join(file_name(&root()));
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     /// Each change reaches the disk in order: waiting between hand-overs, every set is what the file holds.

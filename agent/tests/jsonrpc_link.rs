@@ -290,24 +290,59 @@ fn a_child_that_exits_closes_the_link_and_fails_pending_calls() {
 
 #[test]
 fn writer_never_blocks_the_caller() {
-    let link = link(Framing::Bare, json!([{"sleep_ms": 2000}]));
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    // The child is wedged for ten minutes, so the loops can finish only if the writer never blocks the caller.
+    // The watchdog only turns a hang into a failure.
+    let link = link(Framing::Bare, json!([{"sleep_ms": 600000}]));
+    let pid = link.pid();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let fired = Arc::new(AtomicBool::new(false));
+    let watchdog_fired = Arc::clone(&fired);
+    let watchdog = std::thread::spawn(move || {
+        if let Err(mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(Duration::from_secs(60)) {
+            watchdog_fired.store(true, Ordering::SeqCst);
+            // SAFETY: SIGKILL targets the stand-in child by its captured pid.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    });
     let filler = "y".repeat(1024);
+    let calibration = (0..3)
+        .map(|_| {
+            let started = Instant::now();
+            for _ in 0..4000 {
+                std::hint::black_box(serde_json::to_string(&json!({"filler": filler})).unwrap());
+            }
+            started.elapsed()
+        })
+        .min()
+        .expect("three calibration runs");
     let started = Instant::now();
     for _ in 0..1000 {
         link.notify("noise", json!({"filler": filler}));
     }
-    let took = started.elapsed();
-    assert!(took < Duration::from_millis(100), "1000 notifications took {took:?}");
     // The queue holds about 1000 lines and a pipe's worth: far more than that is refused, not waited on.
-    let started = Instant::now();
     let mut refused = 0;
     for _ in 0..3000 {
         if link.request("more", json!({"filler": filler})).try_take() == Some(Err(LinkError::Busy)) {
             refused += 1;
         }
     }
+    let took = started.elapsed();
+    let _ = done_tx.send(());
+    watchdog.join().expect("the watchdog joins");
+    assert!(
+        !fired.load(Ordering::SeqCst),
+        "the caller was held up by a child that never reads"
+    );
+    // The child never reads, so waiting even a few milliseconds before refusing adds seconds against
+    // a calibration of milliseconds. The factor leaves room for thread scheduling.
+    assert!(
+        took < calibration * 50,
+        "the caller took {took:?} against a serialization calibration of {calibration:?}"
+    );
     assert!(refused > 0, "a full queue should refuse");
-    assert!(started.elapsed() < Duration::from_millis(500));
     link.shutdown(Duration::from_millis(100));
 }
 

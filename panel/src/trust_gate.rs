@@ -2174,9 +2174,11 @@ mod tests {
     const CLAUDE: Profile = Profile::Claude;
     const B: TabId = TabId(2);
 
-    /// Polls every 5 ms until `done` holds for everything seen so far, for at most two seconds.
+    /// Polls every 5 ms and ends as soon as `done` holds for everything seen so far.
+    /// The 60-second limit only makes a worker that never answers fail instead of hanging the test;
+    /// it says nothing about how fast the worker is.
     fn drain(gate: &mut TrustGate, done: impl Fn(&[GateEvent]) -> bool) -> Vec<GateEvent> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut seen = Vec::new();
         loop {
             seen.extend(gate.poll());
