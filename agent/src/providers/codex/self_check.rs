@@ -832,6 +832,7 @@ impl Peer {
             .iter()
             .map(OsString::from)
             .collect(),
+            over_cap: super::approvals::over_cap_reply,
         })
         .map_err(|e| format!("codex app-server could not be started: {e}"))?;
         Ok(Peer {

@@ -1376,3 +1376,102 @@ fn a_pump_during_the_start_cannot_take_the_modes_report() {
 fn sleep_ms(ms: u64) -> Value {
     json!({ "sleep_ms": ms })
 }
+
+// ---------------------------------------------------------------- a request too large to read
+
+/// The notes Eitri put on rows for requests it answered itself, by row.
+fn answered_by_eitri(events: &[AgentDomainEvent]) -> Vec<(Option<String>, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::PermissionDenied {
+                tool_use_id,
+                reason_type: Some(kind),
+                reason,
+                ..
+            } if kind == "eitri" => Some((tool_use_id.clone(), reason.clone().unwrap_or_default())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A permission request larger than 16 MiB cannot be read or shown, so it is answered `cancelled` (ACP's
+/// own refusal, never a Codex-shaped decline or an error) and the call's row says Eitri answered it. One
+/// whose call id is past the bytes Eitri reads gets a row of its own. The turn goes on.
+#[test]
+fn an_over_cap_permission_request_is_cancelled_with_a_note_on_its_row() {
+    let big = agent::jsonrpc_link::MAX_LINE + 1;
+    let mut script = boot("agent");
+    script.extend([
+        expect_prompt(3, "touch"),
+        update("s1", tool_call("c9", "execute", "Run command")),
+        json!({"write_big": {
+            "prefix": r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"toolCallId":"c9","rawInput":{"command":""#,
+            "bytes": big,
+            "suffix": r#""}},"options":[]}}"#,
+        }}),
+        expect_answer(7, json!({"outcome": {"outcome": "cancelled"}})),
+        json!({"write_big": {
+            "prefix": r#"{"jsonrpc":"2.0","id":8,"method":"session/request_permission","params":{"sessionId":"s1","options":[{"name":""#,
+            "bytes": big,
+            "suffix": r#""}]}}"#,
+        }}),
+        expect_answer(8, json!({"outcome": {"outcome": "cancelled"}})),
+        reply(3, json!({"stopReason": "end_turn"})),
+    ]);
+    let provider = started(script, None);
+    send(&provider, "touch").expect("sends");
+    let events = until_completed(&provider);
+    assert_eq!(turn_end(&events).0, TurnOutcome::Completed);
+    let notes = answered_by_eitri(&events);
+    assert_eq!(notes.len(), 2, "{events:#?}");
+    assert_eq!(notes[0].0.as_deref(), Some("c9"));
+    let added = notes[1].0.clone().expect("a row");
+    assert_ne!(added, "c9");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::ToolCallStarted { tool_use_id, .. } if *tool_use_id == added
+        )),
+        "the note sits on no row: {events:#?}"
+    );
+    for (_, note) in &notes {
+        assert!(note.contains("larger than 16 MiB"), "{note}");
+        assert!(note.contains("cancelled"), "{note}");
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
+        "a request nobody could read became a card"
+    );
+}
+
+/// A permission request whose session id comes after the bytes Eitri reads may be another session's: its call
+/// id is not trusted to name a row of this one, and the note goes on a row Eitri adds.
+#[test]
+fn an_over_cap_permission_request_naming_no_session_does_not_mark_a_call_of_this_one() {
+    let big = agent::jsonrpc_link::MAX_LINE + 1;
+    let mut script = boot("agent");
+    script.extend([
+        expect_prompt(3, "touch"),
+        update("s1", tool_call("c9", "execute", "Run command")),
+        json!({"write_big": {
+            "prefix": r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"c9","rawInput":{"command":""#,
+            "bytes": big,
+            "suffix": r#""}},"sessionId":"s2","options":[]}}"#,
+        }}),
+        expect_answer(7, json!({"outcome": {"outcome": "cancelled"}})),
+        reply(3, json!({"stopReason": "end_turn"})),
+    ]);
+    let provider = started(script, None);
+    send(&provider, "touch").expect("sends");
+    let events = until_completed(&provider);
+    let notes = answered_by_eitri(&events);
+    assert_eq!(notes.len(), 1, "{events:#?}");
+    assert_ne!(
+        notes[0].0.as_deref(),
+        Some("c9"),
+        "another session's request marked this session's call"
+    );
+}

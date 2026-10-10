@@ -13,6 +13,10 @@ use crate::projection::AgentDomainEvent;
 use crate::provider::{AgentProvider, ProviderError, SendTurnRequest};
 use std::path::PathBuf;
 
+/// What `PermissionDenied.reason_type` says when Eitri itself answered another agent's request; the panel
+/// reads it as "answered by Eitri".
+pub const ANSWERED_BY_EITRI: &str = "eitri";
+
 /// Who reviews what the agent asks to run outside its sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reviewer {

@@ -1857,3 +1857,81 @@ mod recorder {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+// ---------------------------------------------------------------- a request too large to read
+
+/// Requests larger than 16 MiB are answered at once by what their method allows, never a grant: a command
+/// approval declined, an extra-permissions request granted nothing. The call's row says Eitri answered it,
+/// a request that names no call gets a row of its own, and one about a thread outside the tab's family is
+/// not shown.
+#[test]
+fn an_over_cap_request_is_refused_with_a_note_on_its_row() {
+    let big = agent::jsonrpc_link::MAX_LINE + 1;
+    let provider = running(
+        "th-o1",
+        "tu-o1",
+        Reviewer::User,
+        vec![
+            item_started("th-o1", "tu-o1", command_item("exec-o1", "touch /x")),
+            json!({"write_big": {
+                "prefix": r#"{"id":"r-o1","method":"item/commandExecution/requestApproval","params":{"threadId":"th-o1","turnId":"tu-o1","itemId":"exec-o1","command":""#,
+                "bytes": big,
+                "suffix": r#""}}"#,
+            }}),
+            expect_answer(json!("r-o1"), r#"{"decision":"decline"}"#),
+            json!({"write_big": {
+                "prefix": r#"{"id":"r-o2","method":"item/permissions/requestApproval","params":{"x":""#,
+                "bytes": big,
+                "suffix": r#""}}"#,
+            }}),
+            expect_answer(json!("r-o2"), r#"{"permissions":{},"scope":"turn"}"#),
+            json!({"write_big": {
+                "prefix": r#"{"id":"r-o3","method":"item/fileChange/requestApproval","params":{"threadId":"th-elsewhere","itemId":"f-1","x":""#,
+                "bytes": big,
+                "suffix": r#""}}"#,
+            }}),
+            expect_answer(json!("r-o3"), r#"{"decision":"decline"}"#),
+            json!({"sleep_ms": 200}),
+            turn_completed("th-o1", "tu-o1", "completed"),
+        ],
+    );
+    let events = until_turn_completed(&provider);
+    let notes: Vec<(Option<String>, String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::PermissionDenied {
+                tool_use_id,
+                tool_name,
+                reason_type: Some(kind),
+                reason,
+            } if kind == "eitri" => Some((
+                tool_use_id.clone(),
+                tool_name.clone(),
+                reason.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 2, "{events:#?}");
+    assert_eq!(notes[0].0.as_deref(), Some("exec-o1"));
+    assert_eq!(notes[0].1, "commandExecution");
+    assert!(
+        notes[0].2.contains("declined") && notes[0].2.contains("16 MiB"),
+        "{}",
+        notes[0].2
+    );
+    assert_eq!(notes[1].1, "permissions");
+    assert!(notes[1].2.contains("grants none"), "{}", notes[1].2);
+    let added = notes[1].0.clone().expect("a row");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::ToolCallStarted { tool_use_id, .. } if *tool_use_id == added
+        )),
+        "the note sits on no row: {events:#?}"
+    );
+    assert!(
+        !format!("{events:?}").contains("f-1"),
+        "a request from outside the family was shown"
+    );
+}

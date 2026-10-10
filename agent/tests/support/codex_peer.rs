@@ -295,6 +295,7 @@ impl Peer {
             framing: Framing::Bare,
             env,
             env_remove,
+            over_cap: agent::providers::codex::approvals::over_cap_reply,
         })
         .expect("codex app-server starts");
         Peer {

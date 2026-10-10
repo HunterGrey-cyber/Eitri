@@ -2075,3 +2075,80 @@ fn an_interrupt_with_a_command_card_waiting_does_not_stop_the_session() {
     assert!(!outside.join("escalated").exists(), "the cancelled command ran");
     let _ = provider.close_session(agent::CloseSessionRequest { session_id: thread });
 }
+
+/// Codex 0.161.0 refuses a `turn/interrupt` sent the moment `turn/start` was answered on a thread's first
+/// turn ("no active turn to interrupt", three times in three when measured) and runs the turn on. Eitri sends
+/// its interrupt then whenever the key came before that answer, so the refused interrupt is sent again: the
+/// turn ends interrupted and the session goes on.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn an_interrupt_the_moment_a_turn_starts_ends_it() {
+    use agent::{AgentDomainEvent, AgentProvider, ExternalProvider, ExternalStart, InterruptTurnRequest, Reviewer};
+    use agent::{SendTurnRequest, TurnOutcome, TurnPolicy};
+    let codex = real_codex();
+    for round in 0..4 {
+        let s = Scratch::new(&format!("int-at-start-{round}"));
+        let model = ScriptedModel::start(vec![Step::events(vec![
+            json!({"type": "response.created", "response": {"id": "{RID}"}}),
+        ])
+        .when_body_has("PROMPT-AT-START")
+        .then_hang(Duration::from_secs(60))])
+        .expect("model");
+        let home = s.dir("home");
+        write_home(&home, &model, "");
+        let project = s.dir("proj");
+        write_project(&project, "");
+        let provider = real_provider(&codex, &s, &home, &project);
+        let policy = TurnPolicy {
+            reviewer: Reviewer::User,
+        };
+        let thread = provider
+            .start(ExternalStart {
+                cwd: text_of(&project).to_string(),
+                plan: plan(&project, DirTrust::Untrusted),
+                policy,
+                resume: None,
+            })
+            .expect("the session starts");
+        provider
+            .send_turn_with(
+                SendTurnRequest {
+                    session_id: thread.clone(),
+                    text: "PROMPT-AT-START".to_string(),
+                },
+                policy,
+            )
+            .expect("the turn starts");
+        let pressed = Instant::now();
+        provider
+            .interrupt_turn(InterruptTurnRequest {
+                session_id: thread.clone(),
+            })
+            .expect("the interrupt is accepted");
+        let mut events = Vec::new();
+        while !events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+        {
+            assert!(
+                pressed.elapsed() < Duration::from_secs(20),
+                "round {round}: the turn did not end: {events:#?}"
+            );
+            events.extend(provider.pump());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!("round {round}: the turn ended {:?} after the key", pressed.elapsed());
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentDomainEvent::TurnCompleted {
+                    outcome: TurnOutcome::Interrupted,
+                    ..
+                }
+            )),
+            "round {round}: {events:#?}"
+        );
+        assert_eq!(session_lost(&events), None, "round {round}: the session was stopped");
+        let _ = provider.close_session(agent::CloseSessionRequest { session_id: thread });
+    }
+}

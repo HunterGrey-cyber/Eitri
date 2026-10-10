@@ -31,7 +31,7 @@ use super::wire::{
     ThreadStartResponse, ThreadUnsubscribeParams, TurnInterruptParams, TurnNotification, TurnStartParams,
     TurnStartResponse, TurnStatus,
 };
-use crate::external::{ExternalProvider, ExternalStart, TurnPolicy};
+use crate::external::{ExternalProvider, ExternalStart, TurnPolicy, ANSWERED_BY_EITRI};
 use crate::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, Pending, Skipped};
 use crate::projection::{ContentKind, PermissionOutcome, ResumeStatus, TurnEndDetail, TurnOutcome};
 use crate::provider::{
@@ -80,14 +80,19 @@ const NOTICE_TAIL_CHARS: usize = 400;
 /// interrupted turn at once but lets a running command go on to its own end, so a command or file change
 /// still running when this has passed is stopped with the whole session.
 pub const INTERRUPT_SETTLE: Duration = Duration::from_secs(3);
+/// How long after Codex refused a `turn/interrupt` it is sent again, while the turn still runs. Codex refuses
+/// one that comes the moment `turn/start` was answered ("no active turn to interrupt") and runs the turn on.
+const INTERRUPT_RETRY: Duration = Duration::from_millis(100);
+/// How many times one turn's refused interrupt is sent again: as many as fit in [`INTERRUPT_SETTLE`], after
+/// which a tab's turn is stopped anyway and a turn with no tab's turn around it (one Codex started after its
+/// start timed out) is not asked forever.
+const INTERRUPT_RESENDS: u32 = 30;
 /// Running calls remembered at most; past it something always counts as still running.
 const RUNNING_CALLS_KEPT: usize = 4096;
 
 /// JSON-RPC's "method not found".
 const METHOD_NOT_FOUND: i64 = -32601;
 
-/// What `PermissionDenied.reason_type` says when Eitri itself answered a request.
-const ANSWERED_BY_EITRI: &str = "eitri";
 /// The prefix of the id of a row Eitri adds for a request it answered that has no row of its own.
 const ANSWERED_ROW_PREFIX: &str = "eitri-answered-";
 /// What `PermissionDenied.reason_type` says when Codex's own reviewer refused a call, or ran out of time,
@@ -136,6 +141,9 @@ struct ActiveTurn {
     /// When the first interrupt was pressed, plus [`INTERRUPT_SETTLE`]: whatever still changes things after
     /// it stops the session.
     settle_until: Option<Instant>,
+    /// When each turn in `interrupted` was first told to stop. One still running [`INTERRUPT_SETTLE`] later
+    /// stops the session, whatever Codex answered.
+    told_to_stop: HashMap<String, Instant>,
     /// Every turn of the family has ended after an interrupt, and the tab's turn waits for the calls still
     /// running before it ends.
     settling: bool,
@@ -156,6 +164,7 @@ impl ActiveTurn {
             interrupting: false,
             own_end: None,
             settle_until: None,
+            told_to_stop: HashMap::new(),
             settling: false,
             last_message: String::new(),
             usage: None,
@@ -230,6 +239,17 @@ pub fn stopped_after_interrupt(kept_doing: &str) -> String {
 /// What the tab says when the user stopped the calls Codex left running in the background.
 pub const STOPPED_BACKGROUND: &str =
     "What Codex left running in the background was stopped with its session. The conversation can be resumed.";
+
+/// A `turn/interrupt` sent, and its answer.
+struct SentInterrupt {
+    thread_id: String,
+    turn_id: String,
+    answer: Pending,
+    /// Codex refused it: it is sent again then, should the turn still run.
+    again_at: Option<Instant>,
+    /// How many times this turn's interrupt was sent again before this one.
+    resent: u32,
+}
 
 /// The session being stopped: something kept running after an interrupt, or the user stopped what was left
 /// running in the background.
@@ -330,6 +350,9 @@ struct State {
     running_unread: bool,
     /// Something kept running after an interrupt and the child is being stopped for it.
     stopping: Option<Stopping>,
+    /// The `turn/interrupt` requests whose answers are still read: a refused one is sent again while its
+    /// turn runs.
+    interrupts: Vec<SentInterrupt>,
     /// The child was stopped by Eitri and is gone, the conversation whole: it can be continued.
     stopped_whole: bool,
     /// The calls of `running` that were still running when the tab's turn last ended: put in the background
@@ -664,6 +687,7 @@ impl CodexProvider {
             framing: Framing::Bare,
             env,
             env_remove,
+            over_cap: approvals::over_cap_reply,
         })
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => provider_error(ProviderErrorCode::ProviderUnavailable, NOT_FOUND),
@@ -784,9 +808,9 @@ impl CodexProvider {
 
     // ------------------------------------------------------------ interrupt
 
-    /// Queues the one `turn/interrupt` each running turn of the family gets. Never waits: Codex answers a
-    /// second interrupt of an interrupted turn only when the turn ends, so the answers are dropped unread.
-    /// Interrupting the parent alone does not stop a child, so every family turn is named.
+    /// Queues the one `turn/interrupt` each running turn of the family gets. Never waits: the answers are
+    /// read by `follow_interrupts`, and Codex answers a second interrupt of an interrupted turn only when the
+    /// turn ends. Interrupting the parent alone does not stop a child, so every family turn is named.
     fn send_interrupts(&self, st: &mut State) {
         let Some(family) = st.family.as_ref() else { return };
         let Some(turn) = st.turn.as_mut() else { return };
@@ -799,11 +823,9 @@ impl CodexProvider {
             if turn_id == UNREAD_TURN || !turn.interrupted.insert(turn_id.clone()) {
                 continue;
             }
-            let Ok(params) = to_json(&TurnInterruptParams { thread_id, turn_id }) else {
-                continue;
-            };
-            if let Some(link) = lock(&self.link).as_ref() {
-                drop(link.request(method::TURN_INTERRUPT, params));
+            turn.told_to_stop.entry(turn_id.clone()).or_insert_with(Instant::now);
+            if let Some(sent) = self.request_interrupt(thread_id, turn_id, 0) {
+                st.interrupts.push(sent);
             }
         }
     }
@@ -815,14 +837,101 @@ impl CodexProvider {
             if !turn.interrupted.insert(turn_id.to_string()) {
                 return;
             }
+            turn.told_to_stop
+                .entry(turn_id.to_string())
+                .or_insert_with(Instant::now);
         }
-        let params = TurnInterruptParams {
-            thread_id: thread_id.to_string(),
-            turn_id: turn_id.to_string(),
+        if let Some(sent) = self.request_interrupt(thread_id.to_string(), turn_id.to_string(), 0) {
+            st.interrupts.push(sent);
+        }
+    }
+
+    fn request_interrupt(&self, thread_id: String, turn_id: String, resent: u32) -> Option<SentInterrupt> {
+        let params = to_json(&TurnInterruptParams {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+        })
+        .ok()?;
+        let answer = lock(&self.link).as_ref()?.request(method::TURN_INTERRUPT, params);
+        Some(SentInterrupt {
+            thread_id,
+            turn_id,
+            answer,
+            again_at: None,
+            resent,
+        })
+    }
+
+    /// Reads the answers to the interrupts sent. Codex refuses one that comes the moment `turn/start` was
+    /// answered and runs the turn on, so a refused interrupt of a turn that still runs is sent again a
+    /// moment later. An interrupt of a turn that is over is forgotten, its answer unread.
+    fn follow_interrupts(&self, st: &mut State) {
+        if st.interrupts.is_empty() || st.dead || st.closed {
+            return;
+        }
+        let now = Instant::now();
+        let running = st.family.as_ref().map(Family::running_turns).unwrap_or_default();
+        let mut again = Vec::new();
+        st.interrupts.retain_mut(|sent| {
+            if !running
+                .iter()
+                .any(|(thread, turn)| *thread == sent.thread_id && *turn == sent.turn_id)
+            {
+                return false;
+            }
+            if sent.again_at.is_none() {
+                match sent.answer.try_take() {
+                    None => return true,
+                    Some(Ok(_)) => return false,
+                    Some(Err(e)) if sent.resent < INTERRUPT_RESENDS => {
+                        eprintln!("agent: Codex did not take an interrupt ({e}); it is sent again");
+                        sent.again_at = Some(now + INTERRUPT_RETRY);
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("agent: Codex did not take an interrupt ({e}); it is not sent again");
+                        return false;
+                    }
+                }
+            }
+            if sent.again_at.is_some_and(|at| now >= at) {
+                again.push((sent.thread_id.clone(), sent.turn_id.clone(), sent.resent + 1));
+                return false;
+            }
+            true
+        });
+        for (thread_id, turn_id, resent) in again {
+            if let Some(sent) = self.request_interrupt(thread_id, turn_id, resent) {
+                st.interrupts.push(sent);
+            }
+        }
+    }
+
+    /// A turn of the family still running [`INTERRUPT_SETTLE`] after it was told to stop, whatever Codex
+    /// answered, stops the session as a command left running does, so the tab is never left busy for good.
+    /// The tab's turn then ends interrupted.
+    fn stop_an_overdue_interrupt(&self, st: &mut State) {
+        if st.dead || st.closed || st.stopping.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let overdue = match (st.turn.as_ref(), st.family.as_ref()) {
+            (Some(turn), Some(family)) if turn.interrupting => family.running_turns().iter().any(|(_, id)| {
+                turn.told_to_stop
+                    .get(id)
+                    .is_some_and(|at| now >= *at + INTERRUPT_SETTLE)
+            }),
+            _ => false,
         };
-        if let (Ok(params), Some(link)) = (to_json(&params), lock(&self.link).as_ref()) {
-            drop(link.request(method::TURN_INTERRUPT, params));
+        if !overdue {
+            return;
         }
+        eprintln!("agent: Codex did not end a turn after its interrupt; its session is stopped");
+        // The key stopped what was still running, whatever the tab's own turn reported before.
+        if let Some(turn) = st.turn.as_mut() {
+            turn.own_end = Some(translate::turn_ending(&TurnStatus::Interrupted, None));
+        }
+        st.interrupts.clear();
+        self.stop_session(st, stopped_after_interrupt("did not end the turn"));
     }
 
     /// Interrupts every running turn of the family. A card that waits is answered first: a command or
@@ -857,6 +966,11 @@ impl CodexProvider {
                     .map(str::to_string);
                 if let (Some(turn), Some(ended)) = (st.turn.as_mut(), ended) {
                     if turn.interrupted.insert(ended.clone()) {
+                        // A stand-in for a turn whose start could not be read has no id of its own: a time
+                        // kept for it would stand for whichever such turn runs next.
+                        if ended != UNREAD_TURN {
+                            turn.told_to_stop.entry(ended.clone()).or_insert_with(Instant::now);
+                        }
                         turn.cancelled.insert(ended);
                     }
                 }
@@ -1287,8 +1401,21 @@ impl CodexProvider {
                     (None, _) => {}
                 }
             }
-            Skipped::RequestAnswered { method } => {
+            Skipped::RequestAnswered {
+                method,
+                thread_id,
+                item_id,
+                ..
+            } => {
                 eprintln!("agent: a {method} request from Codex was larger than 16 MiB and was answered at once");
+                let Some((tool_name, note)) = approvals::over_cap_note(&method) else {
+                    return;
+                };
+                // As with any request: one about a thread outside the tab's family is not shown.
+                if thread_id.as_deref().is_some_and(|thread| !in_family(st, thread)) {
+                    return;
+                }
+                Self::note_answered(st, thread_id.as_deref(), item_id, tool_name, note);
             }
             Skipped::ResponseFailed { id } => {
                 eprintln!("agent: Codex's answer to request {id} was larger than 16 MiB");
@@ -2283,8 +2410,11 @@ impl AgentProvider for CodexProvider {
 
     fn pump(&self) -> Vec<AgentDomainEvent> {
         let mut st = lock(&self.state);
-        if !st.closed {
-            self.drain(&mut st);
+        let caught_up = st.closed || self.drain(&mut st);
+        self.follow_interrupts(&mut st);
+        // Only once everything Codex wrote has been read: a turn end waiting behind a backlog is not overdue.
+        if caught_up {
+            self.stop_an_overdue_interrupt(&mut st);
         }
         self.settle(&mut st);
         report_background(&mut st);

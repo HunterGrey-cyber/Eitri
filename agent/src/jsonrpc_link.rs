@@ -57,6 +57,23 @@ pub enum Framing {
     Bare,
 }
 
+/// The JSON-RPC error a request too large to read is refused with, where its protocol has no refusal of
+/// its own: "invalid request".
+pub const REQUEST_TOO_LARGE: i64 = -32600;
+
+/// What the link writes back, at once, to a request from the agent larger than [`MAX_LINE`]. Nothing past
+/// the request's method could be read, so the answer must refuse whatever was asked.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OverCapReply {
+    Result(Value),
+    Error { code: i64, message: &'static str },
+}
+
+/// Picks the [`OverCapReply`] for a request by its method, in the provider's own protocol. The link
+/// answers inside its reader rather than leave it to the owner, because an unanswered request hangs the
+/// agent and an owner may not be reading.
+pub type OverCapAnswer = fn(method: &str) -> OverCapReply;
+
 #[derive(Clone, Debug)]
 pub struct LinkSpec {
     /// Absolute: a relative one would resolve against the untrusted project root the child runs in.
@@ -68,6 +85,8 @@ pub struct LinkSpec {
     pub env: Vec<(OsString, OsString)>,
     /// Variables taken away from what the child inherits.
     pub env_remove: Vec<OsString>,
+    /// How a request too large to read is answered.
+    pub over_cap: OverCapAnswer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,8 +120,17 @@ impl std::error::Error for LinkError {}
 /// What an over-long line was, as far as its prefix says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Skipped {
-    /// A server request that was answered inside the link (a decline, or an error).
-    RequestAnswered { method: String },
+    /// A server request that was answered inside the link with what [`LinkSpec::over_cap`] picked. The
+    /// ids are the ones its first bytes named, for the owner to say on the call's row what happened.
+    RequestAnswered {
+        method: String,
+        /// `params.threadId` (Codex).
+        thread_id: Option<String>,
+        /// `params.sessionId` (ACP).
+        session_id: Option<String>,
+        /// `params.itemId` (Codex) or `params.toolCall.toolCallId` (ACP).
+        item_id: Option<String>,
+    },
     /// A response; only the request with this id failed.
     ResponseFailed { id: u64 },
     /// A notification about one item that is too large to show.
@@ -185,6 +213,7 @@ struct PendingMap {
 
 struct Shared {
     framing: Framing,
+    over_cap: OverCapAnswer,
     next_id: AtomicU64,
     pending: Mutex<PendingMap>,
     /// `None` once the link is shut down; the writer thread ends and the child sees EOF.
@@ -337,6 +366,7 @@ impl JsonRpcLink {
         let (in_tx, in_rx) = sync_channel::<Incoming>(INCOMING_QUEUE);
         let shared = Arc::new(Shared {
             framing: spec.framing,
+            over_cap: spec.over_cap,
             next_id: AtomicU64::new(1),
             pending: Mutex::new(PendingMap::default()),
             writer: Mutex::new(Some(write_tx)),
@@ -702,19 +732,23 @@ fn handle_over_cap(prefix: &[u8], shared: &Shared, tx: &SyncSender<Incoming>) ->
             let (Some(id), method) = (found.id, found.method.unwrap_or_default()) else {
                 return Err("a request from the agent was too large and its id could not be read".to_string());
             };
-            // The agent treats a failed approval as a denial, and an unanswered request hangs it.
-            let answered = if method == "item/permissions/requestApproval" {
-                let grant = serde_json::json!({ "permissions": {}, "scope": "turn" });
-                shared.respond(&id, &grant)
-            } else if method.ends_with("requestApproval") {
-                shared.respond(&id, &serde_json::json!({ "decision": "decline" }))
-            } else {
-                shared.respond_error(&id, -32600, "too large")
+            // An unanswered request hangs the agent; the provider's answer refuses what it asked.
+            let answered = match (shared.over_cap)(&method) {
+                OverCapReply::Result(result) => shared.respond(&id, &result),
+                OverCapReply::Error { code, message } => shared.respond_error(&id, code, message),
             };
             if let Err(e) = answered {
                 link_log!("the answer to an over-sized request was not sent: {e}");
             }
-            push(tx, Incoming::Skipped(Skipped::RequestAnswered { method }))
+            push(
+                tx,
+                Incoming::Skipped(Skipped::RequestAnswered {
+                    method,
+                    thread_id: found.thread_id,
+                    session_id: found.session_id,
+                    item_id: found.item_id,
+                }),
+            )
         }
         (false, true) => match found.id.as_ref().and_then(Value::as_u64) {
             Some(id) => {
@@ -759,6 +793,7 @@ struct Prefix {
     has_id: bool,
     id: Option<Value>,
     thread_id: Option<String>,
+    session_id: Option<String>,
     item_id: Option<String>,
 }
 
@@ -815,25 +850,18 @@ impl Scan<'_> {
     }
 
     /// A string whose opening quote is next.
-    fn string(&mut self) -> Result<String, Cut> {
+    /// `None` when the string is not exactly what a JSON parser would read (an invalid escape, a lone
+    /// surrogate, bytes that are not UTF-8): a key or an id read approximately could name the wrong thing.
+    fn string(&mut self) -> Result<Option<String>, Cut> {
+        let start = self.i;
         self.i += 1;
-        let mut out = Vec::new();
         loop {
             match self.next()? {
-                b'"' => return Ok(String::from_utf8_lossy(&out).into_owned()),
-                b'\\' => match self.next()? {
-                    b'n' => out.push(b'\n'),
-                    b't' => out.push(b'\t'),
-                    b'r' => out.push(b'\r'),
-                    b'u' => {
-                        for _ in 0..4 {
-                            self.next()?;
-                        }
-                        out.push(b'?');
-                    }
-                    other => out.push(other),
-                },
-                c => out.push(c),
+                b'"' => return Ok(serde_json::from_slice::<String>(&self.b[start..self.i]).ok()),
+                b'\\' => {
+                    self.next()?;
+                }
+                _ => {}
             }
         }
     }
@@ -850,7 +878,8 @@ impl Scan<'_> {
                 }
                 b',' => self.i += 1,
                 b'"' => {
-                    let key = self.string()?;
+                    // A key not read exactly matches none of the paths recorded.
+                    let key = self.string()?.unwrap_or_else(|| "\u{0}unread".to_string());
                     self.ws();
                     if self.next()? != b':' {
                         return Err(Cut);
@@ -900,8 +929,9 @@ impl Scan<'_> {
             b'{' => self.object(path),
             b'[' => self.array(path),
             b'"' => {
-                let text = self.string()?;
-                self.record_string(path, text);
+                if let Some(text) = self.string()? {
+                    self.record_string(path, text);
+                }
                 Ok(())
             }
             _ => {
@@ -936,7 +966,10 @@ impl Scan<'_> {
             ["method"] => self.found.method = Some(text),
             ["id"] => self.found.id = Some(Value::String(text)),
             ["params", "threadId"] => self.found.thread_id = Some(text),
-            ["params", "itemId"] | ["params", "item", "id"] => self.found.item_id = Some(text),
+            ["params", "sessionId"] => self.found.session_id = Some(text),
+            ["params", "itemId"] | ["params", "item", "id"] | ["params", "toolCall", "toolCallId"] => {
+                self.found.item_id = Some(text)
+            }
             _ => {}
         }
     }
@@ -1023,6 +1056,20 @@ mod tests {
         assert_eq!(request.id, Some(Value::from(3)));
         assert_eq!(request.method.as_deref(), Some("x"));
 
+        let permission = scan_within(
+            br#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"toolCallId":"c9","rawInput":{"#,
+        );
+        assert_eq!(permission.session_id.as_deref(), Some("s1"));
+        // An id is recorded as a JSON parser reads it, or not at all.
+        let escaped =
+            scan_within(br#"{"id":7,"method":"m","params":{"sessionId":"s\u0031","toolCall":{"toolCallId":"c\q9"}"#);
+        assert_eq!(escaped.session_id.as_deref(), Some("s1"));
+        assert!(escaped.item_id.is_none(), "an invalid escape was read as an id");
+        let key = scan_within(br#"{"id":7,"method":"m","params":{"\u0069temId":"i1","item\d":"i2"}"#);
+        assert_eq!(key.item_id.as_deref(), Some("i1"));
+        assert_eq!(permission.item_id.as_deref(), Some("c9"));
+        assert!(permission.thread_id.is_none());
+
         let item =
             scan_within(br#"{"method":"item/completed","params":{"item":{"id":"i9","list":[1,2,3]},"threadId":"t2"#);
         assert_eq!(item.item_id.as_deref(), Some("i9"));
@@ -1053,6 +1100,10 @@ mod tests {
     fn shared_for_test() -> Arc<Shared> {
         Arc::new(Shared {
             framing: Framing::Bare,
+            over_cap: |_| OverCapReply::Error {
+                code: REQUEST_TOO_LARGE,
+                message: "too large",
+            },
             next_id: AtomicU64::new(1),
             pending: Mutex::new(PendingMap::default()),
             writer: Mutex::new(None),

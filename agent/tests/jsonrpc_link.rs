@@ -4,10 +4,24 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use agent::jsonrpc_link::{resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, Skipped, MAX_LINE};
+use agent::jsonrpc_link::{
+    resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, OverCapAnswer, OverCapReply, Skipped,
+    MAX_LINE, REQUEST_TOO_LARGE,
+};
 use serde_json::{json, Value};
 
+fn refuse_all(_: &str) -> OverCapReply {
+    OverCapReply::Error {
+        code: REQUEST_TOO_LARGE,
+        message: "too large",
+    }
+}
+
 fn link(framing: Framing, script: Value) -> JsonRpcLink {
+    link_answering(framing, script, refuse_all)
+}
+
+fn link_answering(framing: Framing, script: Value, over_cap: OverCapAnswer) -> JsonRpcLink {
     JsonRpcLink::spawn(LinkSpec {
         program: PathBuf::from(env!("CARGO_BIN_EXE_eitri-agent-standin")),
         args: vec![OsString::from(script.to_string())],
@@ -15,6 +29,7 @@ fn link(framing: Framing, script: Value) -> JsonRpcLink {
         framing,
         env: Vec::new(),
         env_remove: Vec::new(),
+        over_cap,
     })
     .expect("the stand-in starts")
 }
@@ -131,13 +146,14 @@ fn non_json_line_is_dropped_and_the_link_lives() {
     );
 }
 
+/// Codex's answers: an approval declined, extra permissions granted none, anything else refused.
 #[test]
 fn over_cap_server_request_is_answered_at_once() {
-    let link = link(
+    let link = link_answering(
         Framing::Bare,
         json!([
             {"write_big": {
-                "prefix": r#"{"id":91,"method":"item/commandExecution/requestApproval","params":{"command":""#,
+                "prefix": r#"{"id":91,"method":"item/commandExecution/requestApproval","params":{"threadId":"t1","itemId":"i1","command":""#,
                 "bytes": MAX_LINE + (1 << 20),
                 "suffix": r#""}}"#,
             }},
@@ -154,17 +170,72 @@ fn over_cap_server_request_is_answered_at_once() {
             {"expect": r#"^\{"id":"s-3","error":\{.*"code":-32600.*\}\}$"#},
             {"write": r#"{"method":"alive","params":{}}"#},
         ]),
+        agent::providers::codex::approvals::over_cap_reply,
     );
-    for method in [
-        "item/commandExecution/requestApproval",
-        "item/permissions/requestApproval",
-        "item/tool/call",
-    ] {
+    assert_eq!(
+        next(&link),
+        Incoming::Skipped(Skipped::RequestAnswered {
+            method: "item/commandExecution/requestApproval".into(),
+            thread_id: Some("t1".into()),
+            session_id: None,
+            item_id: Some("i1".into()),
+        })
+    );
+    for method in ["item/permissions/requestApproval", "item/tool/call"] {
         assert_eq!(
             next(&link),
-            Incoming::Skipped(Skipped::RequestAnswered { method: method.into() })
+            Incoming::Skipped(Skipped::RequestAnswered {
+                method: method.into(),
+                thread_id: None,
+                session_id: None,
+                item_id: None,
+            })
         );
     }
+    assert_eq!(
+        next(&link),
+        Incoming::Notification {
+            method: "alive".into(),
+            params: json!({})
+        }
+    );
+}
+
+/// An ACP agent's answers, in its framing: a permission request `cancelled`, never a Codex-shaped decline,
+/// and anything else refused, an approval-named method included.
+#[test]
+fn over_cap_acp_request_is_answered_in_acp_s_own_terms() {
+    let link = link_answering(
+        Framing::WithJsonrpcMember,
+        json!([
+            {"write_big": {
+                "prefix": r#"{"jsonrpc":"2.0","id":5,"method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"toolCallId":"c9","rawInput":""#,
+                "bytes": MAX_LINE + 1,
+                "suffix": r#""}}}"#,
+            }},
+            {"expect": r#"^\{"jsonrpc":"2\.0","id":5,"result":\{"outcome":\{"outcome":"cancelled"\}\}\}$"#},
+            {"write_big": {
+                "prefix": r#"{"jsonrpc":"2.0","id":6,"method":"item/commandExecution/requestApproval","params":{"x":""#,
+                "bytes": MAX_LINE + 1,
+            }},
+            {"expect": r#"^\{"jsonrpc":"2\.0","id":6,"error":\{.*"code":-32600.*\}\}$"#},
+            {"write": r#"{"jsonrpc":"2.0","method":"alive","params":{}}"#},
+        ]),
+        agent::providers::acp::provider::over_cap_reply,
+    );
+    assert_eq!(
+        next(&link),
+        Incoming::Skipped(Skipped::RequestAnswered {
+            method: "session/request_permission".into(),
+            thread_id: None,
+            session_id: Some("s1".into()),
+            item_id: Some("c9".into()),
+        })
+    );
+    assert!(matches!(
+        next(&link),
+        Incoming::Skipped(Skipped::RequestAnswered { method, .. }) if method == "item/commandExecution/requestApproval"
+    ));
     assert_eq!(
         next(&link),
         Incoming::Notification {
@@ -444,6 +515,7 @@ fn shutdown_kills_the_children_the_agent_started_too() {
         framing: Framing::Bare,
         env: Vec::new(),
         env_remove: Vec::new(),
+        over_cap: refuse_all,
     })
     .expect("sh starts");
     let end = soon();
@@ -509,6 +581,7 @@ fn shutdown_kills_the_children_of_an_agent_that_already_exited() {
         framing: Framing::Bare,
         env: Vec::new(),
         env_remove: Vec::new(),
+        over_cap: refuse_all,
     })
     .expect("sh starts");
     let end = soon();

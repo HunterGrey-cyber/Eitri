@@ -2035,3 +2035,103 @@ fn a_stop_for_a_count_that_moved_is_refused() {
     }
     assert!(alive(provider.pid()), "nothing was stopped");
 }
+
+// ---------------------------------------------------------------- an interrupt Codex refuses
+
+/// Codex refuses `turn/interrupt` with "no active turn to interrupt" when it comes the moment `turn/start` was
+/// answered (measured on 0.161.0: three times in seven), and the turn then runs on. A refused interrupt of a
+/// turn that still runs is sent again.
+#[test]
+fn a_refused_interrupt_of_a_turn_that_runs_is_sent_again() {
+    let (t, u) = ("th-f4a", "turn-f4a");
+    let interrupt =
+        |id: u64| format!(r#"{{"id":{id},"method":"turn/interrupt","params":{{"threadId":"{t}","turnId":"{u}"}}}}"#);
+    let (provider, thread) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            expect_exact(&interrupt(5)),
+            write(json!({"id": 5, "error": {"code": -32600, "message": "no active turn to interrupt"}})),
+            expect_exact(&interrupt(6)),
+            turn_completed(t, u, "interrupted", Value::Null),
+        ],
+    );
+    send(&provider, &thread, "go").expect("starts");
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: thread.clone(),
+        })
+        .expect("the interrupt is accepted");
+    let events = until_turn_completed(&provider);
+    assert!(matches!(
+        the_completion(&events),
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Interrupted,
+            ..
+        }
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })),
+        "a turn the second interrupt ended stopped the session"
+    );
+}
+
+/// A turn that has not ended `INTERRUPT_SETTLE` after its interrupt was sent, whatever Codex answered, stops
+/// the session the way a command left running does: the tab's turn ends interrupted and the session can be
+/// resumed, so the tab is never left busy for good.
+#[test]
+fn a_turn_that_does_not_end_after_its_interrupt_stops_the_session() {
+    let (t, u) = ("th-f4b", "turn-f4b");
+    let (provider, thread) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            expect_exact(&format!(
+                r#"{{"id":5,"method":"turn/interrupt","params":{{"threadId":"{t}","turnId":"{u}"}}}}"#
+            )),
+            write(json!({"id": 5, "error": {"code": -32600, "message": "no active turn to interrupt"}})),
+            // After its last step the stand-in reads its input to the end and answers nothing more.
+        ],
+    );
+    send(&provider, &thread, "go").expect("starts");
+    let pressed = Instant::now();
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: thread.clone(),
+        })
+        .expect("the interrupt is accepted");
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
+    });
+    assert!(
+        pressed.elapsed() >= agent::providers::codex::provider::INTERRUPT_SETTLE,
+        "the session was stopped {:?} after the interrupt",
+        pressed.elapsed()
+    );
+    let end = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentDomainEvent::TurnCompleted {
+                    outcome: TurnOutcome::Interrupted,
+                    ..
+                }
+            )
+        })
+        .expect("the turn ends interrupted");
+    let gone = events
+        .iter()
+        .position(
+            |e| matches!(e, AgentDomainEvent::SessionUnavailable { reason } if reason.contains("did not end the turn")),
+        )
+        .expect("the session says why it stopped");
+    assert!(end < gone, "{events:#?}");
+    assert!(provider.stopped_resumable(), "the conversation cannot be resumed");
+}

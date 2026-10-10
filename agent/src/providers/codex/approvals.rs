@@ -20,6 +20,7 @@ use super::wire::{
     FileChangeApprovalParams, PatchChangeKind, PermissionsApprovalParams, PermissionsGrant, ServerRequest, ThreadItem,
     UserInputParams, UserInputResponse,
 };
+use crate::jsonrpc_link::{OverCapReply, REQUEST_TOO_LARGE};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -457,6 +458,42 @@ fn named_tool<'a>(message: &'a str, server: &str) -> Option<&'a str> {
     let rest = message.strip_prefix("Allow the ")?.strip_prefix(server)?;
     let tool = rest.strip_prefix(" MCP server to run tool \"")?.strip_suffix("\"?")?;
     (!tool.is_empty() && !tool.contains('"')).then_some(tool)
+}
+
+/// How the link answers a request from Codex too large to read: the way a request of its method that
+/// could not be read is answered, and with "invalid request" where Eitri has no refusal of its own to send.
+/// Nothing of what was asked could be read, so nothing is granted.
+pub fn over_cap_reply(method: &str) -> OverCapReply {
+    use super::wire::method as m;
+    if method == m::PERMISSIONS_APPROVAL {
+        OverCapReply::Result(to_value(&PermissionsGrant::none_for_turn()))
+    } else if method.ends_with("requestApproval") {
+        OverCapReply::Result(decline())
+    } else {
+        OverCapReply::Error {
+            code: REQUEST_TOO_LARGE,
+            message: "too large",
+        }
+    }
+}
+
+/// What the row of a request answered by [`over_cap_reply`] says, with the tool name of the row Eitri adds
+/// when the call has none. `None` for a request that is about no call or question, which only the log names.
+pub fn over_cap_note(method: &str) -> Option<(&'static str, String)> {
+    use super::wire::method as m;
+    let (tool_name, note) = match method {
+        m::COMMAND_APPROVAL => ("commandExecution", "Codex asked to run a command; Eitri declined it"),
+        m::FILE_CHANGE_APPROVAL => ("fileChange", "Codex asked to change files; Eitri declined it"),
+        m::PERMISSIONS_APPROVAL => ("permissions", "Codex asked for extra permissions; Eitri grants none"),
+        m::MCP_ELICITATION => ("mcpToolCall", "Codex's tool server asked for input; Eitri refused it"),
+        m::TOOL_REQUEST_USER_INPUT => ("requestUserInput", "Codex asked a question; Eitri refused it"),
+        other if other.ends_with("requestApproval") => ("approval", "Codex asked for an approval; Eitri declined it"),
+        _ => return None,
+    };
+    Some((
+        tool_name,
+        format!("{note}, since the request was larger than 16 MiB and could not be shown"),
+    ))
 }
 
 fn decline() -> Value {

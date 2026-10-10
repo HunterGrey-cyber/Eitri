@@ -1664,3 +1664,33 @@ fn an_announcement_with_no_thread_id_ends_the_session() {
     assert!(reported.contains("no thread id"), "{reported}");
     assert!(send(&provider, &thread, "next").is_err());
 }
+
+// ---------------------------------------------------------------- a family turn that does not end after its interrupt
+
+/// The tab's own turn reports `completed` after the key while a child ignores its interrupt: once the child is
+/// overdue the session is stopped, and the tab's turn ends interrupted, since the key is what stopped the child.
+#[test]
+fn a_child_that_does_not_end_after_its_interrupt_stops_the_session_and_the_turn_ends_interrupted() {
+    let (provider, thread) = running(
+        "tab",
+        "t1",
+        vec![
+            announce("tab", "t1", "child", "/root/child"),
+            turn_started("child", "c1"),
+            expect_interrupt(5, "tab", "t1"),
+            expect_interrupt(6, "child", "c1"),
+            turn_completed("tab", "t1", "completed"),
+            // The child never ends; the stand-in reads its input to the end and answers nothing more.
+        ],
+    );
+    pump_for(&provider, Duration::from_millis(300));
+    interrupt(&provider, &thread);
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
+    });
+    let (turn, outcome, _) = ended(&events);
+    assert_eq!(turn, "t1");
+    assert_eq!(outcome, TurnOutcome::Interrupted, "{events:#?}");
+}

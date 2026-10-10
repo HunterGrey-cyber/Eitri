@@ -22,9 +22,12 @@
 
 use super::history::History;
 use super::translate::{self, Fold};
-use super::wire::{self, method, ChunkKind, InitializeResponse, OptionKind, PermissionRequest, Update};
-use crate::external::{ContextGauge, ExternalProvider, ExternalStart, TurnPolicy};
-use crate::jsonrpc_link::{resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, Pending, Skipped};
+use super::wire::{self, method, ChunkKind, InitializeResponse, OptionKind, PermissionRequest, ToolCallFields, Update};
+use crate::external::{ContextGauge, ExternalProvider, ExternalStart, TurnPolicy, ANSWERED_BY_EITRI};
+use crate::jsonrpc_link::{
+    resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, OverCapReply, Pending, Skipped,
+    REQUEST_TOO_LARGE,
+};
 use crate::projection::{AgentDomainEvent, PermissionOutcome, ResumeStatus, TurnEndDetail, TurnOutcome};
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
@@ -58,6 +61,21 @@ const NOTICE_TAIL_CHARS: usize = 400;
 
 /// JSON-RPC's "method not found".
 const METHOD_NOT_FOUND: i64 = -32601;
+/// The prefix of the id of a row Eitri adds for a request it answered whose call it could not name.
+const ANSWERED_ROW_PREFIX: &str = "eitri-answered-";
+
+/// How the link answers a request from the agent too large to read: a permission request `cancelled`, the
+/// one ACP answer that needs none of the request's options, and anything else "invalid request".
+pub fn over_cap_reply(name: &str) -> OverCapReply {
+    if name == method::REQUEST_PERMISSION {
+        OverCapReply::Result(wire::cancelled_outcome())
+    } else {
+        OverCapReply::Error {
+            code: REQUEST_TOO_LARGE,
+            message: "too large",
+        }
+    }
+}
 
 /// What an ACP agent is, as the user registered it.
 #[derive(Debug, Clone)]
@@ -121,6 +139,8 @@ struct State {
     /// Cards waiting for an answer, by permission id, in the order they were drawn.
     cards: Vec<(String, WaitingCard)>,
     next_card: u64,
+    /// Rows Eitri added for requests it answered, for their ids.
+    next_answered_row: u64,
     seen_unknown: HashSet<String>,
     context: Option<ContextGauge>,
     /// Why the session may not take turns any more: the agent reported a mode other than the one asked
@@ -211,6 +231,7 @@ impl AcpProvider {
             framing: Framing::WithJsonrpcMember,
             env: Vec::new(),
             env_remove: Vec::new(),
+            over_cap: over_cap_reply,
         })
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => provider_error(
@@ -591,7 +612,7 @@ impl AcpProvider {
                     }
                 }
             }
-            Incoming::Skipped(skipped) => on_skipped(&self.agent, skipped),
+            Incoming::Skipped(skipped) => self.on_skipped(st, skipped),
             Incoming::Closed { reason } => self.on_closed(st, &reason),
         }
     }
@@ -733,6 +754,98 @@ impl AcpProvider {
         });
     }
 
+    fn on_skipped(&self, st: &mut State, skipped: Skipped) {
+        let agent = &self.agent;
+        match skipped {
+            Skipped::TurnTooLarge { method: name, .. } | Skipped::ItemTooLarge { method: name, .. } => {
+                eprintln!("agent: a {name} message from {agent} was larger than 16 MiB; not shown");
+            }
+            Skipped::RequestAnswered {
+                method: name,
+                session_id,
+                item_id,
+                ..
+            } => {
+                eprintln!("agent: a {name} request from {agent} was larger than 16 MiB and was answered at once");
+                if name == method::REQUEST_PERMISSION {
+                    self.note_over_cap(st, session_id.as_deref(), item_id);
+                }
+            }
+            Skipped::ResponseFailed { id } => {
+                eprintln!("agent: {agent}'s answer to request {id} was larger than 16 MiB");
+            }
+        }
+    }
+
+    /// Says on the call's row that Eitri cancelled a permission request too large to read, which no card
+    /// could show. The call is the one the request's first bytes named, with this session; a request that
+    /// named no call, or no session, within them gets a row Eitri adds, since a note on no row would never be
+    /// seen. A request about another
+    /// session, or one made with no turn running, is only logged.
+    fn note_over_cap(&self, st: &mut State, session_id: Option<&str>, call_id: Option<String>) {
+        if session_id.is_some_and(|session| st.session_id.as_deref() != Some(session)) {
+            return;
+        }
+        // A call is named only for a request that named this session too: one whose session id came after
+        // the bytes read could be another session's call of the same id.
+        let call_id = call_id.filter(|_| session_id.is_some());
+        let State {
+            turn,
+            events,
+            next_answered_row,
+            ..
+        } = st;
+        let Some(turn) = turn.as_mut() else { return };
+        let turn_id = turn.id.clone();
+        let note = format!(
+            "{} asked for a decision in a request larger than 16 MiB, which Eitri cannot show; Eitri cancelled it",
+            self.agent
+        );
+        let denied = |row: String, tool_name: String| AgentDomainEvent::PermissionDenied {
+            tool_use_id: Some(row),
+            tool_name,
+            reason_type: Some(ANSWERED_BY_EITRI.to_string()),
+            reason: Some(note.clone()),
+        };
+        match call_id.filter(|id| !id.is_empty()) {
+            Some(id) => {
+                let named = ToolCallFields {
+                    id,
+                    title: None,
+                    kind: None,
+                    status: None,
+                    raw_input: None,
+                    raw_output: None,
+                    locations: None,
+                    content: Vec::new(),
+                };
+                let call = turn
+                    .fold
+                    .ensure_started(&turn_id, &named, &mut |event| events.push_back(event));
+                events.push_back(denied(call.id.clone(), translate::tool_name(call.kind.as_deref())));
+            }
+            None => {
+                *next_answered_row += 1;
+                // The turn's id keeps the row's id unique in a projection that outlives this connection.
+                let row = format!("{ANSWERED_ROW_PREFIX}{turn_id}-{next_answered_row}");
+                let tool_name = translate::tool_name(None);
+                events.push_back(AgentDomainEvent::ToolCallStarted {
+                    turn_id: turn_id.clone(),
+                    tool_use_id: row.clone(),
+                    name: tool_name.clone(),
+                    input: json!({}),
+                });
+                events.push_back(denied(row.clone(), tool_name));
+                events.push_back(AgentDomainEvent::ToolCallCompleted {
+                    turn_id,
+                    tool_use_id: row,
+                    content: Value::String(String::new()),
+                    is_error: false,
+                });
+            }
+        }
+    }
+
     /// Ends the turn with the agent's answer to its prompt.
     fn finish_turn(&self, st: &mut State) {
         let Some(turn) = st.turn.take() else { return };
@@ -793,20 +906,6 @@ fn link_error(agent: &str, link: &JsonRpcLink, what: &str, e: LinkError) -> Prov
             ProviderErrorCode::ProviderProtocolError,
             format!("{agent} refused {what}: {message}"),
         ),
-    }
-}
-
-fn on_skipped(agent: &str, skipped: Skipped) {
-    match skipped {
-        Skipped::TurnTooLarge { method, .. } | Skipped::ItemTooLarge { method, .. } => {
-            eprintln!("agent: a {method} message from {agent} was larger than 16 MiB; not shown");
-        }
-        Skipped::RequestAnswered { method } => {
-            eprintln!("agent: a {method} request from {agent} was larger than 16 MiB and was answered at once");
-        }
-        Skipped::ResponseFailed { id } => {
-            eprintln!("agent: {agent}'s answer to request {id} was larger than 16 MiB");
-        }
     }
 }
 

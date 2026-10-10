@@ -154,7 +154,8 @@ tab's mode.
   Eitri waits up to three seconds after the key. If a command, a file change or something it could not read is
   still running by then, Eitri stops the Codex session, and everything it started with it, and says so: "Codex
   kept running a command after the interrupt; its session was stopped so nothing more runs. The conversation can
-  be resumed." A command the model left running in the background past its own call is not caught by this: the
+  be resumed." The same happens if the turn itself has not ended three seconds after Eitri told Codex to stop it
+  (Codex can refuse an interrupt that comes just as the turn starts; Eitri asks again first). A command the model left running in the background past its own call is not caught by this: the
   turn ends, the band says how many are still running, the turn's review says later changes are not in it, and
   `<leader>k` stops them by stopping the session after a `y/n` (the conversation can be resumed); a later
   interrupt or closing the tab stops them too.

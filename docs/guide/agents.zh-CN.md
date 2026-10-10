@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=0122d09873151b44ca70b184b642c5b09a37f135c4958a6512e1ba62de953abc -->
+<!-- translated-from: agents.md sha256=87854cb4d7a2bd100f7115fda38b814d7db5b843f33883581f8fe6cbe9fe0596 -->
 
 # Codex 与其他 agent
 
@@ -89,7 +89,7 @@ Codex 在它的 `workspace-write` 沙箱里运行，批准策略是 `on-request`
 <a id="interrupting-subagents-and-resuming"></a>
 ### 中断、子 agent 与恢复
 
-- **中断。** `Ctrl+c` 立刻结束回合，但 Codex 会让已经启动的命令运行到结束。Eitri 在按键之后最多等三秒。如果到那时仍有命令、文件改动或它读不懂的东西在运行，Eitri 会停掉 Codex 会话和它启动的一切，并说明：“Codex kept running a command after the interrupt; its session was stopped so nothing more runs. The conversation can be resumed.” 模型在自己那次调用之后留在后台继续运行的命令不在此列：回合照常结束，状态栏显示还有几个在运行，那个回合的审查会说明之后的改动不在其中，`<leader>k` 会在一个 `y/n` 之后通过停掉会话来停掉它们（对话之后可以恢复）；之后的一次中断，或关闭标签页，也会停掉它们。
+- **中断。** `Ctrl+c` 立刻结束回合，但 Codex 会让已经启动的命令运行到结束。Eitri 在按键之后最多等三秒。如果到那时仍有命令、文件改动或它读不懂的东西在运行，Eitri 会停掉 Codex 会话和它启动的一切，并说明：“Codex kept running a command after the interrupt; its session was stopped so nothing more runs. The conversation can be resumed.” 如果 Eitri 让 Codex 停下回合三秒之后，回合本身仍未结束（回合刚开始时 Codex 可能拒绝中断，Eitri 会先再请求一次），也会这样停掉会话。模型在自己那次调用之后留在后台继续运行的命令不在此列：回合照常结束，状态栏显示还有几个在运行，那个回合的审查会说明之后的改动不在其中，`<leader>k` 会在一个 `y/n` 之后通过停掉会话来停掉它们（对话之后可以恢复）；之后的一次中断，或关闭标签页，也会停掉它们。
 - **子 agent。** Codex 可能启动子 agent，Eitri 没法关掉这一点。它们的行和卡片写的是 `subagent`，它们继承标签页的沙箱和信任回答，中断或关闭标签页会波及所有子 agent，而在每一个都空闲之前，标签页都算忙。子 agent 自己的文字不会显示。
 - **恢复。** Codex 的对话可以恢复。恢复选择器和 `w` 只列出你所在标签页那个 agent 的已保存会话。保存的标签页的恢复方式和 Claude 的一样（见[快速上手](getting-started.zh-CN.md#tabs-and-sessions)），但每个 Codex 标签页回来时都带着它的恢复信息，要等 Codex 自己的信任问题有了结果才启动：被回答了，或者因为项目没有什么可信任的而不需要问。
 - **用量。** 标签页在 `prefix i`（`limits`）里显示 Codex 的速率限制报告，Codex 报告了的话，还会在回合结束那一行里写出重置时间。Codex 的 token 不带费用，所以不显示费用。
