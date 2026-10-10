@@ -2046,11 +2046,18 @@ fn run_worker(
     }
 }
 
-/// A gate on the worker, for tests: closed, every job waits until it is opened (or ten seconds
+/// A gate on the worker, for tests: closed, every job waits until it is opened (or sixty seconds
 /// pass, so a test that never opens it does not leave a thread blocked for good).
+/// A test asserts the timeout flag is still false after a call that must not wait for the worker,
+/// so a call that does wait fails instead of passing slowly.
+/// The flag proves only that a call did not wait for the held worker (it would come back only after
+/// the timeout); it does not bound the call's own time.
 #[cfg(test)]
 #[derive(Clone, Default)]
-pub(crate) struct WorkerHold(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+pub(crate) struct WorkerHold(
+    std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
 
 #[cfg(test)]
 impl WorkerHold {
@@ -2069,12 +2076,19 @@ impl WorkerHold {
         self.0 .1.notify_all();
     }
 
+    pub(crate) fn timed_out(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn wait(&self) {
         let (closed, changed) = &*self.0;
         let guard = closed.lock().unwrap();
-        let _ = changed
-            .wait_timeout_while(guard, std::time::Duration::from_secs(10), |closed| *closed)
+        let (_guard, timeout) = changed
+            .wait_timeout_while(guard, std::time::Duration::from_secs(60), |closed| *closed)
             .unwrap();
+        if timeout.timed_out() {
+            self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -2882,9 +2896,8 @@ mod tests {
         start(&mut gate, A);
         let view = gate.show(A, 1, &CLAUDE).unwrap();
         hold.close();
-        let began = Instant::now();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
-        assert!(began.elapsed() < Duration::from_millis(50));
+        assert!(!hold.timed_out(), "the answer waited for the worker");
         std::thread::sleep(Duration::from_millis(50));
         assert!(gate.poll().is_empty());
         assert!(!fx.record_file().exists());
@@ -2901,13 +2914,16 @@ mod tests {
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         std::fs::create_dir_all(fx.state.join("eitri")).unwrap();
         std::fs::write(fx.state.join("eitri/trust"), b"i am a file\n").unwrap();
-        let mut gate = fx.gate();
+        let hold = WorkerHold::default();
+        let mut gate = fx.held(&hold);
         start(&mut gate, A);
         let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(view.remember, TrustRememberView::Yes);
-        let began = Instant::now();
+        hold.close();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
-        assert!(began.elapsed() < Duration::from_millis(50));
+        assert!(!hold.timed_out(), "the answer waited for the worker");
+        assert!(gate.poll().is_empty());
+        hold.open();
         let seen = drain(&mut gate, |seen| {
             seen.iter().any(|e| matches!(e, GateEvent::RecordRefused { .. }))
         });
@@ -3192,10 +3208,9 @@ mod tests {
         let fx = Fx::new("cmdqueue");
         let hold = WorkerHold::closed();
         let mut gate = fx.held(&hold);
-        let began = Instant::now();
         gate.command("t".into(), TrustAction::Trust, A, &CLAUDE);
         gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
-        assert!(began.elapsed() < Duration::from_millis(50));
+        assert!(!hold.timed_out(), "the commands waited for the worker");
         std::thread::sleep(Duration::from_millis(50));
         assert!(gate.poll().is_empty());
         hold.open();
