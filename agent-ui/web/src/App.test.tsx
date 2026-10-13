@@ -82,6 +82,53 @@ function dispatchLiveTab(state: AgentUiState, throughRevision = 1) {
   dispatch({ kind: "snapshot", tab: 1, throughRevision, state });
 }
 
+describe("chat actions in the complete panel", () => {
+  it("lets Enter and Space activate tool disclosure as ordinary buttons", () => {
+    const { container, getByRole } = render(<App />);
+    dispatchLiveTab(snapshotState({ toolCalls: [
+      { seq: 1, toolUseId: "tool", name: "Read", input: { file_path: "main.rs" },
+        result: { content: "fn main() {}", isError: false } },
+    ] }));
+    const show = getByRole("button", { name: "Show Read details" });
+    act(() => show.focus());
+    expect(fireEvent.keyDown(show, { key: " " })).toBe(true);
+    expect(fireEvent.keyDown(show, { key: "Enter" })).toBe(true);
+    fireEvent.click(show);
+    expect(container.querySelector(".tool-result-body")?.textContent).toBe("fn main() {}");
+    fireEvent.click(getByRole("button", { name: "Hide Read details" }));
+    expect(container.querySelector(".tool-result-body")).toBeNull();
+  });
+
+  it("sends from a focused action and returns to the draft", () => {
+    const { container, getByRole } = render(<App />);
+    dispatchLiveTab(snapshotState());
+    enterInputMode(container);
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "Review this change" } });
+    const send = getByRole("button", { name: "Send message" });
+    act(() => send.focus());
+    expect(fireEvent.keyDown(send, { key: "Enter" })).toBe(true);
+    fireEvent.click(send);
+    expect(lastOfType("send_message")).toMatchObject({ text: "Review this change", tab: 1 });
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.value).toBe("");
+  });
+
+  it("takes the queue back into INPUT and merges it with the unsent draft", () => {
+    const { container, getByRole } = render(<App />);
+    dispatchLiveTab(snapshotState({ activeTurnId: "turn" }));
+    enterInputMode(container);
+    fireEvent.change(container.querySelector("textarea")!, { target: { value: "My draft" } });
+    dispatch({ kind: "queue", tab: 1, items: [{ text: "Run tests", queuedAt: 1 }], error: null });
+    fireEvent.click(getByRole("button", { name: "Edit queued messages" }));
+    expect(lastOfType("take_back_queue")).toMatchObject({ tab: 1 });
+    dispatch({ kind: "queue_taken", tab: 1, texts: ["Run tests"] });
+    expect(container.querySelector("textarea")!.value).toContain("My draft");
+    expect(container.querySelector("textarea")!.value).toContain("Run tests");
+    expect(lastOfType("send_message")).toBeUndefined();
+  });
+});
+
 /** An empty tab 1, which is how every window starts. */
 function dispatchEmptyTab() {
   dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
@@ -3289,7 +3336,7 @@ describe("v1: typing never answers a card", () => {
   it("Enter on a button that answers nothing (Stop) keeps the browser's own activation", () => {
     arrivedOnACard();
     press("x");
-    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    const stop = buttonLabelled(document.body, "Stop")!;
     act(() => stop.focus());
     // A key on its own (the v1-ui GUI pass: Stop no longer acts in the middle of typing, below).
     wait(300);
@@ -3303,7 +3350,7 @@ describe("v1: typing never answers a card", () => {
      the same with its Enter. Stop now acts only on a key that stands alone or ends a quick motion. */
   it.each([[" "], ["Enter"]])("t then %j on Stop at 80 ms interrupts nothing, and says so", (key) => {
     const { container } = arrivedOnACard();
-    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    const stop = buttonLabelled(document.body, "Stop")!;
     act(() => stop.focus());
     wait(300);
     press("t");
@@ -3315,7 +3362,7 @@ describe("v1: typing never answers a card", () => {
 
   it("j onto Stop then Enter at 80 ms is one quick motion: it interrupts", () => {
     arrivedOnACard();
-    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    const stop = buttonLabelled(document.body, "Stop")!;
     act(() => stop.focus());
     wait(300);
     press("j");
@@ -3498,7 +3545,7 @@ describe("v1: typing never answers a card", () => {
      button also cancels and shows why. */
   it.each([["Enter"], [" "]])("K01: g, a pause, then %j on Stop interrupts nothing", (key) => {
     arrivedOnACard();
-    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    const stop = buttonLabelled(document.body, "Stop")!;
     act(() => stop.focus());
     wait(1000); press("g"); wait(5000);
     expect(document.activeElement).toBe(stop);
@@ -4765,7 +4812,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     const { container } = withACardAndStop();
     press("j");
     press("j");
-    expect(document.activeElement?.textContent).toBe("ctrl+c interrupt");
+    expect(document.activeElement?.textContent).toBe("Stop");
     expect(container.querySelector(".message-list")!.getAttribute("data-focused")).toBe("false");
     press("k");
     expect(document.activeElement).toBe(root(container));
@@ -5293,7 +5340,7 @@ describe("App global HINT: the panel's half", () => {
     show(1, collect(1));
     fireEvent.keyDown(root(container), { key: "i" });
     act(() => container.querySelector("textarea")!.focus());
-    const stop = buttonLabelled(container, "ctrl+c interrupt")!;
+    const stop = buttonLabelled(container, "Stop")!;
     dispatch({ kind: "hint_land", sessionId: 1, index: AT.stop });
     expect(document.activeElement).toBe(stop);
     expect(container.querySelector("textarea")).toBeNull();
@@ -6290,7 +6337,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("j"); // no layout yet: a plain move onto "b"
     const list = fakeLayout(container, [100, 1000]);
     list.scrollTop = 300; // "b" runs past both edges
-    const stop = buttonLabelled(container, "ctrl+c interrupt")!;
+    const stop = buttonLabelled(container, "Stop")!;
     act(() => stop.focus());
 
     press("k");

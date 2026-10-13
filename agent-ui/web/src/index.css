@@ -261,8 +261,8 @@ body,
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0 12px;
-  min-height: 28px;
+  padding: 6px 12px;
+  min-height: 36px;
   border-top: 1px solid var(--nv-border);
   font-family: var(--nv-font-mono);
   font-size: var(--fs-sm);
@@ -343,7 +343,10 @@ body,
    both layouts. V1's editor-context line used to sit here too (`.context-line`); the bottom band
    moved it into the band's own `.band-context` segment. */
 .queue-lines {
-  padding: 0 12px;
+  margin: 6px 12px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--nv-border);
+  border-radius: 8px;
   font-size: var(--fs-sm);
   color: var(--nv-muted);
 }
@@ -351,6 +354,28 @@ body,
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  padding: 3px 0;
+}
+.queue-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+  color: var(--nv-fg);
+  font-weight: 500;
+}
+.queue-items {
+  max-height: 18vh;
+  overflow-y: auto;
+}
+.queue-heading button {
+  background: none;
+  color: var(--nv-muted);
+  border: 0;
+  padding: 4px;
+  font: inherit;
+  cursor: pointer;
 }
 .queue-error {
   color: var(--nv-fg);
@@ -926,8 +951,8 @@ textarea,
    the timeline on a resumed session) happens to be present, which this selector still gets wrong in
    that one case and is recorded here rather than silently claimed fixed. */
 .row-prompt:not(:first-child) {
-  margin-top: 10px;
-  padding-top: 10px;
+  margin-top: 22px;
+  padding-top: 18px;
   border-top: 1px solid var(--nv-border);
 }
 /* Two prompts sent back to back, with no reply between them (queued while a turn was running, or
@@ -938,12 +963,90 @@ textarea,
   padding-top: 0;
   border-top: none;
 }
-/* The row right after a prompt (the reply, almost always) gets a little more breathing room than
-   the bare 4px two adjacent `.row`s' own `padding: 2px 0` already gives every other row pair --
-   the turn separator above puts 10px above a NEW prompt, and a reply immediately below a prompt
-   reads better with more than the default gap too, even though it carries no rule of its own. */
+/* Separate a prompt from its response without making another divider inside the same turn. */
 .row-prompt + .row:not(.row-prompt) {
-  margin-top: 4px;
+  margin-top: 14px;
+}
+.row-assistant {
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.row-assistant p {
+  margin: 0 0 0.85em;
+}
+.row-assistant p:last-child {
+  margin-bottom: 0;
+}
+.row-assistant h1 {
+  font-size: var(--fs-title);
+}
+.row-assistant h2,
+.row-assistant h3 {
+  font-size: var(--fs-prose);
+}
+.row-assistant h1,
+.row-assistant h2,
+.row-assistant h3 {
+  line-height: 1.4;
+  margin: 1.2em 0 0.5em;
+  font-weight: 600;
+}
+.row-assistant .row-body > div > :first-child {
+  margin-top: 0;
+}
+.row-assistant li + li {
+  margin-top: 0.3em;
+}
+.row-tool,
+.row-tool-run {
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.tool-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+  min-height: 24px;
+  font-family: var(--nv-font-prose);
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.tool-details-toggle,
+.tool-group-toggle {
+  background: none;
+  border: 0;
+  color: var(--nv-muted);
+  font: inherit;
+  cursor: pointer;
+  padding: 3px 6px;
+  border-radius: 4px;
+}
+.tool-group-toggle {
+  color: var(--nv-muted);
+  font-family: var(--nv-font-prose);
+  font-size: var(--fs-sm);
+  margin-bottom: 4px;
+}
+.tool-details-toggle:hover,
+.tool-group-toggle:hover,
+.queue-heading button:hover {
+  text-decoration: underline;
+}
+.tool-card-run {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.tool-card-run > span {
+  min-width: 0;
+}
+.tool-card-run button {
+  flex: none;
+  font-family: var(--nv-font-prose);
+  color: var(--nv-surface-fg);
 }
 .row-tool .row-body {
   font-family: var(--nv-font-mono);
@@ -1344,8 +1447,62 @@ textarea,
      item and it shrinks before anything is pushed down. */
   flex-wrap: wrap;
   gap: 8px;
-  padding: 10px;
-  border-top: 1px solid var(--nv-border);
+  margin: 10px 12px;
+  padding: 12px;
+  border: 1px solid var(--nv-border);
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+.composer:focus-within {
+  border-color: var(--nv-muted);
+}
+.composer-actions {
+  display: flex;
+  flex: 0 0 100%;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.composer-help {
+  margin-right: auto;
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+}
+.composer-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 30px;
+  padding: 4px 10px;
+  border: 1px solid var(--nv-border);
+  border-radius: 6px;
+  color: var(--nv-fg);
+  background: none;
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.composer-actions .composer-send {
+  border-color: var(--nv-fg);
+  font-weight: 600;
+}
+.composer-actions button:disabled {
+  color: var(--nv-muted);
+  border-color: var(--nv-border);
+  cursor: default;
+}
+.composer-actions button:not(:disabled):hover {
+  border-color: var(--nv-fg);
+  text-decoration: underline;
+}
+@media (max-width: 380px) {
+  .composer-help {
+    flex: 0 0 100%;
+    margin-bottom: 2px;
+  }
 }
 
 /* Why the box stopped taking input while a terminal handoff closes the conversation. A control that
@@ -1386,6 +1543,7 @@ textarea,
    it instead of a border. */
 .composer textarea {
   flex: 1;
+  min-width: 0;
   resize: none;
   min-height: 1.4em;
   background: none;
@@ -1403,8 +1561,11 @@ textarea,
    `--nv-muted`, the placeholder's colour. */
 .composer-browse-hint {
   flex: 1;
+  min-width: 0;
   min-height: 1.4em;
   display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
   align-items: center;
   color: var(--nv-muted);
   font-size: var(--fs-base);
@@ -1707,19 +1868,22 @@ textarea,
 .activity-line .stop {
   flex: none;
 }
-/* `ctrl+c interrupt` is words in the line, not WebKit's button
-   face. Still a real button for the mouse and `hjkl`; focused, the
-   solid-cursor rule at the end of this file wins (it is more specific). */
+/* The short label leaves room for the current action in a narrow panel. The shortcut is in the
+   tooltip and accessible name; the solid focus treatment still identifies the keyboard target. */
 .activity-line .stop {
   background: none;
-  border: 0;
-  padding: 0 2px;
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--nv-border);
+  border-radius: 5px;
+  padding: 4px 8px;
   font: inherit;
-  color: var(--nv-muted);
+  color: var(--nv-fg);
   cursor: pointer;
+  margin-left: auto;
 }
 .activity-line .stop::before {
-  content: "· ";
+  content: "■ ";
 }
 /* The only shrinkable child of `.turn-activity`. The plain default, stated rather than inherited so
    that the day a second shrinkable child appears here, this is a number someone has to choose

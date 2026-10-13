@@ -1,6 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AgentUiState, ToolCallRecord } from "../types";
-import { renderToolCall } from "../toolRegistry";
+import { lookupTool, renderToolCall } from "../toolRegistry";
+import { shortToolName } from "../externalTools";
 import { buildTimeline, isUsableLink, type TimelineItem } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
 import { forgetMarkdown, renderMarkdown } from "../markdown";
@@ -23,6 +24,7 @@ type Props = {
   /** Expanded rows, keyed by timeline `key`. `App.tsx` holds this state because Enter acts on
    *  its cursor through `toggle-expand`. Expanding a run's key reveals its calls (`display.ts`). */
   expanded: Record<string, boolean>;
+  onToggleExpand?: (key: string) => void;
   /** The index into THIS component's own `timeline` (below) that `Enter`/`y` act on in `App.tsx`.
    *  Safe to compare by position rather than by identity: both here and there, `timeline` is
    *  `buildDisplay(buildTimeline(state), …)` over the same `state`, `expanded` and `detailed`, a pure
@@ -196,6 +198,7 @@ export function MessageList({
   onAnswerPermission,
   answeredPermissions,
   onPermissionReason,
+  onToggleExpand,
   onOpenPath,
   onUnreadChange,
   unseenSeed,
@@ -312,6 +315,19 @@ export function MessageList({
     () => given ?? buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
     [given, state, expanded, detailed],
   );
+  // Reuse the same grouping rules for the collapse handle, including the boundaries at failures,
+  // edits and permission requests. The handle belongs to the group's first visible call.
+  const openRuns = useMemo(() => {
+    const runs = new Map<string, { key: string; count: number }>();
+    if (!detailed && Object.keys(expanded).some((key) => key.startsWith("r-") && expanded[key])) {
+      for (const item of buildDisplay(timeline, { expanded: {}, detailed: false, turnRunning: state.activeTurnId !== null })) {
+        if (item.kind === "run" && expanded[item.key]) {
+          runs.set(`t-${item.seq}`, { key: item.key, count: item.calls.length });
+        }
+      }
+    }
+    return runs;
+  }, [timeline, expanded, detailed, state.activeTurnId]);
 
   const followingRef = useRef(true);
   const lastScrollTopRef = useRef(0);
@@ -594,8 +610,8 @@ export function MessageList({
 
   /** The card callbacks a row calls, through one ref that never changes, so a new callback from the
    *  parent (they are made on every render) does not make every row render again. */
-  const rowHandlersRef = useRef<RowHandlers>({ onAnswerPermission, onPermissionReason });
-  rowHandlersRef.current = { onAnswerPermission, onPermissionReason };
+  const rowHandlersRef = useRef<RowHandlers>({ onAnswerPermission, onPermissionReason, onToggleExpand });
+  rowHandlersRef.current = { onAnswerPermission, onPermissionReason, onToggleExpand };
 
   const awaitingPermission = new Set(state.pendingPermissions.map((p) => p.toolUseId).filter(isUsableLink));
 
@@ -637,6 +653,9 @@ export function MessageList({
               yanked={item.key === yankedKey}
               expanded={expanded[item.key] === true}
               detailed={detailed}
+              interactive={onToggleExpand !== undefined}
+              runKey={openRuns.get(item.key)?.key}
+              runCount={openRuns.get(item.key)?.count}
               sessionEnded={sessionEnded}
               abandoned={call !== null && isAbandonedCall(call, state, sessionEnded)}
               gated={call !== null && awaitingPermission.has(call.toolUseId)}
@@ -657,6 +676,7 @@ export function MessageList({
 }
 
 type RowHandlers = {
+  onToggleExpand: Props["onToggleExpand"];
   onAnswerPermission: Props["onAnswerPermission"];
   onPermissionReason: Props["onPermissionReason"];
 };
@@ -667,6 +687,9 @@ type TimelineRowProps = {
   yanked: boolean;
   expanded: boolean;
   detailed: boolean;
+  interactive: boolean;
+  runKey?: string;
+  runCount?: number;
   sessionEnded: boolean;
   /** A tool call whose result can never arrive (`isAbandonedCall`). */
   abandoned: boolean;
@@ -693,6 +716,9 @@ const TimelineRow = memo(function TimelineRow({
   yanked,
   expanded,
   detailed,
+  interactive,
+  runKey,
+  runCount,
   sessionEnded,
   abandoned,
   gated,
@@ -725,8 +751,30 @@ const TimelineRow = memo(function TimelineRow({
     }
     case "tool": {
       const yankedClass = yanked ? "row-yanked" : undefined;
+      const quiet = lookupTool(item.call.name)?.quiet === true;
+      const status = gated ? "Awaiting approval" : item.call.result === null
+        ? (abandoned ? "Stopped" : "Running") : item.call.result.isError ? "Failed" : "Completed";
       return (
         <Row kind="tool" sign={toolSign(item.call, abandoned)} current={current} className={yankedClass} navStop="row">
+          {interactive && runKey !== undefined && (
+            <button type="button" className="tool-group-toggle" aria-expanded="true"
+              aria-label={`Collapse ${runCount} tool calls`}
+              onClick={() => handlers.current.onToggleExpand?.(runKey)}>
+              <span aria-hidden="true">▾</span> Collapse {runCount} tool calls
+            </button>
+          )}
+          {!quiet && (
+            <div className="tool-heading">
+              <span className="tool-state" aria-hidden="true">{status}</span>
+              {interactive && !detailed && !gated && item.call.result !== null && (
+                <button type="button" className="tool-details-toggle" aria-expanded={expanded}
+                  aria-label={`${expanded ? "Hide" : "Show"} ${shortToolName(item.call.name)} details`}
+                  onClick={() => handlers.current.onToggleExpand?.(item.key)}>
+                  {expanded ? "Less" : "Details"} <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+                </button>
+              )}
+            </div>
+          )}
           <div data-awaiting-permission={gated ? "true" : undefined}>
             {/* A gated call shows "waiting for approval" because its permission card already shows
                 the invocation. Repeating it here would make a pending call look as if it had run. */}
@@ -775,7 +823,14 @@ const TimelineRow = memo(function TimelineRow({
       return (
         <Row kind="tool-run" sign="✓" current={current} className={yankedClass} navStop="row">
           <div className="tool-card tool-card-run">
-            {runSummary(item.calls)} <span className="fold-marker" aria-label="collapsed">▸</span>
+            <span>{runSummary(item.calls)}</span>
+            {interactive ? (
+              <button type="button" className="tool-details-toggle" aria-expanded="false"
+                aria-label={`Expand ${item.calls.length} tool calls`}
+                onClick={() => handlers.current.onToggleExpand?.(item.key)}>
+                Show <span className="fold-marker" aria-hidden="true">▸</span>
+              </button>
+            ) : <span className="fold-marker" aria-label="collapsed">▸</span>}
           </div>
         </Row>
       );

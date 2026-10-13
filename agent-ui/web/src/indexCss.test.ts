@@ -1812,8 +1812,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     const notFirst = withoutComments.match(/\.row-prompt:not\(:first-child\)\s*\{[^}]*\}/);
     expect(notFirst).not.toBeNull();
     const notFirstBody = notFirst![0];
-    expect(notFirstBody).toMatch(/margin-top:\s*10px;/);
-    expect(notFirstBody).toMatch(/padding-top:\s*10px;/);
+    expect(notFirstBody).toMatch(/margin-top:\s*22px;/);
+    expect(notFirstBody).toMatch(/padding-top:\s*18px;/);
     expect(notFirstBody).toMatch(/border-top:\s*1px solid var\(--nv-border\);/);
 
     // Two prompts sent back to back (no reply between them) share one hairline, not two -- the
@@ -2224,15 +2224,13 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(lead.textOverflow).toBe("ellipsis");
   });
 
-  /** `mock: bottom.html` B: `✻ Working… 1m 12s · ctrl+c interrupt` -- the Stop control is words in
-   *  the line, not a boxed button (the r2-gui GUI pass, 2026-09-26, saw WebKit's own
-   *  button face). Focused, it is still the solid cursor every focused control is. */
-  it("draws the activity line's Stop as words, and as the solid cursor when focused", () => {
-    const html = `<div class="agent-ui-root"><div class="activity-line"><button type="button" class="stop">ctrl+c interrupt</button></div></div>`;
+  // The compact Stop button still uses the same solid focus treatment as other controls.
+  it("draws an explicit Stop control, and the solid cursor when focused", () => {
+    const html = `<div class="agent-ui-root"><div class="activity-line"><button type="button" class="stop">Stop</button></div></div>`;
     const stop = computed(html, ".stop");
-    expect(stop.borderTopStyle).toMatch(/^(none|)$/);
+    expect(stop.borderTopStyle).toBe("solid");
     expect(stop.backgroundColor).toMatch(/^(transparent|rgba\(0, 0, 0, 0\)|)$/);
-    expect(stop.color).toBe("var(--nv-muted)");
+    expect(stop.color).toBe("var(--nv-fg)");
     // A fresh copy, focused before its style is first read: jsdom does not recompute on focus.
     document.body.innerHTML = html;
     document.body.querySelector<HTMLElement>(".stop")!.focus();

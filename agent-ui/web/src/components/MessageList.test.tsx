@@ -9,6 +9,25 @@ import type { AgentDomainEvent, AgentUiState } from "../types";
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
 
+it("opens a tool group and offers a way to collapse that same group", () => {
+  const onToggleExpand = vi.fn();
+  const props = {
+    state: state({ toolCalls: [
+      { seq: 1, toolUseId: "a", name: "Read", input: { file_path: "a.rs" }, result: { content: "first", isError: false } },
+      { seq: 2, toolUseId: "b", name: "Read", input: { file_path: "b.rs" }, result: { content: "second", isError: false } },
+    ] }),
+    sessionEnded: false, cursor: -1, onAnswerPermission: vi.fn(), onToggleExpand,
+  };
+  const { getByRole, getAllByRole, rerender } = render(<MessageList {...props} expanded={{}} />);
+  fireEvent.click(getByRole("button", { name: /Expand 2 tool calls/ }));
+  expect(onToggleExpand).toHaveBeenLastCalledWith("r-1");
+  rerender(<MessageList {...props} expanded={{ "r-1": true }} />);
+  fireEvent.click(getByRole("button", { name: /Collapse 2 tool calls/ }));
+  expect(onToggleExpand).toHaveBeenLastCalledWith("r-1");
+  fireEvent.click(getAllByRole("button", { name: "Show Read details" })[0]);
+  expect(onToggleExpand).toHaveBeenLastCalledWith("t-1");
+});
+
 beforeAll(() => {
   // jsdom implements no layout, so `scrollIntoView` does not exist on Element at all -- the
   // auto-scroll effect would throw before a single assertion ran.
