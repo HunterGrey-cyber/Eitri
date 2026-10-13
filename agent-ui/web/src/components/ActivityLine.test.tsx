@@ -34,9 +34,9 @@ it("counts the queue, names the interrupt key, and names a card that waits (P1)"
   const { container, rerender } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={2} pendingTool={null} />,
   );
-  // Queue and permission status share the same slot; Stop remains available in either case.
-  expect(container.querySelector(".activity-line")!.textContent).toContain("2 queued · Stop");
-  expect(container.querySelector("button.stop")!.textContent).toBe("Stop");
+  // The lowercase interrupt hint is the Stop button's label, so the hint itself is clickable.
+  expect(container.querySelector(".activity-line")!.textContent).toContain("2 queued · ctrl+c interrupt");
+  expect(container.querySelector("button.stop")!.textContent).toBe("ctrl+c interrupt");
   rerender(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={0} pendingTool="Bash" mode="input" />,
   );
@@ -83,10 +83,12 @@ it("codex-release-p1 #9: the hint names both S4's navigation and S1's pause, in 
   expect(text()).toContain("alone");
 });
 
-it("keeps Stop and its keyboard shortcut discoverable even while a card waits", () => {
+/** "the activity line already ends in `ctrl+c interrupt` ...; it is kept and
+ *  pinned by a test, including while a card waits." Pins the button's own text, not just its
+ *  presence -- CC's own words, unchanged by a card taking over the rest of the line. */
+it("keeps ctrl+c interrupt as the Stop button's own text, even while a card waits (R34)", () => {
   const { container } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,
   );
-  expect(container.querySelector("button.stop")!.textContent).toBe("Stop");
-  expect(container.querySelector("button.stop")!.getAttribute("title")).toBe("Stop agent (Ctrl+C)");
+  expect(container.querySelector("button.stop")!.textContent).toBe("ctrl+c interrupt");
 });

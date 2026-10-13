@@ -228,7 +228,7 @@ export function Composer({
   }, [text, mode]);
 
   function submit(now: boolean) {
-    if (disabled || sessionEnded || closing || editingInNvim) return;
+    if (disabled || editingInNvim) return;
     const body = text;
     // Held-back slash commands are neither sent nor queued, including through send-now. This
     // includes `/login`, `/config` and `/resume`. Keep the draft unchanged and show a flash
@@ -249,9 +249,6 @@ export function Composer({
     }
     setBox("");
     setWalk({ index: null, stash: "" });
-    // A keyboard-activated send button becomes disabled with the empty draft. Put the caret
-    // back before that happens, so the next keystroke can start the next message.
-    focusAtCaret();
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -331,15 +328,7 @@ export function Composer({
   }
 
   return (
-    <div
-      className="composer"
-      data-input={mode === "input" ? "true" : undefined}
-      {...(hintTarget ? { [HINT_COMPOSER_ATTR]: "" } : {})}
-      onBlur={(event) => {
-        // Moving between the draft, history search and send actions keeps the draft mounted.
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) onModeChange("browse");
-      }}
-    >
+    <div className="composer" {...(hintTarget ? { [HINT_COMPOSER_ATTR]: "" } : {})}>
       {closing && (
         <p className="composer-closing" role="status">
           This conversation is being closed so it can continue in a terminal. Anything still in the
@@ -375,7 +364,6 @@ export function Composer({
           </span>
           <textarea
             ref={textareaRef}
-            aria-label="Message to agent"
             {...NO_TEXT_ASSIST}
             value={text}
             disabled={disabled}
@@ -386,6 +374,16 @@ export function Composer({
               onDraftChange?.(e.target.value);
             }}
             onFocus={() => onModeChange("input")}
+            // Mouse-driven "click away": a keyboard-driven Esc already sets BROWSE at the panel
+            // level (`keymap.ts`'s `resolveKey`), and this is what keeps a click OUT of the box
+            // agreeing with it, without either being the only path that can make the change. The
+            // history-search line takes real DOM focus of its own: a blur that
+            // lands there must not report BROWSE, or opening `Ctrl+r` would itself leave INPUT.
+            onBlur={(e) => {
+              if (!(e.relatedTarget instanceof HTMLElement && e.relatedTarget.closest(".history-search"))) {
+                onModeChange("browse");
+              }
+            }}
             onKeyDown={onKeyDown}
             onKeyUp={(e) => {
               caretRef.current = e.currentTarget.selectionStart;
@@ -447,35 +445,9 @@ export function Composer({
           </div>
         </>
       )}
-      {mode === "input" && !sessionEnded && !closing && (
-        <div className="composer-actions">
-          <span className="composer-help">Shift+Enter for newline</span>
-          {running && (
-            <button
-              type="button"
-              className="composer-send-now"
-              aria-label="Send now"
-              title="Send now (Ctrl+Enter)"
-              disabled={disabled || editingInNvim || (text.trim() === "" && queueCount === 0)}
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => submit(true)}
-            >
-              Send now
-            </button>
-          )}
-          <button
-            type="button"
-            className="composer-send"
-            aria-label={running ? "Queue message" : "Send message"}
-            title={running ? "Queue for after this turn (Enter)" : "Send message (Enter)"}
-            disabled={disabled || editingInNvim || text.trim() === ""}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => submit(false)}
-          >
-            {running ? "Queue" : "Send"}<span aria-hidden="true">↵</span>
-          </button>
-        </div>
-      )}
+      {/* No Send or Stop buttons here: Enter sends and Shift+Enter inserts a newline (both handled
+          above), and the mouse Stop button lives in `ActivityLine`, gated on the provider's advertised
+          `interrupt` capability, never on the backend's name. */}
     </div>
   );
 }

@@ -5847,10 +5847,6 @@ export default function App() {
           state={frozenSnapshot?.state ?? state}
           sessionEnded={frozenSnapshot?.sessionEnded ?? sessionEnded}
           expanded={frozenSnapshot?.expanded ?? expanded}
-          onToggleExpand={(key) => {
-            if (frozenSnapshot !== null) return;
-            setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
-          }}
           cursor={frozenTimeline === null ? cursor : (indexOfKey(frozenTimeline, timeline[cursor]?.key ?? "") ?? -1)}
           timeline={frozenTimeline ?? timeline}
           detailed={frozenSnapshot?.detailed ?? detailed}
@@ -5993,16 +5989,11 @@ export default function App() {
         turnClock={turnClock}
         canInterrupt={state.capabilities.interrupt}
         onInterrupt={interrupt}
+        queued={queue.length}
         pendingTool={oldestPendingTool(state)}
         mode={mode}
       />
-      <QueueLines items={queue} error={queueError}
-        onEdit={sessionEnded || handingOff || scratchEditing ? undefined : () => {
-          setMode("input");
-          setComposerFocusRequest((n) => n + 1);
-          post({ type: "take_back_queue" });
-        }}
-      />
+      <QueueLines items={queue} error={queueError} />
       {/* Above the composer, deliberately -- the confirmation
           used to sit below everything, at the very bottom; the band leaves no room there for a
           multi-line dialog, so it moves up here instead, controlled by `handoffOpen`. It must not

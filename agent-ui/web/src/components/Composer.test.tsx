@@ -79,68 +79,6 @@ describe("Composer's prompt glyph", () => {
 });
 
 describe("Composer sending", () => {
-  it("sends from the visible action and disables it for an empty draft", () => {
-    const { container, textarea, onSend } = renderComposer();
-    const send = () => container.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')!;
-    expect(send()?.disabled).toBe(true);
-    fireEvent.change(textarea, { target: { value: "Review the changes" } });
-    expect(send().disabled).toBe(false);
-    send().focus();
-    fireEvent.click(send());
-    expect(onSend).toHaveBeenCalledOnce();
-    expect(onSend).toHaveBeenCalledWith("Review the changes");
-    expect(textarea.value).toBe("");
-    expect(document.activeElement).toBe(textarea);
-  });
-
-  it("keeps queue and send-now actions distinct while working", () => {
-    const onQueue = vi.fn();
-    const onSendNow = vi.fn();
-    const { container, textarea, onSend } = renderComposer({ running: true, onQueue, onSendNow });
-    fireEvent.change(textarea, { target: { value: "Then run tests" } });
-    fireEvent.click(container.querySelector('button[aria-label="Queue message"]')!);
-    expect(onQueue).toHaveBeenCalledOnce();
-    expect(onQueue).toHaveBeenCalledWith("Then run tests");
-    expect(onSendNow).not.toHaveBeenCalled();
-    fireEvent.change(textarea, { target: { value: "Use the smaller fixture" } });
-    fireEvent.click(container.querySelector('button[aria-label="Send now"]')!);
-    expect(onSendNow).toHaveBeenCalledOnce();
-    expect(onSendNow).toHaveBeenCalledWith("Use the smaller fixture");
-    expect(onSend).not.toHaveBeenCalled();
-  });
-
-  it("can send the existing queue now without another draft", () => {
-    const onSendNow = vi.fn();
-    const { container } = renderComposer({ running: true, queueCount: 2, onSendNow });
-    const button = container.querySelector<HTMLButtonElement>('button[aria-label="Send now"]')!;
-    expect(button.disabled).toBe(false);
-    fireEvent.click(button);
-    expect(onSendNow).toHaveBeenCalledWith("");
-  });
-
-  it("keeps INPUT when focus moves to its actions, then leaves INPUT when focus leaves the composer", () => {
-    const onModeChange = vi.fn();
-    const { container, textarea } = renderComposer({ onModeChange });
-    fireEvent.change(textarea, { target: { value: "hello" } });
-    onModeChange.mockClear();
-    const send = container.querySelector('button[aria-label="Send message"]')!;
-    expect(send).not.toBeNull();
-    fireEvent.blur(textarea, { relatedTarget: send });
-    expect(onModeChange).not.toHaveBeenCalled();
-    fireEvent.blur(send, { relatedTarget: document.body });
-    expect(onModeChange).toHaveBeenCalledWith("browse");
-  });
-
-  it("does not bypass slash-command refusals or the scratch editor through a click", () => {
-    const { container, textarea, onSend, rerender } = renderComposerWithRerender();
-    fireEvent.change(textarea, { target: { value: "/login" } });
-    fireEvent.click(container.querySelector('button[aria-label="Send message"]')!);
-    expect(onSend).not.toHaveBeenCalled();
-    expect(textarea.value).toBe("/login");
-    rerender({ editingInNvim: true });
-    expect(container.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')!.disabled).toBe(true);
-  });
-
   it("sends on Enter and clears the box", () => {
     const { textarea, onSend } = renderComposer();
     fireEvent.change(textarea, { target: { value: "hello" } });
@@ -166,7 +104,9 @@ describe("Composer sending", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  // A dead or closing session must reject keyboard sends as well as disable its controls.
+  /* `disabled` prevents sending a second turn while one runs. The backend rejects it too,
+     but the UI must not offer it. There is no Send button; Enter is the remaining send path,
+     so this checks that Enter cannot send while disabled. */
   it("cannot send while disabled, even via Enter", () => {
     const { textarea, onSend } = renderComposer({ disabled: true });
     expect(textarea.disabled).toBe(true);
@@ -176,7 +116,9 @@ describe("Composer sending", () => {
   });
 });
 
-// Stop lives in ActivityLine and is offered only when the provider advertises interrupt support.
+// The composer sends on Enter and inserts a newline on Shift+Enter. The mouse Stop button lives
+// in `ActivityLine`, gated by the provider's `interrupt` capability. Its behavior is tested in
+// `ActivityLine.test.tsx`.
 
 describe("Composer on a session that has ended", () => {
   it("says the session ended rather than inviting a turn that cannot be taken", () => {

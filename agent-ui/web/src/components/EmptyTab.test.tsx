@@ -1054,10 +1054,14 @@ describe("EmptyTab (F3)", () => {
     it("a keysRequest bump in INPUT focuses the composer's textarea", () => {
       const rendered = renderEmpty();
       const { container, props } = rendered;
-      // Simulate focus lost without a delivered blur, so this exercises the recovery branch
-      // where the mode is still INPUT but DOM focus is outside the panel.
-      container.querySelector("textarea")!.addEventListener("focusout", (event) => event.stopPropagation(), { once: true });
+      // Moving real DOM focus away from the textarea normally flips `mode` to browse through
+      // `Composer`'s own `onBlur` -- to keep testing THIS branch (mode stays "input" while the
+      // root does not contain `document.activeElement`) rather than the browse one above, the
+      // `relatedTarget` is given `.history-search`'s own class, the one case `onBlur` itself
+      // already carves out (`Composer.tsx`'s doc comment: "a blur that lands there must not
+      // report BROWSE").
       const outside = document.createElement("button");
+      outside.className = "history-search";
       document.body.appendChild(outside);
       act(() => outside.focus());
       expect(document.activeElement).toBe(outside);
