@@ -220,6 +220,12 @@ mod tests {
         assert_eq!(classify(Key::M, shift), key("M"), "Shift is folded into a character");
         assert_eq!(classify(Key::percent, shift), key("%"));
         assert_eq!(classify(Key::Escape, ModifierType::empty()), Press::Escape);
+        // The per-module text size chords, from the main keys and the keypad.
+        assert_eq!(classify(Key::equal, ctrl), key("C-="));
+        assert_eq!(classify(Key::minus, ctrl), key("C--"));
+        assert_eq!(classify(Key::_0, ctrl), key("C-0"));
+        assert_eq!(classify(Key::KP_Add, ctrl), key("C-+"));
+        assert_eq!(classify(Key::KP_Subtract, ctrl), key("C--"));
         assert_eq!(classify(Key::Shift_L, shift), Press::Modifier);
         assert_eq!(classify(Key::Control_L, ctrl), Press::Modifier);
         assert_eq!(classify(Key::x, ModifierType::SUPER_MASK), Press::Other);

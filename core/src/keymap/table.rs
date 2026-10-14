@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use super::action::{self, Action, ActionError, OptValue, SwapTarget, TabAction};
+use super::action::{self, Action, ActionError, OptValue, SwapTarget, TabAction, TextChange};
 use super::key::{Chord, KeyName, KeyParseError, KeySpec};
 use super::panel::PanelUserTable;
 use super::root::{self, HelpRow};
@@ -268,6 +268,14 @@ fn default_bindings() -> Vec<Binding> {
         );
     }
     bind("F11", Action::WindowImmersive, false);
+    // The text size of the module with the keys alone: the prefix before the chord that sizes every pane
+    // together (`Ctrl+=`/`Ctrl+-`/`Ctrl+0`, the root table). Larger and smaller repeat like a resize, so
+    // one prefix takes a run of steps with Ctrl still held; a reset is one press.
+    bind("C-=", Action::Text(TextChange::Larger), true);
+    // The keypad's `+` with Ctrl reads as `C-+`; its `-` and `0` are already the two below.
+    bind("C-+", Action::Text(TextChange::Larger), true);
+    bind("C--", Action::Text(TextChange::Smaller), true);
+    bind("C-0", Action::Text(TextChange::Reset), false);
     bind("e", Action::Module(ModuleId::editor()), false);
     bind("a", Action::Module(ModuleId::agent()), false);
     bind("t", Action::Module(ModuleId::terminal()), false);
@@ -779,6 +787,10 @@ mod tests {
         ("C-j", "send-keys keys=C-j", false),
         ("C-k", "send-keys keys=C-k", false),
         ("F11", "window.immersive", false),
+        ("C-=", "text.larger", true),
+        ("C-+", "text.larger", true),
+        ("C--", "text.smaller", true),
+        ("C-0", "text.reset", false),
         ("e", "module.editor", false),
         ("a", "module.agent", false),
         ("t", "module.terminal", false),
@@ -836,7 +848,7 @@ mod tests {
     fn every_default_is_a_stock_tmux_key_or_marked_eitri_only() {
         // `[` and `PPage` are stock tmux's own keys too (both non-repeatable, like our `copy-mode`
         // bindings), so they need no entry here even though Eitri's action differs from tmux's.
-        const EITRI_ONLY: [&str; 7] = ["C-l", "C-h", "C-j", "C-k", "F11", "e", "a"];
+        const EITRI_ONLY: [&str; 11] = ["C-l", "C-h", "C-j", "C-k", "F11", "e", "a", "C-=", "C-+", "C--", "C-0"];
         for binding in Keymap::defaults().bindings() {
             let name = binding.key.to_string();
             if EITRI_ONLY.contains(&name.as_str()) {

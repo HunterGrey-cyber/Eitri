@@ -46,6 +46,7 @@ The keys marked "repeats" can be pressed again within half a second without the 
 | `<prefix> x` | close this module and end what runs in it, after a `y/n` question; closing the last one on screen closes Eitri |
 | `<prefix> [` or `<prefix> PageUp` | scroll the bottom terminal back (copy mode); only while the terminal has the keys, elsewhere it flashes a refusal |
 | `<prefix> F11` | immersive: fullscreen without the top bar |
+| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / back in step, for the pane with the keys only (repeats: keep Ctrl down and press `=` or `-` again) |
 
 **The window and the panel.**
 

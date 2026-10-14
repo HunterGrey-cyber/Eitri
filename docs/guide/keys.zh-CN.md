@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=b8779f27d80595422c60449984b8aa4a97dfa40949fe792d6a6b729220b5e97d -->
+<!-- translated-from: keys.md sha256=7aa6b94699e46b1f45efa3d5bc70b0c9886d5f54e4004849ca330171e2f9d8ed -->
 
 # 按键
 
@@ -41,6 +41,7 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `<prefix> x` | 关闭这个模块并结束它里面运行的东西，会先问一个 `y/n`；关掉屏幕上的最后一个模块就关闭 Eitri |
 | `<prefix> [` 或 `<prefix> PageUp` | 把底部终端往回滚（复制模式）；只在终端拿着按键时有效，在别处只会闪一下拒绝提示 |
 | `<prefix> F11` | 沉浸模式：不带顶栏的全屏 |
+| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 只放大 / 缩小 / 还原拿着按键的那个窗格的文字（repeats：按住 Ctrl 再按 `=` 或 `-` 继续调） |
 
 **窗口和面板。**
 
