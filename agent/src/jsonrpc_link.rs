@@ -505,9 +505,7 @@ enum ChildState {
 
 /// Whether the child has exited, asked without reaping it, so its pid keeps naming its group.
 fn child_state(pid: u32) -> ChildState {
-    let Ok(pid) = libc::id_t::try_from(pid) else {
-        return ChildState::Gone;
-    };
+    let pid: libc::id_t = pid;
     // SAFETY: an all-zero `siginfo_t` is a valid value, and `waitid` writes only into it.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` lives for the call; WNOWAIT leaves the child waitable.
