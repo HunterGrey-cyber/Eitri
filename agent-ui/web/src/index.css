@@ -491,11 +491,15 @@ body,
    font that actually carries the glyph -- Noto Sans Symbols 2 first, Symbola and Segoe UI Symbol as
    fallbacks a Linux/Windows host might carry instead, Adwaita Mono (GNOME's default, likely already
    installed) before finally falling through to the panel's own mono stack, which would draw a
-   `.notdef` box. Colour is the mode: `--nv-warn` for auto (a judgement call worth noticing),
+   `.notdef` box. Colour is the mode: `--nv-muted` for manual (every edit asks: nothing to warn
+   about), `--nv-warn` for auto (a judgement call worth noticing),
    `--nv-error` for bypass (no gate at all) -- a glyph colour, never text
    (`indexCss.test.ts`'s `MODE_GLYPH_BRANCH` exemption, the same shape `.wk-key`'s already has). */
 .mode-glyph {
   font-family: "Noto Sans Symbols 2", "Symbola", "Segoe UI Symbol", "Adwaita Mono", var(--nv-font-mono);
+}
+.mode-glyph[data-mode-name="manual"] {
+  color: var(--nv-muted);
 }
 .mode-glyph[data-mode-name="auto"] {
   color: var(--nv-warn);

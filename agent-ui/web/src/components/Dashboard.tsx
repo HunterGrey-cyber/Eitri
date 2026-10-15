@@ -37,9 +37,20 @@ export function dashItems(hello: Hello): DashItem[] {
  *  outside protected paths run without a card; other operations ask. This matches
  *  `agent/src/permission_policy.rs`. Bypass runs edits and commands without asking. */
 export const MODE_CONSEQUENCE: Record<string, string> = {
+  manual: "Safe reads run; every edit and anything else asks.",
   auto: "Edits in this project and safe reads run; anything else asks.",
   bypass: "Nothing asks: edits and commands run unasked.",
 };
+
+/** The consequence line for this tab. Manual's line is about Claude's tools, which Eitri's own policy
+ *  judges; another agent runs what its own sandbox allows without asking anyone, edits included, so
+ *  on its tab manual says only what reaches Eitri, and where the rest is described. */
+export function modeConsequence(mode: PermissionModeChoice, agent: string | null, prefix: string): string | undefined {
+  if (mode === "manual" && agent !== null) {
+    return `Every request ${agent} makes asks; what it runs without asking is in ${prefix} i.`;
+  }
+  return MODE_CONSEQUENCE[mode];
+}
 
 const ITEM_ICON: Record<DashItem, string> = {
   new: "+",
@@ -160,7 +171,7 @@ type Props = {
  * is exactly the key this screen's own `j`/`k`/letters/`Enter` must never intercept from. */
 export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix, editorLink = null, agent = null }: Props) {
   const items = dashItems(hello);
-  const consequence = MODE_CONSEQUENCE[mode];
+  const consequence = modeConsequence(mode, agent, prefix);
   return (
     <div className="dashboard">
       <div className="dash-title">Eitri</div>

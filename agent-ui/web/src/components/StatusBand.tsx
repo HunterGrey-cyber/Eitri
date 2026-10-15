@@ -15,7 +15,7 @@ type Props = {
   onJump?: () => void;
 };
 
-/** `facts.pill`'s leading `"⏵⏵ "` names the mode word after it (`"auto"`/`"bypass"`), which is all
+/** `facts.pill`'s leading `"⏵⏵ "` names the mode word after it (`"manual"`/`"auto"`/`"bypass"`), which is all
  *  `data-mode-name` needs -- `App.tsx` only ever builds this in the
  *  short form (`modePill(mode, cycleOffered, true)`), so there is nothing else in the string to
  *  strip. `undefined` for a pill that never carries the glyph (a future caller, a test fixture that

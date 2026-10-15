@@ -108,9 +108,14 @@ pub fn disallowed_tools() -> &'static [&'static str] {
 ///
 /// Serialized on `AgentDomainEvent::PermissionModeChanged` for the panel's JSON snapshot.
 /// `rename_all = "snake_case"` matches the other wire-facing enums in this crate.
+///
+/// `Manual` is the strictest mode: the host's policy answers every request, and every file write or
+/// edit gets a card ([`crate::classify_in_manual`]). It is never more permissive than `Auto`.
+/// CLI mode reports cannot produce it because they describe the CLI's policy, not the host's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
+    Manual,
     Auto,
     Bypass,
 }

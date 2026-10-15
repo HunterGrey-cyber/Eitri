@@ -39,7 +39,7 @@ function dispatch(payload: unknown) {
 const HELLO: Hello = {
   backend: "legacy",
   projectDir: "/home/user/project",
-  permissionModes: ["auto", "bypass"],
+  permissionModes: ["manual", "auto", "bypass"],
   resumableSessions: [],
   expectedVerdandiRevision: null,
   account: null,

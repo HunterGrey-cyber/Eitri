@@ -66,7 +66,8 @@ pub use event::{AgentEvent, PermissionSource};
 pub use external::{DirTrust, ExternalProvider, ExternalStart, Reviewer, TrustPlan, TurnPolicy};
 pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, UiWake, UI_EVENT_QUEUE_CAPACITY};
 pub use permission_policy::{
-    classify_permission_request, classify_with_rules, rule_that_allows, Classification, PermissionVerdict,
+    classify_in_manual, classify_permission_request, classify_with_rules, rule_that_allows, Classification,
+    PermissionVerdict,
 };
 pub use permission_rules::{PrefixRule, PrefixRules, RuleRefusal};
 pub use persistence::{resumable_sessions, NameUpdate, ResumableSession};

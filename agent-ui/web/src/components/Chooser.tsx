@@ -100,7 +100,7 @@ function tabNumber(tab: { tab: TabId; label: string }, info: TabInfo | null): nu
 
 /** Shows the mode and location for starting or resuming the current row above the keys.
  *  For open tabs, `tabModeRoute` determines what `Shift+Tab` can do from here.
- *  The mode key toggles auto and bypass, so the hint says "toggle".
+ *  The mode key cycles manual -> auto -> bypass, so the hint says "cycle".
  *  Uses "auto mode" in the full sentence rather than the shorter wording from `modePill`. */
 function modeLine(row: ChooserRow | undefined, active: TabInfo | null, defaultMode: PermissionModeChoice): ReactNode {
   // A filter with no matches leaves `row` undefined. Return no mode line instead of reading
@@ -110,7 +110,7 @@ function modeLine(row: ChooserRow | undefined, active: TabInfo | null, defaultMo
     const mode = row.info?.mode ?? "auto";
     const route = tabModeRoute(row, active);
     const tail =
-      route === "toggle" ? "(shift+tab to toggle)" : route === "ended" ? "· the session has ended" : "· switch to it to change";
+      route === "toggle" ? "(shift+tab to cycle)" : route === "ended" ? "· the session has ended" : "· switch to it to change";
     return (
       <>
         Tab {tabNumber(row.tab, row.info)} runs in <ModeGlyph mode={mode} /> {mode} mode on {tail}
@@ -121,21 +121,22 @@ function modeLine(row: ChooserRow | undefined, active: TabInfo | null, defaultMo
   const verb = row.kind === "new" ? "Start" : "Resume";
   return (
     <>
-      {verb} in <ModeGlyph mode={mode} /> {mode} mode on (shift+tab to toggle)
+      {verb} in <ModeGlyph mode={mode} /> {mode} mode on (shift+tab to cycle)
     </>
   );
 }
 
-/** What `Shift+Tab` on an open tab's row does, matching what Rust's
- *  `TabSet::cycle_mode` would do with it: leaving bypass works on any tab in any state; entering it
- *  is refused on an ended/failed tab (`modeKeyRoute`'s "fixed") and on a tab that is not the one on
- *  screen -- both said here instead of sending a
- *  command Rust would only refuse into a banner hidden under this overlay. */
+/** What `Shift+Tab` on an open tab's row does, matching what Rust's `TabSet::cycle_mode` would do
+ *  with it: leaving bypass works on any tab in any state; manual -> auto works on any tab whose session
+ *  has not ended, on screen or not, since it asks nothing; entering bypass is refused on an
+ *  ended/failed tab (`modeKeyRoute`'s "fixed") and on a tab that is not the one on screen ("tab N is
+ *  not the one on screen"), because only the tab on screen can show its question -- both said here
+ *  instead of sending a command Rust would only refuse into a banner hidden under this overlay. */
 function tabModeRoute(row: Extract<ChooserRow, { kind: "tab" }>, active: TabInfo | null): "toggle" | "ended" | "elsewhere" {
   const info = row.info;
   const route = modeKeyRoute({ confirmOpen: false, chooserOpen: false, tabState: info?.state ?? null, tabMode: info?.mode ?? null });
   if (route === "fixed") return "ended";
-  if (info?.mode === "bypass") return "toggle";
+  if (info?.mode === "bypass" || info?.mode === "manual") return "toggle";
   return active !== null && row.tab.tab === active.id ? "toggle" : "elsewhere";
 }
 

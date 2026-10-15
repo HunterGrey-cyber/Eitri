@@ -120,7 +120,7 @@ right after a reply arrives do not start HINT or open the box in the middle of a
 | `Ctrl+y` | approve the oldest card waiting in this tab (see [Answering a card](#answering-a-card)) |
 | `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back; `:q!` changes nothing unless you already saved the draft with `:w`, in which case the saved text comes back |
 | `Ctrl+o` | the detailed view (also in BROWSE) |
-| `Shift+Tab` | switch between Auto and Bypass; entering Bypass asks first, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks) |
+| `Shift+Tab` | cycle the tab's mode: Manual, Auto, Bypass, then Manual again (an agent with no Manual mode: Auto and Bypass); entering Bypass asks first, only from Auto, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks) |
 | `Esc` | stop typing and go back to BROWSE |
 | `?` | the list of keys, from an empty box |
 
@@ -185,7 +185,7 @@ After it, a short list of what can follow appears. These keys work in BROWSE.
 | `<leader>/` | search the conversation |
 | `<leader>i` | this tab's details |
 | `<leader>t` | continue this conversation in a terminal (Claude tabs; a Codex or registered agent's tab says it is not available yet) |
-| `<leader>m` | switch between Auto and Bypass (as `Shift+Tab`) |
+| `<leader>m` | cycle the tab's mode (as `Shift+Tab`) |
 | `<leader>k` | stop the commands a Codex tab left running in the background, which ends its session (it can be resumed), after a `y/n` question |
 | `<leader>?` | the list of keys |
 

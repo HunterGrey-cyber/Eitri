@@ -15,8 +15,30 @@ reviewer and trust question; they are described in [Codex and other agents](agen
 
 ## Who decides a tool call
 
-Every tool call Claude Code wants to run is sent to Eitri first, in both modes, before it runs. What happens
-next depends on the tab's mode (`Shift+Tab` switches it) and on how Claude Code is running.
+Every tool call Claude Code wants to run is sent to Eitri first, in every mode, before it runs. What happens
+next depends on the tab's mode and on how Claude Code is running. A tab is in one of three modes, and
+`Shift+Tab` (or `<leader>m`) cycles them in Claude Code's order: manual, auto, bypass, then manual again. A new
+tab starts in auto unless you set `agent.default_mode`
+([How a launch starts](configuration.md#how-a-launch-starts)).
+
+### Manual
+
+Manual is the strictest mode. Eitri's own rules answer every call, whatever Claude Code is running: the rules
+described under [Auto, when Claude Code is not running its auto mode](#auto-when-claude-code-is-not-running-its-auto-mode),
+with one difference: **every file edit or write made with Claude Code's file tools (`Write`, `Edit`,
+`NotebookEdit`) is a card**, inside the project too. Nothing is left to Claude Code's auto mode, so no row says
+`blocked by auto`. Reading and searching inside the project and read-only commands still run without asking,
+your [saved rules](#saved-rules) still apply (a shell command that writes is judged by its words, as in auto, so
+a rule that allows it still does), and Claude Code's own questions are treated as in auto
+([When Claude Code itself asks](#when-claude-code-itself-asks)).
+
+Measured against Eitri's own rules, manual is never more permissive than auto: it only turns some of what they
+allow into cards. Where Claude Code runs its own auto mode, an Auto tab does not use those rules: it leaves every
+call no saved rule allows to Claude Code's classifier, which may refuse it. A Manual tab answers those calls
+itself, so reading inside the project, read-only commands, subagents (`Task`, `Agent`), `ToolSearch` and
+`TodoWrite` run in manual without Claude Code's classifier seeing them (an approval from Eitri skips it), where
+in auto that classifier could have blocked one. Everything else Eitri's rules would put on a card is a card in
+manual too.
 
 ### Auto, when Claude Code runs its own auto mode
 
@@ -55,8 +77,8 @@ In bypass Eitri approves every call itself, without a card. That includes Claude
 tab an ask rule stops nothing. Because that is a lot of trust, `Shift+Tab` into bypass asks first. The question is
 a `y/n` that says what else changes: if cards are waiting in the tab it reads "Switch to bypass and approve the N
 waiting cards?", and every waiting card is counted. The `y` counts only when it is pressed on its own and a moment
-after the question appears, and only the cards still waiting at that moment are approved. Leaving bypass needs no
-question.
+after the question appears, and only the cards still waiting at that moment are approved. Bypass is entered only
+from auto. Leaving bypass needs no question and lands in manual.
 
 Starting in bypass without the question is possible only by saying so in advance, with
 `agent.default_mode = "bypass"` in your `init.lua`; see
@@ -73,9 +95,9 @@ ends that session with a message and answers nothing further in it.
 
 A permission card for a plain shell command can carry a third button, "Always allow `git log *` in this
 project". Pressing it saves a rule and answers the card. The button belongs to the cards Eitri's own checks
-draw. Where Claude Code runs its auto mode, which is the usual case, Eitri hands most calls to that mode instead
-of drawing a card, so you may rarely or never see the button; a rule then comes mainly from a session where
-Claude Code runs in its default mode, or from editing the rules file by hand.
+draw. Where Claude Code runs its auto mode, which is the usual case, an Auto tab hands most calls to that mode
+instead of drawing a card, so you may rarely see the button there; a rule then comes mainly from a Manual tab,
+a session where Claude Code runs in its default mode, or from editing the rules file by hand.
 
 - **What a rule looks like.** It is written the way Claude Code writes it, `Bash(git log *)`, and matches whole
   leading words: `cargo test *` allows `cargo test --release` but not `cargo testx`. Only `Bash` has rules; there
@@ -105,7 +127,7 @@ Claude Code runs in its default mode, or from editing the rules file by hand.
   rule allows every plainly readable command that starts with its words, including ones the button would have
   offered no rule for: with `cargo *` saved, `cargo -p helper run` runs without a card too. Save or write the
   narrowest rule that does the job.
-- **Where rules apply.** In an Auto tab, in both cases above. In bypass no rule is needed. A rule never
+- **Where rules apply.** In a Manual tab, and in an Auto tab in both cases above. In bypass no rule is needed. A rule never
   answers one of Claude Code's own questions (next section).
 - **Where they are stored.** Outside the project, one file per project under `~/.local/state/eitri/permissions/`
   (`$XDG_STATE_HOME/eitri/permissions/` when that is set). Eitri writes nothing into the project, unlike Claude
@@ -123,7 +145,7 @@ answered by a saved rule or handed to Claude Code's classifier.
 so under the question's label, for instance `your ask rule: Write — allowed in bypass`. Entering bypass approves
 the ones already waiting as well.
 
-**In an Auto tab it arrives as a card whose label says who asked.** These are always a card there:
+**In an Auto or Manual tab it arrives as a card whose label says who asked.** These are always a card there:
 
 - A question forced by a `permissions.ask` rule of yours that names a tool. The card says "your ask rule:" and
   the tool, for instance `your ask rule: Write`.
@@ -132,17 +154,17 @@ the ones already waiting as well.
   Eitri as a question with no reason, so Eitri cannot tell it from any other unexplained question and shows it.
 - A question of a kind this version of Eitri does not recognise.
 
-**A question that gives its reason** (the card says "Claude Code asked" and shows the sentence): in an Auto tab
-Eitri answers it only if you approved that same call, with that same input, on a card a moment before, and only
-once; otherwise it is a card. Because in an Auto
+**A question that gives its reason** (the card says "Claude Code asked" and shows the sentence): in an Auto or
+Manual tab Eitri answers it only if you approved that same call, with that same input, on a card a moment before,
+and only once; otherwise it is a card. Because in an Auto
 tab Claude Code's own auto mode normally decides, there is usually no earlier approval, so such a question is
-a card there. Where Claude Code's auto mode is running, its check on sensitive files (`.git/`, `.claude/`) does
+a card there; in a Manual tab you usually approved the call on Eitri's own card first. Where Claude Code's auto mode is running, its check on sensitive files (`.git/`, `.claude/`) does
 not ask at all and its classifier decides; the sensitive-file question appears when Claude Code runs in its
 default mode.
 
 One limit to know about: Eitri cannot tell Claude Code's own reason from a reason a hook gave. A hook of yours
 (or of a trusted project) that asks with a reason is treated like any other question with a reason, so in an
-Auto tab your approval of that same call on a card answers it too.
+Auto or Manual tab your approval of that same call on a card answers it too.
 
 ## Trusting a project
 
@@ -255,6 +277,8 @@ above is weaker than it may sound.
   project's, can rewrite a tool call's input after Eitri has seen the original. When Claude Code then asks, its
   card shows the rewritten input and the tool's row shows the original. Hooks work this way in a terminal too.
 - **In an Auto tab, Claude Code's auto mode can write under `.git/` without asking**, a new git hook included.
+  A Manual tab puts every `Write`, `Edit` and `NotebookEdit` call on a card, but not every write: a shell command
+  is judged by its words, so a saved rule such as `Bash(cp *)` still lets `cp x .git/hooks/pre-commit` run.
   Turn review does not show changes under `.git/`, and the trust question watches `.claude/`, `.mcp.json` and
   `CLAUDE.md`, not `.git/`. After a turn in a repository you care about, `ls .git/hooks` is worth a look. An
   edit under `.claude/` does make Eitri ask the trust question again before the next session.
@@ -264,5 +288,5 @@ above is weaker than it may sound.
   only through the hook's command text, as building the project is.
 - **Bypass answers your own ask rules too.** In a bypass tab a `permissions.ask` rule, yours or a trusted
   project's, stops nothing: Eitri answers the question it raises like any other.
-- **A reason is not proof of origin.** In an Auto tab, a question with a reason is answered on your approval of
+- **A reason is not proof of origin.** In an Auto or Manual tab, a question with a reason is answered on your approval of
   the same call, and Eitri cannot tell Claude Code's own check from a hook that asks with a reason.

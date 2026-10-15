@@ -14,9 +14,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
+/// A tab's permission mode, Eitri's own (the CLI under it never changes with it). `Manual` is the
+/// strictest: Eitri's policy answers every request and cards every file edit; `Auto` lets the
+/// policy (or, on a CLI running its own auto mode, the CLI's classifier) decide; `Bypass` answers
+/// everything `allow`. Declared in `Shift+Tab`'s order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionModeChoice {
+    Manual,
     Auto,
     Bypass,
 }
@@ -24,6 +29,7 @@ pub enum SessionModeChoice {
 impl From<SessionModeChoice> for PermissionMode {
     fn from(choice: SessionModeChoice) -> Self {
         match choice {
+            SessionModeChoice::Manual => PermissionMode::Manual,
             SessionModeChoice::Auto => PermissionMode::Auto,
             SessionModeChoice::Bypass => PermissionMode::Bypass,
         }
@@ -33,6 +39,7 @@ impl From<SessionModeChoice> for PermissionMode {
 impl SessionModeChoice {
     pub fn as_str(self) -> &'static str {
         match self {
+            SessionModeChoice::Manual => "manual",
             SessionModeChoice::Auto => "auto",
             SessionModeChoice::Bypass => "bypass",
         }
@@ -40,6 +47,7 @@ impl SessionModeChoice {
 
     pub fn parse(text: &str) -> Option<Self> {
         match text {
+            "manual" => Some(SessionModeChoice::Manual),
             "auto" => Some(SessionModeChoice::Auto),
             "bypass" => Some(SessionModeChoice::Bypass),
             _ => None,
@@ -47,12 +55,11 @@ impl SessionModeChoice {
     }
 
     /// The next of `offered` (in order), wrapping; a mode not in `offered` goes to the first one it
-    /// can parse. **Not what `Shift+Tab` does since v1 (O2 a):** that key is now a fixed
-    /// auto/bypass TOGGLE, frozen as such, and goes through `TabSet::cycle_mode`/
-    /// `cycle_default_mode`, which switch on the mode explicitly rather than calling this.
-    /// `agent_prefs::startup_mode`'s own "the first offered mode" default reads
-    /// `CLIENT_IMPLEMENTED_PERMISSION_MODES.first()` directly and does not call this either -- this
-    /// function has no production caller left; it is kept for its own tests, below.
+    /// can parse. **Not what `Shift+Tab` does:** `TabSet::cycle_mode`/`cycle_default_mode` switch on
+    /// the mode explicitly, because entering bypass is never a plain step (it asks first) and an
+    /// agent that offers no manual mode skips it. `agent_prefs::startup_mode` does not call this
+    /// either (new tabs start in Auto, not in the first offered mode) -- this function has no
+    /// production caller left; it is kept for its own tests, below.
     pub fn cycled(self, offered: &[&str]) -> Self {
         let modes: Vec<Self> = offered.iter().filter_map(|m| Self::parse(m)).collect();
         match modes.iter().position(|m| *m == self) {
@@ -199,9 +206,10 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
     },
-    /// `Shift+Tab`/`<leader>m` toggles any tab between `auto` and `bypass`. Entering bypass
-    /// requires `ModeCycle::Confirm`, answered by `confirm_bypass`; leaving bypass is
-    /// immediate.
+    /// `Shift+Tab`/`<leader>m` on any tab: cycles it manual -> auto -> bypass -> manual, Claude
+    /// Code's order (auto <-> bypass on a tab whose agent offers no manual mode). Entering bypass
+    /// always asks first (`ModeCycle::Confirm`, answered by `confirm_bypass`); every other step is
+    /// immediate (`TabSet::cycle_mode`).
     CycleMode {
         request_id: String,
         #[serde(default)]
@@ -371,10 +379,10 @@ pub enum InboundMessage {
         #[serde(default)]
         agent: Option<String>,
     },
-    /// `Shift+Tab` on the chooser's `New session` row or a record: the same auto/bypass
-    /// TOGGLE as `CycleMode`, applied to `TabSet::default_mode` (the window's remembered default for
-    /// new tabs) rather than any one tab's own `mode` -- `cycle_mode{tab}` toggles any tab's mode,
-    /// live or empty, not only a `NotStarted` one. Window-level for the same reason `TabVerb` is.
+    /// `Shift+Tab` on the chooser's `New session` row or a record: the same cycle as
+    /// `CycleMode`, applied to `TabSet::default_mode` (the window's remembered default for new tabs)
+    /// rather than any one tab's own `mode` -- `cycle_mode{tab}` cycles any tab's mode, live or
+    /// empty, not only a `NotStarted` one. Window-level for the same reason `TabVerb` is.
     CycleDefaultMode {
         request_id: String,
     },
@@ -5304,14 +5312,14 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_hello_keeps_its_real_two_mode_choice() {
+    fn the_legacy_hello_offers_its_three_modes() {
         let greeting = crate::agent_backend::BackendGreeting::for_kind(
             crate::agent_backend::BackendKind::Legacy,
             std::path::PathBuf::from("/tmp/project"),
         );
         let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
         assert_eq!(parsed["backend"], "legacy");
-        assert_eq!(parsed["permissionModes"], json!(["auto", "bypass"]));
+        assert_eq!(parsed["permissionModes"], json!(["manual", "auto", "bypass"]));
         assert_eq!(
             parsed["resumableSessions"],
             json!([]),
@@ -5465,6 +5473,30 @@ mod tests {
         assert_eq!(value["tabs"][1]["marker"], "ended");
         assert_eq!(value["tabs"][1]["name"], serde_json::Value::Null);
         assert_eq!(value["tabs"][1]["title"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_manual_tab_and_a_manual_default_are_sent_as_manual() {
+        let tabs = vec![TabView {
+            id: TabId(1),
+            number: 1,
+            label: "1 new".into(),
+            name: None,
+            state: TabStateWire::NotStarted,
+            mode: SessionModeChoice::Manual,
+            marker: None,
+            pending: 0,
+            resumable: false,
+            failure: None,
+            failed_after_start: false,
+            resumes_on_r: false,
+            title: None,
+            agent: "claude".into(),
+        }];
+        let value: Value =
+            serde_json::from_str(&serialize_tabs_for_js(TabId(1), &tabs, SessionModeChoice::Manual)).unwrap();
+        assert_eq!(value["defaultMode"], "manual");
+        assert_eq!(value["tabs"][0]["mode"], "manual");
     }
 
     #[test]

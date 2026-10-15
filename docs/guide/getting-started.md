@@ -36,7 +36,7 @@ account when one is configured, and a short menu:
 | `s` | restore the tabs the last window on this project had open (shown only when there are some) |
 | `r` | resume the most recent saved conversation (shown only when there is one) |
 | `w` | choose among every saved session |
-| `Shift+Tab` | switch between Auto and Bypass before you start |
+| `Shift+Tab` | cycle the mode (Manual, Auto, Bypass) before you start |
 | `?` | list all the keys |
 
 `Ctrl+h` and `Ctrl+l` move the keys between the editor and the panel.
@@ -92,7 +92,13 @@ A key answers a card only when it is pressed on its own: `a`, `d` and `D` do not
 pressed within about a quarter of a second before or after, and none of them takes a count. That is so the
 first letters of a sentence you are typing cannot answer a card by accident.
 
-**Auto and bypass.** Every tab is in one of two modes, and `Shift+Tab` switches (or `<leader>m`).
+**Manual, auto and bypass.** Every tab is in one of three modes, and `Shift+Tab` (or `<leader>m`) cycles them
+in Claude Code's order: manual, auto, bypass, then manual again.
+
+- **Manual** is the strictest. Eitri's own rules answer every call: reading inside the project and read-only
+  commands run, your saved rules still apply, and everything else is a card, every file edit and write
+  included. Nothing is left to Claude Code's own auto mode. Set `agent.default_mode` to `"manual"` in your
+  `init.lua` to start every tab in it.
 
 - **Auto** is the default. Eitri still sees every call. A call that one of your saved rules allows is approved
   at once. Everything else is left to Claude Code's own auto mode, which decides without a card; when it refuses
@@ -103,7 +109,7 @@ first letters of a sentence you are typing cannot answer a card by accident.
   questions alike, including those a `permissions.ask` rule of yours forces. Because bypass is a lot of trust,
   `Shift+Tab` into it asks first (a `y/n` question whose wording says what else changes, for instance how many
   waiting cards it would approve), and the `y` counts only when it is pressed alone and a moment after the
-  question appears. Leaving bypass needs no question.
+  question appears. Bypass is entered only from auto; leaving it needs no question and lands in manual.
 
 Exactly what each mode lets through, the saved rules, and how a project's own Claude Code configuration is
 trusted are in [Permissions](permissions.md).
@@ -138,7 +144,7 @@ names and modes, and which one was on screen. By default the empty tab offers th
 and `"off"` neither offers nor remembers; see [Configuration](configuration.md). A tab is skipped, and named
 in a short message, when its saved conversation is gone or another window holds it. A tab that was in bypass
 does not come back in bypass unasked: `s` asks (`n` brings it back in Auto), and an automatic restore brings
-it back in Auto and says so. The one exception is your own answer in advance: with `agent.default_mode` set to
+it back in Auto and says so. A tab that was in manual comes back in manual. The one exception is your own answer in advance: with `agent.default_mode` set to
 `"bypass"` in your `init.lua`, saved bypass tabs come back in bypass without a question.
 
 **Continuing in a real terminal.** Press `<leader>t` (or open `<prefix> i` and choose `Continue in a

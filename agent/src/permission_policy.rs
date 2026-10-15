@@ -61,6 +61,10 @@
 //! Bypass mode returns `allow` before `classify_with_rules`, so it never reaches this module.
 //! The CLI is spawned with `--permission-mode default`, and the `PreToolUse` hook still sees every call.
 //!
+//! Manual mode uses [`classify_in_manual`], which removes the edit fast path from [`classify_with_rules`].
+//! Every `Write`, `Edit` and `NotebookEdit` requires a card. This only changes allows into cards,
+//! so Manual is never more permissive than Auto. The conformance tests compare it with CLI `default`.
+//!
 //! Anything this module cannot classify with confidence requires a card. A mistaken allow can
 //! grant unwanted access; an unnecessary card costs a click.
 //! There is no shell parser. A `Bash` command with metacharacters that redirect, chain, glob,
@@ -375,6 +379,30 @@ pub fn classify_with_rules(
         return allow(REASON_ALLOWED_BY_A_PROJECT_RULE);
     }
     classify_permission_request(tool_name, input, project_root)
+}
+
+/// Why a file write or edit is a card in a Manual tab, wherever it points.
+pub const REASON_MANUAL_ASKS_BEFORE_EVERY_EDIT: &str = "manual mode asks before every file write or edit";
+
+/// The policy of a Manual tab: [`classify_with_rules`] with the acceptEdits fast path taken away, so
+/// every `Write`, `Edit` and `NotebookEdit` is a card, in the project or not. That is the CLI's own
+/// `default` mode, which asks before every edit; everything else -- the read-only list, the
+/// project-root boundary, every card the policy already draws, and the saved prefix rules -- is
+/// exactly what [`classify_with_rules`] answers.
+///
+/// Built on top of the Auto policy rather than beside it, so it can never allow a call Auto would
+/// card: it only turns allows into cards, never the other way. The edit tools are carded before
+/// anything else is consulted, so no rule could ever reach them here either.
+pub fn classify_in_manual(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    rules: &crate::permission_rules::PrefixRules,
+) -> Classification {
+    if EDIT_TOOLS.contains(&tool_name) {
+        return ask(REASON_MANUAL_ASKS_BEFORE_EVERY_EDIT);
+    }
+    classify_with_rules(tool_name, input, project_root, rules)
 }
 
 /// The rule [`classify_with_rules`] would answer this call with, in Claude Code's own syntax
@@ -4409,6 +4437,151 @@ mod tests {
             PermissionVerdict::AskTheUser,
             "the protected path still cards -- a rule cannot widen past it"
         );
+    }
+
+    // ---- Manual --------------------------------------------------------------------------------
+
+    /// Requests of every shape the policy judges: reads in and out of the project, read-only and
+    /// writing shell commands, a rule-shaped one, the edit tools in the project and on a protected
+    /// path, malformed input, an unknown tool, and the tools decided by name alone.
+    fn representative_requests(outside: &Outside) -> Vec<(&'static str, Value)> {
+        let secret = outside.secret().display().to_string();
+        vec![
+            ("Read", json!({ "file_path": "src/main.rs" })),
+            ("Read", json!({ "file_path": secret })),
+            ("Read", json!({})),
+            ("Grep", json!({ "pattern": "main" })),
+            ("Glob", json!({ "pattern": "**/*.rs" })),
+            ("Glob", json!({ "pattern": "/etc/*" })),
+            ("Bash", json!({ "command": "ls" })),
+            ("Bash", json!({ "command": "git status" })),
+            ("Bash", json!({ "command": "git log --oneline" })),
+            ("Bash", json!({ "command": "cargo test" })),
+            ("Bash", json!({ "command": "echo hi > out.txt" })),
+            ("Bash", json!({ "command": "ls", "dangerouslyDisableSandbox": true })),
+            ("Write", json!({ "file_path": "new.txt", "content": "x" })),
+            ("Write", json!({ "file_path": "src/main.rs", "content": "x" })),
+            ("Write", json!({ "file_path": secret, "content": "x" })),
+            (
+                "Write",
+                json!({ "file_path": ".vscode/settings.json", "content": "{}" }),
+            ),
+            (
+                "Edit",
+                json!({ "file_path": "src/main.rs", "old_string": "a", "new_string": "b" }),
+            ),
+            (
+                "Edit",
+                json!({ "file_path": ".git/config", "old_string": "a", "new_string": "b" }),
+            ),
+            ("NotebookEdit", json!({ "notebook_path": "n.ipynb", "new_source": "x" })),
+            ("MultiEdit", json!({ "file_path": "src/main.rs", "edits": [] })),
+            ("WebFetch", json!({ "url": "https://example.com" })),
+            ("WebSearch", json!({ "query": "x" })),
+            ("TodoWrite", json!({ "todos": [] })),
+            ("ToolSearch", json!({ "query": "select:Read" })),
+            ("SomeNewTool", json!({})),
+            ("Write", json!("not an object")),
+        ]
+    }
+
+    /// Manual is never more permissive than Auto: wherever Auto cards, Manual cards, with saved
+    /// rules and without.
+    #[test]
+    fn manual_never_allows_what_auto_cards() {
+        let ws = Workspace::new();
+        let outside = Outside::new();
+        for rules in [
+            PrefixRules::default(),
+            rules_for("cargo test"),
+            rules_for("git log --oneline"),
+        ] {
+            for (tool, input) in representative_requests(&outside) {
+                let auto = classify_with_rules(tool, &input, ws.path(), &rules);
+                let manual = classify_in_manual(tool, &input, ws.path(), &rules);
+                if auto.needs_a_human() {
+                    assert!(
+                        manual.needs_a_human(),
+                        "{tool} {input}: Auto cards ({}) but Manual allows ({})",
+                        auto.reason,
+                        manual.reason
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every file write or edit is a card in Manual, even the in-project ones Auto lets through.
+    #[test]
+    fn manual_cards_every_edit_even_in_the_project() {
+        let ws = Workspace::new();
+        for (tool, input) in [
+            ("Write", json!({ "file_path": "new.txt", "content": "x" })),
+            ("Write", json!({ "file_path": "src/main.rs", "content": "x" })),
+            (
+                "Edit",
+                json!({ "file_path": "src/main.rs", "old_string": "a", "new_string": "b" }),
+            ),
+            ("NotebookEdit", json!({ "notebook_path": "n.ipynb", "new_source": "x" })),
+        ] {
+            assert_eq!(
+                classify_with_rules(tool, &input, ws.path(), &PrefixRules::default()).verdict,
+                PermissionVerdict::AllowWithoutAsking,
+                "{tool} {input}: the fast path this test is about must allow it in Auto"
+            );
+            let manual = classify_in_manual(tool, &input, ws.path(), &rules_for("git log"));
+            assert_eq!(manual.verdict, PermissionVerdict::AskTheUser, "{tool} {input}");
+            assert_eq!(manual.reason, REASON_MANUAL_ASKS_BEFORE_EVERY_EDIT);
+        }
+    }
+
+    /// What Auto allows without a human other than an edit, Manual allows too: in-project reads,
+    /// read-only commands, the tools decided by name, and a call a saved rule answers.
+    #[test]
+    fn manual_answers_everything_else_as_auto_does() {
+        let ws = Workspace::new();
+        let outside = Outside::new();
+        let rules = rules_for("cargo test");
+        for (tool, input) in representative_requests(&outside) {
+            if EDIT_TOOLS.contains(&tool) {
+                continue;
+            }
+            assert_eq!(
+                classify_in_manual(tool, &input, ws.path(), &rules),
+                classify_with_rules(tool, &input, ws.path(), &rules),
+                "{tool} {input}"
+            );
+        }
+        for (tool, input) in [
+            ("Read", json!({ "file_path": "src/main.rs" })),
+            ("Bash", json!({ "command": "ls" })),
+            ("Bash", json!({ "command": "git status" })),
+            ("ToolSearch", json!({ "query": "select:Read" })),
+        ] {
+            assert_eq!(
+                classify_in_manual(tool, &input, ws.path(), &PrefixRules::default()).verdict,
+                PermissionVerdict::AllowWithoutAsking,
+                "{tool} {input}"
+            );
+        }
+        let by_rule = classify_in_manual("Bash", &json!({ "command": "cargo test" }), ws.path(), &rules);
+        assert_eq!(by_rule.verdict, PermissionVerdict::AllowWithoutAsking);
+        assert_eq!(by_rule.reason, REASON_ALLOWED_BY_A_PROJECT_RULE);
+    }
+
+    /// Only the file tools always card in Manual. A command that writes is judged by its words, as in
+    /// Auto, so a saved rule for it still answers, wherever the command writes: with `Bash(cp *)` saved,
+    /// a `cp` into `.git/hooks/` runs unasked. The guide's known limits say so; this keeps that true.
+    #[test]
+    fn a_saved_rule_still_answers_a_command_that_writes_in_manual() {
+        let ws = Workspace::new();
+        let cp = json!({ "command": "cp hook.sh .git/hooks/pre-commit" });
+        assert!(classify_in_manual("Bash", &cp, ws.path(), &PrefixRules::default()).needs_a_human());
+        let by_rule = classify_in_manual("Bash", &cp, ws.path(), &rules_for("cp"));
+        assert_eq!(by_rule.verdict, PermissionVerdict::AllowWithoutAsking);
+        assert_eq!(by_rule.reason, REASON_ALLOWED_BY_A_PROJECT_RULE);
+        let edit = json!({ "file_path": ".git/hooks/pre-commit", "content": "x" });
+        assert!(classify_in_manual("Write", &edit, ws.path(), &rules_for("cp")).needs_a_human());
     }
 
     // ---- Bash ----------------------------------------------------------------------------------

@@ -31,8 +31,8 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
  *  permissions on" because it answers waiting permission cards automatically. */
 export function modePill(mode: PermissionModeChoice, cycleOffered: boolean, short = false): string {
   if (short) return mode === "bypass" ? "⏵⏵ bypass permissions on" : `⏵⏵ ${mode}`;
-  // O2 (a): the key toggles auto and bypass, frozen as such -- "toggle", not Claude Code's "cycle".
-  return cycleOffered ? `⏵⏵ ${mode} on (shift+tab to toggle)` : `⏵⏵ ${mode} on`;
+  // The key cycles manual -> auto -> bypass, Claude Code's order and word.
+  return cycleOffered ? `⏵⏵ ${mode} on (shift+tab to cycle)` : `⏵⏵ ${mode} on`;
 }
 
 /** One glyph per marker. `working` has none: `TurnActivity`'s motion draws it. */

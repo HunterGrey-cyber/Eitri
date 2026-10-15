@@ -180,7 +180,9 @@ export type ResumableSession = {
   /** The tab's rename, kept on the record; the chooser shows it ahead of the title. */
   name?: string | null;
 };
-export type PermissionModeChoice = "auto" | "bypass";
+/** A tab's permission mode, Eitri's own (`SessionModeChoice` in Rust), in `Shift+Tab`'s order: manual
+ *  (Eitri's policy answers, every file edit asks), auto, bypass. */
+export type PermissionModeChoice = "manual" | "auto" | "bypass";
 
 /** The command that continues a conversation Eitri has just closed, in the user's own terminal.
  *

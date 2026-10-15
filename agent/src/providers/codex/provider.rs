@@ -31,7 +31,7 @@ use super::wire::{
     ThreadStartResponse, ThreadUnsubscribeParams, TurnInterruptParams, TurnNotification, TurnStartParams,
     TurnStartResponse, TurnStatus,
 };
-use crate::external::{ExternalProvider, ExternalStart, TurnPolicy, ANSWERED_BY_EITRI};
+use crate::external::{ExternalProvider, ExternalStart, Reviewer, TurnPolicy, ANSWERED_BY_EITRI};
 use crate::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, Pending, Skipped};
 use crate::projection::{ContentKind, PermissionOutcome, ResumeStatus, TurnEndDetail, TurnOutcome};
 use crate::provider::{
@@ -151,6 +151,9 @@ struct ActiveTurn {
     last_message: String,
     /// The thread's running token total as of the last report.
     usage: Option<wire::TokenUsage>,
+    /// The reviewer this turn's `turn/start` named; `None` for a turn a subagent opened while the tab was
+    /// idle, which Eitri did not start.
+    reviewer: Option<Reviewer>,
 }
 
 impl ActiveTurn {
@@ -168,6 +171,7 @@ impl ActiveTurn {
             settling: false,
             last_message: String::new(),
             usage: None,
+            reviewer: None,
         }
     }
 }
@@ -365,6 +369,11 @@ struct State {
     /// A `turn/start` got no answer in time and the user was told the turn did not start. Should Codex
     /// start it after all, it is interrupted at once.
     start_abandoned: bool,
+    /// The turns, by thread and turn id, that run under reviewer `user`: each one Eitri started naming it,
+    /// and each subagent turn that began inside one. Codex's own reviewer has no business in any of them;
+    /// a turn that started before (an Auto turn, or one Codex keeps running after an interrupt) is never
+    /// in here, so what its reviewer does later is not mistaken for this.
+    user_reviewed: HashSet<(String, String)>,
     /// Closed by the host.
     closed: bool,
     /// The child ended on its own, or was stopped.
@@ -1457,8 +1466,14 @@ impl CodexProvider {
             // Output is read from the finished item, which carries all of it.
             N::CommandOutputDelta(_) => {}
             // A review under way has nothing to say yet; its verdict is what the row needs.
-            N::AutoReviewStarted(_) => {}
-            N::AutoReviewCompleted(review) => self.on_auto_review(st, review),
+            N::AutoReviewStarted(review) => {
+                self.reviewer_not_honoured(st, &review, method::AUTO_REVIEW_STARTED);
+            }
+            N::AutoReviewCompleted(review) => {
+                if !self.reviewer_not_honoured(st, &review, method::AUTO_REVIEW_COMPLETED) {
+                    self.on_auto_review(st, review)
+                }
+            }
             N::McpStartupStatus(status) => {
                 if let Err(mismatch) = st.watch.mcp_started(&status.name) {
                     self.trip(st, mismatch);
@@ -1531,6 +1546,11 @@ impl CodexProvider {
     /// not be read, this is it. An interrupt the user asked for meanwhile goes out to it now.
     fn adopt_turn(&self, st: &mut State, thread_id: &str, turn_id: &str) {
         let adopted = st.family.as_mut().is_some_and(|f| f.adopt(thread_id, turn_id));
+        // A stand-in is followed only by the tab's turn that is running now, so the turn it turns out to be
+        // began inside that one.
+        if adopted {
+            Self::inherit_reviewer(st, thread_id, turn_id);
+        }
         if adopted && st.turn.as_ref().is_some_and(|t| t.interrupting) {
             self.send_interrupts(st);
         }
@@ -1602,6 +1622,38 @@ impl CodexProvider {
     }
 
     /// The id of the tab's running turn, which every event of a family turn is filed under.
+    /// A subagent's turn that begins inside a tab's turn started with reviewer `user` runs under it too.
+    fn inherit_reviewer(st: &mut State, thread: &str, turn: &str) {
+        let inside_user_turn = st
+            .turn
+            .as_ref()
+            .is_some_and(|t| t.id.is_some() && t.reviewer == Some(Reviewer::User));
+        if inside_user_turn && !is_tab(st, thread) && turn != UNREAD_TURN {
+            st.user_reviewed.insert((thread.to_string(), turn.to_string()));
+        }
+    }
+
+    /// Codex's own reviewer took up a request in a turn that runs under reviewer `user`: the reviewer the
+    /// turn's start named was not honoured, so what the tab's mode says about who decides is not true. The
+    /// session is failed like any other policy difference. A review in a turn that began under Codex's
+    /// reviewer (an Auto turn still winding down) is that turn's business and passes.
+    fn reviewer_not_honoured(&self, st: &mut State, review: &wire::AutoReviewNotification, method: &str) -> bool {
+        if !st
+            .user_reviewed
+            .contains(&(review.thread_id.clone(), review.turn_id.clone()))
+        {
+            return false;
+        }
+        self.trip(
+            st,
+            PolicyMismatch {
+                requested: "approvalsReviewer \"user\" for this turn".to_string(),
+                reported: format!("Codex's own reviewer took up a request in it ({method})"),
+            },
+        );
+        true
+    }
+
     fn tab_turn_id(st: &State) -> Option<String> {
         st.turn.as_ref().and_then(|t| t.id.clone())
     }
@@ -1621,6 +1673,7 @@ impl CodexProvider {
     /// `turn` of member `thread` is running: it joins the tab's turn, or opens one when the tab is idle. An
     /// interrupt the user asked for that this turn missed goes out to it now.
     fn join_family_turn(&self, st: &mut State, thread: &str, turn: String) {
+        Self::inherit_reviewer(st, thread, &turn);
         let edge = match st.family.as_mut() {
             Some(family) => family.turn_started(thread, &turn),
             None => return,
@@ -2741,7 +2794,9 @@ impl ExternalProvider for CodexProvider {
             // Sent under the same lock as the check above: the pump cannot fold a tripwire in between.
             let params = to_json(&TurnStartParams::new(req.session_id.clone(), req.text, policy.reviewer))?;
             let pending = self.request(method::TURN_START, params)?;
-            st.turn = Some(ActiveTurn::new(None));
+            let mut turn = ActiveTurn::new(None);
+            turn.reviewer = Some(policy.reviewer);
+            st.turn = Some(turn);
             (req.session_id.clone(), pending)
         };
         // The user is told the turn did not start, so one Codex starts after all is not left running.
@@ -2773,6 +2828,9 @@ impl ExternalProvider for CodexProvider {
         let turn_id = started.turn.id;
         let mut st = lock(&self.state);
         st.start_abandoned = false;
+        if policy.reviewer == Reviewer::User {
+            st.user_reviewed.insert((thread_id.clone(), turn_id.clone()));
+        }
         let wanted = match st.turn.as_mut() {
             Some(turn) => {
                 turn.id = Some(turn_id.clone());

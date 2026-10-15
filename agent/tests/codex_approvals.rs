@@ -68,6 +68,19 @@ fn policy(reviewer: Reviewer) -> TurnPolicy {
 
 /// A started session on `thread` with one turn `turn` running, then `rest`.
 fn running(thread: &str, turn: &str, reviewer: Reviewer, rest: Vec<Value>) -> Arc<CodexProvider> {
+    running_under(thread, turn, reviewer, reviewer, rest)
+}
+
+/// As `running`, the thread started under `thread_reviewer` and its turn under `turn_reviewer`: a tab whose
+/// mode changed between its start and its turn.
+fn running_under(
+    thread: &str,
+    turn: &str,
+    thread_reviewer: Reviewer,
+    turn_reviewer: Reviewer,
+    rest: Vec<Value>,
+) -> Arc<CodexProvider> {
+    let reviewer = thread_reviewer;
     let mut script = handshake();
     script.push(expect_request(3, "thread/start"));
     script.push(write(json!({"id": 3, "result": {
@@ -105,7 +118,7 @@ fn running(thread: &str, turn: &str, reviewer: Reviewer, rest: Vec<Value>) -> Ar
                 session_id: thread.to_string(),
                 text: "go".into(),
             },
-            policy(reviewer),
+            policy(turn_reviewer),
         )
         .expect("the turn starts");
     provider
@@ -587,6 +600,161 @@ fn the_reviewers_verdict_is_a_note_on_the_reviewed_call() {
     assert!(events.iter().any(
         |e| matches!(e, AgentDomainEvent::ToolCallCompleted { tool_use_id, is_error: false, .. } if *tool_use_id == net)
     ));
+}
+
+fn mismatches(events: &[AgentDomainEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::PolicyMismatch { requested, reported } => Some(format!("{requested} | {reported}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A tab started in Auto and moved to Manual (or Bypass) starts its turn naming reviewer `user` on a thread
+/// whose own reviewer is Codex's. Should Codex's reviewer take up a request in that turn all the same, the
+/// turn's reviewer was not honoured and the tab's mode would be a lie: the session fails as on any other
+/// policy difference, the verdict is not shown as a decision, and no further turn starts.
+#[test]
+fn codex_reviewing_in_a_turn_started_with_reviewer_user_trips() {
+    let command = |c: &str| json!({"type": "command", "source": "shell", "command": c, "cwd": "/work/proj"});
+    let provider = running_under(
+        "th-r",
+        "tu-u",
+        Reviewer::Agent,
+        Reviewer::User,
+        vec![
+            item_started("th-r", "tu-u", command_item("exec-x", "touch /etc/x")),
+            review(
+                "item/autoApprovalReview/started",
+                "tu-u",
+                "rv1",
+                Some("exec-x"),
+                "inProgress",
+                None,
+                command("touch /etc/x"),
+            ),
+            review(
+                "item/autoApprovalReview/completed",
+                "tu-u",
+                "rv1",
+                Some("exec-x"),
+                "approved",
+                Some("looks fine"),
+                command("touch /etc/x"),
+            ),
+            turn_completed("th-r", "tu-u", "completed"),
+        ],
+    );
+    let events = until_turn_completed(&provider);
+    let tripped = mismatches(&events);
+    assert_eq!(tripped.len(), 1, "one tripwire, on the review's start: {events:#?}");
+    assert!(
+        tripped[0].contains("\"user\"") && tripped[0].contains("item/autoApprovalReview/started"),
+        "{tripped:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::PermissionDenied { reason_type: Some(kind), .. } if kind.starts_with("auto_review")
+        )),
+        "a verdict from a reviewer that should not have acted is not shown as one: {events:#?}"
+    );
+    let next = provider.send_turn_with(
+        SendTurnRequest {
+            session_id: "th-r".into(),
+            text: "again".into(),
+        },
+        policy(Reviewer::User),
+    );
+    assert!(next.is_err(), "a tripped session starts no turn: {next:?}");
+}
+
+/// Only the completed review is enough: Codex need not announce the review first.
+#[test]
+fn a_completed_review_alone_in_a_user_turn_trips() {
+    let provider = running_under(
+        "th-r",
+        "tu-u2",
+        Reviewer::Agent,
+        Reviewer::User,
+        vec![
+            review(
+                "item/autoApprovalReview/completed",
+                "tu-u2",
+                "rv1",
+                None,
+                "denied",
+                None,
+                json!({"type": "networkAccess", "host": "example.org", "protocol": "https"}),
+            ),
+            turn_completed("th-r", "tu-u2", "completed"),
+        ],
+    );
+    let events = until_turn_completed(&provider);
+    let tripped = mismatches(&events);
+    assert_eq!(tripped.len(), 1, "{events:#?}");
+    assert!(tripped[0].contains("item/autoApprovalReview/completed"), "{tripped:?}");
+}
+
+/// The reviewer is judged per turn: a review Codex reports late for an Auto turn (it ended, or was
+/// interrupted, before the tab moved to Manual) belongs to that turn and does not trip the Manual turn
+/// that follows it, nor does a review in an Auto turn on a thread that started under reviewer `user`.
+#[test]
+fn a_review_belonging_to_an_earlier_auto_turn_does_not_trip() {
+    let command = |c: &str| json!({"type": "command", "source": "shell", "command": c, "cwd": "/work/proj"});
+    let provider = running_under(
+        "th-r",
+        "tu-a",
+        Reviewer::User,
+        Reviewer::Agent,
+        vec![
+            item_started("th-r", "tu-a", command_item("exec-a", "cargo build")),
+            review(
+                "item/autoApprovalReview/started",
+                "tu-a",
+                "rv1",
+                Some("exec-a"),
+                "inProgress",
+                None,
+                command("cargo build"),
+            ),
+            turn_completed("th-r", "tu-a", "completed"),
+            expect_request(5, "turn/start"),
+            write(json!({"id": 5, "result": {"turn": {
+                "id": "tu-m", "items": [], "itemsView": "notLoaded", "status": "inProgress", "error": null,
+            }}})),
+            // The Auto turn's review, reported once the Manual turn is under way.
+            review(
+                "item/autoApprovalReview/completed",
+                "tu-a",
+                "rv1",
+                Some("exec-a"),
+                "approved",
+                Some("builds the project"),
+                command("cargo build"),
+            ),
+            turn_completed("th-r", "tu-m", "completed"),
+        ],
+    );
+    let first = until_turn_completed(&provider);
+    assert!(mismatches(&first).is_empty(), "{first:#?}");
+    let turn = provider
+        .send_turn_with(
+            SendTurnRequest {
+                session_id: "th-r".into(),
+                text: "now in manual".into(),
+            },
+            policy(Reviewer::User),
+        )
+        .expect("the Manual turn starts");
+    assert_eq!(turn, "tu-m");
+    let second = until_turn_completed(&provider);
+    assert!(
+        mismatches(&second).is_empty(),
+        "a review of the earlier Auto turn tripped the Manual one: {second:#?}"
+    );
 }
 
 #[test]

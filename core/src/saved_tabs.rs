@@ -590,6 +590,28 @@ mod tests {
         assert!(value["tabs"][1].get("name").is_none(), "no rename, no key");
     }
 
+    /// A tab saved in manual is written as the word `manual` and read back as manual.
+    #[test]
+    fn a_manual_tab_is_saved_as_manual_and_read_back() {
+        let saved = SavedTabs {
+            tabs: vec![tab("m", None, SessionModeChoice::Manual)],
+            active: 0,
+            external_tabs: vec![SavedExternalTab {
+                agent: AgentId::Codex,
+                conversation_id: "c".to_string(),
+                provider_session_id: "x".to_string(),
+                name: None,
+                mode: SessionModeChoice::Manual,
+            }],
+            active_external: None,
+        };
+        let text = encode(&saved, &root());
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["tabs"][0]["mode"], "manual");
+        assert_eq!(value["external_tabs"][0]["mode"], "manual");
+        assert_eq!(decode(&text, &root()).unwrap(), saved);
+    }
+
     #[test]
     fn a_wrong_version_another_projects_file_or_a_broken_one_cannot_be_decoded() {
         let text = encode(&two(), &root());

@@ -49,6 +49,9 @@
 //! on legacy the CLI refuses the call headlessly with the hook's reason and no prompt arrives. The
 //! hook goes in the trusted project tier so the test never edits the user's own settings file.
 //!
+//! Test 8 is Manual mode on a sidecar whose CLI runs its own `auto`: a real in-project `Write` must be
+//! the gate's own card, neither answered by the host nor deferred. Passed on CLI 2.1.293.
+//!
 //! **A run that did not exercise what a test is about fails as INCONCLUSIVE**: test 1b needs exactly
 //! five Reads each paired with its own resolution by id; test 3 needs an `Agent`/`Task` call and, for
 //! a `Write` card, proof from the CLI's own transcript that a subagent made it; test 5 counts a trip
@@ -1604,10 +1607,14 @@ fn protected_paths_under_default_with_hook_allow() {
         bypass_trace.assert_target_writes_were_gated(rel, ran, rel);
     }
 
-    // Leaving bypass returns this session to Auto immediately.
+    // Leaving bypass moves this session to Manual immediately; the next press moves it to Auto.
+    match set.cycle_mode(tab).unwrap() {
+        ModeCycle::Changed(SessionModeChoice::Manual) => {}
+        other => panic!("leaving bypass moves at once, to manual, got {other:?}"),
+    }
     match set.cycle_mode(tab).unwrap() {
         ModeCycle::Changed(SessionModeChoice::Auto) => {}
-        other => panic!("leaving bypass moves at once, got {other:?}"),
+        other => panic!("manual -> auto moves at once, got {other:?}"),
     }
     let rel = ".git/probe2";
     let target = dir.join(rel);
@@ -2397,8 +2404,12 @@ fn bypass_approves_the_waiting_card(
     );
 
     match set.cycle_mode(tab).unwrap() {
+        ModeCycle::Changed(SessionModeChoice::Manual) => {}
+        other => panic!("leaving bypass moves at once, to manual, got {other:?}"),
+    }
+    match set.cycle_mode(tab).unwrap() {
         ModeCycle::Changed(SessionModeChoice::Auto) => {}
-        other => panic!("leaving bypass moves at once, got {other:?}"),
+        other => panic!("manual -> auto moves at once, got {other:?}"),
     }
     assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Auto);
 
@@ -2647,6 +2658,103 @@ fn a_hook_that_asks_in_an_auto_tab_sidecar() {
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn a_hook_that_asks_in_an_auto_tab_legacy() {
     user_hook_ask_in_an_auto_tab(BackendKind::Legacy, "hook-ask-legacy");
+}
+
+/// Test 8 (manual mode, 2026-10-14): on a sidecar session whose CLI runs its own `auto`, a Manual tab
+/// defers nothing. A real in-project `Write` -- which an Auto tab there leaves to the CLI's classifier,
+/// with no card -- reaches the panel as the gate's own card, no host answer is a deferral, and the
+/// write is denied on the card and never lands. A session that did not get the CLI's auto mode
+/// decides nothing about deferral and fails as INCONCLUSIVE.
+#[test]
+#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
+fn a_manual_tab_cards_an_in_project_write_on_a_cli_auto_session() {
+    let dir = project("manual-write");
+    let mut set = LiveSet(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual));
+    let tab = set.active();
+    assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Manual);
+    let backend = AgentBackend::start(
+        BackendKind::Sidecar,
+        &dir,
+        None,
+        agent::setting_sources::ProjectTrust::Trusted,
+    )
+    .map_err(|e| e.message)
+    .expect("a session starts; is this running under a test-account wrapper?");
+    assert!(
+        backend.capabilities().cli_auto_mode,
+        "INCONCLUSIVE: this sidecar does not run the CLI's own auto mode, so there is no deferral to refuse"
+    );
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let rel = "manual.txt";
+    set.get_mut(tab)
+        .unwrap()
+        .live_mut()
+        .unwrap()
+        .send_turn(
+            &format!(
+                "Use the Write tool to create the file at the exact relative path {rel} with the exact content \
+                 MANUAL and nothing else. Do not use any other tool."
+            ),
+            "manual-write",
+        )
+        .map_err(|e| e.message)
+        .unwrap();
+    let card = wait_for_the_card_for(&mut set, &dir, tab, rel, "the manual write's card");
+    assert!(
+        set.get(tab).unwrap().live().unwrap().projection().cli_runs_auto(),
+        "INCONCLUSIVE: the CLI did not report its own auto mode, so a card here proves nothing about deferral"
+    );
+    assert!(
+        card.prompt.is_none(),
+        "the card is the gate's own request, not a prompt of the CLI's: {:?}",
+        card.prompt
+    );
+    let deferred: Vec<String> = set
+        .get(tab)
+        .unwrap()
+        .gate_answers()
+        .iter()
+        .filter(|answer| answer.deferred)
+        .map(|answer| format!("{} {}", answer.tool_name, answer.permission_id))
+        .collect();
+    assert!(deferred.is_empty(), "a Manual tab deferred to the CLI: {deferred:?}");
+    // Deny it, and every later card of the turn (a model often tries again after a refusal).
+    let _ = set.get_mut(tab).unwrap().live_mut().unwrap().respond_permission(
+        &card.permission_id,
+        PermissionDecision::Deny {
+            reason: Some("manual-mode probe".into()),
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let out = set.pump(&dir, true);
+        for event in events_from_payload(out.active_payload.as_deref()) {
+            if event["type"] == "permission_requested" {
+                if let Some(id) = event["permission_id"].as_str() {
+                    let _ = set.get_mut(tab).unwrap().live_mut().unwrap().respond_permission(
+                        id,
+                        PermissionDecision::Deny {
+                            reason: Some("manual-mode probe".into()),
+                        },
+                    );
+                }
+            }
+        }
+        if !set.get(tab).unwrap().turn_running() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the denied turn never ended");
+        std::thread::sleep(Duration::from_millis(33));
+    }
+    let deferred = set
+        .get(tab)
+        .unwrap()
+        .gate_answers()
+        .iter()
+        .filter(|a| a.deferred)
+        .count();
+    assert_eq!(deferred, 0, "nothing of the turn was deferred");
+    assert!(!dir.join(rel).exists(), "the write denied on its card never landed");
 }
 
 /// The evidence rules, on synthetic events: these run in a plain `cargo test`, no Claude involved. Each

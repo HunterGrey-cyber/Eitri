@@ -136,22 +136,19 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
     }
 
     // Whether the launch offers the last window's tabs back (`agent.restore`: "offer", the default,
-    // "auto" or "off"), and the mode new tabs start in (`agent.default_mode`: "auto" or "bypass").
+    // "auto" or "off"), and the mode new tabs start in (`agent.default_mode`: "manual", "auto" or
+    // "bypass"; unset is auto).
     // Anything else is a startup failure naming the key, like `agent.font_size` above. Naming bypass
     // here is the one way a window starts in bypass without asking, because the answer is in a file
     // the user wrote.
     let restore_policy = eitri_core::tab_restore::RestorePolicy::parse(
         kernel.config.borrow().get(eitri_core::tab_restore::RESTORE_KEY),
     )?;
+    // What new tabs start in is logged by `set_default_mode`, which knows whether a remembered
+    // choice for this project beats this key.
     let default_mode = eitri_core::agent_prefs::parse_default_mode(
         kernel.config.borrow().get(eitri_core::agent_prefs::DEFAULT_MODE_KEY),
     )?;
-    if let Some(mode) = default_mode {
-        eprintln!(
-            "[agent] new tabs start in {} (init.lua's agent.default_mode)",
-            mode.as_str()
-        );
-    }
 
     // The agent a new tab runs (`agent.default`: "claude", the default, "codex" or a name
     // `eitri.agent.register` accepted) and where the `codex` binary is (`agent.codex.command`, beaten by

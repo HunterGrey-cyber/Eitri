@@ -881,7 +881,7 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Ctrl+y", what: "Approve the oldest card waiting in this tab (the band names it); only a lone Ctrl+y answers" },
   { keys: "Ctrl+g", what: "Edit this in nvim (:wq brings it back, :q! changes nothing)" },
   { keys: "Ctrl+o", what: "Detailed view" },
-  { keys: "Shift+Tab", what: "Toggle auto ⇄ bypass (entering bypass asks first)" },
+  { keys: "Shift+Tab", what: "Cycle manual → auto → bypass (entering bypass asks first)" },
   { keys: "Esc", what: "Stop typing (back to browsing)" },
   { keys: "?", what: "This list, from an empty box" },
 ];

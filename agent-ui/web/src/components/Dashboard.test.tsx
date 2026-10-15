@@ -10,7 +10,7 @@ afterEach(cleanup);
 const HELLO: Hello = {
   backend: "sidecar",
   projectDir: "/home/user/Documents/eitri",
-  permissionModes: ["auto", "bypass"],
+  permissionModes: ["manual", "auto", "bypass"],
   resumableSessions: [],
   expectedVerdandiRevision: "28a5e4c",
   account: "work",
@@ -29,7 +29,7 @@ function session(over: Partial<ResumableSession> = {}): ResumableSession {
 }
 
 function renderDash(
-  over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void; prefix?: string; editorLink?: EditorLink | null } = {},
+  over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void; prefix?: string; editorLink?: EditorLink | null; agent?: string | null } = {},
 ) {
   const onItem = over.onItem ?? vi.fn();
   const props = {
@@ -40,6 +40,7 @@ function renderDash(
     onItem,
     prefix: over.prefix ?? "Ctrl+b",
     editorLink: over.editorLink ?? null,
+    agent: over.agent ?? null,
   };
   return { onItem, ...render(<Dashboard {...props} />) };
 }
@@ -112,7 +113,8 @@ describe("Dashboard: the restore line", () => {
 describe("MODE_CONSEQUENCE", () => {
   /** Auto's text describes the acceptEdits fast path used by this build's policy. The bypass text
    *  is unchanged. */
-  it("says what auto and bypass actually do", () => {
+  it("says what manual, auto and bypass actually do", () => {
+    expect(MODE_CONSEQUENCE.manual).toBe("Safe reads run; every edit and anything else asks.");
     expect(MODE_CONSEQUENCE.auto).toBe("Edits in this project and safe reads run; anything else asks.");
     expect(MODE_CONSEQUENCE.bypass).toBe("Nothing asks: edits and commands run unasked.");
   });
@@ -175,6 +177,18 @@ describe("Dashboard", () => {
     bypass.getByText("Nothing asks: edits and commands run unasked.");
     const unknown = renderDash({ mode: "future-mode" as PermissionModeChoice });
     expect(unknown.container.querySelector(".dash-consequence")).toBeNull();
+  });
+
+  it("draws Mode: manual with its own quiet glyph and says every edit asks", () => {
+    const { container, getByText } = renderDash({ mode: "manual" });
+    getByText(/Mode: manual/);
+    expect(container.querySelector(".mode-glyph")!.getAttribute("data-mode-name")).toBe("manual");
+    getByText("Safe reads run; every edit and anything else asks.");
+  });
+
+  it("on another agent's tab, manual says what reaches Eitri and where the rest is described", () => {
+    const { getByText } = renderDash({ mode: "manual", agent: "codex" });
+    getByText("Every request codex makes asks; what it runs without asking is in Ctrl+b i.");
   });
 
   it("marks the item under cursor with aria-current, and nothing else", () => {

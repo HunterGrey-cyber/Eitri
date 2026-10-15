@@ -217,19 +217,19 @@ describe("Chooser", () => {
     const { root, container } = renderChooser({ defaultMode: "auto" });
     const line = () => container.querySelector(".chooser-mode-line")!.textContent;
     // cursor starts on New session
-    expect(line()).toBe("Start in ⏵⏵ auto mode on (shift+tab to toggle)");
+    expect(line()).toBe("Start in ⏵⏵ auto mode on (shift+tab to cycle)");
     fireEvent.keyDown(root, { key: "j" }); // tab 1, auto, not the active tab (active: null)
     expect(line()).toBe("Tab 1 runs in ⏵⏵ auto mode on · switch to it to change");
     fireEvent.keyDown(root, { key: "j" }); // tab 2, bypass: leaving works from anywhere
-    expect(line()).toBe("Tab 2 runs in ⏵⏵ bypass mode on (shift+tab to toggle)");
+    expect(line()).toBe("Tab 2 runs in ⏵⏵ bypass mode on (shift+tab to cycle)");
     fireEvent.keyDown(root, { key: "j" });
     fireEvent.keyDown(root, { key: "j" }); // a record
-    expect(line()).toBe("Resume in ⏵⏵ auto mode on (shift+tab to toggle)");
+    expect(line()).toBe("Resume in ⏵⏵ auto mode on (shift+tab to cycle)");
   });
 
   it("the active tab's own row offers the toggle", () => {
     const { container } = renderChooser({ active: 1 }); // starts on the active tab's row
-    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("Tab 1 runs in ⏵⏵ auto mode on (shift+tab to toggle)");
+    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("Tab 1 runs in ⏵⏵ auto mode on (shift+tab to cycle)");
   });
 
   it("an ended auto tab's row says it has ended, and Shift+Tab there flashes r rather than asking Rust", () => {
@@ -254,6 +254,25 @@ describe("Chooser", () => {
     fireEvent.keyDown(root, { key: "j" }); // tab 2: bypass, which can always be left
     fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
     expect(props.onCycleTabMode).toHaveBeenCalledWith(2);
+  });
+
+  it("a manual tab that is not the one on screen moves to auto from its row, as Rust moves it; an ended one does not", () => {
+    const manual: TabInfo = { ...TAB1, mode: "manual" };
+    const { root, container, props } = renderChooser({ tabs: [manual, TAB2] });
+    const line = () => container.querySelector(".chooser-mode-line")!.textContent;
+    fireEvent.keyDown(root, { key: "j" }); // tab 1: manual, and not the one on screen
+    expect(line()).toBe("Tab 1 runs in ⏵⏵ manual mode on (shift+tab to cycle)");
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    expect(props.onCycleTabMode).toHaveBeenCalledWith(1);
+
+    const ended: TabInfo = { ...TAB1, mode: "manual", state: "ended" };
+    const second = renderChooser({ tabs: [ended, TAB2] });
+    fireEvent.keyDown(second.root, { key: "j" });
+    expect(second.container.querySelector(".chooser-mode-line")!.textContent).toBe(
+      "Tab 1 runs in ⏵⏵ manual mode on · the session has ended",
+    );
+    fireEvent.keyDown(second.root, { key: "Tab", shiftKey: true });
+    expect(second.props.onCycleTabMode).not.toHaveBeenCalled();
   });
 
   it("Shift+Tab on the active tab's own row toggles it (entering bypass: Rust asks, answered in here)", () => {

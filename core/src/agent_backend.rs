@@ -137,6 +137,33 @@ impl AgentId {
         !matches!(self, AgentId::Claude)
     }
 
+    /// Whether the agent's own permission mode is set once, when its session starts, and cannot
+    /// follow a change of the tab's mode: an ACP agent's (`set_mode` is sent at the start only).
+    /// Claude's CLI never changes its mode either, but Eitri answers every request it raises, and
+    /// Codex's reviewer follows the tab's mode at the next turn.
+    pub fn mode_fixed_at_start(&self) -> bool {
+        matches!(self, AgentId::Acp(_))
+    }
+
+    /// The permission modes a tab of this agent offers, in `Shift+Tab`'s order.
+    pub fn permission_modes(&self) -> &'static [&'static str] {
+        if self.mode_fixed_at_start() {
+            MODES_OF_AN_AGENT_FIXED_AT_START
+        } else {
+            CLIENT_IMPLEMENTED_PERMISSION_MODES
+        }
+    }
+
+    /// `mode` if this agent offers it, else the mode a tab of it takes instead: only Manual can be
+    /// missing, and Auto stands in for it (the start screen says so when that happens).
+    pub fn offered_mode(&self, mode: SessionModeChoice) -> SessionModeChoice {
+        if self.permission_modes().contains(&mode.as_str()) {
+            mode
+        } else {
+            SessionModeChoice::Auto
+        }
+    }
+
     /// How a person reads it: `Claude`, `Codex`, or the ACP agent's own name.
     pub fn label(&self) -> String {
         match self {
@@ -169,12 +196,13 @@ pub enum ExternalLaunch {
 }
 
 /// The policy a turn of an external agent runs under, from the tab's mode: in Auto the agent's own
-/// reviewer decides what still needs asking, in Bypass every request reaches Eitri, which answers it.
+/// reviewer decides what still needs asking; in Manual and Bypass every request reaches Eitri, which
+/// shows each one as a card in Manual and answers it in Bypass.
 pub fn turn_policy(mode: SessionModeChoice) -> TurnPolicy {
     TurnPolicy {
         reviewer: match mode {
             SessionModeChoice::Auto => Reviewer::Agent,
-            SessionModeChoice::Bypass => Reviewer::User,
+            SessionModeChoice::Manual | SessionModeChoice::Bypass => Reviewer::User,
         },
     }
 }
@@ -1025,74 +1053,71 @@ impl AgentBackend {
         }
     }
 
-    /// Answers permission requests that need no human and returns the events the UI should see.
-    /// Both backends gate every tool call with `PreToolUse`, so the UI's permission policy is
-    /// applied here before deciding whether to show a card.
+    /// Answers each `PermissionRequested` that needs no human and returns the events the UI should see.
+    /// Both backends install a `PreToolUse` gate matching `*`. Policy is applied here so a gate request
+    /// can be answered without asking the user. The CLI stays gated in every application mode.
     ///
-    /// Successfully answered requests are hidden from the UI. `ToolCallStarted` and
-    /// `ToolCallCompleted` still show what ran. If sending an answer fails, the request is
-    /// delivered so the user can resolve it instead of leaving an invisible pending request.
+    /// An answered request is omitted from delivery, while `ToolCallStarted` and `ToolCallCompleted`
+    /// still show what ran. If sending the answer fails, the request is delivered so the user can act.
     ///
-    /// `Bypass` allows gate requests before classification. The CLI remains gated, using
-    /// `--permission-mode default` with a hook or the sidecar's INTERACTIVE mode.
-    /// The caller supplies `Tab::mode` on every pump; this function stores no mode of its own.
-    /// An id already in `host_answered` is dropped without another answer or a card.
+    /// `Bypass` answers every request `Allow` before classification. `mode` comes from the caller's
+    /// `Tab::mode` on every pump. An id already in `host_answered` is dropped without another answer.
     ///
-    /// Nothing is answered after `UngatedCliMode`, whether it arrives in this batch or is
-    /// already in the projection. `TabSet::pump` closes the session and thereby denies pending
-    /// requests, so no automatic grant is sent to a session that must be closed.
+    /// Nothing is answered after `UngatedCliMode`, whether it occurs in this batch or was already
+    /// folded into the projection. `TabSet::pump` closes that session and denies unanswered requests.
     ///
-    /// The legacy backend's synchronous resolution is hidden with the answered request.
-    /// The sidecar's `PermissionResolved` arrives on a later pump and is delivered even when
-    /// its request was hidden. Removing pending permissions by id makes this harmless.
+    /// The legacy backend's synchronous resolution is omitted too. A sidecar `PermissionResolved`
+    /// can arrive on a later pump for an id the frontend never saw. Filtering `pendingPermissions`
+    /// by that id is a no-op. `TabSet::pump` also excludes `host_answered` ids from resync snapshots
+    /// and the attention tray through `SnapshotView::of` and `AttentionTracker::resync`, so answered
+    /// requests cannot reappear as cards.
     ///
-    /// `host_answered` also keeps answered requests out of resync snapshots and the attention
-    /// tray through `TabSet::pump`, `SnapshotView::of`, and `AttentionTracker::resync`.
-    /// This prevents an answered request from reappearing as a card.
+    /// The CLI's own prompts (`provider_prompt: Some`) are checked separately before classification.
+    /// They can follow a gate allow for checks that a hook allow or saved prefix rule cannot silence.
+    /// `Bypass` allows them all, including prompts forced by `permissions.ask`, prompts of unknown
+    /// kinds and prompts with no reason. In `Auto`, an approval must match the call's id, tool and
+    /// input, and is consumed once. Otherwise the prompt becomes a card. A prompt that
+    /// `needs_its_own_card` becomes a card in `Auto` even with a matching approval: this includes
+    /// user-forced ask rules, unknown kinds and prompts with no reason.
+    /// Prompts answered without a card enter `answered_for_you` with their row notes.
     ///
-    /// The CLI's own prompts (`provider_prompt: Some`) are handled before gate requests.
-    /// They can ask for checks, such as sensitive files, that a hook allowance or session
-    /// rule does not silence. These prompts bypass the classifier and saved prefix rules.
-    /// `Bypass` allows all such prompts, including forced asks, unknown kinds and prompts
-    /// with no reason. In `Auto`, a prompt requires an approval matching its id, tool and
-    /// input, which is consumed when used. Otherwise a card is shown. A prompt marked
-    /// `needs_its_own_card` requires a card in `Auto` even with a matching approval: it was
-    /// forced by the user's ask rule, has an unknown kind, or gives no reason for asking.
-    /// A content-scoped ask rule can also give no reason.
-    /// Each prompt answered without a card is added to `answered_for_you` with its row note.
+    /// After `respond_permission` succeeds, a `Write`, `Edit` or `NotebookEdit` allowed by the
+    /// acceptEdits fast path enters `answered_for_you.by_the_fast_path` by tool-use id. The entry
+    /// also keeps `(tool_name, input)` because a later CLI prompt for that call can have an empty id.
+    /// The absence of a card cannot identify a fast-path answer: input validation may have failed
+    /// before any hook ran, the request may lack an id, or bypass may have answered the gate.
+    /// A request with no tool-use id is answered normally but leaves no row note.
     ///
-    /// After `respond_permission` succeeds, a `Write`, `Edit` or `NotebookEdit` allowed by
-    /// the classifier is added to `answered_for_you.by_the_fast_path` by tool-use id.
-    /// Only the acceptEdits fast path allows these tools under the classifier; saved prefix
-    /// rules do not apply to them. The entry includes `(tool_name, input)` because a later
-    /// card can lack a tool-use id, preventing removal by id alone. Requests without a
-    /// tool-use id are still answered but have no row note.
+    /// A `Write` allowed by the fast path or bypass is checked for an existing `file_path` just
+    /// before sending `allow`, while the CLI cannot have written it yet. A new-file call enters
+    /// `answered_for_you.creates_file`. `note_new_files` sees only delivered cards, so it cannot
+    /// supply this information for these answers.
     ///
-    /// File existence at `file_path` is checked just before allowing a `Write`, before the
-    /// CLI can write it. A write to a missing file is added to `answered_for_you.creates_file`
-    /// in both the fast path and bypass. `note_new_files` only sees delivered cards, so it
-    /// cannot detect files created by these automatic answers.
+    /// `classify_with_rules` checks `agent::rule_that_allows` first. A reason of
+    /// `REASON_ALLOWED_BY_A_PROJECT_RULE` identifies a saved prefix rule as the source of the allow.
+    /// The rule's display string is fetched again and stored in `answered_for_you.by_rule` after
+    /// `respond_permission` succeeds. This entry also keeps the tool-use id and `(tool_name, input)`
+    /// to match later prompts with no id. A rule matching `ToolCallStarted` is insufficient evidence
+    /// of an answer: validation can fail before the gate, or bypass can answer instead.
     ///
-    /// `classify_with_rules` checks `agent::rule_that_allows` first.
-    /// `REASON_ALLOWED_BY_A_PROJECT_RULE` identifies a saved prefix rule allowance.
-    /// After a successful answer, the rule's display string and `(tool_name, input)` are
-    /// stored in `answered_for_you.by_rule` by tool-use id. The arguments let a later card
-    /// remove the candidate even when that card lacks a tool-use id.
-    /// These notes track actual answers: the absence of a card alone can also mean input
-    /// validation failed before the hook ran, the request had no tool-use id, or bypass
-    /// answered the gate instead of the classifier or saved rule.
+    /// In `Auto`, a session that requested CLI auto mode and reports `AgentSessionProjection::cli_runs_auto`
+    /// uses a saved prefix rule when one allows the request, with the limits of `agent::rule_that_allows`.
+    /// Otherwise the answer is `PermissionDecision::Defer`: the CLI's classifier decides, with no card
+    /// or application classifier. The sidecar must offer both `cli_auto_mode` and `permission_defer`.
+    /// A refusal returns as `AgentDomainEvent::PermissionDenied` and the call's error result.
+    /// A failed deferral is delivered as a card, like any failed answer.
     ///
-    /// When the session requested CLI auto mode, the sidecar offered `cli_auto_mode` and
-    /// `permission_defer`, and `AgentSessionProjection::cli_runs_auto` is true, `Auto`
-    /// allows gate requests matched by `agent::rule_that_allows` and otherwise sends
-    /// `PermissionDecision::Defer`. The local classifier is skipped and the CLI's classifier
-    /// decides without a card. A refusal produces `AgentDomainEvent::PermissionDenied` and
-    /// the call's error result. A failed deferral is delivered as a card.
-    /// The projection is read before each request because ingestion can fold a trip or
-    /// fallback during the batch. A fallback to `default` restores local classification;
-    /// a trip stops answers. CLI prompts and bypass keep their behavior.
+    /// The projection is read before each request because ingestion continues folding during the batch.
+    /// A fallback to `default` stops deferral for the next request, and an ungated-mode report stops
+    /// answering altogether. The CLI's own prompts and bypass keep their separate handling.
+    /// Sessions that did not request CLI auto mode, or fell back to `default`, use the classifier.
     ///
-    /// Each event keeps its fold revision from `take_revised_ui_delivery`.
+    /// `Manual` never defers or uses the fast path. `agent::classify_in_manual` cards every file write
+    /// or edit and otherwise uses the Auto classifier with saved rules, regardless of the CLI mode.
+    /// CLI prompts are handled as in `Auto`, and external agent requests always become cards.
+    /// `Manual` is never more permissive than `Auto`.
+    ///
+    /// Each retained event keeps its fold revision from `take_revised_ui_delivery`.
     /// Dropping an event also drops its revision.
     fn answer_what_needs_no_human(
         &mut self,
@@ -1137,7 +1162,10 @@ impl AgentBackend {
                 (session_tripped(&projection), projection.cli_runs_auto())
             };
             tripped |= projection_tripped;
-            let defers_to_the_cli = self.capabilities().cli_auto_mode && cli_reports_auto;
+            // Only an Auto tab leaves anything to the CLI's classifier: Manual is Eitri's policy
+            // alone, whatever the CLI runs under it.
+            let defers_to_the_cli =
+                mode == PermissionMode::Auto && self.capabilities().cli_auto_mode && cli_reports_auto;
             if tripped {
                 eprintln!("[permission] not answering {tool_name}: the agent reported a policy it was not asked for");
                 kept.push((revision, event));
@@ -1145,12 +1173,12 @@ impl AgentBackend {
             }
             if matches!(self, AgentBackend::External(_)) {
                 // An external agent's requests are judged by nobody here. In Auto its own reviewer has
-                // already passed on what it let through, so what reaches Eitri is the user's to answer;
-                // in Bypass every one is allowed (the requests its provider declines itself never
-                // arrive). Eitri's classifier and the saved prefix rules are about Claude's tools and
-                // are never consulted.
-                if mode == PermissionMode::Auto {
-                    eprintln!("[permission] asking the user: {tool_name} (the agent's own reviewer passed it on)");
+                // already passed on what it let through, and in Manual nothing reviewed it, so what
+                // reaches Eitri is the user's to answer; in Bypass every one is allowed (the requests
+                // its provider declines itself never arrive). Eitri's classifier and the saved prefix
+                // rules are about Claude's tools and are never consulted.
+                if mode != PermissionMode::Bypass {
+                    eprintln!("[permission] asking the user: {tool_name} (the agent asked)");
                     kept.push((revision, event));
                     continue;
                 }
@@ -1199,8 +1227,10 @@ impl AgentBackend {
                 let allow_because = match mode {
                     // Every prompt, whatever it says about why it asked.
                     PermissionMode::Bypass => Ok("in bypass"),
-                    PermissionMode::Auto if prompt.needs_its_own_card() => Err(prompt.label()),
-                    PermissionMode::Auto => approvals
+                    // Manual treats the CLI's own prompts as Auto does: never allowed by a rule,
+                    // never deferred, allowed only for a call the user approved on its card.
+                    PermissionMode::Auto | PermissionMode::Manual if prompt.needs_its_own_card() => Err(prompt.label()),
+                    PermissionMode::Auto | PermissionMode::Manual => approvals
                         .matches(tool_use_id.as_deref(), tool_name, input)
                         .then_some("with your approval")
                         .ok_or_else(|| prompt.reason.clone().unwrap_or_else(|| "no reason given".to_string())),
@@ -1346,7 +1376,11 @@ impl AgentBackend {
                 }
                 continue;
             }
-            let classification = agent::classify_with_rules(tool_name, input, project_root, rules);
+            let classification = if mode == PermissionMode::Manual {
+                agent::classify_in_manual(tool_name, input, project_root, rules)
+            } else {
+                agent::classify_with_rules(tool_name, input, project_root, rules)
+            };
             if classification.needs_a_human() {
                 // The other half of the line below, added 2026-09-19 (later) because its absence
                 // cost a diagnosis: auto mode was still a wall of popups, and
@@ -1368,7 +1402,7 @@ impl AgentBackend {
             let call_id = named_call(tool_use_id);
             let fast_path = call_id
                 .clone()
-                .filter(|_| ACCEPT_EDITS_TOOLS.contains(&tool_name.as_str()))
+                .filter(|_| mode == PermissionMode::Auto && ACCEPT_EDITS_TOOLS.contains(&tool_name.as_str()))
                 .map(|id| FastPathAnsweredForYou {
                     tool_use_id: id,
                     tool_name: tool_name.clone(),
@@ -1766,8 +1800,17 @@ fn write_over_no_file(tool_name: &str, input: &serde_json::Value, project_root: 
 /// just pointed inward.
 ///
 /// `verdandi_rules` is absent because it is confirmed to behave identically to `interactive` in the
-/// current sidecar. A third button that does nothing different is a worse lie than a missing one.
-pub const CLIENT_IMPLEMENTED_PERMISSION_MODES: &[&str] = &["auto", "bypass"];
+/// current sidecar. A button that does nothing different is a worse lie than a missing one.
+///
+/// In `Shift+Tab`'s order, which is Claude Code's. The first is NOT the mode a new tab starts in:
+/// that is Auto unless `init.lua` says otherwise (`agent_prefs::startup_mode`).
+pub const CLIENT_IMPLEMENTED_PERMISSION_MODES: &[&str] = &["manual", "auto", "bypass"];
+
+/// The modes a tab offers when its agent's own permission mode is set once, at the start of its
+/// session, and cannot follow the tab's mode afterwards (an ACP agent). Manual would promise a
+/// stricter agent than Eitri can make it, so it is not offered there; Auto and Bypass are Eitri's
+/// own answers and need nothing of the agent.
+pub const MODES_OF_AN_AGENT_FIXED_AT_START: &[&str] = &["auto", "bypass"];
 
 /// Whether THIS CLIENT can drive a resume for a backend kind, before any provider exists.
 ///
@@ -2153,6 +2196,7 @@ mod tests {
     fn every_offered_mode_is_one_the_legacy_capabilities_actually_claim() {
         for mode in CLIENT_IMPLEMENTED_PERMISSION_MODES {
             let _: PermissionMode = match *mode {
+                "manual" => PermissionMode::Manual,
                 "auto" => PermissionMode::Auto,
                 "bypass" => PermissionMode::Bypass,
                 other => panic!("offered permission mode {other:?} has no PermissionMode to map to"),
@@ -2187,7 +2231,30 @@ mod tests {
         // interactive gate; legacy needs no CLI bypass mode. Those capabilities are also
         // asserted beside the constant.
         let modes: Vec<&str> = greeting.permission_modes.to_vec();
-        assert_eq!(modes, vec!["auto", "bypass"]);
+        assert_eq!(modes, vec!["manual", "auto", "bypass"]);
+    }
+
+    /// Modes are offered by what the agent can honour: an agent whose own mode is set once at the
+    /// start (ACP) is offered no Manual, and a Manual default gives one of its tabs Auto.
+    #[test]
+    fn an_agent_whose_mode_is_fixed_at_start_offers_no_manual() {
+        for agent in [AgentId::Claude, AgentId::Codex] {
+            assert_eq!(agent.permission_modes(), &["manual", "auto", "bypass"], "{agent:?}");
+            assert_eq!(agent.offered_mode(SessionModeChoice::Manual), SessionModeChoice::Manual);
+        }
+        let acp = AgentId::Acp("gem".into());
+        assert_eq!(acp.permission_modes(), &["auto", "bypass"]);
+        assert_eq!(acp.offered_mode(SessionModeChoice::Manual), SessionModeChoice::Auto);
+        assert_eq!(acp.offered_mode(SessionModeChoice::Bypass), SessionModeChoice::Bypass);
+        assert_eq!(acp.offered_mode(SessionModeChoice::Auto), SessionModeChoice::Auto);
+    }
+
+    /// Manual gives Codex's reviewer to the user, as Bypass does: every escalation reaches Eitri.
+    #[test]
+    fn a_manual_turn_hands_codex_reviews_to_the_user() {
+        assert_eq!(turn_policy(SessionModeChoice::Manual).reviewer, Reviewer::User);
+        assert_eq!(turn_policy(SessionModeChoice::Auto).reviewer, Reviewer::Agent);
+        assert_eq!(turn_policy(SessionModeChoice::Bypass).reviewer, Reviewer::User);
     }
 
     #[test]
@@ -4598,6 +4665,247 @@ mod tests {
             backend.shutdown();
         }
     }
+
+    // ---- Manual: Eitri's policy alone, every edit a card ----------------------------------------
+
+    /// The gate requests of a manual table: an in-project read, a read-only and a rule-matched
+    /// command, a command on no list, a force push, an in-project write and edit, and a write on a
+    /// protected path.
+    fn manual_gates() -> Vec<AgentDomainEvent> {
+        vec![
+            gate(
+                "perm-read",
+                "tu-r",
+                "Read",
+                serde_json::json!({ "file_path": "main.rs" }),
+            ),
+            gate("perm-ls", "tu-l", "Bash", serde_json::json!({ "command": "ls" })),
+            gate(
+                "perm-rule",
+                "tu-t",
+                "Bash",
+                serde_json::json!({ "command": "cargo test" }),
+            ),
+            gate(
+                "perm-build",
+                "tu-b",
+                "Bash",
+                serde_json::json!({ "command": "cargo build" }),
+            ),
+            gate(
+                "perm-push",
+                "tu-p",
+                "Bash",
+                serde_json::json!({ "command": "git push --force origin main" }),
+            ),
+            gate(
+                "perm-write",
+                "tu-w",
+                "Write",
+                serde_json::json!({ "file_path": "new.txt", "content": "x" }),
+            ),
+            gate(
+                "perm-edit",
+                "tu-e",
+                "Edit",
+                serde_json::json!({ "file_path": "main.rs", "old_string": "main", "new_string": "start" }),
+            ),
+            gate("perm-git", "tu-g", "Write", probe_write()),
+        ]
+    }
+
+    fn cargo_test_rule() -> agent::PrefixRules {
+        agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(cargo test *)").unwrap())
+    }
+
+    /// On a session whose CLI runs its own auto mode, a Manual tab defers nothing: Eitri's policy
+    /// answers, in-project reads and read-only commands run, a saved rule still allows, and every
+    /// edit is a card (no deferral, no fast path).
+    #[test]
+    fn a_manual_tab_on_an_auto_session_defers_nothing_and_cards_every_edit() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        let mut batch = vec![cli_reports("auto")];
+        batch.extend(manual_gates());
+        provider.queue_all(batch);
+        let mut host_answered = BTreeSet::new();
+        let (delivered, answered) = deliver_noting(
+            &mut backend,
+            &dir,
+            &cargo_test_rule(),
+            PermissionMode::Manual,
+            &mut host_answered,
+            &mut HumanApprovals::default(),
+        );
+        assert_eq!(
+            provider.decisions(),
+            vec![
+                ("perm-read".to_string(), PermissionDecision::Allow),
+                ("perm-ls".to_string(), PermissionDecision::Allow),
+                ("perm-rule".to_string(), PermissionDecision::Allow),
+            ],
+            "nothing deferred, nothing else allowed"
+        );
+        for id in ["perm-build", "perm-push", "perm-write", "perm-edit", "perm-git"] {
+            assert!(carded(&delivered, id), "{id}: {delivered:?}");
+        }
+        assert!(answered.gate_answers.iter().all(|a| !a.deferred));
+        assert!(answered.by_the_fast_path.is_empty(), "no edit was let through");
+        assert_eq!(answered.by_rule.len(), 1, "the saved rule says so on its row");
+        backend.shutdown();
+    }
+
+    /// Manual is never more permissive than Auto, on a CLI-auto session and on a `default` one alike:
+    /// every request Auto cards, Manual cards (and allows only what Auto allowed or deferred); and
+    /// every edit Auto lets through, Manual cards.
+    #[test]
+    fn manual_never_answers_what_auto_leaves_to_a_human() {
+        let dir = a_workspace_holding_one_file();
+        for auto_session in [false, true] {
+            let run = |mode: PermissionMode| {
+                let (provider, mut backend) = if auto_session {
+                    auto_backend(&dir)
+                } else {
+                    sidecar_backend(&dir)
+                };
+                let mut batch = if auto_session {
+                    vec![cli_reports("auto")]
+                } else {
+                    vec![]
+                };
+                batch.extend(manual_gates());
+                provider.queue_all(batch);
+                let (delivered, _) = deliver_noting(
+                    &mut backend,
+                    &dir,
+                    &cargo_test_rule(),
+                    mode,
+                    &mut BTreeSet::new(),
+                    &mut HumanApprovals::default(),
+                );
+                let decisions = provider.decisions();
+                backend.shutdown();
+                (delivered, decisions)
+            };
+            let (auto_cards, auto_decisions) = run(PermissionMode::Auto);
+            let (manual_cards, manual_decisions) = run(PermissionMode::Manual);
+            for gate in manual_gates() {
+                let AgentDomainEvent::PermissionRequested { permission_id: id, .. } = gate else {
+                    unreachable!()
+                };
+                // Auto either allowed it or left it to the CLI's classifier, which may allow it:
+                // either way not a card. Manual may allow only such a request.
+                let auto_answered = auto_decisions.iter().any(|(answered, _)| *answered == id);
+                let manual_allowed = manual_decisions.contains(&(id.clone(), PermissionDecision::Allow));
+                assert!(
+                    !manual_allowed || auto_answered,
+                    "{id} (auto session {auto_session}): Manual allowed what Auto put to a human"
+                );
+                if carded(&auto_cards, &id) {
+                    assert!(carded(&manual_cards, &id), "{id} (auto session {auto_session})");
+                }
+            }
+            assert!(
+                manual_decisions.iter().all(|(_, d)| *d == PermissionDecision::Allow),
+                "Manual never defers: {manual_decisions:?}"
+            );
+            for id in ["perm-write", "perm-edit"] {
+                assert!(carded(&manual_cards, id), "{id} (auto session {auto_session})");
+            }
+            if !auto_session {
+                assert!(
+                    auto_decisions.contains(&("perm-write".to_string(), PermissionDecision::Allow)),
+                    "the premise: Auto's fast path allows the in-project write on a `default` session"
+                );
+            }
+        }
+    }
+
+    /// The CLI's own prompts in Manual are answered as in Auto: a card unless the user approved that
+    /// same call, and a card even then when the prompt needs one of its own. Never deferred.
+    #[test]
+    fn in_manual_the_clis_own_prompt_is_answered_as_in_auto() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        provider.queue(cli_reports("auto"));
+        provider.queue(provider_prompt(
+            "perm-unapproved",
+            Some("tu-other"),
+            "Write",
+            probe_write(),
+            None,
+        ));
+        provider.queue(provider_prompt(
+            "perm-approved",
+            Some("tu-ok"),
+            "Write",
+            probe_write(),
+            None,
+        ));
+        provider.queue(provider_prompt(
+            "perm-ask-rule",
+            Some("tu-rule"),
+            "Write",
+            probe_write(),
+            Some("Write(.git/**)"),
+        ));
+        let mut approvals = HumanApprovals::default();
+        approvals.record("tu-ok", "Write", &probe_write());
+        approvals.record("tu-rule", "Write", &probe_write());
+        let (delivered, answered) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Manual,
+            &mut BTreeSet::new(),
+            &mut approvals,
+        );
+        assert!(carded(&delivered, "perm-unapproved"), "{delivered:?}");
+        assert!(carded(&delivered, "perm-ask-rule"), "{delivered:?}");
+        assert!(!carded(&delivered, "perm-approved"), "{delivered:?}");
+        assert_eq!(
+            provider.decisions(),
+            vec![("perm-approved".to_string(), PermissionDecision::Allow)]
+        );
+        assert_eq!(answered.prompts.len(), 1);
+        assert!(
+            answered.prompts[0].note.ends_with("allowed with your approval"),
+            "{:?}",
+            answered.prompts
+        );
+        backend.shutdown();
+    }
+
+    /// A tripped session answers nothing in Manual either.
+    #[test]
+    fn a_tripped_session_answers_nothing_in_manual() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        provider.queue_all(vec![
+            cli_reports("auto"),
+            AgentDomainEvent::UngatedCliMode {
+                reported: "acceptEdits".into(),
+                detail: "SessionReady".into(),
+            },
+            gate(
+                "perm-read",
+                "tu-r",
+                "Read",
+                serde_json::json!({ "file_path": "main.rs" }),
+            ),
+        ]);
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Manual,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert!(provider.decisions().is_empty(), "{:?}", provider.decisions());
+        assert!(carded(&delivered, "perm-read"), "{delivered:?}");
+        backend.shutdown();
+    }
 }
 
 /// An external agent's tab: how its requests are answered, and what it offers to continue.
@@ -4713,6 +5021,35 @@ mod external_tests {
             vec![("b1".to_string(), PermissionDecision::Allow)]
         );
         assert!(answered.contains("b1"));
+        backend.shutdown();
+    }
+
+    /// Manual on an external tab cards every request, as Auto does; Eitri answers none.
+    #[test]
+    fn external_tab_manual_cards_every_request() {
+        let dir = workspace("external-manual");
+        let (provider, mut backend) = codex_backend(&dir);
+        provider.inner.queue(request(
+            "m1",
+            "commandExecution",
+            serde_json::json!({ "command": "ls" }),
+        ));
+        provider.inner.queue(request(
+            "m2",
+            "fileChange",
+            serde_json::json!({ "changes": [{ "path": "main.rs" }] }),
+        ));
+        let mut answered = BTreeSet::new();
+        let delivered = deliver(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(ls *)").unwrap()),
+            PermissionMode::Manual,
+            &mut answered,
+        );
+        assert!(carded(&delivered, "m1") && carded(&delivered, "m2"), "{delivered:?}");
+        assert!(provider.inner.decisions().is_empty());
+        assert!(answered.is_empty());
         backend.shutdown();
     }
 

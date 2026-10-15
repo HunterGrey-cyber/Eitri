@@ -96,17 +96,17 @@ pub fn set_aside(dir: &Path, project_root: &Path) -> std::io::Result<PathBuf> {
     Ok(aside)
 }
 
-/// The `init.lua` key: `eitri.config.set("agent.default_mode", "auto" | "bypass")`.
+/// The `init.lua` key: `eitri.config.set("agent.default_mode", "manual" | "auto" | "bypass")`.
 pub const DEFAULT_MODE_KEY: &str = "agent.default_mode";
 
 /// The value of [`DEFAULT_MODE_KEY`] as `init.lua` left it: `None` for unset (new tabs start in
-/// auto, as ever), else the mode named. Anything but the two words is an error naming the key, as
+/// auto, as ever), else the mode named. Anything but the three words is an error naming the key, as
 /// every other configuration key here is.
 pub fn parse_default_mode(value: Option<&str>) -> Result<Option<SessionModeChoice>, String> {
     let Some(raw) = value else { return Ok(None) };
-    SessionModeChoice::parse(raw.trim())
-        .map(Some)
-        .ok_or_else(|| format!("eitri.config.set(\"{DEFAULT_MODE_KEY}\", {raw:?}): must be \"auto\" or \"bypass\""))
+    SessionModeChoice::parse(raw.trim()).map(Some).ok_or_else(|| {
+        format!("eitri.config.set(\"{DEFAULT_MODE_KEY}\", {raw:?}): must be \"manual\", \"auto\" or \"bypass\"")
+    })
 }
 
 /// The `init.lua` key: `eitri.config.set("agent.user_settings", true | false)`.
@@ -241,24 +241,31 @@ pub fn check_codex_env(value: Option<&OsStr>, is_file: impl Fn(&Path) -> bool) -
 }
 
 /// Whether this project has a remembered choice of mode that the configured default must not
-/// override: a readable file that says `auto` (the only thing [`save_mode`] writes, once Shift+Tab
-/// has left bypass). A file from before v1 that says bypass is not a choice anyone is still making,
-/// and a missing or unusable one says nothing.
+/// override: a readable file that says `manual` or `auto` (what [`save_mode`] writes when Shift+Tab
+/// moves an empty tab out of a mode). A file from before v1 that says bypass is not a choice anyone
+/// is still making, and a missing or unusable one says nothing.
 pub fn remembers_a_choice(dir: Option<&Path>, project_root: &Path) -> bool {
-    dir.is_some_and(|dir| load_mode(dir, project_root) == LoadedMode::Remembered(SessionModeChoice::Auto))
+    dir.is_some_and(|dir| {
+        matches!(
+            load_mode(dir, project_root),
+            LoadedMode::Remembered(SessionModeChoice::Manual | SessionModeChoice::Auto)
+        )
+    })
 }
 
+/// The mode new tabs take at launch when nothing is remembered and `init.lua` names none: Auto.
+/// Deliberately not the first of `CLIENT_IMPLEMENTED_PERMISSION_MODES`, which lists the modes in
+/// `Shift+Tab`'s order and begins with manual.
+pub const STARTUP_DEFAULT: SessionModeChoice = SessionModeChoice::Auto;
+
 /// The mode new tabs take at launch, and what to log. `dir` is `None` when there is no state
-/// directory at all. The first mode `CLIENT_IMPLEMENTED_PERMISSION_MODES` offers is the default.
+/// directory at all. With nothing usable remembered it is [`STARTUP_DEFAULT`].
 pub fn startup_mode(dir: Option<&Path>, project_root: &Path) -> (SessionModeChoice, Vec<String>) {
-    let default = crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES
-        .first()
-        .and_then(|m| SessionModeChoice::parse(m))
-        .unwrap_or(SessionModeChoice::Auto);
+    let default = STARTUP_DEFAULT;
     let Some(dir) = dir else {
         return (
             default,
-            vec!["[agent] no state directory: new tabs start in the first mode".to_string()],
+            vec!["[agent] no state directory: new tabs start in auto".to_string()],
         );
     };
     match load_mode(dir, project_root) {
@@ -276,7 +283,7 @@ pub fn startup_mode(dir: Option<&Path>, project_root: &Path) -> (SessionModeChoi
         LoadedMode::Missing => (default, Vec::new()),
         LoadedMode::Unusable(why) => {
             let mut notes = vec![format!(
-                "[agent] the remembered mode is unusable ({why}); starting in the first mode"
+                "[agent] the remembered mode is unusable ({why}); starting in auto"
             )];
             match set_aside(dir, project_root) {
                 Ok(aside) => notes.push(format!("[agent] set aside as {}", aside.display())),
@@ -470,7 +477,7 @@ mod tests {
         std::fs::write(dir.join(crate::layout::persist::file_name(&root())), "{ not json").unwrap();
         assert!(matches!(load_mode(&dir, &root()), LoadedMode::Unusable(_)));
         let (mode, notes) = startup_mode(Some(&dir), &root());
-        assert_eq!(mode, SessionModeChoice::Auto, "read as nothing: the first offered mode");
+        assert_eq!(mode, SessionModeChoice::Auto, "read as nothing: the startup default");
         assert!(notes.iter().any(|n| n.contains("unusable")), "{notes:?}");
         assert!(dir
             .join(format!("{}.unusable", crate::layout::persist::file_name(&root())))
@@ -490,15 +497,47 @@ mod tests {
     }
 
     #[test]
-    fn with_no_state_directory_new_tabs_start_in_the_first_offered_mode() {
+    fn with_no_state_directory_new_tabs_start_in_auto() {
         assert_eq!(startup_mode(None, &root()).0, SessionModeChoice::Auto);
+    }
+
+    /// Manual is listed first for `Shift+Tab`'s order, and must not become the startup default by
+    /// being first.
+    #[test]
+    fn manual_first_in_the_offer_does_not_make_it_the_startup_default() {
+        assert_eq!(
+            crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES.first(),
+            Some(&"manual")
+        );
+        assert_eq!(STARTUP_DEFAULT, SessionModeChoice::Auto);
+        assert_eq!(startup_mode(None, &root()).0, SessionModeChoice::Auto);
+        let dir = scratch("nothing-remembered");
+        assert_eq!(startup_mode(Some(&dir), &root()).0, SessionModeChoice::Auto);
+    }
+
+    /// A remembered manual is a choice the configured default does not override, and the launch
+    /// starts in it.
+    #[test]
+    fn a_remembered_manual_is_kept() {
+        let dir = scratch("remembered-manual");
+        save_mode(&dir, &root(), SessionModeChoice::Manual).unwrap();
+        assert_eq!(
+            load_mode(&dir, &root()),
+            LoadedMode::Remembered(SessionModeChoice::Manual)
+        );
+        assert!(remembers_a_choice(Some(&dir), &root()));
+        assert_eq!(
+            startup_mode(Some(&dir), &root()),
+            (SessionModeChoice::Manual, Vec::new())
+        );
     }
 
     #[test]
     fn the_mode_cycles_through_what_the_client_offers_and_wraps() {
         let offered = crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES;
+        assert_eq!(SessionModeChoice::Manual.cycled(offered), SessionModeChoice::Auto);
         assert_eq!(SessionModeChoice::Auto.cycled(offered), SessionModeChoice::Bypass);
-        assert_eq!(SessionModeChoice::Bypass.cycled(offered), SessionModeChoice::Auto);
+        assert_eq!(SessionModeChoice::Bypass.cycled(offered), SessionModeChoice::Manual);
         assert_eq!(
             SessionModeChoice::Bypass.cycled(&["auto"]),
             SessionModeChoice::Auto,
@@ -507,17 +546,20 @@ mod tests {
         assert_eq!(SessionModeChoice::parse("bypass"), Some(SessionModeChoice::Bypass));
         assert_eq!(SessionModeChoice::parse("verdandi_rules"), None);
         assert_eq!(SessionModeChoice::Auto.as_str(), "auto");
+        assert_eq!(SessionModeChoice::parse("manual"), Some(SessionModeChoice::Manual));
+        assert_eq!(SessionModeChoice::Manual.as_str(), "manual");
     }
 
     #[test]
-    fn the_default_mode_key_reads_its_two_words_and_nothing_else() {
+    fn the_default_mode_key_reads_its_three_words_and_nothing_else() {
         assert_eq!(parse_default_mode(None), Ok(None));
         assert_eq!(parse_default_mode(Some("auto")), Ok(Some(SessionModeChoice::Auto)));
+        assert_eq!(parse_default_mode(Some("manual")), Ok(Some(SessionModeChoice::Manual)));
         assert_eq!(
             parse_default_mode(Some(" bypass ")),
             Ok(Some(SessionModeChoice::Bypass))
         );
-        for bad in ["", "Bypass", "yes", "plan", "bypassPermissions"] {
+        for bad in ["", "Bypass", "Manual", "default", "yes", "plan", "bypassPermissions"] {
             let err = parse_default_mode(Some(bad)).unwrap_err();
             assert!(
                 err.contains("agent.default_mode") && err.contains(&format!("{bad:?}")),

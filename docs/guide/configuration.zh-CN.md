@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=a51b1b4bca99ff5c81bcbfd40ee7ff7daa3c734eb4a2110ec3b682b4917845d2 -->
+<!-- translated-from: configuration.md sha256=21d0f43f7b0b558e189772d9abe48431a491ef24fddf6b3bf9d9e0537ea43c0e -->
 
 # 配置
 
@@ -35,7 +35,7 @@ eitri.config.set("review.hint", true)
 | `agent.typing_cadence_hz` | 1 到 60 之间的整数，或 `"off"` | `5` | 你在编辑器里输入时，agent 面板每秒最多允许更新多少次。稳定的较慢频率可以避免面板在你输入时重绘；`"off"` 让它全速更新。 |
 | `agent.default` | `"claude"`、`"codex"`，或用 `eitri.agent.register` 注册的 agent 的名字 | `"claude"` | 新标签页，以及新窗口的第一个标签页，运行哪个 agent。见 [Codex 与其他 agent](agents.zh-CN.md)。 |
 | `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`。带目录部分的相对路径会让 Eitri 在启动时停下。 |
-| `agent.default_mode` | `"auto"` 或 `"bypass"` | `"auto"` | 新标签页开始时所处的模式。见[一次启动怎样开始](#how-a-launch-starts)。 |
+| `agent.default_mode` | `"manual"`、`"auto"` 或 `"bypass"` | `"auto"` | 新标签页开始时所处的模式。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.restore` | `"offer"`、`"auto"` 或 `"off"` | `"offer"` | 对这个项目上一个窗口里开着的标签页怎么办。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.user_settings` | `true` 或 `false` | `true` | agent 会话是否加载你自己的 Claude Code 配置（你的 hook、插件、skill、`CLAUDE.md` 和权限规则），和终端里的 `claude` 一样。`false` 把你自己的配置排除在外；项目自己的配置由[信任](permissions.zh-CN.md)管，不由这个键管。 |
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
@@ -76,11 +76,11 @@ k.del("prefix", "%")                          -- remove a default binding
 
 ```lua
 eitri.config.set("agent.restore", "offer")        -- "offer" (the default), "auto" or "off"
-eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "bypass"
+eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the default) or "bypass"
 ```
 
-- **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有可以继续的会话的标签页（它们的顺序、名字、模式、agent，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成“没有标签页”。设为 `"offer"` 时，只要窗口里还没有任何东西启动，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来（除非项目的 Claude 配置是新的或已改动，这时恢复要等你回答[信任问题](permissions.zh-CN.md#trusting-a-project)，在它上面按 `Esc` 会保留已保存的标签页：它们作为失败的标签页回来，可以用 `r` 再次启动；从空标签页的 `Restore last session` 那一行发起的，在那个标签页仍是空的时候，仍然留在那里供你再选）；`"off"` 既不提议也不记录。每个标签页都会被继续（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。曾经处于 bypass 的标签页，没有你的一句“是”，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。
-- **`agent.default_mode`** 是新标签页开始时所处的模式，针对你还没有用 `Shift+Tab` 离开过 bypass 的项目（那个选择按项目记住，并且始终优先）。设为 `"bypass"` 是唯一一种窗口不经询问就以 bypass 开始的方式，因为你已经在自己的文件里这么说了；它同时也让保存下来的 bypass 标签页不必回答那个问题就以 bypass 回来。这两种模式的含义见[权限](permissions.zh-CN.md)。
+- **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有可以继续的会话的标签页（它们的顺序、名字、模式、agent，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成“没有标签页”。设为 `"offer"` 时，只要窗口里还没有任何东西启动，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来（除非项目的 Claude 配置是新的或已改动，这时恢复要等你回答[信任问题](permissions.zh-CN.md#trusting-a-project)，在它上面按 `Esc` 会保留已保存的标签页：它们作为失败的标签页回来，可以用 `r` 再次启动；从空标签页的 `Restore last session` 那一行发起的，在那个标签页仍是空的时候，仍然留在那里供你再选）；`"off"` 既不提议也不记录。每个标签页都会被继续（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。曾经处于 bypass 的标签页，没有你的一句“是”，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。曾经处于 manual 的标签页会以 manual 回来，不用提问。
+- **`agent.default_mode`** 是新标签页开始时所处的模式，针对你还没有用 `Shift+Tab` 改过空标签页模式的项目（那个选择，manual 或 auto，按项目记住，并且始终优先，它优先时启动日志会说出来；bypass 从不被记住，一个没有 manual 模式的 agent 的标签页离开 bypass 时落到的 auto 也不会被记住）。设为 `"manual"` 会让每个标签页都以最严格的模式开始，在那里每一次文件编辑都是一张卡片；一个没有 manual 模式的 agent 的标签页会改以 auto 开始，Eitri 会说一次，并指明是哪个标签页。设为 `"bypass"` 是唯一一种窗口不经询问就以 bypass 开始的方式，因为你已经在自己的文件里这么说了；它同时也让保存下来的 bypass 标签页不必回答那个问题就以 bypass 回来。这三种模式的含义见[权限](permissions.zh-CN.md)。
 
 <a id="accounts"></a>
 ## 账号

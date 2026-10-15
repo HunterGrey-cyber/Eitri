@@ -28,8 +28,15 @@
 //! The eight `Grep`/`Glob` arms added that day were skipped: 2.1.292 lists neither tool (`TOOLS_THE_CLI_MAY_LACK`), so a
 //! skip is printed and never counted as agreement. Two `Read` arms with the same path reasoning (`/proc`, a symlink out of
 //! the root) ran: the CLI refused both and the policy cards both.
+//!
+//! **2026-10-14 (manual mode): NOT YET RUN.** A Manual tab's policy (`agent::classify_in_manual`) is
+//! now checked on every call as well, against the CLI the probe ran: under `default` it must never be
+//! more permissive, and under `acceptEdits` it must card every `Write`/`Edit`/`NotebookEdit`, since
+//! `default` asks before every edit. One probe was added for it, an in-project `Write` under
+//! `default` (the CLI must refuse it and the file must not exist); the Auto policy is not compared on
+//! the edit calls of a `default` probe, since it reproduces `acceptEdits` for those three tools.
 
-use agent::{classify_permission_request, PermissionVerdict};
+use agent::{classify_in_manual, classify_permission_request, PermissionVerdict, PrefixRules};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -80,6 +87,7 @@ const REFUSAL_PHRASES: &[&str] = &[
 fn the_policy_is_never_more_permissive_than_the_real_cli() {
     let mut stricter_than_the_cli: Vec<String> = Vec::new();
     let mut more_permissive_than_the_cli: Vec<String> = Vec::new();
+    let mut manual_more_permissive: Vec<String> = Vec::new();
     let mut observed_anything = false;
 
     let mut skipped_for_a_missing_tool: Vec<String> = Vec::new();
@@ -121,6 +129,26 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
         }
         for call in &calls {
             observed_anything = true;
+            let is_edit = EDIT_TOOLS.contains(&call.tool_name.as_str());
+            let manual = classify_in_manual(&call.tool_name, &call.input, &workspace, &PrefixRules::default());
+            if is_edit && !manual.needs_a_human() {
+                manual_more_permissive.push(format!(
+                    "{} {} -- Manual must card every edit, and allowed this one ({})",
+                    call.tool_name, call.input, manual.reason
+                ));
+            }
+            if probe.permission_mode.is_none() && !call.allowed_by_the_cli && !manual.needs_a_human() {
+                manual_more_permissive.push(format!(
+                    "{} {} -- the CLI refused it under `default` ({:?}) and Manual would have run it without \
+                     asking ({})",
+                    call.tool_name, call.input, call.refusal, manual.reason
+                ));
+            }
+            // The Auto policy reproduces `acceptEdits` for the edit tools, so a `default` run is not
+            // its reference for those calls (the manual-only probe below).
+            if is_edit && probe.permission_mode.is_none() {
+                continue;
+            }
             let ours = classify_permission_request(&call.tool_name, &call.input, &workspace);
             match (ours.verdict, call.allowed_by_the_cli) {
                 (PermissionVerdict::AllowWithoutAsking, false) => {
@@ -197,7 +225,15 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
         "the policy would have run, without asking, calls the real CLI refused:\n  {}",
         more_permissive_than_the_cli.join("\n  ")
     );
+    assert!(
+        manual_more_permissive.is_empty(),
+        "the Manual policy would have run, without asking, calls `default` refuses:\n  {}",
+        manual_more_permissive.join("\n  ")
+    );
 }
+
+/// The tools the Auto policy judges by Claude Code's acceptEdits fast path, and Manual always cards.
+const EDIT_TOOLS: &[&str] = &["Write", "Edit", "NotebookEdit"];
 
 /// Checks that a user's `permissions.ask` rule stops an edit even when the gate's hook allows it.
 /// This probe has not yet been run. An in-project `Write` can receive the hook's `allow`
@@ -309,7 +345,8 @@ struct Probe {
     /// `permission_policy` reproduces `acceptEdits` for `Write`, `Edit`, and `NotebookEdit`,
     /// and `default` for other tools. The CLI denies writes under `default` regardless of path,
     /// so parity probes for those edit tools use `Some("acceptEdits")` to test the matching mode.
-    /// Other probes use `default`.
+    /// Other probes use `default`. The Manual-mode edit probe also uses `default` and compares only
+    /// against the Manual policy.
     permission_mode: Option<&'static str>,
 }
 
@@ -392,7 +429,7 @@ fn with_an_option_shaped_symlink(workspace: &Path) -> PathBuf {
     workspace.to_path_buf()
 }
 
-/// Twenty-seven probes, one billed turn each, covering both directions of the assertion.
+/// Twenty-eight probes, one billed turn each, covering both directions of the assertion.
 /// The set is not exhaustive; each added probe costs another turn.
 /// Eight Grep and Glob probes run only where the CLI lists those tools.
 ///
@@ -430,6 +467,19 @@ fn probes() -> Vec<Probe> {
             file_must_contain: Some(("probe.txt", "hello")),
             run_in: in_the_workspace,
             permission_mode: Some("acceptEdits"),
+        },
+        // Manual mode's reference: `default` asks before every edit, so with no prompt to answer
+        // the CLI refuses this in-project `Write`, and the Manual policy must card it. The Auto
+        // policy is not compared here (it reproduces `acceptEdits` for this tool).
+        Probe {
+            label: "an in-project write, under default (Manual's reference)",
+            prompt: "Create a file called probe-default.txt in the current directory containing the word \
+                     hello. Use the Write tool.",
+            expects_tool: "Write",
+            file_that_must_not_exist: Some("probe-default.txt"),
+            file_must_contain: None,
+            run_in: in_the_workspace,
+            permission_mode: None,
         },
         // The other edit tool this fast path covers, and the other shape of target: `Edit` requires
         // an existing file, where `Write` above created a new one.

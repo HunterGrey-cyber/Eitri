@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=519372e9744599324832bdab56f7b9fafd6204d4000bdf950d9d5bd8cbf66ab8 -->
+<!-- translated-from: getting-started.md sha256=4b823dd753a6a2e8116497984cd59eb60265552a5c20701f545f7a3e36551f18 -->
 
 # 快速上手
 
@@ -26,7 +26,7 @@ eitri [DIR]
 | `s` | 恢复这个项目上一个窗口里开着的标签页（只在有可恢复的内容时显示） |
 | `r` | 继续最近一次保存的对话（只在有的时候显示） |
 | `w` | 在所有保存过的会话里选一个 |
-| `Shift+Tab` | 在开始之前切换 Auto 和 Bypass |
+| `Shift+Tab` | 在开始之前轮换模式（Manual、Auto、Bypass） |
 | `?` | 列出所有按键 |
 
 `Ctrl+h` 和 `Ctrl+l` 在编辑器和面板之间移动按键焦点。
@@ -61,10 +61,12 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 
 只有单独按下一个键时，它才会回答卡片：如果在这之前或之后大约四分之一秒内还按过别的键，`a`、`d` 和 `D` 什么都不做，而且它们都不接受数字前缀。这样你正在输入的句子的头几个字母，就不会误回答一张卡片。
 
-**Auto 和 bypass。** 每个标签页处于两种模式之一，`Shift+Tab`（或 `<leader>m`）来切换。
+**Manual、auto 和 bypass。** 每个标签页处于三种模式之一，`Shift+Tab`（或 `<leader>m`）按 Claude Code 的顺序轮换它们：manual、auto、bypass，然后再回到 manual。
+
+- **Manual** 最严格。每一次调用都由 Eitri 自己的规则来回答：在项目内部读取和只读命令会运行，你保存的规则仍然适用，其余的都是卡片，每一次文件编辑和写入也在内。没有任何东西交给 Claude Code 自己的 auto 模式。在你的 `init.lua` 里把 `agent.default_mode` 设为 `"manual"`，每个标签页就都以它开始。
 
 - **Auto** 是默认模式。Eitri 仍然看得到每一次调用。你保存的规则允许的调用会被立即批准。其余的交给 Claude Code 自己的 auto 模式来决定，它不用卡片；它拒绝一次调用时，该工具那一行会写 `blocked by auto: <原因>`，多次被拒绝之后，Claude Code 会自己用一张卡片来问你。如果你的 Claude Code 运行不了它的 auto 模式，就由 Eitri 自己的规则来决定哪些调用需要卡片。
-- **Bypass** 让 Eitri 自己批准每一次工具调用，不出卡片：它自己的检查和 Claude Code 自己提出的问题都一样，你的 `permissions.ask` 规则强制要问的也在内。因为 bypass 意味着很大的信任，`Shift+Tab` 进入它时会先问一句（一个 `y/n` 问题，措辞会说明还有什么会变，例如它会批准多少张等待中的卡片），而且只有单独按下、并且在问题出现片刻之后按的 `y` 才算数。离开 bypass 不需要确认。
+- **Bypass** 让 Eitri 自己批准每一次工具调用，不出卡片：它自己的检查和 Claude Code 自己提出的问题都一样，你的 `permissions.ask` 规则强制要问的也在内。因为 bypass 意味着很大的信任，`Shift+Tab` 进入它时会先问一句（一个 `y/n` 问题，措辞会说明还有什么会变，例如它会批准多少张等待中的卡片），而且只有单独按下、并且在问题出现片刻之后按的 `y` 才算数。只能从 auto 进入 bypass；离开它不需要确认，并且会落到 manual。
 
 每种模式具体放行什么、保存的规则，以及项目自己的 Claude Code 配置如何被信任，都在[权限](permissions.zh-CN.md)里。
 
@@ -88,7 +90,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 
 **继续一个对话。** 关闭标签页不会删除它的对话。在空标签页上按 `r` 继续最近一次保存的会话，`<prefix> w`（或空标签页上的 `w`）列出全部，每个都带着名字或标题；另一个窗口当前占用的会话会显示出来，但不能选。
 
-**恢复上次的标签页。** Eitri 记得一个项目上一个窗口里开着哪些标签页：它们的顺序、名字和模式，以及当时在屏幕上的是哪一个。默认情况下，空标签页会把它们作为 `Restore last session`（`s`）提供出来。在你的 `init.lua` 里把 `agent.restore` 设为 `"auto"`，启动时不用按任何键就把它们带回来，`"off"` 则既不提供也不记录；见[配置](configuration.zh-CN.md)。如果某个标签页保存的对话已经没了，或者被另一个窗口占着，它会被跳过，并在一条简短的消息里点名。曾经处于 bypass 的标签页不会不经询问就以 bypass 回来：`s` 会先问（回答 `n` 就让它以 Auto 回来），自动恢复则让它以 Auto 回来并告诉你。唯一的例外是你事先给出的回答：在你的 `init.lua` 里把 `agent.default_mode` 设为 `"bypass"`，保存下来的 bypass 标签页就不用提问直接以 bypass 回来。
+**恢复上次的标签页。** Eitri 记得一个项目上一个窗口里开着哪些标签页：它们的顺序、名字和模式，以及当时在屏幕上的是哪一个。默认情况下，空标签页会把它们作为 `Restore last session`（`s`）提供出来。在你的 `init.lua` 里把 `agent.restore` 设为 `"auto"`，启动时不用按任何键就把它们带回来，`"off"` 则既不提供也不记录；见[配置](configuration.zh-CN.md)。如果某个标签页保存的对话已经没了，或者被另一个窗口占着，它会被跳过，并在一条简短的消息里点名。曾经处于 bypass 的标签页不会不经询问就以 bypass 回来：`s` 会先问（回答 `n` 就让它以 Auto 回来），自动恢复则让它以 Auto 回来并告诉你。曾经处于 manual 的标签页会以 manual 回来。唯一的例外是你事先给出的回答：在你的 `init.lua` 里把 `agent.default_mode` 设为 `"bypass"`，保存下来的 bypass 标签页就不用提问直接以 bypass 回来。
 
 **在真正的终端里继续。** 按 `<leader>t`（或者打开 `<prefix> i` 选 `Continue in a terminal...`）。Eitri 会先说明它会先关闭面板里的这个对话，然后在你确认后，显示在你自己的终端里继续它的 `claude --resume ...` 命令；按 `y` 复制它。Eitri 不会替你启动那个终端，也不会对会话加锁，所以不要在两个地方同时开着它。那个终端运行的是一个普通的 `claude`，用你自己的 Claude Code 设置，没有 Eitri 的权限关卡，所以它的工具调用不会以卡片出现。还没有过第一个回合的会话没有什么可继续的，还有回合在运行的会话也一样。
 

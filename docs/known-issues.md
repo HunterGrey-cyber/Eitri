@@ -119,7 +119,7 @@ one-window mode.
   in terminal `claude`.** That is Claude Code's own rule; your user settings' rules always apply.
 - **In a bypass tab your own ask rules stop nothing.** Since 0.2.2 bypass also approves the questions Claude Code
   raises itself, those your `permissions.ask` rules (or a trusted project's) force included, with no card; the
-  tool's row says it was allowed in bypass. Use an Auto tab where an ask rule has to hold.
+  tool's row says it was allowed in bypass. Use a Manual or Auto tab where an ask rule has to hold.
 - **The bottom terminal can write to your clipboard, by design.** A program running there can set the clipboard
   or the primary selection with an OSC 52 escape sequence (the same default as Alacritty); Eitri shows no notice
   when it happens, so what you paste next may not be what you copied. Reading the clipboard is refused.
@@ -154,7 +154,7 @@ adapter; they have not been tried on every setup.
   Codex client holds, a subagent's file-change approval, and whether the sandbox can reach your session bus, tmux
   or nvim.
 - **There is no Eitri-side classifier or saved rule for these agents.** Every request that reaches Eitri is a card
-  (in Auto), or is approved by Eitri (in Bypass).
+  (in Manual and Auto), or is approved by Eitri (in Bypass).
 - **An ACP agent starts only after a `y`**, because Eitri cannot keep it from loading the project's own
   configuration; an `n` starts nothing and is not remembered. `project_files` is your list: Eitri hashes only
   what you name there. Eitri does not scrub the agent's environment, so an agent that reads a relative-path

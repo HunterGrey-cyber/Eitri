@@ -66,7 +66,7 @@ describe("the backend name is drawn only in the detail popover, never the choose
     const hello: Hello = {
       backend,
       projectDir: "/home/user/src/neovibe",
-      permissionModes: ["auto", "bypass"],
+      permissionModes: ["manual", "auto", "bypass"],
       resumableSessions: [],
       expectedVerdandiRevision: "28a5e4c",
       account: "work",

@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=38f14c2cc78e662286c197207039f7a1d00ac580a2f02e8522378bc30d1a59d2 -->
+<!-- translated-from: permissions.md sha256=f4b499c8f2dccee064fbbb4a5bc9169ac02c2f7ad5e7b066a68a16a282cc709a -->
 
 # 权限与信任
 
@@ -11,7 +11,14 @@
 
 ## 谁来决定一次工具调用
 
-Claude Code 想运行的每一次工具调用，在运行之前都会先发给 Eitri，两种模式下都是如此。接下来发生什么，取决于标签页的模式（`Shift+Tab` 切换它）以及 Claude Code 是怎样在运行的。
+Claude Code 想运行的每一次工具调用，在运行之前都会先发给 Eitri，每种模式下都是如此。接下来发生什么，取决于标签页的模式以及 Claude Code 是怎样在运行的。一个标签页处在三种模式之一，`Shift+Tab`（或 `<leader>m`）按 Claude Code 的顺序轮换它们：manual、auto、bypass，然后再回到 manual。新标签页以 auto 开始，除非你设置了 `agent.default_mode`（[一次启动怎样开始](configuration.zh-CN.md#how-a-launch-starts)）。
+
+<a id="manual"></a>
+### Manual
+
+manual 是最严格的模式。不管 Claude Code 在运行什么，每一次调用都由 Eitri 自己的规则来回答：也就是[Auto，在 Claude Code 没有运行它的 auto 模式时](#auto-when-claude-code-is-not-running-its-auto-mode)里描述的那些规则，只有一处不同：**用 Claude Code 的文件工具（`Write`、`Edit`、`NotebookEdit`）做的每一次文件编辑或写入都是一张卡片**，在项目内部也一样。没有任何东西交给 Claude Code 的 auto 模式，所以不会有哪一行写 `blocked by auto`。在项目内部读取和搜索、只读命令仍然不经询问直接运行，你的[保存的规则](#saved-rules)仍然适用（会写文件的 shell 命令和在 auto 下一样按它的文字判断，所以允许它的规则照样放行），Claude Code 自己的问题按 auto 下的方式处理（[Claude Code 自己提问时](#when-claude-code-itself-asks)）。
+
+以 Eitri 自己的规则来衡量，manual 绝不比 auto 更宽松：它只是把这些规则放行的一部分变成卡片。但在 Claude Code 运行它自己的 auto 模式的地方，Auto 标签页并不使用这些规则：凡是没有保存的规则放行的调用，它都交给 Claude Code 的分类器，而分类器可能拒绝。Manual 标签页自己回答这些调用，所以在项目内部读取、只读命令、子代理（`Task`、`Agent`）、`ToolSearch` 和 `TodoWrite` 在 manual 下运行时不经过 Claude Code 的分类器（Eitri 的批准会跳过它），而在 auto 下那个分类器本可能拦下其中一个。其余凡是 Eitri 的规则会放到卡片上的，在 manual 下也是卡片。
 
 <a id="auto-when-claude-code-runs-its-own-auto-mode"></a>
 ### Auto，在 Claude Code 运行它自己的 auto 模式时
@@ -35,7 +42,7 @@ Claude Code 可能回退到它普通的默认模式，而且某些已安装的�
 
 ### Bypass
 
-在 bypass 下，Eitri 自己批准每一次调用，不出卡片。这也包括 Claude Code 自己提出的问题（[下一节](#when-claude-code-itself-asks)），连你自己的 `permissions.ask` 规则强制发出的问题也在内：在 bypass 标签页里，ask 规则什么也拦不住。因为这意味着很大的信任，`Shift+Tab` 进入 bypass 时会先问。这个问题是一个 `y/n`，会说明还有什么会变：如果标签页里有卡片在等，它写的是 “Switch to bypass and approve the N waiting cards?”，每一张在等的卡片都算在内。只有单独按下、并且在问题出现片刻之后按的 `y` 才算数，而且只有此刻仍在等待的卡片会被批准。离开 bypass 不需要确认。
+在 bypass 下，Eitri 自己批准每一次调用，不出卡片。这也包括 Claude Code 自己提出的问题（[下一节](#when-claude-code-itself-asks)），连你自己的 `permissions.ask` 规则强制发出的问题也在内：在 bypass 标签页里，ask 规则什么也拦不住。因为这意味着很大的信任，`Shift+Tab` 进入 bypass 时会先问。这个问题是一个 `y/n`，会说明还有什么会变：如果标签页里有卡片在等，它写的是 “Switch to bypass and approve the N waiting cards?”，每一张在等的卡片都算在内。只有单独按下、并且在问题出现片刻之后按的 `y` 才算数，而且只有此刻仍在等待的卡片会被批准。只能从 auto 进入 bypass。离开 bypass 不需要确认，并且会落到 manual。
 
 要不经提问就以 bypass 开始，只能事先说好，办法是在你的 `init.lua` 里写 `agent.default_mode = "bypass"`；见[一次启动怎样开始](configuration.zh-CN.md#how-a-launch-starts)。
 
@@ -47,7 +54,7 @@ Claude Code 可能回退到它普通的默认模式，而且某些已安装的�
 <a id="saved-rules"></a>
 ## 保存的规则
 
-一个普通 shell 命令的权限卡片可以带一个第三个按钮，“Always allow `git log *` in this project”。按下它会保存一条规则并回答这张卡片。这个按钮属于 Eitri 自己的检查所画的卡片。Claude Code 运行它的 auto 模式时（这是通常的情况），Eitri 会把大多数调用交给那个模式，而不是画卡片，所以你可能很少甚至从来看不到这个按钮；规则主要来自 Claude Code 运行在默认模式下的会话，或者来自手工编辑规则文件。
+一个普通 shell 命令的权限卡片可以带一个第三个按钮，“Always allow `git log *` in this project”。按下它会保存一条规则并回答这张卡片。这个按钮属于 Eitri 自己的检查所画的卡片。Claude Code 运行它的 auto 模式时（这是通常的情况），Auto 标签页会把大多数调用交给那个模式，而不是画卡片，所以你在那里可能很少看到这个按钮；规则这时主要来自 Manual 标签页、Claude Code 运行在默认模式下的会话，或者来自手工编辑规则文件。
 
 - **规则长什么样。** 它按 Claude Code 的写法来写，`Bash(git log *)`，并且匹配完整的开头单词：`cargo test *` 允许 `cargo test --release`，但不允许 `cargo testx`。只有 `Bash` 有规则；其他任何工具都没有。
 - **按钮提供什么。** 命令的第一个单词，再加上第二个单词（当它是个普通单词时），所以 `git log --oneline` 提供 `git log *`，`uname -a` 提供 `uname *`。当一个选项出现在后面的普通单词之前（`git -C sub log`）时，什么都不提供，因为只用第一个单词会覆盖每一个子命令。按钮只出现在规则能起作用的地方：对于只因为它的第一个单词（或它的 `git` 子命令）不是已知只读的才询问的命令。因为其他任何原因而询问的命令没有第三个按钮。
@@ -60,7 +67,7 @@ Claude Code 可能回退到它普通的默认模式，而且某些已安装的�
 
 - **规则从不让 Eitri 读不清楚的命令运行起来。** 规则只替换“这个程序不在只读名单上”这一个判断。带重定向、管道、`;` 或 `&&`、通配符、引号或 `$(...)`、项目之外的路径，或者 `git -C` 之类选项的命令，即使规则的单词和它匹配，也不会被规则放行。在 Claude Code 运行它的 auto 模式的地方（通常情况），这样的调用交给那个模式的分类器，它可能不出任何卡片就运行它；否则它是一张卡片。
 - **规则覆盖的比按钮提供的更多。** 按钮的谨慎只决定它建议什么。一条保存的规则会允许每一个以它的单词开头、能被读清楚的命令，包括按钮根本不会为之提供规则的命令：保存了 `cargo *` 之后，`cargo -p helper run` 也会不出卡片就运行。保存或写下能满足需要的最窄的规则。
-- **规则在哪里适用。** 在 Auto 标签页里，上面两种情形都适用。在 bypass 下不需要规则。规则从不回答 Claude Code 自己的问题（下一节）。
+- **规则在哪里适用。** 在 Manual 标签页里，以及在 Auto 标签页里上面两种情形下都适用。在 bypass 下不需要规则。规则从不回答 Claude Code 自己的问题（下一节）。
 - **它们存在哪里。** 在项目之外，每个项目一个文件，位于 `~/.local/state/eitri/permissions/` 下（设置了 `$XDG_STATE_HOME/eitri/permissions/` 时用它）。Eitri 不往项目里写任何东西，这和 Claude Code 自己的 “don't ask again” 不一样，后者会写 `.claude/settings.local.json`。要去掉一条规则，就编辑那个文件：`<prefix> i` 在 `permission rules` 那一行里显示它的路径。窗口只在启动时读一次这个文件，所以已经打开的窗口里，被删掉的规则仍然有效，直到你重启那个窗口。Eitri 用不了的文件会在名字后加上 `.unusable` 放到一边，并被当作没有规则来读，这意味着更多的卡片，绝不会更少。
 
 <a id="when-claude-code-itself-asks"></a>
@@ -70,15 +77,15 @@ Eitri 放行一次调用之后，Claude Code 仍可能自己再就它提问。�
 
 **在 bypass 标签页里，每一个都由 Eitri 替你回答**，不管它有没有说明为什么要问；工具那一行会在问题的标签下这么写，例如 `your ask rule: Write — allowed in bypass`。进入 bypass 时，已经在等的这类问题也一并批准。
 
-**在 Auto 标签页里，它会作为一张卡片出现，标签会说是谁在问。** 下面这些在那里一律是卡片：
+**在 Auto 或 Manual 标签页里，它会作为一张卡片出现，标签会说是谁在问。** 下面这些在那里一律是卡片：
 
 - 由你的某条点名了工具的 `permissions.ask` 规则强制发出的问题。卡片会写 “your ask rule:” 和工具名，例如 `your ask rule: Write`。
 - 没有给出理由的问题。卡片会写 “Claude Code asked (maybe your ask rule)”。Claude Code 只在 ask 规则是一个单独的工具名时才点出它；带模式写的规则，比如 `Bash(echo:*)`，到达 Eitri 时就是一个没有理由的问题，所以 Eitri 没法把它和其他没有解释的问题区分开，就把它显示出来。
 - 这个版本的 Eitri 不认识的那一类问题。
 
-**给出了理由的问题**（卡片写 “Claude Code asked” 并显示那句话）：在 Auto 标签页里，只有当你片刻之前在一张卡片上批准过同一次调用、同样的输入，并且只用一次时，Eitri 才回答它；否则它是一张卡片。因为在 Auto 标签页里通常由 Claude Code 自己的 auto 模式来决定，所以通常没有之前的批准，这样的问题在那里就是一张卡片。在 Claude Code 的 auto 模式运行的地方，它对敏感文件（`.git/`、`.claude/`）的检查根本不会询问，由它的分类器来决定；敏感文件的问题出现在 Claude Code 运行于默认模式的时候。
+**给出了理由的问题**（卡片写 “Claude Code asked” 并显示那句话）：在 Auto 或 Manual 标签页里，只有当你片刻之前在一张卡片上批准过同一次调用、同样的输入，并且只用一次时，Eitri 才回答它；否则它是一张卡片。因为在 Auto 标签页里通常由 Claude Code 自己的 auto 模式来决定，所以通常没有之前的批准，这样的问题在那里就是一张卡片；在 Manual 标签页里，你通常已经先在 Eitri 自己的卡片上批准了这次调用。在 Claude Code 的 auto 模式运行的地方，它对敏感文件（`.git/`、`.claude/`）的检查根本不会询问，由它的分类器来决定；敏感文件的问题出现在 Claude Code 运行于默认模式的时候。
 
-有一个要知道的限制：Eitri 分不清 Claude Code 自己的理由和 hook 给出的理由。你的某个 hook（或者某个被信任的项目的 hook）带着理由来询问，会被当作任何其他带理由的问题，所以在 Auto 标签页里，你在卡片上对同一次调用的批准也会回答它。
+有一个要知道的限制：Eitri 分不清 Claude Code 自己的理由和 hook 给出的理由。你的某个 hook（或者某个被信任的项目的 hook）带着理由来询问，会被当作任何其他带理由的问题，所以在 Auto 或 Manual 标签页里，你在卡片上对同一次调用的批准也会回答它。
 
 <a id="trusting-a-project"></a>
 ## 信任一个项目
@@ -143,8 +150,8 @@ eitri.config.set("agent.user_settings", false)    -- true (the default) or false
 其中大多数也在[已知问题](../known-issues.zh-CN.md#安全)里，它们是上面所述的行为比听起来要弱的地方。
 
 - **一个 hook 可以在调用被批准之后改动它。** 你自己的 Claude Code 设置里的 hook，或者被信任的项目里的 hook，可以在 Eitri 看到原始调用之后改写一次工具调用的输入。这时 Claude Code 再询问，它的卡片显示的是改写后的输入，而工具那一行显示的是原来的。在终端里 hook 也是这样工作的。
-- **在 Auto 标签页里，Claude Code 的 auto 模式可以不询问就写入 `.git/` 下**，新的 git hook 也包括在内。回合审阅不显示 `.git/` 下的改动，信任问题盯着 `.claude/`、`.mcp.json` 和 `CLAUDE.md`，不盯 `.git/`。在一个你在意的仓库里完成一个回合之后，值得看一眼 `ls .git/hooks`。对 `.claude/` 下的编辑，Eitri 确实会在下一个会话之前再问一次信任问题。
+- **在 Auto 标签页里，Claude Code 的 auto 模式可以不询问就写入 `.git/` 下**，新的 git hook 也包括在内。Manual 标签页把每一次 `Write`、`Edit` 和 `NotebookEdit` 调用都放到卡片上，但不是每一次写入：shell 命令按它的文字判断，所以像 `Bash(cp *)` 这样保存的规则仍然会让 `cp x .git/hooks/pre-commit` 运行。回合审阅不显示 `.git/` 下的改动，信任问题盯着 `.claude/`、`.mcp.json` 和 `CLAUDE.md`，不盯 `.git/`。在一个你在意的仓库里完成一个回合之后，值得看一眼 `ls .git/hooks`。对 `.claude/` 下的编辑，Eitri 确实会在下一个会话之前再问一次信任问题。
 - **被信任的项目自己的 `permissions.allow` 规则，只有在你也在终端 `claude` 里信任了那个目录时，才会到达 Auto 标签页。** 这是 Claude Code 自己的规则。你的用户设置里的规则始终适用。
 - **信任一个项目，就意味着信任它的代码会运行。** hook 从 `.claude/` 之外调用的脚本，只通过 hook 的命令文本被覆盖，就像构建这个项目一样。
 - **Bypass 也会回答你自己的 ask 规则。** 在 bypass 标签页里，`permissions.ask` 规则（你的，或者被信任的项目的）什么也拦不住：它引出的问题，Eitri 会像对待其他问题一样替你回答。
-- **理由不是出处的证明。** 在 Auto 标签页里，带理由的问题会凭你对同一次调用的批准被回答，而 Eitri 分不清 Claude Code 自己的检查和一个带着理由来询问的 hook。
+- **理由不是出处的证明。** 在 Auto 或 Manual 标签页里，带理由的问题会凭你对同一次调用的批准被回答，而 Eitri 分不清 Claude Code 自己的检查和一个带着理由来询问的 hook。

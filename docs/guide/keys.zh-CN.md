@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=7aa6b94699e46b1f45efa3d5bc70b0c9886d5f54e4004849ca330171e2f9d8ed -->
+<!-- translated-from: keys.md sha256=0cb6907d4db465f19bcc03945166fdc5a56f5f69b0df8edc57c0663ddd91f175 -->
 
 # 按键
 
@@ -97,7 +97,7 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `Ctrl+y` | 批准这个标签页里等得最久的卡片（见[回答一张卡片](#answering-a-card)） |
 | `Ctrl+g` | 在 Neovim 里编辑草稿；`:wq` 把它带回来；`:q!` 什么都不改，除非你已经用 `:w` 保存过草稿，这时保存的文字会回来 |
 | `Ctrl+o` | 详细视图（BROWSE 里也有） |
-| `Shift+Tab` | 在 Auto 和 Bypass 之间切换；进入 Bypass 会先问，回答 `y` 还会批准这个标签页里已经在等的 Claude Code 提问（你的 ask 规则引起的也算），并替你回答之后的提问，见[Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks) |
+| `Shift+Tab` | 轮换标签页的模式：Manual、Auto、Bypass，然后再回到 Manual（没有 Manual 模式的 agent：在 Auto 和 Bypass 之间）；进入 Bypass 会先问，并且只能从 Auto 进入，回答 `y` 还会批准这个标签页里已经在等的 Claude Code 提问（你的 ask 规则引起的也算），并替你回答之后的提问，见[Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks) |
 | `Esc` | 停止输入，回到 BROWSE |
 | `?` | 按键列表，在输入框为空时 |
 
@@ -154,7 +154,7 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `<leader>/` | 在对话里搜索 |
 | `<leader>i` | 这个标签页的详情 |
 | `<leader>t` | 在终端里继续这个对话（Claude 标签页；Codex 或已注册 agent 的标签页会提示这还不可用） |
-| `<leader>m` | 在 Auto 和 Bypass 之间切换（和 `Shift+Tab` 一样） |
+| `<leader>m` | 轮换标签页的模式（和 `Shift+Tab` 一样） |
 | `<leader>k` | 停止 Codex 标签页留在后台运行的命令，这会结束它的会话（之后可以恢复），会先问一个 `y/n` |
 | `<leader>?` | 按键列表 |
 

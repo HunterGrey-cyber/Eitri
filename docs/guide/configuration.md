@@ -46,7 +46,7 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `agent.typing_cadence_hz` | a whole number from 1 to 60, or `"off"` | `5` | While you type in the editor, how many times a second the agent panel is allowed to update. A steady slower rate keeps the panel from redrawing under your typing; `"off"` lets it update at full speed. |
 | `agent.default` | `"claude"`, `"codex"` or the name of an agent registered with `eitri.agent.register` | `"claude"` | The agent a new tab runs, and the first tab of a fresh window. See [Codex and other agents](agents.md). |
 | `agent.codex.command` | an absolute path, or a bare command name | unset | The `codex` a Codex tab runs. `EITRI_CODEX` outranks it; without either, `codex` on `PATH`. A relative path with a directory part stops Eitri at startup. |
-| `agent.default_mode` | `"auto"` or `"bypass"` | `"auto"` | The mode a new tab starts in. See [How a launch starts](#how-a-launch-starts). |
+| `agent.default_mode` | `"manual"`, `"auto"` or `"bypass"` | `"auto"` | The mode a new tab starts in. See [How a launch starts](#how-a-launch-starts). |
 | `agent.restore` | `"offer"`, `"auto"` or `"off"` | `"offer"` | What happens to the tabs the last window on this project had open. See [How a launch starts](#how-a-launch-starts). |
 | `agent.user_settings` | `true` or `false` | `true` | Whether agent sessions load your own Claude Code configuration (your hooks, plugins, skills, `CLAUDE.md` and permission rules), as `claude` does in a terminal. `false` leaves your own configuration out; a project's own configuration is governed by [trust](permissions.md), not by this key. |
 | `modules.chat.on_permission` | `"badge"` or `"reveal"` | `"badge"` | What happens when a permission card arrives while the agent panel is hidden. `"badge"` shows `agent ⚑N` in the top bar and a toast; `"reveal"` brings the panel back where it was, without moving the keys. While another pane is zoomed `"reveal"` shows the badge instead, because showing the panel would not put it on screen. A companion window never hides its panel, so the key does nothing there. |
@@ -95,7 +95,7 @@ Two settings decide what a new window does with the tabs and the mode of its las
 
 ```lua
 eitri.config.set("agent.restore", "offer")        -- "offer" (the default), "auto" or "off"
-eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "bypass"
+eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the default) or "bypass"
 ```
 
 - **`agent.restore`** is what happens to the tabs the last window on this project had open. Eitri keeps the
@@ -107,11 +107,15 @@ eitri.config.set("agent.default_mode", "auto")    -- "auto" (the default) or "by
   you type), the one on screen last time is on screen again, and one message says how many came back. A tab
   is skipped, and named, when its saved record is gone or another window holds its session. A tab that was in
   bypass is never put back in bypass without a yes: `s` asks first, and `n` (or `"auto"`) brings it back in
-  auto.
-- **`agent.default_mode`** is the mode a new tab starts in, for a project where you have not left bypass with
-  `Shift+Tab` (that choice is remembered per project and keeps winning). Setting it to `"bypass"` is the one
-  way a window starts in bypass without asking, because you have said so in your own file; it also lets saved
-  bypass tabs come back in bypass without the question. What the two modes mean is in
+  auto. A tab that was in manual comes back in manual, with no question.
+- **`agent.default_mode`** is the mode a new tab starts in, for a project where you have not changed an empty
+  tab's mode with `Shift+Tab` (that choice, manual or auto, is remembered per project and keeps winning, and the
+  launch log says so when it does; bypass is never remembered, and neither is the auto a tab of an agent with no
+  manual mode lands on when it leaves bypass). `"manual"` starts every tab in the strictest mode, where every
+  file edit is a card; a tab of an agent that has no manual mode starts in auto instead, and Eitri says so once,
+  naming the tab. Setting it to
+  `"bypass"` is the one way a window starts in bypass without asking, because you have said so in your own file;
+  it also lets saved bypass tabs come back in bypass without the question. What the three modes mean is in
   [Permissions](permissions.md).
 
 ## Accounts

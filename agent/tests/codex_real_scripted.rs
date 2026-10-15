@@ -730,6 +730,113 @@ fn approvals_accept_decline_cancel() {
     peer.close();
 }
 
+/// A tab started in Auto and moved to Manual keeps its thread's reviewer (`auto_review`) and names `user`
+/// at every later `turn/start`. Nothing else tells Codex the mode changed, so the turn's reviewer must win
+/// over the thread's: an escalation in that turn has to reach the client as a request, with no review by
+/// Codex's own reviewer first. A control turn on the same thread names `auto_review` again, to show this
+/// harness does see that reviewer at work when it is asked for.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn turn_reviewer_user_overrides_an_auto_review_thread() {
+    use agent::external::Reviewer;
+    use agent::providers::codex::config::session_config;
+    use agent::providers::codex::wire::{ThreadStartParams, TurnStartParams};
+
+    let codex = real_codex();
+    let s = Scratch::new("turn-reviewer");
+    let outside = s.dir("outside");
+    let file = |name: &str| outside.join(name);
+    let escalate = |call: &str, prompt: &str, name: &str| {
+        Step::exec(call, &format!("touch {}", text_of(&file(name))), true)
+            .when_body_has(prompt)
+            .unless_body_has(&format!("\"{call}\""))
+    };
+    let model = ScriptedModel::start(vec![
+        escalate("m1", "PROMPT-MANUAL", "manual"),
+        escalate("a1", "PROMPT-AUTO", "auto"),
+    ])
+    .expect("model");
+    let home = s.dir("home");
+    write_home(&home, &model, "");
+    let project = s.dir("proj");
+    write_project(&project, "");
+
+    let mut peer = Peer::start(&codex, &home, &project, decline_all());
+    let config = session_config(&plan(&project, DirTrust::Untrusted)).expect("config");
+    let params = serde_json::to_value(ThreadStartParams::new(
+        text_of(&project).to_string(),
+        Reviewer::Agent,
+        config,
+    ))
+    .expect("params");
+    let thread = start_thread(&mut peer, params);
+    assert_eq!(
+        json_str(&thread.answer, "/approvalsReviewer"),
+        Some("auto_review"),
+        "the thread should start under Codex's own reviewer"
+    );
+
+    let thread_id = thread.id.clone();
+    let turn = |peer: &mut Peer, text: &str, reviewer: Reviewer| -> (String, String) {
+        let params =
+            serde_json::to_value(TurnStartParams::new(thread_id.clone(), text.to_string(), reviewer)).expect("params");
+        let answer = peer.call(method::TURN_START, params).expect("turn/start");
+        let id = json_str(&answer, "/turn/id").expect("a turn id").to_string();
+        let status = peer
+            .wait_turn(&thread_id, &id, TURN_BUDGET)
+            .unwrap_or_else(|| panic!("the turn did not end; stderr: {}", peer.stderr_tail()));
+        (id, status)
+    };
+    let reviews_in = |peer: &Peer, turn: &str| -> Vec<String> {
+        peer.notes
+            .iter()
+            .filter(|n| n.method == method::AUTO_REVIEW_STARTED || n.method == method::AUTO_REVIEW_COMPLETED)
+            .filter(|n| json_str(&n.params, "/turnId") == Some(turn))
+            .map(|n| format!("{} {}", n.method, n.params.get("review").cloned().unwrap_or_default()))
+            .collect()
+    };
+    let asked_in = |peer: &Peer, turn: &str| -> usize {
+        peer.requests
+            .iter()
+            .filter(|r| r.method == method::COMMAND_APPROVAL)
+            .filter(|r| json_str(&r.params, "/turnId") == Some(turn))
+            .count()
+    };
+
+    let (manual, manual_status) = turn(&mut peer, "PROMPT-MANUAL", Reviewer::User);
+    let manual_reviews = reviews_in(&peer, &manual);
+    let manual_asked = asked_in(&peer, &manual);
+    eprintln!(
+        "turn with reviewer user on an auto_review thread: status {manual_status}, {manual_asked} approval \
+         request(s) to the client, reviews by Codex: {manual_reviews:?}, file written: {}",
+        file("manual").exists()
+    );
+
+    let (auto, auto_status) = turn(&mut peer, "PROMPT-AUTO", Reviewer::Agent);
+    let auto_reviews = reviews_in(&peer, &auto);
+    let auto_asked = asked_in(&peer, &auto);
+    eprintln!(
+        "control turn with reviewer auto_review: status {auto_status}, {auto_asked} approval request(s) to the \
+         client, reviews by Codex: {auto_reviews:?}"
+    );
+    peer.close();
+
+    assert!(
+        manual_reviews.is_empty(),
+        "Codex's own reviewer acted in a turn started with reviewer user: {manual_reviews:?}"
+    );
+    assert_eq!(
+        manual_asked, 1,
+        "the escalation in a turn started with reviewer user should reach the client once"
+    );
+    assert!(!file("manual").exists(), "a declined command ran");
+    assert!(
+        !auto_reviews.is_empty(),
+        "the control turn showed no review by Codex's own reviewer ({auto_asked} request(s) reached the \
+         client): this harness cannot tell the two reviewers apart"
+    );
+}
+
 // ------------------------------------------------------------------------------------ interrupts
 
 /// Interrupting: a running turn ends `interrupted` at once; an approval left unanswered is resolved by the

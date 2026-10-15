@@ -38,7 +38,7 @@ const session = (n: number): ResumableSession => ({
   provider: "claude", providerSessionId: `id-${n}-0000000000`, createdAt: "1", updatedAt: "2", title: `about ${n}`, name: null,
 });
 const HELLO: Hello = {
-  backend: "sidecar", projectDir: "/p", permissionModes: ["auto", "bypass"],
+  backend: "sidecar", projectDir: "/p", permissionModes: ["manual", "auto", "bypass"],
   resumableSessions: Array.from({ length: 10 }, (_, i) => session(i)), expectedVerdandiRevision: "28a5e4c",
   account: null,
 };

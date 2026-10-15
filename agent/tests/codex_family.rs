@@ -742,6 +742,84 @@ fn family_turn_while_tab_idle_opens_a_tab_turn() {
     assert_eq!(send(&provider, &thread, "next").expect("the tab is idle"), "t2");
 }
 
+// ---------------------------------------------------------------- Codex's own reviewer in a child's turn
+
+fn auto_review_completed(thread: &str, turn: &str, item: &str) -> Value {
+    write(json!({"method": "item/autoApprovalReview/completed", "params": {
+        "threadId": thread, "turnId": turn, "startedAtMs": 1, "reviewId": "rv1",
+        "targetItemId": item, "decisionSource": "agent",
+        "review": {"status": "approved", "riskLevel": "low", "userAuthorization": null, "rationale": "fine"},
+        "action": {"type": "command", "source": "shell", "command": "touch x", "cwd": "/work/proj"},
+    }}))
+}
+
+/// A subagent's turn that begins inside a tab turn started with reviewer `user` runs under that turn's
+/// reviewer: Codex's own reviewer taking up a request in it fails the session, as it would in the tab's
+/// own turn.
+#[test]
+fn codex_reviewing_in_a_childs_turn_inside_a_user_turn_trips() {
+    let (provider, _thread) = running(
+        "tab",
+        "t1",
+        vec![
+            announce("tab", "t1", "child", "/root/child"),
+            turn_started("child", "c1"),
+            item_event(
+                "item/started",
+                "child",
+                "c1",
+                command_item("x", "touch x", "inProgress"),
+            ),
+            auto_review_completed("child", "c1", "x"),
+        ],
+    );
+    let events = pump_until(&provider, |events| mismatch_of(events).is_some());
+    let (requested, reported) = mismatch_of(&events).expect("a tripwire");
+    assert!(requested.contains("\"user\""), "{requested}");
+    assert!(reported.contains("item/autoApprovalReview/completed"), "{reported}");
+}
+
+/// A child's turn that opens a tab turn while the tab is idle was not started under any reviewer Eitri
+/// named, so a review in it is shown as a verdict and trips nothing.
+#[test]
+fn a_review_in_a_childs_turn_opened_while_the_tab_is_idle_does_not_trip() {
+    let (provider, _thread) = running(
+        "tab",
+        "t1",
+        vec![
+            announce("tab", "t1", "child", "/root/child"),
+            turn_completed("tab", "t1", "completed"),
+            json!({"sleep_ms": 100}),
+            turn_started("child", "c9"),
+            item_event(
+                "item/started",
+                "child",
+                "c9",
+                command_item("late", "touch late", "inProgress"),
+            ),
+            auto_review_completed("child", "c9", "late"),
+            item_event(
+                "item/completed",
+                "child",
+                "c9",
+                command_item("late", "touch late", "completed"),
+            ),
+            turn_completed("child", "c9", "completed"),
+        ],
+    );
+    let all = pump_until(&provider, |events| {
+        events.iter().filter(|e| is_completed(e)).count() >= 2
+    });
+    assert!(mismatch_of(&all).is_none(), "{all:#?}");
+    assert!(
+        all.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::PermissionDenied { reason_type: Some(kind), .. } if kind == "auto_review_approved"
+        )),
+        "the verdict is a note as in Auto: {all:#?}"
+    );
+}
+
 // ---------------------------------------------------------------- an end that cannot be read
 
 /// A `turn/completed` over the line cap, for `thread`'s turn `turn`.

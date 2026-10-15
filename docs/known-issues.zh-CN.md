@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=55f72cd5409642ba339f49cd2655eee9f80bb260b74e45c88d8c4c1454effbf7 -->
+<!-- translated-from: known-issues.md sha256=383dac73bc670b17e24c032acd11f93da599ebd4d18f54347dcab5a1249c147e -->
 
 # 已知问题与限制
 
@@ -50,7 +50,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **在 Auto 标签页里，Claude Code 自己的 auto 模式可能不经询问就让 agent 在 `.git/` 下写文件**，包括新建一个 git hook。回合审阅不显示 `.git/` 下的改动，信任提问盯的是 `.claude/`、`.mcp.json` 和 `CLAUDE.md`，不是 `.git/`。在你在意的仓库里跑完一个回合后，值得看一眼 `ls .git/hooks`。相反，`.claude/` 下的改动会让 Eitri 在下一个会话之前重新提出信任提问。
 - **你自己 Claude Code 设置里的 hook（或者一个已信任项目的 hook）可以在你批准之后改掉工具调用。** Claude Code 在 Eitri 看过原始输入之后才应用 hook 改写过的输入；如果 Claude Code 随后再询问，它的卡片显示改写后的输入，而工具那一行显示原始的。在终端里 hook 也是这样工作的。
 - **已信任项目的 `permissions.allow` 规则，只有在你也在终端 `claude` 里信任过那个目录时，才会作用到 Auto 标签页。** 这是 Claude Code 自己的规则；你用户设置里的规则始终有效。
-- **在 bypass 标签页里，你自己的 ask 规则什么也拦不住。** 从 0.2.2 起，bypass 也会批准 Claude Code 自己提出的问题，包括你的 `permissions.ask` 规则（或被信任项目的）强制它提出的问题，不出卡片；工具那一行会注明它是在 bypass 下放行的。需要 ask 规则起作用的地方，请用 Auto 标签页。
+- **在 bypass 标签页里，你自己的 ask 规则什么也拦不住。** 从 0.2.2 起，bypass 也会批准 Claude Code 自己提出的问题，包括你的 `permissions.ask` 规则（或被信任项目的）强制它提出的问题，不出卡片；工具那一行会注明它是在 bypass 下放行的。需要 ask 规则起作用的地方，请用 Manual 或 Auto 标签页。
 - **底部终端可以写你的剪贴板，这是有意为之。** 在那里运行的程序可以用 OSC 52 转义序列设置剪贴板或主选区（和 Alacritty 的默认行为一样）；发生时 Eitri 不会提示，所以你接下来粘贴的内容可能不是你复制的。读取剪贴板则会被拒绝。
 - **agent 面板的脚本策略是新的，只在测试里检查过，还没有在每一种环境的屏幕上看过。** 面板现在只允许自己的那段脚本（按哈希），不再允许任意内联脚本。如果更新后 agent 面板一直是空白，请连同你的 WebKitGTK 版本一起报告。
 
@@ -64,7 +64,7 @@ Codex 的标签页，以及用 `eitri.agent.register` 注册的 agent 的标签�
 - **子 agent 关不掉。** Codex 的子 agent 继承标签页的沙箱和信任回答；它们自己的文字不会显示。
 - **模型在自己那次调用之后留在后台继续运行的命令，会比正常结束的回合活得更久。** 回合不会为它等着：状态栏会显示有几个在运行，那个回合的审查会说明之后的改动不在其中，`<leader>k` 会通过停掉 Codex 会话来停掉它们（先问一个 `y/n`；对话之后可以恢复）。在那之后的中断，或者关闭标签页，也会停掉它们。
 - **你的钩子可能抢先回答。** 你自己的 Codex 配置里的 `PermissionRequest` 钩子，可能在 Eitri 看到请求之前就回答了它。没有测过的有：钩子在批准之后改写命令、每种 MCP 批准模式的行为、来自市场清单的插件在已信任的项目里加载、恢复一个有真实 Codex 客户端占着的线程、子 agent 的文件改动批准，以及沙箱能不能够到你的会话总线、tmux 或 nvim。
-- **这些 agent 没有 Eitri 一侧的分类器或保存的规则。** 到达 Eitri 的每个请求，在 Auto 下是一张卡片，在 Bypass 下由 Eitri 批准。
+- **这些 agent 没有 Eitri 一侧的分类器或保存的规则。** 到达 Eitri 的每个请求，在 Manual 和 Auto 下是一张卡片，在 Bypass 下由 Eitri 批准。
 - **ACP agent 只在 `y` 之后才启动**，因为 Eitri 没法不让它加载项目自己的配置；`n` 什么也不启动，也不会被记住。`project_files` 是你的清单：Eitri 只对你在那里点名的东西做哈希。Eitri 不清理 agent 的环境，所以把环境变量里的相对路径当作配置目录的 agent，会去读项目的目录。
 - **ACP agent 不经询问运行什么，是 agent 自己的事。** Eitri 显示它收到的请求，只设置注册里点名的那个模式。这类标签页没有速率限制、上下文条、斜杠命令列表或模型选择器，`<leader>t`（在终端里继续）对它们也还不可用。
 

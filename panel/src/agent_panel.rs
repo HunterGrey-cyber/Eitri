@@ -1535,17 +1535,20 @@ impl AgentPanelHandle {
 
     /// `agent.default_mode` as `init.lua` left it (`None`: unset), applied once after it ran. A mode
     /// Shift+Tab left for this project keeps winning; otherwise the empty tab the window already has,
-    /// and every new one, start in it. Naming bypass here is the user's own answer to the question
-    /// that is otherwise asked every time, so saved bypass tabs also come back in bypass unasked.
+    /// and every new one, start in it (an agent that offers no manual mode starts in auto instead).
+    /// Naming bypass here is the user's own answer to the question that is otherwise asked every time,
+    /// so saved bypass tabs also come back in bypass unasked.
     pub fn set_default_mode(&self, mode: Option<SessionModeChoice>) {
         self.wake();
         let mut state = self.state.borrow_mut();
         state.bypass_by_config = mode == Some(SessionModeChoice::Bypass);
-        if let Some(mode) = mode {
-            if !state.mode_remembered {
-                state.tabs.apply_configured_default(mode);
-            }
+        let Some(mode) = mode else { return };
+        let remembered = state.mode_remembered.then(|| state.tabs.default_mode());
+        if remembered.is_none() {
+            state.tabs.apply_configured_default(mode);
         }
+        // Said here, where it is decided, so the log never claims a mode new tabs do not start in.
+        eprintln!("{}", default_mode_said(mode, remembered));
     }
 
     /// `agent.default` as `init.lua` left it, applied once after it ran: every tab made without naming
@@ -2446,6 +2449,24 @@ fn tabs_payload_recorded(state: &mut AgentPanelState) -> String {
 fn send_tabs(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     let payload = tabs_payload_recorded(&mut state.borrow_mut());
     page.send(&payload);
+    send_mode_note(state, page);
+}
+
+/// What the tab set noted about a tab that could not take the window's mode (an agent with no
+/// manual mode started in auto), said once in the page's transient slot, after the `tabs` that
+/// shows the tab. Kept until a page is ready to show it.
+fn send_mode_note(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+    let note = {
+        let mut state_ref = state.borrow_mut();
+        if !state_ref.document_ready {
+            return;
+        }
+        state_ref.tabs.take_mode_note()
+    };
+    if let Some(note) = note {
+        eprintln!("[permission] {note}");
+        page.send(&eitri_core::agent_bridge::serialize_notice_for_js(&note));
+    }
 }
 
 /// Hands nvim `request` through `main.rs`'s hook, which shows and focuses the editor first.
@@ -2779,6 +2800,7 @@ fn send_tabs_if_changed(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) 
     };
     if let Some(payload) = payload {
         page.send(&payload);
+        send_mode_note(state, page);
     }
 }
 
@@ -4149,12 +4171,13 @@ fn detail_rows(
 
 /// What Codex does without asking, for `prefix i`: the sandbox's reach and every route around it, as
 /// they were measured, not softened. `root` is the project the sandbox is rooted at; the second half
-/// of the sentence follows the tab's mode, since in bypass Eitri answers what Codex's reviewer would.
-fn codex_runs_without_asking(root: &Path, bypass: bool) -> String {
-    let who_decides = if bypass {
-        "Eitri allows anything else"
-    } else {
-        "its reviewer decides anything else"
+/// of the sentence follows the tab's mode: in auto Codex's reviewer decides, in manual every such
+/// request is a card, and in bypass Eitri allows it.
+fn codex_runs_without_asking(root: &Path, mode: SessionModeChoice) -> String {
+    let who_decides = match mode {
+        SessionModeChoice::Bypass => "Eitri allows anything else",
+        SessionModeChoice::Manual => "you decide anything else on a card",
+        SessionModeChoice::Auto => "its reviewer decides anything else",
     };
     format!(
         "Codex runs commands and edits inside {} without asking, reads anywhere, no network or sockets; \
@@ -4165,10 +4188,12 @@ fn codex_runs_without_asking(root: &Path, bypass: bool) -> String {
 }
 
 /// What a mode change does to a Codex tab and when: Eitri's own answers follow it at once, Codex's
-/// reviewer only at the next turn.
+/// reviewer only at the next turn. Codex's reviewer is the user's in manual and bypass, its own in auto.
 const CODEX_MODE_LAG: &str = "a mode change reaches Codex's reviewer at the next turn; a running turn keeps the \
-     reviewer it started with (bypass to auto: Codex keeps asking and Eitri now draws cards; auto to bypass: \
-     Codex's reviewer still decides for the rest of that turn and Eitri accepts what still arrives)";
+     reviewer it started with (a turn started in manual or bypass: Codex asks about everything outside its \
+     sandbox for the rest of it, and Eitri draws a card, or accepts in bypass; a turn started in auto: Codex's \
+     reviewer still decides for the rest of it, and Eitri draws a card for what still arrives, or accepts it \
+     in bypass)";
 
 /// What an ACP agent runs without a question. Eitri sets only the mode the registration names, once at the
 /// start, and does not know what any mode of the agent lets through; without one the agent's own default
@@ -4285,14 +4310,13 @@ fn external_detail_rows(
         ProjectTrust::Trusted => "loaded",
         ProjectTrust::Untrusted => "not loaded",
     };
-    let bypass = tab.mode() == SessionModeChoice::Bypass;
     let (backend_name, session_label, settings, runs_without_asking, mode_lag, limits_label, limits_value) = if is_codex
     {
         (
             "codex app-server".to_string(),
             "thread",
             codex_settings_row(configuration_home.as_deref(), project_loaded),
-            codex_runs_without_asking(project_dir, bypass),
+            codex_runs_without_asking(project_dir, tab.mode()),
             CODEX_MODE_LAG.to_string(),
             "limits",
             limits.as_ref().map(limits_row),
@@ -5870,31 +5894,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         // `apply_confirm_bypass`, below, is what a later `confirm_bypass` message answers it with.
         InboundMessage::CycleMode { .. } => {
             let tab = tab_of(target);
-            let was_empty = matches!(
-                state.borrow().tabs.get(tab).map(|t| &t.backend),
-                Some(TabBackend::NotStarted)
-            );
             // Bound as its own statement, not the match scrutinee: edition 2021 keeps a match
-            // scrutinee's temporaries alive for the whole match, so `state.borrow_mut()` here would
-            // otherwise still hold the `RefCell`'s mutable borrow while the `Changed` arm below calls
-            // `send_tabs`, which itself needs `state.borrow_mut()` -- a reproducible panic ("already
-            // borrowed") once a tab could actually reach `Changed` by leaving bypass.
-            let outcome = state.borrow_mut().tabs.cycle_mode(tab);
+            // scrutinee's temporaries alive for the whole match, and the `Changed` arm below calls
+            // `send_tabs`, which needs `state.borrow_mut()`.
+            let outcome = cycle_tab_mode(state, tab);
             match outcome {
-                Ok(eitri_core::tab_set::ModeCycle::Changed(mode)) => {
-                    if was_empty {
-                        let (prefs_dir, project_dir) = {
-                            let state_ref = state.borrow();
-                            (state_ref.prefs_dir.clone(), state_ref.project_dir.clone())
-                        };
-                        // Remembered for the next empty tab and the next launch. A
-                        // failure to write is logged, not refused: the mode itself did change.
-                        if let Some(dir) = prefs_dir {
-                            if let Err(e) = eitri_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
-                                eprintln!("[agent_panel] could not remember the permission mode: {e}");
-                            }
-                        }
-                    }
+                Ok(eitri_core::tab_set::ModeCycle::Changed(_)) => {
                     send_tabs(state, page);
                     ok(page);
                 }
@@ -6276,6 +6281,59 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             }
         },
     }
+}
+
+/// The log line for `init.lua`'s `agent.default_mode` = `configured`, given the mode this project
+/// remembers from Shift+Tab, if any, which beats it.
+fn default_mode_said(configured: SessionModeChoice, remembered: Option<SessionModeChoice>) -> String {
+    match remembered {
+        Some(kept) => format!(
+            "[agent] init.lua's agent.default_mode is {}, but this project remembers {} (Shift+Tab on an empty \
+             tab), which wins: new tabs start in {}",
+            configured.as_str(),
+            kept.as_str(),
+            kept.as_str()
+        ),
+        None => format!(
+            "[agent] new tabs start in {} (init.lua's agent.default_mode){}",
+            configured.as_str(),
+            if configured == SessionModeChoice::Manual {
+                "; a tab of an agent with no manual mode starts in auto"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+/// The `CycleMode` arm's WebView-free body: `TabSet::cycle_mode` on `tab`, plus remembering the mode an
+/// empty tab moved to, for the next empty tab and the next launch. `TabSet::cycle_mode` can reach
+/// `Changed` on a live tab too, so whether the tab was empty is read before the call. Only a mode the
+/// user moved to on a tab that offers every mode is remembered: a tab whose agent has no manual takes
+/// auto in its place when it leaves bypass, which nobody chose, and remembered it would beat
+/// `init.lua`'s default on every later launch. A failure to write is logged, not refused: the mode
+/// itself did change.
+fn cycle_tab_mode(state: &Rc<RefCell<AgentPanelState>>, tab: TabId) -> Result<eitri_core::tab_set::ModeCycle, String> {
+    let remembered_if_moved = state
+        .borrow()
+        .tabs
+        .get(tab)
+        .is_some_and(|t| matches!(t.backend, TabBackend::NotStarted) && !t.agent().mode_fixed_at_start());
+    let outcome = state.borrow_mut().tabs.cycle_mode(tab);
+    if let Ok(eitri_core::tab_set::ModeCycle::Changed(mode)) = &outcome {
+        if remembered_if_moved {
+            let (prefs_dir, project_dir) = {
+                let state_ref = state.borrow();
+                (state_ref.prefs_dir.clone(), state_ref.project_dir.clone())
+            };
+            if let Some(dir) = prefs_dir {
+                if let Err(e) = eitri_core::agent_prefs::save_mode(&dir, &project_dir, *mode) {
+                    eprintln!("[agent_panel] could not remember the permission mode: {e}");
+                }
+            }
+        }
+    }
+    outcome
 }
 
 /// `cycle_default_mode`: `TabSet::cycle_default_mode` plus remembering the new default on
@@ -6998,6 +7056,47 @@ mod tests {
             Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
         );
         (handle, page, host)
+    }
+
+    /// A new tab of an agent that offers no manual mode, under a manual window default, starts in
+    /// auto, and the page is told so once, in its transient slot, after the `tabs` that shows it.
+    #[test]
+    fn a_new_acp_tab_under_a_manual_default_is_announced_once() {
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual));
+        let page = Rc::new(RecordingPage::default());
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        let notices = || {
+            page.sent
+                .borrow()
+                .iter()
+                .filter(|e| kind_of(e) == "notice")
+                .map(|e| {
+                    serde_json::from_str::<serde_json::Value>(e).unwrap()["text"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(notices().is_empty(), "{:?}", notices());
+        handle.new_tab_for(AgentId::Codex);
+        assert!(notices().is_empty(), "Codex offers manual: {:?}", notices());
+        handle.new_tab_for(AgentId::Acp("gem".into()));
+        let said = notices();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("gem tabs have no manual mode"), "{said:?}");
+        let sent = page.sent.borrow().clone();
+        let last_tabs = sent.iter().rposition(|e| kind_of(e) == "tabs").unwrap();
+        let notice = sent.iter().rposition(|e| kind_of(e) == "notice").unwrap();
+        assert!(last_tabs < notice, "the tab is on screen before it is spoken of");
+        assert_eq!(state.borrow().tabs.active_tab().mode(), SessionModeChoice::Auto);
+        handle.new_tab_for(AgentId::Claude);
+        assert_eq!(notices().len(), 1, "once");
+        assert_eq!(state.borrow().tabs.active_tab().mode(), SessionModeChoice::Manual);
     }
 
     /// A page that panics if a send happens inside another send: the contract every host keeps.
@@ -8390,10 +8489,10 @@ mod tests {
     }
 
     /// Bypass is never remembered on disk: `save_mode` refuses it outright. Auto -> bypass
-    /// always asks first and writes nothing either way; only leaving bypass (always to Auto,
-    /// which is allowed) is ever remembered.
+    /// always asks first and writes nothing either way; leaving bypass (to manual) and manual ->
+    /// auto are remembered.
     #[test]
-    fn cycle_default_mode_moves_the_default_and_remembers_auto_only_on_disk() {
+    fn cycle_default_mode_moves_the_default_and_never_remembers_bypass_on_disk() {
         let dir = agent::state_dirs::test_workspace_dir("panel-cycle-default-mode");
         let prefs_dir = dir.join("prefs");
         let project_dir = dir.join("project");
@@ -8438,12 +8537,78 @@ mod tests {
             "still nothing on disk while bypass"
         );
 
-        // Leaving bypass moves at once and IS remembered -- it is Auto, which is allowed.
+        // Leaving bypass moves at once, to manual, and IS remembered -- manual is allowed.
+        assert_eq!(
+            cycle_default_mode(&state),
+            eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Manual)
+        );
+        assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Manual);
+        assert_eq!(
+            eitri_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            eitri_core::agent_prefs::LoadedMode::Remembered(SessionModeChoice::Manual)
+        );
+        // Manual -> auto moves at once and is remembered too.
         assert_eq!(
             cycle_default_mode(&state),
             eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto)
         );
-        assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Auto);
+        assert_eq!(
+            eitri_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            eitri_core::agent_prefs::LoadedMode::Remembered(SessionModeChoice::Auto)
+        );
+    }
+
+    /// The log says what new tabs start in: init.lua's mode, or the remembered one that beats it.
+    #[test]
+    fn the_default_mode_log_names_the_mode_that_wins() {
+        let said = default_mode_said(SessionModeChoice::Manual, None);
+        assert!(said.starts_with("[agent] new tabs start in manual (init.lua"), "{said}");
+        let said = default_mode_said(SessionModeChoice::Manual, Some(SessionModeChoice::Auto));
+        assert!(said.ends_with("new tabs start in auto"), "{said}");
+        assert!(said.contains("agent.default_mode is manual"), "{said}");
+    }
+
+    /// Shift+Tab on an empty tab remembers the mode it moved to, except where the tab's agent has no
+    /// manual: leaving bypass there lands on auto only because that agent offers nothing stricter, so
+    /// nothing is written and init.lua's manual default is not beaten on the next launch. The window
+    /// default stays manual.
+    #[test]
+    fn leaving_bypass_on_an_empty_acp_tab_remembers_nothing() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-cycle-acp-tab");
+        let prefs_dir = dir.join("prefs");
+        let project_dir = dir.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        let claude = set.active();
+        let acp = set.open(eitri_core::tab_set::AgentId::Acp("gem".into()));
+        let state = state_for_hooks(set);
+        state.borrow_mut().prefs_dir = Some(prefs_dir.clone());
+        state.borrow_mut().project_dir = project_dir.clone();
+        assert_eq!(set_mode(&state, acp), SessionModeChoice::Auto);
+
+        let plan = match cycle_tab_mode(&state, acp) {
+            Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => plan,
+            other => panic!("auto -> bypass asks: {other:?}"),
+        };
+        apply_confirm_bypass(&state, plan.scope, plan.nonce).unwrap();
+        assert_eq!(set_mode(&state, acp), SessionModeChoice::Bypass);
+        assert_eq!(
+            cycle_tab_mode(&state, acp),
+            Ok(eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto))
+        );
+        assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Manual);
+        assert_eq!(
+            eitri_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            eitri_core::agent_prefs::LoadedMode::Missing,
+            "a stand-in mode is not remembered"
+        );
+
+        // The same move on an empty Claude tab is remembered, as before.
+        state.borrow_mut().tabs.select(claude);
+        assert_eq!(
+            cycle_tab_mode(&state, claude),
+            Ok(eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto))
+        );
         assert_eq!(
             eitri_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
             eitri_core::agent_prefs::LoadedMode::Remembered(SessionModeChoice::Auto)
@@ -12738,6 +12903,14 @@ mod tests {
         assert!(value("runs without asking").contains("; Eitri allows anything else, which then runs"));
         assert!(!value("runs without asking").contains("reviewer"));
         assert!(value("settings").ends_with("this project's: loaded"));
+
+        // Manual hands every review to the user: a card, never Codex's reviewer.
+        let rows = codex_rows(SessionModeChoice::Manual, ProjectTrust::Trusted);
+        let value = |label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
+        assert_eq!(value("mode"), "manual");
+        assert!(value("runs without asking").contains("; you decide anything else on a card, which then runs"));
+        assert!(!value("runs without asking").contains("reviewer"));
+        assert!(value("mode lag").contains("a turn started in manual or bypass"));
     }
 
     /// An ACP tab says what Eitri knows of what the agent runs unasked (only the mode it registered, or

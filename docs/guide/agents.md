@@ -99,10 +99,14 @@ this Codex… (once for this binary, a few seconds)".
   `XDG_RUNTIME_DIR` nor your cache directory is elsewhere, the check cannot tell a held sandbox from a broken one
   and fails; set `XDG_STATE_HOME` to a directory outside them.
 
-### Auto and bypass in a Codex tab
+### Manual, auto and bypass in a Codex tab
 
-`Shift+Tab` switches the tab between Auto and Bypass as in any tab, with the same question when entering
-bypass. The modes mean something different here, because Codex has its own approval flow:
+`Shift+Tab` cycles the tab through Manual, Auto and Bypass as in any Claude tab, with the same question when
+entering bypass. The modes mean something different here, because Codex has its own approval flow:
+
+- **Manual.** Codex's reviewer is turned over to you: whenever Codex needs to leave its sandbox it asks, and every
+  such request is a card. Manual does not reach inside the sandbox: commands and edits there still run without a
+  request, as in every mode (below).
 
 - **Auto.** Codex runs under its own reviewer. When it needs to leave its sandbox, its reviewer decides. A call
   the reviewer allowed or refused gets a note on its row: `allowed by auto review: ...` or `blocked by auto
@@ -114,7 +118,8 @@ Whatever the mode, Eitri's classifier, your saved rules and the "defer to Claude
 do not apply to Codex; a request is a card, or answered by the reviewer, or answered as described next.
 
 A mode change takes effect in Eitri at once and in Codex's reviewer at the next turn: a running turn keeps the
-reviewer it started with. `<prefix> i` says so in the `mode lag` row.
+reviewer it started with (a turn started in Manual or Bypass keeps asking about everything outside the sandbox; a
+turn started in Auto keeps its reviewer). `<prefix> i` says so in the `mode lag` row.
 
 **Approve and deny on a card.** `a` approves once and nothing is remembered; there is no "always allow". `d`
 denies and the turn goes on. `D` flashes that Codex takes no reason with a denial. `Ctrl+c` interrupts the
@@ -142,8 +147,8 @@ project's Codex configuration cannot widen it. Inside it:
 - **Commands your own exec-policy `allow` rules cover run outside the sandbox**, with no request.
 - **MCP tools follow the approval mode of their server.** A tool whose server needs no approval runs with no
   request.
-- A request to leave the sandbox is decided by the reviewer in Auto and approved by Eitri in Bypass. A command
-  approved that way runs with your full rights.
+- A request to leave the sandbox is a card in Manual, decided by the reviewer in Auto and approved by Eitri in
+  Bypass. A command approved that way runs with your full rights.
 
 `<prefix> i` spells this out for the tab on screen in the `runs without asking` row, and the row follows the
 tab's mode.
@@ -240,7 +245,10 @@ sets and checks nothing, and `prefix i` says in its `runs without asking` row th
 agent runs without asking.
 
 Eitri's Auto and Bypass are Eitri's own: they decide how Eitri answers the agent's requests, at once, and never
-change the agent's mode. The `mode lag` row says there is none.
+change the agent's mode. The `mode lag` row says there is none. A tab of a registered agent has no Manual mode:
+the agent's own mode is set once, at the start, so Eitri cannot make it stricter afterwards. `Shift+Tab` there
+switches between Auto and Bypass, and a new tab of such an agent, opened while new tabs start in Manual, starts in
+Auto and Eitri says so once.
 
 ### Cards
 

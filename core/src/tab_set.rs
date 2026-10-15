@@ -654,8 +654,8 @@ pub fn running_in_background(n: u32) -> String {
     }
 }
 
-/// Result of `cycle_mode`/`cycle_default_mode`: bypass -> auto changes at once; auto -> bypass
-/// returns a confirmation prompt without changing the mode.
+/// What `cycle_mode`/`cycle_default_mode` return: manual -> auto and leaving bypass move at once;
+/// auto -> bypass always needs a confirm first, never applied here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModeCycle {
     Changed(SessionModeChoice),
@@ -794,6 +794,9 @@ pub struct TabSet {
     recency: Vec<TabId>,
     /// A restore's bypass question on screen, if any: at most one prompt at a time, as `pending_bypass`.
     pending_restore: Option<PendingRestore>,
+    /// Said once on the page when a tab could not take the window's mode (an agent that offers no
+    /// manual mode starts in auto instead): [`TabSet::take_mode_note`].
+    mode_note: Option<String>,
     /// Set once the window has taken the tabs away to close them (`take_all`). A set that has none
     /// left must not be mistaken for a user who closed every tab.
     closing: bool,
@@ -868,6 +871,7 @@ impl TabSet {
             rules: agent::PrefixRules::default(),
             recency: Vec::new(),
             pending_restore: None,
+            mode_note: None,
             closing: false,
             turn_review: None,
             turn_review_off: false,
@@ -1118,6 +1122,9 @@ impl TabSet {
     pub fn get(&self, id: TabId) -> Option<&Tab> {
         self.tabs.iter().find(|t| t.id == id)
     }
+    fn position(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
     pub fn get_mut(&mut self, id: TabId) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|t| t.id == id)
     }
@@ -1132,6 +1139,36 @@ impl TabSet {
         self.default_mode
     }
 
+    /// `wanted` if a tab of `agent` offers it, else the mode it takes instead, noting once for the
+    /// page that tab `number` did not get the mode it was to have. Only Manual can be missing (an ACP
+    /// agent's own mode is set once at its start, so Eitri cannot make it stricter), and Auto stands in.
+    fn mode_offered_to(&mut self, agent: &AgentId, wanted: SessionModeChoice, number: u16) -> SessionModeChoice {
+        let mode = agent.offered_mode(wanted);
+        if mode != wanted {
+            self.mode_note = Some(format!(
+                "{} tabs have no {} mode (the agent's own mode is set once, at its start): tab {number} is in {}",
+                agent.label(),
+                wanted.as_str(),
+                mode.as_str()
+            ));
+        }
+        mode
+    }
+
+    /// Puts the tab at `at` in `wanted`, or in what its agent offers instead, noting it for the page as
+    /// [`TabSet::mode_offered_to`] does. Every route that gives an existing tab a mode goes through
+    /// here, so a tab that did not get the mode it was to have is always said, and only that tab.
+    fn give_mode(&mut self, at: usize, wanted: SessionModeChoice) {
+        let (agent, number) = (self.tabs[at].agent.clone(), self.tabs[at].number);
+        let mode = self.mode_offered_to(&agent, wanted, number);
+        self.tabs[at].mode = mode;
+    }
+
+    /// The note [`TabSet::mode_offered_to`] left, once: the page shows it in its transient slot.
+    pub fn take_mode_note(&mut self) -> Option<String> {
+        self.mode_note.take()
+    }
+
     /// Rules apply to every tab from the next pump. A rule added after a card appeared does not
     /// answer that card.
     pub fn set_rules(&mut self, rules: agent::PrefixRules) {
@@ -1144,11 +1181,22 @@ impl TabSet {
 
     /// `prefix c`: a new empty tab at the lowest free number, selected, running `agent`.
     pub fn open(&mut self, agent: AgentId) -> TabId {
+        self.open_tab(agent, true)
+    }
+
+    /// [`TabSet::open`]; `told` false leaves the page untold about a mode the agent does not offer, for
+    /// a caller that gives the tab its own agent and mode at once (a restore), which says it then.
+    fn open_tab(&mut self, agent: AgentId, told: bool) -> TabId {
         let used: Vec<u16> = self.tabs.iter().map(|t| t.number).collect();
         let id = TabId(self.next_id);
         self.next_id += 1;
-        self.tabs
-            .push(Tab::new(id, tabs::lowest_free_number(&used), self.default_mode, agent));
+        let number = tabs::lowest_free_number(&used);
+        let mode = if told {
+            self.mode_offered_to(&agent, self.default_mode, number)
+        } else {
+            agent.offered_mode(self.default_mode)
+        };
+        self.tabs.push(Tab::new(id, number, mode, agent));
         self.tabs.sort_by_key(|t| t.number);
         self.select(id);
         id
@@ -1282,10 +1330,22 @@ impl TabSet {
         backend.stop_background(shown)
     }
 
-    /// `Shift+Tab` / `<leader>m` toggles auto/bypass with an explicit `match`, rather than the N-way
-    /// `SessionModeChoice::cycled`. Leaving bypass is immediate in every tab state, including
-    /// `ended` and `failed`. Entering bypass requires `confirm_bypass`, so return a plan to show
-    /// without changing the mode.
+    /// `Shift+Tab` / `<leader>m`: cycles the tab's mode in Claude Code's order, manual -> auto ->
+    /// bypass -> manual, skipping manual on a tab whose agent does not offer it
+    /// ([`AgentId::permission_modes`]: auto <-> bypass there). An explicit `match` on the mode, never
+    /// `SessionModeChoice::cycled`, because the steps are not alike:
+    ///
+    /// - manual -> auto moves at once, on a tab whose session has not ended;
+    /// - auto -> bypass never applies here: it always needs a `confirm_bypass` first, and only the tab
+    ///   on screen can ask, so this returns a plan to show rather than a changed mode;
+    /// - leaving bypass moves at once, in every tab state including `ended`/`failed`, to manual (or
+    ///   auto where manual is not offered): the strictest mode the tab has.
+    ///
+    /// An empty tab's move carries the window default with it (there is no session yet for the mode
+    /// to be "just this tab's own"); leaving bypass on any other tab returns a bypass window default
+    /// to auto, so it is never stranded there once the tab that went with it leaves. Leaving bypass on
+    /// an empty tab whose agent has no manual puts the tab in auto but the window default in manual,
+    /// as on any other empty tab: auto there is only what that agent offers instead.
     pub fn cycle_mode(&mut self, id: TabId) -> Result<ModeCycle, String> {
         // A fresh press supersedes the open prompt. `Confirm` below stores a new one if it builds one.
         self.pending_bypass = None;
@@ -1296,22 +1356,46 @@ impl TabSet {
             .iter()
             .position(|t| t.id == id)
             .ok_or_else(|| format!("no tab {}", id.0))?;
+        let not_started = matches!(self.tabs[at].backend, TabBackend::NotStarted);
         match self.tabs[at].mode {
             SessionModeChoice::Bypass => {
+                let next = self.tabs[at].agent.offered_mode(SessionModeChoice::Manual);
                 let tab = &mut self.tabs[at];
+                tab.mode = next;
+                let number = tab.number;
+                let default_moved = if not_started {
+                    self.default_mode = SessionModeChoice::Manual;
+                    true
+                } else if self.default_mode == SessionModeChoice::Bypass {
+                    self.default_mode = SessionModeChoice::Auto;
+                    true
+                } else {
+                    false
+                };
+                eprintln!(
+                    "[permission] mode is now {} (tab {number}{})",
+                    next.as_str(),
+                    if default_moved {
+                        format!("; new sessions {}", self.default_mode.as_str())
+                    } else {
+                        String::new()
+                    }
+                );
+                Ok(ModeCycle::Changed(next))
+            }
+            SessionModeChoice::Manual => {
+                let tab = &mut self.tabs[at];
+                if matches!(tab.wire_state(), TabStateWire::Ended | TabStateWire::Failed) {
+                    return Err("the session has ended".to_string());
+                }
                 tab.mode = SessionModeChoice::Auto;
                 let number = tab.number;
-                let not_started = matches!(tab.backend, TabBackend::NotStarted);
-                // An empty tab's mode change also updates the window default because it has no session yet.
-                // Leaving bypass on any tab resets a bypass window default to auto, wherever that default came
-                // from. A live tab must not leave the default in bypass after it leaves bypass itself.
-                let default_moved = not_started || self.default_mode == SessionModeChoice::Bypass;
-                if default_moved {
+                if not_started {
                     self.default_mode = SessionModeChoice::Auto;
                 }
                 eprintln!(
                     "[permission] mode is now auto (tab {number}{})",
-                    if default_moved { "; new sessions too" } else { "" }
+                    if not_started { "; new sessions too" } else { "" }
                 );
                 Ok(ModeCycle::Changed(SessionModeChoice::Auto))
             }
@@ -1321,7 +1405,7 @@ impl TabSet {
                     TabStateWire::Ended | TabStateWire::Failed => Err("the session has ended".to_string()),
                     _ if id != self.active => Err(format!("tab {} is not the one on screen", tab.number)),
                     _ => {
-                        let scope_kind = if matches!(tab.backend, TabBackend::NotStarted) {
+                        let scope_kind = if not_started {
                             tabs::PromptScope::EmptyTab
                         } else {
                             tabs::PromptScope::LiveTab
@@ -1345,15 +1429,21 @@ impl TabSet {
     }
 
     /// `Shift+Tab` on the chooser's `New session` row or a record, once the active tab is not itself
-    /// `NotStarted`: the same auto/bypass toggle as
-    /// `cycle_mode`, applied to the window's remembered `default_mode` rather than any one tab's own
-    /// mode. Every open tab keeps whatever mode it already has.
+    /// `NotStarted`: the same cycle as `cycle_mode` (manual ->
+    /// auto -> bypass -> manual, entering bypass asked first), applied to the window's remembered
+    /// `default_mode` rather than any one tab's own mode. Every open tab keeps whatever mode it
+    /// already has; a new tab of an agent that offers no manual mode starts in auto.
     pub fn cycle_default_mode(&mut self) -> ModeCycle {
         self.pending_bypass = None;
         self.pending_restore = None;
         self.drop_trust_questions();
         match self.default_mode {
             SessionModeChoice::Bypass => {
+                self.default_mode = SessionModeChoice::Manual;
+                eprintln!("[permission] mode is now manual (new sessions)");
+                ModeCycle::Changed(SessionModeChoice::Manual)
+            }
+            SessionModeChoice::Manual => {
                 self.default_mode = SessionModeChoice::Auto;
                 eprintln!("[permission] mode is now auto (new sessions)");
                 ModeCycle::Changed(SessionModeChoice::Auto)
@@ -1396,6 +1486,11 @@ impl TabSet {
                 }
                 if self.tabs[at].mode == SessionModeChoice::Bypass {
                     return Ok(ConfirmOutcome::AlreadyBypass);
+                }
+                // Bypass is entered only from auto: a prompt left over from before the tab moved
+                // (to manual, by a path that did not drop it) is not a yes to leaving manual.
+                if self.tabs[at].mode != SessionModeChoice::Auto {
+                    return Err("that prompt is no longer current".to_string());
                 }
                 // Recompute what `y` would approve now. A card delivered after the prompt was built must
                 // never be silently approved.
@@ -1743,6 +1838,18 @@ impl TabSet {
         provider_session_id: &str,
         held_elsewhere: bool,
     ) -> ResumeRoute {
+        self.route_resume_told(from, agent, provider_session_id, held_elsewhere, true)
+    }
+
+    /// [`TabSet::route_resume`]; `told` as for [`TabSet::open_tab`].
+    fn route_resume_told(
+        &mut self,
+        from: TabId,
+        agent: &AgentId,
+        provider_session_id: &str,
+        held_elsewhere: bool,
+        told: bool,
+    ) -> ResumeRoute {
         if let Some(open) = self.tab_with_session(agent, provider_session_id) {
             self.select(open);
             return ResumeRoute::SwitchTo(open);
@@ -1757,7 +1864,7 @@ impl TabSet {
             from
         } else {
             let agent = self.get(from).map_or(AgentId::Claude, |t| t.agent.clone());
-            self.open(agent)
+            self.open_tab(agent, told)
         };
         ResumeRoute::StartIn(target)
     }
@@ -2252,6 +2359,7 @@ impl TabSet {
     /// handoff and attention, takes the resumed title, and is told the tab's rename.
     pub fn collect_starts(&mut self) -> Vec<StartCollected> {
         let mut collected = Vec::new();
+        let mut clamped: Vec<(AgentId, SessionModeChoice, u16)> = Vec::new();
         for tab in &mut self.tabs {
             let TabBackend::Starting(pending) = &tab.backend else {
                 continue;
@@ -2278,8 +2386,16 @@ impl TabSet {
                     } else {
                         tab.name = pending.resumed_name;
                     }
-                    // What runs is what the tab says it runs, whichever way it got there.
+                    // What runs is what the tab says it runs, whichever way it got there, in a mode
+                    // its agent offers.
                     tab.agent = backend.agent();
+                    let wanted = tab.mode;
+                    let number = tab.number;
+                    let agent = tab.agent.clone();
+                    tab.mode = agent.offered_mode(wanted);
+                    if tab.mode != wanted {
+                        clamped.push((agent, wanted, number));
+                    }
                     if let Some(wake) = &self.ui_wake {
                         backend.ensure_ui_wake(wake);
                     }
@@ -2322,6 +2438,9 @@ impl TabSet {
                     });
                 }
             }
+        }
+        for (agent, wanted, number) in clamped {
+            self.mode_offered_to(&agent, wanted, number);
         }
         collected
     }
@@ -2918,10 +3037,15 @@ impl TabSet {
     /// needs no question, because the question has been answered in a file the user wrote.
     pub fn apply_configured_default(&mut self, mode: SessionModeChoice) {
         self.default_mode = mode;
-        for tab in &mut self.tabs {
-            if matches!(tab.backend, TabBackend::NotStarted) {
-                tab.mode = mode;
-            }
+        let empty: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| matches!(tab.backend, TabBackend::NotStarted))
+            .map(|(at, _)| at)
+            .collect();
+        for at in empty {
+            self.give_mode(at, mode);
         }
     }
 
@@ -2929,10 +3053,19 @@ impl TabSet {
     /// startup to the tabs that exist by then and have not started: a tab's agent is fixed from the
     /// first message on, so a started or named tab keeps its own.
     pub fn apply_configured_agent(&mut self, agent: AgentId) {
-        for tab in &mut self.tabs {
-            if matches!(tab.backend, TabBackend::NotStarted) && tab.name.is_none() && tab.title.is_none() {
-                tab.agent = agent.clone();
-            }
+        let empty: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                matches!(tab.backend, TabBackend::NotStarted) && tab.name.is_none() && tab.title.is_none()
+            })
+            .map(|(at, _)| at)
+            .collect();
+        for at in empty {
+            self.tabs[at].agent = agent.clone();
+            let mode = self.tabs[at].mode;
+            self.give_mode(at, mode);
         }
     }
 
@@ -3024,12 +3157,13 @@ impl TabSet {
                     continue;
                 }
             };
-            let ResumeRoute::StartIn(target) = self.route_resume(from, &planned.agent, &id, false) else {
+            let ResumeRoute::StartIn(target) = self.route_resume_told(from, &planned.agent, &id, false, false) else {
                 continue;
             };
-            let tab = self.get_mut(target).expect("route_resume names a tab it has");
-            tab.mode = mode;
-            tab.agent = planned.agent;
+            let at = self.position(target).expect("route_resume names a tab it has");
+            self.tabs[at].agent = planned.agent;
+            self.give_mode(at, mode);
+            let tab = &mut self.tabs[at];
             let request_id = format!("restore-{}", n + 1);
             match connected {
                 RestoreConnect::Started(result_rx) => {
@@ -3098,12 +3232,13 @@ impl TabSet {
             if self.tab_with_session(&planned.agent, &id).is_some() {
                 continue;
             }
-            let ResumeRoute::StartIn(target) = self.route_resume(from, &planned.agent, &id, false) else {
+            let ResumeRoute::StartIn(target) = self.route_resume_told(from, &planned.agent, &id, false, false) else {
                 continue;
             };
-            let tab = self.get_mut(target).expect("route_resume names a tab it has");
-            tab.mode = mode;
-            tab.agent = planned.agent;
+            let at = self.position(target).expect("route_resume names a tab it has");
+            self.tabs[at].agent = planned.agent;
+            self.give_mode(at, mode);
+            let tab = &mut self.tabs[at];
             tab.failed_after_start = false;
             tab.failed_resume = Some(id.clone());
             if tab.name.is_none() {
@@ -3135,11 +3270,12 @@ impl TabSet {
         }
         match back_to {
             Some((mode, agent)) => {
-                if let Some(t) = self.get_mut(tab) {
+                if let Some(at) = self.position(tab) {
+                    let t = &mut self.tabs[at];
                     t.backend = TabBackend::NotStarted;
                     t.reported_start_failure = false;
-                    t.mode = mode;
                     t.agent = agent;
+                    self.give_mode(at, mode);
                 }
             }
             None => {
@@ -4630,9 +4766,11 @@ mod tests {
         // Leaving bypass works while `next` is on screen: the tab being changed need not be active.
         assert_eq!(
             set.cycle_mode(tab),
-            Ok(ModeCycle::Changed(SessionModeChoice::Auto)),
-            "leaving bypass on a live tab moves at once"
+            Ok(ModeCycle::Changed(SessionModeChoice::Manual)),
+            "leaving bypass on a live tab moves at once, to manual"
         );
+        // Manual -> auto moves at once too, and needs no tab on screen.
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
         // Entering bypass again still requires confirmation once `tab` is back on screen,
         // just as it did before the session started.
         set.select(tab);
@@ -4674,8 +4812,24 @@ mod tests {
         );
         assert_eq!(
             set.cycle_default_mode(),
+            ModeCycle::Changed(SessionModeChoice::Manual),
+            "leaving bypass moves at once, to manual"
+        );
+        assert_eq!(set.default_mode(), SessionModeChoice::Manual);
+        assert_eq!(
+            set.cycle_default_mode(),
             ModeCycle::Changed(SessionModeChoice::Auto),
-            "leaving bypass moves at once"
+            "manual -> auto moves at once"
+        );
+        assert_eq!(set.default_mode(), SessionModeChoice::Auto);
+        assert!(
+            matches!(set.cycle_default_mode(), ModeCycle::Confirm(_)),
+            "and auto -> bypass asks again"
+        );
+        assert_eq!(
+            set.get(tab).unwrap().mode,
+            SessionModeChoice::Auto,
+            "the open tab's own mode is untouched throughout"
         );
         shut_down_all(&mut set);
     }
@@ -4879,7 +5033,8 @@ mod tests {
             })
         );
 
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        // Leaving bypass lands on manual, where the policy answers again (and an edit cards).
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)));
 
         provider.queue(write("p5"));
         provider.queue(read("p6"));
@@ -4954,8 +5109,13 @@ mod tests {
 
         assert_eq!(
             set.cycle_default_mode(),
+            ModeCycle::Changed(SessionModeChoice::Manual),
+            "bypass -> manual never asks"
+        );
+        assert_eq!(
+            set.cycle_default_mode(),
             ModeCycle::Changed(SessionModeChoice::Auto),
-            "bypass -> auto never asks"
+            "manual -> auto never asks"
         );
         assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto, "still untouched");
         shut_down_all(&mut set);
@@ -5018,8 +5178,13 @@ mod tests {
             );
             assert_eq!(
                 set.cycle_mode(starting_tab),
-                Ok(ModeCycle::Changed(SessionModeChoice::Auto)),
+                Ok(ModeCycle::Changed(SessionModeChoice::Manual)),
                 "a failed bypass tab still leaves at once"
+            );
+            assert_eq!(
+                set.cycle_mode(starting_tab),
+                Err("the session has ended".to_string()),
+                "a failed manual tab stays manual, as an ended auto tab stays auto"
             );
             shut_down_all(&mut set);
         }
@@ -5042,7 +5207,7 @@ mod tests {
             });
             assert_eq!(
                 set.cycle_mode(ended_bypass),
-                Ok(ModeCycle::Changed(SessionModeChoice::Auto)),
+                Ok(ModeCycle::Changed(SessionModeChoice::Manual)),
                 "an ended bypass tab still leaves at once"
             );
             shut_down_all(&mut set);
@@ -5496,11 +5661,11 @@ mod tests {
             "starting the session kept the mode"
         );
 
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)));
         assert_eq!(
             set.default_mode(),
             SessionModeChoice::Auto,
-            "leaving bypass on ANY tab drops an in-window default too"
+            "leaving bypass on ANY tab drops an in-window default too, to auto"
         );
 
         let next = set.open(AgentId::Claude);
@@ -8784,10 +8949,168 @@ mod tests {
             SessionModeChoice::Bypass,
             "and every new one"
         );
-        // Leaving bypass is as it always was: at once, and the default goes with it.
+        // Leaving bypass is as it always was: at once, and an empty tab's default goes with it (to
+        // manual, where leaving bypass lands).
         let tab = set.active();
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)),);
-        assert_eq!(set.default_mode(), SessionModeChoice::Auto);
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)),);
+        assert_eq!(set.default_mode(), SessionModeChoice::Manual);
+    }
+
+    // ---- Manual mode: the three-way cycle ------------------------------------------------------
+
+    /// A Claude tab cycles manual -> auto -> bypass -> manual; only the move into bypass asks, and it
+    /// is offered only from auto. Leaving bypass lands on manual.
+    #[test]
+    fn a_claude_tab_cycles_manual_auto_bypass_and_back_to_manual() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        let tab = set.active();
+        assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Manual);
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Auto,
+            "an empty tab carries the default"
+        );
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(
+            set.get(tab).unwrap().mode(),
+            SessionModeChoice::Auto,
+            "nothing moves before y"
+        );
+        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Bypass);
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)));
+        assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Manual);
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Manual,
+            "the empty tab's default went with it"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// From manual the key never asks and never reaches bypass: bypass is entered only from auto, and
+    /// a confirm left over from a plan made in auto is no yes once the tab is in manual.
+    #[test]
+    fn bypass_is_entered_only_from_auto() {
+        let dir = workspace("manual-bypass-only-from-auto");
+        let mut set = set();
+        let tab = set.active();
+        let (_provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        set.get_mut(tab).unwrap().mode = SessionModeChoice::Manual;
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        let plan = plan(set.cycle_mode(tab));
+        // Something other than the key moved the tab under the open prompt.
+        set.get_mut(tab).unwrap().mode = SessionModeChoice::Manual;
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Err("that prompt is no longer current".to_string())
+        );
+        assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Manual);
+        shut_down_all(&mut set);
+    }
+
+    /// An ACP agent's own mode is set once at its start, so its tab offers no manual: the key goes
+    /// auto <-> bypass, leaving bypass lands on auto.
+    #[test]
+    fn an_acp_tab_skips_manual() {
+        let mut set = set();
+        let acp = set.open(AgentId::Acp("gem".into()));
+        assert_eq!(set.get(acp).unwrap().mode(), SessionModeChoice::Auto);
+        let plan = plan(set.cycle_mode(acp));
+        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        assert_eq!(set.cycle_mode(acp), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Manual,
+            "leaving bypass leaves the window default in manual; the tab's auto is only its agent's stand-in"
+        );
+        assert!(
+            matches!(set.cycle_mode(acp), Ok(ModeCycle::Confirm(_))),
+            "auto -> bypass asks"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// A new ACP tab under a manual window default starts in auto, and the page is told once; a Claude
+    /// or Codex tab takes manual and says nothing.
+    #[test]
+    fn a_new_acp_tab_under_a_manual_default_starts_in_auto_and_says_so_once() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        assert_eq!(set.take_mode_note(), None);
+        let codex = set.open(AgentId::Codex);
+        assert_eq!(set.get(codex).unwrap().mode(), SessionModeChoice::Manual);
+        assert_eq!(set.take_mode_note(), None);
+        let acp = set.open(AgentId::Acp("gem".into()));
+        assert_eq!(set.get(acp).unwrap().mode(), SessionModeChoice::Auto);
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Manual,
+            "the window default is unchanged"
+        );
+        let note = set.take_mode_note().expect("the page is told");
+        assert!(note.contains("gem tabs have no manual mode"), "{note}");
+        let number = set.get(acp).unwrap().number;
+        assert!(note.ends_with(&format!("tab {number} is in auto")), "{note}");
+        assert_eq!(set.take_mode_note(), None, "once");
+    }
+
+    /// The configured default and the configured agent reach the empty tab the window already has in
+    /// a mode its agent offers, saying so when that is not the one asked for.
+    #[test]
+    fn the_configured_default_and_agent_give_an_acp_tab_auto_for_manual() {
+        let mut set = set();
+        set.apply_configured_agent(AgentId::Acp("gem".into()));
+        set.apply_configured_default(SessionModeChoice::Manual);
+        assert_eq!(set.default_mode(), SessionModeChoice::Manual);
+        assert_eq!(set.active_tab().mode(), SessionModeChoice::Auto);
+        assert!(set.take_mode_note().is_some());
+
+        let mut other = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        other.apply_configured_default(SessionModeChoice::Manual);
+        assert_eq!(other.active_tab().mode(), SessionModeChoice::Manual);
+        assert_eq!(other.take_mode_note(), None);
+        other.apply_configured_agent(AgentId::Acp("gem".into()));
+        assert_eq!(other.active_tab().mode(), SessionModeChoice::Auto);
+        assert!(other.take_mode_note().is_some());
+    }
+
+    /// The window default cycles in the same order; a bypass default is left for manual.
+    #[test]
+    fn the_window_default_cycles_manual_auto_bypass() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        assert_eq!(set.cycle_default_mode(), ModeCycle::Changed(SessionModeChoice::Auto));
+        let ModeCycle::Confirm(plan) = set.cycle_default_mode() else {
+            panic!("auto -> bypass asks")
+        };
+        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
+        assert_eq!(set.cycle_default_mode(), ModeCycle::Changed(SessionModeChoice::Manual));
+    }
+
+    /// A tab saved in manual comes back in manual with no question, whichever way the restore runs:
+    /// it is the strictest mode.
+    #[test]
+    fn a_tab_saved_in_manual_comes_back_in_manual_unasked() {
+        for policy in [BypassPolicy::Ask, BypassPolicy::Downgrade, BypassPolicy::Keep] {
+            let mut set = set();
+            let plan = plan_of(
+                vec![
+                    planned("m", SessionModeChoice::Manual),
+                    planned("a", SessionModeChoice::Auto),
+                ],
+                None,
+            );
+            let RestoreStep::Go(go) = set.begin_restore(plan, policy) else {
+                panic!("{policy:?}: nothing in bypass, nothing to ask")
+            };
+            assert_eq!((go.downgraded, go.asked), (0, false));
+            let from = set.active();
+            set.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
+            assert_eq!(mode_of(&set, "m"), SessionModeChoice::Manual, "{policy:?}");
+            assert_eq!(mode_of(&set, "a"), SessionModeChoice::Auto, "{policy:?}");
+        }
     }
 
     fn planned(id: &str, mode: SessionModeChoice) -> PlannedTab {
@@ -10655,8 +10978,8 @@ mod external_tab_tests {
         );
         assert_eq!(provider.policies(), vec![reviewer(Reviewer::Agent)], "no new turn yet");
 
-        // Back to Auto before the turn ends: the next request is a card again, at once.
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        // Out of bypass before the turn ends (to manual): the next request is a card again, at once.
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)));
         provider.inner.queue(command("p3"));
         until("the card after leaving bypass", || {
             set.pump(&dir, true);
@@ -10683,12 +11006,157 @@ mod external_tab_tests {
         }
         provider.inner.queue(turn_completed("turn-1"));
         until("the turn ends", || set.pump(&dir, true).turn_ended.contains(&tab));
-        // The next turn carries the mode the tab is in now.
+        // The next turn carries the mode the tab is in now: manual hands every review to the user.
         send(&mut set, tab, "second");
         assert_eq!(
             provider.policies(),
-            vec![reviewer(Reviewer::Agent), reviewer(Reviewer::Agent)]
+            vec![reviewer(Reviewer::Agent), reviewer(Reviewer::User)]
         );
+        for mut t in set.take_all() {
+            if let TabBackend::Live(b) = &mut t.backend {
+                b.shutdown();
+            }
+        }
+    }
+
+    /// A Codex tab in manual: its turns hand every review to the user (reviewer `user`), and every
+    /// request that reaches Eitri is a card, none answered by Eitri.
+    #[test]
+    fn a_manual_codex_tab_cards_every_request_and_reviews_nothing_itself() {
+        let dir = workspace("external-manual");
+        let (mut set, tab, provider) = codex_tab(&dir, SessionModeChoice::Manual);
+        send(&mut set, tab, "first");
+        provider.inner.queue(AgentDomainEvent::TurnStarted {
+            turn_id: "turn-1".into(),
+        });
+        provider.inner.queue(command("p1"));
+        provider.inner.queue(command("p2"));
+        until("both cards are waiting", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 2
+        });
+        set.pump(&dir, true);
+        assert!(provider.inner.decisions().is_empty(), "manual answers nothing itself");
+        assert_eq!(provider.policies(), vec![reviewer(Reviewer::User)]);
+        // Manual -> auto moves at once; the reviewer follows at the next turn.
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        for id in ["p1", "p2"] {
+            provider.inner.queue(AgentDomainEvent::PermissionResolved {
+                permission_id: id.into(),
+                outcome: agent::PermissionOutcome::CancelledByInterrupt,
+            });
+        }
+        provider.inner.queue(turn_completed("turn-1"));
+        until("the turn ends", || set.pump(&dir, true).turn_ended.contains(&tab));
+        send(&mut set, tab, "second");
+        assert_eq!(
+            provider.policies(),
+            vec![reviewer(Reviewer::User), reviewer(Reviewer::Agent)]
+        );
+        for mut t in set.take_all() {
+            if let TabBackend::Live(b) = &mut t.backend {
+                b.shutdown();
+            }
+        }
+    }
+
+    /// An ACP tab saved in manual (a hand-edited file: no ACP tab is ever in manual) comes back in
+    /// auto, a mode its agent offers.
+    #[test]
+    fn an_acp_tab_saved_in_manual_comes_back_in_auto() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let plan = RestorePlan {
+            items: vec![planned(AgentId::Acp("gem".into()), "g", SessionModeChoice::Manual)],
+            skipped: Vec::new(),
+            active_session: None,
+        };
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing to ask")
+        };
+        let from = set.active();
+        set.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
+        assert_eq!(set.get(from).unwrap().mode(), SessionModeChoice::Auto);
+        assert_eq!(set.get(from).unwrap().agent(), &AgentId::Acp("gem".into()));
+        let note = set
+            .take_mode_note()
+            .expect("the restore says the tab is not in its saved mode");
+        let number = set.get(from).unwrap().number;
+        assert!(note.starts_with("gem tabs have no manual mode"), "{note}");
+        assert!(note.ends_with(&format!("tab {number} is in auto")), "{note}");
+        assert_eq!(set.take_mode_note(), None, "once");
+    }
+
+    /// Under a manual window default, a restore whose first tab is an ACP agent's brings the next tabs back
+    /// into new tabs of their own agents, in their saved modes, and says nothing: no tab was kept from the
+    /// mode it was to have (the new tab is opened for the ACP agent of the tab before it, and only then
+    /// given its own agent and mode).
+    #[test]
+    fn a_restore_after_an_acp_tab_names_no_tab_it_did_not_clamp() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        assert_eq!(set.take_mode_note(), None);
+        let plan = RestorePlan {
+            items: vec![
+                planned(AgentId::Acp("gem".into()), "g", SessionModeChoice::Auto),
+                planned(AgentId::Claude, "c", SessionModeChoice::Manual),
+                planned(AgentId::Codex, "x", SessionModeChoice::Manual),
+            ],
+            skipped: Vec::new(),
+            active_session: None,
+        };
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing to ask")
+        };
+        let from = set.active();
+        set.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
+        let of = |id: &str| {
+            set.tabs()
+                .iter()
+                .find(|t| matches!(&t.backend, TabBackend::Starting(p) if p.resume.as_deref() == Some(id)))
+                .map(|t| (t.agent().clone(), t.mode()))
+                .expect("a tab for the session")
+        };
+        assert_eq!(of("g"), (AgentId::Acp("gem".into()), SessionModeChoice::Auto));
+        assert_eq!(of("c"), (AgentId::Claude, SessionModeChoice::Manual));
+        assert_eq!(of("x"), (AgentId::Codex, SessionModeChoice::Manual));
+        assert_eq!(set.take_mode_note(), None, "no tab was kept from its mode");
+    }
+
+    /// A session that turns out to be an ACP agent's when its backend arrives, in a tab that was in manual,
+    /// takes auto, and the page is told which tab.
+    #[test]
+    fn a_backend_arriving_in_a_mode_its_agent_lacks_is_said() {
+        let dir = workspace("arrival-clamp");
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        let tab = set.active();
+        assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Manual);
+        let agent = AgentId::Acp("gem".into());
+        let provider = Arc::new(ExternalRecordingProvider::named("acp:gem", false));
+        let backend = AgentBackend::start_external_with(
+            agent.clone(),
+            provider.clone(),
+            &dir,
+            empty_trust_plan(),
+            SessionModeChoice::Auto,
+            None,
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(backend)).unwrap();
+        set.get_mut(tab).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "r1".into(),
+            result_rx: rx,
+            first_turn: None,
+            resume: None,
+            resumed_title: None,
+            resumed_name: None,
+        });
+        set.collect_starts();
+        assert_eq!(set.get(tab).unwrap().agent(), &agent);
+        assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Auto);
+        let note = set.take_mode_note().expect("the page is told");
+        let number = set.get(tab).unwrap().number;
+        assert!(note.starts_with("gem tabs have no manual mode"), "{note}");
+        assert!(note.ends_with(&format!("tab {number} is in auto")), "{note}");
         for mut t in set.take_all() {
             if let TabBackend::Live(b) = &mut t.backend {
                 b.shutdown();

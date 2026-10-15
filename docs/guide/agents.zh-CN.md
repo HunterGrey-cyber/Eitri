@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=87854cb4d7a2bd100f7115fda38b814d7db5b843f33883581f8fe6cbe9fe0596 -->
+<!-- translated-from: agents.md sha256=708112b02ab4d50ac229ea193e1e6b9f37bec15a0d329cfa4290a14a6f6c2376 -->
 
 # Codex 与其他 agent
 
@@ -56,17 +56,19 @@ Eitri 第一次启动一个它没检查过的 `codex` 时，会在你自己的�
 - **检查通过之前，每一次 Codex 启动都会被拒绝**，已信任的项目也一样，消息是 “Eitri could not confirm that this Codex keeps its levers”，后面跟着一个日志 `check.log` 的路径，它就在判定文件旁边。失败不会被记住，所以下次启动会再试。
 - 检查会把沙箱绝不能让 Codex 写入的文件放在它自己的一个目录里。Codex 的沙箱总是允许命令写 `/tmp` 和 `$TMPDIR`，所以如果你的状态目录在这两者之一之下，而 `XDG_RUNTIME_DIR` 和你的缓存目录又都不在别处，检查就分辨不出沙箱是守住了还是坏了，于是失败；把 `XDG_STATE_HOME` 设到它们之外的目录。
 
-<a id="auto-and-bypass-in-a-codex-tab"></a>
-### Codex 标签页里的 Auto 和 bypass
+<a id="manual-auto-and-bypass-in-a-codex-tab"></a>
+### Codex 标签页里的 Manual、auto 和 bypass
 
-`Shift+Tab` 像在任何标签页里一样在 Auto 和 Bypass 之间切换，进入 bypass 时问同样的问题。这两种模式在这里意思不同，因为 Codex 有它自己的批准流程：
+`Shift+Tab` 像在任何 Claude 标签页里一样轮换 Manual、Auto 和 Bypass，进入 bypass 时问同样的问题。这些模式在这里意思不同，因为 Codex 有它自己的批准流程：
+
+- **Manual。** Codex 的审查者交给了你：每当 Codex 需要离开它的沙箱，它都会问，而每一个这样的请求都是一张卡片。Manual 管不到沙箱里面：那里的命令和编辑仍然不经请求就运行，每种模式下都是如此（见下文）。
 
 - **Auto。** Codex 在它自己的审查者之下运行。当它需要离开沙箱时，由它的审查者决定。审查者允许或拒绝的调用，那一行上会有一条说明：`allowed by auto review: ...` 或 `blocked by auto review: ...`，后面是审查者给的理由。审查者没有裁决的，会以卡片的形式交给你。
 - **Bypass。** Codex 发来的、本来会变成卡片的每一个请求，Eitri 都自己批准，不出卡片；那一行写的是 “allowed in bypass”。进入 bypass 时，已经在等待的卡片会被批准。
 
 不论哪种模式，Eitri 的分类器、你保存的规则，以及 Claude 标签页里“交还给 Claude Code”的处理，都不适用于 Codex；一个请求要么是一张卡片，要么由审查者回答，要么按下面所说由 Eitri 自己回答。
 
-模式的改变在 Eitri 里立即生效，在 Codex 的审查者那里要到下一个回合：正在运行的回合沿用它开始时的审查者。`<prefix> i` 的 `mode lag` 一行会这么说。
+模式的改变在 Eitri 里立即生效，在 Codex 的审查者那里要到下一个回合：正在运行的回合沿用它开始时的审查者（在 Manual 或 Bypass 下开始的回合，对沙箱之外的一切都继续询问；在 Auto 下开始的回合，继续由它的审查者决定）。`<prefix> i` 的 `mode lag` 一行会这么说。
 
 **在卡片上批准和拒绝。** `a` 批准一次，什么都不会被记住；没有“总是允许”。`d` 拒绝，回合继续。`D` 会闪出提示：Codex 的拒绝不接受理由。`Ctrl+c` 中断回合，同时取消正在等待的请求。卡片显示它批准的东西：命令和它所在的文件夹、每个被改的文件及其完整的 diff，或者工具服务器、工具和参数。命令卡片会写明它 “runs outside the sandbox with your full rights”，网络卡片写的是它可能这样。
 
@@ -82,7 +84,7 @@ Codex 在它的 `workspace-write` 沙箱里运行，批准策略是 `on-request`
 - 沙箱里没有网络，也不能访问套接字。
 - **你自己的 exec-policy `allow` 规则覆盖的命令在沙箱之外运行**，不经任何请求。
 - **MCP 工具遵循它们所在服务器的批准模式。** 服务器不需要批准的工具，不经请求就运行。
-- 离开沙箱的请求，在 Auto 下由审查者决定，在 Bypass 下由 Eitri 批准。这样被批准的命令以你的全部权限运行。
+- 离开沙箱的请求，在 Manual 下是一张卡片，在 Auto 下由审查者决定，在 Bypass 下由 Eitri 批准。这样被批准的命令以你的全部权限运行。
 
 `<prefix> i` 在 `runs without asking` 一行里为屏幕上的标签页把这些写明，这一行随标签页的模式而变。
 
@@ -142,7 +144,7 @@ Eitri 用你当前的环境原样启动 agent。如果一个 agent 把环境变�
 
 Eitri 不向 agent 提供文件或终端方法，也从不调用它的认证步骤。它对 agent 只设一件事：注册里有 `auto_mode` 时，这个模式 id 会在每个会话开始时设上，两种 Eitri 模式下都一样。之后 Eitri 会拿 agent 报告的每一次模式去和它对照：设置被拒绝，或者有差异，都会让标签页带着一条不一致的消息结束，之后什么也不再回答。没有 `auto_mode` 时，Eitri 什么也不设、什么也不检查，`prefix i` 的 `runs without asking` 一行会说 Eitri 不知道这个 agent 不经询问会运行什么。
 
-Eitri 的 Auto 和 Bypass 是 Eitri 自己的：它们立即决定 Eitri 怎样回答 agent 的请求，并且从不改变 agent 的模式。`mode lag` 一行说的就是没有这种延迟。
+Eitri 的 Auto 和 Bypass 是 Eitri 自己的：它们立即决定 Eitri 怎样回答 agent 的请求，并且从不改变 agent 的模式。`mode lag` 一行说的就是没有这种延迟。注册的 agent 的标签页没有 Manual 模式：agent 自己的模式只在开始时设一次，Eitri 之后没法让它更严格。在那里 `Shift+Tab` 在 Auto 和 Bypass 之间切换；新标签页默认以 Manual 开始时，新开的这种 agent 的标签页会以 Auto 开始，Eitri 会说一次。
 
 <a id="cards"></a>
 ### 卡片

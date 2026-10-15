@@ -58,7 +58,7 @@ function dispatch(payload: unknown) {
 const HELLO: Hello = {
   backend: "legacy",
   projectDir: "/home/user/project",
-  permissionModes: ["auto", "bypass"],
+  permissionModes: ["manual", "auto", "bypass"],
   resumableSessions: [],
   expectedVerdandiRevision: null,
   account: null,
@@ -596,6 +596,15 @@ describe("App handshake", () => {
     dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, mode: "bypass" }] });
     dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
     expect(container.querySelector(".status-band .mode-pill")?.textContent).toBe("⏵⏵ bypass permissions on");
+  });
+
+  it("shows a manual tab's mode in the band, with the quiet manual glyph", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO, permissionModes: ["manual", "auto", "bypass"] });
+    dispatch({ kind: "tabs", active: 1, defaultMode: "manual", tabs: [{ ...LIVE_TAB, mode: "manual" }] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
+    expect(container.querySelector(".status-band .mode-pill")?.textContent).toBe("⏵⏵ manual");
+    expect(container.querySelector(".status-band .mode-glyph")?.getAttribute("data-mode-name")).toBe("manual");
   });
 
   it("shows why the tab failed to start, from the tabs envelope alone", () => {
