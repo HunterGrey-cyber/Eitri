@@ -95,7 +95,7 @@ type Props = {
   /** The shared prompt history, newest last. */
   history?: string[];
   /** How many messages are held for the turn's end -- `↑` from the first line takes them back
-   * before it ever walks history. One sent into the running turn is not counted: the agent
+   *  before it ever walks history. One sent into the running turn is not counted: the agent
    *  may already have read it. */
   queueCount?: number;
   onTakeBackQueue?: () => void;

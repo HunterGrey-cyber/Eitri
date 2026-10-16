@@ -312,8 +312,8 @@ type InboundHandler = (
      *  would load. Tab-scoped. A second one for the same tab replaces the first. `serialize_trust_prompt_for_js`,
      *  `core/src/agent_bridge.rs`. */
     | TrustPromptEnvelope
-    /** This tab's queue, its last flush refusal reason, and `note`: why messages are held
-     *  for the turn's end rather than sent during the turn. */
+    /** This tab's queue, its current refusal reason if the last flush was refused,
+     *  and `note`: why its messages are held for the turn's end rather than in the turn. */
     | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null; note?: string | null; enterSteers?: boolean | null }
     /** Rust's mirror of the composer's own text, sent only on a switch, `ready`,
      *  a reset or a scratch-editor return -- never while the user is typing. `refused` names the send

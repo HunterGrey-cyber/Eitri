@@ -142,7 +142,7 @@ describe("Dashboard", () => {
     expect(queryByText(/sidecar/)).toBeNull();
   });
 
-  it("draws every item with its key letter, and no mode row", () => {
+  it("draws every item with its key letter and no mode row", () => {
     const withRecord: Hello = { ...HELLO, resumableSessions: [session()] };
     const { container } = renderDash({ hello: withRecord });
     const items = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
@@ -162,7 +162,7 @@ describe("Dashboard", () => {
     expect(muted.textContent).not.toContain("older");
   });
 
-  /* The start screen omits extra hints. The status band under it names the mode, and
+  /* The start screen carries no hints of its own. The status band under it names the mode, and
      the `?` sheet (the last item) says what a mode does, what a message carries and the window's keys. */
   it("draws nothing but the name, the where-line and the items: no mode row and no notes under them", () => {
     for (const mode of ["auto", "bypass"] as const) {

@@ -3067,8 +3067,8 @@ impl TabSet {
         out
     }
 
-    /// Return held messages oldest first for the panel to merge into the input box.
-    /// Messages already sent into a running turn stay queued because the agent may have read them.
+    /// The held messages, oldest first, for the panel to merge into the box. A message already
+    /// sent into the running turn stays: the agent may have read it, and taking it back would not unsay it.
     pub fn take_back_queue(&mut self, id: TabId) -> Vec<String> {
         let Some(tab) = self.get_mut(id) else { return Vec::new() };
         tab.settle_steered();
@@ -3104,7 +3104,7 @@ impl TabSet {
             .unwrap_or_default()
     }
 
-    /// Every tab's queue, summed: held messages and those sent into a
+    /// Every tab's queue, summed (the window-close prompt): held messages and those sent into a
     /// running turn that the agent has not been seen to read.
     pub fn queued_count(&self) -> usize {
         self.tabs.iter().map(|t| t.queue.len()).sum()

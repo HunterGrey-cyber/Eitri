@@ -65,8 +65,9 @@ function toBrowse(rendered: RenderResult, props: EmptyTabProps): HTMLElement {
   return rendered.container.querySelector(".empty-tab")!;
 }
 
-/* The composer is the menu's New session row, between the name and the other rows. It shares
-   their width and key column. */
+/* The box under the start screen's menu is no separate block. The
+   box is now the menu's New session row: between the name and the other rows, as wide as they are, its key in
+   their key column. */
 describe("EmptyTab: the box is the dashboard's New session row", () => {
   it("sits after the name and the where-line and before the other rows, with its key where theirs are", () => {
     const rendered = renderEmpty({ landing: "browse" });

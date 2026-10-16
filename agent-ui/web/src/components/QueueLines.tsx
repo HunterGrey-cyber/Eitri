@@ -5,10 +5,10 @@ function firstLine(text: string): string {
   return rest.length > 0 ? `${first} …` : first;
 }
 
-/** Queued messages above the input box, oldest first. `↪` marks a message sent into the running
- *  turn that the agent has not read yet; it leaves when its row appears in the conversation.
- *  `⧗` marks a message held until the turn ends. `note` quietly explains why messages are held;
- *  a refused flush explains why it failed and how to retry. */
+/** The lines above the box, oldest first (Claude Code lists queued messages "above the input box", "in
+ *  gray"): `↪` for a message sent into the running turn that the agent has not read yet (it leaves when
+ *  its row appears in the conversation), `⧗` for one held until the turn ends. `note` says once,
+ *  quietly, why messages are held rather than in the turn; a refused flush says why and how to retry. */
 export function QueueLines({ items, error, note = null }: { items: QueueItem[]; error: string | null; note?: string | null }) {
   if (items.length === 0 && error === null) return null;
   const held = items.some((item) => item.steered !== true);

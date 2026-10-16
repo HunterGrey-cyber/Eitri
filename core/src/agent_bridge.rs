@@ -1406,13 +1406,11 @@ impl CallNotes {
     }
 }
 
-/// [`serialize_events_for_js`], with this batch's row notes:
-/// `"ruleNotes":[{"toolUseId":..,"rule":"Bash(git log *)"}]`,
-/// `"createsFile":[{"permissionId":..,"toolUseId":..|null}]`,
-/// `"autoNotes":["toolu_..", ...]`, and `"autoCreatesFile":["toolu_..", ...]`.
-/// `autoCreatesFile` includes bypass `Write` calls too. `"turnTimes"` contains
-/// `{"turnId":..,"startedAtMs":..,"endedAtMs":..,"anchorSeq":..|null}` for each turn ended in this batch.
-/// Each field is omitted when empty.
+/// [`serialize_events_for_js`], plus nonempty notes for this batch: `ruleNotes` pairs
+/// tool-use ids with saved rules, `createsFile` pairs permission ids with nullable tool-use
+/// ids, and `autoNotes` and `autoCreatesFile` contain tool-use ids, including bypass writes
+/// in the latter. `turnTimes` carries `turnId`, `startedAtMs`, `endedAtMs`, and nullable
+/// `anchorSeq` for turns ending in this batch. Empty fields are omitted.
 pub fn serialize_events_with_notes_for_js(
     tab: crate::tabs::TabId,
     from_revision: u64,
@@ -2206,11 +2204,12 @@ pub fn serialize_begin_rename_for_js(tab: crate::tabs::TabId, current: Option<&s
     json!({ "kind": "begin_rename", "tab": tab.0, "current": current }).to_string()
 }
 
-/// A tab's held queue and messages sent into the running turn but not yet read. Sends only
-/// typed text; editor context stays out of the displayed user text. `note` explains why
-/// messages are held. `enter_steers` tells whether Enter can send into the running turn;
-/// `None` means no live session, so the page uses the snapshot capability. The value can
-/// change if the agent does not support the method, and the composer wording follows it.
+/// A tab's queue (the `⧗` lines of held messages, and the `↪` lines of messages sent into the running turn and
+/// not yet read). Only what was typed crosses: the wire text carries the editor context, which the panel
+/// never shows as the user's own words. `note` says why messages are held rather than in the turn, and
+/// `enter_steers` whether Enter puts a message into the running turn now (`None` with no live session: the
+/// page then reads the snapshot's capability): the agent can stop being able to (a Codex that turns out not
+/// to know the method), and the box's words follow it.
 pub fn serialize_queue_for_js(
     tab: crate::tabs::TabId,
     items: &[crate::tab_set::Queued],

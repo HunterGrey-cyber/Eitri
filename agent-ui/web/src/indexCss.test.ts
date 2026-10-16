@@ -1252,7 +1252,7 @@ describe("index.css cascade (which rule actually wins)", () => {
      no column: the conversation and the foot fill the panel between two side margins
      (`--page-pad`, a viewport unit clamp), so nothing measured is needed, nothing reaches past anything,
      and no container can come back for it. */
-  /* There is no width limit. The conversation and the foot fill the panel less `--page-pad`
+  /* No width limit. The conversation and the foot fill the panel less `--page-pad`
      at each side, at every width, and nothing at the list's foot is drawn over the rows. */
   it("fills the panel at every width: no column cap, one margin for the list and the foot, no wide block, no fade", () => {
     expect(withoutComments).not.toMatch(/--row-inline-size|--list-inline-size|--column-w|--wide-cap|--column-max/);
@@ -1818,8 +1818,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(clobbered.background).toBe("var(--nv-bg)");
   });
 
-  /* The band's mode block uses the same appearance as the editor's adjacent statusline mode
-     section; only the word differs. */
+  /* The band's mode block and the editor's statusline mode
+     section beside it look the same; only the word differs. */
   it("paints the mode block in the statusline's own mode colours, closed by an arrow, and nothing without the keys", () => {
     const block = (mode: string, focused = "true") =>
       `<div class="status-band"><div class="band-open"><span class="band-seg band-mode" data-mode="${mode}" data-focused="${focused}">X</span></div></div>`;
@@ -2101,8 +2101,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     for (const r of ring) expect(r.declarations).toContain("var(--nv-focus-ring)");
   });
 
-  /* The composer uses the page background inside a thin frame, with slightly rounder corners
-     than the conversation blocks and a prompt cell before the text. */
+  /* No tint on the composer: the page in a hairline frame,
+     rounded a little more than the conversation's blocks, the prompt `›` in a cell before the text. */
   it("draws the composer as a framed box on the page with a prompt cell, and a visible ring over it while it has the keys", () => {
     const rules = splitRules(withoutComments);
     const box = rules.find((r) => r.selector === ".composer")!;
@@ -2114,7 +2114,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(focus.declarations).toMatch(/outline:\s*1px solid var\(--nv-focus-ring\);/);
     expect(focus.declarations).toMatch(/border-color:\s*var\(--nv-focus-ring\);/);
   });
-  /** The composer is one framed box on the page (2026-10-15, after a tinted one; flat 2026-10-14; a rounded card from 2026-10-13); nothing inside it draws a second box. The r2-gui
+  /** The composer is one framed box on the page (it was a tinted one, a flat one and a rounded card before); nothing inside it draws a second box. The r2-gui
    *  GUI pass (2026-09-26) saw BROWSE's stand-in boxed, and WebKit's own focus ring drawing a box round
    *  the textarea in INPUT. */
   it("draws no box or focus ring of its own inside the composer card, in either mode", () => {

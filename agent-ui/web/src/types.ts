@@ -295,13 +295,13 @@ export type HistoryNotice = {
   writerVersion: string | null;
 };
 
-/** One message typed while a turn ran, as it reaches the panel: what the
+/** One message typed while a turn ran as it reaches the panel: what the
  * user typed, when (epoch ms), and whether it was sent into the running turn and the agent has not
  * read it yet (`steered`, a `↪` line) or waits for the turn's end (a `⧗` line). The wire text composed
  * against the editor context, and the id it was sent under, are Rust's own concern and never reach here.
  * `steered` is optional only for callers written before it existed; Rust always sends it. */
 export type QueueItem = { text: string; queuedAt: number; steered?: boolean };
-/** V1's editor-context line: the file relative to the project root (or
+/** V1's editor-context line the file relative to the project root (or
  * absolute outside it), and the selected line range when there is a selection. */
 /** Where the panel stands with the editor beside it, in a companion window (`editor_link`,
  *  `serialize_editor_link_for_js`, `core/src/agent_bridge.rs`). `text` is the band's own words and is

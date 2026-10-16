@@ -148,7 +148,7 @@ impl EditorFont {
 mod tests {
     use super::*;
 
-    /// At 144 dpi, an unset `guifont` gives 14 points (18.67 logical px). The panel's
+    /// A 144 dpi desktop with an unset `guifont` (14 points, 18.67 logical px). The panel's
     /// base is 18.67 / 1.5 CSS px, which WebKit's page zoom draws at the editor's own 18.67.
     #[test]
     fn the_editor_font_is_handed_over_in_css_px_and_follows_both_events() {

@@ -2392,10 +2392,10 @@ export default function App() {
     copyCodeRef.current = el;
     el?.setAttribute("data-hint-landed", "");
   }
-  // A streamed delta can replace the landed block and remove its outline, leaving nothing to clear.
-  // Leave the detached copy ref unchanged. Clear the landing when the cursor leaves the block's
-  // row, including non-key arrivals, so the outline cannot mark a different row. Keep it when an
-  // arrival stays on the row so `y` still copies the block after `Ctrl+h Ctrl+l`.
+  // Replacing a landed block during streaming removes its outline; the detached ref is left alone.
+  // Clear the landing when a non-key event moves the cursor off the block's row, or the outline
+  // would remain on a different row. Keys clear it themselves. An arrival that stays on the row
+  // keeps the landing, so `y` still copies the block after `Ctrl+h Ctrl+l`.
   useEffect(() => {
     const block = copyCodeRef.current;
     if (block === null || frozenSnapshotRef.current !== null) return;

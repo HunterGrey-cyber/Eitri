@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=1154a3443a78f5a685f7340e9d152b533a42e95aedc1269785d8e2ac74f3e6f9 -->
+<!-- translated-from: configuration.md sha256=a3c8961ab7ab1afdbec0b797ec3e294f0a84c9aa045951c97c73c33a8e1225f4 -->
 
 # 配置
 
@@ -31,7 +31,7 @@ eitri.config.set("review.hint", true)
 | 键 | 值 | 默认值 | 作用 |
 |---|---|---|---|
 | `agent.account` | 一个账号名 | 未设置 | 这个窗口使用的 Claude 账号。见[账号](#accounts)。 |
-| `agent.font_size` | 9 到 32 之间的数字 | 编辑器的字号 | agent 面板的文字大小，单位是像素。不设置时，面板文字和编辑器（`guifont`）一样大，两边对齐。 |
+| `agent.font_size` | 9 到 32 之间的数字 | 编辑器的字号 | agent 面板的基础字号，单位是像素。对话按基础字号的 12/14 绘制（回复、工具行和代码），所以读起来比编辑器的文字略小；面板底部的状态行按基础字号本身绘制，这样它和编辑器的状态栏对齐。不设置时，基础字号就是编辑器（`guifont`）的字号。 |
 | `agent.typing_cadence_hz` | 1 到 60 之间的整数，或 `"off"` | `5` | 你在编辑器里输入时，agent 面板每秒最多允许更新多少次。稳定的较慢频率可以避免面板在你输入时重绘；`"off"` 让它全速更新。 |
 | `agent.default` | `"claude"`、`"codex"`，或用 `eitri.agent.register` 注册的 agent 的名字 | `"claude"` | 新标签页，以及新窗口的第一个标签页，运行哪个 agent。见 [Codex 与其他 agent](agents.zh-CN.md)。 |
 | `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`。带目录部分的相对路径会让 Eitri 在启动时停下。 |

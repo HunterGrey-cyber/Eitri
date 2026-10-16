@@ -244,9 +244,9 @@ pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
     lines
 }
 
-/// The window asks only if some tab is running or has a queued message. A message sent into a
-/// running turn but not yet read counts as queued here; the tab's close prompt distinguishes
-/// the two.
+/// The window asks only if some tab is running or has a queued message. A message
+/// sent into a running turn and not yet read counts as queued here; the tab's own close prompt tells
+/// the two apart.
 pub fn window_close_prompt(running: usize, queued: usize) -> Option<String> {
     let mut parts = Vec::new();
     if running > 0 {

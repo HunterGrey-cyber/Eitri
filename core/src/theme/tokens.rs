@@ -24,11 +24,11 @@ const TEXT_CONTRAST: f64 = 4.5;
 const UI_CONTRAST: f64 = 3.0;
 /// Only needs to be visibly a band. Not a WCAG figure.
 const CURSORLINE_CONTRAST: f64 = 1.15;
-/// The conversation cursor has only a filled band, so its fill must remain visible.
-/// Start with a light mix of `cursorline` into `bg` and raise it in 2% steps until it reaches
-/// the contrast threshold against `bg`, with a weaker band when the panel lacks keyboard focus.
-/// A fixed 24%/12% mix measured only 1.02-1.06:1 on tokyonight and rose-pine dawn, which shows no
-/// band at all. These are visibility thresholds, not WCAG figures.
+/// The conversation's cursor band is the only mark of the cursor there (no bar, no outline), so its fill has
+/// to be seen. It starts from a light mix of `cursorline` into `bg` and is raised
+/// in 2% steps until it reaches this much contrast against `bg`:
+/// the band while the panel holds the keys, and the weaker one while it does not. A plain 24%/12% mix
+/// measured 1.02-1.06:1 on tokyonight and rose-pine dawn, which is no band at all. Not WCAG figures.
 const CURSOR_BAND_CONTRAST: f64 = 1.08;
 const CURSOR_BAND_INACTIVE_CONTRAST: f64 = 1.035;
 const CURSOR_BAND_START: f64 = 0.24;
@@ -1334,7 +1334,7 @@ mod tests {
         }
     }
 
-    /// With rose-pine dawn and LazyVim's lualine, the mode block
+    /// Rose-pine dawn with LazyVim's lualine: the mode block
     /// is lualine's own pair, unguarded, and a scheme with no lualine keeps the guarded cursorline block.
     #[test]
     fn the_status_band_mode_block_copies_lualines_mode_sections() {
@@ -1389,7 +1389,7 @@ mod tests {
         for bad in ["Mono:hx", "Mono:h-3", "Mono:h0", "Mono:hNaN", "Mono:hinf"] {
             assert_eq!(guifont_size_px(bad), px(14.0), "{bad}");
         }
-        // No explicit height uses the default, 18.67px on Linux.
+        // A desktop with no height, so 18.67px on Linux.
         if !cfg!(target_os = "macos") {
             assert!(
                 (guifont_size_px("Source Code Pro,DejaVu Sans Mono,Courier New,monospace") - 18.666_666).abs() < 1e-3

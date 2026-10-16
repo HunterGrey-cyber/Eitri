@@ -273,8 +273,8 @@ describe("phaseOf", () => {
   });
 
   it("the resync degradation: a thinking delta with no text is lost to a resync, never invented", () => {
-    // A resync can lose `turnThinking` but must never invent it. An empty thinking delta opens no
-    // block, so the wire carries no thinking state and the phase degrades.
+    // The invariant, written as a test: `turnThinking` can only ever be LOST. A delta
+    // with no text opens no block, so nothing on the wire says thinking, and the phase degrades.
     let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "" });
     expect(phaseOf(state)).toEqual({ kind: "thinking" });

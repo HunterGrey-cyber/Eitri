@@ -42,7 +42,7 @@ Both windows read the same file: the one-window mode and the [companion window](
 | key | value | default | what it does |
 |---|---|---|---|
 | `agent.account` | an account name | unset | The Claude account the window uses. See [Accounts](#accounts). |
-| `agent.font_size` | a number from 9 to 32 | the editor's size | The agent panel's text size, in pixels. Unset, the panel's text is the editor's own size (`guifont`), so the two panes match. |
+| `agent.font_size` | a number from 9 to 32 | the editor's size | The agent panel's base text size, in pixels. The conversation is drawn at 12/14 of the base (a reply, tool lines and code), so it reads a little smaller than the editor's text; the status line at the bottom of the panel is drawn at the base itself, so it lines up with the editor's statusline. Unset, the base is the editor's own size (`guifont`). |
 | `agent.typing_cadence_hz` | a whole number from 1 to 60, or `"off"` | `5` | While you type in the editor, how many times a second the agent panel is allowed to update. A steady slower rate keeps the panel from redrawing under your typing; `"off"` lets it update at full speed. |
 | `agent.default` | `"claude"`, `"codex"` or the name of an agent registered with `eitri.agent.register` | `"claude"` | The agent a new tab runs, and the first tab of a fresh window. See [Codex and other agents](agents.md). |
 | `agent.codex.command` | an absolute path, or a bare command name | unset | The `codex` a Codex tab runs. `EITRI_CODEX` outranks it; without either, `codex` on `PATH`. A relative path with a directory part stops Eitri at startup. |

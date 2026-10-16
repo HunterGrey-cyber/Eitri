@@ -156,7 +156,7 @@ type Props = {
   agent?: string | null;
 };
 
-/** The empty tab's dashboard: a centred question, the
+/** The empty tab's dashboard a centred question, the
  *  where-line and one row per `dashItems(hello)`, each with its key -- and nothing else. What a mode
  *  does, what a message carries from the editor and the window's keys are all in the `?` sheet, which
  *  the last row opens; only a companion window with no editor attached says one more line, because

@@ -5493,6 +5493,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 payloads
             };
             dispatch_all(page, payloads);
+            // A mode note set before any page was ready (the configured agent clamping the empty
+            // tab) is held back by `send_mode_note`; this is the first moment it can be said, after
+            // the `tabs` that shows the tab. Taking it clears it, so a later `tabs` does not repeat it.
+            send_mode_note(state, page);
             ok(page);
             // The interrupted reverts, offered once the page can show them (and again after a reload).
             let owed = {
@@ -7153,6 +7157,46 @@ mod tests {
         handle.new_tab_for(AgentId::Claude);
         assert_eq!(notices().len(), 1, "once");
         assert_eq!(state.borrow().tabs.active_tab().mode(), SessionModeChoice::Manual);
+    }
+
+    /// A note the tab set made before any page was ready (the configured ACP agent clamping the
+    /// empty tab out of manual, as `init.lua` does at startup) is said once the page says `ready`,
+    /// after the `tabs` that shows the tab, and not again on a later `tabs`.
+    #[test]
+    fn a_mode_note_made_before_the_page_was_ready_is_said_once_at_ready() {
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual));
+        let page = Rc::new(RecordingPage::default());
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
+        handle.set_default_agent(AgentId::Acp("gem".into()));
+        assert_eq!(state.borrow().tabs.active_tab().mode(), SessionModeChoice::Auto);
+        let notices = || {
+            page.sent
+                .borrow()
+                .iter()
+                .filter(|e| kind_of(e) == "notice")
+                .map(|e| {
+                    serde_json::from_str::<serde_json::Value>(e).unwrap()["text"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .filter(|text| text.contains("have no manual mode"))
+                .collect::<Vec<_>>()
+        };
+        assert!(notices().is_empty(), "nothing is said to a page that is not ready");
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        let said = notices();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("gem tabs have no manual mode"), "{said:?}");
+        let sent = page.sent.borrow().clone();
+        let last_tabs = sent.iter().rposition(|e| kind_of(e) == "tabs").unwrap();
+        let notice = sent.iter().rposition(|e| kind_of(e) == "notice").unwrap();
+        assert!(last_tabs < notice, "the tab is on screen before it is spoken of");
+        handle.new_tab_for(AgentId::Claude);
+        assert_eq!(notices().len(), 1, "a later tabs change does not say it again");
     }
 
     /// A page that panics if a send happens inside another send: the contract every host keeps.
