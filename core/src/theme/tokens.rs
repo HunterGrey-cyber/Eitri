@@ -150,7 +150,8 @@ pub struct ThemeTokens {
     pub hint_bg: Rgb,
     pub hint_fg: Rgb,
     pub search: Rgb,
-    /// `warn`/`error`/`ok` are guarded at `UI_CONTRAST` against `bg`: borders, rules, tints and
+    /// `warn`/`error` are guarded at `UI_CONTRAST` against both `bg` and `chrome` (the status band's
+    /// mode glyphs sit on `chrome`), `ok` against `bg` alone: borders, rules, tints and
     /// dots only, never text. The panel draws warning and error text in `fg` and puts these on a
     /// border beside it; `agent-ui/web/src/indexCss.test.ts` holds its `color:` declarations to
     /// `fg`/`muted`. A consumer that needs coloured text needs its own 4.5:1 token, not these.
@@ -369,8 +370,15 @@ impl ThemeTokens {
             TEXT_CONTRAST,
         );
 
-        let warn = signal(&["DiagnosticWarn", "WarningMsg"], FALLBACK_WARN);
-        let error = signal(&["DiagnosticError", "ErrorMsg"], FALLBACK_ERROR);
+        // `warn` and `error` are also the colours of the status band's `auto` and `bypass` mode glyphs,
+        // which sit on `chrome`, so they are guarded against `chrome` as well as `bg`. Where `chrome`
+        // is close to `bg` this changes nothing: a colour that already passes both is returned as is.
+        let band_signal = |names: &[&str], fallback: Rgb| {
+            let raw = g.fg_of(names).unwrap_or(fallback);
+            ensure_contrast_against_both(ensure_contrast(raw, bg, fg, UI_CONTRAST), bg, chrome, fg, UI_CONTRAST)
+        };
+        let warn = band_signal(&["DiagnosticWarn", "WarningMsg"], FALLBACK_WARN);
+        let error = band_signal(&["DiagnosticError", "ErrorMsg"], FALLBACK_ERROR);
         // The three tinted fills and the pair of text colours on each (see the fields' own doc).
         let tinted = |toward: Rgb, amount: f64| -> (Rgb, Rgb, Rgb) {
             let fill = bg.mix(toward, amount);
@@ -999,6 +1007,55 @@ mod tests {
             .into_iter()
             .map(|(name, p)| (name, ThemeTokens::derive(&p)))
             .collect()
+    }
+
+    /// The status band's `auto` and `bypass` glyphs are drawn in `warn` and `error` on `chrome`, so both
+    /// reach the non-text threshold against `chrome` as well as `bg`, on every palette, a reversed
+    /// StatusLine (where `chrome` is Normal's fg, the far side of mid-grey from `bg`) included.
+    #[test]
+    fn warn_and_error_are_readable_on_chrome_as_well_as_bg() {
+        let mut cases = hard_palettes();
+        for background in ["dark", "light"] {
+            let (fg, bg) = if background == "dark" {
+                (0xe0e0e0, 0x1a1a1a)
+            } else {
+                (0x202020, 0xf4f4f4)
+            };
+            let reversed = HlAttrs {
+                fg: None,
+                bg: None,
+                reverse: true,
+            };
+            cases.push((
+                if background == "dark" {
+                    "reversed-dark"
+                } else {
+                    "reversed-light"
+                },
+                ThemeTokens::derive(&payload(
+                    background,
+                    &[
+                        ("Normal", hl(Some(fg), Some(bg))),
+                        ("StatusLine", reversed),
+                        ("DiagnosticWarn", hl(Some(0xe5c07b), None)),
+                        ("DiagnosticError", hl(Some(0xe06c75), None)),
+                    ],
+                )),
+            ));
+        }
+        for (name, t) in cases {
+            for (colour_name, colour) in [("warn", t.warn), ("error", t.error)] {
+                for (surface_name, surface) in [("bg", t.bg), ("chrome", t.chrome)] {
+                    assert!(
+                        colour.contrast(surface) >= UI_CONTRAST,
+                        "{name}: {colour_name} {} on {surface_name} {} is {:.2}:1",
+                        colour.hex(),
+                        surface.hex(),
+                        colour.contrast(surface)
+                    );
+                }
+            }
+        }
     }
 
     /// The text drawn on your message and the composer, on a permission card, and on a failure's tint

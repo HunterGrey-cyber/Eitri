@@ -1597,8 +1597,24 @@ describe("index.css cascade (which rule actually wins)", () => {
      in the file carries a container-query unit (the WebKitGTK reason). */
 
   it("derives --row-gutter from the sign column instead of copying its sum, and every indent that lines up with the grid spends it", () => {
-    expect(ROOT_TOKENS.get("--row-gutter")).toBe("calc(var(--row-sign-w) + var(--row-gap))");
+    // Half 1: the declared value is a formula over the two knobs that make up the sign column, not a
+    // copy of their sum -- `calc(28px)` would satisfy every other test in this file just as well.
+    const gutter = ROOT_TOKENS.get("--row-gutter");
+    expect(gutter).toBe("calc(var(--row-sign-w) + var(--row-gap))");
+    expect(gutter).toMatch(/var\(--row-sign-w\)/);
+    expect(gutter).toMatch(/var\(--row-gap\)/);
+    // Half 2: a correct formula sitting unused proves nothing. Its consumers are the review overlay's lines
+    // that sit under a grid row's body; each spends the token, and nothing in the file spells the sign
+    // column's width (20px plus the 8px gap, or the older 30px / 32px sums) as a literal in a calc.
     expect(winningDeclaration('<div class="review-comment-text">note</div>', ".review-comment-text", "padding-left")).toBe("var(--row-gutter)");
+    const consumers = splitRules(withoutComments).filter((r) => /var\(--row-gutter\)/.test(r.declarations));
+    expect(consumers.length).toBeGreaterThanOrEqual(1);
+    for (const rule of consumers) {
+      for (const branch of rule.selector.split(",").map((b) => b.trim())) expect(branch).toMatch(/^\.review-/);
+    }
+    expect(withoutComments).not.toMatch(/\b(?:28|30|32)px\)/);
+    // Negative control: a hand-copied sum in a calc is what the scan above is for.
+    expect(".review-comment-text { padding-left: calc(28px); }").toMatch(/\b(?:28|30|32)px\)/);
   });
   it("keeps a container-query unit out of every custom property declaration (WebKitGTK guard)", () => {
     // Since 2026-09-24 there is no container-query unit anywhere in the file (the tripwire near the
@@ -1671,6 +1687,18 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(computed(html, ".row-body").borderRadius).toBe("18px 18px 5px 18px");
     expect(computed(html, ".row-sign").display).toBe("none");
     expect(winningDeclaration(html, ".row-body", "background", ".row-prompt .row-body { background: none; }")).toBe("none");
+    // One unbroken token must break inside the bubble instead of scrolling the conversation sideways: the
+    // body states both wrapping properties itself, so the list's own `overflow-x: hidden` cannot turn an
+    // overflow into a silent clip.
+    const live = computed(html, ".row-prompt .row-body");
+    expect(live.whiteSpace).toBe("pre-wrap");
+    expect(live.overflowWrap).toBe("anywhere");
+    const bodyRule = splitRules(withoutComments).find((r) => r.selector === ".row-prompt .row-body")!;
+    expect(bodyRule.declarations).toMatch(/white-space:\s*pre-wrap;/);
+    expect(bodyRule.declarations).toMatch(/overflow-wrap:\s*anywhere;/);
+    // Negative controls: a later rule, and a lower-specificity `!important` one, each take the wrapping away.
+    expect(computed(html, ".row-prompt .row-body", ".row-prompt .row-body { overflow-wrap: normal; }").overflowWrap).toBe("normal");
+    expect(computed(html, ".row-prompt .row-body", ".row-body { white-space: nowrap !important; }").whiteSpace).toBe("nowrap");
   });
   /* 2026-10-15: the things a reader reviews or answers are framed and nothing else is -- an edit, a
      failure's output (pinned with the connector test), the permission card, a code block, and your own
@@ -1866,6 +1894,13 @@ describe("index.css cascade (which rule actually wins)", () => {
     );
     // `--nv-editor-cmd-rows` is one of the names Rust sends, only beside a measured editor.
     expect(tokensRs).toContain('"--nv-editor-cmd-rows"');
+    // Manual's quiet glyph takes the chrome's muted on the band, the body's elsewhere (the chooser).
+    const glyph = (inBand: boolean) =>
+      inBand
+        ? `<div class="status-band"><span class="mode-glyph" data-mode-name="manual">x</span></div>`
+        : `<div class="chooser"><span class="mode-glyph" data-mode-name="manual">x</span></div>`;
+    expect(winningDeclaration(glyph(true), ".mode-glyph", "color")).toBe("var(--nv-chrome-muted)");
+    expect(winningDeclaration(glyph(false), ".mode-glyph", "color")).toBe("var(--nv-muted)");
     // Chrome-guarded text is admitted on the band now that it sits on chrome.
     expect(unguardedTextColorDeclarations(".status-band .band-open { color: var(--nv-chrome-fg); }")).toEqual([]);
   });
@@ -1899,7 +1934,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     // Focus cannot fill what is already filled: the ring outside it is the mark.
     expect(winningDeclarationOn(approve, "outline")).toBe("2px solid var(--nv-fg)");
     deny.focus();
-    expect(winningDeclarationOn(deny, "outline")).toBe("2px solid var(--nv-fg)");
+    // Deny is filled by focus like every other button, so the fill is its one focus sign: no ring on top.
+    expect(winningDeclarationOn(deny, "outline")).toBe("none");
   });
 
   it("keeps the cursor band under a row whose control has focus: the focused control is the one solid mark", () => {
@@ -1950,6 +1986,46 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(computed(html(), ".cursor-band").pointerEvents).toBe("none");
     expect(computed(html(), ".cursor-band").borderRadius).toBe("8px");
     expect(computed(html('data-visual="caret"'), ".cursor-band").display).toBe("none");
+  });
+
+  /** The conversation's cursor is a soft flat fill and nothing else: no bar at its left edge, no frame, no
+   *  mode colour. The fill is carried a little above and below the row by the band's box-shadow, which is
+   *  the one shadow allowed, and only in the band's own fill variables. */
+  const bandMarks = (sheet: string): string[] => {
+    const found: string[] = [];
+    for (const rule of splitRules(sheet)) {
+      const branches = rule.selector.split(",").map((b) => b.trim()).filter((b) => b.includes(".cursor-band"));
+      if (branches.length === 0) continue;
+      for (const branch of branches) {
+        if (/(?:::?before|::?after)\s*$/.test(branch)) found.push(`${branch} is a pseudo-element mark`);
+      }
+      if (/(?:^|;)\s*(?:border(?!-radius)[\w-]*|outline[\w-]*)\s*:|--nv-mode-/.test(rule.declarations)) found.push(`${rule.selector} draws a frame or a mode colour`);
+      const shadow = /box-shadow:\s*([^;]+);/.exec(rule.declarations)?.[1];
+      if (shadow !== undefined && !/^(?:0 -?8px 0 var\(--band-fill(?:-inactive)?\),?\s*)+$/.test(shadow.trim())) {
+        found.push(`${rule.selector} has a shadow other than the fill extension: ${shadow}`);
+      }
+    }
+    return found;
+  };
+  it("draws the conversation's cursor with no bar, frame or mode colour on the band", () => {
+    expect(bandMarks(withoutComments)).toEqual([]);
+    expect(splitRules(withoutComments).some((r) => /\.cursor-band\s*::?(?:before|after)/.test(r.selector))).toBe(false);
+    const row = `<div class="message-list" data-focused="true"><div class="row row-tool row-current" data-sign="✓"><span class="row-sign">✓</span><div class="row-body">x</div></div><div class="cursor-band" aria-hidden="true"></div></div>`;
+    // The fill is the band behind the rows, not the conversation row's own, and no sign cell is drawn.
+    expect(computed(row, ".row").background).not.toBe("var(--nv-cursorline)");
+    expect(computed(row, ".row-sign").display).toBe("none");
+    // Negative controls: a bar drawn with `::before` / `::after`, a border, an outline, a mode colour and a
+    // foreign shadow are each caught.
+    for (const extra of [
+      '.cursor-band::before { content: ""; width: 3px; background: var(--nv-chrome-accent); }',
+      '.message-list[data-focused="false"] .cursor-band::after { content: ""; background: var(--rule-frame); }',
+      ".cursor-band { border-left: 3px solid var(--nv-fg); }",
+      ".cursor-band { outline: 1px solid var(--nv-fg); }",
+      ".cursor-band { background: var(--nv-mode-insert); }",
+      ".cursor-band { box-shadow: -3px 0 0 var(--nv-fg); }",
+    ]) {
+      expect(bandMarks(`${withoutComments}\n${extra}`), extra).not.toEqual([]);
+    }
   });
   it("dims an unfocused mode block even in INPUT, and draws it with no bar at its edge", () => {
     // The mode block carries no left bar in either mode (the mode is said by its label), and an
@@ -2019,6 +2095,34 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(hint.borderRadius).toMatch(/^(0|0px|)$/);
     const box = computed(`<div class="composer"><textarea></textarea></div>`, ".composer textarea");
     expect(box.outlineStyle).toBe("none");
+  });
+
+  /* Pressing `i` swaps BROWSE's stand-in line for the textarea; the empty composer must be the same height
+     in both, or the conversation above it moves. One line height and one min-height, and the keycap stays
+     inside that line box. */
+  it("gives the empty composer one line height and one min-height in BROWSE and INSERT", () => {
+    const browse = `<div class="composer"><div class="composer-browse-hint">Ask the agent...<span class="composer-key">i</span></div></div>`;
+    const input = `<div class="composer"><textarea rows="1"></textarea></div>`;
+    const hint = computed(browse, ".composer-browse-hint");
+    const area = computed(input, ".composer textarea");
+    expect(area.lineHeight).toBe("1.6");
+    expect(hint.lineHeight).toBe(area.lineHeight);
+    // jsdom resolves an `em` length against the font size, so the written value is read from the rules.
+    expect(hint.minHeight).toBe(area.minHeight);
+    for (const selector of [".composer-browse-hint", ".composer textarea"]) {
+      expect(splitRules(withoutComments).find((r) => r.selector === selector)!.declarations, selector).toMatch(
+        /min-height:\s*1\.6em;/,
+      );
+    }
+    expect(hint.fontSize).toBe(area.fontSize);
+    // The keycap's line box is smaller than the stand-in's, so its border and padding cannot grow the line.
+    expect(computed(browse, ".composer-key").lineHeight).toBe("1.2");
+    // Negative control: a stand-in left at the inherited line height would differ from the textarea.
+    const stripped = css.replace(/(\.composer-browse-hint \{[^}]*?)line-height: 1\.6;/, "$1");
+    expect(stripped).not.toBe(css);
+    document.head.innerHTML = `<style>${stripped}</style>`;
+    document.body.innerHTML = browse;
+    expect(getComputedStyle(document.body.querySelector(".composer-browse-hint")!).lineHeight).not.toBe("1.6");
   });
 
   /* The v1-ui GUI pass (2026-09-27): WebKitGTK drew "Ask the agent...— i or Ctrl+j to type" -- the

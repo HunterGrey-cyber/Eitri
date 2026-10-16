@@ -55,7 +55,7 @@ button:disabled {
 button:hover {
   border-color: var(--nv-fg);
 }
-button:focus-visible, input:focus-visible, textarea:focus-visible, [role="button"]:focus-visible {
+input:focus-visible, textarea:focus-visible, [role="button"]:focus-visible {
   outline: 2px solid var(--nv-fg);
   outline-offset: 3px;
 }
@@ -236,6 +236,7 @@ pre {
   background: var(--nv-tint);
   color: var(--nv-tint-fg);
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .row-prompt .prompt-delivered {
   display: block;
@@ -510,7 +511,7 @@ pre {
 }
 /* The cursor is measured by the navigation layer, so it has no layout footprint. The two shadows
    carry the fill a little above and below the row, so the row's first and last lines do not sit on
-   the band's edge; the bar on its left is what the eye finds while scrolling. */
+   the band's edge. The band carries no border, outline or mode colour: a flat, soft fill is the whole mark. */
 .cursor-band {
   position: absolute;
   top: 0;
@@ -521,22 +522,9 @@ pre {
   box-shadow: 0 -8px 0 var(--band-fill), 0 8px 0 var(--band-fill);
   border-radius: 8px;
 }
-.cursor-band::before {
-  content: "";
-  position: absolute;
-  top: -8px;
-  bottom: -8px;
-  left: 0;
-  width: 3px;
-  border-radius: 2px;
-  background: var(--nv-chrome-accent);
-}
 .message-list[data-focused="false"] .cursor-band, .agent-ui-root[data-panel-mode="input"] .cursor-band {
   background: var(--band-fill-inactive);
   box-shadow: 0 -8px 0 var(--band-fill-inactive), 0 8px 0 var(--band-fill-inactive);
-}
-.message-list[data-focused="false"] .cursor-band::before, .agent-ui-root[data-panel-mode="input"] .cursor-band::before {
-  background: var(--rule-frame);
 }
 /* A permission card is its own frame; the band behind it would draw a second one. */
 .message-list:has(.row-current .permission-card) .cursor-band {
@@ -792,7 +780,9 @@ pre {
   border: 0;
   background: none;
   outline: none;
+  /* One line height and one min-height with `.composer-browse-hint`: pressing `i` must not resize the card. */
   line-height: 1.6;
+  min-height: 1.6em;
   font-family: var(--nv-font-prose);
   font-size: var(--fs-prose);
   overflow-y: auto;
@@ -811,6 +801,10 @@ pre {
   outline: none;
   color: var(--nv-muted);
   font-size: var(--fs-prose);
+  /* The same line box as the textarea that replaces this line on `i`, so the empty composer keeps its
+     height and nothing above it moves. */
+  line-height: 1.6;
+  min-height: 1.6em;
   white-space: pre-wrap;
   cursor: text;
 }
@@ -823,6 +817,8 @@ pre {
   margin-left: auto;
   font-family: var(--nv-font-mono);
   font-size: var(--fs-sm);
+  /* Small enough that border and padding stay inside the hint's line box. */
+  line-height: 1.2;
   border: 1px solid var(--rule-soft);
   border-radius: 5px;
   padding: 0 7px;
@@ -1592,11 +1588,12 @@ pre {
   border-radius: 3px;
   line-height: 1.3;
 }
+/* A focused button is drawn as the solid cursor and nothing else: the fill is its one focus sign, so
+   no ring is added. The one exception is a permission card's primary answer, which is already solid. */
 .agent-ui-root button:focus {
   background: var(--nv-fg);
   color: var(--nv-bg);
-  outline: 2px solid var(--nv-fg);
-  outline-offset: 2px;
+  outline: none;
 }
 .agent-ui-root button:focus * {
   background: var(--nv-fg);
@@ -1938,12 +1935,18 @@ input::placeholder {
    `.notdef` box. Colour is the mode: `--nv-muted` for manual (every edit asks: nothing to warn
    about), `--nv-warn` for auto (a judgement call worth noticing),
    `--nv-error` for bypass (no gate at all) -- a glyph colour, never text
-   (`indexCss.test.ts`'s `MODE_GLYPH_BRANCH` exemption, the same shape `.wk-key`'s already has). */
+   (`indexCss.test.ts`'s `MODE_GLYPH_BRANCH` exemption, the same shape `.wk-key`'s already has).
+   `warn` and `error` are guarded at 3:1 against both `--nv-bg` and `--nv-chrome` in Rust, so they read on
+   the band's statusline fill as well as on the page. */
 .mode-glyph {
   font-family: "Noto Sans Symbols 2", "Symbola", "Segoe UI Symbol", "Adwaita Mono", var(--nv-font-mono);
 }
 .mode-glyph[data-mode-name="manual"] {
   color: var(--nv-muted);
+}
+/* On the band the glyph sits on the statusline's fill, so manual's quiet colour is that fill's own muted. */
+.status-band .mode-glyph[data-mode-name="manual"] {
+  color: var(--nv-chrome-muted);
 }
 .mode-glyph[data-mode-name="auto"] {
   color: var(--nv-warn);
