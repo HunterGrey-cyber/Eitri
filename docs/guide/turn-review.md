@@ -73,7 +73,8 @@ While the review is open it takes every key: the keys that answer permission car
 until you close it. Patches are drawn with the diff colours only, in two line-number columns.
 
 By default nothing tells you a review is waiting. If you want a hint after each turn that changed files, the
-status band can say `2 files changed · c to review`; see [Turning it off](#turning-it-off).
+status band can say `2 files changed · c to review`; while the turn runs, a line above the input box then
+counts what its edits have changed so far (`2 files changed +14 −1`). See [Turning it off](#turning-it-off).
 
 ## Reverting and undoing
 
@@ -170,7 +171,9 @@ eitri.config.set("review.hint", true)     -- say "N files changed · c to review
 ```
 
 `review.enabled` is `true` and `review.hint` is `false` by default. Anything but `true` or `false` is a
-startup error that names the key. With review off, no snapshot is taken and no review can be opened.
+startup error that names the key. With review off, no snapshot is taken and no review can be opened, and
+neither the status band nor the line above the input box says anything about a turn's changes, whatever
+`review.hint` is.
 
 ## Where the snapshots live
 

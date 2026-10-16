@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
 import { initialState } from "../reducer";
 import type { AgentUiState, ToolCallRecord } from "../types";
-import { latestTurnChanges, latestTurnId, TurnChanges } from "./TurnChanges";
+import { REVIEW_SETTINGS_OFF } from "../types";
+import { latestTurnChanges, latestTurnId, TurnChanges, turnChangesWanted } from "./TurnChanges";
+
+const HINT_ON = { enabled: true, hint: true };
 
 const edit = (seq: number, turnId: string, file: string, isError = false): ToolCallRecord => ({
   seq,
@@ -31,12 +34,35 @@ describe("latestTurnChanges", () => {
     expect(latestTurnChanges(withCalls([]))).toBeNull();
   });
 
-  it("offers the review key only once the turn is over", () => {
-    const running = render(<TurnChanges state={withCalls([edit(1, "t1", "/a")], "t1")} />);
-    expect(running.container.textContent).toBe("1 file changed+2−1");
-    running.unmount();
-    const done = render(<TurnChanges state={withCalls([edit(1, "t1", "/a")])} />);
-    expect(done.container.textContent).toContain("c to review");
+});
+
+describe("the change line", () => {
+  const running = withCalls([edit(1, "t1", "/a")], "t1");
+
+  it("is off by default: no settings, or the hint off, draws nothing", () => {
+    expect(render(<TurnChanges state={running} review={REVIEW_SETTINGS_OFF} />).container.textContent).toBe("");
+    expect(render(<TurnChanges state={running} review={{ enabled: true, hint: false }} />).container.textContent).toBe("");
+    expect(turnChangesWanted(REVIEW_SETTINGS_OFF)).toBe(false);
+  });
+
+  it("is drawn while the turn runs when review is on and the hint asked for", () => {
+    expect(turnChangesWanted(HINT_ON)).toBe(true);
+    expect(render(<TurnChanges state={running} review={HINT_ON} />).container.textContent).toBe("1 file changed+2−1");
+  });
+
+  it("draws nothing, and so offers no key, when review is off, even with the hint on", () => {
+    const off = { enabled: false, hint: true };
+    expect(turnChangesWanted(off)).toBe(false);
+    const { container } = render(<TurnChanges state={running} review={off} />);
+    expect(container.textContent).toBe("");
+    expect(container.textContent).not.toContain("c to review");
+  });
+
+  it("leaves a finished turn to the status band and never offers the key itself", () => {
+    const done = render(<TurnChanges state={withCalls([edit(1, "t1", "/a")])} review={HINT_ON} />);
+    expect(done.container.textContent).toBe("");
+    const live = render(<TurnChanges state={running} review={HINT_ON} />);
+    expect(live.container.textContent).not.toContain("c to review");
   });
 });
 
@@ -62,7 +88,7 @@ describe("the latest turn", () => {
     };
     expect(latestTurnId(toolFree)).toBeNull();
     expect(latestTurnChanges(toolFree)).toBeNull();
-    expect(render(<TurnChanges state={toolFree} />).container.textContent).toBe("");
+    expect(render(<TurnChanges state={toolFree} review={HINT_ON} />).container.textContent).toBe("");
     // A thought names the latest turn, which still changed nothing.
     const thought = { ...toolFree, thinking: [{ seq: 5, turnId: "t2", text: "hm" }] };
     expect(latestTurnId(thought)).toBe("t2");

@@ -1305,6 +1305,16 @@ pub fn serialize_review_hint_for_js(hint: &crate::turn_review::ReviewHint) -> St
     json!({ "kind": "review_hint", "tab": hint.tab, "turn": hint.turn, "files": hint.files }).to_string()
 }
 
+/// `{"kind":"review_settings","enabled":bool,"hint":bool}`: the window's turn review switches as the
+/// page needs them. `enabled` is whether a review is installed, so `c` can open one (`review.enabled`
+/// and a backend with turn boundaries); `hint` is `review.hint`. Window-level, sent in the `ready`
+/// batch before the tabs and again when `init.lua`'s values are applied. The page draws its running
+/// turn's change line only when both are true, and a page that never got this envelope treats both as
+/// false, so an older host leaves the page quiet.
+pub fn serialize_review_settings_for_js(enabled: bool, hint: bool) -> String {
+    json!({ "kind": "review_settings", "enabled": enabled, "hint": hint }).to_string()
+}
+
 /// `{"kind":"events","tab":...,"fromRevision":...,"throughRevision":...,"events":[...]}`.
 /// Each event uses `AgentDomainEvent`'s tagged `Serialize` shape. `from_revision` is the projection's
 /// `last_revision` before folding the batch; `through_revision` is its value afterward.
@@ -3842,6 +3852,17 @@ mod tests {
                 Some(written.as_str()),
                 "the committed turn endings fixture is not what this test produces; if the change is \
                  intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
+    #[test]
+    fn the_review_settings_envelope_carries_both_switches_by_name() {
+        for (enabled, hint) in [(false, false), (true, false), (false, true), (true, true)] {
+            let parsed: Value = serde_json::from_str(&serialize_review_settings_for_js(enabled, hint)).unwrap();
+            assert_eq!(
+                parsed,
+                json!({ "kind": "review_settings", "enabled": enabled, "hint": hint })
             );
         }
     }

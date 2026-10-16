@@ -1,5 +1,5 @@
 [English](turn-review.md) | 简体中文
-<!-- translated-from: turn-review.md sha256=5f3291fccfba9a5b59887ae3bc1abce0a756adb36109e60ea024ddf8daef4ac8 -->
+<!-- translated-from: turn-review.md sha256=e68bf5472560f9d2695a44751158b34a782d77304ca95a9bb7775906319f8c87 -->
 
 # 审阅一个回合
 
@@ -54,7 +54,7 @@ agent 在你的项目上工作之后，回合审阅回答一个问题：在那�
 
 审阅打开期间，它接管每一个键：比如回答权限卡片的那些键，在你关掉它之前什么都不做。补丁只用 diff 的颜色绘制，带有两列行号。
 
-默认情况下，没有任何东西告诉你有一个审阅在等着。如果你希望在每个改动了文件的回合之后得到一个提示，状态条可以写 `2 files changed · c to review`；见[关掉它](#turning-it-off)。
+默认情况下，没有任何东西告诉你有一个审阅在等着。如果你希望在每个改动了文件的回合之后得到一个提示，状态条可以写 `2 files changed · c to review`；回合进行期间，输入框上方还会有一行，统计它的编辑到目前为止改了什么（`2 files changed +14 −1`）。见[关掉它](#turning-it-off)。
 
 ## 还原和撤销
 
@@ -118,7 +118,7 @@ eitri.config.set("review.enabled", false) -- take no snapshots at all; `c` says 
 eitri.config.set("review.hint", true)     -- say "N files changed · c to review" in the status band after a turn
 ```
 
-`review.enabled` 默认是 `true`，`review.hint` 默认是 `false`。`true` 或 `false` 之外的任何值都是启动错误，并点出这个键。审阅关闭时，不拍任何快照，也打不开任何审阅。
+`review.enabled` 默认是 `true`，`review.hint` 默认是 `false`。`true` 或 `false` 之外的任何值都是启动错误，并点出这个键。审阅关闭时，不拍任何快照，也打不开任何审阅；不管 `review.hint` 是什么，状态条和输入框上方的那一行都不会提回合的改动。
 
 ## 快照存在哪里
 

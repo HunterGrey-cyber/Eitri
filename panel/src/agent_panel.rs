@@ -627,6 +627,10 @@ struct AgentPanelState {
     /// Whether a finished turn's hint reaches the status band (`review.hint`). Off until
     /// `set_review` says otherwise: the review is still one key away.
     review_hint: bool,
+    /// Whether a turn review is installed, so `c` can open one: `review.enabled` and a backend that
+    /// has turn boundaries. Off until `set_review` installs one. Told to the page with `review_hint`
+    /// (`review_settings`), which draws nothing about the turn's changes unless both are on.
+    review_enabled: bool,
     /// What `set_review` builds the turn review from: the state and home directories and the
     /// canonical project root, read once when the state is made.
     review_roots: ReviewRoots,
@@ -1586,7 +1590,12 @@ impl AgentPanelHandle {
     /// finished turn writes to the status band.
     pub fn set_review(&self, review: ReviewConfig) {
         self.wake();
-        self.state.borrow_mut().apply_review(review);
+        let payload = {
+            let mut state = self.state.borrow_mut();
+            state.apply_review(review);
+            review_settings_payload(&state)
+        };
+        self.dispatch(payload);
     }
 
     /// Where a restore's one-line result goes. `main.rs` installs this once.
@@ -2137,6 +2146,12 @@ fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: eitri_core::at
     }
 }
 
+/// The `review_settings` envelope for the state as it is: whether `c` can open a review, and whether
+/// the user asked to be told about a turn's changes.
+fn review_settings_payload(state: &AgentPanelState) -> String {
+    eitri_core::agent_bridge::serialize_review_settings_for_js(state.review_enabled, state.review_hint)
+}
+
 /// The three values a turn review is built from.
 struct ReviewRoots {
     state_home: Option<std::ffi::OsString>,
@@ -2154,6 +2169,7 @@ impl AgentPanelState {
     /// The state half of [`AgentPanelHandle::set_review`], which needs no page.
     fn apply_review(&mut self, review: ReviewConfig) {
         self.review_hint = review.hint;
+        self.review_enabled = false;
         if review.enabled {
             let roots = &self.review_roots;
             let installed = eitri_core::turn_review::TurnReview::new(
@@ -2161,8 +2177,9 @@ impl AgentPanelState {
                 roots.home.as_deref(),
                 &roots.canonical_root,
             );
-            if let Err(why) = self.tabs.install_turn_review(installed) {
-                eprintln!("[agent_panel] {why}");
+            match self.tabs.install_turn_review(installed) {
+                Ok(()) => self.review_enabled = true,
+                Err(why) => eprintln!("[agent_panel] {why}"),
             }
         } else {
             self.tabs.turn_review_off();
@@ -2301,6 +2318,7 @@ fn panel_state(
         review_hints: Vec::new(),
         shown_hints: Vec::new(),
         review_hint: false,
+        review_enabled: false,
         review_roots,
         editor_request_hook: None,
         editor_rpc: None,
@@ -2362,6 +2380,7 @@ fn bare_state(
         review_hints: Vec::new(),
         shown_hints: Vec::new(),
         review_hint: false,
+        review_enabled: false,
         review_roots: ReviewRoots {
             state_home: None,
             home: None,
@@ -5437,6 +5456,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                     0,
                     eitri_core::agent_bridge::serialize_display_for_js(state_ref.thinking_display),
                 );
+                // Whether the page may speak of a turn's changes, before the tabs it would speak of.
+                window.insert(1, review_settings_payload(state_ref));
                 let tabs = tabs_payload_recorded(state_ref);
                 let active = state_ref.tabs.active_state_payloads();
                 // What the last window left open, if the dashboard may offer it: a reloaded page
@@ -7274,6 +7295,45 @@ mod tests {
         assert_eq!(displays(&page.inner.sent), vec!["collapsed", "hidden", "hidden"]);
     }
 
+    /// The review switches reach the page: off before `init.lua`'s values are applied, at once to a
+    /// page already listening when they are, before the tabs on every `ready`, and again to a document
+    /// that replaces the first.
+    #[test]
+    fn the_review_settings_are_told_at_once_and_again_on_every_ready() {
+        let (handle, page) = handle_with_strict_page();
+        page.inner.visible.set(true);
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        let settings = |page: &std::cell::RefCell<Vec<String>>| -> Vec<(bool, bool)> {
+            page.borrow()
+                .iter()
+                .filter(|e| kind_of(e) == "review_settings")
+                .map(|e| {
+                    let v = serde_json::from_str::<serde_json::Value>(e).unwrap();
+                    (v["enabled"].as_bool().unwrap(), v["hint"].as_bool().unwrap())
+                })
+                .collect()
+        };
+        let kinds: Vec<String> = page.inner.sent.borrow().iter().map(|e| kind_of(e)).collect();
+        let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+        assert!(at("review_settings") < at("tabs"), "{kinds:?}");
+        assert_eq!(settings(&page.inner.sent), vec![(false, false)]);
+        handle.set_review(ReviewConfig {
+            enabled: true,
+            hint: true,
+        });
+        assert_eq!(settings(&page.inner.sent), vec![(false, false), (true, true)]);
+        handle.page_message(r#"{"type":"ready","request_id":"r2"}"#);
+        assert_eq!(
+            settings(&page.inner.sent),
+            vec![(false, false), (true, true), (true, true)]
+        );
+        handle.set_review(ReviewConfig {
+            enabled: false,
+            hint: true,
+        });
+        assert_eq!(settings(&page.inner.sent).last(), Some(&(false, true)));
+    }
+
     #[test]
     fn the_tick_runs_until_the_close_and_never_after() {
         let (handle, page) = handle_with_strict_page();
@@ -8048,12 +8108,22 @@ mod tests {
             hint: false,
         });
         assert!(state.borrow().tabs.turn_review().is_some());
+        assert!(state.borrow().review_enabled);
         assert!(!state.borrow().review_hint);
         state.borrow_mut().apply_review(ReviewConfig {
             enabled: true,
             hint: true,
         });
         assert!(state.borrow().review_hint);
+
+        // A backend without turn boundaries installs none, so the page is not told `c` would open one.
+        let state = state_for_hooks(TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto));
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled: true,
+            hint: true,
+        });
+        assert!(state.borrow().tabs.turn_review().is_none());
+        assert!(!state.borrow().review_enabled);
 
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
         state.borrow_mut().apply_review(ReviewConfig {
@@ -8062,6 +8132,7 @@ mod tests {
         });
         let state = state.borrow();
         assert!(state.tabs.turn_review().is_none());
+        assert!(!state.review_enabled);
         let tab = state.tabs.active();
         assert_eq!(
             state

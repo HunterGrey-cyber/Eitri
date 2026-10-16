@@ -237,6 +237,9 @@ type InboundHandler = (
      *  `serialize_display_for_js`, `core/src/agent_bridge.rs`). Window-level, sent on every `ready`
      *  before the tabs. */
     | { kind: "display"; thinking: ThinkingDisplay }
+    /** The window's turn review switches (`serialize_review_settings_for_js`, `core/src/agent_bridge.rs`).
+     *  Window-level, sent on every `ready` before the tabs and again when `init.lua`'s values arrive. */
+    | { kind: "review_settings"; enabled: boolean; hint: boolean }
     /** Whether this panel's pane holds the window's keyboard focus. `shell` decides this from
      *  GTK's focus widget (`shell/src/pane_focus.rs`). It is not decided from this page's own
      *  `window` focus/blur: `shell` arbitrates Ctrl+h/Ctrl+l, and the same answer drives the
@@ -414,6 +417,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "handoff" ||
         obj.kind === "theme" ||
         obj.kind === "display" ||
+        obj.kind === "review_settings" ||
         obj.kind === "pane_focus" ||
         obj.kind === "editor_typing" ||
         obj.kind === "enter_input" ||

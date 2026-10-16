@@ -761,3 +761,48 @@ describe("o", () => {
     expect(status(rendered.container)).toBe("opened; 2 hunks no longer match this buffer");
   });
 });
+
+describe("the change line above the composer", () => {
+  const edit = {
+    seq: 1, toolUseId: "e1", name: "Edit", turnId: "t1",
+    input: { file_path: "/home/user/project/a.rs", old_string: "a\nb", new_string: "a\nc\nd" },
+    result: { content: "ok", isError: false },
+  };
+  const running = () => dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ activeTurnId: "t1", toolCalls: [edit] }) });
+  const line = (container: HTMLElement) => container.querySelector(".turn-changes");
+
+  it("is not drawn by default: a host that sends no review settings leaves it out", () => {
+    const { container } = started();
+    running();
+    expect(line(container)).toBeNull();
+  });
+
+  it("is drawn while a turn runs once review is on and the hint asked for, and never offers the key", () => {
+    const { container } = started();
+    dispatch({ kind: "review_settings", enabled: true, hint: true });
+    running();
+    expect(line(container)!.textContent).toBe("1 file changed+2−1");
+    expect(container.textContent).not.toContain("c to review");
+  });
+
+  it("is not drawn with the hint off, nor with review off", () => {
+    const { container } = started();
+    dispatch({ kind: "review_settings", enabled: true, hint: false });
+    running();
+    expect(line(container)).toBeNull();
+    dispatch({ kind: "review_settings", enabled: false, hint: true });
+    expect(line(container)).toBeNull();
+    expect(container.textContent).not.toContain("c to review");
+  });
+
+  it("gives the finished turn to the band: the count and the key are said once", () => {
+    const { container } = started();
+    dispatch({ kind: "review_settings", enabled: true, hint: true });
+    running();
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 2, state: snapshotState({ activeTurnId: null, toolCalls: [edit] }) });
+    dispatch({ kind: "review_hint", tab: 1, turn: 1, files: 1 });
+    expect(line(container)).toBeNull();
+    expect(bandText(container)).toContain("1 file changed · c to review");
+    expect(container.textContent!.split("c to review").length - 1).toBe(1);
+  });
+});

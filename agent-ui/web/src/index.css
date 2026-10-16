@@ -938,9 +938,6 @@ pre {
   font-size: var(--fs-sm);
   color: var(--nv-muted);
 }
-.turn-changes-key {
-  margin-left: auto;
-}
 .history-notice {
   display: flex;
   flex-wrap: wrap;

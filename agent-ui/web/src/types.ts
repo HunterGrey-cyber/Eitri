@@ -705,6 +705,12 @@ export type ChooserEnvelope = { open: ChooserTab[]; records: ChooserRecord[] };
 /** Turn review (the `review`, `review_diff` and `review_hint` envelopes; `core/src/agent_bridge.rs`).
  *  Every attribution, count and state is decided in Rust; this side only draws what it is told. */
 export type ReviewScope = "turn" | "session";
+/** The window's turn review switches (the `review_settings` envelope). `enabled`: a review is installed,
+ *  so `c` can open one. `hint`: the user asked to be told about a turn's changes (`review.hint`). Both
+ *  start false and stay false when no envelope comes, so the page says nothing about a turn's changes
+ *  unless it was told it may. */
+export type ReviewSettings = { enabled: boolean; hint: boolean };
+export const REVIEW_SETTINGS_OFF: ReviewSettings = { enabled: false, hint: false };
 /** `no_baseline`: no snapshot of the turn's start exists, so nothing can be compared. `unfinished`: Eitri
  *  exited mid-turn, so the review compares the base with the disk as it is now. `pending`: a snapshot
  *  of this turn is still being taken. */

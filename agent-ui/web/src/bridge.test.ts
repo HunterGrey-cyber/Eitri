@@ -119,6 +119,13 @@ describe("installDispatch", () => {
     expect(handler).toHaveBeenCalledWith({ kind: "pane_focus", focused: true });
   });
 
+  it("demuxes a review_settings envelope", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__eitriDispatch!(JSON.stringify({ kind: "review_settings", enabled: true, hint: false }));
+    expect(handler).toHaveBeenCalledWith({ kind: "review_settings", enabled: true, hint: false });
+  });
+
   it("demuxes an error envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);

@@ -123,8 +123,8 @@ import {
   withStatus,
 } from "./review";
 import type { ReviewEffect, ReviewState } from "./review";
-import type { ReviewRecoveryEntry, ThinkingDisplay } from "./types";
-import { THINKING_DISPLAYS } from "./types";
+import type { ReviewRecoveryEntry, ReviewSettings, ThinkingDisplay } from "./types";
+import { REVIEW_SETTINGS_OFF, THINKING_DISPLAYS } from "./types";
 import { Chooser } from "./components/Chooser";
 import { withChooserTitles } from "./chooser";
 import { SlashPicker } from "./components/SlashPicker";
@@ -1218,6 +1218,9 @@ export default function App() {
    *  names the first whatever the hint setting says, and an overlay opened later starts with them. Nothing
    *  is kept here but what the shell last said. */
   const [reviewRecovery, setReviewRecovery] = useState<ReviewRecoveryEntry[]>([]);
+  /** The window's turn review switches (`review_settings`). Off until the shell says otherwise, so a
+   *  host that never sends them leaves the change line undrawn. */
+  const [reviewSettings, setReviewSettings] = useState<ReviewSettings>(REVIEW_SETTINGS_OFF);
   /** The detail popover's rows, or `null` when it is closed. Set by a
    *  `tab_detail` envelope (the reply to `open_detail`, sent by the band and by `prefix i`);
    *  closed the same places `keymapOpen` is forced shut, since the two are mutually exclusive
@@ -2476,6 +2479,9 @@ export default function App() {
         // drawing thinking some way nobody asked for.
         if ((THINKING_DISPLAYS as readonly string[]).includes(payload.thinking)) setThinkingDisplay(payload.thinking);
         else console.warn("agent-ui: a display envelope named an unknown thinking level", payload.thinking);
+      } else if (payload.kind === "review_settings") {
+        // Only a real `true` turns a switch on: anything else from the wire leaves the line undrawn.
+        setReviewSettings({ enabled: payload.enabled === true, hint: payload.hint === true });
       } else if (payload.kind === "editor_typing") {
         // Window-level and Rust's alone (a cadence slower than the meter's step): it slows the
         // meter, never pauses it. Deliberately not among the envelopes that cancel a waiting answer
@@ -6043,7 +6049,7 @@ export default function App() {
         pendingTool={oldestPendingTool(state)}
         mode={mode}
       />
-      <TurnChanges state={state} />
+      <TurnChanges state={state} review={reviewSettings} />
       <QueueLines items={queue} error={queueError} note={queueNote} />
       {/* Above the composer, deliberately -- the confirmation
           used to sit below everything, at the very bottom; the band leaves no room there for a

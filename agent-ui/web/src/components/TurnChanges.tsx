@@ -1,4 +1,4 @@
-import type { AgentUiState } from "../types";
+import type { AgentUiState, ReviewSettings } from "../types";
 import { fileChangesOf } from "../diff";
 
 export type TurnChangeSummary = { files: number; added: number; removed: number };
@@ -47,14 +47,23 @@ export function latestTurnChanges(state: AgentUiState): TurnChangeSummary | null
   return files.size === 0 ? null : { files: files.size, added, removed };
 }
 
-/** One quiet line above the composer: the latest turn's changes, and once the turn is over, the key
- *  that opens them for review. `c` reviews the tab's latest turn, the same turn counted here, so the key
- *  is offered only beside that turn's own count. */
-export function TurnChanges({ state }: { state: AgentUiState }) {
+/** Whether the change line may be drawn at all: only for a window that has a turn review to open
+ *  (`enabled`) and whose user asked to be told about a turn's changes (`hint`). Turn review keeps out
+ *  of the way unless asked, so a page told neither (or nothing) draws nothing. */
+export function turnChangesWanted(review: ReviewSettings): boolean {
+  return review.enabled && review.hint;
+}
+
+/** One quiet line above the composer while a turn runs: what its finished edits changed so far. Drawn
+ *  only when `turnChangesWanted`. It offers no key: once the turn is over the status band says how many
+ *  files changed on disk and that `c` reviews them, counted from the snapshots the review opens (which
+ *  include what a command changed), so the count and the key are said once, in one place. */
+export function TurnChanges({ state, review }: { state: AgentUiState; review: ReviewSettings }) {
+  if (!turnChangesWanted(review) || state.activeTurnId === null) return null;
   const changes = latestTurnChanges(state);
   if (changes === null) return null;
   return (
-    <div className="turn-changes" aria-label="Changes in the latest turn">
+    <div className="turn-changes" aria-label="Changes in the running turn">
       <span>{changes.files === 1 ? "1 file changed" : `${changes.files} files changed`}</span>
       <span className="edit-count-added">
         <span className="edit-sign">+</span>
@@ -64,7 +73,6 @@ export function TurnChanges({ state }: { state: AgentUiState }) {
         <span className="edit-sign">−</span>
         {changes.removed}
       </span>
-      {state.activeTurnId === null && <span className="turn-changes-key">c to review</span>}
     </div>
   );
 }
