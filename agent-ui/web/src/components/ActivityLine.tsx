@@ -41,15 +41,19 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
   // session that dies some OTHER way (nothing here has found one) from reading "working" forever.
   const working = state.status.kind === "running" && state.activeTurnId !== null;
   if (!working) return null;
+  const phase = phaseOf(state);
+  // The star is the line's one moving thing, and it moves only while the agent is working: a card
+  // waiting, or a phase that is the user's to end, holds it still (`index.css`'s `turn-breath`).
+  const moving = pendingTool === null && phase.kind !== "blocked";
   return (
     <div className="activity-line" data-nav-stop="status">
-      <span className="activity-glyph" aria-hidden="true">
+      <span className="activity-glyph" aria-hidden="true" data-moving={moving ? "true" : undefined}>
         ✻
       </span>
       {/* A card waiting IS what the line says: the phase word beside it only said
           "waiting for you" again, and at 520px the two were cut together, losing the keys that
           answer the card (r2-gui GUI pass, 2026-09-26). */}
-      {pendingTool === null && <TurnActivity phase={phaseOf(state)} clock={turnClock} />}
+      {pendingTool === null && <TurnActivity phase={phase} clock={turnClock} />}
       {pendingTool !== null ? (
         <span className="activity-card">
           {/* The hint names both requirements for answering: move the cursor onto the card with

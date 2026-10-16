@@ -84,8 +84,8 @@ Insert mode only `Ctrl+l`, since `Ctrl+h`, `Ctrl+j` and `Ctrl+k` keep their Inse
 your configuration has not mapped to something else: a mapping of your own is left alone.
 
 **From the agent panel.** `Ctrl+h` and `Ctrl+l` leave the panel to the module on that side. `Ctrl+k` and
-`Ctrl+j` depend on the panel's mode (below): `Ctrl+j` in BROWSE starts typing, in the box (INPUT) it leaves
-the panel to the module below; `Ctrl+k` in INPUT goes back to BROWSE, and in BROWSE it leaves the panel to
+`Ctrl+j` depend on the panel's mode (below): `Ctrl+j` in BROWSE starts typing, in the box (INSERT) it leaves
+the panel to the module below; `Ctrl+k` in INSERT goes back to BROWSE, and in BROWSE it leaves the panel to
 the module above. From the topmost module, `Ctrl+k` goes on to the top bar: `h` and `l` move along it,
 `Enter` activates an item, and `Ctrl+j` or `Esc` return the keys to where they were.
 
@@ -94,34 +94,38 @@ module below, never the box.
 
 ## The panel's modes
 
-The panel has two modes, shown at the left of its bottom band.
+The panel has two modes, shown at the left of its bottom band in the same block, colours and place as the
+editor's own statusline shows its mode (lualine's mode section, when you use lualine).
 
-- **INPUT** is the message box. Typing goes into it.
+- **INSERT** is the message box. Typing goes into it.
 - **BROWSE** is the conversation. The keys are vim's: you move over rows, fold and copy them, and answer
   cards.
 
-`Esc` leaves INPUT for BROWSE. `i` or `o` (the caret where you left it), `A` (at the end of the draft) or
-`Ctrl+j` go from BROWSE to INPUT. `i`, `o`, `A` and `f` act only on a key that stands alone: if another key
+`Esc` leaves INSERT for BROWSE. `i` or `o` (the caret where you left it), `A` (at the end of the draft) or
+`Ctrl+j` go from BROWSE to INSERT. `i`, `o`, `A` and `f` act only on a key that stands alone: if another key
 is pressed within about a quarter of a second of it, it does nothing, so the first letters of a sentence typed
 right after a reply arrives do not start HINT or open the box in the middle of a word.
 
-### In INPUT
+### In INSERT
 
 | keys | what they do |
 |---|---|
-| `Enter` | send; while a turn runs, queue the message for when it ends |
-| `Ctrl+Enter` | send now: interrupts a running turn, then sends the queue and this message |
+| `Enter` | send; while a turn runs, put the message into that turn without stopping it (the agent reads it at its next step), or, when the tab's agent cannot take messages mid-turn, hold it until the turn ends |
+| `Ctrl+Enter` | send now: interrupts a running turn, then sends what is held and this message |
 | `Shift+Enter`, `Alt+Enter`, or a backslash then `Enter` | a new line (the backslash is replaced by it) |
-| `Up` | from the first line: take the queue back, then step through earlier prompts |
+| `Up` | from the first line: take the held messages back, then step through earlier prompts (a message already put into the turn stays) |
 | `Down` | from the last line, once you are stepping through earlier prompts: one step forward again |
 | `Ctrl+r` | search earlier prompts; `Enter` puts one in the box |
+| `/` at the start | open the command menu while the box holds one line and the caret is in its first word: it lists the commands this tab accepts (Claude Code's own, or the ones an ACP agent reports; a Codex tab has none), typing narrows it, a space closes it |
+| `Up` / `Down` / `Ctrl+n` / `Ctrl+p` | with the command menu open: move the selection (these do not step through earlier prompts while it shows) |
+| `Tab` | with the command menu open: complete the selected command and a space; `Enter` does the same until the name is whole, then sends |
 | `Ctrl+w` / `Ctrl+u` | delete a word / to the start of the line |
 | `Ctrl+c` | interrupt a running turn; when idle, clear the box into the history |
 | `Ctrl+y` | approve the oldest card waiting in this tab (see [Answering a card](#answering-a-card)) |
 | `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back; `:q!` changes nothing unless you already saved the draft with `:w`, in which case the saved text comes back |
 | `Ctrl+o` | the detailed view (also in BROWSE) |
 | `Shift+Tab` | cycle the tab's mode: Manual, Auto, Bypass, then Manual again (an agent with no Manual mode: Auto and Bypass); entering Bypass asks first, only from Auto, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks) |
-| `Esc` | stop typing and go back to BROWSE |
+| `Esc` | stop typing and go back to BROWSE; with the command menu open, it closes the menu first and keeps the text |
 | `?` | the list of keys, from an empty box |
 
 A message that starts with `/` is a Claude Code slash command. Some work (`/clear`, `/compact`, `/cost`,
@@ -218,7 +222,7 @@ A permission card waits for you in the conversation, next to the tool call it ga
 | `h` / `l`, then `Enter` | walk to one of the card's buttons and press it |
 | `]p` / `[p` | move the cursor to the next / the previous waiting card |
 
-From INPUT, `Ctrl+y` approves the oldest card waiting in this tab, and the band names the card it would
+From INSERT, `Ctrl+y` approves the oldest card waiting in this tab, and the band names the card it would
 approve. There is no key that denies from the box, since a denial can carry a reason you want to type.
 
 These keys answer only when they stand alone. `a`, `d`, `D` and `Enter` on a button do nothing if another key

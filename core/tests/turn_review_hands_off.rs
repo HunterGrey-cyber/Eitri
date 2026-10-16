@@ -280,6 +280,7 @@ fn the_permission_and_send_paths_never_read_review_state() {
         ("flush_queue", "send_turn_in"),
         ("send_now", "interrupt"),
         ("queue_message", "queued_at_ms"),
+        ("steer_held", "steer"),
     ] {
         check(&format!("TabSet::{name}"), &functions(&tabs, name), anchor);
     }
@@ -377,7 +378,13 @@ fn called(body: &str) -> std::collections::BTreeSet<String> {
 /// ordinary queue and flush: nothing else in the review code sends, queues or flushes a turn.
 #[test]
 fn only_the_confirmed_review_send_reaches_the_send_path() {
-    const SEND_PATH: [&str; 4] = ["send_turn", "send_turn_in", "queue_message", "flush_queue"];
+    const SEND_PATH: [&str; 5] = [
+        "send_turn",
+        "send_turn_in",
+        "queue_message",
+        "flush_queue",
+        "steer_held",
+    ];
     // The confirmed send's function in `flow.rs`: where the review flow hands the confirmed text to
     // `TabSet::send_review`.
     const CONFIRMED_SEND: &str = "confirmed_send";
@@ -424,6 +431,7 @@ fn only_the_confirmed_review_send_reaches_the_send_path() {
         "flush_queue",
         "send_now",
         "queue_message",
+        "steer_held",
     ] {
         regions.extend(functions(&tabs, name));
     }

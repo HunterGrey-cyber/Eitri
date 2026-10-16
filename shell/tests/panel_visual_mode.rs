@@ -677,6 +677,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: ProjectionRef::Borrowed(projection),

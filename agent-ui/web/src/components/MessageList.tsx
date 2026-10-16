@@ -1,10 +1,12 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { AgentUiState, ToolCallRecord } from "../types";
+import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { AgentUiState, ThinkingBlock, ThinkingDisplay, ToolCallRecord } from "../types";
 import { renderToolCall } from "../toolRegistry";
 import { buildTimeline, isUsableLink, type TimelineItem } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
 import { forgetMarkdown, renderMarkdown } from "../markdown";
 import { turnEndingText } from "../turnEnding";
+import { endingDuration, NO_TURN_DURATIONS, placeFooters, workedFooters } from "../turnTimes";
+import type { TurnDurations } from "../turnTimes";
 import { HistoryNotice } from "./HistoryNotice";
 import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
@@ -13,11 +15,14 @@ import { noteUserScroll, RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT, type UserScroll
 import { pillLabel, pillShown } from "../pill";
 import { parsePath } from "../paths";
 import type { PathRef } from "../paths";
-import { CursorBand } from "../cursorBand";
+import { CursorBand, type BandBox } from "../cursorBand";
 import { conversationRows } from "../nav";
 
 type Props = {
   state: AgentUiState;
+  /** How long each finished turn ran (`turnTimes.ts`): the "Worked for" line under a turn's last row, and
+   *  the duration on a turn-ending row. Absent: no turn has a known time. */
+  turnDurations?: TurnDurations;
   /** The session is gone. Pending cards stay visible but can no longer submit into it. */
   sessionEnded: boolean;
   /** Expanded rows, keyed by timeline `key`. `App.tsx` holds this state because Enter acts on
@@ -37,14 +42,13 @@ type Props = {
   /** `Ctrl+o` shows every result in full, at wider cuts, with no collapsed runs. Stored per tab
    *  in `TabViewState.detailed`; fresh tabs default to `false`. */
   detailed?: boolean;
-  /** Whether the panel has the keyboard (the `pane_focus` envelope). Drives the cursor's solid
-   *  and hollow states in `index.css`; see the `.row-current .row-sign` rule there. Defaults to
+  /** How thinking is shown (`init.lua`'s `agent.thinking`, the `display` envelope). Defaults to
+   *  `collapsed`, its default there; `App.tsx` always passes it. */
+  thinkingDisplay?: ThinkingDisplay;
+  /** Whether the panel has the keyboard (the `pane_focus` envelope). Drives the cursor band's two strengths
+   *  in `index.css` (and the sign-cell cursor's solid and hollow states outside the conversation). Defaults to
    *  `true`, the state with no host to say otherwise; `App.tsx` always passes it explicitly. */
   focused?: boolean;
-  /** A code block reached through HINT keeps its outline until the next key. `App.tsx` sets
-   *  `data-hint-landed` on its `pre` because the block lives in markdown HTML. This flag makes
-   *  the current row's sign hollow so only one item has a solid mark. */
-  codeLanded?: boolean;
   /** Rules offered by Rust for the visible cards, mapped as `permissionId -> "<words> *"`.
    *  A missing `rule_offers` entry means no rule; the card never invents a suggestion. */
   ruleOffers?: Record<string, string>;
@@ -171,26 +175,33 @@ function listTakesUpward(list: HTMLElement, target: EventTarget | null): boolean
   return true;
 }
 
-/** Writes the list's content-box inline size, in px, to `--list-inline-size` on the list itself --
- *  what `index.css`'s `.row` derives `--row-inline-size` from, and every wide-content escape and the
- *  prompt's inset read. Skips the write when nothing changed, so an unchanged size never restyles
- *  the conversation. */
-function writeListInlineSize(list: HTMLElement, contentWidth: number): void {
-  const value = `${Math.max(0, contentWidth)}px`;
-  if (list.style.getPropertyValue("--list-inline-size") !== value) {
-    list.style.setProperty("--list-inline-size", value);
-  }
+/** How far the cursor's band reaches past the column's text on each side, where the margin allows it. */
+export const BAND_BLEED_PX = 16;
+
+/** The band's box for a row: the row's own box vertically; horizontally the column the row sits in, widened
+ *  by `BAND_BLEED_PX` into the margin each side -- in a narrow panel, where the margin is smaller than that,
+ *  the list's whole width, edge to edge (`index.css`, `.cursor-band`). */
+export function bandBox(row: HTMLElement, listWidth: number): BandBox {
+  const bleed = Math.min(BAND_BLEED_PX, row.offsetLeft);
+  const left = row.offsetLeft - bleed;
+  return {
+    left,
+    top: row.offsetTop,
+    width: Math.min(listWidth - left, row.offsetWidth + 2 * bleed),
+    height: row.offsetHeight,
+  };
 }
 
 export function MessageList({
   state,
+  turnDurations = NO_TURN_DURATIONS,
   sessionEnded,
   expanded,
   cursor,
   timeline: given,
   detailed = false,
+  thinkingDisplay = "collapsed",
   focused = true,
-  codeLanded = false,
   ruleOffers,
   yankedKey = null,
   onAnswerPermission,
@@ -219,28 +230,20 @@ export function MessageList({
   const bandRowKeyRef = useRef<string | null>(null);
   const placeBandRef = useRef<(glide: boolean) => void>(() => {});
 
-  /* Measure the list width here because CSS size query containers caused stale `scrollTop` resets
-     in WebKitGTK 2.52.6 when the status clock ticked during streaming. Containers on `.row`,
-     `.row-body`, the list and assistant rows all caused the same behavior.
-     Measure before first paint and update the width when `ResizeObserver` sees the list's box resize.
-     Content growth alone does not resize that box. Until the first width write, `index.css`
-     keeps content within the row; jsdom uses the same fallback without layout or `ResizeObserver`.
-     Observe each row too: changing `--prose-measure` can resize rows without resizing the list.
-     While following, snap to the end after layout and before paint so reflow or a shorter viewport
-     cannot hide the newest content. Leave a parked reader or a pending provisional stop in place.
-     `shell/tests/panel_stream_scroll.rs` covers streaming and resizing in the real engine. */
+  /* Watch the list and its rows for size changes. Viewport-based margins supply row widths;
+     no measured width or size query container is needed. A size container on `.row` caused
+     WebKitGTK to reset `scrollTop` when the status line clock ticked during streaming.
+
+     A resize can hide the tail without a state change: narrower replies grow taller, or the
+     composer, terminal, or key strip makes the list shorter. Rows must be observed too because
+     their size can change without changing the list's box, such as after a margin or font change.
+     While following, snap to the end after layout and before paint. Leave parked readers and
+     pending provisional stops in place. */
   useLayoutEffect(() => {
     const list = listRef.current;
     if (list === null) return;
-    const style = getComputedStyle(list);
-    writeListInlineSize(list, list.clientWidth - parseFloat(style.paddingLeft || "0") - parseFloat(style.paddingRight || "0"));
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver((entries) => {
-      // `contentRect` is the content box, which excludes the padding and a vertical scrollbar --
-      // the same box the rows are laid out across. Only the list's own entry carries its width.
-      for (const entry of entries) {
-        if (entry.target === list) writeListInlineSize(list, entry.contentRect.width);
-      }
+    const observer = new ResizeObserver(() => {
       // As the follow effect does, read the position first: a scroll whose event has not arrived yet
       // still decides whether this is a view that is following. Through the ref: see `onScrollRef`.
       // A row changed size, or the list did: the cursor's band follows its row at once, before the end is
@@ -309,8 +312,10 @@ export function MessageList({
      `MarkdownBody` renders each reply once per text instead of repeating markdown processing
      for every list render. Keep `timeline` above `onScroll` because `updatePill` reads it too. */
   const timeline = useMemo(
-    () => given ?? buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
-    [given, state, expanded, detailed],
+    () =>
+      given ??
+      buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null, thinking: thinkingDisplay }),
+    [given, state, expanded, detailed, thinkingDisplay],
   );
 
   const followingRef = useRef(true);
@@ -578,10 +583,7 @@ export function MessageList({
     if (list === null || el === null) return;
     const band = (bandRef.current ??= new CursorBand(el));
     const row = conversationRows(list)[cursor];
-    band.place(
-      row === undefined ? null : { left: row.offsetLeft, top: row.offsetTop, width: row.offsetWidth, height: row.offsetHeight },
-      glide,
-    );
+    band.place(row === undefined ? null : bandBox(row, list.clientWidth), glide);
   };
   useLayoutEffect(() => {
     const key = timeline[cursor]?.key ?? null;
@@ -597,6 +599,13 @@ export function MessageList({
   const rowHandlersRef = useRef<RowHandlers>({ onAnswerPermission, onPermissionReason });
   rowHandlersRef.current = { onAnswerPermission, onPermissionReason };
 
+  const footers = useMemo(
+    () => workedFooters(state, turnDurations),
+    [state.activeTurnId, state.turnEndings, state.transcript, state.thinking, state.toolCalls, state.pendingPermissions, turnDurations],
+  );
+  // By row key, over the rows actually drawn: a turn's newest row may be a hidden or folded thought.
+  const placedFooters = useMemo(() => placeFooters(timeline, footers), [timeline, footers]);
+
   const awaitingPermission = new Set(state.pendingPermissions.map((p) => p.toolUseId).filter(isUsableLink));
 
   return (
@@ -604,7 +613,6 @@ export function MessageList({
       <div
         className="message-list"
         data-focused={String(focused)}
-        data-code-landed={codeLanded ? "" : undefined}
         data-visual={visual ?? undefined}
         ref={listRef}
         onScroll={onScroll}
@@ -629,21 +637,32 @@ export function MessageList({
           // cursor move renders the two rows it changes and no other (`TimelineRow`).
           const call = item.kind === "tool" ? item.call : null;
           const permissionId = item.kind === "permission" ? item.request.permissionId : null;
+          const footer = placedFooters.get(item.key) ?? null;
           return (
-            <TimelineRow
-              key={item.key}
-              item={item}
-              current={index === cursor}
-              yanked={item.key === yankedKey}
-              expanded={expanded[item.key] === true}
-              detailed={detailed}
-              sessionEnded={sessionEnded}
-              abandoned={call !== null && isAbandonedCall(call, state, sessionEnded)}
-              gated={call !== null && awaitingPermission.has(call.toolUseId)}
-              ruleOffer={permissionId === null ? null : (ruleOffers?.[permissionId] ?? null)}
-              alreadyAnswered={permissionId !== null && (answeredPermissions?.has(permissionId) ?? false)}
-              handlers={rowHandlersRef}
-            />
+            <Fragment key={item.key}>
+              <TimelineRow
+                item={item}
+                current={index === cursor}
+                yanked={item.key === yankedKey}
+                expanded={expanded[item.key] === true}
+                detailed={detailed}
+                thinkingDisplay={thinkingDisplay}
+                sessionEnded={sessionEnded}
+                abandoned={call !== null && isAbandonedCall(call, state, sessionEnded)}
+                gated={call !== null && awaitingPermission.has(call.toolUseId)}
+                ruleOffer={permissionId === null ? null : (ruleOffers?.[permissionId] ?? null)}
+                alreadyAnswered={permissionId !== null && (answeredPermissions?.has(permissionId) ?? false)}
+                handlers={rowHandlersRef}
+                ranFor={item.kind === "ending" ? endingDuration(turnDurations, item.ending.turnId) : null}
+              />
+              {footer !== null && (
+                // Chrome, not a row: no `data-nav-stop`, so `j`/`k` and `y` never see it, and the inner
+                // `aria-hidden` span is what VISUAL's copy leaves out (`VISUAL_CHROME`).
+                <div className="turn-time" data-turn-time="">
+                  <span aria-hidden="true">{footer}</span>
+                </div>
+              )}
+            </Fragment>
           );
         })}
         {/* No end-of-list sentinel any more: it existed for the smooth `scrollIntoView` a new row used
@@ -667,6 +686,7 @@ type TimelineRowProps = {
   yanked: boolean;
   expanded: boolean;
   detailed: boolean;
+  thinkingDisplay: ThinkingDisplay;
   sessionEnded: boolean;
   /** A tool call whose result can never arrive (`isAbandonedCall`). */
   abandoned: boolean;
@@ -675,6 +695,8 @@ type TimelineRowProps = {
   /** A card's offered rule, exactly as Rust offered it. */
   ruleOffer: string | null;
   alreadyAnswered: boolean;
+  /** For a turn-ending row: how long the turn ran, worded (`formatDuration`), or `null` when unknown. */
+  ranFor: string | null;
   handlers: { current: RowHandlers };
 };
 
@@ -686,18 +708,23 @@ export function timelineRowRenderCount(): number {
 
 /** One conversation row. Memoized on its props, which are values or the timeline's own item: a held
  *  `j`/`k` moves the cursor several rows a second, and rendering every row of a long conversation for
- *  each move cost a frame or more. */
+ *  each move cost a frame or more. A streamed batch is the same case: `buildTimeline` hands back a
+ *  record's item while the record is unchanged, and `buildDisplay` a run's while its members are, so
+ *  a batch renders the one row it wrote to. Anything a row draws must come from its item or from a
+ *  prop here, or the row keeps showing what it showed before. */
 const TimelineRow = memo(function TimelineRow({
   item,
   current,
   yanked,
   expanded,
   detailed,
+  thinkingDisplay,
   sessionEnded,
   abandoned,
   gated,
   ruleOffer,
   alreadyAnswered,
+  ranFor,
   handlers,
 }: TimelineRowProps) {
   rowRenders += 1;
@@ -705,9 +732,13 @@ const TimelineRow = memo(function TimelineRow({
     case "prompt": {
       // Plain text, never markdown: this is what the user typed, and parsing it would render
       // their literal backticks and asterisks as formatting they did not ask for.
-      const yankedClass = yanked ? "row-yanked" : undefined;
+      // A message the agent read inside its running turn is part of that turn: `row-prompt-delivered`
+      // keeps it from opening a new one on screen (`index.css`).
+      const promptClass = [item.delivered ? "row-prompt-delivered" : null, yanked ? "row-yanked" : null]
+        .filter((name) => name !== null)
+        .join(" ");
       return (
-        <Row kind="prompt" sign="›" current={current} className={yankedClass} navStop="row">
+        <Row kind="prompt" sign="›" current={current} className={promptClass || undefined} navStop="row">
           {item.text}
         </Row>
       );
@@ -764,7 +795,17 @@ const TimelineRow = memo(function TimelineRow({
       return (
         <Row kind="ending" sign="·" current={current} className={yankedClass} navStop="row">
           {/* The reset time the ending itself kept: a later limit report never changes an older row. */}
-          {turnEndingText(item.ending, item.ending.resetsAt ?? null)}
+          {turnEndingText(item.ending, item.ending.resetsAt ?? null, ranFor)}
+        </Row>
+      );
+    }
+    case "thinking": {
+      // The agent's thinking: a muted row, its text behind the row's own fold (`Enter`/`zo`/`zc`, on
+      // `expanded[key]` like a tool's result) unless the level or the detailed view shows it whole.
+      const yankedClass = yanked ? "row-yanked" : undefined;
+      return (
+        <Row kind="thinking" sign="∴" current={current} className={yankedClass} navStop="row">
+          <ThinkingBody block={item.block} open={item.open} level={thinkingDisplay} expanded={expanded} detailed={detailed} />
         </Row>
       );
     }
@@ -792,6 +833,66 @@ const TimelineRow = memo(function TimelineRow({
     }
   }
 });
+
+/** How many lines a thought has, not counting the line breaks at its end. */
+export function thoughtLineCount(text: string): number {
+  const trimmed = text.replace(/\n+$/, "");
+  return trimmed === "" ? 0 : trimmed.split("\n").length;
+}
+
+/** How many of a thought's last lines `preview` shows while it is written. */
+export const THINKING_PREVIEW_LINES = 4;
+
+/** The last `count` lines of a thought, without the line breaks at its end. */
+export function lastThoughtLines(text: string, count: number): string {
+  return text.replace(/\n+$/, "").split("\n").slice(-count).join("\n");
+}
+
+/** One thinking block as its level draws it. The text is a React text child in a `pre-wrap` box, never
+ *  markdown or HTML: it is the provider's text, shown as it came. While the block is written the head
+ *  says `Thinking…`; after, `Thought` and how many lines it has (none named for a blank one). `preview` shows the newest lines in a
+ *  box of fixed height while it is written, so the rows below do not move as lines arrive. */
+function ThinkingBody({
+  block,
+  open,
+  level,
+  expanded,
+  detailed,
+}: {
+  block: ThinkingBlock;
+  open: boolean;
+  level: ThinkingDisplay;
+  expanded: boolean;
+  detailed: boolean;
+}) {
+  const always = detailed || level === "expanded";
+  const whole = always || expanded;
+  const lines = thoughtLineCount(block.text);
+  // A thought of only spaces and line breaks has nothing to count: "0 lines" or "3 lines" of nothing
+  // would both mislead, so its head says just `Thought`.
+  const counted = block.text.trim() !== "";
+  return (
+    <div className="thinking" data-open={open ? "true" : undefined} data-whole={whole ? "true" : undefined}>
+      <div className="thinking-head">
+        {open ? "Thinking…" : "Thought"}
+        {!open && counted && <span className="thinking-count">{` · ${lines} ${lines === 1 ? "line" : "lines"}`}</span>}
+        {!always && (
+          <>
+            {" "}
+            <span className="fold-marker" aria-label={whole ? "expanded" : "collapsed"}>
+              {whole ? "▾" : "▸"}
+            </span>
+          </>
+        )}
+      </div>
+      {whole ? (
+        <div className="thinking-text">{block.text}</div>
+      ) : level === "preview" && open ? (
+        <div className="thinking-preview">{lastThoughtLines(block.text, THINKING_PREVIEW_LINES)}</div>
+      ) : null}
+    </div>
+  );
+}
 
 /** One reply's rendered HTML, made when the reply first shows and again only when its text changes.
  *  The list renders every row on every update (a cursor move, a streamed batch), and leaving that to

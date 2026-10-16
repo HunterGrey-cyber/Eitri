@@ -27,6 +27,10 @@ local GROUPS = {
   "DiagnosticInfo", "Function", "String", "@keyword", "Statement", "@function", "@string", "@type", "Type",
   "@comment", "@number", "Number", "@constant", "Constant", "@variable", "Identifier", "@operator",
   "Operator", "@punctuation", "Delimiter", "@property", "@tag", "Tag",
+  -- The statusline's mode sections, which the panel's own mode block copies. lualine creates them when it
+  -- loads (LazyVim: after VimEnter), so the first payload may lack them and the resnapshot timer below
+  -- carries them over a few seconds later.
+  "lualine_a_normal", "lualine_a_insert", "lualine_a_visual",
 }
 
 -- Runs on the main loop (autocmd callback): `nvim_get_hl` is not allowed in a fast event.

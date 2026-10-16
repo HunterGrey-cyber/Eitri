@@ -26,13 +26,15 @@
       "accountLimits": null,
       "activeTurnId": "t1",
       "assistantMessageOpen": true,
+      "availableCommands": null,
       "backend": "sidecar",
       "backgroundCalls": 0,
       "capabilities": {
         "bypassPermissionMode": false,
         "fork": false,
         "interrupt": false,
-        "resume": false
+        "resume": false,
+        "steer": false
       },
       "conversationId": "fixture-conversation-id",
       "cwd": null,
@@ -53,6 +55,8 @@
       "status": {
         "kind": "starting"
       },
+      "thinking": [],
+      "thinkingOpen": false,
       "toolCalls": [],
       "transcript": [
         {
@@ -85,13 +89,15 @@
       "accountLimits": null,
       "activeTurnId": "t1",
       "assistantMessageOpen": true,
+      "availableCommands": null,
       "backend": "sidecar",
       "backgroundCalls": 0,
       "capabilities": {
         "bypassPermissionMode": false,
         "fork": false,
         "interrupt": false,
-        "resume": false
+        "resume": false,
+        "steer": false
       },
       "conversationId": "fixture-conversation-id",
       "cwd": null,
@@ -112,6 +118,8 @@
       "status": {
         "kind": "starting"
       },
+      "thinking": [],
+      "thinkingOpen": false,
       "toolCalls": [],
       "transcript": [
         {

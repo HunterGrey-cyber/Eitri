@@ -6,6 +6,7 @@
 //! `ProviderError::UnsupportedCapability`.
 
 mod spawn;
+mod steer;
 mod translate;
 mod watch;
 
@@ -22,7 +23,7 @@ pub use spawn::{
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
     ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
-    StreamingPreference,
+    SteerTurnRequest, StreamingPreference,
 };
 use crate::runtime_thread::RuntimeThread;
 use crate::setting_sources::{ProjectTrust, Source};
@@ -34,7 +35,8 @@ use claude_runtime_protocol::v1::{
     HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
     PermissionMode as ProtoPermissionMode, PersistenceMode, ReplayStart,
     ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest, SettingSource,
-    SettingSourceSelection, StreamingMode, ToolPolicy, WatchSessionEventsRequest,
+    SettingSourceSelection, SteerTurnRequest as ProtoSteerTurnRequest, StreamingMode, ToolPolicy,
+    WatchSessionEventsRequest,
 };
 use hyper_util::rt::TokioIo;
 use spawn::SpawnedSidecar;
@@ -71,6 +73,10 @@ const CAP_PROVIDER_PERMISSION_PROMPTS: &str = "provider_permission_prompts";
 /// instead of silently reading as absent.
 const CAP_CLI_AUTO_MODE: &str = claude_runtime_protocol::CAP_CLI_AUTO_MODE;
 const CAP_PERMISSION_DEFER: &str = claude_runtime_protocol::CAP_PERMISSION_DEFER;
+/// The `SteerTurn` RPC and its `UserMessageDelivered` and `UserMessageDropped` events.
+/// Advertised only when the CLI can report what became of a message;
+/// exposed as `ProviderCapabilities::steer`.
+const CAP_STEER_TURN: &str = claude_runtime_protocol::CAP_STEER_TURN;
 const PERMISSION_MODE_BYPASS: &str = "bypass";
 const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 
@@ -133,6 +139,7 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
             .any(|m| m == PERMISSION_MODE_INTERACTIVE),
         // Both or neither: see `ProviderCapabilities::cli_auto_mode`.
         cli_auto_mode: CLIENT_IMPLEMENTS_CLI_AUTO_MODE && has(CAP_CLI_AUTO_MODE) && has(CAP_PERMISSION_DEFER),
+        steer: has(CAP_STEER_TURN),
     }
 }
 
@@ -184,6 +191,8 @@ fn provider_error_code(code: ProtoErrorCode) -> ProviderErrorCode {
         ProtoErrorCode::ProviderUnavailable => ProviderErrorCode::ProviderUnavailable,
         ProtoErrorCode::ProviderProtocolError => ProviderErrorCode::ProviderProtocolError,
         ProtoErrorCode::DeadlineExceeded => ProviderErrorCode::DeadlineExceeded,
+        ProtoErrorCode::TurnMismatch => ProviderErrorCode::TurnMismatch,
+        ProtoErrorCode::SteerUnavailable => ProviderErrorCode::SteerUnavailable,
     }
 }
 
@@ -578,16 +587,104 @@ fn map_status(status: tonic::Status) -> ProviderError {
     // Business errors arrive as protobuf-encoded `ErrorDetail` in `grpc-status-details-bin`.
     // Tonic extracts this trailer into `status.details()`; it is absent from `status.metadata()`.
     // Decode the details directly so typed provider errors are not lost as transport errors.
-    let bytes = status.details();
-    if !bytes.is_empty() {
-        if let Ok(detail) = <ErrorDetail as prost::Message>::decode(bytes) {
-            return ProviderError::Provider {
-                code: provider_error_code(detail.code()),
-                message: detail.message,
-            };
-        }
+    match error_detail(&status) {
+        Some(detail) => ProviderError::Provider {
+            code: provider_error_code(detail.code()),
+            message: detail.message,
+        },
+        None => ProviderError::Transport(status.message().to_string()),
     }
-    ProviderError::Transport(status.message().to_string())
+}
+
+/// The sidecar's own error, when the status carries one (see `map_status` for where it travels).
+fn error_detail(status: &tonic::Status) -> Option<ErrorDetail> {
+    let bytes = status.details();
+    if bytes.is_empty() {
+        return None;
+    }
+    <ErrorDetail as prost::Message>::decode(bytes).ok()
+}
+
+/// The longest part of the sidecar's own words a refused message's reason carries, in characters.
+const MAX_STEER_REASON_CHARS: usize = 200;
+
+/// What a failed `SteerTurn` means for the message.
+#[derive(Debug)]
+enum SteerFailure {
+    /// The sidecar answered with its own error, or the call failed in a way that means its handler
+    /// never took the message: nothing reached the CLI.
+    Refused(ProviderError),
+    /// No answer that says so (the connection failed or broke, the call was cut off): the message may
+    /// have reached the CLI.
+    Unknown(String),
+}
+
+fn steer_failure(status: tonic::Status) -> SteerFailure {
+    if let Some(detail) = error_detail(&status) {
+        return SteerFailure::Refused(steer_refusal(detail));
+    }
+    // Without the sidecar's own error, the code says whether the handler can have run. These are the
+    // codes gRPC (here or on the sidecar's side) gives a call it rejects before any handler acts on it:
+    // a method the server does not have, a message too large or malformed, a refused request. The rest
+    // (`Unavailable`, `Cancelled`, `DeadlineExceeded`, `Unknown`, `Internal`, `DataLoss`, ...) can come
+    // after the request was taken.
+    use tonic::Code;
+    let words = match status.code() {
+        Code::Unimplemented => Some("this sidecar cannot take messages mid-turn".to_string()),
+        Code::ResourceExhausted => Some("the message is too large to send".to_string()),
+        Code::InvalidArgument
+        | Code::NotFound
+        | Code::AlreadyExists
+        | Code::PermissionDenied
+        | Code::Unauthenticated
+        | Code::FailedPrecondition
+        | Code::OutOfRange => {
+            let message = status.message();
+            let words: String = message.chars().take(MAX_STEER_REASON_CHARS).collect();
+            let cut = if message.chars().count() > MAX_STEER_REASON_CHARS {
+                "…"
+            } else {
+                ""
+            };
+            Some(format!("Claude did not take it: {words}{cut}"))
+        }
+        _ => None,
+    };
+    match words {
+        Some(message) => SteerFailure::Refused(ProviderError::Provider {
+            code: ProviderErrorCode::Unspecified,
+            message,
+        }),
+        None => SteerFailure::Unknown(status.message().to_string()),
+    }
+}
+
+/// A refused `SteerTurn` as the host shows it, after "held until the turn ends:". The code is kept, so
+/// a caller can still tell a stale turn from a session that cannot steer at all.
+fn steer_refusal(detail: ErrorDetail) -> ProviderError {
+    let code = provider_error_code(detail.code());
+    let message = match (code, detail.reason.as_str()) {
+        (ProviderErrorCode::NoActiveTurn, _) => "the turn had ended when it reached Claude".to_string(),
+        (ProviderErrorCode::TurnMismatch, _) => "the turn it was typed in had ended when it reached Claude".to_string(),
+        (ProviderErrorCode::SteerUnavailable, "first_turn_held") => {
+            "the session's first turn has not reached Claude yet".to_string()
+        }
+        (ProviderErrorCode::SteerUnavailable, "cli_lifecycle_not_reported") => {
+            "Claude has not yet said this session can take messages mid-turn".to_string()
+        }
+        (ProviderErrorCode::SteerUnavailable, _) => "Claude cannot take messages mid-turn now".to_string(),
+        (ProviderErrorCode::SessionNotFound, _) => "the session has ended".to_string(),
+        _ => {
+            let words: String = detail.message.chars().take(MAX_STEER_REASON_CHARS).collect();
+            let cut = if detail.message.chars().count() > MAX_STEER_REASON_CHARS {
+                "…"
+            } else {
+                ""
+            };
+            format!("Claude did not take it: {words}{cut}")
+        }
+    };
+    ProviderError::Provider { code, message }
 }
 
 /// Refuses session creation unless the sidecar advertises the gated `interactive` policy,
@@ -749,6 +846,9 @@ fn build_create_request_loading(
                 crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32,
                 crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32,
             },
+            // Never set: a sidecar that refuses its CLI refuses the session, and Eitri has no way
+            // for a user to decide otherwise per session.
+            accept_unsupported_cli: false,
         }),
         resume_provider_session_id,
         fork,
@@ -864,6 +964,47 @@ impl AgentProvider for ClaudeSidecarProvider {
         Ok(response.turn_id)
     }
 
+    /// Takes one message for the running turn and returns at once: the provider's runtime sends it.
+    /// Never waits on the sidecar, since the host calls this on its UI thread.
+    ///
+    /// **Order.** Verdandi's kernel hands a steered message to the CLI's input queue before it answers
+    /// `SteerTurn`, and the CLI takes that queue in order, so messages answered in order reach the CLI
+    /// in order. One message is in flight at a time (`send_steers`): a later one waits in the gate,
+    /// unsent, until the one before it is answered, and is dropped unsent when that one is refused. A
+    /// message the CLI drops after taking it cannot take later ones back with it: nothing on this wire
+    /// withdraws a queued message, so each is reported as what the CLI did with it.
+    ///
+    /// **Refusals** arrive as `UserMessageDropped`, worded for the host's held note (`steer_refusal`).
+    /// `Err` only when the gate refuses it here (the id is open already, or too many are open), when
+    /// nothing was sent either.
+    fn steer_turn(&self, request: SteerTurnRequest) -> Result<(), ProviderError> {
+        if !self.capabilities.steer {
+            return Err(ProviderError::UnsupportedCapability("steer"));
+        }
+        let SteerTurnRequest {
+            session_id,
+            expected_turn_id,
+            client_message_id,
+            text,
+            as_typed,
+        } = request;
+        let proto_request = ProtoSteerTurnRequest {
+            session_id,
+            command_id: uuid::Uuid::new_v4().to_string(),
+            expected_turn_id,
+            client_message_id: client_message_id.clone(),
+            text,
+        };
+        if let Some(now) = self.events.open_steer(&client_message_id, as_typed, proto_request)? {
+            self.runtime.handle().spawn(send_steers(
+                self.client.clone(),
+                Arc::clone(&self.events),
+                (client_message_id, now),
+            ));
+        }
+        Ok(())
+    }
+
     fn interrupt_turn(&self, request: InterruptTurnRequest) -> Result<(), ProviderError> {
         let mut client = self.client.clone();
         let proto_request = ProtoInterruptTurnRequest {
@@ -901,25 +1042,159 @@ impl AgentProvider for ClaudeSidecarProvider {
 }
 
 /// The events received off the wire and not yet taken by `pump`, with the signal that says so.
-/// Pushing raises it, so nothing can be queued without whoever drains `pump` being woken.
-#[derive(Default)]
+/// Whatever becomes ready raises it, so nothing can be queued without whoever drains `pump` being
+/// woken.
+///
+/// Every event passes the steer gate (`steer::SteerGate`) on its way in, under the same lock as the
+/// ready list, so a turn's end held for its follow-up and the follow-up's start become ready in one
+/// step and one `pump()` returns both.
 struct EventQueue {
-    events: Mutex<Vec<AgentDomainEvent>>,
+    state: Mutex<QueueState>,
     signal: Arc<crate::provider::EventSignal>,
+    /// How long a held turn end waits for its follow-up turn: `steer::FOLLOW_UP_WAIT`, shorter only
+    /// in tests.
+    follow_up_wait: Duration,
+}
+
+#[derive(Default)]
+struct QueueState {
+    ready: Vec<AgentDomainEvent>,
+    gate: steer::SteerGate<ProtoSteerTurnRequest>,
+}
+
+impl Default for EventQueue {
+    fn default() -> Self {
+        Self::with_follow_up_wait(steer::FOLLOW_UP_WAIT)
+    }
 }
 
 impl EventQueue {
-    fn push(&self, event: AgentDomainEvent) {
-        self.events.lock().unwrap().push(event);
+    fn with_follow_up_wait(follow_up_wait: Duration) -> Self {
+        Self {
+            state: Mutex::default(),
+            signal: Arc::default(),
+            follow_up_wait,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Makes `events` ready, in order, and wakes the reader when there are any.
+    fn deliver(&self, state: &mut QueueState, events: Vec<AgentDomainEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        state.ready.extend(events);
         self.signal.raise();
     }
 
-    fn take(&self) -> Vec<AgentDomainEvent> {
-        std::mem::take(&mut *self.events.lock().unwrap())
+    /// One event off this session's stream. Runs on the provider's runtime, the only place the
+    /// stream is read: a hold it begins arms a timer task there, which sleeps rather than blocks.
+    fn push(self: &Arc<Self>, event: AgentDomainEvent) {
+        let hold_started = {
+            let mut state = self.lock();
+            let passed = state.gate.pass(event);
+            self.deliver(&mut state, passed.ready);
+            passed.hold_started
+        };
+        if let Some(generation) = hold_started {
+            let queue = Arc::clone(self);
+            let wait = self.follow_up_wait;
+            tokio::spawn(async move {
+                tokio::time::sleep(wait).await;
+                queue.expire_hold(generation);
+            });
+        }
     }
 
+    fn expire_hold(&self, generation: u64) {
+        let mut state = self.lock();
+        let out = state.gate.expire(generation);
+        self.deliver(&mut state, out);
+    }
+
+    fn open_steer(
+        &self,
+        client_id: &str,
+        as_typed: String,
+        request: ProtoSteerTurnRequest,
+    ) -> Result<Option<ProtoSteerTurnRequest>, ProviderError> {
+        self.lock().gate.open(client_id, as_typed, request)
+    }
+
+    /// Records an accepted message; the next one to send, if one waits.
+    fn steer_accepted(&self, client_id: &str) -> Option<(String, ProtoSteerTurnRequest)> {
+        self.lock().gate.accepted(client_id)
+    }
+
+    fn steer_refused(&self, client_id: &str, reason: &str) {
+        let mut state = self.lock();
+        let out = state.gate.refused(client_id, reason);
+        self.deliver(&mut state, out);
+    }
+
+    fn steer_unknown(&self, client_id: &str) {
+        let mut state = self.lock();
+        let out = state.gate.unknown(client_id);
+        self.deliver(&mut state, out);
+    }
+
+    fn take(&self) -> Vec<AgentDomainEvent> {
+        std::mem::take(&mut self.lock().ready)
+    }
+
+    /// Everything received and not yet taken, held events included.
     fn len(&self) -> usize {
-        self.events.lock().unwrap().len()
+        let state = self.lock();
+        state.ready.len() + state.gate.held_len()
+    }
+}
+
+/// Sends steered messages one at a time, each once the one before it was answered, recording every
+/// answer in the gate where it arrives. Runs on the provider's runtime and only awaits.
+///
+/// The message is recorded before it is sent, so a delivery that races the answer still finds its typed
+/// text, and a turn that ends meanwhile is held for its follow-up. An answer that does not come in time,
+/// or a transport failure after the request may have gone, leaves the message open for its outcome:
+/// the CLI may have it, and reporting it dropped would have the host send it again.
+async fn send_steers(
+    client: RuntimeServiceClient<Channel>,
+    events: Arc<EventQueue>,
+    first: (String, ProtoSteerTurnRequest),
+) {
+    let mut next = Some(first);
+    while let Some((id, request)) = next.take() {
+        let mut client = client.clone();
+        let answer = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.steer_turn(request)).await;
+        next = match answer {
+            Ok(Ok(_)) => events.steer_accepted(&id),
+            Ok(Err(status)) => match steer_failure(status) {
+                SteerFailure::Refused(error) => {
+                    let reason = match error {
+                        ProviderError::Provider { message, .. } => message,
+                        other => other.to_string(),
+                    };
+                    events.steer_refused(&id, &reason);
+                    None
+                }
+                SteerFailure::Unknown(why) => {
+                    eprintln!(
+                        "agent: ClaudeSidecarProvider: SteerTurn failed in transport ({why}); the message may have reached Claude, so its outcome is awaited"
+                    );
+                    events.steer_unknown(&id);
+                    None
+                }
+            },
+            Err(_) => {
+                eprintln!(
+                    "agent: ClaudeSidecarProvider: SteerTurn was not answered in {UNARY_RPC_TIMEOUT:?}; the message may have reached Claude, so its outcome is awaited"
+                );
+                events.steer_unknown(&id);
+                None
+            }
+        };
     }
 }
 
@@ -1319,7 +1594,7 @@ mod tests {
         HandshakeResponse {
             protocol_major: 3,
             // The handshake reports the protocol minor from `capabilities.json`.
-            protocol_minor: 14,
+            protocol_minor: 20,
             sidecar_version: "0.2.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
             sdk_declared_claude_code_version: "2.1.269".into(),
@@ -1374,6 +1649,19 @@ mod tests {
                 "cli_auto_mode",
                 "permission_defer",
                 "permission_denied_events",
+                // These capabilities are listed in `capabilities.json`; this client reads none of them.
+                "cli_compatibility_report",
+                "gated_cli_mode_default",
+                "effective_claude_config_dir",
+                "startup_report_file",
+                "effective_session_report",
+                "extra_mcp_servers",
+                "extra_mcp_servers_http",
+                // `steer_turn` provides `ProviderCapabilities::steer` and is advertised only when the
+                // sidecar's CLI is at least 2.1.252. `list_commands` provides the `CommandsUpdated` event,
+                // which is translated whenever it arrives.
+                "steer_turn",
+                "list_commands",
                 // Executable sources are advertised as capabilities rather than a separate wire field.
                 // `executable_host_cli` is always present; checkout builds also offer `executable_sdk_bundled`.
                 // Packaged builds cannot offer it: the SDK uses `createRequire` to find its CLI, and the
@@ -1473,6 +1761,219 @@ mod tests {
         assert!(!capabilities_from_handshake(&older).resume);
     }
 
+    /// Steering is offered exactly when the sidecar advertises `steer_turn`, which it does only for a
+    /// CLI new enough to report what became of a message: without it a Claude tab's Enter holds.
+    #[test]
+    fn steering_is_offered_exactly_when_the_sidecar_advertises_it() {
+        assert!(capabilities_from_handshake(&real_handshake_today()).steer);
+        let mut older = real_handshake_today();
+        older.capabilities.retain(|c| c != CAP_STEER_TURN);
+        assert!(!capabilities_from_handshake(&older).steer);
+        assert_eq!(CAP_STEER_TURN, "steer_turn", "the word the sidecar advertises");
+    }
+
+    fn detail(code: ProtoErrorCode, reason: &str, message: &str) -> ErrorDetail {
+        ErrorDetail {
+            code: code as i32,
+            message: message.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    fn refusal_words(error: ProviderError) -> (ProviderErrorCode, String) {
+        match error {
+            ProviderError::Provider { code, message } => (code, message),
+            other => panic!("expected a provider error, got {other}"),
+        }
+    }
+
+    /// Each refusal reads as a reason the panel can show after "held until the turn ends:", and keeps
+    /// its code.
+    #[test]
+    fn a_refused_steer_is_worded_for_the_held_note_and_keeps_its_code() {
+        let cases = [
+            (
+                detail(ProtoErrorCode::NoActiveTurn, "", "no turn is running"),
+                ProviderErrorCode::NoActiveTurn,
+                "the turn had ended when it reached Claude",
+            ),
+            (
+                detail(ProtoErrorCode::TurnMismatch, "", "turn t1 is not the running turn"),
+                ProviderErrorCode::TurnMismatch,
+                "the turn it was typed in had ended when it reached Claude",
+            ),
+            (
+                detail(ProtoErrorCode::SteerUnavailable, "cli_lifecycle_not_reported", "x"),
+                ProviderErrorCode::SteerUnavailable,
+                "Claude has not yet said this session can take messages mid-turn",
+            ),
+            (
+                detail(ProtoErrorCode::SteerUnavailable, "first_turn_held", "x"),
+                ProviderErrorCode::SteerUnavailable,
+                "the session's first turn has not reached Claude yet",
+            ),
+            (
+                detail(ProtoErrorCode::SteerUnavailable, "a_reason_from_a_newer_sidecar", "x"),
+                ProviderErrorCode::SteerUnavailable,
+                "Claude cannot take messages mid-turn now",
+            ),
+            (
+                detail(ProtoErrorCode::SessionNotFound, "", "no such session"),
+                ProviderErrorCode::SessionNotFound,
+                "the session has ended",
+            ),
+            (
+                detail(
+                    ProtoErrorCode::InvalidConfiguration,
+                    "steer_text_empty",
+                    "a steered message needs text that is not only whitespace",
+                ),
+                ProviderErrorCode::InvalidConfiguration,
+                "Claude did not take it: a steered message needs text that is not only whitespace",
+            ),
+        ];
+        for (wire, code, words) in cases {
+            assert_eq!(refusal_words(steer_refusal(wire)), (code, words.to_string()));
+        }
+        let long = "y".repeat(MAX_STEER_REASON_CHARS + 10);
+        let (_, words) = refusal_words(steer_refusal(detail(ProtoErrorCode::InvalidConfiguration, "", &long)));
+        assert!(words.ends_with('…'), "{words}");
+        assert_eq!(
+            words.chars().count(),
+            "Claude did not take it: ".len() + MAX_STEER_REASON_CHARS + 1
+        );
+    }
+
+    /// The sidecar's own error means nothing was sent; a status without one (the transport failed)
+    /// means the message may have reached the CLI.
+    #[test]
+    fn only_the_sidecars_own_error_counts_as_not_sent() {
+        let bytes = prost::Message::encode_to_vec(&detail(ProtoErrorCode::TurnMismatch, "", "stale"));
+        let refused = tonic::Status::with_details(tonic::Code::FailedPrecondition, "stale", bytes.into());
+        assert!(matches!(
+            steer_failure(refused),
+            SteerFailure::Refused(ProviderError::Provider {
+                code: ProviderErrorCode::TurnMismatch,
+                ..
+            })
+        ));
+        let broken = tonic::Status::unavailable("connection reset");
+        assert!(matches!(steer_failure(broken), SteerFailure::Unknown(why) if why == "connection reset"));
+        assert!(matches!(
+            steer_failure(tonic::Status::deadline_exceeded("slow")),
+            SteerFailure::Unknown(_)
+        ));
+        // Rejected before any handler ran: not sent, so dropped at once rather than awaited.
+        for (status, words) in [
+            (
+                tonic::Status::unimplemented("no such method"),
+                "this sidecar cannot take messages mid-turn",
+            ),
+            (
+                tonic::Status::resource_exhausted("message too large"),
+                "the message is too large to send",
+            ),
+            (
+                tonic::Status::invalid_argument("bad request"),
+                "Claude did not take it: bad request",
+            ),
+        ] {
+            assert!(
+                matches!(steer_failure(status), SteerFailure::Refused(ProviderError::Provider { message, .. }) if message == words)
+            );
+        }
+    }
+
+    /// The two new refusals are complaints about one message, never a reason to end the session.
+    #[test]
+    fn the_steer_refusals_are_benign() {
+        assert!(ProviderErrorCode::TurnMismatch.is_benign());
+        assert!(ProviderErrorCode::SteerUnavailable.is_benign());
+        assert_eq!(
+            provider_error_code(ProtoErrorCode::SteerUnavailable),
+            ProviderErrorCode::SteerUnavailable
+        );
+    }
+
+    fn turn_completed(turn: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome: crate::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: crate::TurnEndDetail::default(),
+        }
+    }
+
+    /// The queue as the watch task drives it, on a current-thread runtime like the provider's: a turn
+    /// end held for its follow-up becomes ready together with the follow-up's start, in one `take`, and
+    /// the reader is woken only then.
+    #[test]
+    fn the_queue_releases_a_held_turn_end_with_the_follow_up_in_one_take() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let queue = Arc::new(EventQueue::default());
+        queue
+            .open_steer("m1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        queue.steer_accepted("m1");
+        let seen = queue.signal.seen();
+        runtime.block_on(async {
+            queue.push(turn_completed("t1"));
+        });
+        assert!(queue.take().is_empty(), "held");
+        assert_eq!(queue.len(), 1, "a held event still counts as pending");
+        assert_eq!(queue.signal.seen(), seen, "nothing ready, nobody woken");
+        runtime.block_on(async {
+            queue.push(AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        });
+        assert_ne!(queue.signal.seen(), seen, "woken once the pair is ready");
+        assert_eq!(
+            queue.take(),
+            [
+                turn_completed("t1"),
+                AgentDomainEvent::TurnStarted { turn_id: "t2".into() }
+            ]
+        );
+    }
+
+    /// The timer a hold arms runs on the runtime without blocking it, and when no follow-up comes it
+    /// drops the open message ahead of the held end and wakes the reader.
+    #[test]
+    fn the_queue_timer_drops_the_open_message_when_no_follow_up_comes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
+        queue
+            .open_steer("m1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        queue.steer_accepted("m1");
+        let seen = queue.signal.seen();
+        runtime.block_on(async {
+            queue.push(turn_completed("t1"));
+            // Other work on the same runtime goes on while the hold waits.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(queue.take().is_empty());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        assert_ne!(queue.signal.seen(), seen);
+        assert_eq!(
+            queue.take(),
+            [
+                AgentDomainEvent::UserMessageDropped {
+                    client_message_id: "m1".into(),
+                    reason: steer::UNREPORTED.into(),
+                },
+                turn_completed("t1"),
+            ]
+        );
+    }
+
     #[test]
     fn bypass_is_not_reported_when_the_provider_does_not_offer_it() {
         let mut response = real_handshake_today();
@@ -1493,10 +1994,10 @@ mod tests {
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        // Thirty-two capabilities in the packaged fixture returned by `real_handshake_today()`.
+        // Forty-one capabilities in the packaged fixture returned by `real_handshake_today()`.
         // Checkout builds also advertise `executable_sdk_bundled`; a sidecar with egress
         // restrictions enabled additionally advertises `egress_restricted`.
-        assert_eq!(info.advertised_capabilities.len(), 32);
+        assert_eq!(info.advertised_capabilities.len(), 41);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }

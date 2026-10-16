@@ -10,7 +10,7 @@ type Props = {
   /** Report Enter, Tab, and Escape before stopping them here. They never bubble to `App`'s
    *  typing guard, so without this callback a following `Ctrl+y` could approve a card. This
    *  matches the `/` and `:` input lines' use of `noteLineKey`. */
-  onLineKey?: (event: React.KeyboardEvent<HTMLInputElement>) => void;
+  onLineKey?: (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
 };
 
 /** readline's `(reverse-i-search)` line: typing narrows, `Ctrl+r` goes older,

@@ -19,7 +19,7 @@ pub use crate::agent_backend::AgentId;
 use crate::agent_backend::{AgentBackend, BackendError, BackendKind};
 use crate::agent_bridge::{
     serialize_events_with_notes_for_js, serialize_handoff_for_js, serialize_snapshot_with_notes_for_js,
-    serialize_tabs_for_js, CallNotes, SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView,
+    serialize_tabs_for_js, CallNotes, SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView, TurnTime,
 };
 use crate::attention::{Attention, AttentionTracker};
 use crate::saved_tabs::{SavedExternalTab, SavedTab, SavedTabs};
@@ -117,6 +117,44 @@ pub struct Queued {
     pub text: String,
     pub wire: String,
     pub queued_at_ms: u64,
+    pub state: QueuedState,
+    /// Whether Enter may put it into a running turn. False for a confirmed review, which waits for the
+    /// turn's end: it describes what that turn did, so it belongs after it.
+    pub steerable: bool,
+    /// The ids it was sent into a turn under and reported dropped from, oldest first. A provider that
+    /// gave up waiting on a message reports it dropped, and may still see the agent read it later: a
+    /// delivery under one of these ids means the message reached the agent, so it leaves the queue
+    /// instead of being sent again.
+    pub dropped_as: Vec<String>,
+}
+
+impl Queued {
+    /// A message waiting for the turn to end.
+    pub fn held(text: &str, wire: String, queued_at_ms: u64) -> Queued {
+        Queued {
+            text: text.to_string(),
+            wire,
+            queued_at_ms,
+            state: QueuedState::Held,
+            steerable: true,
+            dropped_as: Vec::new(),
+        }
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.state == QueuedState::Held
+    }
+}
+
+/// Where a typed message is: waiting for the turn to end, or sent into the running turn and not yet
+/// read by the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueuedState {
+    /// Goes out with the next turn (`TabSet::flush_queue`), or into this one when the agent can take it.
+    Held,
+    /// Sent into the running turn under `client_id` (`AgentBackend::steer`); it leaves the queue when
+    /// the agent reads it, and is held again if the agent refuses it or the turn ends first.
+    Steered { client_id: String, sent_at_ms: u64 },
 }
 
 /// What a flush sent, and how the backend answered.
@@ -224,6 +262,10 @@ pub struct Tab {
     /// Why the last flush was refused. Cleared by a flush that goes out, a take-back or
     /// a reset.
     pub queue_error: Option<String>,
+    /// Why messages typed while the turn ran are held rather than in the turn (the agent cannot take
+    /// them, refused one, or the turn ended before it read one). Shown once under the queue; cleared when
+    /// nothing is held any more.
+    pub queue_note: Option<String>,
     /// The panel's composer text, mirrored here so a switch or a reload cannot lose it.
     pub draft: String,
     /// Permission id -> the rule the card offers: only for a card a rule would answer.
@@ -281,6 +323,10 @@ pub struct Tab {
     /// `TurnStarted` event, because a legacy `TurnStarted` is returned by `send_turn` and never
     /// pumped -- so it is at most one 33 ms tick late, on both backends.
     turn_clock: Option<(String, u64)>,
+    /// How many of the newest entries in `notes.turn_times` no payload has carried yet. The active
+    /// tab's events payload takes exactly those; a snapshot carries all of them and zeroes this. A
+    /// background tab's count grows until a switch sends its snapshot.
+    turn_times_unsent: usize,
     /// Permission ids this tab answered `allow` for, through `approve_pending` in bypass or
     /// `answer_what_needs_no_human` under the classifier, while awaiting `PermissionResolved`.
     /// Hide these from `SnapshotView::of` and the tray's resync/attention feed so answered requests
@@ -359,6 +405,7 @@ impl Tab {
             last_handoff: None,
             queue: Vec::new(),
             queue_error: None,
+            queue_note: None,
             draft: String::new(),
             rule_offers: std::collections::BTreeMap::new(),
             editing_draft: None,
@@ -370,6 +417,7 @@ impl Tab {
             auto_edit_candidates: std::collections::BTreeMap::new(),
             creates_file_unsent: BTreeSet::new(),
             turn_clock: None,
+            turn_times_unsent: 0,
             host_answered: BTreeSet::new(),
             human_allowed: crate::agent_backend::HumanApprovals::default(),
             prompt_note_candidates: std::collections::BTreeMap::new(),
@@ -468,6 +516,47 @@ impl Tab {
             .is_some_and(|backend| backend.projection().active_turn_id.is_some())
     }
 
+    /// Applies what the provider reported about the messages this tab put into the running turn: one the
+    /// agent read leaves the queue (its row is in the conversation now), one it did not is held again
+    /// where it stood, with the reason. Read from the projection's record (`steer_outcome`), not from a
+    /// batch of events, so a resync that dropped the events loses none of it. Whether the queue changed.
+    fn settle_steered(&mut self) -> bool {
+        if self.queue.iter().all(|q| q.is_held() && q.dropped_as.is_empty()) {
+            return false;
+        }
+        let TabBackend::Live(backend) = &self.backend else {
+            return false;
+        };
+        let projection = backend.projection();
+        settle_against(&mut self.queue, &mut self.queue_note, &projection)
+    }
+
+    /// The tab's session is being taken away (a tripwire): what it reported is applied, and a message
+    /// still in the turn is held again, since nothing will report on it any more.
+    /// Whether the queue changed.
+    fn hold_steered_on_failure(&mut self) -> bool {
+        let settled = self.settle_steered();
+        if self.queue.iter().all(Queued::is_held) {
+            return settled;
+        }
+        for item in self.queue.iter_mut() {
+            item.state = QueuedState::Held;
+        }
+        self.queue_note = Some(held_note("the session was closed before the agent read it"));
+        true
+    }
+
+    /// Whether Enter while a turn runs puts the message into it: the live session's agent can take one now.
+    /// `None` without a live session.
+    pub fn steers(&self) -> Option<bool> {
+        self.live().map(AgentBackend::steers)
+    }
+
+    /// The messages sent into the running turn that the agent has not been seen to read.
+    pub fn steered_unconfirmed(&self) -> usize {
+        self.queue.iter().filter(|q| !q.is_held()).count()
+    }
+
     /// The session `r` continues on this ended tab: one its agent stopped itself with the conversation whole,
     /// on a tab whose sessions can be continued, by its own id. `None` for every other tab, where `r` empties
     /// the tab to a start screen.
@@ -556,6 +645,9 @@ pub struct PumpOutput {
     pub turn_ended: Vec<TabId>,
     /// Tabs whose `rule_offers` changed in this tick: the caller sends them to the panel.
     pub offers_changed: Vec<TabId>,
+    /// Tabs whose queue changed in this tick (a message put into the turn was read, or held again): the
+    /// caller sends the active one's queue to the panel.
+    pub queue_changed: Vec<TabId>,
     /// Tabs failed this tick because their CLI reported an ungated permission mode, with each
     /// backend removed for shutdown. The caller shuts them down off the GTK thread, as it does for
     /// closed tabs (`eitri_panel::agent_panel`'s `Retiring::backend`).
@@ -573,6 +665,56 @@ pub struct Tripped {
     /// The session, still running until the caller shuts it down: its shutdown is what denies the
     /// requests left pending in it.
     pub backend: AgentBackend,
+}
+
+/// The line under the queue that says why its messages wait for the turn to end.
+fn held_note(why: &str) -> String {
+    format!("held until the turn ends: {why}")
+}
+
+/// [`Tab::settle_steered`] against a projection the caller already reads, so whatever else it decides
+/// from the same read (whether a turn runs) is consistent with what the agent reported.
+fn settle_against(
+    queue: &mut Vec<Queued>,
+    note: &mut Option<String>,
+    projection: &agent::AgentSessionProjection,
+) -> bool {
+    let mut changed = false;
+    let mut dropped = None;
+    queue.retain_mut(|item| {
+        // Reported dropped once, and read by the agent after all.
+        let read_late = item
+            .dropped_as
+            .iter()
+            .any(|id| matches!(projection.steer_outcome(id), Some(agent::SteerOutcome::Delivered)));
+        if read_late {
+            changed = true;
+            return false;
+        }
+        let QueuedState::Steered { client_id, .. } = &item.state else {
+            return true;
+        };
+        match projection.steer_outcome(client_id) {
+            Some(agent::SteerOutcome::Delivered) => {
+                changed = true;
+                false
+            }
+            Some(agent::SteerOutcome::Dropped { reason }) => {
+                dropped = Some(reason.clone());
+                item.dropped_as.push(client_id.clone());
+                item.state = QueuedState::Held;
+                changed = true;
+                true
+            }
+            None => true,
+        }
+    });
+    if let Some(reason) = dropped {
+        *note = Some(held_note(&reason));
+    } else if changed && !queue.iter().any(Queued::is_held) {
+        *note = None;
+    }
+    changed
 }
 
 /// Why a tab whose CLI reported `reported` was closed. Names the setting most
@@ -783,6 +925,8 @@ pub struct TabSet {
     pending_bypass: Option<BypassPlan>,
     /// The next `BypassPlan::nonce`, starting at 1 so `0` is never a valid nonce to compare against.
     next_nonce: u64,
+    /// Numbers the messages put into a running turn, for their client ids.
+    next_steer: u64,
     /// Every card the tabs removed from this set had been handed, so the window's `arrived`
     /// (`attention`) never goes down when a tab closes: [`crate::attention::react`] reads only its
     /// growth.
@@ -867,6 +1011,7 @@ impl TabSet {
             default_mode,
             pending_bypass: None,
             next_nonce: 1,
+            next_steer: 1,
             removed_arrived: 0,
             rules: agent::PrefixRules::default(),
             recency: Vec::new(),
@@ -1767,6 +1912,7 @@ impl TabSet {
         }
         tab.draft = parts.join("\n\n");
         tab.queue_error = None;
+        tab.queue_note = None;
         tab.rule_offers.clear();
         tab.rule_offers_seen.clear();
         tab.user_answered.clear();
@@ -1879,6 +2025,7 @@ impl TabSet {
             first_text: false,
             turn_ended: Vec::new(),
             offers_changed: Vec::new(),
+            queue_changed: Vec::new(),
             tripped: Vec::new(),
             review_hints: Vec::new(),
         };
@@ -2014,6 +2161,10 @@ impl TabSet {
             });
             if let Some(reason) = tripped_reason {
                 eprintln!("[permission] tab {}: {reason}", tab.id.0);
+                // Nothing will report on a message still in the turn once the session goes.
+                if tab.hold_steered_on_failure() {
+                    out.queue_changed.push(tab.id);
+                }
                 tab.attention.session_ended(on_screen);
                 tab.was_running = false;
                 tab.turn_clock = None;
@@ -2035,11 +2186,16 @@ impl TabSet {
             // fresher read to prefer. The `Resync` arm is different (see its own comment below) and
             // re-observes the clock itself from the snapshot it actually sends, rather than reading
             // `tab.turn_clock` as this call left it.
-            observe_turn_clock(
-                &mut tab.turn_clock,
-                backend.projection().active_turn_id.as_deref(),
-                wall_clock_ms(),
-            );
+            {
+                let projection = backend.projection();
+                observe_turn_clock(
+                    &mut tab.turn_clock,
+                    &mut tab.notes.turn_times,
+                    &mut tab.turn_times_unsent,
+                    &projection,
+                    wall_clock_ms(),
+                );
+            }
             let mut resynced = false;
             match delivery {
                 RevisedDelivery::Nothing => {}
@@ -2114,6 +2270,16 @@ impl TabSet {
                             &events,
                         ),
                         auto_creates_file: std::mem::take(&mut tab.creates_file_unsent),
+                        // Only the active tab's payload leaves here; a background tab's turns wait
+                        // for the snapshot its next switch sends.
+                        turn_times: if is_active {
+                            let times = &tab.notes.turn_times;
+                            let fresh = times[times.len() - tab.turn_times_unsent.min(times.len())..].to_vec();
+                            tab.turn_times_unsent = 0;
+                            fresh
+                        } else {
+                            Vec::new()
+                        },
                     };
                     // Every card in the batch is counted, those the snapshot drew included: they are
                     // pending all the same, and this tab has not counted them yet.
@@ -2287,7 +2453,9 @@ impl TabSet {
                             // so use the same guarded observation as `active_state_payloads`.
                             observe_turn_clock(
                                 &mut tab.turn_clock,
-                                view.projection.active_turn_id.as_deref(),
+                                &mut tab.notes.turn_times,
+                                &mut tab.turn_times_unsent,
+                                &view.projection,
                                 wall_clock_ms(),
                             );
                             let payload = serialize_snapshot_with_notes_for_js(
@@ -2296,6 +2464,7 @@ impl TabSet {
                                 tab.turn_clock.as_ref().map(|(_, at)| *at),
                                 &tab.notes,
                             );
+                            tab.turn_times_unsent = 0;
                             // Under the guard the snapshot is serialized from (see the arm's comment).
                             (payload, view.projection.last_revision)
                         };
@@ -2343,6 +2512,11 @@ impl TabSet {
             tab.user_answered.retain(|id| still.contains(id));
             if refresh_offers(tab, project_root) {
                 out.offers_changed.push(tab.id);
+            }
+            // What the agent did with the messages put into its turn, read off the projection this
+            // delivery (or resync) left: delivered ones leave the queue as their rows arrive.
+            if tab.settle_steered() {
+                out.queue_changed.push(tab.id);
             }
             // `turn_running()` guards a turn that has already started again (a send that raced the
             // completion): the queue waits for that one's end instead.
@@ -2403,6 +2577,10 @@ impl TabSet {
                     tab.was_running = false;
                     tab.attention.restart();
                     tab.notes = CallNotes::default();
+                    // A new session numbers its turns afresh, and the old tab's last turn was not
+                    // seen to end: its clock and durations belong to the session that is gone.
+                    tab.turn_clock = None;
+                    tab.turn_times_unsent = 0;
                     tab.rule_candidates.clear();
                     tab.auto_edit_candidates.clear();
                     tab.creates_file_unsent.clear();
@@ -2470,7 +2648,9 @@ impl TabSet {
                     // exact).
                     observe_turn_clock(
                         &mut tab.turn_clock,
-                        view.projection.active_turn_id.as_deref(),
+                        &mut tab.notes.turn_times,
+                        &mut tab.turn_times_unsent,
+                        &view.projection,
                         wall_clock_ms(),
                     );
                     let payload = serialize_snapshot_with_notes_for_js(
@@ -2479,6 +2659,7 @@ impl TabSet {
                         tab.turn_clock.as_ref().map(|(_, at)| *at),
                         &tab.notes,
                     );
+                    tab.turn_times_unsent = 0;
                     (payload, view.projection.last_revision)
                 };
                 backend.note_ui_snapshot(revision);
@@ -2495,6 +2676,8 @@ impl TabSet {
             tab.id,
             &tab.queue,
             tab.queue_error.as_deref(),
+            tab.queue_note.as_deref(),
+            tab.steers(),
         ));
         payloads.push(crate::agent_bridge::serialize_draft_for_js(tab.id, &tab.draft));
         if tab.live().is_some() {
@@ -2573,7 +2756,8 @@ impl TabSet {
             number: tab.number,
             label_name: tab.label_name(),
             turn_running: tab.turn_running(),
-            queued: tab.queue.len(),
+            queued: tab.queue.len() - tab.steered_unconfirmed(),
+            steered: tab.steered_unconfirmed(),
             legacy: self.kind == BackendKind::Legacy && tab.agent == AgentId::Claude,
             has_backend: tab.live().is_some(),
         })
@@ -2596,8 +2780,16 @@ impl TabSet {
         tabs::close_others(&entries, self.active())
     }
 
-    /// `wire` already includes the editor context captured when the message was queued.
-    pub fn queue_message(&mut self, id: TabId, text: &str, wire: String, now_ms: u64) -> Result<usize, String> {
+    /// `wire` already includes the editor context captured when the message was composed.
+    /// When `steerable` is false, the message waits for the turn's end regardless of later Enter presses.
+    pub fn queue_message(
+        &mut self,
+        id: TabId,
+        text: &str,
+        wire: String,
+        now_ms: u64,
+        steerable: bool,
+    ) -> Result<usize, String> {
         let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
         if tab.pending_handoff.is_some() {
             return Err("this tab is being handed off to a terminal".to_string());
@@ -2613,19 +2805,111 @@ impl TabSet {
             text: text.to_string(),
             wire,
             queued_at_ms: now_ms,
+            state: QueuedState::Held,
+            steerable,
+            dropped_as: Vec::new(),
         });
         Ok(tab.queue.len())
     }
 
-    /// Send the whole queue as one turn, only when the tab can take one.
+    /// Enter while a turn runs: the tab's held messages, oldest first, go into the running turn when its
+    /// agent can take messages mid-turn (`AgentBackend::steer`); each leaves the queue once the agent
+    /// reads it. Only into the turn the page showed running when Enter was pressed (`shown_turn`): a message
+    /// typed in a turn that has ended since waits for the next end. The first refusal stops the rest, so a
+    /// later message never reaches the agent before an earlier one (the provider keeps that order for the
+    /// refusals it learns of later), and the held ones wait for the turn's end with the reason under them.
+    /// A message that may not be steered (a confirmed review, or a slash command on an agent that reads
+    /// commands: `reads_slash_commands`) stops them too, for the same order. A card
+    /// waiting does not stop it: the agent reads the message once that call is answered, sooner than the
+    /// turn's end, and the card keeps its own keys. Whether the queue changed.
+    pub fn steer_held(&mut self, id: TabId, now_ms: u64, shown_turn: Option<&str>) -> bool {
+        let mut next = self.next_steer;
+        let Some(tab) = self.get_mut(id) else { return false };
+        let mut changed = tab.settle_steered();
+        if tab.pending_handoff.is_some() || !tab.turn_running() || !tab.queue.iter().any(Queued::is_held) {
+            return changed;
+        }
+        let label = tab.agent.label();
+        let TabBackend::Live(backend) = &mut tab.backend else {
+            return changed;
+        };
+        let reads_commands = reads_slash_commands(&tab.agent, &backend.projection());
+        let mut refusal = None;
+        for item in tab.queue.iter_mut().filter(|q| q.is_held()) {
+            if !item.steerable {
+                refusal = Some("a review waits for the turn's end, and what follows it waits too".to_string());
+                break;
+            }
+            if reads_commands && is_slash_command(&item.text) {
+                refusal = Some("a command waits for the turn's end, and what follows it waits too".to_string());
+                break;
+            }
+            let Some(turn) = shown_turn else {
+                refusal = Some("no turn was running when it was typed".to_string());
+                break;
+            };
+            let client_id = format!("eitri-{}-{next}", id.0);
+            match backend.steer(turn, &client_id, &item.wire, &item.text) {
+                Ok(()) => {
+                    next += 1;
+                    item.state = QueuedState::Steered {
+                        client_id,
+                        sent_at_ms: now_ms,
+                    };
+                    changed = true;
+                }
+                Err(crate::agent_backend::SteerRefusal::Unsupported) => {
+                    refusal = Some(format!("{label} cannot take messages mid-turn"));
+                    break;
+                }
+                Err(crate::agent_backend::SteerRefusal::Refused(why)) => {
+                    refusal = Some(why);
+                    break;
+                }
+            }
+        }
+        let note = refusal.as_deref().map(held_note);
+        changed |= tab.queue_note != note;
+        tab.queue_note = note;
+        self.next_steer = next;
+        changed
+    }
+
+    /// Send the held queue as one turn when the tab can accept it.
+    ///
+    /// A message sent into the previous turn has either had its outcome reported, been held again,
+    /// or started a follow-up turn through `AgentProvider::steer_turn`. A running turn prevents
+    /// another send. Messages with no reported outcome are retried, accepting possible duplicate
+    /// delivery rather than silently losing them.
+    ///
+    /// Read delivery outcomes and the active turn under one projection lock. Separate reads could
+    /// straddle a delivery and turn completion, making a read message look unreported and sending it twice.
     pub fn flush_queue(&mut self, id: TabId) -> Option<Flush> {
         let tab = self.get_mut(id)?;
-        if tab.queue.is_empty() || tab.pending_handoff.is_some() || tab.turn_running() {
+        if tab.queue.is_empty() || tab.pending_handoff.is_some() {
             return None;
         }
-        let backend = tab.live_mut()?;
-        if !backend.projection().pending_permissions.is_empty() {
+        {
+            let TabBackend::Live(backend) = &tab.backend else {
+                return None;
+            };
+            let projection = backend.projection();
+            settle_against(&mut tab.queue, &mut tab.queue_note, &projection);
+            if projection.active_turn_id.is_some() || !projection.pending_permissions.is_empty() {
+                return None;
+            }
+        }
+        if tab.queue.is_empty() {
             return None;
+        }
+        if !tab.queue.iter().all(Queued::is_held) {
+            eprintln!(
+                "[agent_panel] tab {}: the agent never said whether it read a message sent into its turn; it is sent again",
+                tab.id.0
+            );
+            for item in tab.queue.iter_mut() {
+                item.state = QueuedState::Held;
+            }
         }
         let wire = tab
             .queue
@@ -2646,6 +2930,7 @@ impl TabSet {
             Ok(_) => {
                 tab.queue.clear();
                 tab.queue_error = None;
+                tab.queue_note = None;
                 tab.turn_trace = trace;
             }
             Err(error) => tab.queue_error = Some(error.message.clone()),
@@ -2674,14 +2959,14 @@ impl TabSet {
     ///
     /// Only the review flow's confirmed send calls this. It adds nothing to the prompt history.
     pub fn send_review(&mut self, id: TabId, text: &str, now_ms: u64) -> Result<Option<Flush>, String> {
-        self.queue_message(id, text, text.to_owned(), now_ms)?;
+        self.queue_message(id, text, text.to_owned(), now_ms, false)?;
         Ok(self.flush_queue(id))
     }
 
     /// Queue nonempty text, then interrupt a running turn or flush the queue.
     pub fn send_now(&mut self, id: TabId, text: &str, wire: String, now_ms: u64) -> Result<SendNow, String> {
         if !text.trim().is_empty() {
-            self.queue_message(id, text, wire, now_ms)?;
+            self.queue_message(id, text, wire, now_ms, true)?;
         }
         let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
         if tab.turn_running() {
@@ -2759,11 +3044,17 @@ impl TabSet {
         out
     }
 
-    /// The whole queue, oldest first, for the panel to merge into the box.
+    /// Return held messages oldest first for the panel to merge into the input box.
+    /// Messages already sent into a running turn stay queued because the agent may have read them.
     pub fn take_back_queue(&mut self, id: TabId) -> Vec<String> {
         let Some(tab) = self.get_mut(id) else { return Vec::new() };
+        tab.settle_steered();
         tab.queue_error = None;
-        std::mem::take(&mut tab.queue).into_iter().map(|q| q.text).collect()
+        tab.queue_note = None;
+        let (held, steered): (Vec<Queued>, Vec<Queued>) =
+            std::mem::take(&mut tab.queue).into_iter().partition(Queued::is_held);
+        tab.queue = steered;
+        held.into_iter().map(|q| q.text).collect()
     }
 
     /// Mirror the panel's draft without echoing it back.
@@ -2790,7 +3081,8 @@ impl TabSet {
             .unwrap_or_default()
     }
 
-    /// Every tab's queue, summed.
+    /// Every tab's queue, summed: held messages and those sent into a
+    /// running turn that the agent has not been seen to read.
     pub fn queued_count(&self) -> usize {
         self.tabs.iter().map(|t| t.queue.len()).sum()
     }
@@ -3567,13 +3859,85 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
 
 /// Keeps `clock` in step with the projection's running turn: stamped `now_ms` the first time a
 /// turn id is seen, kept while that id runs, cleared when none does.
-fn observe_turn_clock(clock: &mut Option<(String, u64)>, active_turn_id: Option<&str>, now_ms: u64) {
-    match active_turn_id {
-        None => *clock = None,
-        Some(id) if clock.as_ref().is_some_and(|(seen, _)| seen == id) => {}
-        Some(id) => *clock = Some((id.to_string(), now_ms)),
+///
+/// A turn the clock was stamped for that stops running -- ended well or badly, or replaced by the
+/// next turn's id -- is appended to `times` (and counted in `unsent`), so the panel can say how long
+/// it took. A turn nobody stamped (it began before this process, or inside one tick) leaves no entry.
+fn observe_turn_clock(
+    clock: &mut Option<(String, u64)>,
+    times: &mut Vec<TurnTime>,
+    unsent: &mut usize,
+    projection: &agent::AgentSessionProjection,
+    now_ms: u64,
+) {
+    let active_turn_id = projection.active_turn_id.as_deref();
+    if active_turn_id.is_some_and(|id| clock.as_ref().is_some_and(|(seen, _)| seen == id)) {
+        return;
+    }
+    if let Some((turn_id, started_at_ms)) = clock.take() {
+        times.push(TurnTime {
+            turn_id,
+            started_at_ms,
+            ended_at_ms: now_ms.max(started_at_ms),
+            // The newest row on the page is where the turn stopped -- unless another turn is already
+            // running, whose rows may be the newest by now: then no row can be named, and the panel
+            // shows no duration line for this turn.
+            anchor_seq: if active_turn_id.is_none() {
+                newest_item_seq(projection)
+            } else {
+                None
+            },
+        });
+        *unsent += 1;
+        if times.len() > MAX_TURN_TIMES {
+            let excess = times.len() - MAX_TURN_TIMES;
+            times.drain(..excess);
+            *unsent = (*unsent).min(MAX_TURN_TIMES);
+        }
+    }
+    if let Some(id) = active_turn_id {
+        *clock = Some((id.to_string(), now_ms));
     }
 }
+
+/// Whether the tab's agent reads a message starting with `/` as a command of its own: Claude always, and
+/// any agent that listed its commands (an ACP agent's `available_commands_update`). Such a message is never
+/// put into a running turn, where it would arrive as text; it waits for the turn's end and goes out as a
+/// turn of its own, as Claude Code runs a command typed while it works. Codex lists none, and takes a
+/// message into its turn as typed.
+fn reads_slash_commands(agent: &AgentId, projection: &agent::AgentSessionProjection) -> bool {
+    matches!(agent, AgentId::Claude)
+        || projection
+            .available_commands
+            .as_ref()
+            .is_some_and(|list| !list.is_empty())
+}
+
+/// Whether typed text is a slash command: it starts with `/`, after any leading blanks (the page's `/`
+/// menu reads it the same way, and holding a message that was not one only delays it to the turn's end).
+fn is_slash_command(text: &str) -> bool {
+    text.trim_start().starts_with('/')
+}
+
+/// The `seq` of the newest row the agent wrote (a reply, a thought, a call, a card or an ending):
+/// the one a turn that just ended finished on. The
+/// user's prompts are left out, because a queued message can be sent the moment a turn ends, and
+/// the line saying how long that turn took belongs above it, not under it.
+fn newest_item_seq(projection: &agent::AgentSessionProjection) -> Option<u64> {
+    [
+        projection.transcript.last().map(|m| m.seq),
+        projection.thinking.last().map(|t| t.seq),
+        projection.tool_calls.last().map(|c| c.seq),
+        projection.turn_endings.last().map(|e| e.seq),
+        projection.pending_permissions.values().map(|p| p.seq).max(),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+/// How many finished turns' durations a tab remembers; the oldest are dropped first.
+const MAX_TURN_TIMES: usize = 1000;
 
 /// Why [`TabSet::install_turn_review`] refused, as the panel says it.
 pub const TURN_REVIEW_NEEDS_SIDECAR: &str = "turn review needs the sidecar backend";
@@ -4186,7 +4550,7 @@ mod tests {
             set.get(tab).unwrap().turn_running()
         });
 
-        set.queue_message(tab, "follow-up", "follow-up-wire".into(), 0)
+        set.queue_message(tab, "follow-up", "follow-up-wire".into(), 0, true)
             .expect("queuing behind a running turn");
 
         provider.queue(completed("t1", agent::TurnOutcome::Completed));
@@ -5978,11 +6342,11 @@ mod tests {
         pump_until_running(&mut set, &dir, tab, true);
 
         assert_eq!(
-            set.queue_message(tab, "and the tests", "ctx A\n\nand the tests".into(), 1),
+            set.queue_message(tab, "and the tests", "ctx A\n\nand the tests".into(), 1, true),
             Ok(1)
         );
         assert_eq!(
-            set.queue_message(tab, "then commit", "ctx B\n\nthen commit".into(), 2),
+            set.queue_message(tab, "then commit", "ctx B\n\nthen commit".into(), 2, true),
             Ok(2)
         );
         assert!(set.flush_queue(tab).is_none(), "a running turn holds the queue");
@@ -6033,7 +6397,7 @@ mod tests {
         provider.queue(started("t1"));
         pump_until_running(&mut set, &dir, empty, true);
         assert!(set.close_needs_confirm(empty), "a running turn");
-        assert_eq!(set.queue_message(empty, "later", "later".into(), 1), Ok(1));
+        assert_eq!(set.queue_message(empty, "later", "later".into(), 1, true), Ok(1));
         assert!(set.close_needs_confirm(empty), "a running turn with a queue");
         shut_down_all(&mut set);
     }
@@ -6088,6 +6452,225 @@ mod tests {
         shut_down_all(&mut set);
     }
 
+    /// Pumps `tab` until a payload for the active tab carries `turnTimes`, returning that payload's
+    /// `turnTimes`. Every payload the pump hands back is looked at, since the entry rides on whichever
+    /// events envelope the tick that saw the turn end builds.
+    fn pump_until_turn_times(set: &mut TabSet, dir: &Path) -> serde_json::Value {
+        let mut found = None;
+        until("an events payload carrying turnTimes", || {
+            if let Some(payload) = set.pump(dir, true).active_payload {
+                let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                if value["kind"] == "events" && value.get("turnTimes").is_some() {
+                    found = Some(value["turnTimes"].clone());
+                }
+            }
+            found.is_some()
+        });
+        found.unwrap()
+    }
+
+    fn snapshot_turn_times(set: &mut TabSet) -> serde_json::Value {
+        let snapshot: serde_json::Value = serde_json::from_str(&the_snapshot(set.active_state_payloads())).unwrap();
+        snapshot["turnTimes"].clone()
+    }
+
+    /// A turn that ends records how long it ran, on the events envelope of the batch that ended it
+    /// and in every later snapshot; a second end is a second entry.
+    #[test]
+    fn a_completed_turn_records_its_duration_in_the_events_and_the_snapshot() {
+        let dir = workspace("tabs-turn-times-completed");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        assert_eq!(
+            snapshot_turn_times(&mut set),
+            serde_json::json!([]),
+            "nothing has ended yet"
+        );
+
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        let started_at = set.get(tab).unwrap().turn_started_at_ms().expect("t1 stamped");
+        std::thread::sleep(Duration::from_millis(25));
+        provider.queue(text_delta("t1", "done"));
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        let times = pump_until_turn_times(&mut set, &dir);
+        let times = times.as_array().unwrap();
+        assert_eq!(times.len(), 1, "{times:?}");
+        assert_eq!(times[0]["turnId"], "t1");
+        assert_eq!(times[0]["startedAtMs"], serde_json::json!(started_at));
+        let ended_at = times[0]["endedAtMs"].as_u64().unwrap();
+        assert!(
+            ended_at >= started_at + 25,
+            "the turn ran at least the sleep: {started_at} -> {ended_at}"
+        );
+        assert_eq!(set.get(tab).unwrap().turn_times_unsent, 0, "the events carried it");
+        let newest = {
+            let snapshot: serde_json::Value = serde_json::from_str(&the_snapshot(set.active_state_payloads())).unwrap();
+            let transcript = snapshot["state"]["transcript"].as_array().unwrap().clone();
+            transcript.last().expect("the reply is on the page")["seq"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(
+            times[0]["anchorSeq"],
+            serde_json::json!(newest),
+            "the duration line stands under the newest row"
+        );
+
+        // A tick with nothing new does not send it again.
+        assert!(set.pump(&dir, true).active_payload.is_none());
+
+        provider.queue(started("t2"));
+        pump_until_running(&mut set, &dir, tab, true);
+        provider.queue(completed("t2", agent::TurnOutcome::Completed));
+        let second = pump_until_turn_times(&mut set, &dir);
+        assert_eq!(
+            second
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["turnId"].clone())
+                .collect::<Vec<_>>(),
+            vec![serde_json::json!("t2")],
+            "only the turn that ended in this batch rides on the events envelope"
+        );
+
+        let all = snapshot_turn_times(&mut set);
+        assert_eq!(
+            all.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["turnId"].clone())
+                .collect::<Vec<_>>(),
+            vec![serde_json::json!("t1"), serde_json::json!("t2")],
+            "the snapshot carries every recorded turn, oldest first"
+        );
+        assert_eq!(all[0]["endedAtMs"].as_u64().unwrap(), ended_at);
+        shut_down_all(&mut set);
+    }
+
+    /// A turn that ends badly still ran for some time, and the turn-ending row says how long.
+    #[test]
+    fn an_interrupted_turn_records_its_duration_too() {
+        let dir = workspace("tabs-turn-times-interrupted");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        provider.queue(completed("t1", agent::TurnOutcome::Interrupted));
+        let times = pump_until_turn_times(&mut set, &dir);
+        assert_eq!(times[0]["turnId"], "t1");
+        shut_down_all(&mut set);
+    }
+
+    /// A turn no tick saw running (it began and ended between two ticks) has no stamped start, so it
+    /// has no duration: the panel shows nothing rather than a guess.
+    #[test]
+    fn a_turn_no_tick_saw_running_records_no_duration() {
+        let dir = workspace("tabs-turn-times-unstamped");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let base = set.get(tab).unwrap().live().unwrap().projection().last_revision;
+        provider.queue(started("t1"));
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        until("both events to fold, with no tick", || {
+            set.get(tab).unwrap().live().unwrap().projection().last_revision >= base + 2
+        });
+        let mut carried = false;
+        for _ in 0..5 {
+            if let Some(payload) = set.pump(&dir, true).active_payload {
+                carried |= payload.contains("turnTimes");
+            }
+        }
+        assert!(!carried, "no payload names a duration");
+        assert_eq!(snapshot_turn_times(&mut set), serde_json::json!([]));
+        shut_down_all(&mut set);
+    }
+
+    /// Each tab keeps its own durations; a background tab's finished turn waits for the snapshot a
+    /// switch sends instead of going out as an envelope for a tab nobody is looking at.
+    #[test]
+    fn a_background_tabs_turn_durations_wait_for_its_snapshot() {
+        let dir = workspace("tabs-turn-times-background");
+        let mut set = set();
+        let background = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(background).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, background, true);
+        let foreground = set.open(AgentId::Claude);
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        until("the background tab's turn to end", || {
+            set.pump(&dir, true);
+            !set.get(background).unwrap().was_running
+        });
+        assert_eq!(set.get(background).unwrap().turn_times_unsent, 1);
+        set.select(background);
+        let times = snapshot_turn_times(&mut set);
+        assert_eq!(times[0]["turnId"], "t1");
+        assert_eq!(set.get(background).unwrap().turn_times_unsent, 0);
+        set.remove(foreground).unwrap();
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn the_turn_log_drops_its_oldest_entries_past_the_cap() {
+        let mut clock = None;
+        let mut times = Vec::new();
+        let mut unsent = 0;
+        let mut projection = agent::AgentSessionProjection::default();
+        let mut observe = |active: Option<&str>, now: u64| {
+            projection.active_turn_id = active.map(str::to_string);
+            observe_turn_clock(&mut clock, &mut times, &mut unsent, &projection, now);
+        };
+        for n in 0..(MAX_TURN_TIMES + 5) {
+            observe(Some(&format!("t{n}")), 1_000 + n as u64);
+            observe(None, 1_500 + n as u64);
+        }
+        // The next turn id replacing a running one also ends it, but names no row to stand under.
+        observe(Some("a"), 9_000);
+        observe(Some("b"), 9_400);
+        assert_eq!(times.len(), MAX_TURN_TIMES);
+        assert_eq!(
+            times[0].turn_id, "t6",
+            "the oldest went, one per entry added past the cap"
+        );
+        assert_eq!(unsent, MAX_TURN_TIMES);
+        let last = times.last().unwrap();
+        assert_eq!(
+            (last.turn_id.as_str(), last.ended_at_ms, last.anchor_seq),
+            ("a", 9_400, None)
+        );
+    }
+
+    #[test]
+    fn a_turn_ends_on_the_agents_last_row_even_with_a_prompt_already_after_it() {
+        let mut clock = None;
+        let mut times = Vec::new();
+        let mut unsent = 0;
+        let mut projection = agent::AgentSessionProjection::default();
+        projection.active_turn_id = Some("t1".to_string());
+        observe_turn_clock(&mut clock, &mut times, &mut unsent, &projection, 1_000);
+        projection.transcript.push(agent::TranscriptMessage {
+            seq: 4,
+            text: "done".to_string(),
+        });
+        projection.user_prompts.push(agent::UserPromptRecord {
+            seq: 5,
+            text: "next".to_string(),
+            delivered: false,
+        });
+        projection.active_turn_id = None;
+        observe_turn_clock(&mut clock, &mut times, &mut unsent, &projection, 3_000);
+        assert_eq!(times[0].anchor_seq, Some(4));
+    }
+
     /// A flush the backend refuses stays in the queue with a line saying
     /// why, and is not retried on every tick.
     #[test]
@@ -6099,7 +6682,7 @@ mod tests {
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
         provider.queue(started("t1"));
         pump_until_running(&mut set, &dir, tab, true);
-        set.queue_message(tab, "later", "later".into(), 1).unwrap();
+        set.queue_message(tab, "later", "later".into(), 1, true).unwrap();
         provider.refuse_sends(true);
         provider.queue(completed("t1", agent::TurnOutcome::Completed));
         pump_until_running(&mut set, &dir, tab, false);
@@ -6132,7 +6715,7 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().attention.attention().pending == 1
         });
-        set.queue_message(tab, "after the card", "after the card".into(), 1)
+        set.queue_message(tab, "after the card", "after the card".into(), 1, true)
             .unwrap();
         assert!(set.flush_queue(tab).is_none());
         assert!(provider.turns().is_empty());
@@ -6149,7 +6732,7 @@ mod tests {
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
         provider.queue(started("t1"));
         pump_until_running(&mut set, &dir, tab, true);
-        set.queue_message(tab, "one", "one".into(), 1).unwrap();
+        set.queue_message(tab, "one", "one".into(), 1, true).unwrap();
         match set.send_now(tab, "two", "two".into(), 2).unwrap() {
             SendNow::Interrupting(outcome) => assert!(outcome.is_ok()),
             SendNow::Flushed(_) => panic!("a running turn is interrupted first"),
@@ -6188,8 +6771,8 @@ mod tests {
         let tab = set.active();
         let (_provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        set.queue_message(tab, "a", "a".into(), 1).unwrap();
-        set.queue_message(tab, "b", "b".into(), 2).unwrap();
+        set.queue_message(tab, "a", "a".into(), 1, true).unwrap();
+        set.queue_message(tab, "b", "b".into(), 2, true).unwrap();
         assert_eq!(set.take_back_queue(tab), vec!["a".to_string(), "b".to_string()]);
         assert!(set.get(tab).unwrap().queue.is_empty());
         assert!(set.take_back_queue(tab).is_empty());
@@ -6202,7 +6785,7 @@ mod tests {
         let mut set = set();
         let tab = set.active();
         assert!(
-            set.queue_message(tab, "x", "x".into(), 1).is_err(),
+            set.queue_message(tab, "x", "x".into(), 1, true).is_err(),
             "an empty tab sends, it does not queue"
         );
         let (_tx, result_rx) = mpsc::channel();
@@ -6215,12 +6798,12 @@ mod tests {
             resumed_name: None,
         });
         assert_eq!(
-            set.queue_message(tab, "x", "x".into(), 1),
+            set.queue_message(tab, "x", "x".into(), 1, true),
             Ok(1),
             "the box is live while it starts"
         );
         set.get_mut(tab).unwrap().backend = TabBackend::Failed { reason: "no".into() };
-        assert!(set.queue_message(tab, "y", "y".into(), 2).is_err());
+        assert!(set.queue_message(tab, "y", "y".into(), 2, true).is_err());
     }
 
     /// `r` on an ended tab puts its queue back into the draft.
@@ -6230,16 +6813,8 @@ mod tests {
         let tab = set.active();
         {
             let t = set.get_mut(tab).unwrap();
-            t.queue.push(Queued {
-                text: "q1".into(),
-                wire: "q1".into(),
-                queued_at_ms: 1,
-            });
-            t.queue.push(Queued {
-                text: "q2".into(),
-                wire: "q2".into(),
-                queued_at_ms: 2,
-            });
+            t.queue.push(Queued::held("q1", "q1".into(), 1));
+            t.queue.push(Queued::held("q2", "q2".into(), 2));
             t.draft = "half".into();
             t.backend = TabBackend::Failed { reason: "gone".into() };
         }
@@ -6256,11 +6831,7 @@ mod tests {
         let one = set.active();
         let two = set.open(AgentId::Claude);
         for (tab, text) in [(one, "a"), (two, "b"), (two, "c")] {
-            set.get_mut(tab).unwrap().queue.push(Queued {
-                text: text.into(),
-                wire: text.into(),
-                queued_at_ms: 0,
-            });
+            set.get_mut(tab).unwrap().queue.push(Queued::held(text, text.into(), 0));
         }
         assert_eq!(set.close_facts(two).unwrap().queued, 2);
         assert_eq!(set.queued_count(), 3);
@@ -7771,7 +8342,7 @@ mod tests {
         let first = set.active();
         let (_provider, backend) = live(&dir);
         set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
-        set.queue_message(first, "queued", "queued".into(), 5).unwrap();
+        set.queue_message(first, "queued", "queued".into(), 5, true).unwrap();
         set.set_draft(first, "typing");
         let second = set.open(AgentId::Claude);
         let kinds = |payloads: Vec<String>| -> Vec<(String, serde_json::Value)> {
@@ -11512,5 +12083,716 @@ mod external_tab_tests {
         // A second report for the same tab changes nothing.
         set.retire_done(tab);
         assert_eq!(guard.check(), Ok(()));
+    }
+}
+
+/// Enter while a turn runs: a message goes into the running turn when the tab's agent can take it, and
+/// is held for the turn's end otherwise.
+#[cfg(test)]
+mod steer_tests {
+    use super::*;
+    use crate::test_providers::{empty_trust_plan, ExternalRecordingProvider, RecordingProvider};
+    use agent::{AgentConversation, ProviderErrorCode};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    fn workspace(label: &str) -> PathBuf {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        dir
+    }
+
+    fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn pump_until_running(set: &mut TabSet, dir: &Path, tab: TabId, running: bool) -> PumpOutput {
+        let mut all = None::<PumpOutput>;
+        until("the turn state", || {
+            let out = set.pump(dir, true);
+            match all.as_mut() {
+                None => all = Some(out),
+                Some(all) => {
+                    all.turn_ended.extend(out.turn_ended);
+                    all.queue_changed.extend(out.queue_changed);
+                }
+            }
+            set.get(tab).unwrap().was_running == running
+        });
+        all.unwrap()
+    }
+
+    fn turn_completed(turn: &str, outcome: agent::TurnOutcome) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        }
+    }
+
+    /// A Codex tab on a scripted provider, with `turn-1` running and delivered.
+    fn running_codex(label: &str, steering: bool) -> (PathBuf, TabSet, TabId, Arc<ExternalRecordingProvider>) {
+        let dir = workspace(label);
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.open(AgentId::Codex);
+        let provider = Arc::new(if steering {
+            ExternalRecordingProvider::steering_codex()
+        } else {
+            ExternalRecordingProvider::codex()
+        });
+        let backend = AgentBackend::start_external_with(
+            AgentId::Codex,
+            provider.clone(),
+            &dir,
+            empty_trust_plan(),
+            SessionModeChoice::Auto,
+            None,
+        )
+        .unwrap();
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.inner.queue(AgentDomainEvent::TurnStarted {
+            turn_id: "turn-1".into(),
+        });
+        pump_until_running(&mut set, &dir, tab, true);
+        (dir, set, tab, provider)
+    }
+
+    /// Enter on `text` while the turn runs, with the editor context of the moment in front of it.
+    fn enter(set: &mut TabSet, tab: TabId, text: &str) {
+        set.queue_message(tab, text, format!("ctx\n\n{text}"), 1, true).unwrap();
+        set.steer_held(tab, 2, Some("turn-1"));
+    }
+
+    /// The queue as `(typed text, sent into the turn)`.
+    fn queue(set: &TabSet, tab: TabId) -> Vec<(String, bool)> {
+        set.get(tab)
+            .unwrap()
+            .queue
+            .iter()
+            .map(|q| (q.text.clone(), !q.is_held()))
+            .collect()
+    }
+
+    fn note(set: &TabSet, tab: TabId) -> Option<String> {
+        set.get(tab).unwrap().queue_note.clone()
+    }
+
+    fn prompts(set: &TabSet, tab: TabId) -> Vec<String> {
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .user_prompts
+            .iter()
+            .map(|p| p.text.clone())
+            .collect()
+    }
+
+    fn shut_down(set: &mut TabSet) {
+        for mut tab in set.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn enter_puts_the_message_into_the_turn_and_its_row_comes_when_the_agent_reads_it() {
+        let (dir, mut set, tab, provider) = running_codex("steer-delivered", true);
+        enter(&mut set, tab, "look at the parser too");
+        let sent = provider.steers();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].expected_turn_id, "turn-1", "the turn the user saw running");
+        assert_eq!(
+            sent[0].text, "ctx\n\nlook at the parser too",
+            "the wire text carries the context"
+        );
+        assert_eq!(sent[0].as_typed, "look at the parser too");
+        assert_eq!(sent[0].client_message_id, format!("eitri-{}-1", tab.0));
+        assert_eq!(queue(&set, tab), [("look at the parser too".to_string(), true)]);
+        assert_eq!(note(&set, tab), None);
+        assert!(prompts(&set, tab).is_empty(), "no row before the agent read it");
+
+        provider.inner.queue(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: sent[0].client_message_id.clone(),
+            turn_id: "turn-1".into(),
+            text: "look at the parser too".into(),
+        });
+        let mut changed = Vec::new();
+        until("the message leaves the queue", || {
+            changed.extend(set.pump(&dir, true).queue_changed);
+            set.get(tab).unwrap().queue.is_empty()
+        });
+        assert_eq!(changed, [tab], "the panel is sent the queue again");
+        assert_eq!(prompts(&set, tab), ["look at the parser too"]);
+        assert!(set.get(tab).unwrap().turn_running(), "the turn was never interrupted");
+        assert_eq!(provider.inner.interrupts(), 0);
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn a_message_the_agent_did_not_read_is_held_again_and_goes_out_after_the_turn() {
+        let (dir, mut set, tab, provider) = running_codex("steer-dropped", true);
+        enter(&mut set, tab, "and the tests");
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue_all(vec![
+            AgentDomainEvent::UserMessageDropped {
+                client_message_id: id,
+                reason: "the turn ended before Codex read it".into(),
+            },
+            turn_completed("turn-1", agent::TurnOutcome::Completed),
+        ]);
+        let out = pump_until_running(&mut set, &dir, tab, false);
+        assert_eq!(queue(&set, tab), [("and the tests".to_string(), false)]);
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("held until the turn ends: the turn ended before Codex read it")
+        );
+        assert!(prompts(&set, tab).is_empty(), "a dropped message has no row");
+        assert_eq!(out.turn_ended, [tab]);
+        let flush = set.flush_queue(tab).expect("it goes out now");
+        assert!(flush.outcome.is_ok());
+        assert_eq!(flush.typed, "and the tests");
+        assert_eq!(provider.inner.turns(), ["ctx\n\nand the tests"]);
+        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert_eq!(note(&set, tab), None);
+        shut_down(&mut set);
+    }
+
+    /// The agent runs a message it could not fold into the turn as a follow-up turn of its own (Claude after
+    /// a plain-text answer or an interrupt): the provider returns the turn's end and the follow-up's start
+    /// from one `pump()`, so the host never sees the turn over with the message unreported, sends nothing,
+    /// and the message leaves the queue when the follow-up reads it. Had the end been folded on its own,
+    /// the flush would have sent the message again while the agent ran it too.
+    #[test]
+    fn a_message_run_in_a_follow_up_turn_is_never_sent_again() {
+        let (dir, mut set, tab, provider) = running_codex("steer-follow-up", true);
+        enter(&mut set, tab, "and the tests");
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue_all(vec![
+            turn_completed("turn-1", agent::TurnOutcome::Completed),
+            AgentDomainEvent::TurnStarted {
+                turn_id: "turn-2".into(),
+            },
+        ]);
+        let mut ended = Vec::new();
+        until("the follow-up turn is folded", || {
+            ended.extend(set.pump(&dir, true).turn_ended);
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .active_turn_id
+                .as_deref()
+                == Some("turn-2")
+        });
+        assert!(ended.is_empty(), "a turn runs, so nothing is flushed: {ended:?}");
+        assert!(set.flush_queue(tab).is_none(), "the follow-up runs");
+        assert_eq!(
+            queue(&set, tab),
+            [("and the tests".to_string(), true)],
+            "still in the agent's hands"
+        );
+
+        provider.inner.queue_all(vec![
+            AgentDomainEvent::UserMessageDelivered {
+                client_message_id: id,
+                turn_id: "turn-2".into(),
+                text: "and the tests".into(),
+            },
+            turn_completed("turn-2", agent::TurnOutcome::Completed),
+        ]);
+        let out = pump_until_running(&mut set, &dir, tab, false);
+        assert_eq!(out.turn_ended, [tab]);
+        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(set.flush_queue(tab).is_none());
+        assert!(provider.inner.turns().is_empty(), "never sent as a turn of its own");
+        assert_eq!(
+            prompts(&set, tab),
+            ["and the tests"],
+            "one row, where the agent read it"
+        );
+        shut_down(&mut set);
+    }
+
+    /// The provider gave up waiting on a message (its follow-up turn came too late) and reported it
+    /// dropped, so the host held it again; the flush was refused while the late follow-up ran, and then
+    /// the delivery came after all under the old id. The message leaves the queue and is never sent a
+    /// second time.
+    #[test]
+    fn a_message_reported_dropped_and_then_read_late_is_not_sent_again() {
+        let (dir, mut set, tab, provider) = running_codex("steer-read-late", true);
+        enter(&mut set, tab, "and the tests");
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue_all(vec![
+            AgentDomainEvent::UserMessageDropped {
+                client_message_id: id.clone(),
+                reason: "Claude did not say whether it read it".into(),
+            },
+            turn_completed("turn-1", agent::TurnOutcome::Completed),
+        ]);
+        let out = pump_until_running(&mut set, &dir, tab, false);
+        assert_eq!(out.turn_ended, [tab]);
+        assert_eq!(queue(&set, tab), [("and the tests".to_string(), false)], "held again");
+        // The agent is already running the message as a turn of its own, so the send is refused.
+        provider.inner.refuse_sends(true);
+        let flush = set.flush_queue(tab).expect("a flush is tried");
+        assert!(flush.outcome.is_err());
+        provider.inner.refuse_sends(false);
+        assert_eq!(queue(&set, tab), [("and the tests".to_string(), false)]);
+
+        provider.inner.queue_all(vec![
+            AgentDomainEvent::TurnStarted {
+                turn_id: "turn-2".into(),
+            },
+            AgentDomainEvent::UserMessageDelivered {
+                client_message_id: id,
+                turn_id: "turn-2".into(),
+                text: "and the tests".into(),
+            },
+        ]);
+        until("the late delivery takes the message out of the queue", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().queue.is_empty()
+        });
+        assert_eq!(note(&set, tab), None);
+        provider
+            .inner
+            .queue(turn_completed("turn-2", agent::TurnOutcome::Completed));
+        let out = pump_until_running(&mut set, &dir, tab, false);
+        assert_eq!(out.turn_ended, [tab]);
+        assert!(set.flush_queue(tab).is_none(), "nothing left to send");
+        assert_eq!(
+            provider.inner.turns(),
+            ["ctx\n\nand the tests"],
+            "only the refused attempt; the agent ran it once"
+        );
+        // The refused send still shows its prompt (a rejected turn does, by design, with its error), and
+        // the delivery is the row where the agent read it.
+        assert_eq!(prompts(&set, tab), ["and the tests", "and the tests"]);
+        shut_down(&mut set);
+    }
+
+    /// A slash command typed while the turn runs waits for the turn's end on an agent that reads commands
+    /// (Claude, or one that listed its commands), and so does what follows it; on Codex, which lists none,
+    /// it goes into the turn as typed.
+    #[test]
+    fn a_slash_command_waits_for_the_turns_end_where_the_agent_reads_commands() {
+        const WAITS: &str =
+            "held until the turn ends: a command waits for the turn's end, and what follows it waits too";
+
+        // An agent that listed its commands.
+        let (dir, mut set, tab, provider) = running_codex("steer-command-listed", true);
+        provider.inner.queue(AgentDomainEvent::CommandsAvailable {
+            commands: vec![agent::SlashCommand {
+                name: "compact".into(),
+                description: String::new(),
+                hint: None,
+            }],
+        });
+        until("the list of commands is folded", || {
+            set.pump(&dir, true);
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .available_commands
+                .is_some()
+        });
+        set.queue_message(tab, "/compact", "/compact".into(), 1, true).unwrap();
+        set.queue_message(tab, "then this", "then this".into(), 1, true)
+            .unwrap();
+        assert!(set.steer_held(tab, 2, Some("turn-1")), "the note changed");
+        assert!(provider.steers().is_empty(), "nothing went into the turn");
+        assert_eq!(
+            queue(&set, tab),
+            [("/compact".to_string(), false), ("then this".to_string(), false)]
+        );
+        assert_eq!(note(&set, tab).as_deref(), Some(WAITS));
+        shut_down(&mut set);
+
+        // Claude reads commands whatever it listed (its tabs cannot steer yet, so this is the rule alone);
+        // an ACP agent that withdrew its list (an empty one) reads none.
+        let mut none_listed = agent::AgentSessionProjection::default();
+        assert!(reads_slash_commands(&AgentId::Claude, &none_listed));
+        assert!(!reads_slash_commands(&AgentId::Codex, &none_listed));
+        none_listed.available_commands = Some(Vec::new());
+        assert!(!reads_slash_commands(&AgentId::Acp("x".into()), &none_listed));
+
+        // Codex lists none: the text goes in as typed, and a slash later in a message is no command.
+        let (_dir, mut set, tab, provider) = running_codex("steer-command-codex", true);
+        enter(&mut set, tab, "/status");
+        let texts: Vec<String> = provider.steers().into_iter().map(|s| s.as_typed).collect();
+        assert_eq!(texts, ["/status"]);
+        assert_eq!(note(&set, tab), None);
+        shut_down(&mut set);
+        assert!(is_slash_command("/x") && is_slash_command("  /x") && !is_slash_command("a/b"));
+    }
+
+    #[test]
+    fn a_refusal_holds_the_message_and_every_one_after_it_keeping_their_order() {
+        let (dir, mut set, tab, provider) = running_codex("steer-refused", true);
+        provider.refuse_steers(Some(ProviderErrorCode::NoActiveTurn));
+        set.queue_message(tab, "first", "first".into(), 1, true).unwrap();
+        set.queue_message(tab, "second", "second".into(), 1, true).unwrap();
+        assert!(set.steer_held(tab, 2, Some("turn-1")), "the note changed");
+        assert_eq!(
+            queue(&set, tab),
+            [("first".to_string(), false), ("second".to_string(), false)]
+        );
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("held until the turn ends: the scripted agent took no message")
+        );
+        assert!(provider.steers().is_empty(), "nothing was sent");
+
+        // The next Enter tries again, oldest first, and the note goes once nothing is held.
+        provider.refuse_steers(None);
+        enter(&mut set, tab, "third");
+        let texts: Vec<String> = provider.steers().into_iter().map(|s| s.as_typed).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
+        assert!(queue(&set, tab).iter().all(|(_, steered)| *steered));
+        assert_eq!(note(&set, tab), None);
+        let ids: std::collections::BTreeSet<String> =
+            provider.steers().into_iter().map(|s| s.client_message_id).collect();
+        assert_eq!(ids.len(), 3, "every message has its own id");
+        let _ = dir;
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn an_agent_that_cannot_take_messages_mid_turn_holds_them_and_says_so() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-unsupported-codex", false);
+        enter(&mut set, tab, "later");
+        assert_eq!(queue(&set, tab), [("later".to_string(), false)]);
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("held until the turn ends: Codex cannot take messages mid-turn")
+        );
+        assert!(provider.steers().is_empty());
+        shut_down(&mut set);
+
+        // A Claude tab: the sidecar does not take them yet either.
+        let dir = workspace("steer-unsupported-claude");
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.active();
+        let provider = Arc::new(RecordingProvider::default());
+        let conversation =
+            AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Sidecar(Box::new(conversation)));
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        pump_until_running(&mut set, &dir, tab, true);
+        enter(&mut set, tab, "later");
+        assert_eq!(queue(&set, tab), [("later".to_string(), false)]);
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("held until the turn ends: Claude cannot take messages mid-turn")
+        );
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn nothing_is_put_into_a_turn_when_none_runs() {
+        let dir = workspace("steer-idle");
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.open(AgentId::Codex);
+        let provider = Arc::new(ExternalRecordingProvider::steering_codex());
+        let backend = AgentBackend::start_external_with(
+            AgentId::Codex,
+            provider.clone(),
+            &dir,
+            empty_trust_plan(),
+            SessionModeChoice::Auto,
+            None,
+        )
+        .unwrap();
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        set.queue_message(tab, "x", "x".into(), 1, true).unwrap();
+        assert!(!set.steer_held(tab, 2, Some("turn-1")));
+        assert!(provider.steers().is_empty());
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn taking_the_queue_back_leaves_what_was_sent_into_the_turn() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-take-back", true);
+        enter(&mut set, tab, "sent");
+        provider.refuse_steers(Some(ProviderErrorCode::NoActiveTurn));
+        enter(&mut set, tab, "held");
+        assert_eq!(
+            queue(&set, tab),
+            [("sent".to_string(), true), ("held".to_string(), false)]
+        );
+        assert_eq!(set.take_back_queue(tab), ["held"]);
+        assert_eq!(queue(&set, tab), [("sent".to_string(), true)]);
+        assert_eq!(note(&set, tab), None, "nothing is held any more");
+        assert!(set.take_back_queue(tab).is_empty());
+        shut_down(&mut set);
+    }
+
+    /// Codex forgets a message it had not read when the turn is interrupted (measured on 0.162.1), and says
+    /// so as a drop before the turn's end: `Ctrl+Enter` then sends it ahead of what was typed with the key.
+    #[test]
+    fn send_now_with_a_message_in_the_turn_sends_it_again_once_the_agent_drops_it() {
+        let (dir, mut set, tab, provider) = running_codex("steer-send-now", true);
+        enter(&mut set, tab, "first");
+        let id = provider.steers()[0].client_message_id.clone();
+        match set.send_now(tab, "now", "now".into(), 3).unwrap() {
+            SendNow::Interrupting(Ok(_)) => {}
+            _ => panic!("a running turn is interrupted"),
+        }
+        assert_eq!(provider.inner.interrupts(), 1);
+        assert_eq!(
+            queue(&set, tab),
+            [("first".to_string(), true), ("now".to_string(), false)]
+        );
+        provider.inner.queue_all(vec![
+            AgentDomainEvent::UserMessageDropped {
+                client_message_id: id,
+                reason: "the turn ended before Codex read it".into(),
+            },
+            turn_completed("turn-1", agent::TurnOutcome::Interrupted),
+        ]);
+        let out = pump_until_running(&mut set, &dir, tab, false);
+        assert_eq!(out.turn_ended, [tab]);
+        let flush = set.flush_queue(tab).expect("the queue goes out after the interrupt");
+        assert_eq!(flush.typed, "first\n\nnow");
+        assert_eq!(provider.inner.turns(), ["ctx\n\nfirst\n\nnow"]);
+        shut_down(&mut set);
+    }
+
+    /// A provider that never said what became of a message: it goes out with the next turn rather than
+    /// staying in the queue for good.
+    #[test]
+    fn a_message_no_outcome_was_reported_for_goes_out_with_the_next_turn() {
+        let (dir, mut set, tab, provider) = running_codex("steer-no-outcome", true);
+        enter(&mut set, tab, "unanswered");
+        provider
+            .inner
+            .queue(turn_completed("turn-1", agent::TurnOutcome::Completed));
+        pump_until_running(&mut set, &dir, tab, false);
+        let flush = set.flush_queue(tab).expect("sent");
+        assert_eq!(flush.typed, "unanswered");
+        shut_down(&mut set);
+    }
+
+    /// What the agent did with a message is read off the projection, so a path that never sees the events
+    /// (a resync, or a take-back before the next pump) still finds it.
+    #[test]
+    fn the_outcome_is_read_from_the_projection_not_only_from_a_delivered_batch() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-from-projection", true);
+        enter(&mut set, tab, "read");
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: id.clone(),
+            turn_id: "turn-1".into(),
+            text: "read".into(),
+        });
+        until("the projection folds it", || {
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .steer_outcome(&id)
+                .is_some()
+        });
+        assert!(set.take_back_queue(tab).is_empty());
+        assert!(set.get(tab).unwrap().queue.is_empty(), "settled without a pump");
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn closing_says_a_message_in_the_turn_may_not_have_reached_the_agent() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-close", true);
+        enter(&mut set, tab, "sent");
+        provider.refuse_steers(Some(ProviderErrorCode::NoActiveTurn));
+        enter(&mut set, tab, "held");
+        let facts = set.close_facts(tab).unwrap();
+        assert_eq!((facts.queued, facts.steered), (1, 1));
+        let lines = tabs::close_prompt(&facts);
+        assert!(
+            lines.contains(&"1 queued message goes to history".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"1 message sent into the turn may not have reached the agent; it goes to history".to_string()
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(set.queue_texts(tab), ["sent", "held"], "both go to history");
+        assert_eq!(set.queued_count(), 2, "the window counts both");
+        assert!(tabs::close_steps(&facts).contains(&tabs::CloseStep::QueueToHistory));
+        shut_down(&mut set);
+    }
+
+    /// The flush reads what the agent reported and whether a turn runs in one read: a delivery and the turn's
+    /// end folded after the last pump and before the flush are seen together, and the message the agent read
+    /// is not sent again.
+    #[test]
+    fn a_delivery_folded_just_before_the_flush_is_not_sent_again() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-fold-before-flush", true);
+        enter(&mut set, tab, "read just now");
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue_all(vec![
+            AgentDomainEvent::UserMessageDelivered {
+                client_message_id: id,
+                turn_id: "turn-1".into(),
+                text: "read just now".into(),
+            },
+            turn_completed("turn-1", agent::TurnOutcome::Completed),
+        ]);
+        until("the projection folds both, with no pump", || {
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .active_turn_id
+                .is_none()
+        });
+        assert_eq!(
+            queue(&set, tab),
+            [("read just now".to_string(), true)],
+            "not settled yet"
+        );
+        assert!(set.flush_queue(tab).is_none(), "nothing left to send");
+        assert!(
+            provider.inner.turns().is_empty(),
+            "the message the agent read was not sent again"
+        );
+        assert!(set.get(tab).unwrap().queue.is_empty());
+        shut_down(&mut set);
+    }
+
+    /// A delivery folded with the turn still running: the flush sends nothing, and the message leaves the
+    /// queue as read.
+    #[test]
+    fn a_flush_during_the_turn_settles_and_sends_nothing() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-flush-running", true);
+        enter(&mut set, tab, "mid-turn");
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: id.clone(),
+            turn_id: "turn-1".into(),
+            text: "mid-turn".into(),
+        });
+        until("the delivery is folded", || {
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .steer_outcome(&id)
+                .is_some()
+        });
+        assert!(set.flush_queue(tab).is_none());
+        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(provider.inner.turns().is_empty());
+        shut_down(&mut set);
+    }
+
+    /// Only into the turn the page showed: one typed in a turn that has ended since, or with none showing,
+    /// is held.
+    #[test]
+    fn a_message_goes_only_into_the_turn_the_page_showed() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-shown-turn", true);
+        set.queue_message(tab, "for the old turn", "for the old turn".into(), 1, true)
+            .unwrap();
+        set.steer_held(tab, 2, Some("turn-0"));
+        assert!(provider.steers().is_empty());
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("held until the turn ends: the turn it was typed in has ended")
+        );
+        set.steer_held(tab, 3, None);
+        assert!(provider.steers().is_empty());
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("held until the turn ends: no turn was running when it was typed")
+        );
+        set.steer_held(tab, 4, Some("turn-1"));
+        assert_eq!(provider.steers().len(), 1);
+        assert_eq!(note(&set, tab), None);
+        shut_down(&mut set);
+    }
+
+    /// A confirmed review held behind the turn waits for its end, and so does what is typed after it.
+    #[test]
+    fn a_review_waits_for_the_turns_end_and_keeps_what_follows_behind_it() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-review", true);
+        assert!(set.send_review(tab, "the review", 1).unwrap().is_none(), "it waits");
+        enter(&mut set, tab, "typed after it");
+        assert!(
+            provider.steers().is_empty(),
+            "nothing goes into the turn ahead of the review"
+        );
+        assert_eq!(
+            queue(&set, tab),
+            [("the review".to_string(), false), ("typed after it".to_string(), false)]
+        );
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("held until the turn ends: a review waits for the turn's end, and what follows it waits too")
+        );
+        shut_down(&mut set);
+    }
+
+    /// A tripwire takes the session away: a message still in the turn is held again with the reason, not
+    /// left as `↪` for good.
+    #[test]
+    fn a_tab_failed_by_a_tripwire_holds_what_was_in_the_turn() {
+        let (dir, mut set, tab, provider) = running_codex("steer-tripwire", true);
+        enter(&mut set, tab, "in the turn");
+        provider.inner.queue(AgentDomainEvent::PolicyMismatch {
+            requested: "on-request".into(),
+            reported: "never".into(),
+        });
+        let mut changed = Vec::new();
+        until("the tab fails", || {
+            let mut out = set.pump(&dir, true);
+            changed.append(&mut out.queue_changed);
+            for tripped in out.tripped {
+                let mut backend = tripped.backend;
+                backend.shutdown();
+            }
+            matches!(set.get(tab).unwrap().backend, TabBackend::Failed { .. })
+        });
+        assert_eq!(queue(&set, tab), [("in the turn".to_string(), false)]);
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("held until the turn ends: the session was closed before the agent read it")
+        );
+        assert_eq!(changed, [tab], "the panel is sent the queue again");
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn the_queue_envelope_says_whether_enter_steers_now() {
+        let (_dir, mut set, tab, _provider) = running_codex("steer-envelope", true);
+        let payloads = set.active_state_payloads();
+        let queue: serde_json::Value = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .find(|v| v["kind"] == "queue")
+            .unwrap();
+        assert_eq!(queue["enterSteers"], true);
+        assert_eq!(set.get(tab).unwrap().steers(), Some(true));
+        shut_down(&mut set);
+        let (_dir, mut set, tab, _provider) = running_codex("steer-envelope-no", false);
+        assert_eq!(set.get(tab).unwrap().steers(), Some(false));
+        shut_down(&mut set);
     }
 }

@@ -454,3 +454,12 @@ describe("PermissionCard shows everything it asks to approve", () => {
     expect(css).toMatch(/\.permission-card \.diff-text\s*\{[^}]*min-width:\s*0/);
   });
 });
+
+it("names the key that answers it on Approve and Deny, as data the stylesheet draws", () => {
+  const { container } = render(
+    <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={() => {}} />,
+  );
+  expect(container.querySelector('[data-nav-action="allow"]')!.getAttribute("data-key")).toBe("a");
+  expect(container.querySelector('[data-nav-action="deny"]')!.getAttribute("data-key")).toBe("d");
+  expect(container.querySelector('[data-nav-action="allow"]')!.textContent).toBe("Approve");
+});

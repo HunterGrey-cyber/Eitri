@@ -29,15 +29,17 @@ use super::wire::{
     self, method, AccountReadParams, AccountReadResponse, InitializeParams, InitializeResponse, ItemDelta,
     ItemNotification, ServerNotification, SubAgentKind, ThreadItem, ThreadResumeParams, ThreadStartParams,
     ThreadStartResponse, ThreadUnsubscribeParams, TurnInterruptParams, TurnNotification, TurnStartParams,
-    TurnStartResponse, TurnStatus,
+    TurnStartResponse, TurnStatus, TurnSteerParams,
 };
 use crate::external::{ExternalProvider, ExternalStart, Reviewer, TurnPolicy, ANSWERED_BY_EITRI};
 use crate::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, Pending, Skipped};
-use crate::projection::{ContentKind, PermissionOutcome, ResumeStatus, TurnEndDetail, TurnOutcome};
+use crate::projection::{
+    thinking_open_after, ContentKind, PermissionOutcome, ResumeStatus, TurnEndDetail, TurnOutcome,
+};
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
-    ResumeSessionRequest, SendTurnRequest,
+    ResumeSessionRequest, SendTurnRequest, SteerTurnRequest,
 };
 use crate::{AgentDomainEvent, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT};
 use serde::Serialize;
@@ -374,10 +376,87 @@ struct State {
     /// a turn that started before (an Auto turn, or one Codex keeps running after an interrupt) is never
     /// in here, so what its reviewer does later is not mistaken for this.
     user_reviewed: HashSet<(String, String)>,
+    /// Messages sent into the running turn with `turn/steer` whose fate Codex has not told yet, oldest
+    /// first. Each ends as `UserMessageDelivered` (its `userMessage` item came) or `UserMessageDropped`
+    /// (refused, or the turn or session ended first: Codex forgets a message it had not read when the turn
+    /// is interrupted, measured on 0.162.1).
+    steers: Vec<SentSteer>,
+    /// The child ended on its own and its notice waits for the last of its stderr: the reason the link
+    /// gave, and when to give up waiting. Finished by `pump`, so nothing sleeps while holding this state.
+    closing_notice: Option<(String, Instant)>,
     /// Closed by the host.
     closed: bool,
     /// The child ended on its own, or was stopped.
     dead: bool,
+    /// Whether the projection's thinking block is open after the events queued so far
+    /// (`thinking_open_after`), followed through `events` up to `thought_scanned`.
+    thought_open: bool,
+    thought_scanned: usize,
+    /// The reasoning item and part the last thought sent came from.
+    thought_part: Option<(String, ThoughtPart)>,
+}
+
+/// Which part of a reasoning item a thought came from. Codex writes a reasoning item as summary parts
+/// (or raw content parts) and a past turn's item joins them with a blank line; a thought from another
+/// part, or from another item, is given the same blank line live, so the text reads the same live and
+/// resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThoughtPart {
+    Summary(Option<i64>),
+    Content(Option<i64>),
+    /// An item that streamed nothing and arrived whole.
+    Whole,
+}
+
+/// A message sent into the running turn.
+struct SentSteer {
+    client_id: String,
+    /// What the user typed, for the transcript row once Codex has read it.
+    as_typed: String,
+    /// The answer to `turn/steer`, until it is read.
+    answer: Option<Pending>,
+    /// The request, not sent yet because an earlier message's answer has not come: Codex may still refuse
+    /// that one, and a later message must never reach the model before an earlier one.
+    waiting: Option<Value>,
+}
+
+/// The start of the id Eitri gives a turn whose start it could not read.
+const UNREAD_TURN_PREFIX: &str = "eitri-unread-turn-";
+
+/// How long a child's end waits for its stderr before the notice goes without it.
+const CLOSING_NOTICE_WAIT: Duration = Duration::from_millis(100);
+
+/// Why a message waiting behind a refused one was not sent either.
+const BEHIND_A_REFUSAL: &str = "an earlier message was not taken, and this one waits behind it";
+
+/// The most messages sent into one turn and not yet read; a further one waits for the turn's end.
+const MAX_STEERS: usize = 64;
+
+/// The longest reason a dropped message carries of Codex's own words, in characters.
+const MAX_STEER_REASON_CHARS: usize = 200;
+
+/// Why Codex did not take a message into the running turn, from its answer to `turn/steer`.
+fn steer_refusal(e: &LinkError) -> String {
+    match e {
+        LinkError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => {
+            "this Codex cannot take messages while a turn runs".to_string()
+        }
+        LinkError::Rpc { message, .. }
+            if message.contains("no active turn") || message.contains("expected active turn id") =>
+        {
+            "the turn had ended when it reached Codex".to_string()
+        }
+        LinkError::Rpc { message, .. } => {
+            let words: String = message.chars().take(MAX_STEER_REASON_CHARS).collect();
+            let cut = if message.chars().count() > MAX_STEER_REASON_CHARS {
+                "…"
+            } else {
+                ""
+            };
+            format!("Codex did not take it: {words}{cut}")
+        }
+        other => format!("Codex did not take it: {other}"),
+    }
 }
 
 pub struct CodexProvider {
@@ -388,6 +467,9 @@ pub struct CodexProvider {
     state_home: PathBuf,
     /// Where Codex keeps the user's own configuration, as it reported.
     codex_home: PathBuf,
+    /// Codex does not know `turn/steer`: every later message waits for the turn's end. Outside `state` so
+    /// `capabilities` never waits for a pump.
+    steer_unsupported: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -711,6 +793,7 @@ impl CodexProvider {
             version,
             state_home: launch.state_home,
             codex_home,
+            steer_unsupported: AtomicBool::new(false),
         })
     }
 
@@ -994,6 +1077,101 @@ impl CodexProvider {
         self.send_interrupts(st);
         if forget_unnamed_turns(st) {
             self.close_family_turn(st);
+        }
+    }
+
+    // ------------------------------------------------------------ messages into the running turn
+
+    /// Reads the answers to `turn/steer`. An accepted message waits for its `userMessage` item; a refused
+    /// one is dropped with Codex's reason.
+    ///
+    /// In order: a message waits unsent until every earlier one's answer has come, and a refusal drops the
+    /// messages waiting behind it too, so they reach the model in the order they were typed or not at all.
+    /// `send_waiting` false (a turn ending) reads answers and sends nothing.
+    fn follow_steers(&self, st: &mut State, send_waiting: bool) {
+        let mut at = 0;
+        while at < st.steers.len() {
+            if let Some(answer) = st.steers[at].answer.as_mut() {
+                match answer.try_take() {
+                    None => return,
+                    Some(Ok(_)) => {
+                        st.steers[at].answer = None;
+                        at += 1;
+                    }
+                    Some(Err(e)) => {
+                        if matches!(&e, LinkError::Rpc { code, .. } if *code == METHOD_NOT_FOUND) {
+                            self.steer_unsupported.store(true, Ordering::Release);
+                        }
+                        eprintln!("agent: Codex did not take a message into the running turn ({e})");
+                        let refused = st.steers.remove(at);
+                        st.events.push_back(AgentDomainEvent::UserMessageDropped {
+                            client_message_id: refused.client_id,
+                            reason: steer_refusal(&e),
+                        });
+                        let behind: Vec<SentSteer> = st.steers.drain(at..).collect();
+                        for later in behind {
+                            st.events.push_back(AgentDomainEvent::UserMessageDropped {
+                                client_message_id: later.client_id,
+                                reason: BEHIND_A_REFUSAL.to_string(),
+                            });
+                        }
+                        return;
+                    }
+                }
+            } else if st.steers[at].waiting.is_some() {
+                if !send_waiting {
+                    return;
+                }
+                let params = st.steers[at].waiting.take().expect("checked above");
+                match self.request(method::TURN_STEER, params) {
+                    Ok(answer) => st.steers[at].answer = Some(answer),
+                    Err(_) => {
+                        let lost: Vec<SentSteer> = st.steers.drain(at..).collect();
+                        for later in lost {
+                            st.events.push_back(AgentDomainEvent::UserMessageDropped {
+                                client_message_id: later.client_id,
+                                reason: "Codex ended before it read it".to_string(),
+                            });
+                        }
+                    }
+                }
+                return;
+            } else {
+                at += 1;
+            }
+        }
+    }
+
+    /// A `userMessage` item on the tab's thread carrying the id of a message sent into the turn: Codex
+    /// has read it into the turn.
+    fn note_delivered(&self, st: &mut State, thread_id: &str, turn_id: &str, item: &ThreadItem) {
+        let ThreadItem::UserMessage(message) = item else { return };
+        let Some(client_id) = message.client_id.as_deref() else {
+            return;
+        };
+        if !is_tab(st, thread_id) {
+            return;
+        }
+        let Some(at) = st.steers.iter().position(|s| s.client_id == client_id) else {
+            return;
+        };
+        let sent = st.steers.remove(at);
+        st.events.push_back(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: sent.client_id,
+            turn_id: turn_id.to_string(),
+            text: sent.as_typed,
+        });
+    }
+
+    /// Every message sent into the turn that Codex has not read is dropped with `reason`. An answer already
+    /// read off the pipe goes first: a refusal names its own reason, and an unknown method is remembered.
+    fn drop_steers(&self, st: &mut State, reason: &str) {
+        self.follow_steers(st, false);
+        for sent in std::mem::take(&mut st.steers) {
+            st.events.push_back(AgentDomainEvent::UserMessageDropped {
+                client_message_id: sent.client_id,
+                reason: reason.to_string(),
+            });
         }
     }
 
@@ -1329,27 +1507,34 @@ impl CodexProvider {
         st.dead = true;
         // Nothing can answer what waited any more.
         self.drop_cards(st, PermissionOutcome::ProviderFailed);
-        // The end of the output stream can be read a moment before the last of stderr; give it a short
-        // chance so the notice says why the child went.
-        let mut tail = String::new();
-        for _ in 0..5 {
-            tail = lock(&self.link)
-                .as_ref()
-                .map(|l| notice_tail(&l.stderr_tail()))
-                .unwrap_or_default();
-            if !tail.is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        self.drop_steers(st, "Codex ended before it read it");
+        // The end of the output stream can be read a moment before the last of stderr; the notice waits a
+        // short while for it so it says why the child went. `pump` finishes it: waiting here would hold this
+        // state, which the UI thread's calls take.
+        st.closing_notice = Some((reason.to_string(), Instant::now() + CLOSING_NOTICE_WAIT));
+        self.finish_closing_notice(st);
+    }
+
+    /// Sends the child's end once its stderr says why, or once the wait is over without it.
+    fn finish_closing_notice(&self, st: &mut State) {
+        let Some((reason, until)) = st.closing_notice.as_ref() else {
+            return;
+        };
+        let tail = lock(&self.link)
+            .as_ref()
+            .map(|l| notice_tail(&l.stderr_tail()))
+            .unwrap_or_default();
+        if tail.is_empty() && Instant::now() < *until {
+            return;
         }
         let suffix = if tail.is_empty() {
             String::new()
         } else {
             format!(": {tail}")
         };
-        st.events.push_back(AgentDomainEvent::SessionUnavailable {
-            reason: format!("Codex ended unexpectedly ({reason}){suffix}"),
-        });
+        let reason = format!("Codex ended unexpectedly ({reason}){suffix}");
+        st.closing_notice = None;
+        st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
     }
 
     fn on_skipped(&self, st: &mut State, skipped: Skipped) {
@@ -1437,8 +1622,15 @@ impl CodexProvider {
         match notification {
             N::ItemStarted(n) => self.on_item_started(st, n),
             N::ItemCompleted(n) => self.on_item_completed(st, n),
-            N::AgentMessageDelta(d) => self.on_delta(st, d, ContentKind::Text),
-            N::ReasoningSummaryDelta(d) | N::ReasoningTextDelta(d) => self.on_delta(st, d, ContentKind::Thinking),
+            N::AgentMessageDelta(d) => self.on_delta(st, d, ContentKind::Text, None),
+            N::ReasoningSummaryDelta(d) => {
+                let part = ThoughtPart::Summary(d.summary_index);
+                self.on_delta(st, d, ContentKind::Thinking, Some(part))
+            }
+            N::ReasoningTextDelta(d) => {
+                let part = ThoughtPart::Content(d.content_index);
+                self.on_delta(st, d, ContentKind::Thinking, Some(part))
+            }
             N::TurnCompleted(n) => self.on_turn_completed(st, n),
             N::TokenUsageUpdated(u) => {
                 // The tab's own figure; a subagent's tokens are its own thread's.
@@ -1581,7 +1773,7 @@ impl CodexProvider {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or_default();
-            let turn_id = format!("eitri-unread-turn-{thread_id}-{stamp}");
+            let turn_id = format!("{UNREAD_TURN_PREFIX}{thread_id}-{stamp}");
             st.turn = Some(ActiveTurn::new(Some(turn_id.clone())));
             st.events.push_back(AgentDomainEvent::TurnStarted { turn_id });
         }
@@ -1777,6 +1969,7 @@ impl CodexProvider {
     }
 
     fn on_item_started(&self, st: &mut State, n: ItemNotification) {
+        self.note_delivered(st, &n.thread_id, &n.turn_id, &n.item);
         // Before anything decides whether the item is shown: what runs is counted whoever runs it.
         if let Some(kind) = Running::of(&n.item) {
             match n.item.id() {
@@ -1834,6 +2027,7 @@ impl CodexProvider {
     }
 
     fn on_item_completed(&self, st: &mut State, n: ItemNotification) {
+        self.note_delivered(st, &n.thread_id, &n.turn_id, &n.item);
         if let Some(id) = n.item.id() {
             st.running.remove(&(n.thread_id.clone(), id.to_string()));
         }
@@ -1897,6 +2091,7 @@ impl CodexProvider {
                     let parts = if r.summary.is_empty() { &r.content } else { &r.summary };
                     let text = parts.join("\n\n");
                     if !text.is_empty() {
+                        let text = thought_text(st, r.id.clone(), ThoughtPart::Whole, text);
                         st.events.push_back(AgentDomainEvent::ContentDelta {
                             turn_id,
                             kind: ContentKind::Thinking,
@@ -1933,7 +2128,8 @@ impl CodexProvider {
         }
     }
 
-    fn on_delta(&self, st: &mut State, delta: ItemDelta, kind: ContentKind) {
+    /// `part` is which part of a reasoning item a thinking delta writes; `None` for a message's text.
+    fn on_delta(&self, st: &mut State, delta: ItemDelta, kind: ContentKind, part: Option<ThoughtPart>) {
         if delta.delta.is_empty() || !self.running_turn(st, &delta.thread_id, &delta.turn_id) {
             return;
         }
@@ -1943,13 +2139,17 @@ impl CodexProvider {
         }
         *st.items.entry(delta.item_id.clone()).or_insert(0) += delta.delta.len();
         if kind == ContentKind::Text {
-            st.message_text.entry(delta.item_id).or_default().push_str(&delta.delta);
+            st.message_text
+                .entry(delta.item_id.clone())
+                .or_default()
+                .push_str(&delta.delta);
         }
-        st.events.push_back(AgentDomainEvent::ContentDelta {
-            turn_id,
-            kind,
-            text: delta.delta,
-        });
+        let text = match part {
+            Some(part) => thought_text(st, delta.item_id, part, delta.delta),
+            None => delta.delta,
+        };
+        st.events
+            .push_back(AgentDomainEvent::ContentDelta { turn_id, kind, text });
     }
 
     /// A turn of the family ended. The tab's turn ends with the last of them, with the outcome of the tab's
@@ -2044,6 +2244,8 @@ impl CodexProvider {
         st.background.extend(left);
         st.background_unread |= st.running_unread;
         report_background(st);
+        // Before the end, so the host holds them again by the time it sees the turn over.
+        self.drop_steers(st, "the turn ended before Codex read it");
         st.events.push_back(AgentDomainEvent::TurnCompleted {
             turn_id,
             outcome,
@@ -2315,6 +2517,8 @@ impl AgentProvider for CodexProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             interrupt: true,
+            // Until Codex answers `turn/steer` with an unknown method: the tab then says Enter holds.
+            steer: !self.steer_unsupported.load(Ordering::Acquire),
             ..Default::default()
         }
     }
@@ -2381,6 +2585,77 @@ impl AgentProvider for CodexProvider {
         Ok(())
     }
 
+    /// Never waits: the answer is read by `pump` (`follow_steers`), and what became of the message arrives
+    /// as an event. A message behind one whose answer has not come waits unsent, so Codex sees them in
+    /// order. Refused at once, nothing sent, when the turn Codex runs is not the one the host saw, it has no
+    /// id yet, an interrupt was asked for (Codex would forget the message), the tab's own turn is over while
+    /// its subagents finish, only a subagent's turn runs, or this Codex does not know the method.
+    fn steer_turn(&self, request: SteerTurnRequest) -> Result<(), ProviderError> {
+        let mut st = lock(&self.state);
+        if st.thread_id.as_deref() != Some(request.session_id.as_str()) {
+            return Err(provider_error(
+                ProviderErrorCode::SessionNotFound,
+                "no such Codex session",
+            ));
+        }
+        Self::require_open(&st)?;
+        if let Some(why) = st.blocked {
+            return Err(provider_error(ProviderErrorCode::ProviderUnavailable, why));
+        }
+        if self.steer_unsupported.load(Ordering::Acquire) {
+            return Err(ProviderError::UnsupportedCapability("steer"));
+        }
+        let no_turn = |why: &str| provider_error(ProviderErrorCode::NoActiveTurn, why);
+        let Some(turn) = st.turn.as_ref() else {
+            return Err(no_turn("no turn is running"));
+        };
+        if turn.id.as_deref() != Some(request.expected_turn_id.as_str()) {
+            return Err(no_turn("the running turn is not the one the message was typed in"));
+        }
+        if turn.interrupting || turn.own_end.is_some() || turn.settling {
+            return Err(no_turn("the turn is ending"));
+        }
+        // Codex steers the tab thread's own turn: a turn a subagent opened, or one whose start could not be
+        // read, has nothing on the tab's thread to take the message.
+        let own = st
+            .family
+            .as_ref()
+            .and_then(|f| f.running_on(f.tab_thread()))
+            .map(str::to_string);
+        match own.as_deref() {
+            Some(id) if id == request.expected_turn_id && id != UNREAD_TURN && !id.starts_with(UNREAD_TURN_PREFIX) => {}
+            Some(_) => return Err(no_turn("Eitri could not read the turn's start")),
+            None => return Err(no_turn("only a subagent is running")),
+        }
+        if st.steers.len() >= MAX_STEERS {
+            return Err(provider_error(
+                ProviderErrorCode::TurnAlreadyActive,
+                "too many messages are waiting for Codex to read them",
+            ));
+        }
+        let thread_id = st.thread_id.clone().unwrap_or_default();
+        let params = to_json(&TurnSteerParams::new(
+            thread_id,
+            request.client_message_id.clone(),
+            request.text,
+            request.expected_turn_id,
+        ))?;
+        // Behind a message whose answer has not come, this one waits unsent (`follow_steers`).
+        let behind = st.steers.iter().any(|s| s.answer.is_some() || s.waiting.is_some());
+        let (answer, waiting) = if behind {
+            (None, Some(params))
+        } else {
+            (Some(self.request(method::TURN_STEER, params)?), None)
+        };
+        st.steers.push(SentSteer {
+            client_id: request.client_message_id,
+            as_typed: request.as_typed,
+            answer,
+            waiting,
+        });
+        Ok(())
+    }
+
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError> {
         let mut st = lock(&self.state);
         if st.thread_id.as_deref() != Some(request.session_id.as_str()) {
@@ -2433,6 +2708,7 @@ impl AgentProvider for CodexProvider {
                 self.interrupt_running(&mut st);
             }
             self.drop_cards(&mut st, PermissionOutcome::CancelledBySessionClose);
+            self.drop_steers(&mut st, "the session was closed before Codex read it");
             st.closed = true;
             st.events.push_back(AgentDomainEvent::SessionClosed {
                 reason: "closed_by_host".to_string(),
@@ -2465,14 +2741,44 @@ impl AgentProvider for CodexProvider {
         let mut st = lock(&self.state);
         let caught_up = st.closed || self.drain(&mut st);
         self.follow_interrupts(&mut st);
+        self.follow_steers(&mut st, true);
+        self.finish_closing_notice(&mut st);
         // Only once everything Codex wrote has been read: a turn end waiting behind a backlog is not overdue.
         if caught_up {
             self.stop_an_overdue_interrupt(&mut st);
         }
         self.settle(&mut st);
         report_background(&mut st);
+        follow_thought(&mut st);
+        st.thought_scanned = 0;
         st.events.drain(..).collect()
     }
+}
+
+/// Whether the projection's thinking block is open once the queued events are folded: carried across
+/// pumps in `thought_open`, and followed through each event once.
+fn follow_thought(st: &mut State) -> bool {
+    for event in st.events.iter().skip(st.thought_scanned) {
+        st.thought_open = thinking_open_after(st.thought_open, event);
+    }
+    st.thought_scanned = st.events.len();
+    st.thought_open
+}
+
+/// The text to send for a thought from `part` of reasoning item `item`. While a thought is open, one from
+/// another part or another item starts after a blank line: the projection and the page fold back-to-back
+/// thinking deltas into one block with nothing between them, and a resumed turn joins the same parts with
+/// a blank line (`resume::turn_events`).
+fn thought_text(st: &mut State, item: String, part: ThoughtPart, text: String) -> String {
+    let open = follow_thought(st);
+    let here = (item, part);
+    let text = if open && st.thought_part.as_ref().is_some_and(|last| *last != here) {
+        format!("\n\n{text}")
+    } else {
+        text
+    };
+    st.thought_part = Some(here);
+    text
 }
 
 impl CodexProvider {

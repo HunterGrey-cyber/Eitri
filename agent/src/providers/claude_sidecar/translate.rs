@@ -9,7 +9,7 @@ use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
 use claude_runtime_protocol::v1::{
     PermissionMode as ProtoPermissionMode, PermissionOrigin as ProtoPermissionOrigin,
     PermissionOutcome as ProtoPermissionOutcome, ResumeStatus as ProtoResumeStatus, SessionCloseReason,
-    SessionEvent as ProtoSessionEvent, TurnOutcome as ProtoTurnOutcome,
+    SessionEvent as ProtoSessionEvent, TurnOutcome as ProtoTurnOutcome, UserMessageDropReason,
 };
 
 /// Translates one proto `SessionEvent`'s wire fields into this crate's own domain events. Returns
@@ -278,6 +278,45 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
             reason_type: denied.reason_type,
             reason: denied.reason,
         }),
+        // Capability 'steer_turn': a message sent with `SteerTurn` reached the model. The wire carries
+        // no text, so `text` is left empty here and filled in with what the user typed by the provider,
+        // which kept it (`steer::SteerGate::pass`). `into_running_turn: false` (the CLI ran it as a turn
+        // of its own, which the sidecar opened just before) is a delivery all the same: the row goes
+        // where the model read it.
+        ProtoEvent::UserMessageDelivered(delivered) => one(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: delivered.client_message_id,
+            turn_id: delivered.turn_id,
+            text: String::new(),
+        }),
+        ProtoEvent::UserMessageDropped(dropped) => one(AgentDomainEvent::UserMessageDropped {
+            reason: drop_reason(dropped.reason()).to_string(),
+            client_message_id: dropped.client_message_id,
+        }),
+        // Capability 'list_commands': the session's whole command list, each one replacing the last.
+        // Untrusted text, bounded by the same rules as an ACP agent's list. Aliases are left out: the
+        // menu offers one row per command, as Claude Code's does, and an alias typed in full is sent
+        // as typed and resolved by the CLI.
+        ProtoEvent::CommandsUpdated(updated) => one(AgentDomainEvent::CommandsAvailable {
+            commands: crate::providers::acp::wire::bound_commands(updated.commands.into_iter().map(|command| {
+                crate::providers::acp::wire::RawCommand {
+                    name: command.name,
+                    description: Some(command.description),
+                    hint: Some(command.argument_hint),
+                }
+            })),
+        }),
+    }
+}
+
+/// Why a message sent into the running turn will never reach the model, as the host shows it after
+/// "held until the turn ends:".
+fn drop_reason(reason: UserMessageDropReason) -> &'static str {
+    match reason {
+        UserMessageDropReason::Cancelled => "Claude cancelled it",
+        UserMessageDropReason::Discarded => "Claude discarded it",
+        UserMessageDropReason::Refused => "Claude refused it",
+        UserMessageDropReason::SessionClosed => super::steer::SESSION_ENDED,
+        UserMessageDropReason::Unspecified => "Claude did not take it",
     }
 }
 
@@ -1525,5 +1564,119 @@ mod tests {
         let mut split = MessageSplit::new(false);
         split.before(&text("t1", Some("msg_a"), "a"));
         assert_eq!(split.before(&text("t1", Some("msg_b"), "b")), None);
+    }
+
+    /// Both kinds of delivery are deliveries: folded into the running turn, or run as a turn of its
+    /// own after it. The text is left for the provider, which kept what the user typed.
+    #[test]
+    fn a_delivered_message_translates_whether_or_not_it_joined_the_running_turn() {
+        for (turn, into_running_turn) in [("t1", true), ("t2", false)] {
+            let event = wrap(ProtoEvent::UserMessageDelivered(
+                claude_runtime_protocol::v1::UserMessageDelivered {
+                    client_message_id: "eitri-1-0".into(),
+                    turn_id: turn.into(),
+                    into_running_turn,
+                },
+            ));
+            assert_eq!(
+                translate(event),
+                Some(AgentDomainEvent::UserMessageDelivered {
+                    client_message_id: "eitri-1-0".into(),
+                    turn_id: turn.into(),
+                    text: String::new(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_message_translates_with_a_reason_the_held_note_can_show() {
+        let cases = [
+            (UserMessageDropReason::Cancelled, "Claude cancelled it"),
+            (UserMessageDropReason::Discarded, "Claude discarded it"),
+            (UserMessageDropReason::Refused, "Claude refused it"),
+            (
+                UserMessageDropReason::SessionClosed,
+                "the session ended before Claude read it",
+            ),
+            (UserMessageDropReason::Unspecified, "Claude did not take it"),
+        ];
+        for (reason, words) in cases {
+            let event = wrap(ProtoEvent::UserMessageDropped(
+                claude_runtime_protocol::v1::UserMessageDropped {
+                    client_message_id: "eitri-1-0".into(),
+                    reason: reason as i32,
+                },
+            ));
+            assert_eq!(
+                translate(event),
+                Some(AgentDomainEvent::UserMessageDropped {
+                    client_message_id: "eitri-1-0".into(),
+                    reason: words.into(),
+                })
+            );
+        }
+        // A reason a newer sidecar adds reads as the unspecified one.
+        let event = wrap(ProtoEvent::UserMessageDropped(
+            claude_runtime_protocol::v1::UserMessageDropped {
+                client_message_id: "eitri-1-0".into(),
+                reason: 99,
+            },
+        ));
+        assert!(matches!(
+            translate(event),
+            Some(AgentDomainEvent::UserMessageDropped { reason, .. }) if reason == "Claude did not take it"
+        ));
+    }
+
+    /// The CLI's list becomes the menu's rows: an argument hint is the row's hint (none when empty),
+    /// aliases add no rows, and the list is bounded like an ACP agent's (a name with whitespace or an
+    /// invisible character is dropped, a repeated name keeps its first entry, one leading `/` goes).
+    #[test]
+    fn the_command_list_translates_into_bounded_menu_rows() {
+        let command =
+            |name: &str, description: &str, hint: &str, aliases: &[&str]| claude_runtime_protocol::v1::SlashCommand {
+                name: name.into(),
+                description: description.into(),
+                argument_hint: hint.into(),
+                aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            };
+        let event = wrap(ProtoEvent::CommandsUpdated(
+            claude_runtime_protocol::v1::CommandsUpdated {
+                commands: vec![
+                    command("compact", "Clear history but keep a summary", "[instructions]", &[]),
+                    command("clear", "Clear the conversation", "", &["reset", "new"]),
+                    command("my-skill", "A user skill\nover two lines", "<file>", &[]),
+                    command("/review", "Review a pull request", "", &[]),
+                    command("bad name", "dropped", "", &[]),
+                    command("hid\u{200b}den", "dropped", "", &[]),
+                    command("compact", "a repeat", "", &[]),
+                ],
+            },
+        ));
+        let row = |name: &str, description: &str, hint: Option<&str>| crate::SlashCommand {
+            name: name.into(),
+            description: description.into(),
+            hint: hint.map(str::to_string),
+        };
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::CommandsAvailable {
+                commands: vec![
+                    row("compact", "Clear history but keep a summary", Some("[instructions]")),
+                    row("clear", "Clear the conversation", None),
+                    row("my-skill", "A user skill over two lines", Some("<file>")),
+                    row("review", "Review a pull request", None),
+                ],
+            })
+        );
+        // An empty list is a list: the CLI offers nothing, and the menu falls back to nothing reported.
+        let empty = wrap(ProtoEvent::CommandsUpdated(
+            claude_runtime_protocol::v1::CommandsUpdated { commands: Vec::new() },
+        ));
+        assert_eq!(
+            translate(empty),
+            Some(AgentDomainEvent::CommandsAvailable { commands: Vec::new() })
+        );
     }
 }

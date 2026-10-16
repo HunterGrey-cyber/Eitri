@@ -20,7 +20,7 @@ describe("P2 runs", () => {
     expect(shown.map((i) => i.kind)).toEqual(["message", "run", "message"]);
     const run = shown[1] as Extract<TimelineItem, { kind: "run" }>;
     expect(run.key).toBe("r-2");
-    expect(runSummary(run.calls)).toBe("Read ×2 · Bash ×1");
+    expect(runSummary(run.calls)).toBe("Read 2 files, ran 1 command");
   });
 
   it("leaves a single call, a running call, the running turn's tail and an expanded run alone", () => {
@@ -62,15 +62,15 @@ describe("P2 runs", () => {
   it("v1 trial item 7: an edit between reads is never counted into a fold, on either side", () => {
     // 4A (the acceptEdits fast path) auto-allows in-project Write/Edit/NotebookEdit with no card,
     // so nothing else marks an edit as different from an ordinary finished, ungated call -- without
-    // this rule it would have folded into "Read ×4 · Edit ×1" and the change would have vanished
+    // this rule it would have folded into "Read 4 files, Edit ×1" and the change would have vanished
     // behind a count. A run of other tools now stops at it instead, on both sides.
     const items = [tool(call(1, "Read")), tool(call(2, "Read")), tool(call(3, "Edit")), tool(call(4, "Read")), tool(call(5, "Read"))];
     const shown = buildDisplay(items, opts);
     expect(shown.map((i) => i.kind)).toEqual(["run", "tool", "run"]);
     const [before, edit, after] = shown as [Extract<TimelineItem, { kind: "run" }>, Extract<TimelineItem, { kind: "tool" }>, Extract<TimelineItem, { kind: "run" }>];
-    expect(runSummary(before.calls)).toBe("Read ×2");
+    expect(runSummary(before.calls)).toBe("Read 2 files");
     expect(edit.call.toolUseId).toBe("t3");
-    expect(runSummary(after.calls)).toBe("Read ×2");
+    expect(runSummary(after.calls)).toBe("Read 2 files");
   });
 
   it("v1 trial item 7: Write, Edit and NotebookEdit never fold into a count-only run", () => {
@@ -138,5 +138,110 @@ describe("a turn ending in a run of finished calls", () => {
     const items = [tool(call(1, "Read")), tool(call(2, "Read")), tool(call(3, "Read")), ending, tool(call(5, "Read")), tool(call(6, "Read"))];
     expect(buildDisplay(items, opts).map((i) => i.kind)).toEqual(["run", "ending", "run"]);
     expect(buildDisplay(items, { ...opts, detailed: true }).map((i) => i.kind)).toEqual(items.map((i) => i.kind));
+  });
+});
+
+describe("runs and turns", () => {
+  const inTurn = (seq: number, turnId: string): TimelineItem => tool({ ...call(seq, "Read"), turnId });
+  const thoughtIn = (seq: number, turnId: string): TimelineItem => ({
+    kind: "thinking",
+    seq,
+    key: `k-${seq}`,
+    block: { seq, turnId, text: "t" },
+    open: false,
+  });
+
+  it("a run never crosses into the next turn, so each turn's line has a row of its own to stand under", () => {
+    const items = [inTurn(1, "t1"), inTurn(2, "t1"), inTurn(3, "t2"), inTurn(4, "t2")];
+    const shown = buildDisplay(items, opts);
+    expect(shown.map((i) => i.key)).toEqual(["r-1", "r-3"]);
+    // A thought of the next turn ends the run too, and is not folded into it.
+    const withThought = [inTurn(1, "t1"), inTurn(2, "t1"), thoughtIn(3, "t2"), inTurn(4, "t2"), inTurn(5, "t2")];
+    expect(buildDisplay(withThought, opts).map((i) => i.key)).toEqual(["r-1", "k-3", "r-4"]);
+    // An item that names no turn joins either side.
+    expect(buildDisplay([inTurn(1, "t1"), tool(call(2, "Read")), inTurn(3, "t1")], opts).map((i) => i.key)).toEqual(["r-1"]);
+  });
+});
+
+describe("thinking among the rows", () => {
+  const thought = (seq: number, open = false): TimelineItem => ({
+    kind: "thinking",
+    seq,
+    key: `k-${seq}`,
+    block: { seq, turnId: "t", text: `thought ${seq}` },
+    open,
+  });
+  const kinds = (items: TimelineItem[]) => items.map((i) => i.kind);
+
+  it("collapsed and preview fold a finished thought between two calls into their run; one before or after stays a row", () => {
+    const items = [thought(1), tool(call(2, "Read")), thought(3), tool(call(4, "Read")), thought(5), msg(6)];
+    for (const thinking of ["collapsed", "preview", undefined] as const) {
+      const shown = buildDisplay(items, { ...opts, thinking });
+      expect(kinds(shown), String(thinking)).toEqual(["thinking", "run", "thinking", "message"]);
+      const run = shown[1] as Extract<TimelineItem, { kind: "run" }>;
+      expect(run.calls.map((c) => c.seq)).toEqual([2, 4]);
+      expect(run.thoughts?.map((t) => t.seq)).toEqual([3]);
+    }
+    // Opened, the run gives back every row it held, the thought among them.
+    expect(kinds(buildDisplay(items, { ...opts, expanded: { "r-2": true } }))).toEqual(kinds(items));
+  });
+
+  it("a thought still being written is never folded away", () => {
+    const items = [tool(call(1, "Read")), thought(2, true), tool(call(3, "Read")), msg(4)];
+    expect(kinds(buildDisplay(items, opts))).toEqual(["tool", "thinking", "tool", "message"]);
+  });
+
+  it("expanded folds no thought; hidden leaves every thought out and folds as if there were none", () => {
+    const items = [tool(call(1, "Read")), thought(2), tool(call(3, "Read")), msg(4)];
+    expect(kinds(buildDisplay(items, { ...opts, thinking: "expanded" }))).toEqual(["tool", "thinking", "tool", "message"]);
+    expect(kinds(buildDisplay(items, { ...opts, thinking: "hidden" }))).toEqual(["run", "message"]);
+    expect(kinds(buildDisplay([thought(1), msg(2)], { ...opts, thinking: "hidden" }))).toEqual(["message"]);
+  });
+
+  it("the detailed view keeps every thought whatever the level", () => {
+    const items = [tool(call(1, "Read")), thought(2), tool(call(3, "Read")), msg(4)];
+    for (const thinking of ["collapsed", "preview", "expanded", "hidden"] as const) {
+      expect(kinds(buildDisplay(items, { ...opts, thinking, detailed: true })), thinking).toEqual(kinds(items));
+    }
+  });
+
+  it("a run that only thinking follows is still the running turn's tail", () => {
+    const items = [tool(call(1, "Read")), tool(call(2, "Read")), thought(3, true)];
+    expect(kinds(buildDisplay(items, { ...opts, turnRunning: true }))).toEqual(["tool", "tool", "thinking"]);
+    expect(kinds(buildDisplay(items, opts))).toEqual(["run", "thinking"]);
+  });
+
+  it("finds a thought folded into a run at the run, and zc from it closes that run", () => {
+    const items = [tool(call(1, "Read")), thought(2), tool(call(3, "Read")), msg(4)];
+    const shown = buildDisplay(items, opts);
+    expect(indexOfKey(shown, "k-2")).toBe(0);
+    expect(runKeyOf(items, opts, "k-2")).toBe("r-1");
+    expect(runKeyOf(items, opts, "k-9")).toBeNull();
+  });
+});
+
+describe("a run's identity", () => {
+  /* Rows are memoized on their item, so a run that folds the same members must be the same object
+     from one build to the next, and a new one as soon as any member changes. */
+  it("is the same object while its members are, and a new one when a member changes", () => {
+    const a = tool(call(1, "Read"));
+    const b = tool(call(2, "Read"));
+    const between: TimelineItem = { kind: "thinking", seq: 3, key: "k-3", block: { seq: 3, turnId: "t", text: "x" }, open: false };
+    const c = tool(call(4, "Bash"));
+    const m = msg(5);
+    const first = buildDisplay([a, b, between, c, m], opts)[0];
+    expect(first.kind).toBe("run");
+    expect(buildDisplay([a, b, between, c, m], opts)[0]).toBe(first);
+    expect(buildDisplay([a, b, between, c, msg(5)], opts)[0], "a row outside the run changed").toBe(first);
+
+    const c2 = tool({ ...call(4, "Bash"), name: "Grep" });
+    const changed = buildDisplay([a, b, between, c2, m], opts)[0] as Extract<TimelineItem, { kind: "run" }>;
+    expect(changed).not.toBe(first);
+    expect(runSummary(changed.calls)).toBe("Read 2 files, searched 1 pattern");
+
+    const shorter = buildDisplay([a, b, m], opts)[0] as Extract<TimelineItem, { kind: "run" }>;
+    expect(shorter).not.toBe(first);
+    expect(shorter.calls.map((x) => x.seq)).toEqual([1, 2]);
+    expect(shorter.thoughts).toBeUndefined();
   });
 });

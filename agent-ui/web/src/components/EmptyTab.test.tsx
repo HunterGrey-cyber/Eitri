@@ -65,6 +65,35 @@ function toBrowse(rendered: RenderResult, props: EmptyTabProps): HTMLElement {
   return rendered.container.querySelector(".empty-tab")!;
 }
 
+/* The composer is the menu's New session row, between the name and the other rows. It shares
+   their width and key column. */
+describe("EmptyTab: the box is the dashboard's New session row", () => {
+  it("sits after the name and the where-line and before the other rows, with its key where theirs are", () => {
+    const rendered = renderEmpty({ landing: "browse" });
+    const dashboard = rendered.container.querySelector(".dashboard")!;
+    expect(Array.from(dashboard.children).map((el) => el.className)).toEqual(["dash-title", "dash-where", "dash-input", "dash-items"]);
+    expect(dashboard.querySelector(".dash-input .composer")).not.toBeNull();
+    expect(dashboard.querySelector(".dash-input .composer-key")!.textContent).toBe("i");
+    // No sentence after the placeholder there: the key says it.
+    expect(dashboard.querySelector(".composer-hint")).toBeNull();
+    // The rows no longer draw a New session row of their own.
+    expect(dashboard.querySelector(".dash-items")!.textContent).not.toContain("New session");
+  });
+
+  it("keeps the same box when the dashboard gives way to the starting screen, so nothing in it is lost", () => {
+    const rendered = renderEmpty();
+    const before = rendered.container.querySelector("textarea")!;
+    fireEvent.change(before, { target: { value: "half a thought" } });
+    rendered.rerender(<EmptyTab {...rendered.props} tab={{ ...TAB, state: "starting" }} />);
+    expect(rendered.container.querySelector(".dashboard")).toBeNull();
+    const after = rendered.container.querySelector("textarea")!;
+    expect(after).toBe(before);
+    expect(after.value).toBe("half a thought");
+    // Off the dashboard it is the plain box again: no key at its end.
+    expect(rendered.container.querySelector(".empty-box .composer")).not.toBeNull();
+  });
+});
+
 describe("EmptyTab: requests are edges, not levels (GUI pass 2026-09-26, r2-gui)", () => {
   it("an arrival counted before it mounted is not one: it mounts where it was landed", () => {
     // The window's counters outlive any one tab: a new tab mounts with whatever `arrive` count the
@@ -99,11 +128,11 @@ describe("EmptyTab (F3)", () => {
     const { container } = renderEmpty();
     expect(container.querySelector("textarea")).not.toBeNull();
     expect(document.activeElement).toBe(container.querySelector("textarea"));
-    // The dashboard shows five actions (`new`, `resume`, `sessions`, `mode`, `keys`) instead of
-    // individual resume rows. `HELLO` has ten sessions, so this checks that the action count is
-    // independent of the session count.
+    // The dashboard shows four actions (`new`, `resume`, `sessions`, `keys`) instead of individual
+    // resume rows. `HELLO` has ten sessions, so this checks that the action count is independent of
+    // the session count.
     expect(container.querySelectorAll('[data-nav-stop="resume"]').length).toBe(0);
-    expect(container.querySelectorAll('[data-nav-stop="dash"]').length).toBe(5);
+    expect(container.querySelectorAll('[data-nav-stop="dash"]').length).toBe(4);
     expect(container.textContent).not.toContain("about 8");
     expect(container.querySelector(".dashboard")).not.toBeNull();
   });
@@ -216,9 +245,9 @@ describe("EmptyTab (F3)", () => {
       // Clamped, not wrapped: holding k at the top stays put.
       fireEvent.keyDown(root, { key: "k" });
       expect(items().indexOf(current()!)).toBe(0);
-      // HELLO above has records, so the table is new/resume/sessions/mode/keys -- 5 items, last index 4.
+      // HELLO above has records, so the table is new/resume/sessions/keys -- 4 items, last index 3.
       for (let i = 0; i < 10; i++) fireEvent.keyDown(root, { key: "j" });
-      expect(items().indexOf(current()!)).toBe(4);
+      expect(items().indexOf(current()!)).toBe(3);
     });
 
     it("Enter runs the item under the cursor", () => {
@@ -429,16 +458,19 @@ describe("EmptyTab (F3)", () => {
       }
     });
 
-    it("the Mode item still runs on Enter, and its key column now reads ⇧Tab (V1 S2)", () => {
-      const rendered = renderEmpty();
+    /* 2026-10-15: the mode is no longer an item (the status band names it; Shift+Tab changes it). The
+       last row is Keys, and Enter on it opens the sheet rather than changing the mode. */
+    it("has no Mode item: Enter on the last row opens the keys sheet and leaves the mode alone", () => {
+      const onOpenKeymap = vi.fn();
+      const rendered = renderEmpty({ onOpenKeymap });
       const { props } = rendered;
       const root = toBrowse(rendered, props);
-      // HELLO above has records, so the table is new/resume/sessions/mode/keys -- "mode" is index 3.
-      const items = Array.from(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
-      expect(items[3].querySelector(".dash-key")!.textContent).toBe("⇧Tab");
+      const keys = Array.from(root.querySelectorAll<HTMLElement>(".dash-key, .composer-key")).map((el) => el.textContent);
+      expect(keys).not.toContain("⇧Tab");
       for (let i = 0; i < 3; i++) fireEvent.keyDown(root, { key: "j" });
       fireEvent.keyDown(root, { key: "Enter" });
-      expect(props.onCycleMode).toHaveBeenCalledTimes(1);
+      expect(onOpenKeymap).toHaveBeenCalledTimes(1);
+      expect(props.onCycleMode).not.toHaveBeenCalled();
     });
 
     it("? opens the keymap overlay", () => {
@@ -1004,19 +1036,13 @@ describe("EmptyTab (F3)", () => {
       }
     });
 
-    it("the Mode item still runs on Enter, and its label is the real way in (⇧Tab)", () => {
+    it("draws no key column entry for the mode, and no bare m", () => {
       const rendered = renderEmpty();
-      const { props, container } = rendered;
+      const { props } = rendered;
       const root = toBrowse(rendered, props);
-      // dashItems' own order with a resumable session present: new, resume, sessions, mode, keys.
-      fireEvent.keyDown(root, { key: "j" });
-      fireEvent.keyDown(root, { key: "j" });
-      fireEvent.keyDown(root, { key: "j" });
-      fireEvent.keyDown(root, { key: "Enter" });
-      expect(props.onCycleMode).toHaveBeenCalledTimes(1);
-      const keys = Array.from(container.querySelectorAll(".dash-key")).map((el) => el.textContent);
-      expect(keys).toContain("⇧Tab");
-      expect(keys).not.toContain("m");
+      // The box's own key (BROWSE's stand-in, the New session row) and the rows' keys, in order.
+      const keys = Array.from(root.querySelectorAll(".composer-key, .dash-key")).map((el) => el.textContent);
+      expect(keys).toEqual(["i", "r", "w", "?"]);
     });
   });
 
@@ -1092,7 +1118,8 @@ describe("EmptyTab (F3)", () => {
       expect(container.querySelector("textarea")).toBeNull();
       expect(onModeChange).toHaveBeenLastCalledWith("browse");
       expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
-      expect(container.querySelector('.dash-item[aria-current="true"]')?.textContent).toContain("New session");
+      // The cursor is on the New session row, which is the box itself (2026-10-15).
+      expect(container.querySelector('.dash-input[aria-current="true"] .composer')).not.toBeNull();
     });
 
     it("Esc mid-composition belongs to the input method", () => {

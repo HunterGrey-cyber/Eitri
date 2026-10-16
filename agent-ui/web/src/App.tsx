@@ -42,6 +42,7 @@ import { appendQuote, formatQuote } from "./quote";
 import { installCtrlBracketAsEscape } from "./ctrlBracket";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
+import { TurnChanges } from "./components/TurnChanges";
 import { buildTimeline, oldestPendingPermission, oldestWaitingPermission, promptIndex, waitingCardAfter } from "./timeline";
 import { buildDisplay, indexOfKey, runKeyOf } from "./display";
 import { outputText, primaryText } from "./copyText";
@@ -88,6 +89,7 @@ import { classify, failureEvidence, remedyNamesR } from "./problems";
 import { ActivityLine } from "./components/ActivityLine";
 import { StatusBand } from "./components/StatusBand";
 import { QueueLines } from "./components/QueueLines";
+import { heldCount } from "./queueLines";
 import { DetailPopover } from "./components/DetailPopover";
 import { ContinueInTerminal } from "./components/TerminalHandoff";
 import { HintLayer } from "./components/HintLayer";
@@ -121,17 +123,20 @@ import {
   withStatus,
 } from "./review";
 import type { ReviewEffect, ReviewState } from "./review";
-import type { ReviewRecoveryEntry } from "./types";
+import type { ReviewRecoveryEntry, ThinkingDisplay } from "./types";
+import { THINKING_DISPLAYS } from "./types";
 import { Chooser } from "./components/Chooser";
 import { withChooserTitles } from "./chooser";
 import { SlashPicker } from "./components/SlashPicker";
 import type { SlashPickerKind } from "./components/SlashPicker";
 import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
-import { barePickerCommand } from "./slashCommands";
+import { barePickerCommand, completionSource } from "./slashCommands";
 import { parseEffortReply, parseModelReply } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
 import { cardSummary, shortModel, usageSegment } from "./band";
 import { latestTurnEnding } from "./turnEnding";
+import { durationsFromSnapshot, durationsWith, NO_TURN_DURATIONS } from "./turnTimes";
+import type { TurnDurations } from "./turnTimes";
 import type { ApproveFact, BandFacts } from "./band";
 import type { AgentUiState, HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope, ContextSummary, EditorLink, QueueItem, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
@@ -430,6 +435,7 @@ type FrozenSnapshot = {
   ruleOffers: Record<string, string>;
   answeredPermissions: ReadonlySet<string>;
   sessionEnded: boolean;
+  turnDurations: TurnDurations;
 };
 
 /** The tool name of the oldest pending permission, selected by lowest `seq`, for
@@ -634,6 +640,11 @@ export default function App() {
    *  Clear it on the events that clear `state.activeTurnId`. Read raw envelopes because folded state
    *  does not retain whether the turn was first seen in events or a snapshot. */
   const [turnClock, setTurnClock] = useState<TurnClock | null>(null);
+  /** How long each finished turn of the ACTIVE tab ran, by turn id (`turnTimes` on the envelopes, stamped by
+   *  Rust's tab set): the "Worked for" line under a turn and the duration on a turn-ending row. A snapshot
+   *  replaces the whole table, an events envelope adds the turns that ended in it, and a tab switch empties
+   *  it until the new tab's snapshot lands. Chrome only -- nothing here is a row or a cursor stop. */
+  const [turnDurations, setTurnDurations] = useState<TurnDurations>(NO_TURN_DURATIONS);
   /** Which timeline rows show their full tool result rather than the folded placeholder, keyed by
    *  the timeline `key` -- never the cursor index, because a resolved permission removes a card and
    *  shifts every later index, which would silently move an expansion onto a different row.
@@ -643,6 +654,9 @@ export default function App() {
    *  `TabViewState.detailed`, like `expanded`, and restored on a switch. A tab with no saved
    *  view starts with `false`. */
   const [detailed, setDetailed] = useState(false);
+  /** How thinking is shown (`init.lua`'s `agent.thinking`), as the `display` envelope last said. Window-
+   *  level and read once by the host; `collapsed`, its default, until the envelope arrives. */
+  const [thinkingDisplay, setThinkingDisplay] = useState<ThinkingDisplay>("collapsed");
   /** BROWSE (read, move the cursor, act on "this item") / INPUT (typing into the composer) / HINT
    *. See
    *  `./keymap`'s own doc comment on `PanelMode`. */
@@ -773,6 +787,12 @@ export default function App() {
    *  `editorContext`, which are window-wide (`tabs.ts`'s `TAB_SCOPED`). */
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [queueError, setQueueError] = useState<string | null>(null);
+  /** Why the tab's messages are held for the turn's end rather than in the turn (the queue envelope's
+   *  `note`): shown once under the `⧗` lines. */
+  const [queueNote, setQueueNote] = useState<string | null>(null);
+  /** Whether Enter puts a message into the running turn, as the tab's latest queue envelope says (`null`
+   *  before one came): it follows the agent live, which the snapshot's capability does not. */
+  const [queueSteers, setQueueSteers] = useState<boolean | null>(null);
   const [history, setHistory] = useState<string[]>([]);
   const [ruleOffers, setRuleOffers] = useState<Record<string, string>>({});
   /** v1 hardening: the cards this tab has answered from this panel, by `permissionId`,
@@ -1541,8 +1561,14 @@ export default function App() {
    *  `state`, like `MessageList`'s memo, plus `expanded` and `detailed`: `buildDisplay` folds
    *  rows using both, so either changing must recompute what the cursor indexes. */
   const timeline = useMemo(
-    () => buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
-    [state, expanded, detailed],
+    () =>
+      buildDisplay(buildTimeline(state), {
+        expanded,
+        detailed,
+        turnRunning: state.activeTurnId !== null,
+        thinking: thinkingDisplay,
+      }),
+    [state, expanded, detailed, thinkingDisplay],
   );
   /** For the dispatch handler (installed once), as `cursorRef`: #22's park names the cursor's row by key. */
   const timelineRef = useRef(timeline);
@@ -1558,8 +1584,9 @@ export default function App() {
             expanded: frozenSnapshot.expanded,
             detailed: frozenSnapshot.detailed,
             turnRunning: frozenSnapshot.state.activeTurnId !== null,
+            thinking: thinkingDisplay,
           }),
-    [frozenSnapshot],
+    [frozenSnapshot, thinkingDisplay],
   );
   const answerableItems = useMemo(
     (): AnswerableItem[] =>
@@ -2350,34 +2377,26 @@ export default function App() {
   /** A code block HINT landed on: the next `y` copies exactly that block's code rather than the
    *  whole message. Cleared by that copy and by any other key the table resolves. */
   const copyCodeRef = useRef<HTMLElement | null>(null);
-  /** Whether `copyCodeRef` holds a block, used for `MessageList`'s `data-code-landed`. The row's
-   *  sign goes hollow while the block is selected. */
-  const [codeLanded, setCodeLanded] = useState(false);
-  /** Write `copyCodeRef` and update both landing indicators together. The dispatch handler and
-   *  `enterRegion` read the ref synchronously. Set `data-hint-landed` on the block directly
-   *  because it lives in markdown `innerHTML`; `codeLanded` updates the row. A streamed rerender
-   *  replaces the `pre`, removing the old attribute and leaving a disconnected ref that
-   *  `isConnected` can reject. */
+  /** Updates `copyCodeRef` and the block's `data-hint-landed` attribute together.
+   *  The dispatch handler and `enterRegion` read the ref synchronously. The block lives in
+   *  markdown `innerHTML`, so React cannot render the attribute. The cursor band is drawn
+   *  beneath the outline and needs no separate list attribute. A streamed delta can replace
+   *  this `pre`, removing its attribute and leaving the ref detached (`isConnected`). */
   function markLandedCode(el: HTMLElement | null) {
     const previous = copyCodeRef.current;
     if (previous === el) return;
     previous?.removeAttribute("data-hint-landed");
     copyCodeRef.current = el;
     el?.setAttribute("data-hint-landed", "");
-    setCodeLanded(el !== null);
   }
-  // A streamed delta can replace the landed block and remove its outline. Restore the row's solid
-  // sign, leaving the detached copy ref unchanged. Clear the landing when the cursor leaves the
-  // block's row, including non-key arrivals, so the outline and hollow sign cannot mark different
-  // rows. Keep it when an arrival stays on the row so `y` still copies the block after `Ctrl+h
-  // Ctrl+l`.
+  // A streamed delta can replace the landed block and remove its outline, leaving nothing to clear.
+  // Leave the detached copy ref unchanged. Clear the landing when the cursor leaves the block's
+  // row, including non-key arrivals, so the outline cannot mark a different row. Keep it when an
+  // arrival stays on the row so `y` still copies the block after `Ctrl+h Ctrl+l`.
   useEffect(() => {
     const block = copyCodeRef.current;
     if (block === null || frozenSnapshotRef.current !== null) return;
-    if (!block.isConnected) {
-      if (codeLanded) setCodeLanded(false);
-      return;
-    }
+    if (!block.isConnected) return;
     const root = containerRef.current;
     if (root === null) return;
     if (rowOf(root, block) !== (conversationRows(root)[cursor] ?? null)) markLandedCode(null);
@@ -2452,6 +2471,11 @@ export default function App() {
       }
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
+      } else if (payload.kind === "display") {
+        // How thinking is shown. A word this build does not know keeps the level it has, rather than
+        // drawing thinking some way nobody asked for.
+        if ((THINKING_DISPLAYS as readonly string[]).includes(payload.thinking)) setThinkingDisplay(payload.thinking);
+        else console.warn("agent-ui: a display envelope named an unknown thinking level", payload.thinking);
       } else if (payload.kind === "editor_typing") {
         // Window-level and Rust's alone (a cadence slower than the meter's step): it slows the
         // meter, never pauses it. Deliberately not among the envelopes that cancel a waiting answer
@@ -2750,11 +2774,14 @@ export default function App() {
           setSearch(null);
           setExLine(null);
           setTurnClock(null);
+          setTurnDurations(NO_TURN_DURATIONS);
           setHandoff(null);
           setFatalError(null);
           setCommandNotice(null);
           setQueue([]);
           setQueueError(null);
+          setQueueNote(null);
+          setQueueSteers(null);
           setRuleOffers({});
           answeredRef.current = new Set();
           setAnsweredPermissions(answeredRef.current);
@@ -2868,6 +2895,7 @@ export default function App() {
         // unknown. Keep an already exact clock for the same turn, and do not restart an approximate
         // one without a supplied start time. Clear the clock when there is no active turn.
         const startedAt = payload.turnStartedAtMs;
+        setTurnDurations(durationsFromSnapshot(payload.turnTimes));
         setTurnClock((current) => {
           const activeTurnId = payload.state.activeTurnId;
           if (activeTurnId === null) return null;
@@ -2924,6 +2952,7 @@ export default function App() {
         ) {
           firstTextReceivedAt.current = performance.now();
         }
+        setTurnDurations((current) => durationsWith(current, payload.turnTimes));
         setState((s) => applyCallNotes(applyEvents(s, payload.events), payload));
       } else if (payload.kind === "command_result") {
         setPendingCommands((prev) => {
@@ -3034,6 +3063,7 @@ export default function App() {
         // snapshot with the same `activeTurnId` would otherwise retain the old `since` and `exact: true`, showing an inflated elapsed time without `+`. Resetting avoids relying on turn ids
         // being unique across sessions.
         setTurnClock(null);
+        setTurnDurations(NO_TURN_DURATIONS);
         setHandoff(payload);
         // Suppresses the resume offer for THIS client's already-delivered `hello`, which was
         // computed once at mount. That only ever matches when this session was itself resume-started
@@ -3076,6 +3106,7 @@ export default function App() {
         setHandoffOpen(false);
         // The third of the three whole-state resets, now saying the same thing as the other two.
         setTurnClock(null);
+        if (kept === null) setTurnDurations(NO_TURN_DURATIONS);
         // A kept conversation says it in its own lost-session row; the banner would say it twice.
         setFatalError(kept === null ? payload.message : null);
         // No `requestHello()` here: Rust re-sends `hello`, recomputed, whenever the set
@@ -3191,6 +3222,8 @@ export default function App() {
       } else if (payload.kind === "queue") {
         setQueue(payload.items);
         setQueueError(payload.error);
+        setQueueNote(payload.note ?? null);
+        setQueueSteers(payload.enterSteers ?? null);
       } else if (payload.kind === "draft" && takeRefusedEcho(payload.tab, payload.refused)) {
         // The echo of a refused send this page put back itself: Rust's copy of the box can trail what was typed
         // since, and the box already holds the message and everything typed after it. Nothing to apply.
@@ -3515,7 +3548,7 @@ export default function App() {
     const requestId = nextRequestId();
     inFlight.current.set(requestId, { kind: "send", tab, text });
     setCommandNotice(null);
-    postToRust({ type: "queue_message", request_id: requestId, tab, text });
+    postToRust({ type: "queue_message", request_id: requestId, tab, text, turn_id: stateRef.current.activeTurnId });
   }
 
   function interrupt() {
@@ -3594,7 +3627,7 @@ export default function App() {
    *  callbacks run. `SearchBar` stops those keys, so `onKeyDown` never sees them; otherwise
    *  an immediate `a` after closing a line could answer a card as though it stood alone.
    *  Uses the same `event.timeStamp` clock as `onKeyDown`. */
-  function noteLineKey(event: KeyboardEvent<HTMLInputElement>) {
+  function noteLineKey(event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) {
     // This key is not a kill, so a following `Ctrl+y` is judged on its own.
     lastKeyWasKillRef.current = false;
     const cancelled = typingGuard.onKey(event.key, event.timeStamp > 0 ? event.timeStamp : performance.now());
@@ -4052,7 +4085,6 @@ export default function App() {
               paneFocused={paneFocused}
               // The first-run hint reads the live prefix instead of assuming the default.
               // This is the same value the `?` overlay shows as `prefixLabel`.
-              prefix={keymapHelp.prefix}
               editorLink={editorLink}
               focusRequest={inputRequest}
               arriveRequest={arriveRequest}
@@ -4098,9 +4130,10 @@ export default function App() {
                 queueMessage(text);
               }}
               history={history}
-              queueCount={queue.length}
+              queueCount={heldCount(queue)}
               queue={queue}
               queueError={queueError}
+              queueNote={queueNote}
               onTakeBackQueue={() => post({ type: "take_back_queue" })}
               queueTaken={queueTaken}
               onHistoryPush={(t) => postToRust({ type: "history_push", request_id: nextRequestId(), text: t })}
@@ -4193,6 +4226,7 @@ export default function App() {
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
+              agent={isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : null}
             />
           </PanelErrorBoundary>
         )}
@@ -4206,6 +4240,9 @@ export default function App() {
   // a turn as started when the user pressed Send. The reducer also clears it on a session that ends
   // without one, because no TurnCompleted is ever coming for a session that is gone.
   const turnInProgress = state.activeTurnId !== null;
+  /** Enter while the turn runs puts the message into it (the agent reads it at its next step) when the
+   *  tab's agent says it can; otherwise the message is held for the turn's end. */
+  const enterSteers = (queueSteers ?? state.capabilities.steer) === true;
   /* The conversation is on its way out: Rust already owns the backend on a shutdown worker and will
      refuse every command until that finishes. The composer must reflect that rather than accepting
      input it cannot deliver. */
@@ -4469,7 +4506,7 @@ export default function App() {
     countRef.current = null;
     visualCountRef.current = null;
     regionPendingGRef.current = null;
-    setFrozenSnapshot({ state, expanded, detailed, ruleOffers, answeredPermissions, sessionEnded });
+    setFrozenSnapshot({ state, expanded, detailed, ruleOffers, answeredPermissions, sessionEnded, turnDurations });
     modeRef.current = line ? "vline" : "caret";
     setMode(modeRef.current);
     root.focus({ preventScroll: true });
@@ -5337,7 +5374,11 @@ export default function App() {
         const run =
           action.open || expanded[key]
             ? null
-            : runKeyOf(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }, key);
+            : runKeyOf(
+                buildTimeline(state),
+                { expanded, detailed, turnRunning: state.activeTurnId !== null, thinking: thinkingDisplay },
+                key,
+              );
         setExpanded((prev) => ({ ...prev, [run ?? key]: action.open }));
         break;
       }
@@ -5762,6 +5803,8 @@ export default function App() {
     <div
       className="agent-ui-root agent-ui-conversation"
       ref={containerRef}
+      // Lets the stylesheet show key hints only where those keys would act (BROWSE, not INPUT).
+      data-panel-mode={mode}
       // Real, focusable, so BROWSE's keydown handler has a DOM node to bubble from -- see the
       // effect above `onKeyDown` that keeps focus here whenever `mode` is "browse".
       tabIndex={0}
@@ -5845,13 +5888,16 @@ export default function App() {
             mark an unrelated frozen row as current. */}
         <MessageList
           state={frozenSnapshot?.state ?? state}
+          turnDurations={frozenSnapshot?.turnDurations ?? turnDurations}
           sessionEnded={frozenSnapshot?.sessionEnded ?? sessionEnded}
           expanded={frozenSnapshot?.expanded ?? expanded}
           cursor={frozenTimeline === null ? cursor : (indexOfKey(frozenTimeline, timeline[cursor]?.key ?? "") ?? -1)}
           timeline={frozenTimeline ?? timeline}
           detailed={frozenSnapshot?.detailed ?? detailed}
-          focused={paneFocused && !edgeFocused}
-          codeLanded={codeLanded}
+          thinkingDisplay={thinkingDisplay}
+          // The band is drawn at full strength only while the list has the keys: in INPUT they are in
+          // the composer, and a bright band left above it would compete with the box being typed in.
+          focused={paneFocused && !edgeFocused && mode !== "input"}
           ruleOffers={frozenSnapshot?.ruleOffers ?? ruleOffers}
           yankedKey={yanked?.key ?? null}
           onAnswerPermission={answerPermission}
@@ -5881,6 +5927,7 @@ export default function App() {
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
+              agent={isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : null}
             />
           </PanelErrorBoundary>
         )}
@@ -5989,11 +6036,12 @@ export default function App() {
         turnClock={turnClock}
         canInterrupt={state.capabilities.interrupt}
         onInterrupt={interrupt}
-        queued={queue.length}
+        queued={heldCount(queue)}
         pendingTool={oldestPendingTool(state)}
         mode={mode}
       />
-      <QueueLines items={queue} error={queueError} />
+      <TurnChanges state={state} />
+      <QueueLines items={queue} error={queueError} note={queueNote} />
       {/* Above the composer, deliberately -- the confirmation
           used to sit below everything, at the very bottom; the band leaves no room there for a
           multi-line dialog, so it moves up here instead, controlled by `handoffOpen`. It must not
@@ -6024,6 +6072,10 @@ export default function App() {
         mode={mode}
         // The held-back slash commands are Claude Code's; another agent's tab sends a leading `/` as typed.
         claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
+        // The `/` menu's rows: the agent's own list when it reported one, Claude's built-ins on a Claude tab,
+        // none otherwise (`completionSource`). Withheld while a y/n question is up: an open menu
+        // would take the `Esc` that answers it, and the question owns the keys.
+        slashCommands={confirm !== null ? null : completionSource(activeTab?.agent, state.availableCommands)}
         // `composerFocusRequest` is bumped by the `inputRequest` effect only when no overlay is open,
         // and by the `i`/`o`/`A` mode actions. Passing the raw request would let `Composer`
         // focus its textarea under an overlay.
@@ -6035,13 +6087,15 @@ export default function App() {
         onSend={sendMessage}
         onDraftChange={mirrorDraft}
         running={turnInProgress}
+        enterSteers={enterSteers}
         onQueue={queueMessage}
         onSendNow={(t) => {
           post({ type: "send_now", text: t });
           resumeFollowing(containerRef.current?.querySelector(".message-list"));
         }}
         history={history}
-        queueCount={queue.length}
+        // `↑` takes back only what is held: a message sent into the turn may already be read.
+        queueCount={heldCount(queue)}
         onTakeBackQueue={() => post({ type: "take_back_queue" })}
         queueTaken={queueTaken}
         onHistoryPush={(t) => postToRust({ type: "history_push", request_id: nextRequestId(), text: t })}

@@ -46,6 +46,9 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             // `build_create_request` sends AUTO for `cli_permission_mode` when the handshake
             // offers both `cli_auto_mode` and `permission_defer`.
             cli_permission_mode: claude_runtime_protocol::v1::CliPermissionMode::Auto as i32,
+            // `accept_unsupported_cli: false` preserves the value sent by clients
+            // that predate this field.
+            accept_unsupported_cli: false,
         }),
         // Absent `model`, `effort`, `system_prompt` and `output_format` use the CLI defaults.
         // This smoke test does not exercise these options.

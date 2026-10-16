@@ -839,8 +839,13 @@ impl AgentConversation {
         self.ingest.stats()
     }
 
+    /// What the provider said it can do when it connected, with `steer` asked again: a provider may
+    /// learn mid-session that its agent cannot take messages while a turn runs.
     pub fn capabilities(&self) -> ProviderCapabilities {
-        self.capabilities
+        ProviderCapabilities {
+            steer: self.steers(),
+            ..self.capabilities
+        }
     }
 
     /// Whether this session can be continued later, as its provider said when it connected: an external
@@ -987,6 +992,54 @@ impl AgentConversation {
         }
         let session_id = self.require_session()?;
         self.provider.interrupt_turn(InterruptTurnRequest { session_id })?;
+        Ok(())
+    }
+
+    /// Whether this conversation's provider can put a message into the running turn (capability
+    /// `steer`). Asked of the provider each time: one may learn mid-session that its agent cannot.
+    pub fn steers(&self) -> bool {
+        self.provider.capabilities().steer
+    }
+
+    /// Puts one user message into the running turn without interrupting it
+    /// (`AgentProvider::steer_turn`), naming `expected_turn_id`, the turn the user saw running, so a turn
+    /// that has ended or changed by the time the message arrives refuses it. `Ok` means sent: whether
+    /// the agent read it comes back as `UserMessageDelivered` or `UserMessageDropped`. Refused here,
+    /// nothing sent, when this side's projection shows no turn or another one, or the provider lacks the
+    /// capability.
+    pub fn steer_turn(
+        &self,
+        expected_turn_id: &str,
+        client_message_id: &str,
+        text: &str,
+        as_typed: &str,
+    ) -> Result<(), ConversationError> {
+        if !self.steers() {
+            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
+                "steer",
+            )));
+        }
+        let running = self.projection().active_turn_id.clone();
+        if running.as_deref() != Some(expected_turn_id) {
+            let message = if running.is_some() {
+                "the turn it was typed in has ended"
+            } else {
+                "no turn is running"
+            };
+            return Err(ConversationError::Provider(ProviderError::Provider {
+                code: crate::ProviderErrorCode::NoActiveTurn,
+                message: message.to_string(),
+            }));
+        }
+        let expected_turn_id = expected_turn_id.to_string();
+        let session_id = self.require_session()?;
+        self.provider.steer_turn(crate::provider::SteerTurnRequest {
+            session_id,
+            expected_turn_id,
+            client_message_id: client_message_id.to_string(),
+            text: text.to_string(),
+            as_typed: as_typed.to_string(),
+        })?;
         Ok(())
     }
 
@@ -1169,6 +1222,7 @@ mod tests {
                     fork: false,
                     interrupt: true,
                     bypass_permission_mode: true,
+                    steer: false,
                 },
                 ..Default::default()
             }
@@ -1476,6 +1530,7 @@ mod tests {
             vec![crate::UserPromptRecord {
                 seq: 1,
                 text: "what did we say?".into(),
+                delivered: false,
             }],
             vec![crate::TranscriptMessage {
                 seq: 2,
@@ -1500,6 +1555,7 @@ mod tests {
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
+                    steer: false,
                 }
             }
             fn info(&self) -> ProviderInfo {
@@ -2361,6 +2417,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             }
         }
         fn info(&self) -> ProviderInfo {

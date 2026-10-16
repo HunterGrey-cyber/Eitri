@@ -159,8 +159,10 @@ pub struct CloseFacts {
     /// `label_name` of the tab, for the prompt.
     pub label_name: String,
     pub turn_running: bool,
-    /// Always 0 until phase 3's queue.
+    /// Messages held for the turn's end.
     pub queued: usize,
+    /// Messages sent into the running turn that the agent has not been seen to read.
+    pub steered: usize,
     pub legacy: bool,
     /// Whether there is a backend to shut down (an empty tab has none).
     pub has_backend: bool,
@@ -180,7 +182,7 @@ pub fn close_steps(facts: &CloseFacts) -> Vec<CloseStep> {
     if facts.turn_running {
         steps.push(CloseStep::Interrupt);
     }
-    if facts.queued > 0 {
+    if facts.queued + facts.steered > 0 {
         steps.push(CloseStep::QueueToHistory);
     }
     if facts.has_backend {
@@ -229,13 +231,22 @@ pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
         1 => lines.push("1 queued message goes to history".to_string()),
         n => lines.push(format!("{n} queued messages go to history")),
     }
+    match facts.steered {
+        0 => {}
+        1 => lines.push("1 message sent into the turn may not have reached the agent; it goes to history".to_string()),
+        n => lines.push(format!(
+            "{n} messages sent into the turn may not have reached the agent; they go to history"
+        )),
+    }
     if facts.legacy {
         lines.push("not resumable (legacy backend)".to_string());
     }
     lines
 }
 
-/// The window asks only if some tab is running or has a queued message.
+/// The window asks only if some tab is running or has a queued message. A message sent into a
+/// running turn but not yet read counts as queued here; the tab's close prompt distinguishes
+/// the two.
 pub fn window_close_prompt(running: usize, queued: usize) -> Option<String> {
     let mut parts = Vec::new();
     if running > 0 {
@@ -528,6 +539,7 @@ mod tests {
             label_name: "docs".into(),
             turn_running,
             queued,
+            steered: 0,
             legacy,
             has_backend: true,
         }

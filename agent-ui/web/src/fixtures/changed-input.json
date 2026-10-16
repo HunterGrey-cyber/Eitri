@@ -57,13 +57,15 @@
       "accountLimits": null,
       "activeTurnId": "t1",
       "assistantMessageOpen": false,
+      "availableCommands": null,
       "backend": "sidecar",
       "backgroundCalls": 0,
       "capabilities": {
         "bypassPermissionMode": true,
         "fork": false,
         "interrupt": true,
-        "resume": true
+        "resume": true,
+        "steer": false
       },
       "conversationId": null,
       "cwd": "/project",
@@ -94,6 +96,8 @@
       "status": {
         "kind": "running"
       },
+      "thinking": [],
+      "thinkingOpen": false,
       "toolCalls": [
         {
           "changedInput": {
@@ -118,7 +122,8 @@
     },
     "tab": 1,
     "throughRevision": 7,
-    "turnStartedAtMs": null
+    "turnStartedAtMs": null,
+    "turnTimes": []
   },
   "writtenBy": "core/src/agent_bridge.rs, tests::the_changed_input_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
 }

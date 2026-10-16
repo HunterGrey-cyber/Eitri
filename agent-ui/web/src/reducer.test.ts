@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyCallNotes, applyEvent, applySnapshot, keepAfterFailure, initialState, MAX_HELD_DENIALS, resetToStartScreen } from "./reducer";
+import { applyCallNotes, applyEvent, applyEvents, applySnapshot, keepAfterFailure, initialState, MAX_HELD_DENIALS, resetToStartScreen } from "./reducer";
 import type { AgentDomainEvent, AgentUiSnapshot, TurnEndDetail, TurnOutcome, UsageInfo } from "./types";
 /** What Rust really sends for the turn-ending cases; written from its serializer. */
 import fixture from "./fixtures/turn-endings.json";
@@ -205,16 +205,34 @@ describe("applyEvent", () => {
   });
 
   // The mode lives on the tab in the `tabs` envelope, outside this per-session projection. This
-  // known event returns the state unchanged and must not trigger the exhaustiveness warning.
-  it("permission_mode_changed returns the state unchanged and does not warn", () => {
+  // known event advances `nextSeq` without changing other state and must not trigger the
+  // exhaustiveness warning.
+  it("permission_mode_changed changes nothing but nextSeq and does not warn", () => {
     const consoleWarn = console.warn;
     let warned = false;
     console.warn = () => { warned = true; };
     const before = applyEvent(initialState(), { type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
     const after = applyEvent(before, { type: "permission_mode_changed", mode: "bypass", provider_mode: "BYPASS_PERMISSIONS", floor_applied: false });
-    expect(after).toBe(before);
+    expect(after).toEqual({ ...before, nextSeq: before.nextSeq + 1 });
     expect(warned).toBe(false);
     console.warn = consoleWarn;
+  });
+
+  // Rust's projection bumps `last_revision` once for every event, a mode change included, and a turn's
+  // footer is placed by a seq Rust names: an item folded after a mode change must get Rust's number.
+  it("an item after a permission_mode_changed takes the seq Rust gives it (one per event)", () => {
+    const events: AgentDomainEvent[] = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "permission_mode_changed", mode: "bypass", provider_mode: "BYPASS_PERMISSIONS", floor_applied: false },
+      { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" },
+      { type: "permission_mode_changed", mode: "auto", provider_mode: "DEFAULT", floor_applied: false },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "c1", name: "Read", input: {} },
+    ] as AgentDomainEvent[];
+    const one = events.reduce(applyEvent, initialState());
+    expect(one.thinking.map((t) => t.seq)).toEqual([2]);
+    expect(one.toolCalls.map((c) => c.seq)).toEqual([4]);
+    expect(one.nextSeq).toBe(events.length);
+    expect(applyEvents(initialState(), events)).toEqual(one);
   });
 
   it("permission_requested pushes onto pendingPermissions without clearing prior entries", () => {
@@ -581,18 +599,18 @@ describe("turnThinking", () => {
     expect(state.turnThinking).toBe(true);
   });
 
-  it("a REPEATED thinking delta returns the exact same object -- the re-render guard", () => {
+  it("a repeated thinking delta keeps the bit and appends its text, advancing nextSeq like any other event", () => {
+    // It used to return the very same object, so a turn that merely kept thinking cost no render. The
+    // text is drawn now, so the fold must carry it; a batch of them is still one fold and one render
+    // (`applyEvents`).
     const first = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
-    const second = applyEvent(first, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "still going" });
-    // Use `toBe` to require the same object and avoid another render for repeated thinking deltas.
-    // `toEqual` would also accept a fresh object with equal values and miss that extra render.
-    expect(second).toBe(first);
+    const second = applyEvent(first, { type: "content_delta", turn_id: "t1", kind: "thinking", text: " still going" });
+    expect(second.turnThinking).toBe(true);
+    expect(second.thinking).toEqual([{ seq: 0, turnId: "t1", text: "hmm still going" }]);
+    expect(second.nextSeq).toBe(first.nextSeq + 1);
   });
 
-  it("a single (non-repeated) thinking delta still advances nextSeq like any other event", () => {
-    // Only a REPEAT is free. The first thinking delta from a fresh state creates no item but is
-    // still a real occurrence -- this is `reducer.test.ts`'s existing "seq assignment" invariant,
-    // restated here so the two guards cannot silently disagree about the boundary between them.
+  it("a single thinking delta advances nextSeq like any other event", () => {
     const before = initialState().nextSeq;
     const state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
     expect(state.nextSeq).toBe(before + 1);
@@ -609,7 +627,7 @@ describe("turnThinking", () => {
     expect(state.transcript).toEqual([]);
     expect(state.assistantMessageOpen).toBe(false);
     // It is still a real, ordered occurrence, so it consumes a revision exactly like any other
-    // event that creates nothing -- only a REPEATED thinking delta is free.
+    // event that creates nothing.
     expect(state.nextSeq).toBe(initialState().nextSeq + 1);
   });
 
@@ -898,6 +916,36 @@ describe("the commands an agent left running", () => {
     // Another tab's snapshot without one is a tab with none.
     const { backgroundCalls: _b, ...old } = snapshot;
     expect(applySnapshot(counted, old as typeof snapshot, 4).backgroundCalls).toBe(0);
+  });
+});
+
+describe("the slash commands an agent listed", () => {
+  it("commands_available replaces the whole list, as Rust's fold does, and a snapshot carries it", () => {
+    expect(initialState().availableCommands).toBeNull();
+    let state = applyEvent(initialState(), {
+      type: "commands_available",
+      commands: [{ name: "web", description: "Search the web", hint: "query" }, { name: "test", description: "" }],
+    });
+    expect(state.availableCommands).toEqual([{ name: "web", description: "Search the web", hint: "query" }, { name: "test", description: "" }]);
+    state = applyEvent(state, { type: "commands_available", commands: [{ name: "plan", description: "Plan" }] });
+    expect(state.availableCommands).toEqual([{ name: "plan", description: "Plan" }]);
+    const emptied = applyEvent(state, { type: "commands_available", commands: [] });
+    expect(emptied.availableCommands, "an empty list withdraws them; it is not 'no report'").toEqual([]);
+
+    const { nextSeq: _n, turnThinking: _t, denialsBeforeTheirCall: _d, ...snapshot } = state;
+    expect(applySnapshot(initialState(), snapshot, 4).availableCommands).toEqual([{ name: "plan", description: "Plan" }]);
+    // Another tab's snapshot without the key, or with a null, is a tab that listed none.
+    const { availableCommands: _a, ...old } = snapshot;
+    expect(applySnapshot(state, old as typeof snapshot, 4).availableCommands).toBeNull();
+    expect(applySnapshot(state, { ...snapshot, availableCommands: null }, 4).availableCommands).toBeNull();
+  });
+
+  it("holds what an agent said to the page's bounds again", () => {
+    const state = applyEvent(initialState(), {
+      type: "commands_available",
+      commands: [{ name: "ok", description: "line one\nline two" }, { name: "bad name", description: "x" }],
+    });
+    expect(state.availableCommands).toEqual([{ name: "ok", description: "line one line two" }]);
   });
 });
 
@@ -1198,6 +1246,70 @@ describe("turn endings", () => {
         expect(loaded.turnEndings).toEqual(state.turnEndings);
         expect(loaded.nextSeq).toBe(state.nextSeq);
       });
+    }
+  });
+});
+
+describe("applyEvents folds a batch exactly as one event at a time, over every kind of event", () => {
+  /** A small seeded generator, so a failure names its seed and reproduces. */
+  function rng(seed: number) {
+    let s = seed >>> 0;
+    return () => {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      return s / 2 ** 32;
+    };
+  }
+
+  function randomEvents(r: () => number, n: number): AgentDomainEvent[] {
+    const out: AgentDomainEvent[] = [];
+    let turn = 0;
+    let call = 0;
+    let msg = 0;
+    const pick = <T,>(xs: T[]) => xs[Math.floor(r() * xs.length)];
+    for (let i = 0; i < n; i++) {
+      const k = r();
+      const tid = `t${turn}`;
+      if (k < 0.25) out.push({ type: "content_delta", turn_id: pick([tid, `t${turn + 1}`]), kind: "thinking", text: pick(["", "a", "b\n"]) });
+      else if (k < 0.45) out.push({ type: "content_delta", turn_id: pick([tid, `t${turn + 1}`]), kind: "text", text: pick(["", "x", "y "]) });
+      else if (k < 0.5) out.push({ type: "user_message_delivered", client_message_id: `m${msg++}`, turn_id: tid, text: "steer" });
+      else if (k < 0.55) out.push({ type: "user_message_dropped", client_message_id: `m${msg++}`, reason: "r" });
+      else if (k < 0.58) out.push({ type: "commands_available", commands: [{ name: "a", description: "" }] });
+      else if (k < 0.63) out.push({ type: "tool_call_started", turn_id: tid, tool_use_id: `c${call++}`, name: "Read", input: {} });
+      else if (k < 0.68) out.push({ type: "tool_call_completed", turn_id: tid, tool_use_id: `c${Math.max(0, call - 1)}`, content: "ok", is_error: false });
+      else if (k < 0.72) out.push({ type: "assistant_message_boundary", turn_id: tid });
+      else if (k < 0.76) out.push({ type: "turn_started", turn_id: `t${++turn}` });
+      else if (k < 0.8)
+        out.push({
+          type: "turn_completed",
+          turn_id: tid,
+          outcome: "completed",
+          result_text: "",
+          stop_reason: null,
+          usage: null,
+          detail: { reason: null, api_error_status: null, message: null },
+        });
+      else if (k < 0.84) out.push({ type: "user_prompt_submitted", text: "p" });
+      else if (k < 0.88) out.push({ type: "background_calls", running: 1 });
+      else if (k < 0.91) out.push({ type: "permission_mode_changed", mode: "auto", provider_mode: "default", floor_applied: false });
+      else out.push({ type: "content_delta", turn_id: tid, kind: "thinking", text: "z" });
+    }
+    return out;
+  }
+
+  it("for 500 seeded sequences split into random batches", () => {
+    for (let seed = 1; seed <= 500; seed++) {
+      const r = rng(seed);
+      const events = randomEvents(r, 40);
+      const one = events.reduce(applyEvent, initialState());
+      let batched = initialState();
+      for (let i = 0; i < events.length; ) {
+        const len = 1 + Math.floor(r() * 12);
+        batched = applyEvents(batched, events.slice(i, i + len));
+        i += len;
+      }
+      expect(batched, `seed ${seed}`).toEqual(one);
+      // Rust numbers every event once: the page's counter is the number of events folded.
+      expect(one.nextSeq, `seed ${seed}`).toBe(events.length);
     }
   });
 });

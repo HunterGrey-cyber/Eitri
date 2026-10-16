@@ -56,25 +56,16 @@ function renderComposerWithRerender(overrides: Overrides = {}) {
   };
 }
 
-/** The bare shell-prompt glyph replaces the bordered box. */
+/** The composer is a rounded card (`index.css`), and the card is its mark: no shell-prompt glyph is drawn
+ *  in front of the box, in either mode or after the session ends. */
 describe("Composer's prompt glyph", () => {
-  /** `mock: bottom.html` B draws `❯ Ask the agent…` in BROWSE too; until the r2-gui GUI pass
-   *  (2026-09-26) BROWSE kept the old bordered box with no glyph, so the bottom changed shape on
-   *  every `i` and `Esc`. */
-  it("draws ❯ right before the textarea in INPUT, and before the stand-in in BROWSE", () => {
-    const { container } = renderComposer();
-    const prompt = container.querySelector(".composer-prompt")!;
-    expect(prompt.textContent).toBe("❯");
-    expect(prompt.compareDocumentPosition(container.querySelector("textarea")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    cleanup();
-    const browse = renderComposer({ mode: "browse" });
-    const glyph = browse.container.querySelector(".composer-prompt")!;
-    expect(glyph.textContent).toBe("❯");
-    expect(glyph.compareDocumentPosition(browse.container.querySelector(".composer-browse-hint")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  });
-  it("draws no glyph for a session that has ended: there is no prompt to type at", () => {
-    const { container } = renderComposer({ mode: "browse", sessionEnded: true });
-    expect(container.querySelector(".composer-prompt")).toBeNull();
+  it("draws no glyph before the textarea in INPUT, the stand-in in BROWSE, or an ended session's line", () => {
+    for (const overrides of [{}, { mode: "browse" as const }, { mode: "browse" as const, sessionEnded: true }]) {
+      const { container } = renderComposer(overrides);
+      expect(container.querySelector(".composer-prompt")).toBeNull();
+      expect(container.textContent).not.toContain("❯");
+      cleanup();
+    }
   });
 });
 
@@ -127,9 +118,10 @@ describe("Composer on a session that has ended", () => {
     expect(textarea.disabled).toBe(true);
   });
 
-  it("keeps the ordinary prompt while the session is alive", () => {
+  it("draws no grey prompt in an ordinary empty box, and opens one line tall", () => {
     const { textarea } = renderComposer();
-    expect(textarea.placeholder).toBe("Ask the agent...");
+    expect(textarea.placeholder).toBe("");
+    expect(textarea.rows).toBe(1);
   });
 });
 
@@ -269,9 +261,9 @@ describe("Composer's BROWSE/INPUT split", () => {
   it("shows an empty-looking box instead of a textarea in BROWSE, with the C1b/S3 hint after it", () => {
     const { container } = renderComposer({ mode: "browse" });
     expect(container.querySelector("textarea")).toBeNull();
-    // The stand-in shows the placeholder followed by a dim typing hint. `i`, a click and Tab still
-    // enter INPUT.
-    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent... — i or Ctrl+j to type");
+    // The stand-in shows the placeholder with the key at its right end (`.composer-key`). `i`, a
+    // click and Tab still enter INPUT.
+    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...i");
   });
 
   it("takes focus back when asked, even if it is already mounted", () => {
@@ -315,34 +307,42 @@ describe("Composer's BROWSE/INPUT split", () => {
 /** C1b/S3: the dim `i or Ctrl+j to type` that follows the placeholder or the draft in
  *  BROWSE, restoring what 2026-09-19 removed once that removal's own premise (`Ctrl+l` opening the
  *  composer directly) ended. */
+/* C1b/S3 restored a reminder of the way in; since 2026-10-15 it is the key alone at the box's right end, as
+   the start screen's menu shows its keys, not the sentence "i or Ctrl+j to type" after the placeholder. */
 describe("Composer's BROWSE hint (C1b/S3)", () => {
-  it("shows the hint after the placeholder, with nothing typed", () => {
+  it("shows the key at the right end, with nothing typed, and no sentence", () => {
     const { container } = renderComposer({ mode: "browse" });
-    expect(container.querySelector(".composer-hint")!.textContent).toBe(" — i or Ctrl+j to type");
+    expect(container.querySelector(".composer-key")!.textContent).toBe("i");
+    expect(container.textContent).not.toContain("Ctrl+j to type");
   });
 
-  it("shows the same hint after an unsent draft too", () => {
+  it("shows the same key after an unsent draft too", () => {
     const { container } = renderComposer({ mode: "browse", restoredDraft: { text: "half a thought", seq: 1 } });
     const hint = container.querySelector(".composer-browse-hint")!;
     expect(hint.querySelector(".composer-draft")).not.toBeNull();
-    expect(hint.querySelector(".composer-hint")!.textContent).toBe(" — i or Ctrl+j to type");
+    expect(hint.querySelector(".composer-key")!.textContent).toBe("i");
+  });
+
+  it("names another key where the host says so", () => {
+    const { container } = renderComposer({ mode: "browse", browseKey: "a" });
+    expect(container.querySelector(".composer-key")!.textContent).toBe("a");
   });
 
   it("is not shown in INPUT -- the caret is the sign there", () => {
     const { container } = renderComposer({ mode: "input" });
-    expect(container.querySelector(".composer-hint")).toBeNull();
+    expect(container.querySelector(".composer-key")).toBeNull();
   });
 
   it("is not shown on a session that has ended -- that row says r instead", () => {
     const { container } = renderComposer({ mode: "browse", sessionEnded: true });
-    expect(container.querySelector(".composer-hint")).toBeNull();
+    expect(container.querySelector(".composer-key")).toBeNull();
     // The row above says "Press r..."; the composer does not repeat it.
     expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("This session has ended.");
   });
 
   it("is not shown while a scratch round trip owns the draft (editingInNvim)", () => {
     const { container } = renderComposer({ mode: "browse", editingInNvim: true });
-    expect(container.querySelector(".composer-hint")).toBeNull();
+    expect(container.querySelector(".composer-key")).toBeNull();
   });
 });
 
@@ -398,7 +398,7 @@ describe("Composer in BROWSE (C2)", () => {
 
   it("reads like the empty box it stands in for when there is nothing typed", () => {
     const { container } = renderComposer({ mode: "browse" });
-    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent... — i or Ctrl+j to type");
+    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...i");
   });
 
   // App.tsx's document-capture router (`modeKey.ts`) handles Shift+Tab in every mode before this
@@ -410,7 +410,7 @@ describe("Composer during a turn (C1, F1)", () => {
     const onQueue = vi.fn();
     const { textarea, onSend } = renderComposer({ running: true, onQueue });
     expect(textarea.disabled).toBe(false);
-    expect(textarea.placeholder).toBe("Queue a follow-up…");
+    expect(textarea.placeholder).toBe("Enter holds it until the turn ends…");
     fireEvent.change(textarea, { target: { value: "and the tests" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onQueue).toHaveBeenCalledWith("and the tests");
@@ -645,6 +645,32 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       const { container, textarea } = renderComposer({ history: ["a"] });
       fireEvent.keyDown(textarea, { key: "r", ctrlKey: true });
       expect(container.querySelector(".history-search")).not.toBeNull();
+    },
+    "/ command": () => {
+      // The menu opens on a leading slash given a command source, and not without one.
+      const commands = [{ name: "compact", description: "Free up context" }];
+      const { container, textarea } = renderComposer({ slashCommands: commands });
+      typed(textarea, "/co");
+      expect(container.querySelector(".slash-menu")).not.toBeNull();
+      cleanup();
+      const bare = renderComposer();
+      typed(bare.textarea, "/co");
+      expect(bare.container.querySelector(".slash-menu")).toBeNull();
+    },
+    "Ctrl+n / Ctrl+p": () => {
+      const commands = [{ name: "compact", description: "" }, { name: "cost", description: "" }];
+      const { container, textarea } = renderComposer({ slashCommands: commands });
+      typed(textarea, "/co");
+      fireEvent.keyDown(textarea, { key: "n", ctrlKey: true });
+      expect(container.querySelector(".slash-menu-row.current")!.textContent).toContain("/cost");
+      fireEvent.keyDown(textarea, { key: "p", ctrlKey: true });
+      expect(container.querySelector(".slash-menu-row.current")!.textContent).toContain("/compact");
+    },
+    Tab: () => {
+      const { textarea } = renderComposer({ slashCommands: [{ name: "compact", description: "" }] });
+      typed(textarea, "/co");
+      fireEvent.keyDown(textarea, { key: "Tab" });
+      expect(textarea.value).toBe("/compact ");
     },
     "Ctrl+w / Ctrl+u": () => {
       const { textarea } = renderComposer();

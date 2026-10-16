@@ -92,8 +92,12 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::PolicyMismatch { .. } => "PolicyMismatch",
             AgentDomainEvent::AccountLimits { .. } => "AccountLimits",
             AgentDomainEvent::BackgroundCalls { .. } => "BackgroundCalls",
+            AgentDomainEvent::CommandsAvailable { .. } => "CommandsAvailable",
             // Derived by ingestion, never read off the wire: matched for exhaustiveness.
             AgentDomainEvent::ToolInputChanged { .. } => "ToolInputChanged",
+            // No Claude provider puts a message into a running turn yet: matched for exhaustiveness.
+            AgentDomainEvent::UserMessageDelivered { .. } => "UserMessageDelivered",
+            AgentDomainEvent::UserMessageDropped { .. } => "UserMessageDropped",
         };
         *counts.entry(kind).or_default() += 1;
     }

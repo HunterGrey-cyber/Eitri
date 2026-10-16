@@ -9,10 +9,10 @@ type Props = {
   clock: TurnClock | null;
 };
 
-/** Show activity for a turn while the caller's `ActivityLine.working` predicate is true.
+/** Show the phase word and elapsed clock while the caller's `ActivityLine.working` predicate is true.
  * This component relies on the caller to determine whether a turn is in flight.
- * Withhold `.meter` and `.meter-fill` while `phase.kind === "blocked"` because permission is pending
- * and the agent is not working. The phase word and elapsed clock still render. */
+ * `ActivityLine` supplies the motion through its star, which holds still while `phase.kind === "blocked"`
+ * because permission is pending and the agent is not working. The phase word and clock still render. */
 export function TurnActivity({ phase, clock }: Props) {
   // Tick once a second in this component so the elapsed clock does not re-render the whole panel
   // on top of streaming updates. The state value is unused; it only forces `elapsed` to be
@@ -31,11 +31,6 @@ export function TurnActivity({ phase, clock }: Props) {
 
   return (
     <span className="turn-activity" data-phase={phase.kind}>
-      {phase.kind !== "blocked" && (
-        <span className="meter" aria-hidden="true">
-          <span className="meter-fill" />
-        </span>
-      )}
       <span className="turn-state">{phaseWord(phase)}</span>
       {elapsed !== null && <span className="turn-elapsed">{elapsed}</span>}
     </span>

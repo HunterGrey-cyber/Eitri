@@ -66,7 +66,7 @@ it("draws mode with data-mode and data-focused, dim when the pane lacks the keys
   const mode = container.querySelector<HTMLElement>('[data-testid="mode-block"]')!;
   expect(mode.dataset.mode).toBe("input");
   expect(mode.dataset.focused).toBe("true");
-  expect(mode.textContent).toBe("INPUT");
+  expect(mode.textContent).toBe("INSERT");
 });
 
 it("draws the mode glyph in its own span, named for the permission mode", () => {

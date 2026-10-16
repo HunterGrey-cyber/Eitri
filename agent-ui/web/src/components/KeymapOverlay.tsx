@@ -3,6 +3,7 @@ import { browseKeys, CARET_KEYS, INPUT_KEYS, REVIEW_KEYS, VISUAL_KEYS } from "..
 import type { KeyHelp, PanelBinding, PanelTable } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
+import { MODE_CONSEQUENCE, modeConsequence } from "./Dashboard";
 
 type Props = {
   /** Requested by a backdrop click only -- `App.tsx` owns `?`/`Escape`/`q`, which it intercepts
@@ -24,6 +25,9 @@ type Props = {
   companion?: boolean;
   /** Whether the Slash commands section is drawn: they are Claude Code's, so another agent's tab has none. */
   claudeSlashCommands?: boolean;
+  /** The word for the active tab's agent when it is not Claude (`agentTitle`), for what manual means on its
+   *  tab: another agent runs what its own sandbox allows without asking anyone. `null`/absent for Claude. */
+  agent?: string | null;
 };
 
 /** One of the four groups, rendered from the same tables `keymap.test.ts` binds to
@@ -205,7 +209,7 @@ function SlashCommands() {
  * fires it.
  */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true },
+  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null },
   ref,
 ) {
   return (
@@ -222,11 +226,12 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           than to `BROWSE_KEYS`, which tests tie to `resolveKey` in both directions. The Typing
           section likewise adds GTK-handled keys separately. `Ctrl+[` is handled by the
           `../ctrlBracket` document listener, so describe it in the note rather than as a
-          `BROWSE_KEYS` row. */}
+          `BROWSE_KEYS` row. The note also explains each permission mode; the status band names
+          the active mode. */}
       <Section
         title="This panel"
         rows={[...browseKeys(prefixLabel), { keys: "Ctrl+j", what: "Type (the box below)" }]}
-        note="Ctrl+[ is Esc everywhere in this panel."
+        note={`Ctrl+[ is Esc everywhere in this panel. Modes (Shift+Tab): manual — ${modeConsequence("manual", agent, prefixLabel)} auto — ${MODE_CONSEQUENCE.auto} bypass — ${MODE_CONSEQUENCE.bypass}`}
       />
       <Selecting panel={panel} />
       {/* The review overlay (`c`): its keys are `./review`'s, not `resolveKey`'s, so they are a section of
@@ -241,8 +246,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           an `INPUT_KEYS` binding handled by `resolveKey`. `compose_turn_text` adds the editor's
           file name or its live Visual selection. `feed.rs` omits the cursor line. Selection
           limits are `MAX_SELECTION_LINES = 400` and `CONTENT_LIMIT = 2000`.
-          `CLI_LOCAL_COMMANDS`, including bare `/model` and `/effort`, omit the context block.
-          `Dashboard.tsx` gives the shorter form in `.dash-context`. */}
+          `CLI_LOCAL_COMMANDS`, including bare `/model` and `/effort`, omit the context block. */}
       <Section
         title="Typing"
         note="Enter also sends the editor's file name — not its text or cursor — or the lines selected there in Visual mode (up to 400 lines and 2000 characters). /model, /effort and the CLI's other local commands go without it."

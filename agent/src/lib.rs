@@ -95,16 +95,16 @@ pub const LEGACY_NOT_IN_BUILD: &str =
     "the legacy backend is not in this build (it is development-only: build with --features shell/legacy-backend)";
 
 pub use projection::{
-    describe_failed_resume, AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice,
-    HistorySource, InputChange, MatchedAskRule, PermissionOutcome, PermissionRequestRecord, ProjectionStatus,
-    ProviderPrompt, ResumeStatus, TokenUsage, ToolCallDenial, ToolCallRecord, ToolCallResult, TranscriptMessage,
-    TurnEndDetail, TurnEndingKind, TurnEndingRecord, TurnOutcome, UngatedCliModeRecord, UsageInfo, UserPromptRecord,
-    MAX_TURN_END_MESSAGE_CHARS,
+    describe_failed_resume, thinking_open_after, AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection,
+    ContentKind, HistoryNotice, HistorySource, InputChange, MatchedAskRule, PermissionOutcome, PermissionRequestRecord,
+    ProjectionStatus, ProviderPrompt, ResumeStatus, SlashCommand, SteerOutcome, ThinkingBlock, TokenUsage,
+    ToolCallDenial, ToolCallRecord, ToolCallResult, TranscriptMessage, TurnEndDetail, TurnEndingKind, TurnEndingRecord,
+    TurnOutcome, UngatedCliModeRecord, UsageInfo, UserPromptRecord, MAX_STEER_OUTCOMES, MAX_TURN_END_MESSAGE_CHARS,
 };
 pub use provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, EventSignal, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
-    ResumeSessionRequest, SendTurnRequest, StreamingPreference,
+    ResumeSessionRequest, SendTurnRequest, SteerTurnRequest, StreamingPreference,
 };
 pub use providers::claude_sidecar::{
     sidecar_availability, sidecar_missing_message, user_sidecar_path, BackpressureStats, ClaudeSidecarProvider,

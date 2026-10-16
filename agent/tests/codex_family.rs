@@ -1772,3 +1772,44 @@ fn a_child_that_does_not_end_after_its_interrupt_stops_the_session_and_the_turn_
     assert_eq!(turn, "t1");
     assert_eq!(outcome, TurnOutcome::Interrupted, "{events:#?}");
 }
+
+/// A turn a subagent opened has nothing on the tab's own thread to take a message: it is refused unsent,
+/// saying so, rather than sent to Codex to be refused as "no active turn".
+#[test]
+fn a_message_while_only_a_subagent_runs_is_refused_unsent() {
+    let (provider, thread) = running(
+        "th-sub",
+        "t-own",
+        vec![
+            announce("th-sub", "t-own", "child", "/root/child"),
+            turn_started("child", "c-1"),
+            turn_completed("child", "c-1", "completed"),
+            turn_completed("th-sub", "t-own", "completed"),
+            json!({"sleep_ms": 100}),
+            turn_started("child", "c-2"),
+            json!({"sleep_ms": 1500}),
+            turn_completed("child", "c-2", "completed"),
+        ],
+    );
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnStarted { turn_id } if turn_id == "c-2"))
+    });
+    assert!(events.iter().any(is_completed), "the tab's own turn ended first");
+    let refused = provider.steer_turn(agent::SteerTurnRequest {
+        session_id: thread.clone(),
+        expected_turn_id: "c-2".into(),
+        client_message_id: "m1".into(),
+        text: "x".into(),
+        as_typed: "x".into(),
+    });
+    match refused {
+        Err(ProviderError::Provider { code, message }) => {
+            assert_eq!(code, agent::ProviderErrorCode::NoActiveTurn);
+            assert_eq!(message, "only a subagent is running");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    until_turn_completed(&provider);
+}

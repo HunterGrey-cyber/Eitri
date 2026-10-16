@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=21d0f43f7b0b558e189772d9abe48431a491ef24fddf6b3bf9d9e0537ea43c0e -->
+<!-- translated-from: configuration.md sha256=1845c21ba889a0dc8ac36dbc3bfacee50fa3c059957a059ace8c39c26b1e5e22 -->
 
 # 配置
 
@@ -31,12 +31,13 @@ eitri.config.set("review.hint", true)
 | 键 | 值 | 默认值 | 作用 |
 |---|---|---|---|
 | `agent.account` | 一个账号名 | 未设置 | 这个窗口使用的 Claude 账号。见[账号](#accounts)。 |
-| `agent.font_size` | 9 到 32 之间的数字 | `14` | agent 面板的文字大小，单位是像素。 |
+| `agent.font_size` | 9 到 32 之间的数字 | 编辑器的字号 | agent 面板的文字大小，单位是像素。不设置时，面板文字和编辑器（`guifont`）一样大，两边对齐。 |
 | `agent.typing_cadence_hz` | 1 到 60 之间的整数，或 `"off"` | `5` | 你在编辑器里输入时，agent 面板每秒最多允许更新多少次。稳定的较慢频率可以避免面板在你输入时重绘；`"off"` 让它全速更新。 |
 | `agent.default` | `"claude"`、`"codex"`，或用 `eitri.agent.register` 注册的 agent 的名字 | `"claude"` | 新标签页，以及新窗口的第一个标签页，运行哪个 agent。见 [Codex 与其他 agent](agents.zh-CN.md)。 |
 | `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`。带目录部分的相对路径会让 Eitri 在启动时停下。 |
 | `agent.default_mode` | `"manual"`、`"auto"` 或 `"bypass"` | `"auto"` | 新标签页开始时所处的模式。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.restore` | `"offer"`、`"auto"` 或 `"off"` | `"offer"` | 对这个项目上一个窗口里开着的标签页怎么办。见[一次启动怎样开始](#how-a-launch-starts)。 |
+| `agent.thinking` | `"collapsed"`、`"preview"`、`"expanded"` 或 `"hidden"` | `"collapsed"` | agent 面板怎样显示 agent 的思考过程。`"collapsed"` 每段思考画成一行不显眼的行，像工具输出一样用 `Enter` 展开；`"preview"` 在一段思考还在写的时候，另外在一个不会变高的框里显示它最新的几行；`"expanded"` 完整显示每段思考；`"hidden"` 一段也不显示。无论这里怎么设，`Ctrl+o` 都会完整显示每段思考。 |
 | `agent.user_settings` | `true` 或 `false` | `true` | agent 会话是否加载你自己的 Claude Code 配置（你的 hook、插件、skill、`CLAUDE.md` 和权限规则），和终端里的 `claude` 一样。`false` 把你自己的配置排除在外；项目自己的配置由[信任](permissions.zh-CN.md)管，不由这个键管。 |
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
 | `review.enabled` | `true` 或 `false` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |

@@ -71,6 +71,7 @@ impl AgentProvider for ScriptedProvider {
             bypass_permission_mode: true,
             interactive_permission_mode: true,
             cli_auto_mode: false,
+            steer: false,
         }
     }
     fn info(&self) -> ProviderInfo {

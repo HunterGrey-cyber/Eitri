@@ -142,19 +142,20 @@ describe("the start screen", () => {
     const { container } = fresh("codex");
     expect(container.querySelector(".dash-where")!.textContent).toContain("Codex");
     expect(container.querySelector(".dash-where")!.textContent).not.toContain("team");
-    expect(container.textContent).toContain("New Codex session");
+    // Since 2026-10-15 the New session row is the box itself, so the where-line is what names the agent.
+    expect(container.querySelector(".dash-input .composer")).not.toBeNull();
   });
 
   it("names the registered name of an ACP agent", () => {
     const { container } = fresh("acp:gem");
     expect(container.querySelector(".dash-where")!.textContent).toContain("gem");
-    expect(container.textContent).toContain("New gem session");
+    expect(container.querySelector(".dash-input .composer")).not.toBeNull();
   });
 
   it("leaves a Claude tab as it was", () => {
     const { container } = fresh("claude");
     expect(container.querySelector(".dash-where")!.textContent).toBe("~/project · team");
-    expect(container.textContent).toContain("New session");
+    expect(container.querySelector(".dash-input .composer")).not.toBeNull();
   });
 
   it("opens the command line on a colon, so :tabnew codex works from a fresh window", () => {

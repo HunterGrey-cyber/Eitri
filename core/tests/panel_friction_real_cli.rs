@@ -117,6 +117,7 @@ fn a_queued_message_goes_out_after_an_interrupt() {
         "Now reply with exactly QUEUED-OK and nothing else.",
         "Now reply with exactly QUEUED-OK and nothing else.".into(),
         1,
+        true,
     )
     .unwrap();
     match set.send_now(tab, "", String::new(), 2).unwrap() {

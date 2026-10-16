@@ -40,10 +40,10 @@ pub const CADENCE_HZ_RANGE: RangeInclusive<u32> = 1..=60;
 /// How long after an editor key the user counts as typing.
 pub const TYPING_WINDOW: Duration = Duration::from_millis(500);
 
-/// The shortest interval between two repaints the page drives by itself: its turn meter
-/// (`agent-ui/web/src/index.css`, `turn-meter` over 1200 ms in 4 steps) holds each state for
+/// The shortest interval between two repaints the page drives by itself: the activity line's star
+/// (`agent-ui/web/src/index.css`, `turn-breath` over 1200 ms in 4 steps) holds each state for
 /// 300 ms. A cadence whose period is at least this needs no help from the page; a slower one asks
-/// the page to slow its meter down to the cadence (`editor_typing`,
+/// the page to slow its star down to the cadence (`editor_typing`,
 /// `agent-ui/web/src/typingCadence.ts`). `indexCss.test.ts` holds this equal to the stylesheet's.
 pub const SELF_DRIVEN_STEP_MS: u32 = 300;
 
@@ -130,9 +130,13 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         // A tripwire and a limit change state the user may act on, so neither waits for a slot.
         AgentDomainEvent::PolicyMismatch { .. }
         | AgentDomainEvent::AccountLimits { .. }
-        | AgentDomainEvent::BackgroundCalls { .. } => false,
+        | AgentDomainEvent::BackgroundCalls { .. }
+        | AgentDomainEvent::CommandsAvailable { .. } => false,
         // It travels with the CLI's own prompt (a card), and says the card is for another input.
         AgentDomainEvent::ToolInputChanged { .. } => false,
+        // A message the user put into the running turn reached the agent or came back: its row and
+        // the line above the box change together, so neither waits for a slot.
+        AgentDomainEvent::UserMessageDelivered { .. } | AgentDomainEvent::UserMessageDropped { .. } => false,
     }
 }
 
@@ -171,7 +175,7 @@ impl<T> PanelCadence<T> {
     }
 
     /// The period in milliseconds when the page has to be told the user is typing: its own repaints
-    /// (the turn meter's step, [`SELF_DRIVEN_STEP_MS`]) are then faster than this cadence and would
+    /// (the activity star's step, [`SELF_DRIVEN_STEP_MS`]) are then faster than this cadence and would
     /// add frame-clock cycles the pacing removes elsewhere. `None` when they are already no faster
     /// (every cadence of 4/s or more) or pacing is off -- then telling the page would only cost the two
     /// repaints the message itself causes per typing burst.
@@ -435,7 +439,7 @@ mod tests {
     #[test]
     fn the_page_is_told_about_typing_only_when_its_own_motion_would_outpace_the_cadence() {
         let needs = |hz: Option<u32>| PanelCadence::<String>::new(hz).page_needs_typing_state();
-        // The meter holds each state for 300 ms: a cadence of 4/s (250 ms) or faster already
+        // The star holds each state for 300 ms: a cadence of 4/s (250 ms) or faster already
         // covers it; 3/s (333 ms) and slower would be outpaced by it.
         assert_eq!(needs(Some(8)), None);
         assert_eq!(needs(Some(60)), None);

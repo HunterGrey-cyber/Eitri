@@ -1,6 +1,6 @@
 use agent::{
-    AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus, TokenUsage,
-    TurnEndDetail, TurnEndingKind, TurnOutcome, UsageInfo,
+    thinking_open_after, AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionMode, PermissionOutcome,
+    ProjectionStatus, ResumeStatus, TokenUsage, TurnEndDetail, TurnEndingKind, TurnOutcome, UsageInfo,
 };
 use serde_json::json;
 
@@ -70,6 +70,7 @@ fn content_delta_thinking_has_no_transcript_effect_but_still_bumps_revision() {
         text: "hmm".into(),
     });
     assert!(projection.transcript.is_empty());
+    assert_eq!(projection.thinking.len(), 1);
     assert_eq!(projection.last_revision, 1);
 }
 
@@ -843,6 +844,224 @@ fn a_thinking_delta_does_not_split_the_text_around_it() {
     assert_eq!(texts(&projection), vec!["before after"]);
 }
 
+fn thinking(text: &str) -> AgentDomainEvent {
+    AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Thinking,
+        text: text.into(),
+    }
+}
+
+fn thoughts(projection: &AgentSessionProjection) -> Vec<&str> {
+    projection.thinking.iter().map(|t| t.text.as_str()).collect()
+}
+
+/// Streamed thinking is one block per run, ordered by the delta that opened it, like a streamed reply.
+#[test]
+fn consecutive_thinking_deltas_are_one_block_that_keeps_its_first_seq() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&thinking("Look at "));
+    let first = projection.thinking[0].seq;
+    projection.apply(&thinking("the parser"));
+    projection.apply(&thinking(" first.\nThen the tests."));
+    assert_eq!(
+        thoughts(&projection),
+        vec!["Look at the parser first.\nThen the tests."]
+    );
+    assert_eq!(projection.thinking[0].seq, first);
+    assert_eq!(projection.thinking[0].turn_id, "t1");
+    assert!(projection.thinking_open);
+    assert_eq!(projection.last_revision, 4, "every delta is still a revision");
+}
+
+/// A block ends where anything that ends a reply ends it, and at the reply itself; the next thought
+/// is a block of its own.
+#[test]
+fn a_thinking_block_closes_at_text_a_tool_call_a_card_and_every_boundary() {
+    let closers: Vec<(&str, AgentDomainEvent)> = vec![
+        (
+            "text",
+            AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: ContentKind::Text,
+                text: "Here is the plan.".into(),
+            },
+        ),
+        (
+            "message boundary",
+            AgentDomainEvent::AssistantMessageBoundary { turn_id: "t1".into() },
+        ),
+        (
+            "tool call",
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: "toolu_1".into(),
+                name: "Read".into(),
+                input: json!({}),
+            },
+        ),
+        (
+            "card",
+            AgentDomainEvent::PermissionRequested {
+                permission_id: "perm-1".into(),
+                tool_use_id: None,
+                tool_name: "Bash".into(),
+                input: json!({}),
+                provider_prompt: None,
+            },
+        ),
+        ("prompt", AgentDomainEvent::UserPromptSubmitted { text: "and?".into() }),
+        ("turn start", AgentDomainEvent::TurnStarted { turn_id: "t2".into() }),
+        (
+            "turn end",
+            ended("t1", TurnOutcome::Completed, TurnEndDetail::default()),
+        ),
+        (
+            "session closed",
+            AgentDomainEvent::SessionClosed {
+                reason: "closed_by_host".into(),
+            },
+        ),
+        (
+            "session lost",
+            AgentDomainEvent::SessionUnavailable {
+                reason: "the provider exited".into(),
+            },
+        ),
+    ];
+    for (name, closer) in closers {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        projection.apply(&thinking("first"));
+        projection.apply(&closer);
+        assert!(!projection.thinking_open, "{name}");
+        projection.apply(&thinking("second"));
+        assert_eq!(thoughts(&projection), vec!["first", "second"], "{name}");
+        assert!(projection.thinking[0].seq < projection.thinking[1].seq, "{name}");
+    }
+}
+
+/// What is not an item of the conversation does not cut a thought in two: a result arriving, a limit
+/// report, a card answered.
+#[test]
+fn events_that_are_not_items_leave_a_thinking_block_open() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&thinking("one "));
+    projection.apply(&AgentDomainEvent::ToolCallCompleted {
+        turn_id: "t1".into(),
+        tool_use_id: "toolu_0".into(),
+        content: json!("ok"),
+        is_error: false,
+    });
+    projection.apply(&AgentDomainEvent::AccountLimits {
+        used_percent: 12.0,
+        window_minutes: None,
+        resets_at: None,
+        plan: None,
+    });
+    projection.apply(&AgentDomainEvent::PermissionResolved {
+        permission_id: "perm-0".into(),
+        outcome: agent::PermissionOutcome::Allowed,
+    });
+    projection.apply(&AgentDomainEvent::BackgroundCalls { running: 1 });
+    projection.apply(&thinking("thought"));
+    assert_eq!(thoughts(&projection), vec!["one thought"]);
+}
+
+/// A delta with no text makes no empty row, and does not end the block it arrives in.
+#[test]
+fn an_empty_thinking_delta_opens_nothing_and_closes_nothing() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&thinking(""));
+    assert!(projection.thinking.is_empty());
+    assert!(!projection.thinking_open);
+    assert_eq!(projection.last_revision, 1);
+    projection.apply(&thinking("a"));
+    projection.apply(&thinking(""));
+    projection.apply(&thinking("b"));
+    assert_eq!(thoughts(&projection), vec!["ab"]);
+    assert!(projection.thinking_open);
+}
+
+/// Thinking takes its place in the one order: before the reply it led to, between the calls it sat
+/// between.
+#[test]
+fn thinking_blocks_are_ordered_against_every_other_item() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::UserPromptSubmitted { text: "fix it".into() });
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&thinking("read the file"));
+    projection.apply(&AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: "toolu_1".into(),
+        name: "Read".into(),
+        input: json!({}),
+    });
+    projection.apply(&thinking("now the fix"));
+    projection.apply(&thinking(" is clear"));
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "Fixed.".into(),
+    });
+
+    let mut merged: Vec<(u64, String)> = Vec::new();
+    merged.extend(
+        projection
+            .user_prompts
+            .iter()
+            .map(|p| (p.seq, format!("prompt:{}", p.text))),
+    );
+    merged.extend(
+        projection
+            .thinking
+            .iter()
+            .map(|t| (t.seq, format!("thinking:{}", t.text))),
+    );
+    merged.extend(
+        projection
+            .tool_calls
+            .iter()
+            .map(|c| (c.seq, format!("tool:{}", c.tool_use_id))),
+    );
+    merged.extend(
+        projection
+            .transcript
+            .iter()
+            .map(|m| (m.seq, format!("text:{}", m.text))),
+    );
+    merged.sort_by_key(|(seq, _)| *seq);
+    assert_eq!(
+        merged.into_iter().map(|(_, label)| label).collect::<Vec<_>>(),
+        vec![
+            "prompt:fix it".to_string(),
+            "thinking:read the file".to_string(),
+            "tool:toolu_1".to_string(),
+            "thinking:now the fix is clear".to_string(),
+            "text:Fixed.".to_string(),
+        ],
+    );
+}
+
+/// A record written before thinking was kept still reads, and a block reads back as it was written.
+#[test]
+fn a_thinking_block_round_trips_and_older_json_without_it_still_loads() {
+    let block = agent::ThinkingBlock {
+        seq: 7,
+        turn_id: "t1".into(),
+        text: "why\nbecause".into(),
+    };
+    let text = serde_json::to_string(&block).unwrap();
+    assert_eq!(serde_json::from_str::<agent::ThinkingBlock>(&text).unwrap(), block);
+    // The stored history (`history::store`) never carried thinking, and a file written by any build
+    // still loads with the three collections it has.
+    let stored = r#"{"version":1,"conversation_id":"c","provider_session_id":"p","written_at":"0","transcript":[{"seq":0,"text":"hi"}]}"#;
+    let history: agent::history::store::StoredHistory = serde_json::from_str(stored).unwrap();
+    assert_eq!(history.transcript.len(), 1);
+}
+
 /// The forbidden failure mode, at the projection level.
 ///
 /// A session that dies mid-turn used to leave `active_turn_id` set forever. Three separate surfaces
@@ -1045,6 +1264,7 @@ fn every_seq_is_strictly_below_the_revision_a_snapshot_would_report() {
         .chain(projection.tool_calls.iter().map(|c| c.seq))
         .chain(projection.pending_permissions.values().map(|p| p.seq))
         .chain(projection.turn_endings.iter().map(|e| e.seq))
+        .chain(projection.thinking.iter().map(|t| t.seq))
         .max()
         .unwrap();
     assert!(
@@ -1082,6 +1302,7 @@ fn no_single_event_ever_creates_more_than_one_item() {
             .chain(projection.tool_calls.iter().map(|c| c.seq))
             .chain(projection.pending_permissions.values().map(|p| p.seq))
             .chain(projection.turn_endings.iter().map(|e| e.seq))
+            .chain(projection.thinking.iter().map(|t| t.seq))
             .collect();
         let before_dedup = seqs.len();
         seqs.sort_unstable();
@@ -1257,6 +1478,22 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
                 clipped: false,
             },
         },
+        AgentDomainEvent::CommandsAvailable {
+            commands: vec![agent::SlashCommand {
+                name: "plan".into(),
+                description: "Plan".into(),
+                hint: None,
+            }],
+        },
+        AgentDomainEvent::UserMessageDelivered {
+            client_message_id: "eitri-1-1".into(),
+            turn_id: "t1".into(),
+            text: "and the tests".into(),
+        },
+        AgentDomainEvent::UserMessageDropped {
+            client_message_id: "eitri-1-2".into(),
+            reason: "the turn ended before the agent read it".into(),
+        },
     ]
 }
 
@@ -1293,7 +1530,10 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::PolicyMismatch { .. } => "PolicyMismatch",
         AgentDomainEvent::AccountLimits { .. } => "AccountLimits",
         AgentDomainEvent::BackgroundCalls { .. } => "BackgroundCalls",
+        AgentDomainEvent::CommandsAvailable { .. } => "CommandsAvailable",
         AgentDomainEvent::ToolInputChanged { .. } => "ToolInputChanged",
+        AgentDomainEvent::UserMessageDelivered { .. } => "UserMessageDelivered",
+        AgentDomainEvent::UserMessageDropped { .. } => "UserMessageDropped",
     }
 }
 
@@ -1369,4 +1609,243 @@ fn cost_unreported_round_trips_and_defaults_true_for_old_json() {
         serde_json::from_str(r#"{"total_cost_usd":1.5,"num_turns":3,"tokens":null,"model":null}"#).unwrap();
     assert!(old.cost_reported);
     assert_eq!(old.total_cost_usd, 1.5);
+}
+
+#[test]
+fn a_command_list_replaces_the_one_before_and_an_empty_one_withdraws_them() {
+    let command = |name: &str| agent::SlashCommand {
+        name: name.to_string(),
+        description: String::new(),
+        hint: None,
+    };
+    let mut projection = AgentSessionProjection::default();
+    assert!(
+        projection.available_commands.is_none(),
+        "no report yet is not an empty list"
+    );
+    projection.apply(&AgentDomainEvent::CommandsAvailable {
+        commands: vec![command("web"), command("test")],
+    });
+    projection.apply(&AgentDomainEvent::CommandsAvailable {
+        commands: vec![command("plan")],
+    });
+    assert_eq!(projection.available_commands, Some(vec![command("plan")]));
+    projection.apply(&AgentDomainEvent::CommandsAvailable { commands: vec![] });
+    assert_eq!(projection.available_commands, Some(vec![]));
+}
+
+/// `thinking_open_after` is what a provider reads to know whether its next thought continues the block
+/// on screen. It must say what `apply` does, event by event, from an open block and from a closed one;
+/// the one difference it allows (an attached resume) is on the side that only leaves out a separator.
+#[test]
+fn thinking_open_after_says_what_apply_does() {
+    let t = || "t1".to_string();
+    let events = vec![
+        AgentDomainEvent::SessionOpened {
+            session_id: "s".into(),
+            provider_session_id: "p".into(),
+            model: "m".into(),
+            cwd: "/".into(),
+        },
+        AgentDomainEvent::TurnStarted { turn_id: t() },
+        AgentDomainEvent::UserPromptSubmitted { text: "hi".into() },
+        AgentDomainEvent::ContentDelta {
+            turn_id: t(),
+            kind: ContentKind::Text,
+            text: "reply".into(),
+        },
+        AgentDomainEvent::ContentDelta {
+            turn_id: t(),
+            kind: ContentKind::Thinking,
+            text: "more".into(),
+        },
+        AgentDomainEvent::ContentDelta {
+            turn_id: t(),
+            kind: ContentKind::Thinking,
+            text: String::new(),
+        },
+        AgentDomainEvent::AssistantMessageBoundary { turn_id: t() },
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: t(),
+            tool_use_id: "c1".into(),
+            name: "Bash".into(),
+            input: json!({}),
+        },
+        AgentDomainEvent::ToolCallCompleted {
+            turn_id: t(),
+            tool_use_id: "c0".into(),
+            content: json!("ok"),
+            is_error: false,
+        },
+        AgentDomainEvent::PermissionRequested {
+            permission_id: "p1".into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: json!({}),
+            provider_prompt: None,
+        },
+        AgentDomainEvent::PermissionResolved {
+            permission_id: "p0".into(),
+            outcome: PermissionOutcome::Allowed,
+        },
+        AgentDomainEvent::TurnCompleted {
+            turn_id: t(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: TurnEndDetail::default(),
+        },
+        AgentDomainEvent::ResumeOutcome {
+            requested_provider_session_id: "p".into(),
+            status: ResumeStatus::Rejected,
+            attached_provider_session_id: None,
+            forked: false,
+            detail: None,
+        },
+        AgentDomainEvent::SessionUnavailable { reason: "gone".into() },
+        AgentDomainEvent::SessionClosed {
+            reason: "closed".into(),
+        },
+        AgentDomainEvent::PermissionModeChanged {
+            mode: PermissionMode::Auto,
+            provider_mode: "default".into(),
+            floor_applied: false,
+        },
+        AgentDomainEvent::UngatedCliMode {
+            reported: "x".into(),
+            detail: "y".into(),
+        },
+        AgentDomainEvent::CliPermissionMode {
+            reported: "default".into(),
+        },
+        AgentDomainEvent::PermissionDenied {
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            reason_type: None,
+            reason: None,
+        },
+        AgentDomainEvent::PolicyMismatch {
+            requested: "a".into(),
+            reported: "b".into(),
+        },
+        AgentDomainEvent::BackgroundCalls { running: 1 },
+        AgentDomainEvent::AccountLimits {
+            used_percent: 50.0,
+            window_minutes: None,
+            resets_at: None,
+            plan: None,
+        },
+        AgentDomainEvent::ToolInputChanged {
+            tool_use_id: "c1".into(),
+            change: agent::InputChange {
+                fields: serde_json::Map::new(),
+                removed: vec![],
+                clipped: false,
+            },
+        },
+        AgentDomainEvent::CommandsAvailable { commands: vec![] },
+        AgentDomainEvent::UserMessageDelivered {
+            client_message_id: "eitri-1-1".into(),
+            turn_id: t(),
+            text: "and the tests".into(),
+        },
+        AgentDomainEvent::UserMessageDropped {
+            client_message_id: "eitri-1-2".into(),
+            reason: "the turn ended before the agent read it".into(),
+        },
+    ];
+    for open in [true, false] {
+        for event in &events {
+            let mut projection = AgentSessionProjection::default();
+            projection.apply(&AgentDomainEvent::TurnStarted { turn_id: t() });
+            if open {
+                projection.apply(&AgentDomainEvent::ContentDelta {
+                    turn_id: t(),
+                    kind: ContentKind::Thinking,
+                    text: "thought".into(),
+                });
+            }
+            assert_eq!(projection.thinking_open, open);
+            projection.apply(event);
+            assert_eq!(
+                thinking_open_after(open, event),
+                projection.thinking_open,
+                "from open={open}: {event:?}"
+            );
+        }
+    }
+    // The allowed difference: an attached resume leaves the block open, and the helper calls it closed.
+    let attached = AgentDomainEvent::ResumeOutcome {
+        requested_provider_session_id: "p".into(),
+        status: ResumeStatus::Attached,
+        attached_provider_session_id: Some("p".into()),
+        forked: false,
+        detail: None,
+    };
+    assert!(!thinking_open_after(true, &attached));
+}
+
+/// A message put into the running turn is a user prompt where the agent read it, and only then; a dropped
+/// one adds nothing to the conversation. Both outcomes are kept by client id, bounded, for the host.
+#[test]
+fn a_message_put_into_the_turn_is_a_prompt_where_the_agent_read_it() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "Looking at the parser.".into(),
+    });
+    let before = projection.last_revision;
+    projection.apply(&AgentDomainEvent::UserMessageDelivered {
+        client_message_id: "eitri-1-1".into(),
+        turn_id: "t1".into(),
+        text: "and the tests".into(),
+    });
+    assert_eq!(projection.user_prompts.len(), 1);
+    assert_eq!(projection.user_prompts[0].text, "and the tests");
+    assert_eq!(projection.user_prompts[0].seq, before, "where it was read");
+    assert!(
+        !projection.assistant_message_open,
+        "the reply after it is a new message"
+    );
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "And the tests.".into(),
+    });
+    assert_eq!(projection.transcript.len(), 2);
+    assert_eq!(projection.active_turn_id.as_deref(), Some("t1"), "the turn goes on");
+    assert_eq!(
+        projection.steer_outcome("eitri-1-1"),
+        Some(&agent::SteerOutcome::Delivered)
+    );
+
+    let prompts = projection.user_prompts.clone();
+    let revision = projection.last_revision;
+    projection.apply(&AgentDomainEvent::UserMessageDropped {
+        client_message_id: "eitri-1-2".into(),
+        reason: "the turn ended before the agent read it".into(),
+    });
+    assert_eq!(projection.user_prompts, prompts, "nothing is added");
+    assert_eq!(projection.last_revision, revision + 1);
+    assert_eq!(
+        projection.steer_outcome("eitri-1-2"),
+        Some(&agent::SteerOutcome::Dropped {
+            reason: "the turn ended before the agent read it".into()
+        })
+    );
+    assert_eq!(projection.steer_outcome("eitri-1-3"), None);
+
+    for n in 0..agent::MAX_STEER_OUTCOMES {
+        projection.apply(&AgentDomainEvent::UserMessageDropped {
+            client_message_id: format!("later-{n}"),
+            reason: "r".into(),
+        });
+    }
+    assert_eq!(projection.steer_outcomes.len(), agent::MAX_STEER_OUTCOMES);
+    assert_eq!(projection.steer_outcome("eitri-1-1"), None, "the oldest went first");
+    let serialized = serde_json::to_value(&projection).unwrap();
+    assert!(serialized.get("steerOutcomes").is_none() && serialized.get("steer_outcomes").is_none());
 }

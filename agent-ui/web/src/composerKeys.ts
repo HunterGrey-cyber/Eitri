@@ -52,10 +52,11 @@ export function caretOnLastLine(value: string, caret: number): boolean {
   return !value.slice(caret).includes("\n");
 }
 
-/** The box's floor (the old fixed 44px) and its ceiling (40% of the panel, C3). */
-export const COMPOSER_MIN_PX = 44;
+/** The textarea's height: its content, at most 40% of the panel (C3). There is no floor here: an empty box is
+ *  one line tall (`rows={1}` and the stylesheet's `min-height`), the height BROWSE's stand-in has inside the
+ *  same card, so entering INPUT does not grow the card. */
 export function growHeight(scrollHeight: number, panelHeight: number): number {
-  return Math.max(COMPOSER_MIN_PX, Math.min(scrollHeight, Math.floor(panelHeight * 0.4)));
+  return Math.min(scrollHeight, Math.floor(panelHeight * 0.4));
 }
 
 /** Restore queued text before the current box contents. */
@@ -78,6 +79,10 @@ export const COMPOSER_CHORDS: string[] = [
   "Alt+Enter / \\ Enter",
   "↑ / ↓",
   "Ctrl+r",
+  // The `/` command menu's keys (`Composer`'s open-menu branch, ahead of everything else).
+  "/ command",
+  "Ctrl+n / Ctrl+p",
+  "Tab",
   "Ctrl+w / Ctrl+u",
   "Ctrl+c",
   // A design decision: like `Ctrl+o`, left to bubble to `App`'s INPUT branch, which approves the

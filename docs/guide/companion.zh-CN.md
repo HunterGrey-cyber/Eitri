@@ -1,5 +1,5 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=b4c669ee8c43f2e2200dab3bfef48948619c08e32023aeec72275304cd9b0dac -->
+<!-- translated-from: companion.md sha256=164fc451facd5a8ce564edd9695d6db03bb87f1833ded60fc4f3213139907f24 -->
 
 # 配合你自己的 Neovim 使用
 
@@ -50,9 +50,9 @@ eitri panel [--nvim <addr>] [DIR]
 | 按键 | 发生什么 |
 |---|---|
 | `Ctrl+h`、`Ctrl+l` | 总是离开窗口：由窗口管理器移动焦点 |
-| `Ctrl+k` | 在 BROWSE 里离开窗口；在 INPUT 里切换到 BROWSE |
-| `Ctrl+j` | 在 INPUT 里离开窗口；在 BROWSE 里切换到 INPUT |
-| INPUT 里的 `Ctrl+g` | 在你的 Neovim 的一个临时缓冲区里编辑草稿（没有附着的编辑器时，它会说编辑器没有连接） |
+| `Ctrl+k` | 在 BROWSE 里离开窗口；在 INSERT 里切换到 BROWSE |
+| `Ctrl+j` | 在 INSERT 里离开窗口；在 BROWSE 里切换到 INSERT |
+| INSERT 里的 `Ctrl+g` | 在你的 Neovim 的一个临时缓冲区里编辑草稿（没有附着的编辑器时，它会说编辑器没有连接） |
 | 前缀里的 `Select` 键 | 和 `Ctrl+h/j/k/l` 一样的由窗口管理器移动焦点 |
 
 从面板里打开一个文件，会在你的 Neovim 里打开它，并把编辑器的窗口带到前面（在 tmux 里除外，见下）。第二次 `:EitriPanel` 会把面板带到前面。

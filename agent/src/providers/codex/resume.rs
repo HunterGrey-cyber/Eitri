@@ -15,7 +15,7 @@ use super::wire::{
     Turn, TurnStatus,
 };
 use crate::jsonrpc_link::LinkError;
-use crate::projection::{AgentDomainEvent, ContentKind, TurnEndDetail, TurnOutcome};
+use crate::projection::{thinking_open_after, AgentDomainEvent, ContentKind, TurnEndDetail, TurnOutcome};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::Instant;
@@ -228,11 +228,26 @@ fn user_text(content: &[Value]) -> String {
         .join("\n")
 }
 
+/// The client id a message read inside a past turn is reported under: never one Eitri hands out live
+/// (`eitri-<tab>-<n>`), so the projection's record of live messages' outcomes is not answered by history.
+fn history_message_id(item_id: &str) -> String {
+    format!("{NOTE_TURN}-message-{item_id}")
+}
+
 /// The events of one past turn: the prompt, the start, what it said and ran, a note for what could not be
 /// read, and the end.
+///
+/// The user messages the turn opens with are its prompt, before the start. A user message after anything
+/// else of the turn was put into it while it ran (`turn/steer`): it is reported where it stands, as the
+/// live stream reports it (`UserMessageDelivered`), so it reads as part of the turn, below what came
+/// before it, and ends the reply and the thought before it exactly as it did live.
 fn turn_events(thread_id: &str, turn: &Turn, items: &[ThreadItem], complete: Complete) -> Vec<AgentDomainEvent> {
     let mut events = Vec::new();
-    for item in items {
+    let opening = items
+        .iter()
+        .take_while(|item| matches!(item, ThreadItem::UserMessage(_)))
+        .count();
+    for item in &items[..opening] {
         if let ThreadItem::UserMessage(m) = item {
             events.push(AgentDomainEvent::UserPromptSubmitted {
                 text: user_text(&m.content),
@@ -243,8 +258,17 @@ fn turn_events(thread_id: &str, turn: &Turn, items: &[ThreadItem], complete: Com
         turn_id: turn.id.clone(),
     });
     let mut last_message = String::new();
-    for item in items {
+    // Whether the thinking block is open after `events[..thought_scanned]`, as the projection folds them.
+    let (mut thought_open, mut thought_scanned) = (false, 0);
+    for item in &items[opening..] {
         match item {
+            ThreadItem::UserMessage(m) => {
+                events.push(AgentDomainEvent::UserMessageDelivered {
+                    client_message_id: history_message_id(&m.id),
+                    turn_id: turn.id.clone(),
+                    text: user_text(&m.content),
+                });
+            }
             ThreadItem::AgentMessage(m) => {
                 events.push(AgentDomainEvent::AssistantMessageBoundary {
                     turn_id: turn.id.clone(),
@@ -260,8 +284,17 @@ fn turn_events(thread_id: &str, turn: &Turn, items: &[ThreadItem], complete: Com
             }
             ThreadItem::Reasoning(r) => {
                 let parts = if r.summary.is_empty() { &r.content } else { &r.summary };
-                let text = parts.join("\n\n");
+                let mut text = parts.join("\n\n");
                 if !text.is_empty() {
+                    // A reasoning item straight after another lands in the same block; the blank line
+                    // between them is the one the live stream puts there (`provider::thought_text`).
+                    for event in &events[thought_scanned..] {
+                        thought_open = thinking_open_after(thought_open, event);
+                    }
+                    thought_scanned = events.len();
+                    if thought_open {
+                        text.insert_str(0, "\n\n");
+                    }
                     events.push(AgentDomainEvent::ContentDelta {
                         turn_id: turn.id.clone(),
                         kind: ContentKind::Thinking,
@@ -390,6 +423,123 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The same reasoning items `tests/codex_provider.rs`'s `reasoning_streams_as_it_resumes` streams live,
+    /// read back as a past turn: the text is the text the live stream gave.
+    #[test]
+    fn reasoning_reads_as_it_streamed() {
+        let turn: Turn = serde_json::from_value(turn("t1")).expect("turn");
+        let reasoning = |id: &str, summary: Value, content: Value| json!({"type": "reasoning", "id": id, "summary": summary, "content": content});
+        let items: Vec<ThreadItem> = [
+            reasoning("r1", json!(["weigh options", "then act"]), json!([])),
+            reasoning("r2", json!([]), json!(["raw one", "raw two"])),
+            reasoning("r3", json!(["whole a", "whole b"]), json!([])),
+            json!({"type": "agentMessage", "id": "m1", "text": "done"}),
+            reasoning("r4", json!(["after"]), json!([])),
+        ]
+        .into_iter()
+        .map(|item| serde_json::from_value(item).expect("item"))
+        .collect();
+        let mut projection = crate::AgentSessionProjection::default();
+        for event in turn_events("th", &turn, &items, Complete::Yes) {
+            projection.apply(&event);
+        }
+        let blocks: Vec<&str> = projection.thinking.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(
+            blocks,
+            [
+                "weigh options\n\nthen act\n\nraw one\n\nraw two\n\nwhole a\n\nwhole b",
+                "after"
+            ]
+        );
+    }
+
+    /// A message put into the turn while it ran is read back where it stood: after the thought and before
+    /// the command it came between, marked as read inside the turn, and ending the thought before it as it
+    /// did live (the next thought is a block of its own, with no separator in front). The turn's own
+    /// opening message stays its prompt, before the start.
+    #[test]
+    fn a_message_put_into_the_turn_is_read_back_where_it_stood() {
+        let turn: Turn = serde_json::from_value(turn("t1")).expect("turn");
+        let user = |id: &str, text: &str| json!({"type": "userMessage", "id": id, "content": [{"type": "text", "text": text}]});
+        let reasoning = |id: &str, text: &str| json!({"type": "reasoning", "id": id, "summary": [text], "content": []});
+        let items: Vec<ThreadItem> = [
+            user("u1", "fix the parser"),
+            reasoning("r1", "look first"),
+            user("u2", "and the tests"),
+            reasoning("r2", "tests too"),
+            json!({"type": "commandExecution", "id": "c1", "command": "cargo test", "status": "completed",
+                   "aggregatedOutput": "ok", "exitCode": 0}),
+            json!({"type": "agentMessage", "id": "m1", "text": "done"}),
+        ]
+        .into_iter()
+        .map(|item| serde_json::from_value(item).expect("item"))
+        .collect();
+        let events = turn_events("th", &turn, &items, Complete::Yes);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                AgentDomainEvent::UserPromptSubmitted { .. } => "prompt",
+                AgentDomainEvent::TurnStarted { .. } => "start",
+                AgentDomainEvent::ContentDelta {
+                    kind: ContentKind::Thinking,
+                    ..
+                } => "thought",
+                AgentDomainEvent::UserMessageDelivered { .. } => "delivered",
+                AgentDomainEvent::ToolCallStarted { .. } => "call",
+                _ => "other",
+            })
+            .filter(|k| *k != "other")
+            .collect();
+        assert_eq!(kinds, ["prompt", "start", "thought", "delivered", "thought", "call"]);
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentDomainEvent::UserMessageDelivered { client_message_id, .. } => Some(client_message_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["eitri-history-message-u2"], "never an id handed out live");
+
+        let mut projection = crate::AgentSessionProjection::default();
+        for event in &events {
+            projection.apply(event);
+        }
+        let prompts: Vec<(&str, bool)> = projection
+            .user_prompts
+            .iter()
+            .map(|p| (p.text.as_str(), p.delivered))
+            .collect();
+        assert_eq!(prompts, [("fix the parser", false), ("and the tests", true)]);
+        let blocks: Vec<&str> = projection.thinking.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(blocks, ["look first", "tests too"]);
+        let delivered = projection.user_prompts[1].seq;
+        assert!(projection.thinking[0].seq < delivered && delivered < projection.thinking[1].seq);
+        assert!(delivered < projection.tool_calls[0].seq);
+        assert_eq!(projection.transcript.len(), 1);
+    }
+
+    /// A turn that opens with something other than a message (one the agent opened itself) has no prompt:
+    /// a message in it was put into it while it ran.
+    #[test]
+    fn a_message_after_the_turns_first_item_is_never_its_prompt() {
+        let turn: Turn = serde_json::from_value(turn("t1")).expect("turn");
+        let items: Vec<ThreadItem> = [
+            json!({"type": "agentMessage", "id": "m1", "text": "on it"}),
+            json!({"type": "userMessage", "id": "u1", "content": [{"type": "text", "text": "stop"}]}),
+        ]
+        .into_iter()
+        .map(|item| serde_json::from_value(item).expect("item"))
+        .collect();
+        let events = turn_events("th", &turn, &items, Complete::Yes);
+        assert!(matches!(events[0], AgentDomainEvent::TurnStarted { .. }));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::UserPromptSubmitted { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::UserMessageDelivered { text, .. } if text == "stop")));
     }
 
     /// Item cursors that go round in a circle end the turn's read instead of asking for ever.

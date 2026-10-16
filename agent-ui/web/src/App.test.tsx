@@ -4770,6 +4770,23 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     expect(document.activeElement).toBe(root(container));
   });
 
+  it("i dims the row cursor while the composer has the keys, and Esc brightens it again", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = withACardAndStop();
+      dispatch({ kind: "pane_focus", focused: true });
+      const list = () => container.querySelector(".message-list")!.getAttribute("data-focused");
+      expect(list()).toBe("true");
+      press("i");
+      expect(list()).toBe("false");
+      fireEvent.keyDown(container.querySelector<HTMLTextAreaElement>("textarea")!, { key: "Escape" });
+      act(() => vi.advanceTimersByTime(300));
+      expect(list()).toBe("true");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("j past the last row lands on Stop, draws the row cursor hollow, and k comes back", () => {
     const { container } = withACardAndStop();
     press("j");
@@ -5843,15 +5860,13 @@ describe("App global HINT: the panel's half", () => {
       dispatch({ kind: "hint_land", sessionId, index });
     }
     const marked = (c: HTMLElement) => Array.from(c.querySelectorAll("pre[data-hint-landed]"));
-    const listMarked = (c: HTMLElement) => c.querySelector(".message-list")!.hasAttribute("data-code-landed");
 
-    it("K07-6: a landing on a code block marks that block and the list, and nothing else", () => {
+    it("K07-6: a landing on a code block marks that block, and nothing else", () => {
       const { container } = conversation("then look.\n\n```\npwd\n```\n");
       const [first, second] = Array.from(container.querySelectorAll("pre.code-block"));
       expect(second).toBeDefined();
       land(1, AT.code);
       expect(marked(container)).toEqual([first]);
-      expect(listMarked(container)).toBe(true);
     });
     it.each([
       ["j", (c: HTMLElement) => fireEvent.keyDown(root(c), { key: "j" })],
@@ -5868,9 +5883,8 @@ describe("App global HINT: the panel's half", () => {
       expect(marked(container)).toHaveLength(1);
       next(container);
       expect(marked(container)).toEqual([]);
-      expect(listMarked(container)).toBe(false);
     });
-    it("K07-10: a streamed delta that re-renders the landed block takes the hollow sign with it", () => {
+    it("K07-10: a streamed delta that re-renders the landed block takes the mark with it", () => {
       const { container } = started();
       events(
         { type: "user_prompt_submitted", text: "list it" },
@@ -5880,7 +5894,7 @@ describe("App global HINT: the panel's half", () => {
       layOut(container);
       act(() => root(container).focus());
       land(1, 2); // prompt 0, the reply 1, its code block 2
-      expect(listMarked(container)).toBe(true);
+      expect(marked(container)).toHaveLength(1);
       const block = container.querySelector("pre.code-block");
       dispatch({
         kind: "events", tab: 1, fromRevision: 3, throughRevision: 4,
@@ -5888,18 +5902,16 @@ describe("App global HINT: the panel's half", () => {
       });
       expect(block!.isConnected).toBe(false);
       expect(marked(container)).toEqual([]);
-      expect(listMarked(container)).toBe(false);
     });
     it("an arrival that lands on a card takes the block's mark with it", () => {
       const { container } = conversation();
       land(1, AT.code);
-      expect(listMarked(container)).toBe(true);
+      expect(marked(container)).toHaveLength(1);
       dispatch({ kind: "pane_focus", focused: false });
       dispatch({ kind: "pane_focus", focused: true });
       dispatch({ kind: "arrive" });
       expect(container.querySelector(".row-current")).toBe(container.querySelector(".row-permission"));
       expect(marked(container)).toEqual([]);
-      expect(listMarked(container)).toBe(false);
     });
     it("an arrival that stays on the block's row keeps the mark (y still copies it)", () => {
       const { container } = started();
@@ -5915,7 +5927,7 @@ describe("App global HINT: the panel's half", () => {
       dispatch({ kind: "pane_focus", focused: true });
       dispatch({ kind: "arrive" });
       expect(marked(container)).toHaveLength(1);
-      expect(listMarked(container)).toBe(true);
+      expect(marked(container)).toHaveLength(1);
     });
     it("the clamp uses the label's real height (a large font)", () => {
       const tall = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
@@ -8898,7 +8910,7 @@ describe("P2 runs and R3 the detailed view", () => {
     // A reload's snapshot lands the cursor on the last row (the phase-3 GUI pass); start at the top.
     gg(container);
     expect(container.querySelectorAll(".row-tool-run")).toHaveLength(1);
-    expect(container.querySelector(".row-tool-run")!.textContent).toContain("Read ×2 · Bash ×1");
+    expect(container.querySelector(".row-tool-run")!.textContent).toContain("Read 2 files, ran 1 command");
     fireEvent.keyDown(root, { key: "Enter" });
     expect(container.querySelectorAll(".row-tool")).toHaveLength(3);
     expect(container.querySelectorAll('[data-folded="true"]')).toHaveLength(3);
@@ -8943,7 +8955,7 @@ describe("P2 runs and R3 the detailed view", () => {
 
   it("zo on a collapsed run expands it, and zc on either of its calls collapses it again", () => {
     const { container, root, z, summary, calls } = twoReadsThenAMessage();
-    expect(summary()).toContain("Read ×2");
+    expect(summary()).toContain("Read 2 files");
 
     z("o");
     expect(summary(), "zo opened the run").toBeNull();
@@ -8953,18 +8965,18 @@ describe("P2 runs and R3 the detailed view", () => {
     // the cursor on it.
     expect(container.querySelector(".row-current")!.textContent).toContain("a.rs");
     z("c");
-    expect(summary()).toContain("Read ×2");
+    expect(summary()).toContain("Read 2 files");
     expect(calls()).toBe(0);
     expect(container.querySelector(".row-current")!.classList.contains("row-tool-run")).toBe(true);
     z("c");
-    expect(summary(), "zc on a run that is closed leaves it closed").toContain("Read ×2");
+    expect(summary(), "zc on a run that is closed leaves it closed").toContain("Read 2 files");
 
     // ...and from its SECOND call the cursor follows the run back to where it folded.
     z("o");
     fireEvent.keyDown(root, { key: "j" });
     expect(container.querySelector(".row-current")!.textContent).toContain("b.rs");
     z("c");
-    expect(summary()).toContain("Read ×2");
+    expect(summary()).toContain("Read 2 files");
     expect(container.querySelector(".row-current")!.classList.contains("row-tool-run")).toBe(true);
   });
 
@@ -8990,7 +9002,7 @@ describe("P2 runs and R3 the detailed view", () => {
     expect(calls(), "the run is still open").toBe(2);
     expect(container.querySelectorAll('[data-folded="true"]'), "its result closed first").toHaveLength(2);
     z("c");
-    expect(summary(), "the second zc closes the run").toContain("Read ×2");
+    expect(summary(), "the second zc closes the run").toContain("Read 2 files");
   });
 
   it("Ctrl+o shows every call and zc folds nothing there -- not even a run opened before it", () => {
@@ -9002,7 +9014,7 @@ describe("P2 runs and R3 the detailed view", () => {
     expect(calls(), "the detailed view has no run to fold").toBe(2);
     expect(summary()).toBeNull();
     fireEvent.keyDown(root, { key: "o", ctrlKey: true }); // back to the folded view: the run again
-    expect(summary()).toContain("Read ×2");
+    expect(summary()).toContain("Read 2 files");
     expect(container.querySelectorAll('[data-folded="true"]')).toHaveLength(0);
 
     // A run opened first, then the detailed view: zc there must leave it open for when Ctrl+o ends.

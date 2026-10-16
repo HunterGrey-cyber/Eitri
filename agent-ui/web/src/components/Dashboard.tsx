@@ -21,14 +21,16 @@ export const DASH_ITEM_KEY: Record<DashItem, string> = {
 
 /** Every item this tab currently offers, in the table's own order: `"resume"` only when
  *  a record exists to resume -- an empty `resumableSessions` is the ordinary case for a fresh
- *  workspace, and offering to resume nothing would be a dead key. */
+ *  workspace, and offering to resume nothing would be a dead key. The mode is not an item: the status
+ *  band under this screen already names it and Shift+Tab changes it there, so a row for it only said
+ *  the same thing twice. */
 export function dashItems(hello: Hello): DashItem[] {
   const items: DashItem[] = ["new"];
   // The last window's tabs, offered only while Rust says there are some to bring back -- a launch
   // action, so a later empty tab beside live ones never has it (Rust stops sending the offer).
   if ((hello.restore?.labels.length ?? 0) > 0) items.push("restore");
   if (hello.resumableSessions.length > 0) items.push("resume");
-  items.push("sessions", "mode", "keys");
+  items.push("sessions", "keys");
   return items;
 }
 
@@ -145,10 +147,6 @@ type Props = {
   cursor: number;
   narrow: boolean;
   onItem: (item: DashItem) => void;
-  /** The window's readable prefix chord, passed from `App.tsx`'s `keymapHelp.prefix` through
-   *  `EmptyTab`. Read it live so the hint reflects any reconfiguration in `init.lua`, such as
-   *  Ctrl+a instead of the default Ctrl+b. */
-  prefix: string;
   /** Companion mode (`App.tsx`'s `editorLink`, `null` in the one-window mode): the start screen then
    *  speaks for a window that holds only this panel. Optional so a caller with no editor beside it
    *  needs no stand-in. */
@@ -159,8 +157,10 @@ type Props = {
 };
 
 /** The empty tab's dashboard: a centred `Eitri`, the
- *  where-line, one row per `dashItems(hello)`, the selected mode's consequence line, what every
- *  message also carries from the editor, and the first-run hint.
+ *  where-line and one row per `dashItems(hello)`, each with its key -- and nothing else. What a mode
+ *  does, what a message carries from the editor and the window's keys are all in the `?` sheet, which
+ *  the last row opens; only a companion window with no editor attached says one more line, because
+ *  that is a problem to fix, not a fact to learn.
  *
  * Items carry `data-nav-stop="dash"` for the same CSS/grid symmetry the rest of the panel's rows
  * have, but they are deliberately NOT `nav.ts` stops (`controlsOf`'s selector has no `[role=
@@ -169,63 +169,67 @@ type Props = {
  * here is ever really DOM-focused. A real, focused `<button>` would eat a `Space` keydown as
  * native activation before it ever reached the leader system (`App.tsx`'s root `onKeyDown`), which
  * is exactly the key this screen's own `j`/`k`/letters/`Enter` must never intercept from. */
-export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix, editorLink = null, agent = null }: Props) {
-  const items = dashItems(hello);
-  const consequence = modeConsequence(mode, agent, prefix);
+export function Dashboard({ hello, mode, cursor, narrow, onItem, editorLink = null, agent = null }: Props) {
   return (
     <div className="dashboard">
+      <DashboardHead hello={hello} narrow={narrow} agent={agent} />
+      <DashboardItems hello={hello} mode={mode} cursor={cursor} onItem={onItem} editorLink={editorLink} agent={agent} />
+    </div>
+  );
+}
+
+/** The dashboard's name and where-line. `EmptyTab` draws it above its box, which it keeps in one place in
+ *  the tree whatever the screen shows (see `EmptyTab`'s own note on the start screen's box). */
+export function DashboardHead({ hello, narrow, agent = null }: { hello: Hello; narrow: boolean; agent?: string | null }) {
+  return (
+    <>
       <div className="dash-title">Eitri</div>
       <div className="dash-where">{whereLine(hello, narrow, agent)}</div>
+    </>
+  );
+}
+
+/** The dashboard's rows and, in a companion window with no editor, its one line under them. With
+ *  `boxIsNew`, the New session row is not drawn here: the box above the rows is that row (`EmptyTab`), and
+ *  the cursor's index still counts it, so `j`/`k` and Enter mean what they did. */
+export function DashboardItems({
+  hello,
+  mode,
+  cursor,
+  onItem,
+  editorLink = null,
+  agent = null,
+  boxIsNew = false,
+}: Omit<Props, "narrow"> & { boxIsNew?: boolean }) {
+  const items = dashItems(hello);
+  return (
+    <>
       <div className="dash-items">
-        {items.map((item, index) => (
-          <div
-            key={item}
-            className="dash-item"
-            role="button"
-            tabIndex={-1}
-            data-nav-stop="dash"
-            aria-current={index === cursor ? "true" : undefined}
-            onClick={() => onItem(item)}
-          >
-            <span className="dash-icon" aria-hidden="true">
-              {item === "mode" ? (
-                <span className="mode-glyph" data-mode-name={mode}>
-                  ⏵⏵
-                </span>
-              ) : (
-                ITEM_ICON[item]
-              )}
-            </span>
-            <span className="dash-label">
-              <ItemLabel item={item} hello={hello} mode={mode} agent={agent} />
-            </span>
-            <span className="dash-key">{DASH_ITEM_KEY[item]}</span>
-          </div>
-        ))}
+        {items.map((item, index) =>
+          boxIsNew && item === "new" ? null : (
+            <div
+              key={item}
+              className="dash-item"
+              role="button"
+              tabIndex={-1}
+              data-nav-stop="dash"
+              aria-current={index === cursor ? "true" : undefined}
+              onClick={() => onItem(item)}
+            >
+              <span className="dash-icon" aria-hidden="true">
+                {ITEM_ICON[item]}
+              </span>
+              <span className="dash-label">
+                <ItemLabel item={item} hello={hello} mode={mode} agent={agent} />
+              </span>
+              <span className="dash-key">{DASH_ITEM_KEY[item]}</span>
+            </div>
+          ),
+        )}
       </div>
-      {consequence !== undefined && <div className="dash-consequence">{consequence}</div>}
-      {/* Explain editor context where a session starts. `compose_turn_text` appends the file name
-          or live Visual selection to panel turns; it sends neither the cursor position nor the
-          whole file's text. Show the hint at every width and in every mode. CLI-local commands such
-          as `/model` and `/effort` omit this context, as the `?` overlay's Typing note explains.
-          Use the same tokens as `.dash-consequence`. */}
-      {/* Companion form: the editor is another window, so the line says which file travels and, with no
-          editor attached, how to attach one. `editorLink` is `null` in the one-window mode, where
-          Rust never sends one. */}
-      <div className="dash-context">
-        {editorLink === null
-          ? "Each message also sends the editor's file name, or the lines you selected there in Visual mode."
-          : editorLink.state === "attached"
-            ? "Each message also sends the file open in your nvim, or the lines you selected there in Visual mode."
-            : "No editor is attached: run :EitriPanel in nvim to send its file with each message."}
-      </div>
-      {/* Show the key hint on every empty tab. It occupies otherwise empty space and needs no
-          persistent first-run state. */}
-      <div className="dash-hint">
-        {editorLink === null
-          ? `Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · ${prefix}  window keys · ?  all keys`
-          : `Ctrl+h / Ctrl+l  leave the panel · i or Ctrl+j  type · ctrl+c  interrupt · ${prefix}  tab keys · ?  all keys`}
-      </div>
-    </div>
+      {editorLink !== null && editorLink.state !== "attached" && (
+        <div className="dash-context">No editor is attached: run :EitriPanel in nvim to send its file with each message.</div>
+      )}
+    </>
   );
 }

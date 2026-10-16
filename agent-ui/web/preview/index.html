@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Eitri chat panel preview</title>
+<style>
+  body { margin: 0; font: 13px system-ui, "Noto Sans CJK SC", sans-serif; background: #555a61; color: #eee; }
+  header { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; padding: 8px 14px; background: #2b2e33; position: sticky; top: 0; z-index: 1; }
+  header label { display: flex; gap: 6px; align-items: center; }
+  select { font: inherit; }
+  main { display: flex; gap: 18px; padding: 18px; align-items: flex-start; overflow-x: auto; }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 6px; flex: none; }
+  figcaption { font-weight: 600; }
+  iframe { border: 0; background: #000; height: calc(100vh - 110px); box-shadow: 0 0 0 1px #0005; }
+</style>
+</head>
+<body>
+<header>
+  <label>Theme <select id="theme">
+    <option>tokyonight-night</option><option>gruvbox-dark</option><option>catppuccin-latte</option><option>rose-pine-dawn</option>
+  </select></label>
+  <label>Scenario <select id="scenario">
+    <option value="running">Running + queued</option><option value="permission">Awaiting approval</option><option value="done">Done</option><option value="long">Long conversation + thinking</option>
+  </select></label>
+  <label>Panel width <select id="width">
+    <option>360</option><option selected>480</option><option>640</option><option>860</option><option value="1280">1280 (full screen)</option><option value="1920">1920 (full screen)</option>
+  </select></label>
+  <label>Thinking <select id="thinking">
+    <option value="collapsed">Collapsed (default)</option><option value="preview">Preview</option><option value="expanded">Expanded</option><option value="hidden">Hidden</option>
+  </select></label>
+  <label><input type="checkbox" id="input" /> Input mode</label>
+  <label>Slash menu <select id="draft">
+    <option value="">None</option><option value="/">/</option><option value="/co">/co</option><option value="/re">/re</option><option value="/zzz">/zzz (no match)</option>
+  </select></label>
+  <label>Agent <select id="agent">
+    <option value="claude">Claude (built-in commands)</option><option value="acp">ACP (agent-reported)</option><option value="codex">Codex (no menu)</option>
+  </select></label>
+</header>
+<main id="frames"></main>
+<script>
+  const ids = ["theme", "scenario", "width", "thinking", "input", "draft", "agent"];
+  const saved = JSON.parse(localStorage.getItem("eitri-preview") || "{}");
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (saved[id] !== undefined) el.type === "checkbox" ? (el.checked = saved[id]) : (el.value = saved[id]);
+    el.addEventListener("change", render);
+  }
+  function render() {
+    const v = Object.fromEntries(ids.map((id) => { const el = document.getElementById(id); return [id, el.type === "checkbox" ? el.checked : el.value]; }));
+    localStorage.setItem("eitri-preview", JSON.stringify(v));
+    const fig = document.createElement("figure");
+    const cap = document.createElement("figcaption");
+    cap.textContent = `${v.theme} · ${v.width}px`;
+    const f = document.createElement("iframe");
+    f.style.width = v.width + "px";
+    f.src = `panel.html?theme=${v.theme}&scenario=${v.scenario}&thinking=${v.thinking}&input=${v.input ? 1 : 0}&agent=${v.agent}&draft=${encodeURIComponent(v.draft)}`;
+    fig.append(cap, f);
+    document.getElementById("frames").replaceChildren(fig);
+  }
+  render();
+</script>
+</body>
+</html>

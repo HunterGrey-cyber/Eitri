@@ -183,6 +183,12 @@ body,
 .empty-tab-resume .detail {
   overflow-wrap: anywhere;
 }
+/* On the starting and failed screens the box stands under what they say, the same margin each side rather
+   than the conversation's foot's step in to the body's edge (there is no sign column here for it to line
+   up with). On the dashboard it is the New session row (`.dash-input`, below). */
+.empty-box .composer {
+  margin: 20px 0 0;
+}
 
 /* tmux's window list: one row, shown only with two or more tabs or while
    a rename is open (`showTabBar`, `tabs.ts`). Above `errorBanner` in the conversation layout and
@@ -220,7 +226,7 @@ body,
   color: var(--nv-muted);
 }
 /* A background tab with a turn running: a plain, static mark. Deliberately NOT
-   animated -- `.turn-activity .meter-fill` is the one animated element in this stylesheet
+   animated -- the activity line's star (`.activity-glyph`) is the one animated element in this stylesheet
    (`indexCss.test.ts`), and a second, per-tab motion would either duplicate that guarantee or
    escape it. The active tab's own turn is shown by `ActivityLine` instead. */
 /* Defect 4 (phase 2's sandbox pass): a label cut with `…` (the tab's own name-truncation) followed
@@ -248,26 +254,38 @@ body,
   width: 24ch;
 }
 
-/* The activity line, directly above the composer (only while a turn runs),
-   replacing the winbar and status line formerly split from
-   `.session-header`. Plain body surface, not nvim's own `StatusLine` colours: dropping the
-   winbar/status-line's `chrome`/`chrome-fg` pair keeps this line agreeing with the band below it
-   (`StatusRow`/`Footer`, the two OTHER members of that V2 stack,
-   are gone, replaced by the one band; this line is what is left). No `z-index` anywhere here
-   at all: the `?` overlay and the detail popover are
-   positioned against `.agent-ui-scroller`, the list's own region, so neither can reach this line
-   and nothing here has to out-paint them. */
+/* The activity line, directly above the composer (only while a turn runs): Claude Code's running line,
+   `✻ Working… 12s · 2 queued · ctrl+c interrupt`, one mono line at the small size, muted but for the
+   phase word. Plain body surface, not nvim's `StatusLine` colours, so it agrees with the band below.
+   It opens the foot: this line, the turn's changes, the queued lines and the composer share the
+   conversation's side margins (`--page-pad`) and fill the panel, and the star sits in the sign column so
+   the words after it start where the conversation's text does. The foot reads as one block above the
+   status band, and no rule separates it from the conversation -- the composer is the boundary. No `z-index` anywhere here: the `?` overlay and the detail popover are positioned
+   against `.agent-ui-scroller`, the list's own region, so neither can reach this line and nothing here
+   has to out-paint them. */
 .activity-line {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 0 12px;
-  min-height: 28px;
-  border-top: 1px solid var(--nv-border);
+  gap: var(--sign-gap);
+  box-sizing: border-box;
+  margin-inline: var(--page-pad);
+  padding: 4px 0 0;
+  min-height: 26px;
   font-family: var(--nv-font-mono);
   font-size: var(--fs-sm);
+  color: var(--nv-muted);
   /* Never two lines: see the in-flight indicator's own comment further down. */
   white-space: nowrap;
+}
+/* The star at the head of the line, in the accent the old bar meter was filled with. While the agent
+   works it breathes (`turn-breath`, with the in-flight motion further down); a card waiting, or a phase
+   that is the user's to end, holds it still (`data-moving` is absent then). An inline block, so a
+   transform applies to it. */
+.activity-glyph {
+  display: inline-block;
+  flex: none;
+  width: var(--sign-w);
+  color: var(--nv-chrome-accent);
 }
 /* The interrupt-key reminder, or a card that waits, in the activity line's own
    slot. `.activity-card` is deliberately readable text (`--nv-fg`), not muted like the reminder it
@@ -296,12 +314,18 @@ body,
    span run out of the row; an atomic inline does both. As an `inline-block` its shrink-to-fit width is its
    content's own, so nothing inside wraps and the whole span moves to the next line when it does not fit this
    one; only a span longer than the whole row is capped at `max-width: 100%` and broken, anywhere. Fenced code
-   is `pre code`, which this leaves alone. */
+   is `pre code`, which this leaves alone. It sits on your own tint (`--tint-you`), rounded, a step smaller
+   than the prose around it, in the tint's guarded ink. */
 .row-assistant code:not(pre code) {
   cursor: pointer;
   display: inline-block;
   max-width: 100%;
   overflow-wrap: anywhere;
+  padding: 0 0.3em;
+  border-radius: 4px;
+  background: var(--tint-you);
+  color: var(--nv-tint-fg);
+  font-size: var(--fs-md);
 }
 /* A table's cells keep their words whole and the table scrolls in its own box (see
    `.table-scroll` above), so a span in a cell is neither broken nor capped at the cell's width -- the rule
@@ -339,28 +363,70 @@ body,
   color: var(--nv-fg);
   overflow-wrap: anywhere;
 }
-/* The queued lines: muted, one line each, directly above the composer in
-   both layouts. V1's editor-context line used to sit here too (`.context-line`); the bottom band
-   moved it into the band's own `.band-context` segment. */
+/* The queued lines: muted italic, one line each, directly above the composer in the foot --
+   provisional text, the way Codex and Claude Code show a message that has not reached the agent yet. */
 .queue-lines {
-  padding: 0 12px;
+  box-sizing: border-box;
+  margin-inline: var(--page-pad);
+  padding: 2px 0 0;
   font-size: var(--fs-sm);
   color: var(--nv-muted);
 }
+/* Each line's mark stands in the sign column and its words start at the body's edge, as the activity
+   line's star and words do above it. */
 .queue-line {
+  display: grid;
+  grid-template-columns: var(--sign-w) minmax(0, 1fr);
+  column-gap: var(--sign-gap);
+  line-height: 1.7;
+  font-style: italic;
+}
+.queue-glyph {
+  font-style: normal;
+}
+.queue-text {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.queue-note,
+.queue-error {
+  padding-left: var(--body-edge);
+}
+/* A message sent into the running turn and not yet read: dimmer than a held one, since it needs nothing
+   from the user. */
+.queue-line-steered {
+  opacity: 0.75;
+}
+/* Why the held lines are held: said once, quieter than the lines themselves. */
+.queue-note {
+  font-style: italic;
+  opacity: 0.8;
+}
 .queue-error {
   color: var(--nv-fg);
-  border-left: 2px solid var(--nv-warn);
-  padding-left: 6px;
+}
+/* The latest turn's changes (`TurnChanges.tsx`): one quiet mono line in the foot -- how many
+   files, `+N −M` with the signs coloured as an edit card's are, and, once the turn is over, the key that
+   opens them for review at the line's right end. */
+.turn-changes {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  box-sizing: border-box;
+  margin-inline: var(--page-pad);
+  padding: 4px 0 0 calc(var(--sign-w) + var(--sign-gap));
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.turn-changes-key {
+  margin-left: auto;
 }
 /* The bottom band: replaces `StatusRow`, `Footer`, `NewPill`
    and `ContextLine` with one vim-statusline row (lualine's own layout -- a mode section, facts,
-   then the right side; tmux's `status-right` for the right-hand facts). One line, `line-height:
-   24px`, mono `--fs-sm`.
+   then the right side; tmux's `status-right` for the right-hand facts). One line, the editor's row high,
+   mono at the editor's text size (`--fs-code`).
 
    **Plain fills preserve the theme tokens' contrast guarantees.**
    A blended fill on the whole band and mode
@@ -374,29 +440,31 @@ body,
    `--nv-fg` text, and plain `--nv-bg` under it, are BOTH real, Rust-enforced guarantees for every
    theme. An arbitrary percentage mix of either with `--nv-bg` carries no such guarantee (relative
    luminance is not linear in the mix fraction), so this band uses the two tokens directly, at full
-   strength, rather than a blend of them -- the mockup's `today` style (a plain surface, the mode
-   section marked by its own cursorline fill and a 3px left border), which is exactly what the old
-   `.panel-footer .mode-block` already did, carried forward rather than reinvented. */
+   strength, rather than a blend of them -- a plain surface, the mode section marked by its own
+   cursorline fill and its label, which is what the old `.panel-footer .mode-block` already did, carried
+   forward rather than reinvented. */
 /* The band is as tall as the editor's statusline beside it. A plain
    `min-height` grows with whatever the band's children need (the `⏵⏵`
    fallback symbol font in particular has its own metrics), so the band never actually matched the
    editor's own statusline beside it. `--nv-editor-row` is the editor's real cell height
    (`core/src/theme/tokens.rs`, `ThemeTokens.editor_row_px`, `None` until `neovide-editor` reports
    one -- the `24px` fallback is what a reload before that first report, or `--clean`, still
-   shows). `box-sizing: border-box` folds the 1px `border-top` into that fixed height rather than
-   adding to it, and `overflow: hidden` is what actually stops a child from growing the row instead
-   of clipping to it -- a bigger min-height alone would not have fixed this. */
+   shows). `overflow: hidden` is what actually stops a child from growing the row instead of
+   clipping to it -- a bigger min-height alone would not have fixed this.
+   No top rule: the composer card above it is the foot's boundary, and a hairline under the card read
+   as a second edge. With no border, the line box is the whole row, so the text sits on the same
+   centre line as the editor's statusline text. */
 .status-band {
   display: flex;
   align-items: center;
   height: var(--nv-editor-row, 24px);
   box-sizing: border-box;
   overflow: hidden;
-  line-height: calc(var(--nv-editor-row, 24px) - 1px);
-  padding: 0 12px;
-  border-top: 1px solid var(--nv-border);
+  line-height: var(--nv-editor-row, 24px);
+  /* No left margin: the mode section starts at the band's edge, as the statusline's does at the editor's. */
+  padding: 0 var(--page-pad) 0 0;
   font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-code);
   color: var(--nv-fg);
 }
 /* Not content, just this render's ruler (`StatusBand.tsx`'s own doc comment): one character, at
@@ -468,24 +536,56 @@ body,
   white-space: normal;
   overflow-wrap: anywhere;
 }
-/* The mode section: bold, its own fill, dim while the pane lacks the keys
-   (`data-focused`, `paneFocused`'s own claim) -- moved unchanged from the old `Footer`'s mode
-   block, itself explained by the big comment above this rule. */
+/* The mode section, drawn the way the editor's statusline draws its own beside it (2026-10-15): lualine's
+   mode section -- its colours for the mode (`--nv-status-*`: `lualine_a_normal` for BROWSE and HINT,
+   `_insert` for INSERT, `_visual` for CARET, VISUAL and V-LINE), bold, one cell of air each side, from
+   the band's left edge, the full height of the row, and closed by lualine's default section separator,
+   a solid arrow in the section's colour one cell wide. The arrow is drawn, not typed: U+E0B0 is a Nerd
+   Font glyph the panel's font may not carry, and a triangle the row's height is what that glyph is.
+   The colours are copied as nvim has them, unguarded, for the reason the syntax colours are
+   (`tokens.rs`, `status_normal`): it is the editor's own pair; with no lualine they are the guarded
+   cursorline block the band drew before. Without the keys the block stays, empty and in the cursorline,
+   as an inactive statusline carries no mode. */
+.status-band .band-open {
+  align-self: stretch;
+}
 .band-mode {
   /* Never squeezed by a long flash beside it: the flash wraps, the mode keeps its width. */
   flex-shrink: 0;
-  font-weight: 600;
-  padding: 0 6px;
-  background: var(--nv-cursorline);
-  border-left: 3px solid var(--nv-mode-browse);
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  position: relative;
+  margin-right: 1ch;
+  font-weight: 700;
+  padding: 0 1ch;
+  background: var(--nv-status-normal-bg);
+  color: var(--nv-status-normal-fg);
 }
 .band-mode[data-mode="input"] {
-  border-left-color: var(--nv-mode-input);
+  background: var(--nv-status-insert-bg);
+  color: var(--nv-status-insert-fg);
+}
+.band-mode[data-mode="caret"],
+.band-mode[data-mode="visual"],
+.band-mode[data-mode="vline"] {
+  background: var(--nv-status-visual-bg);
+  color: var(--nv-status-visual-fg);
+}
+.band-mode::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 100%;
+  width: 1ch;
+  background: inherit;
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
 }
 .band-mode[data-focused="false"] {
+  background: var(--nv-cursorline);
   color: var(--nv-muted);
   font-weight: 400;
-  border-left-color: var(--nv-muted);
 }
 /* U+23F5 is not in FiraCode Nerd Font (`fc-list ':charset=23f5'`, 2026-09-26): this needs a
    font that actually carries the glyph -- Noto Sans Symbols 2 first, Symbola and Segoe UI Symbol as
@@ -522,9 +622,14 @@ body,
   cursor: help; /* the full diagnostic line is in its title attribute */
 }
 
+/* The page reads as a document that fills the panel: the side margin is `--page-pad` (the chat page's
+   measures below) and the rows inside run from one edge to the other, on a thin scrollbar in the
+   hairline colour. */
 .message-list {
   overflow-y: auto;
-  padding: 12px;
+  padding: 16px var(--page-pad);
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-soft) transparent;
   /* Nothing in the conversation may scroll it sideways.
      `overflow-y: auto` makes this box scroll on BOTH axes, so any line that cannot
      wrap -- a path, a URL, a long argument with no space in it -- used to push the whole document,
@@ -553,85 +658,28 @@ body,
    it emits and nothing else in an assistant row renders a bare `<pre>`, so this rule is fully
    superseded, not narrowed. */
 
-/* --- the panel's own horizontal geometry, as tokens (2026-09-21) ----------------------------
-   These four were literals scattered across eight rules, and two of them had to agree with each
-   other by hand: `.row`'s `22px` sign column plus its `8px` column gap is exactly the `30px` every
-   `calc(100cqw - 30px)` escape below subtracts. Nothing checked that:
-   the cqw magic numbers are hardcoded independently rather than derived from the grid's own
-   22px/8px, so a grid-geometry change would silently desync them -- the escapes would have kept
-   subtracting 30 while the grid moved, and no test in `indexCss.test.ts` reads the arithmetic, only
-   the literal `calc()` strings. Now `--row-gutter` IS that sum, so the two cannot disagree.
+/* --- the sign-column grid's horizontal geometry, as tokens ------------------------------------
+   `--row-gutter` is the sign column plus the gap beside it, derived from the two rather than written as
+   their sum, so the review overlay's indented lines (`.review-note`, `.review-hunk`, ...) cannot drift
+   from the grid they line up with. `--prose-measure` is that grid's body track: `1fr` uses the width
+   there is. The conversation's own rows are on a grid of their own, a sign cell and a body (the chat
+   rows below).
 
-   **No container-query unit travels inside a custom property here, deliberately.** The first
-   version of this block put the whole `calc(100cqw - ...)` in `--row-escape`. CSS substitution makes that
-   fine -- a `var()` is substituted as tokens and parsed at the use site, so the `cqw` would resolve
-   against `.row`, the `container-type: inline-size` element -- and it rendered correctly in
-   Chromium. But this panel runs in WebKitGTK, container units in custom properties are exactly the
-   corner where an engine has shipped bugs before, and the failure mode is not subtle: resolve them
-   against the viewport instead of the row and every width in the panel is wrong. So the token
-   carries only the NUMBER (`--row-gutter`), each rule writes its own `100cqw`, and the prompt's
-   inset is expressed in percentages, which resolve against the grid area and have worked
-   everywhere for twenty years. The magic-number problem is solved either way; this way costs one
-   `var()` per rule and depends on nothing clever.
-
-   **Correction (2026-09-24): there is no container-query unit anywhere in this file any more.**
-   The WebKitGTK caution above was right about the engine and wrong about the corner: the query
-   container itself, on `.row`, is what broke -- it made WebKitGTK 2.52.6 reset the message list's
-   `scrollTop` on every tick of the status line's elapsed counter while a reply streamed (see the
-   `.row` rule). The row's width is now `--row-inline-size`, derived on `.row` from a px value
-   `MessageList.tsx` measures, so each escape spends `var(--row-inline-size)` where it spent
-   `100cqw` and `var(--row-gutter)` exactly as before. `--row-inline-size` is a custom property
-   carrying a plain px `calc()`, not a container unit, and is declared on `.row` rather than here
-   because it has to resolve against the list's measured width, which lives on the list.
-
-   `--prose-measure` controls the prose width. `1fr` is "use the panel you have": prose fills
-   the row the way code and tool output already do. Setting it to `62ch` restores, exactly, the
-   readable measure this panel shipped with until today -- one declaration, nothing else to change.
-   Worth knowing before you leave it at `1fr`: on a panel zoomed to a wide screen (`Ctrl+a m`) a
-   paragraph really does run the whole width, which is long for Latin prose and fine for CJK.
-
-   `--prompt-inset` is how far your own message steps away from the left edge. The shape is Cursor's
-   -- its `--conversation-opposed-inset: clamp(0px,(100% - 480px) * 0.4,20%)`, read out of
-   `/usr/share/cursor/.../workbench.desktop.main.css` rather than remembered -- because the idea is
-   right: distinguish the two speakers by POSITION, proportionally, and give the space back on a
-   narrow panel instead of reserving it. The numbers are not Cursor's: the cap is 8% of the row and
-   never more than 120px, against its 20% and no absolute bound, and the knee is 560px rather than
-   480px -- this panel keeps its sign column and adds a rule, so it needs far less displacement to
-   say the same thing, and its sign cell is a cursor that must not be stranded from its own row. Cursor also floors its inset at
-   `max(32px, ...)`; this deliberately does not, because at narrow widths that 32px is taken from an
-   already cramped measure to repeat something the `\u203a` glyph and the rule already say. */
+   **No container query anywhere in this file, and no container-query unit.** A size query container on
+   a conversation row (`container-type: inline-size`, read through `100cqw`) made WebKitGTK 2.52.6 reset
+   `.message-list`'s `scrollTop` to a stale value every time the status line's elapsed counter ticked
+   while a reply streamed, so the panel stopped following the reply about a second in; a container on
+   `.row-body`, on `.message-list` or on the assistant rows only broke the same way.
+   `shell/tests/panel_stream_scroll.rs` pins it against the real engine and `indexCss.test.ts` keeps a
+   display-free tripwire. Widths that depend on the panel are written against the viewport instead
+   (`@media`, `vw`, and percentages), which is the panel's own width. No custom property carries a
+   container-query unit either: with no container a `cqw` silently resolves against the viewport, a
+   wrong width with nothing to say so. */
 :root {
   --row-sign-w: 22px;
   --row-gap: 8px;
-  /* The left gutter every row reserves: the sign column plus the gap beside it. Subtract it from
-     the row's own width (`--row-inline-size`, declared on `.row`; it was `100cqw` until 2026-09-24)
-     and you are on the row's own right edge -- which is what every escape below does. */
   --row-gutter: calc(var(--row-sign-w) + var(--row-gap));
   --prose-measure: 1fr;
-  /* Your own message's displacement, as a ramp rather than a step: nothing at all until the ROW is
-     past the knee, then three tenths of the surplus, capped. The three parts are separate because
-     only the shape is worth keeping stable -- tune any one of them without restating the others.
-     Lower bound 0 is the point: a narrow panel gives the space back to the text instead of
-     reserving it, which is where this deliberately parts company with Cursor's `max(32px, ...)`.
-
-     Each is a plain length, a unitless number and a plain number, so that no custom property here
-     carries a container-query unit (see the block above for why). The `cqw` is written once, at the
-     one rule that uses these. (2026-09-24: that rule now reads `--row-inline-size` instead of
-     `100cqw`, for the reason the correction above gives; the ramp and its basis are unchanged.)
-
-     **The basis is the ROW, not the body's grid area, and that is a correction.** A first revision
-     wrote the whole ramp in percentages, which on a grid item resolve against the grid AREA -- so
-     the inset silently depended on `--prose-measure`, and a reviewer measured the consequence:
-     setting the documented `62ch` made the area 496.5px, 3.5px under a 500px knee, and the
-     displacement vanished at every width with nothing to show for it. Against `100cqw` the two
-     knobs are independent, which is what the comment above always claimed they were. */
-  --prompt-inset-knee: 560px;
-  --prompt-inset-slope: 0.3;
-  /* Percent of the row. Also bounded absolutely: at a 1900px panel an unbounded 8% put 155px of
-     nothing between the sign cell -- which is the panel's cursor, and its only focus signal -- and
-     the row it marks. Measured, not guessed. */
-  --prompt-inset-cap: 8;
-  --prompt-inset-cap-max: 120px;
 }
 
 /* --- one text size, and every other one a ratio of it (2026-09-21) --------------------------
@@ -653,101 +701,129 @@ body,
    `4ch` measured 32px instead of 24px. The literal is a second copy of Rust's
    `DEFAULT_PANEL_FONT_SIZE_PX`, and `indexCss.test.ts` holds the two equal.
 
-   Deliberately NOT nvim's `guifont` height. That is the editor's size for a MONOSPACE face, and
-   this panel is mostly proportional prose; following it 1:1 would make the two panes disagree by
-   however much the two faces disagree at the same nominal size. Following `g:neovide_scale_factor`
-   -- so one `Ctrl+=` zooms both panes -- is the better answer and needs a fork change; it is not
-   done here. */
+   Since 2026-10-15 the base is the editor's own text size unless `agent.font_size` says otherwise
+   (`shell` reads `guifont` the way Neovide does and converts it out of WebKit's page zoom), and a
+   reply's prose and every mono line of content -- a tool line, a code block, a diff, the status band --
+   are drawn at the base itself, so by default the panel's text is the editor's size beside it. The
+   smaller steps (thoughts, notes, counts) stay the ratios they were. */
 :root {
   --fs-xs: calc(var(--nv-font-size, 14px) * 11 / 14);
   --fs-sm: calc(var(--nv-font-size, 14px) * 12 / 14);
-  --fs-code: calc(var(--nv-font-size, 14px) * 12.5 / 14);
+  --fs-code: var(--nv-font-size, 14px);
   --fs-md: calc(var(--nv-font-size, 14px) * 13 / 14);
   --fs-base: var(--nv-font-size, 14px);
-  --fs-prose: calc(var(--nv-font-size, 14px) * 15 / 14);
+  --fs-prose: var(--nv-font-size, 14px);
   /* A seventh step, added rather than reusing one of the six above:
-     The dashboard name is "22px mono", well past `--fs-prose`'s own 15/14, and the guard
+     The dashboard name is "22px mono", well past the prose size, and the guard
      below ("every font-size spends a token, never a literal length") means it has to be one of
      these rather than a bare `22px` on `.dash-title`. Same ratio-of-the-base shape as the rest. */
   --fs-title: calc(var(--nv-font-size, 14px) * 22 / 14);
+  /* An eighth: a heading inside a reply, one twentieth larger than the reply's own prose, so it is told
+     apart by weight first and size second, as a document's run-in headings are. */
+  --fs-heading: calc(var(--nv-font-size, 14px) * 14.7 / 14);
 }
 
-/* --- the sign-column grid (panel-as-document, task 3) --------------------------------------
-   One grid for every row, so signs line up down the whole document however the body is built. */
+/* --- the chat page's measures and tints ----------------------------------------------------------
+   The conversation and the foot under it (the activity line, the turn's changes, the queued lines, the
+   composer, the session's end) fill the panel at every width, less `--page-pad` at each side (12px in a
+   narrow panel, growing with it to 40px when the panel has the whole screen). There is no column width:
+   the panel is as wide as you made it, and the text uses it. Every user of the margin reads `--page-pad`
+   where it is used, so the narrow block below (or a test) can change it. The status band runs the whole
+   width too, as the editor's status line does. All of it is written against the viewport, not a container
+   query (see the sign-column grid's geometry block): the viewport is the panel.
+
+   Every conversation row is a sign cell and a body. `--sign-w` is two characters of the mono face at the
+   sign's size, written from `--fs-code` rather than `2ch`, so it is the same width in a row, in the
+   foot's lines and in the turn-time line whatever font each of them is set in; `--sign-gap` is the gap
+   after it. Everything that reads as text -- prose, a tool line, your message, a thought, an ending, the
+   time line, the activity line -- starts where the body does, `--body-edge` from the margin; only a sign
+   (a glyph, never selectable) stands in the cell before it.
+
+   `--tint-you` is the one surface that is yours: the messages you sent and the box you write the next
+   one in. It is `--nv-tint`, a small step from `--nv-bg` toward `--nv-fg` (the way Codex tints a user
+   row from the live background, so it follows every theme), mixed in Rust so that Rust can guard the
+   text drawn on it: `--nv-tint-fg` and `--nv-tint-muted`, never the body's `--nv-fg`/`--nv-muted`,
+   which are guarded against `--nv-bg` only and lose some of their margin on any tint. The permission
+   card's and a session-end row's tints are the same kind of fill with their own pairs
+   (`--nv-warn-tint*`, `--nv-error-tint*`). `--rule-soft` is the hairline of the tables, the scrollbar and a
+   code block's edge, a little stronger than the tint; `--rule-frame` is the frame round an edit, your
+   messages and the composer, a step stronger again so it holds on the tint. Both are line colours, never a
+   fill under text. */
+:root {
+  --page-pad: clamp(12px, 2.5vw, 40px);
+  --sign-w: calc(var(--fs-code) * 1.2);
+  --sign-gap: 6px;
+  --body-edge: calc(var(--sign-w) + var(--sign-gap));
+  --tint-you: var(--nv-tint);
+  --rule-soft: color-mix(in srgb, var(--nv-fg) 13%, var(--nv-bg));
+  --rule-frame: color-mix(in srgb, var(--nv-fg) 20%, var(--nv-bg));
+  --radius-block: 4px;
+}
+
+
+
+/* --- the sign-column grid ----------------------------------------------------------------------
+   One grid for the rows outside the conversation -- the turn review's rows, the start screen's handoff
+   row -- so their signs line up down the page however a body is built; their cursor is the current
+   row's sign cell (below). The conversation's own rows leave this grid for a sign cell of their own that
+   is drawn as generated content (the chat rows below). */
 .row {
   display: grid;
   grid-template-columns: var(--row-sign-w) minmax(0, var(--prose-measure));
   gap: 0 var(--row-gap);
   align-items: start;
   padding: 2px 0;
-  /* Every row reserves the same 2px, transparent unless a state below gives it a real colour.
-     With the global `box-sizing: border-box`, a border-left shrinks the content box it is on --
-     so a row that had NO border-left at all sat 2px further left than one that did, and the sign
-     column (this rule's whole reason to exist) was on two different x positions down the page.
-     Only the colour differs below; the width must not, or this same misalignment comes back. */
+  /* Every row on this grid reserves the same 2px, so the sign column sits on one x position down the
+     page whatever a row's own state; the review overlay's indented lines count it
+     (`calc(var(--row-gutter) + 2px)`). */
   border-left: 2px solid transparent;
-  /* The row's own content-box width, for the "escape the prose measure" rules far below (fenced
-     code, the permission-card diff and input, tool output) and the prompt's inset. A custom
-     property inherits through any number of plain wrapper elements, which is what lets it reach a
-     `<pre>` sitting several of them below `.row-body` -- the job a size query container
-     (`container-type: inline-size`, and `100cqw`) did here from 2026-09-20 to 2026-09-24.
-
-     **That container is gone, and it must not come back** (2026-09-24). In WebKitGTK 2.52.6 it made
-     the engine reset `.message-list`'s `scrollTop` to a stale value every time the status line's
-     elapsed counter ticked while a reply streamed, so the panel stopped following a reply about a
-     second in. This is pinned by
-     `shell/tests/panel_stream_scroll.rs` against the real
-     engine plus a display-free tripwire in `indexCss.test.ts`. A container on
-     `.row-body`, on `.message-list`, or on the assistant rows only was each measured to break the
-     same way.
-
-     `--list-inline-size` is the list's content-box width in px, written by `MessageList.tsx` before
-     the first paint and again only when the list is resized (never per streamed delta). The `2px`
-     is this rule's own `border-left`, which the global `box-sizing: border-box` takes out of the
-     content box -- exactly what `100cqw` measured. Before the first write (and in jsdom) the
-     fallback makes every escape degrade to "no escape" (`max(100%, ...)` below) and the prompt's
-     inset to 0, never to an overflow. */
-  --row-inline-size: calc(var(--list-inline-size, 0px) - 2px);
 }
-/* The cursor `j`/`k` move and `Enter`/`y` act on:
-   `--nv-cursorline` is a BACKGROUND (nvim's own `Visual` highlight token, the same one
-   `.row-choice:hover` already paints with), not text, so `indexCss.test.ts`'s
-   text-colour guard does not apply to this rule at all. Kept separate from the signal-colour
-   border rules above: a row can be both the current row and, say, an error row at once, and the
-   two cues must not fight each other for the same 2px border. */
+/* The current row of a list drawn on the sign-column grid (the review overlay): `--nv-cursorline` is a
+   BACKGROUND (nvim's own `Visual` highlight token), not text, so `indexCss.test.ts`'s text-colour guard
+   does not apply to it. */
 .row-current {
   background: var(--nv-cursorline);
 }
-/* In the conversation the fill is not the row's own: it is one band behind the rows that glides from the
-   row the cursor left to the row it reached, as Neovide's cursor glides (`cursorBand.ts`). Same token, same
-   full strength, so the same guaranteed contrast under `--nv-fg` text (the band's comment above). The
-   row's sign cell stays the row's. The band takes no pointer events and sits under every row's content
-   (`z-index: -1` in the list's stacking context), so it covers no text, selection or button. It is hidden
-   wherever the row fill was turned off: the panel without the keys, and VISUAL. */
+/* In the conversation the cursor is vim's cursorline, not the row's own fill: one flat band behind the
+   rows that glides from the row the cursor left to the row it reached, as Neovide's cursor glides
+   (`cursorBand.ts` measures the row's box). It runs the width of the column, a little past the text into
+   the margin each side (`MessageList.tsx`, `bandBox`) -- the list's whole width in a narrow panel -- and is
+   three pixels taller than the row at each end. It is drawn lighter than the
+   editor's cursorline -- a mix of `--nv-cursorline` into `--nv-bg`, so a whole reply under it still reads
+   as a page -- with square corners and no mark of its own: where the keys are is said by the band's place
+   and by the status band's mode block. Text on it is `--nv-fg`/`--nv-muted`, and Rust guards each of
+   those against both fills the mix is made of, so any mix of the two reads too. The band takes no pointer
+   events and sits under every row's content (`z-index: -1` in the list's stacking context), so it covers
+   no text, selection or button. VISUAL hides it (the selection is the cursor there). Without the keys it
+   is the same band at a weaker mix, so coming back to the panel shows where `j`/`k` continue from. A
+   control focused inside the current row, or a code block the global f HINT landed on, is drawn as its
+   own solid or outlined mark over the band. The measured height is the row's; the three pixels each end
+   are the band's own `top` offset and bottom padding. */
 .message-list > .row-current {
   background: none;
 }
 .cursor-band {
+  --band-fill: color-mix(in srgb, var(--nv-cursorline) 45%, var(--nv-bg));
   position: absolute;
-  top: 0;
+  top: -3px;
   left: 0;
   z-index: -1;
   pointer-events: none;
-  background: var(--nv-cursorline);
+  box-sizing: content-box;
+  padding-bottom: 6px;
+  background: var(--band-fill);
 }
 .cursor-band[data-row="none"],
-.message-list[data-focused="false"] > .cursor-band,
 .message-list[data-visual] > .cursor-band {
   display: none;
 }
-/* The row `y`/`Y` just copied, flashed for 400ms (`App.tsx`'s `copied`, codecompanion's yank
-   flash) so a keypress with no visible result of its own still tells the reader something happened.
-   **Correction:** `y`/`Y` always act on `timeline[cursor]` (`App.tsx`), so the row
-   this class lands on already carries `.row-current`'s cursorline fill -- painting the identical
-   `background: var(--nv-cursorline)` again is a no-op the reader never sees. An inset outline in
-   `--nv-ok` (already an admitted non-text colour, the same token `.row-tool[data-sign="✓"]` below
-   uses for a successful tool row) reads as "copied" and stays visible on top of the cursorline fill,
-   with no new token and no new text-colour-guard exemption. */
+.message-list[data-focused="false"] > .cursor-band {
+  --band-fill: color-mix(in srgb, var(--nv-cursorline) 20%, var(--nv-bg));
+}
+/* The row `y`/`Y` just copied, flashed for 400ms (`App.tsx`'s `copied`, codecompanion's yank flash) so
+   a keypress with no visible result of its own still tells the reader something happened: an inset
+   outline in `--nv-ok`, a non-text colour, which stays visible over the cursor band under the same
+   row. */
 .row-yanked {
   outline: 2px solid var(--nv-ok);
   outline-offset: -2px;
@@ -759,41 +835,19 @@ body,
   line-height: 1.65;
   user-select: none;
 }
-/* In variant C, the prompt row's own `›` reads `--nv-fg`, not the base rule's
-   `--nv-muted` -- the same colour `.row-prompt .row-body` below now uses for the text itself, so
-   the whole row (glyph and words) reads as one speaker cue rather than the sign being a step
-   fainter than the message it marks. Placed BEFORE `.row-current .row-sign` in source order,
-   deliberately: the two rules are equal specificity ((0,2,0) each), so on a row that is both
-   `.row-prompt` and `.row-current` the LATER rule wins the tie -- and the cursor's own colour has
-   to win there (Global Constraint: `--nv-bg` as text only in `.row-current .row-sign`), so this
-   rule must come first. `indexCss.test.ts` pins both the ordering and the live cascade result. */
-.row-prompt .row-sign {
-  color: var(--nv-fg);
-}
-/* The panel's cursor is its current row's sign cell, drawn the way the editor's cursor sits on a
-   character: a solid block with the glyph knocked out while the panel has the keys, the same block
-   hollow while it does not (2026-09-19). The editor's is Neovide's own hollow-when-unfocused block
-   and the top bar's focused item is the same shape again, so the whole window
-   says "the keys go here" one way: solid.
-   A hollow cursor also shows where you land on coming back.
+/* On the sign-column grid the cursor is the current row's sign cell, drawn the way the editor's cursor
+   sits on a character: a solid block with the glyph knocked out. The editor's is Neovide's own block,
+   and the top bar's focused item is the same shape again, so the whole window says "the keys go here"
+   one way: solid. The conversation draws its cursor as the band above instead, and its rows draw their
+   signs as generated content (the chat rows below), never as this cell.
 
-   The solid block is `--nv-bg` text on an `--nv-fg` fill: the body's own guarded text pair,
-   reversed, so the same contrast. `indexCss.test.ts` admits `--nv-bg` as text ONLY in a rule that
-   is entirely `.row-current .row-sign` and fills it with `--nv-fg`. The unfocused state lives on
-   `.message-list[data-focused]`, set by `App.tsx` from the `pane_focus` envelope. It drops the row's
-   cursorline fill too, so the one thing still marking the row is the hollow cell. */
+   The solid block is `--nv-bg` text on an `--nv-fg` fill: the body's own guarded text pair, reversed,
+   so the same contrast. `indexCss.test.ts` admits `--nv-bg` as text ONLY in a rule that is entirely
+   `.row-current .row-sign` and fills it with `--nv-fg`. */
 .row-current .row-sign {
   background: var(--nv-fg);
   color: var(--nv-bg);
   border-radius: 2px;
-}
-.message-list[data-focused="false"] .row-current {
-  background: none;
-}
-.message-list[data-focused="false"] .row-current .row-sign {
-  background: none;
-  color: var(--nv-fg);
-  box-shadow: inset 0 0 0 1.5px var(--nv-fg);
 }
 /* In visual mode, the DOM
    selection while VISUAL/V-LINE is on reads in nvim's own Visual colour (the same `--nv-cursorline`
@@ -856,125 +910,253 @@ textarea,
 .row-body {
   font-family: var(--nv-font-prose);
   font-size: var(--fs-prose);
-  line-height: 1.65;
+  line-height: 1.7;
   min-width: 0;
 }
-/* Your own message (2026-09-21). It used to be muted text flush with the left edge, which made the
-   thing YOU typed the faintest thing on the page and left the two speakers distinguishable only by
-   a glyph. It is now displaced to the right in proportion to the panel (`--prompt-inset` above) and
-   marked with a rule down its own left edge.
 
-   **It is deliberately not a bubble.** A filled, rounded, right-hugging pill is the signature of
-   every other chat product -- Cursor's is `border-radius: 12px` on a bordered, filled
-   `width: fit-content` box. Three candidates were rendered at 560px and 1150px,
-   light and dark, before this one was
-   chosen: a filled square block read as a fourth kind of card (it competed with `.tool-card` and
-   `.permission-card`, which are the panel's real boxes and use `--nv-surface` for exactly that),
-   and position alone read as an accidental indent. The rule is this panel's own vocabulary --
-   state travels on a border and never on text colour, the same sentence three comments in this
-   file already make -- applied to a different edge of a different element than the row's own
-   signal border, so the two cannot be confused.
+/* --- the conversation's rows ---------------------------------------------------------------------
+   The page reads like a terminal session in Neovim's own idiom: one left edge and a sign column. Every
+   row is a grid of a sign cell and a body (`--sign-w`, `--sign-gap`), and the sign is the row's own
+   `data-sign` drawn as generated content, so it is never part of a selection or of what `y` and VISUAL
+   copy, and the empty alternative text keeps a screen reader from reading it out beside the row's words;
+   `.row-sign`, the cell the other lists draw, stays hidden and chrome to VISUAL. Rows align on their first
+   line's baseline, so a sign sits level with the text it belongs to whatever size the row's text is. An
+   assistant reply has no sign: its cell is empty and its text starts at the same edge as everything else.
+   There is never a coloured rail down a row's side. Quiet things stay quiet -- prose is prose, a tool call
+   is one muted line -- and a frame goes only round what a reader reviews or answers: an edit, a failure's
+   output, the permission card, a code block, and your own messages and the box you write them in. Every
+   frame is 1px at `--radius-block`, with no shadow. Spacing says what belongs together: a turn opens with air above your message,
+   tool lines and thoughts sit close, and the reply after them takes its air back.
 
-   The rule is `--nv-muted`, based on measured contrast: it was
-   `--nv-border` first, which Rust derives as `bg.mix(fg, 0.15)` and does not contrast-guard --
-   1.27:1 on rose-pine dawn, 1.15:1 once the cursor is on your own message. Below the knee the
-   inset is exactly 0, so that hairline is the ENTIRE speaker cue. `--nv-muted` is one of the two
-   colours Rust guards for text (>= 4.5:1), far past the 3:1 WCAG 1.4.11 asks of a meaningful
-   non-text indicator. Colour on a border, never on the glyph -- the same rule every signal here
-   follows. `--nv-fg` replaces `--nv-muted` on the text itself, also a guarded-for-text colour, so
-   `indexCss.test.ts`'s colour scan is satisfied by construction rather than by exemption. The sign
-   column does NOT move: it is the spine the whole document lines up on.
+   A sign is not text, so its colour is held to the non-text threshold: `--nv-error` is guarded at 3:1
+   against `--nv-bg`, and the running mark takes the accent the activity line's star is drawn in
+   (`indexCss.test.ts` admits exactly these two, on exactly these glyphs); every other sign is muted. */
+.message-list > .row {
+  display: grid;
+  grid-template-columns: var(--sign-w) minmax(0, 1fr);
+  column-gap: var(--sign-gap);
+  align-items: baseline;
+  padding: 0;
+  border-left: 0;
+}
+.message-list > .row::before {
+  content: attr(data-sign);
+  content: attr(data-sign) / "";
+  grid-column: 1;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
+  color: var(--nv-muted);
+}
+.message-list > .row > .row-body {
+  grid-column: 2;
+}
+.message-list .row-sign {
+  display: none;
+}
+.row-tool[data-sign="◐"]::before {
+  color: var(--nv-chrome-accent);
+}
+.row-tool[data-sign="✗"]::before {
+  color: var(--nv-error);
+}
+/* A card that is waiting is marked with the flag the status band counts it by, not the `!` the row
+   carries as data. */
+.message-list > .row-permission::before {
+  content: "⚑";
+  content: "⚑" / "";
+}
+.message-list > .row + .row {
+  margin-top: 10px;
+}
+/* "Worked for 1m 23s" under a finished turn's last row (`turnTimes.ts`): muted, small, at the body's
+   edge, a little below the row. Chrome, not a row: it carries no `data-nav-stop`, so the cursor never
+   lands on it, and its text sits in an `aria-hidden` span, which VISUAL's copy leaves out like the other
+   chrome. Sitting between two rows, it gives the row after it the gap two rows have. */
+.turn-time {
+  margin: 6px 0 0;
+  padding-left: var(--body-edge);
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+}
+.message-list > .turn-time + .row {
+  margin-top: 10px;
+}
 
-   **Variant C increases the separation between prompts and replies:**
-   the rule moved from `--nv-muted` to `--nv-fg` (the same
-   `.row-sign` change just above), the text itself steps down one size to `--fs-base` (a rung below
-   the reply's own `--fs-prose`), and a turn boundary got its own hairline (`.row-prompt:not
-   (:first-child)`, below), in `--nv-border` rather than this rule's own colour -- a different edge
-   of a different element, so the two signals stay distinguishable from each other the same way this
-   rule was already kept distinguishable from `.tool-card`/`.permission-card`. This variant has not
-   been finalised; it is built as the recommended option and is meant to be
-   overridable, not final. */
+/* Your own message: a bubble at the body's edge, its `›` in the sign cell outside it -- a soft fill
+   (`--tint-you`) with round corners and no frame, the way a chat draws what you said, so your words tell
+   apart from the agent's at a glance without reading as a card or a button. It is as wide as its text
+   needs, up to the right margin, so a one-line request is a short bubble and not a slab across a wide
+   panel. The text is the tint's own `--nv-tint-fg`, with its own line breaks kept. A long token with no
+   space in it (a pasted JWT) breaks inside the bubble rather than scrolling the whole conversation
+   sideways. */
 .row-prompt .row-body {
-  color: var(--nv-fg);
-  white-space: pre-wrap;
-  margin-left: clamp(
-    0px,
-    (var(--row-inline-size) - var(--prompt-inset-knee)) * var(--prompt-inset-slope),
-    min(var(--prompt-inset-cap) * (var(--row-inline-size) / 100), var(--prompt-inset-cap-max))
-  );
-  border-left: 2px solid var(--nv-fg);
-  padding-left: 10px;
+  justify-self: start;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 7px 14px;
+  border-radius: 12px;
+  background: var(--tint-you);
+  color: var(--nv-tint-fg);
   font-size: var(--fs-base);
   line-height: 1.6;
-  /* A review predicted the inset would newly push an unbreakable token out of the row. Measured
-     against the PRISTINE stylesheet, it is not a regression -- it is a live bug, and worse today:
-     a 110-char token in a prompt (what pasting a JWT looks like) scrolls the whole conversation
-     sideways by 533px at a 420px panel and 53px at 900px on the build before this change, against
-     1px at every width with this line. The sign-column spine moves with it, which is the part that
-     makes it more than cosmetic. `.row-error pre` and `.tool-result-body` already carry
-     `word-break` for the same reason; the one `pre-wrap` block without it was the user's own
-     message. `anywhere` rather than `break-word` because it also lets the line BREAK for
-     min-content sizing, which is what stops the grid being sized by the token in the first
-     place. */
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-/* A turn boundary: `.row-prompt .row-body`'s own 2px `--nv-fg` rule
-   above already says WHOSE message this is; this hairline says where one turn ends and the next
-   begins, on the row's OWN top edge rather than the body's left one, in `--nv-border` (a line
-   colour, never a fill under text -- "uses --nv-border only for rules" elsewhere in this file) so
-   the two signals cannot be mistaken for each other. `:not(:first-child)` rather than a
-   `.row + .row-prompt` sibling selector: the very first row in the conversation must not carry a
-   separator above it (there is no prior turn), and `:first-child` is the one condition that is true
-   regardless of what row type, if any, precedes it -- `.row + .row-prompt` would draw the line even
-   on that very first row if `HistoryNotice` (a non-`.row` sibling `MessageList.tsx` renders above
-   the timeline on a resumed session) happens to be present, which this selector still gets wrong in
-   that one case and is recorded here rather than silently claimed fixed. */
-.row-prompt:not(:first-child) {
+/* A turn opens with air above your message. Two messages sent back to back (queued while a turn ran, or
+   sent in a quick burst) are one turn's input and sit together: that rule names `:not(:first-child)`
+   again only to outrank the opening margin at every width (the wide block raises it). The row after
+   your message gets a little more room than two of the agent's rows do. */
+.message-list > .row-prompt:not(:first-child) {
+  margin-top: 26px;
+}
+.message-list > .row-prompt + .row-prompt:not(:first-child) {
+  margin-top: 6px;
+}
+.message-list > .row-prompt + .row:not(.row-prompt) {
+  margin-top: 14px;
+}
+/* A message you put into a running turn, drawn where the agent read it (`row-prompt-delivered`): it is
+   part of that turn, not the start of a new one, so it takes the gap any two rows have rather than the
+   air a turn opens with. One class more than the opening rule, so it wins at every width without
+   repeating the wide block. */
+.message-list > .row-prompt.row-prompt-delivered:not(:first-child) {
   margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--nv-border);
 }
-/* Two prompts sent back to back, with no reply between them (queued while a turn was running, or
-   sent in a fast burst): they are still one turn's worth of input, so they share ONE hairline
-   above the first of the pair rather than drawing a second one directly under it. */
-.row-prompt + .row-prompt {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: none;
-}
-/* The row right after a prompt (the reply, almost always) gets a little more breathing room than
-   the bare 4px two adjacent `.row`s' own `padding: 2px 0` already gives every other row pair --
-   the turn separator above puts 10px above a NEW prompt, and a reply immediately below a prompt
-   reads better with more than the default gap too, even though it carries no rule of its own. */
-.row-prompt + .row:not(.row-prompt) {
-  margin-top: 4px;
-}
+
+/* A tool call is one quiet line: mono, muted, its status in the sign cell in front of it -- ✓ done,
+   ✗ failed, ◐ still running. Success is the expected case and stays muted; only a failure, or something
+   still running, takes a colour on its glyph (the note at the head of this section). Tool lines and
+   thoughts sit close; the reply after them takes its air back. */
 .row-tool .row-body {
   font-family: var(--nv-font-mono);
   font-size: var(--fs-code);
 }
-/* Signal colour goes on a border, never on the sign's own text. `indexCss.test.ts` pins every
-   `color:` declaration in this file to --nv-fg/--nv-muted -- Rust guards only those two for text;
-   --nv-warn/--nv-error/--nv-ok are guarded to 3:1, enough for a border or a rule (WCAG 1.4.11), not
-   for text (1.4.3 wants 4.5:1), and this file already once measured 2.05-3.84:1 the other time a
-   signal colour went on text. The glyph (◐/✓/✗/!/→) is what actually carries the state; the border
-   is the second, non-load-bearing cue -- never colour alone, but never colour ON the glyph either. */
-.row-permission {
-  border-left: 2px solid var(--nv-warn);
+.row-tool .row-body,
+.row-tool-run .row-body {
+  line-height: 22px;
 }
-.row-tool[data-sign="✗"] {
-  border-left: 2px solid var(--nv-error);
+.message-list > .row-tool + .row-tool,
+.message-list > .row-tool + .row-tool-run,
+.message-list > .row-tool-run + .row-tool,
+.message-list > .row-tool-run + .row-tool-run {
+  margin-top: 4px;
 }
-.row-tool[data-sign="✓"] {
-  border-left: 2px solid var(--nv-ok);
+.message-list > .row-tool + .row-assistant,
+.message-list > .row-tool-run + .row-assistant {
+  margin-top: 14px;
 }
-.row-error {
-  border-left: 2px solid var(--nv-error);
+
+/* The agent's thinking: `∴ Thought · 4 lines ▸`, muted italic, a step smaller than a reply, and plain
+   text -- the provider's own words, drawn as they came (`MessageList`'s `ThinkingBody`), so `pre-wrap`
+   keeps its line breaks and `anywhere` lets a long token break instead of widening the row. An opened
+   thought is indented no further than the line that heads it. It sits among the tool lines with their
+   spacing. */
+.row-thinking .row-body {
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+  line-height: 22px;
 }
-/* `state.status.reason` on the lost-session row: restores the wrapping `.session-lost pre` had
-   before panel-as-document task 3 dropped it with no replacement. Without it the reason (often a
-   long transport-error string) renders on one unwrapped line and overflows the 62ch column, which
-   is the opposite of `App.tsx`'s own comment that this text "is rendered in full". */
+.thinking-head {
+  font-style: italic;
+}
+/* The provider's text, which may be written right to left or carry stray direction marks: isolated, so
+   its direction cannot reorder the row around it. */
+.thinking-text,
+.thinking-preview {
+  margin-top: 2px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+  unicode-bidi: isolate;
+}
+/* While a thought is written, `preview` shows its newest lines in a box of fixed height: lines arriving
+   push the oldest out at the top instead of moving every row below. Flex with its content at the end is
+   what keeps the newest line at the bottom edge and lets an overflow leave at the top. */
+.thinking-preview {
+  height: calc(4 * 1.55em);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+.message-list > .row-thinking + .row-tool,
+.message-list > .row-thinking + .row-tool-run,
+.message-list > .row-thinking + .row-thinking,
+.message-list > .row-tool + .row-thinking,
+.message-list > .row-tool-run + .row-thinking {
+  margin-top: 4px;
+}
+.message-list > .row-thinking + .row-assistant {
+  margin-top: 14px;
+}
+
+/* A reply's prose: the first and last block sit flush with the row, paragraphs and lists keep a modest
+   rhythm, and a heading is told apart by weight first and size second. An inline code span sits on your
+   own tint, a step smaller than the prose around it. */
+.row-assistant .row-body > div > :first-child {
+  margin-top: 0;
+}
+.row-assistant .row-body > div > :last-child {
+  margin-bottom: 0;
+}
+.row-assistant p {
+  margin: 0 0 0.7em;
+}
+.row-assistant :is(h1, h2, h3, h4) {
+  font-size: var(--fs-heading);
+  font-weight: 600;
+  line-height: 1.4;
+  margin: 1.1em 0 0.45em;
+}
+.row-assistant :is(ul, ol) {
+  margin: 0 0 0.7em;
+  padding-left: 1.3em;
+}
+.row-assistant li + li {
+  margin-top: 0.2em;
+}
+
+/* A turn that did not complete -- failed, hit a limit, was interrupted, or was cut off by the session
+   ending -- says so where it stopped: a quiet marker, small, muted and italic. It is information, and
+   the words carry it, so no signal colour is drawn on the text. The provider's own message can hold line
+   breaks and a long unbroken token (a URL, a request id): `pre-line` keeps the breaks and wraps at
+   spaces, `anywhere` lets a long token break instead of widening the column. */
+.row-ending .row-body {
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+  font-style: italic;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+/* The session's end, said under the conversation in the foot (`App.tsx` draws it between the list and the
+   activity line): a lost session as a flat block on `--nv-error-tint`, its text in that tint's guarded
+   pair, an ordinary end as a muted line. Neither draws its sign cell. */
+.agent-ui-conversation > .row {
+  display: block;
+  box-sizing: border-box;
+  margin: 8px var(--page-pad) 0;
+  padding: 0;
+  border-left: 0;
+}
+.agent-ui-conversation > .row > .row-sign {
+  display: none;
+}
+.agent-ui-conversation > .row-error {
+  padding: 8px 12px;
+  border-radius: var(--radius-block);
+  background: var(--nv-error-tint);
+  color: var(--nv-error-tint-fg);
+}
+.agent-ui-conversation > .row-error pre {
+  color: var(--nv-error-tint-fg);
+}
+.agent-ui-conversation > .row-error .row-problem-remedy,
+.agent-ui-conversation > .row-error .row-hint {
+  color: var(--nv-error-tint-muted);
+}
+/* `state.status.reason` on the lost-session row, wrapped: the reason is often a long transport-error
+   string, and it is shown in full. */
 .row-error pre {
   margin: 8px 0 0;
   white-space: pre-wrap;
@@ -983,10 +1165,10 @@ textarea,
   color: var(--nv-fg);
   user-select: text;
 }
-/* `Row`'s own `problem` prop draws a headline (inherits `.row-body`'s own text
-   colour -- no `color:` here, so the guard above never has to look at it) and a remedy line ABOVE
-   whatever the row already rendered (`.row-error pre`'s raw text included, unchanged and below).
-   The remedy reads as secondary, the same `--nv-muted` `.row-hint` already uses for "press r". */
+/* `Row`'s `problem` prop draws a headline (inheriting `.row-body`'s text colour, so it declares none)
+   and a remedy line ABOVE whatever the row already rendered (`.row-error pre`'s raw text included,
+   unchanged and below). The remedy reads as secondary, the same `--nv-muted` `.row-hint` uses for
+   "press r". */
 .row-problem {
   margin-bottom: 6px;
 }
@@ -994,97 +1176,25 @@ textarea,
   color: var(--nv-muted);
   margin-top: 2px;
   /* A remedy can carry its own line breaks ("Looked for it at:" and the paths, one a line, for a
-     missing sidecar): the v1-ui GUI pass (2026-09-27) saw them run together into one line. */
-  white-space: pre-line;
-}
-/* An ordinary ending (the host closed it, the provider exited cleanly) -- deliberately NOT
-   `row-error`. A clean end is not an error.
-   Informational, not alarming -- styling this like a loss would train the eye to ignore the one
-   that matters. No signal colour and no `✗`, so a reader cannot mistake this for the row above. */
-.row-ended .row-body {
-  color: var(--nv-muted);
-}
-/* A turn that did not complete -- failed, hit a limit, was interrupted, or was cut off by the session
-   ending -- says so where it stopped. Muted like `.row-ended` and for the same reason: it is
-   information, and the glyph and the words carry it, so no signal colour is drawn on the text. The
-   provider's own message can hold line breaks and a long unbroken token (a URL, a request id):
-   `pre-line` keeps the breaks and wraps at spaces, `anywhere` lets a long token break instead of
-   widening the column. */
-.row-ending .row-body {
-  color: var(--nv-muted);
+     missing sidecar), which must not run together into one line; a path longer than the row breaks
+     anywhere rather than running out of a narrow panel. */
   white-space: pre-line;
   overflow-wrap: anywhere;
+}
+/* An ordinary ending (the host closed it, the provider exited cleanly) is deliberately not drawn like a
+   lost session: it is information, not alarm, and styling it like a loss would train the eye to ignore
+   the one that matters. */
+.row-ended .row-body {
+  color: var(--nv-muted);
 }
 .row-hint {
   color: var(--nv-muted);
   font-size: var(--fs-code);
   margin-top: 4px;
 }
-/* --- wide content escapes the 62ch prose measure -------------------------
-   `.row`'s body track is `minmax(0, 62ch)` -- a readable prose measure.
-   Fenced code (`.code-block`) and tool output
-   (`.tool-result-body`) are not prose, sit several PLAIN wrapper elements below `.row-body`
-   (`renderMarkdown`'s own unstyled wrapper div for the former, `[data-awaiting-permission]` >
-   `.tool-call` > `.tool-result` for the latter -- none of which carries a class this file styles),
-   and should use whatever width the panel actually has instead of wrapping at 62 characters.
-
-   `.row-body` itself cannot simply stop being capped: it is ONE grid cell holding a mix of prose
-   and wide content for `.row-assistant` (a markdown reply can have both), so the cap has to come
-   off the wide elements individually, not off their container. Subgrid was the other candidate
-   and does not reach through those plain wrappers -- subgrid placement only promotes a grid
-   container's DIRECT children, and every wrapper between here and `.row-body` would have to
-   become `display: contents` (removing its own box) to relay it further, which `.tool-card` and
-   `.permission-card` cannot afford: their background/border/padding IS their box.
-
-   `.row`'s own `container-type: inline-size` (above) is what a `cqw` unit below is relative to,
-   and a container query reaches through any number of plain elements in between by definition --
-   the property subgrid does not have. `100cqw` is `.row`'s own full content-box width, the same
-   box its grid tracks are laid out inside, so `calc(100cqw - 30px)` -- 22px sign column + 8px
-   column gap, the same two numbers the grid above already uses -- lands exactly on `.row`'s own
-   right edge: as far right as a full-width prose line would reach if the body track had no cap at
-   all. On a panel narrower than 62ch this is IDENTICAL to `.row-body`'s own width (the track's
-   `minmax(0, ...)` has already given it all of `100cqw - 30px` at that point), so nothing here
-   overflows a narrow panel -- see indexCss.test.ts's cascade test for both directions.
-
-   **Correction (2026-09-24): the mechanism changed, the geometry did not.** The query container
-   is gone (see the `.row` rule for why: in WebKitGTK it made the list lose its reader while a
-   reply streamed). The row's content-box width now reaches these rules as `--row-inline-size`, a
-   custom property `.row` derives from the list's measured width, and custom properties inherit
-   through plain elements just as a container query reached through them. So every `100cqw` below
-   is `var(--row-inline-size)`, and the right edge each rule lands on is the same one. Each is also
-   wrapped in `max(100%, ...)`: until `MessageList.tsx` has measured the list, `--row-inline-size`
-   is `-2px`, and the escape degrades to its containing block's own width -- "no escape" -- rather
-   than to a negative or tiny width.
-
-   `.tool-card-generic` joined this list, alongside `.code-block`/`.tool-result-body`
-   rather than the way `.permission-card-edit` does further down: its own left edge already sits
-   flush with `.row-body`'s (it is a direct-enough descendant, through `.tool-call` and
-   `[data-awaiting-permission]` -- neither carries a rule here either), so no compensating
-   `margin-left` is needed, same as the first two. An unrecognized tool's raw JSON dump is a fourth
-   `<pre>` under this same 62ch cap and had been missed the first time this list was written. */
-.code-block,
-.tool-result-body,
-.tool-card-generic {
-  width: max(100%, calc(var(--row-inline-size) - var(--row-gutter)));
-}
-/* The one state where the `- 30px` above is wrong.
-   `.tool-result-error` below adds `border-left: 2px` + `padding-left: 6px` to `.tool-result`, the
-   DIRECT parent of `.tool-result-body` (`toolRegistry.tsx`: `<div className={"tool-result" +
-   (result.isError ? " tool-result-error" : "")}>`). The rule above assumes that parent is flush
-   with `.row-body`, which on the error path it is not: the child's content box starts 8px in and,
-   at a width equal to the full body track, ended 8px past `.row`'s right edge -- eating into
-   `.message-list`'s 12px right padding, so no scrollbar and nothing visibly broken, but it is the
-   alignment the whole rule exists to get right. `.tool-result-error .tool-result-body` is (0,2,0)
-   against (0,1,0) and sits later in the file, so it wins twice over. */
-.tool-result-error .tool-result-body {
-  /* The 8px is `.tool-result-error`'s own gutter -- its `border-left: 2px` plus `padding-left: 6px`
-     -- taken off the escape rather than written as a second magic number. */
-  width: max(100%, calc(var(--row-inline-size) - var(--row-gutter) - 8px));
-}
-/* The JSON dump itself: an ordinary block `<pre>` with no width of its own, so it already fills
-   whatever width `.tool-card-generic` above gives its box. `overflow-x: auto` is what keeps ONE
-   unusually long line (a long string value, say) from bleeding past that box's own border/
-   background rather than scrolling inside it -- the same role `.code-block`'s own `overflow-x`
+/* An unrecognized tool's raw JSON dump: an ordinary block `<pre>` with no width of its own, so it fills
+   the card. `overflow-x: auto` is what keeps ONE unusually long line (a long string value, say) from
+   bleeding past the card rather than scrolling inside it, the role `.code-block`'s own `overflow-x`
    plays for a fenced code block. */
 .tool-card-generic pre {
   overflow-x: auto;
@@ -1105,123 +1215,190 @@ textarea,
   overflow-wrap: anywhere;
 }
 
-/* Text on a card is `--nv-surface-fg`/`--nv-surface-muted`, guarded against the card's own fill;
-   the body's `--nv-fg`/`--nv-muted` are guarded against `bg` (sw-theme-2). */
+/* A tool call's own line: one quiet mono line in the body's muted ink, no box -- a tool call is the
+   agent at work, not something waiting on you. Its status is the row's glyph column (the chat rows
+   above). The line sits on `--nv-bg`, so its text is the body's pair. */
 .tool-card {
-  background: var(--nv-surface);
-  color: var(--nv-surface-fg);
-  border-left: 3px solid var(--nv-mode-browse);
-  padding: 6px 10px;
-  border-radius: 4px;
+  margin: 0;
+  color: var(--nv-muted);
   font-family: var(--nv-font-mono);
   font-size: var(--fs-code);
 }
 .tool-card-skill {
-  border-left-color: var(--nv-ok);
   font-style: italic;
 }
-/* T1: a table scrolls in its own box, cells never break mid-word; the list never scrolls sideways
-   (see `.message-list: nothing scrolls it sideways` below, which this joins). */
+/* A call a card is waiting on keeps full-strength text: it is not receding, it is the reason a card is
+   on screen at all. */
+.tool-card-gated {
+  color: var(--nv-fg);
+}
+/* The fold marker recedes behind the line it closes. */
+.fold-marker {
+  opacity: 0.7;
+}
+/* A table scrolls in its own box and its cells never break mid-word, so the list never scrolls sideways
+   (`.message-list`); it has no frame and no corners: a bold head over one hairline, and a hairline
+   between rows. The head has no fill, so every cell is the body's own ink on `--nv-bg`. */
 .table-scroll {
   overflow-x: auto;
   max-width: 100%;
+  margin: 0.2em 0 0.9em;
+}
+.table-scroll table {
+  border-collapse: collapse;
+  font-size: var(--fs-base);
 }
 .table-scroll th,
 .table-scroll td {
+  padding: 5px 12px;
+  text-align: left;
+  vertical-align: top;
   overflow-wrap: normal;
   word-break: normal;
 }
-/* ToolSearch's line, and a collapsed run, recede -- neither is an action waiting on you. */
-.tool-card-muted,
-.tool-card-run {
-  color: var(--nv-surface-muted);
+.table-scroll th:first-child,
+.table-scroll td:first-child {
+  padding-left: 0;
 }
-/* A gated call's own line stays full-strength text (unlike the muted rows above) -- it is not
-   receding, it is the reason a card is on screen at all. */
-.tool-card-gated {
-  color: var(--nv-surface-fg);
+.table-scroll th {
+  font-weight: 600;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.table-scroll tr + tr td,
+.table-scroll thead + tbody tr:first-child td {
+  border-top: 1px solid var(--rule-soft);
+}
+.table-scroll thead + tbody tr:first-child td {
+  border-top: 0;
 }
 /* A `Bash` call's command is a `<pre>` (`toolRegistry.tsx`), and a `<pre>` keeps the UA's
-   `white-space: pre` -- no wrapping at all, not even at its spaces -- so a long command was the
-   GUI pass's case of the whole conversation scrolling sideways (see `.message-list`). It wraps like
-   the tool's own output below it (`.tool-result-body`); newlines in a multi-line command still show. */
+   `white-space: pre` -- no wrapping at all, not even at its spaces -- so a long command would scroll
+   the whole conversation sideways (see `.message-list`). It wraps like the tool's own output below it
+   (`.tool-result-body`); newlines in a multi-line command still show. */
 .tool-card-bash {
   white-space: pre-wrap;
 }
-/* A tool call's outcome, drawn for every tool. The three states have to be distinguishable at a
-   glance and not by colour alone -- "has this already run?" was unanswerable from the panel while
-   only errors were ever printed. */
-.tool-result {
-  margin-top: 4px;
+/* A tool call's outcome, drawn for every tool, under its line and indented to the body's edge. Each
+   output block opens with a muted `⎿` in a cell of its own, Claude Code's connector from a call to what
+   it printed (generated content: it is never selected or copied, and the empty alternative text keeps a
+   screen reader from reading it). The block has no fill, no frame and no rail, so its text is the
+   body's pair on `--nv-bg`: muted for an output that went well, `--nv-fg` for a failure's, which is
+   what sets it apart -- the row's `✗` carries the red. The three states still tell apart by more than
+   colour: the row's status glyph, the words, and the output itself. */
+.tool-result,
+.tool-result-preview {
+  display: grid;
+  grid-template-columns: var(--sign-w) minmax(0, 1fr);
+  column-gap: var(--sign-gap);
+  align-items: baseline;
   font-family: var(--nv-font-mono);
   font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.tool-result::before,
+.tool-result-preview::before {
+  content: "⎿";
+  content: "⎿" / "";
+  grid-column: 1;
+  grid-row: 1;
+  color: var(--nv-muted);
+}
+.tool-result > *,
+.tool-result-preview > * {
+  grid-column: 2;
 }
 .tool-result-pending {
   color: var(--nv-muted);
   font-style: italic;
 }
-/* sw-panel-render-6: a `null` result the panel knows can never arrive -- not a rerun of
-   `.tool-result-pending`'s "still running" claim, so it gets its own class even though today it
-   reads identically. */
+/* A `null` result the panel knows can never arrive -- not a rerun of `.tool-result-pending`'s "still
+   running" claim, so it gets its own class even though today it reads identically. */
 .tool-result-abandoned {
   color: var(--nv-muted);
   font-style: italic;
 }
-/* Signal colours (`--nv-warn`, `--nv-error`, `--nv-ok`, `--nv-mode-*`) are never text colours here.
-   Rust guards the first three at 3:1, which is enough for a border, a rule, a tint or a dot (WCAG
-   1.4.11) and not for 12px text (1.4.3, 4.5:1); the mode colours are not guarded at all. Drawn as
-   text on rose-pine dawn they measured 2.05:1 to 3.84:1. So a warning's or an error's text is
-   `--nv-fg`, and the colour goes on the border or on a rule beside it -- a rule that is there or not
-   is also a cue that does not depend on colour. `indexCss.test.ts` holds every `color:` here to
-   `--nv-fg`/`--nv-muted`. */
-.tool-result-error {
-  color: var(--nv-fg);
-  border-left: 2px solid var(--nv-error);
-  padding-left: 6px;
-}
-/* A folded, finished call's result preview (`toolRegistry.tsx`'s `ToolResultPreview`): its first lines and
-   how many more there are, so a row says how much output a command made and whether it failed without
-   being opened. It stays inside the row's text track and never scrolls: each line is cut at the track's
-   edge with an ellipsis instead of wrapping, so three lines are three lines of height whatever the output
-   holds. The track is `minmax(0, 1fr)` so a long line cannot widen the row past the list (a grid track
-   with a zero minimum contributes nothing to its container's minimum width, which a plain block of
-   `white-space: pre` lines does). A failed call takes `.tool-result-error`'s own rule beside it. */
-.tool-result-preview {
-  margin-top: 4px;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-}
-.tool-result-preview-line {
-  white-space: pre;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-/* A refused call's reason is the CLI's own words: it wraps, muted like the "blocked by auto" note above it,
-   and the row is as tall as the text needs (the list measures its rows, as it does for any wrapped line). */
-.tool-result-preview-wrapped .tool-result-preview-line {
-  white-space: pre-wrap;
-  overflow: visible;
-  text-overflow: clip;
-  overflow-wrap: anywhere;
-  color: var(--nv-muted);
-}
-.tool-result-preview-more {
-  color: var(--nv-muted);
-  font-size: var(--fs-xs);
-}
+/* A finished, successful call keeps its output folded away -- success is the expected case, and its
+   row's glyph and line already say what ran (`Enter`, or `Ctrl+o` for every row, still opens it). A
+   failure shows its first line under the `⎿`, in the body's full-strength ink: signal colours
+   (`--nv-warn`, `--nv-error`, `--nv-ok`, `--nv-mode-*`) are never text colours here. Rust guards the
+   first three at 3:1, enough for a glyph, a border or a tint (WCAG 1.4.11) and not for 12px text
+   (1.4.3, 4.5:1); the mode colours are not guarded at all. */
 .tool-result-body {
-  background: var(--nv-bg);
-  padding: 6px 8px;
-  border-radius: 4px;
   margin: 0;
+  padding: 0;
+  color: var(--nv-muted);
+  line-height: 1.5;
   /* Bounded here as well as in `truncateResult`: the truncation budget is a character count, and a
      few thousand characters of one-column output is still taller than the panel. */
   max-height: 260px;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.row-tool[data-sign="✓"] .tool-call[data-folded="true"] .tool-result-preview {
+  display: none;
+}
+/* A failure's output is the one tool output with a frame: it is what should stop a reader skimming the
+   tool lines. A block at the body's edge on the error tint, outlined in the error colour mixed halfway
+   into the page (the `✗` beside the call carries the full colour), its text in that tint's guarded pair
+   (`--nv-error-tint-fg`/`-muted`). The frame stands in for the `⎿`, which it drops. */
+.tool-result.tool-result-error,
+.tool-result-preview.tool-result-error {
+  /* One zero-minimum track, as the connector's two are: a long line still cannot widen the row. The
+     block's own width follows an edit's frame (at least 36rem, at most the row). */
+  grid-template-columns: minmax(0, 1fr);
+  width: max-content;
+  min-width: min(100%, 36rem);
+  max-width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--nv-error) 50%, var(--nv-bg));
+  border-radius: var(--radius-block);
+  background: var(--nv-error-tint);
+}
+.tool-result-error::before {
+  content: none;
+}
+.tool-result-error > * {
+  grid-column: 1;
+}
+.tool-result-error,
+.tool-result-error .tool-result-body {
+  color: var(--nv-error-tint-fg);
+}
+/* The folded preview (`toolRegistry.tsx`'s `ToolResultPreview`): its first lines and how many more
+   there are, so a row says how much output a command made and whether it failed without being opened.
+   It stays inside the row's text track and never scrolls: each line is cut at the track's edge with an
+   ellipsis instead of wrapping, so three lines are three lines of height whatever the output holds. The
+   track is `minmax(0, 1fr)` so a long line cannot widen the row past the list (a grid track with a zero
+   minimum contributes nothing to its container's minimum width, which a plain block of
+   `white-space: pre` lines does). */
+.tool-result-preview {
+  line-height: 1.5;
+}
+.tool-result-preview-line {
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A refused call's reason is the CLI's own words: it wraps, in the failure's full-strength ink, and the row
+   is as tall as the text needs (the list measures its rows, as it does for any wrapped line). */
+.tool-result-preview-wrapped .tool-result-preview-line {
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+/* How many more lines there are: always muted, a failure's in its tint's muted ink. */
+.tool-result-preview-more {
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+}
+.tool-result-error .tool-result-preview-more,
+.tool-result-error .tool-result-truncated {
+  color: var(--nv-error-tint-muted);
+  font-size: var(--fs-xs);
 }
 .tool-result-truncated {
   color: var(--nv-muted);
@@ -1232,43 +1409,41 @@ textarea,
    on the card further down. */
 .tool-awaiting-permission {
   color: var(--nv-fg);
-  border-left: 2px solid var(--nv-warn);
-  padding-left: 6px;
   font-size: var(--fs-xs);
   margin-top: 2px;
 }
 
+/* A permission card: the one block on the page that asks for you while it waits -- a tinted block at the
+   body's edge, outlined in the warn colour (a non-text mark, guarded at 3:1) and with no second box round
+   it, its tool named in bold, the request inside,
+   the primary answer filled. The fill is `--nv-warn-tint`, `--nv-bg` with a little `--nv-warn` in it,
+   mixed in Rust, and the text on it is that tint's guarded pair (`--nv-warn-tint-fg`/
+   `--nv-warn-tint-muted`), never the body's: the body's pair is guarded against `--nv-bg` alone. */
 .permission-card {
-  background: var(--nv-surface);
-  color: var(--nv-surface-fg);
+  margin: 4px 0 6px;
+  padding: 12px 14px;
   border: 1px solid var(--nv-warn);
-  border-radius: 6px;
-  padding: 10px;
-  margin-bottom: 12px;
+  border-radius: var(--radius-block);
+  background: var(--nv-warn-tint);
+  color: var(--nv-warn-tint-fg);
 }
-/* The raw-JSON `<pre>` a permission card renders for every NON-Edit tool --
-   the cards this product actually produces are overwhelmingly `Bash`,
-   `WebFetch` and unknown tools, all of which take this branch (`ToolInput` in PermissionCard.tsx
-   falls back here whenever `editPreview` returns null). It is the FIFTH `<pre>` under the 62ch cap
-   and the most common one, and the first pass at "wide content escapes the measure" missed it, so
-   a long Bash command still scrolled sideways inside a ~62ch box with empty panel to its right.
-
-   `margin-left: -11px` for the same reason `.permission-card-edit` further down carries it, and
-   with the same arithmetic: `.permission-card` is `border: 1px` + `padding: 10px`, so its content
-   box begins 11px inside `.row-body`'s own left edge. */
+.permission-card-tool {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+/* The raw-JSON `<pre>` a permission card renders for every tool with no dedicated view (`ToolInput` in
+   `PermissionCard.tsx` falls back here whenever `editPreview` returns null). Its own `--nv-bg` fill
+   inside the tinted card, so the body's pair again. */
 .permission-card-input {
   background: var(--nv-bg);
-  /* Its own `bg` fill inside the surface-painted card, so the body's pair again. */
   color: var(--nv-fg);
   padding: 6px;
-  border-radius: 4px;
+  border-radius: var(--radius-block);
   overflow-x: auto;
   /* Wrapped, never scrolled: a line wider than the card must not hide its tail from the person
      approving it. */
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  width: max(100%, calc(var(--row-inline-size) - var(--row-gutter)));
-  margin-left: -11px;
 }
 /* The `Bash` card's own command line -- Claude Code's `Command:`, real newlines and all, wrapped
    rather than scrolled sideways (unlike the JSON `<pre>` above, which stays a single unbroken block
@@ -1291,65 +1466,182 @@ textarea,
   direction: ltr;
   unicode-bidi: bidi-override;
 }
-/* One escaped character (`⟨U+202E⟩`), and the line saying why there are any. The signal colour is a
-   border, never text (see the note above `.tool-result-error`). */
+/* One escaped character (`⟨U+202E⟩`), and the line saying why there are any. The signal colour is an
+   outline, never text (see the note above `.tool-result-body`). */
 .permission-card-escape,
 .code-escape {
   outline: 1px solid var(--nv-warn);
 }
 .permission-card-warning {
-  border-left: 2px solid var(--nv-warn);
-  padding-left: 6px;
+  font-weight: 600;
+}
+.permission-card-warning::before {
+  content: "⚠ ";
+  content: "⚠ " / "";
 }
 .permission-card-description {
-  color: var(--nv-surface-muted);
+  color: var(--nv-warn-tint-muted);
 }
-/* O3: the CLI's own prompt -- a small label naming whose question it is, then the CLI's sentence. */
+/* The CLI's own prompt -- a small label naming whose question it is, then the CLI's sentence. */
 .permission-card-provider {
   margin: 4px 0 6px;
   font-size: var(--fs-sm);
-  color: var(--nv-surface-fg);
+  color: var(--nv-warn-tint-fg);
   overflow-wrap: anywhere;
 }
 .permission-card-provider-label {
   font-size: var(--fs-xs);
-  color: var(--nv-surface-muted);
+  color: var(--nv-warn-tint-muted);
   border: 1px solid var(--nv-border);
   border-radius: 3px;
   padding: 0 4px;
   margin-right: 6px;
   white-space: nowrap;
 }
-/* Approve, Deny and the third button take the panel's face and scale like every other control
-   in it (the composer, the rename box, the reason box above them). They kept WebKit's own 13.33px
-   form-control font, so at a larger panel text size the prose, the card's title and the reason box grew and
-   the buttons did not (seen in the rc.3 sandbox screenshots). */
+/* Approve, Deny and the third button take the panel's face and scale like every other control in it (the
+   composer, the rename box, the reason box above them) rather than WebKit's 13.33px form-control font,
+   which did not grow with the panel's text size. Rounded, framed with the hairline, on `--nv-bg`; the
+   first -- the primary answer -- filled with the body's pair reversed, the same guaranteed contrast as
+   the cursor block (`indexCss.test.ts` admits `--nv-bg` as its text only in a rule that paints that
+   fill). Focused, a button is the solid cursor (the rule at the end of this file); the primary one,
+   already solid, takes a ring outside it instead, so the keys' place still shows on it. */
 .permission-card-buttons button {
   margin-right: 8px;
+  padding: 4px 14px;
+  border: 1px solid var(--rule-soft);
+  border-radius: 8px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
   font: inherit;
   font-size: var(--fs-base);
+  cursor: pointer;
 }
-/* The reason box fills the card. It kept the browser's intrinsic width -- about twenty
-   characters -- so its placeholder read "Reason (shown to the ag" (an rc.3 sandbox screenshot). Where even
-   the card's width is too narrow for it the placeholder ends in an ellipsis rather than a hard clip.
-   Its face and size are the combined rule further down's (`font: inherit` and `--fs-base`). */
+.permission-card-buttons button:first-child {
+  background: var(--nv-fg);
+  border-color: var(--nv-fg);
+  color: var(--nv-bg);
+}
+/* The reason box fills the card, not the browser's intrinsic twenty-odd characters (its placeholder read
+   "Reason (shown to the ag"); where even the card is too narrow, the placeholder ends in an ellipsis
+   rather than a hard clip. Its face and size are the combined rule further down's (`font: inherit` and
+   `--fs-base`). */
 .permission-card input {
   display: block;
   width: 100%;
   box-sizing: border-box;
-  margin: 6px 0;
+  margin: 10px 0;
+  padding: 6px 10px;
+  border: 1px solid var(--rule-soft);
+  border-radius: 8px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
   text-overflow: ellipsis;
 }
 
+/* The composer is one box at the foot, centred: the same margin each side (2026-10-15; it used to step in
+   to the body's edge on the left only, and read as off-centre). It is the page, not a tint -- a hairline
+   frame on `--nv-bg`, rounded a little more than the conversation's blocks so it reads as the place you
+   type -- with the prompt `›` before the text. While it has the keys the frame becomes a ring in the INSERT
+   block's colour (the status band's, lualine's insert section), laid over the hairline, so the place the
+   keys are is never only a caret. Everything written in it is the body's pair (`--nv-fg`, `--nv-muted`),
+   the placeholder included. It is the last block of the foot (the activity line's comment). */
 .composer {
+  /* The `/` command menu sits just above the box, against this edge. */
+  position: relative;
   display: flex;
   /* Wrap so the closing notice below can take a whole row of its own rather than being squeezed in
      beside the textarea. With no notice present nothing wraps: the textarea is the only flexible
      item and it shrinks before anything is pushed down. */
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
-  padding: 10px;
-  border-top: 1px solid var(--nv-border);
+  box-sizing: border-box;
+  min-height: 44px;
+  margin: 6px var(--page-pad) 10px;
+  padding: 9px 12px 9px 9px;
+  border: 1px solid var(--rule-frame);
+  border-radius: 8px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+}
+/* The prompt: `›`, the sign your sent messages carry in the conversation, in a cell of its own before the
+   text, level with the first line however many the box grows to. Generated content: never typed, copied or
+   read out. */
+.composer::before {
+  content: "›";
+  content: "›" / "";
+  flex: none;
+  align-self: flex-start;
+  width: 1.4em;
+  text-align: center;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-base);
+  line-height: 1.5;
+  color: var(--nv-muted);
+  pointer-events: none;
+}
+.composer:focus-within {
+  outline: 1.5px solid color-mix(in srgb, var(--nv-status-insert-bg) 70%, var(--nv-bg));
+  outline-offset: -1px;
+}
+
+/* The `/` command menu (`SlashMenu.tsx`): a card of the composer's family just above the box, as wide as
+   it, drawn over the end of the conversation with a soft shadow. Rows are the editor's own colours: the
+   selected one in the cursorline fill, rounded, the description muted. */
+.slash-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 3;
+  box-sizing: border-box;
+  padding: 6px;
+  background: var(--nv-bg);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-block);
+  box-shadow: 0 6px 20px color-mix(in srgb, var(--nv-fg) 12%, transparent);
+  color: var(--nv-fg);
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+  /* The composer draws at most `SLASH_MENU_ROWS` one-line rows; the cap only keeps a short panel from
+     being covered by them, and the menu scrolls if it hits it. */
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.slash-menu-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.slash-menu-row.current {
+  background: var(--nv-cursorline);
+}
+/* A name and its hint are one line at most half the row, cut with an ellipsis at the end (the hint goes first), so
+   a long hint from an agent never wraps or squeezes the description out. The three isolate their direction:
+   a right-to-left run in one cannot reorder the text beside it. */
+.slash-menu-name {
+  flex: 0 1 auto;
+  min-width: 14ch;
+  max-width: 50%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  unicode-bidi: isolate;
+}
+.slash-menu-hint,
+.slash-menu-desc {
+  color: var(--nv-muted);
+  unicode-bidi: isolate;
+}
+.slash-menu-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 /* Why the box stopped taking input while a terminal handoff closes the conversation. A control that
@@ -1360,82 +1652,70 @@ textarea,
   margin: 0;
   font-size: var(--fs-sm);
   color: var(--nv-fg);
-  border-left: 2px solid var(--nv-warn);
-  padding-left: 6px;
 }
 /* A held-back slash command's own local flash (`Composer.tsx`'s `slashFlash`),
-   same shape as `.composer-closing` just above -- transient rather than persistent, so it carries
-   no distinct colour of its own beyond the same `--nv-warn` border-only accent. */
+   same shape as `.composer-closing` just above -- transient rather than persistent. */
 .composer-slash-flash {
   flex: 0 0 100%;
   margin: 0;
   font-size: var(--fs-sm);
   color: var(--nv-fg);
-  border-left: 2px solid var(--nv-warn);
-  padding-left: 6px;
 }
-/* The shell-prompt glyph,
-   replacing the box's own left border. Plain `--nv-fg`, deliberately NOT `--nv-mode-input`: that
-   token is not guarded for text at all (the big comment just below, on `.composer-browse-hint`,
-   says so directly -- "both go on a border ... never `color:`"), so a single always-visible
-   character is not the place to spend the one exemption this file makes for a mode colour as a
-   glyph (`.mode-glyph`, which only ever uses `--nv-warn`/`--nv-error`, each guarded at 3:1). */
-.composer-prompt {
-  flex: none;
-  color: var(--nv-fg);
-  font-family: var(--nv-font-mono);
-  line-height: 1.4;
-}
-/* The bordered box is gone: a bare line, `.composer-prompt` marking
-   it instead of a border. */
+/* The textarea draws no box of its own inside the composer card: no border, no fill, no focus ring. */
 .composer textarea {
   flex: 1;
   resize: none;
-  min-height: 1.4em;
+  min-height: 1.5em;
+  line-height: 1.5;
   background: none;
   color: var(--nv-fg);
   border: 0;
   padding: 0;
-  /* WebKit's own focus ring drew the box back round the textarea (r2-gui GUI pass, 2026-09-26);
-     the caret and the band's INPUT block say where the keys are. */
+  /* WebKit's own focus ring would draw a second box inside the card; the caret, the card's INPUT frame
+     and the band's INPUT block say where the keys are. */
   outline: none;
 }
-/* BROWSE's stand-in for the textarea (`Composer.tsx`): same slot in the flex row, but nothing here
-   accepts a keystroke. Bare, like the textarea, behind the same `❯` (`mock: bottom.html` B; the
-   r2-gui GUI pass, 2026-09-26, found it still boxed). It used to carry the mode on a
-   `--nv-mode-browse` left border; the band's mode block carries it now. The label stays
+/* The placeholder in the tint's guarded muted ink. Without this rule WebKit draws it in its UA sheet's
+   `darkGray` (about 1.9:1 on a light tint), whatever the card's colour; `opacity: 1` undoes the UA's
+   own dimming where an engine applies one. */
+.composer textarea::placeholder {
+  color: var(--nv-muted);
+  opacity: 1;
+}
+/* BROWSE's stand-in for the textarea (`Composer.tsx`): same slot in the box, but nothing here accepts
+   a keystroke. Bare, like the textarea; the band's mode block carries the mode. The label is
    `--nv-muted`, the placeholder's colour. */
 .composer-browse-hint {
   flex: 1;
-  min-height: 1.4em;
+  min-height: 1.5em;
   display: flex;
   align-items: center;
   color: var(--nv-muted);
   font-size: var(--fs-base);
-  line-height: 1.4;
+  line-height: 1.5;
   cursor: text;
   outline: none;
 }
-/* C2: the unsent draft, previewed like the greyed-out text it stands in for, never the panel's own
-   fill or a bubble -- see `.row-prompt`'s own comment for why a prompt is never boxed here. */
+/* The unsent draft, previewed in BROWSE like the greyed-out text it stands in for. */
 .composer-draft {
   white-space: pre-wrap;
+}
+/* The key that opens the box (`Composer`'s `browseKey`): at its right end, mono and muted, as the start
+   screen's menu draws its keys. */
+.composer-key {
+  margin-left: auto;
+  padding-left: 8px;
+  font-family: var(--nv-font-mono);
+  color: var(--nv-muted);
+}
+/* With messages queued the count comes first at the right end and the key after it. */
+.composer-queued + .composer-key {
+  margin-left: 0;
 }
 .composer-queued {
   margin-left: auto;
   padding-left: 8px;
-}
-/* The dim reminder that follows the placeholder or the draft;
-   `.composer-browse-hint` describes it in its own
-   doc comment in `Composer.tsx`. Dimmer than the already-muted line it sits in, the same way
-   `.empty-tab-resume .detail` steps down from its own `strong` sibling. */
-.composer-hint {
-  opacity: 0.7;
-  /* Its own leading space would otherwise vanish: `.composer-browse-hint` is a flex row, which makes
-     this span a flex item, and a block's leading white space is removed. The v1-ui GUI pass
-     (2026-09-27) saw "Ask the agent...— i or Ctrl+j to type" in WebKitGTK. `pre-wrap` keeps the
-     space and still wraps a narrow panel. */
-  white-space: pre-wrap;
+  font-size: var(--fs-sm);
 }
 
 /* C3: the composer uses the panel's own face and scale (WebKitGTK's UA sheet gives form controls
@@ -1472,6 +1752,34 @@ textarea,
   color: var(--nv-fg);
 }
 
+/* --- the chat page at the panel's two extremes ------------------------------------------------------
+   A narrow panel (beside a side panel, or a small window) gives the margins and a little of the sign
+   column back to the text. A panel with the whole window gets more air above the conversation and between
+   turns. Both are written against the
+   viewport, which is the panel itself -- never a container query (see the sign-column grid's geometry
+   block). */
+@media (max-width: 420px) {
+  :root {
+    --page-pad: 10px;
+    --sign-gap: 4px;
+  }
+  .message-list {
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+}
+@media (min-width: 1100px) {
+  .message-list {
+    padding-top: 32px;
+  }
+  .message-list > .row-prompt:not(:first-child) {
+    margin-top: 34px;
+  }
+  .composer {
+    margin-bottom: 18px;
+  }
+}
+
 /* --- Phase 3: backend-aware start screen, identities, and in-panel errors ------------------- */
 /* --- The empty tab replaces the mode-selector start screen -------- */
 
@@ -1493,7 +1801,7 @@ textarea,
 
 /* --- The empty tab's dashboard ------------------------- */
 /* LazyVim's start screen (snacks.nvim), `mock: empty.html` C: a centred `Eitri`, the where-line,
-   one row per `dashItems`, the selected mode's consequence line. Replaces the eight resume rows
+   one row per `dashItems` with its key, and nothing more (`Dashboard.tsx`). Replaces the eight resume rows
    (`.empty-tab-resume` above is now dead JSX-wise -- kept only because `indexCss.test.ts`'s
    "keeps the empty tab inside its column" test still renders a synthetic `.empty-tab-resume
    .session-title` fragment against it; deleting the rule would fail that out-of-scope test rather
@@ -1521,7 +1829,32 @@ textarea,
   flex-direction: column;
   align-items: stretch;
   width: 100%;
-  max-width: 360px;
+  max-width: var(--dash-w);
+}
+.dashboard {
+  /* The menu's width, which the box above its rows shares, so the two read as one list. */
+  --dash-w: 440px;
+}
+/* The box you type in, as the dashboard's first row (`EmptyTab`): as wide as the rows, left-aligned text in
+   the centred screen, a little air above it after the where-line and below it before the rows. Its edges are
+   the rows' edges and its padding theirs, so its key (`.composer-key`) stands in the rows' key column. With
+   the cursor on it in BROWSE its hairline takes the body's ink at half strength -- the box's own form of the
+   rows' cursorline fill, which its tint would hide; in INSERT its ring says the same. */
+.dash-input {
+  width: 100%;
+  max-width: var(--dash-w);
+  margin: 10px 0 6px;
+  text-align: left;
+}
+.dash-input .composer {
+  margin: 0;
+  min-height: 0;
+  /* The prompt in the rows' icon cell and the text where their labels start: a row's own padding less
+     this box's border, then the same 1.4em cell and 8px gap a row has. */
+  padding: 6px 9px;
+}
+.dash-input[aria-current="true"] .composer {
+  border-color: color-mix(in srgb, var(--nv-fg) 45%, var(--nv-bg));
 }
 /* Deliberately NOT `<button>` (`Dashboard.tsx`'s own doc comment): `role="button"`/`tabIndex={-1}`
    on a `div`, so a `Space` keydown here is never native button activation -- it has to reach the
@@ -1531,7 +1864,7 @@ textarea,
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 10px;
+  padding: 5px 10px;
   border-radius: 3px;
   cursor: pointer;
   text-align: left;
@@ -1556,41 +1889,18 @@ textarea,
 .dash-resume-title {
   color: var(--nv-muted);
 }
-/* The key column. `--nv-mode-browse` is guarded for
-   borders/rules (3:1 or not at all), never for text -- `indexCss.test.ts`'s guard has no exemption
-   branch for it the way it does for `.wk-key`/`.mode-glyph`, so this draws the letter in the
-   body's own guaranteed `--nv-fg` text colour instead, inside a 1px `--nv-mode-browse` border box:
-   the same signal, on a border beside the text rather than on the text itself.
-   It is the same trade-off `StatusBand`'s fills make. */
+/* The key column: the letter alone, in the mono face and the muted ink, at the row's right end -- the way
+   snacks.nvim's dashboard lists its keys. No box round it: the row is already the thing you choose. */
 .dash-key {
   font-family: var(--nv-font-mono);
-  font-weight: 600;
-  color: var(--nv-fg);
-  border: 1px solid var(--nv-mode-browse);
-  border-radius: 3px;
-  padding: 0 5px;
-}
-.dash-consequence {
   color: var(--nv-muted);
-  font-size: var(--fs-sm);
-  margin-top: 4px;
-  max-width: 360px;
 }
-/* What every message also carries from the editor, drawn under the
-   consequence line -- the same declarations as `.dash-consequence` (existing tokens only, no new
-   ones), so the two read as one muted note; `.dash-hint` below stays the last line. */
+/* The one line under the items, and only in a companion window with no editor attached: something to fix,
+   so it is said where it can be seen. */
 .dash-context {
   color: var(--nv-muted);
   font-size: var(--fs-sm);
-  margin-top: 4px;
-  max-width: 360px;
-}
-/* The first-run hint line, drawn under everything else on the dashboard --
-   same tokens as `.dash-consequence` (existing tokens only, no new ones). */
-.dash-hint {
-  color: var(--nv-muted);
-  font-size: var(--fs-xs);
-  margin-top: 8px;
+  margin-top: 10px;
   max-width: 360px;
 }
 /* The pill, the `⏵⏵` glyph split into its own `.mode-glyph` span above -- moved into
@@ -1599,87 +1909,71 @@ textarea,
   color: var(--nv-fg);
 }
 
-/* In-flight motion. Per-turn state, so it lives on its own
-   line (`.activity-line`) rather than the sign column (per-item state)
-   or anywhere else. The meter -- leftmost inside it -- never moves as the word's width
-   changes (`running NotebookEdit` is the longest). */
+/* In-flight motion. Per-turn state, so it lives on the activity
+   line rather than on a row or anywhere else. */
 .turn-activity {
   display: flex;
   align-items: center;
   gap: 6px;
 }
-.turn-activity .meter {
-  /* `4ch` in the inherited `--nv-font-mono` (`.activity-line`, above): exactly four activity-line
-     characters wide, matching the four discrete steps below. */
-  width: 4ch;
-  /* `flex: none`, the same idiom `.diff-gutter` below already uses, and for the same reason. Its
-     only child is an EMPTY span, so this box's min-content size is 0 and flexbox's automatic
-     minimum is min(4ch, 0) = 0 -- as a plain flex item with the default `flex-shrink: 1` it
-     was the first thing on a squeezed status line to vanish, and it vanished completely. The one
-     animated element in the product disappearing on exactly the narrow panel where the
-     reassurance matters most, with no error and nothing jsdom can see. */
-  flex: none;
-  height: 3px;
-  overflow: hidden;
+/* The one animated element in the whole stylesheet, and the only rule in the file with an `animation:`
+   declaration (`indexCss.test.ts` asserts both halves of that, and that there is exactly one
+   `@keyframes`): the activity line's star breathes while the agent works -- full size, a little smaller,
+   smallest, a little smaller -- the way Claude Code's spinner glyph moves in place of a progress bar.
+
+   `transform` only -- never colour or alpha: the star's accent clears its 3:1 guarantee only at full
+   strength, so a fade would spend most of its period below it, a defect no static check could catch once
+   it existed. The keyframes body is asserted to contain only `transform:` declarations for
+   the same reason. And in steps, never eased: four visible states per cycle, one repaint per
+   `--meter-step` (300ms unless the typing cadence slows it, `typingCadence.ts`; the name is the bar
+   meter's, which this star replaced), so the panel never repaints faster than that while the user types
+   in the editor beside it. `steps(2, jump-end)` on each half of the cycle gives exactly the four states
+   1, 0.8, 0.6, 0.8. Not while a card waits or the phase is the user's to end (`data-moving` is absent
+   then): a moving star would claim the agent is working when it is not. */
+.activity-glyph[data-moving] {
+  animation: turn-breath calc(var(--meter-step, 300ms) * 4) steps(2, jump-end) infinite;
 }
-/* The one animated element in the whole stylesheet, and the only rule in the file with an
-   `animation:` declaration (`indexCss.test.ts` asserts both halves of that, and that there is
-   exactly one `@keyframes`). `transform` only -- never colour or alpha: `--nv-chrome-accent` clears
-   its 3:1 guard only at full strength, so a fade would spend most of its period below that
-   guarantee, a defect no static check could catch once it existed. The keyframes
-   body is asserted to contain only `transform:` declarations for the same reason. */
-.turn-activity .meter-fill {
-  display: block;
-  width: 100%;
-  height: 100%;
-  background: var(--nv-chrome-accent);
-  transform-origin: left center;
-  /* `jump-none`, not `start`.
-     `steps(4, start)` is `jump-start`, which emits progress {0.25, 0.5, 0.75, 1} -- so
-     against a `from` of 0.25 the scale ran {0.4375, 0.625, 0.8125, 1}, i.e. 1.75ch, 2.5ch, 3.25ch
-     and 4ch of a 4ch meter. It never landed on a cell boundary, never showed fewer than ~1.75 of
-     its four cells, and never displayed the `from` value at all -- which made that value's stated
-     purpose ("never empty, so it cannot read as a blink") unreachable. `jump-none` emits {0, 1/3,
-     2/3, 1}, so the scale is exactly {0.25, 0.5, 0.75, 1}: one, two, three, four cells, starting
-     on the `from` value. */
-  animation: turn-meter calc(var(--meter-step, 300ms) * 4) steps(4, jump-none) infinite;
-}
-@keyframes turn-meter {
-  from { transform: scaleX(0.25); }
-  to { transform: scaleX(1); }
-}
-/* Nothing is lost: the word already carries all five phases and does not move. What reduced motion
-   costs is the LIVENESS channel, and the elapsed clock (`.turn-elapsed`) replaces it -- a number
-   that increments once a second is a content update, not motion. */
-@media (prefers-reduced-motion: reduce) {
-  .turn-activity .meter-fill {
-    animation: none;
-    /* `animation: none` ALONE rendered a full 4ch bar, not "one cell of four".
-       The rule above declares `transform-origin` but no static `transform`,
-       so with the animation removed the computed transform is the initial `none` -- the identity
-       -- and `width: 100%` painted the whole meter. A meter must never rest at
-       full, because a full bar reads as a completed percentage. The `from` value here
-       sets the static state for reduced motion,
-       while the phase remains visible: the word and
-       the clock beside it are unchanged, and the meter is a static mark that a turn is in flight
-       rather than a bar reporting progress. */
-    transform: scaleX(0.25);
+@keyframes turn-breath {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(0.6);
   }
 }
-/* Secondary body text, the same tone `.panel-footer .mode-block[data-focused="false"]` uses above.
-   V2 split `StatusLine` into three lines: the session status word and the
-   position counter are gone from here (the status word is not shown in V2 at all; the position is
-   folded into `StatusRow`'s own text), which is also what retires the old three-way shrink
-   priority between them and the in-flight indicator -- `.activity-line` holds only the indicator
-   and Stop now, so there is only one thing left that can give. */
-.activity-line .turn-activity .turn-state,
+/* Nothing is lost: the word already carries all five phases and does not move. What reduced motion
+   costs is the LIVENESS channel, and the elapsed clock (`.turn-elapsed`) replaces it -- a number that
+   increments once a second is a content update, not motion. The star rests at its full size,
+   the cycle's first state. */
+@media (prefers-reduced-motion: reduce) {
+  .activity-glyph[data-moving] {
+    animation: none;
+    transform: scale(1);
+  }
+}
+/* The phase word is the line's one full-strength text, said like Claude Code's (`Running Bash…`): a
+   capital first letter and an ellipsis while the agent works, none while the phase is the user's. The
+   clock and everything after it are muted; the queue count joins the clock with the line's separator. */
+.activity-line .turn-activity .turn-state {
+  color: var(--nv-fg);
+}
 .activity-line .turn-activity .turn-elapsed {
   color: var(--nv-muted);
 }
+.activity-line .turn-state::first-letter {
+  text-transform: uppercase;
+}
+.activity-line .turn-activity:not([data-phase="blocked"]) .turn-state::after {
+  content: "…";
+}
+.activity-line .turn-activity + .activity-keys::before {
+  content: "· ";
+}
 /* --- what the activity line sacrifices first as it narrows -----------------------------------------
    `.activity-line` is a nowrap flex row that could not shrink and never clipped, and the in-flight
-   indicator roughly DOUBLES its minimum content width: 4ch of meter plus `running NotebookEdit`
-   (20ch in the longest phase word) plus `123s+` plus a 10px gap, on a bar that needed
+   indicator roughly DOUBLES its minimum content width: the star plus `running NotebookEdit`
+   (20ch in the longest phase word) plus `123s+` plus its gaps, on a bar that needed
    about 250px before it. So under pressure the phase word wrapped to a second line -- breaking the
    `min-height: 28px` -- and past that the Stop button was pushed
    off the right edge. `App.tsx`'s own comment beside that button says it is the ONLY Stop control
@@ -1687,13 +1981,12 @@ textarea,
    happen.
 
    **The priority order: the phase word truncates with an ellipsis** (`running NotebookEdit` ->
-   `running Note…`), and nothing else. **Never:** the meter, the elapsed clock, and the Stop button.
+   `running Note…`), and nothing else. **Never:** the star, the elapsed clock, and the Stop button.
    Those are `flex: none`, so a narrow panel spends the word and never spends the control that
-   stops a turn. What `flex: none` buys the meter and the clock is that the DISTRIBUTION never
-   spends them -- not that they can never be clipped. Once the phase word is gone there is nothing
-   left inside `.turn-activity` to give, so a deeper squeeze takes the box below its own fixed
-   content; `overflow: hidden` on it is what makes that clip (the clock, then the meter) rather
-   than overflowing onto Stop. The panel width at which any of this begins is a screen question,
+   stops a turn. What `flex: none` buys the clock is that the DISTRIBUTION never spends it -- not
+   that it can never be clipped. Once the phase word is gone there is nothing left inside
+   `.turn-activity` to give, so a deeper squeeze takes the box below its own fixed content;
+   `overflow: hidden` on it is what makes that clip (the clock) rather than overflowing onto Stop. The panel width at which any of this begins is a screen question,
    and needs visual measurement.
 
    Two mechanics worth knowing before editing this: shrinking is distributed by `flex-shrink x
@@ -1724,6 +2017,10 @@ textarea,
 }
 .activity-line .stop::before {
   content: "· ";
+}
+/* The queue count already ends in its own separator, so the Stop control after it needs none. */
+.activity-line .activity-keys + .stop::before {
+  content: none;
 }
 /* The only shrinkable child of `.turn-activity`. The plain default, stated rather than inherited so
    that the day a second shrinkable child appears here, this is a number someone has to choose
@@ -2212,7 +2509,7 @@ textarea,
 .permission-card-stale {
   margin-top: 8px;
   font-size: var(--fs-xs);
-  color: var(--nv-surface-muted);
+  color: var(--nv-warn-tint-muted);
 }
 
 /* The empty tab's resume rows, under the fresh prompt -- moved here from
@@ -2352,21 +2649,42 @@ textarea,
    the panel already guards for text against `--nv-bg` at 4.5:1, so this needs no new entry in
    `indexCss.test.ts`'s exemption list -- and needing one would have been the sign that the choice
    was wrong. */
+/* Where a resumed session's history came from: one quiet line above the first row, `↺` in the sign column
+   and the words at the body's edge, its way to the file a word after them rather than a form button -- muted, underlined by dots, the page's own face. Focused by the cursor it is the solid cursor
+   block like any control (the focus rule at the end of this file). A hairline under it parts what was
+   restored from what follows only by place, not by a box. */
 .history-notice {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin: 0 0 12px;
-  padding: 10px;
-  border: 1px solid var(--nv-muted);
-  border-left-width: 3px;
-  border-radius: 4px;
+  display: grid;
+  grid-template-columns: var(--sign-w) minmax(0, auto) auto;
+  justify-content: start;
+  column-gap: var(--sign-gap);
+  align-items: baseline;
+  margin: 0 0 14px;
+  padding: 0 0 10px;
+  border-bottom: 1px solid var(--rule-soft);
   color: var(--nv-muted);
   font-size: var(--fs-sm);
 }
+.history-notice::before {
+  content: "↺";
+  content: "↺" / "";
+  font-family: var(--nv-font-mono);
+  text-align: center;
+}
 .history-notice > span {
-  flex: 1;
   min-width: 0;
+}
+.history-notice > button {
+  margin: 0 0 0 10px;
+  white-space: nowrap;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--nv-muted);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: pointer;
 }
 
 .command-notice {
@@ -2387,81 +2705,127 @@ textarea,
   user-select: text;
 }
 
-/* --- the permission card's diff (wire 2) -------------------------------------------------------
-   Signal colours live on the gutter and the left border, never on the text: --nv-ok/--nv-error are
-   guarded at 3:1 for non-text UI, and this file has already once drawn text in them at 2.05-3.84:1.
-   `indexCss.test.ts` keeps every `color:` on --nv-fg/--nv-muted. */
-/* Widened the same way `.code-block`/`.tool-result-body` are (see the big comment above them):
-   `calc(100cqw - 30px)` against `.row`'s own query container -- since 2026-09-24,
-   `max(100%, calc(var(--row-inline-size) - var(--row-gutter)))`, the same right edge without the
-   container (see that comment's correction). The difference here is that this
-   box, unlike those two, does not already sit flush against `.row-body`'s own left edge -- it is
-   inside `.permission-card`'s 10px padding AND its 1px border -- so `margin-left: -11px` pulls it
-   back out to that edge first (matching where the diff's own text and a plain paragraph both
-   start), and only then does the width reach `.row`'s right edge. **The previous -10px offset used only the
-   padding:** with the global `box-sizing:
-   border-box`, `.permission-card`'s content box begins 1 + 10 = 11px in, so pulling back only 10
-   left this box 1px right of where a code block starts and put its own right edge 1px past `.row`
-   -- painting over the card's `--nv-warn` right border, which is the cue that a permission is
-   pending. `overflow: hidden` on THIS box is what makes widening
-   it, rather than `.permission-card-diff`/`.diff-line` further down, the right target: anything
-   grown inside an `overflow: hidden` ancestor without also growing that ancestor is invisible,
-   clipped at its edge. Everything this box contains -- the head bar and the diff -- is a plain
-   block-level child with no width of its own, so it fills whatever width this rule gives the box;
-   nothing further down needs its own copy of this rule. */
-.permission-card-edit {
-  border: 1px solid var(--nv-border);
-  border-radius: 4px;
-  overflow: hidden;
-  width: max(100%, calc(var(--row-inline-size) - var(--row-gutter)));
-  margin-left: -11px;
-}
+/* --- an edit: a framed block, the diff inside it ---------------------------------------------------------
+   An edit is the unit a reader reviews, so in the transcript it is framed: the head -- the tool's name, the
+   file, and the counts at the right edge -- in a hairline box at the body's edge, its status glyph in the
+   sign cell outside, and the diff on demand inside the same box under a hairline. Folded, it is the head
+   alone. It has no fill, so the cursor's band shows through it and its text stays the body's pair. The
+   same view sits inside a permission card without the frame, where the diff is what is being approved and
+   the card's tint is the surface under it.
+
+   Signal colours live on the counts' `+`/`−` glyphs and on the diff lines' tint, never on text:
+   `--nv-ok`/`--nv-error` are guarded at 3:1 for non-text marks, not the 4.5:1 text needs, so the numbers
+   themselves stay in the head's muted ink and only the sign before each is coloured
+   (`indexCss.test.ts` admits exactly that). */
 .permission-card-edit-head {
-  display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
-  padding: 6px 8px; background: var(--nv-surface); border-bottom: 1px solid var(--nv-border);
-  color: var(--nv-surface-fg);
+  display: flex;
+  gap: 0.7em;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
+  line-height: 22px;
+  color: var(--nv-muted);
 }
-.permission-card-edit-path { font-family: var(--nv-font-mono); font-size: var(--fs-sm); color: var(--nv-surface-fg); word-break: break-all; }
-.permission-card-edit-counts { font-family: var(--nv-font-mono); font-size: var(--fs-sm); color: var(--nv-surface-muted); white-space: nowrap; }
+.permission-card-edit-tool {
+  flex: none;
+}
+.permission-card-edit-path { font-family: var(--nv-font-mono); font-size: var(--fs-code); color: var(--nv-muted); word-break: break-all; }
+.permission-card-edit-counts { font-family: var(--nv-font-mono); font-size: var(--fs-code); color: var(--nv-muted); white-space: nowrap; }
+.edit-count-added .edit-sign { color: var(--nv-ok); }
+.edit-count-removed .edit-sign { color: var(--nv-error); }
 .permission-card-edit-note {
-  padding: 6px 8px; font-size: var(--fs-sm); color: var(--nv-muted);
-  border-bottom: 1px solid var(--nv-border); border-left: 3px solid var(--nv-warn);
+  font-size: var(--fs-sm); color: var(--nv-muted);
 }
-/* The bottom padding is room for the horizontal scrollbar, which is WebKitGTK's overlay one and
-   takes none of its own -- at panel text 0.9 it was drawn over a one-line diff's `+` line. `scrollbar-gutter`
-   reserves the block-axis scrollbar's room only, so the strip is plain padding. */
-.permission-card-diff { margin: 0; padding: 0 0 12px; font-family: var(--nv-font-mono); font-size: var(--fs-sm); overflow-x: auto; }
-.diff-line { display: flex; gap: 6px; padding: 0 8px; white-space: pre; color: var(--nv-fg); }
+/* In a transcript row: the frame, the head's padding and the counts pushed to the right edge, and the
+   notes and the diff each under a hairline inside it. */
+.tool-call > .permission-card-edit {
+  /* As wide as its head or its diff needs, as a code block is: at least 36rem (or the row, if that is
+     narrower), at most the row -- a full-width frame round one short line read as a slab on a wide panel. */
+  width: max-content;
+  min-width: min(100%, 36rem);
+  max-width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--rule-frame);
+  border-radius: var(--radius-block);
+  overflow: hidden;
+}
+.tool-call > .permission-card-edit > .permission-card-edit-head {
+  padding: 3px 10px;
+}
+.tool-call > .permission-card-edit .permission-card-edit-counts {
+  margin-left: auto;
+}
+.tool-call > .permission-card-edit > .permission-card-edit-note,
+.tool-call > .permission-card-edit > .permission-card-diff {
+  border-top: 1px solid var(--rule-soft);
+}
+.tool-call > .permission-card-edit > .permission-card-edit-note {
+  padding: 4px 10px;
+}
+/* The diff's top padding parts it from the line above; the bottom padding is room for the horizontal
+   scrollbar, which is WebKitGTK's overlay one and takes none of its own -- with less, it was drawn over a
+   one-line diff's `+` line. `scrollbar-gutter` reserves the block-axis scrollbar's room only, so the strip
+   is plain padding. */
+.permission-card-diff { margin: 0; padding: 4px 0 12px; font-family: var(--nv-font-mono); font-size: var(--fs-code); overflow-x: auto; }
+.tool-call[data-folded="true"] .permission-card-diff { display: none; }
+.diff-line { display: flex; gap: 6px; padding: 0 10px; white-space: pre; color: var(--nv-fg); }
 .diff-gutter { width: 1ch; flex: none; color: var(--nv-muted); }
-.diff-added { border-left: 3px solid var(--nv-ok); }
-.diff-removed { border-left: 3px solid var(--nv-error); }
-.diff-context { border-left: 3px solid transparent; }
-/* The same diff inside a permission card sits on the card's `--nv-surface`, not on `bg`. */
-.permission-card .diff-line { color: var(--nv-surface-fg); white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-added { background: color-mix(in srgb, var(--nv-ok) 12%, transparent); }
+.diff-removed { background: color-mix(in srgb, var(--nv-error) 12%, transparent); }
+.diff-added .diff-gutter { color: var(--nv-ok); }
+.diff-removed .diff-gutter { color: var(--nv-error); }
+/* In a permission card the lines have no tint of their own: the card's pair is guarded against its own
+   fill and not against a second one laid over it, so the gutter's glyph is the only colour there. */
+.permission-card .diff-added,
+.permission-card .diff-removed { background: none; }
+/* Inside a permission card the diff wraps: a line wider than the card must not hide its tail from the
+   person approving it. */
+.permission-card .diff-line { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--nv-warn-tint-fg); }
+/* The head, the diff and its note have no fill of their own: in a tool row they sit on `--nv-bg` (the
+   body's pair, above), inside a permission card on its warn tint, so they take that tint's pair there. */
+.permission-card .permission-card-edit-head,
+.permission-card .permission-card-edit-path,
+.permission-card .permission-card-edit-counts,
+.permission-card .diff-gutter,
+.permission-card .permission-card-edit-note { color: var(--nv-warn-tint-muted); }
+.permission-card .permission-card-edit-path { color: var(--nv-warn-tint-fg); }
+.permission-card .diff-added .diff-gutter { color: var(--nv-ok); }
+.permission-card .diff-removed .diff-gutter { color: var(--nv-error); }
+.permission-card .permission-card-edit { margin-top: 2px; }
 /* A flex item's minimum width is its content's, so without this a long line would still widen the
    row past the card instead of wrapping. */
 .permission-card .diff-text { min-width: 0; }
-.permission-card .diff-gutter,
-.permission-card .permission-card-edit-note { color: var(--nv-surface-muted); }
 
 /* --- syntax highlighting (panel-as-document, task 4) -------------------------------------------
    highlight.js emits plain `hljs-*` classes; these are the only place they get colour, and it comes
    from the same nvim highlight groups the editor draws with -- so a Rust keyword is the same colour
    in the panel and in the buffer three inches to its left. */
+/* A fenced code block is a surface block in a hairline frame, as wide as the row. Its long lines scroll
+   inside it. */
 .code-block {
   font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-  line-height: 18px;
+  font-size: var(--fs-code);
+  line-height: 1.55;
   /* --nv-surface, not --nv-bg: the --nv-syn-* colours below are derived against Normal's
      background, so painting them on --nv-surface is a small (~4%) departure from an exact editor
      match. A visually distinct code block is worth that. Its plain text follows the fill: the
-     surface-guarded `--nv-surface-fg`, not the body's `--nv-fg` (sw-theme-2). */
+     surface-guarded `--nv-surface-fg`, not the body's `--nv-fg`. */
   background: var(--nv-surface);
   color: var(--nv-surface-fg);
-  border: 1px solid var(--nv-border);
-  border-radius: 3px;
-  padding: 8px 10px;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-block);
+  padding: 10px 12px;
   overflow-x: auto;
+}
+/* In a reply a fenced block is as wide as its lines need, so five short lines are not a slab across a wide
+   panel: at least 36rem (or the row, if that is narrower), at most the row. A longer line scrolls inside the
+   block (`overflow-x: auto` above), never the list. Written against the row's own `%` and rem, never a
+   measured width or a container. */
+.row-assistant .code-block {
+  width: max-content;
+  min-width: min(100%, 36rem);
+  max-width: 100%;
 }
 /* These rules are the deliberate, narrow exception to the "text is only --nv-fg/--nv-muted" guard
    below: they are the whole feature this task adds, and `indexCss.test.ts` allows exactly this --
@@ -2529,20 +2893,17 @@ textarea,
   color: var(--nv-bg);
   outline: none;
 }
-/* A control inside the current row has the keys, so the row's own cursor steps back to hollow:
-   one solid mark at a time, and the hollow one says which row `h` returns to. */
-.message-list .row-current:focus-within .row-sign {
-  background: none;
-  color: var(--nv-fg);
-  box-shadow: inset 0 0 0 1.5px var(--nv-fg);
+/* A permission card's primary answer is already drawn solid (the body's pair reversed), so focus
+   cannot be shown by filling it: it takes a ring just outside its edge instead. */
+.agent-ui-root .permission-card-buttons button:first-child:focus {
+  outline: 2px solid var(--nv-fg);
+  outline-offset: 2px;
 }
 /* A code block the global f HINT landed on is "the item" until the next key (`y` copies it, `v`
    starts inside it). It is drawn as the block's own outline in the body's ink, thinner while the panel
-   does not have the keys (the solid/hollow rule), and the current row's sign steps back to hollow
-   meanwhile, as for a control focused inside the row: one solid mark at a time, and the hollow one says
-   which row `j`/`k` continue from. An attribute each (`App.tsx`'s `markLandedCode`), not `:has()` and
-   not focus on the `pre`: a focused non-control would enter `./nav`'s "the selected control is the
-   focused one" logic. */
+   does not have the keys (the solid/hollow rule); the cursor band stays under the row `j`/`k` continue
+   from. An attribute (`App.tsx`'s `markLandedCode`), not focus on the `pre`: a focused non-control would
+   enter `./nav`'s "the selected control is the focused one" logic. */
 .message-list pre.code-block[data-hint-landed] {
   outline-style: solid;
   outline-width: 2px;
@@ -2551,11 +2912,6 @@ textarea,
 }
 .message-list[data-focused="false"] pre.code-block[data-hint-landed] {
   outline-width: 1.5px;
-}
-.message-list[data-code-landed] .row-current .row-sign {
-  background: none;
-  color: var(--nv-fg);
-  box-shadow: inset 0 0 0 1.5px var(--nv-fg);
 }
 
 /* The global f HINT's labels. The IncSearch pair, so a
@@ -2653,4 +3009,22 @@ textarea,
 .trust-footer {
   margin: 14px 0 0;
   color: var(--nv-muted);
+}
+
+/* The key that answers a card, drawn on its button only while that key would do it: the card is
+   under the cursor, the list has the keys, and the panel is in BROWSE. Drawn from the attribute so
+   the button's own name stays "Approve"/"Deny" for a screen reader and for copying. */
+.agent-ui-conversation[data-panel-mode="browse"]
+  .message-list[data-focused="true"]
+  .row-current
+  .permission-card-buttons
+  button[data-key]:not(:disabled)::after {
+  content: attr(data-key);
+  margin-left: 8px;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-xs);
+  opacity: 0.7;
 }

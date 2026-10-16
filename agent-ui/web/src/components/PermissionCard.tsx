@@ -122,12 +122,15 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
         <button
           data-nav-order={1}
           data-nav-action="allow"
+          data-key="a"
           onClick={() => handleAnswer("allow")}
           disabled={inert || !approvable}
         >
           Approve
         </button>
-        <button data-nav-order={2} data-nav-action="deny" onClick={() => handleAnswer("deny")} disabled={inert}>Deny</button>
+        <button data-nav-order={2} data-nav-action="deny" data-key="d" onClick={() => handleAnswer("deny")} disabled={inert}>
+          Deny
+        </button>
         {ruleOffer && (
           <button data-nav-order={3} data-nav-action="always" onClick={() => handleAnswer("allow", true)} disabled={inert}>
             Always allow <ShownInline text={ruleOffer} /> in this project

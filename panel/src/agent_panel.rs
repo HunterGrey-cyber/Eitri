@@ -594,6 +594,9 @@ struct AgentPanelState {
     /// `prefix r` reload) is told on `ready`. A document is otherwise told only when focus
     /// changes, and a reload does not change focus.
     pane_focused: bool,
+    /// How the page shows the agent's thinking (`init.lua`'s `agent.thinking`), sent on every `ready`
+    /// so a reloaded document draws thinking the way the first one did.
+    thinking_display: eitri_core::agent_prefs::ThinkingDisplay,
     /// Where the panel's two HINT messages (`hint_request`, `hint_targets`) go. `None` until
     /// `shell::hint::HintCoordinator` installs one via `AgentPanelHandle::on_hint`. An `Rc<dyn Fn>`
     /// rather than a plain closure field because the hook must be cloned out of the borrow before
@@ -1030,7 +1033,7 @@ impl AgentPanelHandle {
         // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
         // message handler takes the same `RefCell`, and anything that let it run during the
         // dispatch would panic on an already-borrowed cell rather than fail gracefully.
-        let (payload, class, first_text, turn_ended, offers_changed, tripped, review_hints) = {
+        let (payload, class, first_text, turn_ended, offers_changed, queue_changed, tripped, review_hints) = {
             let mut state_ref = state.borrow_mut();
             let state_ref = &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
@@ -1091,6 +1094,7 @@ impl AgentPanelHandle {
                 first_text,
                 out.turn_ended,
                 out.offers_changed,
+                out.queue_changed,
                 out.tripped,
                 out.review_hints,
             )
@@ -1138,6 +1142,10 @@ impl AgentPanelHandle {
                     trace.emit();
                 }
             }
+        }
+        // A message put into a turn was read (its row went out above) or is held again.
+        for tab in queue_changed {
+            send_queue(state, page, tab);
         }
         // A turn ended in these tabs; their queued messages go out now.
         for tab in turn_ended {
@@ -1601,6 +1609,15 @@ impl AgentPanelHandle {
             self.state.borrow_mut().tabs.drop_bypass_prompt();
         }
         self.dispatch(eitri_core::agent_bridge::serialize_pane_focus_for_js(focused));
+    }
+
+    /// `agent.thinking` as `init.lua` left it, applied once after it ran. Recorded for every later
+    /// `ready` and told to a document that is already listening (the dispatch is guarded, as
+    /// `set_pane_focused`'s is).
+    pub fn set_thinking_display(&self, display: eitri_core::agent_prefs::ThinkingDisplay) {
+        self.wake();
+        self.state.borrow_mut().thinking_display = display;
+        self.dispatch(eitri_core::agent_bridge::serialize_display_for_js(display));
     }
 
     /// Asks the panel to open its composer with the caret in it. Sent only from the new-tab path
@@ -2273,6 +2290,7 @@ fn panel_state(
         theme: eitri_core::theme::ThemeTokens::fallback(),
         keymap_help: None,
         pane_focused: false,
+        thinking_display: eitri_core::agent_prefs::ThinkingDisplay::Collapsed,
         hint_hook: None,
         attention_hook: None,
         last_tabs_payload: None,
@@ -2333,6 +2351,7 @@ fn bare_state(
         theme: eitri_core::theme::ThemeTokens::fallback(),
         keymap_help: None,
         pane_focused: false,
+        thinking_display: eitri_core::agent_prefs::ThinkingDisplay::Collapsed,
         hint_hook: None,
         attention_hook: None,
         last_tabs_payload: None,
@@ -2851,7 +2870,13 @@ fn send_queue(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId
             return;
         }
         let t = s.tabs.get(tab).expect("the active tab exists");
-        eitri_core::agent_bridge::serialize_queue_for_js(tab, &t.queue, t.queue_error.as_deref())
+        eitri_core::agent_bridge::serialize_queue_for_js(
+            tab,
+            &t.queue,
+            t.queue_error.as_deref(),
+            t.queue_note.as_deref(),
+            t.steers(),
+        )
     };
     page.send(&payload);
 }
@@ -5402,10 +5427,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 );
                 let context_payload = eitri_core::agent_bridge::serialize_editor_context_for_js(context.as_ref());
                 state_ref.last_context_payload = Some(context_payload.clone());
-                let window = window_payloads(
+                let mut window = window_payloads(
                     eitri_core::agent_bridge::serialize_history_for_js(&state_ref.history),
                     context_payload,
                     state_ref.editor_link.as_ref(),
+                );
+                // How thinking is shown, before the tabs and the snapshot it applies to.
+                window.insert(
+                    0,
+                    eitri_core::agent_bridge::serialize_display_for_js(state_ref.thinking_display),
                 );
                 let tabs = tabs_payload_recorded(state_ref);
                 let active = state_ref.tabs.active_state_payloads();
@@ -5918,14 +5948,14 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             page.send(&payload);
             ok(page);
         }
-        InboundMessage::QueueMessage { text, .. } => {
+        InboundMessage::QueueMessage { text, turn_id, .. } => {
             let tab = tab_of(target);
             let queued = {
                 let mut state_ref = state.borrow_mut();
                 let state_ref = &mut *state_ref;
                 // Captured now: what the editor shows when Enter is pressed.
                 let wire = eitri_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
-                state_ref.tabs.queue_message(tab, &text, wire, now_ms())
+                state_ref.tabs.queue_message(tab, &text, wire, now_ms(), true)
             };
             match queued {
                 Ok(_) => {
@@ -5934,7 +5964,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                     let flush = state.borrow_mut().tabs.flush_queue(tab);
                     match flush {
                         Some(flush) => apply_flush(state, page, tab, flush),
-                        None => send_queue(state, page, tab),
+                        None => {
+                            // Into the running turn when its agent can take it; held otherwise. Never
+                            // waits on the agent: the outcome arrives through the pump.
+                            state.borrow_mut().tabs.steer_held(tab, now_ms(), turn_id.as_deref());
+                            send_queue(state, page, tab);
+                        }
                     }
                     ok(page);
                 }
@@ -7208,7 +7243,35 @@ mod tests {
             at("history") < at("tabs") && at("editor_context") < at("tabs"),
             "{kinds:?}"
         );
+        assert!(at("display") < at("tabs"), "{kinds:?}");
         assert!(kinds.iter().any(|k| k == "command_result"), "{kinds:?}");
+    }
+
+    /// `agent.thinking` reaches the page: at once to a page already listening, and again on every
+    /// `ready`, so a reloaded document shows thinking the way the first one did.
+    #[test]
+    fn the_thinking_level_is_told_at_once_and_again_on_every_ready() {
+        use eitri_core::agent_prefs::ThinkingDisplay;
+        let (handle, page) = handle_with_strict_page();
+        page.inner.visible.set(true);
+        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        let displays = |page: &std::cell::RefCell<Vec<String>>| -> Vec<String> {
+            page.borrow()
+                .iter()
+                .filter(|e| kind_of(e) == "display")
+                .map(|e| {
+                    serde_json::from_str::<serde_json::Value>(e).unwrap()["thinking"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        assert_eq!(displays(&page.inner.sent), vec!["collapsed"]);
+        handle.set_thinking_display(ThinkingDisplay::Hidden);
+        assert_eq!(displays(&page.inner.sent), vec!["collapsed", "hidden"]);
+        handle.page_message(r#"{"type":"ready","request_id":"r2"}"#);
+        assert_eq!(displays(&page.inner.sent), vec!["collapsed", "hidden", "hidden"]);
     }
 
     #[test]
@@ -9155,11 +9218,10 @@ mod tests {
     fn the_detail_popover_counts_the_queue_and_names_the_rules_file() {
         let mut set = TabSet::new(BackendKind::Legacy, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let tab = set.active();
-        set.get_mut(tab).unwrap().queue.push(eitri_core::tab_set::Queued {
-            text: "a".into(),
-            wire: "a".into(),
-            queued_at_ms: 0,
-        });
+        set.get_mut(tab)
+            .unwrap()
+            .queue
+            .push(eitri_core::tab_set::Queued::held("a", "a".into(), 0));
         let rules = std::path::Path::new("/s/eitri/permissions/0123456789abcdef.json");
         let rows = detail_rows(
             set.active_tab(),

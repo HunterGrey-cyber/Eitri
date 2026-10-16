@@ -331,7 +331,9 @@ describe("turn ending", () => {
   });
   it("outlasts the model, usage and context, the cards and the queue, and is never in a y/n prompt's band", () => {
     const facts: BandFacts = { ...running, ending: end("failed"), usage: { text: "1k tok $0.01", title: "" } };
-    const narrow = ids(240, facts);
+    // 255, not 240, since 2026-10-15: INSERT is a letter longer than INPUT was, and the mode block's
+    // separator arrow takes a cell of its own.
+    const narrow = ids(255, facts);
     expect(narrow).toContain("ending");
     expect(narrow).not.toContain("model");
     expect(narrow).not.toContain("cards");

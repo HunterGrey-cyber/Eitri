@@ -162,6 +162,13 @@ impl TextSize {
         }
     }
 
+    /// A new un-zoomed size for the panel (the editor's font changed while the panel follows it): S, R
+    /// and any outstanding write are untouched, so a zoom in effect stays in effect at the new size.
+    pub(crate) fn with_base(mut self, base: f32) -> Self {
+        self.base = base;
+        self
+    }
+
     /// The panel's effective scale, `P = S × R`, clamped before multiplication by `base`.
     pub(crate) fn panel_scale(&self) -> f32 {
         (self.current_s() * self.r).clamp(ZOOM_MIN, ZOOM_MAX)
@@ -531,6 +538,18 @@ impl TextSizeController {
             "[text-size] panel {:.2} ({:.1}px)",
             state.panel_scale(),
             state.panel_px()
+        );
+    }
+
+    /// The panel's un-zoomed size moved (it follows the editor's `guifont`, or the desktop's text scaling
+    /// moved the conversion): the live size is re-derived from it with the zoom kept.
+    pub(crate) fn set_base(&self, base: f32) {
+        let next = self.state.borrow().clone().with_base(base);
+        *self.state.borrow_mut() = next;
+        self.push_panel_px();
+        eprintln!(
+            "[text-size] base {base:.2}px (the editor's font), panel {:.1}px",
+            self.state.borrow().panel_px()
         );
     }
 
@@ -1252,6 +1271,16 @@ mod tests {
             route_focused_module(Some(&ModuleId::terminal())),
             TextSizeTarget::Neither
         );
+    }
+
+    #[test]
+    fn a_new_base_keeps_the_zoom_in_effect() {
+        let (zoomed, _) = TextSize::new(14.0, 1.0).both_larger();
+        let zoomed = zoomed.panel_larger();
+        let scale = zoomed.panel_scale();
+        let moved = zoomed.clone().with_base(12.0);
+        assert_eq!(moved.panel_scale(), scale);
+        assert!((moved.panel_px() - 12.0 * scale).abs() < 1e-4);
     }
 
     #[test]

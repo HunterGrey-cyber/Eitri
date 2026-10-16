@@ -611,8 +611,10 @@ fn classify_assistant_line(value: &Value) -> ParsedLine {
                     Some(outcome) => outcomes.push(outcome),
                     None => dropped_blocks += 1,
                 },
-                // `thinking` has no projection effect on the live path either, so restoring it
-                // would make history show something a live turn does not. 13,588 of them here.
+                // `thinking` is deliberately not restored on a resume, though a live turn shows it: a
+                // resumed Claude conversation shows its prompts, replies and calls, and no past thought.
+                // Restoring them would hold every one in memory and send every one in every snapshot,
+                // and a long transcript carries thousands (13,588 in the ones this reader was tried on).
                 _ => dropped_blocks += 1,
             }
         }

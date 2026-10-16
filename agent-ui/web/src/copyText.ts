@@ -26,6 +26,9 @@ export function primaryText(item: TimelineItem): string {
       return runSummary(item.calls);
     case "ending":
       return turnEndingText(item.ending);
+    case "thinking":
+      // The thought's own text, whether or not its fold is open: the row stands for it.
+      return item.block.text;
   }
 }
 

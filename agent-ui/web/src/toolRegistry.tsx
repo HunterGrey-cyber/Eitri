@@ -213,7 +213,7 @@ function editConfig(label: string, toolName: string, pathField = "file_path"): T
             {label}: <PathLink path={pathOf(input, pathField)} />
           </div>
         );
-      return <EditDiff preview={preview} maxLines={expanded ? undefined : 0} createsFile={createsFile} />;
+      return <EditDiff preview={preview} maxLines={expanded ? undefined : 0} createsFile={createsFile} tool={toolName} />;
     },
   };
 }

@@ -868,13 +868,17 @@ export const REVIEW_KEYS: KeyHelp[] = [
 ];
 
 export const INPUT_KEYS: KeyHelp[] = [
-  { keys: "Enter", what: "Send; while a turn runs, queue it for the turn's end" },
-  { keys: "Ctrl+Enter", what: "Send now: interrupts a running turn, then sends the queue and this" },
+  { keys: "Enter", what: "Send; while a turn runs, into that turn (the agent reads it at its next step), or held for its end when the agent cannot take it" },
+  { keys: "Ctrl+Enter", what: "Send now: interrupts a running turn, then sends what is held and this" },
   { keys: "Shift+Enter", what: "New line" },
   // Alt+Enter and backslash before Enter insert a newline, as in Claude Code, instead of sending the draft.
   { keys: "Alt+Enter / \\ Enter", what: "New line (a backslash right before the caret is replaced by it)" },
-  { keys: "↑ / ↓", what: "From the first / last line: the queue back, then earlier prompts" },
+  { keys: "↑ / ↓", what: "From the first / last line: the held messages back, then earlier prompts" },
   { keys: "Ctrl+r", what: "Search earlier prompts (Enter puts one in the box)" },
+  // The `/` command menu (`Composer.tsx`): open while the box holds one line whose first word starts with `/`.
+  { keys: "/ command", what: "Start the box with / for the command menu; typing narrows it, a space closes it" },
+  { keys: "Ctrl+n / Ctrl+p", what: "In the command menu: next / previous command (↑ / ↓ too, ahead of prompt history)" },
+  { keys: "Tab", what: "In the command menu: complete the selected command and a space; Enter does too when what you typed begins the name" },
   { keys: "Ctrl+w / Ctrl+u", what: "Delete a word / to the line's start" },
   { keys: "Ctrl+c", what: "Interrupt a running turn; idle, clear the box into history" },
   // A design decision (2026-09-30): an added key. The band names the card it would approve.
@@ -882,7 +886,7 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Ctrl+g", what: "Edit this in nvim (:wq brings it back, :q! changes nothing)" },
   { keys: "Ctrl+o", what: "Detailed view" },
   { keys: "Shift+Tab", what: "Cycle manual → auto → bypass (entering bypass asks first)" },
-  { keys: "Esc", what: "Stop typing (back to browsing)" },
+  { keys: "Esc", what: "Stop typing (back to browsing); with the command menu open, close it first" },
   { keys: "?", what: "This list, from an empty box" },
 ];
 

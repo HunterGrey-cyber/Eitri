@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildTimeline, oldestPendingPermission, promptIndex, waitingCardAfter, waitingCardIndex } from "./timeline";
 import type { TimelineItem } from "./timeline";
 import { initialState } from "./reducer";
-import type { AgentUiState, PermissionRequestRecord, ToolCallRecord, TranscriptMessage } from "./types";
+import type { AgentUiState, PermissionRequestRecord, ToolCallRecord, TranscriptMessage, TurnEnding } from "./types";
 
 function msg(seq: number, text: string): TranscriptMessage {
   return { seq, text };
@@ -31,6 +31,8 @@ function labels(s: AgentUiState): string[] {
         return `perm:${item.request.permissionId}`;
       case "ending":
         return `ending:${item.ending.kind}`;
+      case "thinking":
+        return `thinking:${item.block.text}${item.open ? "…" : ""}`;
       case "run":
         // Only `display.ts`'s `buildDisplay` produces runs from `buildTimeline`'s output.
         // `TimelineItem` includes them, so this switch must handle the kind even though it cannot occur here.
@@ -224,6 +226,52 @@ describe("buildTimeline", () => {
       ["tool", 6],
     ]);
     expect(new Set(items.map((i) => i.key)).size).toBe(6);
+  });
+});
+
+describe("buildTimeline's item identity", () => {
+  /* Rows are memoized on their item: an item must be the same object while its record is, and a new
+     one when the reducer replaces the record, or a row would either draw again for nothing or keep
+     showing what the record said before. */
+  it("hands back the same item for the same record, and a new item for a replaced one", () => {
+    const prompt = { seq: 1, text: "go" };
+    const reply = msg(2, "a");
+    const call = tool(3, "tu");
+    const card = perm(4, "p", null);
+    const ending: TurnEnding = { seq: 5, turnId: "t", kind: "interrupted", reason: null, apiErrorStatus: null, message: null };
+    const done = { seq: 6, turnId: "t", text: "thought" };
+    const open = { seq: 7, turnId: "t", text: "still" };
+    const s = state({
+      userPrompts: [prompt],
+      transcript: [reply],
+      toolCalls: [call],
+      pendingPermissions: [card],
+      turnEndings: [ending],
+      thinking: [done, open],
+      thinkingOpen: true,
+    });
+    const before = buildTimeline(s);
+    const again = buildTimeline({ ...s });
+    expect(again.length).toBe(before.length);
+    again.forEach((item, i) => expect(item, item.key).toBe(before[i]));
+
+    // The reducer's way of changing a record: a new object in its place. Only that item changes.
+    const reply2 = { ...reply, text: "ab" };
+    const call2 = { ...call, result: { content: "ok", isError: false } };
+    const open2 = { ...open, text: "still more" };
+    const after = buildTimeline({ ...s, transcript: [reply2], toolCalls: [call2], thinking: [done, open2] });
+    const byKey = (items: TimelineItem[], key: string) => items.find((item) => item.key === key)!;
+    for (const key of ["u-1", "p-4", "e-5", "k-6"]) expect(byKey(after, key), key).toBe(byKey(before, key));
+    for (const key of ["m-2", "t-3", "k-7"]) expect(byKey(after, key), key).not.toBe(byKey(before, key));
+    expect(byKey(after, "m-2")).toMatchObject({ kind: "message", text: "ab" });
+    expect(byKey(after, "t-3")).toMatchObject({ kind: "tool", call: call2 });
+    expect(byKey(after, "k-7")).toMatchObject({ kind: "thinking", block: open2, open: true });
+
+    // A thought that closes keeps its record but not its item: `open` is drawn.
+    const closed = buildTimeline({ ...s, thinkingOpen: false });
+    expect(byKey(closed, "k-7")).not.toBe(byKey(before, "k-7"));
+    expect(byKey(closed, "k-7")).toMatchObject({ kind: "thinking", open: false });
+    expect(byKey(closed, "k-6")).toBe(byKey(before, "k-6"));
   });
 });
 

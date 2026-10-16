@@ -1488,58 +1488,35 @@ function stubResizeObserver(): FakeObserver[] {
 const resize = (observer: FakeObserver, target: Element, width: number) =>
   observer.callback([{ target, contentRect: { width } } as unknown as ResizeObserverEntry], {} as ResizeObserver);
 
-/* The rows' width comes from here, not from a CSS size container (2026-09-24). `.row` used to be
-   `container-type: inline-size`, which in WebKitGTK made the list lose its reader whenever the
-   status line's clock ticked during a streamed reply (`shell/tests/panel_stream_scroll.rs` is the
-   real-engine test). The replacement writes the list's content-box width to `--list-inline-size`,
-   and its whole safety argument is WHEN it writes: before the first paint, then only on a resize --
-   never on a streamed delta, which would restyle the conversation 30 times a second. */
-describe("MessageList measures its own width for the rows' escapes", () => {
+/* The list's observer (2026-09-24). From then until 2026-10-13 it also wrote the list's width to
+   `--list-inline-size` for the rows' escapes (the replacement for a CSS size container on `.row`, which in
+   WebKitGTK made the list lose its reader whenever the status line's clock ticked during a streamed
+   reply). The chat page's rows spend no measured width, so nothing is written; what still matters is
+   that the observer is made once, watches the list and its rows, and does nothing per streamed delta. */
+describe("MessageList watches its own size without writing a width", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: () => {} };
 
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("writes --list-inline-size on the list before anything else reads it", () => {
-    // jsdom lays nothing out, so the content box measures 0 -- which the stylesheet turns into "no
-    // escape" (see index.css's `.row` rule). The point is that the property is there from the start.
-    const { container } = render(<MessageList state={state({ transcript: texts("hi") })} {...props} />);
-    const list = container.querySelector<HTMLElement>(".message-list")!;
-    expect(list.style.getPropertyValue("--list-inline-size")).toBe("0px");
-  });
-
-  it("re-measures on a resize, and writes nothing while a reply streams", () => {
+  it("observes the list and its rows once, writes no width, and adds nothing while a reply streams", () => {
     const observers = stubResizeObserver();
     const { container, rerender, unmount } = render(
       <MessageList state={state({ transcript: texts("the reply so far") })} {...props} />,
     );
     const list = container.querySelector<HTMLElement>(".message-list")!;
     expect(observers).toHaveLength(1);
-    // The list itself, and (since the GUI pass, 2026-09-24) the one row in it -- see the next block.
     expect(observers[0].observed).toEqual([list, list.querySelector(".row")]);
     const setProperty = vi.spyOn(list.style, "setProperty");
-
-    // A resize reaches the rows, as the content box the observer reports.
     resize(observers[0], list, 537.5);
-    expect(list.style.getPropertyValue("--list-inline-size")).toBe("537.5px");
-    expect(setProperty).toHaveBeenCalledTimes(1);
-    // The same size again changes nothing, so it costs no restyle.
-    resize(observers[0], list, 537.5);
-    expect(setProperty).toHaveBeenCalledTimes(1);
-    // A ROW's entry is not the list's width, whatever its content box says.
-    resize(observers[0], list.querySelector(".row")!, 120);
-    expect(list.style.getPropertyValue("--list-inline-size")).toBe("537.5px");
-
-    // Streaming: the open message grows on every delta (a new `state` each time). No write, no
-    // second observer, and the growing row is not observed again.
+    expect(list.style.getPropertyValue("--list-inline-size")).toBe("");
     for (const text of ["the reply so far, and", "the reply so far, and more", "the reply so far, and more text"]) {
       rerender(<MessageList state={state({ transcript: texts(text) })} {...props} />);
     }
-    expect(setProperty).toHaveBeenCalledTimes(1);
+    expect(setProperty).not.toHaveBeenCalled();
     expect(observers).toHaveLength(1);
     expect(observers[0].observed).toHaveLength(2);
-
     unmount();
     expect(observers[0].disconnected).toBe(true);
   });

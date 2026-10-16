@@ -48,6 +48,7 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     // Its CLI always runs `default` (`--permission-mode default`), and its hook relay has no way
     // to say "no decision": every request it raises is answered with Eitri's own policy.
     cli_auto_mode: false,
+    steer: false,
 };
 
 // Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
@@ -419,6 +420,16 @@ impl From<std::io::Error> for BackendError {
             folded_events: Vec::new(),
         }
     }
+}
+
+/// Why a message typed while a turn runs was not put into it ([`AgentBackend::steer`]); it is held
+/// until the turn ends instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SteerRefusal {
+    /// The agent cannot take messages while a turn runs at all.
+    Unsupported,
+    /// It could, but not this one now: the turn was ending, or the agent said no.
+    Refused(String),
 }
 
 /// The event a submitted prompt becomes. Free function so `send_turn` and its test build it the
@@ -829,6 +840,50 @@ impl AgentBackend {
         external.conversation.send_turn_with(wire_text, turn_policy(mode))?;
         external.conversation.note_title(as_typed);
         Ok(Vec::new())
+    }
+
+    /// Whether a message typed while a turn runs can go into that turn (the provider's capability
+    /// `steer`). The legacy backend's CLI reads its input only between turns.
+    pub fn steers(&self) -> bool {
+        match self {
+            AgentBackend::Legacy(_) => false,
+            AgentBackend::Sidecar(conversation) => conversation.steers(),
+            AgentBackend::External(external) => external.conversation.steers(),
+        }
+    }
+
+    /// Puts one message into the running turn without interrupting it, under the host's id for it.
+    /// Nothing is folded here: the transcript row comes when the provider reports the agent read it
+    /// (`UserMessageDelivered`), at that point of the conversation. A refusal means nothing was sent;
+    /// [`SteerRefusal`] says why in words the panel shows after "held until the turn ends:".
+    ///
+    /// `shown_turn` is the turn the page showed running when Enter was pressed; another turn running now
+    /// refuses it.
+    pub fn steer(
+        &mut self,
+        shown_turn: &str,
+        client_message_id: &str,
+        wire_text: &str,
+        as_typed: &str,
+    ) -> Result<(), SteerRefusal> {
+        let result = match self {
+            AgentBackend::Legacy(_) => return Err(SteerRefusal::Unsupported),
+            AgentBackend::Sidecar(conversation) => {
+                conversation.steer_turn(shown_turn, client_message_id, wire_text, as_typed)
+            }
+            AgentBackend::External(external) => {
+                external
+                    .conversation
+                    .steer_turn(shown_turn, client_message_id, wire_text, as_typed)
+            }
+        };
+        result.map_err(|e| match e {
+            ConversationError::Provider(agent::ProviderError::UnsupportedCapability(_)) => SteerRefusal::Unsupported,
+            ConversationError::Provider(agent::ProviderError::Provider { message, .. }) => {
+                SteerRefusal::Refused(message)
+            }
+            other => SteerRefusal::Refused(other.to_string()),
+        })
     }
 
     /// A session tab's rename. Legacy writes no records, so its name lives only in the

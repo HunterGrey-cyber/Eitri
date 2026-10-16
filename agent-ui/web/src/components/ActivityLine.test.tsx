@@ -29,6 +29,26 @@ it("shows the turn's motion and Stop while working, and Stop interrupts", () => 
   expect(container.querySelector("button.stop")).toBeNull();
 });
 
+it("moves its star while the agent works, and holds it still while a card waits or the phase is the user's", () => {
+  const onInterrupt = vi.fn();
+  const glyph = (c: HTMLElement) => c.querySelector<HTMLElement>(".activity-glyph")!;
+  const { container, rerender } = render(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} />,
+  );
+  expect(glyph(container).textContent?.trim()).toBe("✻");
+  expect(glyph(container).getAttribute("aria-hidden")).toBe("true");
+  expect(glyph(container).dataset.moving).toBe("true");
+  const moving = glyph(container);
+  // The same element across a re-render: the animation is never torn down and restarted by one.
+  rerender(<ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={1} />);
+  expect(glyph(container)).toBe(moving);
+  // A card waiting: the agent is not working, so the star does not say it is.
+  rerender(<ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} pendingTool="Bash" />);
+  expect(glyph(container).dataset.moving).toBeUndefined();
+  // No meter: the star is the line's only motion.
+  expect(container.querySelector(".meter, .meter-fill")).toBeNull();
+});
+
 it("counts the queue, names the interrupt key, and names a card that waits (P1)", () => {
   const onInterrupt = vi.fn();
   const { container, rerender } = render(

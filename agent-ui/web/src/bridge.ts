@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
 import type { KeymapHelp, PaneDirection } from "./keymap";
 import { isHex64, isTrustRemember } from "./trust";
 import type { TrustPromptEnvelope } from "./trust";
@@ -45,7 +45,9 @@ export type OutboundMessage =
   | { type: "hint_targets"; request_id: string; session_id: number; count: number }
   /** Queue this text behind the tab's running turn. Rust answers with a
    *  `command_result`; a refusal never touches the box (the panel already sent it). */
-  | { type: "queue_message"; request_id: string; tab: TabId; text: string }
+  /** `turn_id`: the turn the page showed running when Enter was pressed; the message goes only into that
+   *  one, and is held for its end otherwise. */
+  | { type: "queue_message"; request_id: string; tab: TabId; text: string; turn_id: string | null }
   /** `↑`: empty the tab's queue and hand its texts back as `queue_taken`. */
   | { type: "take_back_queue"; request_id: string; tab: TabId }
   /** `Ctrl+Enter`: queue this text (if non-empty), then interrupt if a turn is
@@ -221,13 +223,20 @@ type InboundHandler = (
          *  for paths that did not exist just before the answer. Carries the `createsFile` signal
          *  for calls that raised no card to carry it. */
         autoCreatesFile?: string[];
+        /** The turns that ended in this batch and how long each ran (`TurnTimeWire`); absent when none did. */
+        turnTimes?: TurnTimeWire[];
       }
     /** `turnStartedAtMs`: when the running turn started, `Date.now()`'s clock, kept per tab by
      *  Rust (`tab_set`'s `turn_clock`) so a switch or a reload shows its real elapsed time; `null`
-     *  (or absent, from an older build) when none runs. */
-    | { kind: "snapshot"; tab: TabId; throughRevision: number; state: AgentUiSnapshot; turnStartedAtMs?: number | null }
+     *  (or absent, from an older build) when none runs. `turnTimes`: how long every finished turn of the
+     *  tab ran, replacing the panel's whole table (absent from an older build). */
+    | { kind: "snapshot"; tab: TabId; throughRevision: number; state: AgentUiSnapshot; turnStartedAtMs?: number | null; turnTimes?: TurnTimeWire[] }
     | ({ kind: "handoff"; tab: TabId } & HandoffCommand)
     | { kind: "theme"; vars: Record<string, string> }
+    /** How the panel shows the agent's thinking (`init.lua`'s `agent.thinking`;
+     *  `serialize_display_for_js`, `core/src/agent_bridge.rs`). Window-level, sent on every `ready`
+     *  before the tabs. */
+    | { kind: "display"; thinking: ThinkingDisplay }
     /** Whether this panel's pane holds the window's keyboard focus. `shell` decides this from
      *  GTK's focus widget (`shell/src/pane_focus.rs`). It is not decided from this page's own
      *  `window` focus/blur: `shell` arbitrates Ctrl+h/Ctrl+l, and the same answer drives the
@@ -300,8 +309,9 @@ type InboundHandler = (
      *  would load. Tab-scoped. A second one for the same tab replaces the first. `serialize_trust_prompt_for_js`,
      *  `core/src/agent_bridge.rs`. */
     | TrustPromptEnvelope
-    /** This tab's queue and the refusal reason if its last flush was refused. */
-    | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null }
+    /** This tab's queue, its last flush refusal reason, and `note`: why messages are held
+     *  for the turn's end rather than sent during the turn. */
+    | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null; note?: string | null; enterSteers?: boolean | null }
     /** Rust's mirror of the composer's own text, sent only on a switch, `ready`,
      *  a reset or a scratch-editor return -- never while the user is typing. `refused` names the send
      *  whose refusal this follows (a first message the trust question put off), which the page has put
@@ -403,6 +413,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "snapshot" ||
         obj.kind === "handoff" ||
         obj.kind === "theme" ||
+        obj.kind === "display" ||
         obj.kind === "pane_focus" ||
         obj.kind === "editor_typing" ||
         obj.kind === "enter_input" ||

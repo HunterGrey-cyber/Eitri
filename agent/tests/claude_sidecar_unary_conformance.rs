@@ -143,6 +143,15 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "cli_auto_mode",
         "permission_defer",
         "permission_denied_events",
+        "cli_compatibility_report",
+        "gated_cli_mode_default",
+        "effective_claude_config_dir",
+        "startup_report_file",
+        "effective_session_report",
+        "extra_mcp_servers",
+        "extra_mcp_servers_http",
+        "steer_turn",
+        "list_commands",
         "executable_host_cli",
     ]
     .iter()
@@ -150,6 +159,9 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
     .collect();
     // Compare capability order and length as well as membership to catch changes to
     // the sidecar's literal list.
+    //
+    // `steer_turn` requires CLI version 2.1.252 or later. Its absence fails this test
+    // because an older CLI would lose steering support.
     //
     // Strip two optional capabilities before comparing the rest with `expected`.
     // `egress_restricted` must follow `tool_allow_list` and precede `set_permission_mode`;

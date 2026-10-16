@@ -12,9 +12,21 @@ import {
 } from "../composerKeys";
 import type { HistoryWalk } from "../promptHistory";
 import { stepHistory } from "../promptHistory";
-import { heldBackSlashCommand, slashCommandFlashText } from "../slashCommands";
+import { pickerStep } from "../chooser";
+import {
+  heldBackSlashCommand,
+  matchCompletions,
+  menuToken,
+  slashCommandFlashText,
+  slashMenuWindow,
+  SLASH_MENU_ROWS,
+  startsMatch,
+} from "../slashCommands";
+import type { CompletionCommand } from "../slashCommands";
 import { HistorySearch } from "./HistorySearch";
+import { SlashMenu } from "./SlashMenu";
 import { NO_TEXT_ASSIST } from "../textField";
+import { runningPlaceholder } from "../queueLines";
 
 /** A draft the host is putting back into the box after a send was refused.
  *
@@ -72,14 +84,19 @@ type Props = {
    *  Optional so callers and tests that do not save drafts need no callback. */
   onDraftChange?: (text: string) => void;
   /** Whether this tab has a turn running (phase 3, C1). The box stays live and typable through it --
-   *  Enter queues a follow-up instead of sending, and `Ctrl+Enter` sends now. */
+   *  Enter puts the message into the running turn, or holds it for the turn's end when the agent cannot
+   *  take it (`enterSteers`; Rust decides, `onQueue` carries both), and `Ctrl+Enter` sends now. */
   running: boolean;
+  /** Whether Enter while the turn runs puts the message into it (the agent's capability `steer`): only
+   *  what the empty box says changes. */
+  enterSteers?: boolean;
   onQueue?: (text: string) => void;
   onSendNow?: (text: string) => void;
   /** The shared prompt history, newest last. */
   history?: string[];
-  /** How many items are queued behind the running turn -- `↑` from the first line takes them back
-   * before it ever walks history. */
+  /** How many messages are held for the turn's end -- `↑` from the first line takes them back
+   * before it ever walks history. One sent into the running turn is not counted: the agent
+   *  may already have read it. */
   queueCount?: number;
   onTakeBackQueue?: () => void;
   /** Reply to `take_back_queue`: the queue's texts, merged ahead of whatever is in the box
@@ -99,9 +116,16 @@ type Props = {
   /** Whether a typed `/command` is judged as one of Claude Code's (a held-back one is refused with a
    *  flash). False in another agent's tab, which sends every draft as typed. */
   claudeSlashCommands?: boolean;
+  /** The commands the `/` menu offers in this tab (`../slashCommands`' `completionSource`). `null`, or
+   *  absent, is "no menu": an agent that reports no list (Codex) has nothing to complete. */
+  slashCommands?: readonly CompletionCommand[] | null;
   /** Passes keys consumed by the `Ctrl+r` search to the containing component's typing guard
    *  through `HistorySearch`'s `onLineKey`, since these keys do not bubble. */
-  onLineKey?: (event: React.KeyboardEvent<HTMLInputElement>) => void;
+  onLineKey?: (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
+  /** The key BROWSE's stand-in names at its right end, the way the start screen's menu shows its keys: the
+   *  key that opens the box. Since 2026-10-15 it replaces the "i or Ctrl+j to type" sentence that followed
+   *  the placeholder (`Ctrl+j` is in the `?` sheet). */
+  browseKey?: string;
 };
 
 /** C2: the BROWSE stand-in's own draft preview, cut to two lines so it reads like a hint rather
@@ -124,6 +148,7 @@ export function Composer({
   onSend,
   onDraftChange,
   running,
+  enterSteers = false,
   onQueue = () => {},
   onSendNow = () => {},
   history = [],
@@ -136,11 +161,22 @@ export function Composer({
   editingInNvim = false,
   onOpenKeymap = () => {},
   claudeSlashCommands = true,
+  slashCommands = null,
   onLineKey,
+  browseKey = "i",
 }: Props) {
   const [text, setText] = useState("");
   const [walk, setWalk] = useState<HistoryWalk>({ index: null, stash: "" });
   const [searching, setSearching] = useState(false);
+  /* The `/` menu. `caret` mirrors the textarea's selection (a keystroke, a click or a selection change
+     moves it without the text changing), `menuIndex`/`menuTop` are the selected row and the first row
+     drawn, and `menuDismissed` is Esc: it holds until the text next changes by typing. A draft put into
+     the box by the panel itself (a history walk, the queue taken back, a refused send restored, a search
+     result) starts dismissed too, so the menu only opens from what the user types and `↑`/`↓` keep walking. */
+  const [caret, setCaret] = useState(0);
+  const [menuIndex, setMenuIndex] = useState(0);
+  const [menuTop, setMenuTop] = useState(0);
+  const [menuDismissed, setMenuDismissed] = useState(false);
   /* Show a held-back slash command's flash locally, since an overlay can hide the shared band.
    *  Increment `seq` for each attempt so pressing Enter twice on the same text shows two flashes. */
   const [slashFlash, setSlashFlash] = useState<{ text: string; seq: number } | null>(null);
@@ -164,11 +200,27 @@ export function Composer({
    *  somewhere in the same text (defect 1: a landing put it at the start). */
   const caretRef = useRef<number | null>(null);
 
-  function setBox(next: string, caret: number | null = null) {
+  /** The caret `setBox` has decided on and not yet placed in the box. React reports a `select` for a
+   *  keydown with the box's selection as it still was, before the new text is drawn; reading that would
+   *  put the menu's caret back where it was, so selection reports are ignored until it is placed. */
+  const placingCaret = useRef(false);
+  function trackCaret(el: HTMLTextAreaElement) {
+    if (!placingCaret.current) setCaret(el.selectionStart);
+  }
+
+  /** Puts `next` in the box. `recalled` is a draft the user did not type (history, the queue, a search
+   *  result): a recalled `/command` must not open the menu, which would own `↑`/`↓` and stop the walk on it. */
+  function setBox(next: string, caret: number | null = null, recalled = false) {
     setText(next);
     onDraftChange?.(next);
     caretRef.current = caret;
+    setCaret(caret ?? next.length);
+    setMenuIndex(0);
+    setMenuTop(0);
+    setMenuDismissed(recalled);
+    placingCaret.current = true;
     requestAnimationFrame(() => {
+      placingCaret.current = false;
       const el = textareaRef.current;
       if (el === null) return;
       const at = caret ?? next.length;
@@ -209,12 +261,16 @@ export function Composer({
     // `App.tsx`'s send-refusal handler mirrors recovered text once, where it computes that text.
     setText(restoredDraft.text);
     caretRef.current = null;
+    setCaret(restoredDraft.text.length);
+    setMenuIndex(0);
+    setMenuTop(0);
+    setMenuDismissed(true);
     setWalk({ index: null, stash: "" });
   }, [restoredDraft]);
 
   useEffect(() => {
     if (queueTaken === null) return;
-    setBox(mergeTaken(queueTaken.texts, textareaRef.current?.value ?? text));
+    setBox(mergeTaken(queueTaken.texts, textareaRef.current?.value ?? text), null, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queueTaken?.seq]);
 
@@ -226,6 +282,34 @@ export function Composer({
     const panel = el.closest<HTMLElement>(".agent-ui-root")?.clientHeight || window.innerHeight;
     el.style.height = `${growHeight(el.scrollHeight, panel)}px`;
   }, [text, mode]);
+
+  /* The menu is open while the draft is one line whose first word starts with `/`, the caret is in that
+     word, something matches, Esc has not closed it since the text last changed, and nothing else owns
+     the box (the history search, the scratch editor, a dead session). */
+  const token =
+    slashCommands !== null && mode === "input" && !disabled && !editingInNvim && !searching ? menuToken(text, caret) : null;
+  const matches = token !== null && slashCommands !== null ? matchCompletions(slashCommands, token.query) : [];
+  const menuOpen = token !== null && matches.length > 0 && !menuDismissed;
+  const selected = Math.min(menuIndex, Math.max(0, matches.length - 1));
+  const shownFrom = slashMenuWindow(selected, menuTop, matches.length);
+
+  function selectMenu(next: number) {
+    setMenuIndex(next);
+    setMenuTop(slashMenuWindow(next, shownFrom, matches.length));
+  }
+  function moveMenu(step: 1 | -1) {
+    selectMenu((selected + step + matches.length) % matches.length);
+  }
+
+  /** Puts the command's name into the draft's first word, followed by a space the caret lands after (one
+   *  already there is reused), and leaves the rest of the draft alone. */
+  function completeWith(command: CompletionCommand) {
+    if (token === null) return;
+    const rest = text.slice(token.end);
+    const head = `/${command.name} `;
+    setBox(head + rest.replace(/^ /, ""), head.length);
+    textareaRef.current?.focus();
+  }
 
   function submit(now: boolean) {
     if (disabled || editingInNvim) return;
@@ -254,6 +338,46 @@ export function Composer({
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (isImeKey({ isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) return;
     const el = e.currentTarget;
+    /* The open `/` menu takes its keys ahead of everything below, so `↑`/`↓` never reach the prompt
+       history or the queue while it shows. It is the textarea's own handler: an IME's key was returned
+       above, so a composing Enter or Esc never completes or closes anything. */
+    if (menuOpen && token !== null && !e.altKey && !e.metaKey) {
+      const step = e.shiftKey ? null : pickerStep(e);
+      if (step !== null) {
+        e.preventDefault();
+        moveMenu(step);
+        return;
+      }
+      if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey) {
+        e.preventDefault();
+        completeWith(matches[selected]);
+        return;
+      }
+      // Enter completes only when what is typed matches the selected name from its start (or a word's
+      // start in it, `startsMatch`) and is not yet the whole name; a name that merely contains the letters
+      // is for Tab and the arrows, and Enter then sends the text as typed, so a user's own `/view` is not
+      // rewritten into `/review`. With Ctrl Enter keeps its own meaning, and Shift+Enter is a newline.
+      if (
+        e.key === "Enter" &&
+        !e.shiftKey &&
+        !e.ctrlKey &&
+        el.value.slice(0, token.end) !== `/${matches[selected].name}` &&
+        startsMatch(matches[selected], token.query)
+      ) {
+        e.preventDefault();
+        completeWith(matches[selected]);
+        return;
+      }
+      if (e.key === "Escape" && !e.shiftKey && !e.ctrlKey) {
+        // Closes the menu and nothing else: the key does not bubble to the panel's own Esc (back to
+        // browsing). The typing guard is told of it, as the history search tells of its own.
+        e.preventDefault();
+        e.stopPropagation();
+        onLineKey?.(e);
+        setMenuDismissed(true);
+        return;
+      }
+    }
     // App.tsx's document-capture router (`modeKey.ts`) handles Shift+Tab before it reaches this
     // handler.
     if (e.key === "Enter" && !e.shiftKey) {
@@ -313,7 +437,7 @@ export function Composer({
       if (step !== null) {
         e.preventDefault();
         setWalk(step.walk);
-        setBox(step.text);
+        setBox(step.text, null, true);
       }
       return;
     }
@@ -322,7 +446,7 @@ export function Composer({
       if (step !== null) {
         e.preventDefault();
         setWalk(step.walk);
-        setBox(step.text);
+        setBox(step.text, null, true);
       }
     }
   }
@@ -348,7 +472,7 @@ export function Composer({
               onLineKey={onLineKey}
               onAccept={(t) => {
                 setSearching(false);
-                setBox(t);
+                setBox(t, null, true);
                 focusAtCaret();
               }}
               onCancel={() => {
@@ -357,22 +481,36 @@ export function Composer({
               }}
             />
           )}
-          {/* A bare `❯` prompt replaces the bordered textarea look. Use plain `--nv-fg` so the prompt does
-              not carry a mode colour. */}
-          <span className="composer-prompt" aria-hidden="true">
-            ❯
-          </span>
+          {menuOpen && (
+            <SlashMenu
+              rows={matches.slice(shownFrom, shownFrom + SLASH_MENU_ROWS)}
+              firstIndex={shownFrom}
+              total={matches.length}
+              selected={selected}
+              onPick={(i) => completeWith(matches[i])}
+              onWheel={(by) => selectMenu(Math.max(0, Math.min(matches.length - 1, selected + by)))}
+            />
+          )}
+          {/* No prompt glyph: the tinted block the composer is drawn as (`index.css`) is its mark. */}
           <textarea
             ref={textareaRef}
             {...NO_TEXT_ASSIST}
             value={text}
+            // One line when empty, the height BROWSE's stand-in has, so `i` does not grow the box and push
+            // the conversation up; the layout effect above grows it with the text.
+            rows={1}
             disabled={disabled}
             readOnly={editingInNvim}
             autoFocus
             onChange={(e) => {
               setText(e.target.value);
               onDraftChange?.(e.target.value);
+              setCaret(e.target.selectionStart);
+              setMenuIndex(0);
+              setMenuTop(0);
+              setMenuDismissed(false);
             }}
+            onSelect={(e) => trackCaret(e.currentTarget)}
             onFocus={() => onModeChange("input")}
             // Mouse-driven "click away": a keyboard-driven Esc already sets BROWSE at the panel
             // level (`keymap.ts`'s `resolveKey`), and this is what keeps a click OUT of the box
@@ -387,9 +525,11 @@ export function Composer({
             onKeyDown={onKeyDown}
             onKeyUp={(e) => {
               caretRef.current = e.currentTarget.selectionStart;
+              trackCaret(e.currentTarget);
             }}
             onMouseUp={(e) => {
               caretRef.current = e.currentTarget.selectionStart;
+              trackCaret(e.currentTarget);
             }}
             placeholder={
               closing
@@ -399,8 +539,11 @@ export function Composer({
                   : editingInNvim
                     ? "editing in nvim — :wq to return"
                     : running
-                      ? "Queue a follow-up…"
-                      : "Ask the agent..."
+                      ? runningPlaceholder(enterSteers)
+                      : // Nothing in an ordinary empty box: the caret and the box's INPUT frame already say
+                        // where the keys are, and grey text behind an input method's preedit reads as a
+                        // second line of input.
+                        undefined
             }
           />
         </>
@@ -419,29 +562,25 @@ export function Composer({
         // control that does not become active when focus reaches it would be the surprising
         // behaviour. It reads like the empty box it stands in for, not like an instruction, but
         // `Ctrl+l`, `prefix a` and a tab switch all land BROWSE, so a reader can land here with no
-        // other on-screen route into the box. So a dim `i or Ctrl+j to type` follows the placeholder
-        // or the draft alike, but never in INPUT (the caret is the sign there), on an ended session
-        // (its own branch above says `r` instead), or while a scratch round trip owns the draft
-        // (`editingInNvim`: typing here would only be lost to nvim's own buffer). It draws the same
-        // bare `❯` line INPUT draws, so the bottom keeps its shape across `i`/`Esc`; the band's mode
-        // block is the mode.
+        // other on-screen route into the box. So the key that leads in, `browseKey`, sits at the box's
+        // right end, as the start screen's menu shows its keys, after the placeholder or the draft
+        // alike. It is never shown on an ended session (its own branch above) or while a scratch round
+        // trip owns the draft (`editingInNvim`: typing here would only be lost to nvim's own buffer);
+        // in INPUT the caret is the sign instead. It is the same card INPUT draws, so the bottom keeps
+        // its shape across `i`/`Esc`; the band's mode block is the mode.
         <>
-          <span className="composer-prompt" aria-hidden="true">
-            ❯
-          </span>
           <div className="composer-browse-hint" tabIndex={0} onFocus={() => onModeChange("input")}>
             {text.trim() === "" ? (
               "Ask the agent..."
             ) : (
               <span className="composer-draft">{twoLines(text)}</span>
             )}
+            {queueCount > 0 && <span className="composer-queued">+{queueCount} queued</span>}
             {!editingInNvim && (
-              <span className="composer-hint" aria-hidden="true">
-                {" "}
-                — i or Ctrl+j to type
+              <span className="composer-key" aria-hidden="true">
+                {browseKey}
               </span>
             )}
-            {queueCount > 0 && <span className="composer-queued">+{queueCount} queued</span>}
           </div>
         </>
       )}

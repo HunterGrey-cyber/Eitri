@@ -3,13 +3,14 @@
  * `core/src/panel_cadence.rs` is the Rust half). While the user types in the editor, Rust pushes the
  * stream on an even cadence so the panel causes few, evenly spaced GTK frame-clock cycles -- each one
  * can make the editor's next frame land a refresh late. The page's own motion must not undo that:
- * the turn meter repaints on its own, so while the user types it is slowed to no faster than the
- * cadence (never paused: the stream is meant to stay smooth, and a still meter reads as a hang).
+ * the activity line's star repaints on its own, so while the user types it is slowed to no faster than
+ * the cadence (never paused: the stream is meant to stay smooth, and a still star reads as a hang). The
+ * variable keeps the name of the bar meter the star replaced.
  *
  * The only self-driven motion in the panel, checked 2026-09-29 by reading every `setInterval`,
  * `requestAnimationFrame`, `animation` and `transition` in `src/`:
  *
- * - the meter (`index.css`, `.turn-activity .meter-fill`): 4 visible states in 1200 ms, one repaint
+ * - the star (`index.css`, `.activity-glyph[data-moving]`): 4 visible states in 1200 ms, one repaint
  *   per {@link NATURAL_METER_STEP_MS}. Slowed here, through `--meter-step`.
  * - the elapsed clock (`components/TurnActivity.tsx`): one repaint a second. The slowest cadence
  *   Rust accepts is one push a second, so this is never faster than the cadence and is left alone.
@@ -18,25 +19,25 @@
  *   does not.
  *
  * Rust sends `editor_typing` only for a cadence slower than {@link NATURAL_METER_STEP_MS}
- * (`panel_cadence::SELF_DRIVEN_STEP_MS`, the same number); at faster ones the meter is already
+ * (`panel_cadence::SELF_DRIVEN_STEP_MS`, the same number); at faster ones the star is already
  * within the cadence and telling the page would cost it two repaints per burst for nothing.
  */
 
-/** One visible state of the meter with nothing slowing it: `index.css` animates 4 states over
+/** One visible state of the star with nothing slowing it: `index.css` animates 4 states over
  *  1200 ms. `indexCss.test.ts` holds this equal to the stylesheet and to the Rust constant. */
 export const NATURAL_METER_STEP_MS = 300;
 
-/** How long the meter holds each state while the user types, given the gap between the panel's
+/** How long the star holds each state while the user types, given the gap between the panel's
  *  pushes: the natural step, or the gap if that is longer. Never shorter than the natural step --
- *  typing must not speed the meter up -- and a gap that is not a usable number falls back to it. */
+ *  typing must not speed the star up -- and a gap that is not a usable number falls back to it. */
 export function typingMeterStepMs(periodMs: number): number {
   if (!Number.isFinite(periodMs) || periodMs <= 0) return NATURAL_METER_STEP_MS;
   return Math.max(NATURAL_METER_STEP_MS, Math.round(periodMs));
 }
 
 /** Applies Rust's `editor_typing` to the document's root. While `typing`, `data-editor-typing` is
- *  set and `--meter-step` slows the meter; otherwise both are gone. A period that is not a usable
- *  number is "not typing": a malformed message must not leave the meter slowed. */
+ *  set and `--meter-step` slows the star; otherwise both are gone. A period that is not a usable
+ *  number is "not typing": a malformed message must not leave the star slowed. */
 export function applyEditorTyping(root: HTMLElement, typing: boolean, periodMs: number): void {
   if (typing && Number.isFinite(periodMs) && periodMs > 0) {
     root.setAttribute("data-editor-typing", "");

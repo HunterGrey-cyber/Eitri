@@ -164,6 +164,11 @@ tab's mode.
   turn ends, the band says how many are still running, the turn's review says later changes are not in it, and
   `<leader>k` stops them by stopping the session after a `y/n` (the conversation can be resumed); a later
   interrupt or closing the tab stops them too.
+- **A message while a turn runs.** `Enter` puts it into the running turn (Codex's `turn/steer`) without
+  stopping it; Codex reads it at its next step (after the command or card it is waiting on, if any), and the
+  conversation shows it where Codex read it. A message Codex refuses (by Codex's own source, a review or a
+  compaction may refuse one; Eitri has not seen that happen) or has not read when the turn ends is held for the turn's end, with a line saying why. Codex forgets a message
+  it had not read when the turn is interrupted, so Eitri sends it again with the next turn.
 - **Subagents.** Codex may start subagents and Eitri cannot turn that off. Their rows and cards say `subagent`,
   they inherit the sandbox and the trust answer of the tab, interrupting or closing the tab reaches all of
   them, and the tab counts as busy until every one of them is idle. A subagent's own text is not shown.
@@ -176,8 +181,8 @@ tab's mode.
 
 ### What a Codex tab does not have
 
-- Slash commands are sent to Codex as typed. There is no held-back command list and no `/model` or `/effort`
-  picker.
+- Slash commands are sent to Codex as typed. There is no held-back command list, no `/model` or `/effort`
+  picker, and no `/` command menu (Codex reports no command list to complete from).
 - `<leader>t` (continue in a terminal) flashes "Continuing a Codex session in a terminal is not available yet".
 - `prefix i` lacks the Claude-only rows (the Claude session ids, the CLI build, permission rules, account and
   model).
@@ -273,8 +278,11 @@ whose name `init.lua` no longer registers is skipped.
 
 ### What an ACP tab does not have
 
-Plans, command lists, session titles and other updates an ACP agent may send are not shown; Eitri has no rate
-limits, no context bar, no slash-command list and no model picker for these tabs. `prefix i` has a `context` row,
+ACP has no way to put a message into a running turn, so `Enter` while one runs holds the message until the turn
+ends. Plans, session titles and other updates an ACP agent may send are not shown; Eitri has no rate
+limits, no context bar and no model picker for these tabs. The command list an agent reports is the `/` menu in
+its composer (see [the composer's keys](keys.md)): the names and descriptions are drawn as plain text, and a tab
+whose agent has reported none has no menu. `prefix i` has a `context` row,
 which shows how full the agent's context is once the agent reports it. Tokens come without a cost.
 
 ## Known limits

@@ -458,6 +458,81 @@ fn updates_map_and_unknown_kind_is_dropped() {
 }
 
 #[test]
+fn command_lists_become_events_only_when_they_change() {
+    let mut script = boot("agent");
+    let list = |names: &[(&str, &str)]| {
+        update(
+            "s1",
+            json!({"sessionUpdate": "available_commands_update",
+                   "availableCommands": names.iter().map(|(n, d)| json!({"name": n, "description": d,
+                       "input": {"hint": "args"}})).collect::<Vec<_>>()}),
+        )
+    };
+    script.extend([
+        expect_prompt(3, "x"),
+        list(&[("web", "Search the web"), ("test", "Run\nthe tests")]),
+        // The same list again is not news, and an unreadable one is dropped whole.
+        list(&[("web", "Search the web"), ("test", "Run\nthe tests")]),
+        update(
+            "s1",
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": "no"}),
+        ),
+        list(&[("plan", "Plan")]),
+        reply(3, json!({"stopReason": "end_turn"})),
+    ]);
+    let provider = started(script, None);
+    send(&provider, "x").expect("sends");
+    let events = until_completed(&provider);
+    let lists: Vec<Vec<(String, String, Option<String>)>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::CommandsAvailable { commands } => Some(
+                commands
+                    .iter()
+                    .map(|c| (c.name.clone(), c.description.clone(), c.hint.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    let row = |n: &str, d: &str| (n.to_string(), d.to_string(), Some("args".to_string()));
+    assert_eq!(
+        lists,
+        vec![
+            vec![row("web", "Search the web"), row("test", "Run the tests")],
+            vec![row("plan", "Plan")]
+        ]
+    );
+}
+
+#[test]
+fn a_list_sent_while_the_session_starts_is_not_lost() {
+    let mut script = handshake(false);
+    script.extend([
+        expect_request(2, "session/new", json!({"cwd": "/work", "mcpServers": []})),
+        update(
+            "s1",
+            json!({"sessionUpdate": "available_commands_update",
+                   "availableCommands": [{"name": "web", "description": "Search the web"}]}),
+        ),
+        reply(2, json!({"sessionId": "s1", "models": {"currentModelId": "m-1"}})),
+    ]);
+    let provider = started(script, None);
+    let events = pump_until(&provider, "the commands", |e| {
+        matches!(e, AgentDomainEvent::CommandsAvailable { .. })
+    });
+    let opened = events
+        .iter()
+        .position(|e| matches!(e, AgentDomainEvent::SessionOpened { .. }))
+        .expect("opened");
+    let listed = events
+        .iter()
+        .position(|e| matches!(e, AgentDomainEvent::CommandsAvailable { .. }))
+        .expect("listed");
+    assert!(opened < listed, "the list follows the session's opening");
+}
+
+#[test]
 fn usage_update_is_context_not_tokens() {
     let mut script = boot("agent");
     script.extend([

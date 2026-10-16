@@ -36,7 +36,7 @@ account when one is configured, and a short menu:
 | `s` | restore the tabs the last window on this project had open (shown only when there are some) |
 | `r` | resume the most recent saved conversation (shown only when there is one) |
 | `w` | choose among every saved session |
-| `Shift+Tab` | cycle the mode (Manual, Auto, Bypass) before you start |
+| `Shift+Tab` | cycle the mode (Manual, Auto, Bypass) before you start (the mode is shown at the bottom of the panel) |
 | `?` | list all the keys |
 
 `Ctrl+h` and `Ctrl+l` move the keys between the editor and the panel.
@@ -58,15 +58,22 @@ started". What the question shows and what each answer means is in
 selected there in Visual mode. A selection is what points the agent at a particular piece of code, so select
 the function in the editor first when you say "fix this function"; a cursor position alone is not sent.
 
-While Claude answers, the reply appears as rendered markdown as it streams in. Each file edit is a diff row of
-its own. Each tool the agent runs is a row too: a command, a file it read, a search.
+While Claude answers, the reply appears as rendered markdown as it streams in. Each tool the agent runs is a
+quiet line of its own, with a mark in front saying whether it finished (`✓`), failed (`✗`) or is still running
+(`◐`): a command, a file it read, a search. Each file edit is a small card naming the file and the lines it adds
+and removes, with the diff inside it.
 
 - `Esc` leaves the box and goes back to browsing the conversation. In browsing, `j` and `k` step from row to
   row, `Enter` shows or hides a tool's result, `Ctrl+o` shows the detailed view (every result, with longer excerpts), `y` copies the row and `?`
   lists all the keys.
 - `Ctrl+c` interrupts the turn that is running.
-- `Enter` on a message you type while a turn is running queues it for when that turn ends. `Ctrl+Enter` sends it
-  now: it interrupts the running turn, then sends the queue and this message.
+- `Enter` on a message you type while a turn is running puts it into that turn without stopping it, as in
+  Claude Code and Codex: the agent reads it at its next step, and it shows above the box as `↪ <message>` until
+  then, when it appears in the conversation where the agent read it. A tab whose agent cannot take messages
+  mid-turn holds it instead, as `⧗ <message>`, and sends it when the turn ends; the empty box says which one
+  Enter does in that tab. Today Codex tabs take messages mid-turn; Claude and ACP tabs hold them. A message the
+  agent did not read before the turn ended (an interrupt, for one) is held again with a line saying why.
+  `Ctrl+Enter` sends now: it interrupts the running turn, then sends what is held and this message.
 - `Ctrl+g` in the box edits your draft in Neovim; `:wq` brings it back.
 
 After a turn that edited files, `c` in browsing shows what changed on disk during it; see
@@ -157,8 +164,8 @@ turn still running.
 
 ## When something ends
 
-A turn that does not finish normally no longer looks like one that did. A muted `·` row appears where it
-stopped, and the status line at the bottom of the panel says it in a few words until you send the next
+A turn that does not finish normally no longer looks like one that did. A muted row in italics appears where
+it stopped, and the status line at the bottom of the panel says it in a few words until you send the next
 prompt:
 
 | what happened | the row says | the status line says |
@@ -177,7 +184,7 @@ tab switch, and can be copied with `y` like any other row.
 
 When the session itself is gone, the conversation says so. A red `This session was lost` banner means the
 connection broke and what is shown above may be incomplete; a quiet `This session has ended (<reason>)` means
-it closed. Either way, press `r` in browsing to start a new session in that tab. A message you queued while a turn
+it closed. Either way, press `r` in browsing to start a new session in that tab. A message held while a turn
 ran is still sent when that turn ends, even when it ended at a limit.
 
 Known rough edges are listed in [Known issues](../known-issues.md).

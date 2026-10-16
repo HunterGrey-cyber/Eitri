@@ -48,7 +48,8 @@ describe("applyEvents", () => {
         case 1:
           return { type: "assistant_message_boundary", turn_id: "t1" };
         case 2:
-          return { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hm" };
+          // Thinking runs are joined too, and an empty one at a run's head must not take the block's seq.
+          return { type: "content_delta", turn_id: `t${rand(2)}`, kind: "thinking", text: ["hm", "", " more"][rand(3)] };
         case 3:
           return { type: "user_prompt_submitted", text: "go" };
         case 4:

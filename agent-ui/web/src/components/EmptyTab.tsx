@@ -9,11 +9,12 @@ import type { BoxEntry, SeqStep } from "../leader";
 import { isActivatableControl } from "../nav";
 import { isImeKey } from "../composerKeys";
 import { Composer } from "./Composer";
+import { completionSource } from "../slashCommands";
 import type { RestoredDraft } from "./Composer";
 import { HandoffCommandCard } from "./TerminalHandoff";
 import { QueueLines } from "./QueueLines";
 import { Row } from "./Row";
-import { Dashboard, dashItems } from "./Dashboard";
+import { DashboardHead, DashboardItems, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
 import { classify, failureEvidence, remedyNamesR } from "../problems";
@@ -118,6 +119,8 @@ export type EmptyTabProps = {
    *  built by `App.tsx` from `editorContext`, so this component needs no copy. */
   queue?: QueueItem[];
   queueError?: string | null;
+  /** Why its messages are held (the queue envelope's `note`). */
+  queueNote?: string | null;
   onTakeBackQueue?: () => void;
   queueTaken?: { texts: string[]; seq: number } | null;
   onHistoryPush?: (text: string) => void;
@@ -130,10 +133,6 @@ export type EmptyTabProps = {
    *  `tab_verb` actions from either layout. */
   panelTable?: PanelTable;
   onPanelAction?: (binding: PanelBinding) => void;
-  /** The window's readable prefix chord from `App.tsx`'s `keymapHelp.prefix`, passed to
-   *  `Dashboard`'s key hint. Defaults to Ctrl+b, matching `keymapHelp` before the keymap envelope
-   *  arrives, so callers without a configured prefix still get the correct hint. */
-  prefix?: string;
   /** Companion mode (`App.tsx`'s `editorLink`): passed through to `Dashboard`, whose words change when
    *  the editor is another window. `null` (the default) is the one-window mode. */
   editorLink?: EditorLink | null;
@@ -180,7 +179,6 @@ export function EmptyTab(props: EmptyTabProps) {
   // only the raw text.
   const failureProblem = failed && failure !== null ? classify(failure, hello?.account ?? null) : null;
   const showDashboard = hello !== null && !starting && !failed;
-  const prefix = props.prefix ?? "Ctrl+b";
   const editorLink = props.editorLink ?? null;
   const [dashCursor, setDashCursor] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -716,6 +714,9 @@ export function EmptyTab(props: EmptyTabProps) {
     }
   }
 
+  // `hello !== null` beside `showDashboard`, which TS cannot narrow through, so the dashboard's parts take
+  // `hello` without a non-null assertion.
+  const inDashboard = hello !== null && showDashboard;
   return (
     <div className="empty-tab" tabIndex={0} onKeyDown={onKeyDown} ref={rootRef}>
       {handoff !== null && <HandoffCommandCard handoff={handoff} />}
@@ -742,47 +743,64 @@ export function EmptyTab(props: EmptyTabProps) {
       )}
       {/* The empty tab's dashboard: replaces the eight resume rows that used to sit below
           the composer. Never drawn while starting or failed (those screens keep their own).
-          `hello !== null` (not just `showDashboard`, which TS cannot narrow through) is what lets
-          `Dashboard`'s `hello: Hello` prop take it without a non-null assertion. */}
-      {hello !== null && showDashboard && (
-        <Dashboard
-          hello={hello}
-          mode={tab.mode}
-          cursor={dashCursor}
-          narrow={narrow}
-          onItem={runItem}
-          prefix={prefix}
-          editorLink={editorLink}
-          agent={isExternalAgent(tab.agent) ? agentTitle(tab.agent) : null}
-        />
-      )}
-      <QueueLines items={props.queue ?? []} error={props.queueError ?? null} />
-      <Composer
-        disabled={failed}
-        sessionEnded={failed}
-        closing={false}
-        restoredDraft={props.restoredDraft}
-        mode={mode}
-        focusRequest={composerFocus}
-        caretOnFocus={composerCaret}
-        hintTarget={!failed}
-        onModeChange={setMode}
-        onSend={props.onSend}
-        onDraftChange={props.onDraftChange}
-        running={starting}
-        onQueue={props.onQueue}
-        onSendNow={(text) => {
-          if (text.trim() !== "") props.onQueue?.(text);
-        }}
-        history={props.history}
-        queueCount={props.queueCount}
-        onTakeBackQueue={props.onTakeBackQueue}
-        queueTaken={props.queueTaken}
-        onHistoryPush={props.onHistoryPush}
-        onEditInNvim={props.onEditInNvim}
-        editingInNvim={props.editingInNvim}
-        onOpenKeymap={props.onOpenKeymap}
-      />
+
+          On the dashboard the box you type in IS the New session row (2026-10-15): it sits between the
+          name and the other rows, as wide as they are, its key at the right where theirs are, and the
+          cursor's first stop. The box keeps one place in the tree on every screen -- the same parent
+          and the same position, whether the dashboard is drawn around it or not -- so going from the
+          dashboard to "Starting…" when a message is sent never remounts it (its focus, an input
+          method's composition and its history walk all live in it). */}
+      <div className={inDashboard ? "dashboard" : "empty-box-stack"}>
+        {inDashboard && hello !== null && (
+          <DashboardHead hello={hello} narrow={narrow} agent={isExternalAgent(tab.agent) ? agentTitle(tab.agent) : null} />
+        )}
+        <QueueLines items={props.queue ?? []} error={props.queueError ?? null} note={props.queueNote ?? null} />
+        <div
+          className={inDashboard ? "dash-input" : "empty-box"}
+          data-nav-stop={inDashboard ? "dash" : undefined}
+          aria-current={inDashboard && dashCursor === 0 ? "true" : undefined}
+        >
+          <Composer
+            disabled={failed}
+            sessionEnded={failed}
+            closing={false}
+            restoredDraft={props.restoredDraft}
+            mode={mode}
+            focusRequest={composerFocus}
+            caretOnFocus={composerCaret}
+            hintTarget={!failed}
+            onModeChange={setMode}
+            onSend={props.onSend}
+            onDraftChange={props.onDraftChange}
+            running={starting}
+            onQueue={props.onQueue}
+            onSendNow={(text) => {
+              if (text.trim() !== "") props.onQueue?.(text);
+            }}
+            history={props.history}
+            queueCount={props.queueCount}
+            onTakeBackQueue={props.onTakeBackQueue}
+            queueTaken={props.queueTaken}
+            onHistoryPush={props.onHistoryPush}
+            onEditInNvim={props.onEditInNvim}
+            editingInNvim={props.editingInNvim}
+            onOpenKeymap={props.onOpenKeymap}
+            // A tab that has not started has no reported list yet: Claude's built-ins, nothing for another agent.
+            slashCommands={completionSource(props.tab.agent, null)}
+          />
+        </div>
+        {inDashboard && hello !== null && (
+          <DashboardItems
+            hello={hello}
+            mode={tab.mode}
+            cursor={dashCursor}
+            onItem={runItem}
+            editorLink={editorLink}
+            agent={isExternalAgent(tab.agent) ? agentTitle(tab.agent) : null}
+            boxIsNew
+          />
+        )}
+      </div>
       {/* The which-key box: `WHICH_KEY_DELAY_MS` after
           a leader/table sequence started above is still pending. `.empty-tab` is this screen's own
           positioned ancestor (index.css) -- there is no `.agent-ui-scroller` here for it

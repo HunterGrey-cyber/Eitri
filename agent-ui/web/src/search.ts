@@ -19,9 +19,15 @@ export function rowSearchText(item: TimelineItem): string {
     case "ending":
       return turnEndingText(item.ending);
     case "run":
-      // Search each folded call's name and input, since a collapsed run shows no invocation of its
-      // own. This lets `/bash` find the run while it is collapsed.
-      return item.calls.flatMap((call) => [call.name, JSON.stringify(call.input)]).join("\n");
+      // Search each folded call's name and input, plus thoughts folded into the run. This lets
+      // `/bash` and thought text find the run while it is collapsed.
+      return [
+        ...item.calls.flatMap((call) => [call.name, JSON.stringify(call.input)]),
+        ...(item.thoughts ?? []).map((t) => t.text),
+      ].join("\n");
+    case "thinking":
+      // What the row can show once opened, so `/` finds a thought while it is folded.
+      return item.block.text;
   }
 }
 

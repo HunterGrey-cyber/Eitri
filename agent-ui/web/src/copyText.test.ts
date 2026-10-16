@@ -18,7 +18,7 @@ describe("N3: what y and Y copy", () => {
       { seq: 3, toolUseId: "a", name: "Read", input: {}, result: { content: "", isError: false } },
       { seq: 4, toolUseId: "b", name: "Read", input: {}, result: { content: "", isError: false } },
     ] };
-    expect(primaryText(run)).toBe("Read ×2");
+    expect(primaryText(run)).toBe("Read 2 files");
   });
 
   it("Y copies a tool's whole output, never the cut one, and nothing else has an output", () => {

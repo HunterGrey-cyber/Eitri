@@ -80,9 +80,9 @@ In the panel:
 | key | what happens |
 |---|---|
 | `Ctrl+h`, `Ctrl+l` | always leave the window: the window manager moves focus |
-| `Ctrl+k` | leaves the window from BROWSE; in INPUT it switches to BROWSE |
-| `Ctrl+j` | leaves the window from INPUT; in BROWSE it switches to INPUT |
-| `Ctrl+g` in INPUT | edits the draft in a scratch buffer in your Neovim (it says the editor is not connected when none is attached) |
+| `Ctrl+k` | leaves the window from BROWSE; in INSERT it switches to BROWSE |
+| `Ctrl+j` | leaves the window from INSERT; in BROWSE it switches to INSERT |
+| `Ctrl+g` in INSERT | edits the draft in a scratch buffer in your Neovim (it says the editor is not connected when none is attached) |
 | the prefix's `Select` keys | the same window-manager focus move as `Ctrl+h/j/k/l` |
 
 Opening a file from the panel opens it in your Neovim and raises the editor's window (not from inside tmux,

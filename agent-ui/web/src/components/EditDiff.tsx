@@ -20,7 +20,19 @@ import { HiddenWarning, Revealed } from "./Revealed";
  * protected path), and a right-to-left override in a file name could make it read as another file.
  * `data-path` keeps the real path, so opening it opens the file the call names.
  */
-export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPreview; maxLines?: number; createsFile?: boolean }) {
+export function EditDiff({
+  preview,
+  maxLines,
+  createsFile,
+  tool,
+}: {
+  preview: EditPreview;
+  maxLines?: number;
+  createsFile?: boolean;
+  /** The tool's name, shown before the path where the view is a transcript row's line (`✓ Edit path +5 −1`);
+   *  left out inside a permission card, whose own head already names the tool. */
+  tool?: string;
+}) {
   const shownPath = useProjectRelative(preview.filePath);
   const diff = preview.diff !== null && maxLines !== undefined && preview.diff.length > maxLines ? preview.diff.slice(0, maxLines) : preview.diff;
   const pathPieces = revealHidden(shownPath);
@@ -34,8 +46,9 @@ export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPrev
   return (
     <div className="permission-card-edit">
       <div className="permission-card-edit-head">
-        {/* Show the path before the change so readers can identify the file. A nonempty path is a
-            `gf` and click target; an empty path cannot be opened. */}
+        {tool !== undefined && <span className="permission-card-edit-tool">{tool}</span>}
+        {/* Show the path after the tool name and before the change so readers can identify the
+            file. A nonempty path is a `gf` and click target; an empty path cannot be opened. */}
         {preview.filePath ? (
           <span className="permission-card-edit-path path-link" data-path={preview.filePath}>
             <Revealed pieces={pathPieces} />
@@ -44,7 +57,15 @@ export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPrev
           <span className="permission-card-edit-path">(no file named)</span>
         )}
         <span className="permission-card-edit-counts">
-          +{preview.added} −{preview.removed}
+          {/* The sign carries the colour, the number stays in the head's ink (`index.css`). */}
+          <span className="edit-count-added">
+            <span className="edit-sign">+</span>
+            {preview.added}
+          </span>{" "}
+          <span className="edit-count-removed">
+            <span className="edit-sign">−</span>
+            {preview.removed}
+          </span>
         </span>
       </div>
       <HiddenWarning count={hidden} what="change" />

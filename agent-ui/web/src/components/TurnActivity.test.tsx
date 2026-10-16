@@ -8,21 +8,23 @@ import { TurnActivity } from "./TurnActivity";
 import type { TurnPhase } from "../turnPhase";
 
 describe("TurnActivity", () => {
-  it("draws the meter for every phase except blocked, and never for blocked", () => {
+  it("draws the phase word for every phase, blocked included, and no motion of its own", () => {
+    // The moving mark is the activity line's star (`ActivityLine.test.tsx`); this leaf only says which
+    // phase the turn is in and for how long.
     const phases: TurnPhase[] = [
       { kind: "sent" },
       { kind: "thinking" },
       { kind: "replying" },
       { kind: "tool", toolName: "Bash" },
+      { kind: "blocked" },
     ];
     for (const phase of phases) {
       const { container, unmount } = render(<TurnActivity phase={phase} clock={null} />);
-      expect(container.querySelector(".meter-fill")).not.toBeNull();
+      expect(container.querySelector(".turn-state")?.textContent).not.toBe("");
+      expect(container.querySelector(".meter, .meter-fill")).toBeNull();
       unmount();
     }
     const { container } = render(<TurnActivity phase={{ kind: "blocked" }} clock={null} />);
-    expect(container.querySelector(".meter-fill")).toBeNull();
-    // The word still renders with the meter withheld; only the motion stops.
     expect(container.querySelector(".turn-state")?.textContent).toBe("waiting for you");
   });
 
@@ -31,21 +33,20 @@ describe("TurnActivity", () => {
     expect(container.querySelector(".turn-activity")?.getAttribute("data-phase")).toBe("tool");
   });
 
-  it("ticks the elapsed clock once a second, without re-mounting the meter", () => {
+  it("ticks the elapsed clock once a second, without re-mounting the phase word", () => {
     vi.useFakeTimers();
     try {
       const since = Date.now();
       const { container } = render(<TurnActivity phase={{ kind: "sent" }} clock={{ turnId: "t1", since, exact: true }} />);
       expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s");
-      const meterBeforeTick = container.querySelector(".meter-fill");
+      const wordBeforeTick = container.querySelector(".turn-state");
 
       act(() => {
         vi.advanceTimersByTime(1000);
       });
       expect(container.querySelector(".turn-elapsed")?.textContent).toBe("1s");
-      // A clock tick must preserve the same meter element throughout the animation.
-      // Updating the elapsed text must not tear down and rebuild the meter every second.
-      expect(container.querySelector(".meter-fill")).toBe(meterBeforeTick);
+      // The SAME element, not a new one -- a tick re-renders this leaf's text, not the whole subtree.
+      expect(container.querySelector(".turn-state")).toBe(wordBeforeTick);
 
       act(() => {
         vi.advanceTimersByTime(4000);
@@ -85,23 +86,22 @@ describe("TurnActivity", () => {
 });
 
 // A design decision (revised 2026-09-29): while the user types in the editor the page slows the
-// meter to the panel's cadence, but it never pauses the motion the turn is showing, and the elapsed
-// clock (one repaint a second, never faster than the slowest cadence Rust accepts) is left alone.
+// activity line's star to the panel's cadence, but it never pauses the motion the turn is showing, and
+// the elapsed clock (one repaint a second, never faster than the slowest cadence Rust accepts) is left
+// alone.
 describe("TurnActivity while the user types in the editor", () => {
   afterEach(() => {
     document.documentElement.removeAttribute("data-editor-typing");
     document.documentElement.style.removeProperty("--meter-step");
   });
 
-  it("keeps the meter mounted and the elapsed clock ticking once a second", async () => {
+  it("keeps the elapsed clock ticking once a second while the motion's step is slowed", async () => {
     const { applyEditorTyping } = await import("../typingCadence");
     vi.useFakeTimers();
     try {
       applyEditorTyping(document.documentElement, true, 1000);
       const since = Date.now();
       const { container } = render(<TurnActivity phase={{ kind: "replying" }} clock={{ turnId: "t1", since, exact: true }} />);
-      const meter = container.querySelector(".meter-fill");
-      expect(meter).not.toBeNull();
       expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s");
       for (let second = 1; second <= 3; second += 1) {
         act(() => {
@@ -109,9 +109,7 @@ describe("TurnActivity while the user types in the editor", () => {
         });
         expect(container.querySelector(".turn-elapsed")?.textContent).toBe(`${second}s`);
       }
-      expect(container.querySelector(".meter-fill")).toBe(meter);
-      // Never paused: nothing inline stops the animation, and the typing state is only the variable.
-      expect((meter as HTMLElement).style.animationPlayState).toBe("");
+      // Never paused: the typing state is only the variable the star's animation reads.
       expect(document.documentElement.style.getPropertyValue("--meter-step")).toBe("1000ms");
     } finally {
       vi.useRealTimers();

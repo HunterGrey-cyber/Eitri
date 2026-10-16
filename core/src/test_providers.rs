@@ -205,6 +205,12 @@ pub struct ExternalRecordingProvider {
     stops: std::sync::Mutex<u32>,
     /// While set, the next `stop_background` is refused with this code.
     stop_refusal: std::sync::Mutex<Option<agent::ProviderErrorCode>>,
+    /// Advertises `steer` and takes messages into the running turn, as Codex does.
+    steering: bool,
+    /// Every message it was sent into a running turn, in order.
+    steers: std::sync::Mutex<Vec<agent::SteerTurnRequest>>,
+    /// While set, every `steer_turn` is refused with this code (nothing sent).
+    steer_refusal: std::sync::Mutex<Option<agent::ProviderErrorCode>>,
 }
 
 impl ExternalRecordingProvider {
@@ -225,7 +231,28 @@ impl ExternalRecordingProvider {
             close_gate: std::sync::Mutex::new(None),
             stops: std::sync::Mutex::new(0),
             stop_refusal: std::sync::Mutex::new(None),
+            steering: false,
+            steers: std::sync::Mutex::new(Vec::new()),
+            steer_refusal: std::sync::Mutex::new(None),
         }
+    }
+
+    /// A Codex provider that takes messages into the running turn (`steer`).
+    pub fn steering_codex() -> Self {
+        ExternalRecordingProvider {
+            steering: true,
+            ..Self::codex()
+        }
+    }
+
+    /// Every message sent into a running turn, in order.
+    pub fn steers(&self) -> Vec<agent::SteerTurnRequest> {
+        self.steers.lock().unwrap().clone()
+    }
+
+    /// Refuses every later `steer_turn` with `code` (`None` takes them again).
+    pub fn refuse_steers(&self, code: Option<agent::ProviderErrorCode>) {
+        *self.steer_refusal.lock().unwrap() = code;
     }
 
     /// How many stops of the background it took.
@@ -259,7 +286,23 @@ impl ExternalRecordingProvider {
 
 impl agent::AgentProvider for ExternalRecordingProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        agent::AgentProvider::capabilities(&self.inner)
+        ProviderCapabilities {
+            steer: self.steering,
+            ..agent::AgentProvider::capabilities(&self.inner)
+        }
+    }
+    fn steer_turn(&self, request: agent::SteerTurnRequest) -> Result<(), agent::ProviderError> {
+        if !self.steering {
+            return Err(agent::ProviderError::UnsupportedCapability("steer"));
+        }
+        if let Some(code) = *self.steer_refusal.lock().unwrap() {
+            return Err(agent::ProviderError::Provider {
+                code,
+                message: "the scripted agent took no message".into(),
+            });
+        }
+        self.steers.lock().unwrap().push(request);
+        Ok(())
     }
     fn info(&self) -> ProviderInfo {
         agent::AgentProvider::info(&self.inner)

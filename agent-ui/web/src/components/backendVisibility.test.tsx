@@ -71,7 +71,7 @@ describe("the backend name is drawn only in the detail popover, never the choose
       expectedVerdandiRevision: "28a5e4c",
       account: "work",
     };
-    const { container } = render(<Dashboard hello={hello} mode="auto" cursor={0} narrow={false} onItem={vi.fn()} prefix="Ctrl+b" />);
+    const { container } = render(<Dashboard hello={hello} mode="auto" cursor={0} narrow={false} onItem={vi.fn()} />);
     expect(container.textContent).not.toContain(backend);
   });
 

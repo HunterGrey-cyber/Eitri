@@ -30,13 +30,17 @@ export type TurnPhase =
  *
  * `toolCalls` persists between turns. Interrupted and denied calls can retain null results,
  * so a later prompt must prevent an old call from naming the next turn's initial phase.
- * The composer is disabled while `state.activeTurnId !== null`, so prompts arrive only
- * at turn boundaries. If prompts can arrive during a turn, scope this check to the call's turn.
+ * Only calls from earlier turns are displaced by a prompt. `user_message_delivered` can
+ * add a prompt during a running turn without stopping that turn's tool calls.
  *
- * `turnThinking` is ephemeral and `applySnapshot` clears it. After a resync, thinking with
- * no unfinished call degrades to `sent`; with an unfinished call and no later text it
- * degrades to `tool`. A denied call cannot be distinguished from a live call in the snapshot
- * because both have null results. The next thinking delta or assistant text displaces it.
+ * `turnThinking` is ephemeral and is cleared by snapshots and unrelated events.
+ * `thinkingOpen` is persisted as `thinking_open` while the newest thought is being written.
+ * Replies, calls, prompts, and turn endings close it in both folds. Either flag produces
+ * `thinking`, so snapshots and unrelated events preserve a thought that is still open.
+ * A thinking delta with no text opens no block and can still be lost: without an unfinished
+ * call it degrades to `sent`; with one and no later text it degrades to `tool`.
+ * A denied call cannot be distinguished from a live call in the snapshot. The next
+ * thinking delta or assistant text displaces it.
  *
  * `permission_resolved` carries an outcome, but `toolCalls` stores no verdict in
  * `AgentSessionProjection::apply`. The reducer must match that snapshot shape; a verdict
@@ -82,10 +86,10 @@ export function phaseOf(state: AgentUiState): TurnPhase {
 
   // The NEWEST unfinished call: with several in flight, the phase is named after the one that
   // started last, and a sibling completing changes nothing about it.
-  let openTool: { seq: number; name: string } | null = null;
+  let openTool: { seq: number; name: string; turnId: string | undefined } | null = null;
   for (const call of state.toolCalls) {
     if (call.result === null && (openTool === null || call.seq > openTool.seq)) {
-      openTool = { seq: call.seq, name: call.name };
+      openTool = { seq: call.seq, name: call.name, turnId: call.turnId };
     }
   }
   // The three displacers, in the order the doc comment lists them.
@@ -94,15 +98,25 @@ export function phaseOf(state: AgentUiState): TurnPhase {
   // denied call keeps `result: null` forever and `toolCalls` is never cleared, so without this the
   // call would still be "the newest unfinished call" in the NEXT turn.
   //
-  // `!state.turnThinking` is "no thinking delta has arrived after it": the bit is set by a thinking
-  // delta and cleared by EVERY other event (reducer.ts), so while it is set the most recent thing
-  // that happened is a thinking delta, which is necessarily after the tool call. Rule 3 directly
-  // below then names that state, rather than this clause silently dropping to `sent`.
-  if (openTool !== null && lastMessageSeq < openTool.seq && lastPromptSeq < openTool.seq && !state.turnThinking) {
+  // `!thinking` is "no thought has started after it": `turnThinking` is set by a thinking delta and
+  // cleared by EVERY other event (reducer.ts), and `thinkingOpen` stays true from a thought's first
+  // text until something closes it -- a call starting among those things, so an open thought is
+  // necessarily after the tool call. Rule 3 directly below then names that state, rather than this
+  // clause silently dropping to `sent`.
+  const thinking = state.turnThinking || state.thinkingOpen;
+  //
+  // A prompt after a call of the RUNNING turn displaces nothing: it was put into that turn while the call ran.
+  const ofRunningTurn = openTool !== null && state.activeTurnId !== null && openTool.turnId === state.activeTurnId;
+  if (
+    openTool !== null &&
+    lastMessageSeq < openTool.seq &&
+    (lastPromptSeq < openTool.seq || ofRunningTurn) &&
+    !thinking
+  ) {
     return { kind: "tool", toolName: openTool.name };
   }
 
-  if (state.turnThinking) return { kind: "thinking" };
+  if (thinking) return { kind: "thinking" };
   if (lastIsMessage) return { kind: "replying" };
   return { kind: "sent" };
 }
@@ -111,7 +125,8 @@ export function phaseOf(state: AgentUiState): TurnPhase {
 export function phaseWord(phase: TurnPhase): string {
   switch (phase.kind) {
     case "sent":
-      return "sent";
+      // Nothing has come back yet: the agent is at work, which is what Claude Code says too.
+      return "working";
     case "thinking":
       return "thinking";
     case "replying":

@@ -28,7 +28,7 @@ use crate::jsonrpc_link::{
     resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, OverCapReply, Pending, Skipped,
     REQUEST_TOO_LARGE,
 };
-use crate::projection::{AgentDomainEvent, PermissionOutcome, ResumeStatus, TurnEndDetail, TurnOutcome};
+use crate::projection::{AgentDomainEvent, PermissionOutcome, ResumeStatus, SlashCommand, TurnEndDetail, TurnOutcome};
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
@@ -143,6 +143,8 @@ struct State {
     next_answered_row: u64,
     seen_unknown: HashSet<String>,
     context: Option<ContextGauge>,
+    /// The commands the agent last listed (`available_commands_update`); empty before any list.
+    commands: Vec<SlashCommand>,
     /// Why the session may not take turns any more: the agent reported a mode other than the one asked
     /// for, or would not load the saved session.
     blocked: Option<&'static str>,
@@ -159,6 +161,8 @@ struct State {
 #[derive(Default)]
 struct Boot {
     mode: Option<String>,
+    /// The latest command list the agent sent before the session was open.
+    commands: Option<Vec<SlashCommand>>,
     history: Option<History>,
 }
 
@@ -173,6 +177,16 @@ pub struct AcpProvider {
     close_session: bool,
     /// What the agent calls itself and its version, for the panel.
     label: Option<String>,
+}
+
+/// Keeps the agent's command list and tells the host, but only when it differs from the one held: an
+/// agent that repeats its list, or says an empty one before it has any, changes nothing.
+fn note_commands(st: &mut State, commands: Vec<SlashCommand>) {
+    if st.commands == commands {
+        return;
+    }
+    st.commands = commands.clone();
+    st.events.push_back(AgentDomainEvent::CommandsAvailable { commands });
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -384,6 +398,7 @@ impl AcpProvider {
                 match &update {
                     Update::Mode(mode) => boot.mode = Some(mode.clone()),
                     Update::Options { mode: Some(mode) } => boot.mode = Some(mode.clone()),
+                    Update::Commands(commands) => boot.commands = Some(commands.clone()),
                     _ => {}
                 }
                 if let Some(history) = boot.history.as_mut() {
@@ -424,6 +439,7 @@ impl AcpProvider {
         }
         let mut boot = Boot {
             mode: None,
+            commands: None,
             history: Some(History::default()),
         };
         let pending = self.request(method::SESSION_LOAD, wire::session_load_params(&saved, &req.cwd))?;
@@ -495,6 +511,9 @@ impl AcpProvider {
                 forked: false,
                 detail: None,
             });
+        }
+        if let Some(commands) = boot.commands.take() {
+            note_commands(&mut st, commands);
         }
         if let Some((requested, reported)) = mismatch {
             self.trip(&mut st, requested, reported);
@@ -658,6 +677,7 @@ impl AcpProvider {
         }
         match update {
             Update::Context { used, size } => st.context = Some(ContextGauge { used, size }),
+            Update::Commands(commands) => note_commands(st, commands),
             Update::Mode(mode) => self.check_mode(st, &mode),
             Update::Options { mode: Some(mode) } => self.check_mode(st, &mode),
             Update::Options { mode: None } | Update::Ignored(_) => {}

@@ -447,6 +447,7 @@ mod tests {
         UserPromptRecord {
             seq,
             text: text.to_string(),
+            delivered: false,
         }
     }
 

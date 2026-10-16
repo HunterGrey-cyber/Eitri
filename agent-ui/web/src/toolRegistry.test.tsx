@@ -513,7 +513,7 @@ describe("P2, P3, P4, R3 in the registry", () => {
     const input = { file_path: "/p/a.rs", old_string, new_string };
     const folded = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, false, { expanded: false }));
     expect(folded).toContain("/p/a.rs");
-    expect(folded).toContain("+10 −10");
+    expect(folded.replace(/<[^>]*>/g, "")).toContain("+10 −10");
     expect((folded.match(/class="diff-line/g) ?? []).length).toBe(0);
     // `expanded` is the same per-row flag `Enter` (`toggle-expand`, MessageList.tsx) already
     // toggles for every tool row -- no new key, just a lower default fold.
@@ -553,7 +553,7 @@ describe("P2, P3, P4, R3 in the registry", () => {
       ),
     );
     expect(notebook).toContain("a.ipynb");
-    expect(notebook).toContain("+2 −0");
+    expect(notebook.replace(/<[^>]*>/g, "")).toContain("+2 −0");
     expect(notebook.toLowerCase()).toContain("cell");
     expect((notebook.match(/class="diff-line/g) ?? []).length).toBe(2);
   });

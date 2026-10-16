@@ -283,3 +283,35 @@ export function codexChangePreview(
     wholeFile: false,
   };
 }
+
+/** What one finished call changed on disk by its own input, file by file: `Edit`/`Write`/`NotebookEdit`
+ *  (`editPreview`), each entry of a Codex `fileChange` (`codexChangePreview`), and each diff of an ACP
+ *  agent's edit, delete or move. Empty for every other call. Counted the way each call's row draws it. */
+export function fileChangesOf(toolName: string, input: unknown): { filePath: string; added: number; removed: number }[] {
+  const fields = input !== null && typeof input === "object" ? (input as Record<string, unknown>) : null;
+  if (toolName === "fileChange") {
+    const changes = Array.isArray(fields?.changes) ? fields.changes : [];
+    return changes
+      .filter((c): c is { path: string; kind: string; diff: string } => typeof c === "object" && c !== null && typeof c.path === "string")
+      .map((change) => {
+        const { filePath, added, removed } = codexChangePreview(change);
+        return { filePath, added, removed };
+      });
+  }
+  if (/^acp:(edit|delete|move)$/.test(toolName)) {
+    const diffs = Array.isArray(fields?.diffs) ? fields.diffs : [];
+    return diffs
+      .filter((d): d is { path: string; oldText?: string | null; newText?: string } => typeof d === "object" && d !== null && typeof d.path === "string")
+      .map((d) => {
+        const before = d.oldText ?? "";
+        const after = d.newText ?? "";
+        const shown = lineDiff(before, after);
+        // Over the diff's size cap, every line on each side counts, as `editPreview` counts an `Edit`.
+        if (shown === null) return { filePath: d.path, added: lines(after).length, removed: lines(before).length };
+        const count = (kind: DiffLineKind) => shown.filter((l) => l.kind === kind).length;
+        return { filePath: d.path, added: count("added"), removed: count("removed") };
+      });
+  }
+  const preview = editPreview(toolName, input);
+  return preview === null ? [] : [{ filePath: preview.filePath, added: preview.added, removed: preview.removed }];
+}

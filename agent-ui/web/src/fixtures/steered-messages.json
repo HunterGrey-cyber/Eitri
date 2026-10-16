@@ -1,0 +1,171 @@
+{
+  "events": {
+    "events": [
+      {
+        "cwd": "/project",
+        "model": "gpt-test",
+        "provider_session_id": "thread-1",
+        "session_id": "codex-1",
+        "type": "session_opened"
+      },
+      {
+        "turn_id": "t1",
+        "type": "turn_started"
+      },
+      {
+        "text": "fix the parser",
+        "type": "user_prompt_submitted"
+      },
+      {
+        "kind": "text",
+        "text": "Looking at the parser.",
+        "turn_id": "t1",
+        "type": "content_delta"
+      },
+      {
+        "input": {
+          "command": "cargo test -p parser"
+        },
+        "name": "commandExecution",
+        "tool_use_id": "item-1",
+        "turn_id": "t1",
+        "type": "tool_call_started"
+      },
+      {
+        "content": "ok",
+        "is_error": false,
+        "tool_use_id": "item-1",
+        "turn_id": "t1",
+        "type": "tool_call_completed"
+      },
+      {
+        "client_message_id": "eitri-1-1",
+        "text": "and the tests",
+        "turn_id": "t1",
+        "type": "user_message_delivered"
+      },
+      {
+        "kind": "text",
+        "text": "Adding tests too.",
+        "turn_id": "t1",
+        "type": "content_delta"
+      },
+      {
+        "client_message_id": "eitri-1-2",
+        "reason": "the turn ended before Codex read it",
+        "type": "user_message_dropped"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": null
+        },
+        "outcome": "completed",
+        "result_text": "Adding tests too.",
+        "stop_reason": null,
+        "turn_id": "t1",
+        "type": "turn_completed",
+        "usage": null
+      }
+    ],
+    "fromRevision": 0,
+    "kind": "events",
+    "tab": 1,
+    "throughRevision": 10
+  },
+  "queue": {
+    "enterSteers": true,
+    "error": null,
+    "items": [
+      {
+        "queuedAt": 20,
+        "steered": true,
+        "text": "look at the lexer too"
+      },
+      {
+        "queuedAt": 22,
+        "steered": false,
+        "text": "then commit"
+      }
+    ],
+    "kind": "queue",
+    "note": "held until the turn ends: the turn ended before Codex read it",
+    "tab": 1
+  },
+  "snapshot": {
+    "kind": "snapshot",
+    "state": {
+      "accountLimits": null,
+      "activeTurnId": null,
+      "assistantMessageOpen": false,
+      "availableCommands": null,
+      "backend": "external",
+      "backgroundCalls": 0,
+      "capabilities": {
+        "bypassPermissionMode": false,
+        "fork": false,
+        "interrupt": true,
+        "resume": false,
+        "steer": true
+      },
+      "conversationId": null,
+      "cwd": "/project",
+      "history": null,
+      "lastTurnEnding": null,
+      "model": "gpt-test",
+      "pendingPermissions": [],
+      "provider": null,
+      "providerSessionId": "thread-1",
+      "sessionId": "codex-1",
+      "status": {
+        "kind": "running"
+      },
+      "thinking": [],
+      "thinkingOpen": false,
+      "toolCalls": [
+        {
+          "input": {
+            "command": "cargo test -p parser"
+          },
+          "name": "commandExecution",
+          "result": {
+            "content": "ok",
+            "isError": false
+          },
+          "seq": 4,
+          "toolUseId": "item-1",
+          "turnId": "t1"
+        }
+      ],
+      "transcript": [
+        {
+          "seq": 3,
+          "text": "Looking at the parser."
+        },
+        {
+          "seq": 7,
+          "text": "Adding tests too."
+        }
+      ],
+      "turnEndings": [],
+      "usage": null,
+      "userPrompts": [
+        {
+          "seq": 2,
+          "text": "fix the parser"
+        },
+        {
+          "delivered": true,
+          "seq": 6,
+          "text": "and the tests"
+        }
+      ]
+    },
+    "tab": 1,
+    "throughRevision": 10,
+    "turnStartedAtMs": null,
+    "turnTimes": []
+  },
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_steered_messages_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

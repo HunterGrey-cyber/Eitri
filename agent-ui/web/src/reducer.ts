@@ -1,3 +1,4 @@
+import { cleanCommands } from "./slashCommands";
 import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, ProviderPrompt, Seq, ToolCallRecord, TurnEnding, WireProviderPrompt } from "./types";
 
 /** The state before any snapshot arrives. `backend` defaults to "legacy" only because something
@@ -24,10 +25,13 @@ export function initialState(): AgentUiState {
     usage: null,
     accountLimits: null,
     backgroundCalls: 0,
+    availableCommands: null,
     turnEndings: [],
     lastTurnEnding: null,
     history: null,
     assistantMessageOpen: false,
+    thinking: [],
+    thinkingOpen: false,
     nextSeq: 0,
     turnThinking: false,
     ...NOTHING_HELD,
@@ -88,6 +92,10 @@ export function resetToStartScreen(state: AgentUiState): AgentUiState {
  * every later one appends to that same message, which keeps the first's `seq`. Folding them one by
  * one copied the whole transcript once per delta; a batch of D deltas over M messages copied M x D
  * entries for one render.
+ *
+ * A run of thinking deltas is folded the same way, with one difference: a thinking delta with no text
+ * opens no block, so the empty ones at the head of a run only move `nextSeq` on, and the block the
+ * joined delta opens takes the `seq` of the first one that has text, as folding one by one gives it.
  */
 export function applyEvents(state: AgentUiState, events: readonly AgentDomainEvent[]): AgentUiState {
   let folded = state;
@@ -95,29 +103,38 @@ export function applyEvents(state: AgentUiState, events: readonly AgentDomainEve
   while (i < events.length) {
     const first = events[i];
     let end = i + 1;
-    if (isTextDelta(first)) {
+    const kind = mergeableKind(first);
+    if (kind !== null) {
+      const turn = (first as ContentDelta).turn_id;
       while (end < events.length) {
         const next = events[end];
-        if (!isTextDelta(next) || next.turn_id !== first.turn_id) break;
+        if (mergeableKind(next) !== kind || (next as ContentDelta).turn_id !== turn) break;
         end += 1;
       }
     }
     if (end - i === 1) {
       folded = applyEvent(folded, first);
     } else {
-      const run = events.slice(i, end) as TextDelta[];
-      const merged = applyEvent(folded, { ...(first as TextDelta), text: run.map((e) => e.text).join("") });
-      folded = { ...merged, nextSeq: merged.nextSeq + (end - i - 1) };
+      const run = events.slice(i, end) as ContentDelta[];
+      // Only a thinking run skips its empty head (see above); a text delta with no text still opens a
+      // message, as `AgentSessionProjection::apply` does.
+      let lead = 0;
+      if (kind === "thinking") while (lead < run.length - 1 && run[lead].text === "") lead += 1;
+      const skipped = { ...folded, nextSeq: folded.nextSeq + lead };
+      const merged = applyEvent(skipped, { ...run[lead], text: run.slice(lead).map((e) => e.text).join("") });
+      folded = { ...merged, nextSeq: merged.nextSeq + (run.length - lead - 1) };
     }
     i = end;
   }
   return folded;
 }
 
-type TextDelta = Extract<AgentDomainEvent, { type: "content_delta" }> & { kind: "text" };
+type ContentDelta = Extract<AgentDomainEvent, { type: "content_delta" }>;
 
-function isTextDelta(event: AgentDomainEvent): event is TextDelta {
-  return event.type === "content_delta" && event.kind === "text" && typeof event.text === "string";
+/** The kind of a delta `applyEvents` may join with its neighbours, or `null` for any other event. */
+function mergeableKind(event: AgentDomainEvent): "text" | "thinking" | null {
+  if (event.type !== "content_delta" || typeof event.text !== "string") return null;
+  return event.kind === "text" || event.kind === "thinking" ? event.kind : null;
 }
 
 let transcriptEntriesCopied = 0;
@@ -136,12 +153,10 @@ export function transcriptEntriesCopiedCount(): number {
  * means a locally-folded item gets the number Rust would have given it, so the live path and a
  * later snapshot describe the same order rather than two schemes that merely happen to agree.
  *
- * **There is exactly one exception, and it is the first thing this function does** (2026-09-20): a
- * REPEATED thinking delta returns `incoming` itself, advancing nothing, so that a turn that merely
- * keeps thinking costs no re-render. The two counters therefore drift apart by one per such delta.
- * The paragraph above is the rule and this is the whole of its exception -- see the early return's
- * own comment for why it is safe, and `types.ts`'s `nextSeq` doc for what was checked rather than
- * assumed. Nothing else in this function may take a second exception without the same check.
+ * There is no exception any more. `permission_mode_changed` used to return `incoming` and advance
+ * nothing, and a repeated thinking delta did the same; both drifted the page's numbering one behind
+ * Rust's per such event, which nothing noticed until turn footers compared a seq Rust named with the
+ * page's own. A batch of thinking deltas still costs one fold (`applyEvents`) and one render.
  *
  * The events in one `{kind:"events"}` batch arrive in fold order -- `UiDelivery::Events` is
  * documented as "apply these events, in order", and `ConversationIngest` queues one entry per event
@@ -150,13 +165,6 @@ export function transcriptEntriesCopiedCount(): number {
  * this counter rather than continuing it.
  */
 export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): AgentUiState {
-  // A repeated thinking delta changes nothing. Returning `incoming` itself lets `App.tsx` skip
-  // a render on the 33ms pump while the turn keeps thinking. This also leaves `nextSeq` unchanged:
-  // no item is created, so nothing downstream needs a new `seq`. The first thinking delta still
-  // falls through and advances `nextSeq` like other events.
-  if (event.type === "content_delta" && event.kind === "thinking" && incoming.turnThinking) {
-    return incoming;
-  }
   const seq = incoming.nextSeq;
   // Advance `nextSeq` once here so every `return state` below includes it, even when no visible
   // state changes. Each event is still an ordered occurrence. Clear `turnThinking` by default
@@ -181,11 +189,11 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
     case "turn_started":
       // A new turn is newer news than however the last one ended: the band stops saying it. The row
       // already in the transcript stays where it is.
-      return { ...state, activeTurnId: event.turn_id, assistantMessageOpen: false, lastTurnEnding: null };
+      return { ...state, activeTurnId: event.turn_id, assistantMessageOpen: false, thinkingOpen: false, lastTurnEnding: null };
     case "assistant_message_boundary":
       // Two messages with no tool call between them are two entries, as `AgentSessionProjection`
       // folds them (the phase-3 GUI pass, 2026-09-25).
-      return { ...state, assistantMessageOpen: false };
+      return { ...state, assistantMessageOpen: false, thinkingOpen: false };
     case "user_prompt_submitted":
       // `assistantMessageOpen: false` for the same reason `AgentSessionProjection::apply` does it:
       // a prompt can only occur between assistant messages, and leaving the run open appends the
@@ -194,9 +202,43 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         ...state,
         userPrompts: [...state.userPrompts, { seq, text: event.text }],
         assistantMessageOpen: false,
+        thinkingOpen: false,
       };
+    case "user_message_delivered":
+      // The same row a submitted prompt is, at the point the agent read it -- not where Enter was pressed,
+      // which is why it is not folded when it is sent -- and closing the run for the same reason as
+      // `AgentSessionProjection::apply`'s arm. Marked delivered, as Rust marks it, so it reads as part
+      // of the running turn rather than the start of a new one.
+      return {
+        ...state,
+        userPrompts: [...state.userPrompts, { seq, text: event.text, delivered: true }],
+        assistantMessageOpen: false,
+        thinkingOpen: false,
+      };
+    case "user_message_dropped":
+      // Nothing in the conversation: Rust holds the message again, and its queue envelope says why.
+      return state;
     case "content_delta": {
-      if (event.kind === "thinking") return { ...state, turnThinking: true };
+      if (event.kind === "thinking") {
+        // The agent's thinking, kept as `AgentSessionProjection::apply` keeps it: consecutive deltas
+        // are one block, ordered by the delta that opened it, and a delta with no text opens nothing
+        // and closes nothing. MUST stay identical to that fold. Text that is not a string (a shape
+        // Rust never sends) is read as none rather than appended as "undefined".
+        const text = typeof event.text === "string" ? event.text : "";
+        if (text === "") return { ...state, turnThinking: true };
+        if (state.thinkingOpen && state.thinking.length > 0) {
+          const thinking = state.thinking.slice();
+          const open = thinking[thinking.length - 1];
+          thinking[thinking.length - 1] = { ...open, text: open.text + text };
+          return { ...state, thinking, turnThinking: true };
+        }
+        return {
+          ...state,
+          thinking: [...state.thinking, { seq, turnId: event.turn_id, text }],
+          thinkingOpen: true,
+          turnThinking: true,
+        };
+      }
       // Guard against TS/Rust variant drift at runtime. TypeScript has narrowed `event.kind` to
       // "text" after the thinking case, so a cast is needed to check for an unknown variant.
       // Without the guard, a new Rust variant could append a transcript entry with undefined text.
@@ -219,9 +261,10 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         // `seq` is untouched: a message is ordered by where it started, so a reply still streaming
         // does not slide below the tool call that already interrupted it.
         transcript[transcript.length - 1] = { seq: open.seq, text: open.text + event.text };
-        return { ...state, transcript };
+        // A reply ends the thought before it; the next thought is a block of its own.
+        return { ...state, transcript, thinkingOpen: false };
       }
-      return { ...state, transcript: [...state.transcript, { seq, text: event.text }], assistantMessageOpen: true };
+      return { ...state, transcript: [...state.transcript, { seq, text: event.text }], assistantMessageOpen: true, thinkingOpen: false };
     }
     case "tool_call_started": {
       const record: ToolCallRecord = {
@@ -242,6 +285,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         ...state,
         toolCalls: [...state.toolCalls, record],
         assistantMessageOpen: false,
+        thinkingOpen: false,
         ...(held === undefined
           ? {}
           : { denialsBeforeTheirCall: state.denialsBeforeTheirCall.filter((d) => d.toolUseId !== event.tool_use_id) }),
@@ -266,6 +310,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       return {
         ...state,
         assistantMessageOpen: false,
+        thinkingOpen: false,
         pendingPermissions: [
           // Keyed by `permission_id` like the Rust map: a repeat replaces the card and takes the newer `seq`.
           ...state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id),
@@ -302,7 +347,14 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // updates the band until the next turn starts. A completed turn adds no ending row. Keep this
       // behavior identical to `AgentSessionProjection::apply`. Use a fallback for absent `detail`
       // so an event without it still produces a row.
-      const done = { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage, ...NOTHING_HELD };
+      const done = {
+        ...state,
+        activeTurnId: null,
+        assistantMessageOpen: false,
+        thinkingOpen: false,
+        usage: event.usage ?? state.usage,
+        ...NOTHING_HELD,
+      };
       if (event.outcome === "completed") return done;
       const detail = event.detail ?? { reason: null, api_error_status: null, message: null };
       const ending: TurnEnding = {
@@ -333,6 +385,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "unavailable", reason: describeFailedResume(event) },
         assistantMessageOpen: false,
+        thinkingOpen: false,
         ...NOTHING_HELD,
       };
     }
@@ -342,6 +395,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "unavailable", reason: event.reason },
         assistantMessageOpen: false,
+        thinkingOpen: false,
         ...NOTHING_HELD,
       };
     case "session_closed":
@@ -350,6 +404,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         activeTurnId: null,
         status: { kind: "closed", reason: event.reason },
         assistantMessageOpen: false,
+        thinkingOpen: false,
         ...NOTHING_HELD,
       };
     case "cli_permission_mode":
@@ -398,6 +453,10 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
     case "background_calls":
       // The latest count wins, as in `AgentSessionProjection::apply`.
       return { ...state, backgroundCalls: event.running };
+    case "commands_available":
+      // The latest list replaces the whole earlier one, as in `AgentSessionProjection::apply`. The names
+      // and descriptions are the agent's own text: bounded here again, whatever Rust let through.
+      return { ...state, availableCommands: cleanCommands(event.commands) };
     case "tool_input_changed": {
       // Rust compared the CLI's prompt with the gate request (one it may have answered itself, so
       // the page never saw it) and says so here: applied, never recomputed. Like
@@ -416,9 +475,10 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // The mode lives on the tab (`tabs` envelope), not the projection: `TabInfo.mode` is what the
       // band and the box read, and Rust's own `tabs` envelope already reflects an acknowledged
       // switch. Folding a second copy here would just be a value that can drift from it, so this
-      // event is a no-op for the reducer -- `incoming`, not `state`, so it advances neither `nextSeq`
-      // nor `turnThinking`, the same as the repeated-thinking-delta exception above.
-      return incoming;
+      // event changes nothing the page draws. It still advances `nextSeq`, as Rust bumps
+      // `last_revision` for it: the seqs Rust names (a turn's footer anchor) must be the page's own.
+      // `turnThinking` is left as it was: a mode switch says nothing about what the agent is doing.
+      return { ...incoming, nextSeq: seq + 1 };
     default: {
       // Exhaustiveness guard: a new AgentDomainEvent variant added on the Rust side without a
       // matching TS case lands here at runtime -- observable, never silently dropped.
@@ -501,7 +561,12 @@ function providerPromptFromWire(wire: WireProviderPrompt): ProviderPrompt {
  *  never showed anything still fails the ordinary way. The cards go: nothing can answer them any
  *  more. */
 export function keepAfterFailure(state: AgentUiState, reason: string): AgentUiState | null {
-  const said = state.history !== null || state.userPrompts.length > 0 || state.transcript.length > 0 || state.toolCalls.length > 0;
+  const said =
+    state.history !== null ||
+    state.userPrompts.length > 0 ||
+    state.transcript.length > 0 ||
+    state.toolCalls.length > 0 ||
+    state.thinking.length > 0;
   if (!said) return null;
   return {
     ...state,
@@ -509,6 +574,7 @@ export function keepAfterFailure(state: AgentUiState, reason: string): AgentUiSt
     activeTurnId: null,
     pendingPermissions: [],
     assistantMessageOpen: false,
+    thinkingOpen: false,
     turnThinking: false,
     ...NOTHING_HELD,
   };
@@ -542,8 +608,14 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
     accountLimits: snapshot.accountLimits ?? null,
     // A payload from a build that predates the count is a tab with none.
     backgroundCalls: snapshot.backgroundCalls ?? 0,
+    // `null` is "no list reported"; a payload from a build that predates the key says the same.
+    availableCommands: cleanCommands(snapshot.availableCommands),
     turnEndings: snapshot.turnEndings ?? [],
     lastTurnEnding: snapshot.lastTurnEnding ?? null,
+    // Taken from the wire like `assistantMessageOpen`; a payload without them is a conversation with no
+    // thinking.
+    thinking: snapshot.thinking ?? [],
+    thinkingOpen: snapshot.thinkingOpen ?? false,
     nextSeq: throughRevision,
     turnThinking: false,
     ...NOTHING_HELD,

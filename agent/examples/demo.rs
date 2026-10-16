@@ -117,6 +117,9 @@ fn print_event(event: &AgentDomainEvent) {
         }
         AgentDomainEvent::AccountLimits { used_percent, .. } => println!("[account limits] {used_percent}% used"),
         AgentDomainEvent::BackgroundCalls { running } => println!("[background] {running} running"),
+        AgentDomainEvent::CommandsAvailable { commands } => println!("[commands] {} listed", commands.len()),
+        AgentDomainEvent::UserMessageDelivered { text, .. } => println!("[user, into the turn] {text}"),
+        AgentDomainEvent::UserMessageDropped { reason, .. } => println!("[user message not taken] {reason}"),
         AgentDomainEvent::TurnCompleted {
             result_text,
             outcome,

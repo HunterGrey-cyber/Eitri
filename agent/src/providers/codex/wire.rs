@@ -30,6 +30,7 @@ pub mod method {
     pub const THREAD_ITEMS_LIST: &str = "thread/items/list";
     pub const TURN_START: &str = "turn/start";
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
+    pub const TURN_STEER: &str = "turn/steer";
 
     pub const THREAD_STARTED: &str = "thread/started";
     pub const TURN_STARTED: &str = "turn/started";
@@ -243,6 +244,29 @@ impl TurnStartParams {
             approval_policy: APPROVAL_POLICY,
             approvals_reviewer: reviewer,
             sandbox_policy: sandbox_policy(),
+        }
+    }
+}
+
+/// `turn/steer`: one user message into the running turn. `expectedTurnId` makes Codex refuse it when that
+/// turn is no longer the one running, and `clientUserMessageId` comes back on the `userMessage` item Codex
+/// emits when the model reads it. No policy rides on it: the turn keeps what its `turn/start` sent.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSteerParams {
+    pub thread_id: String,
+    pub client_user_message_id: String,
+    pub input: Vec<UserInput>,
+    pub expected_turn_id: String,
+}
+
+impl TurnSteerParams {
+    pub fn new(thread_id: String, client_user_message_id: String, text: String, expected_turn_id: String) -> Self {
+        TurnSteerParams {
+            thread_id,
+            client_user_message_id,
+            input: vec![UserInput::Text { text }],
+            expected_turn_id,
         }
     }
 }
@@ -724,6 +748,9 @@ pub struct UserMessageItem {
     pub id: String,
     #[serde(default)]
     pub content: Vec<Value>,
+    /// The client's own id of a message sent with `turn/steer`; `None` for a turn's own input.
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -967,6 +994,12 @@ pub struct ItemDelta {
     pub item_id: String,
     #[serde(default)]
     pub delta: String,
+    /// The summary part a reasoning summary delta writes to; absent on every other delta.
+    #[serde(default)]
+    pub summary_index: Option<i64>,
+    /// The content part a raw reasoning delta writes to; absent on every other delta.
+    #[serde(default)]
+    pub content_index: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

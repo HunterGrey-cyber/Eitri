@@ -62,6 +62,23 @@ pub struct SendTurnRequest {
     pub text: String,
 }
 
+/// A user message for the turn that is running ([`AgentProvider::steer_turn`]).
+#[derive(Debug, Clone)]
+pub struct SteerTurnRequest {
+    pub session_id: String,
+    /// The turn the page showed running when the user pressed Enter (the host refuses before this when its
+    /// own turn is another). A provider refuses the message when another turn (or none) runs by the time it
+    /// arrives, so it never lands in a turn the user did not see.
+    pub expected_turn_id: String,
+    /// The host's own id for this message, echoed back by `UserMessageDelivered` or
+    /// `UserMessageDropped`.
+    pub client_message_id: String,
+    /// What goes to the agent: the user's words with the editor context composed in.
+    pub text: String,
+    /// What the user typed, which the transcript row shows once the agent has read the message.
+    pub as_typed: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct InterruptTurnRequest {
     pub session_id: String,
@@ -164,6 +181,10 @@ pub struct ProviderCapabilities {
     /// request is exactly what it was before either existed. The gate is installed either way; this
     /// changes only what a deferred call meets. False on the legacy backend.
     pub cli_auto_mode: bool,
+    /// The provider can put a user message into the turn that is running, without interrupting it
+    /// ([`AgentProvider::steer_turn`]); the agent reads it at its next step. Without it a message
+    /// typed while a turn runs is held by the host until the turn ends.
+    pub steer: bool,
 }
 
 /// Descriptive, non-branching facts about the connected provider: versions to show a human, the
@@ -229,6 +250,11 @@ pub enum ProviderErrorCode {
     ProviderUnavailable,
     ProviderProtocolError,
     DeadlineExceeded,
+    /// A message for the running turn named a turn that is no longer the one running.
+    TurnMismatch,
+    /// The session cannot take a message into the running turn now; the host holds it for the turn's
+    /// end.
+    SteerUnavailable,
 }
 
 impl ProviderErrorCode {
@@ -246,6 +272,8 @@ impl ProviderErrorCode {
                 | ProviderErrorCode::PermissionNotFound
                 | ProviderErrorCode::PermissionAlreadyResolved
                 | ProviderErrorCode::IdempotencyConflict
+                | ProviderErrorCode::TurnMismatch
+                | ProviderErrorCode::SteerUnavailable
         )
     }
 }
@@ -306,6 +334,37 @@ pub trait AgentProvider {
     /// a second `send_turn` is rejected while a turn is in flight, rather than queued.
     fn send_turn(&self, request: SendTurnRequest) -> Result<String, ProviderError>;
     fn interrupt_turn(&self, request: InterruptTurnRequest) -> Result<(), ProviderError>;
+    /// Puts one user message into the running turn without interrupting it. Called on the host's UI
+    /// thread, so it must not wait on the agent: `Ok` means the provider took the message and will send
+    /// it (or has), never that the agent has it. `Err` means the provider refused it here and nothing was
+    /// or will be sent, so the host still holds it. A provider without capability `steer` refuses every
+    /// one.
+    ///
+    /// **Outcomes.** What became of every message taken arrives through [`pump`](Self::pump): one of
+    /// `AgentDomainEvent::UserMessageDelivered` (the agent read it) or `UserMessageDropped` (the agent or
+    /// the provider refused it, or the provider will not wait for it any longer), with one exception
+    /// below. **When:** before that turn's `TurnCompleted`; or, when the agent runs the message as a turn
+    /// of its own right after that turn (a follow-up turn the provider opens itself, with no
+    /// `send_turn`), inside the follow-up, whose `TurnStarted` is returned by the same `pump()` call as
+    /// the previous turn's `TurnCompleted`. So the host never sees no turn running while a message it
+    /// handed over has no outcome.
+    ///
+    /// **Giving up is not knowing.** A provider that stops waiting -- a follow-up that does not come in
+    /// time, a session or stream that ends -- reports the message dropped although the agent may have
+    /// it. If the agent is later seen to read it, `UserMessageDelivered` still comes under the same id:
+    /// the one case of two outcomes for one message, and the later one wins. The host takes such a
+    /// message back from its queue rather than send it again (`Queued::dropped_as` in the tab set). A
+    /// session that has ended reports nothing more, so a message dropped with it may have reached the
+    /// agent unseen.
+    ///
+    /// **Order.** Messages reach the agent in the order they were taken: a provider sends one only after
+    /// the agent has taken every earlier one, and when one is refused it drops, unsent, every later one
+    /// it has not sent. One the agent drops after taking it cannot take back later ones the agent
+    /// already has; each is reported as what the agent did with it.
+    fn steer_turn(&self, request: SteerTurnRequest) -> Result<(), ProviderError> {
+        let _ = request;
+        Err(ProviderError::UnsupportedCapability("steer"))
+    }
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError>;
     fn close_session(&self, request: CloseSessionRequest) -> Result<(), ProviderError>;
     /// Drains every `AgentDomainEvent` that has arrived since the last call. Never blocks --

@@ -6,6 +6,7 @@ import { BROWSE_KEYS, CARET_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS, REVIEW_KEYS, VI
 import type { KeyHelp, PanelTable } from "../keymap";
 import { binding, TABLE } from "../testFixtures";
 import { listedSlashCommands } from "../slashCommands";
+import { MODE_CONSEQUENCE } from "./Dashboard";
 
 afterEach(cleanup);
 
@@ -100,11 +101,24 @@ describe("KeymapOverlay", () => {
   // to `resolveKey` both ways and would fail on it. It is a note under the table instead, and a section
   // without a note draws no `<p>` at all.
   describe("the note under This panel (R9)", () => {
-    it("says Ctrl+[ is Esc, in a <p> after the table, and adds no row", () => {
+    it("says on another agent's tab that manual asks for what reaches Eitri, and where the rest is described", () => {
+      const { container } = render(
+        <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+a" panel={EMPTY_PANEL_TABLE} agent="Codex" />,
+      );
+      expect(sectionTitled(container, "This panel").querySelector("p")!.textContent).toContain(
+        "manual — Every request Codex makes asks; what it runs without asking is in Ctrl+a i.",
+      );
+    });
+
+    it("says Ctrl+[ is Esc and what each mode does, in a <p> after the table, and adds no row", () => {
       const section = sectionTitled(overlay().container, "This panel");
       expect(section.querySelectorAll("p")).toHaveLength(1);
       const note = section.querySelector("p")!;
-      expect(note.textContent).toBe("Ctrl+[ is Esc everywhere in this panel.");
+      // The modes' consequence lines moved here from the start screen (2026-10-15), word for word.
+      // Manual's line (2026-10-14) joins them, in Shift+Tab's order.
+      expect(note.textContent).toBe(
+        `Ctrl+[ is Esc everywhere in this panel. Modes (Shift+Tab): manual — ${MODE_CONSEQUENCE.manual} auto — ${MODE_CONSEQUENCE.auto} bypass — ${MODE_CONSEQUENCE.bypass}`,
+      );
       expect(section.querySelector("table")!.nextElementSibling).toBe(note);
       // BROWSE_KEYS, plus the mirror's own `Ctrl+j` -- the same count the whole-container test pins.
       expect(section.querySelectorAll("tr")).toHaveLength(BROWSE_KEYS.length + 1);

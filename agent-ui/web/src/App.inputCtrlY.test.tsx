@@ -193,7 +193,7 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
         expect.objectContaining({ type: "permission_response", tab: 1, permission_id: "perm-1", decision: "allow" }),
       ]);
       expect(document.activeElement).toBe(textarea(container));
-      expect(container.querySelector('[data-testid="mode-block"]')!.textContent).toBe("INPUT");
+      expect(container.querySelector('[data-testid="mode-block"]')!.textContent).toBe("INSERT");
     });
 
     it("two cards: the OLDEST, even with the row cursor left on the newer one; the next Ctrl+y the other", () => {

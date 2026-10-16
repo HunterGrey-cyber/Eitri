@@ -138,9 +138,12 @@ export function textWidth(text: string): number {
  *  `.status-band--wrap` let the band grow upward until the prompt or flash ends. Other segments
  *  still degrade by priority. */
 
-const PAD = 2; // one character of padding each side (8px at --fs-sm)
-// CARET, VISUAL, and V-LINE shorten to C, V, and VL when the band is narrow.
-const MODE_TEXT: Record<PanelMode, string> = { input: "INPUT", browse: "BROWSE", hint: "HINT", caret: "CARET", visual: "VISUAL", vline: "V-LINE" };
+const PAD = 2; // one character of padding each side
+/** The mode block's separator arrow, one cell after it (`index.css`, `.band-mode::after`). */
+const MODE_ARROW = 1;
+// CARET, VISUAL, and V-LINE shorten to C, V, and VL when the band is narrow. INPUT displays as
+// INSERT to match the adjacent editor's mode label while typing.
+const MODE_TEXT: Record<PanelMode, string> = { input: "INSERT", browse: "BROWSE", hint: "HINT", caret: "CARET", visual: "VISUAL", vline: "V-LINE" };
 const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: "H", caret: "C", visual: "V", vline: "VL" };
 
 /** The bottom band's degrade rule, a pure function of the facts and the measured
@@ -152,7 +155,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   if (widthPx <= 0 || charPx <= 0) return [mode, pill];
   const budget = Math.floor(widthPx / charPx);
   if (f.prompt !== null) {
-    const roomForPrompt = budget - textWidth(mode.text) - 2 * PAD;
+    const roomForPrompt = budget - textWidth(mode.text) - MODE_ARROW - 2 * PAD;
     return [mode, { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt }];
   }
   const ctxFull = f.context && (f.context.lines ? `⧉ ${f.context.file}:${f.context.lines[0]}-${f.context.lines[1]}` : `⧉ ${f.context.file}`);
@@ -177,7 +180,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.position ? [{ id: "position", text: f.position, side: "right" } as Seg] : []),
     ...(f.unread ? [{ id: "unread", text: f.unread, side: "right" } as Seg] : []),
   ];
-  const width = (s: Seg[]) => s.reduce((n, x) => n + textWidth(x.text) + PAD, 0);
+  const width = (s: Seg[]) => s.reduce((n, x) => n + textWidth(x.text) + PAD + (x.id === "mode" ? MODE_ARROW : 0), 0);
   const steps: ((s: Seg[]) => Seg[])[] = [
     // Usage drops before even shortening the context, so a narrow panel keeps the displayed file
     // name ahead of a token and cost figure.

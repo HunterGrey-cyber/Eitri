@@ -6,7 +6,7 @@ describe("phaseOf", () => {
   it("reads sent when nothing has come back yet", () => {
     const state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
     expect(phaseOf(state)).toEqual({ kind: "sent" });
-    expect(phaseWord(phaseOf(state))).toBe("sent");
+    expect(phaseWord(phaseOf(state))).toBe("working");
   });
 
   it("reads thinking once a thinking delta has arrived and nothing has landed since", () => {
@@ -159,7 +159,7 @@ describe("phaseOf", () => {
     state = applyEvent(state, { type: "user_prompt_submitted", text: "never mind, do X" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
     expect(phaseOf(state)).toEqual({ kind: "sent" });
-    expect(phaseWord(phaseOf(state))).toBe("sent");
+    expect(phaseWord(phaseOf(state))).toBe("working");
   });
 
   it("a DENIED call does not claim 'running <Tool>' into the next turn", () => {
@@ -224,7 +224,8 @@ describe("phaseOf", () => {
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
     state = applyEvent(state, { type: "tool_call_completed", turn_id: "t1", tool_use_id: "tu1", content: "ok", is_error: false });
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm, now what" });
-    // The last ITEM is still the completed tool call (thinking creates no item), but the phase must
+    // The last item `phaseOf` reads is still the completed tool call (it reads prompts, replies and calls,
+    // not thinking blocks), but the phase must
     // report thinking, not replying -- rule 3 runs before rule 4 for exactly this reason.
     expect(phaseOf(state)).toEqual({ kind: "thinking" });
   });
@@ -238,28 +239,60 @@ describe("phaseOf", () => {
     expect(phaseOf(state).kind).not.toBe("tool");
   });
 
-  it("the resync degradation: a resync mid-thinking degrades the phase to sent, never invents thinking", () => {
-    // A resync can lose `turnThinking` but must never invent it.
+  it("a resync mid-thought keeps thinking: the open thought is on the wire", () => {
     let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
     expect(phaseOf(state)).toEqual({ kind: "thinking" });
 
-    // Take the snapshot Rust would actually send for this state (no `turnThinking` key at all --
-    // it is reducer-internal on both sides, unlike `assistantMessageOpen`, which IS on the wire
-    // since sw-panel-render-2's fix and so stays in `wire` here) and resync onto it.
+    // The snapshot Rust would send: no `turnThinking` (reducer-internal), but `thinkingOpen`, which is
+    // Rust's `thinking_open`, stays.
+    const { nextSeq: _seq, turnThinking: _thinking, ...wire } = state;
+    const resynced = applySnapshot(state, wire, state.nextSeq);
+    expect(resynced.thinkingOpen).toBe(true);
+    expect(phaseWord(phaseOf(resynced))).toBe("thinking");
+  });
+
+  it("any other event mid-thought keeps thinking (a list of commands, a count of background calls)", () => {
+    let state = applyEvent(initialState(), { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+    state = applyEvent(state, { type: "background_calls", running: 0 });
+    expect(state.turnThinking).toBe(false);
+    expect(phaseOf(state)).toEqual({ kind: "thinking" });
+    state = applyEvent(state, { type: "commands_available", commands: [{ name: "a", description: "" }] });
+    expect(phaseOf(state)).toEqual({ kind: "thinking" });
+    // Over an unfinished call too: the thought started after the call, so it is what is happening.
+    let withCall = applyEvent(initialState(), { type: "turn_started", turn_id: "t1" });
+    withCall = applyEvent(withCall, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
+    withCall = applyEvent(withCall, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+    withCall = applyEvent(withCall, { type: "background_calls", running: 1 });
+    expect(phaseOf(withCall)).toEqual({ kind: "thinking" });
+    // What closes the thought ends it: a reply.
+    withCall = applyEvent(withCall, { type: "content_delta", turn_id: "t1", kind: "text", text: "so" });
+    expect(phaseOf(withCall)).toEqual({ kind: "replying" });
+  });
+
+  it("the resync degradation: a thinking delta with no text is lost to a resync, never invented", () => {
+    // A resync can lose `turnThinking` but must never invent it. An empty thinking delta opens no
+    // block, so the wire carries no thinking state and the phase degrades.
+    let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "" });
+    expect(phaseOf(state)).toEqual({ kind: "thinking" });
+    expect(state.thinkingOpen).toBe(false);
+
     const { nextSeq: _seq, turnThinking: _thinking, ...wire } = state;
     const resynced = applySnapshot(state, wire, state.nextSeq);
     expect(phaseOf(resynced)).toEqual({ kind: "sent" });
   });
 
-  it("the OTHER degraded path: a resync mid-thinking over an unfinished call degrades to that call, not to thinking", () => {
-    // A snapshot does not distinguish a denied call from a running one: both have `result: null`.
-    // After the ephemeral `turnThinking` bit is lost, the phase shows the call until another thinking
-    // delta or model text arrives. This is correct for a live call; distinguishing a denied call
-    // requires more information on the wire. Resync may lose the thinking phase but must never invent it.
+  it("the OTHER degraded path: a resync after an empty thinking delta over an unfinished call degrades to that call", () => {
+    // A snapshot carries no record that a permission was DENIED -- a denied call and a running one are
+    // both `result: null` -- so once the ephemeral `turnThinking` bit is gone, and no open thought says
+    // otherwise, the phase reads the call again until the next thinking delta or the model's next
+    // text arrives. The degradation is toward a LESS specific phase, never INTO `thinking`.
     let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
-    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "" });
     expect(phaseOf(state)).toEqual({ kind: "thinking" });
 
     const { nextSeq: _n, turnThinking: _t, ...wire } = state;
@@ -271,7 +304,7 @@ describe("phaseOf", () => {
 
 describe("phaseWord", () => {
   it("names all five phases, one word each", () => {
-    expect(phaseWord({ kind: "sent" })).toBe("sent");
+    expect(phaseWord({ kind: "sent" })).toBe("working");
     expect(phaseWord({ kind: "thinking" })).toBe("thinking");
     expect(phaseWord({ kind: "replying" })).toBe("replying");
     expect(phaseWord({ kind: "tool", toolName: "NotebookEdit" })).toBe("running NotebookEdit");

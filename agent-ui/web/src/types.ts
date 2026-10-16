@@ -1,3 +1,5 @@
+import type { CompletionCommand } from "./slashCommands";
+
 /** The ordering key every item in a conversation carries, shared across `TranscriptMessage`,
  * `ToolCallRecord`, `PermissionRequestRecord` and `UserPromptRecord` so the four can be
  * interleaved into the one sequence they really formed.
@@ -19,7 +21,25 @@ export type TranscriptMessage = { seq: Seq; text: string };
  * backends, and Rust deliberately records the pre-composition text (`agent/src/projection.rs`'s
  * `UserPromptSubmitted`). Rendering the wire text would show the user a file path and a selection
  * they never wrote. */
-export type UserPromptRecord = { seq: Seq; text: string };
+export type UserPromptRecord = {
+  seq: Seq;
+  text: string;
+  /** A message put into a running turn that the agent read there (`user_message_delivered`): drawn as
+   *  part of that turn, not as the start of a new one. Absent on every other prompt; Rust sends the key
+   *  only when it is true, so the two folds stay equal. */
+  delivered?: true;
+};
+/** One run of the agent's thinking (Rust's `ThinkingBlock`): consecutive thinking deltas of one turn,
+ * ordered by the delta that opened it, as a reply is. Plain text the provider sent: drawn as text,
+ * never as markdown or HTML. */
+export type ThinkingBlock = { seq: Seq; turnId: string; text: string };
+/** How the panel shows thinking (`init.lua`'s `agent.thinking`, the `display` envelope): `collapsed`
+ * (the default) is one muted row per block, its text behind the row's fold; `preview` shows a block's
+ * last lines in a box of fixed height while it is written, then the collapsed row; `expanded` shows every
+ * block whole; `hidden` draws no thinking rows. The detailed view (`Ctrl+o`) shows every block whole
+ * whatever this says. */
+export type ThinkingDisplay = "collapsed" | "preview" | "expanded" | "hidden";
+export const THINKING_DISPLAYS: readonly ThinkingDisplay[] = ["collapsed", "preview", "expanded", "hidden"];
 export type ToolCallRecord = {
   seq: Seq;
   toolUseId: string;
@@ -214,6 +234,9 @@ export type Capabilities = {
   fork: boolean;
   interrupt: boolean;
   bypassPermissionMode: boolean;
+  /** Enter while a turn runs puts the message into that turn (the agent reads it at its next step);
+   *  without it the message is held for the turn's end. Optional only for callers written before it. */
+  steer?: boolean;
 };
 
 /** Descriptive only -- for display and diagnostics, never for deciding whether a control is
@@ -272,10 +295,12 @@ export type HistoryNotice = {
   writerVersion: string | null;
 };
 
-/** One item waiting behind a running turn, as it reaches the panel: what the
- * user typed, and when it was queued (epoch ms), for the composer's "queued" list. The wire text
- * composed against the editor context at queue time is Rust's own concern and never reaches here. */
-export type QueueItem = { text: string; queuedAt: number };
+/** One message typed while a turn ran, as it reaches the panel: what the
+ * user typed, when (epoch ms), and whether it was sent into the running turn and the agent has not
+ * read it yet (`steered`, a `↪` line) or waits for the turn's end (a `⧗` line). The wire text composed
+ * against the editor context, and the id it was sent under, are Rust's own concern and never reach here.
+ * `steered` is optional only for callers written before it existed; Rust always sends it. */
+export type QueueItem = { text: string; queuedAt: number; steered?: boolean };
 /** V1's editor-context line: the file relative to the project root (or
  * absolute outside it), and the selected line range when there is a selection. */
 /** Where the panel stands with the editor beside it, in a companion window (`editor_link`,
@@ -317,6 +342,11 @@ export type AgentUiState = {
    *  them while there are any, and `<leader>k` stops them with the session. `0` for every agent that keeps
    *  no such count. A snapshot carries it. */
   backgroundCalls: number;
+  /** The slash commands the tab's agent listed (`commands_available`; an ACP agent's
+   *  `available_commands_update`), or `null` before any list. The `/` menu offers them in place of
+   *  Claude's built-in table (`completionSource`). Untrusted text from the agent: bounded on the way in
+   *  and drawn as plain text. A snapshot carries it. */
+  availableCommands: CompletionCommand[] | null;
   /** The turns that ended without completing, oldest first: failed, hit a limit, interrupted, or cut off
    *  by the session ending. Each is a muted row where the turn stopped. A turn that completed adds none. */
   turnEndings: TurnEnding[];
@@ -339,6 +369,14 @@ export type AgentUiState = {
    * on every snapshot landing mid-reply: a tab switch back to a streaming reply, `prefix r`, and a
    * bounded-queue Resync. `applySnapshot` now takes this from the snapshot like every other field. */
   assistantMessageOpen: boolean;
+  /** The agent's thinking, oldest first (Rust's `thinking`). A snapshot carries it like the other
+   * collections. */
+  thinking: ThinkingBlock[];
+  /** True while the last thinking block is still being written: the next thinking delta continues it.
+   * Closed by assistant text and by everything that closes `assistantMessageOpen`. On the wire, as
+   * `assistantMessageOpen` is and for the same reason: a snapshot taken mid-thought must neither split
+   * the thought nor draw it as finished. */
+  thinkingOpen: boolean;
   /** Reducer-internal, never on the wire: the `seq` the next locally-folded item will take.
    *
    * Seeded from a snapshot's own `throughRevision`, which Rust guarantees is strictly greater than
@@ -347,14 +385,9 @@ export type AgentUiState = {
    * call, exactly as `AgentSessionProjection::apply` bumps `last_revision`, so on the healthy path
    * the numbers are the same numbers Rust would have assigned rather than a parallel scheme.
    *
-   * **One exception, since the in-flight motion change (2026-09-20):** a REPEATED thinking delta
-   * returns the incoming state untouched and advances nothing, so this counter and Rust's
-   * `last_revision` drift apart by one for each such delta. That is safe and is checked rather
-   * than assumed -- the skipped number is assigned to no item, locally folded `seq`s stay strictly
-   * increasing, every item in a snapshot sits below its `throughRevision`, and `applySnapshot`
-   * re-seeds this field from that number, so no collision and no reordering is reachable. Nothing
-   * in this frontend ever compares a `seq` here against a Rust-assigned one. See `applyEvent`'s
-   * own early return for why that delta must not allocate a render, let alone a number. */
+   * Every event advances it, `permission_mode_changed` included (it changes nothing else here, but Rust
+   * bumps `last_revision` for it): a turn's footer is placed by a seq Rust names, so a counter one
+   * behind would put it under the wrong row. */
   nextSeq: Seq;
   /** Reducer-internal, never on the wire: true from a `content_delta` with `kind: "thinking"` until
    * the next event of any other kind. The one ephemeral bit `turnPhase.ts`'s `phaseOf` reads that is
@@ -389,10 +422,17 @@ export type AgentUiState = {
  * it used to be, on the theory that it was reducer-internal like the other two, but Rust's own
  * projection carries the same bit and disagreeing about it split a mid-stream reply across a
  * snapshot -- see that field's own doc comment on `AgentUiState`. */
-export type AgentUiSnapshot = Omit<AgentUiState, "nextSeq" | "turnThinking" | "denialsBeforeTheirCall" | "changedInputsBeforeTheirCall"> & {
+export type AgentUiSnapshot = Omit<
+  AgentUiState,
+  "nextSeq" | "turnThinking" | "denialsBeforeTheirCall" | "changedInputsBeforeTheirCall" | "thinking" | "thinkingOpen"
+> & {
   /** Present only while Rust holds a change whose call has not started: it is the one held list
    *  Rust sends, so a rebuilt page attaches it when the call starts, as Rust does. */
   changedInputsBeforeTheirCall?: AgentUiState["changedInputsBeforeTheirCall"];
+  /** Rust always sends both; optional so a payload recorded before thinking was kept still reads, as a
+   *  conversation with none. */
+  thinking?: AgentUiState["thinking"];
+  thinkingOpen?: boolean;
 };
 
 /** How long a turn has been running, tracked in `App.tsx` alongside `AgentUiState` rather than
@@ -469,6 +509,11 @@ export type TurnEnding = {
   resetsAt?: number | null;
 };
 
+/** How long one finished turn ran, as Rust's tab set stamped it (`turnTimes` on a snapshot or events
+ *  envelope; `core/src/agent_bridge.rs`'s `TurnTime`). Times are `Date.now()`'s clock. `anchorSeq` is the
+ *  `seq` of the newest row when the end was seen, or `null` when Rust could not tell which row that was. */
+export type TurnTimeWire = { turnId: string; startedAtMs: number; endedAtMs: number; anchorSeq: Seq | null };
+
 /** The token counts of one usage report, as Verdandi's `TurnUsage` carries them (Rust's
  *  `agent::TokenUsage`, snake_case as serde derives it). The prompt is three figures, not one: Claude
  *  Code caches aggressively, so on a large prompt `input` is typically single digits and nearly all of
@@ -514,6 +559,12 @@ export type AgentDomainEvent =
   | { type: "session_opened"; session_id: string; provider_session_id: string; model: string; cwd: string }
   | { type: "turn_started"; turn_id: string }
   | { type: "user_prompt_submitted"; text: string }
+  /** A message put into the running turn was read by the agent: a user prompt at this point of the
+   *  conversation (`AgentDomainEvent::UserMessageDelivered`). */
+  | { type: "user_message_delivered"; client_message_id: string; turn_id: string; text: string }
+  /** A message put into the running turn did not reach the agent; Rust holds it again and the queue
+   *  envelope says why. Nothing in the conversation changes (`AgentDomainEvent::UserMessageDropped`). */
+  | { type: "user_message_dropped"; client_message_id: string; reason: string }
   | { type: "content_delta"; turn_id: string; kind: "text" | "thinking"; text: string }
   /** The streaming assistant message is over; the next text starts a new one. Mirrors
    *  `AgentDomainEvent::AssistantMessageBoundary`. Reachable on **both** backends: legacy emits it
@@ -586,6 +637,9 @@ export type AgentDomainEvent =
   /** How many commands the agent left running after its turns ended (`AgentDomainEvent::BackgroundCalls`),
    *  whenever that changes. The latest wins. */
   | { type: "background_calls"; running: number }
+  /** The slash commands the agent says the session accepts, whole (`AgentDomainEvent::CommandsAvailable`).
+   *  The latest list replaces the earlier one. */
+  | { type: "commands_available"; commands: CompletionCommand[] }
   /** The CLI's own prompt for a call carried another input than the gate was asked about. Rust
    *  derives it when it folds the prompt and sends it right after, even when the host answered the
    *  gate request itself and so never delivered it: the page applies it and compares nothing.

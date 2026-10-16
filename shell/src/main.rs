@@ -611,7 +611,22 @@ fn build_ui(
     // is kept current by `text_size_controller` below. `panel_tokens` reads this rather than the
     // captured `panel_font_size` so a colorscheme change re-derives every OTHER token but never
     // resets a zoom back to the un-zoomed base.
-    let panel_px = Rc::new(std::cell::Cell::new(config.panel_font_size));
+    // The editor's font size (`guifont`), which the panel's text equals unless `agent.font_size` is set:
+    // Neovide's default until nvim's first theme payload says otherwise (the listener below), and in the
+    // panel's CSS px, which differ from the editor's logical px by WebKitGTK's page zoom (`webkit_zoom`).
+    let editor_font = Rc::new(std::cell::Cell::new(webkit_zoom::EditorFont::new(
+        gtk4::Settings::default().map_or(xft_dpi::GTK_DEFAULT_XFT_DPI, |s| s.gtk_xft_dpi()),
+        eitri_core::theme::guifont_size_px(""),
+    )));
+    let panel_base = if config.panel_font_follows_editor {
+        editor_font.get().css_px()
+    } else {
+        config.panel_font_size
+    };
+    // Filled in once `text_size_controller` exists (below): the theme listener, registered before it,
+    // hands it the editor's new font size through this.
+    let text_size_slot: Rc<std::cell::RefCell<Option<Rc<text_size::TextSizeController>>>> = Rc::default();
+    let panel_px = Rc::new(std::cell::Cell::new(panel_base));
     // The editor's cell height, reported by `connect_cell_size_changed` below. It is `None` until
     // nvim reports a font, as is `--nv-editor-row`; `panel_tokens` reads it when building the
     // theme. The editor reports GTK logical pixels, converted to panel CSS pixels using
@@ -685,7 +700,19 @@ fn build_ui(
         let agent_panel_handle = agent_panel_handle.clone();
         let pane_for_theme = pane.clone();
         let terminal = terminal.clone();
+        let editor_font = editor_font.clone();
+        let text_size_slot = text_size_slot.clone();
+        let follows_editor = config.panel_font_follows_editor;
         feed_pump.listen_theme(feed, move |payload| {
+            // The editor's font first, so the theme sent below already carries the panel's new size.
+            if follows_editor {
+                let mut font = editor_font.get();
+                let moved = font.set_logical_px(eitri_core::theme::guifont_size_px(&payload.options.guifont));
+                editor_font.set(font);
+                if let (Some(base), Some(controller)) = (moved, text_size_slot.borrow().as_ref()) {
+                    controller.set_base(base);
+                }
+            }
             let tokens = eitri_core::theme::ThemeTokens::derive(&payload);
             println!(
                 "[theme] following nvim colorscheme {:?} (background={})",
@@ -708,9 +735,25 @@ fn build_ui(
         // buffers text-size writes through `ScaleWatch` until nvim starts.
         Some(pane.clone()),
         agent_panel_handle.clone(),
-        config.panel_font_size,
+        panel_base,
         panel_px,
     );
+    *text_size_slot.borrow_mut() = Some(text_size_controller.clone());
+    // The desktop's text scaling moved WebKit's page zoom, so the editor's size is a different number of
+    // the panel's CSS px (the cell height's own handler above does the same for `--nv-editor-row`).
+    if config.panel_font_follows_editor {
+        if let Some(settings) = gtk4::Settings::default() {
+            let controller = text_size_controller.clone();
+            settings.connect_gtk_xft_dpi_notify(move |settings| {
+                let mut font = editor_font.get();
+                let moved = font.follow_xft_dpi(settings.gtk_xft_dpi());
+                editor_font.set(font);
+                if let Some(base) = moved {
+                    controller.set_base(base);
+                }
+            });
+        }
+    }
 
     // `Ctrl`+wheel over a module: the text size of that pane only. Every host
     // exists by now -- the editor, the agent, the terminal and each Lua panel were added above.

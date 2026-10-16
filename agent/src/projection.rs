@@ -120,7 +120,7 @@ pub enum TurnEndingKind {
 /// the activity line went away and nothing said why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnEndingRecord {
-    /// Ordering key, shared with the other four collections. See `AgentSessionProjection::apply`.
+    /// Ordering key, shared with the other collections. See `AgentSessionProjection::apply`.
     pub seq: u64,
     pub turn_id: String,
     pub kind: TurnEndingKind,
@@ -221,6 +221,22 @@ pub enum AgentDomainEvent {
     /// wrote.
     UserPromptSubmitted {
         text: String,
+    },
+    /// A message the user put into the running turn (`AgentProvider::steer_turn`) has been read by the
+    /// agent: the provider's own report, never assumed by the host. Folded as a user prompt at this
+    /// point of the conversation, which is where the agent took it in -- not where Enter was pressed.
+    /// `text` is what the user typed, as for `UserPromptSubmitted`.
+    UserMessageDelivered {
+        client_message_id: String,
+        turn_id: String,
+        text: String,
+    },
+    /// A message put into the running turn did not reach the agent: it refused it, or the turn ended
+    /// before reading it. Adds nothing to the conversation; the host holds the message again and says
+    /// why (`reason`, in Eitri's words with the agent's own after a colon when it gave any).
+    UserMessageDropped {
+        client_message_id: String,
+        reason: String,
     },
     ContentDelta {
         turn_id: String,
@@ -382,6 +398,13 @@ pub enum AgentDomainEvent {
     /// until it ends.
     BackgroundCalls {
         running: u32,
+    },
+    /// The slash commands the agent says this session accepts, whole, each time it says so (ACP
+    /// `available_commands_update`). The latest list replaces the earlier one; an empty list withdraws
+    /// them. Only reported by an agent that has such a list: a session whose agent never reports one
+    /// keeps `available_commands` at `None`, and the panel falls back to what it knows of that agent.
+    CommandsAvailable {
+        commands: Vec<SlashCommand>,
     },
     /// The account's usage limit changed, as the agent reported it. Account-wide, not per turn.
     AccountLimits {
@@ -767,6 +790,19 @@ pub struct UngatedCliModeRecord {
     pub detail: String,
 }
 
+/// One slash command an agent advertises. **Untrusted text from the agent**: the producer bounds it
+/// (`providers::acp::wire::parse_commands`), and the page draws it as plain text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlashCommand {
+    /// The word typed after the `/`, without the slash. Never empty, never holds whitespace.
+    pub name: String,
+    /// One line saying what the command does; may be empty.
+    pub description: String,
+    /// What the command takes after its name, when the agent said (ACP `input.hint`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
 /// The latest `AgentDomainEvent::AccountLimits` a session reported, as the projection keeps it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccountLimitsRecord {
@@ -799,6 +835,34 @@ pub struct TranscriptMessage {
     pub text: String,
 }
 
+/// One run of the agent's thinking (`ContentDelta` with [`ContentKind::Thinking`]), with the position it
+/// occupies among everything else.
+///
+/// A collection of its own rather than a kind of `TranscriptMessage`: a reply is markdown the panel
+/// renders, while thinking is shown as plain text and only on request, and keeping them apart means no
+/// reader of `transcript` can mistake one for the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingBlock {
+    /// Ordering key, shared with the other collections. See `AgentSessionProjection::apply`.
+    ///
+    /// The seq of the delta that OPENED this block, never updated as it grows, for the same reason as
+    /// `TranscriptMessage::seq`.
+    pub seq: u64,
+    pub turn_id: String,
+    pub text: String,
+}
+
+/// The most outcomes of messages put into a running turn a projection remembers; the oldest goes first.
+/// The host reads each one within a tick of its fold, so this only bounds a session that steers a lot.
+pub const MAX_STEER_OUTCOMES: usize = 256;
+
+/// What became of a message put into the running turn, as the provider reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SteerOutcome {
+    Delivered,
+    Dropped { reason: String },
+}
+
 /// One prompt the user sent, with the position it occupies among everything else.
 ///
 /// A fourth collection rather than a role on `TranscriptMessage`, because `transcript`'s
@@ -811,6 +875,11 @@ pub struct UserPromptRecord {
     /// `PermissionRequestRecord::seq`. See `AgentSessionProjection::apply`.
     pub seq: u64,
     pub text: String,
+    /// A message put into a running turn that the agent read there (`UserMessageDelivered`): part of
+    /// that turn, not the start of a new one. Left out of the serialized form when false, so every
+    /// record written before it existed reads the same.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1125,10 +1194,25 @@ pub struct AgentSessionProjection {
     /// standalone markdown and the formatting of every streamed reply breaks.
     ///
     /// Anything that can only occur BETWEEN assistant messages closes the run: a tool call, a
-    /// permission request, a turn boundary, a session event. `Thinking` deliberately does not --
-    /// it has no transcript effect and must not split the text around it.
+    /// permission request, a turn boundary, a session event. `Thinking` deliberately does not: an
+    /// agent that streams a thought in the middle of a reply (an ACP agent may) would otherwise cut
+    /// the reply in two, each half markdown-parsed alone.
     #[serde(skip)]
     pub assistant_message_open: bool,
+    /// The agent's thinking, in arrival order, each block carrying the `seq` that orders it against
+    /// the other collections. Consecutive thinking deltas are one block (`thinking_open`).
+    ///
+    /// Not part of a stored history (`history::store` keeps prompts, replies and tool calls) and not
+    /// read back from Claude's own transcript, so a resumed Claude conversation has none; an agent whose
+    /// history is replayed as events (Codex) has the blocks its replay carries.
+    pub thinking: Vec<ThinkingBlock>,
+    /// True while the last thing that could end a run of thinking has not happened since a thinking
+    /// delta: the next thinking delta CONTINUES the last block. Closed by assistant text and by
+    /// everything that closes `assistant_message_open`. On the wire (`thinkingOpen`) for the reason
+    /// `assistant_message_open` is: a snapshot can land in the middle of a block, and the panel draws
+    /// a block that is still open differently from one that is over.
+    #[serde(skip)]
+    pub thinking_open: bool,
     /// Strictly increasing by exactly one per `apply` call. What a WebView bridge snapshot's
     /// `throughRevision` reports, and what a later `events{fromRevision, throughRevision, ...}`
     /// batch continues from.
@@ -1171,6 +1255,10 @@ pub struct AgentSessionProjection {
     /// turns ended. Zero once the session is over. Not serialized.
     #[serde(skip)]
     pub background_calls: u32,
+    /// The latest `AgentDomainEvent::CommandsAvailable`, or `None` before the first. Not serialized
+    /// here: the snapshot carries it as `availableCommands`.
+    #[serde(skip)]
+    pub available_commands: Option<Vec<SlashCommand>>,
     /// `background_calls` as it was when the latest turn ended, which a resync that ends that turn reads.
     /// Not serialized.
     #[serde(skip)]
@@ -1199,6 +1287,12 @@ pub struct AgentSessionProjection {
     /// nothing outside it can read or change what it holds.
     #[serde(skip)]
     pub call_index: CallIndex,
+    /// What became of each message put into the running turn, by the host's client id, oldest first and
+    /// at most [`MAX_STEER_OUTCOMES`]. Kept here rather than only in the events so the host still learns
+    /// it after a resync dropped them (`eitri_core::tab_set` reads it after every delivery). The
+    /// delivered ones are also user prompts; nothing else of it is drawn. Not serialized.
+    #[serde(skip)]
+    pub steer_outcomes: VecDeque<(String, SteerOutcome)>,
 }
 
 /// [`AgentSessionProjection::call_index`]: the position of each tool-use id's first call, valid for
@@ -1393,6 +1487,23 @@ impl AgentSessionProjection {
         self.denials_before_their_call.remove(at).map(|(_, denial)| denial)
     }
 
+    fn note_steer_outcome(&mut self, client_message_id: &str, outcome: SteerOutcome) {
+        self.steer_outcomes.retain(|(id, _)| id != client_message_id);
+        self.steer_outcomes.push_back((client_message_id.to_string(), outcome));
+        while self.steer_outcomes.len() > MAX_STEER_OUTCOMES {
+            self.steer_outcomes.pop_front();
+        }
+    }
+
+    /// What the provider reported about the message sent under `client_message_id`, if anything yet.
+    pub fn steer_outcome(&self, client_message_id: &str) -> Option<&SteerOutcome> {
+        self.steer_outcomes
+            .iter()
+            .rev()
+            .find(|(id, _)| id == client_message_id)
+            .map(|(_, outcome)| outcome)
+    }
+
     /// Whether the CLI's latest report on this session says it runs its own `auto` mode under the
     /// gate. False before any report, after a fallback to `default`, and on every session that did
     /// not ask for auto (none of which ever reports one).
@@ -1402,8 +1513,8 @@ impl AgentSessionProjection {
 
     /// The reducer: folds one event's effect into this projection, unconditionally bumping
     /// `last_revision` by exactly one regardless of whether the event has any other observable
-    /// effect (an event with a real revision but no other effect -- e.g. a `ContentDelta` with
-    /// `ContentKind::Thinking` -- is still a real, ordered occurrence a WebView bridge must be
+    /// effect (an event with a real revision but no other effect -- e.g. a `CliPermissionMode` or a
+    /// thinking delta with no text -- is still a real, ordered occurrence a WebView bridge must be
     /// able to skip past correctly when replaying from a revision, not something invisible to the
     /// counter). Pure and side-effect-free -- no I/O -- so it's trivially testable without
     /// spawning anything.
@@ -1411,7 +1522,7 @@ impl AgentSessionProjection {
     /// Ordering: an item created by this call takes `seq = self.last_revision` as read on entry --
     /// the value BEFORE the bump at the bottom. Two consequences the rest of the system relies on.
     /// (1) No two items ever share a `seq`, because no single event creates more than one item and
-    /// every call bumps the counter exactly once, so `seq` is a total order over all four
+    /// every call bumps the counter exactly once, so `seq` is a total order over all the
     /// collections. (2) Every `seq` is strictly less than `last_revision` afterwards, so a
     /// snapshot's `throughRevision` is a strict upper bound on the seqs inside it -- which is what
     /// lets the frontend seed its own counter from that number and never collide with an item the
@@ -1442,23 +1553,51 @@ impl AgentSessionProjection {
             AgentDomainEvent::TurnStarted { turn_id } => {
                 self.active_turn_id = Some(turn_id.clone());
                 self.assistant_message_open = false;
+                self.thinking_open = false;
                 self.last_turn_ending = None;
             }
             AgentDomainEvent::UserPromptSubmitted { text } => {
                 self.user_prompts.push(UserPromptRecord {
                     seq,
                     text: text.clone(),
+                    delivered: false,
                 });
                 // Anything that can only occur BETWEEN assistant messages closes the run. A prompt
                 // is the clearest such thing: without this, the reply to the next turn is appended
                 // to the reply to the last one and they render as a single message.
                 self.assistant_message_open = false;
+                self.thinking_open = false;
+            }
+            AgentDomainEvent::UserMessageDelivered {
+                client_message_id,
+                text,
+                ..
+            } => {
+                self.user_prompts.push(UserPromptRecord {
+                    seq,
+                    text: text.clone(),
+                    delivered: true,
+                });
+                // The agent read it between two of its own steps, so whatever it said before is over,
+                // and so is the thought: the next one sits below this prompt, not in the block above it.
+                self.assistant_message_open = false;
+                self.thinking_open = false;
+                self.note_steer_outcome(client_message_id, SteerOutcome::Delivered);
+            }
+            AgentDomainEvent::UserMessageDropped {
+                client_message_id,
+                reason,
+            } => {
+                self.note_steer_outcome(client_message_id, SteerOutcome::Dropped { reason: reason.clone() });
             }
             AgentDomainEvent::ContentDelta {
                 kind: ContentKind::Text,
                 text,
                 ..
             } => {
+                // The reply that follows a thought is a new thing on screen; the next thought is a new
+                // block.
+                self.thinking_open = false;
                 match self.transcript.last_mut() {
                     // Appending leaves `seq` alone: a message is ordered by where it started.
                     Some(open) if self.assistant_message_open => open.text.push_str(text),
@@ -1473,13 +1612,29 @@ impl AgentSessionProjection {
             }
             AgentDomainEvent::ContentDelta {
                 kind: ContentKind::Thinking,
-                ..
+                turn_id,
+                text,
             } => {
-                // No projection effect -- mirrors the pre-Phase-1 AgentSessionState::apply's
-                // identical treatment of `Thinking`. Still bumps last_revision (see fn doc).
+                // A delta with no text opens no block: an empty one would be a row that says nothing.
+                // It closes nothing either, and still bumps `last_revision` (see the doc above).
+                if !text.is_empty() {
+                    match self.thinking.last_mut() {
+                        // Appending leaves `seq` alone: a block is ordered by where it started.
+                        Some(open) if self.thinking_open => open.text.push_str(text),
+                        _ => {
+                            self.thinking.push(ThinkingBlock {
+                                seq,
+                                turn_id: turn_id.clone(),
+                                text: text.clone(),
+                            });
+                            self.thinking_open = true;
+                        }
+                    }
+                }
             }
             AgentDomainEvent::AssistantMessageBoundary { .. } => {
                 self.assistant_message_open = false;
+                self.thinking_open = false;
             }
             AgentDomainEvent::ToolCallStarted {
                 turn_id,
@@ -1490,6 +1645,7 @@ impl AgentSessionProjection {
                 // A tool call can only happen between assistant messages, so whatever text was
                 // streaming has ended; the text after it is a new message.
                 self.assistant_message_open = false;
+                self.thinking_open = false;
                 let denied = self.take_held_denial(tool_use_id);
                 let changed_input = self.take_held_changed_input(tool_use_id);
                 if self.call_index.covers == self.tool_calls.len() {
@@ -1531,6 +1687,7 @@ impl AgentSessionProjection {
                 provider_prompt,
             } => {
                 self.assistant_message_open = false;
+                self.thinking_open = false;
                 if let Some(id) = tool_use_id.as_deref().filter(|id| !id.is_empty()) {
                     if provider_prompt.is_none() {
                         self.remember_gate_input(id, input);
@@ -1580,6 +1737,7 @@ impl AgentSessionProjection {
                 }
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
+                self.thinking_open = false;
                 self.clear_held_for_calls();
                 // Conditional, where this arm used to assign unconditionally -- which is how the
                 // sidecar path's fabricated zero reached the projection in the first place. A turn
@@ -1619,6 +1777,7 @@ impl AgentSessionProjection {
                     self.record_lost_turn(seq);
                     self.active_turn_id = None;
                     self.assistant_message_open = false;
+                    self.thinking_open = false;
                     self.clear_held_for_calls();
                     self.status = ProjectionStatus::Unavailable {
                         reason: describe_failed_resume(
@@ -1634,6 +1793,7 @@ impl AgentSessionProjection {
                 self.record_lost_turn(seq);
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
+                self.thinking_open = false;
                 self.clear_held_for_calls();
                 self.status = ProjectionStatus::Unavailable { reason: reason.clone() };
             }
@@ -1641,6 +1801,7 @@ impl AgentSessionProjection {
                 self.record_lost_turn(seq);
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
+                self.thinking_open = false;
                 self.clear_held_for_calls();
                 self.status = ProjectionStatus::Closed { reason: reason.clone() };
             }
@@ -1669,6 +1830,7 @@ impl AgentSessionProjection {
                 }
             }
             AgentDomainEvent::BackgroundCalls { running } => self.background_calls = *running,
+            AgentDomainEvent::CommandsAvailable { commands } => self.available_commands = Some(commands.clone()),
             // The latest report wins: the agent states the whole window each time.
             AgentDomainEvent::AccountLimits {
                 used_percent,
@@ -1721,6 +1883,53 @@ impl AgentSessionProjection {
             }
         }
         self.last_revision += 1;
+    }
+}
+
+/// Whether the projection's thinking block is open after `event`, given whether it was before: what
+/// [`AgentSessionProjection::apply`] does to `thinking_open`, for a provider that has to know whether
+/// the thought it is about to send continues the block on screen or starts a new one.
+///
+/// One difference, on the safe side: a `ResumeOutcome` counts as closing, though one that attached to
+/// the session asked for leaves the block open. A provider that takes an open block for closed only
+/// leaves out a separator; one that took a closed block for open would start the next block with one.
+/// No wildcard arm, so a new event has to say which it is.
+pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
+    match event {
+        // An empty delta opens nothing and closes nothing.
+        AgentDomainEvent::ContentDelta {
+            kind: ContentKind::Thinking,
+            text,
+            ..
+        } => open || !text.is_empty(),
+        AgentDomainEvent::ContentDelta {
+            kind: ContentKind::Text,
+            ..
+        }
+        | AgentDomainEvent::TurnStarted { .. }
+        | AgentDomainEvent::UserPromptSubmitted { .. }
+        | AgentDomainEvent::UserMessageDelivered { .. }
+        | AgentDomainEvent::AssistantMessageBoundary { .. }
+        | AgentDomainEvent::ToolCallStarted { .. }
+        | AgentDomainEvent::PermissionRequested { .. }
+        | AgentDomainEvent::TurnCompleted { .. }
+        | AgentDomainEvent::ResumeOutcome { .. }
+        | AgentDomainEvent::SessionUnavailable { .. }
+        | AgentDomainEvent::SessionClosed { .. } => false,
+        AgentDomainEvent::SessionOpened { .. }
+        | AgentDomainEvent::ToolCallCompleted { .. }
+        | AgentDomainEvent::PermissionResolved { .. }
+        | AgentDomainEvent::PermissionModeChanged { .. }
+        | AgentDomainEvent::UngatedCliMode { .. }
+        | AgentDomainEvent::CliPermissionMode { .. }
+        | AgentDomainEvent::PermissionDenied { .. }
+        | AgentDomainEvent::PolicyMismatch { .. }
+        | AgentDomainEvent::BackgroundCalls { .. }
+        | AgentDomainEvent::AccountLimits { .. }
+        | AgentDomainEvent::ToolInputChanged { .. }
+        | AgentDomainEvent::CommandsAvailable { .. }
+        // Dropped changes nothing on screen: it only settles a queued message.
+        | AgentDomainEvent::UserMessageDropped { .. } => open,
     }
 }
 

@@ -31,39 +31,43 @@ export function resetTimeText(resetsAt: number, now: Date = new Date()): string 
  *  after a colon when it said anything; it is shown as it came (Rust already trimmed and capped it), and
  *  nothing here reads a reset time out of it -- if the CLI wrote one into its text, it is in the text.
  *  `resetsAt` is the reset time the ending kept from the account's limit reports, when the agent gave one (Codex
- *  does, Claude Code does not): a turn stopped by the usage limit says when it ends. */
-export function turnEndingText(ending: Wording, resetsAt: number | null = null): string {
+ *  does, Claude Code does not): a turn stopped by the usage limit says when it ends. `ranFor` is how long the
+ *  turn ran, already worded (`formatDuration`), when Rust stamped it: ` after 12s` follows the headline. */
+export function turnEndingText(ending: Wording, resetsAt: number | null = null, ranFor: string | null = null): string {
   const message = ending.message !== null && ending.message !== "" ? `: ${ending.message}` : "";
+  // How long the turn ran, said before the provider's own words so those stay the row's last line.
+  const after = ranFor === null ? "" : ` after ${ranFor}`;
+  const tail = `${after}${message}`;
   const reason = ending.reason ?? "";
   switch (ending.kind) {
     case "interrupted":
-      return "interrupted";
+      return `interrupted${after}`;
     case "lost":
-      return "the turn did not finish: the session ended";
+      return `the turn did not finish: the session ended${after}`;
     case "limit_reached":
     case "failed":
       break;
   }
-  if (CONTEXT_FULL.has(reason)) return `stopped: the context is full${message}`;
-  if (HOOK_STOPPED.has(reason)) return `stopped by a hook${message}`;
+  if (CONTEXT_FULL.has(reason)) return `stopped: the context is full${tail}`;
+  if (HOOK_STOPPED.has(reason)) return `stopped by a hook${tail}`;
   if (ending.kind === "limit_reached") {
-    if (reason === "max_turns") return `stopped at the turn limit${message}`;
-    if (SPENDING_LIMIT.has(reason)) return `stopped at the spending limit${message}`;
+    if (reason === "max_turns") return `stopped at the turn limit${tail}`;
+    if (SPENDING_LIMIT.has(reason)) return `stopped at the spending limit${tail}`;
     if (reason === "usage_limit") {
       const when = resetsAt !== null && Number.isFinite(resetsAt) ? ` (resets ${resetTimeText(resetsAt)})` : "";
-      return `stopped at the usage limit${when}${message}`;
+      return `stopped at the usage limit${when}${tail}`;
     }
-    if (reason === "rate_limited") return `rate limited${message}`;
-    return `stopped at a limit${reason !== "" ? ` (${reason})` : ""}${message}`;
+    if (reason === "rate_limited") return `rate limited${tail}`;
+    return `stopped at a limit${reason !== "" ? ` (${reason})` : ""}${tail}`;
   }
   // A 429 is where a usage or rate limit shows up: Verdandi reports it as an API error with that status.
-  if (ending.apiErrorStatus === 429) return `rate or usage limit reached (HTTP 429)${message}`;
-  if (NOT_AN_ERROR.has(reason)) return `the turn stopped (${reason})${message}`;
+  if (ending.apiErrorStatus === 429) return `rate or usage limit reached (HTTP 429)${tail}`;
+  if (NOT_AN_ERROR.has(reason)) return `the turn stopped (${reason})${tail}`;
   const named = [
     reason !== "" && reason !== "api_error" ? reason : null,
     ending.apiErrorStatus !== null ? `HTTP ${ending.apiErrorStatus}` : null,
   ].filter((part): part is string => part !== null);
-  return `the turn ended with an error${named.length > 0 ? ` (${named.join(", ")})` : ""}${message}`;
+  return `the turn ended with an error${named.length > 0 ? ` (${named.join(", ")})` : ""}${tail}`;
 }
 
 /** The band's few words for the latest ending; the row has the detail. */

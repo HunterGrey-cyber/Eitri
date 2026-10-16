@@ -51,7 +51,7 @@ describe("composer keys", () => {
   it("grows the box to its content, at most 40% of the panel", () => {
     expect(growHeight(60, 1000)).toBe(60);
     expect(growHeight(900, 1000)).toBe(400);
-    expect(growHeight(10, 1000), "never below the old floor").toBe(44);
+    expect(growHeight(20, 1000), "one line stays one line").toBe(20);
   });
 
   it("puts the queue back ahead of what is in the box, blank-line separated", () => {

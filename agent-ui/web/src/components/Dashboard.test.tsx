@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
-import { DASH_ITEM_KEY, Dashboard, MODE_CONSEQUENCE, dashItems } from "./Dashboard";
+import { DASH_ITEM_KEY, Dashboard, MODE_CONSEQUENCE, dashItems, modeConsequence } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import type { EditorLink, Hello, PermissionModeChoice, ResumableSession } from "../types";
 
@@ -29,7 +29,7 @@ function session(over: Partial<ResumableSession> = {}): ResumableSession {
 }
 
 function renderDash(
-  over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void; prefix?: string; editorLink?: EditorLink | null; agent?: string | null } = {},
+  over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void; editorLink?: EditorLink | null; agent?: string | null } = {},
 ) {
   const onItem = over.onItem ?? vi.fn();
   const props = {
@@ -38,7 +38,6 @@ function renderDash(
     cursor: over.cursor ?? 0,
     narrow: over.narrow ?? false,
     onItem,
-    prefix: over.prefix ?? "Ctrl+b",
     editorLink: over.editorLink ?? null,
     agent: over.agent ?? null,
   };
@@ -47,20 +46,20 @@ function renderDash(
 
 describe("dashItems", () => {
   it("omits resume with no records", () => {
-    expect(dashItems(HELLO)).toEqual(["new", "sessions", "mode", "keys"]);
+    expect(dashItems(HELLO)).toEqual(["new", "sessions", "keys"]);
   });
   it("offers resume once a record exists", () => {
     const withRecord: Hello = { ...HELLO, resumableSessions: [session()] };
-    expect(dashItems(withRecord)).toEqual(["new", "resume", "sessions", "mode", "keys"]);
+    expect(dashItems(withRecord)).toEqual(["new", "resume", "sessions", "keys"]);
   });
 });
 
 describe("dashItems: restoring the last window's tabs", () => {
   const OFFER = { labels: ["api", "docs"], bypass: 0 };
   it("offers restore right after new, and only with something to bring back", () => {
-    expect(dashItems({ ...HELLO, restore: OFFER })).toEqual(["new", "restore", "sessions", "mode", "keys"]);
+    expect(dashItems({ ...HELLO, restore: OFFER })).toEqual(["new", "restore", "sessions", "keys"]);
     expect(dashItems({ ...HELLO, resumableSessions: [session()], restore: OFFER })).toEqual([
-      "new", "restore", "resume", "sessions", "mode", "keys",
+      "new", "restore", "resume", "sessions", "keys",
     ]);
   });
   it("never draws a dead key: no offer, a null one or an empty one shows nothing", () => {
@@ -112,7 +111,7 @@ describe("Dashboard: the restore line", () => {
 
 describe("MODE_CONSEQUENCE", () => {
   /** Auto's text describes the acceptEdits fast path used by this build's policy. The bypass text
-   *  is unchanged. */
+   *  is unchanged. `KeymapOverlay` shows these descriptions in the `?` sheet. */
   it("says what manual, auto and bypass actually do", () => {
     expect(MODE_CONSEQUENCE.manual).toBe("Safe reads run; every edit and anything else asks.");
     expect(MODE_CONSEQUENCE.auto).toBe("Edits in this project and safe reads run; anything else asks.");
@@ -141,11 +140,11 @@ describe("Dashboard", () => {
     expect(queryByText(/sidecar/)).toBeNull();
   });
 
-  it("draws every item with its key letter; mode reads ⇧Tab, not a letter", () => {
+  it("draws every item with its key letter, and no mode row", () => {
     const withRecord: Hello = { ...HELLO, resumableSessions: [session()] };
     const { container } = renderDash({ hello: withRecord });
     const items = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
-    expect(items.map((el) => el.querySelector(".dash-key")!.textContent)).toEqual(["i", "r", "w", "⇧Tab", "?"]);
+    expect(items.map((el) => el.querySelector(".dash-key")!.textContent)).toEqual(["i", "r", "w", "?"]);
   });
 
   it("shows the newest record's title, muted, next to Resume last", () => {
@@ -161,41 +160,43 @@ describe("Dashboard", () => {
     expect(muted.textContent).not.toContain("older");
   });
 
-  it("draws Mode: auto with a .mode-glyph", () => {
-    const { container, getByText } = renderDash({ mode: "auto" });
-    getByText(/Mode: auto/);
-    const glyph = container.querySelector(".mode-glyph")!;
-    expect(glyph).not.toBeNull();
-    expect(glyph.getAttribute("data-mode-name")).toBe("auto");
-    expect(glyph.textContent).toBe("⏵⏵");
+  /* The start screen omits extra hints. The status band under it names the mode, and
+     the `?` sheet (the last item) says what a mode does, what a message carries and the window's keys. */
+  it("draws nothing but the name, the where-line and the items: no mode row and no notes under them", () => {
+    for (const mode of ["auto", "bypass"] as const) {
+      const { container, unmount } = renderDash({ mode });
+      expect(container.querySelector(".mode-glyph")).toBeNull();
+      expect(container.textContent).not.toMatch(/Mode:/);
+      for (const gone of [".dash-consequence", ".dash-context", ".dash-hint"]) {
+        expect(container.querySelector(gone), gone).toBeNull();
+      }
+      expect(container.textContent).not.toContain(MODE_CONSEQUENCE[mode]);
+      expect(Array.from(container.querySelector(".dashboard")!.children).map((el) => el.className)).toEqual([
+        "dash-title",
+        "dash-where",
+        "dash-items",
+      ]);
+      unmount();
+    }
   });
 
-  it("draws the consequence line for auto and bypass, and none for an unknown mode", () => {
-    const { getByText } = renderDash({ mode: "auto" });
-    getByText("Edits in this project and safe reads run; anything else asks.");
-    const bypass = renderDash({ mode: "bypass" });
-    bypass.getByText("Nothing asks: edits and commands run unasked.");
-    const unknown = renderDash({ mode: "future-mode" as PermissionModeChoice });
-    expect(unknown.container.querySelector(".dash-consequence")).toBeNull();
-  });
-
-  it("draws Mode: manual with its own quiet glyph and says every edit asks", () => {
-    const { container, getByText } = renderDash({ mode: "manual" });
-    getByText(/Mode: manual/);
-    expect(container.querySelector(".mode-glyph")!.getAttribute("data-mode-name")).toBe("manual");
-    getByText("Safe reads run; every edit and anything else asks.");
-  });
-
-  it("on another agent's tab, manual says what reaches Eitri and where the rest is described", () => {
-    const { getByText } = renderDash({ mode: "manual", agent: "codex" });
-    getByText("Every request codex makes asks; what it runs without asking is in Ctrl+b i.");
+  /* Manual's consequence (2026-10-14) is said where the other modes' are since 2026-10-15, the `?` sheet;
+     the start screen draws no mode row (the band names the mode). */
+  it("says every edit asks in manual, and on another agent's tab only what reaches Eitri", () => {
+    const { container } = renderDash({ mode: "manual" });
+    expect(container.textContent).not.toMatch(/Mode:/);
+    expect(modeConsequence("manual", null, "Ctrl+b")).toBe("Safe reads run; every edit and anything else asks.");
+    expect(modeConsequence("manual", "codex", "Ctrl+b")).toBe(
+      "Every request codex makes asks; what it runs without asking is in Ctrl+b i.",
+    );
+    expect(modeConsequence("auto", "codex", "Ctrl+b")).toBe(MODE_CONSEQUENCE.auto);
   });
 
   it("marks the item under cursor with aria-current, and nothing else", () => {
     const withRecord: Hello = { ...HELLO, resumableSessions: [session()] };
     const { container } = renderDash({ hello: withRecord, cursor: 2 });
     const items = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
-    expect(items.map((el) => el.getAttribute("aria-current"))).toEqual([null, null, "true", null, null]);
+    expect(items.map((el) => el.getAttribute("aria-current"))).toEqual([null, null, "true", null]);
   });
 
   it("items are div role=button with tabIndex=-1, never a real <button>", () => {
@@ -218,95 +219,23 @@ describe("Dashboard", () => {
   });
 });
 
-/** every turn carries what the editor is showing, and this
- *  is where a person picks the mode and starts a session, so it says what goes with each message. What
- *  goes is the editor's file name, or the lines selected in Visual mode -- never the file's text and
- *  never the cursor (`core/src/editor_context/feed.rs` parses `line` and drops it), so the sentence
- *  names those two and nothing else. It is a fact about every turn, not about the mode. */
-describe("Dashboard's context line", () => {
-  const CONTEXT_LINE = "Each message also sends the editor's file name, or the lines you selected there in Visual mode.";
-
-  it("says what each message carries from the editor, once, for auto and bypass", () => {
-    for (const mode of ["auto", "bypass"] as const) {
-      const { container } = renderDash({ mode });
-      const lines = container.querySelectorAll(".dash-context");
-      expect(lines).toHaveLength(1);
-      expect(lines[0].textContent).toBe(CONTEXT_LINE);
-    }
-  });
-
-  it("is drawn under the consequence line and above the first-run hint, which stays last", () => {
-    const { container } = renderDash({ mode: "auto" });
-    const consequence = container.querySelector(".dash-consequence")!;
-    const context = container.querySelector(".dash-context")!;
-    const hint = container.querySelector(".dash-hint")!;
-    expect(consequence.nextElementSibling).toBe(context);
-    expect(context.nextElementSibling).toBe(hint);
-    expect(hint.nextElementSibling).toBeNull();
-  });
-
-  it("does not hinge on the mode: a mode with no consequence line still says it", () => {
-    const { container } = renderDash({ mode: "future-mode" as PermissionModeChoice });
-    expect(container.querySelector(".dash-consequence")).toBeNull();
-    expect(container.querySelector(".dash-context")!.textContent).toBe(CONTEXT_LINE);
-  });
-
-  it("is drawn in a narrow panel too, in the same words", () => {
-    const { container } = renderDash({ narrow: true });
-    expect(container.querySelector(".dash-context")!.textContent).toBe(CONTEXT_LINE);
-  });
-});
-
-describe("Dashboard's first-run hint line", () => {
-  it("shows the stock Ctrl+b prefix by default", () => {
-    const { container } = renderDash();
-    const hint = container.querySelector(".dash-hint")!;
-    expect(hint.textContent).toBe(
-      "Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · Ctrl+b  window keys · ?  all keys",
-    );
-  });
-
-  it("reads a configured prefix instead", () => {
-    const { container } = renderDash({ prefix: "Ctrl+a" });
-    const hint = container.querySelector(".dash-hint")!;
-    expect(hint.textContent).toBe(
-      "Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · Ctrl+a  window keys · ?  all keys",
-    );
-  });
-
-  it("is drawn on every render, not gated behind any first-run state", () => {
-    // Show the hint on every empty tab. No first-run state or seen-before prop is needed.
-    const first = renderDash();
-    expect(first.container.querySelector(".dash-hint")).not.toBeNull();
-    const second = renderDash();
-    expect(second.container.querySelector(".dash-hint")).not.toBeNull();
-  });
-});
-
-describe("Dashboard: companion hint and context lines", () => {
-  const HINT = "Ctrl+h / Ctrl+l  leave the panel · i or Ctrl+j  type · ctrl+c  interrupt · Ctrl+b  tab keys · ?  all keys";
-
-  it("companion hint and context lines, with an editor attached", () => {
-    const { container } = renderDash({ editorLink: { state: "attached", text: "" } });
-    expect(container.querySelector(".dash-hint")!.textContent).toBe(HINT);
-    expect(container.querySelector(".dash-context")!.textContent).toBe(
-      "Each message also sends the file open in your nvim, or the lines you selected there in Visual mode.",
-    );
-  });
-
-  it("companion hint and context lines, with no editor attached", () => {
+/** A companion window with no editor attached is the one case the start screen says a line under its items:
+ *  it is something to fix (attach an editor), not something to learn, so it is said where it is seen. With
+ *  an editor attached, or in the one-window mode, nothing is said. */
+describe("Dashboard: the companion line", () => {
+  it("says how to attach an editor while none is attached", () => {
     for (const state of ["none", "attaching", "detached", "failed"] as const) {
       const { container, unmount } = renderDash({ editorLink: { state, text: "x" } });
-      expect(container.querySelector(".dash-hint")!.textContent).toBe(HINT);
       expect(container.querySelector(".dash-context")!.textContent).toBe(
         "No editor is attached: run :EitriPanel in nvim to send its file with each message.",
       );
+      expect(container.querySelector(".dash-hint")).toBeNull();
       unmount();
     }
   });
 
-  it("reads a configured prefix in the companion hint", () => {
-    const { container } = renderDash({ prefix: "Ctrl+a", editorLink: { state: "attached", text: "" } });
-    expect(container.querySelector(".dash-hint")!.textContent).toContain("Ctrl+a  tab keys");
+  it("says nothing with an editor attached, or in the one-window mode", () => {
+    expect(renderDash({ editorLink: { state: "attached", text: "" } }).container.querySelector(".dash-context")).toBeNull();
+    expect(renderDash({ editorLink: null }).container.querySelector(".dash-context")).toBeNull();
   });
 });

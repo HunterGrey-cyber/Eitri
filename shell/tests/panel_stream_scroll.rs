@@ -10,6 +10,9 @@
 //!
 //! Each scenario runs on 560x740 and 519x480 CSS-px panels at zoom 1.0 and 1.5.
 //! The window size is the CSS size times the zoom.
+//! A 1280x800 panel at zoom 1.0 also checks a reply that fills a wide window.
+//! Its opening code block (`WIDE_CODE`) grows with its long lines, from a 36rem minimum
+//! up to the row's width. The block uses `width: max-content` and `max-width: 100%`.
 //!
 //! S1 checks following with no input. A scroll event that reports a lower `scrollTop` must
 //! leave the list at its true bottom: without input, a drop is either a bottom clamp or a bug.
@@ -49,9 +52,10 @@
 //!
 //! S9 changes layout four times after the turn ends while the view is following at the bottom.
 //! The changes are a second apart and have no streaming state change to trigger a snap.
-//! The window narrows to `S9_NARROW` of its width, then shortens to `S9_SHORTEN`
-//! of its height. A theme envelope raises the font size through `serialize_theme_for_js`.
-//! Setting `--prose-measure` to `S9_PROSE_MEASURE` on `:root` changes only the rows.
+//! The window narrows to `S9_NARROW` of its width, capped at `S9_NARROWED_MAX_CSS_PX`,
+//! then shortens to `S9_SHORTEN` of its height. A theme envelope raises the font size
+//! through `serialize_theme_for_js`. Setting `--page-pad` to `S9_PAGE_PAD` on
+//! `.message-list` narrows only the rows; the foot keeps the page's margin.
 //! Each change must return the view to the end by the second sampled frame
 //! (`S9_MAX_SHORT_FRAMES`) and keep it there. Snapping only on state changes misses these resizes.
 //!
@@ -80,8 +84,10 @@
 //! S7 requires a cancelled wheel at the bottom, a new row that leaves the view short without
 //! wheel movement, and `S7_MIN_PAUSE_MS` of silence. S8 requires its wheel while following
 //! with a screen of growth left. S9 requires each change to move the end by at least `HIDDEN_PX`
-//! and each resize to change the list's box. Each long token must exceed the list's width
-//! when measured on one line in its rendered font.
+//! and each resize to change the list's box. Except on the 1280x800 panel, each long token must
+//! exceed the list's width when measured on one line in its rendered font.
+//! On the 1280x800 panel, the code block must grow at least `WIDE_MIN_OVER_PX` past
+//! its 36rem minimum. On every panel, the code block must never become wider than its row.
 //! Missing a trigger fails as "did not exercise the trigger". A reading point between paragraphs
 //! can resolve to the row body, whose offset tracks only `scrollTop`; the scroll checks still cover it.
 //!
@@ -95,7 +101,7 @@
 //! the intended size. The test uses a plain `main` (`harness = false`) because GTK needs the main thread.
 //! Frame and scroll traces go to `$PANEL_STREAM_SCROLL_TRACE_DIR`, defaulting to
 //! `<target tmp>/panel_stream_scroll/`. `PANEL_STREAM_SCROLL_ONLY=S1,S2` selects scenarios.
-//! The configuration matrix is fixed. Each run takes about 15s, with thirty-six runs.
+//! The configuration matrix is fixed. Each run takes about 15s, with forty-five runs.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -183,9 +189,28 @@ const LIVE_COMMAND: &str =
 /// this one is exactly as long as the old one.
 const LONG_PATH: &str =
     "/nonexistent/outside-the-project/a/deeply/nested/directory/with/no/space/in/it/src/components/MessageList.tsx";
+/// The streamed reply's opening: a fenced block whose lines grow, a delta at a time, from a few
+/// characters to wider than the 1280x800 panel's row, so there the block's `width: max-content` box
+/// widens past its 36rem minimum while the view follows, then stops at the row's width
+/// (`max-width: 100%`) and scrolls inside itself; on the narrow panels it scrolls inside the row from its
+/// first long line. Either way the conversation itself must not scroll sideways, and the view must stay
+/// at its end.
+const WIDE_CODE: &str = "The call site as it reads now:\n\n```rust\n\
+let request = Request::builder().uri(endpoint).header(\"x-trace\", trace_id).body(payload).expect(\"a request\");\n\
+let response = client.send(request).await.map_err(|error| Error::Transport { endpoint: endpoint.to_string(), source: error })?;\n\
+let decoded: Vec<Record> = serde_json::from_slice(&response.into_body().collect().await?.to_bytes()).map_err(Error::Decode)?;\n\
+for record in decoded.iter().filter(|record| record.kind == Kind::Changed && record.revision > last_seen_revision && !record.tombstone) { apply(record)?; }\n\
+```\n\n";
 /// A URL in an earlier reply's prose, which `marked` turns into a link.
 const LONG_URL: &str =
     "https://docs.example.com/reference/a/long/path/with/no/space/in/it/anywhere/index.html?query=abcdefghijklmnopqrstuvwxyz";
+/// A panel at least this wide is the whole-window configuration: the three long tokens fit on one line
+/// there, so the long-line code block is what exercises the sideways check.
+const WIDE_LAYOUT_PX: f64 = 1100.0;
+/// The whole-window vacuity guard: the code block must have grown at least this far past its minimum width.
+const WIDE_MIN_OVER_PX: f64 = 40.0;
+/// How far a code block may exceed its row's width: sub-pixel rounding, nothing more.
+const WIDE_PAST_ROW_PX: f64 = 1.0;
 /// How far `.message-list`'s content may reach past its own width: sub-pixel rounding, nothing more.
 const SIDEWAYS_PX: f64 = 1.0;
 /// S9: idle ticks after each of its four changes (about 1s).
@@ -193,12 +218,31 @@ const S9_PAUSE_TICKS: usize = 30;
 /// S9: the window's width and then height, as fractions of the configuration's own.
 const S9_NARROW: f64 = 0.62;
 const S9_SHORTEN: f64 = 0.75;
+/// S9: and a narrowed window no wider than this many CSS px, so the whole-window panel (1280px, where
+/// 62% is still a wide panel) is cut down to a side panel's width, as a divider dragged across most of the
+/// window does. 62% of the other configurations is under it.
+const S9_NARROWED_MAX_CSS_PX: f64 = 400.0;
+
+/// The CSS width S9's resize asks for: `fraction` of the configuration's own, capped at
+/// `S9_NARROWED_MAX_CSS_PX` when it narrows.
+fn s9_narrowed_css_width(config: Config, fraction: f64) -> f64 {
+    let width = f64::from(config.width) * fraction;
+    if fraction < 1.0 {
+        width.min(S9_NARROWED_MAX_CSS_PX)
+    } else {
+        width
+    }
+}
 /// S9: the panel font size the theme push sets (Rust's default is 14px).
 const S9_FONT_SIZE_PX: f32 = 18.0;
-/// S9: the documented prose-measure knob, set narrower than any configuration's rows -- after the
-/// narrowing and the font push, which is when it is applied. (30ch was not: at 18px it is wider than a
-/// 347px panel's row, and moved nothing, found by the vacuity guard.)
-const S9_PROSE_MEASURE: &str = "16ch";
+/// S9: the side margin (`--page-pad`) set on the list element alone, after the narrowing and the font
+/// push, which is when it is applied: 64px each side takes about 128px from rows that are 300-330px
+/// wide. Set on the list rather than `:root`, so the foot, which reads the same variable, keeps its
+/// margin and the list's own box does not change: only the rows do, which is the case the observer
+/// watches the rows for. It replaces `--column-w` (the centred column, gone 2026-10-14) and, before that,
+/// `--prose-measure`, which sizes only the sign-column grid outside the conversation, so setting it
+/// moved nothing and the vacuity guard said so.
+const S9_PAGE_PAD: &str = "64px";
 /// S9: how many sampled frames after each change may show the view short of its end. One: the
 /// instrument samples in `requestAnimationFrame`, which runs before the rendering update's layout and
 /// `ResizeObserver` callbacks, so the first frame after a change reads the new layout under the old
@@ -230,11 +274,14 @@ const fn config(width: i32, height: i32, zoom: f64) -> Config {
     Config { width, height, zoom }
 }
 
-const CONFIGS: [Config; 4] = [
+const CONFIGS: [Config; 5] = [
     config(560, 740, 1.0),
     config(560, 740, 1.5),
     config(519, 480, 1.0),
     config(519, 480, 1.5),
+    // The whole window: the rows fill 1280px and a reply's code block can reach the row's width. Zoom 1.0 only -- at 1.5 the window would be
+    // the Xvfb screen's full 1920x1200, with nothing left for a window manager's rounding.
+    config(1280, 800, 1.0),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,7 +444,7 @@ enum Step {
         height: f64,
     },
     /// S9: a script run in the page as it stands, outside the dispatch path -- what the GUI pass did
-    /// through the inspector to set `--prose-measure`.
+    /// through the inspector to restyle the conversation.
     Script(String),
 }
 
@@ -500,6 +547,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: ProjectionRef::Borrowed(&projection),
@@ -563,8 +611,8 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
             })
             .collect()
     };
-    // Message 1, rich markdown, about 3.6s of deltas.
-    for group in ticks_of(&rich_reply(7, 5400), &mut rng) {
+    // Message 1, a fenced block of long lines and then rich markdown, about 4s of deltas.
+    for group in ticks_of(&format!("{WIDE_CODE}{}", rich_reply(7, 5400)), &mut rng) {
         batch(text_batch(group), &mut steps);
     }
     for _ in 0..quiet_before_tool_ticks {
@@ -628,7 +676,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
         steps.push(Step::Dispatch(serialize_theme_for_js(&bigger)));
         pause(&mut steps);
         steps.push(Step::Script(format!(
-            "window.__mark('restyle'); document.documentElement.style.setProperty('--prose-measure', '{S9_PROSE_MEASURE}');"
+            "window.__mark('restyle'); document.querySelector('.message-list').style.setProperty('--page-pad', '{S9_PAGE_PAD}');"
         )));
         pause(&mut steps);
     }
@@ -670,7 +718,8 @@ const INSTRUMENT: &str = r#"
 (() => {
   const SCENARIO = "__SCENARIO__";
   const P = { scenario: SCENARIO, frames: [], scrolls: [], marks: [], park: null, rearms: 0, listChanges: 0,
-              firstText: null, lastText: null, viewport: null, focused: null, swipe: null, gesture: null };
+              firstText: null, lastText: null, viewport: null, focused: null, swipe: null, gesture: null,
+              wide: null };
   const now = () => Math.round(performance.now() * 10) / 10;
   const mark = (name, extra) => P.marks.push(Object.assign({ t: now(), mark: name }, extra || {}));
   // S9's own steps mark themselves through this; a window resize marks itself below.
@@ -848,8 +897,29 @@ const INSTRUMENT: &str = r#"
       }
       f.st = l.scrollTop; f.sh = l.scrollHeight; f.ch = l.clientHeight;
       f.sw = l.scrollWidth; f.cw = l.clientWidth;
+      // The whole-window vacuity guard and the block's cap: how far the streamed reply's long-line code
+      // block grew past its 36rem minimum (`over`), and how far past its row it ever was (`pastRow`), at
+      // most each, over the run. `rem` is the root's font size, which the panel sets from its text size.
+      const code = Array.from(l.querySelectorAll(".row-assistant .code-block"))
+        .find((b) => (b.textContent || "").includes("Request::builder()"));
+      const body = code ? code.closest(".row-body") : null;
+      if (code && body) {
+        const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 14;
+        const w = code.getBoundingClientRect().width;
+        const rowW = body.getBoundingClientRect().width;
+        const over = Math.round((w - Math.min(rowW, 36 * rem)) * 10) / 10;
+        const pastRow = Math.round((w - rowW) * 10) / 10;
+        if (P.wide === null) P.wide = { t: f.t, over, pastRow, row: Math.round(rowW) };
+        else {
+          if (over > P.wide.over) P.wide = { ...P.wide, t: f.t, over, row: Math.round(rowW) };
+          if (pastRow > P.wide.pastRow) P.wide.pastRow = pastRow;
+        }
+      }
       const lr = l.getBoundingClientRect();
-      const hit = document.elementFromPoint(lr.left + 60, lr.top + 40);
+      // The reading point: 80px from the list's edge, which is inside the text at every width (the side
+      // margin is at most 40px and the sign cell about 21px more), and 40px below the list's top.
+      const readX = lr.left + 80;
+      const hit = document.elementFromPoint(readX, lr.top + 40);
       if (hit && l.contains(hit)) {
         const block = hit.closest("p, li, pre, h1, h2, h3, h4, table, .tool-call, .row-body") || hit;
         f.rk = block.tagName + ":" + (block.textContent || "").slice(0, 48);
@@ -972,7 +1042,7 @@ fn run_one(config: Config, scenario: Scenario, replay: &Replay) -> Result<Value,
                 Step::Dispatch(p) => Action::Dispatch(p.clone()),
                 Step::Idle => Action::Idle,
                 Step::Resize { width, height } => Action::Resize(
-                    (f64::from(window_width) * width).round() as i32,
+                    (s9_narrowed_css_width(config, *width) * config.zoom).round() as i32,
                     (f64::from(window_height) * height).round() as i32,
                 ),
                 Step::Script(js) => Action::Script(js.clone()),
@@ -1107,6 +1177,9 @@ struct Probe {
     gesture: Option<Value>,
     /// The sideways check's three long tokens, each measured on one line against the list's width.
     tokens: Option<Value>,
+    /// The streamed reply's `WIDE_CODE` block: how far it grew past its minimum width (`over`, the
+    /// largest and when), and how far past its row it ever was (`pastRow`).
+    wide: Option<Value>,
     rearms: u64,
     list_changes: u64,
     /// The page's size when the turn started (`viewport` is read at the end of the run).
@@ -1169,6 +1242,7 @@ impl Probe {
             swipe: v.get("swipe").filter(|p| !p.is_null()).cloned(),
             gesture: v.get("gesture").filter(|p| !p.is_null()).cloned(),
             tokens: v.get("tokens").filter(|p| !p.is_null()).cloned(),
+            wide: v.get("wide").filter(|p| !p.is_null()).cloned(),
             rearms: v["rearms"].as_u64().unwrap_or(0),
             list_changes: v["listChanges"].as_u64().unwrap_or(0),
             first_text: num(v, "firstText"),
@@ -1284,7 +1358,8 @@ fn judge(config: Config, scenario: Scenario, probe: &Probe) -> Verdict {
             last.sh.unwrap()
         ));
     }
-    judge_sideways(probe, t_start, &mut v);
+    judge_sideways(config, probe, t_start, &mut v);
+    judge_wide_layout(config, probe, &mut v);
 
     // --- S1(a): an unrequested drop that leaves the view off the bottom ---------------------------
     let drops_off_bottom = |from: f64| -> Vec<String> {
@@ -1786,15 +1861,17 @@ fn judge_s8(config: Config, probe: &Probe, t_end: f64, v: &mut Verdict) {
 /// scrolls on both axes, so ANY descendant whose text cannot wrap -- a `<pre>` left at the UA's
 /// `white-space: pre`, a path or URL with no space in it -- makes the whole conversation, sign column
 /// and all, scroll horizontally. Vacuous unless the replay's three long tokens really are wider than
-/// the list when laid out on one line.
+/// the list when laid out on one line -- except on the whole-window panel, where they fit and the
+/// streamed reply's long-line code block (`judge_wide_layout`) is what could push the list sideways.
 ///
 /// One frame per width change is not judged: the frame whose `clientWidth` differs from the frame
 /// before it. The instrument samples in `requestAnimationFrame`, which runs before the rendering
-/// update's layout and `ResizeObserver` callbacks -- so that frame reads a layout still carrying the
-/// OLD `--list-inline-size`, which `MessageList`'s observer rewrites before the frame is painted. S9's
-/// narrowing showed exactly that on the fixed build: one frame 201px wide at the new width, the next
-/// one flush. A stale width that stayed would show in the frame after it, which IS judged.
-fn judge_sideways(probe: &Probe, t_start: f64, v: &mut Verdict) {
+/// update's layout and `ResizeObserver` callbacks -- so that frame can read a layout from before the
+/// resize under the new width. (Until 2026-10-13 that was the old `--list-inline-size`, a width
+/// `MessageList`'s observer wrote; S9's narrowing showed one frame 201px wide at the new width and the
+/// next one flush. Nothing writes a width any more, and the frame stays unjudged.) A stale width that
+/// stayed would show in the frame after it, which IS judged.
+fn judge_sideways(config: Config, probe: &Probe, t_start: f64, v: &mut Verdict) {
     let mut previous_width: Option<f64> = None;
     let widths: Vec<(&Frame, f64)> = probe
         .frames
@@ -1821,6 +1898,11 @@ fn judge_sideways(probe: &Probe, t_start: f64, v: &mut Verdict) {
             f.t - t_start
         ));
     }
+    // On the whole-window panel the three tokens fit on one line, so they cannot be what exercises the
+    // check there: the long-line code block is, and `judge_wide_layout` holds the run to it instead.
+    if f64::from(config.width) >= WIDE_LAYOUT_PX {
+        return;
+    }
     let Some(tokens) = &probe.tokens else {
         v.vacuous.push("the long tokens were never measured".into());
         return;
@@ -1838,9 +1920,34 @@ fn judge_sideways(probe: &Probe, t_start: f64, v: &mut Verdict) {
     }
 }
 
+/// The streamed reply's long-line code block: it is never wider than its row (every configuration), and
+/// on the panel given the whole window (`config.width >= WIDE_LAYOUT_PX`) the run is vacuous unless the
+/// block really grew past its minimum width while the view followed it -- the `width: max-content` rule
+/// this configuration exists for. On a narrower panel its growth is only reported.
+fn judge_wide_layout(config: Config, probe: &Probe, v: &mut Verdict) {
+    let over = probe.wide.as_ref().and_then(|w| num(w, "over"));
+    let past_row = probe.wide.as_ref().and_then(|w| num(w, "pastRow"));
+    v.lines.push(format!(
+        "code block: grew {} past its minimum width, at most {} past its row",
+        over.map_or("nothing (not found)".to_string(), |o| format!("{o:.0}px")),
+        past_row.map_or("(not found)".to_string(), |o| format!("{o:.0}px"))
+    ));
+    if let Some(p) = past_row.filter(|p| *p > WIDE_PAST_ROW_PX) {
+        v.failures.push(format!(
+            "code block: the long-line block was {p:.0}px wider than its row (max-width: 100% must hold it to the row)"
+        ));
+    }
+    if f64::from(config.width) >= WIDE_LAYOUT_PX && over.is_none_or(|o| o < WIDE_MIN_OVER_PX) {
+        v.vacuous.push(format!(
+            "the {}px panel never drew the long-line code block wider than its minimum width (at most {over:?}px)",
+            config.width
+        ));
+    }
+}
+
 /// S9 changes layout after the turn ends while the view follows at the bottom.
 /// The window narrows so the reply reflows taller, then shortens the list's box. A theme
-/// envelope raises the font size, and `--prose-measure` narrows only the rows. After each,
+/// envelope raises the font size, and `--page-pad` on the list narrows only the rows. After each,
 /// at most `S9_MAX_SHORT_FRAMES` sampled frames may show the view short of the end.
 /// It must then stay at the end until the next change. Snapping only on state changes
 /// leaves the view short while nothing streams.
@@ -1872,7 +1979,7 @@ fn judge_s9(probe: &Probe, t_end: f64, v: &mut Verdict) {
         "narrowed the window",
         "shortened the window",
         "raised the font size",
-        "narrowed the prose measure",
+        "widened the list's side margin",
     ];
     for (i, &(t, kind)) in triggers.iter().enumerate() {
         let until = triggers.get(i + 1).map_or(f64::MAX, |(next, _)| *next);
@@ -2258,11 +2365,70 @@ fn judge_self_test() -> Result<usize, String> {
         ran += 1;
     }
     let v = s9(S9Shape::RestyleMovesNothing);
-    if v.vacuous.len() != 1 || !v.vacuous[0].contains("narrowed the prose measure moved the list's end only") {
+    if v.vacuous.len() != 1 || !v.vacuous[0].contains("widened the list's side margin moved the list's end only") {
         return Err(format!(
             "S9: a restyle that moves nothing must be the one vacuity finding; failures {:?}, vacuous {:?}",
             v.failures, v.vacuous
         ));
+    }
+    ran += 1;
+
+    // The code block's guards: on the whole-window panel a block that never grew past its minimum width
+    // (or was never found) leaves the run unexercised; one that did is fine; a narrow panel is not
+    // judged for growth; and a block wider than its row fails on any panel.
+    let wide_findings = |width: i32, wide: Value| {
+        let mut v = Verdict {
+            lines: Vec::new(),
+            failures: Vec::new(),
+            vacuous: Vec::new(),
+        };
+        judge_wide_layout(
+            Config {
+                width,
+                height: 800,
+                zoom: 1.0,
+            },
+            &Probe::parse(&json!({ "wide": wide })),
+            &mut v,
+        );
+        (v.vacuous.len(), v.failures.len())
+    };
+    let cases = [
+        (1280, Value::Null, (1, 0)),
+        (
+            1280,
+            json!({ "t": 1.0, "over": 0.0, "pastRow": -600.0, "row": 1195 }),
+            (1, 0),
+        ),
+        (
+            1280,
+            json!({ "t": 1.0, "over": 224.0, "pastRow": 0.0, "row": 1195 }),
+            (0, 0),
+        ),
+        (
+            1280,
+            json!({ "t": 1.0, "over": 224.0, "pastRow": 40.0, "row": 1195 }),
+            (0, 1),
+        ),
+        (560, Value::Null, (0, 0)),
+        (
+            560,
+            json!({ "t": 1.0, "over": 0.0, "pastRow": 0.5, "row": 500 }),
+            (0, 0),
+        ),
+        (
+            560,
+            json!({ "t": 1.0, "over": 0.0, "pastRow": 30.0, "row": 500 }),
+            (0, 1),
+        ),
+    ];
+    for (width, wide, want) in cases {
+        let got = wide_findings(width, wide.clone());
+        if got != want {
+            return Err(format!(
+                "the code-block guard at {width}px with {wide}: {got:?} (vacuity, failure) findings, want {want:?}"
+            ));
+        }
     }
     ran += 1;
     Ok(ran)
@@ -2306,7 +2472,10 @@ const CTRL_E_Y_PROBE: &str = r#"
 })();
 "#;
 
-/// A history long enough to scroll (five rows: a prompt, a `Bash` tool call, four more prompts),
+/// Extra single-line prompts in `ctrl_e_y_replay`, enough that the history is taller than the panel.
+const FILLER_ROWS: usize = 14;
+
+/// A history long enough to scroll (a prompt, a `Bash` tool call, `FILLER_ROWS` filler prompts, four more prompts),
 /// with the tool call's own result 80 lines long -- long enough to overflow the product's own
 /// capped `.tool-result-body` (260px, `index.css`) once really laid out, which jsdom cannot do.
 /// Mirrors `App.test.tsx`'s own `startedAppWithExpandedResult` shape (a prompt, the tool call, more
@@ -2319,7 +2488,7 @@ fn ctrl_e_y_replay() -> Replay {
         model: "claude-sonnet-5".into(),
         cwd: "/nonexistent/ctrl-e-y".into(),
     });
-    let events = [
+    let mut events = vec![
         AgentDomainEvent::UserPromptSubmitted { text: "r0".into() },
         AgentDomainEvent::ToolCallStarted {
             turn_id: "t1".into(),
@@ -2333,11 +2502,18 @@ fn ctrl_e_y_replay() -> Replay {
             content: json!(numbered_lines("row", 80)),
             is_error: false,
         },
-        AgentDomainEvent::UserPromptSubmitted { text: "r1".into() },
-        AgentDomainEvent::UserPromptSubmitted { text: "r2".into() },
-        AgentDomainEvent::UserPromptSubmitted { text: "r3".into() },
-        AgentDomainEvent::UserPromptSubmitted { text: "r4".into() },
     ];
+    // Filler between the tool call and the last rows: a message is a single-line tinted row since the
+    // chat page's 2026-10-14 look, so five rows no longer overflow a 740px panel and there was nothing for
+    // Ctrl+y to scroll ("0 then 0"). `r4` is still the last row.
+    for filler in 0..FILLER_ROWS {
+        events.push(AgentDomainEvent::UserPromptSubmitted {
+            text: format!("filler {filler}"),
+        });
+    }
+    for last in ["r1", "r2", "r3", "r4"] {
+        events.push(AgentDomainEvent::UserPromptSubmitted { text: last.into() });
+    }
     for event in &events {
         projection.apply(event);
     }
@@ -2366,6 +2542,7 @@ fn ctrl_e_y_replay() -> Replay {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: ProjectionRef::Borrowed(&projection),

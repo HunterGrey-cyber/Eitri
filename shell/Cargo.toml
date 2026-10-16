@@ -3,6 +3,9 @@ name = "shell"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+# The package also builds `eitri-tmux-shim`; without this, `cargo run -p shell` cannot tell which
+# binary is the product and refuses to start.
+default-run = "shell"
 
 [build-dependencies]
 # build_web.rs's fingerprint over agent-ui/web's build inputs. Already

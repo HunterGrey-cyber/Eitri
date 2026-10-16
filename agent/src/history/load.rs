@@ -72,6 +72,9 @@ pub(crate) fn seed_from(
     // true; the first live delta would otherwise append to the previous session's reply and render
     // both replies as one bubble.
     projection.assistant_message_open = false;
+    // Neither source restores thinking today, so this is already false; stated so a later source
+    // that does cannot leave a restored thought open for the first live one to be appended to.
+    projection.thinking_open = false;
     projection
 }
 
@@ -463,6 +466,7 @@ mod tests {
         UserPromptRecord {
             seq,
             text: text.to_string(),
+            delivered: false,
         }
     }
 
@@ -661,6 +665,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["because of the loop", "a new reply"]
         );
+    }
+
+    /// Neither record a resume reads carries thinking back: Claude's transcript has its thinking
+    /// blocks dropped by the reader, and Eitri's own copy never stored any. The seed has no block, none
+    /// is open, and the first live thought is a block of its own.
+    #[test]
+    fn a_resumed_conversation_restores_no_thinking() {
+        let conversation_id = setup();
+        let thinking = r#"{"type":"assistant","uuid":"th","message":{"role":"assistant","content":[{"type":"thinking","thinking":"THINKING-SENTINEL","signature":"s"}]}}"#;
+        let path = write_transcript(&format!(
+            "{}\n{}\n{}\n",
+            typed_prompt("why is this slow?"),
+            thinking,
+            assistant_text("because of the loop")
+        ));
+
+        let mut projection = seed_from(Ok(path), &conversation_id, "sess-th");
+        assert!(projection.thinking.is_empty(), "{:?}", projection.thinking);
+        assert!(!projection.thinking_open);
+        assert_eq!(projection.transcript.len(), 1);
+
+        projection.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t-live".into(),
+            kind: ContentKind::Thinking,
+            text: "a live thought".into(),
+        });
+        assert_eq!(projection.thinking.len(), 1);
+        assert_eq!(projection.thinking[0].text, "a live thought");
+        assert!(projection.thinking[0].seq >= projection.history.as_ref().unwrap().upto_seq);
     }
 
     /// Each stored `TranscriptMessage` is already coalesced. `apply` closes a run only on a prompt

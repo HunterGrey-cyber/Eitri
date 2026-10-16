@@ -160,6 +160,52 @@ pub fn parse_review_hint(value: Option<&str>) -> Result<bool, String> {
     parse_switch(REVIEW_HINT_KEY, value, false)
 }
 
+/// The `init.lua` key: `eitri.config.set("agent.thinking", "collapsed" | "preview" | "expanded" | "hidden")`.
+pub const THINKING_KEY: &str = "agent.thinking";
+
+/// How the agent panel shows the agent's thinking ([`THINKING_KEY`]). The detailed view shows every
+/// block in full whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingDisplay {
+    /// One muted row per block, its text behind the row's fold. The default: something the user did
+    /// not ask for stays quiet until they do.
+    #[default]
+    Collapsed,
+    /// While a block is written, its last lines in a box of fixed height; then the collapsed row.
+    Preview,
+    /// Every block's whole text, always.
+    Expanded,
+    /// No thinking rows at all.
+    Hidden,
+}
+
+impl ThinkingDisplay {
+    /// The word `init.lua` uses and the panel reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingDisplay::Collapsed => "collapsed",
+            ThinkingDisplay::Preview => "preview",
+            ThinkingDisplay::Expanded => "expanded",
+            ThinkingDisplay::Hidden => "hidden",
+        }
+    }
+}
+
+/// The value of [`THINKING_KEY`] as `init.lua` left it: unset is [`ThinkingDisplay::Collapsed`], else one
+/// of the four words. Anything else is an error naming the key, as every other configuration key here is.
+pub fn parse_thinking_display(value: Option<&str>) -> Result<ThinkingDisplay, String> {
+    match value.map(str::trim) {
+        None | Some("collapsed") => Ok(ThinkingDisplay::Collapsed),
+        Some("preview") => Ok(ThinkingDisplay::Preview),
+        Some("expanded") => Ok(ThinkingDisplay::Expanded),
+        Some("hidden") => Ok(ThinkingDisplay::Hidden),
+        Some(_) => Err(format!(
+            "eitri.config.set(\"{THINKING_KEY}\", {:?}): must be \"collapsed\", \"preview\", \"expanded\" or \"hidden\"",
+            value.unwrap_or_default()
+        )),
+    }
+}
+
 /// The `init.lua` key: `eitri.config.set("agent.default", "claude" | "codex" | "<registered name>")`.
 pub const AGENT_DEFAULT_KEY: &str = "agent.default";
 
@@ -308,6 +354,28 @@ mod tests {
 
     fn root() -> PathBuf {
         PathBuf::from("/home/user/project")
+    }
+
+    #[test]
+    fn thinking_display_reads_the_four_words_and_refuses_others_naming_the_key() {
+        assert_eq!(parse_thinking_display(None), Ok(ThinkingDisplay::Collapsed));
+        for display in [
+            ThinkingDisplay::Collapsed,
+            ThinkingDisplay::Preview,
+            ThinkingDisplay::Expanded,
+            ThinkingDisplay::Hidden,
+        ] {
+            assert_eq!(parse_thinking_display(Some(display.as_str())), Ok(display));
+            assert_eq!(
+                parse_thinking_display(Some(&format!(" {} ", display.as_str()))),
+                Ok(display)
+            );
+        }
+        for bad in ["", "Collapsed", "off", "true", "show", "collapsed preview"] {
+            let err = parse_thinking_display(Some(bad)).unwrap_err();
+            assert!(err.starts_with("eitri.config.set(\"agent.thinking\", "), "{bad}: {err}");
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
     }
 
     #[test]

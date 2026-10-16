@@ -20,7 +20,12 @@ pub struct LuaPanelMeta {
 
 /// What `init.lua` decided for this window.
 pub struct WindowConfig {
+    /// `agent.font_size`, or the shipped default when it is unset.
     pub panel_font_size: f32,
+    /// `agent.font_size` is unset: the panel's text follows the editor's own size (`guifont`) instead of
+    /// `panel_font_size`, so the two panes are one size by default. A window with no editor of its own
+    /// (a companion window) has nothing to follow and keeps `panel_font_size`.
+    pub panel_font_follows_editor: bool,
     pub typing_cadence: Option<u32>,
     pub restore_policy: eitri_core::tab_restore::RestorePolicy,
     pub default_mode: Option<eitri_core::agent_bridge::SessionModeChoice>,
@@ -40,6 +45,8 @@ pub struct WindowConfig {
     /// `review.enabled` and `review.hint`: whether turn review runs, and whether a finished turn
     /// puts a hint in the status band.
     pub review: ReviewConfig,
+    /// `agent.thinking`: how the agent panel shows the agent's thinking.
+    pub thinking_display: eitri_core::agent_prefs::ThinkingDisplay,
 }
 
 /// How big the agent panel's text is. One number: every other size in `index.css` is a ratio of
@@ -123,6 +130,7 @@ fn lua_claims(kernel: &Kernel, panels: &[LuaPanelMeta]) -> eitri_core::keymap::L
 /// resumed session open empty on 2026-09-21 (see `agent::account`).
 pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, String> {
     let panel_font_size = parse_panel_font_size(kernel.config.borrow().get("agent.font_size"))?;
+    let panel_font_follows_editor = kernel.config.borrow().get("agent.font_size").is_none();
 
     // How often the agent panel's stream reaches its page while the user types in the editor
     // (an even cadence, not a hold; `eitri_core::panel_cadence`). Unset is `DEFAULT_CADENCE_HZ` (5)
@@ -272,8 +280,21 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         )?,
     };
 
+    // How the panel shows the agent's thinking (`agent.thinking`: "collapsed", the default, "preview",
+    // "expanded" or "hidden"). Anything else is a startup failure naming the key, like the keys above.
+    let thinking_display = eitri_core::agent_prefs::parse_thinking_display(
+        kernel.config.borrow().get(eitri_core::agent_prefs::THINKING_KEY),
+    )?;
+    if thinking_display != eitri_core::agent_prefs::ThinkingDisplay::Collapsed {
+        eprintln!(
+            "[panel] thinking shown {} (init.lua's agent.thinking)",
+            thinking_display.as_str()
+        );
+    }
+
     Ok(WindowConfig {
         panel_font_size,
+        panel_font_follows_editor,
         typing_cadence,
         restore_policy,
         default_mode,
@@ -286,13 +307,14 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         tmux_skipped,
         companion_wm,
         review,
+        thinking_display,
     })
 }
 
 impl WindowConfig {
     /// The settings that live on the panel itself: the typing cadence, the restore policy, the
-    /// default mode and agent for new tabs, the registered agents, the `codex` command and the turn review
-    /// switches.
+    /// default mode and agent for new tabs, the registered agents, the `codex` command, the turn review
+    /// switches and how thinking is shown.
     pub fn apply_to_panel(&self, panel: &AgentPanelHandle) {
         panel.set_typing_cadence(self.typing_cadence);
         panel.set_restore_policy(self.restore_policy);
@@ -304,6 +326,7 @@ impl WindowConfig {
             enabled: self.review.enabled,
             hint: self.review.hint,
         });
+        panel.set_thinking_display(self.thinking_display);
     }
 }
 
@@ -548,6 +571,29 @@ mod tests {
         let loaded = ran.and_then(|()| load(&kernel, panels));
         std::fs::remove_dir_all(&scratch).unwrap();
         loaded
+    }
+
+    /// `agent.thinking` through the real Lua engine: unset is collapsed, each word is read, anything else
+    /// is a startup failure naming the key.
+    #[test]
+    fn window_config_reads_the_thinking_key() {
+        use eitri_core::agent_prefs::ThinkingDisplay;
+        assert_eq!(load_from("", &[]).unwrap().thinking_display, ThinkingDisplay::Collapsed);
+        for display in [
+            ThinkingDisplay::Collapsed,
+            ThinkingDisplay::Preview,
+            ThinkingDisplay::Expanded,
+            ThinkingDisplay::Hidden,
+        ] {
+            let set = format!("eitri.config.set(\"agent.thinking\", \"{}\")\n", display.as_str());
+            assert_eq!(load_from(&set, &[]).unwrap().thinking_display, display);
+        }
+        for bad in ["\"verbose\"", "true", "1"] {
+            let err = load_from(&format!("eitri.config.set(\"agent.thinking\", {bad})\n"), &[])
+                .err()
+                .unwrap();
+            assert!(err.contains("agent.thinking"), "{bad}: {err}");
+        }
     }
 
     /// A Lua panel's id is what lets `init.lua` bind `module.<id>`; the loader gets it from the host's

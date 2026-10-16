@@ -797,6 +797,76 @@ fn delta_note(method: &str, thread: &str, turn: &str, item: &str, delta: &str) -
     write(json!({"method": method, "params": {"threadId": thread, "turnId": turn, "itemId": item, "delta": delta}}))
 }
 
+fn part_note(method: &str, thread: &str, turn: &str, item: &str, index: (&str, i64), delta: &str) -> Value {
+    write(json!({"method": method, "params": {
+        "threadId": thread, "turnId": turn, "itemId": item, "delta": delta, index.0: index.1,
+    }}))
+}
+
+/// What a resumed turn holding the same reasoning items reads as: `resume.rs`'s
+/// `reasoning_reads_as_it_streamed` folds them to this same text.
+const REASONING_AS_ONE_BLOCK: &str = "weigh options\n\nthen act\n\nraw one\n\nraw two\n\nwhole a\n\nwhole b";
+
+/// Reasoning parts and back-to-back reasoning items stream into one thinking block, separated by the blank
+/// line a resumed turn joins them with, so a conversation reads the same live and resumed.
+#[test]
+fn reasoning_streams_as_it_resumes() {
+    let (t, u) = ("th-9", "turn-9");
+    let reasoning = |id: &str, summary: Value, content: Value| json!({"type": "reasoning", "id": id, "summary": summary, "content": content});
+    let summary = "item/reasoning/summaryTextDelta";
+    let raw = "item/reasoning/textDelta";
+    let (provider, thread) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            item_note("item/started", t, u, reasoning("r1", json!([]), json!([]))),
+            part_note(summary, t, u, "r1", ("summaryIndex", 0), "weigh "),
+            part_note(summary, t, u, "r1", ("summaryIndex", 0), "options"),
+            part_note(summary, t, u, "r1", ("summaryIndex", 1), "then act"),
+            item_note(
+                "item/completed",
+                t,
+                u,
+                reasoning("r1", json!(["weigh options", "then act"]), json!([])),
+            ),
+            item_note("item/started", t, u, reasoning("r2", json!([]), json!([]))),
+            part_note(raw, t, u, "r2", ("contentIndex", 0), "raw one"),
+            part_note(raw, t, u, "r2", ("contentIndex", 1), "raw two"),
+            item_note(
+                "item/completed",
+                t,
+                u,
+                reasoning("r2", json!([]), json!(["raw one", "raw two"])),
+            ),
+            item_note(
+                "item/completed",
+                t,
+                u,
+                reasoning("r3", json!(["whole a", "whole b"]), json!([])),
+            ),
+            item_note(
+                "item/completed",
+                t,
+                u,
+                json!({"type": "agentMessage", "id": "m1", "text": "done"}),
+            ),
+            // After a reply, a thought is a new block and starts with no blank line.
+            item_note("item/started", t, u, reasoning("r4", json!([]), json!([]))),
+            part_note(summary, t, u, "r4", ("summaryIndex", 0), "after"),
+            item_note("item/completed", t, u, reasoning("r4", json!(["after"]), json!([]))),
+            turn_completed(t, u, "completed", Value::Null),
+        ],
+    );
+    send(&provider, &thread, "go").expect("starts");
+    let mut projection = agent::AgentSessionProjection::default();
+    for event in until_turn_completed(&provider) {
+        projection.apply(&event);
+    }
+    let blocks: Vec<&str> = projection.thinking.iter().map(|b| b.text.as_str()).collect();
+    assert_eq!(blocks, [REASONING_AS_ONE_BLOCK, "after"]);
+}
+
 #[test]
 fn stream_maps_messages_reasoning_commands_file_changes() {
     let (t, u) = ("th-5", "turn-5");
@@ -916,7 +986,8 @@ fn stream_maps_messages_reasoning_commands_file_changes() {
             })
             .collect()
     };
-    assert_eq!(text_of(ContentKind::Thinking), ["weigh ", "options", "a\n\nb"]);
+    // The second item follows the first in the same block, after the blank line a resumed turn puts there.
+    assert_eq!(text_of(ContentKind::Thinking), ["weigh ", "options", "\n\na\n\nb"]);
     assert_eq!(text_of(ContentKind::Text), ["Hel", "lo", " world", "Bye"]);
     let boundaries = events
         .iter()
@@ -2134,4 +2205,247 @@ fn a_turn_that_does_not_end_after_its_interrupt_stops_the_session() {
         .expect("the session says why it stopped");
     assert!(end < gone, "{events:#?}");
     assert!(provider.stopped_resumable(), "the conversation cannot be resumed");
+}
+
+// ---------------------------------------------------------------- messages into the running turn
+
+fn steer(provider: &CodexProvider, thread: &str, turn: &str, id: &str, text: &str) -> Result<(), ProviderError> {
+    provider.steer_turn(agent::SteerTurnRequest {
+        session_id: thread.to_string(),
+        expected_turn_id: turn.to_string(),
+        client_message_id: id.to_string(),
+        text: format!("ctx\n\n{text}"),
+        as_typed: text.to_string(),
+    })
+}
+
+fn user_message(thread: &str, turn: &str, client_id: &str, text: &str) -> Vec<Value> {
+    let item = json!({"type": "userMessage", "id": format!("um-{client_id}"), "clientId": client_id,
+                      "content": [{"type": "text", "text": text, "text_elements": []}]});
+    vec![
+        item_note("item/started", thread, turn, item.clone()),
+        item_note("item/completed", thread, turn, item),
+    ]
+}
+
+fn index_of(events: &[AgentDomainEvent], what: impl Fn(&AgentDomainEvent) -> bool) -> usize {
+    events
+        .iter()
+        .position(what)
+        .unwrap_or_else(|| panic!("not found in {events:#?}"))
+}
+
+/// `turn/steer` carries the message, the client's id and the turn the host saw; the `userMessage` item that
+/// carries the id back is the delivery, folded once, before the turn's end, with what the user typed.
+#[test]
+fn a_message_put_into_the_turn_is_delivered_when_codex_reads_it() {
+    let steer_line = concat!(
+        r#"{"id":5,"method":"turn/steer","params":{"clientUserMessageId":"m1","expectedTurnId":"turn-a","#,
+        r#""input":[{"text":"ctx\n\nand the tests","type":"text"}],"threadId":"th-s1"}}"#,
+    );
+    let mut rest = vec![
+        expect_request(4, "turn/start"),
+        turn_response(4, "turn-a"),
+        expect_exact(steer_line),
+        write(json!({"id": 5, "result": {"turnId": "turn-a"}})),
+    ];
+    rest.extend(user_message("th-s1", "turn-a", "m1", "ctx\n\nand the tests"));
+    rest.push(turn_completed("th-s1", "turn-a", "completed", Value::Null));
+    let (provider, thread) = open("th-s1", rest);
+    assert!(provider.capabilities().steer);
+    let turn = send(&provider, &thread, "go").expect("the turn starts");
+    steer(&provider, &thread, &turn, "m1", "and the tests").expect("sent");
+    let events = until_turn_completed(&provider);
+    let delivered: Vec<&AgentDomainEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentDomainEvent::UserMessageDelivered { .. }))
+        .collect();
+    assert_eq!(
+        delivered,
+        [&AgentDomainEvent::UserMessageDelivered {
+            client_message_id: "m1".into(),
+            turn_id: "turn-a".into(),
+            text: "and the tests".into(),
+        }],
+        "once, with the typed text, not the wire text"
+    );
+    assert!(
+        index_of(&events, |e| matches!(e, AgentDomainEvent::UserMessageDelivered { .. }))
+            < index_of(&events, |e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::UserMessageDropped { .. })));
+}
+
+/// Codex's refusal drops the message with words of Eitri's; a Codex that does not know the method is not
+/// asked again.
+#[test]
+fn a_refused_message_is_dropped_and_an_unknown_method_is_not_tried_again() {
+    let rest = vec![
+        expect_request(4, "turn/start"),
+        turn_response(4, "turn-a"),
+        expect_request(5, "turn/steer"),
+        write(json!({"id": 5, "error": {"code": -32600,
+            "message": "expected active turn id `turn-a` but found `turn-b`"}})),
+        expect_request(6, "turn/steer"),
+        write(json!({"id": 6, "error": {"code": -32601, "message": "method not found"}})),
+        turn_completed("th-s2", "turn-a", "completed", Value::Null),
+    ];
+    let (provider, thread) = open("th-s2", rest);
+    let turn = send(&provider, &thread, "go").expect("the turn starts");
+    steer(&provider, &thread, &turn, "m1", "one").expect("sent");
+    let events = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::UserMessageDropped { .. }))
+    });
+    assert!(events.contains(&AgentDomainEvent::UserMessageDropped {
+        client_message_id: "m1".into(),
+        reason: "the turn had ended when it reached Codex".into(),
+    }));
+    steer(&provider, &thread, &turn, "m2", "two").expect("sent");
+    let events = until_turn_completed(&provider);
+    assert!(
+        events.contains(&AgentDomainEvent::UserMessageDropped {
+            client_message_id: "m2".into(),
+            reason: "this Codex cannot take messages while a turn runs".into(),
+        }),
+        "the refusal read before the turn's end names its own reason: {events:#?}"
+    );
+    match steer(&provider, &thread, &turn, "m3", "three") {
+        Err(ProviderError::UnsupportedCapability(_)) => {}
+        other => panic!("expected the capability to be gone, got {other:?}"),
+    }
+    assert!(!provider.capabilities().steer, "and the tab is told");
+}
+
+/// Codex forgets a message it took but had not read when the turn ends (an interrupt): it is dropped before
+/// the turn's end, so the host holds it again by the time it sees the turn over.
+#[test]
+fn a_message_codex_had_not_read_is_dropped_before_the_turn_ends() {
+    let rest = vec![
+        expect_request(4, "turn/start"),
+        turn_response(4, "turn-a"),
+        expect_request(5, "turn/steer"),
+        write(json!({"id": 5, "result": {"turnId": "turn-a"}})),
+        turn_completed("th-s3", "turn-a", "interrupted", Value::Null),
+    ];
+    let (provider, thread) = open("th-s3", rest);
+    let turn = send(&provider, &thread, "go").expect("the turn starts");
+    steer(&provider, &thread, &turn, "m1", "unread").expect("sent");
+    let events = until_turn_completed(&provider);
+    let dropped = index_of(&events, |e| {
+        *e == AgentDomainEvent::UserMessageDropped {
+            client_message_id: "m1".into(),
+            reason: "the turn ended before Codex read it".into(),
+        }
+    });
+    assert!(dropped < index_of(&events, |e| matches!(e, AgentDomainEvent::TurnCompleted { .. })));
+}
+
+/// Nothing is sent without a running turn, for a turn other than the running one, or after an interrupt
+/// was asked for (Codex would forget it).
+#[test]
+fn a_message_for_no_turn_another_turn_or_an_ending_one_is_refused_unsent() {
+    let rest = vec![
+        expect_request(4, "turn/start"),
+        turn_response(4, "turn-a"),
+        expect_request(5, "turn/interrupt"),
+        write(json!({"id": 5, "result": {}})),
+        turn_completed("th-s4", "turn-a", "interrupted", Value::Null),
+    ];
+    let (provider, thread) = open("th-s4", rest);
+    let no_turn = |r: Result<(), ProviderError>| match r {
+        Err(ProviderError::Provider { code, .. }) => assert_eq!(code, ProviderErrorCode::NoActiveTurn),
+        other => panic!("expected NoActiveTurn, got {other:?}"),
+    };
+    no_turn(steer(&provider, &thread, "turn-a", "m0", "idle"));
+    let turn = send(&provider, &thread, "go").expect("the turn starts");
+    no_turn(steer(&provider, &thread, "turn-x", "m1", "another turn"));
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: thread.clone(),
+        })
+        .expect("interrupted");
+    no_turn(steer(&provider, &thread, &turn, "m2", "after the key"));
+    let events = until_turn_completed(&provider);
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AgentDomainEvent::UserMessageDropped { .. } | AgentDomainEvent::UserMessageDelivered { .. }
+    )));
+}
+
+/// The `turn/steer` request with this id for this client message id.
+fn expect_steer(id: u64, client_id: &str) -> Value {
+    json!({ "expect": format!(r#"^\{{"id":{id},"method":"turn/steer","params":\{{"clientUserMessageId":"{client_id}""#) })
+}
+
+/// A later message waits unsent until the earlier one's answer comes: refused, both are dropped in order
+/// and the later one was never sent (it is dropped as waiting behind the refusal, not by the turn's end).
+#[test]
+fn a_message_waits_behind_an_unanswered_one_and_a_refusal_drops_both() {
+    let rest = vec![
+        expect_request(4, "turn/start"),
+        turn_response(4, "turn-a"),
+        expect_steer(5, "m1"),
+        json!({"sleep_ms": 300}),
+        write(json!({"id": 5, "error": {"code": -32600, "message": "input exceeds the maximum length"}})),
+        turn_completed("th-s5", "turn-a", "completed", Value::Null),
+    ];
+    let (provider, thread) = open("th-s5", rest);
+    let turn = send(&provider, &thread, "go").expect("the turn starts");
+    steer(&provider, &thread, &turn, "m1", "too long").expect("sent");
+    steer(&provider, &thread, &turn, "m2", "after it").expect("taken, to wait");
+    let events = until_turn_completed(&provider);
+    let dropped: Vec<&AgentDomainEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentDomainEvent::UserMessageDropped { .. }))
+        .collect();
+    assert_eq!(
+        dropped,
+        [
+            &AgentDomainEvent::UserMessageDropped {
+                client_message_id: "m1".into(),
+                reason: "Codex did not take it: input exceeds the maximum length".into(),
+            },
+            &AgentDomainEvent::UserMessageDropped {
+                client_message_id: "m2".into(),
+                reason: "an earlier message was not taken, and this one waits behind it".into(),
+            },
+        ]
+    );
+}
+
+/// Accepted, the waiting message goes out next, and both are read in the order they were typed.
+#[test]
+fn a_waiting_message_goes_out_once_the_earlier_one_is_taken() {
+    let mut rest = vec![
+        expect_request(4, "turn/start"),
+        turn_response(4, "turn-a"),
+        expect_steer(5, "m1"),
+        json!({"sleep_ms": 200}),
+        write(json!({"id": 5, "result": {"turnId": "turn-a"}})),
+        expect_steer(6, "m2"),
+        write(json!({"id": 6, "result": {"turnId": "turn-a"}})),
+    ];
+    rest.extend(user_message("th-s6", "turn-a", "m1", "ctx\n\nfirst"));
+    rest.extend(user_message("th-s6", "turn-a", "m2", "ctx\n\nsecond"));
+    rest.push(turn_completed("th-s6", "turn-a", "completed", Value::Null));
+    let (provider, thread) = open("th-s6", rest);
+    let turn = send(&provider, &thread, "go").expect("the turn starts");
+    steer(&provider, &thread, &turn, "m1", "first").expect("sent");
+    steer(&provider, &thread, &turn, "m2", "second").expect("taken, to wait");
+    let events = until_turn_completed(&provider);
+    let delivered: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::UserMessageDelivered { client_message_id, .. } => Some(client_message_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, ["m1", "m2"]);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::UserMessageDropped { .. })));
 }

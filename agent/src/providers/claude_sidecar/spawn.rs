@@ -107,46 +107,23 @@ impl SpawnedSidecar {
     }
 }
 
-/// Baseline sidecar revision for development and conformance testing.
-/// Revision mismatches produce a startup diagnostic so the running build can be
-/// identified. Checkout overrides allow testing unreleased sidecars and protocol
-/// migrations without rejecting a different revision at startup.
+/// The sidecar revision this client is developed and verified against.
+/// A different checkout revision produces a startup diagnostic rather than preventing startup,
+/// so development overrides can test unreleased sidecars and protocol changes.
+/// Keep this value aligned with the protocol dependency in `agent/Cargo.toml`, since that
+/// dependency supplies the generated wire types this client compiles against.
+/// Use the seven-character prefix here because the per-user directory and release checks use it.
 ///
-/// Keep this value aligned with the protocol dependency revision in `agent/Cargo.toml`,
-/// since that revision supplies the generated wire types compiled into this client.
+/// Before updating this value, run the real-sidecar tests against the candidate revision.
+/// These cover multi-turn content, bypassed tool execution, reuse after interruption, teardown
+/// without orphan processes, resume with matching content and provider session ID, streaming,
+/// replay, recovery and backpressure. Compilation alone does not check the live handshake.
 ///
-/// Update this value after the ignored real-sidecar conformance tests pass against
-/// the candidate revision. They cover multiple turns with content checks, BYPASS
-/// tool execution, reuse after interruption, teardown without orphan processes,
-/// resume verified by content and provider session ID, partial assistant streaming,
-/// replay, recovery, and backpressure.
-/// The unary conformance tests include a live handshake to check protocol agreement.
-///
-/// A packaged sidecar may have no checkout or `.git` directory to compare.
-/// Protocol major is checked at handshake. It and the build-time `sidecar_version`
-/// are carried on `ProviderInfo`. Keep this diagnostic until the client checks
-/// the supported sidecar version range.
-///
-/// The baseline protocol includes `SetPermissionMode`, `PermissionModeChanged`,
-/// and `TextDelta.message_id`.
-///
-/// For gated sessions using CLI `default`, the sidecar explicitly passes
-/// `permissionMode: 'default'` to prevent local `.claude/settings.json` from widening permissions.
-///
-/// The protocol also includes `ClaudeHostPolicy.provider_permission_prompts`,
-/// `PermissionRequested.origin` and its `provider_*` fields, `PermissionOrigin`,
-/// `MatchedAskRule`, and the `provider_permission_prompts` capability.
-///
-/// Protocol 3.14 supports CLI auto mode under the gate through
-/// `ClaudeHostPolicy.cli_permission_mode`, `ResolvePermissionRequest.defer`,
-/// `PermissionOutcome.DEFERRED`, and the `PermissionDenied` event.
-/// Its capabilities include `cli_auto_mode`, `permission_defer`, and
-/// `permission_denied_events`. This client does not send or read
-/// `await_account_identity`, `ToolAllowList.init_check`, the handshake fields
-/// `egress_probe` and `structured_output_tools`, or `SessionReady.effective_*`.
-/// Keep this value as the seven-character prefix of the full dependency revision:
-/// the per-user sidecar directory and release checks use that prefix.
-pub const EXPECTED_VERDANDI_REVISION: &str = "8e0f7e1";
+/// Checkout revision diagnostics require git metadata, which packaged sidecar artifacts lack.
+/// `ProviderInfo` also carries the protocol major and `sidecar_version`. The handshake checks
+/// the protocol major; this revision remains the checkout skew warning until the client checks
+/// the sidecar version range.
+pub const EXPECTED_VERDANDI_REVISION: &str = "8061cc4";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.

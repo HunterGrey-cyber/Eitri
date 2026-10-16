@@ -1,0 +1,695 @@
+{
+  "cases": [
+    {
+      "events": {
+        "events": [
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "thinking",
+            "text": "Read the ",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "thinking",
+            "text": "parser first.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "input": {
+              "file_path": "/project/src/parser.rs"
+            },
+            "name": "Read",
+            "tool_use_id": "toolu_1",
+            "turn_id": "t1",
+            "type": "tool_call_started"
+          },
+          {
+            "content": "fn parse() {}",
+            "is_error": false,
+            "tool_use_id": "toolu_1",
+            "turn_id": "t1",
+            "type": "tool_call_completed"
+          },
+          {
+            "kind": "thinking",
+            "text": "The loop ",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "thinking",
+            "text": "never ends.\nFix the bound.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Fixed.",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 10
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [
+            {
+              "seq": 2,
+              "text": "Read the parser first.",
+              "turnId": "t1"
+            },
+            {
+              "seq": 6,
+              "text": "The loop ",
+              "turnId": "t1"
+            }
+          ],
+          "thinkingOpen": true,
+          "toolCalls": [
+            {
+              "input": {
+                "file_path": "/project/src/parser.rs"
+              },
+              "name": "Read",
+              "result": {
+                "content": "fn parse() {}",
+                "isError": false
+              },
+              "seq": 4,
+              "toolUseId": "toolu_1",
+              "turnId": "t1"
+            }
+          ],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 0,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "interleaved",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [
+            {
+              "seq": 2,
+              "text": "Read the parser first.",
+              "turnId": "t1"
+            },
+            {
+              "seq": 6,
+              "text": "The loop never ends.\nFix the bound.",
+              "turnId": "t1"
+            }
+          ],
+          "thinkingOpen": false,
+          "toolCalls": [
+            {
+              "input": {
+                "file_path": "/project/src/parser.rs"
+              },
+              "name": "Read",
+              "result": {
+                "content": "fn parse() {}",
+                "isError": false
+              },
+              "seq": 4,
+              "toolUseId": "toolu_1",
+              "turnId": "t1"
+            }
+          ],
+          "transcript": [
+            {
+              "seq": 8,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 0,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 10,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 7
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "thinking",
+            "text": "One",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "thinking",
+            "text": " two",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "thinking",
+            "text": " three",
+            "turn_id": "t1",
+            "type": "content_delta"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [
+            {
+              "seq": 2,
+              "text": "One",
+              "turnId": "t1"
+            }
+          ],
+          "thinkingOpen": true,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 0,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 3,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "open_at_the_snapshot",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [
+            {
+              "seq": 2,
+              "text": "One two three",
+              "turnId": "t1"
+            }
+          ],
+          "thinkingOpen": true,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 0,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 3
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "thinking",
+            "text": "",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "thinking",
+            "text": "a",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "thinking",
+            "text": "",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "thinking",
+            "text": "b",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "text",
+            "text": "ok",
+            "turn_id": "t1",
+            "type": "content_delta"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 7
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [
+            {
+              "seq": 3,
+              "text": "a",
+              "turnId": "t1"
+            }
+          ],
+          "thinkingOpen": true,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 0,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "empty_delta",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [
+            {
+              "seq": 3,
+              "text": "ab",
+              "turnId": "t1"
+            }
+          ],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 6,
+              "text": "ok"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 0,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 4
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Half ",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "thinking",
+            "text": "hmm",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "text",
+            "text": "and half.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "kind": "thinking",
+            "text": "after",
+            "turn_id": "t1",
+            "type": "content_delta"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 6
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [
+            {
+              "seq": 3,
+              "text": "hmm",
+              "turnId": "t1"
+            }
+          ],
+          "thinkingOpen": true,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 2,
+              "text": "Half "
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 0,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "thought_inside_a_reply",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [
+            {
+              "seq": 3,
+              "text": "hmm",
+              "turnId": "t1"
+            },
+            {
+              "seq": 5,
+              "text": "after",
+              "turnId": "t1"
+            }
+          ],
+          "thinkingOpen": true,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 2,
+              "text": "Half and half."
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 0,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 6,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 4
+    }
+  ],
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_thinking_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

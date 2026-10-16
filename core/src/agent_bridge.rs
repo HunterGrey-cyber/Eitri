@@ -221,12 +221,16 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
     },
-    /// `Enter` while a turn runs: queued with the editor context of this moment.
+    /// `Enter` while a turn runs: composed with the editor context of this moment, then put into the running
+    /// turn when the tab's agent can take it (`TabSet::steer_held`), held for the turn's end otherwise.
     QueueMessage {
         request_id: String,
         #[serde(default)]
         tab: Option<u64>,
         text: String,
+        /// The turn the page showed running when Enter was pressed: the message goes only into that one.
+        #[serde(default)]
+        turn_id: Option<String>,
     },
     /// `↑` on the box's first line with a queue: returns the whole queue as `queue_taken`.
     TakeBackQueue {
@@ -773,6 +777,14 @@ pub fn serialize_theme_for_js(tokens: &crate::theme::ThemeTokens) -> String {
         .map(|(name, value)| (name, serde_json::Value::String(value)))
         .collect();
     json!({ "kind": "theme", "vars": vars }).to_string()
+}
+
+/// `{"kind":"display","thinking":"collapsed"|"preview"|"expanded"|"hidden"}`: how the panel shows the
+/// agent's thinking (`init.lua`'s `agent.thinking`). Window-level, read once at startup, and sent in the
+/// `ready` batch before the tabs, so a fresh or reloaded document draws its first conversation with it.
+/// Kept out of `hello`, which describes the backend, and out of `theme`, which is CSS variables only.
+pub fn serialize_display_for_js(thinking: crate::agent_prefs::ThinkingDisplay) -> String {
+    json!({ "kind": "display", "thinking": thinking.as_str() }).to_string()
 }
 
 /// `{"kind":"pane_focus","focused":bool}`: whether the agent panel's pane holds the window's
@@ -1336,6 +1348,34 @@ pub struct CallNotes {
     /// Its source is `AgentBackend::answer_what_needs_no_human`'s `AnsweredForYou::creates_file`.
     /// The wire key `autoCreatesFile` covers bypass answers too.
     pub auto_creates_file: BTreeSet<String>,
+    /// How long each finished turn ran, oldest first (`TurnTime`). The tab keeps every one it
+    /// stamped; a batch's notes hold only those that ended in it. The panel's "Worked for" line and
+    /// the duration on a turn-ending row read them, so a turn with no entry (history from a resume,
+    /// a turn that began before this process) shows no time rather than a wrong one.
+    pub turn_times: Vec<TurnTime>,
+}
+
+/// When one finished turn started and ended, on the panel's `Date.now()` clock. Both ends are read
+/// from the tab's tick, so a turn is at most one tick (about 33 ms) longer than it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnTime {
+    pub turn_id: String,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    /// The `seq` of the newest row when the end was seen: the panel puts the duration line after
+    /// that row. `None` when it cannot be told (another turn was already running).
+    pub anchor_seq: Option<u64>,
+}
+
+impl TurnTime {
+    fn to_json(&self) -> Value {
+        json!({
+            "turnId": self.turn_id,
+            "startedAtMs": self.started_at_ms,
+            "endedAtMs": self.ended_at_ms,
+            "anchorSeq": self.anchor_seq,
+        })
+    }
 }
 
 impl CallNotes {
@@ -1345,6 +1385,7 @@ impl CallNotes {
             && self.prompt_notes.is_empty()
             && self.allowed_by_auto.is_empty()
             && self.auto_creates_file.is_empty()
+            && self.turn_times.is_empty()
     }
 
     /// Whether this tool-use id's `Write` created its file (see `creates_file` and, for the
@@ -1359,7 +1400,9 @@ impl CallNotes {
 /// `"ruleNotes":[{"toolUseId":..,"rule":"Bash(git log *)"}]`,
 /// `"createsFile":[{"permissionId":..,"toolUseId":..|null}]`,
 /// `"autoNotes":["toolu_..", ...]`, and `"autoCreatesFile":["toolu_..", ...]`.
-/// `autoCreatesFile` includes bypass `Write` calls too. Each field is omitted when empty.
+/// `autoCreatesFile` includes bypass `Write` calls too. `"turnTimes"` contains
+/// `{"turnId":..,"startedAtMs":..,"endedAtMs":..,"anchorSeq":..|null}` for each turn ended in this batch.
+/// Each field is omitted when empty.
 pub fn serialize_events_with_notes_for_js(
     tab: crate::tabs::TabId,
     from_revision: u64,
@@ -1400,6 +1443,9 @@ pub fn serialize_events_with_notes_for_js(
     }
     if !notes.auto_creates_file.is_empty() {
         payload["autoCreatesFile"] = notes.auto_creates_file.iter().cloned().collect();
+    }
+    if !notes.turn_times.is_empty() {
+        payload["turnTimes"] = notes.turn_times.iter().map(TurnTime::to_json).collect();
     }
     payload.to_string()
 }
@@ -1492,7 +1538,15 @@ pub fn serialize_snapshot_with_notes_for_js(
     let user_prompts: Vec<Value> = projection
         .user_prompts
         .iter()
-        .map(|prompt| json!({ "seq": prompt.seq, "text": prompt.text }))
+        .map(|prompt| {
+            // `delivered` only when true: a message read inside the running turn. Every other prompt
+            // keeps the shape it always had.
+            if prompt.delivered {
+                json!({ "seq": prompt.seq, "text": prompt.text, "delivered": true })
+            } else {
+                json!({ "seq": prompt.seq, "text": prompt.text })
+            }
+        })
         .collect();
 
     // Written out rather than leaning on `TranscriptMessage`'s derive. Both field names happen to
@@ -1667,6 +1721,14 @@ pub fn serialize_snapshot_with_notes_for_js(
         })
         .collect();
 
+    // The agent's thinking, block by block, spelled out like the collections above. Plain text: the
+    // panel never renders it as markdown.
+    let thinking: Vec<Value> = projection
+        .thinking
+        .iter()
+        .map(|block| json!({ "seq": block.seq, "turnId": block.turn_id, "text": block.text }))
+        .collect();
+
     let mut state = json!({
         "backend": view.backend,
         "history": history,
@@ -1692,6 +1754,10 @@ pub fn serialize_snapshot_with_notes_for_js(
         // disagreed about whether the last transcript entry was still open. Sending the real bit
         // is what lets `applySnapshot` take it from the wire instead of guessing "closed".
         "assistantMessageOpen": projection.assistant_message_open,
+        "thinking": thinking,
+        // Whether the last block is still being written, for the same reason as the bit above: a
+        // snapshot taken mid-thought must not split the thought, or draw it as finished.
+        "thinkingOpen": projection.thinking_open,
         // the tab's last reported usage, so a tab switch or a panel reload
         // shows the figure the band draws without waiting for the next turn to report one. An
         // explicit `null` until a provider has reported something (never a zeroed object), then
@@ -1710,11 +1776,17 @@ pub fn serialize_snapshot_with_notes_for_js(
             "resetsAt": limits.resets_at,
             "plan": limits.plan,
         })),
+        // The slash commands the agent listed (`{name, description, hint?}`), `null` before any list -- the
+        // page then falls back to what it knows of the agent. The text is the agent's own and bounded at
+        // the producer; the page draws it as plain text.
+        "availableCommands": projection.available_commands,
         "capabilities": {
             "resume": capabilities.resume,
             "fork": capabilities.fork,
             "interrupt": capabilities.interrupt,
             "bypassPermissionMode": capabilities.bypass_permission_mode,
+            // What Enter does while a turn runs: puts the message into the turn, or holds it for the end.
+            "steer": capabilities.steer,
             // No `modeSwitch`: live sessions keep their CLI mode, and the tab's permission
             // mode is local to the client.
         },
@@ -1739,6 +1811,9 @@ pub fn serialize_snapshot_with_notes_for_js(
         "throughRevision": projection.last_revision,
         "state": state,
         "turnStartedAtMs": turn_started_at_ms,
+        // How long every finished turn of this tab ran (`CallNotes::turn_times`): the panel replaces
+        // its whole table with this list, so a turn absent here shows no duration.
+        "turnTimes": notes.turn_times.iter().map(TurnTime::to_json).collect::<Vec<_>>(),
     })
     .to_string()
 }
@@ -2121,18 +2196,24 @@ pub fn serialize_begin_rename_for_js(tab: crate::tabs::TabId, current: Option<&s
     json!({ "kind": "begin_rename", "tab": tab.0, "current": current }).to_string()
 }
 
-/// A tab's queue. Sends only the typed text; the wire text also carries editor context, which
-/// the panel must not display as the user's own words.
+/// A tab's held queue and messages sent into the running turn but not yet read. Sends only
+/// typed text; editor context stays out of the displayed user text. `note` explains why
+/// messages are held. `enter_steers` tells whether Enter can send into the running turn;
+/// `None` means no live session, so the page uses the snapshot capability. The value can
+/// change if the agent does not support the method, and the composer wording follows it.
 pub fn serialize_queue_for_js(
     tab: crate::tabs::TabId,
     items: &[crate::tab_set::Queued],
     error: Option<&str>,
+    note: Option<&str>,
+    enter_steers: Option<bool>,
 ) -> String {
     let items: Vec<Value> = items
         .iter()
-        .map(|q| json!({ "text": q.text, "queuedAt": q.queued_at_ms }))
+        .map(|q| json!({ "text": q.text, "queuedAt": q.queued_at_ms, "steered": !q.is_held() }))
         .collect();
-    json!({ "kind": "queue", "tab": tab.0, "items": items, "error": error }).to_string()
+    json!({ "kind": "queue", "tab": tab.0, "items": items, "error": error, "note": note, "enterSteers": enter_steers })
+        .to_string()
 }
 
 /// A tab's unsent draft, sent only when the panel's own copy is not the latest.
@@ -3486,6 +3567,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: Some(&provider),
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -3726,6 +3808,7 @@ mod tests {
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
+                    steer: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -3758,6 +3841,207 @@ mod tests {
                 committed.as_deref(),
                 Some(written.as_str()),
                 "the committed turn endings fixture is not what this test produces; if the change is \
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
+    #[test]
+    fn the_display_envelope_names_the_thinking_level_in_the_words_init_lua_uses() {
+        use crate::agent_prefs::ThinkingDisplay;
+        for (display, word) in [
+            (ThinkingDisplay::Collapsed, "collapsed"),
+            (ThinkingDisplay::Preview, "preview"),
+            (ThinkingDisplay::Expanded, "expanded"),
+            (ThinkingDisplay::Hidden, "hidden"),
+        ] {
+            let parsed: Value = serde_json::from_str(&serialize_display_for_js(display)).unwrap();
+            assert_eq!(parsed, json!({ "kind": "display", "thinking": word }));
+        }
+    }
+
+    /// A projection in the middle of a thought sends the block and says it is still open, so a panel
+    /// rebuilt from it neither splits the thought nor draws it as finished.
+    #[test]
+    fn a_snapshot_mid_thought_carries_the_block_and_says_it_is_open() {
+        let state_of = |projection: &AgentSessionProjection| -> Value {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: Some("sess-1"),
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities::default(),
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            parsed["state"].clone()
+        };
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        for chunk in ["First ", "the parser."] {
+            projection.apply(&AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: agent::ContentKind::Thinking,
+                text: chunk.into(),
+            });
+        }
+        let state = state_of(&projection);
+        assert_eq!(
+            state["thinking"],
+            json!([{ "seq": 1, "turnId": "t1", "text": "First the parser." }])
+        );
+        assert_eq!(state["thinkingOpen"], true);
+        // Thinking is not a reply: nothing of it is in the transcript.
+        assert_eq!(state["transcript"], json!([]));
+
+        projection.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: "Done.".into(),
+        });
+        let state = state_of(&projection);
+        assert_eq!(state["thinkingOpen"], false);
+        assert_eq!(state["thinking"][0]["text"], "First the parser.");
+    }
+
+    /// `agent-ui/web/src/fixtures/thinking.json`: for each way thinking arrives, the events payload this
+    /// side sends, the snapshot after a prefix of them (`split`), and the snapshot after all of them. The
+    /// panel's reducer must fold the events to what the last snapshot carries, from nothing and from the
+    /// middle one. Compared on every run; `EITRI_WRITE_FIXTURES=1` rewrites it.
+    #[test]
+    fn the_thinking_fixture_is_what_the_serializer_sends() {
+        use agent::{ContentKind, TurnEndDetail, TurnOutcome};
+        let thought = |text: &str| AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Thinking,
+            text: text.into(),
+        };
+        let said = |text: &str| AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Text,
+            text: text.into(),
+        };
+        let call = |id: &str| AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            name: "Read".into(),
+            input: json!({ "file_path": "/project/src/parser.rs" }),
+        };
+        let done = |id: &str| AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            content: json!("fn parse() {}"),
+            is_error: false,
+        };
+        let ended = AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: "Fixed.".into(),
+            stop_reason: None,
+            usage: None,
+            detail: TurnEndDetail::default(),
+        };
+        // (name, events after the turn starts, how many of ALL the events the middle snapshot folds)
+        let cases: Vec<(&str, Vec<AgentDomainEvent>, usize)> = vec![
+            // Thinking between calls and before the reply, streamed in pieces; the middle snapshot lands
+            // inside the second thought.
+            (
+                "interleaved",
+                vec![
+                    thought("Read the "),
+                    thought("parser first."),
+                    call("toolu_1"),
+                    done("toolu_1"),
+                    thought("The loop "),
+                    thought("never ends.\nFix the bound."),
+                    said("Fixed."),
+                    ended,
+                ],
+                7,
+            ),
+            // The turn is still thinking when the middle snapshot is taken, and goes on after it.
+            (
+                "open_at_the_snapshot",
+                vec![thought("One"), thought(" two"), thought(" three")],
+                3,
+            ),
+            // A delta with no text is no block and ends none.
+            (
+                "empty_delta",
+                vec![thought(""), thought("a"), thought(""), thought("b"), said("ok")],
+                4,
+            ),
+            // A thought arriving in the middle of a reply does not cut the reply in two.
+            (
+                "thought_inside_a_reply",
+                vec![said("Half "), thought("hmm"), said("and half."), thought("after")],
+                4,
+            ),
+        ];
+
+        let view_of = |projection: &AgentSessionProjection| -> Value {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: Some("sess-1"),
+                provider_session_id: Some("prov-1".into()),
+                capabilities: agent::ProviderCapabilities::default(),
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap()
+        };
+        let mut written_cases = Vec::new();
+        for (name, rest, split) in cases {
+            let mut events = vec![
+                AgentDomainEvent::UserPromptSubmitted {
+                    text: "fix the parser".into(),
+                },
+                AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            ];
+            events.extend(rest);
+            assert!(split <= events.len(), "{name}");
+            let mut projection = AgentSessionProjection::default();
+            let mut middle = Value::Null;
+            for (at, event) in events.iter().enumerate() {
+                if at == split {
+                    middle = view_of(&projection);
+                }
+                projection.apply(event);
+            }
+            if split == events.len() {
+                middle = view_of(&projection);
+            }
+            let events_payload = serialize_events_for_js(TabId(1), 0, projection.last_revision, &events);
+            written_cases.push(json!({
+                "name": name,
+                "split": split,
+                "events": serde_json::from_str::<Value>(&events_payload).unwrap(),
+                "middle": middle,
+                "snapshot": view_of(&projection),
+            }));
+        }
+        let fixture = json!({
+            "writtenBy": "core/src/agent_bridge.rs, tests::the_thinking_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "cases": written_cases,
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/thinking.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the thinking fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed thinking fixture is not what this test produces; if the change is \
                  intended, regenerate it with EITRI_WRITE_FIXTURES=1"
             );
         }
@@ -3981,6 +4265,7 @@ mod tests {
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
+                    steer: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4013,6 +4298,123 @@ mod tests {
                 committed.as_deref(),
                 Some(written.as_str()),
                 "the committed codex cards fixture is not what this test produces; if the change is \
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
+    /// `agent-ui/web/src/fixtures/steered-messages.json`: a Codex turn into which one message went and was
+    /// read (a user prompt where the agent read it) and another was dropped (nothing in the conversation),
+    /// as the events this side sends and the snapshot of the same projection, and the queue envelopes the
+    /// lines above the box are drawn from. The panel's tests fold the events with its own reducer and must
+    /// arrive at the snapshot. Compared on every run; `EITRI_WRITE_FIXTURES=1` rewrites it.
+    #[test]
+    fn the_steered_messages_fixture_is_what_the_serializer_sends() {
+        use crate::tab_set::{Queued, QueuedState};
+        let events = vec![
+            AgentDomainEvent::SessionOpened {
+                session_id: "codex-1".into(),
+                provider_session_id: "thread-1".into(),
+                model: "gpt-test".into(),
+                cwd: "/project".into(),
+            },
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            AgentDomainEvent::UserPromptSubmitted {
+                text: "fix the parser".into(),
+            },
+            AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: agent::ContentKind::Text,
+                text: "Looking at the parser.".into(),
+            },
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: "item-1".into(),
+                name: "commandExecution".into(),
+                input: json!({ "command": "cargo test -p parser" }),
+            },
+            AgentDomainEvent::ToolCallCompleted {
+                turn_id: "t1".into(),
+                tool_use_id: "item-1".into(),
+                content: json!("ok"),
+                is_error: false,
+            },
+            AgentDomainEvent::UserMessageDelivered {
+                client_message_id: "eitri-1-1".into(),
+                turn_id: "t1".into(),
+                text: "and the tests".into(),
+            },
+            AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: agent::ContentKind::Text,
+                text: "Adding tests too.".into(),
+            },
+            AgentDomainEvent::UserMessageDropped {
+                client_message_id: "eitri-1-2".into(),
+                reason: "the turn ended before Codex read it".into(),
+            },
+            AgentDomainEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                outcome: agent::TurnOutcome::Completed,
+                result_text: "Adding tests too.".into(),
+                stop_reason: None,
+                usage: None,
+                detail: Default::default(),
+            },
+        ];
+        let mut projection = AgentSessionProjection::default();
+        for event in &events {
+            projection.apply(event);
+        }
+        let view = SnapshotView {
+            backend: "external",
+            conversation_id: None,
+            session_id: Some("codex-1"),
+            provider_session_id: Some("thread-1".into()),
+            capabilities: agent::ProviderCapabilities {
+                interrupt: true,
+                steer: true,
+                ..Default::default()
+            },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        };
+        let events_payload = serialize_events_for_js(TabId(1), 0, projection.last_revision, &events);
+        let snapshot_payload = serialize_snapshot_for_js(TabId(1), &view, None);
+        let mut steered = Queued::held("look at the lexer too", "ctx\n\nlook at the lexer too".into(), 20);
+        steered.state = QueuedState::Steered {
+            client_id: "eitri-1-3".into(),
+            sent_at_ms: 21,
+        };
+        let running_queue = serialize_queue_for_js(
+            TabId(1),
+            &[steered, Queued::held("then commit", "ctx\n\nthen commit".into(), 22)],
+            None,
+            Some("held until the turn ends: the turn ended before Codex read it"),
+            Some(true),
+        );
+        let fixture = json!({
+            "writtenBy": "core/src/agent_bridge.rs, tests::the_steered_messages_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "events": serde_json::from_str::<Value>(&events_payload).unwrap(),
+            "snapshot": serde_json::from_str::<Value>(&snapshot_payload).unwrap(),
+            "queue": serde_json::from_str::<Value>(&running_queue).unwrap(),
+        });
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/steered-messages.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the steered messages fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed steered messages fixture is not what this test produces; if the change is \
                  intended, regenerate it with EITRI_WRITE_FIXTURES=1"
             );
         }
@@ -4085,6 +4487,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4169,6 +4572,7 @@ mod tests {
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
+                    steer: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
@@ -4267,6 +4671,7 @@ mod tests {
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
+                    steer: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
@@ -4298,6 +4703,7 @@ mod tests {
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
+                    steer: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
@@ -4337,6 +4743,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn available_commands_reach_the_ui_snapshot() {
+        let commands_in_snapshot = |projection: &AgentSessionProjection| -> Value {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities {
+                    resume: false,
+                    fork: false,
+                    interrupt: true,
+                    bypass_permission_mode: true,
+                    interactive_permission_mode: true,
+                    cli_auto_mode: false,
+                    steer: false,
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            assert!(
+                parsed["state"].as_object().unwrap().contains_key("availableCommands"),
+                "the key is always sent: `null` says the agent listed none"
+            );
+            parsed["state"]["availableCommands"].clone()
+        };
+        let mut projection = AgentSessionProjection::default();
+        assert_eq!(commands_in_snapshot(&projection), Value::Null);
+
+        projection.apply(&AgentDomainEvent::CommandsAvailable {
+            commands: vec![
+                agent::SlashCommand {
+                    name: "web".into(),
+                    description: "Search the web".into(),
+                    hint: Some("query".into()),
+                },
+                agent::SlashCommand {
+                    name: "test".into(),
+                    description: String::new(),
+                    hint: None,
+                },
+            ],
+        });
+        assert_eq!(
+            commands_in_snapshot(&projection),
+            json!([
+                {"name": "web", "description": "Search the web", "hint": "query"},
+                {"name": "test", "description": ""},
+            ])
+        );
+
+        // The latest list replaces the whole earlier one, and an empty one withdraws them.
+        projection.apply(&AgentDomainEvent::CommandsAvailable { commands: vec![] });
+        assert_eq!(commands_in_snapshot(&projection), json!([]));
+    }
+
     /// sw-panel-render-2 (2026-09-27): a snapshot taken mid-reply used to say nothing at all about
     /// whether the last transcript entry was still open -- `applySnapshot` forced its own copy of
     /// the bit to `false` regardless, splitting a streaming reply into two rows on every snapshot
@@ -4351,6 +4815,7 @@ mod tests {
             bypass_permission_mode: true,
             interactive_permission_mode: true,
             cli_auto_mode: false,
+            steer: false,
         };
         let mut projection = AgentSessionProjection::default();
         projection.apply(&AgentDomainEvent::SessionOpened {
@@ -4434,6 +4899,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4493,6 +4959,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: true,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4629,6 +5096,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4674,6 +5142,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4712,6 +5181,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4755,6 +5225,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4819,6 +5290,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4912,6 +5384,7 @@ mod tests {
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
+                    steer: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4964,6 +5437,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5083,6 +5557,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5152,6 +5627,7 @@ mod tests {
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
+                steer: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5613,18 +6089,31 @@ mod tests {
 
     #[test]
     fn the_phase_three_envelopes_have_their_exact_shapes() {
-        use crate::tab_set::Queued;
+        use crate::tab_set::{Queued, QueuedState};
         let tab = TabId(4);
-        let queue = [Queued {
-            text: "and the tests".into(),
-            wire: "ctx\n\nand the tests".into(),
-            queued_at_ms: 17,
-        }];
+        let mut steered = Queued::held("look at the parser too", "ctx\n\nlook at the parser too".into(), 12);
+        steered.state = QueuedState::Steered {
+            client_id: "eitri-4-1".into(),
+            sent_at_ms: 12,
+        };
+        let queue = [
+            steered,
+            Queued::held("and the tests", "ctx\n\nand the tests".into(), 17),
+        ];
         let value = |s: String| -> Value { serde_json::from_str(&s).unwrap() };
         assert_eq!(
-            value(serialize_queue_for_js(tab, &queue, Some("refused"))),
-            json!({ "kind": "queue", "tab": 4, "items": [{ "text": "and the tests", "queuedAt": 17 }], "error": "refused" }),
-            "the wire text (with its context) never goes to the panel"
+            value(serialize_queue_for_js(
+                tab,
+                &queue,
+                Some("refused"),
+                Some("held until the turn ends: why"),
+                Some(true)
+            )),
+            json!({ "kind": "queue", "tab": 4, "items": [
+                { "text": "look at the parser too", "queuedAt": 12, "steered": true },
+                { "text": "and the tests", "queuedAt": 17, "steered": false },
+            ], "error": "refused", "note": "held until the turn ends: why", "enterSteers": true }),
+            "the wire text (with its context) and the client id never go to the panel"
         );
         assert_eq!(
             value(serialize_draft_for_js(tab, "half")),
