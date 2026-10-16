@@ -1,107 +1,104 @@
-//! Tests that streaming replies stay at the bottom while following and stay put while reading,
-//! using the WebKitGTK engine linked by `shell`.
+//! Checks that the agent panel keeps streaming replies at the reader's chosen position in
+//! WebKitGTK, the engine `shell` links. With `.row { container-type: inline-size }`, WebKitGTK
+//! 2.52.6 reset `.message-list`'s `scrollTop` to a stale value when the elapsed counter ticked.
+//! `MessageList` read the drop as user scrolling and stopped following, hiding new output.
+//! jsdom has no layout, and Chromium did not reproduce this movement.
 //!
-//! With `.row { container-type: inline-size }`, WebKitGTK 2.52.6 reset `.message-list`'s
-//! `scrollTop` to a stale value on each tick of the status line's elapsed counter.
-//! `MessageList`'s `onScroll` treated that drop as user input and stopped following.
-//! jsdom has no layout, and Chromium does not reproduce the movement, so this test uses
-//! `webkit6` with the document embedded by `agent_panel.rs` and the product's bridge serializers.
-//! It calls `evaluate_javascript` once per 33ms tick, matching the pump's cadence.
+//! The test uses `webkit6` with the document embedded by `agent_panel.rs` and the same
+//! `agent_bridge::serialize_*_for_js` functions used by the product. It calls
+//! `evaluate_javascript` every 33ms, matching the pump's cadence.
 //!
-//! Each scenario runs on 560x740 and 519x480 CSS-px panels at zoom 1.0 and 1.5.
-//! The window size is the CSS size times the zoom.
-//! A 1280x800 panel at zoom 1.0 also checks a reply that fills a wide window.
-//! Its opening code block (`WIDE_CODE`) grows with its long lines, from a 36rem minimum
-//! up to the row's width. The block uses `width: max-content` and `max-width: 100%`.
+//! Run each scenario at 560x740 and 519x480 CSS px with page zoom 1.0 and 1.5, and at
+//! 1280x800 with zoom 1.0. Window dimensions are the CSS dimensions times the zoom.
+//! The reply begins with long code lines (`WIDE_CODE`) that grow with each delta. `index.css`
+//! uses a block-level `pre` with `max-width: 100%` and `overflow-x: auto`, so the code block
+//! stays as wide as its row and scrolls internally without moving the conversation sideways.
 //!
-//! S1 checks following with no input. A scroll event that reports a lower `scrollTop` must
-//! leave the list at its true bottom: without input, a drop is either a bottom clamp or a bug.
-//! The view must never spend more than 250ms over 50px short of the end, and must end at the bottom.
-//! S1(c) additionally checks every following frame in S1 and S6 against `AT_BOTTOM_PX`.
-//! This catches smooth scrolling that leaves a newly mounted reply below the edge for a frame.
+//! - S1, follow: start at the bottom with no input. Any scroll event with a decreased
+//!   `scrollTop` must still be at the true bottom, since a decrease can be a bottom clamp.
+//!   No interval longer than 250ms may stay more than 50px short of the end. Finish at the bottom.
+//! - S2, parked inside the streaming reply: once the second assistant message is 1.5 screens
+//!   tall, send a wheel and let it scroll. After 300ms, require no scroll events, an unchanged
+//!   `scrollTop` in every frame, and the same text offset at the reading point. Later deltas
+//!   append plain paragraphs, excluding markdown restructuring above the reader.
+//! - S3, parked in older history: park before any text arrives and apply S2's stability checks.
+//!   This protects parked readers when follow logic changes.
+//! - S4, re-arm: write `scrollTop = scrollHeight` every 400ms during the turn and apply S1's
+//!   check that a decrease in `scrollTop` still leaves the list at its bottom.
+//! - S5, browser PageUp: focus a control inside the list from the start of the live tool call,
+//!   then send PageUp and its default scroll. The tool row uses `tabindex=-1` because the replay
+//!   has no natively focusable row element. Apply S2's checks. Tracking only wheels, pointers,
+//!   touch drags and panel keys misses this input and can snap the reader back on the next delta.
+//! - S6, sideways swipe: once message 2 is half a screen tall, send eight wheels with
+//!   `deltaX: -40` and sub-pixel vertical jitter. The list must not move; S1 applies throughout.
+//!   A negative `deltaY` alone must not end following when the swipe does not scroll up.
+//! - S7, cancelled wheel followed by a row and silence: cancel an upward wheel at the bottom
+//!   after `MessageList` sees it, then add the live tool row during the gesture. WebKitGTK scrolls
+//!   synthetic wheels unless cancelled. Leave 330ms of quiet before the call to avoid a pending
+//!   snap event, and let the call run about 2s instead of 630ms. Require the bottom within
+//!   `S7_CATCH_UP_LIMIT_MS` of the wheel, when the gesture ends. S1's decrease and final-distance
+//!   checks apply. Waiting for another state change would leave the new row below the view.
+//! - S8, initial scroll event with no movement: once message 2 is half a screen tall, send an
+//!   upward wheel (`S8_WHEEL_DELTA`) just before a text delta, then dispatch a scroll event with
+//!   the list unmoved. WebKitGTK can send this event before its animated wheel scroll starts.
+//!   From `S8_SETTLE_MS` to the turn's end, stay at least half the wheel distance above its start.
+//!   The initial event must not re-arm following and let the delta's snap cancel the wheel.
+//! - S1(c), every following frame at the end: in S1 and S6, require the end within `AT_BOTTOM_PX`
+//!   throughout the turn. S1's 50px/250ms allowance alone permits a smooth scroll to leave a newly
+//!   mounted reply row below the edge for a frame or two.
+//! - S9, layout changes without streaming: after the turn, while following, make four changes
+//!   one second apart. Narrow to `S9_NARROW` of the width, capped at `S9_NARROWED_MAX_CSS_PX`,
+//!   then shorten to `S9_SHORTEN` of the height. Raise the font size with a theme envelope via
+//!   `serialize_theme_for_js`, then set `--page-pad` to `S9_PAGE_PAD` on `.message-list` to narrow
+//!   the rows while leaving the footer's page margin unchanged.
+//!   Require the end by the second sampled frame (`S9_MAX_SHORT_FRAMES`) after each change and
+//!   stay there. Snapping only on state changes misses these layout changes.
+//! - Sideways, every scenario: require `.message-list`'s `scrollWidth` to be within `SIDEWAYS_PX`
+//!   of `clientWidth` in every frame, except the frame sampled during a width change
+//!   (`judge_sideways`). Exercise a long live command (`LIVE_COMMAND`), an older long path
+//!   (`LONG_PATH`) and a long prose URL (`LONG_URL`).
 //!
-//! S2 parks the reader inside the second assistant message once it is 1.5 screens tall,
-//! using a wheel event and its resulting scroll. After a 300ms settle, no scroll event,
-//! frame's `scrollTop`, or text offset at the reading point may move for the rest of the turn.
-//! Only plain paragraphs are appended after parking, so markdown restructuring above the
-//! reader is outside this check. S3 parks in older history before the first text arrives
-//! and checks the same stability, guarding against changes that move parked readers.
+//! Re-snapping before paint while following can hide the size-container bug from S1 and S4:
+//! the engine's drop is corrected before the scroll event reads the position. S2 exposes it
+//! with a parked reader, so keep that coverage. S5 parks similarly but was not checked with
+//! the container restored. `indexCss.test.ts` provides a matching guard without a display.
 //!
-//! S4 writes `scrollTop = scrollHeight` every 400ms to re-arm following; S1's scroll check applies.
-//! S5 parks with the browser's PageUp default action on a focused control inside the list.
-//! The live tool call's row uses `tabindex=-1` because the replay has no focusable row element.
-//! S2's stability checks apply. Tracking only wheels, pointers, touch drags, and panel keys
-//! misses this input and can pull the reader back to the bottom on the next delta.
+//! Parked scroll events are checked by order. `scrollIndex` counts events dispatched before
+//! the park; only later events can move the reader. A `t >= park.t` check can include the
+//! previous delta's snap event, dispatched just before the park callback in the same rendering
+//! update. WebKitGTK's 1ms clock can give both the same timestamp. Each run prints this count.
+//! `judge_self_test` runs synthetic checks without a display on every invocation, including
+//! plain `cargo test --workspace`. It covers timestamp ties, movement that must fail, and a
+//! park with no index.
 //!
-//! S6 sends eight sideways wheels with `deltaX: -40` and sub-pixel vertical jitter once
-//! message 2 is half a screen tall. The list does not move, and S1's checks apply throughout.
-//! A negative `deltaY` alone must not stop following when the gesture does not scroll up.
+//! Trigger checks prevent empty passes. History must span three screens and start at the
+//! bottom; the counter must tick at least five times during streaming; and the turn must grow
+//! the list by two screens. S2, S3 and S5 must park with at least two later counter ticks.
+//! S5 needs focus at least 500ms before PageUp, so focus itself cannot explain the stable park.
+//! S6 needs all eight swipes while following with a screen of growth left. S7 needs its wheel
+//! cancelled at the bottom, the tool row to move the view away from the bottom without wheel
+//! movement, and `S7_MIN_PAUSE_MS` of quiet. S8 needs a wheel while following with a screen of
+//! growth left. S9 needs each change to move the list's end by at least `HIDDEN_PX`, and each
+//! resize must change the list's own box. On the smaller panels, the three long tokens must exceed
+//! the list width in their rendered font.
+//! Every panel also needs code content at least `CODE_OVERFLOW_MIN_PX` wider than its visible
+//! code block, and the block must never exceed its row. This supplies overflow on the wide
+//! panel, where the three tokens fit on one line.
+//! A missed trigger fails as "did not exercise the trigger". Between paragraphs the reading
+//! point can resolve to the row body and track only `scrollTop`; the separate `scrollTop`
+//! checks still cover that case.
 //!
-//! S7 cancels a wheel up at the tail after `MessageList` has seen it, so it moves nothing.
-//! A live tool call's row arrives during the gesture, followed by about 2s of silence.
-//! The replay is quiet for 330ms before the call so no earlier snap event is pending.
-//! The view must return to the bottom within `S7_CATCH_UP_LIMIT_MS` of the wheel,
-//! when the gesture ends. Waiting for the tool result leaves the new row hidden during the pause.
-//! S1's scroll check and the final distance check also apply.
-//!
-//! S8 sends a wheel up (`S8_WHEEL_DELTA`) just before a text delta once message 2 is
-//! half a screen tall. WebKitGTK animates the scroll, but can first report no movement.
-//! That event is dispatched explicitly so every run exercises it. It must not re-arm
-//! following and let the delta's snap cancel the wheel. From `S8_SETTLE_MS` after the wheel
-//! until the turn ends, the view must stay at least half the wheel's distance above its start.
-//!
-//! S9 changes layout four times after the turn ends while the view is following at the bottom.
-//! The changes are a second apart and have no streaming state change to trigger a snap.
-//! The window narrows to `S9_NARROW` of its width, capped at `S9_NARROWED_MAX_CSS_PX`,
-//! then shortens to `S9_SHORTEN` of its height. A theme envelope raises the font size
-//! through `serialize_theme_for_js`. Setting `--page-pad` to `S9_PAGE_PAD` on
-//! `.message-list` narrows only the rows; the foot keeps the page's margin.
-//! Each change must return the view to the end by the second sampled frame
-//! (`S9_MAX_SHORT_FRAMES`) and keep it there. Snapping only on state changes misses these resizes.
-//!
-//! Every scenario checks that `.message-list`'s `scrollWidth` stays within `SIDEWAYS_PX`
-//! of its `clientWidth`. Long tokens exercise overflow: `LIVE_COMMAND` in a live `Bash` call,
-//! `LONG_PATH` in an earlier `Read`, and `LONG_URL` in earlier reply prose.
-//! The single frame sampled while the list's width changes is excluded by `judge_sideways`.
-//!
-//! Re-snapping before paint can hide the size-container bug from S1 and S4 by correcting
-//! the drop before its scroll event. S2 exposes it while the reader is parked, so keep that
-//! coverage. `indexCss.test.ts` provides a guard that does not need a display.
-//!
-//! A park stores `scrollIndex`, the number of scroll events already dispatched.
-//! Only later events can count as moving the parked reader. A previous delta's snap can
-//! dispatch its event just before the park's frame callback in the same rendering update.
-//! WebKitGTK's 1ms clock can give both the same timestamp, so `t >= park.t` counts an old
-//! position as a new movement. Event order avoids this false failure without hiding a later yank.
-//! `judge_self_test` runs without a display on every invocation, including without `--ignored`.
-//! Thus `cargo test --workspace` checks the timestamp tie, a later yank, and a missing index.
-//!
-//! Each run must exercise its trigger. History must be three screens tall and initially
-//! at the bottom, streaming must grow it by two screens, and the elapsed counter must tick
-//! at least five times during streaming. S2/S3/S5 must park with at least two counter ticks
-//! afterward. S5 requires focus inside the list at least 500ms before PageUp so focus itself
-//! cannot explain the park. S6 requires all eight wheels while following with a screen of growth left.
-//! S7 requires a cancelled wheel at the bottom, a new row that leaves the view short without
-//! wheel movement, and `S7_MIN_PAUSE_MS` of silence. S8 requires its wheel while following
-//! with a screen of growth left. S9 requires each change to move the end by at least `HIDDEN_PX`
-//! and each resize to change the list's box. Except on the 1280x800 panel, each long token must
-//! exceed the list's width when measured on one line in its rendered font.
-//! On the 1280x800 panel, the code block must grow at least `WIDE_MIN_OVER_PX` past
-//! its 36rem minimum. On every panel, the code block must never become wider than its row.
-//! Missing a trigger fails as "did not exercise the trigger". A reading point between paragraphs
-//! can resolve to the row body, whose offset tracks only `scrollTop`; the scroll checks still cover it.
-//!
-//! `support/own_x_server.rs` starts an isolated `Xvfb` with a 1920x1200 screen and no input devices.
-//! Inherited `WAYLAND_DISPLAY` and `DISPLAY` are dropped before GTK initialises, so this command
-//! cannot open windows on the invoking desktop:
+//! `support/own_x_server.rs` starts an `Xvfb` with a 1920x1200 screen and no input devices
+//! before GTK initialises. It clears inherited `WAYLAND_DISPLAY` and `DISPLAY` values.
+//! Run with:
 //!
 //!     cargo test -p shell --test panel_stream_scroll -- --ignored
 //!
-//! A 640x480 screen clamps the 1110px-tall window and fails the trigger guard instead of testing
-//! the intended size. The test uses a plain `main` (`harness = false`) because GTK needs the main thread.
-//! Frame and scroll traces go to `$PANEL_STREAM_SCROLL_TRACE_DIR`, defaulting to
-//! `<target tmp>/panel_stream_scroll/`. `PANEL_STREAM_SCROLL_ONLY=S1,S2` selects scenarios.
-//! The configuration matrix is fixed. Each run takes about 15s, with forty-five runs.
+//! A 640x480 screen clamps the 1110px-tall window and causes a missing-trigger failure.
+//! A plain `main` (`harness = false`) keeps GTK on the main thread. Every frame and scroll
+//! event is traced to `$PANEL_STREAM_SCROLL_TRACE_DIR`, default `<target tmp>/panel_stream_scroll/`.
+//! `PANEL_STREAM_SCROLL_ONLY=S1,S2` narrows the scenarios. The matrix is fixed, at about 15s per
+//! run, forty-five runs.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -190,16 +187,16 @@ const LIVE_COMMAND: &str =
 const LONG_PATH: &str =
     "/nonexistent/outside-the-project/a/deeply/nested/directory/with/no/space/in/it/src/components/MessageList.tsx";
 /// The streamed reply's opening: a fenced block whose lines grow, a delta at a time, from a few
-/// characters to wider than the 1280x800 panel's row, so there the block's `width: max-content` box
-/// widens past its 36rem minimum while the view follows, then stops at the row's width
-/// (`max-width: 100%`) and scrolls inside itself; on the narrow panels it scrolls inside the row from its
-/// first long line. Either way the conversation itself must not scroll sideways, and the view must stay
-/// at its end.
+/// characters to wider than the 1280x800 panel's row (the last line is about 215 characters, over
+/// 1500px in a 12px monospace font against a row of about 1150px). The block is always its row wide and
+/// the lines scroll inside it, so what grows is the block's scrollable width; on the narrow panels it
+/// scrolls from the first long line. Either way the conversation itself must not scroll sideways, and
+/// the view must stay at its end.
 const WIDE_CODE: &str = "The call site as it reads now:\n\n```rust\n\
 let request = Request::builder().uri(endpoint).header(\"x-trace\", trace_id).body(payload).expect(\"a request\");\n\
 let response = client.send(request).await.map_err(|error| Error::Transport { endpoint: endpoint.to_string(), source: error })?;\n\
 let decoded: Vec<Record> = serde_json::from_slice(&response.into_body().collect().await?.to_bytes()).map_err(Error::Decode)?;\n\
-for record in decoded.iter().filter(|record| record.kind == Kind::Changed && record.revision > last_seen_revision && !record.tombstone) { apply(record)?; }\n\
+for record in decoded.iter().filter(|record| record.kind == Kind::Changed && record.revision > last_seen_revision && !record.tombstone && record.owner == current_owner && !record.hidden_by_policy) { apply(record)?; }\n\
 ```\n\n";
 /// A URL in an earlier reply's prose, which `marked` turns into a link.
 const LONG_URL: &str =
@@ -207,8 +204,9 @@ const LONG_URL: &str =
 /// A panel at least this wide is the whole-window configuration: the three long tokens fit on one line
 /// there, so the long-line code block is what exercises the sideways check.
 const WIDE_LAYOUT_PX: f64 = 1100.0;
-/// The whole-window vacuity guard: the code block must have grown at least this far past its minimum width.
-const WIDE_MIN_OVER_PX: f64 = 40.0;
+/// The vacuity guard: the code block's content must have been at least this much wider than the block's
+/// own visible width at some point, i.e. a long line really scrolled inside it.
+const CODE_OVERFLOW_MIN_PX: f64 = 40.0;
 /// How far a code block may exceed its row's width: sub-pixel rounding, nothing more.
 const WIDE_PAST_ROW_PX: f64 = 1.0;
 /// How far `.message-list`'s content may reach past its own width: sub-pixel rounding, nothing more.
@@ -897,17 +895,16 @@ const INSTRUMENT: &str = r#"
       }
       f.st = l.scrollTop; f.sh = l.scrollHeight; f.ch = l.clientHeight;
       f.sw = l.scrollWidth; f.cw = l.clientWidth;
-      // The whole-window vacuity guard and the block's cap: how far the streamed reply's long-line code
-      // block grew past its 36rem minimum (`over`), and how far past its row it ever was (`pastRow`), at
-      // most each, over the run. `rem` is the root's font size, which the panel sets from its text size.
+      // The vacuity guard and the block's cap: how far the streamed reply's long-line code block's
+      // content reached past the block's own visible width (`over`: the block scrolls inside itself),
+      // and how far the block itself was past its row (`pastRow`), at most each, over the run.
       const code = Array.from(l.querySelectorAll(".row-assistant .code-block"))
         .find((b) => (b.textContent || "").includes("Request::builder()"));
       const body = code ? code.closest(".row-body") : null;
       if (code && body) {
-        const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 14;
         const w = code.getBoundingClientRect().width;
         const rowW = body.getBoundingClientRect().width;
-        const over = Math.round((w - Math.min(rowW, 36 * rem)) * 10) / 10;
+        const over = Math.round((code.scrollWidth - code.clientWidth) * 10) / 10;
         const pastRow = Math.round((w - rowW) * 10) / 10;
         if (P.wide === null) P.wide = { t: f.t, over, pastRow, row: Math.round(rowW) };
         else {
@@ -1177,8 +1174,8 @@ struct Probe {
     gesture: Option<Value>,
     /// The sideways check's three long tokens, each measured on one line against the list's width.
     tokens: Option<Value>,
-    /// The streamed reply's `WIDE_CODE` block: how far it grew past its minimum width (`over`, the
-    /// largest and when), and how far past its row it ever was (`pastRow`).
+    /// The streamed reply's `WIDE_CODE` block: how far its content reached past its own visible width
+    /// (`over`, the largest and when), and how far past its row the block ever was (`pastRow`).
     wide: Option<Value>,
     rearms: u64,
     list_changes: u64,
@@ -1920,15 +1917,15 @@ fn judge_sideways(config: Config, probe: &Probe, t_start: f64, v: &mut Verdict) 
     }
 }
 
-/// The streamed reply's long-line code block: it is never wider than its row (every configuration), and
-/// on the panel given the whole window (`config.width >= WIDE_LAYOUT_PX`) the run is vacuous unless the
-/// block really grew past its minimum width while the view followed it -- the `width: max-content` rule
-/// this configuration exists for. On a narrower panel its growth is only reported.
+/// The streamed reply's long-line code block: it is never wider than its row, and on every panel the run
+/// is vacuous unless a long line really overflowed the block (content at least `CODE_OVERFLOW_MIN_PX`
+/// wider than its visible width) while the reply streamed -- the block scrolls inside itself, which is
+/// what must neither move the view nor push the conversation sideways.
 fn judge_wide_layout(config: Config, probe: &Probe, v: &mut Verdict) {
     let over = probe.wide.as_ref().and_then(|w| num(w, "over"));
     let past_row = probe.wide.as_ref().and_then(|w| num(w, "pastRow"));
     v.lines.push(format!(
-        "code block: grew {} past its minimum width, at most {} past its row",
+        "code block: its content reached {} past the block's visible width, the block at most {} past its row",
         over.map_or("nothing (not found)".to_string(), |o| format!("{o:.0}px")),
         past_row.map_or("(not found)".to_string(), |o| format!("{o:.0}px"))
     ));
@@ -1937,9 +1934,9 @@ fn judge_wide_layout(config: Config, probe: &Probe, v: &mut Verdict) {
             "code block: the long-line block was {p:.0}px wider than its row (max-width: 100% must hold it to the row)"
         ));
     }
-    if f64::from(config.width) >= WIDE_LAYOUT_PX && over.is_none_or(|o| o < WIDE_MIN_OVER_PX) {
+    if over.is_none_or(|o| o < CODE_OVERFLOW_MIN_PX) {
         v.vacuous.push(format!(
-            "the {}px panel never drew the long-line code block wider than its minimum width (at most {over:?}px)",
+            "the {}px panel's long-line code block never had content wider than its visible width (at most {over:?}px)",
             config.width
         ));
     }
@@ -2126,6 +2123,7 @@ fn synthetic_parked_run(before_write: &[(f64, f64)], after_write: &[(f64, f64)],
         "marks": [{ "t": T_START, "mark": "turn_started" }, { "t": T_END, "mark": "turn_completed" }],
         "park": park, "rearms": 0, "listChanges": 1, "firstText": FIRST_TEXT, "lastText": LAST_TEXT,
         "focused": null, "swipe": null, "tokens": synthetic_tokens(900.0, CW),
+        "wide": { "t": 1.0, "over": 600.0, "pastRow": 0.0, "row": 500 },
         "viewport": { "innerWidth": 560, "innerHeight": 740, "dpr": 1 },
     })
 }
@@ -2223,6 +2221,7 @@ fn synthetic_s9_run(shape: S9Shape) -> Value {
         ],
         "park": null, "rearms": 0, "listChanges": 1, "firstText": FIRST_TEXT, "lastText": LAST_TEXT,
         "focused": null, "swipe": null, "tokens": synthetic_tokens(900.0, 536.0),
+        "wide": { "t": 1.0, "over": 600.0, "pastRow": 0.0, "row": 500 },
         "viewport": { "innerWidth": 560, "innerHeight": 740, "dpr": 1 },
     })
 }
@@ -2373,9 +2372,9 @@ fn judge_self_test() -> Result<usize, String> {
     }
     ran += 1;
 
-    // The code block's guards: on the whole-window panel a block that never grew past its minimum width
-    // (or was never found) leaves the run unexercised; one that did is fine; a narrow panel is not
-    // judged for growth; and a block wider than its row fails on any panel.
+    // The code block's guards, at every width: a block never found, or whose content never reached
+    // `CODE_OVERFLOW_MIN_PX` past its visible width, leaves the run unexercised; one that did is fine;
+    // and a block wider than its row fails.
     let wide_findings = |width: i32, wide: Value| {
         let mut v = Verdict {
             lines: Vec::new(),
@@ -2410,15 +2409,20 @@ fn judge_self_test() -> Result<usize, String> {
             json!({ "t": 1.0, "over": 224.0, "pastRow": 40.0, "row": 1195 }),
             (0, 1),
         ),
-        (560, Value::Null, (0, 0)),
+        (560, Value::Null, (1, 0)),
         (
             560,
-            json!({ "t": 1.0, "over": 0.0, "pastRow": 0.5, "row": 500 }),
+            json!({ "t": 1.0, "over": 39.0, "pastRow": 0.5, "row": 500 }),
+            (1, 0),
+        ),
+        (
+            560,
+            json!({ "t": 1.0, "over": 600.0, "pastRow": 0.5, "row": 500 }),
             (0, 0),
         ),
         (
             560,
-            json!({ "t": 1.0, "over": 0.0, "pastRow": 30.0, "row": 500 }),
+            json!({ "t": 1.0, "over": 600.0, "pastRow": 30.0, "row": 500 }),
             (0, 1),
         ),
     ];
