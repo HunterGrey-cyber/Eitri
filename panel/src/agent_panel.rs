@@ -6550,7 +6550,7 @@ fn web_url(url: &str) -> Option<&str> {
 /// What a click on a link in the panel may hand `UriLauncher`: a web address `web_url` accepts, or a
 /// `mailto:` one. Every other scheme is refused, and so is a relative link (it resolves to the panel's
 /// own base, which `web_url` refuses). The input comes back unchanged.
-fn clicked_link_url(uri: &str) -> Option<&str> {
+pub fn clicked_link_url(uri: &str) -> Option<&str> {
     web_url(uri).or_else(|| mail_url(uri))
 }
 

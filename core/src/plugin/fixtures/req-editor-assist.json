@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "id": 20,
+  "verb": "editor.assist",
+  "args": {
+    "root": "/w/work",
+    "diagnostics": "off",
+    "inlay_hints": "off"
+  }
+}

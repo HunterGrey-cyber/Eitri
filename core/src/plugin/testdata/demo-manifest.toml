@@ -1,0 +1,38 @@
+id = "demo"
+title = "Demo"
+protocol = 1
+site = "build/site"
+entry = "index.html"
+capabilities = ["tasks", "editor.open", "editor.assist", "layout.focus", "state", "net"]
+
+[settings]
+work = { default = "~/demo-work", kind = "dir" }
+
+[roots]
+work = "${work}"
+
+[net]
+origins = ["https://learn.example.org"]
+
+[vars.course]
+chars = "lower-digit-dash"
+max_len = 40
+
+[vars.exercise]
+chars = "lower-digit-dash"
+max_len = 64
+
+[tasks.prepare]
+argv = ["${plugin}/bin/learn", "prepare", "${course}", "${exercise}", "--work", "${work}", "--json"]
+cwd = "${work}"
+timeout_secs = 60
+
+[tasks.watch]
+argv = ["${plugin}/bin/learn", "watch", "${course}", "${exercise}", "--work", "${work}", "--json"]
+cwd = "${work}"
+timeout_secs = 0
+
+[tasks.reset]
+argv = ["${plugin}/bin/learn", "reset", "${course}", "${exercise}", "--work", "${work}", "--json"]
+cwd = "${work}"
+timeout_secs = 60

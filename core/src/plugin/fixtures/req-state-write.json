@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "id": 24,
+  "verb": "state.write",
+  "args": {
+    "key": "preferences",
+    "value": {
+      "course": "rust"
+    }
+  }
+}

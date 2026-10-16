@@ -24,6 +24,8 @@ pub struct Kernel {
     pub keymap: Rc<RefCell<super::keymap::KeymapStore>>,
     /// `eitri.agent.register`: the ACP agents `init.lua` registered, read by the host once it has run.
     pub agents: Rc<RefCell<super::agent::AgentRegistry>>,
+    /// `eitri.plugin.load`: the plugins `init.lua` loaded, read by the host once it has run.
+    pub plugins: Rc<RefCell<super::plugin::PluginRegistry>>,
 }
 
 /// The panel installer for a host that has no Lua panels (the companion window, `eitri-mac`):
@@ -40,6 +42,7 @@ pub fn refuse_panels(lua: &Lua, eitri: &Table) -> mlua::Result<()> {
     let panel = lua.create_table()?;
     panel.set("register", register)?;
     eitri.set("panel", panel)?;
+    super::plugin::refuse_plugins(lua, eitri)?;
     Ok(())
 }
 
@@ -112,6 +115,18 @@ impl Kernel {
         let config = Rc::new(RefCell::new(super::config::ConfigStore::default()));
 
         install_panels(&lua, &eitri)?;
+        // A host that has no plugin pages sets `eitri.plugin` itself (`refuse_panels`); every other host gets the
+        // real call, recording into this registry.
+        let plugins = Rc::new(RefCell::new(super::plugin::PluginRegistry::default()));
+        if matches!(eitri.get::<Value>("plugin")?, Value::Nil) {
+            super::plugin::install(
+                &lua,
+                &eitri,
+                plugins.clone(),
+                crate::plugin::state::PluginStore::eitri_root_from_env(),
+                std::env::var_os("HOME").map(PathBuf::from),
+            )?;
+        }
         super::command::install(&lua, &eitri, commands.clone())?;
         super::event::install(&lua, &eitri, events.clone())?;
         super::config::install(&lua, &eitri, config.clone())?;
@@ -132,6 +147,7 @@ impl Kernel {
             layout,
             keymap,
             agents,
+            plugins,
         })
     }
 
@@ -164,10 +180,11 @@ impl Kernel {
     /// logs and the shell continues with whatever it registered before the error (the editor and
     /// the agent are not registered here at all: every window has them).
     ///
-    /// **Three exceptions, startup failures: a command id `eitri.command.register` refused**
+    /// **Four exceptions, startup failures: a command id `eitri.command.register` refused**
     /// (`CommandRegistry::refused`), **a value `eitri.config.set` could not store**
     /// (`ConfigStore::refused`: a table, a function, a string that is not UTF-8, a key
-    /// that is not a string), **and an agent `eitri.agent.register` refused** (`AgentRegistry::refused`).
+    /// that is not a string), **an agent `eitri.agent.register` refused** (`AgentRegistry::refused`),
+    /// **and a plugin `eitri.plugin.load` refused** (`PluginRegistry::refused`).
     /// All are config values Eitri validates, and like `agent.font_size` or
     /// a keybinding collision (in the host's `main()`) they exit 1 naming themselves -- rather than a window
     /// that silently lacks everything init.lua registered after them, or runs on a key's default:
@@ -186,7 +203,13 @@ impl Kernel {
         let commands = self.commands.borrow();
         let config = self.config.borrow();
         let agents = self.agents.borrow();
-        match commands.refused().or(config.refused()).or(agents.refused()) {
+        let plugins = self.plugins.borrow();
+        match commands
+            .refused()
+            .or(config.refused())
+            .or(agents.refused())
+            .or(plugins.refused())
+        {
             Some(refused) => Err(format!("{} ({})", refused, path.display())),
             None => Ok(()),
         }
@@ -259,6 +282,20 @@ mod tests {
             Some("reached"),
             "register must return without an error"
         );
+    }
+
+    /// A refused plugin is a startup failure naming the call, like a refused command id. (The plugin directory
+    /// does not exist, so nothing is written into this machine's state home.)
+    #[test]
+    fn a_refused_plugin_load_fails_the_start() {
+        let dir = std::env::temp_dir().join(format!("nv-kernel-plugin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = dir.join("init.lua");
+        std::fs::write(&init, "pcall(eitri.plugin.load, '/nonexistent/plugin', {})\n").unwrap();
+        let kernel = Kernel::new(dir.clone(), |_, _| Ok(())).unwrap();
+        let outcome = kernel.run_and_check_init_file(&init);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(outcome.unwrap_err().contains("eitri.plugin.load"));
     }
 
     /// The documented consequence of the custom searcher: extending `package.path` from `init.lua`

@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "id": 25,
+  "verb": "log.append",
+  "args": {
+    "stream": "progress",
+    "items": [
+      {
+        "plugin": "demo",
+        "course": "rust"
+      }
+    ]
+  }
+}

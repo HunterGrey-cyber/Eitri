@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "re": 26,
+  "ok": true,
+  "result": {
+    "items": [
+      {
+        "plugin": "demo",
+        "course": "rust"
+      }
+    ],
+    "next": null
+  }
+}

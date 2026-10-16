@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "event": "task.exit",
+  "data": {
+    "run": 3,
+    "status": "cancelled",
+    "dropped_lines": 0,
+    "dropped_bytes": 0
+  }
+}

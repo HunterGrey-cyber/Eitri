@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "id": 17,
+  "verb": "task.start",
+  "args": {
+    "task": "watch",
+    "vars": {
+      "course": "rust",
+      "exercise": "ch04-02-fix-total-len"
+    }
+  }
+}

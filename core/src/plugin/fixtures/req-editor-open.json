@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "id": 19,
+  "verb": "editor.open",
+  "args": {
+    "path": "/w/work/rust/ch04-02-fix-total-len/src/main.rs",
+    "line": 4,
+    "col": 2
+  }
+}

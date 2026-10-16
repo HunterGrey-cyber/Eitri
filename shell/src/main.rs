@@ -19,6 +19,8 @@ mod module_grid;
 mod pane_focus;
 mod pane_switch;
 mod panel_super;
+mod plugin_page;
+mod plugin_panels;
 mod prefix;
 mod prefix_strip;
 mod process_memory;
@@ -345,6 +347,16 @@ fn build_ui(
     };
     config.apply_to_panel(&agent_panel_handle);
     let keymap = config.keymap.clone();
+
+    // Each `eitri.plugin.load` becomes a Lua panel whose content is the plugin's page. Registered before the
+    // Lua panels are read below, so a plugin is placed, keyed, killed and revived like any Lua panel.
+    let plugin_panels = match plugin_panels::PluginPanels::install(&lua_engine) {
+        Ok(panels) => Rc::new(panels),
+        Err(message) => {
+            eprintln!("eitri: {message}");
+            std::process::exit(1);
+        }
+    };
 
     // The bottom terminal starts hidden on first launch. Its shell starts when it is first shown
     // through any route, via the change hook below. A terminal that is never shown starts no
@@ -1047,6 +1059,15 @@ fn build_ui(
             grid.show_module(id).map(|_| ())
         })
     };
+    // A plugin page's `layout.focus`: the same helpers the prefix uses, so a hidden editor is shown first.
+    {
+        let show_on_screen = show_on_screen.clone();
+        let focus_and_arrive = focus_and_arrive.clone();
+        plugin_panels.set_layout(Rc::new(move |id: &ModuleId| {
+            show_on_screen(id).map_err(|e| e.to_string())?;
+            focus_and_arrive(id).map_err(|e| e.to_string())
+        }));
+    }
     // The scratch round trips (`Ctrl+g`, `gf`): the editor is shown and given the keys before nvim
     // is handed the request, and an edit that came back returns the keys to the chat.
     {
@@ -1077,10 +1098,11 @@ fn build_ui(
             let module_layout = module_layout.clone();
             Rc::new(move || !module_layout.borrow().is_gone(&ModuleId::editor()))
         };
-        agent_panel_handle.set_editor_rpc(Rc::new(editor_rpc::EmbeddedEditorRpc::new(
-            pane.clone(),
-            editor_present,
-        )));
+        // One handle on this window's editor, shared: the chat's turn review and every plugin page ask through it.
+        let editor_rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc> =
+            Rc::new(editor_rpc::EmbeddedEditorRpc::new(pane.clone(), editor_present));
+        agent_panel_handle.set_editor_rpc(editor_rpc.clone());
+        plugin_panels.set_editor(editor_rpc);
     }
     // The review overlay in this window's own nvim: the module goes with the window, and a file the
     // review opened there is shown and given the keys, as a draft being edited is.
@@ -1200,6 +1222,7 @@ fn build_ui(
         let decls = decls.clone();
         let killed = killed.clone();
         let editor_quitting = editor_quitting.clone();
+        let plugin_panels = plugin_panels.clone();
         Rc::new(move |id, confirmed| {
             let scope = eitri_core::layout::can_kill(&module_layout.borrow(), id).map_err(|e| e.to_string())?;
             if scope == KillScope::Window {
@@ -1222,6 +1245,8 @@ fn build_ui(
                 ModuleKind::LuaWebview => {
                     grid.kill_module(id, reopen, &*focus_module)
                         .map_err(|e| e.to_string())?;
+                    // A no-op for a Lua panel that is not a plugin.
+                    plugin_panels.stop(id);
                     if let Some((_, widget, _, _)) = lua_pages.iter().find(|(m, _, _, _)| m == id) {
                         if let Some(webview) = widget.downcast_ref::<webkit6::WebView>() {
                             use webkit6::prelude::*;
@@ -2136,6 +2161,8 @@ fn build_ui(
         // The close path waits for nvim's `:confirm qall` before reaching this handler,
         // so nvim has already exited and that call returns at once. An nvim that cannot
         // be killed refuses the close instead of reaching this handler.
+        // Plugins shut down with the window; the application waits up to the grace period.
+        plugin_panels.shutdown(&app_for_close);
         agent_panel::hold_until_done(&app_for_close, agent_panel_handle.shutdown());
         // `lua_engine` is otherwise unused past this point in this task, but referencing it
         // here is what keeps its `Rc` alive for the life of the window rather than dropping as

@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": 26,
+  "verb": "log.read",
+  "args": {
+    "stream": "progress",
+    "from": "0001:0"
+  }
+}

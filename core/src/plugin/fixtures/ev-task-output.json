@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "event": "task.output",
+  "data": {
+    "run": 3,
+    "stream": "stdout",
+    "lines": [
+      "{\"type\":\"check_started\",\"course\":\"rust\",\"exercise\":\"ch04-02-fix-total-len\",\"input\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+    ]
+  }
+}

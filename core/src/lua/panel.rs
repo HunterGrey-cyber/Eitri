@@ -30,7 +30,7 @@ impl PanelSlot {
         }
     }
 
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "main" => Some(Self::Main),
             "side" => Some(Self::Side),

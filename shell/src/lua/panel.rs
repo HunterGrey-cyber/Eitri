@@ -137,7 +137,7 @@ pub(crate) fn install(
 /// The signal closure uses the callback's `WebView` argument rather than capturing an owned
 /// clone. Capturing a clone would create a strong reference cycle through the view's
 /// signal-handler storage, preventing a replaced panel from being freed.
-fn install_crash_recovery(
+pub(crate) fn install_crash_recovery(
     webview: &webkit6::WebView,
     id: String,
     url: String,

@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "id": 22,
+  "verb": "layout.focus",
+  "args": {
+    "target": "editor"
+  }
+}

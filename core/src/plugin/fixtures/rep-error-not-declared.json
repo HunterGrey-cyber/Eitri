@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "re": 20,
+  "ok": false,
+  "error": {
+    "code": "not_declared",
+    "message": "Capability is not declared"
+  }
+}

@@ -9,7 +9,7 @@
 mod panel;
 
 pub(crate) use eitri_core::lua::panel::PanelSlot;
-pub(crate) use panel::PanelRegistry;
+pub(crate) use panel::{install_crash_recovery, PanelEntry, PanelRegistry};
 
 use eitri_core::lua::kernel::Kernel;
 use std::cell::RefCell;

@@ -29,6 +29,7 @@ pub mod pane_switch;
 pub mod panel_cadence;
 pub mod panel_control;
 pub mod permission_store;
+pub mod plugin;
 pub mod project_root;
 pub mod project_trust;
 pub mod prompt_history;

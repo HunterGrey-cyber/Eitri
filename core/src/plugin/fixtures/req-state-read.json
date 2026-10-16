@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "id": 23,
+  "verb": "state.read",
+  "args": {
+    "key": "preferences"
+  }
+}

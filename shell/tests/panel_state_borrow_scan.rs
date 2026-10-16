@@ -14,7 +14,8 @@
 //!
 //! **What it reads.** Every `.rs` file under the directories in `SCANNED` (relative to the workspace
 //! root; one that is missing or holds no such file fails the scan, and so does a missing anchor: the
-//! panel's state, its message handler and the terminal pane's `send_command`, so a scan whose code moved
+//! panel's state, its message handler and the terminal pane's `send_command`, and the plugin host's
+//! (`core/src/plugin/host.rs`), which page messages reach from a WebKit signal too, so a scan whose code moved
 //! away cannot pass on what is left) as text, comments and string and character
 //! literals blanked out first (so a message or a doc comment that names the shape is not one). For
 //! each `match` keyword, and each `if` or `while` keyword followed by `let`, the scrutinee is
@@ -279,7 +280,7 @@ fn offences(src: &str) -> Vec<(usize, Form, String)> {
 }
 
 /// Directories scanned, relative to the workspace root.
-const SCANNED: &[&str] = &["shell/src", "panel/src", "mac/src"];
+const SCANNED: &[&str] = &["shell/src", "panel/src", "mac/src", "core/src/plugin"];
 
 #[test]
 fn no_scrutinee_holds_a_state_borrow() {
@@ -289,6 +290,7 @@ fn no_scrutinee_holds_a_state_borrow() {
         &read,
         &[
             "struct AgentPanelState",
+            "struct PluginHostState",
             "fn handle_inbound_message(",
             "fn send_command(",
         ],

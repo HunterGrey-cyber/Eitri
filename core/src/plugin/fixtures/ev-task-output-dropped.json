@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "event": "task.output",
+  "data": {
+    "run": 3,
+    "stream": "stderr",
+    "lines": [],
+    "dropped_lines": 1
+  }
+}

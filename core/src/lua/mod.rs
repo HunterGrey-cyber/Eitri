@@ -14,3 +14,4 @@ pub mod kernel;
 pub mod keymap;
 pub mod layout;
 pub mod panel;
+pub mod plugin;

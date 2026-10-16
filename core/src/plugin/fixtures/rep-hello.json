@@ -1,0 +1,36 @@
+{
+  "v": 1,
+  "re": 16,
+  "ok": true,
+  "result": {
+    "host": "eitri",
+    "version": "0.1.0",
+    "protocol": 1,
+    "capabilities": [
+      "tasks",
+      "editor.open",
+      "editor.assist",
+      "layout.focus",
+      "state",
+      "net"
+    ],
+    "roots": {
+      "work": "/w/work",
+      "plugin": "/w/plugin"
+    },
+    "runs": [
+      {
+        "run": 3,
+        "task": "watch",
+        "vars": {
+          "course": "rust",
+          "exercise": "ch04-02-fix-total-len"
+        },
+        "tail": [
+          "{\"type\":\"check_started\",\"course\":\"rust\",\"exercise\":\"ch04-02-fix-total-len\",\"input\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+          "{\"type\":\"check_started\",\"course\":\"rust\",\"exercise\":\"ch04-02-fix-total-len\",\"input\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+        ]
+      }
+    ]
+  }
+}
