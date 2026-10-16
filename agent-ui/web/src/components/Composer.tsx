@@ -504,6 +504,9 @@ export function Composer({
             // One line when empty, the height BROWSE's stand-in has, so `i` does not grow the box and push
             // the conversation up; the layout effect above grows it with the text.
             rows={1}
+            // A fixed name: the placeholder is empty while the box holds the keys (and says different things
+            // otherwise), and a control with no name is announced as just "edit text".
+            aria-label="Message the agent"
             disabled={disabled}
             readOnly={editingInNvim}
             autoFocus

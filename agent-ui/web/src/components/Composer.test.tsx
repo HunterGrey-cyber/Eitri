@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, getByRole, render } from "@testing-library/react";
 import { Composer } from "./Composer";
 import { COMPOSER_CHORDS } from "../composerKeys";
 import { resolveKey } from "../keymap";
@@ -863,5 +863,20 @@ describe("Alt+Enter and backslash+Enter insert a newline (#27, K14)", () => {
     fireEvent.keyDown(textarea, { key: "Enter", altKey: true, keyCode: 229 });
     expect(textarea.value).toBe("x\\");
     expect(onSend).not.toHaveBeenCalled();
+  });
+});
+
+/** The box's placeholder is empty while it holds the keys, and a control named only by its placeholder has no
+ *  name then: a screen reader announced just "edit text". The name is fixed, whatever the placeholder says. */
+describe("Composer: the accessible name", () => {
+  it("is the same fixed name whether the placeholder is empty, a hint or a notice", () => {
+    for (const overrides of [{}, { idleHint: "Ctrl+l to start typing" }, { sessionEnded: true }, { running: true }] as Overrides[]) {
+      const { textarea } = renderComposer(overrides);
+      expect(textarea.getAttribute("aria-label"), JSON.stringify(overrides)).toBe("Message the agent");
+      cleanup();
+    }
+    const { container } = renderComposer();
+    expect(container.querySelector("textarea")!.hasAttribute("placeholder")).toBe(false);
+    expect(getByRole(container, "textbox", { name: "Message the agent" })).toBe(container.querySelector("textarea"));
   });
 });

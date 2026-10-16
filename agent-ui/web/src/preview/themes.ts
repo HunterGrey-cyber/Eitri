@@ -96,6 +96,17 @@ function tinted(p: Palette, toward: string, amount: number): [string, string, st
   return [rgbToHex(fill), rgbToHex(text), rgbToHex(ensureContrastWithPole(muted, fill, text, 4.5))];
 }
 
+// The cursor band's two fills and the composer's focus ring, derived the way `tokens.rs` derives them
+// (`cursor_band_fill`, `focus_ring`): bg mixed toward cursorline in 2% steps from a light start until the
+// fill reaches its minimum against bg; INPUT's colour held to 3:1 against bg.
+function cursorBandFill(bg: Rgb, cursorline: Rgb, start: number, min: number): Rgb {
+  for (let amount = start; amount < 1; amount += 0.02) {
+    const candidate = mix(bg, cursorline, amount);
+    if (contrast(candidate, bg) >= min) return candidate;
+  }
+  return cursorline;
+}
+
 export function themeVars(name: string): Record<string, string> {
   const p = palettes[name] ?? palettes["tokyonight-night"];
   const vars: Record<string, string> = {
@@ -110,6 +121,10 @@ export function themeVars(name: string): Record<string, string> {
     vars[`${prefix}-fg`] = text;
     vars[`${prefix}-muted`] = secondary;
   }
+  const [bg, fg, line] = [hexToRgb(p.bg), hexToRgb(p.fg), hexToRgb(p.cursorline)];
+  vars["cursor-band"] = rgbToHex(cursorBandFill(bg, line, 0.24, 1.08));
+  vars["cursor-band-inactive"] = rgbToHex(cursorBandFill(bg, line, 0.12, 1.035));
+  vars["focus-ring"] = rgbToHex(ensureContrastWithPole(hexToRgb(p.status.insert[0]), bg, fg, 3));
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(vars)) out[`--nv-${k}`] = v;
   for (const [k, v] of Object.entries(p.syn)) out[`--nv-syn-${k}`] = v;

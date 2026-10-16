@@ -4181,6 +4181,7 @@ export default function App() {
             ending: null,
           }}
           paneFocused={paneFocused}
+          entryKey={panelEntryKey(keymapHelp.window, editorLink !== null)}
         />
         {/* `prefix w`'s chooser can open over an empty tab 1 too -- `.agent-ui-root` is this layout's
             own positioned ancestor (it has no `.agent-ui-scroller` to nest inside). */}
@@ -6214,6 +6215,7 @@ export default function App() {
           background: sessionEnded ? null : state.backgroundCalls,
         }}
         paneFocused={paneFocused}
+        entryKey={panelEntryKey(keymapHelp.window, editorLink !== null)}
         onOpenDetail={() => post({ type: "open_detail" })}
         onJump={() => unreadJumpRef.current()}
       />

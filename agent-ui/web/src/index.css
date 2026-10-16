@@ -18,8 +18,8 @@
   --rule-soft: color-mix(in srgb, var(--nv-fg) 13%, var(--nv-bg));
   --rule-frame: color-mix(in srgb, var(--nv-fg) 24%, var(--nv-bg));
   --radius-block: 10px;
-  --band-fill: color-mix(in srgb, var(--nv-cursorline) 24%, var(--nv-bg));
-  --band-fill-inactive: color-mix(in srgb, var(--nv-cursorline) 12%, var(--nv-bg));
+  --band-fill: var(--nv-cursor-band);
+  --band-fill-inactive: var(--nv-cursor-band-inactive);
 }
 * {
   box-sizing: border-box;
@@ -766,8 +766,8 @@ pre {
   box-shadow: 0 3px 0 color-mix(in srgb, var(--nv-fg) 4%, var(--nv-bg));
 }
 .composer:focus-within {
-  border-color: var(--nv-status-insert-bg);
-  outline: 1px solid var(--nv-status-insert-bg);
+  border-color: var(--nv-focus-ring);
+  outline: 1px solid var(--nv-focus-ring);
   outline-offset: 0;
 }
 .composer textarea {
@@ -1032,7 +1032,7 @@ pre {
 /* With them, and the caret in it, the box takes INPUT's colour, as it does on the chat page; the cursor's
    `--nv-fg` frame above is BROWSE's. */
 .agent-ui-root[data-pane-focused="true"] .dash-input .composer:focus-within {
-  border-color: var(--nv-status-insert-bg);
+  border-color: var(--nv-focus-ring);
 }
 .dash-items {
   display: flex;

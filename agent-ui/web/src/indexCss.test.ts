@@ -1879,7 +1879,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     const typing = splitRules(withoutComments).find(
       (r) => r.parent === null && r.selector === '.agent-ui-root[data-pane-focused="true"] .dash-input .composer:focus-within',
     )!;
-    expect(typing.declarations).toMatch(/border-color:\s*var\(--nv-status-insert-bg\);/);
+    expect(typing.declarations).toMatch(/border-color:\s*var\(--nv-focus-ring\);/);
   });
 
   /* 2026-10-16: with no config the editor's statusline sat one row above the panel's band (nvim's command line
@@ -1980,8 +1980,10 @@ describe("index.css cascade (which rule actually wins)", () => {
   it("draws the conversation's cursor as a flat full-bleed band with the keys and a weaker one without", () => {
     const html = (attrs = "") => `<div class="message-list" ${attrs}><div class="cursor-band"></div></div>`;
     expect(computed(html(), ".cursor-band").background).toBe("var(--band-fill)");
-    expect(ROOT_TOKENS.get("--band-fill")).toBe("color-mix(in srgb, var(--nv-cursorline) 24%, var(--nv-bg))");
-    expect(ROOT_TOKENS.get("--band-fill-inactive")).toBe("color-mix(in srgb, var(--nv-cursorline) 12%, var(--nv-bg))");
+    // The fills are the Rust-guarded colours (`cursor_band`, `cursor_band_inactive`), not a mix made here: a
+    // plain 24%/12% mix of cursorline into bg measured 1.02-1.06:1, the only cursor mark being nearly invisible.
+    expect(ROOT_TOKENS.get("--band-fill")).toBe("var(--nv-cursor-band)");
+    expect(ROOT_TOKENS.get("--band-fill-inactive")).toBe("var(--nv-cursor-band-inactive)");
     expect(computed(html('data-focused="false"'), ".cursor-band").background).toBe("var(--band-fill-inactive)");
     expect(computed(html(), ".cursor-band").pointerEvents).toBe("none");
     expect(computed(html(), ".cursor-band").borderRadius).toBe("8px");
@@ -2072,6 +2074,33 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(now.color).toBe("var(--nv-bg)");
   });
 
+  /* A lualine mode block's fill is the editor's own colour and unguarded; with no lualine it is the cursorline
+     stand-in, 1.15:1 on bg. Drawn as the composer's ring it can be fainter than the unfocused frame, so rings,
+     borders and outlines take `--nv-focus-ring` (guarded at 3:1 in Rust) and the mode fills stay fills. */
+  it("never draws a status-block colour as a border, outline or shadow", () => {
+    const stroke = /^(?:border(?:-(?:top|right|bottom|left|inline|block)(?:-[a-z]+)?)?(?:-color)?|outline(?:-color)?|box-shadow|text-decoration(?:-color)?|caret-color|accent-color)$/i;
+    const offenders: string[] = [];
+    for (const rule of splitRules(withoutComments)) {
+      for (const raw of rule.declarations.split(";")) {
+        const m = raw.trim().match(/^([a-z-]+)\s*:\s*(.*)$/is);
+        if (m !== null && stroke.test(m[1]) && /var\(--nv-status-(?:normal|insert|visual)-bg\)/.test(m[2])) {
+          offenders.push(`${rule.selector} { ${raw.trim()} }`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+    // The guard sees what it claims to: a ring written in a mode fill is caught.
+    const bad = splitRules(".composer:focus-within { outline: 1px solid var(--nv-status-insert-bg); }");
+    expect(/var\(--nv-status-insert-bg\)/.test(bad[0].declarations)).toBe(true);
+    // The two focus rules draw the guarded ring.
+    const ring = splitRules(withoutComments).filter((r) => r.selector.endsWith(".composer:focus-within"));
+    expect(ring.map((r) => r.selector).sort()).toEqual([
+      '.agent-ui-root[data-pane-focused="true"] .dash-input .composer:focus-within',
+      ".composer:focus-within",
+    ]);
+    for (const r of ring) expect(r.declarations).toContain("var(--nv-focus-ring)");
+  });
+
   /* The composer uses the page background inside a thin frame, with slightly rounder corners
      than the conversation blocks and a prompt cell before the text. */
   it("draws the composer as a framed box on the page with a prompt cell, and a visible ring over it while it has the keys", () => {
@@ -2082,7 +2111,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(box.declarations).toMatch(/border:\s*1px solid var\(--rule-frame\);/);
     expect(rules.find((r) => r.selector === ".composer::before")).toBeUndefined();
     const focus = rules.find((r) => r.selector === ".composer:focus-within")!;
-    expect(focus.declarations).toMatch(/outline:\s*1px solid var\(--nv-status-insert-bg\);/);
+    expect(focus.declarations).toMatch(/outline:\s*1px solid var\(--nv-focus-ring\);/);
+    expect(focus.declarations).toMatch(/border-color:\s*var\(--nv-focus-ring\);/);
   });
   /** The composer is one framed box on the page (2026-10-15, after a tinted one; flat 2026-10-14; a rounded card from 2026-10-13); nothing inside it draws a second box. The r2-gui
    *  GUI pass (2026-09-26) saw BROWSE's stand-in boxed, and WebKit's own focus ring drawing a box round

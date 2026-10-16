@@ -7,6 +7,10 @@ type Props = {
   /** Same claim `Footer`'s old mode block made: dim,
    *  never hidden, while this pane lacks the keys. */
   paneFocused: boolean;
+  /** The key that brings the keyboard into this panel (`panelEntryKey`), named in the dim mode block's title.
+   *  `null` or absent when the window lists none (a companion window, or before the keymap arrives): the
+   *  title then says only that the pane lacks the keys, rather than naming a key that may not be bound. */
+  entryKey?: string | null;
   /** A click anywhere on the band except the `↓N` button: what `StatusRow`
    *  used to do for its whole row. Absent on the start screen, which never opened the popover from
    *  here either. */
@@ -29,7 +33,13 @@ function pillGlyphMode(pill: string): string | undefined {
  *  own function because the band-open element it goes inside is a `<button>` or a `<div>`
  *  depending on whether a click does anything (see that element's own doc comment), and JSX cannot
  *  share children between two different host elements without factoring the children out first. */
-function renderLeftSeg(seg: Seg, facts: BandFacts, paneFocused: boolean, glyphMode: string | undefined) {
+function renderLeftSeg(
+  seg: Seg,
+  facts: BandFacts,
+  paneFocused: boolean,
+  glyphMode: string | undefined,
+  entryKey: string | null | undefined,
+) {
   if (seg.id === "mode") {
     return (
       <span
@@ -38,7 +48,11 @@ function renderLeftSeg(seg: Seg, facts: BandFacts, paneFocused: boolean, glyphMo
         data-mode={facts.mode}
         data-focused={paneFocused ? "true" : "false"}
         data-testid="mode-block"
-        title={paneFocused ? undefined : "This pane does not have keyboard focus (Ctrl+l to focus it)"}
+        title={
+          paneFocused
+            ? undefined
+            : `This pane does not have keyboard focus${entryKey == null ? "" : ` (${entryKey} to focus it)`}`
+        }
       >
         {/* BROWSE/INPUT is a claim about where typing lands, so it is drawn only while
             this pane holds the keys. Without them the block stays, dim and empty, as an inactive
@@ -74,7 +88,7 @@ function renderLeftSeg(seg: Seg, facts: BandFacts, paneFocused: boolean, glyphMo
  *  pixels a mono character actually takes (a hidden `.band-measure` span, re-measured whenever its
  *  own box changes size -- a font-size or theme push included, since either changes what that span
  *  renders at) and the band's own content-box width, and turning each `Seg` into markup. */
-export function StatusBand({ facts, paneFocused, onOpenDetail, onJump }: Props) {
+export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump }: Props) {
   const bandRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
   const [widthPx, setWidthPx] = useState(0);
@@ -130,10 +144,10 @@ export function StatusBand({ facts, paneFocused, onOpenDetail, onJump }: Props) 
           classes, no click handling and no place in `controlsOf`'s selector. */}
       {onOpenDetail !== undefined ? (
         <button type="button" className="band-open" onClick={onOpenDetail}>
-          {left.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode))}
+          {left.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey))}
         </button>
       ) : (
-        <div className="band-open">{left.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode))}</div>
+        <div className="band-open">{left.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey))}</div>
       )}
       <span className="band-spacer" />
       <div className="band-right">

@@ -101,6 +101,14 @@ describe("EmptyTab: the box is the dashboard's New session row", () => {
     expect(away.container.querySelector("textarea")!.hasAttribute("placeholder")).toBe(false);
   });
 
+  it("gives the start screen's box a fixed accessible name whatever its placeholder says", () => {
+    for (const props of [{ paneFocused: true }, { paneFocused: false, entryKey: "Ctrl+l" }]) {
+      const rendered = renderEmpty(props);
+      expect(rendered.container.querySelector("textarea")!.getAttribute("aria-label")).toBe("Message the agent");
+      rendered.unmount();
+    }
+  });
+
   it("names the key it was given, not a literal one, and names none when it has none", () => {
     const remapped = renderEmpty({ paneFocused: false, entryKey: "Alt+l" });
     expect(remapped.container.querySelector("textarea")!.getAttribute("placeholder")).toBe("Alt+l to start typing");

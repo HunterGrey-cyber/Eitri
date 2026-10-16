@@ -238,3 +238,20 @@ it("draws the interrupted-revert notice with the review pointer off, in the band
   expect(container.querySelector(".band-review")).toBeNull();
   expect(container.querySelectorAll(".band-recovery[style]")).toHaveLength(0);
 });
+
+/** The dim mode block says which key brings the keys here, and the key is the window's own (`panelEntryKey`),
+ *  not a literal: remapped it must read the remapped one, and with none known the clause is left out. */
+it("names the panel-entry key in the dim mode block's title, and leaves the clause out where there is none", () => {
+  const title = (props: { entryKey?: string | null; paneFocused?: boolean }) => {
+    const { container } = render(<StatusBand facts={RUNNING} paneFocused={props.paneFocused ?? false} entryKey={props.entryKey} />);
+    const text = container.querySelector<HTMLElement>('[data-testid="mode-block"]')!.getAttribute("title");
+    cleanup();
+    return text;
+  };
+  expect(title({ entryKey: "Ctrl+l" })).toBe("This pane does not have keyboard focus (Ctrl+l to focus it)");
+  expect(title({ entryKey: "Alt+l" })).toBe("This pane does not have keyboard focus (Alt+l to focus it)");
+  expect(title({ entryKey: null })).toBe("This pane does not have keyboard focus");
+  expect(title({})).toBe("This pane does not have keyboard focus");
+  // With the keys there is no title at all.
+  expect(title({ entryKey: "Ctrl+l", paneFocused: true })).toBeNull();
+});

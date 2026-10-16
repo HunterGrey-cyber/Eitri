@@ -24,6 +24,15 @@ const TEXT_CONTRAST: f64 = 4.5;
 const UI_CONTRAST: f64 = 3.0;
 /// Only needs to be visibly a band. Not a WCAG figure.
 const CURSORLINE_CONTRAST: f64 = 1.15;
+/// The conversation cursor has only a filled band, so its fill must remain visible.
+/// Start with a light mix of `cursorline` into `bg` and raise it in 2% steps until it reaches
+/// the contrast threshold against `bg`, with a weaker band when the panel lacks keyboard focus.
+/// A fixed 24%/12% mix measured only 1.02-1.06:1 on tokyonight and rose-pine dawn, which shows no
+/// band at all. These are visibility thresholds, not WCAG figures.
+const CURSOR_BAND_CONTRAST: f64 = 1.08;
+const CURSOR_BAND_INACTIVE_CONTRAST: f64 = 1.035;
+const CURSOR_BAND_START: f64 = 0.24;
+const CURSOR_BAND_INACTIVE_START: f64 = 0.12;
 
 /// The panel's prose face, and the window chrome's. IBM Plex Sans where it is installed; otherwise the
 /// desktop's own sans (Adwaita Sans on GNOME, Inter, then whatever `system-ui` names -- San Francisco on
@@ -196,6 +205,20 @@ pub struct ThemeTokens {
     pub status_normal: (Rgb, Rgb),
     pub status_insert: (Rgb, Rgb),
     pub status_visual: (Rgb, Rgb),
+    /// The fill of the conversation's cursor band while the panel holds the keys, and the weaker one
+    /// while it does not: `bg` mixed toward `cursorline` from a light start until the fill reaches
+    /// `CURSOR_BAND_CONTRAST` / `CURSOR_BAND_INACTIVE_CONTRAST` against `bg`, never past `cursorline`
+    /// itself. Both are therefore between `bg` and `cursorline`, so the text `cursorline` was guarded
+    /// for still reads on them.
+    pub cursor_band: Rgb,
+    pub cursor_band_inactive: Rgb,
+    /// The ring a focused composer draws, guarded at `UI_CONTRAST` against `bg` (the composer's own
+    /// fill). INPUT's colour, from lualine's insert section where there is one: that block's `bg` is
+    /// the editor's own colour and unguarded, and where it is close to `bg` (or is the `cursorline`
+    /// stand-in, 1.15:1) a ring drawn in it is fainter than the unfocused frame. Without lualine it
+    /// starts from `String`'s foreground, the colour `mode_input` already names. A border, outline or
+    /// fill only, like `warn`; never text.
+    pub focus_ring: Rgb,
     /// `(suffix, colour)` in `SYNTAX` order.
     pub syntax: Vec<(&'static str, Rgb)>,
     /// A CSS `font-family` value.
@@ -391,6 +414,21 @@ impl ThemeTokens {
         let (warn_tint, warn_tint_fg, warn_tint_muted) = tinted(warn, 0.06);
         let (error_tint, error_tint_fg, error_tint_muted) = tinted(error, 0.09);
 
+        let cursor_band = cursor_band_fill(bg, cursorline, CURSOR_BAND_START, CURSOR_BAND_CONTRAST);
+        let cursor_band_inactive = cursor_band_fill(
+            bg,
+            cursorline,
+            CURSOR_BAND_INACTIVE_START,
+            CURSOR_BAND_INACTIVE_CONTRAST,
+        );
+        let mode_input = g.fg_of(&["String"]).unwrap_or(fg);
+        let focus_ring = ensure_contrast_with_pole(
+            lualine_block(&g, "lualine_a_insert").map_or(mode_input, |(fill, _)| fill),
+            bg,
+            fg,
+            UI_CONTRAST,
+        );
+
         ThemeTokens {
             bg,
             fg,
@@ -441,7 +479,10 @@ impl ThemeTokens {
             status_insert: status_block(&g, "lualine_a_insert", cursorline, fg),
             status_visual: status_block(&g, "lualine_a_visual", cursorline, fg),
             mode_browse: function.unwrap_or(fg),
-            mode_input: g.fg_of(&["String"]).unwrap_or(fg),
+            mode_input,
+            cursor_band,
+            cursor_band_inactive,
+            focus_ring,
             syntax: SYNTAX
                 .iter()
                 .map(|&(name, ts, legacy)| (name, g.fg_of(&[ts, legacy]).unwrap_or(fg)))
@@ -491,6 +532,9 @@ impl ThemeTokens {
             ("status-insert-fg", self.status_insert.1),
             ("status-visual-bg", self.status_visual.0),
             ("status-visual-fg", self.status_visual.1),
+            ("cursor-band", self.cursor_band),
+            ("cursor-band-inactive", self.cursor_band_inactive),
+            ("focus-ring", self.focus_ring),
         ];
         let mut vars: Vec<(String, String)> = colours
             .into_iter()
@@ -543,10 +587,29 @@ pub(crate) fn mono_font_stack(guifont: &str) -> String {
 /// A statusline mode section's `(bg, fg)` as the group draws it, or `fallback` when the group is missing
 /// or leaves either colour to Normal (`ThemeTokens::status_normal`).
 fn status_block(g: &Groups<'_>, group: &str, fallback_bg: Rgb, fallback_fg: Rgb) -> (Rgb, Rgb) {
+    lualine_block(g, group).unwrap_or((fallback_bg, fallback_fg))
+}
+
+/// A lualine mode section's `(bg, fg)`, or `None` when the group is missing or leaves either colour to Normal.
+fn lualine_block(g: &Groups<'_>, group: &str) -> Option<(Rgb, Rgb)> {
     match g.payload.groups.get(group).map(|attrs| g.effective(attrs)) {
-        Some((Some(fg), Some(bg))) => (bg, fg),
-        _ => (fallback_bg, fallback_fg),
+        Some((Some(fg), Some(bg))) => Some((bg, fg)),
+        _ => None,
     }
+}
+
+/// `bg` mixed toward `cursorline` in 2% steps from `start`, stopping at the first step that reaches `min`
+/// contrast against `bg`; `cursorline` itself when none does (the fill never goes past it).
+fn cursor_band_fill(bg: Rgb, cursorline: Rgb, start: f64, min: f64) -> Rgb {
+    let mut amount = start;
+    while amount < 1.0 {
+        let candidate = bg.mix(cursorline, amount);
+        if candidate.contrast(bg) >= min {
+            return candidate;
+        }
+        amount += 0.02;
+    }
+    cursorline
 }
 
 /// Neovide's `guifont` height when the option names none, in points (`font_options.rs`,
@@ -610,13 +673,14 @@ mod tests {
         assert_eq!(t.fg.hex(), "#e0e2ea");
         assert_eq!(t.color_scheme, "dark");
         let vars = t.css_vars();
-        // 45, and the status band's three mode blocks as a bg and fg each (2026-10-15).
-        assert_eq!(vars.len(), 51);
+        // 45, the status band's three mode blocks as a bg and fg each (2026-10-15), and the cursor band's two
+        // fills with the composer's focus ring.
+        assert_eq!(vars.len(), 54);
         assert!(vars
             .iter()
             .all(|(name, value)| name.starts_with("--nv-") && !value.is_empty()));
         let names: std::collections::HashSet<_> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 51, "no duplicate variable names");
+        assert_eq!(names.len(), 54, "no duplicate variable names");
         // The count alone would be satisfied by any variable at all, and this one carries a UNIT --
         // a bare `14` reaches the panel as an invalid `font-size` and every ratio built on it
         // silently falls back to the browser default.
@@ -1124,6 +1188,130 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The conversation's cursor band is its only cursor mark, so on every hard palette its fill is a mix of
+    /// `bg` and `cursorline` that reaches the minimum against `bg` (the weaker one too), or is `cursorline`
+    /// itself where even that is as visible as the palette allows; the focused fill is never fainter than
+    /// the unfocused one.
+    #[test]
+    fn the_cursor_band_is_visible_against_bg_on_every_hard_palette() {
+        for (name, t) in hard_palettes() {
+            for (label, fill, min) in [
+                ("cursor_band", t.cursor_band, CURSOR_BAND_CONTRAST),
+                (
+                    "cursor_band_inactive",
+                    t.cursor_band_inactive,
+                    CURSOR_BAND_INACTIVE_CONTRAST,
+                ),
+            ] {
+                let contrast = fill.contrast(t.bg);
+                assert!(
+                    contrast >= min || fill == t.cursorline,
+                    "{name}: {label} {} on bg {} is {contrast:.3}:1 (needs {min})",
+                    fill.hex(),
+                    t.bg.hex()
+                );
+                assert!(
+                    t.cursorline.contrast(t.bg) >= contrast - 1e-9,
+                    "{name}: {label} must not go past cursorline"
+                );
+            }
+            assert!(
+                t.cursor_band.contrast(t.bg) >= t.cursor_band_inactive.contrast(t.bg),
+                "{name}: the focused band is the stronger one"
+            );
+            assert!(
+                t.cursor_band.contrast(t.fg) >= TEXT_CONTRAST || t.fg.contrast(t.bg) < TEXT_CONTRAST,
+                "{name}: fg still reads on the band, {:.2}",
+                t.cursor_band.contrast(t.fg)
+            );
+        }
+    }
+
+    /// The minimum is a floor the fill is raised to, not a ceiling: the plain 24%/12% mix is kept where it
+    /// already shows, and raised where it does not.
+    #[test]
+    fn the_cursor_band_starts_light_and_is_raised_only_as_far_as_the_minimum_needs() {
+        let (bg, line) = (Rgb::from_u32(0x1a1b26), Rgb::from_u32(0x283457));
+        // tokyonight-night: 24% / 12% measured 1.06 / 1.03.
+        assert!(bg.mix(line, CURSOR_BAND_START).contrast(bg) < CURSOR_BAND_CONTRAST);
+        let band = cursor_band_fill(bg, line, CURSOR_BAND_START, CURSOR_BAND_CONTRAST);
+        assert!(band.contrast(bg) >= CURSOR_BAND_CONTRAST);
+        // One step less would not have reached it: no more is added than needed.
+        let steps = ((0..60)
+            .map(|i| CURSOR_BAND_START + 0.02 * f64::from(i))
+            .find(|a| bg.mix(line, *a) == band)
+            .expect("the result is one of the steps")
+            - CURSOR_BAND_START)
+            / 0.02;
+        assert!(steps > 0.5, "raised at least one step");
+        let previous = bg.mix(line, CURSOR_BAND_START + 0.02 * (steps.round() - 1.0));
+        assert!(previous.contrast(bg) < CURSOR_BAND_CONTRAST);
+        // A fill that already shows is left as the light mix.
+        let bright = Rgb::from_u32(0x606060);
+        assert_eq!(
+            cursor_band_fill(bg, bright, CURSOR_BAND_START, CURSOR_BAND_CONTRAST),
+            bg.mix(bright, CURSOR_BAND_START)
+        );
+        // An unreachable minimum stops at cursorline, never past it.
+        assert_eq!(
+            cursor_band_fill(bg, Rgb::from_u32(0x1b1c27), 0.24, 1.5),
+            Rgb::from_u32(0x1b1c27)
+        );
+        // Reaches the panel as two variables.
+        let vars: HashMap<String, String> = ThemeTokens::fallback().css_vars().into_iter().collect();
+        assert!(vars["--nv-cursor-band"].starts_with('#') && vars["--nv-cursor-band-inactive"].starts_with('#'));
+    }
+
+    /// The composer's focus ring is a border and outline, so it is held to the non-text 3:1 against `bg` on
+    /// every hard palette, with lualine's insert section or without it. A lualine insert block that is
+    /// itself the faint `cursorline` stand-in must not be what the ring falls back to.
+    #[test]
+    fn the_composer_focus_ring_reaches_ui_contrast_on_bg_with_and_without_lualine() {
+        for (name, t) in hard_palettes() {
+            assert!(
+                t.focus_ring.contrast(t.bg) >= UI_CONTRAST,
+                "{name}: focus_ring {} on bg {} is {:.2}:1",
+                t.focus_ring.hex(),
+                t.bg.hex(),
+                t.focus_ring.contrast(t.bg)
+            );
+        }
+        let normal = ("Normal", hl(Some(0xc0caf5), Some(0x1a1b26)));
+        // No lualine at all: not the 1.15:1 cursorline stand-in `status_insert` falls back to.
+        let plain = ThemeTokens::derive(&payload(
+            "dark",
+            &[normal.clone(), ("String", hl(Some(0x9ece6a), None))],
+        ));
+        assert_eq!(plain.status_insert.0, plain.cursorline);
+        assert!(
+            plain.status_insert.0.contrast(plain.bg) < UI_CONTRAST,
+            "the stand-in really is faint"
+        );
+        assert!(plain.focus_ring.contrast(plain.bg) >= UI_CONTRAST);
+        assert_eq!(
+            plain.focus_ring,
+            Rgb::from_u32(0x9ece6a),
+            "String's colour already reads: kept as it is"
+        );
+        // No lualine and no String either: fg-ward from the fallback, still 3:1.
+        let bare = ThemeTokens::derive(&payload("dark", &[normal.clone()]));
+        assert!(bare.focus_ring.contrast(bare.bg) >= UI_CONTRAST);
+        // A lualine insert block too close to bg is walked toward fg until it reads; one that reads is kept.
+        let faint = ThemeTokens::derive(&payload(
+            "dark",
+            &[normal.clone(), ("lualine_a_insert", hl(Some(0x15161e), Some(0x1e2030)))],
+        ));
+        assert_eq!(faint.status_insert.0, Rgb::from_u32(0x1e2030));
+        assert!(faint.focus_ring.contrast(faint.bg) >= UI_CONTRAST);
+        let strong = ThemeTokens::derive(&payload(
+            "dark",
+            &[normal, ("lualine_a_insert", hl(Some(0x15161e), Some(0x9ece6a)))],
+        ));
+        assert_eq!(strong.focus_ring, Rgb::from_u32(0x9ece6a));
+        let vars: HashMap<String, String> = strong.css_vars().into_iter().collect();
+        assert_eq!(vars["--nv-focus-ring"], "#9ece6a");
     }
 
     #[test]

@@ -624,6 +624,27 @@ describe("App handshake", () => {
     expect(hint(container)).toBeNull();
   });
 
+  it("names the window's own key in the dim mode block of both bands, and none where the window lists none", () => {
+    const modeTitle = (container: HTMLElement) =>
+      container.querySelector('.status-band [data-testid="mode-block"]')?.getAttribute("title") ?? null;
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ kind: "pane_focus", focused: false });
+    expect(modeTitle(container)).toBe("This pane does not have keyboard focus");
+    dispatch({
+      kind: "keymap", prefix: "Ctrl+b", window: [{ keys: "Alt+h / Alt+l", what: "Module left / right" }],
+      prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c",
+    });
+    expect(modeTitle(container)).toBe("This pane does not have keyboard focus (Alt+l to focus it)");
+    // The conversation's band, from a live tab.
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
+    expect(modeTitle(container)).toBe("This pane does not have keyboard focus (Alt+l to focus it)");
+    dispatch({ kind: "editor_link", state: "attached", text: "nvim" });
+    expect(modeTitle(container)).toBe("This pane does not have keyboard focus");
+  });
+
   it("says a tab's agent has no manual mode in the band's message slot", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
