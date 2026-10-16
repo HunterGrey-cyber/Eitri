@@ -66,6 +66,15 @@ export function agentWord(agent: string | undefined): string | null {
   return agent!.startsWith("acp:") ? agent!.slice(4) : agent!;
 }
 
+/** The modes a tab of this agent offers, in `Shift+Tab`'s order. The handshake's list is the client's; an ACP agent
+ *  sets its own mode once, when its session starts, so manual would promise a stricter agent than Eitri can make
+ *  it and its tab cycles auto and bypass only (`AgentId::permission_modes` in `core/src/agent_backend.rs`, which
+ *  this mirrors: a tab has no list of its own on the wire). */
+export function tabPermissionModes(offered: PermissionModeChoice[], agent: string | undefined): PermissionModeChoice[] {
+  const isAcp = agent !== undefined && agent.startsWith("acp:");
+  return isAcp ? offered.filter((mode) => mode !== "manual") : offered;
+}
+
 export function activeTabInfo(tabs: TabsEnvelope | null): TabInfo | null {
   if (tabs === null) return null;
   return tabs.tabs.find((t) => t.id === tabs.active) ?? null;

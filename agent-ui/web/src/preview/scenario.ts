@@ -138,6 +138,16 @@ export function withAgent(packets: unknown[], agent: PreviewAgent): unknown[] {
   });
 }
 
+/** The same scenario with the tab in `mode`, and the handshake offering all three modes (the scripted
+ *  Claude scenarios offer two): what the page shows for a manual tab. */
+export function withMode(packets: unknown[], mode: "manual" | "auto" | "bypass"): unknown[] {
+  return (packets as { kind: string; tabs?: Record<string, unknown>[] }[]).map((p) => {
+    if (p.kind === "tabs") return { ...p, tabs: p.tabs!.map((t) => ({ ...t, mode })) };
+    if (p.kind === "hello") return { ...p, permissionModes: ["manual", "auto", "bypass"] };
+    return p;
+  });
+}
+
 /** The items of a scripted snapshot carry `seq`s written with gaps filled by fractions (a thought slotted
  *  in between two items); this gives every item the integer of its place in the one order, as Rust's
  *  numbering would, and moves the snapshot's revision past them. */

@@ -1869,6 +1869,9 @@ input::placeholder {
 .status-band--wrap .band-message {
   white-space: normal;
   overflow-wrap: anywhere;
+  /* The band's content sits in a <button>, whose own text is centred; a sentence of several lines reads from
+     its left edge, beside the mode block. */
+  text-align: left;
 }
 /* The mode section, drawn the way the editor's statusline draws its own beside it (2026-10-15): lualine's
    mode section -- its colours for the mode (`--nv-status-*`: `lualine_a_normal` for BROWSE and HINT,

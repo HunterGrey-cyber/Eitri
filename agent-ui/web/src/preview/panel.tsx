@@ -1,6 +1,6 @@
 // The panel as the preview page shows it: the real app, fed a scripted conversation instead of
 // Rust, with outgoing messages logged rather than delivered.
-import { scenarioPackets, withAgent, type PreviewAgent, type Scenario, type ThinkingLevel } from "./scenario";
+import { scenarioPackets, withAgent, withMode, type PreviewAgent, type Scenario, type ThinkingLevel } from "./scenario";
 import { themeVars } from "./themes";
 
 const params = new URLSearchParams(location.search);
@@ -24,14 +24,18 @@ const withHistory = (packets: unknown[]): unknown[] =>
         };
         return { ...packet, state: { ...packet.state, history } };
       });
-const packets = withHistory(withAgent(
+// `mode=manual|auto|bypass`: the tab runs in that mode (the scenarios script auto).
+const mode = params.get("mode");
+const withTabMode = (packets: unknown[]): unknown[] =>
+  mode === "manual" || mode === "auto" || mode === "bypass" ? withMode(packets, mode) : packets;
+const packets = withHistory(withTabMode(withAgent(
   scenarioPackets(
     (params.get("scenario") ?? "running") as Scenario,
     theme,
     (params.get("thinking") ?? "collapsed") as ThinkingLevel,
   ),
   (params.get("agent") ?? "claude") as PreviewAgent,
-));
+)));
 // A draft typed into the box goes in the way Rust's own copy of a draft does (a `draft` envelope for the
 // active tab), then INPUT is entered so the menu opens as it would for a user who had typed it.
 const draft = params.get("draft");
@@ -42,6 +46,9 @@ function feed() {
   }
   for (const p of packets) window.__eitriDispatch(JSON.stringify(p));
   if (draft) window.__eitriDispatch(JSON.stringify({ kind: "draft", tab: 1, text: draft }));
+  // `notice=TEXT` is a line Rust says once, which the band shows as its flash.
+  const notice = params.get("notice");
+  if (notice) window.__eitriDispatch(JSON.stringify({ kind: "notice", text: notice }));
   if (params.get("input") === "1" || draft) window.__eitriDispatch(JSON.stringify({ kind: "enter_input" }));
   // `esc=1` presses Esc once things have landed: the start screen opens in INSERT, and this shows its BROWSE.
   if (params.get("esc") === "1") {

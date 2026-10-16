@@ -750,6 +750,22 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
 /** One line of the `?` keymap: the key as a person types it, and what it does. */
 export type KeyHelp = { keys: string; what: string };
 
+/** The row `shell`'s "Anywhere in the window" section prints for moving between modules (`eitri_core::keymap::root::
+ *  help_rows`; a Rust test pins the words): its keys read `<left> / <right>`. The panel sits in the module to the
+ *  right of the editor, so the second key is the one that brings the keyboard into it. */
+const MODULE_MOVE_ROW = "Module left / right";
+
+/** The key that brings the keyboard into this panel, read from the window keys the `?` sheet lists, or `null` when
+ *  they list none: a companion window holds only the panel, and its one root row says the window manager decides
+ *  where focus goes, and before the `keymap` envelope arrives there are no rows at all. A hint with no key to name
+ *  is left out rather than guessed. */
+export function panelEntryKey(windowKeys: KeyHelp[], companion: boolean): string | null {
+  if (companion) return null;
+  const row = windowKeys.find((help) => help.what === MODULE_MOVE_ROW);
+  const keys = row?.keys.split(" / ").map((key) => key.trim());
+  return keys !== undefined && keys.length === 2 && keys[1] !== "" ? keys[1] : null;
+}
+
 /** The PageUp row's text under the effective prefix (`KeymapHelp.prefix`, as a person reads it). vim's way
  *  back a page is `Ctrl+b`, which this panel never claims (`resolveKey`'s `Ctrl+f` note); the row says why
  *  only when `Ctrl+b` really is the prefix -- under another one (`Ctrl+a`) naming `Ctrl+b` as

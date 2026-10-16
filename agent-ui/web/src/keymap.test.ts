@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { noteKey } from "./heldSuper";
-import { BROWSE_KEYS, CARET_KEYS, FIXED_PAIRS, INPUT_KEYS, VISUAL_KEYS, isPlainAnswerKey, resolveKey } from "./keymap";
+import { BROWSE_KEYS, CARET_KEYS, FIXED_PAIRS, INPUT_KEYS, VISUAL_KEYS, isPlainAnswerKey, panelEntryKey, resolveKey } from "./keymap";
 import type { KeyContext, KeyLike, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 
 const key = (
@@ -1153,6 +1153,25 @@ describe("the ? keymap tables", () => {
 /* The a/d/D cases and `App.tsx`'s bypass-confirm y share `isPlainAnswerKey`.
    Test it directly so callers can rely on its modifier and composition checks independently
    of the routing in `resolveKey`. */
+describe("panelEntryKey: the key that brings the keyboard into the panel, from the window keys the ? sheet lists", () => {
+  const FULL_WINDOW = [
+    { keys: "Ctrl+h / Ctrl+l", what: "Module left / right" },
+    { keys: "Ctrl+k", what: "Module above" },
+  ];
+  it("is the right-hand key of the module-move row", () => {
+    expect(panelEntryKey(FULL_WINDOW, false)).toBe("Ctrl+l");
+    expect(panelEntryKey([{ keys: "Alt+h / Alt+l", what: "Module left / right" }], false)).toBe("Alt+l");
+  });
+  it("is null in a companion window, where the window manager decides, whatever its one root row says", () => {
+    expect(panelEntryKey(FULL_WINDOW, true)).toBeNull();
+    expect(panelEntryKey([{ keys: "Ctrl+h / Ctrl+l", what: "leave the panel (your window manager moves focus)" }], false)).toBeNull();
+  });
+  it("is null before the keymap arrives, and for a row it cannot read", () => {
+    expect(panelEntryKey([], false)).toBeNull();
+    expect(panelEntryKey([{ keys: "Ctrl+l", what: "Module left / right" }], false)).toBeNull();
+  });
+});
+
 describe("isPlainAnswerKey", () => {
   it("is true for a bare key, and Shift alone does not disqualify it", () => {
     expect(isPlainAnswerKey(key("a"))).toBe(true);

@@ -19,7 +19,7 @@ import {
   STEP_LINES,
 } from "./jkScroll";
 import { cancelHold, isHolding, keepHoldAlive, releaseHold, startHold } from "./jkHold";
-import { EMPTY_PANEL_TABLE, isPlainAnswerKey, resolveKey } from "./keymap";
+import { EMPTY_PANEL_TABLE, isPlainAnswerKey, panelEntryKey, resolveKey } from "./keymap";
 import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from "./keymap";
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
@@ -75,7 +75,7 @@ import type { PathRef } from "./paths";
 import { PathPick } from "./components/PathPick";
 import { LinkPick } from "./components/LinkPick";
 import { isExternalTool, agentTitle } from "./externalTools";
-import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, forgetClosed, isExternalAgent, saveView, takeView, withoutHandoff } from "./tabs";
+import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, forgetClosed, isExternalAgent, saveView, tabPermissionModes, takeView, withoutHandoff } from "./tabs";
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
 import type { NavKeyRequest } from "./components/EmptyTab";
@@ -4091,6 +4091,7 @@ export default function App() {
               handoff={handoff}
               failure={activeTab.failure ?? fatalError}
               paneFocused={paneFocused}
+              entryKey={panelEntryKey(keymapHelp.window, editorLink !== null)}
               // The first-run hint reads the live prefix instead of assuming the default.
               // This is the same value the `?` overlay shows as `prefixLabel`.
               editorLink={editorLink}
@@ -4235,6 +4236,7 @@ export default function App() {
               companion={editorLink !== null}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
               agent={isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : null}
+              modes={hello === null ? undefined : tabPermissionModes(hello.permissionModes, activeTab?.agent)}
             />
           </PanelErrorBoundary>
         )}
@@ -5937,6 +5939,7 @@ export default function App() {
               companion={editorLink !== null}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
               agent={isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : null}
+              modes={hello === null ? undefined : tabPermissionModes(hello.permissionModes, activeTab?.agent)}
             />
           </PanelErrorBoundary>
         )}

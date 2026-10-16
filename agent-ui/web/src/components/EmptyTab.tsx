@@ -47,6 +47,9 @@ export type EmptyTabProps = {
   handoff: HandoffCommand | null;
   failure: string | null;
   paneFocused: boolean;
+  /** The key that brings the keyboard into this panel (`panelEntryKey`), for the box's hint while the panel lacks
+   *  it. `null`/absent -- a companion window, or the key not known yet -- draws no hint. */
+  entryKey?: string | null;
   /** `:` in BROWSE: opens the window's command line (`:tabnew codex` from a fresh window). */
   onExLine?: () => void;
   focusRequest: number;
@@ -798,7 +801,7 @@ export function EmptyTab(props: EmptyTabProps) {
             // A tab that has not started has no reported list yet: Claude's built-ins, nothing for another agent.
             slashCommands={completionSource(props.tab.agent, null)}
             // The window's own key for the module to the right, which is where the panel sits.
-            idleHint={props.paneFocused ? undefined : "Ctrl+l to start typing"}
+            idleHint={props.paneFocused || props.entryKey == null ? undefined : `${props.entryKey} to start typing`}
           />
         </div>
         {inDashboard && hello !== null && (

@@ -172,6 +172,15 @@ mod tests {
         }
     }
 
+    /// The agent panel reads the key that brings the keyboard into it off this row (`panelEntryKey` in
+    /// `agent-ui/web/src/keymap.ts`): the second of its two keys, found by these words.
+    #[test]
+    fn the_module_move_row_is_the_one_the_panel_reads_its_entry_key_from() {
+        let rows = help_rows();
+        assert_eq!(rows[0].keys, "Ctrl+h / Ctrl+l");
+        assert_eq!(rows[0].what, "Module left / right");
+    }
+
     #[test]
     fn the_root_accelerators_are_the_specs_table() {
         let got: Vec<(&str, Vec<&str>)> = ROOT_ACCELS.iter().map(|r| (r.action, r.accels.to_vec())).collect();

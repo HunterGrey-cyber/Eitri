@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { acceptsEnvelope, activeTabInfo, countedTabTarget, forgetClosed, markerGlyph, modePill, saveView, showTabBar, takeView, withoutHandoff } from "./tabs";
+import { acceptsEnvelope, activeTabInfo, countedTabTarget, forgetClosed, markerGlyph, modePill, saveView, showTabBar, tabPermissionModes, takeView, withoutHandoff } from "./tabs";
 import type { TabViewState } from "./tabs";
 import type { TabInfo, TabsEnvelope } from "./types";
 
@@ -134,5 +134,18 @@ describe("countedTabTarget (vim {N}gt / {N}gT)", () => {
   });
   it("gT has no target when the active tab is not in the list", () => {
     expect(countedTabTarget({ ...env, active: 99 }, "tab.prev", 1)).toBeNull();
+  });
+});
+
+describe("tabPermissionModes", () => {
+  const all = ["manual", "auto", "bypass"] as const;
+  it("gives Claude's and Codex's tabs the client's whole list, in cycle order", () => {
+    expect(tabPermissionModes([...all], undefined)).toEqual(["manual", "auto", "bypass"]);
+    expect(tabPermissionModes([...all], "claude")).toEqual(["manual", "auto", "bypass"]);
+    expect(tabPermissionModes([...all], "codex")).toEqual(["manual", "auto", "bypass"]);
+  });
+
+  it("drops manual on an ACP agent's tab, whose mode is set once at the start", () => {
+    expect(tabPermissionModes([...all], "acp:gemini")).toEqual(["auto", "bypass"]);
   });
 });

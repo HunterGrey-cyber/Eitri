@@ -607,6 +607,37 @@ describe("App handshake", () => {
     expect(container.querySelector(".status-band .mode-glyph")?.getAttribute("data-mode-name")).toBe("manual");
   });
 
+  it("hints the window's own key to bring the keyboard to an empty tab, and none in a companion window", () => {
+    const hint = (container: HTMLElement) => container.querySelector("textarea")?.getAttribute("placeholder") ?? null;
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ kind: "pane_focus", focused: false });
+    // No keymap envelope yet: no key is known, so none is named.
+    expect(hint(container)).toBeNull();
+    dispatch({
+      kind: "keymap", prefix: "Ctrl+b", window: [{ keys: "Alt+h / Alt+l", what: "Module left / right" }],
+      prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c",
+    });
+    expect(hint(container)).toBe("Alt+l to start typing");
+    dispatch({ kind: "editor_link", state: "attached", text: "nvim" });
+    expect(hint(container)).toBeNull();
+  });
+
+  it("says a tab's agent has no manual mode in the band's message slot", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    const note = "gemini tabs have no manual mode (the agent's own mode is set once, at its start): tab 1 is in auto";
+    dispatch({ kind: "hello", ...HELLO, permissionModes: ["manual", "auto", "bypass"] });
+    dispatch({ kind: "tabs", active: 1, defaultMode: "manual", tabs: [{ ...LIVE_TAB, mode: "auto" }] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
+    dispatch({ kind: "notice", text: note });
+    act(() => widen(container));
+    expect(container.querySelector(".status-band .band-message")?.textContent).toBe(note);
+    expect(container.querySelector(".status-band .mode-pill")?.textContent).toBe("⏵⏵ auto");
+    vi.unstubAllGlobals();
+  });
+
   it("shows why the tab failed to start, from the tabs envelope alone", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });

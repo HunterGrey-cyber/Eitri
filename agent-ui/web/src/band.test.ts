@@ -136,6 +136,19 @@ describe("defect 1: a y/n prompt or a flash is never truncated", () => {
     expect(message.wraps).toBe(true);
   });
 
+  /* The sentence Rust says when a tab's agent has no manual mode (`TabSet::mode_offered_to`): it arrives as a
+     notice, which the band shows as its flash. At the panel's 480px it is about 100 columns of text. */
+  it("keeps the 'has no manual mode' sentence whole beside a manual pill, wrapping at 480px", () => {
+    const note =
+      "gemini tabs have no manual mode (the agent's own mode is set once, at its start): tab 2 is in auto";
+    const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", message: note }, 480, 7.2);
+    const message = segs.find((s) => s.id === "message")!;
+    expect(message.text).toBe(note);
+    expect(message.wraps).toBe(true);
+    expect(segs.find((s) => s.id === "pill")!.text).toBe("⏵⏵ manual");
+    expect(segs.find((s) => s.id === "mode")!.text).toBe("BROWSE");
+  });
+
   it("a flash that wraps leaves the mode its word: the letter would not make it fit", () => {
     const segs = bandLayout({ ...idle, message: D11_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
     expect(segs.find((s) => s.id === "mode")!.text).toBe("BROWSE");

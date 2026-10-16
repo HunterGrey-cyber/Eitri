@@ -110,6 +110,36 @@ describe("KeymapOverlay", () => {
       );
     });
 
+    it("says on a Claude tab that manual asks for every edit, and on the tab's own cycle row", () => {
+      const { container } = overlay();
+      expect(sectionTitled(container, "This panel").querySelector("p")!.textContent).toContain(
+        "manual — Safe reads run; every edit and anything else asks. auto —",
+      );
+      expect(sectionTitled(container, "Typing").textContent).toContain(
+        "Cycle manual → auto → bypass (entering bypass asks first)",
+      );
+    });
+
+    it("names only the modes the tab offers: an ACP agent's tab has no manual, in the note or the Shift+Tab row", () => {
+      const { container } = render(
+        <KeymapOverlay
+          onClose={() => {}}
+          windowKeys={WINDOW}
+          prefixKeys={PREFIX}
+          prefixLabel="Ctrl+b"
+          panel={EMPTY_PANEL_TABLE}
+          agent="gemini"
+          modes={["auto", "bypass"]}
+        />,
+      );
+      expect(sectionTitled(container, "This panel").querySelector("p")!.textContent).toBe(
+        `Ctrl+[ is Esc everywhere in this panel. Modes (Shift+Tab): auto — ${MODE_CONSEQUENCE.auto} bypass — ${MODE_CONSEQUENCE.bypass}`,
+      );
+      const typing = sectionTitled(container, "Typing").textContent!;
+      expect(typing).toContain("Cycle auto → bypass (entering bypass asks first)");
+      expect(container.textContent).not.toContain("manual");
+    });
+
     it("says Ctrl+[ is Esc and what each mode does, in a <p> after the table, and adds no row", () => {
       const section = sectionTitled(overlay().container, "This panel");
       expect(section.querySelectorAll("p")).toHaveLength(1);

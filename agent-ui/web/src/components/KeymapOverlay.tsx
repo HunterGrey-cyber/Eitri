@@ -3,7 +3,8 @@ import { browseKeys, CARET_KEYS, INPUT_KEYS, REVIEW_KEYS, VISUAL_KEYS } from "..
 import type { KeyHelp, PanelBinding, PanelTable } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
-import { MODE_CONSEQUENCE, modeConsequence } from "./Dashboard";
+import type { PermissionModeChoice } from "../types";
+import { modeConsequence } from "./Dashboard";
 
 type Props = {
   /** Requested by a backdrop click only -- `App.tsx` owns `?`/`Escape`/`q`, which it intercepts
@@ -28,7 +29,19 @@ type Props = {
   /** The word for the active tab's agent when it is not Claude (`agentTitle`), for what manual means on its
    *  tab: another agent runs what its own sandbox allows without asking anyone. `null`/absent for Claude. */
   agent?: string | null;
+  /** The modes the active tab offers, in cycle order (`tabPermissionModes`): the sheet names only these, so
+   *  a tab whose agent has no manual mode is not told about one. Absent reads as all three. */
+  modes?: PermissionModeChoice[];
 };
+
+const ALL_MODES: PermissionModeChoice[] = ["manual", "auto", "bypass"];
+
+/** The Typing section's Shift+Tab row, worded for the modes the tab cycles through. */
+function cycleRow(row: KeyHelp, modes: PermissionModeChoice[]): KeyHelp {
+  if (row.keys !== "Shift+Tab") return row;
+  const asks = modes.includes("bypass") ? " (entering bypass asks first)" : "";
+  return { ...row, what: `Cycle ${modes.join(" → ")}${asks}` };
+}
 
 /** One of the four groups, rendered from the same tables `keymap.test.ts` binds to
  *  `resolveKey` both ways -- this component adds no keys of its own, only a title and a layout.
@@ -209,7 +222,7 @@ function SlashCommands() {
  * fires it.
  */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null },
+  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES },
   ref,
 ) {
   return (
@@ -231,7 +244,9 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
       <Section
         title="This panel"
         rows={[...browseKeys(prefixLabel), { keys: "Ctrl+j", what: "Type (the box below)" }]}
-        note={`Ctrl+[ is Esc everywhere in this panel. Modes (Shift+Tab): manual — ${modeConsequence("manual", agent, prefixLabel)} auto — ${MODE_CONSEQUENCE.auto} bypass — ${MODE_CONSEQUENCE.bypass}`}
+        note={`Ctrl+[ is Esc everywhere in this panel. Modes (Shift+Tab): ${modes
+          .map((mode) => `${mode} — ${modeConsequence(mode, agent, prefixLabel)}`)
+          .join(" ")}`}
       />
       <Selecting panel={panel} />
       {/* The review overlay (`c`): its keys are `./review`'s, not `resolveKey`'s, so they are a section of
@@ -251,7 +266,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         title="Typing"
         note="Enter also sends the editor's file name — not its text or cursor — or the lines selected there in Visual mode (up to 400 lines and 2000 characters). /model, /effort and the CLI's other local commands go without it."
         rows={[
-          ...INPUT_KEYS,
+          ...INPUT_KEYS.map((row) => cycleRow(row, modes)),
           // The pane-motion row lists only Ctrl+h/l. Ctrl+j/k have their own meanings in the rows
           // below, so including them here would give conflicting descriptions.
           { keys: "Ctrl+h / l", what: "Move between panes (Eitri keeps these)" },
